@@ -1,40 +1,42 @@
 # Backlog
 
-Diário de progresso do Forja. Entradas em ordem cronológica reversa (mais recente no topo).
+Forja progress diary. Entries in reverse chronological order (newest on top).
 
-Formato:
+Format:
 
 ```
-## [YYYY-MM-DD] <milestone>/<etapa> — <título>
+## [YYYY-MM-DD] <milestone>/<step> — <title>
 
-**Feito:** ...
-**Decisões:** ...
-**Pendências:** ...
-**Próximo:** ...
+**Done:** ...
+**Decisions:** ...
+**Pending:** ...
+**Next:** ...
 ```
 
 ---
 
-## [2026-04-27] M1 / Etapa 1 — Bootstrap do repositório
+## [2026-04-27] M1 / Step 1 — Repository bootstrap
 
-**Feito:**
-- Branch `feat/m1-foundation` criada a partir de `main`.
-- `CLAUDE.md` na raiz: premissa raiz, mapa Doc→Subsistema, stack travada, regras absolutas, workflow.
-- `docs/BACKLOG.md` (este arquivo).
-- `package.json` com scripts (`dev`, `test`, `lint`, `typecheck`, `build`) e bin `agent`.
-- `tsconfig.json` strict (incluindo `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `verbatimModuleSyntax`).
-- `biome.json` (linter + formatter, 100 col, single quotes, semi).
-- `.gitignore` cobrindo runtime state per spec §2.7 (`.agent/sessions.db`, traces, checkpoints, memory local).
-- `src/cli/index.ts` stub — responde a `--version` / `-v`; resto sai com exit 1 e ponteiro pra spec.
+**Done:**
+- Branch `feat/m1-foundation` created from `main`.
+- `CLAUDE.md` at the root: root premise, Doc→Subsystem map, locked stack, hard rules, workflow.
+- `docs/BACKLOG.md` (this file).
+- `package.json` with scripts (`dev`, `test`, `lint`, `typecheck`, `build`) and bin `agent`.
+- `tsconfig.json` strict (including `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `verbatimModuleSyntax`).
+- `biome.json` (linter + formatter, 100 col, single quotes, semicolons).
+- `.gitignore` covering runtime state per spec §2.7 (`.agent/sessions.db`, traces, checkpoints, local memory).
+- `src/cli/index.ts` stub — responds to `--version` / `-v`; anything else exits 1 with a pointer to the spec.
+- Project-wide language policy: English everywhere except `docs/spec/` (PT-BR).
 
-**Decisões:**
-- **Test runner:** `bun test` built-in, não Vitest da spec §16. Razão: alinha com princípio 5 ("single runtime"); zero deps. Revisitar se faltar feature crítica (snapshot multi-arquivo, parallel isolation, etc).
-- **Linter:** Biome (single binary, Bun-friendly) em vez de ESLint+Prettier — alinha com "single runtime" também.
-- **`docs/BACKLOG.md` em vez de `.txt`** — markdown renderiza no GitHub e mantém consistência com o resto do repo.
-- **Branch por milestone** (`feat/mN-*`) até estabilizar trunk-based.
-- **Pastas de subsistema não criadas vazias** — emergem na etapa que precisa delas. `.gitkeep` em pastas vazias é ruído.
-- **Stack alinhada com spec §3**: TS + Bun + bun:sqlite + Ink. Nenhum desvio.
+**Decisions:**
+- **Test runner:** `bun test` built-in, not Vitest from spec §16. Reason: aligns with principle 5 ("single runtime"); zero extra deps. Revisit if a critical Vitest feature is missing.
+- **Linter:** Biome (single binary, Bun-friendly) instead of ESLint + Prettier — same single-runtime alignment.
+- **`docs/BACKLOG.md` instead of `.txt`** — markdown renders on GitHub and matches the rest of the repo.
+- **Branch per milestone** (`feat/mN-*`) until trunk-based stabilizes.
+- **No empty subsystem folders** — they emerge in the step that needs them. `.gitkeep` in empty dirs is noise.
+- **Stack matches spec §3** exactly: TS + Bun + bun:sqlite + Ink. No drift.
+- **Project language is English**; only `docs/spec/` stays in PT-BR.
 
-**Pendências:** rodar `bun install` localmente (depende do ambiente do dev). Confirmar `bun --version >= 1.1`.
+**Pending:** none for this step.
 
-**Próximo:** Etapa 2 — Storage layer (SQLite) com schema mínimo do `AGENTIC_CLI §13`: tabelas `sessions`, `messages`, `tool_calls`, `approvals`, `checkpoints`, `traces`. Migrations infra. Repository pattern fino sobre `bun:sqlite`. Testes de schema + CRUD básico.
+**Next:** Step 2 — Storage layer (SQLite) with the minimal schema from `AGENTIC_CLI §13`: tables `sessions`, `messages`, `tool_calls`, `approvals`, `checkpoints`, `traces`. Migrations infra. Thin repository pattern over `bun:sqlite`. Schema + basic CRUD tests.

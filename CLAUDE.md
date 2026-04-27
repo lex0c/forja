@@ -1,18 +1,18 @@
 # CLAUDE.md
 
-Instruções pra Claude Code trabalhando no Forja — agentic CLI especificada em `docs/spec/`.
+Instructions for Claude Code working on Forja — the agentic CLI specified in `docs/spec/`.
 
-## Premissa raiz
+## Root premise
 
-> **Meça duas vezes, corte uma.**
+> **Measure twice, cut once.**
 
-Toda ação com side effect persistente passa por verificação prévia. Toda decisão sobre cortar tem fallback. Toda inferência declara o que **não** mediu (`not_checked`, `assumptions`, `confidence`). Os princípios em `docs/spec/AGENTIC_CLI.md §1` derivam dessa raiz.
+Every action with a persistent side effect goes through prior verification. Every cut decision has a fallback. Every inference declares what was **not** measured (`not_checked`, `assumptions`, `confidence`). The principles in `docs/spec/AGENTIC_CLI.md §1` derive from this root.
 
-## Antes de implementar qualquer subsistema, leia a spec
+## Before implementing any subsystem, read the spec
 
-Spec arquitetural em `docs/spec/AGENTIC_CLI.md`. Cada subsistema tem doc dedicado:
+The architectural spec lives in `docs/spec/AGENTIC_CLI.md`. Each subsystem has a dedicated doc:
 
-| Implementando | Leia |
+| Implementing | Read |
 |---|---|
 | Harness, loop, budget, profiles | `AGENTIC_CLI` §5, `STATE_MACHINE`, `ORCHESTRATION` |
 | Tools | `AGENTIC_CLI` §7, `CONTRACTS` §2.6 |
@@ -25,8 +25,8 @@ Spec arquitetural em `docs/spec/AGENTIC_CLI.md`. Cada subsistema tem doc dedicad
 | Storage / schema / audit | `AGENTIC_CLI` §13, `AUDIT` |
 | Context engine, compaction | `AGENTIC_CLI` §6, `CONTEXT_TUNING` |
 | Sampling, output budgets | `TOKEN_TUNING` |
-| UI Ink, microcopy, design tokens | `AGENTIC_CLI` §17, `UI`, `DESIGN_SYSTEM` |
-| Memory cross-session | `MEMORY` |
+| UI (Ink), microcopy, design tokens | `AGENTIC_CLI` §17, `UI`, `DESIGN_SYSTEM` |
+| Cross-session memory | `MEMORY` |
 | Recap | `RECAP` |
 | Code index (tree-sitter) | `CODE_INDEX` |
 | Code generation pipeline | `CODE_GENERATION` |
@@ -34,65 +34,67 @@ Spec arquitetural em `docs/spec/AGENTIC_CLI.md`. Cada subsistema tem doc dedicad
 | Failure handling, recovery | `FAILURE_MODES` |
 | Performance budgets, SLOs | `PERFORMANCE` |
 | Feature flags | `FEATURE_FLAGS` |
-| **O que NÃO fazer** | `ANTI_PATTERNS` (ler antes de propor "feature legal") |
+| **What NOT to do** | `ANTI_PATTERNS` (read before proposing any "cool feature") |
 
-Spec é protocolo, não sugestão. Divergir da spec exige PR contra a spec **primeiro**, código depois. Nunca editar `docs/spec/` sem pedido explícito do usuário.
+The spec is a protocol, not a suggestion. Diverging from the spec requires a PR against the spec **first**, code after. Never edit `docs/spec/` without an explicit user request.
 
-## Stack travada
+## Locked stack
 
-- Linguagem: **TypeScript** strict
-- Runtime: **Bun** (single-binary via `bun build --compile`)
-- Storage: **SQLite via `bun:sqlite`** — SQL cru com tipos, **sem ORM**
-- TUI: **Ink** (React no terminal)
+- Language: **TypeScript** strict
+- Runtime: **Bun** (single binary via `bun build --compile`)
+- Storage: **SQLite via `bun:sqlite`** — raw SQL with types, **no ORM**
+- TUI: **Ink** (React in the terminal)
 - Lint/format: **Biome**
 - Test: **`bun test`** (built-in)
 - Provider SDKs: `@anthropic-ai/sdk` (M1), `@modelcontextprotocol/sdk` (M3+)
 
-Mudança de stack exige PR contra `docs/spec/AGENTIC_CLI.md §3`.
+Stack changes require a PR against `docs/spec/AGENTIC_CLI.md §3`.
 
-## Regras absolutas
+## Hard rules
 
-- **Sem ORM.** SQL cru com tipos.
-- **Sem regex em policy/permissions.** Glob + prefix only.
-- **Sem vector DB v1.** Sem cargo cult (princípio 12, `ANTI_PATTERNS` §2.2).
-- **Sem auto-commit, sem persona tuning, sem prompt-as-IP, sem undercover mode.** Ler `ANTI_PATTERNS` antes.
-- **Eval é load-bearing.** Subsistema sem eval não fecha (princípio 4).
-- **stdout puro, stderr pra log.** Modo `--json` = NDJSON em stdout, nada mais.
-- **Trace tudo.** Sem reproduzibilidade, não existe (princípio 7).
-- **Reversível por design.** Toda escrita tem checkpoint (princípio 10).
-- **Confiança explícita.** Diretório novo / `AGENTS.md` desconhecido = não-confiável até prova.
+- **No ORM.** Raw SQL with types.
+- **No regex in policy/permissions.** Glob + prefix only.
+- **No vector DB in v1.** No cargo cult (principle 12, `ANTI_PATTERNS` §2.2).
+- **No auto-commit, no persona tuning, no prompt-as-IP, no undercover mode.** Read `ANTI_PATTERNS` first.
+- **Eval is load-bearing.** A subsystem without eval doesn't ship (principle 4).
+- **stdout is pure, stderr is for logs.** `--json` mode means NDJSON on stdout, nothing else.
+- **Trace everything.** Without reproducibility, it doesn't exist (principle 7).
+- **Reversible by design.** Every write has a checkpoint (principle 10).
+- **Explicit trust.** New directory / unknown `AGENTS.md` is untrusted until proven.
 
-## Workflow obrigatório
+## Required workflow
 
-1. Identificar doc(s) da spec relevantes e ler antes de codar.
-2. Atualizar `docs/BACKLOG.md` (entrada nova no topo) **antes** e **depois** do trabalho.
-3. Código novo nasce com teste. Sem teste = não tá pronto.
-4. Commit: mensagem descreve o **porquê**, não o quê.
-5. Branch por milestone (`feat/mN-*`) até estabilizar trunk-based.
+1. Identify the relevant spec doc(s) and read them before coding.
+2. Update `docs/BACKLOG.md` (new entry on top) **before** and **after** the work.
+3. New code is born with tests. No tests means not done.
+4. Commit messages describe the **why**, not the what. Commits in English.
+5. Branch per milestone (`feat/mN-*`) until trunk-based stabilizes.
 
-## Comandos
+## Commands
 
-- `bun install` — deps
-- `bun test` — tests
-- `bun run dev` — entrypoint em watch
+- `bun install` — install deps
+- `bun test` — run tests
+- `bun run dev` — entry point in watch mode
 - `bun run typecheck` — `tsc --noEmit`
 - `bun run lint` — Biome check
 - `bun run lint:fix` — Biome auto-fix
-- `bun run build` — compila binário em `dist/agent`
+- `bun run build` — compile binary into `dist/agent`
 
-## Estrutura
+## Layout
 
 ```
 docs/
-  spec/             # spec arquitetural (read-only sem PR de spec)
-  BACKLOG.md        # diário de progresso
-src/                # subsistemas emergem conforme cada milestone exige
+  spec/             # architectural spec (read-only without a spec PR; PT-BR)
+  BACKLOG.md        # progress diary
+src/                # subsystems emerge as each milestone demands
 tests/
 evals/              # smoke / regression / bench (spec §16)
 ```
 
-Pastas vazias com `.gitkeep` são ruído — diretórios de subsistema (`src/harness`, `src/tools`, etc) nascem na etapa que escreve código neles.
+Empty folders with `.gitkeep` are noise — subsystem directories (`src/harness`, `src/tools`, etc.) are born in the step that writes code into them.
 
-## Idioma
+## Language
 
-Specs e `BACKLOG.md` em **PT-BR**. Mensagens de erro user-facing em PT-BR. Identificadores de código, comentários técnicos e nomes de tools em **inglês** (interoperabilidade com providers e MCP).
+The whole project is in **English**: source code, identifiers, comments, error messages, commit messages, `BACKLOG.md`, READMEs.
+
+The single exception is `docs/spec/`, which stays in **PT-BR** — that is the architect's authored material. Do not translate the spec without an explicit request.

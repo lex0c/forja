@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
-// Entry point. Implementação real começa na Etapa 2.
-// Spec: docs/spec/AGENTIC_CLI.md §2 (modos de operação).
+// Entry point. Real implementation starts in Step 2.
+// Spec: docs/spec/AGENTIC_CLI.md §2 (operation modes).
 
 const VERSION = '0.0.0';
 
