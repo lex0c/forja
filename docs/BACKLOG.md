@@ -15,6 +15,26 @@ Format:
 
 ---
 
+## [2026-04-27] M1 / Step 1.5 — Production hygiene pass
+
+**Done:**
+- `.github/workflows/ci.yml` — runs typecheck → lint → test on push to `main` and on every PR. Bun pinned to `1.3.13`. Concurrency group cancels superseded runs.
+- `.editorconfig` at the root — keeps cross-editor formatting aligned with Biome (2-space, LF, UTF-8, final newline). Markdown keeps trailing whitespace (line breaks).
+- Trusted Biome's postinstall (`bun pm trust @biomejs/biome`) so the platform binary is fetched at install time instead of lazily on first lint. Bun added `trustedDependencies` to `package.json`.
+- `tests/cli.test.ts` — first smoke test: `--version`, `-v`, `--version --json`, no-args exit-1. Also unblocks `bun test` in CI (zero test files makes Bun exit 1).
+
+**Decisions:**
+- **Skipped pre-commit hook and README.md** for now (explicit user call). CI gate covers the regression case for the moment.
+- **CI uses `bun install --frozen-lockfile`** — fail loud if `bun.lock` drifts from `package.json`.
+- **CI Bun version pinned to current dev (`1.3.13`)** rather than floating `latest` — reproducible builds beat free upgrades.
+- **Smoke test uses `Bun.spawnSync`** (not `node:child_process`) — consistent with the runtime, no extra type dance.
+
+**Pending:** README and pre-commit hook still owed eventually.
+
+**Next:** Step 2 — Storage layer (SQLite) per `AGENTIC_CLI §13`.
+
+---
+
 ## [2026-04-27] M1 / Step 1 — Repository bootstrap
 
 **Done:**
