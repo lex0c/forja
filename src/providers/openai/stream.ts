@@ -1,4 +1,4 @@
-import type { StopReason, StreamEvent } from '../types.ts';
+import type { StopReason, StreamEvent, UsageInfo } from '../types.ts';
 
 // Minimal structural subset of an OpenAI Chat Completions streaming chunk.
 // Defined locally so tests can construct chunks without depending on SDK
@@ -26,9 +26,25 @@ export interface RawOpenAIChoice {
   finish_reason?: string | null;
 }
 
+// Usage object that OpenAI emits in the **final** chunk when the request was
+// made with `stream_options: { include_usage: true }`. The provider opts
+// in by default; absent usage means the user's compatibility endpoint
+// (Azure, OpenRouter, etc) ignored the flag — we still emit a `usage`
+// event with zeros so downstream consumers always see one row per turn.
+export interface RawOpenAIUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  // Recent OpenAI API exposes cached input via `prompt_tokens_details`.
+  prompt_tokens_details?: {
+    cached_tokens?: number;
+  };
+}
+
 export interface RawOpenAIChunk {
   id?: string;
   choices?: RawOpenAIChoice[];
+  usage?: RawOpenAIUsage | null;
 }
 
 interface ToolCallInProgress {
@@ -76,11 +92,28 @@ export async function* normalizeOpenAIStream(
   let messageStarted = false;
   let stopReason: StopReason = 'end_turn';
   const toolCalls = new Map<number, ToolCallInProgress>();
+  // OpenAI streams usage on the final chunk when include_usage is set.
+  // Cache writes aren't reported separately (the prompt_tokens_details
+  // shape only exposes reads), so cache_creation stays at zero.
+  const usage: UsageInfo = { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
 
   for await (const chunk of raw) {
     if (!messageStarted) {
       yield { kind: 'start', message_id: chunk.id ?? synthesizeMessageId() };
       messageStarted = true;
+    }
+
+    if (chunk.usage !== undefined && chunk.usage !== null) {
+      const u = chunk.usage;
+      const cached = u.prompt_tokens_details?.cached_tokens ?? 0;
+      const prompt = u.prompt_tokens ?? 0;
+      // OpenAI's `prompt_tokens` is the full prompt count *including* the
+      // cached portion. Split so `input` matches Anthropic's semantics
+      // (non-cached input tokens) and cost math composes the same way
+      // across providers.
+      usage.input = Math.max(0, prompt - cached);
+      usage.cache_read = cached;
+      usage.output = u.completion_tokens ?? 0;
     }
 
     const choice = chunk.choices?.[0];
@@ -190,5 +223,6 @@ export async function* normalizeOpenAIStream(
   if (!messageStarted) {
     yield { kind: 'start', message_id: synthesizeMessageId() };
   }
+  yield { kind: 'usage', usage };
   yield { kind: 'stop', reason: stopReason };
 }

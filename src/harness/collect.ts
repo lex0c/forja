@@ -1,4 +1,5 @@
-import type { StopReason, StreamEvent } from '../providers/index.ts';
+import { emptyUsage } from '../providers/cost.ts';
+import type { StopReason, StreamEvent, UsageInfo } from '../providers/index.ts';
 
 export interface CollectedToolUse {
   id: string;
@@ -19,6 +20,12 @@ export interface CollectedStep {
   thinking: string;
   stop_reason: StopReason;
   errors: CollectedError[];
+  usage: UsageInfo;
+  // True iff at least one `usage` event was seen on the stream. Lets the
+  // harness persist NULL token columns (instead of zeroes) when an adapter
+  // never reports — the difference matters for analytics that want to
+  // distinguish "no measurement" from "measured zero".
+  usageSeen: boolean;
 }
 
 const empty = (): CollectedStep => ({
@@ -28,6 +35,8 @@ const empty = (): CollectedStep => ({
   thinking: '',
   stop_reason: 'end_turn',
   errors: [],
+  usage: emptyUsage(),
+  usageSeen: false,
 });
 
 // Drain a provider stream into a single CollectedStep. The normalizer guarantees
@@ -81,6 +90,13 @@ export const collectStep = async (
         out.tool_uses.push({ id: ev.id, name, input: ev.final_args });
         break;
       }
+      case 'usage':
+        // Last `usage` event wins. Adapters emit exactly one per turn
+        // today, but if a provider ever splits the report across multiple
+        // events the spec semantic is "final values", not "sum across".
+        out.usage = ev.usage;
+        out.usageSeen = true;
+        break;
       case 'stop':
         out.stop_reason = ev.reason;
         break;

@@ -1,21 +1,16 @@
 import { describe, expect, test } from 'bun:test';
 import { type RawGoogleChunk, normalizeGoogleStream } from '../../src/providers/google/stream.ts';
 import type { StreamEvent } from '../../src/providers/types.ts';
+import { collect, collectNonUsage } from './_stream-helpers.ts';
 
 const fromChunks = (chunks: RawGoogleChunk[]): AsyncIterable<RawGoogleChunk> =>
   (async function* () {
     for (const c of chunks) yield c;
   })();
 
-const collect = async (stream: AsyncIterable<StreamEvent>): Promise<StreamEvent[]> => {
-  const out: StreamEvent[] = [];
-  for await (const e of stream) out.push(e);
-  return out;
-};
-
 describe('normalizeGoogleStream', () => {
   test('text-only stream: synth start, text deltas, stop', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeGoogleStream(
         fromChunks([
           { responseId: 'resp_1', candidates: [{ content: { parts: [{ text: 'hello' }] } }] },
@@ -33,7 +28,7 @@ describe('normalizeGoogleStream', () => {
   });
 
   test('synthesizes a message_id when responseId is absent', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeGoogleStream(
         fromChunks([{ candidates: [{ content: { parts: [{ text: 'hi' }] } }] }]),
       ),
@@ -46,7 +41,7 @@ describe('normalizeGoogleStream', () => {
   });
 
   test('functionCall part emits start, delta with serialized args, stop', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeGoogleStream(
         fromChunks([
           {
@@ -76,7 +71,7 @@ describe('normalizeGoogleStream', () => {
   });
 
   test('synthesized tool_use ids are stable across the three events', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeGoogleStream(
         fromChunks([
           {
@@ -96,7 +91,7 @@ describe('normalizeGoogleStream', () => {
   });
 
   test('respects functionCall.id when the SDK provides one', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeGoogleStream(
         fromChunks([
           {
@@ -118,7 +113,7 @@ describe('normalizeGoogleStream', () => {
   });
 
   test('thought parts become thinking_delta', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeGoogleStream(
         fromChunks([
           {
@@ -131,7 +126,7 @@ describe('normalizeGoogleStream', () => {
   });
 
   test('text part with thought:false stays text_delta', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeGoogleStream(
         fromChunks([{ candidates: [{ content: { parts: [{ text: 'visible' }] } }] }]),
       ),
@@ -151,7 +146,7 @@ describe('normalizeGoogleStream', () => {
       ['SOMETHING_NEW', { kind: 'stop', reason: 'end_turn' }],
     ];
     for (const [reason, expected] of cases) {
-      const events = await collect(
+      const events = await collectNonUsage(
         normalizeGoogleStream(fromChunks([{ candidates: [{ finishReason: reason }] }])),
       );
       expect(events).toContainEqual(expected);
@@ -159,7 +154,7 @@ describe('normalizeGoogleStream', () => {
   });
 
   test('null finishReason in earlier chunk does not clobber a later valid one', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeGoogleStream(
         fromChunks([
           { candidates: [{ content: { parts: [{ text: 'a' }] }, finishReason: null }] },
@@ -171,14 +166,14 @@ describe('normalizeGoogleStream', () => {
   });
 
   test('empty stream still yields a well-formed start+stop sequence', async () => {
-    const events = await collect(normalizeGoogleStream(fromChunks([])));
+    const events = await collectNonUsage(normalizeGoogleStream(fromChunks([])));
     expect(events).toHaveLength(2);
     expect(events[0]?.kind).toBe('start');
     expect(events[1]).toEqual({ kind: 'stop', reason: 'end_turn' });
   });
 
   test('mixed text and tool_use parts in a single chunk', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeGoogleStream(
         fromChunks([
           {
@@ -205,5 +200,26 @@ describe('normalizeGoogleStream', () => {
       'tool_use_stop',
       'stop',
     ]);
+  });
+
+  test('extracts usage from usageMetadata, splitting cached tokens out of prompt total', async () => {
+    const events = await collect(
+      normalizeGoogleStream(
+        fromChunks([
+          {
+            responseId: 'resp_u',
+            candidates: [{ content: { parts: [{ text: 'hi' }] }, finishReason: 'STOP' }],
+            usageMetadata: {
+              promptTokenCount: 1500,
+              cachedContentTokenCount: 1000,
+              candidatesTokenCount: 30,
+            },
+          },
+        ]),
+      ),
+    );
+    const u = events.find((e) => e.kind === 'usage');
+    if (u?.kind !== 'usage') throw new Error('expected usage event');
+    expect(u.usage).toEqual({ input: 500, output: 30, cache_read: 1000, cache_creation: 0 });
   });
 });

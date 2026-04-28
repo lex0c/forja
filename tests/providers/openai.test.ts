@@ -93,7 +93,7 @@ describe('createOpenAIProvider', () => {
     })) {
       events.push(ev);
     }
-    expect(events).toEqual([
+    expect(events.filter((e) => e.kind !== 'usage')).toEqual([
       { kind: 'start', message_id: 'cmpl-x' },
       { kind: 'text_delta', text: 'hi' },
       { kind: 'stop', reason: 'end_turn' },
@@ -148,6 +148,37 @@ describe('createOpenAIProvider', () => {
     }>;
     expect(tools[0]?.type).toBe('function');
     expect(tools[0]?.function.name).toBe('read_file');
+  });
+
+  test('generate sends stream_options.include_usage by default', async () => {
+    const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const provider = createOpenAIProvider('gpt-4o', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 1,
+    })) {
+      // drain
+    }
+    const params = handle.createCalls[0]?.params as Record<string, unknown>;
+    expect(params.stream_options).toEqual({ include_usage: true });
+  });
+
+  test('includeUsage:false omits stream_options for compatibility endpoints', async () => {
+    const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const provider = createOpenAIProvider('gpt-4o', {
+      client: handle.client,
+      includeUsage: false,
+    });
+    for await (const _ of provider.generate({
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 1,
+    })) {
+      // drain
+    }
+    const params = handle.createCalls[0]?.params as Record<string, unknown>;
+    expect(params.stream_options).toBeUndefined();
   });
 
   test('assistant message with tool_use blocks becomes a single message + tool_calls', async () => {

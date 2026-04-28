@@ -1,4 +1,4 @@
-import type { StopReason, StreamEvent } from '../types.ts';
+import type { StopReason, StreamEvent, UsageInfo } from '../types.ts';
 
 // Minimal structural subset of a Gemini streaming chunk that we read.
 // Defined locally so tests can construct chunks without touching the SDK
@@ -23,10 +23,21 @@ export interface RawGoogleCandidate {
   finishReason?: string | null;
 }
 
+// Gemini reports per-turn token counts via `usageMetadata` on the final
+// chunk. `cachedContentTokenCount` is the cache-hit portion of the
+// prompt; `promptTokenCount` is the FULL prompt count (cached included),
+// matching OpenAI semantics — we split so `input` means non-cached.
+export interface RawGoogleUsageMetadata {
+  promptTokenCount?: number;
+  candidatesTokenCount?: number;
+  cachedContentTokenCount?: number;
+  totalTokenCount?: number;
+}
+
 export interface RawGoogleChunk {
   responseId?: string;
   candidates?: RawGoogleCandidate[];
-  // usageMetadata exists but isn't read by the normalizer
+  usageMetadata?: RawGoogleUsageMetadata;
 }
 
 const FINISH_REASON_MAP: Readonly<Record<string, StopReason>> = {
@@ -62,8 +73,21 @@ export async function* normalizeGoogleStream(
   let messageStarted = false;
   let stopReason: StopReason = 'end_turn';
   let toolCallCounter = 0;
+  // Accumulate the final usageMetadata seen during the stream. Gemini
+  // reports cumulative counts, so the LAST chunk is authoritative.
+  // cache_creation isn't a Gemini concept (its cache is server-persistent
+  // and pre-warmed via a separate API), so we leave it at zero.
+  const usage: UsageInfo = { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
 
   for await (const chunk of raw) {
+    if (chunk.usageMetadata !== undefined) {
+      const u = chunk.usageMetadata;
+      const cached = u.cachedContentTokenCount ?? 0;
+      const prompt = u.promptTokenCount ?? 0;
+      usage.input = Math.max(0, prompt - cached);
+      usage.cache_read = cached;
+      usage.output = u.candidatesTokenCount ?? 0;
+    }
     if (!messageStarted) {
       yield { kind: 'start', message_id: chunk.responseId ?? synthesizeMessageId() };
       messageStarted = true;
@@ -101,5 +125,6 @@ export async function* normalizeGoogleStream(
   if (!messageStarted) {
     yield { kind: 'start', message_id: synthesizeMessageId() };
   }
+  yield { kind: 'usage', usage };
   yield { kind: 'stop', reason: stopReason };
 }

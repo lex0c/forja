@@ -119,7 +119,7 @@ describe('createAnthropicProvider', () => {
     })) {
       events.push(ev);
     }
-    expect(events).toEqual([
+    expect(events.filter((e) => e.kind !== 'usage')).toEqual([
       { kind: 'start', message_id: 'mock_msg' },
       { kind: 'text_delta', text: 'hi' },
       { kind: 'stop', reason: 'end_turn' },

@@ -15,6 +15,72 @@ Format:
 
 ---
 
+## [2026-04-28] M2 / Step 1 — Telemetry: usage tokens + cost tracking
+
+Opens M2 ("Robustez"). Pre-requisite for compaction (need to know when to
+trigger) and eval smoke (need cost numbers). Without it, the CLI is flying
+blind on production runs.
+
+**Done:**
+- `src/providers/types.ts` — new `UsageInfo` (`input` / `output` / `cache_read` / `cache_creation`) and a canonical `kind: 'usage'` `StreamEvent` between the last content event and `stop` in every well-formed turn.
+- `src/providers/anthropic/stream.ts` — extracts usage from `message_start.message.usage` (input + cache_read + cache_creation) and from the final `message_delta.usage` (output). Both shapes optional in `RawAnthropicEvent` so older SDK responses still parse. Defaults to zero when the SDK omits it.
+- `src/providers/openai/stream.ts` — reads `chunk.usage` from the final chunk (only present when `stream_options.include_usage` is set). Splits `prompt_tokens` minus `prompt_tokens_details.cached_tokens` so `input` semantics match Anthropic (non-cached tokens at full rate, cache_read at the discount tier).
+- `src/providers/openai/index.ts` — opts into `stream_options: { include_usage: true }` on every `chat.completions.create`. Falls back to a zeroed UsageInfo when compatibility endpoints (Azure, OpenRouter) ignore the flag.
+- `src/providers/google/stream.ts` — reads `chunk.usageMetadata` (cumulative; last chunk wins). Same `prompt − cached` split. `cache_creation` stays zero (Gemini's cache is pre-warmed via a separate API; the stream never reports writes).
+- `src/providers/cost.ts` — `computeCost(caps, usage)` honors the four-tier rate table (`input`, `output`, `cache_read`, `cache_creation`); falls back to the raw input rate when `cost_per_1k_cached_input` or `cost_per_1k_cache_write` aren't declared. `addUsage` + `emptyUsage` for accumulation.
+- `src/storage/migrations/003-usage-cost.ts` — `ALTER TABLE messages ADD COLUMN cache_creation_tokens INTEGER` + `ADD COLUMN cost_usd REAL`. The original schema had `cached_tokens` (reads) but no separate write column; cost_usd avoids re-deriving pricing every time `agent audit costs` runs.
+- `src/storage/repos/messages.ts` — `Message` carries `cacheCreationTokens` / `costUsd`; `appendMessage` accepts and persists them.
+- `src/harness/collect.ts` — `CollectedStep.usage` accumulated from `kind: 'usage'` events. Last event wins (defensive for adapters that ever split the report).
+- `src/harness/loop.ts` — every assistant turn writes `tokens_in` / `tokens_out` / `cached_tokens` / `cache_creation_tokens` / `cost_usd` to `messages`. Session-wide totals (`totalUsage`, `totalCostUsd`) accumulate across turns, persist via `completeSession(..., totalCostUsd)` (the column already existed but was always written as `0`), and surface in `HarnessResult.usage` + `HarnessResult.costUsd`.
+- `src/harness/types.ts` — `HarnessResult` exposes `usage: UsageInfo` and `costUsd: number`. `session_finished` HarnessEvent reuses `result`, so renderers see the totals without a new event shape.
+- `src/cli/output/plain.ts` — final summary line now reads `[done/done] N steps · Mms · tokens IN/OUT[ (cache_r X, cache_w Y)] · $0.XXXX`. Cache columns elided when zero so OpenAI/Gemini users don't get noise.
+- `src/cli/output/json.ts` — unchanged; passes `session_finished` through and `result.usage` / `result.costUsd` ride along automatically. New test pins the NDJSON shape.
+
+**New tests (+62 over M1):**
+- `tests/providers/cost.test.ts` — 9 cases: empty usage, input/output composition, cached_input rate honored, fallback to input rate when cached_input undeclared, cache_write rate honored, fallback for cache_creation, all-four composition, addUsage commutativity.
+- `tests/providers/anthropic-stream.test.ts` — 2 new: usage extracted from message_start + message_delta with cache splits; zeroed usage event when SDK omits the payload.
+- `tests/providers/openai-stream.test.ts` — 1 new: cached_tokens split out of prompt_tokens (matches Anthropic semantics).
+- `tests/providers/google-stream.test.ts` — 1 new: cachedContentTokenCount split out of promptTokenCount.
+- `tests/harness/loop.test.ts` — 3 new: aggregates usage across turns + persists to `sessions.total_cost_usd`; per-message tokens + cost on assistant rows; `session_finished` event carries the same usage/cost as the result.
+- `tests/cli/output-plain.test.ts` — 1 new: summary shows cache columns when non-zero; existing summary tests updated to assert `tokens N/M` + `$0.XXXX`.
+- `tests/cli/output-json.test.ts` — assert NDJSON `session_finished` line contains `result.usage.input` and `result.costUsd`.
+- All 3 stream test files gained a `collectNonUsage` helper so the existing exact-sequence assertions (~30 tests) didn't need a `usage` event boilerplate — only the dedicated usage tests use raw `collect`.
+- Total suite: **396 pass / 7 skip / 867 expect() calls** in ~1.4s.
+
+**Decisions:**
+- **`usage` is its own canonical `StreamEvent` kind**, not a field tacked onto `stop`. Adapters emit it once per turn between the last content event and `stop`; `collectStep` accumulates it independently. Tying usage to `stop` would force every test that asserts a `stop` shape to know about usage; making it its own event lets renderers / collectors choose to ignore it.
+- **`prompt_tokens − cached_tokens` split for OpenAI/Gemini** at the adapter, not the cost computer. OpenAI's `prompt_tokens` is the *full* prompt count including cache hits; Anthropic's `input_tokens` is *non-cached only*. Normalizing to Anthropic's semantics here means `computeCost` doesn't need a per-provider branch — it just multiplies by the declared rate.
+- **`cost_per_1k_cached_input` / `cost_per_1k_cache_write` fall through to `cost_per_1k_input`** when undeclared. Charging the raw input rate is loud failure — overcounts vs. the discount tier rather than undercounting silently to zero. A model entry that forgets to declare cache rates will show inflated cost and surface the gap in `agent audit costs`.
+- **OpenAI provider opts into `stream_options.include_usage` unconditionally.** Without the flag, the final chunk has no `usage` field. A handful of compatibility endpoints (early Azure, some OpenRouter setups) ignore it; the normalizer falls back to a zeroed UsageInfo so the harness still sees a usage event and `costUsd` reads as 0 instead of crashing.
+- **Storage migration is additive (`ALTER TABLE` for two columns).** Reusing existing `messages.tokens_in/tokens_out/cached_tokens` rather than introducing a parallel `usage_events` table — keeps queries ergonomic (`SELECT cost_usd FROM messages WHERE session_id = ?`). Per-message `cost_usd` redundant with `tokens × pricing` but stored anyway because `audit costs --by tool` (spec §1) shouldn't have to re-derive pricing every query.
+- **Mock provider in tests gains `capsOverride`** for cost-bearing tests (`cost_per_1k_input: 0` was the default; that hides cost bugs). Existing tests stay zero-cost.
+- **`collectNonUsage` helper** in stream tests instead of updating ~30 inline arrays. The tests are pinning canonical event order; usage arriving as a new event would force boilerplate without testing anything different. Dedicated usage tests use raw `collect`.
+
+**Out of scope (still M2+):**
+- `agent audit costs --by tool / --by session` CLI subcommands (spec §1) — needs M2 Step on session listing/inspection
+- Compaction (next Step — uses these usage numbers to decide trigger threshold)
+- Cache breakpoint hints to the provider (CONTEXT_TUNING)
+- Real-network test fixtures for usage extraction (deferred to evals)
+- `agent stats --tokens` discrepancy detector (TOKEN_TUNING §8.3) — needs local tokenizer (M5)
+- Honest pricing values in capabilities — they're still illustrative per `PROVIDERS.md §5`; dynamic pricing config deferred
+
+**Code-review fixes folded in before commit:**
+- **Anthropic cache_write rates declared explicitly.** All three Anthropic models (`opus-4-7`, `sonnet-4-6`, `haiku-4-5`) now carry `cost_per_1k_cache_write` at 1.25× their input rate per Anthropic's public pricing. Before this fix, `computeCost` fell back to the raw input rate for cache-creation tokens, undercounting Anthropic cache-write turns by 25%. The first review pass mislabeled the fallback as "overcount" — it was the opposite direction.
+- **`computeCost` docstring rewrites the cache-fallback decision honestly.** Says "undercounts on Anthropic, declare the rate explicitly" instead of the original "overcounts slightly" claim.
+- **OpenAI `stream_options.include_usage` is opt-out via `CreateOpenAIProviderOptions.includeUsage`.** Some compat endpoints (older Azure deployments, certain proxies) reject unknown params with HTTP 400; the option lets users disable telemetry rather than fail the run. Default stays `true`. Two new tests pin both branches: that the param is forwarded by default, and that `includeUsage: false` omits it.
+- **`mergeUsage` (Anthropic adapter) uses `Math.max` instead of overwrite.** Today's SDK reports cumulative; if a future shift to incremental deltas (or interim partial counts) ever happens, the largest-seen value wins instead of a smaller late event silently shrinking totals. Regression test pins it.
+- **OpenAI normalizer extracts usage AFTER emitting `start`.** Reading `chunk.usage` first was harmless today (the usage-only chunk has empty choices and falls through), but the canonical contract is "start-first"; reordering keeps the invariant.
+- **Harness writes NULL token/cost columns when no `usage` event was seen.** New `usageSeen` flag on `CollectedStep` flips `true` only when an actual `kind: 'usage'` event arrived. Lets downstream analytics (`agent audit costs`) tell "adapter never reported" from "turn measured zero". Three new collect.test.ts cases cover the flag transitions; loop test asserts NULL persistence.
+- **`formatCost` is magnitude-aware.** Sub-$1 keeps 4 decimals (real billing precision matters there); $1–$100 uses 3; $100+ uses 2. Long sessions no longer print `$50.0000`-style cosmetic noise. Test sweeps three ranges.
+- **`collectNonUsage` consolidated** into `tests/providers/_stream-helpers.ts` instead of duplicated across 3 files. Imported by all stream tests.
+- **Migration 003 carries a note** that `cost_usd` is intentionally a write-time snapshot, not a recomputable derivation — historical rows preserve the rate the user was actually billed at, even if pricing config drifts later.
+
+**Pending:** none for this step.
+
+**Next:** M2 / Step 2 — Output sanitization (CSI escape stripping in `bash` / `read_file` / `grep` outputs before content reaches the model). Small, isolated, closes a security gap from M1. After that, compaction.
+
+---
+
 ## [2026-04-27] M1 / Step 7 — Hardening pass
 
 Addresses the 10-issue review of M1: real reliability/security gaps caught

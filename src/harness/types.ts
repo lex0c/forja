@@ -1,5 +1,5 @@
 import type { Decision, PermissionEngine } from '../permissions/index.ts';
-import type { Provider, StreamEvent } from '../providers/index.ts';
+import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
 import type { DB } from '../storage/index.ts';
 import type { ToolRegistry } from '../tools/index.ts';
 
@@ -85,6 +85,10 @@ export interface HarnessResult {
   sessionId: string;
   steps: number;
   durationMs: number;
+  // Aggregated token usage across all provider turns this run.
+  usage: UsageInfo;
+  // Total cost computed from `usage` × the provider's pricing.
+  costUsd: number;
   // Final assistant message id, if any was produced.
   lastMessageId?: string;
   // Optional human-readable detail for diagnostics (e.g., the provider

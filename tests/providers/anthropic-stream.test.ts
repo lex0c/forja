@@ -3,7 +3,7 @@ import {
   type RawAnthropicEvent,
   normalizeAnthropicStream,
 } from '../../src/providers/anthropic/stream.ts';
-import type { StreamEvent } from '../../src/providers/types.ts';
+import { collect, collectNonUsage } from './_stream-helpers.ts';
 
 const fromEvents = (events: RawAnthropicEvent[]): AsyncIterable<RawAnthropicEvent> => {
   return (async function* () {
@@ -11,15 +11,9 @@ const fromEvents = (events: RawAnthropicEvent[]): AsyncIterable<RawAnthropicEven
   })();
 };
 
-const collect = async (stream: AsyncIterable<StreamEvent>): Promise<StreamEvent[]> => {
-  const out: StreamEvent[] = [];
-  for await (const e of stream) out.push(e);
-  return out;
-};
-
 describe('normalizeAnthropicStream', () => {
   test('text-only message: start, text deltas, stop', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeAnthropicStream(
         fromEvents([
           { type: 'message_start', message: { id: 'msg_1' } },
@@ -41,7 +35,7 @@ describe('normalizeAnthropicStream', () => {
   });
 
   test('tool_use: start, partial json deltas, stop with parsed args', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeAnthropicStream(
         fromEvents([
           { type: 'message_start', message: { id: 'msg_2' } },
@@ -77,7 +71,7 @@ describe('normalizeAnthropicStream', () => {
   });
 
   test('empty tool_use args produce final_args = {}', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeAnthropicStream(
         fromEvents([
           {
@@ -93,7 +87,7 @@ describe('normalizeAnthropicStream', () => {
   });
 
   test('malformed tool_use json emits an error event and drops the tool_use_stop', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeAnthropicStream(
         fromEvents([
           {
@@ -120,7 +114,7 @@ describe('normalizeAnthropicStream', () => {
   });
 
   test('tool_use args that decode to a non-object are rejected', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeAnthropicStream(
         fromEvents([
           {
@@ -143,7 +137,7 @@ describe('normalizeAnthropicStream', () => {
   });
 
   test('thinking_delta passes through; signature_delta is dropped', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeAnthropicStream(
         fromEvents([
           { type: 'content_block_start', index: 0, content_block: { type: 'thinking' } },
@@ -167,7 +161,7 @@ describe('normalizeAnthropicStream', () => {
   });
 
   test('multiple content blocks: text then tool_use', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeAnthropicStream(
         fromEvents([
           { type: 'message_start', message: { id: 'm' } },
@@ -205,7 +199,7 @@ describe('normalizeAnthropicStream', () => {
   });
 
   test('parallel tool_use blocks track partial args per index', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeAnthropicStream(
         fromEvents([
           {
@@ -241,7 +235,7 @@ describe('normalizeAnthropicStream', () => {
   });
 
   test('unknown stop_reason falls back to end_turn', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeAnthropicStream(
         fromEvents([
           { type: 'message_delta', delta: { stop_reason: 'something_new' } },
@@ -253,12 +247,14 @@ describe('normalizeAnthropicStream', () => {
   });
 
   test('defaults to end_turn when no stop_reason is ever set', async () => {
-    const events = await collect(normalizeAnthropicStream(fromEvents([{ type: 'message_stop' }])));
+    const events = await collectNonUsage(
+      normalizeAnthropicStream(fromEvents([{ type: 'message_stop' }])),
+    );
     expect(events).toContainEqual({ kind: 'stop', reason: 'end_turn' });
   });
 
   test('null stop_reason in a later delta does not clobber an earlier valid one', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeAnthropicStream(
         fromEvents([
           { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
@@ -271,7 +267,7 @@ describe('normalizeAnthropicStream', () => {
   });
 
   test('omitted stop_reason is treated as no signal', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeAnthropicStream(
         fromEvents([
           { type: 'message_delta', delta: { stop_reason: 'max_tokens' } },
@@ -281,5 +277,82 @@ describe('normalizeAnthropicStream', () => {
       ),
     );
     expect(events).toContainEqual({ kind: 'stop', reason: 'max_tokens' });
+  });
+
+  test('emits a usage event with input/output/cache splits from message_start + message_delta', async () => {
+    const events = await collect(
+      normalizeAnthropicStream(
+        fromEvents([
+          {
+            type: 'message_start',
+            message: {
+              id: 'msg_u',
+              usage: {
+                input_tokens: 200,
+                cache_read_input_tokens: 1000,
+                cache_creation_input_tokens: 500,
+                output_tokens: 0,
+              },
+            },
+          },
+          { type: 'content_block_start', index: 0, content_block: { type: 'text' } },
+          { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } },
+          { type: 'content_block_stop', index: 0 },
+          {
+            type: 'message_delta',
+            delta: { stop_reason: 'end_turn' },
+            usage: { output_tokens: 17 },
+          },
+          { type: 'message_stop' },
+        ]),
+      ),
+    );
+    const u = events.find((e) => e.kind === 'usage');
+    if (u?.kind !== 'usage') throw new Error('expected usage event');
+    expect(u.usage).toEqual({ input: 200, output: 17, cache_read: 1000, cache_creation: 500 });
+  });
+
+  test('mergeUsage takes the running max so a partial later event cannot shrink totals', async () => {
+    // Defensive against a hypothetical SDK shift to incremental deltas
+    // (or interim message_deltas with partial counts). With Math.max,
+    // the stream still emits the largest cumulative reading we ever saw
+    // — never a smaller "interim" snapshot reported after a larger one.
+    const events = await collect(
+      normalizeAnthropicStream(
+        fromEvents([
+          {
+            type: 'message_start',
+            message: { id: 'msg_x', usage: { input_tokens: 200, output_tokens: 0 } },
+          },
+          {
+            type: 'message_delta',
+            delta: { stop_reason: 'end_turn' },
+            usage: { output_tokens: 50 },
+          },
+          // Pathological interim event: smaller cumulative output than already seen.
+          { type: 'message_delta', delta: {}, usage: { output_tokens: 30 } },
+          { type: 'message_stop' },
+        ]),
+      ),
+    );
+    const u = events.find((e) => e.kind === 'usage');
+    if (u?.kind !== 'usage') throw new Error('expected usage event');
+    expect(u.usage.output).toBe(50);
+    expect(u.usage.input).toBe(200);
+  });
+
+  test('emits a zeroed usage event when the SDK omits usage payloads', async () => {
+    const events = await collect(
+      normalizeAnthropicStream(
+        fromEvents([
+          { type: 'message_start', message: { id: 'msg_z' } },
+          { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+          { type: 'message_stop' },
+        ]),
+      ),
+    );
+    const u = events.find((e) => e.kind === 'usage');
+    if (u?.kind !== 'usage') throw new Error('expected usage event');
+    expect(u.usage).toEqual({ input: 0, output: 0, cache_read: 0, cache_creation: 0 });
   });
 });

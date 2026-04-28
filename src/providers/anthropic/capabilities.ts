@@ -15,12 +15,17 @@ const ANTHROPIC_BASE = {
 
 // Costs come from PROVIDERS.md §5 verbatim. The spec acknowledges these are
 // illustrative; real pricing should live in a dynamic config (deferred).
+//
+// Cache write rates follow Anthropic's public 5-min cache pricing of 1.25×
+// the input rate — without declaring them, `computeCost` falls back to the
+// raw input rate and undercounts cache-creation turns by 25%.
 export const ANTHROPIC_CAPS: Record<string, ProviderCapabilities> = {
   'claude-opus-4-7': {
     ...ANTHROPIC_BASE,
     cost_per_1k_input: 15.0,
     cost_per_1k_output: 75.0,
     cost_per_1k_cached_input: 1.5,
+    cost_per_1k_cache_write: 18.75,
     notes: ['frontier model; best for security-audit and deliberate reasoning workflows'],
   },
   'claude-sonnet-4-6': {
@@ -28,6 +33,7 @@ export const ANTHROPIC_CAPS: Record<string, ProviderCapabilities> = {
     cost_per_1k_input: 3.0,
     cost_per_1k_output: 15.0,
     cost_per_1k_cached_input: 0.3,
+    cost_per_1k_cache_write: 3.75,
     notes: ['default for autonomous profile; balanced quality/cost'],
   },
   'claude-haiku-4-5': {
@@ -35,6 +41,7 @@ export const ANTHROPIC_CAPS: Record<string, ProviderCapabilities> = {
     cost_per_1k_input: 0.25,
     cost_per_1k_output: 1.25,
     cost_per_1k_cached_input: 0.025,
+    cost_per_1k_cache_write: 0.3125,
     notes: ['cheap and fast; default for compaction and one-shot prompts'],
   },
 };

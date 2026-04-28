@@ -16,6 +16,12 @@ export interface CreateOpenAIProviderOptions {
   baseURL?: string;
   // Inject a pre-built SDK client (test seam).
   client?: OpenAI;
+  // Send `stream_options: { include_usage: true }` so the final chunk
+  // carries token counts. OpenAI itself supports this since 2024; some
+  // OpenAI-compatible endpoints (older Azure deployments, certain proxies)
+  // reject unknown params with HTTP 400. Set this to `false` if you hit
+  // that — cost tracking will report zeros, but the run will succeed.
+  includeUsage?: boolean;
 }
 
 interface OpenAIToolCall {
@@ -154,6 +160,8 @@ export const createOpenAIProvider = (
     client = new OpenAI(sdkOpts);
   }
 
+  const includeUsage = options.includeUsage ?? true;
+
   const generate = async function* (req: GenerateRequest): AsyncIterable<StreamEvent> {
     const messages: OpenAIMessage[] = [];
     if (req.system !== undefined) {
@@ -169,6 +177,12 @@ export const createOpenAIProvider = (
       stream: true,
       max_tokens: req.max_tokens,
     };
+    if (includeUsage) {
+      // Opt into the final-chunk usage payload so we can compute cost.
+      // Documented as configurable in CreateOpenAIProviderOptions because
+      // some compat endpoints reject the param outright.
+      params.stream_options = { include_usage: true };
+    }
     if (req.tools !== undefined) params.tools = toOpenAITools(req.tools);
     if (req.temperature !== undefined) params.temperature = req.temperature;
     if (req.stop_sequences !== undefined) params.stop = req.stop_sequences;

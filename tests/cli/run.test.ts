@@ -89,7 +89,15 @@ afterEach(() => {
 describe('exitCodeFor', () => {
   test('done → 0', () => {
     expect(
-      exitCodeFor({ status: 'done', reason: 'done', sessionId: 's', steps: 1, durationMs: 1 }),
+      exitCodeFor({
+        status: 'done',
+        reason: 'done',
+        sessionId: 's',
+        steps: 1,
+        durationMs: 1,
+        usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+        costUsd: 0,
+      }),
     ).toBe(0);
   });
   test('exhausted → 2', () => {
@@ -100,6 +108,8 @@ describe('exitCodeFor', () => {
         sessionId: 's',
         steps: 1,
         durationMs: 1,
+        usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+        costUsd: 0,
       }),
     ).toBe(2);
   });
@@ -111,6 +121,8 @@ describe('exitCodeFor', () => {
         sessionId: 's',
         steps: 1,
         durationMs: 1,
+        usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+        costUsd: 0,
       }),
     ).toBe(130);
   });
@@ -122,6 +134,8 @@ describe('exitCodeFor', () => {
         sessionId: 's',
         steps: 1,
         durationMs: 1,
+        usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+        costUsd: 0,
       }),
     ).toBe(1);
   });

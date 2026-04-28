@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
   ProviderContentBlock,
@@ -106,6 +107,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   let consecutiveErrors = 0;
   let sessionId = '';
   let lastMessageId = '';
+  // Session-wide totals. Each completed provider turn adds its usage and
+  // its computed cost; we persist the aggregate to `sessions.total_cost_usd`
+  // on `completeSession` and surface both in the result + session_finished
+  // event so renderers can show "$X.XX, N tokens" without re-querying.
+  let totalUsage = emptyUsage();
+  let totalCostUsd = 0;
 
   // Distinguish wall-clock from user abort — both use `signal.aborted` but
   // the user wants different exit reasons.
@@ -118,7 +125,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     // no row to mark and SQLite would just throw a foreign-key error.
     if (sessionId.length > 0) {
       try {
-        completeSession(config.db, sessionId, exitToStatus[reason], 0);
+        completeSession(config.db, sessionId, exitToStatus[reason], totalCostUsd);
       } catch {
         // Storage already broken; nothing useful to do beyond return the
         // result so the caller knows the run is over.
@@ -130,6 +137,8 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       sessionId,
       steps,
       durationMs: Date.now() - startMs,
+      usage: totalUsage,
+      costUsd: totalCostUsd,
       lastMessageId,
     };
     if (detail !== undefined) result.detail = detail;
@@ -226,11 +235,25 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         assistantContent.push(block);
       }
 
+      const turnCostUsd = computeCost(config.provider.capabilities, collected.usage);
+      totalUsage = addUsage(totalUsage, collected.usage);
+      totalCostUsd += turnCostUsd;
+
+      // When the adapter never emitted a `usage` event, persist NULL on
+      // the token/cost columns instead of zeroes. Future analytics can
+      // then distinguish "no measurement" from "measured zero" — both
+      // are legal but mean different things (e.g., a stream that aborted
+      // before message_stop vs. a turn that genuinely produced nothing).
       const assistantMsg = appendMessage(config.db, {
         sessionId,
         role: 'assistant',
         parentId: lastMessageId,
         content: assistantContent.length > 0 ? assistantContent : '',
+        tokensIn: collected.usageSeen ? collected.usage.input : null,
+        tokensOut: collected.usageSeen ? collected.usage.output : null,
+        cachedTokens: collected.usageSeen ? collected.usage.cache_read : null,
+        cacheCreationTokens: collected.usageSeen ? collected.usage.cache_creation : null,
+        costUsd: collected.usageSeen ? turnCostUsd : null,
       });
       lastMessageId = assistantMsg.id;
       if (assistantContent.length > 0) {

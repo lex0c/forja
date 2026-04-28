@@ -12,6 +12,8 @@ export interface Message {
   tokensIn: number | null;
   tokensOut: number | null;
   cachedTokens: number | null;
+  cacheCreationTokens: number | null;
+  costUsd: number | null;
   createdAt: number;
 }
 
@@ -24,6 +26,8 @@ interface MessageRow {
   tokens_in: number | null;
   tokens_out: number | null;
   cached_tokens: number | null;
+  cache_creation_tokens: number | null;
+  cost_usd: number | null;
   created_at: number;
 }
 
@@ -36,6 +40,8 @@ const fromRow = (row: MessageRow): Message => ({
   tokensIn: row.tokens_in,
   tokensOut: row.tokens_out,
   cachedTokens: row.cached_tokens,
+  cacheCreationTokens: row.cache_creation_tokens,
+  costUsd: row.cost_usd,
   createdAt: row.created_at,
 });
 
@@ -48,6 +54,8 @@ export interface AppendMessageInput {
   tokensIn?: number | null;
   tokensOut?: number | null;
   cachedTokens?: number | null;
+  cacheCreationTokens?: number | null;
+  costUsd?: number | null;
   createdAt?: number;
 }
 
@@ -58,6 +66,8 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
   const tokensIn = input.tokensIn ?? null;
   const tokensOut = input.tokensOut ?? null;
   const cachedTokens = input.cachedTokens ?? null;
+  const cacheCreationTokens = input.cacheCreationTokens ?? null;
+  const costUsd = input.costUsd ?? null;
   const content = JSON.stringify(input.content);
 
   // The schema FK only enforces that parent_id exists in `messages`, not that
@@ -81,8 +91,9 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
 
   db.query(
     `INSERT INTO messages
-     (id, session_id, parent_id, role, content, tokens_in, tokens_out, cached_tokens, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     (id, session_id, parent_id, role, content,
+      tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     input.sessionId,
@@ -92,6 +103,8 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
     tokensIn,
     tokensOut,
     cachedTokens,
+    cacheCreationTokens,
+    costUsd,
     createdAt,
   );
   return {
@@ -103,6 +116,8 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
     tokensIn,
     tokensOut,
     cachedTokens,
+    cacheCreationTokens,
+    costUsd,
     createdAt,
   };
 };
@@ -111,7 +126,7 @@ export const getMessage = (db: DB, id: string): Message | null => {
   const row = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, created_at
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at
        FROM messages WHERE id = ?`,
     )
     .get(id) as MessageRow | null;
@@ -122,7 +137,7 @@ export const listMessagesBySession = (db: DB, sessionId: string): Message[] => {
   const rows = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
-              tokens_in, tokens_out, cached_tokens, created_at
+              tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at
        FROM messages
        WHERE session_id = ?
        ORDER BY created_at ASC, id ASC`,

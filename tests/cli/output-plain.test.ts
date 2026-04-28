@@ -138,12 +138,16 @@ describe('plain renderer', () => {
         sessionId: 's',
         steps: 3,
         durationMs: 1234,
+        usage: { input: 100, output: 50, cache_read: 0, cache_creation: 0 },
+        costUsd: 0.0123,
       },
     });
     const out = cap.err.join('');
     expect(out).toContain('[done/done]');
     expect(out).toContain('3 steps');
     expect(out).toContain('1234ms');
+    expect(out).toContain('tokens 100/50');
+    expect(out).toContain('$0.0123');
   });
 
   test('session_finished includes detail when present', () => {
@@ -156,12 +160,57 @@ describe('plain renderer', () => {
         sessionId: 's',
         steps: 1,
         durationMs: 50,
+        usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+        costUsd: 0,
         detail: '5 consecutive tool errors',
       },
     });
     const out = cap.err.join('');
     expect(out).toContain('[error/maxToolErrors]');
     expect(out).toContain('5 consecutive tool errors');
+  });
+
+  test('session_finished cost format uses 4 decimals under $1, 3 between $1-$100, 2 above', () => {
+    const sample = (costUsd: number): string => {
+      const { renderer, cap } = make();
+      renderer.onEvent({
+        type: 'session_finished',
+        result: {
+          status: 'done',
+          reason: 'done',
+          sessionId: 's',
+          steps: 1,
+          durationMs: 1,
+          usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+          costUsd,
+        },
+      });
+      return cap.err.join('');
+    };
+    expect(sample(0.0009)).toContain('$0.0009');
+    expect(sample(2.5)).toContain('$2.500');
+    expect(sample(2.5)).not.toContain('$2.5000');
+    expect(sample(150)).toContain('$150.00');
+    expect(sample(150)).not.toContain('$150.000');
+  });
+
+  test('session_finished shows cache columns when non-zero', () => {
+    const { renderer, cap } = make();
+    renderer.onEvent({
+      type: 'session_finished',
+      result: {
+        status: 'done',
+        reason: 'done',
+        sessionId: 's',
+        steps: 1,
+        durationMs: 10,
+        usage: { input: 200, output: 80, cache_read: 1000, cache_creation: 500 },
+        costUsd: 0.005,
+      },
+    });
+    const out = cap.err.join('');
+    expect(out).toContain('cache_r 1000');
+    expect(out).toContain('cache_w 500');
   });
 
   test('inserts newline between text streaming and tool indicator', () => {

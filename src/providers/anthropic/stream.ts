@@ -1,10 +1,21 @@
-import type { StopReason, StreamEvent } from '../types.ts';
+import type { StopReason, StreamEvent, UsageInfo } from '../types.ts';
+
+// Anthropic usage shape. `input_tokens` is the prompt minus cache hits;
+// `cache_creation_input_tokens` is what was written to cache this turn (full
+// price tier); `cache_read_input_tokens` is what was read from cache (cheap
+// tier). All can be undefined on older API versions or when caching is off.
+export interface RawAnthropicUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+}
 
 // Minimal structural type covering the Anthropic raw stream events we read.
 // Defined locally so tests can construct events without depending on the SDK
 // type surface; the real SDK events are structurally compatible.
 export type RawAnthropicEvent =
-  | { type: 'message_start'; message: { id: string } }
+  | { type: 'message_start'; message: { id: string; usage?: RawAnthropicUsage } }
   | {
       type: 'content_block_start';
       index: number;
@@ -23,7 +34,11 @@ export type RawAnthropicEvent =
         | { type: 'signature_delta'; signature: string };
     }
   | { type: 'content_block_stop'; index: number }
-  | { type: 'message_delta'; delta: { stop_reason?: string | null } }
+  | {
+      type: 'message_delta';
+      delta: { stop_reason?: string | null };
+      usage?: RawAnthropicUsage;
+    }
   | { type: 'message_stop' };
 
 interface ToolUseInProgress {
@@ -53,11 +68,40 @@ export async function* normalizeAnthropicStream(
 ): AsyncIterable<StreamEvent> {
   const toolUses = new Map<number, ToolUseInProgress>();
   let stopReason: StopReason = 'end_turn';
+  // Anthropic splits usage across two events: input/cache numbers ride
+  // `message_start.message.usage`; output_tokens lands on the final
+  // `message_delta.usage`. Accumulate then emit a single `usage` event
+  // right before `stop` so the harness sees one canonical row per turn.
+  const usage: UsageInfo = { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
+
+  // Anthropic reports CUMULATIVE usage in both message_start and message_delta
+  // today, so a straight assignment would also be correct. We keep the
+  // running max instead so a hypothetical SDK shift to incremental deltas
+  // (or an interim event reporting partial counts) can't silently shrink
+  // the totals — `Math.max` is monotonic over cumulative streams and
+  // recovers the largest-seen value over delta streams as long as one
+  // event ever carries the full count.
+  const mergeUsage = (u: RawAnthropicUsage | undefined): void => {
+    if (u === undefined) return;
+    if (typeof u.input_tokens === 'number') {
+      usage.input = Math.max(usage.input, u.input_tokens);
+    }
+    if (typeof u.output_tokens === 'number') {
+      usage.output = Math.max(usage.output, u.output_tokens);
+    }
+    if (typeof u.cache_read_input_tokens === 'number') {
+      usage.cache_read = Math.max(usage.cache_read, u.cache_read_input_tokens);
+    }
+    if (typeof u.cache_creation_input_tokens === 'number') {
+      usage.cache_creation = Math.max(usage.cache_creation, u.cache_creation_input_tokens);
+    }
+  };
 
   for await (const event of raw) {
     switch (event.type) {
       case 'message_start':
         yield { kind: 'start', message_id: event.message.id };
+        mergeUsage(event.message.usage);
         break;
 
       case 'content_block_start':
@@ -134,9 +178,11 @@ export async function* normalizeAnthropicStream(
         if (typeof event.delta.stop_reason === 'string') {
           stopReason = mapStopReason(event.delta.stop_reason);
         }
+        mergeUsage(event.usage);
         break;
 
       case 'message_stop':
+        yield { kind: 'usage', usage };
         yield { kind: 'stop', reason: stopReason };
         break;
     }
