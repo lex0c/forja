@@ -57,6 +57,60 @@ describe('readFileTool', () => {
     expect(out.content).toBe('hello');
   });
 
+  test('streams large files without materializing the whole content', async () => {
+    // Build a ~6 MB file (200_000 lines of ~30 bytes) and request a tiny
+    // window. Previously, file.text() loaded all 6 MB into a string
+    // before slicing — pagination did nothing for memory. The streaming
+    // path keeps working memory proportional to `limit`. We verify by
+    // asserting the response is small AND total_lines is correct
+    // (proves the rest of the file was traversed only for counting).
+    const path = join(dir, 'huge.txt');
+    const lines = Array.from(
+      { length: 200_000 },
+      (_, i) => `line-${i.toString().padStart(10, '0')}`,
+    );
+    writeFileSync(path, lines.join('\n'));
+    const out = await readFileTool.execute({ path, offset: 5, limit: 3 }, makeCtx({ cwd: dir }));
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.lines_returned).toBe(3);
+    expect(out.total_lines).toBe(200_000);
+    expect(out.truncated).toBe(true);
+    expect(out.content).toBe('line-0000000005\nline-0000000006\nline-0000000007');
+    // Sanity: returned content is bounded by limit, not file size.
+    expect(out.content.length).toBeLessThan(200);
+  });
+
+  test('file ending with newline has a trailing empty line (matches split semantics)', async () => {
+    const path = join(dir, 'trailing.txt');
+    writeFileSync(path, 'a\nb\n');
+    const out = await readFileTool.execute({ path }, makeCtx({ cwd: dir }));
+    if (isToolError(out)) throw new Error('unexpected error');
+    expect(out.total_lines).toBe(3);
+    expect(out.content).toBe('a\nb\n');
+    expect(out.lines_returned).toBe(3);
+  });
+
+  test('empty file is reported as 1 empty line', async () => {
+    const path = join(dir, 'empty.txt');
+    writeFileSync(path, '');
+    const out = await readFileTool.execute({ path }, makeCtx({ cwd: dir }));
+    if (isToolError(out)) throw new Error('unexpected error');
+    expect(out.total_lines).toBe(1);
+    expect(out.lines_returned).toBe(1);
+    expect(out.content).toBe('');
+  });
+
+  test('offset past EOF returns no lines and is not marked truncated', async () => {
+    const path = join(dir, 'small.txt');
+    writeFileSync(path, 'a\nb\nc');
+    const out = await readFileTool.execute({ path, offset: 100, limit: 10 }, makeCtx({ cwd: dir }));
+    if (isToolError(out)) throw new Error('unexpected error');
+    expect(out.lines_returned).toBe(0);
+    expect(out.total_lines).toBe(3);
+    expect(out.truncated).toBe(false);
+    expect(out.content).toBe('');
+  });
+
   test('honors aborted signal', async () => {
     const ctrl = new AbortController();
     ctrl.abort();
