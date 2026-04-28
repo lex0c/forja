@@ -1,8 +1,10 @@
+import { emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
   Provider,
   ProviderContentBlock,
   ProviderMessage,
+  UsageInfo,
 } from '../providers/index.ts';
 import { abortableIterable } from './abortable.ts';
 import { collectStep } from './collect.ts';
@@ -53,6 +55,19 @@ export interface CompactionResult {
   // Number of original messages folded into the summary (counts the
   // middle slice that got replaced; excludes preserved goal + tail).
   foldedCount: number;
+  // Token usage for the compaction LLM call itself. Zero when
+  // strategy='skipped' (no call was made). On 'fallback' it carries
+  // whatever partial usage the failed call reported before throwing
+  // (some providers emit usage events even on stream errors). The
+  // caller MUST fold this into session totals — a compaction call is
+  // a billed provider request and ignoring it underreports spend.
+  usage: UsageInfo;
+  // Whether the compaction call's stream reported usage telemetry.
+  // False on skipped (no call) and on fallback paths where usage
+  // never arrived. The caller should downgrade `usageComplete` when
+  // an LLM-or-fallback strategy reports false, mirroring the
+  // per-turn logic in the harness loop.
+  usageSeen: boolean;
   // Optional reason when strategy='fallback' or 'skipped' — surfaces
   // through the harness event for observability.
   reason?: string;
@@ -118,12 +133,22 @@ const renderTranscriptForSummary = (middle: ProviderMessage[]): string => {
   return lines.join('\n\n');
 };
 
+interface SummaryAttempt {
+  text: string;
+  usage: UsageInfo;
+  usageSeen: boolean;
+  // Stream-level errors (malformed JSON args from a thinking model,
+  // etc). Non-empty list signals the caller should fall back, but we
+  // still hand back any usage that arrived on the way.
+  errors: { code: string; message: string }[];
+}
+
 const callSummaryProvider = async (
   provider: Provider,
   goal: ProviderMessage,
   middle: ProviderMessage[],
   options: CompactionOptions,
-): Promise<string> => {
+): Promise<SummaryAttempt> => {
   const goalText =
     typeof goal.content === 'string'
       ? goal.content
@@ -147,23 +172,21 @@ const callSummaryProvider = async (
     temperature: 0,
   };
 
-  // Stream the response and collect — we only care about the text.
-  // Errors propagate to the caller, which falls back to deterministic
-  // elision. signal forwards the harness's combined abort signal so
-  // a Ctrl+C or wall-clock timeout interrupts the summary call too.
+  // Stream the response and collect. signal forwards the harness's
+  // combined abort signal so Ctrl+C or wall-clock timeout
+  // interrupts the summary call. A `provider.generate` throw
+  // propagates — caller treats that as zero-usage fallback.
   const stream =
     options.signal !== undefined
       ? abortableIterable(provider.generate(req), options.signal)
       : provider.generate(req);
   const collected = await collectStep(stream);
-  if (collected.errors.length > 0) {
-    const detail = collected.errors.map((e) => `${e.code}: ${e.message}`).join('; ');
-    throw new Error(`compaction stream errored: ${detail}`);
-  }
-  if (collected.text.length === 0) {
-    throw new Error('compaction produced empty summary');
-  }
-  return collected.text;
+  return {
+    text: collected.text,
+    usage: collected.usage,
+    usageSeen: collected.usageSeen,
+    errors: collected.errors.map((e) => ({ code: e.code, message: e.message })),
+  };
 };
 
 // Wrap the LLM-produced summary in a synthetic assistant message. Two
@@ -184,11 +207,6 @@ const wrapSummary = (summary: string): ProviderMessage => {
   return { role: 'assistant', content: body };
 };
 
-const wrapFallbackNote = (foldedCount: number, reason: string): ProviderMessage => ({
-  role: 'assistant',
-  content: `${SUMMARY_MARKER_OPEN}\nstrategy: deterministic-fallback\nreason: ${reason}\nfolded_messages: ${foldedCount}\nbody: tool_results in the dropped range have been replaced with size pointers; original payloads remain in the audit log.\n${SUMMARY_MARKER_CLOSE}`,
-});
-
 export const compactMessages = async (
   provider: Provider,
   messages: ProviderMessage[],
@@ -208,13 +226,22 @@ export const compactMessages = async (
       messages,
       strategy: 'skipped',
       foldedCount: 0,
+      usage: emptyUsage(),
+      usageSeen: false,
       reason: `history shorter than goal+fold+tail (${messages.length} < ${safeTail + 2})`,
     };
   }
 
   const goal = messages[0];
   if (goal === undefined) {
-    return { messages, strategy: 'skipped', foldedCount: 0, reason: 'empty history' };
+    return {
+      messages,
+      strategy: 'skipped',
+      foldedCount: 0,
+      usage: emptyUsage(),
+      usageSeen: false,
+      reason: 'empty history',
+    };
   }
 
   // Alignment invariant: the inserted summary message has role
@@ -236,6 +263,8 @@ export const compactMessages = async (
         messages,
         strategy: 'skipped',
         foldedCount: 0,
+        usage: emptyUsage(),
+        usageSeen: false,
         reason: 'cannot align tail without overlapping goal',
       };
     }
@@ -248,29 +277,62 @@ export const compactMessages = async (
       messages,
       strategy: 'skipped',
       foldedCount: 0,
+      usage: emptyUsage(),
+      usageSeen: false,
       reason: 'no middle messages to fold after tail alignment',
     };
   }
   const tailMessages = messages.slice(tailStart);
 
+  // Track usage from the attempt — populated even on the fallback
+  // path so callers can fold partial usage into session totals when
+  // the stream errored AFTER reporting tokens.
+  let attemptUsage: UsageInfo = emptyUsage();
+  let attemptUsageSeen = false;
+
   // Try the LLM summary first.
   try {
-    const summary = await callSummaryProvider(provider, goal, middle, options);
+    const attempt = await callSummaryProvider(provider, goal, middle, options);
+    attemptUsage = attempt.usage;
+    attemptUsageSeen = attempt.usageSeen;
+    if (attempt.errors.length > 0) {
+      const detail = attempt.errors.map((e) => `${e.code}: ${e.message}`).join('; ');
+      throw new Error(`compaction stream errored: ${detail}`);
+    }
+    if (attempt.text.length === 0) {
+      throw new Error('compaction produced empty summary');
+    }
     return {
-      messages: [goal, wrapSummary(summary), ...tailMessages],
+      messages: [goal, wrapSummary(attempt.text), ...tailMessages],
       strategy: 'llm',
       foldedCount: middle.length,
+      usage: attemptUsage,
+      usageSeen: attemptUsageSeen,
     };
   } catch (e) {
     // LLM path failed — apply deterministic elision so the run survives.
     // The original tool_result bodies stay in the SQLite audit log;
-    // the model just sees pointers.
+    // the model just sees pointers. Whatever usage we captured before
+    // the throw still flows through so the caller can charge for
+    // tokens the provider may already have billed.
+    //
+    // No synthetic note inserted between goal and middle: middle[0] is
+    // always assistant (post-alignment, slice(1, tailStart) starts at
+    // the first assistant turn). Wrapping the elided middle with an
+    // assistant-role note would emit `[user_goal, assistant_note,
+    // assistant_middle, ...]` — two consecutive assistants, which
+    // OpenAI's chat API rejects with 400 and Anthropic warns against.
+    // The strategy/reason/foldedCount info is already on the
+    // `compaction_finished` event for observability; the model only
+    // needs to see the pointers, which carry their own context.
     const reason = e instanceof Error ? e.message || e.name : String(e);
     const elided = fallbackCompact(middle);
     return {
-      messages: [goal, wrapFallbackNote(middle.length, reason), ...elided, ...tailMessages],
+      messages: [goal, ...elided, ...tailMessages],
       strategy: 'fallback',
       foldedCount: middle.length,
+      usage: attemptUsage,
+      usageSeen: attemptUsageSeen,
       reason,
     };
   }

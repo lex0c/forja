@@ -956,6 +956,90 @@ describe('runAgent', () => {
     expect(events.find((e) => e.type === 'compaction_started')).toBeUndefined();
   });
 
+  test('compaction usage and cost fold into session totals', async () => {
+    // Compaction call is a billed provider request — its usage must
+    // contribute to result.usage and result.costUsd. Without the
+    // fold, sessions that compact systematically underreport spend.
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const { config } = buildConfig(
+      [
+        // Turn 1: triggers compaction (input over threshold).
+        {
+          tool_uses: [{ id: 't1', name: 'echo', input: { msg: 'hi' } }],
+          stop_reason: 'tool_use',
+          usage: { input: 800, output: 5 },
+        },
+        // Turn 2: this is the COMPACTION call (consumed by the same
+        // mock). Reports its own usage that must be folded.
+        {
+          text: '[compacted_history]\nGOAL: x\n[/compacted_history]',
+          stop_reason: 'end_turn',
+          usage: { input: 300, output: 50 },
+        },
+        // Turn 3: post-compaction agent step.
+        { text: 'done', stop_reason: 'end_turn', usage: { input: 100, output: 5 } },
+      ],
+      {
+        capsOverride: {
+          context_window: 1000,
+          cost_per_1k_input: 1.0,
+          cost_per_1k_output: 2.0,
+        },
+        budget: { compactionThreshold: 0.7, compactionPreserveTail: 1, maxToolErrors: 99 },
+      },
+    );
+    const result = await runAgent({ ...config, onEvent: (e) => events.push(e) });
+    expect(result.status).toBe('done');
+
+    const finished = events.find((e) => e.type === 'compaction_finished');
+    if (finished?.type !== 'compaction_finished') throw new Error('expected event');
+    expect(finished.strategy).toBe('llm');
+    // 300 × 1.0 + 50 × 2.0 = 400 → /1000 = 0.4
+    expect(finished.costUsd).toBeCloseTo(0.4, 6);
+    expect(finished.usage.input).toBe(300);
+    expect(finished.usage.output).toBe(50);
+
+    // Session totals must include all three calls:
+    //   turn 1: 800×1 + 5×2 = 810 → 0.810
+    //   compaction: 0.400
+    //   turn 3: 100×1 + 5×2 = 110 → 0.110
+    //   total: 1.320; tokens summed across all 3
+    expect(result.usage.input).toBe(800 + 300 + 100);
+    expect(result.usage.output).toBe(5 + 50 + 5);
+    expect(result.costUsd).toBeCloseTo(1.32, 6);
+  });
+
+  test('compaction without usage telemetry downgrades usageComplete', async () => {
+    // The compaction LLM call is a billed request — if it doesn't
+    // report usage (compat endpoint, mid-stream failure), the
+    // aggregate flag must flip false even when every other turn
+    // reported. Otherwise renderers present partial totals as
+    // authoritative.
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'echo', input: { msg: 'hi' } }],
+          stop_reason: 'tool_use',
+          usage: { input: 800, output: 5 },
+        },
+        // Compaction call — text but NO usage block. ScriptedStep
+        // omits `usage:` so replayStep skips the kind:'usage' event.
+        {
+          text: '[compacted_history]\nGOAL: x\n[/compacted_history]',
+          stop_reason: 'end_turn',
+        },
+        { text: 'done', stop_reason: 'end_turn', usage: { input: 100, output: 5 } },
+      ],
+      {
+        capsOverride: { context_window: 1000 },
+        budget: { compactionThreshold: 0.7, compactionPreserveTail: 1, maxToolErrors: 99 },
+      },
+    );
+    const result = await runAgent({ ...config, onEvent: (e) => events.push(e) });
+    expect(result.usageComplete).toBe(false);
+  });
+
   test('compaction does NOT trigger after the run is aborted', async () => {
     // If the user aborts between the tool_results push and the
     // trigger check, the harness should skip compaction — the next

@@ -38,6 +38,12 @@ export type HarnessEvent =
       strategy: 'llm' | 'fallback' | 'skipped';
       foldedCount: number;
       durationMs: number;
+      // Usage and cost the compaction call itself incurred. The
+      // summary call is a billed provider request — surfacing it
+      // here lets renderers show "session cost includes $X for
+      // compaction" instead of silently underreporting.
+      usage: UsageInfo;
+      costUsd: number;
       reason?: string;
     }
   | { type: 'session_finished'; result: HarnessResult };

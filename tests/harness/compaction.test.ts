@@ -31,6 +31,20 @@ const replyText = function* (text: string): Iterable<StreamEvent> {
   yield { kind: 'stop', reason: 'end_turn' };
 };
 
+const replyTextWithUsage = (
+  text: string,
+  usage: { input: number; output: number },
+): (() => Iterable<StreamEvent>) =>
+  function* (): Iterable<StreamEvent> {
+    yield { kind: 'start', message_id: 'm' };
+    yield { kind: 'text_delta', text };
+    yield {
+      kind: 'usage',
+      usage: { input: usage.input, output: usage.output, cache_read: 0, cache_creation: 0 },
+    };
+    yield { kind: 'stop', reason: 'end_turn' };
+  };
+
 const mockProvider = (
   reply: ((req: GenerateRequest) => Iterable<StreamEvent>) | Error,
 ): MockProviderHandle => {
@@ -140,6 +154,32 @@ describe('compactMessages — LLM path', () => {
     expect(result.messages).toEqual(short);
   });
 
+  test('returns usage and usageSeen from the LLM call', async () => {
+    // The harness loop folds these into session totals — without
+    // them, compacting sessions silently underreport spend.
+    const handle = mockProvider(
+      replyTextWithUsage('[compacted_history]\nGOAL: x\n[/compacted_history]', {
+        input: 250,
+        output: 40,
+      }),
+    );
+    const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
+    expect(result.strategy).toBe('llm');
+    expect(result.usage.input).toBe(250);
+    expect(result.usage.output).toBe(40);
+    expect(result.usageSeen).toBe(true);
+  });
+
+  test('returns usageSeen=false when the LLM call omits usage', async () => {
+    const handle = mockProvider(() =>
+      replyText('[compacted_history]\nGOAL: x\n[/compacted_history]'),
+    );
+    const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
+    expect(result.strategy).toBe('llm');
+    expect(result.usageSeen).toBe(false);
+    expect(result.usage).toEqual({ input: 0, output: 0, cache_read: 0, cache_creation: 0 });
+  });
+
   test('default maxTokens is 1024 when not specified', async () => {
     const handle = mockProvider(() =>
       replyText('[compacted_history]\nGOAL: x\n[/compacted_history]'),
@@ -217,27 +257,24 @@ describe('compactMessages — LLM path', () => {
 });
 
 describe('compactMessages — deterministic fallback', () => {
-  test('falls back when the provider throws', async () => {
+  test('falls back when the provider throws — preserves middle with elided bodies', async () => {
     const handle = mockProvider(new Error('rate limited'));
     const history = buildHistory(5);
     const result = await compactMessages(handle.provider, history, { preserveTail: 3 });
 
     expect(result.strategy).toBe('fallback');
     expect(result.reason).toContain('rate limited');
-    // Goal preserved + fallback note + middle (with bodies elided) + tail.
+    // Goal preserved + middle (with bodies elided) + tail. NO synthetic
+    // note inserted — that would put an assistant-role message right
+    // after the goal_user, immediately followed by the middle's first
+    // assistant turn (two consecutive assistants → wire-level break).
     expect(result.messages[0]).toBe(history[0]);
     expect(result.messages.slice(-3)).toEqual(history.slice(-3));
     // Middle messages should still be present (not just a single
     // summary), with tool_result bodies replaced by pointers.
-    const fallbackNote = result.messages[1];
-    if (typeof fallbackNote?.content === 'string') {
-      expect(fallbackNote.content).toContain('deterministic-fallback');
-      expect(fallbackNote.content).toContain('rate limited');
-    }
-    // Find a tool_result inside the elided middle; its content should be
-    // a pointer string, not the original body.
-    const middleStart = 2; // after goal + fallback note
+    const middleStart = 1; // immediately after the goal
     const middleEnd = result.messages.length - 3;
+    let foundElidedToolResult = false;
     for (let i = middleStart; i < middleEnd; i++) {
       const m = result.messages[i];
       if (typeof m?.content === 'string') continue;
@@ -245,9 +282,74 @@ describe('compactMessages — deterministic fallback', () => {
         if (block.type === 'tool_result') {
           expect(block.content).toContain('elided');
           expect(block.content).not.toContain('file contents step');
+          foundElidedToolResult = true;
         }
       }
     }
+    expect(foundElidedToolResult).toBe(true);
+  });
+
+  test('fallback path preserves user/assistant alternation (no consecutive same-role)', async () => {
+    // Regression: an earlier version inserted a synthetic
+    // assistant-role note between goal and the elided middle, which
+    // sat next to middle[0] (also assistant) — OpenAI Chat
+    // Completions rejects consecutive assistant messages with 400,
+    // and Anthropic warns against the pattern. Defense: scan the
+    // returned messages and ensure no two adjacent share a role.
+    const handle = mockProvider(new Error('rate limited'));
+    const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
+    expect(result.strategy).toBe('fallback');
+    for (let i = 1; i < result.messages.length; i++) {
+      expect(result.messages[i]?.role).not.toBe(result.messages[i - 1]?.role);
+    }
+  });
+
+  test('llm path preserves user/assistant alternation (no consecutive same-role)', async () => {
+    // Same regression check on the happy path. The summary message
+    // is assistant-role; it must sit between goal_user and a
+    // user-starting tail (the alignment shift handles even
+    // preserveTail values to keep this invariant).
+    const handle = mockProvider(() =>
+      replyText('[compacted_history]\nGOAL: x\n[/compacted_history]'),
+    );
+    const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
+    expect(result.strategy).toBe('llm');
+    for (let i = 1; i < result.messages.length; i++) {
+      expect(result.messages[i]?.role).not.toBe(result.messages[i - 1]?.role);
+    }
+  });
+
+  test('fallback path preserves any partial usage seen before stream errors', async () => {
+    // Some providers emit usage events even when the stream
+    // ultimately errors. The compaction call may have been billed
+    // for those tokens — return them so the caller folds the cost.
+    const handle = mockProvider(function* (): Iterable<StreamEvent> {
+      yield { kind: 'start', message_id: 'm' };
+      yield {
+        kind: 'usage',
+        usage: { input: 200, output: 0, cache_read: 0, cache_creation: 0 },
+      };
+      yield {
+        kind: 'error',
+        code: 'tool_args_parse_error',
+        message: 'malformed',
+        retryable: false,
+      };
+      yield { kind: 'stop', reason: 'end_turn' };
+    });
+    const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
+    expect(result.strategy).toBe('fallback');
+    expect(result.usageSeen).toBe(true);
+    expect(result.usage.input).toBe(200);
+  });
+
+  test('skipped path returns zero usage and usageSeen=false', async () => {
+    const handle = mockProvider(() => replyText('not called'));
+    const short = buildHistory(1);
+    const result = await compactMessages(handle.provider, short, { preserveTail: 3 });
+    expect(result.strategy).toBe('skipped');
+    expect(result.usage).toEqual({ input: 0, output: 0, cache_read: 0, cache_creation: 0 });
+    expect(result.usageSeen).toBe(false);
   });
 
   test('falls back when the stream yields only errors', async () => {

@@ -458,11 +458,33 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // but defensive) sees the new history without reassignment.
           messages.length = 0;
           messages.push(...compaction.messages);
+
+          // Compaction's LLM call (when it ran) is a billed provider
+          // request — fold its usage into session totals. Skipping
+          // this would systematically underreport spend on every
+          // compacting session, defeating the whole point of the
+          // per-session cost tracking. The 'skipped' strategy never
+          // made a call so contributes zero (emptyUsage); 'fallback'
+          // contributes whatever partial usage arrived before the
+          // failure (some providers emit usage on stream errors).
+          const compactionCost = computeCost(config.provider.capabilities, compaction.usage);
+          totalUsage = addUsage(totalUsage, compaction.usage);
+          totalCostUsd += compactionCost;
+          // If the compaction call MADE a provider request (llm or
+          // fallback strategy) but didn't see usage telemetry, the
+          // session total is now a lower bound — same conservative
+          // logic as the per-turn check.
+          if (compaction.strategy !== 'skipped' && !compaction.usageSeen) {
+            usageComplete = false;
+          }
+
           const finishedEvent: HarnessEvent = {
             type: 'compaction_finished',
             strategy: compaction.strategy,
             foldedCount: compaction.foldedCount,
             durationMs: Date.now() - compactStart,
+            usage: compaction.usage,
+            costUsd: compactionCost,
             ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
           };
           safeEmit(config.onEvent, finishedEvent);
