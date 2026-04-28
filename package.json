@@ -26,5 +26,10 @@
     "@types/bun": "latest",
     "typescript": "^5.6.0"
   },
-  "trustedDependencies": ["@biomejs/biome"]
+  "trustedDependencies": ["@biomejs/biome"],
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.91.1",
+    "@google/genai": "^1.50.1",
+    "openai": "^6.34.0"
+  }
 }
