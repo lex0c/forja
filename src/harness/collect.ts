@@ -33,12 +33,23 @@ const empty = (): CollectedStep => ({
 // Drain a provider stream into a single CollectedStep. The normalizer guarantees
 // well-formed event ordering (CONTRACTS §4), so we just accumulate per-kind.
 // Tool use names arrive on `tool_use_start` and don't repeat on `_stop`; we
-// track them in a temp map keyed by id.
-export const collectStep = async (events: AsyncIterable<StreamEvent>): Promise<CollectedStep> => {
+// track them in a temp map keyed by id. The optional `onEvent` callback
+// forwards each raw provider event for live observers (UI renderers).
+export const collectStep = async (
+  events: AsyncIterable<StreamEvent>,
+  onEvent?: (event: StreamEvent) => void,
+): Promise<CollectedStep> => {
   const out = empty();
   const toolNamesById = new Map<string, string>();
 
   for await (const ev of events) {
+    if (onEvent !== undefined) {
+      try {
+        onEvent(ev);
+      } catch {
+        // Renderers throwing must not derail the loop.
+      }
+    }
     switch (ev.kind) {
       case 'start':
         out.message_id = ev.message_id;

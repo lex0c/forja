@@ -35,10 +35,29 @@ describe('cli entry', () => {
     expect(parsed).toEqual({ version: '0.0.0' });
   });
 
-  test('no args exits 1 with stderr pointer to spec', () => {
+  test('no args exits 1 with usage', () => {
     const { code, stderr } = run();
     expect(code).toBe(1);
-    expect(stderr).toContain('not implemented');
-    expect(stderr).toContain('AGENTIC_CLI.md');
+    expect(stderr).toContain('missing prompt');
+    expect(stderr).toContain('Usage:');
+  });
+
+  test('--help exits 0 and prints usage to stdout', () => {
+    const { code, stdout } = run('--help');
+    expect(code).toBe(0);
+    expect(stdout).toContain('Usage:');
+    expect(stdout).toContain('--json');
+  });
+
+  test('unknown flag exits 1 with diagnostic', () => {
+    const { code, stderr } = run('--bogus');
+    expect(code).toBe(1);
+    expect(stderr).toContain('unknown flag');
+  });
+
+  test('unknown model exits 1 with diagnostic from bootstrap', () => {
+    const { code, stderr } = run('--model', 'fake/model', 'hello');
+    expect(code).toBe(1);
+    expect(stderr).toContain('unknown model');
   });
 });

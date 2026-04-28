@@ -15,6 +15,7 @@ export {
   DEFAULT_BUDGET,
   type ExitReason,
   type HarnessConfig,
+  type HarnessEvent,
   type HarnessResult,
   type RunBudget,
 } from './types.ts';

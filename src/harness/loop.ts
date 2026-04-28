@@ -8,8 +8,6 @@ import type {
   ProviderToolUseBlock,
 } from '../providers/index.ts';
 import { appendMessage, completeSession, createSession } from '../storage/index.ts';
-
-type TerminalSessionStatus = 'done' | 'interrupted' | 'exhausted' | 'error';
 import type { ToolContext } from '../tools/index.ts';
 import { collectStep } from './collect.ts';
 import { invokeTool } from './invoke-tool.ts';
@@ -17,9 +15,21 @@ import {
   DEFAULT_BUDGET,
   type ExitReason,
   type HarnessConfig,
+  type HarnessEvent,
   type HarnessResult,
   type RunBudget,
 } from './types.ts';
+
+type TerminalSessionStatus = 'done' | 'interrupted' | 'exhausted' | 'error';
+
+const safeEmit = (onEvent: HarnessConfig['onEvent'], event: HarnessEvent): void => {
+  if (onEvent === undefined) return;
+  try {
+    onEvent(event);
+  } catch {
+    // Renderers throwing must not derail the loop.
+  }
+};
 
 const stableStringify = (obj: unknown): string => {
   if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
@@ -104,8 +114,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       lastMessageId,
     };
     if (detail !== undefined) result.detail = detail;
+    safeEmit(config.onEvent, { type: 'session_finished', result });
     return result;
   };
+
+  safeEmit(config.onEvent, { type: 'session_start', sessionId: session.id });
 
   while (true) {
     if (signal.aborted) return finish('aborted');
@@ -113,6 +126,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     if (Date.now() - startMs >= budget.maxWallClockMs) return finish('maxWallClockMs');
 
     steps += 1;
+    safeEmit(config.onEvent, { type: 'step_start', stepN: steps });
 
     const req: GenerateRequest = {
       model: config.provider.id,
@@ -127,7 +141,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
 
     let collected: Awaited<ReturnType<typeof collectStep>>;
     try {
-      collected = await collectStep(config.provider.generate(req));
+      collected = await collectStep(config.provider.generate(req), (ev) =>
+        safeEmit(config.onEvent, { type: 'provider_event', event: ev }),
+      );
     } catch (e) {
       const detail = e instanceof Error ? e.message || e.name || String(e) : String(e);
       return finish('providerError', detail);
@@ -191,6 +207,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         permissions: config.permissionEngine.view(),
       };
 
+      safeEmit(config.onEvent, {
+        type: 'tool_invoking',
+        toolUseId: tu.id,
+        toolName: tu.name,
+        args: tu.input,
+      });
+
       const inv = await invokeTool(
         {
           toolUseId: tu.id,
@@ -205,6 +228,21 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ctx,
         },
       );
+
+      if (inv.decision !== null) {
+        safeEmit(config.onEvent, {
+          type: 'tool_decided',
+          toolUseId: tu.id,
+          decision: inv.decision,
+        });
+      }
+      safeEmit(config.onEvent, {
+        type: 'tool_finished',
+        toolUseId: tu.id,
+        toolName: tu.name,
+        failed: inv.failed,
+        durationMs: inv.durationMs,
+      });
 
       toolResults.push(inv.toolResult);
       if (inv.failed) {

@@ -15,6 +15,63 @@ Format:
 
 ---
 
+## [2026-04-27] M1 / Step 6 — One-shot CLI + harness lifecycle events (closes M1)
+
+**Done:**
+- `src/harness/types.ts` — `HarnessEvent` union (`session_start`, `step_start`, `provider_event`, `tool_invoking`, `tool_decided`, `tool_finished`, `session_finished`) + `onEvent` callback on `HarnessConfig`.
+- `src/harness/collect.ts` — `collectStep` now accepts an `onEvent` forwarder so each provider stream event surfaces in real time. Renderer throws are swallowed.
+- `src/harness/loop.ts` — emits the lifecycle events around each step, around each tool invocation, and around the session itself. `safeEmit` helper makes the integration crash-proof.
+- `src/harness/invoke-tool.ts` — `InvokeToolResult` now carries the `Decision | null` so the loop can fire `tool_decided` events for renderers (null when the tool wasn't found, since no decision happened).
+- `src/cli/args.ts` — hand-rolled parser. Flags: `--version`/`-v`, `--help`/`-h`, `--json`, `--model <id>`, `--max-steps <n>`. Unknown flag → reject with diagnostic. Anything not a flag is collected as the prompt (joined by spaces).
+- `src/cli/bootstrap.ts` — `bootstrap(input)` builds a `HarnessConfig` from cwd + env. Default model is `anthropic/claude-sonnet-4-6`. Loads `./.agent/permissions.yaml` if present (returns `policySource: 'project'`), otherwise falls back to `defaultPolicy()` (strict + empty rules — refuses everything until explicitly configured). Migrates the DB. Registers the 6 builtin tools. Exposes `providerOverride` and `dbPath` test seams.
+- `src/cli/output/{types,plain,json}.ts` — `OutputRenderer` interface, plus two implementations:
+  - `plain.ts` for TTY/pipe output: assistant text streams to stdout, tool indicators and lifecycle markers go to stderr (so a piped stdout stays a clean transcript). ANSI colors only when stderr is a TTY and `NO_COLOR` is unset.
+  - `json.ts` for `--json`: NDJSON lines to stdout, one per `HarnessEvent`. Spec §2.2: in `--json`, stdout is NDJSON only.
+- `src/cli/signal.ts` — `installSignalHandler` wires SIGINT to an `AbortController`. First Ctrl+C requests graceful abort; second forces `process.exit(130)`.
+- `src/cli/run.ts` — orchestrator. Picks renderer, builds bootstrap input from args, installs signal handler, calls `runAgent`, maps the `HarnessResult` to a process exit code per spec §2.2 (0 done · 1 error · 2 exhausted · 130 interrupted).
+- `src/cli/index.ts` — full rewrite. Was a stub that exited 1; now dispatches to `run` after parsing args, with `--version`/`--help` short-circuits and a `missing prompt` error path.
+- `tests/cli/args.test.ts` — **15 cases** covering each flag, value parsing, rejection of unknown flags / non-numeric `--max-steps` / missing `--model` value, mixed-flag prompts, empty argv.
+- `tests/cli/bootstrap.test.ts` — **7 cases** with isolated tmpdirs and a mock provider: default model, model override, unknown-model rejection, project policy loading, default-policy fallback, budget forwarding, DB migration.
+- `tests/harness/events.test.ts` — **6 cases** for the `onEvent` contract: bracketing events, `step_start` per iteration, `provider_event` forwarding, full `tool_invoking → tool_decided → tool_finished` sequence, `tool_decided` skipped for unknown tools (no decision was made), throwing renderer doesn't derail the loop.
+- `tests/cli.test.ts` updated for the new entry: `--help` exit 0 with usage, missing prompt exits 1 with usage, unknown flag rejected, unknown model from bootstrap surfaces in stderr.
+- Total suite: **289 pass / 6 skip / 617 expect() calls** in ~1.6s.
+
+**Code-review fixes folded in before commit:**
+- **`bootstrap` no longer leaks the DB on throw.** Reordered to load policy and resolve the provider *before* opening SQLite, since those steps can throw on malformed YAML or unknown model. `migrate` (the only remaining throw-source after the DB opens) is wrapped in try/catch that closes the DB on throw. Two regression tests assert the DB file isn't even created when bootstrap aborts.
+- **`src/cli/index.ts` now catches stray throws from `main()`.** Top-level `await main()` was unwrapped — any sync throw from `parseArgs` or stdout/stderr writes would surface as Bun's default unhandled-rejection trace instead of a "forja: ..." diagnostic.
+- **`--max-steps` rejects decimals, hex, scientific notation, and leading zeros.** Was: `Number.parseInt('3.5', 10)` returned `3` and silently passed validation. Now: regex `^[1-9][0-9]*$` validates the literal before parsing. Three regression tests pin the behavior.
+- **Dead code removed from `args.ts`.** `FLAGS_REQUIRING_VALUE` was declared and consulted in the default branch, but the flags it listed were already intercepted by their explicit `case`s — the check could never fire. Default branch simplified to rejecting any `--`-prefixed token outright.
+
+**Decisions:**
+- **No Ink in M1.** The roadmap mentioned "Ink mínimo" but plain text + ANSI delivers a working one-shot CLI today. Ink belongs with the *interactive* TUI (input editor, slash commands, ongoing conversation) which is M2 territory. Adding React + Ink for one-shot streaming would be ~300 lines of components for output that ANSI does in 80 lines. Documented as deliberate deferral.
+- **Hand-rolled arg parser.** The flag set is small (5 flags) and stable. Adding `commander` or `yargs` would be more surface area than the parser itself. ~80 lines.
+- **`OutputRenderer` interface** sits between the harness and the actual renderer. Plain + JSON ship now; an `InkRenderer` can drop in next without touching the harness or the CLI dispatch.
+- **Stdout vs stderr split:** assistant text → stdout (clean transcript when piped); everything else (tool indicators, lifecycle markers, summary) → stderr. Aligns with spec §2.2 ("stdout puro, stderr pra log") and lets `agent "summarize X" > out.md` work intuitively.
+- **Color detection looks at `stderr.isTTY`**, not stdout. Tool indicators live on stderr; if it's piped, ANSI would corrupt the log. `NO_COLOR` env var disables colors regardless.
+- **Default policy is strict + empty.** First-time users hit a deny on every tool, which forces them to opt in via `.agent/permissions.yaml`. Surprising at first but the right default for a tool that runs `bash`. Documented in usage.
+- **`onEvent` is synchronous.** Async would let renderers do work before the loop continues but adds complexity (await per event) and doesn't help the current renderers. Sync + crash-proof (try/catch around each call) is the right trade for M1.
+- **`tool_decided` is skipped for unknown tools.** No decision happened; emitting an event would imply one. Renderers can rely on the invariant: if `tool_decided` fires, there's a real `Decision`.
+- **DB closes on every CLI exit path** — `try/finally` in `run.ts`. SQLite WAL leaves dangling files if not closed cleanly.
+- **Exit 130 for both abort and SIGINT.** Unix convention for "terminated by signal 2 (INT)". Even though the wall-clock cap also returns `interrupted`, that's fine — exit 130 means "didn't run to completion", not specifically "user pressed C".
+
+**Out of scope:**
+- Ink components and interactive TUI — M2
+- Slash commands (`/help`, `/cost`, `/model`, `/clear`) — M3
+- Resume / `--resume <id>` — M2
+- Plan mode (`--plan`) — M2
+- Replay (`--replay <id>`) — M2
+- Cost display (no token extraction yet) — M2
+- `--list-tools`, `--list-sessions`, `agent doctor` — M2
+- Capability detection beyond TTY/NO_COLOR (truecolor, locale, image protocol) — M2
+- `agent` with no prompt as REPL — M2
+- Hierarchy resolution for permissions (enterprise → user → project) — M2
+
+**Pending:** none for this step. **M1 closes here.**
+
+**Next:** M2. Plenty of options (compaction, telemetry/cost, plan mode, resume, sandbox, doctor, more eval coverage). Decide priority once we run the CLI against real models for a while and see what hurts.
+
+---
+
 ## [2026-04-27] M1 / Step 5 — Agent Harness (autonomous loop)
 
 **Done:**

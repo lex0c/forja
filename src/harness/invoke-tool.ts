@@ -1,4 +1,4 @@
-import type { PermissionEngine, ToolArgs } from '../permissions/index.ts';
+import type { Decision, PermissionEngine, ToolArgs } from '../permissions/index.ts';
 import type { ProviderToolResultBlock } from '../providers/index.ts';
 import {
   type DB,
@@ -37,6 +37,10 @@ export interface InvokeToolResult {
   // confirmation required, tool error, exception). Used by the loop to
   // count consecutive errors against `maxToolErrors`.
   failed: boolean;
+  // Permission decision that gated this call. Null when the tool wasn't
+  // found (no decision happened). The loop uses this to emit a
+  // `tool_decided` event for renderers.
+  decision: Decision | null;
 }
 
 const buildErrorBlock = (
@@ -90,6 +94,7 @@ export const invokeTool = async (
       toolCallId: '',
       durationMs: Date.now() - start,
       failed: true,
+      decision: null,
     };
   }
 
@@ -125,6 +130,7 @@ export const invokeTool = async (
       toolCallId: toolCall.id,
       durationMs: Date.now() - start,
       failed: true,
+      decision,
     };
   }
 
@@ -153,6 +159,7 @@ export const invokeTool = async (
       toolCallId: toolCall.id,
       durationMs: Date.now() - start,
       failed: true,
+      decision,
     };
   }
 
@@ -190,6 +197,7 @@ export const invokeTool = async (
       toolCallId: toolCall.id,
       durationMs: duration,
       failed: true,
+      decision,
     };
   }
 
@@ -209,5 +217,6 @@ export const invokeTool = async (
     toolCallId: toolCall.id,
     durationMs: duration,
     failed: false,
+    decision,
   };
 };

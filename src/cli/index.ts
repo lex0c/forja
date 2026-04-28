@@ -1,19 +1,49 @@
 #!/usr/bin/env bun
-// Entry point. Real implementation starts in Step 2.
-// Spec: docs/spec/AGENTIC_CLI.md §2 (operation modes).
+import { parseArgs, usage } from './args.ts';
+import { run } from './run.ts';
 
 const VERSION = '0.0.0';
 
-const args = Bun.argv.slice(2);
-
-if (args.includes('--version') || args.includes('-v')) {
-  if (args.includes('--json')) {
-    process.stdout.write(`${JSON.stringify({ version: VERSION })}\n`);
-  } else {
-    process.stdout.write(`${VERSION}\n`);
+const main = async (): Promise<number> => {
+  const parsed = parseArgs(Bun.argv.slice(2));
+  if (!parsed.ok) {
+    process.stderr.write(`forja: ${parsed.message}\n\n${usage()}\n`);
+    return 1;
   }
-  process.exit(0);
-}
+  const { args } = parsed;
 
-process.stderr.write('forja: not implemented yet — see docs/spec/AGENTIC_CLI.md §18 (M1)\n');
-process.exit(1);
+  if (args.help) {
+    process.stdout.write(`${usage()}\n`);
+    return 0;
+  }
+
+  if (args.version) {
+    if (args.json) {
+      process.stdout.write(`${JSON.stringify({ version: VERSION })}\n`);
+    } else {
+      process.stdout.write(`${VERSION}\n`);
+    }
+    return 0;
+  }
+
+  if (args.prompt.length === 0) {
+    process.stderr.write(`forja: missing prompt\n\n${usage()}\n`);
+    return 1;
+  }
+
+  return run({ args });
+};
+
+// `run()` has its own try/catch for expected failures (bootstrap, runtime).
+// This outer wrap catches anything synchronous in `main` itself or any
+// stray throw `run()` doesn't handle, so the user gets a diagnostic
+// instead of Bun's default unhandled-rejection trace.
+let code: number;
+try {
+  code = await main();
+} catch (e) {
+  const msg = e instanceof Error ? e.message || e.name || String(e) : String(e);
+  process.stderr.write(`forja: unexpected error: ${msg}\n`);
+  code = 1;
+}
+process.exit(code);
