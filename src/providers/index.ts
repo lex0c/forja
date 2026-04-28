@@ -11,6 +11,7 @@ export type {
   ProviderMessageRole,
   ProviderTextBlock,
   ProviderToolDef,
+  ProviderToolInputSchema,
   ProviderToolResultBlock,
   ProviderToolUseBlock,
   PromptDialect,

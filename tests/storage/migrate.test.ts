@@ -86,23 +86,30 @@ describe('migrate', () => {
     db.close();
   });
 
-  test('records hash and timestamp in _migrations', () => {
+  test('records hash and timestamp in _migrations for every applied migration', () => {
     const db = openMemoryDb();
     migrate(db);
-    const rows = db.query('SELECT id, name, hash, applied_at FROM _migrations').all() as {
+    const rows = db
+      .query('SELECT id, name, hash, applied_at FROM _migrations ORDER BY id ASC')
+      .all() as {
       id: number;
       name: string;
       hash: string;
       applied_at: number;
     }[];
-    expect(rows).toHaveLength(1);
-    const row = rows[0];
-    expect(row).toBeDefined();
-    if (row === undefined) return;
-    expect(row.id).toBe(1);
-    expect(row.name).toBe('001-initial');
-    expect(row.hash).toMatch(/^[0-9a-f]{64}$/);
-    expect(row.applied_at).toBeGreaterThan(0);
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+    const first = rows[0];
+    expect(first).toBeDefined();
+    if (first === undefined) return;
+    expect(first.id).toBe(1);
+    expect(first.name).toBe('001-initial');
+    expect(first.hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(first.applied_at).toBeGreaterThan(0);
+    // Every applied migration shares the same shape.
+    for (const r of rows) {
+      expect(r.hash).toMatch(/^[0-9a-f]{64}$/);
+      expect(r.applied_at).toBeGreaterThan(0);
+    }
     db.close();
   });
 });

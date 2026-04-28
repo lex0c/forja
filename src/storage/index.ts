@@ -38,3 +38,11 @@ export type {
   ToolCall,
   ToolCallStatus,
 } from './repos/tool-calls.ts';
+
+export { listApprovalsByToolCall, recordApproval } from './repos/approvals.ts';
+export type {
+  Approval,
+  ApprovalDecidedBy,
+  ApprovalDecision,
+  RecordApprovalInput,
+} from './repos/approvals.ts';

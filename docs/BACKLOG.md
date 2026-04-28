@@ -15,6 +15,70 @@ Format:
 
 ---
 
+## [2026-04-27] M1 / Step 4 — Permission Engine + Tool System + 6 builtin tools
+
+**Done:**
+- `src/storage/migrations/002-approvals.ts` — adds the `approvals` table per AGENTIC_CLI §13 (FK cascades from `tool_calls`, CHECK constraints on `decision` and `decided_by`, index on `tool_call_id`).
+- `src/storage/repos/approvals.ts` — `recordApproval`, `listApprovalsByToolCall`. Exported through `src/storage/index.ts`.
+- `src/permissions/types.ts` — `Policy`, `PolicyMode` (`strict` | `acceptEdits` | `bypass`), `PolicyCategory` (`fs.read` | `fs.write` | `bash` | `web.fetch` | `misc`), `Decision` (allow / deny / confirm), per-tool rule shapes (`BashPolicy`, `PathPolicy`, `FetchPolicy`), `PermissionsView`.
+- `src/permissions/matcher.ts` — `matchPath` (Bun.Glob, cwd-anchored so `**/foo` can't reach `/etc/passwd`), `matchCommand` and `matchHost` (custom glob→regex compiler so `*` matches across `/` and spaces), plus `firstMatching*` helpers for diagnostics.
+- `src/permissions/engine.ts` — `createPermissionEngine(policy, opts)` returns `check(toolName, category, args) → Decision`. Order: deny rules first (always win), then allow, then confirm; default = deny. `bypass` short-circuits to allow. `acceptEdits` upgrades unmatched writes from deny to confirm (not auto-allow — see Decisions).
+- `src/permissions/config.ts` — `parsePolicy`, `loadPolicyFromString`, `loadPolicyFromFile`, `defaultPolicy`. Strict validator: rejects mistyped keys (`allow_path` instead of `allow_paths` is the bug class), rejects malformed mode values, rejects non-mapping top-level.
+- `src/permissions/index.ts` — public surface.
+- `src/tools/types.ts` — `Tool<I, O>`, `ToolContext` (signal + cwd + sessionId + stepId + permissions per CONTRACTS §2), `ToolResult<O> = O | ToolError`, `isToolError` discriminator, `toolError` constructor, `ERROR_CODES` enum.
+- `src/tools/registry.ts` — `createToolRegistry`.
+- `src/tools/builtin/{read-file,write-file,edit-file,glob,grep,bash}.ts` — six tools, all returning `ToolResult` (no thrown errors).
+- `src/tools/builtin/index.ts` — `BUILTIN_TOOLS` array + `registerBuiltinTools(reg)` helper.
+- `src/tools/index.ts` — public surface.
+- `.github/workflows/ci.yml` — adds `apt install ripgrep` step so the grep tool's tests run instead of skipping.
+- New dep: `yaml@latest` (parser).
+- New tests:
+  - `tests/storage/approvals.test.ts` — 6 cases: roundtrip, ordering, FK cascade, CHECK rejections, FK rejection on unknown tool_call_id.
+  - `tests/permissions/matcher.test.ts` — 18 cases covering path resolution (relative, absolute, outside-cwd), command matching (exact, prefix, wildcard with spaces and slashes), host matching (case, glob), `firstMatching*` helpers.
+  - `tests/permissions/engine.test.ts` — 17 cases: bash allow/deny/confirm, path allow/deny/confirm, mode behaviors (strict/acceptEdits/bypass), web.fetch hosts, misc category, missing-arg rejections.
+  - `tests/permissions/config.test.ts` — 10 cases: full policy parse, mode default, malformed-key rejection, YAML syntax errors, default policy.
+  - `tests/tools/registry.test.ts` — 4 cases.
+  - `tests/tools/_helpers.ts` — shared `makeCtx()` for tool tests.
+  - `tests/tools/{read-file,write-file,edit-file,glob,bash}.test.ts` — 5 happy-path + error-path + abort-signal coverage per tool.
+  - `tests/tools/grep.test.ts` — 6 cases gated on `rg` availability via `describe.if(RG_AVAILABLE)` (skips locally if ripgrep missing; CI installs it).
+- Existing `tests/storage/migrate.test.ts` updated to assert ≥ 2 migrations (was hardcoded to 1).
+- Total suite: **228 pass / 6 skip / 446 expect() calls** in ~600ms.
+
+**Code-review fixes folded in before commit:**
+- **`acceptEdits` mode now matches spec §8 semantics.** Was: `confirm_paths` still required confirmation AND unmatched writes escalated to confirm. Now: `confirm_paths` for writes auto-allows (skip confirmation step — the actual convenience the mode promises); unmatched writes default-deny (mode is convenience, not bypass); reads keep the same confirm behavior. Deny still wins over confirm in all modes.
+- **`PermissionsView.hasPathRule` removed.** It was hardcoded to look up `write_file`/`read_file` rules, ignoring per-tool overrides on `edit_file`/`glob`/etc. — wrong by construction, with no caller. The harness in Step 5 will call `engine.check(toolName, ...)` directly with the right tool name. The view now exposes only `mode`.
+- **`parsePolicy` rejects top-level arrays.** Previously slipped through the `typeof === 'object'` check.
+- **`bash` wraps `SIGTERM` in try/catch** (was already wrapped on the SIGKILL escalation). The proc can exit on its own between the timer firing and `proc.kill()` running — kill on a dead pid throws ESRCH; we swallow it now.
+- **`edit_file` rejects empty `old_string` explicitly** (`edit.old_string_empty`) with a hint pointing to `write_file`. Previously fell through to `old_string_not_found`, which was less diagnostic.
+
+**Decisions:**
+- **`Tool.execute` returns `O | ToolError` instead of throwing** (CONTRACTS §2, cláusula 7). Errors are *data*. Tests use `isToolError(out)` discriminator instead of try/catch. The harness in Step 5 catches stray throws and converts them, but builtins don't throw.
+- **Custom glob→regex compiler for commands and hosts** instead of `Bun.Glob`. Bun's `*` doesn't cross `/` (correct for paths, wrong for `curl * | sh` where the URL contains `/`). The compiler escapes regex metachars and translates `*`→`.*`, `?`→`.`. The "no regex in policy" rule (CLAUDE.md) is preserved — the user still authors with glob syntax; regex is an internal implementation detail.
+- **`acceptEdits` mode upgrades unmatched writes from deny to confirm**, not to auto-allow. The mode is opt-in convenience for refactor sessions, not a free-for-all. Auto-allow lives in `bypass` (which requires an explicit dangerous flag, deferred).
+- **Permission categories instead of per-tool rules everywhere.** New tools join an existing category instead of needing a new policy section. The YAML still supports per-tool overrides (`tools.bash`, `tools.write_file`).
+- **Path matcher is cwd-anchored.** A pattern like `src/**` resolves against cwd before matching, and an absolute target outside the cwd subtree falls back to direct absolute match. Result: bare `**/foo` can't reach `/etc/passwd` — security property by construction.
+- **Strict validator rejects unknown shapes** (e.g., `allow_path` typo'd as singular). Silently ignoring unrecognized keys is how YAML-driven policies turn into "allow-everything" in production.
+- **`bash` is `writes: true` pessimistically** (per CONTRACTS §2.6.3). The `read_only` flag in the input schema is a hint *from the caller*, not the tool — Step 5 harness can use it to route through a different policy path.
+- **`grep` shells out to `rg`** instead of pure-TS implementation. Performance + battle-tested feature set. Tests skip cleanly if `rg` is missing; CI installs it.
+- **Hierarchy resolution is project-only in M1** — no enterprise/user/project/session merging yet. Spec §8 requires it; landing in M2 with the trust subsystem.
+- **`yaml` over `js-yaml`** — newer API surface, comparable battle-testing, smaller install footprint.
+
+**Out of scope:**
+- Sandbox (`bwrap` / `sandbox-exec`) — M2
+- Checkpoint creation before writes — Step 5 / M3
+- Hook integration (PreToolUse / PostToolUse) — M4
+- Hierarchy enterprise → user → project → session — M2
+- Output sanitization (CSI escape stripping) — M2
+- The other 15 tools in CONTRACTS §2.6 (background, task_*, memory_*, fetch_url, code retrieval) — later steps/milestones
+- Confirmation UI — Step 6 (Ink); engine returns `Decision` shape ready for the UI to consume
+- Real-API/network tests for grep — would need fixtures; current coverage is enough for the wrapper
+
+**Pending:** none for this step.
+
+**Next:** Step 5 — Agent Harness loop (autonomous profile) per AGENTIC_CLI §5. Ties storage + provider + permissions + tools together: session lifecycle, message loop with budget, tool invocation pipeline (engine.check → record approval → execute → persist), abort/cancel, basic checkpoint stub.
+
+---
+
 ## [2026-04-27] M1 / Step 3.6 — OpenAI (GPT) adapter
 
 **Done:**
