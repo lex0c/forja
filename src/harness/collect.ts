@@ -1,6 +1,24 @@
 import { emptyUsage } from '../providers/cost.ts';
 import type { StopReason, StreamEvent, UsageInfo } from '../providers/index.ts';
 
+// Wraps an iteration error so the partial CollectedStep is recoverable
+// at the harness layer. Without this, usage/text/tool_uses captured
+// before the stream threw are dropped on the floor — including the
+// `usage` event some adapters emit from `finally` to record billed
+// tokens on failed turns.
+export class CollectStepError extends Error {
+  override readonly cause: unknown;
+  readonly partial: CollectedStep;
+  constructor(cause: unknown, partial: CollectedStep) {
+    const message =
+      cause instanceof Error ? cause.message || cause.name || String(cause) : String(cause);
+    super(message);
+    this.name = 'CollectStepError';
+    this.cause = cause;
+    this.partial = partial;
+  }
+}
+
 export interface CollectedToolUse {
   id: string;
   name: string;
@@ -51,63 +69,74 @@ export const collectStep = async (
   const out = empty();
   const toolNamesById = new Map<string, string>();
 
-  for await (const ev of events) {
-    if (onEvent !== undefined) {
-      try {
-        onEvent(ev);
-      } catch {
-        // Renderers throwing must not derail the loop.
+  try {
+    for await (const ev of events) {
+      if (onEvent !== undefined) {
+        try {
+          onEvent(ev);
+        } catch {
+          // Renderers throwing must not derail the loop.
+        }
       }
-    }
-    switch (ev.kind) {
-      case 'start':
-        out.message_id = ev.message_id;
-        break;
-      case 'text_delta':
-        out.text += ev.text;
-        break;
-      case 'thinking_delta':
-        out.thinking += ev.text;
-        break;
-      case 'tool_use_start':
-        toolNamesById.set(ev.id, ev.name);
-        break;
-      case 'tool_use_delta':
-        // Args are accumulated by the normalizer; we don't need partial chunks.
-        break;
-      case 'tool_use_stop': {
-        const name = toolNamesById.get(ev.id);
-        if (name === undefined) {
-          // Shouldn't happen if the normalizer is well-behaved; record as
-          // an error rather than crash the loop.
-          out.errors.push({
-            code: 'harness.orphan_tool_use_stop',
-            message: `tool_use_stop for unknown id ${ev.id}`,
-            retryable: false,
-          });
+      switch (ev.kind) {
+        case 'start':
+          out.message_id = ev.message_id;
+          break;
+        case 'text_delta':
+          out.text += ev.text;
+          break;
+        case 'thinking_delta':
+          out.thinking += ev.text;
+          break;
+        case 'tool_use_start':
+          toolNamesById.set(ev.id, ev.name);
+          break;
+        case 'tool_use_delta':
+          // Args are accumulated by the normalizer; we don't need partial chunks.
+          break;
+        case 'tool_use_stop': {
+          const name = toolNamesById.get(ev.id);
+          if (name === undefined) {
+            // Shouldn't happen if the normalizer is well-behaved; record as
+            // an error rather than crash the loop.
+            out.errors.push({
+              code: 'harness.orphan_tool_use_stop',
+              message: `tool_use_stop for unknown id ${ev.id}`,
+              retryable: false,
+            });
+            break;
+          }
+          out.tool_uses.push({ id: ev.id, name, input: ev.final_args });
           break;
         }
-        out.tool_uses.push({ id: ev.id, name, input: ev.final_args });
-        break;
+        case 'usage':
+          // Last `usage` event wins. Adapters emit exactly one per turn
+          // today, but if a provider ever splits the report across multiple
+          // events the spec semantic is "final values", not "sum across".
+          out.usage = ev.usage;
+          out.usageSeen = true;
+          break;
+        case 'stop':
+          out.stop_reason = ev.reason;
+          break;
+        case 'error':
+          out.errors.push({
+            code: ev.code,
+            message: ev.message,
+            retryable: ev.retryable,
+          });
+          break;
       }
-      case 'usage':
-        // Last `usage` event wins. Adapters emit exactly one per turn
-        // today, but if a provider ever splits the report across multiple
-        // events the spec semantic is "final values", not "sum across".
-        out.usage = ev.usage;
-        out.usageSeen = true;
-        break;
-      case 'stop':
-        out.stop_reason = ev.reason;
-        break;
-      case 'error':
-        out.errors.push({
-          code: ev.code,
-          message: ev.message,
-          retryable: ev.retryable,
-        });
-        break;
     }
+  } catch (e) {
+    // Stream threw mid-iteration. Whatever events we already
+    // captured (text deltas, tool_uses, AND usage emitted by the
+    // adapter's `finally`) are intact in `out`. Wrap so the harness
+    // can recover the partial state from the error and fold partial
+    // usage into session totals — otherwise turns that errored mid-
+    // stream get billed by the provider but omitted from cost
+    // tracking.
+    throw new CollectStepError(e, out);
   }
 
   return out;

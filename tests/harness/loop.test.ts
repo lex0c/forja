@@ -1311,6 +1311,95 @@ describe('runAgent', () => {
     expect(events.find((e) => e.type === 'compaction_started')).toBeDefined();
   });
 
+  test('partial usage emitted before stream throw is folded into session totals', async () => {
+    // Regression: when the provider stream throws after a usage
+    // event was already emitted (adapters yield from finally on
+    // disconnect), the harness used to discard the partial. The
+    // turn was billed but cost tracking missed it. Now
+    // CollectStepError carries the partial and we fold it.
+    const partialProvider: Provider = {
+      id: 'mock/partial',
+      family: 'anthropic',
+      capabilities: {
+        tools: 'native',
+        cache: false,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 100_000,
+        output_max_tokens: 4096,
+        cost_per_1k_input: 1.0,
+        cost_per_1k_output: 2.0,
+        notes: [],
+      },
+      async *generate() {
+        yield { kind: 'start', message_id: 'm' };
+        yield {
+          kind: 'usage',
+          usage: { input: 200, output: 30, cache_read: 0, cache_creation: 0 },
+        };
+        throw new Error('connection reset');
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+    const result = await runAgent({
+      provider: partialProvider,
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+    });
+    expect(result.reason).toBe('providerError');
+    // 200 × 1 + 30 × 2 = 260 → 0.260
+    expect(result.usage.input).toBe(200);
+    expect(result.usage.output).toBe(30);
+    expect(result.costUsd).toBeCloseTo(0.26, 6);
+    // Still incomplete because the turn errored.
+    expect(result.usageComplete).toBe(false);
+  });
+
+  test('stream throw without prior usage event leaves totals empty', async () => {
+    // Symmetric guard: if the stream throws BEFORE emitting any
+    // usage event, the partial is empty and totals stay zero.
+    // No phantom charge; usageComplete still false.
+    const noUsageProvider: Provider = {
+      id: 'mock/no-usage',
+      family: 'anthropic',
+      capabilities: {
+        tools: 'native',
+        cache: false,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 100_000,
+        output_max_tokens: 4096,
+        cost_per_1k_input: 1.0,
+        cost_per_1k_output: 2.0,
+        notes: [],
+      },
+      async *generate() {
+        yield { kind: 'start', message_id: 'm' };
+        throw new Error('upstream gone');
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+    const result = await runAgent({
+      provider: noUsageProvider,
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+    });
+    expect(result.reason).toBe('providerError');
+    expect(result.usage).toEqual({ input: 0, output: 0, cache_read: 0, cache_creation: 0 });
+    expect(result.costUsd).toBe(0);
+    expect(result.usageComplete).toBe(false);
+  });
+
   test('init failure surfaces with usageComplete=false', async () => {
     // guardedFinish path: any uncaught throw in the harness body has
     // ambiguous billing state. Safer to mark partial than to claim

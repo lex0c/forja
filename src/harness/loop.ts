@@ -12,7 +12,7 @@ import { estimatePromptTokens } from '../providers/tokens.ts';
 import { appendMessage, completeSession, createSession } from '../storage/index.ts';
 import type { ToolContext } from '../tools/index.ts';
 import { abortableIterable } from './abortable.ts';
-import { collectStep } from './collect.ts';
+import { CollectStepError, collectStep } from './collect.ts';
 import { compactMessages } from './compaction.ts';
 import { invokeTool } from './invoke-tool.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
@@ -220,12 +220,27 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         );
       } catch (e) {
         // The provider request was sent (and likely billed for input
-        // tokens) before the throw — abort mid-stream, transient
-        // network failure after the headers landed, etc. We have no
-        // usage telemetry for this turn and the normal usageSeen
-        // check below never runs, so flip the aggregate flag here so
-        // renderers don't present partial totals as authoritative.
+        // tokens) before the throw. Always flip the aggregate flag —
+        // even if we recover partial usage, totals are by definition
+        // a lower bound when the turn ended in error.
         usageComplete = false;
+
+        // Recover whatever the stream emitted before the throw.
+        // Adapters yield `usage` from their `finally` block precisely
+        // for this case, so a failed turn that already received
+        // input/cache numbers from the provider can still be charged.
+        // CollectStepError carries the partial CollectedStep; non-
+        // wrapped errors (extreme: collectStep itself crashed before
+        // catching) have no recoverable state.
+        if (e instanceof CollectStepError) {
+          const partial = e.partial;
+          if (partial.usageSeen) {
+            const partialCost = computeCost(config.provider.capabilities, partial.usage);
+            totalUsage = addUsage(totalUsage, partial.usage);
+            totalCostUsd += partialCost;
+          }
+        }
+
         // SDK throws when the abort signal fires mid-call (Ctrl+C or
         // wall-clock timeout). Reroute to the matching ExitReason so the
         // user sees `interrupted` exit code 130 instead of a generic
@@ -233,7 +248,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (signal.aborted) {
           return finish(isWallClockTimeout() ? 'maxWallClockMs' : 'aborted');
         }
-        const detail = e instanceof Error ? e.message || e.name || String(e) : String(e);
+        const cause = e instanceof CollectStepError ? e.cause : e;
+        const detail =
+          cause instanceof Error ? cause.message || cause.name || String(cause) : String(cause);
         return finish('providerError', detail);
       }
 
