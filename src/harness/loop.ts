@@ -97,25 +97,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   const callerSignal = config.signal ?? new AbortController().signal;
   const signal = AbortSignal.any([callerSignal, wallClockController.signal]);
 
-  const session = createSession(config.db, {
-    model: config.provider.id,
-    cwd: config.cwd,
-  });
-
-  const userMsg = appendMessage(config.db, {
-    sessionId: session.id,
-    role: 'user',
-    content: config.userPrompt,
-  });
-
-  const messages: ProviderMessage[] = [{ role: 'user', content: config.userPrompt }];
+  const messages: ProviderMessage[] = [];
   const tools = buildToolDefs(config);
   const recentToolHashes: string[] = [];
   const HASH_WINDOW = 5;
 
   let steps = 0;
   let consecutiveErrors = 0;
-  let lastMessageId = userMsg.id;
+  let sessionId = '';
+  let lastMessageId = '';
 
   // Distinguish wall-clock from user abort — both use `signal.aborted` but
   // the user wants different exit reasons.
@@ -124,16 +114,20 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
 
   const finish = (reason: ExitReason, detail?: string): HarnessResult => {
     clearTimeout(wallClockTimer);
-    try {
-      completeSession(config.db, session.id, exitToStatus[reason], 0);
-    } catch {
-      // Storage already broken; nothing useful to do beyond return the
-      // result so the caller knows the run is over.
+    // Skip completeSession when init failed before createSession — there's
+    // no row to mark and SQLite would just throw a foreign-key error.
+    if (sessionId.length > 0) {
+      try {
+        completeSession(config.db, sessionId, exitToStatus[reason], 0);
+      } catch {
+        // Storage already broken; nothing useful to do beyond return the
+        // result so the caller knows the run is over.
+      }
     }
     const result: HarnessResult = {
       status: exitToHarnessStatus[reason],
       reason,
-      sessionId: session.id,
+      sessionId,
       steps,
       durationMs: Date.now() - startMs,
       lastMessageId,
@@ -152,13 +146,27 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     return finish('internalError', detail);
   };
 
-  safeEmit(config.onEvent, { type: 'session_start', sessionId: session.id });
-
-  // The whole loop body is wrapped so SQLite errors (or any uncaught
-  // throw from the persistence path) become a clean error exit instead
-  // of crashing the caller. Tool exceptions are wrapped earlier by
-  // invokeTool; this is the safety net for the surrounding writes.
+  // Init writes (createSession + initial appendMessage) live INSIDE the
+  // try so a SQLite failure here routes through guardedFinish — that
+  // clears the wall-clock timer instead of leaking it for the full
+  // maxWallClockMs window (default 10 min).
   try {
+    const session = createSession(config.db, {
+      model: config.provider.id,
+      cwd: config.cwd,
+    });
+    sessionId = session.id;
+
+    const userMsg = appendMessage(config.db, {
+      sessionId,
+      role: 'user',
+      content: config.userPrompt,
+    });
+    lastMessageId = userMsg.id;
+    messages.push({ role: 'user', content: config.userPrompt });
+
+    safeEmit(config.onEvent, { type: 'session_start', sessionId });
+
     while (true) {
       if (signal.aborted) {
         return finish(isWallClockTimeout() ? 'maxWallClockMs' : 'aborted');
@@ -219,7 +227,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       }
 
       const assistantMsg = appendMessage(config.db, {
-        sessionId: session.id,
+        sessionId,
         role: 'assistant',
         parentId: lastMessageId,
         content: assistantContent.length > 0 ? assistantContent : '',
@@ -287,7 +295,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         const ctx: ToolContext = {
           signal,
           cwd: config.cwd,
-          sessionId: session.id,
+          sessionId,
           stepId: assistantMsg.id,
           permissions: config.permissionEngine.view(),
         };
@@ -343,7 +351,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // path; nothing reads it post-bail today, but a future refactor
           // that does (resume, replay) gets a consistent view.
           const partialMsg = appendMessage(config.db, {
-            sessionId: session.id,
+            sessionId,
             role: 'user',
             parentId: lastMessageId,
             content: toolResults,
@@ -357,7 +365,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // Persist tool_results back as a user message; mirror them in the
       // running provider message list for the next turn.
       const resultMsg = appendMessage(config.db, {
-        sessionId: session.id,
+        sessionId,
         role: 'user',
         parentId: lastMessageId,
         content: toolResults,

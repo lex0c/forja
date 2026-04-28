@@ -604,6 +604,32 @@ describe('runAgent', () => {
     expect(result.reason).toBe('aborted');
   });
 
+  test('init failure (createSession throws) clears wall-clock timer', async () => {
+    // If SQLite is unavailable when runAgent starts (closed handle, locked
+    // file, I/O error), createSession throws *before* the loop's try/catch.
+    // Without moving init inside the try, the wall-clock setTimeout leaks
+    // and keeps the event loop alive for the full maxWallClockMs (default
+    // 10 min). We verify the run returns promptly with internalError.
+    db.close();
+    const { config } = buildConfig([{ text: 'never reached', stop_reason: 'end_turn' }], {
+      // Long wall-clock cap — if the timer leaked, this would dominate
+      // duration. We assert duration is well under it.
+      budget: { maxSteps: 5 },
+    });
+    const t0 = Date.now();
+    const result = await runAgent(config);
+    const elapsed = Date.now() - t0;
+    expect(result.status).toBe('error');
+    expect(result.reason).toBe('internalError');
+    expect(result.sessionId).toBe('');
+    expect(result.steps).toBe(0);
+    // Sanity: the call returned, not just hung. Guard against a future
+    // regression where finish() never gets invoked on early failure.
+    expect(elapsed).toBeLessThan(1000);
+    // Reopen so afterEach (none here, but next test's beforeEach reopens
+    // anyway) doesn't trip — defensive cleanup.
+  });
+
   test('provider crash exits as providerError with detail', async () => {
     const provider: Provider = {
       id: 'mock/crash',
