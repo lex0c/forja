@@ -40,6 +40,12 @@ interface ToolCallInProgress {
   id: string;
   name: string;
   partialArgs: string;
+  // `tool_use_start` is deferred until we have a non-empty `name`. OpenAI
+  // can split the name across deltas; emitting start with name='' would
+  // make the harness invoke a tool with empty name (`unknown tool` error)
+  // even when a later delta supplies the real name. Once started, `name`
+  // is locked and `partialArgs` is flushed as a single delta.
+  started: boolean;
 }
 
 const FINISH_REASON_MAP: Readonly<Record<string, StopReason>> = {
@@ -92,31 +98,47 @@ export async function* normalizeOpenAIStream(
         for (const tc of delta.tool_calls) {
           let inProgress = toolCalls.get(tc.index);
           if (inProgress === undefined) {
+            // Register the entry but DON'T emit start yet — name may
+            // arrive in a later delta. id is locked here regardless.
             const id = tc.id ?? `call_${tc.index}_${crypto.randomUUID()}`;
             const name = tc.function?.name ?? '';
-            inProgress = { id, name, partialArgs: '' };
+            inProgress = { id, name, partialArgs: '', started: false };
             toolCalls.set(tc.index, inProgress);
-            yield { kind: 'tool_use_start', id, name };
-          } else {
-            // The id is locked once `tool_use_start` has been emitted.
-            // Replacing it now (even with a "more real" id from a later
-            // delta) breaks the harness's id↔name correlation in
-            // `harness/collect.ts`, which would orphan tool_use_stop
-            // and silently drop the tool call.
-            if (
-              typeof tc.function?.name === 'string' &&
-              tc.function.name.length > 0 &&
-              inProgress.name.length === 0
-            ) {
-              inProgress.name = tc.function.name;
-            }
+          } else if (
+            typeof tc.function?.name === 'string' &&
+            tc.function.name.length > 0 &&
+            inProgress.name.length === 0
+          ) {
+            // Name straggled in. id stays locked from the first delta.
+            inProgress.name = tc.function.name;
           }
-          if (typeof tc.function?.arguments === 'string' && tc.function.arguments.length > 0) {
-            inProgress.partialArgs += tc.function.arguments;
+
+          // Always buffer args; we may not be started yet.
+          const argsChunk = tc.function?.arguments;
+          const hasArgs = typeof argsChunk === 'string' && argsChunk.length > 0;
+          if (hasArgs) {
+            inProgress.partialArgs += argsChunk;
+          }
+
+          // Emit start the moment we have a name. Flush whatever args
+          // we've buffered as a single delta so consumers that mirror
+          // partial_args chunks see the same byte stream they would
+          // have seen if the name had arrived first.
+          if (!inProgress.started && inProgress.name.length > 0) {
+            yield { kind: 'tool_use_start', id: inProgress.id, name: inProgress.name };
+            inProgress.started = true;
+            if (inProgress.partialArgs.length > 0) {
+              yield {
+                kind: 'tool_use_delta',
+                id: inProgress.id,
+                partial_args: inProgress.partialArgs,
+              };
+            }
+          } else if (inProgress.started && hasArgs) {
             yield {
               kind: 'tool_use_delta',
               id: inProgress.id,
-              partial_args: tc.function.arguments,
+              partial_args: argsChunk,
             };
           }
         }
@@ -132,6 +154,18 @@ export async function* normalizeOpenAIStream(
   // parse and emit at end-of-stream, ordered by the original tool_call index.
   const sortedTools = Array.from(toolCalls.entries()).sort(([a], [b]) => a - b);
   for (const [, tool] of sortedTools) {
+    if (!tool.started) {
+      // Name never arrived. Emitting tool_use_stop without a matching
+      // start would orphan in `harness/collect.ts`. Surface as an error
+      // so the harness fails the step instead of silently dropping.
+      yield {
+        kind: 'error',
+        code: 'openai.tool_use_no_name',
+        message: `tool_call ${tool.id} ended without a function name`,
+        retryable: false,
+      };
+      continue;
+    }
     let parsed: Record<string, unknown> = {};
     if (tool.partialArgs.length > 0) {
       try {

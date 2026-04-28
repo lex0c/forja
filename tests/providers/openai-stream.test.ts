@@ -205,6 +205,106 @@ describe('normalizeOpenAIStream', () => {
     }
   });
 
+  test('name straggling to a later chunk: start fires once name is known with the right name', async () => {
+    // Chunk 1 carries the id but no function.name (and some args).
+    // Chunk 2 supplies the name (and more args). Without deferral, the
+    // old code emitted tool_use_start with name='' — the harness then
+    // tried to invoke "" → unknown tool, dropping a valid call.
+    const events = await collect(
+      normalizeOpenAIStream(
+        fromChunks([
+          {
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: 'call_x',
+                      type: 'function',
+                      function: { arguments: '{"path":' },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+          {
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      function: { name: 'read_file', arguments: '"/etc/hosts"}' },
+                    },
+                  ],
+                },
+                finish_reason: 'tool_calls',
+              },
+            ],
+          },
+        ]),
+      ),
+    );
+    const start = events.find((e) => e.kind === 'tool_use_start');
+    const stop = events.find((e) => e.kind === 'tool_use_stop');
+    expect(start).toBeDefined();
+    expect(stop).toBeDefined();
+    if (start?.kind === 'tool_use_start') {
+      expect(start.name).toBe('read_file');
+      expect(start.id).toBe('call_x');
+    }
+    if (stop?.kind === 'tool_use_stop') {
+      expect(stop.id).toBe('call_x');
+      expect(stop.final_args).toEqual({ path: '/etc/hosts' });
+    }
+    // The first delta arrived BEFORE start would have been an orphan.
+    // With deferral, start fires first; the buffered bytes are flushed
+    // as a single delta after.
+    const startIdx = events.findIndex((e) => e.kind === 'tool_use_start');
+    const firstDeltaIdx = events.findIndex((e) => e.kind === 'tool_use_delta');
+    expect(firstDeltaIdx).toBeGreaterThan(startIdx);
+  });
+
+  test('tool_call that ends without a name emits an error (no orphan stop)', async () => {
+    // Pathological stream: a tool_call delta with id and args but no
+    // name ever arrives. We must not emit tool_use_stop with name='' —
+    // that would orphan in collect.ts (which keys on the start name).
+    // Instead, emit an error event so the harness fails the step.
+    const events = await collect(
+      normalizeOpenAIStream(
+        fromChunks([
+          {
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: 'call_orphan',
+                      type: 'function',
+                      function: { arguments: '{}' },
+                    },
+                  ],
+                },
+                finish_reason: 'tool_calls',
+              },
+            ],
+          },
+        ]),
+      ),
+    );
+    expect(events.find((e) => e.kind === 'tool_use_start')).toBeUndefined();
+    expect(events.find((e) => e.kind === 'tool_use_stop')).toBeUndefined();
+    const error = events.find((e) => e.kind === 'error');
+    expect(error).toBeDefined();
+    if (error?.kind === 'error') {
+      expect(error.code).toBe('openai.tool_use_no_name');
+      expect(error.message).toContain('call_orphan');
+    }
+  });
+
   test('start/delta/stop ids stay consistent across the lifecycle', async () => {
     // Three chunks: name-only, args-only, finish. All emitted events for
     // index 0 must share the same id. This is the contract collect.ts
