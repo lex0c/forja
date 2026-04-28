@@ -57,12 +57,60 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024; // 4 MB per CONTRACTS §2.6.3
 const MAX_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
-const truncate = (s: string): { text: string; truncated: boolean } => {
-  if (s.length <= MAX_OUTPUT_BYTES) return { text: s, truncated: false };
-  return {
-    text: `${s.slice(0, MAX_OUTPUT_BYTES)}\n[... truncated; ${s.length - MAX_OUTPUT_BYTES} bytes omitted]`,
-    truncated: true,
-  };
+// Stream the pipe and stop accumulating once we've kept `cap` bytes.
+// We KEEP draining the reader after the cap is hit — if we abandoned
+// the stream the kernel pipe buffer would fill and the child would
+// block on its next write (effectively a deadlock when paired with
+// `proc.exited`). Memory stays bounded at ~cap because past-cap chunks
+// are read and discarded, never appended to the chunk list.
+//
+// UTF-8 is decoded with `{ stream: true }` so a multi-byte sequence
+// straddling a chunk boundary doesn't produce a replacement char. The
+// final `decoder.decode()` flushes any trailing incomplete bytes.
+const readCapped = async (
+  stream: ReadableStream<Uint8Array>,
+  cap: number,
+): Promise<{ text: string; truncated: boolean }> => {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder('utf-8');
+  const chunks: string[] = [];
+  let acceptedBytes = 0;
+  let omittedBytes = 0;
+  let truncated = false;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (truncated) {
+        omittedBytes += value.byteLength;
+        continue;
+      }
+      const remaining = cap - acceptedBytes;
+      if (value.byteLength <= remaining) {
+        chunks.push(decoder.decode(value, { stream: true }));
+        acceptedBytes += value.byteLength;
+      } else {
+        // Last chunk that fits — take the prefix that fits the cap,
+        // flush the decoder, mark truncated. Subsequent reads just
+        // count omitted bytes.
+        if (remaining > 0) {
+          chunks.push(decoder.decode(value.subarray(0, remaining), { stream: true }));
+          acceptedBytes += remaining;
+        }
+        chunks.push(decoder.decode());
+        omittedBytes += value.byteLength - remaining;
+        truncated = true;
+      }
+    }
+    if (!truncated) chunks.push(decoder.decode());
+  } finally {
+    reader.releaseLock();
+  }
+  let text = chunks.join('');
+  if (truncated) {
+    text = `${text}\n[... truncated; ${omittedBytes} bytes omitted]`;
+  }
+  return { text, truncated };
 };
 
 export const bashTool: Tool<BashInput, BashOutput> = {
@@ -148,17 +196,17 @@ export const bashTool: Tool<BashInput, BashOutput> = {
       }, 2000);
     }, timeout);
 
-    let stdout = '';
-    let stderr = '';
+    let out: { text: string; truncated: boolean } = { text: '', truncated: false };
+    let err: { text: string; truncated: boolean } = { text: '', truncated: false };
     let exitCode = -1;
     try {
-      const [outText, errText, code] = await Promise.all([
-        new Response(proc.stdout as ReadableStream<Uint8Array>).text(),
-        new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+      const [outRes, errRes, code] = await Promise.all([
+        readCapped(proc.stdout as ReadableStream<Uint8Array>, MAX_OUTPUT_BYTES),
+        readCapped(proc.stderr as ReadableStream<Uint8Array>, MAX_OUTPUT_BYTES),
         proc.exited,
       ]);
-      stdout = outText;
-      stderr = errText;
+      out = outRes;
+      err = errRes;
       exitCode = code;
     } finally {
       clearTimeout(timer);
@@ -172,8 +220,6 @@ export const bashTool: Tool<BashInput, BashOutput> = {
       });
     }
 
-    const out = truncate(stdout);
-    const err = truncate(stderr);
     return {
       stdout: out.text,
       stderr: err.text,

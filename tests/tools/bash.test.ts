@@ -99,6 +99,54 @@ describe('bashTool', () => {
     }
   });
 
+  test('streams stdout and caps it at 4 MB without buffering full output', async () => {
+    // Generate ~6 MB of stdout; the cap is 4 MB. With the previous
+    // implementation (Response(...).text()) the entire 6 MB landed in
+    // memory before truncation. This regression asserts truncation
+    // happens AT the cap — the returned text length is bounded
+    // independent of how much the command produced.
+    const out = await bashTool.execute(
+      // dd to /dev/stdout, then tr nulls to printable bytes so the
+      // text is valid UTF-8 (and the decoder doesn't mangle anything).
+      {
+        command: "dd if=/dev/zero bs=1048576 count=6 2>/dev/null | tr '\\0' 'a'",
+        timeout_ms: 10_000,
+      },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.exit_code).toBe(0);
+    expect(out.truncated).toBe(true);
+    // 4 MB cap + a short suffix line. Anything close to 6 MB would
+    // mean the cap was applied post-buffer (the bug).
+    const cap = 4 * 1024 * 1024;
+    expect(out.stdout.length).toBeLessThan(cap + 200);
+    expect(out.stdout).toContain('truncated');
+    expect(out.stdout).toContain('bytes omitted');
+  });
+
+  test('streams stderr and caps it at 4 MB independently of stdout', async () => {
+    const out = await bashTool.execute(
+      {
+        command: "dd if=/dev/zero bs=1048576 count=6 2>/dev/null | tr '\\0' 'b' >&2",
+        timeout_ms: 10_000,
+      },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.truncated).toBe(true);
+    const cap = 4 * 1024 * 1024;
+    expect(out.stderr.length).toBeLessThan(cap + 200);
+    expect(out.stderr).toContain('bytes omitted');
+  });
+
+  test('output below the cap is returned untruncated', async () => {
+    const out = await bashTool.execute({ command: "printf 'hello world'" }, makeCtx({ cwd: dir }));
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.stdout).toBe('hello world');
+    expect(out.truncated).toBe(false);
+  });
+
   test('relative cwd argument is resolved against ctx.cwd', async () => {
     // Create a subdir and verify pwd resolves there.
     Bun.spawnSync(['mkdir', '-p', join(dir, 'sub')]);
