@@ -221,6 +221,37 @@ describe('executeCase', () => {
     expect(r.passed).toBe(true);
   });
 
+  test('setup.files with .. escape is rejected at runtime even when loader is bypassed', async () => {
+    // Direct EvalCase construction skips the loader's parse-time
+    // sandbox guard. The executor must still refuse — defense in
+    // depth catches programmatic callers and any future entry
+    // point that builds EvalCase without going through parseEvalCase.
+    const c = baseCase({
+      setup: { files: { '../escape.txt': 'leak' } },
+      expect: [{ kind: 'status', status: 'done' }],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: { providerOverride: mockProvider([{ text: 'ok' }]) },
+    });
+    expect(r.passed).toBe(false);
+    expect(r.failure ?? '').toMatch(/escapes the eval workspace/);
+  });
+
+  test('setup.files with absolute path is rejected at runtime', async () => {
+    const c = baseCase({
+      setup: { files: { '/tmp/forja-eval-escape-test.txt': 'leak' } },
+      expect: [{ kind: 'status', status: 'done' }],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: { providerOverride: mockProvider([{ text: 'ok' }]) },
+    });
+    expect(r.passed).toBe(false);
+    expect(r.failure ?? '').toMatch(/escapes the eval workspace/);
+    // Confirm nothing was actually written.
+    const { existsSync } = await import('node:fs');
+    expect(existsSync('/tmp/forja-eval-escape-test.txt')).toBe(false);
+  });
+
   test('budget cap on cost is strict-greater: cost==budget passes', async () => {
     // Mock provider emits no usage events, so costUsd=0. With
     // maxCostUsd:0, cost equals budget — not exceeded — and the

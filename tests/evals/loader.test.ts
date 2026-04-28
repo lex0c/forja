@@ -231,6 +231,74 @@ expect:
     );
   });
 
+  test('rejects setup.files path with .. segment', () => {
+    const yaml = `
+name: x
+prompt: y
+setup:
+  files:
+    "../escape.txt": "leak"
+expect:
+  - status: done
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(/contains '\.\.' segment/);
+  });
+
+  test('rejects setup.files path with .. segment in middle', () => {
+    const yaml = `
+name: x
+prompt: y
+setup:
+  files:
+    "src/../../escape.txt": "leak"
+expect:
+  - status: done
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(/contains '\.\.' segment/);
+  });
+
+  test('rejects setup.files absolute path (POSIX)', () => {
+    const yaml = `
+name: x
+prompt: y
+setup:
+  files:
+    "/tmp/escape.txt": "leak"
+expect:
+  - status: done
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(/is absolute/);
+  });
+
+  test('rejects setup.files empty key', () => {
+    const yaml = `
+name: x
+prompt: y
+setup:
+  files:
+    "": "leak"
+expect:
+  - status: done
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(/non-empty path/);
+  });
+
+  test('accepts safe relative paths with subdirectories', () => {
+    const yaml = `
+name: x
+prompt: y
+setup:
+  files:
+    "src/nested/file.txt": "ok"
+    "config.json": "{}"
+expect:
+  - status: done
+`;
+    const c = parseEvalCase(yaml, '/tmp/c.yaml');
+    expect(c.setup?.files?.['src/nested/file.txt']).toBe('ok');
+    expect(c.setup?.files?.['config.json']).toBe('{}');
+  });
+
   test('rejects compaction_triggered with unknown strategy', () => {
     const yaml = `
 name: x

@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { type BootstrapInput, bootstrap } from '../cli/bootstrap.ts';
 import { type HarnessEvent, type HarnessResult, runAgent } from '../harness/index.ts';
 import type { EvalCase, EvalCaseResult, EvalSummary, ExpectationOutcome } from './types.ts';
@@ -50,6 +50,20 @@ const DEFAULT_EVAL_POLICY_YAML = `defaults:
   mode: bypass
 `;
 
+// Refuse setup.files paths that would write outside the eval
+// workspace. Eval YAML is shareable (CI, gist links, registry);
+// `../../../etc/cron.d/payload` or `/tmp/exfil` would happily
+// land via the previous `join(dir, relPath)` if relPath was
+// crafted to escape. `resolve(dir, relPath)` collapses `..`
+// segments and absolute prefixes; we then prove containment
+// against the resolved sandbox root before writing.
+const containsPath = (parent: string, child: string): boolean => {
+  const resolvedParent = resolve(parent);
+  const resolvedChild = resolve(child);
+  if (resolvedChild === resolvedParent) return true;
+  return resolvedChild.startsWith(resolvedParent + sep);
+};
+
 const setupCwd = (caseDef: EvalCase): string => {
   const dir = mkdtempSync(join(tmpdir(), 'forja-eval-'));
   if (caseDef.setup?.fixture !== undefined) {
@@ -61,7 +75,10 @@ const setupCwd = (caseDef: EvalCase): string => {
   }
   if (caseDef.setup?.files !== undefined) {
     for (const [relPath, body] of Object.entries(caseDef.setup.files)) {
-      const target = join(dir, relPath);
+      const target = resolve(dir, relPath);
+      if (!containsPath(dir, target)) {
+        throw new Error(`eval setup.files path '${relPath}' escapes the eval workspace`);
+      }
       const targetDir = dirname(target);
       if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });
       writeFileSync(target, body);

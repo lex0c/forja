@@ -1,5 +1,5 @@
 import { readFileSync, statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import type { EvalBudget, EvalCase, EvalExpectation, EvalSetup } from './types.ts';
 
@@ -89,6 +89,26 @@ const parseSetup = (raw: unknown): EvalSetup | undefined => {
     for (const [path, body] of Object.entries(files)) {
       if (typeof body !== 'string') {
         throw new Error(`eval: setup.files['${path}'] must be a string`);
+      }
+      // Surface sandbox-escape attempts at parse time so a
+      // malicious YAML never gets to runtime FS calls. The
+      // executor checks resolved containment too (defense in
+      // depth — direct EvalCase construction in tests bypasses
+      // the loader). Block: empty key, absolute paths
+      // (`/etc/...`, `C:\...`), and any `..` segment.
+      if (path.length === 0) {
+        throw new Error('eval: setup.files key must be a non-empty path');
+      }
+      if (isAbsolute(path)) {
+        throw new Error(
+          `eval: setup.files['${path}'] is absolute; only paths relative to the eval workspace are allowed`,
+        );
+      }
+      const segments = path.split(/[\\/]/);
+      if (segments.includes('..')) {
+        throw new Error(
+          `eval: setup.files['${path}'] contains '..' segment; paths must stay inside the eval workspace`,
+        );
       }
       out[path] = body;
     }

@@ -24,7 +24,7 @@ const discoverCases = (dir: string): string[] => {
   return out.sort();
 };
 
-interface CliArgs {
+export interface CliArgs {
   // Either a directory of YAML cases or a single YAML file. When
   // omitted, defaults to `evals/smoke` relative to cwd.
   target: string;
@@ -39,7 +39,21 @@ interface CliArgs {
   repeat: number;
 }
 
-const parseArgs = (argv: readonly string[]): CliArgs => {
+// Consume the value that follows a value-taking flag. Refuses to
+// swallow another flag (`--model --repeat 5` would silently make
+// '--repeat' the model id) or fall off the end of argv
+// (`forja eval --model` with no value would assign undefined).
+// Either case ran the wrong model in CI before this guard,
+// invalidating cost/pass-rate baselines without a visible error.
+const expectValue = (argv: readonly string[], i: number, flag: string): string => {
+  const next = argv[i + 1];
+  if (next === undefined || next.startsWith('-')) {
+    throw new Error(`${flag} requires a value`);
+  }
+  return next;
+};
+
+export const parseArgs = (argv: readonly string[]): CliArgs => {
   let target = 'evals/smoke';
   let modelId: string | undefined;
   let perCaseTimeoutMs: number | undefined;
@@ -47,11 +61,14 @@ const parseArgs = (argv: readonly string[]): CliArgs => {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--model') {
-      modelId = argv[++i];
+      modelId = expectValue(argv, i, '--model');
+      i += 1;
       continue;
     }
     if (a === '--timeout-ms') {
-      const v = Number(argv[++i]);
+      const raw = expectValue(argv, i, '--timeout-ms');
+      i += 1;
+      const v = Number(raw);
       if (!Number.isFinite(v) || v <= 0) {
         throw new Error('--timeout-ms must be a positive number');
       }
@@ -59,7 +76,9 @@ const parseArgs = (argv: readonly string[]): CliArgs => {
       continue;
     }
     if (a === '--repeat') {
-      const v = Number(argv[++i]);
+      const raw = expectValue(argv, i, '--repeat');
+      i += 1;
+      const v = Number(raw);
       if (!Number.isInteger(v) || v < 1) {
         throw new Error('--repeat must be a positive integer');
       }
