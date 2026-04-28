@@ -73,25 +73,41 @@ export async function* normalizeGoogleStream(
   let messageStarted = false;
   let stopReason: StopReason = 'end_turn';
   let toolCallCounter = 0;
-  // Accumulate the final usageMetadata seen during the stream. Gemini
-  // reports cumulative counts, so the LAST chunk is authoritative.
-  // cache_creation isn't a Gemini concept (its cache is server-persistent
-  // and pre-warmed via a separate API), so we leave it at zero.
-  // `usageSeen` gates emission of the canonical `usage` event: older
-  // SDK responses can omit usageMetadata entirely; in that case we want
-  // the harness to record NULL, not 0.
-  const usage: UsageInfo = { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
+  // Accumulate raw counters across the stream and split prompt-vs-cache
+  // only at emit time. Splitting per-chunk would let a later partial
+  // usageMetadata (e.g., only candidatesTokenCount) reset earlier
+  // prompt/cache values to 0 via `?? 0` defaults — silently
+  // underreporting cost. `Math.max` is monotonic over Gemini's
+  // cumulative reports and recovers the largest value over any
+  // hypothetical delta-style report. cache_creation isn't a Gemini
+  // concept (its cache is server-persistent and pre-warmed via a
+  // separate API), so it stays at zero.
+  let rawPrompt = 0;
+  let rawCandidates = 0;
+  let rawCached = 0;
   let usageSeen = false;
 
   for await (const chunk of raw) {
     if (chunk.usageMetadata !== undefined) {
       const u = chunk.usageMetadata;
-      const cached = u.cachedContentTokenCount ?? 0;
-      const prompt = u.promptTokenCount ?? 0;
-      usage.input = Math.max(0, prompt - cached);
-      usage.cache_read = cached;
-      usage.output = u.candidatesTokenCount ?? 0;
-      usageSeen = true;
+      // Field-level detection: an empty `usageMetadata: {}` (older SDKs
+      // sometimes send the field with no counts) is NOT measurement.
+      // Without this, defaults flip the flag and the harness persists
+      // 0 instead of NULL.
+      let touched = false;
+      if (typeof u.promptTokenCount === 'number') {
+        rawPrompt = Math.max(rawPrompt, u.promptTokenCount);
+        touched = true;
+      }
+      if (typeof u.candidatesTokenCount === 'number') {
+        rawCandidates = Math.max(rawCandidates, u.candidatesTokenCount);
+        touched = true;
+      }
+      if (typeof u.cachedContentTokenCount === 'number') {
+        rawCached = Math.max(rawCached, u.cachedContentTokenCount);
+        touched = true;
+      }
+      if (touched) usageSeen = true;
     }
     if (!messageStarted) {
       yield { kind: 'start', message_id: chunk.responseId ?? synthesizeMessageId() };
@@ -130,6 +146,17 @@ export async function* normalizeGoogleStream(
   if (!messageStarted) {
     yield { kind: 'start', message_id: synthesizeMessageId() };
   }
-  if (usageSeen) yield { kind: 'usage', usage };
+  if (usageSeen) {
+    // Gemini's promptTokenCount is the FULL prompt count including the
+    // cached portion (matches OpenAI semantics). Split here so `input`
+    // is non-cached at the cost computer's input rate.
+    const usage: UsageInfo = {
+      input: Math.max(0, rawPrompt - rawCached),
+      output: rawCandidates,
+      cache_read: rawCached,
+      cache_creation: 0,
+    };
+    yield { kind: 'usage', usage };
+  }
   yield { kind: 'stop', reason: stopReason };
 }

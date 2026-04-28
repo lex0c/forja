@@ -24,6 +24,7 @@ describe('JSON renderer', () => {
           durationMs: 5,
           usage: { input: 10, output: 5, cache_read: 0, cache_creation: 0 },
           costUsd: 0.0001,
+          usageComplete: true,
         },
       },
     ];

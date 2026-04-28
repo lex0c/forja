@@ -92,15 +92,20 @@ export async function* normalizeOpenAIStream(
   let messageStarted = false;
   let stopReason: StopReason = 'end_turn';
   const toolCalls = new Map<number, ToolCallInProgress>();
-  // OpenAI streams usage on the final chunk when include_usage is set.
-  // Cache writes aren't reported separately (the prompt_tokens_details
-  // shape only exposes reads), so cache_creation stays at zero.
-  // `usageSeen` gates emission of the canonical `usage` event: compat
-  // endpoints (older Azure, some proxies) silently drop stream_options,
-  // so no usage chunk ever arrives. Emitting a synthetic zero would
-  // make the harness record 0 instead of NULL — confusing "no telemetry"
-  // with "measured zero spend".
-  const usage: UsageInfo = { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
+  // Accumulate raw counters across the stream and split prompt-vs-cache
+  // only at emit time. OpenAI normally emits usage in a single final
+  // chunk, but compat endpoints / future SDK shifts could split the
+  // report; per-chunk `?? 0` defaults would let a later partial usage
+  // payload reset earlier values to zero. `Math.max` keeps the largest
+  // observation. Cache writes aren't reported separately by OpenAI
+  // (prompt_tokens_details only exposes reads), so cache_creation
+  // stays at zero. `usageSeen` gates emission of the canonical event:
+  // compat endpoints (older Azure, some proxies) silently drop
+  // stream_options, so no usage chunk ever arrives — emitting a
+  // synthetic zero would confuse "no telemetry" with "measured zero".
+  let rawPrompt = 0;
+  let rawCompletion = 0;
+  let rawCached = 0;
   let usageSeen = false;
 
   for await (const chunk of raw) {
@@ -111,16 +116,23 @@ export async function* normalizeOpenAIStream(
 
     if (chunk.usage !== undefined && chunk.usage !== null) {
       const u = chunk.usage;
-      const cached = u.prompt_tokens_details?.cached_tokens ?? 0;
-      const prompt = u.prompt_tokens ?? 0;
-      // OpenAI's `prompt_tokens` is the full prompt count *including* the
-      // cached portion. Split so `input` matches Anthropic's semantics
-      // (non-cached input tokens) and cost math composes the same way
-      // across providers.
-      usage.input = Math.max(0, prompt - cached);
-      usage.cache_read = cached;
-      usage.output = u.completion_tokens ?? 0;
-      usageSeen = true;
+      // Field-level detection: a usage object that's present but missing
+      // every token field (compat endpoint that returns `usage: {}`, or
+      // a malformed proxy response) is NOT measurement.
+      let touched = false;
+      if (typeof u.prompt_tokens === 'number') {
+        rawPrompt = Math.max(rawPrompt, u.prompt_tokens);
+        touched = true;
+      }
+      if (typeof u.completion_tokens === 'number') {
+        rawCompletion = Math.max(rawCompletion, u.completion_tokens);
+        touched = true;
+      }
+      if (typeof u.prompt_tokens_details?.cached_tokens === 'number') {
+        rawCached = Math.max(rawCached, u.prompt_tokens_details.cached_tokens);
+        touched = true;
+      }
+      if (touched) usageSeen = true;
     }
 
     const choice = chunk.choices?.[0];
@@ -230,6 +242,18 @@ export async function* normalizeOpenAIStream(
   if (!messageStarted) {
     yield { kind: 'start', message_id: synthesizeMessageId() };
   }
-  if (usageSeen) yield { kind: 'usage', usage };
+  if (usageSeen) {
+    // OpenAI's `prompt_tokens` is the full prompt count *including*
+    // the cached portion. Split here so `input` matches Anthropic's
+    // semantics (non-cached input tokens) and cost math composes the
+    // same way across providers.
+    const usage: UsageInfo = {
+      input: Math.max(0, rawPrompt - rawCached),
+      output: rawCompletion,
+      cache_read: rawCached,
+      cache_creation: 0,
+    };
+    yield { kind: 'usage', usage };
+  }
   yield { kind: 'stop', reason: stopReason };
 }

@@ -113,6 +113,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // event so renderers can show "$X.XX, N tokens" without re-querying.
   let totalUsage = emptyUsage();
   let totalCostUsd = 0;
+  // Stays true until an assistant turn produces output without an
+  // accompanying usage event. The aggregate `usage`/`costUsd` only
+  // sums measured turns; this flag tells the caller whether those
+  // numbers are complete or a lower-bound estimate.
+  let usageComplete = true;
 
   // Distinguish wall-clock from user abort — both use `signal.aborted` but
   // the user wants different exit reasons.
@@ -139,6 +144,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       durationMs: Date.now() - startMs,
       usage: totalUsage,
       costUsd: totalCostUsd,
+      usageComplete,
       lastMessageId,
     };
     if (detail !== undefined) result.detail = detail;
@@ -238,6 +244,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       const turnCostUsd = computeCost(config.provider.capabilities, collected.usage);
       totalUsage = addUsage(totalUsage, collected.usage);
       totalCostUsd += turnCostUsd;
+      // A turn that produced ANY output (text or tool_use) without a
+      // usage event is unmeasured — flip the session-level flag so
+      // the renderer marks the cost as a lower bound. Empty assistant
+      // turns (no text, no tool_uses) are skipped: if the model said
+      // nothing, missing usage isn't underreporting anything.
+      const producedOutput = collected.text.length > 0 || collected.tool_uses.length > 0;
+      if (producedOutput && !collected.usageSeen) usageComplete = false;
 
       // When the adapter never emitted a `usage` event, persist NULL on
       // the token/cost columns instead of zeroes. Future analytics can

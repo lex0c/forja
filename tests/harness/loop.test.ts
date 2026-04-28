@@ -382,6 +382,55 @@ describe('runAgent', () => {
     expect(assistant?.costUsd).toBeCloseTo(0.3, 6);
   });
 
+  test('usageComplete flips false when an output-producing turn lacked a usage event', async () => {
+    // Two turns: first produces text + tool_use WITH usage, second is
+    // an assistant text turn WITHOUT usage. Flag must end false so the
+    // renderer marks aggregate cost as a lower bound.
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: 'hi' } }],
+          stop_reason: 'tool_use',
+          usage: { input: 100, output: 20 },
+        },
+        // No `usage:` field → replayStep doesn't yield kind:'usage'.
+        { text: 'done', stop_reason: 'end_turn' },
+      ],
+      { capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 } },
+    );
+    const result = await runAgent(config);
+    expect(result.usageComplete).toBe(false);
+    // Aggregate sums only the measured turn — verify it didn't fold in
+    // a phantom zero from the unmeasured one.
+    expect(result.usage.input).toBe(100);
+  });
+
+  test('usageComplete stays true when every output-producing turn reported usage', async () => {
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: 'hi' } }],
+          stop_reason: 'tool_use',
+          usage: { input: 50, output: 10 },
+        },
+        { text: 'done', stop_reason: 'end_turn', usage: { input: 60, output: 5 } },
+      ],
+      { capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 } },
+    );
+    const result = await runAgent(config);
+    expect(result.usageComplete).toBe(true);
+  });
+
+  test('usageComplete ignores empty assistant turns without usage', async () => {
+    // An assistant turn with no text and no tool_uses (the model said
+    // nothing) lacking usage isn't underreporting anything — flag
+    // should stay true. Hard to stage in production, but the test
+    // pins the contract so a future refactor doesn't drift.
+    const { config } = buildConfig([{ stop_reason: 'end_turn' }]);
+    const result = await runAgent(config);
+    expect(result.usageComplete).toBe(true);
+  });
+
   test('persists NULL token columns when the adapter never emits a usage event', async () => {
     // No `usage:` on the scripted step → replayStep never yields kind:'usage'.
     // The collector's usageSeen stays false and the harness writes NULL

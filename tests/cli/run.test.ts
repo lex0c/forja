@@ -97,6 +97,7 @@ describe('exitCodeFor', () => {
         durationMs: 1,
         usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
         costUsd: 0,
+        usageComplete: true,
       }),
     ).toBe(0);
   });
@@ -110,6 +111,7 @@ describe('exitCodeFor', () => {
         durationMs: 1,
         usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
         costUsd: 0,
+        usageComplete: true,
       }),
     ).toBe(2);
   });
@@ -123,6 +125,7 @@ describe('exitCodeFor', () => {
         durationMs: 1,
         usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
         costUsd: 0,
+        usageComplete: true,
       }),
     ).toBe(130);
   });
@@ -136,6 +139,7 @@ describe('exitCodeFor', () => {
         durationMs: 1,
         usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
         costUsd: 0,
+        usageComplete: true,
       }),
     ).toBe(1);
   });

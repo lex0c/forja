@@ -489,6 +489,68 @@ describe('normalizeOpenAIStream', () => {
     expect(events[1]).toEqual({ kind: 'stop', reason: 'end_turn' });
   });
 
+  test('does NOT emit a usage event when chunk.usage is an empty object', async () => {
+    // Compat endpoints sometimes echo back `usage: {}` without any
+    // token fields. Field-level detection should refuse to flip the
+    // usageSeen flag and the harness should record NULL, not 0.
+    const events = await collect(
+      normalizeOpenAIStream(
+        fromChunks([
+          { id: 'cmpl-x', choices: [{ delta: { content: 'hi' } }] },
+          { choices: [{ delta: {}, finish_reason: 'stop' }] },
+          { choices: [], usage: {} },
+        ]),
+      ),
+    );
+    expect(events.find((e) => e.kind === 'usage')).toBeUndefined();
+  });
+
+  test('partial later usage chunk does not zero earlier prompt/cache values', async () => {
+    // Bug regression: per-chunk `?? 0` defaults would let a usage chunk
+    // carrying only completion_tokens reset prompt/cache to 0, silently
+    // underreporting cost. Field-by-field merge with Math.max keeps the
+    // largest value seen.
+    const events = await collect(
+      normalizeOpenAIStream(
+        fromChunks([
+          { id: 'cmpl-x', choices: [{ delta: { content: 'hi' } }] },
+          { choices: [{ delta: {}, finish_reason: 'stop' }] },
+          {
+            choices: [],
+            usage: {
+              prompt_tokens: 1200,
+              prompt_tokens_details: { cached_tokens: 1000 },
+              completion_tokens: 5,
+            },
+          },
+          // Later chunk carries only completion_tokens — must NOT erase
+          // prompt/cache values from the earlier chunk.
+          { choices: [], usage: { completion_tokens: 12 } },
+        ]),
+      ),
+    );
+    const u = events.find((e) => e.kind === 'usage');
+    if (u?.kind !== 'usage') throw new Error('expected usage event');
+    expect(u.usage).toEqual({ input: 200, output: 12, cache_read: 1000, cache_creation: 0 });
+  });
+
+  test('emits a usage event when only completion_tokens is present', async () => {
+    // Partial measurement (one field set) is still measurement.
+    const events = await collect(
+      normalizeOpenAIStream(
+        fromChunks([
+          { id: 'cmpl-x', choices: [{ delta: { content: 'hi' } }] },
+          { choices: [{ delta: {}, finish_reason: 'stop' }] },
+          { choices: [], usage: { completion_tokens: 9 } },
+        ]),
+      ),
+    );
+    const u = events.find((e) => e.kind === 'usage');
+    if (u?.kind !== 'usage') throw new Error('expected usage event');
+    expect(u.usage.output).toBe(9);
+    expect(u.usage.input).toBe(0);
+  });
+
   test('does NOT emit a usage event when no chunk carries usage (compat endpoint case)', async () => {
     // Some OpenAI-compatible endpoints silently drop stream_options.
     // Emitting a synthetic zero would flip the harness's `usageSeen`

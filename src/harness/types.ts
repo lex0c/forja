@@ -85,10 +85,18 @@ export interface HarnessResult {
   sessionId: string;
   steps: number;
   durationMs: number;
-  // Aggregated token usage across all provider turns this run.
+  // Aggregated token usage across all provider turns this run. Only
+  // turns that reported usage contribute; see `usageComplete`.
   usage: UsageInfo;
-  // Total cost computed from `usage` × the provider's pricing.
+  // Total cost computed from `usage` × the provider's pricing. Same
+  // completeness caveat as `usage`.
   costUsd: number;
+  // True iff every assistant turn this session emitted a `usage`
+  // event. False when at least one turn produced output but no usage
+  // (compat endpoints that drop stream_options, mid-stream failures,
+  // older SDKs without telemetry). Renderers should mark partial
+  // results as estimates so the user doesn't read the cost as final.
+  usageComplete: boolean;
   // Final assistant message id, if any was produced.
   lastMessageId?: string;
   // Optional human-readable detail for diagnostics (e.g., the provider

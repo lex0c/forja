@@ -202,6 +202,68 @@ describe('normalizeGoogleStream', () => {
     ]);
   });
 
+  test('does NOT emit a usage event when usageMetadata is an empty object', async () => {
+    const events = await collect(
+      normalizeGoogleStream(
+        fromChunks([
+          {
+            responseId: 'r',
+            candidates: [{ content: { parts: [{ text: 'hi' }] }, finishReason: 'STOP' }],
+            usageMetadata: {},
+          },
+        ]),
+      ),
+    );
+    expect(events.find((e) => e.kind === 'usage')).toBeUndefined();
+  });
+
+  test('partial later usageMetadata does not zero earlier prompt/cache values', async () => {
+    // Bug regression: a later chunk reporting only candidatesTokenCount
+    // must not reset previously captured promptTokenCount/cached values
+    // to 0 via `?? 0` defaults.
+    const events = await collect(
+      normalizeGoogleStream(
+        fromChunks([
+          {
+            responseId: 'r',
+            candidates: [{ content: { parts: [{ text: 'one ' }] } }],
+            usageMetadata: {
+              promptTokenCount: 1500,
+              cachedContentTokenCount: 1000,
+              candidatesTokenCount: 3,
+            },
+          },
+          {
+            candidates: [{ content: { parts: [{ text: 'two' }] }, finishReason: 'STOP' }],
+            // Partial: only the latest output count.
+            usageMetadata: { candidatesTokenCount: 30 },
+          },
+        ]),
+      ),
+    );
+    const u = events.find((e) => e.kind === 'usage');
+    if (u?.kind !== 'usage') throw new Error('expected usage event');
+    expect(u.usage).toEqual({ input: 500, output: 30, cache_read: 1000, cache_creation: 0 });
+  });
+
+  test('emits a usage event with partial measurement (only candidatesTokenCount)', async () => {
+    const events = await collect(
+      normalizeGoogleStream(
+        fromChunks([
+          {
+            responseId: 'r',
+            candidates: [{ content: { parts: [{ text: 'hi' }] }, finishReason: 'STOP' }],
+            usageMetadata: { candidatesTokenCount: 7 },
+          },
+        ]),
+      ),
+    );
+    const u = events.find((e) => e.kind === 'usage');
+    if (u?.kind !== 'usage') throw new Error('expected usage event');
+    expect(u.usage.output).toBe(7);
+    expect(u.usage.input).toBe(0);
+  });
+
   test('does NOT emit a usage event when no chunk carries usageMetadata', async () => {
     const events = await collect(
       normalizeGoogleStream(

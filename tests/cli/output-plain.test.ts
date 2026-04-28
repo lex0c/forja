@@ -140,6 +140,7 @@ describe('plain renderer', () => {
         durationMs: 1234,
         usage: { input: 100, output: 50, cache_read: 0, cache_creation: 0 },
         costUsd: 0.0123,
+        usageComplete: true,
       },
     });
     const out = cap.err.join('');
@@ -162,6 +163,7 @@ describe('plain renderer', () => {
         durationMs: 50,
         usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
         costUsd: 0,
+        usageComplete: true,
         detail: '5 consecutive tool errors',
       },
     });
@@ -183,6 +185,7 @@ describe('plain renderer', () => {
           durationMs: 1,
           usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
           costUsd,
+          usageComplete: true,
         },
       });
       return cap.err.join('');
@@ -192,6 +195,28 @@ describe('plain renderer', () => {
     expect(sample(2.5)).not.toContain('$2.5000');
     expect(sample(150)).toContain('$150.00');
     expect(sample(150)).not.toContain('$150.000');
+  });
+
+  test('session_finished marks tokens and cost as estimates when usageComplete is false', () => {
+    const { renderer, cap } = make();
+    renderer.onEvent({
+      type: 'session_finished',
+      result: {
+        status: 'done',
+        reason: 'done',
+        sessionId: 's',
+        steps: 2,
+        durationMs: 10,
+        usage: { input: 100, output: 20, cache_read: 0, cache_creation: 0 },
+        costUsd: 0.005,
+        usageComplete: false,
+      },
+    });
+    const out = cap.err.join('');
+    // Tilde prefix on both fields signals "lower bound" — at least one
+    // turn this session produced output without reporting telemetry.
+    expect(out).toContain('tokens ~100/20');
+    expect(out).toContain('~$0.0050');
   });
 
   test('session_finished shows cache columns when non-zero', () => {
@@ -206,6 +231,7 @@ describe('plain renderer', () => {
         durationMs: 10,
         usage: { input: 200, output: 80, cache_read: 1000, cache_creation: 500 },
         costUsd: 0.005,
+        usageComplete: true,
       },
     });
     const out = cap.err.join('');

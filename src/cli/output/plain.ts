@@ -119,9 +119,14 @@ export const createPlainRenderer = (options: PlainRendererOptions): OutputRender
           if (u.cache_creation > 0) cacheBits.push(`cache_w ${u.cache_creation}`);
           const cache = cacheBits.length > 0 ? ` (${cacheBits.join(', ')})` : '';
           const tokens = `${u.input}/${u.output}${cache}`;
-          const cost = formatCost(r.costUsd);
+          // Tilde indicates the value is a lower bound — at least one
+          // turn this session produced output without reporting usage.
+          // Mark both tokens and cost so the user reads them as
+          // estimates instead of authoritative totals.
+          const cost = `${r.usageComplete ? '' : '~'}${formatCost(r.costUsd)}`;
+          const tokenLabel = r.usageComplete ? `tokens ${tokens}` : `tokens ~${tokens}`;
           err(
-            `\n${colored} ${r.steps} steps · ${r.durationMs}ms · ${color(useColor, DIM, `tokens ${tokens} · ${cost}`)}${detail}\n`,
+            `\n${colored} ${r.steps} steps · ${r.durationMs}ms · ${color(useColor, DIM, `${tokenLabel} · ${cost}`)}${detail}\n`,
           );
           break;
         }
