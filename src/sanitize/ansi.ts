@@ -62,6 +62,14 @@ const ANSI_PATTERN = new RegExp(
     '\\x1b[@-~]',
     // C1 control bytes (8-bit single-byte equivalents)
     '[\\x80-\\x9f]',
+    // Bare ESC fallback: any \x1b not consumed by a pattern above is
+    // a stray control introducer. Leaving it would violate the
+    // invariant that no control bytes reach model/audit sinks —
+    // string concatenation downstream could pair it with later text
+    // and re-form a live escape (e.g., `output + "\x1b" + nextChunk`
+    // where nextChunk starts with `[31m`). Always strip. Comes last
+    // so structured sequences match first.
+    '\\x1b',
   ].join('|'),
   'g',
 );

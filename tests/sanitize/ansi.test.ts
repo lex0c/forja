@@ -60,9 +60,34 @@ describe('stripAnsi', () => {
     // bytes is the security risk we're guarding against, while a
     // stray `123;` in output is harmless noise.
     expect(stripAnsi('foo\x1b[123;')).toBe('foo123;');
-    // ESC alone at end-of-string with no following byte is left as-is
-    // — the single-char rule requires a printable byte after.
-    expect(stripAnsi('foo\x1b')).toBe('foo\x1b');
+  });
+
+  test('strips bare ESC bytes that no other pattern consumed', () => {
+    // Trailing ESC at end-of-string: previous rules required a
+    // following byte. Leaving it would violate the invariant — a
+    // downstream concatenation `persisted + nextChunk` where
+    // nextChunk starts with `[31m` would reconstitute a live escape.
+    expect(stripAnsi('foo\x1b')).toBe('foo');
+    // ESC followed by a non-printable that no alternative matches
+    // (e.g., \t at 0x09 sits below 0x40 so the single-char rule
+    // declines). The bare-ESC fallback strips ESC; the \t survives
+    // as the legitimate whitespace it is.
+    expect(stripAnsi('foo\x1b\tbar')).toBe('foo\tbar');
+    // Two ESCs back to back: the first has no printable byte after
+    // it (the second ESC is itself 0x1B, below the 0x40-0x7E
+    // single-char range), so the bare-ESC fallback strips it. The
+    // second ESC then pairs with the following `b` (0x62, in range)
+    // as a legitimate single-char escape and is consumed as a unit.
+    expect(stripAnsi('a\x1b\x1bb')).toBe('a');
+    // Two ESCs at end-of-string: nothing printable to pair with;
+    // the bare-ESC fallback fires twice.
+    expect(stripAnsi('end\x1b\x1b')).toBe('end');
+    // ESC followed by a sub-0x40 byte (digit `1` is 0x31): single-
+    // char declines, bare-ESC strips ESC, digit survives.
+    expect(stripAnsi('a\x1b1b')).toBe('a1b');
+    // Sanity: structured patterns still match first — a complete
+    // CSI is consumed as a unit, not byte-by-byte.
+    expect(stripAnsi('a\x1b[31mb\x1b[0m')).toBe('ab');
   });
 
   test('does not strip tab/newline/CR/null (legitimate whitespace bytes)', () => {
