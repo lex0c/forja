@@ -409,6 +409,23 @@ describe('runAgent', () => {
     expect(result.usage.input).toBe(100);
   });
 
+  test('partial run persists usage_complete=false on the sessions row', async () => {
+    // The runtime flag must reach the DB so audit queries can mark the
+    // total as a lower bound. Without persistence, any future
+    // `agent audit costs` lookup would silently underreport.
+    const { config } = buildConfig(
+      [
+        { tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: 'hi' } }], stop_reason: 'tool_use' },
+        { text: 'done', stop_reason: 'end_turn' },
+      ],
+      { capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 } },
+    );
+    const result = await runAgent(config);
+    expect(result.usageComplete).toBe(false);
+    const session = getSession(db, result.sessionId);
+    expect(session?.usageComplete).toBe(false);
+  });
+
   test('usageComplete stays true when every output-producing turn reported usage', async () => {
     const { config } = buildConfig(
       [
@@ -772,6 +789,10 @@ describe('runAgent', () => {
     });
     expect(result.status).toBe('interrupted');
     expect(result.reason).toBe('aborted');
+    // Mid-stream abort means the request went out (likely billed for
+    // input tokens) without a usage event reaching us. Aggregate must
+    // be marked as a lower bound.
+    expect(result.usageComplete).toBe(false);
   });
 
   test('init failure (createSession throws) clears wall-clock timer', async () => {
@@ -835,5 +856,20 @@ describe('runAgent', () => {
     expect(result.status).toBe('error');
     expect(result.reason).toBe('providerError');
     expect(result.detail).toContain('network');
+    // Provider error mid-call: input tokens may have been billed
+    // before the throw. No usage event reached us — aggregate is a
+    // lower bound, flag must be false.
+    expect(result.usageComplete).toBe(false);
+  });
+
+  test('init failure surfaces with usageComplete=false', async () => {
+    // guardedFinish path: any uncaught throw in the harness body has
+    // ambiguous billing state. Safer to mark partial than to claim
+    // authoritative totals when we don't know.
+    db.close();
+    const { config } = buildConfig([{ text: 'never reached', stop_reason: 'end_turn' }]);
+    const result = await runAgent(config);
+    expect(result.reason).toBe('internalError');
+    expect(result.usageComplete).toBe(false);
   });
 });
