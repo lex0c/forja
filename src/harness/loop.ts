@@ -12,6 +12,7 @@ import { appendMessage, completeSession, createSession } from '../storage/index.
 import type { ToolContext } from '../tools/index.ts';
 import { abortableIterable } from './abortable.ts';
 import { collectStep } from './collect.ts';
+import { compactMessages } from './compaction.ts';
 import { invokeTool } from './invoke-tool.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
 import {
@@ -420,6 +421,53 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       });
       lastMessageId = resultMsg.id;
       messages.push({ role: 'user', content: toolResults });
+
+      // Compaction trigger check. We use the prompt tokens BILLED for
+      // the turn we just completed (from `collected.usage`) as a proxy
+      // for "size of the next request" — the next prompt is the same
+      // history plus the freshly-appended tool_results, so if the last
+      // turn was already over threshold the next will be even larger.
+      // Free signal — no extra HTTP call.
+      //
+      // DB messages stay untouched; only the in-memory `messages`
+      // array sent to the provider gets rewritten. Audit + replay can
+      // re-derive from the full history if they ever need a different
+      // compaction policy.
+      if (
+        !signal.aborted &&
+        collected.usageSeen &&
+        config.provider.capabilities.context_window > 0
+      ) {
+        const promptTokens =
+          collected.usage.input + collected.usage.cache_read + collected.usage.cache_creation;
+        const contextWindow = config.provider.capabilities.context_window;
+        const triggerAt = budget.compactionThreshold * contextWindow;
+        if (promptTokens > triggerAt && messages.length > 1 + budget.compactionPreserveTail) {
+          safeEmit(config.onEvent, {
+            type: 'compaction_started',
+            promptTokens,
+            threshold: triggerAt,
+            contextWindow,
+          });
+          const compactStart = Date.now();
+          const compaction = await compactMessages(config.provider, messages, {
+            preserveTail: budget.compactionPreserveTail,
+            signal,
+          });
+          // In-place replace so the caller's reference (none today,
+          // but defensive) sees the new history without reassignment.
+          messages.length = 0;
+          messages.push(...compaction.messages);
+          const finishedEvent: HarnessEvent = {
+            type: 'compaction_finished',
+            strategy: compaction.strategy,
+            foldedCount: compaction.foldedCount,
+            durationMs: Date.now() - compactStart,
+            ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
+          };
+          safeEmit(config.onEvent, finishedEvent);
+        }
+      }
     }
   } catch (e) {
     return guardedFinish(e);

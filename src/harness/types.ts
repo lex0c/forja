@@ -25,6 +25,21 @@ export type HarnessEvent =
       failed: boolean;
       durationMs: number;
     }
+  | {
+      type: 'compaction_started';
+      // Token count that crossed the threshold — what we observed
+      // BEFORE the next request would have gone out.
+      promptTokens: number;
+      threshold: number;
+      contextWindow: number;
+    }
+  | {
+      type: 'compaction_finished';
+      strategy: 'llm' | 'fallback' | 'skipped';
+      foldedCount: number;
+      durationMs: number;
+      reason?: string;
+    }
   | { type: 'session_finished'; result: HarnessResult };
 
 // Budget caps for an autonomous run. Per AGENTIC_CLI §5: every limit has
@@ -40,6 +55,14 @@ export interface RunBudget {
   // Cap on output tokens per provider call (passed straight through as
   // `max_tokens`). Not part of session-wide budget.
   maxOutputTokensPerCall: number;
+  // Fraction of `provider.capabilities.context_window` at which the
+  // harness triggers compaction. AGENTIC_CLI §6 / ORCHESTRATION §4.1
+  // recommend 0.7 — leaves 30% headroom for the compaction call
+  // itself plus the next response. Set to 1.0 to effectively disable.
+  compactionThreshold: number;
+  // Number of trailing turns preserved literally during compaction.
+  // ORCHESTRATION §4.6 recommends 3.
+  compactionPreserveTail: number;
 }
 
 export const DEFAULT_BUDGET: RunBudget = {
@@ -48,6 +71,8 @@ export const DEFAULT_BUDGET: RunBudget = {
   maxToolErrors: 5,
   maxRepeatedToolHash: 3,
   maxOutputTokensPerCall: 4096,
+  compactionThreshold: 0.7,
+  compactionPreserveTail: 3,
 };
 
 // Why the loop stopped. `done` is the only success path; everything else

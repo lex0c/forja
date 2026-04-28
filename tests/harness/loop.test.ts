@@ -131,7 +131,13 @@ const buildConfig = (
     extraTools?: Tool[];
     policy?: Partial<Policy>;
     signal?: AbortSignal;
-    budget?: Partial<{ maxSteps: number; maxToolErrors: number; maxRepeatedToolHash: number }>;
+    budget?: Partial<{
+      maxSteps: number;
+      maxToolErrors: number;
+      maxRepeatedToolHash: number;
+      compactionThreshold: number;
+      compactionPreserveTail: number;
+    }>;
     capsOverride?: Partial<Provider['capabilities']>;
   } = {},
 ) => {
@@ -860,6 +866,154 @@ describe('runAgent', () => {
     // before the throw. No usage event reached us — aggregate is a
     // lower bound, flag must be false.
     expect(result.usageComplete).toBe(false);
+  });
+
+  test('compaction triggers when prompt tokens cross the threshold', async () => {
+    // Tiny context window (1000) with low threshold makes the trigger
+    // fire on the first turn — we report 800 input tokens (80% of
+    // 1000) which is above the default 0.7 ratio. Need enough turns
+    // before the trigger to have something to fold (goal + 4 turns =
+    // 9 messages > 1 + tail(3)). Pre-stage them with a 2-turn
+    // sequence; trigger arrives after enough history exists.
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const { config, handle } = buildConfig(
+      [
+        // Turn 1: small response, low usage.
+        {
+          tool_uses: [{ id: 't1', name: 'echo', input: { msg: 'a' } }],
+          stop_reason: 'tool_use',
+          usage: { input: 100, output: 5 },
+        },
+        // Turn 2: same.
+        {
+          tool_uses: [{ id: 't2', name: 'echo', input: { msg: 'b' } }],
+          stop_reason: 'tool_use',
+          usage: { input: 200, output: 5 },
+        },
+        // Turn 3: prompt over threshold → triggers compaction
+        // before the next request goes out.
+        {
+          tool_uses: [{ id: 't3', name: 'echo', input: { msg: 'c' } }],
+          stop_reason: 'tool_use',
+          usage: { input: 800, output: 5 },
+        },
+        // Turn 4 (post-compaction): would receive the compacted
+        // summary call's reply too — provider returns an LLM-style
+        // summary first, then the next agent turn closes the loop.
+        // The compaction call goes through the SAME mock provider,
+        // pulling the next scripted step. We fake the summary as a
+        // plain text turn.
+        {
+          text: '[compacted_history]\nGOAL: test\nDECISIONS: (none)\nFILES_TOUCHED: (none)\nERRORS: (none)\nPENDING: (none)\n[/compacted_history]',
+          stop_reason: 'end_turn',
+        },
+        // Turn 5 (next agent step after compaction): finish.
+        { text: 'done', stop_reason: 'end_turn', usage: { input: 50, output: 3 } },
+      ],
+      {
+        capsOverride: { context_window: 1000, cost_per_1k_input: 0, cost_per_1k_output: 0 },
+        budget: { compactionThreshold: 0.7, compactionPreserveTail: 3, maxToolErrors: 99 },
+      },
+    );
+    const result = await runAgent({ ...config, onEvent: (e) => events.push(e) });
+    expect(result.status).toBe('done');
+    const started = events.find((e) => e.type === 'compaction_started');
+    const finished = events.find((e) => e.type === 'compaction_finished');
+    expect(started).toBeDefined();
+    expect(finished).toBeDefined();
+    if (finished?.type === 'compaction_finished') {
+      expect(finished.strategy).toBe('llm');
+      expect(finished.foldedCount).toBeGreaterThan(0);
+    }
+    // After compaction, the next request the provider sees must be
+    // shorter than the pre-compaction history. The mock captured all
+    // requests; the post-compaction step's request reflects the
+    // rewritten messages list.
+    const postCompactReq = handle.requests[handle.requests.length - 1];
+    expect(postCompactReq).toBeDefined();
+    if (postCompactReq !== undefined) {
+      expect(postCompactReq.messages.length).toBeLessThan(8);
+    }
+  });
+
+  test('compaction does NOT trigger when prompt tokens stay below threshold', async () => {
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'echo', input: { msg: 'hi' } }],
+          stop_reason: 'tool_use',
+          usage: { input: 100, output: 5 },
+        },
+        { text: 'done', stop_reason: 'end_turn', usage: { input: 110, output: 3 } },
+      ],
+      {
+        capsOverride: { context_window: 100_000 },
+      },
+    );
+    const result = await runAgent({ ...config, onEvent: (e) => events.push(e) });
+    expect(result.status).toBe('done');
+    expect(events.find((e) => e.type === 'compaction_started')).toBeUndefined();
+  });
+
+  test('compaction does NOT trigger after the run is aborted', async () => {
+    // If the user aborts between the tool_results push and the
+    // trigger check, the harness should skip compaction — the next
+    // iteration is about to exit anyway. Without the guard we'd
+    // burn an extra LLM call that immediately falls back.
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const ctrl = new AbortController();
+    // The mock aborts during turn 1's tool execution (echo is
+    // synchronous, but we abort right before the trigger by aborting
+    // inside the tool — abort runs before the next signal check).
+    const abortingTool: Tool = {
+      name: 'aborter',
+      description: 'aborts the signal mid-call',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: true },
+      async execute() {
+        ctrl.abort();
+        return { ok: true };
+      },
+    };
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'aborter', input: {} }],
+          stop_reason: 'tool_use',
+          // High input → would trigger compaction if not for abort.
+          usage: { input: 800, output: 5 },
+        },
+      ],
+      {
+        capsOverride: { context_window: 1000 },
+        budget: { compactionThreshold: 0.7, compactionPreserveTail: 1 },
+        signal: ctrl.signal,
+        extraTools: [abortingTool],
+      },
+    );
+    await runAgent({ ...config, onEvent: (e) => events.push(e) });
+    expect(events.find((e) => e.type === 'compaction_started')).toBeUndefined();
+  });
+
+  test('compaction does NOT trigger when the turn lacked usage telemetry', async () => {
+    // Without usageSeen we can't compute prompt tokens reliably; the
+    // trigger must skip rather than guess. The session ends as
+    // usageComplete=false (already covered) and no compaction fires.
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const { config } = buildConfig(
+      // No `usage:` on these steps → usageSeen=false.
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'echo', input: { msg: 'hi' } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ],
+      { capsOverride: { context_window: 100 } }, // tiny window
+    );
+    await runAgent({ ...config, onEvent: (e) => events.push(e) });
+    expect(events.find((e) => e.type === 'compaction_started')).toBeUndefined();
   });
 
   test('init failure surfaces with usageComplete=false', async () => {

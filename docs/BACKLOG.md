@@ -15,6 +15,147 @@ Format:
 
 ---
 
+## [2026-04-28] M2 / Step 3 — Compaction
+
+`AGENTIC_CLI.md §6` and `ORCHESTRATION.md §4` require the harness to
+shrink conversation history when the prompt approaches the model's
+context window. M1 sent the full history every turn; long sessions
+would either burn cache hits or hit the cap. Step 1's telemetry
+provides the trigger signal (per-turn prompt token count); Step 3
+spends it.
+
+**Done:**
+- `src/harness/compaction.ts` — `compactMessages(provider, messages, options)`
+  rewrites a `ProviderMessage[]` keeping the first user message
+  (goal) and the last K turns literal, summarizing everything in
+  between via an LLM call. Falls back to deterministic elision (drop
+  `tool_result` bodies, replace with `[tool_result elided: N bytes]`
+  pointers) when the LLM call fails. `temperature: 0` on the summary
+  call so the same input compacts the same way across reruns.
+- `src/harness/types.ts` — `RunBudget.compactionThreshold` (default
+  `0.7`) and `compactionPreserveTail` (default `3`) per spec
+  §4.1/§4.6. New `HarnessEvent` kinds `compaction_started` and
+  `compaction_finished` carry threshold, prompt tokens, strategy
+  (`'llm' | 'fallback' | 'skipped'`), folded count, duration, and
+  reason. JSON renderer carries them through NDJSON automatically.
+- `src/harness/loop.ts` — trigger check at the bottom of each loop
+  iteration (after tool_results push, before the next request). Uses
+  the LAST turn's `usage.input + cache_read + cache_creation` as a
+  proxy for "size of the next request" — free signal, no extra
+  countTokens HTTP call. Skips when telemetry was unavailable for
+  the turn (`usageSeen=false`) since a guess could be very wrong.
+  In-place rewrites the running `messages` array; the SQLite
+  `messages` table stays intact so audit / replay can re-derive a
+  different compaction policy later.
+- Synthetic summary message uses `assistant` role with explicit
+  `[compacted_history] ... [/compacted_history]` markers. Wrapper
+  re-adds markers if the model forgets them so downstream scanners
+  (recap, audit) can locate compacted blocks unambiguously.
+- Fallback path emits a synthetic note describing strategy + reason,
+  followed by the original middle messages with `tool_result` bodies
+  elided. Pointer string includes original byte size and points to
+  the audit log so a forensics user can recover the body.
+
+**New tests (+11 over Step 2):**
+- `tests/harness/compaction.test.ts` — 8 cases:
+  - LLM happy path: goal + tail preserved, middle replaced with one
+    summary message.
+  - Marker re-injection when the model returns prose without them.
+  - Summary request shape: `temperature: 0`, configurable `maxTokens`,
+    compaction system prompt instead of the run's.
+  - History too short → `strategy: 'skipped'`, no provider call.
+  - LLM throw → `strategy: 'fallback'`, original middle preserved
+    with `tool_result` content elided.
+  - Stream-only errors → fallback (no useful summary).
+  - Empty summary text → fallback.
+  - Aborted signal → fallback (the abort reaches the LLM call via
+    `abortableIterable`).
+- `tests/harness/loop.test.ts` — 3 cases:
+  - Trigger fires when `prompt_tokens > threshold × context_window`;
+    `compaction_started` and `compaction_finished` events emit;
+    post-compaction request reaches the provider with shorter
+    `messages.length`.
+  - Below threshold → no event.
+  - `usageSeen=false` → no event (can't guess size honestly).
+- Total suite: **459 pass / 7 skip / 1016 expect() calls** in ~1.5s.
+
+**Decisions:**
+- **Trigger signal is the LAST turn's billed prompt tokens**, not a
+  pre-flight `countTokens` call. `countTokens` would be a free-cost
+  HTTP roundtrip on Anthropic and a heuristic on OpenAI; reusing
+  telemetry already collected is exact (for the request that just
+  ran) and zero-cost. The next request is "this history + freshly
+  appended tool_results" — strictly larger than what we measured —
+  so a turn ≥70% guarantees the next ≥70%. Slightly eager but
+  always correct in the safe direction (trigger before we hit the
+  cap, never after).
+- **Skip when `usageSeen=false`.** Compat endpoints that drop usage
+  telemetry leave us blind to the actual prompt size. Guessing
+  (chars/4 heuristic over the messages) could be wildly off and
+  trigger needless compactions. The conservative call is to skip;
+  the user's `~$X.XX (incomplete)` cost indicator already signals
+  the missing telemetry.
+- **In-memory only — no DB rewrite.** `messages` table keeps every
+  original turn. Compaction only mutates the running provider array.
+  Replay can re-decide whether to compact or take the long path.
+  Avoids an "atomic mid-session DB rewrite" mechanism that would
+  multiply the test surface for marginal gain in M2.
+- **Same provider as the run for the summary call.** Spec §4.5
+  recommends a cheaper model per profile (Haiku for autonomous
+  Anthropic). Selecting the cheap model requires a registry-aware
+  policy that we'll add when we have profile abstractions in M3+.
+  For now, using the run's provider keeps the integration tight
+  and lets users override via the registry.
+- **Summary inserted as `assistant` role, not `user`.** Two
+  consecutive `user` messages would also be valid (Anthropic accepts),
+  but presenting the summary as the agent's own context note keeps
+  the next turn's user/assistant alternation obvious to the model
+  reading the prompt.
+- **Fallback preserves the middle messages with elided
+  `tool_result` content** rather than collapsing to a single note.
+  Tool_use blocks reference IDs the next turn might still cite;
+  preserving the structure (with bodies replaced by pointers) keeps
+  those references resolvable. Pointer carries original byte size
+  so a verbose-mode user knows the magnitude of what was dropped.
+- **Marker re-injection on missing markers.** Tests pin that the
+  wrapper re-adds `[compacted_history]...[/compacted_history]` when
+  the model forgets — drift in the model's structured-output
+  adherence shouldn't break downstream scanners.
+
+**Out of scope (deferred):**
+- `PreCompact` hook — requires hooks subsystem (M4).
+- Pinned context (`CONTEXT_TUNING.md §12.4`) — needs the slash
+  command surface and the user-facing pin/unpin UX.
+- Goal re-injection literal (`§4.2 step "Goal re-injection literal +
+  pinned context"`) — currently the goal IS preserved as message[0]
+  but isn't re-injected into the system prompt. Lands when system
+  prompt architecture (`CONTEXT_TUNING.md §1`) is implemented.
+- Schema-validated compaction output with retry — depends on
+  constrained generation backend (M5) for reliable structured
+  decoding. Current loose-text approach is acceptable while we
+  monitor adherence in eval.
+- Per-profile cheap-model selection (`§4.5`) — requires profile +
+  model-registry policy plumbing (M3+).
+- DB persistence of compaction events / `compaction_runs` table —
+  current `onEvent` callback is enough for M2 observability;
+  formal audit table lands with the rest of the audit subsystem.
+- Atomic SQLite transaction around compaction — only relevant when
+  we DO persist the rewrite (deferred above).
+- `evals/compaction/static_fallback/` corpus — bound to the evals
+  smoke step.
+- Truncation tier (oldest assistant turns head+tail) when fallback
+  is still > threshold (`§4.6` step 6) — current fallback drops
+  bodies; size-bounded follow-up is M2 later step.
+
+**Pending:** none for this step.
+
+**Next:** M2 / Step 4 — Trust prompt + permission hierarchy. New
+directory / unknown `AGENTS.md` requires confirmation; merge
+enterprise → user → project → session policy resolution. Fixes a
+gap from M1 where `./.agent/permissions.yaml` was the only source.
+
+---
+
 ## [2026-04-28] M2 / Step 2 — Output sanitization (ANSI strip)
 
 `SECURITY_GUIDELINE.md §3.2` (line 161) and §5 invariant 4 require a
