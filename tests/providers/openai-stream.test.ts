@@ -489,6 +489,21 @@ describe('normalizeOpenAIStream', () => {
     expect(events[1]).toEqual({ kind: 'stop', reason: 'end_turn' });
   });
 
+  test('does NOT emit a usage event when no chunk carries usage (compat endpoint case)', async () => {
+    // Some OpenAI-compatible endpoints silently drop stream_options.
+    // Emitting a synthetic zero would flip the harness's `usageSeen`
+    // flag and persist 0 instead of NULL.
+    const events = await collect(
+      normalizeOpenAIStream(
+        fromChunks([
+          { id: 'cmpl-x', choices: [{ delta: { content: 'hi' } }] },
+          { choices: [{ delta: {}, finish_reason: 'stop' }] },
+        ]),
+      ),
+    );
+    expect(events.find((e) => e.kind === 'usage')).toBeUndefined();
+  });
+
   test('extracts usage from final chunk and splits cached_tokens out of prompt total', async () => {
     const events = await collect(
       normalizeOpenAIStream(

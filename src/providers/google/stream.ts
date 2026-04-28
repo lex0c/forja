@@ -77,7 +77,11 @@ export async function* normalizeGoogleStream(
   // reports cumulative counts, so the LAST chunk is authoritative.
   // cache_creation isn't a Gemini concept (its cache is server-persistent
   // and pre-warmed via a separate API), so we leave it at zero.
+  // `usageSeen` gates emission of the canonical `usage` event: older
+  // SDK responses can omit usageMetadata entirely; in that case we want
+  // the harness to record NULL, not 0.
   const usage: UsageInfo = { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
+  let usageSeen = false;
 
   for await (const chunk of raw) {
     if (chunk.usageMetadata !== undefined) {
@@ -87,6 +91,7 @@ export async function* normalizeGoogleStream(
       usage.input = Math.max(0, prompt - cached);
       usage.cache_read = cached;
       usage.output = u.candidatesTokenCount ?? 0;
+      usageSeen = true;
     }
     if (!messageStarted) {
       yield { kind: 'start', message_id: chunk.responseId ?? synthesizeMessageId() };
@@ -125,6 +130,6 @@ export async function* normalizeGoogleStream(
   if (!messageStarted) {
     yield { kind: 'start', message_id: synthesizeMessageId() };
   }
-  yield { kind: 'usage', usage };
+  if (usageSeen) yield { kind: 'usage', usage };
   yield { kind: 'stop', reason: stopReason };
 }

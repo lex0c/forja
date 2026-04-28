@@ -95,7 +95,13 @@ export async function* normalizeOpenAIStream(
   // OpenAI streams usage on the final chunk when include_usage is set.
   // Cache writes aren't reported separately (the prompt_tokens_details
   // shape only exposes reads), so cache_creation stays at zero.
+  // `usageSeen` gates emission of the canonical `usage` event: compat
+  // endpoints (older Azure, some proxies) silently drop stream_options,
+  // so no usage chunk ever arrives. Emitting a synthetic zero would
+  // make the harness record 0 instead of NULL — confusing "no telemetry"
+  // with "measured zero spend".
   const usage: UsageInfo = { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
+  let usageSeen = false;
 
   for await (const chunk of raw) {
     if (!messageStarted) {
@@ -114,6 +120,7 @@ export async function* normalizeOpenAIStream(
       usage.input = Math.max(0, prompt - cached);
       usage.cache_read = cached;
       usage.output = u.completion_tokens ?? 0;
+      usageSeen = true;
     }
 
     const choice = chunk.choices?.[0];
@@ -223,6 +230,6 @@ export async function* normalizeOpenAIStream(
   if (!messageStarted) {
     yield { kind: 'start', message_id: synthesizeMessageId() };
   }
-  yield { kind: 'usage', usage };
+  if (usageSeen) yield { kind: 'usage', usage };
   yield { kind: 'stop', reason: stopReason };
 }

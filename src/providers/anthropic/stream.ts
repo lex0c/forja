@@ -71,8 +71,13 @@ export async function* normalizeAnthropicStream(
   // Anthropic splits usage across two events: input/cache numbers ride
   // `message_start.message.usage`; output_tokens lands on the final
   // `message_delta.usage`. Accumulate then emit a single `usage` event
-  // right before `stop` so the harness sees one canonical row per turn.
+  // right before `stop` — but ONLY if the upstream actually reported
+  // any field. Emitting a synthetic zero would flip the harness's
+  // `usageSeen` flag and persist 0 instead of NULL on turns where the
+  // provider never spoke (broken SDK, compat endpoint, hard mid-stream
+  // failure), conflating "no measurement" with "measured zero".
   const usage: UsageInfo = { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
+  let usageSeen = false;
 
   // Anthropic reports CUMULATIVE usage in both message_start and message_delta
   // today, so a straight assignment would also be correct. We keep the
@@ -83,18 +88,24 @@ export async function* normalizeAnthropicStream(
   // event ever carries the full count.
   const mergeUsage = (u: RawAnthropicUsage | undefined): void => {
     if (u === undefined) return;
+    let touched = false;
     if (typeof u.input_tokens === 'number') {
       usage.input = Math.max(usage.input, u.input_tokens);
+      touched = true;
     }
     if (typeof u.output_tokens === 'number') {
       usage.output = Math.max(usage.output, u.output_tokens);
+      touched = true;
     }
     if (typeof u.cache_read_input_tokens === 'number') {
       usage.cache_read = Math.max(usage.cache_read, u.cache_read_input_tokens);
+      touched = true;
     }
     if (typeof u.cache_creation_input_tokens === 'number') {
       usage.cache_creation = Math.max(usage.cache_creation, u.cache_creation_input_tokens);
+      touched = true;
     }
+    if (touched) usageSeen = true;
   };
 
   for await (const event of raw) {
@@ -182,7 +193,7 @@ export async function* normalizeAnthropicStream(
         break;
 
       case 'message_stop':
-        yield { kind: 'usage', usage };
+        if (usageSeen) yield { kind: 'usage', usage };
         yield { kind: 'stop', reason: stopReason };
         break;
     }

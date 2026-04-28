@@ -202,6 +202,20 @@ describe('normalizeGoogleStream', () => {
     ]);
   });
 
+  test('does NOT emit a usage event when no chunk carries usageMetadata', async () => {
+    const events = await collect(
+      normalizeGoogleStream(
+        fromChunks([
+          {
+            responseId: 'r',
+            candidates: [{ content: { parts: [{ text: 'hi' }] }, finishReason: 'STOP' }],
+          },
+        ]),
+      ),
+    );
+    expect(events.find((e) => e.kind === 'usage')).toBeUndefined();
+  });
+
   test('extracts usage from usageMetadata, splitting cached tokens out of prompt total', async () => {
     const events = await collect(
       normalizeGoogleStream(

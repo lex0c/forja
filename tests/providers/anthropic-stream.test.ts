@@ -341,7 +341,10 @@ describe('normalizeAnthropicStream', () => {
     expect(u.usage.input).toBe(200);
   });
 
-  test('emits a zeroed usage event when the SDK omits usage payloads', async () => {
+  test('does NOT emit a usage event when the SDK never carries a usage payload', async () => {
+    // Synthetic zero-usage would flip the harness's `usageSeen` flag and
+    // persist 0 instead of NULL — conflating "no telemetry" with
+    // "measured zero". Adapter must stay silent when nothing was reported.
     const events = await collect(
       normalizeAnthropicStream(
         fromEvents([
@@ -351,8 +354,27 @@ describe('normalizeAnthropicStream', () => {
         ]),
       ),
     );
+    expect(events.find((e) => e.kind === 'usage')).toBeUndefined();
+  });
+
+  test('emits a usage event even when only one field is reported', async () => {
+    // Partial measurement is still measurement — emit so downstream can
+    // record what the provider did say.
+    const events = await collect(
+      normalizeAnthropicStream(
+        fromEvents([
+          {
+            type: 'message_start',
+            message: { id: 'msg_p', usage: { input_tokens: 42 } },
+          },
+          { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+          { type: 'message_stop' },
+        ]),
+      ),
+    );
     const u = events.find((e) => e.kind === 'usage');
     if (u?.kind !== 'usage') throw new Error('expected usage event');
-    expect(u.usage).toEqual({ input: 0, output: 0, cache_read: 0, cache_creation: 0 });
+    expect(u.usage.input).toBe(42);
+    expect(u.usage.output).toBe(0);
   });
 });
