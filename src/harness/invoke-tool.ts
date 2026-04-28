@@ -29,6 +29,12 @@ export interface InvokeToolDeps {
   registry: ToolRegistry;
   engine: PermissionEngine;
   ctx: ToolContext;
+  // Plan mode flag — when true, tools whose metadata declares
+  // `writes: true` are blocked at the harness layer regardless of
+  // permission policy (AGENTIC_CLI §5). The block is independent of
+  // the engine so even a session-layer policy that allows writes
+  // can't subvert the read-only profile.
+  planMode?: boolean;
 }
 
 export interface InvokeToolResult {
@@ -104,6 +110,55 @@ export const invokeTool = async (
       durationMs: Date.now() - start,
       failed: true,
       decision: null,
+    };
+  }
+
+  // Plan-mode write block. `writes: true` alone is too aggressive —
+  // tools like `bash` declare writes=true pessimistically (per
+  // CONTRACTS §2.6.3) but most invocations are read-only inspections.
+  // Tools opt out via `metadata.planSafe: true` to signal "policy
+  // governs me, plan mode shouldn't unconditionally block". Tools
+  // that ALWAYS mutate (write_file, edit_file) leave planSafe unset
+  // so plan mode blocks them.
+  //
+  // The block runs BEFORE the permission engine but DOES persist a
+  // tool_call + approval row so `agent audit approvals` shows what
+  // the model attempted. Otherwise plan-mode denies would be
+  // forensically invisible.
+  const planBlocked =
+    deps.planMode === true && tool.metadata.writes === true && tool.metadata.planSafe !== true;
+  if (planBlocked) {
+    const reason = `plan mode: ${input.toolName} mutates filesystem state and has no read-only path`;
+    const toolCall = withTransaction(deps.db, () => {
+      const tc = createToolCall(deps.db, {
+        messageId: input.messageId,
+        toolName: input.toolName,
+        input: input.args,
+      });
+      recordApproval(deps.db, {
+        toolCallId: tc.id,
+        decision: 'deny',
+        decidedBy: 'policy',
+        reason,
+      });
+      finishToolCall(deps.db, {
+        id: tc.id,
+        status: 'denied',
+        durationMs: Date.now() - start,
+        error: reason,
+      });
+      return tc;
+    });
+    return {
+      toolResult: buildErrorBlock(
+        input.toolUseId,
+        input.toolName,
+        `denied: plan mode is read-only — ${input.toolName} mutates filesystem state. Continue your plan; describe the change instead of applying it.`,
+      ),
+      toolCallId: toolCall.id,
+      durationMs: Date.now() - start,
+      failed: true,
+      decision: { kind: 'deny', reason },
     };
   }
 

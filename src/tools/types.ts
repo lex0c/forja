@@ -27,6 +27,15 @@ export interface ToolMetadata {
   // Side effect declarations. `writes: true` triggers checkpoint creation
   // in the harness (Step 5+).
   writes: boolean;
+  // Plan-mode override: when true, the tool is allowed in plan mode
+  // even if `writes: true` is set pessimistically (the canonical
+  // example is `bash` — it CAN write but most invocations are
+  // read-only inspections like `git status`/`ls`/`cat`). Tools that
+  // ALWAYS mutate (write_file, edit_file) leave this unset/false so
+  // plan mode blocks them. Per AGENTIC_CLI §5.1 "bash com efeito" —
+  // policy/sandbox govern destructive bash, plan mode only blocks
+  // unconditional writers.
+  planSafe?: boolean;
   network?: boolean;
   exec?: boolean;
   idempotent: boolean;

@@ -15,6 +15,121 @@ Format:
 
 ---
 
+## [2026-04-28] M2 / Step 5 — Plan mode (`--plan`)
+
+`AGENTIC_CLI §5` calls plan mode "blocked at the harness level, not
+in policy" — a read-only profile where the model produces a
+structured plan instead of applying changes. Step 5 ships the
+one-shot CLI version. Interactive `[a]ccept/[e]dit/[r]eject` review
+flow needs the Ink UI and is deferred per the spec's plan→execute
+section.
+
+**Done:**
+- `src/cli/args.ts` — `--plan` flag parsed alongside `--json`/etc.
+  `ParsedArgs.plan: boolean` (default false). Usage line lists the
+  flag.
+- `src/harness/types.ts` — `HarnessConfig.planMode?: boolean`.
+- `src/harness/invoke-tool.ts` — `InvokeToolDeps.planMode?: boolean`.
+  When true and the resolved tool has `metadata.writes === true`,
+  the call short-circuits BEFORE the permission engine and BEFORE
+  any DB write. Returns a synthetic deny tool_result with a clear
+  read-only message; no `tool_call` row, no `approval` row, no
+  `execute()` invocation. Plan mode runs at the harness layer so
+  even a session-policy override that allows writes can't subvert
+  the read-only profile (spec invariant).
+- `src/harness/loop.ts` — propagates `config.planMode` into
+  `invokeTool` deps.
+- `src/cli/bootstrap.ts` — `BootstrapInput.plan?: boolean`. When
+  true, sets `config.planMode = true` AND injects
+  `PLAN_MODE_SYSTEM_PROMPT` (markdown structure: Goal/Scope/Steps/
+  Risks/Assumptions). Subset of the spec's full YAML schema —
+  schema-validated output is M5+ when constrained generation lands.
+- `src/cli/run.ts` — wires `args.plan` → `BootstrapInput.plan`.
+  Prints `[plan mode] read-only run; write tools are blocked at the
+  harness` to errSink before the run starts.
+
+**Decisions:**
+- **Harness-level block, not session-policy injection.** I considered
+  injecting a session-layer policy with `deny_paths: ['**']` +
+  `locked: true` for write tools — would reuse Step 4's lock
+  semantics and feel cleaner. Rejected: (a) plan mode is profile,
+  not policy — confusing two concepts undermines both; (b) spec is
+  explicit ("blocked at the harness level, not policy"); (c) policy
+  block has more moving parts (tool→category→section lookup) than a
+  single `metadata.writes` check, more surface for the read-only
+  invariant to drift; (d) harness-level block reads as `metadata.writes`
+  — same predicate the checkpoint subsystem will use in M3 — keeping
+  the concept centralized.
+- **System prompt is markdown, not YAML schema.** Spec §5.1 lists
+  the formal YAML schema for plan output. Without constrained
+  generation (`generateConstrained` is M5), asking the model for
+  YAML and parsing it loosely would produce occasional malformed
+  output that callers couldn't reliably consume. Markdown is what
+  the model produces naturally and the user can read directly;
+  the YAML schema is an upgrade for when the constrained backend
+  ships.
+- **No interactive review.** Plan mode in M2 ends with the markdown
+  on stdout (or NDJSON `text_delta` events) and exits. The spec's
+  `[a]ccept/[e]dit/[r]eject` modal needs Ink components and a
+  re-enter-run flow — both M3+. Single-shot plan still useful by
+  itself: dirigir the CLI in big repos with confidence the run
+  won't apply anything.
+- **Plan-aware system prompt at bootstrap, not in the loop.**
+  Bootstrap is where flag → config conversion happens; injecting
+  there keeps the loop ignorant of plan mode beyond the
+  `planMode` flag pass-through. Loop only consults the flag at
+  the invokeTool propagation site.
+- **Indicator on stderr regardless of `--json`.** Per spec §2.2,
+  stdout in `--json` mode is NDJSON only; the plan-mode marker is
+  operational metadata, not run output, so it goes to stderr where
+  it doesn't pollute downstream pipes.
+- **Per-tool `metadata.writes` is the source of truth.** Tools
+  declare `writes: true` in their metadata (already the case for
+  `write_file`, `edit_file`, `bash`). Plan mode reads from there;
+  no parallel "list of write tools" to keep in sync.
+
+**Tools with `writes: true` (blocked in plan mode):** `write_file`,
+`edit_file`, `bash` (declared writes-true pessimistically per
+CONTRACTS §2.6.3). Read-only tools (`read_file`, `glob`, `grep`)
+proceed through the normal allow path.
+
+**New tests (+10 over Step 4):**
+- `tests/cli/args.test.ts` — 2: `--plan` flag set, default false.
+  Usage line mentions `--plan`.
+- `tests/cli/bootstrap.test.ts` — 2: plan:true → planMode + system
+  prompt; plan omitted → both unset.
+- `tests/cli/run.test.ts` — 1: `[plan mode]` indicator on errSink.
+- `tests/harness/invoke-tool.test.ts` — 2: write tool denied
+  before policy + DB (no execute, no toolCallId); read-only tool
+  still executes normally in plan mode.
+- `tests/harness/loop.test.ts` — 1: end-to-end runAgent with
+  planMode + permissive policy + write tool_use → denied at
+  harness, decision.kind === 'deny', execute never called.
+- Total suite: **548 pass / 7 skip / 1215 expect() calls** in ~1.6s.
+
+**Out of scope (deferred):**
+- Interactive `<PlanReview>` modal with `[a]ccept/[e]dit/[r]eject` —
+  M3 (needs Ink).
+- Plan → run reentry with structured goal injection — M3.
+- Schema-validated YAML output (`spec §5.1` formal schema) — M5
+  (constrained generation backend).
+- Plan-as-artifact persistence (`.agent/plans/<timestamp>.md`) —
+  deferred; current model output goes to stdout, captured if user
+  redirects.
+- `acceptEdits` profile (third profile in §5.1) — separate step.
+  acceptEdits is policy-mode (`PolicyMode.acceptEdits`) and already
+  exists in the engine; CLI flag would just inject a session policy.
+
+**Pending:** none for this step.
+
+**Next:** M2 / Step 6 — Eval smoke. Final canonical M2 item per
+spec §18. Minimal eval harness: 5-10 fixed tasks, executor that
+runs `runAgent` against a real model, measures pass-rate + p50
+cost. Critério de saída: pass-rate ≥85% smoke, p50 < $0.20/task.
+Without it the rest of M2 is asserted-to-work without proof.
+
+---
+
 ## [2026-04-28] M2 / Step 4 — Permission hierarchy
 
 `AGENTIC_CLI §8` requires layered policy resolution: enterprise →

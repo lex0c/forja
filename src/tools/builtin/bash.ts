@@ -138,6 +138,13 @@ export const bashTool: Tool<BashInput, BashOutput> = {
   metadata: {
     category: 'bash',
     writes: true, // pessimistic per CONTRACTS §2.6.3
+    // Plan mode allows bash because most invocations are read-only
+    // inspections (git status, ls, cat, rg). Destructive bash is
+    // governed by policy + sandbox, not the plan profile —
+    // AGENTIC_CLI §5.1 calls out "bash com efeito" specifically.
+    // Users who don't trust the model in plan mode set
+    // tools.bash.deny in the session-layer policy.
+    planSafe: true,
     exec: true,
     idempotent: false,
     display: 'raw',

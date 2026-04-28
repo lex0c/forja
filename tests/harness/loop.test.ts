@@ -1400,6 +1400,52 @@ describe('runAgent', () => {
     expect(result.usageComplete).toBe(false);
   });
 
+  test('plan mode: write tool denied at harness even when policy would allow', async () => {
+    // End-to-end: run with planMode: true, model emits a write
+    // tool_use, harness short-circuits with the read-only deny.
+    // tool_call NOT persisted (plan-mode denies before DB).
+    let executed = false;
+    const writeTool: Tool = {
+      name: 'write_file',
+      description: 'mock write',
+      inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
+      metadata: { category: 'fs.write', writes: true, idempotent: false },
+      async execute() {
+        executed = true;
+        return { ok: true };
+      },
+    };
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const { config } = buildConfig(
+      [
+        // Turn 1: emit a write_file tool_use.
+        {
+          tool_uses: [{ id: 'tu1', name: 'write_file', input: { path: 'x.ts' } }],
+          stop_reason: 'tool_use',
+        },
+        // Turn 2: model gives up after seeing the deny, returns a plan.
+        { text: '# Plan\n\nblocked attempt; describing instead.', stop_reason: 'end_turn' },
+      ],
+      {
+        extraTools: [writeTool],
+        // Even with a permissive policy, plan mode wins.
+        policy: { tools: { write_file: { allow_paths: ['**'] } } },
+      },
+    );
+    const result = await runAgent({
+      ...config,
+      planMode: true,
+      onEvent: (e) => events.push(e),
+    });
+    expect(result.status).toBe('done');
+    expect(executed).toBe(false);
+    // Tool indicator showed denied decision.
+    const decided = events.find((e) => e.type === 'tool_decided');
+    if (decided?.type === 'tool_decided') {
+      expect(decided.decision.kind).toBe('deny');
+    }
+  });
+
   test('init failure surfaces with usageComplete=false', async () => {
     // guardedFinish path: any uncaught throw in the harness body has
     // ambiguous billing state. Safer to mark partial than to claim

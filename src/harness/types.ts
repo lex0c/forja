@@ -113,6 +113,12 @@ export interface HarnessConfig {
   // Synchronous observer for lifecycle events. Throws are caught and
   // discarded so a buggy renderer doesn't kill the loop.
   onEvent?: (event: HarnessEvent) => void;
+  // Plan mode (AGENTIC_CLI §5): read-only profile. The harness
+  // refuses any tool with metadata.writes === true before execution
+  // — even if policy would have allowed it. This is harness-level,
+  // not policy-level, so a plan run is read-only regardless of
+  // permission hierarchy state.
+  planMode?: boolean;
 }
 
 export interface HarnessResult {

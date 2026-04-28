@@ -4,6 +4,7 @@ import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
 import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
+import { composeWithUserPrompt } from './plan-prompt.ts';
 
 export const DEFAULT_MODEL = 'anthropic/claude-sonnet-4-6';
 
@@ -13,6 +14,14 @@ export interface BootstrapInput {
   cwd?: string;
   budget?: Partial<RunBudget>;
   signal?: AbortSignal;
+  // Plan mode (AGENTIC_CLI §5): read-only profile. Plumbs through
+  // to the harness's planMode flag and triggers injection of a
+  // plan-aware system prompt instructing structured output.
+  plan?: boolean;
+  // Caller-supplied system prompt. When `plan` is also set, the
+  // plan-mode prompt is prepended (plan-mode is the operating
+  // profile; user content is layered as extra context).
+  systemPrompt?: string;
   // Test seam: when set, skip the registry lookup and use this provider.
   providerOverride?: Provider;
   // Test seam: override the DB path (default: defaultDbPath()).
@@ -97,6 +106,16 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     throw e;
   }
 
+  // Resolve the effective system prompt. Plan mode prepends its
+  // own prompt to whatever the caller supplied; without plan mode,
+  // the caller's prompt passes through unchanged.
+  let resolvedSystemPrompt: string | undefined;
+  if (input.plan === true) {
+    resolvedSystemPrompt = composeWithUserPrompt(input.systemPrompt);
+  } else if (input.systemPrompt !== undefined) {
+    resolvedSystemPrompt = input.systemPrompt;
+  }
+
   const config: HarnessConfig = {
     provider,
     toolRegistry,
@@ -106,6 +125,8 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     userPrompt: input.prompt,
     ...(input.budget !== undefined ? { budget: input.budget } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
+    ...(input.plan === true ? { planMode: true } : {}),
+    ...(resolvedSystemPrompt !== undefined ? { systemPrompt: resolvedSystemPrompt } : {}),
   };
 
   return { config, db, modelId, policyLayers, lockConflicts: resolved.lockConflicts };

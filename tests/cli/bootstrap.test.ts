@@ -129,6 +129,72 @@ describe('bootstrap', () => {
     db.close();
   });
 
+  test('plan: true sets harness planMode and injects plan-aware system prompt', () => {
+    const { config, db } = bootstrap({
+      prompt: 'refactor auth',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      plan: true,
+    });
+    expect(config.planMode).toBe(true);
+    expect(config.systemPrompt).toContain('PLAN MODE');
+    expect(config.systemPrompt).toContain('BLOCKED');
+    db.close();
+  });
+
+  test('plan omitted leaves planMode unset and no system prompt', () => {
+    const { config, db } = bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+    });
+    expect(config.planMode).toBeUndefined();
+    expect(config.systemPrompt).toBeUndefined();
+    db.close();
+  });
+
+  test('plan + caller systemPrompt composes (plan first, user after separator)', () => {
+    const { config, db } = bootstrap({
+      prompt: 'refactor',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      plan: true,
+      systemPrompt: 'Project convention: prefer functional style.',
+    });
+    expect(config.planMode).toBe(true);
+    expect(config.systemPrompt).toContain('PLAN MODE');
+    expect(config.systemPrompt).toContain('Project convention');
+    // Plan instructions come first; user prompt after separator.
+    const planIdx = (config.systemPrompt ?? '').indexOf('PLAN MODE');
+    const userIdx = (config.systemPrompt ?? '').indexOf('Project convention');
+    expect(planIdx).toBeLessThan(userIdx);
+    db.close();
+  });
+
+  test('caller systemPrompt without plan passes through unchanged', () => {
+    const { config, db } = bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      systemPrompt: 'You are a senior engineer.',
+    });
+    expect(config.planMode).toBeUndefined();
+    expect(config.systemPrompt).toBe('You are a senior engineer.');
+    db.close();
+  });
+
   test('forwards budget overrides into config', () => {
     const { config, db } = bootstrap({
       prompt: 'hi',

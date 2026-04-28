@@ -386,6 +386,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             registry: config.toolRegistry,
             engine: config.permissionEngine,
             ctx,
+            ...(config.planMode === true ? { planMode: true } : {}),
           },
         );
 

@@ -170,6 +170,111 @@ describe('invokeTool', () => {
     expect(tc?.status).toBe('error');
   });
 
+  test('plan mode: blocks writes:true tools BEFORE policy + execute', async () => {
+    // Even with a policy that would allow the write, plan mode
+    // refuses at the harness layer. tool.execute is never called;
+    // the tool_call IS persisted with status=denied for the audit
+    // trail (covered by the dedicated audit test below).
+    let executed = false;
+    const writeTool: Tool = {
+      name: 'write_file',
+      description: 'writes',
+      inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
+      metadata: { category: 'fs.write', writes: true, idempotent: false },
+      async execute() {
+        executed = true;
+        return { ok: true };
+      },
+    };
+    const deps = {
+      ...buildDeps(writeTool, { tools: { write_file: { allow_paths: ['**'] } } }),
+      planMode: true,
+    };
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'x.ts' }, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(true);
+    expect(inv.toolResult.is_error).toBe(true);
+    expect(inv.toolResult.content).toContain('plan mode');
+    expect(inv.toolResult.content).toContain('read-only');
+    expect(executed).toBe(false);
+    expect(inv.decision?.kind).toBe('deny');
+  });
+
+  test('plan mode: read-only tools (writes:false) still execute normally', async () => {
+    // Sanity: plan mode is the WRITE block, not a "deny everything"
+    // mode. read_file/glob/grep/echo all proceed through the
+    // normal allow path.
+    const deps = { ...buildDeps(okTool), planMode: true };
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'echo', args: { msg: 'hi' }, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(false);
+    expect(JSON.parse(inv.toolResult.content)).toEqual({ echoed: 'hi' });
+  });
+
+  test('plan mode: planSafe:true tools (writes pessimistically true) still execute', async () => {
+    // Regression: `bash` declares writes:true pessimistically per
+    // CONTRACTS §2.6.3, but most invocations are read-only
+    // inspections (git status, ls). planSafe:true opts out of the
+    // plan-mode block — policy + sandbox govern destructive bash.
+    let executed = false;
+    const inspectableTool: Tool = {
+      name: 'bash',
+      description: 'reads or writes',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'bash', writes: true, planSafe: true, idempotent: false },
+      async execute() {
+        executed = true;
+        return { stdout: 'ok' };
+      },
+    };
+    const deps = {
+      ...buildDeps(inspectableTool, { tools: { bash: { allow: ['*'] } } }),
+      planMode: true,
+    };
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'bash', args: { command: 'git status' }, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(false);
+    expect(executed).toBe(true);
+  });
+
+  test('plan mode: write deny IS persisted to approvals (audit trail)', async () => {
+    // Regression: prior fix short-circuited before DB so plan-mode
+    // attempts were forensically invisible. Now we persist the
+    // tool_call + approval row even though we don't execute, so
+    // `agent audit approvals` shows what the model attempted.
+    const writeTool: Tool = {
+      name: 'write_file',
+      description: 'writes',
+      inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
+      metadata: { category: 'fs.write', writes: true, idempotent: false },
+      async execute() {
+        return { ok: true };
+      },
+    };
+    const deps = {
+      ...buildDeps(writeTool, { tools: { write_file: { allow_paths: ['**'] } } }),
+      planMode: true,
+    };
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'x.ts' }, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(true);
+    expect(inv.toolCallId).not.toBe('');
+    const tc = getToolCall(db, inv.toolCallId);
+    expect(tc?.status).toBe('denied');
+    const approvals = listApprovalsByToolCall(db, inv.toolCallId);
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]?.decision).toBe('deny');
+    expect(approvals[0]?.reason).toContain('plan mode');
+  });
+
   test('strips ANSI from tool result before persistence and tool_result block', async () => {
     // Malicious tool returns output laced with terminal-control bytes.
     // The sanitization layer must scrub these out so neither the model
