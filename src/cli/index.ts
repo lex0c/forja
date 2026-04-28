@@ -1,6 +1,5 @@
 #!/usr/bin/env bun
 import { parseArgs, usage } from './args.ts';
-import { run } from './run.ts';
 
 const VERSION = '0.0.0';
 
@@ -31,6 +30,12 @@ const main = async (): Promise<number> => {
     return 1;
   }
 
+  // Lazy import: pulling `./run.ts` transitively loads provider SDKs,
+  // storage, permissions — the whole stack. Keeping it behind the help/
+  // version branches means a broken or missing provider dep can't break
+  // `forja --help` or `forja --version`, which users hit first when
+  // diagnosing install issues.
+  const { run } = await import('./run.ts');
   return run({ args });
 };
 
