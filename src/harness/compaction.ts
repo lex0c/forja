@@ -90,22 +90,56 @@ ${SUMMARY_MARKER_CLOSE}
 
 Skip any section whose content would be empty by writing "(none)" after the colon. Do not editorialize, apologize, or add prose outside the markers.`;
 
+// Spec ORCHESTRATION §4.6 step 6: when dropping tool_result bodies
+// alone isn't enough (text-heavy histories with few/no tool calls),
+// also truncate long text content head+tail with a size pointer.
+// Without this tier, fallback on a chatty session leaves the history
+// essentially the same size and the next provider call still hits
+// the context cap. Threshold + slice sizes match the spec's
+// "preserve first 200 chars + last 200 chars" recommendation.
+const TRUNCATE_THRESHOLD = 800;
+const TRUNCATE_HEAD = 200;
+const TRUNCATE_TAIL = 200;
+
+const truncateLongText = (s: string): string => {
+  if (s.length <= TRUNCATE_THRESHOLD) return s;
+  const head = s.slice(0, TRUNCATE_HEAD);
+  const tail = s.slice(-TRUNCATE_TAIL);
+  const elided = s.length - TRUNCATE_HEAD - TRUNCATE_TAIL;
+  return `${head}\n[... ${elided} chars elided — compaction fallback, original in audit log ...]\n${tail}`;
+};
+
 const fallbackElide = (block: ProviderContentBlock): ProviderContentBlock => {
-  if (block.type !== 'tool_result') return block;
-  const sizeBytes = block.content.length;
-  // Tool args/output get replaced with a pointer so the model still
-  // sees that the call happened (and against which tool_use_id) but
-  // not the body. is_error is preserved so the model knows whether
-  // the call succeeded.
-  return {
-    ...block,
-    content: `[tool_result elided: ${sizeBytes} bytes — compaction fallback, original in audit log]`,
-  };
+  if (block.type === 'tool_result') {
+    const sizeBytes = block.content.length;
+    // Tool args/output get replaced with a pointer so the model
+    // still sees that the call happened (and against which
+    // tool_use_id) but not the body. is_error is preserved so the
+    // model knows whether the call succeeded.
+    return {
+      ...block,
+      content: `[tool_result elided: ${sizeBytes} bytes — compaction fallback, original in audit log]`,
+    };
+  }
+  if (block.type === 'text') {
+    // Long assistant text (model produced a wall of explanation
+    // before invoking tools, or never invoked tools at all): head+
+    // tail truncate. Short text stays intact.
+    return { ...block, text: truncateLongText(block.text) };
+  }
+  // tool_use: args are usually small and reference IDs the next
+  // turn might still cite. Preserve fidelity.
+  return block;
 };
 
 const fallbackCompact = (middle: ProviderMessage[]): ProviderMessage[] =>
   middle.map((m) => {
-    if (typeof m.content === 'string') return m;
+    if (typeof m.content === 'string') {
+      // String-content messages (text-only chat with no blocks) get
+      // the same truncate treatment so a chatty history doesn't
+      // sail through fallback unchanged.
+      return { ...m, content: truncateLongText(m.content) };
+    }
     return { ...m, content: m.content.map(fallbackElide) };
   });
 

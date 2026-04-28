@@ -343,6 +343,89 @@ describe('compactMessages — deterministic fallback', () => {
     expect(result.usage.input).toBe(200);
   });
 
+  test('fallback truncates long string-content messages (text-heavy chat)', async () => {
+    // Regression: the prior fallback only elided tool_result blocks.
+    // A chat-heavy session with few tool calls would sail through
+    // unchanged — same context size, same 400 on the next call.
+    // Spec ORCHESTRATION §4.6 step 6: head+tail truncate with size
+    // pointer when bodies-only drop isn't enough.
+    const handle = mockProvider(new Error('rate limited'));
+    const longText = 'a'.repeat(5000);
+    const history: ProviderMessage[] = [
+      { role: 'user', content: 'goal' },
+      { role: 'assistant', content: longText },
+      { role: 'user', content: 'follow-up' },
+      { role: 'assistant', content: 'ok' },
+      { role: 'user', content: 'final' },
+    ];
+    const result = await compactMessages(handle.provider, history, { preserveTail: 3 });
+    expect(result.strategy).toBe('fallback');
+    // The long middle assistant message should be truncated, not
+    // returned verbatim.
+    const middle = result.messages[1];
+    expect(middle?.role).toBe('assistant');
+    const middleContent =
+      typeof middle?.content === 'string' ? middle.content : JSON.stringify(middle?.content);
+    expect(middleContent.length).toBeLessThan(longText.length);
+    expect(middleContent).toContain('elided');
+  });
+
+  test('fallback truncates long text blocks inside structured content', async () => {
+    const handle = mockProvider(new Error('rate limited'));
+    const longText = 'b'.repeat(5000);
+    const history: ProviderMessage[] = [
+      { role: 'user', content: 'goal' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: longText },
+          { type: 'tool_use', id: 'tu1', name: 'echo', input: { x: 1 } },
+        ],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'tu1', name: 'echo', content: 'ok' }],
+      },
+      { role: 'assistant', content: 'reply' },
+      { role: 'user', content: 'final' },
+    ];
+    const result = await compactMessages(handle.provider, history, { preserveTail: 3 });
+    expect(result.strategy).toBe('fallback');
+    const middle = result.messages[1];
+    if (Array.isArray(middle?.content)) {
+      const textBlock = middle.content.find((b) => b.type === 'text');
+      if (textBlock?.type === 'text') {
+        expect(textBlock.text.length).toBeLessThan(longText.length);
+        expect(textBlock.text).toContain('elided');
+      }
+      // tool_use args preserved verbatim — the next turn might
+      // reference the tool_use_id.
+      const toolUseBlock = middle.content.find((b) => b.type === 'tool_use');
+      if (toolUseBlock?.type === 'tool_use') {
+        expect(toolUseBlock.input).toEqual({ x: 1 });
+      }
+    }
+  });
+
+  test('fallback leaves short text untouched', async () => {
+    // Threshold guard: messages below the truncate cutoff stay
+    // verbatim, so short conversations don't get unnecessarily
+    // mangled.
+    const handle = mockProvider(new Error('rate limited'));
+    const short = 'short content';
+    const history: ProviderMessage[] = [
+      { role: 'user', content: 'goal' },
+      { role: 'assistant', content: short },
+      { role: 'user', content: 'a' },
+      { role: 'assistant', content: 'b' },
+      { role: 'user', content: 'c' },
+    ];
+    const result = await compactMessages(handle.provider, history, { preserveTail: 3 });
+    expect(result.strategy).toBe('fallback');
+    const middle = result.messages[1];
+    expect(middle?.content).toBe(short);
+  });
+
   test('skipped path returns zero usage and usageSeen=false', async () => {
     const handle = mockProvider(() => replyText('not called'));
     const short = buildHistory(1);
