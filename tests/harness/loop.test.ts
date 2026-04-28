@@ -438,14 +438,15 @@ describe('runAgent', () => {
     expect(result.usageComplete).toBe(false);
   });
 
-  test('usageComplete ignores empty assistant turns without usage', async () => {
-    // An assistant turn with no text and no tool_uses (the model said
-    // nothing) lacking usage isn't underreporting anything — flag
-    // should stay true. Hard to stage in production, but the test
-    // pins the contract so a future refactor doesn't drift.
+  test('usageComplete flips false even on an empty assistant turn without usage', async () => {
+    // The prompt was sent and input tokens were billed regardless of
+    // whether the model emitted text/tool_use/thinking. An assistant
+    // turn that completes cleanly (the provider accepted the request
+    // and returned a stream) without usage telemetry IS underreporting
+    // cost — the renderer must mark aggregate as a lower bound.
     const { config } = buildConfig([{ stop_reason: 'end_turn' }]);
     const result = await runAgent(config);
-    expect(result.usageComplete).toBe(true);
+    expect(result.usageComplete).toBe(false);
   });
 
   test('persists NULL token columns when the adapter never emits a usage event', async () => {

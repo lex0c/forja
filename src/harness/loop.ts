@@ -244,18 +244,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       const turnCostUsd = computeCost(config.provider.capabilities, collected.usage);
       totalUsage = addUsage(totalUsage, collected.usage);
       totalCostUsd += turnCostUsd;
-      // A turn that produced ANY billable output without a usage event
-      // is unmeasured — flip the session-level flag so the renderer
-      // marks the cost as a lower bound. "Billable" includes thinking
-      // tokens: Anthropic's extended thinking is charged as output
-      // even when the model emits no visible text or tool_use. Empty
-      // assistant turns (no text, no tool_uses, no thinking) are
-      // skipped — missing usage isn't underreporting anything.
-      const producedOutput =
-        collected.text.length > 0 ||
-        collected.tool_uses.length > 0 ||
-        collected.thinking.length > 0;
-      if (producedOutput && !collected.usageSeen) usageComplete = false;
+      // ANY assistant turn that completes without a usage event is
+      // unmeasured — every successful provider call bills input tokens
+      // for the prompt, even when the model emits no text, no
+      // tool_use, and no thinking. Stream errors and aborts don't
+      // reach here (they exit via providerError/aborted finish paths),
+      // so we're only counting turns that the provider actually
+      // accepted and processed. Flipping the flag tells the renderer
+      // to mark aggregate cost as a lower bound.
+      if (!collected.usageSeen) usageComplete = false;
 
       // When the adapter never emitted a `usage` event, persist NULL on
       // the token/cost columns instead of zeroes. Future analytics can
