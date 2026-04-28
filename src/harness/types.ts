@@ -66,8 +66,13 @@ export interface RunBudget {
   // recommend 0.7 — leaves 30% headroom for the compaction call
   // itself plus the next response. Set to 1.0 to effectively disable.
   compactionThreshold: number;
-  // Number of trailing turns preserved literally during compaction.
-  // ORCHESTRATION §4.6 recommends 3.
+  // Lower bound on trailing turns preserved literally during
+  // compaction. ORCHESTRATION §4.6 recommends 3. Effective preserved
+  // count may be `+1` because the compaction module aligns the tail
+  // boundary to an assistant message (keeps tool_use → tool_result
+  // pairs intact); when the requested boundary lands on a user the
+  // module walks back one position. preserveTail=0 still preserves
+  // the trailing assistant + its tool_result for the same reason.
   compactionPreserveTail: number;
 }
 

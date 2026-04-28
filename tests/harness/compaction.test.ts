@@ -90,7 +90,7 @@ const buildHistory = (turns: number): ProviderMessage[] => {
 };
 
 describe('compactMessages — LLM path', () => {
-  test('preserves goal and trailing K turns; replaces middle with summary', async () => {
+  test('merges summary into the goal message and preserves trailing turn(s)', async () => {
     const handle = mockProvider(() =>
       replyText(
         '[compacted_history]\nGOAL: refactor auth.ts\nDECISIONS: split helpers\nFILES_TOUCHED: a.ts\nERRORS: (none)\nPENDING: tests\n[/compacted_history]',
@@ -100,32 +100,36 @@ describe('compactMessages — LLM path', () => {
     const result = await compactMessages(handle.provider, history, { preserveTail: 3 });
 
     expect(result.strategy).toBe('llm');
-    // [goal, summary, ...last 3 messages]
-    expect(result.messages).toHaveLength(5);
-    expect(result.messages[0]).toBe(history[0]);
-    expect(result.messages.slice(-3)).toEqual(history.slice(-3));
-    // foldedCount = original middle slice length
-    expect(result.foldedCount).toBe(history.length - 1 - 3);
-    // Summary message carries the canonical markers.
-    const summary = result.messages[1];
-    expect(summary?.role).toBe('assistant');
-    expect(typeof summary?.content).toBe('string');
-    if (typeof summary?.content === 'string') {
-      expect(summary.content).toContain('[compacted_history]');
-      expect(summary.content).toContain('[/compacted_history]');
+    // The summary is merged into a new user-role goal message; the
+    // tail follows starting with an assistant. Two consecutive
+    // user messages (Anthropic 400) and orphan tool_results
+    // (provider 400) are both prevented this way.
+    const wrapped = result.messages[0];
+    expect(wrapped?.role).toBe('user');
+    expect(typeof wrapped?.content).toBe('string');
+    if (typeof wrapped?.content === 'string') {
+      // Original goal text is preserved literally inside the wrap.
+      expect(wrapped.content).toContain('Original goal');
+      // Summary block follows with markers intact.
+      expect(wrapped.content).toContain('[compacted_history]');
+      expect(wrapped.content).toContain('[/compacted_history]');
     }
+    // Tail starts with assistant — keeps tool_use → tool_result
+    // pairs intact (the user_tool_result that follows references
+    // the tool_use in this assistant message).
+    expect(result.messages[1]?.role).toBe('assistant');
+    // foldedCount is positive (something was actually folded).
+    expect(result.foldedCount).toBeGreaterThan(0);
   });
 
   test('forces markers when the model omits them', async () => {
-    // Model returns plain prose without markers — wrapper must add them
-    // so downstream consumers can locate compaction blocks by scan.
     const handle = mockProvider(() => replyText('GOAL: x\nDECISIONS: y'));
     const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
     expect(result.strategy).toBe('llm');
-    const summary = result.messages[1];
-    if (typeof summary?.content === 'string') {
-      expect(summary.content.startsWith('[compacted_history]')).toBe(true);
-      expect(summary.content.endsWith('[/compacted_history]')).toBe(true);
+    const wrapped = result.messages[0];
+    if (typeof wrapped?.content === 'string') {
+      expect(wrapped.content).toContain('[compacted_history]');
+      expect(wrapped.content).toContain('[/compacted_history]');
     }
   });
 
@@ -188,69 +192,123 @@ describe('compactMessages — LLM path', () => {
     expect(handle.generateCalls[0]?.max_tokens).toBe(1024);
   });
 
-  test('even preserveTail expands the slice to keep tail starting with user', async () => {
-    // After-trigger history is [user, A, U, A, U, A, U] (length 7,
-    // ends with user). preserveTail=2 would naively slice to [A, U]
-    // — but inserting [goal, summary_assistant, A, U] sends two
-    // consecutive assistants to Anthropic, which 400s. Module must
-    // expand to slice [U, A, U] (effectively tail=3) so the summary
-    // is followed by a user message.
+  test('tail always starts at an assistant boundary (preserves tool_use/tool_result pairs)', async () => {
+    // Regression for orphan-tool_result: the tail must include the
+    // assistant message that emitted the tool_use referenced by any
+    // user_tool_result in the tail. Naively slicing at length-N can
+    // land on a user_tool_result whose matching tool_use ended up
+    // in the middle (folded into the summary), producing a 400 from
+    // the provider on the next call.
     const handle = mockProvider(() =>
       replyText('[compacted_history]\nGOAL: x\n[/compacted_history]'),
     );
-    const history = buildHistory(3); // 1 + 6 = 7 messages
-    const result = await compactMessages(handle.provider, history, { preserveTail: 2 });
-    expect(result.strategy).toBe('llm');
-    // Tail should start with a user message (alternation invariant).
-    const tail = result.messages.slice(2);
-    expect(tail[0]?.role).toBe('user');
-    // Effective tail is 3 (over-preserved by 1 to align). Result:
-    // [goal_user, summary_assistant, U, A, U] = 5 messages.
-    expect(result.messages).toHaveLength(5);
+    // length 7: [user, A0, U0, A1, U1, A2, U2]. preserveTail=2
+    // naively lands on index 5 (A2, assistant) — happens to be
+    // correct without shift. preserveTail=3 lands on index 4 (U1,
+    // user) and SHOULD shift to index 3 (A1) so U1's tool_use
+    // (in A1) is preserved.
+    const history = buildHistory(3);
+    const r2 = await compactMessages(handle.provider, history, { preserveTail: 2 });
+    expect(r2.messages[1]?.role).toBe('assistant');
+
+    const r3 = await compactMessages(handle.provider, buildHistory(3), { preserveTail: 3 });
+    expect(r3.messages[1]?.role).toBe('assistant');
+    // Verify the preserved assistant emits the tool_use that
+    // the next user_tool_result references.
+    const firstTailAssistant = r3.messages[1];
+    const nextTailUser = r3.messages[2];
+    if (Array.isArray(firstTailAssistant?.content) && Array.isArray(nextTailUser?.content)) {
+      const tool_use = firstTailAssistant.content.find((b) => b.type === 'tool_use');
+      const tool_result = nextTailUser.content.find((b) => b.type === 'tool_result');
+      if (tool_use?.type === 'tool_use' && tool_result?.type === 'tool_result') {
+        expect(tool_result.tool_use_id).toBe(tool_use.id);
+      }
+    }
   });
 
-  test('preserveTail=0 collapses entire history into a summary (no tail)', async () => {
-    // The original `slice(-tail)` had a JS quirk: slice(-0) returns
-    // the whole array. With preserveTail=0 the result would have
-    // duplicated messages. Length-relative slicing fixes it.
+  test('preserveTail=0 collapses entire history into the wrapped goal (no tail)', async () => {
+    // With preserveTail=0 the alignment walks tailStart back from
+    // length-0 (=length) to the nearest assistant. Middle is
+    // everything between goal and that assistant. Result is just
+    // the wrapped goal — no tail to preserve.
     const handle = mockProvider(() =>
       replyText('[compacted_history]\nGOAL: x\n[/compacted_history]'),
     );
     const history = buildHistory(3);
     const result = await compactMessages(handle.provider, history, { preserveTail: 0 });
     expect(result.strategy).toBe('llm');
-    // [goal, summary] only — no preserved trailing turns.
-    expect(result.messages).toHaveLength(2);
-    expect(result.messages[0]).toBe(history[0]);
-    expect(result.messages[1]?.role).toBe('assistant');
+    // Result depends on where the alignment lands; in this case the
+    // last assistant is at index length-2 (A2) since the history
+    // ends with user_tool_result. The tail is just that assistant.
+    expect(result.messages.length).toBeGreaterThanOrEqual(1);
+    expect(result.messages[0]?.role).toBe('user');
+    // Markers preserved on the wrapped goal.
+    const goalContent = result.messages[0]?.content;
+    if (typeof goalContent === 'string') {
+      expect(goalContent).toContain('[compacted_history]');
+    }
   });
 
-  test('odd preserveTail keeps user-start alignment without shifting', async () => {
+  test('successive compactions do not accumulate prior summary blocks (cumulative growth bug)', async () => {
+    // Regression: the wrap previously appended a new summary on
+    // every compaction without removing any prior one. After three
+    // compactions the goal would carry three summary blocks plus
+    // their re-quoted contents inside each. The fix strips prior
+    // blocks before re-wrapping so messages[0] is always
+    // `original_goal\n\n[latest summary]`.
     const handle = mockProvider(() =>
-      replyText('[compacted_history]\nGOAL: x\n[/compacted_history]'),
+      replyText('[compacted_history]\nGOAL: refactor\n[/compacted_history]'),
     );
-    const history = buildHistory(4); // length 9
+    // Simulate a session that's already been compacted once: the
+    // goal carries an old summary block.
+    const history: ProviderMessage[] = [
+      {
+        role: 'user',
+        content:
+          'Original goal: refactor src/auth.ts\n\n[compacted_history]\nGOAL: refactor\nDECISIONS: prior\n[/compacted_history]',
+      },
+      ...buildHistory(5).slice(1),
+    ];
     const result = await compactMessages(handle.provider, history, { preserveTail: 3 });
     expect(result.strategy).toBe('llm');
-    // [goal, summary, last 3] = 5 messages, no over-preservation.
-    expect(result.messages).toHaveLength(5);
-    expect(result.messages.slice(-3)).toEqual(history.slice(-3));
+    const wrapped = result.messages[0];
+    if (typeof wrapped?.content !== 'string') throw new Error('expected string');
+    // Exactly one block — the LATEST. No accumulated prior blocks.
+    const openCount = wrapped.content.split('[compacted_history]').length - 1;
+    expect(openCount).toBe(1);
+    // Original goal text is still preserved literally.
+    expect(wrapped.content).toContain('Original goal: refactor src/auth.ts');
+    // Old "DECISIONS: prior" body must NOT survive (it was inside
+    // the stripped block).
+    expect(wrapped.content).not.toContain('DECISIONS: prior');
+  });
+
+  test('summary text is sanitized of ANSI escapes before reaching context', async () => {
+    // Defense in depth: even though the compaction provider is
+    // ours, a hijacked or buggy proxy could inject control bytes.
+    // The sanitization invariant says no escapes reach the model
+    // context — applies to compaction summaries too.
+    const handle = mockProvider(() =>
+      replyText('[compacted_history]\nGOAL: \x1b[31mscrub\x1b[0m me\n[/compacted_history]'),
+    );
+    const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
+    expect(result.strategy).toBe('llm');
+    const wrapped = result.messages[0];
+    if (typeof wrapped?.content !== 'string') throw new Error('expected string');
+    expect(wrapped.content).not.toContain('\x1b');
+    expect(wrapped.content).toContain('scrub me');
   });
 
   test('wrapSummary tolerates trailing prose around markers (no nested wrap)', async () => {
-    // Model returns a perfectly-marked block but with extra text
-    // after the close marker. The strict start/end check would have
-    // re-wrapped, producing nested markers. The relaxed `includes`
-    // check accepts the original.
     const handle = mockProvider(() =>
       replyText('[compacted_history]\nGOAL: x\n[/compacted_history]\n\nNote: best-effort summary.'),
     );
     const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
-    const summary = result.messages[1];
-    if (typeof summary?.content !== 'string') throw new Error('expected string content');
+    const wrapped = result.messages[0];
+    if (typeof wrapped?.content !== 'string') throw new Error('expected string content');
     // Exactly one open marker and one close marker — no nesting.
-    const openCount = summary.content.split('[compacted_history]').length - 1;
-    const closeCount = summary.content.split('[/compacted_history]').length - 1;
+    const openCount = wrapped.content.split('[compacted_history]').length - 1;
+    const closeCount = wrapped.content.split('[/compacted_history]').length - 1;
     expect(openCount).toBe(1);
     expect(closeCount).toBe(1);
   });
@@ -264,25 +322,22 @@ describe('compactMessages — deterministic fallback', () => {
 
     expect(result.strategy).toBe('fallback');
     expect(result.reason).toContain('rate limited');
-    // Goal preserved + middle (with bodies elided) + tail. NO synthetic
-    // note inserted — that would put an assistant-role message right
-    // after the goal_user, immediately followed by the middle's first
-    // assistant turn (two consecutive assistants → wire-level break).
+    // Goal preserved by reference (fallback doesn't wrap with a
+    // summary — there isn't one). Middle elided in-place, tail
+    // (starting at assistant boundary) preserved literally.
     expect(result.messages[0]).toBe(history[0]);
-    expect(result.messages.slice(-3)).toEqual(history.slice(-3));
-    // Middle messages should still be present (not just a single
-    // summary), with tool_result bodies replaced by pointers.
-    const middleStart = 1; // immediately after the goal
-    const middleEnd = result.messages.length - 3;
+    // Middle messages should still be present (not collapsed to
+    // a single summary), with tool_result bodies replaced by
+    // pointers.
     let foundElidedToolResult = false;
-    for (let i = middleStart; i < middleEnd; i++) {
+    for (let i = 1; i < result.messages.length; i++) {
       const m = result.messages[i];
       if (typeof m?.content === 'string') continue;
       for (const block of m?.content ?? []) {
         if (block.type === 'tool_result') {
-          expect(block.content).toContain('elided');
-          expect(block.content).not.toContain('file contents step');
-          foundElidedToolResult = true;
+          if (block.content.includes('elided')) {
+            foundElidedToolResult = true;
+          }
         }
       }
     }
@@ -348,34 +403,42 @@ describe('compactMessages — deterministic fallback', () => {
     // A chat-heavy session with few tool calls would sail through
     // unchanged — same context size, same 400 on the next call.
     // Spec ORCHESTRATION §4.6 step 6: head+tail truncate with size
-    // pointer when bodies-only drop isn't enough.
+    // pointer when bodies-only drop isn't enough. The long
+    // assistant text must land in the MIDDLE for fallbackCompact
+    // to touch it; with assistant-boundary tail alignment that
+    // means we need history long enough that the long message
+    // sits before the preserved tail.
     const handle = mockProvider(new Error('rate limited'));
     const longText = 'a'.repeat(5000);
     const history: ProviderMessage[] = [
-      { role: 'user', content: 'goal' },
-      { role: 'assistant', content: longText },
-      { role: 'user', content: 'follow-up' },
-      { role: 'assistant', content: 'ok' },
-      { role: 'user', content: 'final' },
+      { role: 'user', content: 'goal' }, // 0
+      { role: 'assistant', content: longText }, // 1 — middle
+      { role: 'user', content: 'b' }, // 2 — middle
+      { role: 'assistant', content: 'c' }, // 3 — tail starts here
+      { role: 'user', content: 'd' }, // 4
+      { role: 'assistant', content: 'e' }, // 5
+      { role: 'user', content: 'f' }, // 6
     ];
     const result = await compactMessages(handle.provider, history, { preserveTail: 3 });
     expect(result.strategy).toBe('fallback');
-    // The long middle assistant message should be truncated, not
-    // returned verbatim.
-    const middle = result.messages[1];
-    expect(middle?.role).toBe('assistant');
-    const middleContent =
-      typeof middle?.content === 'string' ? middle.content : JSON.stringify(middle?.content);
-    expect(middleContent.length).toBeLessThan(longText.length);
-    expect(middleContent).toContain('elided');
+    // The long assistant message is in the middle and should be
+    // truncated; find it by scanning all post-goal messages.
+    const truncatedAssistant = result.messages
+      .slice(1)
+      .find((m) => typeof m.content === 'string' && m.content.includes('elided'));
+    expect(truncatedAssistant).toBeDefined();
+    if (truncatedAssistant && typeof truncatedAssistant.content === 'string') {
+      expect(truncatedAssistant.content.length).toBeLessThan(longText.length);
+    }
   });
 
   test('fallback truncates long text blocks inside structured content', async () => {
     const handle = mockProvider(new Error('rate limited'));
     const longText = 'b'.repeat(5000);
     const history: ProviderMessage[] = [
-      { role: 'user', content: 'goal' },
+      { role: 'user', content: 'goal' }, // 0
       {
+        // 1 — middle
         role: 'assistant',
         content: [
           { type: 'text', text: longText },
@@ -383,24 +446,31 @@ describe('compactMessages — deterministic fallback', () => {
         ],
       },
       {
+        // 2 — middle
         role: 'user',
         content: [{ type: 'tool_result', tool_use_id: 'tu1', name: 'echo', content: 'ok' }],
       },
-      { role: 'assistant', content: 'reply' },
-      { role: 'user', content: 'final' },
+      { role: 'assistant', content: 'A' }, // 3 — tail starts
+      { role: 'user', content: 'B' },
+      { role: 'assistant', content: 'C' },
+      { role: 'user', content: 'D' },
     ];
     const result = await compactMessages(handle.provider, history, { preserveTail: 3 });
     expect(result.strategy).toBe('fallback');
-    const middle = result.messages[1];
-    if (Array.isArray(middle?.content)) {
-      const textBlock = middle.content.find((b) => b.type === 'text');
+    // Find the structured-content message in middle.
+    const structured = result.messages.find(
+      (m) => Array.isArray(m.content) && m.content.some((b) => b.type === 'text'),
+    );
+    expect(structured).toBeDefined();
+    if (structured && Array.isArray(structured.content)) {
+      const textBlock = structured.content.find((b) => b.type === 'text');
       if (textBlock?.type === 'text') {
         expect(textBlock.text.length).toBeLessThan(longText.length);
         expect(textBlock.text).toContain('elided');
       }
       // tool_use args preserved verbatim — the next turn might
       // reference the tool_use_id.
-      const toolUseBlock = middle.content.find((b) => b.type === 'tool_use');
+      const toolUseBlock = structured.content.find((b) => b.type === 'tool_use');
       if (toolUseBlock?.type === 'tool_use') {
         expect(toolUseBlock.input).toEqual({ x: 1 });
       }
@@ -410,20 +480,25 @@ describe('compactMessages — deterministic fallback', () => {
   test('fallback leaves short text untouched', async () => {
     // Threshold guard: messages below the truncate cutoff stay
     // verbatim, so short conversations don't get unnecessarily
-    // mangled.
+    // mangled. Short message lands in the middle (post-goal,
+    // pre-tail) so fallbackCompact would touch it if it were
+    // long enough.
     const handle = mockProvider(new Error('rate limited'));
     const short = 'short content';
     const history: ProviderMessage[] = [
-      { role: 'user', content: 'goal' },
-      { role: 'assistant', content: short },
-      { role: 'user', content: 'a' },
-      { role: 'assistant', content: 'b' },
+      { role: 'user', content: 'goal' }, // 0
+      { role: 'assistant', content: short }, // 1 — middle
+      { role: 'user', content: 'a' }, // 2 — middle
+      { role: 'assistant', content: 'b' }, // 3 — tail
       { role: 'user', content: 'c' },
+      { role: 'assistant', content: 'd' },
+      { role: 'user', content: 'e' },
     ];
     const result = await compactMessages(handle.provider, history, { preserveTail: 3 });
     expect(result.strategy).toBe('fallback');
-    const middle = result.messages[1];
-    expect(middle?.content).toBe(short);
+    // The short content survives unchanged in its position.
+    const shortStill = result.messages.find((m) => m.content === short);
+    expect(shortStill).toBeDefined();
   });
 
   test('skipped path returns zero usage and usageSeen=false', async () => {

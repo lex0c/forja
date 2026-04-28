@@ -447,7 +447,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         });
         const contextWindow = config.provider.capabilities.context_window;
         const triggerAt = budget.compactionThreshold * contextWindow;
-        if (promptTokens > triggerAt && messages.length > 1 + budget.compactionPreserveTail) {
+        // Guard: requires at least goal + something-to-fold + an
+        // assistant boundary for the tail. compactMessages will skip
+        // (and emit a noisy started/finished pair) for shorter
+        // histories; check here so we don't fire the events at all.
+        // `+ 2` accounts for the assistant-boundary alignment the
+        // module performs — naive `1 + tail` could pass even when
+        // the alignment shift collapses the middle to empty.
+        if (promptTokens > triggerAt && messages.length >= budget.compactionPreserveTail + 3) {
           safeEmit(config.onEvent, {
             type: 'compaction_started',
             promptTokens,

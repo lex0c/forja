@@ -6,6 +6,7 @@ import type {
   ProviderMessage,
   UsageInfo,
 } from '../providers/index.ts';
+import { stripAnsi } from '../sanitize/index.ts';
 import { abortableIterable } from './abortable.ts';
 import { collectStep } from './collect.ts';
 
@@ -183,14 +184,6 @@ const callSummaryProvider = async (
   middle: ProviderMessage[],
   options: CompactionOptions,
 ): Promise<SummaryAttempt> => {
-  const goalText =
-    typeof goal.content === 'string'
-      ? goal.content
-      : goal.content
-          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-          .map((b) => b.text)
-          .join('\n');
-
   const transcript = renderTranscriptForSummary(middle);
 
   const req: GenerateRequest = {
@@ -199,7 +192,7 @@ const callSummaryProvider = async (
     messages: [
       {
         role: 'user',
-        content: `ORIGINAL GOAL (preserve literally in summary):\n${goalText}\n\nTRANSCRIPT TO SUMMARIZE:\n${transcript}`,
+        content: `ORIGINAL GOAL (preserve literally in summary):\n${goalText(goal)}\n\nTRANSCRIPT TO SUMMARIZE:\n${transcript}`,
       },
     ],
     max_tokens: options.maxTokens ?? 1024,
@@ -223,22 +216,72 @@ const callSummaryProvider = async (
   };
 };
 
-// Wrap the LLM-produced summary in a synthetic assistant message. Two
-// consecutive user messages would also work (Anthropic accepts), but
-// presenting the summary as the agent's own context note keeps the
-// next turn's user/assistant alternation obvious to the model.
-const wrapSummary = (summary: string): ProviderMessage => {
-  const trimmed = summary.trim();
+// Strip any prior `[compacted_history]...[/compacted_history]` block(s)
+// from a string. Cumulative compactions previously appended a new
+// summary on top of every prior wrap, growing the goal monotonically:
+// after compaction N the wrapped goal contained N summaries. Each new
+// compaction's LLM call would also see all prior summaries inside the
+// "ORIGINAL GOAL" the LLM was told to preserve literally — they got
+// re-quoted in the new summary, snowballing further. Stripping resets
+// to "original goal + LATEST summary", which is what subsequent
+// compactions actually need.
+//
+// Non-greedy match across newlines so multiple consecutive blocks are
+// each removed independently. A goal that legitimately contained the
+// markers (extreme edge case) would be partially corrupted; we accept
+// that to avoid the unbounded-growth bug in practice.
+const SUMMARY_BLOCK_RE = /\n*\[compacted_history\][\s\S]*?\[\/compacted_history\]\n*/g;
+const stripPriorSummary = (text: string): string => text.replace(SUMMARY_BLOCK_RE, '').trim();
+
+// Extract plain text from a goal message regardless of whether the
+// content was set as a string or as a list of blocks, then strip any
+// prior summary block. The harness always uses string content for the
+// initial user prompt, but compaction may rewrite messages[0] into a
+// wrapped goal that already carries a summary; subsequent compactions
+// must see the ORIGINAL goal, not the prior summary.
+const goalText = (goal: ProviderMessage): string => {
+  const raw =
+    typeof goal.content === 'string'
+      ? goal.content
+      : goal.content
+          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+          .map((b) => b.text)
+          .join('\n');
+  return stripPriorSummary(raw);
+};
+
+// Merge the LLM-produced summary INTO the goal message rather than
+// emitting a separate synthetic message. Two reasons:
+//   1. Tool-pair integrity — the tail must start with the assistant
+//      message that emitted the tool_use referenced by following
+//      user_tool_result blocks. If we inserted a separate summary
+//      message and forced the tail to start with `user`, that user
+//      tool_result would be orphaned (its matching tool_use was in
+//      the middle, now folded into the summary), and providers
+//      reject orphaned tool_result blocks with 400.
+//   2. Alternation — Anthropic rejects consecutive same-role
+//      messages. With tail starting at `assistant` we'd need the
+//      preceding message to be `user`. Merging into the goal keeps
+//      `[user_goal+summary, assistant_first_tail, ...]` as a clean
+//      user→assistant→user→... sequence.
+const wrapGoalWithSummary = (goal: ProviderMessage, summary: string): ProviderMessage => {
+  // Strip ANSI from the LLM-produced summary before it lands in the
+  // model's context (and the audit log via the provider response
+  // path). Compaction calls go through our trusted provider, but a
+  // hijacked or buggy proxy could inject control bytes; the
+  // sanitization layer is the canonical defense and applying it
+  // here keeps the invariant from §SECURITY_GUIDELINE §5/4
+  // consistent across compaction paths.
+  const trimmed = stripAnsi(summary).trim();
   // Defensive: model may forget one or both markers, or pad text
   // around them. We accept anywhere-in-the-string occurrences and
-  // only re-wrap when at least one marker is missing entirely. A
-  // strict start/end check would re-wrap perfectly-marked output
-  // that has trailing whitespace or stray prose, producing nested
-  // markers that confuse downstream scanners.
+  // only re-wrap when at least one marker is missing entirely.
   const hasMarkers =
     trimmed.includes(SUMMARY_MARKER_OPEN) && trimmed.includes(SUMMARY_MARKER_CLOSE);
   const body = hasMarkers ? trimmed : `${SUMMARY_MARKER_OPEN}\n${trimmed}\n${SUMMARY_MARKER_CLOSE}`;
-  return { role: 'assistant', content: body };
+  // goalText already strips any prior summary block, so this never
+  // accumulates: the wrap is always [original_goal]\n\n[latest summary].
+  return { role: 'user', content: `${goalText(goal)}\n\n${body}` };
 };
 
 export const compactMessages = async (
@@ -278,31 +321,37 @@ export const compactMessages = async (
     };
   }
 
-  // Alignment invariant: the inserted summary message has role
-  // 'assistant'. Whatever follows it must be role 'user', otherwise
-  // we ship a prompt with two consecutive assistant messages and
-  // Anthropic's API rejects it with 400. The harness loop pushes
-  // messages in [user, assistant, user, ...] alternation, so an
-  // even `preserveTail` lands the slice on an assistant boundary.
-  // Shift the slice one earlier (effectively `preserveTail+1`) when
-  // that happens — over-preserving is honest, broken alternation is
-  // a wire-level failure.
+  // Alignment invariant: the tail MUST start with an `assistant`
+  // message so tool_use → tool_result pairs stay intact. The
+  // harness loop produces [user_goal, assistant, user_tool_result,
+  // assistant, user_tool_result, ...]; a user_tool_result in the
+  // tail references a tool_use emitted by an assistant turn — if
+  // that assistant ended up in the middle (folded into the summary
+  // we're merging into the goal), the next provider call sees an
+  // orphan tool_result and rejects with 400.
+  //
+  // Walk back from the requested boundary to the nearest assistant.
+  // The summary is merged into the goal (user-role), so the resulting
+  // [wrappedGoal_user, tail_starts_with_assistant, ...] sequence has
+  // clean user→assistant→user alternation regardless of preserveTail
+  // parity. Over-preserving by one position when the boundary lands
+  // on a user is the price of correctness.
   let tailStart = messages.length - safeTail;
-  if (safeTail > 0 && messages[tailStart]?.role === 'assistant') {
-    if (tailStart <= 1) {
-      // Can't expand without eating the goal slot. The history is
-      // pathological (very short, off-alignment); refuse instead of
-      // emitting a malformed prompt.
-      return {
-        messages,
-        strategy: 'skipped',
-        foldedCount: 0,
-        usage: emptyUsage(),
-        usageSeen: false,
-        reason: 'cannot align tail without overlapping goal',
-      };
-    }
+  while (tailStart > 1 && messages[tailStart]?.role !== 'assistant') {
     tailStart -= 1;
+  }
+  if (tailStart < 1 || messages[tailStart]?.role !== 'assistant') {
+    // Pathological history shape — no assistant message between the
+    // goal and the requested tail. Refuse rather than emit a
+    // malformed prompt.
+    return {
+      messages,
+      strategy: 'skipped',
+      foldedCount: 0,
+      usage: emptyUsage(),
+      usageSeen: false,
+      reason: 'cannot align tail to assistant boundary',
+    };
   }
 
   const middle = messages.slice(1, tailStart);
@@ -337,7 +386,7 @@ export const compactMessages = async (
       throw new Error('compaction produced empty summary');
     }
     return {
-      messages: [goal, wrapSummary(attempt.text), ...tailMessages],
+      messages: [wrapGoalWithSummary(goal, attempt.text), ...tailMessages],
       strategy: 'llm',
       foldedCount: middle.length,
       usage: attemptUsage,
