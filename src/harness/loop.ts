@@ -8,7 +8,7 @@ import type {
   ProviderToolResultBlock,
   ProviderToolUseBlock,
 } from '../providers/index.ts';
-import { estimateMessagesTokens } from '../providers/tokens.ts';
+import { estimatePromptTokens } from '../providers/tokens.ts';
 import { appendMessage, completeSession, createSession } from '../storage/index.ts';
 import type { ToolContext } from '../tools/index.ts';
 import { abortableIterable } from './abortable.ts';
@@ -423,17 +423,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       lastMessageId = resultMsg.id;
       messages.push({ role: 'user', content: toolResults });
 
-      // Compaction trigger check. The prior implementation used the
-      // last turn's billed input as a proxy for next-prompt size, but
-      // by this point the loop already appended fresh tool_results
-      // to `messages`. A single big tool output (read_file on a
-      // large file, grep with many hits) can push the next prompt
-      // over the cap even when the prior one was below threshold —
-      // leading to a context-length 400 on the next call before the
-      // trigger ever fires. We re-estimate over the actual messages
-      // we're about to send so the decision matches reality.
+      // Compaction trigger check. Estimate the FULL outbound prompt
+      // — messages + system + tool schemas — against the threshold.
+      // Tool schemas alone run 2-4k tokens each per CONTEXT_TUNING.md
+      // §2.1; a long system prompt adds another 0.5-3k. Counting only
+      // `messages` undercounts the trigger and lets the next request
+      // sail over the cap when the surrounding overhead is what's
+      // pushing it close.
       //
-      // estimateMessagesTokens is the local chars/4 heuristic: free
+      // estimatePromptTokens is the local chars/4 heuristic: free
       // (no HTTP), conservative (overestimates by ~10-25% vs real
       // tokenizers), good enough for a 70%-of-window threshold that
       // already includes a buffer.
@@ -443,7 +441,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // re-derive from the full history if they ever need a different
       // compaction policy.
       if (!signal.aborted && config.provider.capabilities.context_window > 0) {
-        const promptTokens = estimateMessagesTokens(messages);
+        const promptTokens = estimatePromptTokens(messages, {
+          ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
+          ...(tools.length > 0 ? { tools } : {}),
+        });
         const contextWindow = config.provider.capabilities.context_window;
         const triggerAt = budget.compactionThreshold * contextWindow;
         if (promptTokens > triggerAt && messages.length > 1 + budget.compactionPreserveTail) {

@@ -930,6 +930,58 @@ describe('runAgent', () => {
     }
   });
 
+  test('compaction trigger counts system prompt and tool schemas (not just messages)', async () => {
+    // Regression: the prior trigger estimated only the messages
+    // array. A long system prompt or large tool schemas (2-4k tokens
+    // each per CONTEXT_TUNING.md §2.1) push the real prompt over the
+    // cap while messages alone stays comfortably below — leading to
+    // skipped compaction and a context-length 400 on the next call.
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    // Tools are pulled from the registry; use the real `echo` tool
+    // registered by buildConfig but inflate its description so the
+    // schema cost is large.
+    const heavyTool: Tool = {
+      name: 'heavy',
+      description: 'x'.repeat(2000), // ~500 token description
+      inputSchema: { type: 'object', properties: {} },
+      metadata: { category: 'misc', writes: false, idempotent: true },
+      async execute() {
+        return { ok: true };
+      },
+    };
+    const longSystem = 'y'.repeat(800); // ~200 tokens
+    const { config } = buildConfig(
+      [
+        // Tiny messages — under threshold by message-only estimate.
+        {
+          tool_uses: [{ id: 't1', name: 'heavy', input: {} }],
+          stop_reason: 'tool_use',
+          usage: { input: 50, output: 5 },
+        },
+        // Compaction summary call.
+        {
+          text: '[compacted_history]\nGOAL: x\n[/compacted_history]',
+          stop_reason: 'end_turn',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ],
+      {
+        extraTools: [heavyTool],
+        capsOverride: { context_window: 1000, cost_per_1k_input: 0, cost_per_1k_output: 0 },
+        budget: { compactionThreshold: 0.7, compactionPreserveTail: 1, maxToolErrors: 99 },
+      },
+    );
+    const result = await runAgent({
+      ...config,
+      systemPrompt: longSystem,
+      onEvent: (e) => events.push(e),
+    });
+    expect(result.status).toBe('done');
+    // System (~200) + tool schema (~500) + tiny messages = > 700
+    // (= 70% of 1000). Trigger must fire.
+    expect(events.find((e) => e.type === 'compaction_started')).toBeDefined();
+  });
+
   test('compaction triggers on the SAME turn a big tool_result pushes prompt over', async () => {
     // Regression: prior trigger used last turn's billed input. A
     // single tool that returns a huge payload (read_file on a 200KB
