@@ -60,6 +60,17 @@ export const globTool: Tool<GlobInput, GlobOutput> = {
     if (ctx.signal.aborted) {
       return toolError(ERROR_CODES.aborted, 'tool aborted before glob', { retryable: true });
     }
+    // Tool args come from model JSON via a cast in the harness; the TS
+    // shape isn't enforced at runtime. Guard before patternEscapesRoot,
+    // which would otherwise crash inside isAbsolute/split on a non-string
+    // and surface as `tool.exception` (consuming the consecutive-error
+    // budget needlessly). Same pattern as the engine's resolveFsTarget
+    // type guards.
+    if (typeof args.pattern !== 'string' || args.pattern.length === 0) {
+      return toolError(ERROR_CODES.invalidArg, 'glob pattern must be a non-empty string', {
+        details: { receivedType: typeof args.pattern },
+      });
+    }
     if (patternEscapesRoot(args.pattern)) {
       return toolError(
         ERROR_CODES.globPatternEscapes,

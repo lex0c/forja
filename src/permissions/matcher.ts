@@ -69,7 +69,12 @@ const compileGlobToRegex = (pattern: string): RegExp => {
     else if (ch === '?') out += '.';
     else out += ch.replace(REGEX_META, '\\$&');
   }
-  return new RegExp(`^${out}$`);
+  // `s` (dotAll) so `.` (and therefore the `.*` we use for `*`) matches
+  // newlines too. The `bash` tool accepts multi-line commands; without
+  // dotAll, a pattern like `*` or `python -c *` fails to match an input
+  // that contains `\n`, and policy rules silently fall through to the
+  // default deny.
+  return new RegExp(`^${out}$`, 's');
 };
 
 // Command matching: pattern with `*` matches any sequence of characters

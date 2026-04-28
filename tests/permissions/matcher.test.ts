@@ -66,6 +66,20 @@ describe('matchCommand', () => {
   test('* matches any character including spaces', () => {
     expect(matchCommand('rm -rf *', 'rm -rf / --no-preserve-root')).toBe(true);
   });
+
+  test('* matches across newlines (multi-line bash commands)', () => {
+    // bash tool accepts multi-line commands. Without dotAll, the `.`
+    // in our regex would skip `\n` and policy rules like `*` or
+    // `bash -c *` would fall through to default deny on heredocs and
+    // multi-line scripts.
+    expect(matchCommand('*', 'echo a\necho b')).toBe(true);
+    expect(matchCommand('python -c *', 'python -c "for i in range(3):\n  print(i)"')).toBe(true);
+    expect(matchCommand('cat <<EOF\n*\nEOF', 'cat <<EOF\nhello\nworld\nEOF')).toBe(true);
+  });
+
+  test('? matches a single character including newline', () => {
+    expect(matchCommand('a?b', 'a\nb')).toBe(true);
+  });
 });
 
 describe('matchHost', () => {

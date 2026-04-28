@@ -69,6 +69,7 @@ export const ERROR_CODES = {
   oldEqualsNew: 'edit.old_equals_new',
   oldStringEmpty: 'edit.old_string_empty',
   globPatternEscapes: 'glob.pattern_escapes_root',
+  invalidArg: 'tool.invalid_arg',
   bashTimeout: 'bash.timeout',
   bashSpawnFailed: 'bash.spawn_failed',
   ripgrepMissing: 'grep.ripgrep_missing',

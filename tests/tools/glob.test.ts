@@ -51,6 +51,23 @@ describe('globTool', () => {
     expect(out.count).toBe(0);
   });
 
+  test('rejects non-string pattern with a clean validation error', async () => {
+    // Cast bypasses TS — model JSON args are runtime-untyped.
+    for (const bogus of [123, null, { not: 'string' }, ['array'], undefined]) {
+      const out = await globTool.execute(
+        { pattern: bogus } as unknown as Parameters<typeof globTool.execute>[0],
+        makeCtx({ cwd: dir }),
+      );
+      expect(isToolError(out)).toBe(true);
+      if (isToolError(out)) {
+        // Must be a structured validation error, NOT a tool.exception
+        // from a downstream throw inside isAbsolute/split.
+        expect(out.error_code).toBe('tool.invalid_arg');
+        expect(out.error_message).toContain('non-empty string');
+      }
+    }
+  });
+
   test('rejects parent-traversal patterns (would bypass policy)', async () => {
     const out = await globTool.execute(
       { pattern: '../secret/*.txt', cwd: 'src' },
