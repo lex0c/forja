@@ -1180,6 +1180,54 @@ describe('runAgent', () => {
     expect(result.usageComplete).toBe(false);
   });
 
+  test('compaction does NOT trigger on the final allowed step (maxSteps reached)', async () => {
+    // Regression: compaction runs at the END of a step body, but
+    // the loop's maxSteps check is at the TOP of the next
+    // iteration. With budget.maxSteps=2 and the trigger firing at
+    // the bottom of step 2, we'd burn an extra billed summary call
+    // right before the next top-check exits as maxSteps. Skip
+    // when no further step is allowed.
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const fatTool: Tool = {
+      name: 'fat',
+      description: 'returns sizable text',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: true },
+      async execute() {
+        return 'x'.repeat(3000);
+      },
+    };
+    const { config } = buildConfig(
+      [
+        // Two fat-tool turns: estimate crosses threshold after
+        // turn 2. With maxSteps=2 the loop must NOT compact.
+        {
+          tool_uses: [{ id: 't1', name: 'echo', input: { msg: 'a' } }],
+          stop_reason: 'tool_use',
+          usage: { input: 50, output: 5 },
+        },
+        {
+          tool_uses: [{ id: 't2', name: 'fat', input: {} }],
+          stop_reason: 'tool_use',
+          usage: { input: 50, output: 5 },
+        },
+      ],
+      {
+        extraTools: [fatTool],
+        capsOverride: { context_window: 1000, cost_per_1k_input: 0, cost_per_1k_output: 0 },
+        budget: {
+          compactionThreshold: 0.7,
+          compactionPreserveTail: 1,
+          maxToolErrors: 99,
+          maxSteps: 2,
+        },
+      },
+    );
+    const result = await runAgent({ ...config, onEvent: (e) => events.push(e) });
+    expect(result.reason).toBe('maxSteps');
+    expect(events.find((e) => e.type === 'compaction_started')).toBeUndefined();
+  });
+
   test('compaction does NOT trigger after the run is aborted', async () => {
     // If the user aborts between the tool_results push and the
     // trigger check, the harness should skip compaction — the next

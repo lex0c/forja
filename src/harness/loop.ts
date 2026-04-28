@@ -440,7 +440,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // array sent to the provider gets rewritten. Audit + replay can
       // re-derive from the full history if they ever need a different
       // compaction policy.
-      if (!signal.aborted && config.provider.capabilities.context_window > 0) {
+      // Skip when the budget is exhausted: compaction would issue a
+      // billed summary call right before the loop's top-of-iteration
+      // check exits with `maxSteps` anyway. Same logic as the
+      // signal.aborted guard — don't burn tokens on work whose
+      // result will never be used.
+      if (
+        !signal.aborted &&
+        steps < budget.maxSteps &&
+        config.provider.capabilities.context_window > 0
+      ) {
         const promptTokens = estimatePromptTokens(messages, {
           ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
           ...(tools.length > 0 ? { tools } : {}),
