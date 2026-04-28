@@ -18,6 +18,7 @@ const policy = (p: Partial<Policy> = {}): Policy => ({
 
 interface ScriptedStep {
   text?: string;
+  thinking?: string;
   tool_uses?: { id: string; name: string; input: Record<string, unknown> }[];
   stop_reason?: CollectedStep['stop_reason'];
   message_id?: string;
@@ -26,6 +27,9 @@ interface ScriptedStep {
 
 const replayStep = function* (step: ScriptedStep): Iterable<StreamEvent> {
   yield { kind: 'start', message_id: step.message_id ?? `mock_${crypto.randomUUID()}` };
+  if (step.thinking !== undefined && step.thinking.length > 0) {
+    yield { kind: 'thinking_delta', text: step.thinking };
+  }
   if (step.text !== undefined && step.text.length > 0) {
     yield { kind: 'text_delta', text: step.text };
   }
@@ -419,6 +423,19 @@ describe('runAgent', () => {
     );
     const result = await runAgent(config);
     expect(result.usageComplete).toBe(true);
+  });
+
+  test('usageComplete flips false on a thinking-only turn without usage', async () => {
+    // Anthropic's extended thinking emits thinking_delta events that
+    // are charged as output tokens even when the model produces no
+    // text or tool_use that turn. Missing usage on such a turn IS
+    // underreporting and must surface in the aggregate flag.
+    const { config } = buildConfig(
+      [{ thinking: 'reasoning silently...', stop_reason: 'end_turn' }],
+      { capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 } },
+    );
+    const result = await runAgent(config);
+    expect(result.usageComplete).toBe(false);
   });
 
   test('usageComplete ignores empty assistant turns without usage', async () => {
