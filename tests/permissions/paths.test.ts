@@ -1,65 +1,119 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  ENTERPRISE_POLICY_PATH,
+  enterprisePolicyPath,
   projectPolicyPath,
   userPolicyPath,
 } from '../../src/permissions/paths.ts';
 
-describe('permission policy paths', () => {
-  test('enterprise path is /etc/agent/permissions.yaml', () => {
-    expect(ENTERPRISE_POLICY_PATH).toBe('/etc/agent/permissions.yaml');
+// Tests pin platform explicitly so they pass deterministically on
+// Linux, macOS, AND Windows hosts. Without explicit `platform`, the
+// Windows branch would activate on a Windows runner and the Unix
+// branch on a Linux/macOS runner, making expectations host-dependent.
+
+describe('enterprisePolicyPath', () => {
+  test('Linux returns /etc/agent/permissions.yaml', () => {
+    expect(enterprisePolicyPath('linux', {})).toBe('/etc/agent/permissions.yaml');
   });
 
-  test('user path uses XDG_CONFIG_HOME when set', () => {
-    expect(userPolicyPath({ XDG_CONFIG_HOME: '/x', HOME: '/h' })).toBe('/x/agent/permissions.yaml');
+  test('macOS returns /etc/agent/permissions.yaml', () => {
+    expect(enterprisePolicyPath('darwin', {})).toBe('/etc/agent/permissions.yaml');
   });
 
-  test('user path falls back to ~/.config/agent when XDG is unset', () => {
-    expect(userPolicyPath({ HOME: '/home/lex' })).toBe('/home/lex/.config/agent/permissions.yaml');
+  test('Windows uses %PROGRAMDATA%\\agent\\permissions.yaml when set', () => {
+    expect(enterprisePolicyPath('win32', { PROGRAMDATA: 'C:\\ProgramData' })).toContain('agent');
+    expect(enterprisePolicyPath('win32', { PROGRAMDATA: 'C:\\ProgramData' })).toContain(
+      'permissions.yaml',
+    );
   });
 
-  test('user path falls back gracefully when XDG is empty string (not just unset)', () => {
-    // Empty XDG should be treated like unset — some shells export
-    // XDG_CONFIG_HOME='' which would otherwise produce
-    // '/agent/permissions.yaml' (root path).
-    expect(userPolicyPath({ XDG_CONFIG_HOME: '', HOME: '/home/lex' })).toBe(
+  test('Windows returns null when PROGRAMDATA is unset', () => {
+    expect(enterprisePolicyPath('win32', {})).toBeNull();
+  });
+
+  test('Windows returns null when PROGRAMDATA is relative', () => {
+    expect(enterprisePolicyPath('win32', { PROGRAMDATA: 'relative\\path' })).toBeNull();
+  });
+});
+
+describe('userPolicyPath — Linux/macOS', () => {
+  test('uses XDG_CONFIG_HOME when set', () => {
+    expect(userPolicyPath({ XDG_CONFIG_HOME: '/x', HOME: '/h' }, 'linux')).toBe(
+      '/x/agent/permissions.yaml',
+    );
+  });
+
+  test('falls back to ~/.config/agent when XDG is unset', () => {
+    expect(userPolicyPath({ HOME: '/home/lex' }, 'linux')).toBe(
       '/home/lex/.config/agent/permissions.yaml',
     );
   });
 
-  test('user path returns null when HOME is unset and XDG is unset', () => {
-    // Regression: previously fell through to join('', '.config',
-    // 'agent', 'permissions.yaml') which produces a RELATIVE path.
-    // existsSync would then check against the current cwd, letting
-    // a repo-local `.config/agent/permissions.yaml` masquerade as
-    // the user layer. Returning null tells the resolver to skip.
-    expect(userPolicyPath({})).toBeNull();
-  });
-
-  test('user path returns null when HOME is empty string', () => {
-    expect(userPolicyPath({ HOME: '' })).toBeNull();
-  });
-
-  test('user path returns null when HOME is relative (not absolute)', () => {
-    // Defensive: a non-absolute HOME would still produce a relative
-    // joined path. Per XDG/POSIX, HOME should always be absolute;
-    // refuse rather than guess.
-    expect(userPolicyPath({ HOME: 'relative/home' })).toBeNull();
-  });
-
-  test('user path ignores XDG_CONFIG_HOME when it is relative (per XDG spec)', () => {
-    // XDG spec: "If the value is not an absolute path, the value
-    // is invalid and should be discarded."
-    expect(userPolicyPath({ XDG_CONFIG_HOME: 'rel', HOME: '/home/lex' })).toBe(
+  test('treats XDG empty string as unset', () => {
+    expect(userPolicyPath({ XDG_CONFIG_HOME: '', HOME: '/home/lex' }, 'linux')).toBe(
       '/home/lex/.config/agent/permissions.yaml',
     );
   });
 
-  test('user path returns null when both XDG and HOME are non-absolute', () => {
-    expect(userPolicyPath({ XDG_CONFIG_HOME: 'rel-xdg', HOME: 'rel-home' })).toBeNull();
+  test('returns null when HOME is unset and XDG is unset', () => {
+    expect(userPolicyPath({}, 'linux')).toBeNull();
   });
 
-  test('project path is cwd/.agent/permissions.yaml', () => {
-    expect(projectPolicyPath('/p')).toBe('/p/.agent/permissions.yaml');
+  test('returns null when HOME is empty string', () => {
+    expect(userPolicyPath({ HOME: '' }, 'linux')).toBeNull();
+  });
+
+  test('returns null when HOME is relative (not absolute)', () => {
+    expect(userPolicyPath({ HOME: 'relative/home' }, 'linux')).toBeNull();
+  });
+
+  test('ignores XDG_CONFIG_HOME when relative (per XDG spec)', () => {
+    expect(userPolicyPath({ XDG_CONFIG_HOME: 'rel', HOME: '/home/lex' }, 'linux')).toBe(
+      '/home/lex/.config/agent/permissions.yaml',
+    );
+  });
+
+  test('returns null when both XDG and HOME are non-absolute', () => {
+    expect(userPolicyPath({ XDG_CONFIG_HOME: 'rel-xdg', HOME: 'rel-home' }, 'linux')).toBeNull();
+  });
+});
+
+describe('userPolicyPath — Windows', () => {
+  test('uses APPDATA when set', () => {
+    const result = userPolicyPath({ APPDATA: 'C:\\Users\\Lex\\AppData\\Roaming' }, 'win32');
+    expect(result).toContain('agent');
+    expect(result).toContain('permissions.yaml');
+  });
+
+  test('falls back to USERPROFILE\\AppData\\Roaming when APPDATA is unset', () => {
+    const result = userPolicyPath({ USERPROFILE: 'C:\\Users\\Lex' }, 'win32');
+    expect(result).toContain('AppData');
+    expect(result).toContain('Roaming');
+    expect(result).toContain('agent');
+  });
+
+  test('still honors XDG_CONFIG_HOME when explicitly set on Windows', () => {
+    // Some Windows users (WSL, dotfile managers) opt into XDG. We
+    // honor it on every platform when set absolute.
+    const result = userPolicyPath({ XDG_CONFIG_HOME: 'C:\\xdg', APPDATA: 'C:\\AppData' }, 'win32');
+    expect(result).toContain('xdg');
+    expect(result).not.toContain('AppData');
+  });
+
+  test('returns null when neither APPDATA nor USERPROFILE is set', () => {
+    expect(userPolicyPath({}, 'win32')).toBeNull();
+  });
+
+  test('returns null when APPDATA is relative', () => {
+    expect(userPolicyPath({ APPDATA: 'relative\\appdata' }, 'win32')).toBeNull();
+  });
+});
+
+describe('projectPolicyPath', () => {
+  test('joins cwd with .agent/permissions.yaml', () => {
+    // Asserts on substrings rather than exact path so the test
+    // passes regardless of host separator.
+    const result = projectPolicyPath('/p');
+    expect(result).toContain('.agent');
+    expect(result).toContain('permissions.yaml');
   });
 });

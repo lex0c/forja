@@ -31,7 +31,7 @@ export {
 } from './config.ts';
 
 export {
-  ENTERPRISE_POLICY_PATH,
+  enterprisePolicyPath,
   projectPolicyPath,
   userPolicyPath,
 } from './paths.ts';

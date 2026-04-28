@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import { defaultPolicy, loadPolicyFromFile } from './config.ts';
-import { ENTERPRISE_POLICY_PATH, projectPolicyPath, userPolicyPath } from './paths.ts';
+import { enterprisePolicyPath, projectPolicyPath, userPolicyPath } from './paths.ts';
 import type { Policy, PolicyDefaults, PolicyMode, PolicyToolsSection } from './types.ts';
 
 // Hierarchy resolution per AGENTIC_CLI §8: enterprise → user → project
@@ -70,7 +70,9 @@ const loadLayers = (options: ResolveOptions): LayerPolicy[] => {
   const out: LayerPolicy[] = [];
 
   const enterprisePath =
-    options.enterprisePath === null ? null : (options.enterprisePath ?? ENTERPRISE_POLICY_PATH);
+    options.enterprisePath === null
+      ? null
+      : (options.enterprisePath ?? enterprisePolicyPath(undefined, options.env));
   if (enterprisePath !== null && existsSync(enterprisePath)) {
     out.push({
       layer: 'enterprise',
