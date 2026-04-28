@@ -77,24 +77,41 @@ const ANSI_PATTERN = new RegExp(
 export const stripAnsi = (s: string): string => s.replace(ANSI_PATTERN, '');
 
 // Recursively strip ANSI from every string leaf in a value. Preserves
-// shape (objects, arrays, numbers, booleans, null) so a tool returning
-// `{ stdout: "..", stderr: ".." }` keeps that schema for the model.
+// shape (plain objects, arrays, numbers, booleans, null) so a tool
+// returning `{ stdout: "..", stderr: ".." }` keeps that schema for
+// the model. Non-plain objects (Date, Map, Set, Error, class
+// instances, Buffer) are NOT walked: doing so would call
+// `Object.entries` and either flatten them to `{}` (Date, Map, Set)
+// or destroy their prototype (class instances), silently corrupting
+// the output. Instead, we follow JSON serialization semantics:
+//   - If the value has `toJSON`, call it and recurse on the result
+//     (matches JSON.stringify; Date → ISO string for example).
+//   - Otherwise, return the value opaquely. The harness's downstream
+//     `JSON.stringify(content)` will render it per JSON's own rules
+//     (Map/Set/Error → `{}`, custom instance → enumerable props).
 //
-// `unknown` in, `unknown` out — the harness JSON-stringifies the result
-// downstream and doesn't depend on the type. Defended against:
-//   - Cyclic references: tracked via an ancestry stack (WeakSet that
-//     entries are added to before recursing and removed after). Only
-//     references that close back on the current path are marked as
-//     cycles; the same object referenced twice as siblings (a
-//     non-cyclic DAG, e.g., a shared error appearing under two keys)
-//     is sanitized in both places, mirroring how JSON.stringify
-//     would re-emit it. Tools shouldn't produce true cycles (JSON
-//     can't represent them), but the sanitizer must not
-//     stack-overflow on a buggy input.
-//   - Non-plain objects (Date, Buffer, Map): treated as opaque — string
-//     leaves inside don't reach. Caller is expected to serialize first
-//     if they want deep walking; tool contract is plain JSON-shaped.
+// `unknown` in, `unknown` out — the harness JSON-stringifies the
+// result downstream and doesn't depend on the type. Defenses:
+//   - Cyclic references tracked via an ancestry-stack WeakSet.
+//     Entries added before recursing and removed after, so a non-
+//     cyclic DAG (same object referenced from sibling positions)
+//     is sanitized in every position — only refs that close back
+//     on the current path are marked as cycles.
+//   - The walker never falls into infinite toJSON loops because
+//     the post-toJSON value is structurally different (it's the
+//     serialized form, not the original instance).
 const CYCLE_MARKER = '<cycle>';
+
+const isPlainObject = (v: object): boolean => {
+  // Object.create(null) has null prototype but is functionally a
+  // plain dict — walk it. Anything else with a custom prototype
+  // (Date, Map, instance of Foo) is treated as opaque.
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+};
+
+const hasToJSON = (v: object): v is { toJSON: (key?: unknown) => unknown } =>
+  typeof (v as { toJSON?: unknown }).toJSON === 'function';
 
 const sanitizeWithSeen = (value: unknown, seen: WeakSet<object>): unknown => {
   if (typeof value === 'string') return stripAnsi(value);
@@ -105,6 +122,20 @@ const sanitizeWithSeen = (value: unknown, seen: WeakSet<object>): unknown => {
     if (Array.isArray(value)) {
       return value.map((v) => sanitizeWithSeen(v, seen));
     }
+    // Honor `toJSON` like JSON.stringify does — Date → ISO string,
+    // class instances that opt into a serialized form get their
+    // serialized shape sanitized. The seen-set still guards against
+    // cycles in pathological toJSON implementations.
+    if (hasToJSON(value)) {
+      return sanitizeWithSeen(value.toJSON(), seen);
+    }
+    // Non-plain objects without toJSON: opaque pass-through. The
+    // caller will eventually JSON.stringify and get the same shape
+    // they would have gotten without us — Map/Set/Error → `{}`,
+    // instance → its own enumerable props. Walking would
+    // corruptively flatten these to literal `{}`, losing the
+    // identity that JSON's default rendering preserves.
+    if (!isPlainObject(value)) return value;
     // Plain object walk. Non-enumerable / symbol keys are ignored —
     // tool outputs are spec'd as JSON-shaped, and JSON.stringify
     // drops them too.

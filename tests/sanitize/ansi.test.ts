@@ -208,4 +208,81 @@ describe('sanitizeToolOutput', () => {
     sanitizeToolOutput(input);
     expect(input.msg).toBe('\x1b[31mhi\x1b[0m');
   });
+
+  test('Date becomes its ISO string via toJSON (matches JSON.stringify)', () => {
+    // A walker that called Object.entries on a Date would replace it
+    // with `{}` — silently losing the timestamp. Honoring toJSON
+    // matches JSON.stringify semantics: the Date renders as an ISO
+    // string, which (being a string) then has ANSI stripped if any.
+    const d = new Date('2026-04-28T12:34:56.000Z');
+    const out = sanitizeToolOutput({ when: d, label: '\x1b[31mhi\x1b[0m' });
+    expect(out).toEqual({ when: '2026-04-28T12:34:56.000Z', label: 'hi' });
+    expect(JSON.stringify(out)).toBe(JSON.stringify({ when: d, label: 'hi' }));
+  });
+
+  test('Map and Set are passed through opaquely (JSON renders them as {})', () => {
+    // Walking a Map with Object.entries gives `[]` (Map's entries
+    // aren't enumerable string-keyed props), corrupting it to `{}`.
+    // Opaque pass-through preserves the Map identity so JSON.stringify
+    // downstream renders it per JSON's rules — the same shape callers
+    // would have seen without us.
+    const m = new Map([['k', 'v']]);
+    const s = new Set(['a', 'b']);
+    const out = sanitizeToolOutput({ m, s, plain: 'ok' }) as {
+      m: Map<string, string>;
+      s: Set<string>;
+      plain: string;
+    };
+    // Identity preserved.
+    expect(out.m).toBe(m);
+    expect(out.s).toBe(s);
+    expect(out.plain).toBe('ok');
+    // Downstream JSON.stringify gives the same shape it always would.
+    expect(JSON.stringify(out)).toBe(JSON.stringify({ m, s, plain: 'ok' }));
+  });
+
+  test('Error instances pass through (own props preserved by JSON.stringify)', () => {
+    const e = new Error('\x1b[31mboom\x1b[0m');
+    const out = sanitizeToolOutput({ e }) as { e: Error };
+    // Identity preserved (so any .message ANSI is kept; that's the
+    // tool's responsibility to scrub at construction time, or the
+    // caller's via stripAnsi(err.message)).
+    expect(out.e).toBe(e);
+  });
+
+  test('class instance without toJSON is opaque (prototype preserved)', () => {
+    class Custom {
+      tag = '\x1b[31mlabel\x1b[0m';
+      constructor(public x: number) {}
+      method() {
+        return this.x;
+      }
+    }
+    const inst = new Custom(7);
+    const out = sanitizeToolOutput({ inst }) as { inst: Custom };
+    // Same instance — prototype methods survive. Walking would have
+    // replaced `inst` with `{ x: 7, tag: '...' }`, losing `method()`.
+    expect(out.inst).toBe(inst);
+    expect(out.inst.method()).toBe(7);
+  });
+
+  test('class instance WITH toJSON honors the serialized form (and ANSI inside it gets stripped)', () => {
+    // toJSON's return value IS the JSON-faithful representation; we
+    // walk it. A toJSON that returns a string with ANSI → stripped.
+    class WithJSON {
+      toJSON() {
+        return { kind: 'WithJSON', label: '\x1b[31mscrub me\x1b[0m' };
+      }
+    }
+    const inst = new WithJSON();
+    const out = sanitizeToolOutput({ inst });
+    expect(out).toEqual({ inst: { kind: 'WithJSON', label: 'scrub me' } });
+  });
+
+  test('Object.create(null) is treated as a plain dict and walked', () => {
+    const dict = Object.create(null) as Record<string, string>;
+    dict.k = '\x1b[31mhi\x1b[0m';
+    const out = sanitizeToolOutput({ dict }) as { dict: Record<string, string> };
+    expect(out.dict.k).toBe('hi');
+  });
 });
