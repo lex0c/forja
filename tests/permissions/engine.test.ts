@@ -246,6 +246,40 @@ describe('engine.check (search tools: glob/grep)', () => {
     expect(eng.check('glob', 'fs.read', { pattern: 'src/**' }).kind).toBe('deny');
     expect(eng.check('grep', 'fs.read', { pattern: 'foo' }).kind).toBe('deny');
   });
+
+  test('glob with non-string cwd is denied (does not crash on path.resolve)', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { glob: { allow_paths: ['./**'], deny_paths: ['secrets'] } } }),
+      { cwd: CWD },
+    );
+    // Cast bypasses TS — model JSON can carry any shape at runtime.
+    const d = eng.check('glob', 'fs.read', {
+      cwd: 123,
+    } as unknown as Parameters<typeof eng.check>[2]);
+    expect(d.kind).toBe('deny');
+    if (d.kind === 'deny') expect(d.reason).toContain('non-string');
+  });
+
+  test('grep with non-string path is denied (does not crash on path.resolve)', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { grep: { allow_paths: ['./**'], deny_paths: ['secrets'] } } }),
+      { cwd: CWD },
+    );
+    const d = eng.check('grep', 'fs.read', {
+      path: ['oops'],
+    } as unknown as Parameters<typeof eng.check>[2]);
+    expect(d.kind).toBe('deny');
+  });
+
+  test('read_file with non-string path is denied (regression)', () => {
+    const eng = createPermissionEngine(policy({ tools: { read_file: { allow_paths: ['**'] } } }), {
+      cwd: CWD,
+    });
+    const d = eng.check('read_file', 'fs.read', {
+      path: { not: 'a string' },
+    } as unknown as Parameters<typeof eng.check>[2]);
+    expect(d.kind).toBe('deny');
+  });
 });
 
 describe('engine misc category', () => {

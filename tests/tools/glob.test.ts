@@ -51,6 +51,34 @@ describe('globTool', () => {
     expect(out.count).toBe(0);
   });
 
+  test('rejects parent-traversal patterns (would bypass policy)', async () => {
+    const out = await globTool.execute(
+      { pattern: '../secret/*.txt', cwd: 'src' },
+      makeCtx({ cwd: dir }),
+    );
+    expect(isToolError(out)).toBe(true);
+    if (isToolError(out)) {
+      expect(out.error_code).toBe('glob.pattern_escapes_root');
+      expect(out.hint).toContain('..');
+    }
+  });
+
+  test('rejects parent-traversal in mid-pattern segments', async () => {
+    const out = await globTool.execute({ pattern: 'src/../README.md' }, makeCtx({ cwd: dir }));
+    expect(isToolError(out)).toBe(true);
+    if (isToolError(out)) {
+      expect(out.error_code).toBe('glob.pattern_escapes_root');
+    }
+  });
+
+  test('rejects absolute patterns', async () => {
+    const out = await globTool.execute({ pattern: '/etc/*' }, makeCtx({ cwd: dir }));
+    expect(isToolError(out)).toBe(true);
+    if (isToolError(out)) {
+      expect(out.error_code).toBe('glob.pattern_escapes_root');
+    }
+  });
+
   test('honors aborted signal', async () => {
     const ctrl = new AbortController();
     ctrl.abort();

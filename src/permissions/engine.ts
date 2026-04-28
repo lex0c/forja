@@ -44,13 +44,31 @@ export interface ToolArgs {
 //   - grep: `args.path` (optional; defaults to session cwd)
 //   - glob: `args.cwd` (optional; defaults to session cwd; the `pattern`
 //     argument defines what's matched, not what's allowed)
-// Without this resolver the engine deny-rejects glob/grep for
-// "missing 'path' argument" before any rule matching can run, making
-// `tools.grep.allow_paths` / `tools.glob.allow_paths` unusable.
+//
+// Tool args come from model-emitted JSON via `as ToolArgs`; the TS
+// shape isn't enforced at runtime. A field that should be a string can
+// land here as a number, array, or object. We type-guard before
+// returning — passing a non-string to path matching would throw
+// ERR_INVALID_ARG_TYPE inside path.resolve, which the harness catches
+// as `internalError` and reports as a SQLite-class failure. The right
+// behavior is a clean policy deny.
+//
+// Distinction:
+//   - field omitted → fall back to session cwd (grep/glob only;
+//     read_file/write_file/edit_file still require the field)
+//   - field present but wrong type → null → caller emits deny
+const isNonEmptyString = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+
 const resolveFsTarget = (toolName: string, args: ToolArgs, cwd: string): string | null => {
-  if (toolName === 'glob') return args.cwd ?? cwd;
-  if (toolName === 'grep') return args.path ?? cwd;
-  return typeof args.path === 'string' && args.path.length > 0 ? args.path : null;
+  if (toolName === 'glob') {
+    if (args.cwd === undefined) return cwd;
+    return isNonEmptyString(args.cwd) ? args.cwd : null;
+  }
+  if (toolName === 'grep') {
+    if (args.path === undefined) return cwd;
+    return isNonEmptyString(args.path) ? args.path : null;
+  }
+  return isNonEmptyString(args.path) ? args.path : null;
 };
 
 const denyDefault = (toolName: string, mode: PolicyMode): Decision => ({
@@ -114,7 +132,7 @@ const checkPath = (
 ): Decision => {
   const path = resolveFsTarget(toolName, args, cwd);
   if (path === null) {
-    return { kind: 'deny', reason: `${toolName}: missing 'path' argument` };
+    return { kind: 'deny', reason: `${toolName}: missing or non-string path argument` };
   }
 
   // For search-tool roots we also need to check the literal path against
