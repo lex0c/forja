@@ -56,3 +56,6 @@ export type { ModelEntry, ModelRegistry } from './registry.ts';
 
 // Cost / usage helpers
 export { addUsage, computeCost, emptyUsage } from './cost.ts';
+
+// Token estimation
+export { estimateMessagesTokens } from './tokens.ts';

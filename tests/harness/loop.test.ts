@@ -868,51 +868,47 @@ describe('runAgent', () => {
     expect(result.usageComplete).toBe(false);
   });
 
-  test('compaction triggers when prompt tokens cross the threshold', async () => {
-    // Tiny context window (1000) with low threshold makes the trigger
-    // fire on the first turn — we report 800 input tokens (80% of
-    // 1000) which is above the default 0.7 ratio. Need enough turns
-    // before the trigger to have something to fold (goal + 4 turns =
-    // 9 messages > 1 + tail(3)). Pre-stage them with a 2-turn
-    // sequence; trigger arrives after enough history exists.
+  test('compaction triggers when message-array estimate crosses the threshold', async () => {
+    // The trigger now estimates over the messages we're ABOUT to
+    // send (post-tool_result-push), not the prior turn's billed
+    // input. We feed a tool that returns a sizable payload over
+    // several turns; with a tiny context_window the heuristic
+    // (chars/4) crosses the threshold quickly. usage telemetry is
+    // not required for the trigger to fire — only message size.
     const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const fatTool: Tool = {
+      name: 'fat',
+      description: 'returns a sizable string',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: true },
+      async execute() {
+        // ~1200 chars → ~300 tokens via chars/4. With context_window
+        // = 400 and threshold 0.7 (=280), one or two turns push us
+        // over.
+        return 'x'.repeat(1200);
+      },
+    };
     const { config, handle } = buildConfig(
       [
-        // Turn 1: small response, low usage.
+        // Turn 1: ask the tool; tool_result pushes prompt over.
         {
-          tool_uses: [{ id: 't1', name: 'echo', input: { msg: 'a' } }],
+          tool_uses: [{ id: 't1', name: 'fat', input: {} }],
           stop_reason: 'tool_use',
-          usage: { input: 100, output: 5 },
+          usage: { input: 50, output: 5 },
         },
-        // Turn 2: same.
+        // Turn 2 will be the COMPACTION call — provider receives
+        // the summary prompt, returns a structured block.
         {
-          tool_uses: [{ id: 't2', name: 'echo', input: { msg: 'b' } }],
-          stop_reason: 'tool_use',
-          usage: { input: 200, output: 5 },
-        },
-        // Turn 3: prompt over threshold → triggers compaction
-        // before the next request goes out.
-        {
-          tool_uses: [{ id: 't3', name: 'echo', input: { msg: 'c' } }],
-          stop_reason: 'tool_use',
-          usage: { input: 800, output: 5 },
-        },
-        // Turn 4 (post-compaction): would receive the compacted
-        // summary call's reply too — provider returns an LLM-style
-        // summary first, then the next agent turn closes the loop.
-        // The compaction call goes through the SAME mock provider,
-        // pulling the next scripted step. We fake the summary as a
-        // plain text turn.
-        {
-          text: '[compacted_history]\nGOAL: test\nDECISIONS: (none)\nFILES_TOUCHED: (none)\nERRORS: (none)\nPENDING: (none)\n[/compacted_history]',
+          text: '[compacted_history]\nGOAL: test\n[/compacted_history]',
           stop_reason: 'end_turn',
         },
-        // Turn 5 (next agent step after compaction): finish.
+        // Turn 3: post-compaction agent step; finish.
         { text: 'done', stop_reason: 'end_turn', usage: { input: 50, output: 3 } },
       ],
       {
-        capsOverride: { context_window: 1000, cost_per_1k_input: 0, cost_per_1k_output: 0 },
-        budget: { compactionThreshold: 0.7, compactionPreserveTail: 3, maxToolErrors: 99 },
+        extraTools: [fatTool],
+        capsOverride: { context_window: 400, cost_per_1k_input: 0, cost_per_1k_output: 0 },
+        budget: { compactionThreshold: 0.7, compactionPreserveTail: 1, maxToolErrors: 99 },
       },
     );
     const result = await runAgent({ ...config, onEvent: (e) => events.push(e) });
@@ -925,15 +921,60 @@ describe('runAgent', () => {
       expect(finished.strategy).toBe('llm');
       expect(finished.foldedCount).toBeGreaterThan(0);
     }
-    // After compaction, the next request the provider sees must be
-    // shorter than the pre-compaction history. The mock captured all
-    // requests; the post-compaction step's request reflects the
+    // After compaction, the request that goes out reflects the
     // rewritten messages list.
     const postCompactReq = handle.requests[handle.requests.length - 1];
     expect(postCompactReq).toBeDefined();
     if (postCompactReq !== undefined) {
-      expect(postCompactReq.messages.length).toBeLessThan(8);
+      expect(postCompactReq.messages.length).toBeLessThanOrEqual(3);
     }
+  });
+
+  test('compaction triggers on the SAME turn a big tool_result pushes prompt over', async () => {
+    // Regression: prior trigger used last turn's billed input. A
+    // single tool that returns a huge payload (read_file on a 200KB
+    // file, grep with thousands of hits) could push the next prompt
+    // over the cap WITHOUT the prior turn ever crossing threshold,
+    // and the trigger would skip — letting the next provider call
+    // 400 with context-length-exceeded. The fix reads the actual
+    // post-push messages array via heuristic estimate.
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const hugeTool: Tool = {
+      name: 'huge',
+      description: 'returns a wall of text',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: true },
+      async execute() {
+        // ~4000 chars → ~1000 tokens estimated. The prior turn's
+        // billed input is only 50 — well under the 0.7×1000=700
+        // threshold under the OLD trigger. Under the NEW trigger,
+        // post-push messages estimate well over 700.
+        return 'a'.repeat(4000);
+      },
+    };
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 't1', name: 'huge', input: {} }],
+          stop_reason: 'tool_use',
+          usage: { input: 50, output: 5 }, // small last-turn input
+        },
+        // Compaction summary call.
+        {
+          text: '[compacted_history]\nGOAL: x\n[/compacted_history]',
+          stop_reason: 'end_turn',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ],
+      {
+        extraTools: [hugeTool],
+        capsOverride: { context_window: 1000, cost_per_1k_input: 0, cost_per_1k_output: 0 },
+        budget: { compactionThreshold: 0.7, compactionPreserveTail: 1, maxToolErrors: 99 },
+      },
+    );
+    const result = await runAgent({ ...config, onEvent: (e) => events.push(e) });
+    expect(result.status).toBe('done');
+    expect(events.find((e) => e.type === 'compaction_started')).toBeDefined();
   });
 
   test('compaction does NOT trigger when prompt tokens stay below threshold', async () => {
@@ -960,17 +1001,29 @@ describe('runAgent', () => {
     // Compaction call is a billed provider request — its usage must
     // contribute to result.usage and result.costUsd. Without the
     // fold, sessions that compact systematically underreport spend.
+    // The trigger is now size-driven, so we use a fat tool whose
+    // result pushes the estimate over threshold.
     const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const fatTool: Tool = {
+      name: 'fat',
+      description: 'returns sizable text',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: true },
+      async execute() {
+        return 'z'.repeat(4000); // ~1000 estimated tokens
+      },
+    };
     const { config } = buildConfig(
       [
-        // Turn 1: triggers compaction (input over threshold).
+        // Turn 1: tool result pushes message-array estimate over
+        // threshold (context 1000 × 0.7 = 700; 4000 chars → 1000
+        // estimated tokens).
         {
-          tool_uses: [{ id: 't1', name: 'echo', input: { msg: 'hi' } }],
+          tool_uses: [{ id: 't1', name: 'fat', input: {} }],
           stop_reason: 'tool_use',
-          usage: { input: 800, output: 5 },
+          usage: { input: 50, output: 5 },
         },
-        // Turn 2: this is the COMPACTION call (consumed by the same
-        // mock). Reports its own usage that must be folded.
+        // Turn 2: COMPACTION call. Reports its own usage.
         {
           text: '[compacted_history]\nGOAL: x\n[/compacted_history]',
           stop_reason: 'end_turn',
@@ -980,6 +1033,7 @@ describe('runAgent', () => {
         { text: 'done', stop_reason: 'end_turn', usage: { input: 100, output: 5 } },
       ],
       {
+        extraTools: [fatTool],
         capsOverride: {
           context_window: 1000,
           cost_per_1k_input: 1.0,
@@ -1000,13 +1054,13 @@ describe('runAgent', () => {
     expect(finished.usage.output).toBe(50);
 
     // Session totals must include all three calls:
-    //   turn 1: 800×1 + 5×2 = 810 → 0.810
-    //   compaction: 0.400
-    //   turn 3: 100×1 + 5×2 = 110 → 0.110
-    //   total: 1.320; tokens summed across all 3
-    expect(result.usage.input).toBe(800 + 300 + 100);
+    //   turn 1:   50×1 +  5×2 = 60   → 0.060
+    //   compaction: 300×1 + 50×2 = 400 → 0.400
+    //   turn 3:  100×1 +  5×2 = 110  → 0.110
+    //   total: 0.570; tokens summed across all 3
+    expect(result.usage.input).toBe(50 + 300 + 100);
     expect(result.usage.output).toBe(5 + 50 + 5);
-    expect(result.costUsd).toBeCloseTo(1.32, 6);
+    expect(result.costUsd).toBeCloseTo(0.57, 6);
   });
 
   test('compaction without usage telemetry downgrades usageComplete', async () => {
@@ -1016,12 +1070,21 @@ describe('runAgent', () => {
     // reported. Otherwise renderers present partial totals as
     // authoritative.
     const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const fatTool: Tool = {
+      name: 'fat',
+      description: 'returns sizable text',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: true },
+      async execute() {
+        return 'q'.repeat(4000);
+      },
+    };
     const { config } = buildConfig(
       [
         {
-          tool_uses: [{ id: 't1', name: 'echo', input: { msg: 'hi' } }],
+          tool_uses: [{ id: 't1', name: 'fat', input: {} }],
           stop_reason: 'tool_use',
-          usage: { input: 800, output: 5 },
+          usage: { input: 50, output: 5 },
         },
         // Compaction call — text but NO usage block. ScriptedStep
         // omits `usage:` so replayStep skips the kind:'usage' event.
@@ -1032,6 +1095,7 @@ describe('runAgent', () => {
         { text: 'done', stop_reason: 'end_turn', usage: { input: 100, output: 5 } },
       ],
       {
+        extraTools: [fatTool],
         capsOverride: { context_window: 1000 },
         budget: { compactionThreshold: 0.7, compactionPreserveTail: 1, maxToolErrors: 99 },
       },
@@ -1052,12 +1116,15 @@ describe('runAgent', () => {
     // inside the tool — abort runs before the next signal check).
     const abortingTool: Tool = {
       name: 'aborter',
-      description: 'aborts the signal mid-call',
+      description: 'aborts the signal mid-call and returns a sizable payload',
       inputSchema: { type: 'object' },
       metadata: { category: 'misc', writes: false, idempotent: true },
       async execute() {
         ctrl.abort();
-        return { ok: true };
+        // Big enough that the post-push estimate would normally
+        // trigger compaction (context 1000 × 0.7 = 700; 4000 chars
+        // → 1000 estimated tokens). The abort guard must skip it.
+        return 'x'.repeat(4000);
       },
     };
     const { config } = buildConfig(
@@ -1065,8 +1132,7 @@ describe('runAgent', () => {
         {
           tool_uses: [{ id: 't1', name: 'aborter', input: {} }],
           stop_reason: 'tool_use',
-          // High input → would trigger compaction if not for abort.
-          usage: { input: 800, output: 5 },
+          usage: { input: 50, output: 5 },
         },
       ],
       {
@@ -1080,24 +1146,42 @@ describe('runAgent', () => {
     expect(events.find((e) => e.type === 'compaction_started')).toBeUndefined();
   });
 
-  test('compaction does NOT trigger when the turn lacked usage telemetry', async () => {
-    // Without usageSeen we can't compute prompt tokens reliably; the
-    // trigger must skip rather than guess. The session ends as
-    // usageComplete=false (already covered) and no compaction fires.
+  test('compaction trigger works without any usage telemetry (size-based)', async () => {
+    // Reverse of the old "no telemetry → skip" behavior. The new
+    // trigger is size-driven (chars/4 over messages) and doesn't
+    // depend on `usageSeen` at all — a session running against a
+    // compat endpoint that drops stream_options must still get its
+    // history compacted when message size demands it.
     const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const fatTool: Tool = {
+      name: 'fat',
+      description: 'returns sizable text',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: true },
+      async execute() {
+        return 'y'.repeat(2000);
+      },
+    };
     const { config } = buildConfig(
-      // No `usage:` on these steps → usageSeen=false.
+      // Note: NO `usage:` field on any scripted step — usageSeen
+      // stays false throughout.
       [
+        { tool_uses: [{ id: 't1', name: 'fat', input: {} }], stop_reason: 'tool_use' },
+        // Compaction summary call.
         {
-          tool_uses: [{ id: 't1', name: 'echo', input: { msg: 'hi' } }],
-          stop_reason: 'tool_use',
+          text: '[compacted_history]\nGOAL: x\n[/compacted_history]',
+          stop_reason: 'end_turn',
         },
         { text: 'done', stop_reason: 'end_turn' },
       ],
-      { capsOverride: { context_window: 100 } }, // tiny window
+      {
+        extraTools: [fatTool],
+        capsOverride: { context_window: 400, cost_per_1k_input: 0, cost_per_1k_output: 0 },
+        budget: { compactionThreshold: 0.7, compactionPreserveTail: 1, maxToolErrors: 99 },
+      },
     );
     await runAgent({ ...config, onEvent: (e) => events.push(e) });
-    expect(events.find((e) => e.type === 'compaction_started')).toBeUndefined();
+    expect(events.find((e) => e.type === 'compaction_started')).toBeDefined();
   });
 
   test('init failure surfaces with usageComplete=false', async () => {

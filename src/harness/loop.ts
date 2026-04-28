@@ -8,6 +8,7 @@ import type {
   ProviderToolResultBlock,
   ProviderToolUseBlock,
 } from '../providers/index.ts';
+import { estimateMessagesTokens } from '../providers/tokens.ts';
 import { appendMessage, completeSession, createSession } from '../storage/index.ts';
 import type { ToolContext } from '../tools/index.ts';
 import { abortableIterable } from './abortable.ts';
@@ -422,24 +423,27 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       lastMessageId = resultMsg.id;
       messages.push({ role: 'user', content: toolResults });
 
-      // Compaction trigger check. We use the prompt tokens BILLED for
-      // the turn we just completed (from `collected.usage`) as a proxy
-      // for "size of the next request" — the next prompt is the same
-      // history plus the freshly-appended tool_results, so if the last
-      // turn was already over threshold the next will be even larger.
-      // Free signal — no extra HTTP call.
+      // Compaction trigger check. The prior implementation used the
+      // last turn's billed input as a proxy for next-prompt size, but
+      // by this point the loop already appended fresh tool_results
+      // to `messages`. A single big tool output (read_file on a
+      // large file, grep with many hits) can push the next prompt
+      // over the cap even when the prior one was below threshold —
+      // leading to a context-length 400 on the next call before the
+      // trigger ever fires. We re-estimate over the actual messages
+      // we're about to send so the decision matches reality.
+      //
+      // estimateMessagesTokens is the local chars/4 heuristic: free
+      // (no HTTP), conservative (overestimates by ~10-25% vs real
+      // tokenizers), good enough for a 70%-of-window threshold that
+      // already includes a buffer.
       //
       // DB messages stay untouched; only the in-memory `messages`
       // array sent to the provider gets rewritten. Audit + replay can
       // re-derive from the full history if they ever need a different
       // compaction policy.
-      if (
-        !signal.aborted &&
-        collected.usageSeen &&
-        config.provider.capabilities.context_window > 0
-      ) {
-        const promptTokens =
-          collected.usage.input + collected.usage.cache_read + collected.usage.cache_creation;
+      if (!signal.aborted && config.provider.capabilities.context_window > 0) {
+        const promptTokens = estimateMessagesTokens(messages);
         const contextWindow = config.provider.capabilities.context_window;
         const triggerAt = budget.compactionThreshold * contextWindow;
         if (promptTokens > triggerAt && messages.length > 1 + budget.compactionPreserveTail) {

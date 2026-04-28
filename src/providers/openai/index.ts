@@ -1,4 +1,8 @@
 import OpenAI from 'openai';
+// Shared chars/4 heuristic — see `src/providers/tokens.ts` for accuracy
+// bounds. OpenAI has no server-side countTokens endpoint until tiktoken
+// lands in M5.
+import { estimateMessagesTokens } from '../tokens.ts';
 import type {
   ConstrainedRequest,
   GenerateRequest,
@@ -129,29 +133,6 @@ const toOpenAITools = (
     },
   }));
 
-// chars/4 heuristic for token counting. OpenAI has no server-side
-// countTokens endpoint (unlike Anthropic and Google); a proper local impl
-// uses tiktoken. M5 will wire that. The heuristic is within ~10% for
-// English text, which is good enough for budget early-warning thresholds.
-const heuristicTokenCount = (messages: ProviderMessage[]): number => {
-  let chars = 0;
-  for (const m of messages) {
-    if (typeof m.content === 'string') {
-      chars += m.content.length;
-      continue;
-    }
-    for (const block of m.content) {
-      if (block.type === 'text') chars += block.text.length;
-      else if (block.type === 'tool_use') {
-        chars += block.name.length + JSON.stringify(block.input).length;
-      } else {
-        chars += block.content.length + block.tool_use_id.length;
-      }
-    }
-  }
-  return Math.ceil(chars / 4);
-};
-
 export const createOpenAIProvider = (
   modelName: string,
   options: CreateOpenAIProviderOptions = {},
@@ -215,6 +196,6 @@ export const createOpenAIProvider = (
     generateConstrained: (_req: ConstrainedRequest): Promise<string> =>
       Promise.reject(new Error('generateConstrained not implemented in M1')),
     countTokens: (messages: ProviderMessage[]): Promise<number> =>
-      Promise.resolve(heuristicTokenCount(messages)),
+      Promise.resolve(estimateMessagesTokens(messages)),
   };
 };
