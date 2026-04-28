@@ -1,4 +1,4 @@
-import type { StopReason, StreamEvent, UsageInfo } from '../types.ts';
+import type { StopReason, StreamEvent } from '../types.ts';
 
 // Minimal structural subset of an OpenAI Chat Completions streaming chunk.
 // Defined locally so tests can construct chunks without depending on SDK
@@ -107,153 +107,171 @@ export async function* normalizeOpenAIStream(
   let rawCompletion = 0;
   let rawCached = 0;
   let usageSeen = false;
+  let usageEmitted = false;
 
-  for await (const chunk of raw) {
-    if (!messageStarted) {
-      yield { kind: 'start', message_id: chunk.id ?? synthesizeMessageId() };
-      messageStarted = true;
+  // Inline helper closing the usage-emit block so both the happy path
+  // (post-loop) and the failure path (finally) share one shape.
+  const emitUsage = function* (): Iterable<StreamEvent> {
+    if (usageSeen && !usageEmitted) {
+      yield {
+        kind: 'usage',
+        usage: {
+          input: Math.max(0, rawPrompt - rawCached),
+          output: rawCompletion,
+          cache_read: rawCached,
+          cache_creation: 0,
+        },
+      };
+      usageEmitted = true;
     }
+  };
 
-    if (chunk.usage !== undefined && chunk.usage !== null) {
-      const u = chunk.usage;
-      // Field-level detection: a usage object that's present but missing
-      // every token field (compat endpoint that returns `usage: {}`, or
-      // a malformed proxy response) is NOT measurement.
-      let touched = false;
-      if (typeof u.prompt_tokens === 'number') {
-        rawPrompt = Math.max(rawPrompt, u.prompt_tokens);
-        touched = true;
+  try {
+    for await (const chunk of raw) {
+      if (!messageStarted) {
+        yield { kind: 'start', message_id: chunk.id ?? synthesizeMessageId() };
+        messageStarted = true;
       }
-      if (typeof u.completion_tokens === 'number') {
-        rawCompletion = Math.max(rawCompletion, u.completion_tokens);
-        touched = true;
-      }
-      if (typeof u.prompt_tokens_details?.cached_tokens === 'number') {
-        rawCached = Math.max(rawCached, u.prompt_tokens_details.cached_tokens);
-        touched = true;
-      }
-      if (touched) usageSeen = true;
-    }
 
-    const choice = chunk.choices?.[0];
-    if (choice === undefined) continue;
-
-    const delta = choice.delta;
-    if (delta !== undefined) {
-      if (typeof delta.content === 'string' && delta.content.length > 0) {
-        yield { kind: 'text_delta', text: delta.content };
+      if (chunk.usage !== undefined && chunk.usage !== null) {
+        const u = chunk.usage;
+        // Field-level detection: a usage object that's present but missing
+        // every token field (compat endpoint that returns `usage: {}`, or
+        // a malformed proxy response) is NOT measurement.
+        let touched = false;
+        if (typeof u.prompt_tokens === 'number') {
+          rawPrompt = Math.max(rawPrompt, u.prompt_tokens);
+          touched = true;
+        }
+        if (typeof u.completion_tokens === 'number') {
+          rawCompletion = Math.max(rawCompletion, u.completion_tokens);
+          touched = true;
+        }
+        if (typeof u.prompt_tokens_details?.cached_tokens === 'number') {
+          rawCached = Math.max(rawCached, u.prompt_tokens_details.cached_tokens);
+          touched = true;
+        }
+        if (touched) usageSeen = true;
       }
-      if (typeof delta.refusal === 'string' && delta.refusal.length > 0) {
-        yield { kind: 'text_delta', text: delta.refusal };
-      }
-      if (delta.tool_calls !== undefined) {
-        for (const tc of delta.tool_calls) {
-          let inProgress = toolCalls.get(tc.index);
-          if (inProgress === undefined) {
-            // Register the entry but DON'T emit start yet — name may
-            // arrive in a later delta. id is locked here regardless.
-            const id = tc.id ?? `call_${tc.index}_${crypto.randomUUID()}`;
-            const name = tc.function?.name ?? '';
-            inProgress = { id, name, partialArgs: '', started: false };
-            toolCalls.set(tc.index, inProgress);
-          } else if (
-            typeof tc.function?.name === 'string' &&
-            tc.function.name.length > 0 &&
-            inProgress.name.length === 0
-          ) {
-            // Name straggled in. id stays locked from the first delta.
-            inProgress.name = tc.function.name;
-          }
 
-          // Always buffer args; we may not be started yet.
-          const argsChunk = tc.function?.arguments;
-          const hasArgs = typeof argsChunk === 'string' && argsChunk.length > 0;
-          if (hasArgs) {
-            inProgress.partialArgs += argsChunk;
-          }
+      const choice = chunk.choices?.[0];
+      if (choice === undefined) continue;
 
-          // Emit start the moment we have a name. Flush whatever args
-          // we've buffered as a single delta so consumers that mirror
-          // partial_args chunks see the same byte stream they would
-          // have seen if the name had arrived first.
-          if (!inProgress.started && inProgress.name.length > 0) {
-            yield { kind: 'tool_use_start', id: inProgress.id, name: inProgress.name };
-            inProgress.started = true;
-            if (inProgress.partialArgs.length > 0) {
+      const delta = choice.delta;
+      if (delta !== undefined) {
+        if (typeof delta.content === 'string' && delta.content.length > 0) {
+          yield { kind: 'text_delta', text: delta.content };
+        }
+        if (typeof delta.refusal === 'string' && delta.refusal.length > 0) {
+          yield { kind: 'text_delta', text: delta.refusal };
+        }
+        if (delta.tool_calls !== undefined) {
+          for (const tc of delta.tool_calls) {
+            let inProgress = toolCalls.get(tc.index);
+            if (inProgress === undefined) {
+              // Register the entry but DON'T emit start yet — name may
+              // arrive in a later delta. id is locked here regardless.
+              const id = tc.id ?? `call_${tc.index}_${crypto.randomUUID()}`;
+              const name = tc.function?.name ?? '';
+              inProgress = { id, name, partialArgs: '', started: false };
+              toolCalls.set(tc.index, inProgress);
+            } else if (
+              typeof tc.function?.name === 'string' &&
+              tc.function.name.length > 0 &&
+              inProgress.name.length === 0
+            ) {
+              // Name straggled in. id stays locked from the first delta.
+              inProgress.name = tc.function.name;
+            }
+
+            // Always buffer args; we may not be started yet.
+            const argsChunk = tc.function?.arguments;
+            const hasArgs = typeof argsChunk === 'string' && argsChunk.length > 0;
+            if (hasArgs) {
+              inProgress.partialArgs += argsChunk;
+            }
+
+            // Emit start the moment we have a name. Flush whatever args
+            // we've buffered as a single delta so consumers that mirror
+            // partial_args chunks see the same byte stream they would
+            // have seen if the name had arrived first.
+            if (!inProgress.started && inProgress.name.length > 0) {
+              yield { kind: 'tool_use_start', id: inProgress.id, name: inProgress.name };
+              inProgress.started = true;
+              if (inProgress.partialArgs.length > 0) {
+                yield {
+                  kind: 'tool_use_delta',
+                  id: inProgress.id,
+                  partial_args: inProgress.partialArgs,
+                };
+              }
+            } else if (inProgress.started && hasArgs) {
               yield {
                 kind: 'tool_use_delta',
                 id: inProgress.id,
-                partial_args: inProgress.partialArgs,
+                partial_args: argsChunk,
               };
             }
-          } else if (inProgress.started && hasArgs) {
-            yield {
-              kind: 'tool_use_delta',
-              id: inProgress.id,
-              partial_args: argsChunk,
-            };
           }
         }
       }
+
+      if (typeof choice.finish_reason === 'string') {
+        stopReason = FINISH_REASON_MAP[choice.finish_reason] ?? 'end_turn';
+      }
     }
 
-    if (typeof choice.finish_reason === 'string') {
-      stopReason = FINISH_REASON_MAP[choice.finish_reason] ?? 'end_turn';
-    }
-  }
-
-  // Close out tool_use blocks. OpenAI doesn't emit a per-tool stop, so we
-  // parse and emit at end-of-stream, ordered by the original tool_call index.
-  const sortedTools = Array.from(toolCalls.entries()).sort(([a], [b]) => a - b);
-  for (const [, tool] of sortedTools) {
-    if (!tool.started) {
-      // Name never arrived. Emitting tool_use_stop without a matching
-      // start would orphan in `harness/collect.ts`. Surface as an error
-      // so the harness fails the step instead of silently dropping.
-      yield {
-        kind: 'error',
-        code: 'openai.tool_use_no_name',
-        message: `tool_call ${tool.id} ended without a function name`,
-        retryable: false,
-      };
-      continue;
-    }
-    let parsed: Record<string, unknown> = {};
-    if (tool.partialArgs.length > 0) {
-      try {
-        const obj = JSON.parse(tool.partialArgs) as unknown;
-        if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
-          throw new Error('tool args must decode to a JSON object');
-        }
-        parsed = obj as Record<string, unknown>;
-      } catch (e) {
+    // Close out tool_use blocks. OpenAI doesn't emit a per-tool stop, so we
+    // parse and emit at end-of-stream, ordered by the original tool_call index.
+    const sortedTools = Array.from(toolCalls.entries()).sort(([a], [b]) => a - b);
+    for (const [, tool] of sortedTools) {
+      if (!tool.started) {
+        // Name never arrived. Emitting tool_use_stop without a matching
+        // start would orphan in `harness/collect.ts`. Surface as an error
+        // so the harness fails the step instead of silently dropping.
         yield {
           kind: 'error',
-          code: 'tool_args_parse_error',
-          message: `failed to parse tool_use args for ${tool.id}: ${(e as Error).message}`,
+          code: 'openai.tool_use_no_name',
+          message: `tool_call ${tool.id} ended without a function name`,
           retryable: false,
         };
         continue;
       }
+      let parsed: Record<string, unknown> = {};
+      if (tool.partialArgs.length > 0) {
+        try {
+          const obj = JSON.parse(tool.partialArgs) as unknown;
+          if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
+            throw new Error('tool args must decode to a JSON object');
+          }
+          parsed = obj as Record<string, unknown>;
+        } catch (e) {
+          yield {
+            kind: 'error',
+            code: 'tool_args_parse_error',
+            message: `failed to parse tool_use args for ${tool.id}: ${(e as Error).message}`,
+            retryable: false,
+          };
+          continue;
+        }
+      }
+      yield { kind: 'tool_use_stop', id: tool.id, final_args: parsed };
     }
-    yield { kind: 'tool_use_stop', id: tool.id, final_args: parsed };
-  }
 
-  if (!messageStarted) {
-    yield { kind: 'start', message_id: synthesizeMessageId() };
-  }
-  if (usageSeen) {
+    if (!messageStarted) {
+      yield { kind: 'start', message_id: synthesizeMessageId() };
+    }
     // OpenAI's `prompt_tokens` is the full prompt count *including*
-    // the cached portion. Split here so `input` matches Anthropic's
-    // semantics (non-cached input tokens) and cost math composes the
-    // same way across providers.
-    const usage: UsageInfo = {
-      input: Math.max(0, rawPrompt - rawCached),
-      output: rawCompletion,
-      cache_read: rawCached,
-      cache_creation: 0,
-    };
-    yield { kind: 'usage', usage };
+    // the cached portion. emitUsage splits here so `input` matches
+    // Anthropic's semantics (non-cached input tokens) and cost math
+    // composes the same way across providers.
+    yield* emitUsage();
+    yield { kind: 'stop', reason: stopReason };
+  } finally {
+    // Mid-stream error/disconnect: surface whatever usage already
+    // arrived (compat endpoints have been observed to send usage
+    // chunks before the final). Without this, a turn that errors
+    // after one usage chunk loses the billed-token signal.
+    yield* emitUsage();
   }
-  yield { kind: 'stop', reason: stopReason };
 }

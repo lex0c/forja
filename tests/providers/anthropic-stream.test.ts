@@ -3,6 +3,7 @@ import {
   type RawAnthropicEvent,
   normalizeAnthropicStream,
 } from '../../src/providers/anthropic/stream.ts';
+import type { StreamEvent } from '../../src/providers/types.ts';
 import { collect, collectNonUsage } from './_stream-helpers.ts';
 
 const fromEvents = (events: RawAnthropicEvent[]): AsyncIterable<RawAnthropicEvent> => {
@@ -277,6 +278,59 @@ describe('normalizeAnthropicStream', () => {
       ),
     );
     expect(events).toContainEqual({ kind: 'stop', reason: 'max_tokens' });
+  });
+
+  test('emits usage from finally when stream errors after message_start', async () => {
+    // Regression: usage was only yielded inside the message_stop
+    // branch. Anthropic puts input + cache numbers on
+    // message_start, so a turn that errors after that point still
+    // has measurable cost. The finally path emits whatever
+    // arrived before the failure so the harness charges for
+    // billed tokens even on failed turns.
+    const erroringRaw = (async function* (): AsyncIterable<RawAnthropicEvent> {
+      yield {
+        type: 'message_start',
+        message: { id: 'msg_part', usage: { input_tokens: 150, cache_read_input_tokens: 50 } },
+      };
+      throw new Error('connection reset');
+    })();
+
+    const events: StreamEvent[] = [];
+    let caught: unknown;
+    try {
+      for await (const ev of normalizeAnthropicStream(erroringRaw)) {
+        events.push(ev);
+      }
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    const usageEv = events.find((e) => e.kind === 'usage');
+    expect(usageEv).toBeDefined();
+    if (usageEv?.kind === 'usage') {
+      expect(usageEv.usage.input).toBe(150);
+      expect(usageEv.usage.cache_read).toBe(50);
+    }
+  });
+
+  test('does NOT double-emit usage on the happy path', async () => {
+    // Both message_stop and finally can emit; the usageEmitted
+    // sentinel must guard against doubling.
+    const events = await collect(
+      normalizeAnthropicStream(
+        fromEvents([
+          { type: 'message_start', message: { id: 'm', usage: { input_tokens: 10 } } },
+          {
+            type: 'message_delta',
+            delta: { stop_reason: 'end_turn' },
+            usage: { output_tokens: 5 },
+          },
+          { type: 'message_stop' },
+        ]),
+      ),
+    );
+    const usageEvents = events.filter((e) => e.kind === 'usage');
+    expect(usageEvents).toHaveLength(1);
   });
 
   test('emits a usage event with input/output/cache splits from message_start + message_delta', async () => {

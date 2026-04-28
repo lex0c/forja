@@ -505,6 +505,45 @@ describe('normalizeOpenAIStream', () => {
     expect(events.find((e) => e.kind === 'usage')).toBeUndefined();
   });
 
+  test('emits usage from finally when stream errors after a usage chunk arrived', async () => {
+    // Some OpenAI compat endpoints send usage chunks before the
+    // final stream chunk. If the connection drops after a usage
+    // arrived but before normal end-of-stream, the prior code
+    // dropped the data on the floor. finally now surfaces it.
+    const erroringRaw = (async function* (): AsyncIterable<RawOpenAIChunk> {
+      yield { id: 'cmpl-x', choices: [{ delta: { content: 'partial' } }] };
+      yield {
+        choices: [],
+        usage: { prompt_tokens: 200, completion_tokens: 30 },
+      };
+      throw new Error('socket closed');
+    })();
+    const events: StreamEvent[] = [];
+    try {
+      for await (const ev of normalizeOpenAIStream(erroringRaw)) events.push(ev);
+    } catch {}
+    const usageEv = events.find((e) => e.kind === 'usage');
+    expect(usageEv).toBeDefined();
+    if (usageEv?.kind === 'usage') {
+      expect(usageEv.usage.input).toBe(200);
+      expect(usageEv.usage.output).toBe(30);
+    }
+  });
+
+  test('does NOT double-emit usage on the happy path', async () => {
+    const events = await collect(
+      normalizeOpenAIStream(
+        fromChunks([
+          { id: 'cmpl-x', choices: [{ delta: { content: 'hi' } }] },
+          { choices: [{ delta: {}, finish_reason: 'stop' }] },
+          { choices: [], usage: { prompt_tokens: 10, completion_tokens: 5 } },
+        ]),
+      ),
+    );
+    const usageEvents = events.filter((e) => e.kind === 'usage');
+    expect(usageEvents).toHaveLength(1);
+  });
+
   test('partial later usage chunk does not zero earlier prompt/cache values', async () => {
     // Bug regression: per-chunk `?? 0` defaults would let a usage chunk
     // carrying only completion_tokens reset prompt/cache to 0, silently

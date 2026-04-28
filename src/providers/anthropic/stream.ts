@@ -76,8 +76,18 @@ export async function* normalizeAnthropicStream(
   // `usageSeen` flag and persist 0 instead of NULL on turns where the
   // provider never spoke (broken SDK, compat endpoint, hard mid-stream
   // failure), conflating "no measurement" with "measured zero".
+  //
+  // Two emission paths:
+  //   - Happy path: emit on `message_stop` before `stop`.
+  //   - Failure path: emit from `finally` if a stream error or
+  //     disconnect terminates iteration before `message_stop`. Anthropic
+  //     puts input + cache numbers in `message_start`, so a turn that
+  //     errors after that point has measurable cost we'd otherwise
+  //     drop. The harness persists those tokens as billed even though
+  //     the run ended in providerError.
   const usage: UsageInfo = { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
   let usageSeen = false;
+  let usageEmitted = false;
 
   // Anthropic reports CUMULATIVE usage in both message_start and message_delta
   // today, so a straight assignment would also be correct. We keep the
@@ -108,94 +118,107 @@ export async function* normalizeAnthropicStream(
     if (touched) usageSeen = true;
   };
 
-  for await (const event of raw) {
-    switch (event.type) {
-      case 'message_start':
-        yield { kind: 'start', message_id: event.message.id };
-        mergeUsage(event.message.usage);
-        break;
+  try {
+    for await (const event of raw) {
+      switch (event.type) {
+        case 'message_start':
+          yield { kind: 'start', message_id: event.message.id };
+          mergeUsage(event.message.usage);
+          break;
 
-      case 'content_block_start':
-        if (event.content_block.type === 'tool_use') {
-          toolUses.set(event.index, {
-            id: event.content_block.id,
-            name: event.content_block.name,
-            partialArgs: '',
-          });
-          yield {
-            kind: 'tool_use_start',
-            id: event.content_block.id,
-            name: event.content_block.name,
-          };
-        }
-        // text and thinking blocks need no start event in the canonical shape;
-        // their first delta carries the data.
-        break;
-
-      case 'content_block_delta': {
-        const { delta } = event;
-        if (delta.type === 'text_delta') {
-          yield { kind: 'text_delta', text: delta.text };
-        } else if (delta.type === 'input_json_delta') {
-          const tool = toolUses.get(event.index);
-          if (tool !== undefined) {
-            tool.partialArgs += delta.partial_json;
+        case 'content_block_start':
+          if (event.content_block.type === 'tool_use') {
+            toolUses.set(event.index, {
+              id: event.content_block.id,
+              name: event.content_block.name,
+              partialArgs: '',
+            });
             yield {
-              kind: 'tool_use_delta',
-              id: tool.id,
-              partial_args: delta.partial_json,
+              kind: 'tool_use_start',
+              id: event.content_block.id,
+              name: event.content_block.name,
             };
           }
-        } else if (delta.type === 'thinking_delta') {
-          yield { kind: 'thinking_delta', text: delta.thinking };
-        }
-        // signature_delta (extended thinking signing) is intentionally dropped:
-        // it has no UI value and isn't part of the canonical taxonomy.
-        break;
-      }
+          // text and thinking blocks need no start event in the canonical shape;
+          // their first delta carries the data.
+          break;
 
-      case 'content_block_stop': {
-        const tool = toolUses.get(event.index);
-        if (tool !== undefined) {
-          let parsed: Record<string, unknown> = {};
-          if (tool.partialArgs.length > 0) {
-            try {
-              const obj = JSON.parse(tool.partialArgs) as unknown;
-              if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
-                throw new Error('tool args must decode to a JSON object');
-              }
-              parsed = obj as Record<string, unknown>;
-            } catch (e) {
+        case 'content_block_delta': {
+          const { delta } = event;
+          if (delta.type === 'text_delta') {
+            yield { kind: 'text_delta', text: delta.text };
+          } else if (delta.type === 'input_json_delta') {
+            const tool = toolUses.get(event.index);
+            if (tool !== undefined) {
+              tool.partialArgs += delta.partial_json;
               yield {
-                kind: 'error',
-                code: 'tool_args_parse_error',
-                message: `failed to parse tool_use args for ${tool.id}: ${(e as Error).message}`,
-                retryable: false,
+                kind: 'tool_use_delta',
+                id: tool.id,
+                partial_args: delta.partial_json,
               };
-              toolUses.delete(event.index);
-              break;
             }
+          } else if (delta.type === 'thinking_delta') {
+            yield { kind: 'thinking_delta', text: delta.thinking };
           }
-          yield { kind: 'tool_use_stop', id: tool.id, final_args: parsed };
-          toolUses.delete(event.index);
+          // signature_delta (extended thinking signing) is intentionally dropped:
+          // it has no UI value and isn't part of the canonical taxonomy.
+          break;
         }
-        break;
+
+        case 'content_block_stop': {
+          const tool = toolUses.get(event.index);
+          if (tool !== undefined) {
+            let parsed: Record<string, unknown> = {};
+            if (tool.partialArgs.length > 0) {
+              try {
+                const obj = JSON.parse(tool.partialArgs) as unknown;
+                if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) {
+                  throw new Error('tool args must decode to a JSON object');
+                }
+                parsed = obj as Record<string, unknown>;
+              } catch (e) {
+                yield {
+                  kind: 'error',
+                  code: 'tool_args_parse_error',
+                  message: `failed to parse tool_use args for ${tool.id}: ${(e as Error).message}`,
+                  retryable: false,
+                };
+                toolUses.delete(event.index);
+                break;
+              }
+            }
+            yield { kind: 'tool_use_stop', id: tool.id, final_args: parsed };
+            toolUses.delete(event.index);
+          }
+          break;
+        }
+
+        case 'message_delta':
+          // Anthropic may emit interim message_deltas without a stop_reason
+          // (null or omitted). We only update on a real string value, so a
+          // later null can't clobber an earlier valid stop_reason.
+          if (typeof event.delta.stop_reason === 'string') {
+            stopReason = mapStopReason(event.delta.stop_reason);
+          }
+          mergeUsage(event.usage);
+          break;
+
+        case 'message_stop':
+          if (usageSeen) {
+            yield { kind: 'usage', usage };
+            usageEmitted = true;
+          }
+          yield { kind: 'stop', reason: stopReason };
+          break;
       }
-
-      case 'message_delta':
-        // Anthropic may emit interim message_deltas without a stop_reason
-        // (null or omitted). We only update on a real string value, so a
-        // later null can't clobber an earlier valid stop_reason.
-        if (typeof event.delta.stop_reason === 'string') {
-          stopReason = mapStopReason(event.delta.stop_reason);
-        }
-        mergeUsage(event.usage);
-        break;
-
-      case 'message_stop':
-        if (usageSeen) yield { kind: 'usage', usage };
-        yield { kind: 'stop', reason: stopReason };
-        break;
+    }
+  } finally {
+    // Stream ended without a `message_stop` (mid-stream error, abort,
+    // network drop). If we already saw usage on `message_start` or an
+    // interim `message_delta`, surface what we have so the harness
+    // can charge for billed tokens even on failed turns.
+    if (usageSeen && !usageEmitted) {
+      yield { kind: 'usage', usage };
     }
   }
 }

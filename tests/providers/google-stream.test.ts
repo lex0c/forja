@@ -217,6 +217,43 @@ describe('normalizeGoogleStream', () => {
     expect(events.find((e) => e.kind === 'usage')).toBeUndefined();
   });
 
+  test('emits usage from finally when stream errors after usageMetadata arrived', async () => {
+    const erroringRaw = (async function* (): AsyncIterable<RawGoogleChunk> {
+      yield {
+        responseId: 'r',
+        candidates: [{ content: { parts: [{ text: 'partial' }] } }],
+        usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 5 },
+      };
+      throw new Error('stream aborted');
+    })();
+    const events: StreamEvent[] = [];
+    try {
+      for await (const ev of normalizeGoogleStream(erroringRaw)) events.push(ev);
+    } catch {}
+    const usageEv = events.find((e) => e.kind === 'usage');
+    expect(usageEv).toBeDefined();
+    if (usageEv?.kind === 'usage') {
+      expect(usageEv.usage.input).toBe(100);
+      expect(usageEv.usage.output).toBe(5);
+    }
+  });
+
+  test('does NOT double-emit usage on the happy path', async () => {
+    const events = await collect(
+      normalizeGoogleStream(
+        fromChunks([
+          {
+            responseId: 'r',
+            candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+            usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5 },
+          },
+        ]),
+      ),
+    );
+    const usageEvents = events.filter((e) => e.kind === 'usage');
+    expect(usageEvents).toHaveLength(1);
+  });
+
   test('partial later usageMetadata does not zero earlier prompt/cache values', async () => {
     // Bug regression: a later chunk reporting only candidatesTokenCount
     // must not reset previously captured promptTokenCount/cached values
