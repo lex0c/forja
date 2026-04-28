@@ -181,6 +181,79 @@ describe('createOpenAIProvider', () => {
     expect(params.stream_options).toBeUndefined();
   });
 
+  test('FORJA_OPENAI_INCLUDE_USAGE=0 disables stream_options when no option passed', async () => {
+    // The CLI bootstrap calls entry.factory() with no options, so the
+    // adapter must consult the env var for users on broken compat
+    // endpoints who can't change code. Recognized falsy values (0,
+    // false, no, off; case-insensitive) opt out.
+    const original = process.env.FORJA_OPENAI_INCLUDE_USAGE;
+    process.env.FORJA_OPENAI_INCLUDE_USAGE = '0';
+    try {
+      const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+      const provider = createOpenAIProvider('gpt-4o', { client: handle.client });
+      for await (const _ of provider.generate({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 1,
+      })) {
+        // drain
+      }
+      const params = handle.createCalls[0]?.params as Record<string, unknown>;
+      expect(params.stream_options).toBeUndefined();
+    } finally {
+      if (original === undefined) delete process.env.FORJA_OPENAI_INCLUDE_USAGE;
+      else process.env.FORJA_OPENAI_INCLUDE_USAGE = original;
+    }
+  });
+
+  test('FORJA_OPENAI_INCLUDE_USAGE=false also disables (case-insensitive)', async () => {
+    const original = process.env.FORJA_OPENAI_INCLUDE_USAGE;
+    process.env.FORJA_OPENAI_INCLUDE_USAGE = 'False';
+    try {
+      const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+      const provider = createOpenAIProvider('gpt-4o', { client: handle.client });
+      for await (const _ of provider.generate({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 1,
+      })) {
+        // drain
+      }
+      const params = handle.createCalls[0]?.params as Record<string, unknown>;
+      expect(params.stream_options).toBeUndefined();
+    } finally {
+      if (original === undefined) delete process.env.FORJA_OPENAI_INCLUDE_USAGE;
+      else process.env.FORJA_OPENAI_INCLUDE_USAGE = original;
+    }
+  });
+
+  test('explicit includeUsage option overrides the env var', async () => {
+    // If both are set, the option wins. Lets a programmatic caller
+    // force-enable telemetry even on a host where the operator opted
+    // out at the env level (and vice versa).
+    const original = process.env.FORJA_OPENAI_INCLUDE_USAGE;
+    process.env.FORJA_OPENAI_INCLUDE_USAGE = '0';
+    try {
+      const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+      const provider = createOpenAIProvider('gpt-4o', {
+        client: handle.client,
+        includeUsage: true,
+      });
+      for await (const _ of provider.generate({
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 1,
+      })) {
+        // drain
+      }
+      const params = handle.createCalls[0]?.params as Record<string, unknown>;
+      expect(params.stream_options).toEqual({ include_usage: true });
+    } finally {
+      if (original === undefined) delete process.env.FORJA_OPENAI_INCLUDE_USAGE;
+      else process.env.FORJA_OPENAI_INCLUDE_USAGE = original;
+    }
+  });
+
   test('assistant message with tool_use blocks becomes a single message + tool_calls', async () => {
     const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
     const provider = createOpenAIProvider('gpt-4o', { client: handle.client });

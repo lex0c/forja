@@ -21,8 +21,22 @@ export interface CreateOpenAIProviderOptions {
   // OpenAI-compatible endpoints (older Azure deployments, certain proxies)
   // reject unknown params with HTTP 400. Set this to `false` if you hit
   // that — cost tracking will report zeros, but the run will succeed.
+  // When omitted, falls back to the FORJA_OPENAI_INCLUDE_USAGE env var
+  // so users on the CLI path (where the registry factory is invoked
+  // with no options) can still opt out without code changes.
   includeUsage?: boolean;
 }
+
+// Resolve the `includeUsage` default from the environment for callers
+// who don't pass an explicit option (notably the registry factory used
+// by the CLI bootstrap, which forwards no options today). Truthy by
+// default; recognized falsy strings disable the param.
+const includeUsageFromEnv = (): boolean => {
+  const v = process.env.FORJA_OPENAI_INCLUDE_USAGE;
+  if (v === undefined || v === '') return true;
+  const norm = v.toLowerCase();
+  return !(norm === '0' || norm === 'false' || norm === 'no' || norm === 'off');
+};
 
 interface OpenAIToolCall {
   id: string;
@@ -160,7 +174,7 @@ export const createOpenAIProvider = (
     client = new OpenAI(sdkOpts);
   }
 
-  const includeUsage = options.includeUsage ?? true;
+  const includeUsage = options.includeUsage ?? includeUsageFromEnv();
 
   const generate = async function* (req: GenerateRequest): AsyncIterable<StreamEvent> {
     const messages: OpenAIMessage[] = [];
