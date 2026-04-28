@@ -309,6 +309,97 @@ describe('runAgent', () => {
     expect(sessions).toHaveLength(1);
   });
 
+  test('stream errors fail the run (not silently exit done)', async () => {
+    // Mock provider emits tool_use_start + malformed args → normalizer
+    // produces an error event and drops tool_use_stop. Without the
+    // error check, collected.tool_uses is empty and the loop exits
+    // as `done` (exit code 0) — masking a real failure where the
+    // model's tool call was lost.
+    const provider: Provider = {
+      id: 'mock/stream-err',
+      family: 'anthropic',
+      capabilities: {
+        tools: 'native',
+        cache: false,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 1000,
+        output_max_tokens: 100,
+        cost_per_1k_input: 0,
+        cost_per_1k_output: 0,
+        notes: [],
+      },
+      async *generate() {
+        yield { kind: 'start', message_id: 'm' };
+        yield { kind: 'tool_use_start', id: 'tu1', name: 'echo' };
+        yield {
+          kind: 'error',
+          code: 'tool_args_parse_error',
+          message: 'failed to parse tool_use args for tu1: bad json',
+          retryable: false,
+        };
+        yield { kind: 'stop', reason: 'tool_use' };
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+    const result = await runAgent({
+      provider,
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+    });
+    expect(result.status).toBe('error');
+    expect(result.reason).toBe('providerError');
+    expect(result.detail).toContain('tool_args_parse_error');
+  });
+
+  test('stream errors WITH no tool_uses still fail (not done)', async () => {
+    // Edge: error emitted but no tool_use_start either (degenerate
+    // normalizer output). Same fail-fast behavior.
+    const provider: Provider = {
+      id: 'mock/stream-err2',
+      family: 'anthropic',
+      capabilities: {
+        tools: 'native',
+        cache: false,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 1000,
+        output_max_tokens: 100,
+        cost_per_1k_input: 0,
+        cost_per_1k_output: 0,
+        notes: [],
+      },
+      async *generate() {
+        yield { kind: 'start', message_id: 'm' };
+        yield {
+          kind: 'error',
+          code: 'normalizer.bug',
+          message: 'something went wrong',
+          retryable: false,
+        };
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+    const result = await runAgent({
+      provider,
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+    });
+    expect(result.status).toBe('error');
+    expect(result.reason).toBe('providerError');
+  });
+
   test('abort during provider stream returns interrupted/aborted (not providerError)', async () => {
     // Simulate the SDK throwing AbortError when the signal fires mid-call.
     const ctrl = new AbortController();

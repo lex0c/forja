@@ -32,11 +32,12 @@ export interface RawOpenAIChunk {
 }
 
 interface ToolCallInProgress {
+  // Locked at the first delta for this `index`. We commit to whatever id
+  // we have at start time — synthesized or real — and never replace it,
+  // because `tool_use_start` was already yielded with that id and the
+  // harness's name lookup keys on it. Mutating id mid-stream orphans
+  // the downstream tool_use_stop in `harness/collect.ts`.
   id: string;
-  // Real OpenAI ids start with `call_`, same as our synthesized fallback,
-  // so the prefix can't be used to tell them apart. Track an explicit flag
-  // and only let it be replaced once.
-  idIsSynthesized: boolean;
   name: string;
   partialArgs: string;
 }
@@ -93,23 +94,15 @@ export async function* normalizeOpenAIStream(
           if (inProgress === undefined) {
             const id = tc.id ?? `call_${tc.index}_${crypto.randomUUID()}`;
             const name = tc.function?.name ?? '';
-            inProgress = {
-              id,
-              idIsSynthesized: tc.id === undefined,
-              name,
-              partialArgs: '',
-            };
+            inProgress = { id, name, partialArgs: '' };
             toolCalls.set(tc.index, inProgress);
             yield { kind: 'tool_use_start', id, name };
           } else {
-            // id and name may straggle across the first few chunks. We only
-            // accept a real id once — subsequent ids are ignored (defensive
-            // against SDK quirks, since OpenAI sends id only in chunk 1 in
-            // practice).
-            if (tc.id !== undefined && inProgress.idIsSynthesized) {
-              inProgress.id = tc.id;
-              inProgress.idIsSynthesized = false;
-            }
+            // The id is locked once `tool_use_start` has been emitted.
+            // Replacing it now (even with a "more real" id from a later
+            // delta) breaks the harness's id↔name correlation in
+            // `harness/collect.ts`, which would orphan tool_use_stop
+            // and silently drop the tool call.
             if (
               typeof tc.function?.name === 'string' &&
               tc.function.name.length > 0 &&

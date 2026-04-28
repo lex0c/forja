@@ -221,6 +221,20 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         messages.push({ role: 'assistant', content: assistantContent });
       }
 
+      // Stream errors (normalizer-level: malformed tool_use args, orphan
+      // tool_use_stop, etc.) mean the provider produced output we couldn't
+      // structure correctly. The most common case is a malformed JSON
+      // arguments stream — `tool_use_stop` is dropped and the call vanishes
+      // from `tool_uses`. If we then exited as `done` because the array
+      // is empty, the run reports success while silently losing the
+      // model's intent. Surface this as a step-level failure instead.
+      // The assistant message is already persisted above so the audit
+      // trail keeps whatever text did come through.
+      if (collected.errors.length > 0) {
+        const detail = collected.errors.map((e) => `${e.code}: ${e.message}`).join('; ');
+        return finish('providerError', `stream errors: ${detail}`);
+      }
+
       // No tool uses → model is done speaking.
       if (collected.tool_uses.length === 0) {
         return finish('done');

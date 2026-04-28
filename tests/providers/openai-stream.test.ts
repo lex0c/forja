@@ -163,7 +163,12 @@ describe('normalizeOpenAIStream', () => {
     }
   });
 
-  test('id arriving in a later chunk overrides the synthesized one', async () => {
+  test('id is locked at start: a later id is ignored to keep start/stop coherent', async () => {
+    // First chunk has no id (we synthesize one). A second chunk includes
+    // a real id. The harness's id↔name lookup keys on the id seen at
+    // tool_use_start; if we silently swapped to the late id, the
+    // matching tool_use_stop would orphan in collect.ts and the tool
+    // call would be dropped (`harness.orphan_tool_use_stop`).
     const events = await collect(
       normalizeOpenAIStream(
         fromChunks([
@@ -179,7 +184,7 @@ describe('normalizeOpenAIStream', () => {
           {
             choices: [
               {
-                delta: { tool_calls: [{ index: 0, id: 'real_id', function: { arguments: '{}' } }] },
+                delta: { tool_calls: [{ index: 0, id: 'late_id', function: { arguments: '{}' } }] },
                 finish_reason: 'tool_calls',
               },
             ],
@@ -187,11 +192,59 @@ describe('normalizeOpenAIStream', () => {
         ]),
       ),
     );
+    const start = events.find((e) => e.kind === 'tool_use_start');
     const stop = events.find((e) => e.kind === 'tool_use_stop');
+    expect(start).toBeDefined();
     expect(stop).toBeDefined();
-    if (stop?.kind === 'tool_use_stop') {
-      expect(stop.id).toBe('real_id');
+    if (start?.kind === 'tool_use_start' && stop?.kind === 'tool_use_stop') {
+      // Critical invariant: start.id === stop.id so the harness can
+      // correlate them. The actual value (synth or real) doesn't matter.
+      expect(stop.id).toBe(start.id);
+      // The late real id must NOT have replaced the synthesized one.
+      expect(stop.id).not.toBe('late_id');
     }
+  });
+
+  test('start/delta/stop ids stay consistent across the lifecycle', async () => {
+    // Three chunks: name-only, args-only, finish. All emitted events for
+    // index 0 must share the same id. This is the contract collect.ts
+    // depends on.
+    const events = await collect(
+      normalizeOpenAIStream(
+        fromChunks([
+          {
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    { index: 0, id: 'call_locked', type: 'function', function: { name: 'foo' } },
+                  ],
+                },
+              },
+            ],
+          },
+          {
+            choices: [
+              {
+                delta: {
+                  tool_calls: [{ index: 0, function: { arguments: '{"a":1}' } }],
+                },
+              },
+            ],
+          },
+          { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+        ]),
+      ),
+    );
+    const ids = events
+      .filter(
+        (e) =>
+          e.kind === 'tool_use_start' || e.kind === 'tool_use_delta' || e.kind === 'tool_use_stop',
+      )
+      .map((e) => ('id' in e ? e.id : ''));
+    expect(ids).toHaveLength(3);
+    expect(new Set(ids).size).toBe(1);
+    expect(ids[0]).toBe('call_locked');
   });
 
   test('refusal field is emitted as text_delta', async () => {
