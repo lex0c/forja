@@ -22,15 +22,36 @@ export interface PermissionEngine {
 }
 
 // Loose shape used for argument-shape lookups. The engine reads only the
-// fields it knows about per category; unknown fields are ignored.
+// fields it knows about per category; unknown fields are ignored. The
+// index signature reflects that callers (harness, tests) pass the raw
+// tool args which can carry anything (`pattern`, `offset`, etc.).
 export interface ToolArgs {
   // bash
   command?: string;
-  // fs.*
+  // fs.* — `path` is the file/dir target for read_file/write_file/edit_file
+  // and the optional search root for grep. `cwd` is the optional search
+  // root for glob (which has no `path` argument at all).
   path?: string;
+  cwd?: string;
   // web.fetch
   url?: string;
+  [key: string]: unknown;
 }
+
+// Resolves the policy-relevant filesystem target per tool semantics.
+// read_file/write_file/edit_file all operate on a single `path`. grep
+// and glob are search tools whose effective root differs:
+//   - grep: `args.path` (optional; defaults to session cwd)
+//   - glob: `args.cwd` (optional; defaults to session cwd; the `pattern`
+//     argument defines what's matched, not what's allowed)
+// Without this resolver the engine deny-rejects glob/grep for
+// "missing 'path' argument" before any rule matching can run, making
+// `tools.grep.allow_paths` / `tools.glob.allow_paths` unusable.
+const resolveFsTarget = (toolName: string, args: ToolArgs, cwd: string): string | null => {
+  if (toolName === 'glob') return args.cwd ?? cwd;
+  if (toolName === 'grep') return args.path ?? cwd;
+  return typeof args.path === 'string' && args.path.length > 0 ? args.path : null;
+};
 
 const denyDefault = (toolName: string, mode: PolicyMode): Decision => ({
   kind: 'deny',
@@ -69,6 +90,20 @@ const checkBash = (
   return denyDefault(toolName, mode);
 };
 
+// Search-tool roots (grep/glob) are policy-allowed when the pattern
+// admits a descendant of the root. For example, `allow_paths: ['src/**']`
+// and a grep rooted at `src` should pass — the search will only land
+// on files under `src`. We probe by appending a synthetic segment to
+// the root and matching that. Without this, `src` doesn't match
+// `src/**` (the `**` requires at least one path component) and the
+// rule is unusable for search tools.
+const SYNTHETIC_DESCENDANT = '.forja-check';
+
+const isSearchTool = (toolName: string): boolean => toolName === 'grep' || toolName === 'glob';
+
+const matchTargetForRules = (toolName: string, path: string): string =>
+  isSearchTool(toolName) ? `${path}/${SYNTHETIC_DESCENDANT}` : path;
+
 const checkPath = (
   toolName: string,
   args: ToolArgs,
@@ -77,20 +112,28 @@ const checkPath = (
   cwd: string,
   isWrite: boolean,
 ): Decision => {
-  const path = args.path;
-  if (typeof path !== 'string' || path.length === 0) {
+  const path = resolveFsTarget(toolName, args, cwd);
+  if (path === null) {
     return { kind: 'deny', reason: `${toolName}: missing 'path' argument` };
   }
 
-  const denied = firstMatchingPath(rules?.deny_paths, path, cwd);
+  // For search-tool roots we also need to check the literal path against
+  // deny rules — a `deny_paths: ['secrets/**']` should block grep rooted
+  // at `secrets`, not just descendants. Run deny against both forms and
+  // refuse on either match.
+  const matchTarget = matchTargetForRules(toolName, path);
+  const deniedLiteral = isSearchTool(toolName)
+    ? firstMatchingPath(rules?.deny_paths, path, cwd)
+    : null;
+  const denied = firstMatchingPath(rules?.deny_paths, matchTarget, cwd) ?? deniedLiteral;
   if (denied !== null) {
     return { kind: 'deny', reason: `path matched deny rule: ${denied}` };
   }
-  const allowed = firstMatchingPath(rules?.allow_paths, path, cwd);
+  const allowed = firstMatchingPath(rules?.allow_paths, matchTarget, cwd);
   if (allowed !== null) {
     return { kind: 'allow', reason: `path matched allow rule: ${allowed}` };
   }
-  const confirm = firstMatchingPath(rules?.confirm_paths, path, cwd);
+  const confirm = firstMatchingPath(rules?.confirm_paths, matchTarget, cwd);
   if (confirm !== null) {
     // acceptEdits per AGENTIC_CLI §8: "aceita edits sem confirmação".
     // For writes, a confirm_paths match becomes an auto-allow — that IS

@@ -186,6 +186,68 @@ describe('engine.check (web.fetch)', () => {
   });
 });
 
+describe('engine.check (search tools: glob/grep)', () => {
+  test('glob with no `cwd` arg falls back to session cwd', () => {
+    const eng = createPermissionEngine(policy({ tools: { glob: { allow_paths: ['./**'] } } }), {
+      cwd: CWD,
+    });
+    const d = eng.check('glob', 'fs.read', { pattern: 'src/**/*.ts' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('glob with explicit `cwd` arg matches against allow_paths', () => {
+    const eng = createPermissionEngine(policy({ tools: { glob: { allow_paths: ['src/**'] } } }), {
+      cwd: CWD,
+    });
+    const d = eng.check('glob', 'fs.read', { pattern: '**/*.ts', cwd: 'src' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('grep with no `path` arg falls back to session cwd', () => {
+    const eng = createPermissionEngine(policy({ tools: { grep: { allow_paths: ['./**'] } } }), {
+      cwd: CWD,
+    });
+    const d = eng.check('grep', 'fs.read', { pattern: 'foo' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('grep with explicit `path` arg matches against allow_paths', () => {
+    const eng = createPermissionEngine(policy({ tools: { grep: { allow_paths: ['src/**'] } } }), {
+      cwd: CWD,
+    });
+    const d = eng.check('grep', 'fs.read', { pattern: 'foo', path: 'src' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('grep with explicit `path` outside allow_paths is denied', () => {
+    const eng = createPermissionEngine(policy({ tools: { grep: { allow_paths: ['src/**'] } } }), {
+      cwd: CWD,
+    });
+    const d = eng.check('grep', 'fs.read', { pattern: 'foo', path: 'docs' });
+    expect(d.kind).toBe('deny');
+  });
+
+  test('grep rooted at a deny_paths directory is rejected (literal match)', () => {
+    // The synthetic-descendant probe alone wouldn't fire because
+    // `secrets/**` doesn't match `secrets/.forja-check`'s deny check
+    // unless the deny pattern itself reaches descendants. Instead the
+    // engine also matches the literal root for search tools.
+    const eng = createPermissionEngine(
+      policy({
+        tools: { grep: { allow_paths: ['**'], deny_paths: ['secrets'] } },
+      }),
+      { cwd: CWD },
+    );
+    expect(eng.check('grep', 'fs.read', { pattern: 'foo', path: 'secrets' }).kind).toBe('deny');
+  });
+
+  test('glob/grep still default-deny when no allow_paths configured', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    expect(eng.check('glob', 'fs.read', { pattern: 'src/**' }).kind).toBe('deny');
+    expect(eng.check('grep', 'fs.read', { pattern: 'foo' }).kind).toBe('deny');
+  });
+});
+
 describe('engine misc category', () => {
   test('misc tools auto-allow (no gate yet)', () => {
     const eng = createPermissionEngine(policy({}), { cwd: CWD });
