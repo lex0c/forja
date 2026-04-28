@@ -1,0 +1,241 @@
+import { createHash } from 'node:crypto';
+import type {
+  GenerateRequest,
+  ProviderContentBlock,
+  ProviderMessage,
+  ProviderToolDef,
+  ProviderToolResultBlock,
+  ProviderToolUseBlock,
+} from '../providers/index.ts';
+import { appendMessage, completeSession, createSession } from '../storage/index.ts';
+
+type TerminalSessionStatus = 'done' | 'interrupted' | 'exhausted' | 'error';
+import type { ToolContext } from '../tools/index.ts';
+import { collectStep } from './collect.ts';
+import { invokeTool } from './invoke-tool.ts';
+import {
+  DEFAULT_BUDGET,
+  type ExitReason,
+  type HarnessConfig,
+  type HarnessResult,
+  type RunBudget,
+} from './types.ts';
+
+const stableStringify = (obj: unknown): string => {
+  if (obj === null || typeof obj !== 'object') return JSON.stringify(obj);
+  if (Array.isArray(obj)) return `[${obj.map(stableStringify).join(',')}]`;
+  const keys = Object.keys(obj as Record<string, unknown>).sort();
+  const parts = keys.map(
+    (k) => `${JSON.stringify(k)}:${stableStringify((obj as Record<string, unknown>)[k])}`,
+  );
+  return `{${parts.join(',')}}`;
+};
+
+const hashToolCall = (name: string, args: Record<string, unknown>): string =>
+  createHash('sha256')
+    .update(`${name}:${stableStringify(args)}`)
+    .digest('hex');
+
+const exitToStatus: Record<ExitReason, TerminalSessionStatus> = {
+  done: 'done',
+  maxSteps: 'exhausted',
+  maxWallClockMs: 'interrupted',
+  maxToolErrors: 'error',
+  degenerateLoop: 'error',
+  aborted: 'interrupted',
+  providerError: 'error',
+  scriptExhausted: 'error',
+};
+
+const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
+  done: 'done',
+  maxSteps: 'exhausted',
+  maxWallClockMs: 'interrupted',
+  maxToolErrors: 'error',
+  degenerateLoop: 'error',
+  aborted: 'interrupted',
+  providerError: 'error',
+  scriptExhausted: 'error',
+};
+
+const buildToolDefs = (config: HarnessConfig): ProviderToolDef[] =>
+  config.toolRegistry.list().map((t) => ({
+    name: t.name,
+    description: t.description,
+    input_schema: t.inputSchema,
+  }));
+
+// Strip `name` from the tool model so it stays inside our domain — providers
+// expect their own format already constructed by the adapter.
+
+export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> => {
+  const budget: RunBudget = { ...DEFAULT_BUDGET, ...(config.budget ?? {}) };
+  const startMs = Date.now();
+  const signal = config.signal ?? new AbortController().signal;
+
+  const session = createSession(config.db, {
+    model: config.provider.id,
+    cwd: config.cwd,
+  });
+
+  const userMsg = appendMessage(config.db, {
+    sessionId: session.id,
+    role: 'user',
+    content: config.userPrompt,
+  });
+
+  const messages: ProviderMessage[] = [{ role: 'user', content: config.userPrompt }];
+  const tools = buildToolDefs(config);
+  const recentToolHashes: string[] = [];
+  const HASH_WINDOW = 5;
+
+  let steps = 0;
+  let consecutiveErrors = 0;
+  let lastMessageId = userMsg.id;
+
+  const finish = (reason: ExitReason, detail?: string): HarnessResult => {
+    completeSession(config.db, session.id, exitToStatus[reason], 0);
+    const result: HarnessResult = {
+      status: exitToHarnessStatus[reason],
+      reason,
+      sessionId: session.id,
+      steps,
+      durationMs: Date.now() - startMs,
+      lastMessageId,
+    };
+    if (detail !== undefined) result.detail = detail;
+    return result;
+  };
+
+  while (true) {
+    if (signal.aborted) return finish('aborted');
+    if (steps >= budget.maxSteps) return finish('maxSteps');
+    if (Date.now() - startMs >= budget.maxWallClockMs) return finish('maxWallClockMs');
+
+    steps += 1;
+
+    const req: GenerateRequest = {
+      model: config.provider.id,
+      // Snapshot the running message list so post-call mutations (the next
+      // iteration appends assistant + tool_results) don't retroactively
+      // change what the provider observed.
+      messages: [...messages],
+      max_tokens: budget.maxOutputTokensPerCall,
+      ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
+      ...(tools.length > 0 ? { tools } : {}),
+    };
+
+    let collected: Awaited<ReturnType<typeof collectStep>>;
+    try {
+      collected = await collectStep(config.provider.generate(req));
+    } catch (e) {
+      const detail = e instanceof Error ? e.message || e.name || String(e) : String(e);
+      return finish('providerError', detail);
+    }
+
+    // Build assistant content blocks: text first, then tool_uses, mirroring
+    // the order the model produced them. Empty text is omitted.
+    const assistantContent: ProviderContentBlock[] = [];
+    if (collected.text.length > 0) {
+      assistantContent.push({ type: 'text', text: collected.text });
+    }
+    for (const tu of collected.tool_uses) {
+      const block: ProviderToolUseBlock = {
+        type: 'tool_use',
+        id: tu.id,
+        name: tu.name,
+        input: tu.input,
+      };
+      assistantContent.push(block);
+    }
+
+    const assistantMsg = appendMessage(config.db, {
+      sessionId: session.id,
+      role: 'assistant',
+      parentId: lastMessageId,
+      content: assistantContent.length > 0 ? assistantContent : '',
+    });
+    lastMessageId = assistantMsg.id;
+    if (assistantContent.length > 0) {
+      messages.push({ role: 'assistant', content: assistantContent });
+    }
+
+    // No tool uses → model is done speaking.
+    if (collected.tool_uses.length === 0) {
+      return finish('done');
+    }
+
+    // Execute every tool_use in this step, collecting results.
+    const toolResults: ProviderToolResultBlock[] = [];
+    for (const tu of collected.tool_uses) {
+      if (signal.aborted) return finish('aborted');
+
+      // Degenerate-loop detection: hash this call and check the sliding
+      // window. We do this BEFORE invocation so we can refuse cheaply.
+      const h = hashToolCall(tu.name, tu.input);
+      recentToolHashes.push(h);
+      if (recentToolHashes.length > HASH_WINDOW) recentToolHashes.shift();
+      const repeats = recentToolHashes.filter((x) => x === h).length;
+      if (repeats >= budget.maxRepeatedToolHash) {
+        return finish(
+          'degenerateLoop',
+          `tool ${tu.name} called ${repeats} times with identical args in last ${HASH_WINDOW} calls`,
+        );
+      }
+
+      const ctx: ToolContext = {
+        signal,
+        cwd: config.cwd,
+        sessionId: session.id,
+        stepId: assistantMsg.id,
+        permissions: config.permissionEngine.view(),
+      };
+
+      const inv = await invokeTool(
+        {
+          toolUseId: tu.id,
+          toolName: tu.name,
+          args: tu.input,
+          messageId: assistantMsg.id,
+        },
+        {
+          db: config.db,
+          registry: config.toolRegistry,
+          engine: config.permissionEngine,
+          ctx,
+        },
+      );
+
+      toolResults.push(inv.toolResult);
+      if (inv.failed) {
+        consecutiveErrors += 1;
+      } else {
+        consecutiveErrors = 0;
+      }
+
+      if (consecutiveErrors >= budget.maxToolErrors) {
+        // Persist the partial tool_result message before bailing so the
+        // session history reflects what actually happened.
+        const partialMsg = appendMessage(config.db, {
+          sessionId: session.id,
+          role: 'user',
+          parentId: lastMessageId,
+          content: toolResults,
+        });
+        lastMessageId = partialMsg.id;
+        return finish('maxToolErrors', `${consecutiveErrors} consecutive tool errors`);
+      }
+    }
+
+    // Persist tool_results back as a user message; mirror them in the
+    // running provider message list for the next turn.
+    const resultMsg = appendMessage(config.db, {
+      sessionId: session.id,
+      role: 'user',
+      parentId: lastMessageId,
+      content: toolResults,
+    });
+    lastMessageId = resultMsg.id;
+    messages.push({ role: 'user', content: toolResults });
+  }
+};

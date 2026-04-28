@@ -171,7 +171,41 @@ describe('createGoogleProvider', () => {
     expect(tools[0]?.functionDeclarations[0]?.name).toBe('read_file');
   });
 
-  test('appendMessage with tool_result block throws (deferred to harness)', async () => {
+  test('tool_result block with name is converted to functionResponse', async () => {
+    const handle = mockClient([{ candidates: [{ finishReason: 'STOP' }] }]);
+    const provider = createGoogleProvider('gemini-2.5-flash', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'gemini-2.5-flash',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'tu1',
+              name: 'read_file',
+              content: '{"data":"hello"}',
+            },
+          ],
+        },
+      ],
+      max_tokens: 1,
+    })) {
+      // drain
+    }
+    const params = handle.streamCalls[0]?.params as {
+      contents: Array<{ role: string; parts: Array<Record<string, unknown>> }>;
+    };
+    expect(params.contents[0]?.role).toBe('user');
+    expect(params.contents[0]?.parts[0]).toEqual({
+      functionResponse: {
+        name: 'read_file',
+        response: { result: '{"data":"hello"}' },
+      },
+    });
+  });
+
+  test('tool_result block without name throws (harness must populate it)', async () => {
     const handle = mockClient([{ candidates: [{ finishReason: 'STOP' }] }]);
     const provider = createGoogleProvider('gemini-2.5-flash', { client: handle.client });
     const stream = provider.generate({
@@ -193,7 +227,7 @@ describe('createGoogleProvider', () => {
       err = e as Error;
     }
     expect(err).not.toBeNull();
-    expect(err?.message).toMatch(/tool_result.*not yet supported/i);
+    expect(err?.message).toMatch(/missing the function name/i);
   });
 
   test('countTokens returns the SDK totalTokens value', async () => {

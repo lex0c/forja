@@ -71,6 +71,11 @@ export interface ProviderToolUseBlock {
 export interface ProviderToolResultBlock {
   type: 'tool_result';
   tool_use_id: string;
+  // Optional function name. Anthropic and OpenAI correlate tool results
+  // back to their calls by id; Gemini correlates by name and has no
+  // per-call id, so the harness populates this field for Gemini compat.
+  // Other adapters can ignore it.
+  name?: string;
   content: string;
   is_error?: boolean;
 }

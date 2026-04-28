@@ -35,12 +35,21 @@ const blockToParts = (block: ProviderContentBlock): GooglePart[] => {
     return [{ functionCall: { name: block.name, args: block.input } }];
   }
   // tool_result: Gemini correlates by function name, not by tool_use_id.
-  // The harness layer (Step 5) is the right place to resolve id->name; for
-  // now we throw to surface this gap rather than silently corrupt history.
-  throw new Error(
-    'tool_result message blocks are not yet supported by the Gemini adapter ' +
-      '(needs id->name resolution that lives in the harness; will land in M1 Step 5)',
-  );
+  // The harness populates `name` on tool_result blocks specifically for
+  // this case; if it's missing we fail loud instead of guessing.
+  if (block.name === undefined || block.name.length === 0) {
+    throw new Error(
+      `tool_result block for ${block.tool_use_id} is missing the function name; Gemini correlates by name, so the harness must populate it`,
+    );
+  }
+  return [
+    {
+      functionResponse: {
+        name: block.name,
+        response: { result: block.content },
+      },
+    },
+  ];
 };
 
 const toGoogleContent = (m: ProviderMessage): GoogleContent => {

@@ -15,6 +15,49 @@ Format:
 
 ---
 
+## [2026-04-27] M1 / Step 5 — Agent Harness (autonomous loop)
+
+**Done:**
+- `src/harness/types.ts` — `RunBudget` (`maxSteps`, `maxWallClockMs`, `maxToolErrors`, `maxRepeatedToolHash`, `maxOutputTokensPerCall`), `DEFAULT_BUDGET`, `ExitReason` enum (`done`/`maxSteps`/`maxWallClockMs`/`maxToolErrors`/`degenerateLoop`/`aborted`/`providerError`/`scriptExhausted`), `HarnessConfig`, `HarnessResult`.
+- `src/harness/collect.ts` — `collectStep(events)` drains a provider stream into `{message_id, text, tool_uses, thinking, stop_reason, errors}`. Tool names from `tool_use_start` are tracked by id and reattached on `_stop` (canonical event has only the id at stop time). Orphan stops become `harness.orphan_tool_use_stop` errors instead of crashes.
+- `src/harness/invoke-tool.ts` — single-tool pipeline. Lookup → persist `tool_calls` row → engine.check → record approval → start/finish with the right status. `confirm` decisions become `confirm_no` denials in M1 (no UI yet); the original prompt is surfaced to the model in the tool_result. Tool exceptions never propagate; they're wrapped as `tool.exception` errors.
+- `src/harness/loop.ts` — `runAgent(config)` autonomous loop. Builds the running message list, calls provider, builds assistant content blocks (text first, then tool_uses) for both DB persistence and the next request, drives every tool through `invokeTool`, accumulates tool_results into the next user message. Snapshots `messages` on each request so post-call mutations don't retroactively change what the provider observed. Sliding-window degenerate-loop detector (sha256 of `name:stableJson(args)`, window 5, threshold from `budget.maxRepeatedToolHash`).
+- `src/harness/index.ts` — public surface.
+- `tests/harness/collect.test.ts` — **8 tests**: text-only, single tool_use lifecycle, parallel tool_uses tracked by id, text+tool_use coexistence, thinking_delta, error events captured, orphan-stop defensive path, default stop_reason.
+- `tests/harness/invoke-tool.test.ts` — **6 tests**: happy path with approval row + tool_call lifecycle, unknown tool (no DB rows), policy deny, M1 confirm-becomes-denied with prompt surfaced, tool returning ToolError, tool throwing → `tool.exception`.
+- `tests/harness/loop.test.ts` — **10 tests** with a scripted mock provider: text-only one-step done, tool→result→done two-step (with assertion that the second request observes the tool_result message), maxSteps cap, pre-aborted signal, unknown tool (loop continues), policy deny (loop continues), maxToolErrors cap, degenerateLoop detection (identical args), session/messages persisted to SQLite, provider crash → providerError with detail.
+- Total suite: **254 pass / 6 skip / 529 expect() calls** in ~670ms.
+
+**Code-review fixes folded in before commit:**
+- **Gemini integration unblocked.** The harness emits user messages with `tool_result` blocks; the Gemini adapter rejected them because Gemini correlates by function name, not id. Now `ProviderToolResultBlock` carries an optional `name`, the harness populates it from `input.toolName` on every result (success and error paths), and the Gemini adapter converts to `functionResponse` instead of throwing. Anthropic and OpenAI ignore the field. Two new tests pin the contract: Gemini conversion with `name` works; the missing-`name` case still throws (for catching harness bugs).
+- **Empty error messages no longer get lost.** `(e as Error).message ?? String(e)` returned `""` when an `Error` had an empty message (nullish coalescing only catches null/undefined). Replaced with `e.message || e.name || String(e)` — falls through to the constructor name and finally `toString` so we never report `tool crashed: ` with no body. Same fix in the harness `providerError` path.
+
+**Decisions:**
+- **`maxCostUsd` deferred to M2.** Stream events don't expose token usage in M1 (the normalizer drops `message_delta.usage`); cost tracking lives with telemetry.
+- **`confirm` → `confirm_no` in M1**, with the prompt text mirrored into the tool_result so the model sees *why* it was denied. Step 6 (TUI) replaces this branch with a real prompt and decides `confirm_yes`/`confirm_no` based on user input.
+- **No checkpoint creation in this step.** The plan listed "checkpoints básicos" but the table doesn't exist yet; adding a stub now would be dead code. Migration 003 + git-stash integration land in M3 with the rest of the rollback subsystem.
+- **`messages` array is cloned per request** (`{...messages}`). The previous version passed a shared reference; mutations during the next iteration would have changed what the provider observed (caught by a test asserting the second request sees the tool_result message as the last entry).
+- **Hash window is in-memory.** Spec §13 has `tool_calls.input_hash` for SQL-side analysis; the harness's degenerate-loop detection uses an in-process sliding window keyed on `sha256(name + stableJson(args))`. SQL-side detection is M2.
+- **All registered tools are sent to the provider.** No filtering by playbook/role yet — the harness exposes the full registry. Filtering is a Step 6 / playbooks (M3) concern.
+- **Aborted signal is checked before each step AND between tool invocations within a step.** A multi-tool step honors abort mid-execution rather than waiting for the next iteration.
+- **`scriptExhausted` exit reason** is reserved for the mock provider draining (test-only path); production providers never hit it.
+
+**Out of scope:**
+- Streaming UI — the harness collects whole steps before persisting (Step 6 will tee events to UI)
+- Compaction — full message history sent every turn (M2)
+- Checkpoints — `tool.metadata.writes` flag is read but no snapshot is taken (M3)
+- Hooks (PreToolUse, PostToolUse, Stop, etc.) — M4
+- Subagents (`task_*`) — M3
+- Resume from DB — current loop only runs forward from a fresh user prompt (M2)
+- Cost tracking — needs token usage extraction in stream normalizer (M2)
+- Provider retry/backoff on 5xx — would wrap provider.generate; harness in M2
+
+**Pending:** none for this step.
+
+**Next:** Step 6 — Ink TUI mínimo + one-shot mode wiring. Connect the CLI entry (`src/cli/index.ts` is still a stub) to `runAgent` with a real Anthropic provider, render streaming output and tool calls in the terminal, wire `Ctrl+C` to the AbortSignal. Closes M1.
+
+---
+
 ## [2026-04-27] M1 / Step 4 — Permission Engine + Tool System + 6 builtin tools
 
 **Done:**
