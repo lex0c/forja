@@ -3,6 +3,7 @@ import type {
   ConstrainedRequest,
   GenerateRequest,
   Provider,
+  ProviderContentBlock,
   ProviderMessage,
   ProviderToolDef,
   StreamEvent,
@@ -16,11 +17,27 @@ export interface CreateAnthropicProviderOptions {
   client?: Anthropic;
 }
 
+// Strip `name` from tool_result blocks. Our canonical
+// ProviderToolResultBlock keeps `name` as optional metadata for
+// Gemini (which correlates results to calls by name). Anthropic
+// only accepts `tool_use_id`/`content`/`is_error` and 400s with
+// `Extra inputs are not permitted` if `name` leaks through.
+const stripToolResultName = (block: ProviderContentBlock): ProviderContentBlock => {
+  if (block.type !== 'tool_result') return block;
+  const cleaned: ProviderContentBlock = {
+    type: 'tool_result',
+    tool_use_id: block.tool_use_id,
+    content: block.content,
+  };
+  if (block.is_error !== undefined) cleaned.is_error = block.is_error;
+  return cleaned;
+};
+
 const toAnthropicMessage = (
   m: ProviderMessage,
 ): { role: ProviderMessage['role']; content: ProviderMessage['content'] } => ({
   role: m.role,
-  content: m.content,
+  content: typeof m.content === 'string' ? m.content : m.content.map(stripToolResultName),
 });
 
 const toAnthropicTool = (t: ProviderToolDef): Anthropic.Tool => ({

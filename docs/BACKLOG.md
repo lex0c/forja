@@ -15,6 +15,242 @@ Format:
 
 ---
 
+## [2026-04-28] M2 — exit baseline (smoke run on Haiku 4.5)
+
+First end-to-end smoke run against `anthropic/claude-haiku-4-5`
+after Step 6 landed. The point: confirm the M2 exit criterion
+(§18 — `pass-rate ≥ 85% smoke, p50 < $0.20/task` for the
+autonomous profile) is met and surface any blocking bugs the
+unit tests missed.
+
+**Result:** 6/7 passed = 85.7% pass-rate, p50 $0.0009/case,
+total $0.0075 across the suite, 16.8s wall clock.
+
+**Cases:**
+
+| # | Case | Pass | Cost | Steps |
+|---|---|---|---|---|
+| 01 | read file and report contents | ✓ | $0.0009 | 2 |
+| 02 | create file with specified content | ✓ | $0.0009 | 2 |
+| 03 | edit existing file in place | ✓ | $0.0015 | 3 |
+| 04 | grep search and report matches | ✓ | $0.0015 | 3 |
+| 05 | plan mode blocks file mutations | ✗ | $0.0008 | 1 |
+| 06 | glob enumerates typescript files | ✓ | $0.0009 | 2 |
+| 07 | bash runs read-only inspection in plan mode | ✓ | $0.0011 | 2 |
+
+Case 05 failed only the `output_contains: "Plan"` assertion. The
+security-critical `file_not_exists: should-not-exist.txt` PASSED
+— plan-mode block worked, no leak. The model produced a
+summary but didn't include the literal string "Plan" in its
+output, which is a fragile keyword. The plan-mode prompt's
+Goal/Steps/Risks structure is what we should assert against;
+"Plan" the word is a proxy that doesn't always match. M3 will
+rewrite case 05 against the spec's plan YAML schema once
+`generateConstrained` lands and the plan markdown stops being
+a free-form output.
+
+**Bugs surfaced and fixed during the baseline:**
+
+1. **Anthropic adapter dropped tool_result blocks with `name`.**
+   Our canonical `ProviderToolResultBlock` keeps `name` as
+   optional metadata for Gemini (which correlates results to
+   calls by name). Anthropic accepts only `tool_use_id`,
+   `content`, `is_error` and 400s with
+   `messages.N.content.0.tool_result.name: Extra inputs are
+   not permitted` if anything else leaks through. Every
+   multi-turn run that returned a tool_result was dying on the
+   second model call. The unit tests didn't catch it because
+   the mock provider doesn't validate the request body.
+   Fixed in `src/providers/anthropic/index.ts` —
+   `stripToolResultName` rewrites the block before sending.
+2. **Cost computation off by 1000x.** Registry pricing values
+   are dollars-per-million (Anthropic / OpenAI / Google all
+   publish in $/M); the field name `cost_per_1k_*` and the
+   divisor in `computeCost` were per-1k. Result: every cost
+   number was 1000x too high. Inflated costs masked
+   themselves in unit tests because tests use small token
+   counts and asserted against the inflated values. Surfaced
+   here because case 01 reported $0.45 for what was really
+   $0.00045. Fixed in `src/providers/cost.ts` (divisor →
+   1_000_000); test expectations updated. Field rename
+   (`_1k_*` → `_1m_*`) deferred to `docs/TODO.md` per spec-PR
+   discipline.
+
+**Decisions:**
+
+- **`output_contains` is the right primitive but case 05 used
+  the wrong keyword.** The full plan YAML schema (Goal/Scope/
+  Steps/Risks/Assumptions) lands when we have constrained
+  generation in M5; until then asserting against free-form
+  markdown is brittle. Leaving the failure visible documents
+  the gap.
+- **Don't game pass-rate by tweaking case 05.** 6/7 hits the
+  spec criterion; lowering the assertion to make 7/7 would
+  defeat the criterion's purpose. The case stays as-is and the
+  85.7% gets reported truthfully.
+- **Both bugs have a unit-test gap.** Mock providers in
+  `tests/providers/anthropic/` don't validate against the real
+  SDK shape, so the `name`-leak passed unit tests for months.
+  Cost test used the same wrong unit assumption as the
+  registry, so the 1000x error reinforced itself. Both are now
+  protected by the smoke run; consider adding a contract test
+  that POSTs a recorded-fixture request to a local mock that
+  replays the real Anthropic schema validation. Deferred —
+  smoke covers it for now.
+
+**M2 status: closed.** Exit criterion (§18) met. Step 1–6 all
+in. Next: M3 (subagents + worktree + MCP + resume + checkpoints
++ `/undo` + `bash_background` + `todo_write` + Repo Map).
+
+---
+
+## [2026-04-28] M2 / Step 6 — Eval smoke harness (closes M2)
+
+`AGENTIC_CLI §16` says "sem eval, nada disso importa." Step 6
+ships the smoke tier: 5–10 fixed cases, executor that wraps
+`runAgent` against a real model, asserts declarative
+expectations, aggregates pass-rate + p50 cost. The exit criterion
+for the autonomous profile (§18) is `pass-rate ≥ 85% smoke,
+p50 < $0.20/task`; the harness is what measures it.
+
+**Done:**
+- `src/evals/types.ts` — `EvalCase`, `EvalExpectation` (8 kinds:
+  `tool_called`, `tool_not_called`, `file_exists`,
+  `file_not_exists`, `file_contains`, `status`, `exit_reason`,
+  `output_contains`), `EvalCaseResult`, `EvalSummary`. The
+  expectation set covers M2's surface: tool tracking (telemetry),
+  fs effects (writes/edits), final state (status/exit_reason),
+  output (plan-mode markdown / report shape).
+- `src/evals/loader.ts` — YAML parser with the same
+  reject-unknown-keys discipline as the policy parser. Typo like
+  `expects` (plural) or `tests_pass` (unknown kind) errors out
+  loudly instead of silently dropping the assertion. Status and
+  exit_reason values validated against fixed unions.
+- `src/evals/executor.ts` — `executeCase`:
+  1. mkdtemp → copy `setup.fixture` → write `setup.files` →
+     drop a default `.agent/permissions.yaml` with
+     `defaults.mode: bypass` if neither layer supplied one (evals
+     run autonomously, no operator to confirm; plan-mode block
+     stays at the harness layer regardless).
+  2. `bootstrap` with disabled enterprise/user policy paths
+     (cwd-only project policy) and a per-case `AbortController`
+     chained to the parent signal + a 60s timer.
+  3. `runAgent` with `onEvent` hooked to record `tool_invoking`
+     names and accumulate `text_delta` into a single output
+     string. Cleanup of the cwd happens AFTER expectation
+     evaluation so `file_*` checks see the post-run filesystem.
+  4. `summarize` aggregates pass-rate, total cost, p50 cost.
+- `src/evals/cli.ts` — `bun run src/evals/cli.ts <dir|file>`.
+  Discovers `*.yaml` under a directory, runs cases sequentially,
+  emits NDJSON per case + final summary on stdout, human progress
+  on stderr (matches the spec §2.2 stdout-pure invariant).
+  Returns 0 on full pass, 1 on any fail. Flags: `--model` (smoke
+  defaults to whatever bootstrap default is), `--timeout-ms` per
+  case.
+- `package.json` — `eval:smoke` script wired to `evals/smoke`.
+- `evals/smoke/*.yaml` — 7 cases:
+  - `01-read-file` (read_file + output_contains the secret)
+  - `02-create-file` (write_file + file_contains)
+  - `03-edit-file` (edit_file on a fixture)
+  - `04-grep-search` (grep with multi-file fixture)
+  - `05-plan-mode-blocks-write` (plan + file_not_exists +
+    output_contains "Plan")
+  - `06-glob-search` (glob enumerates ts files)
+  - `07-bash-readonly` (plan mode + bash with `head -n 1`,
+    asserts plan-mode allows read-only bash via `planSafe`)
+- `evals/fixtures/` — three reusable fixture trees referenced by
+  the smoke cases.
+- `tests/evals/loader.test.ts` + `tests/evals/executor.test.ts`
+  — unit coverage with mock providers. 23 tests covering all
+  expectation kinds, schema rejection paths, fixture/inline-file
+  setup, plan-mode block behavior, and summary aggregation.
+
+**Decisions:**
+
+- **Real-model smoke is local-only for now, not CI.** Running
+  smoke on every PR means an `ANTHROPIC_API_KEY` secret + real
+  spend per PR and rate-limit pressure. The harness is ready for
+  CI; promoting it waits until we have a baseline pass-rate from
+  local runs and a budget envelope. Spec §16 calls for "roda em
+  CI" — the cost gate is a dial, not a refusal.
+- **Default policy is `bypass`, not `acceptEdits`.** Evals are
+  autonomous tests; no human is there to answer prompts. Strict
+  mode would dead-end every read_file/write_file/bash on the
+  default-deny path. `acceptEdits` still default-denies unmatched
+  paths — needs explicit allow rules per case. `bypass` is the
+  right semantic for a smoke run; cases that want stricter
+  policy drop their own `.agent/permissions.yaml` via setup.
+  Plan mode stays orthogonal — it's a harness-layer block,
+  unaffected by `bypass`.
+- **8 expectation kinds, not the spec's `tests_pass`/
+  `todo_used`.** `tests_pass` requires a test runner orchestrated
+  inside the eval cwd; `todo_used` requires the `todo_write` tool
+  (M3 per spec §18). Both deliberately deferred; the 8 we
+  implemented cover M2's surface end-to-end.
+- **Sequential execution, not parallel.** Each case opens its
+  own SQLite DB inside its tmpdir, so concurrency is technically
+  safe — but smoke is small (7 cases), parallel would make
+  per-case cost prints interleave on stderr, and rate-limit
+  pressure on a single API key is easier to reason about
+  serially. Promote to parallel when bench tier (~500 cases)
+  forces the issue.
+- **Cleanup order matters for file_* assertions.** First version
+  used a single `try { … } finally { rmSync(cwd) }` — and
+  every `file_exists` assertion failed because cleanup ran
+  before evaluation. Fixed by splitting: harness-cleanup
+  (close DB, clear timer) in the inner finally, expectation
+  evaluation immediately after, fs-cleanup last. Tests around
+  `setup.files`/`setup.fixture` lock the order in.
+- **Per-case YAML schema mirrors spec §16 with omissions
+  explicit.** We support `setup.fixture`, `setup.files`,
+  `prompt`, `expect`, `budget.maxSteps`, `budget.maxCostUsd`,
+  `plan`. Spec also lists `tests_pass` and `todo_used` — those
+  are valid YAML keys today (would parse) but will be rejected
+  as unknown-kinds because `EXPECTATION_KEYS` doesn't list them.
+  When M3 lands `todo_write` and a test-runner integration, add
+  the kinds + assertions.
+- **NDJSON on stdout, summary on stdout too.** The spec says
+  stdout is for machine output. The summary line is also
+  machine-consumable (`type: 'eval_summary'`); putting it on
+  stdout means a `bun run eval:smoke | jq` pipeline gets both
+  per-case and aggregate without parsing stderr. Human-readable
+  summary lives on stderr alongside per-case progress.
+
+**Pending (deferred to later milestones):**
+
+- **CI integration.** Spec §16 wants "regrediu? PR bloqueado" —
+  needs the smoke baseline + the secret + a CI workflow file.
+  Schedule: after the first successful local smoke baseline.
+- **Regression tier (~100 cases, < 10min).** Spec §16 says
+  "todo PR." Authoring 100 cases is substantial and pre-supposes
+  M3 features (todo_write, hooks). Land alongside M3.
+- **Bench tier (~500 cases, weekly).** Same concern + multi-
+  model comparison matrix per spec §16/PROVIDERS §7.
+- **Multi-model first-class.** Today the runner takes a single
+  `--model` flag. Multi-model eval is required for
+  "provider-pluggable, não provider-parity" — needs per-tier
+  threshold config, matrix output, and per-model registry
+  pricing. M3+ alongside the second provider's stabilization.
+- **Golden traces.** Spec calls for "comparação contra golden
+  traces versionados." Pure-output assertions (output_contains)
+  cover 80% of the value; full trace diffing waits until we
+  have a stable serialization (likely M3+).
+
+**Next (M2 closure):**
+
+- M2 goal — "Robustez" — is structurally complete. Step 1
+  (telemetry), Step 2 (compaction), Step 3 (sanitize), Step 4
+  (permission hierarchy), Step 5 (plan mode), Step 6 (eval
+  smoke) all in. M2 exit criterion (§18) — pass-rate ≥ 85% on
+  smoke, p50 < $0.20 — needs a local baseline run against Haiku
+  to verify; until then the harness is "ready, not yet
+  measured." That measurement is the actual M2 sign-off.
+- M3 starts after the baseline: subagents + worktree + MCP +
+  resume + checkpoints + `/undo` + `bash_background` +
+  `todo_write` + Repo Map.
+
+---
+
 ## [2026-04-28] M2 / Step 5 — Plan mode (`--plan`)
 
 `AGENTIC_CLI §5` calls plan mode "blocked at the harness level, not

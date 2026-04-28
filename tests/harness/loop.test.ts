@@ -367,13 +367,14 @@ describe('runAgent', () => {
       cache_read: 0,
       cache_creation: 50,
     });
-    // Turn 1: 100×3 + 20×15 + 50×3.75 = 300 + 300 + 187.5 = 787.5 → /1000 = 0.7875
-    // Turn 2: 200×3 + 40×15 = 600 + 600 = 1200 → /1000 = 1.2
-    // Total: 1.9875
-    expect(result.costUsd).toBeCloseTo(1.9875, 6);
+    // Rates are dollars-per-million tokens.
+    // Turn 1: 100×3 + 20×15 + 50×3.75 = 300 + 300 + 187.5 = 787.5 → /1e6 = 0.0007875
+    // Turn 2: 200×3 + 40×15 = 600 + 600 = 1200 → /1e6 = 0.0012
+    // Total: 0.0019875
+    expect(result.costUsd).toBeCloseTo(0.0019875, 9);
 
     const session = getSession(db, result.sessionId);
-    expect(session?.totalCostUsd).toBeCloseTo(1.9875, 6);
+    expect(session?.totalCostUsd).toBeCloseTo(0.0019875, 9);
   });
 
   test('persists per-message tokens and cost on assistant turns', async () => {
@@ -388,8 +389,8 @@ describe('runAgent', () => {
     const assistant = msgs.find((m) => m.role === 'assistant');
     expect(assistant?.tokensIn).toBe(50);
     expect(assistant?.tokensOut).toBe(10);
-    // 50×3 + 10×15 = 300 → /1000 = 0.3
-    expect(assistant?.costUsd).toBeCloseTo(0.3, 6);
+    // 50×3 + 10×15 = 300 → /1e6 = 0.0003
+    expect(assistant?.costUsd).toBeCloseTo(0.0003, 9);
   });
 
   test('usageComplete flips false when an output-producing turn lacked a usage event', async () => {
@@ -1122,21 +1123,21 @@ describe('runAgent', () => {
     const finished = events.find((e) => e.type === 'compaction_finished');
     if (finished?.type !== 'compaction_finished') throw new Error('expected event');
     expect(finished.strategy).toBe('llm');
-    // 300 × 1.0 + 50 × 2.0 = 400 → /1000 = 0.4
-    expect(finished.costUsd).toBeCloseTo(0.4, 6);
+    // Rates are $/1M. 300 × 1.0 + 50 × 2.0 = 400 → /1e6 = 0.0004
+    expect(finished.costUsd).toBeCloseTo(0.0004, 9);
     expect(finished.usage.input).toBe(300);
     expect(finished.usage.output).toBe(50);
 
     // Session totals must include compaction + every agent turn
-    // that reported usage. Pricing: input=1.0/1k, output=2.0/1k.
-    // turn 1 (echo): 50+5×2 = 60 → 0.060
-    // turn 2 (fat):  50+5×2 = 60 → 0.060
-    // compaction:    300+50×2 = 400 → 0.400
-    // post-comp:     100+5×2  = 110 → 0.110
-    // total: 0.630
+    // that reported usage. Pricing: input=$1/M, output=$2/M.
+    // turn 1 (echo): 50+5×2 = 60 → 0.000060
+    // turn 2 (fat):  50+5×2 = 60 → 0.000060
+    // compaction:    300+50×2 = 400 → 0.000400
+    // post-comp:     100+5×2  = 110 → 0.000110
+    // total: 0.000630
     expect(result.usage.input).toBe(50 * 2 + 300 + 100);
     expect(result.usage.output).toBe(5 * 2 + 50 + 5);
-    expect(result.costUsd).toBeCloseTo(0.63, 6);
+    expect(result.costUsd).toBeCloseTo(0.00063, 9);
   });
 
   test('compaction without usage telemetry downgrades usageComplete', async () => {
@@ -1352,10 +1353,10 @@ describe('runAgent', () => {
       userPrompt: 'hi',
     });
     expect(result.reason).toBe('providerError');
-    // 200 × 1 + 30 × 2 = 260 → 0.260
+    // Rates are $/1M. 200 × 1 + 30 × 2 = 260 → /1e6 = 0.00026
     expect(result.usage.input).toBe(200);
     expect(result.usage.output).toBe(30);
-    expect(result.costUsd).toBeCloseTo(0.26, 6);
+    expect(result.costUsd).toBeCloseTo(0.00026, 9);
     // Still incomplete because the turn errored.
     expect(result.usageComplete).toBe(false);
   });

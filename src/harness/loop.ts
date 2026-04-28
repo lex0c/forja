@@ -205,6 +205,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         max_tokens: budget.maxOutputTokensPerCall,
         ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
         ...(tools.length > 0 ? { tools } : {}),
+        ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
       };
 
       let collected: Awaited<ReturnType<typeof collectStep>>;

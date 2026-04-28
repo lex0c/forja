@@ -22,11 +22,12 @@ describe('computeCost', () => {
     expect(computeCost(baseCaps(), emptyUsage())).toBe(0);
   });
 
-  test('charges input/output at the declared per-1k rate', () => {
-    // 1000 input × $3/1k = $3.00; 100 output × $15/1k = $1.50; total $4.50
+  test('charges input/output at the declared per-million rate', () => {
+    // Registry values are dollars-per-million (industry convention).
+    // 1M input × $3/M = $3.00; 100k output × $15/M = $1.50; total $4.50.
     const cost = computeCost(baseCaps(), {
-      input: 1000,
-      output: 100,
+      input: 1_000_000,
+      output: 100_000,
       cache_read: 0,
       cache_creation: 0,
     });
@@ -34,11 +35,11 @@ describe('computeCost', () => {
   });
 
   test('uses cached_input rate for cache_read tokens when declared', () => {
-    // 1000 cache_read × $0.30/1k = $0.30 (vs $3.00 at full rate)
+    // 1M cache_read × $0.30/M = $0.30 (vs $3.00 at full rate).
     const cost = computeCost(baseCaps(), {
       input: 0,
       output: 0,
-      cache_read: 1000,
+      cache_read: 1_000_000,
       cache_creation: 0,
     });
     expect(cost).toBeCloseTo(0.3, 6);
@@ -53,7 +54,7 @@ describe('computeCost', () => {
     const cost = computeCost(rest as ProviderCapabilities, {
       input: 0,
       output: 0,
-      cache_read: 1000,
+      cache_read: 1_000_000,
       cache_creation: 0,
     });
     expect(cost).toBeCloseTo(3.0, 6);
@@ -65,7 +66,7 @@ describe('computeCost', () => {
       input: 0,
       output: 0,
       cache_read: 0,
-      cache_creation: 1000,
+      cache_creation: 1_000_000,
     });
     expect(cost).toBeCloseTo(3.75, 6);
   });
@@ -78,7 +79,7 @@ describe('computeCost', () => {
       input: 0,
       output: 0,
       cache_read: 0,
-      cache_creation: 1000,
+      cache_creation: 1_000_000,
     });
     expect(cost).toBeCloseTo(3.0, 6);
   });
@@ -86,10 +87,10 @@ describe('computeCost', () => {
   test('composes all four token classes', () => {
     const caps = baseCaps({ cost_per_1k_cache_write: 3.75 });
     const cost = computeCost(caps, {
-      input: 1000,
-      output: 200,
-      cache_read: 1000,
-      cache_creation: 1000,
+      input: 1_000_000,
+      output: 200_000,
+      cache_read: 1_000_000,
+      cache_creation: 1_000_000,
     });
     // 3 + 3 + 0.30 + 3.75 = $10.05
     expect(cost).toBeCloseTo(10.05, 6);

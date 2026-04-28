@@ -1,0 +1,14 @@
+name: grep search and report matches
+prompt: |
+  Search the working directory for files containing the literal string "TODO".
+  List the matching file names. Use a search tool, not by reading every file.
+setup:
+  fixture: ../fixtures/code-with-todos
+expect:
+  - tool_called: grep
+  - output_contains: a.ts
+  - output_contains: c.ts
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

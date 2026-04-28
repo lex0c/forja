@@ -1,0 +1,13 @@
+name: read file and report contents
+prompt: |
+  Read the file at src/secret.txt and tell me the exact token it contains.
+  Reply with just the token, nothing else.
+setup:
+  fixture: ../fixtures/src-with-secret
+expect:
+  - tool_called: read_file
+  - output_contains: TOKEN_FORJA_42
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

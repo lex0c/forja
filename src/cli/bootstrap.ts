@@ -22,6 +22,9 @@ export interface BootstrapInput {
   // plan-mode prompt is prepended (plan-mode is the operating
   // profile; user content is layered as extra context).
   systemPrompt?: string;
+  // Sampling temperature plumbed straight to HarnessConfig.
+  // Evals set this to 0 for deterministic runs.
+  temperature?: number;
   // Test seam: when set, skip the registry lookup and use this provider.
   providerOverride?: Provider;
   // Test seam: override the DB path (default: defaultDbPath()).
@@ -127,6 +130,7 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.plan === true ? { planMode: true } : {}),
     ...(resolvedSystemPrompt !== undefined ? { systemPrompt: resolvedSystemPrompt } : {}),
+    ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
   };
 
   return { config, db, modelId, policyLayers, lockConflicts: resolved.lockConflicts };

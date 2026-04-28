@@ -1,0 +1,15 @@
+name: glob enumerates typescript files
+prompt: |
+  List all TypeScript source files in the src/ directory using a glob pattern.
+  Reply with the filenames separated by newlines.
+setup:
+  fixture: ../fixtures/code-with-todos
+expect:
+  - tool_called: glob
+  - output_contains: a.ts
+  - output_contains: b.ts
+  - output_contains: c.ts
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

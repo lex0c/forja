@@ -1,0 +1,16 @@
+name: bash runs read-only inspection in plan mode
+plan: true
+prompt: |
+  Use the bash tool to print the first line of greeting.txt with the `head -n 1`
+  command, then report what you saw.
+setup:
+  fixture: ../fixtures/greeting
+expect:
+  - tool_called: bash
+  - tool_not_called: write_file
+  - tool_not_called: edit_file
+  - output_contains: hello world
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

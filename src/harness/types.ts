@@ -119,6 +119,13 @@ export interface HarnessConfig {
   // not policy-level, so a plan run is read-only regardless of
   // permission hierarchy state.
   planMode?: boolean;
+  // Sampling temperature passed straight through to every
+  // provider call this run makes. When unset, each provider
+  // applies its own default (Anthropic 1.0, OpenAI 1.0, etc).
+  // Setting `0` makes runs deterministic — required for evals
+  // and any workflow that needs repeatable output. Tunable per
+  // workflow per `TOKEN_TUNING.md`.
+  temperature?: number;
 }
 
 export interface HarnessResult {
