@@ -1,5 +1,6 @@
 import type { Decision, PermissionEngine, ToolArgs } from '../permissions/index.ts';
 import type { ProviderToolResultBlock } from '../providers/index.ts';
+import { sanitizeToolOutput, stripAnsi } from '../sanitize/index.ts';
 import {
   type DB,
   createToolCall,
@@ -58,11 +59,18 @@ const buildErrorBlock = (
 
 const errorMessage = (e: unknown): string => {
   if (e instanceof Error) {
-    // Empty `message` is a real case (`new Error()`); fall through to name
-    // and finally toString so we never report `tool crashed: ` with no body.
-    return e.message || e.name || String(e);
+    // Strip ANSI from each candidate before the fallback. A throw with
+    // an ANSI-only message (e.g., `new Error('\x1b[31m\x1b[0m')`) sanitizes
+    // down to an empty string; without this pre-strip the original
+    // non-empty literal would short-circuit `||` and the user/model
+    // would later see "tool crashed: " with no class.
+    const msg = stripAnsi(e.message);
+    if (msg.length > 0) return msg;
+    const name = stripAnsi(e.name);
+    if (name.length > 0) return name;
+    return stripAnsi(String(e));
   }
-  return String(e);
+  return stripAnsi(String(e));
 };
 
 const wrapException = (e: unknown): ToolError => ({
@@ -194,14 +202,22 @@ export const invokeTool = async (
 
   const toolCall = setup.toolCall;
 
-  let result: unknown;
+  let rawResult: unknown;
   let crashed = false;
   try {
-    result = await tool.execute(input.args, deps.ctx);
+    rawResult = await tool.execute(input.args, deps.ctx);
   } catch (e) {
-    result = wrapException(e);
+    rawResult = wrapException(e);
     crashed = true;
   }
+
+  // Sanitize once, share across the audit row and the tool_result block.
+  // Stripping ANSI before either sink means a malicious tool can't slip
+  // terminal-control sequences into the model's context (token waste,
+  // injection vector) or into the DB row (later replay/recap could
+  // echo them back to a user's terminal). SECURITY_GUIDELINE §5
+  // invariant 4 requires this layer between tool exec and context.
+  const result = sanitizeToolOutput(rawResult);
 
   const duration = Date.now() - start;
 

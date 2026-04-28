@@ -15,6 +15,107 @@ Format:
 
 ---
 
+## [2026-04-28] M2 / Step 2 — Output sanitization (ANSI strip)
+
+`SECURITY_GUIDELINE.md §3.2` (line 161) and §5 invariant 4 require a
+sanitization layer between tool execution and the model context. M1
+left the gap explicit; Step 2 closes it.
+
+**Threat covered:**
+- A tool returning `\x1b[2K\x1b[1AOK: file empty` lets a malicious
+  file lie about what happened when its output is later echoed in a
+  terminal (verbose mode, audit replay, recap renderer).
+- Tools embedding OSC sequences (`\x1b]0;title\x07`) can hijack the
+  terminal title or, with OSC 8, inject deceptive hyperlinks.
+- Token waste: ANSI bytes in the model's context inflate input cost
+  with bytes the model can't render.
+- Prompt-injection vector: text hidden inside escape blocks.
+
+**Done:**
+- `src/sanitize/ansi.ts` — `stripAnsi(s)` removes CSI (`\x1b[...`),
+  OSC with both BEL and ST terminators, DCS/APC/PM/SOS, 7-bit
+  single-char escapes (range 0x40-0x7E covering Type Fe + Fs + RIS),
+  and 8-bit C1 controls (0x80-0x9F). Alternation order matches
+  structured patterns first, so a malformed `\x1b[123;` falls
+  through to the single-char rule (eats just `\x1b[`, leaves `123;`
+  as text — leaving live ESC bytes is the security risk).
+- `src/sanitize/ansi.ts` — `sanitizeToolOutput(value)` recursively
+  walks objects and arrays, stripping ANSI from every string leaf
+  while preserving shape, primitives, and discriminator booleans
+  (`is_error: true` on `ToolError` survives intact). Cycle detection
+  via `WeakSet` replaces revisited references with `<cycle>`; tool
+  outputs shouldn't contain cycles, but a buggy input must not
+  stack-overflow.
+- `src/harness/invoke-tool.ts` — sanitizes the tool result once,
+  before both sinks: the audit row (`finishToolCall(... output ...)`)
+  and the model-facing `tool_result` block. ToolError messages also
+  pass through (a subprocess crashing with colored stderr won't
+  smuggle escape bytes into either path).
+
+**New tests (+18 over Step 1):**
+- `tests/sanitize/ansi.test.ts` — 12 cases: SGR colors, cursor/erase
+  (the canonical "rewrite history" pattern), OSC with both
+  terminator styles, DCS/APC, single-char escapes, C1 bytes,
+  preservation of plain text and whitespace, malformed CSI handling,
+  consecutive sequences. Plus 9 `sanitizeToolOutput` cases: nested
+  walk, non-string preservation, cyclic objects, cyclic arrays,
+  ToolError discriminator, no-mutation guarantee.
+- `tests/harness/invoke-tool.test.ts` — 2 new: ANSI stripped from
+  both `tool_result.content` and persisted `tool_calls.output`;
+  ANSI in `ToolError.error_message` also stripped. Hard guarantee:
+  `JSON.stringify(tc?.output)` contains no `\x1b` byte.
+- Total suite: **444 pass / 7 skip / 959 expect() calls** in ~1.4s.
+
+**Decisions:**
+- **Sanitize at the harness, not the tool layer.** Universal policy
+  beats per-tool opt-in: no future tool can forget to strip. The
+  sanitizer runs once and feeds both the audit row and the
+  `tool_result` block, so neither path can drift.
+- **Strip everything, don't preserve SGR.** The spec language
+  ("preservar SGR seguro") targets terminal renderers. For tool
+  output flowing to the MODEL there's no terminal — colors are
+  noise. A future verbose/interactive renderer that wants to display
+  tool output to the user can re-decide at its own layer with its
+  own safe-SGR allowlist (renderer side, against text we already
+  scrubbed at intake).
+- **Recursive walker, not flat string strip.** Tools return
+  structured objects (`{stdout, stderr, exit_code}`). Walking
+  preserves shape so the model gets `{stdout: "error: real", ...}`
+  instead of a re-stringified blob.
+- **Cycle marker is `<cycle>`** rather than throwing or silently
+  dropping the branch. Tool contract is JSON-shaped (no cycles in
+  practice), but a buggy input mustn't stack-overflow; the marker
+  keeps the path navigable.
+- **Malformed CSI strips just `\x1b[`** instead of leaving the ESC
+  byte. The conservative direction is "remove control bytes
+  aggressively, leave printable text alone" — orphan params (`123;`)
+  in output are harmless noise; live ESC bytes are the security risk.
+- **No `--include-tool-output` raw escape hatch yet.** Spec §1.4
+  mentions one for future verbose mode. Deferred until M2 has a
+  verbose-output path that needs it; the audit row will hold raw
+  bytes only when explicitly opted in (and re-stripped before
+  re-display).
+- **`stripAnsi` keeps `\t \n \r`.** Whitespace bytes are part of
+  legitimate text content; only escape sequences are control bytes
+  for sanitization purposes.
+
+**Out of scope:**
+- Renderer-side SGR allowlist for verbose mode (M2 later step or M3)
+- Secret redaction (`SECURITY_GUIDELINE.md §6` — separate layer)
+- Injection heuristic with `injection_suspect: true` flag
+  (`SECURITY_GUIDELINE.md §9.1.5` — bound to `fetch_url` policy work)
+- Real-shell ANSI fixture corpus from `evals/` (deferred to evals
+  smoke step)
+
+**Pending:** none for this step.
+
+**Next:** M2 / Step 3 — Compaction. Sliding-window history +
+Haiku-driven summarization when context approaches the model's cap.
+The Step 1 telemetry tells the harness when to trigger; this step
+spends those numbers.
+
+---
+
 ## [2026-04-28] M2 / Step 1 — Telemetry: usage tokens + cost tracking
 
 Opens M2 ("Robustez"). Pre-requisite for compaction (need to know when to
