@@ -3,6 +3,8 @@ import type { ExitReason, HarnessResult } from '../harness/index.ts';
 // One declarative expectation evaluated against a finished run.
 // Each shape carries exactly the data needed for its assertion;
 // the executor switches on the `kind` discriminant.
+export type CompactionStrategy = 'llm' | 'fallback' | 'skipped';
+
 export type EvalExpectation =
   | { kind: 'tool_called'; tool: string }
   | { kind: 'tool_not_called'; tool: string }
@@ -11,7 +13,16 @@ export type EvalExpectation =
   | { kind: 'file_contains'; path: string; pattern: string }
   | { kind: 'status'; status: HarnessResult['status'] }
   | { kind: 'exit_reason'; reason: ExitReason }
-  | { kind: 'output_contains'; pattern: string };
+  | { kind: 'output_contains'; pattern: string }
+  // Compaction observability: assert that at least `minCount`
+  // `compaction_finished` events fired during the run, optionally
+  // restricted to a specific `strategy` ('llm' / 'fallback' /
+  // 'skipped'). Without `strategy`, every emission counts.
+  // Critical to observe explicitly because the harness emits a
+  // `compaction_finished` event with `strategy: 'fallback'` when
+  // the LLM call fails — silently masking adapter bugs unless
+  // we assert against the strategy directly.
+  | { kind: 'compaction_triggered'; minCount: number; strategy?: CompactionStrategy };
 
 // Optional setup applied before the run: copy a fixture directory
 // into the eval's temp cwd, then overwrite/create files declared
@@ -29,6 +40,16 @@ export interface EvalSetup {
 export interface EvalBudget {
   maxSteps?: number;
   maxCostUsd?: number;
+  // Override the harness compaction trigger ratio for this case.
+  // Useful for forcing compaction with small fixtures: setting
+  // 0.01 means a ~2k-token prompt against a 200k-window provider
+  // will trip compaction, instead of needing the default 70%
+  // (~140k tokens).
+  compactionThreshold?: number;
+  // Override how many trailing turns compaction preserves
+  // literally. Lower values let compaction fire more
+  // aggressively in narrow tests.
+  compactionPreserveTail?: number;
 }
 
 export interface EvalCase {

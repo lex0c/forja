@@ -30,12 +30,20 @@ interface CliArgs {
   target: string;
   modelId?: string;
   perCaseTimeoutMs?: number;
+  // Number of rounds — each round runs every case once. When >1,
+  // the runner reports per-case variance (pass count, cost range)
+  // alongside aggregate stats. Used to validate stability of the
+  // smoke baseline before declaring it "trusted." Round-major
+  // ordering means later rounds may benefit from prompt-cache
+  // hits; that's intentional — it shows real-world cost behavior.
+  repeat: number;
 }
 
 const parseArgs = (argv: readonly string[]): CliArgs => {
   let target = 'evals/smoke';
   let modelId: string | undefined;
   let perCaseTimeoutMs: number | undefined;
+  let repeat = 1;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--model') {
@@ -50,26 +58,60 @@ const parseArgs = (argv: readonly string[]): CliArgs => {
       perCaseTimeoutMs = v;
       continue;
     }
+    if (a === '--repeat') {
+      const v = Number(argv[++i]);
+      if (!Number.isInteger(v) || v < 1) {
+        throw new Error('--repeat must be a positive integer');
+      }
+      repeat = v;
+      continue;
+    }
     if (a !== undefined && !a.startsWith('-')) {
       target = a;
       continue;
     }
     throw new Error(`unknown argument: ${a}`);
   }
-  const result: CliArgs = { target };
+  const result: CliArgs = { target, repeat };
   if (modelId !== undefined) result.modelId = modelId;
   if (perCaseTimeoutMs !== undefined) result.perCaseTimeoutMs = perCaseTimeoutMs;
   return result;
 };
 
+interface CaseAggregate {
+  name: string;
+  sourcePath: string;
+  runs: EvalCaseResult[];
+}
+
+const aggregateLine = (agg: CaseAggregate): Record<string, unknown> => {
+  const passCount = agg.runs.filter((r) => r.passed).length;
+  const costs = agg.runs.map((r) => r.costUsd);
+  const durations = agg.runs.map((r) => r.durationMs);
+  return {
+    type: 'eval_case_aggregate',
+    name: agg.name,
+    sourcePath: agg.sourcePath,
+    runs: agg.runs.length,
+    passCount,
+    failCount: agg.runs.length - passCount,
+    costMin: Math.min(...costs),
+    costMax: Math.max(...costs),
+    costAvg: costs.reduce((a, b) => a + b, 0) / costs.length,
+    durationMinMs: Math.min(...durations),
+    durationMaxMs: Math.max(...durations),
+  };
+};
+
 // Each case emits one NDJSON line on stdout (machine-readable);
 // human progress + summary go to stderr. Mirrors the CLI's
-// stdout-is-pure invariant.
-const emitCaseLine = (result: EvalCaseResult): void => {
+// stdout-is-pure invariant. The optional `run` field tags lines
+// emitted under --repeat so consumers can re-aggregate.
+const emitCaseLine = (result: EvalCaseResult, run?: { index: number; total: number }): void => {
   const failedExpectations = result.expectations
     .filter((e) => !e.passed)
     .map((e) => ({ expectation: e.expectation, detail: e.detail ?? '' }));
-  const line = {
+  const line: Record<string, unknown> = {
     type: 'eval_case',
     name: result.name,
     sourcePath: result.sourcePath,
@@ -83,7 +125,15 @@ const emitCaseLine = (result: EvalCaseResult): void => {
     failure: result.failure,
     failedExpectations,
   };
+  if (run !== undefined) {
+    line.run = run.index;
+    line.totalRuns = run.total;
+  }
   process.stdout.write(`${JSON.stringify(line)}\n`);
+};
+
+const emitAggregateLine = (agg: CaseAggregate): void => {
+  process.stdout.write(`${JSON.stringify(aggregateLine(agg))}\n`);
 };
 
 const emitSummaryLine = (summary: EvalSummary): void => {
@@ -91,8 +141,14 @@ const emitSummaryLine = (summary: EvalSummary): void => {
   process.stdout.write(`${JSON.stringify(line)}\n`);
 };
 
-const writeProgress = (caseDef: EvalCase, idx: number, total: number): void => {
-  process.stderr.write(`[${idx + 1}/${total}] ${caseDef.name} ... `);
+const writeProgress = (
+  caseDef: EvalCase,
+  idx: number,
+  total: number,
+  run?: { index: number; total: number },
+): void => {
+  const tag = run === undefined ? '' : ` (run ${run.index}/${run.total})`;
+  process.stderr.write(`[${idx + 1}/${total}]${tag} ${caseDef.name} ... `);
 };
 
 const writeOutcome = (result: EvalCaseResult): void => {
@@ -108,6 +164,21 @@ const writeOutcome = (result: EvalCaseResult): void => {
         process.stderr.write(`  - ${e.detail}\n`);
       }
     }
+  }
+};
+
+const writeVariance = (aggregates: readonly CaseAggregate[]): void => {
+  process.stderr.write('\nper-case stability:\n');
+  for (const agg of aggregates) {
+    const passes = agg.runs.filter((r) => r.passed).length;
+    const total = agg.runs.length;
+    const costs = agg.runs.map((r) => r.costUsd);
+    const min = Math.min(...costs);
+    const max = Math.max(...costs);
+    const flag = passes === total ? ' ' : '!';
+    process.stderr.write(
+      `  ${flag} ${passes}/${total}  $${min.toFixed(4)}–$${max.toFixed(4)}  ${agg.name}\n`,
+    );
   }
 };
 
@@ -155,20 +226,43 @@ export const main = async (argv: readonly string[]): Promise<number> => {
     opts.bootstrapOverride = { modelId: parsed.modelId };
   }
 
-  const results: EvalCaseResult[] = [];
-  for (let i = 0; i < cases.length; i++) {
-    const c = cases[i];
-    if (c === undefined) continue;
-    writeProgress(c, i, cases.length);
-    const r = await executeCase(c, opts);
-    writeOutcome(r);
-    emitCaseLine(r);
-    results.push(r);
+  // Round-major ordering: every case runs once per round. Lets
+  // later rounds benefit from prompt-cache hits the way real
+  // production traffic would; case-major would understate cost
+  // by serving back-to-back identical prompts to a cold cache.
+  const aggregates = new Map<string, CaseAggregate>();
+  const allResults: EvalCaseResult[] = [];
+
+  for (let round = 1; round <= parsed.repeat; round++) {
+    for (let i = 0; i < cases.length; i++) {
+      const c = cases[i];
+      if (c === undefined) continue;
+      const runMeta = parsed.repeat > 1 ? { index: round, total: parsed.repeat } : undefined;
+      writeProgress(c, i, cases.length, runMeta);
+      const r = await executeCase(c, opts);
+      writeOutcome(r);
+      emitCaseLine(r, runMeta);
+      allResults.push(r);
+      const agg = aggregates.get(c.sourcePath) ?? {
+        name: c.name,
+        sourcePath: c.sourcePath,
+        runs: [],
+      };
+      agg.runs.push(r);
+      aggregates.set(c.sourcePath, agg);
+    }
   }
 
-  const summary = summarize(results);
+  const aggList = [...aggregates.values()];
+  if (parsed.repeat > 1) {
+    for (const agg of aggList) emitAggregateLine(agg);
+  }
+
+  const summary = summarize(allResults);
   emitSummaryLine(summary);
   writeSummary(summary);
+
+  if (parsed.repeat > 1) writeVariance(aggList);
 
   // Exit code mirrors the test convention: 0 = all pass, 1 = any
   // case failed. Spec §16 calls for hard regression gating and

@@ -7,7 +7,7 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "ignore": ["dist", "node_modules", ".agent", ".claude", "docs/spec"]
+    "ignore": ["dist", "node_modules", ".agent", ".claude", "docs/spec", "evals/fixtures"]
   },
   "formatter": {
     "enabled": true,

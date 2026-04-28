@@ -1,0 +1,19 @@
+name: compaction triggers and folds history
+prompt: |
+  Read each TypeScript file under src/ in alphabetical order
+  (a.ts, b.ts, c.ts, d.ts, e.ts) and then tell me what dependency
+  every single file imports from. Quote the dependency name verbatim.
+setup:
+  fixture: ../fixtures/chunky-modules
+expect:
+  - tool_called: read_file
+  - compaction_triggered:
+      strategy: llm
+      min_count: 1
+  - status: done
+  - output_contains: forja-core
+budget:
+  maxSteps: 10
+  maxCostUsd: 0.10
+  compactionThreshold: 0.02
+  compactionPreserveTail: 1

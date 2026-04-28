@@ -15,6 +15,262 @@ Format:
 
 ---
 
+## [2026-04-28] M2 / Step 6.2 — Variance baseline (smoke ×3)
+
+After Step 6.1 closed the compaction gap, the remaining
+hardening question was: **is the baseline stable, or did we
+just get lucky in run #1?** Step 6.2 turns "ran once, all
+green" into "ran 3 times, all green with ≤ 3% cost spread."
+That converts the smoke from "first runnable" to "trusted
+baseline."
+
+**Done:**
+
+- `--repeat N` flag on `bun run eval:smoke`. Round-major
+  ordering (every case once per round, repeat). Choosing
+  round-major over case-major intentionally: matches how real
+  CI traffic would arrive, lets prompt-cache hits manifest
+  the way they would in production. Case-major would understate
+  cost by serving back-to-back identical prompts to a cold
+  cache.
+- Per-case aggregation in the runner: `eval_case_aggregate`
+  NDJSON line per case (passCount, failCount, costMin, costMax,
+  costAvg, duration range). `eval_case` lines now carry `run`
+  and `totalRuns` fields when `--repeat > 1` so consumers can
+  re-aggregate however they want.
+- Stderr summary grew a "per-case stability" block listing
+  N/M passes and cost range per case, with a `!` flag on any
+  case that didn't pass every round. Mirrors what a CI
+  dashboard would show after a regression run.
+
+**Real-model 3× baseline (Haiku 4.5):**
+
+```
+24/24 passed (100.0%) — total $0.1515, 88348ms
+p50 cost: $0.0050
+
+per-case stability:
+    3/3  $0.0034–$0.0034  read file and report contents
+    3/3  $0.0036–$0.0036  create file with specified content
+    3/3  $0.0059–$0.0059  edit existing file in place
+    3/3  $0.0060–$0.0060  grep search and report matches
+    3/3  $0.0066–$0.0068  plan mode blocks file mutations
+    3/3  $0.0035–$0.0035  glob enumerates typescript files
+    3/3  $0.0041–$0.0041  bash runs read-only inspection in plan mode
+    3/3  $0.0173–$0.0174  compaction triggers and folds history
+```
+
+24/24 = perfect stability. Six of eight cases produced
+**identical cost to the cent** across all three rounds —
+output is fully deterministic at `temperature: 0` and token
+counts reproduce exactly. The two cases with non-zero spread
+(plan mode at ~3%, compaction at <1%) are the runs with the
+longest/most-variable assistant text; the variance is at the
+cache_creation tier, not the output tier. Cost stayed inside
+case budgets every run.
+
+**Decisions:**
+
+- **Round-major, not case-major.** Production traffic isn't
+  back-to-back identical prompts; spreading rounds out
+  exercises cache eviction and warm-cache hit/miss patterns
+  closer to real conditions. The pricing implication is real:
+  case-major against Anthropic's 5-min cache would inflate
+  apparent stability while understating cost.
+- **Strict pass: every round must pass.** Considered "majority
+  rules" (case passes if 2/3 rounds pass). Rejected: a single
+  failure in a determinism-asserted suite is signal, not
+  noise. With temperature 0, a flake means a real bug
+  somewhere — adapter, cache, harness state leak. Hiding
+  flakes behind a tolerance defeats the purpose of running
+  3×.
+- **Skipped negative-path eval cases** (`strategy: fallback`,
+  `exit_reason: aborted`). Both paths already have substantial
+  unit coverage: `tests/harness/compaction.test.ts` has 11
+  fallback assertions (network failure, schema fail, abort
+  during summary call); `tests/harness/loop.test.ts` covers
+  signal-aborted, abort-during-stream, and the
+  wall-clock-vs-aborted distinction. Adding eval-level cases
+  would be redundant and would require either a deliberately
+  broken model id (operationally awkward) or per-case
+  timeout-trigger logic (false-positive prone).
+- **No CI gate yet, despite the runner being CI-ready.**
+  CI promotion needs a secret, a per-PR cost decision, and a
+  golden baseline to gate against. Worth doing in M3 alongside
+  multi-provider smoke; doing it now would block merges before
+  the baseline has settled past Step 6.
+
+**What this validates beyond Step 6.1:**
+
+- `temperature: 0` actually flows end-to-end through
+  `BootstrapInput.temperature` → `HarnessConfig.temperature`
+  → `GenerateRequest.temperature` and into the Anthropic API.
+  If any leg dropped the field, output would have varied
+  across rounds.
+- The compaction LLM call is itself deterministic at
+  temperature 0 (otherwise case 08 would show meaningful
+  cost variance, not <1%).
+- Multi-tool-use turns (Haiku does parallel tool_use)
+  reproduce identically across rounds. Tool ordering, args,
+  and result handling are stable — no race conditions in
+  the tool dispatch layer.
+- Prompt-cache misses are consistent. We don't currently
+  emit `cache_control` on messages, so every round pays full
+  input cost; the consistency of that cost confirms message
+  shape is byte-identical round-to-round.
+
+**Risks not addressed:**
+
+- Single-day baseline. Could re-run weekly to detect provider
+  drift (model serving the same id but with subtle behavior
+  changes is a real Anthropic operational pattern). Schedule
+  this once CI gating exists.
+- Single API key. Different keys could hit different load
+  shedders and produce different latency/cost; cost shouldn't
+  vary materially, latency might.
+- Single host (Linux). Fixture I/O is sync and small enough
+  that the FS shouldn't matter, but never been validated on
+  macOS or Windows.
+
+**M2 status: closed with confidence.** Step 6 closed the
+"runs at all" question; Step 6.1 closed the "compaction
+works" question; Step 6.2 closed the "is it actually stable"
+question. Further smoke surface (multi-provider, regression
+tier) lives in M3+.
+
+**Next:** M3 (subagents + worktree + MCP + resume + checkpoints
++ /undo + bash_background + todo_write + Repo Map). The smoke
+suite is now genuinely the gate it claimed to be.
+
+---
+
+## [2026-04-28] M2 / Step 6.1 — Compaction smoke coverage
+
+Step 6 baseline closed M2 but flagged compaction as a blind spot:
+unit-tested in isolation, never exercised end-to-end against a
+real model. The post-baseline review explicitly called this out
+("compaction has unit coverage but no real-model exercise").
+Step 6.1 closes that gap before M3 starts.
+
+**Done:**
+
+- `EvalBudget` now exposes `compactionThreshold` and
+  `compactionPreserveTail`. Loader validates both
+  (`compactionThreshold` ∈ (0, 1]; `compactionPreserveTail` ≥ 0
+  integer). Cases can drop the trigger ratio so compaction fires
+  with small fixtures instead of needing 140k-token prompts.
+- New `compaction_triggered` expectation kind. Schema:
+  `compaction_triggered: { min_count: N, strategy?: 'llm' |
+  'fallback' | 'skipped' }`. Executor watches
+  `compaction_finished` events on the harness onEvent stream
+  and counts emissions per strategy. Asserting `strategy: llm`
+  means the compaction LLM call actually round-tripped — without
+  that distinction, a silent fallback would mask an adapter
+  break.
+- Executor plumbs the full `EvalBudget` into `BootstrapInput.budget`
+  (previously only `maxSteps` got through). All four knobs flow
+  cleanly to `HarnessConfig.budget` via the existing partial
+  override path.
+- `evals/fixtures/chunky-modules/src/{a,b,c,d,e}.ts` — five
+  ~700–850 token TypeScript modules, each importing from
+  `forja-core/*`. Realistic-looking source so the model treats
+  them as plausible code rather than lorem ipsum.
+- `evals/smoke/08-compaction-triggers.yaml` — 5-step read tour
+  with `compactionThreshold: 0.02`. Asserts `tool_called: read_file`,
+  `compaction_triggered: { strategy: llm, min_count: 1 }`,
+  `status: done`, `output_contains: forja-core`.
+- `biome.json` — added `evals/fixtures` to ignore list.
+  Fixtures are mock source code intentionally loose; lint rules
+  shouldn't apply.
+- Loader unit tests: 7 new tests covering compaction budget
+  validation (range checks for `compactionThreshold`,
+  non-negative integer for `compactionPreserveTail`) and
+  `compaction_triggered` parsing (with/without strategy,
+  `min_count` validation, strategy enum validation).
+
+**Real-model baseline (Haiku 4.5):**
+
+| # | Case | Pass | Cost | Steps |
+|---|---|---|---|---|
+| 01 | read file | ✓ | $0.0035 | 2 |
+| 02 | create file | ✓ | $0.0036 | 2 |
+| 03 | edit file | ✓ | $0.0059 | 3 |
+| 04 | grep search | ✓ | $0.0059 | 3 |
+| 05 | plan mode blocks write | ✓ | $0.0066 | 2 |
+| 06 | glob enumerate | ✓ | $0.0035 | 2 |
+| 07 | bash readonly in plan | ✓ | $0.0041 | 2 |
+| 08 | **compaction triggers** | ✓ | $0.0174 | 3 |
+
+8/8 passed = 100%, total $0.0505, p50 $0.0050, 30s wall clock.
+Compaction fired with `strategy: llm` (LLM call to summarize
+folded turns succeeded) — first observation of this path
+end-to-end. The compaction case is the most expensive
+(~$0.017) because it pays for the summary call on top of the
+agent turns; still ~12× under the §18 per-case budget.
+
+**Decisions:**
+
+- **Assert `strategy: llm` explicitly, not just `min_count`.**
+  The harness emits `compaction_finished` regardless of which
+  branch ran. A silent fallback (LLM call broken, deterministic
+  head/tail kicks in) would still satisfy `min_count: 1`. The
+  whole reason this case exists is to prove the LLM-summary
+  path round-trips. Asserting strategy makes the case fail
+  loudly if the adapter regresses again.
+- **Threshold 0.02 (2% of 200k = 4k tokens), not 0.7.** Default
+  threshold needs ~140k tokens to fire — would require massive
+  fixtures and burn budget. 0.02 trips after 3-4 reads of the
+  chunky fixtures, well within the maxSteps cap.
+- **Five fixtures, not three.** Three would trigger compaction
+  on Haiku's parallel tool_use (model often reads multiple
+  files in one step) but leave little headroom for the
+  post-compaction summary turn. Five gives the run room to
+  show that compaction folded history AND the agent kept
+  working with the compacted context.
+- **Fixture source is plausible TypeScript, not lorem ipsum.**
+  The model is more likely to engage with code-shaped content
+  the way it would in production. Lorem ipsum could mask
+  shape-related bugs (e.g., a sanitizer that mishandles import
+  statements).
+- **Biome ignores `evals/fixtures`.** Fixtures simulate real
+  source for the model; they reference fictional symbols
+  (`forja-core/*`), have unused imports for shape verisimilitude,
+  and use non-null assertions where the simulated logic asks
+  for it. Linting them adds zero value and creates churn.
+
+**What this validates beyond unit tests:**
+
+- Compaction trigger arithmetic (`estimatePromptTokens` against
+  the real provider tool-def and message shapes).
+- Tail alignment to assistant boundary survives a real
+  multi-tool-use turn (Haiku does parallel tool_use; the tail
+  must still land on a coherent boundary).
+- The compaction LLM call's prompt is well-formed for the
+  Anthropic adapter (would have caught the `tool_result.name`
+  leak again if it had regressed).
+- Cost accounting folds compaction's own usage into the
+  session total (`usageComplete: true` and totals add up).
+- Post-compaction context is sufficient for the agent to
+  produce a coherent answer (the model still mentioned
+  `forja-core` after compaction — the goal survived the fold).
+
+**Not yet validated (deferred to M3):**
+
+- Compaction with a deliberately broken LLM model id —
+  exercises the fallback path.
+- Multiple compactions in a single session (history grows
+  past threshold twice). Today's case only fires once.
+- Compaction observability under
+  `cumulative_growth_strip` — whether prior `[compacted_history]`
+  blocks are stripped correctly when re-compacting.
+
+**Next:** M3 (subagents + worktree + MCP + resume + checkpoints
++ /undo + bash_background + todo_write + Repo Map). The smoke
+suite is now genuinely defending M2's surface; the compaction
+gap is closed.
+
+---
+
 ## [2026-04-28] M2 — exit baseline (smoke run on Haiku 4.5)
 
 First end-to-end smoke run against `anthropic/claude-haiku-4-5`

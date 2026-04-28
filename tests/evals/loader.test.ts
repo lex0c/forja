@@ -142,6 +142,108 @@ budget:
     expect(c.setup?.files?.['src/a.ts']).toBe('export const a = 1\n');
     expect(c.budget).toEqual({ maxSteps: 7, maxCostUsd: 0.05 });
   });
+
+  test('parses compaction budget knobs', () => {
+    const yaml = `
+name: x
+prompt: y
+expect:
+  - status: done
+budget:
+  compactionThreshold: 0.02
+  compactionPreserveTail: 1
+`;
+    const c = parseEvalCase(yaml, '/tmp/c.yaml');
+    expect(c.budget?.compactionThreshold).toBe(0.02);
+    expect(c.budget?.compactionPreserveTail).toBe(1);
+  });
+
+  test('rejects compactionThreshold out of (0, 1]', () => {
+    const baseYaml = (v: string) => `
+name: x
+prompt: y
+expect:
+  - status: done
+budget:
+  compactionThreshold: ${v}
+`;
+    expect(() => parseEvalCase(baseYaml('0'), '/tmp/c.yaml')).toThrow(
+      /compactionThreshold must be a number in \(0, 1\]/,
+    );
+    expect(() => parseEvalCase(baseYaml('1.5'), '/tmp/c.yaml')).toThrow(
+      /compactionThreshold must be a number in \(0, 1\]/,
+    );
+  });
+
+  test('rejects compactionPreserveTail negative', () => {
+    const yaml = `
+name: x
+prompt: y
+expect:
+  - status: done
+budget:
+  compactionPreserveTail: -1
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(
+      /compactionPreserveTail must be a non-negative integer/,
+    );
+  });
+
+  test('parses compaction_triggered with strategy', () => {
+    const yaml = `
+name: x
+prompt: y
+expect:
+  - compaction_triggered:
+      min_count: 2
+      strategy: llm
+`;
+    const c = parseEvalCase(yaml, '/tmp/c.yaml');
+    expect(c.expect[0]).toEqual({
+      kind: 'compaction_triggered',
+      minCount: 2,
+      strategy: 'llm',
+    });
+  });
+
+  test('parses compaction_triggered without strategy (any)', () => {
+    const yaml = `
+name: x
+prompt: y
+expect:
+  - compaction_triggered:
+      min_count: 1
+`;
+    const c = parseEvalCase(yaml, '/tmp/c.yaml');
+    expect(c.expect[0]).toEqual({ kind: 'compaction_triggered', minCount: 1 });
+  });
+
+  test('rejects compaction_triggered with min_count <= 0', () => {
+    const yaml = `
+name: x
+prompt: y
+expect:
+  - compaction_triggered:
+      min_count: 0
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(
+      /min_count must be a positive integer/,
+    );
+  });
+
+  test('rejects compaction_triggered with unknown strategy', () => {
+    const yaml = `
+name: x
+prompt: y
+expect:
+  - compaction_triggered:
+      min_count: 1
+      strategy: bogus
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(
+      /strategy must be one of: fallback, llm, skipped/,
+    );
+  });
 });
 
 describe('loadEvalCase', () => {

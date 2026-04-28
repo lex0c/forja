@@ -35,6 +35,10 @@ interface ToolInvocation {
   args: Record<string, unknown>;
 }
 
+interface CompactionRecord {
+  strategy: 'llm' | 'fallback' | 'skipped';
+}
+
 // Default project policy injected when the case (or its fixture)
 // doesn't ship one. Evals run autonomously — there's no operator
 // to confirm tool calls, so strict mode would dead-end every
@@ -80,6 +84,7 @@ const evaluateExpectations = (
   result: HarnessResult | undefined,
   invocations: ToolInvocation[],
   outputText: string,
+  compactions: CompactionRecord[],
 ): ExpectationOutcome[] => {
   const calledTools = new Set(invocations.map((i) => i.toolName));
   return caseDef.expect.map((expectation): ExpectationOutcome => {
@@ -179,6 +184,24 @@ const evaluateExpectations = (
             : { detail: `assistant output did not contain '${expectation.pattern}'` }),
         };
       }
+      case 'compaction_triggered': {
+        const matching =
+          expectation.strategy === undefined
+            ? compactions
+            : compactions.filter((c) => c.strategy === expectation.strategy);
+        const passed = matching.length >= expectation.minCount;
+        if (passed) return { expectation, passed };
+        const seen = compactions.map((c) => c.strategy).join(', ') || '<none>';
+        const target =
+          expectation.strategy === undefined
+            ? `≥ ${expectation.minCount} compaction(s)`
+            : `≥ ${expectation.minCount} compaction(s) with strategy='${expectation.strategy}'`;
+        return {
+          expectation,
+          passed,
+          detail: `expected ${target}, observed strategies: [${seen}]`,
+        };
+      }
     }
   });
 };
@@ -189,6 +212,7 @@ export const executeCase = async (
 ): Promise<EvalCaseResult> => {
   const startedAt = Date.now();
   const invocations: ToolInvocation[] = [];
+  const compactions: CompactionRecord[] = [];
   let outputText = '';
 
   let cwd: string | undefined;
@@ -226,8 +250,20 @@ export const executeCase = async (
       // when stochasticity is the property under test.
       temperature: 0,
       ...(caseDef.plan === true ? { plan: true } : {}),
-      ...(caseDef.budget?.maxSteps !== undefined
-        ? { budget: { maxSteps: caseDef.budget.maxSteps } }
+      ...(caseDef.budget !== undefined
+        ? {
+            budget: {
+              ...(caseDef.budget.maxSteps !== undefined
+                ? { maxSteps: caseDef.budget.maxSteps }
+                : {}),
+              ...(caseDef.budget.compactionThreshold !== undefined
+                ? { compactionThreshold: caseDef.budget.compactionThreshold }
+                : {}),
+              ...(caseDef.budget.compactionPreserveTail !== undefined
+                ? { compactionPreserveTail: caseDef.budget.compactionPreserveTail }
+                : {}),
+            },
+          }
         : {}),
       signal: controller.signal,
       ...(options.bootstrapOverride ?? {}),
@@ -240,6 +276,10 @@ export const executeCase = async (
         onEvent: (e: HarnessEvent) => {
           if (e.type === 'tool_invoking') {
             invocations.push({ toolName: e.toolName, args: e.args });
+            return;
+          }
+          if (e.type === 'compaction_finished') {
+            compactions.push({ strategy: e.strategy });
             return;
           }
           if (e.type === 'provider_event' && e.event.kind === 'text_delta') {
@@ -270,7 +310,7 @@ export const executeCase = async (
             detail: failure ?? 'setup failed',
           }),
         )
-      : evaluateExpectations(caseDef, cwd, result, invocations, outputText);
+      : evaluateExpectations(caseDef, cwd, result, invocations, outputText, compactions);
 
   if (cwd !== undefined) {
     rmSync(cwd, { recursive: true, force: true });

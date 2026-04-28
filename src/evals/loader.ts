@@ -18,7 +18,14 @@ const TOP_LEVEL_KEYS: ReadonlySet<string> = new Set([
 
 const SETUP_KEYS: ReadonlySet<string> = new Set(['fixture', 'files']);
 
-const BUDGET_KEYS: ReadonlySet<string> = new Set(['maxSteps', 'maxCostUsd']);
+const BUDGET_KEYS: ReadonlySet<string> = new Set([
+  'maxSteps',
+  'maxCostUsd',
+  'compactionThreshold',
+  'compactionPreserveTail',
+]);
+
+const VALID_COMPACTION_STRATEGIES: ReadonlySet<string> = new Set(['llm', 'fallback', 'skipped']);
 
 // Each expectation form has a tight schema — the parser rejects
 // unknown discriminants AND extra keys to keep the surface
@@ -35,6 +42,7 @@ const EXPECTATION_KEYS = {
   status: new Set(['status']),
   exit_reason: new Set(['exit_reason']),
   output_contains: new Set(['output_contains']),
+  compaction_triggered: new Set(['compaction_triggered']),
 } as const satisfies Record<EvalExpectation['kind'], ReadonlySet<string>>;
 
 const requireString = (v: unknown, label: string): string => {
@@ -105,6 +113,26 @@ const parseBudget = (raw: unknown): EvalBudget | undefined => {
       throw new Error('eval: budget.maxCostUsd must be a non-negative number');
     }
     out.maxCostUsd = r.maxCostUsd;
+  }
+  if (r.compactionThreshold !== undefined) {
+    if (
+      typeof r.compactionThreshold !== 'number' ||
+      r.compactionThreshold <= 0 ||
+      r.compactionThreshold > 1
+    ) {
+      throw new Error('eval: budget.compactionThreshold must be a number in (0, 1]');
+    }
+    out.compactionThreshold = r.compactionThreshold;
+  }
+  if (r.compactionPreserveTail !== undefined) {
+    if (
+      typeof r.compactionPreserveTail !== 'number' ||
+      !Number.isInteger(r.compactionPreserveTail) ||
+      r.compactionPreserveTail < 0
+    ) {
+      throw new Error('eval: budget.compactionPreserveTail must be a non-negative integer');
+    }
+    out.compactionPreserveTail = r.compactionPreserveTail;
   }
   return out;
 };
@@ -196,6 +224,31 @@ const parseExpectation = (raw: unknown, idx: number): EvalExpectation => {
     }
     case 'output_contains':
       return { kind, pattern: requireString(r.output_contains, `expect[${idx}].output_contains`) };
+    case 'compaction_triggered': {
+      const cf = requireRecord(r.compaction_triggered, `expect[${idx}].compaction_triggered`);
+      rejectUnknown(cf, new Set(['min_count', 'strategy']), `expect[${idx}].compaction_triggered`);
+      const minCountRaw = cf.min_count;
+      if (typeof minCountRaw !== 'number' || !Number.isInteger(minCountRaw) || minCountRaw < 1) {
+        throw new Error(
+          `eval: expect[${idx}].compaction_triggered.min_count must be a positive integer`,
+        );
+      }
+      const out: EvalExpectation = { kind, minCount: minCountRaw };
+      if (cf.strategy !== undefined) {
+        const strategy = requireString(cf.strategy, `expect[${idx}].compaction_triggered.strategy`);
+        if (!VALID_COMPACTION_STRATEGIES.has(strategy)) {
+          throw new Error(
+            `eval: expect[${idx}].compaction_triggered.strategy must be one of: ${[
+              ...VALID_COMPACTION_STRATEGIES,
+            ]
+              .sort()
+              .join(', ')}`,
+          );
+        }
+        out.strategy = strategy as 'llm' | 'fallback' | 'skipped';
+      }
+      return out;
+    }
   }
 };
 
