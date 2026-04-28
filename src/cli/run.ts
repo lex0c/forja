@@ -67,7 +67,20 @@ export const run = async (options: RunOptions): Promise<number> => {
       signal,
       ...(options.bootstrapOverride ?? {}),
     };
-    const { config, db } = bootstrap(bootstrapInput);
+    const { config, db, lockConflicts } = bootstrap(bootstrapInput);
+
+    // Surface lock-conflict warnings before the run starts. Each
+    // conflict means an enterprise/user/project layer marked a
+    // section as locked and a lower-precedence layer tried to
+    // override it; the override was dropped from the merged policy.
+    // Admins need this signal — silently swallowing it defeats the
+    // whole point of `locked: true`.
+    for (const c of lockConflicts) {
+      errSink(
+        `⚠ permission policy: ${c.section} locked by ${c.lockedBy}; ${c.attemptedBy}'s override dropped\n`,
+      );
+    }
+
     const cfg = {
       ...config,
       onEvent: (e: Parameters<OutputRenderer['onEvent']>[0]) => renderer.onEvent(e),

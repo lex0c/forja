@@ -1,0 +1,190 @@
+import { existsSync } from 'node:fs';
+import { defaultPolicy, loadPolicyFromFile } from './config.ts';
+import { ENTERPRISE_POLICY_PATH, projectPolicyPath, userPolicyPath } from './paths.ts';
+import type { Policy, PolicyDefaults, PolicyMode, PolicyToolsSection } from './types.ts';
+
+// Hierarchy resolution per AGENTIC_CLI §8: enterprise → user → project
+// → session, with `locked` semantics. Higher-precedence layers can
+// mark sections as locked, preventing lower layers from overriding
+// them. Absent files at any layer are skipped (no error).
+//
+// Merge semantics for non-locked sections: REPLACE, not extend. A
+// lower layer that defines `tools.bash` fully replaces the higher
+// layer's `tools.bash`. Predictable + matches how most config systems
+// behave; users who want to extend re-list everything. The lock bit
+// on a section is the override-blocking primitive — once set, lower
+// layers' attempts to redefine that section are dropped (with a
+// warning surfaced via the `lockConflicts` array).
+
+export type Layer = 'enterprise' | 'user' | 'project' | 'session';
+
+export interface LayerPolicy {
+  layer: Layer;
+  policy: Policy;
+  // Path the policy was loaded from (for diagnostics). Absent for
+  // layers that were synthesized rather than loaded from disk —
+  // notably 'session' which today comes from runtime injection.
+  path?: string;
+}
+
+export interface LockConflict {
+  // Which section was locked + which lower layer tried to override.
+  section: string;
+  lockedBy: Layer;
+  attemptedBy: Layer;
+}
+
+export interface ResolveResult {
+  policy: Policy;
+  layers: LayerPolicy[];
+  lockConflicts: LockConflict[];
+}
+
+export interface ResolveOptions {
+  cwd: string;
+  // Test seams + override hooks. When provided, these short-circuit
+  // path discovery for the corresponding layer.
+  enterprisePath?: string | null;
+  userPath?: string | null;
+  // Session-layer policy (CLI flags or runtime overrides). Optional;
+  // typically empty in M1.
+  session?: Policy;
+  // Inject the env table for path discovery. Lets tests run with a
+  // controlled XDG_CONFIG_HOME without touching process.env.
+  env?: NodeJS.ProcessEnv;
+}
+
+const SECTION_KEYS: readonly (keyof PolicyToolsSection)[] = [
+  'bash',
+  'read_file',
+  'write_file',
+  'edit_file',
+  'glob',
+  'grep',
+  'fetch_url',
+];
+
+// Load each layer if its file exists. enterprisePath=null disables
+// the enterprise lookup entirely (test seam to avoid touching /etc).
+const loadLayers = (options: ResolveOptions): LayerPolicy[] => {
+  const out: LayerPolicy[] = [];
+
+  const enterprisePath =
+    options.enterprisePath === null ? null : (options.enterprisePath ?? ENTERPRISE_POLICY_PATH);
+  if (enterprisePath !== null && existsSync(enterprisePath)) {
+    out.push({
+      layer: 'enterprise',
+      policy: loadPolicyFromFile(enterprisePath),
+      path: enterprisePath,
+    });
+  }
+
+  const userPath =
+    options.userPath === null ? null : (options.userPath ?? userPolicyPath(options.env));
+  if (userPath !== null && existsSync(userPath)) {
+    out.push({ layer: 'user', policy: loadPolicyFromFile(userPath), path: userPath });
+  }
+
+  const projPath = projectPolicyPath(options.cwd);
+  if (existsSync(projPath)) {
+    out.push({ layer: 'project', policy: loadPolicyFromFile(projPath), path: projPath });
+  }
+
+  if (options.session !== undefined) {
+    out.push({ layer: 'session', policy: options.session });
+  }
+
+  return out;
+};
+
+// Walk layers in precedence order (enterprise first, session last).
+// Each layer can REPLACE earlier sections OR be REJECTED by an
+// earlier lock. The first time a section is set, its `locked` field
+// is sticky — subsequent layers can no longer modify that section.
+const merge = (
+  layers: readonly LayerPolicy[],
+): { policy: Policy; lockConflicts: LockConflict[] } => {
+  // Track mode as `undefined` until a layer explicitly sets it. The
+  // final fallback to 'strict' happens at emit time so layers that
+  // omit `defaults.mode` don't trip the lock-conflict log against a
+  // higher-precedence layer that locked the field.
+  let mergedMode: PolicyMode | undefined;
+  let defaultsLocked: boolean | undefined;
+  let defaultsLockedBy: Layer | null = null;
+  const mergedTools: PolicyToolsSection = {};
+  const sectionLockedBy: Partial<Record<keyof PolicyToolsSection, Layer>> = {};
+  const lockConflicts: LockConflict[] = [];
+
+  for (const { layer, policy } of layers) {
+    // defaults.mode — only counts as an "attempt" when the layer
+    // explicitly set the field. Silent layers (no `defaults.mode`
+    // in the YAML, surfaced as `undefined` after parse) don't
+    // generate phantom conflicts against a locked higher-precedence
+    // mode.
+    if (defaultsLockedBy !== null) {
+      if (policy.defaults.mode !== undefined && policy.defaults.mode !== mergedMode) {
+        lockConflicts.push({
+          section: 'defaults.mode',
+          lockedBy: defaultsLockedBy,
+          attemptedBy: layer,
+        });
+      }
+    } else if (policy.defaults.mode !== undefined) {
+      mergedMode = policy.defaults.mode;
+      if (policy.defaults.locked === true) {
+        defaultsLocked = true;
+        defaultsLockedBy = layer;
+      }
+    }
+
+    // tools.* sections
+    for (const key of SECTION_KEYS) {
+      const incoming = policy.tools[key];
+      const lockedBy = sectionLockedBy[key];
+      if (lockedBy !== undefined) {
+        // Locked by an earlier layer; reject any non-empty override.
+        if (incoming !== undefined) {
+          lockConflicts.push({
+            section: `tools.${key}`,
+            lockedBy,
+            attemptedBy: layer,
+          });
+        }
+        continue;
+      }
+      if (incoming !== undefined) {
+        // biome-ignore lint/suspicious/noExplicitAny: section types differ per key — narrowing per branch would not improve safety.
+        (mergedTools as any)[key] = incoming;
+        if (incoming.locked === true) {
+          sectionLockedBy[key] = layer;
+        }
+      }
+    }
+  }
+
+  // Fall back to strict at emit time when no layer set mode. Engine
+  // also guards (`?? 'strict'`) but emitting a concrete value keeps
+  // the merged policy self-describing for `agent perms` introspection.
+  const mergedDefaults: PolicyDefaults = {
+    mode: mergedMode ?? 'strict',
+    ...(defaultsLocked !== undefined ? { locked: defaultsLocked } : {}),
+  };
+
+  return {
+    policy: { defaults: mergedDefaults, tools: mergedTools },
+    lockConflicts,
+  };
+};
+
+// Public entry — discover layers, merge, return the effective policy
+// plus the layer trail and any lock conflicts. Bootstrap consumes
+// `policy`; CLI rendering / debug surfaces consume `layers` and
+// `lockConflicts` for `agent perms` style introspection.
+export const resolvePolicy = (options: ResolveOptions): ResolveResult => {
+  const layers = loadLayers(options);
+  if (layers.length === 0) {
+    return { policy: defaultPolicy(), layers: [], lockConflicts: [] };
+  }
+  const { policy, lockConflicts } = merge(layers);
+  return { policy, layers, lockConflicts };
+};

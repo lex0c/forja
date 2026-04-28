@@ -9,21 +9,29 @@ export type PolicyMode = 'strict' | 'acceptEdits' | 'bypass';
 
 // Policy rules per category. Each section is optional; absence means "no
 // opinion at this layer" (engine falls through to defaults).
+//
+// `locked` (per AGENTIC_CLI §8): when set in a higher-precedence layer
+// (enterprise > user > project > session), lower layers cannot override
+// this section. Used by enterprise admins to enforce non-negotiable
+// rules like "deny rm -rf" or "deny outbound web fetch to internal IPs".
 export interface BashPolicy {
   allow?: readonly string[];
   confirm?: readonly string[];
   deny?: readonly string[];
+  locked?: boolean;
 }
 
 export interface PathPolicy {
   allow_paths?: readonly string[];
   confirm_paths?: readonly string[];
   deny_paths?: readonly string[];
+  locked?: boolean;
 }
 
 export interface FetchPolicy {
   allow_hosts?: readonly string[];
   deny_hosts?: readonly string[];
+  locked?: boolean;
 }
 
 export interface PolicyToolsSection {
@@ -38,7 +46,18 @@ export interface PolicyToolsSection {
 }
 
 export interface PolicyDefaults {
-  mode: PolicyMode;
+  // Optional so the parser can distinguish "user file omitted
+  // defaults" from "user file explicitly said mode=strict". The
+  // hierarchy resolver needs that distinction to avoid logging
+  // phantom lock conflicts when a lower layer is silent on mode
+  // and a higher layer locked the field. The merged policy
+  // (consumed by the engine) always has `mode` set via the
+  // resolver's final default.
+  mode?: PolicyMode;
+  // When set in a higher-precedence layer, lower layers cannot
+  // change `mode`. Apply at the same hierarchy granularity as
+  // section-level lock (per AGENTIC_CLI §8).
+  locked?: boolean;
 }
 
 export interface Policy {

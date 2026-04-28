@@ -241,4 +241,41 @@ describe('run end-to-end with mock provider', () => {
     });
     expect(flushed).toBe(true);
   });
+
+  test('lock conflicts are surfaced to errSink before the run starts', async () => {
+    // Stage a layered policy where enterprise locks tools.bash and
+    // a project file tries to override it. run() should print one
+    // warning per conflict on errSink so the operator sees the
+    // signal — silently swallowing it would defeat the locked
+    // semantic.
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const entFile = path.join(workdir, 'ent.yaml');
+    fs.writeFileSync(entFile, 'tools:\n  bash:\n    deny:\n      - "rm *"\n    locked: true\n');
+    fs.mkdirSync(path.join(workdir, '.agent'), { recursive: true });
+    fs.writeFileSync(
+      path.join(workdir, '.agent/permissions.yaml'),
+      'tools:\n  bash:\n    allow:\n      - "ls *"\n',
+    );
+
+    const { renderer } = recordingRenderer();
+    const errLines: string[] = [];
+    await run({
+      args: baseArgs(),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'ok' }]),
+        dbPath,
+        cwd: workdir,
+        enterprisePolicyPath: entFile,
+        userPolicyPath: null,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: renderer,
+      errSink: (s) => errLines.push(s),
+    });
+    const all = errLines.join('');
+    expect(all).toContain('tools.bash');
+    expect(all).toContain('locked by enterprise');
+    expect(all).toContain('project');
+  });
 });

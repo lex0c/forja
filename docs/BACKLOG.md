@@ -15,6 +15,120 @@ Format:
 
 ---
 
+## [2026-04-28] M2 / Step 4 — Permission hierarchy
+
+`AGENTIC_CLI §8` requires layered policy resolution: enterprise →
+user → project → session. M1 only loaded `./.agent/permissions.yaml`,
+leaving the higher and lower precedence tiers stubbed. Step 4 closes
+that gap; trust prompt (the other half of M2 step 4 in the spec) is
+deferred to `docs/TODO.md` because it depends on interactive UI that
+hasn't landed yet.
+
+**Done:**
+- `src/permissions/paths.ts` — path discovery for each layer.
+  `ENTERPRISE_POLICY_PATH = /etc/agent/permissions.yaml`. User path
+  honors `XDG_CONFIG_HOME` (with empty-string fallback to
+  `~/.config/agent/permissions.yaml`). Project path stays
+  `cwd/.agent/permissions.yaml`.
+- `src/permissions/hierarchy.ts` — `resolvePolicy({cwd, ...})` walks
+  the four layers, loads each that exists, merges with locked-section
+  semantics. Returns the effective `Policy`, the loaded
+  `LayerPolicy[]` trail, and a `LockConflict[]` array describing any
+  override attempts that were rejected.
+- `src/permissions/types.ts` — added `locked?: boolean` to
+  `PolicyDefaults`, `BashPolicy`, `PathPolicy`, `FetchPolicy`. Validator
+  accepts and rejects non-boolean values.
+- `src/permissions/config.ts` — `parsePolicy` round-trips `locked` on
+  defaults and on each tool section.
+- `src/cli/bootstrap.ts` — replaces the single-file `loadPolicyFromFile`
+  call with `resolvePolicy`. New `BootstrapResult` shape: `policyLayers`
+  (array of which layers contributed) + `lockConflicts` (warnings to
+  surface). Test seams `enterprisePolicyPath`/`userPolicyPath` accept
+  `null` to disable a layer entirely (avoid touching `/etc` in tests).
+- `docs/TODO.md` — trust prompt deferral with rationale and pull-in
+  signal.
+
+**Merge semantics:**
+- **Replace, not extend.** A lower-precedence layer that defines
+  `tools.bash` fully replaces the higher layer's `tools.bash`.
+  Predictable + matches most config systems; users who want to extend
+  re-list everything. Spec stayed silent on this; replace is the safer
+  choice for security policy (no surprise merges that allow more than
+  the user intended).
+- **Locked sections drop overrides + record conflicts.** Once any
+  layer marks a section as `locked: true`, subsequent layers'
+  attempts to redefine that section are silently dropped from the
+  merged result and recorded in `lockConflicts` with
+  `{section, lockedBy, attemptedBy}`. Caller (CLI run.ts) prints
+  conflicts as warnings to stderr.
+- **Same-value isn't a conflict.** A lower layer setting
+  `defaults.mode: strict` when enterprise locked mode at `strict` is
+  silently OK — only differing values trip the conflict log.
+
+**New tests (+15 over Step 3):**
+- `tests/permissions/paths.test.ts` — 5 cases: enterprise constant,
+  XDG honored, XDG-empty falls back, ~/.config fallback, project path.
+- `tests/permissions/hierarchy.test.ts` — 10 cases: discovery (no
+  files, project only, three-layer precedence, session override),
+  locked semantics (enterprise blocks user, enterprise blocks project,
+  user blocks project, multi-layer conflict log, non-locked replace,
+  same-value non-conflict).
+- `tests/cli/bootstrap.test.ts` — updated to use `policyLayers`
+  instead of removed `policySource` field; `enterprisePolicyPath: null`
+  + `userPolicyPath: null` test seams pin that the test suite never
+  touches `/etc/agent` or `~/.config/agent` during run.
+- Total suite: **512 pass / 7 skip / 1132 expect() calls** in ~1.5s.
+
+**Decisions:**
+- **`enterprisePath: null` and `userPath: null` as test seams** rather
+  than relying on `existsSync` returning false. Tests that don't
+  actively use a layer set the path to `null` so the layer is
+  guaranteed not to be probed. Catches the class of test bugs where
+  a CI runner happens to have `/etc/agent/permissions.yaml` and the
+  test silently picks it up.
+- **`Policy` type ships `locked` as part of the schema**, not as a
+  separate per-layer flag map. Round-trips through YAML; admins can
+  inspect any layer's `locked` directly in the file without consulting
+  a separate manifest.
+- **All four layers use the same lock semantics**, not "only
+  enterprise can lock". Spec language is "enterprise pode marcar
+  regras como locked" (can mark) — doesn't preclude others. Uniform
+  semantics are simpler and let user/project lock things from session
+  too (think: a project locks its `tools.write_file.deny_paths`
+  against runtime `--allow-write-everywhere` flags later).
+- **`session` layer threads through `ResolveOptions.session`** rather
+  than reading a separate config file. Session-layer config in M1 is
+  only injected via tests / harness wiring; CLI flags adding to it is
+  Step 5+ work.
+- **`policyLayers` returns `('enterprise'|'user'|'project'|'session')[]`**
+  instead of the old single `policySource: 'project'|'default'` enum.
+  Multi-layer is now the norm; an empty array signals "no layer file
+  found anywhere — engine falls back to default strict policy".
+
+**Out of scope:**
+- Trust prompt (deferred — see `docs/TODO.md`).
+- `agent perms` introspection subcommand (would render `layers` and
+  `lockConflicts` for the user). Cosmetic, lands when slash commands
+  arrive in M3.
+- CLI flag → session policy threading (`--allow`, `--deny`, etc).
+  Session layer accepts injected policy today; binding flags to it
+  is a later step.
+- Windows path discovery (`%PROGRAMDATA%`, `%APPDATA%`). Linux/Mac
+  only in M1/M2; same posture as `src/storage/paths.ts`.
+- Multi-file policy in a layer (e.g., `~/.config/agent/permissions.d/*.yaml`).
+  Single file per layer for now; conf.d-style fragments deferred.
+
+**Pending:** none for this step.
+
+**Next:** M2 / Step 5 — Plan mode (`--plan`). Read-only profile that
+short-circuits all `writes: true` tools, asks the model to produce a
+plan in markdown, exits without applying. Reuses the permissions
+engine: a session-layer policy with `bypass`-style read tools and
+deny-all writes. Useful for dirigirthe CLI in big repos with
+confidence.
+
+---
+
 ## [2026-04-28] M2 / Step 3 — Compaction
 
 `AGENTIC_CLI.md §6` and `ORCHESTRATION.md §4` require the harness to
