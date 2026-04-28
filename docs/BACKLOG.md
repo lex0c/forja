@@ -15,6 +15,135 @@ Format:
 
 ---
 
+## [2026-04-28] M2 / Step 6.3 — Multi-provider baseline (OpenAI)
+
+After Step 6.2 the Anthropic baseline was solid but the
+"provider-pluggable" claim still rested on argument: only
+Anthropic had ever round-tripped end-to-end. Step 6.3 runs the
+same smoke suite against `openai/gpt-4o-mini` to convert
+"adapter has unit coverage" into "adapter has been observed
+under load."
+
+**Done:**
+
+- 3× baseline against `openai/gpt-4o-mini` with `temperature: 0`.
+  No code changes required to the adapter — it worked
+  end-to-end on first run (no equivalent of the
+  `tool_result.name` Anthropic bug). Multi-tool-use parallel
+  dispatch, compaction with `strategy: llm`, plan mode, and
+  permission gating all behaved correctly.
+- Rewrote `evals/smoke/07-bash-readonly.yaml`. The previous
+  assertion `output_contains: "hello world"` was testing **a
+  property of the model** (whether it cited bash output back
+  in its summary) rather than a property of the harness.
+  Haiku happened to do so; gpt-4o-mini in plan mode produced
+  only the structured plan markdown without echoing the bash
+  output. Replaced with `output_contains: "# Plan"` —
+  asserts that the plan-mode system prompt was honored, which
+  is what the case actually wants to validate. Tool dispatch
+  invariants (`tool_called: bash`, `tool_not_called:
+  write_file`, `tool_not_called: edit_file`) carry the rest
+  of the assertion weight.
+
+**Real-model 3× baselines (head-to-head):**
+
+| Metric | Haiku 4.5 | gpt-4o-mini |
+|---|---|---|
+| Pass rate | 24/24 (100%) | 24/24 (100%) |
+| Total cost (3 rounds) | $0.1515 | $0.0096 |
+| p50 cost / case | $0.0050 | $0.0002 |
+| Wall clock (3 rounds) | 88s | 92s |
+| Cases with cost variance | 2/8 | 0/8 |
+| Compaction strategy | llm | llm |
+
+**Decisions:**
+
+- **Case 07 fix is honest, not gaming.** Important to be
+  explicit about this. The prior assertion only passed
+  against Anthropic because of how Haiku interprets plan
+  mode's "PROPOSE a plan" instruction in tension with the
+  user's "report what you saw." gpt-4o-mini reads the
+  system prompt as authoritative and produces only the
+  plan, never citing bash output. Both behaviors are valid;
+  the test should validate the harness invariant (bash
+  invoked, writes blocked, plan markdown produced), not
+  which interpretation the model picks. Documenting this
+  here so a future contributor doesn't "fix" the case back
+  to the brittle form.
+- **gpt-4o-mini's perfect variance is suspicious.** OpenAI
+  documents that `temperature: 0` doesn't guarantee 100%
+  determinism (load balancing across infrastructure can
+  produce minor variations). Today's 0/8 cases-with-spread
+  result is consistent with documented behavior **for this
+  prompt size and time window** but should not be assumed
+  permanent. A weekly run against the same baseline would
+  tell us whether the determinism holds or whether OpenAI's
+  stack drifts day-to-day.
+- **No registry expansion to gpt-5.x family.** The user's
+  pricing audit covered gpt-5.x; the registry today only
+  has gpt-4o and gpt-4o-mini. Adding gpt-5.x is a feature
+  expansion (new defaults, new capability declarations,
+  spec PR against PROVIDERS.md §5) — out of scope for
+  hardening. Tracked implicitly: the next time someone
+  needs gpt-5.x, the doc trail is in the conversation that
+  produced this baseline.
+- **No Google/Gemini run yet.** Same gating logic as the
+  gpt-5.x decision: registry comments admit Gemini pricing
+  is illustrative ("not committed real Gemini prices").
+  Running smoke against Gemini today would test the
+  adapter's wire shape against fake pricing, conflating
+  two issues. Bundle Gemini with the pricing/spec update
+  in M3.
+
+**What this validates:**
+
+- The OpenAI tool-call ↔ tool-result split (`role: 'tool'` 
+  with `tool_call_id`) round-trips correctly through our
+  canonical `ProviderToolResultBlock`.
+- `temperature: 0` is forwarded to OpenAI's
+  `chat.completions.create` and applied (output is
+  reproducible for this suite size).
+- `stream_options: { include_usage: true }` reaches the
+  endpoint and the final usage chunk is consumed by the
+  normalizer (`usageComplete: true` on every run).
+- `parallel_tool_calls` defaults work — gpt-4o-mini does
+  emit multiple tool_calls per turn in case 08 (compaction
+  case reads 5 files in parallel) and the dispatch layer
+  handles them.
+- Compaction's LLM-summary call works against OpenAI's API
+  shape (no Anthropic-specific assumptions in the
+  compaction module's prompt construction).
+- Cost computation lines up: gpt-4o-mini at $0.15/M input
+  and $0.60/M output produces case-08 costs around
+  $0.00125 — consistent with ~5k input tokens + ~500
+  output tokens × the corrected pricing.
+
+**Risks not addressed:**
+
+- Single-day baseline. Same caveat as Anthropic — needs
+  weekly recurrence in CI to detect provider drift.
+- Single host (Linux) on one residential network. OpenAI's
+  rate-limit and geo-routing behavior could vary by
+  origin.
+- gpt-4o-mini doesn't expose controllable prompt cache
+  (declared `cache: 'client_only'`); we're paying full
+  input cost every round. If the registry later gains
+  gpt-5.x with `cache: 'server_5min'`-equivalent semantics,
+  caching cases would need re-baselined.
+
+**M2 status: closed with multi-provider evidence.** Smoke
+suite passes 24/24 against two independent provider
+adapters with cost ratio matching public pricing. The
+"provider-pluggable" claim now has measurement, not just
+spec text.
+
+**Next:** M3 (subagents + worktree + MCP + resume +
+checkpoints + /undo + bash_background + todo_write +
+Repo Map). Provider expansion (gpt-5.x, real Gemini
+pricing) lives there alongside the spec PR for PROVIDERS.md.
+
+---
+
 ## [2026-04-28] M2 / Step 6.2 — Variance baseline (smoke ×3)
 
 After Step 6.1 closed the compaction gap, the remaining
