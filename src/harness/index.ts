@@ -11,6 +11,7 @@ export {
   invokeTool,
 } from './invoke-tool.ts';
 export { runAgent } from './loop.ts';
+export { AbortError, abortableIterable } from './abortable.ts';
 export {
   DEFAULT_RETRY,
   generateWithRetry,

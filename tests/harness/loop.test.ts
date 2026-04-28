@@ -309,6 +309,140 @@ describe('runAgent', () => {
     expect(sessions).toHaveLength(1);
   });
 
+  test('wall-clock timeout in the tool loop is reported as maxWallClockMs (not aborted)', async () => {
+    // The tool loop checks signal.aborted between invocations. If a
+    // wall-clock timeout fires while a tool is running, the next
+    // iteration must report `maxWallClockMs`, not `aborted` — otherwise
+    // budget exhaustions get misclassified as user cancellations.
+    //
+    // Setup: a slow tool that takes longer than maxWallClockMs. The
+    // wall-clock controller fires mid-execution; on the next loop
+    // iteration we hit the abort check.
+    const slowTool: Tool = {
+      name: 'slow',
+      description: 'sleeps',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: false },
+      async execute() {
+        await new Promise((r) => setTimeout(r, 80));
+        return { ok: true };
+      },
+    };
+    const provider = mockProvider([
+      {
+        tool_uses: [
+          { id: 'tu1', name: 'slow', input: {} },
+          { id: 'tu2', name: 'slow', input: {} },
+        ],
+        stop_reason: 'tool_use',
+      },
+    ]);
+    const result = await runAgent({
+      provider: provider.provider,
+      toolRegistry: (() => {
+        const r = createToolRegistry();
+        r.register(slowTool);
+        return r;
+      })(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      budget: { maxWallClockMs: 30 },
+    });
+    expect(result.status).toBe('interrupted');
+    expect(result.reason).toBe('maxWallClockMs');
+  });
+
+  test('hung provider stream is interrupted by user abort', async () => {
+    // Provider yields one event then hangs forever. Without
+    // abortableIterable wrapping the stream, the for-await in
+    // collectStep would block indefinitely. With it, the user's
+    // abort signal breaks the race and the loop exits as
+    // interrupted/aborted.
+    const ctrl = new AbortController();
+    setTimeout(() => ctrl.abort(), 30);
+    const provider: Provider = {
+      id: 'mock/hang',
+      family: 'anthropic',
+      capabilities: {
+        tools: 'native',
+        cache: false,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 1000,
+        output_max_tokens: 100,
+        cost_per_1k_input: 0,
+        cost_per_1k_output: 0,
+        notes: [],
+      },
+      async *generate() {
+        yield { kind: 'start', message_id: 'm' };
+        await new Promise(() => {
+          // never resolves — simulates a stuck HTTP read
+        });
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+    const result = await runAgent({
+      provider,
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      signal: ctrl.signal,
+    });
+    expect(result.status).toBe('interrupted');
+    expect(result.reason).toBe('aborted');
+  });
+
+  test('hung provider stream is interrupted by maxWallClockMs', async () => {
+    // Same hung provider, but no user abort — the wall-clock controller
+    // inside runAgent fires the combined signal after 30ms. Proves the
+    // wall-clock cap actually enforces during a stuck stream, not just
+    // between iterations.
+    const provider: Provider = {
+      id: 'mock/hang2',
+      family: 'anthropic',
+      capabilities: {
+        tools: 'native',
+        cache: false,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 1000,
+        output_max_tokens: 100,
+        cost_per_1k_input: 0,
+        cost_per_1k_output: 0,
+        notes: [],
+      },
+      async *generate() {
+        yield { kind: 'start', message_id: 'm' };
+        await new Promise(() => {
+          // never resolves
+        });
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+    const result = await runAgent({
+      provider,
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      budget: { maxWallClockMs: 30 },
+    });
+    expect(result.status).toBe('interrupted');
+    expect(result.reason).toBe('maxWallClockMs');
+  });
+
   test('stream errors fail the run (not silently exit done)', async () => {
     // Mock provider emits tool_use_start + malformed args → normalizer
     // produces an error event and drops tool_use_stop. Without the

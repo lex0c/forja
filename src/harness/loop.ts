@@ -9,6 +9,7 @@ import type {
 } from '../providers/index.ts';
 import { appendMessage, completeSession, createSession } from '../storage/index.ts';
 import type { ToolContext } from '../tools/index.ts';
+import { abortableIterable } from './abortable.ts';
 import { collectStep } from './collect.ts';
 import { invokeTool } from './invoke-tool.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
@@ -178,8 +179,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
 
       let collected: Awaited<ReturnType<typeof collectStep>>;
       try {
+        // Wrap the provider stream so the combined abort signal (user +
+        // wall-clock) actually reaches the for-await inside collectStep.
+        // The Provider interface doesn't propagate signals to the SDK,
+        // so without this a hung HTTP request blocks indefinitely and
+        // neither Ctrl+C nor maxWallClockMs can interrupt it.
         collected = await collectStep(
-          generateWithRetry(config.provider, req, DEFAULT_RETRY),
+          abortableIterable(generateWithRetry(config.provider, req, DEFAULT_RETRY), signal),
           (ev) => safeEmit(config.onEvent, { type: 'provider_event', event: ev }),
         );
       } catch (e) {
@@ -243,7 +249,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // Execute every tool_use in this step, collecting results.
       const toolResults: ProviderToolResultBlock[] = [];
       for (const tu of collected.tool_uses) {
-        if (signal.aborted) return finish('aborted');
+        // Same wall-clock-vs-user-abort distinction as the top-of-loop
+        // check; otherwise a wall-clock timeout that lands between tool
+        // invocations gets misreported as a user abort.
+        if (signal.aborted) {
+          return finish(isWallClockTimeout() ? 'maxWallClockMs' : 'aborted');
+        }
 
         // Degenerate-loop detection: hash this call and check the sliding
         // window. We do this BEFORE invocation so we can refuse cheaply.
