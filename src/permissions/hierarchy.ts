@@ -116,22 +116,39 @@ const merge = (
   const lockConflicts: LockConflict[] = [];
 
   for (const { layer, policy } of layers) {
-    // defaults.mode — only counts as an "attempt" when the layer
-    // explicitly set the field. Silent layers (no `defaults.mode`
-    // in the YAML, surfaced as `undefined` after parse) don't
-    // generate phantom conflicts against a locked higher-precedence
-    // mode.
+    // defaults.mode and defaults.locked are independent — a layer
+    // can set `locked: true` WITHOUT setting `mode` to freeze the
+    // inherited (or default) value, and the lock must still apply.
+    // The prior implementation nested `locked` inside the
+    // mode-was-set branch, so a "lock-only" layer silently failed
+    // to lock anything and lower layers could override the mode
+    // with no conflict reported.
+    const incomingMode = policy.defaults.mode;
+    const incomingLocked = policy.defaults.locked === true;
+
     if (defaultsLockedBy !== null) {
-      if (policy.defaults.mode !== undefined && policy.defaults.mode !== mergedMode) {
+      // Already locked by an earlier layer. This layer can't
+      // change mode; only flag a conflict when it explicitly
+      // tried (mode set AND different from merged value). A
+      // layer that re-asserts the same mode or sets locked:true
+      // (re-affirming the lock) is silently OK.
+      if (incomingMode !== undefined && incomingMode !== mergedMode) {
         lockConflicts.push({
           section: 'defaults.mode',
           lockedBy: defaultsLockedBy,
           attemptedBy: layer,
         });
       }
-    } else if (policy.defaults.mode !== undefined) {
-      mergedMode = policy.defaults.mode;
-      if (policy.defaults.locked === true) {
+    } else {
+      // Not yet locked. Apply mode change and/or lock activation.
+      if (incomingMode !== undefined) {
+        mergedMode = incomingMode;
+      }
+      if (incomingLocked) {
+        // Lock applies to whatever mergedMode is — possibly
+        // inherited from an earlier layer, possibly still
+        // undefined (resolver fills with default 'strict' at
+        // emit). Either way the freeze is enforced from here on.
         defaultsLocked = true;
         defaultsLockedBy = layer;
       }

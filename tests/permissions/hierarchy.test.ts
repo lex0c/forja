@@ -58,6 +58,23 @@ describe('resolvePolicy — discovery', () => {
     expect(result.policy.defaults.mode).toBe('strict');
   });
 
+  test('skips user layer when userPolicyPath returns null (no absolute home)', () => {
+    // Regression: when HOME is unset the user path used to fall
+    // through to a relative `.config/agent/permissions.yaml` and
+    // existsSync would check it against the cwd. A repo with such
+    // a file could masquerade as the user layer and override
+    // project-local policy. Resolver must skip when path is null.
+    writeYaml(projectFile('.agent/permissions.yaml'), 'defaults:\n  mode: acceptEdits\n');
+    // Inject env with no HOME, no XDG — userPolicyPath returns null.
+    const result = resolvePolicy({
+      cwd: workdir,
+      enterprisePath: null,
+      env: {},
+    });
+    expect(result.layers.map((l) => l.layer)).toEqual(['project']);
+    expect(result.policy.defaults.mode).toBe('acceptEdits');
+  });
+
   test('session layer takes precedence over project when injected', () => {
     writeYaml(projectFile('.agent/permissions.yaml'), 'defaults:\n  mode: strict\n');
     const result = resolvePolicy({
@@ -161,6 +178,45 @@ describe('resolvePolicy — locked semantics', () => {
     writeFileSync(usr, 'defaults:\n  mode: strict\n');
     const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: usr });
     expect(result.lockConflicts).toEqual([]);
+  });
+
+  test('locked-only layer (no mode) freezes the inherited mode and blocks lower overrides', async () => {
+    // Regression: defaults.locked used to activate only inside the
+    // branch that processed mode changes. A layer with
+    // `defaults: { locked: true }` and no mode field silently
+    // failed to lock anything, letting lower layers override
+    // freely with no conflict reported. Lock must apply
+    // independently of whether the same layer also set mode.
+    const ent = projectFile('ent.yaml');
+    const usr = projectFile('usr.yaml');
+    writeFileSync(ent, 'defaults:\n  mode: bypass\n');
+    // user freezes whatever mode it inherited (bypass), no mode field.
+    writeFileSync(usr, 'defaults:\n  locked: true\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'defaults:\n  mode: strict\n');
+
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: usr });
+    // Inherited bypass survives; project's strict attempt is
+    // dropped and recorded.
+    expect(result.policy.defaults.mode).toBe('bypass');
+    expect(result.policy.defaults.locked).toBe(true);
+    expect(result.lockConflicts).toEqual([
+      { section: 'defaults.mode', lockedBy: 'user', attemptedBy: 'project' },
+    ]);
+  });
+
+  test('locked-only layer with no inherited mode locks the resolver default (strict)', async () => {
+    // Edge case: nobody set mode anywhere; the FIRST locked layer
+    // freezes the eventual default 'strict' applied at emit.
+    const usr = projectFile('usr.yaml');
+    writeFileSync(usr, 'defaults:\n  locked: true\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'defaults:\n  mode: bypass\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
+    // Project's bypass attempt is rejected; merged mode falls
+    // back to the resolver's strict default at emit.
+    expect(result.policy.defaults.mode).toBe('strict');
+    expect(result.lockConflicts).toEqual([
+      { section: 'defaults.mode', lockedBy: 'user', attemptedBy: 'project' },
+    ]);
   });
 
   test('lower layer that omits defaults entirely does NOT trip phantom conflict', () => {

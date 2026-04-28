@@ -27,6 +27,38 @@ describe('permission policy paths', () => {
     );
   });
 
+  test('user path returns null when HOME is unset and XDG is unset', () => {
+    // Regression: previously fell through to join('', '.config',
+    // 'agent', 'permissions.yaml') which produces a RELATIVE path.
+    // existsSync would then check against the current cwd, letting
+    // a repo-local `.config/agent/permissions.yaml` masquerade as
+    // the user layer. Returning null tells the resolver to skip.
+    expect(userPolicyPath({})).toBeNull();
+  });
+
+  test('user path returns null when HOME is empty string', () => {
+    expect(userPolicyPath({ HOME: '' })).toBeNull();
+  });
+
+  test('user path returns null when HOME is relative (not absolute)', () => {
+    // Defensive: a non-absolute HOME would still produce a relative
+    // joined path. Per XDG/POSIX, HOME should always be absolute;
+    // refuse rather than guess.
+    expect(userPolicyPath({ HOME: 'relative/home' })).toBeNull();
+  });
+
+  test('user path ignores XDG_CONFIG_HOME when it is relative (per XDG spec)', () => {
+    // XDG spec: "If the value is not an absolute path, the value
+    // is invalid and should be discarded."
+    expect(userPolicyPath({ XDG_CONFIG_HOME: 'rel', HOME: '/home/lex' })).toBe(
+      '/home/lex/.config/agent/permissions.yaml',
+    );
+  });
+
+  test('user path returns null when both XDG and HOME are non-absolute', () => {
+    expect(userPolicyPath({ XDG_CONFIG_HOME: 'rel-xdg', HOME: 'rel-home' })).toBeNull();
+  });
+
   test('project path is cwd/.agent/permissions.yaml', () => {
     expect(projectPolicyPath('/p')).toBe('/p/.agent/permissions.yaml');
   });
