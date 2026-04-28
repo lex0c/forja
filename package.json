@@ -1,0 +1,36 @@
+{
+  "name": "forja",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Agentic CLI — terminal-first, multi-provider, self-hostable",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "agent": "./dist/agent"
+  },
+  "scripts": {
+    "dev": "bun run --watch src/cli/index.ts",
+    "start": "bun run src/cli/index.ts",
+    "test": "bun test",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build src/cli/index.ts --compile --outfile dist/agent"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.0",
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  },
+  "trustedDependencies": ["@biomejs/biome"],
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.91.1",
+    "@google/genai": "^1.50.1",
+    "openai": "^6.34.0",
+    "yaml": "^2.8.3"
+  }
+}

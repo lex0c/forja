@@ -1,0 +1,27 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Forja runtime state (per spec §2.7)
+.agent/sessions.db
+.agent/sessions.db-*
+.agent/traces/
+.agent/checkpoints/
+.agent/memory/local/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+
+# Bun
+.bun/
