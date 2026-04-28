@@ -8,7 +8,7 @@ import type {
 } from '../providers/index.ts';
 import { stripAnsi } from '../sanitize/index.ts';
 import { abortableIterable } from './abortable.ts';
-import { collectStep } from './collect.ts';
+import { CollectStepError, collectStep } from './collect.ts';
 
 // Compaction shrinks the in-memory conversation history when the
 // provider's prompt is approaching its context window. AGENTIC_CLI §6
@@ -393,6 +393,16 @@ export const compactMessages = async (
       usageSeen: attemptUsageSeen,
     };
   } catch (e) {
+    // If collectStep threw mid-iteration (CollectStepError), the
+    // partial CollectedStep is on the error — including usage that
+    // the adapter's `finally` block emitted before the stream
+    // failed. Recover so compaction's billed tokens still flow into
+    // session totals; without this, a failed compaction call gets
+    // billed by the provider but reported as zero-usage fallback.
+    if (e instanceof CollectStepError) {
+      attemptUsage = e.partial.usage;
+      attemptUsageSeen = e.partial.usageSeen;
+    }
     // LLM path failed — apply deterministic elision so the run survives.
     // The original tool_result bodies stay in the SQLite audit log;
     // the model just sees pointers. Whatever usage we captured before

@@ -501,6 +501,31 @@ describe('compactMessages — deterministic fallback', () => {
     expect(shortStill).toBeDefined();
   });
 
+  test('fallback path preserves partial usage when collectStep throws (CollectStepError)', async () => {
+    // Regression: when the compaction summary stream emits a usage
+    // event and then throws (disconnect mid-response), collectStep
+    // wraps the partial in CollectStepError. compactMessages must
+    // unpack and surface that usage so the harness charges for the
+    // billed tokens; previously the partial was discarded and the
+    // fallback reported usageSeen=false / zero usage.
+    const handle = mockProvider(function* (): Iterable<StreamEvent> {
+      yield { kind: 'start', message_id: 'm' };
+      yield { kind: 'text_delta', text: '[compacted_history]\nGOAL:' };
+      yield {
+        kind: 'usage',
+        usage: { input: 250, output: 30, cache_read: 10, cache_creation: 0 },
+      };
+      throw new Error('connection reset');
+    });
+    const result = await compactMessages(handle.provider, buildHistory(5), { preserveTail: 3 });
+    expect(result.strategy).toBe('fallback');
+    expect(result.usageSeen).toBe(true);
+    expect(result.usage.input).toBe(250);
+    expect(result.usage.output).toBe(30);
+    expect(result.usage.cache_read).toBe(10);
+    expect(result.reason).toContain('connection reset');
+  });
+
   test('skipped path returns zero usage and usageSeen=false', async () => {
     const handle = mockProvider(() => replyText('not called'));
     const short = buildHistory(1);
