@@ -6,6 +6,7 @@ import {
   finishToolCall,
   recordApproval,
   startToolCall,
+  withTransaction,
 } from '../storage/index.ts';
 import {
   type Tool,
@@ -98,79 +99,100 @@ export const invokeTool = async (
     };
   }
 
-  // Persist the call before deciding, so audit captures both the request
-  // and the (eventual) approval row even if execution short-circuits.
-  const toolCall = createToolCall(deps.db, {
-    messageId: input.messageId,
-    toolName: input.toolName,
-    input: input.args,
-  });
-
   const decision = deps.engine.check(
     input.toolName,
     tool.metadata.category,
     input.args as ToolArgs,
   );
 
-  if (decision.kind === 'deny') {
+  // Setup phase: persist the tool_call, the approval, and the initial
+  // status (denied / running) atomically. Without the transaction, a
+  // crash between createToolCall and recordApproval leaves an orphan
+  // call row; between recordApproval and finishToolCall leaves a row
+  // stuck in 'pending' with an approval that says it should be denied.
+  type Setup =
+    | { phase: 'denied'; toolCall: { id: string }; reason: string }
+    | { phase: 'confirm_no'; toolCall: { id: string }; prompt: string }
+    | { phase: 'started'; toolCall: { id: string } };
+
+  const setup = withTransaction(deps.db, (): Setup => {
+    const toolCall = createToolCall(deps.db, {
+      messageId: input.messageId,
+      toolName: input.toolName,
+      input: input.args,
+    });
+
+    if (decision.kind === 'deny') {
+      recordApproval(deps.db, {
+        toolCallId: toolCall.id,
+        decision: 'deny',
+        decidedBy: 'policy',
+        reason: decision.reason,
+      });
+      finishToolCall(deps.db, {
+        id: toolCall.id,
+        status: 'denied',
+        durationMs: Date.now() - start,
+        error: decision.reason,
+      });
+      return { phase: 'denied', toolCall, reason: decision.reason };
+    }
+
+    if (decision.kind === 'confirm') {
+      // M1 has no UI to ask the user, so we treat `confirm` as denied with a
+      // dedicated reason. Step 6 (TUI) will wire a real confirm prompt and
+      // change `decision` to `confirm_yes`/`confirm_no` based on user input.
+      recordApproval(deps.db, {
+        toolCallId: toolCall.id,
+        decision: 'confirm_no',
+        decidedBy: 'policy',
+        reason: 'confirmation required, no UI in M1',
+      });
+      finishToolCall(deps.db, {
+        id: toolCall.id,
+        status: 'denied',
+        durationMs: Date.now() - start,
+        error: `confirmation required: ${decision.prompt}`,
+      });
+      return { phase: 'confirm_no', toolCall, prompt: decision.prompt };
+    }
+
+    // allow
     recordApproval(deps.db, {
       toolCallId: toolCall.id,
-      decision: 'deny',
+      decision: 'allow',
       decidedBy: 'policy',
-      reason: decision.reason,
+      reason: decision.reason ?? null,
     });
-    finishToolCall(deps.db, {
-      id: toolCall.id,
-      status: 'denied',
-      durationMs: Date.now() - start,
-      error: decision.reason,
-    });
+    startToolCall(deps.db, toolCall.id);
+    return { phase: 'started', toolCall };
+  });
+
+  if (setup.phase === 'denied') {
     return {
-      toolResult: buildErrorBlock(input.toolUseId, input.toolName, `denied: ${decision.reason}`),
-      toolCallId: toolCall.id,
+      toolResult: buildErrorBlock(input.toolUseId, input.toolName, `denied: ${setup.reason}`),
+      toolCallId: setup.toolCall.id,
       durationMs: Date.now() - start,
       failed: true,
       decision,
     };
   }
 
-  if (decision.kind === 'confirm') {
-    // M1 has no UI to ask the user, so we treat `confirm` as denied with a
-    // dedicated reason. Step 6 (TUI) will wire a real confirm prompt and
-    // change `decision` to `confirm_yes`/`confirm_no` based on user input.
-    recordApproval(deps.db, {
-      toolCallId: toolCall.id,
-      decision: 'confirm_no',
-      decidedBy: 'policy',
-      reason: 'confirmation required, no UI in M1',
-    });
-    finishToolCall(deps.db, {
-      id: toolCall.id,
-      status: 'denied',
-      durationMs: Date.now() - start,
-      error: `confirmation required: ${decision.prompt}`,
-    });
+  if (setup.phase === 'confirm_no') {
     return {
       toolResult: buildErrorBlock(
         input.toolUseId,
         input.toolName,
-        `requires user confirmation: ${decision.prompt}`,
+        `requires user confirmation: ${setup.prompt}`,
       ),
-      toolCallId: toolCall.id,
+      toolCallId: setup.toolCall.id,
       durationMs: Date.now() - start,
       failed: true,
       decision,
     };
   }
 
-  // allow
-  recordApproval(deps.db, {
-    toolCallId: toolCall.id,
-    decision: 'allow',
-    decidedBy: 'policy',
-    reason: decision.reason ?? null,
-  });
-  startToolCall(deps.db, toolCall.id);
+  const toolCall = setup.toolCall;
 
   let result: unknown;
   let crashed = false;

@@ -66,6 +66,39 @@ describe('bashTool', () => {
     if (isToolError(out)) expect(out.error_code).toBe('tool.aborted');
   });
 
+  test('scrubs sensitive env vars from the subprocess', async () => {
+    const original = {
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+      MY_TOKEN: process.env.MY_TOKEN,
+      AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY,
+      HARMLESS_VAR: process.env.HARMLESS_VAR,
+    };
+    process.env.ANTHROPIC_API_KEY = 'sk-secret-anthropic';
+    process.env.MY_TOKEN = 'tok-secret';
+    process.env.AWS_SECRET_ACCESS_KEY = 'aws-secret';
+    process.env.HARMLESS_VAR = 'visible';
+    try {
+      const out = await bashTool.execute(
+        {
+          command:
+            'echo "K=${ANTHROPIC_API_KEY:-MISSING} T=${MY_TOKEN:-MISSING} A=${AWS_SECRET_ACCESS_KEY:-MISSING} H=${HARMLESS_VAR:-MISSING}"',
+        },
+        makeCtx({ cwd: dir }),
+      );
+      if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+      expect(out.stdout).toContain('K=MISSING');
+      expect(out.stdout).toContain('T=MISSING');
+      expect(out.stdout).toContain('A=MISSING');
+      // Non-sensitive var still passes through.
+      expect(out.stdout).toContain('H=visible');
+    } finally {
+      for (const [k, v] of Object.entries(original)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+
   test('relative cwd argument is resolved against ctx.cwd', async () => {
     // Create a subdir and verify pwd resolves there.
     Bun.spawnSync(['mkdir', '-p', join(dir, 'sub')]);

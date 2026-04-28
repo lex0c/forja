@@ -11,6 +11,7 @@ import { appendMessage, completeSession, createSession } from '../storage/index.
 import type { ToolContext } from '../tools/index.ts';
 import { collectStep } from './collect.ts';
 import { invokeTool } from './invoke-tool.ts';
+import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
 import {
   DEFAULT_BUDGET,
   type ExitReason,
@@ -54,6 +55,7 @@ const exitToStatus: Record<ExitReason, TerminalSessionStatus> = {
   degenerateLoop: 'error',
   aborted: 'interrupted',
   providerError: 'error',
+  internalError: 'error',
   scriptExhausted: 'error',
 };
 
@@ -65,6 +67,7 @@ const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
   degenerateLoop: 'error',
   aborted: 'interrupted',
   providerError: 'error',
+  internalError: 'error',
   scriptExhausted: 'error',
 };
 
@@ -81,7 +84,15 @@ const buildToolDefs = (config: HarnessConfig): ProviderToolDef[] =>
 export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> => {
   const budget: RunBudget = { ...DEFAULT_BUDGET, ...(config.budget ?? {}) };
   const startMs = Date.now();
-  const signal = config.signal ?? new AbortController().signal;
+
+  // Combine the caller's abort signal with a wall-clock timer so the cap
+  // fires even when a provider call hangs mid-step (between-step checks
+  // miss this case). AbortSignal.any composes them; either firing aborts
+  // downstream provider/tool work via the canonical signal.
+  const wallClockController = new AbortController();
+  const wallClockTimer = setTimeout(() => wallClockController.abort(), budget.maxWallClockMs);
+  const callerSignal = config.signal ?? new AbortController().signal;
+  const signal = AbortSignal.any([callerSignal, wallClockController.signal]);
 
   const session = createSession(config.db, {
     model: config.provider.id,
@@ -103,8 +114,19 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   let consecutiveErrors = 0;
   let lastMessageId = userMsg.id;
 
+  // Distinguish wall-clock from user abort — both use `signal.aborted` but
+  // the user wants different exit reasons.
+  const isWallClockTimeout = (): boolean =>
+    wallClockController.signal.aborted && !callerSignal.aborted;
+
   const finish = (reason: ExitReason, detail?: string): HarnessResult => {
-    completeSession(config.db, session.id, exitToStatus[reason], 0);
+    clearTimeout(wallClockTimer);
+    try {
+      completeSession(config.db, session.id, exitToStatus[reason], 0);
+    } catch {
+      // Storage already broken; nothing useful to do beyond return the
+      // result so the caller knows the run is over.
+    }
     const result: HarnessResult = {
       status: exitToHarnessStatus[reason],
       reason,
@@ -118,162 +140,192 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     return result;
   };
 
+  // Convert any uncaught exception (typically SQLite errors from append
+  // operations) into a clean error exit instead of letting it crash the
+  // caller. Tool exceptions are already wrapped by invokeTool; this catch
+  // is for the persistence path that surrounds it.
+  const guardedFinish = (e: unknown): HarnessResult => {
+    const detail = e instanceof Error ? e.message || e.name || String(e) : String(e);
+    return finish('internalError', detail);
+  };
+
   safeEmit(config.onEvent, { type: 'session_start', sessionId: session.id });
 
-  while (true) {
-    if (signal.aborted) return finish('aborted');
-    if (steps >= budget.maxSteps) return finish('maxSteps');
-    if (Date.now() - startMs >= budget.maxWallClockMs) return finish('maxWallClockMs');
+  // The whole loop body is wrapped so SQLite errors (or any uncaught
+  // throw from the persistence path) become a clean error exit instead
+  // of crashing the caller. Tool exceptions are wrapped earlier by
+  // invokeTool; this is the safety net for the surrounding writes.
+  try {
+    while (true) {
+      if (signal.aborted) {
+        return finish(isWallClockTimeout() ? 'maxWallClockMs' : 'aborted');
+      }
+      if (steps >= budget.maxSteps) return finish('maxSteps');
 
-    steps += 1;
-    safeEmit(config.onEvent, { type: 'step_start', stepN: steps });
+      steps += 1;
+      safeEmit(config.onEvent, { type: 'step_start', stepN: steps });
 
-    const req: GenerateRequest = {
-      model: config.provider.id,
-      // Snapshot the running message list so post-call mutations (the next
-      // iteration appends assistant + tool_results) don't retroactively
-      // change what the provider observed.
-      messages: [...messages],
-      max_tokens: budget.maxOutputTokensPerCall,
-      ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
-      ...(tools.length > 0 ? { tools } : {}),
-    };
-
-    let collected: Awaited<ReturnType<typeof collectStep>>;
-    try {
-      collected = await collectStep(config.provider.generate(req), (ev) =>
-        safeEmit(config.onEvent, { type: 'provider_event', event: ev }),
-      );
-    } catch (e) {
-      const detail = e instanceof Error ? e.message || e.name || String(e) : String(e);
-      return finish('providerError', detail);
-    }
-
-    // Build assistant content blocks: text first, then tool_uses, mirroring
-    // the order the model produced them. Empty text is omitted.
-    const assistantContent: ProviderContentBlock[] = [];
-    if (collected.text.length > 0) {
-      assistantContent.push({ type: 'text', text: collected.text });
-    }
-    for (const tu of collected.tool_uses) {
-      const block: ProviderToolUseBlock = {
-        type: 'tool_use',
-        id: tu.id,
-        name: tu.name,
-        input: tu.input,
+      const req: GenerateRequest = {
+        model: config.provider.id,
+        // Snapshot the running message list so post-call mutations (the next
+        // iteration appends assistant + tool_results) don't retroactively
+        // change what the provider observed.
+        messages: [...messages],
+        max_tokens: budget.maxOutputTokensPerCall,
+        ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
+        ...(tools.length > 0 ? { tools } : {}),
       };
-      assistantContent.push(block);
-    }
 
-    const assistantMsg = appendMessage(config.db, {
-      sessionId: session.id,
-      role: 'assistant',
-      parentId: lastMessageId,
-      content: assistantContent.length > 0 ? assistantContent : '',
-    });
-    lastMessageId = assistantMsg.id;
-    if (assistantContent.length > 0) {
-      messages.push({ role: 'assistant', content: assistantContent });
-    }
-
-    // No tool uses → model is done speaking.
-    if (collected.tool_uses.length === 0) {
-      return finish('done');
-    }
-
-    // Execute every tool_use in this step, collecting results.
-    const toolResults: ProviderToolResultBlock[] = [];
-    for (const tu of collected.tool_uses) {
-      if (signal.aborted) return finish('aborted');
-
-      // Degenerate-loop detection: hash this call and check the sliding
-      // window. We do this BEFORE invocation so we can refuse cheaply.
-      const h = hashToolCall(tu.name, tu.input);
-      recentToolHashes.push(h);
-      if (recentToolHashes.length > HASH_WINDOW) recentToolHashes.shift();
-      const repeats = recentToolHashes.filter((x) => x === h).length;
-      if (repeats >= budget.maxRepeatedToolHash) {
-        return finish(
-          'degenerateLoop',
-          `tool ${tu.name} called ${repeats} times with identical args in last ${HASH_WINDOW} calls`,
+      let collected: Awaited<ReturnType<typeof collectStep>>;
+      try {
+        collected = await collectStep(
+          generateWithRetry(config.provider, req, DEFAULT_RETRY),
+          (ev) => safeEmit(config.onEvent, { type: 'provider_event', event: ev }),
         );
+      } catch (e) {
+        // SDK throws when the abort signal fires mid-call (Ctrl+C or
+        // wall-clock timeout). Reroute to the matching ExitReason so the
+        // user sees `interrupted` exit code 130 instead of a generic
+        // `error` from `providerError`.
+        if (signal.aborted) {
+          return finish(isWallClockTimeout() ? 'maxWallClockMs' : 'aborted');
+        }
+        const detail = e instanceof Error ? e.message || e.name || String(e) : String(e);
+        return finish('providerError', detail);
       }
 
-      const ctx: ToolContext = {
-        signal,
-        cwd: config.cwd,
+      // Build assistant content blocks: text first, then tool_uses, mirroring
+      // the order the model produced them. Empty text is omitted.
+      const assistantContent: ProviderContentBlock[] = [];
+      if (collected.text.length > 0) {
+        assistantContent.push({ type: 'text', text: collected.text });
+      }
+      for (const tu of collected.tool_uses) {
+        const block: ProviderToolUseBlock = {
+          type: 'tool_use',
+          id: tu.id,
+          name: tu.name,
+          input: tu.input,
+        };
+        assistantContent.push(block);
+      }
+
+      const assistantMsg = appendMessage(config.db, {
         sessionId: session.id,
-        stepId: assistantMsg.id,
-        permissions: config.permissionEngine.view(),
-      };
-
-      safeEmit(config.onEvent, {
-        type: 'tool_invoking',
-        toolUseId: tu.id,
-        toolName: tu.name,
-        args: tu.input,
+        role: 'assistant',
+        parentId: lastMessageId,
+        content: assistantContent.length > 0 ? assistantContent : '',
       });
+      lastMessageId = assistantMsg.id;
+      if (assistantContent.length > 0) {
+        messages.push({ role: 'assistant', content: assistantContent });
+      }
 
-      const inv = await invokeTool(
-        {
+      // No tool uses → model is done speaking.
+      if (collected.tool_uses.length === 0) {
+        return finish('done');
+      }
+
+      // Execute every tool_use in this step, collecting results.
+      const toolResults: ProviderToolResultBlock[] = [];
+      for (const tu of collected.tool_uses) {
+        if (signal.aborted) return finish('aborted');
+
+        // Degenerate-loop detection: hash this call and check the sliding
+        // window. We do this BEFORE invocation so we can refuse cheaply.
+        const h = hashToolCall(tu.name, tu.input);
+        recentToolHashes.push(h);
+        if (recentToolHashes.length > HASH_WINDOW) recentToolHashes.shift();
+        const repeats = recentToolHashes.filter((x) => x === h).length;
+        if (repeats >= budget.maxRepeatedToolHash) {
+          return finish(
+            'degenerateLoop',
+            `tool ${tu.name} called ${repeats} times with identical args in last ${HASH_WINDOW} calls`,
+          );
+        }
+
+        const ctx: ToolContext = {
+          signal,
+          cwd: config.cwd,
+          sessionId: session.id,
+          stepId: assistantMsg.id,
+          permissions: config.permissionEngine.view(),
+        };
+
+        safeEmit(config.onEvent, {
+          type: 'tool_invoking',
           toolUseId: tu.id,
           toolName: tu.name,
           args: tu.input,
-          messageId: assistantMsg.id,
-        },
-        {
-          db: config.db,
-          registry: config.toolRegistry,
-          engine: config.permissionEngine,
-          ctx,
-        },
-      );
+        });
 
-      if (inv.decision !== null) {
+        const inv = await invokeTool(
+          {
+            toolUseId: tu.id,
+            toolName: tu.name,
+            args: tu.input,
+            messageId: assistantMsg.id,
+          },
+          {
+            db: config.db,
+            registry: config.toolRegistry,
+            engine: config.permissionEngine,
+            ctx,
+          },
+        );
+
+        if (inv.decision !== null) {
+          safeEmit(config.onEvent, {
+            type: 'tool_decided',
+            toolUseId: tu.id,
+            decision: inv.decision,
+          });
+        }
         safeEmit(config.onEvent, {
-          type: 'tool_decided',
+          type: 'tool_finished',
           toolUseId: tu.id,
-          decision: inv.decision,
+          toolName: tu.name,
+          failed: inv.failed,
+          durationMs: inv.durationMs,
         });
+
+        toolResults.push(inv.toolResult);
+        if (inv.failed) {
+          consecutiveErrors += 1;
+        } else {
+          consecutiveErrors = 0;
+        }
+
+        if (consecutiveErrors >= budget.maxToolErrors) {
+          // Persist the partial tool_result message before bailing so the
+          // session history reflects what actually happened. Mirror it in
+          // the in-memory `messages` array for symmetry with the normal
+          // path; nothing reads it post-bail today, but a future refactor
+          // that does (resume, replay) gets a consistent view.
+          const partialMsg = appendMessage(config.db, {
+            sessionId: session.id,
+            role: 'user',
+            parentId: lastMessageId,
+            content: toolResults,
+          });
+          lastMessageId = partialMsg.id;
+          messages.push({ role: 'user', content: toolResults });
+          return finish('maxToolErrors', `${consecutiveErrors} consecutive tool errors`);
+        }
       }
-      safeEmit(config.onEvent, {
-        type: 'tool_finished',
-        toolUseId: tu.id,
-        toolName: tu.name,
-        failed: inv.failed,
-        durationMs: inv.durationMs,
+
+      // Persist tool_results back as a user message; mirror them in the
+      // running provider message list for the next turn.
+      const resultMsg = appendMessage(config.db, {
+        sessionId: session.id,
+        role: 'user',
+        parentId: lastMessageId,
+        content: toolResults,
       });
-
-      toolResults.push(inv.toolResult);
-      if (inv.failed) {
-        consecutiveErrors += 1;
-      } else {
-        consecutiveErrors = 0;
-      }
-
-      if (consecutiveErrors >= budget.maxToolErrors) {
-        // Persist the partial tool_result message before bailing so the
-        // session history reflects what actually happened.
-        const partialMsg = appendMessage(config.db, {
-          sessionId: session.id,
-          role: 'user',
-          parentId: lastMessageId,
-          content: toolResults,
-        });
-        lastMessageId = partialMsg.id;
-        return finish('maxToolErrors', `${consecutiveErrors} consecutive tool errors`);
-      }
+      lastMessageId = resultMsg.id;
+      messages.push({ role: 'user', content: toolResults });
     }
-
-    // Persist tool_results back as a user message; mirror them in the
-    // running provider message list for the next turn.
-    const resultMsg = appendMessage(config.db, {
-      sessionId: session.id,
-      role: 'user',
-      parentId: lastMessageId,
-      content: toolResults,
-    });
-    lastMessageId = resultMsg.id;
-    messages.push({ role: 'user', content: toolResults });
+  } catch (e) {
+    return guardedFinish(e);
   }
 };

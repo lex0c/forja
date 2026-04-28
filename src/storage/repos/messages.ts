@@ -1,4 +1,5 @@
 import type { DB } from '../db.ts';
+import { parseJsonSafe } from '../json-safe.ts';
 
 export type MessageRole = 'user' | 'assistant' | 'tool';
 
@@ -31,7 +32,7 @@ const fromRow = (row: MessageRow): Message => ({
   sessionId: row.session_id,
   parentId: row.parent_id,
   role: row.role,
-  content: JSON.parse(row.content) as unknown,
+  content: parseJsonSafe(row.content, `messages(${row.id}).content`),
   tokensIn: row.tokens_in,
   tokensOut: row.tokens_out,
   cachedTokens: row.cached_tokens,

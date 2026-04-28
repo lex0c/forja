@@ -12,6 +12,12 @@ export {
 } from './invoke-tool.ts';
 export { runAgent } from './loop.ts';
 export {
+  DEFAULT_RETRY,
+  generateWithRetry,
+  isRetryableError,
+  type RetryOptions,
+} from './retry.ts';
+export {
   DEFAULT_BUDGET,
   type ExitReason,
   type HarnessConfig,

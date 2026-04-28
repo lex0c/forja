@@ -11,6 +11,13 @@ export interface RunOptions {
   // Test seams: defaults derive from args + process state in production.
   bootstrapOverride?: Partial<BootstrapInput>;
   signal?: AbortSignal;
+  // Inject a renderer to capture output instead of writing to process
+  // streams. Skips the json/plain selection branch when set.
+  rendererOverride?: OutputRenderer;
+  // Sink for the catastrophic "forja: <error>" line printed when
+  // bootstrap or runAgent throws unexpectedly. Defaults to
+  // process.stderr; tests inject a string collector.
+  errSink?: (s: string) => void;
 }
 
 const pickRenderer = (args: ParsedArgs): OutputRenderer => {
@@ -42,7 +49,8 @@ export const exitCodeFor = (result: HarnessResult): number => {
 
 export const run = async (options: RunOptions): Promise<number> => {
   const { args } = options;
-  const renderer = pickRenderer(args);
+  const renderer = options.rendererOverride ?? pickRenderer(args);
+  const errSink = options.errSink ?? ((s: string) => process.stderr.write(s));
 
   const controller = new AbortController();
   const signal = options.signal ?? controller.signal;
@@ -73,7 +81,7 @@ export const run = async (options: RunOptions): Promise<number> => {
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message || e.name || String(e) : String(e);
-    process.stderr.write(`forja: ${msg}\n`);
+    errSink(`forja: ${msg}\n`);
     return 1;
   } finally {
     restoreSignal();

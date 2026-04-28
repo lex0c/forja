@@ -309,6 +309,49 @@ describe('runAgent', () => {
     expect(sessions).toHaveLength(1);
   });
 
+  test('abort during provider stream returns interrupted/aborted (not providerError)', async () => {
+    // Simulate the SDK throwing AbortError when the signal fires mid-call.
+    const ctrl = new AbortController();
+    const provider: Provider = {
+      id: 'mock/abort',
+      family: 'anthropic',
+      capabilities: {
+        tools: 'native',
+        cache: false,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 1000,
+        output_max_tokens: 100,
+        cost_per_1k_input: 0,
+        cost_per_1k_output: 0,
+        notes: [],
+      },
+      // biome-ignore lint/correctness/useYield: throws before yielding
+      async *generate() {
+        // Abort the moment we're called, then throw the SDK-style AbortError.
+        ctrl.abort();
+        const e = new Error('aborted by signal') as Error & { code: string };
+        e.code = 'ABORT_ERR';
+        throw e;
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+    const registry = createToolRegistry();
+    const result = await runAgent({
+      provider,
+      toolRegistry: registry,
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      signal: ctrl.signal,
+    });
+    expect(result.status).toBe('interrupted');
+    expect(result.reason).toBe('aborted');
+  });
+
   test('provider crash exits as providerError with detail', async () => {
     const provider: Provider = {
       id: 'mock/crash',

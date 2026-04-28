@@ -1,4 +1,5 @@
 import type { DB } from '../db.ts';
+import { parseJsonSafe } from '../json-safe.ts';
 
 export type ToolCallStatus = 'pending' | 'running' | 'done' | 'error' | 'denied';
 
@@ -30,8 +31,8 @@ const fromRow = (row: ToolCallRow): ToolCall => ({
   id: row.id,
   messageId: row.message_id,
   toolName: row.tool_name,
-  input: JSON.parse(row.input) as unknown,
-  output: row.output !== null ? (JSON.parse(row.output) as unknown) : null,
+  input: parseJsonSafe(row.input, `tool_calls(${row.id}).input`),
+  output: row.output !== null ? parseJsonSafe(row.output, `tool_calls(${row.id}).output`) : null,
   status: row.status,
   durationMs: row.duration_ms,
   error: row.error,

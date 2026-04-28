@@ -59,7 +59,8 @@ export type ExitReason =
   | 'maxToolErrors'
   | 'degenerateLoop'
   | 'aborted' // user cancelled via signal
-  | 'providerError' // unrecoverable provider failure
+  | 'providerError' // unrecoverable provider failure (network, 4xx)
+  | 'internalError' // uncaught throw in the harness path (typically SQLite)
   | 'scriptExhausted'; // mock provider drained — only seen in tests
 
 export interface HarnessConfig {

@@ -1,5 +1,6 @@
 export { MEMORY_DB, openDb, openMemoryDb, withTransaction } from './db.ts';
 export type { DB } from './db.ts';
+export { StorageJsonError } from './json-safe.ts';
 
 export { defaultDataDir, defaultDbPath } from './paths.ts';
 

@@ -1,12 +1,37 @@
-import { isAbsolute, resolve } from 'node:path';
+import { realpathSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { Glob } from 'bun';
+
+// Resolve symlinks before matching. Without this, a symlink at
+// `src/link → /etc/passwd` would let a `src/**` allow rule grant access
+// to `/etc/passwd` because the matcher only sees the cwd-relative form.
+//
+// realpath fails on paths that don't exist (e.g., `write_file` creating
+// a new file). For those we fall back to realpathing the parent dir +
+// joining the basename — that catches the case where `src` itself is a
+// symlink to `/etc/`. If even the parent doesn't exist, give up and use
+// the input — there's nothing to follow.
+const resolveSymlinks = (abs: string): string => {
+  try {
+    return realpathSync(abs);
+  } catch {
+    try {
+      return join(realpathSync(dirname(abs)), basename(abs));
+    } catch {
+      return abs;
+    }
+  }
+};
 
 // Path matching: every pattern and every input is normalized to a path
 // relative to `cwd`, then matched with Bun.Glob. Absolute paths outside
 // cwd never match cwd-relative patterns (a bare `**/foo` won't reach into
-// `/etc/passwd`), which is the security property we want.
+// `/etc/passwd`), which is the security property we want. Symlinks are
+// resolved on the target before matching, so a symlink inside cwd that
+// points outside cwd won't sneak past.
 export const matchPath = (pattern: string, target: string, cwd: string): boolean => {
-  const absTarget = isAbsolute(target) ? target : resolve(cwd, target);
+  const absTargetRaw = isAbsolute(target) ? target : resolve(cwd, target);
+  const absTarget = resolveSymlinks(absTargetRaw);
   const absPattern = isAbsolute(pattern) ? pattern : resolve(cwd, pattern);
 
   const absCwd = resolve(cwd);

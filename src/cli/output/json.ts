@@ -7,11 +7,20 @@ import type { OutputRenderer } from './types.ts';
 // We pass the HarnessEvent through directly; provider_event embeds the
 // canonical StreamEvent shape (CONTRACTS.md §4) so consumers can rely on
 // the exact taxonomy.
-export const createJsonRenderer = (): OutputRenderer => ({
-  onEvent(event: HarnessEvent) {
-    process.stdout.write(`${JSON.stringify(event)}\n`);
-  },
-  flush() {
-    // No trailing state to emit; each event is self-contained.
-  },
-});
+export interface JsonRendererOptions {
+  // Sink for NDJSON lines. Defaults to process.stdout.write in production;
+  // tests inject string-collecting fakes.
+  out?: (s: string) => void;
+}
+
+export const createJsonRenderer = (options: JsonRendererOptions = {}): OutputRenderer => {
+  const out = options.out ?? ((s: string) => process.stdout.write(s));
+  return {
+    onEvent(event: HarnessEvent) {
+      out(`${JSON.stringify(event)}\n`);
+    },
+    flush() {
+      // No trailing state to emit; each event is self-contained.
+    },
+  };
+};
