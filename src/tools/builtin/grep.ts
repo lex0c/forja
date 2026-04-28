@@ -40,26 +40,23 @@ interface RipgrepMatchEvent {
 
 type RipgrepEvent = RipgrepBeginEvent | RipgrepMatchEvent | { type: string };
 
-const parseRipgrepJson = (stdout: string): GrepMatch[] => {
-  const out: GrepMatch[] = [];
-  for (const line of stdout.split('\n')) {
-    if (line.length === 0) continue;
-    let event: RipgrepEvent;
-    try {
-      event = JSON.parse(line) as RipgrepEvent;
-    } catch {
-      continue; // skip malformed lines
-    }
-    if (event.type === 'match') {
-      const m = (event as RipgrepMatchEvent).data;
-      out.push({
-        file: m.path.text,
-        line: m.line_number,
-        text: m.lines.text.replace(/\n$/, ''),
-      });
-    }
+// Parse a single NDJSON line. Returns the GrepMatch if the line is a
+// `match` event, or null for begin/end/summary lines and malformed JSON.
+const parseRipgrepLine = (line: string): GrepMatch | null => {
+  if (line.length === 0) return null;
+  let event: RipgrepEvent;
+  try {
+    event = JSON.parse(line) as RipgrepEvent;
+  } catch {
+    return null; // skip malformed lines
   }
-  return out;
+  if (event.type !== 'match') return null;
+  const m = (event as RipgrepMatchEvent).data;
+  return {
+    file: m.path.text,
+    line: m.line_number,
+    text: m.lines.text.replace(/\n$/, ''),
+  };
 };
 
 export const grepTool: Tool<GrepInput, GrepOutput> = {
@@ -95,6 +92,9 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
     }
 
     const max = args.max_results ?? DEFAULT_MAX;
+    // Pass --max-count as a per-file safety so a single huge file can't
+    // dominate the budget. The global cap is enforced below by counting
+    // matches as we stream and killing rg when we hit `max`.
     const cmd: string[] = ['rg', '--json', '--max-count', String(max)];
     if (args.case_insensitive === true) cmd.push('-i');
     if (args.glob !== undefined) cmd.push('--glob', args.glob);
@@ -124,11 +124,60 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
       return toolError(ERROR_CODES.ripgrepFailed, `failed to spawn ripgrep: ${msg}`);
     }
 
-    const stdout = await new Response(proc.stdout as ReadableStream<Uint8Array>).text();
+    // Stream stdout line-by-line, parsing as we go. The earlier
+    // implementation buffered the whole output into memory before
+    // slicing, so a large repo could blow up memory even when `max`
+    // was small. With streaming we stop as soon as we hit `max` matches
+    // and kill rg so it stops walking the tree.
+    const matches: GrepMatch[] = [];
+    let truncated = false;
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      for await (const chunk of proc.stdout as ReadableStream<Uint8Array>) {
+        buffer += decoder.decode(chunk, { stream: true });
+
+        let newlineIdx = buffer.indexOf('\n');
+        while (newlineIdx !== -1) {
+          const line = buffer.slice(0, newlineIdx);
+          buffer = buffer.slice(newlineIdx + 1);
+          const m = parseRipgrepLine(line);
+          if (m !== null) {
+            matches.push(m);
+            if (matches.length >= max) {
+              truncated = true;
+              break;
+            }
+          }
+          newlineIdx = buffer.indexOf('\n');
+        }
+
+        if (truncated) {
+          try {
+            proc.kill('SIGTERM');
+          } catch {
+            // already exited
+          }
+          break;
+        }
+      }
+      // Flush any trailing line in the buffer that didn't end with `\n`.
+      if (!truncated && buffer.length > 0) {
+        const m = parseRipgrepLine(buffer);
+        if (m !== null) matches.push(m);
+      }
+    } catch (e) {
+      // for-await on an aborted stream throws; surface as a clean error.
+      return toolError(ERROR_CODES.ripgrepFailed, `ripgrep stream failed: ${(e as Error).message}`);
+    }
+
     const exit = await proc.exited;
 
-    // ripgrep returns 0 on matches, 1 on no matches, 2+ on errors.
-    if (exit !== 0 && exit !== 1) {
+    // If we killed rg because of truncation, ignore the exit code (it
+    // reflects SIGTERM, not an error). Otherwise: rg returns 0 on
+    // matches, 1 on no matches, 2+ on real errors.
+    if (!truncated && exit !== 0 && exit !== 1) {
       const stderr = await new Response(proc.stderr as ReadableStream<Uint8Array>).text();
       return toolError(
         ERROR_CODES.ripgrepFailed,
@@ -137,11 +186,9 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
       );
     }
 
-    const matches = parseRipgrepJson(stdout);
-    const truncated = matches.length >= max;
     return {
       pattern: args.pattern,
-      matches: matches.slice(0, max),
+      matches,
       count: matches.length,
       truncated,
     };

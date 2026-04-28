@@ -309,6 +309,33 @@ describe('runAgent', () => {
     expect(sessions).toHaveLength(1);
   });
 
+  test('max_tokens stop_reason exits as exhausted/maxOutputTokens (not done)', async () => {
+    // Provider returns text and stops with max_tokens — output was
+    // truncated by the per-call cap. Reporting `done` (exit 0) would
+    // silently hand the user an incomplete answer.
+    const { config } = buildConfig([{ text: 'partial answer', stop_reason: 'max_tokens' }]);
+    const result = await runAgent(config);
+    expect(result.status).toBe('exhausted');
+    expect(result.reason).toBe('maxOutputTokens');
+    expect(result.detail).toContain('max_tokens');
+  });
+
+  test('refusal stop_reason exits as done (the refusal IS the response)', async () => {
+    // Model said "no" — that's a valid completion. Should NOT be
+    // surfaced as an error; the user gets the refusal text in the
+    // assistant message.
+    const { config } = buildConfig([{ text: "I can't help with that.", stop_reason: 'refusal' }]);
+    const result = await runAgent(config);
+    expect(result.status).toBe('done');
+    expect(result.reason).toBe('done');
+  });
+
+  test('stop_sequence stop_reason exits as done', async () => {
+    const { config } = buildConfig([{ text: 'all done', stop_reason: 'stop_sequence' }]);
+    const result = await runAgent(config);
+    expect(result.status).toBe('done');
+  });
+
   test('wall-clock timeout in the tool loop is reported as maxWallClockMs (not aborted)', async () => {
     // The tool loop checks signal.aborted between invocations. If a
     // wall-clock timeout fires while a tool is running, the next

@@ -52,6 +52,7 @@ const exitToStatus: Record<ExitReason, TerminalSessionStatus> = {
   done: 'done',
   maxSteps: 'exhausted',
   maxWallClockMs: 'interrupted',
+  maxOutputTokens: 'exhausted',
   maxToolErrors: 'error',
   degenerateLoop: 'error',
   aborted: 'interrupted',
@@ -64,6 +65,7 @@ const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
   done: 'done',
   maxSteps: 'exhausted',
   maxWallClockMs: 'interrupted',
+  maxOutputTokens: 'exhausted',
   maxToolErrors: 'error',
   degenerateLoop: 'error',
   aborted: 'interrupted',
@@ -241,8 +243,21 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         return finish('providerError', `stream errors: ${detail}`);
       }
 
-      // No tool uses → model is done speaking.
+      // No tool uses → check the stop_reason before declaring success.
+      // `end_turn`, `stop_sequence`, and `refusal` are all "model finished
+      // speaking" (the refusal IS the response, even if it's a no). But
+      // `max_tokens` means the per-call output cap truncated the answer
+      // mid-stream; reporting `done` here would silently hand the user
+      // an incomplete response with exit code 0. Surface it as an
+      // `exhausted` exit so callers know to retry with a higher cap or
+      // route to compaction (M2).
       if (collected.tool_uses.length === 0) {
+        if (collected.stop_reason === 'max_tokens') {
+          return finish(
+            'maxOutputTokens',
+            `provider truncated at max_tokens (cap=${budget.maxOutputTokensPerCall})`,
+          );
+        }
         return finish('done');
       }
 

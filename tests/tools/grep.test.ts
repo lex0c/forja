@@ -77,6 +77,23 @@ describe.if(RG_AVAILABLE)('grepTool (with ripgrep)', () => {
     }
   });
 
+  test('max_results is a global cap across files (not per-file like rg --max-count)', async () => {
+    // Create N files each with 5 hits. Without a global cap, rg's
+    // per-file --max-count would let through up to N*5 matches even
+    // when max_results is small.
+    for (let i = 0; i < 4; i++) {
+      writeFileSync(join(dir, `src/multi-${i}.ts`), Array(5).fill('needle here').join('\n'));
+    }
+    const out = await grepTool.execute(
+      { pattern: 'needle', max_results: 3 },
+      makeCtx({ cwd: dir }),
+    );
+    if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
+    expect(out.count).toBe(3);
+    expect(out.matches).toHaveLength(3);
+    expect(out.truncated).toBe(true);
+  });
+
   test('honors aborted signal', async () => {
     const ctrl = new AbortController();
     ctrl.abort();

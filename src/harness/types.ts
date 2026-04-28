@@ -56,6 +56,7 @@ export type ExitReason =
   | 'done' // model emitted text without tool_use
   | 'maxSteps'
   | 'maxWallClockMs'
+  | 'maxOutputTokens' // provider truncated the response at max_tokens
   | 'maxToolErrors'
   | 'degenerateLoop'
   | 'aborted' // user cancelled via signal
