@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { type BgManager, createBgManager } from '../../src/bg/index.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import type { DB } from '../../src/storage/db.ts';
@@ -77,6 +77,59 @@ describe('bg manager: spawn', () => {
     const r = await mgr.spawn({ command: 'true' });
     expect(r.label).toBeNull();
     await waitForExit(r.id);
+  });
+
+  test('spawned subprocess does not keep parent runtime alive (unref)', async () => {
+    // Regression: without proc.unref(), a referenced bg subprocess
+    // holds the parent event loop active even after the last
+    // userspace work is done — a CLI that spawned a long-running
+    // process and then "exited cleanly" would hang until the child
+    // dies. Verified end-to-end by spawning a fresh `bun` process
+    // that creates a manager + spawns a 30s sleep + returns
+    // without cleanup. With unref, that bun process exits in ms;
+    // without it, the bun process hangs ≥30s waiting on the child.
+    const repoRoot = resolve(import.meta.dir, '..', '..');
+    const script = `
+      import { mkdtempSync } from 'node:fs';
+      import { tmpdir } from 'node:os';
+      import { join } from 'node:path';
+      import { createBgManager } from '${repoRoot}/src/bg/index.ts';
+      import { openMemoryDb } from '${repoRoot}/src/storage/db.ts';
+      import { migrate } from '${repoRoot}/src/storage/migrate.ts';
+      import { createSession } from '${repoRoot}/src/storage/repos/sessions.ts';
+      const db = openMemoryDb();
+      migrate(db);
+      const sid = createSession(db, { model: 'm', cwd: '/p' }).id;
+      const dir = mkdtempSync(join(tmpdir(), 'unref-test-'));
+      const mgr = createBgManager({ db, sessionId: sid, logDir: dir });
+      await mgr.spawn({ command: 'sleep 30' });
+      // No cleanup, no exit-event awaits, nothing keeping the loop
+      // alive except the unref'd subprocess itself.
+    `;
+    const start = Date.now();
+    const child = Bun.spawn(['bun', '-e', script], {
+      stdout: 'ignore',
+      stderr: 'ignore',
+    });
+    const exitCode = await child.exited;
+    const elapsed = Date.now() - start;
+    expect(exitCode).toBe(0);
+    // Parent should exit in well under 5 seconds; the bg process
+    // sleeps 30 seconds. If unref regressed, this would block
+    // ~30 seconds and the test runner would time out.
+    expect(elapsed).toBeLessThan(5000);
+    // Reap the orphaned grandchild bg process so the test host is
+    // clean. Best-effort — the bun process is gone, so the bash
+    // grandchild may have been reparented to PID 1 already.
+    try {
+      // Find sleep processes by command line and signal them. We
+      // don't have the pid here (the script didn't surface it), so
+      // a targeted pkill is the cleanest portable option.
+      Bun.spawnSync(['pkill', '-f', 'sleep 30'], { stdout: 'ignore', stderr: 'ignore' });
+    } catch {
+      // If pkill is missing or denied, leave it — sleep 30 will
+      // self-exit within the test wall clock.
+    }
   });
 
   test('scrubs credentials from spawned env (defense-in-depth)', async () => {

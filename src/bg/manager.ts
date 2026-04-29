@@ -233,10 +233,17 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
         env: scrubEnv(process.env),
         stdout: Bun.file(stdoutPath),
         stderr: Bun.file(stderrPath),
-        // Detach from parent so a crash of the harness doesn't
-        // propagate via SIGHUP. Reaping still happens via
-        // proc.exited even with detached children.
       });
+      // Unref the subprocess so it does NOT keep the parent event
+      // loop alive. A bg process is by definition long-running
+      // (npm run dev, pytest --watch, file watchers); without unref,
+      // a referenced child holds the harness alive after the loop
+      // exits, and the CLI hangs on what looks like a clean exit
+      // path. Cleanup at session end issues SIGTERM/SIGKILL anyway,
+      // so we don't NEED the child to keep the parent alive. The
+      // exit handler subscribes via `proc.exited` which still
+      // resolves on detached children — no reaping regression.
+      proc.unref();
     } catch (e) {
       // Spawn-time failure (typical: bash not on PATH — vanishingly
       // rare on this stack — or cwd doesn't exist). Record the
