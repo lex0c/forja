@@ -71,6 +71,38 @@ export const bashKillTool: Tool<BashKillInput, BashKillOutput> = {
     if (typeof args.process_id !== 'string' || args.process_id.length === 0) {
       return toolError(ERROR_CODES.invalidArg, 'process_id must be a non-empty string');
     }
+    // Schema declares `signal` as an enum and `grace_period_ms` with
+    // minimum: 0, but providers don't enforce schema constraints —
+    // model JSON arrives unvalidated. Without these checks, an
+    // unexpected `signal` value (e.g. 'SIGUSR1') leaks into
+    // proc.kill() with a confusing failure shape, and a non-numeric
+    // or negative `grace_period_ms` is coerced inside the manager's
+    // sleep path, collapsing the grace window to ~0ms — graceful
+    // shutdown becomes immediate SIGKILL escalation, defeating the
+    // documented semantics. Reject runtime-side with the same
+    // boundaries the schema declares.
+    const ALLOWED_SIGNALS = ['SIGTERM', 'SIGKILL', 'SIGINT', 'SIGHUP'] as const;
+    if (args.signal !== undefined) {
+      if (
+        typeof args.signal !== 'string' ||
+        !(ALLOWED_SIGNALS as readonly string[]).includes(args.signal)
+      ) {
+        return toolError(
+          ERROR_CODES.invalidArg,
+          `signal must be one of: ${ALLOWED_SIGNALS.join(', ')}`,
+        );
+      }
+    }
+    if (args.grace_period_ms !== undefined) {
+      if (
+        typeof args.grace_period_ms !== 'number' ||
+        !Number.isFinite(args.grace_period_ms) ||
+        !Number.isInteger(args.grace_period_ms) ||
+        args.grace_period_ms < 0
+      ) {
+        return toolError(ERROR_CODES.invalidArg, 'grace_period_ms must be a non-negative integer');
+      }
+    }
     try {
       const opts: { signal?: 'SIGTERM' | 'SIGKILL' | 'SIGINT' | 'SIGHUP'; gracePeriodMs?: number } =
         {};

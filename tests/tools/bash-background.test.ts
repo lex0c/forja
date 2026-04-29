@@ -134,4 +134,47 @@ describe('bash_background tool', () => {
     const out = await mgr.readOutput(r.process_id);
     expect(out.stdout.trim()).toBe(otherDir);
   });
+
+  // max_runtime_ms is documented in the schema as `minimum: 100`, but
+  // model JSON arrives unvalidated against the schema. Without a
+  // runtime check, a non-numeric value coerces to NaN inside
+  // setTimeout (effective ~1ms terminate) and a numeric value <100ms
+  // kills the process before any useful work — defeating the
+  // documented "minimum runtime cap" semantics.
+  test('rejects max_runtime_ms below the 100ms minimum', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashBackgroundTool.execute({ command: 'sleep 1', max_runtime_ms: 1 }, ctx);
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('max_runtime_ms');
+  });
+
+  test('rejects non-numeric max_runtime_ms', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashBackgroundTool.execute(
+      // biome-ignore lint/suspicious/noExplicitAny: testing invalid input shape
+      { command: 'sleep 1', max_runtime_ms: 'abc' as any },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+  });
+
+  test('rejects non-integer max_runtime_ms', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashBackgroundTool.execute({ command: 'sleep 1', max_runtime_ms: 500.5 }, ctx);
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+  });
+
+  test('accepts max_runtime_ms at the 100ms minimum', async () => {
+    // Sanity: the minimum boundary itself is allowed. Tool returns
+    // process_id; the manager handles termination via its own
+    // SIGTERM → SIGKILL grace cycle.
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashBackgroundTool.execute({ command: 'sleep 0.05', max_runtime_ms: 100 }, ctx);
+    if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+    expect(typeof r.process_id).toBe('string');
+    await waitForExit(r.process_id);
+  });
 });

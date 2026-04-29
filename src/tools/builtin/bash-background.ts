@@ -81,6 +81,27 @@ export const bashBackgroundTool: Tool<BashBackgroundInput, BashBackgroundOutput>
     if (typeof args.command !== 'string' || args.command.length === 0) {
       return toolError(ERROR_CODES.invalidArg, 'command must be a non-empty string');
     }
+    // Schema declares `minimum: 100` but providers may not enforce
+    // schema constraints — model JSON arrives unvalidated. Without
+    // these checks, a non-numeric value (e.g. "abc") gets coerced
+    // by setTimeout into a silly delay (NaN → 1ms-ish), and a
+    // numeric value below 100ms terminates the process before any
+    // useful work could happen — defeating the documented
+    // "minimum runtime cap" semantics. Reject runtime-side with
+    // a clean tool error that matches the schema declaration.
+    // No upper bound: bash_background is the right tool for long
+    // dev servers / watchers / pytest --watch where the runtime is
+    // legitimately unbounded.
+    if (args.max_runtime_ms !== undefined) {
+      if (
+        typeof args.max_runtime_ms !== 'number' ||
+        !Number.isFinite(args.max_runtime_ms) ||
+        !Number.isInteger(args.max_runtime_ms) ||
+        args.max_runtime_ms < 100
+      ) {
+        return toolError(ERROR_CODES.invalidArg, 'max_runtime_ms must be an integer >= 100 (ms)');
+      }
+    }
     // Resolve cwd against the session: undefined → session cwd;
     // absolute → as-is; relative → resolve from session cwd. Same
     // pattern as the synchronous bash tool. Forwarding args.cwd
