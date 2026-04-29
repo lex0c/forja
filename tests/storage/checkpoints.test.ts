@@ -172,6 +172,54 @@ describe('checkpoints repo', () => {
     expect(aged.map((c) => c.gitRef)).toEqual(['old']);
   });
 
+  test('listCheckpointsOlderThan with cwd scopes to that project only', () => {
+    // Two sessions in different cwds, both with aged-out rows. The
+    // cwd-scoped variant returns only the local one — protects the
+    // lazy retention sweep from crossing project boundaries.
+    const otherSession = createSession(db, { model: 'm', cwd: '/other' }).id;
+    insertCheckpoint(db, {
+      sessionId,
+      stepId: 's1',
+      gitRef: 'local',
+      hadBash: false,
+      createdAt: 100,
+    });
+    insertCheckpoint(db, {
+      sessionId: otherSession,
+      stepId: 's2',
+      gitRef: 'foreign',
+      hadBash: false,
+      createdAt: 100,
+    });
+
+    const aged = listCheckpointsOlderThan(db, 500, '/p');
+    expect(aged.map((c) => c.gitRef)).toEqual(['local']);
+  });
+
+  test('listCheckpointsOlderThan without cwd returns rows globally', () => {
+    // Backwards-compatible signature: undefined cwd preserves the
+    // pre-fix shape for any future tooling that wants a cross-project
+    // sweep.
+    const otherSession = createSession(db, { model: 'm', cwd: '/other' }).id;
+    insertCheckpoint(db, {
+      sessionId,
+      stepId: 's1',
+      gitRef: 'a',
+      hadBash: false,
+      createdAt: 100,
+    });
+    insertCheckpoint(db, {
+      sessionId: otherSession,
+      stepId: 's2',
+      gitRef: 'b',
+      hadBash: false,
+      createdAt: 100,
+    });
+
+    const aged = listCheckpointsOlderThan(db, 500);
+    expect(aged.map((c) => c.gitRef).sort()).toEqual(['a', 'b']);
+  });
+
   test('cascade: deleting a session drops its checkpoints', () => {
     insertCheckpoint(db, { sessionId, stepId: 's1', gitRef: 'a', hadBash: false });
     db.query('DELETE FROM sessions WHERE id = ?').run(sessionId);

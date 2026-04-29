@@ -171,6 +171,50 @@ describe('CheckpointManager — available mode', () => {
     expect(await resolveRef(repo, sessionRef(sessionId))).toBeNull();
   });
 
+  test('purge by age does NOT touch rows from sessions in other cwds', async () => {
+    // Lazy retention runs at session_start of every agent run, with
+    // manager bound to the current cwd. The age-based row sweep must
+    // be cwd-scoped — otherwise running the agent in /repo/A would
+    // periodically wipe /repo/B's audit history once those rows
+    // crossed the cutoff, even though /repo/B's git refs (and the
+    // ability to restore from them) are intact in /repo/B's git
+    // store. Result without the scope: CLI in /repo/B reports "no
+    // checkpoints" for a session that still has working refs.
+    await initRepoWithSeed(repo);
+    // Seed a session that "lives" in a foreign cwd.
+    const foreignCwd = await mkdtemp(join(tmpdir(), 'forja-mgr-foreign-'));
+    try {
+      const foreignSession = createSession(db, { model: 'm', cwd: foreignCwd }).id;
+      // Aged-out row tied to the foreign session.
+      insertCheckpoint(db, {
+        sessionId: foreignSession,
+        stepId: 'foreign-step',
+        gitRef: 'aaa',
+        hadBash: false,
+        createdAt: 0,
+      });
+      // Aged-out row in the local session.
+      insertCheckpoint(db, {
+        sessionId,
+        stepId: 'local-step',
+        gitRef: 'bbb',
+        hadBash: false,
+        createdAt: 0,
+      });
+
+      const mgr = createCheckpointManager({ db, cwd: repo, sessionId, available: true });
+      await mgr.purge({ olderThanDays: 1 });
+
+      // Local session's aged row is gone.
+      expect(listCheckpointsBySession(db, sessionId)).toHaveLength(0);
+      // Foreign session's row stays — its cwd doesn't match the
+      // manager's cwd, so retention skips it.
+      expect(listCheckpointsBySession(db, foreignSession)).toHaveLength(1);
+    } finally {
+      await rm(foreignCwd, { recursive: true, force: true });
+    }
+  });
+
   test('purge by age drops aged-out rows and refs without surviving rows', async () => {
     await initRepoWithSeed(repo);
     const mgr = createCheckpointManager({ db, cwd: repo, sessionId, available: true });

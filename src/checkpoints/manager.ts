@@ -209,7 +209,14 @@ class CheckpointManagerImpl implements CheckpointManager {
     }
     const cutoffDays = opts.olderThanDays ?? DEFAULT_RETENTION_DAYS;
     const cutoffMs = Date.now() - cutoffDays * 24 * 60 * 60 * 1000;
-    const aged = listCheckpointsOlderThan(this.db, cutoffMs);
+    // cwd-scoped age listing. The harness wires manager to the
+    // current run's cwd; without the scope, lazy retention here
+    // would walk rows from sessions in OTHER cwds and delete them
+    // — wiping audit history for projects this manager isn't
+    // responsible for. The scope keeps the row sweep aligned with
+    // the ref sweep below (which is naturally cwd-bound: refs only
+    // exist in the git store of the cwd they were created in).
+    const aged = listCheckpointsOlderThan(this.db, cutoffMs, this.cwd);
     // Group rows by session: when every row of a session is aged out,
     // the ref is purged too. Sessions with mixed-age checkpoints keep
     // their ref (it points at the chain head, which is the newest

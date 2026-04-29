@@ -113,14 +113,34 @@ export const deleteCheckpointsBySession = (db: DB, sessionId: string): number =>
 // audit row crosses the retention horizon. Ref deletion is the caller's
 // responsibility (separate concern from the DB row); returns the deleted
 // rows so the caller can issue matching `git update-ref -d` calls.
-export const listCheckpointsOlderThan = (db: DB, cutoffMs: number): Checkpoint[] => {
+//
+// `cwd` scopes the listing to a single project. The lazy sweep at
+// session_start runs in the active agent's cwd and must NOT touch
+// rows belonging to sessions in other directories — those refs live
+// in a different git store, so deleting their DB rows leaves the audit
+// log inconsistent with the still-restorable git state. Pass undefined
+// only for explicit cross-project administrative cleanup (no current
+// caller does this; left available for future tooling).
+export const listCheckpointsOlderThan = (db: DB, cutoffMs: number, cwd?: string): Checkpoint[] => {
+  if (cwd === undefined) {
+    const rows = db
+      .query(
+        `SELECT id, session_id, step_id, git_ref, created_at, had_bash
+         FROM checkpoints
+         WHERE created_at < ?
+         ORDER BY created_at ASC, id ASC`,
+      )
+      .all(cutoffMs) as CheckpointRow[];
+    return rows.map(fromRow);
+  }
   const rows = db
     .query(
-      `SELECT id, session_id, step_id, git_ref, created_at, had_bash
-       FROM checkpoints
-       WHERE created_at < ?
-       ORDER BY created_at ASC, id ASC`,
+      `SELECT c.id, c.session_id, c.step_id, c.git_ref, c.created_at, c.had_bash
+       FROM checkpoints c
+       JOIN sessions s ON c.session_id = s.id
+       WHERE c.created_at < ? AND s.cwd = ?
+       ORDER BY c.created_at ASC, c.id ASC`,
     )
-    .all(cutoffMs) as CheckpointRow[];
+    .all(cutoffMs, cwd) as CheckpointRow[];
   return rows.map(fromRow);
 };
