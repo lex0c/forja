@@ -300,12 +300,60 @@ export const monitor = async (
         stdoutCursor = r.stdoutCursor;
         stderrCursor = r.stderrCursor;
         if (r.status !== 'running') {
-          // Process gone — drain anything left in the buffer
-          // (likely an unterminated tail). Spec is silent on
-          // this; we emit any non-empty tail as a final event
-          // so the model doesn't lose the trailing partial
-          // line of a crash log.
-          if (stdoutBuf.length > 0) {
+          // Process gone. Drain pending bytes from the log files
+          // BEFORE finalizing — `readOutput` returns at most maxBytes
+          // (default 64KB) per call. A process that emitted >64KB and
+          // exited in the same poll window would leave
+          // r.stdoutPending/r.stderrPending > 0; without this drain,
+          // lines past the first chunk are silently dropped. Same
+          // class of bug as wait_for's process_output drain
+          // (commit 2bb1e36); applied here for symmetry. The drain
+          // loop is tight (no sleep) since the process is already
+          // gone and we just want to consume the remaining bytes.
+          while (r.stdoutPending > 0 || r.stderrPending > 0) {
+            if (events.length >= maxEvents) break;
+            try {
+              r = await bg.readOutput(condition.processId, {
+                sinceStdout: stdoutCursor,
+                sinceStderr: stderrCursor,
+              });
+            } catch (e) {
+              duration.cleanup();
+              throw e;
+            }
+            const drainNow = Date.now();
+            const drainStdout = extractLines(stdoutBuf, r.stdout);
+            stdoutBuf = drainStdout.rest;
+            for (const line of drainStdout.lines) {
+              events.push({
+                kind: 'process_output_line',
+                timestamp: drainNow,
+                payload: { stream: 'stdout', line },
+              });
+              if (events.length >= maxEvents) break;
+            }
+            if (events.length >= maxEvents) break;
+            const drainStderr = extractLines(stderrBuf, r.stderr);
+            stderrBuf = drainStderr.rest;
+            for (const line of drainStderr.lines) {
+              events.push({
+                kind: 'process_output_line',
+                timestamp: drainNow,
+                payload: { stream: 'stderr', line },
+              });
+              if (events.length >= maxEvents) break;
+            }
+            // Defensive: stop if cursors didn't advance — would be
+            // an infinite loop if pending didn't shrink (e.g., a
+            // future readOutput regression returning end < cursor).
+            if (r.stdoutCursor === stdoutCursor && r.stderrCursor === stderrCursor) break;
+            stdoutCursor = r.stdoutCursor;
+            stderrCursor = r.stderrCursor;
+          }
+          // After the drain, emit any unterminated tail in the
+          // partial-line buffers so a final-line-without-\n from a
+          // crash log isn't lost.
+          if (stdoutBuf.length > 0 && events.length < maxEvents) {
             events.push({
               kind: 'process_output_line',
               timestamp: Date.now(),
@@ -320,6 +368,15 @@ export const monitor = async (
               payload: { stream: 'stderr', line: stderrBuf, partial: true },
             });
             stderrBuf = '';
+          }
+          // If max_events was hit during the drain, surface that
+          // reason instead of process_exited — the cap was the
+          // dominant terminator.
+          if (events.length >= maxEvents) {
+            return finalize('max_events', {
+              processStatus: r.status,
+              processExitCode: r.exitCode,
+            });
           }
           return finalize('process_exited', {
             processStatus: r.status,
@@ -402,6 +459,42 @@ export const monitor = async (
         stdoutCursor = r.stdoutCursor;
         stderrCursor = r.stderrCursor;
         if (r.status !== 'running') {
+          // Drain pending bytes from the log files BEFORE finalizing.
+          // Same drain pattern as process_output_lines; same
+          // motivation as wait_for's process_output drain (commit
+          // 2bb1e36). Without this, pattern matches in the tail of
+          // a process that emitted >64KB and exited quickly are
+          // silently lost. The overlap buffer carries naturally
+          // through the loop iterations — scanWithOverlap's dedup
+          // already prevents double-emission.
+          while (r.stdoutPending > 0 || r.stderrPending > 0) {
+            if (events.length >= maxEvents) break;
+            try {
+              r = await bg.readOutput(condition.processId, {
+                sinceStdout: stdoutCursor,
+                sinceStderr: stderrCursor,
+              });
+            } catch (e) {
+              duration.cleanup();
+              throw e;
+            }
+            const tailStdoutScan = scanWithOverlap(stdoutPatternBuf, r.stdout, 'stdout');
+            stdoutPatternBuf = tailStdoutScan.nextBuffer;
+            if (!tailStdoutScan.ok) break;
+            const tailStderrScan = scanWithOverlap(stderrPatternBuf, r.stderr, 'stderr');
+            stderrPatternBuf = tailStderrScan.nextBuffer;
+            if (!tailStderrScan.ok) break;
+            // Defensive cursor-advance guard.
+            if (r.stdoutCursor === stdoutCursor && r.stderrCursor === stderrCursor) break;
+            stdoutCursor = r.stdoutCursor;
+            stderrCursor = r.stderrCursor;
+          }
+          if (events.length >= maxEvents) {
+            return finalize('max_events', {
+              processStatus: r.status,
+              processExitCode: r.exitCode,
+            });
+          }
           return finalize('process_exited', {
             processStatus: r.status,
             processExitCode: r.exitCode,

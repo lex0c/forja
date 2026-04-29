@@ -227,6 +227,31 @@ describe('bg manager: readOutput', () => {
     expect(next.stdoutPending).toBe(0);
   });
 
+  test('concurrent readOutput calls preserve max cursor (no rollback)', async () => {
+    // Regression: two callers reading the same process in parallel
+    // (e.g., canonical bash_output racing a wait_for / monitor poll
+    // loop) can each compute a different stdoutWin.end. Whichever
+    // resolves second used to clobber the cursor with its smaller
+    // value, replaying already-emitted bytes on the next canonical
+    // call. The DB-level WHERE cursor_position < ? clause makes
+    // out-of-order writes no-ops.
+    const r = await mgr.spawn({ command: `printf 'x%.0s' {1..500}` });
+    await waitForExit(r.id);
+    // Both reads are canonical (no `since*`); they both target
+    // cursor=0 at start. One asks for 50 bytes, the other for 200.
+    // Whichever resolves last would, under the old code, clobber
+    // the cursor with its end value.
+    const [smallRead, bigRead] = await Promise.all([
+      mgr.readOutput(r.id, { maxBytes: 50 }),
+      mgr.readOutput(r.id, { maxBytes: 200 }),
+    ]);
+    expect(smallRead.stdoutCursor).toBe(50);
+    expect(bigRead.stdoutCursor).toBe(200);
+    // Persisted cursor is the MAX of the two — never less.
+    const row = getBgProcess(db, r.id);
+    expect(row?.stdoutCursorPosition).toBe(200);
+  });
+
   test('explicit `sinceStdout` overrides stored cursor', async () => {
     const r = await mgr.spawn({ command: 'echo abcdef' });
     await waitForExit(r.id);

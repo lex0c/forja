@@ -401,10 +401,20 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     const stdoutWin = await readWindow(row.stdoutLogPath, stdoutStart, maxBytes);
     const stderrWin = await readWindow(row.stderrLogPath, stderrStart, maxBytes);
 
-    if (!isExplicitStdoutSince && stdoutWin.end > row.stdoutCursorPosition) {
+    // Cursor advance for canonical reads (no explicit `since`).
+    // The local `> row.X` check is intentionally absent: the row
+    // snapshot we read at the top of this call may already be
+    // stale if another reader (canonical bash_output, wait_for, or
+    // monitor poll loop) ran concurrently. Trusting the snapshot
+    // means a slower call could clobber a faster one's larger
+    // cursor with a smaller value — silent rollback that replays
+    // already-seen bytes. Monotonicity is enforced at the DB
+    // layer via `WHERE <cursor_col> < ?`; out-of-order writes
+    // from concurrent readers become no-ops there.
+    if (!isExplicitStdoutSince) {
       advanceBgProcessStdoutCursor(db, id, stdoutWin.end);
     }
-    if (!isExplicitStderrSince && stderrWin.end > row.stderrCursorPosition) {
+    if (!isExplicitStderrSince) {
       advanceBgProcessStderrCursor(db, id, stderrWin.end);
     }
 

@@ -124,6 +124,30 @@ describe('monitor: process_output_lines', () => {
     expect(result.processStatus).toBe('running');
   });
 
+  test('drains pending bytes after exit (lines past 64KB cap)', async () => {
+    // Regression: a single readOutput call returns at most maxBytes
+    // (default 64KB). If the process emits >64KB and exits, the
+    // first poll scans only the first chunk and `r.stdoutPending`
+    // is >0. Without the post-exit drain loop, lines in the tail
+    // are silently lost.
+    //
+    // We emit ~70KB of filler bytes (single line via printf without
+    // \n) THEN a `\necho TAIL-LINE-MARKER` line so the marker lands
+    // past the first 64KB chunk on a fresh line.
+    const r = await mgr.spawn({
+      command: `printf 'x%.0s' {1..70000}; echo; echo TAIL-LINE-MARKER`,
+    });
+    const result = await monitor(
+      { kind: 'process_output_lines', processId: r.id },
+      { durationMs: 5000, pollIntervalMs: 50, maxEvents: 200, bgManager: mgr },
+    );
+    expect(result.reason).toBe('process_exited');
+    const lines = result.events.map((e) => (e.payload as { line: string }).line);
+    // Marker is on a line PAST the 70KB filler — without the drain,
+    // it sits in the unread tail and gets dropped.
+    expect(lines.some((l) => l.includes('TAIL-LINE-MARKER'))).toBe(true);
+  });
+
   test('emits a trailing partial line on process exit', async () => {
     // printf without trailing \n leaves an unterminated line. The
     // drain on exit should emit it as a partial event.
@@ -231,6 +255,26 @@ describe('monitor: process_output_pattern', () => {
         { durationMs: 100, bgManager: mgr },
       ),
     ).rejects.toThrow(/global.*'g'/);
+  });
+
+  test('drains pending bytes after exit (pattern in tail past 64KB cap)', async () => {
+    // Regression: pattern mode also has the per-call 64KB cap.
+    // A pattern in the tail of a process that emitted >64KB and
+    // exited would be silently lost without the drain loop.
+    const r = await mgr.spawn({
+      command: `printf 'x%.0s' {1..70000}; echo TAIL-PATTERN-37`,
+    });
+    const result = await monitor(
+      {
+        kind: 'process_output_pattern',
+        processId: r.id,
+        pattern: /TAIL-PATTERN-37/g,
+      },
+      { durationMs: 5000, pollIntervalMs: 50, bgManager: mgr },
+    );
+    expect(result.reason).toBe('process_exited');
+    const matches = result.events.map((e) => (e.payload as { match: string }).match);
+    expect(matches).toContain('TAIL-PATTERN-37');
   });
 
   test('terminates with process_exited and processStatus payload', async () => {

@@ -164,28 +164,41 @@ export const listBgProcessesBySession = (
   return rows.map(fromRow);
 };
 
-// Stdout cursor advance — hot path on every successful `bash_output` call.
-// Single UPDATE rather than read-then-write to avoid a race where two
-// concurrent reads would clobber each other. The legacy column is named
-// `cursor_position` (predates the dual-cursor split in migration 006);
-// the public name is explicit about which stream it tracks.
+// Stdout cursor advance — hot path on every successful `bash_output`,
+// `wait_for(process_output)`, and `monitor(process_output_*)` call.
+// Three readers can target the same process concurrently (e.g.,
+// canonical bash_output + a wait_for poll loop + a monitor poll
+// loop), and each call's `stdoutWin.end` may differ. A naive
+// `UPDATE SET cursor_position = ?` would let the slowest read
+// clobber a faster one's larger cursor, rolling back already-emitted
+// bytes and replaying them.
+//
+// Fix: monotonic at the DB level via `cursor_position < ?` —
+// only updates when the new value is greater, so out-of-order
+// writes from concurrent readers are no-ops. SQLite's row-level
+// locking serializes the comparison + write, so the pattern is
+// race-free.
+//
+// The legacy column is named `cursor_position` (predates the
+// dual-cursor split in migration 006); the public name is explicit
+// about which stream it tracks.
 export const advanceBgProcessStdoutCursor = (db: DB, id: string, newCursor: number): void => {
   db.query(
     `UPDATE background_processes
      SET cursor_position = ?
-     WHERE id = ?`,
-  ).run(newCursor, id);
+     WHERE id = ? AND cursor_position < ?`,
+  ).run(newCursor, id, newCursor);
 };
 
-// Stderr cursor advance. Tracked independently so that a noisy stdout
-// can't strand stderr writes — see migration 006 for the failure mode
-// the original single-cursor model produced.
+// Stderr cursor advance. Same monotonic guard as stdout — see
+// rationale above. Tracked independently so a noisy stdout can't
+// strand stderr writes (migration 006 failure mode).
 export const advanceBgProcessStderrCursor = (db: DB, id: string, newCursor: number): void => {
   db.query(
     `UPDATE background_processes
      SET stderr_cursor_position = ?
-     WHERE id = ?`,
-  ).run(newCursor, id);
+     WHERE id = ? AND stderr_cursor_position < ?`,
+  ).run(newCursor, id, newCursor);
 };
 
 // Mark a process as exited or killed. exit_code may be null on signal-

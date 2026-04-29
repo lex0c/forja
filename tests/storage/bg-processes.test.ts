@@ -149,6 +149,37 @@ describe('bg-processes repo', () => {
     expect(fetched?.stdoutCursorPosition).toBe(0);
   });
 
+  test('stdout cursor is monotonic — smaller value does not roll back', () => {
+    // Regression: concurrent readers (canonical bash_output +
+    // wait_for poll + monitor poll) can each compute a stdoutWin.end
+    // and call advance. Without DB-level monotonicity, a slower
+    // read with a smaller end could clobber a faster read's larger
+    // cursor — replaying already-emitted bytes on the next canonical
+    // read.
+    const proc = insert();
+    advanceBgProcessStdoutCursor(db, proc.id, 100);
+    advanceBgProcessStdoutCursor(db, proc.id, 50); // simulate slow read
+    expect(getBgProcess(db, proc.id)?.stdoutCursorPosition).toBe(100);
+    // Equal value is also a no-op (WHERE clause uses <)
+    advanceBgProcessStdoutCursor(db, proc.id, 100);
+    expect(getBgProcess(db, proc.id)?.stdoutCursorPosition).toBe(100);
+    // Larger value still advances
+    advanceBgProcessStdoutCursor(db, proc.id, 200);
+    expect(getBgProcess(db, proc.id)?.stdoutCursorPosition).toBe(200);
+  });
+
+  test('stderr cursor is monotonic — smaller value does not roll back', async () => {
+    const { advanceBgProcessStderrCursor } = await import(
+      '../../src/storage/repos/bg-processes.ts'
+    );
+    const proc = insert();
+    advanceBgProcessStderrCursor(db, proc.id, 100);
+    advanceBgProcessStderrCursor(db, proc.id, 30);
+    expect(getBgProcess(db, proc.id)?.stderrCursorPosition).toBe(100);
+    advanceBgProcessStderrCursor(db, proc.id, 250);
+    expect(getBgProcess(db, proc.id)?.stderrCursorPosition).toBe(250);
+  });
+
   test('finalizeBgProcess marks exited with code and timestamp', () => {
     const proc = insert();
     finalizeBgProcess(db, { id: proc.id, status: 'exited', exitCode: 0, exitedAt: 5000 });
