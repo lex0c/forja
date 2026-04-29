@@ -7,6 +7,7 @@ import {
   createSession,
   getSession,
   listSessions,
+  reopenSession,
   updateSessionCost,
 } from '../../src/storage/repos/sessions.ts';
 
@@ -97,6 +98,26 @@ describe('sessions repo', () => {
     expect(getSession(db, s.id)?.totalCostUsd).toBe(0.05);
   });
 
+  test('listSessions ties on same started_at follow insertion order (newest first)', () => {
+    // Direct regression for migration 008. Without the seq
+    // tiebreaker, two sessions sharing started_at fall back to
+    // SQLite's implementation-defined order; --resume last would
+    // attach to whichever the impl picked first, possibly an
+    // older session. With seq DESC as the secondary key, the
+    // most-recently-inserted session wins deterministically.
+    const ms = 1_700_000_000_000;
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      ids.push(createSession(db, { model: 'm', cwd: '/p', startedAt: ms }).id);
+    }
+    const list = listSessions(db, { limit: 5 });
+    // Newest-first: ids inserted last appear first in the listing.
+    expect(list.map((s) => s.id)).toEqual([...ids].reverse());
+    // 'last' resolution (limit=1) returns the most-recently-inserted.
+    const last = listSessions(db, { limit: 1 });
+    expect(last[0]?.id).toBe(ids[ids.length - 1]);
+  });
+
   test('CHECK constraint rejects invalid status at the SQL layer', () => {
     expect(() =>
       db.exec(
@@ -104,5 +125,31 @@ describe('sessions repo', () => {
           "VALUES ('x', 0, 'm', '/p', 'bogus', 0)",
       ),
     ).toThrow();
+  });
+
+  test('reopenSession flips a finished session back to running', () => {
+    // Resume continuation reuses a prior session id; without
+    // reopen, completeSession at the end of the resumed run trips
+    // its WHERE status='running' guard.
+    const s = createSession(db, { model: 'm', cwd: '/p' });
+    completeSession(db, s.id, 'done', 0.5, true);
+    expect(getSession(db, s.id)?.status).toBe('done');
+    reopenSession(db, s.id);
+    expect(getSession(db, s.id)?.status).toBe('running');
+    expect(getSession(db, s.id)?.endedAt).toBeNull();
+    // completeSession should now succeed again on the resumed run.
+    completeSession(db, s.id, 'done', 1.5, true);
+    expect(getSession(db, s.id)?.status).toBe('done');
+    expect(getSession(db, s.id)?.totalCostUsd).toBe(1.5);
+  });
+
+  test('reopenSession is idempotent on an already-running session', () => {
+    const s = createSession(db, { model: 'm', cwd: '/p' });
+    expect(() => reopenSession(db, s.id)).not.toThrow();
+    expect(getSession(db, s.id)?.status).toBe('running');
+  });
+
+  test('reopenSession rejects unknown id', () => {
+    expect(() => reopenSession(db, 'nope')).toThrow(/not found/);
   });
 });

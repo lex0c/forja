@@ -14,6 +14,7 @@ const baseArgs = (overrides: Partial<ParsedArgs> = {}): ParsedArgs => ({
   version: false,
   help: false,
   plan: false,
+  listSessions: false,
   ...overrides,
 });
 

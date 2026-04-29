@@ -10,13 +10,26 @@ import type {
   ProviderToolUseBlock,
 } from '../providers/index.ts';
 import { estimatePromptTokens } from '../providers/tokens.ts';
-import { appendMessage, completeSession, createSession } from '../storage/index.ts';
+import {
+  appendMessage,
+  completeSession,
+  createSession,
+  getSession,
+  listMessageTailBySession,
+  reopenSession,
+} from '../storage/index.ts';
 import { type TodoStore, createTodoStore } from '../todo/index.ts';
 import type { ToolContext } from '../tools/index.ts';
 import { abortableIterable } from './abortable.ts';
 import { CollectStepError, collectStep } from './collect.ts';
 import { compactMessages } from './compaction.ts';
 import { invokeTool } from './invoke-tool.ts';
+import {
+  ALIGNMENT_FETCH_MARGIN,
+  MAX_RESUME_MESSAGES,
+  STRANDED_TURN_PLACEHOLDER,
+  messagesToProviderMessages,
+} from './resume.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
 import {
   DEFAULT_BUDGET,
@@ -123,10 +136,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // finally so accumulated state from a long-lived process doesn't
   // leak across sessions. Spec §7.4: not persisted, work-state only.
   const todoStore: TodoStore = createTodoStore();
-  // Session-wide totals. Each completed provider turn adds its usage and
-  // its computed cost; we persist the aggregate to `sessions.total_cost_usd`
-  // on `completeSession` and surface both in the result + session_finished
-  // event so renderers can show "$X.XX, N tokens" without re-querying.
+  // Per-run totals. Each completed provider turn adds its usage and
+  // its computed cost; HarnessResult.usage / costUsd report THIS
+  // RUN's numbers — caller telemetry that has to stay self-
+  // consistent (zero usage means zero cost, etc.).
   let totalUsage = emptyUsage();
   let totalCostUsd = 0;
   // Stays true until an assistant turn produces output without an
@@ -134,6 +147,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // sums measured turns; this flag tells the caller whether those
   // numbers are complete or a lower-bound estimate.
   let usageComplete = true;
+  // Cumulative state from prior runs of the same session id (zero
+  // for new sessions). Held SEPARATELY from the per-run totals so
+  // HarnessResult stays per-run while the persisted column stays
+  // cumulative — fixing the contract mismatch where seeding
+  // totalCostUsd from the existing row made costUsd report
+  // "current run + prior" while usage was still "current only".
+  // Persistence at finish() writes (priorCostUsd + totalCostUsd);
+  // the result reports just totalCostUsd.
+  let priorCostUsd = 0;
+  let priorUsageComplete = true;
 
   // Distinguish wall-clock from user abort — both use `signal.aborted` but
   // the user wants different exit reasons.
@@ -146,7 +169,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     // no row to mark and SQLite would just throw a foreign-key error.
     if (sessionId.length > 0) {
       try {
-        completeSession(config.db, sessionId, exitToStatus[reason], totalCostUsd, usageComplete);
+        // Persist CUMULATIVE totals (prior + this run) so the row
+        // reflects the session's lifetime cost. The result returned
+        // below stays per-run (caller telemetry).
+        completeSession(
+          config.db,
+          sessionId,
+          exitToStatus[reason],
+          priorCostUsd + totalCostUsd,
+          priorUsageComplete && usageComplete,
+        );
       } catch {
         // Storage already broken; nothing useful to do beyond return the
         // result so the caller knows the run is over.
@@ -195,17 +227,77 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // whether the OS kill landed.
   try {
     try {
-      const session = createSession(config.db, {
-        model: config.provider.id,
-        cwd: config.cwd,
-      });
-      sessionId = session.id;
+      // Resume vs new session. In resume mode, the prior session id
+      // is reused and its persisted messages are loaded back into
+      // the in-memory array so the model sees the full conversation
+      // before the new userPrompt. The session is flipped back to
+      // 'running' so completeSession at run-end doesn't trip its
+      // 'must be running' WHERE guard. We validate the id BEFORE
+      // any side effects so a typo'd session id doesn't leave a
+      // half-initialized state.
+      // Resume budget semantics: `steps`, `consecutiveErrors`,
+      // `totalUsage`, `totalCostUsd`, and `usageComplete` are
+      // PER-RUN accumulators that start at zero/true — they drive
+      // HarnessResult, which is per-run telemetry that has to
+      // stay self-consistent (zero usage means zero cost, etc.).
+      // The CUMULATIVE state (prior + this run) is held separately
+      // in `priorCostUsd` / `priorUsageComplete` and only used at
+      // completeSession time so the persisted column reflects the
+      // session's lifetime cost. This separation closes the bug
+      // where seeding totalCostUsd from the row made costUsd
+      // report cumulative while usage stayed per-run.
+      // The CLI's run.ts also calls getSession before constructing
+      // the config (`resolveResumeId`) so a typo'd id fails fast on
+      // stderr. The duplicate check here is intentional defense in
+      // depth: programmatic callers (evals, future tests) may build
+      // a HarnessConfig directly without going through the CLI, and
+      // getSession returning null inside the loop would otherwise
+      // surface as a confusing 'getSession on null result' downstream
+      // when we read totalCostUsd. The cost of one extra SELECT per
+      // resume call is negligible.
+      const resumeId = config.resumeFromSessionId;
+      if (resumeId !== undefined) {
+        const existing = getSession(config.db, resumeId);
+        if (existing === null) {
+          throw new Error(`session ${resumeId} not found`);
+        }
+        // cwd divergence between the original session and the
+        // resume context is silently broken: messages reference
+        // files / paths from the original cwd, but bash calls in
+        // the resumed run land in the new cwd. Refuse rather than
+        // let the model think it's in a filesystem that doesn't
+        // match its conversation. Operators who legitimately want
+        // to resume in a different directory can `cd` to the
+        // original first or start a fresh session — both are
+        // clearer than silent divergence.
+        if (existing.cwd !== config.cwd) {
+          throw new Error(
+            `cannot resume session ${resumeId}: original cwd was '${existing.cwd}', current cwd is '${config.cwd}'. cd to the original directory or start a new session.`,
+          );
+        }
+        priorCostUsd = existing.totalCostUsd;
+        priorUsageComplete = existing.usageComplete;
+        reopenSession(config.db, resumeId);
+        sessionId = resumeId;
+      } else {
+        const session = createSession(config.db, {
+          model: config.provider.id,
+          cwd: config.cwd,
+        });
+        sessionId = session.id;
+      }
 
       // bg manager creation MUST happen here, after sessionId is
       // resolved — every row insertBgProcess writes carries the
       // session_id FK, so a manager built before createSession would
       // crash on first spawn. The manager is short-lived: lives
       // until the outer finally cleans it up.
+      //
+      // Note: bg processes from the prior run of a resumed session
+      // are NOT carried over. The previous run's harness terminated
+      // them in its outer finally; this fresh manager starts empty.
+      // Documented as an explicit boundary — resume restores
+      // conversational context, not running children.
       if (config.bgLogDir !== undefined) {
         bgManager = createBgManager({
           db: config.db,
@@ -220,10 +312,79 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         });
       }
 
+      // Resume path: hydrate messages from persistence BEFORE
+      // appending the new user prompt. The model sees [old turns,
+      // new prompt] and continues naturally. The new prompt is
+      // also persisted so the next resume sees it too.
+      //
+      // Bounded fetch: SQL returns at most (MAX + alignment
+      // margin) rows, so a 50k-message session never materializes
+      // in JS memory. The earlier implementation read the full
+      // log into memory and sliced — defeating the cap and OOM-ing
+      // on long-running sessions.
+      //
+      // droppedFromHead reported on the resume_truncated event
+      // accounts for BOTH the rows that never left SQL (totalCount
+      // - fetchedCount) and the rows the alignment walk skipped
+      // inside the fetched slice. Kept count is what the model
+      // actually sees in context.
+      //
+      // Carry forward the parent_id chain across resume. Without
+      // seeding lastMessageId from the prior tail, the new user
+      // turn appends with parent_id=null and starts a NEW root in
+      // the same session — the parent_id graph forks at every
+      // resume boundary, breaking traversal/replay/audit logic
+      // that walks parent links to reconstruct the conversation
+      // tree. The persisted tail is already ordered by seq
+      // (migration 007), so the tail is just the last element of
+      // what we fetched (which IS the absolute tail since the
+      // bounded fetch picks newest rows).
+      let priorTailId: string | null = null;
+      if (resumeId !== undefined) {
+        const tail = listMessageTailBySession(
+          config.db,
+          resumeId,
+          MAX_RESUME_MESSAGES + ALIGNMENT_FETCH_MARGIN,
+        );
+        const restored = messagesToProviderMessages(tail.messages);
+        messages.push(...restored.messages);
+        const fetchedCount = tail.messages.length;
+        const droppedBeyondFetch = tail.totalCount - fetchedCount;
+        const totalDropped = droppedBeyondFetch + restored.droppedFromHead;
+        if (totalDropped > 0) {
+          safeEmit(config.onEvent, {
+            type: 'resume_truncated',
+            sessionId,
+            kept: restored.messages.length,
+            dropped: totalDropped,
+          });
+        }
+        // Stranded-turn handling. If the last restored message is
+        // `user` (either the original prompt that never got an
+        // assistant response, or a tool_result whose follow-up
+        // assistant turn never landed because the run aborted),
+        // appending the resume's new user prompt would create
+        // user→user on the wire — every provider 400s on that.
+        // Insert an in-memory-only synthetic assistant placeholder
+        // to satisfy alternation. Not persisted: each resume
+        // re-derives it on demand from whatever shape the log is
+        // in at that moment.
+        const inMemoryTail = messages[messages.length - 1];
+        if (inMemoryTail !== undefined && inMemoryTail.role === 'user') {
+          messages.push({ role: 'assistant', content: STRANDED_TURN_PLACEHOLDER });
+        }
+        const lastFetched = tail.messages[tail.messages.length - 1];
+        if (lastFetched !== undefined) priorTailId = lastFetched.id;
+      }
+
       const userMsg = appendMessage(config.db, {
         sessionId,
         role: 'user',
         content: config.userPrompt,
+        // null on first turn (new session); tail id on resume so
+        // the chain stays connected. appendMessage validates the
+        // parent belongs to the same session.
+        ...(priorTailId !== null ? { parentId: priorTailId } : {}),
       });
       lastMessageId = userMsg.id;
       messages.push({ role: 'user', content: config.userPrompt });

@@ -245,6 +245,57 @@ a runtime check is a contract you HOPE holds, not one you ENFORCE.
 Pattern: every schema constraint has a parallel runtime guard that
 returns a clean error.
 
+### 3.4 Cumulative fields need to be seeded, not overwritten
+
+When a row holds a CUMULATIVE value (cost, counts, totals, byte
+sums) and your code path ends with an `UPDATE table SET col = ?`,
+the local accumulator MUST start from the existing persisted
+value — not zero.
+
+Real bug from this repo:
+
+```ts
+// In runAgent's resume path:
+let totalCostUsd = 0;            // local accumulator
+// ... resume runs new turns, totalCostUsd grows by N
+completeSession(db, id, status, totalCostUsd, ...);
+// → UPDATE sessions SET total_cost_usd = N WHERE id = ?
+//   The prior $0.50 the session had cost is now $N. History lost.
+```
+
+Fix:
+
+```ts
+let totalCostUsd = 0;
+if (resumeId !== undefined) {
+  const existing = getSession(db, resumeId);
+  totalCostUsd = existing.totalCostUsd;  // seed from the row
+}
+// ... resume runs add to totalCostUsd
+completeSession(db, id, status, totalCostUsd, ...);
+// → UPDATE writes (prior + new)
+```
+
+This is the dual of §3.1 (`AND col < ?` defends against concurrent
+writes overwriting forward progress). Here we defend against the
+SAME function losing its own prior history because it didn't
+read before writing.
+
+When you see this pattern, ask:
+
+- Is this column cumulative semantically (cost, count, total) or
+  monotonic (cursor, version)?
+- Does the UPDATE replace the entire value, or merge?
+- If replace + cumulative, you need a seed read.
+
+Audit prompts that catch this:
+
+- "What columns does completeSession / closeX / finalize* write?"
+- "For each, is the local accumulator seeded from the row at
+  init, or does it start at zero?"
+- "If start-at-zero: is the column genuinely fresh-per-call, or
+  does the function get called for an existing row?"
+
 ---
 
 ## 4. Sibling parity

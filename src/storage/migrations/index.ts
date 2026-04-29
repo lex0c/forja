@@ -4,6 +4,8 @@ import { migration003UsageCost } from './003-usage-cost.ts';
 import { migration004SessionUsageComplete } from './004-session-usage-complete.ts';
 import { migration005BackgroundProcesses } from './005-background-processes.ts';
 import { migration006BgStderrCursor } from './006-bg-stderr-cursor.ts';
+import { migration007MessageSeq } from './007-message-seq.ts';
+import { migration008SessionSeq } from './008-session-seq.ts';
 
 export interface Migration {
   id: number;
@@ -18,4 +20,6 @@ export const MIGRATIONS: readonly Migration[] = [
   migration004SessionUsageComplete,
   migration005BackgroundProcesses,
   migration006BgStderrCursor,
+  migration007MessageSeq,
+  migration008SessionSeq,
 ];

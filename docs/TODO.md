@@ -5,6 +5,45 @@ rationale and a "pull-in" signal so we know when to revisit.
 
 ---
 
+## Monotonic seq tiebreaker on the remaining time-ordered tables
+
+**Status:** noted during the M3/Step 2.4 audit pass (2026-04-29).
+
+**What it is:** migrations 007 (messages.seq) and 008 (sessions.seq)
+fixed the timestamp-tie ordering bug for the two tables whose
+listings drive resume behavior. The same bug shape exists in three
+more time-ordered repos that fall back to UUID lex on tied
+timestamps:
+
+- `src/storage/repos/tool-calls.ts:130` — `ORDER BY created_at ASC, id ASC`
+- `src/storage/repos/bg-processes.ts:148, 161` — `ORDER BY spawned_at DESC, id ASC`
+- `src/storage/repos/approvals.ts:66` — `ORDER BY decided_at ASC, id ASC`
+
+**Effect today:** none observable. Each listing function is
+exported but has no production call site (verified via grep).
+The listings are reserved for the audit CLI / recap / forensics
+work that hasn't landed yet.
+
+**Fix shape:** mirror migrations 007/008 — add `seq INTEGER NOT
+NULL DEFAULT 0` to each table, populate atomically at INSERT time
+via the `MAX(seq)+1` subquery, backfill via ROW_NUMBER over the
+existing ORDER BY, secondary `seq` in each list query.
+
+**Pull-in signal:** any of these listings gets wired to a live
+consumer (audit CLI, recap subsystem, the `agent audit` command
+in spec §13). At that point the ordering becomes load-bearing
+and the same class of bug that hit messages/sessions becomes
+visible to users. Apply the migrations together rather than
+piecemeal — the schema-change cost amortizes across three repos
+that all need it.
+
+**Why deferred:** YAGNI. Adding three migrations + index changes
+for tables nobody queries today is schema churn for a theoretical
+bug. The pattern is well-established in 007/008 so the eventual
+fix is mechanical.
+
+---
+
 ## Trust prompt for new directories (`AGENTIC_CLI §9.1`)
 
 **Status:** deferred from M2 / Step 4. Hierarchy resolution (the other

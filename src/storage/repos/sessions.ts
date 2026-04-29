@@ -53,9 +53,14 @@ export const createSession = (db: DB, input: CreateSessionInput): Session => {
   // the same reason: a freshly-created session has no measured turns
   // yet; the harness flips it to 0 via completeSession when finalizing
   // an incomplete run.
+  //
+  // `seq` is computed atomically via subquery (migration 008) so two
+  // sessions started in the same ms tick still have a deterministic
+  // order on listSessions — which is what `--resume last` depends
+  // on. Same shape as messages.seq (migration 007).
   db.query(
-    `INSERT INTO sessions (id, started_at, model, cwd, status, total_cost_usd)
-     VALUES (?, ?, ?, ?, 'running', 0)`,
+    `INSERT INTO sessions (id, started_at, model, cwd, status, total_cost_usd, seq)
+     VALUES (?, ?, ?, ?, 'running', 0, (SELECT COALESCE(MAX(seq), -1) + 1 FROM sessions))`,
   ).run(id, startedAt, input.model, input.cwd);
   return {
     id,
@@ -99,10 +104,17 @@ export const listSessions = (db: DB, options: ListSessionsOptions = {}): Session
   }
   const where = filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : '';
   params.push(limit);
+  // Secondary order by seq DESC (migration 008) is the deterministic
+  // tiebreaker when two sessions started in the same millisecond
+  // tick. Without it, `listSessions(..., {limit:1})[0]` could
+  // return either of the tied rows depending on SQLite's
+  // implementation-defined fallback — and `--resume last` then
+  // attaches to the wrong conversation. seq is monotonically
+  // increasing per insert, so DESC gives newest-first.
   const sql = `SELECT id, started_at, ended_at, model, cwd, status, total_cost_usd, usage_complete
                FROM sessions
                ${where}
-               ORDER BY started_at DESC
+               ORDER BY started_at DESC, seq DESC
                LIMIT ?`;
   const rows = db.query(sql).all(...params) as SessionRow[];
   return rows.map(fromRow);
@@ -134,6 +146,20 @@ export const updateSessionCost = (db: DB, id: string, totalCostUsd: number): voi
   const result = db
     .query('UPDATE sessions SET total_cost_usd = ? WHERE id = ?')
     .run(totalCostUsd, id);
+  if (result.changes === 0) {
+    throw new Error(`session ${id} not found`);
+  }
+};
+
+// Flip a previously-finalized session back to 'running' so a resume
+// continuation can reuse the same id. Idempotent — calling on an
+// already-running session is a no-op. Without this, completeSession
+// at the end of the resumed run would fail its WHERE status='running'
+// guard and throw.
+export const reopenSession = (db: DB, id: string): void => {
+  const result = db
+    .query("UPDATE sessions SET status = 'running', ended_at = NULL WHERE id = ?")
+    .run(id);
   if (result.changes === 0) {
     throw new Error(`session ${id} not found`);
   }

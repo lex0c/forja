@@ -9,6 +9,17 @@ import type { ToolRegistry } from '../tools/index.ts';
 // observers (TTY renderer, NDJSON output, future telemetry).
 export type HarnessEvent =
   | { type: 'session_start'; sessionId: string }
+  | {
+      // Emitted only on resume when the persisted message log
+      // exceeded MAX_RESUME_MESSAGES and the older tail was
+      // dropped. Renderers can show "resumed with N of M
+      // messages, M-N dropped" so the user knows part of the
+      // history is no longer in context.
+      type: 'resume_truncated';
+      sessionId: string;
+      kept: number;
+      dropped: number;
+    }
   | { type: 'step_start'; stepN: number }
   | { type: 'provider_event'; event: StreamEvent }
   | {
@@ -146,6 +157,16 @@ export interface HarnessConfig {
   // and any workflow that needs repeatable output. Tunable per
   // workflow per `TOKEN_TUNING.md`.
   temperature?: number;
+  // Resume mode (AGENTIC_CLI §2.1): when set, the harness skips
+  // createSession and uses this id instead. Persisted messages for
+  // the session are loaded into the in-memory `messages` array
+  // before the new userPrompt is appended, so the model sees the
+  // full prior conversation as context. The session is reopened
+  // (status flipped back to 'running') so completeSession at the
+  // end of the resumed run doesn't trip its 'must be running'
+  // guard. Caller is responsible for verifying the id exists
+  // before constructing the config.
+  resumeFromSessionId?: string;
 }
 
 export interface HarnessResult {

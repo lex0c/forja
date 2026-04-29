@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import { resolve } from 'node:path';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 
 // Spawn the CLI entrypoint as a subprocess with a preload that throws
 // the moment src/cli/run.ts is loaded. If `--help` or `--version`
@@ -11,9 +13,13 @@ const repoRoot = resolve(import.meta.dir, '../..');
 const entry = resolve(repoRoot, 'src/cli/index.ts');
 const preload = resolve(repoRoot, 'tests/cli/fixtures/block-run-load.ts');
 
-const runCli = async (
-  args: string[],
-): Promise<{ exitCode: number; stdout: string; stderr: string }> => {
+interface CliResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+const runCli = async (args: string[]): Promise<CliResult> => {
   const proc = Bun.spawn(['bun', '--preload', preload, entry, ...args], {
     cwd: repoRoot,
     stdout: 'pipe',
@@ -25,6 +31,31 @@ const runCli = async (
     proc.exited,
   ]);
   return { exitCode, stdout, stderr };
+};
+
+// Variant that spawns the CLI without the lazy-load preload so
+// run.ts is allowed to load. Used for flags like --list-sessions
+// that legitimately reach into the run path. Sets XDG_DATA_HOME
+// to an isolated tmpdir so the test doesn't read or write the
+// developer's actual ~/.local/share/forja state.
+const runCliWithRun = async (args: string[]): Promise<CliResult & { dataDir: string }> => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'forja-cli-'));
+  try {
+    const proc = Bun.spawn(['bun', entry, ...args], {
+      cwd: repoRoot,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: { ...process.env, XDG_DATA_HOME: dataDir },
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout as ReadableStream<Uint8Array>).text(),
+      new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+      proc.exited,
+    ]);
+    return { exitCode, stdout, stderr, dataDir };
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
 };
 
 describe('cli entrypoint lazy-loads run module', () => {
@@ -62,5 +93,25 @@ describe('cli entrypoint lazy-loads run module', () => {
     const { exitCode, stderr } = await runCli(['hello']);
     expect(exitCode).not.toBe(0);
     expect(stderr).toContain('cli/run.ts was loaded');
+  });
+});
+
+describe('cli entrypoint: prompt requirement', () => {
+  test('--list-sessions does NOT require a prompt', async () => {
+    // Regression: index.ts had an unconditional empty-prompt check
+    // that fired before --list-sessions could short-circuit inside
+    // run(). The unit test in resume.test.ts didn't catch this
+    // because it called run() directly, bypassing the entry. Now
+    // verified end-to-end through the real binary path.
+    const { exitCode, stderr } = await runCliWithRun(['--list-sessions', '--json']);
+    expect(exitCode).toBe(0);
+    expect(stderr).not.toContain('missing prompt');
+  });
+
+  test('bare invocation without a prompt still errors with "missing prompt"', async () => {
+    // Sanity: the gate is still in place for every other path.
+    const { exitCode, stderr } = await runCli([]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('missing prompt');
   });
 });

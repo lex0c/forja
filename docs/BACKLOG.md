@@ -15,6 +15,85 @@ Format:
 
 ---
 
+## [2026-04-29] M3 / Step 2.4 — Resume + list-sessions (CLI)
+
+Lands the non-UI half of spec §2.1 session continuity:
+`agent --list-sessions` and `agent --resume <id|last>`. The
+interactive picker (bare `--resume`, `/sessions *` slash
+commands, mini-recap inline) waits for the M4 Ink TUI.
+
+**Slice scope:**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/cli/args.ts` | UPDATED | New flags `--list-sessions`, `--resume <id\|last>`. `--resume` requires a value (interactive picker is M4) |
+| `src/cli/list-sessions.ts` | NEW | Standalone handler — opens DB, lists newest-first, prints table or NDJSON. Skips bootstrap entirely (no API key needed) |
+| `src/cli/run.ts` | UPDATED | Dispatch on flags: list-sessions short-circuit, resume id/`last` resolution before bootstrap, validation that prompt is non-empty for resume |
+| `src/cli/bootstrap.ts` | UPDATED | Plumbs `resumeFromSessionId` to HarnessConfig |
+| `src/storage/repos/sessions.ts` | UPDATED | New `reopenSession(db, id)` flips status='running', clears endedAt — needed because completeSession's WHERE guard requires running |
+| `src/harness/types.ts` | UPDATED | `HarnessConfig.resumeFromSessionId` |
+| `src/harness/resume.ts` | NEW | `messagesToProviderMessages` reconstitutes ProviderMessage[] from persisted Message rows. Skips role='tool' (forward-compat: not currently emitted) |
+| `src/harness/loop.ts` | UPDATED | Init block forks: resume path uses existing id + reopenSession + listMessagesBySession, new-session path unchanged. New userPrompt is appended after history regardless |
+| Tests | NEW | `tests/storage/sessions.test.ts` (+3 reopenSession), `tests/harness/resume.test.ts` (4 cases), `tests/cli/list-sessions.test.ts` (7 cases), `tests/cli/resume.test.ts` (7 e2e cases incl. resume by id, resume 'last', empty session list, missing prompt, unknown id, status round-trip done→running→done) |
+
+**Decisions:**
+
+- **`--resume` requires a value (id or `last`).** Bare `--resume`
+  for picker waits for the TUI. Falling back to a CLI prompt
+  selector would be its own UX problem (number-of-rows? formatting
+  in pipes?) — defer cleanly.
+- **`last` is resolved BEFORE bootstrap.** Run.ts opens a temporary
+  DB just to resolve, validates the id exists, then passes the
+  concrete id through. Trade: one extra DB-open per resume call
+  (cheap, sqlite is memory-mapped); benefit: typo'd id fails fast
+  with a clean errSink message instead of an `internalError` exit
+  with no diagnostic.
+- **Resume requires a non-empty prompt.** Without one, the model
+  would just see its own last assistant message replayed — no new
+  turn. Cleaner to error than to loop on degenerate input.
+- **bg processes are NOT carried over.** The previous run
+  terminated them in its outer finally; resume starts with a fresh
+  bg manager. Documented as a deliberate boundary in the loop
+  comment — resume restores conversation, not running children.
+- **Skipping role='tool' messages on reconstitution.** The schema
+  has the slot but the loop never persists it (tool results are
+  wrapped in user-role messages). Defensive skip if a future
+  migration changes this — the resume reconstitution would just
+  drop role=tool until the helper is updated.
+- **`reopenSession` is idempotent.** Calling on an already-running
+  session is a no-op (UPDATE with WHERE id=?). Calling on an
+  unknown id throws. Tests cover both.
+- **No bootstrap dependency for `--list-sessions`.** Inspecting
+  prior runs shouldn't require an API key or a parsable
+  `permissions.yaml`. The handler opens DB + migrates + queries +
+  closes, that's it.
+
+**Pending (M4 / later):**
+
+- Interactive picker (bare `--resume`) — needs Ink TUI.
+- `/sessions list/show/switch` slash commands — needs TUI command
+  surface.
+- Mini-recap inline in the listing — Recap subsystem (M4).
+- `--replay` for debug/eval — separate step.
+- Worktree-aware filtering on resume (warn if cwd diverged
+  between original session and resume).
+
+**Why it matters:**
+
+- Closes the most-asked-for non-UI feature: "I ran something
+  yesterday, let me continue that thread."
+- Unblocks downstream eval flows that need stable session ids
+  for replay.
+- Demonstrates the storage layer round-trips messages cleanly
+  (the resume helper is the first non-trivial reader of the
+  persisted message log).
+
+**Verification:** `bun test` 931 pass / 10 skip / 0 fail (+27 new
+tests across cli, storage, harness); `tsc --noEmit` clean;
+`biome check` clean.
+
+---
+
 ## [2026-04-29] M3 / Step 2.3 — todo_write tool
 
 Lands the TodoList primitive from spec §7.4. The model uses

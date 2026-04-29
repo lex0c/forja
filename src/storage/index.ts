@@ -14,6 +14,7 @@ export {
   createSession,
   getSession,
   listSessions,
+  reopenSession,
   updateSessionCost,
 } from './repos/sessions.ts';
 export type {
@@ -23,7 +24,13 @@ export type {
   SessionStatus,
 } from './repos/sessions.ts';
 
-export { appendMessage, getMessage, listMessagesBySession } from './repos/messages.ts';
+export {
+  appendMessage,
+  getMessage,
+  listMessageTailBySession,
+  listMessagesBySession,
+} from './repos/messages.ts';
+export type { MessageTail } from './repos/messages.ts';
 export type { AppendMessageInput, Message, MessageRole } from './repos/messages.ts';
 
 export {
