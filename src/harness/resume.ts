@@ -17,6 +17,16 @@ import type { Message, MessageRole } from '../storage/repos/messages.ts';
 // new follow-up.
 export const MAX_RESUME_MESSAGES = 500;
 
+// Extra rows fetched beyond MAX_RESUME_MESSAGES so the alignment
+// walk in messagesToProviderMessages has room to skip past
+// user_tool_result rows when looking for a safe head. Without the
+// margin, a tail composed of [user_tr, user_tr, ..., assistant]
+// (where the user_tool_result run exceeds MAX) would leave no
+// safe boundary inside the kept window and produce an empty
+// restored slice. 100 rows ≈ 50 turns of slack — generous for
+// any realistic conversation shape.
+export const ALIGNMENT_FETCH_MARGIN = 100;
+
 // Stand-in user prompt prepended when truncation lands on an
 // assistant message. Anthropic's API (and others) require the
 // first message to be `user`, so a kept slice starting with

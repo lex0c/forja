@@ -15,7 +15,7 @@ import {
   completeSession,
   createSession,
   getSession,
-  listMessagesBySession,
+  listMessageTailBySession,
   reopenSession,
 } from '../storage/index.ts';
 import { type TodoStore, createTodoStore } from '../todo/index.ts';
@@ -24,7 +24,12 @@ import { abortableIterable } from './abortable.ts';
 import { CollectStepError, collectStep } from './collect.ts';
 import { compactMessages } from './compaction.ts';
 import { invokeTool } from './invoke-tool.ts';
-import { STRANDED_TURN_PLACEHOLDER, messagesToProviderMessages } from './resume.ts';
+import {
+  ALIGNMENT_FETCH_MARGIN,
+  MAX_RESUME_MESSAGES,
+  STRANDED_TURN_PLACEHOLDER,
+  messagesToProviderMessages,
+} from './resume.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
 import {
   DEFAULT_BUDGET,
@@ -311,29 +316,47 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // appending the new user prompt. The model sees [old turns,
       // new prompt] and continues naturally. The new prompt is
       // also persisted so the next resume sees it too.
-      // messagesToProviderMessages caps at MAX_RESUME_MESSAGES;
-      // any older head is dropped (recency over depth — see
-      // resume.ts comment). When that happens we surface the count
-      // so a renderer / log shows the user "resumed with N of M".
+      //
+      // Bounded fetch: SQL returns at most (MAX + alignment
+      // margin) rows, so a 50k-message session never materializes
+      // in JS memory. The earlier implementation read the full
+      // log into memory and sliced — defeating the cap and OOM-ing
+      // on long-running sessions.
+      //
+      // droppedFromHead reported on the resume_truncated event
+      // accounts for BOTH the rows that never left SQL (totalCount
+      // - fetchedCount) and the rows the alignment walk skipped
+      // inside the fetched slice. Kept count is what the model
+      // actually sees in context.
+      //
       // Carry forward the parent_id chain across resume. Without
       // seeding lastMessageId from the prior tail, the new user
       // turn appends with parent_id=null and starts a NEW root in
       // the same session — the parent_id graph forks at every
       // resume boundary, breaking traversal/replay/audit logic
       // that walks parent links to reconstruct the conversation
-      // tree. The persisted list is already ordered by seq
-      // (migration 007), so the tail is just the last element.
+      // tree. The persisted tail is already ordered by seq
+      // (migration 007), so the tail is just the last element of
+      // what we fetched (which IS the absolute tail since the
+      // bounded fetch picks newest rows).
       let priorTailId: string | null = null;
       if (resumeId !== undefined) {
-        const persisted = listMessagesBySession(config.db, resumeId);
-        const restored = messagesToProviderMessages(persisted);
+        const tail = listMessageTailBySession(
+          config.db,
+          resumeId,
+          MAX_RESUME_MESSAGES + ALIGNMENT_FETCH_MARGIN,
+        );
+        const restored = messagesToProviderMessages(tail.messages);
         messages.push(...restored.messages);
-        if (restored.droppedFromHead > 0) {
+        const fetchedCount = tail.messages.length;
+        const droppedBeyondFetch = tail.totalCount - fetchedCount;
+        const totalDropped = droppedBeyondFetch + restored.droppedFromHead;
+        if (totalDropped > 0) {
           safeEmit(config.onEvent, {
             type: 'resume_truncated',
             sessionId,
             kept: restored.messages.length,
-            dropped: restored.droppedFromHead,
+            dropped: totalDropped,
           });
         }
         // Stranded-turn handling. If the last restored message is
@@ -350,8 +373,8 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (inMemoryTail !== undefined && inMemoryTail.role === 'user') {
           messages.push({ role: 'assistant', content: STRANDED_TURN_PLACEHOLDER });
         }
-        const tail = persisted[persisted.length - 1];
-        if (tail !== undefined) priorTailId = tail.id;
+        const lastFetched = tail.messages[tail.messages.length - 1];
+        if (lastFetched !== undefined) priorTailId = lastFetched.id;
       }
 
       const userMsg = appendMessage(config.db, {

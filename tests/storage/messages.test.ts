@@ -5,6 +5,7 @@ import { migrate } from '../../src/storage/migrate.ts';
 import {
   appendMessage,
   getMessage,
+  listMessageTailBySession,
   listMessagesBySession,
 } from '../../src/storage/repos/messages.ts';
 import { createSession } from '../../src/storage/repos/sessions.ts';
@@ -73,6 +74,45 @@ describe('messages repo', () => {
     appendMessage(db, { sessionId, role: 'user', content: 'c', createdAt: 50 });
     const list = listMessagesBySession(db, sessionId);
     expect(list.map((m) => m.content)).toEqual(['a', 'b', 'c']);
+  });
+
+  test('listMessageTailBySession bounds the row count regardless of session size', () => {
+    // Regression: resume's hydration was previously reading the
+    // full log into JS via listMessagesBySession and slicing in
+    // memory — a 50k-message session would OOM despite the cap.
+    // The bounded variant pushes the limit into SQL so the JS
+    // heap never sees more than `limit` rows.
+    for (let i = 0; i < 200; i++) {
+      appendMessage(db, { sessionId, role: 'user', content: `msg-${i}` });
+    }
+    const tail = listMessageTailBySession(db, sessionId, 50);
+    expect(tail.totalCount).toBe(200);
+    expect(tail.messages).toHaveLength(50);
+    // Tail is the most-recent 50, oldest-first within the slice.
+    expect(tail.messages[0]?.content).toBe('msg-150');
+    expect(tail.messages[49]?.content).toBe('msg-199');
+  });
+
+  test('listMessageTailBySession returns all rows when session is smaller than limit', () => {
+    for (let i = 0; i < 5; i++) {
+      appendMessage(db, { sessionId, role: 'user', content: `msg-${i}` });
+    }
+    const tail = listMessageTailBySession(db, sessionId, 100);
+    expect(tail.totalCount).toBe(5);
+    expect(tail.messages).toHaveLength(5);
+    expect(tail.messages.map((m) => m.content)).toEqual([
+      'msg-0',
+      'msg-1',
+      'msg-2',
+      'msg-3',
+      'msg-4',
+    ]);
+  });
+
+  test('listMessageTailBySession on empty session returns 0/0', () => {
+    const tail = listMessageTailBySession(db, sessionId, 100);
+    expect(tail.totalCount).toBe(0);
+    expect(tail.messages).toEqual([]);
   });
 
   test('listMessagesBySession ties on same created_at follow insertion order', () => {
