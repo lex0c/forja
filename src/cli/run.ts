@@ -91,50 +91,61 @@ const resolveResumeId = (
 export const run = async (options: RunOptions): Promise<number> => {
   const { args } = options;
   const errSink = options.errSink ?? ((s: string) => process.stderr.write(s));
-
-  // List-sessions short-circuit. No provider, no policy engine, no
-  // harness — only the DB. Lets `agent --list-sessions` work
-  // without an API key set, which is the right shape for an
-  // inspection tool.
-  if (args.listSessions) {
-    return runListSessions({
-      json: args.json,
-      ...(options.bootstrapOverride?.dbPath !== undefined
-        ? { dbPath: options.bootstrapOverride.dbPath }
-        : {}),
-      out: (s) => process.stdout.write(s),
-    });
-  }
-
-  // Resume: require a follow-up prompt — without it there's no new
-  // user turn to drive the loop, and the model would just see its
-  // own last assistant message replayed. Resolve 'last' / id BEFORE
-  // bootstrap so a typo fails fast with a clean error.
-  let resumeFromSessionId: string | undefined;
-  if (args.resume !== undefined) {
-    if (args.prompt.length === 0) {
-      errSink('forja: --resume requires a follow-up prompt\n');
-      return 1;
-    }
-    const dbPath = options.bootstrapOverride?.dbPath ?? defaultDbPath();
-    const resolved = resolveResumeId(args.resume, dbPath);
-    if (!resolved.ok) {
-      errSink(`forja: ${resolved.message}\n`);
-      return 1;
-    }
-    resumeFromSessionId = resolved.id;
-  }
-
-  const renderer = options.rendererOverride ?? pickRenderer(args);
-
-  const controller = new AbortController();
-  const signal = options.signal ?? controller.signal;
-  // In production, wire SIGINT to abort. Tests pass their own signal and
-  // skip the handler.
-  const restoreSignal =
-    options.signal === undefined ? installSignalHandler(controller) : () => undefined;
+  // Single top-level try wraps both the preflight branches
+  // (--list-sessions short-circuit, --resume id resolution) AND
+  // the main run path. Without this, an exception from openDb
+  // inside the preflight (corrupt DB, unreadable path) escaped
+  // run() instead of routing through errSink → exit 1, breaking
+  // the contract that run() always returns a number. Signal
+  // handler is installed inside the try only when the main run
+  // path needs it — list-sessions is synchronous and short, no
+  // need to wire SIGINT for it.
+  let restoreSignal: () => void = () => undefined;
 
   try {
+    // List-sessions short-circuit. No provider, no policy engine, no
+    // harness — only the DB. Lets `agent --list-sessions` work
+    // without an API key set, which is the right shape for an
+    // inspection tool.
+    if (args.listSessions) {
+      return runListSessions({
+        json: args.json,
+        ...(options.bootstrapOverride?.dbPath !== undefined
+          ? { dbPath: options.bootstrapOverride.dbPath }
+          : {}),
+        out: (s) => process.stdout.write(s),
+      });
+    }
+
+    // Resume: require a follow-up prompt — without it there's no new
+    // user turn to drive the loop, and the model would just see its
+    // own last assistant message replayed. Resolve 'last' / id BEFORE
+    // bootstrap so a typo fails fast with a clean error.
+    let resumeFromSessionId: string | undefined;
+    if (args.resume !== undefined) {
+      if (args.prompt.length === 0) {
+        errSink('forja: --resume requires a follow-up prompt\n');
+        return 1;
+      }
+      const dbPath = options.bootstrapOverride?.dbPath ?? defaultDbPath();
+      const resolved = resolveResumeId(args.resume, dbPath);
+      if (!resolved.ok) {
+        errSink(`forja: ${resolved.message}\n`);
+        return 1;
+      }
+      resumeFromSessionId = resolved.id;
+    }
+
+    const renderer = options.rendererOverride ?? pickRenderer(args);
+
+    const controller = new AbortController();
+    const signal = options.signal ?? controller.signal;
+    // In production, wire SIGINT to abort. Tests pass their own signal and
+    // skip the handler.
+    if (options.signal === undefined) {
+      restoreSignal = installSignalHandler(controller);
+    }
+
     const bootstrapInput: BootstrapInput = {
       prompt: args.prompt,
       ...(args.model !== undefined ? { modelId: args.model } : {}),

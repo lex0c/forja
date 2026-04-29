@@ -274,6 +274,29 @@ describe('--resume flow', () => {
     // to the run.ts catch block.
   });
 
+  test('preflight DB failure routes through errSink (does not throw)', async () => {
+    // Regression: --list-sessions and resume preflight executed
+    // BEFORE the run() try/catch. If openDb / migrate threw (e.g.,
+    // unreadable path), the exception escaped run() instead of
+    // surfacing as exit 1 + 'forja: ...' on errSink — breaking
+    // the contract that run() always returns a number.
+    //
+    // Force a failure by pointing dbPath at a path that can't be
+    // opened: a directory (sqlite open expects a file). bun:sqlite
+    // throws on this; the test verifies the throw lands in run()'s
+    // top-level catch.
+    const errLines: string[] = [];
+    const code = await run({
+      args: baseArgs({ listSessions: true }),
+      bootstrapOverride: { dbPath: workdir }, // workdir is a directory, not a file
+      signal: new AbortController().signal,
+      rendererOverride: recordingRenderer().renderer,
+      errSink: (s) => errLines.push(s),
+    });
+    expect(code).toBe(1);
+    expect(errLines.join('')).toContain('forja:');
+  });
+
   test('resume with unknown id surfaces a clean error', async () => {
     // The harness throws 'session X not found' from getSession;
     // run() catches it and prints to errSink with exit 1.
