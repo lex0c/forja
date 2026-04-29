@@ -92,4 +92,46 @@ describe('bash_background tool', () => {
     if (!isToolError(r)) return;
     expect(r.error_code).toBe('tool.invalid_arg');
   });
+
+  test('omitted cwd defaults to ctx.cwd, not process.cwd()', async () => {
+    // Session cwd is a tmp dir distinct from the harness's process
+    // dir. Without the fix, the spawn falls through to process.cwd()
+    // and `pwd` echoes the harness directory; with the fix it
+    // echoes the session dir.
+    const sessionCwd = mkdtempSync(join(tmpdir(), 'forja-bg-cwd-'));
+    tempRoots.push(sessionCwd);
+    const ctx = makeCtx({ sessionId, bgManager: mgr, cwd: sessionCwd });
+    const r = await bashBackgroundTool.execute({ command: 'pwd' }, ctx);
+    if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+    await waitForExit(r.process_id);
+    const out = await mgr.readOutput(r.process_id);
+    expect(out.stdout.trim()).toBe(sessionCwd);
+  });
+
+  test('relative cwd resolves against ctx.cwd', async () => {
+    // Session cwd has a `sub/` subdirectory. Passing args.cwd='sub'
+    // (relative) should land in <session>/sub, not process.cwd()/sub.
+    const { mkdirSync } = await import('node:fs');
+    const sessionCwd = mkdtempSync(join(tmpdir(), 'forja-bg-cwd-'));
+    tempRoots.push(sessionCwd);
+    mkdirSync(join(sessionCwd, 'sub'));
+    const ctx = makeCtx({ sessionId, bgManager: mgr, cwd: sessionCwd });
+    const r = await bashBackgroundTool.execute({ command: 'pwd', cwd: 'sub' }, ctx);
+    if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+    await waitForExit(r.process_id);
+    const out = await mgr.readOutput(r.process_id);
+    expect(out.stdout.trim()).toBe(join(sessionCwd, 'sub'));
+  });
+
+  test('absolute cwd is used as-is', async () => {
+    const sessionCwd = mkdtempSync(join(tmpdir(), 'forja-bg-cwd-'));
+    const otherDir = mkdtempSync(join(tmpdir(), 'forja-bg-other-'));
+    tempRoots.push(sessionCwd, otherDir);
+    const ctx = makeCtx({ sessionId, bgManager: mgr, cwd: sessionCwd });
+    const r = await bashBackgroundTool.execute({ command: 'pwd', cwd: otherDir }, ctx);
+    if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+    await waitForExit(r.process_id);
+    const out = await mgr.readOutput(r.process_id);
+    expect(out.stdout.trim()).toBe(otherDir);
+  });
 });

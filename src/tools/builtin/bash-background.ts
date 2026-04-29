@@ -1,3 +1,4 @@
+import { isAbsolute, resolve } from 'node:path';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
 export interface BashBackgroundInput {
@@ -80,11 +81,26 @@ export const bashBackgroundTool: Tool<BashBackgroundInput, BashBackgroundOutput>
     if (typeof args.command !== 'string' || args.command.length === 0) {
       return toolError(ERROR_CODES.invalidArg, 'command must be a non-empty string');
     }
+    // Resolve cwd against the session: undefined → session cwd;
+    // absolute → as-is; relative → resolve from session cwd. Same
+    // pattern as the synchronous bash tool. Forwarding args.cwd
+    // verbatim (or omitting it) makes the manager fall back to
+    // process.cwd(), which silently runs commands in the wrong
+    // directory whenever the harness was launched with a different
+    // working dir than the session — e.g. evals (each case has its
+    // own tmp cwd) and worktree subagents (M3+).
+    const wd =
+      args.cwd === undefined
+        ? ctx.cwd
+        : isAbsolute(args.cwd)
+          ? args.cwd
+          : resolve(ctx.cwd, args.cwd);
+
     try {
       const r = await ctx.bgManager.spawn({
         command: args.command,
+        cwd: wd,
         ...(args.label !== undefined ? { label: args.label } : {}),
-        ...(args.cwd !== undefined ? { cwd: args.cwd } : {}),
         ...(args.max_runtime_ms !== undefined ? { maxRuntimeMs: args.max_runtime_ms } : {}),
       });
       return {
