@@ -154,7 +154,8 @@ export const listBgProcessesBySession = (
   const rows = db
     .query(
       `SELECT id, session_id, os_pid, label, command, cwd, spawned_at,
-              exited_at, exit_code, status, stdout_log_path, stderr_log_path, cursor_position
+              exited_at, exit_code, status, stdout_log_path, stderr_log_path,
+              cursor_position, stderr_cursor_position
        FROM background_processes
        WHERE session_id = ? AND status IN (${placeholders})
        ORDER BY spawned_at DESC, id ASC`,

@@ -106,6 +106,28 @@ describe('bg-processes repo', () => {
     expect(final.map((p) => p.label).sort()).toEqual(['a', 'b']);
   });
 
+  test('listBgProcessesBySession returns numeric cursors on filtered results', async () => {
+    // Regression: the status-filtered SELECT used to omit
+    // `stderr_cursor_position`, leaving stderrCursorPosition
+    // undefined and breaking downstream cursor arithmetic.
+    const { advanceBgProcessStderrCursor } = await import(
+      '../../src/storage/repos/bg-processes.ts'
+    );
+    const a = insert({ label: 'a' });
+    advanceBgProcessStdoutCursor(db, a.id, 100);
+    advanceBgProcessStderrCursor(db, a.id, 50);
+    finalizeBgProcess(db, { id: a.id, status: 'exited', exitCode: 0 });
+    const filtered = listBgProcessesBySession(db, sessionId, { status: 'exited' });
+    expect(filtered).toHaveLength(1);
+    const row = filtered[0];
+    if (row === undefined) return;
+    expect(row.stdoutCursorPosition).toBe(100);
+    expect(row.stderrCursorPosition).toBe(50);
+    // Defensive: catch a future regression to undefined explicitly
+    expect(typeof row.stdoutCursorPosition).toBe('number');
+    expect(typeof row.stderrCursorPosition).toBe('number');
+  });
+
   test('advanceBgProcessStdoutCursor updates only stdout cursor', () => {
     const proc = insert({ label: 'dev' });
     advanceBgProcessStdoutCursor(db, proc.id, 1024);
