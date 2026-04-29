@@ -350,6 +350,35 @@ describe('runCheckpointsCli', () => {
       expect(errStr).toContain('git stash pop');
     });
 
+    test('restore on a GC-collected commit emits a friendly purge hint', async () => {
+      await initRepoWithSeed(repo);
+      // Insert a row that points at a sha that does not exist in
+      // git. The CLI's restore path should detect this through the
+      // "bad object" probe and rewrite to the purge hint instead of
+      // surfacing raw git output.
+      const phantomCkpt = insertCheckpoint(db, {
+        sessionId,
+        stepId: 'msg-x',
+        gitRef: '0000000000000000000000000000000000000000',
+        hadBash: false,
+      });
+      const c = capture();
+      const code = await runCheckpointsCli({
+        verb: 'restore',
+        positionals: [sessionId, phantomCkpt.id],
+        json: false,
+        yes: false,
+        cwd: repo,
+        dbOverride: db,
+        out: c.pushOut,
+        err: c.pushErr,
+      });
+      expect(code).toBe(1);
+      const errStr = c.err.join('');
+      expect(errStr).toContain('garbage-collected');
+      expect(errStr).toContain(`--checkpoints purge ${sessionId}`);
+    });
+
     test('restore rejects ckpt id from a different session', async () => {
       await initRepoWithSeed(repo);
       const otherSessionId = createSession(db, { model: 'm', cwd: repo }).id;

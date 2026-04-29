@@ -211,6 +211,26 @@ const runRestoreImpl = async (
     return 0;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
+    // Friendly rewrite for the most common failure: the checkpoint
+    // commit was reclaimed by `git gc` (typical after a manual
+    // prune, or because the user ran `git gc --aggressive` and the
+    // ref namespace got truncated). Raw git output ("fatal: bad
+    // object" / "not a valid object name") doesn't tell the user
+    // what to do next; the rewrite points them at purge.
+    if (
+      msg.includes('bad object') ||
+      msg.includes('not a valid object name') ||
+      msg.includes('unknown revision') ||
+      // Empty/all-zero sha and other unresolvable revisions surface
+      // here. Same root cause as the cases above (commit object isn't
+      // there) so the fix is the same: tell the user to purge.
+      msg.includes('Needed a single revision')
+    ) {
+      input.err(
+        `forja: checkpoint ${ckpt.id} references commit ${ckpt.gitRef} which is no\nlonger reachable in git (likely garbage-collected). Run\n\`agent --checkpoints purge ${sessionId}\` to drop the stale rows.\n`,
+      );
+      return 1;
+    }
     input.err(`forja: ${msg}\n`);
     return 1;
   }
