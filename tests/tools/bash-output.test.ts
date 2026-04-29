@@ -116,4 +116,70 @@ describe('bash_output tool', () => {
     if (!isToolError(r)) throw new Error('expected error');
     expect(r.error_code).toBe('tool.invalid_arg');
   });
+
+  // Validation parity with schema: since_* declares minimum: 0 and
+  // max_bytes declares minimum: 1, but model JSON arrives unvalidated.
+  // Negative cursors produce overlapping reads; max_bytes<=0 returns
+  // empty chunks with nonzero pending forever (busy-wait loop bait);
+  // non-integer values land in slice math.
+  test('rejects negative since_stdout', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashOutputTool.execute({ process_id: 'x', since_stdout: -1 }, ctx);
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('since_stdout');
+  });
+
+  test('rejects negative since_stderr', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashOutputTool.execute({ process_id: 'x', since_stderr: -42 }, ctx);
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('since_stderr');
+  });
+
+  test('rejects non-integer since_stdout', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashOutputTool.execute({ process_id: 'x', since_stdout: 1.5 }, ctx);
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+  });
+
+  test('rejects non-numeric since_stdout', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashOutputTool.execute(
+      // biome-ignore lint/suspicious/noExplicitAny: testing invalid input shape
+      { process_id: 'x', since_stdout: 'abc' as any },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+  });
+
+  test('rejects max_bytes below 1', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashOutputTool.execute({ process_id: 'x', max_bytes: 0 }, ctx);
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('max_bytes');
+  });
+
+  test('rejects non-integer max_bytes', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashOutputTool.execute({ process_id: 'x', max_bytes: 100.5 }, ctx);
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+  });
+
+  test('accepts since_stdout=0 boundary', async () => {
+    // 0 means "from the beginning" — schema permits and so does the
+    // manager (read from byte 0). Validation must not over-reject
+    // the documented boundary.
+    const spawned = await mgr.spawn({ command: 'echo hello' });
+    await waitForExit(spawned.id);
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await bashOutputTool.execute({ process_id: spawned.id, since_stdout: 0 }, ctx);
+    if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+    expect(r.stdout).toContain('hello');
+  });
 });

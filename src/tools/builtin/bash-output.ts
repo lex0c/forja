@@ -97,6 +97,41 @@ export const bashOutputTool: Tool<BashOutputInput, BashOutputOutput> = {
     if (typeof args.process_id !== 'string' || args.process_id.length === 0) {
       return toolError(ERROR_CODES.invalidArg, 'process_id must be a non-empty string');
     }
+    // Schema declares `since_*` as `minimum: 0` and `max_bytes` as
+    // `minimum: 1`, but providers don't enforce schema constraints —
+    // model JSON arrives unvalidated. Without these checks:
+    //   - since_*: -1 makes the manager's cursor math go backwards
+    //     relative to bytes read, returning chunks that overlap the
+    //     model's previous read window;
+    //   - max_bytes <= 0 returns empty chunks with nonzero pending
+    //     forever, trapping a polling loop in busy-wait;
+    //   - non-integer values land in slice/substr arithmetic and
+    //     produce off-by-fractional reads.
+    // Reject runtime-side with the same boundaries the schema declares.
+    const validateNonNegativeInt = (v: unknown, label: string): string | null => {
+      if (typeof v !== 'number' || !Number.isFinite(v) || !Number.isInteger(v) || v < 0) {
+        return `${label} must be a non-negative integer`;
+      }
+      return null;
+    };
+    if (args.since_stdout !== undefined) {
+      const err = validateNonNegativeInt(args.since_stdout, 'since_stdout');
+      if (err !== null) return toolError(ERROR_CODES.invalidArg, err);
+    }
+    if (args.since_stderr !== undefined) {
+      const err = validateNonNegativeInt(args.since_stderr, 'since_stderr');
+      if (err !== null) return toolError(ERROR_CODES.invalidArg, err);
+    }
+    if (args.max_bytes !== undefined) {
+      if (
+        typeof args.max_bytes !== 'number' ||
+        !Number.isFinite(args.max_bytes) ||
+        !Number.isInteger(args.max_bytes) ||
+        args.max_bytes < 1
+      ) {
+        return toolError(ERROR_CODES.invalidArg, 'max_bytes must be a positive integer (>=1)');
+      }
+    }
     try {
       const opts: { sinceStdout?: number; sinceStderr?: number; maxBytes?: number } = {};
       if (args.since_stdout !== undefined) opts.sinceStdout = args.since_stdout;
