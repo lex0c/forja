@@ -201,4 +201,33 @@ describe('bashTool', () => {
     expect(elapsed).toBeLessThan(4000);
     expect(elapsed).toBeGreaterThanOrEqual(2000);
   });
+
+  // Validation parity: schema declares timeout_ms minimum: 100; runtime
+  // must enforce. Without the check, NaN coerces inside Math.min and
+  // setTimeout fires near-immediately.
+  test('rejects timeout_ms below 100', async () => {
+    const out = await bashTool.execute({ command: 'true', timeout_ms: 50 }, makeCtx({ cwd: dir }));
+    if (!isToolError(out)) throw new Error('expected error');
+    expect(out.error_code).toBe('tool.invalid_arg');
+    expect(out.error_message).toContain('timeout_ms');
+  });
+
+  test('rejects non-numeric timeout_ms', async () => {
+    const out = await bashTool.execute(
+      // biome-ignore lint/suspicious/noExplicitAny: testing invalid input shape
+      { command: 'true', timeout_ms: 'abc' as any },
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected error');
+    expect(out.error_code).toBe('tool.invalid_arg');
+  });
+
+  test('rejects non-integer timeout_ms', async () => {
+    const out = await bashTool.execute(
+      { command: 'true', timeout_ms: 500.5 },
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected error');
+    expect(out.error_code).toBe('tool.invalid_arg');
+  });
 });

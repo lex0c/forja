@@ -104,6 +104,32 @@ describe.if(RG_AVAILABLE)('grepTool (with ripgrep)', () => {
     expect(isToolError(out)).toBe(true);
     if (isToolError(out)) expect(out.error_code).toBe('tool.aborted');
   });
+
+  // Validation parity: schema declares max_results minimum: 1; runtime
+  // must enforce. Bad values would otherwise reach ripgrep's CLI flag
+  // and surface as a messy --max-count parse error.
+  test('rejects max_results below 1', async () => {
+    const out = await grepTool.execute({ pattern: 'x', max_results: 0 }, makeCtx({ cwd: dir }));
+    if (!isToolError(out)) throw new Error('expected error');
+    expect(out.error_code).toBe('tool.invalid_arg');
+    expect(out.error_message).toContain('max_results');
+  });
+
+  test('rejects non-integer max_results', async () => {
+    const out = await grepTool.execute({ pattern: 'x', max_results: 5.5 }, makeCtx({ cwd: dir }));
+    if (!isToolError(out)) throw new Error('expected error');
+    expect(out.error_code).toBe('tool.invalid_arg');
+  });
+
+  test('rejects non-numeric max_results', async () => {
+    const out = await grepTool.execute(
+      // biome-ignore lint/suspicious/noExplicitAny: testing invalid input shape
+      { pattern: 'x', max_results: 'abc' as any },
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected error');
+    expect(out.error_code).toBe('tool.invalid_arg');
+  });
 });
 
 describe.if(!RG_AVAILABLE)('grepTool (ripgrep absent)', () => {

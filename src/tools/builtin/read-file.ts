@@ -38,13 +38,39 @@ export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
     cost: { latency_ms_typical: 5 },
   },
   async execute(args, ctx): Promise<ToolResult<ReadFileOutput>> {
-    const offset = args.offset ?? 0;
-    const limit = args.limit ?? DEFAULT_LIMIT;
-    const abs = isAbsolute(args.path) ? args.path : resolve(ctx.cwd, args.path);
-
     if (ctx.signal.aborted) {
       return toolError(ERROR_CODES.aborted, 'tool aborted before read', { retryable: true });
     }
+    // Schema declares offset (minimum: 0) and limit (minimum: 1) but
+    // providers don't enforce schema constraints — model JSON arrives
+    // unvalidated. Without these checks: negative offset reads from
+    // a negative line index (slice misbehavior); fractional values
+    // land in line-slice math producing off-by-fractional reads;
+    // limit=0 returns empty content despite a valid file with a
+    // confusing pending=true. Reject runtime-side.
+    if (args.offset !== undefined) {
+      if (
+        typeof args.offset !== 'number' ||
+        !Number.isFinite(args.offset) ||
+        !Number.isInteger(args.offset) ||
+        args.offset < 0
+      ) {
+        return toolError(ERROR_CODES.invalidArg, 'offset must be a non-negative integer');
+      }
+    }
+    if (args.limit !== undefined) {
+      if (
+        typeof args.limit !== 'number' ||
+        !Number.isFinite(args.limit) ||
+        !Number.isInteger(args.limit) ||
+        args.limit < 1
+      ) {
+        return toolError(ERROR_CODES.invalidArg, 'limit must be a positive integer (>=1)');
+      }
+    }
+    const offset = args.offset ?? 0;
+    const limit = args.limit ?? DEFAULT_LIMIT;
+    const abs = isAbsolute(args.path) ? args.path : resolve(ctx.cwd, args.path);
 
     const file = Bun.file(abs);
     if (!(await file.exists())) {

@@ -142,6 +142,23 @@ export const bashTool: Tool<BashInput, BashOutput> = {
       return toolError(ERROR_CODES.aborted, 'tool aborted before exec', { retryable: true });
     }
 
+    // Schema declares timeout_ms with minimum: 100 but providers
+    // don't enforce schema constraints — model JSON arrives
+    // unvalidated. Without these checks: 'abc' coerces inside
+    // Math.min to NaN and setTimeout fires ~1ms; negative or zero
+    // values kill the command immediately; non-integers land in
+    // setTimeout's fractional-ms behavior. Reject runtime-side.
+    if (args.timeout_ms !== undefined) {
+      if (
+        typeof args.timeout_ms !== 'number' ||
+        !Number.isFinite(args.timeout_ms) ||
+        !Number.isInteger(args.timeout_ms) ||
+        args.timeout_ms < 100
+      ) {
+        return toolError(ERROR_CODES.invalidArg, 'timeout_ms must be an integer >= 100');
+      }
+    }
+
     const timeout = Math.min(args.timeout_ms ?? DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
     const wd =
       args.cwd === undefined
