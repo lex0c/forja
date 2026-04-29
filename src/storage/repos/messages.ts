@@ -89,11 +89,21 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
     }
   }
 
+  // `seq` is computed via subquery in the same INSERT so it's
+  // atomic under SQLite's single-writer model. Without this, two
+  // appends in the same millisecond would tie on created_at and
+  // be ordered by UUID lex (random) on listMessagesBySession,
+  // breaking resume's tool_use ↔ tool_result pairing. The subquery
+  // sees committed state at INSERT time; concurrent writers are
+  // serialized by SQLite, so MAX(seq) is always current.
   db.query(
     `INSERT INTO messages
      (id, session_id, parent_id, role, content,
-      tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at, seq)
+     VALUES (
+       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+       (SELECT COALESCE(MAX(seq), -1) + 1 FROM messages WHERE session_id = ?)
+     )`,
   ).run(
     id,
     input.sessionId,
@@ -106,6 +116,7 @@ export const appendMessage = (db: DB, input: AppendMessageInput): Message => {
     cacheCreationTokens,
     costUsd,
     createdAt,
+    input.sessionId,
   );
   return {
     id,
@@ -134,13 +145,19 @@ export const getMessage = (db: DB, id: string): Message | null => {
 };
 
 export const listMessagesBySession = (db: DB, sessionId: string): Message[] => {
+  // ORDER BY seq is the canonical replay order — strictly monotonic
+  // per session, populated atomically at INSERT time, so two appends
+  // in the same millisecond no longer tie. created_at is preserved
+  // for diagnostics (rendering, cost analysis) but doesn't drive
+  // ordering anymore. The (session_id, seq) index makes this an
+  // index seek.
   const rows = db
     .query(
       `SELECT id, session_id, parent_id, role, content,
               tokens_in, tokens_out, cached_tokens, cache_creation_tokens, cost_usd, created_at
        FROM messages
        WHERE session_id = ?
-       ORDER BY created_at ASC, id ASC`,
+       ORDER BY seq ASC`,
     )
     .all(sessionId) as MessageRow[];
   return rows.map(fromRow);

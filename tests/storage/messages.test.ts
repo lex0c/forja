@@ -56,12 +56,47 @@ describe('messages repo', () => {
     expect(fetched?.cachedTokens).toBe(80);
   });
 
-  test('listMessagesBySession orders by created_at ascending', () => {
+  test('listMessagesBySession orders by insertion seq, not created_at', () => {
+    // Migration 007 introduced an explicit `seq` column populated
+    // at INSERT time so resume replay sees turns in the order they
+    // were appended — not the order their timestamps suggest. The
+    // assertion here looks counter-intuitive (c has the smallest
+    // createdAt but appears LAST) by design: in production every
+    // append uses Date.now(), so insertion order equals timestamp
+    // order; a test that overrides createdAt out-of-band exposes
+    // the divergence and confirms seq wins. Critical for resume:
+    // without this, an assistant message with tool_use blocks
+    // could land after the user message with the matching
+    // tool_result blocks, producing an invalid conversation.
     appendMessage(db, { sessionId, role: 'user', content: 'a', createdAt: 100 });
     appendMessage(db, { sessionId, role: 'assistant', content: 'b', createdAt: 200 });
     appendMessage(db, { sessionId, role: 'user', content: 'c', createdAt: 50 });
     const list = listMessagesBySession(db, sessionId);
-    expect(list.map((m) => m.content)).toEqual(['c', 'a', 'b']);
+    expect(list.map((m) => m.content)).toEqual(['a', 'b', 'c']);
+  });
+
+  test('listMessagesBySession ties on same created_at follow insertion order', () => {
+    // Direct regression for the bug Migration 007 closes. Two
+    // appends at exactly the same created_at would, under the old
+    // ORDER BY created_at, id, fall back to UUID lex sort —
+    // random for v4. With seq the order is deterministic.
+    const ms = 1_700_000_000_000;
+    for (let i = 0; i < 10; i++) {
+      appendMessage(db, { sessionId, role: 'user', content: `m${i}`, createdAt: ms });
+    }
+    const list = listMessagesBySession(db, sessionId);
+    expect(list.map((m) => m.content)).toEqual([
+      'm0',
+      'm1',
+      'm2',
+      'm3',
+      'm4',
+      'm5',
+      'm6',
+      'm7',
+      'm8',
+      'm9',
+    ]);
   });
 
   test('cascades on session delete', () => {
