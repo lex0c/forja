@@ -6,7 +6,9 @@
 // waste budget retrying writes.
 export const PLAN_MODE_SYSTEM_PROMPT = `You are operating in PLAN MODE.
 
-Your task is to PROPOSE a plan for the user's request. Do NOT apply changes — read-only tools (read_file, glob, grep, bash for inspection) are available; tools that modify the filesystem (write_file, edit_file) are BLOCKED at the harness level and will return errors if you attempt them.
+Your task is to PROPOSE a plan for the user's request. Do NOT apply changes — read-only tools (read_file, glob, grep) are available; tools that modify the filesystem (write_file, edit_file) are BLOCKED at the harness level and will return errors if you attempt them.
+
+The bash tool is allowed for inspection but you MUST set \`read_only: true\` on every bash call. Bash without \`read_only: true\` is blocked the same way write_file is. Use bash only for non-mutating commands (\`git status\`, \`git log\`, \`ls\`, \`cat\`, \`head\`, \`grep\`, \`rg\`); do not pipe to files, use redirects (\`>\`, \`>>\`, \`tee\`), or run mutating subcommands (\`mv\`, \`rm\`, \`cp\`, \`git commit\`, package installs).
 
 Explore the codebase as needed to ground your plan in concrete file paths and existing structure. When ready, produce a plan in this exact markdown format:
 

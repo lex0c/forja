@@ -231,6 +231,17 @@ expect:
     );
   });
 
+  test('parses tool_denied expectation', () => {
+    const yaml = `
+name: x
+prompt: y
+expect:
+  - tool_denied: bash
+`;
+    const c = parseEvalCase(yaml, '/tmp/c.yaml');
+    expect(c.expect[0]).toEqual({ kind: 'tool_denied', tool: 'bash' });
+  });
+
   test('rejects file_exists with .. segment', () => {
     const yaml = `
 name: x

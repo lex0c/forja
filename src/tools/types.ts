@@ -27,15 +27,32 @@ export interface ToolMetadata {
   // Side effect declarations. `writes: true` triggers checkpoint creation
   // in the harness (Step 5+).
   writes: boolean;
-  // Plan-mode override: when true, the tool is allowed in plan mode
-  // even if `writes: true` is set pessimistically (the canonical
-  // example is `bash` — it CAN write but most invocations are
-  // read-only inspections like `git status`/`ls`/`cat`). Tools that
-  // ALWAYS mutate (write_file, edit_file) leave this unset/false so
-  // plan mode blocks them. Per AGENTIC_CLI §5.1 "bash com efeito" —
-  // policy/sandbox govern destructive bash, plan mode only blocks
-  // unconditional writers.
-  planSafe?: boolean;
+  // Plan-mode predicate. When the harness is in plan mode and
+  // the tool has `writes: true`, this decides per-invocation
+  // whether the call may proceed. Three forms:
+  //   - omitted: every invocation blocked in plan mode (default
+  //     for write_file/edit_file — they ALWAYS mutate, the gate
+  //     here IS bullet-proof).
+  //   - `true`: every invocation allowed regardless of args.
+  //     Equivalent to "plan mode trusts this tool unconditionally".
+  //   - function: per-call predicate that inspects args. The
+  //     canonical case is `bash` — it CAN write, but the model
+  //     declares intent via `args.read_only`. Boolean-only would
+  //     either block legitimate inspections (git status, ls, cat)
+  //     or silently allow `echo x > file`. The predicate lets the
+  //     tool author encode the rule that `read_only === true` is
+  //     the gate.
+  //
+  // IMPORTANT: the predicate form is best-effort, NOT a security
+  // boundary. It catches honest models that forget to declare
+  // intent. It does NOT catch confused or adversarial models that
+  // declare `read_only: true` while sending `echo x > file` —
+  // observed in practice (M2 / Step 6.5 baseline). Real protection
+  // for adversarial inputs requires sandbox (spec §9.1, M3+).
+  // The `writes: true` + omitted-predicate combo IS bullet-proof
+  // because the harness never executes the tool. Use that for
+  // tools that should never run in plan mode period.
+  planSafe?: boolean | ((args: Record<string, unknown>) => boolean);
   network?: boolean;
   exec?: boolean;
   idempotent: boolean;

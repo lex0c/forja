@@ -217,9 +217,10 @@ describe('invokeTool', () => {
 
   test('plan mode: planSafe:true tools (writes pessimistically true) still execute', async () => {
     // Regression: `bash` declares writes:true pessimistically per
-    // CONTRACTS §2.6.3, but most invocations are read-only
-    // inspections (git status, ls). planSafe:true opts out of the
-    // plan-mode block — policy + sandbox govern destructive bash.
+    // CONTRACTS §2.6.3, but tools can opt out of the plan-mode
+    // block via `planSafe: true` when policy + sandbox govern
+    // destructive intent on their own (no per-call distinction
+    // needed at the harness layer).
     let executed = false;
     const inspectableTool: Tool = {
       name: 'bash',
@@ -241,6 +242,155 @@ describe('invokeTool', () => {
     );
     expect(inv.failed).toBe(false);
     expect(executed).toBe(true);
+  });
+
+  test('plan mode: planSafe predicate allows when args satisfy it', async () => {
+    // The function form lets the tool inspect per-call args. The
+    // canonical case is bash: `read_only: true` declared by the
+    // model passes the gate; missing or false keeps the call
+    // blocked. This is what makes "plan mode = no writes" honest
+    // even though bash is technically writes:true.
+    let executed = false;
+    const conditionalTool: Tool = {
+      name: 'bash',
+      description: 'reads or writes',
+      inputSchema: { type: 'object' },
+      metadata: {
+        category: 'bash',
+        writes: true,
+        planSafe: (args) => (args as { read_only?: unknown }).read_only === true,
+        idempotent: false,
+      },
+      async execute() {
+        executed = true;
+        return { stdout: 'ok' };
+      },
+    };
+    const deps = {
+      ...buildDeps(conditionalTool, { tools: { bash: { allow: ['*'] } } }),
+      planMode: true,
+    };
+    const inv = await invokeTool(
+      {
+        toolUseId: 'tu1',
+        toolName: 'bash',
+        args: { command: 'git status', read_only: true },
+        messageId,
+      },
+      deps,
+    );
+    expect(inv.failed).toBe(false);
+    expect(executed).toBe(true);
+  });
+
+  test('plan mode: planSafe predicate blocks when args do not satisfy it', async () => {
+    // Without read_only:true, plan mode refuses bash even though
+    // policy would allow. This is the whole point — `echo x > file`
+    // would silently mutate before this guard. The deny reason
+    // includes the hint to add `read_only: true` so the model
+    // can self-correct on retry.
+    let executed = false;
+    const conditionalTool: Tool = {
+      name: 'bash',
+      description: 'reads or writes',
+      inputSchema: { type: 'object' },
+      metadata: {
+        category: 'bash',
+        writes: true,
+        planSafe: (args) => (args as { read_only?: unknown }).read_only === true,
+        idempotent: false,
+      },
+      async execute() {
+        executed = true;
+        return { stdout: 'ok' };
+      },
+    };
+    const deps = {
+      ...buildDeps(conditionalTool, { tools: { bash: { allow: ['*'] } } }),
+      planMode: true,
+    };
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'bash', args: { command: 'echo x > file' }, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(true);
+    expect(executed).toBe(false);
+    expect(inv.toolResult.content).toContain('read_only');
+    expect(inv.decision?.kind).toBe('deny');
+  });
+
+  test('plan mode: planSafe predicate fails closed on truthy-but-not-true args', async () => {
+    // Strict equality matters. `read_only: 1` or `read_only: "true"`
+    // would pass a truthy check but the predicate uses `=== true`,
+    // so they're refused. Documents the contract: model must
+    // declare boolean true, not lie with a coerced value.
+    const conditionalTool: Tool = {
+      name: 'bash',
+      description: 'reads or writes',
+      inputSchema: { type: 'object' },
+      metadata: {
+        category: 'bash',
+        writes: true,
+        planSafe: (args) => (args as { read_only?: unknown }).read_only === true,
+        idempotent: false,
+      },
+      async execute() {
+        return { stdout: 'ok' };
+      },
+    };
+    const deps = {
+      ...buildDeps(conditionalTool, { tools: { bash: { allow: ['*'] } } }),
+      planMode: true,
+    };
+    for (const badValue of [1, 'true', {}, [], 'yes']) {
+      const inv = await invokeTool(
+        {
+          toolUseId: `tu-${String(badValue)}`,
+          toolName: 'bash',
+          args: { command: 'ls', read_only: badValue },
+          messageId,
+        },
+        deps,
+      );
+      expect(inv.failed).toBe(true);
+    }
+  });
+
+  test('plan mode: planSafe predicate that throws fails closed', async () => {
+    // A buggy predicate (NPE on unexpected args, etc.) must not
+    // open the gate. Treats a thrown predicate the same as
+    // returning false — the call is denied, the underlying tool's
+    // own validation surfaces the actual error on a future retry.
+    let executed = false;
+    const throwingPredicateTool: Tool = {
+      name: 'bash',
+      description: 'reads or writes',
+      inputSchema: { type: 'object' },
+      metadata: {
+        category: 'bash',
+        writes: true,
+        planSafe: (args) => {
+          // Simulate a predicate that assumes a field shape and
+          // crashes when the model passes something unexpected.
+          return (args as { nested: { read_only: boolean } }).nested.read_only === true;
+        },
+        idempotent: false,
+      },
+      async execute() {
+        executed = true;
+        return { stdout: 'ok' };
+      },
+    };
+    const deps = {
+      ...buildDeps(throwingPredicateTool, { tools: { bash: { allow: ['*'] } } }),
+      planMode: true,
+    };
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'bash', args: { command: 'ls' }, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(true);
+    expect(executed).toBe(false);
   });
 
   test('plan mode: write deny IS persisted to approvals (audit trail)', async () => {

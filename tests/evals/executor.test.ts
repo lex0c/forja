@@ -221,6 +221,72 @@ describe('executeCase', () => {
     expect(r.passed).toBe(true);
   });
 
+  test('tool_denied passes when plan mode blocks a write tool', async () => {
+    // Plan mode unconditionally denies write_file (no planSafe).
+    // The mock emits a write_file tool_use; the gate fires with
+    // a deny decision; tool_denied: write_file matches.
+    const c = baseCase({
+      plan: true,
+      expect: [
+        { kind: 'tool_denied', tool: 'write_file' },
+        { kind: 'file_not_exists', path: 'leak.txt' },
+      ],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([
+          {
+            tool_uses: [
+              { id: 't1', name: 'write_file', input: { path: 'leak.txt', content: 'leak' } },
+            ],
+          },
+          { text: 'attempted but blocked' },
+        ]),
+      },
+    });
+    expect(r.passed).toBe(true);
+  });
+
+  test('tool_denied fails when the tool was invoked AND allowed', async () => {
+    // Default eval policy is bypass — write_file would be allowed.
+    // Without plan mode, no deny fires; tool_denied must report
+    // "invoked but allowed" so the case author can spot the gap.
+    const c = baseCase({
+      expect: [{ kind: 'tool_denied', tool: 'write_file' }],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([
+          {
+            tool_uses: [
+              { id: 't1', name: 'write_file', input: { path: 'out.txt', content: 'ok' } },
+            ],
+          },
+          { text: 'wrote' },
+        ]),
+      },
+    });
+    expect(r.passed).toBe(false);
+    expect(r.expectations[0]?.detail ?? '').toMatch(/invoked but allowed/);
+  });
+
+  test('tool_denied fails when the tool was never invoked', async () => {
+    // Vacuous denies are a footgun: a tool_denied assertion that
+    // passes because the model never tried gives false confidence
+    // the gate fired. The expectation must distinguish "denied"
+    // from "absent" and fail with "never invoked" wording.
+    const c = baseCase({
+      expect: [{ kind: 'tool_denied', tool: 'bash' }],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'no tools used' }]),
+      },
+    });
+    expect(r.passed).toBe(false);
+    expect(r.expectations[0]?.detail ?? '').toMatch(/never invoked/);
+  });
+
   test('file_exists expectation that escapes cwd fails the assertion (no host probe)', async () => {
     // Direct EvalCase construction bypasses the loader. Without
     // the runtime guard, file_exists would probe arbitrary host

@@ -8,6 +8,15 @@ export type CompactionStrategy = 'llm' | 'fallback' | 'skipped';
 export type EvalExpectation =
   | { kind: 'tool_called'; tool: string }
   | { kind: 'tool_not_called'; tool: string }
+  // Asserts the tool was invoked AND the harness/permission engine
+  // returned a deny decision for it. Critical for proving guards
+  // fire under load: `file_not_exists` confirms the sandbox held,
+  // but a model that never even attempted the call would satisfy
+  // it vacuously. Pairing with `tool_denied` proves the gate
+  // actually executed and refused — not that nothing happened.
+  // Catches regressions where a future refactor makes a guard
+  // silently allow what it was meant to block.
+  | { kind: 'tool_denied'; tool: string }
   | { kind: 'file_exists'; path: string }
   | { kind: 'file_not_exists'; path: string }
   | { kind: 'file_contains'; path: string; pattern: string }

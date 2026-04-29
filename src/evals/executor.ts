@@ -31,8 +31,14 @@ export interface ExecuteOptions {
 }
 
 interface ToolInvocation {
+  toolUseId: string;
   toolName: string;
   args: Record<string, unknown>;
+}
+
+interface ToolDecisionRecord {
+  toolUseId: string;
+  kind: 'allow' | 'confirm' | 'deny';
 }
 
 interface CompactionRecord {
@@ -117,8 +123,22 @@ const evaluateExpectations = (
   invocations: ToolInvocation[],
   outputText: string,
   compactions: CompactionRecord[],
+  decisions: ToolDecisionRecord[],
 ): ExpectationOutcome[] => {
   const calledTools = new Set(invocations.map((i) => i.toolName));
+  // Stitch decisions back to tool names via toolUseId. The
+  // harness emits `tool_invoking` (carries name + id) before
+  // `tool_decided` (carries id + decision); the executor records
+  // both, then we join here. Using ids beats positional matching
+  // because failed invocations (unknown tool, no decision emitted)
+  // would otherwise misalign the index.
+  const idToName = new Map(invocations.map((i) => [i.toolUseId, i.toolName]));
+  const denialsByTool = new Set<string>();
+  for (const d of decisions) {
+    if (d.kind !== 'deny') continue;
+    const name = idToName.get(d.toolUseId);
+    if (name !== undefined) denialsByTool.add(name);
+  }
   return caseDef.expect.map((expectation): ExpectationOutcome => {
     switch (expectation.kind) {
       case 'tool_called': {
@@ -139,6 +159,23 @@ const evaluateExpectations = (
           expectation,
           passed,
           ...(passed ? {} : { detail: `tool '${expectation.tool}' was called` }),
+        };
+      }
+      case 'tool_denied': {
+        const passed = denialsByTool.has(expectation.tool);
+        if (passed) return { expectation, passed };
+        const seen = [...denialsByTool].join(', ') || '<no denies>';
+        if (!calledTools.has(expectation.tool)) {
+          return {
+            expectation,
+            passed: false,
+            detail: `tool '${expectation.tool}' was never invoked, so no deny could fire (denied tools: ${seen})`,
+          };
+        }
+        return {
+          expectation,
+          passed: false,
+          detail: `tool '${expectation.tool}' was invoked but allowed (denied tools: ${seen})`,
         };
       }
       case 'file_exists': {
@@ -265,6 +302,7 @@ export const executeCase = async (
 ): Promise<EvalCaseResult> => {
   const startedAt = Date.now();
   const invocations: ToolInvocation[] = [];
+  const decisions: ToolDecisionRecord[] = [];
   const compactions: CompactionRecord[] = [];
   let outputText = '';
 
@@ -328,7 +366,11 @@ export const executeCase = async (
         ...config,
         onEvent: (e: HarnessEvent) => {
           if (e.type === 'tool_invoking') {
-            invocations.push({ toolName: e.toolName, args: e.args });
+            invocations.push({ toolUseId: e.toolUseId, toolName: e.toolName, args: e.args });
+            return;
+          }
+          if (e.type === 'tool_decided') {
+            decisions.push({ toolUseId: e.toolUseId, kind: e.decision.kind });
             return;
           }
           if (e.type === 'compaction_finished') {
@@ -363,7 +405,7 @@ export const executeCase = async (
             detail: failure ?? 'setup failed',
           }),
         )
-      : evaluateExpectations(caseDef, cwd, result, invocations, outputText, compactions);
+      : evaluateExpectations(caseDef, cwd, result, invocations, outputText, compactions, decisions);
 
   if (cwd !== undefined) {
     rmSync(cwd, { recursive: true, force: true });

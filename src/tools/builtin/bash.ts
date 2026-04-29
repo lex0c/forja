@@ -138,13 +138,17 @@ export const bashTool: Tool<BashInput, BashOutput> = {
   metadata: {
     category: 'bash',
     writes: true, // pessimistic per CONTRACTS §2.6.3
-    // Plan mode allows bash because most invocations are read-only
-    // inspections (git status, ls, cat, rg). Destructive bash is
-    // governed by policy + sandbox, not the plan profile —
-    // AGENTIC_CLI §5.1 calls out "bash com efeito" specifically.
-    // Users who don't trust the model in plan mode set
-    // tools.bash.deny in the session-layer policy.
-    planSafe: true,
+    // Plan mode allows bash ONLY when the model declares the
+    // call read-only via `args.read_only === true`. Without this
+    // gate, plan mode would either block all bash (losing
+    // legitimate inspections like git status / ls / cat / head)
+    // or allow all bash including `echo x > file` (silently
+    // breaking the "plan mode = no writes" promise). Strict
+    // equality to `true` — string "true", truthy values like 1,
+    // and missing field all fail closed. The model commits to
+    // intent; if it lies, policy + sandbox are the next layer
+    // of defense (AGENTIC_CLI §5.1 "bash com efeito").
+    planSafe: (args) => (args as { read_only?: unknown }).read_only === true,
     exec: true,
     idempotent: false,
     display: 'raw',

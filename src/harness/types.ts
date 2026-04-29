@@ -114,10 +114,20 @@ export interface HarnessConfig {
   // discarded so a buggy renderer doesn't kill the loop.
   onEvent?: (event: HarnessEvent) => void;
   // Plan mode (AGENTIC_CLI §5): read-only profile. The harness
-  // refuses any tool with metadata.writes === true before execution
-  // — even if policy would have allowed it. This is harness-level,
-  // not policy-level, so a plan run is read-only regardless of
-  // permission hierarchy state.
+  // refuses tools with `metadata.writes === true` before
+  // execution — even if policy would have allowed it. This is
+  // harness-level, not policy-level, so write_file/edit_file
+  // are blocked regardless of permission hierarchy state.
+  //
+  // Tools that opt in via `metadata.planSafe` (boolean or
+  // predicate) MAY run in plan mode. The bash tool uses a
+  // predicate that gates on `args.read_only === true`. This
+  // gate is best-effort, NOT a security boundary: a model that
+  // declares read_only:true on a mutating command (observed
+  // with Haiku 4.5 sending `echo > file` with read_only:true)
+  // bypasses the gate. For adversarial protection, use sandbox
+  // (spec §9.1, M3+). For accidental-write protection from
+  // honest models, the predicate is sufficient.
   planMode?: boolean;
   // Sampling temperature passed straight through to every
   // provider call this run makes. When unset, each provider

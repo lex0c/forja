@@ -36,6 +36,7 @@ const VALID_COMPACTION_STRATEGIES: ReadonlySet<string> = new Set(['llm', 'fallba
 const EXPECTATION_KEYS = {
   tool_called: new Set(['tool_called']),
   tool_not_called: new Set(['tool_not_called']),
+  tool_denied: new Set(['tool_denied']),
   file_exists: new Set(['file_exists']),
   file_not_exists: new Set(['file_not_exists']),
   file_contains: new Set(['file_contains']),
@@ -201,6 +202,8 @@ const parseExpectation = (raw: unknown, idx: number): EvalExpectation => {
       return { kind, tool: requireString(r.tool_called, `expect[${idx}].tool_called`) };
     case 'tool_not_called':
       return { kind, tool: requireString(r.tool_not_called, `expect[${idx}].tool_not_called`) };
+    case 'tool_denied':
+      return { kind, tool: requireString(r.tool_denied, `expect[${idx}].tool_denied`) };
     case 'file_exists': {
       const path = requireString(r.file_exists, `expect[${idx}].file_exists`);
       validateWorkspaceRelativePath(path, `expect[${idx}].file_exists`);

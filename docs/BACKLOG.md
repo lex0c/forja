@@ -15,6 +15,143 @@ Format:
 
 ---
 
+## [2026-04-28] M2 / Step 6.5 — Plan-mode bash gate: limit found, scope honest
+
+A code-review observation (`bash` marked `planSafe: true` could
+silently allow `echo x > file` in plan mode) led to a fix: turn
+`planSafe` into a predicate that requires `args.read_only === true`.
+A negative smoke case written to verify the fix promptly proved
+the predicate is **insufficient**: Haiku 4.5 in plan mode sent
+`{ command: "echo \"should-not-write\" > exfil.txt", read_only: true }`
+and the harness gate accepted because the model declared intent.
+File got written.
+
+This entry records both the fix that landed AND the limit it
+hits, so future hardening doesn't repeat the same false-confidence
+pattern.
+
+**Done (the fix):**
+
+- `ToolMetadata.planSafe` extended from `boolean` to
+  `boolean | ((args: Record<string, unknown>) => boolean)`.
+  Predicate form lets each tool author encode per-call intent
+  validation. Predicate that throws fails closed; strict
+  `=== true` rejects truthy-but-not-true values.
+- `bash` switched from `planSafe: true` to
+  `planSafe: (args) => args.read_only === true`. Model must
+  declare intent on every plan-mode bash call.
+- Plan-mode system prompt updated with explicit instruction:
+  "bash MUST set `read_only: true` on every call. Bash without
+  it is blocked the same way write_file is. Do not pipe to files,
+  use redirects (`>`, `>>`, `tee`), or run mutating subcommands."
+- Deny reason and model-facing message tailored: predicate
+  failure says "add `read_only: true` to args, retry";
+  unconditional block says "describe in plan instead".
+- Audit trail preserved (tool_call + denied approval row).
+- Unit tests: 4 new in `tests/harness/invoke-tool.test.ts`
+  (predicate allows on satisfy, blocks on miss, strict equality
+  for truthy values, fail-closed on throw).
+- New eval expectation kind `tool_denied: <toolname>` —
+  general-purpose, asserts the tool was invoked AND a deny
+  decision fired (catches regressions where a guard silently
+  starts allowing what it was meant to block). Uses
+  `tool_decided` events; correlates by toolUseId.
+- New `tool_denied` expectation kind (general-purpose; useful
+  for future negative cases across permissions/hooks/MCP).
+
+**Done (the honesty):**
+
+- `ToolMetadata.planSafe` and `HarnessConfig.planMode` JSDoc
+  rewritten to be explicit: predicate form is best-effort, not
+  a security boundary; `writes: true` + omitted predicate is
+  bullet-proof. Documents the observed Haiku failure inline so
+  future contributors see the concrete failure mode, not just a
+  caveat.
+
+**Cut (two iterations of overreach):**
+
+1. **First attempt** — `09-plan-mode-bash-write-blocked.yaml`:
+   asserted the bash predicate catches mutating commands.
+   Failed under Haiku immediately (model sent
+   `{ command: "echo > exfil.txt", read_only: true }`,
+   gate accepted, file written). Predicate is best-effort,
+   not security. Removed; documented as the motivating
+   evidence for the JSDoc honesty pass.
+2. **Second attempt** — `09-plan-mode-write-tool-denied.yaml`:
+   pivoted to the bullet-proof gate (write_file with no
+   predicate, unconditional deny). Passed 3/3 on Haiku.
+   Failed 0/3 on gpt-4o-mini — different mechanism: GPT
+   reads the plan-mode system prompt's "write_file is
+   BLOCKED" instruction and **preempts by never invoking
+   write_file at all**. The case asserts `tool_denied:
+   write_file`, which fails with "never invoked" because
+   no call ever happened. Both behaviors are aligned;
+   neither is wrong; the case can't reliably distinguish
+   "gate fired" from "model preempted" across providers.
+   Removed.
+
+**The lesson:** smoke can verify what models reliably DO
+(read files, write when allowed, produce plan markdown,
+trigger compaction). Smoke cannot reliably verify what the
+HARNESS would do if the model tried something it shouldn't,
+because aligned models defensively skip. Gate-firing is
+covered by unit tests with mock providers
+(`tests/harness/invoke-tool.test.ts`); attempting integration
+verification of denial paths confuses unit-level assertions
+with integration-level reality.
+
+**Decisions:**
+
+- **Don't try to shell-parse bash commands for write intent.**
+  Considered adding redirect-detection (`>`, `>>`, `tee`) +
+  mutator-list (`rm`, `mv`, `cp`, `git commit`, etc.) as
+  defense-in-depth. Rejected: shell escapes (`bash -c '…'`,
+  here-docs, `eval`, `\>`) make any pattern match incomplete,
+  and incomplete protection that LOOKS thorough is worse than
+  no protection — operators trust it. Spec ANTI_PATTERNS likely
+  flags this class. Sandbox (M3+) is the right answer.
+- **Keep the predicate fix despite its limit.** It still
+  catches the honest-but-forgetful case (model omits
+  `read_only`, gate denies, model retries with the flag). Real
+  value, even if not security. Removing it would mean
+  `planSafe: true` lets `echo > file` through with NO friction
+  at all.
+- **No negative smoke case for plan mode.** Both attempts at
+  one (bash predicate, write_file gate) failed for different
+  reasons that ultimately point at the same root: smoke is a
+  model-behavior test, not a harness-behavior test. The gate
+  itself is unit-tested with mock providers and proven correct
+  in isolation. Mixing the two layers — using a real-model
+  case to assert harness-internal behavior — produces a test
+  that's fragile by construction.
+- **Don't cross §6.3 step boundary numbering.** Skipping 6.4
+  intentionally — this entry is the followup that 6.3's review
+  surfaced. Keeping it as 6.5 leaves room for 6.4 if a parallel
+  hardening lands later from another review pass.
+
+**Risks documented for M3:**
+
+- Plan mode + bash is "best-effort no writes" until sandbox.
+  Any operator running plan mode against untrusted prompts (CI
+  bot, shared-secret input) should assume bash CAN write and
+  rely on policy + sandbox layers, not plan-mode messaging.
+- The honest model failure mode (`read_only: true` on a
+  redirect) suggests the system prompt instruction isn't always
+  followed even by aligned models. A constrained generation
+  layer (M5+) that schema-validates `read_only` against
+  command structure could close this without shell parsing —
+  worth revisiting when constrained backend lands.
+- New `tool_denied` expectation is the building block for any
+  future negative case across the eval surface (permission
+  denies, hook denies, future MCP denies). Lives ready in
+  M3.
+
+**Spec reference:** `AGENTIC_CLI.md §5` (plan mode), `§5.1`
+("bash com efeito" — confirms policy/sandbox govern destructive
+bash, not plan profile alone), `§9.1` (sandbox / trust).
+
+---
+
 ## [2026-04-28] M2 / Step 6.3 — Multi-provider baseline (OpenAI)
 
 After Step 6.2 the Anthropic baseline was solid but the
