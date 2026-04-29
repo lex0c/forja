@@ -15,6 +15,289 @@ Format:
 
 ---
 
+## [2026-04-29] M3 / Step 2.2.1 — wait_for + non-bg conditions
+
+Opens Step 2.2 (`wait_for` / `monitor` primitives, spec
+§7.3.1) with the cheap-conditions slice: a wait_for tool
+that supports `sleep`, `file_exists`, `file_change`,
+`port_open`, and `http_response`. None of these depend on
+the bg manager — they're standalone utility waits that any
+synchronous workflow can use today.
+
+**Why this slice first:**
+
+- Spec §7.3.1 calls out the cost difference: 4-5 polling
+  steps via repeated `bash_output` ≈ $0.40 in LLM calls
+  vs `wait_for` ≈ $0.10. Even without process-aware
+  conditions, the model gains `sleep` (no more "ask the
+  user to wait" steps), `file_exists` (wait for a build
+  artifact), `port_open` (wait for a server to be ready),
+  and `http_response` (probe an endpoint). All immediately
+  useful.
+- Process-aware conditions (`process_exit`,
+  `process_output`) need the bg manager's stream
+  subscription surface — that's a different category of
+  work (file watching with regex against a growing log).
+  Splitting them out as 2.2.2 keeps each step's surface
+  auditable.
+- `monitor` and composition (`all_of`, `any_of`) are
+  another distinct category — streaming events and
+  recursive condition resolution. 2.2.3.
+
+**Slice scope (2.2.1):**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/wait/` module | NEW | `waitFor(condition, opts)` primitive + per-kind condition implementations |
+| Condition `sleep` | NEW | `setTimeout` raced against signal-abort |
+| Condition `file_exists` | NEW | poll `fs.existsSync` at `pollIntervalMs` (default 500ms); resolve immediately if already present |
+| Condition `file_change` | NEW | snapshot mtime on first poll, compare on subsequent. mtime-based — granularity bounded by FS (1s on some) |
+| Condition `port_open` | NEW | `net.connect` probe; success closes the connection, failure retries until timeout |
+| Condition `http_response` | NEW | `fetch` HEAD/GET; optional `status?` match (else any 2xx) |
+| Tool `wait_for` | NEW | category=`misc` (no command/path decision), planSafe (read-only) |
+| Tests | NEW | Per-condition unit tests + tool-level integration tests. port_open + http_response use `Bun.serve` on ephemeral ports for deterministic fixtures |
+| BACKLOG, bootstrap test | NEW | Tool count 9 → 10 |
+
+**Out of scope for 2.2.1 (deferred):**
+
+- **`process_exit` / `process_output` (2.2.2).** Need
+  bg manager subscription. process_exit is cheap
+  (already have `live` map with exitedSettled
+  promises). process_output requires growing-log
+  watch + regex matching with cursor — more involved.
+- **`monitor` (2.2.3).** Streaming observation. Spec
+  §7.3.1 makes it distinct from `wait_for` because
+  the LLM runs at the END (after max_events / duration /
+  cancellation), not on first match.
+- **Composition (`all_of` / `any_of`, 2.2.3).**
+  Recursive WaitCondition resolution. Spec acknowledges
+  race-condition surface in `any_of`. Deferred so the
+  base conditions are stable before the combinator
+  layer lands on top.
+
+**Decisions to make explicit upfront:**
+
+- **Polling, not native filesystem watches.** `fs.watch`
+  is platform-specific (inotify / FSEvents / Windows API)
+  with subtle correctness gotchas (events drop on rename,
+  some FSes don't fire). Spec §7.3.1 describes
+  `chokidar / fs.watch` — both are watcher libraries with
+  fallback layers we'd need to vendor. Going with mtime
+  polling for v1: portable, simple, and the latency
+  difference (≤ pollIntervalMs) is acceptable for the
+  build-artifact / server-ready use cases.
+- **`http_response` uses HEAD by default.** Avoids
+  downloading a response body just to check status.
+  When user wants body content (future enhancement),
+  that's a different condition kind.
+- **`port_open` opens then closes the probe connection
+  immediately.** No data sent. Tests against a TCP
+  service that doesn't accept connections (e.g. the
+  socket exists but server is mid-init) will fail-fast
+  on RST, which is the right signal.
+- **No `process_*` conditions in this slice.** Even
+  though the bg subsystem just landed, mixing it into
+  2.2.1 would force the wait module to depend on bg
+  internals before its own surface is stable.
+- **Relative paths resolve against `ctx.cwd`, not
+  `process.cwd()`.** Lesson carried over from the
+  bash_background cwd review (commit `509f964`):
+  `args.cwd` defaulting via `process.cwd()` silently
+  runs in the wrong directory whenever the harness
+  was launched with a different working dir than the
+  session (evals, bootstrap-from-script, worktree
+  subagents). Apply the same pattern to `file_exists`
+  and `file_change` conditions when they accept a
+  `path` arg — undefined unsupported (path is
+  required), absolute used as-is, relative resolved
+  via `resolve(ctx.cwd, path)`. Pin with regression
+  tests that set `ctx.cwd` to a tmp dir distinct from
+  the harness's process dir and assert the condition
+  fires against the SESSION path, not the harness path.
+
+**Spec reference:** `AGENTIC_CLI.md §7.3.1`,
+`CONTEXT_TUNING.md §3` (cost rationale).
+
+**Done:**
+
+- New `src/wait/` module exporting `waitFor(condition, opts)`
+  primitive plus the discriminated `WaitCondition` union for 5
+  kinds. Internal poll loop dispatches per-kind; abort and
+  timeout fold into a single `combinedSignal` via
+  `buildTimeoutSignal()` so the polling code only watches one
+  signal source. Cleanup function clears the timer on every
+  exit path.
+- Five conditions implemented:
+  - `sleep` — `setTimeout` raced against caller signal. Edge
+    case: when `durationMs > timeoutMs`, the wait reports
+    `conditionMet: 'timeout'` rather than masquerading as a
+    successful sleep.
+  - `file_exists` — poll `fs.existsSync` at `pollIntervalMs`
+    (default 500ms). Resolves immediately if the file is
+    already present.
+  - `file_change` — snapshot `mtimeMs` on first poll, compare
+    on subsequent. Treats "missing → present" as a change so
+    the model can wait for a build artifact to appear OR be
+    refreshed. Payload reports both `mtimeMs` and
+    `previousMtimeMs` (null when the file was missing
+    initially).
+  - `port_open` — `net.connect` probe with per-attempt
+    timeout = `pollIntervalMs`. On failure, sleeps
+    `min(pollIntervalMs, 100ms)` before retrying — fast-failing
+    sockets don't need the full poll interval.
+  - `http_response` — `fetch` HEAD with optional `status?`
+    match (defaults to any 2xx). Caller signal threads through
+    `fetch`'s own signal so a wait-level abort interrupts a
+    slow server mid-request, not just between polls.
+- `wait_for` tool (`src/tools/builtin/wait-for.ts`):
+  - `category: 'misc'` + `planSafe: true` (pure observational
+    primitive — no command, no path mutation; HEAD probes,
+    file stats, TCP connect+close are all read-only).
+  - Snake-case condition fields in the schema
+    (`duration_ms`, `poll_interval_ms`, etc.) consistent with
+    every other Forja tool surface.
+  - Path resolution against `ctx.cwd` for `file_exists` /
+    `file_change`. Lesson from commit `509f964`: relative paths
+    must land in the session dir, not `process.cwd()`.
+    Validation rejects unknown kinds and bad arg shapes with
+    clean tool errors instead of letting `waitFor` throw.
+- Tool count: 9 → 10. Bootstrap test updated.
+- 17 unit tests in `tests/wait/wait-for.test.ts` cover every
+  kind's match path, timeout path, and abort path. `port_open`
+  uses `Bun.listen` on an ephemeral port; `http_response`
+  uses `Bun.serve` with `/ok` (200) and `/teapot` (418)
+  routes — no flaky external calls.
+- 11 tool tests in `tests/tools/wait-for.test.ts`:
+  happy paths (sleep / file_exists abs / file_exists relative
+  resolves against ctx.cwd / file_change payload), timeout
+  reporting, signal propagation (mid-wait abort + pre-aborted
+  ctx returns clean tool error), input validation (unknown
+  kind, missing required field, negative timeout, port out of
+  range).
+- Total: 732 pass / 7 skip / 0 fail. Typecheck + lint green.
+
+**Decisions taken (not in opener):**
+
+- **Rejected per-condition file modules.** Opener had me
+  considering `src/wait/conditions/sleep.ts`, `port-open.ts`,
+  etc. Single-file `src/wait/index.ts` is ~270 LOC and reads
+  end-to-end in one screen — splitting would have added
+  coordination cost (cross-file shared types like
+  `WaitConditionMet`) without enabling parallel work. Revisit
+  when 2.2.2 / 2.2.3 land more conditions.
+- **`combinedSignal` pattern.** Internal helper
+  `buildTimeoutSignal(timeoutMs, callerSignal)` returns a
+  single signal that fires on EITHER the caller abort OR the
+  internal timeout. The polling loop only checks one signal
+  source; the `timeoutFired()` accessor lets the caller
+  distinguish timeout-from-abort when reporting the result.
+  Cleaner than tracking two signals across every await.
+- **`http_response` defaults to "any 2xx".** Spec doesn't pin
+  the default. 2xx is the common "service ready" semantic;
+  models that want a specific code (418 for a teapot probe)
+  pass `status` explicitly. A 4xx/5xx return without explicit
+  `status` does NOT match — it's still a network success but
+  the service isn't ready.
+- **`mtime null → present` IS a change.** Strictly speaking
+  "mtime change" implies the file existed at baseline. But
+  the practical use case ("wait for the build artifact to
+  appear or update") wants both shapes. Documented in JSDoc;
+  payload's `previousMtimeMs: null` lets the caller
+  distinguish creation from modification.
+- **`port_open` per-attempt timeout = `pollIntervalMs`.**
+  Without a per-attempt cap, a slow DNS lookup or
+  unreachable host could hang each probe far longer than the
+  poll interval. Capping at the poll interval keeps the loop
+  responsive to the outer timeout.
+
+**Pending (Step 2.2.2 / 2.2.3):**
+
+- 2.2.2: `process_exit`, `process_output` (depend on bg
+  manager subscription).
+- 2.2.3: `monitor` (streaming events), `all_of` / `any_of`
+  composition.
+
+**Risks documented:**
+
+- **mtime polling has 1-second granularity on some FS.**
+  ext4 and APFS have sub-second mtimes; FAT and some NFS
+  setups round to 1s. A back-to-back `writeFileSync` could
+  land within the same mtime tick on those filesystems and
+  the change goes undetected. Mitigation today: documented;
+  the test `'matches when an existing file is modified'`
+  uses a 200ms gap which exceeds the worst-case granularity.
+  Pull-in signal: if a real workflow on a low-resolution FS
+  flakes, switch to content-hash comparison or `fs.watch`
+  (with all the platform fragility that entails).
+- **`port_open` reports false negative on slow listen()
+  socket initialization.** A server that calls `listen()` but
+  hasn't fully bound yet may return RST instead of accepting
+  — `tryConnect` reports false, the wait keeps polling. By
+  next poll the bind has completed. Behavioral parity with
+  any other "wait for server ready" pattern; spec
+  acknowledges this in the §7.3.1 example.
+- **`http_response` HEAD may be unsupported by some
+  servers.** A few legacy services return 405 on HEAD. The
+  current default (any 2xx) would never match. Pull-in
+  signal: when a real workflow needs GET-style probing,
+  add `method: 'GET' | 'HEAD'` to the condition.
+
+**Code review fixes applied before commit:**
+
+- **Reject `..` in path segments (file_exists / file_change).**
+  The first draft resolved relative paths against `ctx.cwd` but
+  did nothing to prevent `../../etc/passwd`-style traversal —
+  `resolve()` happily collapses `..` and the model gets a
+  boolean of existence + mtime for any path on the system.
+  Cosmetic protection (model can pass `/etc/passwd` directly
+  if absolute paths are allowed at all), but the cheap
+  loader-style check closes the obvious leak vector. Rejects
+  `..` segments in BOTH relative and absolute paths
+  (`/foo/../etc/passwd` rejected too, since `..` in the
+  middle obscures the actual target). 3 regression tests
+  pin the contract: relative traversal rejected, absolute
+  traversal rejected, filename containing literal `..`
+  (e.g. `foo..txt`) accepted.
+- **`tryConnect` honors caller signal.** Was: per-attempt
+  hang up to the connect-timeout after caller abort, with
+  the outer poll loop catching it on the next iteration.
+  Now: `combinedSignal` is threaded into `tryConnect`; on
+  abort, the socket is destroyed and the probe settles
+  immediately. Regression test fires abort 50ms into a
+  probe of a non-routable host and asserts the wait
+  returns in <500ms (vs ~1.2s without the cascade).
+- **`port_open` per-attempt timeout has a 200ms floor.**
+  Was: connect timeout = `pollIntervalMs`, which at very
+  low poll values (10ms) rejected legit DNS/handshake
+  before they could complete. Now: `Math.max(pollIntervalMs,
+  200)` for the connect attempt. The combined signal still
+  cuts the attempt short on user timeout, so the floor
+  doesn't hold the loop past the user-supplied cap.
+- **`http_response` exposes `redirect` option.** Was:
+  fetch followed 3xx silently, so a 301→200 chain
+  matched as 200 and the model couldn't distinguish "the
+  endpoint redirected" from "the endpoint responded".
+  Now: `redirect?: 'follow' | 'manual'` on the condition.
+  Default 'follow' preserves the prior behavior; 'manual'
+  surfaces the literal status. 2 regression tests pin
+  both modes (follow returns 200 from /redirect, manual
+  returns 301).
+
+**Code review follow-ups (not blocking, deferred):**
+
+- **`file_change` accepts directories silently.** Spec says
+  "file"; we don't reject. Could be feature or bug. Fix or
+  document when a real workflow surfaces the ambiguity.
+- **No path policy gate on `wait_for`** — operators can't
+  deny `tools.wait_for.allow_paths: ['build/**']`. Same
+  asymmetry exists for `port_open` / `http_response` (no
+  network policy). Real fix: per-condition category routing
+  (`fs.read` for file_*, future `net.probe` for network
+  conditions) — needs engine support, scope of 2.2.3 or
+  later.
+
+---
+
 ## [2026-04-28] M3 / Step 2.1 — bash_background trio + storage
 
 Opens M3 / Step 2 with the smallest cohesive slice of the

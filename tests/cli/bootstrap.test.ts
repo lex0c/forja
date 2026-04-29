@@ -74,6 +74,7 @@ describe('bootstrap', () => {
         'glob',
         'grep',
         'read_file',
+        'wait_for',
         'write_file',
       ].sort(),
     );
