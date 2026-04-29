@@ -15,6 +15,86 @@ Format:
 
 ---
 
+## [2026-04-29] M3 / Step 3 — closes acceptance criteria 6+7
+
+`CHECKPOINTS.md §5` listed 8 acceptance criteria. The mock-driven
+test suite covered 1–5 + 8; criteria 6 (real-model smoke) and 7
+(perf in 10k-file repo) were the difference between "code that
+passes mocks" and "subsystem we know works". This pass lands both.
+
+**Critério 7 — performance bench.**
+
+`evals/bench-checkpoint-snapshot.ts` synthesizes a temp git repo
+with 10k small files (configurable via `--files`), seeds an
+initial commit, and runs the production `snapshot()` 100 times,
+mutating one file per iteration so write-tree has real work
+(skip-on-noop is rejected as an invalid measurement). One
+warm-up round discarded to keep page-cache + JIT off the timing
+distribution.
+
+Result on dev box (ext4, NVMe, ~10k files):
+  min   111.57ms
+  p50   117.13ms
+  mean  117.97ms
+  p95   124.04ms
+  p99   137.04ms
+  max   149.45ms
+
+SLO is `p95 < 500ms` per CHECKPOINTS §2.8. We're at 124ms — 4×
+headroom. The bench is shape-stable enough to drop into a CI
+gate later (cost: $0, no API).
+
+**Critério 6 — real-model smoke.**
+
+`evals/smoke-checkpoint-undo.sh` mirrors the smoke-resume pattern:
+- mktemp workspace, isolated XDG, fresh `git init`
+- bypass-mode `.agent/permissions.yaml` so write_file isn't policy-denied
+- 3 seed files, sha-256-captured pre-edit
+- agent prompt asking Claude Haiku to prepend a header line to all
+  three via write_file
+- assert: at least one `checkpoint_created` event AND at least one
+  file changed (proves the agent did the work)
+- `--undo --yes <sessionId>`
+- assert: each file's sha-256 matches the pre-edit capture, byte-
+  for-byte
+
+Cost: ~$0.005-0.02 per run on Haiku 4.5.
+
+**Bug surfaced by the smoke (and fixed):**
+
+`src/cli/index.ts` had a top-level "missing prompt" gate that
+exempted `--list-sessions` but not `--undo` / `--checkpoints`.
+Running `--undo <session>` without a follow-up prompt errored
+out with the help text instead of dispatching the lifecycle
+verb. Mock tests didn't catch this — they call `run()` directly,
+bypassing the entry. The smoke spawns the real binary path and
+caught it on the first run.
+
+Fix: extend the prompt-optional list to cover the two new
+verbs. Tests in `tests/cli/index.test.ts` now exercise both
+end-to-end through the spawned subprocess so the regression
+can't sneak back via the `run()` shortcut.
+
+**Why the smoke was load-bearing:**
+
+The bug above is exactly the class of failure that mocks miss —
+not a logic error in the checkpoint subsystem itself, but a
+glue-layer mismatch between the CLI entry and the verb
+dispatcher. Without the smoke, this would have shipped to a real
+user as "agent --undo X gives me the help text". Worth the
+~$0.01 tax to catch upfront.
+
+**Step 3 status:** all 8 acceptance criteria of CHECKPOINTS §5
+satisfied. Subsystem ships.
+
+**Verification:** `bun test` 1050 pass / 10 skip / 0 fail (+2 new
+tests for the prompt gate); `tsc --noEmit` clean; `biome check`
+clean. `bun run evals/bench-checkpoint-snapshot.ts` exits 0
+(p95=124ms). `./evals/smoke-checkpoint-undo.sh` exits 0 against
+Haiku 4.5.
+
+---
+
 ## [2026-04-29] M3 / Step 3 — review fixes (post-self-review pass)
 
 Self-review surfaced 13 issues across the Step 3 surface — 3 critical
