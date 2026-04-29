@@ -206,6 +206,22 @@ describe('monitor tool: validation', () => {
     expect(r.error_message).toContain('30min');
   });
 
+  test('rejects non-integer duration_ms', async () => {
+    // Schema declares integer; runtime must enforce so the cap
+    // and timer-boundary semantics stay deterministic.
+    const ctx = makeCtx({ sessionId });
+    const r = await monitorTool.execute(
+      {
+        condition: { kind: 'file_changes', path: '/tmp/x' },
+        duration_ms: 100.5,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('integer');
+  });
+
   test('rejects negative duration_ms', async () => {
     const ctx = makeCtx({ sessionId });
     const r = await monitorTool.execute(

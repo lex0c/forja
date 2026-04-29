@@ -125,8 +125,8 @@ const buildCondition = (
   switch (kind) {
     case 'sleep': {
       const dur = raw.duration_ms;
-      if (typeof dur !== 'number' || !Number.isFinite(dur) || dur < 0) {
-        return { ok: false, message: 'sleep.duration_ms must be a non-negative number' };
+      if (typeof dur !== 'number' || !Number.isFinite(dur) || !Number.isInteger(dur) || dur < 0) {
+        return { ok: false, message: 'sleep.duration_ms must be a non-negative integer' };
       }
       if (dur > MAX_WAIT_MS) {
         return {
@@ -481,6 +481,7 @@ export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
     if (
       typeof args.timeout_ms !== 'number' ||
       !Number.isFinite(args.timeout_ms) ||
+      !Number.isInteger(args.timeout_ms) ||
       args.timeout_ms < 1
     ) {
       return toolError(ERROR_CODES.invalidArg, 'timeout_ms must be a positive integer (>=1ms)');

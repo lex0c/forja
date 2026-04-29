@@ -180,6 +180,35 @@ describe('wait_for tool: input validation', () => {
     expect(r.error_code).toBe('tool.invalid_arg');
   });
 
+  // Schema declares timeout_ms as integer; runtime must enforce so
+  // the API contract holds and timeout boundary semantics stay
+  // deterministic across polling/composition flows.
+  test('rejects non-integer timeout_ms', async () => {
+    const ctx = makeCtx();
+    const r = await waitForTool.execute(
+      { condition: { kind: 'sleep', duration_ms: 100 }, timeout_ms: 100.5 },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('integer');
+  });
+
+  test('rejects non-integer sleep duration_ms', async () => {
+    // Same parity for the inner sleep condition — schema declares
+    // integer, runtime must enforce. Without this, sleepMs receives
+    // a fractional ms value and the wall-clock boundary between
+    // sleep and surrounding compositions becomes nondeterministic.
+    const ctx = makeCtx();
+    const r = await waitForTool.execute(
+      { condition: { kind: 'sleep', duration_ms: 100.5 }, timeout_ms: 1000 },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('integer');
+  });
+
   test('rejects poll_interval_ms below 10', async () => {
     // Schema declares minimum: 10 but providers may not enforce
     // at runtime. Without this check, poll_interval_ms=0 creates

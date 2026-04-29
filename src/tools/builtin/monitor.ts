@@ -233,6 +233,7 @@ export const monitorTool: Tool<MonitorInput, MonitorOutput> = {
     if (
       typeof args.duration_ms !== 'number' ||
       !Number.isFinite(args.duration_ms) ||
+      !Number.isInteger(args.duration_ms) ||
       args.duration_ms < 1
     ) {
       return toolError(ERROR_CODES.invalidArg, 'duration_ms must be a positive integer (>=1ms)');
