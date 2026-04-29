@@ -164,11 +164,9 @@ describe('--resume flow', () => {
       rendererOverride: recordingRenderer().renderer,
     });
 
-    // Brief gap so timestamps differ. 20ms is conservative against
-    // CI-machine clock-resolution noise (Date.now is 1ms-granular,
-    // but two sessions starting within the same tick would tie on
-    // the ORDER BY started_at DESC sort).
-    await new Promise((r) => setTimeout(r, 20));
+    // Migration 008's seq tiebreaker makes the order deterministic
+    // even when two sessions start in the same ms tick — no sleep
+    // needed for correctness, kept removed.
 
     // Run #2 (separate session).
     await run({

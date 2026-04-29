@@ -98,6 +98,26 @@ describe('sessions repo', () => {
     expect(getSession(db, s.id)?.totalCostUsd).toBe(0.05);
   });
 
+  test('listSessions ties on same started_at follow insertion order (newest first)', () => {
+    // Direct regression for migration 008. Without the seq
+    // tiebreaker, two sessions sharing started_at fall back to
+    // SQLite's implementation-defined order; --resume last would
+    // attach to whichever the impl picked first, possibly an
+    // older session. With seq DESC as the secondary key, the
+    // most-recently-inserted session wins deterministically.
+    const ms = 1_700_000_000_000;
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      ids.push(createSession(db, { model: 'm', cwd: '/p', startedAt: ms }).id);
+    }
+    const list = listSessions(db, { limit: 5 });
+    // Newest-first: ids inserted last appear first in the listing.
+    expect(list.map((s) => s.id)).toEqual([...ids].reverse());
+    // 'last' resolution (limit=1) returns the most-recently-inserted.
+    const last = listSessions(db, { limit: 1 });
+    expect(last[0]?.id).toBe(ids[ids.length - 1]);
+  });
+
   test('CHECK constraint rejects invalid status at the SQL layer', () => {
     expect(() =>
       db.exec(
