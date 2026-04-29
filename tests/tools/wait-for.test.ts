@@ -1,7 +1,11 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { type BgManager, createBgManager } from '../../src/bg/index.ts';
+import { type DB, openMemoryDb } from '../../src/storage/db.ts';
+import { migrate } from '../../src/storage/migrate.ts';
+import { createSession } from '../../src/storage/repos/sessions.ts';
 import { waitForTool } from '../../src/tools/builtin/wait-for.ts';
 import { isToolError } from '../../src/tools/types.ts';
 import { makeCtx } from './_helpers.ts';
@@ -238,5 +242,181 @@ describe('wait_for tool: input validation', () => {
     );
     if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
     expect(r.matched).toBe(true);
+  });
+});
+
+describe('wait_for tool: process_* conditions', () => {
+  let db: DB;
+  let sessionId: string;
+  let mgr: BgManager;
+  const procRoots: string[] = [];
+
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+    sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+    const dir = mkdtempSync(join(tmpdir(), 'forja-wait-tool-proc-'));
+    procRoots.push(dir);
+    mgr = createBgManager({ db, sessionId, logDir: dir });
+  });
+
+  afterEach(async () => {
+    await mgr.cleanup();
+    for (const root of procRoots) {
+      try {
+        rmSync(root, { recursive: true, force: true });
+      } catch {}
+    }
+    procRoots.length = 0;
+  });
+
+  test('process_exit reports exit code in payload', async () => {
+    const spawned = await mgr.spawn({ command: 'sleep 0.1; exit 13' });
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'process_exit', process_id: spawned.id },
+        timeout_ms: 5000,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+    expect(r.matched).toBe(true);
+    expect(r.condition_met).toBe('process_exit');
+    expect(r.payload?.exitCode).toBe(13);
+  });
+
+  test('process_output literal pattern (default is_regex=false)', async () => {
+    // Pattern contains regex meta `.` — literal mode escapes it so
+    // it matches "1.0" only, not "100".
+    const spawned = await mgr.spawn({ command: 'sleep 0.1; echo "version 1.0"' });
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'process_output', process_id: spawned.id, pattern: 'version 1.0' },
+        timeout_ms: 5000,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+    expect(r.matched).toBe(true);
+    expect(r.payload?.match).toBe('version 1.0');
+  });
+
+  test('process_output literal does NOT match wildcard interpretations', async () => {
+    // Pattern "1.0" as literal escapes the `.`. With is_regex=false
+    // (default), this should NOT match "100".
+    const spawned = await mgr.spawn({ command: 'echo "version 100"; sleep 0.05' });
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'process_output', process_id: spawned.id, pattern: '1.0' },
+        timeout_ms: 200,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+    expect(r.matched).toBe(false);
+    expect(r.payload?.processExited).toBe(true);
+  });
+
+  test('process_output is_regex=true compiles pattern as regex', async () => {
+    const spawned = await mgr.spawn({ command: 'sleep 0.1; echo "ERROR: code 42"' });
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await waitForTool.execute(
+      {
+        condition: {
+          kind: 'process_output',
+          process_id: spawned.id,
+          pattern: 'ERROR:\\s+code\\s+\\d+',
+          is_regex: true,
+        },
+        timeout_ms: 5000,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+    expect(r.matched).toBe(true);
+    expect(r.payload?.match).toMatch(/^ERROR:\s+code\s+\d+$/);
+  });
+
+  test('rejects invalid regex when is_regex=true', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await waitForTool.execute(
+      {
+        condition: {
+          kind: 'process_output',
+          process_id: 'x',
+          pattern: '[unclosed',
+          is_regex: true,
+        },
+        timeout_ms: 100,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('not a valid regex');
+  });
+
+  test('rejects empty pattern', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'process_output', process_id: 'x', pattern: '' },
+        timeout_ms: 100,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('pattern');
+  });
+
+  test('returns bg.process_not_found on unknown process_id', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'process_exit', process_id: 'no-such-id' },
+        timeout_ms: 1000,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('bg.process_not_found');
+  });
+
+  test('returns bg.manager_unavailable when ctx lacks manager', async () => {
+    // Ctx without bgManager — common case is plain harness without
+    // bg subsystem wired up.
+    const ctx = makeCtx({ sessionId });
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'process_exit', process_id: 'x' },
+        timeout_ms: 1000,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('bg.manager_unavailable');
+  });
+
+  test('rejects empty process_id', async () => {
+    const ctx = makeCtx({ sessionId, bgManager: mgr });
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'process_exit', process_id: '' },
+        timeout_ms: 100,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
   });
 });

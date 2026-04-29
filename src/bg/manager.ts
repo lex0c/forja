@@ -105,10 +105,22 @@ export interface KillResult {
   exitedAt: number | null;
 }
 
+export interface StatusSnapshot {
+  status: BgProcess['status'];
+  exitCode: number | null;
+  exitedAt: number | null;
+}
+
 export interface BgManager {
   spawn(input: SpawnInput): Promise<SpawnResult>;
   readOutput(id: string, opts?: ReadOutputInput): Promise<ReadOutputResult>;
   kill(id: string, opts?: KillInput): Promise<KillResult>;
+  // Thin status accessor — returns null when the id is unknown.
+  // Used by the wait subsystem's `process_exit` polling loop and
+  // by external tooling that needs lifecycle info without pulling
+  // the whole row (`agent doctor`, future UI tray, etc). Cheaper
+  // than readOutput (no log file IO).
+  getStatus(id: string): StatusSnapshot | null;
   // Terminate every still-running process started by this manager.
   // Used by the session-end cleanup hook. Best-effort — the actual
   // DB rows are flipped to 'killed' even if the OS kill fails.
@@ -505,6 +517,26 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
 
   const liveCount = (): number => live.size;
 
+  const getStatus = (id: string): StatusSnapshot | null => {
+    const row = getBgProcess(db, id);
+    if (row === null) return null;
+    if (row.sessionId !== sessionId) {
+      // Cross-session ids throw — same surface as readOutput and
+      // kill. Returning null would conflate "id doesn't exist
+      // anywhere" (caller's bug) with "id belongs to another
+      // session" (shared-DB defense), and downstream callers
+      // would surface both as bg.process_not_found, hiding the
+      // real diagnosis. Throw lets the wait module report a
+      // distinct error if needed.
+      throw new Error(`bg process not in this session: ${id}`);
+    }
+    return {
+      status: row.status,
+      exitCode: row.exitCode,
+      exitedAt: row.exitedAt,
+    };
+  };
+
   // Wire the abort signal AFTER cleanup is defined so the listener
   // can reference it. `once: true` means the listener runs at most
   // once even if the signal fires multiple times. The catch swallows
@@ -527,5 +559,5 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     }
   }
 
-  return { spawn, readOutput, kill, cleanup, liveCount };
+  return { spawn, readOutput, kill, getStatus, cleanup, liveCount };
 };

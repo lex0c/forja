@@ -15,6 +15,239 @@ Format:
 
 ---
 
+## [2026-04-29] M3 / Step 2.2.2 — process_exit + process_output
+
+Continues Step 2.2 with the bg-aware wait conditions. After
+2.2.1 the `wait_for` tool can sleep, watch files, probe ports,
+and poll HTTP — but for the highest-value use case (waiting on
+a `bash_background` process to be ready) the model still has to
+loop `bash_output` calls, paying LLM cost every step. Spec §7.3.1
+calls out the savings: ~$0.40 polling vs ~$0.10 with `wait_for`
+on a typical port-ready loop.
+
+**Slice scope (2.2.2):**
+
+| Component | Status | Notes |
+|---|---|---|
+| `BgManager.getStatus(id)` | NEW | Thin accessor returning `{ status, exitCode, exitedAt } \| null`. Enough for process_exit polling without exposing the full row |
+| `WaitOptions.bgManager?` | NEW | Optional injection; process_* conditions fail with clean error when manager is missing |
+| Condition `process_exit` | NEW | Poll `getStatus` until `status !== 'running'`. Payload: `{ processId, status, exitCode }`. No log-file reads |
+| Condition `process_output` | NEW | Poll `readOutput` with explicit `since*` (transient — doesn't advance model's persisted cursor). Test compiled regex against the new chunk. Local cursors with `PATTERN_OVERLAP=64` avoid missing patterns spanning poll boundaries |
+| Tool surface | UPDATED | New kinds in WaitForCondition. `pattern: string` + `is_regex?: boolean` (default false → escape literal). `process_id: string` |
+| Tests | NEW | `tests/wait/process.test.ts` with bg manager fixtures (DB + tmp logDir). Tool-level cases extend `tests/tools/wait-for.test.ts` |
+
+**Decisions to make explicit upfront:**
+
+- **Pattern is RegExp internally, string at the tool boundary.**
+  JSON has no native regex; the tool accepts `pattern: string`
+  and `is_regex?: boolean`. `is_regex: false` (default) escapes
+  the input as a literal — matches "READY" exactly, no
+  surprise from `.` or `[`. `is_regex: true` compiles the
+  string as a regex; if invalid, clean tool error.
+- **Process exit during a `process_output` wait is reported
+  via payload, not a new conditionMet kind.** Wait returns
+  `matched: false` with `payload: { processExited: true,
+  exitCode, status }`. Adding 'process_exit' to the
+  conditionMet for an OUTPUT wait would conflate two
+  different intents. Tools that want exit OR output should
+  use `any_of` (lands in 2.2.3).
+- **Transient reads via `sinceStdout`/`sinceStderr`.** The
+  wait module uses explicit `since*` so the model's
+  persisted cursor stays untouched. Same lesson from commit
+  `3f8bbda`: explicit since = transient. After a successful
+  wait, the model's next `bash_output` call sees the SAME
+  bytes (including the matched window) — wait observed,
+  didn't consume.
+- **Pattern overlap heuristic.** Each poll re-reads the last
+  `PATTERN_OVERLAP_BYTES = 64` bytes of the previous read
+  alongside the new bytes. Catches patterns up to 64 bytes
+  long that straddle a poll boundary. Patterns longer than
+  64 bytes risk missing matches; document as risk and pull
+  in a configurable overlap if a real workflow surfaces it.
+- **`getStatus` instead of exposing `getBgProcess`.** The
+  manager already imports the repo for its own internal
+  needs; re-exposing the full row would couple wait/ to
+  storage row shape. `getStatus` returns only what wait
+  needs, lets storage shape evolve independently.
+
+**Out of scope for 2.2.2 (deferred to 2.2.3):**
+
+- `monitor` (streaming events, LLM runs at the end).
+- `all_of` / `any_of` composition (recursive resolution,
+  spec acknowledges race surface in `any_of`).
+
+**Spec reference:** `AGENTIC_CLI.md §7.3.1`,
+`src/bg/manager.ts` (readOutput + status accessor).
+
+**Done:**
+
+- `BgManager.getStatus(id)` — thin accessor returning
+  `StatusSnapshot { status, exitCode, exitedAt } | null`.
+  Cross-session ids return null (defense-in-depth, same
+  pattern as readOutput / kill).
+- `WaitOptions.bgManager?: BgManager` injection point. Only
+  required for process_* conditions. Other conditions
+  ignore the field.
+- Condition `process_exit` — polls `getStatus` until
+  status leaves 'running'. Payload reports
+  `{ processId, status, exitCode, exitedAt }`. Cheap (no
+  log file IO). Already-exited processes match on first
+  poll (verified < 200ms in test).
+- Condition `process_output` — polls
+  `manager.readOutput` with explicit `sinceStdout`/
+  `sinceStderr` so the read is transient (lesson from
+  commit `3f8bbda`). Local cursors track wait progress
+  independently from the model's persisted cursor; a
+  successful wait does NOT consume bytes — a subsequent
+  canonical bash_output sees the SAME content (test
+  pins this contract). Pattern is regex (compiled at
+  the tool layer); first match returns
+  `{ processId, stream: 'stdout' | 'stderr', match }`.
+  When the process exits without matching, returns
+  `matched: false` with payload
+  `{ processExited: true, status, exitCode }` so the
+  model can distinguish "running but no marker yet
+  (timeout)" from "service crashed before saying ready
+  (process exited)".
+- `PATTERN_OVERLAP_BYTES = 64` — each poll re-reads the
+  last 64 bytes of the previous read alongside the new
+  bytes, catching patterns that straddle a poll
+  boundary. Test pins this with `printf 'BLT-'; sleep
+  0.1; printf 'TOKEN-37'` + pattern `/BLT-TOKEN-37/`.
+- Tool surface adds `process_exit` and `process_output`
+  kinds to `WaitForCondition`. Schema fields:
+  `process_id` (required), `pattern: string` (literal
+  by default), `is_regex?: boolean` (default false →
+  literal escape via `escapeRegexLiteral`). The global
+  flag (`g`) is rejected because RegExp.exec with /g
+  carries lastIndex state across calls and breaks the
+  per-poll re-read pattern.
+- Tool error mapping:
+  - missing bgManager → `bg.manager_unavailable` (same
+    code as bash_output / bash_kill — uniform operator
+    surface)
+  - unknown / cross-session process_id →
+    `bg.process_not_found` (same code as bash_output /
+    bash_kill)
+  - invalid regex when `is_regex: true` →
+    `tool.invalid_arg` with the underlying message
+  - empty process_id / empty pattern → `tool.invalid_arg`
+- 14 unit tests in `tests/wait/process.test.ts`: literal
+  match in stdout, regex match in stderr, observational
+  contract (cursors stay at 0), timeout, processExited
+  payload on exit-without-match, pattern overlap across
+  polls, unknown id, missing bgManager. process_exit
+  covers natural exit, non-zero code, immediate match
+  on already-exited, timeout on never-exiting.
+- 10 tool tests in `tests/tools/wait-for.test.ts`:
+  process_exit reports exit code; process_output
+  literal escapes regex meta (`1.0` doesn't match
+  `100`); is_regex=true compiles regex; invalid regex
+  rejected; bg.process_not_found / bg.manager_unavailable
+  surfaces.
+- Total: 762 pass / 7 skip / 0 fail. Typecheck + lint
+  green.
+
+**Decisions taken (not in opener):**
+
+- **Tool error codes mirror bash_output/bash_kill.** When
+  bgManager is missing or process_id is unknown, the
+  operator-facing surface is the same as the existing bg
+  tools — `bg.manager_unavailable` and `bg.process_not_found`.
+  Avoids one-off wait-prefixed codes that would force the
+  operator to learn duplicate vocabulary.
+- **process_output's exit detection is reactive, not
+  predictive.** We don't subscribe to the natural-exit
+  promise; we poll readOutput and check `r.status`. The
+  `live` map in the manager isn't part of the public
+  surface, and exposing it would couple wait/ deeper than
+  needed. The polling cost is bounded (one extra DB read
+  per cycle) and the observability is the same.
+- **Local cursors live entirely in the wait module.** No
+  storage state. If the wait is aborted mid-flight, the
+  cursors are simply discarded — nothing to clean up.
+  Future `monitor` (2.2.3) may want persistent state for
+  cross-session resumption, but that's a separate
+  concern.
+- **The /g rejection happens after construction, not
+  before.** `new RegExp(pattern)` from a string can't
+  carry the global flag (no inline `/g` flag in JS regex
+  syntax, and the second arg isn't accepted from our
+  schema). The `regex.global` check is defensive against
+  future construction paths that might.
+
+**Pending (Step 2.2.3):**
+
+- `monitor` (streaming events, LLM runs at the end after
+  max_events / duration / cancellation).
+- `all_of` / `any_of` composition (recursive resolution,
+  spec acknowledges race surface in `any_of`).
+
+**Code review fixes applied before commit:**
+
+- **`process_output` drains pending bytes after exit.**
+  Was: a process emitting >64KB (default `readOutput`
+  maxBytes) and exiting in the same poll window would
+  have only the first chunk scanned. `r.status='exited'`
+  + `r.stdoutPending > 0` triggered an immediate
+  processExited report, silently skipping the tail
+  where the pattern might live. Now: on detecting exit,
+  the loop drains until both stream pendings are 0,
+  testing each chunk. Defensive break on cursor-not-
+  advancing prevents infinite loops if a future
+  readOutput regression returns end < cursor.
+  Regression test: 70KB filler + EXIT-MARKER-DRAIN +
+  exit; before the fix, the marker was reported as
+  processExited.
+- **`getStatus` throws on cross-session ids.** Was:
+  returned null, conflating "id doesn't exist anywhere"
+  with "id belongs to another session" — both
+  surfaced as `bg.process_not_found`, hiding the real
+  diagnosis. Now: throws same shape as readOutput /
+  kill (`bg process not in this session: ${id}`).
+  process_exit's case in waitFor catches and re-
+  throws, preserving the existing tool surface.
+- **Removed dead `/g flag rejection` test.** Was: a
+  test whose body was `expect(typeof ctx).toBe('object')`
+  with a comment admitting the flag is unreachable
+  via string-only schema. The `regex.global` check in
+  the tool stays as defensive code, the test was
+  noise.
+- **Added empty-pattern rejection test.** Mirrors the
+  existing "rejects empty process_id" — pattern
+  validation was already in `buildCondition`, just
+  uncovered.
+
+**Risks documented:**
+
+- **Patterns longer than `PATTERN_OVERLAP_BYTES = 64` may
+  miss matches that straddle a poll boundary.** A 100-byte
+  pattern split 70/30 across two polls would have only the
+  last 64 of the first poll re-read, the leading 6 bytes
+  of the pattern would be lost. Mitigation today:
+  documented; configurable overlap can land if a real
+  workflow surfaces longer patterns. Most "ready marker"
+  patterns are <30 bytes — we're not close to the limit.
+- **`process_output` matches on regex.exec, which is
+  greedy.** A pattern like `/STARTED|FINISHED/` hits the
+  first occurrence; if both substrings appear in the same
+  poll's chunk, we only see the leftmost. Most ready-marker
+  use cases are first-occurrence anyway, so this is the
+  desired behavior. Multi-event observation belongs in
+  `monitor` (2.2.3), not wait_for.
+- **Race: process exits between getStatus poll and
+  readOutput poll in process_output.** Status check happens
+  AFTER readOutput; if the process exited mid-poll, we'd
+  read the final bytes, fail to match, then notice
+  `r.status !== 'running'` and report processExited. The
+  final bytes ARE in the chunk we tested, so no real
+  loss. Documented for completeness — observed-zero-impact.
+- **Inherited from 2.2.1:** mtime granularity, port_open
+  listen() init false-negative, HEAD unsupported on
+  legacy servers.
+
+---
+
 ## [2026-04-29] M3 / Step 2.2.1 — wait_for + non-bg conditions
 
 Opens Step 2.2 (`wait_for` / `monitor` primitives, spec

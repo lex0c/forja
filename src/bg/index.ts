@@ -8,4 +8,5 @@ export type {
   ReadOutputResult,
   SpawnInput,
   SpawnResult,
+  StatusSnapshot,
 } from './manager.ts';

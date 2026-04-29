@@ -26,6 +26,18 @@ export type WaitForCondition =
       url: string;
       status?: number;
       redirect?: 'follow' | 'manual';
+    }
+  | { kind: 'process_exit'; process_id: string }
+  | {
+      kind: 'process_output';
+      process_id: string;
+      pattern: string;
+      // When true, `pattern` compiles as a RegExp; when false (or
+      // omitted), pattern is matched as a literal string with all
+      // regex meta-characters escaped. Default false — models that
+      // wait for "READY" don't want to discover later that the `.`
+      // matched anything.
+      is_regex?: boolean;
     };
 
 export interface WaitForInput {
@@ -134,29 +146,82 @@ const buildCondition = (
       if (redirect === 'follow' || redirect === 'manual') cond.redirect = redirect;
       return { ok: true, cond };
     }
+    case 'process_exit': {
+      if (typeof raw.process_id !== 'string' || raw.process_id.length === 0) {
+        return { ok: false, message: 'process_exit.process_id must be a non-empty string' };
+      }
+      return { ok: true, cond: { kind: 'process_exit', processId: raw.process_id } };
+    }
+    case 'process_output': {
+      if (typeof raw.process_id !== 'string' || raw.process_id.length === 0) {
+        return { ok: false, message: 'process_output.process_id must be a non-empty string' };
+      }
+      if (typeof raw.pattern !== 'string' || raw.pattern.length === 0) {
+        return { ok: false, message: 'process_output.pattern must be a non-empty string' };
+      }
+      const isRegex = raw.is_regex === true;
+      let regex: RegExp;
+      try {
+        // Literal mode escapes regex meta so "1.0" doesn't match
+        // "100". Regex mode compiles directly. Reject the global
+        // flag — RegExp.exec without /g is stateless across
+        // calls; with /g, repeated exec advances lastIndex which
+        // breaks our per-poll re-read pattern.
+        regex = isRegex
+          ? new RegExp(raw.pattern as string)
+          : new RegExp(escapeRegexLiteral(raw.pattern as string));
+        if (regex.global) {
+          return {
+            ok: false,
+            message: "process_output.pattern must not use the global ('g') flag",
+          };
+        }
+      } catch (e) {
+        return {
+          ok: false,
+          message: `process_output.pattern is not a valid regex: ${e instanceof Error ? e.message : String(e)}`,
+        };
+      }
+      return {
+        ok: true,
+        cond: { kind: 'process_output', processId: raw.process_id, pattern: regex },
+      };
+    }
     default:
       return {
         ok: false,
-        message: `unknown condition.kind '${kind}' (expected: sleep | file_exists | file_change | port_open | http_response)`,
+        message: `unknown condition.kind '${kind}' (expected: sleep | file_exists | file_change | port_open | http_response | process_exit | process_output)`,
       };
   }
 };
 
+// Standard regex-literal escape. Source:
+// https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_expressions#escaping
+const escapeRegexLiteral = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
   name: 'wait_for',
   description:
-    'Block until a condition is met or a timeout fires. ZERO LLM cost during the wait — only wall-clock. Useful for: sleep N ms, wait for a file to appear or change, wait for a TCP port to open, wait for an HTTP endpoint to respond. For long-running shell processes started by bash_background, use bash_output polling (or wait_for process_* conditions in a future release).',
+    "Block until a condition is met or a timeout fires. ZERO LLM cost during the wait — only wall-clock. Conditions: sleep N ms; wait for a file to appear or change; wait for a TCP port to open; wait for an HTTP endpoint to respond; wait for a bash_background process to exit; wait for a regex/literal pattern to appear in a bash_background process's output. For process_output, the wait is observational — it does NOT consume bytes, so a subsequent bash_output sees the same content (including the matched window).",
   inputSchema: {
     type: 'object',
     properties: {
       condition: {
         type: 'object',
         description:
-          'The condition to wait for. Discriminated by `kind`: sleep | file_exists | file_change | port_open | http_response.',
+          'The condition to wait for. Discriminated by `kind`: sleep | file_exists | file_change | port_open | http_response | process_exit | process_output.',
         properties: {
           kind: {
             type: 'string',
-            enum: ['sleep', 'file_exists', 'file_change', 'port_open', 'http_response'],
+            enum: [
+              'sleep',
+              'file_exists',
+              'file_change',
+              'port_open',
+              'http_response',
+              'process_exit',
+              'process_output',
+            ],
           },
           duration_ms: {
             type: 'integer',
@@ -194,6 +259,21 @@ export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
             enum: ['follow', 'manual'],
             description:
               "For kind=http_response: 'follow' (default) traverses 3xx redirects and matches the FINAL status; 'manual' surfaces the literal status of the requested URL.",
+          },
+          process_id: {
+            type: 'string',
+            description:
+              'For kind=process_exit | process_output: the process_id returned by bash_background.',
+          },
+          pattern: {
+            type: 'string',
+            description:
+              'For kind=process_output: text to match in the process output. Literal string by default; set is_regex=true to interpret as a regex.',
+          },
+          is_regex: {
+            type: 'boolean',
+            description:
+              'For kind=process_output: when true, `pattern` compiles as a regex. Default false (literal). The global (g) flag is rejected.',
           },
         },
         required: ['kind'],
@@ -240,23 +320,48 @@ export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
       return toolError(ERROR_CODES.invalidArg, built.message);
     }
 
-    const opts: { timeoutMs: number; pollIntervalMs?: number; signal?: AbortSignal } = {
+    // process_* conditions need a session-bound bg manager. Surface
+    // the absence as the same error code bash_output / bash_kill use
+    // when ctx.bgManager is missing — consistent operator-facing
+    // shape across all bg-aware tools.
+    if (
+      (built.cond.kind === 'process_exit' || built.cond.kind === 'process_output') &&
+      ctx.bgManager === undefined
+    ) {
+      return toolError(
+        'bg.manager_unavailable',
+        `wait_for(${built.cond.kind}) requires a session-bound bg manager but none was provided`,
+      );
+    }
+
+    const opts: {
+      timeoutMs: number;
+      pollIntervalMs?: number;
+      signal?: AbortSignal;
+      bgManager?: typeof ctx.bgManager;
+    } = {
       timeoutMs: args.timeout_ms,
       signal: ctx.signal,
     };
     if (args.poll_interval_ms !== undefined) opts.pollIntervalMs = args.poll_interval_ms;
+    if (ctx.bgManager !== undefined) opts.bgManager = ctx.bgManager;
 
     let result: WaitResult;
     try {
       result = await waitFor(built.cond, opts);
     } catch (e) {
-      // waitFor doesn't throw under normal use — abort comes back as
-      // a `aborted` result, timeout as `timeout`. Defensive in case
-      // a condition implementation regresses.
-      return toolError(
-        'wait.internal_error',
-        `wait_for failed: ${e instanceof Error ? e.message : String(e)}`,
-      );
+      const message = e instanceof Error ? e.message : String(e);
+      // waitFor throws synchronously when a process_* condition
+      // references an unknown id or a cross-session id (mgr.getStatus
+      // returned null, mgr.readOutput threw). Surface as the same
+      // bg.process_not_found code that bash_output / bash_kill use.
+      const isNotFound = /not found|not in this session/i.test(message);
+      if (isNotFound) {
+        return toolError('bg.process_not_found', `wait_for failed: ${message}`);
+      }
+      // Other throws are defensive guards that shouldn't fire under
+      // normal use; surface as a wait-internal error.
+      return toolError('wait.internal_error', `wait_for failed: ${message}`);
     }
 
     const out: WaitForOutput = {

@@ -1,5 +1,6 @@
 import { existsSync, statSync } from 'node:fs';
 import { connect } from 'node:net';
+import type { BgManager } from '../bg/index.ts';
 
 // `wait_for` primitive (spec §7.3.1). Blocks until a condition is
 // met or a timeout fires, with **zero LLM calls** during the wait —
@@ -28,22 +29,30 @@ export type WaitCondition =
       // for 3xx in some implementations, but Bun surfaces the actual
       // 3xx code, which is what we match against.
       redirect?: 'follow' | 'manual';
-    };
+    }
+  | { kind: 'process_exit'; processId: string }
+  | { kind: 'process_output'; processId: string; pattern: RegExp };
 
 export interface WaitOptions {
   // Hard cap on the wait. When reached, the result reports
   // matched=false with conditionMet='timeout'.
   timeoutMs: number;
   // Poll interval for non-streaming conditions (file_exists,
-  // file_change, port_open, http_response). Defaults to 500ms.
-  // Lower = more responsive, higher = cheaper. The condition
-  // resolves at the next poll boundary, so worst-case detection
-  // latency is one pollIntervalMs.
+  // file_change, port_open, http_response, process_exit,
+  // process_output). Defaults to 500ms. Lower = more responsive,
+  // higher = cheaper. The condition resolves at the next poll
+  // boundary, so worst-case detection latency is one pollIntervalMs.
   pollIntervalMs?: number;
   // Optional abort signal. When fired, the wait returns immediately
   // with matched=false and conditionMet='aborted'. The harness's
   // combined signal (caller + wall-clock) is the canonical source.
   signal?: AbortSignal;
+  // Required for `process_exit` and `process_output` conditions —
+  // those poll the bg manager's getStatus / readOutput surface.
+  // Other conditions ignore this field. When a process_* condition
+  // is used and bgManager is undefined, waitFor throws (the tool
+  // layer surfaces it as a clean tool error).
+  bgManager?: BgManager;
 }
 
 export type WaitConditionMet =
@@ -52,6 +61,8 @@ export type WaitConditionMet =
   | 'file_change'
   | 'port_open'
   | 'http_response'
+  | 'process_exit'
+  | 'process_output'
   | 'timeout'
   | 'aborted';
 
@@ -258,13 +269,15 @@ export const waitFor = async (
     if (payload !== undefined) result.payload = payload;
     return result;
   };
-  const finishUnmatched = (): WaitResult => {
+  const finishUnmatched = (payload?: Record<string, unknown>): WaitResult => {
     timeout.cleanup();
-    return {
+    const result: WaitResult = {
       matched: false,
       conditionMet: timeout.timeoutFired() ? 'timeout' : 'aborted',
       elapsedMs: Date.now() - start,
     };
+    if (payload !== undefined) result.payload = payload;
+    return result;
   };
 
   // Per-condition state captured before the poll loop starts. Keeping
@@ -273,6 +286,34 @@ export const waitFor = async (
   let baselineMtime: number | null = null;
   if (condition.kind === 'file_change') {
     baselineMtime = safeMtimeMs(condition.path);
+  }
+
+  // process_output's local cursors. The wait tracks its OWN view of
+  // how far it's read, INDEPENDENT of the model's persisted cursor.
+  // Both reads use explicit `since*` so they're transient — the
+  // model's next bash_output sees the same bytes (including the
+  // matched window). Same lesson from commit 3f8bbda: explicit
+  // since = transient, leaves persisted cursor untouched.
+  let waitStdoutCursor = 0;
+  let waitStderrCursor = 0;
+
+  // Each poll re-reads the last PATTERN_OVERLAP_BYTES of the
+  // previous chunk alongside the new bytes, so a pattern that
+  // straddles a poll boundary still matches. Patterns longer than
+  // the overlap risk getting missed — documented as a Step 2.2.2
+  // risk; configurable overlap can land if a real workflow needs
+  // longer patterns.
+  const PATTERN_OVERLAP_BYTES = 64;
+
+  // process_* conditions need the bg manager. Reject upfront with a
+  // clear error rather than failing per-poll. The tool layer
+  // catches this and surfaces it as `bg.manager_unavailable`.
+  if (
+    (condition.kind === 'process_exit' || condition.kind === 'process_output') &&
+    options.bgManager === undefined
+  ) {
+    timeout.cleanup();
+    throw new Error(`wait_for(${condition.kind}) requires options.bgManager but none was provided`);
   }
 
   while (true) {
@@ -337,6 +378,150 @@ export const waitFor = async (
               status,
             });
           }
+        }
+        break;
+      }
+      case 'process_exit': {
+        // Cheap status poll — no log file IO. The manager's
+        // getStatus reflects the DB row; the natural-exit handler
+        // updates it on `proc.exited` resolution, so we'll see
+        // 'exited' / 'killed' / 'failed' soon after the OS reaps
+        // the child. getStatus throws on cross-session ids and
+        // returns null for unknown ids — both surface as a
+        // bg.process_not_found tool error in the layer above.
+        let snap: ReturnType<NonNullable<typeof options.bgManager>['getStatus']> | null;
+        try {
+          snap = options.bgManager?.getStatus(condition.processId) ?? null;
+        } catch (e) {
+          timeout.cleanup();
+          throw e;
+        }
+        if (snap === null) {
+          // Unknown process_id — fail fast rather than spin until
+          // timeout.
+          timeout.cleanup();
+          throw new Error(`bg process not found: ${condition.processId}`);
+        }
+        if (snap.status !== 'running') {
+          return finishMatched('process_exit', {
+            processId: condition.processId,
+            status: snap.status,
+            exitCode: snap.exitCode,
+            exitedAt: snap.exitedAt,
+          });
+        }
+        break;
+      }
+      case 'process_output': {
+        // Transient read with explicit since* so the model's
+        // persisted cursor stays untouched — a wait_for that found
+        // a 'READY' marker doesn't consume the bytes; the model's
+        // next canonical bash_output sees the same content.
+        //
+        // Each poll re-reads from `cursor - PATTERN_OVERLAP_BYTES`
+        // (clamped to 0) so a pattern that straddles a poll
+        // boundary still matches.
+        const overlap = PATTERN_OVERLAP_BYTES;
+        const bg = options.bgManager;
+        if (bg === undefined) {
+          // Defensive — shouldn't reach here because we validated
+          // bgManager presence at function entry.
+          timeout.cleanup();
+          throw new Error('bgManager unexpectedly undefined mid-wait');
+        }
+        let r: Awaited<ReturnType<typeof bg.readOutput>>;
+        try {
+          r = await bg.readOutput(condition.processId, {
+            sinceStdout: Math.max(0, waitStdoutCursor - overlap),
+            sinceStderr: Math.max(0, waitStderrCursor - overlap),
+          });
+        } catch (e) {
+          // Manager throws on unknown id / cross-session. Same
+          // surface as process_exit.
+          timeout.cleanup();
+          throw e;
+        }
+        // Test stdout chunk first, then stderr. RegExp.exec
+        // returns the first match; we mark which stream produced
+        // it. Models polling for "READY" don't care which stream;
+        // models polling for an error pattern DO.
+        const stdoutMatch = condition.pattern.exec(r.stdout);
+        if (stdoutMatch !== null) {
+          return finishMatched('process_output', {
+            processId: condition.processId,
+            stream: 'stdout',
+            match: stdoutMatch[0],
+          });
+        }
+        // Reset lastIndex on stickyless patterns? RegExp.exec
+        // without /g doesn't carry state, so back-to-back exec
+        // calls work. /g would; the tool layer disallows /g via
+        // its compile path.
+        const stderrMatch = condition.pattern.exec(r.stderr);
+        if (stderrMatch !== null) {
+          return finishMatched('process_output', {
+            processId: condition.processId,
+            stream: 'stderr',
+            match: stderrMatch[0],
+          });
+        }
+        // Advance local cursors for the next poll.
+        waitStdoutCursor = r.stdoutCursor;
+        waitStderrCursor = r.stderrCursor;
+        // If the process has exited and we still didn't match, we
+        // need to drain any remaining bytes BEFORE giving up. The
+        // first read returns up to maxBytes (default 64KB); a
+        // process that emitted >64KB and exited would otherwise
+        // have its tail (which may contain the pattern) silently
+        // skipped. Loop reading + testing until both streams are
+        // fully consumed.
+        if (r.status !== 'running') {
+          while (r.stdoutPending > 0 || r.stderrPending > 0) {
+            try {
+              r = await bg.readOutput(condition.processId, {
+                sinceStdout: Math.max(0, waitStdoutCursor - overlap),
+                sinceStderr: Math.max(0, waitStderrCursor - overlap),
+              });
+            } catch (e) {
+              timeout.cleanup();
+              throw e;
+            }
+            const tailStdout = condition.pattern.exec(r.stdout);
+            if (tailStdout !== null) {
+              return finishMatched('process_output', {
+                processId: condition.processId,
+                stream: 'stdout',
+                match: tailStdout[0],
+              });
+            }
+            const tailStderr = condition.pattern.exec(r.stderr);
+            if (tailStderr !== null) {
+              return finishMatched('process_output', {
+                processId: condition.processId,
+                stream: 'stderr',
+                match: tailStderr[0],
+              });
+            }
+            // Defensive: stop if the cursors didn't advance (would
+            // be an infinite loop if pending didn't shrink, e.g. a
+            // future readOutput regression). End of file vs.
+            // pending mismatch is handled by the while condition.
+            if (r.stdoutCursor === waitStdoutCursor && r.stderrCursor === waitStderrCursor) {
+              break;
+            }
+            waitStdoutCursor = r.stdoutCursor;
+            waitStderrCursor = r.stderrCursor;
+          }
+          // Drain complete, no match. Report exit so the model can
+          // distinguish "service started but never said READY"
+          // (running, hit timeout) from "service crashed before
+          // saying READY" (exited, no match).
+          return finishUnmatched({
+            processId: condition.processId,
+            processExited: true,
+            status: r.status,
+            exitCode: r.exitCode,
+          });
         }
         break;
       }
