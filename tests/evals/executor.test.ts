@@ -221,6 +221,90 @@ describe('executeCase', () => {
     expect(r.passed).toBe(true);
   });
 
+  test('file_exists expectation that escapes cwd fails the assertion (no host probe)', async () => {
+    // Direct EvalCase construction bypasses the loader. Without
+    // the runtime guard, file_exists would probe arbitrary host
+    // paths — both leaking host state into eval results AND
+    // making the case non-portable. Must fail the assertion
+    // cleanly with a workspace-escape message.
+    const c = baseCase({
+      expect: [{ kind: 'file_exists', path: '../../../etc/passwd' }],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: { providerOverride: mockProvider([{ text: 'ok' }]) },
+    });
+    expect(r.passed).toBe(false);
+    expect(r.expectations[0]?.detail ?? '').toMatch(/escapes the eval workspace/);
+  });
+
+  test('file_contains with absolute path fails the assertion (no host read)', async () => {
+    // /etc/passwd exists on every Linux/Mac host; without the
+    // guard, file_contains would read it and the pattern check
+    // would happen against real host content. The runtime guard
+    // refuses to call readFileSync at all.
+    const c = baseCase({
+      expect: [{ kind: 'file_contains', path: '/etc/passwd', pattern: 'root' }],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: { providerOverride: mockProvider([{ text: 'ok' }]) },
+    });
+    expect(r.passed).toBe(false);
+    expect(r.expectations[0]?.detail ?? '').toMatch(/escapes the eval workspace/);
+  });
+
+  test('file_not_exists escape returns workspace-escape, not "exists but should not"', async () => {
+    // Subtle: /etc/passwd exists. Without the guard, file_not_exists
+    // would say "exists but should not" — leaking host state into
+    // the failure message. With the guard, the message is
+    // workspace-escape regardless of whether the host file exists.
+    const c = baseCase({
+      expect: [{ kind: 'file_not_exists', path: '/etc/passwd' }],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: { providerOverride: mockProvider([{ text: 'ok' }]) },
+    });
+    expect(r.passed).toBe(false);
+    expect(r.expectations[0]?.detail ?? '').toMatch(/escapes the eval workspace/);
+    expect(r.expectations[0]?.detail ?? '').not.toMatch(/exists but should not/);
+  });
+
+  test('setup.fixture that escapes the case boundary is rejected at runtime', async () => {
+    // sourcePath is /tmp/.../sub/case.yaml. Boundary is /tmp/.../
+    // (parent of sub). A fixture '../../..' would resolve to /, way
+    // outside. Without the guard, cpSync would happily clone whatever
+    // is there into the temp eval workspace — could be repo root,
+    // home dir, or worse.
+    const subdir = join(workdir, 'sub');
+    mkdirSync(subdir, { recursive: true });
+    const sourcePath = join(subdir, 'case.yaml');
+    writeFileSync(sourcePath, '');
+    const c = baseCase({
+      sourcePath,
+      setup: { fixture: '../../..' },
+      expect: [{ kind: 'status', status: 'done' }],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: { providerOverride: mockProvider([{ text: 'ok' }]) },
+    });
+    expect(r.passed).toBe(false);
+    expect(r.failure ?? '').toMatch(/escapes the case boundary/);
+  });
+
+  test('setup.fixture with absolute path is rejected at runtime', async () => {
+    // Loader normally rejects absolute fixtures at parse time;
+    // direct EvalCase construction (this test) bypasses the
+    // loader. Runtime guard must still catch it.
+    const c = baseCase({
+      setup: { fixture: '/etc' },
+      expect: [{ kind: 'status', status: 'done' }],
+    });
+    const r = await executeCase(c, {
+      bootstrapOverride: { providerOverride: mockProvider([{ text: 'ok' }]) },
+    });
+    expect(r.passed).toBe(false);
+    expect(r.failure ?? '').toMatch(/escapes the case boundary/);
+  });
+
   test('setup.files with .. escape is rejected at runtime even when loader is bypassed', async () => {
     // Direct EvalCase construction skips the loader's parse-time
     // sandbox guard. The executor must still refuse — defense in

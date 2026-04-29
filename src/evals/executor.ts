@@ -67,7 +67,22 @@ const containsPath = (parent: string, child: string): boolean => {
 const setupCwd = (caseDef: EvalCase): string => {
   const dir = mkdtempSync(join(tmpdir(), 'forja-eval-'));
   if (caseDef.setup?.fixture !== undefined) {
-    const src = resolve(dirname(caseDef.sourcePath), caseDef.setup.fixture);
+    const caseDir = dirname(caseDef.sourcePath);
+    // Boundary: fixture must resolve under the parent of the
+    // case file's directory. Allows reaching sibling dirs
+    // (`../fixtures/foo` — our own smoke layout) but refuses
+    // climbing further (`../../..`) or jumping out entirely
+    // via absolute paths (`/etc`). Loader-level check rejects
+    // absolute paths at parse time; this guard catches `..`
+    // traversal escapes and protects programmatic EvalCase
+    // construction that bypasses the loader.
+    const boundary = dirname(caseDir);
+    const src = resolve(caseDir, caseDef.setup.fixture);
+    if (!containsPath(boundary, src)) {
+      throw new Error(
+        `eval setup.fixture '${caseDef.setup.fixture}' escapes the case boundary (${boundary})`,
+      );
+    }
     if (!existsSync(src)) {
       throw new Error(`fixture not found: ${src}`);
     }
@@ -127,7 +142,14 @@ const evaluateExpectations = (
         };
       }
       case 'file_exists': {
-        const target = join(cwd, expectation.path);
+        const target = resolve(cwd, expectation.path);
+        if (!containsPath(cwd, target)) {
+          return {
+            expectation,
+            passed: false,
+            detail: `file '${expectation.path}' escapes the eval workspace`,
+          };
+        }
         const passed = existsSync(target);
         return {
           expectation,
@@ -136,7 +158,14 @@ const evaluateExpectations = (
         };
       }
       case 'file_not_exists': {
-        const target = join(cwd, expectation.path);
+        const target = resolve(cwd, expectation.path);
+        if (!containsPath(cwd, target)) {
+          return {
+            expectation,
+            passed: false,
+            detail: `file '${expectation.path}' escapes the eval workspace`,
+          };
+        }
         const passed = !existsSync(target);
         return {
           expectation,
@@ -145,7 +174,14 @@ const evaluateExpectations = (
         };
       }
       case 'file_contains': {
-        const target = join(cwd, expectation.path);
+        const target = resolve(cwd, expectation.path);
+        if (!containsPath(cwd, target)) {
+          return {
+            expectation,
+            passed: false,
+            detail: `file '${expectation.path}' escapes the eval workspace`,
+          };
+        }
         if (!existsSync(target)) {
           return {
             expectation,

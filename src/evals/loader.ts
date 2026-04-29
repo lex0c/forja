@@ -52,6 +52,30 @@ const requireString = (v: unknown, label: string): string => {
   return v;
 };
 
+// Reusable parse-time guard for any path that must stay inside
+// the eval workspace at runtime (setup.files keys, file_exists/
+// file_not_exists/file_contains expectation paths). Rejects empty,
+// absolute, and any `..` segment. Loader-level rejection surfaces
+// the error before any FS interaction; the executor still
+// validates resolved containment to catch programmatic
+// EvalCase construction that bypasses the loader.
+const validateWorkspaceRelativePath = (path: string, label: string): void => {
+  if (path.length === 0) {
+    throw new Error(`eval: ${label} must be a non-empty path`);
+  }
+  if (isAbsolute(path)) {
+    throw new Error(
+      `eval: ${label} '${path}' is absolute; only paths relative to the eval workspace are allowed`,
+    );
+  }
+  const segments = path.split(/[\\/]/);
+  if (segments.includes('..')) {
+    throw new Error(
+      `eval: ${label} '${path}' contains '..' segment; paths must stay inside the eval workspace`,
+    );
+  }
+};
+
 const requireRecord = (v: unknown, label: string): Record<string, unknown> => {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) {
     throw new Error(`eval: ${label} must be a mapping`);
@@ -81,7 +105,20 @@ const parseSetup = (raw: unknown): EvalSetup | undefined => {
   rejectUnknown(r, SETUP_KEYS, 'setup');
   const setup: EvalSetup = {};
   if (r.fixture !== undefined) {
-    setup.fixture = requireString(r.fixture, 'setup.fixture');
+    const fixture = requireString(r.fixture, 'setup.fixture');
+    // Absolute fixture paths bypass the executor's case-relative
+    // boundary entirely (a literal '/etc' or '/home/x/.ssh' would
+    // resolve to itself, escaping any containment check anchored
+    // at the case dir). Reject at parse time. `..` segments are
+    // allowed because legitimate layouts ship fixtures in a
+    // sibling directory (e.g., `../fixtures/foo`); the executor
+    // enforces the resolved-path boundary.
+    if (isAbsolute(fixture)) {
+      throw new Error(
+        `eval: setup.fixture '${fixture}' is absolute; only paths relative to the case file are allowed`,
+      );
+    }
+    setup.fixture = fixture;
   }
   if (r.files !== undefined) {
     const files = requireRecord(r.files, 'setup.files');
@@ -90,26 +127,7 @@ const parseSetup = (raw: unknown): EvalSetup | undefined => {
       if (typeof body !== 'string') {
         throw new Error(`eval: setup.files['${path}'] must be a string`);
       }
-      // Surface sandbox-escape attempts at parse time so a
-      // malicious YAML never gets to runtime FS calls. The
-      // executor checks resolved containment too (defense in
-      // depth — direct EvalCase construction in tests bypasses
-      // the loader). Block: empty key, absolute paths
-      // (`/etc/...`, `C:\...`), and any `..` segment.
-      if (path.length === 0) {
-        throw new Error('eval: setup.files key must be a non-empty path');
-      }
-      if (isAbsolute(path)) {
-        throw new Error(
-          `eval: setup.files['${path}'] is absolute; only paths relative to the eval workspace are allowed`,
-        );
-      }
-      const segments = path.split(/[\\/]/);
-      if (segments.includes('..')) {
-        throw new Error(
-          `eval: setup.files['${path}'] contains '..' segment; paths must stay inside the eval workspace`,
-        );
-      }
+      validateWorkspaceRelativePath(path, `setup.files['${path}']`);
       out[path] = body;
     }
     setup.files = out;
@@ -183,16 +201,24 @@ const parseExpectation = (raw: unknown, idx: number): EvalExpectation => {
       return { kind, tool: requireString(r.tool_called, `expect[${idx}].tool_called`) };
     case 'tool_not_called':
       return { kind, tool: requireString(r.tool_not_called, `expect[${idx}].tool_not_called`) };
-    case 'file_exists':
-      return { kind, path: requireString(r.file_exists, `expect[${idx}].file_exists`) };
-    case 'file_not_exists':
-      return { kind, path: requireString(r.file_not_exists, `expect[${idx}].file_not_exists`) };
+    case 'file_exists': {
+      const path = requireString(r.file_exists, `expect[${idx}].file_exists`);
+      validateWorkspaceRelativePath(path, `expect[${idx}].file_exists`);
+      return { kind, path };
+    }
+    case 'file_not_exists': {
+      const path = requireString(r.file_not_exists, `expect[${idx}].file_not_exists`);
+      validateWorkspaceRelativePath(path, `expect[${idx}].file_not_exists`);
+      return { kind, path };
+    }
     case 'file_contains': {
       const fc = requireRecord(r.file_contains, `expect[${idx}].file_contains`);
       rejectUnknown(fc, new Set(['path', 'pattern']), `expect[${idx}].file_contains`);
+      const path = requireString(fc.path, `expect[${idx}].file_contains.path`);
+      validateWorkspaceRelativePath(path, `expect[${idx}].file_contains.path`);
       return {
         kind,
-        path: requireString(fc.path, `expect[${idx}].file_contains.path`),
+        path,
         pattern: requireString(fc.pattern, `expect[${idx}].file_contains.pattern`),
       };
     }

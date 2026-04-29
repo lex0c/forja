@@ -231,6 +231,67 @@ expect:
     );
   });
 
+  test('rejects file_exists with .. segment', () => {
+    const yaml = `
+name: x
+prompt: y
+expect:
+  - file_exists: ../../etc/passwd
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(
+      /file_exists.*contains '\.\.' segment/,
+    );
+  });
+
+  test('rejects file_not_exists with absolute path', () => {
+    const yaml = `
+name: x
+prompt: y
+expect:
+  - file_not_exists: /etc/passwd
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(/file_not_exists.*is absolute/);
+  });
+
+  test('rejects file_contains with .. segment in path', () => {
+    const yaml = `
+name: x
+prompt: y
+expect:
+  - file_contains:
+      path: ../../host-secret
+      pattern: TOKEN
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(
+      /file_contains.path.*contains '\.\.' segment/,
+    );
+  });
+
+  test('rejects setup.fixture absolute path', () => {
+    const yaml = `
+name: x
+prompt: y
+setup:
+  fixture: /etc
+expect:
+  - status: done
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(/setup.fixture '\/etc' is absolute/);
+  });
+
+  test('accepts setup.fixture with .. (sibling reach)', () => {
+    const yaml = `
+name: x
+prompt: y
+setup:
+  fixture: ../fixtures/foo
+expect:
+  - status: done
+`;
+    const c = parseEvalCase(yaml, '/tmp/c.yaml');
+    expect(c.setup?.fixture).toBe('../fixtures/foo');
+  });
+
   test('rejects setup.files path with .. segment', () => {
     const yaml = `
 name: x
