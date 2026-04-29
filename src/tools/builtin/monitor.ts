@@ -210,6 +210,32 @@ export const monitorTool: Tool<MonitorInput, MonitorOutput> = {
     ) {
       return toolError(ERROR_CODES.invalidArg, 'duration_ms must be a positive integer (>=1ms)');
     }
+    // Schema constraints (poll_interval_ms minimum=10, max_events
+    // minimum=1) are not guaranteed at runtime — model JSON arrives
+    // unvalidated. Without these checks, poll_interval_ms=0 creates
+    // a tight polling loop that hammers the filesystem / network
+    // until duration_ms fires; max_events<1 would terminate before
+    // the first poll could even emit. Reject runtime-side.
+    if (args.poll_interval_ms !== undefined) {
+      if (
+        typeof args.poll_interval_ms !== 'number' ||
+        !Number.isFinite(args.poll_interval_ms) ||
+        !Number.isInteger(args.poll_interval_ms) ||
+        args.poll_interval_ms < 10
+      ) {
+        return toolError(ERROR_CODES.invalidArg, 'poll_interval_ms must be an integer >= 10 (ms)');
+      }
+    }
+    if (args.max_events !== undefined) {
+      if (
+        typeof args.max_events !== 'number' ||
+        !Number.isFinite(args.max_events) ||
+        !Number.isInteger(args.max_events) ||
+        args.max_events < 1
+      ) {
+        return toolError(ERROR_CODES.invalidArg, 'max_events must be a positive integer');
+      }
+    }
     const built = buildCondition(args.condition, ctx.cwd);
     if (!built.ok) {
       return toolError(ERROR_CODES.invalidArg, built.message);

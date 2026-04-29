@@ -180,6 +180,38 @@ describe('wait_for tool: input validation', () => {
     expect(r.error_code).toBe('tool.invalid_arg');
   });
 
+  test('rejects poll_interval_ms below 10', async () => {
+    // Schema declares minimum: 10 but providers may not enforce
+    // at runtime. Without this check, poll_interval_ms=0 creates
+    // a tight loop until timeout fires.
+    const ctx = makeCtx();
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'sleep', duration_ms: 100 },
+        timeout_ms: 1000,
+        poll_interval_ms: 0,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('poll_interval_ms');
+  });
+
+  test('rejects non-integer poll_interval_ms', async () => {
+    const ctx = makeCtx();
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'sleep', duration_ms: 100 },
+        timeout_ms: 1000,
+        poll_interval_ms: 50.5,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+  });
+
   test('rejects invalid redirect mode', async () => {
     const ctx = makeCtx();
     // biome-ignore lint/suspicious/noExplicitAny: testing invalid input shape

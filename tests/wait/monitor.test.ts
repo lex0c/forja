@@ -124,6 +124,67 @@ describe('monitor: process_output_lines', () => {
     expect(result.processStatus).toBe('running');
   });
 
+  test('caps the partial-line buffer on no-newline streams', async () => {
+    // Regression: stdoutBuf accumulated unbounded when the source
+    // emitted bytes without \n (progress bars, binary, printf
+    // without newline). Long-running processes could OOM the
+    // harness before durationMs fired. Cap MAX_LINE_BUFFER_BYTES
+    // (8KB) flushes oversized buffers as cap-sized partial events
+    // and resets, keeping memory bounded.
+    //
+    // Emit ~20KB of `x` with NO newline, then exit. Without the
+    // cap, one giant 20KB partial event at the end. With the cap,
+    // expect ≥2 events of ≤8KB each (the cap chunks plus a
+    // remainder ≤ cap).
+    const r = await mgr.spawn({
+      command: `printf 'x%.0s' {1..20000}`,
+    });
+    const result = await monitor(
+      { kind: 'process_output_lines', processId: r.id },
+      { durationMs: 5000, pollIntervalMs: 50, maxEvents: 100, bgManager: mgr },
+    );
+    const partials = result.events.filter(
+      (e) =>
+        (e.payload as { stream: string }).stream === 'stdout' &&
+        (e.payload as { partial?: boolean }).partial === true,
+    );
+    expect(partials.length).toBeGreaterThanOrEqual(2);
+    // Each emitted chunk is bounded by the 8KB cap.
+    for (const e of partials) {
+      const line = (e.payload as { line: string }).line;
+      expect(line.length).toBeLessThanOrEqual(8 * 1024);
+    }
+    // All bytes were captured: total emitted bytes ≈ 20K (some
+    // tolerance for the trailing partial-tail emission, which is
+    // also ≤ cap).
+    const totalBytes = partials.reduce(
+      (sum, e) => sum + (e.payload as { line: string }).line.length,
+      0,
+    );
+    expect(totalBytes).toBe(20000);
+  });
+
+  test('cap reset allows normal lines to flow afterwards', async () => {
+    // After flushing oversized partial chunks, normal newline-
+    // terminated lines should be captured cleanly — the cap path
+    // shouldn't poison subsequent extraction.
+    const r = await mgr.spawn({
+      command: `printf 'x%.0s' {1..10000}; echo; echo NORMAL-LINE-AFTER-FLUSH`,
+    });
+    const result = await monitor(
+      { kind: 'process_output_lines', processId: r.id },
+      { durationMs: 5000, pollIntervalMs: 50, maxEvents: 100, bgManager: mgr },
+    );
+    const lines = result.events.map((e) => (e.payload as { line: string }).line);
+    expect(lines.some((l) => l.includes('NORMAL-LINE-AFTER-FLUSH'))).toBe(true);
+    // The normal line is full and not flagged partial
+    const normalEvent = result.events.find(
+      (e) => (e.payload as { line: string }).line === 'NORMAL-LINE-AFTER-FLUSH',
+    );
+    expect(normalEvent).toBeDefined();
+    expect((normalEvent?.payload as { partial?: boolean }).partial).toBeUndefined();
+  });
+
   test('drains pending bytes after exit (lines past 64KB cap)', async () => {
     // Regression: a single readOutput call returns at most maxBytes
     // (default 64KB). If the process emits >64KB and exits, the

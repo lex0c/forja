@@ -384,6 +384,21 @@ export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
     ) {
       return toolError(ERROR_CODES.invalidArg, 'timeout_ms must be a positive integer (>=1ms)');
     }
+    // Schema declares minimum: 10 but providers may not enforce
+    // schema constraints — model JSON arrives unvalidated.
+    // poll_interval_ms < 10 (or 0, or negative) creates a near-
+    // tight polling loop that hammers the filesystem / network
+    // until the outer timeout fires. Reject runtime-side.
+    if (args.poll_interval_ms !== undefined) {
+      if (
+        typeof args.poll_interval_ms !== 'number' ||
+        !Number.isFinite(args.poll_interval_ms) ||
+        !Number.isInteger(args.poll_interval_ms) ||
+        args.poll_interval_ms < 10
+      ) {
+        return toolError(ERROR_CODES.invalidArg, 'poll_interval_ms must be an integer >= 10 (ms)');
+      }
+    }
     const built = buildCondition(args.condition, ctx.cwd);
     if (!built.ok) {
       return toolError(ERROR_CODES.invalidArg, built.message);

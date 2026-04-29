@@ -204,6 +204,50 @@ describe('monitor tool: validation', () => {
     if (!isToolError(r)) throw new Error('expected error');
     expect(r.error_code).toBe('tool.invalid_arg');
   });
+
+  test('rejects poll_interval_ms below 10', async () => {
+    const ctx = makeCtx({ sessionId });
+    const r = await monitorTool.execute(
+      {
+        condition: { kind: 'file_changes', path: '/tmp/x' },
+        duration_ms: 1000,
+        poll_interval_ms: 0,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('poll_interval_ms');
+  });
+
+  test('rejects max_events below 1', async () => {
+    const ctx = makeCtx({ sessionId });
+    const r = await monitorTool.execute(
+      {
+        condition: { kind: 'file_changes', path: '/tmp/x' },
+        duration_ms: 1000,
+        max_events: 0,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('max_events');
+  });
+
+  test('rejects non-integer max_events', async () => {
+    const ctx = makeCtx({ sessionId });
+    const r = await monitorTool.execute(
+      {
+        condition: { kind: 'file_changes', path: '/tmp/x' },
+        duration_ms: 1000,
+        max_events: 5.5,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+  });
 });
 
 describe('monitor tool: bg manager dependency', () => {

@@ -71,6 +71,21 @@ const DEFAULT_MAX_EVENTS = 100;
 // documented as risk; pull-in if real workflows need longer.
 const PATTERN_OVERLAP_BYTES = 64;
 
+// Hard cap on the partial-line buffer in `process_output_lines`
+// mode. Without this, a process emitting an unbroken stream
+// (progress bars overwriting in-place via \r, raw binary blobs,
+// `printf` without \n) accumulates indefinitely in stdoutBuf /
+// stderrBuf and can OOM the harness before durationMs fires. When
+// the buffer exceeds the cap, we flush slices of cap size as
+// partial events and keep going — the model sees the data,
+// memory stays bounded.
+//
+// 8 KB is generous enough to fit any reasonable log line
+// (including verbose stack traces) without splitting it, while
+// being small enough that even max_events × cap (100 × 8KB =
+// 800KB) fits comfortably in the model's context budget.
+const MAX_LINE_BUFFER_BYTES = 8 * 1024;
+
 const sleepMs = (ms: number, signal?: AbortSignal): Promise<void> =>
   new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -254,6 +269,35 @@ export const monitor = async (
           duration.cleanup();
           throw new Error('bgManager unexpectedly undefined mid-monitor');
         }
+        // Flush helper: when the partial-line buffer grows past
+        // MAX_LINE_BUFFER_BYTES, slice off cap-sized chunks and
+        // emit them as `partial: true` events so memory stays
+        // bounded under no-newline streams (progress bars, binary
+        // output, printf without \n). Returns the trimmed buffer
+        // and whether max_events was hit during the flush. Closes
+        // over `events` and `maxEvents` from outer scope.
+        const flushOversize = (
+          buf: string,
+          stream: 'stdout' | 'stderr',
+          timestamp: number,
+        ): { newBuf: string; maxHit: boolean } => {
+          let current = buf;
+          while (current.length > MAX_LINE_BUFFER_BYTES) {
+            events.push({
+              kind: 'process_output_line',
+              timestamp,
+              payload: {
+                stream,
+                line: current.slice(0, MAX_LINE_BUFFER_BYTES),
+                partial: true,
+              },
+            });
+            current = current.slice(MAX_LINE_BUFFER_BYTES);
+            if (events.length >= maxEvents) return { newBuf: current, maxHit: true };
+          }
+          return { newBuf: current, maxHit: false };
+        };
+
         let r: Awaited<ReturnType<typeof bg.readOutput>>;
         try {
           r = await bg.readOutput(condition.processId, {
@@ -282,6 +326,19 @@ export const monitor = async (
             });
           }
         }
+        // Cap the buffered partial line BEFORE next poll appends
+        // more bytes — without this, a no-newline stream grows
+        // stdoutBuf without bound across polls.
+        {
+          const flushed = flushOversize(stdoutBuf, 'stdout', now);
+          stdoutBuf = flushed.newBuf;
+          if (flushed.maxHit) {
+            return finalize('max_events', {
+              processStatus: r.status,
+              processExitCode: r.exitCode,
+            });
+          }
+        }
         const stderrExt = extractLines(stderrBuf, r.stderr);
         stderrBuf = stderrExt.rest;
         for (const line of stderrExt.lines) {
@@ -291,6 +348,16 @@ export const monitor = async (
             payload: { stream: 'stderr', line },
           });
           if (events.length >= maxEvents) {
+            return finalize('max_events', {
+              processStatus: r.status,
+              processExitCode: r.exitCode,
+            });
+          }
+        }
+        {
+          const flushed = flushOversize(stderrBuf, 'stderr', now);
+          stderrBuf = flushed.newBuf;
+          if (flushed.maxHit) {
             return finalize('max_events', {
               processStatus: r.status,
               processExitCode: r.exitCode,
@@ -333,6 +400,15 @@ export const monitor = async (
               if (events.length >= maxEvents) break;
             }
             if (events.length >= maxEvents) break;
+            // Cap stdoutBuf inside the drain too — a >64KB no-newline
+            // tail from a crashed process would otherwise emit one
+            // gigantic partial event at the end. Same flush helper
+            // as the main poll loop.
+            {
+              const flushed = flushOversize(stdoutBuf, 'stdout', drainNow);
+              stdoutBuf = flushed.newBuf;
+              if (flushed.maxHit) break;
+            }
             const drainStderr = extractLines(stderrBuf, r.stderr);
             stderrBuf = drainStderr.rest;
             for (const line of drainStderr.lines) {
@@ -342,6 +418,12 @@ export const monitor = async (
                 payload: { stream: 'stderr', line },
               });
               if (events.length >= maxEvents) break;
+            }
+            if (events.length >= maxEvents) break;
+            {
+              const flushed = flushOversize(stderrBuf, 'stderr', drainNow);
+              stderrBuf = flushed.newBuf;
+              if (flushed.maxHit) break;
             }
             // Defensive: stop if cursors didn't advance — would be
             // an infinite loop if pending didn't shrink (e.g., a
