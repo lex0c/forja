@@ -177,6 +177,32 @@ export const resolveRef = async (cwd: string, ref: string): Promise<string | nul
 // per CHECKPOINTS §2.4.
 export const sessionRef = (sessionId: string): string => `refs/agent/checkpoints/${sessionId}`;
 
+// Namespace for working-tree preservation commits created when
+// restore() can't use git stash (unborn HEAD path). Suffix is
+// `<timestampMs>-<8-char-uuid>`: the timestamp drives the lazy
+// retention sweep (drop refs older than cutoff), the UUID slice
+// avoids collisions when two restores land in the same ms.
+export const RESTORE_SAVED_REF_PREFIX = 'refs/agent/restore-saved/';
+
+const restoreSavedRefName = (): string => {
+  const uuid = crypto.randomUUID().replace(/-/g, '').slice(0, 8);
+  return `${RESTORE_SAVED_REF_PREFIX}${Date.now()}-${uuid}`;
+};
+
+// Parse the timestamp prefix out of a restore-saved ref name. Returns
+// null when the ref doesn't match the expected `<ms>-<uuid>` shape —
+// callers treat null as "skip retention; can't decide" rather than
+// guessing. Lives here so the ref-name format stays a single concern.
+export const parseRestoreSavedTimestamp = (ref: string): number | null => {
+  if (!ref.startsWith(RESTORE_SAVED_REF_PREFIX)) return null;
+  const tail = ref.slice(RESTORE_SAVED_REF_PREFIX.length);
+  const dash = tail.indexOf('-');
+  const tsStr = dash === -1 ? tail : tail.slice(0, dash);
+  const ts = Number.parseInt(tsStr, 10);
+  if (!Number.isFinite(ts) || ts <= 0) return null;
+  return ts;
+};
+
 export interface SnapshotInput {
   cwd: string;
   sessionId: string;
@@ -407,10 +433,13 @@ export const restore = async (cwd: string, commitSha: string): Promise<RestoreRe
         if (sha.length === 0) {
           throw new Error('git commit-tree produced empty output (unborn-HEAD preserve)');
         }
-        // Timestamp namespace keeps multiple unborn-HEAD restores
-        // distinguishable; ms granularity is enough since restore is
-        // strictly serial (one CLI invocation at a time).
-        const ref = `refs/agent/restore-saved/${Date.now()}`;
+        // Timestamp + UUID slice keeps multiple unborn-HEAD restores
+        // distinguishable. Plain `Date.now()` would collide silently
+        // when two restores land in the same ms (rare in practice but
+        // possible in scripted/test scenarios) — `update-ref` then
+        // overwrites the prior ref, leaving the first preservation
+        // commit unreachable. The UUID slice closes that window.
+        const ref = restoreSavedRefName();
         await runGit(['update-ref', ref, sha], { cwd });
         stashed = true;
         stashRef = ref;
@@ -498,6 +527,39 @@ export const deleteSessionRef = async (cwd: string, sessionId: string): Promise<
 // rest of the surface (consistency, env scrubbing, timeout).
 export const setSessionRef = async (cwd: string, sessionId: string, sha: string): Promise<void> => {
   await runGit(['update-ref', sessionRef(sessionId), sha], { cwd });
+};
+
+// Enumerate every restore-saved preservation ref, with its parsed
+// timestamp and full ref name. Drives the lazy retention sweep —
+// these refs aren't tied to a session and there's no DB row to
+// gate against, so the timestamp baked into the ref name is the
+// only retention signal. Refs whose timestamp doesn't parse
+// (older format pre-L2 fix, or hand-created) come back with
+// `timestampMs: null` and are skipped by the sweep.
+export const listRestoreSavedRefs = async (
+  cwd: string,
+): Promise<{ ref: string; sha: string; timestampMs: number | null }[]> => {
+  const { stdout } = await runGit(
+    ['for-each-ref', '--format=%(refname) %(objectname)', RESTORE_SAVED_REF_PREFIX.slice(0, -1)],
+    { cwd },
+  );
+  const lines = stdout.split('\n').filter((l) => l.length > 0);
+  const out: { ref: string; sha: string; timestampMs: number | null }[] = [];
+  for (const line of lines) {
+    const [ref, sha] = line.split(' ');
+    if (ref === undefined || sha === undefined) continue;
+    if (!ref.startsWith(RESTORE_SAVED_REF_PREFIX)) continue;
+    out.push({ ref, sha, timestampMs: parseRestoreSavedTimestamp(ref) });
+  }
+  return out;
+};
+
+// Delete a single restore-saved ref by its full name. Idempotent
+// (deleting a missing ref is a no-op in modern git; the okExitCodes
+// fallback covers older versions). Used by both the lazy sweep and
+// any future explicit recovery flow.
+export const deleteRestoreSavedRef = async (cwd: string, ref: string): Promise<void> => {
+  await runGit(['update-ref', '-d', ref], { cwd, okExitCodes: [1] });
 };
 
 // Enumerate every session id that currently has a checkpoint ref.

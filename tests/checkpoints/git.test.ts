@@ -3,12 +3,15 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  RESTORE_SAVED_REF_PREFIX,
   deleteSessionRef,
   diff,
   getHeadSha,
   isGitRepo,
   isWorkingTreeDirty,
+  listRestoreSavedRefs,
   listSessionRefs,
+  parseRestoreSavedTimestamp,
   resolveRef,
   restore,
   sessionRef,
@@ -439,5 +442,99 @@ describe('listSessionRefs / deleteSessionRef', () => {
   test('deleteSessionRef on missing ref is a no-op', async () => {
     await initRepoWithCommit(repo);
     await deleteSessionRef(repo, 'never-existed'); // no throw
+  });
+});
+
+describe('parseRestoreSavedTimestamp', () => {
+  test('parses the timestamp prefix', () => {
+    expect(parseRestoreSavedTimestamp(`${RESTORE_SAVED_REF_PREFIX}1700000000000-deadbeef`)).toBe(
+      1_700_000_000_000,
+    );
+  });
+
+  test('handles refs without a uuid suffix (forward-compat with older format)', () => {
+    expect(parseRestoreSavedTimestamp(`${RESTORE_SAVED_REF_PREFIX}1700000000000`)).toBe(
+      1_700_000_000_000,
+    );
+  });
+
+  test('returns null for refs outside the namespace', () => {
+    expect(parseRestoreSavedTimestamp('refs/heads/main')).toBeNull();
+    expect(parseRestoreSavedTimestamp('refs/agent/checkpoints/foo')).toBeNull();
+  });
+
+  test('returns null for non-numeric prefixes', () => {
+    expect(parseRestoreSavedTimestamp(`${RESTORE_SAVED_REF_PREFIX}manual-tag`)).toBeNull();
+    expect(parseRestoreSavedTimestamp(`${RESTORE_SAVED_REF_PREFIX}-uuid`)).toBeNull();
+  });
+
+  test('returns null for non-positive timestamps', () => {
+    expect(parseRestoreSavedTimestamp(`${RESTORE_SAVED_REF_PREFIX}0-uuid`)).toBeNull();
+    expect(parseRestoreSavedTimestamp(`${RESTORE_SAVED_REF_PREFIX}-1-uuid`)).toBeNull();
+  });
+});
+
+describe('listRestoreSavedRefs', () => {
+  test('returns parsed timestamps for refs in the namespace', async () => {
+    await initRepoWithCommit(repo);
+    const head = (await getHeadSha(repo)) ?? '';
+    const ts1 = 1_700_000_000_000;
+    const ts2 = 1_700_000_001_000;
+    await runGit(repo, ['update-ref', `${RESTORE_SAVED_REF_PREFIX}${ts1}-aaaaaaaa`, head]);
+    await runGit(repo, ['update-ref', `${RESTORE_SAVED_REF_PREFIX}${ts2}-bbbbbbbb`, head]);
+
+    const refs = await listRestoreSavedRefs(repo);
+    expect(refs).toHaveLength(2);
+    const sorted = [...refs].sort((a, b) => (a.timestampMs ?? 0) - (b.timestampMs ?? 0));
+    expect(sorted[0]?.timestampMs).toBe(ts1);
+    expect(sorted[1]?.timestampMs).toBe(ts2);
+  });
+
+  test('emits null timestamp for refs that do not match the format', async () => {
+    await initRepoWithCommit(repo);
+    const head = (await getHeadSha(repo)) ?? '';
+    await runGit(repo, ['update-ref', `${RESTORE_SAVED_REF_PREFIX}manual-tag`, head]);
+
+    const refs = await listRestoreSavedRefs(repo);
+    expect(refs).toHaveLength(1);
+    expect(refs[0]?.timestampMs).toBeNull();
+  });
+});
+
+describe('restore-saved ref name uniqueness', () => {
+  test('two restores in the same ms produce distinct refs', async () => {
+    // The L2 fix appends a UUID slice so back-to-back restores in
+    // the same millisecond don't collide on update-ref.
+    await initRepoWithCommit(repo);
+    // Force unborn HEAD by re-init'ing in a fresh dir.
+    const fresh = await mkdtemp(join(tmpdir(), 'forja-uniq-'));
+    try {
+      await runGit(fresh, ['init', '-b', 'main']);
+      // Snapshot a no-op tree so we have a commit to restore against.
+      await writeFile(join(fresh, 'a.txt'), 'v1\n');
+      const ckpt = await snapshot({
+        cwd: fresh,
+        sessionId: 's',
+        stepId: 'm',
+        iso: 'iso',
+      });
+      // First dirty restore: writes a different version of a.txt
+      // (collides with the checkpoint name → gets preserved).
+      await writeFile(join(fresh, 'a.txt'), 'v2\n');
+      const r1 = await restore(fresh, ckpt.sha as string);
+      // Second dirty restore: re-dirty and restore again immediately.
+      await writeFile(join(fresh, 'a.txt'), 'v3\n');
+      const r2 = await restore(fresh, ckpt.sha as string);
+
+      expect(r1.stashRef).toBeDefined();
+      expect(r2.stashRef).toBeDefined();
+      expect(r1.stashRef).not.toBe(r2.stashRef);
+
+      // Both refs still resolve — neither was clobbered.
+      expect(await resolveRef(fresh, r1.stashRef as string)).not.toBeNull();
+      expect(await resolveRef(fresh, r2.stashRef as string)).not.toBeNull();
+    } finally {
+      await rm(fresh, { recursive: true, force: true });
+    }
   });
 });

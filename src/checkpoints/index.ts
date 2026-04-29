@@ -14,12 +14,16 @@ export type {
 } from './manager.ts';
 
 export {
+  RESTORE_SAVED_REF_PREFIX,
+  deleteRestoreSavedRef,
   deleteSessionRef,
   diff as gitDiff,
   getHeadSha,
   isGitRepo,
   isWorkingTreeDirty,
+  listRestoreSavedRefs,
   listSessionRefs,
+  parseRestoreSavedTimestamp,
   resolveRef,
   restore as gitRestore,
   sessionRef,

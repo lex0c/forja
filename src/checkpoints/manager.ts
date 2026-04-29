@@ -9,10 +9,12 @@ import {
   listCheckpointsOlderThan,
 } from '../storage/index.ts';
 import {
+  deleteRestoreSavedRef,
   deleteSessionRef,
   diff as gitDiff,
   restore as gitRestore,
   snapshot as gitSnapshot,
+  listRestoreSavedRefs,
   listSessionRefs,
   resolveRef,
   sessionRef,
@@ -280,6 +282,32 @@ class CheckpointManagerImpl implements CheckpointManager {
         }
       } catch {
         // ignored — listing failures aren't worth crashing cleanup
+      }
+    }
+    // Sweep restore-saved preservation refs by age. These refs are
+    // created by restore() in the unborn-HEAD path (no DB row, no
+    // session linkage); the timestamp baked into the ref name is the
+    // only retention signal. Same cutoff as the row-driven sweep
+    // above so users get one consistent retention window.
+    if (this.available) {
+      try {
+        const restoreRefs = await listRestoreSavedRefs(this.cwd);
+        for (const { ref, timestampMs } of restoreRefs) {
+          // Skip refs whose name doesn't follow the timestamped format
+          // (manual creations, format from a future / past iteration).
+          // Conservative: if we can't read a timestamp, we don't know
+          // if it's safe to drop.
+          if (timestampMs === null) continue;
+          if (timestampMs < cutoffMs) {
+            try {
+              await deleteRestoreSavedRef(this.cwd, ref);
+            } catch {
+              // ignored
+            }
+          }
+        }
+      } catch {
+        // ignored
       }
     }
     return deleted;

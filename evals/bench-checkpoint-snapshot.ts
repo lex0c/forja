@@ -17,7 +17,7 @@
 //
 // Cost: $0 — pure local subprocess benchmark, no API.
 
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { snapshot } from '../src/checkpoints/git.ts';
@@ -79,7 +79,7 @@ const populateRepo = async (cwd: string, fileCount: number): Promise<void> => {
   let written = 0;
   for (let d = 0; d < dirsPerLevel && written < fileCount; d++) {
     const dirPath = join(cwd, `d${d.toString().padStart(3, '0')}`);
-    await Bun.spawn({ cmd: ['mkdir', '-p', dirPath] }).exited;
+    await mkdir(dirPath, { recursive: true });
     for (let f = 0; f < filesPerDir && written < fileCount; f++) {
       // Small contents — the bench measures git's traversal cost,
       // not blob hashing of large files. ~24 bytes per file × 10k

@@ -201,4 +201,46 @@ describe('CheckpointManager — available mode', () => {
     await mgr.purge({ olderThanDays: 999 });
     expect(await resolveRef(repo, sessionRef(sessionId))).toBeNull();
   });
+
+  test('purge drops aged-out restore-saved refs by parsed timestamp', async () => {
+    // restore-saved refs are created by restore() on unborn HEAD when
+    // working tree is dirty. They have no DB row and no session
+    // linkage — only the timestamp baked into the ref name decides
+    // retention. The sweep walks the namespace and deletes refs older
+    // than the cutoff.
+    await initRepoWithSeed(repo);
+    const mgr = createCheckpointManager({ db, cwd: repo, sessionId, available: true });
+
+    // Seed one old (60s ago) and one fresh ref. The shas can be any
+    // reachable commit — the seed commit is convenient.
+    const head = (await runGit(repo, ['rev-parse', 'HEAD'])).trim();
+    const oldTs = Date.now() - 60_000;
+    const oldRef = `refs/agent/restore-saved/${oldTs}-aaaaaaaa`;
+    const freshRef = `refs/agent/restore-saved/${Date.now()}-bbbbbbbb`;
+    await runGit(repo, ['update-ref', oldRef, head]);
+    await runGit(repo, ['update-ref', freshRef, head]);
+
+    // 30s cutoff drops the old ref but spares the fresh one.
+    // olderThanDays accepts fractional days via the float math, so
+    // 30 / 86400 = ~30s.
+    await mgr.purge({ olderThanDays: 30 / 86400 });
+
+    expect(await resolveRef(repo, oldRef)).toBeNull();
+    expect(await resolveRef(repo, freshRef)).not.toBeNull();
+  });
+
+  test('purge ignores restore-saved refs with unparseable timestamps', async () => {
+    // Conservative path: a hand-created ref or one from a future
+    // format that doesn't start with `<digits>-` is left alone. The
+    // sweep doesn't guess the age.
+    await initRepoWithSeed(repo);
+    const mgr = createCheckpointManager({ db, cwd: repo, sessionId, available: true });
+    const head = (await runGit(repo, ['rev-parse', 'HEAD'])).trim();
+    const weirdRef = 'refs/agent/restore-saved/manual-tag';
+    await runGit(repo, ['update-ref', weirdRef, head]);
+
+    await mgr.purge({ olderThanDays: 0.0000001 });
+
+    expect(await resolveRef(repo, weirdRef)).not.toBeNull();
+  });
 });
