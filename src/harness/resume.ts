@@ -1,6 +1,22 @@
 import type { ProviderContentBlock, ProviderMessage } from '../providers/index.ts';
 import type { Message, MessageRole } from '../storage/repos/messages.ts';
 
+// Hard cap on how many persisted messages we reload at resume init.
+// Compaction trims the in-memory array during a normal run, but the
+// persisted log keeps every appendMessage call — a long uncompacted
+// session, or one that crashed mid-compaction, can accumulate
+// thousands of rows. Loading them all on resume is the same
+// unbounded-buffer trap the playbook §5.3 calls out: GC pressure
+// at best, OOM at worst. 500 is generous (compaction targets a
+// fraction of that for the active window) and keeps a resumed run
+// inside the same memory envelope as a fresh one.
+//
+// Truncation policy: keep the MOST RECENT 500 messages, drop the
+// older tail. Recency matters more than depth for continuity —
+// the model's most useful context is what came right before the
+// new follow-up.
+export const MAX_RESUME_MESSAGES = 500;
+
 // Reconstruct the in-memory ProviderMessage[] from persisted rows.
 // Today the harness only persists role='user' and role='assistant'
 // — tool results are wrapped in user-role messages whose content is
@@ -18,9 +34,20 @@ import type { Message, MessageRole } from '../storage/repos/messages.ts';
 const isAssistantOrUser = (role: MessageRole): role is 'user' | 'assistant' =>
   role === 'user' || role === 'assistant';
 
-export const messagesToProviderMessages = (rows: Message[]): ProviderMessage[] => {
+export interface ReconstitutedMessages {
+  messages: ProviderMessage[];
+  // Diagnostic: how many rows were truncated from the head of the
+  // persisted log to fit MAX_RESUME_MESSAGES. The harness exposes
+  // this through events so a renderer can show "resumed with N of
+  // M messages, M-N older messages dropped".
+  droppedFromHead: number;
+}
+
+export const messagesToProviderMessages = (rows: Message[]): ReconstitutedMessages => {
+  const droppedFromHead = rows.length > MAX_RESUME_MESSAGES ? rows.length - MAX_RESUME_MESSAGES : 0;
+  const sliced = droppedFromHead > 0 ? rows.slice(droppedFromHead) : rows;
   const out: ProviderMessage[] = [];
-  for (const row of rows) {
+  for (const row of sliced) {
     if (!isAssistantOrUser(row.role)) continue;
     // The cast is unverified: the persistence layer stored arbitrary
     // JSON content (parseJsonSafe → unknown), and we trust that the
@@ -36,5 +63,5 @@ export const messagesToProviderMessages = (rows: Message[]): ProviderMessage[] =
       content: row.content as string | ProviderContentBlock[],
     });
   }
-  return out;
+  return { messages: out, droppedFromHead };
 };

@@ -9,6 +9,17 @@ import type { ToolRegistry } from '../tools/index.ts';
 // observers (TTY renderer, NDJSON output, future telemetry).
 export type HarnessEvent =
   | { type: 'session_start'; sessionId: string }
+  | {
+      // Emitted only on resume when the persisted message log
+      // exceeded MAX_RESUME_MESSAGES and the older tail was
+      // dropped. Renderers can show "resumed with N of M
+      // messages, M-N dropped" so the user knows part of the
+      // history is no longer in context.
+      type: 'resume_truncated';
+      sessionId: string;
+      kept: number;
+      dropped: number;
+    }
   | { type: 'step_start'; stepN: number }
   | { type: 'provider_event'; event: StreamEvent }
   | {

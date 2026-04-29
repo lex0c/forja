@@ -237,6 +237,20 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (existing === null) {
           throw new Error(`session ${resumeId} not found`);
         }
+        // cwd divergence between the original session and the
+        // resume context is silently broken: messages reference
+        // files / paths from the original cwd, but bash calls in
+        // the resumed run land in the new cwd. Refuse rather than
+        // let the model think it's in a filesystem that doesn't
+        // match its conversation. Operators who legitimately want
+        // to resume in a different directory can `cd` to the
+        // original first or start a fresh session — both are
+        // clearer than silent divergence.
+        if (existing.cwd !== config.cwd) {
+          throw new Error(
+            `cannot resume session ${resumeId}: original cwd was '${existing.cwd}', current cwd is '${config.cwd}'. cd to the original directory or start a new session.`,
+          );
+        }
         totalCostUsd = existing.totalCostUsd;
         usageComplete = existing.usageComplete;
         reopenSession(config.db, resumeId);
@@ -278,10 +292,22 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // appending the new user prompt. The model sees [old turns,
       // new prompt] and continues naturally. The new prompt is
       // also persisted so the next resume sees it too.
+      // messagesToProviderMessages caps at MAX_RESUME_MESSAGES;
+      // any older head is dropped (recency over depth — see
+      // resume.ts comment). When that happens we surface the count
+      // so a renderer / log shows the user "resumed with N of M".
       if (resumeId !== undefined) {
         const persisted = listMessagesBySession(config.db, resumeId);
         const restored = messagesToProviderMessages(persisted);
-        messages.push(...restored);
+        messages.push(...restored.messages);
+        if (restored.droppedFromHead > 0) {
+          safeEmit(config.onEvent, {
+            type: 'resume_truncated',
+            sessionId,
+            kept: restored.messages.length,
+            dropped: restored.droppedFromHead,
+          });
+        }
       }
 
       const userMsg = appendMessage(config.db, {

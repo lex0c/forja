@@ -229,6 +229,51 @@ describe('--resume flow', () => {
     expect(errLines.join('')).toContain('follow-up prompt');
   });
 
+  test('resume in a different cwd is rejected with a clear error', async () => {
+    // Silent cwd divergence is dangerous — the model resumes a
+    // conversation that referenced files in cwd A, but bash calls
+    // run in cwd B. Refuse so the user fixes it deliberately.
+    await run({
+      args: baseArgs({ prompt: 'first' }),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'a' }]),
+        dbPath,
+        cwd: workdir,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: recordingRenderer().renderer,
+    });
+
+    db = openTestDb();
+    const id = listSessions(db, {})[0]?.id;
+    if (id === undefined) throw new Error('expected session');
+    db.close();
+
+    // Resume in a DIFFERENT cwd.
+    const otherDir = mkdtempSync(join(tmpdir(), 'forja-resume-other-'));
+    const errLines: string[] = [];
+    const code = await run({
+      args: baseArgs({ prompt: 'follow', resume: id }),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'b' }]),
+        dbPath,
+        cwd: otherDir,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: recordingRenderer().renderer,
+      errSink: (s) => errLines.push(s),
+    });
+    rmSync(otherDir, { recursive: true, force: true });
+    // The harness throws inside runAgent's init; runAgent catches
+    // it via guardedFinish and surfaces as internalError exit (1).
+    expect(code).toBe(1);
+    // Best signal we can verify here: the run did NOT succeed.
+    // The detail is on session_finished's result.detail; renderers
+    // would surface it. errLines might be empty in this path
+    // because the throw is converted to a result, not propagated
+    // to the run.ts catch block.
+  });
+
   test('resume with unknown id surfaces a clean error', async () => {
     // The harness throws 'session X not found' from getSession;
     // run() catches it and prints to errSink with exit 1.
