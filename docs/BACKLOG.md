@@ -15,6 +15,58 @@ Format:
 
 ---
 
+## [2026-04-29] M3 / Step 2.2 — defense-in-depth: wait/monitor wall-clock cap
+
+After the security review that produced the per-leaf policy gate,
+walked the recommended hardening list. Findings recorded here.
+
+**Done — wait_for / monitor wall-clock cap (30min):**
+
+The harness's `maxWallClockMs` (default 10min) is the canonical
+upper bound on any tool, but operators that bump the harness cap
+for long-running builds re-open the gap: a model declaring
+`timeout_ms: 86400000` (24h) under a generous harness cap would
+pin a tool slot for the full window. Per-tool cap of 30min is
+generous for any real probe (build watches, dev-server readiness,
+slow integration paths) and conservative against the pathological
+case.
+
+- `src/tools/builtin/wait-for.ts` — `MAX_WAIT_MS = 30 * 60 * 1000`
+  enforced on `args.timeout_ms` AND on `sleep`'s `duration_ms`
+  (otherwise `sleep` is bounded only by `timeout_ms`, which now
+  has the cap, but the explicit check fails fast on a clearly
+  bogus sleep).
+- `src/tools/builtin/monitor.ts` — `MAX_DURATION_MS` mirrored
+  on `args.duration_ms`.
+- 3 regression tests added (one per site). Error messages cite
+  "30min" so operators reading audit logs see the cap by name.
+
+**Audited but no change needed:**
+
+- `src/permissions/matcher.ts` — symlink resolution via
+  `realpathSync` is ALREADY in place (lines 14-24), with a clean
+  fallback for non-existent paths (realpath the parent + join
+  basename). Test coverage in `tests/permissions/symlink.test.ts`.
+  My initial security assessment underestimated this surface —
+  defense-in-depth is stronger than I credited.
+- `src/wait/monitor.ts:257,613` and `src/harness/loop.ts:229,287,384`
+  — `X.fired ? 'X' : 'aborted'` patterns. These are 2-source
+  binary decisions (duration timer / wall-clock timer vs caller
+  signal). They do NOT have a third "deterministic no-match"
+  terminal that the wait_for bug exhibited, so the same
+  fall-through-aborted bug doesn't apply. Documented as audited
+  in the playbook §2 follow-up.
+- `src/tools/builtin/bash.ts` — `timedOut` flag is set explicitly
+  by the timer, no ambiguity with caller abort. Separate gap:
+  `ctx.signal.aborted` mid-exec doesn't thread to `proc.kill()`,
+  so a harness-level abort during a long bash leaves the child
+  running. Logged as a follow-up in TODO.md (out of scope here).
+
+**Verification:** `bun test` 841 pass / 7 skip / 0 fail (+3 new
+cap tests); `tsc --noEmit` clean; `biome check` clean.
+
+---
+
 ## [2026-04-29] M3 / Step 2.2 — security fix: per-leaf policy gate on wait_for / monitor
 
 **Bug:** `wait_for` and `monitor` are `category='misc'` (the harness's

@@ -192,6 +192,20 @@ describe('monitor tool: validation', () => {
     expect(r.error_message).toContain("must not contain '..'");
   });
 
+  test('rejects duration_ms above the 30min cap', async () => {
+    const ctx = makeCtx({ sessionId });
+    const r = await monitorTool.execute(
+      {
+        condition: { kind: 'file_changes', path: '/tmp/x' },
+        duration_ms: 31 * 60 * 1000,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('30min');
+  });
+
   test('rejects negative duration_ms', async () => {
     const ctx = makeCtx({ sessionId });
     const r = await monitorTool.execute(

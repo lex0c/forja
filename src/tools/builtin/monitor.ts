@@ -45,6 +45,14 @@ export interface MonitorOutput {
 const isObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
 
+// Hard cap on monitor wall-clock budget. Same rationale as
+// wait_for's MAX_WAIT_MS — the harness's maxWallClockMs is the
+// canonical upper bound, but this per-tool cap defends against
+// operator configurations that bump the harness cap for long
+// builds. 30min is generous for any real streaming-observation
+// scenario.
+const MAX_DURATION_MS = 30 * 60 * 1000;
+
 const escapeRegexLiteral = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 const buildCondition = (
@@ -228,6 +236,12 @@ export const monitorTool: Tool<MonitorInput, MonitorOutput> = {
       args.duration_ms < 1
     ) {
       return toolError(ERROR_CODES.invalidArg, 'duration_ms must be a positive integer (>=1ms)');
+    }
+    if (args.duration_ms > MAX_DURATION_MS) {
+      return toolError(
+        ERROR_CODES.invalidArg,
+        `duration_ms exceeds maximum (${MAX_DURATION_MS}ms / 30min)`,
+      );
     }
     // Schema constraints (poll_interval_ms minimum=10, max_events
     // minimum=1) are not guaranteed at runtime — model JSON arrives

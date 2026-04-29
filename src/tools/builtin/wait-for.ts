@@ -69,6 +69,17 @@ const isObject = (v: unknown): v is Record<string, unknown> =>
 // (B and (C or D))" is depth 3 and already gnarly to read).
 const MAX_COMPOSITION_DEPTH = 5;
 
+// Hard cap on wait wall-clock budget. The harness has its own
+// `maxWallClockMs` (default 10min) that aborts any tool past that
+// window — but operators that bump the harness cap for long-running
+// builds re-open the gap. A model declaring `timeout_ms: 86400000`
+// (24h) under a generous harness cap pins a tool slot for a day.
+// 30min is generous for any real probe (build watches, dev-server
+// readiness, slow integration paths) and conservative against the
+// pathological case. Same cap covers the `sleep` condition's
+// duration_ms, which is otherwise bounded only by timeout_ms.
+const MAX_WAIT_MS = 30 * 60 * 1000;
+
 // Validate + normalize the model-supplied condition. We refuse
 // unknown kinds and missing required fields with clean tool errors
 // rather than letting waitFor throw on a TypeError. Path resolution
@@ -116,6 +127,12 @@ const buildCondition = (
       const dur = raw.duration_ms;
       if (typeof dur !== 'number' || !Number.isFinite(dur) || dur < 0) {
         return { ok: false, message: 'sleep.duration_ms must be a non-negative number' };
+      }
+      if (dur > MAX_WAIT_MS) {
+        return {
+          ok: false,
+          message: `sleep.duration_ms exceeds maximum (${MAX_WAIT_MS}ms / 30min)`,
+        };
       }
       return { ok: true, cond: { kind: 'sleep', durationMs: dur } };
     }
@@ -458,6 +475,12 @@ export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
       args.timeout_ms < 1
     ) {
       return toolError(ERROR_CODES.invalidArg, 'timeout_ms must be a positive integer (>=1ms)');
+    }
+    if (args.timeout_ms > MAX_WAIT_MS) {
+      return toolError(
+        ERROR_CODES.invalidArg,
+        `timeout_ms exceeds maximum (${MAX_WAIT_MS}ms / 30min). The harness wall-clock cap is the upper bound; this per-tool cap is defense in depth so a generous harness configuration doesn't pin a tool slot indefinitely.`,
+      );
     }
     // Schema declares minimum: 10 but providers may not enforce
     // schema constraints — model JSON arrives unvalidated.

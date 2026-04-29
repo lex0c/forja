@@ -198,6 +198,35 @@ describe('wait_for tool: input validation', () => {
     expect(r.error_message).toContain('poll_interval_ms');
   });
 
+  test('rejects timeout_ms above the 30min cap', async () => {
+    const ctx = makeCtx();
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'sleep', duration_ms: 100 },
+        timeout_ms: 31 * 60 * 1000,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('timeout_ms');
+    expect(r.error_message).toContain('30min');
+  });
+
+  test('rejects sleep duration_ms above the 30min cap', async () => {
+    const ctx = makeCtx();
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'sleep', duration_ms: 31 * 60 * 1000 },
+        timeout_ms: 60 * 1000,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('sleep.duration_ms');
+  });
+
   test('rejects non-integer poll_interval_ms', async () => {
     const ctx = makeCtx();
     const r = await waitForTool.execute(
