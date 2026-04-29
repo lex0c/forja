@@ -167,12 +167,21 @@ describe('wait_for: process_output', () => {
 
   test('reports processExited in payload when process exits without matching', async () => {
     // Process exits cleanly; pattern was never written.
+    // Regression: previously this returned conditionMet='aborted'
+    // because finishUnmatched maps to aborted/timeout based on
+    // whether the outer timeout fired. With timeoutMs=5000 and a
+    // process that exits in ~100ms, timeout.timeoutFired() is
+    // false → 'aborted' was reported despite no abort having
+    // occurred. The explicit 'process_exited' terminal preserves
+    // the contract that 'aborted' means "a signal aborted the
+    // wait", not "the process happened to finish".
     const r = await mgr.spawn({ command: 'echo something-else; sleep 0.1' });
     const result = await waitFor(
       { kind: 'process_output', processId: r.id, pattern: /BG_NEVER_HAPPENS/ },
       { timeoutMs: 5000, pollIntervalMs: 50, bgManager: mgr },
     );
     expect(result.matched).toBe(false);
+    expect(result.conditionMet).toBe('process_exited');
     expect(result.payload?.processExited).toBe(true);
     expect(result.payload?.status).toBe('exited');
     expect(result.payload?.exitCode).toBe(0);

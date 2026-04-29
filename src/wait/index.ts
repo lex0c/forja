@@ -88,7 +88,15 @@ export type WaitConditionMet =
   | 'all_of'
   | 'any_of'
   | 'timeout'
-  | 'aborted';
+  | 'aborted'
+  // Distinct non-match terminal: the process being observed by
+  // `process_output` exited (cleanly or otherwise) before the
+  // pattern matched. Without this, the drain block would fall
+  // through finishUnmatched → 'aborted' (when the outer timeout
+  // hadn't fired) and a normal "service finished without saying
+  // READY" would be misreported as an abort. Mirrors the
+  // `process_exited` MonitorReason in `monitor.ts`.
+  | 'process_exited';
 
 export interface WaitResult {
   // True iff the condition fired. False on timeout or abort.
@@ -317,6 +325,31 @@ export const waitFor = async (
     if (payload !== undefined) result.payload = payload;
     return result;
   };
+  // Composition-specific no-match terminal. all_of (a sub returned
+  // matched=false) or any_of (every sub returned matched=false) can
+  // resolve deterministically BEFORE the outer timeout fires and
+  // WITHOUT a caller abort — e.g. multiple process_output subs whose
+  // processes exit without matching. finishUnmatched would label
+  // those as 'aborted' (no abort actually occurred), corrupting
+  // callers that branch on aborted-vs-timeout. Priority: outer
+  // timeout > caller abort > deterministic composition no-match.
+  const finishUnmatchedComposition = (
+    kind: 'all_of' | 'any_of',
+    payload?: Record<string, unknown>,
+  ): WaitResult => {
+    timeout.cleanup();
+    let conditionMet: WaitConditionMet;
+    if (timeout.timeoutFired()) conditionMet = 'timeout';
+    else if (options.signal?.aborted) conditionMet = 'aborted';
+    else conditionMet = kind;
+    const result: WaitResult = {
+      matched: false,
+      conditionMet,
+      elapsedMs: Date.now() - start,
+    };
+    if (payload !== undefined) result.payload = payload;
+    return result;
+  };
 
   // process_* conditions need the bg manager. Reject upfront with a
   // clear error rather than failing per-poll OR letting any_of
@@ -426,6 +459,11 @@ export const waitFor = async (
         // Cancel any still-running siblings AFTER the winner has
         // resolved. allSettled guarantees we don't return before
         // every sub-wait has cleaned up its own timer / handlers.
+        // Note: when `winner !== null`, errors thrown by losing
+        // siblings (e.g. one had a bad process_id) are intentionally
+        // dropped — race semantics is "first success wins, others
+        // are irrelevant". Real errors are only surfaced when EVERY
+        // sub rejected (the realError block below).
         subAc.abort();
         await Promise.allSettled(subPromises);
         // Real error (e.g., process_not_found) takes precedence
@@ -446,7 +484,12 @@ export const waitFor = async (
           }
           return finishMatched('any_of', payload);
         }
-        return finishUnmatched();
+        // No winner, no real error: every sub deterministically
+        // returned matched=false (e.g. all process_output subs
+        // saw their processes exit without matching). Use
+        // finishUnmatchedComposition so callers can distinguish
+        // this from a cancellation.
+        return finishUnmatchedComposition('any_of');
       }
 
       // all_of — every sub must match. Short-circuit on the first
@@ -464,7 +507,20 @@ export const waitFor = async (
           return { result: r, index: i };
         }),
       );
-      await Promise.all(tracked);
+      // Promise.all rejects immediately on the FIRST sub-rejection
+      // (e.g. process_not_found thrown by a process_* leaf). Without
+      // intervention, siblings keep polling until their own timeouts
+      // fire — leaking timers and signals past this function's
+      // return. Cancel siblings, drain them via allSettled, then
+      // re-throw so the caller sees the original error.
+      try {
+        await Promise.all(tracked);
+      } catch (e) {
+        subAc.abort();
+        await Promise.allSettled(subPromises);
+        timeout.cleanup();
+        throw e;
+      }
       if (firstFail !== null) {
         const failed = firstFail as { result: WaitResult; index: number };
         const subKind = condition.conditions[failed.index]?.kind ?? 'unknown';
@@ -475,7 +531,11 @@ export const waitFor = async (
         if (failed.result.payload !== undefined) {
           payload.failedPayload = failed.result.payload;
         }
-        return finishUnmatched(payload);
+        // Deterministic failure: a sub said matched=false (e.g.
+        // a process_output sub exited without matching). Same
+        // reason as any_of: don't mislabel as 'aborted'. Outer
+        // timeout/abort still take precedence if they fired.
+        return finishUnmatchedComposition('all_of', payload);
       }
       return finishMatched('all_of', { matched: condition.conditions.length });
     } finally {
@@ -707,13 +767,24 @@ export const waitFor = async (
           // Drain complete, no match. Report exit so the model can
           // distinguish "service started but never said READY"
           // (running, hit timeout) from "service crashed before
-          // saying READY" (exited, no match).
-          return finishUnmatched({
-            processId: condition.processId,
-            processExited: true,
-            status: r.status,
-            exitCode: r.exitCode,
-          });
+          // saying READY" (exited, no match). Use conditionMet=
+          // 'process_exited' explicitly — finishUnmatched would
+          // map to 'aborted' here (no outer timeout fired, no
+          // caller abort), which is wrong: the wait ended because
+          // the process terminated, not because the wait was
+          // cancelled.
+          timeout.cleanup();
+          return {
+            matched: false,
+            conditionMet: 'process_exited',
+            elapsedMs: Date.now() - start,
+            payload: {
+              processId: condition.processId,
+              processExited: true,
+              status: r.status,
+              exitCode: r.exitCode,
+            },
+          };
         }
         break;
       }

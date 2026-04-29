@@ -240,6 +240,110 @@ describe('wait_for: composition error propagation', () => {
     ).rejects.toThrow(/process_\* condition.*requires options\.bgManager/);
   });
 
+  test('all_of: aborts siblings when a sub throws a real error', async () => {
+    // Regression: prior to the fix, all_of's `await Promise.all(tracked)`
+    // rejected immediately on the first sub-throw without aborting
+    // subAc. Siblings kept polling until their own (here outer) timeouts
+    // fired — leaking timers / signal listeners past the function's
+    // return. With bgManager provided + an unknown process_id, the
+    // process_exit sub throws synchronously on its first poll; the
+    // sibling file_exists would otherwise spin until the outer 5s.
+    // This test asserts BOTH the throw propagates AND the wait
+    // returns quickly (< 500ms), proving siblings were cancelled.
+    const { createBgManager } = await import('../../src/bg/index.ts');
+    const { openMemoryDb } = await import('../../src/storage/db.ts');
+    const { migrate } = await import('../../src/storage/migrate.ts');
+    const { createSession } = await import('../../src/storage/repos/sessions.ts');
+    const db = openMemoryDb();
+    migrate(db);
+    const sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+    const mgr = createBgManager({ db, sessionId, logDir: mktemp() });
+    const dir = mktemp();
+    const start = Date.now();
+    let caught: unknown;
+    try {
+      await waitFor(
+        {
+          kind: 'all_of',
+          conditions: [
+            { kind: 'file_exists', path: join(dir, 'never.txt') },
+            { kind: 'process_exit', processId: 'no-such-id' },
+          ],
+        },
+        { timeoutMs: 5000, pollIntervalMs: 50, bgManager: mgr },
+      );
+    } catch (e) {
+      caught = e;
+    }
+    await mgr.cleanup();
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toMatch(/bg process not found/);
+    expect(Date.now() - start).toBeLessThan(500);
+  });
+
+  test('all_of: deterministic sub-failure reports kind, not aborted', async () => {
+    // Regression: previously, when an all_of sub returned matched=
+    // false BEFORE the outer timeout (e.g. a process_output sub
+    // whose process exited without matching), the composition fell
+    // through finishUnmatched → conditionMet='aborted' (no abort
+    // actually occurred). Now: conditionMet='all_of' in this
+    // deterministic-failure path; outer timeout/abort still take
+    // precedence if they fired first.
+    const { createBgManager } = await import('../../src/bg/index.ts');
+    const { openMemoryDb } = await import('../../src/storage/db.ts');
+    const { migrate } = await import('../../src/storage/migrate.ts');
+    const { createSession } = await import('../../src/storage/repos/sessions.ts');
+    const db = openMemoryDb();
+    migrate(db);
+    const sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+    const mgr = createBgManager({ db, sessionId, logDir: mktemp() });
+    const spawned = await mgr.spawn({ command: 'echo nope; sleep 0.05' });
+    const r = await waitFor(
+      {
+        kind: 'all_of',
+        conditions: [
+          { kind: 'process_output', processId: spawned.id, pattern: /WILL_NEVER_APPEAR/ },
+        ],
+      },
+      { timeoutMs: 5000, pollIntervalMs: 30, bgManager: mgr },
+    );
+    await mgr.cleanup();
+    expect(r.matched).toBe(false);
+    expect(r.conditionMet).toBe('all_of');
+    expect(r.payload?.failedKind).toBe('process_output');
+  });
+
+  test('any_of: every sub deterministically fails reports kind, not aborted', async () => {
+    // Regression: previously, when every any_of sub resolved with
+    // matched=false before the outer timeout fired, Promise.any
+    // rejected (synthetic AggregateError), no realError was found,
+    // winner was null, and the function fell into finishUnmatched
+    // → 'aborted'. Now: 'any_of' in this deterministic case.
+    const { createBgManager } = await import('../../src/bg/index.ts');
+    const { openMemoryDb } = await import('../../src/storage/db.ts');
+    const { migrate } = await import('../../src/storage/migrate.ts');
+    const { createSession } = await import('../../src/storage/repos/sessions.ts');
+    const db = openMemoryDb();
+    migrate(db);
+    const sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+    const mgr = createBgManager({ db, sessionId, logDir: mktemp() });
+    const a = await mgr.spawn({ command: 'echo a-out; sleep 0.05' });
+    const b = await mgr.spawn({ command: 'echo b-out; sleep 0.05' });
+    const r = await waitFor(
+      {
+        kind: 'any_of',
+        conditions: [
+          { kind: 'process_output', processId: a.id, pattern: /MISS_A/ },
+          { kind: 'process_output', processId: b.id, pattern: /MISS_B/ },
+        ],
+      },
+      { timeoutMs: 5000, pollIntervalMs: 30, bgManager: mgr },
+    );
+    await mgr.cleanup();
+    expect(r.matched).toBe(false);
+    expect(r.conditionMet).toBe('any_of');
+  });
+
   test('deeply nested process_* triggers recursive bgManager check', async () => {
     // any_of([sleep, all_of([process_exit])]) — two levels deep.
     expect(

@@ -15,6 +15,156 @@ Format:
 
 ---
 
+## [2026-04-29] M3 / Step 2.2 — post-review fix: all_of sibling leak on sub-throw
+
+Code review follow-up after Step 2.2 was reportedly closed. Single
+🟡 bug found and fixed; symmetrical 🟢 issues documented as
+deliberate decisions.
+
+**Bug:** in `src/wait/index.ts`, `all_of` orchestration awaited
+`Promise.all(tracked)` without intercepting rejections. When a
+sub threw a real error (e.g. `process_exit` against an unknown
+process_id, which throws `bg process not found` synchronously
+on first poll), `Promise.all` rejected immediately. The outer
+`finally` only removed the outer-abort listener — `subAc` was
+never aborted, so sibling sub-waits kept polling until their
+own (outer) timeouts fired. Net effect: timer + signal-listener
+leak past the function's return; observable as a 5s wait
+instead of <100ms when one sub failed fast.
+
+**Fix:** wrap `Promise.all(tracked)` in try/catch:
+1. `subAc.abort()` — cancel siblings.
+2. `await Promise.allSettled(subPromises)` — drain so we don't
+   return before children clean up timers / handlers.
+3. `timeout.cleanup()` — outer timer.
+4. Re-throw original error.
+
+Regression test: `tests/wait/composition.test.ts` — all_of with
+[file_exists never-appears, process_exit bad-id] under
+bgManager. Asserts both the throw propagates AND elapsed < 500ms
+(proving siblings were cancelled, not waited out).
+
+**Non-fix (race semantics, deliberate):** in `any_of`, when a
+winner emerges, errors thrown by losing siblings are silently
+dropped. Considered briefly as "asymmetric error visibility"
+but rejected: race contract is "first success wins, others
+become irrelevant" — surfacing losing-sibling errors after a
+success would break the success contract for noise. Real errors
+are still surfaced when EVERY sub rejects (the existing
+AggregateError → realError path). Comment in code documents
+this as intentional.
+
+**Done:**
+- `src/wait/index.ts` — try/catch around all_of's Promise.all,
+  abort+drain on rejection (lines ~467 onward).
+- Comment update in any_of's allSettled block — documents the
+  losing-sibling-error drop as deliberate race semantics.
+- `tests/wait/composition.test.ts` — regression test for
+  sibling-cancellation timing.
+
+**Why:** principle 9 (reversible by design) requires that a
+failed orchestration doesn't leave background polling loops
+holding signal listeners. The leak was bounded by the outer
+timeout (so not unbounded), but it violated the "wait_for
+returns when its decision is made, not later" contract.
+
+**Verification:** `bun test` 828 pass / 7 skip / 0 fail;
+`tsc --noEmit` clean; `biome check` clean.
+
+### Follow-up: `process_output` mis-reports normal exit as `aborted`
+
+Second 🟡 caught right after committing the all_of fix.
+
+**Bug:** in the `process_output` drain block, when the process
+exits without matching, the no-match return went through
+`finishUnmatched(...)`. That helper picks `conditionMet` from
+`timeout.timeoutFired() ? 'timeout' : 'aborted'`. With a generous
+outer timeout (e.g. 5s) and a process that finishes in ~100ms,
+the timeout hadn't fired → `conditionMet='aborted'` despite no
+abort signal being raised. Workflows that branch on
+`conditionMet==='aborted'` (treating it as a user/system cancel)
+would terminate prematurely on a normal process completion.
+
+**Fix:** add `'process_exited'` to the `WaitConditionMet` union
+and return it explicitly from the drain block (bypassing
+`finishUnmatched`'s aborted/timeout dichotomy). Mirrors the
+`MonitorReason='process_exited'` already used by `monitor.ts`,
+keeping the two primitives' vocabulary aligned. Tool surface
+relays the value via `condition_met` automatically — the type
+re-export carries the new variant.
+
+**Done:**
+- `src/wait/index.ts` — `WaitConditionMet` adds `'process_exited'`;
+  drain-block return uses it explicitly with `timeout.cleanup()`.
+- `tests/wait/process.test.ts` — existing test for
+  `processExited in payload` now also asserts
+  `conditionMet === 'process_exited'`. Comment explains the
+  prior buggy behavior so future regressions are caught.
+
+**Why:** principle 7 (trace everything). The conditionMet field
+is the trace primitive that downstream code reads to decide
+"why did the wait end?". Conflating "process finished" with
+"someone aborted me" corrupts that trace and propagates wrong
+decisions into hooks, recap, audit.
+
+**Verification:** `bun test` 828 pass / 7 skip / 0 fail;
+`tsc --noEmit` clean; `biome check` clean.
+
+### Follow-up: composition no-match also mis-reports as `aborted`
+
+Same root cause as the `process_output` follow-up, one level up
+in the composition layer.
+
+**Bug:** in `src/wait/index.ts`, both branches of the composition
+handler returned `finishUnmatched(...)` for deterministic
+no-match outcomes:
+- `any_of` — every sub resolved with `matched=false` before the
+  outer timeout (e.g. multiple `process_output` subs whose
+  processes exited without matching).
+- `all_of` — a sub returned `matched=false` and triggered the
+  short-circuit (e.g. one `process_output` sub exited).
+In both cases, `timeout.timeoutFired()` is false and no caller
+abort happened, so `finishUnmatched` defaults to
+`conditionMet='aborted'`. Workflows branching on
+`conditionMet==='aborted'` (treating it as a user/system cancel)
+prematurely terminated on a deterministic composition outcome.
+
+**Fix:** new helper `finishUnmatchedComposition(kind, payload)`
+with priority `outer timeout > caller abort > kind`. Both
+composition no-match paths now use it. The `WaitConditionMet`
+union already includes `'all_of'` / `'any_of'` (previously only
+emitted on match) — it now also signals "composition resolved
+deterministically without a match", symmetric with how
+`finishMatched` uses the same kind.
+
+**Decision:** outer timeout still wins over kind. If the outer
+timeout fires *while* a composition is being resolved (e.g.
+during the inter-poll sleep), the wait was effectively cut
+short — `'timeout'` is the more specific signal. Same for
+caller abort. The kind label is reserved for "every sub ran to
+its own conclusion before the outer signal fired".
+
+**Done:**
+- `src/wait/index.ts` — adds `finishUnmatchedComposition`,
+  rewires `any_of` no-winner block + `all_of` firstFail block
+  to use it. Comments explain the distinction.
+- `tests/wait/composition.test.ts` — two regression tests:
+  `all_of: deterministic sub-failure reports kind, not aborted`
+  and `any_of: every sub deterministically fails reports kind,
+  not aborted`. Both use `process_output` against a process
+  that exits early to produce the deterministic-fail signal.
+
+**Why:** principle 7 (trace everything), principle 8 (failure
+modes are first-class). `aborted` and `timeout` both mean "the
+wait did not run to its natural conclusion". A composition
+that ran every sub to completion DID reach a conclusion — the
+trace primitive must reflect that.
+
+**Verification:** `bun test` 830 pass / 7 skip / 0 fail;
+`tsc --noEmit` clean; `biome check` clean.
+
+---
+
 ## [2026-04-29] M3 / Step 2.2.4 — monitor (streaming observation, closes Step 2.2)
 
 Closes Step 2.2 with the streaming-observation half of spec
