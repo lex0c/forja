@@ -17,6 +17,16 @@ import type { Message, MessageRole } from '../storage/repos/messages.ts';
 // new follow-up.
 export const MAX_RESUME_MESSAGES = 500;
 
+// Stand-in user prompt prepended when truncation lands on an
+// assistant message. Anthropic's API (and others) require the
+// first message to be `user`, so a kept slice starting with
+// assistant would 400 even though tool_use ↔ tool_result pairs
+// are intact behind it. The placeholder satisfies the role-
+// alternation rule without introducing fake content the model
+// could mistake for a real instruction.
+export const TRUNCATION_PLACEHOLDER =
+  '[Earlier conversation truncated to fit the resume memory budget. Continuing from this turn.]';
+
 // Reconstruct the in-memory ProviderMessage[] from persisted rows.
 // Today the harness only persists role='user' and role='assistant'
 // — tool results are wrapped in user-role messages whose content is
@@ -43,8 +53,49 @@ export interface ReconstitutedMessages {
   droppedFromHead: number;
 }
 
+// Boundary safety: the kept slice MUST start at a position where
+// the provider can replay it without orphaning any reference. The
+// harness loop produces alternation
+//   [user_root, assistant, user_tool_result, assistant, user_tool_result, ...]
+// and tool_result blocks reference tool_use blocks emitted by the
+// IMMEDIATELY preceding assistant. So contiguous suffixes preserve
+// tool-pair integrity already — the only failure mode is a kept
+// slice whose head is a `user` carrying tool_result blocks: that
+// row's tool_use was in the dropped assistant, leaving an orphan.
+//
+// Two safe head-of-slice shapes:
+//   - assistant (its tool_use blocks are intact in this row; the
+//     following user_tool_result references THIS assistant)
+//   - user with string content (a fresh prompt — root or post-
+//     resume continuation; carries no tool_result references)
+//
+// When the cut lands on a user-tool_result, walk forward to the
+// next safe row. If the resulting head is `assistant`, prepend a
+// synthetic user message so provider role-alternation rules
+// (Anthropic requires first message = user) still hold. The
+// placeholder is small and stable; it doesn't pretend to summarize
+// the dropped history (that's compaction's job, which costs an
+// LLM call we can't afford at resume init).
+const isSafeHead = (row: Message): boolean => {
+  if (row.role === 'assistant') return true;
+  if (row.role === 'user' && typeof row.content === 'string') return true;
+  return false;
+};
+
 export const messagesToProviderMessages = (rows: Message[]): ReconstitutedMessages => {
-  const droppedFromHead = rows.length > MAX_RESUME_MESSAGES ? rows.length - MAX_RESUME_MESSAGES : 0;
+  let cut = rows.length > MAX_RESUME_MESSAGES ? rows.length - MAX_RESUME_MESSAGES : 0;
+  // Walk forward past unsafe heads (user_tool_result without its
+  // matching assistant). If no safe boundary exists in the kept
+  // window, cut walks to rows.length and the kept slice is empty —
+  // degraded UX (resume effectively starts fresh) but a valid one.
+  while (cut < rows.length) {
+    const candidate = rows[cut];
+    if (candidate === undefined) break;
+    if (isSafeHead(candidate)) break;
+    cut += 1;
+  }
+  const droppedFromHead = cut;
+
   const sliced = droppedFromHead > 0 ? rows.slice(droppedFromHead) : rows;
   const out: ProviderMessage[] = [];
   for (const row of sliced) {
@@ -62,6 +113,13 @@ export const messagesToProviderMessages = (rows: Message[]): ReconstitutedMessag
       role: row.role,
       content: row.content as string | ProviderContentBlock[],
     });
+  }
+  // If we cut at an assistant message, prepend the synthetic user
+  // placeholder so the provider sees the required user-first
+  // alternation. Skipped when the head is already user (either
+  // user_root preserved, or out is empty).
+  if (out[0]?.role === 'assistant') {
+    out.unshift({ role: 'user', content: TRUNCATION_PLACEHOLDER });
   }
   return { messages: out, droppedFromHead };
 };
