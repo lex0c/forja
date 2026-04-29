@@ -23,6 +23,7 @@ export {
   resolveRef,
   restore as gitRestore,
   sessionRef,
+  setSessionRef,
   snapshot as gitSnapshot,
 } from './git.ts';
 export type { RestoreResult, SnapshotResult } from './git.ts';

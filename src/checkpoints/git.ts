@@ -1,6 +1,6 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 // Low-level git plumbing for the checkpoint subsystem.
 //
@@ -33,7 +33,21 @@ interface RunGitOptions {
   // returns 1 when there's a diff). When set, exit codes in this list
   // resolve normally instead of throwing.
   okExitCodes?: number[];
+  // Hard cap on subprocess wall-clock. Default RUN_GIT_DEFAULT_TIMEOUT_MS
+  // (30s) — enough for write-tree + commit-tree on a 10k-file repo per
+  // CHECKPOINTS §2.8, short enough that a stuck git process (e.g., ref
+  // store waiting on another git's lock) doesn't wedge a session
+  // indefinitely. The harness's checkpoint snapshot wraps `runGit` in
+  // its own catch-and-skip, so a timeout here surfaces as a missing
+  // checkpoint, not a failed step.
+  timeoutMs?: number;
 }
+
+// Default timeout for any git subprocess we spawn. The hot path is
+// snapshot() → up to 5 git invocations per write step; 30s gives a
+// 6s/op average ceiling, which is well above the typical millisecond-
+// scale runtime but bounded enough to recover from a wedged ref lock.
+const RUN_GIT_DEFAULT_TIMEOUT_MS = 30_000;
 
 const runGit = async (args: string[], opts: RunGitOptions): Promise<SpawnGitResult> => {
   const env: Record<string, string> = {
@@ -57,19 +71,53 @@ const runGit = async (args: string[], opts: RunGitOptions): Promise<SpawnGitResu
     stdout: 'pipe',
     stderr: 'pipe',
   });
+  // Sentinel: did the timeout fire? We can't distinguish a manual kill
+  // from a natural exit through proc.exited alone (both resolve), so we
+  // track it explicitly to surface a meaningful error.
+  let timedOut = false;
+  const timeoutMs = opts.timeoutMs ?? RUN_GIT_DEFAULT_TIMEOUT_MS;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try {
+      proc.kill();
+    } catch {
+      // proc may already be exited; kill() throws — ignore.
+    }
+  }, timeoutMs);
+  // Stdin failure must NOT leak the subprocess. A broken pipe during
+  // sink.write or end (e.g., git refused stdin and exited) leaves
+  // proc.exited unresolved without this defensive kill — the await
+  // below would then hang for the full timeoutMs. We swallow the kill
+  // error (proc may already be gone) and let the exit path surface
+  // whatever git actually said on stderr.
   if (opts.stdin !== undefined) {
     const sink = proc.stdin;
     if (sink === undefined) {
+      clearTimeout(timer);
       throw new Error('git subprocess opened with stdin pipe returned no sink');
     }
-    sink.write(opts.stdin);
-    await sink.end();
+    try {
+      sink.write(opts.stdin);
+      await sink.end();
+    } catch (e) {
+      try {
+        proc.kill();
+      } catch {
+        // already dead
+      }
+      clearTimeout(timer);
+      throw e;
+    }
   }
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
+  clearTimeout(timer);
+  if (timedOut) {
+    throw new Error(`git ${args.join(' ')} timed out after ${timeoutMs}ms`);
+  }
   if (exitCode !== 0 && !(opts.okExitCodes ?? []).includes(exitCode)) {
     throw new Error(`git ${args.join(' ')} exited ${exitCode}: ${stderr.trim() || stdout.trim()}`);
   }
@@ -162,9 +210,12 @@ const tempIndexPath = async (): Promise<string> => {
 
 const cleanupTempIndex = async (indexFile: string): Promise<void> => {
   try {
-    // The index file lives in a directory we created; remove the whole
-    // directory so we don't leave a `forja-ckpt-XXXX` shell behind.
-    await rm(join(indexFile, '..'), { recursive: true, force: true });
+    // The index file lives in a directory we created (mkdtemp'd under
+    // os.tmpdir); remove the whole directory so we don't leave a
+    // `forja-ckpt-XXXX` shell behind. dirname() over `join(..., '..')`
+    // because the latter doesn't normalize trailing-slash quirks on
+    // every platform.
+    await rm(dirname(indexFile), { recursive: true, force: true });
   } catch {
     // Best-effort cleanup — leaking a /tmp directory is preferable to
     // masking the real result of a snapshot.
@@ -280,6 +331,14 @@ export interface RestoreResult {
 // push -u` saves them first. The stash is reported in the result so
 // the caller can echo a recovery hint.
 export const restore = async (cwd: string, commitSha: string): Promise<RestoreResult> => {
+  // Validate the commit object exists BEFORE stashing. A GC'd or
+  // corrupt commit would otherwise leave a stash orphan tied to a
+  // failed restore: we'd push the user's working tree to stash,
+  // then fail on read-tree, and the caller would have already told
+  // the operator the restore succeeded. `^{commit}` forces the
+  // peel — a tree or blob with the same sha would still fail here.
+  // The probe goes through runGit so timeout + okExitCodes apply.
+  await runGit(['rev-parse', '--verify', `${commitSha}^{commit}`], { cwd });
   const dirty = await isWorkingTreeDirty(cwd);
   let stashed = false;
   let stashRef: string | undefined;
@@ -302,6 +361,20 @@ export const restore = async (cwd: string, commitSha: string): Promise<RestoreRe
   // This is the same primitive `git checkout <sha> -- .` uses internally
   // but without the side effects of touching HEAD or the reflog.
   await runGit(['read-tree', '--reset', '-u', commitSha], { cwd });
+  // Re-sync the index with HEAD (when HEAD is born). After the read-tree
+  // above, the index matches the checkpoint's tree, NOT HEAD — so the
+  // user's `git status` would show every file that differs between HEAD
+  // and the checkpoint as "staged for commit". For users who hadn't
+  // committed during the agent run, HEAD already matches the checkpoint
+  // and this is a no-op; for users who had, this collapses the surprise
+  // "you have N staged files" message into the natural "you have N
+  // unstaged changes vs HEAD" view.
+  //
+  // `read-tree HEAD` (no -u, no --reset) updates only the index.
+  const headAfter = await getHeadSha(cwd);
+  if (headAfter !== null) {
+    await runGit(['read-tree', headAfter], { cwd });
+  }
   if (stashed && stashRef !== undefined) return { stashed, stashRef };
   return { stashed: false };
 };
@@ -347,6 +420,16 @@ export const deleteSessionRef = async (cwd: string, sessionId: string): Promise<
   // silently in modern git. okExitCodes covers the rare case where
   // an older git refuses with a non-zero exit on an absent ref.
   await runGit(['update-ref', '-d', sessionRef(sessionId)], { cwd, okExitCodes: [1] });
+};
+
+// Re-point a session's checkpoint ref at a different commit. Used by
+// the lazy-purge sweep when older rows in a session's chain age out
+// but newer ones survive — the chain's head ref needs to follow the
+// surviving newest commit so future snapshots don't try to parent off
+// a deleted ancestor. Runs through the same `runGit` wrapper as the
+// rest of the surface (consistency, env scrubbing, timeout).
+export const setSessionRef = async (cwd: string, sessionId: string, sha: string): Promise<void> => {
+  await runGit(['update-ref', sessionRef(sessionId), sha], { cwd });
 };
 
 // Enumerate every session id that currently has a checkpoint ref.

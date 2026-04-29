@@ -16,6 +16,7 @@ import {
   listSessionRefs,
   resolveRef,
   sessionRef,
+  setSessionRef,
 } from './git.ts';
 
 // Default retention for orphaned / aged-out checkpoint refs. Per
@@ -182,7 +183,6 @@ class CheckpointManagerImpl implements CheckpointManager {
     let deleted = 0;
     if (opts.sessionId !== undefined) {
       const sid = opts.sessionId;
-      const rows = listCheckpointsBySession(this.db, sid);
       deleted = deleteCheckpointsBySession(this.db, sid);
       if (this.available) {
         // Best-effort ref delete. We swallow the error so a failure
@@ -195,9 +195,6 @@ class CheckpointManagerImpl implements CheckpointManager {
           // ignored
         }
       }
-      // Touch rows to keep linter happy that we might use them; the
-      // count comes from the DB delete above.
-      void rows;
       return deleted;
     }
     const cutoffDays = opts.olderThanDays ?? DEFAULT_RETENTION_DAYS;
@@ -232,24 +229,13 @@ class CheckpointManagerImpl implements CheckpointManager {
         // newer commits are first in the listing (DESC).
         const head = remaining[0];
         if (head !== undefined) {
-          // resolveRef + reset is idempotent: if the ref already
-          // points at `head.gitRef` (no aged-out rows past the head),
-          // this is a no-op.
+          // Idempotent: skip the spawn when the ref already matches
+          // (the common case — aging out rows from the tail of the
+          // chain doesn't move the head).
           const current = await resolveRef(this.cwd, sessionRef(sessionId));
           if (current !== head.gitRef) {
             try {
-              // We don't expose update-ref directly to keep the
-              // surface small; do the same primitive inline.
-              const proc = Bun.spawn({
-                cmd: ['git', 'update-ref', sessionRef(sessionId), head.gitRef],
-                cwd: this.cwd,
-                env: {
-                  LC_ALL: 'C',
-                  PATH: process.env.PATH ?? '',
-                  HOME: process.env.HOME ?? '',
-                },
-              });
-              await proc.exited;
+              await setSessionRef(this.cwd, sessionId, head.gitRef);
             } catch {
               // ignored
             }
@@ -263,9 +249,20 @@ class CheckpointManagerImpl implements CheckpointManager {
     if (this.available) {
       try {
         const refs = await listSessionRefs(this.cwd);
+        // Pull every session_id that still has at least one row in a
+        // single query, then walk the refs against that set. The
+        // earlier per-ref `listCheckpointsBySession` call was O(N×M)
+        // — fine for a handful of refs but quadratic in the worst
+        // case the cleanup pass is supposed to handle.
+        const liveSessions = new Set<string>(
+          (
+            this.db.query('SELECT DISTINCT session_id FROM checkpoints').all() as {
+              session_id: string;
+            }[]
+          ).map((r) => r.session_id),
+        );
         for (const { sessionId } of refs) {
-          const rows = listCheckpointsBySession(this.db, sessionId);
-          if (rows.length === 0) {
+          if (!liveSessions.has(sessionId)) {
             try {
               await deleteSessionRef(this.cwd, sessionId);
             } catch {

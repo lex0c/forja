@@ -272,6 +272,47 @@ describe('restore', () => {
     expect(await Bun.file(join(repo, 'b.txt')).exists()).toBe(false);
   });
 
+  test('post-restore index matches HEAD, not the checkpoint tree', async () => {
+    await initRepoWithCommit(repo);
+    // Snapshot 1: working tree = HEAD + a new file. The checkpoint's
+    // tree thus diverges from HEAD by one untracked file.
+    await writeFile(join(repo, 'extra.txt'), 'extra\n');
+    const ckpt = await snapshot({
+      cwd: repo,
+      sessionId: 's',
+      stepId: 'm',
+      iso: 'iso',
+    });
+    // Restore — afterward, working tree should match the ckpt (extra.txt
+    // present), but the index should match HEAD (extra.txt absent from
+    // the index). `git status` would show extra.txt as untracked, not as
+    // a "staged change".
+    await restore(repo, ckpt.sha as string);
+    const status = await runGit(repo, ['status', '--porcelain']);
+    // Untracked files are prefixed with `??`. Staged changes would be
+    // `A ` / `M ` / `D `. Either form is fine for this test as long
+    // as no `staged` letter shows up.
+    const lines = status.split('\n').filter((l) => l.length > 0);
+    for (const line of lines) {
+      // First column = staged status. The fix collapses it to ' '
+      // (whitespace) for our reverted untracked file.
+      const staged = line[0];
+      expect(staged).toBe('?');
+    }
+  });
+
+  test('throws on a non-existent commit before stashing', async () => {
+    await initRepoWithCommit(repo);
+    await writeFile(join(repo, 'dirty.txt'), 'work-in-progress\n');
+    // Use a sha that's syntactically valid but unreachable. The
+    // probe in restore() should reject before push-stashing.
+    await expect(restore(repo, '0000000000000000000000000000000000000000')).rejects.toThrow();
+    // The dirty file must still be in the working tree — proving we
+    // did not stash before failing.
+    const text = await Bun.file(join(repo, 'dirty.txt')).text();
+    expect(text).toBe('work-in-progress\n');
+  });
+
   test('does not stash when working tree is already clean', async () => {
     await initRepoWithCommit(repo);
     await writeFile(join(repo, 'c.txt'), 'state\n');
