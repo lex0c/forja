@@ -171,6 +171,12 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  // Close the DB before scrubbing the temp dir. Without this the
+  // in-memory sqlite handle leaks across test cases (cheap on a
+  // small suite, but inconsistent with the rest of the project's
+  // test fixtures and a foot-gun for any future test that reuses
+  // the `db` binding).
+  db.close();
   await rm(repo, { recursive: true, force: true });
 });
 
@@ -421,11 +427,10 @@ describe('harness checkpoint wiring', () => {
       checkpointsRetentionDays: 1,
       script: [{ text: 'done', stop_reason: 'end_turn' }],
     });
+    // The harness now awaits the lazy purge in its outer finally
+    // (C1), so by the time runAgent returns the sweep has fully
+    // completed against the DB. No timing dance needed.
     await runAgent(config);
-    // Yield once so any pending purge promise resolves before we
-    // observe the row count. Without this yield the test races on
-    // fast machines where the purge hasn't finished yet.
-    await new Promise((resolve) => setTimeout(resolve, 50));
 
     expect(listCheckpointsBySession(db, oldSessionId)).toHaveLength(0);
   });
@@ -453,7 +458,6 @@ describe('harness checkpoint wiring', () => {
       ],
     });
     const result = await runAgent(config);
-    await new Promise((resolve) => setTimeout(resolve, 50));
     expect(listCheckpointsBySession(db, result.sessionId)).toHaveLength(1);
   });
 
@@ -476,7 +480,6 @@ describe('harness checkpoint wiring', () => {
       script: [{ text: 'done', stop_reason: 'end_turn' }],
     });
     await runAgent(config);
-    await new Promise((resolve) => setTimeout(resolve, 50));
     // The aged-out row is left in place because no manager-driven
     // purge ran (sweep only fires when git is available).
     expect(listCheckpointsBySession(db, oldSessionId)).toHaveLength(1);

@@ -143,6 +143,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // intentionally; the lazy-purge sweep at startup of the NEXT run
   // is what reclaims them.
   let checkpointManager: CheckpointManager | undefined;
+  // Tracks the in-flight retention sweep (if any). Captured in the
+  // outer scope so the outer finally can await it before the caller
+  // closes the DB. Without the await, the purge would race against
+  // db.close() in cli/run.ts and hit a closed sqlite handle.
+  let checkpointsPurgeInFlight: Promise<unknown> | undefined;
   // Per-session TodoList store. Created once per session here so the
   // todo_write tool sees a fresh list, and torn down in the outer
   // finally so accumulated state from a long-lived process doesn't
@@ -361,7 +366,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // any in-flight session's created_at; the current
           // session's rows are excluded by construction.
           const retentionDays = config.checkpointsRetentionDays;
-          checkpointManager
+          checkpointsPurgeInFlight = checkpointManager
             .purge(retentionDays !== undefined ? { olderThanDays: retentionDays } : {})
             .catch(() => {
               // Swallowed — see rationale above.
@@ -625,14 +630,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // working tree didn't change, write-tree matches the prior
         // checkpoint, no row written). Cheap defense in depth.
         //
-        // had_bash: any tool name in the step that the bash family —
-        // `bash`, `bash_background`, `bash_kill` — owns. The CLI
-        // surfaces a warning before `--undo` when this flag is true
-        // because bash side effects (DB writes, network requests,
-        // process spawns) are NOT reversed by checkpoint restore.
-        // Detected by name rather than metadata to keep the rule
-        // explicit and auditable; no other tool today has the same
-        // out-of-cwd risk profile.
+        // had_bash: true iff at least one tool in this step has side
+        // effects that escape cwd (DB writes, network calls, process
+        // spawns) — these are NOT reversed by checkpoint restore. The
+        // tool's own `metadata.escapesCwd` is the source of truth;
+        // the explicit name list (`bash`, `bash_background`,
+        // `bash_kill`) is a defense-in-depth fallback for external
+        // tool definitions that haven't set the flag yet. Variable
+        // name kept as `hadBash` to match the persisted column;
+        // `escapesCwd` is the conceptual rename for a future cleanup.
         if (checkpointManager !== undefined) {
           let hasWrites = false;
           let hadBash = false;
@@ -640,7 +646,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             const tool = config.toolRegistry.get(tu.name);
             if (tool === null) continue;
             if (tool.metadata.writes) hasWrites = true;
-            if (tu.name === 'bash' || tu.name === 'bash_background' || tu.name === 'bash_kill') {
+            if (
+              tool.metadata.escapesCwd === true ||
+              tu.name === 'bash' ||
+              tu.name === 'bash_background' ||
+              tu.name === 'bash_kill'
+            ) {
               hadBash = true;
             }
           }
@@ -875,6 +886,19 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       return guardedFinish(e);
     }
   } finally {
+    // Drain the lazy retention sweep BEFORE anything else in the
+    // finally fires. The caller (cli/run.ts) is allowed to close the
+    // DB right after runAgent returns; without this drain the purge
+    // would race against db.close() and hit a closed sqlite handle.
+    // The .catch() chain at construction already absorbed errors, so
+    // the await here is purely a synchronization point.
+    if (checkpointsPurgeInFlight !== undefined) {
+      try {
+        await checkpointsPurgeInFlight;
+      } catch {
+        // Already swallowed at construction; defensive.
+      }
+    }
     if (bgManager !== undefined) {
       try {
         await bgManager.cleanup();
