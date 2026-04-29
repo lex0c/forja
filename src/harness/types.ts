@@ -105,6 +105,16 @@ export interface HarnessConfig {
   toolRegistry: ToolRegistry;
   permissionEngine: PermissionEngine;
   db: DB;
+  // Directory where bg-aware tools' stdout/stderr log files are
+  // written. When set, the harness creates a session-scoped
+  // BgManager after createSession and threads it through
+  // ToolContext so `bash_background`/`bash_output`/`bash_kill` can
+  // dispatch through it. The manager is owned by the harness
+  // (cleanup runs in the session-end finally) — callers who need
+  // pre-existing managers for testing build them directly with
+  // createBgManager. When absent, bg-aware tools surface a clean
+  // tool-error.
+  bgLogDir?: string;
   cwd: string;
   systemPrompt?: string;
   userPrompt: string;

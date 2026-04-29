@@ -1,0 +1,17 @@
+name: bash_background spawn → bash_output read flow
+prompt: |
+  Use the bash_background tool to start the command
+  `bash -c "sleep 0.5; echo BG_TOKEN_36"` in the background.
+  Save the process_id from the result. Then call bash_output with that
+  process_id and report the captured stdout. If the first bash_output call
+  shows status='running' or stdout_pending > 0, call it again to drain
+  the rest. Reply with the exact token you observed in the output.
+expect:
+  - tool_called: bash_background
+  - tool_called: bash_output
+  - tool_not_called: bash
+  - output_contains: BG_TOKEN_36
+  - status: done
+budget:
+  maxSteps: 10
+  maxCostUsd: 0.15

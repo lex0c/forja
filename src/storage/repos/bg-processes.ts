@@ -15,7 +15,11 @@ export interface BgProcess {
   status: BgProcessStatus;
   stdoutLogPath: string;
   stderrLogPath: string;
-  cursorPosition: number;
+  // Byte offset on each stream already returned to the model.
+  // Stdout and stderr advance independently so a noisy stdout
+  // can't strand stderr writes (see migration 006).
+  stdoutCursorPosition: number;
+  stderrCursorPosition: number;
 }
 
 interface BgProcessRow {
@@ -32,6 +36,7 @@ interface BgProcessRow {
   stdout_log_path: string;
   stderr_log_path: string;
   cursor_position: number;
+  stderr_cursor_position: number;
 }
 
 const fromRow = (row: BgProcessRow): BgProcess => ({
@@ -47,7 +52,8 @@ const fromRow = (row: BgProcessRow): BgProcess => ({
   status: row.status,
   stdoutLogPath: row.stdout_log_path,
   stderrLogPath: row.stderr_log_path,
-  cursorPosition: row.cursor_position,
+  stdoutCursorPosition: row.cursor_position,
+  stderrCursorPosition: row.stderr_cursor_position,
 });
 
 export interface InsertBgProcessInput {
@@ -96,7 +102,8 @@ export const insertBgProcess = (db: DB, input: InsertBgProcessInput): BgProcess 
     status: 'running',
     stdoutLogPath: input.stdoutLogPath,
     stderrLogPath: input.stderrLogPath,
-    cursorPosition: 0,
+    stdoutCursorPosition: 0,
+    stderrCursorPosition: 0,
   };
 };
 
@@ -104,7 +111,8 @@ export const getBgProcess = (db: DB, id: string): BgProcess | null => {
   const row = db
     .query(
       `SELECT id, session_id, os_pid, label, command, cwd, spawned_at,
-              exited_at, exit_code, status, stdout_log_path, stderr_log_path, cursor_position
+              exited_at, exit_code, status, stdout_log_path, stderr_log_path,
+              cursor_position, stderr_cursor_position
        FROM background_processes
        WHERE id = ?`,
     )
@@ -133,7 +141,8 @@ export const listBgProcessesBySession = (
     const rows = db
       .query(
         `SELECT id, session_id, os_pid, label, command, cwd, spawned_at,
-                exited_at, exit_code, status, stdout_log_path, stderr_log_path, cursor_position
+                exited_at, exit_code, status, stdout_log_path, stderr_log_path,
+                cursor_position, stderr_cursor_position
          FROM background_processes
          WHERE session_id = ?
          ORDER BY spawned_at DESC, id ASC`,
@@ -154,13 +163,26 @@ export const listBgProcessesBySession = (
   return rows.map(fromRow);
 };
 
-// Cursor advance is a hot path: every successful `bash_output` call
-// updates it. Done as a single UPDATE rather than read-then-write to
-// avoid a race where two concurrent reads would clobber each other.
-export const advanceBgProcessCursor = (db: DB, id: string, newCursor: number): void => {
+// Stdout cursor advance — hot path on every successful `bash_output` call.
+// Single UPDATE rather than read-then-write to avoid a race where two
+// concurrent reads would clobber each other. The legacy column is named
+// `cursor_position` (predates the dual-cursor split in migration 006);
+// the public name is explicit about which stream it tracks.
+export const advanceBgProcessStdoutCursor = (db: DB, id: string, newCursor: number): void => {
   db.query(
     `UPDATE background_processes
      SET cursor_position = ?
+     WHERE id = ?`,
+  ).run(newCursor, id);
+};
+
+// Stderr cursor advance. Tracked independently so that a noisy stdout
+// can't strand stderr writes — see migration 006 for the failure mode
+// the original single-cursor model produced.
+export const advanceBgProcessStderrCursor = (db: DB, id: string, newCursor: number): void => {
+  db.query(
+    `UPDATE background_processes
+     SET stderr_cursor_position = ?
      WHERE id = ?`,
   ).run(newCursor, id);
 };

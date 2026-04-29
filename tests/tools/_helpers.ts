@@ -9,4 +9,5 @@ export const makeCtx = (overrides: Partial<ToolContext> = {}): ToolContext => ({
   sessionId: overrides.sessionId ?? 'test-session',
   stepId: overrides.stepId ?? 'test-step',
   permissions: overrides.permissions ?? defaultView(),
+  ...(overrides.bgManager !== undefined ? { bgManager: overrides.bgManager } : {}),
 });

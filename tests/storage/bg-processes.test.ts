@@ -3,7 +3,7 @@ import { openMemoryDb } from '../../src/storage/db.ts';
 import type { DB } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
-  advanceBgProcessCursor,
+  advanceBgProcessStdoutCursor,
   finalizeBgProcess,
   getBgProcess,
   insertBgProcess,
@@ -42,7 +42,8 @@ describe('bg-processes repo', () => {
     });
     expect(proc.id).toBeString();
     expect(proc.status).toBe('running');
-    expect(proc.cursorPosition).toBe(0);
+    expect(proc.stdoutCursorPosition).toBe(0);
+    expect(proc.stderrCursorPosition).toBe(0);
     expect(proc.exitedAt).toBeNull();
     expect(proc.exitCode).toBeNull();
 
@@ -105,13 +106,25 @@ describe('bg-processes repo', () => {
     expect(final.map((p) => p.label).sort()).toEqual(['a', 'b']);
   });
 
-  test('advanceBgProcessCursor updates cursor without touching other fields', () => {
+  test('advanceBgProcessStdoutCursor updates only stdout cursor', () => {
     const proc = insert({ label: 'dev' });
-    advanceBgProcessCursor(db, proc.id, 1024);
+    advanceBgProcessStdoutCursor(db, proc.id, 1024);
     const fetched = getBgProcess(db, proc.id);
-    expect(fetched?.cursorPosition).toBe(1024);
+    expect(fetched?.stdoutCursorPosition).toBe(1024);
+    expect(fetched?.stderrCursorPosition).toBe(0);
     expect(fetched?.label).toBe('dev');
     expect(fetched?.status).toBe('running');
+  });
+
+  test('advanceBgProcessStderrCursor updates only stderr cursor', async () => {
+    const { advanceBgProcessStderrCursor } = await import(
+      '../../src/storage/repos/bg-processes.ts'
+    );
+    const proc = insert({ label: 'noisy-stderr' });
+    advanceBgProcessStderrCursor(db, proc.id, 512);
+    const fetched = getBgProcess(db, proc.id);
+    expect(fetched?.stderrCursorPosition).toBe(512);
+    expect(fetched?.stdoutCursorPosition).toBe(0);
   });
 
   test('finalizeBgProcess marks exited with code and timestamp', () => {

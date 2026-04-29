@@ -64,7 +64,19 @@ describe('bootstrap', () => {
         .list()
         .map((t) => t.name)
         .sort(),
-    ).toEqual(['bash', 'edit_file', 'glob', 'grep', 'read_file', 'write_file'].sort());
+    ).toEqual(
+      [
+        'bash',
+        'bash_background',
+        'bash_kill',
+        'bash_output',
+        'edit_file',
+        'glob',
+        'grep',
+        'read_file',
+        'write_file',
+      ].sort(),
+    );
     db.close();
   });
 

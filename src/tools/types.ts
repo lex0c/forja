@@ -1,3 +1,4 @@
+import type { BgManager } from '../bg/index.ts';
 import type { PermissionsView, PolicyCategory } from '../permissions/index.ts';
 import type { ProviderToolInputSchema } from '../providers/index.ts';
 
@@ -70,6 +71,12 @@ export interface ToolContext {
   sessionId: string;
   stepId: string;
   permissions: PermissionsView;
+  // Background process manager for the current session. Optional so
+  // existing tools that don't need bg orchestration aren't forced to
+  // declare a dependency. Tools that DO need it (`bash_background`,
+  // `bash_output`, `bash_kill`) surface a clean error when absent
+  // rather than dereferencing undefined.
+  bgManager?: BgManager;
 }
 
 export interface Tool<I = unknown, O = unknown> {

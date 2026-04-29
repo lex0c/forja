@@ -49,7 +49,8 @@ export type {
 } from './repos/approvals.ts';
 
 export {
-  advanceBgProcessCursor,
+  advanceBgProcessStderrCursor,
+  advanceBgProcessStdoutCursor,
   finalizeBgProcess,
   getBgProcess,
   insertBgProcess,

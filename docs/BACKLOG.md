@@ -15,7 +15,7 @@ Format:
 
 ---
 
-## [2026-04-28] M3 / Step 2.1 (in progress) — bash_background trio + storage
+## [2026-04-28] M3 / Step 2.1 — bash_background trio + storage
 
 Opens M3 / Step 2 with the smallest cohesive slice of the
 background-process subsystem: the three execution tools
@@ -140,17 +140,236 @@ slice.
   who run with autonomous agents over flaky
   connections should expect to occasionally clean up
   manually with `pkill -P <harness-pid>` or similar.
-- **Log file disk usage.** A `npm run dev` running
-  for an hour with verbose output can produce 100+
-  MB of logs. No automatic rotation in 2.1. If this
-  bites in practice, add per-process `max_log_bytes`
-  before bumping into wait/monitor work.
+- **Log file disk usage / no gc.** Spec §7.3 says
+  "Limpo no fim da sessão (ou via /bg cleanup)" —
+  ambiguous between cleaning the PROCESSES (we do)
+  and the log FILES (we don't). Decision: keep log
+  files after session end so operators can do
+  post-mortem inspection (a `npm run dev` that
+  crashed yesterday is exactly the kind of thing
+  someone wants to read tomorrow). Trade: `.agent/bg/`
+  accumulates ~2 files per spawn forever. Pull-in
+  signals to add gc:
+    - `agent doctor` lands (M4) — natural place to
+      run `forja bg gc --older-than=7d`.
+    - Slash commands land — `/bg cleanup` per spec.
+    - A real workflow saturates disk before either —
+      add `max_log_bytes` or age-based prune as
+      hotfix.
+  The `npm run dev` + verbose-output worst-case is
+  ~100 MB/hour. Single session is bounded; cross-
+  session accumulation is the only concern, and
+  that's a non-issue until someone hits it.
 - **Multi-process race in DB updates.** Process
   exit events fire on Node's event loop; if two bg
   processes exit nanoseconds apart and both update
   the DB, SQLite's serialization handles it (we're
   WAL mode). Documented for completeness — no
   observed issue, but worth noting.
+- **Operator can't deny output reads from already-
+  spawned process.** `bash_output` and `bash_kill`
+  are category=`misc` (auto-allowed). The defense
+  in depth is at spawn time — if a spawn passes
+  policy, reading its output and killing it are
+  treated as already-approved operations. This is
+  intentional (see code comments in those tools)
+  but means a policy change mid-session won't
+  retroactively gate output reads. Pull-in signal:
+  if an operator workflow specifically wants
+  policy-gated output reads, add a category
+  `bg.read`/`bg.kill` and a corresponding
+  `tools.bash_output` / `tools.bash_kill` policy
+  section. Not blocking today.
+
+**Done:**
+
+- Migration 005 (`background_processes`) with 13 columns,
+  2 indices, FK on session_id with cascade, CHECK on
+  status enum (`running|exited|killed|failed`).
+- Repo `bg-processes.ts` exposing
+  `insertBgProcess` / `getBgProcess` / `listBgProcessesBySession`
+  (with single+array status filter) /
+  `advanceBgProcessCursor` (hot-path single UPDATE) /
+  `finalizeBgProcess` (status='exited|killed|failed') /
+  `markRunningAsKilled` (bulk session-level converge).
+- Process manager `src/bg/manager.ts` factory
+  `createBgManager({ db, sessionId, logDir })` exposing:
+  - `spawn(input)` — `Bun.spawn` with stdout/stderr piped
+    direct to `<id>.{stdout,stderr}.log` files, subscribes
+    to `proc.exited` for natural-exit DB updates
+  - `readOutput(id, { since?, maxBytes? })` — byte-cursor
+    window read with UTF-8 replace decoding (binary-safe),
+    advances persisted cursor on success, reports
+    `stdoutPending` / `stderrPending` for truncation
+  - `kill(id, { signal?, gracePeriodMs? })` — SIGTERM →
+    grace via `Promise.race` → SIGKILL escalation,
+    idempotent on already-finished processes
+  - `cleanup()` — parallel kill of every still-running
+    process for the session, plus `markRunningAsKilled`
+    DB convergence for any kill that threw
+- Three tools registered in builtin tool set
+  (`bash_background`, `bash_output`, `bash_kill`),
+  all under category `bash` so existing bash policy
+  rules apply uniformly. Tool count: 6 → 9.
+- `HarnessConfig.bgLogDir?: string` triggers
+  session-scoped manager creation inside the loop
+  (after `createSession`). Wired through
+  `ToolContext.bgManager` so the three tools dispatch
+  via closure-captured manager.
+- Outer try/finally in `runAgent` calls
+  `bgManager.cleanup()` on EVERY exit path: natural
+  done, budget exhaustion, abort, internalError.
+  Cleanup is best-effort — any thrown error is
+  swallowed so the run's `HarnessResult` stays clean,
+  and DB convergence via `markRunningAsKilled` ensures
+  no zombie audit rows even if OS kills failed.
+- CLI bootstrap auto-sets `bgLogDir = <cwd>/.agent/bg`
+  per spec §2.7 — bg works end-to-end via `forja run`
+  without operator config.
+- 51 unit tests across the subsystem: 14 (repo) +
+  20 (manager) + 17 (3 tools) = 51 new tests.
+- 3 integration tests in `tests/harness/bg-cleanup.test.ts`
+  prove the cleanup hook fires on natural exit, on
+  internalError, AND that a missing `bgLogDir`
+  produces clean `bg.manager_unavailable` errors
+  rather than crashes.
+- Regression case `36-bash-background-flow.yaml`
+  exercises the full spawn→read→exit cycle. Validated
+  1/1 on both Haiku 4.5 ($0.008, 4.8s) and gpt-4o-mini
+  ($0.0006, 6.7s).
+- Regression case `37-bg-output-kill-under-strict-policy.yaml`
+  exercises the full bg flow under `defaults.mode: strict`
+  with `tools.bash.allow: ['*echo*']` — proves operator
+  policy works end-to-end (spawn passes via bash policy,
+  bash_output/bash_kill pass via misc category).
+  Validated 1/1 on Haiku ($0.013, 5.5s).
+
+**Code review fixes applied before commit:**
+
+The first draft had three bugs surfaced by review:
+
+1. **Critical — `bash_output` and `bash_kill` denied
+   under non-bypass policy.** Both were `category: 'bash'`,
+   which routes through `checkBash` which requires
+   `args.command`. Neither tool has that arg. Result:
+   under any strict / acceptEdits policy, both default-
+   denied. Fix: switched to `category: 'misc'` —
+   spawn-time was already gated, reading/killing a
+   previously-approved process opens no new attack
+   surface. Documented the operator-gating gap in
+   risks.
+2. **Critical — single cursor lost stderr writes when
+   stdout outpaced stderr.** Trace: stdout 50B,
+   stderr 1B → cursor advances to 50 → next stderr
+   read uses start=50, stderr_total=2 → returns empty
+   forever (or skips intermediate bytes if stderr
+   later exceeds 50). Fix: migration 006 adds
+   `stderr_cursor_position`, manager reads two
+   independent windows, repo exposes
+   `advanceBgProcessStdoutCursor` /
+   `advanceBgProcessStderrCursor`, tool surface
+   exposes `since_stdout` / `since_stderr` and returns
+   `stdout_cursor` / `stderr_cursor` separately.
+   Regression test pins the specific failure mode
+   (50B stdout + delayed stderr writes both before
+   AND after first read).
+3. **Critical — engine looked up bash policy by tool
+   name, not category.** `bash_background` would never
+   match `tools.bash.allow` rules — the engine called
+   `lookupRules('bash_background', ...)` instead of
+   `lookupRules('bash', ...)`. Operators writing the
+   spec-correct `tools.bash.allow: ['npm *']` would
+   find every `bash_background` denied. Fix:
+   `policySectionFor()` collapses every
+   bash-category tool to `tools.bash`. fs.* and
+   web.fetch keep their per-tool sections (read_file's
+   allow_paths is naturally distinct from
+   write_file's). Surfaced by the failing case 37
+   smoke; tightening engine logic was the right
+   fix, not duplicating policy sections in user
+   YAML.
+
+Robustness / minor polish:
+
+- Exit handler IIFE wrapped in try/finally so
+  `live.delete(id)` always runs even when DB throws.
+  Inner DB operations have their own try/swallow so
+  a thrown error doesn't reject the stored Promise
+  (kill/cleanup await it).
+- Cleanup grace tightened: per-call kill keeps 5s
+  default (operator-initiated, can wait), session-end
+  cleanup uses 2s. Prevents 5s × N latency at exit
+  for a session with many SIGTERM-ignoring processes.
+
+**Decisions taken (not in opener):**
+
+- **`bgManager` is owned by the harness loop, not by
+  config.** Spec §13 has bg processes carrying a
+  `session_id` FK, and `sessionId` is generated by
+  `createSession` inside the loop. A pre-built manager
+  passed via config would have stale or null
+  sessionId. Solution: `HarnessConfig.bgLogDir`
+  declares intent ("enable bg, here's where logs
+  go"); the loop instantiates the manager lazily
+  after `createSession`. Ownership = lifecycle;
+  cleanup runs in the same try/finally that owns the
+  session.
+- **Tools surface a clean `bg.manager_unavailable`
+  when ctx lacks the manager.** Three writes to
+  `ToolError`-shape rather than throwing. Lets the
+  model see "this capability isn't configured" and
+  pick a different approach (use plain `bash`
+  instead). Tested explicitly.
+- **Cross-session id rejection.** Manager bound to
+  session A throws `not in this session: <id>` if
+  asked about a process from session B. Defensive —
+  the DB is shared, so an attacker-supplied id from
+  another session would otherwise leak output.
+- **Output read is single-cursor on stdout.** Spec
+  §7.3 calls for `bash_output(process_id, since?)` —
+  one cursor. We read the same window from both
+  stdout and stderr; if stderr lags, the next call
+  catches it up. Asymmetric per-stream cursors
+  would be more general but isn't what the spec
+  specifies, and would complicate the audit trail.
+- **`exitCode` recorded even on killed processes.**
+  Useful diagnostic — kill via SIGTERM reports 143,
+  SIGKILL reports 137. Distinguishing "operator
+  killed cleanly" from "kernel had to escalate" is
+  visible without log file inspection.
+
+**Cut (out of 2.1, deferred with rationale):**
+
+- **`wait_for` / `monitor` primitives (§7.3.1).**
+  Step 2.2. The model can poll via repeated
+  `bash_output` today — costs more LLM steps but
+  works end-to-end. Spec acknowledges the cost
+  difference (~$0.40 polling vs ~$0.10 with
+  `wait_for`). 2.1 ships the baseline; 2.2 adds the
+  optimization layer.
+- **`<BackgroundProcessTray>` UI.** Tray waits for
+  Ink work in M3/M4. Status visible today via
+  `bash_output` (model view) and `background_processes`
+  table (audit view).
+- **`/bg cleanup` slash command.** Slash commands
+  not implemented. Session-end cleanup covers the
+  primary case; orphaned-from-prior-crash cleanup
+  waits for slash command surface.
+- **Per-process `max_log_bytes`.** No log rotation
+  in 2.1. Listed as a documented risk. Add when a
+  real workflow saturates disk.
+
+**Pending (M3 next steps after Step 2):**
+
+- Step 2.2 — `wait_for` primitive (`sleep`,
+  `file_exists`, `file_change`, `port_open`,
+  process-aware conditions on top of 2.1's manager).
+- Step 2.3 — `monitor` primitive (streaming
+  observation), `http_response` wait condition,
+  composition (`all_of` / `any_of`).
+- After Step 2: pick the next subsystem from M3
+  scope (subagents, MCP, checkpoints+`/undo`,
+  `todo_write`, Repo Map).
 
 ---
 
