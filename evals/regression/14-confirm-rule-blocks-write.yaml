@@ -1,0 +1,21 @@
+name: confirm rule without UI blocks the write
+prompt: |
+  Use the write_file tool to create `output.txt` with the single-line content
+  `should not land`. Report whatever the tool returns, even if it's an error.
+  Do NOT retry under a different name, do NOT switch to a different tool.
+setup:
+  files:
+    .agent/permissions.yaml: |
+      defaults:
+        mode: strict
+      tools:
+        write_file:
+          confirm_paths:
+            - '**'
+expect:
+  - tool_called: write_file
+  - file_not_exists: output.txt
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

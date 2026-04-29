@@ -1,0 +1,16 @@
+name: multi-tool flow — glob then read first match
+prompt: |
+  First use the glob tool to find every `.ts` file under the working
+  directory. Then pick the file whose name comes first alphabetically and
+  use read_file to read its full contents. Reply with the exact source code
+  of that file, nothing else.
+setup:
+  fixture: ../fixtures/nested-tree
+expect:
+  - tool_called: glob
+  - tool_called: read_file
+  - output_contains: export function alpha
+  - status: done
+budget:
+  maxSteps: 6
+  maxCostUsd: 0.10

@@ -1,0 +1,20 @@
+name: bash.allow lets a matching command through
+prompt: |
+  Use the bash tool to run `echo hello-from-policy`. Set `read_only: true`.
+  Reply with the exact output of the command, nothing else.
+setup:
+  files:
+    .agent/permissions.yaml: |
+      defaults:
+        mode: strict
+      tools:
+        bash:
+          allow:
+            - 'echo *'
+expect:
+  - tool_called: bash
+  - output_contains: hello-from-policy
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

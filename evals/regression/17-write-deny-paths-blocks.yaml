@@ -1,0 +1,24 @@
+name: write_file deny_paths blocks writes under sensitive prefix
+prompt: |
+  Use the write_file tool to create `secrets/leak.txt` with the single line
+  `oops`. Report whatever the tool returns. Do NOT retry under a different
+  path, do NOT switch tools.
+setup:
+  files:
+    .agent/permissions.yaml: |
+      defaults:
+        mode: acceptEdits
+      tools:
+        write_file:
+          allow_paths:
+            - '**'
+          deny_paths:
+            - 'secrets/**'
+expect:
+  - tool_called: write_file
+  - tool_denied: write_file
+  - file_not_exists: secrets/leak.txt
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

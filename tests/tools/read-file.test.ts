@@ -122,4 +122,49 @@ describe('readFileTool', () => {
     expect(isToolError(out)).toBe(true);
     if (isToolError(out)) expect(out.error_code).toBe('tool.aborted');
   });
+
+  // Validation parity: schema declares offset minimum: 0 and
+  // limit minimum: 1; runtime must enforce. Negative or fractional
+  // values land in line-slice math; limit=0 returns empty content
+  // with confusing pending semantics.
+  test('rejects negative offset', async () => {
+    writeFileSync(join(dir, 'a.txt'), 'x\n');
+    const out = await readFileTool.execute({ path: 'a.txt', offset: -1 }, makeCtx({ cwd: dir }));
+    if (!isToolError(out)) throw new Error('expected error');
+    expect(out.error_code).toBe('tool.invalid_arg');
+    expect(out.error_message).toContain('offset');
+  });
+
+  test('rejects non-integer offset', async () => {
+    writeFileSync(join(dir, 'a.txt'), 'x\n');
+    const out = await readFileTool.execute({ path: 'a.txt', offset: 1.5 }, makeCtx({ cwd: dir }));
+    if (!isToolError(out)) throw new Error('expected error');
+    expect(out.error_code).toBe('tool.invalid_arg');
+  });
+
+  test('rejects limit below 1', async () => {
+    writeFileSync(join(dir, 'a.txt'), 'x\n');
+    const out = await readFileTool.execute({ path: 'a.txt', limit: 0 }, makeCtx({ cwd: dir }));
+    if (!isToolError(out)) throw new Error('expected error');
+    expect(out.error_code).toBe('tool.invalid_arg');
+    expect(out.error_message).toContain('limit');
+  });
+
+  test('rejects non-numeric limit', async () => {
+    writeFileSync(join(dir, 'a.txt'), 'x\n');
+    const out = await readFileTool.execute(
+      // biome-ignore lint/suspicious/noExplicitAny: testing invalid input shape
+      { path: 'a.txt', limit: 'abc' as any },
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected error');
+    expect(out.error_code).toBe('tool.invalid_arg');
+  });
+
+  test('accepts offset=0 boundary', async () => {
+    writeFileSync(join(dir, 'a.txt'), 'hello\n');
+    const out = await readFileTool.execute({ path: 'a.txt', offset: 0 }, makeCtx({ cwd: dir }));
+    if (isToolError(out)) throw new Error(`unexpected: ${out.error_message}`);
+    expect(out.content).toContain('hello');
+  });
 });

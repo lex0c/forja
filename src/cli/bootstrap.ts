@@ -1,3 +1,4 @@
+import { join } from 'node:path';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
 import { type LockConflict, createPermissionEngine, resolvePolicy } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/index.ts';
@@ -119,12 +120,20 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     resolvedSystemPrompt = input.systemPrompt;
   }
 
+  // Background-process log directory. Lives under `.agent/bg/`
+  // alongside the DB (spec §2.7). The harness creates it on first
+  // spawn; we just declare the path here so the manager knows where
+  // to put log files. Per-cwd: a worktree's bg processes don't
+  // collide with the parent repo's.
+  const bgLogDir = join(cwd, '.agent', 'bg');
+
   const config: HarnessConfig = {
     provider,
     toolRegistry,
     permissionEngine,
     db,
     cwd,
+    bgLogDir,
     userPrompt: input.prompt,
     ...(input.budget !== undefined ? { budget: input.budget } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),

@@ -15,6 +15,2558 @@ Format:
 
 ---
 
+## [2026-04-29] hardening: bash tool abort handling + SIGKILL escalation
+
+Surface-level claim corrected by evidence. Initial analysis said
+"`ctx.signal` doesn't thread to bash subprocess during exec" — a
+quick standalone test (`bun run` calling `Bun.spawn` with
+`signal: ctrl.signal`) showed Bun honors signal natively and kills
+in ~100ms with SIGTERM. Lesson: don't claim a gap by reading code
+alone; verify with a runnable repro. Logged as a meta-lesson
+worth folding into CODER_PLAYBOOK §6 (test completeness).
+
+**Real gaps that DID exist:**
+
+1. **No SIGKILL escalation.** Bun.spawn's signal handler sends
+   SIGTERM only. A child with `trap "" TERM` (or any unresponsive
+   process) would survive caller abort indefinitely.
+2. **Misleading terminal classification.** When ctx.signal aborted
+   mid-exec, the tool returned `{ exit_code: 143, timed_out: false }`
+   — looking like a successful run that returned 143. The model
+   would mis-route on this, treating cancellation as a result.
+3. **Orphaned-children pipe block.** When `bash` itself dies but
+   spawned a child holding stdout (e.g. `bash -c 'sleep 60 &'`),
+   the orphan keeps the pipe fd open. Stream reads block until the
+   orphan exits naturally — abort returns ~60s late despite the
+   bash process being long dead.
+
+**Fix:**
+
+- `src/tools/builtin/bash.ts` — explicit abort listener on
+  `ctx.signal` schedules a SIGKILL fallback after 5s grace
+  (mirrors `bg/manager`'s `DEFAULT_KILL_GRACE_MS`). The timeout
+  path keeps its existing 2s grace (timeouts are already a "ran
+  too long" signal — no reason to extend).
+- After exec, if `ctx.signal.aborted` was observed during the
+  call, return `tool.aborted` instead of letting the bare
+  `exit_code` slip through. Audit log + model both see the
+  cancellation explicitly.
+- `readCapped` accepts an optional `stopSignal`. The bash tool
+  fires it via `proc.exited.then(() => readStopAc.abort())` so
+  pending stream reads cancel as soon as the bash process itself
+  dies, not when orphaned children eventually release the pipe.
+
+**Tests:**
+
+- `caller abort mid-exec returns tool.aborted` — abort during
+  `sleep 5`, asserts elapsed < 1s and error_code === 'tool.aborted'.
+- `SIGKILL escalation when child ignores SIGTERM (timeout path)` —
+  `trap "" TERM; while true; do sleep 0.1; done` with timeout=200ms;
+  asserts elapsed in [2s, 4s] window, proving SIGKILL fired after
+  the 2s grace (without escalation, would hang forever).
+
+**Verification:** `bun test` 843 pass / 7 skip / 0 fail (+2 new
+tests); `tsc --noEmit` clean; `biome check` clean.
+
+**Removed from TODO.md** (`bash tool: thread ctx.signal to the
+running subprocess` — done, not deferred).
+
+---
+
+## [2026-04-29] M3 / Step 2.2 — defense-in-depth: wait/monitor wall-clock cap
+
+After the security review that produced the per-leaf policy gate,
+walked the recommended hardening list. Findings recorded here.
+
+**Done — wait_for / monitor wall-clock cap (30min):**
+
+The harness's `maxWallClockMs` (default 10min) is the canonical
+upper bound on any tool, but operators that bump the harness cap
+for long-running builds re-open the gap: a model declaring
+`timeout_ms: 86400000` (24h) under a generous harness cap would
+pin a tool slot for the full window. Per-tool cap of 30min is
+generous for any real probe (build watches, dev-server readiness,
+slow integration paths) and conservative against the pathological
+case.
+
+- `src/tools/builtin/wait-for.ts` — `MAX_WAIT_MS = 30 * 60 * 1000`
+  enforced on `args.timeout_ms` AND on `sleep`'s `duration_ms`
+  (otherwise `sleep` is bounded only by `timeout_ms`, which now
+  has the cap, but the explicit check fails fast on a clearly
+  bogus sleep).
+- `src/tools/builtin/monitor.ts` — `MAX_DURATION_MS` mirrored
+  on `args.duration_ms`.
+- 3 regression tests added (one per site). Error messages cite
+  "30min" so operators reading audit logs see the cap by name.
+
+**Audited but no change needed:**
+
+- `src/permissions/matcher.ts` — symlink resolution via
+  `realpathSync` is ALREADY in place (lines 14-24), with a clean
+  fallback for non-existent paths (realpath the parent + join
+  basename). Test coverage in `tests/permissions/symlink.test.ts`.
+  My initial security assessment underestimated this surface —
+  defense-in-depth is stronger than I credited.
+- `src/wait/monitor.ts:257,613` and `src/harness/loop.ts:229,287,384`
+  — `X.fired ? 'X' : 'aborted'` patterns. These are 2-source
+  binary decisions (duration timer / wall-clock timer vs caller
+  signal). They do NOT have a third "deterministic no-match"
+  terminal that the wait_for bug exhibited, so the same
+  fall-through-aborted bug doesn't apply. Documented as audited
+  in the playbook §2 follow-up.
+- `src/tools/builtin/bash.ts` — `timedOut` flag is set explicitly
+  by the timer, no ambiguity with caller abort. Separate gap:
+  `ctx.signal.aborted` mid-exec doesn't thread to `proc.kill()`,
+  so a harness-level abort during a long bash leaves the child
+  running. Logged as a follow-up in TODO.md (out of scope here).
+
+**Verification:** `bun test` 841 pass / 7 skip / 0 fail (+3 new
+cap tests); `tsc --noEmit` clean; `biome check` clean.
+
+---
+
+## [2026-04-29] M3 / Step 2.2 — security fix: per-leaf policy gate on wait_for / monitor
+
+**Bug:** `wait_for` and `monitor` are `category='misc'` (the harness's
+`engine.check` returns `allow` for misc), but their leaf conditions
+DO touch resources governed by existing policy sections:
+- `file_exists` / `file_change` / `file_changes` — fs.read
+  (`tools.read_file` allow_paths / deny_paths).
+- `http_response` — web.fetch (`tools.fetch_url` allow_hosts /
+  deny_hosts).
+- `port_open` — same as above (host-based).
+
+In a strict / locked deployment that configures
+`tools.fetch_url` and `tools.read_file` to restrict access, a model
+could still use `wait_for` to probe arbitrary internal URLs or
+sensitive absolute paths, because no per-condition policy check
+ran before execution. Identical exposure on `monitor`'s
+`file_changes` condition.
+
+**Fix:** the tools self-gate each leaf condition before dispatch.
+- `ToolContext` adds an optional `permissionCheck(toolName,
+  category, args) → Decision` predicate.
+- The harness loop (`src/harness/loop.ts`) wires it as a thin
+  delegate over `permissionEngine.check`.
+- `src/tools/builtin/wait-for.ts` adds `checkLeafPolicies(cond,
+  ctx)` that walks the (possibly composed) condition tree and
+  calls the predicate per gated leaf:
+    - `file_exists` / `file_change` → `(read_file, fs.read, {path})`
+    - `http_response` → `(fetch_url, web.fetch, {url})`
+    - `port_open` → `(fetch_url, web.fetch, {url: 'http://host:port'})`
+      — synthesizes an http URL so the engine extracts the
+      hostname for allow_hosts/deny_hosts matching. Port is
+      informational; FetchPolicy is host-based today.
+    - `process_exit` / `process_output` → NOT re-gated; the
+      process was authorized at spawn time via tools.bash.
+    - `sleep` → no gate (no resource access).
+- `src/tools/builtin/monitor.ts` adds the same gate for
+  `file_changes` (process_output_* leaves are not re-gated).
+- New error code `permission.denied` (in `ERROR_CODES`) for
+  leaf-level denies. Distinct from the harness-level deny
+  (which uses `tool_decided` event).
+
+**Decisions:**
+- `confirm` decisions also block at leaves — the leaf has no UI
+  surface to escalate a per-condition prompt. Operators that want
+  a leaf-only confirm flow can configure deny rules instead.
+- `permissionCheck` is REQUIRED on ToolContext (not optional).
+  Initial cut made it optional with fall-through-allow to keep
+  test changes minimal — but the same default-convenience
+  anti-pattern documented in `CODER_PLAYBOOK §2.1` and §8 would
+  silently re-introduce the bypass any time a future entrypoint
+  constructs a ToolContext without going through the harness
+  loop. Tightening to required forces type errors at every
+  construction site (currently two: harness loop + test helper).
+  The test helper provides a default allow-all predicate so
+  non-gating tests stay terse; tests exercising deny paths
+  override.
+- Reuse existing policy sections (`tools.read_file`,
+  `tools.fetch_url`) rather than introducing new wait_for /
+  monitor sections — operators that already lock down read_file
+  inherit the same allowlist for probes. Fewer dials to keep in
+  sync.
+
+**Done:**
+- `src/tools/types.ts` — ToolContext.permissionCheck +
+  ERROR_CODES.permissionDenied.
+- `src/harness/loop.ts` — wires the callback.
+- `src/tools/builtin/wait-for.ts` — checkLeafPolicies + call
+  site before waitFor dispatch.
+- `src/tools/builtin/monitor.ts` — checkLeafPolicy for
+  file_changes.
+- `tests/tools/_helpers.ts` — makeCtx now spreads
+  permissionCheck overrides (was silently dropped before).
+- `tests/tools/wait-for.test.ts` — 6 new tests covering deny on
+  http_response / port_open / file_exists, composition deny,
+  process_* skip, allow happy path.
+- `tests/tools/monitor.test.ts` — 2 new tests for file_changes
+  deny + process_output_lines skip.
+
+**Why:** principle 6 (explicit trust) — when two policy sections
+already encode operator intent for fs/network access, a third
+tool that performs the same operations must respect those rules.
+A "we'll add wait_for-specific rules later" approach drifts from
+sibling parity (Coder Playbook §4.1).
+
+**Verification:** `bun test` 838 pass / 7 skip / 0 fail (+8 new
+tests); `tsc --noEmit` clean; `biome check` clean.
+
+---
+
+## [2026-04-29] docs — Coder Playbook (`docs/CODER_PLAYBOOK.md`)
+
+Consolidates the recurring bug patterns found across M2/M3 reviews
+into a runtime knowledge artifact for the Forja agent (and humans
+reviewing PRs).
+
+**Source material:** every entry derives from a real bug fixed in
+this repo's history — categorized by the post-mortem after Step 2.2
+plus the three sibling-cancel / no-match-terminal fixes that landed
+right after.
+
+**Sections:**
+1. Async control flow (Promise.all leaks, AbortSignal cascades,
+   real-error-vs-synthetic-rejection in Promise.any).
+2. Terminal classification (`aborted` is not the catch-all;
+   distinct outcomes need distinct labels).
+3. Concurrency on shared state (DB-level monotonic guards;
+   transient overrides; runtime validation of schema constraints).
+4. Sibling parity (validation, path resolution, convention seams,
+   route-by-category).
+5. Boundary handling (drain-before-end, overlap windows, bounded
+   buffers).
+6. Test completeness (assert the terminal label, not just the
+   boolean; tests as regression markers).
+7. Schema/SELECT discipline (column-add audit, `replace_all`
+   pitfalls).
+8. The meta-pattern (defaults that are convenient but wrong, and
+   the audit reflex after N occurrences of the same class).
+
+**Why a playbook and not just spec entries:** the spec describes
+WHAT each subsystem does. The playbook describes HOW to write code
+that doesn't regress the bugs we already paid for. Different
+audience, different access pattern — the agent reads this when
+deciding HOW to implement, not WHAT to implement.
+
+**Pending:** none — file is self-contained. Future bug-class
+discoveries should append a new entry to the matching section
+rather than start a new doc.
+
+---
+
+## [2026-04-29] M3 / Step 2.2 — post-review fix: all_of sibling leak on sub-throw
+
+Code review follow-up after Step 2.2 was reportedly closed. Single
+🟡 bug found and fixed; symmetrical 🟢 issues documented as
+deliberate decisions.
+
+**Bug:** in `src/wait/index.ts`, `all_of` orchestration awaited
+`Promise.all(tracked)` without intercepting rejections. When a
+sub threw a real error (e.g. `process_exit` against an unknown
+process_id, which throws `bg process not found` synchronously
+on first poll), `Promise.all` rejected immediately. The outer
+`finally` only removed the outer-abort listener — `subAc` was
+never aborted, so sibling sub-waits kept polling until their
+own (outer) timeouts fired. Net effect: timer + signal-listener
+leak past the function's return; observable as a 5s wait
+instead of <100ms when one sub failed fast.
+
+**Fix:** wrap `Promise.all(tracked)` in try/catch:
+1. `subAc.abort()` — cancel siblings.
+2. `await Promise.allSettled(subPromises)` — drain so we don't
+   return before children clean up timers / handlers.
+3. `timeout.cleanup()` — outer timer.
+4. Re-throw original error.
+
+Regression test: `tests/wait/composition.test.ts` — all_of with
+[file_exists never-appears, process_exit bad-id] under
+bgManager. Asserts both the throw propagates AND elapsed < 500ms
+(proving siblings were cancelled, not waited out).
+
+**Non-fix (race semantics, deliberate):** in `any_of`, when a
+winner emerges, errors thrown by losing siblings are silently
+dropped. Considered briefly as "asymmetric error visibility"
+but rejected: race contract is "first success wins, others
+become irrelevant" — surfacing losing-sibling errors after a
+success would break the success contract for noise. Real errors
+are still surfaced when EVERY sub rejects (the existing
+AggregateError → realError path). Comment in code documents
+this as intentional.
+
+**Done:**
+- `src/wait/index.ts` — try/catch around all_of's Promise.all,
+  abort+drain on rejection (lines ~467 onward).
+- Comment update in any_of's allSettled block — documents the
+  losing-sibling-error drop as deliberate race semantics.
+- `tests/wait/composition.test.ts` — regression test for
+  sibling-cancellation timing.
+
+**Why:** principle 9 (reversible by design) requires that a
+failed orchestration doesn't leave background polling loops
+holding signal listeners. The leak was bounded by the outer
+timeout (so not unbounded), but it violated the "wait_for
+returns when its decision is made, not later" contract.
+
+**Verification:** `bun test` 828 pass / 7 skip / 0 fail;
+`tsc --noEmit` clean; `biome check` clean.
+
+### Follow-up: `process_output` mis-reports normal exit as `aborted`
+
+Second 🟡 caught right after committing the all_of fix.
+
+**Bug:** in the `process_output` drain block, when the process
+exits without matching, the no-match return went through
+`finishUnmatched(...)`. That helper picks `conditionMet` from
+`timeout.timeoutFired() ? 'timeout' : 'aborted'`. With a generous
+outer timeout (e.g. 5s) and a process that finishes in ~100ms,
+the timeout hadn't fired → `conditionMet='aborted'` despite no
+abort signal being raised. Workflows that branch on
+`conditionMet==='aborted'` (treating it as a user/system cancel)
+would terminate prematurely on a normal process completion.
+
+**Fix:** add `'process_exited'` to the `WaitConditionMet` union
+and return it explicitly from the drain block (bypassing
+`finishUnmatched`'s aborted/timeout dichotomy). Mirrors the
+`MonitorReason='process_exited'` already used by `monitor.ts`,
+keeping the two primitives' vocabulary aligned. Tool surface
+relays the value via `condition_met` automatically — the type
+re-export carries the new variant.
+
+**Done:**
+- `src/wait/index.ts` — `WaitConditionMet` adds `'process_exited'`;
+  drain-block return uses it explicitly with `timeout.cleanup()`.
+- `tests/wait/process.test.ts` — existing test for
+  `processExited in payload` now also asserts
+  `conditionMet === 'process_exited'`. Comment explains the
+  prior buggy behavior so future regressions are caught.
+
+**Why:** principle 7 (trace everything). The conditionMet field
+is the trace primitive that downstream code reads to decide
+"why did the wait end?". Conflating "process finished" with
+"someone aborted me" corrupts that trace and propagates wrong
+decisions into hooks, recap, audit.
+
+**Verification:** `bun test` 828 pass / 7 skip / 0 fail;
+`tsc --noEmit` clean; `biome check` clean.
+
+### Follow-up: composition no-match also mis-reports as `aborted`
+
+Same root cause as the `process_output` follow-up, one level up
+in the composition layer.
+
+**Bug:** in `src/wait/index.ts`, both branches of the composition
+handler returned `finishUnmatched(...)` for deterministic
+no-match outcomes:
+- `any_of` — every sub resolved with `matched=false` before the
+  outer timeout (e.g. multiple `process_output` subs whose
+  processes exited without matching).
+- `all_of` — a sub returned `matched=false` and triggered the
+  short-circuit (e.g. one `process_output` sub exited).
+In both cases, `timeout.timeoutFired()` is false and no caller
+abort happened, so `finishUnmatched` defaults to
+`conditionMet='aborted'`. Workflows branching on
+`conditionMet==='aborted'` (treating it as a user/system cancel)
+prematurely terminated on a deterministic composition outcome.
+
+**Fix:** new helper `finishUnmatchedComposition(kind, payload)`
+with priority `outer timeout > caller abort > kind`. Both
+composition no-match paths now use it. The `WaitConditionMet`
+union already includes `'all_of'` / `'any_of'` (previously only
+emitted on match) — it now also signals "composition resolved
+deterministically without a match", symmetric with how
+`finishMatched` uses the same kind.
+
+**Decision:** outer timeout still wins over kind. If the outer
+timeout fires *while* a composition is being resolved (e.g.
+during the inter-poll sleep), the wait was effectively cut
+short — `'timeout'` is the more specific signal. Same for
+caller abort. The kind label is reserved for "every sub ran to
+its own conclusion before the outer signal fired".
+
+**Done:**
+- `src/wait/index.ts` — adds `finishUnmatchedComposition`,
+  rewires `any_of` no-winner block + `all_of` firstFail block
+  to use it. Comments explain the distinction.
+- `tests/wait/composition.test.ts` — two regression tests:
+  `all_of: deterministic sub-failure reports kind, not aborted`
+  and `any_of: every sub deterministically fails reports kind,
+  not aborted`. Both use `process_output` against a process
+  that exits early to produce the deterministic-fail signal.
+
+**Why:** principle 7 (trace everything), principle 8 (failure
+modes are first-class). `aborted` and `timeout` both mean "the
+wait did not run to its natural conclusion". A composition
+that ran every sub to completion DID reach a conclusion — the
+trace primitive must reflect that.
+
+**Verification:** `bun test` 830 pass / 7 skip / 0 fail;
+`tsc --noEmit` clean; `biome check` clean.
+
+---
+
+## [2026-04-29] M3 / Step 2.2.4 — monitor (streaming observation, closes Step 2.2)
+
+Closes Step 2.2 with the streaming-observation half of spec
+§7.3.1: a `monitor` tool that collects events over a duration
+and returns the batch when the budget is exhausted. Distinct
+from `wait_for` (which stops at first match): the model gets
+a list of events, not a binary matched/no-match.
+
+Use cases the spec calls out: tail logs for warnings/errors
+across a build, watch a file tree for compilation output,
+collect every line a dev server emits during startup.
+
+**Slice scope (2.2.4):**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/wait/monitor.ts` | NEW | `monitor(condition, opts)` primitive. Polls per-condition, accumulates events, terminates on durationMs / maxEvents / abort / process_exited |
+| Condition `process_output_lines` | NEW | Each newline-delimited line in stdout/stderr is an event. Partial-line buffering across poll boundaries |
+| Condition `process_output_pattern` | NEW | Each regex match (multi-match via /g) is an event. Tool layer compiles user pattern with /g — opposite of wait_for which rejects /g |
+| Condition `file_changes` | NEW | Each mtime change on a single path is an event. Glob expansion deferred (single path only for v1) |
+| Tool `monitor` | NEW | Separate from wait_for — different return shape. category=misc, planSafe=true. Tool count 10 → 11 |
+| Tests | NEW | tests/wait/monitor.test.ts + tests/tools/monitor.test.ts |
+
+**Decisions to make explicit upfront:**
+
+- **`monitor` is a separate tool, not a `wait_for` extension.**
+  Return shape is fundamentally different (events array
+  vs single match). Sharing the wait_for tool would force
+  a discriminated union on the OUTPUT shape which models
+  consume — confusing for the LLM and asymmetric in the
+  schema. Two tools with crisp single-purpose surfaces.
+- **`/g` flag IS used internally for pattern matching.**
+  For `process_output_pattern`, we need ALL matches in a
+  chunk, not just the first. `String.matchAll` requires
+  /g. Tool layer compiles user pattern with /g (opposite
+  of wait_for's `process_output` which rejects /g — there
+  we used `RegExp.exec` once and /g would carry
+  lastIndex state across calls breaking the per-poll
+  re-read pattern). Different primitive, different
+  constraint.
+- **Observational reads, same as wait_for.** Uses
+  `manager.readOutput` with explicit `sinceStdout`/
+  `sinceStderr` so the model's persisted cursor stays
+  untouched. A subsequent canonical `bash_output` sees
+  the SAME bytes the monitor collected.
+- **Single path for `file_changes`, no glob.** Spec
+  mentions glob; v1 supports a single absolute or
+  relative-to-ctx.cwd path. Glob expansion needs a
+  watcher across multiple files (chokidar-style), which
+  reopens the polling-vs-native-watcher decision from
+  Step 2.2.1. Defer until a real workflow surfaces it.
+- **Termination reasons enumerated.** `'duration'` (the
+  durationMs cap fired), `'max_events'` (event count
+  reached the cap), `'aborted'` (caller signal),
+  `'process_exited'` (process_* conditions only —
+  monitor stops when the source process is gone).
+- **Empty pattern list / no events is a valid result.**
+  `monitor` returns `{ events: [], reason: 'duration' }`
+  when nothing matched. Not an error. The model decides
+  what to do with empty observations.
+- **Process_* events drain on exit.** Same lesson from
+  Step 2.2.2's drain fix: when a process exits with
+  pending bytes, scan the tail before terminating.
+  Pattern matches in the tail still produce events.
+
+**Out of scope (deferred):**
+
+- **Glob in `file_changes`.** Pull-in: when a workflow
+  needs "watch every TS file under src/".
+- **Per-line max length cap.** A pathological process
+  emitting a 10MB single line (no \n) would buffer
+  indefinitely. Default `readOutput` maxBytes (64KB)
+  caps per-poll growth; a separate cap on accumulated
+  buffer would be a real defense. Pull-in: if a
+  workflow surfaces it.
+- **Event ordering across streams.** Events from
+  stdout and stderr are interleaved by poll round, not
+  by their ACTUAL emission timestamps (we don't have
+  per-byte timestamps from the kernel). Documented as
+  a risk — the events list is approximately ordered.
+
+**Spec reference:** `AGENTIC_CLI.md §7.3.1` (monitor
+clauses), `src/wait/index.ts` (sibling primitive).
+
+**Done:**
+
+- `src/wait/monitor.ts` — `monitor(condition, opts)`
+  primitive. Polls per-condition, accumulates events,
+  terminates on durationMs / maxEvents / abort /
+  process_exited. Sibling to waitFor; lives in the
+  same module barrel.
+- 3 condition kinds:
+  - `process_output_lines` — newline-delimited lines
+    from bg stdout/stderr. Partial-line buffer carried
+    across polls; `\r\n` normalized to `\n`. On
+    process exit, drains any unterminated tail as a
+    final event with `partial: true`.
+  - `process_output_pattern` — every match (multi-
+    match via /g via `String.matchAll`) becomes an
+    event. The compiled RegExp ALWAYS has /g —
+    opposite of wait_for's `process_output` which
+    rejects /g (different primitive, different
+    constraint).
+  - `file_changes` — every mtime change on a single
+    path. Glob deferred (single path only for v1).
+- Termination reasons enumerated:
+  `'duration'` / `'max_events'` / `'aborted'` /
+  `'process_exited'`. The result also carries
+  `processStatus` and `processExitCode` (when
+  applicable) so the model knows whether the source
+  process is still running on duration-termination
+  vs already exited.
+- Observational reads via `manager.readOutput` with
+  explicit `sinceStdout`/`sinceStderr` — model
+  cursor untouched. Test pins this contract: a
+  monitor call leaves the cursor at 0; subsequent
+  canonical `bash_output` sees the same content the
+  monitor observed.
+- `monitor` tool (`src/tools/builtin/monitor.ts`):
+  - `category: 'misc'`, `planSafe: true` —
+    observational, same as wait_for.
+  - Schema mirrors monitor input shape with
+    snake_case fields. Pattern is string + is_regex
+    (default false → literal escape). Both modes
+    compile with /g.
+  - `file_changes.path` resolves against `ctx.cwd`;
+    `..` segments rejected (same as wait_for's
+    file_exists / file_change).
+  - `bgManager` validation walks the condition: any
+    `process_output_*` requires it; missing manager
+    → `bg.manager_unavailable`. Unknown / cross-
+    session process_id → `bg.process_not_found`
+    (uniform with bash_output / wait_for).
+- Tool count: 10 → 11. Bootstrap test updated.
+- 17 unit tests in `tests/wait/monitor.test.ts`:
+  every-line capture, stream separation, observational
+  contract, max_events termination, duration
+  termination with `processStatus: 'running'`,
+  trailing partial-line drain on exit, every-regex-
+  match collection, max_events=1 short-circuit,
+  process_exited payload, file_changes (changes +
+  no-changes), abort signal handling (mid + pre-
+  aborted), bgManager validation (process_* requires
+  it, file_changes doesn't), unknown id throws.
+- 12 tool tests in `tests/tools/monitor.test.ts`:
+  end-to-end happy paths for all 3 conditions,
+  literal vs is_regex, ctx.cwd path resolution,
+  validation (unknown kind / empty pattern / invalid
+  regex / `..` / negative duration), bg manager
+  dependency (`bg.manager_unavailable`,
+  `bg.process_not_found`, file_changes works without
+  manager).
+- Total: 812 pass / 7 skip / 0 fail. Typecheck +
+  lint green.
+
+**Decisions taken (not in opener):**
+
+- **Tighter default poll interval (200ms vs
+  wait_for's 500ms).** monitor is generally observing
+  rapidly-changing state (logs flowing, files being
+  written by a build). 500ms felt sluggish for that
+  use case. Configurable via `pollIntervalMs`.
+- **Default `maxEvents = 100`.** A bounded cap so the
+  payload returned to the model is predictable in
+  size. Models can override; the default keeps a
+  "tail until done" call safe even for chatty
+  processes.
+- **Partial-line drain on process exit.** When
+  `process_output_lines` sees the source exit, any
+  unterminated tail in the buffer becomes a final
+  event with `partial: true`. Without this, the
+  trailing line of a crash log (no \n before the
+  process died) would be silently dropped.
+- **`processStatus` carried across termination
+  reasons.** Initially the field was only set on
+  `process_exited`; tests revealed that a model
+  hitting `duration` on a still-running process gets
+  no signal about the process state. Now: every
+  termination path includes `processStatus` /
+  `processExitCode` from the last successful
+  `readOutput` poll, so the model can distinguish
+  "duration ran out, process is still running"
+  (continue polling later) from "duration ran out,
+  process happens to have exited" (no point
+  continuing).
+- **Removed unused `waitForExit` helper from the
+  test file.** The lines tests don't need to wait for
+  exit explicitly — monitor's `process_exited`
+  termination is the natural signal. Lint complained
+  about the unused import; rather than suppress, just
+  removed.
+
+**Code review fixes applied before commit:**
+
+- **`process_output_pattern` overlap + dedup.** Was:
+  each poll read strictly new bytes; a pattern
+  straddling a poll boundary disappeared from the
+  events list. Same class of bug as wait_for's
+  `process_output` (fixed in commit 2bb1e36). Now:
+  `PATTERN_OVERLAP_BYTES = 64` carry-over buffer per
+  stream prepended to the new chunk before `matchAll`.
+  Matches whose end falls inside the buffer (i.e.,
+  entirely already emitted last poll) are skipped —
+  emit only matches that extend into new bytes. Two
+  regression tests pin the contract: a marker
+  straddling `printf 'BLT-MON-'; sleep 0.1; printf
+  'TOKEN-99'` is matched once; a single short marker
+  observed across many polls emits exactly one event
+  (no double-emit).
+- **Removed defensive non-/g fallback.** Was: pattern
+  scan path branched on `condition.pattern.global` and
+  fell back to a single `RegExp.exec` for non-/g —
+  fail-quietly behavior that contradicted monitor's
+  "every match" semantics. Now: throw upfront with a
+  clear message. Tool layer always compiles with /g;
+  programmatic callers get a loud failure instead of
+  silent semantic drift. Regression test pins:
+  passing a non-/g regex rejects with `/global.*'g'/`.
+- **Snake_case payload keys at the tool boundary.**
+  Was: top-level result fields used snake_case
+  (`condition_met`, `elapsed_ms`) but inner payloads
+  passed through with camelCase (`mtimeMs`,
+  `processId`, `matchedIndex`). Models that learned
+  snake from `process_id` got tripped by camel in
+  payloads. Now: shared helper `src/tools/_keys.ts`
+  recursively converts payload keys to snake_case;
+  applied at the boundary in both `wait_for` and
+  `monitor` tools. Internal types stay camelCase
+  (idiomatic TS); conversion is a tool-output detail.
+  Tool tests updated to expect snake (e.g.
+  `r.payload?.mtime_ms`); module-level tests stay
+  camelCase since they exercise the wait module
+  directly.
+
+**Risks documented:**
+
+- **Per-line max length unbounded.** A pathological
+  process emitting a 10MB single line (no \n) would
+  buffer indefinitely. Default `readOutput` maxBytes
+  (64KB) caps per-poll growth; a separate cap on
+  accumulated buffer would be a real defense.
+  Pull-in: if a workflow surfaces it, add
+  `maxLineBytes` per condition with truncation
+  marker.
+- **Event ordering across streams is poll-batch
+  approximate.** Events from stdout and stderr are
+  interleaved by poll round, not by their actual
+  emission timestamps (we don't have per-byte kernel
+  timestamps). For a log with interleaved
+  stdout/stderr writes within a single poll window,
+  the order is "stdout first, then stderr" by our
+  implementation, NOT chronological. Document; if a
+  workflow needs strict ordering, the bg subsystem
+  would need a unified merged-stream output (spec
+  §7.3 doesn't currently call for this).
+- **`file_changes` mtime granularity.** Same risk
+  as wait_for's `file_change`. Documented in 2.2.1
+  risks.
+- **Glob expansion for `file_changes` deferred.**
+  Spec mentions `path: string | glob`; v1 supports
+  single path. Pull-in: when "watch every TS file
+  under src/" becomes a real workflow.
+
+**Step 2.2 closure:** all four sub-steps (2.2.1
+non-bg conditions, 2.2.2 process_*, 2.2.3
+composition, 2.2.4 monitor) shipped. The wait/monitor
+half of spec §7.3.1 is complete.
+
+---
+
+## [2026-04-29] M3 / Step 2.2.3 — wait_for composition (all_of / any_of)
+
+Closes the `wait_for` tool surface with the composition layer
+spec §7.3.1 calls out: `all_of` (AND — wait for every
+sub-condition) and `any_of` (OR — race for the first match).
+Recursive over the 7 existing condition kinds (sleep,
+file_exists, file_change, port_open, http_response,
+process_exit, process_output) so a model can express
+"wait for the dev server to be ready (port_open OR
+http_response on /health) AND the build artifact to be
+written (file_exists)" in a single tool call.
+
+`monitor` (the third half of §7.3.1, streaming events) is
+split into Step 2.2.4 — different primitive (returns
+`{ events[], reason }`, separate tool surface).
+
+**Slice scope (2.2.3):**
+
+| Component | Status | Notes |
+|---|---|---|
+| `WaitCondition.all_of` | NEW | Recursive: `{ kind: 'all_of'; conditions: WaitCondition[] }` |
+| `WaitCondition.any_of` | NEW | Same shape, OR semantics |
+| `WaitConditionMet.all_of` / `any_of` | NEW | Distinct success kinds for payload routing |
+| Dispatch: any_of | NEW | Promise.any over sub-waits — first match wins. Loser sub-waits are aborted via shared AbortController. allSettled at the end ensures no leaked timers |
+| Dispatch: all_of | NEW | Spawn sub-waits in parallel, short-circuit abort on first failure (matched=false). Promise.all waits for all to settle (aborted siblings resolve quickly) |
+| Tool: recursive `buildCondition` | UPDATED | Validates nested conditions[]. Depth limit prevents adversarial nesting |
+| Tests | NEW | `tests/wait/composition.test.ts` + tool-level cases |
+
+**Decisions to make explicit upfront:**
+
+- **`any_of` uses `Promise.any`, not `Promise.race`.** Race
+  resolves on first SETTLED promise — including a sub
+  that timed out. We want first MATCHED. Promise.any
+  rejects only when all promises reject; we map
+  matched=false → rejection, matched=true → resolution.
+  Cleaner than ad-hoc filtering.
+- **`all_of` short-circuits on first failure.** As soon
+  as any sub returns matched=false, we abort the rest
+  via shared AbortController. Avoids paying the full
+  outer timeout for siblings that can't possibly help.
+- **Sub-waits inherit `bgManager` and a shared abort
+  signal.** Process_* conditions can appear inside
+  composition (`any_of([{ kind: 'process_exit'... }])`).
+  We thread `options.bgManager` to sub-calls; missing
+  manager fails fast at the sub's entry validation.
+- **Depth limit = 5.** `all_of([all_of([all_of(...)])])`
+  could be unbounded otherwise. Hard cap defends
+  against adversarial / buggy model output. Pulled in
+  if a real workflow needs deeper.
+- **Empty `conditions` arrays are well-defined:**
+  - `all_of([])` matches IMMEDIATELY (vacuously true —
+    the universal quantifier over empty set is true).
+  - `any_of([])` times out (vacuously false — the
+    existential over empty set is false).
+  - Both documented in the schema; no special-case
+    error.
+- **PolicyMode interactions stay at the leaf.** A
+  composition has no policy decision — only its leaves
+  (file_exists path, port_open host, etc.) do. Same as
+  Step 2.2.1's "no path policy gate on wait_for" risk;
+  composition doesn't make that gap better or worse.
+
+**Out of scope (2.2.4):**
+
+- `monitor` — streaming events with LLM-runs-at-end
+  semantics. Different return shape, different tool.
+
+**Spec reference:** `AGENTIC_CLI.md §7.3.1` (composition
+clauses), `src/wait/index.ts` (existing dispatch).
+
+**Done:**
+
+- WaitCondition extended with `all_of` and `any_of`,
+  both recursive over `WaitCondition[]`.
+  WaitConditionMet adds `'all_of'` and `'any_of'`
+  success kinds.
+- Composition handlers run BEFORE the poll loop in
+  `waitFor` (composition orchestrates, doesn't poll).
+  Sub-waits get a derived AbortController (`subAc`)
+  whose signal is what they receive as their `signal`
+  option. Outer-abort propagates to subAc via a
+  `once: true` listener; on resolution we abort subAc
+  to cancel siblings.
+- `any_of` uses `Promise.any` over sub-promises
+  mapped so matched=false → rejection. First MATCH
+  wins (not first settled). Loser sub-waits are
+  cancelled; `Promise.allSettled` ensures we don't
+  return before they clean up. Payload reports
+  `{ matchedIndex, matchedKind, matchedPayload? }`.
+- `all_of` uses `Promise.all` over tracked sub-promises;
+  the first failure (matched=false) sets `firstFail`
+  and aborts siblings via `subAc`. Promise.all still
+  awaits everyone settling (aborted siblings resolve
+  quickly). Payload reports `{ matched: N }` on success
+  or `{ failedIndex, failedKind, failedPayload? }` on
+  failure.
+- Empty-array semantics:
+  - `all_of([])` returns matched=true with `matched: 0`
+    immediately.
+  - `any_of([])` waits out the outer `timeoutMs` then
+    returns matched=false / conditionMet=`'timeout'`.
+- Tool surface adds `all_of` / `any_of` kinds to the
+  schema. `buildCondition` recurses with
+  `depth + 1`; `MAX_COMPOSITION_DEPTH = 5` rejects
+  unbounded nesting. `containsProcessCondition`
+  walks the (possibly composed) condition tree so
+  `bgManager` validation at the tool boundary catches
+  process_* nested in composition (e.g.,
+  `any_of([process_exit, sleep])`) — surfaces as
+  `bg.manager_unavailable`, not a mid-wait
+  `wait.internal_error`.
+- 11 unit tests in `tests/wait/composition.test.ts`:
+  any_of races first match, cancels losers,
+  empty array timeouts, captures matched sub-payload;
+  all_of waits for everyone, short-circuits on first
+  failure, empty array immediate match, payload on
+  failure; nested any_of inside all_of; aborted
+  signal propagates to sub-waits.
+- 5 tool tests in `tests/tools/wait-for.test.ts`:
+  empty arrays, recursive validation rejects nested
+  bad kind, depth limit rejects deep nesting,
+  process_* nested → bg.manager_unavailable,
+  end-to-end any_of via tool surface.
+- Total: 780 pass / 7 skip / 0 fail. Typecheck +
+  lint green.
+
+**Decisions taken (not in opener):**
+
+- **Listener cleanup in `finally`.** The composition
+  handler's outer-abort listener is added to
+  `combinedSignal` and removed in a `finally` block.
+  Without this, nested composition (sub-wait inside a
+  parent) would leave a dangling listener on the
+  parent's signal until both finished — small leak,
+  documented for hygiene.
+- **`Promise.any` rejection ignored, not aggregated.**
+  When all sub-promises reject (no match), Promise.any
+  throws AggregateError with the individual results.
+  We swallow the aggregate and call `finishUnmatched()`
+  with no payload — the conditionMet will reflect
+  whether the outer timeout or caller signal fired.
+  Surfacing per-sub failure reasons in any_of's payload
+  was considered; rejected because the model only cares
+  that NONE matched, and the outer reason (timeout vs
+  abort) is what's actionable. all_of's failure DOES
+  surface the failing sub because that IS actionable
+  ("which dependency failed?").
+- **Depth limit at the tool boundary, not the wait
+  module.** Programmatic callers building WaitConditions
+  in code can compose as deep as they want (TypeScript's
+  recursive type signals the intent). The depth limit
+  is specifically to defend against adversarial /
+  buggy MODEL output via the tool — the validation
+  layer is the right gate.
+
+**Code review fixes applied before commit:**
+
+- **`any_of` distinguishes real errors from
+  matched=false rejections.** Was: Promise.any's
+  AggregateError was caught silently — a composition
+  with all sub-waits rejecting (e.g., a single-element
+  any_of where the sub throws `bg process not found`)
+  silently reported timeout. Now: AggregateError.errors
+  is scanned for Error instances; the first real one is
+  re-thrown, propagating up through the tool layer as
+  `bg.process_not_found` (or whatever the sub-error
+  shape was). WaitResult-shaped rejections (the
+  synthetic `throw r` for matched=false) are skipped
+  — those are legitimate "no match" outcomes. all_of
+  was already correct because Promise.all rejects on
+  first rejection.
+- **Recursive bgManager pre-check covers nested
+  process_*.** Was: only the top-level kind was
+  checked, so `any_of([process_exit, sleep])` without
+  bgManager would dispatch sub-waits and let them fail
+  with the (now-fixed-above) any_of error path. Now:
+  `containsProcessKind` walks the condition tree at
+  function entry, throws a clear "composition needs
+  manager" error before any dispatch happens. Mirrors
+  the tool layer's own `containsProcessCondition` so
+  programmatic callers get the same protection. The
+  pre-check runs BEFORE the composition handler so
+  sub-waits never get spawned with a missing manager.
+- 3 regression tests pin the contract:
+  any_of with a process_* sub but no manager rejects
+  with /bgManager/; nested process_* (2-level deep)
+  also rejects; all_of fails fast at function entry
+  with clear message.
+
+**Pending (Step 2.2.4):**
+
+- `monitor` — streaming events with LLM-runs-at-end
+  semantics. Returns `{ events[], reason }`, separate
+  tool surface. Distinct enough to deserve its own
+  step.
+
+**Risks documented:**
+
+- **No depth limit in the wait module itself.**
+  Programmatic callers (the tool layer or future
+  internal use) could construct deeper nesting and
+  the wait module would happily recurse. Stack depth
+  in JS handles ~1000+ levels comfortably; the model-
+  facing limit at the tool layer is the practical
+  bound. If a future programmatic caller produces
+  pathological depth, a wait-module-level cap can
+  land.
+- **Multiple sub-waits in parallel multiply poll
+  cost.** A composition with N sub-conditions polling
+  every 500ms means N concurrent polls. Each poll is
+  cheap (fs.existsSync, a TCP connect, etc.) but the
+  multiplier is real for large N. `MAX_COMPOSITION_DEPTH`
+  bounds the tree, not the breadth — N=20 sub-waits
+  in a single any_of is allowed and may stress the
+  event loop. Pull-in: if a real workflow needs many
+  parallel probes, batch via stride-polling.
+- **Sub-wait timeoutMs == outer timeoutMs.** Each
+  sub-wait gets the same `timeoutMs` as the outer.
+  Their internal timer fires roughly when the outer's
+  combinedSignal aborts (both connected). Doesn't
+  cause double-counting, but wasted timer
+  registrations. Negligible.
+
+---
+
+## [2026-04-29] M3 / Step 2.2.2 — process_exit + process_output
+
+Continues Step 2.2 with the bg-aware wait conditions. After
+2.2.1 the `wait_for` tool can sleep, watch files, probe ports,
+and poll HTTP — but for the highest-value use case (waiting on
+a `bash_background` process to be ready) the model still has to
+loop `bash_output` calls, paying LLM cost every step. Spec §7.3.1
+calls out the savings: ~$0.40 polling vs ~$0.10 with `wait_for`
+on a typical port-ready loop.
+
+**Slice scope (2.2.2):**
+
+| Component | Status | Notes |
+|---|---|---|
+| `BgManager.getStatus(id)` | NEW | Thin accessor returning `{ status, exitCode, exitedAt } \| null`. Enough for process_exit polling without exposing the full row |
+| `WaitOptions.bgManager?` | NEW | Optional injection; process_* conditions fail with clean error when manager is missing |
+| Condition `process_exit` | NEW | Poll `getStatus` until `status !== 'running'`. Payload: `{ processId, status, exitCode }`. No log-file reads |
+| Condition `process_output` | NEW | Poll `readOutput` with explicit `since*` (transient — doesn't advance model's persisted cursor). Test compiled regex against the new chunk. Local cursors with `PATTERN_OVERLAP=64` avoid missing patterns spanning poll boundaries |
+| Tool surface | UPDATED | New kinds in WaitForCondition. `pattern: string` + `is_regex?: boolean` (default false → escape literal). `process_id: string` |
+| Tests | NEW | `tests/wait/process.test.ts` with bg manager fixtures (DB + tmp logDir). Tool-level cases extend `tests/tools/wait-for.test.ts` |
+
+**Decisions to make explicit upfront:**
+
+- **Pattern is RegExp internally, string at the tool boundary.**
+  JSON has no native regex; the tool accepts `pattern: string`
+  and `is_regex?: boolean`. `is_regex: false` (default) escapes
+  the input as a literal — matches "READY" exactly, no
+  surprise from `.` or `[`. `is_regex: true` compiles the
+  string as a regex; if invalid, clean tool error.
+- **Process exit during a `process_output` wait is reported
+  via payload, not a new conditionMet kind.** Wait returns
+  `matched: false` with `payload: { processExited: true,
+  exitCode, status }`. Adding 'process_exit' to the
+  conditionMet for an OUTPUT wait would conflate two
+  different intents. Tools that want exit OR output should
+  use `any_of` (lands in 2.2.3).
+- **Transient reads via `sinceStdout`/`sinceStderr`.** The
+  wait module uses explicit `since*` so the model's
+  persisted cursor stays untouched. Same lesson from commit
+  `3f8bbda`: explicit since = transient. After a successful
+  wait, the model's next `bash_output` call sees the SAME
+  bytes (including the matched window) — wait observed,
+  didn't consume.
+- **Pattern overlap heuristic.** Each poll re-reads the last
+  `PATTERN_OVERLAP_BYTES = 64` bytes of the previous read
+  alongside the new bytes. Catches patterns up to 64 bytes
+  long that straddle a poll boundary. Patterns longer than
+  64 bytes risk missing matches; document as risk and pull
+  in a configurable overlap if a real workflow surfaces it.
+- **`getStatus` instead of exposing `getBgProcess`.** The
+  manager already imports the repo for its own internal
+  needs; re-exposing the full row would couple wait/ to
+  storage row shape. `getStatus` returns only what wait
+  needs, lets storage shape evolve independently.
+
+**Out of scope for 2.2.2 (deferred to 2.2.3):**
+
+- `monitor` (streaming events, LLM runs at the end).
+- `all_of` / `any_of` composition (recursive resolution,
+  spec acknowledges race surface in `any_of`).
+
+**Spec reference:** `AGENTIC_CLI.md §7.3.1`,
+`src/bg/manager.ts` (readOutput + status accessor).
+
+**Done:**
+
+- `BgManager.getStatus(id)` — thin accessor returning
+  `StatusSnapshot { status, exitCode, exitedAt } | null`.
+  Cross-session ids return null (defense-in-depth, same
+  pattern as readOutput / kill).
+- `WaitOptions.bgManager?: BgManager` injection point. Only
+  required for process_* conditions. Other conditions
+  ignore the field.
+- Condition `process_exit` — polls `getStatus` until
+  status leaves 'running'. Payload reports
+  `{ processId, status, exitCode, exitedAt }`. Cheap (no
+  log file IO). Already-exited processes match on first
+  poll (verified < 200ms in test).
+- Condition `process_output` — polls
+  `manager.readOutput` with explicit `sinceStdout`/
+  `sinceStderr` so the read is transient (lesson from
+  commit `3f8bbda`). Local cursors track wait progress
+  independently from the model's persisted cursor; a
+  successful wait does NOT consume bytes — a subsequent
+  canonical bash_output sees the SAME content (test
+  pins this contract). Pattern is regex (compiled at
+  the tool layer); first match returns
+  `{ processId, stream: 'stdout' | 'stderr', match }`.
+  When the process exits without matching, returns
+  `matched: false` with payload
+  `{ processExited: true, status, exitCode }` so the
+  model can distinguish "running but no marker yet
+  (timeout)" from "service crashed before saying ready
+  (process exited)".
+- `PATTERN_OVERLAP_BYTES = 64` — each poll re-reads the
+  last 64 bytes of the previous read alongside the new
+  bytes, catching patterns that straddle a poll
+  boundary. Test pins this with `printf 'BLT-'; sleep
+  0.1; printf 'TOKEN-37'` + pattern `/BLT-TOKEN-37/`.
+- Tool surface adds `process_exit` and `process_output`
+  kinds to `WaitForCondition`. Schema fields:
+  `process_id` (required), `pattern: string` (literal
+  by default), `is_regex?: boolean` (default false →
+  literal escape via `escapeRegexLiteral`). The global
+  flag (`g`) is rejected because RegExp.exec with /g
+  carries lastIndex state across calls and breaks the
+  per-poll re-read pattern.
+- Tool error mapping:
+  - missing bgManager → `bg.manager_unavailable` (same
+    code as bash_output / bash_kill — uniform operator
+    surface)
+  - unknown / cross-session process_id →
+    `bg.process_not_found` (same code as bash_output /
+    bash_kill)
+  - invalid regex when `is_regex: true` →
+    `tool.invalid_arg` with the underlying message
+  - empty process_id / empty pattern → `tool.invalid_arg`
+- 14 unit tests in `tests/wait/process.test.ts`: literal
+  match in stdout, regex match in stderr, observational
+  contract (cursors stay at 0), timeout, processExited
+  payload on exit-without-match, pattern overlap across
+  polls, unknown id, missing bgManager. process_exit
+  covers natural exit, non-zero code, immediate match
+  on already-exited, timeout on never-exiting.
+- 10 tool tests in `tests/tools/wait-for.test.ts`:
+  process_exit reports exit code; process_output
+  literal escapes regex meta (`1.0` doesn't match
+  `100`); is_regex=true compiles regex; invalid regex
+  rejected; bg.process_not_found / bg.manager_unavailable
+  surfaces.
+- Total: 762 pass / 7 skip / 0 fail. Typecheck + lint
+  green.
+
+**Decisions taken (not in opener):**
+
+- **Tool error codes mirror bash_output/bash_kill.** When
+  bgManager is missing or process_id is unknown, the
+  operator-facing surface is the same as the existing bg
+  tools — `bg.manager_unavailable` and `bg.process_not_found`.
+  Avoids one-off wait-prefixed codes that would force the
+  operator to learn duplicate vocabulary.
+- **process_output's exit detection is reactive, not
+  predictive.** We don't subscribe to the natural-exit
+  promise; we poll readOutput and check `r.status`. The
+  `live` map in the manager isn't part of the public
+  surface, and exposing it would couple wait/ deeper than
+  needed. The polling cost is bounded (one extra DB read
+  per cycle) and the observability is the same.
+- **Local cursors live entirely in the wait module.** No
+  storage state. If the wait is aborted mid-flight, the
+  cursors are simply discarded — nothing to clean up.
+  Future `monitor` (2.2.3) may want persistent state for
+  cross-session resumption, but that's a separate
+  concern.
+- **The /g rejection happens after construction, not
+  before.** `new RegExp(pattern)` from a string can't
+  carry the global flag (no inline `/g` flag in JS regex
+  syntax, and the second arg isn't accepted from our
+  schema). The `regex.global` check is defensive against
+  future construction paths that might.
+
+**Pending (Step 2.2.3):**
+
+- `monitor` (streaming events, LLM runs at the end after
+  max_events / duration / cancellation).
+- `all_of` / `any_of` composition (recursive resolution,
+  spec acknowledges race surface in `any_of`).
+
+**Code review fixes applied before commit:**
+
+- **`process_output` drains pending bytes after exit.**
+  Was: a process emitting >64KB (default `readOutput`
+  maxBytes) and exiting in the same poll window would
+  have only the first chunk scanned. `r.status='exited'`
+  + `r.stdoutPending > 0` triggered an immediate
+  processExited report, silently skipping the tail
+  where the pattern might live. Now: on detecting exit,
+  the loop drains until both stream pendings are 0,
+  testing each chunk. Defensive break on cursor-not-
+  advancing prevents infinite loops if a future
+  readOutput regression returns end < cursor.
+  Regression test: 70KB filler + EXIT-MARKER-DRAIN +
+  exit; before the fix, the marker was reported as
+  processExited.
+- **`getStatus` throws on cross-session ids.** Was:
+  returned null, conflating "id doesn't exist anywhere"
+  with "id belongs to another session" — both
+  surfaced as `bg.process_not_found`, hiding the real
+  diagnosis. Now: throws same shape as readOutput /
+  kill (`bg process not in this session: ${id}`).
+  process_exit's case in waitFor catches and re-
+  throws, preserving the existing tool surface.
+- **Removed dead `/g flag rejection` test.** Was: a
+  test whose body was `expect(typeof ctx).toBe('object')`
+  with a comment admitting the flag is unreachable
+  via string-only schema. The `regex.global` check in
+  the tool stays as defensive code, the test was
+  noise.
+- **Added empty-pattern rejection test.** Mirrors the
+  existing "rejects empty process_id" — pattern
+  validation was already in `buildCondition`, just
+  uncovered.
+
+**Risks documented:**
+
+- **Patterns longer than `PATTERN_OVERLAP_BYTES = 64` may
+  miss matches that straddle a poll boundary.** A 100-byte
+  pattern split 70/30 across two polls would have only the
+  last 64 of the first poll re-read, the leading 6 bytes
+  of the pattern would be lost. Mitigation today:
+  documented; configurable overlap can land if a real
+  workflow surfaces longer patterns. Most "ready marker"
+  patterns are <30 bytes — we're not close to the limit.
+- **`process_output` matches on regex.exec, which is
+  greedy.** A pattern like `/STARTED|FINISHED/` hits the
+  first occurrence; if both substrings appear in the same
+  poll's chunk, we only see the leftmost. Most ready-marker
+  use cases are first-occurrence anyway, so this is the
+  desired behavior. Multi-event observation belongs in
+  `monitor` (2.2.3), not wait_for.
+- **Race: process exits between getStatus poll and
+  readOutput poll in process_output.** Status check happens
+  AFTER readOutput; if the process exited mid-poll, we'd
+  read the final bytes, fail to match, then notice
+  `r.status !== 'running'` and report processExited. The
+  final bytes ARE in the chunk we tested, so no real
+  loss. Documented for completeness — observed-zero-impact.
+- **Inherited from 2.2.1:** mtime granularity, port_open
+  listen() init false-negative, HEAD unsupported on
+  legacy servers.
+
+---
+
+## [2026-04-29] M3 / Step 2.2.1 — wait_for + non-bg conditions
+
+Opens Step 2.2 (`wait_for` / `monitor` primitives, spec
+§7.3.1) with the cheap-conditions slice: a wait_for tool
+that supports `sleep`, `file_exists`, `file_change`,
+`port_open`, and `http_response`. None of these depend on
+the bg manager — they're standalone utility waits that any
+synchronous workflow can use today.
+
+**Why this slice first:**
+
+- Spec §7.3.1 calls out the cost difference: 4-5 polling
+  steps via repeated `bash_output` ≈ $0.40 in LLM calls
+  vs `wait_for` ≈ $0.10. Even without process-aware
+  conditions, the model gains `sleep` (no more "ask the
+  user to wait" steps), `file_exists` (wait for a build
+  artifact), `port_open` (wait for a server to be ready),
+  and `http_response` (probe an endpoint). All immediately
+  useful.
+- Process-aware conditions (`process_exit`,
+  `process_output`) need the bg manager's stream
+  subscription surface — that's a different category of
+  work (file watching with regex against a growing log).
+  Splitting them out as 2.2.2 keeps each step's surface
+  auditable.
+- `monitor` and composition (`all_of`, `any_of`) are
+  another distinct category — streaming events and
+  recursive condition resolution. 2.2.3.
+
+**Slice scope (2.2.1):**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/wait/` module | NEW | `waitFor(condition, opts)` primitive + per-kind condition implementations |
+| Condition `sleep` | NEW | `setTimeout` raced against signal-abort |
+| Condition `file_exists` | NEW | poll `fs.existsSync` at `pollIntervalMs` (default 500ms); resolve immediately if already present |
+| Condition `file_change` | NEW | snapshot mtime on first poll, compare on subsequent. mtime-based — granularity bounded by FS (1s on some) |
+| Condition `port_open` | NEW | `net.connect` probe; success closes the connection, failure retries until timeout |
+| Condition `http_response` | NEW | `fetch` HEAD/GET; optional `status?` match (else any 2xx) |
+| Tool `wait_for` | NEW | category=`misc` (no command/path decision), planSafe (read-only) |
+| Tests | NEW | Per-condition unit tests + tool-level integration tests. port_open + http_response use `Bun.serve` on ephemeral ports for deterministic fixtures |
+| BACKLOG, bootstrap test | NEW | Tool count 9 → 10 |
+
+**Out of scope for 2.2.1 (deferred):**
+
+- **`process_exit` / `process_output` (2.2.2).** Need
+  bg manager subscription. process_exit is cheap
+  (already have `live` map with exitedSettled
+  promises). process_output requires growing-log
+  watch + regex matching with cursor — more involved.
+- **`monitor` (2.2.3).** Streaming observation. Spec
+  §7.3.1 makes it distinct from `wait_for` because
+  the LLM runs at the END (after max_events / duration /
+  cancellation), not on first match.
+- **Composition (`all_of` / `any_of`, 2.2.3).**
+  Recursive WaitCondition resolution. Spec acknowledges
+  race-condition surface in `any_of`. Deferred so the
+  base conditions are stable before the combinator
+  layer lands on top.
+
+**Decisions to make explicit upfront:**
+
+- **Polling, not native filesystem watches.** `fs.watch`
+  is platform-specific (inotify / FSEvents / Windows API)
+  with subtle correctness gotchas (events drop on rename,
+  some FSes don't fire). Spec §7.3.1 describes
+  `chokidar / fs.watch` — both are watcher libraries with
+  fallback layers we'd need to vendor. Going with mtime
+  polling for v1: portable, simple, and the latency
+  difference (≤ pollIntervalMs) is acceptable for the
+  build-artifact / server-ready use cases.
+- **`http_response` uses HEAD by default.** Avoids
+  downloading a response body just to check status.
+  When user wants body content (future enhancement),
+  that's a different condition kind.
+- **`port_open` opens then closes the probe connection
+  immediately.** No data sent. Tests against a TCP
+  service that doesn't accept connections (e.g. the
+  socket exists but server is mid-init) will fail-fast
+  on RST, which is the right signal.
+- **No `process_*` conditions in this slice.** Even
+  though the bg subsystem just landed, mixing it into
+  2.2.1 would force the wait module to depend on bg
+  internals before its own surface is stable.
+- **Relative paths resolve against `ctx.cwd`, not
+  `process.cwd()`.** Lesson carried over from the
+  bash_background cwd review (commit `509f964`):
+  `args.cwd` defaulting via `process.cwd()` silently
+  runs in the wrong directory whenever the harness
+  was launched with a different working dir than the
+  session (evals, bootstrap-from-script, worktree
+  subagents). Apply the same pattern to `file_exists`
+  and `file_change` conditions when they accept a
+  `path` arg — undefined unsupported (path is
+  required), absolute used as-is, relative resolved
+  via `resolve(ctx.cwd, path)`. Pin with regression
+  tests that set `ctx.cwd` to a tmp dir distinct from
+  the harness's process dir and assert the condition
+  fires against the SESSION path, not the harness path.
+
+**Spec reference:** `AGENTIC_CLI.md §7.3.1`,
+`CONTEXT_TUNING.md §3` (cost rationale).
+
+**Done:**
+
+- New `src/wait/` module exporting `waitFor(condition, opts)`
+  primitive plus the discriminated `WaitCondition` union for 5
+  kinds. Internal poll loop dispatches per-kind; abort and
+  timeout fold into a single `combinedSignal` via
+  `buildTimeoutSignal()` so the polling code only watches one
+  signal source. Cleanup function clears the timer on every
+  exit path.
+- Five conditions implemented:
+  - `sleep` — `setTimeout` raced against caller signal. Edge
+    case: when `durationMs > timeoutMs`, the wait reports
+    `conditionMet: 'timeout'` rather than masquerading as a
+    successful sleep.
+  - `file_exists` — poll `fs.existsSync` at `pollIntervalMs`
+    (default 500ms). Resolves immediately if the file is
+    already present.
+  - `file_change` — snapshot `mtimeMs` on first poll, compare
+    on subsequent. Treats "missing → present" as a change so
+    the model can wait for a build artifact to appear OR be
+    refreshed. Payload reports both `mtimeMs` and
+    `previousMtimeMs` (null when the file was missing
+    initially).
+  - `port_open` — `net.connect` probe with per-attempt
+    timeout = `pollIntervalMs`. On failure, sleeps
+    `min(pollIntervalMs, 100ms)` before retrying — fast-failing
+    sockets don't need the full poll interval.
+  - `http_response` — `fetch` HEAD with optional `status?`
+    match (defaults to any 2xx). Caller signal threads through
+    `fetch`'s own signal so a wait-level abort interrupts a
+    slow server mid-request, not just between polls.
+- `wait_for` tool (`src/tools/builtin/wait-for.ts`):
+  - `category: 'misc'` + `planSafe: true` (pure observational
+    primitive — no command, no path mutation; HEAD probes,
+    file stats, TCP connect+close are all read-only).
+  - Snake-case condition fields in the schema
+    (`duration_ms`, `poll_interval_ms`, etc.) consistent with
+    every other Forja tool surface.
+  - Path resolution against `ctx.cwd` for `file_exists` /
+    `file_change`. Lesson from commit `509f964`: relative paths
+    must land in the session dir, not `process.cwd()`.
+    Validation rejects unknown kinds and bad arg shapes with
+    clean tool errors instead of letting `waitFor` throw.
+- Tool count: 9 → 10. Bootstrap test updated.
+- 17 unit tests in `tests/wait/wait-for.test.ts` cover every
+  kind's match path, timeout path, and abort path. `port_open`
+  uses `Bun.listen` on an ephemeral port; `http_response`
+  uses `Bun.serve` with `/ok` (200) and `/teapot` (418)
+  routes — no flaky external calls.
+- 11 tool tests in `tests/tools/wait-for.test.ts`:
+  happy paths (sleep / file_exists abs / file_exists relative
+  resolves against ctx.cwd / file_change payload), timeout
+  reporting, signal propagation (mid-wait abort + pre-aborted
+  ctx returns clean tool error), input validation (unknown
+  kind, missing required field, negative timeout, port out of
+  range).
+- Total: 732 pass / 7 skip / 0 fail. Typecheck + lint green.
+
+**Decisions taken (not in opener):**
+
+- **Rejected per-condition file modules.** Opener had me
+  considering `src/wait/conditions/sleep.ts`, `port-open.ts`,
+  etc. Single-file `src/wait/index.ts` is ~270 LOC and reads
+  end-to-end in one screen — splitting would have added
+  coordination cost (cross-file shared types like
+  `WaitConditionMet`) without enabling parallel work. Revisit
+  when 2.2.2 / 2.2.3 land more conditions.
+- **`combinedSignal` pattern.** Internal helper
+  `buildTimeoutSignal(timeoutMs, callerSignal)` returns a
+  single signal that fires on EITHER the caller abort OR the
+  internal timeout. The polling loop only checks one signal
+  source; the `timeoutFired()` accessor lets the caller
+  distinguish timeout-from-abort when reporting the result.
+  Cleaner than tracking two signals across every await.
+- **`http_response` defaults to "any 2xx".** Spec doesn't pin
+  the default. 2xx is the common "service ready" semantic;
+  models that want a specific code (418 for a teapot probe)
+  pass `status` explicitly. A 4xx/5xx return without explicit
+  `status` does NOT match — it's still a network success but
+  the service isn't ready.
+- **`mtime null → present` IS a change.** Strictly speaking
+  "mtime change" implies the file existed at baseline. But
+  the practical use case ("wait for the build artifact to
+  appear or update") wants both shapes. Documented in JSDoc;
+  payload's `previousMtimeMs: null` lets the caller
+  distinguish creation from modification.
+- **`port_open` per-attempt timeout = `pollIntervalMs`.**
+  Without a per-attempt cap, a slow DNS lookup or
+  unreachable host could hang each probe far longer than the
+  poll interval. Capping at the poll interval keeps the loop
+  responsive to the outer timeout.
+
+**Pending (Step 2.2.2 / 2.2.3):**
+
+- 2.2.2: `process_exit`, `process_output` (depend on bg
+  manager subscription).
+- 2.2.3: `monitor` (streaming events), `all_of` / `any_of`
+  composition.
+
+**Risks documented:**
+
+- **mtime polling has 1-second granularity on some FS.**
+  ext4 and APFS have sub-second mtimes; FAT and some NFS
+  setups round to 1s. A back-to-back `writeFileSync` could
+  land within the same mtime tick on those filesystems and
+  the change goes undetected. Mitigation today: documented;
+  the test `'matches when an existing file is modified'`
+  uses a 200ms gap which exceeds the worst-case granularity.
+  Pull-in signal: if a real workflow on a low-resolution FS
+  flakes, switch to content-hash comparison or `fs.watch`
+  (with all the platform fragility that entails).
+- **`port_open` reports false negative on slow listen()
+  socket initialization.** A server that calls `listen()` but
+  hasn't fully bound yet may return RST instead of accepting
+  — `tryConnect` reports false, the wait keeps polling. By
+  next poll the bind has completed. Behavioral parity with
+  any other "wait for server ready" pattern; spec
+  acknowledges this in the §7.3.1 example.
+- **`http_response` HEAD may be unsupported by some
+  servers.** A few legacy services return 405 on HEAD. The
+  current default (any 2xx) would never match. Pull-in
+  signal: when a real workflow needs GET-style probing,
+  add `method: 'GET' | 'HEAD'` to the condition.
+
+**Code review fixes applied before commit:**
+
+- **Reject `..` in path segments (file_exists / file_change).**
+  The first draft resolved relative paths against `ctx.cwd` but
+  did nothing to prevent `../../etc/passwd`-style traversal —
+  `resolve()` happily collapses `..` and the model gets a
+  boolean of existence + mtime for any path on the system.
+  Cosmetic protection (model can pass `/etc/passwd` directly
+  if absolute paths are allowed at all), but the cheap
+  loader-style check closes the obvious leak vector. Rejects
+  `..` segments in BOTH relative and absolute paths
+  (`/foo/../etc/passwd` rejected too, since `..` in the
+  middle obscures the actual target). 3 regression tests
+  pin the contract: relative traversal rejected, absolute
+  traversal rejected, filename containing literal `..`
+  (e.g. `foo..txt`) accepted.
+- **`tryConnect` honors caller signal.** Was: per-attempt
+  hang up to the connect-timeout after caller abort, with
+  the outer poll loop catching it on the next iteration.
+  Now: `combinedSignal` is threaded into `tryConnect`; on
+  abort, the socket is destroyed and the probe settles
+  immediately. Regression test fires abort 50ms into a
+  probe of a non-routable host and asserts the wait
+  returns in <500ms (vs ~1.2s without the cascade).
+- **`port_open` per-attempt timeout has a 200ms floor.**
+  Was: connect timeout = `pollIntervalMs`, which at very
+  low poll values (10ms) rejected legit DNS/handshake
+  before they could complete. Now: `Math.max(pollIntervalMs,
+  200)` for the connect attempt. The combined signal still
+  cuts the attempt short on user timeout, so the floor
+  doesn't hold the loop past the user-supplied cap.
+- **`http_response` exposes `redirect` option.** Was:
+  fetch followed 3xx silently, so a 301→200 chain
+  matched as 200 and the model couldn't distinguish "the
+  endpoint redirected" from "the endpoint responded".
+  Now: `redirect?: 'follow' | 'manual'` on the condition.
+  Default 'follow' preserves the prior behavior; 'manual'
+  surfaces the literal status. 2 regression tests pin
+  both modes (follow returns 200 from /redirect, manual
+  returns 301).
+
+**Code review follow-ups (not blocking, deferred):**
+
+- **`file_change` accepts directories silently.** Spec says
+  "file"; we don't reject. Could be feature or bug. Fix or
+  document when a real workflow surfaces the ambiguity.
+- **No path policy gate on `wait_for`** — operators can't
+  deny `tools.wait_for.allow_paths: ['build/**']`. Same
+  asymmetry exists for `port_open` / `http_response` (no
+  network policy). Real fix: per-condition category routing
+  (`fs.read` for file_*, future `net.probe` for network
+  conditions) — needs engine support, scope of 2.2.3 or
+  later.
+
+---
+
+## [2026-04-28] M3 / Step 2.1 — bash_background trio + storage
+
+Opens M3 / Step 2 with the smallest cohesive slice of the
+background-process subsystem: the three execution tools
+(`bash_background`, `bash_output`, `bash_kill`) plus the
+storage table that persists process state across turns.
+
+**Why this subsystem next, why this slice first:**
+
+- `bash_background` extends an existing tool (`bash`) rather
+  than introducing a new architectural layer (subagents,
+  MCP, slash commands). Lowest blast radius for a first
+  M3-after-eval-regression step.
+- It unblocks real workflows the M2 tool surface can't
+  reach: long-running dev servers, file watchers, builds
+  with progress output. Today the only options are
+  "block bash for 30s and pray" or "give up on long
+  commands."
+- Wait/Monitor primitives (`§7.3.1`) are valuable but
+  much bigger — file watching, port probing, HTTP
+  polling, condition composition. They depend on
+  `bash_background`'s process_id surface for half their
+  conditions (`process_output`, `process_exit`).
+  Splitting them out as Step 2.2 keeps each step's
+  surface auditable.
+
+**Plan (stepwise):**
+
+- 2.1 — Storage migration + repo + process manager + 3
+  tools + session-end cleanup + unit tests + 1
+  regression case. **This entry.**
+- 2.2 — `wait_for` and `monitor` primitives (the cheap
+  conditions first: `sleep`, `file_exists`, `file_change`,
+  `port_open`; then process-aware conditions on top of
+  2.1's manager).
+- 2.3 — `http_response` wait condition + composition
+  (`all_of` / `any_of`).
+
+**Slice scope (Step 2.1):**
+
+| Component | Status | Notes |
+|---|---|---|
+| Migration `005-background-processes` | NEW | Table per spec §13 model. Indices on (session_id, status) |
+| `bgProcessRepo` | NEW | Typed CRUD; `cleanup(sessionId)` marks running rows killed |
+| Process manager | NEW | `src/bg/manager.ts`. Wraps `Bun.spawn`, log files in `.agent/bg/<id>.{stdout,stderr}.log`, exit-event → DB update, kill = SIGTERM → 5s grace → SIGKILL |
+| Tool `bash_background` | NEW | category=`bash`, writes=true. Returns `{ process_id, label, spawned_at }` |
+| Tool `bash_output` | NEW | category=`bash` (read-side; pessimistic), idempotent for fixed cursor. Cap N KB per call |
+| Tool `bash_kill` | NEW | category=`bash`. Idempotent on already-exited |
+| Session-end cleanup | NEW | Wired into harness exit path; best-effort via `process.on('exit')` |
+| Unit tests | NEW | Manager (spawn/output/kill/exit), repo (CRUD/cleanup), 3 tools (perm denial, error paths) |
+| Regression case | NEW | `36-bash-background-flow.yaml` — spawn sleep+echo, poll output, kill. Explicit multi-step prompt |
+
+**Out of scope for 2.1 (deferred with rationale):**
+
+- **`wait_for` / `monitor` (§7.3.1).** Step 2.2. Without
+  these, the model has to poll via repeated
+  `bash_output` calls — costs more LLM steps but works.
+  Spec acknowledges the cost difference (`~$0.40` vs
+  `~$0.10` for a port-ready loop). 2.1 ships the
+  baseline; 2.2 adds the optimization. Cleaner than
+  shipping a half-implemented wait/monitor surface.
+- **`<BackgroundProcessTray>` UI.** No interactive UI
+  yet. Tray waits for Ink work in the broader M3/M4
+  scope. Status visible today via `bash_output` (the
+  model's view) and the `background_processes` DB
+  table (the audit log view).
+- **`/bg cleanup` slash command.** Slash commands not
+  implemented yet. Session-end cleanup covers the
+  primary case (no zombies after a session ends);
+  inter-session cleanup (orphaned rows from a crashed
+  prior session) waits for slash command surface.
+- **`maxOutputSize` per-process budget.** Spec doesn't
+  pin this. We'll use a sane per-call cap on
+  `bash_output` (e.g., 64 KB) but no total-output
+  ceiling per process — operator manages disk via
+  `bash_kill` if needed.
+
+**Decisions to make explicit upfront:**
+
+- **OS pid vs internal id.** The tool returns an
+  internal `process_id` (UUID-class string), not the
+  OS pid. Operator-facing diagnosis can pull the OS
+  pid from the DB if needed; the public surface
+  doesn't depend on OS-level identifiers (lets us
+  swap process strategy later — daemon, remote, etc.
+  — without breaking the tool contract). Spec §7.3 is
+  intentionally vague on which one `process_id`
+  refers to; we pin internal-id here.
+- **Permission engine treatment.** All three tools
+  fall under category=`bash`. The bash policy
+  (`allow`/`deny`/`confirm`) gates the SPAWN COMMAND
+  on `bash_background`. `bash_output` and `bash_kill`
+  reference an existing process_id; we don't re-check
+  the original command's policy on those calls (the
+  decision was already made when spawning). If
+  policy changes mid-session and a previously-allowed
+  command's output is still being read, that's not a
+  regression — the spawn was approved; reading
+  stdout from an already-spawned process doesn't open
+  new attack surface.
+- **Log file path is in `.agent/bg/`.** Same prefix as
+  the SQLite DB. Auto-created on first spawn.
+  Cleanup: rotate by session_id at session start (or
+  delete on `cleanup` call). 2.1 keeps the simplest
+  policy: create on spawn, leave on disk after kill,
+  cleanup happens via session-end manager pass.
+- **No prompt-cache concern.** bg processes are local;
+  no provider call involved. The harness loop's
+  prompt-cache logic is independent.
+
+**Spec reference:** `AGENTIC_CLI.md §7.3` (background
+processes), `§13` (data model — `background_processes`),
+`CONTRACTS §2.6` (tool contract). `§7.3.1` is the next
+slice.
+
+**Risks documented:**
+
+- **Zombie processes on hard crash.** `process.on('exit')`
+  is best-effort — `kill -9` to the harness leaves bg
+  processes orphaned. Mitigation: store `os_pid` in
+  DB so a future `agent doctor` (M4 spec §18) can
+  detect and kill. Today: documented gap. Operators
+  who run with autonomous agents over flaky
+  connections should expect to occasionally clean up
+  manually with `pkill -P <harness-pid>` or similar.
+- **Log file disk usage / no gc.** Spec §7.3 says
+  "Limpo no fim da sessão (ou via /bg cleanup)" —
+  ambiguous between cleaning the PROCESSES (we do)
+  and the log FILES (we don't). Decision: keep log
+  files after session end so operators can do
+  post-mortem inspection (a `npm run dev` that
+  crashed yesterday is exactly the kind of thing
+  someone wants to read tomorrow). Trade: `.agent/bg/`
+  accumulates ~2 files per spawn forever. Pull-in
+  signals to add gc:
+    - `agent doctor` lands (M4) — natural place to
+      run `forja bg gc --older-than=7d`.
+    - Slash commands land — `/bg cleanup` per spec.
+    - A real workflow saturates disk before either —
+      add `max_log_bytes` or age-based prune as
+      hotfix.
+  The `npm run dev` + verbose-output worst-case is
+  ~100 MB/hour. Single session is bounded; cross-
+  session accumulation is the only concern, and
+  that's a non-issue until someone hits it.
+- **Multi-process race in DB updates.** Process
+  exit events fire on Node's event loop; if two bg
+  processes exit nanoseconds apart and both update
+  the DB, SQLite's serialization handles it (we're
+  WAL mode). Documented for completeness — no
+  observed issue, but worth noting.
+- **Operator can't deny output reads from already-
+  spawned process.** `bash_output` and `bash_kill`
+  are category=`misc` (auto-allowed). The defense
+  in depth is at spawn time — if a spawn passes
+  policy, reading its output and killing it are
+  treated as already-approved operations. This is
+  intentional (see code comments in those tools)
+  but means a policy change mid-session won't
+  retroactively gate output reads. Pull-in signal:
+  if an operator workflow specifically wants
+  policy-gated output reads, add a category
+  `bg.read`/`bg.kill` and a corresponding
+  `tools.bash_output` / `tools.bash_kill` policy
+  section. Not blocking today.
+
+**Done:**
+
+- Migration 005 (`background_processes`) with 13 columns,
+  2 indices, FK on session_id with cascade, CHECK on
+  status enum (`running|exited|killed|failed`).
+- Repo `bg-processes.ts` exposing
+  `insertBgProcess` / `getBgProcess` / `listBgProcessesBySession`
+  (with single+array status filter) /
+  `advanceBgProcessCursor` (hot-path single UPDATE) /
+  `finalizeBgProcess` (status='exited|killed|failed') /
+  `markRunningAsKilled` (bulk session-level converge).
+- Process manager `src/bg/manager.ts` factory
+  `createBgManager({ db, sessionId, logDir })` exposing:
+  - `spawn(input)` — `Bun.spawn` with stdout/stderr piped
+    direct to `<id>.{stdout,stderr}.log` files, subscribes
+    to `proc.exited` for natural-exit DB updates
+  - `readOutput(id, { since?, maxBytes? })` — byte-cursor
+    window read with UTF-8 replace decoding (binary-safe),
+    advances persisted cursor on success, reports
+    `stdoutPending` / `stderrPending` for truncation
+  - `kill(id, { signal?, gracePeriodMs? })` — SIGTERM →
+    grace via `Promise.race` → SIGKILL escalation,
+    idempotent on already-finished processes
+  - `cleanup()` — parallel kill of every still-running
+    process for the session, plus `markRunningAsKilled`
+    DB convergence for any kill that threw
+- Three tools registered in builtin tool set
+  (`bash_background`, `bash_output`, `bash_kill`),
+  all under category `bash` so existing bash policy
+  rules apply uniformly. Tool count: 6 → 9.
+- `HarnessConfig.bgLogDir?: string` triggers
+  session-scoped manager creation inside the loop
+  (after `createSession`). Wired through
+  `ToolContext.bgManager` so the three tools dispatch
+  via closure-captured manager.
+- Outer try/finally in `runAgent` calls
+  `bgManager.cleanup()` on EVERY exit path: natural
+  done, budget exhaustion, abort, internalError.
+  Cleanup is best-effort — any thrown error is
+  swallowed so the run's `HarnessResult` stays clean,
+  and DB convergence via `markRunningAsKilled` ensures
+  no zombie audit rows even if OS kills failed.
+- CLI bootstrap auto-sets `bgLogDir = <cwd>/.agent/bg`
+  per spec §2.7 — bg works end-to-end via `forja run`
+  without operator config.
+- 51 unit tests across the subsystem: 14 (repo) +
+  20 (manager) + 17 (3 tools) = 51 new tests.
+- 3 integration tests in `tests/harness/bg-cleanup.test.ts`
+  prove the cleanup hook fires on natural exit, on
+  internalError, AND that a missing `bgLogDir`
+  produces clean `bg.manager_unavailable` errors
+  rather than crashes.
+- Regression case `36-bash-background-flow.yaml`
+  exercises the full spawn→read→exit cycle. Validated
+  1/1 on both Haiku 4.5 ($0.008, 4.8s) and gpt-4o-mini
+  ($0.0006, 6.7s).
+- Regression case `37-bg-output-kill-under-strict-policy.yaml`
+  exercises the full bg flow under `defaults.mode: strict`
+  with `tools.bash.allow: ['*echo*']` — proves operator
+  policy works end-to-end (spawn passes via bash policy,
+  bash_output/bash_kill pass via misc category).
+  Validated 1/1 on Haiku ($0.013, 5.5s).
+
+**Code review fixes applied before commit:**
+
+The first draft had three bugs surfaced by review:
+
+1. **Critical — `bash_output` and `bash_kill` denied
+   under non-bypass policy.** Both were `category: 'bash'`,
+   which routes through `checkBash` which requires
+   `args.command`. Neither tool has that arg. Result:
+   under any strict / acceptEdits policy, both default-
+   denied. Fix: switched to `category: 'misc'` —
+   spawn-time was already gated, reading/killing a
+   previously-approved process opens no new attack
+   surface. Documented the operator-gating gap in
+   risks.
+2. **Critical — single cursor lost stderr writes when
+   stdout outpaced stderr.** Trace: stdout 50B,
+   stderr 1B → cursor advances to 50 → next stderr
+   read uses start=50, stderr_total=2 → returns empty
+   forever (or skips intermediate bytes if stderr
+   later exceeds 50). Fix: migration 006 adds
+   `stderr_cursor_position`, manager reads two
+   independent windows, repo exposes
+   `advanceBgProcessStdoutCursor` /
+   `advanceBgProcessStderrCursor`, tool surface
+   exposes `since_stdout` / `since_stderr` and returns
+   `stdout_cursor` / `stderr_cursor` separately.
+   Regression test pins the specific failure mode
+   (50B stdout + delayed stderr writes both before
+   AND after first read).
+3. **Critical — engine looked up bash policy by tool
+   name, not category.** `bash_background` would never
+   match `tools.bash.allow` rules — the engine called
+   `lookupRules('bash_background', ...)` instead of
+   `lookupRules('bash', ...)`. Operators writing the
+   spec-correct `tools.bash.allow: ['npm *']` would
+   find every `bash_background` denied. Fix:
+   `policySectionFor()` collapses every
+   bash-category tool to `tools.bash`. fs.* and
+   web.fetch keep their per-tool sections (read_file's
+   allow_paths is naturally distinct from
+   write_file's). Surfaced by the failing case 37
+   smoke; tightening engine logic was the right
+   fix, not duplicating policy sections in user
+   YAML.
+
+Robustness / minor polish:
+
+- Exit handler IIFE wrapped in try/finally so
+  `live.delete(id)` always runs even when DB throws.
+  Inner DB operations have their own try/swallow so
+  a thrown error doesn't reject the stored Promise
+  (kill/cleanup await it).
+- Cleanup grace tightened: per-call kill keeps 5s
+  default (operator-initiated, can wait), session-end
+  cleanup uses 2s. Prevents 5s × N latency at exit
+  for a session with many SIGTERM-ignoring processes.
+
+**Decisions taken (not in opener):**
+
+- **`bgManager` is owned by the harness loop, not by
+  config.** Spec §13 has bg processes carrying a
+  `session_id` FK, and `sessionId` is generated by
+  `createSession` inside the loop. A pre-built manager
+  passed via config would have stale or null
+  sessionId. Solution: `HarnessConfig.bgLogDir`
+  declares intent ("enable bg, here's where logs
+  go"); the loop instantiates the manager lazily
+  after `createSession`. Ownership = lifecycle;
+  cleanup runs in the same try/finally that owns the
+  session.
+- **Tools surface a clean `bg.manager_unavailable`
+  when ctx lacks the manager.** Three writes to
+  `ToolError`-shape rather than throwing. Lets the
+  model see "this capability isn't configured" and
+  pick a different approach (use plain `bash`
+  instead). Tested explicitly.
+- **Cross-session id rejection.** Manager bound to
+  session A throws `not in this session: <id>` if
+  asked about a process from session B. Defensive —
+  the DB is shared, so an attacker-supplied id from
+  another session would otherwise leak output.
+- **Output read is single-cursor on stdout.** Spec
+  §7.3 calls for `bash_output(process_id, since?)` —
+  one cursor. We read the same window from both
+  stdout and stderr; if stderr lags, the next call
+  catches it up. Asymmetric per-stream cursors
+  would be more general but isn't what the spec
+  specifies, and would complicate the audit trail.
+- **`exitCode` recorded even on killed processes.**
+  Useful diagnostic — kill via SIGTERM reports 143,
+  SIGKILL reports 137. Distinguishing "operator
+  killed cleanly" from "kernel had to escalate" is
+  visible without log file inspection.
+
+**Cut (out of 2.1, deferred with rationale):**
+
+- **`wait_for` / `monitor` primitives (§7.3.1).**
+  Step 2.2. The model can poll via repeated
+  `bash_output` today — costs more LLM steps but
+  works end-to-end. Spec acknowledges the cost
+  difference (~$0.40 polling vs ~$0.10 with
+  `wait_for`). 2.1 ships the baseline; 2.2 adds the
+  optimization layer.
+- **`<BackgroundProcessTray>` UI.** Tray waits for
+  Ink work in M3/M4. Status visible today via
+  `bash_output` (model view) and `background_processes`
+  table (audit view).
+- **`/bg cleanup` slash command.** Slash commands
+  not implemented. Session-end cleanup covers the
+  primary case; orphaned-from-prior-crash cleanup
+  waits for slash command surface.
+- **Per-process `max_log_bytes`.** No log rotation
+  in 2.1. Listed as a documented risk. Add when a
+  real workflow saturates disk.
+
+**Pending (M3 next steps after Step 2):**
+
+- Step 2.2 — `wait_for` primitive (`sleep`,
+  `file_exists`, `file_change`, `port_open`,
+  process-aware conditions on top of 2.1's manager).
+- Step 2.3 — `monitor` primitive (streaming
+  observation), `http_response` wait condition,
+  composition (`all_of` / `any_of`).
+- After Step 2: pick the next subsystem from M3
+  scope (subagents, MCP, checkpoints+`/undo`,
+  `todo_write`, Repo Map).
+
+---
+
+## [2026-04-28] M3 / Step 1.6 — Regression real-model baseline (closes Step 1)
+
+Closes M3 / Step 1 by running the 35-case regression suite
+against Anthropic Haiku 4.5 and OpenAI gpt-4o-mini, 3 rounds
+each, and producing the parity matrix. Surfaces two
+authoring bugs (cases 28 and 29) and four model-capability
+divergences on gpt-4o-mini that we explicitly choose to
+preserve rather than paper over.
+
+**Why this slice closes Step 1:**
+
+- Step 1.4 (parity matrix) was folded in here when Gemini
+  was deferred. With two providers in scope, the
+  measurement task IS the parity matrix.
+- Step 1 originally targeted "~100 cases." We landed 35.
+  Going broader without first proving the suite is stable
+  would compound any structural issue (case design, prompt
+  framing, expectation scope) across more cases. 35 with
+  the parity matrix is the right exit criterion: enough
+  surface to be load-bearing, small enough to fix in flight.
+
+**Done — baseline matrix:**
+
+| Provider | Model | Rounds | Pass rate | Total cost | Wall clock | p50 cost/case |
+|---|---|---|---|---|---|---|
+| Anthropic | Haiku 4.5 | 3 | 105/105 (100%) | $0.7994 | 11.4 min | $0.0042 |
+| OpenAI | gpt-4o-mini | 3 | 91/105 (86.7%) | $0.0818 | 8.8 min | $0.0002 |
+
+**Cost ratio: 9.8× cheaper on gpt-4o-mini, with 13.3pp
+lower pass rate.** The same dynamic the smoke baseline
+recorded (Step 6.3: $0.0050 vs $0.0002 p50, both 100%
+on smoke) — at regression depth, the cost gap holds but
+the pass rate gap appears.
+
+**Authoring fixes applied DURING the baseline run:**
+
+Smoke-check round (1 round Haiku) before the full baseline
+caught two cases that were reliable on Haiku 4.5 but had
+expectation/budget issues:
+
+- **Case 28** (`plan-mode-multi-tool-readonly-chain`):
+  `status: exhausted` because `maxSteps: 6` was tight
+  for grep + read + plan-markdown emission. Bumped to
+  `maxSteps: 8`. Strictly more permissive — cannot break
+  any other case.
+- **Case 29** (`plan-and-policy-coexist`): asserted
+  `output_contains: "# Plan"` after a policy-denied
+  bash call. Model correctly attempted bash → got
+  denied → reported the denial → did NOT emit a plan
+  markdown afterward. The case's core invariant is the
+  gate-stack composition (`tool_denied: bash` after
+  plan-gate let it through). Plan-markdown emission
+  was over-broad assertion outside the case's scope.
+  Dropped that one assertion. Strictly weaker — cannot
+  break what was passing.
+
+Both fixes re-verified on Haiku (35/35 second
+smoke-check) before the 3-round baseline kicked off.
+
+**gpt-4o-mini divergences (per-case stability):**
+
+| # | Case | Stability | Diagnosis |
+|---|---|---|---|
+| 12 | glob → read first match | 0/3 | gpt-4o-mini calls glob and stops — interprets the file list as the answer rather than chaining into read_file |
+| 23 | compaction multi-round | 0/3 | Hits `maxSteps: 14` budget. gpt-4o-mini takes more steps than Haiku for the same 10-read sequence. Even with `--timeout-ms 180000` (validated separately), still exhausts. Different completion strategy, not a wall-clock issue |
+| 28 | plan + multi-tool readonly chain | 0/3 | Same family as #12: calls grep, never read_file. `status: error` |
+| 30 | grep → edit | 0/3 | Same family: calls grep, never edit_file |
+| 5 | edit_file disambiguation | 2/3 | Round 2 the model called write_file instead of edit_file, even with the file already existing. Flaky |
+| 25 | compaction preserve_tail=0 | 1/3 | Rounds 1+2 picked wrong tools (glob/grep instead of read_file). Round 3 worked. Inconsistent prompt interpretation |
+
+Pattern: 4 of 6 failures are "gpt-4o-mini calls one tool
+of a multi-tool chain and stops." Case 23 is a different
+family (more-steps-than-Haiku for the same work). Case 5
+is rare flake.
+
+**Decisions:**
+
+- **Cases 12, 28, 30, 23 stay in the suite — no prompt
+  gaming.** Step 6.5 explicitly documented: "If the
+  case fails reliably on one provider but passes on
+  another, that's a model capability divergence, not a
+  harness bug — record it in the parity matrix and
+  accept it." Strengthening prompts ("YOU MUST CALL X
+  THEN Y") to satisfy the weaker model would game the
+  test, hide the real model gap, and create false
+  confidence. The cases capture real coverage on
+  Haiku 4.5 and any future stronger model. They will
+  light up red on gpt-4o-mini as expected and that's
+  diagnostic, not a bug.
+- **Provider-aware threshold becomes the gate model.**
+  CI gate (deferred per `docs/TODO.md`) cannot use a
+  flat 100%-pass threshold across providers. Two
+  options:
+  1. Per-provider thresholds: 100% on Haiku, ≥85% on
+     gpt-4o-mini.
+  2. Provider-agnostic core suite + provider-specific
+     extension cases: cases known to be model-strength
+     dependent live in a sibling tier
+     (`evals/regression-frontier/`?).
+  Option 2 is conceptually cleaner; option 1 ships
+  faster. Defer the choice to when CI gate is
+  actually being wired (it's not blocking M3 progress).
+- **Case 23's `maxSteps: 14` stays.** Bumping to 20+
+  to satisfy gpt-4o-mini would let the case pass on
+  any provider regardless of efficiency. The point of
+  step budgets is exactly to detect inefficient
+  completion paths. Same model-capability-disclosure
+  argument.
+- **No new harness features required.** Confirmed
+  during the run that everything we need is already
+  there: NDJSON output, per-case aggregates, variance
+  reporting. The only operational improvement is a
+  `--timeout-ms` flag that already exists; using it
+  per-provider in baseline runs is a doc convention,
+  not a code change.
+
+**Cut (kept the close tight):**
+
+- **No live re-categorization of cases into tiers.**
+  Sliding cases 12, 23, 28, 30 into a "frontier-only"
+  tier today would require both a directory move AND a
+  decision on the per-provider gate semantics. Both
+  defer to CI-gate work (TODO.md). Today the cases
+  stay in `evals/regression/` and the parity matrix
+  documents the divergence.
+- **No expansion to ~100 cases.** The original Step 1
+  target. Reaching 100 means scaling each batch by ~3×.
+  Lesson learned in 1.6: scaling cases without
+  scaling provider coverage means accumulating
+  Haiku-only coverage. Better to scale providers
+  next (e.g., add Sonnet 4.6 to the parity matrix —
+  cheap, faster, and validates the Anthropic family
+  more thoroughly) before adding more cases.
+- **No real-model run for case 23 with bumped
+  maxSteps.** Validated separately at maxSteps:14 +
+  timeout 180s — still exhausts on gpt-4o-mini. The
+  capability gap is real, not a budget artifact.
+
+**Pending (M3 next steps after Step 1):**
+
+- M3 Step 2: pick the next subsystem from the M3
+  scope: subagents, MCP, checkpoints+`/undo`,
+  `bash_background`, `todo_write`, or Repo Map
+  (tree-sitter). Priorities driven by which one
+  blocks the most downstream work.
+- Per-provider CI gate decision, when CI work
+  resumes from `docs/TODO.md`.
+- Case-tier resolution for divergent cases (option 1
+  vs option 2 above) when CI gate lands.
+
+**Risks documented:**
+
+- **Haiku-only suites accumulate silently.** Today
+  every regression case was authored against Haiku
+  observability. Future cases written without a
+  cross-provider sanity check will pile on more
+  Haiku-only coverage. Mitigation: every new batch
+  should run a 1-round gpt-4o-mini smoke check before
+  closing the batch — the cost is trivial ($0.05 per
+  35-case round).
+- **gpt-4o-mini's chain-stopping pattern may
+  generalize.** Cases 12, 28, 30 all fail on the
+  same primitive: chain second-tool dispatch. If a
+  future user runs Forja against gpt-4o-mini for a
+  real workflow that depends on chained tool calls,
+  they'll hit the same wall — and we'd rather they
+  hit it in our regression suite than in production.
+  The 0/3 result is the operator-facing signal:
+  "this provider+model combination is not chain-safe
+  on tool sequences."
+- **The cost gap (9.8×) understates the value gap.**
+  Pass rate adjusted: Haiku 4.5 effective cost per
+  passed case ≈ $0.0076/case; gpt-4o-mini ≈ $0.0009/
+  case but only 86.7% reliable. Quality-weighted, the
+  ratio narrows substantially. This nuance belongs in
+  M7 (hybrid profile) cost modeling — flagged here so
+  the spec PR doesn't quote the raw 9.8× number.
+
+**Spec reference:** `AGENTIC_CLI.md §16` (eval tiers,
+golden traces), `PROVIDERS.md §7` (multi-model
+first-class), `src/evals/cli.ts` (`--timeout-ms` flag).
+
+---
+
+## [2026-04-28] M3 / Step 1.5 — Regression batch 4: multi-tool flows
+
+Continues M3 / Step 1 with batch 4 — 6 cases that
+exercise multi-tool sequences and parallel dispatch. Total
+in `evals/regression/` is now 35.
+
+**Step 1.4 collapsed.** The original plan called Step 1.4
+"provider adapter parity matrix" (re-run a subset under
+OpenAI and Gemini). With Gemini deferred indefinitely
+(see `docs/TODO.md`), and with the regression cases being
+provider-agnostic by construction (the runner accepts
+`--model` for any registered provider), the parity
+"matrix" reduces to "run the suite under Anthropic, then
+under OpenAI." That's a measurement task, not an authoring
+task — it folds into Step 1.6 where we produce the real-
+model baseline. Skipping 1.4 doesn't drop coverage; it
+recognizes the work was always going to happen under a
+different name.
+
+**Why multi-tool flows matter:**
+
+- Real workflows chain tools. Smoke and batches 1-3 are
+  largely single-tool: each case proves "tool X works
+  for behavior Y." Multi-tool exercises the seam — the
+  tool_result of call N flows into the args of call N+1.
+- Parallel dispatch (multiple tool_use blocks in one
+  assistant turn) is a provider-adapter concern.
+  Step 6.3 noted this "behaved correctly" for both
+  Anthropic and OpenAI under smoke, but smoke never
+  forces parallel dispatch — case 34 does.
+- Edit-after-read is the modal refactor pattern; if it
+  silently regressed, every code-modifying workflow
+  would break and smoke would still pass.
+
+**Done — cases 30-35:**
+
+| # | Flow | Why this case |
+|---|---|---|
+| 30 | grep → edit_file | Find-and-fix workflow. Asserts the matched file is the one mutated, AND that edit_file (not write_file) was used — preserves the in-place semantics |
+| 31 | read_file → write_file (derived) | Data-transformation pattern: read input.json, sum its array, write output.json. Asserts input is preserved verbatim, output contains the derived value |
+| 32 | read_file → edit_file (same file) | Read-then-modify-based-on-contents: read version.txt (`41`), edit to `42`. The model's edit_file `old_string` must be derived from the prior read result. Catches a regression where tool_result content fails to round-trip into subsequent tool args |
+| 33 | glob → edit_file (one of N) | File-selection-then-mutation: glob finds 3 TS files; edit only `alpha.ts`; assert the other two are unchanged. Three negative `file_contains` assertions — the most defensive case in the batch |
+| 34 | parallel tool_use (3 reads, 1 turn) | Explicit instruction to dispatch all three read_file calls in a SINGLE assistant turn. Provider adapters serialize parallel tool_use differently (Anthropic emits multiple tool_use blocks per content array; OpenAI emits a tool_calls array) — this case is the regression net for that adapter logic |
+| 35 | glob → read ×N → write_file | 3-step chain. Glob finds 3 TS files, reads each, writes summary.txt with derived data (function return values per file). Asserts depth: 2-step works in cases 30-34, this proves 3-step composes |
+
+**Cut (out of scope for this batch):**
+
+- **No grep → write_file case.** Would test the same
+  "tool A drives tool B" axis as case 30 with a
+  weaker assertion (write creates new files; edit
+  asserts the IN-PLACE constraint). Case 30 is
+  strictly stronger.
+- **No bash → file-tool chains.** Bash output as input
+  to read_file is somewhat implicit in case 35
+  (glob → read), and bash → write would test
+  composition that's already covered by case 31's
+  read → write pattern. Diminishing returns.
+- **No 4-step chains.** If 3-step works, 4-step
+  failing would be a budget issue
+  (`maxSteps`/`maxToolErrors`), not a composition
+  issue. Cases 35's 10-step budget already gives the
+  model headroom; deeper chains pay for themselves
+  only when concrete bugs appear.
+
+**Decisions:**
+
+- **Case 31 uses `[10, 20, 30, 40]` summing to 100.**
+  Picked deliberately: `100` is short enough for
+  `output_contains` to be unambiguous (no ambient `100`
+  in the prompt or fixture), and the math is trivial
+  enough that arithmetic errors aren't a model-skill
+  test. If a model can't sum 4 small integers, it has
+  bigger problems than the harness.
+- **Case 32's `41 → 42` is intentional.** `42` is
+  unique in the fixture (input is `41`, no other 42s
+  exist anywhere in setup). The increment is the
+  smallest-possible derived computation — same
+  philosophy as case 31, isolating the harness from
+  model arithmetic skill.
+- **Case 33 asserts unchanged files explicitly.** Three
+  separate `file_contains` assertions on the
+  not-edited files. Slight assertion bloat but worth
+  it: a regression where the model edits the WRONG
+  file (e.g., picks delta.ts because of alphabetical
+  confusion) would otherwise pass — assertion on the
+  target alone wouldn't catch the collateral mutation.
+- **Case 34 trusts the model on parallel dispatch.**
+  The prompt is explicit ("emit all three read_file
+  calls in a SINGLE assistant turn"). If a provider
+  adapter regresses — say, splits parallel tool_use
+  into sequential calls under the hood — the case
+  still passes (3 sequential reads also yields the
+  three colors in output). This case proves the
+  end-to-end semantics, not the wire-level dispatch
+  shape. The wire-level test is in unit coverage
+  (`tests/providers/*-stream.test.ts`).
+
+**Pending (Step 1.6):**
+
+- Real-model baseline run across the full 35-case
+  suite under Anthropic (Haiku 4.5) and OpenAI
+  (gpt-4o-mini), 3 rounds each. Decisions to make at
+  that point:
+  1. Cost envelope: 35 × ~$0.005 × 3 = ~$0.50 per
+     provider per baseline. Acceptable.
+  2. Wall-clock: 35 × ~5s × 3 ≈ 8min serial — close
+     to the spec target (<10min). Parallelism still
+     deferred unless this exceeds.
+  3. Drop list: any case that fails reliably across
+     rounds for model-behavior reasons (not harness
+     bugs) gets pulled per the Step 6.5 honesty pass.
+
+**Risks documented:**
+
+- **Case 34 may not actually parallel-dispatch.**
+  Models sometimes ignore the "single turn" hint and
+  serialize anyway, especially smaller ones. The
+  case still passes via the output assertions
+  (sequential reads also produce all three colors),
+  but the test is silently weaker than intended. If
+  we want to force parallel dispatch as a hard
+  invariant, we'd need a new `parallel_tool_use`
+  expectation kind that asserts ≥2 tool_use blocks
+  appeared in a single assistant message. Tracked
+  here, not implemented — adding the expectation
+  kind is a §1.7+ harness change.
+- **Case 35's three-step chain is the longest in
+  the suite.** If the model halts after step 2
+  ("here's the data" without writing), the case
+  fails on `file_exists: summary.txt`. The prompt
+  is explicit about all three steps with numbered
+  instructions; further hand-holding would feel
+  test-gaming. If the case flakes, the right fix is
+  at the suite-level summary (mark as flaky in the
+  parity matrix) rather than rephrasing.
+- **Case 33's negative assertions can mask reads.**
+  `file_contains: src/beta/beta.ts pattern: return 2;`
+  passes IF the file is unchanged OR if the model
+  rewrote the file with the same content. Highly
+  unlikely in practice, but flagging the assertion
+  pattern: `file_contains` is presence, not absence
+  of mutation. Only `tool_not_called: edit_file`
+  would catch a no-op edit, but cases 30/32/33 all
+  *want* edit_file to be called once. We accept
+  this gap — a model that no-op-edits the wrong
+  file is a regression class smoke wouldn't catch
+  either.
+
+**Spec reference:** `AGENTIC_CLI.md §7` (tool system),
+`§7.1` (tools v1), `PROVIDERS.md` (parallel tool_use
+adapter contract), `src/providers/*-stream.ts`
+(per-provider parallel-dispatch normalization).
+
+---
+
+## [2026-04-28] M3 / Step 1.3 — Regression batch 3: compaction + plan mode
+
+Continues M3 / Step 1 with batch 3 — 7 cases that
+exercise compaction edge cases, plan-mode harness gates,
+and the plan/policy gate composition. Total in
+`evals/regression/` is now 29.
+
+**Why this slice next:**
+
+- Smoke covers ONE compaction (case 08, `min_count: 1`,
+  `strategy: llm`). It does not cover: multiple
+  compactions in a single run, the goal-reinjection
+  layer's correctness, `preserveTail: 0` (most-aggressive
+  fold), or compaction under `--plan`. Each is a real
+  failure mode in the spec (`AGENTIC_CLI §6.1`,
+  `CONTEXT_TUNING §3`).
+- Plan mode smoke covers write_file blocking (case 05).
+  edit_file uses a different harness code path
+  (`invoke-tool.ts:175-195`); a regression there would
+  pass smoke and ship broken. Edge case is worth a
+  dedicated case.
+- The plan/policy interaction has zero coverage outside
+  unit tests. Subagents will extend the gate stack
+  (sandbox, then plan, then policy, then hooks); pinning
+  the existing two-layer composition NOW means future
+  layer additions have a known-good baseline to compare
+  against.
+
+**Done — cases 23-29:**
+
+| # | Subsystem | Why this case |
+|---|---|---|
+| 23 | compaction multi-round | `min_count: 2` — fixture forces ≥2 compactions by re-reading the chunky-modules tree twice. Catches a regression where the second compaction silently no-ops or deadlocks |
+| 24 | compaction preserves goal | Embeds literal token `MARKER_24_GOAL_KEPT` in the prompt; asserts it survives in final output despite compaction firing. Tests the goal-reinjection layer (`compact*.ts:240-242` "subsequent compactions must see the ORIGINAL goal") under load |
+| 25 | `preserveTail: 0` | Most-aggressive fold: every middle turn becomes summary, no literal tail preserved. Asserts the run still completes to `status: done` and reports the verbatim dependency. Catches a regression where preserve_tail=0 trips the alignment-shift edge (`loop.ts:482-484` `+ 2` accounting) |
+| 26 | compaction under `--plan` | 4-axis intersection: plan + read_file ×5 + compaction triggered + plan markdown emitted. Catches regressions where compaction's LLM call somehow trips the plan-mode write gate (it shouldn't — different layer — but composition is exactly the kind of thing that breaks silently) |
+| 27 | plan blocks edit_file | Symmetric with smoke 05 on the edit_file path. Different harness code (`invoke-tool.ts` plan-gate predicate), different deny message. Asserts greeting.txt content unchanged after the run |
+| 28 | plan + multi-tool read-only chain | grep → read_file chain in plan mode, both pass plan-gate, plan markdown emitted. Negative side: write_file/edit_file not called. Documents that read tools chain freely under plan; the gate is precisely targeted at writes |
+| 29 | plan + policy compose | The big one: plan: true + bash with read_only:true + policy `bash.deny: ['cat *']`. Plan-gate sees read_only and lets it pass; policy deny then fires. Asserts `tool_denied: bash` AND plan markdown present AND fixture file unchanged. Catches any regression where one gate silently swallows the other's decision |
+
+**Cut (kept the slice tight):**
+
+- **No `strategy: fallback` case.** Forcing the
+  compaction LLM call to fail requires either provider
+  fault injection (no surface today) or an unreachable
+  network. Mock providers cover this in unit tests
+  (`tests/harness/compact*.test.ts`); a real-model case
+  would either flake on transient errors or never
+  trigger the fallback path. `tool_denied`-style
+  rigor: keep harness-internal behavior in unit tests;
+  reserve regression for "model + harness end-to-end."
+- **No `compaction-skipped` case.** When prompt
+  doesn't exceed threshold, no compaction event fires.
+  Asserting "no compaction" via absence is weaker than
+  asserting presence, and the existing 8 cases without
+  compaction triggers already implicitly exercise this
+  path (they pass without firing compaction). Skipped
+  is the default; default doesn't need a dedicated
+  case.
+- **No multi-strategy-mix case.** A run where
+  compaction round 1 succeeds with `llm` and round 2
+  falls back to `fallback` would be the highest-value
+  test of the strategy field — but again, requires
+  fault injection. Deferred to whenever the harness
+  grows a strategy-override env var (`CONTEXT_TUNING`
+  open question).
+
+**Decisions:**
+
+- **Fixture reuse over fixture proliferation.** Cases
+  23, 24, 25, 26 all consume `chunky-modules`. The
+  fixture was sized for one compaction; lowering
+  `compactionThreshold` to 0.01 in case 23 forces two
+  without changing the fixture. Ad-hoc threshold
+  tuning per case keeps fixtures stable.
+- **`MARKER_24_GOAL_KEPT` is intentionally weird.** The
+  compactor's LLM-summarization step gets a goal that
+  contains an explicit "must be honored in your FINAL
+  message" instruction. If the summary correctly
+  preserves the goal, the marker re-enters the
+  context and the model echoes it. If the summary
+  paraphrases the goal away (regression), the model
+  has no source for the marker. The token's
+  uniqueness (`MARKER_24_GOAL_KEPT` is a literal not
+  found in any fixture or system prompt) means a hit
+  on `output_contains` cannot come from anywhere
+  else.
+- **Case 29 frames the policy denial as expected.**
+  The prompt explicitly says "the policy layer is a
+  separate gate — it may block the command for its
+  own reasons." Same Step 6.5 mitigation: model has
+  permission to attempt the call (so policy gets to
+  fire), and the prompt won't trip preemption
+  defenses by sounding malicious.
+
+**Pending (Step 1.4 onward):**
+
+- 1.4: provider adapter parity matrix — re-run a
+  selected subset of batches 1-3 under OpenAI and
+  Gemini (when smoke unblocks), publish the matrix.
+- 1.5: multi-tool flows (grep→edit, glob→write,
+  bash→edit). Cross-tool sequences not yet tested.
+- 1.6: real-model baseline across full ~100-case
+  suite, 3 rounds, decide on parallelism.
+
+**Risks documented:**
+
+- **Case 23 budget tight at maxSteps: 14.** Reading
+  10 files (5 × 2) plus model thinking turns may
+  bump against the cap. If the case starts failing
+  with `exhausted` instead of `done`, raise to 16.
+  Tracked here so future debugging starts at the
+  right knob.
+- **Case 24 depends on instruction-following AND
+  goal preservation.** Two failure modes that a
+  single failed run can't distinguish:
+  - Goal got dropped by the summarizer (harness
+    bug) — the fix is in `compact*.ts`.
+  - Goal preserved but model ignored the marker
+    instruction (model bug) — drop the case.
+  When this case starts failing, the next-step
+  diagnosis is to read the audit log: did the
+  post-compaction message stack contain
+  `MARKER_24_GOAL_KEPT`? If yes, model-side; if no,
+  harness-side. Documented here so the bisection
+  is a transcript-read, not a binary search through
+  prompt rewording.
+- **Case 25's `preserveTail: 0` may break some
+  models.** Without literal tail, the model relies
+  entirely on its own summary of intent. Smaller
+  models (gpt-4o-mini in our smoke set) may lose
+  track of where they were in the sequence. If the
+  case fails reliably on one provider but passes on
+  another, that's a model capability divergence,
+  not a harness bug — record it in the parity
+  matrix (Step 1.4) and accept it.
+
+**Spec reference:** `AGENTIC_CLI.md §5` (plan mode),
+`§6.1` (compaction), `CONTEXT_TUNING.md §3` (preserve
+parameters), `src/harness/compact*.ts` (goal preservation
+implementation).
+
+---
+
+## [2026-04-28] M3 / Step 1.2 — Regression batch 2: permission engine
+
+Continues M3 / Step 1.1 with batch 2 — 10 cases that
+exercise the permission engine surface (`src/permissions/
+engine.ts`). Each case ships its own
+`.agent/permissions.yaml` via `setup.files`, which the eval
+executor wires up automatically (`src/evals/executor.ts`
+drops a default `bypass` policy only when the case+fixture
+didn't provide one — see lines 108-115).
+
+**Why permissions next:**
+
+- Smoke runs entirely in default `bypass`. The engine has
+  unit coverage but never round-tripped under load with a
+  real model emitting tool calls under deny rules. M2's
+  smoke proves "the model uses tools"; this proves "the
+  model handles being told no."
+- The engine is the surface that subagents (M3 next),
+  MCP (M3+), and hooks (M4) layer on top of. Catching
+  regressions here BEFORE those subsystems land means we
+  know any future deny-class bug is in the layer above,
+  not below.
+
+**Done — cases 13-22 (numbered to extend batch 1):**
+
+| # | Engine surface | Why this case |
+|---|---|---|
+| 13 | `defaults.mode: strict` + no rules → default deny | Bedrock invariant: empty strict = nothing allowed. Asserts `tool_denied` after the model tries — proves the gate fires, not just that the model preempted |
+| 14 | `confirm_paths` + no UI → silent deny | Documents the M1-era behavior (`invoke-tool.ts:235-251`): confirm becomes `confirm_no` when no operator. Uses `file_not_exists` instead of `tool_denied` because the engine emits `kind: confirm`, not `deny` — cleanly distinguishes the two paths |
+| 15 | `bash.allow` matches → allow | Positive case: the rule actually permits when intended. `echo *` with `read_only: true` |
+| 16 | `bash.deny` wins over `bash.allow` | Asserts the deny-precedence invariant from `engine.ts:90-95` — gives the model BOTH `allow: ['*']` and `deny: ['rm *']`, expects `rm` denied |
+| 17 | `write_file.deny_paths` blocks under `acceptEdits` | Confirms deny_paths fires even under acceptEdits (the most permissive non-bypass mode). `secrets/**` blocked despite `allow_paths: ['**']` |
+| 18 | `write_file.allow_paths` permits under strict | Positive path-rule case: `*.md` allows `notes.md`. Mirror of #20 |
+| 19 | `read_file.deny_paths` blocks reads | Symmetric with #17 for the read axis. Catches any future regression where deny_paths is silently treated as write-only |
+| 20 | strict + write outside allow_paths → deny | Negative path-rule case: `*.md` rule does NOT cover `data.json`. Default deny under strict |
+| 21 | acceptEdits + no rule → still deny | The single most likely confusion vector for users: "acceptEdits" sounds like "allow all edits". It's not — it auto-accepts `confirm_paths` matches but unmatched paths still deny (`engine.ts:172-175`). This case proves the engine matches the JSDoc |
+| 22 | `bypass` short-circuits even deny rules | `engine.ts:221-223` returns `allow` before any rule runs. Asserts that adding a deny rule to a bypass policy is a no-op — important for operators who think they're "hardening" bypass with selective denies |
+
+**Cut (bounded scope):**
+
+- **No `confirm` decision via `tool_denied`.** The
+  `tool_denied` expectation fires only on `kind: 'deny'`
+  per `executor.ts:137-141`. Confirm decisions emit
+  `kind: 'confirm'` and the harness layer turns them
+  into `confirm_no` errors. Case 14 routes around this
+  by asserting on `file_not_exists` directly. Adding
+  a `tool_confirmed` expectation kind was considered
+  and rejected — the existing surface is enough; one
+  more discriminant would be paid for thinly until
+  the M2 confirm-UI lands.
+- **No FetchPolicy cases.** `web.fetch` is the engine
+  category, but no `fetch_url` tool exists yet — the
+  builtin tool surface stops at the 6 from M1. Coverage
+  arrives when the tool does, not before.
+- **No hierarchy cases (enterprise / user / project /
+  session).** `src/permissions/hierarchy.ts` resolves
+  layered policies, but eval cases ship a single
+  `.agent/permissions.yaml` (the project layer). Real
+  hierarchy testing needs multi-file fixtures and
+  potentially HOME/XDG override surfaces — out of
+  scope for batch 2, comes back when subagents start
+  using the session layer.
+
+**Decisions:**
+
+- **Phrase prompts so the model attempts the call.**
+  Step 6.5's lesson cuts here too: aligned models
+  preempt suspicious requests. For deny-class cases
+  (13, 16, 17, 19, 20, 21) the prompt explicitly says
+  "report whatever the tool returns, even if it's a
+  denial — do NOT switch tools, do NOT retry." The
+  model needs to invoke the gated tool for the engine
+  to deny it; if it preempts, `tool_denied` fails
+  vacuously. Mitigation: model has no policy
+  visibility (verified — policy doesn't leak into
+  system prompt; checked `harness/loop.ts:206`), so it
+  attempts naturally unless something in the prompt
+  itself looks dangerous.
+- **`acceptEdits` confusion gets its own case (#21).**
+  This is the only spec-§8 nuance ("aceita edits sem
+  confirmação") that consistently surprises operators
+  reading the policy file. Ship it as a regression
+  pinning the documented behavior so any future
+  refactor that loosens it lights up red.
+- **Loader-level guarantees re-validated implicitly.**
+  Each `.agent/permissions.yaml` shipped via
+  `setup.files` round-trips through
+  `loadPolicyFromFile` at engine construction. A
+  YAML key typo (`allow_path` singular) would crash
+  the case at load time with the policy parser's
+  rejection message — so these cases also prove the
+  policy parser stays strict-but-tolerant under load.
+
+**Pending (Step 1.3 onward):**
+
+- Compaction edge cases: preserve-tail boundaries,
+  fallback strategy when LLM call fails, multiple
+  compactions in one run.
+- Plan mode + multi-tool interleaving (plan + bash +
+  edit attempt).
+- Cross-cutting: bash deny when plan mode also active
+  (which gate fires first?).
+
+**Risks documented:**
+
+- **Cases 13, 16, 17, 19, 20, 21 depend on the model
+  attempting the call.** Same vector that bit Step 6.5.
+  Mitigation in prompt phrasing above. Worst case: a
+  case fails 0/3 because the model preempted on every
+  round. The right response then is to drop the case
+  (per the Step 6.5 honesty pass), not to tweak the
+  prompt until it works — model-behavior tests vs
+  harness-behavior tests stay separated.
+- **Path glob semantics use `**` literally.** YAML
+  parsers can be subtle about `**` inside flow scalars;
+  block scalars (used here) sidestep the issue. If a
+  future case writes the policy inline as a flow scalar
+  and `**` interacts with anchors/aliases, the rule
+  silently doesn't match. Pin the convention: always
+  block-scalar policy YAMLs in `setup.files`.
+
+**Spec reference:** `AGENTIC_CLI.md §8` (permission
+engine), `§9` (trust & safety), `src/permissions/engine.ts`
+(deny-precedence and bypass-shortcircuit invariants).
+
+---
+
+## [2026-04-28] M3 / Step 1.1 — Regression tier scaffold + first batch
+
+Opens M3 by attacking the spec §16 mandate "regression
+(~100 cases, < 10min) — todo PR" before subsystems that
+will lean on it (subagents, MCP, checkpoints). Step 1.1 is
+the first slice: scaffold `evals/regression/` and land a
+first batch (~12-15) of cases that exercise tool surface
+edge cases the smoke tier intentionally skips.
+
+**Why this slice first:**
+
+- The harness already supports any directory under
+  `evals/`. Runner is uncoupled from naming convention
+  beyond `*.yaml` extension (verified in `src/evals/cli.ts`
+  `discoverCases`). So a regression tier needs no
+  harness changes for the simplest path — just YAML.
+- Subagents, MCP, checkpoints (the rest of M3) all add
+  surfaces that need regression coverage. Building the
+  tier *first* means those subsystems get born with a
+  net under them, instead of retrofitting tests after
+  the fact.
+- Regression as a TIER also unlocks the CI gate item in
+  `docs/TODO.md` once it stabilizes.
+
+**Plan (stepwise):**
+
+- 1.1 — scaffold + tool-depth batch (~12-15 cases). This
+  entry.
+- 1.2 — permission engine cases (deny/allow/ask hierarchy
+  edges, `.agent/permissions.yaml` glob matching, prefix
+  rules).
+- 1.3 — compaction + plan mode edge cases (preserve-tail
+  boundaries, fallback strategy when LLM call fails,
+  plan mode + multi-tool interleaving).
+- 1.4 — provider adapter parity matrix (same case across
+  Anthropic / OpenAI / Gemini once Gemini smoke unblocks).
+- 1.5 — multi-tool flows (glob→read, grep→edit, bash→write).
+
+**Decisions to make explicit upfront:**
+
+- **No real-model baseline run inside Step 1.1.** Writing
+  cases and confirming they parse is one unit; running
+  them against a paid provider is another. Cost
+  envelope per real-model run scales with case count
+  (15 cases × $0.005 ≈ $0.075/round; 100 cases × 3
+  rounds ≈ $1.50). Real-model baseline lands in Step 1.6
+  after the 5 batches stabilize, so the cost is paid
+  once on a complete suite instead of paid 5 times on
+  intermediate states.
+- **Cases stay deterministic-by-design.** Avoid
+  expectations that depend on model-specific phrasing
+  (the Step 6.3 lesson: `output_contains: "hello world"`
+  was a property of Haiku, not the harness). Prefer
+  tool-call invariants (`tool_called`, `file_contains`,
+  `file_exists`, `tool_denied`).
+- **No new harness features in 1.1.** Parallelism (to
+  hit the < 10min target with 100 cases) is a separate
+  step. Today, regression runs serial like smoke.
+
+**Spec reference:** `AGENTIC_CLI.md §16` (eval tiers),
+`PROVIDERS.md §7` (multi-model first-class).
+
+**Done:**
+
+- New tier directory `evals/regression/` born with its
+  first 12 cases. No `.gitkeep`, no README — the
+  directory is created by the YAMLs themselves, mirroring
+  the project rule that empty folders are noise.
+- Cases (numbered for stable ordering, not for
+  dependency):
+
+  | # | Subsystem under test | Insight beyond smoke |
+  |---|---|---|
+  | 01 | `read_file` offset/limit | smoke reads whole file; this proves the line-window args round-trip through tool dispatch |
+  | 02 | `read_file` missing path | error path; model must NOT fall back to write_file |
+  | 03 | `write_file` deep nested dir | smoke writes at root; this proves intermediate dir creation |
+  | 04 | `write_file` overwrite | smoke creates new file; this proves stale content gets replaced |
+  | 05 | `edit_file` disambiguation | exercises the ambiguity-fail path: model must use surrounding context to pick one of two identical substrings |
+  | 06 | `edit_file` missing pattern | error path; model must NOT fall back to write_file |
+  | 07 | `grep` zero matches | empty-result path; model must NOT invent matches or write files |
+  | 08 | `grep` real regex | proves regex (not literal) interpretation: `function\s+\w+` finds 3 names |
+  | 09 | `glob` deep nesting | `**/*.ts` walks 3 directory levels |
+  | 10 | `glob` zero matches | empty-result path; symmetric with 07 for the file-discovery axis |
+  | 11 | `bash` piped command | `wc -l < file` exercises shell redirection in plan-friendly mode |
+  | 12 | multi-tool glob→read | proves tool-call chaining: glob output drives read_file path |
+
+- New fixture `evals/fixtures/nested-tree/` carries the
+  3-level TS tree used by cases 08, 09, and 12 (one
+  fixture, three cases — keeps fixtures tight). Inline
+  `setup.files` covers the 6 cases (01, 04, 05, 06, 11,
+  and 03 implicitly via writes to a fresh workspace) where
+  a one-liner file is enough — fixture dirs are reserved
+  for trees with structure.
+- All 12 YAMLs verified to load through
+  `src/evals/loader.ts` without a single parse error.
+  Loader-level invariants exercised:
+  - inline `setup.files` paths (relative-only, no `..`)
+  - `tool_called` / `tool_not_called` / `file_contains` /
+    `file_exists` / `file_not_exists` / `output_contains`
+    / `status` discriminants
+  - YAML literal block (`|`) for multi-line file content
+- `bun run typecheck`, `bun run lint`, and `bun test`
+  all green (625 pass, 0 fail) — no source touched, no
+  drift introduced.
+
+**Cut (kept the slice tight):**
+
+- **No README in `evals/regression/`.** CLAUDE.md
+  prohibits unsolicited markdown docs; the convention is
+  documented here in BACKLOG and self-evident in the
+  YAMLs themselves. If a second contributor lands and
+  asks "what goes in regression vs smoke?", that's the
+  signal to write the README — pre-writing it would be
+  speculative documentation.
+- **No real-model baseline run.** Confirmed in the
+  opening entry above — paying $0.30+ for a 12-case
+  Haiku baseline today, then re-paying it after each of
+  the 4 remaining batches lands, would cost ~$1.50
+  unnecessarily. Single baseline run gates Step 1.6
+  (closes the regression tier) instead.
+- **No new harness features.** Considered adding a
+  `--tier` shorthand (`bun run eval:regression`) but
+  the existing CLI already accepts a directory arg, so
+  `bun run eval -- evals/regression` works today. A
+  shorthand is shoe-leather; deferred until the tier
+  proves it deserves one.
+
+**Decisions:**
+
+- **Determinism over model-style assertions.** Every
+  case asserts on harness-observable facts
+  (`tool_called`, `file_contains`, `status: done`) plus
+  at most a single `output_contains` fragment that's a
+  literal echo of fixture content (e.g., `line three`,
+  `alpha.ts`). No assertions on phrasing, sentence
+  structure, or summarization style. This is the Step
+  6.3 lesson applied at scale: provider divergence is
+  guaranteed; we only assert on what the harness sees.
+- **Negative tool calls (`tool_not_called`) earn their
+  weight.** Cases 02, 06, 07, and 10 all pair the
+  positive `tool_called` with a `tool_not_called:
+  write_file` to defend against the failure mode where
+  a model "fixes" a missing file/pattern by writing
+  one. The `code-with-todos` fixture in cases 07 and
+  10 is read-only by intent — any write_file invocation
+  is a regression.
+- **Inline files vs fixture dirs.** Drew the line at
+  "does the case need >1 file or directory structure?"
+  Yes → fixture. No → inline. Keeps cases readable
+  without forcing a fixture dir for every single-file
+  scenario.
+
+**Pending (Step 1.2 onward):**
+
+- Permission engine cases (deny/allow/ask hierarchy
+  edges, `.agent/permissions.yaml` glob matching).
+- Compaction + plan mode edge cases.
+- Provider adapter parity matrix (waits on Gemini smoke
+  unblock — see `docs/TODO.md`).
+- Multi-tool flows beyond glob→read (grep→edit,
+  bash→write, plan→summarize).
+- Step 1.6: real-model baseline across the full
+  ~100-case suite, 3 rounds, decide on parallelism.
+
+**Risks documented:**
+
+- **Suite size will eventually need parallelism.** At
+  ~5s per case serial (smoke baseline), 100 cases × 3
+  rounds = 25 minutes. Spec target is < 10min. Step
+  6.3's smoke is round-major precisely so prompt-cache
+  helps; that's not enough at 100 cases. Worker pool
+  with N=4 is the obvious next step but introduces
+  ordering nondeterminism in the NDJSON output, which
+  the existing aggregate logic doesn't account for.
+  Tracked as Step 1.7-or-later.
+- **Inline `setup.files` heredocs accumulate.** 6 of 12
+  cases use them. If a future case wants the same
+  multi-line file, copy-paste tax grows. Rule of
+  three: the third copy of any inline body promotes to
+  a fixture.
+
+---
+
 ## [2026-04-28] M2 / Step 6.5 — Plan-mode bash gate: limit found, scope honest
 
 A code-review observation (`bash` marked `planSafe: true` could

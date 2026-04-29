@@ -91,6 +91,23 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
       return toolError(ERROR_CODES.aborted, 'tool aborted before grep', { retryable: true });
     }
 
+    // Schema declares max_results minimum: 1 but providers don't
+    // enforce schema constraints — model JSON arrives unvalidated.
+    // Without this check, the value flows into String() and into
+    // ripgrep's --max-count flag, surfacing as a messy CLI parse
+    // error ("invalid value 'abc' for '--max-count'") instead of
+    // a clean tool.invalid_arg.
+    if (args.max_results !== undefined) {
+      if (
+        typeof args.max_results !== 'number' ||
+        !Number.isFinite(args.max_results) ||
+        !Number.isInteger(args.max_results) ||
+        args.max_results < 1
+      ) {
+        return toolError(ERROR_CODES.invalidArg, 'max_results must be a positive integer (>=1)');
+      }
+    }
+
     const max = args.max_results ?? DEFAULT_MAX;
     // Pass --max-count as a per-file safety so a single huge file can't
     // dominate the budget. The global cap is enforced below by counting

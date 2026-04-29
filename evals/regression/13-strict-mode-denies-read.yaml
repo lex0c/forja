@@ -1,0 +1,19 @@
+name: strict mode with no rules default-denies
+prompt: |
+  Use the read_file tool to read `notes.txt`. Reply with whatever the tool
+  returns, even if it's an error. Do NOT switch to a different tool, do NOT
+  invent contents from memory.
+setup:
+  files:
+    notes.txt: |
+      this content should never reach the model
+    .agent/permissions.yaml: |
+      defaults:
+        mode: strict
+expect:
+  - tool_called: read_file
+  - tool_denied: read_file
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

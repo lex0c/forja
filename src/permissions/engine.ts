@@ -203,8 +203,26 @@ const checkFetch = (
   return denyDefault(toolName, mode);
 };
 
-const lookupRules = (toolName: string, tools: PolicyToolsSection): unknown =>
-  (tools as unknown as Record<string, unknown>)[toolName];
+// Resolve the policy section name for a tool. The mapping is mostly
+// identity (`read_file` → `tools.read_file`, `bash` → `tools.bash`),
+// but the bash family — `bash`, `bash_background`, `bash_output`,
+// `bash_kill` — all share `tools.bash` so an operator writes one
+// allow/deny list instead of duplicating across four sections.
+//
+// The policy section is selected per-category, not per-tool: every
+// bash-category tool reads `tools.bash`. fs.* and web.fetch keep
+// their per-tool lookup because their semantics already differ
+// (read_file's allow_paths != write_file's allow_paths).
+const policySectionFor = (toolName: string, category: PolicyCategory): string => {
+  if (category === 'bash') return 'bash';
+  return toolName;
+};
+
+const lookupRules = (
+  toolName: string,
+  category: PolicyCategory,
+  tools: PolicyToolsSection,
+): unknown => (tools as unknown as Record<string, unknown>)[policySectionFor(toolName, category)];
 
 export const createPermissionEngine = (
   policy: Policy,
@@ -227,14 +245,14 @@ export const createPermissionEngine = (
         return checkBash(
           toolName,
           args,
-          lookupRules(toolName, policy.tools) as BashPolicy | undefined,
+          lookupRules(toolName, category, policy.tools) as BashPolicy | undefined,
           mode,
         );
       case 'fs.read':
         return checkPath(
           toolName,
           args,
-          lookupRules(toolName, policy.tools) as PathPolicy | undefined,
+          lookupRules(toolName, category, policy.tools) as PathPolicy | undefined,
           mode,
           cwd,
           false,
@@ -243,7 +261,7 @@ export const createPermissionEngine = (
         return checkPath(
           toolName,
           args,
-          lookupRules(toolName, policy.tools) as PathPolicy | undefined,
+          lookupRules(toolName, category, policy.tools) as PathPolicy | undefined,
           mode,
           cwd,
           true,
@@ -252,7 +270,7 @@ export const createPermissionEngine = (
         return checkFetch(
           toolName,
           args,
-          lookupRules(toolName, policy.tools) as FetchPolicy | undefined,
+          lookupRules(toolName, category, policy.tools) as FetchPolicy | undefined,
           mode,
         );
       case 'misc':

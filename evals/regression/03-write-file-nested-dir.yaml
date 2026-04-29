@@ -1,0 +1,16 @@
+name: write_file creates intermediate directories
+prompt: |
+  Create a new file at the path `a/b/c/note.txt` whose only content is the
+  single line: nested ok
+  The intermediate directories `a/`, `a/b/`, and `a/b/c/` do not exist yet —
+  create them as part of writing the file.
+expect:
+  - tool_called: write_file
+  - file_exists: a/b/c/note.txt
+  - file_contains:
+      path: a/b/c/note.txt
+      pattern: nested ok
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

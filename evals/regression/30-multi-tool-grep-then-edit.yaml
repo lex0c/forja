@@ -1,0 +1,19 @@
+name: multi-tool flow — grep then edit on the matched file
+prompt: |
+  Use the grep tool to find every file in `src/` that contains a `TODO`
+  comment. Then use edit_file on `src/a.ts` to remove the line that starts
+  with `// TODO`. Replace it with nothing (empty new_string). Leave the
+  rest of the file unchanged. Do NOT touch any other file.
+setup:
+  fixture: ../fixtures/code-with-todos
+expect:
+  - tool_called: grep
+  - tool_called: edit_file
+  - tool_not_called: write_file
+  - file_contains:
+      path: src/a.ts
+      pattern: export const a = 1;
+  - status: done
+budget:
+  maxSteps: 8
+  maxCostUsd: 0.15

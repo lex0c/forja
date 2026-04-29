@@ -1,0 +1,13 @@
+name: read_file recovers from missing file
+prompt: |
+  Try to read the file at `does-not-exist.txt`. If the read fails, say so
+  clearly in plain English and stop — do NOT create the file, do NOT retry
+  with a different path. Just acknowledge the file is missing and finish.
+expect:
+  - tool_called: read_file
+  - tool_not_called: write_file
+  - file_not_exists: does-not-exist.txt
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

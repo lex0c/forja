@@ -1,0 +1,20 @@
+name: bash runs piped commands
+prompt: |
+  Use the bash tool to run `wc -l < greeting.txt` and report the number of
+  lines in `greeting.txt`. Set `read_only: true` since the command does not
+  modify the filesystem. Reply with just the number, nothing else.
+setup:
+  files:
+    greeting.txt: |
+      hello
+      world
+      forja
+expect:
+  - tool_called: bash
+  - tool_not_called: write_file
+  - tool_not_called: edit_file
+  - output_contains: "3"
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

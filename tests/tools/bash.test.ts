@@ -154,4 +154,80 @@ describe('bashTool', () => {
     if (isToolError(out)) throw new Error(`unexpected error: ${out.error_message}`);
     expect(out.stdout.trim().endsWith(`${dir}/sub`)).toBe(true);
   });
+
+  test('caller abort mid-exec returns tool.aborted (not exit_code 143)', async () => {
+    // Bun.spawn already honors signal natively (sends SIGTERM), but
+    // the tool used to surface the resulting exit_code 143 as a
+    // success-shaped result. The model would see "the bash command
+    // ran and returned 143" instead of "the call was cancelled".
+    // Now: abort observed -> tool.aborted error.
+    const ctrl = new AbortController();
+    const start = Date.now();
+    setTimeout(() => ctrl.abort(), 50);
+    const out = await bashTool.execute(
+      { command: 'sleep 5; echo nope' },
+      makeCtx({ cwd: dir, signal: ctrl.signal }),
+    );
+    const elapsed = Date.now() - start;
+    if (!isToolError(out)) throw new Error('expected aborted error');
+    expect(out.error_code).toBe('tool.aborted');
+    expect(out.error_message).toContain('aborted');
+    // Process really died — no orphan; well under sleep duration.
+    expect(elapsed).toBeLessThan(1000);
+  });
+
+  test('SIGKILL escalation when child ignores SIGTERM (timeout path)', async () => {
+    // bash with SIGTERM trap that ignores — graceful kill alone
+    // won't work. The escalation timer fires SIGKILL after the
+    // grace window. Uses the timeout path (2s grace) to keep the
+    // test fast. 'trap "" TERM' makes SIGTERM a no-op; only SIGKILL
+    // stops it. Without escalation, this would hang past timeout
+    // and the test would itself time out.
+    const start = Date.now();
+    const out = await bashTool.execute(
+      {
+        command: 'trap "" TERM; while true; do sleep 0.1; done',
+        timeout_ms: 200,
+      },
+      makeCtx({ cwd: dir }),
+    );
+    const elapsed = Date.now() - start;
+    if (!isToolError(out)) throw new Error('expected timeout error');
+    expect(out.error_code).toBe('bash.timeout');
+    // 200ms timeout + 2s grace -> SIGKILL fires around 2.2s. Allow
+    // generous slack for CI / scheduler noise but well under 5s
+    // (proves SIGKILL escalation actually happens; without it, the
+    // process would survive indefinitely).
+    expect(elapsed).toBeLessThan(4000);
+    expect(elapsed).toBeGreaterThanOrEqual(2000);
+  });
+
+  // Validation parity: schema declares timeout_ms minimum: 100; runtime
+  // must enforce. Without the check, NaN coerces inside Math.min and
+  // setTimeout fires near-immediately.
+  test('rejects timeout_ms below 100', async () => {
+    const out = await bashTool.execute({ command: 'true', timeout_ms: 50 }, makeCtx({ cwd: dir }));
+    if (!isToolError(out)) throw new Error('expected error');
+    expect(out.error_code).toBe('tool.invalid_arg');
+    expect(out.error_message).toContain('timeout_ms');
+  });
+
+  test('rejects non-numeric timeout_ms', async () => {
+    const out = await bashTool.execute(
+      // biome-ignore lint/suspicious/noExplicitAny: testing invalid input shape
+      { command: 'true', timeout_ms: 'abc' as any },
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected error');
+    expect(out.error_code).toBe('tool.invalid_arg');
+  });
+
+  test('rejects non-integer timeout_ms', async () => {
+    const out = await bashTool.execute(
+      { command: 'true', timeout_ms: 500.5 },
+      makeCtx({ cwd: dir }),
+    );
+    if (!isToolError(out)) throw new Error('expected error');
+    expect(out.error_code).toBe('tool.invalid_arg');
+  });
 });

@@ -1,0 +1,37 @@
+name: bash_output and bash_kill work under strict policy with bash.allow
+prompt: |
+  Three-step task. The bash policy is strict; only commands matching
+  `*echo*` are allowed for the bash category. bash_output and bash_kill
+  do NOT need to match a bash policy rule.
+
+  Step 1: use bash_background with the command
+  `while true; do echo BG_TICK_37; sleep 0.1; done`. Do NOT prepend
+  `bash -c` — the harness wraps your command for you. The command
+  contains `echo` and matches the policy. Save the returned process_id.
+
+  Step 2: wait briefly (your next tool call's overhead is enough), then
+  call bash_output on the process_id and report the captured stdout.
+
+  Step 3: call bash_kill with `signal: SIGKILL` and report the final
+  status.
+
+  Final reply: include the marker text you saw in stdout and the final
+  killed status.
+setup:
+  files:
+    .agent/permissions.yaml: |
+      defaults:
+        mode: strict
+      tools:
+        bash:
+          allow:
+            - '*echo*'
+expect:
+  - tool_called: bash_background
+  - tool_called: bash_output
+  - tool_called: bash_kill
+  - output_contains: BG_TICK_37
+  - status: done
+budget:
+  maxSteps: 10
+  maxCostUsd: 0.15
