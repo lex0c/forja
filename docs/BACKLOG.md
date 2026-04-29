@@ -15,6 +15,276 @@ Format:
 
 ---
 
+## [2026-04-29] M3 / Step 2.2.4 — monitor (streaming observation, closes Step 2.2)
+
+Closes Step 2.2 with the streaming-observation half of spec
+§7.3.1: a `monitor` tool that collects events over a duration
+and returns the batch when the budget is exhausted. Distinct
+from `wait_for` (which stops at first match): the model gets
+a list of events, not a binary matched/no-match.
+
+Use cases the spec calls out: tail logs for warnings/errors
+across a build, watch a file tree for compilation output,
+collect every line a dev server emits during startup.
+
+**Slice scope (2.2.4):**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/wait/monitor.ts` | NEW | `monitor(condition, opts)` primitive. Polls per-condition, accumulates events, terminates on durationMs / maxEvents / abort / process_exited |
+| Condition `process_output_lines` | NEW | Each newline-delimited line in stdout/stderr is an event. Partial-line buffering across poll boundaries |
+| Condition `process_output_pattern` | NEW | Each regex match (multi-match via /g) is an event. Tool layer compiles user pattern with /g — opposite of wait_for which rejects /g |
+| Condition `file_changes` | NEW | Each mtime change on a single path is an event. Glob expansion deferred (single path only for v1) |
+| Tool `monitor` | NEW | Separate from wait_for — different return shape. category=misc, planSafe=true. Tool count 10 → 11 |
+| Tests | NEW | tests/wait/monitor.test.ts + tests/tools/monitor.test.ts |
+
+**Decisions to make explicit upfront:**
+
+- **`monitor` is a separate tool, not a `wait_for` extension.**
+  Return shape is fundamentally different (events array
+  vs single match). Sharing the wait_for tool would force
+  a discriminated union on the OUTPUT shape which models
+  consume — confusing for the LLM and asymmetric in the
+  schema. Two tools with crisp single-purpose surfaces.
+- **`/g` flag IS used internally for pattern matching.**
+  For `process_output_pattern`, we need ALL matches in a
+  chunk, not just the first. `String.matchAll` requires
+  /g. Tool layer compiles user pattern with /g (opposite
+  of wait_for's `process_output` which rejects /g — there
+  we used `RegExp.exec` once and /g would carry
+  lastIndex state across calls breaking the per-poll
+  re-read pattern). Different primitive, different
+  constraint.
+- **Observational reads, same as wait_for.** Uses
+  `manager.readOutput` with explicit `sinceStdout`/
+  `sinceStderr` so the model's persisted cursor stays
+  untouched. A subsequent canonical `bash_output` sees
+  the SAME bytes the monitor collected.
+- **Single path for `file_changes`, no glob.** Spec
+  mentions glob; v1 supports a single absolute or
+  relative-to-ctx.cwd path. Glob expansion needs a
+  watcher across multiple files (chokidar-style), which
+  reopens the polling-vs-native-watcher decision from
+  Step 2.2.1. Defer until a real workflow surfaces it.
+- **Termination reasons enumerated.** `'duration'` (the
+  durationMs cap fired), `'max_events'` (event count
+  reached the cap), `'aborted'` (caller signal),
+  `'process_exited'` (process_* conditions only —
+  monitor stops when the source process is gone).
+- **Empty pattern list / no events is a valid result.**
+  `monitor` returns `{ events: [], reason: 'duration' }`
+  when nothing matched. Not an error. The model decides
+  what to do with empty observations.
+- **Process_* events drain on exit.** Same lesson from
+  Step 2.2.2's drain fix: when a process exits with
+  pending bytes, scan the tail before terminating.
+  Pattern matches in the tail still produce events.
+
+**Out of scope (deferred):**
+
+- **Glob in `file_changes`.** Pull-in: when a workflow
+  needs "watch every TS file under src/".
+- **Per-line max length cap.** A pathological process
+  emitting a 10MB single line (no \n) would buffer
+  indefinitely. Default `readOutput` maxBytes (64KB)
+  caps per-poll growth; a separate cap on accumulated
+  buffer would be a real defense. Pull-in: if a
+  workflow surfaces it.
+- **Event ordering across streams.** Events from
+  stdout and stderr are interleaved by poll round, not
+  by their ACTUAL emission timestamps (we don't have
+  per-byte timestamps from the kernel). Documented as
+  a risk — the events list is approximately ordered.
+
+**Spec reference:** `AGENTIC_CLI.md §7.3.1` (monitor
+clauses), `src/wait/index.ts` (sibling primitive).
+
+**Done:**
+
+- `src/wait/monitor.ts` — `monitor(condition, opts)`
+  primitive. Polls per-condition, accumulates events,
+  terminates on durationMs / maxEvents / abort /
+  process_exited. Sibling to waitFor; lives in the
+  same module barrel.
+- 3 condition kinds:
+  - `process_output_lines` — newline-delimited lines
+    from bg stdout/stderr. Partial-line buffer carried
+    across polls; `\r\n` normalized to `\n`. On
+    process exit, drains any unterminated tail as a
+    final event with `partial: true`.
+  - `process_output_pattern` — every match (multi-
+    match via /g via `String.matchAll`) becomes an
+    event. The compiled RegExp ALWAYS has /g —
+    opposite of wait_for's `process_output` which
+    rejects /g (different primitive, different
+    constraint).
+  - `file_changes` — every mtime change on a single
+    path. Glob deferred (single path only for v1).
+- Termination reasons enumerated:
+  `'duration'` / `'max_events'` / `'aborted'` /
+  `'process_exited'`. The result also carries
+  `processStatus` and `processExitCode` (when
+  applicable) so the model knows whether the source
+  process is still running on duration-termination
+  vs already exited.
+- Observational reads via `manager.readOutput` with
+  explicit `sinceStdout`/`sinceStderr` — model
+  cursor untouched. Test pins this contract: a
+  monitor call leaves the cursor at 0; subsequent
+  canonical `bash_output` sees the same content the
+  monitor observed.
+- `monitor` tool (`src/tools/builtin/monitor.ts`):
+  - `category: 'misc'`, `planSafe: true` —
+    observational, same as wait_for.
+  - Schema mirrors monitor input shape with
+    snake_case fields. Pattern is string + is_regex
+    (default false → literal escape). Both modes
+    compile with /g.
+  - `file_changes.path` resolves against `ctx.cwd`;
+    `..` segments rejected (same as wait_for's
+    file_exists / file_change).
+  - `bgManager` validation walks the condition: any
+    `process_output_*` requires it; missing manager
+    → `bg.manager_unavailable`. Unknown / cross-
+    session process_id → `bg.process_not_found`
+    (uniform with bash_output / wait_for).
+- Tool count: 10 → 11. Bootstrap test updated.
+- 17 unit tests in `tests/wait/monitor.test.ts`:
+  every-line capture, stream separation, observational
+  contract, max_events termination, duration
+  termination with `processStatus: 'running'`,
+  trailing partial-line drain on exit, every-regex-
+  match collection, max_events=1 short-circuit,
+  process_exited payload, file_changes (changes +
+  no-changes), abort signal handling (mid + pre-
+  aborted), bgManager validation (process_* requires
+  it, file_changes doesn't), unknown id throws.
+- 12 tool tests in `tests/tools/monitor.test.ts`:
+  end-to-end happy paths for all 3 conditions,
+  literal vs is_regex, ctx.cwd path resolution,
+  validation (unknown kind / empty pattern / invalid
+  regex / `..` / negative duration), bg manager
+  dependency (`bg.manager_unavailable`,
+  `bg.process_not_found`, file_changes works without
+  manager).
+- Total: 812 pass / 7 skip / 0 fail. Typecheck +
+  lint green.
+
+**Decisions taken (not in opener):**
+
+- **Tighter default poll interval (200ms vs
+  wait_for's 500ms).** monitor is generally observing
+  rapidly-changing state (logs flowing, files being
+  written by a build). 500ms felt sluggish for that
+  use case. Configurable via `pollIntervalMs`.
+- **Default `maxEvents = 100`.** A bounded cap so the
+  payload returned to the model is predictable in
+  size. Models can override; the default keeps a
+  "tail until done" call safe even for chatty
+  processes.
+- **Partial-line drain on process exit.** When
+  `process_output_lines` sees the source exit, any
+  unterminated tail in the buffer becomes a final
+  event with `partial: true`. Without this, the
+  trailing line of a crash log (no \n before the
+  process died) would be silently dropped.
+- **`processStatus` carried across termination
+  reasons.** Initially the field was only set on
+  `process_exited`; tests revealed that a model
+  hitting `duration` on a still-running process gets
+  no signal about the process state. Now: every
+  termination path includes `processStatus` /
+  `processExitCode` from the last successful
+  `readOutput` poll, so the model can distinguish
+  "duration ran out, process is still running"
+  (continue polling later) from "duration ran out,
+  process happens to have exited" (no point
+  continuing).
+- **Removed unused `waitForExit` helper from the
+  test file.** The lines tests don't need to wait for
+  exit explicitly — monitor's `process_exited`
+  termination is the natural signal. Lint complained
+  about the unused import; rather than suppress, just
+  removed.
+
+**Code review fixes applied before commit:**
+
+- **`process_output_pattern` overlap + dedup.** Was:
+  each poll read strictly new bytes; a pattern
+  straddling a poll boundary disappeared from the
+  events list. Same class of bug as wait_for's
+  `process_output` (fixed in commit 2bb1e36). Now:
+  `PATTERN_OVERLAP_BYTES = 64` carry-over buffer per
+  stream prepended to the new chunk before `matchAll`.
+  Matches whose end falls inside the buffer (i.e.,
+  entirely already emitted last poll) are skipped —
+  emit only matches that extend into new bytes. Two
+  regression tests pin the contract: a marker
+  straddling `printf 'BLT-MON-'; sleep 0.1; printf
+  'TOKEN-99'` is matched once; a single short marker
+  observed across many polls emits exactly one event
+  (no double-emit).
+- **Removed defensive non-/g fallback.** Was: pattern
+  scan path branched on `condition.pattern.global` and
+  fell back to a single `RegExp.exec` for non-/g —
+  fail-quietly behavior that contradicted monitor's
+  "every match" semantics. Now: throw upfront with a
+  clear message. Tool layer always compiles with /g;
+  programmatic callers get a loud failure instead of
+  silent semantic drift. Regression test pins:
+  passing a non-/g regex rejects with `/global.*'g'/`.
+- **Snake_case payload keys at the tool boundary.**
+  Was: top-level result fields used snake_case
+  (`condition_met`, `elapsed_ms`) but inner payloads
+  passed through with camelCase (`mtimeMs`,
+  `processId`, `matchedIndex`). Models that learned
+  snake from `process_id` got tripped by camel in
+  payloads. Now: shared helper `src/tools/_keys.ts`
+  recursively converts payload keys to snake_case;
+  applied at the boundary in both `wait_for` and
+  `monitor` tools. Internal types stay camelCase
+  (idiomatic TS); conversion is a tool-output detail.
+  Tool tests updated to expect snake (e.g.
+  `r.payload?.mtime_ms`); module-level tests stay
+  camelCase since they exercise the wait module
+  directly.
+
+**Risks documented:**
+
+- **Per-line max length unbounded.** A pathological
+  process emitting a 10MB single line (no \n) would
+  buffer indefinitely. Default `readOutput` maxBytes
+  (64KB) caps per-poll growth; a separate cap on
+  accumulated buffer would be a real defense.
+  Pull-in: if a workflow surfaces it, add
+  `maxLineBytes` per condition with truncation
+  marker.
+- **Event ordering across streams is poll-batch
+  approximate.** Events from stdout and stderr are
+  interleaved by poll round, not by their actual
+  emission timestamps (we don't have per-byte kernel
+  timestamps). For a log with interleaved
+  stdout/stderr writes within a single poll window,
+  the order is "stdout first, then stderr" by our
+  implementation, NOT chronological. Document; if a
+  workflow needs strict ordering, the bg subsystem
+  would need a unified merged-stream output (spec
+  §7.3 doesn't currently call for this).
+- **`file_changes` mtime granularity.** Same risk
+  as wait_for's `file_change`. Documented in 2.2.1
+  risks.
+- **Glob expansion for `file_changes` deferred.**
+  Spec mentions `path: string | glob`; v1 supports
+  single path. Pull-in: when "watch every TS file
+  under src/" becomes a real workflow.
+
+**Step 2.2 closure:** all four sub-steps (2.2.1
+non-bg conditions, 2.2.2 process_*, 2.2.3
+composition, 2.2.4 monitor) shipped. The wait/monitor
+half of spec §7.3.1 is complete.
+
+---
+
 ## [2026-04-29] M3 / Step 2.2.3 — wait_for composition (all_of / any_of)
 
 Closes the `wait_for` tool surface with the composition layer

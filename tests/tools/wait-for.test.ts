@@ -92,7 +92,7 @@ describe('wait_for tool: happy paths', () => {
     );
     if (isToolError(r)) throw new Error('unexpected');
     expect(r.matched).toBe(true);
-    expect(typeof r.payload?.mtimeMs).toBe('number');
+    expect(typeof r.payload?.mtime_ms).toBe('number');
   });
 });
 
@@ -351,7 +351,7 @@ describe('wait_for tool: composition (all_of / any_of)', () => {
     if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
     expect(r.matched).toBe(true);
     expect(r.condition_met).toBe('any_of');
-    expect(r.payload?.matchedIndex).toBe(1);
+    expect(r.payload?.matched_index).toBe(1);
   });
 });
 
@@ -394,7 +394,7 @@ describe('wait_for tool: process_* conditions', () => {
     if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
     expect(r.matched).toBe(true);
     expect(r.condition_met).toBe('process_exit');
-    expect(r.payload?.exitCode).toBe(13);
+    expect(r.payload?.exit_code).toBe(13);
   });
 
   test('process_output literal pattern (default is_regex=false)', async () => {
@@ -430,7 +430,7 @@ describe('wait_for tool: process_* conditions', () => {
     );
     if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
     expect(r.matched).toBe(false);
-    expect(r.payload?.processExited).toBe(true);
+    expect(r.payload?.process_exited).toBe(true);
   });
 
   test('process_output is_regex=true compiles pattern as regex', async () => {

@@ -73,6 +73,7 @@ describe('bootstrap', () => {
         'edit_file',
         'glob',
         'grep',
+        'monitor',
         'read_file',
         'wait_for',
         'write_file',

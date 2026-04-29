@@ -6,6 +6,7 @@ import { bashTool } from './bash.ts';
 import { editFileTool } from './edit-file.ts';
 import { globTool } from './glob.ts';
 import { grepTool } from './grep.ts';
+import { monitorTool } from './monitor.ts';
 import { readFileTool } from './read-file.ts';
 import { waitForTool } from './wait-for.ts';
 import { writeFileTool } from './write-file.ts';
@@ -24,6 +25,8 @@ export { globTool } from './glob.ts';
 export type { GlobInput, GlobOutput } from './glob.ts';
 export { grepTool } from './grep.ts';
 export type { GrepInput, GrepMatch, GrepOutput } from './grep.ts';
+export { monitorTool } from './monitor.ts';
+export type { MonitorInput, MonitorOutput } from './monitor.ts';
 export { readFileTool } from './read-file.ts';
 export type { ReadFileInput, ReadFileOutput } from './read-file.ts';
 export { waitForTool } from './wait-for.ts';
@@ -38,6 +41,7 @@ export const BUILTIN_TOOLS = [
   globTool,
   grepTool,
   waitForTool,
+  monitorTool,
   writeFileTool,
   editFileTool,
   bashTool,

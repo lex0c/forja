@@ -5,6 +5,7 @@ import {
   type WaitResult,
   waitFor,
 } from '../../wait/index.ts';
+import { keysToSnake } from '../_keys.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
 // Tool-surface mirror of WaitCondition. Two differences from the
@@ -437,7 +438,12 @@ export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
       condition_met: result.conditionMet,
       elapsed_ms: result.elapsedMs,
     };
-    if (result.payload !== undefined) out.payload = result.payload;
+    // Convert payload keys to snake_case at the tool boundary so
+    // the model sees a uniform convention across every Forja tool
+    // (top-level fields AND nested payload).
+    if (result.payload !== undefined) {
+      out.payload = keysToSnake(result.payload) as Record<string, unknown>;
+    }
     return out;
   },
 };

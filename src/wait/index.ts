@@ -2,6 +2,19 @@ import { existsSync, statSync } from 'node:fs';
 import { connect } from 'node:net';
 import type { BgManager } from '../bg/index.ts';
 
+// Re-exports for the monitor primitive (Step 2.2.4) — sibling
+// streaming-observation module. Lives in a separate file so the
+// wait_for code stays focused.
+export type {
+  MonitorCondition,
+  MonitorEvent,
+  MonitorEventKind,
+  MonitorOptions,
+  MonitorReason,
+  MonitorResult,
+} from './monitor.ts';
+export { monitor } from './monitor.ts';
+
 // `wait_for` primitive (spec §7.3.1). Blocks until a condition is
 // met or a timeout fires, with **zero LLM calls** during the wait —
 // only wall-clock cost. The harness's combined signal (caller abort
