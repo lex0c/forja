@@ -5,43 +5,6 @@ rationale and a "pull-in" signal so we know when to revisit.
 
 ---
 
-## bash tool: thread `ctx.signal` to the running subprocess
-
-**Status:** noted during the M3/Step 2.2 security audit
-(2026-04-29). Out of scope for the wait/monitor hardening pass.
-
-**What it is:** `src/tools/builtin/bash.ts` checks
-`ctx.signal.aborted` BEFORE spawning the subprocess, but does not
-listen for abort during execution. When the harness aborts mid-
-bash (caller cancellation, wall-clock timeout), the child
-process keeps running — the bash tool waits on `proc.exited`
-without a kill path tied to the caller signal.
-
-**Effect today:** a harness-level abort surfaces to the model as
-a tool-call interruption (the harness short-circuits the tool
-invocation), but the OS-level child process leaks past the
-abort window. For a long `bash { command: 'sleep 600' }`, this
-holds a process slot until natural exit despite the harness
-giving up on it.
-
-**Fix shape:** add a listener that calls `proc.kill('SIGTERM')`
-on `ctx.signal` abort, with a follow-up `SIGKILL` after a grace
-window if the child ignores SIGTERM. Mirror the pattern already
-implemented in `src/bg/manager.ts` for bash_kill — the kill
-grace cycle there is the canonical implementation.
-
-**Pull-in signal:** any incident where a harness abort during
-bash leaves orphaned child processes, OR M3+ work on resource
-caps / cleanup hooks that expects all spawned children to honor
-the harness signal contract.
-
-**Why deferred:** the wait/monitor hardening pass focused on the
-explicit user-flagged class of bugs (misc-bypass + wall-clock
-cap). Threading abort signals into bash is a parallel hardening
-that deserves its own commit + tests, not a drive-by.
-
----
-
 ## Trust prompt for new directories (`AGENTIC_CLI §9.1`)
 
 **Status:** deferred from M2 / Step 4. Hierarchy resolution (the other

@@ -15,6 +15,64 @@ Format:
 
 ---
 
+## [2026-04-29] hardening: bash tool abort handling + SIGKILL escalation
+
+Surface-level claim corrected by evidence. Initial analysis said
+"`ctx.signal` doesn't thread to bash subprocess during exec" — a
+quick standalone test (`bun run` calling `Bun.spawn` with
+`signal: ctrl.signal`) showed Bun honors signal natively and kills
+in ~100ms with SIGTERM. Lesson: don't claim a gap by reading code
+alone; verify with a runnable repro. Logged as a meta-lesson
+worth folding into CODER_PLAYBOOK §6 (test completeness).
+
+**Real gaps that DID exist:**
+
+1. **No SIGKILL escalation.** Bun.spawn's signal handler sends
+   SIGTERM only. A child with `trap "" TERM` (or any unresponsive
+   process) would survive caller abort indefinitely.
+2. **Misleading terminal classification.** When ctx.signal aborted
+   mid-exec, the tool returned `{ exit_code: 143, timed_out: false }`
+   — looking like a successful run that returned 143. The model
+   would mis-route on this, treating cancellation as a result.
+3. **Orphaned-children pipe block.** When `bash` itself dies but
+   spawned a child holding stdout (e.g. `bash -c 'sleep 60 &'`),
+   the orphan keeps the pipe fd open. Stream reads block until the
+   orphan exits naturally — abort returns ~60s late despite the
+   bash process being long dead.
+
+**Fix:**
+
+- `src/tools/builtin/bash.ts` — explicit abort listener on
+  `ctx.signal` schedules a SIGKILL fallback after 5s grace
+  (mirrors `bg/manager`'s `DEFAULT_KILL_GRACE_MS`). The timeout
+  path keeps its existing 2s grace (timeouts are already a "ran
+  too long" signal — no reason to extend).
+- After exec, if `ctx.signal.aborted` was observed during the
+  call, return `tool.aborted` instead of letting the bare
+  `exit_code` slip through. Audit log + model both see the
+  cancellation explicitly.
+- `readCapped` accepts an optional `stopSignal`. The bash tool
+  fires it via `proc.exited.then(() => readStopAc.abort())` so
+  pending stream reads cancel as soon as the bash process itself
+  dies, not when orphaned children eventually release the pipe.
+
+**Tests:**
+
+- `caller abort mid-exec returns tool.aborted` — abort during
+  `sleep 5`, asserts elapsed < 1s and error_code === 'tool.aborted'.
+- `SIGKILL escalation when child ignores SIGTERM (timeout path)` —
+  `trap "" TERM; while true; do sleep 0.1; done` with timeout=200ms;
+  asserts elapsed in [2s, 4s] window, proving SIGKILL fired after
+  the 2s grace (without escalation, would hang forever).
+
+**Verification:** `bun test` 843 pass / 7 skip / 0 fail (+2 new
+tests); `tsc --noEmit` clean; `biome check` clean.
+
+**Removed from TODO.md** (`bash tool: thread ctx.signal to the
+running subprocess` — done, not deferred).
+
+---
+
 ## [2026-04-29] M3 / Step 2.2 — defense-in-depth: wait/monitor wall-clock cap
 
 After the security review that produced the per-leaf policy gate,
