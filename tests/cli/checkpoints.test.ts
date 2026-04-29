@@ -229,6 +229,35 @@ describe('runCheckpointsCli', () => {
       expect(out).toContain('state-2');
     });
 
+    test('rejects ckpt id from a different session under the same cwd', async () => {
+      // The cwd guard catches cross-cwd misuse, but if two sessions
+      // share a cwd, a ckpt id from session B passed under session A
+      // would diff successfully against the wrong context. Same
+      // family of bug as the cross-session refusal restore already
+      // had — diff was missed in the original pass.
+      await initRepoWithSeed(repo);
+      const otherSessionId = createSession(db, { model: 'm', cwd: repo }).id;
+      const otherCkpt = insertCheckpoint(db, {
+        sessionId: otherSessionId,
+        stepId: 's',
+        gitRef: 'abc',
+        hadBash: false,
+      });
+      const c = capture();
+      const code = await runCheckpointsCli({
+        verb: 'diff',
+        positionals: [sessionId, otherCkpt.id],
+        json: false,
+        yes: false,
+        cwd: repo,
+        dbOverride: db,
+        out: c.pushOut,
+        err: c.pushErr,
+      });
+      expect(code).toBe(1);
+      expect(c.err.join('')).toContain('not found in session');
+    });
+
     test('non-git cwd refuses with clear message', async () => {
       // No initRepoWithSeed: cwd is a plain temp dir.
       insertCheckpoint(db, {

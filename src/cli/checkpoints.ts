@@ -170,8 +170,19 @@ const runDiff = async (input: CheckpointsCliInput, db: DB): Promise<number> => {
     input.err('forja: checkpoints not available (cwd is not a git repository)\n');
     return 1;
   }
+  // Cross-session id avoidance — same shape as runRestore. Without
+  // this, two sessions sharing a cwd would let a ckpt id from session
+  // B diff "successfully" under session A's context, returning a
+  // diff against the wrong checkpoint and misleading the operator
+  // during recovery. CheckpointManager.get / .diff look up by id
+  // globally, so the session-scoping has to live here.
+  const ckpt = await mgr.get(ckptId);
+  if (ckpt === null || ckpt.sessionId !== sessionId) {
+    input.err(`forja: checkpoint ${ckptId} not found in session ${sessionId}\n`);
+    return 1;
+  }
   try {
-    const out = await mgr.diff(ckptId);
+    const out = await mgr.diff(ckpt.id);
     input.out(out);
     return 0;
   } catch (e) {
