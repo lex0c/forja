@@ -324,10 +324,19 @@ const checkLeafPolicies = (
     }
     case 'port_open': {
       // Synthesize an http URL so the engine's URL parser extracts
-      // the hostname for allow_hosts/deny_hosts matching. A bracket-
-      // wrapped IPv6 host already comes in compatible with URL
-      // syntax; bare hostnames and IPv4 work without modification.
-      const synthUrl = `http://${cond.host}:${cond.port}`;
+      // the hostname for allow_hosts/deny_hosts matching. IPv6
+      // literals (any host containing `:`) must be bracket-wrapped
+      // — otherwise `http://::1:22` fails URL parsing and the
+      // engine denies on "invalid URL", systematically blocking
+      // legitimate IPv6 readiness checks even when allow_hosts
+      // would permit. The bracketed form is what `new URL().hostname`
+      // returns for IPv6, so operators writing IPv6 in allow_hosts
+      // / deny_hosts must use the bracketed form (`[::1]`) — same
+      // convention fetch_url already requires for IPv6 URL inputs.
+      // Hostnames and IPv4 addresses pass through unchanged.
+      const wrapped =
+        cond.host.includes(':') && !cond.host.startsWith('[') ? `[${cond.host}]` : cond.host;
+      const synthUrl = `http://${wrapped}:${cond.port}`;
       const decision = ctx.permissionCheck('fetch_url', 'web.fetch', { url: synthUrl });
       if (decision.kind !== 'allow') {
         return { ok: false, reason: `wait_for port_open: ${decision.reason}` };

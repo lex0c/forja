@@ -659,6 +659,94 @@ describe('wait_for tool: per-leaf policy gate', () => {
     expect(seen[0]?.url).toBe('http://internal.example:22');
   });
 
+  test('port_open with IPv6 host bracket-wraps for URL synthesis', async () => {
+    // Regression: bare `::1` made `http://::1:8080` unparseable, so
+    // the engine returned deny with "invalid URL" before any host
+    // matching ran — systematically blocking legitimate IPv6
+    // readiness checks even under allow_hosts that would permit.
+    // Now: hosts containing `:` are bracket-wrapped; the URL
+    // parses; the engine extracts the hostname (in bracketed form,
+    // the canonical `new URL().hostname` output for IPv6) and
+    // routes through allow_hosts/deny_hosts as intended.
+    const seen: Array<{ url: string }> = [];
+    const recordingDeny = (
+      _tool: string,
+      _cat: string,
+      args: Record<string, unknown>,
+    ): { kind: 'deny'; reason: string } => {
+      if (typeof args.url === 'string') seen.push({ url: args.url });
+      return { kind: 'deny', reason: 'denied by test' };
+    };
+    const ctx = makeCtx({ permissionCheck: recordingDeny });
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'port_open', host: '::1', port: 8080 },
+        timeout_ms: 1000,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected deny (from policy, not URL parse)');
+    expect(r.error_code).toBe('permission.denied');
+    // Bracket-wrapped — proves URL synthesis is parseable. Without
+    // brackets, `http://::1:8080` throws inside `new URL()`.
+    expect(seen[0]?.url).toBe('http://[::1]:8080');
+    // Sanity: the synthesized URL really does parse and yields a
+    // hostname (the engine extracts via `new URL(url).hostname`).
+    expect(new URL(seen[0]?.url ?? '').hostname).toBe('[::1]');
+  });
+
+  test('port_open with already-bracketed IPv6 host does not double-wrap', async () => {
+    // If a model passes `[::1]` (already bracketed), preserve it
+    // rather than producing `http://[[::1]]:port` which would
+    // fail to parse.
+    const seen: Array<{ url: string }> = [];
+    const recordingDeny = (
+      _tool: string,
+      _cat: string,
+      args: Record<string, unknown>,
+    ): { kind: 'deny'; reason: string } => {
+      if (typeof args.url === 'string') seen.push({ url: args.url });
+      return { kind: 'deny', reason: 'denied' };
+    };
+    const ctx = makeCtx({ permissionCheck: recordingDeny });
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'port_open', host: '[::1]', port: 8080 },
+        timeout_ms: 1000,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected deny');
+    expect(r.error_code).toBe('permission.denied');
+    expect(seen[0]?.url).toBe('http://[::1]:8080');
+  });
+
+  test('port_open with IPv4 / hostname is not wrapped', async () => {
+    // Sanity: only colon-bearing hosts trigger the bracket wrap.
+    // IPv4 addresses and DNS hostnames pass through unchanged.
+    const seen: Array<{ url: string }> = [];
+    const recordingDeny = (
+      _t: string,
+      _c: string,
+      args: Record<string, unknown>,
+    ): { kind: 'deny'; reason: string } => {
+      if (typeof args.url === 'string') seen.push({ url: args.url });
+      return { kind: 'deny', reason: 'denied' };
+    };
+    const ctx = makeCtx({ permissionCheck: recordingDeny });
+    await waitForTool.execute(
+      {
+        condition: { kind: 'port_open', host: '192.168.1.1', port: 22 },
+        timeout_ms: 1000,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    expect(seen[0]?.url).toBe('http://192.168.1.1:22');
+  });
+
   test('file_exists is gated through read_file path policy', async () => {
     const ctx = makeCtx({ permissionCheck: denyEverything });
     const r = await waitForTool.execute(
