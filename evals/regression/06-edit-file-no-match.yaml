@@ -1,0 +1,26 @@
+name: edit_file recovers from missing pattern
+prompt: |
+  In `notes.txt`, replace the literal phrase `THIS_PHRASE_DOES_NOT_EXIST` with
+  `replaced`. The phrase is NOT present in the file, so the edit will fail.
+  When the failure happens, acknowledge it in plain English and stop — do NOT
+  fall back to write_file, do NOT rewrite the file from scratch, do NOT
+  retry with a different pattern. Just report that the phrase was not found.
+setup:
+  files:
+    notes.txt: |
+      apples
+      oranges
+      bananas
+expect:
+  - tool_called: edit_file
+  - tool_not_called: write_file
+  - file_contains:
+      path: notes.txt
+      pattern: apples
+  - file_contains:
+      path: notes.txt
+      pattern: oranges
+  - status: done
+budget:
+  maxSteps: 6
+  maxCostUsd: 0.10

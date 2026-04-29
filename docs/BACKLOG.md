@@ -15,6 +15,615 @@ Format:
 
 ---
 
+## [2026-04-28] M3 / Step 1.5 — Regression batch 4: multi-tool flows
+
+Continues M3 / Step 1 with batch 4 — 6 cases that
+exercise multi-tool sequences and parallel dispatch. Total
+in `evals/regression/` is now 35.
+
+**Step 1.4 collapsed.** The original plan called Step 1.4
+"provider adapter parity matrix" (re-run a subset under
+OpenAI and Gemini). With Gemini deferred indefinitely
+(see `docs/TODO.md`), and with the regression cases being
+provider-agnostic by construction (the runner accepts
+`--model` for any registered provider), the parity
+"matrix" reduces to "run the suite under Anthropic, then
+under OpenAI." That's a measurement task, not an authoring
+task — it folds into Step 1.6 where we produce the real-
+model baseline. Skipping 1.4 doesn't drop coverage; it
+recognizes the work was always going to happen under a
+different name.
+
+**Why multi-tool flows matter:**
+
+- Real workflows chain tools. Smoke and batches 1-3 are
+  largely single-tool: each case proves "tool X works
+  for behavior Y." Multi-tool exercises the seam — the
+  tool_result of call N flows into the args of call N+1.
+- Parallel dispatch (multiple tool_use blocks in one
+  assistant turn) is a provider-adapter concern.
+  Step 6.3 noted this "behaved correctly" for both
+  Anthropic and OpenAI under smoke, but smoke never
+  forces parallel dispatch — case 34 does.
+- Edit-after-read is the modal refactor pattern; if it
+  silently regressed, every code-modifying workflow
+  would break and smoke would still pass.
+
+**Done — cases 30-35:**
+
+| # | Flow | Why this case |
+|---|---|---|
+| 30 | grep → edit_file | Find-and-fix workflow. Asserts the matched file is the one mutated, AND that edit_file (not write_file) was used — preserves the in-place semantics |
+| 31 | read_file → write_file (derived) | Data-transformation pattern: read input.json, sum its array, write output.json. Asserts input is preserved verbatim, output contains the derived value |
+| 32 | read_file → edit_file (same file) | Read-then-modify-based-on-contents: read version.txt (`41`), edit to `42`. The model's edit_file `old_string` must be derived from the prior read result. Catches a regression where tool_result content fails to round-trip into subsequent tool args |
+| 33 | glob → edit_file (one of N) | File-selection-then-mutation: glob finds 3 TS files; edit only `alpha.ts`; assert the other two are unchanged. Three negative `file_contains` assertions — the most defensive case in the batch |
+| 34 | parallel tool_use (3 reads, 1 turn) | Explicit instruction to dispatch all three read_file calls in a SINGLE assistant turn. Provider adapters serialize parallel tool_use differently (Anthropic emits multiple tool_use blocks per content array; OpenAI emits a tool_calls array) — this case is the regression net for that adapter logic |
+| 35 | glob → read ×N → write_file | 3-step chain. Glob finds 3 TS files, reads each, writes summary.txt with derived data (function return values per file). Asserts depth: 2-step works in cases 30-34, this proves 3-step composes |
+
+**Cut (out of scope for this batch):**
+
+- **No grep → write_file case.** Would test the same
+  "tool A drives tool B" axis as case 30 with a
+  weaker assertion (write creates new files; edit
+  asserts the IN-PLACE constraint). Case 30 is
+  strictly stronger.
+- **No bash → file-tool chains.** Bash output as input
+  to read_file is somewhat implicit in case 35
+  (glob → read), and bash → write would test
+  composition that's already covered by case 31's
+  read → write pattern. Diminishing returns.
+- **No 4-step chains.** If 3-step works, 4-step
+  failing would be a budget issue
+  (`maxSteps`/`maxToolErrors`), not a composition
+  issue. Cases 35's 10-step budget already gives the
+  model headroom; deeper chains pay for themselves
+  only when concrete bugs appear.
+
+**Decisions:**
+
+- **Case 31 uses `[10, 20, 30, 40]` summing to 100.**
+  Picked deliberately: `100` is short enough for
+  `output_contains` to be unambiguous (no ambient `100`
+  in the prompt or fixture), and the math is trivial
+  enough that arithmetic errors aren't a model-skill
+  test. If a model can't sum 4 small integers, it has
+  bigger problems than the harness.
+- **Case 32's `41 → 42` is intentional.** `42` is
+  unique in the fixture (input is `41`, no other 42s
+  exist anywhere in setup). The increment is the
+  smallest-possible derived computation — same
+  philosophy as case 31, isolating the harness from
+  model arithmetic skill.
+- **Case 33 asserts unchanged files explicitly.** Three
+  separate `file_contains` assertions on the
+  not-edited files. Slight assertion bloat but worth
+  it: a regression where the model edits the WRONG
+  file (e.g., picks delta.ts because of alphabetical
+  confusion) would otherwise pass — assertion on the
+  target alone wouldn't catch the collateral mutation.
+- **Case 34 trusts the model on parallel dispatch.**
+  The prompt is explicit ("emit all three read_file
+  calls in a SINGLE assistant turn"). If a provider
+  adapter regresses — say, splits parallel tool_use
+  into sequential calls under the hood — the case
+  still passes (3 sequential reads also yields the
+  three colors in output). This case proves the
+  end-to-end semantics, not the wire-level dispatch
+  shape. The wire-level test is in unit coverage
+  (`tests/providers/*-stream.test.ts`).
+
+**Pending (Step 1.6):**
+
+- Real-model baseline run across the full 35-case
+  suite under Anthropic (Haiku 4.5) and OpenAI
+  (gpt-4o-mini), 3 rounds each. Decisions to make at
+  that point:
+  1. Cost envelope: 35 × ~$0.005 × 3 = ~$0.50 per
+     provider per baseline. Acceptable.
+  2. Wall-clock: 35 × ~5s × 3 ≈ 8min serial — close
+     to the spec target (<10min). Parallelism still
+     deferred unless this exceeds.
+  3. Drop list: any case that fails reliably across
+     rounds for model-behavior reasons (not harness
+     bugs) gets pulled per the Step 6.5 honesty pass.
+
+**Risks documented:**
+
+- **Case 34 may not actually parallel-dispatch.**
+  Models sometimes ignore the "single turn" hint and
+  serialize anyway, especially smaller ones. The
+  case still passes via the output assertions
+  (sequential reads also produce all three colors),
+  but the test is silently weaker than intended. If
+  we want to force parallel dispatch as a hard
+  invariant, we'd need a new `parallel_tool_use`
+  expectation kind that asserts ≥2 tool_use blocks
+  appeared in a single assistant message. Tracked
+  here, not implemented — adding the expectation
+  kind is a §1.7+ harness change.
+- **Case 35's three-step chain is the longest in
+  the suite.** If the model halts after step 2
+  ("here's the data" without writing), the case
+  fails on `file_exists: summary.txt`. The prompt
+  is explicit about all three steps with numbered
+  instructions; further hand-holding would feel
+  test-gaming. If the case flakes, the right fix is
+  at the suite-level summary (mark as flaky in the
+  parity matrix) rather than rephrasing.
+- **Case 33's negative assertions can mask reads.**
+  `file_contains: src/beta/beta.ts pattern: return 2;`
+  passes IF the file is unchanged OR if the model
+  rewrote the file with the same content. Highly
+  unlikely in practice, but flagging the assertion
+  pattern: `file_contains` is presence, not absence
+  of mutation. Only `tool_not_called: edit_file`
+  would catch a no-op edit, but cases 30/32/33 all
+  *want* edit_file to be called once. We accept
+  this gap — a model that no-op-edits the wrong
+  file is a regression class smoke wouldn't catch
+  either.
+
+**Spec reference:** `AGENTIC_CLI.md §7` (tool system),
+`§7.1` (tools v1), `PROVIDERS.md` (parallel tool_use
+adapter contract), `src/providers/*-stream.ts`
+(per-provider parallel-dispatch normalization).
+
+---
+
+## [2026-04-28] M3 / Step 1.3 — Regression batch 3: compaction + plan mode
+
+Continues M3 / Step 1 with batch 3 — 7 cases that
+exercise compaction edge cases, plan-mode harness gates,
+and the plan/policy gate composition. Total in
+`evals/regression/` is now 29.
+
+**Why this slice next:**
+
+- Smoke covers ONE compaction (case 08, `min_count: 1`,
+  `strategy: llm`). It does not cover: multiple
+  compactions in a single run, the goal-reinjection
+  layer's correctness, `preserveTail: 0` (most-aggressive
+  fold), or compaction under `--plan`. Each is a real
+  failure mode in the spec (`AGENTIC_CLI §6.1`,
+  `CONTEXT_TUNING §3`).
+- Plan mode smoke covers write_file blocking (case 05).
+  edit_file uses a different harness code path
+  (`invoke-tool.ts:175-195`); a regression there would
+  pass smoke and ship broken. Edge case is worth a
+  dedicated case.
+- The plan/policy interaction has zero coverage outside
+  unit tests. Subagents will extend the gate stack
+  (sandbox, then plan, then policy, then hooks); pinning
+  the existing two-layer composition NOW means future
+  layer additions have a known-good baseline to compare
+  against.
+
+**Done — cases 23-29:**
+
+| # | Subsystem | Why this case |
+|---|---|---|
+| 23 | compaction multi-round | `min_count: 2` — fixture forces ≥2 compactions by re-reading the chunky-modules tree twice. Catches a regression where the second compaction silently no-ops or deadlocks |
+| 24 | compaction preserves goal | Embeds literal token `MARKER_24_GOAL_KEPT` in the prompt; asserts it survives in final output despite compaction firing. Tests the goal-reinjection layer (`compact*.ts:240-242` "subsequent compactions must see the ORIGINAL goal") under load |
+| 25 | `preserveTail: 0` | Most-aggressive fold: every middle turn becomes summary, no literal tail preserved. Asserts the run still completes to `status: done` and reports the verbatim dependency. Catches a regression where preserve_tail=0 trips the alignment-shift edge (`loop.ts:482-484` `+ 2` accounting) |
+| 26 | compaction under `--plan` | 4-axis intersection: plan + read_file ×5 + compaction triggered + plan markdown emitted. Catches regressions where compaction's LLM call somehow trips the plan-mode write gate (it shouldn't — different layer — but composition is exactly the kind of thing that breaks silently) |
+| 27 | plan blocks edit_file | Symmetric with smoke 05 on the edit_file path. Different harness code (`invoke-tool.ts` plan-gate predicate), different deny message. Asserts greeting.txt content unchanged after the run |
+| 28 | plan + multi-tool read-only chain | grep → read_file chain in plan mode, both pass plan-gate, plan markdown emitted. Negative side: write_file/edit_file not called. Documents that read tools chain freely under plan; the gate is precisely targeted at writes |
+| 29 | plan + policy compose | The big one: plan: true + bash with read_only:true + policy `bash.deny: ['cat *']`. Plan-gate sees read_only and lets it pass; policy deny then fires. Asserts `tool_denied: bash` AND plan markdown present AND fixture file unchanged. Catches any regression where one gate silently swallows the other's decision |
+
+**Cut (kept the slice tight):**
+
+- **No `strategy: fallback` case.** Forcing the
+  compaction LLM call to fail requires either provider
+  fault injection (no surface today) or an unreachable
+  network. Mock providers cover this in unit tests
+  (`tests/harness/compact*.test.ts`); a real-model case
+  would either flake on transient errors or never
+  trigger the fallback path. `tool_denied`-style
+  rigor: keep harness-internal behavior in unit tests;
+  reserve regression for "model + harness end-to-end."
+- **No `compaction-skipped` case.** When prompt
+  doesn't exceed threshold, no compaction event fires.
+  Asserting "no compaction" via absence is weaker than
+  asserting presence, and the existing 8 cases without
+  compaction triggers already implicitly exercise this
+  path (they pass without firing compaction). Skipped
+  is the default; default doesn't need a dedicated
+  case.
+- **No multi-strategy-mix case.** A run where
+  compaction round 1 succeeds with `llm` and round 2
+  falls back to `fallback` would be the highest-value
+  test of the strategy field — but again, requires
+  fault injection. Deferred to whenever the harness
+  grows a strategy-override env var (`CONTEXT_TUNING`
+  open question).
+
+**Decisions:**
+
+- **Fixture reuse over fixture proliferation.** Cases
+  23, 24, 25, 26 all consume `chunky-modules`. The
+  fixture was sized for one compaction; lowering
+  `compactionThreshold` to 0.01 in case 23 forces two
+  without changing the fixture. Ad-hoc threshold
+  tuning per case keeps fixtures stable.
+- **`MARKER_24_GOAL_KEPT` is intentionally weird.** The
+  compactor's LLM-summarization step gets a goal that
+  contains an explicit "must be honored in your FINAL
+  message" instruction. If the summary correctly
+  preserves the goal, the marker re-enters the
+  context and the model echoes it. If the summary
+  paraphrases the goal away (regression), the model
+  has no source for the marker. The token's
+  uniqueness (`MARKER_24_GOAL_KEPT` is a literal not
+  found in any fixture or system prompt) means a hit
+  on `output_contains` cannot come from anywhere
+  else.
+- **Case 29 frames the policy denial as expected.**
+  The prompt explicitly says "the policy layer is a
+  separate gate — it may block the command for its
+  own reasons." Same Step 6.5 mitigation: model has
+  permission to attempt the call (so policy gets to
+  fire), and the prompt won't trip preemption
+  defenses by sounding malicious.
+
+**Pending (Step 1.4 onward):**
+
+- 1.4: provider adapter parity matrix — re-run a
+  selected subset of batches 1-3 under OpenAI and
+  Gemini (when smoke unblocks), publish the matrix.
+- 1.5: multi-tool flows (grep→edit, glob→write,
+  bash→edit). Cross-tool sequences not yet tested.
+- 1.6: real-model baseline across full ~100-case
+  suite, 3 rounds, decide on parallelism.
+
+**Risks documented:**
+
+- **Case 23 budget tight at maxSteps: 14.** Reading
+  10 files (5 × 2) plus model thinking turns may
+  bump against the cap. If the case starts failing
+  with `exhausted` instead of `done`, raise to 16.
+  Tracked here so future debugging starts at the
+  right knob.
+- **Case 24 depends on instruction-following AND
+  goal preservation.** Two failure modes that a
+  single failed run can't distinguish:
+  - Goal got dropped by the summarizer (harness
+    bug) — the fix is in `compact*.ts`.
+  - Goal preserved but model ignored the marker
+    instruction (model bug) — drop the case.
+  When this case starts failing, the next-step
+  diagnosis is to read the audit log: did the
+  post-compaction message stack contain
+  `MARKER_24_GOAL_KEPT`? If yes, model-side; if no,
+  harness-side. Documented here so the bisection
+  is a transcript-read, not a binary search through
+  prompt rewording.
+- **Case 25's `preserveTail: 0` may break some
+  models.** Without literal tail, the model relies
+  entirely on its own summary of intent. Smaller
+  models (gpt-4o-mini in our smoke set) may lose
+  track of where they were in the sequence. If the
+  case fails reliably on one provider but passes on
+  another, that's a model capability divergence,
+  not a harness bug — record it in the parity
+  matrix (Step 1.4) and accept it.
+
+**Spec reference:** `AGENTIC_CLI.md §5` (plan mode),
+`§6.1` (compaction), `CONTEXT_TUNING.md §3` (preserve
+parameters), `src/harness/compact*.ts` (goal preservation
+implementation).
+
+---
+
+## [2026-04-28] M3 / Step 1.2 — Regression batch 2: permission engine
+
+Continues M3 / Step 1.1 with batch 2 — 10 cases that
+exercise the permission engine surface (`src/permissions/
+engine.ts`). Each case ships its own
+`.agent/permissions.yaml` via `setup.files`, which the eval
+executor wires up automatically (`src/evals/executor.ts`
+drops a default `bypass` policy only when the case+fixture
+didn't provide one — see lines 108-115).
+
+**Why permissions next:**
+
+- Smoke runs entirely in default `bypass`. The engine has
+  unit coverage but never round-tripped under load with a
+  real model emitting tool calls under deny rules. M2's
+  smoke proves "the model uses tools"; this proves "the
+  model handles being told no."
+- The engine is the surface that subagents (M3 next),
+  MCP (M3+), and hooks (M4) layer on top of. Catching
+  regressions here BEFORE those subsystems land means we
+  know any future deny-class bug is in the layer above,
+  not below.
+
+**Done — cases 13-22 (numbered to extend batch 1):**
+
+| # | Engine surface | Why this case |
+|---|---|---|
+| 13 | `defaults.mode: strict` + no rules → default deny | Bedrock invariant: empty strict = nothing allowed. Asserts `tool_denied` after the model tries — proves the gate fires, not just that the model preempted |
+| 14 | `confirm_paths` + no UI → silent deny | Documents the M1-era behavior (`invoke-tool.ts:235-251`): confirm becomes `confirm_no` when no operator. Uses `file_not_exists` instead of `tool_denied` because the engine emits `kind: confirm`, not `deny` — cleanly distinguishes the two paths |
+| 15 | `bash.allow` matches → allow | Positive case: the rule actually permits when intended. `echo *` with `read_only: true` |
+| 16 | `bash.deny` wins over `bash.allow` | Asserts the deny-precedence invariant from `engine.ts:90-95` — gives the model BOTH `allow: ['*']` and `deny: ['rm *']`, expects `rm` denied |
+| 17 | `write_file.deny_paths` blocks under `acceptEdits` | Confirms deny_paths fires even under acceptEdits (the most permissive non-bypass mode). `secrets/**` blocked despite `allow_paths: ['**']` |
+| 18 | `write_file.allow_paths` permits under strict | Positive path-rule case: `*.md` allows `notes.md`. Mirror of #20 |
+| 19 | `read_file.deny_paths` blocks reads | Symmetric with #17 for the read axis. Catches any future regression where deny_paths is silently treated as write-only |
+| 20 | strict + write outside allow_paths → deny | Negative path-rule case: `*.md` rule does NOT cover `data.json`. Default deny under strict |
+| 21 | acceptEdits + no rule → still deny | The single most likely confusion vector for users: "acceptEdits" sounds like "allow all edits". It's not — it auto-accepts `confirm_paths` matches but unmatched paths still deny (`engine.ts:172-175`). This case proves the engine matches the JSDoc |
+| 22 | `bypass` short-circuits even deny rules | `engine.ts:221-223` returns `allow` before any rule runs. Asserts that adding a deny rule to a bypass policy is a no-op — important for operators who think they're "hardening" bypass with selective denies |
+
+**Cut (bounded scope):**
+
+- **No `confirm` decision via `tool_denied`.** The
+  `tool_denied` expectation fires only on `kind: 'deny'`
+  per `executor.ts:137-141`. Confirm decisions emit
+  `kind: 'confirm'` and the harness layer turns them
+  into `confirm_no` errors. Case 14 routes around this
+  by asserting on `file_not_exists` directly. Adding
+  a `tool_confirmed` expectation kind was considered
+  and rejected — the existing surface is enough; one
+  more discriminant would be paid for thinly until
+  the M2 confirm-UI lands.
+- **No FetchPolicy cases.** `web.fetch` is the engine
+  category, but no `fetch_url` tool exists yet — the
+  builtin tool surface stops at the 6 from M1. Coverage
+  arrives when the tool does, not before.
+- **No hierarchy cases (enterprise / user / project /
+  session).** `src/permissions/hierarchy.ts` resolves
+  layered policies, but eval cases ship a single
+  `.agent/permissions.yaml` (the project layer). Real
+  hierarchy testing needs multi-file fixtures and
+  potentially HOME/XDG override surfaces — out of
+  scope for batch 2, comes back when subagents start
+  using the session layer.
+
+**Decisions:**
+
+- **Phrase prompts so the model attempts the call.**
+  Step 6.5's lesson cuts here too: aligned models
+  preempt suspicious requests. For deny-class cases
+  (13, 16, 17, 19, 20, 21) the prompt explicitly says
+  "report whatever the tool returns, even if it's a
+  denial — do NOT switch tools, do NOT retry." The
+  model needs to invoke the gated tool for the engine
+  to deny it; if it preempts, `tool_denied` fails
+  vacuously. Mitigation: model has no policy
+  visibility (verified — policy doesn't leak into
+  system prompt; checked `harness/loop.ts:206`), so it
+  attempts naturally unless something in the prompt
+  itself looks dangerous.
+- **`acceptEdits` confusion gets its own case (#21).**
+  This is the only spec-§8 nuance ("aceita edits sem
+  confirmação") that consistently surprises operators
+  reading the policy file. Ship it as a regression
+  pinning the documented behavior so any future
+  refactor that loosens it lights up red.
+- **Loader-level guarantees re-validated implicitly.**
+  Each `.agent/permissions.yaml` shipped via
+  `setup.files` round-trips through
+  `loadPolicyFromFile` at engine construction. A
+  YAML key typo (`allow_path` singular) would crash
+  the case at load time with the policy parser's
+  rejection message — so these cases also prove the
+  policy parser stays strict-but-tolerant under load.
+
+**Pending (Step 1.3 onward):**
+
+- Compaction edge cases: preserve-tail boundaries,
+  fallback strategy when LLM call fails, multiple
+  compactions in one run.
+- Plan mode + multi-tool interleaving (plan + bash +
+  edit attempt).
+- Cross-cutting: bash deny when plan mode also active
+  (which gate fires first?).
+
+**Risks documented:**
+
+- **Cases 13, 16, 17, 19, 20, 21 depend on the model
+  attempting the call.** Same vector that bit Step 6.5.
+  Mitigation in prompt phrasing above. Worst case: a
+  case fails 0/3 because the model preempted on every
+  round. The right response then is to drop the case
+  (per the Step 6.5 honesty pass), not to tweak the
+  prompt until it works — model-behavior tests vs
+  harness-behavior tests stay separated.
+- **Path glob semantics use `**` literally.** YAML
+  parsers can be subtle about `**` inside flow scalars;
+  block scalars (used here) sidestep the issue. If a
+  future case writes the policy inline as a flow scalar
+  and `**` interacts with anchors/aliases, the rule
+  silently doesn't match. Pin the convention: always
+  block-scalar policy YAMLs in `setup.files`.
+
+**Spec reference:** `AGENTIC_CLI.md §8` (permission
+engine), `§9` (trust & safety), `src/permissions/engine.ts`
+(deny-precedence and bypass-shortcircuit invariants).
+
+---
+
+## [2026-04-28] M3 / Step 1.1 — Regression tier scaffold + first batch
+
+Opens M3 by attacking the spec §16 mandate "regression
+(~100 cases, < 10min) — todo PR" before subsystems that
+will lean on it (subagents, MCP, checkpoints). Step 1.1 is
+the first slice: scaffold `evals/regression/` and land a
+first batch (~12-15) of cases that exercise tool surface
+edge cases the smoke tier intentionally skips.
+
+**Why this slice first:**
+
+- The harness already supports any directory under
+  `evals/`. Runner is uncoupled from naming convention
+  beyond `*.yaml` extension (verified in `src/evals/cli.ts`
+  `discoverCases`). So a regression tier needs no
+  harness changes for the simplest path — just YAML.
+- Subagents, MCP, checkpoints (the rest of M3) all add
+  surfaces that need regression coverage. Building the
+  tier *first* means those subsystems get born with a
+  net under them, instead of retrofitting tests after
+  the fact.
+- Regression as a TIER also unlocks the CI gate item in
+  `docs/TODO.md` once it stabilizes.
+
+**Plan (stepwise):**
+
+- 1.1 — scaffold + tool-depth batch (~12-15 cases). This
+  entry.
+- 1.2 — permission engine cases (deny/allow/ask hierarchy
+  edges, `.agent/permissions.yaml` glob matching, prefix
+  rules).
+- 1.3 — compaction + plan mode edge cases (preserve-tail
+  boundaries, fallback strategy when LLM call fails,
+  plan mode + multi-tool interleaving).
+- 1.4 — provider adapter parity matrix (same case across
+  Anthropic / OpenAI / Gemini once Gemini smoke unblocks).
+- 1.5 — multi-tool flows (glob→read, grep→edit, bash→write).
+
+**Decisions to make explicit upfront:**
+
+- **No real-model baseline run inside Step 1.1.** Writing
+  cases and confirming they parse is one unit; running
+  them against a paid provider is another. Cost
+  envelope per real-model run scales with case count
+  (15 cases × $0.005 ≈ $0.075/round; 100 cases × 3
+  rounds ≈ $1.50). Real-model baseline lands in Step 1.6
+  after the 5 batches stabilize, so the cost is paid
+  once on a complete suite instead of paid 5 times on
+  intermediate states.
+- **Cases stay deterministic-by-design.** Avoid
+  expectations that depend on model-specific phrasing
+  (the Step 6.3 lesson: `output_contains: "hello world"`
+  was a property of Haiku, not the harness). Prefer
+  tool-call invariants (`tool_called`, `file_contains`,
+  `file_exists`, `tool_denied`).
+- **No new harness features in 1.1.** Parallelism (to
+  hit the < 10min target with 100 cases) is a separate
+  step. Today, regression runs serial like smoke.
+
+**Spec reference:** `AGENTIC_CLI.md §16` (eval tiers),
+`PROVIDERS.md §7` (multi-model first-class).
+
+**Done:**
+
+- New tier directory `evals/regression/` born with its
+  first 12 cases. No `.gitkeep`, no README — the
+  directory is created by the YAMLs themselves, mirroring
+  the project rule that empty folders are noise.
+- Cases (numbered for stable ordering, not for
+  dependency):
+
+  | # | Subsystem under test | Insight beyond smoke |
+  |---|---|---|
+  | 01 | `read_file` offset/limit | smoke reads whole file; this proves the line-window args round-trip through tool dispatch |
+  | 02 | `read_file` missing path | error path; model must NOT fall back to write_file |
+  | 03 | `write_file` deep nested dir | smoke writes at root; this proves intermediate dir creation |
+  | 04 | `write_file` overwrite | smoke creates new file; this proves stale content gets replaced |
+  | 05 | `edit_file` disambiguation | exercises the ambiguity-fail path: model must use surrounding context to pick one of two identical substrings |
+  | 06 | `edit_file` missing pattern | error path; model must NOT fall back to write_file |
+  | 07 | `grep` zero matches | empty-result path; model must NOT invent matches or write files |
+  | 08 | `grep` real regex | proves regex (not literal) interpretation: `function\s+\w+` finds 3 names |
+  | 09 | `glob` deep nesting | `**/*.ts` walks 3 directory levels |
+  | 10 | `glob` zero matches | empty-result path; symmetric with 07 for the file-discovery axis |
+  | 11 | `bash` piped command | `wc -l < file` exercises shell redirection in plan-friendly mode |
+  | 12 | multi-tool glob→read | proves tool-call chaining: glob output drives read_file path |
+
+- New fixture `evals/fixtures/nested-tree/` carries the
+  3-level TS tree used by cases 08, 09, and 12 (one
+  fixture, three cases — keeps fixtures tight). Inline
+  `setup.files` covers the 6 cases (01, 04, 05, 06, 11,
+  and 03 implicitly via writes to a fresh workspace) where
+  a one-liner file is enough — fixture dirs are reserved
+  for trees with structure.
+- All 12 YAMLs verified to load through
+  `src/evals/loader.ts` without a single parse error.
+  Loader-level invariants exercised:
+  - inline `setup.files` paths (relative-only, no `..`)
+  - `tool_called` / `tool_not_called` / `file_contains` /
+    `file_exists` / `file_not_exists` / `output_contains`
+    / `status` discriminants
+  - YAML literal block (`|`) for multi-line file content
+- `bun run typecheck`, `bun run lint`, and `bun test`
+  all green (625 pass, 0 fail) — no source touched, no
+  drift introduced.
+
+**Cut (kept the slice tight):**
+
+- **No README in `evals/regression/`.** CLAUDE.md
+  prohibits unsolicited markdown docs; the convention is
+  documented here in BACKLOG and self-evident in the
+  YAMLs themselves. If a second contributor lands and
+  asks "what goes in regression vs smoke?", that's the
+  signal to write the README — pre-writing it would be
+  speculative documentation.
+- **No real-model baseline run.** Confirmed in the
+  opening entry above — paying $0.30+ for a 12-case
+  Haiku baseline today, then re-paying it after each of
+  the 4 remaining batches lands, would cost ~$1.50
+  unnecessarily. Single baseline run gates Step 1.6
+  (closes the regression tier) instead.
+- **No new harness features.** Considered adding a
+  `--tier` shorthand (`bun run eval:regression`) but
+  the existing CLI already accepts a directory arg, so
+  `bun run eval -- evals/regression` works today. A
+  shorthand is shoe-leather; deferred until the tier
+  proves it deserves one.
+
+**Decisions:**
+
+- **Determinism over model-style assertions.** Every
+  case asserts on harness-observable facts
+  (`tool_called`, `file_contains`, `status: done`) plus
+  at most a single `output_contains` fragment that's a
+  literal echo of fixture content (e.g., `line three`,
+  `alpha.ts`). No assertions on phrasing, sentence
+  structure, or summarization style. This is the Step
+  6.3 lesson applied at scale: provider divergence is
+  guaranteed; we only assert on what the harness sees.
+- **Negative tool calls (`tool_not_called`) earn their
+  weight.** Cases 02, 06, 07, and 10 all pair the
+  positive `tool_called` with a `tool_not_called:
+  write_file` to defend against the failure mode where
+  a model "fixes" a missing file/pattern by writing
+  one. The `code-with-todos` fixture in cases 07 and
+  10 is read-only by intent — any write_file invocation
+  is a regression.
+- **Inline files vs fixture dirs.** Drew the line at
+  "does the case need >1 file or directory structure?"
+  Yes → fixture. No → inline. Keeps cases readable
+  without forcing a fixture dir for every single-file
+  scenario.
+
+**Pending (Step 1.2 onward):**
+
+- Permission engine cases (deny/allow/ask hierarchy
+  edges, `.agent/permissions.yaml` glob matching).
+- Compaction + plan mode edge cases.
+- Provider adapter parity matrix (waits on Gemini smoke
+  unblock — see `docs/TODO.md`).
+- Multi-tool flows beyond glob→read (grep→edit,
+  bash→write, plan→summarize).
+- Step 1.6: real-model baseline across the full
+  ~100-case suite, 3 rounds, decide on parallelism.
+
+**Risks documented:**
+
+- **Suite size will eventually need parallelism.** At
+  ~5s per case serial (smoke baseline), 100 cases × 3
+  rounds = 25 minutes. Spec target is < 10min. Step
+  6.3's smoke is round-major precisely so prompt-cache
+  helps; that's not enough at 100 cases. Worker pool
+  with N=4 is the obvious next step but introduces
+  ordering nondeterminism in the NDJSON output, which
+  the existing aggregate logic doesn't account for.
+  Tracked as Step 1.7-or-later.
+- **Inline `setup.files` heredocs accumulate.** 6 of 12
+  cases use them. If a future case wants the same
+  multi-line file, copy-paste tax grows. Rule of
+  three: the third copy of any inline body promotes to
+  a fixture.
+
+---
+
 ## [2026-04-28] M2 / Step 6.5 — Plan-mode bash gate: limit found, scope honest
 
 A code-review observation (`bash` marked `planSafe: true` could

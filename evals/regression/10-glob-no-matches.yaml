@@ -1,0 +1,16 @@
+name: glob handles zero matches gracefully
+prompt: |
+  Use the glob tool with the pattern `**/*.xyz` to find files in the working
+  directory. No file with the .xyz extension exists, so the result will be
+  empty. Report that no files matched in plain English. Do NOT create files
+  to make the pattern match, do NOT switch to a different tool.
+setup:
+  fixture: ../fixtures/code-with-todos
+expect:
+  - tool_called: glob
+  - tool_not_called: write_file
+  - tool_not_called: edit_file
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

@@ -1,0 +1,23 @@
+name: write_file allow_paths permits a matching write in strict mode
+prompt: |
+  Use the write_file tool to create `notes.md` with the single line
+  `forja regression batch 2`. Reply when the file is created.
+setup:
+  files:
+    .agent/permissions.yaml: |
+      defaults:
+        mode: strict
+      tools:
+        write_file:
+          allow_paths:
+            - '*.md'
+expect:
+  - tool_called: write_file
+  - file_exists: notes.md
+  - file_contains:
+      path: notes.md
+      pattern: forja regression batch 2
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

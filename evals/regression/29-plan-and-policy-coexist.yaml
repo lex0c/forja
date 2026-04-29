@@ -1,0 +1,32 @@
+name: plan mode and policy gates compose — policy fires after plan-gate
+plan: true
+prompt: |
+  Use the bash tool to run `cat greeting.txt` with `read_only: true` set.
+  Report whatever the tool returns, even if it's a denial. The plan-mode
+  gate will let the call through (read_only commands are allowed in plan
+  mode). The policy layer is a separate gate — it may block the command
+  for its own reasons. Either way, finish with a brief plan describing
+  what you would do once the file's contents are visible.
+setup:
+  fixture: ../fixtures/greeting
+  files:
+    .agent/permissions.yaml: |
+      defaults:
+        mode: strict
+      tools:
+        bash:
+          allow:
+            - 'echo *'
+          deny:
+            - 'cat *'
+expect:
+  - tool_called: bash
+  - tool_denied: bash
+  - file_contains:
+      path: greeting.txt
+      pattern: hello world
+  - output_contains: "# Plan"
+  - status: done
+budget:
+  maxSteps: 6
+  maxCostUsd: 0.10

@@ -1,0 +1,23 @@
+name: compaction works correctly under --plan
+plan: true
+prompt: |
+  Read every TypeScript file under src/ in alphabetical order (a.ts, b.ts,
+  c.ts, d.ts, e.ts), then produce a plan that summarizes what every file
+  imports. The reads will be extensive enough that compaction will fire.
+  Plan mode is on — do NOT modify any file.
+setup:
+  fixture: ../fixtures/chunky-modules
+expect:
+  - tool_called: read_file
+  - tool_not_called: write_file
+  - tool_not_called: edit_file
+  - compaction_triggered:
+      strategy: llm
+      min_count: 1
+  - output_contains: "# Plan"
+  - status: done
+budget:
+  maxSteps: 12
+  maxCostUsd: 0.15
+  compactionThreshold: 0.02
+  compactionPreserveTail: 1

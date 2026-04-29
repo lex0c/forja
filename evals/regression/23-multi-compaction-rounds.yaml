@@ -1,0 +1,20 @@
+name: compaction triggers more than once in a single run
+prompt: |
+  Read every TypeScript file under src/ in alphabetical order
+  (a.ts, b.ts, c.ts, d.ts, e.ts), then read each one a SECOND time in the
+  same alphabetical order. After all ten reads, tell me the dependency name
+  every file imports from. Quote it verbatim.
+setup:
+  fixture: ../fixtures/chunky-modules
+expect:
+  - tool_called: read_file
+  - compaction_triggered:
+      strategy: llm
+      min_count: 2
+  - status: done
+  - output_contains: forja-core
+budget:
+  maxSteps: 14
+  maxCostUsd: 0.15
+  compactionThreshold: 0.01
+  compactionPreserveTail: 1
