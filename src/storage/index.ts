@@ -71,3 +71,14 @@ export type {
   InsertBgProcessInput,
   ListBgProcessesFilter,
 } from './repos/bg-processes.ts';
+
+export {
+  deleteCheckpoint,
+  deleteCheckpointsBySession,
+  getCheckpoint,
+  getLatestCheckpointBySession,
+  insertCheckpoint,
+  listCheckpointsBySession,
+  listCheckpointsOlderThan,
+} from './repos/checkpoints.ts';
+export type { Checkpoint, InsertCheckpointInput } from './repos/checkpoints.ts';
