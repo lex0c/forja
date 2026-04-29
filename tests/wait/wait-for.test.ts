@@ -273,6 +273,7 @@ describe('wait_for: http_response', () => {
       { timeoutMs: 200, pollIntervalMs: 100 },
     );
     expect(noMatch.matched).toBe(false);
+    expect(noMatch.conditionMet).toBe('timeout');
 
     const matched = await waitFor(
       { kind: 'http_response', url: `${baseUrl}/redirect`, status: 301, redirect: 'manual' },

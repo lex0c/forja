@@ -462,6 +462,12 @@ describe('wait_for tool: process_* conditions', () => {
     );
     if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
     expect(r.matched).toBe(false);
+    // Process exits in ~50ms, well before the 200ms outer timeout —
+    // the explicit 'process_exited' terminal must surface through
+    // the tool boundary (snake_case condition_met). Without this
+    // assertion, the prior 'aborted' mis-classification regression
+    // would slip through.
+    expect(r.condition_met).toBe('process_exited');
     expect(r.payload?.process_exited).toBe(true);
   });
 

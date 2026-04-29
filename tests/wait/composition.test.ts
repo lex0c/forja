@@ -170,6 +170,12 @@ describe('wait_for: all_of', () => {
     );
     const elapsed = Date.now() - start;
     expect(r.matched).toBe(false);
+    // Outer timeout fires before/with sub's own — finishUnmatched-
+    // Composition gives priority to the outer timeout, so 'timeout'
+    // is the deterministic terminal here. Locks the no-match
+    // classification so a future regression of the "report aborted
+    // when neither timeout nor abort fired" bug is caught.
+    expect(r.conditionMet).toBe('timeout');
     expect(r.payload?.failedIndex).toBe(0);
     expect(r.payload?.failedKind).toBe('file_exists');
     // Should fail in roughly the timeout window, not wait the full
@@ -196,6 +202,7 @@ describe('wait_for: all_of', () => {
       { timeoutMs: 100, pollIntervalMs: 50 },
     );
     expect(r.matched).toBe(false);
+    expect(r.conditionMet).toBe('timeout');
     expect(r.payload?.failedIndex).toBe(0);
     expect(r.payload?.failedKind).toBe('file_exists');
   });
