@@ -7,17 +7,20 @@ import {
   insertCheckpoint,
   listCheckpointsBySession,
   listCheckpointsOlderThan,
+  updateCheckpointGitRef,
 } from '../storage/index.ts';
 import {
   deleteRestoreSavedRef,
   deleteSessionRef,
+  getCommitMessage,
+  getCommitTree,
+  getHeadSha,
   diff as gitDiff,
   restore as gitRestore,
   snapshot as gitSnapshot,
   listRestoreSavedRefs,
   listSessionRefs,
-  resolveRef,
-  sessionRef,
+  rewriteCheckpointCommit,
   setSessionRef,
 } from './git.ts';
 
@@ -241,20 +244,65 @@ class CheckpointManagerImpl implements CheckpointManager {
           }
           continue;
         }
-        // Some checkpoints survived; re-point the session ref at the
-        // most recent surviving sha so the chain stays reachable. The
-        // newer commits are first in the listing (DESC).
-        const head = remaining[0];
-        if (head !== undefined) {
-          // Idempotent: skip the spawn when the ref already matches
-          // (the common case — aging out rows from the tail of the
-          // chain doesn't move the head).
-          const current = await resolveRef(this.cwd, sessionRef(sessionId));
-          if (current !== head.gitRef) {
+        // Some checkpoints survived. Just re-pointing the session ref
+        // at the latest survivor is NOT enough: every survivor still
+        // parents the now-aged commits via its commit object, so git
+        // treats the aged commits as reachable and gc never reclaims
+        // them. Retention would only HIDE history, not enforce object
+        // retention — defeating the whole point of the retentionDays
+        // knob (CHECKPOINTS.md §2.5).
+        //
+        // Sever ancestry by rewriting the surviving chain in
+        // chronological order: the oldest survivor's parent becomes
+        // current HEAD (or null if unborn), and each subsequent
+        // survivor's parent becomes the prior survivor's NEW sha.
+        // The original commit objects (both aged and the originals
+        // of survivors) become unreachable from any ref; a future
+        // git gc reclaims them.
+        const chronological = [...remaining].reverse();
+        const headSha = await getHeadSha(this.cwd).catch(() => null);
+        const rewrites: { id: string; newSha: string }[] = [];
+        let priorParent: string | null = headSha;
+        let rewriteOk = true;
+        for (const ckpt of chronological) {
+          try {
+            const treeSha = await getCommitTree(this.cwd, ckpt.gitRef);
+            const message = await getCommitMessage(this.cwd, ckpt.gitRef);
+            const newSha = await rewriteCheckpointCommit(this.cwd, treeSha, priorParent, message);
+            rewrites.push({ id: ckpt.id, newSha });
+            priorParent = newSha;
+          } catch {
+            // If any rewrite fails, abort the whole batch. The DB and
+            // ref stay untouched (we apply both AFTER the loop), so
+            // state is consistent: original chain still intact, aged
+            // commits still reachable until the next purge retries.
+            // The orphan commit objects we already created are
+            // unreachable and will be reclaimed by git gc.
+            rewriteOk = false;
+            break;
+          }
+        }
+        if (rewriteOk && rewrites.length === chronological.length) {
+          // All rewrites succeeded. Apply DB updates first, then move
+          // the ref. If the ref move fails after DB updates land, the
+          // DB points at the new commits but the ref still points at
+          // the original chain — restore by id still works (manager
+          // looks up by sha from DB), and next purge sees the ref
+          // mismatch and retries the move. Inverse ordering would
+          // leave the ref ahead of the DB and break restore lookups.
+          for (const r of rewrites) {
             try {
-              await setSessionRef(this.cwd, sessionId, head.gitRef);
+              updateCheckpointGitRef(this.db, r.id, r.newSha);
             } catch {
-              // ignored
+              // Row vanished mid-purge; leave the rest as-is.
+            }
+          }
+          const finalSha = rewrites[rewrites.length - 1]?.newSha;
+          if (finalSha !== undefined) {
+            try {
+              await setSessionRef(this.cwd, sessionId, finalSha);
+            } catch {
+              // ignored — DB is the authoritative pointer
             }
           }
         }

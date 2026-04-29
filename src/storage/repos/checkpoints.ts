@@ -102,6 +102,19 @@ export const deleteCheckpoint = (db: DB, id: string): void => {
   db.query('DELETE FROM checkpoints WHERE id = ?').run(id);
 };
 
+// Update a checkpoint's git_ref. Used by the retention rewrite path
+// when surviving checkpoints are re-parented onto current HEAD: the
+// rebuilt commit has a new sha, and the row must follow so future
+// restore/diff/list operations resolve correctly. Throws on unknown
+// id rather than silently no-op'ing — a missing row at this point
+// signals state corruption that should surface, not silently mask.
+export const updateCheckpointGitRef = (db: DB, id: string, gitRef: string): void => {
+  const result = db.query('UPDATE checkpoints SET git_ref = ? WHERE id = ?').run(gitRef, id);
+  if (result.changes === 0) {
+    throw new Error(`checkpoint ${id} not found`);
+  }
+};
+
 // Bulk delete by session — used by `--checkpoints purge --session=<id>`.
 // Returns row count for cleanup logging.
 export const deleteCheckpointsBySession = (db: DB, sessionId: string): number => {

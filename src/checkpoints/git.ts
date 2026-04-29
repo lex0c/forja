@@ -529,6 +529,55 @@ export const setSessionRef = async (cwd: string, sessionId: string, sha: string)
   await runGit(['update-ref', sessionRef(sessionId), sha], { cwd });
 };
 
+// Read a commit's tree sha. Used by the retention rewrite path —
+// when severing aged ancestry from a surviving chain, the survivor's
+// tree stays the same, only the parent pointer changes.
+export const getCommitTree = async (cwd: string, commitSha: string): Promise<string> => {
+  const { stdout } = await runGit(['rev-parse', `${commitSha}^{tree}`], { cwd });
+  return stdout.trim();
+};
+
+// Read a commit's full message body. Same path: rewrites preserve
+// the original message verbatim so `git log refs/agent/checkpoints`
+// stays human-grep-able with the original "forja: pre-step N <iso>"
+// shape, and audit tooling indexed by message stays stable.
+export const getCommitMessage = async (cwd: string, commitSha: string): Promise<string> => {
+  const { stdout } = await runGit(['log', '-1', '--format=%B', commitSha], { cwd });
+  return stdout.trimEnd();
+};
+
+// Build a commit object from an existing tree with an explicit
+// (possibly null) parent. Distinct from `snapshot()` because the
+// tree is given (not derived from the working tree) and there's no
+// temp-index dance. Used by retention to re-parent surviving
+// checkpoints onto current HEAD, severing reachability of aged
+// commits so git gc can reclaim them — without this, the chain's
+// parent links keep aged commits alive forever even after their DB
+// rows are deleted (CHECKPOINTS.md §2.5).
+export const rewriteCheckpointCommit = async (
+  cwd: string,
+  treeSha: string,
+  parentSha: string | null,
+  message: string,
+): Promise<string> => {
+  const args = ['commit-tree', treeSha];
+  if (parentSha !== null) {
+    args.push('-p', parentSha);
+  }
+  const env: Record<string, string> = {
+    GIT_AUTHOR_NAME: 'forja',
+    GIT_AUTHOR_EMAIL: 'forja@local',
+    GIT_COMMITTER_NAME: 'forja',
+    GIT_COMMITTER_EMAIL: 'forja@local',
+  };
+  const { stdout } = await runGit(args, { cwd, env, stdin: message });
+  const sha = stdout.trim();
+  if (sha.length === 0) {
+    throw new Error('git commit-tree produced empty output (retention rewrite)');
+  }
+  return sha;
+};
+
 // Enumerate every restore-saved preservation ref, with its parsed
 // timestamp and full ref name. Drives the lazy retention sweep —
 // these refs aren't tied to a session and there's no DB row to

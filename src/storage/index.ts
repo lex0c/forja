@@ -80,5 +80,6 @@ export {
   insertCheckpoint,
   listCheckpointsBySession,
   listCheckpointsOlderThan,
+  updateCheckpointGitRef,
 } from './repos/checkpoints.ts';
 export type { Checkpoint, InsertCheckpointInput } from './repos/checkpoints.ts';

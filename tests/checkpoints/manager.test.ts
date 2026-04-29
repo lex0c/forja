@@ -232,6 +232,71 @@ describe('CheckpointManager — available mode', () => {
     expect(await resolveRef(repo, sessionRef(sessionId))).toBeNull();
   });
 
+  test('purge severs aged ancestry so git gc can reclaim aged commits', async () => {
+    // The chain shape (each new ckpt parents the prior) means a
+    // simple ref re-point doesn't sever reachability — git treats
+    // every parent of a referenced commit as alive. Aged commits
+    // would survive every gc unless retention rewrites the surviving
+    // chain to break the link.
+    //
+    // Setup: 4 snapshots, each with a different file content. Then
+    // backdate the oldest two so they age out under olderThanDays=1.
+    await initRepoWithSeed(repo);
+    const mgr = createCheckpointManager({ db, cwd: repo, sessionId, available: true });
+
+    await writeFile(join(repo, 'state.txt'), 'A\n');
+    const a = await mgr.snapshot({ stepId: 'a', hadBash: false });
+    await writeFile(join(repo, 'state.txt'), 'B\n');
+    const b = await mgr.snapshot({ stepId: 'b', hadBash: false });
+    await writeFile(join(repo, 'state.txt'), 'C\n');
+    const c = await mgr.snapshot({ stepId: 'c', hadBash: false });
+    await writeFile(join(repo, 'state.txt'), 'D\n');
+    const d = await mgr.snapshot({ stepId: 'd', hadBash: false });
+
+    // Original shas — these are what we expect to become unreachable
+    // once retention rewrites the chain. The aged ones (A, B) AND
+    // the ORIGINAL surviving ones (C, D) all become unreachable
+    // because survivors get rewritten to fresh commits without aged
+    // ancestors.
+    const shaA = a.gitRef as string;
+    const shaB = b.gitRef as string;
+    const shaCOriginal = c.gitRef as string;
+    const shaDOriginal = d.gitRef as string;
+
+    db.query('UPDATE checkpoints SET created_at = ? WHERE id = ?').run(0, a.checkpointId);
+    db.query('UPDATE checkpoints SET created_at = ? WHERE id = ?').run(0, b.checkpointId);
+
+    await mgr.purge({ olderThanDays: 1 });
+
+    // DB rows for A, B gone. C, D survive but with REWRITTEN git_ref.
+    const survivors = listCheckpointsBySession(db, sessionId);
+    expect(survivors).toHaveLength(2);
+    const survivorShas = survivors.map((r) => r.gitRef);
+    expect(survivorShas).not.toContain(shaCOriginal);
+    expect(survivorShas).not.toContain(shaDOriginal);
+
+    // Reachability check: every commit reachable from any ref in
+    // the repo. Aged shas AND original surviving shas must all be
+    // absent — the chain is severed.
+    const reachable = (await runGit(repo, ['rev-list', '--all'])).trim().split('\n');
+    expect(reachable).not.toContain(shaA);
+    expect(reachable).not.toContain(shaB);
+    expect(reachable).not.toContain(shaCOriginal);
+    expect(reachable).not.toContain(shaDOriginal);
+
+    // The rebuilt survivor head is at the session ref.
+    const refSha = await resolveRef(repo, sessionRef(sessionId));
+    expect(refSha).not.toBeNull();
+    expect(reachable).toContain(refSha as string);
+
+    // Working-tree contents at the rebuilt latest ckpt's tree match
+    // what was captured at the time of D (state.txt = "D"). Proves
+    // the rewrite preserved the tree, not just the lineage.
+    const restoreResult = await mgr.restore(survivors[0]?.id as string);
+    expect(restoreResult).toBeDefined();
+    expect(await Bun.file(join(repo, 'state.txt')).text()).toBe('D\n');
+  });
+
   test('purge sweeps orphan refs whose DB rows are gone', async () => {
     await initRepoWithSeed(repo);
     const mgr = createCheckpointManager({ db, cwd: repo, sessionId, available: true });
