@@ -10,7 +10,12 @@ import type { Provider, StreamEvent } from '../../src/providers/index.ts';
 import { type DB, openDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { listMessagesBySession } from '../../src/storage/repos/messages.ts';
-import { getSession, listSessions, updateSessionCost } from '../../src/storage/repos/sessions.ts';
+import {
+  createSession,
+  getSession,
+  listSessions,
+  updateSessionCost,
+} from '../../src/storage/repos/sessions.ts';
 
 const baseArgs = (overrides: Partial<ParsedArgs> = {}): ParsedArgs => ({
   prompt: 'hi',
@@ -319,6 +324,39 @@ describe('--resume flow', () => {
     });
     expect(code).toBe(1);
     expect(errLines.join('')).toContain('not found');
+  });
+
+  test('resume of a session with no persisted messages does not crash', async () => {
+    // Edge case: a session row exists but appendMessage never ran
+    // (e.g., bootstrap created the session and the harness aborted
+    // before the user prompt landed). Resume should treat this as
+    // an empty conversation — the new userMsg becomes the root
+    // (parent_id=null) instead of failing or referencing a tail
+    // that doesn't exist.
+    const setupDb = openDb(dbPath);
+    migrate(setupDb);
+    const s = createSession(setupDb, { model: 'mock/m', cwd: workdir });
+    setupDb.close();
+
+    const code = await run({
+      args: baseArgs({ prompt: 'first message', resume: s.id }),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'a' }]),
+        dbPath,
+        cwd: workdir,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: recordingRenderer().renderer,
+    });
+    expect(code).toBe(0);
+
+    db = openTestDb();
+    const msgs = listMessagesBySession(db, s.id);
+    expect(msgs).toHaveLength(2);
+    // The prompt is the chain root since there was no prior tail.
+    expect(msgs[0]?.parentId).toBeNull();
+    expect(msgs[0]?.content).toBe('first message');
+    db.close();
   });
 
   test('parent_id chain is contiguous across resume boundaries', async () => {
