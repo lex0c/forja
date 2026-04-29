@@ -146,6 +146,16 @@ export interface HarnessConfig {
   // and any workflow that needs repeatable output. Tunable per
   // workflow per `TOKEN_TUNING.md`.
   temperature?: number;
+  // Resume mode (AGENTIC_CLI §2.1): when set, the harness skips
+  // createSession and uses this id instead. Persisted messages for
+  // the session are loaded into the in-memory `messages` array
+  // before the new userPrompt is appended, so the model sees the
+  // full prior conversation as context. The session is reopened
+  // (status flipped back to 'running') so completeSession at the
+  // end of the resumed run doesn't trip its 'must be running'
+  // guard. Caller is responsible for verifying the id exists
+  // before constructing the config.
+  resumeFromSessionId?: string;
 }
 
 export interface HarnessResult {

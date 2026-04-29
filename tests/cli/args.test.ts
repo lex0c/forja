@@ -135,6 +135,52 @@ describe('parseArgs', () => {
     if (!r.ok) return;
     expect(r.args.prompt).toBe('');
   });
+
+  test('--list-sessions flag', () => {
+    const r = parseArgs(['--list-sessions']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.listSessions).toBe(true);
+  });
+
+  test('--list-sessions composes with --json', () => {
+    const r = parseArgs(['--list-sessions', '--json']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.listSessions).toBe(true);
+    expect(r.args.json).toBe(true);
+  });
+
+  test('--resume requires a value', () => {
+    const r = parseArgs(['--resume']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--resume');
+  });
+
+  test('--resume with literal id', () => {
+    const r = parseArgs(['--resume', 'abc-123', 'follow up']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.resume).toBe('abc-123');
+    expect(r.args.prompt).toBe('follow up');
+  });
+
+  test('--resume last is accepted as a value', () => {
+    const r = parseArgs(['--resume', 'last', 'continue please']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.resume).toBe('last');
+    expect(r.args.prompt).toBe('continue please');
+  });
+
+  test('--resume rejects another flag as its value', () => {
+    // Defends against `--resume --json` being misread as resume
+    // value '--json'. Forces the user to provide an explicit id
+    // or 'last'.
+    const r = parseArgs(['--resume', '--json']);
+    expect(r.ok).toBe(false);
+  });
 });
 
 describe('usage', () => {
@@ -146,5 +192,7 @@ describe('usage', () => {
     expect(u).toContain('--plan');
     expect(u).toContain('--model');
     expect(u).toContain('--max-steps');
+    expect(u).toContain('--list-sessions');
+    expect(u).toContain('--resume');
   });
 });

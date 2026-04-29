@@ -138,3 +138,17 @@ export const updateSessionCost = (db: DB, id: string, totalCostUsd: number): voi
     throw new Error(`session ${id} not found`);
   }
 };
+
+// Flip a previously-finalized session back to 'running' so a resume
+// continuation can reuse the same id. Idempotent — calling on an
+// already-running session is a no-op. Without this, completeSession
+// at the end of the resumed run would fail its WHERE status='running'
+// guard and throw.
+export const reopenSession = (db: DB, id: string): void => {
+  const result = db
+    .query("UPDATE sessions SET status = 'running', ended_at = NULL WHERE id = ?")
+    .run(id);
+  if (result.changes === 0) {
+    throw new Error(`session ${id} not found`);
+  }
+};

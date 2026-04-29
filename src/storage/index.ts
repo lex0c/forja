@@ -14,6 +14,7 @@ export {
   createSession,
   getSession,
   listSessions,
+  reopenSession,
   updateSessionCost,
 } from './repos/sessions.ts';
 export type {

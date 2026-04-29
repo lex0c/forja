@@ -10,13 +10,21 @@ import type {
   ProviderToolUseBlock,
 } from '../providers/index.ts';
 import { estimatePromptTokens } from '../providers/tokens.ts';
-import { appendMessage, completeSession, createSession } from '../storage/index.ts';
+import {
+  appendMessage,
+  completeSession,
+  createSession,
+  getSession,
+  listMessagesBySession,
+  reopenSession,
+} from '../storage/index.ts';
 import { type TodoStore, createTodoStore } from '../todo/index.ts';
 import type { ToolContext } from '../tools/index.ts';
 import { abortableIterable } from './abortable.ts';
 import { CollectStepError, collectStep } from './collect.ts';
 import { compactMessages } from './compaction.ts';
 import { invokeTool } from './invoke-tool.ts';
+import { messagesToProviderMessages } from './resume.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
 import {
   DEFAULT_BUDGET,
@@ -195,17 +203,63 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // whether the OS kill landed.
   try {
     try {
-      const session = createSession(config.db, {
-        model: config.provider.id,
-        cwd: config.cwd,
-      });
-      sessionId = session.id;
+      // Resume vs new session. In resume mode, the prior session id
+      // is reused and its persisted messages are loaded back into
+      // the in-memory array so the model sees the full conversation
+      // before the new userPrompt. The session is flipped back to
+      // 'running' so completeSession at run-end doesn't trip its
+      // 'must be running' WHERE guard. We validate the id BEFORE
+      // any side effects so a typo'd session id doesn't leave a
+      // half-initialized state.
+      // Resume budget semantics: `steps`, `consecutiveErrors`, and
+      // `totalUsage` are local accumulators that start at zero —
+      // intentional, the model's prior turns shouldn't count against
+      // this run's caps. `totalCostUsd` and `usageComplete` are
+      // different: they're persisted on the session row, and
+      // completeSession OVERWRITES them at run-end. To keep the
+      // session-level cost a true cumulative, we seed the local
+      // accumulators from the prior persisted values so the UPDATE
+      // at the end writes (prior + new), not just (new). Same for
+      // usageComplete — if prior runs were already incomplete, that
+      // state has to AND-down with the resume run's completeness.
+      // The CLI's run.ts also calls getSession before constructing
+      // the config (`resolveResumeId`) so a typo'd id fails fast on
+      // stderr. The duplicate check here is intentional defense in
+      // depth: programmatic callers (evals, future tests) may build
+      // a HarnessConfig directly without going through the CLI, and
+      // getSession returning null inside the loop would otherwise
+      // surface as a confusing 'getSession on null result' downstream
+      // when we read totalCostUsd. The cost of one extra SELECT per
+      // resume call is negligible.
+      const resumeId = config.resumeFromSessionId;
+      if (resumeId !== undefined) {
+        const existing = getSession(config.db, resumeId);
+        if (existing === null) {
+          throw new Error(`session ${resumeId} not found`);
+        }
+        totalCostUsd = existing.totalCostUsd;
+        usageComplete = existing.usageComplete;
+        reopenSession(config.db, resumeId);
+        sessionId = resumeId;
+      } else {
+        const session = createSession(config.db, {
+          model: config.provider.id,
+          cwd: config.cwd,
+        });
+        sessionId = session.id;
+      }
 
       // bg manager creation MUST happen here, after sessionId is
       // resolved — every row insertBgProcess writes carries the
       // session_id FK, so a manager built before createSession would
       // crash on first spawn. The manager is short-lived: lives
       // until the outer finally cleans it up.
+      //
+      // Note: bg processes from the prior run of a resumed session
+      // are NOT carried over. The previous run's harness terminated
+      // them in its outer finally; this fresh manager starts empty.
+      // Documented as an explicit boundary — resume restores
+      // conversational context, not running children.
       if (config.bgLogDir !== undefined) {
         bgManager = createBgManager({
           db: config.db,
@@ -218,6 +272,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // request, where finally can be seconds away.
           abortSignal: signal,
         });
+      }
+
+      // Resume path: hydrate messages from persistence BEFORE
+      // appending the new user prompt. The model sees [old turns,
+      // new prompt] and continues naturally. The new prompt is
+      // also persisted so the next resume sees it too.
+      if (resumeId !== undefined) {
+        const persisted = listMessagesBySession(config.db, resumeId);
+        const restored = messagesToProviderMessages(persisted);
+        messages.push(...restored);
       }
 
       const userMsg = appendMessage(config.db, {

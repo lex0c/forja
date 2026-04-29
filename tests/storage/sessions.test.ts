@@ -7,6 +7,7 @@ import {
   createSession,
   getSession,
   listSessions,
+  reopenSession,
   updateSessionCost,
 } from '../../src/storage/repos/sessions.ts';
 
@@ -104,5 +105,31 @@ describe('sessions repo', () => {
           "VALUES ('x', 0, 'm', '/p', 'bogus', 0)",
       ),
     ).toThrow();
+  });
+
+  test('reopenSession flips a finished session back to running', () => {
+    // Resume continuation reuses a prior session id; without
+    // reopen, completeSession at the end of the resumed run trips
+    // its WHERE status='running' guard.
+    const s = createSession(db, { model: 'm', cwd: '/p' });
+    completeSession(db, s.id, 'done', 0.5, true);
+    expect(getSession(db, s.id)?.status).toBe('done');
+    reopenSession(db, s.id);
+    expect(getSession(db, s.id)?.status).toBe('running');
+    expect(getSession(db, s.id)?.endedAt).toBeNull();
+    // completeSession should now succeed again on the resumed run.
+    completeSession(db, s.id, 'done', 1.5, true);
+    expect(getSession(db, s.id)?.status).toBe('done');
+    expect(getSession(db, s.id)?.totalCostUsd).toBe(1.5);
+  });
+
+  test('reopenSession is idempotent on an already-running session', () => {
+    const s = createSession(db, { model: 'm', cwd: '/p' });
+    expect(() => reopenSession(db, s.id)).not.toThrow();
+    expect(getSession(db, s.id)?.status).toBe('running');
+  });
+
+  test('reopenSession rejects unknown id', () => {
+    expect(() => reopenSession(db, 'nope')).toThrow(/not found/);
   });
 });

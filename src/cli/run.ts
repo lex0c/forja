@@ -1,6 +1,8 @@
 import { type HarnessResult, runAgent } from '../harness/index.ts';
+import { defaultDbPath, getSession, listSessions, migrate, openDb } from '../storage/index.ts';
 import type { ParsedArgs } from './args.ts';
 import { type BootstrapInput, bootstrap } from './bootstrap.ts';
+import { runListSessions } from './list-sessions.ts';
 import { createJsonRenderer } from './output/json.ts';
 import { createPlainRenderer } from './output/plain.ts';
 import type { OutputRenderer } from './output/types.ts';
@@ -47,10 +49,83 @@ export const exitCodeFor = (result: HarnessResult): number => {
   }
 };
 
+// Resolve a `--resume` CLI value into an actual session id. 'last'
+// becomes the most recently started session; anything else is
+// taken as a literal id and verified to exist. Returns null +
+// error message when the resolution fails so the caller can print
+// a clean diagnostic and exit non-zero.
+//
+// Lives outside the main `run()` flow because list-sessions and
+// resume both need the same DB-only pre-step before deciding
+// whether to enter the harness path.
+const resolveResumeId = (
+  resume: string,
+  dbPath: string,
+): { ok: true; id: string } | { ok: false; message: string } => {
+  const db = openDb(dbPath);
+  try {
+    migrate(db);
+    if (resume === 'last') {
+      const sessions = listSessions(db, { limit: 1 });
+      const first = sessions[0];
+      if (first === undefined) {
+        return { ok: false, message: "no sessions found to resume (with 'last')" };
+      }
+      return { ok: true, id: first.id };
+    }
+    // Literal id path. Validate upfront so a typo'd id fails with
+    // a clean errSink message before bootstrap. Without this
+    // pre-check, the throw inside runAgent's init block lands in
+    // guardedFinish and surfaces as an internalError exit (1)
+    // with no diagnostic on stderr — confusing for users.
+    const existing = getSession(db, resume);
+    if (existing === null) {
+      return { ok: false, message: `session ${resume} not found` };
+    }
+    return { ok: true, id: resume };
+  } finally {
+    db.close();
+  }
+};
+
 export const run = async (options: RunOptions): Promise<number> => {
   const { args } = options;
-  const renderer = options.rendererOverride ?? pickRenderer(args);
   const errSink = options.errSink ?? ((s: string) => process.stderr.write(s));
+
+  // List-sessions short-circuit. No provider, no policy engine, no
+  // harness — only the DB. Lets `agent --list-sessions` work
+  // without an API key set, which is the right shape for an
+  // inspection tool.
+  if (args.listSessions) {
+    return runListSessions({
+      json: args.json,
+      ...(options.bootstrapOverride?.dbPath !== undefined
+        ? { dbPath: options.bootstrapOverride.dbPath }
+        : {}),
+      out: (s) => process.stdout.write(s),
+    });
+  }
+
+  // Resume: require a follow-up prompt — without it there's no new
+  // user turn to drive the loop, and the model would just see its
+  // own last assistant message replayed. Resolve 'last' / id BEFORE
+  // bootstrap so a typo fails fast with a clean error.
+  let resumeFromSessionId: string | undefined;
+  if (args.resume !== undefined) {
+    if (args.prompt.length === 0) {
+      errSink('forja: --resume requires a follow-up prompt\n');
+      return 1;
+    }
+    const dbPath = options.bootstrapOverride?.dbPath ?? defaultDbPath();
+    const resolved = resolveResumeId(args.resume, dbPath);
+    if (!resolved.ok) {
+      errSink(`forja: ${resolved.message}\n`);
+      return 1;
+    }
+    resumeFromSessionId = resolved.id;
+  }
+
+  const renderer = options.rendererOverride ?? pickRenderer(args);
 
   const controller = new AbortController();
   const signal = options.signal ?? controller.signal;
@@ -65,6 +140,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       ...(args.model !== undefined ? { modelId: args.model } : {}),
       ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
       ...(args.plan === true ? { plan: true } : {}),
+      ...(resumeFromSessionId !== undefined ? { resumeFromSessionId } : {}),
       signal,
       ...(options.bootstrapOverride ?? {}),
     };

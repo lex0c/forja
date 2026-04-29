@@ -26,6 +26,13 @@ export interface BootstrapInput {
   // Sampling temperature plumbed straight to HarnessConfig.
   // Evals set this to 0 for deterministic runs.
   temperature?: number;
+  // Resume mode (AGENTIC_CLI §2.1): when set, the harness skips
+  // createSession and continues the named session by reloading
+  // its persisted messages and appending `prompt` as the new
+  // user turn. Caller (CLI run.ts) is responsible for resolving
+  // `last` aliases before constructing this — bootstrap takes a
+  // concrete id only.
+  resumeFromSessionId?: string;
   // Test seam: when set, skip the registry lookup and use this provider.
   providerOverride?: Provider;
   // Test seam: override the DB path (default: defaultDbPath()).
@@ -140,6 +147,9 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     ...(input.plan === true ? { planMode: true } : {}),
     ...(resolvedSystemPrompt !== undefined ? { systemPrompt: resolvedSystemPrompt } : {}),
     ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
+    ...(input.resumeFromSessionId !== undefined
+      ? { resumeFromSessionId: input.resumeFromSessionId }
+      : {}),
   };
 
   return { config, db, modelId, policyLayers, lockConflicts: resolved.lockConflicts };
