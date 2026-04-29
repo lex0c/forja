@@ -47,3 +47,19 @@ export type {
   ApprovalDecision,
   RecordApprovalInput,
 } from './repos/approvals.ts';
+
+export {
+  advanceBgProcessCursor,
+  finalizeBgProcess,
+  getBgProcess,
+  insertBgProcess,
+  listBgProcessesBySession,
+  markRunningAsKilled,
+} from './repos/bg-processes.ts';
+export type {
+  BgProcess,
+  BgProcessStatus,
+  FinalizeBgProcessInput,
+  InsertBgProcessInput,
+  ListBgProcessesFilter,
+} from './repos/bg-processes.ts';

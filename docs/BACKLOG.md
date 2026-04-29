@@ -15,6 +15,145 @@ Format:
 
 ---
 
+## [2026-04-28] M3 / Step 2.1 (in progress) — bash_background trio + storage
+
+Opens M3 / Step 2 with the smallest cohesive slice of the
+background-process subsystem: the three execution tools
+(`bash_background`, `bash_output`, `bash_kill`) plus the
+storage table that persists process state across turns.
+
+**Why this subsystem next, why this slice first:**
+
+- `bash_background` extends an existing tool (`bash`) rather
+  than introducing a new architectural layer (subagents,
+  MCP, slash commands). Lowest blast radius for a first
+  M3-after-eval-regression step.
+- It unblocks real workflows the M2 tool surface can't
+  reach: long-running dev servers, file watchers, builds
+  with progress output. Today the only options are
+  "block bash for 30s and pray" or "give up on long
+  commands."
+- Wait/Monitor primitives (`§7.3.1`) are valuable but
+  much bigger — file watching, port probing, HTTP
+  polling, condition composition. They depend on
+  `bash_background`'s process_id surface for half their
+  conditions (`process_output`, `process_exit`).
+  Splitting them out as Step 2.2 keeps each step's
+  surface auditable.
+
+**Plan (stepwise):**
+
+- 2.1 — Storage migration + repo + process manager + 3
+  tools + session-end cleanup + unit tests + 1
+  regression case. **This entry.**
+- 2.2 — `wait_for` and `monitor` primitives (the cheap
+  conditions first: `sleep`, `file_exists`, `file_change`,
+  `port_open`; then process-aware conditions on top of
+  2.1's manager).
+- 2.3 — `http_response` wait condition + composition
+  (`all_of` / `any_of`).
+
+**Slice scope (Step 2.1):**
+
+| Component | Status | Notes |
+|---|---|---|
+| Migration `005-background-processes` | NEW | Table per spec §13 model. Indices on (session_id, status) |
+| `bgProcessRepo` | NEW | Typed CRUD; `cleanup(sessionId)` marks running rows killed |
+| Process manager | NEW | `src/bg/manager.ts`. Wraps `Bun.spawn`, log files in `.agent/bg/<id>.{stdout,stderr}.log`, exit-event → DB update, kill = SIGTERM → 5s grace → SIGKILL |
+| Tool `bash_background` | NEW | category=`bash`, writes=true. Returns `{ process_id, label, spawned_at }` |
+| Tool `bash_output` | NEW | category=`bash` (read-side; pessimistic), idempotent for fixed cursor. Cap N KB per call |
+| Tool `bash_kill` | NEW | category=`bash`. Idempotent on already-exited |
+| Session-end cleanup | NEW | Wired into harness exit path; best-effort via `process.on('exit')` |
+| Unit tests | NEW | Manager (spawn/output/kill/exit), repo (CRUD/cleanup), 3 tools (perm denial, error paths) |
+| Regression case | NEW | `36-bash-background-flow.yaml` — spawn sleep+echo, poll output, kill. Explicit multi-step prompt |
+
+**Out of scope for 2.1 (deferred with rationale):**
+
+- **`wait_for` / `monitor` (§7.3.1).** Step 2.2. Without
+  these, the model has to poll via repeated
+  `bash_output` calls — costs more LLM steps but works.
+  Spec acknowledges the cost difference (`~$0.40` vs
+  `~$0.10` for a port-ready loop). 2.1 ships the
+  baseline; 2.2 adds the optimization. Cleaner than
+  shipping a half-implemented wait/monitor surface.
+- **`<BackgroundProcessTray>` UI.** No interactive UI
+  yet. Tray waits for Ink work in the broader M3/M4
+  scope. Status visible today via `bash_output` (the
+  model's view) and the `background_processes` DB
+  table (the audit log view).
+- **`/bg cleanup` slash command.** Slash commands not
+  implemented yet. Session-end cleanup covers the
+  primary case (no zombies after a session ends);
+  inter-session cleanup (orphaned rows from a crashed
+  prior session) waits for slash command surface.
+- **`maxOutputSize` per-process budget.** Spec doesn't
+  pin this. We'll use a sane per-call cap on
+  `bash_output` (e.g., 64 KB) but no total-output
+  ceiling per process — operator manages disk via
+  `bash_kill` if needed.
+
+**Decisions to make explicit upfront:**
+
+- **OS pid vs internal id.** The tool returns an
+  internal `process_id` (UUID-class string), not the
+  OS pid. Operator-facing diagnosis can pull the OS
+  pid from the DB if needed; the public surface
+  doesn't depend on OS-level identifiers (lets us
+  swap process strategy later — daemon, remote, etc.
+  — without breaking the tool contract). Spec §7.3 is
+  intentionally vague on which one `process_id`
+  refers to; we pin internal-id here.
+- **Permission engine treatment.** All three tools
+  fall under category=`bash`. The bash policy
+  (`allow`/`deny`/`confirm`) gates the SPAWN COMMAND
+  on `bash_background`. `bash_output` and `bash_kill`
+  reference an existing process_id; we don't re-check
+  the original command's policy on those calls (the
+  decision was already made when spawning). If
+  policy changes mid-session and a previously-allowed
+  command's output is still being read, that's not a
+  regression — the spawn was approved; reading
+  stdout from an already-spawned process doesn't open
+  new attack surface.
+- **Log file path is in `.agent/bg/`.** Same prefix as
+  the SQLite DB. Auto-created on first spawn.
+  Cleanup: rotate by session_id at session start (or
+  delete on `cleanup` call). 2.1 keeps the simplest
+  policy: create on spawn, leave on disk after kill,
+  cleanup happens via session-end manager pass.
+- **No prompt-cache concern.** bg processes are local;
+  no provider call involved. The harness loop's
+  prompt-cache logic is independent.
+
+**Spec reference:** `AGENTIC_CLI.md §7.3` (background
+processes), `§13` (data model — `background_processes`),
+`CONTRACTS §2.6` (tool contract). `§7.3.1` is the next
+slice.
+
+**Risks documented:**
+
+- **Zombie processes on hard crash.** `process.on('exit')`
+  is best-effort — `kill -9` to the harness leaves bg
+  processes orphaned. Mitigation: store `os_pid` in
+  DB so a future `agent doctor` (M4 spec §18) can
+  detect and kill. Today: documented gap. Operators
+  who run with autonomous agents over flaky
+  connections should expect to occasionally clean up
+  manually with `pkill -P <harness-pid>` or similar.
+- **Log file disk usage.** A `npm run dev` running
+  for an hour with verbose output can produce 100+
+  MB of logs. No automatic rotation in 2.1. If this
+  bites in practice, add per-process `max_log_bytes`
+  before bumping into wait/monitor work.
+- **Multi-process race in DB updates.** Process
+  exit events fire on Node's event loop; if two bg
+  processes exit nanoseconds apart and both update
+  the DB, SQLite's serialization handles it (we're
+  WAL mode). Documented for completeness — no
+  observed issue, but worth noting.
+
+---
+
 ## [2026-04-28] M3 / Step 1.6 — Regression real-model baseline (closes Step 1)
 
 Closes M3 / Step 1 by running the 35-case regression suite
