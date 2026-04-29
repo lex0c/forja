@@ -8,6 +8,7 @@ import { globTool } from './glob.ts';
 import { grepTool } from './grep.ts';
 import { monitorTool } from './monitor.ts';
 import { readFileTool } from './read-file.ts';
+import { todoWriteTool } from './todo-write.ts';
 import { waitForTool } from './wait-for.ts';
 import { writeFileTool } from './write-file.ts';
 
@@ -29,19 +30,24 @@ export { monitorTool } from './monitor.ts';
 export type { MonitorInput, MonitorOutput } from './monitor.ts';
 export { readFileTool } from './read-file.ts';
 export type { ReadFileInput, ReadFileOutput } from './read-file.ts';
+export { todoWriteTool } from './todo-write.ts';
+export type { TodoWriteInput, TodoWriteItem, TodoWriteOutput } from './todo-write.ts';
 export { waitForTool } from './wait-for.ts';
 export type { WaitForInput, WaitForOutput } from './wait-for.ts';
 export { writeFileTool } from './write-file.ts';
 export type { WriteFileInput, WriteFileOutput } from './write-file.ts';
 
 // Order is intentional: read-only tools first, then writes, then exec.
-// Useful when scanning a `agent --list-tools` output.
+// Useful when scanning a `agent --list-tools` output. todo_write
+// sits with the read-only group — its 'write' is harness-internal
+// state, not external mutation.
 export const BUILTIN_TOOLS = [
   readFileTool,
   globTool,
   grepTool,
   waitForTool,
   monitorTool,
+  todoWriteTool,
   writeFileTool,
   editFileTool,
   bashTool,

@@ -11,6 +11,7 @@ import type {
 } from '../providers/index.ts';
 import { estimatePromptTokens } from '../providers/tokens.ts';
 import { appendMessage, completeSession, createSession } from '../storage/index.ts';
+import { type TodoStore, createTodoStore } from '../todo/index.ts';
 import type { ToolContext } from '../tools/index.ts';
 import { abortableIterable } from './abortable.ts';
 import { CollectStepError, collectStep } from './collect.ts';
@@ -117,6 +118,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // closure so the outer-finally cleanup hook can find it whether
   // we exited normally or through guardedFinish.
   let bgManager: BgManager | undefined;
+  // Per-session TodoList store. Created once per session here so the
+  // todo_write tool sees a fresh list, and torn down in the outer
+  // finally so accumulated state from a long-lived process doesn't
+  // leak across sessions. Spec §7.4: not persisted, work-state only.
+  const todoStore: TodoStore = createTodoStore();
   // Session-wide totals. Each completed provider turn adds its usage and
   // its computed cost; we persist the aggregate to `sessions.total_cost_usd`
   // on `completeSession` and surface both in the result + session_finished
@@ -405,6 +411,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             permissions: config.permissionEngine.view(),
             permissionCheck: (toolName, category, args) =>
               config.permissionEngine.check(toolName, category, args),
+            todoStore,
             ...(bgManager !== undefined ? { bgManager } : {}),
           };
 
@@ -584,5 +591,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // are visible via the background_processes audit table.
       }
     }
+    // Defensive: drop the in-memory TodoList for this session.
+    // The store is currently a function-local Map (created on
+    // line ~125) so GC reclaims it when runAgent returns — the
+    // clear is redundant in today's ownership model. Kept for
+    // forward compatibility: if the store is ever hoisted to a
+    // process-level singleton (e.g., daemon mode running multiple
+    // sessions in one process), this hook is what prevents
+    // accumulation. Idempotent on unknown / empty sessionId.
+    todoStore.clear(sessionId);
   }
 };

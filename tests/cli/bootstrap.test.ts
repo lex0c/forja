@@ -75,6 +75,7 @@ describe('bootstrap', () => {
         'grep',
         'monitor',
         'read_file',
+        'todo_write',
         'wait_for',
         'write_file',
       ].sort(),

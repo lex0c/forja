@@ -1,6 +1,7 @@
 import type { BgManager } from '../bg/index.ts';
 import type { Decision, PermissionsView, PolicyCategory, ToolArgs } from '../permissions/index.ts';
 import type { ProviderToolInputSchema } from '../providers/index.ts';
+import type { TodoStore } from '../todo/index.ts';
 
 // Per CONTRACTS §2: tool errors are *data*, not exceptions. The harness
 // catches stray throws and converts them, but tools are expected to
@@ -77,6 +78,13 @@ export interface ToolContext {
   // `bash_output`, `bash_kill`) surface a clean error when absent
   // rather than dereferencing undefined.
   bgManager?: BgManager;
+  // Session-bound TodoList store. Optional so existing tools that
+  // don't need it aren't forced to declare a dependency. The
+  // todo_write tool surfaces a clean error when absent rather than
+  // dereferencing undefined. Per spec §7.4, the list does NOT
+  // persist across sessions; the harness creates a fresh store at
+  // session start and clears it at session end.
+  todoStore?: TodoStore;
   // Per-call permission predicate. The harness wires this to
   // `permissionEngine.check`. Tools whose category gate is too coarse
   // for their actual side effects (notably `wait_for` and `monitor`,
