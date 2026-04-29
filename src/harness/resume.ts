@@ -147,5 +147,24 @@ export const messagesToProviderMessages = (rows: Message[]): ReconstitutedMessag
   if (out[0]?.role === 'assistant') {
     out.unshift({ role: 'user', content: TRUNCATION_PLACEHOLDER });
   }
-  return { messages: out, droppedFromHead };
+  // Repair internal user→user gaps. A single stranded resume left
+  // a trailing user; the loop patched it once. But repeated
+  // aborted resumes accumulate INTERNAL user,user pairs in the
+  // log (each aborted resume appends its own user prompt without
+  // an assistant ever responding), and the single trailing patch
+  // misses them. Walk consecutive pairs and insert a synthetic
+  // assistant between any user→user. Same placeholder
+  // (STRANDED_TURN_PLACEHOLDER) — these are all "the model never
+  // got to reply" gaps.
+  const repaired: ProviderMessage[] = [];
+  for (let i = 0; i < out.length; i++) {
+    const curr = out[i];
+    if (curr === undefined) continue;
+    repaired.push(curr);
+    const next = out[i + 1];
+    if (curr.role === 'user' && next !== undefined && next.role === 'user') {
+      repaired.push({ role: 'assistant', content: STRANDED_TURN_PLACEHOLDER });
+    }
+  }
+  return { messages: repaired, droppedFromHead };
 };

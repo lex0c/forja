@@ -82,9 +82,26 @@ describe('messagesToProviderMessages', () => {
     expect(messagesToProviderMessages([])).toEqual({ messages: [], droppedFromHead: 0 });
   });
 
+  // Helper: realistic alternating-role rows. Production message
+  // logs always alternate user/assistant; a previous version of
+  // these tests used all-user inputs which exposed the cap math
+  // but didn't reflect the actual on-disk shape. After the
+  // alternation-repair pass landed (synthetic assistants between
+  // user→user pairs), all-user inputs got rewritten into 2x
+  // their original size — masking what the cap test actually
+  // checks. Switching to alternating rows tests cap math
+  // cleanly and reflects production.
+  const alternating = (n: number): Message[] => {
+    const rows: Message[] = [];
+    for (let i = 0; i < n; i++) {
+      rows.push(msg(i % 2 === 0 ? 'user' : 'assistant', `msg-${i}`));
+    }
+    return rows;
+  };
+
   test('input below the cap is preserved untruncated', () => {
     // Boundary: exactly MAX_RESUME_MESSAGES rows passes through.
-    const rows = Array.from({ length: MAX_RESUME_MESSAGES }, (_, i) => msg('user', `msg ${i}`));
+    const rows = alternating(MAX_RESUME_MESSAGES);
     const r = messagesToProviderMessages(rows);
     expect(r.messages).toHaveLength(MAX_RESUME_MESSAGES);
     expect(r.droppedFromHead).toBe(0);
@@ -94,14 +111,14 @@ describe('messagesToProviderMessages', () => {
     // Adversarial case: 700 persisted messages, cap is 500. The
     // older 200 are dropped; we keep the most recent 500. Recency
     // matters more than depth — model context is most useful for
-    // what immediately preceded the new turn. All-user-string-
-    // content rows are valid heads, so no walk-forward fires.
+    // what immediately preceded the new turn.
     const total = MAX_RESUME_MESSAGES + 200;
-    const rows = Array.from({ length: total }, (_, i) => msg('user', `msg-${i}`));
+    const rows = alternating(total);
     const r = messagesToProviderMessages(rows);
     expect(r.messages).toHaveLength(MAX_RESUME_MESSAGES);
     expect(r.droppedFromHead).toBe(200);
     // First kept message is the (200)th original (0-indexed).
+    // Index 200 is even → role 'user' → safe head.
     expect(r.messages[0]?.content).toBe('msg-200');
     // Last kept is the (699)th original.
     expect(r.messages[r.messages.length - 1]?.content).toBe(`msg-${total - 1}`);
@@ -211,6 +228,39 @@ describe('messagesToProviderMessages: alignment to safe head', () => {
     const r = messagesToProviderMessages(rows);
     expect(r.droppedFromHead).toBe(0);
     expect(r.messages[0]?.content).toBe('first goal');
+  });
+
+  test('repairs internal user→user pairs from repeated stranded resumes', () => {
+    // Multiple aborted resumes accumulate consecutive user
+    // messages in the log: each resume appends its own user
+    // prompt without an assistant ever responding. The trailing-
+    // user fix in the loop patches one gap; this helper repairs
+    // ALL internal user→user pairs by inserting synthetic
+    // assistant placeholders between them.
+    const rows: Message[] = [
+      msg('user', 'goal'),
+      msg('user', 'aborted resume 1'),
+      msg('user', 'aborted resume 2'),
+      msg('assistant', [{ type: 'text' as const, text: 'finally a reply' }]),
+      msg('user', 'aborted resume 3'),
+    ];
+    const r = messagesToProviderMessages(rows);
+    // Every consecutive user→user pair has a synthetic assistant
+    // inserted between them. Verify alternation: no two adjacent
+    // user messages remain.
+    for (let i = 1; i < r.messages.length; i++) {
+      const prev = r.messages[i - 1];
+      const curr = r.messages[i];
+      if (prev?.role === 'user' && curr?.role === 'user') {
+        throw new Error(`consecutive user messages at indices ${i - 1}, ${i} — alternation broken`);
+      }
+    }
+    // 5 original rows + 2 synthetic placeholders (one between
+    // 'goal'→'aborted resume 1', one between
+    // 'aborted resume 1'→'aborted resume 2'; the user→assistant
+    // pair (resume 2 → reply) and assistant→user pair
+    // (reply → resume 3) need no repair).
+    expect(r.messages).toHaveLength(7);
   });
 
   test('skips role=tool entries during alignment too', () => {

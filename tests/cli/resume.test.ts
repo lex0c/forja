@@ -506,6 +506,54 @@ describe('--resume flow', () => {
     db.close();
   });
 
+  test('repeated stranded resumes do not accumulate alternation violations', async () => {
+    // Direct integration: simulate the post-state of three
+    // aborted resumes by appending three consecutive user
+    // messages to a session row, then resume normally. Without
+    // the internal-pair repair, the provider sees user,user,
+    // user,assistant_placeholder,user_new — strict-alternation
+    // providers reject. With repair, every internal user→user
+    // pair has a synthetic assistant inserted, so the provider
+    // receives clean user→assistant alternation.
+    const setupDb = openDb(dbPath);
+    migrate(setupDb);
+    const s = createSession(setupDb, { model: 'mock/m', cwd: workdir });
+    appendMessage(setupDb, { sessionId: s.id, role: 'user', content: 'original goal' });
+    appendMessage(setupDb, { sessionId: s.id, role: 'user', content: 'aborted resume A' });
+    appendMessage(setupDb, { sessionId: s.id, role: 'user', content: 'aborted resume B' });
+    setupDb.close();
+
+    const seenMessages: ProviderMessage[][] = [];
+    const recordingProvider: Provider = {
+      ...mockProvider([{ text: 'recovered' }]),
+      async *generate(req) {
+        seenMessages.push(req.messages);
+        yield { kind: 'start', message_id: `mock_${crypto.randomUUID()}` };
+        yield { kind: 'text_delta', text: 'recovered' };
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+    };
+
+    const code = await run({
+      args: baseArgs({ prompt: 'final follow up', resume: s.id }),
+      bootstrapOverride: { providerOverride: recordingProvider, dbPath, cwd: workdir },
+      signal: new AbortController().signal,
+      rendererOverride: recordingRenderer().renderer,
+    });
+    expect(code).toBe(0);
+
+    // Assert no two consecutive user messages on the wire.
+    const firstCall = seenMessages[0];
+    if (firstCall === undefined) throw new Error('expected provider call');
+    for (let i = 1; i < firstCall.length; i++) {
+      const prev = firstCall[i - 1];
+      const curr = firstCall[i];
+      if (prev?.role === 'user' && curr?.role === 'user') {
+        throw new Error(`consecutive user messages at indices ${i - 1}, ${i} — alternation broken`);
+      }
+    }
+  });
+
   test('resume of session with only a user message (no assistant)', async () => {
     // Edge case: prior run crashed/aborted before the model
     // produced any assistant turn — persisted log is just
