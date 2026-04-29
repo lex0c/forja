@@ -21,6 +21,24 @@ export interface ParsedArgs {
   // there's nothing for the model to do (the picker form `--resume`
   // without a value waits for M4 / Ink TUI).
   resume?: string;
+  // Confirm-bypass for had_bash warning on `--undo` /
+  // `--checkpoints restore`. Without `--yes`, the handler refuses
+  // a destructive restore on a step that ran bash (because bash
+  // side effects — DB, network, processes — are not reversed).
+  // Pre-TUI substitute for the spec's interactive `Type 'undo' to
+  // confirm` prompt; headless friendly.
+  yes: boolean;
+  // Undo mode (AGENTIC_CLI §12 / CHECKPOINTS.md §2.3). Restores
+  // the latest checkpoint of the named session. Same semantics as
+  // `agent --checkpoints restore <session> <latest-ckpt>` but
+  // resolves the latest id internally.
+  undo?: string;
+  // Checkpoint subcommands (CHECKPOINTS.md §2.3). The verb is one
+  // of `list | diff | restore | purge`; positionals follow the
+  // verb until the next flag. Lifted out of `--undo` because the
+  // spec keeps these as independent commands and they share a
+  // dispatcher inside the handler.
+  checkpoints?: { verb: string; positionals: string[] };
   model?: string;
   maxSteps?: number;
 }
@@ -42,6 +60,7 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
     help: false,
     plan: false,
     listSessions: false,
+    yes: false,
   };
   const promptParts: string[] = [];
   let i = 0;
@@ -82,6 +101,53 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         }
         args.resume = value;
         i += 2;
+        break;
+      }
+      case '--yes':
+      case '-y':
+        args.yes = true;
+        i += 1;
+        break;
+      case '--undo': {
+        const value = argv[i + 1];
+        if (value === undefined || value.startsWith('--')) {
+          return { ok: false, message: '--undo requires a session id' };
+        }
+        args.undo = value;
+        i += 2;
+        break;
+      }
+      case '--checkpoints': {
+        const verb = argv[i + 1];
+        const known = ['list', 'diff', 'restore', 'purge'] as const;
+        if (verb === undefined || verb.startsWith('--')) {
+          return {
+            ok: false,
+            message: `--checkpoints requires a subcommand (${known.join('|')})`,
+          };
+        }
+        if (!known.includes(verb as (typeof known)[number])) {
+          return {
+            ok: false,
+            message: `unknown --checkpoints subcommand: ${verb}. Use one of ${known.join('|')}`,
+          };
+        }
+        // Greedy collection of positionals until the next flag. The
+        // sub-handler validates arity per verb (list takes 1, diff
+        // and restore take 2, purge takes 1). Centralizing arity
+        // here would couple the parser to handler shape; let the
+        // handler own that contract.
+        const positionals: string[] = [];
+        let j = i + 2;
+        while (j < argv.length) {
+          const next = argv[j];
+          if (next === undefined) break;
+          if (next.startsWith('--')) break;
+          positionals.push(next);
+          j += 1;
+        }
+        args.checkpoints = { verb, positionals };
+        i = j;
         break;
       }
       case '--help':
@@ -142,6 +208,10 @@ export const usage = (): string =>
     '  --plan                 Read-only mode: produce a plan, do not apply changes',
     '  --list-sessions        Print known sessions (newest first) and exit',
     '  --resume <id|last>     Continue a prior session; positional prompt is the follow-up',
+    '  --undo <session>       Restore the latest checkpoint of a session',
+    '  --checkpoints <cmd>    Checkpoint subcommands: list <session> | diff <session> <ckpt>',
+    '                          | restore <session> <ckpt> | purge <session>',
+    '  --yes, -y              Skip the bash-side-effect confirm on undo/restore',
     '  --model <id>           Model id (default: anthropic/claude-sonnet-4-6)',
     '  --max-steps <n>        Override harness step budget',
     '',
