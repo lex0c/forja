@@ -50,10 +50,22 @@ export const exitCodeFor = (result: HarnessResult): number => {
 };
 
 // Resolve a `--resume` CLI value into an actual session id. 'last'
-// becomes the most recently started session; anything else is
-// taken as a literal id and verified to exist. Returns null +
-// error message when the resolution fails so the caller can print
-// a clean diagnostic and exit non-zero.
+// becomes the most recently started session FOR THE CURRENT CWD;
+// anything else is taken as a literal id and verified to exist.
+// Returns null + error message when the resolution fails so the
+// caller can print a clean diagnostic and exit non-zero.
+//
+// The cwd filter on 'last' matters in multi-repo usage: without
+// it, 'last' picks the newest session globally, which runAgent
+// then rejects with a cwd-mismatch error even though a valid
+// session for the current repo might be just one slot down. The
+// resolver scopes 'last' to the active cwd so the user sees the
+// behavior they expect (continue the latest session of THIS
+// project).
+//
+// Literal ids stay unfiltered — if the user typed an id, they
+// know what they want. Cross-cwd literal resume still trips
+// runAgent's cwd guard and surfaces a clean error.
 //
 // Lives outside the main `run()` flow because list-sessions and
 // resume both need the same DB-only pre-step before deciding
@@ -61,15 +73,19 @@ export const exitCodeFor = (result: HarnessResult): number => {
 const resolveResumeId = (
   resume: string,
   dbPath: string,
+  cwd: string,
 ): { ok: true; id: string } | { ok: false; message: string } => {
   const db = openDb(dbPath);
   try {
     migrate(db);
     if (resume === 'last') {
-      const sessions = listSessions(db, { limit: 1 });
+      const sessions = listSessions(db, { limit: 1, cwd });
       const first = sessions[0];
       if (first === undefined) {
-        return { ok: false, message: "no sessions found to resume (with 'last')" };
+        return {
+          ok: false,
+          message: `no sessions found to resume (with 'last') for cwd '${cwd}'`,
+        };
       }
       return { ok: true, id: first.id };
     }
@@ -128,7 +144,11 @@ export const run = async (options: RunOptions): Promise<number> => {
         return 1;
       }
       const dbPath = options.bootstrapOverride?.dbPath ?? defaultDbPath();
-      const resolved = resolveResumeId(args.resume, dbPath);
+      // Use the same cwd resolution bootstrap will — without this
+      // the resume resolution and the harness's cwd guard might
+      // disagree on which directory is "current".
+      const cwd = options.bootstrapOverride?.cwd ?? process.cwd();
+      const resolved = resolveResumeId(args.resume, dbPath, cwd);
       if (!resolved.ok) {
         errSink(`forja: ${resolved.message}\n`);
         return 1;

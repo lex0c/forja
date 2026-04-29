@@ -208,7 +208,69 @@ describe('--resume flow', () => {
     db.close();
   });
 
-  test("resume 'last' fails clean when no sessions exist", async () => {
+  test("resume 'last' is scoped to the current cwd", async () => {
+    // Multi-repo regression: 'last' used to pick the newest
+    // session GLOBALLY, then runAgent rejected it for cwd
+    // mismatch. With the cwd filter, 'last' resolves to the
+    // newest session FOR THIS cwd, so the user gets the
+    // "continue this project's latest run" UX they expect.
+    const otherCwd = mkdtempSync(join(tmpdir(), 'forja-resume-other-'));
+    try {
+      // Newer session in a DIFFERENT cwd. listSessions ordered by
+      // (started_at DESC, seq DESC) — so this would be the first
+      // result globally without the filter.
+      const setupDb = openDb(dbPath);
+      migrate(setupDb);
+      createSession(setupDb, { model: 'mock/m', cwd: otherCwd });
+      setupDb.close();
+
+      // Slightly older session in OUR cwd. We expect 'last' to
+      // find this one because the global newest belongs to
+      // otherCwd.
+      await run({
+        args: baseArgs({ prompt: 'this-cwd-prompt' }),
+        bootstrapOverride: {
+          providerOverride: mockProvider([{ text: 'a' }]),
+          dbPath,
+          cwd: workdir,
+        },
+        signal: new AbortController().signal,
+        rendererOverride: recordingRenderer().renderer,
+      });
+
+      db = openTestDb();
+      const allSessions = listSessions(db, {});
+      // Two sessions exist; the otherCwd one is newer.
+      expect(allSessions).toHaveLength(2);
+      const ourSession = allSessions.find((s) => s.cwd === workdir);
+      if (ourSession === undefined) throw new Error('expected our-cwd session');
+      db.close();
+
+      // Now resume 'last' from workdir — should land on ourSession,
+      // not the otherCwd session (which would fail cwd guard).
+      const code = await run({
+        args: baseArgs({ prompt: 'continuing', resume: 'last' }),
+        bootstrapOverride: {
+          providerOverride: mockProvider([{ text: 'b' }]),
+          dbPath,
+          cwd: workdir,
+        },
+        signal: new AbortController().signal,
+        rendererOverride: recordingRenderer().renderer,
+      });
+      expect(code).toBe(0);
+
+      db = openTestDb();
+      // Our session got new messages (resume worked).
+      const ourMsgs = listMessagesBySession(db, ourSession.id);
+      expect(ourMsgs.some((m) => m.content === 'continuing')).toBe(true);
+      db.close();
+    } finally {
+      rmSync(otherCwd, { recursive: true, force: true });
+    }
+  });
+
+  test("resume 'last' fails clean when no sessions exist for this cwd", async () => {
     const errLines: string[] = [];
     const code = await run({
       args: baseArgs({ prompt: 'continuing', resume: 'last' }),
@@ -218,7 +280,11 @@ describe('--resume flow', () => {
       errSink: (s) => errLines.push(s),
     });
     expect(code).toBe(1);
-    expect(errLines.join('')).toContain('no sessions');
+    const out = errLines.join('');
+    expect(out).toContain('no sessions');
+    // Error message names the cwd that was searched, so the user
+    // sees why 'last' didn't find anything.
+    expect(out).toContain(workdir);
   });
 
   test('resume with empty prompt is rejected', async () => {
