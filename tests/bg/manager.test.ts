@@ -235,6 +235,54 @@ describe('bg manager: readOutput', () => {
     expect(replay.stdout).toContain('abcdef');
   });
 
+  test('explicit since does NOT rewind the persisted cursor (replay safety)', async () => {
+    // Regression: a `sinceStdout: 0` replay used to write the new
+    // (smaller) end back to the cursor, so subsequent canonical
+    // reads would re-deliver bytes the model already saw.
+    const r = await mgr.spawn({ command: 'echo abcdef' });
+    await waitForExit(r.id);
+    const first = await mgr.readOutput(r.id);
+    const cursorAfterFirst = getBgProcess(db, r.id)?.stdoutCursorPosition ?? 0;
+    expect(first.stdout).toContain('abcdef');
+    expect(cursorAfterFirst).toBeGreaterThan(0);
+
+    // Replay from byte 0 — should return the same content but
+    // leave the persisted cursor untouched.
+    await mgr.readOutput(r.id, { sinceStdout: 0, sinceStderr: 0 });
+    const cursorAfterReplay = getBgProcess(db, r.id)?.stdoutCursorPosition;
+    expect(cursorAfterReplay).toBe(cursorAfterFirst);
+
+    // Canonical read after replay sees nothing new (caught up).
+    const next = await mgr.readOutput(r.id);
+    expect(next.stdout).toBe('');
+  });
+
+  test('explicit since past EOF does NOT skip future writes', async () => {
+    // Regression: a `sinceStdout: 999999` past EOF used to set the
+    // cursor to 999999 (readWindow returns end=start when start>=
+    // total), silently swallowing every real future write up to
+    // byte 999999.
+    const r = await mgr.spawn({
+      command: 'echo first; sleep 0.3; echo second',
+    });
+    // Read 'first' early so we have a real cursor.
+    await new Promise((res) => setTimeout(res, 100));
+    const early = await mgr.readOutput(r.id);
+    expect(early.stdout).toContain('first');
+    const cursorBefore = getBgProcess(db, r.id)?.stdoutCursorPosition ?? 0;
+
+    // Probe past EOF — would corrupt cursor under the old logic.
+    const probe = await mgr.readOutput(r.id, { sinceStdout: 999999 });
+    expect(probe.stdout).toBe('');
+    const cursorAfterProbe = getBgProcess(db, r.id)?.stdoutCursorPosition;
+    expect(cursorAfterProbe).toBe(cursorBefore);
+
+    // Wait for second echo, then canonical read sees it.
+    await waitForExit(r.id);
+    const after = await mgr.readOutput(r.id);
+    expect(after.stdout).toContain('second');
+  });
+
   test('stderr cursor is independent — noisy stdout does not strand stderr writes', async () => {
     // Stage 1: stdout writes 50 bytes, stderr writes 1 byte.
     const r = await mgr.spawn({

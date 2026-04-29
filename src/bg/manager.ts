@@ -358,6 +358,22 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       // session output. Reject cleanly.
       throw new Error(`bg process not in this session: ${id}`);
     }
+    // An explicit `since*` is a transient replay/skip-ahead read —
+    // we serve the requested window but DO NOT mutate the persisted
+    // cursor. Two failure modes if we did:
+    //   (a) `sinceStdout: 0` with small maxBytes rewinds the cursor
+    //       to ~maxBytes, so the next canonical read replays old
+    //       chunks the model has already seen.
+    //   (b) `sinceStdout: 999999` past EOF returns end=999999
+    //       (readWindow returns `{ text: '', end: start }` when
+    //       start ≥ total), and writing that as the cursor
+    //       silently swallows every real future write up to byte
+    //       999999.
+    // Canonical reads (no since) advance monotonically — `>` rather
+    // than `!==` so even an internal regression that produced
+    // end < cursor cannot drag the cursor backward.
+    const isExplicitStdoutSince = opts.sinceStdout !== undefined;
+    const isExplicitStderrSince = opts.sinceStderr !== undefined;
     const stdoutStart = opts.sinceStdout ?? row.stdoutCursorPosition;
     const stderrStart = opts.sinceStderr ?? row.stderrCursorPosition;
     const maxBytes = opts.maxBytes ?? DEFAULT_OUTPUT_READ_LIMIT_BYTES;
@@ -373,10 +389,10 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     const stdoutWin = await readWindow(row.stdoutLogPath, stdoutStart, maxBytes);
     const stderrWin = await readWindow(row.stderrLogPath, stderrStart, maxBytes);
 
-    if (stdoutWin.end !== row.stdoutCursorPosition) {
+    if (!isExplicitStdoutSince && stdoutWin.end > row.stdoutCursorPosition) {
       advanceBgProcessStdoutCursor(db, id, stdoutWin.end);
     }
-    if (stderrWin.end !== row.stderrCursorPosition) {
+    if (!isExplicitStderrSince && stderrWin.end > row.stderrCursorPosition) {
       advanceBgProcessStderrCursor(db, id, stderrWin.end);
     }
 
