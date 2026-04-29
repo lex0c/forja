@@ -15,6 +15,47 @@ Format:
 
 ---
 
+## [2026-04-29] docs — Coder Playbook (`docs/CODER_PLAYBOOK.md`)
+
+Consolidates the recurring bug patterns found across M2/M3 reviews
+into a runtime knowledge artifact for the Forja agent (and humans
+reviewing PRs).
+
+**Source material:** every entry derives from a real bug fixed in
+this repo's history — categorized by the post-mortem after Step 2.2
+plus the three sibling-cancel / no-match-terminal fixes that landed
+right after.
+
+**Sections:**
+1. Async control flow (Promise.all leaks, AbortSignal cascades,
+   real-error-vs-synthetic-rejection in Promise.any).
+2. Terminal classification (`aborted` is not the catch-all;
+   distinct outcomes need distinct labels).
+3. Concurrency on shared state (DB-level monotonic guards;
+   transient overrides; runtime validation of schema constraints).
+4. Sibling parity (validation, path resolution, convention seams,
+   route-by-category).
+5. Boundary handling (drain-before-end, overlap windows, bounded
+   buffers).
+6. Test completeness (assert the terminal label, not just the
+   boolean; tests as regression markers).
+7. Schema/SELECT discipline (column-add audit, `replace_all`
+   pitfalls).
+8. The meta-pattern (defaults that are convenient but wrong, and
+   the audit reflex after N occurrences of the same class).
+
+**Why a playbook and not just spec entries:** the spec describes
+WHAT each subsystem does. The playbook describes HOW to write code
+that doesn't regress the bugs we already paid for. Different
+audience, different access pattern — the agent reads this when
+deciding HOW to implement, not WHAT to implement.
+
+**Pending:** none — file is self-contained. Future bug-class
+discoveries should append a new entry to the matching section
+rather than start a new doc.
+
+---
+
 ## [2026-04-29] M3 / Step 2.2 — post-review fix: all_of sibling leak on sub-throw
 
 Code review follow-up after Step 2.2 was reportedly closed. Single
