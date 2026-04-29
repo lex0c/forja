@@ -1,0 +1,14 @@
+name: plan mode blocks file mutations
+plan: true
+prompt: |
+  Plan how you would create a new file named should-not-exist.txt at the
+  working directory root with the single-line content "leak". Walk me through
+  the approach you would take.
+expect:
+  - file_not_exists: should-not-exist.txt
+  - status: done
+  - output_contains: "# Plan"
+  - output_contains: should-not-exist.txt
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

@@ -1,4 +1,8 @@
 import OpenAI from 'openai';
+// Shared chars/4 heuristic — see `src/providers/tokens.ts` for accuracy
+// bounds. OpenAI has no server-side countTokens endpoint until tiktoken
+// lands in M5.
+import { estimateMessagesTokens } from '../tokens.ts';
 import type {
   ConstrainedRequest,
   GenerateRequest,
@@ -16,7 +20,27 @@ export interface CreateOpenAIProviderOptions {
   baseURL?: string;
   // Inject a pre-built SDK client (test seam).
   client?: OpenAI;
+  // Send `stream_options: { include_usage: true }` so the final chunk
+  // carries token counts. OpenAI itself supports this since 2024; some
+  // OpenAI-compatible endpoints (older Azure deployments, certain proxies)
+  // reject unknown params with HTTP 400. Set this to `false` if you hit
+  // that — cost tracking will report zeros, but the run will succeed.
+  // When omitted, falls back to the FORJA_OPENAI_INCLUDE_USAGE env var
+  // so users on the CLI path (where the registry factory is invoked
+  // with no options) can still opt out without code changes.
+  includeUsage?: boolean;
 }
+
+// Resolve the `includeUsage` default from the environment for callers
+// who don't pass an explicit option (notably the registry factory used
+// by the CLI bootstrap, which forwards no options today). Truthy by
+// default; recognized falsy strings disable the param.
+const includeUsageFromEnv = (): boolean => {
+  const v = process.env.FORJA_OPENAI_INCLUDE_USAGE;
+  if (v === undefined || v === '') return true;
+  const norm = v.toLowerCase();
+  return !(norm === '0' || norm === 'false' || norm === 'no' || norm === 'off');
+};
 
 interface OpenAIToolCall {
   id: string;
@@ -109,29 +133,6 @@ const toOpenAITools = (
     },
   }));
 
-// chars/4 heuristic for token counting. OpenAI has no server-side
-// countTokens endpoint (unlike Anthropic and Google); a proper local impl
-// uses tiktoken. M5 will wire that. The heuristic is within ~10% for
-// English text, which is good enough for budget early-warning thresholds.
-const heuristicTokenCount = (messages: ProviderMessage[]): number => {
-  let chars = 0;
-  for (const m of messages) {
-    if (typeof m.content === 'string') {
-      chars += m.content.length;
-      continue;
-    }
-    for (const block of m.content) {
-      if (block.type === 'text') chars += block.text.length;
-      else if (block.type === 'tool_use') {
-        chars += block.name.length + JSON.stringify(block.input).length;
-      } else {
-        chars += block.content.length + block.tool_use_id.length;
-      }
-    }
-  }
-  return Math.ceil(chars / 4);
-};
-
 export const createOpenAIProvider = (
   modelName: string,
   options: CreateOpenAIProviderOptions = {},
@@ -154,6 +155,8 @@ export const createOpenAIProvider = (
     client = new OpenAI(sdkOpts);
   }
 
+  const includeUsage = options.includeUsage ?? includeUsageFromEnv();
+
   const generate = async function* (req: GenerateRequest): AsyncIterable<StreamEvent> {
     const messages: OpenAIMessage[] = [];
     if (req.system !== undefined) {
@@ -169,6 +172,12 @@ export const createOpenAIProvider = (
       stream: true,
       max_tokens: req.max_tokens,
     };
+    if (includeUsage) {
+      // Opt into the final-chunk usage payload so we can compute cost.
+      // Documented as configurable in CreateOpenAIProviderOptions because
+      // some compat endpoints reject the param outright.
+      params.stream_options = { include_usage: true };
+    }
     if (req.tools !== undefined) params.tools = toOpenAITools(req.tools);
     if (req.temperature !== undefined) params.temperature = req.temperature;
     if (req.stop_sequences !== undefined) params.stop = req.stop_sequences;
@@ -187,6 +196,6 @@ export const createOpenAIProvider = (
     generateConstrained: (_req: ConstrainedRequest): Promise<string> =>
       Promise.reject(new Error('generateConstrained not implemented in M1')),
     countTokens: (messages: ProviderMessage[]): Promise<number> =>
-      Promise.resolve(heuristicTokenCount(messages)),
+      Promise.resolve(estimateMessagesTokens(messages)),
   };
 };

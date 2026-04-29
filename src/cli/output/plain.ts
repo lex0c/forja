@@ -34,6 +34,17 @@ const color = (enable: boolean, code: string, text: string): string =>
 const truncate = (s: string, max: number): string =>
   s.length <= max ? s : `${s.slice(0, max)}... (${s.length - max} more chars)`;
 
+// Format a USD cost with decimals matched to magnitude. Goal is "decimal
+// digits worth reading": at $50.00 the fourth decimal is noise; at
+// $0.0008 we'd lose the value at two decimals. Thresholds align to
+// realistic Anthropic billing — most one-shot runs land under $1, long
+// agentic sessions in the $1–$50 band, audit suites past $50.
+const formatCost = (usd: number): string => {
+  if (usd >= 100) return `$${usd.toFixed(2)}`;
+  if (usd >= 1) return `$${usd.toFixed(3)}`;
+  return `$${usd.toFixed(4)}`;
+};
+
 export const createPlainRenderer = (options: PlainRendererOptions): OutputRenderer => {
   const { useColor } = options;
   const out = options.out ?? ((s: string) => process.stdout.write(s));
@@ -100,7 +111,23 @@ export const createPlainRenderer = (options: PlainRendererOptions): OutputRender
               : r.status === 'interrupted'
                 ? color(useColor, YELLOW, tag)
                 : color(useColor, RED, tag);
-          err(`\n${colored} ${r.steps} steps · ${r.durationMs}ms${detail}\n`);
+          const u = r.usage;
+          // Cache columns only printed when non-zero — Anthropic users see
+          // them, OpenAI/Gemini users typically don't, no need to clutter.
+          const cacheBits: string[] = [];
+          if (u.cache_read > 0) cacheBits.push(`cache_r ${u.cache_read}`);
+          if (u.cache_creation > 0) cacheBits.push(`cache_w ${u.cache_creation}`);
+          const cache = cacheBits.length > 0 ? ` (${cacheBits.join(', ')})` : '';
+          const tokens = `${u.input}/${u.output}${cache}`;
+          // Tilde indicates the value is a lower bound — at least one
+          // turn this session produced output without reporting usage.
+          // Mark both tokens and cost so the user reads them as
+          // estimates instead of authoritative totals.
+          const cost = `${r.usageComplete ? '' : '~'}${formatCost(r.costUsd)}`;
+          const tokenLabel = r.usageComplete ? `tokens ${tokens}` : `tokens ~${tokens}`;
+          err(
+            `\n${colored} ${r.steps} steps · ${r.durationMs}ms · ${color(useColor, DIM, `${tokenLabel} · ${cost}`)}${detail}\n`,
+          );
           break;
         }
       }

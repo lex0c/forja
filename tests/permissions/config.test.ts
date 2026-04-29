@@ -17,9 +17,29 @@ describe('parsePolicy', () => {
     expect(p.tools.fetch_url?.allow_hosts).toEqual(['*.public.com']);
   });
 
-  test('defaults mode to strict when omitted', () => {
-    expect(parsePolicy({}).defaults.mode).toBe('strict');
-    expect(parsePolicy({ tools: {} }).defaults.mode).toBe('strict');
+  test('preserves mode-omitted as undefined (engine/resolver applies the default downstream)', () => {
+    // parsePolicy used to inject mode='strict' as a default. Doing
+    // so made "user file silent on mode" indistinguishable from
+    // "user file said strict explicitly", which then produced
+    // phantom lock-conflicts when a higher layer locked mode at
+    // a non-strict value. Now ms is preserved as undefined; the
+    // engine reads `mode ?? 'strict'` and the hierarchy resolver
+    // applies the default at merge-emit time.
+    expect(parsePolicy({}).defaults.mode).toBeUndefined();
+    expect(parsePolicy({ tools: {} }).defaults.mode).toBeUndefined();
+    expect(parsePolicy({ defaults: { mode: 'strict' } }).defaults.mode).toBe('strict');
+  });
+
+  test('rejects unknown keys (typo defense)', () => {
+    // Typo `allow_path` (singular) used to silently turn into a
+    // no-op section that allows everything by virtue of having no
+    // declared rules. parsePolicy now rejects unknown keys to
+    // catch these at config load time.
+    expect(() => parsePolicy({ tools: { write_file: { allow_path: ['./src/**'] } } })).toThrow(
+      /unknown key 'allow_path'/,
+    );
+    expect(() => parsePolicy({ tools: { bash: { lockd: true } } })).toThrow(/unknown key 'lockd'/);
+    expect(() => parsePolicy({ defaults: { lcoked: true } })).toThrow(/unknown key 'lcoked'/);
   });
 
   test('rejects invalid mode', () => {

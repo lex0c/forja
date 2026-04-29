@@ -210,7 +210,11 @@ export const createPermissionEngine = (
   policy: Policy,
   options: EngineOptions,
 ): PermissionEngine => {
-  const mode = policy.defaults.mode;
+  // Mode is optional on parsed policies (so the resolver can tell
+  // "user file was silent" from "user file said strict explicitly")
+  // but the engine needs a concrete value. Default to strict — same
+  // policy as the empty-file fallback.
+  const mode = policy.defaults.mode ?? 'strict';
   const cwd = options.cwd;
 
   const check = (toolName: string, category: PolicyCategory, args: ToolArgs): Decision => {

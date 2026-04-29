@@ -1,0 +1,14 @@
+name: create file with specified content
+prompt: |
+  Create a new file named hello.txt at the root of the working directory.
+  Its only content must be the single line: hi from forja
+expect:
+  - tool_called: write_file
+  - file_exists: hello.txt
+  - file_contains:
+      path: hello.txt
+      pattern: hi from forja
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

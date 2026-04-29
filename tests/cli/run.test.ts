@@ -13,6 +13,7 @@ const baseArgs = (overrides: Partial<ParsedArgs> = {}): ParsedArgs => ({
   json: false,
   version: false,
   help: false,
+  plan: false,
   ...overrides,
 });
 
@@ -89,7 +90,16 @@ afterEach(() => {
 describe('exitCodeFor', () => {
   test('done → 0', () => {
     expect(
-      exitCodeFor({ status: 'done', reason: 'done', sessionId: 's', steps: 1, durationMs: 1 }),
+      exitCodeFor({
+        status: 'done',
+        reason: 'done',
+        sessionId: 's',
+        steps: 1,
+        durationMs: 1,
+        usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+        costUsd: 0,
+        usageComplete: true,
+      }),
     ).toBe(0);
   });
   test('exhausted → 2', () => {
@@ -100,6 +110,9 @@ describe('exitCodeFor', () => {
         sessionId: 's',
         steps: 1,
         durationMs: 1,
+        usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+        costUsd: 0,
+        usageComplete: true,
       }),
     ).toBe(2);
   });
@@ -111,6 +124,9 @@ describe('exitCodeFor', () => {
         sessionId: 's',
         steps: 1,
         durationMs: 1,
+        usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+        costUsd: 0,
+        usageComplete: true,
       }),
     ).toBe(130);
   });
@@ -122,6 +138,9 @@ describe('exitCodeFor', () => {
         sessionId: 's',
         steps: 1,
         durationMs: 1,
+        usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+        costUsd: 0,
+        usageComplete: true,
       }),
     ).toBe(1);
   });
@@ -222,5 +241,80 @@ describe('run end-to-end with mock provider', () => {
       rendererOverride: renderer,
     });
     expect(flushed).toBe(true);
+  });
+
+  test('plan mode respects --max-steps cap', async () => {
+    // Sanity: plan mode is just a profile flag — it doesn't bypass
+    // the budget. A small maxSteps caps exploration even in plan
+    // mode, returning exhausted/maxSteps as expected.
+    const { renderer } = recordingRenderer();
+    const stepFactory = (i: number): ScriptedStep => ({
+      tool_uses: [{ id: `tu${i}`, name: 'unknown_tool', input: { i } }],
+    });
+    const code = await run({
+      args: baseArgs({ plan: true, maxSteps: 2 }),
+      bootstrapOverride: {
+        providerOverride: mockProvider(Array.from({ length: 5 }, (_, i) => stepFactory(i))),
+        dbPath,
+        cwd: workdir,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: renderer,
+    });
+    expect(code).toBe(2); // exhausted exit code
+  });
+
+  test('plan mode prints the [plan mode] indicator on errSink', async () => {
+    const { renderer } = recordingRenderer();
+    const errLines: string[] = [];
+    await run({
+      args: baseArgs({ plan: true }),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: '# Plan\n\n## Goal\nrefactor' }]),
+        dbPath,
+        cwd: workdir,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: renderer,
+      errSink: (s) => errLines.push(s),
+    });
+    expect(errLines.join('')).toContain('[plan mode]');
+  });
+
+  test('lock conflicts are surfaced to errSink before the run starts', async () => {
+    // Stage a layered policy where enterprise locks tools.bash and
+    // a project file tries to override it. run() should print one
+    // warning per conflict on errSink so the operator sees the
+    // signal — silently swallowing it would defeat the locked
+    // semantic.
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const entFile = path.join(workdir, 'ent.yaml');
+    fs.writeFileSync(entFile, 'tools:\n  bash:\n    deny:\n      - "rm *"\n    locked: true\n');
+    fs.mkdirSync(path.join(workdir, '.agent'), { recursive: true });
+    fs.writeFileSync(
+      path.join(workdir, '.agent/permissions.yaml'),
+      'tools:\n  bash:\n    allow:\n      - "ls *"\n',
+    );
+
+    const { renderer } = recordingRenderer();
+    const errLines: string[] = [];
+    await run({
+      args: baseArgs(),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'ok' }]),
+        dbPath,
+        cwd: workdir,
+        enterprisePolicyPath: entFile,
+        userPolicyPath: null,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: renderer,
+      errSink: (s) => errLines.push(s),
+    });
+    const all = errLines.join('');
+    expect(all).toContain('tools.bash');
+    expect(all).toContain('locked by enterprise');
+    expect(all).toContain('project');
   });
 });

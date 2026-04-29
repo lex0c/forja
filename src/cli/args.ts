@@ -7,6 +7,11 @@ export interface ParsedArgs {
   json: boolean;
   version: boolean;
   help: boolean;
+  // Plan mode (AGENTIC_CLI §5): harness-level read-only profile.
+  // Tools that mutate (writes:true) are blocked before execution
+  // regardless of policy; the model produces a structured plan and
+  // exits without applying.
+  plan: boolean;
   model?: string;
   maxSteps?: number;
 }
@@ -21,7 +26,13 @@ export type ParseResult = { ok: true; args: ParsedArgs } | ParseError;
 const POSITIVE_INT = /^[1-9][0-9]*$/;
 
 export const parseArgs = (argv: readonly string[]): ParseResult => {
-  const args: ParsedArgs = { prompt: '', json: false, version: false, help: false };
+  const args: ParsedArgs = {
+    prompt: '',
+    json: false,
+    version: false,
+    help: false,
+    plan: false,
+  };
   const promptParts: string[] = [];
   let i = 0;
   while (i < argv.length) {
@@ -38,6 +49,10 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         break;
       case '--json':
         args.json = true;
+        i += 1;
+        break;
+      case '--plan':
+        args.plan = true;
         i += 1;
         break;
       case '--help':
@@ -95,6 +110,7 @@ export const usage = (): string =>
     '  --version, -v          Print version and exit',
     '  --help, -h             Show this help and exit',
     '  --json                 Emit NDJSON events to stdout (headless)',
+    '  --plan                 Read-only mode: produce a plan, do not apply changes',
     '  --model <id>           Model id (default: anthropic/claude-sonnet-4-6)',
     '  --max-steps <n>        Override harness step budget',
     '',

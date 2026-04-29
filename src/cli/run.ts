@@ -64,10 +64,31 @@ export const run = async (options: RunOptions): Promise<number> => {
       prompt: args.prompt,
       ...(args.model !== undefined ? { modelId: args.model } : {}),
       ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
+      ...(args.plan === true ? { plan: true } : {}),
       signal,
       ...(options.bootstrapOverride ?? {}),
     };
-    const { config, db } = bootstrap(bootstrapInput);
+    const { config, db, lockConflicts } = bootstrap(bootstrapInput);
+
+    // Plan mode indicator on stderr — stdout stays a clean
+    // transcript / NDJSON. Skip in JSON mode (per spec §2.2 stdout
+    // is NDJSON only; admin-style output goes to stderr regardless).
+    if (args.plan === true) {
+      errSink('[plan mode] read-only run; write tools are blocked at the harness\n');
+    }
+
+    // Surface lock-conflict warnings before the run starts. Each
+    // conflict means an enterprise/user/project layer marked a
+    // section as locked and a lower-precedence layer tried to
+    // override it; the override was dropped from the merged policy.
+    // Admins need this signal — silently swallowing it defeats the
+    // whole point of `locked: true`.
+    for (const c of lockConflicts) {
+      errSink(
+        `⚠ permission policy: ${c.section} locked by ${c.lockedBy}; ${c.attemptedBy}'s override dropped\n`,
+      );
+    }
+
     const cfg = {
       ...config,
       onEvent: (e: Parameters<OutputRenderer['onEvent']>[0]) => renderer.onEvent(e),

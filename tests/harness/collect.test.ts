@@ -116,4 +116,45 @@ describe('collectStep', () => {
     const out = await collectStep(fromEvents([{ kind: 'text_delta', text: 'x' }]));
     expect(out.stop_reason).toBe('end_turn');
   });
+
+  test('captures usage event and flips usageSeen', async () => {
+    const out = await collectStep(
+      fromEvents([
+        { kind: 'start', message_id: 'm' },
+        { kind: 'usage', usage: { input: 50, output: 10, cache_read: 5, cache_creation: 0 } },
+        { kind: 'stop', reason: 'end_turn' },
+      ]),
+    );
+    expect(out.usageSeen).toBe(true);
+    expect(out.usage).toEqual({ input: 50, output: 10, cache_read: 5, cache_creation: 0 });
+  });
+
+  test('absent usage event leaves usageSeen=false and usage at zero', async () => {
+    const out = await collectStep(
+      fromEvents([
+        { kind: 'start', message_id: 'm' },
+        { kind: 'text_delta', text: 'hi' },
+        { kind: 'stop', reason: 'end_turn' },
+      ]),
+    );
+    expect(out.usageSeen).toBe(false);
+    expect(out.usage).toEqual({ input: 0, output: 0, cache_read: 0, cache_creation: 0 });
+  });
+
+  test('usage emitted mid-stream is honored; later usage events overwrite', async () => {
+    // The canonical contract is "usage right before stop", but the
+    // collector's `last usage wins` rule lets adapters that report
+    // partial counts mid-stream still produce sensible numbers.
+    const out = await collectStep(
+      fromEvents([
+        { kind: 'start', message_id: 'm' },
+        { kind: 'usage', usage: { input: 50, output: 5, cache_read: 0, cache_creation: 0 } },
+        { kind: 'text_delta', text: 'more' },
+        { kind: 'usage', usage: { input: 50, output: 12, cache_read: 0, cache_creation: 0 } },
+        { kind: 'stop', reason: 'end_turn' },
+      ]),
+    );
+    expect(out.usage.output).toBe(12);
+    expect(out.usageSeen).toBe(true);
+  });
 });

@@ -86,7 +86,7 @@ describe('createAnthropicProvider', () => {
     expect(provider.capabilities.vision).toBe(true);
     expect(provider.capabilities.constrained).toBe('tools');
     expect(provider.capabilities.context_window).toBe(200_000);
-    expect(provider.capabilities.cost_per_1k_input).toBe(0.25);
+    expect(provider.capabilities.cost_per_1k_input).toBe(1.0);
   });
 
   test('generateConstrained rejects with not-implemented error in M1', async () => {
@@ -119,7 +119,7 @@ describe('createAnthropicProvider', () => {
     })) {
       events.push(ev);
     }
-    expect(events).toEqual([
+    expect(events.filter((e) => e.kind !== 'usage')).toEqual([
       { kind: 'start', message_id: 'mock_msg' },
       { kind: 'text_delta', text: 'hi' },
       { kind: 'stop', reason: 'end_turn' },

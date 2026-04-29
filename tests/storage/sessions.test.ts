@@ -47,7 +47,7 @@ describe('sessions repo', () => {
     createSession(db, { model: 'm', cwd: '/a' });
     createSession(db, { model: 'm', cwd: '/b' });
     const session = createSession(db, { model: 'm', cwd: '/a' });
-    completeSession(db, session.id, 'done', 0.5);
+    completeSession(db, session.id, 'done', 0.5, true);
     expect(listSessions(db, { cwd: '/a' })).toHaveLength(2);
     expect(listSessions(db, { status: 'done' })).toHaveLength(1);
     expect(listSessions(db, { cwd: '/a', status: 'done' })).toHaveLength(1);
@@ -63,21 +63,30 @@ describe('sessions repo', () => {
 
   test('completeSession transitions running to terminal', () => {
     const s = createSession(db, { model: 'm', cwd: '/p' });
-    completeSession(db, s.id, 'done', 1.23);
+    completeSession(db, s.id, 'done', 1.23, true);
     const fetched = getSession(db, s.id);
     expect(fetched?.status).toBe('done');
     expect(fetched?.totalCostUsd).toBe(1.23);
+    expect(fetched?.usageComplete).toBe(true);
     expect(typeof fetched?.endedAt).toBe('number');
+  });
+
+  test('completeSession persists usageComplete=false for partial telemetry', () => {
+    const s = createSession(db, { model: 'm', cwd: '/p' });
+    completeSession(db, s.id, 'interrupted', 0.42, false);
+    const fetched = getSession(db, s.id);
+    expect(fetched?.totalCostUsd).toBe(0.42);
+    expect(fetched?.usageComplete).toBe(false);
   });
 
   test('completeSession refuses to re-terminate a finished session', () => {
     const s = createSession(db, { model: 'm', cwd: '/p' });
-    completeSession(db, s.id, 'done', 0);
-    expect(() => completeSession(db, s.id, 'done', 0)).toThrow(/not in 'running' state/);
+    completeSession(db, s.id, 'done', 0, true);
+    expect(() => completeSession(db, s.id, 'done', 0, true)).toThrow(/not in 'running' state/);
   });
 
   test('completeSession rejects unknown session', () => {
-    expect(() => completeSession(db, 'nope', 'done', 0)).toThrow(/not found/);
+    expect(() => completeSession(db, 'nope', 'done', 0, true)).toThrow(/not found/);
   });
 
   test('updateSessionCost overwrites the cost field', () => {

@@ -1,21 +1,16 @@
 import { describe, expect, test } from 'bun:test';
 import { type RawOpenAIChunk, normalizeOpenAIStream } from '../../src/providers/openai/stream.ts';
 import type { StreamEvent } from '../../src/providers/types.ts';
+import { collect, collectNonUsage } from './_stream-helpers.ts';
 
 const fromChunks = (chunks: RawOpenAIChunk[]): AsyncIterable<RawOpenAIChunk> =>
   (async function* () {
     for (const c of chunks) yield c;
   })();
 
-const collect = async (stream: AsyncIterable<StreamEvent>): Promise<StreamEvent[]> => {
-  const out: StreamEvent[] = [];
-  for await (const e of stream) out.push(e);
-  return out;
-};
-
 describe('normalizeOpenAIStream', () => {
   test('text-only stream: id from first chunk, deltas, stop', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeOpenAIStream(
         fromChunks([
           { id: 'chatcmpl-1', choices: [{ delta: { role: 'assistant', content: '' } }] },
@@ -34,7 +29,7 @@ describe('normalizeOpenAIStream', () => {
   });
 
   test('synthesizes message_id when first chunk has none', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeOpenAIStream(
         fromChunks([{ choices: [{ delta: { content: 'hi' }, finish_reason: 'stop' }] }]),
       ),
@@ -47,7 +42,7 @@ describe('normalizeOpenAIStream', () => {
   });
 
   test('tool_call: name in first chunk, args streamed across chunks, stop after stream end', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeOpenAIStream(
         fromChunks([
           { id: 'c', choices: [{ delta: { role: 'assistant' } }] },
@@ -100,7 +95,7 @@ describe('normalizeOpenAIStream', () => {
   });
 
   test('multiple tool_calls tracked by index, finalized in index order', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeOpenAIStream(
         fromChunks([
           {
@@ -138,7 +133,7 @@ describe('normalizeOpenAIStream', () => {
   });
 
   test('synthesizes tool_call id when SDK omits it', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeOpenAIStream(
         fromChunks([
           {
@@ -169,7 +164,7 @@ describe('normalizeOpenAIStream', () => {
     // tool_use_start; if we silently swapped to the late id, the
     // matching tool_use_stop would orphan in collect.ts and the tool
     // call would be dropped (`harness.orphan_tool_use_stop`).
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeOpenAIStream(
         fromChunks([
           {
@@ -210,7 +205,7 @@ describe('normalizeOpenAIStream', () => {
     // Chunk 2 supplies the name (and more args). Without deferral, the
     // old code emitted tool_use_start with name='' — the harness then
     // tried to invoke "" → unknown tool, dropping a valid call.
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeOpenAIStream(
         fromChunks([
           {
@@ -272,7 +267,7 @@ describe('normalizeOpenAIStream', () => {
     // name ever arrives. We must not emit tool_use_stop with name='' —
     // that would orphan in collect.ts (which keys on the start name).
     // Instead, emit an error event so the harness fails the step.
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeOpenAIStream(
         fromChunks([
           {
@@ -309,7 +304,7 @@ describe('normalizeOpenAIStream', () => {
     // Three chunks: name-only, args-only, finish. All emitted events for
     // index 0 must share the same id. This is the contract collect.ts
     // depends on.
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeOpenAIStream(
         fromChunks([
           {
@@ -348,7 +343,7 @@ describe('normalizeOpenAIStream', () => {
   });
 
   test('refusal field is emitted as text_delta', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeOpenAIStream(
         fromChunks([
           { id: 'c', choices: [{ delta: { refusal: "I can't help with that." } }] },
@@ -360,7 +355,7 @@ describe('normalizeOpenAIStream', () => {
   });
 
   test('content and refusal in the same chunk both emit, in declared order', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeOpenAIStream(
         fromChunks([
           {
@@ -379,7 +374,7 @@ describe('normalizeOpenAIStream', () => {
   });
 
   test('a real-looking id in chunk 1 is not overwritten by a later chunk', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeOpenAIStream(
         fromChunks([
           {
@@ -435,7 +430,7 @@ describe('normalizeOpenAIStream', () => {
       ['something_new', { kind: 'stop', reason: 'end_turn' }],
     ];
     for (const [reason, expected] of cases) {
-      const events = await collect(
+      const events = await collectNonUsage(
         normalizeOpenAIStream(fromChunks([{ choices: [{ delta: {}, finish_reason: reason }] }])),
       );
       expect(events).toContainEqual(expected);
@@ -443,7 +438,7 @@ describe('normalizeOpenAIStream', () => {
   });
 
   test('null finish_reason in earlier chunk does not clobber a later valid one', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeOpenAIStream(
         fromChunks([
           { choices: [{ delta: { content: 'a' }, finish_reason: null }] },
@@ -455,7 +450,7 @@ describe('normalizeOpenAIStream', () => {
   });
 
   test('malformed tool_call args emit an error event and drop the tool_use_stop', async () => {
-    const events = await collect(
+    const events = await collectNonUsage(
       normalizeOpenAIStream(
         fromChunks([
           {
@@ -488,9 +483,149 @@ describe('normalizeOpenAIStream', () => {
   });
 
   test('empty stream still yields a well-formed start+stop sequence', async () => {
-    const events = await collect(normalizeOpenAIStream(fromChunks([])));
+    const events = await collectNonUsage(normalizeOpenAIStream(fromChunks([])));
     expect(events).toHaveLength(2);
     expect(events[0]?.kind).toBe('start');
     expect(events[1]).toEqual({ kind: 'stop', reason: 'end_turn' });
+  });
+
+  test('does NOT emit a usage event when chunk.usage is an empty object', async () => {
+    // Compat endpoints sometimes echo back `usage: {}` without any
+    // token fields. Field-level detection should refuse to flip the
+    // usageSeen flag and the harness should record NULL, not 0.
+    const events = await collect(
+      normalizeOpenAIStream(
+        fromChunks([
+          { id: 'cmpl-x', choices: [{ delta: { content: 'hi' } }] },
+          { choices: [{ delta: {}, finish_reason: 'stop' }] },
+          { choices: [], usage: {} },
+        ]),
+      ),
+    );
+    expect(events.find((e) => e.kind === 'usage')).toBeUndefined();
+  });
+
+  test('emits usage from finally when stream errors after a usage chunk arrived', async () => {
+    // Some OpenAI compat endpoints send usage chunks before the
+    // final stream chunk. If the connection drops after a usage
+    // arrived but before normal end-of-stream, the prior code
+    // dropped the data on the floor. finally now surfaces it.
+    const erroringRaw = (async function* (): AsyncIterable<RawOpenAIChunk> {
+      yield { id: 'cmpl-x', choices: [{ delta: { content: 'partial' } }] };
+      yield {
+        choices: [],
+        usage: { prompt_tokens: 200, completion_tokens: 30 },
+      };
+      throw new Error('socket closed');
+    })();
+    const events: StreamEvent[] = [];
+    try {
+      for await (const ev of normalizeOpenAIStream(erroringRaw)) events.push(ev);
+    } catch {}
+    const usageEv = events.find((e) => e.kind === 'usage');
+    expect(usageEv).toBeDefined();
+    if (usageEv?.kind === 'usage') {
+      expect(usageEv.usage.input).toBe(200);
+      expect(usageEv.usage.output).toBe(30);
+    }
+  });
+
+  test('does NOT double-emit usage on the happy path', async () => {
+    const events = await collect(
+      normalizeOpenAIStream(
+        fromChunks([
+          { id: 'cmpl-x', choices: [{ delta: { content: 'hi' } }] },
+          { choices: [{ delta: {}, finish_reason: 'stop' }] },
+          { choices: [], usage: { prompt_tokens: 10, completion_tokens: 5 } },
+        ]),
+      ),
+    );
+    const usageEvents = events.filter((e) => e.kind === 'usage');
+    expect(usageEvents).toHaveLength(1);
+  });
+
+  test('partial later usage chunk does not zero earlier prompt/cache values', async () => {
+    // Bug regression: per-chunk `?? 0` defaults would let a usage chunk
+    // carrying only completion_tokens reset prompt/cache to 0, silently
+    // underreporting cost. Field-by-field merge with Math.max keeps the
+    // largest value seen.
+    const events = await collect(
+      normalizeOpenAIStream(
+        fromChunks([
+          { id: 'cmpl-x', choices: [{ delta: { content: 'hi' } }] },
+          { choices: [{ delta: {}, finish_reason: 'stop' }] },
+          {
+            choices: [],
+            usage: {
+              prompt_tokens: 1200,
+              prompt_tokens_details: { cached_tokens: 1000 },
+              completion_tokens: 5,
+            },
+          },
+          // Later chunk carries only completion_tokens — must NOT erase
+          // prompt/cache values from the earlier chunk.
+          { choices: [], usage: { completion_tokens: 12 } },
+        ]),
+      ),
+    );
+    const u = events.find((e) => e.kind === 'usage');
+    if (u?.kind !== 'usage') throw new Error('expected usage event');
+    expect(u.usage).toEqual({ input: 200, output: 12, cache_read: 1000, cache_creation: 0 });
+  });
+
+  test('emits a usage event when only completion_tokens is present', async () => {
+    // Partial measurement (one field set) is still measurement.
+    const events = await collect(
+      normalizeOpenAIStream(
+        fromChunks([
+          { id: 'cmpl-x', choices: [{ delta: { content: 'hi' } }] },
+          { choices: [{ delta: {}, finish_reason: 'stop' }] },
+          { choices: [], usage: { completion_tokens: 9 } },
+        ]),
+      ),
+    );
+    const u = events.find((e) => e.kind === 'usage');
+    if (u?.kind !== 'usage') throw new Error('expected usage event');
+    expect(u.usage.output).toBe(9);
+    expect(u.usage.input).toBe(0);
+  });
+
+  test('does NOT emit a usage event when no chunk carries usage (compat endpoint case)', async () => {
+    // Some OpenAI-compatible endpoints silently drop stream_options.
+    // Emitting a synthetic zero would flip the harness's `usageSeen`
+    // flag and persist 0 instead of NULL.
+    const events = await collect(
+      normalizeOpenAIStream(
+        fromChunks([
+          { id: 'cmpl-x', choices: [{ delta: { content: 'hi' } }] },
+          { choices: [{ delta: {}, finish_reason: 'stop' }] },
+        ]),
+      ),
+    );
+    expect(events.find((e) => e.kind === 'usage')).toBeUndefined();
+  });
+
+  test('extracts usage from final chunk and splits cached_tokens out of prompt total', async () => {
+    const events = await collect(
+      normalizeOpenAIStream(
+        fromChunks([
+          { id: 'cmpl-x', choices: [{ delta: { content: 'hi' } }] },
+          { choices: [{ delta: {}, finish_reason: 'stop' }] },
+          {
+            choices: [],
+            usage: {
+              prompt_tokens: 1200,
+              completion_tokens: 50,
+              prompt_tokens_details: { cached_tokens: 1000 },
+            },
+          },
+        ]),
+      ),
+    );
+    const u = events.find((e) => e.kind === 'usage');
+    if (u?.kind !== 'usage') throw new Error('expected usage event');
+    // prompt - cached splits the total into the rate it'll actually be
+    // billed at: input billed at full rate, cache_read at the discount.
+    expect(u.usage).toEqual({ input: 200, output: 50, cache_read: 1000, cache_creation: 0 });
   });
 });

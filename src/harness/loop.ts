@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
   ProviderContentBlock,
@@ -7,10 +8,12 @@ import type {
   ProviderToolResultBlock,
   ProviderToolUseBlock,
 } from '../providers/index.ts';
+import { estimatePromptTokens } from '../providers/tokens.ts';
 import { appendMessage, completeSession, createSession } from '../storage/index.ts';
 import type { ToolContext } from '../tools/index.ts';
 import { abortableIterable } from './abortable.ts';
-import { collectStep } from './collect.ts';
+import { CollectStepError, collectStep } from './collect.ts';
+import { compactMessages } from './compaction.ts';
 import { invokeTool } from './invoke-tool.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
 import {
@@ -106,6 +109,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   let consecutiveErrors = 0;
   let sessionId = '';
   let lastMessageId = '';
+  // Session-wide totals. Each completed provider turn adds its usage and
+  // its computed cost; we persist the aggregate to `sessions.total_cost_usd`
+  // on `completeSession` and surface both in the result + session_finished
+  // event so renderers can show "$X.XX, N tokens" without re-querying.
+  let totalUsage = emptyUsage();
+  let totalCostUsd = 0;
+  // Stays true until an assistant turn produces output without an
+  // accompanying usage event. The aggregate `usage`/`costUsd` only
+  // sums measured turns; this flag tells the caller whether those
+  // numbers are complete or a lower-bound estimate.
+  let usageComplete = true;
 
   // Distinguish wall-clock from user abort — both use `signal.aborted` but
   // the user wants different exit reasons.
@@ -118,7 +132,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     // no row to mark and SQLite would just throw a foreign-key error.
     if (sessionId.length > 0) {
       try {
-        completeSession(config.db, sessionId, exitToStatus[reason], 0);
+        completeSession(config.db, sessionId, exitToStatus[reason], totalCostUsd, usageComplete);
       } catch {
         // Storage already broken; nothing useful to do beyond return the
         // result so the caller knows the run is over.
@@ -130,6 +144,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       sessionId,
       steps,
       durationMs: Date.now() - startMs,
+      usage: totalUsage,
+      costUsd: totalCostUsd,
+      usageComplete,
       lastMessageId,
     };
     if (detail !== undefined) result.detail = detail;
@@ -140,8 +157,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // Convert any uncaught exception (typically SQLite errors from append
   // operations) into a clean error exit instead of letting it crash the
   // caller. Tool exceptions are already wrapped by invokeTool; this catch
-  // is for the persistence path that surrounds it.
+  // is for the persistence path that surrounds it. We don't know what
+  // turns were measured at the throw site, so the safe call is to mark
+  // aggregate totals as incomplete.
   const guardedFinish = (e: unknown): HarnessResult => {
+    usageComplete = false;
     const detail = e instanceof Error ? e.message || e.name || String(e) : String(e);
     return finish('internalError', detail);
   };
@@ -185,6 +205,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         max_tokens: budget.maxOutputTokensPerCall,
         ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
         ...(tools.length > 0 ? { tools } : {}),
+        ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
       };
 
       let collected: Awaited<ReturnType<typeof collectStep>>;
@@ -199,6 +220,28 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           (ev) => safeEmit(config.onEvent, { type: 'provider_event', event: ev }),
         );
       } catch (e) {
+        // The provider request was sent (and likely billed for input
+        // tokens) before the throw. Always flip the aggregate flag —
+        // even if we recover partial usage, totals are by definition
+        // a lower bound when the turn ended in error.
+        usageComplete = false;
+
+        // Recover whatever the stream emitted before the throw.
+        // Adapters yield `usage` from their `finally` block precisely
+        // for this case, so a failed turn that already received
+        // input/cache numbers from the provider can still be charged.
+        // CollectStepError carries the partial CollectedStep; non-
+        // wrapped errors (extreme: collectStep itself crashed before
+        // catching) have no recoverable state.
+        if (e instanceof CollectStepError) {
+          const partial = e.partial;
+          if (partial.usageSeen) {
+            const partialCost = computeCost(config.provider.capabilities, partial.usage);
+            totalUsage = addUsage(totalUsage, partial.usage);
+            totalCostUsd += partialCost;
+          }
+        }
+
         // SDK throws when the abort signal fires mid-call (Ctrl+C or
         // wall-clock timeout). Reroute to the matching ExitReason so the
         // user sees `interrupted` exit code 130 instead of a generic
@@ -206,7 +249,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (signal.aborted) {
           return finish(isWallClockTimeout() ? 'maxWallClockMs' : 'aborted');
         }
-        const detail = e instanceof Error ? e.message || e.name || String(e) : String(e);
+        const cause = e instanceof CollectStepError ? e.cause : e;
+        const detail =
+          cause instanceof Error ? cause.message || cause.name || String(cause) : String(cause);
         return finish('providerError', detail);
       }
 
@@ -226,11 +271,34 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         assistantContent.push(block);
       }
 
+      const turnCostUsd = computeCost(config.provider.capabilities, collected.usage);
+      totalUsage = addUsage(totalUsage, collected.usage);
+      totalCostUsd += turnCostUsd;
+      // ANY assistant turn that completes without a usage event is
+      // unmeasured — every successful provider call bills input tokens
+      // for the prompt, even when the model emits no text, no
+      // tool_use, and no thinking. Stream errors and aborts don't
+      // reach here (they exit via providerError/aborted finish paths),
+      // so we're only counting turns that the provider actually
+      // accepted and processed. Flipping the flag tells the renderer
+      // to mark aggregate cost as a lower bound.
+      if (!collected.usageSeen) usageComplete = false;
+
+      // When the adapter never emitted a `usage` event, persist NULL on
+      // the token/cost columns instead of zeroes. Future analytics can
+      // then distinguish "no measurement" from "measured zero" — both
+      // are legal but mean different things (e.g., a stream that aborted
+      // before message_stop vs. a turn that genuinely produced nothing).
       const assistantMsg = appendMessage(config.db, {
         sessionId,
         role: 'assistant',
         parentId: lastMessageId,
         content: assistantContent.length > 0 ? assistantContent : '',
+        tokensIn: collected.usageSeen ? collected.usage.input : null,
+        tokensOut: collected.usageSeen ? collected.usage.output : null,
+        cachedTokens: collected.usageSeen ? collected.usage.cache_read : null,
+        cacheCreationTokens: collected.usageSeen ? collected.usage.cache_creation : null,
+        costUsd: collected.usageSeen ? turnCostUsd : null,
       });
       lastMessageId = assistantMsg.id;
       if (assistantContent.length > 0) {
@@ -319,6 +387,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             registry: config.toolRegistry,
             engine: config.permissionEngine,
             ctx,
+            ...(config.planMode === true ? { planMode: true } : {}),
           },
         );
 
@@ -372,6 +441,95 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       });
       lastMessageId = resultMsg.id;
       messages.push({ role: 'user', content: toolResults });
+
+      // Compaction trigger check. Estimate the FULL outbound prompt
+      // — messages + system + tool schemas — against the threshold.
+      // Tool schemas alone run 2-4k tokens each per CONTEXT_TUNING.md
+      // §2.1; a long system prompt adds another 0.5-3k. Counting only
+      // `messages` undercounts the trigger and lets the next request
+      // sail over the cap when the surrounding overhead is what's
+      // pushing it close.
+      //
+      // estimatePromptTokens is the local chars/4 heuristic: free
+      // (no HTTP), conservative (overestimates by ~10-25% vs real
+      // tokenizers), good enough for a 70%-of-window threshold that
+      // already includes a buffer.
+      //
+      // DB messages stay untouched; only the in-memory `messages`
+      // array sent to the provider gets rewritten. Audit + replay can
+      // re-derive from the full history if they ever need a different
+      // compaction policy.
+      // Skip when the budget is exhausted: compaction would issue a
+      // billed summary call right before the loop's top-of-iteration
+      // check exits with `maxSteps` anyway. Same logic as the
+      // signal.aborted guard — don't burn tokens on work whose
+      // result will never be used.
+      if (
+        !signal.aborted &&
+        steps < budget.maxSteps &&
+        config.provider.capabilities.context_window > 0
+      ) {
+        const promptTokens = estimatePromptTokens(messages, {
+          ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
+          ...(tools.length > 0 ? { tools } : {}),
+        });
+        const contextWindow = config.provider.capabilities.context_window;
+        const triggerAt = budget.compactionThreshold * contextWindow;
+        // Guard: requires at least goal + something-to-fold + an
+        // assistant boundary for the tail. compactMessages will skip
+        // (and emit a noisy started/finished pair) for shorter
+        // histories; check here so we don't fire the events at all.
+        // `+ 2` accounts for the assistant-boundary alignment the
+        // module performs — naive `1 + tail` could pass even when
+        // the alignment shift collapses the middle to empty.
+        if (promptTokens > triggerAt && messages.length >= budget.compactionPreserveTail + 3) {
+          safeEmit(config.onEvent, {
+            type: 'compaction_started',
+            promptTokens,
+            threshold: triggerAt,
+            contextWindow,
+          });
+          const compactStart = Date.now();
+          const compaction = await compactMessages(config.provider, messages, {
+            preserveTail: budget.compactionPreserveTail,
+            signal,
+          });
+          // In-place replace so the caller's reference (none today,
+          // but defensive) sees the new history without reassignment.
+          messages.length = 0;
+          messages.push(...compaction.messages);
+
+          // Compaction's LLM call (when it ran) is a billed provider
+          // request — fold its usage into session totals. Skipping
+          // this would systematically underreport spend on every
+          // compacting session, defeating the whole point of the
+          // per-session cost tracking. The 'skipped' strategy never
+          // made a call so contributes zero (emptyUsage); 'fallback'
+          // contributes whatever partial usage arrived before the
+          // failure (some providers emit usage on stream errors).
+          const compactionCost = computeCost(config.provider.capabilities, compaction.usage);
+          totalUsage = addUsage(totalUsage, compaction.usage);
+          totalCostUsd += compactionCost;
+          // If the compaction call MADE a provider request (llm or
+          // fallback strategy) but didn't see usage telemetry, the
+          // session total is now a lower bound — same conservative
+          // logic as the per-turn check.
+          if (compaction.strategy !== 'skipped' && !compaction.usageSeen) {
+            usageComplete = false;
+          }
+
+          const finishedEvent: HarnessEvent = {
+            type: 'compaction_finished',
+            strategy: compaction.strategy,
+            foldedCount: compaction.foldedCount,
+            durationMs: Date.now() - compactStart,
+            usage: compaction.usage,
+            costUsd: compactionCost,
+            ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
+          };
+          safeEmit(config.onEvent, finishedEvent);
+        }
+      }
     }
   } catch (e) {
     return guardedFinish(e);

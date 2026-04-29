@@ -37,6 +37,21 @@ describe('parseArgs', () => {
     expect(r.args.prompt).toBe('do thing');
   });
 
+  test('--plan flag', () => {
+    const r = parseArgs(['--plan', 'refactor src/auth.ts']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.plan).toBe(true);
+    expect(r.args.prompt).toBe('refactor src/auth.ts');
+  });
+
+  test('--plan defaults to false when omitted', () => {
+    const r = parseArgs(['hi']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.plan).toBe(false);
+  });
+
   test('--model with value', () => {
     const r = parseArgs(['--model', 'openai/gpt-4o', 'hi']);
     expect(r.ok).toBe(true);
@@ -128,6 +143,7 @@ describe('usage', () => {
     expect(u).toContain('--version');
     expect(u).toContain('--help');
     expect(u).toContain('--json');
+    expect(u).toContain('--plan');
     expect(u).toContain('--model');
     expect(u).toContain('--max-steps');
   });

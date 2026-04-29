@@ -29,3 +29,18 @@ export {
   loadPolicyFromString,
   parsePolicy,
 } from './config.ts';
+
+export {
+  enterprisePolicyPath,
+  projectPolicyPath,
+  userPolicyPath,
+} from './paths.ts';
+
+export type {
+  Layer,
+  LayerPolicy,
+  LockConflict,
+  ResolveOptions,
+  ResolveResult,
+} from './hierarchy.ts';
+export { resolvePolicy } from './hierarchy.ts';

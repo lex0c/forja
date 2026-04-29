@@ -1,0 +1,432 @@
+import { emptyUsage } from '../providers/cost.ts';
+import type {
+  GenerateRequest,
+  Provider,
+  ProviderContentBlock,
+  ProviderMessage,
+  UsageInfo,
+} from '../providers/index.ts';
+import { stripAnsi } from '../sanitize/index.ts';
+import { abortableIterable } from './abortable.ts';
+import { CollectStepError, collectStep } from './collect.ts';
+
+// Compaction shrinks the in-memory conversation history when the
+// provider's prompt is approaching its context window. AGENTIC_CLI §6
+// and ORCHESTRATION.md §4 spec the policy:
+//
+//   - Trigger at 70% of context_window (see the harness loop for the
+//     check; this module just executes when called).
+//   - Preserve the first user message (goal) literal and the last K
+//     turns literal; summarize everything in between.
+//   - LLM call is the canonical path; deterministic fallback when
+//     the LLM call fails so a compaction failure never aborts a run.
+//
+// Scope intentionally trimmed for M2 Step 3:
+//   - No PreCompact hook (hooks subsystem is M4).
+//   - No pinned context (M3+).
+//   - No DB persistence of the synthetic summary message — replay
+//     re-reads the original messages from `messages` table and can
+//     re-compact if needed. Audit captures the event via the
+//     harness's onEvent callback only.
+//   - Single provider for the summary call (same provider as the
+//     run); cheaper-model selection per profile is M3+.
+//   - Fallback drops tool_result bodies; advanced ranking (writes,
+//     decision references) is deferred.
+
+export interface CompactionOptions {
+  // Number of trailing turns preserved literally. ORCHESTRATION §4.6
+  // recommends K=3; configurable so tests can exercise smaller
+  // histories without staging an artificial 10-turn fixture.
+  preserveTail: number;
+  // Cap on the summary's `max_tokens`. Default 1024 — long enough to
+  // capture goal + decisions + files + errors + pending, short enough
+  // that the call doesn't burn through what compaction is trying to
+  // free up.
+  maxTokens?: number;
+  // Forwarded to the provider so a wall-clock timeout or user abort
+  // interrupts the summary call mid-stream.
+  signal?: AbortSignal;
+}
+
+export type CompactionStrategy = 'llm' | 'fallback' | 'skipped';
+
+export interface CompactionResult {
+  messages: ProviderMessage[];
+  strategy: CompactionStrategy;
+  // Number of original messages folded into the summary (counts the
+  // middle slice that got replaced; excludes preserved goal + tail).
+  foldedCount: number;
+  // Token usage for the compaction LLM call itself. Zero when
+  // strategy='skipped' (no call was made). On 'fallback' it carries
+  // whatever partial usage the failed call reported before throwing
+  // (some providers emit usage events even on stream errors). The
+  // caller MUST fold this into session totals — a compaction call is
+  // a billed provider request and ignoring it underreports spend.
+  usage: UsageInfo;
+  // Whether the compaction call's stream reported usage telemetry.
+  // False on skipped (no call) and on fallback paths where usage
+  // never arrived. The caller should downgrade `usageComplete` when
+  // an LLM-or-fallback strategy reports false, mirroring the
+  // per-turn logic in the harness loop.
+  usageSeen: boolean;
+  // Optional reason when strategy='fallback' or 'skipped' — surfaces
+  // through the harness event for observability.
+  reason?: string;
+}
+
+const SUMMARY_MARKER_OPEN = '[compacted_history]';
+const SUMMARY_MARKER_CLOSE = '[/compacted_history]';
+
+const COMPACTION_SYSTEM_PROMPT = `You are summarizing a long conversation between a user and an autonomous coding agent. Your output replaces the middle turns of the transcript so the model can continue without losing critical context. Be precise — every word costs tokens the agent could use to keep working.
+
+Output ONLY the following structured block, nothing else:
+
+${SUMMARY_MARKER_OPEN}
+GOAL: <single line restating the user's original request>
+DECISIONS: <bullet list of concrete decisions taken; empty list if none>
+FILES_TOUCHED: <comma-separated list of paths read/written; empty if none>
+ERRORS: <bullet list of errors hit and whether resolved>
+PENDING: <bullet list of remaining sub-tasks>
+${SUMMARY_MARKER_CLOSE}
+
+Skip any section whose content would be empty by writing "(none)" after the colon. Do not editorialize, apologize, or add prose outside the markers.`;
+
+// Spec ORCHESTRATION §4.6 step 6: when dropping tool_result bodies
+// alone isn't enough (text-heavy histories with few/no tool calls),
+// also truncate long text content head+tail with a size pointer.
+// Without this tier, fallback on a chatty session leaves the history
+// essentially the same size and the next provider call still hits
+// the context cap. Threshold + slice sizes match the spec's
+// "preserve first 200 chars + last 200 chars" recommendation.
+const TRUNCATE_THRESHOLD = 800;
+const TRUNCATE_HEAD = 200;
+const TRUNCATE_TAIL = 200;
+
+const truncateLongText = (s: string): string => {
+  if (s.length <= TRUNCATE_THRESHOLD) return s;
+  const head = s.slice(0, TRUNCATE_HEAD);
+  const tail = s.slice(-TRUNCATE_TAIL);
+  const elided = s.length - TRUNCATE_HEAD - TRUNCATE_TAIL;
+  return `${head}\n[... ${elided} chars elided — compaction fallback, original in audit log ...]\n${tail}`;
+};
+
+const fallbackElide = (block: ProviderContentBlock): ProviderContentBlock => {
+  if (block.type === 'tool_result') {
+    const sizeBytes = block.content.length;
+    // Tool args/output get replaced with a pointer so the model
+    // still sees that the call happened (and against which
+    // tool_use_id) but not the body. is_error is preserved so the
+    // model knows whether the call succeeded.
+    return {
+      ...block,
+      content: `[tool_result elided: ${sizeBytes} bytes — compaction fallback, original in audit log]`,
+    };
+  }
+  if (block.type === 'text') {
+    // Long assistant text (model produced a wall of explanation
+    // before invoking tools, or never invoked tools at all): head+
+    // tail truncate. Short text stays intact.
+    return { ...block, text: truncateLongText(block.text) };
+  }
+  // tool_use: args are usually small and reference IDs the next
+  // turn might still cite. Preserve fidelity.
+  return block;
+};
+
+const fallbackCompact = (middle: ProviderMessage[]): ProviderMessage[] =>
+  middle.map((m) => {
+    if (typeof m.content === 'string') {
+      // String-content messages (text-only chat with no blocks) get
+      // the same truncate treatment so a chatty history doesn't
+      // sail through fallback unchanged.
+      return { ...m, content: truncateLongText(m.content) };
+    }
+    return { ...m, content: m.content.map(fallbackElide) };
+  });
+
+const renderTranscriptForSummary = (middle: ProviderMessage[]): string => {
+  const lines: string[] = [];
+  for (const m of middle) {
+    if (typeof m.content === 'string') {
+      lines.push(`<${m.role}>\n${m.content}\n</${m.role}>`);
+      continue;
+    }
+    const parts: string[] = [];
+    for (const block of m.content) {
+      if (block.type === 'text') {
+        parts.push(block.text);
+      } else if (block.type === 'tool_use') {
+        parts.push(`[tool_use ${block.name}](${JSON.stringify(block.input)})`);
+      } else {
+        parts.push(
+          `[tool_result ${block.name ?? '?'} is_error=${block.is_error ?? false}]\n${block.content}`,
+        );
+      }
+    }
+    lines.push(`<${m.role}>\n${parts.join('\n')}\n</${m.role}>`);
+  }
+  return lines.join('\n\n');
+};
+
+interface SummaryAttempt {
+  text: string;
+  usage: UsageInfo;
+  usageSeen: boolean;
+  // Stream-level errors (malformed JSON args from a thinking model,
+  // etc). Non-empty list signals the caller should fall back, but we
+  // still hand back any usage that arrived on the way.
+  errors: { code: string; message: string }[];
+}
+
+const callSummaryProvider = async (
+  provider: Provider,
+  goal: ProviderMessage,
+  middle: ProviderMessage[],
+  options: CompactionOptions,
+): Promise<SummaryAttempt> => {
+  const transcript = renderTranscriptForSummary(middle);
+
+  const req: GenerateRequest = {
+    model: provider.id,
+    system: COMPACTION_SYSTEM_PROMPT,
+    messages: [
+      {
+        role: 'user',
+        content: `ORIGINAL GOAL (preserve literally in summary):\n${goalText(goal)}\n\nTRANSCRIPT TO SUMMARIZE:\n${transcript}`,
+      },
+    ],
+    max_tokens: options.maxTokens ?? 1024,
+    temperature: 0,
+  };
+
+  // Stream the response and collect. signal forwards the harness's
+  // combined abort signal so Ctrl+C or wall-clock timeout
+  // interrupts the summary call. A `provider.generate` throw
+  // propagates — caller treats that as zero-usage fallback.
+  const stream =
+    options.signal !== undefined
+      ? abortableIterable(provider.generate(req), options.signal)
+      : provider.generate(req);
+  const collected = await collectStep(stream);
+  return {
+    text: collected.text,
+    usage: collected.usage,
+    usageSeen: collected.usageSeen,
+    errors: collected.errors.map((e) => ({ code: e.code, message: e.message })),
+  };
+};
+
+// Strip any prior `[compacted_history]...[/compacted_history]` block(s)
+// from a string. Cumulative compactions previously appended a new
+// summary on top of every prior wrap, growing the goal monotonically:
+// after compaction N the wrapped goal contained N summaries. Each new
+// compaction's LLM call would also see all prior summaries inside the
+// "ORIGINAL GOAL" the LLM was told to preserve literally — they got
+// re-quoted in the new summary, snowballing further. Stripping resets
+// to "original goal + LATEST summary", which is what subsequent
+// compactions actually need.
+//
+// Non-greedy match across newlines so multiple consecutive blocks are
+// each removed independently. A goal that legitimately contained the
+// markers (extreme edge case) would be partially corrupted; we accept
+// that to avoid the unbounded-growth bug in practice.
+const SUMMARY_BLOCK_RE = /\n*\[compacted_history\][\s\S]*?\[\/compacted_history\]\n*/g;
+const stripPriorSummary = (text: string): string => text.replace(SUMMARY_BLOCK_RE, '').trim();
+
+// Extract plain text from a goal message regardless of whether the
+// content was set as a string or as a list of blocks, then strip any
+// prior summary block. The harness always uses string content for the
+// initial user prompt, but compaction may rewrite messages[0] into a
+// wrapped goal that already carries a summary; subsequent compactions
+// must see the ORIGINAL goal, not the prior summary.
+const goalText = (goal: ProviderMessage): string => {
+  const raw =
+    typeof goal.content === 'string'
+      ? goal.content
+      : goal.content
+          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+          .map((b) => b.text)
+          .join('\n');
+  return stripPriorSummary(raw);
+};
+
+// Merge the LLM-produced summary INTO the goal message rather than
+// emitting a separate synthetic message. Two reasons:
+//   1. Tool-pair integrity — the tail must start with the assistant
+//      message that emitted the tool_use referenced by following
+//      user_tool_result blocks. If we inserted a separate summary
+//      message and forced the tail to start with `user`, that user
+//      tool_result would be orphaned (its matching tool_use was in
+//      the middle, now folded into the summary), and providers
+//      reject orphaned tool_result blocks with 400.
+//   2. Alternation — Anthropic rejects consecutive same-role
+//      messages. With tail starting at `assistant` we'd need the
+//      preceding message to be `user`. Merging into the goal keeps
+//      `[user_goal+summary, assistant_first_tail, ...]` as a clean
+//      user→assistant→user→... sequence.
+const wrapGoalWithSummary = (goal: ProviderMessage, summary: string): ProviderMessage => {
+  // Strip ANSI from the LLM-produced summary before it lands in the
+  // model's context (and the audit log via the provider response
+  // path). Compaction calls go through our trusted provider, but a
+  // hijacked or buggy proxy could inject control bytes; the
+  // sanitization layer is the canonical defense and applying it
+  // here keeps the invariant from §SECURITY_GUIDELINE §5/4
+  // consistent across compaction paths.
+  const trimmed = stripAnsi(summary).trim();
+  // Defensive: model may forget one or both markers, or pad text
+  // around them. We accept anywhere-in-the-string occurrences and
+  // only re-wrap when at least one marker is missing entirely.
+  const hasMarkers =
+    trimmed.includes(SUMMARY_MARKER_OPEN) && trimmed.includes(SUMMARY_MARKER_CLOSE);
+  const body = hasMarkers ? trimmed : `${SUMMARY_MARKER_OPEN}\n${trimmed}\n${SUMMARY_MARKER_CLOSE}`;
+  // goalText already strips any prior summary block, so this never
+  // accumulates: the wrap is always [original_goal]\n\n[latest summary].
+  return { role: 'user', content: `${goalText(goal)}\n\n${body}` };
+};
+
+export const compactMessages = async (
+  provider: Provider,
+  messages: ProviderMessage[],
+  options: CompactionOptions,
+): Promise<CompactionResult> => {
+  // Clamp negative inputs and use length-relative slicing instead of
+  // `slice(-tail)`. JS quirk: `[1,2,3].slice(-0)` returns the whole
+  // array (since `-0 === 0` and `slice(0)` is the full array). With
+  // `preserveTail=0` the original code would have produced a tail
+  // overlapping the middle and double-counted every message.
+  const safeTail = Math.max(0, options.preserveTail);
+
+  // Need at least: goal + something-to-fold + tail. Anything shorter
+  // means there's nothing meaningful to compact.
+  if (messages.length < safeTail + 2) {
+    return {
+      messages,
+      strategy: 'skipped',
+      foldedCount: 0,
+      usage: emptyUsage(),
+      usageSeen: false,
+      reason: `history shorter than goal+fold+tail (${messages.length} < ${safeTail + 2})`,
+    };
+  }
+
+  const goal = messages[0];
+  if (goal === undefined) {
+    return {
+      messages,
+      strategy: 'skipped',
+      foldedCount: 0,
+      usage: emptyUsage(),
+      usageSeen: false,
+      reason: 'empty history',
+    };
+  }
+
+  // Alignment invariant: the tail MUST start with an `assistant`
+  // message so tool_use → tool_result pairs stay intact. The
+  // harness loop produces [user_goal, assistant, user_tool_result,
+  // assistant, user_tool_result, ...]; a user_tool_result in the
+  // tail references a tool_use emitted by an assistant turn — if
+  // that assistant ended up in the middle (folded into the summary
+  // we're merging into the goal), the next provider call sees an
+  // orphan tool_result and rejects with 400.
+  //
+  // Walk back from the requested boundary to the nearest assistant.
+  // The summary is merged into the goal (user-role), so the resulting
+  // [wrappedGoal_user, tail_starts_with_assistant, ...] sequence has
+  // clean user→assistant→user alternation regardless of preserveTail
+  // parity. Over-preserving by one position when the boundary lands
+  // on a user is the price of correctness.
+  let tailStart = messages.length - safeTail;
+  while (tailStart > 1 && messages[tailStart]?.role !== 'assistant') {
+    tailStart -= 1;
+  }
+  if (tailStart < 1 || messages[tailStart]?.role !== 'assistant') {
+    // Pathological history shape — no assistant message between the
+    // goal and the requested tail. Refuse rather than emit a
+    // malformed prompt.
+    return {
+      messages,
+      strategy: 'skipped',
+      foldedCount: 0,
+      usage: emptyUsage(),
+      usageSeen: false,
+      reason: 'cannot align tail to assistant boundary',
+    };
+  }
+
+  const middle = messages.slice(1, tailStart);
+  if (middle.length === 0) {
+    return {
+      messages,
+      strategy: 'skipped',
+      foldedCount: 0,
+      usage: emptyUsage(),
+      usageSeen: false,
+      reason: 'no middle messages to fold after tail alignment',
+    };
+  }
+  const tailMessages = messages.slice(tailStart);
+
+  // Track usage from the attempt — populated even on the fallback
+  // path so callers can fold partial usage into session totals when
+  // the stream errored AFTER reporting tokens.
+  let attemptUsage: UsageInfo = emptyUsage();
+  let attemptUsageSeen = false;
+
+  // Try the LLM summary first.
+  try {
+    const attempt = await callSummaryProvider(provider, goal, middle, options);
+    attemptUsage = attempt.usage;
+    attemptUsageSeen = attempt.usageSeen;
+    if (attempt.errors.length > 0) {
+      const detail = attempt.errors.map((e) => `${e.code}: ${e.message}`).join('; ');
+      throw new Error(`compaction stream errored: ${detail}`);
+    }
+    if (attempt.text.length === 0) {
+      throw new Error('compaction produced empty summary');
+    }
+    return {
+      messages: [wrapGoalWithSummary(goal, attempt.text), ...tailMessages],
+      strategy: 'llm',
+      foldedCount: middle.length,
+      usage: attemptUsage,
+      usageSeen: attemptUsageSeen,
+    };
+  } catch (e) {
+    // If collectStep threw mid-iteration (CollectStepError), the
+    // partial CollectedStep is on the error — including usage that
+    // the adapter's `finally` block emitted before the stream
+    // failed. Recover so compaction's billed tokens still flow into
+    // session totals; without this, a failed compaction call gets
+    // billed by the provider but reported as zero-usage fallback.
+    if (e instanceof CollectStepError) {
+      attemptUsage = e.partial.usage;
+      attemptUsageSeen = e.partial.usageSeen;
+    }
+    // LLM path failed — apply deterministic elision so the run survives.
+    // The original tool_result bodies stay in the SQLite audit log;
+    // the model just sees pointers. Whatever usage we captured before
+    // the throw still flows through so the caller can charge for
+    // tokens the provider may already have billed.
+    //
+    // No synthetic note inserted between goal and middle: middle[0] is
+    // always assistant (post-alignment, slice(1, tailStart) starts at
+    // the first assistant turn). Wrapping the elided middle with an
+    // assistant-role note would emit `[user_goal, assistant_note,
+    // assistant_middle, ...]` — two consecutive assistants, which
+    // OpenAI's chat API rejects with 400 and Anthropic warns against.
+    // The strategy/reason/foldedCount info is already on the
+    // `compaction_finished` event for observability; the model only
+    // needs to see the pointers, which carry their own context.
+    const reason = e instanceof Error ? e.message || e.name : String(e);
+    const elided = fallbackCompact(middle);
+    return {
+      messages: [goal, ...elided, ...tailMessages],
+      strategy: 'fallback',
+      foldedCount: middle.length,
+      usage: attemptUsage,
+      usageSeen: attemptUsageSeen,
+      reason,
+    };
+  }
+};

@@ -16,7 +16,16 @@ describe('JSON renderer', () => {
       { type: 'step_start', stepN: 1 },
       {
         type: 'session_finished',
-        result: { status: 'done', reason: 'done', sessionId: 'abc', steps: 1, durationMs: 5 },
+        result: {
+          status: 'done',
+          reason: 'done',
+          sessionId: 'abc',
+          steps: 1,
+          durationMs: 5,
+          usage: { input: 10, output: 5, cache_read: 0, cache_creation: 0 },
+          costUsd: 0.0001,
+          usageComplete: true,
+        },
       },
     ];
     for (const e of events) renderer.onEvent(e);
@@ -26,6 +35,13 @@ describe('JSON renderer', () => {
       const parsed = JSON.parse(line) as { type: string };
       expect(typeof parsed.type).toBe('string');
     }
+    // session_finished line carries usage + cost so external consumers
+    // can read totals without re-querying the DB.
+    const finished = JSON.parse(lines[2] ?? '{}') as {
+      result: { usage: { input: number }; costUsd: number };
+    };
+    expect(finished.result.usage.input).toBe(10);
+    expect(finished.result.costUsd).toBe(0.0001);
   });
 
   test('preserves provider_event StreamEvent shape verbatim', () => {

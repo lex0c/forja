@@ -1,5 +1,5 @@
 import type { Decision, PermissionEngine } from '../permissions/index.ts';
-import type { Provider, StreamEvent } from '../providers/index.ts';
+import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
 import type { DB } from '../storage/index.ts';
 import type { ToolRegistry } from '../tools/index.ts';
 
@@ -25,6 +25,27 @@ export type HarnessEvent =
       failed: boolean;
       durationMs: number;
     }
+  | {
+      type: 'compaction_started';
+      // Token count that crossed the threshold — what we observed
+      // BEFORE the next request would have gone out.
+      promptTokens: number;
+      threshold: number;
+      contextWindow: number;
+    }
+  | {
+      type: 'compaction_finished';
+      strategy: 'llm' | 'fallback' | 'skipped';
+      foldedCount: number;
+      durationMs: number;
+      // Usage and cost the compaction call itself incurred. The
+      // summary call is a billed provider request — surfacing it
+      // here lets renderers show "session cost includes $X for
+      // compaction" instead of silently underreporting.
+      usage: UsageInfo;
+      costUsd: number;
+      reason?: string;
+    }
   | { type: 'session_finished'; result: HarnessResult };
 
 // Budget caps for an autonomous run. Per AGENTIC_CLI §5: every limit has
@@ -40,6 +61,19 @@ export interface RunBudget {
   // Cap on output tokens per provider call (passed straight through as
   // `max_tokens`). Not part of session-wide budget.
   maxOutputTokensPerCall: number;
+  // Fraction of `provider.capabilities.context_window` at which the
+  // harness triggers compaction. AGENTIC_CLI §6 / ORCHESTRATION §4.1
+  // recommend 0.7 — leaves 30% headroom for the compaction call
+  // itself plus the next response. Set to 1.0 to effectively disable.
+  compactionThreshold: number;
+  // Lower bound on trailing turns preserved literally during
+  // compaction. ORCHESTRATION §4.6 recommends 3. Effective preserved
+  // count may be `+1` because the compaction module aligns the tail
+  // boundary to an assistant message (keeps tool_use → tool_result
+  // pairs intact); when the requested boundary lands on a user the
+  // module walks back one position. preserveTail=0 still preserves
+  // the trailing assistant + its tool_result for the same reason.
+  compactionPreserveTail: number;
 }
 
 export const DEFAULT_BUDGET: RunBudget = {
@@ -48,6 +82,8 @@ export const DEFAULT_BUDGET: RunBudget = {
   maxToolErrors: 5,
   maxRepeatedToolHash: 3,
   maxOutputTokensPerCall: 4096,
+  compactionThreshold: 0.7,
+  compactionPreserveTail: 3,
 };
 
 // Why the loop stopped. `done` is the only success path; everything else
@@ -77,6 +113,29 @@ export interface HarnessConfig {
   // Synchronous observer for lifecycle events. Throws are caught and
   // discarded so a buggy renderer doesn't kill the loop.
   onEvent?: (event: HarnessEvent) => void;
+  // Plan mode (AGENTIC_CLI §5): read-only profile. The harness
+  // refuses tools with `metadata.writes === true` before
+  // execution — even if policy would have allowed it. This is
+  // harness-level, not policy-level, so write_file/edit_file
+  // are blocked regardless of permission hierarchy state.
+  //
+  // Tools that opt in via `metadata.planSafe` (boolean or
+  // predicate) MAY run in plan mode. The bash tool uses a
+  // predicate that gates on `args.read_only === true`. This
+  // gate is best-effort, NOT a security boundary: a model that
+  // declares read_only:true on a mutating command (observed
+  // with Haiku 4.5 sending `echo > file` with read_only:true)
+  // bypasses the gate. For adversarial protection, use sandbox
+  // (spec §9.1, M3+). For accidental-write protection from
+  // honest models, the predicate is sufficient.
+  planMode?: boolean;
+  // Sampling temperature passed straight through to every
+  // provider call this run makes. When unset, each provider
+  // applies its own default (Anthropic 1.0, OpenAI 1.0, etc).
+  // Setting `0` makes runs deterministic — required for evals
+  // and any workflow that needs repeatable output. Tunable per
+  // workflow per `TOKEN_TUNING.md`.
+  temperature?: number;
 }
 
 export interface HarnessResult {
@@ -85,6 +144,18 @@ export interface HarnessResult {
   sessionId: string;
   steps: number;
   durationMs: number;
+  // Aggregated token usage across all provider turns this run. Only
+  // turns that reported usage contribute; see `usageComplete`.
+  usage: UsageInfo;
+  // Total cost computed from `usage` × the provider's pricing. Same
+  // completeness caveat as `usage`.
+  costUsd: number;
+  // True iff every assistant turn this session emitted a `usage`
+  // event. False when at least one turn produced output but no usage
+  // (compat endpoints that drop stream_options, mid-stream failures,
+  // older SDKs without telemetry). Renderers should mark partial
+  // results as estimates so the user doesn't read the cost as final.
+  usageComplete: boolean;
   // Final assistant message id, if any was produced.
   lastMessageId?: string;
   // Optional human-readable detail for diagnostics (e.g., the provider

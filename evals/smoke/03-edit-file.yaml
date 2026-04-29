@@ -1,0 +1,14 @@
+name: edit existing file in place
+prompt: |
+  In greeting.txt, replace the word "hello" with "hi". Keep everything else unchanged.
+setup:
+  fixture: ../fixtures/greeting
+expect:
+  - tool_called: edit_file
+  - file_contains:
+      path: greeting.txt
+      pattern: hi world
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

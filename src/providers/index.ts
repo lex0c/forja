@@ -18,6 +18,7 @@ export type {
   StopReason,
   StreamEvent,
   ToolCallingMode,
+  UsageInfo,
 } from './types.ts';
 
 // Anthropic
@@ -52,3 +53,9 @@ export { registerOpenAIModels } from './openai/register.ts';
 // Registry
 export { createDefaultRegistry, createRegistry } from './registry.ts';
 export type { ModelEntry, ModelRegistry } from './registry.ts';
+
+// Cost / usage helpers
+export { addUsage, computeCost, emptyUsage } from './cost.ts';
+
+// Token estimation
+export { estimateMessagesTokens, estimatePromptTokens } from './tokens.ts';

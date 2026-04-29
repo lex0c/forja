@@ -15,6 +15,1301 @@ Format:
 
 ---
 
+## [2026-04-28] M2 / Step 6.5 — Plan-mode bash gate: limit found, scope honest
+
+A code-review observation (`bash` marked `planSafe: true` could
+silently allow `echo x > file` in plan mode) led to a fix: turn
+`planSafe` into a predicate that requires `args.read_only === true`.
+A negative smoke case written to verify the fix promptly proved
+the predicate is **insufficient**: Haiku 4.5 in plan mode sent
+`{ command: "echo \"should-not-write\" > exfil.txt", read_only: true }`
+and the harness gate accepted because the model declared intent.
+File got written.
+
+This entry records both the fix that landed AND the limit it
+hits, so future hardening doesn't repeat the same false-confidence
+pattern.
+
+**Done (the fix):**
+
+- `ToolMetadata.planSafe` extended from `boolean` to
+  `boolean | ((args: Record<string, unknown>) => boolean)`.
+  Predicate form lets each tool author encode per-call intent
+  validation. Predicate that throws fails closed; strict
+  `=== true` rejects truthy-but-not-true values.
+- `bash` switched from `planSafe: true` to
+  `planSafe: (args) => args.read_only === true`. Model must
+  declare intent on every plan-mode bash call.
+- Plan-mode system prompt updated with explicit instruction:
+  "bash MUST set `read_only: true` on every call. Bash without
+  it is blocked the same way write_file is. Do not pipe to files,
+  use redirects (`>`, `>>`, `tee`), or run mutating subcommands."
+- Deny reason and model-facing message tailored: predicate
+  failure says "add `read_only: true` to args, retry";
+  unconditional block says "describe in plan instead".
+- Audit trail preserved (tool_call + denied approval row).
+- Unit tests: 4 new in `tests/harness/invoke-tool.test.ts`
+  (predicate allows on satisfy, blocks on miss, strict equality
+  for truthy values, fail-closed on throw).
+- New eval expectation kind `tool_denied: <toolname>` —
+  general-purpose, asserts the tool was invoked AND a deny
+  decision fired (catches regressions where a guard silently
+  starts allowing what it was meant to block). Uses
+  `tool_decided` events; correlates by toolUseId.
+- New `tool_denied` expectation kind (general-purpose; useful
+  for future negative cases across permissions/hooks/MCP).
+
+**Done (the honesty):**
+
+- `ToolMetadata.planSafe` and `HarnessConfig.planMode` JSDoc
+  rewritten to be explicit: predicate form is best-effort, not
+  a security boundary; `writes: true` + omitted predicate is
+  bullet-proof. Documents the observed Haiku failure inline so
+  future contributors see the concrete failure mode, not just a
+  caveat.
+
+**Cut (two iterations of overreach):**
+
+1. **First attempt** — `09-plan-mode-bash-write-blocked.yaml`:
+   asserted the bash predicate catches mutating commands.
+   Failed under Haiku immediately (model sent
+   `{ command: "echo > exfil.txt", read_only: true }`,
+   gate accepted, file written). Predicate is best-effort,
+   not security. Removed; documented as the motivating
+   evidence for the JSDoc honesty pass.
+2. **Second attempt** — `09-plan-mode-write-tool-denied.yaml`:
+   pivoted to the bullet-proof gate (write_file with no
+   predicate, unconditional deny). Passed 3/3 on Haiku.
+   Failed 0/3 on gpt-4o-mini — different mechanism: GPT
+   reads the plan-mode system prompt's "write_file is
+   BLOCKED" instruction and **preempts by never invoking
+   write_file at all**. The case asserts `tool_denied:
+   write_file`, which fails with "never invoked" because
+   no call ever happened. Both behaviors are aligned;
+   neither is wrong; the case can't reliably distinguish
+   "gate fired" from "model preempted" across providers.
+   Removed.
+
+**The lesson:** smoke can verify what models reliably DO
+(read files, write when allowed, produce plan markdown,
+trigger compaction). Smoke cannot reliably verify what the
+HARNESS would do if the model tried something it shouldn't,
+because aligned models defensively skip. Gate-firing is
+covered by unit tests with mock providers
+(`tests/harness/invoke-tool.test.ts`); attempting integration
+verification of denial paths confuses unit-level assertions
+with integration-level reality.
+
+**Decisions:**
+
+- **Don't try to shell-parse bash commands for write intent.**
+  Considered adding redirect-detection (`>`, `>>`, `tee`) +
+  mutator-list (`rm`, `mv`, `cp`, `git commit`, etc.) as
+  defense-in-depth. Rejected: shell escapes (`bash -c '…'`,
+  here-docs, `eval`, `\>`) make any pattern match incomplete,
+  and incomplete protection that LOOKS thorough is worse than
+  no protection — operators trust it. Spec ANTI_PATTERNS likely
+  flags this class. Sandbox (M3+) is the right answer.
+- **Keep the predicate fix despite its limit.** It still
+  catches the honest-but-forgetful case (model omits
+  `read_only`, gate denies, model retries with the flag). Real
+  value, even if not security. Removing it would mean
+  `planSafe: true` lets `echo > file` through with NO friction
+  at all.
+- **No negative smoke case for plan mode.** Both attempts at
+  one (bash predicate, write_file gate) failed for different
+  reasons that ultimately point at the same root: smoke is a
+  model-behavior test, not a harness-behavior test. The gate
+  itself is unit-tested with mock providers and proven correct
+  in isolation. Mixing the two layers — using a real-model
+  case to assert harness-internal behavior — produces a test
+  that's fragile by construction.
+- **Don't cross §6.3 step boundary numbering.** Skipping 6.4
+  intentionally — this entry is the followup that 6.3's review
+  surfaced. Keeping it as 6.5 leaves room for 6.4 if a parallel
+  hardening lands later from another review pass.
+
+**Risks documented for M3:**
+
+- Plan mode + bash is "best-effort no writes" until sandbox.
+  Any operator running plan mode against untrusted prompts (CI
+  bot, shared-secret input) should assume bash CAN write and
+  rely on policy + sandbox layers, not plan-mode messaging.
+- The honest model failure mode (`read_only: true` on a
+  redirect) suggests the system prompt instruction isn't always
+  followed even by aligned models. A constrained generation
+  layer (M5+) that schema-validates `read_only` against
+  command structure could close this without shell parsing —
+  worth revisiting when constrained backend lands.
+- New `tool_denied` expectation is the building block for any
+  future negative case across the eval surface (permission
+  denies, hook denies, future MCP denies). Lives ready in
+  M3.
+
+**Spec reference:** `AGENTIC_CLI.md §5` (plan mode), `§5.1`
+("bash com efeito" — confirms policy/sandbox govern destructive
+bash, not plan profile alone), `§9.1` (sandbox / trust).
+
+---
+
+## [2026-04-28] M2 / Step 6.3 — Multi-provider baseline (OpenAI)
+
+After Step 6.2 the Anthropic baseline was solid but the
+"provider-pluggable" claim still rested on argument: only
+Anthropic had ever round-tripped end-to-end. Step 6.3 runs the
+same smoke suite against `openai/gpt-4o-mini` to convert
+"adapter has unit coverage" into "adapter has been observed
+under load."
+
+**Done:**
+
+- 3× baseline against `openai/gpt-4o-mini` with `temperature: 0`.
+  No code changes required to the adapter — it worked
+  end-to-end on first run (no equivalent of the
+  `tool_result.name` Anthropic bug). Multi-tool-use parallel
+  dispatch, compaction with `strategy: llm`, plan mode, and
+  permission gating all behaved correctly.
+- Rewrote `evals/smoke/07-bash-readonly.yaml`. The previous
+  assertion `output_contains: "hello world"` was testing **a
+  property of the model** (whether it cited bash output back
+  in its summary) rather than a property of the harness.
+  Haiku happened to do so; gpt-4o-mini in plan mode produced
+  only the structured plan markdown without echoing the bash
+  output. Replaced with `output_contains: "# Plan"` —
+  asserts that the plan-mode system prompt was honored, which
+  is what the case actually wants to validate. Tool dispatch
+  invariants (`tool_called: bash`, `tool_not_called:
+  write_file`, `tool_not_called: edit_file`) carry the rest
+  of the assertion weight.
+
+**Real-model 3× baselines (head-to-head):**
+
+| Metric | Haiku 4.5 | gpt-4o-mini |
+|---|---|---|
+| Pass rate | 24/24 (100%) | 24/24 (100%) |
+| Total cost (3 rounds) | $0.1515 | $0.0096 |
+| p50 cost / case | $0.0050 | $0.0002 |
+| Wall clock (3 rounds) | 88s | 92s |
+| Cases with cost variance | 2/8 | 0/8 |
+| Compaction strategy | llm | llm |
+
+**Decisions:**
+
+- **Case 07 fix is honest, not gaming.** Important to be
+  explicit about this. The prior assertion only passed
+  against Anthropic because of how Haiku interprets plan
+  mode's "PROPOSE a plan" instruction in tension with the
+  user's "report what you saw." gpt-4o-mini reads the
+  system prompt as authoritative and produces only the
+  plan, never citing bash output. Both behaviors are valid;
+  the test should validate the harness invariant (bash
+  invoked, writes blocked, plan markdown produced), not
+  which interpretation the model picks. Documenting this
+  here so a future contributor doesn't "fix" the case back
+  to the brittle form.
+- **gpt-4o-mini's perfect variance is suspicious.** OpenAI
+  documents that `temperature: 0` doesn't guarantee 100%
+  determinism (load balancing across infrastructure can
+  produce minor variations). Today's 0/8 cases-with-spread
+  result is consistent with documented behavior **for this
+  prompt size and time window** but should not be assumed
+  permanent. A weekly run against the same baseline would
+  tell us whether the determinism holds or whether OpenAI's
+  stack drifts day-to-day.
+- **No registry expansion to gpt-5.x family.** The user's
+  pricing audit covered gpt-5.x; the registry today only
+  has gpt-4o and gpt-4o-mini. Adding gpt-5.x is a feature
+  expansion (new defaults, new capability declarations,
+  spec PR against PROVIDERS.md §5) — out of scope for
+  hardening. Tracked implicitly: the next time someone
+  needs gpt-5.x, the doc trail is in the conversation that
+  produced this baseline.
+- **No Google/Gemini run yet.** Same gating logic as the
+  gpt-5.x decision: registry comments admit Gemini pricing
+  is illustrative ("not committed real Gemini prices").
+  Running smoke against Gemini today would test the
+  adapter's wire shape against fake pricing, conflating
+  two issues. Bundle Gemini with the pricing/spec update
+  in M3.
+
+**What this validates:**
+
+- The OpenAI tool-call ↔ tool-result split (`role: 'tool'` 
+  with `tool_call_id`) round-trips correctly through our
+  canonical `ProviderToolResultBlock`.
+- `temperature: 0` is forwarded to OpenAI's
+  `chat.completions.create` and applied (output is
+  reproducible for this suite size).
+- `stream_options: { include_usage: true }` reaches the
+  endpoint and the final usage chunk is consumed by the
+  normalizer (`usageComplete: true` on every run).
+- `parallel_tool_calls` defaults work — gpt-4o-mini does
+  emit multiple tool_calls per turn in case 08 (compaction
+  case reads 5 files in parallel) and the dispatch layer
+  handles them.
+- Compaction's LLM-summary call works against OpenAI's API
+  shape (no Anthropic-specific assumptions in the
+  compaction module's prompt construction).
+- Cost computation lines up: gpt-4o-mini at $0.15/M input
+  and $0.60/M output produces case-08 costs around
+  $0.00125 — consistent with ~5k input tokens + ~500
+  output tokens × the corrected pricing.
+
+**Risks not addressed:**
+
+- Single-day baseline. Same caveat as Anthropic — needs
+  weekly recurrence in CI to detect provider drift.
+- Single host (Linux) on one residential network. OpenAI's
+  rate-limit and geo-routing behavior could vary by
+  origin.
+- gpt-4o-mini doesn't expose controllable prompt cache
+  (declared `cache: 'client_only'`); we're paying full
+  input cost every round. If the registry later gains
+  gpt-5.x with `cache: 'server_5min'`-equivalent semantics,
+  caching cases would need re-baselined.
+
+**M2 status: closed with multi-provider evidence.** Smoke
+suite passes 24/24 against two independent provider
+adapters with cost ratio matching public pricing. The
+"provider-pluggable" claim now has measurement, not just
+spec text.
+
+**Next:** M3 (subagents + worktree + MCP + resume +
+checkpoints + /undo + bash_background + todo_write +
+Repo Map). Provider expansion (gpt-5.x, real Gemini
+pricing) lives there alongside the spec PR for PROVIDERS.md.
+
+---
+
+## [2026-04-28] M2 / Step 6.2 — Variance baseline (smoke ×3)
+
+After Step 6.1 closed the compaction gap, the remaining
+hardening question was: **is the baseline stable, or did we
+just get lucky in run #1?** Step 6.2 turns "ran once, all
+green" into "ran 3 times, all green with ≤ 3% cost spread."
+That converts the smoke from "first runnable" to "trusted
+baseline."
+
+**Done:**
+
+- `--repeat N` flag on `bun run eval:smoke`. Round-major
+  ordering (every case once per round, repeat). Choosing
+  round-major over case-major intentionally: matches how real
+  CI traffic would arrive, lets prompt-cache hits manifest
+  the way they would in production. Case-major would understate
+  cost by serving back-to-back identical prompts to a cold
+  cache.
+- Per-case aggregation in the runner: `eval_case_aggregate`
+  NDJSON line per case (passCount, failCount, costMin, costMax,
+  costAvg, duration range). `eval_case` lines now carry `run`
+  and `totalRuns` fields when `--repeat > 1` so consumers can
+  re-aggregate however they want.
+- Stderr summary grew a "per-case stability" block listing
+  N/M passes and cost range per case, with a `!` flag on any
+  case that didn't pass every round. Mirrors what a CI
+  dashboard would show after a regression run.
+
+**Real-model 3× baseline (Haiku 4.5):**
+
+```
+24/24 passed (100.0%) — total $0.1515, 88348ms
+p50 cost: $0.0050
+
+per-case stability:
+    3/3  $0.0034–$0.0034  read file and report contents
+    3/3  $0.0036–$0.0036  create file with specified content
+    3/3  $0.0059–$0.0059  edit existing file in place
+    3/3  $0.0060–$0.0060  grep search and report matches
+    3/3  $0.0066–$0.0068  plan mode blocks file mutations
+    3/3  $0.0035–$0.0035  glob enumerates typescript files
+    3/3  $0.0041–$0.0041  bash runs read-only inspection in plan mode
+    3/3  $0.0173–$0.0174  compaction triggers and folds history
+```
+
+24/24 = perfect stability. Six of eight cases produced
+**identical cost to the cent** across all three rounds —
+output is fully deterministic at `temperature: 0` and token
+counts reproduce exactly. The two cases with non-zero spread
+(plan mode at ~3%, compaction at <1%) are the runs with the
+longest/most-variable assistant text; the variance is at the
+cache_creation tier, not the output tier. Cost stayed inside
+case budgets every run.
+
+**Decisions:**
+
+- **Round-major, not case-major.** Production traffic isn't
+  back-to-back identical prompts; spreading rounds out
+  exercises cache eviction and warm-cache hit/miss patterns
+  closer to real conditions. The pricing implication is real:
+  case-major against Anthropic's 5-min cache would inflate
+  apparent stability while understating cost.
+- **Strict pass: every round must pass.** Considered "majority
+  rules" (case passes if 2/3 rounds pass). Rejected: a single
+  failure in a determinism-asserted suite is signal, not
+  noise. With temperature 0, a flake means a real bug
+  somewhere — adapter, cache, harness state leak. Hiding
+  flakes behind a tolerance defeats the purpose of running
+  3×.
+- **Skipped negative-path eval cases** (`strategy: fallback`,
+  `exit_reason: aborted`). Both paths already have substantial
+  unit coverage: `tests/harness/compaction.test.ts` has 11
+  fallback assertions (network failure, schema fail, abort
+  during summary call); `tests/harness/loop.test.ts` covers
+  signal-aborted, abort-during-stream, and the
+  wall-clock-vs-aborted distinction. Adding eval-level cases
+  would be redundant and would require either a deliberately
+  broken model id (operationally awkward) or per-case
+  timeout-trigger logic (false-positive prone).
+- **No CI gate yet, despite the runner being CI-ready.**
+  CI promotion needs a secret, a per-PR cost decision, and a
+  golden baseline to gate against. Worth doing in M3 alongside
+  multi-provider smoke; doing it now would block merges before
+  the baseline has settled past Step 6.
+
+**What this validates beyond Step 6.1:**
+
+- `temperature: 0` actually flows end-to-end through
+  `BootstrapInput.temperature` → `HarnessConfig.temperature`
+  → `GenerateRequest.temperature` and into the Anthropic API.
+  If any leg dropped the field, output would have varied
+  across rounds.
+- The compaction LLM call is itself deterministic at
+  temperature 0 (otherwise case 08 would show meaningful
+  cost variance, not <1%).
+- Multi-tool-use turns (Haiku does parallel tool_use)
+  reproduce identically across rounds. Tool ordering, args,
+  and result handling are stable — no race conditions in
+  the tool dispatch layer.
+- Prompt-cache misses are consistent. We don't currently
+  emit `cache_control` on messages, so every round pays full
+  input cost; the consistency of that cost confirms message
+  shape is byte-identical round-to-round.
+
+**Risks not addressed:**
+
+- Single-day baseline. Could re-run weekly to detect provider
+  drift (model serving the same id but with subtle behavior
+  changes is a real Anthropic operational pattern). Schedule
+  this once CI gating exists.
+- Single API key. Different keys could hit different load
+  shedders and produce different latency/cost; cost shouldn't
+  vary materially, latency might.
+- Single host (Linux). Fixture I/O is sync and small enough
+  that the FS shouldn't matter, but never been validated on
+  macOS or Windows.
+
+**M2 status: closed with confidence.** Step 6 closed the
+"runs at all" question; Step 6.1 closed the "compaction
+works" question; Step 6.2 closed the "is it actually stable"
+question. Further smoke surface (multi-provider, regression
+tier) lives in M3+.
+
+**Next:** M3 (subagents + worktree + MCP + resume + checkpoints
++ /undo + bash_background + todo_write + Repo Map). The smoke
+suite is now genuinely the gate it claimed to be.
+
+---
+
+## [2026-04-28] M2 / Step 6.1 — Compaction smoke coverage
+
+Step 6 baseline closed M2 but flagged compaction as a blind spot:
+unit-tested in isolation, never exercised end-to-end against a
+real model. The post-baseline review explicitly called this out
+("compaction has unit coverage but no real-model exercise").
+Step 6.1 closes that gap before M3 starts.
+
+**Done:**
+
+- `EvalBudget` now exposes `compactionThreshold` and
+  `compactionPreserveTail`. Loader validates both
+  (`compactionThreshold` ∈ (0, 1]; `compactionPreserveTail` ≥ 0
+  integer). Cases can drop the trigger ratio so compaction fires
+  with small fixtures instead of needing 140k-token prompts.
+- New `compaction_triggered` expectation kind. Schema:
+  `compaction_triggered: { min_count: N, strategy?: 'llm' |
+  'fallback' | 'skipped' }`. Executor watches
+  `compaction_finished` events on the harness onEvent stream
+  and counts emissions per strategy. Asserting `strategy: llm`
+  means the compaction LLM call actually round-tripped — without
+  that distinction, a silent fallback would mask an adapter
+  break.
+- Executor plumbs the full `EvalBudget` into `BootstrapInput.budget`
+  (previously only `maxSteps` got through). All four knobs flow
+  cleanly to `HarnessConfig.budget` via the existing partial
+  override path.
+- `evals/fixtures/chunky-modules/src/{a,b,c,d,e}.ts` — five
+  ~700–850 token TypeScript modules, each importing from
+  `forja-core/*`. Realistic-looking source so the model treats
+  them as plausible code rather than lorem ipsum.
+- `evals/smoke/08-compaction-triggers.yaml` — 5-step read tour
+  with `compactionThreshold: 0.02`. Asserts `tool_called: read_file`,
+  `compaction_triggered: { strategy: llm, min_count: 1 }`,
+  `status: done`, `output_contains: forja-core`.
+- `biome.json` — added `evals/fixtures` to ignore list.
+  Fixtures are mock source code intentionally loose; lint rules
+  shouldn't apply.
+- Loader unit tests: 7 new tests covering compaction budget
+  validation (range checks for `compactionThreshold`,
+  non-negative integer for `compactionPreserveTail`) and
+  `compaction_triggered` parsing (with/without strategy,
+  `min_count` validation, strategy enum validation).
+
+**Real-model baseline (Haiku 4.5):**
+
+| # | Case | Pass | Cost | Steps |
+|---|---|---|---|---|
+| 01 | read file | ✓ | $0.0035 | 2 |
+| 02 | create file | ✓ | $0.0036 | 2 |
+| 03 | edit file | ✓ | $0.0059 | 3 |
+| 04 | grep search | ✓ | $0.0059 | 3 |
+| 05 | plan mode blocks write | ✓ | $0.0066 | 2 |
+| 06 | glob enumerate | ✓ | $0.0035 | 2 |
+| 07 | bash readonly in plan | ✓ | $0.0041 | 2 |
+| 08 | **compaction triggers** | ✓ | $0.0174 | 3 |
+
+8/8 passed = 100%, total $0.0505, p50 $0.0050, 30s wall clock.
+Compaction fired with `strategy: llm` (LLM call to summarize
+folded turns succeeded) — first observation of this path
+end-to-end. The compaction case is the most expensive
+(~$0.017) because it pays for the summary call on top of the
+agent turns; still ~12× under the §18 per-case budget.
+
+**Decisions:**
+
+- **Assert `strategy: llm` explicitly, not just `min_count`.**
+  The harness emits `compaction_finished` regardless of which
+  branch ran. A silent fallback (LLM call broken, deterministic
+  head/tail kicks in) would still satisfy `min_count: 1`. The
+  whole reason this case exists is to prove the LLM-summary
+  path round-trips. Asserting strategy makes the case fail
+  loudly if the adapter regresses again.
+- **Threshold 0.02 (2% of 200k = 4k tokens), not 0.7.** Default
+  threshold needs ~140k tokens to fire — would require massive
+  fixtures and burn budget. 0.02 trips after 3-4 reads of the
+  chunky fixtures, well within the maxSteps cap.
+- **Five fixtures, not three.** Three would trigger compaction
+  on Haiku's parallel tool_use (model often reads multiple
+  files in one step) but leave little headroom for the
+  post-compaction summary turn. Five gives the run room to
+  show that compaction folded history AND the agent kept
+  working with the compacted context.
+- **Fixture source is plausible TypeScript, not lorem ipsum.**
+  The model is more likely to engage with code-shaped content
+  the way it would in production. Lorem ipsum could mask
+  shape-related bugs (e.g., a sanitizer that mishandles import
+  statements).
+- **Biome ignores `evals/fixtures`.** Fixtures simulate real
+  source for the model; they reference fictional symbols
+  (`forja-core/*`), have unused imports for shape verisimilitude,
+  and use non-null assertions where the simulated logic asks
+  for it. Linting them adds zero value and creates churn.
+
+**What this validates beyond unit tests:**
+
+- Compaction trigger arithmetic (`estimatePromptTokens` against
+  the real provider tool-def and message shapes).
+- Tail alignment to assistant boundary survives a real
+  multi-tool-use turn (Haiku does parallel tool_use; the tail
+  must still land on a coherent boundary).
+- The compaction LLM call's prompt is well-formed for the
+  Anthropic adapter (would have caught the `tool_result.name`
+  leak again if it had regressed).
+- Cost accounting folds compaction's own usage into the
+  session total (`usageComplete: true` and totals add up).
+- Post-compaction context is sufficient for the agent to
+  produce a coherent answer (the model still mentioned
+  `forja-core` after compaction — the goal survived the fold).
+
+**Not yet validated (deferred to M3):**
+
+- Compaction with a deliberately broken LLM model id —
+  exercises the fallback path.
+- Multiple compactions in a single session (history grows
+  past threshold twice). Today's case only fires once.
+- Compaction observability under
+  `cumulative_growth_strip` — whether prior `[compacted_history]`
+  blocks are stripped correctly when re-compacting.
+
+**Next:** M3 (subagents + worktree + MCP + resume + checkpoints
++ /undo + bash_background + todo_write + Repo Map). The smoke
+suite is now genuinely defending M2's surface; the compaction
+gap is closed.
+
+---
+
+## [2026-04-28] M2 — exit baseline (smoke run on Haiku 4.5)
+
+First end-to-end smoke run against `anthropic/claude-haiku-4-5`
+after Step 6 landed. The point: confirm the M2 exit criterion
+(§18 — `pass-rate ≥ 85% smoke, p50 < $0.20/task` for the
+autonomous profile) is met and surface any blocking bugs the
+unit tests missed.
+
+**Result:** 6/7 passed = 85.7% pass-rate, p50 $0.0009/case,
+total $0.0075 across the suite, 16.8s wall clock.
+
+**Cases:**
+
+| # | Case | Pass | Cost | Steps |
+|---|---|---|---|---|
+| 01 | read file and report contents | ✓ | $0.0009 | 2 |
+| 02 | create file with specified content | ✓ | $0.0009 | 2 |
+| 03 | edit existing file in place | ✓ | $0.0015 | 3 |
+| 04 | grep search and report matches | ✓ | $0.0015 | 3 |
+| 05 | plan mode blocks file mutations | ✗ | $0.0008 | 1 |
+| 06 | glob enumerates typescript files | ✓ | $0.0009 | 2 |
+| 07 | bash runs read-only inspection in plan mode | ✓ | $0.0011 | 2 |
+
+Case 05 failed only the `output_contains: "Plan"` assertion. The
+security-critical `file_not_exists: should-not-exist.txt` PASSED
+— plan-mode block worked, no leak. The model produced a
+summary but didn't include the literal string "Plan" in its
+output, which is a fragile keyword. The plan-mode prompt's
+Goal/Steps/Risks structure is what we should assert against;
+"Plan" the word is a proxy that doesn't always match. M3 will
+rewrite case 05 against the spec's plan YAML schema once
+`generateConstrained` lands and the plan markdown stops being
+a free-form output.
+
+**Bugs surfaced and fixed during the baseline:**
+
+1. **Anthropic adapter dropped tool_result blocks with `name`.**
+   Our canonical `ProviderToolResultBlock` keeps `name` as
+   optional metadata for Gemini (which correlates results to
+   calls by name). Anthropic accepts only `tool_use_id`,
+   `content`, `is_error` and 400s with
+   `messages.N.content.0.tool_result.name: Extra inputs are
+   not permitted` if anything else leaks through. Every
+   multi-turn run that returned a tool_result was dying on the
+   second model call. The unit tests didn't catch it because
+   the mock provider doesn't validate the request body.
+   Fixed in `src/providers/anthropic/index.ts` —
+   `stripToolResultName` rewrites the block before sending.
+2. **Cost computation off by 1000x.** Registry pricing values
+   are dollars-per-million (Anthropic / OpenAI / Google all
+   publish in $/M); the field name `cost_per_1k_*` and the
+   divisor in `computeCost` were per-1k. Result: every cost
+   number was 1000x too high. Inflated costs masked
+   themselves in unit tests because tests use small token
+   counts and asserted against the inflated values. Surfaced
+   here because case 01 reported $0.45 for what was really
+   $0.00045. Fixed in `src/providers/cost.ts` (divisor →
+   1_000_000); test expectations updated. Field rename
+   (`_1k_*` → `_1m_*`) deferred to `docs/TODO.md` per spec-PR
+   discipline.
+
+**Decisions:**
+
+- **`output_contains` is the right primitive but case 05 used
+  the wrong keyword.** The full plan YAML schema (Goal/Scope/
+  Steps/Risks/Assumptions) lands when we have constrained
+  generation in M5; until then asserting against free-form
+  markdown is brittle. Leaving the failure visible documents
+  the gap.
+- **Don't game pass-rate by tweaking case 05.** 6/7 hits the
+  spec criterion; lowering the assertion to make 7/7 would
+  defeat the criterion's purpose. The case stays as-is and the
+  85.7% gets reported truthfully.
+- **Both bugs have a unit-test gap.** Mock providers in
+  `tests/providers/anthropic/` don't validate against the real
+  SDK shape, so the `name`-leak passed unit tests for months.
+  Cost test used the same wrong unit assumption as the
+  registry, so the 1000x error reinforced itself. Both are now
+  protected by the smoke run; consider adding a contract test
+  that POSTs a recorded-fixture request to a local mock that
+  replays the real Anthropic schema validation. Deferred —
+  smoke covers it for now.
+
+**M2 status: closed.** Exit criterion (§18) met. Step 1–6 all
+in. Next: M3 (subagents + worktree + MCP + resume + checkpoints
++ `/undo` + `bash_background` + `todo_write` + Repo Map).
+
+---
+
+## [2026-04-28] M2 / Step 6 — Eval smoke harness (closes M2)
+
+`AGENTIC_CLI §16` says "sem eval, nada disso importa." Step 6
+ships the smoke tier: 5–10 fixed cases, executor that wraps
+`runAgent` against a real model, asserts declarative
+expectations, aggregates pass-rate + p50 cost. The exit criterion
+for the autonomous profile (§18) is `pass-rate ≥ 85% smoke,
+p50 < $0.20/task`; the harness is what measures it.
+
+**Done:**
+- `src/evals/types.ts` — `EvalCase`, `EvalExpectation` (8 kinds:
+  `tool_called`, `tool_not_called`, `file_exists`,
+  `file_not_exists`, `file_contains`, `status`, `exit_reason`,
+  `output_contains`), `EvalCaseResult`, `EvalSummary`. The
+  expectation set covers M2's surface: tool tracking (telemetry),
+  fs effects (writes/edits), final state (status/exit_reason),
+  output (plan-mode markdown / report shape).
+- `src/evals/loader.ts` — YAML parser with the same
+  reject-unknown-keys discipline as the policy parser. Typo like
+  `expects` (plural) or `tests_pass` (unknown kind) errors out
+  loudly instead of silently dropping the assertion. Status and
+  exit_reason values validated against fixed unions.
+- `src/evals/executor.ts` — `executeCase`:
+  1. mkdtemp → copy `setup.fixture` → write `setup.files` →
+     drop a default `.agent/permissions.yaml` with
+     `defaults.mode: bypass` if neither layer supplied one (evals
+     run autonomously, no operator to confirm; plan-mode block
+     stays at the harness layer regardless).
+  2. `bootstrap` with disabled enterprise/user policy paths
+     (cwd-only project policy) and a per-case `AbortController`
+     chained to the parent signal + a 60s timer.
+  3. `runAgent` with `onEvent` hooked to record `tool_invoking`
+     names and accumulate `text_delta` into a single output
+     string. Cleanup of the cwd happens AFTER expectation
+     evaluation so `file_*` checks see the post-run filesystem.
+  4. `summarize` aggregates pass-rate, total cost, p50 cost.
+- `src/evals/cli.ts` — `bun run src/evals/cli.ts <dir|file>`.
+  Discovers `*.yaml` under a directory, runs cases sequentially,
+  emits NDJSON per case + final summary on stdout, human progress
+  on stderr (matches the spec §2.2 stdout-pure invariant).
+  Returns 0 on full pass, 1 on any fail. Flags: `--model` (smoke
+  defaults to whatever bootstrap default is), `--timeout-ms` per
+  case.
+- `package.json` — `eval:smoke` script wired to `evals/smoke`.
+- `evals/smoke/*.yaml` — 7 cases:
+  - `01-read-file` (read_file + output_contains the secret)
+  - `02-create-file` (write_file + file_contains)
+  - `03-edit-file` (edit_file on a fixture)
+  - `04-grep-search` (grep with multi-file fixture)
+  - `05-plan-mode-blocks-write` (plan + file_not_exists +
+    output_contains "Plan")
+  - `06-glob-search` (glob enumerates ts files)
+  - `07-bash-readonly` (plan mode + bash with `head -n 1`,
+    asserts plan-mode allows read-only bash via `planSafe`)
+- `evals/fixtures/` — three reusable fixture trees referenced by
+  the smoke cases.
+- `tests/evals/loader.test.ts` + `tests/evals/executor.test.ts`
+  — unit coverage with mock providers. 23 tests covering all
+  expectation kinds, schema rejection paths, fixture/inline-file
+  setup, plan-mode block behavior, and summary aggregation.
+
+**Decisions:**
+
+- **Real-model smoke is local-only for now, not CI.** Running
+  smoke on every PR means an `ANTHROPIC_API_KEY` secret + real
+  spend per PR and rate-limit pressure. The harness is ready for
+  CI; promoting it waits until we have a baseline pass-rate from
+  local runs and a budget envelope. Spec §16 calls for "roda em
+  CI" — the cost gate is a dial, not a refusal.
+- **Default policy is `bypass`, not `acceptEdits`.** Evals are
+  autonomous tests; no human is there to answer prompts. Strict
+  mode would dead-end every read_file/write_file/bash on the
+  default-deny path. `acceptEdits` still default-denies unmatched
+  paths — needs explicit allow rules per case. `bypass` is the
+  right semantic for a smoke run; cases that want stricter
+  policy drop their own `.agent/permissions.yaml` via setup.
+  Plan mode stays orthogonal — it's a harness-layer block,
+  unaffected by `bypass`.
+- **8 expectation kinds, not the spec's `tests_pass`/
+  `todo_used`.** `tests_pass` requires a test runner orchestrated
+  inside the eval cwd; `todo_used` requires the `todo_write` tool
+  (M3 per spec §18). Both deliberately deferred; the 8 we
+  implemented cover M2's surface end-to-end.
+- **Sequential execution, not parallel.** Each case opens its
+  own SQLite DB inside its tmpdir, so concurrency is technically
+  safe — but smoke is small (7 cases), parallel would make
+  per-case cost prints interleave on stderr, and rate-limit
+  pressure on a single API key is easier to reason about
+  serially. Promote to parallel when bench tier (~500 cases)
+  forces the issue.
+- **Cleanup order matters for file_* assertions.** First version
+  used a single `try { … } finally { rmSync(cwd) }` — and
+  every `file_exists` assertion failed because cleanup ran
+  before evaluation. Fixed by splitting: harness-cleanup
+  (close DB, clear timer) in the inner finally, expectation
+  evaluation immediately after, fs-cleanup last. Tests around
+  `setup.files`/`setup.fixture` lock the order in.
+- **Per-case YAML schema mirrors spec §16 with omissions
+  explicit.** We support `setup.fixture`, `setup.files`,
+  `prompt`, `expect`, `budget.maxSteps`, `budget.maxCostUsd`,
+  `plan`. Spec also lists `tests_pass` and `todo_used` — those
+  are valid YAML keys today (would parse) but will be rejected
+  as unknown-kinds because `EXPECTATION_KEYS` doesn't list them.
+  When M3 lands `todo_write` and a test-runner integration, add
+  the kinds + assertions.
+- **NDJSON on stdout, summary on stdout too.** The spec says
+  stdout is for machine output. The summary line is also
+  machine-consumable (`type: 'eval_summary'`); putting it on
+  stdout means a `bun run eval:smoke | jq` pipeline gets both
+  per-case and aggregate without parsing stderr. Human-readable
+  summary lives on stderr alongside per-case progress.
+
+**Pending (deferred to later milestones):**
+
+- **CI integration.** Spec §16 wants "regrediu? PR bloqueado" —
+  needs the smoke baseline + the secret + a CI workflow file.
+  Schedule: after the first successful local smoke baseline.
+- **Regression tier (~100 cases, < 10min).** Spec §16 says
+  "todo PR." Authoring 100 cases is substantial and pre-supposes
+  M3 features (todo_write, hooks). Land alongside M3.
+- **Bench tier (~500 cases, weekly).** Same concern + multi-
+  model comparison matrix per spec §16/PROVIDERS §7.
+- **Multi-model first-class.** Today the runner takes a single
+  `--model` flag. Multi-model eval is required for
+  "provider-pluggable, não provider-parity" — needs per-tier
+  threshold config, matrix output, and per-model registry
+  pricing. M3+ alongside the second provider's stabilization.
+- **Golden traces.** Spec calls for "comparação contra golden
+  traces versionados." Pure-output assertions (output_contains)
+  cover 80% of the value; full trace diffing waits until we
+  have a stable serialization (likely M3+).
+
+**Next (M2 closure):**
+
+- M2 goal — "Robustez" — is structurally complete. Step 1
+  (telemetry), Step 2 (compaction), Step 3 (sanitize), Step 4
+  (permission hierarchy), Step 5 (plan mode), Step 6 (eval
+  smoke) all in. M2 exit criterion (§18) — pass-rate ≥ 85% on
+  smoke, p50 < $0.20 — needs a local baseline run against Haiku
+  to verify; until then the harness is "ready, not yet
+  measured." That measurement is the actual M2 sign-off.
+- M3 starts after the baseline: subagents + worktree + MCP +
+  resume + checkpoints + `/undo` + `bash_background` +
+  `todo_write` + Repo Map.
+
+---
+
+## [2026-04-28] M2 / Step 5 — Plan mode (`--plan`)
+
+`AGENTIC_CLI §5` calls plan mode "blocked at the harness level, not
+in policy" — a read-only profile where the model produces a
+structured plan instead of applying changes. Step 5 ships the
+one-shot CLI version. Interactive `[a]ccept/[e]dit/[r]eject` review
+flow needs the Ink UI and is deferred per the spec's plan→execute
+section.
+
+**Done:**
+- `src/cli/args.ts` — `--plan` flag parsed alongside `--json`/etc.
+  `ParsedArgs.plan: boolean` (default false). Usage line lists the
+  flag.
+- `src/harness/types.ts` — `HarnessConfig.planMode?: boolean`.
+- `src/harness/invoke-tool.ts` — `InvokeToolDeps.planMode?: boolean`.
+  When true and the resolved tool has `metadata.writes === true`,
+  the call short-circuits BEFORE the permission engine and BEFORE
+  any DB write. Returns a synthetic deny tool_result with a clear
+  read-only message; no `tool_call` row, no `approval` row, no
+  `execute()` invocation. Plan mode runs at the harness layer so
+  even a session-policy override that allows writes can't subvert
+  the read-only profile (spec invariant).
+- `src/harness/loop.ts` — propagates `config.planMode` into
+  `invokeTool` deps.
+- `src/cli/bootstrap.ts` — `BootstrapInput.plan?: boolean`. When
+  true, sets `config.planMode = true` AND injects
+  `PLAN_MODE_SYSTEM_PROMPT` (markdown structure: Goal/Scope/Steps/
+  Risks/Assumptions). Subset of the spec's full YAML schema —
+  schema-validated output is M5+ when constrained generation lands.
+- `src/cli/run.ts` — wires `args.plan` → `BootstrapInput.plan`.
+  Prints `[plan mode] read-only run; write tools are blocked at the
+  harness` to errSink before the run starts.
+
+**Decisions:**
+- **Harness-level block, not session-policy injection.** I considered
+  injecting a session-layer policy with `deny_paths: ['**']` +
+  `locked: true` for write tools — would reuse Step 4's lock
+  semantics and feel cleaner. Rejected: (a) plan mode is profile,
+  not policy — confusing two concepts undermines both; (b) spec is
+  explicit ("blocked at the harness level, not policy"); (c) policy
+  block has more moving parts (tool→category→section lookup) than a
+  single `metadata.writes` check, more surface for the read-only
+  invariant to drift; (d) harness-level block reads as `metadata.writes`
+  — same predicate the checkpoint subsystem will use in M3 — keeping
+  the concept centralized.
+- **System prompt is markdown, not YAML schema.** Spec §5.1 lists
+  the formal YAML schema for plan output. Without constrained
+  generation (`generateConstrained` is M5), asking the model for
+  YAML and parsing it loosely would produce occasional malformed
+  output that callers couldn't reliably consume. Markdown is what
+  the model produces naturally and the user can read directly;
+  the YAML schema is an upgrade for when the constrained backend
+  ships.
+- **No interactive review.** Plan mode in M2 ends with the markdown
+  on stdout (or NDJSON `text_delta` events) and exits. The spec's
+  `[a]ccept/[e]dit/[r]eject` modal needs Ink components and a
+  re-enter-run flow — both M3+. Single-shot plan still useful by
+  itself: dirigir the CLI in big repos with confidence the run
+  won't apply anything.
+- **Plan-aware system prompt at bootstrap, not in the loop.**
+  Bootstrap is where flag → config conversion happens; injecting
+  there keeps the loop ignorant of plan mode beyond the
+  `planMode` flag pass-through. Loop only consults the flag at
+  the invokeTool propagation site.
+- **Indicator on stderr regardless of `--json`.** Per spec §2.2,
+  stdout in `--json` mode is NDJSON only; the plan-mode marker is
+  operational metadata, not run output, so it goes to stderr where
+  it doesn't pollute downstream pipes.
+- **Per-tool `metadata.writes` is the source of truth.** Tools
+  declare `writes: true` in their metadata (already the case for
+  `write_file`, `edit_file`, `bash`). Plan mode reads from there;
+  no parallel "list of write tools" to keep in sync.
+
+**Tools with `writes: true` (blocked in plan mode):** `write_file`,
+`edit_file`, `bash` (declared writes-true pessimistically per
+CONTRACTS §2.6.3). Read-only tools (`read_file`, `glob`, `grep`)
+proceed through the normal allow path.
+
+**New tests (+10 over Step 4):**
+- `tests/cli/args.test.ts` — 2: `--plan` flag set, default false.
+  Usage line mentions `--plan`.
+- `tests/cli/bootstrap.test.ts` — 2: plan:true → planMode + system
+  prompt; plan omitted → both unset.
+- `tests/cli/run.test.ts` — 1: `[plan mode]` indicator on errSink.
+- `tests/harness/invoke-tool.test.ts` — 2: write tool denied
+  before policy + DB (no execute, no toolCallId); read-only tool
+  still executes normally in plan mode.
+- `tests/harness/loop.test.ts` — 1: end-to-end runAgent with
+  planMode + permissive policy + write tool_use → denied at
+  harness, decision.kind === 'deny', execute never called.
+- Total suite: **548 pass / 7 skip / 1215 expect() calls** in ~1.6s.
+
+**Out of scope (deferred):**
+- Interactive `<PlanReview>` modal with `[a]ccept/[e]dit/[r]eject` —
+  M3 (needs Ink).
+- Plan → run reentry with structured goal injection — M3.
+- Schema-validated YAML output (`spec §5.1` formal schema) — M5
+  (constrained generation backend).
+- Plan-as-artifact persistence (`.agent/plans/<timestamp>.md`) —
+  deferred; current model output goes to stdout, captured if user
+  redirects.
+- `acceptEdits` profile (third profile in §5.1) — separate step.
+  acceptEdits is policy-mode (`PolicyMode.acceptEdits`) and already
+  exists in the engine; CLI flag would just inject a session policy.
+
+**Pending:** none for this step.
+
+**Next:** M2 / Step 6 — Eval smoke. Final canonical M2 item per
+spec §18. Minimal eval harness: 5-10 fixed tasks, executor that
+runs `runAgent` against a real model, measures pass-rate + p50
+cost. Critério de saída: pass-rate ≥85% smoke, p50 < $0.20/task.
+Without it the rest of M2 is asserted-to-work without proof.
+
+---
+
+## [2026-04-28] M2 / Step 4 — Permission hierarchy
+
+`AGENTIC_CLI §8` requires layered policy resolution: enterprise →
+user → project → session. M1 only loaded `./.agent/permissions.yaml`,
+leaving the higher and lower precedence tiers stubbed. Step 4 closes
+that gap; trust prompt (the other half of M2 step 4 in the spec) is
+deferred to `docs/TODO.md` because it depends on interactive UI that
+hasn't landed yet.
+
+**Done:**
+- `src/permissions/paths.ts` — path discovery for each layer.
+  `ENTERPRISE_POLICY_PATH = /etc/agent/permissions.yaml`. User path
+  honors `XDG_CONFIG_HOME` (with empty-string fallback to
+  `~/.config/agent/permissions.yaml`). Project path stays
+  `cwd/.agent/permissions.yaml`.
+- `src/permissions/hierarchy.ts` — `resolvePolicy({cwd, ...})` walks
+  the four layers, loads each that exists, merges with locked-section
+  semantics. Returns the effective `Policy`, the loaded
+  `LayerPolicy[]` trail, and a `LockConflict[]` array describing any
+  override attempts that were rejected.
+- `src/permissions/types.ts` — added `locked?: boolean` to
+  `PolicyDefaults`, `BashPolicy`, `PathPolicy`, `FetchPolicy`. Validator
+  accepts and rejects non-boolean values.
+- `src/permissions/config.ts` — `parsePolicy` round-trips `locked` on
+  defaults and on each tool section.
+- `src/cli/bootstrap.ts` — replaces the single-file `loadPolicyFromFile`
+  call with `resolvePolicy`. New `BootstrapResult` shape: `policyLayers`
+  (array of which layers contributed) + `lockConflicts` (warnings to
+  surface). Test seams `enterprisePolicyPath`/`userPolicyPath` accept
+  `null` to disable a layer entirely (avoid touching `/etc` in tests).
+- `docs/TODO.md` — trust prompt deferral with rationale and pull-in
+  signal.
+
+**Merge semantics:**
+- **Replace, not extend.** A lower-precedence layer that defines
+  `tools.bash` fully replaces the higher layer's `tools.bash`.
+  Predictable + matches most config systems; users who want to extend
+  re-list everything. Spec stayed silent on this; replace is the safer
+  choice for security policy (no surprise merges that allow more than
+  the user intended).
+- **Locked sections drop overrides + record conflicts.** Once any
+  layer marks a section as `locked: true`, subsequent layers'
+  attempts to redefine that section are silently dropped from the
+  merged result and recorded in `lockConflicts` with
+  `{section, lockedBy, attemptedBy}`. Caller (CLI run.ts) prints
+  conflicts as warnings to stderr.
+- **Same-value isn't a conflict.** A lower layer setting
+  `defaults.mode: strict` when enterprise locked mode at `strict` is
+  silently OK — only differing values trip the conflict log.
+
+**New tests (+15 over Step 3):**
+- `tests/permissions/paths.test.ts` — 5 cases: enterprise constant,
+  XDG honored, XDG-empty falls back, ~/.config fallback, project path.
+- `tests/permissions/hierarchy.test.ts` — 10 cases: discovery (no
+  files, project only, three-layer precedence, session override),
+  locked semantics (enterprise blocks user, enterprise blocks project,
+  user blocks project, multi-layer conflict log, non-locked replace,
+  same-value non-conflict).
+- `tests/cli/bootstrap.test.ts` — updated to use `policyLayers`
+  instead of removed `policySource` field; `enterprisePolicyPath: null`
+  + `userPolicyPath: null` test seams pin that the test suite never
+  touches `/etc/agent` or `~/.config/agent` during run.
+- Total suite: **512 pass / 7 skip / 1132 expect() calls** in ~1.5s.
+
+**Decisions:**
+- **`enterprisePath: null` and `userPath: null` as test seams** rather
+  than relying on `existsSync` returning false. Tests that don't
+  actively use a layer set the path to `null` so the layer is
+  guaranteed not to be probed. Catches the class of test bugs where
+  a CI runner happens to have `/etc/agent/permissions.yaml` and the
+  test silently picks it up.
+- **`Policy` type ships `locked` as part of the schema**, not as a
+  separate per-layer flag map. Round-trips through YAML; admins can
+  inspect any layer's `locked` directly in the file without consulting
+  a separate manifest.
+- **All four layers use the same lock semantics**, not "only
+  enterprise can lock". Spec language is "enterprise pode marcar
+  regras como locked" (can mark) — doesn't preclude others. Uniform
+  semantics are simpler and let user/project lock things from session
+  too (think: a project locks its `tools.write_file.deny_paths`
+  against runtime `--allow-write-everywhere` flags later).
+- **`session` layer threads through `ResolveOptions.session`** rather
+  than reading a separate config file. Session-layer config in M1 is
+  only injected via tests / harness wiring; CLI flags adding to it is
+  Step 5+ work.
+- **`policyLayers` returns `('enterprise'|'user'|'project'|'session')[]`**
+  instead of the old single `policySource: 'project'|'default'` enum.
+  Multi-layer is now the norm; an empty array signals "no layer file
+  found anywhere — engine falls back to default strict policy".
+
+**Out of scope:**
+- Trust prompt (deferred — see `docs/TODO.md`).
+- `agent perms` introspection subcommand (would render `layers` and
+  `lockConflicts` for the user). Cosmetic, lands when slash commands
+  arrive in M3.
+- CLI flag → session policy threading (`--allow`, `--deny`, etc).
+  Session layer accepts injected policy today; binding flags to it
+  is a later step.
+- Windows path discovery (`%PROGRAMDATA%`, `%APPDATA%`). Linux/Mac
+  only in M1/M2; same posture as `src/storage/paths.ts`.
+- Multi-file policy in a layer (e.g., `~/.config/agent/permissions.d/*.yaml`).
+  Single file per layer for now; conf.d-style fragments deferred.
+
+**Pending:** none for this step.
+
+**Next:** M2 / Step 5 — Plan mode (`--plan`). Read-only profile that
+short-circuits all `writes: true` tools, asks the model to produce a
+plan in markdown, exits without applying. Reuses the permissions
+engine: a session-layer policy with `bypass`-style read tools and
+deny-all writes. Useful for dirigirthe CLI in big repos with
+confidence.
+
+---
+
+## [2026-04-28] M2 / Step 3 — Compaction
+
+`AGENTIC_CLI.md §6` and `ORCHESTRATION.md §4` require the harness to
+shrink conversation history when the prompt approaches the model's
+context window. M1 sent the full history every turn; long sessions
+would either burn cache hits or hit the cap. Step 1's telemetry
+provides the trigger signal (per-turn prompt token count); Step 3
+spends it.
+
+**Done:**
+- `src/harness/compaction.ts` — `compactMessages(provider, messages, options)`
+  rewrites a `ProviderMessage[]` keeping the first user message
+  (goal) and the last K turns literal, summarizing everything in
+  between via an LLM call. Falls back to deterministic elision (drop
+  `tool_result` bodies, replace with `[tool_result elided: N bytes]`
+  pointers) when the LLM call fails. `temperature: 0` on the summary
+  call so the same input compacts the same way across reruns.
+- `src/harness/types.ts` — `RunBudget.compactionThreshold` (default
+  `0.7`) and `compactionPreserveTail` (default `3`) per spec
+  §4.1/§4.6. New `HarnessEvent` kinds `compaction_started` and
+  `compaction_finished` carry threshold, prompt tokens, strategy
+  (`'llm' | 'fallback' | 'skipped'`), folded count, duration, and
+  reason. JSON renderer carries them through NDJSON automatically.
+- `src/harness/loop.ts` — trigger check at the bottom of each loop
+  iteration (after tool_results push, before the next request). Uses
+  the LAST turn's `usage.input + cache_read + cache_creation` as a
+  proxy for "size of the next request" — free signal, no extra
+  countTokens HTTP call. Skips when telemetry was unavailable for
+  the turn (`usageSeen=false`) since a guess could be very wrong.
+  In-place rewrites the running `messages` array; the SQLite
+  `messages` table stays intact so audit / replay can re-derive a
+  different compaction policy later.
+- Synthetic summary message uses `assistant` role with explicit
+  `[compacted_history] ... [/compacted_history]` markers. Wrapper
+  re-adds markers if the model forgets them so downstream scanners
+  (recap, audit) can locate compacted blocks unambiguously.
+- Fallback path emits a synthetic note describing strategy + reason,
+  followed by the original middle messages with `tool_result` bodies
+  elided. Pointer string includes original byte size and points to
+  the audit log so a forensics user can recover the body.
+
+**New tests (+11 over Step 2):**
+- `tests/harness/compaction.test.ts` — 8 cases:
+  - LLM happy path: goal + tail preserved, middle replaced with one
+    summary message.
+  - Marker re-injection when the model returns prose without them.
+  - Summary request shape: `temperature: 0`, configurable `maxTokens`,
+    compaction system prompt instead of the run's.
+  - History too short → `strategy: 'skipped'`, no provider call.
+  - LLM throw → `strategy: 'fallback'`, original middle preserved
+    with `tool_result` content elided.
+  - Stream-only errors → fallback (no useful summary).
+  - Empty summary text → fallback.
+  - Aborted signal → fallback (the abort reaches the LLM call via
+    `abortableIterable`).
+- `tests/harness/loop.test.ts` — 3 cases:
+  - Trigger fires when `prompt_tokens > threshold × context_window`;
+    `compaction_started` and `compaction_finished` events emit;
+    post-compaction request reaches the provider with shorter
+    `messages.length`.
+  - Below threshold → no event.
+  - `usageSeen=false` → no event (can't guess size honestly).
+- Total suite: **459 pass / 7 skip / 1016 expect() calls** in ~1.5s.
+
+**Decisions:**
+- **Trigger signal is the LAST turn's billed prompt tokens**, not a
+  pre-flight `countTokens` call. `countTokens` would be a free-cost
+  HTTP roundtrip on Anthropic and a heuristic on OpenAI; reusing
+  telemetry already collected is exact (for the request that just
+  ran) and zero-cost. The next request is "this history + freshly
+  appended tool_results" — strictly larger than what we measured —
+  so a turn ≥70% guarantees the next ≥70%. Slightly eager but
+  always correct in the safe direction (trigger before we hit the
+  cap, never after).
+- **Skip when `usageSeen=false`.** Compat endpoints that drop usage
+  telemetry leave us blind to the actual prompt size. Guessing
+  (chars/4 heuristic over the messages) could be wildly off and
+  trigger needless compactions. The conservative call is to skip;
+  the user's `~$X.XX (incomplete)` cost indicator already signals
+  the missing telemetry.
+- **In-memory only — no DB rewrite.** `messages` table keeps every
+  original turn. Compaction only mutates the running provider array.
+  Replay can re-decide whether to compact or take the long path.
+  Avoids an "atomic mid-session DB rewrite" mechanism that would
+  multiply the test surface for marginal gain in M2.
+- **Same provider as the run for the summary call.** Spec §4.5
+  recommends a cheaper model per profile (Haiku for autonomous
+  Anthropic). Selecting the cheap model requires a registry-aware
+  policy that we'll add when we have profile abstractions in M3+.
+  For now, using the run's provider keeps the integration tight
+  and lets users override via the registry.
+- **Summary inserted as `assistant` role, not `user`.** Two
+  consecutive `user` messages would also be valid (Anthropic accepts),
+  but presenting the summary as the agent's own context note keeps
+  the next turn's user/assistant alternation obvious to the model
+  reading the prompt.
+- **Fallback preserves the middle messages with elided
+  `tool_result` content** rather than collapsing to a single note.
+  Tool_use blocks reference IDs the next turn might still cite;
+  preserving the structure (with bodies replaced by pointers) keeps
+  those references resolvable. Pointer carries original byte size
+  so a verbose-mode user knows the magnitude of what was dropped.
+- **Marker re-injection on missing markers.** Tests pin that the
+  wrapper re-adds `[compacted_history]...[/compacted_history]` when
+  the model forgets — drift in the model's structured-output
+  adherence shouldn't break downstream scanners.
+
+**Out of scope (deferred):**
+- `PreCompact` hook — requires hooks subsystem (M4).
+- Pinned context (`CONTEXT_TUNING.md §12.4`) — needs the slash
+  command surface and the user-facing pin/unpin UX.
+- Goal re-injection literal (`§4.2 step "Goal re-injection literal +
+  pinned context"`) — currently the goal IS preserved as message[0]
+  but isn't re-injected into the system prompt. Lands when system
+  prompt architecture (`CONTEXT_TUNING.md §1`) is implemented.
+- Schema-validated compaction output with retry — depends on
+  constrained generation backend (M5) for reliable structured
+  decoding. Current loose-text approach is acceptable while we
+  monitor adherence in eval.
+- Per-profile cheap-model selection (`§4.5`) — requires profile +
+  model-registry policy plumbing (M3+).
+- DB persistence of compaction events / `compaction_runs` table —
+  current `onEvent` callback is enough for M2 observability;
+  formal audit table lands with the rest of the audit subsystem.
+- Atomic SQLite transaction around compaction — only relevant when
+  we DO persist the rewrite (deferred above).
+- `evals/compaction/static_fallback/` corpus — bound to the evals
+  smoke step.
+- Truncation tier (oldest assistant turns head+tail) when fallback
+  is still > threshold (`§4.6` step 6) — current fallback drops
+  bodies; size-bounded follow-up is M2 later step.
+
+**Pending:** none for this step.
+
+**Next:** M2 / Step 4 — Trust prompt + permission hierarchy. New
+directory / unknown `AGENTS.md` requires confirmation; merge
+enterprise → user → project → session policy resolution. Fixes a
+gap from M1 where `./.agent/permissions.yaml` was the only source.
+
+---
+
+## [2026-04-28] M2 / Step 2 — Output sanitization (ANSI strip)
+
+`SECURITY_GUIDELINE.md §3.2` (line 161) and §5 invariant 4 require a
+sanitization layer between tool execution and the model context. M1
+left the gap explicit; Step 2 closes it.
+
+**Threat covered:**
+- A tool returning `\x1b[2K\x1b[1AOK: file empty` lets a malicious
+  file lie about what happened when its output is later echoed in a
+  terminal (verbose mode, audit replay, recap renderer).
+- Tools embedding OSC sequences (`\x1b]0;title\x07`) can hijack the
+  terminal title or, with OSC 8, inject deceptive hyperlinks.
+- Token waste: ANSI bytes in the model's context inflate input cost
+  with bytes the model can't render.
+- Prompt-injection vector: text hidden inside escape blocks.
+
+**Done:**
+- `src/sanitize/ansi.ts` — `stripAnsi(s)` removes CSI (`\x1b[...`),
+  OSC with both BEL and ST terminators, DCS/APC/PM/SOS, 7-bit
+  single-char escapes (range 0x40-0x7E covering Type Fe + Fs + RIS),
+  and 8-bit C1 controls (0x80-0x9F). Alternation order matches
+  structured patterns first, so a malformed `\x1b[123;` falls
+  through to the single-char rule (eats just `\x1b[`, leaves `123;`
+  as text — leaving live ESC bytes is the security risk).
+- `src/sanitize/ansi.ts` — `sanitizeToolOutput(value)` recursively
+  walks objects and arrays, stripping ANSI from every string leaf
+  while preserving shape, primitives, and discriminator booleans
+  (`is_error: true` on `ToolError` survives intact). Cycle detection
+  via `WeakSet` replaces revisited references with `<cycle>`; tool
+  outputs shouldn't contain cycles, but a buggy input must not
+  stack-overflow.
+- `src/harness/invoke-tool.ts` — sanitizes the tool result once,
+  before both sinks: the audit row (`finishToolCall(... output ...)`)
+  and the model-facing `tool_result` block. ToolError messages also
+  pass through (a subprocess crashing with colored stderr won't
+  smuggle escape bytes into either path).
+
+**New tests (+18 over Step 1):**
+- `tests/sanitize/ansi.test.ts` — 12 cases: SGR colors, cursor/erase
+  (the canonical "rewrite history" pattern), OSC with both
+  terminator styles, DCS/APC, single-char escapes, C1 bytes,
+  preservation of plain text and whitespace, malformed CSI handling,
+  consecutive sequences. Plus 9 `sanitizeToolOutput` cases: nested
+  walk, non-string preservation, cyclic objects, cyclic arrays,
+  ToolError discriminator, no-mutation guarantee.
+- `tests/harness/invoke-tool.test.ts` — 2 new: ANSI stripped from
+  both `tool_result.content` and persisted `tool_calls.output`;
+  ANSI in `ToolError.error_message` also stripped. Hard guarantee:
+  `JSON.stringify(tc?.output)` contains no `\x1b` byte.
+- Total suite: **444 pass / 7 skip / 959 expect() calls** in ~1.4s.
+
+**Decisions:**
+- **Sanitize at the harness, not the tool layer.** Universal policy
+  beats per-tool opt-in: no future tool can forget to strip. The
+  sanitizer runs once and feeds both the audit row and the
+  `tool_result` block, so neither path can drift.
+- **Strip everything, don't preserve SGR.** The spec language
+  ("preservar SGR seguro") targets terminal renderers. For tool
+  output flowing to the MODEL there's no terminal — colors are
+  noise. A future verbose/interactive renderer that wants to display
+  tool output to the user can re-decide at its own layer with its
+  own safe-SGR allowlist (renderer side, against text we already
+  scrubbed at intake).
+- **Recursive walker, not flat string strip.** Tools return
+  structured objects (`{stdout, stderr, exit_code}`). Walking
+  preserves shape so the model gets `{stdout: "error: real", ...}`
+  instead of a re-stringified blob.
+- **Cycle marker is `<cycle>`** rather than throwing or silently
+  dropping the branch. Tool contract is JSON-shaped (no cycles in
+  practice), but a buggy input mustn't stack-overflow; the marker
+  keeps the path navigable.
+- **Malformed CSI strips just `\x1b[`** instead of leaving the ESC
+  byte. The conservative direction is "remove control bytes
+  aggressively, leave printable text alone" — orphan params (`123;`)
+  in output are harmless noise; live ESC bytes are the security risk.
+- **No `--include-tool-output` raw escape hatch yet.** Spec §1.4
+  mentions one for future verbose mode. Deferred until M2 has a
+  verbose-output path that needs it; the audit row will hold raw
+  bytes only when explicitly opted in (and re-stripped before
+  re-display).
+- **`stripAnsi` keeps `\t \n \r`.** Whitespace bytes are part of
+  legitimate text content; only escape sequences are control bytes
+  for sanitization purposes.
+
+**Out of scope:**
+- Renderer-side SGR allowlist for verbose mode (M2 later step or M3)
+- Secret redaction (`SECURITY_GUIDELINE.md §6` — separate layer)
+- Injection heuristic with `injection_suspect: true` flag
+  (`SECURITY_GUIDELINE.md §9.1.5` — bound to `fetch_url` policy work)
+- Real-shell ANSI fixture corpus from `evals/` (deferred to evals
+  smoke step)
+
+**Pending:** none for this step.
+
+**Next:** M2 / Step 3 — Compaction. Sliding-window history +
+Haiku-driven summarization when context approaches the model's cap.
+The Step 1 telemetry tells the harness when to trigger; this step
+spends those numbers.
+
+---
+
+## [2026-04-28] M2 / Step 1 — Telemetry: usage tokens + cost tracking
+
+Opens M2 ("Robustez"). Pre-requisite for compaction (need to know when to
+trigger) and eval smoke (need cost numbers). Without it, the CLI is flying
+blind on production runs.
+
+**Done:**
+- `src/providers/types.ts` — new `UsageInfo` (`input` / `output` / `cache_read` / `cache_creation`) and a canonical `kind: 'usage'` `StreamEvent` between the last content event and `stop` in every well-formed turn.
+- `src/providers/anthropic/stream.ts` — extracts usage from `message_start.message.usage` (input + cache_read + cache_creation) and from the final `message_delta.usage` (output). Both shapes optional in `RawAnthropicEvent` so older SDK responses still parse. Defaults to zero when the SDK omits it.
+- `src/providers/openai/stream.ts` — reads `chunk.usage` from the final chunk (only present when `stream_options.include_usage` is set). Splits `prompt_tokens` minus `prompt_tokens_details.cached_tokens` so `input` semantics match Anthropic (non-cached tokens at full rate, cache_read at the discount tier).
+- `src/providers/openai/index.ts` — opts into `stream_options: { include_usage: true }` on every `chat.completions.create`. Falls back to a zeroed UsageInfo when compatibility endpoints (Azure, OpenRouter) ignore the flag.
+- `src/providers/google/stream.ts` — reads `chunk.usageMetadata` (cumulative; last chunk wins). Same `prompt − cached` split. `cache_creation` stays zero (Gemini's cache is pre-warmed via a separate API; the stream never reports writes).
+- `src/providers/cost.ts` — `computeCost(caps, usage)` honors the four-tier rate table (`input`, `output`, `cache_read`, `cache_creation`); falls back to the raw input rate when `cost_per_1k_cached_input` or `cost_per_1k_cache_write` aren't declared. `addUsage` + `emptyUsage` for accumulation.
+- `src/storage/migrations/003-usage-cost.ts` — `ALTER TABLE messages ADD COLUMN cache_creation_tokens INTEGER` + `ADD COLUMN cost_usd REAL`. The original schema had `cached_tokens` (reads) but no separate write column; cost_usd avoids re-deriving pricing every time `agent audit costs` runs.
+- `src/storage/repos/messages.ts` — `Message` carries `cacheCreationTokens` / `costUsd`; `appendMessage` accepts and persists them.
+- `src/harness/collect.ts` — `CollectedStep.usage` accumulated from `kind: 'usage'` events. Last event wins (defensive for adapters that ever split the report).
+- `src/harness/loop.ts` — every assistant turn writes `tokens_in` / `tokens_out` / `cached_tokens` / `cache_creation_tokens` / `cost_usd` to `messages`. Session-wide totals (`totalUsage`, `totalCostUsd`) accumulate across turns, persist via `completeSession(..., totalCostUsd)` (the column already existed but was always written as `0`), and surface in `HarnessResult.usage` + `HarnessResult.costUsd`.
+- `src/harness/types.ts` — `HarnessResult` exposes `usage: UsageInfo` and `costUsd: number`. `session_finished` HarnessEvent reuses `result`, so renderers see the totals without a new event shape.
+- `src/cli/output/plain.ts` — final summary line now reads `[done/done] N steps · Mms · tokens IN/OUT[ (cache_r X, cache_w Y)] · $0.XXXX`. Cache columns elided when zero so OpenAI/Gemini users don't get noise.
+- `src/cli/output/json.ts` — unchanged; passes `session_finished` through and `result.usage` / `result.costUsd` ride along automatically. New test pins the NDJSON shape.
+
+**New tests (+62 over M1):**
+- `tests/providers/cost.test.ts` — 9 cases: empty usage, input/output composition, cached_input rate honored, fallback to input rate when cached_input undeclared, cache_write rate honored, fallback for cache_creation, all-four composition, addUsage commutativity.
+- `tests/providers/anthropic-stream.test.ts` — 2 new: usage extracted from message_start + message_delta with cache splits; zeroed usage event when SDK omits the payload.
+- `tests/providers/openai-stream.test.ts` — 1 new: cached_tokens split out of prompt_tokens (matches Anthropic semantics).
+- `tests/providers/google-stream.test.ts` — 1 new: cachedContentTokenCount split out of promptTokenCount.
+- `tests/harness/loop.test.ts` — 3 new: aggregates usage across turns + persists to `sessions.total_cost_usd`; per-message tokens + cost on assistant rows; `session_finished` event carries the same usage/cost as the result.
+- `tests/cli/output-plain.test.ts` — 1 new: summary shows cache columns when non-zero; existing summary tests updated to assert `tokens N/M` + `$0.XXXX`.
+- `tests/cli/output-json.test.ts` — assert NDJSON `session_finished` line contains `result.usage.input` and `result.costUsd`.
+- All 3 stream test files gained a `collectNonUsage` helper so the existing exact-sequence assertions (~30 tests) didn't need a `usage` event boilerplate — only the dedicated usage tests use raw `collect`.
+- Total suite: **396 pass / 7 skip / 867 expect() calls** in ~1.4s.
+
+**Decisions:**
+- **`usage` is its own canonical `StreamEvent` kind**, not a field tacked onto `stop`. Adapters emit it once per turn between the last content event and `stop`; `collectStep` accumulates it independently. Tying usage to `stop` would force every test that asserts a `stop` shape to know about usage; making it its own event lets renderers / collectors choose to ignore it.
+- **`prompt_tokens − cached_tokens` split for OpenAI/Gemini** at the adapter, not the cost computer. OpenAI's `prompt_tokens` is the *full* prompt count including cache hits; Anthropic's `input_tokens` is *non-cached only*. Normalizing to Anthropic's semantics here means `computeCost` doesn't need a per-provider branch — it just multiplies by the declared rate.
+- **`cost_per_1k_cached_input` / `cost_per_1k_cache_write` fall through to `cost_per_1k_input`** when undeclared. Charging the raw input rate is loud failure — overcounts vs. the discount tier rather than undercounting silently to zero. A model entry that forgets to declare cache rates will show inflated cost and surface the gap in `agent audit costs`.
+- **OpenAI provider opts into `stream_options.include_usage` unconditionally.** Without the flag, the final chunk has no `usage` field. A handful of compatibility endpoints (early Azure, some OpenRouter setups) ignore it; the normalizer falls back to a zeroed UsageInfo so the harness still sees a usage event and `costUsd` reads as 0 instead of crashing.
+- **Storage migration is additive (`ALTER TABLE` for two columns).** Reusing existing `messages.tokens_in/tokens_out/cached_tokens` rather than introducing a parallel `usage_events` table — keeps queries ergonomic (`SELECT cost_usd FROM messages WHERE session_id = ?`). Per-message `cost_usd` redundant with `tokens × pricing` but stored anyway because `audit costs --by tool` (spec §1) shouldn't have to re-derive pricing every query.
+- **Mock provider in tests gains `capsOverride`** for cost-bearing tests (`cost_per_1k_input: 0` was the default; that hides cost bugs). Existing tests stay zero-cost.
+- **`collectNonUsage` helper** in stream tests instead of updating ~30 inline arrays. The tests are pinning canonical event order; usage arriving as a new event would force boilerplate without testing anything different. Dedicated usage tests use raw `collect`.
+
+**Out of scope (still M2+):**
+- `agent audit costs --by tool / --by session` CLI subcommands (spec §1) — needs M2 Step on session listing/inspection
+- Compaction (next Step — uses these usage numbers to decide trigger threshold)
+- Cache breakpoint hints to the provider (CONTEXT_TUNING)
+- Real-network test fixtures for usage extraction (deferred to evals)
+- `agent stats --tokens` discrepancy detector (TOKEN_TUNING §8.3) — needs local tokenizer (M5)
+- Honest pricing values in capabilities — they're still illustrative per `PROVIDERS.md §5`; dynamic pricing config deferred
+
+**Code-review fixes folded in before commit:**
+- **Anthropic cache_write rates declared explicitly.** All three Anthropic models (`opus-4-7`, `sonnet-4-6`, `haiku-4-5`) now carry `cost_per_1k_cache_write` at 1.25× their input rate per Anthropic's public pricing. Before this fix, `computeCost` fell back to the raw input rate for cache-creation tokens, undercounting Anthropic cache-write turns by 25%. The first review pass mislabeled the fallback as "overcount" — it was the opposite direction.
+- **`computeCost` docstring rewrites the cache-fallback decision honestly.** Says "undercounts on Anthropic, declare the rate explicitly" instead of the original "overcounts slightly" claim.
+- **OpenAI `stream_options.include_usage` is opt-out via `CreateOpenAIProviderOptions.includeUsage`.** Some compat endpoints (older Azure deployments, certain proxies) reject unknown params with HTTP 400; the option lets users disable telemetry rather than fail the run. Default stays `true`. Two new tests pin both branches: that the param is forwarded by default, and that `includeUsage: false` omits it.
+- **`mergeUsage` (Anthropic adapter) uses `Math.max` instead of overwrite.** Today's SDK reports cumulative; if a future shift to incremental deltas (or interim partial counts) ever happens, the largest-seen value wins instead of a smaller late event silently shrinking totals. Regression test pins it.
+- **OpenAI normalizer extracts usage AFTER emitting `start`.** Reading `chunk.usage` first was harmless today (the usage-only chunk has empty choices and falls through), but the canonical contract is "start-first"; reordering keeps the invariant.
+- **Harness writes NULL token/cost columns when no `usage` event was seen.** New `usageSeen` flag on `CollectedStep` flips `true` only when an actual `kind: 'usage'` event arrived. Lets downstream analytics (`agent audit costs`) tell "adapter never reported" from "turn measured zero". Three new collect.test.ts cases cover the flag transitions; loop test asserts NULL persistence.
+- **`formatCost` is magnitude-aware.** Sub-$1 keeps 4 decimals (real billing precision matters there); $1–$100 uses 3; $100+ uses 2. Long sessions no longer print `$50.0000`-style cosmetic noise. Test sweeps three ranges.
+- **`collectNonUsage` consolidated** into `tests/providers/_stream-helpers.ts` instead of duplicated across 3 files. Imported by all stream tests.
+- **Migration 003 carries a note** that `cost_usd` is intentionally a write-time snapshot, not a recomputable derivation — historical rows preserve the rate the user was actually billed at, even if pricing config drifts later.
+
+**Pending:** none for this step.
+
+**Next:** M2 / Step 2 — Output sanitization (CSI escape stripping in `bash` / `read_file` / `grep` outputs before content reaches the model). Small, isolated, closes a security gap from M1. After that, compaction.
+
+---
+
 ## [2026-04-27] M1 / Step 7 — Hardening pass
 
 Addresses the 10-issue review of M1: real reliability/security gaps caught

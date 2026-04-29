@@ -46,14 +46,16 @@ afterEach(() => {
 
 describe('bootstrap', () => {
   test('builds a config with provider override and a fresh DB', () => {
-    const { config, db, modelId, policySource } = bootstrap({
+    const { config, db, modelId, policyLayers } = bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
       dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
     });
     expect(modelId).toBe(DEFAULT_MODEL);
-    expect(policySource).toBe('default');
+    expect(policyLayers).toEqual([]);
     expect(config.provider).toBe(mockProvider);
     expect(config.userPrompt).toBe('hi');
     expect(config.cwd).toBe(workdir);
@@ -73,6 +75,8 @@ describe('bootstrap', () => {
       modelId: 'mock/custom',
       providerOverride: mockProvider,
       dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
     });
     expect(modelId).toBe('mock/custom');
     db.close();
@@ -86,6 +90,8 @@ describe('bootstrap', () => {
         cwd: workdir,
         modelId: 'fake/nope',
         dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
       }),
     ).toThrow(/unknown model: fake\/nope/);
   });
@@ -96,26 +102,96 @@ describe('bootstrap', () => {
       join(workdir, '.agent/permissions.yaml'),
       'defaults:\n  mode: acceptEdits\ntools:\n  bash:\n    allow:\n      - "ls *"\n',
     );
-    const { config, db, policySource } = bootstrap({
+    const { config, db, policyLayers } = bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
       dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
     });
-    expect(policySource).toBe('project');
+    expect(policyLayers).toEqual(['project']);
     expect(config.permissionEngine.mode()).toBe('acceptEdits');
     db.close();
   });
 
   test('falls back to default policy when no file', () => {
-    const { config, db, policySource } = bootstrap({
+    const { config, db, policyLayers } = bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
       dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
     });
-    expect(policySource).toBe('default');
+    expect(policyLayers).toEqual([]);
     expect(config.permissionEngine.mode()).toBe('strict');
+    db.close();
+  });
+
+  test('plan: true sets harness planMode and injects plan-aware system prompt', () => {
+    const { config, db } = bootstrap({
+      prompt: 'refactor auth',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      plan: true,
+    });
+    expect(config.planMode).toBe(true);
+    expect(config.systemPrompt).toContain('PLAN MODE');
+    expect(config.systemPrompt).toContain('BLOCKED');
+    db.close();
+  });
+
+  test('plan omitted leaves planMode unset and no system prompt', () => {
+    const { config, db } = bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+    });
+    expect(config.planMode).toBeUndefined();
+    expect(config.systemPrompt).toBeUndefined();
+    db.close();
+  });
+
+  test('plan + caller systemPrompt composes (plan first, user after separator)', () => {
+    const { config, db } = bootstrap({
+      prompt: 'refactor',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      plan: true,
+      systemPrompt: 'Project convention: prefer functional style.',
+    });
+    expect(config.planMode).toBe(true);
+    expect(config.systemPrompt).toContain('PLAN MODE');
+    expect(config.systemPrompt).toContain('Project convention');
+    // Plan instructions come first; user prompt after separator.
+    const planIdx = (config.systemPrompt ?? '').indexOf('PLAN MODE');
+    const userIdx = (config.systemPrompt ?? '').indexOf('Project convention');
+    expect(planIdx).toBeLessThan(userIdx);
+    db.close();
+  });
+
+  test('caller systemPrompt without plan passes through unchanged', () => {
+    const { config, db } = bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      systemPrompt: 'You are a senior engineer.',
+    });
+    expect(config.planMode).toBeUndefined();
+    expect(config.systemPrompt).toBe('You are a senior engineer.');
     db.close();
   });
 
@@ -126,6 +202,8 @@ describe('bootstrap', () => {
       providerOverride: mockProvider,
       dbPath,
       budget: { maxSteps: 7 },
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
     });
     expect(config.budget?.maxSteps).toBe(7);
     db.close();
@@ -137,6 +215,8 @@ describe('bootstrap', () => {
       cwd: workdir,
       providerOverride: mockProvider,
       dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
     });
     const tables = db
       .query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
@@ -157,6 +237,8 @@ describe('bootstrap', () => {
         cwd: workdir,
         providerOverride: mockProvider,
         dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
       }),
     ).toThrow();
     // The DB file should not exist because openDb was never called for
@@ -173,6 +255,8 @@ describe('bootstrap', () => {
         cwd: workdir,
         modelId: 'fake/nope',
         dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
       }),
     ).toThrow(/unknown model/);
     expect(existsSync(dbPath)).toBe(false);
