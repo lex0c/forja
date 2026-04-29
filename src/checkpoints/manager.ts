@@ -87,7 +87,11 @@ export interface CheckpointManager {
   // the manager is unavailable, or the checkpoint id is unknown, or
   // git refuses (e.g., commit object is gone after a manual GC). Returns
   // info about whether existing changes were stashed.
-  restore(id: string): Promise<{ stashed: boolean; stashRef?: string }>;
+  restore(id: string): Promise<{
+    stashed: boolean;
+    stashRef?: string;
+    stashKind?: 'git-stash' | 'agent-ref';
+  }>;
 
   // Diff between current working tree and a checkpoint commit. Drives
   // `--checkpoints diff`. Empty string means "identical".
@@ -157,7 +161,11 @@ class CheckpointManagerImpl implements CheckpointManager {
     return getCheckpoint(this.db, id);
   }
 
-  async restore(id: string): Promise<{ stashed: boolean; stashRef?: string }> {
+  async restore(id: string): Promise<{
+    stashed: boolean;
+    stashRef?: string;
+    stashKind?: 'git-stash' | 'agent-ref';
+  }> {
     if (!this.available) {
       throw new Error('checkpoints not available (cwd is not a git repository)');
     }

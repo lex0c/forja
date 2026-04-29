@@ -301,6 +301,71 @@ describe('restore', () => {
     }
   });
 
+  test('handles dirty working tree on unborn HEAD without git stash', async () => {
+    // git stash push refuses on unborn HEAD ("You do not have the
+    // initial commit yet"). snapshot() supports unborn repos, so
+    // restore() must too — otherwise --undo on a freshly init'd
+    // repo with dirty working tree hard-fails before read-tree.
+    //
+    // Data-loss case the preservation ref protects against: an
+    // untracked working-tree file with the SAME NAME as something
+    // in the checkpoint gets overwritten by read-tree --reset -u.
+    // Without preservation, the user's version is gone for good.
+    await runGit(repo, ['init', '-b', 'main']);
+    // Checkpoint has a.txt = "v1".
+    await writeFile(join(repo, 'a.txt'), 'v1\n');
+    const ckpt = await snapshot({
+      cwd: repo,
+      sessionId: 's',
+      stepId: 'm',
+      iso: 'iso',
+    });
+    expect(ckpt.sha).not.toBeNull();
+    // User edits a.txt to "v2" (untracked because unborn HEAD).
+    // read-tree --reset -u would overwrite this with the
+    // checkpoint's "v1" content; preservation must capture "v2".
+    await writeFile(join(repo, 'a.txt'), 'v2\n');
+
+    const result = await restore(repo, ckpt.sha as string);
+    expect(result.stashed).toBe(true);
+    expect(result.stashRef).toBeDefined();
+    expect(result.stashRef).toMatch(/^refs\/agent\/restore-saved\//);
+    expect(result.stashKind).toBe('agent-ref');
+
+    // Working tree now has the checkpoint version.
+    const aText = await Bun.file(join(repo, 'a.txt')).text();
+    expect(aText).toBe('v1\n');
+    // Preservation ref's tree contains the user's "v2" version,
+    // recoverable via `git read-tree --reset -u <ref>` or
+    // `git checkout <ref> -- .`.
+    const savedContent = await runGit(repo, ['show', `${result.stashRef as string}:a.txt`]);
+    expect(savedContent).toBe('v2\n');
+  });
+
+  test('skips preservation on unborn HEAD when working tree is clean', async () => {
+    await runGit(repo, ['init', '-b', 'main']);
+    await writeFile(join(repo, 'a.txt'), 'state\n');
+    const ckpt = await snapshot({
+      cwd: repo,
+      sessionId: 's',
+      stepId: 'm',
+      iso: 'iso',
+    });
+    // Take a fresh snapshot capturing the same working tree, then
+    // restore — working tree is unchanged vs the checkpoint, so
+    // isWorkingTreeDirty's `git status --porcelain` should be empty
+    // (the file is in the checkpoint commit's tree, but git considers
+    // it untracked from the unborn-HEAD index's perspective). We
+    // accept the simpler invariant: if porcelain is empty, no
+    // preservation; if non-empty, preserve. The test covers the
+    // "porcelain empty" case explicitly by removing the only
+    // untracked file before restore.
+    await rm(join(repo, 'a.txt'));
+    const result = await restore(repo, ckpt.sha as string);
+    expect(result.stashed).toBe(false);
+    expect(await Bun.file(join(repo, 'a.txt')).text()).toBe('state\n');
+  });
+
   test('throws on a non-existent commit before stashing', async () => {
     await initRepoWithCommit(repo);
     await writeFile(join(repo, 'dirty.txt'), 'work-in-progress\n');

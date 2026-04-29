@@ -328,6 +328,41 @@ describe('runCheckpointsCli', () => {
       expect(errStr).toContain(`Restored to checkpoint ${ckptId}`);
     });
 
+    test('undo on unborn HEAD with dirty working tree uses agent-ref + read-tree hint', async () => {
+      // No initial commit — git stash isn't available. The CLI must
+      // render the read-tree-based recovery hint instead of the
+      // stash-pop one (which would fail with "no initial commit").
+      await runGit(repo, ['init', '-b', 'main']);
+      await writeFile(join(repo, 'shared.txt'), 'v1\n');
+      const ckptId = await createRealCheckpoint(false, 'v1\n');
+      // Mutate the same file to v2; restore should preserve v2 in
+      // the agent-ref before overwriting with v1.
+      await writeFile(join(repo, 'shared.txt'), 'v2\n');
+
+      const c = capture();
+      const code = await runCheckpointsCli({
+        verb: 'restore',
+        positionals: [sessionId, ckptId],
+        json: false,
+        yes: false,
+        cwd: repo,
+        dbOverride: db,
+        out: c.pushOut,
+        err: c.pushErr,
+      });
+      expect(code).toBe(0);
+      const errStr = c.err.join('');
+      expect(errStr).toContain('refs/agent/restore-saved/');
+      expect(errStr).toContain('git read-tree --reset -u');
+      // Must NOT instruct the user to run `git stash pop` — that
+      // command would fail on unborn HEAD. The phrase may still
+      // appear as "git stash pop would fail" explaining WHY we
+      // didn't use it; check for the actionable form specifically.
+      expect(errStr).not.toContain('Run `git stash pop`');
+      // Working tree restored.
+      expect(await Bun.file(join(repo, 'shared.txt')).text()).toBe('v1\n');
+    });
+
     test('restore with explicit ckpt id and dirty working tree stashes', async () => {
       await initRepoWithSeed(repo);
       const ckptId = await createRealCheckpoint(false, 'state-1\n');

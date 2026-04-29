@@ -192,8 +192,18 @@ const runRestoreImpl = async (
   try {
     const result = await mgr.restore(ckpt.id);
     if (result.stashed && result.stashRef !== undefined) {
+      // Recovery hint depends on where we stored the saved working
+      // tree. The regular `git stash` path is recoverable via
+      // `git stash pop`; the unborn-HEAD path uses our own ref so
+      // we point at `git read-tree --reset -u <ref>` instead —
+      // `git stash pop` would also fail with "no initial commit"
+      // and confuse the user.
+      const recoveryHint =
+        result.stashKind === 'agent-ref'
+          ? `Run \`git read-tree --reset -u ${result.stashRef}\` to recover\nthe changes if you need them (HEAD is unborn; \`git stash pop\` would fail).`
+          : 'Run `git stash pop` to recover\nthe changes if you need them.';
       input.err(
-        `Working tree had uncommitted changes; pushed to ${result.stashRef}.\nRestored to checkpoint ${ckpt.id}. Run \`git stash pop\` to recover\nthe changes if you need them.\n`,
+        `Working tree had uncommitted changes; saved to ${result.stashRef}.\nRestored to checkpoint ${ckpt.id}. ${recoveryHint}\n`,
       );
     } else {
       input.err(`Restored to checkpoint ${ckpt.id}.\n`);
@@ -205,6 +215,7 @@ const runRestoreImpl = async (
           checkpoint_id: ckpt.id,
           stashed: result.stashed,
           stash_ref: result.stashRef ?? null,
+          stash_kind: result.stashKind ?? null,
         })}\n`,
       );
     }

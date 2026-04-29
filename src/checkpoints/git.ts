@@ -314,13 +314,22 @@ export const isWorkingTreeDirty = async (cwd: string): Promise<boolean> => {
 };
 
 export interface RestoreResult {
-  // True when we issued a `git stash push` to save the user's pending
-  // changes before resetting. False when the working tree was already
-  // clean.
+  // True when we saved the user's pending working tree before
+  // resetting. False when the working tree was already clean.
   stashed: boolean;
-  // `stash@{0}` when stashed=true. The user can `git stash pop` to
-  // recover their changes. Absent on a clean reset.
+  // Recovery handle — present iff stashed=true. Two shapes:
+  //   - `stash@{0}` when the regular `git stash push` path ran
+  //     (born HEAD). Recover with `git stash pop`.
+  //   - `refs/agent/restore-saved/<ts>` when HEAD was unborn and
+  //     git stash isn't available; we built our own preservation
+  //     commit. Recover with `git read-tree --reset -u <ref>` or
+  //     `git checkout <ref> -- .`.
   stashRef?: string;
+  // Distinguishes the two shapes above so the CLI can render the
+  // right recovery hint instead of telling an unborn-HEAD user to
+  // `git stash pop` (which would also fail). Undefined when not
+  // stashed.
+  stashKind?: 'git-stash' | 'agent-ref';
 }
 
 // Restore the working tree + index to match a checkpoint commit's tree.
@@ -339,27 +348,83 @@ export const restore = async (cwd: string, commitSha: string): Promise<RestoreRe
   // peel — a tree or blob with the same sha would still fail here.
   // The probe goes through runGit so timeout + okExitCodes apply.
   await runGit(['rev-parse', '--verify', `${commitSha}^{commit}`], { cwd });
+  const headBefore = await getHeadSha(cwd);
   const dirty = await isWorkingTreeDirty(cwd);
   let stashed = false;
   let stashRef: string | undefined;
+  let stashKind: 'git-stash' | 'agent-ref' | undefined;
   if (dirty) {
-    // -u keeps untracked files in the stash; -m tags the entry so the
-    // user can identify it in `git stash list`.
-    const res = await runGit(['stash', 'push', '-u', '-m', 'forja: pre-restore working tree'], {
-      cwd,
-    });
-    // `git stash push` prints "No local changes to save" if nothing was
-    // stashed (race: dirty between status and push). Detect via stdout
-    // so we don't lie about stashRef.
-    if (!res.stdout.includes('No local changes to save')) {
-      stashed = true;
-      stashRef = 'stash@{0}';
+    if (headBefore !== null) {
+      // Regular path: HEAD is born, `git stash push -u` works. -u
+      // keeps untracked files in the stash; -m tags the entry so
+      // the user can identify it in `git stash list`.
+      const res = await runGit(['stash', 'push', '-u', '-m', 'forja: pre-restore working tree'], {
+        cwd,
+      });
+      // `git stash push` prints "No local changes to save" if
+      // nothing was stashed (race: dirty between status and push).
+      // Detect via stdout so we don't lie about stashRef.
+      if (!res.stdout.includes('No local changes to save')) {
+        stashed = true;
+        stashRef = 'stash@{0}';
+        stashKind = 'git-stash';
+      }
+    } else {
+      // Unborn HEAD: `git stash push` refuses ("You do not have the
+      // initial commit yet"). snapshot() supports unborn repos via
+      // commit-tree, so restore() must too — otherwise --undo on a
+      // freshly init'd repo with untracked work hard-fails before
+      // read-tree.
+      //
+      // Build a preservation commit using the same temp-index trick
+      // as snapshot, then anchor it under refs/agent/restore-saved/
+      // so it survives git GC. The user recovers via `git read-tree
+      // --reset -u <ref>` (the inverse of what we're about to do
+      // for the checkpoint).
+      const indexFile = await tempIndexPath();
+      try {
+        const env = { GIT_INDEX_FILE: indexFile };
+        // No headSha to seed from on unborn HEAD; the index starts
+        // empty, and `add -A` populates it from the working tree.
+        await runGit(['add', '-A', '.'], { cwd, env });
+        const treeRes = await runGit(['write-tree'], { cwd, env });
+        const tree = treeRes.stdout.trim();
+        if (tree.length === 0) {
+          throw new Error('git write-tree produced empty output (unborn-HEAD preserve)');
+        }
+        const commitEnv: Record<string, string> = {
+          GIT_AUTHOR_NAME: 'forja',
+          GIT_AUTHOR_EMAIL: 'forja@local',
+          GIT_COMMITTER_NAME: 'forja',
+          GIT_COMMITTER_EMAIL: 'forja@local',
+        };
+        const commitRes = await runGit(['commit-tree', tree], {
+          cwd,
+          env: commitEnv,
+          stdin: 'forja: pre-restore working tree (unborn HEAD)',
+        });
+        const sha = commitRes.stdout.trim();
+        if (sha.length === 0) {
+          throw new Error('git commit-tree produced empty output (unborn-HEAD preserve)');
+        }
+        // Timestamp namespace keeps multiple unborn-HEAD restores
+        // distinguishable; ms granularity is enough since restore is
+        // strictly serial (one CLI invocation at a time).
+        const ref = `refs/agent/restore-saved/${Date.now()}`;
+        await runGit(['update-ref', ref, sha], { cwd });
+        stashed = true;
+        stashRef = ref;
+        stashKind = 'agent-ref';
+      } finally {
+        await cleanupTempIndex(indexFile);
+      }
     }
   }
   // `read-tree --reset -u <commit>`: rewrite both index and working tree
-  // to match the commit's tree, leave HEAD at the user's branch tip.
-  // This is the same primitive `git checkout <sha> -- .` uses internally
-  // but without the side effects of touching HEAD or the reflog.
+  // to match the commit's tree, leave HEAD at the user's branch tip
+  // (or unset, on unborn HEAD). This is the same primitive
+  // `git checkout <sha> -- .` uses internally but without the side
+  // effects of touching HEAD or the reflog.
   await runGit(['read-tree', '--reset', '-u', commitSha], { cwd });
   // Re-sync the index with HEAD (when HEAD is born). After the read-tree
   // above, the index matches the checkpoint's tree, NOT HEAD — so the
@@ -368,14 +433,17 @@ export const restore = async (cwd: string, commitSha: string): Promise<RestoreRe
   // committed during the agent run, HEAD already matches the checkpoint
   // and this is a no-op; for users who had, this collapses the surprise
   // "you have N staged files" message into the natural "you have N
-  // unstaged changes vs HEAD" view.
+  // unstaged changes vs HEAD" view. Skipped on unborn HEAD where
+  // there's nothing to re-sync against.
   //
   // `read-tree HEAD` (no -u, no --reset) updates only the index.
   const headAfter = await getHeadSha(cwd);
   if (headAfter !== null) {
     await runGit(['read-tree', headAfter], { cwd });
   }
-  if (stashed && stashRef !== undefined) return { stashed, stashRef };
+  if (stashed && stashRef !== undefined && stashKind !== undefined) {
+    return { stashed, stashRef, stashKind };
+  }
   return { stashed: false };
 };
 
