@@ -296,6 +296,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // any older head is dropped (recency over depth — see
       // resume.ts comment). When that happens we surface the count
       // so a renderer / log shows the user "resumed with N of M".
+      // Carry forward the parent_id chain across resume. Without
+      // seeding lastMessageId from the prior tail, the new user
+      // turn appends with parent_id=null and starts a NEW root in
+      // the same session — the parent_id graph forks at every
+      // resume boundary, breaking traversal/replay/audit logic
+      // that walks parent links to reconstruct the conversation
+      // tree. The persisted list is already ordered by seq
+      // (migration 007), so the tail is just the last element.
+      let priorTailId: string | null = null;
       if (resumeId !== undefined) {
         const persisted = listMessagesBySession(config.db, resumeId);
         const restored = messagesToProviderMessages(persisted);
@@ -308,12 +317,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             dropped: restored.droppedFromHead,
           });
         }
+        const tail = persisted[persisted.length - 1];
+        if (tail !== undefined) priorTailId = tail.id;
       }
 
       const userMsg = appendMessage(config.db, {
         sessionId,
         role: 'user',
         content: config.userPrompt,
+        // null on first turn (new session); tail id on resume so
+        // the chain stays connected. appendMessage validates the
+        // parent belongs to the same session.
+        ...(priorTailId !== null ? { parentId: priorTailId } : {}),
       });
       lastMessageId = userMsg.id;
       messages.push({ role: 'user', content: config.userPrompt });

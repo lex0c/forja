@@ -130,14 +130,19 @@ describe('--resume flow', () => {
     expect(sessionsAfterSecond[0]?.id).toBe(sessionId);
     expect(sessionsAfterSecond[0]?.status).toBe('done');
     // Messages: 2 from first run + 2 from second run = 4 total.
-    // Position-independent assertion: ORDER BY created_at, id can
-    // rank two messages with the same ms timestamp by UUID, which
-    // is non-deterministic. Verify the follow-up landed by content
-    // search rather than positional index.
+    // Migration 007 made the order strictly insertion-deterministic
+    // (seq column, populated at INSERT time), so we can assert
+    // positionally now: [user 'first', assistant 'first reply',
+    // user 'follow up', assistant 'second reply']. Before the
+    // migration, two appends in the same ms could swap on UUID lex.
     const msgsAfterSecond = listMessagesBySession(db, sessionId);
     expect(msgsAfterSecond).toHaveLength(4);
-    expect(msgsAfterSecond.some((m) => m.role === 'user' && m.content === 'follow up')).toBe(true);
-    expect(msgsAfterSecond.some((m) => m.role === 'user' && m.content === 'first')).toBe(true);
+    expect(msgsAfterSecond[0]?.role).toBe('user');
+    expect(msgsAfterSecond[0]?.content).toBe('first');
+    expect(msgsAfterSecond[1]?.role).toBe('assistant');
+    expect(msgsAfterSecond[2]?.role).toBe('user');
+    expect(msgsAfterSecond[2]?.content).toBe('follow up');
+    expect(msgsAfterSecond[3]?.role).toBe('assistant');
     db.close();
   });
 
@@ -314,6 +319,73 @@ describe('--resume flow', () => {
     });
     expect(code).toBe(1);
     expect(errLines.join('')).toContain('not found');
+  });
+
+  test('parent_id chain is contiguous across resume boundaries', async () => {
+    // Regression: the resumed user turn was appending with
+    // parent_id=null, starting a NEW root chain in the same
+    // session. Walking parent_id from any post-resume message
+    // would dead-end at the resume boundary instead of climbing
+    // back through the original conversation. Audit / replay /
+    // any tree-walk got an inconsistent view.
+    //
+    // Now: the resume init seeds the new userMsg's parent_id with
+    // the tail of the prior persisted log. Walking back from the
+    // last message reaches the very first user prompt without a
+    // null-parent break in the middle.
+    await run({
+      args: baseArgs({ prompt: 'first' }),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'a' }]),
+        dbPath,
+        cwd: workdir,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: recordingRenderer().renderer,
+    });
+
+    db = openTestDb();
+    const id = listSessions(db, {})[0]?.id;
+    if (id === undefined) throw new Error('expected session');
+    db.close();
+
+    await run({
+      args: baseArgs({ prompt: 'follow up', resume: id }),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'b' }]),
+        dbPath,
+        cwd: workdir,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: recordingRenderer().renderer,
+    });
+
+    db = openTestDb();
+    const msgs = listMessagesBySession(db, id);
+    expect(msgs).toHaveLength(4);
+    // Build a parent->child map and walk from the last message
+    // back to the root. Every link must resolve until we hit the
+    // single null-parent root (the very first user prompt).
+    const byId = new Map(msgs.map((m) => [m.id, m]));
+    const tail = msgs[msgs.length - 1];
+    if (tail === undefined) throw new Error('expected tail');
+    const visited: string[] = [];
+    let cursor: typeof tail | undefined = tail;
+    while (cursor !== undefined) {
+      visited.push(cursor.id);
+      if (cursor.parentId === null) break;
+      const parent = byId.get(cursor.parentId);
+      if (parent === undefined) throw new Error(`broken chain at ${cursor.id}`);
+      cursor = parent;
+    }
+    // Visited every message exactly once — chain is contiguous.
+    expect(visited.length).toBe(4);
+    // Root is the original 'first' user prompt.
+    const root = byId.get(visited[visited.length - 1] ?? '');
+    expect(root?.role).toBe('user');
+    expect(root?.content).toBe('first');
+    expect(root?.parentId).toBeNull();
+    db.close();
   });
 
   test('preserves total_cost_usd cumulatively across resume', async () => {
