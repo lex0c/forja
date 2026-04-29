@@ -495,4 +495,125 @@ describe('runCheckpointsCli', () => {
       expect(obj).toEqual({ ok: true, deleted: 1 });
     });
   });
+
+  describe('cwd mismatch refusal', () => {
+    // Session was created with cwd=repo. If the user cds to a
+    // different directory and invokes a checkpoint verb against the
+    // same session id, the handler must refuse — running git ops in
+    // the wrong repo can mutate or destroy state for an unrelated
+    // project (especially --undo, which calls read-tree --reset -u
+    // on the active repo's working tree).
+    let otherCwd: string;
+    beforeEach(async () => {
+      otherCwd = await mkdtemp(join(tmpdir(), 'forja-cli-ckpt-other-'));
+    });
+    afterEach(async () => {
+      await rm(otherCwd, { recursive: true, force: true });
+    });
+
+    test('--undo refuses when current cwd differs from session cwd', async () => {
+      insertCheckpoint(db, { sessionId, stepId: 's1', gitRef: 'abc', hadBash: false });
+      const c = capture();
+      const code = await runCheckpointsCli({
+        verb: 'undo',
+        positionals: [sessionId],
+        json: false,
+        yes: false,
+        cwd: otherCwd,
+        dbOverride: db,
+        out: c.pushOut,
+        err: c.pushErr,
+      });
+      expect(code).toBe(1);
+      const errStr = c.err.join('');
+      expect(errStr).toContain(repo);
+      expect(errStr).toContain(otherCwd);
+      expect(errStr).toMatch(/cwd|directory/);
+    });
+
+    test('--checkpoints restore refuses on cwd mismatch', async () => {
+      const ckpt = insertCheckpoint(db, {
+        sessionId,
+        stepId: 's1',
+        gitRef: 'abc',
+        hadBash: false,
+      });
+      const c = capture();
+      const code = await runCheckpointsCli({
+        verb: 'restore',
+        positionals: [sessionId, ckpt.id],
+        json: false,
+        yes: true,
+        cwd: otherCwd,
+        dbOverride: db,
+        out: c.pushOut,
+        err: c.pushErr,
+      });
+      expect(code).toBe(1);
+      expect(c.err.join('')).toContain(repo);
+    });
+
+    test('--checkpoints diff refuses on cwd mismatch', async () => {
+      const ckpt = insertCheckpoint(db, {
+        sessionId,
+        stepId: 's1',
+        gitRef: 'abc',
+        hadBash: false,
+      });
+      const c = capture();
+      const code = await runCheckpointsCli({
+        verb: 'diff',
+        positionals: [sessionId, ckpt.id],
+        json: false,
+        yes: false,
+        cwd: otherCwd,
+        dbOverride: db,
+        out: c.pushOut,
+        err: c.pushErr,
+      });
+      expect(code).toBe(1);
+      expect(c.err.join('')).toContain(repo);
+    });
+
+    test('--checkpoints purge refuses on cwd mismatch (does NOT drop rows)', async () => {
+      insertCheckpoint(db, { sessionId, stepId: 's1', gitRef: 'a', hadBash: false });
+      insertCheckpoint(db, { sessionId, stepId: 's2', gitRef: 'b', hadBash: false });
+      const c = capture();
+      const code = await runCheckpointsCli({
+        verb: 'purge',
+        positionals: [sessionId],
+        json: false,
+        yes: false,
+        cwd: otherCwd,
+        dbOverride: db,
+        out: c.pushOut,
+        err: c.pushErr,
+      });
+      expect(code).toBe(1);
+      // Critical: rows must NOT be deleted when the wrong cwd was
+      // detected. The previous shape called the manager's purge
+      // before validating cwd, leaving DB rows gone with refs intact.
+      expect(listCheckpointsBySession(db, sessionId)).toHaveLength(2);
+    });
+
+    test('--checkpoints list refuses on cwd mismatch', async () => {
+      // List is read-only but a cross-cwd listing is misleading
+      // (the user couldn't act on the entries from this cwd anyway).
+      // Refuse for consistency with the destructive verbs.
+      insertCheckpoint(db, { sessionId, stepId: 's1', gitRef: 'a', hadBash: false });
+      const c = capture();
+      const code = await runCheckpointsCli({
+        verb: 'list',
+        positionals: [sessionId],
+        json: false,
+        yes: false,
+        cwd: otherCwd,
+        dbOverride: db,
+        out: c.pushOut,
+        err: c.pushErr,
+      });
+      expect(code).toBe(1);
+      expect(c.err.join('')).toContain(repo);
+    });
+  });
 });

@@ -90,10 +90,37 @@ const writeListTable = (items: CheckpointListItem[], out: (s: string) => void): 
   }
 };
 
-const ensureSessionExists = (db: DB, sessionId: string, err: (s: string) => void): boolean => {
+// Validate that the session id exists AND was created in the current
+// cwd. The cwd guard is load-bearing for every verb beyond list:
+//   - restore / undo run `git read-tree --reset -u` against the
+//     active repo. If the session belongs to a different project,
+//     the checkpoint's commit sha doesn't exist there, and we'd
+//     either error confusingly OR (catastrophic) clobber unrelated
+//     working-tree state if a sha collision happens.
+//   - diff would compare against the wrong working tree.
+//   - purge would drop DB rows for the wrong project; refs are
+//     scoped to git so the ref delete is a harmless no-op, but the
+//     audit log loss is silent.
+//   - list reads only the DB but a cross-cwd listing is misleading
+//     (the entries can't be acted on from this cwd anyway).
+//
+// Mirrors the cwd guard runAgent already enforces on resume (see
+// src/harness/loop.ts) — same threat model, same message shape.
+const ensureSessionForCwd = (
+  db: DB,
+  sessionId: string,
+  cwd: string,
+  err: (s: string) => void,
+): boolean => {
   const session = getSession(db, sessionId);
   if (session === null) {
     err(`forja: session ${sessionId} not found\n`);
+    return false;
+  }
+  if (session.cwd !== cwd) {
+    err(
+      `forja: session ${sessionId} was created in '${session.cwd}', not '${cwd}'.\ncd to the original directory to operate on this session, or use\n\`agent --list-sessions\` to find a session for the current cwd.\n`,
+    );
     return false;
   }
   return true;
@@ -119,7 +146,7 @@ const runList = async (input: CheckpointsCliInput, db: DB): Promise<number> => {
     input.err('forja: --checkpoints list requires a session id\n');
     return 1;
   }
-  if (!ensureSessionExists(db, sessionId, input.err)) return 1;
+  if (!ensureSessionForCwd(db, sessionId, input.cwd, input.err)) return 1;
   const mgr = await buildManager(db, input.cwd, sessionId);
   const list = await mgr.list(sessionId);
   const items = list.map(toItem);
@@ -134,7 +161,7 @@ const runDiff = async (input: CheckpointsCliInput, db: DB): Promise<number> => {
     input.err('forja: --checkpoints diff requires a session id and a checkpoint id\n');
     return 1;
   }
-  if (!ensureSessionExists(db, sessionId, input.err)) return 1;
+  if (!ensureSessionForCwd(db, sessionId, input.cwd, input.err)) return 1;
   const mgr = await buildManager(db, input.cwd, sessionId);
   // `available=false` short-circuit. The manager throws with a
   // clear "not available" message; we surface it as a clean exit
@@ -253,7 +280,7 @@ const runRestore = async (input: CheckpointsCliInput, db: DB): Promise<number> =
     input.err('forja: --checkpoints restore requires a session id and a checkpoint id\n');
     return 1;
   }
-  if (!ensureSessionExists(db, sessionId, input.err)) return 1;
+  if (!ensureSessionForCwd(db, sessionId, input.cwd, input.err)) return 1;
   const mgr = await buildManager(db, input.cwd, sessionId);
   const ckpt = await mgr.get(ckptId);
   if (ckpt === null || ckpt.sessionId !== sessionId) {
@@ -272,7 +299,7 @@ const runUndo = async (input: CheckpointsCliInput, db: DB): Promise<number> => {
     input.err('forja: --undo requires a session id\n');
     return 1;
   }
-  if (!ensureSessionExists(db, sessionId, input.err)) return 1;
+  if (!ensureSessionForCwd(db, sessionId, input.cwd, input.err)) return 1;
   const ckpt = getLatestCheckpointBySession(db, sessionId);
   if (ckpt === null) {
     input.err(`forja: session ${sessionId} has no checkpoints to undo\n`);
@@ -287,7 +314,7 @@ const runPurge = async (input: CheckpointsCliInput, db: DB): Promise<number> => 
     input.err('forja: --checkpoints purge requires a session id\n');
     return 1;
   }
-  if (!ensureSessionExists(db, sessionId, input.err)) return 1;
+  if (!ensureSessionForCwd(db, sessionId, input.cwd, input.err)) return 1;
   const mgr = await buildManager(db, input.cwd, sessionId);
   const deleted = await mgr.purge({ sessionId });
   if (input.json) {
