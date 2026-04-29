@@ -137,12 +137,19 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         // and restore take 2, purge takes 1). Centralizing arity
         // here would couple the parser to handler shape; let the
         // handler own that contract.
+        //
+        // Stop at any token starting with `-` — both long flags
+        // (`--json`) and short flags (`-y`). Earlier the scan only
+        // stopped at `--`, so `--checkpoints restore <s> <c> -y`
+        // swallowed `-y` as a positional and left yes=false. Session
+        // and checkpoint ids are UUIDs (start with hex), so the
+        // unambiguous-positional case never produces a `-` prefix.
         const positionals: string[] = [];
         let j = i + 2;
         while (j < argv.length) {
           const next = argv[j];
           if (next === undefined) break;
-          if (next.startsWith('--')) break;
+          if (next.startsWith('-')) break;
           positionals.push(next);
           j += 1;
         }

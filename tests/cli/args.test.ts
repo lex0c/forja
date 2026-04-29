@@ -248,6 +248,18 @@ describe('--checkpoints flag', () => {
     expect(r.args.json).toBe(true);
   });
 
+  test('positional collection stops at short flags too', () => {
+    // Bug repro: `--checkpoints restore <session> <ckpt> -y` was
+    // swallowing `-y` as a positional, leaving yes=false and breaking
+    // had-bash restores. The greedy scan only stopped at `--` prefix
+    // tokens; short flags are equally valid breakpoints.
+    const r = parseArgs(['--checkpoints', 'restore', 'sess', 'ckpt', '-y']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.checkpoints?.positionals).toEqual(['sess', 'ckpt']);
+    expect(r.args.yes).toBe(true);
+  });
+
   test('rejects when no verb is given', () => {
     expect(parseArgs(['--checkpoints']).ok).toBe(false);
     expect(parseArgs(['--checkpoints', '--json']).ok).toBe(false);
