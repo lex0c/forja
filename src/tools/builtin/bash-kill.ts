@@ -53,6 +53,10 @@ export const bashKillTool: Tool<BashKillInput, BashKillOutput> = {
     category: 'misc',
     // Sends a signal — pessimistic write under plan mode.
     writes: true,
+    // Killing a bg process is itself a side effect that doesn't
+    // revert when a checkpoint restores: the process is gone and
+    // any half-finished work it had in flight stays half-finished.
+    escapesCwd: true,
     exec: true,
     idempotent: true, // re-killing an already-killed process is a no-op
     display: 'raw',

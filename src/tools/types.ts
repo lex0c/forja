@@ -57,6 +57,15 @@ export interface ToolMetadata {
   planSafe?: boolean | ((args: Record<string, unknown>) => boolean);
   network?: boolean;
   exec?: boolean;
+  // Side effects of this tool may escape `ctx.cwd` — bash, network
+  // calls, process spawns, anything that writes outside the work-tree.
+  // Drives the warning in `--undo` (CHECKPOINTS.md §2.6) because such
+  // effects are NOT reversed by a working-tree restore. Defaults to
+  // false; the bash family opts in. The harness also keeps a name
+  // fallback (`bash`, `bash_background`, `bash_kill`) as defense in
+  // depth so external tool definitions added without setting the flag
+  // still get the warning.
+  escapesCwd?: boolean;
   idempotent: boolean;
   display?: DisplayHint;
   // Optional cost hints; informational only in M1.

@@ -121,6 +121,10 @@ export const bashTool: Tool<BashInput, BashOutput> = {
   metadata: {
     category: 'bash',
     writes: true, // pessimistic per CONTRACTS §2.6.3
+    // Bash side effects (DB writes, network, process spawns, files
+    // outside cwd) are not reversed by checkpoint restore. See
+    // CHECKPOINTS.md §2.6 for the warning UX this drives.
+    escapesCwd: true,
     // Plan mode allows bash ONLY when the model declares the
     // call read-only via `args.read_only === true`. Without this
     // gate, plan mode would either block all bash (losing

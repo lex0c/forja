@@ -58,6 +58,10 @@ export const bashBackgroundTool: Tool<BashBackgroundInput, BashBackgroundOutput>
     // — there's no read-only sense in which a long-running background
     // process makes sense in plan mode anyway.
     writes: true,
+    // See bash.ts — same rationale: bg commands typically spawn
+    // processes and may touch filesystem outside cwd. Drives the
+    // checkpoint-restore warning.
+    escapesCwd: true,
     exec: true,
     idempotent: false,
     display: 'raw',
