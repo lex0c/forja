@@ -15,6 +15,106 @@ Format:
 
 ---
 
+## [2026-04-29] M3 / Step 3 — review fixes (post-self-review pass)
+
+Self-review surfaced 13 issues across the Step 3 surface — 3 critical
+(C1–C3), 5 medium, and 5 minor. All addressed in this pass; the
+checkpoints subsystem now has tighter subprocess hygiene, no
+race-on-shutdown, and a metadata-driven escapesCwd flag.
+
+**Critical:**
+
+- **C1 — Race between fire-and-forget retention purge and `db.close`.**
+  `cli/run.ts` closes the DB right after `runAgent` returns; the
+  prior fire-and-forget purge could outlive the close and hit a
+  closed sqlite handle (segfault risk depending on Bun's binding).
+  Fix: capture the purge promise in the loop's outer scope and
+  `await` it in the outer `finally` (with `.catch` swallow) before
+  any other cleanup. The retention tests dropped their 50ms
+  `setTimeout` polling — the purge now resolves synchronously by
+  the time `runAgent` returns.
+- **C2 — Spec §13 vs CHECKPOINTS.md divergence.** Spec §13 still
+  declared the v0 columns (`ref`, `kind`, `files_changed`,
+  `size_bytes`); the design doc CHECKPOINTS.md §2.4 already
+  resolved the open question to (`git_ref`, `had_bash`) and the
+  code followed §2.4. CLAUDE.md says diverging from spec requires
+  a spec PR first — fixed by editing §13 to match (cascade FK,
+  `had_bash` CHECK, comment pointing to §2.4 for the v0→v1
+  motivation).
+- **C3 — `restore()` could leave a stash orphan on a GC'd commit.**
+  Old shape: stash dirty changes first, then `read-tree --reset
+  -u <sha>` — if the sha was GC'd, the read-tree threw and the
+  user got "Restored to checkpoint X" while their working tree
+  was actually in stash@{0}. Fix: probe `rev-parse --verify
+  <sha>^{commit}` BEFORE stashing. Test verifies dirty file
+  stays in working tree when the sha is unreachable.
+
+**Medium:**
+
+- **M1 — Post-restore index now matches HEAD, not the checkpoint.**
+  `read-tree --reset -u <ckpt>` rewrote both index and worktree
+  to the checkpoint tree, leaving HEAD pointing past it. The
+  user's `git status` then showed the diff between HEAD and the
+  ckpt as "staged for commit" — confusing UX when they had their
+  own commits during the agent run. Fix: after the reset, run
+  `read-tree HEAD` (no -u) to re-sync the index. Status reads as
+  the natural "unstaged changes vs HEAD" (or clean, when HEAD ==
+  ckpt-tree). Test asserts `git status --porcelain` shows only
+  untracked-file rows post-restore.
+- **M2 — Orphan-ref sweep was O(N×M).** Per-ref
+  `listCheckpointsBySession` lookup turned the cleanup into a
+  quadratic walk for sessions with no rows but many refs.
+  Replaced with one `SELECT DISTINCT session_id FROM checkpoints`
+  and a Set lookup. Same correctness, linear.
+- **M3 — `runGit` had no timeout and leaked subprocess on stdin
+  failure.** Added a 30s default timeout (`RUN_GIT_DEFAULT_TIMEOUT_MS`,
+  per-call override via `opts.timeoutMs`); a stuck git process
+  (waiting on a ref lock from another git instance) now throws
+  `git X timed out after Nms` instead of wedging the harness for
+  the full wall-clock budget. Stdin write/end is wrapped in
+  try/finally that kills the subprocess on error, closing the
+  zombie-on-broken-pipe gap.
+- **M4 — Manager opened its own `Bun.spawn` for `update-ref`.**
+  Inconsistent with the rest of the surface (everything else
+  goes through `runGit`). Exposed `setSessionRef(cwd, sessionId,
+  sha)` in `git.ts` and the manager's purge re-pointing now
+  uses it — same env scrubbing, same timeout, same auditable
+  surface.
+- **M5+m2 — Dead code + `path.dirname`.** `purge()`'s sessionId
+  branch read `rows = listCheckpointsBySession` and discarded
+  with `void rows;` (leftover from an earlier shape that wanted
+  per-ref deletion); removed. `cleanupTempIndex` switched
+  `join(indexFile, '..')` → `dirname(indexFile)` for clarity
+  and platform-safety.
+
+**Minor:**
+
+- **m1 — `ToolMetadata.escapesCwd` flag with metadata-first
+  detection.** `had_bash` was hardcoded to a name list (`bash`,
+  `bash_background`, `bash_kill`); future tools with the same
+  risk profile would silently miss the warning. Added optional
+  `escapesCwd?: boolean` to ToolMetadata; the bash family opts
+  in. The harness checks the flag first and falls back to the
+  name list as defense in depth so external tool definitions
+  that pre-date the flag still get the warning.
+- **m3 — Friendly CLI message for GC'd ckpt commits.** `--undo`
+  on a checkpoint whose commit was reclaimed by `git gc` used to
+  surface raw git output (`fatal: bad object` /
+  `Needed a single revision`). Rewrites detected via substring
+  match into "this checkpoint references commit X which is no
+  longer reachable; run `agent --checkpoints purge <session>` to
+  drop the stale rows." Test seeds an unreachable sha and
+  asserts the hint is on stderr.
+
+**Verification:** `bun test` 1048 pass / 10 skip / 0 fail (+3 vs the
+foundation pass: GC-collected restore hint, post-restore index
+shape, restore-on-bad-sha leaves dirty intact); `tsc --noEmit`
+clean; `biome check` clean. Retention tests dropped their
+`setTimeout(50)` polling — the C1 await makes purge resolution
+deterministic.
+
+---
+
 ## [2026-04-29] M3 / Step 3 — Checkpoints + `--undo`
 
 Lands `AGENTIC_CLI §12` + the `CHECKPOINTS.md` design doc:
