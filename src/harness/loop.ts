@@ -205,6 +205,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           db: config.db,
           sessionId,
           logDir: config.bgLogDir,
+          // Propagate the harness's combined signal (caller abort +
+          // wall-clock). A Ctrl+C mid-stream kills bg processes
+          // immediately instead of waiting for runAgent's outer
+          // finally to fire — matters when the loop is mid-provider-
+          // request, where finally can be seconds away.
+          abortSignal: signal,
         });
       }
 

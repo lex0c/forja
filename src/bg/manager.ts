@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { join } from 'node:path';
+import { scrubEnv } from '../sanitize/index.ts';
 import type { DB } from '../storage/db.ts';
 import {
   type BgProcess,
@@ -37,6 +38,14 @@ export interface SpawnInput {
   command: string;
   label?: string;
   cwd?: string;
+  // Optional absolute runtime cap. When set, the manager schedules
+  // a SIGTERM (with normal kill grace → SIGKILL escalation) after
+  // this many milliseconds. Cleared on natural exit so it never
+  // fires after the process is already gone. Default undefined =
+  // no cap, keeping the long-running semantics for dev servers /
+  // watchers / file-system monitors. Models can opt in when they
+  // know a build / test run / one-shot job has a bounded duration.
+  maxRuntimeMs?: number;
 }
 
 export interface SpawnResult {
@@ -122,6 +131,13 @@ export interface CreateBgManagerOptions {
   // processes are written. Created on demand. Caller's responsibility
   // to wire to `.agent/bg/<session-or-global>/` per spec §2.7.
   logDir: string;
+  // Harness-level abort signal. When provided, the manager registers
+  // a one-shot listener that runs `cleanup()` immediately on abort
+  // — bg processes die at signal time instead of waiting for the
+  // session-end finally to fire (which can be seconds later if the
+  // loop is mid-stream). Cleanup is idempotent so the explicit
+  // call in `runAgent`'s outer finally is harmless after this fires.
+  abortSignal?: AbortSignal;
 }
 
 const ensureDir = (dir: string): void => {
@@ -180,7 +196,7 @@ const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
   });
 
 export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
-  const { db, sessionId, logDir } = options;
+  const { db, sessionId, logDir, abortSignal } = options;
   // In-memory map of live handles, keyed by internal process id. The
   // DB is the source of truth for status across restarts; this map
   // is the in-flight reference we need to actually call .kill() on
@@ -209,6 +225,12 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       proc = Bun.spawn({
         cmd: ['bash', '-c', input.command],
         cwd,
+        // env scrubbed at the boundary — same defense the synchronous
+        // bash tool applies. Without this, a model can spawn a bg
+        // process whose command echoes the harness's API keys to the
+        // log file and exfiltrate via bash_output. Defense in depth;
+        // sandbox (M3+) is the next layer.
+        env: scrubEnv(process.env),
         stdout: Bun.file(stdoutPath),
         stderr: Bun.file(stderrPath),
         // Detach from parent so a crash of the harness doesn't
@@ -248,6 +270,20 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       spawnedAt,
     });
 
+    // Optional runtime cap. Schedules a SIGTERM (with normal grace
+    // → SIGKILL escalation) after maxRuntimeMs. Stored locally so
+    // the exit handler can clear it on natural exit and we don't
+    // hold a stale timer past the process's life.
+    let runtimeTimer: ReturnType<typeof setTimeout> | undefined;
+    if (input.maxRuntimeMs !== undefined && input.maxRuntimeMs > 0) {
+      runtimeTimer = setTimeout(() => {
+        // Fire-and-forget kill. If the process already exited (race
+        // between timer firing and natural exit), kill() is a no-op
+        // because status will be 'exited' or 'killed'.
+        void kill(id, { signal: 'SIGTERM' }).catch(() => {});
+      }, input.maxRuntimeMs);
+    }
+
     // Subscribe to exit. When the process finishes naturally we
     // record the exit code; if it was killed via .kill() the kill
     // handler also awaits this promise, so the DB write happens
@@ -267,6 +303,11 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
       //      to do with them.
       try {
         const code = await proc.exited;
+        // Clear the runtime timer so it doesn't fire after the
+        // process is already gone (no-op kill, but allocates a
+        // pointless task in the loop and keeps the timer
+        // referenced for its full duration).
+        if (runtimeTimer !== undefined) clearTimeout(runtimeTimer);
         try {
           const current = getBgProcess(db, id);
           // If status was already moved to 'killed' or 'failed',
@@ -440,6 +481,28 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
   };
 
   const liveCount = (): number => live.size;
+
+  // Wire the abort signal AFTER cleanup is defined so the listener
+  // can reference it. `once: true` means the listener runs at most
+  // once even if the signal fires multiple times. The catch swallows
+  // any cleanup throw so an aborting harness doesn't surface the
+  // bg subsystem's errors as the abort cause.
+  if (abortSignal !== undefined) {
+    if (abortSignal.aborted) {
+      // Already aborted at construction time. Fire cleanup immediately
+      // — there's nothing to do today (no spawns happened) but the
+      // contract should be the same as a normal abort path.
+      cleanup().catch(() => {});
+    } else {
+      abortSignal.addEventListener(
+        'abort',
+        () => {
+          cleanup().catch(() => {});
+        },
+        { once: true },
+      );
+    }
+  }
 
   return { spawn, readOutput, kill, cleanup, liveCount };
 };

@@ -4,6 +4,13 @@ export interface BashBackgroundInput {
   command: string;
   label?: string;
   cwd?: string;
+  // Optional absolute runtime cap in milliseconds. When set, the
+  // process is killed (SIGTERM with grace → SIGKILL) after this
+  // many ms even if it's still running. Default undefined keeps
+  // the long-running semantics (dev servers, watchers); set when
+  // the model knows the job is bounded (a build, test run, one-
+  // shot script) and wants protection against runaway loops.
+  max_runtime_ms?: number;
 }
 
 export interface BashBackgroundOutput {
@@ -29,6 +36,12 @@ export const bashBackgroundTool: Tool<BashBackgroundInput, BashBackgroundOutput>
       cwd: {
         type: 'string',
         description: 'Working directory. Defaults to session cwd.',
+      },
+      max_runtime_ms: {
+        type: 'integer',
+        minimum: 100,
+        description:
+          'Optional absolute runtime cap. Kills the process after this many ms via SIGTERM (with grace → SIGKILL). Omit for unbounded (dev servers, watchers).',
       },
     },
     required: ['command'],
@@ -72,6 +85,7 @@ export const bashBackgroundTool: Tool<BashBackgroundInput, BashBackgroundOutput>
         command: args.command,
         ...(args.label !== undefined ? { label: args.label } : {}),
         ...(args.cwd !== undefined ? { cwd: args.cwd } : {}),
+        ...(args.max_runtime_ms !== undefined ? { maxRuntimeMs: args.max_runtime_ms } : {}),
       });
       return {
         process_id: r.id,

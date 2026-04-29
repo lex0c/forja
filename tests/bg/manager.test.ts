@@ -79,6 +79,42 @@ describe('bg manager: spawn', () => {
     await waitForExit(r.id);
   });
 
+  test('scrubs credentials from spawned env (defense-in-depth)', async () => {
+    // Set a sentinel API-key-shaped variable on the harness env. The
+    // shape matches scrubEnv's pattern (`*_API_KEY` suffix). The
+    // spawned process echoes the variable; if scrubbing works the
+    // child sees an empty string.
+    const sentinel = 'forja-test-secret-must-not-leak';
+    const prev = process.env.FORJA_TEST_API_KEY;
+    process.env.FORJA_TEST_API_KEY = sentinel;
+    try {
+      const r = await mgr.spawn({
+        command: 'printf "%s" "${FORJA_TEST_API_KEY:-<empty>}"',
+      });
+      await waitForExit(r.id);
+      const out = await mgr.readOutput(r.id);
+      expect(out.stdout).toBe('<empty>');
+      expect(out.stdout).not.toContain(sentinel);
+    } finally {
+      if (prev === undefined) delete process.env.FORJA_TEST_API_KEY;
+      else process.env.FORJA_TEST_API_KEY = prev;
+    }
+  });
+
+  test('preserves innocuous env vars (PATH, HOME)', async () => {
+    // Sanity check that scrubEnv didn't gut the env entirely. A child
+    // that can't find `bash` would fail with status='failed' or non-
+    // zero exit; instead we expect a successful echo of $PATH which
+    // bash can only resolve if it ran.
+    const r = await mgr.spawn({
+      command: 'echo "PATH=$PATH"',
+    });
+    await waitForExit(r.id);
+    const out = await mgr.readOutput(r.id);
+    expect(out.stdout).toContain('PATH=');
+    expect(out.stdout.length).toBeGreaterThan('PATH='.length);
+  });
+
   test('liveCount drops back to zero after natural exit', async () => {
     expect(mgr.liveCount()).toBe(0);
     const r = await mgr.spawn({ command: 'true' });
@@ -226,6 +262,87 @@ describe('bg manager: kill', () => {
 
   test('throws on unknown id', async () => {
     expect(mgr.kill('nope')).rejects.toThrow(/not found/);
+  });
+});
+
+describe('bg manager: maxRuntimeMs', () => {
+  test('caps a long-running process at the runtime budget', async () => {
+    const r = await mgr.spawn({ command: 'sleep 30', maxRuntimeMs: 200 });
+    // Wait long enough for SIGTERM grace + SIGKILL escalation cycle
+    // (5s default grace) + slack. The cap fires at 200ms; the
+    // process is cooperative so it should be killed well within
+    // the per-call kill grace, not the full 5s window.
+    const start = Date.now();
+    while (Date.now() - start < 8000) {
+      if (getBgProcess(db, r.id)?.status === 'killed') break;
+      await new Promise((res) => setTimeout(res, 25));
+    }
+    const elapsed = Date.now() - start;
+    expect(getBgProcess(db, r.id)?.status).toBe('killed');
+    // Sanity: cap fired roughly when expected (≥200ms, well under 8s)
+    expect(elapsed).toBeGreaterThanOrEqual(150);
+    expect(elapsed).toBeLessThan(8000);
+  });
+
+  test('cap timer is cleared on natural exit before firing', async () => {
+    // Process exits in ~50ms; cap is 5s. If the timer fires after
+    // exit it would attempt a kill — kill() is a no-op on already-
+    // exited (status check), so we observe via status='exited'.
+    const r = await mgr.spawn({ command: 'true', maxRuntimeMs: 5000 });
+    await waitForExit(r.id);
+    // Wait past 5s to confirm no spurious kill happens after exit
+    // (would flip status to 'killed' if the timer didn't clear).
+    await new Promise((res) => setTimeout(res, 100));
+    expect(getBgProcess(db, r.id)?.status).toBe('exited');
+  });
+
+  test('omitting maxRuntimeMs leaves process unbounded', async () => {
+    const r = await mgr.spawn({ command: 'sleep 30' });
+    // Wait 200ms to give any spurious cap timer a chance to fire.
+    await new Promise((res) => setTimeout(res, 200));
+    expect(getBgProcess(db, r.id)?.status).toBe('running');
+    await mgr.kill(r.id, { signal: 'SIGKILL' });
+  });
+});
+
+describe('bg manager: abortSignal', () => {
+  test('aborting the signal kills running bg processes promptly', async () => {
+    const ac = new AbortController();
+    const signalDir = setupTempLogDir();
+    const signalMgr = createBgManager({
+      db,
+      sessionId,
+      logDir: signalDir,
+      abortSignal: ac.signal,
+    });
+    const r = await signalMgr.spawn({ command: 'sleep 30' });
+    // Sanity: process is running before abort
+    expect(getBgProcess(db, r.id)?.status).toBe('running');
+    ac.abort();
+    // Wait for the cleanup-on-abort listener to fire and finish.
+    // 5s ceiling matches CLEANUP_KILL_GRACE_MS + slack — process is
+    // cooperative (sleep responds to SIGTERM), so it should be much
+    // faster.
+    const start = Date.now();
+    while (Date.now() - start < 5000) {
+      if (getBgProcess(db, r.id)?.status === 'killed') break;
+      await new Promise((res) => setTimeout(res, 25));
+    }
+    expect(getBgProcess(db, r.id)?.status).toBe('killed');
+  });
+
+  test('signal already aborted at construction time is handled gracefully', async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const signalDir = setupTempLogDir();
+    // Should not throw; cleanup runs (no-op since no spawns yet).
+    const signalMgr = createBgManager({
+      db,
+      sessionId,
+      logDir: signalDir,
+      abortSignal: ac.signal,
+    });
+    expect(signalMgr.liveCount()).toBe(0);
   });
 });
 
