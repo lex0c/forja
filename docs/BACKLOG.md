@@ -15,6 +15,231 @@ Format:
 
 ---
 
+## [2026-04-29] M3 / Step 2.2.3 — wait_for composition (all_of / any_of)
+
+Closes the `wait_for` tool surface with the composition layer
+spec §7.3.1 calls out: `all_of` (AND — wait for every
+sub-condition) and `any_of` (OR — race for the first match).
+Recursive over the 7 existing condition kinds (sleep,
+file_exists, file_change, port_open, http_response,
+process_exit, process_output) so a model can express
+"wait for the dev server to be ready (port_open OR
+http_response on /health) AND the build artifact to be
+written (file_exists)" in a single tool call.
+
+`monitor` (the third half of §7.3.1, streaming events) is
+split into Step 2.2.4 — different primitive (returns
+`{ events[], reason }`, separate tool surface).
+
+**Slice scope (2.2.3):**
+
+| Component | Status | Notes |
+|---|---|---|
+| `WaitCondition.all_of` | NEW | Recursive: `{ kind: 'all_of'; conditions: WaitCondition[] }` |
+| `WaitCondition.any_of` | NEW | Same shape, OR semantics |
+| `WaitConditionMet.all_of` / `any_of` | NEW | Distinct success kinds for payload routing |
+| Dispatch: any_of | NEW | Promise.any over sub-waits — first match wins. Loser sub-waits are aborted via shared AbortController. allSettled at the end ensures no leaked timers |
+| Dispatch: all_of | NEW | Spawn sub-waits in parallel, short-circuit abort on first failure (matched=false). Promise.all waits for all to settle (aborted siblings resolve quickly) |
+| Tool: recursive `buildCondition` | UPDATED | Validates nested conditions[]. Depth limit prevents adversarial nesting |
+| Tests | NEW | `tests/wait/composition.test.ts` + tool-level cases |
+
+**Decisions to make explicit upfront:**
+
+- **`any_of` uses `Promise.any`, not `Promise.race`.** Race
+  resolves on first SETTLED promise — including a sub
+  that timed out. We want first MATCHED. Promise.any
+  rejects only when all promises reject; we map
+  matched=false → rejection, matched=true → resolution.
+  Cleaner than ad-hoc filtering.
+- **`all_of` short-circuits on first failure.** As soon
+  as any sub returns matched=false, we abort the rest
+  via shared AbortController. Avoids paying the full
+  outer timeout for siblings that can't possibly help.
+- **Sub-waits inherit `bgManager` and a shared abort
+  signal.** Process_* conditions can appear inside
+  composition (`any_of([{ kind: 'process_exit'... }])`).
+  We thread `options.bgManager` to sub-calls; missing
+  manager fails fast at the sub's entry validation.
+- **Depth limit = 5.** `all_of([all_of([all_of(...)])])`
+  could be unbounded otherwise. Hard cap defends
+  against adversarial / buggy model output. Pulled in
+  if a real workflow needs deeper.
+- **Empty `conditions` arrays are well-defined:**
+  - `all_of([])` matches IMMEDIATELY (vacuously true —
+    the universal quantifier over empty set is true).
+  - `any_of([])` times out (vacuously false — the
+    existential over empty set is false).
+  - Both documented in the schema; no special-case
+    error.
+- **PolicyMode interactions stay at the leaf.** A
+  composition has no policy decision — only its leaves
+  (file_exists path, port_open host, etc.) do. Same as
+  Step 2.2.1's "no path policy gate on wait_for" risk;
+  composition doesn't make that gap better or worse.
+
+**Out of scope (2.2.4):**
+
+- `monitor` — streaming events with LLM-runs-at-end
+  semantics. Different return shape, different tool.
+
+**Spec reference:** `AGENTIC_CLI.md §7.3.1` (composition
+clauses), `src/wait/index.ts` (existing dispatch).
+
+**Done:**
+
+- WaitCondition extended with `all_of` and `any_of`,
+  both recursive over `WaitCondition[]`.
+  WaitConditionMet adds `'all_of'` and `'any_of'`
+  success kinds.
+- Composition handlers run BEFORE the poll loop in
+  `waitFor` (composition orchestrates, doesn't poll).
+  Sub-waits get a derived AbortController (`subAc`)
+  whose signal is what they receive as their `signal`
+  option. Outer-abort propagates to subAc via a
+  `once: true` listener; on resolution we abort subAc
+  to cancel siblings.
+- `any_of` uses `Promise.any` over sub-promises
+  mapped so matched=false → rejection. First MATCH
+  wins (not first settled). Loser sub-waits are
+  cancelled; `Promise.allSettled` ensures we don't
+  return before they clean up. Payload reports
+  `{ matchedIndex, matchedKind, matchedPayload? }`.
+- `all_of` uses `Promise.all` over tracked sub-promises;
+  the first failure (matched=false) sets `firstFail`
+  and aborts siblings via `subAc`. Promise.all still
+  awaits everyone settling (aborted siblings resolve
+  quickly). Payload reports `{ matched: N }` on success
+  or `{ failedIndex, failedKind, failedPayload? }` on
+  failure.
+- Empty-array semantics:
+  - `all_of([])` returns matched=true with `matched: 0`
+    immediately.
+  - `any_of([])` waits out the outer `timeoutMs` then
+    returns matched=false / conditionMet=`'timeout'`.
+- Tool surface adds `all_of` / `any_of` kinds to the
+  schema. `buildCondition` recurses with
+  `depth + 1`; `MAX_COMPOSITION_DEPTH = 5` rejects
+  unbounded nesting. `containsProcessCondition`
+  walks the (possibly composed) condition tree so
+  `bgManager` validation at the tool boundary catches
+  process_* nested in composition (e.g.,
+  `any_of([process_exit, sleep])`) — surfaces as
+  `bg.manager_unavailable`, not a mid-wait
+  `wait.internal_error`.
+- 11 unit tests in `tests/wait/composition.test.ts`:
+  any_of races first match, cancels losers,
+  empty array timeouts, captures matched sub-payload;
+  all_of waits for everyone, short-circuits on first
+  failure, empty array immediate match, payload on
+  failure; nested any_of inside all_of; aborted
+  signal propagates to sub-waits.
+- 5 tool tests in `tests/tools/wait-for.test.ts`:
+  empty arrays, recursive validation rejects nested
+  bad kind, depth limit rejects deep nesting,
+  process_* nested → bg.manager_unavailable,
+  end-to-end any_of via tool surface.
+- Total: 780 pass / 7 skip / 0 fail. Typecheck +
+  lint green.
+
+**Decisions taken (not in opener):**
+
+- **Listener cleanup in `finally`.** The composition
+  handler's outer-abort listener is added to
+  `combinedSignal` and removed in a `finally` block.
+  Without this, nested composition (sub-wait inside a
+  parent) would leave a dangling listener on the
+  parent's signal until both finished — small leak,
+  documented for hygiene.
+- **`Promise.any` rejection ignored, not aggregated.**
+  When all sub-promises reject (no match), Promise.any
+  throws AggregateError with the individual results.
+  We swallow the aggregate and call `finishUnmatched()`
+  with no payload — the conditionMet will reflect
+  whether the outer timeout or caller signal fired.
+  Surfacing per-sub failure reasons in any_of's payload
+  was considered; rejected because the model only cares
+  that NONE matched, and the outer reason (timeout vs
+  abort) is what's actionable. all_of's failure DOES
+  surface the failing sub because that IS actionable
+  ("which dependency failed?").
+- **Depth limit at the tool boundary, not the wait
+  module.** Programmatic callers building WaitConditions
+  in code can compose as deep as they want (TypeScript's
+  recursive type signals the intent). The depth limit
+  is specifically to defend against adversarial /
+  buggy MODEL output via the tool — the validation
+  layer is the right gate.
+
+**Code review fixes applied before commit:**
+
+- **`any_of` distinguishes real errors from
+  matched=false rejections.** Was: Promise.any's
+  AggregateError was caught silently — a composition
+  with all sub-waits rejecting (e.g., a single-element
+  any_of where the sub throws `bg process not found`)
+  silently reported timeout. Now: AggregateError.errors
+  is scanned for Error instances; the first real one is
+  re-thrown, propagating up through the tool layer as
+  `bg.process_not_found` (or whatever the sub-error
+  shape was). WaitResult-shaped rejections (the
+  synthetic `throw r` for matched=false) are skipped
+  — those are legitimate "no match" outcomes. all_of
+  was already correct because Promise.all rejects on
+  first rejection.
+- **Recursive bgManager pre-check covers nested
+  process_*.** Was: only the top-level kind was
+  checked, so `any_of([process_exit, sleep])` without
+  bgManager would dispatch sub-waits and let them fail
+  with the (now-fixed-above) any_of error path. Now:
+  `containsProcessKind` walks the condition tree at
+  function entry, throws a clear "composition needs
+  manager" error before any dispatch happens. Mirrors
+  the tool layer's own `containsProcessCondition` so
+  programmatic callers get the same protection. The
+  pre-check runs BEFORE the composition handler so
+  sub-waits never get spawned with a missing manager.
+- 3 regression tests pin the contract:
+  any_of with a process_* sub but no manager rejects
+  with /bgManager/; nested process_* (2-level deep)
+  also rejects; all_of fails fast at function entry
+  with clear message.
+
+**Pending (Step 2.2.4):**
+
+- `monitor` — streaming events with LLM-runs-at-end
+  semantics. Returns `{ events[], reason }`, separate
+  tool surface. Distinct enough to deserve its own
+  step.
+
+**Risks documented:**
+
+- **No depth limit in the wait module itself.**
+  Programmatic callers (the tool layer or future
+  internal use) could construct deeper nesting and
+  the wait module would happily recurse. Stack depth
+  in JS handles ~1000+ levels comfortably; the model-
+  facing limit at the tool layer is the practical
+  bound. If a future programmatic caller produces
+  pathological depth, a wait-module-level cap can
+  land.
+- **Multiple sub-waits in parallel multiply poll
+  cost.** A composition with N sub-conditions polling
+  every 500ms means N concurrent polls. Each poll is
+  cheap (fs.existsSync, a TCP connect, etc.) but the
+  multiplier is real for large N. `MAX_COMPOSITION_DEPTH`
+  bounds the tree, not the breadth — N=20 sub-waits
+  in a single any_of is allowed and may stress the
+  event loop. Pull-in: if a real workflow needs many
+  parallel probes, batch via stride-polling.
+- **Sub-wait timeoutMs == outer timeoutMs.** Each
+  sub-wait gets the same `timeoutMs` as the outer.
+  Their internal timer fires roughly when the outer's
+  combinedSignal aborts (both connected). Doesn't
+  cause double-counting, but wasted timer
+  registrations. Negligible.
+
+---
+
 ## [2026-04-29] M3 / Step 2.2.2 — process_exit + process_output
 
 Continues Step 2.2 with the bg-aware wait conditions. After

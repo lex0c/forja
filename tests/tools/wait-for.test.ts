@@ -245,6 +245,116 @@ describe('wait_for tool: input validation', () => {
   });
 });
 
+describe('wait_for tool: composition (all_of / any_of)', () => {
+  test('any_of via tool surface — empty array waits out timeout', async () => {
+    const ctx = makeCtx();
+    const r = await waitForTool.execute(
+      { condition: { kind: 'any_of', conditions: [] }, timeout_ms: 100 },
+      ctx,
+    );
+    if (isToolError(r)) throw new Error('unexpected');
+    expect(r.matched).toBe(false);
+    expect(r.condition_met).toBe('timeout');
+  });
+
+  test('all_of via tool surface — empty array matches immediately', async () => {
+    const ctx = makeCtx();
+    const r = await waitForTool.execute(
+      { condition: { kind: 'all_of', conditions: [] }, timeout_ms: 5000 },
+      ctx,
+    );
+    if (isToolError(r)) throw new Error('unexpected');
+    expect(r.matched).toBe(true);
+    expect(r.condition_met).toBe('all_of');
+  });
+
+  test('any_of recursive validation — bad nested kind rejected', async () => {
+    const ctx = makeCtx();
+    const r = await waitForTool.execute(
+      {
+        condition: {
+          kind: 'any_of',
+          conditions: [
+            { kind: 'sleep', duration_ms: 100 },
+            // biome-ignore lint/suspicious/noExplicitAny: testing invalid nested
+            { kind: 'bogus' } as any,
+          ],
+        },
+        timeout_ms: 100,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('any_of.conditions[1]');
+  });
+
+  test('depth limit rejects deeply nested composition', async () => {
+    // 6 levels of nesting — exceeds MAX_COMPOSITION_DEPTH (5).
+    const nested = (depth: number): unknown =>
+      depth === 0
+        ? { kind: 'sleep', duration_ms: 1 }
+        : { kind: 'all_of', conditions: [nested(depth - 1)] };
+    const ctx = makeCtx();
+    const r = await waitForTool.execute(
+      // biome-ignore lint/suspicious/noExplicitAny: testing depth limit
+      { condition: nested(7) as any, timeout_ms: 100 },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('tool.invalid_arg');
+    expect(r.error_message).toContain('depth');
+  });
+
+  test('process_* nested in any_of surfaces bg.manager_unavailable when ctx lacks manager', async () => {
+    // Critical: the top-level kind is any_of (NOT process_*), so the
+    // simple top-level check would miss this. The deep walk via
+    // containsProcessCondition catches it.
+    const ctx = makeCtx(); // no bgManager
+    const r = await waitForTool.execute(
+      {
+        condition: {
+          kind: 'any_of',
+          conditions: [
+            { kind: 'sleep', duration_ms: 5000 },
+            { kind: 'process_exit', process_id: 'x' },
+          ],
+        },
+        timeout_ms: 1000,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('bg.manager_unavailable');
+  });
+
+  test('any_of races sleep against file_exists via tool', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'forja-wait-tool-comp-'));
+    tempRoots.push(dir);
+    const path = join(dir, 'present.txt');
+    writeFileSync(path, 'x');
+    const ctx = makeCtx();
+    const r = await waitForTool.execute(
+      {
+        condition: {
+          kind: 'any_of',
+          conditions: [
+            { kind: 'sleep', duration_ms: 5000 },
+            { kind: 'file_exists', path },
+          ],
+        },
+        timeout_ms: 10000,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+    expect(r.matched).toBe(true);
+    expect(r.condition_met).toBe('any_of');
+    expect(r.payload?.matchedIndex).toBe(1);
+  });
+});
+
 describe('wait_for tool: process_* conditions', () => {
   let db: DB;
   let sessionId: string;

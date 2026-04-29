@@ -31,7 +31,16 @@ export type WaitCondition =
       redirect?: 'follow' | 'manual';
     }
   | { kind: 'process_exit'; processId: string }
-  | { kind: 'process_output'; processId: string; pattern: RegExp };
+  | { kind: 'process_output'; processId: string; pattern: RegExp }
+  // Composition (§7.3.1): all_of waits for every sub-condition to
+  // match (AND, short-circuits on first failure); any_of races for
+  // the first match (OR, cancels siblings on success). Sub-conditions
+  // are recursive WaitConditions, including nested composition. Empty
+  // conditions arrays are well-defined: all_of([]) matches
+  // immediately (vacuously true), any_of([]) waits out the timeout
+  // (vacuously false).
+  | { kind: 'all_of'; conditions: WaitCondition[] }
+  | { kind: 'any_of'; conditions: WaitCondition[] };
 
 export interface WaitOptions {
   // Hard cap on the wait. When reached, the result reports
@@ -63,6 +72,8 @@ export type WaitConditionMet =
   | 'http_response'
   | 'process_exit'
   | 'process_output'
+  | 'all_of'
+  | 'any_of'
   | 'timeout'
   | 'aborted';
 
@@ -216,6 +227,20 @@ const safeMtimeMs = (path: string): number | null => {
   }
 };
 
+// Recursive walk that returns true if the condition tree contains
+// any process_* leaf. Used to gate `bgManager` presence at function
+// entry — even nested-in-composition process_* conditions need the
+// manager. Mirrors the tool layer's `containsProcessCondition` so
+// programmatic callers get the same up-front rejection as the
+// model-facing path.
+const containsProcessKind = (c: WaitCondition): boolean => {
+  if (c.kind === 'process_exit' || c.kind === 'process_output') return true;
+  if (c.kind === 'all_of' || c.kind === 'any_of') {
+    return c.conditions.some(containsProcessKind);
+  }
+  return false;
+};
+
 export const waitFor = async (
   condition: WaitCondition,
   options: WaitOptions,
@@ -280,6 +305,171 @@ export const waitFor = async (
     return result;
   };
 
+  // process_* conditions need the bg manager. Reject upfront with a
+  // clear error rather than failing per-poll OR letting any_of
+  // swallow the rejection in its AggregateError. Walks composition
+  // recursively so a nested `any_of([process_exit, sleep])` is
+  // caught at the same boundary — programmatic callers that bypass
+  // the tool layer get the same protection the model-facing path
+  // gets via containsProcessCondition. Must run BEFORE the
+  // composition handler so we don't dispatch sub-waits with a
+  // missing manager. The tool layer catches this throw and surfaces
+  // it as `bg.manager_unavailable`.
+  if (containsProcessKind(condition) && options.bgManager === undefined) {
+    timeout.cleanup();
+    throw new Error(
+      'wait_for: a process_* condition (possibly nested in composition) requires options.bgManager but none was provided',
+    );
+  }
+
+  // Composition handlers run BEFORE the poll loop. all_of and any_of
+  // orchestrate sub-waits via recursive waitFor calls; they don't
+  // belong in the per-kind switch inside the polling loop.
+  if (condition.kind === 'all_of' || condition.kind === 'any_of') {
+    // Vacuous cases — well-defined per the spec opener:
+    //   all_of([]) is the universal quantifier over an empty set,
+    //   which is TRUE. Match immediately.
+    //   any_of([]) is the existential over an empty set, which is
+    //   FALSE. Wait out the outer timeout to preserve the
+    //   "wait_for either matches or hits timeout" contract.
+    if (condition.conditions.length === 0) {
+      if (condition.kind === 'all_of') {
+        return finishMatched('all_of', { matched: 0 });
+      }
+      try {
+        await sleepMs(options.timeoutMs, combinedSignal);
+      } catch {
+        // expected — combinedSignal aborted
+      }
+      return finishUnmatched();
+    }
+
+    // Sub-waits get a derived abort signal so we can cancel siblings
+    // when the composition is decided (any_of: a winner emerged;
+    // all_of: a sub failed). The derived signal also propagates
+    // outer-abort: when combinedSignal fires (caller signal or
+    // outer timeout), we abort the children too.
+    const subAc = new AbortController();
+    const onOuterAbort = (): void => subAc.abort();
+    if (combinedSignal.aborted) {
+      subAc.abort();
+    } else {
+      combinedSignal.addEventListener('abort', onOuterAbort, { once: true });
+    }
+    const subOpts: WaitOptions = {
+      timeoutMs: options.timeoutMs,
+      signal: subAc.signal,
+      ...(options.pollIntervalMs !== undefined ? { pollIntervalMs: options.pollIntervalMs } : {}),
+      ...(options.bgManager !== undefined ? { bgManager: options.bgManager } : {}),
+    };
+
+    const subPromises = condition.conditions.map((sub) => waitFor(sub, subOpts));
+
+    try {
+      if (condition.kind === 'any_of') {
+        // First match wins. Promise.any rejects only when ALL
+        // promises reject; we map matched=false → rejection so
+        // Promise.any keeps waiting for an actual match instead
+        // of resolving on the first sub that timed out.
+        const matchedOnly = subPromises.map((p, i) =>
+          p.then((r) => {
+            if (r.matched) return { result: r, index: i };
+            // throw the result itself — Promise.any aggregates
+            // these into AggregateError if all reject
+            throw r;
+          }),
+        );
+        let winner: { result: WaitResult; index: number } | null = null;
+        let realError: Error | null = null;
+        try {
+          winner = await Promise.any(matchedOnly);
+        } catch (e) {
+          // Promise.any throws AggregateError when every sub-promise
+          // rejected. Two distinct rejection sources need to be
+          // separated:
+          //   1. Synthetic — our `throw r` mapping turns matched=false
+          //      WaitResults into rejections. Means "no sub matched";
+          //      legitimate composition outcome.
+          //   2. Real — the sub-wait threw (e.g., `bg process not
+          //      found`, `bgManager unexpectedly undefined`).
+          //      Without this distinction, a composition like
+          //      any_of([{kind: process_exit, processId: 'bad-id'}])
+          //      would silently report timeout instead of surfacing
+          //      the actual not-found error.
+          // AggregateError.errors is the array of rejection reasons;
+          // anything that's an Error instance is treated as a real
+          // sub-failure to propagate. WaitResult objects (from the
+          // synthetic path) are plain objects and skipped.
+          if (e instanceof AggregateError) {
+            const errs = e.errors;
+            const found = errs.find((x): x is Error => x instanceof Error);
+            if (found !== undefined) realError = found;
+          } else if (e instanceof Error) {
+            // Defensive — Promise.any's contract is AggregateError,
+            // but if a runtime regresses we still surface it.
+            realError = e;
+          }
+        }
+        // Cancel any still-running siblings AFTER the winner has
+        // resolved. allSettled guarantees we don't return before
+        // every sub-wait has cleaned up its own timer / handlers.
+        subAc.abort();
+        await Promise.allSettled(subPromises);
+        // Real error (e.g., process_not_found) takes precedence
+        // over the no-match path. Tool layer surfaces this as
+        // bg.process_not_found / etc.
+        if (realError !== null) {
+          timeout.cleanup();
+          throw realError;
+        }
+        if (winner !== null) {
+          const subKind = condition.conditions[winner.index]?.kind ?? 'unknown';
+          const payload: Record<string, unknown> = {
+            matchedIndex: winner.index,
+            matchedKind: subKind,
+          };
+          if (winner.result.payload !== undefined) {
+            payload.matchedPayload = winner.result.payload;
+          }
+          return finishMatched('any_of', payload);
+        }
+        return finishUnmatched();
+      }
+
+      // all_of — every sub must match. Short-circuit on the first
+      // failure: as soon as one sub returns matched=false, abort
+      // siblings and report the failing index. Promise.all still
+      // waits for everyone to settle (siblings resolve quickly
+      // after subAc.abort).
+      let firstFail: { result: WaitResult; index: number } | null = null;
+      const tracked = subPromises.map((p, i) =>
+        p.then((r) => {
+          if (!r.matched && firstFail === null) {
+            firstFail = { result: r, index: i };
+            subAc.abort();
+          }
+          return { result: r, index: i };
+        }),
+      );
+      await Promise.all(tracked);
+      if (firstFail !== null) {
+        const failed = firstFail as { result: WaitResult; index: number };
+        const subKind = condition.conditions[failed.index]?.kind ?? 'unknown';
+        const payload: Record<string, unknown> = {
+          failedIndex: failed.index,
+          failedKind: subKind,
+        };
+        if (failed.result.payload !== undefined) {
+          payload.failedPayload = failed.result.payload;
+        }
+        return finishUnmatched(payload);
+      }
+      return finishMatched('all_of', { matched: condition.conditions.length });
+    } finally {
+      combinedSignal.removeEventListener('abort', onOuterAbort);
+    }
+  }
+
   // Per-condition state captured before the poll loop starts. Keeping
   // the switch outside the loop avoids re-checking the discriminant
   // every poll cycle.
@@ -304,17 +494,6 @@ export const waitFor = async (
   // risk; configurable overlap can land if a real workflow needs
   // longer patterns.
   const PATTERN_OVERLAP_BYTES = 64;
-
-  // process_* conditions need the bg manager. Reject upfront with a
-  // clear error rather than failing per-poll. The tool layer
-  // catches this and surfaces it as `bg.manager_unavailable`.
-  if (
-    (condition.kind === 'process_exit' || condition.kind === 'process_output') &&
-    options.bgManager === undefined
-  ) {
-    timeout.cleanup();
-    throw new Error(`wait_for(${condition.kind}) requires options.bgManager but none was provided`);
-  }
 
   while (true) {
     if (combinedSignal.aborted) return finishUnmatched();

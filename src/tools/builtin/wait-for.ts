@@ -38,7 +38,13 @@ export type WaitForCondition =
       // wait for "READY" don't want to discover later that the `.`
       // matched anything.
       is_regex?: boolean;
-    };
+    }
+  // Composition: recursive WaitForCondition arrays. Sub-conditions
+  // are validated and compiled by the same buildCondition routine.
+  // Depth is capped to MAX_COMPOSITION_DEPTH so adversarial input
+  // can't blow the stack with `all_of([all_of([all_of([...])])])`.
+  | { kind: 'all_of'; conditions: WaitForCondition[] }
+  | { kind: 'any_of'; conditions: WaitForCondition[] };
 
 export interface WaitForInput {
   condition: WaitForCondition;
@@ -56,15 +62,29 @@ export interface WaitForOutput {
 const isObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
 
+// Hard cap on composition recursion. Defensive against adversarial
+// or buggy model output that emits nested all_of/any_of indefinitely.
+// 5 covers any reasonable real workflow ("wait for either A or
+// (B and (C or D))" is depth 3 and already gnarly to read).
+const MAX_COMPOSITION_DEPTH = 5;
+
 // Validate + normalize the model-supplied condition. We refuse
 // unknown kinds and missing required fields with clean tool errors
 // rather than letting waitFor throw on a TypeError. Path resolution
 // against ctx.cwd happens here too — relative paths land in the
-// session dir, not process.cwd().
+// session dir, not process.cwd(). Depth tracks composition recursion
+// for the all_of / any_of guard.
 const buildCondition = (
   raw: unknown,
   ctxCwd: string,
+  depth = 0,
 ): { ok: true; cond: WaitCondition } | { ok: false; message: string } => {
+  if (depth > MAX_COMPOSITION_DEPTH) {
+    return {
+      ok: false,
+      message: `composition depth exceeds limit (${MAX_COMPOSITION_DEPTH})`,
+    };
+  }
   if (!isObject(raw)) return { ok: false, message: 'condition must be an object' };
   const kind = raw.kind;
   if (typeof kind !== 'string') {
@@ -187,10 +207,37 @@ const buildCondition = (
         cond: { kind: 'process_output', processId: raw.process_id, pattern: regex },
       };
     }
+    case 'all_of':
+    case 'any_of': {
+      if (!Array.isArray(raw.conditions)) {
+        return {
+          ok: false,
+          message: `${kind}.conditions must be an array of conditions`,
+        };
+      }
+      // Recurse into each sub-condition, accumulating either the
+      // first error or the validated WaitCondition list.
+      const subs: WaitCondition[] = [];
+      for (let i = 0; i < raw.conditions.length; i++) {
+        const subRaw = raw.conditions[i];
+        const subResult = buildCondition(subRaw, ctxCwd, depth + 1);
+        if (!subResult.ok) {
+          return {
+            ok: false,
+            message: `${kind}.conditions[${i}]: ${subResult.message}`,
+          };
+        }
+        subs.push(subResult.cond);
+      }
+      return {
+        ok: true,
+        cond: { kind: kind as 'all_of' | 'any_of', conditions: subs },
+      };
+    }
     default:
       return {
         ok: false,
-        message: `unknown condition.kind '${kind}' (expected: sleep | file_exists | file_change | port_open | http_response | process_exit | process_output)`,
+        message: `unknown condition.kind '${kind}' (expected: sleep | file_exists | file_change | port_open | http_response | process_exit | process_output | all_of | any_of)`,
       };
   }
 };
@@ -198,6 +245,19 @@ const buildCondition = (
 // Standard regex-literal escape. Source:
 // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_expressions#escaping
 const escapeRegexLiteral = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Walks a (possibly composed) WaitCondition and reports whether any
+// leaf is a process_* condition. Used to gate bgManager presence at
+// the tool boundary — composition like
+// `any_of([process_exit, sleep])` still needs the manager even
+// though the top-level kind is any_of.
+const containsProcessCondition = (cond: WaitCondition): boolean => {
+  if (cond.kind === 'process_exit' || cond.kind === 'process_output') return true;
+  if (cond.kind === 'all_of' || cond.kind === 'any_of') {
+    return cond.conditions.some(containsProcessCondition);
+  }
+  return false;
+};
 
 export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
   name: 'wait_for',
@@ -209,7 +269,7 @@ export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
       condition: {
         type: 'object',
         description:
-          'The condition to wait for. Discriminated by `kind`: sleep | file_exists | file_change | port_open | http_response | process_exit | process_output.',
+          'The condition to wait for. Discriminated by `kind`: sleep | file_exists | file_change | port_open | http_response | process_exit | process_output | all_of | any_of (composition).',
         properties: {
           kind: {
             type: 'string',
@@ -221,6 +281,8 @@ export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
               'http_response',
               'process_exit',
               'process_output',
+              'all_of',
+              'any_of',
             ],
           },
           duration_ms: {
@@ -275,6 +337,12 @@ export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
             description:
               'For kind=process_output: when true, `pattern` compiles as a regex. Default false (literal). The global (g) flag is rejected.',
           },
+          conditions: {
+            type: 'array',
+            description:
+              'For kind=all_of | any_of: nested WaitForCondition array. all_of waits for ALL to match (AND, short-circuits on first failure); any_of races for the first match (OR, cancels siblings on success). Empty all_of([]) matches immediately; empty any_of([]) waits out the timeout. Composition depth is capped (5).',
+            items: { type: 'object' },
+          },
         },
         required: ['kind'],
       },
@@ -323,14 +391,14 @@ export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
     // process_* conditions need a session-bound bg manager. Surface
     // the absence as the same error code bash_output / bash_kill use
     // when ctx.bgManager is missing — consistent operator-facing
-    // shape across all bg-aware tools.
-    if (
-      (built.cond.kind === 'process_exit' || built.cond.kind === 'process_output') &&
-      ctx.bgManager === undefined
-    ) {
+    // shape across all bg-aware tools. Walk the (possibly composed)
+    // condition tree so a nested `any_of([process_exit, sleep])`
+    // also surfaces the missing manager as a clean tool error
+    // instead of failing mid-wait with wait.internal_error.
+    if (ctx.bgManager === undefined && containsProcessCondition(built.cond)) {
       return toolError(
         'bg.manager_unavailable',
-        `wait_for(${built.cond.kind}) requires a session-bound bg manager but none was provided`,
+        'wait_for: a process_* condition was used but no session-bound bg manager was provided',
       );
     }
 
