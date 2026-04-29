@@ -403,6 +403,8 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             sessionId,
             stepId: assistantMsg.id,
             permissions: config.permissionEngine.view(),
+            permissionCheck: (toolName, category, args) =>
+              config.permissionEngine.check(toolName, category, args),
             ...(bgManager !== undefined ? { bgManager } : {}),
           };
 

@@ -1,5 +1,5 @@
 import type { BgManager } from '../bg/index.ts';
-import type { PermissionsView, PolicyCategory } from '../permissions/index.ts';
+import type { Decision, PermissionsView, PolicyCategory, ToolArgs } from '../permissions/index.ts';
 import type { ProviderToolInputSchema } from '../providers/index.ts';
 
 // Per CONTRACTS §2: tool errors are *data*, not exceptions. The harness
@@ -77,6 +77,17 @@ export interface ToolContext {
   // `bash_output`, `bash_kill`) surface a clean error when absent
   // rather than dereferencing undefined.
   bgManager?: BgManager;
+  // Per-call permission predicate. The harness wires this to
+  // `permissionEngine.check`. Tools whose category gate is too coarse
+  // for their actual side effects (notably `wait_for` and `monitor`,
+  // which are category='misc' but do fs/network probes per leaf
+  // condition) call this before each gated leaf to enforce the
+  // existing fs/web policy sections. REQUIRED — making it optional
+  // would silently re-introduce the misc-bypass any time a future
+  // entrypoint constructs a ToolContext without going through the
+  // harness loop. Tests inject an explicit allow-all (or a custom
+  // predicate to exercise deny paths) via makeCtx.
+  permissionCheck: (toolName: string, category: PolicyCategory, args: ToolArgs) => Decision;
 }
 
 export interface Tool<I = unknown, O = unknown> {
@@ -108,6 +119,12 @@ export const ERROR_CODES = {
   ripgrepMissing: 'grep.ripgrep_missing',
   ripgrepFailed: 'grep.ripgrep_failed',
   aborted: 'tool.aborted',
+  // Tools whose category gate is too coarse for their actual side
+  // effects (wait_for / monitor) self-gate per leaf condition and
+  // surface this code when the policy denies a leaf. Distinct from
+  // the harness-level deny (which short-circuits before tool.execute
+  // runs and uses the model-facing `tool_decided` event).
+  permissionDenied: 'permission.denied',
 } as const;
 
 export const toolError = (

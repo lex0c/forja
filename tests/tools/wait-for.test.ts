@@ -568,3 +568,157 @@ describe('wait_for tool: process_* conditions', () => {
     expect(r.error_code).toBe('tool.invalid_arg');
   });
 });
+
+describe('wait_for tool: per-leaf policy gate', () => {
+  // wait_for is category='misc' so the harness's engine.check
+  // auto-allows it. The tool self-gates each leaf condition that
+  // touches an existing policy section (fs.read for file_*,
+  // web.fetch for http_response / port_open). These tests inject
+  // a permissionCheck callback to simulate strict deployments and
+  // verify the gate fires before any wait dispatch.
+  const denyEverything = (
+    toolName: string,
+    _category: string,
+    _args: Record<string, unknown>,
+  ): { kind: 'deny'; reason: string } => ({
+    kind: 'deny',
+    reason: `synthesized deny for ${toolName}`,
+  });
+  const allowAll = (): { kind: 'allow'; reason: string } => ({
+    kind: 'allow',
+    reason: 'test allow-all',
+  });
+
+  test('http_response is gated through fetch_url policy', async () => {
+    const ctx = makeCtx({ permissionCheck: denyEverything });
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'http_response', url: 'http://internal.example/healthz' },
+        timeout_ms: 1000,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected deny');
+    expect(r.error_code).toBe('permission.denied');
+    expect(r.error_message).toContain('http_response');
+    expect(r.error_message).toContain('fetch_url');
+  });
+
+  test('port_open is gated through fetch_url policy (host extracted)', async () => {
+    const seen: Array<{ tool: string; url: string }> = [];
+    const recordingDeny = (
+      tool: string,
+      _cat: string,
+      args: Record<string, unknown>,
+    ): { kind: 'deny'; reason: string } => {
+      if (typeof args.url === 'string') seen.push({ tool, url: args.url });
+      return { kind: 'deny', reason: 'denied by test' };
+    };
+    const ctx = makeCtx({ permissionCheck: recordingDeny });
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'port_open', host: 'internal.example', port: 22 },
+        timeout_ms: 1000,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected deny');
+    expect(r.error_code).toBe('permission.denied');
+    // Synthesized URL — engine sees the host for allow_hosts/deny_hosts.
+    expect(seen[0]?.url).toBe('http://internal.example:22');
+  });
+
+  test('file_exists is gated through read_file path policy', async () => {
+    const ctx = makeCtx({ permissionCheck: denyEverything });
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'file_exists', path: '/etc/shadow' },
+        timeout_ms: 1000,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected deny');
+    expect(r.error_code).toBe('permission.denied');
+    expect(r.error_message).toContain('file_exists');
+  });
+
+  test('composition: deny on a single nested leaf blocks the whole wait', async () => {
+    const ctx = makeCtx({ permissionCheck: denyEverything });
+    const r = await waitForTool.execute(
+      {
+        condition: {
+          kind: 'any_of',
+          conditions: [
+            { kind: 'sleep', duration_ms: 50 },
+            { kind: 'http_response', url: 'http://blocked.example' },
+          ],
+        },
+        timeout_ms: 1000,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected deny');
+    expect(r.error_code).toBe('permission.denied');
+    expect(r.error_message).toContain('http_response');
+  });
+
+  test('process_* leaves are NOT re-gated', async () => {
+    // process was authorized at spawn time via tools.bash; reading
+    // its status is not a new resource access. The deny callback
+    // should NOT block this — only the absence of bgManager will.
+    let called = false;
+    const denyButNotProcess = (
+      _t: string,
+      _c: string,
+      _a: Record<string, unknown>,
+    ): { kind: 'deny'; reason: string } => {
+      called = true;
+      return { kind: 'deny', reason: 'should not be called for process_*' };
+    };
+    const ctx = makeCtx({
+      permissionCheck: denyButNotProcess,
+      // No bgManager → bg.manager_unavailable surfaces, NOT
+      // permission.denied. Confirms the policy gate skipped the
+      // process_* leaf.
+    });
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'process_exit', process_id: 'x' },
+        timeout_ms: 100,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected error');
+    expect(r.error_code).toBe('bg.manager_unavailable');
+    expect(called).toBe(false);
+  });
+
+  test('allow callback lets the wait through', async () => {
+    // Sanity check that the gate path resolves correctly when the
+    // engine returns allow. sleep is not a gated kind, but a happy-
+    // path file_exists with allow proves the leaf check doesn't
+    // accidentally block on allow.
+    const dir = require('node:fs').mkdtempSync(
+      require('node:path').join(require('node:os').tmpdir(), 'forja-wait-perm-'),
+    );
+    require('node:fs').writeFileSync(`${dir}/exists.txt`, 'x');
+    const ctx = makeCtx({
+      cwd: dir,
+      permissionCheck: allowAll,
+    });
+    const r = await waitForTool.execute(
+      {
+        condition: { kind: 'file_exists', path: 'exists.txt' },
+        timeout_ms: 500,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+    expect(r.matched).toBe(true);
+  });
+});

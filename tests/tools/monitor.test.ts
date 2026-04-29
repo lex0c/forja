@@ -295,3 +295,59 @@ describe('monitor tool: bg manager dependency', () => {
     expect(r.reason).toBe('duration');
   });
 });
+
+describe('monitor tool: per-leaf policy gate', () => {
+  // monitor is category='misc'; file_changes self-gates through
+  // the existing tools.read_file fs.read policy. process_output_*
+  // leaves are not re-gated (process was authorized at spawn).
+  test('file_changes is gated through read_file path policy', async () => {
+    const denyAll = (): { kind: 'deny'; reason: string } => ({
+      kind: 'deny',
+      reason: 'denied by test',
+    });
+    const ctx = makeCtx({
+      sessionId,
+      bgManager: mgr,
+      permissionCheck: denyAll,
+    });
+    const r = await monitorTool.execute(
+      {
+        condition: { kind: 'file_changes', path: '/etc/shadow' },
+        duration_ms: 200,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (!isToolError(r)) throw new Error('expected deny');
+    expect(r.error_code).toBe('permission.denied');
+    expect(r.error_message).toContain('file_changes');
+  });
+
+  test('process_output_* leaves are NOT re-gated', async () => {
+    // Same rationale as wait_for — the bg process was authorized at
+    // spawn time. monitor reading its log should not trigger the
+    // policy callback.
+    let called = false;
+    const denyButTrack = (): { kind: 'deny'; reason: string } => {
+      called = true;
+      return { kind: 'deny', reason: 'should not be called' };
+    };
+    const spawned = await mgr.spawn({ command: 'echo a; sleep 0.05' });
+    const ctx = makeCtx({
+      sessionId,
+      bgManager: mgr,
+      permissionCheck: denyButTrack,
+    });
+    const r = await monitorTool.execute(
+      {
+        condition: { kind: 'process_output_lines', process_id: spawned.id },
+        duration_ms: 1000,
+        poll_interval_ms: 50,
+      },
+      ctx,
+    );
+    if (isToolError(r)) throw new Error(`unexpected: ${r.error_message}`);
+    expect(called).toBe(false);
+    expect(r.reason).toBe('process_exited');
+  });
+});

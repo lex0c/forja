@@ -6,7 +6,7 @@ import {
   waitFor,
 } from '../../wait/index.ts';
 import { keysToSnake } from '../_keys.ts';
-import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+import { ERROR_CODES, type Tool, type ToolContext, type ToolResult, toolError } from '../types.ts';
 
 // Tool-surface mirror of WaitCondition. Two differences from the
 // internal type:
@@ -260,6 +260,81 @@ const containsProcessCondition = (cond: WaitCondition): boolean => {
   return false;
 };
 
+// Per-leaf policy gating. wait_for is category='misc' (the harness's
+// engine.check returns allow for misc), but several leaf kinds DO
+// touch resources that the existing fs/web policy sections govern:
+//   - file_exists / file_change → fs.read (tools.read_file)
+//   - http_response             → web.fetch (tools.fetch_url)
+//   - port_open                 → web.fetch (tools.fetch_url) via
+//     a synthesized http://host:port URL — the engine extracts the
+//     hostname and matches against allow_hosts/deny_hosts. Port is
+//     informational; FetchPolicy is host-based today.
+// Without this pass, a strict deployment that locks down
+// tools.fetch_url and tools.read_file would still see wait_for probe
+// arbitrary internal URLs / sensitive paths because misc-category
+// tools auto-allow at the harness gate.
+//
+// process_* leaves are NOT re-gated: the bg process was authorized
+// at spawn time via tools.bash, and reading status / log output of
+// an already-running process is not a new resource access. sleep
+// has no resource access.
+//
+// Confirm decisions also block here — the leaf has no UI surface to
+// escalate a per-condition prompt. Operators that want a leaf-only
+// confirm flow can opt-in by configuring deny rules instead, which
+// surface a clean error back to the model.
+//
+// `ctx.permissionCheck` is required on ToolContext (not optional),
+// so tests and production paths both inject a concrete predicate —
+// no silent fall-through-allow to mask a future entrypoint that
+// forgets to wire the engine.
+const checkLeafPolicies = (
+  cond: WaitCondition,
+  ctx: ToolContext,
+): { ok: true } | { ok: false; reason: string } => {
+  switch (cond.kind) {
+    case 'sleep':
+    case 'process_exit':
+    case 'process_output':
+      return { ok: true };
+    case 'file_exists':
+    case 'file_change': {
+      const decision = ctx.permissionCheck('read_file', 'fs.read', { path: cond.path });
+      if (decision.kind !== 'allow') {
+        return { ok: false, reason: `wait_for ${cond.kind}: ${decision.reason}` };
+      }
+      return { ok: true };
+    }
+    case 'port_open': {
+      // Synthesize an http URL so the engine's URL parser extracts
+      // the hostname for allow_hosts/deny_hosts matching. A bracket-
+      // wrapped IPv6 host already comes in compatible with URL
+      // syntax; bare hostnames and IPv4 work without modification.
+      const synthUrl = `http://${cond.host}:${cond.port}`;
+      const decision = ctx.permissionCheck('fetch_url', 'web.fetch', { url: synthUrl });
+      if (decision.kind !== 'allow') {
+        return { ok: false, reason: `wait_for port_open: ${decision.reason}` };
+      }
+      return { ok: true };
+    }
+    case 'http_response': {
+      const decision = ctx.permissionCheck('fetch_url', 'web.fetch', { url: cond.url });
+      if (decision.kind !== 'allow') {
+        return { ok: false, reason: `wait_for http_response: ${decision.reason}` };
+      }
+      return { ok: true };
+    }
+    case 'all_of':
+    case 'any_of': {
+      for (const sub of cond.conditions) {
+        const r = checkLeafPolicies(sub, ctx);
+        if (!r.ok) return r;
+      }
+      return { ok: true };
+    }
+  }
+};
+
 export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
   name: 'wait_for',
   description:
@@ -416,6 +491,15 @@ export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
         'bg.manager_unavailable',
         'wait_for: a process_* condition was used but no session-bound bg manager was provided',
       );
+    }
+
+    // Per-leaf policy gate. Runs AFTER buildCondition (which already
+    // resolved relative paths against ctx.cwd) so allow_paths /
+    // deny_paths match against the canonical absolute path the leaf
+    // will probe. See checkLeafPolicies for the full rationale.
+    const policy = checkLeafPolicies(built.cond, ctx);
+    if (!policy.ok) {
+      return toolError(ERROR_CODES.permissionDenied, policy.reason);
     }
 
     const opts: {

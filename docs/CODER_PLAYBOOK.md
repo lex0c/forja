@@ -291,6 +291,39 @@ adding a new tool with a similar role accidentally falls through to
 default-deny. Route by CATEGORY instead: `bash`, `bash_background`,
 and `bash_output` all map to category `bash` for policy decisions.
 
+### 4.5 Coarse category, fine-grained side effects
+
+A category gate is too coarse when the tool's leaf operations
+touch resources governed by OTHER policy sections. Example: a
+`misc`-category tool that performs fs reads and HTTP probes per
+condition. The harness's category check passes (`misc` allows),
+and the tool then bypasses `tools.read_file` allow_paths and
+`tools.fetch_url` allow_hosts entirely.
+
+Pattern: when a tool's leaves cover surfaces that have their own
+policy sections, self-gate per leaf by calling the engine with the
+appropriate (toolName, category, args) for each gated kind. Reuse
+existing sections — don't introduce parallel ones, because
+operators have to keep them in sync and will forget.
+
+In this repo:
+- `wait_for`'s `file_*` leaves call the engine as
+  `(read_file, fs.read, { path })`.
+- `wait_for`'s `http_response` and `port_open` leaves call as
+  `(fetch_url, web.fetch, { url })`, with port_open synthesizing
+  `http://host:port` so the engine extracts hostname for
+  `allow_hosts` matching.
+- `monitor`'s `file_changes` mirrors the wait_for fs gate.
+
+Process-aware leaves (`process_exit`, `process_output_*`) are NOT
+re-gated — the process was authorized at spawn time, and reading
+its log is not a new resource access. Re-gating would be a false
+positive that punishes the operator for legitimate orchestration.
+
+The seam: tools that need this expose a `permissionCheck` callback
+on `ToolContext`. The harness wires it from the engine; tests
+inject custom predicates to verify deny / allow paths.
+
 ---
 
 ## 5. Boundary handling

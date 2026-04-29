@@ -15,6 +15,95 @@ Format:
 
 ---
 
+## [2026-04-29] M3 / Step 2.2 — security fix: per-leaf policy gate on wait_for / monitor
+
+**Bug:** `wait_for` and `monitor` are `category='misc'` (the harness's
+`engine.check` returns `allow` for misc), but their leaf conditions
+DO touch resources governed by existing policy sections:
+- `file_exists` / `file_change` / `file_changes` — fs.read
+  (`tools.read_file` allow_paths / deny_paths).
+- `http_response` — web.fetch (`tools.fetch_url` allow_hosts /
+  deny_hosts).
+- `port_open` — same as above (host-based).
+
+In a strict / locked deployment that configures
+`tools.fetch_url` and `tools.read_file` to restrict access, a model
+could still use `wait_for` to probe arbitrary internal URLs or
+sensitive absolute paths, because no per-condition policy check
+ran before execution. Identical exposure on `monitor`'s
+`file_changes` condition.
+
+**Fix:** the tools self-gate each leaf condition before dispatch.
+- `ToolContext` adds an optional `permissionCheck(toolName,
+  category, args) → Decision` predicate.
+- The harness loop (`src/harness/loop.ts`) wires it as a thin
+  delegate over `permissionEngine.check`.
+- `src/tools/builtin/wait-for.ts` adds `checkLeafPolicies(cond,
+  ctx)` that walks the (possibly composed) condition tree and
+  calls the predicate per gated leaf:
+    - `file_exists` / `file_change` → `(read_file, fs.read, {path})`
+    - `http_response` → `(fetch_url, web.fetch, {url})`
+    - `port_open` → `(fetch_url, web.fetch, {url: 'http://host:port'})`
+      — synthesizes an http URL so the engine extracts the
+      hostname for allow_hosts/deny_hosts matching. Port is
+      informational; FetchPolicy is host-based today.
+    - `process_exit` / `process_output` → NOT re-gated; the
+      process was authorized at spawn time via tools.bash.
+    - `sleep` → no gate (no resource access).
+- `src/tools/builtin/monitor.ts` adds the same gate for
+  `file_changes` (process_output_* leaves are not re-gated).
+- New error code `permission.denied` (in `ERROR_CODES`) for
+  leaf-level denies. Distinct from the harness-level deny
+  (which uses `tool_decided` event).
+
+**Decisions:**
+- `confirm` decisions also block at leaves — the leaf has no UI
+  surface to escalate a per-condition prompt. Operators that want
+  a leaf-only confirm flow can configure deny rules instead.
+- `permissionCheck` is REQUIRED on ToolContext (not optional).
+  Initial cut made it optional with fall-through-allow to keep
+  test changes minimal — but the same default-convenience
+  anti-pattern documented in `CODER_PLAYBOOK §2.1` and §8 would
+  silently re-introduce the bypass any time a future entrypoint
+  constructs a ToolContext without going through the harness
+  loop. Tightening to required forces type errors at every
+  construction site (currently two: harness loop + test helper).
+  The test helper provides a default allow-all predicate so
+  non-gating tests stay terse; tests exercising deny paths
+  override.
+- Reuse existing policy sections (`tools.read_file`,
+  `tools.fetch_url`) rather than introducing new wait_for /
+  monitor sections — operators that already lock down read_file
+  inherit the same allowlist for probes. Fewer dials to keep in
+  sync.
+
+**Done:**
+- `src/tools/types.ts` — ToolContext.permissionCheck +
+  ERROR_CODES.permissionDenied.
+- `src/harness/loop.ts` — wires the callback.
+- `src/tools/builtin/wait-for.ts` — checkLeafPolicies + call
+  site before waitFor dispatch.
+- `src/tools/builtin/monitor.ts` — checkLeafPolicy for
+  file_changes.
+- `tests/tools/_helpers.ts` — makeCtx now spreads
+  permissionCheck overrides (was silently dropped before).
+- `tests/tools/wait-for.test.ts` — 6 new tests covering deny on
+  http_response / port_open / file_exists, composition deny,
+  process_* skip, allow happy path.
+- `tests/tools/monitor.test.ts` — 2 new tests for file_changes
+  deny + process_output_lines skip.
+
+**Why:** principle 6 (explicit trust) — when two policy sections
+already encode operator intent for fs/network access, a third
+tool that performs the same operations must respect those rules.
+A "we'll add wait_for-specific rules later" approach drifts from
+sibling parity (Coder Playbook §4.1).
+
+**Verification:** `bun test` 838 pass / 7 skip / 0 fail (+8 new
+tests); `tsc --noEmit` clean; `biome check` clean.
+
+---
+
 ## [2026-04-29] docs — Coder Playbook (`docs/CODER_PLAYBOOK.md`)
 
 Consolidates the recurring bug patterns found across M2/M3 reviews

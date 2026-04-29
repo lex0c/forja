@@ -6,7 +6,7 @@ import {
   monitor,
 } from '../../wait/index.ts';
 import { keysToSnake } from '../_keys.ts';
-import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
+import { ERROR_CODES, type Tool, type ToolContext, type ToolResult, toolError } from '../types.ts';
 
 // Tool-surface mirror of MonitorCondition (snake_case fields,
 // JSON-friendly). pattern is string + is_regex (default false →
@@ -132,6 +132,25 @@ const buildCondition = (
 const containsProcessKind = (cond: MonitorCondition): boolean =>
   cond.kind === 'process_output_lines' || cond.kind === 'process_output_pattern';
 
+// Per-leaf policy gate. monitor is category='misc' but `file_changes`
+// reads filesystem state outside the model's bash_output cursor —
+// same surface the existing tools.read_file allow_paths / deny_paths
+// govern. process_output_* leaves were authorized at spawn time
+// (tools.bash) and don't need re-gating. Mirrors wait_for's
+// checkLeafPolicies; see that comment block for the full rationale.
+const checkLeafPolicy = (
+  cond: MonitorCondition,
+  ctx: ToolContext,
+): { ok: true } | { ok: false; reason: string } => {
+  if (cond.kind === 'file_changes') {
+    const decision = ctx.permissionCheck('read_file', 'fs.read', { path: cond.path });
+    if (decision.kind !== 'allow') {
+      return { ok: false, reason: `monitor file_changes: ${decision.reason}` };
+    }
+  }
+  return { ok: true };
+};
+
 export const monitorTool: Tool<MonitorInput, MonitorOutput> = {
   name: 'monitor',
   description:
@@ -246,6 +265,11 @@ export const monitorTool: Tool<MonitorInput, MonitorOutput> = {
         'bg.manager_unavailable',
         'monitor: a process_output_* condition was used but no session-bound bg manager was provided',
       );
+    }
+
+    const policy = checkLeafPolicy(built.cond, ctx);
+    if (!policy.ok) {
+      return toolError(ERROR_CODES.permissionDenied, policy.reason);
     }
 
     const opts: {
