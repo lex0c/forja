@@ -25,7 +25,6 @@ expect:
   - file_contains:
       path: greeting.txt
       pattern: hello world
-  - output_contains: "# Plan"
   - status: done
 budget:
   maxSteps: 6

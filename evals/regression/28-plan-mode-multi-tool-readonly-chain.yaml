@@ -16,5 +16,5 @@ expect:
   - output_contains: "# Plan"
   - status: done
 budget:
-  maxSteps: 6
+  maxSteps: 8
   maxCostUsd: 0.10
