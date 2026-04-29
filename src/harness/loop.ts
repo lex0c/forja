@@ -24,7 +24,7 @@ import { abortableIterable } from './abortable.ts';
 import { CollectStepError, collectStep } from './collect.ts';
 import { compactMessages } from './compaction.ts';
 import { invokeTool } from './invoke-tool.ts';
-import { messagesToProviderMessages } from './resume.ts';
+import { STRANDED_TURN_PLACEHOLDER, messagesToProviderMessages } from './resume.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
 import {
   DEFAULT_BUDGET,
@@ -335,6 +335,20 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             kept: restored.messages.length,
             dropped: restored.droppedFromHead,
           });
+        }
+        // Stranded-turn handling. If the last restored message is
+        // `user` (either the original prompt that never got an
+        // assistant response, or a tool_result whose follow-up
+        // assistant turn never landed because the run aborted),
+        // appending the resume's new user prompt would create
+        // user→user on the wire — every provider 400s on that.
+        // Insert an in-memory-only synthetic assistant placeholder
+        // to satisfy alternation. Not persisted: each resume
+        // re-derives it on demand from whatever shape the log is
+        // in at that moment.
+        const inMemoryTail = messages[messages.length - 1];
+        if (inMemoryTail !== undefined && inMemoryTail.role === 'user') {
+          messages.push({ role: 'assistant', content: STRANDED_TURN_PLACEHOLDER });
         }
         const tail = persisted[persisted.length - 1];
         if (tail !== undefined) priorTailId = tail.id;

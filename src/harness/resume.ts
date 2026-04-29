@@ -27,6 +27,22 @@ export const MAX_RESUME_MESSAGES = 500;
 export const TRUNCATION_PLACEHOLDER =
   '[Earlier conversation truncated to fit the resume memory budget. Continuing from this turn.]';
 
+// In-memory-only synthetic assistant turn used when the prior run
+// aborted before the model produced its response — persisted log
+// ends with a `user` (the root prompt OR a tool_result that the
+// crashed run never got back to). Appending the resume's new user
+// prompt directly would put two consecutive user messages on the
+// wire, which every provider rejects as an alternation violation.
+//
+// The placeholder is inserted between the persisted tail and the
+// new prompt; it is NOT persisted (each resume re-derives it as
+// needed). Distinct from TRUNCATION_PLACEHOLDER (which fills the
+// HEAD of the slice when the cap drops the original root) — both
+// solve alternation problems but at opposite ends of the message
+// list.
+export const STRANDED_TURN_PLACEHOLDER =
+  '[The previous turn was interrupted before a response was produced. Continuing from this point.]';
+
 // Reconstruct the in-memory ProviderMessage[] from persisted rows.
 // Today the harness only persists role='user' and role='assistant'
 // — tool results are wrapped in user-role messages whose content is

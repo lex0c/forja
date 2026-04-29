@@ -6,10 +6,10 @@ import type { ParsedArgs } from '../../src/cli/args.ts';
 import type { OutputRenderer } from '../../src/cli/output/types.ts';
 import { run } from '../../src/cli/run.ts';
 import type { HarnessEvent } from '../../src/harness/index.ts';
-import type { Provider, StreamEvent } from '../../src/providers/index.ts';
+import type { Provider, ProviderMessage, StreamEvent } from '../../src/providers/index.ts';
 import { type DB, openDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
-import { listMessagesBySession } from '../../src/storage/repos/messages.ts';
+import { appendMessage, listMessagesBySession } from '../../src/storage/repos/messages.ts';
 import {
   createSession,
   getSession,
@@ -322,6 +322,174 @@ describe('--resume flow', () => {
     });
     expect(code).toBe(1);
     expect(errLines.join('')).toContain('not found');
+  });
+
+  test('resume tolerates persisted tool_use referencing a tool that no longer exists', async () => {
+    // Real-world scenario: original session called tool 'bash';
+    // the codebase changed and 'bash' was removed from the
+    // registry. The persisted log still has assistant messages
+    // with `tool_use { name: 'bash', ... }`. Resume replays the
+    // log, the model sees the historical tool_use and may try to
+    // call 'bash' again — registry returns "not found", harness
+    // emits a tool error, model recovers.
+    //
+    // The minimum bar: resume init does not crash on the
+    // persisted shape, AND the run completes without the harness
+    // bailing out from a missing tool reference.
+    const setupDb = openDb(dbPath);
+    migrate(setupDb);
+    const s = createSession(setupDb, { model: 'mock/m', cwd: workdir });
+    const userMsg = appendMessage(setupDb, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'find files',
+    });
+    appendMessage(setupDb, {
+      sessionId: s.id,
+      role: 'assistant',
+      content: [
+        // Reference a tool name that may or may not exist in the
+        // current registry. The harness builds tool defs from the
+        // CURRENT registry, but the persisted log is replayed.
+        { type: 'tool_use', id: 'tu-historical-1', name: 'definitely_not_a_real_tool', input: {} },
+      ],
+      parentId: userMsg.id,
+    });
+    appendMessage(setupDb, {
+      sessionId: s.id,
+      role: 'user',
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'tu-historical-1',
+          content: 'historical result',
+        },
+      ],
+    });
+    setupDb.close();
+
+    // Mock provider that simply produces a text reply (doesn't try
+    // to call the unknown tool again — that path is independent of
+    // resume's responsibility).
+    const code = await run({
+      args: baseArgs({ prompt: 'continue', resume: s.id }),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'continuing without that tool' }]),
+        dbPath,
+        cwd: workdir,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: recordingRenderer().renderer,
+    });
+    expect(code).toBe(0);
+  });
+
+  test('resume reloads full DB log even when prior run had compacted in-memory', async () => {
+    // Compaction modifies the in-memory `messages` array but DOES
+    // NOT mutate the DB — every appendMessage persists the
+    // ORIGINAL turn. So a session that compacted heavily during
+    // its run still has the full uncompacted log on disk; resume
+    // reloads it raw, gated only by MAX_RESUME_MESSAGES. Verify
+    // by simulating the post-compaction state (full DB log) and
+    // confirming resume runs the loop without crashing on the
+    // size discrepancy.
+    const setupDb = openDb(dbPath);
+    migrate(setupDb);
+    const s = createSession(setupDb, { model: 'mock/m', cwd: workdir });
+    appendMessage(setupDb, { sessionId: s.id, role: 'user', content: 'goal' });
+    // Build a long alternating tail (~80 turns = 161 messages)
+    // representative of a session where compaction already ran
+    // multiple times in-memory.
+    let parent: string | null = null;
+    const goalMsg = listMessagesBySession(setupDb, s.id)[0];
+    if (goalMsg !== undefined) parent = goalMsg.id;
+    for (let i = 0; i < 80; i++) {
+      const a = appendMessage(setupDb, {
+        sessionId: s.id,
+        role: 'assistant',
+        content: [{ type: 'text', text: `turn ${i}` }],
+        ...(parent !== null ? { parentId: parent } : {}),
+      });
+      const u = appendMessage(setupDb, {
+        sessionId: s.id,
+        role: 'user',
+        content: 'continue',
+        parentId: a.id,
+      });
+      parent = u.id;
+    }
+    setupDb.close();
+
+    const code = await run({
+      args: baseArgs({ prompt: 'final follow-up', resume: s.id }),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'ack' }]),
+        dbPath,
+        cwd: workdir,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: recordingRenderer().renderer,
+    });
+    expect(code).toBe(0);
+
+    // Persisted log grew by 2 (new user prompt + assistant reply);
+    // the size discrepancy didn't break anything.
+    db = openTestDb();
+    const total = listMessagesBySession(db, s.id).length;
+    expect(total).toBe(1 + 80 * 2 + 2);
+    db.close();
+  });
+
+  test('resume of session with only a user message (no assistant)', async () => {
+    // Edge case: prior run crashed/aborted before the model
+    // produced any assistant turn — persisted log is just
+    // [user_root]. Resume appends [user_root, user_followup] in
+    // memory, which violates the user→assistant→user alternation
+    // every provider expects. Without explicit handling, the
+    // first generate() call after resume 400s.
+    //
+    // Setup the corrupt-shape session directly via storage so we
+    // don't have to script a crash in the harness.
+    const setupDb = openDb(dbPath);
+    migrate(setupDb);
+    const s = createSession(setupDb, { model: 'mock/m', cwd: workdir });
+    appendMessage(setupDb, { sessionId: s.id, role: 'user', content: 'crashed prompt' });
+    setupDb.close();
+
+    // Capture what the mock provider sees on its first generate.
+    // If alternation is broken, we'd see two consecutive user
+    // messages at the start.
+    const seenMessages: ProviderMessage[][] = [];
+    const recordingProvider: Provider = {
+      ...mockProvider([{ text: 'recovered' }]),
+      async *generate(req) {
+        seenMessages.push(req.messages);
+        yield { kind: 'start', message_id: `mock_${crypto.randomUUID()}` };
+        yield { kind: 'text_delta', text: 'recovered' };
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+    };
+
+    const code = await run({
+      args: baseArgs({ prompt: 'continuing', resume: s.id }),
+      bootstrapOverride: { providerOverride: recordingProvider, dbPath, cwd: workdir },
+      signal: new AbortController().signal,
+      rendererOverride: recordingRenderer().renderer,
+    });
+    expect(code).toBe(0);
+
+    // Inspect what the provider received on its first call.
+    const firstCallMsgs = seenMessages[0];
+    if (firstCallMsgs === undefined) throw new Error('expected provider call');
+    // The roles must alternate user → assistant → user → ...
+    // (or at minimum, no two consecutive same-role messages).
+    for (let i = 1; i < firstCallMsgs.length; i++) {
+      const prev = firstCallMsgs[i - 1];
+      const curr = firstCallMsgs[i];
+      if (prev !== undefined && curr !== undefined) {
+        expect(curr.role).not.toBe(prev.role);
+      }
+    }
   });
 
   test('resume of a session with no persisted messages does not crash', async () => {
