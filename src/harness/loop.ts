@@ -131,10 +131,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // finally so accumulated state from a long-lived process doesn't
   // leak across sessions. Spec §7.4: not persisted, work-state only.
   const todoStore: TodoStore = createTodoStore();
-  // Session-wide totals. Each completed provider turn adds its usage and
-  // its computed cost; we persist the aggregate to `sessions.total_cost_usd`
-  // on `completeSession` and surface both in the result + session_finished
-  // event so renderers can show "$X.XX, N tokens" without re-querying.
+  // Per-run totals. Each completed provider turn adds its usage and
+  // its computed cost; HarnessResult.usage / costUsd report THIS
+  // RUN's numbers — caller telemetry that has to stay self-
+  // consistent (zero usage means zero cost, etc.).
   let totalUsage = emptyUsage();
   let totalCostUsd = 0;
   // Stays true until an assistant turn produces output without an
@@ -142,6 +142,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // sums measured turns; this flag tells the caller whether those
   // numbers are complete or a lower-bound estimate.
   let usageComplete = true;
+  // Cumulative state from prior runs of the same session id (zero
+  // for new sessions). Held SEPARATELY from the per-run totals so
+  // HarnessResult stays per-run while the persisted column stays
+  // cumulative — fixing the contract mismatch where seeding
+  // totalCostUsd from the existing row made costUsd report
+  // "current run + prior" while usage was still "current only".
+  // Persistence at finish() writes (priorCostUsd + totalCostUsd);
+  // the result reports just totalCostUsd.
+  let priorCostUsd = 0;
+  let priorUsageComplete = true;
 
   // Distinguish wall-clock from user abort — both use `signal.aborted` but
   // the user wants different exit reasons.
@@ -154,7 +164,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     // no row to mark and SQLite would just throw a foreign-key error.
     if (sessionId.length > 0) {
       try {
-        completeSession(config.db, sessionId, exitToStatus[reason], totalCostUsd, usageComplete);
+        // Persist CUMULATIVE totals (prior + this run) so the row
+        // reflects the session's lifetime cost. The result returned
+        // below stays per-run (caller telemetry).
+        completeSession(
+          config.db,
+          sessionId,
+          exitToStatus[reason],
+          priorCostUsd + totalCostUsd,
+          priorUsageComplete && usageComplete,
+        );
       } catch {
         // Storage already broken; nothing useful to do beyond return the
         // result so the caller knows the run is over.
@@ -211,17 +230,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // 'must be running' WHERE guard. We validate the id BEFORE
       // any side effects so a typo'd session id doesn't leave a
       // half-initialized state.
-      // Resume budget semantics: `steps`, `consecutiveErrors`, and
-      // `totalUsage` are local accumulators that start at zero —
-      // intentional, the model's prior turns shouldn't count against
-      // this run's caps. `totalCostUsd` and `usageComplete` are
-      // different: they're persisted on the session row, and
-      // completeSession OVERWRITES them at run-end. To keep the
-      // session-level cost a true cumulative, we seed the local
-      // accumulators from the prior persisted values so the UPDATE
-      // at the end writes (prior + new), not just (new). Same for
-      // usageComplete — if prior runs were already incomplete, that
-      // state has to AND-down with the resume run's completeness.
+      // Resume budget semantics: `steps`, `consecutiveErrors`,
+      // `totalUsage`, `totalCostUsd`, and `usageComplete` are
+      // PER-RUN accumulators that start at zero/true — they drive
+      // HarnessResult, which is per-run telemetry that has to
+      // stay self-consistent (zero usage means zero cost, etc.).
+      // The CUMULATIVE state (prior + this run) is held separately
+      // in `priorCostUsd` / `priorUsageComplete` and only used at
+      // completeSession time so the persisted column reflects the
+      // session's lifetime cost. This separation closes the bug
+      // where seeding totalCostUsd from the row made costUsd
+      // report cumulative while usage stayed per-run.
       // The CLI's run.ts also calls getSession before constructing
       // the config (`resolveResumeId`) so a typo'd id fails fast on
       // stderr. The duplicate check here is intentional defense in
@@ -251,8 +270,8 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             `cannot resume session ${resumeId}: original cwd was '${existing.cwd}', current cwd is '${config.cwd}'. cd to the original directory or start a new session.`,
           );
         }
-        totalCostUsd = existing.totalCostUsd;
-        usageComplete = existing.usageComplete;
+        priorCostUsd = existing.totalCostUsd;
+        priorUsageComplete = existing.usageComplete;
         reopenSession(config.db, resumeId);
         sessionId = resumeId;
       } else {

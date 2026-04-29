@@ -424,6 +424,62 @@ describe('--resume flow', () => {
     db.close();
   });
 
+  test('HarnessResult reports per-run cost; persistence stays cumulative', async () => {
+    // Contract: HarnessResult.costUsd is THIS RUN's telemetry (so
+    // it stays self-consistent with usage); the persisted
+    // total_cost_usd column is the session's LIFETIME cost.
+    // Earlier seeding of totalCostUsd from the row made costUsd
+    // report cumulative while usage stayed per-run — broken
+    // self-consistency.
+    await run({
+      args: baseArgs({ prompt: 'first' }),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'a' }]),
+        dbPath,
+        cwd: workdir,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: recordingRenderer().renderer,
+    });
+
+    db = openTestDb();
+    const id = listSessions(db, {})[0]?.id;
+    if (id === undefined) throw new Error('expected session');
+    // Seed an artificial cumulative cost (simulating a prior run
+    // with usage events that the mock provider can't emit).
+    updateSessionCost(db, id, 0.5);
+    db.close();
+
+    const { renderer, events } = recordingRenderer();
+    await run({
+      args: baseArgs({ prompt: 'follow up', resume: id }),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'b' }]),
+        dbPath,
+        cwd: workdir,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: renderer,
+    });
+
+    // HarnessResult is delivered via session_finished. Its
+    // costUsd reflects only this run (mock provider has no
+    // usage path → 0 for the resume run).
+    const finished = events[events.length - 1] as {
+      type: 'session_finished';
+      result: { costUsd: number; usage: { input: number; output: number } };
+    };
+    expect(finished.type).toBe('session_finished');
+    expect(finished.result.costUsd).toBe(0);
+    expect(finished.result.usage.input).toBe(0);
+    expect(finished.result.usage.output).toBe(0);
+
+    // Persistence stayed cumulative — the prior $0.50 survived.
+    db = openTestDb();
+    expect(getSession(db, id)?.totalCostUsd).toBe(0.5);
+    db.close();
+  });
+
   test('preserves total_cost_usd cumulatively across resume', async () => {
     // Regression: totalCostUsd is OVERWRITTEN by completeSession at
     // run-end. Without seeding the local accumulator from the
