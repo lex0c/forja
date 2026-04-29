@@ -15,6 +15,53 @@ Format:
 
 ---
 
+## [2026-04-29] M3 / Step 3 — fix restore on unborn HEAD with dirty tree
+
+`git stash push` refuses on unborn HEAD with the explicit message
+"You do not have the initial commit yet". `snapshot()` already
+supported unborn repos via `commit-tree`, but `restore()` shipped
+with an unconditional `stash push` that hard-failed before the
+read-tree could run — making `--undo` unusable in a freshly
+init'd repo with any uncommitted work.
+
+The data-loss case the fix protects against: an untracked
+working-tree file with the SAME NAME as something in the
+checkpoint gets overwritten by `read-tree --reset -u`. Without
+preservation, the user's version is gone for good. Untracked
+files NOT in the checkpoint survive read-tree by themselves
+(git leaves them alone), so this only matters for the name-
+collision shape — but that's exactly the shape an `--undo` of an
+agent edit produces.
+
+**Fix:** detect unborn HEAD before stashing. When found, build a
+preservation commit with the same temp-index/commit-tree mechanism
+`snapshot()` uses, anchor it under `refs/agent/restore-saved/<ms>`,
+and report the ref to the caller via the new `stashKind:
+'agent-ref' | 'git-stash'` field on `RestoreResult`. The CLI
+renders the right recovery hint:
+
+  - `git-stash` → "Run `git stash pop` to recover the changes…"
+  - `agent-ref` → "Run `git read-tree --reset -u <ref>` to
+    recover the changes (HEAD is unborn; `git stash pop` would
+    fail)."
+
+**Index re-sync** (`read-tree HEAD` after the reset) is also
+gated on `headAfter !== null`. Was already correct; comment
+updated to call out the unborn case explicitly.
+
+**Tests:** unit test reproduces the bug pre-fix (the previous
+"You do not have the initial commit yet" exit). New tests cover:
+unborn-HEAD dirty restore (preservation ref captures the user's
+version, working tree gets the checkpoint), unborn-HEAD clean
+restore (no preservation), and the CLI recovery-hint variant
+(matches `git read-tree --reset -u`, NOT `Run \`git stash pop\``).
+
+**Verification:** `bun test` 1053 pass / 10 skip / 0 fail (+3 new
+tests for unborn-HEAD paths); `tsc --noEmit` clean; `biome
+check` clean. Bench + smoke from the previous pass still green.
+
+---
+
 ## [2026-04-29] M3 / Step 3 — closes acceptance criteria 6+7
 
 `CHECKPOINTS.md §5` listed 8 acceptance criteria. The mock-driven
