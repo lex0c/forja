@@ -19,6 +19,7 @@ export {
   grepTool,
   readFileTool,
   registerBuiltinTools,
+  todoWriteTool,
   writeFileTool,
 } from './builtin/index.ts';
 export type {
@@ -33,6 +34,9 @@ export type {
   GrepOutput,
   ReadFileInput,
   ReadFileOutput,
+  TodoWriteInput,
+  TodoWriteItem,
+  TodoWriteOutput,
   WriteFileInput,
   WriteFileOutput,
 } from './builtin/index.ts';

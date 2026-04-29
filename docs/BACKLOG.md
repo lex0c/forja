@@ -15,6 +15,74 @@ Format:
 
 ---
 
+## [2026-04-29] M3 / Step 2.3 — todo_write tool
+
+Lands the TodoList primitive from spec §7.4. The model uses
+`todo_write(items)` to make sub-task progress visible during
+multi-step work; the live checklist landing in the TUI is M4
+(Ink), but the storage and tool surface are usable today via
+audit logs.
+
+**Slice scope:**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/todo/index.ts` | NEW | In-memory `TodoStore` keyed by sessionId; per-spec NOT persisted. Defensive copies on get/set so callers can't mutate stored state |
+| `src/tools/builtin/todo-write.ts` | NEW | Tool with snake_case surface (active_form), runtime validation parity, single-in_progress enforcement |
+| `ToolContext.todoStore` | UPDATED | Optional `TodoStore` field, parallel to bgManager. Tool surfaces `todo.store_unavailable` if absent |
+| Harness wiring | UPDATED | Loop creates store at session start, clears on session end. Same lifecycle pattern as bgManager |
+| Tool registry | UPDATED | Registered in `BUILTIN_TOOLS`; sits with read-only group |
+| Tests | NEW | `tests/todo/store.test.ts` (8 cases) + `tests/tools/todo-write.test.ts` (14 cases) |
+
+**Decisions:**
+
+- **In-memory only.** Spec §7.4 is explicit: "Não persiste entre
+  sessões — é estado de trabalho, não memória." No SQLite repo,
+  no audit table. The only persistence surface is the tool_call
+  audit row that records each `todo_write` invocation with its
+  args (the standard mechanism for every tool).
+- **At-most-one in_progress enforced at write time.** Spec calls
+  this out as the right shape. The tool returns
+  `tool.invalid_arg` if the model passes >1 in_progress so the
+  bug is corrected at write time rather than ambiguously
+  rendered. Cheap to enforce here; expensive to chase at render
+  time later.
+- **Atomic replacement, no merge.** The model passes the full
+  intended list every call. Simpler API surface, no partial-
+  update edge cases. Empty array clears the list.
+- **Defensive copies on both get and set.** The store is the
+  single owner of mutation; callers never get a reference to the
+  internal array. Same pattern protects against accidental
+  reference-leak bugs that would otherwise let a tool mutate
+  state without going through `set()`.
+- **Snake_case at the tool boundary, camelCase internally.**
+  `active_form` ↔ `activeForm`. Manual conversion at the seam
+  (not via keysToSnake) because the inbound direction also
+  needs translation; the helper only goes one way today.
+
+**Why it matters:**
+
+- Implements spec §7.4 literally — no scope creep, no daemons,
+  no cross-session memory.
+- Validation parity follows the playbook §3.3 pattern
+  established across the rest of the tool surface this branch.
+- Eval scoring (spec §16) can now reward `todo_write` use on
+  tasks of 5+ steps as planned in `eval.scoring.todo_used`.
+
+**Pending:**
+
+- Live checklist render in the TUI — M4 (Ink). The store +
+  audit log already let a renderer display the current list at
+  any point.
+- Eval cases that reward TodoList usage on multi-step tasks —
+  follow-up to the regression eval batch.
+
+**Verification:** `bun test` 895 pass / 10 skip / 0 fail (+22 new
+tests across todo store + tool); `tsc --noEmit` clean;
+`biome check` clean.
+
+---
+
 ## [2026-04-29] hardening: bash tool abort handling + SIGKILL escalation
 
 Surface-level claim corrected by evidence. Initial analysis said
