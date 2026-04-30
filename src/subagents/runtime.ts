@@ -196,6 +196,13 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   const childConfig: HarnessConfig = {
     provider: input.provider,
     toolRegistry: childRegistry,
+    // Persist the ROOT registry through the chain so the child's
+    // own spawn closure can validate grandchildren against the
+    // full toolset, not against the child's own narrowed view.
+    // `input.parentToolRegistry` IS the root (the caller resolved
+    // it from `config.rootToolRegistry ?? config.toolRegistry`
+    // before passing it in).
+    rootToolRegistry: input.parentToolRegistry,
     permissionEngine: input.permissionEngine,
     db: input.db,
     cwd: input.cwd,

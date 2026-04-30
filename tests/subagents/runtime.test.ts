@@ -11,8 +11,10 @@ import {
   listChildSessions,
 } from '../../src/storage/index.ts';
 import { migrate } from '../../src/storage/migrate.ts';
+import type { SubagentSet } from '../../src/subagents/load.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent, toEnvelope } from '../../src/subagents/runtime.ts';
 import type { SubagentDefinition } from '../../src/subagents/types.ts';
+import { taskTool } from '../../src/tools/builtin/task.ts';
 import { createToolRegistry } from '../../src/tools/registry.ts';
 import type { Tool } from '../../src/tools/types.ts';
 
@@ -383,6 +385,102 @@ describe('runSubagent', () => {
     for (const row of childCalls) {
       expect(row.status).toBe('denied');
     }
+  });
+
+  test('nested spawn: coordinator with [task] only can spawn worker with [echo]', async () => {
+    // Regression: the spawn closure used to forward
+    // `config.toolRegistry` as the parent registry for the next
+    // hop, but inside a child harness `toolRegistry` is ALREADY
+    // narrowed to that child's whitelist. A coordinator subagent
+    // with `tools: [task]` would then try to validate a worker's
+    // `tools: [echo]` against a registry that contained only
+    // `task`, throwing "tool 'echo' not registered with parent
+    // harness" even though echo is registered at the top level.
+    //
+    // Fix: persist the ROOT registry through the chain via
+    // HarnessConfig.rootToolRegistry. The spawn closure now
+    // resolves rootRegistry first, falling back to toolRegistry
+    // only at the top level. Validates a real two-hop delegation
+    // without a workaround.
+    const parent = createSession(db, { model: 'mock/m', cwd: '/p' });
+
+    // Both definitions live in the same SubagentSet so the
+    // coordinator's spawn closure can resolve 'worker'.
+    const coordinator: SubagentDefinition = {
+      name: 'coordinator',
+      description: 'spawns worker',
+      tools: ['task'],
+      budget: { maxSteps: 5, maxCostUsd: 0 },
+      systemPrompt: 'You are the coordinator.',
+      scope: 'project',
+      sourcePath: '/p/coord.md',
+      sourceSha256: 'a'.repeat(64),
+      meta: {},
+    };
+    const worker: SubagentDefinition = {
+      name: 'worker',
+      description: 'does the work',
+      tools: ['echo'],
+      budget: { maxSteps: 5, maxCostUsd: 0 },
+      systemPrompt: 'You are the worker.',
+      scope: 'project',
+      sourcePath: '/p/worker.md',
+      sourceSha256: 'b'.repeat(64),
+      meta: {},
+    };
+    const subagentRegistry: SubagentSet = {
+      byName: new Map([
+        ['coordinator', coordinator],
+        ['worker', worker],
+      ]),
+      shadows: [],
+    };
+
+    // Sequential script for ALL three nested provider calls:
+    //   1. coordinator's first turn: emit task(worker, "do work")
+    //   2. worker's run (just one step): emit text "worker done"
+    //   3. coordinator's closing turn after tool_result: emit text
+    const result = await runSubagent({
+      definition: coordinator,
+      prompt: 'orchestrate',
+      parentSessionId: parent.id,
+      provider: mockProvider([
+        {
+          text: 'spawning worker',
+          tool_uses: [
+            {
+              id: 'tu1',
+              name: 'task',
+              input: { subagent: 'worker', prompt: 'do work' },
+            },
+          ],
+          stop_reason: 'tool_use',
+        },
+        { text: 'worker done', stop_reason: 'end_turn' },
+        { text: 'coordinator done', stop_reason: 'end_turn' },
+      ]),
+      // Parent registry has BOTH task and echo; coordinator gets
+      // narrowed to [task], worker gets narrowed to [echo].
+      parentToolRegistry: buildParentRegistry(taskTool, echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      subagentRegistry,
+    });
+
+    // Coordinator completed cleanly — the nested spawn worked
+    // and its tool_result flowed back into the closing turn.
+    expect(result.status).toBe('done');
+    expect(result.output).toBe('coordinator done');
+
+    // Audit: the chain produced TWO subagent rows in DB —
+    // coordinator (parent → coordinator) and worker
+    // (coordinator → worker).
+    const coordChildren = listChildSessions(db, parent.id);
+    expect(coordChildren).toHaveLength(1);
+    expect(coordChildren[0]?.id).toBe(result.sessionId);
+    const grandchildren = listChildSessions(db, result.sessionId);
+    expect(grandchildren).toHaveLength(1);
   });
 
   test('refuses writes:true tool in whitelist at child-registry build time', async () => {

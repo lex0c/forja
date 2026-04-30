@@ -803,12 +803,21 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                       maxDepth: MAX_SUBAGENT_DEPTH,
                     };
                   }
+                  // Validate child's whitelist against the ROOT
+                  // registry (full toolset), NOT against this
+                  // harness's `toolRegistry` (which is narrowed to
+                  // OUR own whitelist when we're a subagent). A
+                  // coordinator subagent with `tools: [task]` must
+                  // still be able to spawn a worker with
+                  // `tools: [read_file]` even though it doesn't have
+                  // `read_file` itself.
+                  const rootRegistry = config.rootToolRegistry ?? config.toolRegistry;
                   const child = await runSubagent({
                     definition: def,
                     prompt: args.prompt,
                     parentSessionId: sessionId,
                     provider: config.provider,
-                    parentToolRegistry: config.toolRegistry,
+                    parentToolRegistry: rootRegistry,
                     permissionEngine: config.permissionEngine,
                     db: config.db,
                     cwd: config.cwd,

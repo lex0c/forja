@@ -239,6 +239,18 @@ export interface HarnessConfig {
   // with the parent's deps (provider, db, registry, engine). Absent
   // = `task` tool surfaces a clean error if invoked.
   subagentRegistry?: SubagentSet;
+  // Root tool registry for SUBAGENT WHITELIST VALIDATION through
+  // a nested task() chain. The harness's `toolRegistry` is what
+  // the CURRENT run can execute (narrowed to the subagent's
+  // whitelist for child runs); but a child that wants to spawn a
+  // grandchild must validate the grandchild's whitelist against
+  // the ROOT registry, NOT against its own narrowed view —
+  // otherwise a coordinator subagent with `tools: [task]` couldn't
+  // spawn a worker with `tools: [read_file]` because read_file
+  // isn't in the coordinator's narrowed registry. Set by the
+  // top-level bootstrap (or implicitly defaults to `toolRegistry`
+  // when unset, which is the top-level case).
+  rootToolRegistry?: ToolRegistry;
   // Recursion depth of THIS run inside a subagent chain. 0 (or
   // unset) = the top-level user session. The harness's spawn closure
   // increments this when calling `runSubagent` so the child knows
