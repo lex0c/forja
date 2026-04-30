@@ -15,6 +15,63 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.2b.iii — symlink hardening + sensitive-path deny-list
+
+The 4.2b.ii.b closing entry left two SECURITY §8.4 rails open: a
+symlink committed to HEAD that resolves outside the worktree
+(host-secrets exfil), and `.env` / `*.pem` / SSH key material
+that lands inside the worktree just because git tracks it. The
+runtime created the worktree, the child got `cwd` pointed at it,
+and the child's read tools could resolve those paths through
+the OS without any defense in depth. This slice closes both
+rails with a pre-spawn validator that runs inside
+`createWorktree` after `git worktree add` succeeds but before
+the child gets `cwd`.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/subagents/sensitive-paths.ts` | NEW — `SENSITIVE_PATH_DENY_LIST` constant mirroring SECURITY_GUIDELINE §8.4 verbatim + `matchSensitivePath(relPath, patterns?)` matcher (Bun.Glob, two-probe normalization for any-depth matching). Lives in its own module so future read/write tool consumers (§8.4 points 1 and 2) import the same source of truth without pulling worktree code. |
+| `src/subagents/worktree-validation.ts` | NEW — `validateWorktreeContents({worktreePath, denyListPatterns?})` walks the worktree tree (manual recursion, NOT `readdirSync({recursive:true})` — that would silently follow directory symlinks). Per-entry `lstat` detects symlinks; `realpathSync` resolves and prefix-matches the worktree's realpath'd root. Files matching the deny-list are deleted; sensitive directories (`.ssh/**`, `.gnupg/**`) are removed wholesale via a `_probe` child-path test. `WorktreeValidationError` carries `code` + `path` for telemetry. |
+| `src/subagents/worktree.ts` | Validator wired in after `git worktree add` succeeds. Validator throw → rollback (`git worktree remove --force` + `git branch -D` + best-effort `rmSync`) before re-throw, mirroring the existing `add` failure path. Updated header comment to remove the "out of scope for 4.2a" note. |
+| `tests/subagents/sensitive-paths.test.ts` | NEW — 16 tests covering the matcher: anchored patterns, any-depth normalization, `.env.*` vs `.envoy` (false-positive guard), `.aws/credentials` exact match without sweeping `.aws/`, custom override list, posix normalization for Windows-style separators. Includes a snapshot of the canonical list as a regression guard against accidental edits. |
+| `tests/subagents/worktree-validation.test.ts` | NEW — 20 tests on the walker directly (no git): symlink boundary (allowed inside, rejected absolute-out, rejected `../../`-out, broken target, deeply nested), deny-list (root `.env`, multi-depth `*.pem`, `.ssh/` recursive removal, `.aws/credentials` without sweeping the whole dir, `**/credentials*.json` at any depth), edge cases (empty worktree, custom override, non-existent root, `.git` directory skipped). |
+| `tests/subagents/worktree.test.ts` | +2 integration tests through `createWorktree`: rejects worktree whose HEAD has an out-of-bounds symlink (asserts cache root empty + branch list pristine after rollback), strips deny-listed files (`.env` + `cert.pem`) while preserving non-sensitive files. |
+| `tests/subagents/runtime.test.ts` | Activated the `.skip` left by 4.2b.ii.a — symlink rejection surfaces at runtime as `status='error', reason='worktree_create_failed'` with no child session row, no audit row, no orphan branch. |
+
+**Decisions (D1-D7 locked):**
+
+- **D1 — Symlink escaping: REJECT, not sanitize.** Sanitizing silently mutates a worktree that reflects a commit the user authored; that masks a malicious commit. Rejection forces the user to inspect what's in the repo. Map: `WorktreeValidationError(symlink_escapes_worktree)` → rollback inside `createWorktree` → `runSubagent` returns `worktree_create_failed`.
+- **D2 — Deny-listed files: DELETE silently.** Not a malicious-vs-not violation; just scope segregation. The child has nothing legitimate to do with `.env` even if the project ships one. Throwing would block any project that legitimately commits a placeholder `.env`. The deletion is cheap; the parent's source tree is untouched.
+- **D3 — Manual recursive descent (not `readdirSync({recursive:true})`).** The recursive form follows directory symlinks without surfacing them as symlinks — a `dirty -> /etc/passwd` directory symlink would walk straight out of the worktree before the validator ever inspected it. Per-entry `lstat` is the only safe approach.
+- **D4 — Bun.Glob, no regex.** CLAUDE.md hard rule + spec uses globs natively. Two probes per pattern (literal + `**/`-prefixed) give any-depth semantics without inventing pattern syntax. The matcher's first-hit behavior means more-specific patterns can shadow less-specific ones (`id_rsa*` beats `.ssh/**` for `.ssh/id_rsa`); that's fine — both flag the file as sensitive.
+- **D5 — Sensitive *directory* detection via probe.** A `_probe` child path is matched against the deny-list; if any pattern hits, the whole directory is `rmSync` recursive. This handles `.ssh/**` cleanly while keeping `.aws/credentials` (file-level) from sweeping `.aws/` (which can ship legitimate non-sensitive content). The probe filename is unlikely to collide with any specific file pattern.
+- **D6 — `.git` always skipped.** In a linked worktree it's the gitlink file pointing at the admin dir; the parent repo owns admin state, never the validator. Skipping by name (not stat) is faster and tolerates the rare case where a fixture writes a `.git` directory.
+- **D7 — Override hierarchy DEFERRED.** Spec §8.4 lists four override layers (`/trust path`, playbook frontmatter, `agent.toml`, `~/.config/agent/security.toml`). Three of those depend on subsystems that don't exist yet (playbooks, agent.toml schema, global security config). The hardcoded canonical list is the safer floor; PRs that need overrides will land alongside the consuming subsystem (M5 playbooks for the playbook-level layer, M6 trust for `/trust path`).
+- **D8 (post-review) — Two-pass walker, NOT mixed pass.** Initial design walked the tree once, validating symlinks and deleting files in the same loop. Code review caught that `readdirSync` order made spawn nondeterministic when a repo committed both a deny-listed file (`.env`) AND a symlink pointing at it (`link -> .env`): if `.env` iterated first, deletion left the symlink dangling and `realpath` threw `symlink_unresolvable` on the next iteration; if the symlink came first, validation accepted and the run proceeded. Pass 1 now validates ALL symlinks against the boundary, pass 2 then deletes deny-listed files / sensitive directories. Symlinks that target soon-to-be-deleted files are accepted in pass 1 (target intact), then dangle after pass 2 — child can't follow ENOENT, security preserved, spawn deterministic. Same fix closes the symlink-into-sensitive-directory case (M1 from review).
+- **D9 (post-review) — Resolved target redacted from `symlink_escapes_worktree` message.** The message is the only text artifact that may flow into logs / audit / telemetry; the resolved target is the host-side secret path the symlink was trying to read, and embedding it would defeat the purpose of refusing to read the file. The operator gets the symlink path via `error.path` and can `readlink` it themselves for forensic investigation. Spec §6 redaction principle applied defensively even though the validator's caller doesn't currently log the message.
+
+**Out of scope (deferred):**
+
+- **Read/write tool runtime enforcement.** §8.4 points 1 and 2 mandate that `read_file`, `outline_file`, `read_symbol`, `write_file`, `edit_file` all check the deny-list at call time. The matcher is now ready for them to import; the wiring is M2 tool work, not 4.2b.
+- **§8.4 override hierarchy** (D7 above).
+- **Heuristic warning for `0600`/`0400` files with sensitive keywords.** Spec calls this a *warning* (not a block), needs a UX surface (operator notification channel). Lands with the operator-warnings infrastructure later in M3 or M4.
+- **Symlinks created by the child mid-run.** Pre-spawn validation catches HEAD state; a `write_file` that creates a malicious symlink during the run is the permission matcher's problem (already handles symlink resolution per `tests/permissions/symlink.test.ts`). Defense in depth, not redundant.
+- **Audit row capture of `deniedRemoved`.** The validator returns the list of removed files but `createWorktree` discards it. Wiring it into the worktree audit row (or a new `subagent_run.security_events` field) is forensic value, not security value — defer until operator workflows demand it.
+
+**Pending / known limitations:**
+
+- **Race between checkout and validation.** `git worktree add` writes the tree, then we validate. A privileged process modifying the worktree between those two steps could plant a symlink the validator never sees. Linux FS doesn't give us a clean atomic checkpoint; mitigation is the cache root's `0700` mode (already enforced) which makes the race a non-issue under any sane operator setup. Worth re-evaluating if the threat model expands to multi-tenant hosts.
+- **`realpath` requires the target to exist.** Broken symlinks are rejected (D1 generalization). A repo that legitimately commits a dangling symlink (placeholder for build-time generation) can't be a subagent worktree source until the target is created or the symlink removed. Acceptable trade-off; document via the error message.
+- **Probe filename collision (`_probe`).** A pattern like `**/_probe` would trip `isSensitiveDirectory` for every directory and wipe the whole worktree. The current canonical list has no such pattern; if a future addition gets close to this shape, the probe needs to be randomized or the implementation switched to literal-pattern inspection. Low priority.
+
+**Verification:** `bun test` 1362 pass / 10 skip / 0 fail (+43 new across matcher, walker, two-pass invariants, integration, and runtime activation); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** M3 / Step 4.2b.iv — `bgLogDir` per-worktree (lifts the `requiresBgManager` gate). Subagents currently can't run `bun run dev` or any background-managed tool; the gate refuses under any isolation because the bg log directory is global and would mix child output into operator workflows. Per-worktree `bg-logs/` directory + scoped manager closes the gap. After .iv, the 4.2b arc is done; 4.2c lands checkpoints inside worktrees and 4.2d ships `agent worktree gc` + merge helpers.
+
+---
+
 ## [2026-04-30] M3 / Step 4.2b.ii.b — heartbeat liveness for subprocess subagents
 
 The 4.2b.ii.a closing entry left wall-clock (10min default) as

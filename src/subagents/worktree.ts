@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { validateWorktreeContents } from './worktree-validation.ts';
 
 // Subagent worktree lifecycle (spec §11.2). When a definition
 // declares `isolation: worktree`, the harness creates a dedicated
@@ -18,9 +19,9 @@ import { dirname, join } from 'node:path';
 //     snapshots; pulling those into a shared surface would force
 //     a refactor that is not load-bearing for 4.2a.
 //   - No persistence here; the repo / migration owns that.
-//   - No symlink validation / SECURITY §8.4 hardening — out of
-//     scope for 4.2a per the alignment with the user. 4.2b adds
-//     it together with subprocess sandboxing.
+//   - SECURITY §8.4 hardening (symlink boundary + deny-list copy
+//     filter) lives in `worktree-validation.ts` and runs as a
+//     post-checkout step inside `createWorktree`.
 
 // Default cache root resolves through the standard precedence:
 //   1. $XDG_CACHE_HOME (per XDG Base Dir spec)
@@ -259,6 +260,35 @@ export const createWorktree = async (opts: CreateWorktreeOptions): Promise<Workt
     throw new Error(
       `git worktree add failed (exit ${add.exitCode}): ${add.stderr.trim() || add.stdout.trim()}`,
     );
+  }
+  // Post-checkout validation (spec §8.4). The worktree is on
+  // disk with HEAD's tree checked out — any symlink committed
+  // to the parent repo is now an active symlink in the child's
+  // filesystem view. Two failures are possible:
+  //   (a) symlink whose realpath escapes the worktree boundary
+  //       — host-secrets exfil vector. Validator throws; we
+  //       roll back the worktree + branch so the run as a whole
+  //       reports `worktree_create_failed` rather than a half-
+  //       constructed sandbox.
+  //   (b) deny-listed file inside the tree (`.env`, `*.pem`,
+  //       etc.) — validator deletes silently; the run proceeds.
+  // Either way, the orphan-defense / branch cleanup mirrors the
+  // `git worktree add` failure path above so the cache state
+  // and the git refs stay consistent regardless of which step
+  // tripped.
+  try {
+    validateWorktreeContents({ worktreePath: path });
+  } catch (e) {
+    await runGit(['worktree', 'remove', '--force', path], opts.parentCwd).catch(() => undefined);
+    await runGit(['branch', '-D', branch], opts.parentCwd).catch(() => undefined);
+    if (existsSync(path)) {
+      try {
+        rmSync(path, { recursive: true, force: true });
+      } catch {
+        // leave it — operator's gc sweep handles persistent leftovers
+      }
+    }
+    throw e;
   }
   return { path, branch };
 };

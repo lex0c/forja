@@ -7,6 +7,7 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -195,6 +196,77 @@ describe('createWorktree', () => {
     } finally {
       rmSync(notGit, { recursive: true, force: true });
     }
+  });
+
+  test('rejects worktree whose HEAD has a symlink escaping the boundary', async () => {
+    // Commit a symlink that points outside the parent repo
+    // (and therefore outside any worktree branched off it).
+    // After `git worktree add`, the symlink is checked out
+    // intact in the worktree path — the validator must catch
+    // it BEFORE the run starts and roll back the worktree.
+    const outside = mkdtempSync(join(tmpdir(), 'forja-outside-'));
+    try {
+      writeFileSync(join(outside, 'host-secret.txt'), 'host data');
+      symlinkSync(join(outside, 'host-secret.txt'), join(parentRepo, 'leak'));
+      await runGit(parentRepo, ['add', 'leak']);
+      await runGit(parentRepo, ['commit', '-m', 'add malicious symlink']);
+
+      let threw = false;
+      try {
+        await createWorktree({
+          sessionId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+          prompt: 'symlink test',
+          parentCwd: parentRepo,
+          rootDir: worktreeRoot,
+        });
+      } catch {
+        threw = true;
+      }
+      expect(threw).toBe(true);
+      // Critical regression: the worktree dir was rolled back,
+      // so the cache root is empty. Without rollback, an
+      // operator running `agent worktree gc` would see a stale
+      // entry that the run never produced.
+      expect(readdirSync(worktreeRoot)).toEqual([]);
+      // Branch was deleted (the rollback path runs `branch -D`).
+      // We don't know the exact branch name (slug+suffix), but
+      // listing the parent's branches must show only `main`.
+      const branches = await runGit(parentRepo, ['branch', '--list']);
+      expect(branches.trim()).toBe('* main');
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test('strips deny-listed files from the worktree before returning', async () => {
+    // Commit a `.env` and a `*.pem` to the parent repo. After
+    // `git worktree add` they appear in the worktree's
+    // checkout; the validator must remove them so the child's
+    // filesystem view never has the secrets, even via direct
+    // path access. Non-sensitive files survive untouched.
+    writeFileSync(join(parentRepo, '.env'), 'API_KEY=topsecret\n');
+    writeFileSync(join(parentRepo, 'cert.pem'), '----BEGIN----\n');
+    writeFileSync(join(parentRepo, 'safe.txt'), 'public\n');
+    await runGit(parentRepo, ['add', '-A']);
+    await runGit(parentRepo, ['commit', '-m', 'add sensitive files']);
+
+    const handle = await createWorktree({
+      sessionId: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff',
+      prompt: 'strip test',
+      parentCwd: parentRepo,
+      rootDir: worktreeRoot,
+    });
+
+    // Sensitive files gone from the worktree.
+    expect(existsSync(join(handle.path, '.env'))).toBe(false);
+    expect(existsSync(join(handle.path, 'cert.pem'))).toBe(false);
+    // Non-sensitive file remains.
+    expect(existsSync(join(handle.path, 'safe.txt'))).toBe(true);
+    expect(readFileSync(join(handle.path, 'safe.txt'), 'utf8')).toBe('public\n');
+    // Parent repo is untouched — the validator only mutates
+    // the worktree, never the source.
+    expect(existsSync(join(parentRepo, '.env'))).toBe(true);
+    expect(existsSync(join(parentRepo, 'cert.pem'))).toBe(true);
   });
 
   test('chmods the worktree root to 0700 even when pre-created looser', () => {
