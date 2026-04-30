@@ -297,6 +297,60 @@ describe('CheckpointManager — available mode', () => {
     expect(await Bun.file(join(repo, 'state.txt')).text()).toBe('D\n');
   });
 
+  test('rewrite failure leaves aged rows intact for the next purge to retry', async () => {
+    // Bug: aged rows used to be deleted BEFORE the rewrite ran. If
+    // the rewrite failed (transient git error, e.g., a survivor's
+    // commit object missing), aged rows were already gone and no
+    // future purge could re-enter the rewrite branch — the trigger
+    // (aged rows for the session) had been removed. Aged commits
+    // stayed reachable through the un-severed survivor chain
+    // forever. Fix: defer aged-row deletion until git rewrite
+    // succeeds; bundle deletion + survivor updates in one
+    // transaction.
+    await initRepoWithSeed(repo);
+    const mgr = createCheckpointManager({ db, cwd: repo, sessionId, available: true });
+
+    await writeFile(join(repo, 's.txt'), 'A');
+    const a = await mgr.snapshot({ stepId: 'a', hadBash: false });
+    await writeFile(join(repo, 's.txt'), 'B');
+    const b = await mgr.snapshot({ stepId: 'b', hadBash: false });
+    await writeFile(join(repo, 's.txt'), 'C');
+    const c = await mgr.snapshot({ stepId: 'c', hadBash: false });
+
+    // Age out a + b.
+    db.query('UPDATE checkpoints SET created_at = ? WHERE id = ?').run(0, a.checkpointId);
+    db.query('UPDATE checkpoints SET created_at = ? WHERE id = ?').run(0, b.checkpointId);
+
+    // Poison c's git_ref so getCommitTree throws during rewrite.
+    // The survivor chain has just c, so this fails the loop on its
+    // first iteration — aged rows must NOT be deleted in that case.
+    const realC = c.gitRef as string;
+    db.query('UPDATE checkpoints SET git_ref = ? WHERE id = ?').run(
+      '0000000000000000000000000000000000000000',
+      c.checkpointId,
+    );
+
+    await mgr.purge({ olderThanDays: 1 });
+
+    // Aged rows must STILL be in the DB after a failed rewrite.
+    // Pre-fix, they were deleted unconditionally before the rewrite.
+    const survivors = listCheckpointsBySession(db, sessionId);
+    const ids = survivors.map((s) => s.id).sort();
+    expect(ids).toContain(a.checkpointId as string);
+    expect(ids).toContain(b.checkpointId as string);
+    expect(ids).toContain(c.checkpointId as string);
+
+    // Recovery: restore c's real git_ref and run purge again. The
+    // rewrite should now succeed, aged rows finally drop.
+    db.query('UPDATE checkpoints SET git_ref = ? WHERE id = ?').run(realC, c.checkpointId);
+    await mgr.purge({ olderThanDays: 1 });
+
+    const after = listCheckpointsBySession(db, sessionId).map((s) => s.id);
+    expect(after).not.toContain(a.checkpointId as string);
+    expect(after).not.toContain(b.checkpointId as string);
+    expect(after).toContain(c.checkpointId as string);
+  });
+
   test('purge self-heals session ref drift from prior failed rewrite', async () => {
     // Reproduce the post-bug end state: setSessionRef failed during
     // a previous retention rewrite, so the DB rows were updated to

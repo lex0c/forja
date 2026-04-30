@@ -222,23 +222,48 @@ class CheckpointManagerImpl implements CheckpointManager {
     // the ref sweep below (which is naturally cwd-bound: refs only
     // exist in the git store of the cwd they were created in).
     const aged = listCheckpointsOlderThan(this.db, cutoffMs, this.cwd);
-    // Group rows by session: when every row of a session is aged out,
-    // the ref is purged too. Sessions with mixed-age checkpoints keep
-    // their ref (it points at the chain head, which is the newest
-    // commit; older commits remain reachable via parent links and
-    // GC catches them only if the chain is severed).
-    const sessions = new Map<string, number>();
+    // Group aged rows by session — each session's rewrite + aged-row
+    // deletion is its own atomic unit. A failure on one session
+    // doesn't taint another's progress.
+    const agedBySession = new Map<string, Checkpoint[]>();
     for (const row of aged) {
-      sessions.set(row.sessionId, (sessions.get(row.sessionId) ?? 0) + 1);
+      const arr = agedBySession.get(row.sessionId) ?? [];
+      arr.push(row);
+      agedBySession.set(row.sessionId, arr);
     }
-    for (const row of aged) {
-      deleteCheckpoint(this.db, row.id);
-      deleted += 1;
-    }
-    if (this.available) {
-      for (const sessionId of sessions.keys()) {
-        const remaining = listCheckpointsBySession(this.db, sessionId);
+    if (!this.available) {
+      // No git in this cwd: just drop the rows. No refs or commits to
+      // reconcile. Single transaction so a partial DB failure doesn't
+      // leave stragglers.
+      try {
+        withTransaction(this.db, () => {
+          for (const row of aged) {
+            deleteCheckpoint(this.db, row.id);
+            deleted += 1;
+          }
+        });
+      } catch {
+        deleted = 0;
+      }
+    } else {
+      for (const [sessionId, agedRows] of agedBySession) {
+        const allRows = listCheckpointsBySession(this.db, sessionId);
+        const agedIds = new Set(agedRows.map((r) => r.id));
+        const remaining = allRows.filter((c) => !agedIds.has(c.id));
         if (remaining.length === 0) {
+          // All rows for this session aged out. Drop them + the ref.
+          // No survivor chain to rewrite.
+          try {
+            withTransaction(this.db, () => {
+              for (const r of agedRows) {
+                deleteCheckpoint(this.db, r.id);
+                deleted += 1;
+              }
+            });
+          } catch {
+            // DB transaction rolled back; rows stayed.
+            continue;
+          }
           try {
             await deleteSessionRef(this.cwd, sessionId);
           } catch {
@@ -261,6 +286,15 @@ class CheckpointManagerImpl implements CheckpointManager {
         // The original commit objects (both aged and the originals
         // of survivors) become unreachable from any ref; a future
         // git gc reclaims them.
+        //
+        // Crucially, aged rows are NOT deleted yet — only after the
+        // git rewrite + DB update succeed atomically below. A
+        // transient rewrite failure (e.g., getCommitTree throws
+        // because a survivor's commit object was manually pruned)
+        // leaves aged rows in place so the next purge can retry.
+        // Pre-fix, aged rows were deleted up front and the rewrite
+        // trigger was lost forever on transient failure — aged
+        // commits stayed reachable indefinitely.
         const chronological = [...remaining].reverse();
         const headSha = await getHeadSha(this.cwd).catch(() => null);
         const rewrites: { id: string; newSha: string }[] = [];
@@ -274,48 +308,45 @@ class CheckpointManagerImpl implements CheckpointManager {
             rewrites.push({ id: ckpt.id, newSha });
             priorParent = newSha;
           } catch {
-            // If any rewrite fails, abort the whole batch. The DB and
-            // ref stay untouched (we apply both AFTER the loop), so
-            // state is consistent: original chain still intact, aged
-            // commits still reachable until the next purge retries.
-            // The orphan commit objects we already created are
-            // unreachable and will be reclaimed by git gc.
+            // Abort the batch. The orphan commit objects we already
+            // created are unreachable and gc reclaims them; aged
+            // rows untouched, so next purge retries.
             rewriteOk = false;
             break;
           }
         }
-        if (rewriteOk && rewrites.length === chronological.length) {
-          // All rewrites succeeded. Apply DB updates inside a single
-          // transaction so a mid-loop failure doesn't leave the table
-          // half-rewritten — every row either points at its new sha
-          // or at the original. THEN move the ref. Inverse ordering
-          // would leave the ref ahead of the DB and break restore
-          // lookups; this ordering means a ref-move failure leaves
-          // the DB consistent with the new chain but the ref still
-          // pointing at the old head, which the next purge detects
-          // and retries.
-          let dbApplied = true;
-          try {
-            withTransaction(this.db, () => {
-              for (const r of rewrites) {
-                updateCheckpointGitRef(this.db, r.id, r.newSha);
-              }
-            });
-          } catch {
-            // Transaction rolled back — every row stayed on its
-            // original sha. The orphan rewritten commits become
-            // unreachable (we never moved the ref) and gc reclaims
-            // them. Skip the ref move below; state is consistent.
-            dbApplied = false;
-          }
-          if (dbApplied) {
-            const finalSha = rewrites[rewrites.length - 1]?.newSha;
-            if (finalSha !== undefined) {
-              try {
-                await setSessionRef(this.cwd, sessionId, finalSha);
-              } catch {
-                // ignored — DB is the authoritative pointer
-              }
+        if (!rewriteOk || rewrites.length !== chronological.length) continue;
+
+        // All git rewrites succeeded. Aged-row deletion AND survivor
+        // git_ref updates land in one transaction so a mid-loop DB
+        // failure can't leave the table in a half-rewritten state.
+        // Then move the ref. The previous ordering (delete aged,
+        // then rewrite, then update + move) had two failure modes:
+        // (a) rewrite fail → aged gone, no retry; (b) ref-move fail
+        // → DB ahead of ref. The new ordering closes (a); the
+        // self-heal sweep below catches (b).
+        let dbApplied = true;
+        const agedDeletedThisRound = agedRows.length;
+        try {
+          withTransaction(this.db, () => {
+            for (const r of agedRows) {
+              deleteCheckpoint(this.db, r.id);
+            }
+            for (const r of rewrites) {
+              updateCheckpointGitRef(this.db, r.id, r.newSha);
+            }
+          });
+          deleted += agedDeletedThisRound;
+        } catch {
+          dbApplied = false;
+        }
+        if (dbApplied) {
+          const finalSha = rewrites[rewrites.length - 1]?.newSha;
+          if (finalSha !== undefined) {
+            try {
+              await setSessionRef(this.cwd, sessionId, finalSha);
+            } catch {
+              // self-heal sweep below detects + retries
             }
           }
         }
