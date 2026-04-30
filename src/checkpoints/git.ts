@@ -444,32 +444,66 @@ const hasIgnoredCheckpointCollision = async (cwd: string, commitSha: string): Pr
 interface InProgressMarker {
   readonly path: string;
   readonly op: string;
-  readonly resolveHint: string;
+  readonly abortHint: string;
+  // `git <op> --continue` exists for merge/rebase/cherry-pick/revert
+  // but NOT for bisect (which uses good/bad/reset). When undefined,
+  // the error message omits the "or --continue" alternative.
+  readonly continueHint?: string;
   readonly dirOnly?: boolean;
 }
 
 const IN_PROGRESS_MARKERS: readonly InProgressMarker[] = [
-  { path: 'MERGE_HEAD', op: 'merge', resolveHint: 'git merge --abort' },
-  { path: 'CHERRY_PICK_HEAD', op: 'cherry-pick', resolveHint: 'git cherry-pick --abort' },
-  { path: 'REVERT_HEAD', op: 'revert', resolveHint: 'git revert --abort' },
+  {
+    path: 'MERGE_HEAD',
+    op: 'merge',
+    abortHint: 'git merge --abort',
+    continueHint: 'git merge --continue',
+  },
+  {
+    path: 'CHERRY_PICK_HEAD',
+    op: 'cherry-pick',
+    abortHint: 'git cherry-pick --abort',
+    continueHint: 'git cherry-pick --continue',
+  },
+  {
+    path: 'REVERT_HEAD',
+    op: 'revert',
+    abortHint: 'git revert --abort',
+    continueHint: 'git revert --continue',
+  },
   // `rebase-merge` is the dir for interactive / am-style rebase;
   // `rebase-apply` covers non-interactive rebase + `git am`. Either
   // present means the user is mid-rebase.
-  { path: 'rebase-merge', op: 'rebase', resolveHint: 'git rebase --abort', dirOnly: true },
-  { path: 'rebase-apply', op: 'rebase', resolveHint: 'git rebase --abort', dirOnly: true },
-  // bisect uses a different recovery primitive — `--abort` doesn't
-  // apply, the user runs `git bisect reset`.
-  { path: 'BISECT_LOG', op: 'bisect', resolveHint: 'git bisect reset' },
+  {
+    path: 'rebase-merge',
+    op: 'rebase',
+    abortHint: 'git rebase --abort',
+    continueHint: 'git rebase --continue',
+    dirOnly: true,
+  },
+  {
+    path: 'rebase-apply',
+    op: 'rebase',
+    abortHint: 'git rebase --abort',
+    continueHint: 'git rebase --continue',
+    dirOnly: true,
+  },
+  // bisect uses a different recovery primitive — neither --abort
+  // nor --continue apply; the user runs `git bisect reset` or one
+  // of `good`/`bad`/`skip`. continueHint is omitted so the error
+  // message doesn't suggest a non-existent subcommand.
+  { path: 'BISECT_LOG', op: 'bisect', abortHint: 'git bisect reset' },
 ];
 
-// Returns the operation name + resolve hint when an in-progress git
-// op is detected; null when the working tree is in a normal state.
-// Resolves .git lazily — on a worktree-pointer setup, `.git` is a
-// file pointing at the real dir, so we use `rev-parse --git-dir`
+// Returns the operation name + recovery hints when an in-progress
+// git op is detected; null when the working tree is in a normal
+// state. Resolves .git lazily — on a worktree-pointer setup, `.git`
+// is a file pointing at the real dir, so we use `rev-parse --git-dir`
 // which handles both shapes.
 export interface InProgressOperation {
   op: string;
-  resolveHint: string;
+  abortHint: string;
+  continueHint?: string;
 }
 
 export const getInProgressOperation = async (cwd: string): Promise<InProgressOperation | null> => {
@@ -488,7 +522,9 @@ export const getInProgressOperation = async (cwd: string): Promise<InProgressOpe
   for (const marker of IN_PROGRESS_MARKERS) {
     try {
       await access(join(dir, marker.path));
-      return { op: marker.op, resolveHint: marker.resolveHint };
+      const out: InProgressOperation = { op: marker.op, abortHint: marker.abortHint };
+      if (marker.continueHint !== undefined) out.continueHint = marker.continueHint;
+      return out;
     } catch {
       // marker not present; try next
     }
@@ -512,8 +548,16 @@ export const restore = async (cwd: string, commitSha: string): Promise<RestoreRe
   // stash, the read-tree — so a refused restore leaves zero traces.
   const inProgress = await getInProgressOperation(cwd);
   if (inProgress !== null) {
+    // continueHint is undefined for ops that have no `--continue`
+    // form (notably bisect — recovery is reset/good/bad). Build the
+    // hint text dynamically so we never suggest a non-existent
+    // subcommand.
+    const hints =
+      inProgress.continueHint !== undefined
+        ? `\`${inProgress.abortHint}\` or \`${inProgress.continueHint}\``
+        : `\`${inProgress.abortHint}\``;
     throw new Error(
-      `cannot restore: a git ${inProgress.op} is in progress. Resolve it (\`${inProgress.resolveHint}\` or \`git ${inProgress.op} --continue\`) before running --undo.`,
+      `cannot restore: a git ${inProgress.op} is in progress. Resolve it (${hints}) before retrying.`,
     );
   }
   // Validate the commit object exists BEFORE stashing. A GC'd or
@@ -575,18 +619,23 @@ export const restore = async (cwd: string, commitSha: string): Promise<RestoreRe
       //
       // Used both for unborn HEAD (where stash refuses) AND for
       // ignored↔checkpoint collisions (where stash captures but
-      // pop can't apply). `-f` forces add to include ignored; if
-      // there's no collision and we landed here only because of
-      // unborn HEAD, `-f` is a harmless no-op (no .gitignore
-      // matches anything tracked-by-snapshot).
+      // pop can't apply). `-f` forces add to include ignored
+      // files — load-bearing in the collision case, but
+      // potentially expensive in the unborn case (would drag
+      // node_modules / build artifacts into the preservation
+      // commit). Only enable -f when a real collision exists; the
+      // unborn-only path uses plain `-A`, matching the snapshot
+      // behavior (read-tree won't touch ignored files that aren't
+      // in the checkpoint tree, so they don't need preserving).
       const indexFile = await tempIndexPath();
       try {
         const env = { GIT_INDEX_FILE: indexFile };
-        await runGit(['add', '-A', '-f', '.'], { cwd, env });
+        const addArgs = collision ? ['add', '-A', '-f', '.'] : ['add', '-A', '.'];
+        await runGit(addArgs, { cwd, env });
         const treeRes = await runGit(['write-tree'], { cwd, env });
         const tree = treeRes.stdout.trim();
         if (tree.length === 0) {
-          throw new Error('git write-tree produced empty output (unborn-HEAD preserve)');
+          throw new Error('git write-tree produced empty output (restore preserve)');
         }
         const commitEnv: Record<string, string> = {
           GIT_AUTHOR_NAME: 'forja',
@@ -597,11 +646,11 @@ export const restore = async (cwd: string, commitSha: string): Promise<RestoreRe
         const commitRes = await runGit(['commit-tree', tree], {
           cwd,
           env: commitEnv,
-          stdin: 'forja: pre-restore working tree (unborn HEAD)',
+          stdin: 'forja: pre-restore working tree',
         });
         const sha = commitRes.stdout.trim();
         if (sha.length === 0) {
-          throw new Error('git commit-tree produced empty output (unborn-HEAD preserve)');
+          throw new Error('git commit-tree produced empty output (restore preserve)');
         }
         // Timestamp + UUID slice keeps multiple unborn-HEAD restores
         // distinguishable. Plain `Date.now()` would collide silently

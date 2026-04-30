@@ -8,6 +8,7 @@ import {
   listCheckpointsBySession,
   listCheckpointsOlderThan,
   updateCheckpointGitRef,
+  withTransaction,
 } from '../storage/index.ts';
 import {
   deleteRestoreSavedRef,
@@ -283,26 +284,37 @@ class CheckpointManagerImpl implements CheckpointManager {
           }
         }
         if (rewriteOk && rewrites.length === chronological.length) {
-          // All rewrites succeeded. Apply DB updates first, then move
-          // the ref. If the ref move fails after DB updates land, the
-          // DB points at the new commits but the ref still points at
-          // the original chain — restore by id still works (manager
-          // looks up by sha from DB), and next purge sees the ref
-          // mismatch and retries the move. Inverse ordering would
-          // leave the ref ahead of the DB and break restore lookups.
-          for (const r of rewrites) {
-            try {
-              updateCheckpointGitRef(this.db, r.id, r.newSha);
-            } catch {
-              // Row vanished mid-purge; leave the rest as-is.
-            }
+          // All rewrites succeeded. Apply DB updates inside a single
+          // transaction so a mid-loop failure doesn't leave the table
+          // half-rewritten — every row either points at its new sha
+          // or at the original. THEN move the ref. Inverse ordering
+          // would leave the ref ahead of the DB and break restore
+          // lookups; this ordering means a ref-move failure leaves
+          // the DB consistent with the new chain but the ref still
+          // pointing at the old head, which the next purge detects
+          // and retries.
+          let dbApplied = true;
+          try {
+            withTransaction(this.db, () => {
+              for (const r of rewrites) {
+                updateCheckpointGitRef(this.db, r.id, r.newSha);
+              }
+            });
+          } catch {
+            // Transaction rolled back — every row stayed on its
+            // original sha. The orphan rewritten commits become
+            // unreachable (we never moved the ref) and gc reclaims
+            // them. Skip the ref move below; state is consistent.
+            dbApplied = false;
           }
-          const finalSha = rewrites[rewrites.length - 1]?.newSha;
-          if (finalSha !== undefined) {
-            try {
-              await setSessionRef(this.cwd, sessionId, finalSha);
-            } catch {
-              // ignored — DB is the authoritative pointer
+          if (dbApplied) {
+            const finalSha = rewrites[rewrites.length - 1]?.newSha;
+            if (finalSha !== undefined) {
+              try {
+                await setSessionRef(this.cwd, sessionId, finalSha);
+              } catch {
+                // ignored — DB is the authoritative pointer
+              }
             }
           }
         }

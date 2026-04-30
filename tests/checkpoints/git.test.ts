@@ -410,6 +410,35 @@ describe('restore', () => {
     }
   });
 
+  test('refuses during bisect with reset hint, not --continue', async () => {
+    // bisect is the one in-progress op without a `--continue`
+    // subcommand. The error message must NOT suggest one — earlier
+    // versions emitted "or `git bisect --continue`" as a generic
+    // suffix, which would send the user toward a non-existent
+    // command.
+    await initRepoWithCommit(repo);
+    await writeFile(join(repo, 'a.txt'), 'state\n');
+    const ckpt = await snapshot({
+      cwd: repo,
+      sessionId: 's',
+      stepId: 'm',
+      iso: 'iso',
+    });
+    await writeFile(join(repo, '.git', 'BISECT_LOG'), 'fake\n');
+    try {
+      const err = await restore(repo, ckpt.sha as string).then(
+        () => null,
+        (e: Error) => e.message,
+      );
+      expect(err).not.toBeNull();
+      expect(err).toContain('bisect');
+      expect(err).toContain('git bisect reset');
+      expect(err).not.toContain('--continue');
+    } finally {
+      await rm(join(repo, '.git', 'BISECT_LOG'), { force: true });
+    }
+  });
+
   test('refuses during cherry-pick', async () => {
     await initRepoWithCommit(repo);
     await writeFile(join(repo, 'a.txt'), 'state\n');
