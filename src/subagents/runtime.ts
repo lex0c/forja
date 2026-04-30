@@ -9,10 +9,20 @@ import type { SubagentDefinition } from './types.ts';
 
 // Filter the parent's registry down to a child registry containing
 // only the whitelisted tools, in the order the definition declared
-// them. We refuse the call if a tool name in the whitelist isn't
-// registered with the parent (likely a typo) — silent omission would
-// produce a child that runs without the tool the author asked for and
-// the model would have no way to know.
+// them. We refuse the call when a tool name in the whitelist isn't
+// registered with the parent (likely a typo — silent omission would
+// produce a child that runs without the tool the author asked for
+// and the model would have no way to know) AND when a tool declares
+// `metadata.writes=true` (Step 4.1 disables checkpoints for the
+// child; mutating tools have no reverse path until worktree
+// isolation lands in 4.2). The capability gate is registry-driven
+// rather than a hard-coded name list — any newly-registered tool
+// that opts into `writes: true` inherits the refusal automatically.
+//
+// Bootstrap pre-validates the same rule against the loaded
+// registry via `validateSubagentSet`; this runtime check is
+// defense in depth for programmatic callers (evals, future
+// tooling) that build configs without going through bootstrap.
 const buildChildRegistry = (
   parent: ToolRegistry,
   whitelist: readonly string[],
@@ -22,6 +32,13 @@ const buildChildRegistry = (
   const seen = new Set<string>();
   for (const toolName of whitelist) {
     if (seen.has(toolName)) {
+      // Loader pulls this forward to bootstrap-time with an
+      // index-aware message (`tools[]` lists 'echo' twice at
+      // index 0 and index 2). This runtime check stays as
+      // defense in depth for programmatic callers that build
+      // `SubagentDefinition` objects directly. Without it, the
+      // raw `register()` call below would still throw, but with
+      // a less-specific "tool X already registered" message.
       throw new Error(`subagent '${subagentName}': tool '${toolName}' listed twice in tools[]`);
     }
     seen.add(toolName);
@@ -29,6 +46,11 @@ const buildChildRegistry = (
     if (tool === null) {
       throw new Error(
         `subagent '${subagentName}': tool '${toolName}' not registered with parent harness`,
+      );
+    }
+    if (tool.metadata.writes === true) {
+      throw new Error(
+        `subagent '${subagentName}': tool '${toolName}' declares metadata.writes=true and cannot appear in subagent.tools[] in Step 4.1 — write tools require worktree isolation (Step 4.2). Bootstrap should have caught this; if you see it at runtime you're constructing the child registry without going through validateSubagentSet first.`,
       );
     }
     child.register(tool as Tool);

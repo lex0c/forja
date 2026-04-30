@@ -121,6 +121,21 @@ const writeTool: Tool = {
   },
 };
 
+// A non-writing tool that explicitly opts out of plan mode via
+// `planSafe: false`. Used to exercise the plan-mode propagation
+// path without tripping the runtime's writes:true gate (which
+// blocks at child-registry construction before plan-mode logic
+// runs). Mirrors the canonical `task` tool's metadata shape.
+const planUnsafeTool: Tool = {
+  name: 'plan_unsafe',
+  description: 'no-op tool that opts out of plan mode',
+  inputSchema: { type: 'object', properties: {} },
+  metadata: { category: 'misc', writes: false, planSafe: false, idempotent: false },
+  async execute() {
+    return { ok: true };
+  },
+};
+
 const definition = (overrides: Partial<SubagentDefinition> = {}): SubagentDefinition => ({
   name: 'explore',
   description: 'Read-only.',
@@ -327,51 +342,69 @@ describe('runSubagent', () => {
 
   test('child inherits planMode from runtime input', async () => {
     // Regression for the plan-mode bypass surfaced in review (C2).
-    // Parent runs in plan mode → child harness must also block
-    // writes, otherwise a subagent with `write_file` whitelisted
-    // could mutate the tree under `--plan` via task().
-    //
-    // Setup: child whitelist contains write_file (legal in tests
-    // because the loader's worktree refusal only fires through the
-    // parser, not when constructing definitions directly), the
-    // model's first turn calls write_file, and we assert the
-    // tool_calls row landed with status='denied'.
+    // Parent runs in plan mode → child harness must inherit it so
+    // any tool with planSafe:false is blocked inside the child
+    // loop. We use `plan_unsafe` (writes:false, planSafe:false)
+    // because writes:true tools are now refused at child-registry
+    // construction before any run starts; the surface we still
+    // need to test is the planMode FORWARDING through runtime.
     const parent = createSession(db, { model: 'mock/m', cwd: '/p' });
     const result = await runSubagent({
-      definition: definition({ tools: ['write_file'] }),
+      definition: definition({ tools: ['plan_unsafe'] }),
       prompt: 'go',
       parentSessionId: parent.id,
       provider: mockProvider([
         {
           text: '',
-          tool_uses: [{ id: 'tu1', name: 'write_file', input: {} }],
+          tool_uses: [{ id: 'tu1', name: 'plan_unsafe', input: {} }],
           stop_reason: 'tool_use',
         },
         { text: 'after the deny', stop_reason: 'end_turn' },
       ]),
-      parentToolRegistry: buildParentRegistry(echoTool, writeTool),
+      parentToolRegistry: buildParentRegistry(echoTool, planUnsafeTool),
       permissionEngine: buildEngine(),
       db,
       cwd: '/p',
       planMode: true,
     });
-    // Run completes (the harness writes a tool_result for the
-    // denial and the model emits a closing turn). The audit row
-    // for write_file in the CHILD session must be 'denied', NOT
-    // 'done'.
-    const writeCalls = db
+    // Run completes; the audit row for plan_unsafe in the CHILD
+    // session must be 'denied' because plan-mode propagation
+    // worked.
+    const calls = db
       .query<{ status: string; session_id: string }, []>(
         `SELECT tc.status AS status, m.session_id AS session_id
          FROM tool_calls tc
          JOIN messages m ON tc.message_id = m.id
-         WHERE tc.tool_name = 'write_file'`,
+         WHERE tc.tool_name = 'plan_unsafe'`,
       )
       .all() as { status: string; session_id: string }[];
-    const childCalls = writeCalls.filter((r) => r.session_id === result.sessionId);
+    const childCalls = calls.filter((r) => r.session_id === result.sessionId);
     expect(childCalls.length).toBeGreaterThan(0);
     for (const row of childCalls) {
       expect(row.status).toBe('denied');
     }
+  });
+
+  test('refuses writes:true tool in whitelist at child-registry build time', async () => {
+    // Capability gate: registry construction itself must refuse
+    // any tool whose metadata.writes is true, regardless of name.
+    // Defense in depth — bootstrap pre-validates via
+    // validateSubagentSet, but a programmatic caller that builds
+    // a HarnessConfig directly without that step still gets
+    // protected here.
+    const parent = createSession(db, { model: 'mock/m', cwd: '/p' });
+    await expect(
+      runSubagent({
+        definition: definition({ tools: ['write_file'] }),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: mockProvider([{ text: 'never reached', stop_reason: 'end_turn' }]),
+        parentToolRegistry: buildParentRegistry(echoTool, writeTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: '/p',
+      }),
+    ).rejects.toThrow(/declares metadata.writes=true/);
   });
 
   test('refuses to spawn beyond MAX_SUBAGENT_DEPTH', async () => {

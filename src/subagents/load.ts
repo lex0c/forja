@@ -16,23 +16,14 @@ const KEBAB_RE = /^[a-z][a-z0-9-]*$/;
 
 const FRONTMATTER_DELIM = '---';
 
-// Tools whose effects escape `cwd` and CANNOT be rolled back by a
-// working-tree restore (CHECKPOINTS.md §2.6). In Step 4.1 subagents
-// run in-process with checkpoints OFF for the child — a writing
-// subagent here would mutate the parent's tree without any reverse
-// path, and the parent's `--undo` would NOT capture the child's
-// writes (the chain is keyed by session id). Step 4.2 lifts this
-// restriction by giving writing subagents a dedicated worktree
-// (`isolation: worktree`); until then, refuse the definition at
-// load time so the author finds out at bootstrap rather than at
-// the first surprise diff.
-const TOOLS_BLOCKED_UNTIL_WORKTREE: ReadonlySet<string> = new Set([
-  'write_file',
-  'edit_file',
-  'bash',
-  'bash_background',
-  'bash_kill',
-]);
+// Note on tool capability validation: the loader is REGISTRY-AGNOSTIC
+// — it doesn't know which tools the harness has wired or what their
+// metadata says. Validation that depends on tool capabilities (write
+// detection for the Step 4.1 worktree-blocking rule) lives in
+// `validate.ts` and runs at bootstrap (against the loaded registry)
+// AND at runtime (in `runSubagent`'s child-registry construction).
+// Earlier we hardcoded a name list here, which silently let any
+// newly-registered writing tool slip through.
 
 interface ParsedFile {
   frontmatter: Record<string, unknown>;
@@ -90,14 +81,14 @@ const requireString = (fm: Record<string, unknown>, key: string, sourcePath: str
 //   - non-string entries (loader contract)
 //   - empty / whitespace-only strings (`tools: [""]` shape)
 //   - strings with leading/trailing whitespace (`tools: ["read_file "]`)
+//   - duplicate entries (`tools: ["echo", "echo"]`)
 //
-// We refuse the padded case rather than silently trimming because
-// silent normalization masks the underlying mistake: the author
-// intended `"read_file "` and got the registry it asks for, OR
-// they made a YAML quoting typo that's about to bite a different
-// loader downstream. A source-aware load-time error surfaces the
-// problem where it can be fixed cleanly, instead of as a generic
-// "tool not registered" at first runtime invocation.
+// Each refusal carries the offending index in the array so the
+// author can locate the typo without diff'ing the file. Pulling
+// these checks forward to load time prevents a definition error
+// from surfacing mid-run as a generic `tool.exception` from the
+// `task` tool, which costs a tool-error slot and is harder to
+// diagnose than a source-aware bootstrap-time error.
 const requireToolNameArray = (
   fm: Record<string, unknown>,
   key: string,
@@ -107,6 +98,7 @@ const requireToolNameArray = (
   if (!Array.isArray(v)) {
     throw new Error(`subagent ${sourcePath}: '${key}' must be an array of strings`);
   }
+  const seen = new Map<string, number>();
   for (let i = 0; i < v.length; i++) {
     const entry = v[i];
     if (typeof entry !== 'string') {
@@ -122,6 +114,13 @@ const requireToolNameArray = (
         `subagent ${sourcePath}: '${key}[${i}]' has leading or trailing whitespace (got ${JSON.stringify(entry)})`,
       );
     }
+    const priorIndex = seen.get(entry);
+    if (priorIndex !== undefined) {
+      throw new Error(
+        `subagent ${sourcePath}: '${key}' lists '${entry}' twice (index ${priorIndex} and index ${i})`,
+      );
+    }
+    seen.set(entry, i);
   }
   return v as string[];
 };
@@ -180,13 +179,6 @@ const parseDefinition = (
   }
   const description = requireString(fm, 'description', sourcePath);
   const tools = requireToolNameArray(fm, 'tools', sourcePath);
-  for (const t of tools) {
-    if (TOOLS_BLOCKED_UNTIL_WORKTREE.has(t)) {
-      throw new Error(
-        `subagent ${sourcePath}: tool '${t}' cannot appear in subagent.tools[] in Step 4.1 — write/exec tools require worktree isolation (Step 4.2). Until then, the parent's --undo cannot revert the child's writes and the child's checkpoints are unreachable from the parent's session id. Remove the tool or wait for worktree support.`,
-      );
-    }
-  }
   if (fm.budget === undefined) {
     throw new Error(`subagent ${sourcePath}: 'budget' is required`);
   }

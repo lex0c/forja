@@ -4,7 +4,7 @@ import { type LockConflict, createPermissionEngine, resolvePolicy } from '../per
 import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
 import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
-import { type SubagentSet, loadSubagents } from '../subagents/index.ts';
+import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { composeWithUserPrompt } from './plan-prompt.ts';
 
@@ -127,6 +127,15 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     ...(input.userAgentsDir !== undefined ? { userDir: input.userAgentsDir } : {}),
     ...(input.projectAgentsDir !== undefined ? { projectDir: input.projectAgentsDir } : {}),
   });
+
+  // Capability gate against the active tool registry. Catches
+  // any tool with `metadata.writes=true` in a subagent's
+  // whitelist — including newly-registered or external tools the
+  // old name-list approach would have missed. Fails the bootstrap
+  // before the harness wires the registry into HarnessConfig, so
+  // the user sees the violation immediately rather than at first
+  // task() invocation.
+  validateSubagentSet(subagents.byName.values(), toolRegistry);
 
   // From here on, anything that throws must close the DB. `migrate` is
   // the only realistic offender — schema-version drift surfaces here.

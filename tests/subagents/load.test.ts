@@ -128,29 +128,10 @@ budget: { max_steps: 1, max_cost_usd: 0 }
     }
   });
 
-  test('rejects write/exec tools in whitelist (Step 4.1 — until worktree)', async () => {
-    // m5 from the review pass. Subagents in 4.1 run in-process with
-    // the parent's tree; the parent's --undo can't reach the child's
-    // writes (chain keyed by session_id) and the child's checkpoints
-    // are off. Until 4.2 ships worktree isolation, an author who
-    // whitelists write_file/edit_file/bash gets a hard refusal at
-    // load time so the gap doesn't ship into production.
-    const blocked = ['write_file', 'edit_file', 'bash', 'bash_background', 'bash_kill'];
-    for (const tool of blocked) {
-      const src = `---
-name: refactor
-description: y
-tools: [${tool}]
-budget:
-  max_steps: 1
-  max_cost_usd: 0
----
-body`;
-      expect(() => loadSubagentFromString(src, 'user', '/p')).toThrow(
-        /cannot appear in subagent\.tools\[\] in Step 4\.1/,
-      );
-    }
-  });
+  // Note: the prior "rejects write/exec tools" test moved to
+  // tests/subagents/validate.test.ts. The loader is registry-
+  // agnostic; capability validation happens at bootstrap (where
+  // the registry is available) and at runtime (defense in depth).
 
   test('rejects empty / whitespace-only entries in tools[]', () => {
     // Regression: the prior validator only checked `typeof e ===
@@ -174,6 +155,29 @@ body`;
       [
         VALID.replace('tools: [read_file, grep, glob]', 'tools: [read_file, 42]'),
         /'tools\[1\]' must be a string \(got number\)/,
+      ],
+    ];
+    for (const [src, re] of cases) {
+      expect(() => loadSubagentFromString(src, 'user', '/p')).toThrow(re);
+    }
+  });
+
+  test('rejects duplicate entries in tools[] at load time', () => {
+    // Pull-forward of the runtime's duplicate detection. Earlier
+    // a malformed `tools: ["echo", "echo"]` passed bootstrap and
+    // failed mid-run as a generic `tool.exception` from the
+    // `task` tool, burning a tool-error slot and obscuring the
+    // root cause. Now the loader catches it source-aware with
+    // both indices in the message so the author can fix the
+    // typo without diff'ing the file.
+    const cases: Array<[string, RegExp]> = [
+      [
+        VALID.replace('tools: [read_file, grep, glob]', 'tools: [echo, echo]'),
+        /'tools' lists 'echo' twice \(index 0 and index 1\)/,
+      ],
+      [
+        VALID.replace('tools: [read_file, grep, glob]', 'tools: [read_file, grep, read_file]'),
+        /'tools' lists 'read_file' twice \(index 0 and index 2\)/,
       ],
     ];
     for (const [src, re] of cases) {
