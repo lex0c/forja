@@ -437,6 +437,44 @@ describe('runAgent', () => {
     expect(result.status).toBe('done');
   });
 
+  test('budget.maxCostUsd: resumed session already over cap exits BEFORE any provider call', async () => {
+    // Regression: the cap was only checked after a turn / compaction
+    // landed cost on the totals. A resumed session whose row already
+    // had totalCostUsd > cap would still issue one billed provider
+    // call before the post-turn check fired. The pre-call gate at
+    // the top of the loop closes that — `script: []` means the mock
+    // throws on any call, so the test would fail loudly if a call
+    // sneaked through.
+    //
+    // Run #1 — leaves the session with $0.0006 of cumulative spend.
+    const first = buildConfig(
+      [{ text: 'A', stop_reason: 'end_turn', usage: { input: 100, output: 20 } }],
+      { capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 } },
+    );
+    const r1 = await runAgent(first.config);
+    expect(r1.status).toBe('done');
+    expect(r1.costUsd).toBeCloseTo(0.0006, 9);
+
+    // Run #2 (resume) — cap is $0.0001, prior is already $0.0006.
+    // The mock script is EMPTY: any provider call throws "mock
+    // script exhausted" and the test would fail with a different
+    // status/reason. The pre-call gate must short-circuit before
+    // generate() is invoked.
+    const second = buildConfig([], {
+      capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 },
+      budget: { maxCostUsd: 0.0001 },
+    });
+    const r2 = await runAgent({ ...second.config, resumeFromSessionId: r1.sessionId });
+    expect(r2.status).toBe('exhausted');
+    expect(r2.reason).toBe('maxCostUsd');
+    expect(r2.steps).toBe(0); // no step started, no provider call
+    expect(r2.costUsd).toBe(0); // per-run is empty
+    expect(second.handle.requests).toHaveLength(0);
+    // Persisted row reflects unchanged cumulative ($0.0006 from run #1).
+    const session = getSession(db, r1.sessionId);
+    expect(session?.totalCostUsd).toBeCloseTo(0.0006, 9);
+  });
+
   test('budget.maxCostUsd: cumulative across resume (prior cost counts)', async () => {
     // Resume contract: session row stores cumulative cost; cap
     // compares against priorCostUsd + totalCostUsd. A session that

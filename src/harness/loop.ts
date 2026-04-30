@@ -491,6 +491,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           return finish(isWallClockTimeout() ? 'maxWallClockMs' : 'aborted');
         }
         if (steps >= budget.maxSteps) return finish('maxSteps');
+        // Cost cap pre-check. Critical on resume: a session whose
+        // priorCostUsd already crossed budget.maxCostUsd would
+        // otherwise issue one billed provider call before the
+        // post-turn check fires. Documented as cumulative; this
+        // closes the gap so the cap blocks IMMEDIATELY at run
+        // start rather than after one wasted turn. Steady-state
+        // (non-resume) runs land in the post-turn check first
+        // and never reach this branch on a subsequent iteration.
+        {
+          const overage = costCapDetailIfExceeded();
+          if (overage !== null) return finish('maxCostUsd', overage);
+        }
 
         steps += 1;
         safeEmit(config.onEvent, { type: 'step_start', stepN: steps });

@@ -181,6 +181,44 @@ body`;
     }
   });
 
+  test('rejects whitespace-padded tool names with a source-aware error', () => {
+    // `tools: ["read_file "]` would slip through trim-only emptiness
+    // checks and fail later at registry build time with the opaque
+    // "tool not registered" path. Refusing here surfaces the typo
+    // at load time. We refuse rather than silently trim — silent
+    // normalization masks the author's mistake.
+    const cases: Array<[string, RegExp]> = [
+      [
+        VALID.replace('tools: [read_file, grep, glob]', 'tools: ["read_file "]'),
+        /'tools\[0\]' has leading or trailing whitespace \(got "read_file "\)/,
+      ],
+      [
+        VALID.replace('tools: [read_file, grep, glob]', 'tools: [" read_file"]'),
+        /'tools\[0\]' has leading or trailing whitespace \(got " read_file"\)/,
+      ],
+      [
+        VALID.replace('tools: [read_file, grep, glob]', 'tools: [read_file, "  grep  ", glob]'),
+        /'tools\[1\]' has leading or trailing whitespace/,
+      ],
+      [
+        VALID.replace('tools: [read_file, grep, glob]', 'tools: ["\\tread_file"]'),
+        /'tools\[0\]' has leading or trailing whitespace/,
+      ],
+    ];
+    for (const [src, re] of cases) {
+      expect(() => loadSubagentFromString(src, 'user', '/p')).toThrow(re);
+    }
+  });
+
+  test('accepts well-formed tool names unchanged', () => {
+    // Sanity: the new whitespace check doesn't reject legitimate
+    // names (regression guard — a too-aggressive trim check could
+    // start rejecting `read_file` because of the underscore or
+    // similar absurd false positives).
+    const def = loadSubagentFromString(VALID, 'user', '/p');
+    expect(def.tools).toEqual(['read_file', 'grep', 'glob']);
+  });
+
   test('rejects budget with bad numbers', () => {
     expect(() =>
       loadSubagentFromString(VALID.replace('max_steps: 20', 'max_steps: 0'), 'user', '/p'),

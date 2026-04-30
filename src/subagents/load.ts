@@ -85,12 +85,18 @@ const requireString = (fm: Record<string, unknown>, key: string, sourcePath: str
   return v;
 };
 
-// Validate a tools[] frontmatter field. Rejects any non-string
-// entries AND any empty / whitespace-only strings. The empty-string
-// case used to slip through (`tools: [""]` passed the type check)
-// and only surfaced at registry build time as a generic exception
-// on first invocation; pulling it forward to load time gives the
-// author a clean source-aware error instead of a runtime puzzle.
+// Validate a tools[] frontmatter field. Rejects:
+//   - non-string entries (loader contract)
+//   - empty / whitespace-only strings (`tools: [""]` shape)
+//   - strings with leading/trailing whitespace (`tools: ["read_file "]`)
+//
+// We refuse the padded case rather than silently trimming because
+// silent normalization masks the underlying mistake: the author
+// intended `"read_file "` and got the registry it asks for, OR
+// they made a YAML quoting typo that's about to bite a different
+// loader downstream. A source-aware load-time error surfaces the
+// problem where it can be fixed cleanly, instead of as a generic
+// "tool not registered" at first runtime invocation.
 const requireToolNameArray = (
   fm: Record<string, unknown>,
   key: string,
@@ -109,6 +115,11 @@ const requireToolNameArray = (
     }
     if (entry.trim().length === 0) {
       throw new Error(`subagent ${sourcePath}: '${key}[${i}]' must be a non-empty tool name`);
+    }
+    if (entry !== entry.trim()) {
+      throw new Error(
+        `subagent ${sourcePath}: '${key}[${i}]' has leading or trailing whitespace (got ${JSON.stringify(entry)})`,
+      );
     }
   }
   return v as string[];
