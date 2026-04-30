@@ -2,6 +2,7 @@ import { type HarnessResult, runAgent } from '../harness/index.ts';
 import { defaultDbPath, getSession, listSessions, migrate, openDb } from '../storage/index.ts';
 import type { ParsedArgs } from './args.ts';
 import { type BootstrapInput, bootstrap } from './bootstrap.ts';
+import { runCheckpointsCli } from './checkpoints.ts';
 import { runListSessions } from './list-sessions.ts';
 import { createJsonRenderer } from './output/json.ts';
 import { createPlainRenderer } from './output/plain.ts';
@@ -131,6 +132,44 @@ export const run = async (options: RunOptions): Promise<number> => {
           : {}),
         out: (s) => process.stdout.write(s),
       });
+    }
+
+    // Checkpoint subcommands and `--undo` short-circuit the same way
+    // list-sessions does: DB-only path, no bootstrap, no API key.
+    // We dispatch BEFORE the resume branch because they're mutually
+    // exclusive — combining `--undo` with `--resume` would be a
+    // contradictory request and ambiguity here would surprise users.
+    if (args.checkpoints !== undefined || args.undo !== undefined) {
+      const cwd = options.bootstrapOverride?.cwd ?? process.cwd();
+      const dbPathOverride = options.bootstrapOverride?.dbPath;
+      const out = (s: string) => process.stdout.write(s);
+      const err = (s: string) => errSink(s);
+      if (args.undo !== undefined) {
+        return await runCheckpointsCli({
+          verb: 'undo',
+          positionals: [args.undo],
+          json: args.json,
+          yes: args.yes,
+          cwd,
+          ...(dbPathOverride !== undefined ? { dbPath: dbPathOverride } : {}),
+          out,
+          err,
+        });
+      }
+      // args.checkpoints is set; verb has been validated by the parser.
+      const ckpt = args.checkpoints;
+      if (ckpt !== undefined) {
+        return await runCheckpointsCli({
+          verb: ckpt.verb as 'list' | 'diff' | 'restore' | 'purge',
+          positionals: ckpt.positionals,
+          json: args.json,
+          yes: args.yes,
+          cwd,
+          ...(dbPathOverride !== undefined ? { dbPath: dbPathOverride } : {}),
+          out,
+          err,
+        });
+      }
     }
 
     // Resume: require a follow-up prompt — without it there's no new

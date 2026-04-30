@@ -25,12 +25,15 @@ const main = async (): Promise<number> => {
     return 0;
   }
 
-  // --list-sessions is a standalone inspection mode that takes no
-  // prompt; the prompt-required gate below is the right shape for
-  // every other entry path (a normal run, --plan, --resume — all
-  // need an instruction for the model). Resume's empty-prompt
-  // check fires inside run() with a more specific error.
-  if (args.prompt.length === 0 && !args.listSessions) {
+  // Inspection / lifecycle modes don't need a prompt:
+  //   - --list-sessions: pure DB read.
+  //   - --undo / --checkpoints: DB + git only, no provider call.
+  // Every other entry path (normal run, --plan, --resume) does need
+  // an instruction for the model. Resume's empty-prompt check fires
+  // inside run() with a more specific error.
+  const promptOptional =
+    args.listSessions || args.undo !== undefined || args.checkpoints !== undefined;
+  if (args.prompt.length === 0 && !promptOptional) {
     process.stderr.write(`forja: missing prompt\n\n${usage()}\n`);
     return 1;
   }

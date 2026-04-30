@@ -57,6 +57,32 @@ export type HarnessEvent =
       costUsd: number;
       reason?: string;
     }
+  | {
+      // Emitted ONCE per step, after the harness has decided that
+      // the step's tool_uses include at least one tool with
+      // `writes: true` and the snapshot succeeded. Spec §12: a
+      // step that doesn't write produces no event; a step whose
+      // working tree was identical to the prior snapshot ALSO
+      // produces no event (the no-op skip in CheckpointManager).
+      type: 'checkpoint_created';
+      checkpointId: string;
+      gitRef: string;
+      stepId: string;
+      // Mirrors the persisted had_bash flag — true when the
+      // step that produced the checkpoint also ran bash. Renderers
+      // use this to show a hint that `--undo` won't reverse
+      // bash side effects.
+      hadBash: boolean;
+    }
+  | {
+      // Emitted at session_start when the harness was asked to
+      // enable checkpoints but the cwd is not a git repository.
+      // The renderer surfaces this as a one-line warning so the
+      // user knows `/undo` won't be there for this run. Distinct
+      // from `enableCheckpoints=false` (no event emitted).
+      type: 'checkpoints_unavailable';
+      reason: string;
+    }
   | { type: 'session_finished'; result: HarnessResult };
 
 // Budget caps for an autonomous run. Per AGENTIC_CLI §5: every limit has
@@ -167,6 +193,24 @@ export interface HarnessConfig {
   // guard. Caller is responsible for verifying the id exists
   // before constructing the config.
   resumeFromSessionId?: string;
+  // Checkpoint subsystem (M3 §12). When true, the harness probes
+  // `cwd` once at startup and, if the directory is a git repo,
+  // takes a snapshot before every step that runs a tool with
+  // `writes: true`. Default false: explicit opt-in keeps the cost
+  // off the hot path for unit tests and short-lived programmatic
+  // callers. The CLI bootstrap turns it on for real runs.
+  //
+  // Disabling checkpoints does NOT disable write tools — the
+  // harness still executes them, just without the rollback safety
+  // net. CHECKPOINTS.md §2.2 documents the trade-off.
+  enableCheckpoints?: boolean;
+  // Override the default checkpoint retention (CHECKPOINTS.md §2.5,
+  // default 30 days). When checkpoints are enabled, the harness
+  // fires a fire-and-forget purge at session start that drops
+  // checkpoint rows + refs older than this. Set to a small number
+  // in tests that need to exercise the cleanup path; leave unset in
+  // production to use the spec default.
+  checkpointsRetentionDays?: number;
 }
 
 export interface HarnessResult {

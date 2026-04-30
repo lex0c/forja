@@ -15,6 +15,289 @@ Format:
 
 ---
 
+## [2026-04-29] M3 / Step 3 — fix restore on unborn HEAD with dirty tree
+
+`git stash push` refuses on unborn HEAD with the explicit message
+"You do not have the initial commit yet". `snapshot()` already
+supported unborn repos via `commit-tree`, but `restore()` shipped
+with an unconditional `stash push` that hard-failed before the
+read-tree could run — making `--undo` unusable in a freshly
+init'd repo with any uncommitted work.
+
+The data-loss case the fix protects against: an untracked
+working-tree file with the SAME NAME as something in the
+checkpoint gets overwritten by `read-tree --reset -u`. Without
+preservation, the user's version is gone for good. Untracked
+files NOT in the checkpoint survive read-tree by themselves
+(git leaves them alone), so this only matters for the name-
+collision shape — but that's exactly the shape an `--undo` of an
+agent edit produces.
+
+**Fix:** detect unborn HEAD before stashing. When found, build a
+preservation commit with the same temp-index/commit-tree mechanism
+`snapshot()` uses, anchor it under `refs/agent/restore-saved/<ms>`,
+and report the ref to the caller via the new `stashKind:
+'agent-ref' | 'git-stash'` field on `RestoreResult`. The CLI
+renders the right recovery hint:
+
+  - `git-stash` → "Run `git stash pop` to recover the changes…"
+  - `agent-ref` → "Run `git read-tree --reset -u <ref>` to
+    recover the changes (HEAD is unborn; `git stash pop` would
+    fail)."
+
+**Index re-sync** (`read-tree HEAD` after the reset) is also
+gated on `headAfter !== null`. Was already correct; comment
+updated to call out the unborn case explicitly.
+
+**Tests:** unit test reproduces the bug pre-fix (the previous
+"You do not have the initial commit yet" exit). New tests cover:
+unborn-HEAD dirty restore (preservation ref captures the user's
+version, working tree gets the checkpoint), unborn-HEAD clean
+restore (no preservation), and the CLI recovery-hint variant
+(matches `git read-tree --reset -u`, NOT `Run \`git stash pop\``).
+
+**Verification:** `bun test` 1053 pass / 10 skip / 0 fail (+3 new
+tests for unborn-HEAD paths); `tsc --noEmit` clean; `biome
+check` clean. Bench + smoke from the previous pass still green.
+
+---
+
+## [2026-04-29] M3 / Step 3 — closes acceptance criteria 6+7
+
+`CHECKPOINTS.md §5` listed 8 acceptance criteria. The mock-driven
+test suite covered 1–5 + 8; criteria 6 (real-model smoke) and 7
+(perf in 10k-file repo) were the difference between "code that
+passes mocks" and "subsystem we know works". This pass lands both.
+
+**Critério 7 — performance bench.**
+
+`evals/bench-checkpoint-snapshot.ts` synthesizes a temp git repo
+with 10k small files (configurable via `--files`), seeds an
+initial commit, and runs the production `snapshot()` 100 times,
+mutating one file per iteration so write-tree has real work
+(skip-on-noop is rejected as an invalid measurement). One
+warm-up round discarded to keep page-cache + JIT off the timing
+distribution.
+
+Result on dev box (ext4, NVMe, ~10k files):
+  min   111.57ms
+  p50   117.13ms
+  mean  117.97ms
+  p95   124.04ms
+  p99   137.04ms
+  max   149.45ms
+
+SLO is `p95 < 500ms` per CHECKPOINTS §2.8. We're at 124ms — 4×
+headroom. The bench is shape-stable enough to drop into a CI
+gate later (cost: $0, no API).
+
+**Critério 6 — real-model smoke.**
+
+`evals/smoke-checkpoint-undo.sh` mirrors the smoke-resume pattern:
+- mktemp workspace, isolated XDG, fresh `git init`
+- bypass-mode `.agent/permissions.yaml` so write_file isn't policy-denied
+- 3 seed files, sha-256-captured pre-edit
+- agent prompt asking Claude Haiku to prepend a header line to all
+  three via write_file
+- assert: at least one `checkpoint_created` event AND at least one
+  file changed (proves the agent did the work)
+- `--undo --yes <sessionId>`
+- assert: each file's sha-256 matches the pre-edit capture, byte-
+  for-byte
+
+Cost: ~$0.005-0.02 per run on Haiku 4.5.
+
+**Bug surfaced by the smoke (and fixed):**
+
+`src/cli/index.ts` had a top-level "missing prompt" gate that
+exempted `--list-sessions` but not `--undo` / `--checkpoints`.
+Running `--undo <session>` without a follow-up prompt errored
+out with the help text instead of dispatching the lifecycle
+verb. Mock tests didn't catch this — they call `run()` directly,
+bypassing the entry. The smoke spawns the real binary path and
+caught it on the first run.
+
+Fix: extend the prompt-optional list to cover the two new
+verbs. Tests in `tests/cli/index.test.ts` now exercise both
+end-to-end through the spawned subprocess so the regression
+can't sneak back via the `run()` shortcut.
+
+**Why the smoke was load-bearing:**
+
+The bug above is exactly the class of failure that mocks miss —
+not a logic error in the checkpoint subsystem itself, but a
+glue-layer mismatch between the CLI entry and the verb
+dispatcher. Without the smoke, this would have shipped to a real
+user as "agent --undo X gives me the help text". Worth the
+~$0.01 tax to catch upfront.
+
+**Step 3 status:** all 8 acceptance criteria of CHECKPOINTS §5
+satisfied. Subsystem ships.
+
+**Verification:** `bun test` 1050 pass / 10 skip / 0 fail (+2 new
+tests for the prompt gate); `tsc --noEmit` clean; `biome check`
+clean. `bun run evals/bench-checkpoint-snapshot.ts` exits 0
+(p95=124ms). `./evals/smoke-checkpoint-undo.sh` exits 0 against
+Haiku 4.5.
+
+---
+
+## [2026-04-29] M3 / Step 3 — review fixes (post-self-review pass)
+
+Self-review surfaced 13 issues across the Step 3 surface — 3 critical
+(C1–C3), 5 medium, and 5 minor. All addressed in this pass; the
+checkpoints subsystem now has tighter subprocess hygiene, no
+race-on-shutdown, and a metadata-driven escapesCwd flag.
+
+**Critical:**
+
+- **C1 — Race between fire-and-forget retention purge and `db.close`.**
+  `cli/run.ts` closes the DB right after `runAgent` returns; the
+  prior fire-and-forget purge could outlive the close and hit a
+  closed sqlite handle (segfault risk depending on Bun's binding).
+  Fix: capture the purge promise in the loop's outer scope and
+  `await` it in the outer `finally` (with `.catch` swallow) before
+  any other cleanup. The retention tests dropped their 50ms
+  `setTimeout` polling — the purge now resolves synchronously by
+  the time `runAgent` returns.
+- **C2 — Spec §13 vs CHECKPOINTS.md divergence.** Spec §13 still
+  declared the v0 columns (`ref`, `kind`, `files_changed`,
+  `size_bytes`); the design doc CHECKPOINTS.md §2.4 already
+  resolved the open question to (`git_ref`, `had_bash`) and the
+  code followed §2.4. CLAUDE.md says diverging from spec requires
+  a spec PR first — fixed by editing §13 to match (cascade FK,
+  `had_bash` CHECK, comment pointing to §2.4 for the v0→v1
+  motivation).
+- **C3 — `restore()` could leave a stash orphan on a GC'd commit.**
+  Old shape: stash dirty changes first, then `read-tree --reset
+  -u <sha>` — if the sha was GC'd, the read-tree threw and the
+  user got "Restored to checkpoint X" while their working tree
+  was actually in stash@{0}. Fix: probe `rev-parse --verify
+  <sha>^{commit}` BEFORE stashing. Test verifies dirty file
+  stays in working tree when the sha is unreachable.
+
+**Medium:**
+
+- **M1 — Post-restore index now matches HEAD, not the checkpoint.**
+  `read-tree --reset -u <ckpt>` rewrote both index and worktree
+  to the checkpoint tree, leaving HEAD pointing past it. The
+  user's `git status` then showed the diff between HEAD and the
+  ckpt as "staged for commit" — confusing UX when they had their
+  own commits during the agent run. Fix: after the reset, run
+  `read-tree HEAD` (no -u) to re-sync the index. Status reads as
+  the natural "unstaged changes vs HEAD" (or clean, when HEAD ==
+  ckpt-tree). Test asserts `git status --porcelain` shows only
+  untracked-file rows post-restore.
+- **M2 — Orphan-ref sweep was O(N×M).** Per-ref
+  `listCheckpointsBySession` lookup turned the cleanup into a
+  quadratic walk for sessions with no rows but many refs.
+  Replaced with one `SELECT DISTINCT session_id FROM checkpoints`
+  and a Set lookup. Same correctness, linear.
+- **M3 — `runGit` had no timeout and leaked subprocess on stdin
+  failure.** Added a 30s default timeout (`RUN_GIT_DEFAULT_TIMEOUT_MS`,
+  per-call override via `opts.timeoutMs`); a stuck git process
+  (waiting on a ref lock from another git instance) now throws
+  `git X timed out after Nms` instead of wedging the harness for
+  the full wall-clock budget. Stdin write/end is wrapped in
+  try/finally that kills the subprocess on error, closing the
+  zombie-on-broken-pipe gap.
+- **M4 — Manager opened its own `Bun.spawn` for `update-ref`.**
+  Inconsistent with the rest of the surface (everything else
+  goes through `runGit`). Exposed `setSessionRef(cwd, sessionId,
+  sha)` in `git.ts` and the manager's purge re-pointing now
+  uses it — same env scrubbing, same timeout, same auditable
+  surface.
+- **M5+m2 — Dead code + `path.dirname`.** `purge()`'s sessionId
+  branch read `rows = listCheckpointsBySession` and discarded
+  with `void rows;` (leftover from an earlier shape that wanted
+  per-ref deletion); removed. `cleanupTempIndex` switched
+  `join(indexFile, '..')` → `dirname(indexFile)` for clarity
+  and platform-safety.
+
+**Minor:**
+
+- **m1 — `ToolMetadata.escapesCwd` flag with metadata-first
+  detection.** `had_bash` was hardcoded to a name list (`bash`,
+  `bash_background`, `bash_kill`); future tools with the same
+  risk profile would silently miss the warning. Added optional
+  `escapesCwd?: boolean` to ToolMetadata; the bash family opts
+  in. The harness checks the flag first and falls back to the
+  name list as defense in depth so external tool definitions
+  that pre-date the flag still get the warning.
+- **m3 — Friendly CLI message for GC'd ckpt commits.** `--undo`
+  on a checkpoint whose commit was reclaimed by `git gc` used to
+  surface raw git output (`fatal: bad object` /
+  `Needed a single revision`). Rewrites detected via substring
+  match into "this checkpoint references commit X which is no
+  longer reachable; run `agent --checkpoints purge <session>` to
+  drop the stale rows." Test seeds an unreachable sha and
+  asserts the hint is on stderr.
+
+**Verification:** `bun test` 1048 pass / 10 skip / 0 fail (+3 vs the
+foundation pass: GC-collected restore hint, post-restore index
+shape, restore-on-bad-sha leaves dirty intact); `tsc --noEmit`
+clean; `biome check` clean. Retention tests dropped their
+`setTimeout(50)` polling — the C1 await makes purge resolution
+deterministic.
+
+---
+
+## [2026-04-29] M3 / Step 3 — Checkpoints + `--undo`
+
+Lands `AGENTIC_CLI §12` + the `CHECKPOINTS.md` design doc:
+every step that runs a tool with `metadata.writes === true`
+produces a git-backed snapshot that `--undo` (or
+`--checkpoints restore`) can revert to. Reversibility-by-design
+(principle 10) finally has its load-bearing implementation.
+
+**Slice scope:**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/storage/migrations/009-checkpoints.ts` | NEW | `checkpoints` table — id, session_id (FK CASCADE), step_id, git_ref, created_at, had_bash. Two indexes covering (session_id, created_at DESC) and (session_id, step_id) |
+| `src/storage/repos/checkpoints.ts` | NEW | insert/get/listBySession/getLatest/delete/deleteBySession/listOlderThan. CASCADE-tested round-trip |
+| `src/checkpoints/git.ts` | NEW | Low-level git plumbing — runGit wrapper (LC_ALL=C, GIT_TERMINAL_PROMPT=0), isGitRepo, getHeadSha, resolveRef, snapshot (temp index + commit-tree), restore (stash-on-dirty + read-tree --reset -u), diff (tree-vs-tree to cover untracked), listSessionRefs, deleteSessionRef |
+| `src/checkpoints/detect.ts` | NEW | Soft probe: `available: boolean + reason` so the harness can wire a no-op manager when cwd isn't a git repo |
+| `src/checkpoints/manager.ts` | NEW | `CheckpointManager` impl from CHECKPOINTS §3 — snapshot/list/get/restore/diff/purge. Purge handles per-session and per-age (default 30d) with orphan-ref sweep |
+| `src/harness/loop.ts` | UPDATED | Optional manager creation behind `enableCheckpoints` flag. Snapshot fired before the per-step tool loop when any tool_use's metadata declares `writes:true`. `had_bash` derived by tool name (bash, bash_background, bash_kill). Lazy retention purge fired fire-and-forget at session start. New events: `checkpoint_created`, `checkpoints_unavailable` |
+| `src/harness/types.ts` | UPDATED | `enableCheckpoints?: boolean` (default false), `checkpointsRetentionDays?: number`, two new HarnessEvent variants |
+| `src/cli/args.ts` | UPDATED | New flags: `--undo <session>`, `--checkpoints <verb> [positionals…]` (verbs: list/diff/restore/purge), `--yes` / `-y` for the bash-side-effect confirm |
+| `src/cli/checkpoints.ts` | NEW | Standalone handler (no bootstrap, DB-only). All 5 verbs (list/diff/restore/purge + undo as latest-restore alias). Bash-warning gate refuses without `--yes`. Stash-on-dirty messaging on restore. JSON + table formats |
+| `src/cli/run.ts` | UPDATED | Dispatches `--undo` / `--checkpoints` short-circuit before bootstrap (mirroring `--list-sessions`). Mutually exclusive with `--resume` by ordering |
+| `src/cli/bootstrap.ts` | UPDATED | Real CLI runs default `enableCheckpoints: input.plan !== true`. Plan mode opts out (no writes can land ⇒ nothing to undo) |
+| Tests | NEW | `tests/storage/checkpoints.test.ts` (10), `tests/checkpoints/git.test.ts` (21), `tests/checkpoints/detect.test.ts` (2), `tests/checkpoints/manager.test.ts` (14), `tests/harness/checkpoints.test.ts` (10 — wiring + retention sweep), `tests/cli/checkpoints.test.ts` (15 — verbs, JSON shape, bash gate, cross-session refusal), `tests/cli/args.test.ts` (+11 — new flag parsing) |
+
+**Decisions:**
+
+- **Ref shape: linear chain per session under `refs/agent/checkpoints/<session>`.** Each new snapshot's parent is the prior session checkpoint (or HEAD on the first), so the whole history stays reachable from one ref. We update the ref only on a successful new commit; the prior chain stays intact via parent links, and the DB row is the authoritative pointer when we need to walk back. NOT `refs/stash` — would pollute the user's stash list and is one-stack-only.
+- **Snapshot via temp index + `commit-tree`, NOT `git stash create`.** stash-create can't pick parents (always HEAD). Our chain shape requires parent-on-prior-checkpoint, so we use the lower primitive: `GIT_INDEX_FILE=tmp git read-tree HEAD; git add -A; git write-tree; commit-tree <tree> -p <prior>`. The user's `.git/index` is never touched.
+- **No-op skip uses tree-equality vs prior parent.** When the working tree's `write-tree` matches the prior chain head's tree, we return `sha=null` and the harness writes no row. Defense in depth: a tool that lies about `writes:true` won't pollute the audit trail.
+- **`had_bash` derived by tool name, not metadata.** The bash family (`bash`, `bash_background`, `bash_kill`) is the only group whose side effects escape cwd reversibility (DB writes, network, processes). Hardcoding by name keeps the rule auditable; adding a new bash-shaped tool is an explicit edit, not an emergent metadata interaction.
+- **CLI surfaces are headless-first.** `--yes` / `-y` replaces the spec's interactive `Type 'undo' to confirm` prompt. Real interactive confirm waits for the M4 Ink TUI; pre-TUI the operator runs without `-y`, sees the warning, decides, re-runs with `-y`. JSON shape preserved on every verb so eval harnesses and audit consumers can parse.
+- **`session_start` precedes `checkpoints_unavailable`.** Renderers that bracket on `session_start` would otherwise miss the warning. We capture the unavailability flag before session_start and emit it right after, preserving the bracket contract.
+- **Diff uses tree-vs-tree.** `git diff <ckpt-sha>` only sees tracked files; an untracked file added since the snapshot would silently disappear from the diff. We materialize the working tree as an ephemeral commit object via the same temp-index technique and diff `<ckpt-tree>` against `<wt-tree>`. Slightly slower than the naive form, correct on all input shapes.
+- **Lazy retention sweep is fire-and-forget at session_start.** A monorepo with thousands of refs could spend seconds in `update-ref -d`; blocking the harness on cleanup defeats the spec's "non-blocking, best-effort" wording. Errors are swallowed so a corrupt ref store doesn't bring down a session for cleanup that can be retried next run. Safe under concurrent snapshots: the cutoff is `now - retentionDays`, well behind any in-flight session's `created_at`.
+- **`--undo` resolves latest internally rather than requiring `--checkpoints restore <session> <latest>`.** Matches CHECKPOINTS §2.3 word-for-word and is the dominant case. Implemented as a thin alias over `restore` so the bash-warning + stash logic is shared.
+- **Plan mode disables the subsystem.** Saves one git probe per `--plan` invocation and avoids confusion about why an undo would be empty (no writes ran). Spec §12.4 documents the relationship between plan + checkpoints; the implementation makes them orthogonal at construction time.
+
+**Pending (M4 / later):**
+
+- Slash commands `/undo`, `/checkpoint list/restore/diff/purge` — wait on M4 Ink TUI; same internal API consumed.
+- Interactive `Type 'undo' to confirm` prompt — also TUI-bound.
+- `cp --reflink` fallback for non-git directories — deferred per CHECKPOINTS §4. Pull-in signal: a user explicitly asks while in a non-git workspace.
+- Time-based auto-snapshots and branching/forking from a checkpoint — out of scope per CHECKPOINTS §4.
+- Performance smoke against a 10k-file repo (CHECKPOINTS §5 criterion 7). Manual verification today; bundle with the eval-baseline pass when M3 closes.
+
+**Why it matters:**
+
+- "Reversível por design" (root principle 10) finally has the implementation that makes it true. Before this slice, every successful write tool was permanent.
+- Unblocks the M4 TUI work that needs `/undo` semantics already in the engine — the slash command is just a wire to `runCheckpointsCli`.
+- Eval / regression tooling can now restore between runs to keep the working tree in a known state without manual `git reset`.
+
+**Verification:** `bun test` 1045 pass / 10 skip / 0 fail (+114 new tests across storage, checkpoints, harness, cli); `tsc --noEmit` clean; `biome check` clean.
+
+---
+
 ## [2026-04-29] M3 / Step 2.4 — Resume + list-sessions (CLI)
 
 Lands the non-UI half of spec §2.1 session continuity:

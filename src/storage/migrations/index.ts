@@ -6,6 +6,7 @@ import { migration005BackgroundProcesses } from './005-background-processes.ts';
 import { migration006BgStderrCursor } from './006-bg-stderr-cursor.ts';
 import { migration007MessageSeq } from './007-message-seq.ts';
 import { migration008SessionSeq } from './008-session-seq.ts';
+import { migration009Checkpoints } from './009-checkpoints.ts';
 
 export interface Migration {
   id: number;
@@ -22,4 +23,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration006BgStderrCursor,
   migration007MessageSeq,
   migration008SessionSeq,
+  migration009Checkpoints,
 ];

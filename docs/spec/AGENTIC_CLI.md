@@ -1170,14 +1170,19 @@ approvals(
 
 checkpoints(
   id TEXT PRIMARY KEY,
-  session_id TEXT NOT NULL,
-  step_id TEXT NOT NULL,
-  ref TEXT NOT NULL,          -- git ref ou path snapshot
-  kind TEXT NOT NULL,         -- git_stash | reflink | none
-  files_changed INTEGER,
-  size_bytes INTEGER,
-  created_at INTEGER NOT NULL
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  step_id TEXT NOT NULL,      -- messages.id da assistant turn que disparou o snapshot
+  git_ref TEXT NOT NULL,      -- commit SHA do snapshot (ver CHECKPOINTS.md §2.4)
+  created_at INTEGER NOT NULL,
+  had_bash INTEGER NOT NULL DEFAULT 0
+                                CHECK (had_bash IN (0, 1))
 );
+-- Forma resolvida em CHECKPOINTS.md §2.4. As colunas `kind`,
+-- `files_changed` e `size_bytes` da v0 não são mais necessárias:
+-- v1 é git-only (kind sempre 'git'), e os contadores de tamanho
+-- viraram telemetria opcional (PERFORMANCE.md), não dado de
+-- audit. `had_bash` substitui essa cobertura — drives o warning
+-- no /undo quando o step também rodou bash.
 
 hook_runs(
   id TEXT PRIMARY KEY,

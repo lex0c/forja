@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto';
 import { type BgManager, createBgManager } from '../bg/index.ts';
+import {
+  type CheckpointManager,
+  createCheckpointManager,
+  detectCheckpointSupport,
+} from '../checkpoints/index.ts';
 import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
@@ -131,6 +136,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // closure so the outer-finally cleanup hook can find it whether
   // we exited normally or through guardedFinish.
   let bgManager: BgManager | undefined;
+  // Per-session CheckpointManager. Lifecycle parallels bgManager:
+  // created after sessionId is resolved (the manager carries it),
+  // used inline before tool execution, and otherwise just lives on
+  // the stack. No teardown — checkpoint refs are durable artifacts
+  // intentionally; the lazy-purge sweep at startup of the NEXT run
+  // is what reclaims them.
+  let checkpointManager: CheckpointManager | undefined;
+  // Tracks the in-flight retention sweep (if any). Captured in the
+  // outer scope so the outer finally can await it before the caller
+  // closes the DB. Without the await, the purge would race against
+  // db.close() in cli/run.ts and hit a closed sqlite handle.
+  let checkpointsPurgeInFlight: Promise<unknown> | undefined;
   // Per-session TodoList store. Created once per session here so the
   // todo_write tool sees a fresh list, and torn down in the outer
   // finally so accumulated state from a long-lived process doesn't
@@ -312,6 +329,51 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         });
       }
 
+      // Checkpoint manager. Only built when the caller opted in —
+      // unit tests and programmatic callers usually don't, so we
+      // skip the git probe entirely in that case. The probe itself
+      // is best-effort: a non-git cwd yields available=false and
+      // every snapshot becomes a no-op, which keeps the loop's
+      // call sites uniform.
+      //
+      // The `checkpoints_unavailable` event (when the probe finds
+      // no git) is emitted AFTER `session_start` so the bracketing
+      // contract holds — every observer sees session_start as the
+      // first event of a run. Captured to a local and replayed
+      // below.
+      let checkpointsUnavailableReason: string | null = null;
+      if (config.enableCheckpoints === true) {
+        const support = await detectCheckpointSupport(config.cwd);
+        checkpointManager = createCheckpointManager({
+          db: config.db,
+          cwd: config.cwd,
+          sessionId,
+          available: support.available,
+        });
+        if (!support.available && support.reason !== null) {
+          checkpointsUnavailableReason = support.reason;
+        } else if (support.available) {
+          // Lazy retention sweep. Fire-and-forget per CHECKPOINTS §2.5:
+          // it must not block the harness from making progress (a
+          // monorepo with thousands of refs could spend seconds in
+          // ref deletion) AND it must not bubble its errors anywhere
+          // the run depends on (purge throwing on a corrupt ref store
+          // would otherwise bring down a session for a side-effect-
+          // less cleanup).
+          //
+          // Safe under concurrent snapshots in the same session
+          // because purge's age-cutoff (default 30d) is far beyond
+          // any in-flight session's created_at; the current
+          // session's rows are excluded by construction.
+          const retentionDays = config.checkpointsRetentionDays;
+          checkpointsPurgeInFlight = checkpointManager
+            .purge(retentionDays !== undefined ? { olderThanDays: retentionDays } : {})
+            .catch(() => {
+              // Swallowed — see rationale above.
+            });
+        }
+      }
+
       // Resume path: hydrate messages from persistence BEFORE
       // appending the new user prompt. The model sees [old turns,
       // new prompt] and continues naturally. The new prompt is
@@ -390,6 +452,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       messages.push({ role: 'user', content: config.userPrompt });
 
       safeEmit(config.onEvent, { type: 'session_start', sessionId });
+      // Emit the checkpoints-unavailable warning AFTER session_start
+      // so observers can rely on session_start being the first
+      // lifecycle event of a run. Without the order guarantee,
+      // renderers that buffer until session_start as the bracket
+      // signal would miss the warning entirely.
+      if (checkpointsUnavailableReason !== null) {
+        safeEmit(config.onEvent, {
+          type: 'checkpoints_unavailable',
+          reason: checkpointsUnavailableReason,
+        });
+      }
 
       while (true) {
         if (signal.aborted) {
@@ -539,6 +612,76 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             );
           }
           return finish('done');
+        }
+
+        // Snapshot before any of this step's tool_uses run. Spec §12 +
+        // CHECKPOINTS.md §2.1: granularity is per-step, not per-tool —
+        // a refactor of 5 files = 5 edits in the same step ⇒ 1
+        // checkpoint that captures the pre-refactor tree, so `/undo`
+        // returns the user atomically to the state before the step.
+        //
+        // Triggers iff at least one declared tool_use's tool has
+        // `metadata.writes === true`. We inspect the registry here —
+        // not the policy — because the question is "could this step
+        // mutate the working tree", and policy denials happen later
+        // (in invokeTool). A tool that's about to be policy-denied
+        // still doesn't move files, so we'd take a snapshot for nothing
+        // — but the no-op skip in CheckpointManager catches it (the
+        // working tree didn't change, write-tree matches the prior
+        // checkpoint, no row written). Cheap defense in depth.
+        //
+        // had_bash: true iff at least one tool in this step has side
+        // effects that escape cwd (DB writes, network calls, process
+        // spawns) — these are NOT reversed by checkpoint restore. The
+        // tool's own `metadata.escapesCwd` is the source of truth;
+        // the explicit name list (`bash`, `bash_background`,
+        // `bash_kill`) is a defense-in-depth fallback for external
+        // tool definitions that haven't set the flag yet. Variable
+        // name kept as `hadBash` to match the persisted column;
+        // `escapesCwd` is the conceptual rename for a future cleanup.
+        if (checkpointManager !== undefined) {
+          let hasWrites = false;
+          let hadBash = false;
+          for (const tu of collected.tool_uses) {
+            const tool = config.toolRegistry.get(tu.name);
+            if (tool === null) continue;
+            if (tool.metadata.writes) hasWrites = true;
+            if (
+              tool.metadata.escapesCwd === true ||
+              tu.name === 'bash' ||
+              tu.name === 'bash_background' ||
+              tu.name === 'bash_kill'
+            ) {
+              hadBash = true;
+            }
+          }
+          if (hasWrites) {
+            try {
+              const outcome = await checkpointManager.snapshot({
+                stepId: assistantMsg.id,
+                hadBash,
+                stepN: steps,
+              });
+              if (outcome.checkpointId !== null && outcome.gitRef !== null) {
+                safeEmit(config.onEvent, {
+                  type: 'checkpoint_created',
+                  checkpointId: outcome.checkpointId,
+                  gitRef: outcome.gitRef,
+                  stepId: assistantMsg.id,
+                  hadBash,
+                });
+              }
+            } catch {
+              // Snapshot failures must not break the step. The most
+              // likely cause is a transient git issue (locked refs
+              // mid-`git gc`, stale lock file, fs error). The harness
+              // proceeds without a checkpoint for this step — `/undo`
+              // would skip past it to the prior surviving checkpoint,
+              // which is the conservative outcome. The DB row would
+              // not have been written (insertCheckpoint is the last
+              // step inside snapshot()), so audit stays consistent.
+            }
+          }
         }
 
         // Execute every tool_use in this step, collecting results.
@@ -743,6 +886,19 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       return guardedFinish(e);
     }
   } finally {
+    // Drain the lazy retention sweep BEFORE anything else in the
+    // finally fires. The caller (cli/run.ts) is allowed to close the
+    // DB right after runAgent returns; without this drain the purge
+    // would race against db.close() and hit a closed sqlite handle.
+    // The .catch() chain at construction already absorbed errors, so
+    // the await here is purely a synchronization point.
+    if (checkpointsPurgeInFlight !== undefined) {
+      try {
+        await checkpointsPurgeInFlight;
+      } catch {
+        // Already swallowed at construction; defensive.
+      }
+    }
     if (bgManager !== undefined) {
       try {
         await bgManager.cleanup();

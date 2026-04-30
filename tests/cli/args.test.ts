@@ -183,6 +183,96 @@ describe('parseArgs', () => {
   });
 });
 
+describe('--undo flag', () => {
+  test('captures the session id', () => {
+    const r = parseArgs(['--undo', 'sess-123']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.undo).toBe('sess-123');
+  });
+
+  test('rejects when no value follows', () => {
+    const r = parseArgs(['--undo']);
+    expect(r.ok).toBe(false);
+  });
+
+  test('rejects when next token is another flag', () => {
+    const r = parseArgs(['--undo', '--json']);
+    expect(r.ok).toBe(false);
+  });
+});
+
+describe('--yes / -y flag', () => {
+  test('default is false', () => {
+    const r = parseArgs(['hi']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.yes).toBe(false);
+  });
+
+  test('--yes sets the flag', () => {
+    const r = parseArgs(['--yes']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.yes).toBe(true);
+  });
+
+  test('-y short form sets the flag', () => {
+    const r = parseArgs(['-y']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.yes).toBe(true);
+  });
+});
+
+describe('--checkpoints flag', () => {
+  test('list with one positional', () => {
+    const r = parseArgs(['--checkpoints', 'list', 'sess-1']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.checkpoints).toEqual({ verb: 'list', positionals: ['sess-1'] });
+  });
+
+  test('diff captures both positionals', () => {
+    const r = parseArgs(['--checkpoints', 'diff', 'sess', 'ckpt']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.checkpoints?.positionals).toEqual(['sess', 'ckpt']);
+  });
+
+  test('positional collection stops at the next flag', () => {
+    const r = parseArgs(['--checkpoints', 'list', 'sess', '--json']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.checkpoints?.positionals).toEqual(['sess']);
+    expect(r.args.json).toBe(true);
+  });
+
+  test('positional collection stops at short flags too', () => {
+    // Bug repro: `--checkpoints restore <session> <ckpt> -y` was
+    // swallowing `-y` as a positional, leaving yes=false and breaking
+    // had-bash restores. The greedy scan only stopped at `--` prefix
+    // tokens; short flags are equally valid breakpoints.
+    const r = parseArgs(['--checkpoints', 'restore', 'sess', 'ckpt', '-y']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.checkpoints?.positionals).toEqual(['sess', 'ckpt']);
+    expect(r.args.yes).toBe(true);
+  });
+
+  test('rejects when no verb is given', () => {
+    expect(parseArgs(['--checkpoints']).ok).toBe(false);
+    expect(parseArgs(['--checkpoints', '--json']).ok).toBe(false);
+  });
+
+  test('rejects an unknown verb', () => {
+    const r = parseArgs(['--checkpoints', 'foobar']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('unknown');
+  });
+});
+
 describe('usage', () => {
   test('mentions every recognized flag', () => {
     const u = usage();
@@ -194,5 +284,8 @@ describe('usage', () => {
     expect(u).toContain('--max-steps');
     expect(u).toContain('--list-sessions');
     expect(u).toContain('--resume');
+    expect(u).toContain('--undo');
+    expect(u).toContain('--checkpoints');
+    expect(u).toContain('--yes');
   });
 });

@@ -114,4 +114,26 @@ describe('cli entrypoint: prompt requirement', () => {
     expect(exitCode).toBe(1);
     expect(stderr).toContain('missing prompt');
   });
+
+  test('--undo does NOT require a prompt', async () => {
+    // Same regression shape as --list-sessions: the entry-level
+    // empty-prompt guard was firing before --undo could dispatch
+    // inside run(). Caught by the criterion-6 smoke (real model)
+    // before this fix landed.
+    const { exitCode, stderr } = await runCliWithRun(['--undo', 'no-such-session']);
+    // Exit 1 is expected (the session id doesn't exist) but the
+    // failure must come from the handler reporting "session not
+    // found", NOT from the entry's prompt gate.
+    expect(stderr).not.toContain('missing prompt');
+    expect(stderr).toContain('not found');
+    expect(exitCode).toBe(1);
+  });
+
+  test('--checkpoints does NOT require a prompt', async () => {
+    const { stderr } = await runCliWithRun(['--checkpoints', 'list', 'no-such-session']);
+    expect(stderr).not.toContain('missing prompt');
+    // 'not found' lands when the session id is unknown — the
+    // dispatch reached the handler.
+    expect(stderr).toContain('not found');
+  });
 });

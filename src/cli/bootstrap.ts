@@ -142,6 +142,12 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     cwd,
     bgLogDir,
     userPrompt: input.prompt,
+    // Checkpoints (M3 §12): enabled for every CLI run by default
+    // so users get `--undo` for free. Plan mode opts out — there's
+    // nothing to undo when no writes can land. Disabling here also
+    // saves one git probe per run, which matters when --plan is
+    // used inside non-git directories for read-only inspections.
+    enableCheckpoints: input.plan !== true,
     ...(input.budget !== undefined ? { budget: input.budget } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.plan === true ? { planMode: true } : {}),
