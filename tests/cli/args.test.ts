@@ -174,6 +174,39 @@ describe('parseArgs', () => {
     expect(r.message).toContain('--include-subagents requires --list-sessions');
   });
 
+  test('--limit accepts positive integers and threads through args', () => {
+    // The truncation hint emitted by `runListSessions` points
+    // users at --limit explicitly, so the flag MUST exist and
+    // accept the same shape as the cap the listing applies.
+    const r = parseArgs(['--list-sessions', '--limit', '50']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.limit).toBe(50);
+  });
+
+  test('--limit rejects non-positive-integer values', () => {
+    const cases = ['0', '-1', '3.5', 'abc', ''];
+    for (const v of cases) {
+      const r = parseArgs(['--list-sessions', '--limit', v]);
+      expect(r.ok).toBe(false);
+      if (r.ok) continue;
+      // `--list-sessions --limit` (no value): the parser sees the
+      // empty string slot as missing OR consumes the next token
+      // depending on shape. Either form should produce an error.
+      expect(r.message).toMatch(/--limit (must be a positive integer|requires a value)/);
+    }
+  });
+
+  test('--limit standalone (without --list-sessions) is a parse error', () => {
+    // Same combo-rule as --include-subagents. The flag is purely
+    // a listing concern; standalone use is a configuration
+    // mistake worth surfacing at parse time.
+    const r = parseArgs(['--limit', '10']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--limit requires --list-sessions');
+  });
+
   test('--include-subagents combined with a normal prompt is a parse error', () => {
     // Even with a prompt that would otherwise initiate a run, the
     // flag is meaningless without --list-sessions. We refuse rather

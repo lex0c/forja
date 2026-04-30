@@ -45,6 +45,11 @@ export interface ParsedArgs {
   checkpoints?: { verb: string; positionals: string[] };
   model?: string;
   maxSteps?: number;
+  // Cap on rows returned by --list-sessions. Defaults to 20 in
+  // the handler when omitted. Only meaningful paired with
+  // --list-sessions; standalone use is a parse error so the
+  // truncation hint that points at this flag stays actionable.
+  limit?: number;
 }
 
 export interface ParseError {
@@ -197,6 +202,21 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         i += 2;
         break;
       }
+      case '--limit': {
+        const value = argv[i + 1];
+        if (value === undefined) {
+          return { ok: false, message: '--limit requires a value' };
+        }
+        if (!POSITIVE_INT.test(value)) {
+          return {
+            ok: false,
+            message: `--limit must be a positive integer, got '${value}'`,
+          };
+        }
+        args.limit = Number.parseInt(value, 10);
+        i += 2;
+        break;
+      }
       default:
         // Anything still starting with `--` after the explicit cases above
         // is an unknown flag. Single-dash tokens (`-foo`) fall through as
@@ -222,6 +242,16 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
       message: '--include-subagents requires --list-sessions',
     };
   }
+  // --limit governs the listing cap. The truncation hint emitted
+  // by `runListSessions` points users at this flag explicitly, so
+  // it MUST exist and be reachable. Same combo-validation as
+  // --include-subagents: standalone use is a parse error.
+  if (args.limit !== undefined && !args.listSessions) {
+    return {
+      ok: false,
+      message: '--limit requires --list-sessions',
+    };
+  }
   return { ok: true, args };
 };
 
@@ -236,6 +266,7 @@ export const usage = (): string =>
     '  --plan                 Read-only mode: produce a plan, do not apply changes',
     '  --list-sessions        Print known sessions (newest first) and exit',
     '  --include-subagents    With --list-sessions, fan parents into their subagent children (requires --list-sessions)',
+    '  --limit <n>            With --list-sessions, cap rows returned (default 20; requires --list-sessions)',
     '  --resume <id|last>     Continue a prior session; positional prompt is the follow-up',
     '  --undo <session>       Restore the latest checkpoint of a session',
     '  --checkpoints <cmd>    Checkpoint subcommands: list <session> | diff <session> <ckpt>',
