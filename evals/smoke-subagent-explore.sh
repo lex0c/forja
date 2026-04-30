@@ -178,5 +178,59 @@ if ! echo "$PARENT_TEXT" | grep -qiE 'alpha|beta|gamma'; then
 fi
 echo "Parent referenced at least one seed filename — child output flowed back." >&2
 
-echo "PASS: subagent runtime + task tool wired end-to-end against $MODEL." >&2
+# Snapshot subsystem (migration 012): every subagent child must
+# leave a row in subagent_runs fingerprinting the definition it
+# ran under. Mocks use openMemoryDb; this asserts the migration +
+# runtime INSERT actually land on disk against a real DB.
+CHILD_ID=$(sqlite3 "$DB" "
+  SELECT id FROM sessions
+  WHERE parent_session_id = '$PARENT_SESSION'
+  LIMIT 1
+")
+if [[ -z "$CHILD_ID" ]]; then
+  echo "FAIL: could not extract child session id for snapshot assertions." >&2
+  exit 1
+fi
+
+SNAPSHOT_COUNT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM subagent_runs WHERE session_id = '$CHILD_ID'")
+if [[ "$SNAPSHOT_COUNT" -ne 1 ]]; then
+  echo "FAIL: expected 1 subagent_runs row for child $CHILD_ID, got $SNAPSHOT_COUNT." >&2
+  echo "Run NDJSON tail:" >&2
+  tail -20 run.ndjson >&2
+  exit 1
+fi
+
+# Fingerprint check: the snapshot's source_sha256 must match the
+# sha256sum of the .md file we wrote. If they diverge, either the
+# loader didn't hash raw bytes or the runtime captured something
+# else.
+hash_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+SNAPSHOT_SHA=$(sqlite3 "$DB" "SELECT source_sha256 FROM subagent_runs WHERE session_id = '$CHILD_ID'")
+EXPECTED_SHA=$(hash_file ".agent/agents/explore.md")
+if [[ "$SNAPSHOT_SHA" != "$EXPECTED_SHA" ]]; then
+  echo "FAIL: snapshot source_sha256 mismatch." >&2
+  echo "  expected: $EXPECTED_SHA" >&2
+  echo "  got:      $SNAPSHOT_SHA" >&2
+  exit 1
+fi
+
+# Tools whitelist must round-trip the JSON we declared in the
+# definition. The runtime captures definition.tools verbatim so
+# the snapshot reflects exactly what the child harness saw.
+SNAPSHOT_TOOLS=$(sqlite3 "$DB" "SELECT tools_whitelist FROM subagent_runs WHERE session_id = '$CHILD_ID'")
+if [[ "$SNAPSHOT_TOOLS" != '["read_file","glob","grep"]' ]]; then
+  echo "FAIL: snapshot tools_whitelist mismatch." >&2
+  echo "  expected: [\"read_file\",\"glob\",\"grep\"]" >&2
+  echo "  got:      $SNAPSHOT_TOOLS" >&2
+  exit 1
+fi
+echo "Snapshot landed: 1 row, sha256 matches .md, tools_whitelist round-trip OK." >&2
+
+echo "PASS: subagent runtime + task tool + audit snapshot wired end-to-end against $MODEL." >&2
 exit 0
