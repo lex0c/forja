@@ -136,8 +136,16 @@ const parseBudget = (raw: unknown, sourcePath: string): SubagentBudget => {
   if (typeof maxSteps !== 'number' || !Number.isInteger(maxSteps) || maxSteps <= 0) {
     throw new Error(`subagent ${sourcePath}: 'budget.max_steps' must be a positive integer`);
   }
-  if (typeof maxCost !== 'number' || !(maxCost >= 0)) {
-    throw new Error(`subagent ${sourcePath}: 'budget.max_cost_usd' must be a non-negative number`);
+  // `>= 0` alone admits Infinity (YAML `.inf`), which silently
+  // disables the spend cap that the field is required to enforce.
+  // NaN is already rejected by the `>= 0` clause (NaN comparisons
+  // are always false), but `Number.isFinite` catches both with one
+  // honest predicate. Reject any non-finite value so every accepted
+  // definition has a real numeric ceiling.
+  if (typeof maxCost !== 'number' || !Number.isFinite(maxCost) || maxCost < 0) {
+    throw new Error(
+      `subagent ${sourcePath}: 'budget.max_cost_usd' must be a finite non-negative number`,
+    );
   }
   if (
     maxWall !== undefined &&

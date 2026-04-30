@@ -225,7 +225,24 @@ body`;
     ).toThrow(/'budget.max_steps' must be a positive integer/);
     expect(() =>
       loadSubagentFromString(VALID.replace('max_cost_usd: 0.5', 'max_cost_usd: -1'), 'user', '/p'),
-    ).toThrow(/'budget.max_cost_usd' must be a non-negative number/);
+    ).toThrow(/'budget.max_cost_usd' must be a finite non-negative number/);
+  });
+
+  test('rejects non-finite max_cost_usd (Infinity / NaN)', () => {
+    // YAML `.inf` parses to Infinity, which silently passed the
+    // earlier `>= 0` check and disabled the spend cap that this
+    // field is required to enforce. Reject any non-finite value
+    // so every accepted definition has a real numeric ceiling.
+    // Cases cover the YAML literal forms (.inf, .nan) and the
+    // JS-string fallback that the YAML parser may emit on some
+    // non-canonical inputs.
+    const cases = ['.inf', '.Inf', '.INF', '.nan', '.NaN', '.NAN'];
+    for (const literal of cases) {
+      const src = VALID.replace('max_cost_usd: 0.5', `max_cost_usd: ${literal}`);
+      expect(() => loadSubagentFromString(src, 'user', '/p')).toThrow(
+        /'budget\.max_cost_usd' must be a finite non-negative number/,
+      );
+    }
   });
 
   test('accepts CRLF line endings', () => {
