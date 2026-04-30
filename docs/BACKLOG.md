@@ -15,6 +15,39 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.2b.iii follow-up #2 — close deny-list bypass via symlink name
+
+Second review pass on 4.2b.iii surfaced another security gap that
+the two-pass walker introduced. Pass 2 originally skipped EVERY
+symlink (the rationale being that pass 1 had already enforced the
+boundary check). But the deny-list isn't only about boundary —
+it's about NAMES the child can read by path. A repo committing
+`.env -> secrets.txt` (target inside the worktree, target name
+not deny-listed) bypassed the filter completely: pass 1 accepted
+the symlink (target inside boundary), pass 2 skipped it, and the
+child reading `.env` resolved through the OS to `secrets.txt`
+and got the secret bytes.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/subagents/worktree-validation.ts` | Pass 2's symlink branch now matches the symlink's NAME against `matchSensitivePath` (file pattern) AND `isSensitiveDirectory` (`.ssh`-style dir patterns via the `_probe` heuristic). Either trip removes the symlink ENTRY without resolving the target — the resolved file (if inside the worktree) is processed independently when the walker reaches it. `rmSync(absPath, { force: true })` unlinks symlinks without following, so a `.ssh -> regular-dir/` symlink gets the link removed while the underlying directory is left for the walker's regular dir branch. Header comment updated to reflect the new pass-2 contract. |
+| `tests/subagents/worktree-validation.test.ts` | +4 tests under `symlink-name deny-list (bypass guard)`: `.env -> secrets.txt` regression, `.ssh -> regular-dir` (sensitive-dir name), `subdir/.env -> ../keep.txt` (any-depth), `link -> .env` (innocuous-name preserved with dangling target — proves the C1 case still holds under the new rules). |
+| `tests/subagents/worktree.test.ts` | +1 end-to-end integration test: commit `.env -> secrets.txt` (relative target so pass-1 boundary doesn't preempt the deny-list test), createWorktree + cleanup; asserts symlink removed, target survives, status clean (skip-worktree mask covers the tracked symlink deletion too), cleanup classifies removed. |
+
+**Decisions:**
+
+- **Match symlink name only, never resolve target.** Two reasons. (1) Resolution is pass-1 work; pass 2 must be deterministic w.r.t. file deletions and re-resolving would re-introduce order dependencies. (2) The semantic is "what can the child read at this path": the resolved file, evaluated by its own name, gets its own walker visit if it's inside the worktree. Keeping the responsibilities separate avoids double-deletion and keeps the deny-list logic uniform across files and symlinks.
+- **`force: true`, not `recursive: true` for symlink rm.** `rmSync` on a symlink unlinks the symlink entry without following it, even when the symlink targets a directory. `recursive: true` would invite the rare bug of accidentally walking THROUGH a symlink-to-dir; force=true is the minimal flag set that swallows ENOENT (defensive against double-removal that shouldn't happen but isn't worth a noisy throw).
+- **Skip-worktree masking already covers tracked symlink deletions.** The createWorktree post-processing runs `git ls-files -z -- <removedPath>` which returns the symlink path if tracked (git tracks symlink entries the same way it tracks regular files at the index level); the `update-index --skip-worktree` call then masks the deletion from `git status`. No additional plumbing needed for the symlink deletions to be cleanup-clean.
+
+**Verification:** `bun test` 1369 pass / 10 skip / 0 fail (+5 new); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** unchanged — M3 / Step 4.2b.iv (`bgLogDir` per-worktree, lifts the `requiresBgManager` gate).
+
+---
+
 ## [2026-04-30] M3 / Step 4.2b.iii follow-up — skip-worktree mask for deny-list deletions
 
 The 4.2b.iii closing entry left a critical bug uncaught by the

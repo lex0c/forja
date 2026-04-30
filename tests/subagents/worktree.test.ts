@@ -286,6 +286,44 @@ describe('createWorktree', () => {
     expect(branches.trim()).toBe('');
   });
 
+  test('deny-listed symlink is removed AND masked via skip-worktree (no leftover dirty status)', async () => {
+    // End-to-end coverage for the symlink-name bypass + the
+    // skip-worktree masking: a `.env -> secrets.txt` committed
+    // to the parent gets its symlink entry removed by the
+    // validator, and the resulting tracked-symlink deletion is
+    // masked from `git status --porcelain`. Without either
+    // piece, the worktree would either leak the secret to the
+    // child (no name check) or be permanently dirty (no
+    // skip-worktree).
+    writeFileSync(join(parentRepo, 'secrets.txt'), 'API_KEY=topsecret');
+    // Relative target — git stores the symlink string verbatim.
+    // An absolute path here would still point at the parent repo
+    // when checked out into the worktree, escaping the boundary
+    // (a different bug, caught by pass 1). Relative `secrets.txt`
+    // resolves inside whichever working tree the symlink lands in.
+    symlinkSync('secrets.txt', join(parentRepo, '.env'));
+    await runGit(parentRepo, ['add', '-A']);
+    await runGit(parentRepo, ['commit', '-m', 'add symlink bypass attempt']);
+
+    const handle = await createWorktree({
+      sessionId: 'eeeeeeee-ffff-aaaa-bbbb-cccccccccccc',
+      prompt: 'symlink bypass cycle',
+      parentCwd: parentRepo,
+      rootDir: worktreeRoot,
+    });
+    // `.env` symlink is gone; `secrets.txt` survives.
+    expect(existsSync(join(handle.path, '.env'))).toBe(false);
+    expect(existsSync(join(handle.path, 'secrets.txt'))).toBe(true);
+    // status is clean — the tracked symlink deletion was
+    // skip-worktree'd.
+    const status = await runGit(handle.path, ['status', '--porcelain']);
+    expect(status).toBe('');
+
+    const cleanup = await cleanupWorktree({ handle, parentCwd: parentRepo });
+    expect(cleanup.removed).toBe(true);
+    expect(cleanup.preserved).toBe(false);
+  });
+
   test('child writes are still visible to git after skip-worktree masking (no false negative)', async () => {
     // Defense-in-depth on the skip-worktree fix: masking the
     // validator's deletions must NOT also mask genuine child

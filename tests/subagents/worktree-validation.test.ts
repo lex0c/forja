@@ -375,6 +375,81 @@ describe('validateWorktreeContents — two-pass ordering invariants', () => {
   });
 });
 
+describe('validateWorktreeContents — symlink-name deny-list (bypass guard)', () => {
+  test('deletes a symlink whose NAME matches the deny-list (`.env -> secrets.txt`)', () => {
+    // Bypass the original walker missed: pass 1 accepts the
+    // symlink because its target stays inside the worktree;
+    // pass 2 (pre-fix) skipped every symlink unconditionally,
+    // so `.env` survived. Child reading `.env` resolves through
+    // the OS to `secrets.txt` and gets the secret bytes —
+    // deny-list defeated for any pair of (innocuous-target,
+    // sensitive-name) the repo commits.
+    writeFileSync(join(worktree, 'secrets.txt'), 'API_KEY=topsecret');
+    symlinkSync(join(worktree, 'secrets.txt'), join(worktree, '.env'));
+    const result = validateWorktreeContents({ worktreePath: worktree });
+    // `.env` symlink is gone; the resolved target survives
+    // (it's not deny-listed and the child has no obvious path
+    // to discover it without the symlink).
+    expect(existsSync(join(worktree, '.env'))).toBe(false);
+    expect(existsSync(join(worktree, 'secrets.txt'))).toBe(true);
+    expect(result.deniedRemoved).toEqual([{ path: '.env', pattern: '.env' }]);
+    // The symlink was counted as allowed in pass 1 (target was
+    // inside the worktree) — telemetry consistency check.
+    expect(result.symlinksAllowed).toBe(1);
+  });
+
+  test('deletes a symlink whose NAME matches a sensitive-directory pattern (`.ssh -> regular-dir`)', () => {
+    // Companion bypass: a symlink named `.ssh` pointing at a
+    // mundane directory. Pass 1 accepts (target inside). Pass 2
+    // recognizes `.ssh` as a sensitive-directory name via the
+    // `_probe` heuristic and removes the symlink entry.
+    mkdirSync(join(worktree, 'real-dir'));
+    writeFileSync(join(worktree, 'real-dir/file.txt'), 'data');
+    symlinkSync(join(worktree, 'real-dir'), join(worktree, '.ssh'));
+    const result = validateWorktreeContents({ worktreePath: worktree });
+    expect(existsSync(join(worktree, '.ssh'))).toBe(false);
+    // The pointed-at directory survives — its name isn't on the
+    // deny-list and its contents weren't sensitive on their own.
+    expect(existsSync(join(worktree, 'real-dir'))).toBe(true);
+    expect(existsSync(join(worktree, 'real-dir/file.txt'))).toBe(true);
+    expect(result.deniedRemoved).toEqual([{ path: '.ssh', pattern: '.ssh/**' }]);
+  });
+
+  test('deletes a deny-listed symlink at any depth (`subdir/.env -> ../keep.txt`)', () => {
+    // Defense-in-depth: the same any-depth normalization that
+    // applies to file matches also applies to symlink names.
+    // A `.env` symlink hidden under a subdirectory must trip
+    // the same pattern as a root `.env`.
+    mkdirSync(join(worktree, 'subdir'));
+    writeFileSync(join(worktree, 'keep.txt'), 'innocuous');
+    symlinkSync(join(worktree, 'keep.txt'), join(worktree, 'subdir/.env'));
+    const result = validateWorktreeContents({ worktreePath: worktree });
+    expect(existsSync(join(worktree, 'subdir/.env'))).toBe(false);
+    expect(existsSync(join(worktree, 'keep.txt'))).toBe(true);
+    expect(result.deniedRemoved).toEqual([{ path: 'subdir/.env', pattern: '.env' }]);
+  });
+
+  test('symlink with non-sensitive name is preserved even if its target is deny-listed', () => {
+    // The C1 case from the previous review, retested under
+    // the new logic: `link -> .env` (link name innocuous, target
+    // sensitive). Pass 2 sees the symlink, matchSensitivePath
+    // on `link` returns null, sensitive-dir probe on `link`
+    // returns null → symlink is left alone. `.env` itself is
+    // matched as a regular file and deleted; the symlink ends
+    // up dangling but is harmless because the child can't
+    // follow ENOENT.
+    writeFileSync(join(worktree, '.env'), 'SECRET=1');
+    symlinkSync(join(worktree, '.env'), join(worktree, 'innocent-link'));
+    const result = validateWorktreeContents({ worktreePath: worktree });
+    expect(existsSync(join(worktree, '.env'))).toBe(false);
+    // existsSync follows symlinks, so a dangling link returns
+    // false — but the symlink ENTRY is still on disk. Verify
+    // via lstat-equivalent: readdir lists it.
+    expect(readdirSync(worktree)).toContain('innocent-link');
+    expect(result.deniedRemoved).toEqual([{ path: '.env', pattern: '.env' }]);
+  });
+});
+
 describe('validateWorktreeContents — error paths', () => {
   test('non-existent worktree path throws walk_failed', () => {
     let err: WorktreeValidationError | undefined;

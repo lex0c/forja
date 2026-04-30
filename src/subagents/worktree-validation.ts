@@ -33,17 +33,22 @@
 //   - Pass 1 (`validateSymlinks`) — resolve and boundary-check
 //     every symlink while the tree is still intact. No deletions
 //     happen here.
-//   - Pass 2 (`filterDenyList`) — delete deny-listed files and
-//     sensitive directories. Symlinks are skipped entirely.
+//   - Pass 2 (`filterDenyList`) — delete deny-listed files,
+//     sensitive directories, AND symlinks whose NAME matches
+//     the deny-list (the resolved target is irrelevant: a child
+//     reading by path gets the resolved bytes, so a `.env`
+//     symlink is just as sensitive as a `.env` file regardless
+//     of where it points).
 //
-// One-pass mixing the two would be order-dependent: a repo that
-// committed both `.env` and a symlink `link -> .env` would fail
-// or pass spawn based purely on `readdirSync` iteration order
-// (if `.env` is deleted first, `realpath(link)` ENOENTs and the
-// validator throws `symlink_unresolvable`; if `link` is iterated
-// first, realpath succeeds and the spawn proceeds). The two-pass
-// order is deterministic: every symlink is validated before any
-// file is removed, so a symlink pointing at a soon-to-be-deleted
+// One-pass mixing the boundary check with deletion would be
+// order-dependent: a repo that committed both `.env` and a
+// symlink `link -> .env` would fail or pass spawn based purely
+// on `readdirSync` iteration order (if `.env` is deleted first,
+// `realpath(link)` ENOENTs and the validator throws
+// `symlink_unresolvable`; if `link` is iterated first, realpath
+// succeeds and the spawn proceeds). The two-pass order is
+// deterministic: every symlink is validated before any file is
+// removed, so a symlink pointing at a soon-to-be-deleted
 // deny-listed target is allowed during validation. After the
 // deletion the symlink dangles, but the child can't follow it
 // (ENOENT at read time) — security is preserved without
@@ -238,11 +243,21 @@ export const validateWorktreeContents = (opts: ValidateWorktreeOptions): Validat
   };
 
   // Pass 2: delete deny-listed files and sensitive directories.
-  // Symlinks were validated in pass 1 and are skipped here —
-  // their targets may be deleted by this pass (see header
-  // comment for the deterministic-spawn rationale), leaving the
-  // symlink dangling. That's fine: the child can't follow a
-  // dangling symlink, so the security property holds.
+  // Symlinks whose TARGET escapes the boundary were already
+  // rejected by pass 1; symlinks whose target stays inside are
+  // valid for boundary purposes but their NAMES still need a
+  // deny-list check here — otherwise a committed `.env -> secrets.txt`
+  // bypasses the filter (boundary OK, name never inspected, child
+  // reads `.env` and gets the secret content).
+  //
+  // For symlinks the deletion target is the symlink ENTRY, not
+  // the resolved file: the resolved file lives elsewhere in the
+  // worktree and gets evaluated by the walker on its own. We
+  // never recurse THROUGH a symlink in pass 2 — sensitive
+  // directories that are themselves symlinks get the symlink
+  // entry removed, and the underlying directory (which may or
+  // may not have a sensitive name itself) is processed when the
+  // walker reaches it as a regular dir.
   const filterDenyList = (relDir: string): void => {
     const entries = readDir(relDir);
     for (const entry of entries) {
@@ -251,7 +266,39 @@ export const validateWorktreeContents = (opts: ValidateWorktreeOptions): Validat
       const relPath = relDir === '' ? name : `${relDir}/${name}`;
       const absPath = join(relDir === '' ? worktreeReal : join(worktreeReal, relDir), name);
 
-      if (entry.isSymbolicLink()) continue;
+      if (entry.isSymbolicLink()) {
+        // Match the symlink's name against the deny-list as if
+        // it were a regular file (`.env` symlink → file pattern
+        // `.env`) AND as a potential sensitive directory (`.ssh`
+        // symlink → directory pattern `.ssh/**` via the probe).
+        // Either trip removes the symlink itself; the target is
+        // not resolved here (pass 1 already proved boundary
+        // safety, and the resolved target — if inside the
+        // worktree — is processed by the walker independently).
+        const fileMatch = matchSensitivePath(toPosix(relPath), patterns);
+        const dirMatch =
+          fileMatch === null ? isSensitiveDirectory(toPosix(relPath), patterns) : null;
+        const matched = fileMatch ?? dirMatch;
+        if (matched !== null) {
+          try {
+            // `force: true` swallows ENOENT (in case some other
+            // pass already removed it); `recursive: false` is the
+            // default and matters here — `rmSync` on a symlink
+            // unlinks the symlink entry without following it,
+            // which is exactly the semantic we want even when
+            // the symlink targets a directory.
+            rmSync(absPath, { force: true });
+          } catch (e) {
+            throw new WorktreeValidationError(
+              'walk_failed',
+              toPosix(relPath),
+              `failed to remove deny-listed symlink '${toPosix(relPath)}': ${e instanceof Error ? e.message : String(e)}`,
+            );
+          }
+          deniedRemoved.push({ path: toPosix(relPath), pattern: matched });
+        }
+        continue;
+      }
 
       if (entry.isDirectory()) {
         // Directories whose contents are wholesale sensitive
