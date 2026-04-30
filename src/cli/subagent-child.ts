@@ -12,6 +12,7 @@ import {
   migrate,
   openDb,
   setSubagentPayload,
+  updateSubagentHeartbeat,
 } from '../storage/index.ts';
 import { loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
@@ -104,6 +105,21 @@ export interface SubagentChildOptions {
   planMode?: boolean;
 }
 
+// Cadence at which the child writes `last_heartbeat` to its
+// `subagent_outputs` row. The parent's poller compares the
+// most recent value against `Date.now()` and treats a gap >
+// HEARTBEAT_STALE_THRESHOLD_MS (defined in runtime.ts) as
+// evidence the child has hung — typically inside a wedged
+// provider call or a long sync block — and escalates SIGTERM →
+// grace → SIGKILL. The cadence must be substantially smaller
+// than the threshold (so a single delayed write doesn't trip
+// detection) and substantially larger than the cost of one
+// SQLite UPDATE (~µs on indexed columns). 2000ms balances
+// detection latency (a hung child surfaces in single-digit
+// seconds) against overhead (~30 SQLite UPDATEs per minute
+// per active subagent).
+const HEARTBEAT_CADENCE_MS = 2000;
+
 // Build the envelope shape the parent's `runSubagent` expects to
 // reconstruct. Mirrors the field set of `RunSubagentResult` but
 // flattened into a JSON-friendly object — the runtime parses it
@@ -166,6 +182,13 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
   // Track whether the outputs row was inserted so the catch path
   // can publish a final error envelope without a missing-row throw.
   let outputsRowInserted = false;
+  // Background heartbeat writer. Set after the outputs row exists
+  // (insertSubagentOutput is the precondition), cleared in the
+  // outer finally so it never outlives the run. The handle stays
+  // unref'd so it doesn't pin the event loop alive past the
+  // child's exit (Bun timers are ref'd by default; same reason
+  // we unref the SIGKILL escalation in waitForChild).
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 
   // Finalize the child session as error before any pre-harness
   // exit path returns 1. Without this, the row stays in
@@ -232,6 +255,29 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // structured diagnostics instead of "no payload, timed out".
     insertSubagentOutput(db, { sessionId: opts.sessionId });
     outputsRowInserted = true;
+
+    // Start the background heartbeat. Runs orthogonally to the
+    // harness loop so a wedged provider call (event loop
+    // proceeding, but tool execution blocking inside async I/O)
+    // still produces pulses — UNLESS the wedge is in sync code
+    // that blocks the loop itself, which is the failure mode
+    // staleness detection is designed to catch. The first beat
+    // fires after HEARTBEAT_CADENCE_MS, NOT immediately, because
+    // `insertSubagentOutput` already stamped `created_at` and
+    // the parent's poller treats `last_heartbeat IS NULL` as
+    // "not yet pulsed" (not as "stale"). Errors from
+    // updateSubagentHeartbeat are swallowed: a transient SQLite
+    // hiccup must not crash the harness loop, and the parent's
+    // wall-clock ceiling is the outer safety net for "heartbeat
+    // somehow stops despite child being alive".
+    heartbeatTimer = setInterval(() => {
+      try {
+        updateSubagentHeartbeat(db, opts.sessionId);
+      } catch {
+        // ignore — see comment above
+      }
+    }, HEARTBEAT_CADENCE_MS);
+    if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
 
     // Resolve the provider. Use the model recorded on the
     // session row (the parent picked it at spawn time); this is
@@ -497,6 +543,14 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     errSink(`forja: subagent-child: ${msg}\n`);
     return 1;
   } finally {
+    // Stop the heartbeat BEFORE closing the DB. clearInterval
+    // is idempotent on undefined; the unref'd timer wouldn't
+    // pin the loop alive even if we forgot, but explicit clear
+    // releases the FD-equivalent reference promptly. Closing
+    // the DB while the interval is mid-write would queue a
+    // throw on the next tick — swallowed inside the timer body
+    // anyway, but the explicit ordering is cleaner.
+    if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
     db.close();
   }
 };

@@ -336,6 +336,12 @@ export interface RunSubagentInput {
   // values so the kill escalation path completes within the
   // test runner's per-test timeout (5s by default in `bun test`).
   graceMs?: number;
+  // Heartbeat staleness threshold, in ms. Defaults to
+  // `HEARTBEAT_STALE_THRESHOLD_MS` (10_000). When the child's
+  // last heartbeat is older than this, the parent treats it as
+  // wedged and escalates SIGTERM → grace → SIGKILL. Tests pass
+  // small values to exercise the path without waiting 10s.
+  heartbeatStaleMs?: number;
 }
 
 export interface RunSubagentResult {
@@ -353,7 +359,8 @@ export interface RunSubagentResult {
     | HarnessResult['reason']
     | 'worktree_create_failed'
     | 'subprocess_crashed'
-    | 'subprocess_spawn_failed';
+    | 'subprocess_spawn_failed'
+    | 'heartbeat_stale';
   costUsd: number;
   steps: number;
   durationMs: number;
@@ -389,6 +396,20 @@ const POLL_INITIAL_MS = 50;
 const POLL_MAX_MS = 500;
 const POLL_GROWTH = 2;
 
+// Heartbeat staleness threshold for the parent's poller. Catches
+// the failure mode where a child is responding to signals (so
+// SIGTERM would still work) but is wedged inside a tool call
+// (provider request hung, sync block, infinite loop) and stops
+// updating `subagent_outputs.last_heartbeat`. Wall-clock alone
+// would catch this in DEFAULT_WALL_CLOCK_MS (10min) — the
+// heartbeat path catches it in single-digit seconds.
+//
+// The child writes every HEARTBEAT_CADENCE_MS=2000ms (defined
+// in cli/subagent-child.ts). 3 missed beats = 6s of silence.
+// Floor at 10s to absorb transient SQLite contention / GC
+// pauses without false-positive killing of healthy children.
+const HEARTBEAT_STALE_THRESHOLD_MS = 10_000;
+
 // Wait for the subprocess to publish its terminal payload, OR
 // exit without one (child crashed), OR be killed by signal /
 // wall-clock. Returns the resolved state; the runtime's caller
@@ -397,7 +418,8 @@ type WaitOutcome =
   | { kind: 'payload'; payload: Record<string, unknown> }
   | { kind: 'crashed'; exitCode: number }
   | { kind: 'aborted' }
-  | { kind: 'wall_clock' };
+  | { kind: 'wall_clock' }
+  | { kind: 'heartbeat_stale' };
 
 interface WaitForChildArgs {
   db: DB;
@@ -406,6 +428,7 @@ interface WaitForChildArgs {
   signal: AbortSignal | undefined;
   wallClockMs: number;
   graceMs: number;
+  heartbeatStaleMs: number;
   startTs: number;
 }
 
@@ -462,10 +485,10 @@ const drainChildAfterPayload = async (
 };
 
 const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
-  const { db, sessionId, handle, signal, wallClockMs, graceMs, startTs } = args;
+  const { db, sessionId, handle, signal, wallClockMs, graceMs, heartbeatStaleMs, startTs } = args;
 
   let pollDelay = POLL_INITIAL_MS;
-  let killed: 'aborted' | 'wall_clock' | undefined;
+  let killed: 'aborted' | 'wall_clock' | 'heartbeat_stale' | undefined;
   let killedAt = 0;
   let exitedResolved = false;
   // The pending SIGKILL escalation timer (set when killed
@@ -567,6 +590,34 @@ const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
     const elapsed = Date.now() - startTs;
     if (elapsed >= wallClockMs && killed === undefined) {
       killed = 'wall_clock';
+      killedAt = Date.now();
+      handle.kill('SIGTERM');
+      scheduleKill();
+    }
+
+    // Heartbeat staleness — catches "child responds to signals
+    // but is wedged inside a tool call". The wall-clock check
+    // above also catches it eventually, but on a 10-min timeline;
+    // heartbeat staleness fires in ~10s, much closer to the
+    // operator's expectation when something is actually hung.
+    //
+    // Conditions for declaring stale:
+    //   1. Outputs row exists (out !== null) — child got far
+    //      enough into its startup to insert.
+    //   2. Heartbeat has fired at least once (lastHeartbeat !==
+    //      null) — null means "child hasn't pulsed yet, could
+    //      be slow startup but not yet wedged". The wall-clock
+    //      eventually catches the slow-startup case.
+    //   3. Gap > HEARTBEAT_STALE_THRESHOLD_MS — 10s of silence
+    //      after a successful pulse is the wedge signal.
+    //   4. Not already killed — avoids re-firing escalation.
+    if (
+      killed === undefined &&
+      out !== null &&
+      out.lastHeartbeat !== null &&
+      Date.now() - out.lastHeartbeat > heartbeatStaleMs
+    ) {
+      killed = 'heartbeat_stale';
       killedAt = Date.now();
       handle.kill('SIGTERM');
       scheduleKill();
@@ -859,6 +910,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   const childWallClockMs = definition.budget.maxWallClockMs ?? DEFAULT_WALL_CLOCK_MS;
   const graceMs = input.graceMs ?? WALL_CLOCK_GRACE_MS;
   const wallClockMs = input.wallClockMs ?? childWallClockMs + graceMs * 2;
+  const heartbeatStaleMs = input.heartbeatStaleMs ?? HEARTBEAT_STALE_THRESHOLD_MS;
   const outcome = await waitForChild({
     db: input.db,
     sessionId: childSession.id,
@@ -866,6 +918,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     signal: input.signal,
     wallClockMs,
     graceMs,
+    heartbeatStaleMs,
     startTs,
   });
 
@@ -930,6 +983,25 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
         sessionId: childSession.id,
         status: 'interrupted',
         reason: 'maxWallClockMs',
+        costUsd: 0,
+        steps: 0,
+        durationMs: Date.now() - startTs,
+      };
+      break;
+    }
+    case 'heartbeat_stale': {
+      // Child stopped pulsing — typically a wedge inside a
+      // tool call (provider request hung, sync block). Same
+      // shape as wall_clock: 'interrupted' status, lower-bound
+      // cost (we don't know what the child accumulated before
+      // the wedge). Distinct reason so operators can
+      // distinguish "hit the time budget" from "appeared hung
+      // before the budget".
+      result = {
+        output: '',
+        sessionId: childSession.id,
+        status: 'interrupted',
+        reason: 'heartbeat_stale',
         costUsd: 0,
         steps: 0,
         durationMs: Date.now() - startTs,
@@ -1006,7 +1078,8 @@ export interface SubagentEnvelope {
     | HarnessResult['reason']
     | 'worktree_create_failed'
     | 'subprocess_crashed'
-    | 'subprocess_spawn_failed';
+    | 'subprocess_spawn_failed'
+    | 'heartbeat_stale';
   cost_usd: number;
   steps: number;
   duration_ms: number;

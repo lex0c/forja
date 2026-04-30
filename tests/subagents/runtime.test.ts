@@ -14,6 +14,7 @@ import {
   insertSubagentOutput,
   listChildSessions,
   setSubagentPayload,
+  updateSubagentHeartbeat,
 } from '../../src/storage/index.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
@@ -376,6 +377,241 @@ describe('runSubagent — orchestration', () => {
     const session = getSession(db, result.sessionId);
     expect(session?.status).toBe('interrupted');
     expect(session?.usageComplete).toBe(false);
+  });
+
+  test('heartbeat stale → status=interrupted, reason=heartbeat_stale, SIGTERM/SIGKILL escalation', async () => {
+    // Regression for the heartbeat staleness path. A child
+    // that's wedged inside a tool call (provider hung, sync
+    // block) wouldn't pulse `last_heartbeat` even though the
+    // process is still responsive to signals. The wall-clock
+    // would catch it eventually (10min), but heartbeat
+    // staleness fires in ~10s — operator-relevant timing.
+    //
+    // Fixture: spawn that inserts an outputs row with a stale
+    // heartbeat (already > threshold ago) but never publishes
+    // payload and never exits. Parent's poller sees the stale
+    // value on the first iteration, escalates SIGTERM →
+    // grace → SIGKILL.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const killed: { signal: string }[] = [];
+    let resolveExit: ((v: { exitCode: number }) => void) | undefined;
+    const exited = new Promise<{ exitCode: number }>((resolve) => {
+      resolveExit = resolve;
+    });
+    const staleHeartbeatSpawn: SpawnChildProcess = (opts) => {
+      // Insert with `lastHeartbeat` set to 1s ago, then NEVER
+      // update it. The parent's threshold (heartbeatStaleMs:
+      // 100) makes 1s old immediately stale. No payload, no
+      // exit until SIGKILL.
+      insertSubagentOutput(db, {
+        sessionId: opts.sessionId,
+        lastHeartbeat: Date.now() - 1000,
+      });
+      return {
+        exited,
+        kill: (signal) => {
+          killed.push({ signal });
+          if (signal === 'SIGKILL' && resolveExit !== undefined) {
+            resolveExit({ exitCode: 137 });
+            resolveExit = undefined;
+          }
+        },
+      };
+    };
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: staleHeartbeatSpawn,
+      // Wall-clock comfortably larger than the test runtime so
+      // the wall-clock path doesn't preempt the heartbeat
+      // detection.
+      wallClockMs: 60_000,
+      graceMs: 50,
+      heartbeatStaleMs: 100,
+    });
+    expect(result.status).toBe('interrupted');
+    expect(result.reason).toBe('heartbeat_stale');
+    const signals = killed.map((k) => k.signal);
+    expect(signals).toContain('SIGTERM');
+    expect(signals).toContain('SIGKILL');
+    // Same finalization invariants as wall_clock: row landed
+    // 'interrupted', usage_complete=false (cost is unknown,
+    // synthesized as 0).
+    const session = getSession(db, result.sessionId);
+    expect(session?.status).toBe('interrupted');
+    expect(session?.usageComplete).toBe(false);
+  });
+
+  test('healthy heartbeat (refreshed periodically) keeps run alive past threshold', async () => {
+    // The actual property the heartbeat path is supposed to
+    // protect: a child that pulses faster than the staleness
+    // threshold must survive a duration LONGER than the
+    // threshold without being killed. Earlier shape of this
+    // test published payload in the same tick as insert, which
+    // made the parent's loop hit the payload-first branch
+    // before the staleness check could even run — exercising
+    // the wrong path.
+    //
+    // Fixture: spawn that installs its OWN setInterval to
+    // refresh `last_heartbeat` (mimicking the production
+    // child's writer) and only publishes payload AFTER the
+    // run has lived past the threshold. With pulse interval
+    // 30ms and threshold 200ms, the heartbeat is always <
+    // 30ms old at any poll; the run lasts 600ms total
+    // (3× threshold) and completes status='done' with no
+    // signals sent. If the parent ignored heartbeat freshness
+    // and tripped on age alone, SIGTERM would have fired at
+    // ~200ms and the result would be 'heartbeat_stale'.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const killed: { signal: string }[] = [];
+    const refreshingSpawn: SpawnChildProcess = (opts) => {
+      insertSubagentOutput(db, {
+        sessionId: opts.sessionId,
+        lastHeartbeat: Date.now(),
+      });
+      // Pulse every 100ms via setInterval (mimics the
+      // production cadence shape). Threshold is 1000ms —
+      // 10× headroom over the pulse cadence and 2× headroom
+      // over the parent's worst-case poll backoff (capped at
+      // POLL_MAX_MS=500). That ratio survives event-loop
+      // scheduling variance: even if a pulse drifts by a
+      // factor of 5, the row stays under threshold.
+      const pulseTimer = setInterval(() => {
+        try {
+          updateSubagentHeartbeat(db, opts.sessionId);
+        } catch {
+          // ignore — same defensive shape as production
+        }
+      }, 100);
+      // Publish payload after 1500ms (1.5× threshold). The run
+      // genuinely outlives the "naive age check" — without
+      // pulses the row would have been declared stale at
+      // ~1000ms and SIGTERM would fire. Pulses keep it fresh
+      // through the entire window.
+      setTimeout(() => {
+        clearInterval(pulseTimer);
+        setSubagentPayload(db, opts.sessionId, {
+          status: 'done',
+          reason: 'done',
+          output: 'survived past stale threshold with healthy pulses',
+          cost_usd: 0.001,
+          steps: 1,
+          duration_ms: 1500,
+        });
+      }, 1500);
+      return {
+        exited: new Promise<{ exitCode: number }>((resolve) => {
+          // exited resolves shortly after payload (mimics real
+          // child's exit-after-publish flow). The drain helper
+          // in the parent waits for this.
+          setTimeout(() => resolve({ exitCode: 0 }), 1550);
+        }),
+        kill: (signal) => killed.push({ signal }),
+      };
+    };
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: refreshingSpawn,
+      // Threshold smaller than total run duration (1500ms) AND
+      // much larger than pulse cadence (100ms) — proves the
+      // staleness gate IS exercised on each poll AND keeps
+      // skipping because the row stays fresh continuously.
+      heartbeatStaleMs: 1000,
+      // Wall-clock comfortably above run duration so wall_clock
+      // doesn't preempt.
+      wallClockMs: 60_000,
+      // Grace large enough that the post-payload drain has
+      // time to observe the fake's exit promise.
+      graceMs: 200,
+    });
+    expect(result.status).toBe('done');
+    // No SIGTERM, no SIGKILL — heartbeat freshness kept the
+    // staleness gate skipping every iteration.
+    expect(killed).toEqual([]);
+  }, 5_000);
+
+  test('null lastHeartbeat skips staleness gate; wall-clock catches the wedge', async () => {
+    // The null-heartbeat shape covers the startup window
+    // BEFORE the child's first interval tick: the outputs row
+    // exists but `lastHeartbeat` is still null. The parent's
+    // poller MUST treat null as "pre-pulse, not stale";
+    // otherwise every subprocess subagent dies on its first
+    // poll. Earlier shape of this test was payload-first and
+    // didn't exercise the gate at all (setSubagentPayload
+    // also bumps last_heartbeat as a side effect, so by the
+    // time the parent polls, the row is fresh — the null path
+    // never ran).
+    //
+    // Fixture: spawn that inserts the outputs row WITH a null
+    // heartbeat and never publishes payload, never refreshes.
+    // The wall-clock has to be the kill verdict because the
+    // staleness gate skipped every iteration. If the gate
+    // didn't skip nulls, the result would be 'heartbeat_stale'
+    // (much earlier, at heartbeatStaleMs).
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const killed: { signal: string }[] = [];
+    let resolveExit: ((v: { exitCode: number }) => void) | undefined;
+    const exited = new Promise<{ exitCode: number }>((resolve) => {
+      resolveExit = resolve;
+    });
+    const noPulseSpawn: SpawnChildProcess = (opts) => {
+      // Insert with lastHeartbeat=null; never write again.
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      return {
+        exited,
+        kill: (signal) => {
+          killed.push({ signal });
+          if (signal === 'SIGKILL' && resolveExit !== undefined) {
+            resolveExit({ exitCode: 137 });
+            resolveExit = undefined;
+          }
+        },
+      };
+    };
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: noPulseSpawn,
+      // heartbeatStaleMs (50) MUCH smaller than wallClockMs
+      // (300). If null tripped the gate, we'd see stale at
+      // ~50ms; instead we see wall_clock at ~300ms.
+      heartbeatStaleMs: 50,
+      wallClockMs: 300,
+      graceMs: 50,
+    });
+    // Wall-clock won the race — proves staleness gate
+    // correctly skipped every iteration on null heartbeat.
+    expect(result.reason).toBe('maxWallClockMs');
+    expect(result.status).toBe('interrupted');
+    expect(killed.map((k) => k.signal)).toContain('SIGTERM');
   });
 
   test('caller abort → status=interrupted, reason=aborted, SIGTERM/SIGKILL escalation', async () => {
