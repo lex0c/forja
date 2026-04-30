@@ -745,24 +745,46 @@ describe('runSubagent — orchestration', () => {
 });
 
 describe('resolveChildBinaryCmd', () => {
-  test('compiled binary: argv[0] is binary, argv[1] is a CLI arg', () => {
-    // Production shape: ['/usr/local/bin/agent', '--list-sessions']
+  test('compiled Bun binary: argv[0] is literal "bun", execPath is the compiled binary', () => {
+    // Real production shape per Bun's compatibility-spoofing
+    // behavior: in `bun build --compile` outputs, Bun.argv[0]
+    // is the literal string 'bun' (NOT a path), while
+    // process.execPath is the actual compiled binary on disk.
+    // Earlier code used argv[0] as the cmd[0] and would have
+    // spawned `bun --subagent-session-id ...` instead of
+    // re-invoking the compiled agent — every subprocess
+    // subagent spawn would fail in a compiled deployment.
     const cmd = resolveChildBinaryCmd({
-      argv: ['/usr/local/bin/agent', '--list-sessions'],
-      execPath: '/usr/local/bin/bun',
+      argv: ['bun', '--list-sessions'],
+      execPath: '/usr/local/bin/agent',
       appendArgs: ['--subagent-session-id', 'abc'],
     });
     expect(cmd).toEqual(['/usr/local/bin/agent', '--subagent-session-id', 'abc']);
   });
 
-  test('dev mode .ts: argv[0]=bun, argv[1]=script.ts', () => {
-    // `bun run dev` shape: ['bun', 'src/cli/index.ts', '--list-sessions']
+  test('dev mode: execPath = bun interpreter, argv[1] = .ts entry script', () => {
+    // `bun src/cli/index.ts --list-sessions` shape: argv[0] is
+    // the resolved bun path (or 'bun' when called bare),
+    // argv[1] is the entry script. We always use execPath as
+    // the interpreter; the script comes from argv[1].
     const cmd = resolveChildBinaryCmd({
-      argv: ['bun', 'src/cli/index.ts', '--list-sessions'],
-      execPath: 'bun',
+      argv: ['/usr/local/bin/bun', 'src/cli/index.ts', '--list-sessions'],
+      execPath: '/usr/local/bin/bun',
       appendArgs: ['--subagent-session-id', 'xyz'],
     });
-    expect(cmd).toEqual(['bun', 'src/cli/index.ts', '--subagent-session-id', 'xyz']);
+    expect(cmd).toEqual(['/usr/local/bin/bun', 'src/cli/index.ts', '--subagent-session-id', 'xyz']);
+  });
+
+  test('dev mode with execPath != argv[0] (resolved via PATH)', () => {
+    // Some shells leave argv[0] as the literal token the user
+    // typed ('bun') even when execPath resolves to the full
+    // path. We must still use execPath for cmd[0].
+    const cmd = resolveChildBinaryCmd({
+      argv: ['bun', 'src/cli/index.ts'],
+      execPath: '/opt/bun-1.3.13/bin/bun',
+      appendArgs: ['--flag'],
+    });
+    expect(cmd).toEqual(['/opt/bun-1.3.13/bin/bun', 'src/cli/index.ts', '--flag']);
   });
 
   test('extended dev suffixes (.mts / .cts / .mjs / .js)', () => {
@@ -770,44 +792,44 @@ describe('resolveChildBinaryCmd', () => {
     // to compiled-mode resolution.
     for (const suffix of ['.mts', '.cts', '.mjs', '.js']) {
       const cmd = resolveChildBinaryCmd({
-        argv: ['bun', `src/cli/index${suffix}`],
-        execPath: 'bun',
+        argv: ['/usr/local/bin/bun', `src/cli/index${suffix}`],
+        execPath: '/usr/local/bin/bun',
         appendArgs: ['--flag'],
       });
-      expect(cmd).toEqual(['bun', `src/cli/index${suffix}`, '--flag']);
+      expect(cmd).toEqual(['/usr/local/bin/bun', `src/cli/index${suffix}`, '--flag']);
     }
   });
 
-  test('argv[0] missing → falls back to execPath', () => {
-    const cmd = resolveChildBinaryCmd({
-      argv: [],
-      execPath: '/path/to/bun',
-      appendArgs: ['--flag'],
-    });
-    expect(cmd).toEqual(['/path/to/bun', '--flag']);
-  });
-
-  test('compiled binary path that does NOT end in .ts/.js', () => {
-    // E.g., a Linux binary with no extension, or `forja.bin`.
-    // Must resolve as compiled (no script in cmd).
-    const cases = ['/usr/local/bin/forja', '/opt/forja.bin', './dist/agent'];
-    for (const bin of cases) {
+  test('argv missing or single-element → no script appended, uses execPath', () => {
+    // Compiled invocation with no args (`./agent` alone), or
+    // a degenerate empty-argv case (Bun should never produce
+    // it, but the resolver stays well-defined regardless).
+    for (const argv of [[], ['bun']]) {
       const cmd = resolveChildBinaryCmd({
-        argv: [bin, 'some-arg'],
-        execPath: 'bun',
+        argv,
+        execPath: '/usr/local/bin/agent',
         appendArgs: ['--flag'],
       });
-      expect(cmd).toEqual([bin, '--flag']);
+      expect(cmd).toEqual(['/usr/local/bin/agent', '--flag']);
     }
   });
 
-  test('argv[1] absent (single-element argv) resolves as compiled', () => {
+  test('compiled invocation where user passed a positional ending in .ts (false-positive defense)', () => {
+    // If the user runs `./agent foo.ts` (compiled binary,
+    // 'foo.ts' as a prompt fragment), argv[1] is 'foo.ts' which
+    // matches DEV_SCRIPT_SUFFIXES. The resolver appends it to
+    // cmd, producing `<binary> foo.ts --subagent-session-id <id>`.
+    // Functionally harmless: the compiled binary's args parser
+    // sees --subagent-session-id and short-circuits to child
+    // mode before any prompt processing, ignoring 'foo.ts'.
+    // Locking this behavior here so a future tightening doesn't
+    // surprise the caller.
     const cmd = resolveChildBinaryCmd({
-      argv: ['/path/to/agent'],
-      execPath: 'bun',
-      appendArgs: ['--flag'],
+      argv: ['bun', 'foo.ts'],
+      execPath: '/usr/local/bin/agent',
+      appendArgs: ['--subagent-session-id', 'abc'],
     });
-    expect(cmd).toEqual(['/path/to/agent', '--flag']);
+    expect(cmd).toEqual(['/usr/local/bin/agent', 'foo.ts', '--subagent-session-id', 'abc']);
   });
 });
 

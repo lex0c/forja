@@ -148,18 +148,34 @@ export type SpawnChildProcess = (opts: SpawnChildProcessOptions) => ChildProcess
 // Resolve the launcher's argv into the cmd we should pass to
 // `Bun.spawn` for the subagent-child process. Pure function so
 // tests can cover every shape (compiled binary, bun-run dev
-// script, edge case empty argv) without spawning anything.
+// script, edge case missing argv) without spawning anything.
 //
-// Heuristic: if argv[1] ends in `.ts`/`.js`/`.mts`/`.cts`/`.mjs`
-// we're in interpreter mode and need [bun, script]; otherwise
-// we're compiled and only argv[0] matters. We extend the suffix
-// list beyond `.ts`/`.js` so a future rename of the entry to
-// `.mts` (ESM-explicit) doesn't silently swap to compiled-mode
-// resolution. argv[0] missing falls back to process.execPath.
+// `process.execPath` is the source of truth for the binary —
+// it always points at the actual running executable: the bun
+// interpreter in dev (`bun src/cli/index.ts ...`), the compiled
+// agent binary in production (`bun build --compile`).
 //
-// `appendArgs` is the suffix the subagent-child invocation needs
-// (`--subagent-session-id <id>`); the resolver appends them so
-// the final cmd is ready for spawn.
+// `Bun.argv[0]` is NOT a reliable interpreter source: in
+// compiled mode it's the literal string 'bun' (Bun spoofs it
+// for Node.js-compatibility) — using it as the cmd[0] would
+// spawn the bun CLI instead of re-invoking the compiled agent
+// binary, which is the original 4.2b.ii.a regression this
+// resolver was written for. Always use execPath, never argv[0].
+//
+// In dev we additionally need to pass the entry script as
+// argv[1] so the interpreter knows what to run. The detection
+// heuristic: if the launcher's argv[1] ends in a script-shaped
+// suffix (`.ts`/`.js`/`.mts`/`.cts`/`.mjs`), append it. In
+// compiled mode argv[1] is the first user arg, which doesn't
+// match these suffixes for any normal invocation (a user
+// running `./agent foo.ts` would pass 'foo.ts' as a positional
+// prompt; the child would still detect subagent mode via the
+// flag we append, and the extra positional is harmless because
+// child mode short-circuits before prompt processing).
+//
+// `appendArgs` is the suffix the subagent-child invocation
+// needs (`--subagent-session-id <id>`); the resolver appends
+// them so the final cmd is ready for spawn.
 const DEV_SCRIPT_SUFFIXES = ['.ts', '.js', '.mts', '.cts', '.mjs'];
 
 export interface ResolveChildBinaryArgs {
@@ -169,11 +185,10 @@ export interface ResolveChildBinaryArgs {
 }
 
 export const resolveChildBinaryCmd = (input: ResolveChildBinaryArgs): string[] => {
-  const interpreter = input.argv[0] ?? input.execPath;
   const script = input.argv[1];
   const isDevScript =
     script !== undefined && DEV_SCRIPT_SUFFIXES.some((suffix) => script.endsWith(suffix));
-  const cmd = isDevScript ? [interpreter, script] : [interpreter];
+  const cmd = isDevScript ? [input.execPath, script] : [input.execPath];
   cmd.push(...input.appendArgs);
   return cmd;
 };
