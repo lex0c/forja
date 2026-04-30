@@ -15,6 +15,127 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.2b.i — subagent_outputs IPC schema
+
+The 4.2a closing entry left subagents running in-process: a child
+crash takes the parent down, audit only lands post-cleanup (FK
+to sessions(id) requires the child session to exist), and there
+is no place for a subprocess to write liveness signals. Step
+4.2b moves execution to a separate Bun subprocess with SQLite as
+the unidirectional channel (spec AGENTIC_CLI §11:1030 — "mesmo
+binário, processo separado, comunicação via SQLite (write-only
+do filho, read-only do pai)"). That work is too large for a
+single PR; this slice (4.2b.i) lands ONLY the schema + repo so
+the design of the IPC table can be reviewed in isolation.
+4.2b.ii will write the runtime that uses it, .iii hardens
+symlinks per SECURITY §8.4, .iv wires per-worktree bgLogDir.
+
+**Slice scope:**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/storage/migrations/014-subagent-outputs.ts` | NEW | Single table: `session_id PK FK CASCADE`, `payload TEXT` (nullable JSON), `last_heartbeat INTEGER` (nullable), `created_at` / `updated_at`. Partial index on `last_heartbeat ASC WHERE NOT NULL` for the parent's stale-row poller. |
+| `src/storage/repos/subagent-outputs.ts` | NEW | `insertSubagentOutput`, `updateSubagentHeartbeat`, `setSubagentPayload`, `getSubagentOutput`, `listStaleSubagentOutputs`. Defensive JSON parse on payload — malformed → null, surrounding columns intact. |
+| `src/storage/index.ts` | UPDATED | Re-exports for the new repo. |
+| `src/storage/migrations/index.ts` | UPDATED | Migration 014 registered. |
+| `tests/storage/subagent-outputs.test.ts` | NEW | 15 tests — round-trip, default-null shape, PK conflict, heartbeat update, payload update, payload survives heartbeat-only update, FK CASCADE, parent-purge non-cascade, malformed JSON defense, non-object payload defense, stale list ordering + null exclusion, stale list empty case, missing-row throws (heartbeat + payload), unknown-session lookup. |
+
+**Decisions (D1-D5 locked, D6 deferred to 4.2b.ii):**
+
+- **D1 — schema as `(session_id PK FK CASCADE, payload TEXT, last_heartbeat INTEGER, created_at, updated_at)`.** PK = session_id mirrors `subagent_runs` and `subagent_worktrees` — 1:1 with sessions, the row never outlives the session. An auto-increment id would be one more join with no payoff. payload stored as TEXT under the same convention `messages.content` and `subagent_runs.tools_whitelist` use; consumers parse on read.
+- **D2 — no `status` column.** Subagent lifecycle status already lives on `sessions.status`. Duplicating it here invites the two columns to drift; forensic queries that need "still running" join `sessions` on session_id and filter `sessions.status`. `last_heartbeat IS NULL` distinguishes "row exists but child not active yet" from "child is alive and pulsing".
+- **D3 — partial index on `last_heartbeat ASC WHERE last_heartbeat IS NOT NULL`.** The parent's timeout poller wants the longest-quiet children first; the partial form skips never-heartbeated rows (pre-spawn or spawn-failed; not the timeout subsystem's concern). `created_at` doesn't get an index — no query orders by it today, and the migration runner already handles ordering by id.
+- **D4 — `ON DELETE CASCADE` on the FK to sessions(id), no cascade through parent_session_id.** Same shape locked for migrations 012 and 013: deleting the child session drops its outputs row; deleting the parent runs the existing `parent_session_id ON DELETE SET NULL` and leaves the child + its outputs intact. Operators can purge a parent without losing the child's IPC audit trail.
+- **D5 — defensive JSON parse on payload.** Storage corruption is unlikely (TEXT is opaque to SQLite, only our own code writes), but a malformed payload must NOT crash audit listings. Repo returns `payload: null` and surrounding columns intact; consumers detect via `payload === null` paired with non-null timestamps. Mirror of the same pattern in `subagent-runs.ts` for `tools_whitelist`. We also reject non-object JSON (arrays, scalars) — the typed contract is `Record<string, unknown> | null`, and surfacing a shape the consumer wasn't typed for is worse than null.
+- **D6 (deferred to 4.2b.ii)** — Child entrypoint mechanism (`--subagent-session-id <uuid>` flag is the planned shape), heartbeat frequency (planned 1000ms), SIGTERM grace period (5s per FAILURE_MODES §7.3), bgLogDir path convention (planned `<worktree>/.bg-logs/`). These don't bind anything in 4.2b.i; the schema accommodates whatever cadence and flag shape .ii lands on.
+
+**API decisions inside the repo:**
+
+- **Two write helpers (`updateSubagentHeartbeat`, `setSubagentPayload`), not one.** A heartbeat pulse must not require the child to know its terminal payload yet, and writing the terminal payload must not require an additional heartbeat hop. Both helpers bump `last_heartbeat` AND `updated_at` so the parent never sees a "payload published but child looks dead" state mid-write — consumers see them atomically.
+- **Both write helpers throw on missing row.** The 4.2b.ii flow always inserts before the first heartbeat; a missing row indicates a programmer / sequencing bug rather than a recoverable runtime state. Failing loud surfaces the bug at the call site instead of letting the pulse silently no-op.
+- **Insert defaults `payload` and `lastHeartbeat` to null.** The canonical 4.2b.ii sequence is INSERT (null payload, null heartbeat) → first heartbeat UPDATE → … → final payload UPDATE → exit. The optional fields let tests stage pre-populated rows without follow-up updates.
+
+**What this DOESN'T close (already known, out of scope for the schema slice):**
+
+- **No subprocess yet.** runSubagent still runs in-process (4.2a path); no code populates `subagent_outputs` yet. The table sits empty until 4.2b.ii.
+- **No symlink hardening.** SECURITY_GUIDELINE §8.4 deny-list and realpath validation land in 4.2b.iii.
+- **No bgLogDir per-worktree.** `requiresBgManager` tools are still refused under any isolation; 4.2b.iv lifts the gate after wiring per-worktree bg log directories.
+- **No timeout enforcer.** The repo provides `listStaleSubagentOutputs` for the future poller but the poller itself (which translates a stale row into SIGTERM → grace → SIGKILL) is 4.2b.ii.
+- **Schema doesn't store the wall-clock budget.** A future timeout enforcer needs to know each child's `maxWallClockMs` to compute the cutoff. That field already lives on `subagent_runs.budget_max_wall_ms` (migration 012); the poller joins instead of duplicating.
+
+**Review pass (post-self-review).** Self-review surfaced 1
+critical + 3 medium + 3 minor. All addressed in the same commit
+chain.
+
+- **C1 — UPDATE helpers didn't protect against retroactive ts.**
+  `updateSubagentHeartbeat` / `setSubagentPayload` did `SET col
+  = ?` blindly; an out-of-order ts (NTP step backward on the
+  child host, container reinit, VM migration between hosts with
+  skewed clocks, retried writes from test fixtures) would
+  regress `last_heartbeat` and the parent's poller would mark a
+  healthy child as stale, sending SIGTERM. Fix: both helpers now
+  `SET last_heartbeat = MAX(IFNULL(last_heartbeat, 0), ?),
+  updated_at = MAX(updated_at, ?)`. `IFNULL(...,0)` covers the
+  first heartbeat case where the column starts NULL. The
+  `setSubagentPayload` helper still overwrites `payload`
+  unconditionally — a re-publish from a retried final-write
+  must end up with the latest envelope, which is the child's
+  authoritative state. Locked by two regression tests:
+  out-of-order heartbeat doesn't regress, out-of-order
+  setSubagentPayload writes payload but keeps ts forward.
+- **M1 — `setSubagentPayload` re-publish wasn't tested.** The
+  doc treats the call as "last write before exit", but the repo
+  permits re-publish (UPDATE, not INSERT) so a retried
+  final-write lands. Locked by an explicit test that calls the
+  helper twice and asserts the second envelope wins.
+- **M2 — empty object payload `{}` boundary case.** The
+  `parsePayload` reject path treats arrays and scalars as
+  shape-violating (returns null); `{}` is a structurally valid
+  Record<string, unknown> with no keys and must round-trip
+  intact. Test asserts the cycle preserves the empty object
+  reference (not collapsed to null).
+- **M3 — `lastHeartbeat: 0` semantics documented.** Nothing
+  enforces that ts inputs are `Date.now()`-shaped; the schema
+  accepts any positive integer. Comment on
+  `InsertSubagentOutputInput.lastHeartbeat` notes that values
+  like 0 are technically accepted but semantically meaningless
+  and would surface as "ancient" rows in
+  `listStaleSubagentOutputs`. Tests that need determinism
+  should use small plausible epoch values so MAX-guarded
+  updates have room to advance.
+- **m1 — no index on `updated_at`.** Migration comment now
+  records that the column is on the row for future audit
+  queries but the index is deferred to "first real query"
+  (likely a janitor in 4.2b.ii that prunes stale outputs whose
+  owning sessions already finished). Adding a partial index in
+  a follow-up migration is cheaper than indexing speculatively.
+
+**Pending (deferred — not blocking, recorded for visibility):**
+
+- **`parsePayload` collapses parse-error and shape-error into
+  null.** A forensic audit consumer investigating "why did
+  payload disappear?" can't distinguish "JSON malformed" from
+  "JSON valid but not an object". A future helper could return
+  `{ value } | { error: 'parse' | 'shape' }`; deferred —
+  overkill for 4.2b.i, may pay for itself once 4.2b.ii produces
+  real corruption rates.
+- **`Record<string, unknown>` on payload is intentionally
+  loose.** The real shape is the subagent envelope (status,
+  reason, cost_usd, output, etc — see `SubagentEnvelope` in
+  `subagents/runtime.ts`). Importing that type into the storage
+  repo would create a cyclic dep (`storage` ← `subagents`); the
+  cleaner shape is a higher-layer envelope helper that the
+  4.2b.ii subprocess code routes through. Land that with the
+  subprocess work.
+
+**Verification (post-review):** `bun test` 1262 pass / 11 skip /
+0 fail (+19 across the schema repo); `tsc --noEmit` clean;
+`biome check` clean.
+
+**Next:** M3 / Step 4.2b.ii — subprocess spawn + heartbeat writer + parent-side timeout poller + IPC plumbing in `runSubagent`. Replaces the in-process `runAgent` call with `Bun.spawn` of the same binary in subagent-child mode (entrypoint detection via `--subagent-session-id <uuid>`); child writes via the helpers landed here, parent reads + enforces the wall-clock budget via SIGTERM/SIGKILL sequencing per FAILURE_MODES §7.3. Step 4.2b.iii (symlink hardening) and .iv (bgLogDir per-worktree) follow.
+
+---
+
 ## [2026-04-30] M3 / Step 4.2a — worktree skeleton (write-tool gate lifted)
 
 The Step 4.1 closing entry left every writing subagent unrunnable:
