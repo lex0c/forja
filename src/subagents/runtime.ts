@@ -409,6 +409,31 @@ interface WaitForChildArgs {
   startTs: number;
 }
 
+// Race `handle.exited` against a bounded timer. Returns
+// 'exited' when the child terminates first, 'timeout' when the
+// timer wins. The timer is `unref()`'d so it doesn't pin the
+// event loop alive past the caller's return — Bun's setTimeout
+// is ref'd by default (same as Node), and a non-unref'd timer
+// holds the process open for up to graceMs even when nothing
+// else needs it.
+const raceExitAgainstTimeout = (
+  handle: ChildProcessHandle,
+  ms: number,
+): Promise<'exited' | 'timeout'> => {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (v: 'exited' | 'timeout') => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(v);
+    };
+    const timer = setTimeout(() => settle('timeout'), ms);
+    if (typeof timer.unref === 'function') timer.unref();
+    handle.exited.then(() => settle('exited'));
+  });
+};
+
 // Drain a subprocess that has already published its payload.
 // The polling loop returns on payload, but the OS-level exit
 // may not have happened yet — Bun keeps the parent process
@@ -426,27 +451,14 @@ const drainChildAfterPayload = async (
   handle: ChildProcessHandle,
   graceMs: number,
 ): Promise<void> => {
-  let exited = false;
-  handle.exited.then(() => {
-    exited = true;
-  });
-
-  const sleepUntilExitOrTimeout = async (ms: number): Promise<void> => {
-    const start = Date.now();
-    while (!exited && Date.now() - start < ms) {
-      await new Promise<void>((r) => setTimeout(r, Math.min(50, ms)));
-    }
-  };
-
-  await sleepUntilExitOrTimeout(graceMs);
-  if (exited) return;
+  if ((await raceExitAgainstTimeout(handle, graceMs)) === 'exited') return;
 
   // Child published payload but is hanging on shutdown. Force
   // termination and wait one more grace window for the reap.
   // After that we give up — the kernel will eventually reclaim,
   // and runSubagent must not block its caller forever.
   handle.kill('SIGKILL');
-  await sleepUntilExitOrTimeout(graceMs);
+  await raceExitAgainstTimeout(handle, graceMs);
 };
 
 const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
@@ -456,10 +468,43 @@ const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
   let killed: 'aborted' | 'wall_clock' | undefined;
   let killedAt = 0;
   let exitedResolved = false;
-  // Track exit so we can short-circuit the polling loop.
+  // The pending SIGKILL escalation timer (set when killed
+  // transitions to defined). Tracked in this scope so:
+  //   1. The exit handler clears it as soon as the child dies
+  //      naturally — no point firing a kill that no-ops on a
+  //      dead child, and the un-cleared timer would otherwise
+  //      hold the event loop alive for graceMs after
+  //      waitForChild returns (Bun setTimeout is ref'd by
+  //      default).
+  //   2. Each return path can drop the reference; combined
+  //      with `unref()` below, this guarantees post-run hangs
+  //      can't accumulate from leftover timers.
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  // Track exit so we can short-circuit the polling loop AND
+  // clear any pending SIGKILL timer that's no longer needed.
   handle.exited.then(() => {
     exitedResolved = true;
+    if (killTimer !== undefined) {
+      clearTimeout(killTimer);
+      killTimer = undefined;
+    }
   });
+
+  // Schedule the SIGKILL escalation. The timer is `unref()`'d
+  // so it doesn't pin the event loop alive past waitForChild's
+  // return — when the child exited cleanly the body would
+  // no-op anyway (the !exitedResolved guard), but the pending
+  // callback would still hold the process open until graceMs
+  // elapsed without unref. The exit handler above ALSO clears
+  // the timer; unref is the belt-and-suspenders for the path
+  // where waitForChild returns from the 2×grace bail-out
+  // before exit ever resolves.
+  const scheduleKill = () => {
+    killTimer = setTimeout(() => {
+      if (!exitedResolved) handle.kill('SIGKILL');
+    }, graceMs);
+    if (typeof killTimer.unref === 'function') killTimer.unref();
+  };
 
   const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -515,10 +560,7 @@ const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
       killed = 'aborted';
       killedAt = Date.now();
       handle.kill('SIGTERM');
-      // Schedule SIGKILL after grace, ignore-on-already-exited.
-      setTimeout(() => {
-        if (!exitedResolved) handle.kill('SIGKILL');
-      }, graceMs);
+      scheduleKill();
     }
 
     // Wall-clock budget exceeded — same escalation shape.
@@ -527,9 +569,7 @@ const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
       killed = 'wall_clock';
       killedAt = Date.now();
       handle.kill('SIGTERM');
-      setTimeout(() => {
-        if (!exitedResolved) handle.kill('SIGKILL');
-      }, graceMs);
+      scheduleKill();
     }
 
     // After signaling, wait briefly for the child to flush its

@@ -693,6 +693,79 @@ describe('runSubagent — orchestration', () => {
     expect(elapsed).toBeLessThan(50 * 8);
   });
 
+  test('SIGKILL timer is cleared/unref when child exits before grace fires', async () => {
+    // Regression for the timer-leak bug. The earlier code
+    // scheduled `setTimeout(() => kill('SIGKILL'), graceMs)`
+    // without tracking the handle: when the child exited
+    // promptly via SIGTERM, the timer kept ticking and held
+    // the event loop alive for graceMs after waitForChild
+    // returned (Bun setTimeout is ref'd by default, like Node).
+    // In production this caused post-run hangs of multiple
+    // seconds on fast-shutdown paths.
+    //
+    // Probe: caller aborts, child exits cleanly via SIGTERM
+    // before the SIGKILL timer fires. Assert that the SIGKILL
+    // body NEVER ran (no SIGKILL recorded) — proves the timer
+    // was cleared by the exit handler. Wall-time bound also
+    // asserts the run finished well under graceMs (would have
+    // been graceMs+ if the timer leaked and held the loop).
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const killed: { signal: string }[] = [];
+    let resolveExit: ((v: { exitCode: number }) => void) | undefined;
+    const exited = new Promise<{ exitCode: number }>((resolve) => {
+      resolveExit = resolve;
+    });
+    const sigtermRespondingSpawn: SpawnChildProcess = () => ({
+      exited,
+      kill: (signal) => {
+        killed.push({ signal });
+        // Child exits cleanly on SIGTERM — DOES NOT wait for
+        // SIGKILL. The scheduled SIGKILL timer should be
+        // cleared by the exit handler.
+        if (signal === 'SIGTERM' && resolveExit !== undefined) {
+          // Resolve on next tick so the wait loop has a chance
+          // to schedule the kill timer first.
+          setTimeout(() => {
+            resolveExit?.({ exitCode: 0 });
+            resolveExit = undefined;
+          }, 5);
+        }
+      },
+    });
+    const controller = new AbortController();
+    controller.abort();
+    const start = Date.now();
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      // Large grace so the leak would be obvious if the
+      // timer wasn't cleared.
+      graceMs: 2_000,
+      spawnChildProcess: sigtermRespondingSpawn,
+      signal: controller.signal,
+    });
+    const elapsed = Date.now() - start;
+    // SIGTERM was sent; SIGKILL must NOT have been (timer
+    // cleared by exit handler before it fired).
+    expect(killed.map((k) => k.signal)).toContain('SIGTERM');
+    expect(killed.map((k) => k.signal)).not.toContain('SIGKILL');
+    // Wall time stays well below graceMs — without the
+    // unref/clear, the timer would have held the process
+    // alive for 2_000ms+. The test cap is 4×poll cap (~2s
+    // of polling at most) plus child exit; in practice this
+    // resolves in tens of ms.
+    expect(elapsed).toBeLessThan(1_500);
+  });
+
   test('child that publishes payload AND exits cleanly: no SIGKILL needed', async () => {
     // Counterpart: when the child publishes payload AND
     // resolves `exited` promptly, the drain path observes the
