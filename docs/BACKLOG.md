@@ -15,6 +15,43 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.2b.iii follow-up — skip-worktree mask for deny-list deletions
+
+The 4.2b.iii closing entry left a critical bug uncaught by the
+review: `validateWorktreeContents` deleted tracked files via
+`rmSync`, which surfaces as ` D <file>` lines in
+`git status --porcelain`. `cleanupWorktree` treats any non-empty
+status as dirty and preserves the worktree forever — every
+subagent run against any repo that commits a `.env` / `*.pem`
+/ SSH key would leak a worktree + agent branch indefinitely.
+Cache root would fill with leftovers and orphan branches on
+every run, defeating the slice's auto-cleanup contract.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/subagents/worktree.ts` | `createWorktree` now captures the `ValidationResult` from `validateWorktreeContents` and threads it into a new `markValidatorDeletionsSkipWorktree` helper. The helper enumerates tracked files under each removed path via `git ls-files -z` (single files return themselves; sensitive directories like `.ssh/` expand to every tracked descendant), then batch-marks them with `git update-index --skip-worktree -z --stdin`. Skip-worktree failures are non-fatal — the worst case is a preservation `agent worktree gc` (4.2d) reconciles. |
+| `tests/subagents/worktree.test.ts` | +2 regression tests: (a) full create + cleanup cycle on a repo committing `.env` + `cert.pem` + `.ssh/` asserts `git status --porcelain` empty in the worktree, cleanup classifies `removed=true`, no orphan branch left; (b) child writes through the worktree still trip the dirty check (skip-worktree mask is surgical, doesn't suppress genuine work). |
+
+**Decisions:**
+
+- **Why `--skip-worktree`** (and not `git rm` / status-output filter / chmod / leave-tracked-untouched):
+  - `git rm` + commit on the agent branch mutates history; a later merge of the agent branch back into main would propagate the deletion of `.env`. Wrong.
+  - Filtering `git status --porcelain` lines in `cleanupWorktree` against a known-removed list works but pushes validator semantics into cleanup; any future consumer that runs `git status` without going through cleanupWorktree (helpers, debug tooling, the `agent worktree gc` sweep) sees the dirty state and re-introduces the bug.
+  - `chmod 0000` doesn't physically remove the bytes (they sit on disk for the run's duration) and may or may not show as modified depending on `core.fileMode`.
+  - Leaving tracked deny-listed files in place defeats the deny-list's purpose (child can read them through the OS regardless of tool-level checks that are still M2 work).
+  - `--skip-worktree` is per-worktree (no history mutation), surgical (only the validator's removed paths), and dies with `git worktree remove` (no cleanup needed).
+- **Helper enumerates via `git ls-files -z` per removed path.** Handles single files (returns the path) and directory removals (`.ssh/` returns every tracked file inside) uniformly. Untracked deny-listed deletions (e.g. user's `.env.local` not committed) return empty from `ls-files` and skip the update-index call — no-op when the deletion never showed in status anyway.
+- **Batch via `--stdin -z`.** A `.gnupg/` with hundreds of keyfiles would risk argv overflow if we passed paths inline. `--stdin` + `-z` accepts NUL-separated paths from stdin and matches the format `ls-files -z` already produces, so we just join and write.
+- **skip-worktree failures non-fatal.** The validator already accepted the worktree as secure; failing the run because git refused to flip an index bit would be over-strict. The worst case (preserved-but-cleanable worktree at end of run) is exactly what the operator's `agent worktree gc` (4.2d) is for.
+
+**Verification:** `bun test` 1364 pass / 10 skip / 0 fail (+2 new); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** unchanged — M3 / Step 4.2b.iv (`bgLogDir` per-worktree, lifts the `requiresBgManager` gate).
+
+---
+
 ## [2026-04-30] M3 / Step 4.2b.iii — symlink hardening + sensitive-path deny-list
 
 The 4.2b.ii.b closing entry left two SECURITY §8.4 rails open: a

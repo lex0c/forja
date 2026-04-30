@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { validateWorktreeContents } from './worktree-validation.ts';
+import { type ValidationResult, validateWorktreeContents } from './worktree-validation.ts';
 
 // Subagent worktree lifecycle (spec §11.2). When a definition
 // declares `isolation: worktree`, the harness creates a dedicated
@@ -276,8 +276,9 @@ export const createWorktree = async (opts: CreateWorktreeOptions): Promise<Workt
   // `git worktree add` failure path above so the cache state
   // and the git refs stay consistent regardless of which step
   // tripped.
+  let validation: ValidationResult;
   try {
-    validateWorktreeContents({ worktreePath: path });
+    validation = validateWorktreeContents({ worktreePath: path });
   } catch (e) {
     await runGit(['worktree', 'remove', '--force', path], opts.parentCwd).catch(() => undefined);
     await runGit(['branch', '-D', branch], opts.parentCwd).catch(() => undefined);
@@ -290,7 +291,74 @@ export const createWorktree = async (opts: CreateWorktreeOptions): Promise<Workt
     }
     throw e;
   }
+  // Mark the validator's deletions as `--skip-worktree` in the
+  // worktree's index so subsequent `git status` runs treat the
+  // worktree as clean even though tracked files (e.g. a
+  // committed `.env`) are now physically absent. Without this
+  // step, every cleanup pass would see ` D <file>` lines from
+  // the deny-list filter, classify the worktree as dirty, and
+  // preserve it indefinitely — the cache root would fill with
+  // leftovers and orphan agent branches on every run against
+  // any repo that commits deny-listed files.
+  //
+  // Why skip-worktree (and not `git rm`, status filtering, or
+  // chmod): see the slice's BACKLOG entry. Skip-worktree is
+  // surgical (only the deleted paths are affected), local to
+  // the worktree (no history mutation that would propagate via
+  // merge), and dies with `git worktree remove` so there is
+  // nothing to clean up later.
+  //
+  // Untracked deny-listed deletions (e.g. a `.env.local` the
+  // user wrote but never committed) don't show up in
+  // `git status --porcelain` after deletion — they were never
+  // in the index, so `git ls-files` returns empty for them and
+  // we skip the `update-index` call.
+  if (validation.deniedRemoved.length > 0) {
+    await markValidatorDeletionsSkipWorktree(path, validation.deniedRemoved);
+  }
   return { path, branch };
+};
+
+// Apply `--skip-worktree` to every tracked file under each path
+// the validator removed. For single files the `git ls-files`
+// query returns the path itself; for directory removals
+// (`.ssh/`, `.gnupg/`) it expands to every tracked file inside
+// — we mark them in batches via the `--stdin` form so we don't
+// blow argv on big directories. Failures here are NOT fatal:
+// the run already passed validation and the worktree is in a
+// secure state; the worst case from a skip-worktree failure is
+// a preserved-but-cleanable worktree at end of run, which the
+// operator's `agent worktree gc` (4.2d) reconciles.
+const markValidatorDeletionsSkipWorktree = async (
+  worktreePath: string,
+  deniedRemoved: ReadonlyArray<{ path: string; pattern: string }>,
+): Promise<void> => {
+  const tracked: string[] = [];
+  for (const { path: removedPath } of deniedRemoved) {
+    const ls = await runGit(['ls-files', '-z', '--', removedPath], worktreePath);
+    if (ls.exitCode !== 0) continue;
+    for (const file of ls.stdout.split('\0')) {
+      if (file.length > 0) tracked.push(file);
+    }
+  }
+  if (tracked.length === 0) return;
+  // `--stdin` + `-z` so paths with spaces / newlines work
+  // unchanged from `ls-files -z` output.
+  const proc = Bun.spawn({
+    cmd: ['git', '-C', worktreePath, 'update-index', '--skip-worktree', '-z', '--stdin'],
+    env: {
+      LC_ALL: 'C',
+      GIT_TERMINAL_PROMPT: '0',
+      PATH: process.env.PATH ?? '',
+      HOME: process.env.HOME ?? '',
+    },
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  proc.stdin.write(tracked.join('\0'));
+  proc.stdin.end();
+  await proc.exited;
 };
 
 export interface CleanupWorktreeOptions {

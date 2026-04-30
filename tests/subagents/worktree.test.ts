@@ -238,6 +238,81 @@ describe('createWorktree', () => {
     }
   });
 
+  test('worktree appears clean to git after deny-list deletions (regression: skip-worktree)', async () => {
+    // Without the skip-worktree marking, deleting tracked
+    // files (`.env`, `cert.pem`) leaves ` D <file>` lines in
+    // `git status --porcelain`. cleanupWorktree treats any
+    // non-empty status as dirty → preserves the worktree
+    // forever. Every subagent run on a repo with a committed
+    // `.env` would leak a leftover worktree + agent branch.
+    //
+    // With the fix, the validator's deletions are masked via
+    // `git update-index --skip-worktree`, so status reports a
+    // clean tree, cleanup removes the worktree, and the audit
+    // row records `cleaned`.
+    writeFileSync(join(parentRepo, '.env'), 'API_KEY=topsecret\n');
+    writeFileSync(join(parentRepo, 'cert.pem'), '----BEGIN----\n');
+    mkdirSync(join(parentRepo, '.ssh'));
+    writeFileSync(join(parentRepo, '.ssh/id_rsa'), 'private');
+    writeFileSync(join(parentRepo, '.ssh/known_hosts'), 'host');
+    await runGit(parentRepo, ['add', '-A']);
+    await runGit(parentRepo, ['commit', '-m', 'add sensitive files']);
+
+    const handle = await createWorktree({
+      sessionId: 'cccccccc-dddd-eeee-ffff-aaaaaaaaaaaa',
+      prompt: 'clean cycle test',
+      parentCwd: parentRepo,
+      rootDir: worktreeRoot,
+    });
+
+    // git status --porcelain in the worktree must be empty —
+    // deny-listed deletions are hidden by --skip-worktree.
+    const status = await runGit(handle.path, ['status', '--porcelain']);
+    expect(status).toBe('');
+
+    // Sanity: the deletions actually happened on disk.
+    expect(existsSync(join(handle.path, '.env'))).toBe(false);
+    expect(existsSync(join(handle.path, 'cert.pem'))).toBe(false);
+    expect(existsSync(join(handle.path, '.ssh'))).toBe(false);
+
+    // Cleanup with no child changes → must classify clean.
+    const cleanup = await cleanupWorktree({ handle, parentCwd: parentRepo });
+    expect(cleanup.dirty).toBe(false);
+    expect(cleanup.removed).toBe(true);
+    expect(cleanup.preserved).toBe(false);
+    expect(existsSync(handle.path)).toBe(false);
+    // Branch deleted too — no orphan agent/* branch left.
+    const branches = await runGit(parentRepo, ['branch', '--list', handle.branch]);
+    expect(branches.trim()).toBe('');
+  });
+
+  test('child writes are still visible to git after skip-worktree masking (no false negative)', async () => {
+    // Defense-in-depth on the skip-worktree fix: masking the
+    // validator's deletions must NOT also mask genuine child
+    // writes elsewhere in the tree. A child writing
+    // `output.txt` after the validator deleted `.env` should
+    // still trip the dirty check at cleanup time so the
+    // worktree is preserved with the child's work.
+    writeFileSync(join(parentRepo, '.env'), 'SECRET');
+    await runGit(parentRepo, ['add', '.env']);
+    await runGit(parentRepo, ['commit', '-m', 'add env']);
+
+    const handle = await createWorktree({
+      sessionId: 'dddddddd-eeee-ffff-aaaa-bbbbbbbbbbbb',
+      prompt: 'child writes',
+      parentCwd: parentRepo,
+      rootDir: worktreeRoot,
+    });
+    // Simulate child writing output.
+    writeFileSync(join(handle.path, 'output.txt'), 'child wrote this\n');
+
+    const cleanup = await cleanupWorktree({ handle, parentCwd: parentRepo });
+    expect(cleanup.dirty).toBe(true);
+    expect(cleanup.preserved).toBe(true);
+    expect(cleanup.removed).toBe(false);
+    expect(readFileSync(join(handle.path, 'output.txt'), 'utf8')).toBe('child wrote this\n');
+  });
+
   test('strips deny-listed files from the worktree before returning', async () => {
     // Commit a `.env` and a `*.pem` to the parent repo. After
     // `git worktree add` they appear in the worktree's
