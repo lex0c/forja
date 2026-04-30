@@ -529,6 +529,57 @@ describe('restore', () => {
     expect(await Bun.file(join(repo, 'config.txt')).text()).toBe('user-edit\n');
   });
 
+  test('preserves ignored collision even when porcelain reports clean', async () => {
+    // The dirty gate uses `git status --porcelain`, which excludes
+    // ignored files by default. If the user has an ignored file
+    // colliding with a path in the checkpoint AND no other tracked
+    // changes, dirty=false and the preservation branch was being
+    // skipped — read-tree --reset -u then overwrote the local copy
+    // with no recovery handle.
+    //
+    // Setup: commit a seed, snapshot a state that includes an
+    // untracked file, then make that file ignored and clean the
+    // tracked side. Working tree status reads as clean even though
+    // the ignored file diverges from the checkpoint.
+    await initRepoWithCommit(repo);
+    await writeFile(join(repo, 'local.conf'), 'original\n');
+    const ckpt = await snapshot({
+      cwd: repo,
+      sessionId: 's',
+      stepId: 'm',
+      iso: 'iso',
+    });
+    expect(ckpt.sha).not.toBeNull();
+
+    // Make local.conf ignored. Commit the .gitignore so working
+    // tree is clean per porcelain.
+    await writeFile(join(repo, '.gitignore'), 'local.conf\n');
+    await runGit(repo, ['add', '.gitignore']);
+    await runGit(repo, ['commit', '-m', 'ignore local.conf']);
+    // Edit the now-ignored file to a content the user wants to keep.
+    await writeFile(join(repo, 'local.conf'), 'user-edited\n');
+
+    // Sanity: status shows nothing dirty (porcelain excludes ignored).
+    const porcelain = (await runGit(repo, ['status', '--porcelain'])).trim();
+    expect(porcelain).toBe('');
+
+    const result = await restore(repo, ckpt.sha as string);
+    // Pre-fix: result.stashed === false (we skipped preservation).
+    // Post-fix: collision detection fires regardless of dirty,
+    // forcing the agent-ref preservation path.
+    expect(result.stashed).toBe(true);
+    expect(result.stashKind).toBe('agent-ref');
+
+    // Working tree now has the checkpoint's version (the destructive
+    // overwrite — the preservation is what makes it recoverable).
+    expect(await Bun.file(join(repo, 'local.conf')).text()).toBe('original\n');
+
+    // Recovery via read-tree from the preservation ref restores the
+    // user's edited content.
+    await runGit(repo, ['read-tree', '--reset', '-u', result.stashRef as string]);
+    expect(await Bun.file(join(repo, 'local.conf')).text()).toBe('user-edited\n');
+  });
+
   test('throws on a non-existent commit before stashing', async () => {
     await initRepoWithCommit(repo);
     await writeFile(join(repo, 'dirty.txt'), 'work-in-progress\n');

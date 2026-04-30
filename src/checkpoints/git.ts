@@ -570,10 +570,20 @@ export const restore = async (cwd: string, commitSha: string): Promise<RestoreRe
   await runGit(['rev-parse', '--verify', `${commitSha}^{commit}`], { cwd });
   const headBefore = await getHeadSha(cwd);
   const dirty = await isWorkingTreeDirty(cwd);
+  // Collision detection MUST run before deciding to preserve, NOT
+  // after the dirty gate. `isWorkingTreeDirty` uses `git status
+  // --porcelain` which excludes ignored files by default — a tree
+  // that's clean by that signal can still contain an ignored file
+  // colliding with a checkpoint path. Skipping preservation in that
+  // case lets read-tree --reset -u below silently overwrite the
+  // user's ignored copy. The probe is cheap (one ls-tree + one
+  // check-ignore) and answers whether a collision exists; we then
+  // OR with `dirty` to decide whether to preserve at all.
+  const collision = await hasIgnoredCheckpointCollision(cwd, commitSha);
   let stashed = false;
   let stashRef: string | undefined;
   let stashKind: 'git-stash' | 'agent-ref' | undefined;
-  if (dirty) {
+  if (dirty || collision) {
     // Decide between two preservation paths:
     //   - regular `git stash push -u` (cheap, recovery via stash pop)
     //   - custom commit-tree under refs/agent/restore-saved/
@@ -589,11 +599,6 @@ export const restore = async (cwd: string, commitSha: string): Promise<RestoreRe
     //      treats the ignored entry as untracked → "file already
     //      exists"). The custom ref-based recovery uses read-tree
     //      which overwrites unconditionally.
-    //
-    // The collision detection runs unconditionally because it's
-    // cheap (one ls-tree + one check-ignore) and the answer routes
-    // both branches.
-    const collision = await hasIgnoredCheckpointCollision(cwd, commitSha);
     const useCustomRef = headBefore === null || collision;
     if (!useCustomRef) {
       // Regular path: HEAD born, no ignored↔ckpt collision. `-u`
