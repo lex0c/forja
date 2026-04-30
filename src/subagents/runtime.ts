@@ -10,7 +10,7 @@ import {
   insertSubagentRun,
   insertSubagentWorktree,
 } from '../storage/index.ts';
-import type { ToolRegistry } from '../tools/index.ts';
+import { type ToolRegistry, createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import type { SubagentSet } from './load.ts';
 import type { SubagentDefinition, WorktreeOutcome } from './types.ts';
 import {
@@ -45,7 +45,24 @@ const assertWhitelistValidForSubagent = (
   whitelist: readonly string[],
   subagentName: string,
   allowWrites: boolean,
+  // When true, the validator additionally checks that every
+  // whitelisted tool exists in the BUILTIN set — the source of
+  // truth the subprocess child uses to rebuild its own registry
+  // at startup. Production callers (the harness's spawn closure)
+  // hit a real subprocess, so this MUST be true: a programmatic
+  // caller registering a custom tool in `parentToolRegistry`
+  // would otherwise pass the parent-side check, snapshot the
+  // tool name into `audit.toolsWhitelist`, and watch the child
+  // refuse with `unknown_tool` at startup. False is the test
+  // path: when `spawnChildProcess` is injected, the fake child
+  // doesn't use the builtin registry, so the alignment check
+  // is irrelevant.
+  enforceBuiltin: boolean,
 ): void => {
+  // Build the builtin registry once per call. Cheap (just
+  // re-registers the static set) and stays decoupled from any
+  // shared state the parent might have.
+  const builtins = enforceBuiltin ? buildBuiltinRegistry() : null;
   const seen = new Set<string>();
   for (const toolName of whitelist) {
     if (seen.has(toolName)) {
@@ -68,7 +85,33 @@ const assertWhitelistValidForSubagent = (
         `subagent '${subagentName}': tool '${toolName}' declares metadata.requiresBgManager=true; the 4.2a subagent runtime does not wire ctx.bgManager (deferred to 4.2b). Bootstrap should have caught this via validateSubagentSet.`,
       );
     }
+    if (builtins !== null && builtins.get(toolName) === null) {
+      // The parent's registry has this tool, but the builtin
+      // set doesn't. Subagent (4.2b.ii.a) requires builtin
+      // tools because the subprocess child rebuilds its
+      // registry from `registerBuiltinTools()` — the only
+      // tool source visible across the IPC boundary today.
+      // Custom tools (programmatic callers, evals, future
+      // MCP clients) need a transmission mechanism that
+      // doesn't exist yet; refusing here surfaces the issue
+      // at the parent's spawn time instead of letting the
+      // child fail at startup with `unknown_tool`.
+      throw new Error(
+        `subagent '${subagentName}': tool '${toolName}' is registered with the parent but NOT in the builtin set — subagent subprocesses (4.2b.ii.a) can only run with builtin tools because the child rebuilds its registry from registerBuiltinTools(). Custom tools require a transmission mechanism that lands with MCP / plugin support in a later slice.`,
+      );
+    }
   }
+};
+
+// Cached builtin registry would be a tempting micro-opt but
+// `registerBuiltinTools` is idempotent and cheap; keeping the
+// build local also means tests that rebuild the registry
+// (e.g., adding a new builtin in a future slice) see the new
+// shape without coordinating cache invalidation.
+const buildBuiltinRegistry = (): ToolRegistry => {
+  const r = createToolRegistry();
+  registerBuiltinTools(r);
+  return r;
 };
 
 // Subprocess handle abstracted so tests can inject a fake without
@@ -444,12 +487,21 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   }
   const isolation = definition.isolation;
   // Defense in depth — bootstrap pre-validates, this catches
-  // programmatic callers.
+  // programmatic callers. The builtin-set alignment check fires
+  // only when we're going to spawn a real subprocess (no
+  // `spawnChildProcess` injection): the subprocess child
+  // rebuilds its registry from `registerBuiltinTools()` and any
+  // tool name that isn't in that set would surface as
+  // `unknown_tool` mid-spawn. Tests that inject a fake spawn
+  // simulate the child in-process and don't use the builtin
+  // set, so the alignment check is moot for them.
+  const willSpawnRealSubprocess = input.spawnChildProcess === undefined;
   assertWhitelistValidForSubagent(
     input.parentToolRegistry,
     definition.tools,
     definition.name,
     isolation === 'worktree',
+    willSpawnRealSubprocess,
   );
 
   // 1. Worktree creation precedes session creation. We need the
@@ -491,11 +543,31 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
 
   // 2. Create the child session row. is_subagent flag flips on
   // automatically because we set parent_session_id.
-  const childSession = createSession(input.db, {
-    model: input.provider.id,
-    cwd: childCwd,
-    parentSessionId: input.parentSessionId,
-  });
+  //
+  // Wrapped in try/catch BEFORE `cleanupOnFail` is defined
+  // because that helper closes over `childSession.id`, which
+  // doesn't exist yet. A throw here (FK violation if a concurrent
+  // process deleted the parent, schema drift, disk full) would
+  // otherwise leak the just-created worktree directory + agent
+  // branch with no cleanup path. Worktree cleanup is the only
+  // thing this catch handles — there's no session row to
+  // finalize, no audit row to mark, no message to delete; just
+  // the on-disk artifacts the prior step produced.
+  let childSession: ReturnType<typeof createSession>;
+  try {
+    childSession = createSession(input.db, {
+      model: input.provider.id,
+      cwd: childCwd,
+      parentSessionId: input.parentSessionId,
+    });
+  } catch (e) {
+    if (worktreeHandle !== undefined) {
+      await cleanupWorktree({ handle: worktreeHandle, parentCwd: input.cwd }).catch(
+        () => undefined,
+      );
+    }
+    throw e;
+  }
 
   // Single guard around every pre-spawn write that can fail AND
   // the spawn itself. Any throw between session creation and the

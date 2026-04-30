@@ -462,6 +462,64 @@ describe('runSubagent — orchestration', () => {
     ).rejects.toThrow(/declares metadata\.requiresBgManager=true/);
   });
 
+  test('refuses non-builtin tool when spawning real subprocess (parent/child registry alignment)', async () => {
+    // Regression: the parent's `parentToolRegistry` could
+    // contain custom tools (programmatic callers, evals) that
+    // pass the parent-side validation but fail at the child
+    // because the child rebuilds its registry from
+    // `registerBuiltinTools()` only. Without this check, the
+    // failure surfaced as `unknown_tool` mid-spawn — wasted
+    // spawn cycle, confused diagnostics. The validator now
+    // refuses at parent time when the call WILL spawn a real
+    // subprocess. Tests with `spawnChildProcess` injected get
+    // the relaxed check (test mode).
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    // No spawnChildProcess override → triggers strict builtin
+    // alignment. The custom `echo` tool passes the parent
+    // registry but is not in the builtin set.
+    await expect(
+      runSubagent({
+        definition: definition({ tools: ['echo'] }),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: '/p',
+        // NO spawnChildProcess → strict path
+      }),
+    ).rejects.toThrow(/NOT in the builtin set/);
+  });
+
+  test('test-mode (spawnChildProcess injected) allows custom tools', async () => {
+    // Counterpart to the above: when a test injects a fake
+    // spawn, the alignment check is skipped because the fake
+    // child doesn't use the builtin set. Every other test in
+    // this file relies on this relaxed path — assertion here
+    // locks it in so a future tightening doesn't break the
+    // suite silently.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const result = await runSubagent({
+      definition: definition({ tools: ['echo'] }),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: fakeSpawnDone(),
+    });
+    expect(result.status).toBe('done');
+  });
+
   test('refuses to spawn beyond MAX_SUBAGENT_DEPTH', async () => {
     const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
       model: 'mock/m',
@@ -919,6 +977,55 @@ describe('runSubagent — worktree isolation', () => {
     expect(result.worktree).toBeUndefined();
     expect(result.worktreeError).toBeUndefined();
     expect(getSubagentWorktree(db, result.sessionId)).toBeNull();
+    expect(readdirSync(worktreeRoot)).toEqual([]);
+  });
+
+  test('createSession throw after worktree create cleans up worktree, rethrows', async () => {
+    // Regression: previously the worktree was created BEFORE
+    // `createSession`, but `createSession` ran outside any
+    // cleanup guard. A throw there (FK violation from a
+    // concurrent parent delete, schema drift, disk full) would
+    // leak the worktree directory + agent branch on disk with
+    // no path to recovery. The fix wraps createSession in a
+    // try/catch that runs `cleanupWorktree` before rethrowing.
+    //
+    // Force the throw by dropping the `sessions` table after
+    // worktree create but before runSubagent calls
+    // createSession. We hook this via a fake spawn that's
+    // never reached — the test asserts the failure is BEFORE
+    // spawn, so the spawn fake stays inert. Actually, dropping
+    // the table is racy here because runSubagent is one
+    // function call; we drop BEFORE runSubagent and let
+    // createSession be the first SQL operation that hits the
+    // missing table. The parent createSession in setup
+    // succeeded; only the CHILD createSession (inside
+    // runSubagent) fails.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: parentRepo });
+    // Drop sessions table NOW — child createSession will throw,
+    // the worktree will already exist on disk by that point.
+    db.exec('DROP TABLE sessions');
+    let threw = false;
+    try {
+      await runSubagent({
+        definition: definition({ tools: ['echo'], isolation: 'worktree' }),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: parentRepo,
+        worktreeRootDir: worktreeRoot,
+        spawnChildProcess: fakeSpawnDone(),
+      });
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+    // Critical regression assertion: worktreeRoot must be
+    // empty. Without the cleanup guard, a created worktree dir
+    // would remain.
     expect(readdirSync(worktreeRoot)).toEqual([]);
   });
 
