@@ -158,6 +158,11 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
     // when a child run exhausted its budget vs cleanly finished —
     // the envelope IS the tool result on `done`, and a tool error
     // (with the same envelope echoed in details) on anything else.
+    // Audit failure is preserved on this branch too: when the run
+    // failed AND the snapshot insert failed, both signals matter
+    // — operators investigating the failure can't recover the
+    // forensic record either, so the missing snapshot is exactly
+    // what the user needs to see flagged.
     if (result.status !== 'done') {
       const detail = `subagent '${args.subagent}' exited with status='${result.status}', reason='${result.reason}'`;
       return toolError('subagent.run_failed', detail, {
@@ -171,6 +176,7 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
           steps: result.steps,
           duration_ms: result.durationMs,
           output: result.output,
+          ...(result.auditFailure !== undefined ? { audit_failure: result.auditFailure } : {}),
         },
       });
     }

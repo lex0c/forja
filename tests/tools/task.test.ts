@@ -62,6 +62,36 @@ describe('task tool', () => {
     expect(result.details?.available).toEqual(['explore']);
   });
 
+  test('preserves audit_failure on the run_failed branch (both signals matter)', async () => {
+    // When the child both fails AND its snapshot insert fails,
+    // operators investigating need to see both: the run outcome
+    // tells them what went wrong; the audit_failure tells them
+    // the forensic record is missing for the exact failure
+    // they're trying to investigate. Dropping audit_failure on
+    // the failure branch defeats the audit gap fix for the
+    // failure-heavy cases that benefit from it most.
+    const ctx = makeCtx({
+      spawnSubagent: async () =>
+        ranEnvelope({
+          status: 'exhausted',
+          reason: 'maxSteps',
+          output: 'partial',
+          auditFailure: { code: 'snapshot_insert_failed', message: 'storage broken' },
+        }),
+    });
+    const result = await taskTool.execute({ subagent: 'explore', prompt: 'go' }, ctx);
+    expect(isToolError(result)).toBe(true);
+    if (!isToolError(result)) return;
+    expect(result.error_code).toBe('subagent.run_failed');
+    expect(result.details?.status).toBe('exhausted');
+    // The audit signal is preserved alongside the run-failure
+    // envelope so investigators see both dimensions.
+    expect(result.details?.audit_failure).toEqual({
+      code: 'snapshot_insert_failed',
+      message: 'storage broken',
+    });
+  });
+
   test('echoes audit_failure in the envelope when the child reports one', async () => {
     // M1 fix: when the runtime fails to persist the audit
     // snapshot, the run still completes successfully but the
