@@ -15,6 +15,38 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.2b.iii follow-up #3 — detect child re-writes hidden by skip-worktree
+
+The skip-worktree mask from follow-up #1 introduced an inverse
+hazard: it makes `git status` ignore EVERY change to the masked
+paths, not just the validator's deletion. A child that re-creates
+or modifies a masked file (writes a new `.env`, plants a new
+`.ssh/key_*`) would be invisible to `git status --porcelain`,
+classified as a clean worktree, and silently removed at cleanup
+along with the child's writes — losing run output and masking
+post-validation mutations on exactly the paths the deny-list
+flagged as sensitive.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/subagents/worktree.ts` | `WorktreeHandle` gains a `maskedPaths: string[]` field populated from `validation.deniedRemoved.map(d => d.path)`. `cleanupWorktree` runs an `lstatSync` sweep over each masked path BEFORE the `git status --porcelain` check; any path that exists in any form (regular file, symlink, directory, dangling symlink) classifies the worktree as dirty and triggers preserve. The lstat (not `existsSync`) is deliberate: `existsSync` follows symlinks and returns false for dangling targets, but a dangling-symlink ENTRY at a masked path is still a child mutation worth surfacing to the operator. |
+| `tests/subagents/worktree.test.ts` | +3 regression tests: child re-creates `.env` with new content (skip-worktree silences `git status` → only the lstat sweep catches it), child plants a dangling symlink at `.env` (lstat picks it up where existsSync wouldn't), child rebuilds `.ssh/` with new contents (directory case). All three assert dirty + preserved + content survives on disk for operator inspection. |
+
+**Decisions:**
+
+- **lstat, not existsSync.** Symlink-as-dangling-link is a child mutation that must be visible to the operator; existsSync would silently drop it. The cost (one extra branch in fs lookup) is irrelevant compared to correctness.
+- **Track top-level `deniedRemoved.path`, not the expanded tracked file list.** When the validator removes `.ssh/` it expands via `git ls-files -z` to mark every tracked file under `.ssh/` as skip-worktree, but the lstat sweep only needs to know "did this top-level entry come back" — a single lstat on `.ssh` detects any re-creation under it (file, dir, symlink). Storing the expanded list would bloat the handle for no gain.
+- **Sweep runs FIRST, before status.** The lstat check is cheap (handful of syscalls) and unambiguous (path exists or doesn't). Doing it ahead of `git status` means the dirty path is detected even if some other status query bug or git misbehavior also masked the change.
+- **No "unmask + re-status" path.** We could in principle `git update-index --no-skip-worktree` the paths and re-query status; the lstat sweep is simpler, doesn't mutate the index in cleanup, and gives the same answer. The current design treats the index as immutable in cleanupWorktree.
+
+**Verification:** `bun test` 1372 pass / 10 skip / 0 fail (+3 new); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** unchanged — M3 / Step 4.2b.iv (`bgLogDir` per-worktree, lifts the `requiresBgManager` gate).
+
+---
+
 ## [2026-04-30] M3 / Step 4.2b.iii follow-up #2 — close deny-list bypass via symlink name
 
 Second review pass on 4.2b.iii surfaced another security gap that

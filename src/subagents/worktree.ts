@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { type ValidationResult, validateWorktreeContents } from './worktree-validation.ts';
@@ -141,6 +141,17 @@ export interface CreateWorktreeOptions {
 export interface WorktreeHandle {
   path: string;
   branch: string;
+  // Paths the validator removed from this worktree at create
+  // time and masked from `git status` via `--skip-worktree`.
+  // cleanupWorktree stats each before running status — without
+  // that re-check, a child that re-creates or modifies a
+  // masked path (e.g. writes a new `.env`) would be hidden by
+  // the skip-worktree flag, classified as a clean worktree,
+  // and silently removed along with the child's writes.
+  // Empty array when the validator removed nothing — most
+  // worktrees end up with a zero-length list and the lstat
+  // sweep is a no-op.
+  maskedPaths: string[];
 }
 
 // Create a fresh git worktree for a subagent run. Throws on:
@@ -316,7 +327,19 @@ export const createWorktree = async (opts: CreateWorktreeOptions): Promise<Workt
   if (validation.deniedRemoved.length > 0) {
     await markValidatorDeletionsSkipWorktree(path, validation.deniedRemoved);
   }
-  return { path, branch };
+  return {
+    path,
+    branch,
+    // Surface the validator's removals so cleanupWorktree can
+    // detect child re-writes that skip-worktree would otherwise
+    // hide. We thread the canonical relative paths from the
+    // validator (a single entry per top-level removal — `.ssh`
+    // for the directory case, not its expanded tracked
+    // children) because the cleanup-side check only needs to
+    // know "did this entry come back" and lstat'ing a single
+    // dir is enough to detect any re-creation under it.
+    maskedPaths: validation.deniedRemoved.map((d) => d.path),
+  };
 };
 
 // Apply `--skip-worktree` to every tracked file under each path
@@ -396,6 +419,29 @@ export interface CleanupResult {
 // `agent worktree gc` later (4.2d).
 export const cleanupWorktree = async (opts: CleanupWorktreeOptions): Promise<CleanupResult> => {
   const { handle, parentCwd } = opts;
+  // First check: did the child re-create or modify any path
+  // the validator removed at create time? Those paths are
+  // skip-worktree'd in the index, so `git status --porcelain`
+  // would NOT report a re-write — the worktree would look
+  // clean and the cleanup pass would silently drop the
+  // child's work along with the worktree.
+  //
+  // We `lstatSync` (not `existsSync`) so a child re-creating
+  // the path as a dangling symlink is also caught: existsSync
+  // dereferences and returns false for broken symlinks, but
+  // a broken symlink ENTRY is still a mutation the child
+  // performed that the operator should inspect.
+  for (const masked of handle.maskedPaths) {
+    const absPath = join(handle.path, masked);
+    try {
+      lstatSync(absPath);
+      // Path exists in some form — child mutated it.
+      return { dirty: true, preserved: true, removed: false };
+    } catch {
+      // ENOENT: still gone. Continue checking the rest.
+    }
+  }
+
   // `git status --porcelain` against the worktree itself. Empty
   // stdout means a clean tree (no tracked diff, no untracked
   // files). Any line of output means dirty.
