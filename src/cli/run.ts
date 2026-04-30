@@ -132,6 +132,7 @@ export const run = async (options: RunOptions): Promise<number> => {
           ? { dbPath: options.bootstrapOverride.dbPath }
           : {}),
         out: (s) => process.stdout.write(s),
+        err: errSink,
       });
     }
 

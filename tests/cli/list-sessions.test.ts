@@ -282,6 +282,125 @@ describe('runListSessions', () => {
     expect(parsed.depth).toBe(0);
   });
 
+  test('--include-subagents truncates whole subtrees to fit limit', () => {
+    // Cap-on-top-level was the bug: with --include-subagents, the
+    // limit only governed parents and the fan-out could multiply
+    // row count without bound. The fix: cap is on the FINAL row
+    // count, and we only include a parent's subtree if it fits
+    // entirely (mid-tree cuts hide children behind a visible
+    // parent and confuse the user).
+    //
+    // Setup: 3 top-level parents, each with 2 children. Limit=3.
+    // Parent #1's subtree (1 + 2 = 3 rows) fits exactly. Parent
+    // #2 would overflow (3 + 3 = 6 > 3) so the listing stops at
+    // parent #1's subtree. Parents #2 and #3 are reported as
+    // omitted on stderr.
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const parent = createSession(db, {
+        model: 'mock/a',
+        cwd: '/p',
+        startedAt: 1000 - i, // newest first
+      });
+      ids.push(parent.id);
+      for (let j = 0; j < 2; j++) {
+        createSession(db, {
+          model: 'mock/a',
+          cwd: '/p',
+          parentSessionId: parent.id,
+          startedAt: 1000 - i + j + 1,
+        });
+      }
+    }
+    const out: string[] = [];
+    const err: string[] = [];
+    runListSessions({
+      json: true,
+      limit: 3,
+      includeSubagents: true,
+      dbOverride: db,
+      out: (s) => out.push(s),
+      err: (s) => err.push(s),
+    });
+    const lines = out
+      .join('')
+      .trim()
+      .split('\n')
+      .filter((l) => l.length > 0);
+    expect(lines).toHaveLength(3); // parent #1 + its 2 children
+    const parsed = lines.map((l) => JSON.parse(l) as { id: string; depth: number });
+    expect(parsed[0]?.id).toBe(ids[0]); // newest parent first
+    expect(parsed[0]?.depth).toBe(0);
+    expect(parsed[1]?.depth).toBe(1);
+    expect(parsed[2]?.depth).toBe(1);
+
+    // Truncation hint surfaces on stderr — non-JSON mode uses it
+    // for the human listing too. Here we asked for --json, so the
+    // err sink stays the only channel.
+    const errOut = err.join('');
+    expect(errOut).toContain('truncated to fit limit=3');
+    expect(errOut).toContain('2 more top-level sessions omitted');
+  });
+
+  test('--include-subagents stops cleanly when the FIRST subtree overflows', () => {
+    // Edge case: a single top-level parent has more descendants
+    // than the limit. With subtree-atomic semantics we MUST emit
+    // zero rows rather than a partial tree (the parent without
+    // its children would lie about the structure).
+    const parent = createSession(db, { model: 'mock/a', cwd: '/p', startedAt: 1000 });
+    for (let i = 0; i < 5; i++) {
+      createSession(db, {
+        model: 'mock/a',
+        cwd: '/p',
+        parentSessionId: parent.id,
+        startedAt: 1001 + i,
+      });
+    }
+    const out: string[] = [];
+    const err: string[] = [];
+    runListSessions({
+      json: true,
+      limit: 3,
+      includeSubagents: true,
+      dbOverride: db,
+      out: (s) => out.push(s),
+      err: (s) => err.push(s),
+    });
+    expect(out.join('').trim()).toBe('');
+    expect(err.join('')).toContain('1 more top-level session omitted');
+  });
+
+  test('--include-subagents truncation: no err sink → silent (no throw)', () => {
+    // The err sink is optional. When absent, truncation is silent
+    // — the listing itself is already correct within the cap.
+    // We assert no throw and that the listing renders sensibly
+    // (the empty-output case shows the "no sessions found"
+    // sentinel because every parent's subtree overflowed).
+    const parent = createSession(db, { model: 'mock/a', cwd: '/p' });
+    for (let i = 0; i < 5; i++) {
+      createSession(db, {
+        model: 'mock/a',
+        cwd: '/p',
+        parentSessionId: parent.id,
+        startedAt: 1000 + i,
+      });
+    }
+    const out: string[] = [];
+    expect(() =>
+      runListSessions({
+        json: false,
+        limit: 3,
+        includeSubagents: true,
+        dbOverride: db,
+        out: (s) => out.push(s),
+        // No err sink wired.
+      }),
+    ).not.toThrow();
+    // Single parent with overflow → 0 data rows → table renderer
+    // emits "no sessions found." sentinel.
+    expect(out.join('')).toContain('no sessions found');
+  });
+
   test('table mode marks subagent rows with the ↳ indent', () => {
     const parent = createSession(db, { model: 'mock/a', cwd: '/p' });
     appendMessage(db, { sessionId: parent.id, role: 'user', content: 'p' });

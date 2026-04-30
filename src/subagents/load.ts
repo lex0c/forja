@@ -85,14 +85,31 @@ const requireString = (fm: Record<string, unknown>, key: string, sourcePath: str
   return v;
 };
 
-const requireStringArray = (
+// Validate a tools[] frontmatter field. Rejects any non-string
+// entries AND any empty / whitespace-only strings. The empty-string
+// case used to slip through (`tools: [""]` passed the type check)
+// and only surfaced at registry build time as a generic exception
+// on first invocation; pulling it forward to load time gives the
+// author a clean source-aware error instead of a runtime puzzle.
+const requireToolNameArray = (
   fm: Record<string, unknown>,
   key: string,
   sourcePath: string,
 ): string[] => {
   const v = fm[key];
-  if (!Array.isArray(v) || !v.every((e) => typeof e === 'string')) {
+  if (!Array.isArray(v)) {
     throw new Error(`subagent ${sourcePath}: '${key}' must be an array of strings`);
+  }
+  for (let i = 0; i < v.length; i++) {
+    const entry = v[i];
+    if (typeof entry !== 'string') {
+      throw new Error(
+        `subagent ${sourcePath}: '${key}[${i}]' must be a string (got ${typeof entry})`,
+      );
+    }
+    if (entry.trim().length === 0) {
+      throw new Error(`subagent ${sourcePath}: '${key}[${i}]' must be a non-empty tool name`);
+    }
   }
   return v as string[];
 };
@@ -141,7 +158,7 @@ const parseDefinition = (
     throw new Error(`subagent ${sourcePath}: 'name' must be kebab-case (got '${name}')`);
   }
   const description = requireString(fm, 'description', sourcePath);
-  const tools = requireStringArray(fm, 'tools', sourcePath);
+  const tools = requireToolNameArray(fm, 'tools', sourcePath);
   for (const t of tools) {
     if (TOOLS_BLOCKED_UNTIL_WORKTREE.has(t)) {
       throw new Error(

@@ -152,6 +152,35 @@ body`;
     }
   });
 
+  test('rejects empty / whitespace-only entries in tools[]', () => {
+    // Regression: the prior validator only checked `typeof e ===
+    // 'string'`, so `tools: [""]` slipped through bootstrap and
+    // only failed later at registry build time as a generic
+    // exception on first invocation. Pull-forward at load time
+    // gives the author a clean source-aware error.
+    const cases: Array<[string, RegExp]> = [
+      [
+        VALID.replace('tools: [read_file, grep, glob]', 'tools: [""]'),
+        /'tools\[0\]' must be a non-empty tool name/,
+      ],
+      [
+        VALID.replace('tools: [read_file, grep, glob]', 'tools: [read_file, "", grep]'),
+        /'tools\[1\]' must be a non-empty tool name/,
+      ],
+      [
+        VALID.replace('tools: [read_file, grep, glob]', 'tools: ["   "]'),
+        /'tools\[0\]' must be a non-empty tool name/,
+      ],
+      [
+        VALID.replace('tools: [read_file, grep, glob]', 'tools: [read_file, 42]'),
+        /'tools\[1\]' must be a string \(got number\)/,
+      ],
+    ];
+    for (const [src, re] of cases) {
+      expect(() => loadSubagentFromString(src, 'user', '/p')).toThrow(re);
+    }
+  });
+
   test('rejects budget with bad numbers', () => {
     expect(() =>
       loadSubagentFromString(VALID.replace('max_steps: 20', 'max_steps: 0'), 'user', '/p'),

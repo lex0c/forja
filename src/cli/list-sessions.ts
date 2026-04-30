@@ -21,9 +21,20 @@ export interface ListSessionsOptions {
   dbPath?: string;
   dbOverride?: DB;
   out: (s: string) => void;
+  // Optional stderr sink. Used only to emit a one-line truncation
+  // hint when --include-subagents would have produced more rows
+  // than `limit` allows. Defaults to a no-op; the production CLI
+  // wires process.stderr. Surfaces in BOTH human and --json modes
+  // because it's a diagnostic on stderr — NDJSON consumers parse
+  // stdout, and Unix convention keeps stderr available for
+  // advisory messages without breaking the data stream.
+  err?: (s: string) => void;
   // Cap on rows returned. Defaults to 20 (same default the repo
   // uses) — enough to find a session by date, not enough to flood
-  // a terminal.
+  // a terminal. The cap applies to the FINAL output count, not just
+  // the top-level pool: with --include-subagents, fanning a parent
+  // into its subtree can multiply row count, and the listing
+  // truncates whole subtrees (not mid-tree) until the cap fits.
   limit?: number;
   // When true, fan each top-level session out into its subagent
   // children (sessions.parent_session_id-keyed). Default false: the
@@ -110,24 +121,28 @@ const buildItem = (s: Session, db: DB, depth: number): SessionListItem => {
   };
 };
 
-// Walk parent → descendants depth-first. Recursion is bounded by
-// MAX_SUBAGENT_DEPTH (4 levels) at spawn time, so the visit can't
-// run away. The `seen` guard is defense-in-depth against an
-// unexpectedly self-referential row (parent_session_id pointing at
-// itself, which the FK doesn't prevent at write time) — without
-// it a corrupt graph would deadlock the listing in an infinite
-// loop. Order: each parent immediately followed by its full subtree
-// in DFS, oldest sibling first (mirrors listChildSessions).
-const fanOut = (parents: Session[], db: DB): { session: Session; depth: number }[] => {
+// Walk a single root → descendants depth-first. Recursion is
+// bounded by MAX_SUBAGENT_DEPTH (4 levels) at spawn time. The
+// `seen` set is shared across multiple subtree calls within a
+// single listing (passed in by the caller) so a sibling parent
+// that somehow pointed at the same descendant doesn't re-emit it.
+// Defense in depth — a corrupt self-referential row would
+// otherwise deadlock the listing in an infinite loop. Order:
+// each parent immediately followed by its full subtree in DFS,
+// oldest sibling first (mirrors listChildSessions).
+const fanSubtree = (
+  root: Session,
+  db: DB,
+  seen: Set<string>,
+): { session: Session; depth: number }[] => {
   const out: { session: Session; depth: number }[] = [];
-  const seen = new Set<string>();
   const visit = (s: Session, depth: number): void => {
     if (seen.has(s.id)) return;
     seen.add(s.id);
     out.push({ session: s, depth });
     for (const child of listChildSessions(db, s.id)) visit(child, depth + 1);
   };
-  for (const p of parents) visit(p, 0);
+  visit(root, 0);
   return out;
 };
 
@@ -166,21 +181,57 @@ export const runListSessions = (options: ListSessionsOptions): number => {
   const dbPath = options.dbPath ?? defaultDbPath();
   const db = options.dbOverride ?? openDb(dbPath);
   const ownsDb = options.dbOverride === undefined;
+  const limit = options.limit ?? 20;
   try {
     if (ownsDb) migrate(db);
-    const sessions = listSessions(db, { limit: options.limit ?? 20 });
     // listSessions filters out children by default. When the user
     // asks for them, fan each parent into its full descendant tree
     // (DFS, depth-tracked). We do NOT pass {includeSubagents: true}
     // to the repo here because that would mix orphaned children
-    // (parent purged, SET NULL fired) into the top-level pool —
-    // the repo flag is for raw audit listings; --include-subagents
-    // is the hierarchical view.
-    const items: SessionListItem[] = options.includeSubagents
-      ? fanOut(sessions, db).map(({ session, depth }) => buildItem(session, db, depth))
-      : sessions.map((s) => buildItem(s, db, 0));
+    // (purged parent → SET NULL → is_subagent=1 stays, but the
+    // identity flag plus this filter excludes them) into the
+    // top-level pool — the repo flag is for raw audit listings;
+    // --include-subagents is the hierarchical view.
+    const parents = listSessions(db, { limit });
+
+    let items: SessionListItem[];
+    let truncatedTopLevels = 0;
+    if (options.includeSubagents !== true) {
+      items = parents.map((s) => buildItem(s, db, 0));
+    } else {
+      // Subtree-atomic truncation: include each parent's full
+      // tree or none at all. Mid-tree cuts would hide a parent's
+      // children behind the parent itself, which is more confusing
+      // than dropping the whole subtree. The cap is on the FINAL
+      // row count, not just the top-level pool — a parent with
+      // many children can fill the cap on its own.
+      items = [];
+      const seen = new Set<string>();
+      for (const parent of parents) {
+        const subtree = fanSubtree(parent, db, seen);
+        if (items.length + subtree.length > limit) {
+          truncatedTopLevels = parents.length - parents.indexOf(parent);
+          break;
+        }
+        for (const { session, depth } of subtree) {
+          items.push(buildItem(session, db, depth));
+        }
+      }
+    }
+
     if (options.json) writeJson(items, options.out);
     else writeTable(items, options.out);
+
+    // Truncation hint goes to stderr regardless of --json: NDJSON
+    // consumers parse stdout and stderr stays available for
+    // advisory messages. The hint is purely informational; the
+    // listing itself is already correct within the cap.
+    if (truncatedTopLevels > 0 && options.err !== undefined) {
+      const word = truncatedTopLevels === 1 ? 'session' : 'sessions';
+      options.err(
+        `forja: --include-subagents truncated to fit limit=${limit}; ${truncatedTopLevels} more top-level ${word} omitted (re-run with --limit N to see them)\n`,
+      );
+    }
     return 0;
   } finally {
     if (ownsDb) db.close();
