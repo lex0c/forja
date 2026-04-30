@@ -1,6 +1,7 @@
 import type { Decision, PermissionEngine } from '../permissions/index.ts';
 import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
 import type { DB } from '../storage/index.ts';
+import type { SubagentSet } from '../subagents/load.ts';
 import type { ToolRegistry } from '../tools/index.ts';
 
 // Lifecycle events the harness emits during a run. Synchronous (fire and
@@ -111,6 +112,17 @@ export interface RunBudget {
   // module walks back one position. preserveTail=0 still preserves
   // the trailing assistant + its tool_result for the same reason.
   compactionPreserveTail: number;
+  // Hard cap on total spend for this run, in USD. Optional —
+  // absent = no cap, preserves the existing "let other budgets
+  // contain the run" behavior. When set, the harness aborts with
+  // `maxCostUsd` after the FIRST cost-increasing event whose
+  // running total crosses the cap (provider turn or compaction
+  // call). Compared per-event with `>` so a `maxCostUsd: 0` config
+  // means "no spend allowed" — the first paid turn trips the gate.
+  // Honored across resumes via the cumulative tracker (priorCostUsd
+  // + totalCostUsd is what the cap compares against, NOT just the
+  // per-run total).
+  maxCostUsd?: number;
 }
 
 export const DEFAULT_BUDGET: RunBudget = {
@@ -130,6 +142,7 @@ export type ExitReason =
   | 'maxSteps'
   | 'maxWallClockMs'
   | 'maxOutputTokens' // provider truncated the response at max_tokens
+  | 'maxCostUsd' // running cumulative cost crossed budget.maxCostUsd
   | 'maxToolErrors'
   | 'degenerateLoop'
   | 'aborted' // user cancelled via signal
@@ -211,6 +224,40 @@ export interface HarnessConfig {
   // in tests that need to exercise the cleanup path; leave unset in
   // production to use the spec default.
   checkpointsRetentionDays?: number;
+  // Subagent linkage (spec §11). When set, createSession writes
+  // this id into sessions.parent_session_id so the audit trail can
+  // walk parent → child without the runtime tracking it separately.
+  // Mutually exclusive with `resumeFromSessionId` — a resumed run
+  // already has its parent id persisted, and resume reuses the
+  // existing row instead of creating a new one. The runtime
+  // (`subagents/runtime.ts`) is the only intended caller; nothing
+  // stops a test from setting it directly.
+  parentSessionId?: string;
+  // Subagent registry made available to the `task` tool. When set,
+  // the harness wires `ToolContext.spawnSubagent` to a closure that
+  // resolves names against this set and dispatches `runSubagent`
+  // with the parent's deps (provider, db, registry, engine). Absent
+  // = `task` tool surfaces a clean error if invoked.
+  subagentRegistry?: SubagentSet;
+  // Root tool registry for SUBAGENT WHITELIST VALIDATION through
+  // a nested task() chain. The harness's `toolRegistry` is what
+  // the CURRENT run can execute (narrowed to the subagent's
+  // whitelist for child runs); but a child that wants to spawn a
+  // grandchild must validate the grandchild's whitelist against
+  // the ROOT registry, NOT against its own narrowed view —
+  // otherwise a coordinator subagent with `tools: [task]` couldn't
+  // spawn a worker with `tools: [read_file]` because read_file
+  // isn't in the coordinator's narrowed registry. Set by the
+  // top-level bootstrap (or implicitly defaults to `toolRegistry`
+  // when unset, which is the top-level case).
+  rootToolRegistry?: ToolRegistry;
+  // Recursion depth of THIS run inside a subagent chain. 0 (or
+  // unset) = the top-level user session. The harness's spawn closure
+  // increments this when calling `runSubagent` so the child knows
+  // its own depth and can refuse a further spawn at MAX_SUBAGENT_DEPTH.
+  // Set by the runtime, NOT by callers — programmatic users build
+  // top-level configs and let the runtime manage chain state.
+  subagentDepth?: number;
 }
 
 export interface HarnessResult {

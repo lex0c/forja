@@ -1,5 +1,7 @@
 export type {
   DisplayHint,
+  SpawnSubagentArgs,
+  SpawnSubagentResult,
   Tool,
   ToolContext,
   ToolError,
@@ -19,6 +21,7 @@ export {
   grepTool,
   readFileTool,
   registerBuiltinTools,
+  taskTool,
   todoWriteTool,
   writeFileTool,
 } from './builtin/index.ts';
@@ -34,6 +37,8 @@ export type {
   GrepOutput,
   ReadFileInput,
   ReadFileOutput,
+  TaskInput,
+  TaskOutput,
   TodoWriteInput,
   TodoWriteItem,
   TodoWriteOutput,

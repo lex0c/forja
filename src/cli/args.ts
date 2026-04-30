@@ -15,6 +15,10 @@ export interface ParsedArgs {
   // List-sessions mode (AGENTIC_CLI §2.1): print known sessions
   // (newest first) and exit. Honors --json for headless consumers.
   listSessions: boolean;
+  // When --list-sessions is set, fan each parent into its subagent
+  // children one level deep. Default false: most users want the
+  // top-level view; subagent rows are forensic detail.
+  includeSubagents: boolean;
   // Resume mode (AGENTIC_CLI §2.1): continue a prior session by id.
   // Special value 'last' selects the most recently started session.
   // The positional prompt is the follow-up message — without it,
@@ -41,6 +45,11 @@ export interface ParsedArgs {
   checkpoints?: { verb: string; positionals: string[] };
   model?: string;
   maxSteps?: number;
+  // Cap on rows returned by --list-sessions. Defaults to 20 in
+  // the handler when omitted. Only meaningful paired with
+  // --list-sessions; standalone use is a parse error so the
+  // truncation hint that points at this flag stays actionable.
+  limit?: number;
 }
 
 export interface ParseError {
@@ -60,6 +69,7 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
     help: false,
     plan: false,
     listSessions: false,
+    includeSubagents: false,
     yes: false,
   };
   const promptParts: string[] = [];
@@ -86,6 +96,10 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         break;
       case '--list-sessions':
         args.listSessions = true;
+        i += 1;
+        break;
+      case '--include-subagents':
+        args.includeSubagents = true;
         i += 1;
         break;
       case '--resume': {
@@ -188,6 +202,21 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         i += 2;
         break;
       }
+      case '--limit': {
+        const value = argv[i + 1];
+        if (value === undefined) {
+          return { ok: false, message: '--limit requires a value' };
+        }
+        if (!POSITIVE_INT.test(value)) {
+          return {
+            ok: false,
+            message: `--limit must be a positive integer, got '${value}'`,
+          };
+        }
+        args.limit = Number.parseInt(value, 10);
+        i += 2;
+        break;
+      }
       default:
         // Anything still starting with `--` after the explicit cases above
         // is an unknown flag. Single-dash tokens (`-foo`) fall through as
@@ -201,6 +230,28 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
     }
   }
   args.prompt = promptParts.join(' ').trim();
+
+  // --include-subagents only makes sense paired with --list-sessions.
+  // Refuse the combination at parse time so the user gets a clear
+  // error instead of the flag being silently ignored when typed alone
+  // (which used to happen — the flag fell through to the run-mode
+  // branch where nothing read it).
+  if (args.includeSubagents && !args.listSessions) {
+    return {
+      ok: false,
+      message: '--include-subagents requires --list-sessions',
+    };
+  }
+  // --limit governs the listing cap. The truncation hint emitted
+  // by `runListSessions` points users at this flag explicitly, so
+  // it MUST exist and be reachable. Same combo-validation as
+  // --include-subagents: standalone use is a parse error.
+  if (args.limit !== undefined && !args.listSessions) {
+    return {
+      ok: false,
+      message: '--limit requires --list-sessions',
+    };
+  }
   return { ok: true, args };
 };
 
@@ -214,6 +265,8 @@ export const usage = (): string =>
     '  --json                 Emit NDJSON events to stdout (headless)',
     '  --plan                 Read-only mode: produce a plan, do not apply changes',
     '  --list-sessions        Print known sessions (newest first) and exit',
+    '  --include-subagents    With --list-sessions, fan parents into their subagent children (requires --list-sessions)',
+    '  --limit <n>            With --list-sessions, cap rows returned (default 20; requires --list-sessions)',
     '  --resume <id|last>     Continue a prior session; positional prompt is the follow-up',
     '  --undo <session>       Restore the latest checkpoint of a session',
     '  --checkpoints <cmd>    Checkpoint subcommands: list <session> | diff <session> <ckpt>',

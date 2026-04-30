@@ -99,6 +99,21 @@ const resolveResumeId = (
     if (existing === null) {
       return { ok: false, message: `session ${resume} not found` };
     }
+    if (existing.isSubagent) {
+      // O5 C-block. Subagent sessions can't be resumed cleanly
+      // because --resume restores messages but NOT the system
+      // prompt or the tools whitelist — the resumed run would
+      // get the parent's full registry and an empty system
+      // prompt, diverging from how the subagent originally ran.
+      // The audit snapshot from migration 012 enables future
+      // re-hydration (O5b in BACKLOG) but the semantics need
+      // proper design (budget conflicts, plan mode, missing
+      // tools). For now we refuse and point at task().
+      return {
+        ok: false,
+        message: `cannot --resume a subagent session (id ${resume} is a subagent run; use the \`task\` tool to spawn a fresh subagent instead)`,
+      };
+    }
     return { ok: true, id: resume };
   } finally {
     db.close();
@@ -127,10 +142,13 @@ export const run = async (options: RunOptions): Promise<number> => {
     if (args.listSessions) {
       return runListSessions({
         json: args.json,
+        includeSubagents: args.includeSubagents,
+        ...(args.limit !== undefined ? { limit: args.limit } : {}),
         ...(options.bootstrapOverride?.dbPath !== undefined
           ? { dbPath: options.bootstrapOverride.dbPath }
           : {}),
         out: (s) => process.stdout.write(s),
+        err: errSink,
       });
     }
 
@@ -214,7 +232,22 @@ export const run = async (options: RunOptions): Promise<number> => {
       signal,
       ...(options.bootstrapOverride ?? {}),
     };
-    const { config, db, lockConflicts } = bootstrap(bootstrapInput);
+    const { config, db, lockConflicts, subagents } = bootstrap(bootstrapInput);
+
+    // Surface cross-scope subagent shadows. A user's
+    // ~/.config/agent/agents/<name>.md silently being eclipsed by
+    // a project-scope file is the kind of misconfiguration that
+    // wastes hours when the author doesn't see it; one warning
+    // per shadow on stderr makes the precedence visible. Gated on
+    // non-JSON mode so NDJSON consumers get a pure stream — the
+    // information is recoverable from the project tree anyway.
+    if (!args.json) {
+      for (const shadow of subagents.shadows) {
+        errSink(
+          `forja: subagent '${shadow.name}' from ${shadow.shadowed.sourcePath} (user) is shadowed by ${shadow.winning.sourcePath} (project)\n`,
+        );
+      }
+    }
 
     // Plan mode indicator on stderr — stdout stays a clean
     // transcript / NDJSON. Skip in JSON mode (per spec §2.2 stdout

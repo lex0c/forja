@@ -11,8 +11,11 @@ export { MIGRATIONS } from './migrations/index.ts';
 
 export {
   completeSession,
+  countSessions,
   createSession,
+  cumulativeCostUsd,
   getSession,
+  listChildSessions,
   listSessions,
   reopenSession,
   updateSessionCost,
@@ -83,3 +86,10 @@ export {
   updateCheckpointGitRef,
 } from './repos/checkpoints.ts';
 export type { Checkpoint, InsertCheckpointInput } from './repos/checkpoints.ts';
+
+export { getSubagentRun, insertSubagentRun } from './repos/subagent-runs.ts';
+export type {
+  InsertSubagentRunInput,
+  SubagentRun,
+  SubagentScope as SubagentRunScope,
+} from './repos/subagent-runs.ts';

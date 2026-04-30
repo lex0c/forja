@@ -24,6 +24,7 @@ const baseArgs = (overrides: Partial<ParsedArgs> = {}): ParsedArgs => ({
   help: false,
   plan: false,
   listSessions: false,
+  includeSubagents: false,
   yes: false,
   ...overrides,
 });
@@ -269,6 +270,81 @@ describe('--resume flow', () => {
     } finally {
       rmSync(otherCwd, { recursive: true, force: true });
     }
+  });
+
+  test('resume <child-id> on a subagent session is refused with a clear hint', async () => {
+    // O5 C-block. Resuming a subagent session would restore its
+    // messages but NOT its system prompt or tools whitelist —
+    // the resumed run would inherit the parent's full registry
+    // and run with an empty system prompt, diverging silently
+    // from how the subagent originally ran. We refuse at preflight
+    // and point at task() as the right way to spawn a subagent.
+    db = openTestDb();
+    const parent = createSession(db, { model: 'mock/m', cwd: workdir });
+    const child = createSession(db, {
+      model: 'mock/m',
+      cwd: workdir,
+      parentSessionId: parent.id,
+    });
+    db.close();
+
+    const errLines: string[] = [];
+    const code = await run({
+      args: baseArgs({ prompt: 'continuing', resume: child.id }),
+      bootstrapOverride: { dbPath, cwd: workdir },
+      signal: new AbortController().signal,
+      rendererOverride: recordingRenderer().renderer,
+      errSink: (s) => errLines.push(s),
+    });
+    expect(code).toBe(1);
+    const errOut = errLines.join('');
+    expect(errOut).toContain('cannot --resume a subagent session');
+    expect(errOut).toContain(child.id);
+    expect(errOut).toContain('task');
+  });
+
+  test("resume 'last' skips subagent rows", async () => {
+    // M3 regression. Subagent sessions live in the same `sessions`
+    // table linked via `parent_session_id`. `resolveResumeId` calls
+    // `listSessions(db, {limit:1, cwd})`, which defaults to
+    // `includeSubagents:false`. A user typing `--resume last` after
+    // a subagent run should land on the PARENT, not the most recent
+    // subagent child — the child has no follow-up semantics anyway.
+    // This locks the contract so a future refactor that flips the
+    // default doesn't silently change `--resume last` behavior.
+    db = openTestDb();
+    const parent = createSession(db, {
+      model: 'mock/m',
+      cwd: workdir,
+      startedAt: 1000,
+    });
+    appendMessage(db, { sessionId: parent.id, role: 'user', content: 'parent prompt' });
+    // Subagent session — newer started_at, but should be ignored
+    // by --resume last because it's a child.
+    createSession(db, {
+      model: 'mock/m',
+      cwd: workdir,
+      parentSessionId: parent.id,
+      startedAt: 9999,
+    });
+    db.close();
+
+    await run({
+      args: baseArgs({ prompt: 'continuing', resume: 'last' }),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'c' }]),
+        dbPath,
+        cwd: workdir,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: recordingRenderer().renderer,
+    });
+
+    db = openTestDb();
+    const parentMsgs = listMessagesBySession(db, parent.id);
+    // The "continuing" prompt landed on the PARENT, not the child.
+    expect(parentMsgs.some((m) => m.content === 'continuing')).toBe(true);
+    db.close();
   });
 
   test("resume 'last' fails clean when no sessions exist for this cwd", async () => {

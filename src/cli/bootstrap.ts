@@ -4,6 +4,7 @@ import { type LockConflict, createPermissionEngine, resolvePolicy } from '../per
 import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
 import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
+import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { composeWithUserPrompt } from './plan-prompt.ts';
 
@@ -42,6 +43,11 @@ export interface BootstrapInput {
   // touch /etc/agent or ~/.config/agent).
   enterprisePolicyPath?: string | null;
   userPolicyPath?: string | null;
+  // Test seams for subagent discovery. `null` disables the
+  // corresponding scope; absent uses the default path. Mirrors
+  // the permission-layer test seams above.
+  userAgentsDir?: string | null;
+  projectAgentsDir?: string | null;
 }
 
 export interface BootstrapResult {
@@ -57,6 +63,11 @@ export interface BootstrapResult {
   // section that a higher layer locked. Caller (CLI run.ts) prints
   // these as warnings to stderr.
   lockConflicts: LockConflict[];
+  // Subagent definitions discovered under user/project scopes. The
+  // CLI surfaces shadows on stderr as warnings; the runtime uses
+  // `byName` for resolution. Empty when no .md files are found
+  // anywhere.
+  subagents: SubagentSet;
 }
 
 // Build a HarnessConfig from environment + cwd + args. This is the main
@@ -106,6 +117,26 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   const toolRegistry = createToolRegistry();
   registerBuiltinTools(toolRegistry);
 
+  // Subagent discovery (spec §11.1). Loaded eagerly here so a
+  // malformed definition fails fast — at bootstrap time the user
+  // gets a clear error path, instead of a runtime tool failure
+  // mid-conversation. The loader throws on bad frontmatter; we let
+  // it propagate (same convention as policy YAML errors).
+  const subagents = loadSubagents({
+    cwd,
+    ...(input.userAgentsDir !== undefined ? { userDir: input.userAgentsDir } : {}),
+    ...(input.projectAgentsDir !== undefined ? { projectDir: input.projectAgentsDir } : {}),
+  });
+
+  // Capability gate against the active tool registry. Catches
+  // any tool with `metadata.writes=true` in a subagent's
+  // whitelist — including newly-registered or external tools the
+  // old name-list approach would have missed. Fails the bootstrap
+  // before the harness wires the registry into HarnessConfig, so
+  // the user sees the violation immediately rather than at first
+  // task() invocation.
+  validateSubagentSet(subagents.byName.values(), toolRegistry);
+
   // From here on, anything that throws must close the DB. `migrate` is
   // the only realistic offender — schema-version drift surfaces here.
   const dbPath = input.dbPath ?? defaultDbPath();
@@ -148,6 +179,11 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     // saves one git probe per run, which matters when --plan is
     // used inside non-git directories for read-only inspections.
     enableCheckpoints: input.plan !== true,
+    // Wire the subagent set so the `task` tool can resolve names.
+    // Always passed (even when empty) — the tool surfaces a clear
+    // "no subagents defined" hint instead of "registry missing"
+    // when there are simply no .md files yet.
+    subagentRegistry: subagents,
     ...(input.budget !== undefined ? { budget: input.budget } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.plan === true ? { planMode: true } : {}),
@@ -158,5 +194,12 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
       : {}),
   };
 
-  return { config, db, modelId, policyLayers, lockConflicts: resolved.lockConflicts };
+  return {
+    config,
+    db,
+    modelId,
+    policyLayers,
+    lockConflicts: resolved.lockConflicts,
+    subagents,
+  };
 };

@@ -393,6 +393,60 @@ describe('invokeTool', () => {
     expect(executed).toBe(false);
   });
 
+  test('plan mode: explicit planSafe:false blocks writes:false tools (regression for task)', async () => {
+    // Regression for the C1 review finding. Tools whose own
+    // surface doesn't write (writes:false) but whose hidden side
+    // effects can bypass plan mode through indirection MUST be
+    // blocked when they declare `planSafe: false`. The canonical
+    // case is `task` (subagent spawn) — without this gate, a
+    // subagent with `write_file` whitelisted could mutate the
+    // tree from inside a child loop while the parent's gate
+    // happily let `task` through.
+    let executed = false;
+    const indirectMutator: Tool = {
+      name: 'task',
+      description: 'spawns a subagent',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, planSafe: false, idempotent: false },
+      async execute() {
+        executed = true;
+        return { ok: true };
+      },
+    };
+    const deps = {
+      ...buildDeps(indirectMutator),
+      planMode: true,
+    };
+    const inv = await invokeTool({ toolUseId: 'tu1', toolName: 'task', args: {}, messageId }, deps);
+    expect(inv.failed).toBe(true);
+    expect(executed).toBe(false);
+    expect(inv.toolResult.is_error).toBe(true);
+    expect(inv.toolResult.content).toContain('plan mode');
+    expect(inv.decision?.kind).toBe('deny');
+    const tc = getToolCall(db, inv.toolCallId);
+    expect(tc?.status).toBe('denied');
+  });
+
+  test('plan mode: planSafe:false reason mentions opt-out wording', async () => {
+    // The deny message should distinguish "writes:true mutates fs"
+    // from "explicit planSafe:false opt-out" so the model knows
+    // why it was blocked. Different remediation: writes:true
+    // means "describe instead", planSafe:false means "this tool
+    // is structurally unsafe in plan mode regardless of args".
+    const indirectMutator: Tool = {
+      name: 'task',
+      description: 'spawns a subagent',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, planSafe: false, idempotent: false },
+      async execute() {
+        return { ok: true };
+      },
+    };
+    const deps = { ...buildDeps(indirectMutator), planMode: true };
+    const inv = await invokeTool({ toolUseId: 'tu1', toolName: 'task', args: {}, messageId }, deps);
+    expect(inv.toolResult.content).toContain('not plan-safe');
+  });
+
   test('plan mode: write deny IS persisted to approvals (audit trail)', async () => {
     // Regression: prior fix short-circuited before DB so plan-mode
     // attempts were forensically invisible. Now we persist the

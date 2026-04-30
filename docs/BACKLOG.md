@@ -15,6 +15,431 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.1 — subagent definition snapshot (audit gap closed)
+
+Architectural review surfaced a real audit gap that wasn't in the
+prior O1/O2/O3/O4 list: the system prompt and toolset under which
+a subagent ran were never persisted. They lived in `.md` files on
+disk, loaded once at bootstrap; if an author edited
+`~/.config/agent/agents/explore.md` after a child run, the original
+definition was unrecoverable and "explain past behavior" forensics
+became impossible. The cost is asymmetric — every day deferred
+loses evidence on every production run that happens in the
+meantime.
+
+**Decision:** Option A (snapshot at spawn). The other discussed
+shapes (B = system prompt as a `messages` row, C = block/restore
+on `--resume` of a child) were either invasive (B forces a CHECK
+constraint change in migration 001 and ripples through compaction/
+recap) or dependent on A (C-restore needs the snapshot to exist;
+without A there's nothing to restore from). A is a one-table
+ratchet: future runs become auditable, past runs stay lost.
+
+**Slice scope:**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/storage/migrations/012-subagent-runs.ts` | NEW | `subagent_runs` table — session_id PK + FK CASCADE, name, scope (CHECK user/project), source_path, source_sha256, system_prompt, tools_whitelist (JSON TEXT), budget_max_steps, budget_max_cost_usd, budget_max_wall_ms (nullable), captured_at. Index `(name, captured_at DESC)` for cross-run identity queries. |
+| `src/storage/repos/subagent-runs.ts` | NEW | `insertSubagentRun` / `getSubagentRun` with defensive JSON parse (malformed tools_whitelist → empty array, never crashes the listing). |
+| `src/subagents/types.ts` | UPDATED | `SubagentDefinition.sourceSha256: string` (added at load time). |
+| `src/subagents/load.ts` | UPDATED | `createHash('sha256')` over the raw `.md` content (frontmatter + body, original line endings) before parsing. Path-independent fingerprint. |
+| `src/subagents/runtime.ts` | UPDATED | After `runAgent` returns, INSERT the snapshot from the captured definition. Best-effort: a corrupted audit table doesn't mask the run's own outcome (catch swallows insert errors). |
+| `src/cli/list-sessions.ts` | UPDATED | `SessionListItem.subagent_run: { name, source_sha256 } \| null`. Surfaces the snapshot identity in JSON for subagent rows; full detail (system prompt, full toolset, budget) reachable via `getSubagentRun(id)`. |
+| Tests | NEW + UPDATED | `tests/storage/subagent-runs.test.ts` (8 — round-trip, nullable wall_ms, cascade, parent-purge survives, CHECK constraint, JSON shapes, malformed JSON defense), `tests/subagents/load.test.ts` (+1 — sha256 deterministic + path-independent + edit-detection), `tests/subagents/runtime.test.ts` (+3 — snapshot lands on success/exhausted/wall-ms-omitted), `tests/cli/list-sessions.test.ts` (+2 — JSON exposes fingerprint, defensive null when snapshot missing). |
+
+**Decisions:**
+
+- **Hash raw content, not parsed.** Two semantically equivalent
+  files with different whitespace MUST produce different sha —
+  otherwise audit can't tell apart edits to the source form.
+  Defense against the "file was reformatted" rationalization that
+  hides actual semantic shifts behind a stable hash.
+- **Snapshot inserted AFTER runAgent.** runAgent always returns a
+  HarnessResult (top-level catch is exhaustive); the only path
+  with no sessionId is one where createSession itself failed and
+  there's nothing to audit anyway. Pre-call insertion would
+  require restructuring runAgent's session-creation flow (event
+  hook, or the resume misuse path that drags in systemPrompt
+  restoration semantics) — neither pays for itself here.
+- **Best-effort insert with error swallow.** A corrupted audit
+  table (schema drift on a stale DB, FK constraint failure on
+  some future migration mistake) must NOT mask the run's actual
+  outcome. The session itself is finalized; failing the insert
+  would surface as `internalError` and hide the legitimate run
+  exit reason from the parent. Audit losses are recoverable from
+  other artifacts (git log, parent's `tool_calls.input/output`);
+  outcome misreporting isn't.
+- **JSON surface is compact (`name + source_sha256` only).** Full
+  detail (system prompt can be multi-KB, full toolset, budget
+  triple) lives in subagent_runs and is one query away. Listing
+  rows stay readable; forensic queries pull detail explicitly.
+- **CASCADE on session deletion, NOT on parent purge.** The
+  snapshot belongs to the child's audit trail. Deleting the child
+  session row drops the snapshot too; deleting the parent (which
+  ON DELETE SET NULLs the child's parent_session_id) leaves both
+  intact. Mirror of the `parent_session_id` design from migration
+  010.
+
+**Follow-up landed in the same pass — O5 C-block:**
+
+`resolveResumeId` now refuses `--resume` on `is_subagent=true`
+rows with a clear hint at `task()`. Without C-block, resuming a
+subagent silently inherited the parent's full registry and an
+empty system prompt — divergent enough to surprise the user. C-
+block is the honest v1: the spec treats subagents as atomic
+spawns, not continuable sessions. C-restore (re-hydrate from the
+snapshot) becomes possible thanks to migration 012 and is tracked
+as O5b in Pending — deferred as a feature pending real demand and
+proper design for several edge cases (missing tools, renamed
+subagents, budget conflicts, plan-mode propagation).
+
+**What this DOESN'T close (known limitations):**
+
+- **Process-kill timing window.** The snapshot insert runs AFTER
+  `runAgent` returns. If the parent process is `SIGKILL`'d (or
+  OOM-killed) between createSession and the post-await code
+  executing, the session row exists with no snapshot. Closing
+  this would require restructuring the harness to expose a
+  "session created, here's the id" hook so the snapshot can
+  land BEFORE the loop runs. Out of scope for this slice; the
+  auditFailure surface on `RunSubagentResult` catches the
+  synchronous error path which is the dominant case.
+- **N+1 on subagent rows in `--list-sessions`.** With
+  `--include-subagents`, the listing does one extra
+  `getSubagentRun` SELECT per subagent row on top of the existing
+  `cumulativeCostUsd` walk. For typical workloads (<100 rows)
+  negligible; a single `WHERE session_id IN (?, ...)` pre-fetch
+  would make it O(1). Same shape as the prior O1 N+1 note —
+  defer until first user reports a slow listing.
+- **Pre-migration row distinguishability.** A session with
+  `is_subagent=true` but no snapshot can be either a row created
+  before migration 012, or a row whose snapshot insert failed
+  silently. The CLI emits `subagent_run: null` for both. Today
+  treated identically; future fix could add a status column or
+  a one-shot backfill.
+- **`system_prompt` privacy.** Stored as plaintext in the audit
+  table. Same trust model as `messages.content` (sessions DB is
+  same trust level as source `.md` files), but a future privacy
+  pass should consider a redaction layer if subagent prompts
+  start carrying customer data.
+- **CRLF/LF cross-clone instability.** sha256 is over raw bytes,
+  so a Windows clone with `core.autocrlf=true` produces different
+  fingerprints than a Linux clone of the same git revision.
+  Documented as deliberate (silent normalization would alias
+  edits to the source form); authors who want stable shas across
+  platforms should set `* text=lf` in `.gitattributes`. Locked
+  by test in `tests/subagents/load.test.ts`.
+- **Hooks (spec §10).** `subagent_spawn` / `tool_use_pre` events
+  for external audit pipelines stay out of scope until M4.
+- **`traces` table (spec §13).** OpenTelemetry-style span emission
+  is M2/3 territory; the subagent_runs row is the M3 audit
+  primitive.
+
+**Review pass (post-self-review).** Reviewer surfaced 5 medium +
+6 minor + 3 out-of-scope. Addressed in this commit:
+
+- **M1** — silent snapshot failure invisible to caller. Now the
+  runtime returns `RunSubagentResult.auditFailure` when the
+  insert throws; the `task` tool echoes it as `audit_failure` in
+  the envelope; tests assert both the surface AND that run
+  outcome stays authoritative.
+- **M3** — CRLF/LF deliberate divergence locked by test;
+  cross-clone footgun documented above.
+- **M4** — stale "future-proofs the path" comment removed (O5
+  C-block makes the resumed-child re-insert dead code).
+- **M5** — explicit PK conflict test added in repo (locks the
+  fail-loud-on-duplicate contract; flips to `INSERT OR REPLACE`
+  in a future refactor would surface).
+- **m3** — `getSubagentRun` JSDoc clarifies the two
+  null-producing cases (not-a-subagent vs missing-snapshot).
+- **m4** — `captured_at` semantics documented in migration
+  comment (lags `started_at` by run duration; forensic queries
+  filter accordingly).
+
+Deferred (out of scope or known-limitation per above): M2
+(process-kill window), m1 (N+1), m2 (table fingerprint UX), m6
+(test technique), and the three OOS items (privacy, backfill,
+corruption status flag).
+
+**Verification:** `bun test` 1181 pass / 10 skip / 0 fail (+18
+new tests across migration, repo, loader, runtime, CLI, task
+tool); `tsc --noEmit` clean; `biome check` clean.
+
+---
+
+## [2026-04-30] M3 / Step 4.1 — close O1 (cost rollup) + O3 (flag validation)
+
+Two of the four "Pending" items from the prior review fix pass were
+cheap to close; doing them now keeps the deferral list honest about
+what's a real architectural debt vs. an oversight that just needed
+~30 LOC.
+
+**O1 — cumulative cost rollup in `--list-sessions`.**
+
+- New `cumulativeCostUsd(db, rootId)` helper in
+  `src/storage/repos/sessions.ts` walks parent → descendants via
+  `parent_session_id` (DFS with seen-guard against self-loops),
+  sums each row's `total_cost_usd`. Orphans are excluded by design
+  — the FK link is the rollup channel; an audit query that wants
+  detached spend iterates `listSessions({includeSubagents: true})`
+  directly.
+- Every `SessionListItem` now carries `cumulative_cost_usd`. JSON
+  output exposes it on every row. Table appends `+$Y.YYYY` after
+  the per-row cost when descendants billed > 0 (1e-9 tolerance for
+  FP noise), so the user reads "self vs descendants" at a glance
+  without summing per row. Cost column padding bumped to 20 to
+  fit the worst-case `$X.XXXX +$Y.YYYY` layout.
+- Five storage tests + three CLI tests cover: leaf row equals own,
+  multi-level fan-out, orphans don't roll up, unknown id returns 0,
+  self-referential row doesn't deadlock, JSON always carries the
+  field, table annotates only when descendants billed, table omits
+  the `+$0.0000` noise case.
+
+**O3 — `--include-subagents` standalone is now a parse error.**
+
+The flag was silently ignored without `--list-sessions` because no
+non-listing branch read it. Refusing at parse time gives the user
+feedback before bootstrap. Three lines in `src/cli/args.ts`, two
+tests in `tests/cli/args.test.ts`.
+
+**Why now:** both items had honest resolution paths and no spec
+discussion required. Leaving them in Pending would have rotted the
+gap-list as a meaningful "watch out for" signal — every item left
+there now is one with real architectural cost (O2 wants a permission
+shape decision; O4 wants a "budget propagation" semantics call) or
+a pull-trigger that hasn't fired (signing, sandbox).
+
+**Verification:** `bun test` 1160 pass / 10 skip / 0 fail (+10 new
+tests across storage + CLI); `tsc --noEmit` clean; `biome check`
+clean.
+
+---
+
+## [2026-04-30] M3 / Step 4.1 — review fixes (post-self-review pass)
+
+Self-review on `bf2c4c9` surfaced 15 issues across 4 tiers — 3
+critical (C1–C3), 6 medium, 6 minor, 3 out-of-scope. All
+addressable items addressed in this pass; the 3 out-of-scope items
+land in **Pending** below for explicit deferral.
+
+**Critical:**
+
+- **C1+C2 — plan-mode bypass via `task` + child not inheriting
+  `planMode`.** The `task` tool declared `writes: false`, so the
+  harness's plan-mode gate (`writes && !planSafe()`) never fired,
+  and the runtime didn't propagate `planMode` into the child's
+  `HarnessConfig`. Combined: a subagent with `write_file`
+  whitelisted could mutate the working tree under `--plan` via
+  `task()`, with no gate at any layer. Fixed both layers:
+    1. `invoke-tool.ts` extends the gate to include
+       `planSafe === false` (explicit literal). Tools that don't
+       write but have hidden side effects through indirection
+       (canonically `task`) opt into the block by declaring
+       `planSafe: false`. Reading `planSafe === undefined` for
+       read tools (grep/glob/read_file) keeps existing semantics
+       unchanged.
+    2. `RunSubagentInput.planMode` plumbs through; harness loop's
+       spawn closure forwards `config.planMode`. Defense in
+       depth: even if a future regression bypassed the parent
+       gate, the child harness would still block writes inside
+       its own loop.
+  Two regression tests added in `tests/harness/invoke-tool.test.ts`
+  (explicit `planSafe:false` blocks writes:false; deny reason
+  mentions opt-out wording) and one in
+  `tests/subagents/runtime.test.ts` (parent in plan mode → child's
+  write_file lands as `denied` in tool_calls).
+- **C3 — `subagents.shadows` computed but never surfaced.**
+  Bootstrap returned the shadow list; `cli/run.ts` ignored it.
+  Authors editing `~/.config/agent/agents/foo.md` while a
+  project-scope `.agent/agents/foo.md` exists got the project
+  version silently — no diagnostic. Fix: one warning per shadow
+  on stderr, gated on non-`--json` (preserve stdout purity).
+  Tests in `tests/cli/run.test.ts` cover both cases (warning
+  emitted / suppressed in JSON).
+
+**Medium:**
+
+- **M1 — dead `isChildError` predicate + stale comment.** The
+  helper was exported but never called (`task.ts` short-circuits
+  inline) and the `SESSION_FINISHED_TIMEOUT_REASONS` set was
+  inconsistent with its own doc. Removed both; the live code path
+  is the only contract.
+- **M2 — no recursion depth cap.** Forwarding `subagentRegistry`
+  to the child enabled `task → task → task` chains with only
+  per-child `maxSteps` and parent wall-clock containing them.
+  Added `MAX_SUBAGENT_DEPTH = 4` constant + `depth` field on
+  `RunSubagentInput`, harness loop closure increments and bumps
+  to a new `SpawnSubagentResult.depth_exceeded` variant (NOT a
+  raw throw — model can recover from a tool error). The runtime
+  itself ALSO throws on `depth >= MAX` as a defense-in-depth
+  contract for programmatic callers.
+- **M3 — `--resume last` quietly skips subagent rows.**
+  `listSessions(db, {limit:1, cwd})` defaults to
+  `includeSubagents:false` (intended), but no test locked this
+  contract. Added explicit regression in `tests/cli/resume.test.ts`
+  that creates a parent + subagent child, confirms `--resume last`
+  lands on the parent.
+- **M4 — table alignment broken on child rows.** Indented child id
+  was 40 chars (`"  ↳ <36-char uuid>"`) but the column padded to
+  36, shifting the PROMPT column right. Bumped column width to 40
+  so parent and child rows align identically.
+- **M5 — smoke `WRITE_FILE_LEAK` query had false-positive shape.**
+  Filtered by tool name only; a denied attempt would have failed
+  the smoke despite the whitelist working. Tightened to
+  `tc.status = 'done'` — only successful execution counts as a
+  leak.
+- **M6 — SET NULL cascade test on `parent_session_id`.** Already
+  asserted in `tests/storage/sessions.test.ts` ("parent deletion
+  sets child parent_session_id to null"); confirmed and skipped.
+
+**Minor:**
+
+- **m1 — `lastMessageId === undefined` check.** Field is
+  `string | undefined` per typing but the loop seeds it to `''`
+  and never assigns undefined. Added explicit
+  `length === 0` clause for clarity.
+- **m2 — stale comment referencing `--list-subagents`.** The CLI
+  verb doesn't exist; rewrote the comment to point at the actual
+  surface (stderr warning at bootstrap).
+- **m3 — `PROMPT_MAX_BYTES` magic number.** Added comment
+  explaining the choice (32 KiB = "self-contained instruction"
+  per PLAYBOOKS.md §1) and surfaced `byte_limit` + `byte_count`
+  in the oversized-prompt error details so the model reacts
+  without a guess-and-check retry.
+- **m4 — loader-throw stack trace at boundary.** Already wrapped
+  by the outer `try/catch` in `cli/run.ts:265`, which routes the
+  message through `errSink`. Confirmed and skipped.
+- **m5 — loader doesn't reject write tools in whitelist.**
+  Subagents in 4.1 run in-process with checkpoints OFF for the
+  child; a `write_file` whitelist would mutate the parent's tree
+  with no reverse path. Added hard refusal at load time for
+  `write_file`, `edit_file`, `bash`, `bash_background`,
+  `bash_kill`. Step 4.2's worktree isolation will lift this with
+  a separate refs chain. Tests in `tests/subagents/load.test.ts`.
+- **m6 — `task` tool description bloated tokens.** Trimmed paths
+  and prose to match the size of `bash`/`write_file` descriptions
+  while preserving the model-facing decision criteria.
+
+**Verification:** `bun test` 1131 pass / 10 skip / 0 fail
+(+10 new tests across invoke-tool, subagent runtime, task tool,
+CLI run/list-sessions/resume, subagent loader); `tsc --noEmit`
+clean; `biome check` clean.
+`evals/smoke-subagent-explore.sh` exits 0 against
+`anthropic/claude-haiku-4-5` (whitelist enforcement assertion now
+on `tc.status='done'` per M5).
+
+**Pending (deferred from review O2/O4, not blocking 4.1):**
+
+- ~~**O1 — cost rollup**~~ — closed in the [2026-04-30 O1+O3 pass]
+  entry below.
+- **O2 — no dedicated `subagent` permission category.** `task`
+  routes through `'misc'`; an operator can't whitelist/blacklist
+  subagents by name via `permissions.yaml`. Resolution: spec a
+  `subagent` policy section (`allow: [name]`, `deny: [name]`,
+  `locked`), add matcher, migrate the tool's `metadata.category`.
+  Trigger: first request for org-level subagent gating.
+- ~~**O3 — `--include-subagents` standalone**~~ — closed in the
+  [2026-04-30 O1+O3 pass] entry above.
+- ~~**O5 — `--resume <child-id>` ignores the snapshot**~~ —
+  closed via C-block (resume of subagent now refused at preflight
+  with a hint at `task()`). See O5b for the re-hydration path
+  that's now possible thanks to the audit snapshot subsystem.
+- **O5b — re-hydrate HarnessConfig from `subagent_runs` on
+  resume.** With migration 012 in place, the snapshot gives us
+  enough to legitimately resume a subagent (restore systemPrompt,
+  filtered registry, budget) instead of refusing. Deferred
+  because it's a feature, not a bug fix — needs design for
+  several edge cases: tool in whitelist that no longer exists in
+  parent registry, subagent name removed/renamed since the
+  original run, conflict between snapshot budget and `--max-steps`
+  CLI override, plan-mode propagation. Trigger: a user reports a
+  legitimate use case for continuing a crashed subagent run.
+- **O4 — subagent `maxCostUsd` is independent of parent's
+  remaining budget.** Spec §11 endorses "budget próprio" so this
+  is by design, but a parent with a tight cap can still be
+  surprised by a child tree's cumulative spend (cost rollup is
+  query-time per O1; the parent's cap only governs the parent's
+  own provider calls). Combined with the depth cap (4 levels), a
+  worst-case fan-out can multiply spend before the parent
+  notices. Resolution path: when a cost-cap-on-tree feature is
+  needed, sum `listChildSessions(parentId)` recursively at each
+  child's spawn time and refuse if it would push past the
+  parent's cap. Trigger: first user reports surprise from this
+  shape. Until then, document it in the README so authors know
+  to size subagent budgets conservatively.
+
+Lands `AGENTIC_CLI §11` minus worktree isolation: a parent harness
+can declare subagents via `.md` frontmatter, the `task` tool spawns
+a child harness with restricted toolset and own budget, the child
+runs in an isolated context (no parent message history) and writes
+its own session row linked back to the parent via the new
+`sessions.parent_session_id` FK.
+
+**Slice scope:**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/storage/migrations/010-subagents.ts` | NEW | Adds `parent_session_id` to `sessions` (self-referential FK, ON DELETE SET NULL). Index `(parent_session_id, started_at DESC)` for hierarchy fan-out. |
+| `src/storage/repos/sessions.ts` | UPDATED | `Session.parentSessionId`, `createSession({ parentSessionId })`, new `listChildSessions()`, and `listSessions({ includeSubagents })` filter (default OFF). |
+| `src/subagents/types.ts` | NEW | `SubagentDefinition`, `SubagentBudget`, `SubagentScope`. |
+| `src/subagents/paths.ts` | NEW | `userAgentsDir()` + `projectAgentsDir()` mirroring `permissions/paths.ts` shape (XDG + Windows fallbacks). |
+| `src/subagents/load.ts` | NEW | `.md` + YAML-frontmatter parser, kebab-case validation, project shadows user, duplicate-name-in-scope rejected, `meta` overflow for future playbook fields. |
+| `src/subagents/runtime.ts` | NEW | `runSubagent({ definition, prompt, parentSessionId, ... })` — builds child registry filtered to whitelist, fresh `HarnessConfig` w/ child budget + child system prompt, no parent history; returns `{ output, sessionId, status, reason, costUsd, steps, durationMs }`. Optional recursion via forwarded `subagentRegistry`. |
+| `src/harness/types.ts` | UPDATED | `parentSessionId?: string` (threaded into createSession) and `subagentRegistry?: SubagentSet` (drives ctx wiring). |
+| `src/harness/loop.ts` | UPDATED | When `subagentRegistry` set, builds a `spawnSubagent` closure (binds parent session id from current ctx) and threads it into `ToolContext`; forwards same registry to child runs. |
+| `src/tools/types.ts` | UPDATED | `ToolContext.spawnSubagent?` + `SpawnSubagentArgs` / `SpawnSubagentResult` discriminated union (`unknown_subagent` vs `ran`). |
+| `src/tools/builtin/task.ts` | NEW | Built-in tool, schema `{ subagent, prompt }`. Validates args, gates on aborts, maps non-`done` child status → `subagent.run_failed` tool error w/ envelope echoed in details. `planSafe: false` (refuses in plan mode). |
+| `src/cli/bootstrap.ts` | UPDATED | Loads subagents from user/project dirs (test seams `userAgentsDir` / `projectAgentsDir`), exposes the set in `BootstrapResult`, wires `subagentRegistry` into `HarnessConfig`. |
+| `src/cli/list-sessions.ts` | UPDATED | Default listing hides children; `includeSubagents` flag fans each parent into its immediate children oldest-first. JSON shape adds `parent_session_id`; table marks children with `↳ ` indent. |
+| `src/cli/args.ts` | UPDATED | `--include-subagents` flag (boolean, paired with `--list-sessions`). |
+| `evals/smoke-subagent-explore.sh` | NEW | Real-model smoke: parent invokes `task(subagent: 'explore', prompt: '...')`, smoke asserts a child session row was created with `parent_session_id` set, the child never invoked `write_file` (whitelist), and the parent's assistant text references the seed files (output flowed back). |
+| Tests | NEW / UPDATED | `tests/storage/sessions.test.ts` (+5 — parent_session_id round-trip, ON DELETE SET NULL, listChildSessions, listSessions hidden-by-default), `tests/subagents/load.test.ts` (15 — frontmatter parse, validation, precedence, duplicate detection), `tests/subagents/runtime.test.ts` (7 — happy path, parent history isolation, system prompt source, whitelist enforcement, budget cap, typo error, envelope shape), `tests/tools/task.test.ts` (7 — happy path, missing registry, unknown name, run_failed mapping, arg validation, oversized prompt, abort), `tests/cli/list-sessions.test.ts` (+3 — hidden default, fan-out, table indent), `tests/cli/args.test.ts` (+1 — flag parse), `tests/cli/bootstrap.test.ts` (UPDATED — registry assertion includes `task`). |
+
+**Decisions:**
+
+- **In-process, NOT subprocess.** Spec §11 mentions "processo separado, comunicação via SQLite". For Step 4.1 we run the child in the same Bun process: it spawns a fresh session id with `parent_session_id` set, runs the same `runAgent` loop with a filtered registry / restricted prompt / restricted budget, and writes to the same SQLite db. Subprocess isolation is genuinely useful when the child needs filesystem isolation (writing subagents) — at which point worktree isolation IS the answer (Step 4.2). Keeping 4.1 in-process avoids paying the spawn cost (~50-200ms) for the dominant read-only case AND reuses every existing harness invariant (abort-signal propagation, todo store, bg manager, telemetry) without reinventing IPC.
+- **Cost rollup is query-time, not write-time.** I proposed write-time rollup ("parent's `total_cost_usd` = self + children") in the design discussion; on implementation I reverted. Write-time rollup double-counts under resume + repeat task() calls, complicates the budget contract (no cost cap exists in `RunBudget` today anyway), and forces every cost-mutation path through both rows. The honest model: each session row tracks its own spend; `listChildSessions` walks the tree at query time. When a cost cap lands in `RunBudget` later, we revisit by building a parent-time getter that sums on demand.
+- **Checkpoints OFF for in-process subagents.** A child writing in the parent's tree under its own `refs/agent/checkpoints/<child-session>` chain isn't reachable from the parent's `--undo`. Disabling checkpoints for the child avoids creating refs that nobody can find. Read-only subagents (the dominant case) lose nothing. Writing subagents are the §11.2 worktree job — Step 4.2 re-enables checkpoints there because the worktree gives the child its own tree to checkpoint independently.
+- **Whitelist filters at registry build time, not at execution.** `runSubagent` builds a fresh `ToolRegistry` containing only the named tools; the harness's existing `tool not registered` path rejects unknown names. Cleaner than a per-call gate and reuses the existing handling for typo'd tool names. Typos in the whitelist itself THROW at runtime (caller bug, not subagent runtime state) so the author finds them at first use.
+- **`spawnSubagent` lives on `ToolContext`, not as a new harness primitive.** The closure is built once per step and threaded into ctx the same way `bgManager` and `todoStore` are. Tests inject a mock predicate via `makeCtx({ spawnSubagent })`; the harness wires the real one when `config.subagentRegistry` is present. Keeps the tool surface uniform and avoids leaking provider/db/registry references into tools that don't need them.
+- **`unknown_subagent` is a discriminated result, not a throw.** The model can typo a name; that's a tool error the model recovers from (`subagent.unknown` with `available: [...]` in details). Programmer errors (registry missing entirely, typo in the playbook's tool whitelist) DO throw because they signal misconfiguration the model can't fix.
+- **Project scope shadows user scope; same-scope name collision throws.** Same convention as memory + permissions. Cross-scope shadowing is a feature (override the user's default on a per-project basis); within-scope duplication is an authoring mistake (two `.md` files claim the same `name`) and should fail fast at bootstrap.
+- **`task` tool is `category: 'misc'` for now.** The spec's permission engine doesn't have a `subagent` category yet; promoting the route here would force a permission shape decision before its rules are designed. `'misc'` defaults route through the existing engine without behavior change. Migration to a dedicated `subagent` policy section is queued for the permission v2 pass.
+- **`task` is `planSafe: false`.** A subagent could ship `write_file` in its tools whitelist; allowing `task()` in plan mode would let a child mutate the working tree behind the harness's plan-mode gate. The simplest correct rule is "no spawning during plan" — keeps plan mode globally read-only without per-subagent introspection.
+
+**Pending (later slices):**
+
+- Step 4.2: worktree isolation (`isolation: worktree` frontmatter). Re-enables checkpoints for writing subagents because the child's commits land in its own branch under its own worktree. Subprocess spawn becomes worth its cost there.
+- Step 4.3+: playbooks (`code-review`, `security-audit`, etc.). Frontmatter shape (`output_schema`, `references`, `sampling`, `context_recipe`) already lands in `meta` overflow — only the consumer code is missing. PLAYBOOKS.md §11 spells out the procedure.
+- Slash commands `/explain` / `/review` / `/audit` — wait on M4 Ink TUI; the same `runSubagent` API consumed.
+- `--list-subagents` CLI verb (introspection, surfaces shadows). Cheap to add when first user asks.
+- Permission category `subagent` with allow/deny/locked rules per name. Triggered when the org-config ask materializes.
+- Cost rollup helper at the CLI (`cumulativeCost(sessionId)` walks `listChildSessions` recursively). Add when budget cap arrives in `RunBudget`.
+
+**Why it matters:**
+
+- The differential of M3 — what makes the milestone earn its name. Subagents are the primitive every later playbook (review, audit, debug, refactor) is a constraint over.
+- Unblocks the M4 TUI work that wires `/explain` etc. to subagent invocation; the runtime is ready, only the slash-to-tool wire is missing.
+- Establishes the `parent_session_id` audit trail every later cost / replay / forensic tool depends on.
+
+**Verification:** `bun test` 1121 pass / 10 skip / 0 fail (+38 new
+tests across storage, subagents, tools, cli); `tsc --noEmit` clean;
+`biome check` clean. `evals/smoke-subagent-explore.sh` exits 0
+against `anthropic/claude-haiku-4-5`: parent invoked `task()`,
+1 child session row created with `parent_session_id` linked, zero
+`write_file` calls in the child's `tool_calls` (whitelist enforced),
+parent's terminal text referenced the seed files (child output
+flowed back through the tool envelope).
+
+**Bug surfaced by the smoke (and fixed):** initial smoke probed for
+`agent.sqlite` under `$XDG_DATA_HOME/forja/`, but `defaultDbPath()`
+resolves to `sessions.db` (per `src/storage/paths.ts`). The smoke
+failed before the assertions ran. Fixed in the script; nothing to
+change in production code (the path was always correct, only the
+smoke's verification assumption was wrong).
+
+---
+
 ## [2026-04-29] M3 / Step 3 — fix restore on unborn HEAD with dirty tree
 
 `git stash push` refuses on unborn HEAD with the explicit message

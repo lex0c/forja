@@ -75,6 +75,7 @@ describe('bootstrap', () => {
         'grep',
         'monitor',
         'read_file',
+        'task',
         'todo_write',
         'wait_for',
         'write_file',
