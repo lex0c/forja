@@ -541,6 +541,162 @@ describe('runSubagent — orchestration', () => {
     ).rejects.toThrow(/recursion depth/);
   });
 
+  test('parent passes depth into spawn opts (cross-process recursion guard)', async () => {
+    // Without depth propagation, every subprocess child resets
+    // to 0 and a chain of subprocesses could nest beyond
+    // MAX_SUBAGENT_DEPTH (each child computes from a fresh
+    // baseline). The parent's runSubagent must thread its own
+    // `depth` value into the spawn opts so the child's harness
+    // config keeps `subagentDepth` non-zero.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const captured: { depth?: number } = {};
+    const recordingSpawn: SpawnChildProcess = (opts) => {
+      captured.depth = opts.depth;
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      setSubagentPayload(db, opts.sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'ok',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      });
+      return { exited: Promise.resolve({ exitCode: 0 }), kill: () => undefined };
+    };
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      depth: 2,
+      spawnChildProcess: recordingSpawn,
+    });
+    expect(captured.depth).toBe(2);
+  });
+
+  test('parent forwards temperature to spawn opts when set', async () => {
+    // Eval / automation pipelines pin temperature=0 for
+    // determinism. Without forwarding, the subprocess child
+    // would silently fall back to the provider default and
+    // break reproducibility. Capture the spawn opts and
+    // assert the value round-tripped.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const captured: { temperature?: number } = {};
+    const recordingSpawn: SpawnChildProcess = (opts) => {
+      if (opts.temperature !== undefined) captured.temperature = opts.temperature;
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      setSubagentPayload(db, opts.sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'ok',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      });
+      return { exited: Promise.resolve({ exitCode: 0 }), kill: () => undefined };
+    };
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      temperature: 0,
+      spawnChildProcess: recordingSpawn,
+    });
+    expect(captured.temperature).toBe(0);
+  });
+
+  test('temperature stays undefined in spawn opts when input omits it', async () => {
+    // Default behavior: no temperature pinned at the input
+    // means the child falls through to the provider default.
+    // The spawn opts should NOT carry a temperature field
+    // that the child would interpret as "the parent wants
+    // exactly this value" — undefined is the honest signal.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    let observedKey = false;
+    const recordingSpawn: SpawnChildProcess = (opts) => {
+      observedKey = 'temperature' in opts;
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      setSubagentPayload(db, opts.sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'ok',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      });
+      return { exited: Promise.resolve({ exitCode: 0 }), kill: () => undefined };
+    };
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      // no temperature
+      spawnChildProcess: recordingSpawn,
+    });
+    expect(observedKey).toBe(false);
+  });
+
+  test('depth defaults to 0 when input.depth is omitted', async () => {
+    // Top-level invocation shape: parent's runSubagent without
+    // an explicit depth should pass 0 to the spawn so the child
+    // starts a fresh chain. Locks the default so a future
+    // refactor doesn't accidentally change the baseline.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const captured: { depth?: number } = {};
+    const recordingSpawn: SpawnChildProcess = (opts) => {
+      captured.depth = opts.depth;
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      setSubagentPayload(db, opts.sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'ok',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      });
+      return { exited: Promise.resolve({ exitCode: 0 }), kill: () => undefined };
+    };
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      // no depth
+      spawnChildProcess: recordingSpawn,
+    });
+    expect(captured.depth).toBe(0);
+  });
+
   test('depth === MAX_SUBAGENT_DEPTH is the last allowed level', async () => {
     const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
       model: 'mock/m',

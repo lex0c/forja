@@ -73,6 +73,24 @@ export interface SubagentChildOptions {
   // directories).
   userAgentsDir?: string | null;
   projectAgentsDir?: string | null;
+  // Recursion depth THIS child is running at. The parent's
+  // `runSubagent` computes the depth before spawning and passes
+  // it via `--subagent-depth <n>`. Without this, every
+  // subprocess would reset depth to 0 and a chain of subprocess
+  // subagents could nest beyond MAX_SUBAGENT_DEPTH (each child
+  // sees its own task() invocations starting from 0). Threading
+  // it through here closes the cross-process gap. Defaults to
+  // 0 when omitted (top-level shape) — consistent with the
+  // harness's own `subagentDepth ?? 0` semantics.
+  depth?: number;
+  // Sampling temperature for this child. Carried across via
+  // `--subagent-temperature <n>`. Undefined means "use the
+  // provider default" — same semantics as omitting temperature
+  // on a top-level harness. Eval pipelines pin this to 0 for
+  // determinism; without propagation, a subprocess child would
+  // silently ignore the parent's temperature override and run
+  // non-deterministically.
+  temperature?: number;
 }
 
 // Build the envelope shape the parent's `runSubagent` expects to
@@ -343,6 +361,24 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // breaking coordinator-style chains that 4.2a supported
       // in-process.
       subagentRegistry: subagents,
+      // Recursion depth carried across the subprocess boundary
+      // by the parent's `runSubagent` (via `--subagent-depth`
+      // CLI flag, threaded into `opts.depth` here). Without
+      // this, every subprocess child would reset to 0 and any
+      // nested task() chain would compute depth from a fresh
+      // baseline — bypassing the chain-wide MAX_SUBAGENT_DEPTH
+      // guard and allowing runaway fan-out. The harness's
+      // spawn closure increments this on the next hop, so a
+      // grandchild correctly sees `parentDepth + 1`.
+      subagentDepth: opts.depth ?? 0,
+      // Sampling temperature carried across the subprocess
+      // boundary. Conditional spread: when undefined, the
+      // harness lets the provider use its own default (same as
+      // a top-level run with no temperature pinned). Without
+      // forwarding, eval / automation pipelines that pin
+      // temperature=0 would see subprocess subagents silently
+      // run at the provider default and break determinism.
+      ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
       // Checkpoints stay off in 4.2b.ii.a — the worktree path
       // already provides a separate branch for changes; per-step
       // checkpoint chain inside the worktree lands in 4.2c.
@@ -350,15 +386,6 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // bgLogDir omitted: the validator + buildChildRegistry both
       // refuse `requiresBgManager` tools, so the surface is empty.
       // 4.2b.iv wires per-worktree bg logs.
-      //
-      // `subagentDepth` left at default 0. The depth counter
-      // doesn't yet propagate across the subprocess boundary —
-      // a chain of subprocess subagents could nest beyond
-      // MAX_SUBAGENT_DEPTH because each child starts at 0 from
-      // its own perspective. Per-subagent budget caps (steps,
-      // cost, wall-clock) bound the practical damage; rigorous
-      // depth forwarding lands with planMode/temperature in
-      // 4.2b.ii.b (likely via a new column on subagent_runs).
     };
 
     const result = await runAgent(config);

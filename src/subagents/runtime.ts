@@ -141,6 +141,24 @@ export interface SpawnChildProcessOptions {
   // row's cwd matches, so a mismatch here surfaces as an init
   // failure (not silently runs in the wrong tree).
   cwd: string;
+  // Recursion depth this child run is at (0 for a direct child
+  // of the user's session, 1 for a grandchild, etc). Passed
+  // across the subprocess boundary via `--subagent-depth`
+  // so the child's harness keeps `subagentDepth` non-zero and
+  // any nested task() invocation increments from the right
+  // baseline. Without this propagation, a chain of subprocess
+  // subagents would compute depth from 0 inside each child
+  // and bypass MAX_SUBAGENT_DEPTH at the chain level —
+  // runaway fan-out risk.
+  depth: number;
+  // Sampling temperature for the child. Carried across via
+  // `--subagent-temperature`. Undefined means "let the child
+  // use the provider default" (same semantics as omitting
+  // temperature on a top-level harness). Eval / automation
+  // pipelines pin this to 0 for determinism; without
+  // propagation, the subprocess child would silently fall back
+  // to the provider default (~1.0) and break reproducibility.
+  temperature?: number;
 }
 
 export type SpawnChildProcess = (opts: SpawnChildProcessOptions) => ChildProcessHandle;
@@ -218,10 +236,24 @@ export const resolveChildBinaryCmd = (input: ResolveChildBinaryArgs): string[] =
 // propagate from here — the runtime is the only caller of the
 // default factory.
 const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
+  // Internal flags appended in fixed order. `--subagent-temperature`
+  // is conditional: omitting it (instead of stamping a default)
+  // preserves "let the provider decide" semantics and matches
+  // what a top-level harness sees when the caller didn't pin a
+  // value.
+  const appendArgs: string[] = [
+    '--subagent-session-id',
+    opts.sessionId,
+    '--subagent-depth',
+    String(opts.depth),
+  ];
+  if (opts.temperature !== undefined) {
+    appendArgs.push('--subagent-temperature', String(opts.temperature));
+  }
   const cmd = resolveChildBinaryCmd({
     argv: Bun.argv,
     execPath: process.execPath,
-    appendArgs: ['--subagent-session-id', opts.sessionId],
+    appendArgs,
   });
   const proc = Bun.spawn({
     cmd,
@@ -679,7 +711,12 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   const spawn = input.spawnChildProcess ?? defaultSpawnChildProcess;
   let handle: ChildProcessHandle;
   try {
-    handle = spawn({ sessionId: childSession.id, cwd: childCwd });
+    handle = spawn({
+      sessionId: childSession.id,
+      cwd: childCwd,
+      depth,
+      ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
+    });
   } catch (e) {
     await cleanupOnFail();
     return {

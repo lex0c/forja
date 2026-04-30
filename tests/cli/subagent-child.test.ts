@@ -414,6 +414,324 @@ describe('runSubagentChild', () => {
     }
   });
 
+  test('depth flows through to the child harness config', async () => {
+    // The child harness's spawn closure increments
+    // (config.subagentDepth ?? 0) when launching grandchildren.
+    // Without depth propagation, every subprocess starts from 0
+    // and a chain of subprocesses could nest beyond the
+    // MAX_SUBAGENT_DEPTH guard. We assert the child runs with
+    // the depth value the parent passed by checking the
+    // grandchild registration shape: a child seeded with depth=4
+    // (== MAX) attempting one more nested task() must surface
+    // `subagent.depth_exceeded` (the harness's spawn closure
+    // refused, computed depth=5 > MAX).
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    let coordId: string;
+    const projectAgentsDir = mkdtempSync(join(tmpdir(), 'forja-depth-agents-'));
+    try {
+      // worker.md: empty toolset, just exists so the registry
+      // resolves the name. The harness's spawn closure refuses
+      // BEFORE actually spawning when childDepth > MAX, so worker
+      // never runs.
+      writeFileSync(
+        join(projectAgentsDir, 'worker.md'),
+        `---
+name: worker
+description: Worker.
+tools: []
+budget:
+  max_steps: 2
+  max_cost_usd: 0.0
+---
+You are the worker.`,
+      );
+
+      const db = openDb(dbPath);
+      try {
+        migrate(db);
+        const top = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+        const coord = sessionsRepo.createSession(db, {
+          model: 'mock/m',
+          cwd: dbDir,
+          parentSessionId: top.id,
+        });
+        coordId = coord.id;
+        subagentRunsRepo.insertSubagentRun(db, {
+          sessionId: coord.id,
+          name: 'coordinator',
+          scope: 'project',
+          sourcePath: '/fake/coord.md',
+          sourceSha256: 'a'.repeat(64),
+          systemPrompt: 'You are the coordinator.',
+          toolsWhitelist: ['task'],
+          budgetMaxSteps: 5,
+          budgetMaxCostUsd: 0.0,
+        });
+        messagesRepo.appendMessage(db, {
+          sessionId: coord.id,
+          role: 'user',
+          content: 'spawn the worker',
+        });
+      } finally {
+        db.close();
+      }
+
+      let step = 0;
+      const provider: Provider = {
+        id: 'mock/m',
+        family: 'anthropic',
+        capabilities: {
+          tools: 'native',
+          cache: false,
+          vision: false,
+          streaming: true,
+          constrained: 'tools',
+          context_window: 1000,
+          output_max_tokens: 100,
+          cost_per_1k_input: 0,
+          cost_per_1k_output: 0,
+          notes: [],
+        },
+        async *generate(): AsyncGenerator<StreamEvent> {
+          step++;
+          yield { kind: 'start', message_id: `m-${step}` };
+          if (step === 1) {
+            yield { kind: 'tool_use_start', id: 'tu1', name: 'task' };
+            yield {
+              kind: 'tool_use_stop',
+              id: 'tu1',
+              final_args: { subagent: 'worker', prompt: 'go' },
+            };
+            yield { kind: 'stop', reason: 'tool_use' };
+          } else {
+            yield { kind: 'text_delta', text: 'closed' };
+            yield { kind: 'stop', reason: 'end_turn' };
+          }
+        },
+        generateConstrained: () => Promise.reject(new Error('n/a')),
+        countTokens: () => Promise.resolve(0),
+      };
+
+      // Run with depth=4 (== MAX_SUBAGENT_DEPTH). The
+      // coordinator's task('worker') hop would compute
+      // grandchildDepth = 5, which exceeds MAX. The harness's
+      // spawn closure returns `depth_exceeded`. If depth weren't
+      // honored (still 0), grandchildDepth would be 1 and the
+      // call would proceed.
+      const exitCode = await runSubagentChild({
+        sessionId: coordId,
+        dbPath,
+        providerOverride: provider,
+        userAgentsDir: null,
+        projectAgentsDir,
+        depth: 4,
+        errSink: () => undefined,
+      });
+      expect(exitCode).toBe(0);
+
+      // Tool call's output captures `subagent.depth_exceeded`.
+      const db2 = openDb(dbPath);
+      try {
+        const calls = db2
+          .query<{ output: string }, [string]>(
+            `SELECT tc.output AS output
+               FROM tool_calls tc
+               JOIN messages m ON tc.message_id = m.id
+              WHERE m.session_id = ? AND tc.tool_name = 'task'`,
+          )
+          .all(coordId);
+        expect(calls.length).toBeGreaterThan(0);
+        const codes = calls
+          .map((c) => {
+            try {
+              return (JSON.parse(c.output) as { error_code?: string }).error_code;
+            } catch {
+              return undefined;
+            }
+          })
+          .filter(Boolean);
+        expect(codes).toContain('subagent.depth_exceeded');
+      } finally {
+        db2.close();
+      }
+    } finally {
+      rmSync(projectAgentsDir, { recursive: true, force: true });
+    }
+  });
+
+  test('temperature flows through to the harness provider request', async () => {
+    // Eval pipelines pin temperature=0 for determinism; without
+    // propagation, the subprocess child runs at the provider
+    // default and breaks reproducibility. Capture the request
+    // the harness sends to provider.generate; assert
+    // req.temperature matches what the child handler received.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    let childId: string;
+    const db = openDb(dbPath);
+    try {
+      migrate(db);
+      const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+      const child = sessionsRepo.createSession(db, {
+        model: 'mock/m',
+        cwd: dbDir,
+        parentSessionId: parent.id,
+      });
+      childId = child.id;
+      subagentRunsRepo.insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'project',
+        sourcePath: '/fake/explore.md',
+        sourceSha256: 'a'.repeat(64),
+        systemPrompt: 'You are explore.',
+        toolsWhitelist: [],
+        budgetMaxSteps: 5,
+        budgetMaxCostUsd: 0.1,
+      });
+      messagesRepo.appendMessage(db, {
+        sessionId: child.id,
+        role: 'user',
+        content: 'go',
+      });
+    } finally {
+      db.close();
+    }
+
+    const recordedRequests: Array<{ temperature?: number }> = [];
+    const recordingProvider: Provider = {
+      id: 'mock/m',
+      family: 'anthropic',
+      capabilities: {
+        tools: 'native',
+        cache: false,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 1000,
+        output_max_tokens: 100,
+        cost_per_1k_input: 0,
+        cost_per_1k_output: 0,
+        notes: [],
+      },
+      async *generate(req): AsyncGenerator<StreamEvent> {
+        recordedRequests.push(
+          req.temperature !== undefined ? { temperature: req.temperature } : {},
+        );
+        yield { kind: 'start', message_id: 'mock-msg' };
+        yield { kind: 'text_delta', text: 'done' };
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+
+    const exitCode = await runSubagentChild({
+      sessionId: childId,
+      dbPath,
+      providerOverride: recordingProvider,
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      // Pin temperature to 0 — the value an eval would set.
+      // Without propagation through child handler → harness
+      // → provider, the recorded request would lack this
+      // value and surface as undefined / provider default.
+      temperature: 0,
+      errSink: () => undefined,
+    });
+    expect(exitCode).toBe(0);
+    expect(recordedRequests.length).toBeGreaterThan(0);
+    expect(recordedRequests[0]?.temperature).toBe(0);
+  });
+
+  test('temperature undefined → provider request has no temperature pin', async () => {
+    // Counterpart: when the parent didn't pin a temperature,
+    // the harness should leave req.temperature undefined so the
+    // provider applies its own default. Locks the
+    // "absent-by-default" semantics so a future regression
+    // doesn't silently inject a value.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    let childId: string;
+    const db = openDb(dbPath);
+    try {
+      migrate(db);
+      const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+      const child = sessionsRepo.createSession(db, {
+        model: 'mock/m',
+        cwd: dbDir,
+        parentSessionId: parent.id,
+      });
+      childId = child.id;
+      subagentRunsRepo.insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'project',
+        sourcePath: '/fake/explore.md',
+        sourceSha256: 'a'.repeat(64),
+        systemPrompt: 'You are explore.',
+        toolsWhitelist: [],
+        budgetMaxSteps: 5,
+        budgetMaxCostUsd: 0.1,
+      });
+      messagesRepo.appendMessage(db, {
+        sessionId: child.id,
+        role: 'user',
+        content: 'go',
+      });
+    } finally {
+      db.close();
+    }
+
+    const recordedRequests: Array<{ temperature?: number }> = [];
+    const recordingProvider: Provider = {
+      id: 'mock/m',
+      family: 'anthropic',
+      capabilities: {
+        tools: 'native',
+        cache: false,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 1000,
+        output_max_tokens: 100,
+        cost_per_1k_input: 0,
+        cost_per_1k_output: 0,
+        notes: [],
+      },
+      async *generate(req): AsyncGenerator<StreamEvent> {
+        recordedRequests.push(
+          req.temperature !== undefined ? { temperature: req.temperature } : {},
+        );
+        yield { kind: 'start', message_id: 'mock-msg' };
+        yield { kind: 'text_delta', text: 'done' };
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+
+    const exitCode = await runSubagentChild({
+      sessionId: childId,
+      dbPath,
+      providerOverride: recordingProvider,
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      // No temperature.
+      errSink: () => undefined,
+    });
+    expect(exitCode).toBe(0);
+    expect(recordedRequests.length).toBeGreaterThan(0);
+    expect(recordedRequests[0]?.temperature).toBeUndefined();
+  });
+
   test('non-existent session id surfaces a stderr line and exit 1', async () => {
     const errMessages: string[] = [];
     const exitCode = await runSubagentChild({

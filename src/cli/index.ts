@@ -34,7 +34,18 @@ const main = async (): Promise<number> => {
   // wiring failures.
   if (args.subagentSessionId !== undefined) {
     const { runSubagentChild } = await import('./subagent-child.ts');
-    return runSubagentChild({ sessionId: args.subagentSessionId });
+    return runSubagentChild({
+      sessionId: args.subagentSessionId,
+      // Pass the recursion depth carried across the subprocess
+      // boundary. Defaults to 0 (top-level shape) when omitted —
+      // older parent versions or programmatic callers that
+      // didn't supply the flag get the conservative default.
+      ...(args.subagentDepth !== undefined ? { depth: args.subagentDepth } : {}),
+      // Same shape for sampling temperature — undefined means
+      // "use provider default", explicit value pins the child's
+      // sampling for determinism.
+      ...(args.subagentTemperature !== undefined ? { temperature: args.subagentTemperature } : {}),
+    });
   }
 
   // Inspection / lifecycle modes don't need a prompt:

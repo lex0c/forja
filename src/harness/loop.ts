@@ -911,6 +911,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     // gate already refused `task` itself in plan mode,
                     // but a future bypass would still be contained.
                     ...(config.planMode === true ? { planMode: true } : {}),
+                    // Sampling temperature is also a run-wide property.
+                    // The harness uses it for its own provider calls
+                    // (line ~594); subagent runs MUST inherit so that
+                    // eval / automation pipelines pinning
+                    // temperature=0 see deterministic behavior across
+                    // the entire chain. Without this forward, the
+                    // subprocess child would silently fall back to
+                    // the provider default and break reproducibility.
+                    ...(config.temperature !== undefined
+                      ? { temperature: config.temperature }
+                      : {}),
                     // Increment depth: the child being spawned is one
                     // level deeper than this run.
                     depth: childDepth,
