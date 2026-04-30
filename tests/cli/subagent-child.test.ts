@@ -732,6 +732,143 @@ You are the worker.`,
     expect(recordedRequests[0]?.temperature).toBeUndefined();
   });
 
+  test('planMode flows through to the child harness gate (writes blocked)', async () => {
+    // Defense-in-depth: when the parent invoked runSubagent
+    // with planMode:true, the child's harness must reject any
+    // tool with planSafe:false BEFORE execution, even if the
+    // tool is in the whitelist.
+    //
+    // Test artifact disclosure: this fixture seeds the audit
+    // row with `tools_whitelist: ['bash']` directly via the
+    // repo, bypassing the parent's `assertWhitelistValidForSubagent`
+    // which would refuse `bash` (writes:true) without
+    // `isolation:'worktree'`. The child handler does NOT
+    // re-validate the whitelist — it trusts the audit row was
+    // produced by a properly-configured parent — so the test
+    // can invoke runSubagentChild directly with bash in scope.
+    // What the test PROVES is the harness gate behavior under
+    // planMode, which is the load-bearing property regardless
+    // of how bash got into the whitelist. A more production-
+    // shaped scenario (parent + worktree + write_file under
+    // planMode) would require real git fixtures and lands
+    // naturally with the worktree integration test in 4.2b.iii
+    // / .iv. For now, the gate-level coverage is sufficient.
+    //
+    // Mechanic: `bash` from builtins has `metadata.planSafe`
+    // as a predicate `(args) => args.read_only === true`. The
+    // provider emits `bash({ command: 'echo hi', read_only:
+    // false })` — under plan mode, the predicate returns false
+    // and the harness gate denies BEFORE execution. Without
+    // planMode propagation through the chain (CLI flag → child
+    // opts → harness config), the call would land status='done'
+    // and the assertion would fail.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    let childId: string;
+    const db = openDb(dbPath);
+    try {
+      migrate(db);
+      const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+      const child = sessionsRepo.createSession(db, {
+        model: 'mock/m',
+        cwd: dbDir,
+        parentSessionId: parent.id,
+      });
+      childId = child.id;
+      subagentRunsRepo.insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'runner',
+        scope: 'project',
+        sourcePath: '/fake/runner.md',
+        sourceSha256: 'a'.repeat(64),
+        systemPrompt: 'You are a runner.',
+        toolsWhitelist: ['bash'],
+        budgetMaxSteps: 5,
+        budgetMaxCostUsd: 0.0,
+        // Bypass policy so the only thing standing between the
+        // bash call and execution is plan mode.
+        policySnapshot: { defaults: { mode: 'bypass' }, tools: {} },
+      });
+      messagesRepo.appendMessage(db, {
+        sessionId: child.id,
+        role: 'user',
+        content: 'run a command',
+      });
+    } finally {
+      db.close();
+    }
+
+    let step = 0;
+    const provider: Provider = {
+      id: 'mock/m',
+      family: 'anthropic',
+      capabilities: {
+        tools: 'native',
+        cache: false,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 1000,
+        output_max_tokens: 100,
+        cost_per_1k_input: 0,
+        cost_per_1k_output: 0,
+        notes: [],
+      },
+      async *generate(): AsyncGenerator<StreamEvent> {
+        step++;
+        yield { kind: 'start', message_id: `m-${step}` };
+        if (step === 1) {
+          yield { kind: 'tool_use_start', id: 'tu1', name: 'bash' };
+          yield {
+            kind: 'tool_use_stop',
+            id: 'tu1',
+            final_args: { command: 'echo hi', read_only: false },
+          };
+          yield { kind: 'stop', reason: 'tool_use' };
+        } else {
+          yield { kind: 'text_delta', text: 'closed' };
+          yield { kind: 'stop', reason: 'end_turn' };
+        }
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+
+    const exitCode = await runSubagentChild({
+      sessionId: childId,
+      dbPath,
+      providerOverride: provider,
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      planMode: true,
+      errSink: () => undefined,
+    });
+    expect(exitCode).toBe(0);
+
+    // Bash call MUST land status='denied' (plan-mode gate
+    // rejected it). Without planMode propagation, the call
+    // would've reached status='done'.
+    const db2 = openDb(dbPath);
+    try {
+      const calls = db2
+        .query<{ status: string }, [string]>(
+          `SELECT tc.status AS status
+             FROM tool_calls tc
+             JOIN messages m ON tc.message_id = m.id
+            WHERE m.session_id = ? AND tc.tool_name = 'bash'`,
+        )
+        .all(childId);
+      expect(calls.length).toBeGreaterThan(0);
+      for (const row of calls) {
+        expect(row.status).toBe('denied');
+      }
+    } finally {
+      db2.close();
+    }
+  });
+
   test('non-existent session id surfaces a stderr line and exit 1', async () => {
     const errMessages: string[] = [];
     const exitCode = await runSubagentChild({

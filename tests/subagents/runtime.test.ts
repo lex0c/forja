@@ -620,6 +620,83 @@ describe('runSubagent — orchestration', () => {
     expect(captured.temperature).toBe(0);
   });
 
+  test('parent forwards planMode=true to spawn opts', async () => {
+    // Defense-in-depth path: a programmatic caller invoking
+    // runSubagent with planMode:true (or a future regression
+    // re-enabling task() under plan mode) MUST see the child
+    // harness gate writing tools too. Capture the spawn opts
+    // and assert the flag round-tripped.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const captured: { planMode?: boolean } = {};
+    const recordingSpawn: SpawnChildProcess = (opts) => {
+      if (opts.planMode === true) captured.planMode = opts.planMode;
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      setSubagentPayload(db, opts.sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'ok',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      });
+      return { exited: Promise.resolve({ exitCode: 0 }), kill: () => undefined };
+    };
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      planMode: true,
+      spawnChildProcess: recordingSpawn,
+    });
+    expect(captured.planMode).toBe(true);
+  });
+
+  test('planMode stays absent in spawn opts when input omits it', async () => {
+    // Default behavior: omitting planMode at the input should
+    // omit the spawn-opts key — same shape as temperature.
+    // Locks the absent-by-default semantics so a future
+    // regression doesn't silently inject planMode=true.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    let observedKey = false;
+    const recordingSpawn: SpawnChildProcess = (opts) => {
+      observedKey = 'planMode' in opts;
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      setSubagentPayload(db, opts.sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'ok',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      });
+      return { exited: Promise.resolve({ exitCode: 0 }), kill: () => undefined };
+    };
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      // no planMode
+      spawnChildProcess: recordingSpawn,
+    });
+    expect(observedKey).toBe(false);
+  });
+
   test('temperature stays undefined in spawn opts when input omits it', async () => {
     // Default behavior: no temperature pinned at the input
     // means the child falls through to the provider default.

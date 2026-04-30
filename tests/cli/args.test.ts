@@ -435,6 +435,39 @@ describe('--subagent-temperature', () => {
   });
 });
 
+describe('--subagent-plan-mode', () => {
+  test('presence-only flag sets args.subagentPlanMode = true', () => {
+    const r = parseArgs(['--subagent-plan-mode']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentPlanMode).toBe(true);
+  });
+
+  test('absent by default — child runs without plan-mode gate', () => {
+    const r = parseArgs(['hi']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentPlanMode).toBeUndefined();
+  });
+
+  test('coexists with --subagent-session-id and --subagent-depth', () => {
+    // The internal flags arrive together in the spawn command;
+    // the parser must accept any order.
+    const r = parseArgs([
+      '--subagent-session-id',
+      'abc',
+      '--subagent-depth',
+      '2',
+      '--subagent-plan-mode',
+    ]);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentSessionId).toBe('abc');
+    expect(r.args.subagentDepth).toBe(2);
+    expect(r.args.subagentPlanMode).toBe(true);
+  });
+});
+
 describe('usage', () => {
   test('mentions every recognized flag', () => {
     const u = usage();

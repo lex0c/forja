@@ -79,6 +79,18 @@ export interface ParsedArgs {
   // --subagent-session-id. When omitted the child runs at the
   // provider's default — same semantics as the top-level harness.
   subagentTemperature?: number;
+  // Plan-mode flag carried across the subprocess boundary.
+  // Presence = true (no value); absence = false. The top-level
+  // `task` tool gate (planSafe:false) refuses spawning under
+  // plan mode TODAY, so the practical user-visible scenario is
+  // closed at a higher layer. But: programmatic callers that
+  // invoke `runSubagent({ planMode: true })` directly bypass
+  // the top-level gate, AND a future regression flipping the
+  // task tool's planSafe back to true would reopen the surface.
+  // Forwarding here is defense in depth — the child's harness
+  // gate also refuses writes under planMode, so a write tool
+  // in the whitelist is doubly blocked.
+  subagentPlanMode?: boolean;
 }
 
 export interface ParseError {
@@ -279,6 +291,15 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         i += 2;
         break;
       }
+      case '--subagent-plan-mode':
+        // Presence-only flag (no value), mirroring `--plan`.
+        // Setting to false would require the absence form; we
+        // never need to pass a literal "false" because the
+        // child defaults to non-plan-mode when the flag isn't
+        // supplied.
+        args.subagentPlanMode = true;
+        i += 1;
+        break;
       case '--subagent-temperature': {
         const value = argv[i + 1];
         if (value === undefined) {

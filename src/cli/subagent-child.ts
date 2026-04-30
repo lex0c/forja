@@ -91,6 +91,16 @@ export interface SubagentChildOptions {
   // silently ignore the parent's temperature override and run
   // non-deterministically.
   temperature?: number;
+  // Plan-mode flag from the parent. Carried across via
+  // `--subagent-plan-mode` (presence-only). When true, the
+  // child's harness loop refuses any tool whose metadata
+  // declares `writes:true` (or `planSafe:false`) BEFORE
+  // execution — defense in depth that doubles up with the
+  // top-level task tool's planSafe:false gate. Without this
+  // propagation, a programmatic caller invoking runSubagent
+  // with planMode:true would see writing tools execute in the
+  // child unchecked.
+  planMode?: boolean;
 }
 
 // Build the envelope shape the parent's `runSubagent` expects to
@@ -379,6 +389,15 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // temperature=0 would see subprocess subagents silently
       // run at the provider default and break determinism.
       ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+      // Plan mode propagation. When the parent invoked
+      // runSubagent with planMode:true, the child's harness
+      // loop must reject every writing tool BEFORE execution —
+      // defense in depth that doubles up with the top-level
+      // `task` tool gate (planSafe:false). The conditional
+      // spread keeps the absent-by-default semantics: omitting
+      // the flag on the parent side leaves the child running
+      // with normal (non-plan) execution.
+      ...(opts.planMode === true ? { planMode: true } : {}),
       // Checkpoints stay off in 4.2b.ii.a — the worktree path
       // already provides a separate branch for changes; per-step
       // checkpoint chain inside the worktree lands in 4.2c.

@@ -159,6 +159,17 @@ export interface SpawnChildProcessOptions {
   // propagation, the subprocess child would silently fall back
   // to the provider default (~1.0) and break reproducibility.
   temperature?: number;
+  // Plan-mode propagation. Carried across via `--subagent-plan-mode`
+  // (presence-only flag). The top-level task tool gate already
+  // refuses spawning under plan mode (planSafe:false), so this
+  // is defense in depth: programmatic callers that invoke
+  // runSubagent directly with planMode:true, AND any future
+  // regression that flips the task tool gate, must still see
+  // the child's harness reject writing tools. Without this
+  // forward, the child runs without planMode and a write tool
+  // in its whitelist would execute. Boolean shape — undefined /
+  // false omits the flag, true emits it.
+  planMode?: boolean;
 }
 
 export type SpawnChildProcess = (opts: SpawnChildProcessOptions) => ChildProcessHandle;
@@ -249,6 +260,9 @@ const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
   ];
   if (opts.temperature !== undefined) {
     appendArgs.push('--subagent-temperature', String(opts.temperature));
+  }
+  if (opts.planMode === true) {
+    appendArgs.push('--subagent-plan-mode');
   }
   const cmd = resolveChildBinaryCmd({
     argv: Bun.argv,
@@ -716,6 +730,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       cwd: childCwd,
       depth,
       ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
+      ...(input.planMode === true ? { planMode: true } : {}),
     });
   } catch (e) {
     await cleanupOnFail();

@@ -45,6 +45,12 @@ const main = async (): Promise<number> => {
       // "use provider default", explicit value pins the child's
       // sampling for determinism.
       ...(args.subagentTemperature !== undefined ? { temperature: args.subagentTemperature } : {}),
+      // Plan-mode flag (presence-only). Forwards the parent's
+      // run-wide read-only profile so the child's harness gate
+      // refuses writing tools too — defense in depth for any
+      // programmatic caller that invokes runSubagent with
+      // planMode:true.
+      ...(args.subagentPlanMode === true ? { planMode: true } : {}),
     });
   }
 
