@@ -550,6 +550,15 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       ...(definition.budget.maxWallClockMs !== undefined
         ? { budgetMaxWallMs: definition.budget.maxWallClockMs }
         : {}),
+      // Snapshot the parent's resolved Policy so the subprocess
+      // child runs under the same authorization rules the parent
+      // validated. Without this, the child would re-resolve
+      // `.agent/permissions.yaml` etc. on its own startup; an
+      // edit between parent spawn and child read would diverge
+      // the rules mid-run. The engine exposes its underlying
+      // policy via `policy()`; that's the canonical source for
+      // this snapshot.
+      policySnapshot: input.permissionEngine.policy(),
     });
   } catch (e) {
     await cleanupOnFail();

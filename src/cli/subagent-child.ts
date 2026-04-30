@@ -1,5 +1,5 @@
 import { type HarnessResult, runAgent } from '../harness/index.ts';
-import { createPermissionEngine, resolvePolicy } from '../permissions/index.ts';
+import { createPermissionEngine } from '../permissions/index.ts';
 import { type Provider, createDefaultRegistry } from '../providers/index.ts';
 import {
   type DB,
@@ -12,6 +12,7 @@ import {
   openDb,
   setSubagentPayload,
 } from '../storage/index.ts';
+import { loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 
 // M3 / Step 4.2b.ii.a — subagent-child entry path.
@@ -60,9 +61,18 @@ export interface SubagentChildOptions {
   // instead of process.stderr. Tests collect the diagnostic
   // strings; production writes to the real stderr.
   errSink?: (s: string) => void;
-  // Test seams for permission hierarchy — same shape as bootstrap.
-  enterprisePolicyPath?: string | null;
-  userPolicyPath?: string | null;
+  // Note: NO `enterprisePolicyPath` / `userPolicyPath` test
+  // seams. Migration 015 moved policy resolution to the parent;
+  // the child reads the snapshot off `subagent_runs`. Tests
+  // that want a specific policy seed it via the parent's
+  // `insertSubagentRun(..., policySnapshot: ...)` call.
+  //
+  // Test seams for subagent discovery — same shape as bootstrap.
+  // `null` disables the layer entirely (useful for tests that
+  // shouldn't touch the host's ~/.config/agent or repo .agent
+  // directories).
+  userAgentsDir?: string | null;
+  projectAgentsDir?: string | null;
 }
 
 // Build the envelope shape the parent's `runSubagent` expects to
@@ -210,19 +220,17 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       provider = entry.factory();
     }
 
-    // Permission hierarchy resolution. Mirrors bootstrap so the
-    // child runs under the same policies the parent does — a
-    // child should NOT escape the user's permission rules just
-    // because it spawned in its own process. Locked sections,
-    // strict-mode defaults, etc. all carry over.
-    const resolved = resolvePolicy({
-      cwd: session.cwd,
-      ...(opts.enterprisePolicyPath !== undefined
-        ? { enterprisePath: opts.enterprisePolicyPath }
-        : {}),
-      ...(opts.userPolicyPath !== undefined ? { userPath: opts.userPolicyPath } : {}),
-    });
-    const permissionEngine = createPermissionEngine(resolved.policy, { cwd: session.cwd });
+    // Build the permission engine from the SNAPSHOT the parent
+    // persisted on subagent_runs (migration 015). We deliberately
+    // do NOT call `resolvePolicy(...)` here — re-resolving the
+    // .agent/permissions.yaml + enterprise + user layers would
+    // open a drift window: a human edit between parent spawn
+    // and child startup could run the child under different
+    // rules than the parent had validated. The snapshot
+    // collapses that window to zero — the rules are sealed at
+    // spawn time. Locked sections, strict-mode defaults,
+    // matched paths — all carry over byte-for-byte.
+    const permissionEngine = createPermissionEngine(audit.policySnapshot, { cwd: session.cwd });
 
     // The audit row carries the canonical toolset (`tools_whitelist`)
     // the parent pre-validated and committed. The child rebuilds
@@ -252,6 +260,40 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       childRegistry.register(tool);
     }
 
+    // Subagent discovery for nested task() calls. A coordinator-
+    // style subagent that whitelists `task` in its toolset must be
+    // able to spawn grandchildren the same way the top-level
+    // process does — without loading the registry here, the
+    // harness's spawn closure stays undefined and `task` surfaces
+    // `subagent.unavailable` for every invocation. Loading uses
+    // the same path as bootstrap (user + project scope, project
+    // wins on shadow). Validation runs against the full registry
+    // built above so a malformed definition fails fast with a
+    // structured envelope rather than a deferred runtime error.
+    let subagents: ReturnType<typeof loadSubagents>;
+    try {
+      subagents = loadSubagents({
+        cwd: session.cwd,
+        ...(opts.userAgentsDir !== undefined ? { userDir: opts.userAgentsDir } : {}),
+        ...(opts.projectAgentsDir !== undefined ? { projectDir: opts.projectAgentsDir } : {}),
+      });
+      validateSubagentSet(subagents.byName.values(), fullRegistry);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setSubagentPayload(db, opts.sessionId, {
+        status: 'error',
+        reason: 'subagent_load_failed',
+        output: '',
+        cost_usd: 0,
+        steps: 0,
+        duration_ms: 0,
+        message: msg,
+      });
+      envelopePublished = true;
+      errSink(`forja: subagent-child: subagent load failed: ${msg}\n`);
+      return 1;
+    }
+
     // Reconstruct the user prompt. The parent persists the prompt
     // as the first user-role message on the child session row;
     // the harness loop normally appends `userPrompt` after init,
@@ -274,6 +316,14 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     const config = {
       provider,
       toolRegistry: childRegistry,
+      // The grandchild's whitelist (when this child task()s a
+      // worker) validates against `rootToolRegistry`, NOT
+      // `toolRegistry` — a coordinator subagent narrowed to
+      // `[task]` would otherwise refuse a worker's `[read_file]`
+      // because read_file isn't in the coordinator's narrowed
+      // view. Mirrors the same plumbing the parent's
+      // `runSubagent` does at the top level.
+      rootToolRegistry: fullRegistry,
       permissionEngine,
       db,
       cwd: session.cwd,
@@ -286,6 +336,13 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         maxCostUsd: audit.budgetMaxCostUsd,
         ...(audit.budgetMaxWallMs !== null ? { maxWallClockMs: audit.budgetMaxWallMs } : {}),
       },
+      // Subagent registry forwarded so the child's `task` tool
+      // can resolve grandchild names. Without this, the harness
+      // loop's spawn closure stays undefined and every nested
+      // task() invocation surfaces `subagent.unavailable` —
+      // breaking coordinator-style chains that 4.2a supported
+      // in-process.
+      subagentRegistry: subagents,
       // Checkpoints stay off in 4.2b.ii.a — the worktree path
       // already provides a separate branch for changes; per-step
       // checkpoint chain inside the worktree lands in 4.2c.
@@ -293,6 +350,15 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // bgLogDir omitted: the validator + buildChildRegistry both
       // refuse `requiresBgManager` tools, so the surface is empty.
       // 4.2b.iv wires per-worktree bg logs.
+      //
+      // `subagentDepth` left at default 0. The depth counter
+      // doesn't yet propagate across the subprocess boundary —
+      // a chain of subprocess subagents could nest beyond
+      // MAX_SUBAGENT_DEPTH because each child starts at 0 from
+      // its own perspective. Per-subagent budget caps (steps,
+      // cost, wall-clock) bound the practical damage; rigorous
+      // depth forwarding lands with planMode/temperature in
+      // 4.2b.ii.b (likely via a new column on subagent_runs).
     };
 
     const result = await runAgent(config);

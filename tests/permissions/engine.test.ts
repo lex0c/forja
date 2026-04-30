@@ -288,3 +288,34 @@ describe('engine misc category', () => {
     expect(eng.check('todo_write', 'misc', {}).kind).toBe('allow');
   });
 });
+
+describe('engine.policy() returns a deep copy', () => {
+  test('mutating the returned policy does NOT affect the engine', () => {
+    // Subagent runtime serializes the engine's policy into
+    // `subagent_runs.policy_snapshot` for the subprocess child.
+    // If `policy()` returned the captured reference, a caller
+    // could silently corrupt the engine's enforcement state by
+    // mutating any nested field. structuredClone defends.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['echo *'] } } }), {
+      cwd: CWD,
+    });
+    const snap = eng.policy();
+    // Verify the snapshot reflects the engine's state.
+    expect(snap.defaults.mode).toBe('strict');
+    expect(snap.tools.bash).toEqual({ allow: ['echo *'] });
+    // Mutate the snapshot at the deepest level a consumer could
+    // touch — top-level field, nested object, nested array.
+    snap.defaults.mode = 'bypass';
+    const bashRule = snap.tools.bash as { allow?: string[] };
+    if (bashRule.allow !== undefined) bashRule.allow.push('rm -rf /');
+    // Engine's enforcement is untouched. mode() still strict;
+    // the dangerous command is still denied.
+    expect(eng.mode()).toBe('strict');
+    expect(eng.check('bash', 'bash', { command: 'rm -rf /' }).kind).toBe('deny');
+    // A fresh `policy()` call returns the original shape — the
+    // mutation didn't leak back through the closure.
+    const snap2 = eng.policy();
+    expect(snap2.defaults.mode).toBe('strict');
+    expect(snap2.tools.bash).toEqual({ allow: ['echo *'] });
+  });
+});

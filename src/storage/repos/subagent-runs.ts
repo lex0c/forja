@@ -1,3 +1,4 @@
+import type { Policy } from '../../permissions/index.ts';
 import type { DB } from '../db.ts';
 
 export type SubagentScope = 'user' | 'project';
@@ -18,6 +19,17 @@ export interface SubagentRun {
   // Mirrors the optional field in SubagentBudget. Null when the
   // definition didn't declare a wall-clock cap.
   budgetMaxWallMs: number | null;
+  // Snapshot of the parent's resolved Policy at spawn time
+  // (migration 015). The subprocess child reads this and builds
+  // its permission engine from it directly — never re-resolves
+  // the policy yaml from disk. Closes the drift window where
+  // a human edit between parent spawn and child startup could
+  // have run the child under different rules than the parent
+  // validated. Null only on rows from BEFORE migration 015 (the
+  // ALTER TABLE seeded `'{}'` for those, which parses to an
+  // empty Policy → strict-mode defaults: maximally safe
+  // interpretation of "unknown policy").
+  policySnapshot: Policy;
   capturedAt: number;
 }
 
@@ -32,6 +44,7 @@ interface SubagentRunRow {
   budget_max_steps: number;
   budget_max_cost_usd: number;
   budget_max_wall_ms: number | null;
+  policy_snapshot: string;
   captured_at: number;
 }
 
@@ -50,6 +63,41 @@ const fromRow = (row: SubagentRunRow): SubagentRun => {
   } catch {
     tools = [];
   }
+  // Defensive parse on policy_snapshot. A corrupted or
+  // structurally-incomplete snapshot must NOT crash audit
+  // listings or — worse — let the child run under unrestricted
+  // permissions. The pre-migration `'{}'` default parses as
+  // an empty object that LACKS `defaults.mode` and `tools`,
+  // which would crash the engine on first check; we fill those
+  // missing required fields with strict-mode defaults.
+  // "Strict" is the safest interpretation of "snapshot
+  // structurally incomplete": deny everything by default.
+  let policySnapshot: Policy;
+  try {
+    const parsed = JSON.parse(row.policy_snapshot) as unknown;
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const obj = parsed as Record<string, unknown>;
+      const defaults =
+        obj.defaults !== undefined &&
+        obj.defaults !== null &&
+        typeof obj.defaults === 'object' &&
+        !Array.isArray(obj.defaults)
+          ? (obj.defaults as Policy['defaults'])
+          : { mode: 'strict' as const };
+      const tools =
+        obj.tools !== undefined &&
+        obj.tools !== null &&
+        typeof obj.tools === 'object' &&
+        !Array.isArray(obj.tools)
+          ? (obj.tools as Policy['tools'])
+          : {};
+      policySnapshot = { ...obj, defaults, tools } as Policy;
+    } else {
+      policySnapshot = { defaults: { mode: 'strict' }, tools: {} };
+    }
+  } catch {
+    policySnapshot = { defaults: { mode: 'strict' }, tools: {} };
+  }
   return {
     sessionId: row.session_id,
     name: row.name,
@@ -61,6 +109,7 @@ const fromRow = (row: SubagentRunRow): SubagentRun => {
     budgetMaxSteps: row.budget_max_steps,
     budgetMaxCostUsd: row.budget_max_cost_usd,
     budgetMaxWallMs: row.budget_max_wall_ms,
+    policySnapshot,
     capturedAt: row.captured_at,
   };
 };
@@ -76,22 +125,30 @@ export interface InsertSubagentRunInput {
   budgetMaxSteps: number;
   budgetMaxCostUsd: number;
   budgetMaxWallMs?: number;
+  // Optional only for backwards compatibility with older test
+  // fixtures and the rare programmatic caller. Production
+  // callers (the subagent runtime) MUST supply the parent's
+  // resolved Policy so the child runs under sealed rules.
+  // Omitting it persists `'{}'` which the read path falls back
+  // to strict-mode defaults — safe but maximally restrictive.
+  policySnapshot?: Policy;
   capturedAt?: number;
 }
 
 export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): SubagentRun => {
   const capturedAt = input.capturedAt ?? Date.now();
   const wallMs = input.budgetMaxWallMs ?? null;
-  // Serialize the whitelist as a JSON array. Same convention the
+  // Serialize the whitelist + policy as JSON. Same convention the
   // messages table uses for its `content` column — keep the
   // schema dumb, parse on read.
   const toolsJson = JSON.stringify(input.toolsWhitelist);
+  const policyJson = JSON.stringify(input.policySnapshot ?? {});
   db.query(
     `INSERT INTO subagent_runs
        (session_id, name, scope, source_path, source_sha256, system_prompt,
         tools_whitelist, budget_max_steps, budget_max_cost_usd,
-        budget_max_wall_ms, captured_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        budget_max_wall_ms, policy_snapshot, captured_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     input.sessionId,
     input.name,
@@ -103,8 +160,16 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     input.budgetMaxSteps,
     input.budgetMaxCostUsd,
     wallMs,
+    policyJson,
     capturedAt,
   );
+  // Resolve the snapshot for the return value with the same
+  // strict fallback the read path uses, so callers get a
+  // consistent shape regardless of whether they supplied it.
+  const policySnapshot: Policy = input.policySnapshot ?? {
+    defaults: { mode: 'strict' },
+    tools: {},
+  };
   return {
     sessionId: input.sessionId,
     name: input.name,
@@ -116,6 +181,7 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     budgetMaxSteps: input.budgetMaxSteps,
     budgetMaxCostUsd: input.budgetMaxCostUsd,
     budgetMaxWallMs: wallMs,
+    policySnapshot,
     capturedAt,
   };
 };
@@ -134,7 +200,7 @@ export const getSubagentRun = (db: DB, sessionId: string): SubagentRun | null =>
     .query<SubagentRunRow, [string]>(
       `SELECT session_id, name, scope, source_path, source_sha256, system_prompt,
               tools_whitelist, budget_max_steps, budget_max_cost_usd,
-              budget_max_wall_ms, captured_at
+              budget_max_wall_ms, policy_snapshot, captured_at
          FROM subagent_runs
         WHERE session_id = ?`,
     )

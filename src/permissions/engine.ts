@@ -19,6 +19,16 @@ export interface PermissionEngine {
   check(toolName: string, category: PolicyCategory, args: ToolArgs): Decision;
   view(): PermissionsView;
   mode(): PolicyMode;
+  // Returns a deep copy of the resolved Policy this engine was
+  // built from. Subagent runtime persists the copy on
+  // `subagent_runs` so the subprocess child runs under the
+  // parent's exact policy even if `.agent/permissions.yaml`
+  // etc. are edited mid-run. The deep copy is defensive: a
+  // future caller mutating the returned object MUST NOT corrupt
+  // the engine's active enforcement state. Cost is negligible
+  // (typical policies are sub-10KB) compared to the latent-bug
+  // surface a shared reference would expose.
+  policy(): Policy;
 }
 
 // Loose shape used for argument-shape lookups. The engine reads only the
@@ -282,5 +292,18 @@ export const createPermissionEngine = (
 
   const view = (): PermissionsView => ({ mode });
 
-  return { check, view, mode: () => mode };
+  return {
+    check,
+    view,
+    mode: () => mode,
+    // Deep clone via structuredClone — the resolved Policy is
+    // pure data (parsed YAML), no functions or DOM references,
+    // so structuredClone is both correct and ~µs for realistic
+    // sizes. Returning the captured `policy` reference directly
+    // would let any caller silently mutate the engine's
+    // enforcement state. JSON.parse(JSON.stringify(...)) would
+    // also work but loses Date/Map shapes if a future Policy
+    // grows them; structuredClone preserves them.
+    policy: () => structuredClone(policy),
+  };
 };

@@ -15,6 +15,140 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.2b.ii.a follow-up — policy snapshot
+
+The 4.2b.ii.a closing entry left M2 (policy drift between
+parent spawn and child read) as Pending, deferred to .ii.b.
+Closing it now in a follow-up because the cost is small (one
+column + one engine getter) and the race window is real:
+between the parent's `bootstrap()` (which calls `resolvePolicy`
++ `createPermissionEngine`) and the child's startup (which used
+to call `resolvePolicy` again), a human edit to
+`.agent/permissions.yaml` (or any layer above) could run the
+child under different rules than the parent had validated.
+Worst case: a tool the parent confirmed was allowed surfaces
+as denied (or vice versa) inside the same logical run.
+
+**Slice scope:**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/permissions/engine.ts` | UPDATED | New `PermissionEngine.policy()` returns a `structuredClone` of the captured Policy. Deep copy is defensive — a future caller mutating the result MUST NOT corrupt the engine's enforcement state. |
+| `src/storage/migrations/015-subagent-runs-policy.ts` | NEW | `ALTER TABLE subagent_runs ADD COLUMN policy_snapshot TEXT NOT NULL DEFAULT '{}'`. Pre-015 rows get the empty-object default; the read path patches in strict-mode defaults so a pre-migration row falls through to maximally restrictive interpretation. |
+| `src/storage/repos/subagent-runs.ts` | UPDATED | `SubagentRun.policySnapshot: Policy` field. `insertSubagentRun` accepts `policySnapshot?: Policy`. Defensive read parse fills `defaults.mode='strict'` and `tools={}` when shape is structurally incomplete (corruption or pre-015). |
+| `src/subagents/runtime.ts` | UPDATED | `runSubagent` persists `input.permissionEngine.policy()` on the audit row before spawn. Uses the engine's getter — no direct dependency on the resolver. |
+| `src/cli/subagent-child.ts` | UPDATED | Builds the permission engine from `audit.policySnapshot` directly. **Removed** the `resolvePolicy(...)` call entirely. Test seams `enterprisePolicyPath` / `userPolicyPath` removed (no longer meaningful — child doesn't read disk policy). |
+| Tests | NEW + UPDATED | `tests/permissions/engine.test.ts` (+1 — mutation on returned policy doesn't affect engine), `tests/cli/subagent-child.test.ts` (+3 — round-trip with bypass+sentinel snapshot, real-gate probe `bypass allows / strict denies`, pre-015 row falls back to strict). Tool-call status assertions probe the actual gate (read_file under bypass lands `done`, under strict lands `denied`) — not just round-trip. |
+
+**Decisions:**
+
+- **`PermissionEngine.policy()` returns a deep copy via
+  `structuredClone`, not the captured reference.** A shared
+  reference would let any caller mutate the engine's
+  enforcement state (e.g., flipping `defaults.mode` to
+  `bypass` on a strict engine). The cost is negligible
+  (~µs for sub-10KB policies); the latent-bug surface a
+  shared reference would expose is the relevant size.
+  `JSON.parse(JSON.stringify(...))` would also work but
+  loses Date/Map shapes if a future Policy type grows them;
+  structuredClone preserves them.
+- **Schema as `ALTER TABLE ... ADD COLUMN ... NOT NULL
+  DEFAULT '{}'`, not a parallel table.** The audit lives
+  with the rest of the run's snapshot (system_prompt,
+  tools_whitelist, budget). Splitting policy into its own
+  table would force a join on every forensic query for
+  zero gain — the row is 1:1 with subagent_runs anyway.
+  The `'{}'` default is the safe fallback for pre-migration
+  rows: parses as an empty object, the read path detects
+  the missing `defaults.mode` and patches in `'strict'`.
+  Strict is the maximally restrictive interpretation of
+  "policy snapshot unknown" — denies everything by default,
+  zero risk of accidentally elevating permissions.
+- **Read-path defensive parse fills missing required
+  fields with strict defaults.** `JSON.parse('{}')` yields
+  `{}` which lacks `defaults.mode` — calling
+  `engine.check()` on that crashes with `undefined is not
+  an object (evaluating 'policy.defaults.mode')`. The
+  parse path explicitly checks for the required Policy
+  shape (`defaults` object, `tools` object) and falls back
+  per-field to strict. Same defensive shape used for
+  `tools_whitelist` parse (migration 012).
+- **`subagent-child.ts` no longer calls `resolvePolicy`.**
+  The test seams `enterprisePolicyPath` / `userPolicyPath`
+  are gone — they made sense when the child re-resolved
+  disk; with the snapshot path they're dead. Tests that
+  want a specific policy seed it via the parent's
+  `insertSubagentRun(..., policySnapshot)` directly.
+- **`InsertSubagentRunInput.policySnapshot` is optional.**
+  Production callers (the runtime) MUST supply it; the
+  optional shape covers older test fixtures and rare
+  programmatic callers without breaking them. Omitting
+  serializes `'{}'` and falls back to strict on read —
+  safe but maximally restrictive.
+
+**Review fixes (pre-commit).** Self-review surfaced 1 medium
+(structuredClone) and 1 medium (real-gate probe). Both
+addressed in the same commit:
+
+- **M2 — `engine.policy()` returned a mutable reference.**
+  Latent bug for any future caller beyond `JSON.stringify`.
+  Fixed via `structuredClone`. Test asserts mutation on the
+  returned policy (top-level field, nested object, nested
+  array) does not affect engine `mode()` or `check()`
+  behavior; a fresh `policy()` call still returns the
+  original shape.
+- **M3 — bypass-vs-strict round-trip didn't probe actual
+  gate behavior.** A regression that silently substituted
+  the snapshot before engine creation would still pass a
+  round-trip-only test. Added a stronger probe: two
+  children with identical `read_file` tool_use scripts and
+  identical whitelists, differing only in `policySnapshot`.
+  Bypass child's tool_call lands `status='done'` (gate
+  passed); strict child's lands `status='denied'` (gate
+  denied). Same fixture, two snapshots, two outcomes —
+  proves the snapshot drives real enforcement.
+
+**Pending (deferred — not blocking):**
+
+- **M1 — `lockConflicts` not in snapshot.** `resolvePolicy`
+  returns `{ policy, layers, lockConflicts }`; the audit
+  persists only `policy`. Effects of locks ARE baked into
+  the resolved policy (enforcement is correct), but
+  forensic detail "which layer originated this rule?" is
+  lost. Could add a sibling `policy_audit` field with
+  `{ layers, lockConflicts }` in a future migration if the
+  forensic shape grows demand.
+- **m1 — `{ ...obj, defaults, tools }` carries unknown
+  top-level fields.** A snapshot with extra keys round-trips
+  unchanged; not a correctness issue but shape pollution.
+  Strict whitelist of known Policy keys would tighten;
+  defer until the Policy type stabilizes (currently the
+  type itself allows arbitrary additional sections per
+  future spec growth).
+- **m2 — Pre-015 rows store `'{}'` literally.** Raw
+  `SELECT policy_snapshot ...` shows `'{}'`; in-memory
+  reading yields strict-defaults Policy. Operator forensic
+  queries should know the divergence. Documented in the
+  migration comment + repo comment.
+- **m3 — No direct migration 015 test.** Cover via the
+  insert/get round-trip tests on the column. A
+  `PRAGMA table_info(subagent_runs)` assertion would lock
+  the schema shape explicitly; ~10 LOC, defer.
+
+**Verification:** `bun test` 1282 pass / 11 skip / 0 fail
+(+5 since `cfd60d0`: deep-clone test, snapshot round-trip,
+real-gate probe, pre-015 fallback, hermetic-test cleanup);
+`tsc --noEmit` clean; `biome check` clean.
+
+**Next:** M3 / Step 4.2b.ii.b — heartbeat writer in the
+child loop + parent-side stale-row poller + planMode/
+temperature forwarding via the audit row + parallel-children
+stress fixture. M2 from .ii.a review is now closed; M3 (stale
+'running' rows on parent crash) and M5 (concurrent spawns)
+remain for .ii.b.
+
+---
+
 ## [2026-04-30] M3 / Step 4.2b.ii.a — subprocess spawn (subagent isolation v1)
 
 The 4.2b.i closing entry left `subagent_outputs` schema in place
