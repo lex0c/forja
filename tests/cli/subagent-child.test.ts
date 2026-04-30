@@ -151,6 +151,78 @@ describe('runSubagentChild', () => {
     expect(errMessages.join('')).toMatch(/is not a subagent/);
   });
 
+  test('unknown session.model refuses loud (no silent fallback)', async () => {
+    // Cost attribution is per-model; running on a different
+    // provider than what's persisted on the session row corrupts
+    // both cost reporting and audit forensics. Earlier code
+    // silently substituted DEFAULT_MODEL_FALLBACK on a registry
+    // miss — that's exactly the drift we MUST refuse. The child
+    // publishes an unknown_model envelope and exits 1 so the
+    // parent's poller surfaces a clean error.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+    const db = openDb(dbPath);
+    let childId: string;
+    try {
+      migrate(db);
+      const parent = sessionsRepo.createSession(db, {
+        model: 'anthropic/claude-sonnet-4-6',
+        cwd: dbDir,
+      });
+      // Child session uses a model the default registry does
+      // NOT know — drift simulation. The parent could have
+      // registered it via its own providerOverride, but the
+      // child binary's registry won't have it.
+      const child = sessionsRepo.createSession(db, {
+        model: 'fictional/never-registered',
+        cwd: dbDir,
+        parentSessionId: parent.id,
+      });
+      childId = child.id;
+      subagentRunsRepo.insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'project',
+        sourcePath: '/fake/explore.md',
+        sourceSha256: 'a'.repeat(64),
+        systemPrompt: 'You are explore.',
+        toolsWhitelist: [],
+        budgetMaxSteps: 5,
+        budgetMaxCostUsd: 0.1,
+      });
+      messagesRepo.appendMessage(db, {
+        sessionId: child.id,
+        role: 'user',
+        content: 'find the README',
+      });
+    } finally {
+      db.close();
+    }
+    const errMessages: string[] = [];
+    // No providerOverride → falls into the registry-lookup path.
+    const exitCode = await runSubagentChild({
+      sessionId: childId,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      errSink: (s) => errMessages.push(s),
+    });
+    expect(exitCode).toBe(1);
+    expect(errMessages.join('')).toMatch(/unknown model fictional\/never-registered/);
+    // Envelope must be published so the parent's poller
+    // surfaces the failure as a tool error rather than
+    // hitting its own wall-clock timeout.
+    const db2 = openDb(dbPath);
+    try {
+      const out = getSubagentOutput(db2, childId);
+      expect(out?.payload?.status).toBe('error');
+      expect(out?.payload?.reason).toBe('unknown_model');
+    } finally {
+      db2.close();
+    }
+  });
+
   test('missing audit row refused with explicit diagnostic', async () => {
     // Create a child session WITHOUT the subagent_runs row — the
     // child has no way to discover its definition (system prompt,

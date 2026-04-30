@@ -4,6 +4,7 @@ import type { Provider } from '../providers/index.ts';
 import {
   type DB,
   appendMessage,
+  completeSession,
   createSession,
   getSubagentOutput,
   insertSubagentRun,
@@ -498,22 +499,37 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
 
   // Single guard around every pre-spawn write that can fail AND
   // the spawn itself. Any throw between session creation and the
-  // child handle being live cleans up the worktree on the way
-  // out — without this, an `appendMessage` failure (FK
-  // concurrent delete, schema drift) or a `Bun.spawn` failure
-  // (ENOENT, EACCES, out-of-fds) would leak the worktree dir
-  // and the agent branch with no audit record. The session row
-  // + subagent_runs row stay (they belong to the audit trail
-  // even on a failed spawn) but the worktree is reversible
-  // here, so we reverse it. Spawn-time throws additionally
-  // resolve to a `RunSubagentResult` instead of escaping —
-  // that's a child-side failure category, not a programmer
-  // error.
+  // child handle being live must:
+  //   1. Reverse the worktree (if created) — leaving it on disk
+  //      with no operator-visible audit is the worst outcome.
+  //   2. Finalize the child session row to status='error' so it
+  //      doesn't sit in 'running' forever. Without this,
+  //      `--list-sessions` shows phantom active subagents and
+  //      any operational logic that assumes only live runs are
+  //      'running' (e.g., a future stale-session sweeper) gets
+  //      misled. The harness normally finalizes via
+  //      `completeSession` inside `runAgent`, but we never reach
+  //      that path on a parent-side failure.
+  // The session row + subagent_runs row are kept (they belong to
+  // the audit trail even on a failed spawn) — only the
+  // worktree is reversible, and the session's terminal status
+  // is what the operator reads.
   const cleanupOnFail = async (): Promise<void> => {
     if (worktreeHandle !== undefined) {
       await cleanupWorktree({ handle: worktreeHandle, parentCwd: input.cwd }).catch(
         () => undefined,
       );
+    }
+    // Best-effort finalize. Swallow errors — the row may have
+    // been finalized concurrently by an outer purge, or
+    // `completeSession`'s status='running' guard may already
+    // have flipped (it shouldn't, since we never ran the loop).
+    // The audit value of leaving status='running' is far worse
+    // than the noise of a swallow here.
+    try {
+      completeSession(input.db, childSession.id, 'error', 0, true);
+    } catch {
+      // ignore
     }
   };
 
@@ -684,6 +700,29 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       };
       break;
     }
+  }
+
+  // Best-effort finalize the child session row. The 'payload'
+  // outcome already saw the child's harness call
+  // `completeSession` before publishing — the call here is a
+  // no-op for that path because `completeSession` filters on
+  // `status='running'` and a finalized row no longer matches.
+  // For the kill paths (`crashed`/`aborted`/`wall_clock`) the
+  // child was terminated before its harness could finalize,
+  // and without the call below the session row sits in
+  // 'running' indefinitely — phantom active sessions in
+  // `--list-sessions` and a misleading signal for any future
+  // stale-session sweeper. Mapping is lossless:
+  //   result.status ∈ { done, exhausted, error, interrupted }
+  // and that's exactly the terminal `SessionStatus` shape
+  // `completeSession` accepts. Wrapped in try/catch because
+  // the function throws when the row already finalized
+  // (concurrent purge, child raced to it) — that's a non-event,
+  // not an error to surface.
+  try {
+    completeSession(input.db, childSession.id, result.status, result.costUsd, true);
+  } catch {
+    // ignore — the row is already in a terminal state
   }
 
   // Attach worktree shape and any audit failure side-channel.

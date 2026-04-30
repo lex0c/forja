@@ -317,8 +317,14 @@ describe('runSubagent — orchestration', () => {
     expect(result.status).toBe('error');
     expect(result.reason).toBe('subprocess_crashed');
     // Even on crash the child session row + audit row stay
-    // intact for forensic queries.
-    expect(getSession(db, result.sessionId)).not.toBeNull();
+    // intact for forensic queries — but the row MUST be
+    // finalized to 'error', not left in 'running'. A child
+    // that crashes before its harness's completeSession
+    // would otherwise leak a phantom active session that
+    // --list-sessions surfaces as live forever.
+    const session = getSession(db, result.sessionId);
+    expect(session).not.toBeNull();
+    expect(session?.status).toBe('error');
     expect(getSubagentRun(db, result.sessionId)).not.toBeNull();
   });
 
@@ -351,6 +357,10 @@ describe('runSubagent — orchestration', () => {
     const signals = killed.map((k) => k.signal);
     expect(signals).toContain('SIGTERM');
     expect(signals).toContain('SIGKILL');
+    // Session row finalized to 'interrupted', not left in
+    // 'running'. The child was killed before its harness could
+    // call completeSession on its own.
+    expect(getSession(db, result.sessionId)?.status).toBe('interrupted');
   });
 
   test('caller abort → status=interrupted, reason=aborted, SIGTERM/SIGKILL escalation', async () => {
@@ -380,6 +390,9 @@ describe('runSubagent — orchestration', () => {
     expect(result.status).toBe('interrupted');
     expect(result.reason).toBe('aborted');
     expect(killed.map((k) => k.signal)).toContain('SIGTERM');
+    // Same finalization invariant as the wall-clock path:
+    // session row terminal, not 'running'.
+    expect(getSession(db, result.sessionId)?.status).toBe('interrupted');
   });
 
   test('whitelist typo throws (caller bug, not runtime status)', async () => {
@@ -544,21 +557,27 @@ describe('runSubagent — orchestration', () => {
     // The session row + audit row stay (the spawn happened
     // logically, just couldn't physically launch); operator's
     // forensic queries can still resolve them.
-    expect(getSession(db, result.sessionId)).not.toBeNull();
+    const session = getSession(db, result.sessionId);
+    expect(session).not.toBeNull();
     expect(getSubagentRun(db, result.sessionId)).not.toBeNull();
+    // Critical regression: the row MUST NOT stay in 'running'.
+    // A spawn-throw without finalization would leak a phantom
+    // active session into --list-sessions and any stale-row
+    // sweeper would be misled.
+    expect(session?.status).toBe('error');
   });
 
-  test('appendMessage failure cleans up worktree and rethrows (caller bug)', async () => {
+  test('appendMessage failure cleans up worktree, finalizes session, rethrows', async () => {
     // C2 fix: a throw between insertSubagentRun and spawn must
-    // not leak the worktree on disk. We force the failure by
+    // not leak the worktree on disk. Force the failure by
     // dropping the messages table mid-flight; the audit insert
     // runs against the intact subagent_runs table, then
     // appendMessage hits a missing-table error. The runtime
-    // cleans up the worktree and rethrows.
-    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
-      model: 'mock/m',
-      cwd: '/p',
-    });
+    // cleans up the worktree, finalizes the child session row
+    // to status='error' (so it doesn't sit in 'running' as a
+    // phantom active session), and rethrows.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: '/p' });
     db.exec('DROP TABLE messages');
     let threw = false;
     try {
@@ -577,6 +596,44 @@ describe('runSubagent — orchestration', () => {
       threw = true;
     }
     expect(threw).toBe(true);
+    // The child session row was created with parent_session_id
+    // set; it must have been finalized to 'error' on the way
+    // out of the failure path.
+    const children = sessionsRepo.listChildSessions(db, parent.id);
+    expect(children.length).toBe(1);
+    expect(children[0]?.status).toBe('error');
+  });
+
+  test('audit insert failure finalizes session before rethrowing', async () => {
+    // Same shape as the appendMessage path but earlier in the
+    // sequence: drop subagent_runs after createSession runs
+    // for the parent, BEFORE the runtime tries to insert. The
+    // runtime's catch must still finalize the child session row
+    // — the fact that the failure happens upstream of the
+    // worktree audit doesn't change the contract.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: '/p' });
+    db.exec('DROP TABLE subagent_runs');
+    let threw = false;
+    try {
+      await runSubagent({
+        definition: definition({ isolation: 'none' }),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: '/p',
+        spawnChildProcess: fakeSpawnDone(),
+      });
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+    const children = sessionsRepo.listChildSessions(db, parent.id);
+    expect(children.length).toBe(1);
+    expect(children[0]?.status).toBe('error');
   });
 
   test('signal aborted before exited resolves → reports aborted, not crashed', async () => {
@@ -621,6 +678,11 @@ describe('runSubagent — orchestration', () => {
     });
     expect(result.status).toBe('interrupted');
     expect(result.reason).toBe('aborted');
+    // Session row finalized to 'interrupted'. Child exited
+    // fast (SIGINT propagated via process group) before the
+    // parent's wait loop could even send a signal — but the
+    // post-wait finalization MUST still fire.
+    expect(getSession(db, result.sessionId)?.status).toBe('interrupted');
   });
 });
 

@@ -65,8 +65,6 @@ export interface SubagentChildOptions {
   userPolicyPath?: string | null;
 }
 
-const DEFAULT_MODEL_FALLBACK = 'anthropic/claude-sonnet-4-6';
-
 // Build the envelope shape the parent's `runSubagent` expects to
 // reconstruct. Mirrors the field set of `RunSubagentResult` but
 // flattened into a JSON-friendly object — the runtime parses it
@@ -171,12 +169,29 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // Resolve the provider. Use the model recorded on the
     // session row (the parent picked it at spawn time); this is
     // the only way we know which model the parent intended.
+    //
+    // No silent fallback to a default model. If the child's
+    // registry doesn't recognize `session.model`, refuse loud:
+    // running on a different provider than what's persisted
+    // on the row corrupts cost attribution (pricing is per-
+    // model) and breaks audit forensics ("which model was
+    // this run actually using?" must match `sessions.model`).
+    // Drift causes:
+    //   - Parent uses a model id only registered in its own
+    //     process (custom providerOverride during dev/eval)
+    //     and forgets to register it in the child path.
+    //   - Future model id rename where parent and child
+    //     binaries are out of sync (e.g., during a phased
+    //     rollout).
+    // Either case, the right behavior is to fail the run with
+    // a clear envelope and let the operator fix the
+    // misconfiguration.
     let provider: Provider;
     if (opts.providerOverride !== undefined) {
       provider = opts.providerOverride;
     } else {
       const registry = createDefaultRegistry();
-      const entry = registry.get(session.model) ?? registry.get(DEFAULT_MODEL_FALLBACK);
+      const entry = registry.get(session.model);
       if (entry === null) {
         const envelope = {
           status: 'error',
