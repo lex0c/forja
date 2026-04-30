@@ -297,6 +297,45 @@ describe('CheckpointManager — available mode', () => {
     expect(await Bun.file(join(repo, 'state.txt')).text()).toBe('D\n');
   });
 
+  test('purge self-heals session ref drift from prior failed rewrite', async () => {
+    // Reproduce the post-bug end state: setSessionRef failed during
+    // a previous retention rewrite, so the DB rows were updated to
+    // new git_refs but the session ref is still pointing at an
+    // older commit on the original chain. Aged rows that triggered
+    // the rewrite were already deleted, so no future purge would
+    // re-fire the rewrite branch — the orphan-ref sweep also skips
+    // because the session still has rows. Without self-heal, the
+    // divergence persists forever and aged commits stay reachable
+    // via the old chain.
+    //
+    // Simulation: take two snapshots (b is the latest, ref points
+    // at b). Manually rewind the ref to a's sha. Run purge with no
+    // aged rows. Expected: self-heal detects ref != latest survivor
+    // and moves the ref to b's sha.
+    await initRepoWithSeed(repo);
+    const mgr = createCheckpointManager({ db, cwd: repo, sessionId, available: true });
+    await writeFile(join(repo, 'a.txt'), 'A');
+    const a = await mgr.snapshot({ stepId: 'a', hadBash: false });
+    await writeFile(join(repo, 'a.txt'), 'B');
+    const b = await mgr.snapshot({ stepId: 'b', hadBash: false });
+    expect(a.gitRef).not.toBeNull();
+    expect(b.gitRef).not.toBeNull();
+    // Sanity: ref starts at b.
+    expect(await resolveRef(repo, sessionRef(sessionId))).toBe(b.gitRef as string);
+
+    // Simulate the failed-rewrite end state: ref at a (older),
+    // DB still has b as the latest survivor.
+    await runGit(repo, ['update-ref', sessionRef(sessionId), a.gitRef as string]);
+    expect(await resolveRef(repo, sessionRef(sessionId))).toBe(a.gitRef as string);
+
+    // Run a purge with retention=999 days — no rows age out, so the
+    // rewrite branch doesn't run. The self-heal sweep is the ONLY
+    // path that can fix the drift here.
+    await mgr.purge({ olderThanDays: 999 });
+
+    expect(await resolveRef(repo, sessionRef(sessionId))).toBe(b.gitRef as string);
+  });
+
   test('purge sweeps orphan refs whose DB rows are gone', async () => {
     await initRepoWithSeed(repo);
     const mgr = createCheckpointManager({ db, cwd: repo, sessionId, available: true });

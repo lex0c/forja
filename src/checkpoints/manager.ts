@@ -4,6 +4,7 @@ import {
   deleteCheckpoint,
   deleteCheckpointsBySession,
   getCheckpoint,
+  getLatestCheckpointBySession,
   insertCheckpoint,
   listCheckpointsBySession,
   listCheckpointsOlderThan,
@@ -320,9 +321,24 @@ class CheckpointManagerImpl implements CheckpointManager {
         }
       }
     }
-    // Also sweep refs that have NO matching row at all (orphaned by a
-    // prior manual DB wipe). Without this, a user who deleted the DB
-    // would carry stale refs around forever.
+    // Sweep session refs for two divergence shapes:
+    //
+    // 1. ORPHAN: ref exists but no DB rows reference its session.
+    //    Cause: manual DB wipe or a session whose rows aged out via
+    //    a prior purge that never reached the ref-delete branch.
+    //    Action: delete the ref.
+    //
+    // 2. DRIFT: ref points at a sha that doesn't match the latest
+    //    survivor's git_ref. Cause: a previous retention rewrite's
+    //    setSessionRef failed AFTER the DB updates landed (transient
+    //    ref lock, fs hiccup). Without recovery, aged commits stay
+    //    reachable through the old chain forever — the rewrite
+    //    branch above can't re-fire because the trigger (aged rows)
+    //    is already gone, and the orphan check below skips because
+    //    rows exist. Action: re-attempt setSessionRef to the new
+    //    sha; if the new commit was reclaimed by gc in the meantime,
+    //    leave alone (CLI restore surfaces a friendly hint pointing
+    //    at --checkpoints purge for that session).
     if (this.available) {
       try {
         const refs = await listSessionRefs(this.cwd);
@@ -338,13 +354,28 @@ class CheckpointManagerImpl implements CheckpointManager {
             }[]
           ).map((r) => r.session_id),
         );
-        for (const { sessionId } of refs) {
+        for (const { sessionId, sha: refSha } of refs) {
           if (!liveSessions.has(sessionId)) {
             try {
               await deleteSessionRef(this.cwd, sessionId);
             } catch {
               // ignored
             }
+            continue;
+          }
+          // Drift detection. The latest survivor's git_ref is what
+          // the ref SHOULD point at; any other sha means a prior
+          // ref-move failed.
+          const latest = getLatestCheckpointBySession(this.db, sessionId);
+          if (latest === null) continue;
+          if (latest.gitRef === refSha) continue;
+          try {
+            await setSessionRef(this.cwd, sessionId, latest.gitRef);
+          } catch {
+            // Move failed again — could be the new commit was gc'd
+            // (extremely rare; the rewrite would have been very
+            // recent), or another concurrent op is holding the ref
+            // lock. Either way the next purge will retry.
           }
         }
       } catch {
