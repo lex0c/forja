@@ -253,15 +253,13 @@ describe('runListSessions', () => {
     expect(text).toContain('$0.0010 +$0.1500');
   });
 
-  test('table mode annotates intermediate rows under --include-subagents', () => {
-    // Coverage gap from the prior pass: we asserted the annotation
-    // on top-level rows (depth=0) but never on a depth=1 row that
-    // is itself a parent of a billed grandchild. With the M1 fix
-    // that gates cumulative computation on depth=0, intermediate
-    // rows now echo cost_usd as cumulative_cost_usd — so the
-    // annotation should NOT render on the intermediate row even
-    // though the grandchild billed. This test locks the new
-    // contract.
+  test('table mode annotates intermediate rows with their own subtree cumulative', () => {
+    // Intermediate rows (depth>0 with their OWN descendants) must
+    // surface accurate cumulative — this is the correctness fix
+    // that replaced the prior "echo cost_usd at depth>0" shortcut.
+    // Without this, JSON consumers reading per-node rollups got
+    // child cost_usd reported as cumulative even when grandchildren
+    // billed, masking real spend.
     const parent = createSession(db, { model: 'mock/a', cwd: '/p', startedAt: 1000 });
     appendMessage(db, { sessionId: parent.id, role: 'user', content: 'p' });
     completeSession(db, parent.id, 'done', 0.001, true);
@@ -287,12 +285,13 @@ describe('runListSessions', () => {
       out: (s) => out.push(s),
     });
     const text = out.join('');
-    // Top-level row shows full subtree cumulative.
+    // Top-level row shows full subtree cumulative ($0.05 + $0.10).
     expect(text).toContain('$0.0010 +$0.1500');
-    // Intermediate (child) row shows ONLY its own cost — the
-    // grandchild is right below it in the listing, no need to
-    // re-annotate.
-    expect(text).toMatch(/\$0\.0500\s+ {2}↳/);
+    // Intermediate (child) row shows ITS OWN subtree cumulative
+    // ($0.10 from the grandchild) — this is the correctness fix.
+    expect(text).toContain('$0.0500 +$0.1000');
+    // Leaf grandchild has no descendants → no annotation, plain cost.
+    expect(text).toMatch(/\$0\.1000\s{2,}/);
   });
 
   test('table mode skips annotation when descendants billed zero', () => {
@@ -312,6 +311,60 @@ describe('runListSessions', () => {
     const text = out.join('');
     expect(text).toContain('$0.0010');
     expect(text).not.toContain('+$');
+  });
+
+  test('JSON cumulative_cost_usd includes descendants on intermediate (depth>0) rows', () => {
+    // Regression for the M1 fix that overcorrected — earlier
+    // `depth === 0 ? cumulative : own` underreported subtree
+    // cost on intermediate rows (parent → child → grandchild).
+    // JSON consumers doing programmatic per-node rollups (e.g.,
+    // billing reports filtered by subagent type) would see the
+    // child report only its own cost, missing the grandchild's
+    // contribution. Fix: cumulative computed for every node via
+    // post-order walk in fanSubtree.
+    const parent = createSession(db, { model: 'mock/a', cwd: '/p', startedAt: 1000 });
+    appendMessage(db, { sessionId: parent.id, role: 'user', content: 'p' });
+    completeSession(db, parent.id, 'done', 0.001, true);
+    const child = createSession(db, {
+      model: 'mock/a',
+      cwd: '/p',
+      parentSessionId: parent.id,
+      startedAt: 1100,
+    });
+    completeSession(db, child.id, 'done', 0.05, true);
+    const grandchild = createSession(db, {
+      model: 'mock/a',
+      cwd: '/p',
+      parentSessionId: child.id,
+      startedAt: 1200,
+    });
+    completeSession(db, grandchild.id, 'done', 0.1, true);
+
+    const out: string[] = [];
+    runListSessions({
+      json: true,
+      includeSubagents: true,
+      dbOverride: db,
+      out: (s) => out.push(s),
+    });
+    const rows = out
+      .join('')
+      .trim()
+      .split('\n')
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as { id: string; cost_usd: number; cumulative_cost_usd: number });
+    expect(rows).toHaveLength(3);
+    // Parent: own 0.001 + child 0.05 + grandchild 0.1 = 0.151
+    expect(rows[0]?.id).toBe(parent.id);
+    expect(rows[0]?.cumulative_cost_usd).toBeCloseTo(0.151, 9);
+    // Intermediate child: own 0.05 + grandchild 0.1 = 0.15
+    // Pre-fix this reported just 0.05 (own cost), masking the
+    // grandchild's contribution to the subtree.
+    expect(rows[1]?.id).toBe(child.id);
+    expect(rows[1]?.cumulative_cost_usd).toBeCloseTo(0.15, 9);
+    // Leaf grandchild: own = cumulative.
+    expect(rows[2]?.id).toBe(grandchild.id);
+    expect(rows[2]?.cumulative_cost_usd).toBeCloseTo(0.1, 9);
   });
 
   test('JSON output exposes subagent_run fingerprint for subagent rows', () => {

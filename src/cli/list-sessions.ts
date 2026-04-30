@@ -7,7 +7,6 @@
 import type { Session } from '../storage/index.ts';
 import {
   type DB,
-  cumulativeCostUsd,
   defaultDbPath,
   getSubagentRun,
   listChildSessions,
@@ -105,7 +104,7 @@ interface SessionListItem {
   subagent_run: { name: string; source_sha256: string } | null;
 }
 
-const buildItem = (s: Session, db: DB, depth: number): SessionListItem => {
+const buildItem = (s: Session, db: DB, depth: number, cumulativeCost: number): SessionListItem => {
   // First user message content. Sessions almost always have at
   // least one user message (the original prompt); the rare race
   // where listSessions runs before appendMessage just yields an
@@ -137,13 +136,12 @@ const buildItem = (s: Session, db: DB, depth: number): SessionListItem => {
     model: s.model,
     status: s.status,
     cost_usd: s.totalCostUsd,
-    // Cumulative is meaningful for top-level rows where the
-    // subtree is collapsed; for child rows the listing already
-    // shows every descendant separately when --include-subagents
-    // is on, so reporting cumulative there is redundant AND
-    // expensive (each row would trigger its own DFS walk, a real
-    // N+1 explosion at scale). For depth>0 we just echo cost_usd.
-    cumulative_cost_usd: depth === 0 ? cumulativeCostUsd(db, s.id) : s.totalCostUsd,
+    // Cumulative is the row's own cost plus its full subtree.
+    // Computed once per node by fanSubtree (post-order during the
+    // walk) so even intermediate subagent rows surface accurate
+    // rollups for JSON consumers — earlier we shortcut depth>0 to
+    // own cost only, which underreported any node with descendants.
+    cumulative_cost_usd: cumulativeCost,
     prompt_preview: preview,
     parent_session_id: s.parentSessionId,
     is_subagent: s.isSubagent,
@@ -153,26 +151,42 @@ const buildItem = (s: Session, db: DB, depth: number): SessionListItem => {
   };
 };
 
-// Walk a single root → descendants depth-first. Recursion is
-// bounded by MAX_SUBAGENT_DEPTH (4 levels) at spawn time. The
-// `seen` set is shared across multiple subtree calls within a
-// single listing (passed in by the caller) so a sibling parent
-// that somehow pointed at the same descendant doesn't re-emit it.
-// Defense in depth — a corrupt self-referential row would
-// otherwise deadlock the listing in an infinite loop. Order:
-// each parent immediately followed by its full subtree in DFS,
-// oldest sibling first (mirrors listChildSessions).
+// Walk a single root → descendants depth-first AND compute the
+// cumulative cost per node along the way (post-order sum). The
+// shared `seen` set protects against corrupt self-referential
+// rows (FK doesn't prevent them at write time) so we never
+// deadlock; visited-twice nodes contribute zero on the second
+// hit. Order: each parent immediately followed by its full
+// subtree in DFS, oldest sibling first.
+//
+// Cost shape: one `listChildSessions` query per node visited =
+// O(N) per subtree, replacing the prior O(N²) per-row
+// cumulativeCostUsd calls. The trade-off: the helper now owns
+// both the tree shape AND the cost rollup, but consumers (JSON
+// or table renderer) get accurate cumulative for every node
+// without paying per-row walks.
 const fanSubtree = (
   root: Session,
   db: DB,
   seen: Set<string>,
-): { session: Session; depth: number }[] => {
-  const out: { session: Session; depth: number }[] = [];
-  const visit = (s: Session, depth: number): void => {
-    if (seen.has(s.id)) return;
+): { session: Session; depth: number; cumulativeCost: number }[] => {
+  const out: { session: Session; depth: number; cumulativeCost: number }[] = [];
+  // Each visit appends a placeholder, recurses (filling
+  // descendants), then patches the placeholder's cumulative
+  // with own + sum of children's cumulatives. Returning the
+  // node's own cumulative lets the parent fold it in.
+  const visit = (s: Session, depth: number): number => {
+    if (seen.has(s.id)) return 0;
     seen.add(s.id);
-    out.push({ session: s, depth });
-    for (const child of listChildSessions(db, s.id)) visit(child, depth + 1);
+    const idx = out.length;
+    out.push({ session: s, depth, cumulativeCost: 0 });
+    let cumulative = s.totalCostUsd;
+    for (const child of listChildSessions(db, s.id)) {
+      cumulative += visit(child, depth + 1);
+    }
+    const slot = out[idx];
+    if (slot !== undefined) slot.cumulativeCost = cumulative;
+    return cumulative;
   };
   visit(root, 0);
   return out;
@@ -245,7 +259,15 @@ export const runListSessions = (options: ListSessionsOptions): number => {
     let items: SessionListItem[];
     let truncatedTopLevels = 0;
     if (options.includeSubagents !== true) {
-      items = parents.map((s) => buildItem(s, db, 0));
+      // Top-level only. Each parent still needs its full subtree's
+      // cumulative cost — fanSubtree walks the tree once and
+      // returns the root's accurate rollup, then we discard the
+      // descendant rows. Single walk per parent in O(N) total.
+      items = parents.map((s) => {
+        const subtree = fanSubtree(s, db, new Set<string>());
+        const root = subtree[0];
+        return buildItem(s, db, 0, root !== undefined ? root.cumulativeCost : s.totalCostUsd);
+      });
     } else {
       // Subtree-atomic truncation: include each parent's full
       // tree or none at all. Mid-tree cuts would hide a parent's
@@ -261,8 +283,8 @@ export const runListSessions = (options: ListSessionsOptions): number => {
           truncatedTopLevels = parents.length - parents.indexOf(parent);
           break;
         }
-        for (const { session, depth } of subtree) {
-          items.push(buildItem(session, db, depth));
+        for (const { session, depth, cumulativeCost } of subtree) {
+          items.push(buildItem(session, db, depth, cumulativeCost));
         }
       }
     }
