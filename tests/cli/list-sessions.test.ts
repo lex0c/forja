@@ -633,6 +633,87 @@ describe('runListSessions', () => {
     expect(err.join('')).toContain('1 more top-level session omitted');
   });
 
+  test('truncation hint counts ALL omitted parents, not just those in the fetched batch', () => {
+    // The fetch caps at `limit`, so a DB with N >> limit top-level
+    // sessions returns at most `limit` rows. Without the COUNT(*)
+    // fix, the omitted count was computed from `parents.length -
+    // parents.indexOf(parent)` which never exceeded `limit`,
+    // undercounting the real omission. Now an O(1) COUNT against
+    // the same predicate gives accurate diagnostics.
+    //
+    // Fixture: 30 top-level sessions, limit=5. The 5 newest fit
+    // (all leaf rows, no subagents). The hint must say "25
+    // omitted", not "0".
+    for (let i = 0; i < 30; i++) {
+      const s = createSession(db, { model: 'mock/a', cwd: '/p', startedAt: 1000 + i });
+      appendMessage(db, { sessionId: s.id, role: 'user', content: `p${i}` });
+    }
+    const out: string[] = [];
+    const err: string[] = [];
+    runListSessions({
+      json: true,
+      limit: 5,
+      dbOverride: db,
+      out: (s) => out.push(s),
+      err: (s) => err.push(s),
+    });
+    const lines = out
+      .join('')
+      .trim()
+      .split('\n')
+      .filter((l) => l.length > 0);
+    expect(lines).toHaveLength(5);
+    const errOut = err.join('');
+    expect(errOut).toContain('25 more top-level sessions omitted');
+    expect(errOut).toContain('limit=5');
+  });
+
+  test('truncation hint accuracy: --include-subagents path also uses total count', () => {
+    // Same correctness for the subagent-fan-out path: with N
+    // parents in DB but limit=K, we can only fetch K and only
+    // emit some subset of those. The hint must compare against N,
+    // not K, otherwise an --include-subagents listing that fits
+    // every fetched subtree would falsely claim no truncation
+    // when N > K.
+    //
+    // Fixture: 10 top-level (each with 1 child = 2 rows), limit=4.
+    // Two parents fit (4 rows). Eight remain — only 2 of those
+    // were even fetched (limit=4 fetches 4 parents), but the
+    // count must still report 8.
+    for (let i = 0; i < 10; i++) {
+      const parent = createSession(db, {
+        model: 'mock/a',
+        cwd: '/p',
+        startedAt: 1000 + i * 10,
+      });
+      appendMessage(db, { sessionId: parent.id, role: 'user', content: `p${i}` });
+      createSession(db, {
+        model: 'mock/a',
+        cwd: '/p',
+        parentSessionId: parent.id,
+        startedAt: 1001 + i * 10,
+      });
+    }
+    const out: string[] = [];
+    const err: string[] = [];
+    runListSessions({
+      json: true,
+      limit: 4,
+      includeSubagents: true,
+      dbOverride: db,
+      out: (s) => out.push(s),
+      err: (s) => err.push(s),
+    });
+    const lines = out
+      .join('')
+      .trim()
+      .split('\n')
+      .filter((l) => l.length > 0);
+    expect(lines).toHaveLength(4); // 2 parents × (1 self + 1 child)
+    const errOut = err.join('');
+    expect(errOut).toContain('8 more top-level sessions omitted');
+  });
+
   test('--include-subagents truncation: no err sink → silent (no throw)', () => {
     // The err sink is optional. When absent, truncation is silent
     // — the listing itself is already correct within the cap.

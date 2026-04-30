@@ -7,6 +7,7 @@
 import type { Session } from '../storage/index.ts';
 import {
   type DB,
+  countSessions,
   defaultDbPath,
   getSubagentRun,
   listChildSessions,
@@ -255,9 +256,15 @@ export const runListSessions = (options: ListSessionsOptions): number => {
     // top-level pool — the repo flag is for raw audit listings;
     // --include-subagents is the hierarchical view.
     const parents = listSessions(db, { limit });
+    // Total top-level count, ignoring `limit`. Drives the
+    // truncation hint accuracy: `parents.length` is at most
+    // `limit`, so a DB with 1000 top-level sessions and limit=20
+    // would otherwise undercount omissions to 20 max. The
+    // COUNT(*) query is O(1) given the index on is_subagent.
+    const totalTopLevel = countSessions(db);
 
     let items: SessionListItem[];
-    let truncatedTopLevels = 0;
+    let emittedTopLevels = 0;
     if (options.includeSubagents !== true) {
       // Top-level only. Each parent still needs its full subtree's
       // cumulative cost — fanSubtree walks the tree once and
@@ -268,6 +275,7 @@ export const runListSessions = (options: ListSessionsOptions): number => {
         const root = subtree[0];
         return buildItem(s, db, 0, root !== undefined ? root.cumulativeCost : s.totalCostUsd);
       });
+      emittedTopLevels = parents.length;
     } else {
       // Subtree-atomic truncation: include each parent's full
       // tree or none at all. Mid-tree cuts would hide a parent's
@@ -275,17 +283,22 @@ export const runListSessions = (options: ListSessionsOptions): number => {
       // than dropping the whole subtree. The cap is on the FINAL
       // row count, not just the top-level pool — a parent with
       // many children can fill the cap on its own.
+      //
+      // First-fit-stop semantics: emit subtrees in newest-first
+      // order until one wouldn't fit, then stop. Skip-on-overflow
+      // (try the next parent if this one's tree is too big) was
+      // considered but rejected — it produces non-monotonic
+      // listings (gaps in time when a newer subtree skipped) that
+      // are surprising in CLI output.
       items = [];
       const seen = new Set<string>();
       for (const parent of parents) {
         const subtree = fanSubtree(parent, db, seen);
-        if (items.length + subtree.length > limit) {
-          truncatedTopLevels = parents.length - parents.indexOf(parent);
-          break;
-        }
+        if (items.length + subtree.length > limit) break;
         for (const { session, depth, cumulativeCost } of subtree) {
           items.push(buildItem(session, db, depth, cumulativeCost));
         }
+        emittedTopLevels += 1;
       }
     }
 
@@ -296,10 +309,22 @@ export const runListSessions = (options: ListSessionsOptions): number => {
     // consumers parse stdout and stderr stays available for
     // advisory messages. The hint is purely informational; the
     // listing itself is already correct within the cap.
-    if (truncatedTopLevels > 0 && options.err !== undefined) {
-      const word = truncatedTopLevels === 1 ? 'session' : 'sessions';
+    //
+    // The omitted count compares against `totalTopLevel` (the full
+    // DB-side count) so it stays accurate even when `parents`
+    // itself was capped by `limit`. Two distinct cases produce a
+    // hint:
+    //   - subtree overflow during --include-subagents iteration
+    //     (we stopped before exhausting `parents`)
+    //   - DB has more top-level sessions than `limit` allowed us
+    //     to fetch in the first place
+    // Both fold into a single `omitted = total - emitted` figure.
+    const omitted = Math.max(0, totalTopLevel - emittedTopLevels);
+    if (omitted > 0 && options.err !== undefined) {
+      const word = omitted === 1 ? 'session' : 'sessions';
+      const reason = options.includeSubagents === true ? '--include-subagents' : 'listing';
       options.err(
-        `forja: --include-subagents truncated to fit limit=${limit}; ${truncatedTopLevels} more top-level ${word} omitted (re-run with --limit N to see them)\n`,
+        `forja: ${reason} truncated to fit limit=${limit}; ${omitted} more top-level ${word} omitted (re-run with --limit N to see them)\n`,
       );
     }
     return 0;

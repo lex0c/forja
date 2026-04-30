@@ -4,6 +4,7 @@ import type { DB } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
   completeSession,
+  countSessions,
   createSession,
   cumulativeCostUsd,
   getSession,
@@ -257,6 +258,35 @@ describe('sessions repo', () => {
     expect(all).toHaveLength(1);
     expect(all[0]?.id).toBe(child.id);
     expect(all[0]?.isSubagent).toBe(true);
+  });
+
+  test('countSessions: respects same filters as listSessions, ignores limit', () => {
+    // Companion to listSessions for the truncation hint in
+    // --list-sessions. The CLI needs to know the TOTAL count
+    // matching its filters so the omitted-from-listing figure is
+    // accurate. Filters (cwd, status, includeSubagents) must
+    // mirror listSessions; the limit is intentionally ignored.
+    const parent = createSession(db, { model: 'm', cwd: '/p' });
+    completeSession(db, parent.id, 'done', 0, true);
+    createSession(db, { model: 'm', cwd: '/p', parentSessionId: parent.id });
+    createSession(db, { model: 'm', cwd: '/q' });
+    // Default: top-level only (is_subagent=0). 2 rows match.
+    expect(countSessions(db)).toBe(2);
+    // Filter by cwd narrows further.
+    expect(countSessions(db, { cwd: '/p' })).toBe(1);
+    expect(countSessions(db, { cwd: '/q' })).toBe(1);
+    // Filter by status narrows on completion.
+    expect(countSessions(db, { status: 'done' })).toBe(1);
+    expect(countSessions(db, { status: 'running' })).toBe(1);
+    // Combined filters AND.
+    expect(countSessions(db, { cwd: '/p', status: 'done' })).toBe(1);
+    expect(countSessions(db, { cwd: '/q', status: 'done' })).toBe(0);
+    // includeSubagents flips the gate to count children too.
+    expect(countSessions(db, { includeSubagents: true })).toBe(3);
+  });
+
+  test('countSessions: returns 0 on empty DB', () => {
+    expect(countSessions(db)).toBe(0);
   });
 
   test('cumulativeCostUsd: leaf row returns its own cost', () => {

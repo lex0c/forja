@@ -159,6 +159,34 @@ export const listSessions = (db: DB, options: ListSessionsOptions = {}): Session
   return rows.map(fromRow);
 };
 
+// Total count of sessions matching the same filters as
+// `listSessions` but ignoring `limit`. Used by `--list-sessions`
+// to accurately report the truncation hint: `listSessions` itself
+// caps at `limit`, so the iterating code can't tell whether the
+// returned batch IS everything or whether the DB holds more rows
+// the cap excluded. A COUNT(*) against the same predicate fills
+// the gap in O(1) with the index migration 011 created.
+export const countSessions = (db: DB, options: Omit<ListSessionsOptions, 'limit'> = {}): number => {
+  const filters: string[] = [];
+  const params: string[] = [];
+  if (options.cwd !== undefined) {
+    filters.push('cwd = ?');
+    params.push(options.cwd);
+  }
+  if (options.status !== undefined) {
+    filters.push('status = ?');
+    params.push(options.status);
+  }
+  if (options.includeSubagents !== true) {
+    filters.push('is_subagent = 0');
+  }
+  const where = filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : '';
+  const row = db
+    .query<{ n: number }, string[]>(`SELECT COUNT(*) AS n FROM sessions ${where}`)
+    .get(...params);
+  return row?.n ?? 0;
+};
+
 // Sum of `total_cost_usd` for a root session and ALL its
 // descendants reachable via parent_session_id (DFS). Used by
 // `--list-sessions` so the user doesn't have to mentally sum
