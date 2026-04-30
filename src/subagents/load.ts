@@ -3,7 +3,12 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { projectAgentsDir, userAgentsDir } from './paths.ts';
-import type { SubagentBudget, SubagentDefinition, SubagentScope } from './types.ts';
+import type {
+  SubagentBudget,
+  SubagentDefinition,
+  SubagentIsolation,
+  SubagentScope,
+} from './types.ts';
 
 // Spec §11.1 + PLAYBOOKS.md §1.1: definitions are `.md` files with a
 // YAML frontmatter block delimited by `---` lines. The body below the
@@ -183,11 +188,18 @@ const parseDefinition = (
     throw new Error(`subagent ${sourcePath}: 'budget' is required`);
   }
   const budget = parseBudget(fm.budget, sourcePath);
+  const isolation = parseIsolation(fm.isolation, sourcePath);
   if (parsed.body.length === 0) {
     throw new Error(`subagent ${sourcePath}: body (system prompt) is empty`);
   }
 
-  const known: ReadonlySet<string> = new Set(['name', 'description', 'tools', 'budget']);
+  const known: ReadonlySet<string> = new Set([
+    'name',
+    'description',
+    'tools',
+    'budget',
+    'isolation',
+  ]);
   const meta: Record<string, unknown> = {};
   for (const k of Object.keys(fm)) {
     if (!known.has(k)) meta[k] = fm[k];
@@ -200,10 +212,26 @@ const parseDefinition = (
     budget,
     systemPrompt: parsed.body,
     scope,
+    isolation,
     sourcePath,
     sourceSha256,
     meta,
   };
+};
+
+// Parse the optional `isolation` frontmatter field. Defaults to
+// 'none' when absent so every Step 4.1 definition keeps its prior
+// behavior. Only 'none' and 'worktree' are accepted in 4.2 — any
+// other string fails loud at load time so a typo
+// (`isolation: worktee`) doesn't silently downgrade to no isolation.
+const parseIsolation = (raw: unknown, sourcePath: string): SubagentIsolation => {
+  if (raw === undefined) return 'none';
+  if (raw !== 'none' && raw !== 'worktree') {
+    throw new Error(
+      `subagent ${sourcePath}: 'isolation' must be 'none' or 'worktree' (got ${JSON.stringify(raw)})`,
+    );
+  }
+  return raw;
 };
 
 const readDir = (dir: string): string[] => {

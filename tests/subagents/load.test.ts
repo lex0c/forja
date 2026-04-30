@@ -233,6 +233,54 @@ budget: { max_steps: 1, max_cost_usd: 0 }
     expect(defCrlf.systemPrompt.length).toBeGreaterThan(0);
   });
 
+  test('isolation defaults to none when frontmatter omits the field', () => {
+    // Backward-compat invariant: every Step 4.1 definition must
+    // keep loading unchanged. The loader fills the new `isolation`
+    // field with 'none' so the validator/runtime treat the legacy
+    // shape exactly as before.
+    const def = loadSubagentFromString(VALID, 'user', '/p');
+    expect(def.isolation).toBe('none');
+  });
+
+  test("isolation: 'worktree' parses through to the typed field", () => {
+    const src = VALID.replace(
+      '---\nYou are an exploration subagent. Be concise.',
+      'isolation: worktree\n---\nYou are an exploration subagent. Be concise.',
+    );
+    const def = loadSubagentFromString(src, 'user', '/p');
+    expect(def.isolation).toBe('worktree');
+    // Known-fields surface — must NOT spill into meta. A typo in
+    // an `isolation`-adjacent key (e.g., `isolations`) would land
+    // in meta and silently downgrade the protection.
+    expect(def.meta.isolation).toBeUndefined();
+  });
+
+  test("isolation: 'none' parses (explicit form is identical to default)", () => {
+    const src = VALID.replace(
+      '---\nYou are an exploration subagent. Be concise.',
+      'isolation: none\n---\nYou are an exploration subagent. Be concise.',
+    );
+    const def = loadSubagentFromString(src, 'user', '/p');
+    expect(def.isolation).toBe('none');
+  });
+
+  test('isolation rejects any value other than none/worktree at load time', () => {
+    // Typos like `isolation: worktee` would silently downgrade to
+    // 'none' if the loader fell back on a default. Refuse loud at
+    // load time so the author finds the typo before any subagent
+    // with `write_file` ships unguarded.
+    const cases = ['worktee', 'subprocess', 'sandbox', '', 'true'];
+    for (const bad of cases) {
+      const src = VALID.replace(
+        '---\nYou are an exploration subagent. Be concise.',
+        `isolation: ${JSON.stringify(bad)}\n---\nYou are an exploration subagent. Be concise.`,
+      );
+      expect(() => loadSubagentFromString(src, 'user', '/p')).toThrow(
+        /'isolation' must be 'none' or 'worktree'/,
+      );
+    }
+  });
+
   test('captures sha256 of raw content (frontmatter + body)', () => {
     // Snapshot fingerprint contract: hash deterministic from
     // exact file bytes, not from parsed/normalized form. Two

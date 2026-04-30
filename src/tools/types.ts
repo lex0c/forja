@@ -154,6 +154,25 @@ export type SpawnSubagentResult =
       // tool can echo it in its envelope; the run's outcome
       // (status/reason/cost/etc.) is still authoritative.
       auditFailure?: { code: string; message: string };
+      // Worktree lifecycle outcome (spec §11.2). Present only
+      // when the spawned definition declared `isolation: worktree`.
+      // `dirty` distinguishes "the child wrote something we kept
+      // for inspection" (`preserved=true`) from "clean run, both
+      // worktree and branch were dropped" (`removed=true`). The
+      // calling tool surfaces these in its envelope so the parent
+      // model can act on the branch (merge/discard/PR).
+      worktree?: {
+        path: string;
+        branch: string;
+        dirty: boolean;
+        preserved: boolean;
+        removed: boolean;
+      };
+      // `git worktree add` itself failed before the child loop
+      // could start. Combined with `status='error'` /
+      // `reason='worktree_create_failed'` so non-`done` mapping
+      // catches it; the field is advisory detail for diagnostics.
+      worktreeError?: { code: string; message: string };
     };
 
 export interface Tool<I = unknown, O = unknown> {

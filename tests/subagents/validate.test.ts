@@ -11,6 +11,7 @@ const definition = (overrides: Partial<SubagentDefinition> = {}): SubagentDefini
   budget: { maxSteps: 1, maxCostUsd: 0 },
   systemPrompt: 'p',
   scope: 'user',
+  isolation: 'none',
   sourcePath: '/u/explore.md',
   sourceSha256: 'a'.repeat(64),
   meta: {},
@@ -59,7 +60,7 @@ describe('validateSubagentTools', () => {
     const reg = buildRegistry(tool('read_file', false), tool('write_file', true));
     const def = definition({ tools: ['read_file', 'write_file'] });
     expect(() => validateSubagentTools(def, reg)).toThrow(
-      /tool 'write_file' declares metadata.writes=true and cannot appear in subagent.tools\[\] in Step 4\.1/,
+      /tool 'write_file' declares metadata.writes=true and cannot appear in subagent.tools\[\] without 'isolation: worktree'/,
     );
   });
 
@@ -91,6 +92,50 @@ describe('validateSubagentTools', () => {
     const reg = buildRegistry(tool('read_file', false));
     const def = definition({ tools: [] });
     expect(() => validateSubagentTools(def, reg)).not.toThrow();
+  });
+
+  test("isolation: 'worktree' lifts the writes:true gate (writing tools accepted)", () => {
+    // The whole point of declaring worktree isolation: the child
+    // runs in a dedicated branch+tree so its writes can no longer
+    // pollute the parent. Without this gate-lift, no subagent
+    // could ever use write_file/edit_file/bash, defeating the
+    // worktree feature.
+    const reg = buildRegistry(tool('read_file', false), tool('write_file', true));
+    const def = definition({
+      tools: ['read_file', 'write_file'],
+      isolation: 'worktree',
+    });
+    expect(() => validateSubagentTools(def, reg)).not.toThrow();
+  });
+
+  test("isolation: 'worktree' still rejects unregistered tool names", () => {
+    // Worktree only changes the writes:true rule — the registry
+    // sanity check still applies. A typo in `tools[]` is a
+    // programmer error regardless of isolation strategy.
+    const reg = buildRegistry(tool('read_file', false));
+    const def = definition({
+      tools: ['read_file', 'grepp'],
+      isolation: 'worktree',
+    });
+    expect(() => validateSubagentTools(def, reg)).toThrow(
+      /tool 'grepp' is not registered with the active toolset/,
+    );
+  });
+
+  test("isolation: 'none' (default) keeps the writes:true refusal", () => {
+    // The legacy contract: no isolation declared (or explicit
+    // 'none') means writing tools are still refused. Locks in the
+    // Step 4.1 invariant against accidental regression when the
+    // worktree path expands.
+    const reg = buildRegistry(tool('write_file', true));
+    const defImplicit = definition({ tools: ['write_file'] });
+    expect(() => validateSubagentTools(defImplicit, reg)).toThrow(
+      /tool 'write_file' declares metadata\.writes=true/,
+    );
+    const defExplicit = definition({ tools: ['write_file'], isolation: 'none' });
+    expect(() => validateSubagentTools(defExplicit, reg)).toThrow(
+      /tool 'write_file' declares metadata\.writes=true/,
+    );
   });
 });
 

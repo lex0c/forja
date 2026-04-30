@@ -1,4 +1,7 @@
-import { beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { isAbsolute, join } from 'node:path';
 import type { CollectedStep } from '../../src/harness/collect.ts';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { Policy } from '../../src/permissions/index.ts';
@@ -8,6 +11,7 @@ import {
   createSession,
   getSession,
   getSubagentRun,
+  getSubagentWorktree,
   listChildSessions,
 } from '../../src/storage/index.ts';
 import { migrate } from '../../src/storage/migrate.ts';
@@ -145,6 +149,7 @@ const definition = (overrides: Partial<SubagentDefinition> = {}): SubagentDefini
   budget: { maxSteps: 5, maxCostUsd: 0.1 },
   systemPrompt: 'You are an exploration subagent.',
   scope: 'project',
+  isolation: 'none',
   sourcePath: '/fake/explore.md',
   sourceSha256: 'a'.repeat(64),
   meta: {},
@@ -413,6 +418,7 @@ describe('runSubagent', () => {
       budget: { maxSteps: 5, maxCostUsd: 0 },
       systemPrompt: 'You are the coordinator.',
       scope: 'project',
+      isolation: 'none',
       sourcePath: '/p/coord.md',
       sourceSha256: 'a'.repeat(64),
       meta: {},
@@ -424,6 +430,7 @@ describe('runSubagent', () => {
       budget: { maxSteps: 5, maxCostUsd: 0 },
       systemPrompt: 'You are the worker.',
       scope: 'project',
+      isolation: 'none',
       sourcePath: '/p/worker.md',
       sourceSha256: 'b'.repeat(64),
       meta: {},
@@ -725,5 +732,256 @@ describe('runSubagent', () => {
       depth: 0,
     });
     expect(result.status).toBe('done');
+  });
+});
+
+// Worktree isolation tests need a real git repo (so `git worktree
+// add` can succeed) and a real-FS write tool (so we can observe
+// that the child's mutations landed in the worktree, not in the
+// parent). We keep the fixtures local to this describe block so
+// the rest of the file stays in-memory.
+
+const runGit = async (cwd: string, args: string[]): Promise<void> => {
+  const proc = Bun.spawn({
+    cmd: ['git', '-C', cwd, ...args],
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: {
+      LC_ALL: 'C',
+      GIT_TERMINAL_PROMPT: '0',
+      PATH: process.env.PATH ?? '',
+      HOME: process.env.HOME ?? '',
+    },
+  });
+  const [, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(`git ${args.join(' ')} (${exitCode}): ${stderr}`);
+  }
+};
+
+// Real-FS write tool. Resolves the path against the call's cwd
+// (the harness threads it through ctx); `writes:true` so the
+// child-registry build refuses it without `isolation: worktree`,
+// and accepts it when worktree is declared. Mutates the actual
+// file so we can observe where the write landed.
+const realWriteTool: Tool = {
+  name: 'write_file',
+  description: 'real fs write',
+  inputSchema: {
+    type: 'object',
+    properties: { path: { type: 'string' }, content: { type: 'string' } },
+    required: ['path', 'content'],
+  },
+  metadata: { category: 'fs.write', writes: true, idempotent: false },
+  async execute(args, ctx) {
+    const { path, content } = args as { path: string; content: string };
+    const full = isAbsolute(path) ? path : join(ctx.cwd, path);
+    writeFileSync(full, content);
+    return { ok: true, path: full };
+  },
+};
+
+describe('runSubagent — worktree isolation', () => {
+  let parentRepo: string;
+  let worktreeRoot: string;
+
+  beforeEach(async () => {
+    parentRepo = mkdtempSync(join(tmpdir(), 'forja-rt-wt-parent-'));
+    worktreeRoot = mkdtempSync(join(tmpdir(), 'forja-rt-wt-root-'));
+    mkdirSync(parentRepo, { recursive: true });
+    await runGit(parentRepo, ['init', '-b', 'main']);
+    await runGit(parentRepo, ['config', 'user.email', 'test@example.com']);
+    await runGit(parentRepo, ['config', 'user.name', 'Test']);
+    writeFileSync(join(parentRepo, 'README.md'), '# parent\n');
+    await runGit(parentRepo, ['add', '.']);
+    await runGit(parentRepo, ['commit', '-m', 'init']);
+  });
+
+  afterEach(() => {
+    try {
+      rmSync(parentRepo, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+    try {
+      rmSync(worktreeRoot, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  });
+
+  test('clean child run → worktree removed, audit row=cleaned, no parent mutation', async () => {
+    // Definition declares worktree but the child's run only emits
+    // text; nothing on disk should change in the parent OR survive
+    // in the cache root after cleanup. The audit row records the
+    // outcome so an operator can prove the run happened.
+    const parent = createSession(db, { model: 'mock/m', cwd: parentRepo });
+    const result = await runSubagent({
+      definition: definition({
+        tools: ['echo'],
+        isolation: 'worktree',
+      }),
+      prompt: 'no-op task',
+      parentSessionId: parent.id,
+      provider: mockProvider([{ text: 'nothing to do', stop_reason: 'end_turn' }]),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: parentRepo,
+      worktreeRootDir: worktreeRoot,
+    });
+    expect(result.status).toBe('done');
+    const wt = result.worktree;
+    if (wt === undefined) throw new Error('expected worktree info on result');
+    expect(wt.dirty).toBe(false);
+    expect(wt.removed).toBe(true);
+    expect(wt.preserved).toBe(false);
+    expect(wt.path.startsWith(worktreeRoot)).toBe(true);
+    expect(wt.branch.startsWith('agent/')).toBe(true);
+    // Worktree gone from disk; parent README untouched.
+    expect(existsSync(wt.path)).toBe(false);
+    expect(existsSync(join(parentRepo, 'README.md'))).toBe(true);
+    // Audit row landed with terminal status='cleaned'.
+    const audit = getSubagentWorktree(db, result.sessionId);
+    expect(audit?.status).toBe('cleaned');
+    expect(audit?.path).toBe(wt.path);
+    expect(audit?.branch).toBe(wt.branch);
+  });
+
+  test('child wrote → worktree preserved, audit row=preserved, parent untouched', async () => {
+    // The whole point of worktree isolation: writes land on the
+    // worktree's branch, never on the parent's working tree. We
+    // ask the child to call write_file with a relative path; the
+    // tool resolves against ctx.cwd which the runtime sets to the
+    // worktree root.
+    const parent = createSession(db, { model: 'mock/m', cwd: parentRepo });
+    const result = await runSubagent({
+      definition: definition({
+        tools: ['write_file'],
+        isolation: 'worktree',
+      }),
+      prompt: 'create a file',
+      parentSessionId: parent.id,
+      provider: mockProvider([
+        {
+          text: '',
+          tool_uses: [
+            {
+              id: 'tu1',
+              name: 'write_file',
+              input: { path: 'subagent-output.txt', content: 'hello from child\n' },
+            },
+          ],
+          stop_reason: 'tool_use',
+        },
+        { text: 'wrote it', stop_reason: 'end_turn' },
+      ]),
+      parentToolRegistry: buildParentRegistry(realWriteTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: parentRepo,
+      worktreeRootDir: worktreeRoot,
+    });
+    expect(result.status).toBe('done');
+    const wt = result.worktree;
+    if (wt === undefined) throw new Error('expected worktree info on result');
+    expect(wt.dirty).toBe(true);
+    expect(wt.preserved).toBe(true);
+    expect(wt.removed).toBe(false);
+    // The file landed in the worktree, NOT in the parent.
+    expect(existsSync(join(wt.path, 'subagent-output.txt'))).toBe(true);
+    expect(existsSync(join(parentRepo, 'subagent-output.txt'))).toBe(false);
+    const audit = getSubagentWorktree(db, result.sessionId);
+    expect(audit?.status).toBe('preserved');
+  });
+
+  test('worktree create failure surfaces as run-failed, no session, no audit row', async () => {
+    // Force creation to fail by pointing the parent cwd at a
+    // non-git directory; createWorktree's `git worktree list`
+    // refuses upfront. The result must be a clean status='error'
+    // with reason='worktree_create_failed' and no surviving session.
+    const notRepo = mkdtempSync(join(tmpdir(), 'forja-rt-wt-notrepo-'));
+    try {
+      const parent = createSession(db, { model: 'mock/m', cwd: notRepo });
+      const result = await runSubagent({
+        definition: definition({
+          tools: ['echo'],
+          isolation: 'worktree',
+        }),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: mockProvider([{ text: 'never', stop_reason: 'end_turn' }]),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: notRepo,
+        worktreeRootDir: worktreeRoot,
+      });
+      expect(result.status).toBe('error');
+      expect(result.reason).toBe('worktree_create_failed');
+      expect(result.sessionId).toBe('');
+      expect(result.worktreeError).toBeDefined();
+      expect(result.worktreeError?.code).toBe('worktree_create_failed');
+      // No child session was created; parent stays the only one.
+      expect(listChildSessions(db, parent.id)).toEqual([]);
+    } finally {
+      rmSync(notRepo, { recursive: true, force: true });
+    }
+  });
+
+  test("isolation='worktree' lets a write_file definition run end-to-end", async () => {
+    // Regression: with isolation='worktree', the child-registry
+    // build no longer rejects writes:true; the run should reach
+    // status='done' instead of throwing at construction time.
+    // (Without worktree, the same definition throws — the
+    // `refuses writes:true` test in the prior describe locks that
+    // contract.)
+    const parent = createSession(db, { model: 'mock/m', cwd: parentRepo });
+    const result = await runSubagent({
+      definition: definition({
+        tools: ['write_file'],
+        isolation: 'worktree',
+      }),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]),
+      parentToolRegistry: buildParentRegistry(realWriteTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: parentRepo,
+      worktreeRootDir: worktreeRoot,
+    });
+    expect(result.status).toBe('done');
+    // The child didn't actually write, so cleanup removes the worktree.
+    expect(result.worktree?.removed).toBe(true);
+  });
+
+  test("isolation='none' keeps the worktree fields absent (no isolation surface leak)", async () => {
+    // Backward-compat invariant: a Step 4.1 definition that does
+    // NOT declare isolation must not gain a `worktree` field on
+    // its result. The presence of the field is the model's signal
+    // to act on the branch — leaking it on a non-isolated run
+    // would mislead the model into looking for a non-existent
+    // worktree.
+    const parent = createSession(db, { model: 'mock/m', cwd: parentRepo });
+    const result = await runSubagent({
+      definition: definition({ isolation: 'none' }),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: parentRepo,
+      worktreeRootDir: worktreeRoot,
+    });
+    expect(result.status).toBe('done');
+    expect(result.worktree).toBeUndefined();
+    expect(result.worktreeError).toBeUndefined();
+    expect(getSubagentWorktree(db, result.sessionId)).toBeNull();
   });
 });
