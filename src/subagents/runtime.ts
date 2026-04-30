@@ -5,7 +5,7 @@ import type { Provider } from '../providers/index.ts';
 import { type DB, insertSubagentRun, insertSubagentWorktree } from '../storage/index.ts';
 import { type Tool, type ToolRegistry, createToolRegistry } from '../tools/index.ts';
 import type { SubagentSet } from './load.ts';
-import type { SubagentDefinition } from './types.ts';
+import type { SubagentDefinition, WorktreeOutcome } from './types.ts';
 import {
   type CleanupResult,
   type WorktreeHandle,
@@ -60,6 +60,11 @@ const buildChildRegistry = (
     if (tool.metadata.writes === true && !allowWrites) {
       throw new Error(
         `subagent '${subagentName}': tool '${toolName}' declares metadata.writes=true and cannot appear in subagent.tools[] without 'isolation: worktree'. Bootstrap should have caught this; if you see it at runtime you're constructing the child registry without going through validateSubagentSet first.`,
+      );
+    }
+    if (tool.metadata.requiresBgManager === true) {
+      throw new Error(
+        `subagent '${subagentName}': tool '${toolName}' declares metadata.requiresBgManager=true; the 4.2a subagent runtime does not wire ctx.bgManager (deferred to 4.2b). Bootstrap should have caught this via validateSubagentSet.`,
       );
     }
     child.register(tool as Tool);
@@ -152,7 +157,11 @@ export interface RunSubagentResult {
   // failures the harness never sees, e.g. `worktree_create_failed`
   // when `git worktree add` itself errors before any session is
   // created. The calling tool surfaces the string verbatim — the
-  // model reads it for diagnostics, not for a switch.
+  // model reads it for diagnostics, not for a switch. The union
+  // is expected to grow as 4.2b adds subprocess-side failure
+  // modes (`heartbeat_timeout`, `ipc_failed`, etc.); consumers
+  // that branch on `reason` should match positively on known
+  // values and treat the rest as opaque diagnostic text.
   reason: HarnessResult['reason'] | 'worktree_create_failed';
   // Cost the child incurred (per-run total). NOT rolled into the
   // parent's totalCostUsd at write time — that double-counts on
@@ -173,20 +182,10 @@ export interface RunSubagentResult {
   // present when storage is broken. Absent on the success path.
   auditFailure?: { code: string; message: string };
   // Worktree lifecycle outcome when the definition declared
-  // `isolation: worktree`. `dirty=true` means the child made
-  // changes (tracked or untracked diff after the run); the
-  // worktree is preserved on disk for the parent to inspect via
-  // `path` / `branch`. `dirty=false` and `removed=true` means the
-  // child made no changes — both the worktree and the throwaway
-  // branch were dropped. Absent for definitions with
-  // `isolation: none`. Mutually exclusive with `worktreeError`.
-  worktree?: {
-    path: string;
-    branch: string;
-    dirty: boolean;
-    preserved: boolean;
-    removed: boolean;
-  };
+  // `isolation: worktree`. Shape pinned in `WorktreeOutcome` so
+  // every consumer reads the same fields. Absent for definitions
+  // with `isolation: none`. Mutually exclusive with `worktreeError`.
+  worktree?: WorktreeOutcome;
   // Set when `git worktree add` itself failed before the child
   // run could start. The result also carries `status='error'` and
   // `reason='worktree_create_failed'` so non-`done` mapping in the
@@ -343,17 +342,43 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     ...(input.planMode === true ? { planMode: true } : {}),
   };
 
-  // bgLogDir omitted: subagents in Step 4.1 don't get bg tools
-  // unless they declare them in `tools` AND the parent registry
-  // has them. We honor the whitelist regardless, but without a
-  // bgLogDir the bg tools surface a clean error if invoked. That's
-  // intentional — bg processes from a child running in the
-  // parent's tree would mix with the parent's bg processes in the
-  // same log directory and the same `bg list` output. Worktree
-  // isolation (Step 4.2) is the right place to give children
-  // their own bg dir.
+  // bgLogDir omitted: subagents in 4.2a don't get a bg manager
+  // wired (the validator + child-registry build refuse any tool
+  // with `requiresBgManager:true` so the surface is empty
+  // anyway). 4.2b is where worktree subagents get their own bg
+  // log dir — co-mingling with the parent's bg processes in the
+  // same directory and `bg list` output is unsafe.
 
-  const result = await runAgent(childConfig);
+  // Wrap runAgent in try/finally so worktree cleanup ALWAYS runs.
+  // The harness's top-level catch is documented as exhaustive
+  // (every path returns HarnessResult), but a regression there
+  // would otherwise leak the worktree directory + agent branch on
+  // disk with no audit row to find them by. Defense in depth:
+  // even an uncaught throw drops both. We capture the throw and
+  // re-raise after cleanup so the caller still sees the original
+  // error — swallowing would hide a harness bug.
+  let result: HarnessResult;
+  let runAgentError: unknown;
+  try {
+    result = await runAgent(childConfig);
+  } catch (e) {
+    runAgentError = e;
+    // Best-effort cleanup of the worktree; we don't have a real
+    // session id (the throw escaped before/during createSession,
+    // OR after createSession but we can't trust the partial
+    // state), so no audit row gets written either. Operators
+    // discover the leak via filesystem walk in `agent worktree
+    // gc` (4.2d).
+    if (worktreeHandle !== undefined) {
+      try {
+        await cleanupWorktree({ handle: worktreeHandle, parentCwd: input.cwd });
+      } catch {
+        // cleanup itself promised non-throw, but swallowing here is
+        // a second layer of defense in case that contract drifts.
+      }
+    }
+    throw runAgentError;
+  }
   // Audit snapshot of the definition under which this child ran
   // (migration 012). Captured AFTER runAgent because the snapshot
   // FK targets sessions.id and the row is created inside the

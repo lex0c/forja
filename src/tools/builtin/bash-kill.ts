@@ -58,6 +58,10 @@ export const bashKillTool: Tool<BashKillInput, BashKillOutput> = {
     // any half-finished work it had in flight stays half-finished.
     escapesCwd: true,
     exec: true,
+    // Same as bash_background: the runtime dispatches through
+    // `ctx.bgManager`; without it every call surfaces the
+    // bgmanager-missing tool-error. Pulled forward to bootstrap.
+    requiresBgManager: true,
     idempotent: true, // re-killing an already-killed process is a no-op
     display: 'raw',
     cost: { latency_ms_typical: 100 },

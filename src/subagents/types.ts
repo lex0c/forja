@@ -32,6 +32,28 @@ export type SubagentScope = 'user' | 'project';
 // without touching the principal tree.
 export type SubagentIsolation = 'none' | 'worktree';
 
+// Outcome of a worktree-isolated subagent run. Mirrored verbatim by
+// `RunSubagentResult.worktree`, `SpawnSubagentResult` (kind='ran')
+// and `TaskOutput.worktree` so the model and operator see the same
+// shape at every layer. Single source of truth here so the three
+// surfaces can never drift.
+//
+// `dirty` is the post-run `git status --porcelain` verdict (true =
+// any tracked or untracked diff). It drives the preserve/remove
+// decision: clean → both worktree dir and agent branch dropped;
+// dirty → both kept on disk for the parent to inspect via `path` /
+// `branch`. `preserved` and `removed` are mutually exclusive
+// booleans, NOT a discriminated union, because the model reads
+// them positionally and an enum-tag plus a payload would force
+// every consumer through an extra switch.
+export interface WorktreeOutcome {
+  path: string;
+  branch: string;
+  dirty: boolean;
+  preserved: boolean;
+  removed: boolean;
+}
+
 export interface SubagentDefinition {
   // Kebab-case unique identifier. Project scope shadows user
   // scope; cross-scope name collision is reported as a precedence

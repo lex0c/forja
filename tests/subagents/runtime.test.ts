@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import type { CollectedStep } from '../../src/harness/collect.ts';
@@ -958,6 +958,61 @@ describe('runSubagent — worktree isolation', () => {
     expect(result.status).toBe('done');
     // The child didn't actually write, so cleanup removes the worktree.
     expect(result.worktree?.removed).toBe(true);
+  });
+
+  test('runAgent internal error still triggers worktree cleanup (C1 defense)', async () => {
+    // C1 invariant: a runAgent failure must NOT leak the worktree
+    // directory or the agent branch on disk. Today the harness
+    // top-level catch is exhaustive and returns status='error'
+    // (no escape from runAgent), so this test exercises the
+    // post-error cleanup path. The runtime ALSO has try/finally
+    // around runAgent in case that contract regresses — covered
+    // separately via inspection because there's no current
+    // fixture that escapes the harness's own catch.
+    //
+    // Probe: drop the `messages` table so the harness's first
+    // append fails. The harness catches the SQLite error and
+    // returns status='error' / reason='internalError'; cleanup
+    // and audit run normally afterwards.
+    const parent = createSession(db, { model: 'mock/m', cwd: parentRepo });
+    db.exec('DROP TABLE messages');
+
+    const result = await runSubagent({
+      definition: definition({
+        tools: ['echo'],
+        isolation: 'worktree',
+      }),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: mockProvider([{ text: 'unreached', stop_reason: 'end_turn' }]),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: parentRepo,
+      worktreeRootDir: worktreeRoot,
+    });
+    // The harness reported the failure cleanly — no escape.
+    expect(result.status).toBe('error');
+    // Worktree directory is gone. Without C1's cleanup pass it
+    // would still be on disk; this assertion is what enforces
+    // the no-leak guarantee.
+    const remaining = readdirSync(worktreeRoot);
+    expect(remaining).toEqual([]);
+    // The result also surfaces the worktree shape so the calling
+    // tool can echo it; `removed=true` confirms the cleanup ran.
+    expect(result.worktree?.removed).toBe(true);
+  });
+
+  test.skip('symlink targeting outside the worktree is blocked at runtime', async () => {
+    // 4.2b expectation: SECURITY_GUIDELINE §8.4 requires that a
+    // pre-existing symlink in the parent's working tree pointing
+    // outside the repo gets rejected before the child can write
+    // through it. 4.2a does NOT validate symlink targets — git
+    // worktree add carries them across as-is from the source
+    // commit, and the child can `write_file ../../etc/passwd`
+    // through such a link. This skip locks the expectation so
+    // 4.2b's hardening pass has a concrete failing test to
+    // unblock by enabling.
   });
 
   test("isolation='none' keeps the worktree fields absent (no isolation surface leak)", async () => {

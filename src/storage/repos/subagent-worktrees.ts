@@ -103,11 +103,19 @@ export const getSubagentWorktree = (db: DB, sessionId: string): SubagentWorktree
 };
 
 // Surface every worktree currently on disk according to the audit
-// table. Used by `agent worktree gc` (Step 4.2d) to enumerate
-// candidates; here in 4.2a, primarily for tests and for future
-// read-side tooling. Order: oldest first, so a sweep can act on
-// the longest-orphaned ones up front.
-export const listActiveSubagentWorktrees = (db: DB): SubagentWorktree[] => {
+// table — both `active` (the 4.2b subprocess path will use this
+// status while a child runs) and `preserved` (4.2a's "child wrote
+// something, kept for inspection"). 'cleaned' rows are excluded
+// because the worktree dir + branch were already dropped. Used by
+// `agent worktree gc` (Step 4.2d); here in 4.2a, primarily for
+// tests and future read-side tooling. Order: oldest first, so a
+// sweep can act on the longest-orphaned ones up front.
+//
+// The earlier name was `listActiveSubagentWorktrees`, which
+// suggested the result was scoped to the 'active' status. It
+// wasn't — the function returns everything not yet cleaned. The
+// rename makes the contract match the behavior.
+export const listOnDiskSubagentWorktrees = (db: DB): SubagentWorktree[] => {
   const rows = db
     .query<SubagentWorktreeRow, []>(
       `SELECT session_id, path, branch, status, created_at, cleaned_at

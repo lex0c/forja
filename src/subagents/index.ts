@@ -3,6 +3,7 @@ export type {
   SubagentDefinition,
   SubagentIsolation,
   SubagentScope,
+  WorktreeOutcome,
 } from './types.ts';
 export {
   branchName,

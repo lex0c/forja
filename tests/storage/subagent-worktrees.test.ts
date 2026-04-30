@@ -5,7 +5,7 @@ import { createSession } from '../../src/storage/repos/sessions.ts';
 import {
   getSubagentWorktree,
   insertSubagentWorktree,
-  listActiveSubagentWorktrees,
+  listOnDiskSubagentWorktrees,
 } from '../../src/storage/repos/subagent-worktrees.ts';
 
 let db: DB;
@@ -122,7 +122,7 @@ describe('subagent_worktrees repo', () => {
     ).toThrow();
   });
 
-  test('listActiveSubagentWorktrees enumerates non-cleaned rows oldest-first', () => {
+  test('listOnDiskSubagentWorktrees enumerates non-cleaned rows oldest-first', () => {
     // The sweep semantics for 4.2d depend on this ordering: the
     // longest-orphaned worktrees are surfaced first.
     const a = seedSession(seedSession().id);
@@ -149,7 +149,7 @@ describe('subagent_worktrees repo', () => {
       status: 'cleaned',
       createdAt: 50,
     });
-    const list = listActiveSubagentWorktrees(db);
+    const list = listOnDiskSubagentWorktrees(db);
     // 'cleaned' row excluded; remaining sorted by created_at ASC.
     expect(list.map((r) => r.sessionId)).toEqual([a.id, b.id]);
   });

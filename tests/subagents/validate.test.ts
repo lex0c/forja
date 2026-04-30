@@ -28,6 +28,25 @@ const tool = (name: string, writes: boolean): Tool => ({
   },
 });
 
+// Tool factory for `requiresBgManager` flag tests. Mirrors the
+// shape of `bash_background` (writes:true, requiresBgManager:true)
+// without depending on the real implementation — keeps the
+// validator test independent of bg-tool changes.
+const bgTool = (name: string): Tool => ({
+  name,
+  description: name,
+  inputSchema: { type: 'object' },
+  metadata: {
+    category: 'misc',
+    writes: true,
+    requiresBgManager: true,
+    idempotent: false,
+  },
+  async execute() {
+    return { ok: true };
+  },
+});
+
 const buildRegistry = (...tools: Tool[]) => {
   const r = createToolRegistry();
   for (const t of tools) r.register(t);
@@ -119,6 +138,76 @@ describe('validateSubagentTools', () => {
     });
     expect(() => validateSubagentTools(def, reg)).toThrow(
       /tool 'grepp' is not registered with the active toolset/,
+    );
+  });
+
+  test("rejects a requiresBgManager tool under isolation='worktree' (writes:true gate lifted, bg gate fires)", () => {
+    // C3 fix path under worktree: the writes:true refusal no
+    // longer applies (worktree contains the writes), but the
+    // bgmanager-missing gate must catch the same tool. The 4.2a
+    // runtime never wires ctx.bgManager for the child harness;
+    // pulling the failure forward to bootstrap saves the author
+    // a debugging round.
+    const reg = buildRegistry(bgTool('bash_background'));
+    const def = definition({ tools: ['bash_background'], isolation: 'worktree' });
+    expect(() => validateSubagentTools(def, reg)).toThrow(
+      /tool 'bash_background' declares metadata\.requiresBgManager=true/,
+    );
+  });
+
+  test("rejects a requiresBgManager+writes tool under isolation='none' via the writes gate (first fail)", () => {
+    // Under default isolation, the writes:true gate fires first
+    // (it's checked before the bgmanager gate in validate.ts).
+    // The end result is the same — the tool is refused — but
+    // the message points at the more fundamental problem
+    // (mutating tool needs isolation) rather than the bgmanager
+    // wiring. Lock the gate ordering so a refactor doesn't flip
+    // the error path silently.
+    const reg = buildRegistry(bgTool('bash_background'));
+    const def = definition({ tools: ['bash_background'], isolation: 'none' });
+    expect(() => validateSubagentTools(def, reg)).toThrow(
+      /tool 'bash_background' declares metadata\.writes=true/,
+    );
+  });
+
+  test('rejects a writes:false bg-only tool (e.g., bash_output) regardless of isolation', () => {
+    // bash_output has writes:false + requiresBgManager:true, so
+    // the writes gate doesn't fire. The bgmanager gate must catch
+    // it under both isolation modes. This is what protects a
+    // read-only subagent that whitelists bash_output without
+    // realizing the runtime can't dispatch it.
+    const readOnlyBg: Tool = {
+      name: 'bash_output',
+      description: 'read bg stdout',
+      inputSchema: { type: 'object' },
+      metadata: {
+        category: 'misc',
+        writes: false,
+        requiresBgManager: true,
+        idempotent: false,
+      },
+      async execute() {
+        return { ok: true };
+      },
+    };
+    const reg = buildRegistry(readOnlyBg);
+    for (const isolation of ['none', 'worktree'] as const) {
+      const def = definition({ tools: ['bash_output'], isolation });
+      expect(() => validateSubagentTools(def, reg)).toThrow(
+        /tool 'bash_output' declares metadata\.requiresBgManager=true/,
+      );
+    }
+  });
+
+  test('requiresBgManager error names the offending source path', () => {
+    const reg = buildRegistry(bgTool('bash_kill'));
+    const def = definition({
+      tools: ['bash_kill'],
+      isolation: 'worktree',
+      sourcePath: '/u/.config/agent/agents/runner.md',
+    });
+    expect(() => validateSubagentTools(def, reg)).toThrow(
+      /\(\/u\/\.config\/agent\/agents\/runner\.md\)/,
     );
   });
 

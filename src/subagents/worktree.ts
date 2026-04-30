@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -41,9 +41,13 @@ export const defaultWorktreeRoot = (env: NodeJS.ProcessEnv = process.env): strin
 // Slug a free-form user prompt into a kebab-cased fragment safe
 // for a git ref name. Collapses runs of non-alphanumerics, trims
 // leading/trailing dashes, and caps at MAX_SLUG_CHARS so the final
-// branch name stays readable. Empty input (or input that
-// sanitizes away to nothing) falls back to 'task' so we never
-// produce a refname like `agent/-<id>` which git would refuse.
+// branch name stays readable. Two fallback paths to 'task':
+//   - input that sanitizes to empty (`''`, `'!!!'`, all-whitespace)
+//   - input whose post-truncation tail is all dashes (rare: a 41+
+//     char string whose char-40 lands inside a `-`-only run, which
+//     the `replace(/-+$/g, '')` then collapses to empty)
+// The fallback prevents producing a refname like `agent/-<id>`
+// which git would refuse with "is not a valid ref name".
 const MAX_SLUG_CHARS = 40;
 export const slugify = (raw: string): string => {
   const lowered = raw.toLowerCase();
@@ -52,10 +56,14 @@ export const slugify = (raw: string): string => {
   return cleaned.slice(0, MAX_SLUG_CHARS).replace(/-+$/g, '') || 'task';
 };
 
-// Build the branch name git creates for the worktree. We embed
-// the first 8 chars of the session id so two runs with the same
-// prompt-derived slug never collide; the slug itself is for human
-// readability when running `git branch --list 'agent/*'`.
+// Build the branch name git creates for the worktree. The suffix
+// is the first 8 hex characters of the session UUID (after
+// stripping dashes), giving 16^8 ≈ 4.3 billion possible suffixes.
+// Birthday-collision threshold is ~65k branches before a 50% hit
+// — enough headroom for any plausible per-user workload, tight
+// enough that 100k+ branches in a CI fleet should switch to a
+// longer suffix. Slug + suffix together stay grep-friendly when
+// running `git branch --list 'agent/*'` from the parent repo.
 export const branchName = (sessionId: string, prompt: string): string => {
   const slug = slugify(prompt);
   const shortId = sessionId.replace(/-/g, '').slice(0, 8);
@@ -148,20 +156,53 @@ export interface WorktreeHandle {
 export const createWorktree = async (opts: CreateWorktreeOptions): Promise<WorktreeHandle> => {
   const root = opts.rootDir ?? defaultWorktreeRoot(opts.env);
   // Ensure the cache root exists with `0700`. mkdirSync with
-  // recursive:true is a no-op when the directory exists; chmod
-  // afterwards normalizes permissions even on pre-existing
-  // directories created by an unrelated process. We do NOT chmod
-  // ancestor directories — only our own root, so a user with a
-  // looser ~/.cache stays unaffected outside the agent subtree.
+  // recursive:true is a no-op when the directory exists (mode is
+  // ignored on the no-op path); chmod afterwards normalizes
+  // permissions on pre-existing directories created by an
+  // unrelated process. We do NOT chmod ancestor directories —
+  // only our own root, so a user with a looser ~/.cache stays
+  // unaffected outside the agent subtree.
+  //
+  // Race window: between mkdirSync (creates with the umask-derived
+  // mode if the dir didn't exist) and chmodSync there's a brief
+  // interval where another process could open the dir under the
+  // looser permissions. Real attack requires local filesystem
+  // access AND timing-precise opportunism — not a credible threat
+  // for a per-user cache. The post-chmod statSync below verifies
+  // the final mode and refuses the create if the perms are still
+  // group/other-readable, so the worktree never lands inside a
+  // permissively-mode'd root. Any caller-visible failure is the
+  // caller's cue to investigate (custom umask, restricted FS).
   mkdirSync(root, { recursive: true, mode: 0o700 });
   try {
     chmodSync(root, 0o700);
   } catch {
     // chmod failure (e.g., a remount with restricted ops) is
-    // non-fatal: the directory exists, the worktree create itself
-    // will succeed, and the user retains whatever permissions
-    // their system enforced. Log-noisy enough on stderr would
-    // require an event hook we don't wire here in 4.2a.
+    // non-fatal at this line — the post-chmod stat below decides
+    // whether the resulting mode is acceptable. Swallowing here
+    // keeps the failure mode singular: refused at the stat check,
+    // not at the chmod call.
+  }
+  // Verify the mode actually landed at 0700. On most filesystems
+  // the chmod above succeeds; on remounts that strip mode bits
+  // (network mounts, exotic permissions), or when the umask
+  // somehow won out, this catches the divergence before any
+  // worktree gets created underneath.
+  try {
+    const mode = statSync(root).mode & 0o777;
+    if (mode !== 0o700) {
+      throw new Error(
+        `worktree root '${root}' has mode ${mode.toString(8)} after chmod (expected 700); refusing to create worktree under group/other-readable cache. Fix the parent dir's permissions or override via WorktreeOptions.rootDir.`,
+      );
+    }
+  } catch (e) {
+    // statSync itself throwing is unusual (we just created the
+    // dir) but possible on a remount-mid-operation race; surface
+    // a wrapper error rather than the raw ENOENT/EACCES.
+    if (e instanceof Error && e.message.startsWith("worktree root '")) throw e;
+    throw new Error(
+      `worktree root '${root}' could not be stat'd after chmod: ${e instanceof Error ? e.message : String(e)}`,
+    );
   }
   const path = join(root, opts.sessionId);
   if (existsSync(path)) {
@@ -190,6 +231,31 @@ export const createWorktree = async (opts: CreateWorktreeOptions): Promise<Workt
   mkdirSync(dirname(path), { recursive: true });
   const add = await runGit(['worktree', 'add', path, '-b', branch], opts.parentCwd);
   if (add.exitCode !== 0) {
+    // `git worktree add` may have made it past the admin-state
+    // creation (`.git/worktrees/<id>/`) before failing on the
+    // working-tree checkout — disk-full mid-checkout is the
+    // canonical case. The retry on the same id would then trip
+    // on git's own "already registered" refusal even though our
+    // pre-check (`worktree list --porcelain`) had been clean,
+    // because git's view changed between the two calls. `git
+    // worktree prune` reconciles by dropping any admin entries
+    // whose working tree no longer exists. Best-effort: a prune
+    // failure doesn't change the outcome (we still propagate the
+    // original add error) but a successful prune lets the caller
+    // retry without manual intervention. We also rm the leaf
+    // dir if git left it behind partial — `--force` semantics
+    // would be wrong here because the dir might hold the user's
+    // own data if the path collision check above was bypassed
+    // somehow; this is best-effort rmSync against the dir we
+    // just attempted to create.
+    await runGit(['worktree', 'prune'], opts.parentCwd).catch(() => undefined);
+    if (existsSync(path)) {
+      try {
+        rmSync(path, { recursive: true, force: true });
+      } catch {
+        // leave it — operator's gc sweep handles persistent leftovers
+      }
+    }
     throw new Error(
       `git worktree add failed (exit ${add.exitCode}): ${add.stderr.trim() || add.stdout.trim()}`,
     );
