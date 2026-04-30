@@ -159,6 +159,44 @@ export const listSessions = (db: DB, options: ListSessionsOptions = {}): Session
   return rows.map(fromRow);
 };
 
+// Sum of `total_cost_usd` for a root session and ALL its
+// descendants reachable via parent_session_id (DFS). Used by
+// `--list-sessions` so the user doesn't have to mentally sum
+// per-row costs across a fan-out tree.
+//
+// Orphans (rows whose parent was purged → parent_session_id=NULL)
+// are NOT included: the FK link is the rollup channel, and a
+// purged parent has no live tree to walk. Their cost is still
+// recorded on the orphan row itself; an audit query that wants
+// "total spend including detached subagents" can iterate
+// listSessions({includeSubagents: true}) and sum directly.
+//
+// The seen-guard mirrors the listing's fanOut: defense in depth
+// against a corrupt self-referential row that the FK doesn't
+// prevent at write time. Without it, a self-loop would deadlock
+// the walk.
+export const cumulativeCostUsd = (db: DB, rootSessionId: string): number => {
+  const seen = new Set<string>();
+  let total = 0;
+  const visit = (id: string): void => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    const row = db
+      .query<{ total_cost_usd: number }, [string]>(
+        'SELECT total_cost_usd FROM sessions WHERE id = ?',
+      )
+      .get(id);
+    if (row === null) return;
+    total += row.total_cost_usd;
+    const children = db
+      .query<{ id: string }, [string]>('SELECT id FROM sessions WHERE parent_session_id = ?')
+      .all(id);
+    for (const c of children) visit(c.id);
+  };
+  visit(rootSessionId);
+  return total;
+};
+
 // Children of a parent session, oldest-first so renderers can show
 // the natural call order (a parent with two task() invocations sees
 // child[0] before child[1]). Used by --list-sessions hierarchy and

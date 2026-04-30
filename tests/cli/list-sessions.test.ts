@@ -190,6 +190,130 @@ describe('runListSessions', () => {
     expect(parsed[2]?.depth).toBe(1);
   });
 
+  test('JSON output always includes cumulative_cost_usd (leaf row equals own cost)', () => {
+    const s = createSession(db, { model: 'mock/a', cwd: '/p' });
+    appendMessage(db, { sessionId: s.id, role: 'user', content: 'p' });
+    completeSession(db, s.id, 'done', 0.0042, true);
+    const out: string[] = [];
+    runListSessions({ json: true, dbOverride: db, out: (s) => out.push(s) });
+    const item = JSON.parse(out[0] ?? '{}') as {
+      cost_usd: number;
+      cumulative_cost_usd: number;
+    };
+    expect(item.cost_usd).toBeCloseTo(0.0042, 9);
+    expect(item.cumulative_cost_usd).toBeCloseTo(0.0042, 9);
+  });
+
+  test('JSON cumulative_cost_usd sums parent + descendants', () => {
+    // O1 fix: user shouldn't have to mentally sum children's cost.
+    // Top-level row reports cumulative including subagents; the
+    // user reads spend at a glance without --include-subagents.
+    const parent = createSession(db, { model: 'mock/a', cwd: '/p' });
+    appendMessage(db, { sessionId: parent.id, role: 'user', content: 'p' });
+    completeSession(db, parent.id, 'done', 0.001, true);
+    const child = createSession(db, {
+      model: 'mock/a',
+      cwd: '/p',
+      parentSessionId: parent.id,
+    });
+    completeSession(db, child.id, 'done', 0.05, true);
+    const grandchild = createSession(db, {
+      model: 'mock/a',
+      cwd: '/p',
+      parentSessionId: child.id,
+    });
+    completeSession(db, grandchild.id, 'done', 0.1, true);
+    const out: string[] = [];
+    runListSessions({ json: true, dbOverride: db, out: (s) => out.push(s) });
+    const item = JSON.parse(out[0] ?? '{}') as {
+      cost_usd: number;
+      cumulative_cost_usd: number;
+    };
+    expect(item.cost_usd).toBeCloseTo(0.001, 9);
+    // 0.001 (parent) + 0.05 (child) + 0.1 (grandchild) = 0.151
+    expect(item.cumulative_cost_usd).toBeCloseTo(0.151, 9);
+  });
+
+  test('table mode annotates parent rows with descendant cost', () => {
+    // The table delta shows what the children added on top of the
+    // row's own spend. Format: "$0.0010 +$0.1500" (own + descendants).
+    // Rows with no billed descendants render plain ("$0.0010").
+    const parent = createSession(db, { model: 'mock/a', cwd: '/p' });
+    appendMessage(db, { sessionId: parent.id, role: 'user', content: 'p' });
+    completeSession(db, parent.id, 'done', 0.001, true);
+    const child = createSession(db, {
+      model: 'mock/a',
+      cwd: '/p',
+      parentSessionId: parent.id,
+    });
+    completeSession(db, child.id, 'done', 0.15, true);
+    const out: string[] = [];
+    runListSessions({ json: false, dbOverride: db, out: (s) => out.push(s) });
+    const text = out.join('');
+    expect(text).toContain('$0.0010 +$0.1500');
+  });
+
+  test('table mode annotates intermediate rows under --include-subagents', () => {
+    // Coverage gap from the prior pass: we asserted the annotation
+    // on top-level rows (depth=0) but never on a depth=1 row that
+    // is itself a parent of a billed grandchild. With the M1 fix
+    // that gates cumulative computation on depth=0, intermediate
+    // rows now echo cost_usd as cumulative_cost_usd — so the
+    // annotation should NOT render on the intermediate row even
+    // though the grandchild billed. This test locks the new
+    // contract.
+    const parent = createSession(db, { model: 'mock/a', cwd: '/p', startedAt: 1000 });
+    appendMessage(db, { sessionId: parent.id, role: 'user', content: 'p' });
+    completeSession(db, parent.id, 'done', 0.001, true);
+    const child = createSession(db, {
+      model: 'mock/a',
+      cwd: '/p',
+      parentSessionId: parent.id,
+      startedAt: 1100,
+    });
+    completeSession(db, child.id, 'done', 0.05, true);
+    const grandchild = createSession(db, {
+      model: 'mock/a',
+      cwd: '/p',
+      parentSessionId: child.id,
+      startedAt: 1200,
+    });
+    completeSession(db, grandchild.id, 'done', 0.1, true);
+    const out: string[] = [];
+    runListSessions({
+      json: false,
+      includeSubagents: true,
+      dbOverride: db,
+      out: (s) => out.push(s),
+    });
+    const text = out.join('');
+    // Top-level row shows full subtree cumulative.
+    expect(text).toContain('$0.0010 +$0.1500');
+    // Intermediate (child) row shows ONLY its own cost — the
+    // grandchild is right below it in the listing, no need to
+    // re-annotate.
+    expect(text).toMatch(/\$0\.0500\s+ {2}↳/);
+  });
+
+  test('table mode skips annotation when descendants billed zero', () => {
+    // Subagent rows that exist but didn't bill (zero cost) must
+    // not trigger the annotation — otherwise every parent of a
+    // free-mock subagent would render a misleading "+$0.0000".
+    const parent = createSession(db, { model: 'mock/a', cwd: '/p' });
+    appendMessage(db, { sessionId: parent.id, role: 'user', content: 'p' });
+    completeSession(db, parent.id, 'done', 0.001, true);
+    createSession(db, {
+      model: 'mock/a',
+      cwd: '/p',
+      parentSessionId: parent.id,
+    });
+    const out: string[] = [];
+    runListSessions({ json: false, dbOverride: db, out: (s) => out.push(s) });
+    const text = out.join('');
+    expect(text).toContain('$0.0010');
+    expect(text).not.toContain('+$');
+  });
+
   test('--include-subagents recursively walks the full descendant tree', () => {
     // Recursion contract: subagents can spawn subagents up to
     // MAX_SUBAGENT_DEPTH=4. The listing must surface all of them

@@ -15,6 +15,54 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.1 — close O1 (cost rollup) + O3 (flag validation)
+
+Two of the four "Pending" items from the prior review fix pass were
+cheap to close; doing them now keeps the deferral list honest about
+what's a real architectural debt vs. an oversight that just needed
+~30 LOC.
+
+**O1 — cumulative cost rollup in `--list-sessions`.**
+
+- New `cumulativeCostUsd(db, rootId)` helper in
+  `src/storage/repos/sessions.ts` walks parent → descendants via
+  `parent_session_id` (DFS with seen-guard against self-loops),
+  sums each row's `total_cost_usd`. Orphans are excluded by design
+  — the FK link is the rollup channel; an audit query that wants
+  detached spend iterates `listSessions({includeSubagents: true})`
+  directly.
+- Every `SessionListItem` now carries `cumulative_cost_usd`. JSON
+  output exposes it on every row. Table appends `+$Y.YYYY` after
+  the per-row cost when descendants billed > 0 (1e-9 tolerance for
+  FP noise), so the user reads "self vs descendants" at a glance
+  without summing per row. Cost column padding bumped to 20 to
+  fit the worst-case `$X.XXXX +$Y.YYYY` layout.
+- Five storage tests + three CLI tests cover: leaf row equals own,
+  multi-level fan-out, orphans don't roll up, unknown id returns 0,
+  self-referential row doesn't deadlock, JSON always carries the
+  field, table annotates only when descendants billed, table omits
+  the `+$0.0000` noise case.
+
+**O3 — `--include-subagents` standalone is now a parse error.**
+
+The flag was silently ignored without `--list-sessions` because no
+non-listing branch read it. Refusing at parse time gives the user
+feedback before bootstrap. Three lines in `src/cli/args.ts`, two
+tests in `tests/cli/args.test.ts`.
+
+**Why now:** both items had honest resolution paths and no spec
+discussion required. Leaving them in Pending would have rotted the
+gap-list as a meaningful "watch out for" signal — every item left
+there now is one with real architectural cost (O2 wants a permission
+shape decision; O4 wants a "budget propagation" semantics call) or
+a pull-trigger that hasn't fired (signing, sandbox).
+
+**Verification:** `bun test` 1160 pass / 10 skip / 0 fail (+10 new
+tests across storage + CLI); `tsc --noEmit` clean; `biome check`
+clean.
+
+---
+
 ## [2026-04-30] M3 / Step 4.1 — review fixes (post-self-review pass)
 
 Self-review on `bf2c4c9` surfaced 15 issues across 4 tiers — 3
@@ -128,25 +176,18 @@ clean; `biome check` clean.
 `anthropic/claude-haiku-4-5` (whitelist enforcement assertion now
 on `tc.status='done'` per M5).
 
-**Pending (deferred from review O1/O2/O3, not blocking 4.1):**
+**Pending (deferred from review O2/O4, not blocking 4.1):**
 
-- **O1 — cost rollup misleading in `--list-sessions`.** Parent
-  shows self-only spend; child rows show their own. User has to
-  mentally sum across rows. Resolution path: a query-time
-  `cumulativeCost(sessionId)` helper that walks
-  `listChildSessions` recursively + a `--show-cost-tree` (or
-  rollup column) on the listing. Add when cost cap lands in
-  `RunBudget` or when first user reports the gap.
+- ~~**O1 — cost rollup**~~ — closed in the [2026-04-30 O1+O3 pass]
+  entry below.
 - **O2 — no dedicated `subagent` permission category.** `task`
   routes through `'misc'`; an operator can't whitelist/blacklist
   subagents by name via `permissions.yaml`. Resolution: spec a
   `subagent` policy section (`allow: [name]`, `deny: [name]`,
   `locked`), add matcher, migrate the tool's `metadata.category`.
   Trigger: first request for org-level subagent gating.
-- **O3 — `--include-subagents` is silently ignored without
-  `--list-sessions`.** Cosmetic but surprising. Resolution:
-  parser-level validation that flags the unmatched flag pair, OR
-  doc-string on the help text. Either fits a quick polish PR.
+- ~~**O3 — `--include-subagents` standalone**~~ — closed in the
+  [2026-04-30 O1+O3 pass] entry above.
 - **O4 — subagent `maxCostUsd` is independent of parent's
   remaining budget.** Spec §11 endorses "budget próprio" so this
   is by design, but a parent with a tight cap can still be

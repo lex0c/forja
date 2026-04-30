@@ -210,6 +210,18 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
     }
   }
   args.prompt = promptParts.join(' ').trim();
+
+  // --include-subagents only makes sense paired with --list-sessions.
+  // Refuse the combination at parse time so the user gets a clear
+  // error instead of the flag being silently ignored when typed alone
+  // (which used to happen — the flag fell through to the run-mode
+  // branch where nothing read it).
+  if (args.includeSubagents && !args.listSessions) {
+    return {
+      ok: false,
+      message: '--include-subagents requires --list-sessions',
+    };
+  }
   return { ok: true, args };
 };
 
@@ -223,7 +235,7 @@ export const usage = (): string =>
     '  --json                 Emit NDJSON events to stdout (headless)',
     '  --plan                 Read-only mode: produce a plan, do not apply changes',
     '  --list-sessions        Print known sessions (newest first) and exit',
-    '  --include-subagents    With --list-sessions, fan parents into their subagent children',
+    '  --include-subagents    With --list-sessions, fan parents into their subagent children (requires --list-sessions)',
     '  --resume <id|last>     Continue a prior session; positional prompt is the follow-up',
     '  --undo <session>       Restore the latest checkpoint of a session',
     '  --checkpoints <cmd>    Checkpoint subcommands: list <session> | diff <session> <ckpt>',

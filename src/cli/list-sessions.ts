@@ -7,6 +7,7 @@
 import type { Session } from '../storage/index.ts';
 import {
   type DB,
+  cumulativeCostUsd,
   defaultDbPath,
   listChildSessions,
   listSessions,
@@ -68,6 +69,13 @@ interface SessionListItem {
   model: string;
   status: Session['status'];
   cost_usd: number;
+  // Sum of cost_usd for THIS row plus every descendant reachable
+  // via parent_session_id (orphans are excluded — see
+  // cumulativeCostUsd in repos/sessions.ts). Equal to cost_usd for
+  // leaf rows. Forensic field that frees the user from mentally
+  // summing children: a parent at $0.001 with two $0.10 subagents
+  // shows cumulative_cost_usd: 0.201.
+  cumulative_cost_usd: number;
   // Best-effort first-message preview for orientation. Empty
   // string when we can't extract a string content. We deliberately
   // only look at messages.role='user' to skip system/tool noise.
@@ -114,6 +122,13 @@ const buildItem = (s: Session, db: DB, depth: number): SessionListItem => {
     model: s.model,
     status: s.status,
     cost_usd: s.totalCostUsd,
+    // Cumulative is meaningful for top-level rows where the
+    // subtree is collapsed; for child rows the listing already
+    // shows every descendant separately when --include-subagents
+    // is on, so reporting cumulative there is redundant AND
+    // expensive (each row would trigger its own DFS walk, a real
+    // N+1 explosion at scale). For depth>0 we just echo cost_usd.
+    cumulative_cost_usd: depth === 0 ? cumulativeCostUsd(db, s.id) : s.totalCostUsd,
     prompt_preview: preview,
     parent_session_id: s.parentSessionId,
     is_subagent: s.isSubagent,
@@ -165,15 +180,31 @@ const writeTable = (items: SessionListItem[], out: (s: string) => void): void =>
   // worst case keeps the PROMPT column aligned regardless of which
   // depth shows up in any given row.
   const ID_WIDTH = 46;
-  out(`STARTED               STATUS       COST        ${'ID'.padEnd(ID_WIDTH)}  PROMPT\n`);
+  // COST column padding accommodates the worst case "$X.XXXX +$Y.YYYY"
+  // (17 chars) plus a 2-char gap before the ID column so rows like
+  // "$9.9999 +$9.9999" don't visually butt against the id.
+  const COST_WIDTH = 19;
+  out(
+    `STARTED               STATUS       ${'COST'.padEnd(COST_WIDTH)}${'ID'.padEnd(ID_WIDTH)}  PROMPT\n`,
+  );
   for (const it of items) {
     // Subagent rows render with N×"  " indent + "↳ " prefix where
     // N is the row's tree depth. Top-level rows render the bare id.
     const indent = it.depth > 0 ? `${'  '.repeat(it.depth)}↳ ` : '';
     const id = `${indent}${it.id}`.padEnd(ID_WIDTH);
     const status = it.status.padEnd(12);
-    const cost = `$${it.cost_usd.toFixed(4)}`.padEnd(11);
-    out(`${it.started_at}  ${status} ${cost} ${id}  ${it.prompt_preview}\n`);
+    // Show the descendant cost as a delta when a row has children
+    // that themselves billed. Threshold is `5e-5` (half of the
+    // last-shown digit at .toFixed(4)) so the annotation only
+    // surfaces when it would render as nonzero — pairs the cost
+    // gate with the format precision and avoids `+$0.0000` noise.
+    const descendants = it.cumulative_cost_usd - it.cost_usd;
+    const costStr =
+      descendants > 5e-5
+        ? `$${it.cost_usd.toFixed(4)} +$${descendants.toFixed(4)}`
+        : `$${it.cost_usd.toFixed(4)}`;
+    const cost = costStr.padEnd(COST_WIDTH);
+    out(`${it.started_at}  ${status} ${cost}${id}  ${it.prompt_preview}\n`);
   }
 };
 

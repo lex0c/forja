@@ -5,6 +5,7 @@ import { migrate } from '../../src/storage/migrate.ts';
 import {
   completeSession,
   createSession,
+  cumulativeCostUsd,
   getSession,
   listChildSessions,
   listSessions,
@@ -256,6 +257,86 @@ describe('sessions repo', () => {
     expect(all).toHaveLength(1);
     expect(all[0]?.id).toBe(child.id);
     expect(all[0]?.isSubagent).toBe(true);
+  });
+
+  test('cumulativeCostUsd: leaf row returns its own cost', () => {
+    const s = createSession(db, { model: 'm', cwd: '/p' });
+    updateSessionCost(db, s.id, 0.0042);
+    expect(cumulativeCostUsd(db, s.id)).toBeCloseTo(0.0042, 9);
+  });
+
+  test('cumulativeCostUsd: walks descendants and sums', () => {
+    // Tree: root → c1 → gc1
+    //              → c2
+    // Costs: root=$0.001, c1=$0.002, gc1=$0.003, c2=$0.004
+    // Sum: 0.010
+    const root = createSession(db, { model: 'm', cwd: '/p' });
+    updateSessionCost(db, root.id, 0.001);
+    const c1 = createSession(db, { model: 'm', cwd: '/p', parentSessionId: root.id });
+    updateSessionCost(db, c1.id, 0.002);
+    const gc1 = createSession(db, { model: 'm', cwd: '/p', parentSessionId: c1.id });
+    updateSessionCost(db, gc1.id, 0.003);
+    const c2 = createSession(db, { model: 'm', cwd: '/p', parentSessionId: root.id });
+    updateSessionCost(db, c2.id, 0.004);
+    expect(cumulativeCostUsd(db, root.id)).toBeCloseTo(0.01, 9);
+    // Sub-tree from c1: c1 + gc1 = 0.005
+    expect(cumulativeCostUsd(db, c1.id)).toBeCloseTo(0.005, 9);
+    // Leaf
+    expect(cumulativeCostUsd(db, gc1.id)).toBeCloseTo(0.003, 9);
+  });
+
+  test('cumulativeCostUsd: orphan with surviving descendants still rolls them up', () => {
+    // The orphan exclusion is about NOT rolling the orphan's
+    // cost up to its (deleted) parent — the FK link is gone.
+    // Walking DOWNWARD from the orphan still works because the
+    // grandchild's parent_session_id points at the orphan, which
+    // exists. Without this test, a future "orphan exclusion"
+    // refactor that filters by parent_session_id IS NOT NULL on
+    // the orphan itself would silently break the rollup.
+    const parent = createSession(db, { model: 'm', cwd: '/p' });
+    const orphan = createSession(db, { model: 'm', cwd: '/p', parentSessionId: parent.id });
+    updateSessionCost(db, orphan.id, 0.01);
+    const grandchild = createSession(db, {
+      model: 'm',
+      cwd: '/p',
+      parentSessionId: orphan.id,
+    });
+    updateSessionCost(db, grandchild.id, 0.02);
+    db.query('DELETE FROM sessions WHERE id = ?').run(parent.id);
+    // Walking from the orphan: orphan + grandchild = 0.03.
+    expect(cumulativeCostUsd(db, orphan.id)).toBeCloseTo(0.03, 9);
+  });
+
+  test('cumulativeCostUsd: orphans (parent purged) do NOT count', () => {
+    // FK is the rollup channel. After the parent is deleted the
+    // child's parent_session_id goes NULL via SET NULL — there's
+    // no live tree to walk from the (now-gone) root. The orphan's
+    // cost stays on its own row but doesn't roll up to anyone.
+    // An audit pass that wants total spend including detached
+    // children iterates listSessions({includeSubagents:true})
+    // directly.
+    const parent = createSession(db, { model: 'm', cwd: '/p' });
+    updateSessionCost(db, parent.id, 0.001);
+    const child = createSession(db, { model: 'm', cwd: '/p', parentSessionId: parent.id });
+    updateSessionCost(db, child.id, 0.5);
+    db.query('DELETE FROM sessions WHERE id = ?').run(parent.id);
+    // Child still exists, but it has no live parent to roll up to.
+    // Walking from the orphan returns just the orphan's own cost.
+    expect(cumulativeCostUsd(db, child.id)).toBeCloseTo(0.5, 9);
+  });
+
+  test('cumulativeCostUsd: returns 0 for unknown id', () => {
+    expect(cumulativeCostUsd(db, 'nope')).toBe(0);
+  });
+
+  test('cumulativeCostUsd: defense against self-referential row', () => {
+    // Cycle protection. The seen-set prevents an infinite loop
+    // when a corrupt write makes parent_session_id point at the
+    // row's own id. We emit the row's cost exactly once.
+    const s = createSession(db, { model: 'm', cwd: '/p' });
+    updateSessionCost(db, s.id, 0.123);
+    db.query('UPDATE sessions SET parent_session_id = id WHERE id = ?').run(s.id);
+    expect(cumulativeCostUsd(db, s.id)).toBeCloseTo(0.123, 9);
   });
 
   test('migration 011 backfill: pre-existing rows with parent_session_id are flagged', () => {

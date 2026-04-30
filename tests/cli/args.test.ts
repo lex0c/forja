@@ -163,6 +163,27 @@ describe('parseArgs', () => {
     expect(on.args.includeSubagents).toBe(true);
   });
 
+  test('--include-subagents standalone (without --list-sessions) is a parse error', () => {
+    // O3 fix. Prior behavior: the flag fell through to the run-mode
+    // branch where no consumer read it, so the user got silent
+    // ignore instead of feedback. Refusing at parse time surfaces
+    // the misuse before bootstrap.
+    const r = parseArgs(['--include-subagents']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--include-subagents requires --list-sessions');
+  });
+
+  test('--include-subagents combined with a normal prompt is a parse error', () => {
+    // Even with a prompt that would otherwise initiate a run, the
+    // flag is meaningless without --list-sessions. We refuse rather
+    // than picking one interpretation silently.
+    const r = parseArgs(['--include-subagents', 'do', 'something']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--include-subagents requires --list-sessions');
+  });
+
   test('--resume requires a value', () => {
     const r = parseArgs(['--resume']);
     expect(r.ok).toBe(false);

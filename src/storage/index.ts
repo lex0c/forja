@@ -12,6 +12,7 @@ export { MIGRATIONS } from './migrations/index.ts';
 export {
   completeSession,
   createSession,
+  cumulativeCostUsd,
   getSession,
   listChildSessions,
   listSessions,
