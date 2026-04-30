@@ -369,6 +369,89 @@ describe('restore', () => {
     expect(await Bun.file(join(repo, 'a.txt')).text()).toBe('state\n');
   });
 
+  test('refuses during mid-merge with hint pointing at git merge --abort', async () => {
+    // A paused merge leaves .git/MERGE_HEAD in place. Running
+    // read-tree --reset -u on top would clobber the user's
+    // conflict-resolution state. Detect the marker and refuse
+    // with the specific abort command for the operation type.
+    await initRepoWithCommit(repo);
+    await writeFile(join(repo, 'a.txt'), 'state\n');
+    const ckpt = await snapshot({
+      cwd: repo,
+      sessionId: 's',
+      stepId: 'm',
+      iso: 'iso',
+    });
+    // Synthesize a paused-merge state by writing the marker. We
+    // don't need a real conflict — restore's check is a file probe.
+    await writeFile(join(repo, '.git', 'MERGE_HEAD'), 'fake-sha\n');
+    try {
+      await expect(restore(repo, ckpt.sha as string)).rejects.toThrow(/merge.*--abort/);
+    } finally {
+      await rm(join(repo, '.git', 'MERGE_HEAD'), { force: true });
+    }
+  });
+
+  test('refuses during interactive rebase (rebase-merge dir)', async () => {
+    await initRepoWithCommit(repo);
+    await writeFile(join(repo, 'a.txt'), 'state\n');
+    const ckpt = await snapshot({
+      cwd: repo,
+      sessionId: 's',
+      stepId: 'm',
+      iso: 'iso',
+    });
+    const rebaseDir = join(repo, '.git', 'rebase-merge');
+    await Bun.spawn({ cmd: ['mkdir', '-p', rebaseDir] }).exited;
+    try {
+      await expect(restore(repo, ckpt.sha as string)).rejects.toThrow(/rebase.*--abort/);
+    } finally {
+      await rm(rebaseDir, { recursive: true, force: true });
+    }
+  });
+
+  test('refuses during cherry-pick', async () => {
+    await initRepoWithCommit(repo);
+    await writeFile(join(repo, 'a.txt'), 'state\n');
+    const ckpt = await snapshot({
+      cwd: repo,
+      sessionId: 's',
+      stepId: 'm',
+      iso: 'iso',
+    });
+    await writeFile(join(repo, '.git', 'CHERRY_PICK_HEAD'), 'fake\n');
+    try {
+      await expect(restore(repo, ckpt.sha as string)).rejects.toThrow(/cherry-pick.*--abort/);
+    } finally {
+      await rm(join(repo, '.git', 'CHERRY_PICK_HEAD'), { force: true });
+    }
+  });
+
+  test('mid-op refusal fires BEFORE stash, leaving dirty tree intact', async () => {
+    // Same shape as the GC'd-commit test: the user's pending changes
+    // must NOT land in stash if we're going to refuse anyway.
+    await initRepoWithCommit(repo);
+    await writeFile(join(repo, 'a.txt'), 'state\n');
+    const ckpt = await snapshot({
+      cwd: repo,
+      sessionId: 's',
+      stepId: 'm',
+      iso: 'iso',
+    });
+    await writeFile(join(repo, 'dirty.txt'), 'wip\n');
+    await writeFile(join(repo, '.git', 'MERGE_HEAD'), 'fake\n');
+    try {
+      await expect(restore(repo, ckpt.sha as string)).rejects.toThrow();
+    } finally {
+      await rm(join(repo, '.git', 'MERGE_HEAD'), { force: true });
+    }
+    // Dirty file stayed in the working tree — no stash side effect.
+    expect(await Bun.file(join(repo, 'dirty.txt')).text()).toBe('wip\n');
+    // No stash entries created.
+    const stashList = await runGit(repo, ['stash', 'list']);
+    expect(stashList.trim()).toBe('');
+  });
+
   test('throws on a non-existent commit before stashing', async () => {
     await initRepoWithCommit(repo);
     await writeFile(join(repo, 'dirty.txt'), 'work-in-progress\n');

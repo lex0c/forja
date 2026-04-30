@@ -21,6 +21,7 @@ export {
   getCommitMessage,
   getCommitTree,
   getHeadSha,
+  getInProgressOperation,
   isGitRepo,
   isWorkingTreeDirty,
   listRestoreSavedRefs,

@@ -1,6 +1,6 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 
 // Low-level git plumbing for the checkpoint subsystem.
 //
@@ -358,6 +358,73 @@ export interface RestoreResult {
   stashKind?: 'git-stash' | 'agent-ref';
 }
 
+// In-progress git operation markers. Restore is destructive against
+// the index + working tree; running it on top of a paused merge /
+// rebase / cherry-pick / revert / bisect would clobber the user's
+// resolution state and leave them with no way back. Detect the
+// canonical marker (file or dir) under .git, refuse with a hint
+// pointing at the specific abort/reset command.
+//
+// `dirOnly: true` flags entries that are directories rather than
+// files (interactive rebase uses .git/rebase-merge/ as a directory;
+// non-interactive rebase / git-am uses .git/rebase-apply/). Plain
+// fs.access works for both files and dirs but the distinction is
+// useful documentation.
+interface InProgressMarker {
+  readonly path: string;
+  readonly op: string;
+  readonly resolveHint: string;
+  readonly dirOnly?: boolean;
+}
+
+const IN_PROGRESS_MARKERS: readonly InProgressMarker[] = [
+  { path: 'MERGE_HEAD', op: 'merge', resolveHint: 'git merge --abort' },
+  { path: 'CHERRY_PICK_HEAD', op: 'cherry-pick', resolveHint: 'git cherry-pick --abort' },
+  { path: 'REVERT_HEAD', op: 'revert', resolveHint: 'git revert --abort' },
+  // `rebase-merge` is the dir for interactive / am-style rebase;
+  // `rebase-apply` covers non-interactive rebase + `git am`. Either
+  // present means the user is mid-rebase.
+  { path: 'rebase-merge', op: 'rebase', resolveHint: 'git rebase --abort', dirOnly: true },
+  { path: 'rebase-apply', op: 'rebase', resolveHint: 'git rebase --abort', dirOnly: true },
+  // bisect uses a different recovery primitive — `--abort` doesn't
+  // apply, the user runs `git bisect reset`.
+  { path: 'BISECT_LOG', op: 'bisect', resolveHint: 'git bisect reset' },
+];
+
+// Returns the operation name + resolve hint when an in-progress git
+// op is detected; null when the working tree is in a normal state.
+// Resolves .git lazily — on a worktree-pointer setup, `.git` is a
+// file pointing at the real dir, so we use `rev-parse --git-dir`
+// which handles both shapes.
+export interface InProgressOperation {
+  op: string;
+  resolveHint: string;
+}
+
+export const getInProgressOperation = async (cwd: string): Promise<InProgressOperation | null> => {
+  let gitDir: string;
+  try {
+    const { stdout } = await runGit(['rev-parse', '--git-dir'], { cwd });
+    gitDir = stdout.trim();
+  } catch {
+    // Not a git repo at all — by convention we say "no op in
+    // progress" since there's no operation to be in. Restore's own
+    // git checks will surface the missing repo error if needed.
+    return null;
+  }
+  if (gitDir.length === 0) return null;
+  const dir = isAbsolute(gitDir) ? gitDir : join(cwd, gitDir);
+  for (const marker of IN_PROGRESS_MARKERS) {
+    try {
+      await access(join(dir, marker.path));
+      return { op: marker.op, resolveHint: marker.resolveHint };
+    } catch {
+      // marker not present; try next
+    }
+  }
+  return null;
+};
+
 // Restore the working tree + index to match a checkpoint commit's tree.
 // HEAD is left untouched: the user's branch pointer doesn't move, and
 // any commits they made stay intact. Only file contents revert.
@@ -366,6 +433,18 @@ export interface RestoreResult {
 // push -u` saves them first. The stash is reported in the result so
 // the caller can echo a recovery hint.
 export const restore = async (cwd: string, commitSha: string): Promise<RestoreResult> => {
+  // Refuse outright when the user is mid-merge / rebase / cherry-pick /
+  // revert / bisect. read-tree --reset -u below would clobber the
+  // resolution state (.git/MERGE_HEAD, rebase-merge/, etc.) and leave
+  // the user with no way to abort or continue cleanly. The check has
+  // to fire BEFORE every other side effect — the probe below, the
+  // stash, the read-tree — so a refused restore leaves zero traces.
+  const inProgress = await getInProgressOperation(cwd);
+  if (inProgress !== null) {
+    throw new Error(
+      `cannot restore: a git ${inProgress.op} is in progress. Resolve it (\`${inProgress.resolveHint}\` or \`git ${inProgress.op} --continue\`) before running --undo.`,
+    );
+  }
   // Validate the commit object exists BEFORE stashing. A GC'd or
   // corrupt commit would otherwise leave a stash orphan tied to a
   // failed restore: we'd push the user's working tree to stash,
