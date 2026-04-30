@@ -25,6 +25,18 @@ const main = async (): Promise<number> => {
     return 0;
   }
 
+  // Subagent-child mode (Step 4.2b.ii.a). The parent process
+  // spawns the same binary with this flag set; the value is the
+  // pre-created child session id. Short-circuits ALL other entry
+  // paths — no prompt, no list-sessions, no resume, no plan.
+  // Lazy import for the same reason as `./run.ts` below: keeps
+  // the help/version branches above immune to provider/storage
+  // wiring failures.
+  if (args.subagentSessionId !== undefined) {
+    const { runSubagentChild } = await import('./subagent-child.ts');
+    return runSubagentChild({ sessionId: args.subagentSessionId });
+  }
+
   // Inspection / lifecycle modes don't need a prompt:
   //   - --list-sessions: pure DB read.
   //   - --undo / --checkpoints: DB + git only, no provider call.

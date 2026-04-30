@@ -50,6 +50,16 @@ export interface ParsedArgs {
   // --list-sessions; standalone use is a parse error so the
   // truncation hint that points at this flag stays actionable.
   limit?: number;
+  // Subagent-child mode (M3 §11 / Step 4.2b.ii.a). The parent
+  // process spawns the same binary with this flag set; the value
+  // is the pre-created child session id. Triggers a dedicated
+  // entry path that loads the session + audit row, builds a
+  // HarnessConfig with preassignedSessionId, runs the harness,
+  // publishes the terminal payload to subagent_outputs, and
+  // exits. The flag is internal — users never invoke it
+  // directly. Mutually exclusive with every other CLI mode
+  // (resume, list-sessions, undo, checkpoints, plan).
+  subagentSessionId?: string;
 }
 
 export interface ParseError {
@@ -214,6 +224,19 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
           };
         }
         args.limit = Number.parseInt(value, 10);
+        i += 2;
+        break;
+      }
+      case '--subagent-session-id': {
+        const value = argv[i + 1];
+        if (value === undefined || value.startsWith('--')) {
+          return {
+            ok: false,
+            message:
+              '--subagent-session-id requires a session id (internal flag; not for user invocation)',
+          };
+        }
+        args.subagentSessionId = value;
         i += 2;
         break;
       }

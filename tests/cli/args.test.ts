@@ -339,6 +339,27 @@ describe('--checkpoints flag', () => {
   });
 });
 
+describe('--subagent-session-id', () => {
+  test('captures the value into args.subagentSessionId', () => {
+    const r = parseArgs(['--subagent-session-id', 'abc-123']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentSessionId).toBe('abc-123');
+  });
+
+  test('rejects when value is missing', () => {
+    expect(parseArgs(['--subagent-session-id']).ok).toBe(false);
+    expect(parseArgs(['--subagent-session-id', '--json']).ok).toBe(false);
+  });
+
+  test('absent by default', () => {
+    const r = parseArgs(['hi']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentSessionId).toBeUndefined();
+  });
+});
+
 describe('usage', () => {
   test('mentions every recognized flag', () => {
     const u = usage();

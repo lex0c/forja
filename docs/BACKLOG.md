@@ -15,6 +15,268 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.2b.ii.a — subprocess spawn (subagent isolation v1)
+
+The 4.2b.i closing entry left `subagent_outputs` schema in place
+without anything writing to it. This slice flips the subagent
+runtime from in-process (4.2a) to a separate Bun subprocess that
+IS the canonical isolation mandated by AGENTIC_CLI §11:1030
+("mesmo binário, processo separado, comunicação via SQLite —
+write-only do filho, read-only do pai"). The parent creates the
+child session row + audit row + seed user message BEFORE
+spawning; the child binary detects the subagent-child mode via
+`--subagent-session-id <uuid>`, runs the harness against the
+preassigned session id, and publishes its terminal envelope to
+`subagent_outputs`. The parent polls until the payload lands or
+the timeout/abort path forces a kill. Heartbeat-driven liveness,
+symlink hardening, and bgLogDir per-worktree stay deferred to
+.ii.b/.iii/.iv.
+
+**Slice scope:**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/harness/types.ts` | UPDATED | New `HarnessConfig.preassignedSessionId?` — when set, `runAgent` skips both `createSession` and `reopenSession` and uses the caller-provided id. Mutually exclusive with `resumeFromSessionId`. |
+| `src/harness/loop.ts` | UPDATED | Three branches now: resume, preassigned, fresh. Preassigned verifies the row exists with matching cwd and `status='running'`. Message hydration unified across resume + preassigned so the subprocess child sees the parent-inserted seed user message; userPrompt append skipped when `userPrompt === ''`. |
+| `src/cli/args.ts` | UPDATED | `--subagent-session-id <uuid>` flag (internal). Captured into `args.subagentSessionId`. |
+| `src/cli/index.ts` | UPDATED | Subagent-child short-circuit before all other modes — when the flag is present, lazy-imports and runs the child handler. |
+| `src/cli/subagent-child.ts` | NEW | Child entry path. Loads session + audit row, builds permission engine + provider + tool registry from the audit's whitelist, runs `runAgent` with `preassignedSessionId`, extracts terminal output, publishes envelope via `setSubagentPayload`. Error-envelope side channel for pre-run failures (unknown model, unknown tool from snapshot) so the parent's poller never times out on a recoverable diagnosis. |
+| `src/subagents/runtime.ts` | MAJOR REWRITE | Replaced the in-process `runAgent` call with `Bun.spawn` of the same binary. New flow: validate registry → create worktree if isolated → `createSession` for the child → insert `subagent_runs` (FK target now exists) → append seed user message → spawn → poll `subagent_outputs.payload` with backoff → timeout/abort kill escalation (SIGTERM → grace → SIGKILL) → cleanup worktree → insert `subagent_worktrees`. Added `SpawnChildProcess` type so tests can inject a fake; default factory uses `Bun.argv` to detect dev (interpreter+script) vs compiled (binary only). Reason union widened with `subprocess_crashed`. |
+| `tests/harness/loop.test.ts` | UPDATED | +5 tests for the preassigned path (happy, missing id, cwd divergence, finalized row, mutual exclusion with resume). |
+| `tests/cli/args.test.ts` | UPDATED | +3 tests for `--subagent-session-id` parsing. |
+| `tests/cli/subagent-child.test.ts` | NEW | 4 tests — happy harness run + payload publish; missing session id; non-subagent session refused; missing audit row refused. Uses an on-disk DB so the child handler's openDb path is exercised the same way the real subprocess uses it. |
+| `tests/subagents/runtime.test.ts` | REPLACED | The 4.2a in-process tests didn't translate to the subprocess shape; replaced with 16 focused tests built around `SpawnChildProcess` fakes (done payload, exhausted forwarding, crash, wall-clock timeout, abort escalation, whitelist refusals, depth boundary, worktree clean/dirty/create-fail, isolation=none baseline). Symlink hardening test stays `.skip` for 4.2b.iii. |
+
+**Decisions:**
+
+- **`preassignedSessionId` instead of factoring out `createSession`.**
+  The subprocess flow needs the parent and child to share the
+  same session row. Refactoring `runAgent` to expose a "create
+  session before / use existing" split would have rippled
+  through every harness-construction path. A single optional
+  field that skips both lifecycle hooks is the smallest correct
+  change. Mutual-exclusion guard with `resumeFromSessionId` so
+  setting both fails loud rather than picking one silently.
+- **Message hydration unified across resume + preassigned.**
+  The seed user message the parent inserts before spawn must be
+  visible to the child harness's loop. Initially I considered a
+  separate path but the resume code already does exactly the
+  right thing — load tail messages, build the in-memory array,
+  carry the parent_id chain. Generalizing the trigger condition
+  (`preexistingId = resumeId ?? preassignedId`) reuses the
+  hardened path. The empty-userPrompt skip handles the case
+  where the parent already inserted the seed.
+- **Audit row lands BEFORE spawn (was post-run in 4.2a).**
+  The child reads its own definition from `subagent_runs`. The
+  row MUST exist when the child opens the DB; without that, the
+  child has no way to discover its system prompt, tools, or
+  budget. Audit failure here can no longer be best-effort —
+  it's a precondition for the child to function. The runtime
+  cleans up the worktree if audit insert throws and propagates
+  the exception; auditFailure on the result is now reserved
+  for the worktree-audit insert (which IS best-effort because
+  it lands post-cleanup).
+- **Seed user message via the messages table, not CLI argv.**
+  Considered passing the prompt as a `--prompt <json>` flag.
+  Rejected: prompts can be 32KB (PROMPT_MAX_BYTES); CLI argv
+  size limits + escaping become real concerns. Inserting as a
+  message uses the same channel the child harness already
+  reads, no new IPC surface.
+- **Subprocess detection via `Bun.argv` shape, not env var.**
+  The default `defaultSpawnChildProcess` checks if argv[1]
+  ends in `.ts`/`.js` (dev mode, need interpreter+script) vs
+  not (compiled binary). Env var (`FORJA_BIN`) considered but
+  env vars leak into logs and child processes; argv shape is
+  closed over the launcher's own state. Production compiled
+  binary just uses argv[0]; dev `bun run` keeps both.
+- **Polling instead of inotify/fs-watch on the SQLite file.**
+  Polling is portable (Linux/macOS/Windows), simple to reason
+  about, and the latency cost is sub-second for runs that
+  themselves take seconds. Backoff 50ms → 500ms keeps fast
+  runs cheap (sub-second completion sees ≤ 2 polls) while
+  bounding wakeups on long runs.
+- **SIGTERM → grace → SIGKILL escalation, grace configurable.**
+  Per FAILURE_MODES §7.3: 5s grace default. The grace value is
+  exposed as `RunSubagentInput.graceMs` so tests can use a
+  small value (50ms) and complete inside bun's default 5s
+  per-test timeout. Production callers omit it.
+- **Crash without payload → `subprocess_crashed`, NOT
+  `internalError`.** The harness's `internalError` reason is
+  reserved for the harness's own uncaught throws; subprocess
+  crashes are an architectural layer above that. Distinct
+  reason lets operators triage `subprocess_crashed` (look for
+  a child stack trace) vs `internalError` (look for harness
+  bug) without conflating them.
+- **`SpawnChildProcess` is an injection point.** Same shape as
+  `bgManager` and other testable seams. Tests fake the
+  subprocess by writing the payload directly and resolving
+  exited; production uses `Bun.spawn`. Single integration test
+  invoking the real binary deferred to a follow-up — the
+  fakes verify every parent-side behavior except "argv shape
+  resolves to a runnable binary", which is an integration
+  concern, not a unit concern.
+- **Old in-process runtime tests REPLACED, not adapted.** The
+  4.2a tests asserted in-process semantics: provider used by
+  `runSubagent` directly, audit landing post-run, planMode
+  threading through child config, etc. None of those hold
+  under the subprocess shape — provider lives on the child's
+  registry lookup, audit lands pre-spawn, planMode threading
+  hasn't been wired to the child binary yet (deferred to
+  .ii.b). Replacing rather than adapting kept the test surface
+  honest about what's being tested.
+
+**What this DOESN'T close (deferred):**
+
+- **No heartbeat poller.** Wall-clock timeout is the only
+  liveness check today. A child that responds to signals but
+  hangs inside a tool call (no provider response, no exit) is
+  caught only when wallClockMs fires — which can be minutes.
+  4.2b.ii.b adds heartbeat writes from the child (pulse every
+  ~1s) and a `listStaleSubagentOutputs`-driven poller in the
+  parent that catches "heartbeat older than threshold even
+  though wall-clock budget remaining."
+- **No symlink hardening.** Spec SECURITY §8.4 deny-list copy
+  + realpath validation lands in 4.2b.iii.
+- **No bgLogDir per-worktree.** `requiresBgManager` tools are
+  still refused under any isolation; 4.2b.iv lifts the gate
+  after wiring per-worktree bg log directories.
+- **No planMode threading to subprocess.** The 4.2a in-process
+  flow forwarded `config.planMode` to the child harness. The
+  subprocess child today doesn't read planMode from the audit
+  row (the audit doesn't store it). Adding a column or a
+  separate IPC channel for run-level flags lands in .ii.b.
+  Until then, plan-mode subagents would silently lose the
+  flag — but the parent's `task` tool gate (planSafe:false)
+  already refuses spawning under plan mode, so the surface is
+  closed at a higher layer.
+- **No real-binary integration test.** Unit tests inject
+  `SpawnChildProcess` fakes; they verify every parent-side
+  behavior except "the default factory's argv resolution
+  produces a runnable binary." Test for that lives outside
+  bun-test (eval / smoke suite) because it requires either a
+  compiled binary in `dist/` or a dev `bun run` exec path,
+  neither available reliably in the unit-test loop.
+- **`onEvent` doesn't deliver child events to the parent.**
+  The subprocess can't stream HarnessEvents across the IPC
+  boundary; the parent sees only the terminal payload. Hook
+  reserved for parity with the in-process API. M4's TUI work
+  may add a separate event-stream channel via SQLite or an
+  IPC pipe.
+
+**Review pass (post-self-review).** Self-review surfaced 4
+critical + 5 medium + 3 minor. All addressable items addressed
+in the same commit chain; the four deferred items are recorded
+in Pending.
+
+- **C1 — child stdout/stderr never drained.** `Bun.spawn` was
+  configured `stdout: 'pipe', stderr: 'pipe'` but neither
+  stream was read; a child that wrote > pipe buffer (~64KB on
+  Linux) to stderr would block on write. Symptom would have
+  been "long subagent runs randomly hang." Fix: stdout now
+  `'ignore'` (production children shouldn't write to stdout —
+  IPC is via SQLite); stderr `'pipe'` and drained in
+  background. Captured stderr is dropped today; future slice
+  routes to per-worktree log dirs.
+- **C2 — `appendMessage` failure between audit insert and
+  spawn leaked the worktree.** Original try/catch wrapped only
+  `insertSubagentRun`; a throw from `appendMessage` (FK
+  concurrent delete, schema drift) left the worktree dir + the
+  agent branch on disk with no operator-visible audit. Fix:
+  shared `cleanupOnFail` helper covering audit insert,
+  appendMessage, and the spawn call; any throw cleans up
+  consistently. New regression test forces the failure by
+  dropping the messages table mid-flight.
+- **C3 — `Bun.spawn` synchronous throw escaped the runtime.**
+  ENOENT (binary not found), EACCES, out-of-fds, etc. all
+  produce a synchronous exception from Bun. Without the catch,
+  the caller saw an unhandled throw instead of a recoverable
+  `RunSubagentResult`. Fix: spawn wrapped in try/catch that
+  cleans up worktree and resolves with `status='error',
+  reason='subprocess_spawn_failed'`. New reason added to the
+  RunSubagentResult union; `worktreeError`-shaped side-channel
+  carries the original message for diagnosis.
+- **C4 — parent and child wall-clock raced.** Both used the
+  same `definition.budget.maxWallClockMs`; if both fire at the
+  same instant, the parent's SIGTERM/SIGKILL could land
+  mid-`setSubagentPayload` from the child's own
+  wall-clock-induced cleanup, losing the terminal envelope.
+  Fix: parent's effective wall-clock now defaults to
+  `childWallClockMs + 2 × graceMs`, giving the child time to
+  hit its own budget AND publish before the parent's outer
+  kill fires. Caller's explicit `wallClockMs` overrides
+  (tests rely on this for fast timeout exercise).
+- **M1 — `signal.aborted` race with `exitedResolved`.** SIGINT
+  propagates to the whole process group, so a child can exit
+  before the wait loop ever set `killed='aborted'`. The
+  exited-branch then fell through to `crashed`, misreporting a
+  user abort as a crash. Fix: explicit `signal.aborted` check
+  at the top of the exited branch. Regression test pre-aborts
+  the controller and uses a fixture that exits immediately
+  without payload — must surface as `aborted`.
+- **M4 + m2 — extracted `resolveChildBinaryCmd` + renamed
+  `validateChildRegistry`.** The argv-detection heuristic was
+  inline and untested; now a pure function with 6 unit tests
+  covering compiled binary, dev script, extended suffixes
+  (`.ts`, `.js`, `.mts`, `.cts`, `.mjs`), edge cases (argv
+  missing, single-element argv, no-extension binary).
+  `validateChildRegistry` returned `void`; renamed to
+  `assertWhitelistValidForSubagent` so the void return matches
+  the imperative name.
+
+**Pending (deferred — not blocking, recorded for visibility):**
+
+- **M2 — policy drift between parent spawn and child read.**
+  Child re-resolves `.agent/permissions.yaml` etc. on its own
+  startup; if the file changed between spawn and child read,
+  the child runs under a different policy than the parent
+  expected. Race window is hundreds of ms in practice. Fix
+  candidate: persist policy snapshot on the audit row similar
+  to system_prompt + tools_whitelist; blocks 4.2b.ii.b which
+  also needs to forward planMode/temperature to the child.
+- **M3 — stale 'running' rows when parent crashes between
+  createSession and spawn.** `completeSession` never fires;
+  operator's `--list-sessions` shows the row as still running
+  forever. The 4.2b.ii.b heartbeat poller will detect this
+  via "is_subagent + status='running' + last_heartbeat NULL
+  for > N seconds" and mark stale. Closing the gap requires
+  the heartbeat machinery anyway; defer to the same slice.
+- **M5 — concurrent subagent spawns from same parent.**
+  Two `task()` calls in the same model turn produce two
+  parallel children; each gets its own session id + worktree
+  + outputs row, so logically should work. Untested. SQLite
+  WAL mode handles concurrent writes; risk is theoretical
+  but operationally unverified. Add a fixture in 4.2b.ii.b
+  alongside the heartbeat work where parallel children are
+  the expected stress shape.
+- **m1 — poll cadence aggressive on the cold start.**
+  50ms → 100 → 200 → 400 → 500 cap means ~5 polls in the
+  first second. Each poll runs an indexed SELECT on
+  `subagent_outputs`, which competes with the child's UPDATE
+  briefly via SQLite reader-writer locking. Fine under
+  unit-test load, possibly suboptimal under thousand-subagent
+  CI. Tune (or move to event-driven via a notifier table) if
+  benchmarks justify; trivial change.
+- **m3 — `handle.kill` typed strictly to `'SIGTERM' |
+  'SIGKILL'`.** Bun.spawn accepts any signal name; we
+  restrict for caller safety (a future caller passing
+  SIGUSR1 wouldn't behave as the wait loop expects). Kept;
+  documenting the intent is enough.
+
+**Verification (post-review):** `bun test` 1275 pass / 11
+skip / 0 fail (+9 across the new failure paths, the argv
+resolver, and the abort race); `tsc --noEmit` clean;
+`biome check` clean.
+
+**Next:** M3 / Step 4.2b.ii.b — heartbeat writer in the child
+loop + parent-side stale-row poller + planMode/temperature
+forwarding via the audit row (closes M2 + M3 + the planMode
+regression noted above). Add the parallel-children stress
+fixture (M5) at the same time. After .ii.b, .iii (symlink
+hardening) and .iv (bgLogDir per-worktree) finish out the
+4.2b arc.
+
+---
+
 ## [2026-04-30] M3 / Step 4.2b.i — subagent_outputs IPC schema
 
 The 4.2a closing entry left subagents running in-process: a child

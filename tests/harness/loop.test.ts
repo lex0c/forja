@@ -1595,4 +1595,75 @@ describe('runAgent', () => {
     expect(result.reason).toBe('internalError');
     expect(result.usageComplete).toBe(false);
   });
+
+  describe('preassignedSessionId', () => {
+    test('happy path: caller-created row is used directly, sessionId matches', async () => {
+      // The 4.2b.ii subprocess flow needs the harness to run
+      // against a session row the caller created upfront — the
+      // FK targets in subagent_runs / subagent_worktrees can only
+      // resolve when the row exists at spawn time, not after
+      // runAgent returns. The harness must skip its own
+      // createSession on this path.
+      const pre = await import('../../src/storage/repos/sessions.ts');
+      const seeded = pre.createSession(db, { model: 'mock/m', cwd: '/p' });
+      const { config } = buildConfig([{ text: 'used preassigned', stop_reason: 'end_turn' }]);
+      const result = await runAgent({ ...config, preassignedSessionId: seeded.id });
+      expect(result.status).toBe('done');
+      expect(result.sessionId).toBe(seeded.id);
+      // No new session was created; the count stays at 1.
+      expect(listSessions(db, {}).length).toBe(1);
+    });
+
+    test('rejects when no row exists for the preassigned id', async () => {
+      const { config } = buildConfig([{ text: 'never', stop_reason: 'end_turn' }]);
+      const result = await runAgent({
+        ...config,
+        preassignedSessionId: 'nonexistent-id',
+      });
+      // Init failure routes through guardedFinish; the surface
+      // is internalError.
+      expect(result.status).toBe('error');
+      expect(result.reason).toBe('internalError');
+    });
+
+    test('rejects when row cwd diverges from config cwd', async () => {
+      // Mirrors the resume-path cwd check. Relative paths in
+      // messages must resolve consistently between row and runtime.
+      const pre = await import('../../src/storage/repos/sessions.ts');
+      const seeded = pre.createSession(db, { model: 'mock/m', cwd: '/different' });
+      const { config } = buildConfig([{ text: 'never', stop_reason: 'end_turn' }]);
+      const result = await runAgent({ ...config, preassignedSessionId: seeded.id });
+      expect(result.status).toBe('error');
+      expect(result.reason).toBe('internalError');
+    });
+
+    test('rejects when row is already finalized (status != running)', async () => {
+      // Defense: reusing a finalized row would silently overwrite
+      // its terminal status and append messages past the
+      // completed turn. Caller must always preassign a fresh row.
+      const pre = await import('../../src/storage/repos/sessions.ts');
+      const seeded = pre.createSession(db, { model: 'mock/m', cwd: '/p' });
+      pre.completeSession(db, seeded.id, 'done', 0, true);
+      const { config } = buildConfig([{ text: 'never', stop_reason: 'end_turn' }]);
+      const result = await runAgent({ ...config, preassignedSessionId: seeded.id });
+      expect(result.status).toBe('error');
+      expect(result.reason).toBe('internalError');
+    });
+
+    test('rejects when both resumeFromSessionId and preassignedSessionId are set', async () => {
+      // Mutually exclusive contract — setting both is a
+      // programmer bug; failing loud is better than guessing
+      // intent.
+      const pre = await import('../../src/storage/repos/sessions.ts');
+      const seeded = pre.createSession(db, { model: 'mock/m', cwd: '/p' });
+      const { config } = buildConfig([{ text: 'never', stop_reason: 'end_turn' }]);
+      const result = await runAgent({
+        ...config,
+        resumeFromSessionId: seeded.id,
+        preassignedSessionId: seeded.id,
+      });
+      expect(result.status).toBe('error');
+      expect(result.reason).toBe('internalError');
+    });
+  });
 });
