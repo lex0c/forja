@@ -15,6 +15,523 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.2b.ii.a follow-up — policy snapshot
+
+The 4.2b.ii.a closing entry left M2 (policy drift between
+parent spawn and child read) as Pending, deferred to .ii.b.
+Closing it now in a follow-up because the cost is small (one
+column + one engine getter) and the race window is real:
+between the parent's `bootstrap()` (which calls `resolvePolicy`
++ `createPermissionEngine`) and the child's startup (which used
+to call `resolvePolicy` again), a human edit to
+`.agent/permissions.yaml` (or any layer above) could run the
+child under different rules than the parent had validated.
+Worst case: a tool the parent confirmed was allowed surfaces
+as denied (or vice versa) inside the same logical run.
+
+**Slice scope:**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/permissions/engine.ts` | UPDATED | New `PermissionEngine.policy()` returns a `structuredClone` of the captured Policy. Deep copy is defensive — a future caller mutating the result MUST NOT corrupt the engine's enforcement state. |
+| `src/storage/migrations/015-subagent-runs-policy.ts` | NEW | `ALTER TABLE subagent_runs ADD COLUMN policy_snapshot TEXT NOT NULL DEFAULT '{}'`. Pre-015 rows get the empty-object default; the read path patches in strict-mode defaults so a pre-migration row falls through to maximally restrictive interpretation. |
+| `src/storage/repos/subagent-runs.ts` | UPDATED | `SubagentRun.policySnapshot: Policy` field. `insertSubagentRun` accepts `policySnapshot?: Policy`. Defensive read parse fills `defaults.mode='strict'` and `tools={}` when shape is structurally incomplete (corruption or pre-015). |
+| `src/subagents/runtime.ts` | UPDATED | `runSubagent` persists `input.permissionEngine.policy()` on the audit row before spawn. Uses the engine's getter — no direct dependency on the resolver. |
+| `src/cli/subagent-child.ts` | UPDATED | Builds the permission engine from `audit.policySnapshot` directly. **Removed** the `resolvePolicy(...)` call entirely. Test seams `enterprisePolicyPath` / `userPolicyPath` removed (no longer meaningful — child doesn't read disk policy). |
+| Tests | NEW + UPDATED | `tests/permissions/engine.test.ts` (+1 — mutation on returned policy doesn't affect engine), `tests/cli/subagent-child.test.ts` (+3 — round-trip with bypass+sentinel snapshot, real-gate probe `bypass allows / strict denies`, pre-015 row falls back to strict). Tool-call status assertions probe the actual gate (read_file under bypass lands `done`, under strict lands `denied`) — not just round-trip. |
+
+**Decisions:**
+
+- **`PermissionEngine.policy()` returns a deep copy via
+  `structuredClone`, not the captured reference.** A shared
+  reference would let any caller mutate the engine's
+  enforcement state (e.g., flipping `defaults.mode` to
+  `bypass` on a strict engine). The cost is negligible
+  (~µs for sub-10KB policies); the latent-bug surface a
+  shared reference would expose is the relevant size.
+  `JSON.parse(JSON.stringify(...))` would also work but
+  loses Date/Map shapes if a future Policy type grows them;
+  structuredClone preserves them.
+- **Schema as `ALTER TABLE ... ADD COLUMN ... NOT NULL
+  DEFAULT '{}'`, not a parallel table.** The audit lives
+  with the rest of the run's snapshot (system_prompt,
+  tools_whitelist, budget). Splitting policy into its own
+  table would force a join on every forensic query for
+  zero gain — the row is 1:1 with subagent_runs anyway.
+  The `'{}'` default is the safe fallback for pre-migration
+  rows: parses as an empty object, the read path detects
+  the missing `defaults.mode` and patches in `'strict'`.
+  Strict is the maximally restrictive interpretation of
+  "policy snapshot unknown" — denies everything by default,
+  zero risk of accidentally elevating permissions.
+- **Read-path defensive parse fills missing required
+  fields with strict defaults.** `JSON.parse('{}')` yields
+  `{}` which lacks `defaults.mode` — calling
+  `engine.check()` on that crashes with `undefined is not
+  an object (evaluating 'policy.defaults.mode')`. The
+  parse path explicitly checks for the required Policy
+  shape (`defaults` object, `tools` object) and falls back
+  per-field to strict. Same defensive shape used for
+  `tools_whitelist` parse (migration 012).
+- **`subagent-child.ts` no longer calls `resolvePolicy`.**
+  The test seams `enterprisePolicyPath` / `userPolicyPath`
+  are gone — they made sense when the child re-resolved
+  disk; with the snapshot path they're dead. Tests that
+  want a specific policy seed it via the parent's
+  `insertSubagentRun(..., policySnapshot)` directly.
+- **`InsertSubagentRunInput.policySnapshot` is optional.**
+  Production callers (the runtime) MUST supply it; the
+  optional shape covers older test fixtures and rare
+  programmatic callers without breaking them. Omitting
+  serializes `'{}'` and falls back to strict on read —
+  safe but maximally restrictive.
+
+**Review fixes (pre-commit).** Self-review surfaced 1 medium
+(structuredClone) and 1 medium (real-gate probe). Both
+addressed in the same commit:
+
+- **M2 — `engine.policy()` returned a mutable reference.**
+  Latent bug for any future caller beyond `JSON.stringify`.
+  Fixed via `structuredClone`. Test asserts mutation on the
+  returned policy (top-level field, nested object, nested
+  array) does not affect engine `mode()` or `check()`
+  behavior; a fresh `policy()` call still returns the
+  original shape.
+- **M3 — bypass-vs-strict round-trip didn't probe actual
+  gate behavior.** A regression that silently substituted
+  the snapshot before engine creation would still pass a
+  round-trip-only test. Added a stronger probe: two
+  children with identical `read_file` tool_use scripts and
+  identical whitelists, differing only in `policySnapshot`.
+  Bypass child's tool_call lands `status='done'` (gate
+  passed); strict child's lands `status='denied'` (gate
+  denied). Same fixture, two snapshots, two outcomes —
+  proves the snapshot drives real enforcement.
+
+**Pending (deferred — not blocking):**
+
+- **M1 — `lockConflicts` not in snapshot.** `resolvePolicy`
+  returns `{ policy, layers, lockConflicts }`; the audit
+  persists only `policy`. Effects of locks ARE baked into
+  the resolved policy (enforcement is correct), but
+  forensic detail "which layer originated this rule?" is
+  lost. Could add a sibling `policy_audit` field with
+  `{ layers, lockConflicts }` in a future migration if the
+  forensic shape grows demand.
+- **m1 — `{ ...obj, defaults, tools }` carries unknown
+  top-level fields.** A snapshot with extra keys round-trips
+  unchanged; not a correctness issue but shape pollution.
+  Strict whitelist of known Policy keys would tighten;
+  defer until the Policy type stabilizes (currently the
+  type itself allows arbitrary additional sections per
+  future spec growth).
+- **m2 — Pre-015 rows store `'{}'` literally.** Raw
+  `SELECT policy_snapshot ...` shows `'{}'`; in-memory
+  reading yields strict-defaults Policy. Operator forensic
+  queries should know the divergence. Documented in the
+  migration comment + repo comment.
+- **m3 — No direct migration 015 test.** Cover via the
+  insert/get round-trip tests on the column. A
+  `PRAGMA table_info(subagent_runs)` assertion would lock
+  the schema shape explicitly; ~10 LOC, defer.
+
+**Verification:** `bun test` 1282 pass / 11 skip / 0 fail
+(+5 since `cfd60d0`: deep-clone test, snapshot round-trip,
+real-gate probe, pre-015 fallback, hermetic-test cleanup);
+`tsc --noEmit` clean; `biome check` clean.
+
+**Next:** M3 / Step 4.2b.ii.b — heartbeat writer in the
+child loop + parent-side stale-row poller + planMode/
+temperature forwarding via the audit row + parallel-children
+stress fixture. M2 from .ii.a review is now closed; M3 (stale
+'running' rows on parent crash) and M5 (concurrent spawns)
+remain for .ii.b.
+
+---
+
+## [2026-04-30] M3 / Step 4.2b.ii.a — subprocess spawn (subagent isolation v1)
+
+The 4.2b.i closing entry left `subagent_outputs` schema in place
+without anything writing to it. This slice flips the subagent
+runtime from in-process (4.2a) to a separate Bun subprocess that
+IS the canonical isolation mandated by AGENTIC_CLI §11:1030
+("mesmo binário, processo separado, comunicação via SQLite —
+write-only do filho, read-only do pai"). The parent creates the
+child session row + audit row + seed user message BEFORE
+spawning; the child binary detects the subagent-child mode via
+`--subagent-session-id <uuid>`, runs the harness against the
+preassigned session id, and publishes its terminal envelope to
+`subagent_outputs`. The parent polls until the payload lands or
+the timeout/abort path forces a kill. Heartbeat-driven liveness,
+symlink hardening, and bgLogDir per-worktree stay deferred to
+.ii.b/.iii/.iv.
+
+**Slice scope:**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/harness/types.ts` | UPDATED | New `HarnessConfig.preassignedSessionId?` — when set, `runAgent` skips both `createSession` and `reopenSession` and uses the caller-provided id. Mutually exclusive with `resumeFromSessionId`. |
+| `src/harness/loop.ts` | UPDATED | Three branches now: resume, preassigned, fresh. Preassigned verifies the row exists with matching cwd and `status='running'`. Message hydration unified across resume + preassigned so the subprocess child sees the parent-inserted seed user message; userPrompt append skipped when `userPrompt === ''`. |
+| `src/cli/args.ts` | UPDATED | `--subagent-session-id <uuid>` flag (internal). Captured into `args.subagentSessionId`. |
+| `src/cli/index.ts` | UPDATED | Subagent-child short-circuit before all other modes — when the flag is present, lazy-imports and runs the child handler. |
+| `src/cli/subagent-child.ts` | NEW | Child entry path. Loads session + audit row, builds permission engine + provider + tool registry from the audit's whitelist, runs `runAgent` with `preassignedSessionId`, extracts terminal output, publishes envelope via `setSubagentPayload`. Error-envelope side channel for pre-run failures (unknown model, unknown tool from snapshot) so the parent's poller never times out on a recoverable diagnosis. |
+| `src/subagents/runtime.ts` | MAJOR REWRITE | Replaced the in-process `runAgent` call with `Bun.spawn` of the same binary. New flow: validate registry → create worktree if isolated → `createSession` for the child → insert `subagent_runs` (FK target now exists) → append seed user message → spawn → poll `subagent_outputs.payload` with backoff → timeout/abort kill escalation (SIGTERM → grace → SIGKILL) → cleanup worktree → insert `subagent_worktrees`. Added `SpawnChildProcess` type so tests can inject a fake; default factory uses `Bun.argv` to detect dev (interpreter+script) vs compiled (binary only). Reason union widened with `subprocess_crashed`. |
+| `tests/harness/loop.test.ts` | UPDATED | +5 tests for the preassigned path (happy, missing id, cwd divergence, finalized row, mutual exclusion with resume). |
+| `tests/cli/args.test.ts` | UPDATED | +3 tests for `--subagent-session-id` parsing. |
+| `tests/cli/subagent-child.test.ts` | NEW | 4 tests — happy harness run + payload publish; missing session id; non-subagent session refused; missing audit row refused. Uses an on-disk DB so the child handler's openDb path is exercised the same way the real subprocess uses it. |
+| `tests/subagents/runtime.test.ts` | REPLACED | The 4.2a in-process tests didn't translate to the subprocess shape; replaced with 16 focused tests built around `SpawnChildProcess` fakes (done payload, exhausted forwarding, crash, wall-clock timeout, abort escalation, whitelist refusals, depth boundary, worktree clean/dirty/create-fail, isolation=none baseline). Symlink hardening test stays `.skip` for 4.2b.iii. |
+
+**Decisions:**
+
+- **`preassignedSessionId` instead of factoring out `createSession`.**
+  The subprocess flow needs the parent and child to share the
+  same session row. Refactoring `runAgent` to expose a "create
+  session before / use existing" split would have rippled
+  through every harness-construction path. A single optional
+  field that skips both lifecycle hooks is the smallest correct
+  change. Mutual-exclusion guard with `resumeFromSessionId` so
+  setting both fails loud rather than picking one silently.
+- **Message hydration unified across resume + preassigned.**
+  The seed user message the parent inserts before spawn must be
+  visible to the child harness's loop. Initially I considered a
+  separate path but the resume code already does exactly the
+  right thing — load tail messages, build the in-memory array,
+  carry the parent_id chain. Generalizing the trigger condition
+  (`preexistingId = resumeId ?? preassignedId`) reuses the
+  hardened path. The empty-userPrompt skip handles the case
+  where the parent already inserted the seed.
+- **Audit row lands BEFORE spawn (was post-run in 4.2a).**
+  The child reads its own definition from `subagent_runs`. The
+  row MUST exist when the child opens the DB; without that, the
+  child has no way to discover its system prompt, tools, or
+  budget. Audit failure here can no longer be best-effort —
+  it's a precondition for the child to function. The runtime
+  cleans up the worktree if audit insert throws and propagates
+  the exception; auditFailure on the result is now reserved
+  for the worktree-audit insert (which IS best-effort because
+  it lands post-cleanup).
+- **Seed user message via the messages table, not CLI argv.**
+  Considered passing the prompt as a `--prompt <json>` flag.
+  Rejected: prompts can be 32KB (PROMPT_MAX_BYTES); CLI argv
+  size limits + escaping become real concerns. Inserting as a
+  message uses the same channel the child harness already
+  reads, no new IPC surface.
+- **Subprocess detection via `Bun.argv` shape, not env var.**
+  The default `defaultSpawnChildProcess` checks if argv[1]
+  ends in `.ts`/`.js` (dev mode, need interpreter+script) vs
+  not (compiled binary). Env var (`FORJA_BIN`) considered but
+  env vars leak into logs and child processes; argv shape is
+  closed over the launcher's own state. Production compiled
+  binary just uses argv[0]; dev `bun run` keeps both.
+- **Polling instead of inotify/fs-watch on the SQLite file.**
+  Polling is portable (Linux/macOS/Windows), simple to reason
+  about, and the latency cost is sub-second for runs that
+  themselves take seconds. Backoff 50ms → 500ms keeps fast
+  runs cheap (sub-second completion sees ≤ 2 polls) while
+  bounding wakeups on long runs.
+- **SIGTERM → grace → SIGKILL escalation, grace configurable.**
+  Per FAILURE_MODES §7.3: 5s grace default. The grace value is
+  exposed as `RunSubagentInput.graceMs` so tests can use a
+  small value (50ms) and complete inside bun's default 5s
+  per-test timeout. Production callers omit it.
+- **Crash without payload → `subprocess_crashed`, NOT
+  `internalError`.** The harness's `internalError` reason is
+  reserved for the harness's own uncaught throws; subprocess
+  crashes are an architectural layer above that. Distinct
+  reason lets operators triage `subprocess_crashed` (look for
+  a child stack trace) vs `internalError` (look for harness
+  bug) without conflating them.
+- **`SpawnChildProcess` is an injection point.** Same shape as
+  `bgManager` and other testable seams. Tests fake the
+  subprocess by writing the payload directly and resolving
+  exited; production uses `Bun.spawn`. Single integration test
+  invoking the real binary deferred to a follow-up — the
+  fakes verify every parent-side behavior except "argv shape
+  resolves to a runnable binary", which is an integration
+  concern, not a unit concern.
+- **Old in-process runtime tests REPLACED, not adapted.** The
+  4.2a tests asserted in-process semantics: provider used by
+  `runSubagent` directly, audit landing post-run, planMode
+  threading through child config, etc. None of those hold
+  under the subprocess shape — provider lives on the child's
+  registry lookup, audit lands pre-spawn, planMode threading
+  hasn't been wired to the child binary yet (deferred to
+  .ii.b). Replacing rather than adapting kept the test surface
+  honest about what's being tested.
+
+**What this DOESN'T close (deferred):**
+
+- **No heartbeat poller.** Wall-clock timeout is the only
+  liveness check today. A child that responds to signals but
+  hangs inside a tool call (no provider response, no exit) is
+  caught only when wallClockMs fires — which can be minutes.
+  4.2b.ii.b adds heartbeat writes from the child (pulse every
+  ~1s) and a `listStaleSubagentOutputs`-driven poller in the
+  parent that catches "heartbeat older than threshold even
+  though wall-clock budget remaining."
+- **No symlink hardening.** Spec SECURITY §8.4 deny-list copy
+  + realpath validation lands in 4.2b.iii.
+- **No bgLogDir per-worktree.** `requiresBgManager` tools are
+  still refused under any isolation; 4.2b.iv lifts the gate
+  after wiring per-worktree bg log directories.
+- **No planMode threading to subprocess.** The 4.2a in-process
+  flow forwarded `config.planMode` to the child harness. The
+  subprocess child today doesn't read planMode from the audit
+  row (the audit doesn't store it). Adding a column or a
+  separate IPC channel for run-level flags lands in .ii.b.
+  Until then, plan-mode subagents would silently lose the
+  flag — but the parent's `task` tool gate (planSafe:false)
+  already refuses spawning under plan mode, so the surface is
+  closed at a higher layer.
+- **No real-binary integration test.** Unit tests inject
+  `SpawnChildProcess` fakes; they verify every parent-side
+  behavior except "the default factory's argv resolution
+  produces a runnable binary." Test for that lives outside
+  bun-test (eval / smoke suite) because it requires either a
+  compiled binary in `dist/` or a dev `bun run` exec path,
+  neither available reliably in the unit-test loop.
+- **`onEvent` doesn't deliver child events to the parent.**
+  The subprocess can't stream HarnessEvents across the IPC
+  boundary; the parent sees only the terminal payload. Hook
+  reserved for parity with the in-process API. M4's TUI work
+  may add a separate event-stream channel via SQLite or an
+  IPC pipe.
+
+**Review pass (post-self-review).** Self-review surfaced 4
+critical + 5 medium + 3 minor. All addressable items addressed
+in the same commit chain; the four deferred items are recorded
+in Pending.
+
+- **C1 — child stdout/stderr never drained.** `Bun.spawn` was
+  configured `stdout: 'pipe', stderr: 'pipe'` but neither
+  stream was read; a child that wrote > pipe buffer (~64KB on
+  Linux) to stderr would block on write. Symptom would have
+  been "long subagent runs randomly hang." Fix: stdout now
+  `'ignore'` (production children shouldn't write to stdout —
+  IPC is via SQLite); stderr `'pipe'` and drained in
+  background. Captured stderr is dropped today; future slice
+  routes to per-worktree log dirs.
+- **C2 — `appendMessage` failure between audit insert and
+  spawn leaked the worktree.** Original try/catch wrapped only
+  `insertSubagentRun`; a throw from `appendMessage` (FK
+  concurrent delete, schema drift) left the worktree dir + the
+  agent branch on disk with no operator-visible audit. Fix:
+  shared `cleanupOnFail` helper covering audit insert,
+  appendMessage, and the spawn call; any throw cleans up
+  consistently. New regression test forces the failure by
+  dropping the messages table mid-flight.
+- **C3 — `Bun.spawn` synchronous throw escaped the runtime.**
+  ENOENT (binary not found), EACCES, out-of-fds, etc. all
+  produce a synchronous exception from Bun. Without the catch,
+  the caller saw an unhandled throw instead of a recoverable
+  `RunSubagentResult`. Fix: spawn wrapped in try/catch that
+  cleans up worktree and resolves with `status='error',
+  reason='subprocess_spawn_failed'`. New reason added to the
+  RunSubagentResult union; `worktreeError`-shaped side-channel
+  carries the original message for diagnosis.
+- **C4 — parent and child wall-clock raced.** Both used the
+  same `definition.budget.maxWallClockMs`; if both fire at the
+  same instant, the parent's SIGTERM/SIGKILL could land
+  mid-`setSubagentPayload` from the child's own
+  wall-clock-induced cleanup, losing the terminal envelope.
+  Fix: parent's effective wall-clock now defaults to
+  `childWallClockMs + 2 × graceMs`, giving the child time to
+  hit its own budget AND publish before the parent's outer
+  kill fires. Caller's explicit `wallClockMs` overrides
+  (tests rely on this for fast timeout exercise).
+- **M1 — `signal.aborted` race with `exitedResolved`.** SIGINT
+  propagates to the whole process group, so a child can exit
+  before the wait loop ever set `killed='aborted'`. The
+  exited-branch then fell through to `crashed`, misreporting a
+  user abort as a crash. Fix: explicit `signal.aborted` check
+  at the top of the exited branch. Regression test pre-aborts
+  the controller and uses a fixture that exits immediately
+  without payload — must surface as `aborted`.
+- **M4 + m2 — extracted `resolveChildBinaryCmd` + renamed
+  `validateChildRegistry`.** The argv-detection heuristic was
+  inline and untested; now a pure function with 6 unit tests
+  covering compiled binary, dev script, extended suffixes
+  (`.ts`, `.js`, `.mts`, `.cts`, `.mjs`), edge cases (argv
+  missing, single-element argv, no-extension binary).
+  `validateChildRegistry` returned `void`; renamed to
+  `assertWhitelistValidForSubagent` so the void return matches
+  the imperative name.
+
+**Pending (deferred — not blocking, recorded for visibility):**
+
+- **M2 — policy drift between parent spawn and child read.**
+  Child re-resolves `.agent/permissions.yaml` etc. on its own
+  startup; if the file changed between spawn and child read,
+  the child runs under a different policy than the parent
+  expected. Race window is hundreds of ms in practice. Fix
+  candidate: persist policy snapshot on the audit row similar
+  to system_prompt + tools_whitelist; blocks 4.2b.ii.b which
+  also needs to forward planMode/temperature to the child.
+- **M3 — stale 'running' rows when parent crashes between
+  createSession and spawn.** `completeSession` never fires;
+  operator's `--list-sessions` shows the row as still running
+  forever. The 4.2b.ii.b heartbeat poller will detect this
+  via "is_subagent + status='running' + last_heartbeat NULL
+  for > N seconds" and mark stale. Closing the gap requires
+  the heartbeat machinery anyway; defer to the same slice.
+- **M5 — concurrent subagent spawns from same parent.**
+  Two `task()` calls in the same model turn produce two
+  parallel children; each gets its own session id + worktree
+  + outputs row, so logically should work. Untested. SQLite
+  WAL mode handles concurrent writes; risk is theoretical
+  but operationally unverified. Add a fixture in 4.2b.ii.b
+  alongside the heartbeat work where parallel children are
+  the expected stress shape.
+- **m1 — poll cadence aggressive on the cold start.**
+  50ms → 100 → 200 → 400 → 500 cap means ~5 polls in the
+  first second. Each poll runs an indexed SELECT on
+  `subagent_outputs`, which competes with the child's UPDATE
+  briefly via SQLite reader-writer locking. Fine under
+  unit-test load, possibly suboptimal under thousand-subagent
+  CI. Tune (or move to event-driven via a notifier table) if
+  benchmarks justify; trivial change.
+- **m3 — `handle.kill` typed strictly to `'SIGTERM' |
+  'SIGKILL'`.** Bun.spawn accepts any signal name; we
+  restrict for caller safety (a future caller passing
+  SIGUSR1 wouldn't behave as the wait loop expects). Kept;
+  documenting the intent is enough.
+
+**Verification (post-review):** `bun test` 1275 pass / 11
+skip / 0 fail (+9 across the new failure paths, the argv
+resolver, and the abort race); `tsc --noEmit` clean;
+`biome check` clean.
+
+**Next:** M3 / Step 4.2b.ii.b — heartbeat writer in the child
+loop + parent-side stale-row poller + planMode/temperature
+forwarding via the audit row (closes M2 + M3 + the planMode
+regression noted above). Add the parallel-children stress
+fixture (M5) at the same time. After .ii.b, .iii (symlink
+hardening) and .iv (bgLogDir per-worktree) finish out the
+4.2b arc.
+
+---
+
+## [2026-04-30] M3 / Step 4.2b.i — subagent_outputs IPC schema
+
+The 4.2a closing entry left subagents running in-process: a child
+crash takes the parent down, audit only lands post-cleanup (FK
+to sessions(id) requires the child session to exist), and there
+is no place for a subprocess to write liveness signals. Step
+4.2b moves execution to a separate Bun subprocess with SQLite as
+the unidirectional channel (spec AGENTIC_CLI §11:1030 — "mesmo
+binário, processo separado, comunicação via SQLite (write-only
+do filho, read-only do pai)"). That work is too large for a
+single PR; this slice (4.2b.i) lands ONLY the schema + repo so
+the design of the IPC table can be reviewed in isolation.
+4.2b.ii will write the runtime that uses it, .iii hardens
+symlinks per SECURITY §8.4, .iv wires per-worktree bgLogDir.
+
+**Slice scope:**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/storage/migrations/014-subagent-outputs.ts` | NEW | Single table: `session_id PK FK CASCADE`, `payload TEXT` (nullable JSON), `last_heartbeat INTEGER` (nullable), `created_at` / `updated_at`. Partial index on `last_heartbeat ASC WHERE NOT NULL` for the parent's stale-row poller. |
+| `src/storage/repos/subagent-outputs.ts` | NEW | `insertSubagentOutput`, `updateSubagentHeartbeat`, `setSubagentPayload`, `getSubagentOutput`, `listStaleSubagentOutputs`. Defensive JSON parse on payload — malformed → null, surrounding columns intact. |
+| `src/storage/index.ts` | UPDATED | Re-exports for the new repo. |
+| `src/storage/migrations/index.ts` | UPDATED | Migration 014 registered. |
+| `tests/storage/subagent-outputs.test.ts` | NEW | 15 tests — round-trip, default-null shape, PK conflict, heartbeat update, payload update, payload survives heartbeat-only update, FK CASCADE, parent-purge non-cascade, malformed JSON defense, non-object payload defense, stale list ordering + null exclusion, stale list empty case, missing-row throws (heartbeat + payload), unknown-session lookup. |
+
+**Decisions (D1-D5 locked, D6 deferred to 4.2b.ii):**
+
+- **D1 — schema as `(session_id PK FK CASCADE, payload TEXT, last_heartbeat INTEGER, created_at, updated_at)`.** PK = session_id mirrors `subagent_runs` and `subagent_worktrees` — 1:1 with sessions, the row never outlives the session. An auto-increment id would be one more join with no payoff. payload stored as TEXT under the same convention `messages.content` and `subagent_runs.tools_whitelist` use; consumers parse on read.
+- **D2 — no `status` column.** Subagent lifecycle status already lives on `sessions.status`. Duplicating it here invites the two columns to drift; forensic queries that need "still running" join `sessions` on session_id and filter `sessions.status`. `last_heartbeat IS NULL` distinguishes "row exists but child not active yet" from "child is alive and pulsing".
+- **D3 — partial index on `last_heartbeat ASC WHERE last_heartbeat IS NOT NULL`.** The parent's timeout poller wants the longest-quiet children first; the partial form skips never-heartbeated rows (pre-spawn or spawn-failed; not the timeout subsystem's concern). `created_at` doesn't get an index — no query orders by it today, and the migration runner already handles ordering by id.
+- **D4 — `ON DELETE CASCADE` on the FK to sessions(id), no cascade through parent_session_id.** Same shape locked for migrations 012 and 013: deleting the child session drops its outputs row; deleting the parent runs the existing `parent_session_id ON DELETE SET NULL` and leaves the child + its outputs intact. Operators can purge a parent without losing the child's IPC audit trail.
+- **D5 — defensive JSON parse on payload.** Storage corruption is unlikely (TEXT is opaque to SQLite, only our own code writes), but a malformed payload must NOT crash audit listings. Repo returns `payload: null` and surrounding columns intact; consumers detect via `payload === null` paired with non-null timestamps. Mirror of the same pattern in `subagent-runs.ts` for `tools_whitelist`. We also reject non-object JSON (arrays, scalars) — the typed contract is `Record<string, unknown> | null`, and surfacing a shape the consumer wasn't typed for is worse than null.
+- **D6 (deferred to 4.2b.ii)** — Child entrypoint mechanism (`--subagent-session-id <uuid>` flag is the planned shape), heartbeat frequency (planned 1000ms), SIGTERM grace period (5s per FAILURE_MODES §7.3), bgLogDir path convention (planned `<worktree>/.bg-logs/`). These don't bind anything in 4.2b.i; the schema accommodates whatever cadence and flag shape .ii lands on.
+
+**API decisions inside the repo:**
+
+- **Two write helpers (`updateSubagentHeartbeat`, `setSubagentPayload`), not one.** A heartbeat pulse must not require the child to know its terminal payload yet, and writing the terminal payload must not require an additional heartbeat hop. Both helpers bump `last_heartbeat` AND `updated_at` so the parent never sees a "payload published but child looks dead" state mid-write — consumers see them atomically.
+- **Both write helpers throw on missing row.** The 4.2b.ii flow always inserts before the first heartbeat; a missing row indicates a programmer / sequencing bug rather than a recoverable runtime state. Failing loud surfaces the bug at the call site instead of letting the pulse silently no-op.
+- **Insert defaults `payload` and `lastHeartbeat` to null.** The canonical 4.2b.ii sequence is INSERT (null payload, null heartbeat) → first heartbeat UPDATE → … → final payload UPDATE → exit. The optional fields let tests stage pre-populated rows without follow-up updates.
+
+**What this DOESN'T close (already known, out of scope for the schema slice):**
+
+- **No subprocess yet.** runSubagent still runs in-process (4.2a path); no code populates `subagent_outputs` yet. The table sits empty until 4.2b.ii.
+- **No symlink hardening.** SECURITY_GUIDELINE §8.4 deny-list and realpath validation land in 4.2b.iii.
+- **No bgLogDir per-worktree.** `requiresBgManager` tools are still refused under any isolation; 4.2b.iv lifts the gate after wiring per-worktree bg log directories.
+- **No timeout enforcer.** The repo provides `listStaleSubagentOutputs` for the future poller but the poller itself (which translates a stale row into SIGTERM → grace → SIGKILL) is 4.2b.ii.
+- **Schema doesn't store the wall-clock budget.** A future timeout enforcer needs to know each child's `maxWallClockMs` to compute the cutoff. That field already lives on `subagent_runs.budget_max_wall_ms` (migration 012); the poller joins instead of duplicating.
+
+**Review pass (post-self-review).** Self-review surfaced 1
+critical + 3 medium + 3 minor. All addressed in the same commit
+chain.
+
+- **C1 — UPDATE helpers didn't protect against retroactive ts.**
+  `updateSubagentHeartbeat` / `setSubagentPayload` did `SET col
+  = ?` blindly; an out-of-order ts (NTP step backward on the
+  child host, container reinit, VM migration between hosts with
+  skewed clocks, retried writes from test fixtures) would
+  regress `last_heartbeat` and the parent's poller would mark a
+  healthy child as stale, sending SIGTERM. Fix: both helpers now
+  `SET last_heartbeat = MAX(IFNULL(last_heartbeat, 0), ?),
+  updated_at = MAX(updated_at, ?)`. `IFNULL(...,0)` covers the
+  first heartbeat case where the column starts NULL. The
+  `setSubagentPayload` helper still overwrites `payload`
+  unconditionally — a re-publish from a retried final-write
+  must end up with the latest envelope, which is the child's
+  authoritative state. Locked by two regression tests:
+  out-of-order heartbeat doesn't regress, out-of-order
+  setSubagentPayload writes payload but keeps ts forward.
+- **M1 — `setSubagentPayload` re-publish wasn't tested.** The
+  doc treats the call as "last write before exit", but the repo
+  permits re-publish (UPDATE, not INSERT) so a retried
+  final-write lands. Locked by an explicit test that calls the
+  helper twice and asserts the second envelope wins.
+- **M2 — empty object payload `{}` boundary case.** The
+  `parsePayload` reject path treats arrays and scalars as
+  shape-violating (returns null); `{}` is a structurally valid
+  Record<string, unknown> with no keys and must round-trip
+  intact. Test asserts the cycle preserves the empty object
+  reference (not collapsed to null).
+- **M3 — `lastHeartbeat: 0` semantics documented.** Nothing
+  enforces that ts inputs are `Date.now()`-shaped; the schema
+  accepts any positive integer. Comment on
+  `InsertSubagentOutputInput.lastHeartbeat` notes that values
+  like 0 are technically accepted but semantically meaningless
+  and would surface as "ancient" rows in
+  `listStaleSubagentOutputs`. Tests that need determinism
+  should use small plausible epoch values so MAX-guarded
+  updates have room to advance.
+- **m1 — no index on `updated_at`.** Migration comment now
+  records that the column is on the row for future audit
+  queries but the index is deferred to "first real query"
+  (likely a janitor in 4.2b.ii that prunes stale outputs whose
+  owning sessions already finished). Adding a partial index in
+  a follow-up migration is cheaper than indexing speculatively.
+
+**Pending (deferred — not blocking, recorded for visibility):**
+
+- **`parsePayload` collapses parse-error and shape-error into
+  null.** A forensic audit consumer investigating "why did
+  payload disappear?" can't distinguish "JSON malformed" from
+  "JSON valid but not an object". A future helper could return
+  `{ value } | { error: 'parse' | 'shape' }`; deferred —
+  overkill for 4.2b.i, may pay for itself once 4.2b.ii produces
+  real corruption rates.
+- **`Record<string, unknown>` on payload is intentionally
+  loose.** The real shape is the subagent envelope (status,
+  reason, cost_usd, output, etc — see `SubagentEnvelope` in
+  `subagents/runtime.ts`). Importing that type into the storage
+  repo would create a cyclic dep (`storage` ← `subagents`); the
+  cleaner shape is a higher-layer envelope helper that the
+  4.2b.ii subprocess code routes through. Land that with the
+  subprocess work.
+
+**Verification (post-review):** `bun test` 1262 pass / 11 skip /
+0 fail (+19 across the schema repo); `tsc --noEmit` clean;
+`biome check` clean.
+
+**Next:** M3 / Step 4.2b.ii — subprocess spawn + heartbeat writer + parent-side timeout poller + IPC plumbing in `runSubagent`. Replaces the in-process `runAgent` call with `Bun.spawn` of the same binary in subagent-child mode (entrypoint detection via `--subagent-session-id <uuid>`); child writes via the helpers landed here, parent reads + enforces the wall-clock budget via SIGTERM/SIGKILL sequencing per FAILURE_MODES §7.3. Step 4.2b.iii (symlink hardening) and .iv (bgLogDir per-worktree) follow.
+
+---
+
 ## [2026-04-30] M3 / Step 4.2a — worktree skeleton (write-tool gate lifted)
 
 The Step 4.1 closing entry left every writing subagent unrunnable:

@@ -104,3 +104,15 @@ export type {
   SubagentWorktree,
   SubagentWorktreeStatus,
 } from './repos/subagent-worktrees.ts';
+
+export {
+  getSubagentOutput,
+  insertSubagentOutput,
+  listStaleSubagentOutputs,
+  setSubagentPayload,
+  updateSubagentHeartbeat,
+} from './repos/subagent-outputs.ts';
+export type {
+  InsertSubagentOutputInput,
+  SubagentOutput,
+} from './repos/subagent-outputs.ts';

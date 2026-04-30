@@ -25,6 +25,35 @@ const main = async (): Promise<number> => {
     return 0;
   }
 
+  // Subagent-child mode (Step 4.2b.ii.a). The parent process
+  // spawns the same binary with this flag set; the value is the
+  // pre-created child session id. Short-circuits ALL other entry
+  // paths — no prompt, no list-sessions, no resume, no plan.
+  // Lazy import for the same reason as `./run.ts` below: keeps
+  // the help/version branches above immune to provider/storage
+  // wiring failures.
+  if (args.subagentSessionId !== undefined) {
+    const { runSubagentChild } = await import('./subagent-child.ts');
+    return runSubagentChild({
+      sessionId: args.subagentSessionId,
+      // Pass the recursion depth carried across the subprocess
+      // boundary. Defaults to 0 (top-level shape) when omitted —
+      // older parent versions or programmatic callers that
+      // didn't supply the flag get the conservative default.
+      ...(args.subagentDepth !== undefined ? { depth: args.subagentDepth } : {}),
+      // Same shape for sampling temperature — undefined means
+      // "use provider default", explicit value pins the child's
+      // sampling for determinism.
+      ...(args.subagentTemperature !== undefined ? { temperature: args.subagentTemperature } : {}),
+      // Plan-mode flag (presence-only). Forwards the parent's
+      // run-wide read-only profile so the child's harness gate
+      // refuses writing tools too — defense in depth for any
+      // programmatic caller that invokes runSubagent with
+      // planMode:true.
+      ...(args.subagentPlanMode === true ? { planMode: true } : {}),
+    });
+  }
+
   // Inspection / lifecycle modes don't need a prompt:
   //   - --list-sessions: pure DB read.
   //   - --undo / --checkpoints: DB + git only, no provider call.

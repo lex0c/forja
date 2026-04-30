@@ -206,6 +206,28 @@ export interface HarnessConfig {
   // guard. Caller is responsible for verifying the id exists
   // before constructing the config.
   resumeFromSessionId?: string;
+  // Use a session id that the CALLER already created — skips both
+  // `createSession` (the fresh-session path) and `reopenSession`
+  // (the resume path). Spec §11 subprocess subagents use this:
+  // the parent process creates the child session row + audit
+  // rows BEFORE spawning the child binary; the child runs the
+  // harness against the pre-existing id and never touches the
+  // session lifecycle. The row MUST exist and be in `status =
+  // 'active'` (the just-created shape from `createSession`); the
+  // harness will append messages, run the loop, and call
+  // `completeSession` at the end exactly as a fresh run would.
+  //
+  // Mutually exclusive with `resumeFromSessionId` — preassigned
+  // is "I already created the row, use that id" while resume is
+  // "the row already exists from a prior run, reopen it". Setting
+  // both is a programmer bug; the harness throws.
+  //
+  // Mutually exclusive with `parentSessionId` at the runtime
+  // level too: the parent_session_id is set by the caller during
+  // their own `createSession`, not threaded through here. Setting
+  // both is harmless (parentSessionId is ignored on the
+  // preassigned path) but indicates a confused construction.
+  preassignedSessionId?: string;
   // Checkpoint subsystem (M3 §12). When true, the harness probes
   // `cwd` once at startup and, if the directory is a git repo,
   // takes a snapshot before every step that runs a tool with

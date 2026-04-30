@@ -50,6 +50,47 @@ export interface ParsedArgs {
   // --list-sessions; standalone use is a parse error so the
   // truncation hint that points at this flag stays actionable.
   limit?: number;
+  // Subagent-child mode (M3 §11 / Step 4.2b.ii.a). The parent
+  // process spawns the same binary with this flag set; the value
+  // is the pre-created child session id. Triggers a dedicated
+  // entry path that loads the session + audit row, builds a
+  // HarnessConfig with preassignedSessionId, runs the harness,
+  // publishes the terminal payload to subagent_outputs, and
+  // exits. The flag is internal — users never invoke it
+  // directly. Mutually exclusive with every other CLI mode
+  // (resume, list-sessions, undo, checkpoints, plan).
+  subagentSessionId?: string;
+  // Subagent recursion depth carried across the subprocess
+  // boundary. The parent's `runSubagent` knows the depth this
+  // child will run at; passing it via this flag lets the child's
+  // harness config keep `subagentDepth` non-zero, so any nested
+  // task() call increments from the right baseline and trips
+  // MAX_SUBAGENT_DEPTH at the chain-wide limit (not per-process).
+  // Without this, every subprocess would reset to 0 and a
+  // sufficiently deep chain could fan out unbounded. Internal
+  // flag, paired with --subagent-session-id; ignored when that
+  // flag is absent.
+  subagentDepth?: number;
+  // Sampling temperature carried across the subprocess boundary.
+  // Eval / automation workflows pin temperature=0 for
+  // determinism; without this propagation, the subprocess child
+  // would silently fall back to the provider default (typically
+  // ~1.0) and break reproducibility. Internal flag, paired with
+  // --subagent-session-id. When omitted the child runs at the
+  // provider's default — same semantics as the top-level harness.
+  subagentTemperature?: number;
+  // Plan-mode flag carried across the subprocess boundary.
+  // Presence = true (no value); absence = false. The top-level
+  // `task` tool gate (planSafe:false) refuses spawning under
+  // plan mode TODAY, so the practical user-visible scenario is
+  // closed at a higher layer. But: programmatic callers that
+  // invoke `runSubagent({ planMode: true })` directly bypass
+  // the top-level gate, AND a future regression flipping the
+  // task tool's planSafe back to true would reopen the surface.
+  // Forwarding here is defense in depth — the child's harness
+  // gate also refuses writes under planMode, so a write tool
+  // in the whitelist is doubly blocked.
+  subagentPlanMode?: boolean;
 }
 
 export interface ParseError {
@@ -214,6 +255,83 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
           };
         }
         args.limit = Number.parseInt(value, 10);
+        i += 2;
+        break;
+      }
+      case '--subagent-session-id': {
+        const value = argv[i + 1];
+        if (value === undefined || value.startsWith('--')) {
+          return {
+            ok: false,
+            message:
+              '--subagent-session-id requires a session id (internal flag; not for user invocation)',
+          };
+        }
+        args.subagentSessionId = value;
+        i += 2;
+        break;
+      }
+      case '--subagent-depth': {
+        const value = argv[i + 1];
+        if (value === undefined) {
+          return {
+            ok: false,
+            message: '--subagent-depth requires a non-negative integer (internal flag)',
+          };
+        }
+        // Allow 0 (top-level shape, just in case) — POSITIVE_INT
+        // would reject it. Hand-validated.
+        if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+          return {
+            ok: false,
+            message: `--subagent-depth must be a non-negative integer, got '${value}'`,
+          };
+        }
+        args.subagentDepth = Number.parseInt(value, 10);
+        i += 2;
+        break;
+      }
+      case '--subagent-plan-mode':
+        // Presence-only flag (no value), mirroring `--plan`.
+        // Setting to false would require the absence form; we
+        // never need to pass a literal "false" because the
+        // child defaults to non-plan-mode when the flag isn't
+        // supplied.
+        args.subagentPlanMode = true;
+        i += 1;
+        break;
+      case '--subagent-temperature': {
+        const value = argv[i + 1];
+        if (value === undefined) {
+          return {
+            ok: false,
+            message: '--subagent-temperature requires a finite non-negative number (internal flag)',
+          };
+        }
+        // Provider temperature is conventionally 0..2 but the
+        // exact upper bound varies; we accept any finite
+        // non-negative number and let the provider clamp/refuse.
+        // Use `Number()` (NOT `Number.parseFloat`) — parseFloat
+        // accepts leading-digit garbage (`'1abc'` → 1) which
+        // would silently swallow a typo. `Number()` returns NaN
+        // for any partial match. The explicit empty-check
+        // catches the one Number() footgun: `Number('')` is 0,
+        // which would otherwise pass the finite/non-negative
+        // tests and land as temperature=0 silently.
+        if (value.trim().length === 0) {
+          return {
+            ok: false,
+            message: '--subagent-temperature got an empty value',
+          };
+        }
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed) || parsed < 0) {
+          return {
+            ok: false,
+            message: `--subagent-temperature must be a finite non-negative number, got '${value}'`,
+          };
+        }
+        args.subagentTemperature = parsed;
         i += 2;
         break;
       }

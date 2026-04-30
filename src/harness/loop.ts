@@ -292,6 +292,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // when we read totalCostUsd. The cost of one extra SELECT per
       // resume call is negligible.
       const resumeId = config.resumeFromSessionId;
+      const preassignedId = config.preassignedSessionId;
+      if (resumeId !== undefined && preassignedId !== undefined) {
+        // Defense in depth: the two paths are mutually exclusive —
+        // resume reopens an existing finalized session, preassigned
+        // uses a freshly-created row the caller built. Setting both
+        // is a programmer bug, fail loud rather than guess intent.
+        throw new Error(
+          'HarnessConfig: resumeFromSessionId and preassignedSessionId are mutually exclusive',
+        );
+      }
       if (resumeId !== undefined) {
         const existing = getSession(config.db, resumeId);
         if (existing === null) {
@@ -315,6 +325,31 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         priorUsageComplete = existing.usageComplete;
         reopenSession(config.db, resumeId);
         sessionId = resumeId;
+      } else if (preassignedId !== undefined) {
+        // Caller-created row. Verify it exists and matches the
+        // expected shape (cwd, status='running'). The cwd check
+        // mirrors resume's — relative paths in messages must
+        // resolve consistently between the row's recorded cwd
+        // and the runtime cwd. The status check guards against
+        // accidentally rerunning over a finalized session, which
+        // would silently overwrite messages.
+        const existing = getSession(config.db, preassignedId);
+        if (existing === null) {
+          throw new Error(
+            `preassignedSessionId ${preassignedId} not found; the caller must createSession before constructing the config`,
+          );
+        }
+        if (existing.cwd !== config.cwd) {
+          throw new Error(
+            `preassignedSessionId ${preassignedId}: row cwd is '${existing.cwd}', config cwd is '${config.cwd}' — must match`,
+          );
+        }
+        if (existing.status !== 'running') {
+          throw new Error(
+            `preassignedSessionId ${preassignedId}: row status is '${existing.status}', expected 'running' (only fresh, unfinalized rows are usable)`,
+          );
+        }
+        sessionId = preassignedId;
       } else {
         const session = createSession(config.db, {
           model: config.provider.id,
@@ -396,10 +431,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         }
       }
 
-      // Resume path: hydrate messages from persistence BEFORE
-      // appending the new user prompt. The model sees [old turns,
-      // new prompt] and continues naturally. The new prompt is
-      // also persisted so the next resume sees it too.
+      // Hydrate persisted messages BEFORE appending the new user
+      // prompt. Two paths converge here:
+      //   - Resume: the prior run's full transcript is on disk;
+      //     load it so the model sees [old turns, new prompt].
+      //   - Preassigned: the caller (subprocess parent) created
+      //     the row and inserted the seed user message before
+      //     spawning. We need to load that seed too — otherwise
+      //     the child sees an empty conversation and appends a
+      //     fresh prompt-from-config that would silently NOT match
+      //     what the parent committed.
+      // Both paths share the same fetch + alignment walk; only
+      // the trigger condition differs.
       //
       // Bounded fetch: SQL returns at most (MAX + alignment
       // margin) rows, so a 50k-message session never materializes
@@ -413,21 +456,22 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // inside the fetched slice. Kept count is what the model
       // actually sees in context.
       //
-      // Carry forward the parent_id chain across resume. Without
-      // seeding lastMessageId from the prior tail, the new user
-      // turn appends with parent_id=null and starts a NEW root in
-      // the same session — the parent_id graph forks at every
-      // resume boundary, breaking traversal/replay/audit logic
-      // that walks parent links to reconstruct the conversation
-      // tree. The persisted tail is already ordered by seq
-      // (migration 007), so the tail is just the last element of
-      // what we fetched (which IS the absolute tail since the
-      // bounded fetch picks newest rows).
+      // Carry forward the parent_id chain across resume /
+      // preassigned. Without seeding lastMessageId from the prior
+      // tail, the new user turn appends with parent_id=null and
+      // starts a NEW root in the same session — the parent_id
+      // graph forks at the boundary, breaking traversal/replay/
+      // audit logic that walks parent links to reconstruct the
+      // conversation tree. The persisted tail is already ordered
+      // by seq (migration 007), so the tail is just the last
+      // element of what we fetched (which IS the absolute tail
+      // since the bounded fetch picks newest rows).
       let priorTailId: string | null = null;
-      if (resumeId !== undefined) {
+      const preexistingId = resumeId ?? preassignedId;
+      if (preexistingId !== undefined) {
         const tail = listMessageTailBySession(
           config.db,
-          resumeId,
+          preexistingId,
           MAX_RESUME_MESSAGES + ALIGNMENT_FETCH_MARGIN,
         );
         const restored = messagesToProviderMessages(tail.messages);
@@ -435,7 +479,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         const fetchedCount = tail.messages.length;
         const droppedBeyondFetch = tail.totalCount - fetchedCount;
         const totalDropped = droppedBeyondFetch + restored.droppedFromHead;
-        if (totalDropped > 0) {
+        if (totalDropped > 0 && resumeId !== undefined) {
+          // resume_truncated emits only on the resume path. The
+          // preassigned path's seed is freshly inserted by the
+          // parent (typically a single user message) and
+          // truncation there would indicate something is off
+          // with the parent's flow — but it's not a "user
+          // resumed and lost context" event the renderer needs
+          // to surface.
           safeEmit(config.onEvent, {
             type: 'resume_truncated',
             sessionId,
@@ -453,25 +504,49 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // to satisfy alternation. Not persisted: each resume
         // re-derives it on demand from whatever shape the log is
         // in at that moment.
+        //
+        // The placeholder is ONLY needed when we're about to
+        // append a new user prompt. On the preassigned path with
+        // an empty userPrompt (the parent already seeded the
+        // user turn), the seed itself IS the conversation and
+        // we don't append again — so a trailing-user tail is
+        // correct, not stranded.
         const inMemoryTail = messages[messages.length - 1];
-        if (inMemoryTail !== undefined && inMemoryTail.role === 'user') {
+        const willAppendUserPrompt = config.userPrompt.length > 0;
+        if (willAppendUserPrompt && inMemoryTail !== undefined && inMemoryTail.role === 'user') {
           messages.push({ role: 'assistant', content: STRANDED_TURN_PLACEHOLDER });
         }
         const lastFetched = tail.messages[tail.messages.length - 1];
         if (lastFetched !== undefined) priorTailId = lastFetched.id;
       }
 
-      const userMsg = appendMessage(config.db, {
-        sessionId,
-        role: 'user',
-        content: config.userPrompt,
-        // null on first turn (new session); tail id on resume so
-        // the chain stays connected. appendMessage validates the
-        // parent belongs to the same session.
-        ...(priorTailId !== null ? { parentId: priorTailId } : {}),
-      });
-      lastMessageId = userMsg.id;
-      messages.push({ role: 'user', content: config.userPrompt });
+      // Skip appending when userPrompt is empty. The preassigned
+      // path with parent-seeded conversation passes '' here; the
+      // hydration above already loaded the seed, so a second
+      // append with empty content would produce a zero-byte user
+      // message that providers either reject or take literally.
+      // The fresh-session path always supplies a non-empty
+      // userPrompt (CLI guards against missing prompt before
+      // bootstrap).
+      if (config.userPrompt.length > 0) {
+        const userMsg = appendMessage(config.db, {
+          sessionId,
+          role: 'user',
+          content: config.userPrompt,
+          // null on first turn (new session); tail id on resume
+          // / preassigned so the chain stays connected.
+          // appendMessage validates the parent belongs to the
+          // same session.
+          ...(priorTailId !== null ? { parentId: priorTailId } : {}),
+        });
+        lastMessageId = userMsg.id;
+        messages.push({ role: 'user', content: config.userPrompt });
+      } else if (priorTailId !== null) {
+        // No new user message to append; the prior tail id
+        // becomes the lastMessageId we report on the result and
+        // the chain anchor for the assistant turn that follows.
+        lastMessageId = priorTailId;
+      }
 
       safeEmit(config.onEvent, { type: 'session_start', sessionId });
       // Emit the checkpoints-unavailable warning AFTER session_start
@@ -836,6 +911,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     // gate already refused `task` itself in plan mode,
                     // but a future bypass would still be contained.
                     ...(config.planMode === true ? { planMode: true } : {}),
+                    // Sampling temperature is also a run-wide property.
+                    // The harness uses it for its own provider calls
+                    // (line ~594); subagent runs MUST inherit so that
+                    // eval / automation pipelines pinning
+                    // temperature=0 see deterministic behavior across
+                    // the entire chain. Without this forward, the
+                    // subprocess child would silently fall back to
+                    // the provider default and break reproducibility.
+                    ...(config.temperature !== undefined
+                      ? { temperature: config.temperature }
+                      : {}),
                     // Increment depth: the child being spawned is one
                     // level deeper than this run.
                     depth: childDepth,

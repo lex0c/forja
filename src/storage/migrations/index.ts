@@ -11,6 +11,8 @@ import { migration010Subagents } from './010-subagents.ts';
 import { migration011SessionsIsSubagent } from './011-sessions-is-subagent.ts';
 import { migration012SubagentRuns } from './012-subagent-runs.ts';
 import { migration013SubagentWorktrees } from './013-subagent-worktrees.ts';
+import { migration014SubagentOutputs } from './014-subagent-outputs.ts';
+import { migration015SubagentRunsPolicy } from './015-subagent-runs-policy.ts';
 
 export interface Migration {
   id: number;
@@ -32,4 +34,6 @@ export const MIGRATIONS: readonly Migration[] = [
   migration011SessionsIsSubagent,
   migration012SubagentRuns,
   migration013SubagentWorktrees,
+  migration014SubagentOutputs,
+  migration015SubagentRunsPolicy,
 ];

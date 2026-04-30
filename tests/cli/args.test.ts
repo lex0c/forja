@@ -339,6 +339,135 @@ describe('--checkpoints flag', () => {
   });
 });
 
+describe('--subagent-session-id', () => {
+  test('captures the value into args.subagentSessionId', () => {
+    const r = parseArgs(['--subagent-session-id', 'abc-123']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentSessionId).toBe('abc-123');
+  });
+
+  test('rejects when value is missing', () => {
+    expect(parseArgs(['--subagent-session-id']).ok).toBe(false);
+    expect(parseArgs(['--subagent-session-id', '--json']).ok).toBe(false);
+  });
+
+  test('absent by default', () => {
+    const r = parseArgs(['hi']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentSessionId).toBeUndefined();
+  });
+});
+
+describe('--subagent-depth', () => {
+  test('captures non-negative integer into args.subagentDepth', () => {
+    for (const value of ['0', '1', '4', '99']) {
+      const r = parseArgs(['--subagent-depth', value]);
+      expect(r.ok).toBe(true);
+      if (!r.ok) continue;
+      expect(r.args.subagentDepth).toBe(Number.parseInt(value, 10));
+    }
+  });
+
+  test('rejects when value is missing', () => {
+    expect(parseArgs(['--subagent-depth']).ok).toBe(false);
+  });
+
+  test('rejects negative or non-integer values', () => {
+    for (const bad of ['-1', '1.5', 'abc', '03', '']) {
+      const r = parseArgs(['--subagent-depth', bad]);
+      expect(r.ok).toBe(false);
+    }
+  });
+
+  test('absent by default', () => {
+    const r = parseArgs(['hi']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentDepth).toBeUndefined();
+  });
+});
+
+describe('--subagent-temperature', () => {
+  test('captures finite non-negative number into args.subagentTemperature', () => {
+    for (const value of ['0', '0.0', '0.5', '1', '1.5', '2.0', '0.0001']) {
+      const r = parseArgs(['--subagent-temperature', value]);
+      expect(r.ok).toBe(true);
+      if (!r.ok) continue;
+      expect(r.args.subagentTemperature).toBe(Number.parseFloat(value));
+    }
+  });
+
+  test('rejects when value is missing', () => {
+    expect(parseArgs(['--subagent-temperature']).ok).toBe(false);
+  });
+
+  test('rejects negative values', () => {
+    expect(parseArgs(['--subagent-temperature', '-0.1']).ok).toBe(false);
+    expect(parseArgs(['--subagent-temperature', '-1']).ok).toBe(false);
+  });
+
+  test('rejects non-finite (NaN, Infinity, garbage)', () => {
+    for (const bad of ['NaN', 'Infinity', '-Infinity', 'abc', '']) {
+      const r = parseArgs(['--subagent-temperature', bad]);
+      expect(r.ok).toBe(false);
+    }
+  });
+
+  test('rejects leading-digit garbage like "1abc" (parseFloat footgun defense)', () => {
+    // Number.parseFloat('1abc') returns 1 — the parser's earlier
+    // implementation would have silently accepted it as
+    // temperature=1. Number() returns NaN for partial matches,
+    // caught by the finite check. This test locks the strict
+    // interpretation so a future revert to parseFloat surfaces.
+    for (const bad of ['1abc', '1.5xyz', '0e', '.', '1..5', '+', '-']) {
+      const r = parseArgs(['--subagent-temperature', bad]);
+      expect(r.ok).toBe(false);
+    }
+  });
+
+  test('absent by default — child falls through to provider default', () => {
+    const r = parseArgs(['hi']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentTemperature).toBeUndefined();
+  });
+});
+
+describe('--subagent-plan-mode', () => {
+  test('presence-only flag sets args.subagentPlanMode = true', () => {
+    const r = parseArgs(['--subagent-plan-mode']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentPlanMode).toBe(true);
+  });
+
+  test('absent by default — child runs without plan-mode gate', () => {
+    const r = parseArgs(['hi']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentPlanMode).toBeUndefined();
+  });
+
+  test('coexists with --subagent-session-id and --subagent-depth', () => {
+    // The internal flags arrive together in the spawn command;
+    // the parser must accept any order.
+    const r = parseArgs([
+      '--subagent-session-id',
+      'abc',
+      '--subagent-depth',
+      '2',
+      '--subagent-plan-mode',
+    ]);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentSessionId).toBe('abc');
+    expect(r.args.subagentDepth).toBe(2);
+    expect(r.args.subagentPlanMode).toBe(true);
+  });
+});
+
 describe('usage', () => {
   test('mentions every recognized flag', () => {
     const u = usage();
