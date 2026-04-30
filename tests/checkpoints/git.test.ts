@@ -452,6 +452,54 @@ describe('restore', () => {
     expect(stashList.trim()).toBe('');
   });
 
+  test('preserves ignored files that collide with checkpoint paths', async () => {
+    // Bug: `git stash push -u` excludes ignored files. If a path
+    // is in the checkpoint (because at snapshot time .gitignore
+    // didn't list it) but is now ignored locally, read-tree --reset
+    // -u overwrites the on-disk version and the stash never saw it.
+    // The user's content is permanently lost.
+    //
+    // Setup the exact shape: snapshot a file that's untracked-not-
+    // ignored, then later add it to .gitignore and edit it. The
+    // file was never `git add`-ed by the user — only captured by
+    // our snapshot's `git add -A .` at a moment when the gitignore
+    // didn't apply.
+    await initRepoWithCommit(repo);
+    await writeFile(join(repo, 'config.txt'), 'original\n');
+    // Snapshot before .gitignore — config.txt lands in the ckpt
+    // tree as a previously-untracked-non-ignored file.
+    const ckpt = await snapshot({
+      cwd: repo,
+      sessionId: 's',
+      stepId: 'm',
+      iso: 'iso',
+    });
+    expect(ckpt.sha).not.toBeNull();
+    // Now make config.txt ignored AND edit it. The user's edit
+    // is what restore would destroy without the fix.
+    await writeFile(join(repo, '.gitignore'), 'config.txt\n');
+    await writeFile(join(repo, 'config.txt'), 'user-edit\n');
+
+    const result = await restore(repo, ckpt.sha as string);
+    expect(result.stashed).toBe(true);
+    expect(result.stashRef).toBeDefined();
+    // Routed to the custom-ref preservation path because the regular
+    // `stash pop` would conflict with the checkpoint's restored copy
+    // of the same path.
+    expect(result.stashKind).toBe('agent-ref');
+    expect(result.stashRef).toMatch(/^refs\/agent\/restore-saved\//);
+
+    // After restore, working tree has the checkpoint's version.
+    expect(await Bun.file(join(repo, 'config.txt')).text()).toBe('original\n');
+
+    // The user's "user-edit" content is preserved in the
+    // refs/agent/restore-saved/* commit's tree. `git read-tree
+    // --reset -u <ref>` is the documented recovery — applies the
+    // saved tree over the working tree, restoring user-edit content.
+    await runGit(repo, ['read-tree', '--reset', '-u', result.stashRef as string]);
+    expect(await Bun.file(join(repo, 'config.txt')).text()).toBe('user-edit\n');
+  });
+
   test('throws on a non-existent commit before stashing', async () => {
     await initRepoWithCommit(repo);
     await writeFile(join(repo, 'dirty.txt'), 'work-in-progress\n');

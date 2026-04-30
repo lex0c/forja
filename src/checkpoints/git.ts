@@ -178,10 +178,16 @@ export const resolveRef = async (cwd: string, ref: string): Promise<string | nul
 export const sessionRef = (sessionId: string): string => `refs/agent/checkpoints/${sessionId}`;
 
 // Namespace for working-tree preservation commits created when
-// restore() can't use git stash (unborn HEAD path). Suffix is
-// `<timestampMs>-<8-char-uuid>`: the timestamp drives the lazy
-// retention sweep (drop refs older than cutoff), the UUID slice
-// avoids collisions when two restores land in the same ms.
+// restore() can't use git stash. Two cases route here:
+//   1. Unborn HEAD — git stash refuses without an initial commit.
+//   2. Ignored↔checkpoint path collision — `stash push -a` would
+//      capture the ignored file, but `git stash pop` then refuses
+//      to write it because read-tree already placed the checkpoint
+//      version at that path. The custom recovery (`git read-tree
+//      --reset -u <ref>`) overwrites unconditionally.
+// Suffix is `<timestampMs>-<8-char-uuid>`: the timestamp drives
+// the lazy retention sweep (drop refs older than cutoff), the UUID
+// slice avoids collisions when two restores land in the same ms.
 export const RESTORE_SAVED_REF_PREFIX = 'refs/agent/restore-saved/';
 
 const restoreSavedRefName = (): string => {
@@ -358,6 +364,71 @@ export interface RestoreResult {
   stashKind?: 'git-stash' | 'agent-ref';
 }
 
+// True when the checkpoint commit contains at least one path that
+// currently exists locally as an ignored file. That collision is the
+// data-loss case `stash push -u` doesn't cover — `-u` excludes
+// ignored files, so without escalation the read-tree below overwrites
+// the user's local copy with no recovery handle. We escalate to
+// `--all` only when collisions actually exist; the common case (no
+// ignored↔ckpt path overlap) keeps the cheap `-u` path.
+//
+// Implementation: list the ckpt's tree once, hand the paths to
+// `git check-ignore --stdin` (NUL-separated for path-with-spaces
+// safety), narrow to those that physically exist on disk. The
+// check-ignore probe is bounded by tree size (one fork, lines
+// streamed); list-tree is sub-second on the project sizes the SLO
+// targets.
+const hasIgnoredCheckpointCollision = async (cwd: string, commitSha: string): Promise<boolean> => {
+  let lsOut: string;
+  try {
+    const res = await runGit(['ls-tree', '-r', '-z', '--name-only', commitSha], { cwd });
+    lsOut = res.stdout;
+  } catch {
+    // If listing the tree fails, we can't tell. Conservative call:
+    // assume no collision and let the caller's regular path run.
+    // The caller has its own commit-existence probe that will surface
+    // the underlying error if the sha is genuinely bad.
+    return false;
+  }
+  const paths = lsOut.split('\0').filter((p) => p.length > 0);
+  if (paths.length === 0) return false;
+  // `git check-ignore --stdin -z` reads NUL-separated paths and emits
+  // matched ones on stdout. Exit code 0 = at least one matched, 1 =
+  // none matched, 128 = error (no .gitignore at all is fine, returns 1).
+  const proc = Bun.spawn({
+    cmd: ['git', 'check-ignore', '--stdin', '-z'],
+    cwd,
+    env: {
+      LC_ALL: 'C',
+      PATH: process.env.PATH ?? '',
+      HOME: process.env.HOME ?? '',
+    },
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const sink = proc.stdin;
+  if (sink === undefined) return false;
+  sink.write(paths.join('\0'));
+  await sink.end();
+  const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  if (exitCode !== 0 && exitCode !== 1) return false;
+  if (exitCode === 1) return false;
+  // At least one path is ignored. Check if any of them physically
+  // exists on disk — only existing files cause data loss; ignored
+  // patterns matching nothing are harmless.
+  const ignored = stdout.split('\0').filter((p) => p.length > 0);
+  for (const p of ignored) {
+    try {
+      await access(join(cwd, p));
+      return true;
+    } catch {
+      // path doesn't exist on disk; not a collision
+    }
+  }
+  return false;
+};
+
 // In-progress git operation markers. Restore is destructive against
 // the index + working tree; running it on top of a paused merge /
 // rebase / cherry-pick / revert / bisect would clobber the user's
@@ -459,10 +530,31 @@ export const restore = async (cwd: string, commitSha: string): Promise<RestoreRe
   let stashRef: string | undefined;
   let stashKind: 'git-stash' | 'agent-ref' | undefined;
   if (dirty) {
-    if (headBefore !== null) {
-      // Regular path: HEAD is born, `git stash push -u` works. -u
-      // keeps untracked files in the stash; -m tags the entry so
-      // the user can identify it in `git stash list`.
+    // Decide between two preservation paths:
+    //   - regular `git stash push -u` (cheap, recovery via stash pop)
+    //   - custom commit-tree under refs/agent/restore-saved/
+    //     (recovery via `git read-tree --reset -u <ref>`)
+    //
+    // The custom path is required when:
+    //   1. HEAD is unborn — git stash refuses ("no initial commit").
+    //   2. A path in the checkpoint exists locally as an ignored
+    //      file. `stash push -u` skips ignored entries; `stash push
+    //      -a` would capture them but `git stash pop` then refuses
+    //      to write the file (read-tree --reset -u below already
+    //      placed the checkpoint's version at that path, and pop
+    //      treats the ignored entry as untracked → "file already
+    //      exists"). The custom ref-based recovery uses read-tree
+    //      which overwrites unconditionally.
+    //
+    // The collision detection runs unconditionally because it's
+    // cheap (one ls-tree + one check-ignore) and the answer routes
+    // both branches.
+    const collision = await hasIgnoredCheckpointCollision(cwd, commitSha);
+    const useCustomRef = headBefore === null || collision;
+    if (!useCustomRef) {
+      // Regular path: HEAD born, no ignored↔ckpt collision. `-u`
+      // captures tracked + untracked-non-ignored. -m tags the
+      // entry so the user can identify it in `git stash list`.
       const res = await runGit(['stash', 'push', '-u', '-m', 'forja: pre-restore working tree'], {
         cwd,
       });
@@ -475,23 +567,22 @@ export const restore = async (cwd: string, commitSha: string): Promise<RestoreRe
         stashKind = 'git-stash';
       }
     } else {
-      // Unborn HEAD: `git stash push` refuses ("You do not have the
-      // initial commit yet"). snapshot() supports unborn repos via
-      // commit-tree, so restore() must too — otherwise --undo on a
-      // freshly init'd repo with untracked work hard-fails before
-      // read-tree.
+      // Custom path: build a preservation commit capturing the
+      // ENTIRE working tree (tracked + untracked + ignored) via
+      // a temp index. Anchored under refs/agent/restore-saved/<ts>
+      // so it survives git gc; recovery via `git read-tree --reset
+      // -u <ref>` overrides whatever the checkpoint wrote.
       //
-      // Build a preservation commit using the same temp-index trick
-      // as snapshot, then anchor it under refs/agent/restore-saved/
-      // so it survives git GC. The user recovers via `git read-tree
-      // --reset -u <ref>` (the inverse of what we're about to do
-      // for the checkpoint).
+      // Used both for unborn HEAD (where stash refuses) AND for
+      // ignored↔checkpoint collisions (where stash captures but
+      // pop can't apply). `-f` forces add to include ignored; if
+      // there's no collision and we landed here only because of
+      // unborn HEAD, `-f` is a harmless no-op (no .gitignore
+      // matches anything tracked-by-snapshot).
       const indexFile = await tempIndexPath();
       try {
         const env = { GIT_INDEX_FILE: indexFile };
-        // No headSha to seed from on unborn HEAD; the index starts
-        // empty, and `add -A` populates it from the working tree.
-        await runGit(['add', '-A', '.'], { cwd, env });
+        await runGit(['add', '-A', '-f', '.'], { cwd, env });
         const treeRes = await runGit(['write-tree'], { cwd, env });
         const tree = treeRes.stdout.trim();
         if (tree.length === 0) {
