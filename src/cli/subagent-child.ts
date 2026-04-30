@@ -319,39 +319,49 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       childRegistry.register(tool);
     }
 
-    // Subagent discovery for nested task() calls. A coordinator-
-    // style subagent that whitelists `task` in its toolset must be
-    // able to spawn grandchildren the same way the top-level
-    // process does — without loading the registry here, the
-    // harness's spawn closure stays undefined and `task` surfaces
-    // `subagent.unavailable` for every invocation. Loading uses
-    // the same path as bootstrap (user + project scope, project
-    // wins on shadow). Validation runs against the full registry
-    // built above so a malformed definition fails fast with a
-    // structured envelope rather than a deferred runtime error.
-    let subagents: ReturnType<typeof loadSubagents>;
-    try {
-      subagents = loadSubagents({
-        cwd: session.cwd,
-        ...(opts.userAgentsDir !== undefined ? { userDir: opts.userAgentsDir } : {}),
-        ...(opts.projectAgentsDir !== undefined ? { projectDir: opts.projectAgentsDir } : {}),
-      });
-      validateSubagentSet(subagents.byName.values(), fullRegistry);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      setSubagentPayload(db, opts.sessionId, {
-        status: 'error',
-        reason: 'subagent_load_failed',
-        output: '',
-        cost_usd: 0,
-        steps: 0,
-        duration_ms: 0,
-        message: msg,
-      });
-      envelopePublished = true;
-      errSink(`forja: subagent-child: subagent load failed: ${msg}\n`);
-      finalizeAsError();
-      return 1;
+    // Subagent discovery for nested task() calls. ONLY run when
+    // the child's whitelist actually includes `task` — gating
+    // the load avoids coupling ordinary runs to the health of
+    // an unrelated registry. A malformed `.md` under
+    // user/project agents would otherwise abort a child whose
+    // job was just `read_file` with `subagent_load_failed`,
+    // producing a confusing failure mode for runs that have
+    // nothing to do with subagent definitions.
+    //
+    // When `task` IS in the whitelist, loading + validating is
+    // load-bearing: without it, the harness's spawn closure
+    // stays undefined and every `task()` invocation surfaces
+    // `subagent.unavailable`. Validation runs against the full
+    // registry built above so a malformed definition fails
+    // fast with a structured envelope rather than deferring
+    // to first-use. Loading uses the same path as bootstrap
+    // (user + project scope, project wins on shadow).
+    let subagents: ReturnType<typeof loadSubagents> | undefined;
+    const wantsTask = audit.toolsWhitelist.includes('task');
+    if (wantsTask) {
+      try {
+        subagents = loadSubagents({
+          cwd: session.cwd,
+          ...(opts.userAgentsDir !== undefined ? { userDir: opts.userAgentsDir } : {}),
+          ...(opts.projectAgentsDir !== undefined ? { projectDir: opts.projectAgentsDir } : {}),
+        });
+        validateSubagentSet(subagents.byName.values(), fullRegistry);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setSubagentPayload(db, opts.sessionId, {
+          status: 'error',
+          reason: 'subagent_load_failed',
+          output: '',
+          cost_usd: 0,
+          steps: 0,
+          duration_ms: 0,
+          message: msg,
+        });
+        envelopePublished = true;
+        errSink(`forja: subagent-child: subagent load failed: ${msg}\n`);
+        finalizeAsError();
+        return 1;
+      }
     }
 
     // Reconstruct the user prompt. The parent persists the prompt
@@ -402,7 +412,15 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // task() invocation surfaces `subagent.unavailable` —
       // breaking coordinator-style chains that 4.2a supported
       // in-process.
-      subagentRegistry: subagents,
+      //
+      // Conditional spread: when `task` isn't in the whitelist
+      // we skipped the load above, so `subagents` is undefined.
+      // Omitting the field here matches the harness's contract
+      // (`subagentRegistry === undefined` ⇒ spawn closure stays
+      // undefined ⇒ `task` surfaces `subagent.unavailable`).
+      // The whitelist build already excluded `task` in that
+      // case, so the ctx never reaches the closure regardless.
+      ...(subagents !== undefined ? { subagentRegistry: subagents } : {}),
       // Recursion depth carried across the subprocess boundary
       // by the parent's `runSubagent` (via `--subagent-depth`
       // CLI flag, threaded into `opts.depth` here). Without

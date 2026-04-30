@@ -224,6 +224,11 @@ describe('runSubagent — orchestration', () => {
     expect(childRow?.parentSessionId).toBe(parent.id);
     expect(childRow?.isSubagent).toBe(true);
     expect(listChildSessions(db, parent.id).map((c) => c.id)).toEqual([result.sessionId]);
+    // Payload outcome carries authoritative cost from the child;
+    // usage_complete=true reflects that. The non-payload paths
+    // (crashed/aborted/wall_clock) flip this to false because
+    // the synthesized cost=0 is a lower bound only.
+    expect(childRow?.usageComplete).toBe(true);
 
     // Audit row landed BEFORE the spawn (4.2a inserted post-run;
     // .ii.a moved it pre-spawn so the FK target exists when the
@@ -325,6 +330,12 @@ describe('runSubagent — orchestration', () => {
     const session = getSession(db, result.sessionId);
     expect(session).not.toBeNull();
     expect(session?.status).toBe('error');
+    // usage_complete must be false: the synthesized cost=0 is
+    // a lower bound (the child may have made provider calls
+    // before crashing), not an authoritative measurement.
+    // Marking it true would corrupt cost rollups that read the
+    // flag to detect incomplete totals.
+    expect(session?.usageComplete).toBe(false);
     expect(getSubagentRun(db, result.sessionId)).not.toBeNull();
   });
 
@@ -359,8 +370,12 @@ describe('runSubagent — orchestration', () => {
     expect(signals).toContain('SIGKILL');
     // Session row finalized to 'interrupted', not left in
     // 'running'. The child was killed before its harness could
-    // call completeSession on its own.
-    expect(getSession(db, result.sessionId)?.status).toBe('interrupted');
+    // call completeSession on its own. usage_complete=false
+    // because the child died with no payload — we don't know
+    // what it spent before SIGKILL.
+    const session = getSession(db, result.sessionId);
+    expect(session?.status).toBe('interrupted');
+    expect(session?.usageComplete).toBe(false);
   });
 
   test('caller abort → status=interrupted, reason=aborted, SIGTERM/SIGKILL escalation', async () => {
@@ -391,8 +406,11 @@ describe('runSubagent — orchestration', () => {
     expect(result.reason).toBe('aborted');
     expect(killed.map((k) => k.signal)).toContain('SIGTERM');
     // Same finalization invariant as the wall-clock path:
-    // session row terminal, not 'running'.
-    expect(getSession(db, result.sessionId)?.status).toBe('interrupted');
+    // session row terminal, not 'running'. usage_complete=false
+    // because aborted runs don't produce an authoritative cost.
+    const session = getSession(db, result.sessionId);
+    expect(session?.status).toBe('interrupted');
+    expect(session?.usageComplete).toBe(false);
   });
 
   test('whitelist typo throws (caller bug, not runtime status)', async () => {

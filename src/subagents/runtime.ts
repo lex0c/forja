@@ -951,12 +951,28 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // stale-session sweeper. Mapping is lossless:
   //   result.status ∈ { done, exhausted, error, interrupted }
   // and that's exactly the terminal `SessionStatus` shape
-  // `completeSession` accepts. Wrapped in try/catch because
-  // the function throws when the row already finalized
-  // (concurrent purge, child raced to it) — that's a non-event,
-  // not an error to surface.
+  // `completeSession` accepts.
+  //
+  // `usageComplete` flag: only the 'payload' outcome carries
+  // an authoritative cost (the child's harness measured it
+  // before publishing). For 'crashed' / 'aborted' / 'wall_clock'
+  // the synthesized `result.costUsd === 0` is a lower bound —
+  // the child may well have made expensive provider calls
+  // before dying, but we have no way to read its in-flight
+  // accumulator across the IPC boundary. Marking the row
+  // `usage_complete = false` tells consumers (cost rollups,
+  // budget reconciliation, billing audits) "this total is a
+  // floor, not authoritative" — same semantics the harness
+  // uses for its own incomplete-measurement paths.
+  //
+  // Wrapped in try/catch because the function throws when the
+  // row already finalized (concurrent purge, child raced to
+  // it) — that's a non-event, not an error to surface. On
+  // that no-op path the value of `usageComplete` we pass is
+  // irrelevant; the child's own finalize already set the row.
+  const usageComplete = outcome.kind === 'payload';
   try {
-    completeSession(input.db, childSession.id, result.status, result.costUsd, true);
+    completeSession(input.db, childSession.id, result.status, result.costUsd, usageComplete);
   } catch {
     // ignore — the row is already in a terminal state
   }

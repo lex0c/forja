@@ -1191,6 +1191,163 @@ You are the worker.`,
     }
   });
 
+  test('malformed agents .md does NOT abort runs whose whitelist lacks task', async () => {
+    // Regression: the child used to always loadSubagents +
+    // validateSubagentSet, even when `task` wasn't in
+    // audit.toolsWhitelist. A malformed .md in
+    // user/project agents would surface `subagent_load_failed`
+    // for an unrelated run that just wanted, say, read_file.
+    // The fix gates discovery on `wantsTask` so non-task runs
+    // don't couple to registry health.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    const projectAgentsDir = mkdtempSync(join(tmpdir(), 'forja-bad-agents-'));
+    try {
+      // Drop a malformed .md — missing frontmatter delimiters
+      // entirely. loadSubagents would throw on this.
+      writeFileSync(
+        join(projectAgentsDir, 'broken.md'),
+        'this is not a valid subagent definition\nno frontmatter at all\n',
+      );
+
+      let childId: string;
+      const db = openDb(dbPath);
+      try {
+        migrate(db);
+        const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+        const child = sessionsRepo.createSession(db, {
+          model: 'mock/m',
+          cwd: dbDir,
+          parentSessionId: parent.id,
+        });
+        childId = child.id;
+        // Whitelist deliberately EXCLUDES `task` — the child's
+        // job has nothing to do with spawning grandchildren.
+        subagentRunsRepo.insertSubagentRun(db, {
+          sessionId: child.id,
+          name: 'reader',
+          scope: 'project',
+          sourcePath: '/fake/reader.md',
+          sourceSha256: 'a'.repeat(64),
+          systemPrompt: 'You are a reader.',
+          toolsWhitelist: [],
+          budgetMaxSteps: 5,
+          budgetMaxCostUsd: 0.0,
+          policySnapshot: { defaults: { mode: 'bypass' }, tools: {} },
+        });
+        messagesRepo.appendMessage(db, {
+          sessionId: child.id,
+          role: 'user',
+          content: 'just respond',
+        });
+      } finally {
+        db.close();
+      }
+
+      const exitCode = await runSubagentChild({
+        sessionId: childId,
+        dbPath,
+        providerOverride: stubProvider('done'),
+        userAgentsDir: null,
+        projectAgentsDir,
+        errSink: () => undefined,
+      });
+      expect(exitCode).toBe(0);
+
+      // Payload published as 'done', NOT 'subagent_load_failed'.
+      // Without the gate, the malformed broken.md would have
+      // aborted this unrelated run.
+      const db2 = openDb(dbPath);
+      try {
+        const out = getSubagentOutput(db2, childId);
+        expect(out?.payload?.status).toBe('done');
+        expect(out?.payload?.reason).toBe('done');
+      } finally {
+        db2.close();
+      }
+    } finally {
+      rmSync(projectAgentsDir, { recursive: true, force: true });
+    }
+  });
+
+  test('malformed agents .md DOES abort when task IS in whitelist', async () => {
+    // Counterpart: when the child's whitelist includes `task`,
+    // the registry is load-bearing — a malformed .md must
+    // still surface `subagent_load_failed` because nested
+    // task() calls would otherwise dispatch into a broken
+    // registry. Locks the gate so a future regression that
+    // skipped loading unconditionally surfaces here.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    const projectAgentsDir = mkdtempSync(join(tmpdir(), 'forja-bad-agents-'));
+    try {
+      writeFileSync(
+        join(projectAgentsDir, 'broken.md'),
+        'this is not a valid subagent definition\nno frontmatter at all\n',
+      );
+
+      let childId: string;
+      const db = openDb(dbPath);
+      try {
+        migrate(db);
+        const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+        const child = sessionsRepo.createSession(db, {
+          model: 'mock/m',
+          cwd: dbDir,
+          parentSessionId: parent.id,
+        });
+        childId = child.id;
+        // Whitelist INCLUDES `task` — registry must be valid
+        // for grandchildren to dispatch.
+        subagentRunsRepo.insertSubagentRun(db, {
+          sessionId: child.id,
+          name: 'coordinator',
+          scope: 'project',
+          sourcePath: '/fake/coord.md',
+          sourceSha256: 'a'.repeat(64),
+          systemPrompt: 'You are a coordinator.',
+          toolsWhitelist: ['task'],
+          budgetMaxSteps: 5,
+          budgetMaxCostUsd: 0.0,
+          policySnapshot: { defaults: { mode: 'bypass' }, tools: {} },
+        });
+        messagesRepo.appendMessage(db, {
+          sessionId: child.id,
+          role: 'user',
+          content: 'go',
+        });
+      } finally {
+        db.close();
+      }
+
+      const errMessages: string[] = [];
+      const exitCode = await runSubagentChild({
+        sessionId: childId,
+        dbPath,
+        providerOverride: stubProvider('never'),
+        userAgentsDir: null,
+        projectAgentsDir,
+        errSink: (s) => errMessages.push(s),
+      });
+      expect(exitCode).toBe(1);
+      expect(errMessages.join('')).toMatch(/subagent load failed/);
+
+      const db2 = openDb(dbPath);
+      try {
+        const out = getSubagentOutput(db2, childId);
+        expect(out?.payload?.reason).toBe('subagent_load_failed');
+      } finally {
+        db2.close();
+      }
+    } finally {
+      rmSync(projectAgentsDir, { recursive: true, force: true });
+    }
+  });
+
   test('non-subagent session: row left untouched (refuses without finalizing)', async () => {
     // The non-subagent path is the only error branch that
     // intentionally does NOT finalize — the session row
