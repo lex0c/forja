@@ -1134,6 +1134,15 @@ You are the worker.`,
       const out = getSubagentOutput(db2, childId);
       expect(out?.payload?.status).toBe('error');
       expect(out?.payload?.reason).toBe('unknown_model');
+      // Critical: the session row must also be finalized to
+      // 'error', NOT left in 'running'. Without finalization,
+      // a parent crash between the child's exit and the
+      // parent's polling claim would leave the row stuck.
+      const session = (await import('../../src/storage/repos/sessions.ts')).getSession(
+        db2,
+        childId,
+      );
+      expect(session?.status).toBe('error');
     } finally {
       db2.close();
     }
@@ -1165,5 +1174,56 @@ You are the worker.`,
     });
     expect(exitCode).toBe(1);
     expect(errMessages.join('')).toMatch(/no subagent_runs row/);
+    // Same finalization invariant: session row MUST be terminal,
+    // not stuck in 'running'. The audit-missing branch sits
+    // before the outputs row insert, so there's no payload to
+    // publish — the row update is the only signal an operator
+    // gets.
+    const db2 = openDb(dbPath);
+    try {
+      const session = (await import('../../src/storage/repos/sessions.ts')).getSession(
+        db2,
+        childId,
+      );
+      expect(session?.status).toBe('error');
+    } finally {
+      db2.close();
+    }
+  });
+
+  test('non-subagent session: row left untouched (refuses without finalizing)', async () => {
+    // The non-subagent path is the only error branch that
+    // intentionally does NOT finalize — the session row
+    // belongs to a top-level run, and marking it 'error'
+    // would corrupt a session the user cares about. Lock
+    // this carve-out so a future tightening doesn't
+    // accidentally start finalizing top-level sessions.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const db = openDb(dbPath);
+    let topLevelId: string;
+    try {
+      migrate(db);
+      const top = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+      topLevelId = top.id;
+    } finally {
+      db.close();
+    }
+    const errMessages: string[] = [];
+    const exitCode = await runSubagentChild({
+      sessionId: topLevelId,
+      dbPath,
+      errSink: (s) => errMessages.push(s),
+    });
+    expect(exitCode).toBe(1);
+    expect(errMessages.join('')).toMatch(/is not a subagent/);
+    // Row must STAY in 'running' — the child handler refused
+    // to touch a session that isn't its own.
+    const db2 = openDb(dbPath);
+    try {
+      const session = sessionsRepo.getSession(db2, topLevelId);
+      expect(session?.status).toBe('running');
+    } finally {
+      db2.close();
+    }
   });
 });

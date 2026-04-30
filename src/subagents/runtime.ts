@@ -409,6 +409,46 @@ interface WaitForChildArgs {
   startTs: number;
 }
 
+// Drain a subprocess that has already published its payload.
+// The polling loop returns on payload, but the OS-level exit
+// may not have happened yet — Bun keeps the parent process
+// alive while children run, so returning here without awaiting
+// the exit would (a) leave a zombie/orphan child past
+// runSubagent's resolution and (b) race the worktree cleanup
+// against a child that's still touching the tree (shutdown
+// flush, finalize, slow exit). Bound the wait at graceMs and
+// SIGKILL if the child hangs past the grace; one more grace
+// window for the kernel to reap before we give up.
+//
+// Errors during kill are swallowed (handle.kill swallows
+// already-exited throws internally; nothing else to do here).
+const drainChildAfterPayload = async (
+  handle: ChildProcessHandle,
+  graceMs: number,
+): Promise<void> => {
+  let exited = false;
+  handle.exited.then(() => {
+    exited = true;
+  });
+
+  const sleepUntilExitOrTimeout = async (ms: number): Promise<void> => {
+    const start = Date.now();
+    while (!exited && Date.now() - start < ms) {
+      await new Promise<void>((r) => setTimeout(r, Math.min(50, ms)));
+    }
+  };
+
+  await sleepUntilExitOrTimeout(graceMs);
+  if (exited) return;
+
+  // Child published payload but is hanging on shutdown. Force
+  // termination and wait one more grace window for the reap.
+  // After that we give up — the kernel will eventually reclaim,
+  // and runSubagent must not block its caller forever.
+  handle.kill('SIGKILL');
+  await sleepUntilExitOrTimeout(graceMs);
+};
+
 const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
   const { db, sessionId, handle, signal, wallClockMs, graceMs, startTs } = args;
 
@@ -428,6 +468,14 @@ const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
     // raced ahead of our polling cadence and already published.
     const out = getSubagentOutput(db, sessionId);
     if (out !== null && out.payload !== null) {
+      // Wait for the OS-level exit before returning. A child
+      // that publishes payload then hangs (shutdown flush,
+      // finalize, slow signal handler) would otherwise leak
+      // past runSubagent's resolution AND race against the
+      // worktree cleanup that the caller fires next.
+      if (!exitedResolved) {
+        await drainChildAfterPayload(handle, graceMs);
+      }
       return { kind: 'payload', payload: out.payload };
     }
 

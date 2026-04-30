@@ -3,6 +3,7 @@ import { createPermissionEngine } from '../permissions/index.ts';
 import { type Provider, createDefaultRegistry } from '../providers/index.ts';
 import {
   type DB,
+  completeSession,
   defaultDbPath,
   getMessage,
   getSession,
@@ -165,25 +166,52 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
   // Track whether the outputs row was inserted so the catch path
   // can publish a final error envelope without a missing-row throw.
   let outputsRowInserted = false;
+
+  // Finalize the child session as error before any pre-harness
+  // exit path returns 1. Without this, the row stays in
+  // 'running' and pollutes `--list-sessions` until something
+  // else (parent polling, future stale-session sweeper) claims
+  // it. If the parent ALSO crashed, the row would sit there
+  // indefinitely. Best-effort: completeSession's
+  // `WHERE status='running'` guard makes it idempotent (no-op
+  // if already finalized) and the swallow handles missing rows
+  // / closed DBs / schema drift — the diagnostic on stderr is
+  // the authoritative signal.
+  const finalizeAsError = (): void => {
+    try {
+      completeSession(db, opts.sessionId, 'error', 0, true);
+    } catch {
+      // ignore — row may be missing, already finalized, or
+      // the DB handle may be unhealthy (the outer finally
+      // closes it regardless).
+    }
+  };
+
   try {
     migrate(db);
 
     const session = getSession(db, opts.sessionId);
     if (session === null) {
+      // Row doesn't exist — nothing to finalize. The parent
+      // wired a stale or fictional id; that's the parent's
+      // bug to surface.
       errSink(`forja: subagent-child: session ${opts.sessionId} not found in DB\n`);
       return 1;
     }
     if (!session.isSubagent) {
-      // Refuse to run a non-subagent session through this entry
-      // path — the caller wired the wrong id, or the parent_session_id
-      // field is missing. Either way, the harness would happily
-      // execute and pollute the row with subagent-shaped state.
+      // Session row exists but belongs to a top-level run, NOT
+      // a subagent flow. Finalizing it as 'error' here would
+      // corrupt a session the user cares about. Refuse without
+      // touching the row.
       errSink(
         `forja: subagent-child: session ${opts.sessionId} is not a subagent (parent_session_id is null)\n`,
       );
       return 1;
     }
     if (session.status !== 'running') {
+      // Already finalized — nothing to do. finalizeAsError's
+      // status='running' guard would no-op anyway, but skipping
+      // keeps the intent explicit.
       errSink(
         `forja: subagent-child: session ${opts.sessionId} is in status '${session.status}', expected 'running'\n`,
       );
@@ -195,6 +223,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       errSink(
         `forja: subagent-child: no subagent_runs row for session ${opts.sessionId}; parent must insert audit before spawn\n`,
       );
+      finalizeAsError();
       return 1;
     }
 
@@ -243,6 +272,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         setSubagentPayload(db, opts.sessionId, envelope);
         envelopePublished = true;
         errSink(`forja: subagent-child: unknown model ${session.model}\n`);
+        finalizeAsError();
         return 1;
       }
       provider = entry.factory();
@@ -283,6 +313,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         setSubagentPayload(db, opts.sessionId, envelope);
         envelopePublished = true;
         errSink(`forja: subagent-child: unknown tool '${toolName}' in snapshot\n`);
+        finalizeAsError();
         return 1;
       }
       childRegistry.register(tool);
@@ -319,6 +350,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       });
       envelopePublished = true;
       errSink(`forja: subagent-child: subagent load failed: ${msg}\n`);
+      finalizeAsError();
       return 1;
     }
 
@@ -435,6 +467,15 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         // ignore
       }
     }
+    // Finalize the session row. runAgent's contract is to call
+    // completeSession from inside its lifecycle; if the throw
+    // escaped past that path (rare — the harness top-level
+    // catch is documented as exhaustive, but a regression
+    // there would otherwise leak the row), the explicit
+    // finalize here closes the gap. Idempotent: when runAgent
+    // already finalized to 'done' / 'exhausted' / 'error', the
+    // status='running' guard makes this a no-op.
+    finalizeAsError();
     errSink(`forja: subagent-child: ${msg}\n`);
     return 1;
   } finally {

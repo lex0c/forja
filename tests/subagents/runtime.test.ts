@@ -620,6 +620,123 @@ describe('runSubagent — orchestration', () => {
     expect(captured.temperature).toBe(0);
   });
 
+  test('child that publishes payload then hangs gets SIGKILLed before parent returns', async () => {
+    // Regression: the polling loop used to return on payload
+    // without awaiting handle.exited. A child that publishes
+    // payload then hangs on shutdown (slow flush, finalize,
+    // signal handler delay) would let runSubagent resolve while
+    // the subprocess was still alive — Bun keeps the parent
+    // process alive until child dies, so the orphan would
+    // hang the end-of-run AND race against the worktree
+    // cleanup the parent fires next. The drain-after-payload
+    // path waits up to graceMs, then SIGKILLs.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const killed: { signal: string }[] = [];
+    let resolveExit: ((v: { exitCode: number }) => void) | undefined;
+    const exited = new Promise<{ exitCode: number }>((resolve) => {
+      resolveExit = resolve;
+    });
+    const hangAfterPayloadSpawn: SpawnChildProcess = (opts) => {
+      // Publish payload synchronously (child finished its work
+      // and committed the envelope) but DO NOT resolve `exited`
+      // — simulates a hang during shutdown.
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      setSubagentPayload(db, opts.sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'finished work',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      });
+      return {
+        exited,
+        kill: (signal) => {
+          killed.push({ signal });
+          // SIGKILL resolves the exited promise — kernel reaped.
+          if (signal === 'SIGKILL' && resolveExit !== undefined) {
+            resolveExit({ exitCode: 137 });
+            resolveExit = undefined;
+          }
+        },
+      };
+    };
+    const start = Date.now();
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      // Small grace so the test resolves quickly.
+      graceMs: 50,
+      spawnChildProcess: hangAfterPayloadSpawn,
+    });
+    const elapsed = Date.now() - start;
+    // Result MUST reflect the child's payload (status='done',
+    // not 'crashed'). The drain path is about waiting cleanly,
+    // not about reclassifying the outcome.
+    expect(result.status).toBe('done');
+    expect(result.output).toBe('finished work');
+    // SIGKILL was sent — proves the parent didn't return early
+    // while the child was still hanging.
+    expect(killed.map((k) => k.signal)).toContain('SIGKILL');
+    // Wall time bound: drain waits graceMs, then SIGKILL,
+    // then graceMs again before giving up. Total < 4×graceMs
+    // is comfortable under bun's per-test timeout.
+    expect(elapsed).toBeLessThan(50 * 8);
+  });
+
+  test('child that publishes payload AND exits cleanly: no SIGKILL needed', async () => {
+    // Counterpart: when the child publishes payload AND
+    // resolves `exited` promptly, the drain path observes the
+    // exit and returns without sending SIGKILL. Locks the
+    // happy-path semantics so a future regression that always
+    // SIGKILLs (over-eager defense) surfaces here.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const killed: { signal: string }[] = [];
+    const cleanSpawn: SpawnChildProcess = (opts) => {
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      setSubagentPayload(db, opts.sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'ok',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      });
+      return {
+        exited: Promise.resolve({ exitCode: 0 }),
+        kill: (signal) => {
+          killed.push({ signal });
+        },
+      };
+    };
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      graceMs: 50,
+      spawnChildProcess: cleanSpawn,
+    });
+    expect(result.status).toBe('done');
+    expect(killed).toEqual([]);
+  });
+
   test('parent forwards planMode=true to spawn opts', async () => {
     // Defense-in-depth path: a programmatic caller invoking
     // runSubagent with planMode:true (or a future regression
