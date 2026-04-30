@@ -130,6 +130,15 @@ export interface RunSubagentResult {
 // Four levels covers every plausible playbook composition (the
 // canonical one is parent → review-playbook, never deeper) and
 // surfaces a clear error well before the budget caps would.
+//
+// Depth semantics: `depth` is how deep THIS spawn lives. depth=1
+// is the first child of the user's session, depth=4 is the
+// fourth-level descendant. A spawn whose depth would EXCEED the
+// cap is rejected; equality is allowed. The loop's spawn closure
+// MUST mirror this `>` boundary so it can return the recoverable
+// `depth_exceeded` variant before the runtime's contract throw
+// fires — without that alignment, a chain at the exact boundary
+// surfaces as a generic `tool.exception`.
 export const MAX_SUBAGENT_DEPTH = 4;
 
 // Spawn a subagent in-process. Builds a fresh HarnessConfig with the
@@ -143,9 +152,9 @@ export const MAX_SUBAGENT_DEPTH = 4;
 export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentResult> => {
   const { definition } = input;
   const depth = input.depth ?? 0;
-  if (depth >= MAX_SUBAGENT_DEPTH) {
+  if (depth > MAX_SUBAGENT_DEPTH) {
     throw new Error(
-      `subagent '${definition.name}': recursion depth ${depth} reached MAX_SUBAGENT_DEPTH=${MAX_SUBAGENT_DEPTH}`,
+      `subagent '${definition.name}': recursion depth ${depth} would exceed MAX_SUBAGENT_DEPTH=${MAX_SUBAGENT_DEPTH}`,
     );
   }
   const childRegistry = buildChildRegistry(
@@ -166,9 +175,13 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     // Child gets its own budget. The harness merges with DEFAULT_BUDGET,
     // so unspecified fields (output cap, compaction threshold, etc.)
     // inherit the harness defaults — only the caps the definition
-    // explicitly sets are tightened.
+    // explicitly sets are tightened. maxCostUsd MUST be forwarded;
+    // the loader requires it on every definition, dropping it here
+    // would let a writing subagent run past its declared spend cap
+    // until another budget tripped.
     budget: {
       maxSteps: definition.budget.maxSteps,
+      maxCostUsd: definition.budget.maxCostUsd,
       ...(definition.budget.maxWallClockMs !== undefined
         ? { maxWallClockMs: definition.budget.maxWallClockMs }
         : {}),

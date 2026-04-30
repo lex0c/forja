@@ -21,6 +21,10 @@ interface ScriptedStep {
   text?: string;
   tool_uses?: { id: string; name: string; input: Record<string, unknown> }[];
   stop_reason?: CollectedStep['stop_reason'];
+  // Per-step usage emitted before `stop`. Required for any test
+  // that wants `collected.usageSeen=true` and non-zero computed
+  // cost (paired with a capsOverride that sets non-zero pricing).
+  usage?: { input: number; output: number };
 }
 
 const replay = function* (step: ScriptedStep): Iterable<StreamEvent> {
@@ -32,6 +36,17 @@ const replay = function* (step: ScriptedStep): Iterable<StreamEvent> {
     yield { kind: 'tool_use_start', id: tu.id, name: tu.name };
     yield { kind: 'tool_use_stop', id: tu.id, final_args: tu.input };
   }
+  if (step.usage !== undefined) {
+    yield {
+      kind: 'usage',
+      usage: {
+        input: step.usage.input,
+        output: step.usage.output,
+        cache_read: 0,
+        cache_creation: 0,
+      },
+    };
+  }
   yield {
     kind: 'stop',
     reason: step.stop_reason ?? (step.tool_uses?.length ? 'tool_use' : 'end_turn'),
@@ -40,6 +55,11 @@ const replay = function* (step: ScriptedStep): Iterable<StreamEvent> {
 
 interface MockOptions {
   recordRequests?: { messages: unknown[]; system: unknown }[];
+  // Optional pricing overrides so tests can exercise cost-cap
+  // paths without spinning up a separate fixture. Defaults to
+  // free (cost_per_1k = 0); overriding flips on real cost
+  // arithmetic for budget tests.
+  capsOverride?: { cost_per_1k_input?: number; cost_per_1k_output?: number };
 }
 
 const mockProvider = (script: ScriptedStep[], opts: MockOptions = {}): Provider => {
@@ -55,8 +75,8 @@ const mockProvider = (script: ScriptedStep[], opts: MockOptions = {}): Provider 
       constrained: 'tools',
       context_window: 1000,
       output_max_tokens: 100,
-      cost_per_1k_input: 0,
-      cost_per_1k_output: 0,
+      cost_per_1k_input: opts.capsOverride?.cost_per_1k_input ?? 0,
+      cost_per_1k_output: opts.capsOverride?.cost_per_1k_output ?? 0,
       notes: [],
     },
     async *generate(req) {
@@ -349,7 +369,7 @@ describe('runSubagent', () => {
   });
 
   test('refuses to spawn beyond MAX_SUBAGENT_DEPTH', async () => {
-    // Direct unit test on the runtime: passing depth>=MAX throws.
+    // Direct unit test on the runtime: passing depth > MAX throws.
     // The harness loop check (loop.ts) returns a `depth_exceeded`
     // result instead — that path is covered by the task-tool test.
     // Here we lock the runtime contract: programmer error path.
@@ -367,6 +387,65 @@ describe('runSubagent', () => {
         depth: MAX_SUBAGENT_DEPTH + 1,
       }),
     ).rejects.toThrow(/recursion depth/);
+  });
+
+  test('child enforces budget.maxCostUsd from definition', async () => {
+    // The loader requires `max_cost_usd` on every definition.
+    // The runtime MUST forward it into the child harness's budget,
+    // otherwise a writing subagent could run past its declared
+    // dollar cap until another budget tripped. Fixture: pricing
+    // > 0, definition cap of $0.0001, single turn whose cost
+    // pushes past it. Expected exit: status='exhausted',
+    // reason='maxCostUsd'.
+    const parent = createSession(db, { model: 'mock/m', cwd: '/p' });
+    const result = await runSubagent({
+      definition: definition({
+        budget: { maxSteps: 5, maxCostUsd: 0.0001 },
+      }),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: mockProvider(
+        [
+          {
+            text: 'first',
+            usage: { input: 100, output: 20 },
+            stop_reason: 'end_turn',
+          },
+        ],
+        { capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 } },
+      ),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+    });
+    // Turn cost: (100×3 + 20×15) / 1e6 = 600 / 1e6 = $0.0006 > $0.0001 cap.
+    expect(result.status).toBe('exhausted');
+    expect(result.reason).toBe('maxCostUsd');
+    expect(result.costUsd).toBeCloseTo(0.0006, 9);
+  });
+
+  test('depth === MAX_SUBAGENT_DEPTH is the last allowed level (boundary)', async () => {
+    // Regression for the off-by-one boundary: the runtime used to
+    // reject `depth >= MAX` while the loop's spawn closure
+    // returned `depth_exceeded` only on `> MAX`. The exact
+    // boundary (depth === MAX) fell through the closure and got
+    // surfaced as a generic `tool.exception` instead of the
+    // recoverable `subagent.depth_exceeded`. Both layers now
+    // align on `> MAX` — depth === MAX must run cleanly.
+    const parent = createSession(db, { model: 'mock/m', cwd: '/p' });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: mockProvider([{ text: `depth=${MAX_SUBAGENT_DEPTH} ok`, stop_reason: 'end_turn' }]),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      depth: MAX_SUBAGENT_DEPTH,
+    });
+    expect(result.status).toBe('done');
   });
 
   test('child run records subagentDepth on its config', async () => {

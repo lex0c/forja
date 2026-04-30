@@ -137,6 +137,7 @@ const buildConfig = (
       maxRepeatedToolHash: number;
       compactionThreshold: number;
       compactionPreserveTail: number;
+      maxCostUsd: number;
     }>;
     capsOverride?: Partial<Provider['capabilities']>;
   } = {},
@@ -391,6 +392,105 @@ describe('runAgent', () => {
     expect(assistant?.tokensOut).toBe(10);
     // 50×3 + 10×15 = 300 → /1e6 = 0.0003
     expect(assistant?.costUsd).toBeCloseTo(0.0003, 9);
+  });
+
+  test('budget.maxCostUsd: aborts after a turn pushes cumulative cost over the cap', async () => {
+    // Each turn costs (50×3 + 10×15) / 1e6 = $0.0003. Cap at
+    // $0.0004 → first turn lands cleanly (total 0.0003 ≤ cap),
+    // second turn pushes total to 0.0006 (> cap) and the loop
+    // exits with maxCostUsd. The exhausted status maps to exit
+    // code 2 (same shape as maxSteps).
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: 'hi' } }],
+          stop_reason: 'tool_use',
+          usage: { input: 50, output: 10 },
+        },
+        { text: 'done', stop_reason: 'end_turn', usage: { input: 50, output: 10 } },
+      ],
+      {
+        capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 },
+        budget: { maxCostUsd: 0.0004 },
+      },
+    );
+    const result = await runAgent(config);
+    expect(result.status).toBe('exhausted');
+    expect(result.reason).toBe('maxCostUsd');
+    expect(result.detail).toContain('exceeded cap');
+    // Cumulative reflects both turns' spend at the moment the
+    // cap tripped, not just the cap value.
+    expect(result.costUsd).toBeCloseTo(0.0006, 9);
+  });
+
+  test('budget.maxCostUsd: undefined (default) keeps the cap off', async () => {
+    // Sanity guard: an absent maxCostUsd must not silently
+    // introduce a cap of 0 (which would abort every paid run).
+    const { config } = buildConfig(
+      [{ text: 'done', stop_reason: 'end_turn', usage: { input: 1000, output: 500 } }],
+      {
+        capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 },
+        // No budget.maxCostUsd.
+      },
+    );
+    const result = await runAgent(config);
+    expect(result.status).toBe('done');
+  });
+
+  test('budget.maxCostUsd: cumulative across resume (prior cost counts)', async () => {
+    // Resume contract: session row stores cumulative cost; cap
+    // compares against priorCostUsd + totalCostUsd. A session that
+    // already spent $0.0003 with cap $0.0004 has $0.0001 of head-
+    // room — a single follow-up turn at $0.0003 trips immediately.
+    // Without this behavior, a budget-conscious user resuming a
+    // run with a spend cap would silently exceed it.
+
+    // Run #1 — leaves the session with $0.0003 of cumulative spend.
+    const first = buildConfig(
+      [{ text: 'first', stop_reason: 'end_turn', usage: { input: 50, output: 10 } }],
+      { capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 } },
+    );
+    const r1 = await runAgent(first.config);
+    expect(r1.status).toBe('done');
+    expect(r1.costUsd).toBeCloseTo(0.0003, 9);
+
+    // Run #2 (resume) — cap is $0.0004; one $0.0003 turn pushes
+    // cumulative to $0.0006 and trips the gate. Per-run costUsd
+    // is $0.0003 (just this run's spend), not cumulative — cap
+    // detail surfaces the cumulative figure.
+    const second = buildConfig(
+      [{ text: 'second', stop_reason: 'end_turn', usage: { input: 50, output: 10 } }],
+      {
+        capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 },
+        budget: { maxCostUsd: 0.0004 },
+      },
+    );
+    const r2 = await runAgent({ ...second.config, resumeFromSessionId: r1.sessionId });
+    expect(r2.status).toBe('exhausted');
+    expect(r2.reason).toBe('maxCostUsd');
+    // Per-run is current spend only; the persisted row holds
+    // cumulative.
+    expect(r2.costUsd).toBeCloseTo(0.0003, 9);
+    expect(r2.detail).toContain('$0.000600'); // cumulative figure
+    const session = getSession(db, r1.sessionId);
+    expect(session?.totalCostUsd).toBeCloseTo(0.0006, 9);
+  });
+
+  test('budget.maxCostUsd=0 trips on the first paid turn', async () => {
+    // Zero is a literal cap, not "no cap". The first turn that
+    // costs anything pushes total above zero and the gate fires.
+    // Useful for free-runs-only configs (eval against a mocked
+    // provider, hard refusal of accidental spend).
+    const { config } = buildConfig(
+      [{ text: 'done', stop_reason: 'end_turn', usage: { input: 1, output: 1 } }],
+      {
+        capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 },
+        budget: { maxCostUsd: 0 },
+      },
+    );
+    const result = await runAgent(config);
+    expect(result.status).toBe('exhausted');
+    expect(result.reason).toBe('maxCostUsd');
   });
 
   test('usageComplete flips false when an output-producing turn lacked a usage event', async () => {

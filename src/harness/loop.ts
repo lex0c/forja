@@ -78,6 +78,7 @@ const exitToStatus: Record<ExitReason, TerminalSessionStatus> = {
   maxSteps: 'exhausted',
   maxWallClockMs: 'interrupted',
   maxOutputTokens: 'exhausted',
+  maxCostUsd: 'exhausted',
   maxToolErrors: 'error',
   degenerateLoop: 'error',
   aborted: 'interrupted',
@@ -91,6 +92,7 @@ const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
   maxSteps: 'exhausted',
   maxWallClockMs: 'interrupted',
   maxOutputTokens: 'exhausted',
+  maxCostUsd: 'exhausted',
   maxToolErrors: 'error',
   degenerateLoop: 'error',
   aborted: 'interrupted',
@@ -181,6 +183,21 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // the user wants different exit reasons.
   const isWallClockTimeout = (): boolean =>
     wallClockController.signal.aborted && !callerSignal.aborted;
+
+  // Cumulative-cost cap check. Returns a detail string when the cap
+  // is exceeded so callers can build the finish() call inline; null
+  // otherwise. The comparison uses CUMULATIVE cost (priorCostUsd +
+  // totalCostUsd) so that a resumed run honors the same cap that
+  // applied to its predecessor — matching the persistence contract
+  // where the session row stores cumulative spend. Strict `>` so a
+  // `maxCostUsd: 0` config trips the gate on the first paid turn,
+  // not before any work runs.
+  const costCapDetailIfExceeded = (): string | null => {
+    if (budget.maxCostUsd === undefined) return null;
+    const cumulative = priorCostUsd + totalCostUsd;
+    if (cumulative <= budget.maxCostUsd) return null;
+    return `cumulative cost $${cumulative.toFixed(6)} exceeded cap $${budget.maxCostUsd.toFixed(6)}`;
+  };
 
   const finish = (reason: ExitReason, detail?: string): HarnessResult => {
     clearTimeout(wallClockTimer);
@@ -521,6 +538,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               const partialCost = computeCost(config.provider.capabilities, partial.usage);
               totalUsage = addUsage(totalUsage, partial.usage);
               totalCostUsd += partialCost;
+              // Note: we deliberately do NOT check budget.maxCostUsd here.
+              // The provider error path is about to call finish('providerError')
+              // unconditionally — surfacing maxCostUsd instead when the partial
+              // cost crossed the cap would mask the underlying failure (the
+              // provider crash IS the actionable signal). The cumulative cost
+              // is still persisted via priorCostUsd + totalCostUsd at finish(),
+              // so the next resume sees the correct starting point and the
+              // cap will fire there if the run continues.
             }
           }
 
@@ -599,6 +624,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (collected.errors.length > 0) {
           const detail = collected.errors.map((e) => `${e.code}: ${e.message}`).join('; ');
           return finish('providerError', `stream errors: ${detail}`);
+        }
+
+        // Cost cap check after the assistant turn lands and is persisted.
+        // We exit AFTER the audit row is written so the user can see the
+        // turn that pushed them over the cap when they query the session
+        // log. Provider/stream errors above take precedence — the cap is
+        // for clean spend, not for surfacing already-broken turns.
+        {
+          const overage = costCapDetailIfExceeded();
+          if (overage !== null) return finish('maxCostUsd', overage);
         }
 
         // No tool uses → check the stop_reason before declaring success.
@@ -969,6 +1004,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               ...(compaction.reason !== undefined ? { reason: compaction.reason } : {}),
             };
             safeEmit(config.onEvent, finishedEvent);
+
+            // Compaction's billed call can push the cumulative
+            // total past the cap on its own. Check after the
+            // event is emitted (renderers should still see the
+            // compaction_finished event) but before the next
+            // top-of-loop iteration would issue a provider call.
+            const overage = costCapDetailIfExceeded();
+            if (overage !== null) return finish('maxCostUsd', overage);
           }
         }
       }

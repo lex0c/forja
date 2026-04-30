@@ -112,6 +112,17 @@ export interface RunBudget {
   // module walks back one position. preserveTail=0 still preserves
   // the trailing assistant + its tool_result for the same reason.
   compactionPreserveTail: number;
+  // Hard cap on total spend for this run, in USD. Optional —
+  // absent = no cap, preserves the existing "let other budgets
+  // contain the run" behavior. When set, the harness aborts with
+  // `maxCostUsd` after the FIRST cost-increasing event whose
+  // running total crosses the cap (provider turn or compaction
+  // call). Compared per-event with `>` so a `maxCostUsd: 0` config
+  // means "no spend allowed" — the first paid turn trips the gate.
+  // Honored across resumes via the cumulative tracker (priorCostUsd
+  // + totalCostUsd is what the cap compares against, NOT just the
+  // per-run total).
+  maxCostUsd?: number;
 }
 
 export const DEFAULT_BUDGET: RunBudget = {
@@ -131,6 +142,7 @@ export type ExitReason =
   | 'maxSteps'
   | 'maxWallClockMs'
   | 'maxOutputTokens' // provider truncated the response at max_tokens
+  | 'maxCostUsd' // running cumulative cost crossed budget.maxCostUsd
   | 'maxToolErrors'
   | 'degenerateLoop'
   | 'aborted' // user cancelled via signal

@@ -147,6 +147,19 @@ on `tc.status='done'` per M5).
   `--list-sessions`.** Cosmetic but surprising. Resolution:
   parser-level validation that flags the unmatched flag pair, OR
   doc-string on the help text. Either fits a quick polish PR.
+- **O4 — subagent `maxCostUsd` is independent of parent's
+  remaining budget.** Spec §11 endorses "budget próprio" so this
+  is by design, but a parent with a tight cap can still be
+  surprised by a child tree's cumulative spend (cost rollup is
+  query-time per O1; the parent's cap only governs the parent's
+  own provider calls). Combined with the depth cap (4 levels), a
+  worst-case fan-out can multiply spend before the parent
+  notices. Resolution path: when a cost-cap-on-tree feature is
+  needed, sum `listChildSessions(parentId)` recursively at each
+  child's spawn time and refuse if it would push past the
+  parent's cap. Trigger: first user reports surprise from this
+  shape. Until then, document it in the README so authors know
+  to size subagent budgets conservatively.
 
 Lands `AGENTIC_CLI §11` minus worktree isolation: a parent harness
 can declare subagents via `.md` frontmatter, the `task` tool spawns
