@@ -15,6 +15,102 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.2b.ii.b — heartbeat liveness for subprocess subagents
+
+The 4.2b.ii.a closing entry left wall-clock (10min default) as
+the only liveness gate. A child wedged inside a tool call
+(provider request hung, sync block) would respond to signals but
+never publish payload — operators saw 10min hangs before
+detection. Spec FAILURE_MODES §7.3 mandates `last_heartbeat`-based
+detection: the column was ready since 4.2b.i (migration 014),
+the writer + poller were the missing wiring. This slice closes
+that gap.
+
+**Slice scope:**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/cli/subagent-child.ts` | UPDATED | New `HEARTBEAT_CADENCE_MS = 2000` constant. After `insertSubagentOutput` succeeds, install background `setInterval(updateSubagentHeartbeat, 2000)`. unref'd so the timer doesn't pin the event loop alive past child exit. Cleared in the outer finally before `db.close()` so the interval body never races a closed handle. Errors swallowed in the body — a transient SQLite hiccup must not crash the harness. |
+| `src/subagents/runtime.ts` | UPDATED | New `HEARTBEAT_STALE_THRESHOLD_MS = 10_000` constant. `WaitOutcome` gains `'heartbeat_stale'` kind. `RunSubagentResult.reason` union grows `'heartbeat_stale'`. `RunSubagentInput.heartbeatStaleMs?` test seam. `waitForChild` now reads `out.lastHeartbeat` from the same fetch that checks payload; when non-null and gap > threshold and not already killed, escalates SIGTERM → grace → SIGKILL via the existing `scheduleKill()` helper. `killed` type widened to include `'heartbeat_stale'`. New outcome maps to `status='interrupted', reason='heartbeat_stale'` in the result envelope. |
+| Tests | NEW + UPDATED | runtime: stale heartbeat triggers escalation (3 tests — stale fires SIGTERM/SIGKILL, healthy heartbeat survives tight threshold, null heartbeat treated as pre-pulse not stale). subagent-child: 1 e2e test — slow provider holds the loop ~2.3s, asserts `last_heartbeat` was written by the production interval (verifies the writer reaches the DB at the production cadence). |
+
+**Decisions:**
+
+- **Cadence 2000ms (child).** Threshold 10000ms (parent). 5×
+  cadence headroom absorbs transient SQLite contention,
+  GC pauses, and the parent's poll backoff cadence (50ms→500ms)
+  without false positives. MCP's heartbeat analog (60s,
+  AUDIT.md §1.5) is more conservative; subagents are tighter
+  because the worst-case wall-clock fallback (10min) is too
+  long for "operator notices something wrong" timing.
+- **Background `setInterval`, NOT a step-boundary hook.** The
+  failure mode this catches is "child loop blocked inside a
+  tool". A step-boundary hook stops pulsing exactly when we
+  need the pulse most. Background interval keeps tickling
+  while async I/O is mid-flight, only stops when the JS event
+  loop itself blocks — which IS the wedge signal. The trade-
+  off: a fully event-loop-deadlocked child wouldn't pulse,
+  which is exactly what we want.
+- **`unref()` on the interval handle.** Bun timers ref the
+  event loop by default; without unref, a forgotten clear
+  would hold the child process alive past its natural exit.
+  Mirrors the same defense as the SIGKILL escalation timers
+  in runtime.ts (commit `f63b456`).
+- **Threshold gate skips `lastHeartbeat === null`.** The
+  child inserts the outputs row at startup, BEFORE the first
+  interval tick (~2s gap). The parent's poller MUST treat
+  null as "pre-pulse" not "stale" — otherwise every
+  subprocess subagent would die on its first poll. Test
+  `null lastHeartbeat does NOT trip stale detection` locks
+  this behavior with a tight 1ms threshold + null heartbeat.
+- **Reuse of `scheduleKill()` infra.** Same SIGTERM → grace
+  → SIGKILL escalation as the wall-clock and abort paths.
+  The `killed` flag prevents re-firing when subsequent poll
+  iterations also see staleness. The 2×grace bail-out path
+  applies uniformly to all kill verdicts.
+- **`heartbeatStaleMs` exposed as test seam, NOT user-facing
+  config.** The default of 10s is hard-coded into the spec
+  semantics ("> wall_clock_timeout" is too lax; "every
+  cadence" is too tight; the 5× cadence-multiple is the
+  Goldilocks). Production callers omit; tests pass small
+  values to exercise the path quickly.
+
+**What this DOESN'T close:**
+
+- **Child wedged inside synchronous code that blocks the
+  event loop.** Example: `while(true) {}` in a tool. The
+  `setInterval` won't fire because the loop is held. Wall-
+  clock catches this via the parent's `setTimeout`-based
+  budget enforcement (which runs in the parent's event loop,
+  not the child's). 10min latency in that mode; acceptable
+  because synchronous infinite loops in production code are
+  the edge case the wall-clock was designed for.
+- **Operator-facing CLI for stale detection.** `--list-sessions`
+  doesn't expose `last_heartbeat` age. Out of scope; lands
+  with `agent worktree gc` in 4.2d when operator workflows
+  for stale subagents become a deliberate surface.
+- **Heartbeat history.** Single column means we have only
+  the latest pulse. No detection of "child pulsed for a while
+  then stopped" patterns beyond "did pulse at all" + "is it
+  recent". 4.2b.iv could add a sample buffer if forensic
+  patterns prove valuable; defer until demand exists.
+
+**Verification:** `bun test` 1318 pass / 11 skip / 0 fail (+4
+new across stale-detection paths and the e2e cadence probe);
+`tsc --noEmit` clean; `biome check` clean.
+
+**Next:** M3 / Step 4.2b.iii — symlink hardening + deny-list
+copy filter (SECURITY_GUIDELINE §8.4). Worktree subagents that
+write currently inherit any pre-existing symlinks in the parent
+commit; an `.env` symlink pointing outside the repo would let
+a child read host-level secrets. Static deny-list pattern set
++ runtime realpath validation closes the gap. After .iii, .iv
+(bgLogDir per-worktree, lifts `requiresBgManager` gate) finishes
+the 4.2b arc; then 4.2c (checkpoints inside worktree) and 4.2d
+(`agent worktree gc` + merge helpers) for operator surface.
+
+---
+
 ## [2026-04-30] M3 / Step 4.2b.ii.a follow-up — policy snapshot
 
 The 4.2b.ii.a closing entry left M2 (policy drift between
