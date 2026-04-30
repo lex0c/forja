@@ -105,7 +105,42 @@ export interface ToolContext {
   // harness loop. Tests inject an explicit allow-all (or a custom
   // predicate to exercise deny paths) via makeCtx.
   permissionCheck: (toolName: string, category: PolicyCategory, args: ToolArgs) => Decision;
+  // Spawn a subagent (spec §11). Set by the harness when a subagent
+  // registry was wired via HarnessConfig.subagentRegistry; absent
+  // when no subagents are available. The `task` tool surfaces a
+  // clean error in that case rather than dereferencing undefined.
+  // The harness binds parent_session_id from this context's
+  // sessionId so the link is captured automatically.
+  spawnSubagent?: (args: SpawnSubagentArgs) => Promise<SpawnSubagentResult>;
 }
+
+// Inputs the `task` tool passes through to the harness's subagent
+// runner. Kept narrow on purpose — the tool already validates the
+// model-supplied args; this type is just the spawn-side contract.
+export interface SpawnSubagentArgs {
+  name: string;
+  prompt: string;
+}
+
+// Result discriminated by `kind` so the calling tool can map an
+// unknown subagent name into a tool error (model error) without
+// confusing it with an executed-but-failed run (child error).
+export type SpawnSubagentResult =
+  | {
+      kind: 'unknown_subagent';
+      requested: string;
+      available: string[];
+    }
+  | {
+      kind: 'ran';
+      output: string;
+      sessionId: string;
+      status: 'done' | 'interrupted' | 'exhausted' | 'error';
+      reason: string;
+      costUsd: number;
+      steps: number;
+      durationMs: number;
+    };
 
 export interface Tool<I = unknown, O = unknown> {
   name: string;

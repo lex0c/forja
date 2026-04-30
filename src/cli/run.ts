@@ -127,6 +127,7 @@ export const run = async (options: RunOptions): Promise<number> => {
     if (args.listSessions) {
       return runListSessions({
         json: args.json,
+        includeSubagents: args.includeSubagents,
         ...(options.bootstrapOverride?.dbPath !== undefined
           ? { dbPath: options.bootstrapOverride.dbPath }
           : {}),

@@ -5,7 +5,14 @@
 // permissions.yaml doesn't block the listing.
 
 import type { Session } from '../storage/index.ts';
-import { type DB, defaultDbPath, listSessions, migrate, openDb } from '../storage/index.ts';
+import {
+  type DB,
+  defaultDbPath,
+  listChildSessions,
+  listSessions,
+  migrate,
+  openDb,
+} from '../storage/index.ts';
 
 export interface ListSessionsOptions {
   json: boolean;
@@ -18,6 +25,12 @@ export interface ListSessionsOptions {
   // uses) — enough to find a session by date, not enough to flood
   // a terminal.
   limit?: number;
+  // When true, fan each top-level session out into its subagent
+  // children (sessions.parent_session_id-keyed). Default false: the
+  // dominant case is "show me my own runs"; subagent rows are a
+  // forensic detail that adds row count without giving the user
+  // anything they were asking for.
+  includeSubagents?: boolean;
 }
 
 const PROMPT_PREVIEW_BYTES = 80;
@@ -48,6 +61,10 @@ interface SessionListItem {
   // string when we can't extract a string content. We deliberately
   // only look at messages.role='user' to skip system/tool noise.
   prompt_preview: string;
+  // Null on top-level sessions, set when this row is a subagent
+  // child. Surfaces in JSON output unconditionally; the table
+  // renderer indents children under their parent.
+  parent_session_id: string | null;
 }
 
 const buildItem = (s: Session, db: DB): SessionListItem => {
@@ -78,7 +95,23 @@ const buildItem = (s: Session, db: DB): SessionListItem => {
     status: s.status,
     cost_usd: s.totalCostUsd,
     prompt_preview: preview,
+    parent_session_id: s.parentSessionId,
   };
+};
+
+// Walk parent → children one level deep. The default subagent
+// design has a single layer (parent invokes subagent), so depth=1
+// covers the dominant case and keeps the listing readable. Deeper
+// trees still render correctly via the parent_session_id field in
+// the JSON shape; --include-subagents in the table just shows the
+// immediate children.
+const fanOut = (parents: Session[], db: DB): Session[] => {
+  const out: Session[] = [];
+  for (const parent of parents) {
+    out.push(parent);
+    for (const child of listChildSessions(db, parent.id)) out.push(child);
+  }
+  return out;
 };
 
 const writeJson = (items: SessionListItem[], out: (s: string) => void): void => {
@@ -98,7 +131,11 @@ const writeTable = (items: SessionListItem[], out: (s: string) => void): void =>
     'STARTED               STATUS       COST        ID                                    PROMPT\n',
   );
   for (const it of items) {
-    const id = it.id.padEnd(36);
+    const isChild = it.parent_session_id !== null;
+    // Subagent rows render with a `↳ ` indent so the tree shape is
+    // legible at a glance. The id column shrinks accordingly so
+    // column alignment stays the same as the parent row.
+    const id = (isChild ? `  ↳ ${it.id}` : it.id).padEnd(36);
     const status = it.status.padEnd(12);
     const cost = `$${it.cost_usd.toFixed(4)}`.padEnd(11);
     out(`${it.started_at}  ${status} ${cost} ${id}  ${it.prompt_preview}\n`);
@@ -112,7 +149,15 @@ export const runListSessions = (options: ListSessionsOptions): number => {
   try {
     if (ownsDb) migrate(db);
     const sessions = listSessions(db, { limit: options.limit ?? 20 });
-    const items = sessions.map((s) => buildItem(s, db));
+    // listSessions filters out children by default. When the user
+    // asks for them, fan each parent into its immediate children.
+    // We do NOT pass {includeSubagents: true} to the repo here
+    // because that would mix orphaned children (parent purged,
+    // SET NULL fired) into the top-level pool — the repo flag is
+    // for raw audit listings; --include-subagents is the
+    // hierarchical view.
+    const fanned = options.includeSubagents === true ? fanOut(sessions, db) : sessions;
+    const items = fanned.map((s) => buildItem(s, db));
     if (options.json) writeJson(items, options.out);
     else writeTable(items, options.out);
     return 0;

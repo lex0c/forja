@@ -15,6 +15,10 @@ export interface ParsedArgs {
   // List-sessions mode (AGENTIC_CLI §2.1): print known sessions
   // (newest first) and exit. Honors --json for headless consumers.
   listSessions: boolean;
+  // When --list-sessions is set, fan each parent into its subagent
+  // children one level deep. Default false: most users want the
+  // top-level view; subagent rows are forensic detail.
+  includeSubagents: boolean;
   // Resume mode (AGENTIC_CLI §2.1): continue a prior session by id.
   // Special value 'last' selects the most recently started session.
   // The positional prompt is the follow-up message — without it,
@@ -60,6 +64,7 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
     help: false,
     plan: false,
     listSessions: false,
+    includeSubagents: false,
     yes: false,
   };
   const promptParts: string[] = [];
@@ -86,6 +91,10 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         break;
       case '--list-sessions':
         args.listSessions = true;
+        i += 1;
+        break;
+      case '--include-subagents':
+        args.includeSubagents = true;
         i += 1;
         break;
       case '--resume': {
@@ -214,6 +223,7 @@ export const usage = (): string =>
     '  --json                 Emit NDJSON events to stdout (headless)',
     '  --plan                 Read-only mode: produce a plan, do not apply changes',
     '  --list-sessions        Print known sessions (newest first) and exit',
+    '  --include-subagents    With --list-sessions, fan parents into their subagent children',
     '  --resume <id|last>     Continue a prior session; positional prompt is the follow-up',
     '  --undo <session>       Restore the latest checkpoint of a session',
     '  --checkpoints <cmd>    Checkpoint subcommands: list <session> | diff <session> <ckpt>',

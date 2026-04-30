@@ -1,6 +1,7 @@
 import type { Decision, PermissionEngine } from '../permissions/index.ts';
 import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
 import type { DB } from '../storage/index.ts';
+import type { SubagentSet } from '../subagents/load.ts';
 import type { ToolRegistry } from '../tools/index.ts';
 
 // Lifecycle events the harness emits during a run. Synchronous (fire and
@@ -211,6 +212,21 @@ export interface HarnessConfig {
   // in tests that need to exercise the cleanup path; leave unset in
   // production to use the spec default.
   checkpointsRetentionDays?: number;
+  // Subagent linkage (spec §11). When set, createSession writes
+  // this id into sessions.parent_session_id so the audit trail can
+  // walk parent → child without the runtime tracking it separately.
+  // Mutually exclusive with `resumeFromSessionId` — a resumed run
+  // already has its parent id persisted, and resume reuses the
+  // existing row instead of creating a new one. The runtime
+  // (`subagents/runtime.ts`) is the only intended caller; nothing
+  // stops a test from setting it directly.
+  parentSessionId?: string;
+  // Subagent registry made available to the `task` tool. When set,
+  // the harness wires `ToolContext.spawnSubagent` to a closure that
+  // resolves names against this set and dispatches `runSubagent`
+  // with the parent's deps (provider, db, registry, engine). Absent
+  // = `task` tool surfaces a clean error if invoked.
+  subagentRegistry?: SubagentSet;
 }
 
 export interface HarnessResult {

@@ -13,6 +13,7 @@ export {
   completeSession,
   createSession,
   getSession,
+  listChildSessions,
   listSessions,
   reopenSession,
   updateSessionCost,

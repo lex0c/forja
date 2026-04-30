@@ -6,6 +6,7 @@ import {
   completeSession,
   createSession,
   getSession,
+  listChildSessions,
   listSessions,
   reopenSession,
   updateSessionCost,
@@ -151,5 +152,66 @@ describe('sessions repo', () => {
 
   test('reopenSession rejects unknown id', () => {
     expect(() => reopenSession(db, 'nope')).toThrow(/not found/);
+  });
+
+  test('parent_session_id defaults to null for top-level runs', () => {
+    const s = createSession(db, { model: 'm', cwd: '/p' });
+    expect(s.parentSessionId).toBeNull();
+    expect(getSession(db, s.id)?.parentSessionId).toBeNull();
+  });
+
+  test('parent_session_id round-trips when set on a child', () => {
+    const parent = createSession(db, { model: 'm', cwd: '/p' });
+    const child = createSession(db, {
+      model: 'm',
+      cwd: '/p',
+      parentSessionId: parent.id,
+    });
+    expect(child.parentSessionId).toBe(parent.id);
+    expect(getSession(db, child.id)?.parentSessionId).toBe(parent.id);
+  });
+
+  test('listSessions hides children unless includeSubagents is true', () => {
+    // Default listing is the user-facing one — only top-level rows.
+    // --include-subagents flips the gate for audit/debug listings.
+    const parent = createSession(db, { model: 'm', cwd: '/p' });
+    createSession(db, { model: 'm', cwd: '/p', parentSessionId: parent.id });
+    createSession(db, { model: 'm', cwd: '/p', parentSessionId: parent.id });
+    expect(listSessions(db)).toHaveLength(1);
+    expect(listSessions(db, { includeSubagents: true })).toHaveLength(3);
+  });
+
+  test('listChildSessions returns children oldest-first', () => {
+    const parent = createSession(db, { model: 'm', cwd: '/p' });
+    const c1 = createSession(db, {
+      model: 'm',
+      cwd: '/p',
+      parentSessionId: parent.id,
+      startedAt: 1000,
+    });
+    const c2 = createSession(db, {
+      model: 'm',
+      cwd: '/p',
+      parentSessionId: parent.id,
+      startedAt: 2000,
+    });
+    const list = listChildSessions(db, parent.id);
+    expect(list.map((s) => s.id)).toEqual([c1.id, c2.id]);
+  });
+
+  test('parent deletion sets child parent_session_id to null (not cascade)', () => {
+    // Spec §11 + migration 010: child audit trail must survive
+    // a parent retention purge. Cost incurred by the child IS
+    // billed history; cascading would erase it.
+    const parent = createSession(db, { model: 'm', cwd: '/p' });
+    const child = createSession(db, {
+      model: 'm',
+      cwd: '/p',
+      parentSessionId: parent.id,
+    });
+    db.query('DELETE FROM sessions WHERE id = ?').run(parent.id);
+    const fetched = getSession(db, child.id);
+    expect(fetched).not.toBeNull();
+    expect(fetched?.parentSessionId).toBeNull();
   });
 });

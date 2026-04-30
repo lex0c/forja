@@ -15,6 +15,80 @@ Format:
 
 ---
 
+## [2026-04-29] M3 / Step 4.1 — Subagent runtime (in-process) + `task` tool
+
+Lands `AGENTIC_CLI §11` minus worktree isolation: a parent harness
+can declare subagents via `.md` frontmatter, the `task` tool spawns
+a child harness with restricted toolset and own budget, the child
+runs in an isolated context (no parent message history) and writes
+its own session row linked back to the parent via the new
+`sessions.parent_session_id` FK.
+
+**Slice scope:**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/storage/migrations/010-subagents.ts` | NEW | Adds `parent_session_id` to `sessions` (self-referential FK, ON DELETE SET NULL). Index `(parent_session_id, started_at DESC)` for hierarchy fan-out. |
+| `src/storage/repos/sessions.ts` | UPDATED | `Session.parentSessionId`, `createSession({ parentSessionId })`, new `listChildSessions()`, and `listSessions({ includeSubagents })` filter (default OFF). |
+| `src/subagents/types.ts` | NEW | `SubagentDefinition`, `SubagentBudget`, `SubagentScope`. |
+| `src/subagents/paths.ts` | NEW | `userAgentsDir()` + `projectAgentsDir()` mirroring `permissions/paths.ts` shape (XDG + Windows fallbacks). |
+| `src/subagents/load.ts` | NEW | `.md` + YAML-frontmatter parser, kebab-case validation, project shadows user, duplicate-name-in-scope rejected, `meta` overflow for future playbook fields. |
+| `src/subagents/runtime.ts` | NEW | `runSubagent({ definition, prompt, parentSessionId, ... })` — builds child registry filtered to whitelist, fresh `HarnessConfig` w/ child budget + child system prompt, no parent history; returns `{ output, sessionId, status, reason, costUsd, steps, durationMs }`. Optional recursion via forwarded `subagentRegistry`. |
+| `src/harness/types.ts` | UPDATED | `parentSessionId?: string` (threaded into createSession) and `subagentRegistry?: SubagentSet` (drives ctx wiring). |
+| `src/harness/loop.ts` | UPDATED | When `subagentRegistry` set, builds a `spawnSubagent` closure (binds parent session id from current ctx) and threads it into `ToolContext`; forwards same registry to child runs. |
+| `src/tools/types.ts` | UPDATED | `ToolContext.spawnSubagent?` + `SpawnSubagentArgs` / `SpawnSubagentResult` discriminated union (`unknown_subagent` vs `ran`). |
+| `src/tools/builtin/task.ts` | NEW | Built-in tool, schema `{ subagent, prompt }`. Validates args, gates on aborts, maps non-`done` child status → `subagent.run_failed` tool error w/ envelope echoed in details. `planSafe: false` (refuses in plan mode). |
+| `src/cli/bootstrap.ts` | UPDATED | Loads subagents from user/project dirs (test seams `userAgentsDir` / `projectAgentsDir`), exposes the set in `BootstrapResult`, wires `subagentRegistry` into `HarnessConfig`. |
+| `src/cli/list-sessions.ts` | UPDATED | Default listing hides children; `includeSubagents` flag fans each parent into its immediate children oldest-first. JSON shape adds `parent_session_id`; table marks children with `↳ ` indent. |
+| `src/cli/args.ts` | UPDATED | `--include-subagents` flag (boolean, paired with `--list-sessions`). |
+| `evals/smoke-subagent-explore.sh` | NEW | Real-model smoke: parent invokes `task(subagent: 'explore', prompt: '...')`, smoke asserts a child session row was created with `parent_session_id` set, the child never invoked `write_file` (whitelist), and the parent's assistant text references the seed files (output flowed back). |
+| Tests | NEW / UPDATED | `tests/storage/sessions.test.ts` (+5 — parent_session_id round-trip, ON DELETE SET NULL, listChildSessions, listSessions hidden-by-default), `tests/subagents/load.test.ts` (15 — frontmatter parse, validation, precedence, duplicate detection), `tests/subagents/runtime.test.ts` (7 — happy path, parent history isolation, system prompt source, whitelist enforcement, budget cap, typo error, envelope shape), `tests/tools/task.test.ts` (7 — happy path, missing registry, unknown name, run_failed mapping, arg validation, oversized prompt, abort), `tests/cli/list-sessions.test.ts` (+3 — hidden default, fan-out, table indent), `tests/cli/args.test.ts` (+1 — flag parse), `tests/cli/bootstrap.test.ts` (UPDATED — registry assertion includes `task`). |
+
+**Decisions:**
+
+- **In-process, NOT subprocess.** Spec §11 mentions "processo separado, comunicação via SQLite". For Step 4.1 we run the child in the same Bun process: it spawns a fresh session id with `parent_session_id` set, runs the same `runAgent` loop with a filtered registry / restricted prompt / restricted budget, and writes to the same SQLite db. Subprocess isolation is genuinely useful when the child needs filesystem isolation (writing subagents) — at which point worktree isolation IS the answer (Step 4.2). Keeping 4.1 in-process avoids paying the spawn cost (~50-200ms) for the dominant read-only case AND reuses every existing harness invariant (abort-signal propagation, todo store, bg manager, telemetry) without reinventing IPC.
+- **Cost rollup is query-time, not write-time.** I proposed write-time rollup ("parent's `total_cost_usd` = self + children") in the design discussion; on implementation I reverted. Write-time rollup double-counts under resume + repeat task() calls, complicates the budget contract (no cost cap exists in `RunBudget` today anyway), and forces every cost-mutation path through both rows. The honest model: each session row tracks its own spend; `listChildSessions` walks the tree at query time. When a cost cap lands in `RunBudget` later, we revisit by building a parent-time getter that sums on demand.
+- **Checkpoints OFF for in-process subagents.** A child writing in the parent's tree under its own `refs/agent/checkpoints/<child-session>` chain isn't reachable from the parent's `--undo`. Disabling checkpoints for the child avoids creating refs that nobody can find. Read-only subagents (the dominant case) lose nothing. Writing subagents are the §11.2 worktree job — Step 4.2 re-enables checkpoints there because the worktree gives the child its own tree to checkpoint independently.
+- **Whitelist filters at registry build time, not at execution.** `runSubagent` builds a fresh `ToolRegistry` containing only the named tools; the harness's existing `tool not registered` path rejects unknown names. Cleaner than a per-call gate and reuses the existing handling for typo'd tool names. Typos in the whitelist itself THROW at runtime (caller bug, not subagent runtime state) so the author finds them at first use.
+- **`spawnSubagent` lives on `ToolContext`, not as a new harness primitive.** The closure is built once per step and threaded into ctx the same way `bgManager` and `todoStore` are. Tests inject a mock predicate via `makeCtx({ spawnSubagent })`; the harness wires the real one when `config.subagentRegistry` is present. Keeps the tool surface uniform and avoids leaking provider/db/registry references into tools that don't need them.
+- **`unknown_subagent` is a discriminated result, not a throw.** The model can typo a name; that's a tool error the model recovers from (`subagent.unknown` with `available: [...]` in details). Programmer errors (registry missing entirely, typo in the playbook's tool whitelist) DO throw because they signal misconfiguration the model can't fix.
+- **Project scope shadows user scope; same-scope name collision throws.** Same convention as memory + permissions. Cross-scope shadowing is a feature (override the user's default on a per-project basis); within-scope duplication is an authoring mistake (two `.md` files claim the same `name`) and should fail fast at bootstrap.
+- **`task` tool is `category: 'misc'` for now.** The spec's permission engine doesn't have a `subagent` category yet; promoting the route here would force a permission shape decision before its rules are designed. `'misc'` defaults route through the existing engine without behavior change. Migration to a dedicated `subagent` policy section is queued for the permission v2 pass.
+- **`task` is `planSafe: false`.** A subagent could ship `write_file` in its tools whitelist; allowing `task()` in plan mode would let a child mutate the working tree behind the harness's plan-mode gate. The simplest correct rule is "no spawning during plan" — keeps plan mode globally read-only without per-subagent introspection.
+
+**Pending (later slices):**
+
+- Step 4.2: worktree isolation (`isolation: worktree` frontmatter). Re-enables checkpoints for writing subagents because the child's commits land in its own branch under its own worktree. Subprocess spawn becomes worth its cost there.
+- Step 4.3+: playbooks (`code-review`, `security-audit`, etc.). Frontmatter shape (`output_schema`, `references`, `sampling`, `context_recipe`) already lands in `meta` overflow — only the consumer code is missing. PLAYBOOKS.md §11 spells out the procedure.
+- Slash commands `/explain` / `/review` / `/audit` — wait on M4 Ink TUI; the same `runSubagent` API consumed.
+- `--list-subagents` CLI verb (introspection, surfaces shadows). Cheap to add when first user asks.
+- Permission category `subagent` with allow/deny/locked rules per name. Triggered when the org-config ask materializes.
+- Cost rollup helper at the CLI (`cumulativeCost(sessionId)` walks `listChildSessions` recursively). Add when budget cap arrives in `RunBudget`.
+
+**Why it matters:**
+
+- The differential of M3 — what makes the milestone earn its name. Subagents are the primitive every later playbook (review, audit, debug, refactor) is a constraint over.
+- Unblocks the M4 TUI work that wires `/explain` etc. to subagent invocation; the runtime is ready, only the slash-to-tool wire is missing.
+- Establishes the `parent_session_id` audit trail every later cost / replay / forensic tool depends on.
+
+**Verification:** `bun test` 1121 pass / 10 skip / 0 fail (+38 new
+tests across storage, subagents, tools, cli); `tsc --noEmit` clean;
+`biome check` clean. `evals/smoke-subagent-explore.sh` exits 0
+against `anthropic/claude-haiku-4-5`: parent invoked `task()`,
+1 child session row created with `parent_session_id` linked, zero
+`write_file` calls in the child's `tool_calls` (whitelist enforced),
+parent's terminal text referenced the seed files (child output
+flowed back through the tool envelope).
+
+**Bug surfaced by the smoke (and fixed):** initial smoke probed for
+`agent.sqlite` under `$XDG_DATA_HOME/forja/`, but `defaultDbPath()`
+resolves to `sessions.db` (per `src/storage/paths.ts`). The smoke
+failed before the assertions ran. Fixed in the script; nothing to
+change in production code (the path was always correct, only the
+smoke's verification assumption was wrong).
+
+---
+
 ## [2026-04-29] M3 / Step 3 — fix restore on unborn HEAD with dirty tree
 
 `git stash push` refuses on unborn HEAD with the explicit message

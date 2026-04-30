@@ -8,6 +8,7 @@ import { globTool } from './glob.ts';
 import { grepTool } from './grep.ts';
 import { monitorTool } from './monitor.ts';
 import { readFileTool } from './read-file.ts';
+import { taskTool } from './task.ts';
 import { todoWriteTool } from './todo-write.ts';
 import { waitForTool } from './wait-for.ts';
 import { writeFileTool } from './write-file.ts';
@@ -30,6 +31,8 @@ export { monitorTool } from './monitor.ts';
 export type { MonitorInput, MonitorOutput } from './monitor.ts';
 export { readFileTool } from './read-file.ts';
 export type { ReadFileInput, ReadFileOutput } from './read-file.ts';
+export { taskTool } from './task.ts';
+export type { TaskInput, TaskOutput } from './task.ts';
 export { todoWriteTool } from './todo-write.ts';
 export type { TodoWriteInput, TodoWriteItem, TodoWriteOutput } from './todo-write.ts';
 export { waitForTool } from './wait-for.ts';
@@ -48,6 +51,7 @@ export const BUILTIN_TOOLS = [
   waitForTool,
   monitorTool,
   todoWriteTool,
+  taskTool,
   writeFileTool,
   editFileTool,
   bashTool,

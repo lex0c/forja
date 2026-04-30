@@ -23,8 +23,10 @@ import {
   listMessageTailBySession,
   reopenSession,
 } from '../storage/index.ts';
+import { runSubagent } from '../subagents/runtime.ts';
 import { type TodoStore, createTodoStore } from '../todo/index.ts';
 import type { ToolContext } from '../tools/index.ts';
+import type { SpawnSubagentArgs, SpawnSubagentResult } from '../tools/types.ts';
 import { abortableIterable } from './abortable.ts';
 import { CollectStepError, collectStep } from './collect.ts';
 import { compactMessages } from './compaction.ts';
@@ -300,6 +302,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         const session = createSession(config.db, {
           model: config.provider.id,
           cwd: config.cwd,
+          ...(config.parentSessionId !== undefined
+            ? { parentSessionId: config.parentSessionId }
+            : {}),
         });
         sessionId = session.id;
       }
@@ -707,6 +712,65 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             );
           }
 
+          // spawnSubagent closure: only wired when the caller supplied
+          // a subagent registry. The closure binds the *current*
+          // sessionId as the parent id at call time so a child knows
+          // exactly which session spawned it. Each `task` invocation
+          // produces a fresh child session row; recursion is allowed
+          // (a child can task() further children) because the child
+          // harness propagates the same registry down.
+          const spawnSubagentClosure:
+            | ((args: SpawnSubagentArgs) => Promise<SpawnSubagentResult>)
+            | undefined =
+            config.subagentRegistry === undefined
+              ? undefined
+              : async (args: SpawnSubagentArgs): Promise<SpawnSubagentResult> => {
+                  const registry = config.subagentRegistry;
+                  if (registry === undefined) {
+                    return {
+                      kind: 'unknown_subagent',
+                      requested: args.name,
+                      available: [],
+                    };
+                  }
+                  const def = registry.byName.get(args.name);
+                  if (def === undefined) {
+                    return {
+                      kind: 'unknown_subagent',
+                      requested: args.name,
+                      available: Array.from(registry.byName.keys()).sort(),
+                    };
+                  }
+                  const child = await runSubagent({
+                    definition: def,
+                    prompt: args.prompt,
+                    parentSessionId: sessionId,
+                    provider: config.provider,
+                    parentToolRegistry: config.toolRegistry,
+                    permissionEngine: config.permissionEngine,
+                    db: config.db,
+                    cwd: config.cwd,
+                    // Propagate combined parent signal: a Ctrl+C or
+                    // wall-clock timeout on the parent must abort
+                    // the child run too. The child builds its own
+                    // wall-clock on top of this.
+                    signal,
+                    // Forward the registry so the child can task()
+                    // further children. Same set, same names.
+                    subagentRegistry: registry,
+                  });
+                  return {
+                    kind: 'ran',
+                    output: child.output,
+                    sessionId: child.sessionId,
+                    status: child.status,
+                    reason: child.reason,
+                    costUsd: child.costUsd,
+                    steps: child.steps,
+                    durationMs: child.durationMs,
+                  };
+                };
+
           const ctx: ToolContext = {
             signal,
             cwd: config.cwd,
@@ -717,6 +781,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               config.permissionEngine.check(toolName, category, args),
             todoStore,
             ...(bgManager !== undefined ? { bgManager } : {}),
+            ...(spawnSubagentClosure !== undefined ? { spawnSubagent: spawnSubagentClosure } : {}),
           };
 
           safeEmit(config.onEvent, {

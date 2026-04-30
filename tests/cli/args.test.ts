@@ -151,6 +151,18 @@ describe('parseArgs', () => {
     expect(r.args.json).toBe(true);
   });
 
+  test('--include-subagents flag defaults to false and toggles on', () => {
+    const off = parseArgs(['--list-sessions']);
+    expect(off.ok).toBe(true);
+    if (!off.ok) return;
+    expect(off.args.includeSubagents).toBe(false);
+
+    const on = parseArgs(['--list-sessions', '--include-subagents']);
+    expect(on.ok).toBe(true);
+    if (!on.ok) return;
+    expect(on.args.includeSubagents).toBe(true);
+  });
+
   test('--resume requires a value', () => {
     const r = parseArgs(['--resume']);
     expect(r.ok).toBe(false);

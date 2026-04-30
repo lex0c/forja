@@ -15,6 +15,10 @@ export interface Session {
   // `totalCostUsd` is a lower bound and audit queries should mark it
   // as such.
   usageComplete: boolean;
+  // Set when the session was spawned as a subagent (spec §11). Null
+  // for top-level user runs. ON DELETE SET NULL: losing the parent
+  // row must not cascade-delete the child's audit trail.
+  parentSessionId: string | null;
 }
 
 interface SessionRow {
@@ -26,6 +30,7 @@ interface SessionRow {
   status: SessionStatus;
   total_cost_usd: number;
   usage_complete: number;
+  parent_session_id: string | null;
 }
 
 const fromRow = (row: SessionRow): Session => ({
@@ -37,6 +42,7 @@ const fromRow = (row: SessionRow): Session => ({
   status: row.status,
   totalCostUsd: row.total_cost_usd,
   usageComplete: row.usage_complete === 1,
+  parentSessionId: row.parent_session_id,
 });
 
 export interface CreateSessionInput {
@@ -44,11 +50,13 @@ export interface CreateSessionInput {
   model: string;
   cwd: string;
   startedAt?: number;
+  parentSessionId?: string;
 }
 
 export const createSession = (db: DB, input: CreateSessionInput): Session => {
   const id = input.id ?? crypto.randomUUID();
   const startedAt = input.startedAt ?? Date.now();
+  const parentSessionId = input.parentSessionId ?? null;
   // usage_complete defaults to 1 in the schema and starts true here for
   // the same reason: a freshly-created session has no measured turns
   // yet; the harness flips it to 0 via completeSession when finalizing
@@ -59,9 +67,9 @@ export const createSession = (db: DB, input: CreateSessionInput): Session => {
   // order on listSessions — which is what `--resume last` depends
   // on. Same shape as messages.seq (migration 007).
   db.query(
-    `INSERT INTO sessions (id, started_at, model, cwd, status, total_cost_usd, seq)
-     VALUES (?, ?, ?, ?, 'running', 0, (SELECT COALESCE(MAX(seq), -1) + 1 FROM sessions))`,
-  ).run(id, startedAt, input.model, input.cwd);
+    `INSERT INTO sessions (id, started_at, model, cwd, status, total_cost_usd, seq, parent_session_id)
+     VALUES (?, ?, ?, ?, 'running', 0, (SELECT COALESCE(MAX(seq), -1) + 1 FROM sessions), ?)`,
+  ).run(id, startedAt, input.model, input.cwd, parentSessionId);
   return {
     id,
     startedAt,
@@ -71,13 +79,14 @@ export const createSession = (db: DB, input: CreateSessionInput): Session => {
     status: 'running',
     totalCostUsd: 0,
     usageComplete: true,
+    parentSessionId,
   };
 };
 
 export const getSession = (db: DB, id: string): Session | null => {
   const row = db
     .query(
-      `SELECT id, started_at, ended_at, model, cwd, status, total_cost_usd, usage_complete
+      `SELECT id, started_at, ended_at, model, cwd, status, total_cost_usd, usage_complete, parent_session_id
        FROM sessions WHERE id = ?`,
     )
     .get(id) as SessionRow | null;
@@ -88,6 +97,10 @@ export interface ListSessionsOptions {
   limit?: number;
   cwd?: string;
   status?: SessionStatus;
+  // Default: only top-level sessions (parent_session_id IS NULL).
+  // Set true to include children — useful for audit/debug listings.
+  // The list-sessions CLI exposes this as `--include-subagents`.
+  includeSubagents?: boolean;
 }
 
 export const listSessions = (db: DB, options: ListSessionsOptions = {}): Session[] => {
@@ -102,6 +115,9 @@ export const listSessions = (db: DB, options: ListSessionsOptions = {}): Session
     filters.push('status = ?');
     params.push(options.status);
   }
+  if (options.includeSubagents !== true) {
+    filters.push('parent_session_id IS NULL');
+  }
   const where = filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : '';
   params.push(limit);
   // Secondary order by seq DESC (migration 008) is the deterministic
@@ -111,12 +127,28 @@ export const listSessions = (db: DB, options: ListSessionsOptions = {}): Session
   // implementation-defined fallback — and `--resume last` then
   // attaches to the wrong conversation. seq is monotonically
   // increasing per insert, so DESC gives newest-first.
-  const sql = `SELECT id, started_at, ended_at, model, cwd, status, total_cost_usd, usage_complete
+  const sql = `SELECT id, started_at, ended_at, model, cwd, status, total_cost_usd, usage_complete, parent_session_id
                FROM sessions
                ${where}
                ORDER BY started_at DESC, seq DESC
                LIMIT ?`;
   const rows = db.query(sql).all(...params) as SessionRow[];
+  return rows.map(fromRow);
+};
+
+// Children of a parent session, oldest-first so renderers can show
+// the natural call order (a parent with two task() invocations sees
+// child[0] before child[1]). Used by --list-sessions hierarchy and
+// by cost rollup queries.
+export const listChildSessions = (db: DB, parentSessionId: string): Session[] => {
+  const rows = db
+    .query(
+      `SELECT id, started_at, ended_at, model, cwd, status, total_cost_usd, usage_complete, parent_session_id
+       FROM sessions
+       WHERE parent_session_id = ?
+       ORDER BY started_at ASC, seq ASC`,
+    )
+    .all(parentSessionId) as SessionRow[];
   return rows.map(fromRow);
 };
 

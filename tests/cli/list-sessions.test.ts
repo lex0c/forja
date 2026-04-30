@@ -107,4 +107,99 @@ describe('runListSessions', () => {
     const item = JSON.parse(out[0] ?? '{}') as { prompt_preview: string };
     expect(item.prompt_preview).toBe('');
   });
+
+  test('subagent rows are hidden by default', () => {
+    // The dominant case is "show me my own runs". A user who
+    // invoked `task()` should see ONE row, not the parent + N
+    // subagent children inflating the listing. The default omits
+    // children; --include-subagents fans them in.
+    const parent = createSession(db, { model: 'mock/a', cwd: '/p' });
+    appendMessage(db, { sessionId: parent.id, role: 'user', content: 'parent prompt' });
+    createSession(db, {
+      model: 'mock/a',
+      cwd: '/p',
+      parentSessionId: parent.id,
+    });
+    createSession(db, {
+      model: 'mock/a',
+      cwd: '/p',
+      parentSessionId: parent.id,
+    });
+    const out: string[] = [];
+    runListSessions({ json: true, dbOverride: db, out: (s) => out.push(s) });
+    const lines = out
+      .join('')
+      .trim()
+      .split('\n')
+      .filter((l) => l.length > 0);
+    expect(lines).toHaveLength(1);
+    const item = JSON.parse(lines[0] ?? '{}') as {
+      id: string;
+      parent_session_id: string | null;
+    };
+    expect(item.id).toBe(parent.id);
+    expect(item.parent_session_id).toBeNull();
+  });
+
+  test('--include-subagents fans children under their parent', () => {
+    const parent = createSession(db, { model: 'mock/a', cwd: '/p', startedAt: 1000 });
+    appendMessage(db, { sessionId: parent.id, role: 'user', content: 'parent prompt' });
+    const c1 = createSession(db, {
+      model: 'mock/a',
+      cwd: '/p',
+      parentSessionId: parent.id,
+      startedAt: 1100,
+    });
+    const c2 = createSession(db, {
+      model: 'mock/a',
+      cwd: '/p',
+      parentSessionId: parent.id,
+      startedAt: 1200,
+    });
+    const out: string[] = [];
+    runListSessions({
+      json: true,
+      includeSubagents: true,
+      dbOverride: db,
+      out: (s) => out.push(s),
+    });
+    const lines = out
+      .join('')
+      .trim()
+      .split('\n')
+      .filter((l) => l.length > 0);
+    expect(lines).toHaveLength(3);
+    // Order: parent first (newest of the top-level pool), then its
+    // children oldest-first.
+    const parsed = lines.map(
+      (l) => JSON.parse(l) as { id: string; parent_session_id: string | null },
+    );
+    expect(parsed[0]?.id).toBe(parent.id);
+    expect(parsed[0]?.parent_session_id).toBeNull();
+    expect(parsed[1]?.id).toBe(c1.id);
+    expect(parsed[1]?.parent_session_id).toBe(parent.id);
+    expect(parsed[2]?.id).toBe(c2.id);
+    expect(parsed[2]?.parent_session_id).toBe(parent.id);
+  });
+
+  test('table mode marks subagent rows with the ↳ indent', () => {
+    const parent = createSession(db, { model: 'mock/a', cwd: '/p' });
+    appendMessage(db, { sessionId: parent.id, role: 'user', content: 'p' });
+    const child = createSession(db, {
+      model: 'mock/a',
+      cwd: '/p',
+      parentSessionId: parent.id,
+      startedAt: parent.startedAt + 1,
+    });
+    const out: string[] = [];
+    runListSessions({
+      json: false,
+      includeSubagents: true,
+      dbOverride: db,
+      out: (s) => out.push(s),
+    });
+    const text = out.join('');
+    expect(text).toContain(parent.id);
+    expect(text).toContain(`↳ ${child.id}`);
+  });
 });
