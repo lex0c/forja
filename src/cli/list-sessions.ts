@@ -9,6 +9,7 @@ import {
   type DB,
   cumulativeCostUsd,
   defaultDbPath,
+  getSubagentRun,
   listChildSessions,
   listSessions,
   migrate,
@@ -93,6 +94,15 @@ interface SessionListItem {
   // renderers indent without re-walking parent_session_id, and
   // gives JSON consumers a flat-but-shaped tree.
   depth: number;
+  // Audit fingerprint for subagent rows: when this row was
+  // spawned as a subagent, the snapshot captured at run time
+  // gives the definition name + content hash so the user can
+  // tell which version of the .md was active. Null for
+  // top-level rows (no snapshot exists) and for orphan rows
+  // whose snapshot was somehow not captured. Detail (system
+  // prompt, full toolset, budget) lives in subagent_runs and
+  // can be fetched with getSubagentRun(sessionId).
+  subagent_run: { name: string; source_sha256: string } | null;
 }
 
 const buildItem = (s: Session, db: DB, depth: number): SessionListItem => {
@@ -115,6 +125,11 @@ const buildItem = (s: Session, db: DB, depth: number): SessionListItem => {
       // ignore malformed row; preview stays empty
     }
   }
+  // Subagent fingerprint: only meaningful when the row IS a
+  // subagent (is_subagent=true). One extra SELECT per such row
+  // — keeps the listing simple while exposing the snapshot
+  // identity at the same place a user already inspects.
+  const snapshot = s.isSubagent ? getSubagentRun(db, s.id) : null;
   return {
     id: s.id,
     started_at: formatTime(s.startedAt),
@@ -133,6 +148,8 @@ const buildItem = (s: Session, db: DB, depth: number): SessionListItem => {
     parent_session_id: s.parentSessionId,
     is_subagent: s.isSubagent,
     depth,
+    subagent_run:
+      snapshot !== null ? { name: snapshot.name, source_sha256: snapshot.sourceSha256 } : null,
   };
 };
 

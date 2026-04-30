@@ -99,6 +99,21 @@ const resolveResumeId = (
     if (existing === null) {
       return { ok: false, message: `session ${resume} not found` };
     }
+    if (existing.isSubagent) {
+      // O5 C-block. Subagent sessions can't be resumed cleanly
+      // because --resume restores messages but NOT the system
+      // prompt or the tools whitelist — the resumed run would
+      // get the parent's full registry and an empty system
+      // prompt, diverging from how the subagent originally ran.
+      // The audit snapshot from migration 012 enables future
+      // re-hydration (O5b in BACKLOG) but the semantics need
+      // proper design (budget conflicts, plan mode, missing
+      // tools). For now we refuse and point at task().
+      return {
+        ok: false,
+        message: `cannot --resume a subagent session (id ${resume} is a subagent run; use the \`task\` tool to spawn a fresh subagent instead)`,
+      };
+    }
     return { ok: true, id: resume };
   } finally {
     db.close();

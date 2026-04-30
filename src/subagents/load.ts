@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
@@ -170,6 +171,7 @@ const parseDefinition = (
   parsed: ParsedFile,
   scope: SubagentScope,
   sourcePath: string,
+  sourceSha256: string,
 ): SubagentDefinition => {
   const fm = parsed.frontmatter;
   const name = requireString(fm, 'name', sourcePath);
@@ -207,6 +209,7 @@ const parseDefinition = (
     systemPrompt: parsed.body,
     scope,
     sourcePath,
+    sourceSha256,
     meta,
   };
 };
@@ -241,8 +244,15 @@ export const loadSubagentFromString = (
   scope: SubagentScope,
   sourcePath: string,
 ): SubagentDefinition => {
+  // Hash the RAW content (frontmatter + body, original line
+  // endings preserved) so the fingerprint matches exactly what
+  // was on disk at load time. We deliberately do NOT hash the
+  // parsed/normalized form — two semantically equivalent files
+  // with different whitespace would otherwise alias under one
+  // sha and audit lose the distinction.
+  const sourceSha256 = createHash('sha256').update(content).digest('hex');
   const parsed = splitFrontmatter(content, sourcePath);
-  return parseDefinition(parsed, scope, sourcePath);
+  return parseDefinition(parsed, scope, sourcePath, sourceSha256);
 };
 
 export const loadSubagentFromFile = (path: string, scope: SubagentScope): SubagentDefinition => {

@@ -840,6 +840,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     costUsd: child.costUsd,
                     steps: child.steps,
                     durationMs: child.durationMs,
+                    ...(child.auditFailure !== undefined
+                      ? { auditFailure: child.auditFailure }
+                      : {}),
                   };
                 };
 

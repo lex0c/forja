@@ -2,7 +2,7 @@ import type { HarnessConfig, HarnessEvent, HarnessResult } from '../harness/inde
 import { runAgent } from '../harness/index.ts';
 import type { PermissionEngine } from '../permissions/index.ts';
 import type { Provider } from '../providers/index.ts';
-import type { DB } from '../storage/index.ts';
+import { type DB, insertSubagentRun } from '../storage/index.ts';
 import { type Tool, type ToolRegistry, createToolRegistry } from '../tools/index.ts';
 import type { SubagentSet } from './load.ts';
 import type { SubagentDefinition } from './types.ts';
@@ -122,6 +122,14 @@ export interface RunSubagentResult {
   // for renderers that show "subagent X used N/M steps".
   steps: number;
   durationMs: number;
+  // Set when the post-run audit snapshot insert failed. Audit is
+  // best-effort — a failure here does NOT change the run's outcome
+  // — but losing the snapshot silently violates the "measure twice"
+  // principle, so we surface the error to the caller. The `task`
+  // tool echoes this in its tool-result envelope so the parent
+  // model and the CLI can flag it; tests assert the field is
+  // present when storage is broken. Absent on the success path.
+  auditFailure?: { code: string; message: string };
 }
 
 // Hard cap on how deep a chain of `task → task → task` can nest.
@@ -216,6 +224,53 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // their own bg dir.
 
   const result = await runAgent(childConfig);
+  // Audit snapshot of the definition under which this child ran
+  // (migration 012). Captured AFTER runAgent because the snapshot
+  // FK targets sessions.id and the row is created inside the
+  // harness loop — runAgent always returns HarnessResult (top-
+  // level catch in the loop is exhaustive), so the only path
+  // where we have no sessionId is one where createSession itself
+  // failed and there is nothing to audit anyway.
+  //
+  // The snapshot fingerprints what the child was EXECUTING under,
+  // not what the .md file currently looks like. An author editing
+  // `~/.config/agent/agents/explore.md` after this run leaves the
+  // snapshot intact — every future "explain past behavior" query
+  // resolves against this row, not against on-disk state that may
+  // have drifted.
+  //
+  // Best-effort insert: a corrupted audit table (schema drift on
+  // a stale DB, FK violation, disk-full) must NOT mask the run's
+  // outcome. The session is already finalized; throwing here
+  // would surface as `internalError` and hide the actual exit
+  // reason from the parent. Instead, capture the error onto the
+  // result so the calling tool can echo it in its envelope —
+  // makes audit-failure visible without rewriting the success
+  // path.
+  let auditFailure: { code: string; message: string } | undefined;
+  if (result.sessionId.length > 0) {
+    try {
+      insertSubagentRun(input.db, {
+        sessionId: result.sessionId,
+        name: definition.name,
+        scope: definition.scope,
+        sourcePath: definition.sourcePath,
+        sourceSha256: definition.sourceSha256,
+        systemPrompt: definition.systemPrompt,
+        toolsWhitelist: definition.tools,
+        budgetMaxSteps: definition.budget.maxSteps,
+        budgetMaxCostUsd: definition.budget.maxCostUsd,
+        ...(definition.budget.maxWallClockMs !== undefined
+          ? { budgetMaxWallMs: definition.budget.maxWallClockMs }
+          : {}),
+      });
+    } catch (e) {
+      auditFailure = {
+        code: 'snapshot_insert_failed',
+        message: e instanceof Error ? e.message : String(e),
+      };
+    }
+  }
   // The terminal assistant text is the structured output. The harness
   // already persisted it; we reconstruct here from result.lastMessageId
   // when available, falling back to detail for early-exit paths.
@@ -228,6 +283,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     costUsd: result.costUsd,
     steps: result.steps,
     durationMs: result.durationMs,
+    ...(auditFailure !== undefined ? { auditFailure } : {}),
   };
 };
 

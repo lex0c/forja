@@ -9,6 +9,7 @@ import { migration008SessionSeq } from './008-session-seq.ts';
 import { migration009Checkpoints } from './009-checkpoints.ts';
 import { migration010Subagents } from './010-subagents.ts';
 import { migration011SessionsIsSubagent } from './011-sessions-is-subagent.ts';
+import { migration012SubagentRuns } from './012-subagent-runs.ts';
 
 export interface Migration {
   id: number;
@@ -28,4 +29,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration009Checkpoints,
   migration010Subagents,
   migration011SessionsIsSubagent,
+  migration012SubagentRuns,
 ];

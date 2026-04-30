@@ -15,6 +15,158 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.1 — subagent definition snapshot (audit gap closed)
+
+Architectural review surfaced a real audit gap that wasn't in the
+prior O1/O2/O3/O4 list: the system prompt and toolset under which
+a subagent ran were never persisted. They lived in `.md` files on
+disk, loaded once at bootstrap; if an author edited
+`~/.config/agent/agents/explore.md` after a child run, the original
+definition was unrecoverable and "explain past behavior" forensics
+became impossible. The cost is asymmetric — every day deferred
+loses evidence on every production run that happens in the
+meantime.
+
+**Decision:** Option A (snapshot at spawn). The other discussed
+shapes (B = system prompt as a `messages` row, C = block/restore
+on `--resume` of a child) were either invasive (B forces a CHECK
+constraint change in migration 001 and ripples through compaction/
+recap) or dependent on A (C-restore needs the snapshot to exist;
+without A there's nothing to restore from). A is a one-table
+ratchet: future runs become auditable, past runs stay lost.
+
+**Slice scope:**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/storage/migrations/012-subagent-runs.ts` | NEW | `subagent_runs` table — session_id PK + FK CASCADE, name, scope (CHECK user/project), source_path, source_sha256, system_prompt, tools_whitelist (JSON TEXT), budget_max_steps, budget_max_cost_usd, budget_max_wall_ms (nullable), captured_at. Index `(name, captured_at DESC)` for cross-run identity queries. |
+| `src/storage/repos/subagent-runs.ts` | NEW | `insertSubagentRun` / `getSubagentRun` with defensive JSON parse (malformed tools_whitelist → empty array, never crashes the listing). |
+| `src/subagents/types.ts` | UPDATED | `SubagentDefinition.sourceSha256: string` (added at load time). |
+| `src/subagents/load.ts` | UPDATED | `createHash('sha256')` over the raw `.md` content (frontmatter + body, original line endings) before parsing. Path-independent fingerprint. |
+| `src/subagents/runtime.ts` | UPDATED | After `runAgent` returns, INSERT the snapshot from the captured definition. Best-effort: a corrupted audit table doesn't mask the run's own outcome (catch swallows insert errors). |
+| `src/cli/list-sessions.ts` | UPDATED | `SessionListItem.subagent_run: { name, source_sha256 } \| null`. Surfaces the snapshot identity in JSON for subagent rows; full detail (system prompt, full toolset, budget) reachable via `getSubagentRun(id)`. |
+| Tests | NEW + UPDATED | `tests/storage/subagent-runs.test.ts` (8 — round-trip, nullable wall_ms, cascade, parent-purge survives, CHECK constraint, JSON shapes, malformed JSON defense), `tests/subagents/load.test.ts` (+1 — sha256 deterministic + path-independent + edit-detection), `tests/subagents/runtime.test.ts` (+3 — snapshot lands on success/exhausted/wall-ms-omitted), `tests/cli/list-sessions.test.ts` (+2 — JSON exposes fingerprint, defensive null when snapshot missing). |
+
+**Decisions:**
+
+- **Hash raw content, not parsed.** Two semantically equivalent
+  files with different whitespace MUST produce different sha —
+  otherwise audit can't tell apart edits to the source form.
+  Defense against the "file was reformatted" rationalization that
+  hides actual semantic shifts behind a stable hash.
+- **Snapshot inserted AFTER runAgent.** runAgent always returns a
+  HarnessResult (top-level catch is exhaustive); the only path
+  with no sessionId is one where createSession itself failed and
+  there's nothing to audit anyway. Pre-call insertion would
+  require restructuring runAgent's session-creation flow (event
+  hook, or the resume misuse path that drags in systemPrompt
+  restoration semantics) — neither pays for itself here.
+- **Best-effort insert with error swallow.** A corrupted audit
+  table (schema drift on a stale DB, FK constraint failure on
+  some future migration mistake) must NOT mask the run's actual
+  outcome. The session itself is finalized; failing the insert
+  would surface as `internalError` and hide the legitimate run
+  exit reason from the parent. Audit losses are recoverable from
+  other artifacts (git log, parent's `tool_calls.input/output`);
+  outcome misreporting isn't.
+- **JSON surface is compact (`name + source_sha256` only).** Full
+  detail (system prompt can be multi-KB, full toolset, budget
+  triple) lives in subagent_runs and is one query away. Listing
+  rows stay readable; forensic queries pull detail explicitly.
+- **CASCADE on session deletion, NOT on parent purge.** The
+  snapshot belongs to the child's audit trail. Deleting the child
+  session row drops the snapshot too; deleting the parent (which
+  ON DELETE SET NULLs the child's parent_session_id) leaves both
+  intact. Mirror of the `parent_session_id` design from migration
+  010.
+
+**Follow-up landed in the same pass — O5 C-block:**
+
+`resolveResumeId` now refuses `--resume` on `is_subagent=true`
+rows with a clear hint at `task()`. Without C-block, resuming a
+subagent silently inherited the parent's full registry and an
+empty system prompt — divergent enough to surprise the user. C-
+block is the honest v1: the spec treats subagents as atomic
+spawns, not continuable sessions. C-restore (re-hydrate from the
+snapshot) becomes possible thanks to migration 012 and is tracked
+as O5b in Pending — deferred as a feature pending real demand and
+proper design for several edge cases (missing tools, renamed
+subagents, budget conflicts, plan-mode propagation).
+
+**What this DOESN'T close (known limitations):**
+
+- **Process-kill timing window.** The snapshot insert runs AFTER
+  `runAgent` returns. If the parent process is `SIGKILL`'d (or
+  OOM-killed) between createSession and the post-await code
+  executing, the session row exists with no snapshot. Closing
+  this would require restructuring the harness to expose a
+  "session created, here's the id" hook so the snapshot can
+  land BEFORE the loop runs. Out of scope for this slice; the
+  auditFailure surface on `RunSubagentResult` catches the
+  synchronous error path which is the dominant case.
+- **N+1 on subagent rows in `--list-sessions`.** With
+  `--include-subagents`, the listing does one extra
+  `getSubagentRun` SELECT per subagent row on top of the existing
+  `cumulativeCostUsd` walk. For typical workloads (<100 rows)
+  negligible; a single `WHERE session_id IN (?, ...)` pre-fetch
+  would make it O(1). Same shape as the prior O1 N+1 note —
+  defer until first user reports a slow listing.
+- **Pre-migration row distinguishability.** A session with
+  `is_subagent=true` but no snapshot can be either a row created
+  before migration 012, or a row whose snapshot insert failed
+  silently. The CLI emits `subagent_run: null` for both. Today
+  treated identically; future fix could add a status column or
+  a one-shot backfill.
+- **`system_prompt` privacy.** Stored as plaintext in the audit
+  table. Same trust model as `messages.content` (sessions DB is
+  same trust level as source `.md` files), but a future privacy
+  pass should consider a redaction layer if subagent prompts
+  start carrying customer data.
+- **CRLF/LF cross-clone instability.** sha256 is over raw bytes,
+  so a Windows clone with `core.autocrlf=true` produces different
+  fingerprints than a Linux clone of the same git revision.
+  Documented as deliberate (silent normalization would alias
+  edits to the source form); authors who want stable shas across
+  platforms should set `* text=lf` in `.gitattributes`. Locked
+  by test in `tests/subagents/load.test.ts`.
+- **Hooks (spec §10).** `subagent_spawn` / `tool_use_pre` events
+  for external audit pipelines stay out of scope until M4.
+- **`traces` table (spec §13).** OpenTelemetry-style span emission
+  is M2/3 territory; the subagent_runs row is the M3 audit
+  primitive.
+
+**Review pass (post-self-review).** Reviewer surfaced 5 medium +
+6 minor + 3 out-of-scope. Addressed in this commit:
+
+- **M1** — silent snapshot failure invisible to caller. Now the
+  runtime returns `RunSubagentResult.auditFailure` when the
+  insert throws; the `task` tool echoes it as `audit_failure` in
+  the envelope; tests assert both the surface AND that run
+  outcome stays authoritative.
+- **M3** — CRLF/LF deliberate divergence locked by test;
+  cross-clone footgun documented above.
+- **M4** — stale "future-proofs the path" comment removed (O5
+  C-block makes the resumed-child re-insert dead code).
+- **M5** — explicit PK conflict test added in repo (locks the
+  fail-loud-on-duplicate contract; flips to `INSERT OR REPLACE`
+  in a future refactor would surface).
+- **m3** — `getSubagentRun` JSDoc clarifies the two
+  null-producing cases (not-a-subagent vs missing-snapshot).
+- **m4** — `captured_at` semantics documented in migration
+  comment (lags `started_at` by run duration; forensic queries
+  filter accordingly).
+
+Deferred (out of scope or known-limitation per above): M2
+(process-kill window), m1 (N+1), m2 (table fingerprint UX), m6
+(test technique), and the three OOS items (privacy, backfill,
+corruption status flag).
+
+**Verification:** `bun test` 1181 pass / 10 skip / 0 fail (+18
+new tests across migration, repo, loader, runtime, CLI, task
+tool); `tsc --noEmit` clean; `biome check` clean.
+
+---
+
 ## [2026-04-30] M3 / Step 4.1 — close O1 (cost rollup) + O3 (flag validation)
 
 Two of the four "Pending" items from the prior review fix pass were
@@ -188,6 +340,20 @@ on `tc.status='done'` per M5).
   Trigger: first request for org-level subagent gating.
 - ~~**O3 — `--include-subagents` standalone**~~ — closed in the
   [2026-04-30 O1+O3 pass] entry above.
+- ~~**O5 — `--resume <child-id>` ignores the snapshot**~~ —
+  closed via C-block (resume of subagent now refused at preflight
+  with a hint at `task()`). See O5b for the re-hydration path
+  that's now possible thanks to the audit snapshot subsystem.
+- **O5b — re-hydrate HarnessConfig from `subagent_runs` on
+  resume.** With migration 012 in place, the snapshot gives us
+  enough to legitimately resume a subagent (restore systemPrompt,
+  filtered registry, budget) instead of refusing. Deferred
+  because it's a feature, not a bug fix — needs design for
+  several edge cases: tool in whitelist that no longer exists in
+  parent registry, subagent name removed/renamed since the
+  original run, conflict between snapshot budget and `--max-steps`
+  CLI override, plan-mode propagation. Trigger: a user reports a
+  legitimate use case for continuing a crashed subagent run.
 - **O4 — subagent `maxCostUsd` is independent of parent's
   remaining budget.** Spec §11 endorses "budget próprio" so this
   is by design, but a parent with a tight cap can still be

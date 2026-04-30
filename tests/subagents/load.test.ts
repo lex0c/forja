@@ -210,6 +210,43 @@ body`;
     }
   });
 
+  test('sha256 differs between LF and CRLF line endings (deliberate)', () => {
+    // Cross-platform footgun made deliberate: a Windows clone
+    // with `core.autocrlf=true` produces CRLF on disk where
+    // Linux has LF, so the same git revision yields different
+    // shas across machines. This test locks in the deliberate
+    // choice — silently normalizing would alias real edits to
+    // the source form. Authors who want stable shas across
+    // platforms should set `* text=lf` in .gitattributes.
+    const lf = VALID;
+    const crlf = lf.replace(/\n/g, '\r\n');
+    const defLf = loadSubagentFromString(lf, 'user', '/p');
+    const defCrlf = loadSubagentFromString(crlf, 'user', '/p');
+    expect(defLf.sourceSha256).not.toBe(defCrlf.sourceSha256);
+    // Both are still well-formed; the body field strips the line
+    // endings as part of trim, so semantic content survives.
+    expect(defLf.systemPrompt.length).toBeGreaterThan(0);
+    expect(defCrlf.systemPrompt.length).toBeGreaterThan(0);
+  });
+
+  test('captures sha256 of raw content (frontmatter + body)', () => {
+    // Snapshot fingerprint contract: hash deterministic from
+    // exact file bytes, not from parsed/normalized form. Two
+    // semantically equivalent files with different whitespace
+    // MUST produce different sha — otherwise audit can't tell
+    // apart edits to the file's source form.
+    const def = loadSubagentFromString(VALID, 'user', '/p');
+    expect(def.sourceSha256).toMatch(/^[0-9a-f]{64}$/);
+    // Same content yields same sha regardless of source path
+    // (path is identity, sha is content fingerprint).
+    const def2 = loadSubagentFromString(VALID, 'project', '/different/path.md');
+    expect(def2.sourceSha256).toBe(def.sourceSha256);
+    // A whitespace edit (extra blank line in body) changes the sha.
+    const edited = `${VALID}\n`;
+    const def3 = loadSubagentFromString(edited, 'user', '/p');
+    expect(def3.sourceSha256).not.toBe(def.sourceSha256);
+  });
+
   test('accepts well-formed tool names unchanged', () => {
     // Sanity: the new whitespace check doesn't reject legitimate
     // names (regression guard — a too-aggressive trim check could

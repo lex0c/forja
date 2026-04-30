@@ -62,6 +62,25 @@ describe('task tool', () => {
     expect(result.details?.available).toEqual(['explore']);
   });
 
+  test('echoes audit_failure in the envelope when the child reports one', async () => {
+    // M1 fix: when the runtime fails to persist the audit
+    // snapshot, the run still completes successfully but the
+    // tool result must surface the audit_failure so the parent
+    // model + CLI can flag missing forensic record.
+    const ctx = makeCtx({
+      spawnSubagent: async () =>
+        ranEnvelope({
+          auditFailure: { code: 'snapshot_insert_failed', message: 'no such table: subagent_runs' },
+        }),
+    });
+    const result = await taskTool.execute({ subagent: 'explore', prompt: 'go' }, ctx);
+    expect(isToolError(result)).toBe(false);
+    if (isToolError(result)) return;
+    expect(result.audit_failure).toBeDefined();
+    expect(result.audit_failure?.code).toBe('snapshot_insert_failed');
+    expect(result.audit_failure?.message).toContain('subagent_runs');
+  });
+
   test('errors on depth_exceeded with depth + max_depth in details', async () => {
     const ctx = makeCtx({
       spawnSubagent: async () => ({

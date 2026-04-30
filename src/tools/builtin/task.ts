@@ -32,6 +32,11 @@ export interface TaskOutput {
   cost_usd: number;
   steps: number;
   duration_ms: number;
+  // Present only when the child's audit snapshot failed to
+  // persist. The run's outcome above is still authoritative —
+  // this is an advisory so the parent / operator know the
+  // forensic record is missing.
+  audit_failure?: { code: string; message: string };
 }
 
 // Cap on the prompt the parent forwards to the child. 32 KiB is
@@ -178,6 +183,7 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
       cost_usd: result.costUsd,
       steps: result.steps,
       duration_ms: result.durationMs,
+      ...(result.auditFailure !== undefined ? { audit_failure: result.auditFailure } : {}),
     };
   },
 };

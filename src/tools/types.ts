@@ -149,6 +149,11 @@ export type SpawnSubagentResult =
       costUsd: number;
       steps: number;
       durationMs: number;
+      // Optional advisory: the run completed but the audit
+      // snapshot persistence failed. Surfaced so the calling
+      // tool can echo it in its envelope; the run's outcome
+      // (status/reason/cost/etc.) is still authoritative.
+      auditFailure?: { code: string; message: string };
     };
 
 export interface Tool<I = unknown, O = unknown> {

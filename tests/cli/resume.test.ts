@@ -272,6 +272,37 @@ describe('--resume flow', () => {
     }
   });
 
+  test('resume <child-id> on a subagent session is refused with a clear hint', async () => {
+    // O5 C-block. Resuming a subagent session would restore its
+    // messages but NOT its system prompt or tools whitelist —
+    // the resumed run would inherit the parent's full registry
+    // and run with an empty system prompt, diverging silently
+    // from how the subagent originally ran. We refuse at preflight
+    // and point at task() as the right way to spawn a subagent.
+    db = openTestDb();
+    const parent = createSession(db, { model: 'mock/m', cwd: workdir });
+    const child = createSession(db, {
+      model: 'mock/m',
+      cwd: workdir,
+      parentSessionId: parent.id,
+    });
+    db.close();
+
+    const errLines: string[] = [];
+    const code = await run({
+      args: baseArgs({ prompt: 'continuing', resume: child.id }),
+      bootstrapOverride: { dbPath, cwd: workdir },
+      signal: new AbortController().signal,
+      rendererOverride: recordingRenderer().renderer,
+      errSink: (s) => errLines.push(s),
+    });
+    expect(code).toBe(1);
+    const errOut = errLines.join('');
+    expect(errOut).toContain('cannot --resume a subagent session');
+    expect(errOut).toContain(child.id);
+    expect(errOut).toContain('task');
+  });
+
   test("resume 'last' skips subagent rows", async () => {
     // M3 regression. Subagent sessions live in the same `sessions`
     // table linked via `parent_session_id`. `resolveResumeId` calls

@@ -4,7 +4,12 @@ import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { Policy } from '../../src/permissions/index.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
-import { createSession, getSession, listChildSessions } from '../../src/storage/index.ts';
+import {
+  createSession,
+  getSession,
+  getSubagentRun,
+  listChildSessions,
+} from '../../src/storage/index.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent, toEnvelope } from '../../src/subagents/runtime.ts';
 import type { SubagentDefinition } from '../../src/subagents/types.ts';
@@ -124,6 +129,7 @@ const definition = (overrides: Partial<SubagentDefinition> = {}): SubagentDefini
   systemPrompt: 'You are an exploration subagent.',
   scope: 'project',
   sourcePath: '/fake/explore.md',
+  sourceSha256: 'a'.repeat(64),
   meta: {},
   ...overrides,
 });
@@ -423,6 +429,127 @@ describe('runSubagent', () => {
     expect(result.status).toBe('exhausted');
     expect(result.reason).toBe('maxCostUsd');
     expect(result.costUsd).toBeCloseTo(0.0006, 9);
+  });
+
+  test('captures definition snapshot in subagent_runs after the child run', async () => {
+    // Audit invariant: every successful subagent spawn leaves a
+    // row in subagent_runs that fingerprints the definition the
+    // child actually ran under. Author edits to the .md after
+    // the fact don't lose this evidence.
+    const parent = createSession(db, { model: 'mock/m', cwd: '/p' });
+    const def = definition({
+      name: 'explore',
+      sourcePath: '/u/.config/agent/agents/explore.md',
+      sourceSha256: 'f'.repeat(64),
+      tools: ['echo'],
+      budget: { maxSteps: 7, maxCostUsd: 0.05, maxWallClockMs: 30_000 },
+      systemPrompt: 'You are explore (snapshot fixture).',
+    });
+    const result = await runSubagent({
+      definition: def,
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: mockProvider([{ text: 'done', stop_reason: 'end_turn' }]),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+    });
+    const snapshot = getSubagentRun(db, result.sessionId);
+    expect(snapshot).not.toBeNull();
+    expect(snapshot?.name).toBe('explore');
+    expect(snapshot?.sourcePath).toBe('/u/.config/agent/agents/explore.md');
+    expect(snapshot?.sourceSha256).toBe('f'.repeat(64));
+    expect(snapshot?.systemPrompt).toBe('You are explore (snapshot fixture).');
+    expect(snapshot?.toolsWhitelist).toEqual(['echo']);
+    expect(snapshot?.budgetMaxSteps).toBe(7);
+    expect(snapshot?.budgetMaxCostUsd).toBe(0.05);
+    expect(snapshot?.budgetMaxWallMs).toBe(30_000);
+  });
+
+  test('snapshot lands even when the child exits exhausted (audit must survive failure)', async () => {
+    // Forensic case: a budget-exhausted run is exactly when the
+    // user wants to know "what definition was this running
+    // under?". The snapshot must NOT be conditional on success.
+    const parent = createSession(db, { model: 'mock/m', cwd: '/p' });
+    const result = await runSubagent({
+      definition: definition({ budget: { maxSteps: 1, maxCostUsd: 0 } }),
+      prompt: 'loop',
+      parentSessionId: parent.id,
+      provider: mockProvider([
+        {
+          text: 'one',
+          tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: 'x' } }],
+          stop_reason: 'tool_use',
+        },
+      ]),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+    });
+    expect(result.status).toBe('exhausted');
+    expect(getSubagentRun(db, result.sessionId)).not.toBeNull();
+  });
+
+  test('auditFailure surfaces on snapshot insert error (does not mask run outcome)', async () => {
+    // M1 fix from the review pass: when the snapshot insert
+    // fails, the run's outcome (status/reason/output) must STILL
+    // be authoritative — but the failure must be visible to the
+    // caller via auditFailure. We trigger the failure by
+    // pre-inserting a row with the same session_id that runAgent
+    // will create, forcing a PK conflict on the second insert.
+    //
+    // Setup: run the subagent first time → snapshot lands.
+    // Force a duplicate by re-running with a fixture that pins
+    // the session id (we can't do that directly without
+    // restructuring runtime, so we manually corrupt by making
+    // session_id collide via a second runtime invocation against
+    // the same parent and same definition — the first insert
+    // succeeds, the second uses a different session_id and also
+    // succeeds because UUIDs are unique).
+    //
+    // Cleaner approach: drop the subagent_runs table to make
+    // insertSubagentRun fail with a "no such table" error.
+    const parent = createSession(db, { model: 'mock/m', cwd: '/p' });
+    db.exec('DROP TABLE subagent_runs');
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+    });
+    // Run outcome stays authoritative.
+    expect(result.status).toBe('done');
+    expect(result.output).toBe('ok');
+    // Audit failure is surfaced.
+    expect(result.auditFailure).toBeDefined();
+    expect(result.auditFailure?.code).toBe('snapshot_insert_failed');
+    expect(typeof result.auditFailure?.message).toBe('string');
+    expect(result.auditFailure?.message.length).toBeGreaterThan(0);
+  });
+
+  test('snapshot omits budget_max_wall_ms when the definition does not declare it', async () => {
+    // The snapshot column is nullable to mirror SubagentBudget's
+    // optional field. Definitions without max_wall_clock_ms must
+    // round-trip as null, not as 0 (which would conflict with
+    // the loader's "must be positive" rule).
+    const parent = createSession(db, { model: 'mock/m', cwd: '/p' });
+    const result = await runSubagent({
+      definition: definition({ budget: { maxSteps: 5, maxCostUsd: 0 } }),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+    });
+    expect(getSubagentRun(db, result.sessionId)?.budgetMaxWallMs).toBeNull();
   });
 
   test('depth === MAX_SUBAGENT_DEPTH is the last allowed level (boundary)', async () => {

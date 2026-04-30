@@ -314,6 +314,92 @@ describe('runListSessions', () => {
     expect(text).not.toContain('+$');
   });
 
+  test('JSON output exposes subagent_run fingerprint for subagent rows', () => {
+    // Audit surface: the listing carries name + source_sha256 of
+    // the captured definition so a forensic walk doesn't need a
+    // separate query. Detail (system prompt, full toolset, budget)
+    // lives in the subagent_runs row reachable via the same id.
+    const parent = createSession(db, { model: 'mock/a', cwd: '/p' });
+    appendMessage(db, { sessionId: parent.id, role: 'user', content: 'p' });
+    const child = createSession(db, {
+      model: 'mock/a',
+      cwd: '/p',
+      parentSessionId: parent.id,
+      startedAt: parent.startedAt + 1,
+    });
+    // Seed the snapshot directly (no harness in this test).
+    db.query(
+      `INSERT INTO subagent_runs
+         (session_id, name, scope, source_path, source_sha256, system_prompt,
+          tools_whitelist, budget_max_steps, budget_max_cost_usd, captured_at)
+       VALUES (?, 'explore', 'project', '/p/.agent/agents/explore.md',
+               '${'a'.repeat(64)}', 'You are explore.', '["read_file"]', 5, 0.01, 0)`,
+    ).run(child.id);
+
+    const out: string[] = [];
+    runListSessions({
+      json: true,
+      includeSubagents: true,
+      dbOverride: db,
+      out: (s) => out.push(s),
+    });
+    const lines = out
+      .join('')
+      .trim()
+      .split('\n')
+      .filter((l) => l.length > 0);
+    expect(lines).toHaveLength(2);
+    const [parentRow, childRow] = lines.map(
+      (l) =>
+        JSON.parse(l) as {
+          id: string;
+          subagent_run: { name: string; source_sha256: string } | null;
+        },
+    );
+    // Top-level row carries a null fingerprint (not a subagent).
+    expect(parentRow?.id).toBe(parent.id);
+    expect(parentRow?.subagent_run).toBeNull();
+    // Child row carries the captured fingerprint.
+    expect(childRow?.id).toBe(child.id);
+    expect(childRow?.subagent_run?.name).toBe('explore');
+    expect(childRow?.subagent_run?.source_sha256).toBe('a'.repeat(64));
+  });
+
+  test('subagent row without a snapshot reports subagent_run: null (defensive)', () => {
+    // A subagent row with no snapshot can exist in two cases: a
+    // pre-migration-012 row (no snapshot was captured at the
+    // time), or a future bug that created the session but failed
+    // to insert the snapshot. The listing must not crash; emit
+    // null and let the user notice the missing fingerprint.
+    const parent = createSession(db, { model: 'mock/a', cwd: '/p' });
+    appendMessage(db, { sessionId: parent.id, role: 'user', content: 'p' });
+    const child = createSession(db, {
+      model: 'mock/a',
+      cwd: '/p',
+      parentSessionId: parent.id,
+      startedAt: parent.startedAt + 1,
+    });
+    // No subagent_runs row inserted.
+    const out: string[] = [];
+    runListSessions({
+      json: true,
+      includeSubagents: true,
+      dbOverride: db,
+      out: (s) => out.push(s),
+    });
+    const lines = out
+      .join('')
+      .trim()
+      .split('\n')
+      .filter((l) => l.length > 0);
+    const childRow = JSON.parse(lines[1] ?? '{}') as {
+      id: string;
+      subagent_run: unknown;
+    };
+    expect(childRow.id).toBe(child.id);
+    expect(childRow.subagent_run).toBeNull();
+  });
+
   test('--include-subagents recursively walks the full descendant tree', () => {
     // Recursion contract: subagents can spawn subagents up to
     // MAX_SUBAGENT_DEPTH=4. The listing must surface all of them

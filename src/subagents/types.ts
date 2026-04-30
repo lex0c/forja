@@ -41,6 +41,11 @@ export interface SubagentDefinition {
   // surfaces in error messages and `--list-subagents` (later).
   scope: SubagentScope;
   sourcePath: string;
+  // SHA-256 of the raw `.md` content (frontmatter + body) at load
+  // time. Lets the audit table fingerprint the exact version a
+  // subagent ran under, independent of what the file looks like
+  // now. Hex-encoded lowercase for readability in JSON output.
+  sourceSha256: string;
   // Untyped frontmatter overflow. Anything the loader didn't
   // map into a strongly-typed field lives here so future slices
   // (playbooks, sampling, context_recipe) can read frontmatter
