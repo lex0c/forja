@@ -61,13 +61,22 @@ interface SessionListItem {
   // string when we can't extract a string content. We deliberately
   // only look at messages.role='user' to skip system/tool noise.
   prompt_preview: string;
-  // Null on top-level sessions, set when this row is a subagent
-  // child. Surfaces in JSON output unconditionally; the table
-  // renderer indents children under their parent.
+  // Live FK to parent. Goes null when the parent is purged via
+  // ON DELETE SET NULL. Use `is_subagent` for the row's identity.
   parent_session_id: string | null;
+  // Identity flag — true iff this row was created as a subagent.
+  // Stays true even after a parent purge; the orphan detection
+  // case is the (is_subagent: true, parent_session_id: null) shape.
+  is_subagent: boolean;
+  // Tree depth relative to the top-level row in the listing. 0 =
+  // top-level user session; 1 = direct subagent child; 2 =
+  // grandchild; etc. Bounded by MAX_SUBAGENT_DEPTH (4). Lets
+  // renderers indent without re-walking parent_session_id, and
+  // gives JSON consumers a flat-but-shaped tree.
+  depth: number;
 }
 
-const buildItem = (s: Session, db: DB): SessionListItem => {
+const buildItem = (s: Session, db: DB, depth: number): SessionListItem => {
   // First user message content. Sessions almost always have at
   // least one user message (the original prompt); the rare race
   // where listSessions runs before appendMessage just yields an
@@ -96,21 +105,29 @@ const buildItem = (s: Session, db: DB): SessionListItem => {
     cost_usd: s.totalCostUsd,
     prompt_preview: preview,
     parent_session_id: s.parentSessionId,
+    is_subagent: s.isSubagent,
+    depth,
   };
 };
 
-// Walk parent → children one level deep. The default subagent
-// design has a single layer (parent invokes subagent), so depth=1
-// covers the dominant case and keeps the listing readable. Deeper
-// trees still render correctly via the parent_session_id field in
-// the JSON shape; --include-subagents in the table just shows the
-// immediate children.
-const fanOut = (parents: Session[], db: DB): Session[] => {
-  const out: Session[] = [];
-  for (const parent of parents) {
-    out.push(parent);
-    for (const child of listChildSessions(db, parent.id)) out.push(child);
-  }
+// Walk parent → descendants depth-first. Recursion is bounded by
+// MAX_SUBAGENT_DEPTH (4 levels) at spawn time, so the visit can't
+// run away. The `seen` guard is defense-in-depth against an
+// unexpectedly self-referential row (parent_session_id pointing at
+// itself, which the FK doesn't prevent at write time) — without
+// it a corrupt graph would deadlock the listing in an infinite
+// loop. Order: each parent immediately followed by its full subtree
+// in DFS, oldest sibling first (mirrors listChildSessions).
+const fanOut = (parents: Session[], db: DB): { session: Session; depth: number }[] => {
+  const out: { session: Session; depth: number }[] = [];
+  const seen = new Set<string>();
+  const visit = (s: Session, depth: number): void => {
+    if (seen.has(s.id)) return;
+    seen.add(s.id);
+    out.push({ session: s, depth });
+    for (const child of listChildSessions(db, s.id)) visit(child, depth + 1);
+  };
+  for (const p of parents) visit(p, 0);
   return out;
 };
 
@@ -127,19 +144,18 @@ const writeTable = (items: SessionListItem[], out: (s: string) => void): void =>
   }
   // Plain table — a real renderer (boxes, color) is M4 territory.
   // Width is fixed enough to align in any terminal >= 80 cols.
-  // ID column is 40 chars wide so that an indented child row
-  // ("  ↳ <36-char uuid>") still fits within the slot — UUIDs
-  // are 36 chars and the indent prefix is 4 visual cells.
-  const ID_WIDTH = 40;
-  out(
-    'STARTED               STATUS       COST        ID                                        PROMPT\n',
-  );
+  // ID column accommodates the deepest nested row: each level adds
+  // 2 indent chars + the `↳ ` prefix on the leaf, so a depth-4 row
+  // reads "        ↳ <36-char uuid>" = 46 chars. Padding to the
+  // worst case keeps the PROMPT column aligned regardless of which
+  // depth shows up in any given row.
+  const ID_WIDTH = 46;
+  out(`STARTED               STATUS       COST        ${'ID'.padEnd(ID_WIDTH)}  PROMPT\n`);
   for (const it of items) {
-    const isChild = it.parent_session_id !== null;
-    // Subagent rows render with a `↳ ` indent so the tree shape is
-    // legible at a glance. Both parent and child rows pad to the
-    // same width so the PROMPT column aligns regardless of nesting.
-    const id = (isChild ? `  ↳ ${it.id}` : it.id).padEnd(ID_WIDTH);
+    // Subagent rows render with N×"  " indent + "↳ " prefix where
+    // N is the row's tree depth. Top-level rows render the bare id.
+    const indent = it.depth > 0 ? `${'  '.repeat(it.depth)}↳ ` : '';
+    const id = `${indent}${it.id}`.padEnd(ID_WIDTH);
     const status = it.status.padEnd(12);
     const cost = `$${it.cost_usd.toFixed(4)}`.padEnd(11);
     out(`${it.started_at}  ${status} ${cost} ${id}  ${it.prompt_preview}\n`);
@@ -154,14 +170,15 @@ export const runListSessions = (options: ListSessionsOptions): number => {
     if (ownsDb) migrate(db);
     const sessions = listSessions(db, { limit: options.limit ?? 20 });
     // listSessions filters out children by default. When the user
-    // asks for them, fan each parent into its immediate children.
-    // We do NOT pass {includeSubagents: true} to the repo here
-    // because that would mix orphaned children (parent purged,
-    // SET NULL fired) into the top-level pool — the repo flag is
-    // for raw audit listings; --include-subagents is the
-    // hierarchical view.
-    const fanned = options.includeSubagents === true ? fanOut(sessions, db) : sessions;
-    const items = fanned.map((s) => buildItem(s, db));
+    // asks for them, fan each parent into its full descendant tree
+    // (DFS, depth-tracked). We do NOT pass {includeSubagents: true}
+    // to the repo here because that would mix orphaned children
+    // (parent purged, SET NULL fired) into the top-level pool —
+    // the repo flag is for raw audit listings; --include-subagents
+    // is the hierarchical view.
+    const items: SessionListItem[] = options.includeSubagents
+      ? fanOut(sessions, db).map(({ session, depth }) => buildItem(session, db, depth))
+      : sessions.map((s) => buildItem(s, db, 0));
     if (options.json) writeJson(items, options.out);
     else writeTable(items, options.out);
     return 0;

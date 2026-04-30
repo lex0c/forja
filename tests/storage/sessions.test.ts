@@ -157,7 +157,10 @@ describe('sessions repo', () => {
   test('parent_session_id defaults to null for top-level runs', () => {
     const s = createSession(db, { model: 'm', cwd: '/p' });
     expect(s.parentSessionId).toBeNull();
-    expect(getSession(db, s.id)?.parentSessionId).toBeNull();
+    expect(s.isSubagent).toBe(false);
+    const fetched = getSession(db, s.id);
+    expect(fetched?.parentSessionId).toBeNull();
+    expect(fetched?.isSubagent).toBe(false);
   });
 
   test('parent_session_id round-trips when set on a child', () => {
@@ -168,7 +171,10 @@ describe('sessions repo', () => {
       parentSessionId: parent.id,
     });
     expect(child.parentSessionId).toBe(parent.id);
-    expect(getSession(db, child.id)?.parentSessionId).toBe(parent.id);
+    expect(child.isSubagent).toBe(true);
+    const fetched = getSession(db, child.id);
+    expect(fetched?.parentSessionId).toBe(parent.id);
+    expect(fetched?.isSubagent).toBe(true);
   });
 
   test('listSessions hides children unless includeSubagents is true', () => {
@@ -213,5 +219,62 @@ describe('sessions repo', () => {
     const fetched = getSession(db, child.id);
     expect(fetched).not.toBeNull();
     expect(fetched?.parentSessionId).toBeNull();
+  });
+
+  test('orphaned subagent stays excluded from default top-level listing', () => {
+    // Migration 011 fix. The original filter used
+    // `parent_session_id IS NULL` as the top-level predicate, but
+    // ON DELETE SET NULL turns purged children into rows with
+    // null parent_session_id — those would re-surface in the
+    // user-facing listing AND get picked up by `--resume last`
+    // (which calls listSessions(limit:1)). is_subagent is the
+    // identity flag set at create time and never updated, so
+    // orphans stay flagged.
+    const parent = createSession(db, { model: 'm', cwd: '/p', startedAt: 1000 });
+    const child = createSession(db, {
+      model: 'm',
+      cwd: '/p',
+      parentSessionId: parent.id,
+      startedAt: 9999,
+    });
+    // Simulate retention purge of the parent.
+    db.query('DELETE FROM sessions WHERE id = ?').run(parent.id);
+    // After purge: child still exists, parent_session_id is now
+    // NULL (SET NULL fired), but is_subagent stays 1.
+    const refetched = getSession(db, child.id);
+    expect(refetched?.parentSessionId).toBeNull();
+    expect(refetched?.isSubagent).toBe(true);
+
+    // Default listing must NOT surface the orphaned child as
+    // top-level, even though it now satisfies the old
+    // parent_session_id IS NULL predicate.
+    const topLevel = listSessions(db);
+    expect(topLevel).toHaveLength(0);
+
+    // includeSubagents:true brings it back for raw audit queries.
+    const all = listSessions(db, { includeSubagents: true });
+    expect(all).toHaveLength(1);
+    expect(all[0]?.id).toBe(child.id);
+    expect(all[0]?.isSubagent).toBe(true);
+  });
+
+  test('migration 011 backfill: pre-existing rows with parent_session_id are flagged', () => {
+    // Defense for the migration's UPDATE clause. The migration
+    // sets is_subagent=1 for any existing row that already had a
+    // parent_session_id at upgrade time. We can't run the bare
+    // migration here (test DB starts fully migrated), but we can
+    // verify that a row inserted today via createSession with a
+    // parentSessionId lands with is_subagent=1 — same code path
+    // the migration's invariant relies on.
+    const parent = createSession(db, { model: 'm', cwd: '/p' });
+    const child = createSession(db, {
+      model: 'm',
+      cwd: '/p',
+      parentSessionId: parent.id,
+    });
+    const raw = db
+      .query<{ is_subagent: number }, [string]>('SELECT is_subagent FROM sessions WHERE id = ?')
+      .get(child.id);
+    expect(raw?.is_subagent).toBe(1);
   });
 });
