@@ -15,7 +15,138 @@ Format:
 
 ---
 
-## [2026-04-29] M3 / Step 4.1 — Subagent runtime (in-process) + `task` tool
+## [2026-04-30] M3 / Step 4.1 — review fixes (post-self-review pass)
+
+Self-review on `bf2c4c9` surfaced 15 issues across 4 tiers — 3
+critical (C1–C3), 6 medium, 6 minor, 3 out-of-scope. All
+addressable items addressed in this pass; the 3 out-of-scope items
+land in **Pending** below for explicit deferral.
+
+**Critical:**
+
+- **C1+C2 — plan-mode bypass via `task` + child not inheriting
+  `planMode`.** The `task` tool declared `writes: false`, so the
+  harness's plan-mode gate (`writes && !planSafe()`) never fired,
+  and the runtime didn't propagate `planMode` into the child's
+  `HarnessConfig`. Combined: a subagent with `write_file`
+  whitelisted could mutate the working tree under `--plan` via
+  `task()`, with no gate at any layer. Fixed both layers:
+    1. `invoke-tool.ts` extends the gate to include
+       `planSafe === false` (explicit literal). Tools that don't
+       write but have hidden side effects through indirection
+       (canonically `task`) opt into the block by declaring
+       `planSafe: false`. Reading `planSafe === undefined` for
+       read tools (grep/glob/read_file) keeps existing semantics
+       unchanged.
+    2. `RunSubagentInput.planMode` plumbs through; harness loop's
+       spawn closure forwards `config.planMode`. Defense in
+       depth: even if a future regression bypassed the parent
+       gate, the child harness would still block writes inside
+       its own loop.
+  Two regression tests added in `tests/harness/invoke-tool.test.ts`
+  (explicit `planSafe:false` blocks writes:false; deny reason
+  mentions opt-out wording) and one in
+  `tests/subagents/runtime.test.ts` (parent in plan mode → child's
+  write_file lands as `denied` in tool_calls).
+- **C3 — `subagents.shadows` computed but never surfaced.**
+  Bootstrap returned the shadow list; `cli/run.ts` ignored it.
+  Authors editing `~/.config/agent/agents/foo.md` while a
+  project-scope `.agent/agents/foo.md` exists got the project
+  version silently — no diagnostic. Fix: one warning per shadow
+  on stderr, gated on non-`--json` (preserve stdout purity).
+  Tests in `tests/cli/run.test.ts` cover both cases (warning
+  emitted / suppressed in JSON).
+
+**Medium:**
+
+- **M1 — dead `isChildError` predicate + stale comment.** The
+  helper was exported but never called (`task.ts` short-circuits
+  inline) and the `SESSION_FINISHED_TIMEOUT_REASONS` set was
+  inconsistent with its own doc. Removed both; the live code path
+  is the only contract.
+- **M2 — no recursion depth cap.** Forwarding `subagentRegistry`
+  to the child enabled `task → task → task` chains with only
+  per-child `maxSteps` and parent wall-clock containing them.
+  Added `MAX_SUBAGENT_DEPTH = 4` constant + `depth` field on
+  `RunSubagentInput`, harness loop closure increments and bumps
+  to a new `SpawnSubagentResult.depth_exceeded` variant (NOT a
+  raw throw — model can recover from a tool error). The runtime
+  itself ALSO throws on `depth >= MAX` as a defense-in-depth
+  contract for programmatic callers.
+- **M3 — `--resume last` quietly skips subagent rows.**
+  `listSessions(db, {limit:1, cwd})` defaults to
+  `includeSubagents:false` (intended), but no test locked this
+  contract. Added explicit regression in `tests/cli/resume.test.ts`
+  that creates a parent + subagent child, confirms `--resume last`
+  lands on the parent.
+- **M4 — table alignment broken on child rows.** Indented child id
+  was 40 chars (`"  ↳ <36-char uuid>"`) but the column padded to
+  36, shifting the PROMPT column right. Bumped column width to 40
+  so parent and child rows align identically.
+- **M5 — smoke `WRITE_FILE_LEAK` query had false-positive shape.**
+  Filtered by tool name only; a denied attempt would have failed
+  the smoke despite the whitelist working. Tightened to
+  `tc.status = 'done'` — only successful execution counts as a
+  leak.
+- **M6 — SET NULL cascade test on `parent_session_id`.** Already
+  asserted in `tests/storage/sessions.test.ts` ("parent deletion
+  sets child parent_session_id to null"); confirmed and skipped.
+
+**Minor:**
+
+- **m1 — `lastMessageId === undefined` check.** Field is
+  `string | undefined` per typing but the loop seeds it to `''`
+  and never assigns undefined. Added explicit
+  `length === 0` clause for clarity.
+- **m2 — stale comment referencing `--list-subagents`.** The CLI
+  verb doesn't exist; rewrote the comment to point at the actual
+  surface (stderr warning at bootstrap).
+- **m3 — `PROMPT_MAX_BYTES` magic number.** Added comment
+  explaining the choice (32 KiB = "self-contained instruction"
+  per PLAYBOOKS.md §1) and surfaced `byte_limit` + `byte_count`
+  in the oversized-prompt error details so the model reacts
+  without a guess-and-check retry.
+- **m4 — loader-throw stack trace at boundary.** Already wrapped
+  by the outer `try/catch` in `cli/run.ts:265`, which routes the
+  message through `errSink`. Confirmed and skipped.
+- **m5 — loader doesn't reject write tools in whitelist.**
+  Subagents in 4.1 run in-process with checkpoints OFF for the
+  child; a `write_file` whitelist would mutate the parent's tree
+  with no reverse path. Added hard refusal at load time for
+  `write_file`, `edit_file`, `bash`, `bash_background`,
+  `bash_kill`. Step 4.2's worktree isolation will lift this with
+  a separate refs chain. Tests in `tests/subagents/load.test.ts`.
+- **m6 — `task` tool description bloated tokens.** Trimmed paths
+  and prose to match the size of `bash`/`write_file` descriptions
+  while preserving the model-facing decision criteria.
+
+**Verification:** `bun test` 1131 pass / 10 skip / 0 fail
+(+10 new tests across invoke-tool, subagent runtime, task tool,
+CLI run/list-sessions/resume, subagent loader); `tsc --noEmit`
+clean; `biome check` clean.
+`evals/smoke-subagent-explore.sh` exits 0 against
+`anthropic/claude-haiku-4-5` (whitelist enforcement assertion now
+on `tc.status='done'` per M5).
+
+**Pending (deferred from review O1/O2/O3, not blocking 4.1):**
+
+- **O1 — cost rollup misleading in `--list-sessions`.** Parent
+  shows self-only spend; child rows show their own. User has to
+  mentally sum across rows. Resolution path: a query-time
+  `cumulativeCost(sessionId)` helper that walks
+  `listChildSessions` recursively + a `--show-cost-tree` (or
+  rollup column) on the listing. Add when cost cap lands in
+  `RunBudget` or when first user reports the gap.
+- **O2 — no dedicated `subagent` permission category.** `task`
+  routes through `'misc'`; an operator can't whitelist/blacklist
+  subagents by name via `permissions.yaml`. Resolution: spec a
+  `subagent` policy section (`allow: [name]`, `deny: [name]`,
+  `locked`), add matcher, migrate the tool's `metadata.category`.
+  Trigger: first request for org-level subagent gating.
+- **O3 — `--include-subagents` is silently ignored without
+  `--list-sessions`.** Cosmetic but surprising. Resolution:
+  parser-level validation that flags the unmatched flag pair, OR
+  doc-string on the help text. Either fits a quick polish PR.
 
 Lands `AGENTIC_CLI §11` minus worktree isolation: a parent harness
 can declare subagents via `.md` frontmatter, the `task` tool spawns

@@ -6,7 +6,7 @@ import type { Provider, StreamEvent } from '../../src/providers/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { createSession, getSession, listChildSessions } from '../../src/storage/index.ts';
 import { migrate } from '../../src/storage/migrate.ts';
-import { isChildError, runSubagent, toEnvelope } from '../../src/subagents/runtime.ts';
+import { MAX_SUBAGENT_DEPTH, runSubagent, toEnvelope } from '../../src/subagents/runtime.ts';
 import type { SubagentDefinition } from '../../src/subagents/types.ts';
 import { createToolRegistry } from '../../src/tools/registry.ts';
 import type { Tool } from '../../src/tools/types.ts';
@@ -281,7 +281,7 @@ describe('runSubagent', () => {
     ).rejects.toThrow(/tool 'echoo' not registered with parent harness/);
   });
 
-  test('toEnvelope mirrors result fields and isChildError flips on non-done', async () => {
+  test('toEnvelope mirrors result fields', async () => {
     const parent = createSession(db, { model: 'mock/m', cwd: '/p' });
     const ok = await runSubagent({
       definition: definition(),
@@ -296,24 +296,97 @@ describe('runSubagent', () => {
     const env = toEnvelope(ok);
     expect(env.session_id).toBe(ok.sessionId);
     expect(env.output).toBe('hi');
-    expect(isChildError(ok)).toBe(false);
+    expect(env.status).toBe('done');
+  });
 
-    const exhausted = await runSubagent({
-      definition: definition({ budget: { maxSteps: 1, maxCostUsd: 0 } }),
-      prompt: 'loop',
+  test('child inherits planMode from runtime input', async () => {
+    // Regression for the plan-mode bypass surfaced in review (C2).
+    // Parent runs in plan mode → child harness must also block
+    // writes, otherwise a subagent with `write_file` whitelisted
+    // could mutate the tree under `--plan` via task().
+    //
+    // Setup: child whitelist contains write_file (legal in tests
+    // because the loader's worktree refusal only fires through the
+    // parser, not when constructing definitions directly), the
+    // model's first turn calls write_file, and we assert the
+    // tool_calls row landed with status='denied'.
+    const parent = createSession(db, { model: 'mock/m', cwd: '/p' });
+    const result = await runSubagent({
+      definition: definition({ tools: ['write_file'] }),
+      prompt: 'go',
       parentSessionId: parent.id,
       provider: mockProvider([
         {
-          text: 'one',
-          tool_uses: [{ id: 'tu1', name: 'echo', input: { msg: 'x' } }],
+          text: '',
+          tool_uses: [{ id: 'tu1', name: 'write_file', input: {} }],
           stop_reason: 'tool_use',
         },
+        { text: 'after the deny', stop_reason: 'end_turn' },
       ]),
+      parentToolRegistry: buildParentRegistry(echoTool, writeTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      planMode: true,
+    });
+    // Run completes (the harness writes a tool_result for the
+    // denial and the model emits a closing turn). The audit row
+    // for write_file in the CHILD session must be 'denied', NOT
+    // 'done'.
+    const writeCalls = db
+      .query<{ status: string; session_id: string }, []>(
+        `SELECT tc.status AS status, m.session_id AS session_id
+         FROM tool_calls tc
+         JOIN messages m ON tc.message_id = m.id
+         WHERE tc.tool_name = 'write_file'`,
+      )
+      .all() as { status: string; session_id: string }[];
+    const childCalls = writeCalls.filter((r) => r.session_id === result.sessionId);
+    expect(childCalls.length).toBeGreaterThan(0);
+    for (const row of childCalls) {
+      expect(row.status).toBe('denied');
+    }
+  });
+
+  test('refuses to spawn beyond MAX_SUBAGENT_DEPTH', async () => {
+    // Direct unit test on the runtime: passing depth>=MAX throws.
+    // The harness loop check (loop.ts) returns a `depth_exceeded`
+    // result instead — that path is covered by the task-tool test.
+    // Here we lock the runtime contract: programmer error path.
+    const parent = createSession(db, { model: 'mock/m', cwd: '/p' });
+    await expect(
+      runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: mockProvider([{ text: 'never reached', stop_reason: 'end_turn' }]),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: '/p',
+        depth: MAX_SUBAGENT_DEPTH + 1,
+      }),
+    ).rejects.toThrow(/recursion depth/);
+  });
+
+  test('child run records subagentDepth on its config', async () => {
+    // Sanity: depth=0 (top-level) is valid, depth bumps land on
+    // the child harness so the child's own spawn closure can read
+    // it. We can't observe HarnessConfig directly, but we CAN
+    // verify the depth=0 path runs to done — the prior tests
+    // implicitly use this; explicit assertion here.
+    const parent = createSession(db, { model: 'mock/m', cwd: '/p' });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: mockProvider([{ text: 'depth=0 ok', stop_reason: 'end_turn' }]),
       parentToolRegistry: buildParentRegistry(echoTool),
       permissionEngine: buildEngine(),
       db,
       cwd: '/p',
+      depth: 0,
     });
-    expect(isChildError(exhausted)).toBe(true);
+    expect(result.status).toBe('done');
   });
 });

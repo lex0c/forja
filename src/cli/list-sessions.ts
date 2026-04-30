@@ -127,15 +127,19 @@ const writeTable = (items: SessionListItem[], out: (s: string) => void): void =>
   }
   // Plain table — a real renderer (boxes, color) is M4 territory.
   // Width is fixed enough to align in any terminal >= 80 cols.
+  // ID column is 40 chars wide so that an indented child row
+  // ("  ↳ <36-char uuid>") still fits within the slot — UUIDs
+  // are 36 chars and the indent prefix is 4 visual cells.
+  const ID_WIDTH = 40;
   out(
-    'STARTED               STATUS       COST        ID                                    PROMPT\n',
+    'STARTED               STATUS       COST        ID                                        PROMPT\n',
   );
   for (const it of items) {
     const isChild = it.parent_session_id !== null;
     // Subagent rows render with a `↳ ` indent so the tree shape is
-    // legible at a glance. The id column shrinks accordingly so
-    // column alignment stays the same as the parent row.
-    const id = (isChild ? `  ↳ ${it.id}` : it.id).padEnd(36);
+    // legible at a glance. Both parent and child rows pad to the
+    // same width so the PROMPT column aligns regardless of nesting.
+    const id = (isChild ? `  ↳ ${it.id}` : it.id).padEnd(ID_WIDTH);
     const status = it.status.padEnd(12);
     const cost = `$${it.cost_usd.toFixed(4)}`.padEnd(11);
     out(`${it.started_at}  ${status} ${cost} ${id}  ${it.prompt_preview}\n`);

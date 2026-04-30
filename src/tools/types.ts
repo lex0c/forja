@@ -124,12 +124,21 @@ export interface SpawnSubagentArgs {
 
 // Result discriminated by `kind` so the calling tool can map an
 // unknown subagent name into a tool error (model error) without
-// confusing it with an executed-but-failed run (child error).
+// confusing it with an executed-but-failed run (child error). The
+// `depth_exceeded` variant is also a model-recoverable signal —
+// the model should stop nesting `task()` calls and finish the work
+// itself.
 export type SpawnSubagentResult =
   | {
       kind: 'unknown_subagent';
       requested: string;
       available: string[];
+    }
+  | {
+      kind: 'depth_exceeded';
+      requested: string;
+      depth: number;
+      maxDepth: number;
     }
   | {
       kind: 'ran';

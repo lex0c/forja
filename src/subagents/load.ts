@@ -15,6 +15,24 @@ const KEBAB_RE = /^[a-z][a-z0-9-]*$/;
 
 const FRONTMATTER_DELIM = '---';
 
+// Tools whose effects escape `cwd` and CANNOT be rolled back by a
+// working-tree restore (CHECKPOINTS.md §2.6). In Step 4.1 subagents
+// run in-process with checkpoints OFF for the child — a writing
+// subagent here would mutate the parent's tree without any reverse
+// path, and the parent's `--undo` would NOT capture the child's
+// writes (the chain is keyed by session id). Step 4.2 lifts this
+// restriction by giving writing subagents a dedicated worktree
+// (`isolation: worktree`); until then, refuse the definition at
+// load time so the author finds out at bootstrap rather than at
+// the first surprise diff.
+const TOOLS_BLOCKED_UNTIL_WORKTREE: ReadonlySet<string> = new Set([
+  'write_file',
+  'edit_file',
+  'bash',
+  'bash_background',
+  'bash_kill',
+]);
+
 interface ParsedFile {
   frontmatter: Record<string, unknown>;
   body: string;
@@ -124,6 +142,13 @@ const parseDefinition = (
   }
   const description = requireString(fm, 'description', sourcePath);
   const tools = requireStringArray(fm, 'tools', sourcePath);
+  for (const t of tools) {
+    if (TOOLS_BLOCKED_UNTIL_WORKTREE.has(t)) {
+      throw new Error(
+        `subagent ${sourcePath}: tool '${t}' cannot appear in subagent.tools[] in Step 4.1 — write/exec tools require worktree isolation (Step 4.2). Until then, the parent's --undo cannot revert the child's writes and the child's checkpoints are unreachable from the parent's session id. Remove the tool or wait for worktree support.`,
+      );
+    }
+  }
   if (fm.budget === undefined) {
     throw new Error(`subagent ${sourcePath}: 'budget' is required`);
   }
@@ -213,9 +238,10 @@ export interface SubagentSet {
   // name collision. Map for O(1) name lookup; iterate values when
   // a list is needed.
   byName: Map<string, SubagentDefinition>;
-  // Cross-scope shadows. Renderers (e.g., `--list-subagents`) can
-  // surface "user/<name> shadowed by project" so authors don't
-  // wonder why their tweak isn't being picked up.
+  // Cross-scope shadows. The CLI surfaces these on stderr at
+  // bootstrap time so authors don't wonder why a user-scope tweak
+  // isn't being picked up when a project-scope file with the same
+  // name exists.
   shadows: ShadowedDefinition[];
 }
 

@@ -73,10 +73,27 @@ export interface RunSubagentInput {
   temperature?: number;
   // Forward the same subagent set into the child harness so the
   // child's `task` tool can spawn further subagents. Recursion
-  // depth is bounded by per-child budgets — there is no built-in
-  // depth cap. Optional; absent = child has no `spawnSubagent`
-  // and any `task` invocation by the child surfaces a tool error.
+  // depth is bounded by per-child budgets and an explicit MAX_DEPTH
+  // cap (see `depth` below). Optional; absent = child has no
+  // `spawnSubagent` and any `task` invocation by the child surfaces
+  // a tool error.
   subagentRegistry?: SubagentSet;
+  // Plan mode propagation. When the parent harness is in plan mode,
+  // children inherit it so a write tool the child has whitelisted
+  // (e.g., `write_file`) is still blocked at the harness layer
+  // inside the child loop. Without this forward, the `task` tool
+  // would block at the parent's gate (defense in depth) but a
+  // hypothetical bypass — programmatic caller, future tool that
+  // opts back in — would let mutations through under `--plan`.
+  // Setting it here closes the second layer.
+  planMode?: boolean;
+  // Recursion depth of THIS spawn relative to the top-level run.
+  // 0 = direct child of the user's session, 1 = grandchild, etc.
+  // The runtime refuses to spawn beyond MAX_DEPTH so a misbehaving
+  // (or adversarial) definition can't fan out an arbitrarily deep
+  // tree; the existing budget caps eventually fire but consume
+  // provider calls in the meantime.
+  depth?: number;
 }
 
 export interface RunSubagentResult {
@@ -107,7 +124,13 @@ export interface RunSubagentResult {
   durationMs: number;
 }
 
-const SESSION_FINISHED_TIMEOUT_REASONS = new Set(['maxWallClockMs']);
+// Hard cap on how deep a chain of `task → task → task` can nest.
+// Per-child `maxSteps` and parent wall-clock eventually contain a
+// runaway tree, but they consume provider calls in the meantime.
+// Four levels covers every plausible playbook composition (the
+// canonical one is parent → review-playbook, never deeper) and
+// surfaces a clear error well before the budget caps would.
+export const MAX_SUBAGENT_DEPTH = 4;
 
 // Spawn a subagent in-process. Builds a fresh HarnessConfig with the
 // child's restricted toolset, own budget, own system prompt, and
@@ -115,10 +138,16 @@ const SESSION_FINISHED_TIMEOUT_REASONS = new Set(['maxWallClockMs']);
 // not supported for subagents). The function never throws on a child-
 // side failure; it returns a result object whose status/reason carry
 // the exit. Programmer errors (typo in whitelist, missing tools,
-// parent session id missing) are still thrown — those are caller
-// bugs, not subagent runtime states.
+// parent session id missing, recursion depth exceeded) throw — those
+// are caller bugs, not subagent runtime states.
 export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentResult> => {
   const { definition } = input;
+  const depth = input.depth ?? 0;
+  if (depth >= MAX_SUBAGENT_DEPTH) {
+    throw new Error(
+      `subagent '${definition.name}': recursion depth ${depth} reached MAX_SUBAGENT_DEPTH=${MAX_SUBAGENT_DEPTH}`,
+    );
+  }
   const childRegistry = buildChildRegistry(
     input.parentToolRegistry,
     definition.tools,
@@ -155,10 +184,12 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     // worktree isolation in Step 4.2 and re-enable checkpoints
     // there.
     enableCheckpoints: false,
+    subagentDepth: depth,
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.onEvent !== undefined ? { onEvent: input.onEvent } : {}),
     ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
     ...(input.subagentRegistry !== undefined ? { subagentRegistry: input.subagentRegistry } : {}),
+    ...(input.planMode === true ? { planMode: true } : {}),
   };
 
   // bgLogDir omitted: subagents in Step 4.1 don't get bg tools
@@ -193,7 +224,10 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
 // Empty string when there's nothing to return (no assistant turn
 // completed before exit).
 const extractFinalOutput = async (db: DB, result: HarnessResult): Promise<string> => {
-  if (result.lastMessageId === undefined) return '';
+  // HarnessResult.lastMessageId is typed `string | undefined` but
+  // the loop seeds it to '' and only ever assigns a real id; checking
+  // length here is cheaper and more honest than the undefined guard.
+  if (result.lastMessageId === undefined || result.lastMessageId.length === 0) return '';
   const row = db
     .query<{ role: string; content: string }, [string]>(
       'SELECT role, content FROM messages WHERE id = ? LIMIT 1',
@@ -263,10 +297,3 @@ export const toEnvelope = (result: RunSubagentResult): SubagentEnvelope => ({
   steps: result.steps,
   duration_ms: result.durationMs,
 });
-
-// Convenience predicate the calling tool uses to decide whether to
-// turn a child run into a tool error (non-`done` status). 'aborted'
-// from a parent-supplied signal is bubbled as success-with-empty-
-// output to the parent — the abort came from outside the child.
-export const isChildError = (result: RunSubagentResult): boolean =>
-  result.status !== 'done' && !SESSION_FINISHED_TIMEOUT_REASONS.has(result.reason);

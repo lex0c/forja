@@ -133,10 +133,17 @@ if [[ "$CHILD_COUNT" -eq 0 ]]; then
 fi
 echo "Subagent children spawned: $CHILD_COUNT" >&2
 
-# Whitelist enforcement: the child must never have invoked write_file.
-# The explore definition only lists [read_file, glob, grep]; if the
-# harness leaked the parent's full registry to the child, write_file
-# could appear in tool_calls under a child message_id.
+# Whitelist enforcement: the child must never have SUCCESSFULLY
+# invoked write_file. The explore definition only lists
+# [read_file, glob, grep]; if the harness leaked the parent's full
+# registry to the child, write_file could land a tool_calls row
+# with status='done' under a child message_id.
+#
+# Filter on status='done' specifically — denied or errored attempts
+# (which the runtime never reaches because the registry omits the
+# tool entirely, but a future regression COULD produce as audit
+# rows) are NOT a leak: the child still didn't mutate the tree.
+# A row with status='done' is the smoking gun.
 WRITE_FILE_LEAK=$(sqlite3 "$DB" "
   SELECT COUNT(*)
   FROM tool_calls tc
@@ -144,12 +151,13 @@ WRITE_FILE_LEAK=$(sqlite3 "$DB" "
   JOIN sessions s ON m.session_id = s.id
   WHERE s.parent_session_id = '$PARENT_SESSION'
     AND tc.tool_name = 'write_file'
+    AND tc.status = 'done'
 ")
 if [[ "$WRITE_FILE_LEAK" -gt 0 ]]; then
-  echo "FAIL: child invoked write_file ($WRITE_FILE_LEAK calls) — whitelist not enforced." >&2
+  echo "FAIL: child SUCCESSFULLY invoked write_file ($WRITE_FILE_LEAK calls) — whitelist not enforced." >&2
   exit 1
 fi
-echo "Whitelist enforced: 0 write_file calls in child sessions." >&2
+echo "Whitelist enforced: 0 successful write_file calls in child sessions." >&2
 
 # The parent's final assistant text should mention at least one of
 # the seed filenames — proves the explore child actually inspected

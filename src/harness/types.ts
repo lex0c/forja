@@ -227,6 +227,13 @@ export interface HarnessConfig {
   // with the parent's deps (provider, db, registry, engine). Absent
   // = `task` tool surfaces a clean error if invoked.
   subagentRegistry?: SubagentSet;
+  // Recursion depth of THIS run inside a subagent chain. 0 (or
+  // unset) = the top-level user session. The harness's spawn closure
+  // increments this when calling `runSubagent` so the child knows
+  // its own depth and can refuse a further spawn at MAX_SUBAGENT_DEPTH.
+  // Set by the runtime, NOT by callers — programmatic users build
+  // top-level configs and let the runtime manage chain state.
+  subagentDepth?: number;
 }
 
 export interface HarnessResult {

@@ -128,6 +128,30 @@ budget: { max_steps: 1, max_cost_usd: 0 }
     }
   });
 
+  test('rejects write/exec tools in whitelist (Step 4.1 — until worktree)', async () => {
+    // m5 from the review pass. Subagents in 4.1 run in-process with
+    // the parent's tree; the parent's --undo can't reach the child's
+    // writes (chain keyed by session_id) and the child's checkpoints
+    // are off. Until 4.2 ships worktree isolation, an author who
+    // whitelists write_file/edit_file/bash gets a hard refusal at
+    // load time so the gap doesn't ship into production.
+    const blocked = ['write_file', 'edit_file', 'bash', 'bash_background', 'bash_kill'];
+    for (const tool of blocked) {
+      const src = `---
+name: refactor
+description: y
+tools: [${tool}]
+budget:
+  max_steps: 1
+  max_cost_usd: 0
+---
+body`;
+      expect(() => loadSubagentFromString(src, 'user', '/p')).toThrow(
+        /cannot appear in subagent\.tools\[\] in Step 4\.1/,
+      );
+    }
+  });
+
   test('rejects budget with bad numbers', () => {
     expect(() =>
       loadSubagentFromString(VALID.replace('max_steps: 20', 'max_steps: 0'), 'user', '/p'),

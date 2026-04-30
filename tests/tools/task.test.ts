@@ -62,6 +62,25 @@ describe('task tool', () => {
     expect(result.details?.available).toEqual(['explore']);
   });
 
+  test('errors on depth_exceeded with depth + max_depth in details', async () => {
+    const ctx = makeCtx({
+      spawnSubagent: async () => ({
+        kind: 'depth_exceeded',
+        requested: 'review',
+        depth: 5,
+        maxDepth: 4,
+      }),
+    });
+    const result = await taskTool.execute({ subagent: 'review', prompt: 'go' }, ctx);
+    expect(isToolError(result)).toBe(true);
+    if (!isToolError(result)) return;
+    expect(result.error_code).toBe('subagent.depth_exceeded');
+    expect(result.error_message).toContain('depth 5');
+    expect(result.error_message).toContain('max 4');
+    expect(result.details?.depth).toBe(5);
+    expect(result.details?.max_depth).toBe(4);
+  });
+
   test('maps non-done child status to subagent.run_failed', async () => {
     const ctx = makeCtx({
       spawnSubagent: async () =>

@@ -23,7 +23,7 @@ import {
   listMessageTailBySession,
   reopenSession,
 } from '../storage/index.ts';
-import { runSubagent } from '../subagents/runtime.ts';
+import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
 import { type TodoStore, createTodoStore } from '../todo/index.ts';
 import type { ToolContext } from '../tools/index.ts';
 import type { SpawnSubagentArgs, SpawnSubagentResult } from '../tools/types.ts';
@@ -741,6 +741,21 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                       available: Array.from(registry.byName.keys()).sort(),
                     };
                   }
+                  // Depth check happens here (before runSubagent's
+                  // own throw) so the model gets a recoverable tool
+                  // error instead of a wrapped exception. The tool
+                  // surface distinguishes "you passed a bad name"
+                  // (unknown_subagent) from "you nested too deep"
+                  // (depth_exceeded) — both are model-fixable.
+                  const childDepth = (config.subagentDepth ?? 0) + 1;
+                  if (childDepth > MAX_SUBAGENT_DEPTH) {
+                    return {
+                      kind: 'depth_exceeded',
+                      requested: args.name,
+                      depth: childDepth,
+                      maxDepth: MAX_SUBAGENT_DEPTH,
+                    };
+                  }
                   const child = await runSubagent({
                     definition: def,
                     prompt: args.prompt,
@@ -758,6 +773,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     // Forward the registry so the child can task()
                     // further children. Same set, same names.
                     subagentRegistry: registry,
+                    // Plan mode is a global property of the run; the
+                    // child inherits it so a write tool in its
+                    // whitelist still trips the harness gate inside
+                    // the child loop. Defense in depth — the parent's
+                    // gate already refused `task` itself in plan mode,
+                    // but a future bypass would still be contained.
+                    ...(config.planMode === true ? { planMode: true } : {}),
+                    // Increment depth: the child being spawned is one
+                    // level deeper than this run.
+                    depth: childDepth,
                   });
                   return {
                     kind: 'ran',

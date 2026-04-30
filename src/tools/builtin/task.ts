@@ -34,12 +34,18 @@ export interface TaskOutput {
   duration_ms: number;
 }
 
+// Cap on the prompt the parent forwards to the child. 32 KiB is
+// generous for "self-contained instruction" use (PLAYBOOKS.md §1
+// recommends one focused goal per spawn) while bounding the token
+// cost of a misbehaving caller dumping a transcript. Surfaces both
+// the limit and the observed size on the error envelope so the
+// model can react without a guess-and-check retry.
 const PROMPT_MAX_BYTES = 32 * 1024;
 
 export const taskTool: Tool<TaskInput, TaskOutput> = {
   name: 'task',
   description:
-    'Spawn a subagent (declared in ~/.config/agent/agents/<name>.md or <cwd>/.agent/agents/<name>.md) to handle a focused subtask in an isolated context. The child runs with its own restricted toolset, budget, and system prompt; you only see the structured output it returns, never its intermediate steps. Use when the subtask has clear scope (the subagent is purpose-built for it) and benefits from fresh context (your own context stays uncluttered). Pass a self-contained `prompt` — the child sees ONLY this prompt, no history from the current conversation.',
+    'Spawn a named subagent in an isolated context with its own toolset, budget, and system prompt. You receive only the structured output, never the intermediate steps. Use when the subtask has clear scope and benefits from fresh context. The `prompt` must be self-contained — the child has no view of this conversation.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -114,6 +120,7 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
         `'prompt' exceeds ${PROMPT_MAX_BYTES} bytes (got ${promptBytes})`,
         {
           hint: 'Subagent prompts should be self-contained instructions, not entire transcripts. Trim to the essentials.',
+          details: { byte_limit: PROMPT_MAX_BYTES, byte_count: promptBytes },
         },
       );
     }
@@ -130,6 +137,16 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
             : 'No subagents are defined. Add a .md file under ~/.config/agent/agents/ or <cwd>/.agent/agents/.',
         details: { available: result.available },
       });
+    }
+    if (result.kind === 'depth_exceeded') {
+      return toolError(
+        'subagent.depth_exceeded',
+        `subagent '${result.requested}' would nest at depth ${result.depth} (max ${result.maxDepth})`,
+        {
+          hint: 'Stop nesting task() calls. Either finish the work directly in this turn or restructure into a flatter chain.',
+          details: { depth: result.depth, max_depth: result.maxDepth },
+        },
+      );
     }
 
     // Map non-`done` exits to tool errors. The model should know

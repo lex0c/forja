@@ -14,7 +14,7 @@ export type {
   SubagentSet,
 } from './load.ts';
 export { projectAgentsDir, userAgentsDir } from './paths.ts';
-export { isChildError, runSubagent, toEnvelope } from './runtime.ts';
+export { MAX_SUBAGENT_DEPTH, runSubagent, toEnvelope } from './runtime.ts';
 export type {
   RunSubagentInput,
   RunSubagentResult,

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ParsedArgs } from '../../src/cli/args.ts';
@@ -223,6 +223,74 @@ describe('run end-to-end with mock provider', () => {
     expect(code).toBe(1);
     expect(errLines.join('')).toContain('forja:');
     expect(errLines.join('')).toContain('unknown model');
+  });
+
+  test('subagent shadow surfaces a one-line warning on stderr (C3)', async () => {
+    // Regression: bootstrap discovers definitions from user + project
+    // dirs and computes `shadows` for cross-scope name collisions.
+    // Prior behavior was to compute and DISCARD; authors editing the
+    // user version while a project version exists would never see
+    // their tweak take effect. Run-level wiring must echo each
+    // shadow on stderr (gated on non-JSON for stdout purity).
+    const userAgents = join(workdir, 'user-agents');
+    const projectAgents = join(workdir, 'project', '.agent', 'agents');
+    mkdirSync(userAgents, { recursive: true });
+    mkdirSync(projectAgents, { recursive: true });
+    const def = (name: string, desc: string) =>
+      `---\nname: ${name}\ndescription: ${desc}\ntools: []\nbudget:\n  max_steps: 1\n  max_cost_usd: 0\n---\nbody`;
+    writeFileSync(join(userAgents, 'explore.md'), def('explore', 'user version'));
+    writeFileSync(join(projectAgents, 'explore.md'), def('explore', 'project version'));
+
+    const errLines: string[] = [];
+    await run({
+      args: baseArgs(),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'ok' }]),
+        dbPath,
+        cwd: join(workdir, 'project'),
+        userAgentsDir: userAgents,
+        projectAgentsDir: projectAgents,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: recordingRenderer().renderer,
+      errSink: (s) => errLines.push(s),
+    });
+    const out = errLines.join('');
+    expect(out).toContain("subagent 'explore'");
+    expect(out).toContain('(user)');
+    expect(out).toContain('(project)');
+    expect(out).toContain('shadowed by');
+  });
+
+  test('subagent shadow warning is suppressed in --json mode', async () => {
+    // NDJSON consumers expect a clean stream on stdout; we keep
+    // human admin lines off stderr too in JSON mode so any pipeline
+    // that captures both streams stays parseable.
+    const userAgents = join(workdir, 'user-agents');
+    const projectAgents = join(workdir, 'project', '.agent', 'agents');
+    mkdirSync(userAgents, { recursive: true });
+    mkdirSync(projectAgents, { recursive: true });
+    const def = (name: string) =>
+      `---\nname: ${name}\ndescription: x\ntools: []\nbudget:\n  max_steps: 1\n  max_cost_usd: 0\n---\nbody`;
+    writeFileSync(join(userAgents, 'explore.md'), def('explore'));
+    writeFileSync(join(projectAgents, 'explore.md'), def('explore'));
+
+    const errLines: string[] = [];
+    await run({
+      args: baseArgs({ json: true }),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'ok' }]),
+        dbPath,
+        cwd: join(workdir, 'project'),
+        userAgentsDir: userAgents,
+        projectAgentsDir: projectAgents,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: recordingRenderer().renderer,
+      errSink: (s) => errLines.push(s),
+    });
+    const out = errLines.join('');
+    expect(out).not.toContain('shadowed by');
   });
 
   test('renderer.flush is called after a successful run', async () => {

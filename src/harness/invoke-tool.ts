@@ -143,7 +143,29 @@ export const invokeTool = async (
       return false;
     }
   };
-  const planBlocked = deps.planMode === true && tool.metadata.writes === true && !evalPlanSafe();
+  // Block in plan mode when EITHER:
+  //   - the tool declares `writes: true` and isn't plan-safe
+  //     (canonical case: write_file, edit_file, mutating bash)
+  //   - the tool declares `planSafe: false` explicitly
+  //
+  // The second branch covers tools whose own surface doesn't write
+  // (so `writes: false` is honest) but whose hidden side effects can
+  // bypass plan mode through an indirection. The canonical case is
+  // `task`: spawning a subagent doesn't itself touch the FS, but a
+  // subagent with `write_file` in its whitelist would mutate the
+  // tree from inside the child loop. Without this branch, `task`
+  // ran cleanly under `--plan` even with mutating subagents.
+  //
+  // We deliberately distinguish `planSafe === false` (literal,
+  // explicit refusal) from `undefined` (omitted). Read-only tools
+  // like grep/glob/read_file omit `planSafe` and are treated as
+  // safe-by-default-when-writes=false; only an explicit `false`
+  // opts a non-writing tool into the block.
+  const explicitlyPlanUnsafe = tool.metadata.planSafe === false;
+  const planBlocked =
+    deps.planMode === true &&
+    !evalPlanSafe() &&
+    (tool.metadata.writes === true || explicitlyPlanUnsafe);
   if (planBlocked) {
     // Tailor the deny reason: tools with a per-call predicate
     // (e.g., bash) failed because the model didn't declare
@@ -154,7 +176,9 @@ export const invokeTool = async (
     const reason =
       typeof tool.metadata.planSafe === 'function'
         ? `plan mode: ${input.toolName} requires explicit read-only intent in args (e.g., read_only: true); call args did not satisfy the read-only predicate`
-        : `plan mode: ${input.toolName} mutates filesystem state and has no read-only path`;
+        : explicitlyPlanUnsafe
+          ? `plan mode: ${input.toolName} is opted out of plan mode (planSafe: false) — its side effects bypass the read-only profile`
+          : `plan mode: ${input.toolName} mutates filesystem state and has no read-only path`;
     const toolCall = withTransaction(deps.db, () => {
       const tc = createToolCall(deps.db, {
         messageId: input.messageId,
@@ -183,7 +207,9 @@ export const invokeTool = async (
     const modelMessage =
       typeof tool.metadata.planSafe === 'function'
         ? `denied: plan mode requires explicit read-only intent for ${input.toolName} (e.g., add \`read_only: true\` to args). Retry with the read-only declaration if the call really is read-only; otherwise describe the mutation in your plan instead of executing it.`
-        : `denied: plan mode is read-only — ${input.toolName} mutates filesystem state. Continue your plan; describe the change instead of applying it.`;
+        : explicitlyPlanUnsafe
+          ? `denied: plan mode is read-only — ${input.toolName} is not plan-safe. Continue your plan; describe what you would do instead of executing it.`
+          : `denied: plan mode is read-only — ${input.toolName} mutates filesystem state. Continue your plan; describe the change instead of applying it.`;
     return {
       toolResult: buildErrorBlock(input.toolUseId, input.toolName, modelMessage),
       toolCallId: toolCall.id,
