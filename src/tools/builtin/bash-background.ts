@@ -63,6 +63,12 @@ export const bashBackgroundTool: Tool<BashBackgroundInput, BashBackgroundOutput>
     // checkpoint-restore warning.
     escapesCwd: true,
     exec: true,
+    // Hard dependency on `ToolContext.bgManager`. Without it
+    // every invocation returns the bgmanager-missing tool-error;
+    // the subagent validator pulls the failure forward to
+    // bootstrap-time so an author whose whitelist includes this
+    // tool finds out before first invocation.
+    requiresBgManager: true,
     idempotent: false,
     display: 'raw',
     cost: { latency_ms_typical: 50 },

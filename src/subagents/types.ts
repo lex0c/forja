@@ -21,6 +21,39 @@ export interface SubagentBudget {
 
 export type SubagentScope = 'user' | 'project';
 
+// Isolation strategy declared by the subagent author. Spec §11.2:
+// `none` (default) runs the child in the parent's working tree with
+// no write access — the loader / validator refuse `metadata.writes:true`
+// tools in `tools[]`, because the parent's `--undo` cannot reverse a
+// child's writes when checkpoints are off. `worktree` opts the child
+// into a dedicated git worktree under `~/.cache/agent/worktrees/<id>/`;
+// the writes-true gate is lifted there because the child's mutations
+// land on a separate branch the parent can inspect, merge, or discard
+// without touching the principal tree.
+export type SubagentIsolation = 'none' | 'worktree';
+
+// Outcome of a worktree-isolated subagent run. Mirrored verbatim by
+// `RunSubagentResult.worktree`, `SpawnSubagentResult` (kind='ran')
+// and `TaskOutput.worktree` so the model and operator see the same
+// shape at every layer. Single source of truth here so the three
+// surfaces can never drift.
+//
+// `dirty` is the post-run `git status --porcelain` verdict (true =
+// any tracked or untracked diff). It drives the preserve/remove
+// decision: clean → both worktree dir and agent branch dropped;
+// dirty → both kept on disk for the parent to inspect via `path` /
+// `branch`. `preserved` and `removed` are mutually exclusive
+// booleans, NOT a discriminated union, because the model reads
+// them positionally and an enum-tag plus a payload would force
+// every consumer through an extra switch.
+export interface WorktreeOutcome {
+  path: string;
+  branch: string;
+  dirty: boolean;
+  preserved: boolean;
+  removed: boolean;
+}
+
 export interface SubagentDefinition {
   // Kebab-case unique identifier. Project scope shadows user
   // scope; cross-scope name collision is reported as a precedence
@@ -40,6 +73,10 @@ export interface SubagentDefinition {
   // Where this definition was loaded from. Diagnostics only —
   // surfaces in error messages and `--list-subagents` (later).
   scope: SubagentScope;
+  // Isolation strategy. Defaults to `none` when the frontmatter
+  // omits the `isolation` field — preserves the Step 4.1 contract
+  // for every existing definition.
+  isolation: SubagentIsolation;
   sourcePath: string;
   // SHA-256 of the raw `.md` content (frontmatter + body) at load
   // time. Lets the audit table fingerprint the exact version a

@@ -93,3 +93,14 @@ export type {
   SubagentRun,
   SubagentScope as SubagentRunScope,
 } from './repos/subagent-runs.ts';
+
+export {
+  getSubagentWorktree,
+  insertSubagentWorktree,
+  listOnDiskSubagentWorktrees,
+} from './repos/subagent-worktrees.ts';
+export type {
+  InsertSubagentWorktreeInput,
+  SubagentWorktree,
+  SubagentWorktreeStatus,
+} from './repos/subagent-worktrees.ts';

@@ -1,8 +1,23 @@
 export type {
   SubagentBudget,
   SubagentDefinition,
+  SubagentIsolation,
   SubagentScope,
+  WorktreeOutcome,
 } from './types.ts';
+export {
+  branchName,
+  cleanupWorktree,
+  createWorktree,
+  defaultWorktreeRoot,
+  slugify,
+} from './worktree.ts';
+export type {
+  CleanupResult,
+  CleanupWorktreeOptions,
+  CreateWorktreeOptions,
+  WorktreeHandle,
+} from './worktree.ts';
 export {
   loadSubagentFromFile,
   loadSubagentFromString,

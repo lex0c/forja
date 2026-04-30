@@ -74,6 +74,10 @@ export const bashOutputTool: Tool<BashOutputInput, BashOutputOutput> = {
     // risks). The right defense is denying spawn at policy time.
     category: 'misc',
     writes: false,
+    // Hard dependency on `ToolContext.bgManager`. Pulled forward
+    // for the subagent validator the same way bash_background
+    // and bash_kill are.
+    requiresBgManager: true,
     // Reading a fixed `since` window is idempotent. Reading without
     // `since` advances the cursor and is therefore not.
     idempotent: false,

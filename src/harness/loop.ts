@@ -852,6 +852,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     ...(child.auditFailure !== undefined
                       ? { auditFailure: child.auditFailure }
                       : {}),
+                    ...(child.worktree !== undefined ? { worktree: child.worktree } : {}),
+                    ...(child.worktreeError !== undefined
+                      ? { worktreeError: child.worktreeError }
+                      : {}),
                   };
                 };
 

@@ -1,6 +1,7 @@
 import type { BgManager } from '../bg/index.ts';
 import type { Decision, PermissionsView, PolicyCategory, ToolArgs } from '../permissions/index.ts';
 import type { ProviderToolInputSchema } from '../providers/index.ts';
+import type { WorktreeOutcome } from '../subagents/types.ts';
 import type { TodoStore } from '../todo/index.ts';
 
 // Per CONTRACTS §2: tool errors are *data*, not exceptions. The harness
@@ -66,6 +67,18 @@ export interface ToolMetadata {
   // depth so external tool definitions added without setting the flag
   // still get the warning.
   escapesCwd?: boolean;
+  // Tool depends on `ToolContext.bgManager` to function. The
+  // canonical case is the bash-background family
+  // (`bash_background`, `bash_kill`) which dispatches through the
+  // session-scoped BgManager; without it they surface a clean
+  // tool-error at runtime. The validator pulls that runtime
+  // error forward to bootstrap-time so a subagent author whose
+  // whitelist includes a bg-bound tool finds out before first
+  // invocation. For the M3/4.2a subagent runtime, bgManager is
+  // never wired into the child harness (worktree subagents share
+  // the parent's bg log dir, which is unsafe); 4.2b will revisit
+  // by giving worktree subagents their own bg dir.
+  requiresBgManager?: boolean;
   idempotent: boolean;
   display?: DisplayHint;
   // Optional cost hints; informational only in M1.
@@ -154,6 +167,15 @@ export type SpawnSubagentResult =
       // tool can echo it in its envelope; the run's outcome
       // (status/reason/cost/etc.) is still authoritative.
       auditFailure?: { code: string; message: string };
+      // Worktree lifecycle outcome (spec §11.2). Shape pinned in
+      // `WorktreeOutcome`. Present only when the spawned definition
+      // declared `isolation: worktree`.
+      worktree?: WorktreeOutcome;
+      // `git worktree add` itself failed before the child loop
+      // could start. Combined with `status='error'` /
+      // `reason='worktree_create_failed'` so non-`done` mapping
+      // catches it; the field is advisory detail for diagnostics.
+      worktreeError?: { code: string; message: string };
     };
 
 export interface Tool<I = unknown, O = unknown> {

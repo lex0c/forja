@@ -11,6 +11,7 @@ const definition = (overrides: Partial<SubagentDefinition> = {}): SubagentDefini
   budget: { maxSteps: 1, maxCostUsd: 0 },
   systemPrompt: 'p',
   scope: 'user',
+  isolation: 'none',
   sourcePath: '/u/explore.md',
   sourceSha256: 'a'.repeat(64),
   meta: {},
@@ -22,6 +23,25 @@ const tool = (name: string, writes: boolean): Tool => ({
   description: name,
   inputSchema: { type: 'object' },
   metadata: { category: 'misc', writes, idempotent: false },
+  async execute() {
+    return { ok: true };
+  },
+});
+
+// Tool factory for `requiresBgManager` flag tests. Mirrors the
+// shape of `bash_background` (writes:true, requiresBgManager:true)
+// without depending on the real implementation — keeps the
+// validator test independent of bg-tool changes.
+const bgTool = (name: string): Tool => ({
+  name,
+  description: name,
+  inputSchema: { type: 'object' },
+  metadata: {
+    category: 'misc',
+    writes: true,
+    requiresBgManager: true,
+    idempotent: false,
+  },
   async execute() {
     return { ok: true };
   },
@@ -59,7 +79,7 @@ describe('validateSubagentTools', () => {
     const reg = buildRegistry(tool('read_file', false), tool('write_file', true));
     const def = definition({ tools: ['read_file', 'write_file'] });
     expect(() => validateSubagentTools(def, reg)).toThrow(
-      /tool 'write_file' declares metadata.writes=true and cannot appear in subagent.tools\[\] in Step 4\.1/,
+      /tool 'write_file' declares metadata.writes=true and cannot appear in subagent.tools\[\] without 'isolation: worktree'/,
     );
   });
 
@@ -91,6 +111,120 @@ describe('validateSubagentTools', () => {
     const reg = buildRegistry(tool('read_file', false));
     const def = definition({ tools: [] });
     expect(() => validateSubagentTools(def, reg)).not.toThrow();
+  });
+
+  test("isolation: 'worktree' lifts the writes:true gate (writing tools accepted)", () => {
+    // The whole point of declaring worktree isolation: the child
+    // runs in a dedicated branch+tree so its writes can no longer
+    // pollute the parent. Without this gate-lift, no subagent
+    // could ever use write_file/edit_file/bash, defeating the
+    // worktree feature.
+    const reg = buildRegistry(tool('read_file', false), tool('write_file', true));
+    const def = definition({
+      tools: ['read_file', 'write_file'],
+      isolation: 'worktree',
+    });
+    expect(() => validateSubagentTools(def, reg)).not.toThrow();
+  });
+
+  test("isolation: 'worktree' still rejects unregistered tool names", () => {
+    // Worktree only changes the writes:true rule — the registry
+    // sanity check still applies. A typo in `tools[]` is a
+    // programmer error regardless of isolation strategy.
+    const reg = buildRegistry(tool('read_file', false));
+    const def = definition({
+      tools: ['read_file', 'grepp'],
+      isolation: 'worktree',
+    });
+    expect(() => validateSubagentTools(def, reg)).toThrow(
+      /tool 'grepp' is not registered with the active toolset/,
+    );
+  });
+
+  test("rejects a requiresBgManager tool under isolation='worktree' (writes:true gate lifted, bg gate fires)", () => {
+    // C3 fix path under worktree: the writes:true refusal no
+    // longer applies (worktree contains the writes), but the
+    // bgmanager-missing gate must catch the same tool. The 4.2a
+    // runtime never wires ctx.bgManager for the child harness;
+    // pulling the failure forward to bootstrap saves the author
+    // a debugging round.
+    const reg = buildRegistry(bgTool('bash_background'));
+    const def = definition({ tools: ['bash_background'], isolation: 'worktree' });
+    expect(() => validateSubagentTools(def, reg)).toThrow(
+      /tool 'bash_background' declares metadata\.requiresBgManager=true/,
+    );
+  });
+
+  test("rejects a requiresBgManager+writes tool under isolation='none' via the writes gate (first fail)", () => {
+    // Under default isolation, the writes:true gate fires first
+    // (it's checked before the bgmanager gate in validate.ts).
+    // The end result is the same — the tool is refused — but
+    // the message points at the more fundamental problem
+    // (mutating tool needs isolation) rather than the bgmanager
+    // wiring. Lock the gate ordering so a refactor doesn't flip
+    // the error path silently.
+    const reg = buildRegistry(bgTool('bash_background'));
+    const def = definition({ tools: ['bash_background'], isolation: 'none' });
+    expect(() => validateSubagentTools(def, reg)).toThrow(
+      /tool 'bash_background' declares metadata\.writes=true/,
+    );
+  });
+
+  test('rejects a writes:false bg-only tool (e.g., bash_output) regardless of isolation', () => {
+    // bash_output has writes:false + requiresBgManager:true, so
+    // the writes gate doesn't fire. The bgmanager gate must catch
+    // it under both isolation modes. This is what protects a
+    // read-only subagent that whitelists bash_output without
+    // realizing the runtime can't dispatch it.
+    const readOnlyBg: Tool = {
+      name: 'bash_output',
+      description: 'read bg stdout',
+      inputSchema: { type: 'object' },
+      metadata: {
+        category: 'misc',
+        writes: false,
+        requiresBgManager: true,
+        idempotent: false,
+      },
+      async execute() {
+        return { ok: true };
+      },
+    };
+    const reg = buildRegistry(readOnlyBg);
+    for (const isolation of ['none', 'worktree'] as const) {
+      const def = definition({ tools: ['bash_output'], isolation });
+      expect(() => validateSubagentTools(def, reg)).toThrow(
+        /tool 'bash_output' declares metadata\.requiresBgManager=true/,
+      );
+    }
+  });
+
+  test('requiresBgManager error names the offending source path', () => {
+    const reg = buildRegistry(bgTool('bash_kill'));
+    const def = definition({
+      tools: ['bash_kill'],
+      isolation: 'worktree',
+      sourcePath: '/u/.config/agent/agents/runner.md',
+    });
+    expect(() => validateSubagentTools(def, reg)).toThrow(
+      /\(\/u\/\.config\/agent\/agents\/runner\.md\)/,
+    );
+  });
+
+  test("isolation: 'none' (default) keeps the writes:true refusal", () => {
+    // The legacy contract: no isolation declared (or explicit
+    // 'none') means writing tools are still refused. Locks in the
+    // Step 4.1 invariant against accidental regression when the
+    // worktree path expands.
+    const reg = buildRegistry(tool('write_file', true));
+    const defImplicit = definition({ tools: ['write_file'] });
+    expect(() => validateSubagentTools(defImplicit, reg)).toThrow(
+      /tool 'write_file' declares metadata\.writes=true/,
+    );
+    const defExplicit = definition({ tools: ['write_file'], isolation: 'none' });
+    expect(() => validateSubagentTools(defExplicit, reg)).toThrow(
+      /tool 'write_file' declares metadata\.writes=true/,
+    );
   });
 });
 

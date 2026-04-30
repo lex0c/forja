@@ -15,6 +15,158 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.2a — worktree skeleton (write-tool gate lifted)
+
+The Step 4.1 closing entry left every writing subagent unrunnable:
+the loader / validator / runtime all refused `metadata.writes=true`
+in `tools[]`. This slice opens that surface for definitions that
+opt into `isolation: worktree` — the canonical path spec §11.2
+prescribes for any subagent that edits code. Subprocess spawn,
+heartbeat-based timeout, and full checkpoint chain re-enablement
+stay deferred; this slice delivers ONLY the lifecycle: create
+worktree → run child with `cwd=worktree-root` → cleanup → audit.
+
+**Slice scope:**
+
+| Component | Status | Notes |
+|---|---|---|
+| `src/subagents/types.ts` | UPDATED | New `SubagentIsolation = 'none' \| 'worktree'` field on `SubagentDefinition`. Required (no default at the type level) so every consumer is forced to acknowledge the choice; the loader fills 'none' for legacy frontmatter. |
+| `src/subagents/load.ts` | UPDATED | Parses optional `isolation:` frontmatter; rejects any value other than the two literals (typo defense — `isolation: worktee` MUST NOT silently downgrade to none). Adds `isolation` to the `known` set so it doesn't leak into `meta`. |
+| `src/subagents/validate.ts` | UPDATED | Lifts the `writes:true` refusal when `definition.isolation === 'worktree'`. The unregistered-tool check stays unconditional. |
+| `src/subagents/runtime.ts` | UPDATED | `buildChildRegistry` accepts `allowWrites`; `runSubagent` creates a worktree before `runAgent` when isolation is declared, sets the child's `cwd` to the worktree root, runs cleanup post-run, and writes the audit row. `RunSubagentResult` gains `worktree?` (clean/dirty/preserved/removed) and `worktreeError?` (pre-run failure). The `reason` type is widened to `ExitReason \| 'worktree_create_failed'` because the new failure path doesn't go through the harness loop. |
+| `src/subagents/worktree.ts` | NEW | `createWorktree`, `cleanupWorktree`, `slugify`, `branchName`, `defaultWorktreeRoot`. Self-contained — does not reuse `checkpoints/git.ts:runGit` because that helper is private and tuned for index-isolated snapshots; pulling it onto a shared surface would force a refactor unrelated to this slice. |
+| `src/storage/migrations/013-subagent-worktrees.ts` | NEW | `subagent_worktrees` table — session_id PK + FK CASCADE, path, branch, status CHECK active/preserved/cleaned, created_at, cleaned_at. Index on `status` for the future GC sweep (4.2d). |
+| `src/storage/repos/subagent-worktrees.ts` | NEW | `insertSubagentWorktree` / `getSubagentWorktree` / `listActiveSubagentWorktrees`. The CHECK admits 'active' even though 4.2a only writes terminal rows — pre-staging the schema for 4.2b's subprocess work. |
+| `src/tools/types.ts` | UPDATED | `SpawnSubagentResult.kind='ran'` carries `worktree?` and `worktreeError?` so the harness loop's spawn closure can forward them. |
+| `src/harness/loop.ts` | UPDATED | Spawn closure forwards the two new optional fields; existing 'ran' contract unchanged. |
+| `src/tools/builtin/task.ts` | UPDATED | `TaskOutput` envelope gains `worktree?`; non-`done` mapping echoes both `worktree` and `worktree_error` in `details` so the model reads them on the `subagent.run_failed` branch too. |
+| Tests | NEW + UPDATED | `tests/subagents/worktree.test.ts` (17 — slugify, branchName, defaultWorktreeRoot, create happy path, orphan-path refusal, non-git refusal, chmod-tightening, cleanup clean/dirty-untracked/dirty-tracked, preserved-row enumeration), `tests/storage/subagent-worktrees.test.ts` (8 — round-trip terminal+active, FK CASCADE, parent-purge non-cascade, CHECK violation, list ordering, null lookup), `tests/subagents/load.test.ts` (+4 — isolation default, isolation: worktree, isolation: none, typo refusal), `tests/subagents/validate.test.ts` (+3 — worktree lifts gate, worktree still rejects unknowns, none keeps gate), `tests/subagents/runtime.test.ts` (+5 — clean run cleanup + audit, dirty run preservation + audit, create-failure surface, write_file end-to-end, isolation=none keeps fields absent). Existing tests updated to include `isolation: 'none'` on the definition fixtures. |
+
+**Decisions:**
+
+- **Worktree root: `~/.cache/agent/worktrees/<id>/` with chmod 0700, NOT `/tmp`.** Per SECURITY_GUIDELINE §8.4: `/tmp` on shared systems opens symlink-traversal exposure and tmpfs eats the worktree on reboot while a paused subagent might still want to be inspected. XDG-aware lookup (`$XDG_CACHE_HOME` → `~/.cache`); empty-string XDG var treated as unset (common shell oddity). The chmod is applied even to a pre-existing root so a looser parent install can't downgrade the protection.
+- **Worktree id ≠ session id.** I considered preassigning a session id so the worktree path matched `/<session-id>/`, but that required reaching into `runAgent`'s session-creation flow (a non-trivial refactor for a cosmetic correlation). The audit table stores both `session_id` and `path` — operators correlate via SQL, not by reading directory names. Keeping the worktree id as a fresh UUID independent of the session is the smaller change.
+- **Single post-cleanup audit INSERT (not insert-then-update).** The FK on `subagent_worktrees.session_id → sessions(id)` requires the child session to exist, and that happens INSIDE `runAgent`. Pre-creation insertion is impossible without restructuring the harness; intermediate `active` state matters only when 4.2b adds subprocess heartbeats. For in-process synchronous execution the row lands once, with the resolved status. The CHECK accepts 'active' anyway so 4.2b can extend without a constraint rewrite.
+- **`reason` widened to `ExitReason | 'worktree_create_failed'` instead of adding a new `kind` to `SpawnSubagentResult`.** Adding a `spawn_failed` discriminator would have rippled through tools/types.ts, harness/loop.ts, task.ts and their tests for one new code path. Reusing the existing `ran` kind with `status='error'` and a custom reason is honest: the calling tool already maps non-`done` to `subagent.run_failed`, and the worktree-create failure is exactly that — a run that didn't happen because spawn failed. New kind reconsidered when 4.2b's subprocess path produces additional pre-run failure modes.
+- **Branch name: `agent/<slug-of-prompt>-<8-char-uuid>`, slug capped at 40 chars.** Slug for human readability when running `git branch --list 'agent/*'`; uuid suffix for collision safety when two parallel runs share a prompt. `slugify` lowercases, collapses non-alnum runs to `-`, trims edges, and falls back to `'task'` on empty/sanitize-to-empty inputs (avoids producing `agent/-<id>` which git refuses).
+- **Cleanup policy: clean tree → remove (`worktree remove --force` + `branch -D`); dirty tree → preserve.** `git status --porcelain` empty means the child made no tracked or untracked diff — there's nothing to keep. `--force` because ignored files git would call "would be lost" don't survive the same bar (the cleanup contract is "no observable diff → drop"). Branch delete is best-effort; failures are diagnostic, not outcome-affecting.
+- **No symlink validation, no copy-with-deny-list, no commit-on-done.** All three are real SECURITY §8.4 / FAILURE_MODES §7.2 features the spec mandates, but they belong in 4.2b (subprocess + sandbox surface) and 4.2d (commit lifecycle). Pulling them forward here would block the slice on subprocess design that hasn't happened yet.
+- **`writes:true` gate stays unconditional in load + validate + runtime when isolation is 'none'.** Defense in depth: a programmatic caller building a `SubagentDefinition` directly (evals, future tooling) without going through the loader still gets protected by the runtime's `buildChildRegistry`. Any tool that opts into `metadata.writes=true` inherits the refusal automatically — no name list to keep updated.
+- **Checkpoints stay OFF for worktree subagents in 4.2a.** Re-enabling them needs `refs/agent/checkpoints/<child-session>` to live inside the worktree's branch namespace without leaking into the parent's `--undo` walk. That's a non-trivial reasoning task best done in 4.2c with isolated tests; keeping them off here makes 4.2a an honest "writes are now possible, reversibility lands separately" slice instead of trying to do both at once.
+
+**What this DOESN'T close (deferred):**
+
+- **No subprocess.** Spec §11:1030 says "processo separado, comunicação via SQLite". 4.2a runs the child in-process — same Bun process, same DB handle, same harness invariants. Subprocess + IPC + heartbeat is 4.2b. The cost: a child that crashes hard (uncaught throw escapes the harness's top-level catch — currently exhaustive, but a future regression could lose this) takes the parent down with it. In-process is the right pragmatic default while subprocess design is being shaped.
+- **No checkpoint chain.** A writing subagent's mutations land on the worktree's branch but are not snapshotted step-by-step under `refs/agent/checkpoints/<child>`. If the child writes a file then writes-and-corrupts it, the only reverse path is `git checkout` on the worktree branch — coarser-grained than the parent's per-step undo. 4.2c re-enables checkpoints inside the worktree.
+- **No `agent worktree gc` CLI verb.** A preserved worktree shows up in `listActiveSubagentWorktrees(db)` and on disk under `~/.cache/agent/worktrees/`, but the operator command to enumerate + clean orphans is 4.2d. Until then, manual `git worktree remove` + `rm -rf <path>` is the recovery path.
+- **No symlink hardening.** A `.gitignore`'d symlink inside the parent that points outside the repo gets carried into the worktree by `git worktree add` (it's a checkout of the same commit). 4.2a does NOT validate symlink targets at runtime; a writing subagent could escape via a pre-existing symlink. SECURITY_GUIDELINE §8.4 requires the deny-list copy + symlink validation; that lands in 4.2b together with the subprocess sandbox.
+- **No merge / commit / PR helper.** Spec §11.2:1066 lists "Pai decide: merge, descarta, ou abre PR". 4.2a returns `path` + `branch` in the envelope; the model reads them and decides via plain bash. Convenience CLI (`agent worktree merge <id>`) and slash commands (`/diff`, `/merge`) wait for M4's TUI work.
+- **No `commit_on_done` frontmatter.** The spec mentions it for FAILURE_MODES §7.2 conflict semantics; 4.2a doesn't surface it. Default is "never auto-commit" — the parent always inspects the dirty tree on its own.
+- **No `bgLogDir` for worktree subagents.** A child that wants `bash_background` inside the worktree still hits the "no bgLogDir" tool-error. Wiring a per-worktree bg dir is mechanical but pulled into 4.2b alongside the subprocess work where bg-process lifetime semantics need a second pass.
+- **No N+1 fix for the audit lookup in `--list-sessions --include-subagents`.** Each subagent row triggers a `getSubagentWorktree` SELECT on top of the existing `getSubagentRun` SELECT (when 4.2d wires it into the listing). Same shape as the prior O1 N+1 note from Step 4.1 — defer until first user reports a slow listing on > 100 subagent rows.
+
+**Verification:** `bun test` 1238 pass / 10 skip / 0 fail (+57 new tests across worktree module, repo, migration, loader, validator, runtime); `tsc --noEmit` clean; `biome check` clean.
+
+**Review pass (post-self-review).** Self-review surfaced 3 critical
++ 6 medium + 5 minor. All addressed in the same commit chain:
+
+- **C1 — `runAgent` throw could leak the worktree.** The harness's
+  top-level catch is documented as exhaustive, but a regression
+  there would otherwise leave a worktree dir + agent branch on
+  disk with no audit row. Wrapped `runAgent` in try/catch that
+  runs `cleanupWorktree` best-effort before re-raising, so even
+  an uncaught throw drops the artefacts. Test: drop `messages`
+  table → harness returns status='error' → assert
+  `readdirSync(worktreeRoot) === []` and `result.worktree.removed
+  === true`.
+- **C2 — partial `git worktree add` failure left orphan admin
+  state.** When `git worktree add` succeeds at registering
+  `.git/worktrees/<id>/` but fails on the working-tree checkout
+  (canonical case: disk-full mid-checkout), the next attempt
+  with the same id would trip even though our pre-check was
+  clean. Now the catch path runs `git worktree prune` and
+  rmSync's the leaf dir if it landed partial. Best-effort: a
+  prune failure doesn't change the propagated error.
+- **C3 — bg-family tools passed the writes:true gate under
+  worktree but failed at runtime.** The 4.2a runtime never
+  wires `ctx.bgManager`, so `bash_background` / `bash_kill` /
+  `bash_output` would surface the bgmanager-missing error on
+  first invocation. Added `ToolMetadata.requiresBgManager`
+  capability flag (set on those three tools), and a separate
+  validator + child-registry gate that refuses any whitelisted
+  tool with the flag — independent of isolation, since the
+  issue is runtime wiring not write safety. Step 4.2b lifts
+  this once worktree subagents get their own bg log dir. Test:
+  validator throws with source-aware message under both
+  isolation modes.
+- **M1 — triplicate `worktree { path, branch, dirty, preserved,
+  removed }` shape.** Extracted `WorktreeOutcome` in
+  `src/subagents/types.ts`; `RunSubagentResult.worktree`,
+  `SpawnSubagentResult.worktree`, `TaskOutput.worktree` all
+  reference the single type now.
+- **M2 — `listActiveSubagentWorktrees` name didn't match
+  behavior.** Function returned both `active` and `preserved`
+  rows. Renamed to `listOnDiskSubagentWorktrees`; doc comment
+  spells out which statuses are included.
+- **M3 (deferred) — SIGKILL between worktree create + audit
+  insert leaves filesystem orphan with no DB row.** 4.2a writes
+  the audit row post-cleanup (FK to sessions(id) requires the
+  child session to exist). A SIGKILL anywhere between
+  createWorktree and the post-runAgent audit insert leaves a
+  worktree on disk that `listOnDiskSubagentWorktrees(db)`
+  cannot find. `agent worktree gc` (4.2d) MUST do a filesystem
+  walk under `~/.cache/agent/worktrees/` cross-referenced with
+  `git worktree list --porcelain` rather than relying on the
+  audit table alone. 4.2b's subprocess work moves the audit row
+  insertion forward (write-only IPC happens before the child
+  run), which closes this window.
+- **M4 — chmod race [mkdirSync→chmodSync].** Documented; added
+  a post-stat assertion that the cache root mode actually
+  landed at 0700 after the chmod. A remount-mid-operation or
+  exotic FS that strips mode bits now produces a refusal at
+  create time instead of a worktree under group/other-readable
+  perms.
+- **M5 — branch suffix entropy.** Doc comment on `branchName`
+  spells out the 16^8 ≈ 4.3B headroom and the ~65k birthday
+  threshold so a future high-volume CI workload knows when to
+  widen the suffix.
+- **M6 — no test for runAgent failure → cleanup ran.** Added
+  the `runAgent internal error still triggers worktree cleanup
+  (C1 defense)` test. Drops `messages` to force runAgent into
+  status='error'; asserts the worktree dir is gone after.
+- **M7 (deferred) — `parentCwd` semantics inside another
+  worktree are unvalidated.** A user invoking `agent` from an
+  already-checked-out git worktree (not the main repo) would
+  thread that as `parentCwd`. `git worktree add -C <parentCwd>`
+  resolves through `.git/worktrees/<id>/gitdir` to the main
+  repo, so the new worktree lands as a sibling — probably
+  works, but no test covers it. 4.2b adds a fixture that
+  exercises this.
+- **m2 — `slugify` fallback comment.** Now mentions both empty-
+  input and all-dash-after-truncation branches.
+- **m3 — `branchName` doc precise about "8 hex chars from UUID
+  first segment".**
+- **m4 — symlink hardening.** Added `test.skip` placeholder in
+  `tests/subagents/runtime.test.ts` so 4.2b's hardening pass
+  has a concrete failing test to enable.
+- **m5 — `RunSubagentResult.reason` doc** notes the union is
+  expected to grow with 4.2b's subprocess failure modes;
+  consumers should match positively, treat the rest as
+  diagnostic text.
+
+Deferred items (M3, M7) are documented above and don't change
+the slice contract — both are out-of-scope for the in-process
+4.2a runtime and land naturally with subprocess work in 4.2b.
+
+**Verification (post-review):** `bun test` 1243 pass / 11 skip
+/ 0 fail (+5 over the pre-review count: 3 new bgmanager-gate
+tests, 1 C1-defense test, 1 symlink-skip placeholder); `tsc
+--noEmit` clean; `biome check` clean.
+
+**Next:** M3 / Step 4.2b — subprocess + IPC via SQLite (write-only child) + heartbeat-driven timeout + symlink hardening. Justifies the subprocess spawn cost the in-process path side-stepped here, and unlocks the security model SECURITY_GUIDELINE §8.4 expects. Step 4.2c (checkpoint chain inside worktree) and 4.2d (`agent worktree gc` + merge helpers) follow.
+
+---
+
 ## [2026-04-30] M3 / Step 4.1 — subagent definition snapshot (audit gap closed)
 
 Architectural review surfaced a real audit gap that wasn't in the

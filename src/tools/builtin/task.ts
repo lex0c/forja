@@ -1,3 +1,4 @@
+import type { WorktreeOutcome } from '../../subagents/types.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
 // `task` invokes a subagent (spec §11). The model passes a subagent
@@ -37,6 +38,13 @@ export interface TaskOutput {
   // this is an advisory so the parent / operator know the
   // forensic record is missing.
   audit_failure?: { code: string; message: string };
+  // Worktree outcome (spec §11.2). Shape pinned in
+  // `WorktreeOutcome`. Present when the subagent declared
+  // `isolation: worktree`. The model uses `branch` to decide
+  // whether to merge, discard, or open a PR for the child's
+  // changes; `dirty=false, removed=true` means there's nothing
+  // to merge (clean run, dropped automatically).
+  worktree?: WorktreeOutcome;
 }
 
 // Cap on the prompt the parent forwards to the child. 32 KiB is
@@ -177,6 +185,8 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
           duration_ms: result.durationMs,
           output: result.output,
           ...(result.auditFailure !== undefined ? { audit_failure: result.auditFailure } : {}),
+          ...(result.worktree !== undefined ? { worktree: result.worktree } : {}),
+          ...(result.worktreeError !== undefined ? { worktree_error: result.worktreeError } : {}),
         },
       });
     }
@@ -190,6 +200,7 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
       steps: result.steps,
       duration_ms: result.durationMs,
       ...(result.auditFailure !== undefined ? { audit_failure: result.auditFailure } : {}),
+      ...(result.worktree !== undefined ? { worktree: result.worktree } : {}),
     };
   },
 };
