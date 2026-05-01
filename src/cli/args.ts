@@ -43,6 +43,11 @@ export interface ParsedArgs {
   // spec keeps these as independent commands and they share a
   // dispatcher inside the handler.
   checkpoints?: { verb: string; positionals: string[] };
+  // `--worktrees <verb> [positionals]` — operator surface for
+  // gc/list of subagent worktrees (Step 4.2d). Verbs: 'list',
+  // 'gc'. `gc` accepts `--dry-run` and `--force` as
+  // positionals (sub-flags); the handler interprets them.
+  worktrees?: { verb: string; positionals: string[] };
   model?: string;
   maxSteps?: number;
   // Cap on rows returned by --list-sessions. Defaults to 20 in
@@ -180,6 +185,42 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         }
         args.undo = value;
         i += 2;
+        break;
+      }
+      case '--worktrees': {
+        const verb = argv[i + 1];
+        const known = ['list', 'gc'] as const;
+        if (verb === undefined || verb.startsWith('-')) {
+          return {
+            ok: false,
+            message: `--worktrees requires a subcommand (${known.join('|')})`,
+          };
+        }
+        if (!known.includes(verb as (typeof known)[number])) {
+          return {
+            ok: false,
+            message: `unknown --worktrees subcommand: ${verb}. Use one of ${known.join('|')}`,
+          };
+        }
+        // Greedy collection of positionals until the next
+        // top-level flag. `gc` accepts `--dry-run` and
+        // `--force` as positional flag-shaped tokens (the
+        // handler validates them); `list` takes no positionals.
+        // The early-stop on top-level flags (`--json`) keeps
+        // things consistent with --checkpoints.
+        const positionals: string[] = [];
+        let j = i + 2;
+        while (j < argv.length) {
+          const next = argv[j];
+          if (next === undefined) break;
+          // Stop on top-level flags only. We keep `--dry-run`
+          // and `--force` because they're sub-flags of `gc`.
+          if (next === '--json' || next === '--help' || next === '-h') break;
+          positionals.push(next);
+          j += 1;
+        }
+        args.worktrees = { verb, positionals };
+        i = j;
         break;
       }
       case '--checkpoints': {
@@ -418,6 +459,7 @@ export const usage = (): string =>
     '  --limit <n>            With --list-sessions, cap rows returned (default 20; requires --list-sessions)',
     '  --resume <id|last>     Continue a prior session; positional prompt is the follow-up',
     '  --undo <session>       Restore the latest checkpoint of a session',
+    '  --worktrees <verb>     Inspect / gc subagent worktrees (verb: list, gc)',
     '  --checkpoints <cmd>    Checkpoint subcommands: list <session> | diff <session> <ckpt>',
     '                          | restore <session> <ckpt> | purge <session>',
     '  --yes, -y              Skip the bash-side-effect confirm on undo/restore',

@@ -15,6 +15,57 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.2d — `agent --worktrees` operator surface (gc + list)
+
+The 4.2b arc landed full subagent worktree lifecycle (create, isolate,
+validate, cleanup, bg). Spec §11.2 + §16.9 describe the operator
+surface — "Pai decide: merge, descarta, ou abre PR" + "agent worktree
+gc manual" — but no command existed yet. This slice fills that gap
+with `agent --worktrees list` and `agent --worktrees gc [--dry-run]
+[--force]`, anchored on a small reconciler that joins the audit table,
+the cache filesystem, and `git worktree list --porcelain` output.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/subagents/worktree-gc.ts` | NEW — `buildGcPlan` classifies every worktree into one of seven `WorktreeGcEntry` kinds (`orphan`, `stale_cleaned`, `ready_to_remove`, `preserved_dirty`, `missing`, `active`); `applyGcPlan` consumes the plan and dispatches per-kind actions. Pure function in spirit (only side effects are read calls); test seams `runGitWorktreeList` and `worktreeStatus` let the engine exercise without a real git repo. Default removal path runs `git worktree remove --force <path>` then `git branch -D <branch>`, with an `rmSync` fallback when git's admin entry was already pruned. |
+| `src/storage/repos/subagent-worktrees.ts` | `listAllSubagentWorktrees` (returns every row, not just `active`/`preserved`) and `markSubagentWorktreeCleaned` (per-row terminal flip). Both are needed by the reconciler — the list-on-disk variant excludes `cleaned` rows by design, but stale cleaned rows are exactly the inconsistency gc retries. |
+| `src/cli/worktrees.ts` | NEW — `runWorktreesCli` thin wrapper. Validates the verb, parses `--dry-run` / `--force` from positionals, routes to `buildGcPlan` / `applyGcPlan`. Output: NDJSON in `--json` mode (one entry per line + a final summary object); plain table otherwise. Exit 1 only on real failures (apply errors, unknown flags); skip/reconcile outcomes still exit 0. |
+| `src/cli/args.ts` | `--worktrees <verb> [positionals]` parser modeled on `--checkpoints`. Stops positional collection at top-level flags (`--json`, `--help`) but keeps gc sub-flags (`--dry-run`, `--force`) so the handler can interpret them. New `args.worktrees` field. |
+| `src/cli/run.ts` | New short-circuit branch dispatches to `runWorktreesCli` before the resume / run paths. Same DB-only pattern as checkpoints — no provider, no permissions, no API key required. |
+| `src/cli/index.ts` | `promptOptional` now also covers `args.worktrees !== undefined` so the missing-prompt gate doesn't fire on inspection commands. |
+| `tests/subagents/worktree-gc.test.ts` | NEW — 18 unit tests on `buildGcPlan` + `applyGcPlan`. Cover all seven entry kinds, --force lifting on dirty/orphan, `active` rows always skipped, removal failure leaves audit `preserved`, missing rows reconcile audit without calling runRemove. Stubs replace git calls entirely; filesystem state lives in tmpdirs. |
+| `tests/cli/worktrees.test.ts` | NEW — 5 CLI-surface tests. Empty-state / NDJSON output / dry-run / unknown gc flag / unknown verb. Exercises the real engine against tmpdir state (parentCwd is non-git, so the production `runGitWorktreeList` exits non-zero and the engine treats it as "git silent" — still classifies via DB+disk). |
+| `tests/cli/args.test.ts` | +5 tests on `--worktrees` parsing: verb capture, no-positionals for `list`, missing/unknown verb rejection, top-level flag boundary preserves `--json`. |
+
+**Decisions (post-review polish bundled in):**
+
+- **D8 (post-review M1) — Path canonicalization across DB/git/cache.** `realpathSync` per path before unioning into the `allPaths` Set. Fallback to literal on ENOENT keeps the `missing` detection working for rows whose worktree was deleted. macOS-flavored `/var` ↔ `/private/var` and operator-side cache-root symlinks no longer split a single worktree into multiple plan entries.
+- **D9 (post-review M2) — Honest audit on `markSubagentWorktreeCleaned` failure.** Per-row capture of the helper's boolean return + try/catch error. For the `missing` kind (where audit-flip IS the only work), failure flips action to `failed` instead of mis-claiming `reconciled-audit`. For `removed` paths (disk work succeeded, audit lagging), keeps action='removed' but appends `; AUDIT DRIFT: <error>` to detail so operators see the partial state without pretending the disk-side work failed.
+- **D10 (post-review M3) — Don't silence git-known orphans with null branch.** Earlier draft skipped emission when `!onDisk && gitBranch === null` under the dbRow=undefined branch. Hid genuine inconsistencies (git admin entry without a `branch` line, working tree externally removed). Removed the skip; emits orphan with `branch: null` so the operator gets the signal.
+- **D11 (post-review M4) — Deleted unused `formatTime` helper.** YAGNI; re-add when an actual filter needs it.
+
+- **D1 — Flag style (`--worktrees`), not subcommand-style (`agent worktree gc`).** Spec §1605 wrote `agent worktree gc`, but Forja's existing surface uses flags exclusively (`--checkpoints`, `--undo`, `--list-sessions`, `--resume`). Consistency wins: same parser shape, same dispatch path in run.ts, same test patterns. The user types `agent --worktrees gc --dry-run` instead of `agent worktree gc --dry-run`; trade-off is two extra characters for code that's smaller and more uniform.
+- **D2 — Plan/apply split.** `buildGcPlan` returns a `WorktreeGcPlan` value; `applyGcPlan` consumes it. Splits policy from side effects. `--dry-run` literally just renders the plan and skips apply. Tests can assert classification logic (engine pure with stubs) AND apply outcomes (engine + recorded mock removals) independently.
+- **D3 — Seven entry kinds, not three.** Initial sketch had `orphan`, `ready_to_remove`, `preserved_dirty`. Adding `stale_cleaned`, `missing`, and `active` covered the realistic-but-uncommon states without making the apply branch a dictionary of edge cases. `active` in particular is load-bearing: 4.2b inserts active rows BEFORE child spawn, and gc must NEVER touch a worktree whose subagent is still running.
+- **D4 — `--force` only lifts `preserved_dirty` + `orphan`.** Other kinds either auto-act (`ready_to_remove`, `stale_cleaned`, `missing`) or never act (`active`). The flag's surface area stays small and operator-predictable.
+- **D5 — Removal failure leaves audit untouched.** A `git worktree remove` that fails leaves the row at its existing status (`preserved` or `cleaned`). Operator can retry via the next `gc` pass. The alternative (flipping audit on failure) would lie about the world state, which is the bug we already fixed in the bg reaper. Same principle.
+- **D6 — Branch deletion is best-effort and only on successful removal.** A failed remove leaves the working tree linked to the branch and `git branch -D` would refuse. Branch survival is fine — operator can `git branch -D` themselves once the worktree is gone.
+- **D7 — `agent --worktrees merge <id>` deferred.** The spec mentions merge, but operators can use raw `git merge agent/<slug>-<id>` today without ergonomics loss. A merge wrapper would need to handle conflict surfaces (interactive prompts in --json mode? abort flow?) that don't have clear answers yet. Defer until the dor de uso aparece.
+
+**Pending / known limitations:**
+
+- **Cross-repo gc.** The reaper assumes the parent's cwd is the same repo across all worktrees. An operator running gc from a sub-repo of a monorepo would only see worktrees branched off THAT subrepo. Multi-repo gc would need a registry of parent paths in the audit table — out of scope.
+- **Concurrent gc invocations.** Two `gc` runs at the same time would race on the same worktree (both query the plan, both try to remove). The second would see `git worktree remove` fail with "not a worktree". Not catastrophic — the loser's audit row stays untouched, the winner's flips. Could add advisory file locking later; defer.
+- **No retention TTL.** Currently gc removes any clean preserved worktree, regardless of age. An operator might want "preserve last 24h, remove older" — that's a future flag (`--older-than 24h`).
+
+**Verification:** `bun test` 1413 pass / 10 skip / 0 fail (+28 new); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** With 4.2d landed, the 4.2 arc is COMPLETE (a, b, b.i, b.ii.a/b, b.iii, b.iv, d). The 4.2c (per-step checkpoints inside subagent worktrees) remains explicitly out of scope — not in spec, no consumer demand. M3 next steps move out of subagents into the M3-tail items per `docs/spec/AGENTIC_CLI.md` §13: MCP, recap, code index, memory subsystems.
+
+---
+
 ## [2026-04-30] M3 / Step 4.2b.iv — per-subagent bg log dir, lifts requiresBgManager gate
 
 The 4.2a/b arc landed subagents with one capability hole: any

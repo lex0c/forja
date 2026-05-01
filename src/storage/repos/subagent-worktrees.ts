@@ -126,3 +126,40 @@ export const listOnDiskSubagentWorktrees = (db: DB): SubagentWorktree[] => {
     .all();
   return rows.map(fromRow);
 };
+
+// Return every audit row, including 'cleaned'. The gc reconciler
+// (Step 4.2d) needs this because a 'cleaned' row whose worktree
+// path still exists on disk indicates a previously-failed cleanup
+// — the gc retries removal in that case. `listOnDiskSubagentWorktrees`
+// excludes 'cleaned' rows by construction, which would hide that
+// inconsistency. Order by created_at ASC keeps the oldest-first
+// presentation that the operator's eyeball-scan benefits from.
+export const listAllSubagentWorktrees = (db: DB): SubagentWorktree[] => {
+  const rows = db
+    .query<SubagentWorktreeRow, []>(
+      `SELECT session_id, path, branch, status, created_at, cleaned_at
+         FROM subagent_worktrees
+        ORDER BY created_at ASC`,
+    )
+    .all();
+  return rows.map(fromRow);
+};
+
+// Mark a row as 'cleaned' AFTER an out-of-band cleanup pass (gc)
+// removed the worktree directory and branch. Idempotent: a row
+// already 'cleaned' is left alone (UPDATE WHERE status<>'cleaned'
+// returns 0 changes silently). The exit timestamp is bumped so
+// audit reflects when gc reconciled, not when the original
+// cleanup pass tried.
+export const markSubagentWorktreeCleaned = (db: DB, sessionId: string): boolean => {
+  const now = Date.now();
+  const result = db
+    .query(
+      `UPDATE subagent_worktrees
+          SET status = 'cleaned',
+              cleaned_at = ?
+        WHERE session_id = ? AND status <> 'cleaned'`,
+    )
+    .run(now, sessionId);
+  return Number(result.changes) > 0;
+};

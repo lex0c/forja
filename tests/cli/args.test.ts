@@ -499,6 +499,42 @@ describe('--subagent-bg-log-dir', () => {
   });
 });
 
+describe('--worktrees', () => {
+  test('captures verb + positionals', () => {
+    const r = parseArgs(['--worktrees', 'gc', '--dry-run']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.worktrees?.verb).toBe('gc');
+    expect(r.args.worktrees?.positionals).toEqual(['--dry-run']);
+  });
+
+  test('list verb takes no positionals', () => {
+    const r = parseArgs(['--worktrees', 'list']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.worktrees?.verb).toBe('list');
+    expect(r.args.worktrees?.positionals).toEqual([]);
+  });
+
+  test('rejects when verb is missing', () => {
+    expect(parseArgs(['--worktrees']).ok).toBe(false);
+  });
+
+  test('rejects unknown verb', () => {
+    expect(parseArgs(['--worktrees', 'sneeze']).ok).toBe(false);
+  });
+
+  test('stops positional collection at top-level flags', () => {
+    // --json is a top-level flag, must NOT be swallowed as a
+    // gc positional. --dry-run / --force ARE gc sub-flags.
+    const r = parseArgs(['--worktrees', 'gc', '--dry-run', '--json']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.worktrees?.positionals).toEqual(['--dry-run']);
+    expect(r.args.json).toBe(true);
+  });
+});
+
 describe('usage', () => {
   test('mentions every recognized flag', () => {
     const u = usage();
