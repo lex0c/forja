@@ -159,6 +159,21 @@ type BatchSlot =
   | { ok: true; outcome: ScanFileOutcome }
   | { ok: false; path: string; error: string };
 
+// Per-DB serialization. Concurrent scans on the same DB
+// connection are unsafe: they share the connection's temporary
+// table (`_scan_seen`), so one scan's CREATE/DROP would knock
+// the other's path-set out from underneath it. The mutex
+// queues calls so they run end-to-end one at a time, even when
+// the caller awaits the same `idx.scan()` from multiple
+// places. Walker-only work (FS reads in walkProject) inside a
+// scan still runs in parallel within that single scan.
+//
+// WeakMap-keyed by DB so closing the DB releases the entry.
+// The stored promise is `.catch`-swallowed so a rejection in
+// scan N doesn't poison scan N+1 — the rejection still
+// propagates to N's caller via `ours`.
+const scanMutexes = new WeakMap<DB, Promise<unknown>>();
+
 // Run a full scan against `projectRoot`. Idempotent — every
 // indexed file is delete-then-inserted, so repeated runs
 // converge on the current FS state. Files that existed in a
@@ -170,7 +185,30 @@ type BatchSlot =
 // Reference resolution is NOT run here (slice 4.3.3); the
 // caller can re-run the scan after that lands without losing
 // data.
+//
+// Concurrent calls on the same DB are serialized via mutex —
+// see `scanMutexes` above.
 export const scanProject = async (db: DB, opts: ScanOptions): Promise<ScanResult> => {
+  const prior = scanMutexes.get(db) ?? Promise.resolve();
+  const ours = (async () => {
+    await prior.catch(() => {
+      // Swallow prior's failure — independent scans don't
+      // share fate. The rejection already propagated to its
+      // own caller; we just need to know prior is done.
+    });
+    return doScan(db, opts);
+  })();
+  // Park the catch-swallowed handle so the next caller's
+  // `await prior` resolves regardless of our outcome. The real
+  // outcome is returned to OUR caller via `ours`.
+  scanMutexes.set(
+    db,
+    ours.catch(() => {}),
+  );
+  return ours;
+};
+
+const doScan = async (db: DB, opts: ScanOptions): Promise<ScanResult> => {
   const files = await walkProject(opts);
   const result: ScanResult = {
     filesScanned: 0,
@@ -190,15 +228,90 @@ export const scanProject = async (db: DB, opts: ScanOptions): Promise<ScanResult
   // Drop-if-exists guards against an interrupted prior scan
   // that left the table behind on this connection (temp tables
   // are connection-scoped and survive across calls until the DB
-  // closes).
-  db.exec('DROP TABLE IF EXISTS _scan_seen');
-  db.exec('CREATE TEMPORARY TABLE _scan_seen (path TEXT PRIMARY KEY)');
+  // closes). CREATE lives inside the try so a throw between
+  // DROP and CREATE leaves the cleanup path intact.
   try {
+    db.exec('DROP TABLE IF EXISTS _scan_seen');
+    db.exec('CREATE TEMPORARY TABLE _scan_seen (path TEXT PRIMARY KEY)');
     withTransaction(db, () => {
       const stmt = db.query('INSERT OR IGNORE INTO _scan_seen (path) VALUES (?)');
       for (const f of files) stmt.run(f.relPath);
     });
-    return await runScan(db, files, indexedAt, opts, result);
+
+    for (let i = 0; i < files.length; i += BATCH_SIZE) {
+      const batch = files.slice(i, i + BATCH_SIZE);
+      // Read + parse + extract for each file in PARALLEL outside
+      // the transaction. Holding the SQLite write lock through
+      // tree-sitter parses for 100 files (potentially ~1-3 s)
+      // would block concurrent readers; doing the heavy work
+      // first lets the transaction be a tight write-only block.
+      const slots: BatchSlot[] = await Promise.all(
+        batch.map(async (entry): Promise<BatchSlot> => {
+          try {
+            return { ok: true, outcome: await scanOneFile(entry, indexedAt) };
+          } catch (e) {
+            return {
+              ok: false,
+              path: entry.relPath,
+              error: e instanceof Error ? e.message : String(e),
+            };
+          }
+        }),
+      );
+
+      withTransaction(db, () => {
+        for (const slot of slots) {
+          if (!slot.ok) {
+            result.errors.push({ path: slot.path, error: slot.error });
+            continue;
+          }
+          const outcome = slot.outcome;
+          // Per-file try/catch isolates malformed rows from
+          // tanking the rest of the batch. SQLite reverts the
+          // failing statement only — the transaction stays open.
+          // Half-written symbol sets are accepted as a worse-than-
+          // perfect state (file row + partial symbols) until
+          // savepoints land; the alternative was rolling back 100
+          // unrelated files for one bad row.
+          try {
+            deleteFileRow(db, outcome.file.path);
+            upsertFile(db, outcome.file);
+            if (outcome.file.parseStatus === 'failed') {
+              result.errors.push({
+                path: outcome.file.path,
+                error: outcome.file.parseError ?? 'parse failed',
+              });
+            } else {
+              insertSymbols(db, outcome.symbols);
+              insertImports(db, outcome.imports);
+              result.symbolsInserted += outcome.symbols.length;
+              result.importsInserted += outcome.imports.length;
+            }
+            if (outcome.partial) result.partials++;
+            result.filesScanned++;
+          } catch (e) {
+            result.errors.push({
+              path: outcome.file.path,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
+        }
+      });
+    }
+
+    // Prune rows for files that existed in a prior scan but
+    // didn't appear in this one (deleted, renamed, moved into
+    // an exclude pattern). FK CASCADE cleans up their
+    // symbols/imports/references.
+    withTransaction(db, () => {
+      db.query('DELETE FROM files WHERE path NOT IN (SELECT path FROM _scan_seen)').run();
+    });
+
+    setMeta(db, 'last_full_scan_at', String(indexedAt));
+    if (opts.configHash !== undefined) {
+      setMeta(db, 'config_hash', opts.configHash);
+    }
+    return result;
   } finally {
     try {
       db.exec('DROP TABLE IF EXISTS _scan_seen');
@@ -207,87 +320,4 @@ export const scanProject = async (db: DB, opts: ScanOptions): Promise<ScanResult
       // the table never got created, swallow.
     }
   }
-};
-
-const runScan = async (
-  db: DB,
-  files: WalkedFile[],
-  indexedAt: number,
-  opts: ScanOptions,
-  result: ScanResult,
-): Promise<ScanResult> => {
-  for (let i = 0; i < files.length; i += BATCH_SIZE) {
-    const batch = files.slice(i, i + BATCH_SIZE);
-    // Read + parse + extract for each file in PARALLEL outside
-    // the transaction. Holding the SQLite write lock through
-    // tree-sitter parses for 100 files (potentially ~1-3 s)
-    // would block concurrent readers; doing the heavy work
-    // first lets the transaction be a tight write-only block.
-    const slots: BatchSlot[] = await Promise.all(
-      batch.map(async (entry): Promise<BatchSlot> => {
-        try {
-          return { ok: true, outcome: await scanOneFile(entry, indexedAt) };
-        } catch (e) {
-          return {
-            ok: false,
-            path: entry.relPath,
-            error: e instanceof Error ? e.message : String(e),
-          };
-        }
-      }),
-    );
-
-    withTransaction(db, () => {
-      for (const slot of slots) {
-        if (!slot.ok) {
-          result.errors.push({ path: slot.path, error: slot.error });
-          continue;
-        }
-        const outcome = slot.outcome;
-        // Per-file try/catch isolates malformed rows from
-        // tanking the rest of the batch. SQLite reverts the
-        // failing statement only — the transaction stays open.
-        // Half-written symbol sets are accepted as a worse-than-
-        // perfect state (file row + partial symbols) until
-        // savepoints land; the alternative was rolling back 100
-        // unrelated files for one bad row.
-        try {
-          deleteFileRow(db, outcome.file.path);
-          upsertFile(db, outcome.file);
-          if (outcome.file.parseStatus === 'failed') {
-            result.errors.push({
-              path: outcome.file.path,
-              error: outcome.file.parseError ?? 'parse failed',
-            });
-          } else {
-            insertSymbols(db, outcome.symbols);
-            insertImports(db, outcome.imports);
-            result.symbolsInserted += outcome.symbols.length;
-            result.importsInserted += outcome.imports.length;
-          }
-          if (outcome.partial) result.partials++;
-          result.filesScanned++;
-        } catch (e) {
-          result.errors.push({
-            path: outcome.file.path,
-            error: e instanceof Error ? e.message : String(e),
-          });
-        }
-      }
-    });
-  }
-
-  // Prune rows for files that existed in a prior scan but
-  // didn't appear in this one (deleted, renamed, moved into an
-  // exclude pattern). FK CASCADE cleans up their
-  // symbols/imports/references.
-  withTransaction(db, () => {
-    db.query('DELETE FROM files WHERE path NOT IN (SELECT path FROM _scan_seen)').run();
-  });
-
-  setMeta(db, 'last_full_scan_at', String(indexedAt));
-  if (opts.configHash !== undefined) {
-    setMeta(db, 'config_hash', opts.configHash);
-  }
-  return result;
 };

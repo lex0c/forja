@@ -264,6 +264,72 @@ describe('CodeIndex.scan', () => {
     idx.close();
   });
 
+  test('empty walk drops every prior row from the index', async () => {
+    // Project starts with files indexed; then everything is
+    // removed (or excluded). The walker returns zero entries,
+    // _scan_seen is empty, and the prune deletes all files
+    // rows. CASCADE wipes symbols/imports too.
+    writeFile(root, 'src/a.ts', 'export function a() {}');
+    writeFile(root, 'src/b.ts', 'export function b() {}');
+    const idx = await CodeIndex.init({ projectRoot: root, dbOverride: openMemoryDb() });
+    await idx.scan({ respectGitignore: false });
+    expect(idx.status().filesIndexed).toBe(2);
+
+    rmSync(join(root, 'src/a.ts'));
+    rmSync(join(root, 'src/b.ts'));
+    await idx.scan({ respectGitignore: false });
+
+    expect(idx.status().filesIndexed).toBe(0);
+    expect(idx.getSymbol('a').length).toBe(0);
+    expect(idx.getSymbol('b').length).toBe(0);
+    idx.close();
+  });
+
+  test('cleans up a leftover `_scan_seen` from an interrupted prior scan', async () => {
+    // Simulate a prior scan that crashed before its finally
+    // block ran: a `_scan_seen` table is left on the connection
+    // with stale rows. The next scan must DROP IF EXISTS and
+    // create a fresh one — otherwise the prior path-set would
+    // poison the prune (e.g., delete files the new scan
+    // legitimately indexed because they weren't in the leftover
+    // set).
+    const db = openMemoryDb();
+    writeFile(root, 'src/keep.ts', 'export const keep = 1;');
+    const idx = await CodeIndex.init({ projectRoot: root, dbOverride: db });
+
+    // Plant a leftover temp table with a bogus path.
+    db.exec('CREATE TEMPORARY TABLE _scan_seen (path TEXT PRIMARY KEY)');
+    db.query('INSERT INTO _scan_seen (path) VALUES (?)').run('src/ghost.ts');
+
+    await idx.scan({ respectGitignore: false });
+
+    expect(idx.fileMeta('src/keep.ts')).not.toBeNull();
+    expect(idx.fileMeta('src/ghost.ts')).toBeNull();
+    expect(idx.status().filesIndexed).toBe(1);
+    idx.close();
+  });
+
+  test('serializes concurrent scans on the same DB', async () => {
+    // Two `scan()` calls awaited in parallel must NOT share
+    // the connection's `_scan_seen` temp table mid-flight. The
+    // mutex queues them so their CREATE/DROP cycles don't
+    // interleave; both should observe the FS state correctly
+    // and end with the same row count.
+    writeFile(root, 'src/a.ts', 'export const a = 1;');
+    writeFile(root, 'src/b.ts', 'export const b = 2;');
+    const idx = await CodeIndex.init({ projectRoot: root, dbOverride: openMemoryDb() });
+    const [r1, r2] = await Promise.all([
+      idx.scan({ respectGitignore: false }),
+      idx.scan({ respectGitignore: false }),
+    ]);
+    expect(r1.filesScanned).toBe(2);
+    expect(r2.filesScanned).toBe(2);
+    expect(idx.status().filesIndexed).toBe(2);
+    expect(idx.getSymbol('a').length).toBe(1);
+    expect(idx.getSymbol('b').length).toBe(1);
+    idx.close();
+  });
+
   test('drops files matching default privacy excludes', async () => {
     writeFile(root, 'src/keep.ts', 'export function keep() {}');
     writeFile(root, 'node_modules/x/index.js', 'export const x = 1;');
