@@ -32,6 +32,7 @@ import {
   getFile,
   getMeta,
   getSymbolById,
+  getSymbolsByFqn,
   getSymbolsByName,
   listDependentsOf,
   listFiles as listFilesRepo,
@@ -148,6 +149,14 @@ export class CodeIndex {
 
   getSymbolById(id: number): IndexSymbol | null {
     return getSymbolById(this.db, id);
+  }
+
+  // Look up by fully-qualified name (the `<file>:Class.method`
+  // shape produced by the extractor). Returns multiple rows for
+  // overload groups (same FQN, different signatures); the tool
+  // surface dedupes those to the implementation.
+  getSymbolByFqn(fqn: string): IndexSymbol[] {
+    return getSymbolsByFqn(this.db, fqn);
   }
 
   listSymbolsInFile(path: string): IndexSymbol[] {

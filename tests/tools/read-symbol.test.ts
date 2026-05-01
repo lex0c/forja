@@ -112,6 +112,60 @@ describe('read_symbol tool', () => {
     expect(r.source).toContain('return 1');
   });
 
+  test('FQN selects a specific method without needing `file:`', async () => {
+    // Two classes in the same file with same-named methods.
+    // FQN lookup pinpoints one without ambiguity. The
+    // extractor emits FQN as `<file>:Class.method`.
+    writeFile(
+      root,
+      'src/two-classes.ts',
+      `
+export class A {
+  start() { return 'A'; }
+}
+export class B {
+  start() { return 'B'; }
+}
+`.trim(),
+    );
+    await idx.scan({ respectGitignore: false });
+    const r = await readSymbolTool.execute(
+      { symbol: 'src/two-classes.ts:B.start' },
+      makeCtx({ codeIndex: idx, cwd: root }),
+    );
+    expect(isToolError(r)).toBe(false);
+    if (isToolError(r)) return;
+    expect(r.symbol.fqn).toBe('src/two-classes.ts:B.start');
+    expect(r.source).toContain("return 'B'");
+  });
+
+  test('FQN with `file:` arg works (file is redundant but tolerated)', async () => {
+    writeFile(root, 'src/extra.ts', 'export function ping() {}');
+    await idx.scan({ respectGitignore: false });
+    const r = await readSymbolTool.execute(
+      { symbol: 'src/extra.ts:ping', file: 'src/extra.ts' },
+      makeCtx({ codeIndex: idx, cwd: root }),
+    );
+    expect(isToolError(r)).toBe(false);
+    if (isToolError(r)) return;
+    expect(r.symbol.name).toBe('ping');
+  });
+
+  test('FQN miss falls through to name-based lookup', async () => {
+    // A bare name with a colon ("type:name" pattern from some
+    // codebases) shouldn't get stuck on the FQN path. If the
+    // FQN lookup returns zero rows, fall through to name. Here
+    // the colon in the input doesn't match any FQN, so we end
+    // up at name lookup which also misses → not_found.
+    const r = await readSymbolTool.execute(
+      { symbol: 'bogus:thing' },
+      makeCtx({ codeIndex: idx, cwd: root }),
+    );
+    expect(isToolError(r)).toBe(true);
+    if (!isToolError(r)) return;
+    expect(r.error_code).toBe('symbol.not_found');
+  });
+
   test('same-name methods in different classes within one file remain ambiguous', async () => {
     // Two classes in the same file, each with a `start` method:
     // file+kind+name match but FQNs differ (`A.start` vs

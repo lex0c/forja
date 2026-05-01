@@ -72,7 +72,7 @@ const sliceSource = (fullSource: string, startLine: number, endLine: number): st
 export const readSymbolTool: Tool<ReadSymbolInput, ReadSymbolOutput> = {
   name: 'read_symbol',
   description:
-    'Read a single symbol (function/class/method/etc.) from the code index — typically 5-20× smaller token footprint than read_file. Pass `file` to disambiguate when the symbol name appears in multiple files.',
+    'Read a single symbol (function/class/method/etc.) from the code index — typically 5-20× smaller token footprint than read_file. `symbol` accepts either a bare name (`login`) or a fully-qualified name (`src/auth.ts:login`, `src/auth.ts:Auth.login`). FQN form pinpoints a method in a specific class without needing `file`.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -118,6 +118,13 @@ export const readSymbolTool: Tool<ReadSymbolInput, ReadSymbolOutput> = {
     // path.relative + ".." rejection is more robust than a
     // string-prefix check (handles trailing slashes, separator
     // normalization, ".." escapes).
+    //
+    // Index file_path values are POSIX-normalized (forward
+    // slashes) regardless of host OS — see walker.ts's
+    // WalkedFile.relPath contract. On Windows `path.relative`
+    // returns backslashes (`src\\foo.ts`), which would never
+    // match the indexed `src/foo.ts`. Normalize separators
+    // before querying. On POSIX this is a no-op.
     let fileFilter = args.file;
     if (fileFilter !== undefined && isAbsolute(fileFilter)) {
       const rel = relative(ctx.codeIndex.projectRoot, resolve(fileFilter));
@@ -125,14 +132,30 @@ export const readSymbolTool: Tool<ReadSymbolInput, ReadSymbolOutput> = {
       // as-is so getSymbol returns empty (→ symbol.not_found).
       // Up-tree (`..`) paths likewise don't match.
       if (!rel.startsWith('..') && !isAbsolute(rel)) {
-        fileFilter = rel;
+        fileFilter = rel.replaceAll('\\', '/');
       }
     }
 
-    let matches: IndexSymbol[] = ctx.codeIndex.getSymbol(
-      args.symbol,
-      fileFilter !== undefined ? { file: fileFilter } : {},
-    );
+    // FQN-first lookup. The extractor encodes FQNs as
+    // `<file>:<rest>` — a leading colon-bearing segment is the
+    // discriminator. When the model passes one we look up by
+    // `symbols.fqn` (idx_symbols_fqn), which pinpoints a
+    // specific method in a specific class without needing a
+    // separate `file:` arg. `file:` is ignored on the FQN path
+    // since FQN already encodes it; if the FQN miss we fall
+    // through to name-based lookup with the file filter
+    // applied.
+    let matches: IndexSymbol[] = [];
+    const looksLikeFqn = args.symbol.includes(':');
+    if (looksLikeFqn) {
+      matches = ctx.codeIndex.getSymbolByFqn(args.symbol);
+    }
+    if (matches.length === 0) {
+      matches = ctx.codeIndex.getSymbol(
+        args.symbol,
+        fileFilter !== undefined ? { file: fileFilter } : {},
+      );
+    }
 
     // TS function overloads emit one IndexSymbol per signature
     // (`function foo(x:A):A; function foo(x:B):B; function foo(x){...}`

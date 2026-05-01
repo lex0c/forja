@@ -227,6 +227,26 @@ export const getSymbolsByName = (
   return rows.map(fromSymbolRow);
 };
 
+// Look up symbols by their fully-qualified name (the
+// `<file>:Class.method` or `<file>:name` shape extract.ts
+// emits). FQN is unique per symbol+overload-group, so overloads
+// of the same function share an FQN and return as N rows; same
+// dedup path the tool surface applies. Backed by
+// `idx_symbols_fqn` (slice 4.3.0 schema), so this is O(log n)
+// with a partial-NULL filter.
+export const getSymbolsByFqn = (db: DB, fqn: string): IndexSymbol[] => {
+  const rows = db
+    .query<SymbolRow, [string]>(
+      `SELECT id, file_path, name, fqn, kind, visibility, signature,
+              start_line, start_col, end_line, end_col, parent_symbol_id
+         FROM symbols
+        WHERE fqn = ?
+        ORDER BY file_path ASC, start_line ASC`,
+    )
+    .all(fqn);
+  return rows.map(fromSymbolRow);
+};
+
 export const getSymbolById = (db: DB, id: number): IndexSymbol | null => {
   const row = db
     .query<SymbolRow, [number]>(
