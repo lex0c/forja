@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { walkProject } from '../../src/code-index/scanner/walker.ts';
+
+const isRoot = process.geteuid?.() === 0;
 
 // Walker contract: lists supported files relative to project
 // root, applying privacy excludes, gitignore (when present),
@@ -24,6 +26,16 @@ describe('walkProject', () => {
   });
 
   afterEach(() => {
+    // Defensive chmod -R 755 in case a test that did
+    // `chmodSync(..., 0o000)` crashed before its own finally
+    // restored the perms. rmSync recursive can't traverse a
+    // 000 dir; without this, the tmpdir would leak.
+    try {
+      spawnSync('chmod', ['-R', '755', root], { encoding: 'utf8' });
+    } catch {
+      // Not all platforms have chmod binary in PATH; rmSync
+      // handles the rest with `force: true`.
+    }
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -194,6 +206,29 @@ describe('walkProject', () => {
     // disappears.ts: listed by git ls-files, lstat fails ENOENT,
     // path lands in seenPaths to preserve any prior index row.
     expect(seenPaths.sort()).toEqual(['src/disappears.ts', 'src/keep.ts']);
+  });
+
+  test('reports unreadable directories in failedDirs (fallback walk)', async () => {
+    if (isRoot) {
+      // chmod 000 doesn't deny root; test is meaningless under root.
+      return;
+    }
+    writeFile(root, 'src/keep.ts', '');
+    writeFile(root, 'src/restricted/secret.ts', '');
+    chmodSync(join(root, 'src/restricted'), 0o000);
+    try {
+      const { files, failedDirs } = await walkProject({
+        projectRoot: root,
+        respectGitignore: false,
+      });
+      // Files under the unreadable dir don't appear (we couldn't
+      // list them) but failedDirs records the prefix so the
+      // pipeline can preserve any prior index rows under it.
+      expect(files.map((f) => f.relPath)).toEqual(['src/keep.ts']);
+      expect(failedDirs).toEqual(['src/restricted']);
+    } finally {
+      chmodSync(join(root, 'src/restricted'), 0o755);
+    }
   });
 
   test('populates mtimeMs from filesystem stat', async () => {

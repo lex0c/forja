@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodeIndex } from '../../src/code-index/index.ts';
@@ -16,6 +16,8 @@ const writeFile = (root: string, rel: string, content: string): void => {
   writeFileSync(abs, content);
 };
 
+const isRoot = process.geteuid?.() === 0;
+
 describe('CodeIndex.scan', () => {
   let root: string;
 
@@ -24,6 +26,16 @@ describe('CodeIndex.scan', () => {
   });
 
   afterEach(() => {
+    // Defensive chmod -R 755 in case a test that did
+    // `chmodSync(..., 0o000)` crashed before its own finally
+    // restored the perms. rmSync recursive can't traverse a
+    // 000 dir; without this, the tmpdir would leak.
+    try {
+      spawnSync('chmod', ['-R', '755', root], { encoding: 'utf8' });
+    } catch {
+      // Not all platforms have chmod binary in PATH; rmSync
+      // handles the rest with `force: true`.
+    }
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -403,6 +415,81 @@ describe('CodeIndex.scan', () => {
     expect(idx.fileMeta('src/gone.ts')).toBeNull(); // pruned
     expect(idx.getSymbol('flaky').length).toBe(1);
     expect(idx.getSymbol('gone').length).toBe(0);
+    idx.close();
+  });
+
+  test('preserves rows under a transiently unreadable directory subtree', async () => {
+    // End-to-end version of the walker's failedDirs contract.
+    // First scan indexes files under src/restricted/. Then
+    // chmod 000 on the directory blocks the second scan's
+    // fallback-walk readdir; the pipeline must use failedDirs
+    // to preserve those prior rows instead of letting the
+    // prune delete them as "missing".
+    if (isRoot) {
+      return; // chmod 000 doesn't deny root
+    }
+    writeFile(root, 'src/keep.ts', 'export const keep = 1;');
+    writeFile(root, 'src/restricted/secret.ts', 'export const secret = 2;');
+    writeFile(root, 'src/restricted/inner/deep.ts', 'export const deep = 3;');
+
+    const idx = await CodeIndex.init({ projectRoot: root, dbOverride: openMemoryDb() });
+    await idx.scan({ respectGitignore: false });
+    expect(idx.fileMeta('src/restricted/secret.ts')).not.toBeNull();
+    expect(idx.fileMeta('src/restricted/inner/deep.ts')).not.toBeNull();
+
+    chmodSync(join(root, 'src/restricted'), 0o000);
+    try {
+      await idx.scan({ respectGitignore: false });
+
+      // All rows under src/restricted/ preserved despite the
+      // readdir failure. keep.ts re-indexed normally.
+      expect(idx.fileMeta('src/restricted/secret.ts')).not.toBeNull();
+      expect(idx.fileMeta('src/restricted/inner/deep.ts')).not.toBeNull();
+      expect(idx.fileMeta('src/keep.ts')).not.toBeNull();
+      expect(idx.getSymbol('secret').length).toBe(1);
+      expect(idx.getSymbol('deep').length).toBe(1);
+    } finally {
+      chmodSync(join(root, 'src/restricted'), 0o755);
+    }
+    idx.close();
+  });
+
+  test('recovers cleanly when an unreadable directory regains read perms', async () => {
+    // Lifecycle: scan A indexes everything → chmod 000 →
+    // scan B preserves rows under the unreadable subtree →
+    // chmod 755 + delete one file → scan C re-indexes the
+    // subtree, prunes the deleted file, leaves the rest.
+    // Pins that "preserve" doesn't poison the recovery path.
+    if (isRoot) {
+      return;
+    }
+    writeFile(root, 'src/keep.ts', 'export const keep = 1;');
+    writeFile(root, 'src/restricted/secret.ts', 'export const secret = 2;');
+    writeFile(root, 'src/restricted/extra.ts', 'export const extra = 3;');
+
+    const idx = await CodeIndex.init({ projectRoot: root, dbOverride: openMemoryDb() });
+    await idx.scan({ respectGitignore: false });
+
+    chmodSync(join(root, 'src/restricted'), 0o000);
+    try {
+      await idx.scan({ respectGitignore: false }); // preserve cycle
+      expect(idx.fileMeta('src/restricted/secret.ts')).not.toBeNull();
+      expect(idx.fileMeta('src/restricted/extra.ts')).not.toBeNull();
+    } finally {
+      chmodSync(join(root, 'src/restricted'), 0o755);
+    }
+
+    // Recovery: now readable. Remove `extra.ts` to prove the
+    // recovery scan distinguishes preserved-from-prior vs
+    // legitimately-deleted.
+    rmSync(join(root, 'src/restricted/extra.ts'));
+    await idx.scan({ respectGitignore: false });
+
+    expect(idx.fileMeta('src/keep.ts')).not.toBeNull();
+    expect(idx.fileMeta('src/restricted/secret.ts')).not.toBeNull();
+    expect(idx.fileMeta('src/restricted/extra.ts')).toBeNull(); // pruned
+    expect(idx.getSymbol('secret').length).toBe(1);
+    expect(idx.getSymbol('extra').length).toBe(0);
     idx.close();
   });
 

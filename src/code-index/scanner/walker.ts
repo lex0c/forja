@@ -75,6 +75,16 @@ export interface WalkResult {
   // set: they're intentional drops that the prune SHOULD
   // resolve into deleting any leftover row.
   seenPaths: string[];
+  // Project-relative directory paths that the fallback walk
+  // could not enumerate (readdir threw EACCES, ENOENT race,
+  // network FS hiccup). Same hazard class as failed lstat at
+  // the file level, but at the directory level we can't list
+  // the children to add them to seenPaths individually — the
+  // pipeline expands these into preserved subtree prefixes
+  // against the existing files table. Empty when git ls-files
+  // was used (the git path either succeeds wholesale or falls
+  // through to the fallback walk).
+  failedDirs: string[];
 }
 
 // Names whose subtrees never produce an indexable file under
@@ -138,7 +148,16 @@ export const walkProject = async (opts: WalkOptions): Promise<WalkResult> => {
   };
 
   const candidates = respectGitignore ? gitListFiles(projectRoot) : null;
-  const relPaths = candidates !== null ? candidates : await fallbackWalk(projectRoot);
+  let relPaths: string[];
+  let failedDirs: string[];
+  if (candidates !== null) {
+    relPaths = candidates;
+    failedDirs = [];
+  } else {
+    const fb = await fallbackWalk(projectRoot);
+    relPaths = fb.paths;
+    failedDirs = fb.failedDirs;
+  }
 
   // Pre-filter (cheap, in-memory) before stat — drops paths via
   // exclude pattern + extension check before paying for I/O.
@@ -202,7 +221,7 @@ export const walkProject = async (opts: WalkOptions): Promise<WalkResult> => {
       language: entry.language,
     });
   }
-  return { files: results, seenPaths };
+  return { files: results, seenPaths, failedDirs };
 };
 
 // Run `git ls-files --cached --others --exclude-standard -z`
@@ -234,8 +253,18 @@ const gitListFiles = (cwd: string): string[] | null => {
 // loop; here we only short-circuit the descent for well-known
 // noise dirs, since their subtrees can be massive
 // (node_modules in a typical JS project = 50k-200k files).
-const fallbackWalk = async (root: string): Promise<string[]> => {
+//
+// readdir failures on non-root directories are reported via
+// `failedDirs` so the pipeline can preserve any prior index
+// rows under that subtree — silently dropping would let a
+// transient EACCES/ENOENT delete a whole subtree from the
+// index. A failure on the root itself throws, since pre-flight
+// stat already validated the root and a follow-up readdir
+// error indicates a race we can't recover from without losing
+// data.
+const fallbackWalk = async (root: string): Promise<{ paths: string[]; failedDirs: string[] }> => {
   const out: string[] = [];
+  const failedDirs: string[] = [];
   const stack: string[] = [''];
   while (stack.length > 0) {
     const dir = stack.pop();
@@ -244,7 +273,18 @@ const fallbackWalk = async (root: string): Promise<string[]> => {
     let entries: Dirent[];
     try {
       entries = await readdir(abs, { withFileTypes: true });
-    } catch {
+    } catch (e) {
+      if (dir === '') {
+        // Pre-flight stat passed but readdir failed — race with
+        // permissions change / FS unmount mid-walk. Treat as
+        // catastrophic: throwing matches walkProject's pre-flight
+        // contract (root failures don't masquerade as empty walks).
+        throw new Error(
+          `walkProject: failed to enumerate project root: ${e instanceof Error ? e.message : String(e)}`,
+          { cause: e },
+        );
+      }
+      failedDirs.push(dir);
       continue;
     }
     for (const e of entries) {
@@ -261,5 +301,5 @@ const fallbackWalk = async (root: string): Promise<string[]> => {
       // in a code index.
     }
   }
-  return out;
+  return { paths: out, failedDirs };
 };

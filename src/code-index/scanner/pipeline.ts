@@ -209,7 +209,7 @@ export const scanProject = async (db: DB, opts: ScanOptions): Promise<ScanResult
 };
 
 const doScan = async (db: DB, opts: ScanOptions): Promise<ScanResult> => {
-  const { files, seenPaths } = await walkProject(opts);
+  const { files, seenPaths, failedDirs } = await walkProject(opts);
   const result: ScanResult = {
     filesScanned: 0,
     symbolsInserted: 0,
@@ -240,6 +240,25 @@ const doScan = async (db: DB, opts: ScanOptions): Promise<ScanResult> => {
       // let the prune delete rows for transiently unreachable
       // paths.
       for (const p of seenPaths) stmt.run(p);
+
+      // For each directory the walker couldn't enumerate,
+      // promote every prior `files` row under that subtree into
+      // _scan_seen so the prune doesn't treat the whole subtree
+      // as deleted. Plain prefix matching via substr — no LIKE
+      // wildcards in the path, so no need to escape `%`/`_` in
+      // directory names. `length(?)` runs in SQLite over the
+      // TEXT (Unicode chars), matching `substr`'s view; doing
+      // `prefix.length` in JS would mismatch on non-BMP chars
+      // (UTF-16 surrogate pairs count as 2 code units in JS but
+      // 1 character in SQLite).
+      const subtreeStmt = db.query(
+        `INSERT OR IGNORE INTO _scan_seen (path)
+           SELECT path FROM files WHERE substr(path, 1, length(?)) = ?`,
+      );
+      for (const dir of failedDirs) {
+        const prefix = `${dir}/`;
+        subtreeStmt.run(prefix, prefix);
+      }
     });
 
     for (let i = 0; i < files.length; i += BATCH_SIZE) {
