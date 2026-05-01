@@ -22,6 +22,7 @@ import {
   setMeta,
   upsertFile,
 } from '../repo.ts';
+import { resolveImports } from '../resolver.ts';
 import type { FileMeta, FileParseStatus, Import, IndexSymbol } from '../types.ts';
 import { extractFromSource } from './extract.ts';
 import { parseSource } from './parser.ts';
@@ -328,6 +329,15 @@ const doScan = async (db: DB, opts: ScanOptions): Promise<ScanResult> => {
     // symbols/imports/references.
     withTransaction(db, () => {
       db.query('DELETE FROM files WHERE path NOT IN (SELECT path FROM _scan_seen)').run();
+    });
+
+    // Second pass — link `imports.target_path` to concrete
+    // file rows (CODE_INDEX.md §3.1 step 4). Idempotent: only
+    // unresolved rows are touched, so re-running over an
+    // already-resolved DB is a no-op. Reference resolution
+    // lands in slice 4.3.3.b.
+    withTransaction(db, () => {
+      resolveImports(db);
     });
 
     setMeta(db, 'last_full_scan_at', String(indexedAt));
