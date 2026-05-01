@@ -163,7 +163,7 @@ describe('walkProject', () => {
     // failure. seenPaths must NOT preserve such paths;
     // otherwise the pipeline's prune would keep the row alive
     // until a future commit, masking normal edit/delete flows.
-    if (isRoot) return;
+    // Runs as any user — rm semantics don't depend on perms.
     spawnSync('git', ['init', '-q', root], { encoding: 'utf8' });
     spawnSync('git', ['-C', root, 'config', 'user.email', 'test@example.com'], {
       encoding: 'utf8',
@@ -181,6 +181,34 @@ describe('walkProject', () => {
     });
     expect(files.map((f) => f.relPath)).toEqual(['src/keep.ts']);
     // ENOENT → drop, not preserve. Only keep.ts in seenPaths.
+    expect(seenPaths).toEqual(['src/keep.ts']);
+  });
+
+  test('drops ENOTDIR paths from seenPaths (parent replaced by a file)', async () => {
+    // Rare but real: operator removes a directory and creates a
+    // regular file with the same name (`rm -rf src/sub && touch src/sub`).
+    // git ls-files still lists `src/sub/file.ts` (cached); lstat
+    // on that path fails ENOTDIR (parent component is no longer
+    // a directory). Treat as a definitive deletion just like
+    // ENOENT — the path is structurally invalid.
+    spawnSync('git', ['init', '-q', root], { encoding: 'utf8' });
+    spawnSync('git', ['-C', root, 'config', 'user.email', 'test@example.com'], {
+      encoding: 'utf8',
+    });
+    spawnSync('git', ['-C', root, 'config', 'user.name', 'test'], { encoding: 'utf8' });
+    writeFile(root, 'src/keep.ts', 'export const keep = 1;');
+    writeFile(root, 'sub/file.ts', 'export const x = 2;');
+    spawnSync('git', ['-C', root, 'add', '.'], { encoding: 'utf8' });
+    spawnSync('git', ['-C', root, 'commit', '-q', '-m', 'init'], { encoding: 'utf8' });
+    rmSync(join(root, 'sub'), { recursive: true, force: true });
+    writeFileSync(join(root, 'sub'), '# now a regular file, not a directory');
+
+    const { files, seenPaths } = await walkProject({
+      projectRoot: root,
+      respectGitignore: true,
+    });
+    expect(files.map((f) => f.relPath)).toEqual(['src/keep.ts']);
+    // sub/file.ts: lstat → ENOTDIR → drop (not preserve).
     expect(seenPaths).toEqual(['src/keep.ts']);
   });
 

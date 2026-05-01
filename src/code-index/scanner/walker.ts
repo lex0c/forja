@@ -181,13 +181,19 @@ export const walkProject = async (opts: WalkOptions): Promise<WalkResult> => {
   //   - 'preserve' → transient failure (EACCES, EBUSY,
   //                   ETIMEDOUT…); file may exist, keep prior
   //                   row alive
-  //   - 'drop'     → ENOENT; file definitively gone, let the
-  //                   prune remove the prior row
+  //   - 'drop'     → file definitively gone (ENOENT) or its
+  //                   path is no longer valid (ENOTDIR — a
+  //                   parent component is now a file). Let the
+  //                   prune remove the prior row.
   // Without the ENOENT distinction we'd indefinitely keep
   // working-tree-removed-but-still-tracked files queryable
   // (git ls-files surfaces them after `rm src/x.ts`; their
-  // lstat fails ENOENT). Treating that as transient would mask
-  // a normal edit/delete workflow.
+  // lstat fails ENOENT). ENOTDIR covers the rare but real
+  // case where a parent dir was atomically replaced by a file
+  // of the same name (`rm -rf src && touch src`).
+  // EACCES / EBUSY / ETIMEDOUT and other transient errors hit
+  // the 'preserve' branch — the file may still exist, the
+  // operator just can't reach it right now.
   type StatSlot =
     | { entry: (typeof eligible)[number]; stat: Stats; outcome: 'ok' }
     | { entry: (typeof eligible)[number]; outcome: 'preserve' }
@@ -197,8 +203,14 @@ export const walkProject = async (opts: WalkOptions): Promise<WalkResult> => {
       try {
         return { entry: e, stat: await lstat(e.absPath), outcome: 'ok' };
       } catch (err) {
-        const code = (err as { code?: unknown }).code;
-        return code === 'ENOENT'
+        // Defensive narrowing — fs.lstat throws SystemError
+        // (Error with `.code`) in practice, but a foreign throw
+        // (string, null) would crash a naive `.code` access.
+        const code =
+          err !== null && typeof err === 'object' && 'code' in err
+            ? (err as { code: unknown }).code
+            : undefined;
+        return code === 'ENOENT' || code === 'ENOTDIR'
           ? { entry: e, outcome: 'drop' }
           : { entry: e, outcome: 'preserve' };
       }
