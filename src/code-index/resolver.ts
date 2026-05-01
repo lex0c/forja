@@ -92,11 +92,12 @@ const joinAndNormalize = (sourceDir: string, target: string): string | null => {
   return normalized.join('/');
 };
 
-// Try every supported extension + the index-style fallback
-// `<module>/index.<ext>`. The index-style entry mirrors how
-// Node, bundlers, and TypeScript resolve a directory import to
-// `index.ts` / `index.js`. Returns the first hit found in
-// `allPaths`, in the order `RESOLUTION_EXTENSIONS` declares.
+// Try the bare path first (covers explicit-extension imports
+// like `'./auth.ts'` — common in ESM / Bun-style codebases),
+// then every supported extension appended (extensionless
+// imports like `'./auth'` — common in tsc/Node), then the
+// `<module>/index.<ext>` directory fallback. Returns the
+// first hit found in `allPaths`.
 const resolveModuleToPath = (
   allPaths: Set<string>,
   sourceFile: string,
@@ -110,16 +111,31 @@ const resolveModuleToPath = (
   const baseStr = joinAndNormalize(sourceDir, targetModule);
   if (baseStr === null) return null;
 
-  // Direct hits: `<base><ext>`.
-  for (const ext of RESOLUTION_EXTENSIONS) {
-    const candidate = baseStr + ext;
-    const hit = tryResolveCandidate(allPaths, candidate);
-    if (hit !== null) return hit;
+  // 1. Bare path — covers `'./auth.ts'` where the extension
+  //    is already part of target_module. Tested before the
+  //    extension-append loop because for those inputs, the
+  //    appended candidates would be wrong (`'./auth.ts.ts'`).
+  const direct = tryResolveCandidate(allPaths, baseStr);
+  if (direct !== null) return direct;
+
+  // 2. Extensionless target — append each candidate extension.
+  //    Skip when target already ends in one of our extensions
+  //    (would just retry hits we already missed in step 1).
+  const alreadyHasExt = RESOLUTION_EXTENSIONS.some((ext) => baseStr.endsWith(ext));
+  if (!alreadyHasExt) {
+    for (const ext of RESOLUTION_EXTENSIONS) {
+      const candidate = baseStr + ext;
+      const hit = tryResolveCandidate(allPaths, candidate);
+      if (hit !== null) return hit;
+    }
   }
-  // Index-style: `<base>/index<ext>`. Skip when base is empty
-  // (would resolve to `/index.ts` — never matches a relative
-  // file_path).
-  if (baseStr.length > 0) {
+
+  // 3. Directory-style: `<base>/index<ext>`. Same alreadyHasExt
+  //    skip — `'./util.ts'` shouldn't resolve to
+  //    `'./util.ts/index.ts'`. Skip when base is empty (would
+  //    resolve to `/index.ts` — never matches a relative
+  //    file_path).
+  if (baseStr.length > 0 && !alreadyHasExt) {
     for (const ext of RESOLUTION_EXTENSIONS) {
       const candidate = `${baseStr}/index${ext}`;
       const hit = tryResolveCandidate(allPaths, candidate);

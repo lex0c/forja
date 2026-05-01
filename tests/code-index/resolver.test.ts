@@ -31,6 +31,27 @@ describe('resolveImports', () => {
     rmSync(root, { recursive: true, force: true });
   });
 
+  test('resolves explicit-extension imports (./foo.ts) directly', async () => {
+    // Bun/ESM-style codebases often write the extension into
+    // the import string: `import { x } from './foo.ts'`. The
+    // resolver tried APPENDING extensions before, so it would
+    // attempt `./foo.ts.ts` and miss. Pin the bare-path-first
+    // resolution so this canonical pattern works.
+    writeFile(root, 'src/util.ts', 'export const v = 1;');
+    writeFile(root, 'src/page.ts', `import { v } from "./util.ts";`);
+    await idx.scan({ respectGitignore: false });
+    const imports = idx.importsOf('src/page.ts');
+    expect(imports[0]?.targetPath).toBe('src/util.ts');
+  });
+
+  test('resolves explicit-extension imports up-tree (../shared.ts)', async () => {
+    writeFile(root, 'src/a/feature.ts', 'import { shared } from "../shared.ts";');
+    writeFile(root, 'src/shared.ts', 'export const shared = 1;');
+    await idx.scan({ respectGitignore: false });
+    const imports = idx.importsOf('src/a/feature.ts');
+    expect(imports[0]?.targetPath).toBe('src/shared.ts');
+  });
+
   test('resolves a relative import to a sibling .ts file', async () => {
     writeFile(root, 'src/auth.ts', 'import { Token } from "./types";');
     writeFile(root, 'src/types.ts', 'export type Token = string;');

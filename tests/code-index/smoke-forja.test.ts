@@ -64,6 +64,18 @@ describe('smoke: scan the Forja repo', () => {
       // common name.
       expect(result.referencesInserted).toBeGreaterThan(50);
       expect(result.referencesResolved).toBeGreaterThan(0);
+      // Imports resolution: pin that the explicit-extension
+      // imports common in this repo (./auth.ts, ../foo.ts)
+      // resolve correctly. Pre-fix the resolver would always
+      // append an extension and miss every one of these,
+      // leaving target_path null and dependents_of empty for
+      // every Forja file. Smoke surfaces the regression.
+      expect(result.importsResolved).toBeGreaterThan(0);
+      // dependents_of works against a real, frequently-imported
+      // file. types.ts is imported by most code-index modules;
+      // a non-zero result confirms target_path got populated.
+      const dependents = idx.dependentsOf('src/code-index/types.ts');
+      expect(dependents.length).toBeGreaterThan(0);
       // `walkProject` is the one canonical symbol we expect to
       // be resolved — name is unique in the codebase. A regression
       // in the resolver pipeline would flip this to 0.
