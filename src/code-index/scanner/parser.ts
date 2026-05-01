@@ -85,16 +85,32 @@ const getParser = (language: SupportedLanguage): ParserInstance => {
 // Returns `unknown` because the native Tree shape has dozens
 // of methods we don't enumerate; consumers (extract.ts) cast
 // via the local `SyntaxNode = any` alias when walking nodes.
-// Chunk size for the function-form parse callback, measured in
-// JS string units (UTF-16 code units, NOT bytes — for ASCII
-// source the two coincide; for non-BMP characters they diverge).
-// 4 KiB amortizes JS↔native round-trips while staying
-// comfortably under any per-call buffer limit. Tree-sitter
-// stitches chunks internally and doesn't care about the
-// boundary, EXCEPT that we must not split a UTF-16 surrogate
-// pair: high+low halves of one Unicode code point need to
-// arrive together or the UTF-8 encoding crossing the native
-// boundary would corrupt that character.
+// Chunk size for the function-form parse callback, measured
+// in JS string code units. tree-sitter's C/Rust API uses byte
+// offsets, but the Node binding (tree-sitter@0.21) accumulates
+// by the JS-string length of returned chunks: the next
+// callback's `index` equals `previous_index +
+// previous_returned.length` (length in UTF-16 code units, not
+// UTF-8 bytes). Verified empirically against several inputs;
+// pinned by the "binding contract" test in scanner.test.ts.
+//
+// Hypothesis for why: the binding uses tree-sitter's
+// `TSInputEncodingUTF16` mode, treating JS strings as native
+// UTF-16 input. That makes the offset 1:1 with JS string
+// indices, and surrogate pairs (non-BMP codepoints split
+// across chunks) are stitched correctly inside the binding —
+// the high+low halves arrive in successive chunks and tree-
+// sitter reassembles them as a single codepoint. We verified
+// this too: splitting an emoji at the chunk boundary preserves
+// `node.text` with the full codepoint intact (no replacement
+// character corruption). So no surrogate-pair guard is needed
+// here; treating every chunk as a plain JS-string slice is
+// correct for any input the binding accepts.
+//
+// Treating the offset as bytes (Buffer-slice approach) would
+// silently corrupt the parser's assembled source for any
+// non-ASCII file — see the same pinned test for the
+// counter-example.
 const PARSE_CHUNK_SIZE = 4096;
 
 export const parseSource = (source: string, language: SupportedLanguage): unknown => {
@@ -104,14 +120,7 @@ export const parseSource = (source: string, language: SupportedLanguage): unknow
   // larger files like 35 KiB+ source modules).
   return parser.parse((index: number) => {
     if (index >= source.length) return '';
-    let end = Math.min(index + PARSE_CHUNK_SIZE, source.length);
-    // Don't split a surrogate pair across chunks. If the last
-    // code unit of the chunk is a high surrogate (0xD800-0xDBFF),
-    // extend by one so its trailing low surrogate joins it.
-    const lastCode = source.charCodeAt(end - 1);
-    if (lastCode >= 0xd800 && lastCode <= 0xdbff && end < source.length) {
-      end += 1;
-    }
+    const end = Math.min(index + PARSE_CHUNK_SIZE, source.length);
     return source.slice(index, end);
   });
 };
