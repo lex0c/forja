@@ -82,6 +82,12 @@ describe('runCodeIndexCli', () => {
       errors: 0,
       partials: 0,
     });
+    // Resolver counts surface in the summary so CI / scripts
+    // can pin them. References for a single function with no
+    // body calls is 0; imports likewise.
+    expect(typeof obj.references_inserted).toBe('number');
+    expect(typeof obj.imports_resolved).toBe('number');
+    expect(typeof obj.references_resolved).toBe('number');
     expect(typeof obj.duration_ms).toBe('number');
   });
 

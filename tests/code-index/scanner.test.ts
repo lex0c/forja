@@ -615,6 +615,66 @@ describe('extractFromSource — invalid syntax', () => {
   });
 });
 
+describe('extractFromSource — call references', () => {
+  test('emits a call reference for each call_expression', () => {
+    const src = `
+      function helper() { return 1; }
+      export function main() {
+        helper();
+        helper();
+      }
+    `;
+    const { references } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    const calls = references.filter((r) => r.refKind === 'call');
+    // Two `helper()` calls inside main's body.
+    const helperCalls = calls.filter((r) => r.targetSymbolName === 'helper');
+    expect(helperCalls.length).toBe(2);
+  });
+
+  test('member call extracts the property name', () => {
+    const src = `
+      export function run(svc: { start(): void }) {
+        svc.start();
+      }
+    `;
+    const { references } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    expect(references.find((r) => r.targetSymbolName === 'start')).toMatchObject({
+      refKind: 'call',
+    });
+  });
+
+  test('require() does not double-count as call ref + import', () => {
+    // require captures match BOTH @ref.call AND @import.require;
+    // the extractor de-dupes by skipping calls whose function
+    // is the identifier `require`. Net effect: one import row,
+    // zero references for the require call itself.
+    const src = `const fs = require('fs');`;
+    const { references, imports } = extractFromSource(src, 'javascript', 'src/x.js', parseSource);
+    expect(imports.length).toBe(1);
+    expect(references.find((r) => r.targetSymbolName === 'require')).toBeUndefined();
+  });
+
+  test('skips computed / IIFE / call-result calls (no static name)', () => {
+    const src = `
+      function exec(fn: () => void) { fn(); }
+      const k = 'foo';
+      const obj: { [k: string]: () => void } = {};
+      obj[k]();      // computed call
+      (() => {})();  // IIFE
+    `;
+    const { references } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    // The only resolvable name here is 'fn' inside exec's body.
+    // Neither obj[k]() nor (() => {})() yields a static target
+    // name; both are dropped silently.
+    const calls = references.filter((r) => r.refKind === 'call');
+    expect(calls.find((r) => r.targetSymbolName === 'fn')).toBeDefined();
+    // No 'obj' or 'k' references emitted (those aren't function
+    // names; they're parts of a computed call expression).
+    // Importantly, no row with empty name.
+    expect(calls.every((r) => r.targetSymbolName.length > 0)).toBe(true);
+  });
+});
+
 describe('non-ASCII source support', () => {
   test('extracts symbols from sources with non-ASCII identifiers and comments', () => {
     // Real-world i18n / multilingual codebases mix UTF-8 across

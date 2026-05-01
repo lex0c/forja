@@ -104,6 +104,9 @@ const writeScanJson = (result: ScanResult, durationMs: number, out: (s: string) 
       files_scanned: result.filesScanned,
       symbols_inserted: result.symbolsInserted,
       imports_inserted: result.importsInserted,
+      references_inserted: result.referencesInserted,
+      imports_resolved: result.importsResolved,
+      references_resolved: result.referencesResolved,
       partials: result.partials,
       errors: result.errors.length,
       duration_ms: durationMs,
@@ -124,7 +127,9 @@ const writeScanTable = (
 ): void => {
   out(
     `Scanned ${result.filesScanned} files in ${durationMs} ms — ` +
-      `${result.symbolsInserted} symbols, ${result.importsInserted} imports, ` +
+      `${result.symbolsInserted} symbols, ` +
+      `${result.importsInserted} imports (${result.importsResolved} resolved), ` +
+      `${result.referencesInserted} refs (${result.referencesResolved} resolved), ` +
       `${result.partials} partial, ${result.errors.length} failed.\n`,
   );
   // Per-file errors go to stderr so a `--json`-equivalent

@@ -161,3 +161,142 @@ describe('resolveImports', () => {
     expect(dependents.sort()).toEqual(['src/login.ts', 'src/logout.ts']);
   });
 });
+
+describe('resolveReferences', () => {
+  let root: string;
+  let idx: CodeIndex;
+
+  beforeEach(async () => {
+    root = mkdtempSync(join(tmpdir(), 'forja-resolverefs-'));
+    idx = await CodeIndex.init({ projectRoot: root, dbOverride: openMemoryDb() });
+  });
+
+  afterEach(() => {
+    idx.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test('binds a reference to a globally-unique symbol name', async () => {
+    writeFile(
+      root,
+      'src/auth.ts',
+      `
+export function login() { return true; }
+export function start() {
+  login();
+}
+      `.trim(),
+    );
+    await idx.scan({ respectGitignore: false });
+    const login = idx.getSymbol('login');
+    expect(login.length).toBe(1);
+    const refs = idx.findReferences(login[0]?.id ?? -1);
+    expect(refs.length).toBeGreaterThan(0);
+    expect(refs[0]?.targetSymbolName).toBe('login');
+    expect(refs[0]?.targetSymbolId).toBe(login[0]?.id ?? null);
+  });
+
+  test('leaves ambiguous-name references unresolved', async () => {
+    // Same name in two classes → two FQNs → ambiguous; resolver
+    // skips. find_references_by_name still works (string match).
+    writeFile(
+      root,
+      'src/svc.ts',
+      `
+export class A {
+  start() { return 'A'; }
+}
+export class B {
+  start() { return 'B'; }
+}
+export function run(a: A, b: B) {
+  a.start();
+  b.start();
+}
+      `.trim(),
+    );
+    await idx.scan({ respectGitignore: false });
+    // start references — resolver bound 0 because two FQNs exist.
+    const byName = idx.findReferencesByName('start');
+    expect(byName.length).toBe(2);
+    expect(byName.every((r) => r.targetSymbolId === null)).toBe(true);
+  });
+
+  test('overload group with single FQN resolves to the implementation', async () => {
+    // `function poly` × N signatures + impl all share FQN
+    // `<file>:poly`. Resolver picks the impl (largest span).
+    writeFile(
+      root,
+      'src/over.ts',
+      `
+export function poly(x: string): string;
+export function poly(x: number): number;
+export function poly(x: string | number): string | number {
+  return x;
+}
+export function caller() {
+  poly('x');
+}
+      `.trim(),
+    );
+    await idx.scan({ respectGitignore: false });
+    const byName = idx.findReferencesByName('poly');
+    expect(byName.length).toBe(1);
+    // Resolver bound it to the impl.
+    expect(byName[0]?.targetSymbolId).not.toBeNull();
+  });
+
+  test('binds a cross-file reference (caller and callee in different files)', async () => {
+    // The canonical use case: caller in one file, callee in
+    // another. Reference resolution must walk the global symbol
+    // set, not just the file's own symbols.
+    writeFile(root, 'src/auth.ts', 'export function login() { return true; }');
+    writeFile(
+      root,
+      'src/page.ts',
+      `
+import { login } from './auth';
+export function bootstrap() {
+  login();
+}
+      `.trim(),
+    );
+    await idx.scan({ respectGitignore: false });
+    const login = idx.getSymbol('login');
+    expect(login.length).toBe(1);
+    expect(login[0]?.filePath).toBe('src/auth.ts');
+    const refs = idx.findReferences(login[0]?.id ?? -1);
+    // The call site is in src/page.ts, but the bound symbol is
+    // in src/auth.ts.
+    expect(refs.length).toBeGreaterThan(0);
+    expect(refs[0]?.sourceFile).toBe('src/page.ts');
+    expect(refs[0]?.targetSymbolId).toBe(login[0]?.id ?? null);
+  });
+
+  test('idempotent across re-scans (already-resolved refs untouched)', async () => {
+    writeFile(
+      root,
+      'src/x.ts',
+      `
+export function ping() {}
+export function caller() { ping(); }
+      `.trim(),
+    );
+    await idx.scan({ respectGitignore: false });
+    const ping = idx.getSymbol('ping');
+    const refsFirst = idx.findReferences(ping[0]?.id ?? -1);
+    expect(refsFirst.length).toBe(1);
+    await idx.scan({ respectGitignore: false });
+    const ping2 = idx.getSymbol('ping');
+    const refsSecond = idx.findReferences(ping2[0]?.id ?? -1);
+    expect(refsSecond.length).toBe(1);
+  });
+
+  test('zero candidates results in zero resolved (empty DB no-op)', async () => {
+    // Empty project — no symbols, no references. resolveReferences
+    // should return cleanly without touching tables.
+    const result = await idx.scan({ respectGitignore: false });
+    expect(result.referencesResolved).toBe(0);
+    expect(result.referencesInserted).toBe(0);
+  });
+});

@@ -1,15 +1,16 @@
 // Second-pass resolution after the scan inserts file/symbol/
 // import rows. CODE_INDEX.md §3.1 step 4: with all the row data
 // in place, link `imports.target_path` to a concrete project
-// file (when local) and `references_.target_symbol_id` to a
-// symbol id (when the name resolves uniquely). Reference
-// resolution lands in slice 4.3.3.b; this module ships
-// `resolveImports` for slice 4.3.3.a.
+// file (when local — `resolveImports`) AND
+// `references_.target_symbol_id` to a symbol id (when the name
+// resolves uniquely — `resolveReferences`). Both ship together
+// after slice 4.3.3.b; the pipeline runs them in the same
+// transaction at the end of every scan.
 //
 // Idempotent: every call filters on `target_path IS NULL`
-// (or `target_symbol_id IS NULL` later) so re-running over an
-// already-resolved DB is a no-op. Pipeline calls this after
-// every scan.
+// (resolveImports) or `target_symbol_id IS NULL`
+// (resolveReferences) so re-running over an already-resolved DB
+// is a no-op.
 //
 // Known limitations (deferred to a polish slice):
 //   - tsconfig `paths` / module aliases (`@/lib/foo`) NOT
@@ -25,6 +26,13 @@
 //     test in resolver.test.ts. A future fix should either
 //     mark `/`-prefix as external in extract.ts or anchor the
 //     resolver at projectRoot for it.
+//   - References extracted are CALL SITES ONLY. Type
+//     references (`function f(): User`), class heritage
+//     (`class A extends Base`, `class A implements Iface`),
+//     and decorator usage are NOT captured yet — slice
+//     4.3.3.c will extend the query set. `find_references`
+//     for a type-only or heritage-only symbol returns empty
+//     in the meantime even though the symbol is reachable.
 
 import type { DB } from '../storage/db.ts';
 
@@ -136,6 +144,105 @@ export interface ResolveImportsResult {
 // wrap in a transaction; this function does not open one
 // itself so it can compose with the pipeline's existing
 // transactional write batching.
+export interface ResolveReferencesResult {
+  // References inspected this run (target_symbol_id was NULL).
+  candidates: number;
+  // Of those, how many resolved to a unique global symbol.
+  resolved: number;
+}
+
+// Bind `references_.target_symbol_id` to the corresponding
+// `symbols.id` whenever the reference's target_symbol_name
+// resolves to EXACTLY ONE symbol globally. Names that match
+// zero or multiple symbols stay NULL (caller treats them as
+// external or ambiguous).
+//
+// Strategy: build a name → id map up front for names with a
+// single occurrence. SQL bulk UPDATE matched on the map. We
+// stage the map in a TEMPORARY table so the UPDATE is one
+// statement instead of N round-trips. Idempotent — only rows
+// with NULL target_symbol_id are inspected.
+//
+// Same-name overload groups (function foo with multiple
+// declarations + impl) collapse to a single FQN; we group by
+// FQN+name. If a name has multiple candidates with the same
+// FQN, pick the one with the largest line span (the impl). If
+// multiple FQNs exist for one name, leave it ambiguous —
+// caller can disambiguate via find_references_by_name.
+export const resolveReferences = (db: DB): ResolveReferencesResult => {
+  const candidatesRow = db
+    .query<{ n: number }, []>(
+      'SELECT COUNT(*) AS n FROM references_ WHERE target_symbol_id IS NULL',
+    )
+    .get();
+  const candidates = candidatesRow?.n ?? 0;
+  if (candidates === 0) return { candidates: 0, resolved: 0 };
+
+  // Stage a name → id map of every name with exactly one
+  // candidate symbol after collapsing overload groups. The
+  // ROW_NUMBER + group-by-FQN dance keeps this single-pass
+  // SQL: pick the max-span row per (name, fqn), then count
+  // distinct FQNs per name; only names with exactly one FQN
+  // qualify. Dropped via finally so a throw mid-pass doesn't
+  // leak the temp table on this connection.
+  db.exec('DROP TABLE IF EXISTS _resolvable_names');
+  db.exec('CREATE TEMPORARY TABLE _resolvable_names (name TEXT PRIMARY KEY, id INTEGER NOT NULL)');
+  try {
+    // Two-step composition (SQLite doesn't support DISTINCT
+    // inside window functions, ruling out a single CTE):
+    //   1. Per-(name,fqn) impl pick via ROW_NUMBER —
+    //      `rn_in_group=1` is the largest-span symbol for that
+    //      overload group.
+    //   2. Filter by names that have exactly one distinct FQN
+    //      across the table — names whose FQN is shared across
+    //      multiple parent classes (`A.start` vs `B.start`)
+    //      stay ambiguous.
+    db.exec(`
+      INSERT INTO _resolvable_names (name, id)
+      SELECT per_group.name, per_group.id
+        FROM (
+          SELECT name, fqn, id,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY name, fqn
+                   ORDER BY (end_line - start_line) DESC, id ASC
+                 ) AS rn
+            FROM symbols
+            WHERE fqn IS NOT NULL
+        ) per_group
+       WHERE per_group.rn = 1
+         AND per_group.name IN (
+           SELECT name FROM symbols
+            WHERE fqn IS NOT NULL
+            GROUP BY name
+            HAVING COUNT(DISTINCT fqn) = 1
+         );
+    `);
+
+    const updateResult = db
+      .query<{ changes?: number }, []>(`UPDATE references_
+           SET target_symbol_id = (
+             SELECT id FROM _resolvable_names WHERE name = references_.target_symbol_name
+           )
+           WHERE target_symbol_id IS NULL
+             AND target_symbol_name IN (SELECT name FROM _resolvable_names)`)
+      .run();
+
+    // bun:sqlite's run() returns { changes, lastInsertRowid }.
+    // Cast through unknown — TS bindings declare run() loosely.
+    const resolved =
+      typeof (updateResult as { changes?: unknown }).changes === 'number'
+        ? (updateResult as { changes: number }).changes
+        : 0;
+    return { candidates, resolved };
+  } finally {
+    try {
+      db.exec('DROP TABLE IF EXISTS _resolvable_names');
+    } catch {
+      // Best-effort.
+    }
+  }
+};
+
 export const resolveImports = (db: DB): ResolveImportsResult => {
   const rows = db
     .query<{ id: number; source_file: string; target_module: string }, []>(

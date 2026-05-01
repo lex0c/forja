@@ -54,6 +54,23 @@ describe('smoke: scan the Forja repo', () => {
       const codeIndexSym = idx.getSymbol('CodeIndex').find((s) => s.kind === 'class');
       expect(codeIndexSym).toBeDefined();
       expect(codeIndexSym?.visibility).toBe('export');
+
+      // References + resolver pipeline end-to-end. The codebase
+      // has many calls to top-level helpers; pick a function we
+      // know is heavily used and assert refs land. Bypasses the
+      // unique-name check for resolver via findReferencesByName
+      // first (string match), then via findReferences once we
+      // pin the unique resolution worked for at least one
+      // common name.
+      expect(result.referencesInserted).toBeGreaterThan(50);
+      expect(result.referencesResolved).toBeGreaterThan(0);
+      // `walkProject` is the one canonical symbol we expect to
+      // be resolved — name is unique in the codebase. A regression
+      // in the resolver pipeline would flip this to 0.
+      const walkSym = idx.getSymbol('walkProject')[0];
+      expect(walkSym).toBeDefined();
+      const walkRefs = idx.findReferences(walkSym?.id ?? -1);
+      expect(walkRefs.length).toBeGreaterThan(0);
     } finally {
       idx.close();
     }

@@ -70,6 +70,15 @@ export const TS_QUERY = `
 
 (import_statement) @import.stmt
 
+;; Call sites — every call_expression in the file regardless of
+;; scope (module-level, inside functions, inside methods).
+;; The extractor pulls the function-side identifier as the
+;; reference's target_symbol_name. require() calls also
+;; match here AND match the @import.require capture below; the
+;; extractor de-dupes by skipping calls whose function is the
+;; identifier "require".
+(call_expression) @ref.call
+
 ;; CommonJS interop: capture every call_expression whose
 ;; function identifier is "require". Unscoped (matches anywhere
 ;; in the program — lazy-load require inside functions is a

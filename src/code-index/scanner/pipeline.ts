@@ -18,12 +18,13 @@ import { withTransaction } from '../../storage/db.ts';
 import {
   deleteFile as deleteFileRow,
   insertImports,
+  insertReferences,
   insertSymbols,
   setMeta,
   upsertFile,
 } from '../repo.ts';
-import { resolveImports } from '../resolver.ts';
-import type { FileMeta, FileParseStatus, Import, IndexSymbol } from '../types.ts';
+import { resolveImports, resolveReferences } from '../resolver.ts';
+import type { FileMeta, FileParseStatus, Import, IndexSymbol, Reference } from '../types.ts';
 import { extractFromSource } from './extract.ts';
 import { parseSource } from './parser.ts';
 import { type WalkOptions, type WalkedFile, walkProject } from './walker.ts';
@@ -49,6 +50,7 @@ export interface ScanResult {
   filesScanned: number;
   symbolsInserted: number;
   importsInserted: number;
+  referencesInserted: number;
   // Files where parse threw (bug in extractor) or read failed.
   // Best-effort: an extractor exception on one file does not
   // abort the scan — the row is recorded with parse_status=
@@ -59,6 +61,12 @@ export interface ScanResult {
   // could; `parse_status='partial'` is recorded so consumers
   // know the rows for that file are best-effort.
   partials: number;
+  // Imports / references the second-pass resolver bound to
+  // concrete files / symbol ids. Counts target_path /
+  // target_symbol_id assignments, not row inserts. 0 when no
+  // local imports / unique-name references existed.
+  importsResolved: number;
+  referencesResolved: number;
 }
 
 // Hash a string with SHA-256 via Bun's CryptoHasher. Hex is
@@ -93,6 +101,7 @@ interface ScanFileOutcome {
   file: FileMeta;
   symbols: Omit<IndexSymbol, 'id'>[];
   imports: Omit<Import, 'id'>[];
+  references: Omit<Reference, 'id' | 'targetSymbolId'>[];
   partial: boolean;
 }
 
@@ -105,11 +114,13 @@ const scanOneFile = async (entry: WalkedFile, indexedAt: number): Promise<ScanFi
   let parseError: string | null = null;
   let symbols: Omit<IndexSymbol, 'id'>[] = [];
   let imports: Omit<Import, 'sourceFile' | 'targetPath' | 'id'>[] = [];
+  let extractedRefs: Omit<Reference, 'id' | 'sourceFile' | 'targetSymbolId'>[] = [];
   let partial = false;
   try {
     const extracted = extractFromSource(source, entry.language, entry.relPath, parseSource);
     symbols = extracted.symbols;
     imports = extracted.imports;
+    extractedRefs = extracted.references;
     partial = extracted.partial;
     // tree-sitter is permissive: invalid syntax produces ERROR
     // and MISSING nodes but the surrounding constructs still
@@ -125,8 +136,8 @@ const scanOneFile = async (entry: WalkedFile, indexedAt: number): Promise<ScanFi
 
   // imports come out of the extractor without sourceFile and
   // targetPath — fill sourceFile here; targetPath stays null
-  // until the resolver runs in slice 4.3.3 (string spec is in
-  // targetModule meanwhile).
+  // until the resolver runs (slice 4.3.3.a). targetModule is
+  // the raw spec from the import statement.
   const completedImports: Omit<Import, 'id'>[] = imports.map((imp) => ({
     sourceFile: entry.relPath,
     targetPath: null,
@@ -134,6 +145,19 @@ const scanOneFile = async (entry: WalkedFile, indexedAt: number): Promise<ScanFi
     importedNames: imp.importedNames,
     isExternal: imp.isExternal,
   }));
+
+  // References come out of the extractor without sourceFile.
+  // Fill it here; target_symbol_id stays null at insert time
+  // and the resolver pass binds it (slice 4.3.3.b).
+  const completedReferences: Omit<Reference, 'id' | 'targetSymbolId'>[] = extractedRefs.map(
+    (r) => ({
+      sourceFile: entry.relPath,
+      sourceLine: r.sourceLine,
+      sourceCol: r.sourceCol,
+      targetSymbolName: r.targetSymbolName,
+      refKind: r.refKind,
+    }),
+  );
 
   return {
     file: {
@@ -150,6 +174,7 @@ const scanOneFile = async (entry: WalkedFile, indexedAt: number): Promise<ScanFi
     },
     symbols,
     imports: completedImports,
+    references: completedReferences,
     partial,
   };
 };
@@ -215,8 +240,11 @@ const doScan = async (db: DB, opts: ScanOptions): Promise<ScanResult> => {
     filesScanned: 0,
     symbolsInserted: 0,
     importsInserted: 0,
+    referencesInserted: 0,
     errors: [],
     partials: 0,
+    importsResolved: 0,
+    referencesResolved: 0,
   };
   const indexedAt = Date.now();
 
@@ -308,8 +336,10 @@ const doScan = async (db: DB, opts: ScanOptions): Promise<ScanResult> => {
             } else {
               insertSymbols(db, outcome.symbols);
               insertImports(db, outcome.imports);
+              insertReferences(db, outcome.references);
               result.symbolsInserted += outcome.symbols.length;
               result.importsInserted += outcome.imports.length;
+              result.referencesInserted += outcome.references.length;
             }
             if (outcome.partial) result.partials++;
             result.filesScanned++;
@@ -332,12 +362,15 @@ const doScan = async (db: DB, opts: ScanOptions): Promise<ScanResult> => {
     });
 
     // Second pass — link `imports.target_path` to concrete
-    // file rows (CODE_INDEX.md §3.1 step 4). Idempotent: only
-    // unresolved rows are touched, so re-running over an
-    // already-resolved DB is a no-op. Reference resolution
-    // lands in slice 4.3.3.b.
+    // file rows AND `references_.target_symbol_id` to symbol
+    // ids (CODE_INDEX.md §3.1 step 4). Both helpers filter on
+    // their respective NULL columns, so re-running over an
+    // already-resolved DB is a no-op.
     withTransaction(db, () => {
-      resolveImports(db);
+      const importsRes = resolveImports(db);
+      const refsRes = resolveReferences(db);
+      result.importsResolved = importsRes.resolved;
+      result.referencesResolved = refsRes.resolved;
     });
 
     setMeta(db, 'last_full_scan_at', String(indexedAt));

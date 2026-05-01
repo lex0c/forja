@@ -430,6 +430,26 @@ export const insertSymbols = (db: DB, symbols: Omit<IndexSymbol, 'id'>[]): void 
   }
 };
 
+// Bulk insert references. Caller passes rows without `id`
+// (auto-assigned by SQLite) and without `targetSymbolId`
+// (set NULL at insert time; the resolver pass binds names
+// to ids in a second pass once every file's symbols exist).
+export const insertReferences = (
+  db: DB,
+  rows: Omit<Reference, 'id' | 'targetSymbolId'>[],
+): void => {
+  if (rows.length === 0) return;
+  const stmt = db.query(
+    `INSERT INTO references_
+       (source_file, source_line, source_col,
+        target_symbol_name, target_symbol_id, ref_kind)
+     VALUES (?, ?, ?, ?, NULL, ?)`,
+  );
+  for (const ref of rows) {
+    stmt.run(ref.sourceFile, ref.sourceLine, ref.sourceCol, ref.targetSymbolName, ref.refKind);
+  }
+};
+
 // Bulk insert imports. `importedNames` is stored as JSON text
 // per the schema choice in slice 4.3.0 — keeps imports' shape
 // flexible (named/default/namespace as a uniform string array).

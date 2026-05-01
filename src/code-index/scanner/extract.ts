@@ -20,7 +20,14 @@
 //     'unknown' (we couldn't classify, e.g. const inside an
 //     export-from re-export).
 
-import type { Import, IndexSymbol, SymbolKind, SymbolVisibility } from '../types.ts';
+import type {
+  Import,
+  IndexSymbol,
+  Reference,
+  ReferenceKind,
+  SymbolKind,
+  SymbolVisibility,
+} from '../types.ts';
 import type { SupportedLanguage } from './language.ts';
 import { compileQuery } from './parser.ts';
 import { queryFor } from './queries.ts';
@@ -45,6 +52,10 @@ interface SyntaxNode {
 export interface ExtractResult {
   symbols: Omit<IndexSymbol, 'id'>[];
   imports: Omit<Import, 'id' | 'sourceFile' | 'targetPath'>[];
+  // References emitted at parse time. `target_symbol_id` is
+  // unset here — that linking happens in the resolver pass
+  // after every file has its symbols inserted.
+  references: Omit<Reference, 'id' | 'sourceFile' | 'targetSymbolId'>[];
   // True when tree-sitter recovered from one or more syntax
   // errors in the source — the extractor still pulled the
   // valid constructs surrounding ERROR/MISSING nodes, but the
@@ -441,6 +452,51 @@ const extractRequire = (
   };
 };
 
+// Extract a call-site reference from a `call_expression`
+// node. The reference's `target_symbol_name` is the function-
+// side identifier:
+//   - Bare call `foo()` → 'foo' (function field is identifier)
+//   - Method call `obj.foo()` → 'foo' (function is
+//     member_expression; we read its property field)
+//   - Computed call `obj[k]()` / IIFE `(() => {})()` / call
+//     expression results `getFn()()` — no plain identifier
+//     name available, return null (unresolvable at index time)
+//   - `require('x')` — already captured as @import.require by
+//     a separate query branch; skip to avoid double-counting
+//     it as both an import edge AND a 'call' reference.
+//
+// Position is the call_expression node's start (call site, not
+// the function definition). Resolver in slice 4.3.3.b's
+// resolveReferences links target_symbol_name to a unique
+// global symbol when one exists.
+const extractCallReference = (
+  callNode: SyntaxNode,
+): Omit<Reference, 'id' | 'sourceFile' | 'targetSymbolId'> | null => {
+  const fn = fieldNode(callNode, 'function');
+  if (fn === null) return null;
+  // De-dupe with @import.require — see header.
+  if (fn.type === 'identifier' && fn.text === 'require') return null;
+
+  let targetName: string | null = null;
+  if (fn.type === 'identifier') {
+    targetName = fn.text;
+  } else if (fn.type === 'member_expression') {
+    const prop = fieldNode(fn, 'property');
+    if (prop !== null && prop.type === 'property_identifier') {
+      targetName = prop.text;
+    }
+  }
+  if (targetName === null || targetName.length === 0) return null;
+
+  const refKind: ReferenceKind = 'call';
+  return {
+    sourceLine: callNode.startPosition.row,
+    sourceCol: callNode.startPosition.column,
+    targetSymbolName: targetName,
+    refKind,
+  };
+};
+
 // Public surface: parse the source, run the language's query,
 // extract structured symbols + imports. Caller (the scanner
 // pipeline in slice 4.3.1.b) provides the project-relative
@@ -477,6 +533,7 @@ export const extractFromSource = (
 
   const symbols: Omit<IndexSymbol, 'id'>[] = [];
   const imports: Omit<Import, 'id' | 'sourceFile' | 'targetPath'>[] = [];
+  const references: Omit<Reference, 'id' | 'sourceFile' | 'targetSymbolId'>[] = [];
 
   for (const match of matches) {
     for (const capture of match.captures) {
@@ -488,6 +545,9 @@ export const extractFromSource = (
       } else if (capture.name === 'import.require') {
         const imp = extractRequire(capture.node);
         if (imp !== null) imports.push(imp);
+      } else if (capture.name === 'ref.call') {
+        const ref = extractCallReference(capture.node);
+        if (ref !== null) references.push(ref);
       } else if (capture.name in symbolDescriptor) {
         const sym = extractGenericSymbol(capture.name, capture.node, filePath, exportedNames);
         if (sym !== null) symbols.push(sym);
@@ -495,5 +555,5 @@ export const extractFromSource = (
     }
   }
 
-  return { symbols, imports, partial: tree.rootNode.hasError === true };
+  return { symbols, imports, references, partial: tree.rootNode.hasError === true };
 };
