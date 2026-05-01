@@ -1228,7 +1228,53 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     startTs,
   });
 
-  // 7. Cleanup worktree if isolated. Same contract as 4.2a:
+  // 7a. Reap orphan bg processes BEFORE worktree cleanup. The
+  // happy path (child exits cleanly via published payload)
+  // already runs the child harness's bgManager.cleanup() hook
+  // before the subprocess ends — by the time we get here, the
+  // bg DB rows should be in terminal status. But the child can
+  // also exit via paths that bypass its own finally:
+  //
+  //   - SIGKILL on heartbeat staleness (4.2b.ii.b): the harness's
+  //     finally is uncatchable, the bg manager's cleanup never
+  //     runs, and bg processes the child spawned are reparented
+  //     to PID 1, kept alive by the kernel.
+  //   - SIGKILL on wall-clock budget exceeded.
+  //   - Caller abort that escalated past SIGTERM grace.
+  //
+  // In those paths the bg DB still has `status='running'` rows
+  // pointing at PIDs that are now orphaned. The reaper:
+  //   1. Queries the child's running rows.
+  //   2. SIGTERM each verified PID; waits BG_REAP_GRACE_MS.
+  //   3. SIGKILL any still-verified survivors.
+  //   4. Per-row markBgProcessAsKilled for matched/gone rows.
+  //
+  // Best-effort throughout — if a kill fails (process already
+  // exited, EPERM, ESRCH), we move on. The reaper exists so the
+  // operator never sees zombies under a finished subagent's
+  // session ID, not as a security boundary.
+  //
+  // Order matters: reap MUST precede `cleanupWorktree`. A bg
+  // process the child spawned with `bash_background` defaults to
+  // the worktree as its cwd. While alive, that process pins the
+  // worktree directory in two ways the cleanup is sensitive to:
+  //   - Dirtiness check: bg writers can race with `git status
+  //     --porcelain`, producing partial-write artifacts that
+  //     trigger preserve when the post-reap state would have
+  //     been clean.
+  //   - Removal failure: `git worktree remove --force` can fail
+  //     on filesystems that refuse to drop a directory while
+  //     another process has it as cwd (Linux is lenient here,
+  //     but Windows / older macOS / NFS mounts are not — and the
+  //     existing cleanupWorktree comment already calls out this
+  //     failure mode). The audit then records 'preserved' for a
+  //     worktree that's logically empty but stuck.
+  // Reaping first stabilizes the state: bg processes are dead,
+  // their cwd-pins released, the worktree's tracked diff stops
+  // changing, and the cleanup pass sees a deterministic snapshot.
+  await reapChildBgProcesses(input.db, childSession.id);
+
+  // 7b. Cleanup worktree if isolated. Same contract as 4.2a:
   // clean tree → remove; dirty tree → preserve.
   let cleanup: CleanupResult | undefined;
   let auditFailure: { code: string; message: string } | undefined;
@@ -1251,39 +1297,6 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       };
     }
   }
-
-  // Reap any bg processes the child spawned but didn't get to
-  // clean up. The happy path (child exits cleanly via published
-  // payload) already runs the child harness's bgManager.cleanup()
-  // hook before the subprocess ends — by the time we get here,
-  // the bg DB rows should be in terminal status. But the child
-  // can also exit via paths that bypass its own finally:
-  //
-  //   - SIGKILL on heartbeat staleness (4.2b.ii.b): the harness's
-  //     finally is uncatchable, the bg manager's cleanup never
-  //     runs, and bg processes the child spawned are reparented
-  //     to PID 1, kept alive by the kernel.
-  //   - SIGKILL on wall-clock budget exceeded.
-  //   - Caller abort that escalated past SIGTERM grace.
-  //
-  // In those paths the bg DB still has `status='running'` rows
-  // pointing at PIDs that are now orphaned. The subsequent
-  // `rmSync` of bgLogDir would also remove the log files those
-  // orphans are still writing to (Linux unlinks don't kill open
-  // FDs — bytes go to phantom file handles, disk space stays
-  // pinned, processes consume CPU/RAM until they exit on their
-  // own). We close the loop here:
-  //
-  //   1. Query the child's running rows.
-  //   2. SIGTERM each PID; wait BG_REAP_GRACE_MS.
-  //   3. SIGKILL any still alive.
-  //   4. markRunningAsKilled to reflect terminal status in audit.
-  //
-  // Best-effort throughout — if a kill fails (process already
-  // exited, EPERM, ESRCH), we move on. The reaper exists so the
-  // operator never sees zombies under a finished subagent's
-  // session ID, not as a security boundary.
-  await reapChildBgProcesses(input.db, childSession.id);
 
   // Best-effort cleanup of the per-subagent bg log directory —
   // BUT ONLY if every bg row reached terminal status. The
