@@ -209,7 +209,7 @@ export const scanProject = async (db: DB, opts: ScanOptions): Promise<ScanResult
 };
 
 const doScan = async (db: DB, opts: ScanOptions): Promise<ScanResult> => {
-  const files = await walkProject(opts);
+  const { files, seenPaths } = await walkProject(opts);
   const result: ScanResult = {
     filesScanned: 0,
     symbolsInserted: 0,
@@ -235,7 +235,11 @@ const doScan = async (db: DB, opts: ScanOptions): Promise<ScanResult> => {
     db.exec('CREATE TEMPORARY TABLE _scan_seen (path TEXT PRIMARY KEY)');
     withTransaction(db, () => {
       const stmt = db.query('INSERT OR IGNORE INTO _scan_seen (path) VALUES (?)');
-      for (const f of files) stmt.run(f.relPath);
+      // Use the walker's full seenPaths set (includes paths
+      // whose lstat failed) — populating only `files` would
+      // let the prune delete rows for transiently unreachable
+      // paths.
+      for (const p of seenPaths) stmt.run(p);
     });
 
     for (let i = 0; i < files.length; i += BATCH_SIZE) {

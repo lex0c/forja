@@ -22,8 +22,8 @@
 // pipeline.ts) where it's batched per transaction.
 
 import { type SpawnSyncReturns, spawnSync } from 'node:child_process';
-import type { Dirent } from 'node:fs';
-import { lstat, readdir } from 'node:fs/promises';
+import type { Dirent, Stats } from 'node:fs';
+import { lstat, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { CODE_INDEX_DEFAULT_EXCLUDES, CODE_INDEX_MAX_FILE_SIZE_BYTES } from '../privacy.ts';
 import { type SupportedLanguage, detectLanguage } from './language.ts';
@@ -58,6 +58,25 @@ export interface WalkedFile {
   language: SupportedLanguage;
 }
 
+export interface WalkResult {
+  // Files we can index this scan — passed every filter and
+  // produced a successful lstat.
+  files: WalkedFile[];
+  // Every project-relative path the walker observed for which
+  // the prior index row should be PRESERVED across this scan.
+  // Superset of `files.relPath` because it also includes paths
+  // whose lstat transiently failed (race / EACCES / NFS hiccup).
+  // The pipeline's stale-row prune deletes `files` rows whose
+  // path is NOT in this set, so swallowing transient lstat
+  // errors here would cause real data loss; instead we keep
+  // those paths in seenPaths and skip the re-index for this
+  // scan — next scan picks them up if the FS recovers.
+  // Symlinks / directories / oversized files are NOT in this
+  // set: they're intentional drops that the prune SHOULD
+  // resolve into deleting any leftover row.
+  seenPaths: string[];
+}
+
 // Names whose subtrees never produce an indexable file under
 // any reasonable config. Skipping at directory entry time
 // avoids descending into them in the fallback walk (the
@@ -81,11 +100,33 @@ const FAST_SKIP_DIRS = new Set([
   '.next',
 ]);
 
-export const walkProject = async (opts: WalkOptions): Promise<WalkedFile[]> => {
+export const walkProject = async (opts: WalkOptions): Promise<WalkResult> => {
   const projectRoot = opts.projectRoot;
   const respectGitignore = opts.respectGitignore ?? true;
   const additionalExcludes = opts.additionalExcludes ?? [];
   const maxFileSizeBytes = opts.maxFileSizeBytes ?? CODE_INDEX_MAX_FILE_SIZE_BYTES;
+
+  // Pre-flight check on the root itself. An empty walk MUST
+  // mean "no files match" — the pipeline's stale-row prune
+  // treats the walker output as the complete project listing,
+  // so a transient ENOENT/EACCES on the root would silently
+  // wipe the entire index. Surface root failures as a hard
+  // throw so the caller sees a real error instead of a
+  // successful zero-file scan masquerading as data deletion.
+  // `stat` (not `lstat`) follows the root if it happens to be
+  // a symlink — entries beneath are still detected via lstat.
+  let rootStat: Stats;
+  try {
+    rootStat = await stat(projectRoot);
+  } catch (e) {
+    throw new Error(
+      `walkProject: project root '${projectRoot}' is inaccessible: ${e instanceof Error ? e.message : String(e)}`,
+      { cause: e },
+    );
+  }
+  if (!rootStat.isDirectory()) {
+    throw new Error(`walkProject: project root '${projectRoot}' is not a directory`);
+  }
 
   const excludePatterns = [...CODE_INDEX_DEFAULT_EXCLUDES, ...additionalExcludes];
   const excludeGlobs = excludePatterns.map((p) => new Bun.Glob(p));
@@ -116,27 +157,43 @@ export const walkProject = async (opts: WalkOptions): Promise<WalkedFile[]> => {
   // and dropped — CODE_INDEX.md §8.2 sets follow_symlinks=false
   // as the default. A symlink whose target is a regular file
   // would otherwise sneak through the `s.isFile()` check.
-  const stats = await Promise.all(
-    eligible.map(async (e) => {
+  type StatSlot =
+    | { entry: (typeof eligible)[number]; stat: Stats; failed: false }
+    | { entry: (typeof eligible)[number]; failed: true };
+  const stats: StatSlot[] = await Promise.all(
+    eligible.map(async (e): Promise<StatSlot> => {
       try {
-        return { entry: e, stat: await lstat(e.absPath) };
+        return { entry: e, stat: await lstat(e.absPath), failed: false };
       } catch {
-        // File listed but disappeared between listing and
-        // lstat (race with concurrent edit, network FS hiccup).
-        // Skipping is correct — next scan picks it up if it
-        // reappears.
-        return null;
+        // Don't drop the path — return it as failed so the
+        // caller can keep its prior index row alive. Dropping
+        // here would let a transient lstat error propagate
+        // through to the pipeline's prune as "the file was
+        // deleted", causing false data loss.
+        return { entry: e, failed: true };
       }
     }),
   );
 
   const results: WalkedFile[] = [];
+  const seenPaths: string[] = [];
   for (const r of stats) {
-    if (r === null) continue;
+    if (r.failed) {
+      // Preserve the path so the prune doesn't remove the
+      // prior row, but skip re-indexing — we have no metadata
+      // (size, mtime, content) to write a new row with.
+      seenPaths.push(r.entry.relPath);
+      continue;
+    }
     const { entry, stat: s } = r;
+    // Symlinks / non-files / oversized: intentional drops. NOT
+    // added to seenPaths so the prune deletes any leftover row
+    // (e.g., a regular file replaced by a symlink should lose
+    // its prior index row).
     if (s.isSymbolicLink()) continue;
     if (!s.isFile()) continue;
     if (s.size > maxFileSizeBytes) continue;
+    seenPaths.push(entry.relPath);
     results.push({
       relPath: entry.relPath,
       absPath: entry.absPath,
@@ -145,7 +202,7 @@ export const walkProject = async (opts: WalkOptions): Promise<WalkedFile[]> => {
       language: entry.language,
     });
   }
-  return results;
+  return { files: results, seenPaths };
 };
 
 // Run `git ls-files --cached --others --exclude-standard -z`
