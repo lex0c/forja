@@ -91,12 +91,21 @@ export const TS_QUERY = `
   (member_expression property: (property_identifier) @ref.extends))
 
 ;; Class implements — N type_identifiers. Each is its own ref.
+;; Generic implementations (implements I1<X>) wrap the
+;; identifier in a generic_type node, so we need a sibling
+;; pattern to descend through that wrapper.
 (implements_clause (type_identifier) @ref.implements)
+(implements_clause
+  (generic_type (type_identifier) @ref.implements))
 
 ;; Interface extends — TS interfaces inherit from N other
 ;; interfaces via extends_type_clause. Same ref_kind as class
-;; extends since the semantic is identical.
+;; extends since the semantic is identical. Generic case
+;; (extends B<T>) needs the generic_type descent like
+;; implements above.
 (extends_type_clause (type_identifier) @ref.extends)
+(extends_type_clause
+  (generic_type (type_identifier) @ref.extends))
 
 ;; CommonJS interop: capture every call_expression whose
 ;; function identifier is "require". Unscoped (matches anywhere

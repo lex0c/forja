@@ -180,6 +180,47 @@ export function bootstrap() {
     expect(byId.every((r) => r.targetSymbolId === login[0]?.id)).toBe(true);
   });
 
+  test('does NOT leak refs from a same-named symbol in a different file', async () => {
+    // Two files each declare `helper`; their callers are
+    // independent. find_references for `auth.ts:helper` must
+    // NOT surface refs to `legacy.ts:helper` even though both
+    // names are 'helper'. Earlier implementation merged a
+    // findReferencesByName fallback that produced this bug.
+    writeFile(root, 'src/auth.ts', 'export function helper() { return 1; }');
+    writeFile(root, 'src/legacy.ts', 'export function helper() { return 2; }');
+    writeFile(
+      root,
+      'src/auth-caller.ts',
+      'import { helper } from "./auth";\nexport const a = helper();',
+    );
+    writeFile(
+      root,
+      'src/legacy-caller.ts',
+      'import { helper } from "./legacy";\nexport const b = helper();',
+    );
+    await idx.scan({ respectGitignore: false });
+
+    // Manually verify: globally-ambiguous name → resolver
+    // can't bind, refs stay at targetSymbolId=null. The tool
+    // must NOT surface these unresolved refs (they could
+    // belong to either symbol).
+    const allHelpers = idx.findReferencesByName('helper');
+    expect(allHelpers.length).toBe(2);
+    expect(allHelpers.every((r) => r.targetSymbolId === null)).toBe(true);
+
+    const r = await findReferencesTool.execute(
+      { symbol: 'src/auth.ts:helper' },
+      makeCtx({ codeIndex: idx, cwd: root }),
+    );
+    expect(isToolError(r)).toBe(false);
+    if (isToolError(r)) return;
+    // No refs surface for either helper (resolver couldn't bind
+    // and the tool no longer falls back to byName). False
+    // negative beats false positive for the refactor-impact
+    // use case.
+    expect(r.references.length).toBe(0);
+  });
+
   test('ref_kind=import filter returns empty (extractor does not yet emit import refs)', async () => {
     // Documented gap: the extractor does NOT yet capture
     // ref_kind='import'. Pin the current behavior so a future

@@ -78,25 +78,14 @@ const buildSurroundingText = (fullSource: string, line: number): string => {
   return lines.slice(start, end).join('\n');
 };
 
-// Merge resolved + name-matched references, deduping by
-// (file, line, col). Resolved entries win on conflict so
-// `targetSymbolId` info isn't lost. Returns a stable order
-// suitable for slicing.
-const mergeAndDedupe = (resolved: Reference[], byName: Reference[]): Reference[] => {
-  const seen = new Map<string, Reference>();
-  for (const r of resolved) {
-    seen.set(`${r.sourceFile}:${r.sourceLine}:${r.sourceCol}`, r);
-  }
-  for (const r of byName) {
-    const key = `${r.sourceFile}:${r.sourceLine}:${r.sourceCol}`;
-    if (!seen.has(key)) seen.set(key, r);
-  }
-  return Array.from(seen.values()).sort((a, b) => {
+// Order references stably by (file, line, col). Used after
+// the symbol-id-bound lookup so output is deterministic.
+const sortReferences = (refs: Reference[]): Reference[] =>
+  [...refs].sort((a, b) => {
     if (a.sourceFile !== b.sourceFile) return a.sourceFile < b.sourceFile ? -1 : 1;
     if (a.sourceLine !== b.sourceLine) return a.sourceLine - b.sourceLine;
     return a.sourceCol - b.sourceCol;
   });
-};
 
 export const findReferencesTool: Tool<FindReferencesInput, FindReferencesOutput> = {
   name: 'find_references',
@@ -203,13 +192,20 @@ export const findReferencesTool: Tool<FindReferencesInput, FindReferencesOutput>
       return toolError(ERROR_CODES.symbolNotFound, 'unexpected: empty match');
     }
 
-    // Both query paths: resolved (target_symbol_id = ?) and
-    // unresolved-by-name (target_symbol_name = ?, id null).
-    // Merge + dedupe so a reference that's both resolved AND
-    // name-matched (most cases) appears once.
-    const resolved = ctx.codeIndex.findReferences(sym.id);
-    const byName = ctx.codeIndex.findReferencesByName(sym.name);
-    let merged = mergeAndDedupe(resolved, byName);
+    // ID-bound lookup only. Tempting to merge with
+    // findReferencesByName as a "best-effort fallback for refs
+    // the resolver couldn't bind", but with globally-ambiguous
+    // names (two `login` symbols in different files) the byName
+    // path returns refs from BOTH symbols indiscriminately —
+    // surfaces them as references to the symbol the caller
+    // asked about, which is a silent false positive.
+    // Trade-off: if the resolver legitimately failed to bind a
+    // ref to ITS true target (rare; resolver is comprehensive),
+    // we miss it. False negatives beat false positives for the
+    // refactor-impact use case ("only N callers" must be a
+    // floor, not a guess). Operators wanting a name-only
+    // search should use grep.
+    let merged = sortReferences(ctx.codeIndex.findReferences(sym.id));
 
     if (args.ref_kind !== undefined) {
       merged = merged.filter((r) => r.refKind === args.ref_kind);

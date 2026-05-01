@@ -713,6 +713,48 @@ describe('extractFromSource — heritage references', () => {
     expect(refs.map((r) => r.targetSymbolName).sort()).toEqual(['B', 'C']);
   });
 
+  test('class implements with generic argument captures the type identifier', () => {
+    // tree-sitter-typescript wraps `I1<X>` in a generic_type
+    // node; the bare-(type_identifier) capture misses it.
+    // Pin the generic-aware capture covers the common
+    // generic-implements pattern.
+    const src = 'export class Auth implements I1<X>, I2 {}';
+    const { references } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    const refs = references.filter((r) => r.refKind === 'implements');
+    expect(refs.map((r) => r.targetSymbolName).sort()).toEqual(['I1', 'I2']);
+  });
+
+  test('interface extends with generic arguments captures both bases', () => {
+    const src = 'export interface A<T> extends B<T>, C {}';
+    const { references } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    const refs = references.filter((r) => r.refKind === 'extends');
+    expect(refs.map((r) => r.targetSymbolName).sort()).toEqual(['B', 'C']);
+  });
+
+  test('class extends with generic argument captures the bare identifier', () => {
+    // class_heritage > extends_clause already places the
+    // identifier as a direct child even when followed by
+    // type_arguments. Pin to confirm symmetry with the generic
+    // implements/extends-type cases above.
+    const src = 'export class Auth extends Base<T> {}';
+    const { references } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    const refs = references.filter((r) => r.refKind === 'extends');
+    expect(refs.map((r) => r.targetSymbolName)).toEqual(['Base']);
+  });
+
+  test('type-parameter constraints are NOT captured as extends refs', () => {
+    // `class A<T extends Base>` is a generic constraint, not a
+    // class heritage. The `extends` keyword here lives inside
+    // a `constraint` node nested in `type_parameter`, never in
+    // `extends_clause` / `extends_type_clause`. Pin the
+    // negative case so a future query relaxation doesn't
+    // accidentally surface T-extends-Base as a Base reference.
+    const src = 'export class A<T extends Base> { x: T = {} as T; }';
+    const { references } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    const extendsRefs = references.filter((r) => r.refKind === 'extends');
+    expect(extendsRefs).toEqual([]);
+  });
+
   test('JS class extends works (different grammar shape than TS)', () => {
     // tree-sitter-javascript wraps the base directly in
     // class_heritage with no extends_clause; the JS_QUERY uses
