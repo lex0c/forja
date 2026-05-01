@@ -70,6 +70,63 @@ describe('extractFromSource — TypeScript', () => {
     expect(symbols[0]?.visibility).toBe('internal');
   });
 
+  test('named export clause flips visibility to export', () => {
+    // `export { foo }` after a non-exported declaration is the
+    // canonical TS/JS pattern for separating implementation
+    // from API surface. The local symbol's visibility must
+    // reflect the eventual export, even though it isn't wrapped
+    // in export_statement directly.
+    const src = `
+      function login() {}
+      class Auth {}
+      function helper() {}
+      export { login, Auth };
+    `;
+    const { symbols } = extractFromSource(src, 'typescript', 'src/auth.ts', parseSource);
+    expect(symbols.find((s) => s.name === 'login')?.visibility).toBe('export');
+    expect(symbols.find((s) => s.name === 'Auth')?.visibility).toBe('export');
+    expect(symbols.find((s) => s.name === 'helper')?.visibility).toBe('internal');
+  });
+
+  test('aliased named export uses local name (`export { foo as bar }`)', () => {
+    // Local symbol foo is exported under alias bar — for
+    // visibility we care about the LOCAL name, since that's
+    // what the symbol row carries. bar is a foreign-facing alias
+    // and doesn't appear as a separate symbol.
+    const src = `
+      function foo() {}
+      export { foo as bar };
+    `;
+    const { symbols } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    expect(symbols.find((s) => s.name === 'foo')?.visibility).toBe('export');
+    expect(symbols.find((s) => s.name === 'bar')).toBeUndefined();
+  });
+
+  test('re-export from another module does not flip local visibility', () => {
+    // `export { x } from "./other"` re-exports a foreign name —
+    // a coincidentally-named local helper must NOT be marked
+    // as exported on its account.
+    const src = `
+      function login() {}
+      export { login as foreignLogin } from "./other";
+    `;
+    const { symbols } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    expect(symbols.find((s) => s.name === 'login')?.visibility).toBe('internal');
+  });
+
+  test('per-binding visibility for multi-binding const + named export', () => {
+    // `const a = 1, b = 2; export { a }` exports only a.
+    // Visibility must be resolved per-binding, not per-declaration.
+    const src = `
+      const a = 1, b = 2;
+      export { a };
+    `;
+    const { symbols } = extractFromSource(src, 'typescript', 'src/c.ts', parseSource);
+    const consts = symbols.filter((s) => s.kind === 'const');
+    expect(consts.find((c) => c.name === 'a')?.visibility).toBe('export');
+    expect(consts.find((c) => c.name === 'b')?.visibility).toBe('internal');
+  });
+
   test('class with methods + accessibility modifiers', () => {
     const src = `
       export class Auth {
@@ -226,6 +283,40 @@ describe('extractFromSource — TypeScript', () => {
     expect(symbols.filter((s) => s.kind === 'class').length).toBe(0);
     expect(symbols.filter((s) => s.kind === 'method').length).toBe(0);
     expect(symbols.filter((s) => s.kind === 'function').map((f) => f.name)).toEqual(['build']);
+  });
+
+  test('hash-private methods (`#secret()`) classify as private', () => {
+    // ECMAScript hash-private methods carry no
+    // `accessibility_modifier` — the `#` prefix on the name is
+    // the syntactic signal. The extractor inspects the `name`
+    // field's type to detect `private_property_identifier`.
+    const src = `
+      export class Vault {
+        public load() {}
+        #secret() {}
+        plain() {}
+      }
+    `;
+    const { symbols } = extractFromSource(src, 'typescript', 'src/v.ts', parseSource);
+    const methods = symbols.filter((s) => s.kind === 'method');
+    expect(methods.find((m) => m.name === 'load')?.visibility).toBe('public');
+    expect(methods.find((m) => m.name === '#secret')?.visibility).toBe('private');
+    expect(methods.find((m) => m.name === 'plain')?.visibility).toBe('public');
+  });
+
+  test('hash-private methods in JS classify as private', () => {
+    // Same rule applies in JavaScript — hash-private is a
+    // standard ECMAScript feature, not TS-only.
+    const src = `
+      export class Counter {
+        bump() {}
+        #tick() {}
+      }
+    `;
+    const { symbols } = extractFromSource(src, 'javascript', 'src/c.js', parseSource);
+    const methods = symbols.filter((s) => s.kind === 'method');
+    expect(methods.find((m) => m.name === 'bump')?.visibility).toBe('public');
+    expect(methods.find((m) => m.name === '#tick')?.visibility).toBe('private');
   });
 
   test('static method visibility resolves via accessibility modifier', () => {

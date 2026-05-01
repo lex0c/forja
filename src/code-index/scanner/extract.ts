@@ -66,12 +66,24 @@ const fieldNode = (node: SyntaxNode, fieldName: string): SyntaxNode | null => {
   return null;
 };
 
-// Visibility resolution. Top-level statements wrapped in an
-// `export_statement` get visibility='export'. Method accessibility
-// modifiers (TS-only) resolve to public/private/protected via
-// the `accessibility_modifier` child.
-const resolveVisibility = (defNode: SyntaxNode): SymbolVisibility => {
-  // Method case: scan named children for accessibility_modifier
+// Visibility resolution. Three signals are checked, in order:
+//   1. Method accessibility modifiers (TS-only) → public/private/etc
+//   2. Direct `export_statement` parent (e.g. `export function foo`)
+//   3. Named-export clauses elsewhere in the program — e.g.
+//      `function foo() {}` ... `export { foo }` — collected ahead
+//      of time and passed in as `exportedNames`. Re-exports of
+//      the form `export { x } from "./other"` do NOT contribute,
+//      since their `x` refers to a foreign module's binding, not
+//      a local symbol.
+//
+// Methods don't appear in named-export clauses (you can only
+// export top-level bindings), so `symbolName` and `exportedNames`
+// are unused on the method path.
+const resolveVisibility = (
+  defNode: SyntaxNode,
+  symbolName: string | null,
+  exportedNames: ReadonlySet<string>,
+): SymbolVisibility => {
   if (defNode.type === 'method_definition' || defNode.type === 'public_field_definition') {
     for (const child of defNode.namedChildren ?? []) {
       if (child.type === 'accessibility_modifier') {
@@ -80,14 +92,51 @@ const resolveVisibility = (defNode: SyntaxNode): SymbolVisibility => {
         if (text === 'protected') return 'internal';
       }
     }
+    // ECMAScript hash-private methods (`#secret()`) carry no
+    // accessibility_modifier — privacy is conveyed syntactically
+    // through a `private_property_identifier` name node. Detect
+    // by inspecting the `name` field's type.
+    const nameNode = fieldNode(defNode, 'name');
+    if (nameNode !== null && nameNode.type === 'private_property_identifier') {
+      return 'private';
+    }
     return 'public';
   }
-  // Top-level: look at the parent. If parent is export_statement
-  // OR ancestor up to program is export_statement, → 'export'.
   if (defNode.parent !== null && defNode.parent.type === 'export_statement') {
     return 'export';
   }
+  if (symbolName !== null && exportedNames.has(symbolName)) {
+    return 'export';
+  }
   return 'internal';
+};
+
+// Pre-scan the program for top-level named export clauses
+// (`export { foo, bar as baz }`) and collect the local names
+// they re-export. This populates the `exportedNames` set passed
+// into `resolveVisibility`. Re-exports with a `source` field
+// (`export { x } from "./other"`) are skipped because their
+// names refer to a foreign module's exports, not local symbols.
+//
+// We collect the `name` field of each export_specifier (the
+// LOCAL identifier), not the `alias` field — `export { foo as bar }`
+// means the local symbol `foo` is exported (under the name `bar`
+// to consumers), so `foo`'s visibility flips to 'export'.
+const collectLocalExportedNames = (root: SyntaxNode): Set<string> => {
+  const names = new Set<string>();
+  for (const child of root.namedChildren ?? []) {
+    if (child.type !== 'export_statement') continue;
+    if (fieldNode(child, 'source') !== null) continue;
+    for (const inner of child.namedChildren ?? []) {
+      if (inner.type !== 'export_clause') continue;
+      for (const spec of inner.namedChildren ?? []) {
+        if (spec.type !== 'export_specifier') continue;
+        const localName = fieldNode(spec, 'name');
+        if (localName !== null) names.add(localName.text);
+      }
+    }
+  }
+  return names;
 };
 
 // Build a compact one-line signature for a function/method.
@@ -142,12 +191,16 @@ const enclosingClassName = (node: SyntaxNode): string | null => {
 // query captures the lexical_declaration node, but the actual
 // "name" lives in each child `variable_declarator`. A single
 // `const a = 1, b = 2;` declares two symbols. We expand here.
-const extractConstSymbols = (defNode: SyntaxNode, filePath: string): Omit<IndexSymbol, 'id'>[] => {
-  // The query may capture either the export_statement-wrapped
-  // form (where defNode IS the lexical_declaration with parent
-  // = export_statement) or the bare form. Walk children for
-  // variable_declarator nodes regardless.
-  const visibility = resolveVisibility(defNode);
+//
+// Visibility is resolved per-binding, not per-declaration: in
+// `const a = 1, b = 2;` followed by `export { a }`, only `a`
+// is exported. The wrapped-export case (`export const x = 1`)
+// applies to every binding in the same declaration.
+const extractConstSymbols = (
+  defNode: SyntaxNode,
+  filePath: string,
+  exportedNames: ReadonlySet<string>,
+): Omit<IndexSymbol, 'id'>[] => {
   const out: Omit<IndexSymbol, 'id'>[] = [];
   for (const child of defNode.namedChildren ?? []) {
     if (child.type !== 'variable_declarator') continue;
@@ -160,6 +213,7 @@ const extractConstSymbols = (defNode: SyntaxNode, filePath: string): Omit<IndexS
     // says symbols = top-level constants; skipping pattern
     // bindings is acceptable for v1.
     if (nameNode.type !== 'identifier') continue;
+    const visibility = resolveVisibility(defNode, nameNode.text, exportedNames);
     out.push({
       filePath,
       name: nameNode.text,
@@ -185,13 +239,14 @@ const extractGenericSymbol = (
   captureName: string,
   defNode: SyntaxNode,
   filePath: string,
+  exportedNames: ReadonlySet<string>,
 ): Omit<IndexSymbol, 'id'> | null => {
   const desc = symbolDescriptor[captureName];
   if (desc === undefined) return null;
   const nameNode = fieldNode(defNode, 'name');
   if (nameNode === null) return null;
   const parentClassName = desc.kind === 'method' ? enclosingClassName(defNode) : null;
-  const visibility = resolveVisibility(defNode);
+  const visibility = resolveVisibility(defNode, nameNode.text, exportedNames);
   const signature =
     desc.kind === 'function' || desc.kind === 'method' ? buildSignature(defNode) : null;
   return {
@@ -301,6 +356,11 @@ export const extractFromSource = (
   const tree = parseFn(source, language) as TreeShape;
   const query = compileQuery(language, queryFor(language)) as QueryShape;
   const matches = query.matches(tree.rootNode);
+  // Pre-scan once per file: list of names that appear in
+  // top-level `export { ... }` clauses. Used by
+  // `resolveVisibility` to flip otherwise-internal symbols to
+  // 'export' when they're re-exported by name.
+  const exportedNames = collectLocalExportedNames(tree.rootNode);
 
   const symbols: Omit<IndexSymbol, 'id'>[] = [];
   const imports: Omit<Import, 'id' | 'sourceFile' | 'targetPath'>[] = [];
@@ -308,12 +368,12 @@ export const extractFromSource = (
   for (const match of matches) {
     for (const capture of match.captures) {
       if (capture.name === 'symbol.const') {
-        symbols.push(...extractConstSymbols(capture.node, filePath));
+        symbols.push(...extractConstSymbols(capture.node, filePath, exportedNames));
       } else if (capture.name === 'import.stmt') {
         const imp = extractImport(capture.node);
         if (imp !== null) imports.push(imp);
       } else if (capture.name in symbolDescriptor) {
-        const sym = extractGenericSymbol(capture.name, capture.node, filePath);
+        const sym = extractGenericSymbol(capture.name, capture.node, filePath, exportedNames);
         if (sym !== null) symbols.push(sym);
       }
     }
