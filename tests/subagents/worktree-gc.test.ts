@@ -21,14 +21,28 @@ let db: DB;
 let cacheRoot: string;
 let parentCwd: string;
 
-const seedSession = (id?: string): string => {
-  const session = createSession(db, { model: 'mock/m', cwd: '/p' });
+// Seed a parent → child session pair so the worktree audit
+// row's join through sessions.parent_session_id resolves
+// (the gc engine scopes by parent's cwd). Tests pass the
+// child id as `subagent_worktrees.session_id`; the parent
+// carries the cwd that gates row inclusion. The parent's
+// cwd defaults to the test's `parentCwd` tmpdir so the
+// gc engine's repo-root fallback (literal parentCwd when
+// `git rev-parse` fails outside a real repo) matches.
+const seedSession = (id?: string, customCwd?: string): string => {
+  const cwd = customCwd ?? parentCwd;
+  const parent = createSession(db, { model: 'mock/m', cwd });
+  const child = createSession(db, {
+    model: 'mock/m',
+    cwd,
+    parentSessionId: parent.id,
+  });
   // Force a known id when needed for cross-fixture references.
   if (id !== undefined) {
-    db.query('UPDATE sessions SET id = ? WHERE id = ?').run(id, session.id);
+    db.query('UPDATE sessions SET id = ? WHERE id = ?').run(id, child.id);
     return id;
   }
-  return session.id;
+  return child.id;
 };
 
 beforeEach(() => {
@@ -248,6 +262,157 @@ describe('buildGcPlan — classification', () => {
       ['preserved_dirty', pathB],
       ['orphan', pathOrphan],
     ]);
+  });
+});
+
+describe('buildGcPlan — security: cross-repo isolation', () => {
+  test('regression: gc from repo A does NOT see repo B worktrees', async () => {
+    // Critical regression: DB and cache root are global (shared
+    // across every repo the operator works in). Without
+    // repo-scoped row selection, gc invoked from repo A
+    // surfaces repo B's worktrees as candidates; --force (or
+    // even auto-removal of clean preserved entries via the
+    // rmSync fallback) silently destroys preserved work from
+    // repo B. The buildGcPlan join filters by parent session
+    // cwd. Two parents, two repos: gc only sees rows whose
+    // parent's cwd matches the resolved repoRoot.
+    const repoA = mkdtempSync(join(tmpdir(), 'forja-gc-repoA-'));
+    const repoB = mkdtempSync(join(tmpdir(), 'forja-gc-repoB-'));
+    try {
+      // Two parent sessions, one per repo, each with its own
+      // child + worktree row.
+      const idA = seedSession(undefined, repoA);
+      const idB = seedSession(undefined, repoB);
+      const pathA = join(cacheRoot, idA);
+      const pathB = join(cacheRoot, idB);
+      mkdirSync(pathA);
+      mkdirSync(pathB);
+      insertSubagentWorktree(db, {
+        sessionId: idA,
+        path: pathA,
+        branch: 'agent/repoA-deadbeef',
+        status: 'preserved',
+      });
+      insertSubagentWorktree(db, {
+        sessionId: idB,
+        path: pathB,
+        branch: 'agent/repoB-cafebabe',
+        status: 'preserved',
+      });
+
+      // Resolve repoRoot to repoA — operator running gc from
+      // repo A's cwd. The query MUST exclude repo B's row.
+      const planA = await buildGcPlan({
+        db,
+        parentCwd: repoA,
+        cacheRoot,
+        resolveRepoRoot: async () => repoA,
+        runGitWorktreeList: async () => '',
+        worktreeStatus: async () => 'clean',
+      });
+      const pathsA = planA.entries.map((e) => e.path);
+      expect(pathsA).toContain(pathA);
+      expect(pathsA).not.toContain(pathB);
+
+      // Symmetric: gc from repo B sees only repo B's row.
+      const planB = await buildGcPlan({
+        db,
+        parentCwd: repoB,
+        cacheRoot,
+        resolveRepoRoot: async () => repoB,
+        runGitWorktreeList: async () => '',
+        worktreeStatus: async () => 'clean',
+      });
+      const pathsB = planB.entries.map((e) => e.path);
+      expect(pathsB).toContain(pathB);
+      expect(pathsB).not.toContain(pathA);
+    } finally {
+      for (const dir of [repoA, repoB]) {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {
+          // ignore
+        }
+      }
+    }
+  });
+
+  test('regression: SQLite LIKE wildcards in repoRoot are escaped (no cross-repo leak)', async () => {
+    // SQLite LIKE treats `_` as match-single-char and `%` as
+    // match-any-string. Without escaping, a parent cwd of
+    // `/p_test` would generate `LIKE /p_test/%` and match
+    // `/pXtest/anything`, `/p1test/anything`, etc. — leaking
+    // rows from any single-char-different sibling repo into
+    // the gc plan. After fix: ESCAPE '\\' clause + escaping
+    // _/%/\\ in the bound parameter.
+    const idA = seedSession(undefined, '/p_test'); // literal `_`
+    const idB = seedSession(undefined, '/pXtest'); // would match the wildcard
+    const pathA = join(cacheRoot, idA);
+    const pathB = join(cacheRoot, idB);
+    mkdirSync(pathA);
+    mkdirSync(pathB);
+    insertSubagentWorktree(db, {
+      sessionId: idA,
+      path: pathA,
+      branch: 'agent/under_test-deadbeef',
+      status: 'preserved',
+    });
+    insertSubagentWorktree(db, {
+      sessionId: idB,
+      path: pathB,
+      branch: 'agent/sibling-cafebabe',
+      status: 'preserved',
+    });
+
+    // gc scoped to /p_test MUST NOT pull in /pXtest's row.
+    const plan = await buildGcPlan({
+      db,
+      parentCwd: '/p_test',
+      cacheRoot,
+      resolveRepoRoot: async () => '/p_test',
+      runGitWorktreeList: async () => '',
+      worktreeStatus: async () => 'clean',
+    });
+    const paths = plan.entries.map((e) => e.path);
+    expect(paths).toContain(pathA);
+    expect(paths).not.toContain(pathB);
+  });
+
+  test('cache-root scan ignores foreign repo dirs even when not in DB', async () => {
+    // A cache-root subdir that has no audit row AND is not
+    // in current repo's git list. Could be a foreign repo's
+    // crashed run or a non-Forja directory. gc must NOT emit
+    // it as orphan — operator running gc in another repo
+    // would see it from THAT scope.
+    const foreignDir = join(cacheRoot, 'foreign-session-id');
+    mkdirSync(foreignDir);
+    const plan = await buildGcPlan({
+      db,
+      parentCwd,
+      cacheRoot,
+      resolveRepoRoot: async () => parentCwd,
+      runGitWorktreeList: async () => '', // current repo's git knows nothing
+      worktreeStatus: async () => 'clean',
+    });
+    expect(plan.entries.map((e) => e.path)).not.toContain(foreignDir);
+  });
+
+  test('non-git parentCwd → fallback warning + scoping by literal cwd', async () => {
+    // resolveRepoRoot returning null (not a git repo) is the
+    // production fallback for parentCwd outside any working
+    // tree. Engine warns but scopes by literal parentCwd
+    // instead of going unscoped (which would re-introduce
+    // the cross-repo leak).
+    const plan = await buildGcPlan({
+      db,
+      parentCwd,
+      cacheRoot,
+      resolveRepoRoot: async () => null,
+      runGitWorktreeList: async () => '',
+      worktreeStatus: async () => 'clean',
+    });
+    expect(plan.warnings.length).toBeGreaterThan(0);
+    expect(plan.warnings[0]).toContain('not inside a git repository');
   });
 });
 

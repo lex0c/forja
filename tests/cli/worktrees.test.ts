@@ -50,6 +50,23 @@ afterEach(() => {
   }
 });
 
+// Seed parent → child sessions so the gc engine's repo-scope
+// query (joins through sessions.parent_session_id) finds the
+// row. The child id is what `subagent_worktrees.session_id`
+// references; the parent's cwd gates row inclusion (gc resolves
+// repoRoot via `git rev-parse` and falls back to literal
+// parentCwd when not in a git repo — tests use the literal
+// parentCwd as the parent's cwd to match that fallback).
+const seedChildSession = (): { id: string } => {
+  const parent = createSession(db, { model: 'mock/m', cwd: parentCwd });
+  const child = createSession(db, {
+    model: 'mock/m',
+    cwd: parentCwd,
+    parentSessionId: parent.id,
+  });
+  return { id: child.id };
+};
+
 describe('runWorktreesCli — list', () => {
   test('empty state → "no worktrees found" (table) / nothing (json)', async () => {
     const code = await runWorktreesCli({
@@ -70,7 +87,7 @@ describe('runWorktreesCli — list', () => {
     // the final line is a summary object so consumers get an
     // explicit end-of-stream marker. Without this, parsing
     // libraries that expect a sentinel had to rely on EOF.
-    const session = createSession(db, { model: 'mock/m', cwd: parentCwd });
+    const session = seedChildSession();
     const path = join(cacheRoot, session.id);
     mkdirSync(path);
     insertSubagentWorktree(db, {
@@ -102,7 +119,7 @@ describe('runWorktreesCli — list', () => {
   });
 
   test('json mode → NDJSON one entry per row', async () => {
-    const session = createSession(db, { model: 'mock/m', cwd: parentCwd });
+    const session = seedChildSession();
     const path = join(cacheRoot, session.id);
     mkdirSync(path);
     insertSubagentWorktree(db, {
@@ -140,7 +157,7 @@ describe('runWorktreesCli — list', () => {
 
 describe('runWorktreesCli — gc', () => {
   test('--dry-run prints plan, does not mutate DB', async () => {
-    const session = createSession(db, { model: 'mock/m', cwd: parentCwd });
+    const session = seedChildSession();
     const path = join(cacheRoot, session.id);
     mkdirSync(path);
     insertSubagentWorktree(db, {
@@ -183,7 +200,7 @@ describe('runWorktreesCli — gc', () => {
     // every machine consumer parsing stdout. Pin: every
     // non-empty line in --json --dry-run output must
     // JSON.parse without throwing.
-    const session = createSession(db, { model: 'mock/m', cwd: parentCwd });
+    const session = seedChildSession();
     const path = join(cacheRoot, session.id);
     mkdirSync(path);
     insertSubagentWorktree(db, {

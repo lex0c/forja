@@ -145,6 +145,66 @@ export const listAllSubagentWorktrees = (db: DB): SubagentWorktree[] => {
   return rows.map(fromRow);
 };
 
+// Scope worktree audit rows to a single parent-repo root.
+// `agent --worktrees gc` MUST run scoped: the DB and the cache
+// root are global resources shared across every repository the
+// operator works in, so an unscoped query would pull in
+// worktrees created from other repos. The CLI then sees them
+// as candidates and `--force` (or even auto-removal of clean
+// preserved entries) silently destroys preserved work from
+// repo B while the operator was running gc in repo A.
+//
+// Scoping path: subagent_worktrees.session_id → sessions.id
+// (the child session) → sessions.parent_session_id →
+// sessions.id (the parent session) → sessions.cwd (where the
+// parent ran from). A row qualifies when the parent's cwd is
+// equal to OR under `repoRoot`.
+//
+// `repoRoot` MUST be canonical (e.g., already passed through
+// `git rev-parse --show-toplevel`).
+//
+// LIKE wildcard escape: SQLite's LIKE treats `%` as
+// match-any-string and `_` as match-single-char, both legal
+// characters in Linux paths. Without escaping, a repoRoot of
+// `/home/user/test_dir` would match parent cwds like
+// `/home/user/testXdir/anything` — cross-repo leak via
+// wildcard. We escape `%`, `_`, and `\` (the escape char
+// itself) before binding, and pin the ESCAPE clause so SQLite
+// honors the chosen escape character. Equality match (first
+// `WHERE`) is a safe direct comparison and doesn't need
+// escaping.
+//
+// Known limitations:
+//   - Rows whose parent_session_id is NULL (parent session was
+//     deleted or the row is top-level somehow — worktrees are
+//     subagent territory so this is unusual) are EXCLUDED.
+//     Operator can't gc them via this CLI; manual cleanup
+//     (rm dir + DB UPDATE) is needed for that edge case.
+//   - Nested repos (repo B physically inside repo A) appear in
+//     gc invoked from repo A — the LIKE doesn't distinguish
+//     "subdirectory" from "nested git repo". Rare; operator
+//     running gc in the inner repo gets the precise scope.
+const escapeLikePattern = (s: string): string =>
+  // Order matters: escape backslash first so the subsequent
+  // wildcard escapes don't double-escape the inserted slashes.
+  s
+    .replace(/\\/g, '\\\\')
+    .replace(/[%_]/g, '\\$&');
+
+export const listSubagentWorktreesByRepo = (db: DB, repoRoot: string): SubagentWorktree[] => {
+  const rows = db
+    .query<SubagentWorktreeRow, [string, string]>(
+      `SELECT sw.session_id, sw.path, sw.branch, sw.status, sw.created_at, sw.cleaned_at
+         FROM subagent_worktrees sw
+         JOIN sessions cs ON cs.id = sw.session_id
+         JOIN sessions ps ON ps.id = cs.parent_session_id
+        WHERE ps.cwd = ? OR ps.cwd LIKE ? ESCAPE '\\'
+        ORDER BY sw.created_at ASC`,
+    )
+    .all(repoRoot, `${escapeLikePattern(repoRoot)}/%`);
+  return rows.map(fromRow);
+};
+
 // Mark a row as 'cleaned' AFTER an out-of-band cleanup pass (gc)
 // removed the worktree directory and branch. Idempotent: a row
 // already 'cleaned' is left alone (UPDATE WHERE status<>'cleaned'

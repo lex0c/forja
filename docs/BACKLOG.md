@@ -57,11 +57,13 @@ the cache filesystem, and `git worktree list --porcelain` output.
 
 **Pending / known limitations:**
 
-- **Cross-repo gc.** The reaper assumes the parent's cwd is the same repo across all worktrees. An operator running gc from a sub-repo of a monorepo would only see worktrees branched off THAT subrepo. Multi-repo gc would need a registry of parent paths in the audit table — out of scope.
+- **Cross-repo scoping is per-invocation.** gc invoked from repo A only operates on rows whose parent session's cwd is at or under A's repo root (resolved via `git rev-parse --show-toplevel`, fallback to literal cwd). Worktrees from repo B remain untouched even if both repos share the global DB + cache root. Operator must run gc in each repo to clean that repo's leftovers. A multi-repo "sweep all" would need explicit operator opt-in (`--all-repos`?) — defer until demand exists.
+- **Orphan-parent worktrees invisible to gc.** `subagent_worktrees.session_id` references the CHILD session; the JOIN to find the parent's cwd uses `sessions.parent_session_id`. If the parent session was deleted (manual purge, FK SET NULL cascade), the row becomes invisible to `--worktrees gc`. Operator must clean manually (rm dir + DB UPDATE). Rare in practice; documenting because the path-scoping query intentionally excludes parent-NULL rows to keep cross-repo isolation safe.
+- **Nested repos confuse scoping.** Repo B physically inside repo A (`/a/.../b`) — gc from A includes B's rows because `b/cwd LIKE /a/%`. The LIKE doesn't distinguish "subdirectory" from "nested git repo". gc from B gets the precise scope; gc from A surfaces B's rows. Per-row `git rev-parse` would fix it but adds a fork per row. Defer.
 - **Concurrent gc invocations.** Two `gc` runs at the same time would race on the same worktree (both query the plan, both try to remove). The second would see `git worktree remove` fail with "not a worktree". Not catastrophic — the loser's audit row stays untouched, the winner's flips. Could add advisory file locking later; defer.
 - **No retention TTL.** Currently gc removes any clean preserved worktree, regardless of age. An operator might want "preserve last 24h, remove older" — that's a future flag (`--older-than 24h`).
 
-**Verification:** `bun test` 1413 pass / 10 skip / 0 fail (+28 new); `tsc --noEmit` clean; `biome check` clean.
+**Verification:** `bun test` 1428 pass / 10 skip / 0 fail (+43 new across all review iterations including LIKE-wildcard regression); `tsc --noEmit` clean; `biome check` clean. Real-surface smoke `evals/smoke-worktree-gc.sh` passes — covers `git rev-parse`, `git worktree list --porcelain` parsing, `git worktree remove --force`, real filesystem mutation, and the operator CLI dispatch end-to-end without a provider call.
 
 **Next:** With 4.2d landed, the 4.2 arc is COMPLETE (a, b, b.i, b.ii.a/b, b.iii, b.iv, d). The 4.2c (per-step checkpoints inside subagent worktrees) remains explicitly out of scope — not in spec, no consumer demand. M3 next steps move out of subagents into the M3-tail items per `docs/spec/AGENTIC_CLI.md` §13: MCP, recap, code index, memory subsystems.
 

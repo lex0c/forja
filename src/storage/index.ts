@@ -100,6 +100,7 @@ export {
   insertSubagentWorktree,
   listAllSubagentWorktrees,
   listOnDiskSubagentWorktrees,
+  listSubagentWorktreesByRepo,
   markSubagentWorktreeCleaned,
 } from './repos/subagent-worktrees.ts';
 export type {

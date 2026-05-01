@@ -28,7 +28,7 @@ import { type Dirent, existsSync, lstatSync, readdirSync, realpathSync, rmSync }
 import { join, sep } from 'node:path';
 import {
   type DB,
-  listAllSubagentWorktrees,
+  listSubagentWorktreesByRepo,
   markSubagentWorktreeCleaned,
 } from '../storage/index.ts';
 import { defaultWorktreeRoot } from './worktree.ts';
@@ -117,6 +117,14 @@ export interface BuildGcPlanOptions {
   // runs `git -C <worktree> status --porcelain`; tests pin
   // clean/dirty per path.
   worktreeStatus?: (path: string) => Promise<'clean' | 'dirty' | 'unreadable'>;
+  // Test seam: substitute the repo-root resolver. Production
+  // runs `git -C <parentCwd> rev-parse --show-toplevel`; tests
+  // pin a literal path so the repo-scoping filter exercises
+  // deterministically without a real git repo. Returning null
+  // signals "not a git repo" — the engine then keeps the
+  // unscoped behavior would be unsafe, so it falls back to
+  // an empty plan with a warning.
+  resolveRepoRoot?: (parentCwd: string) => Promise<string | null>;
 }
 
 const defaultRunGitWorktreeList = async (parentCwd: string): Promise<string> => {
@@ -153,6 +161,31 @@ const defaultWorktreeStatus = async (path: string): Promise<'clean' | 'dirty' | 
   const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
   if (exitCode !== 0) return 'unreadable';
   return stdout.length === 0 ? 'clean' : 'dirty';
+};
+
+// Resolve the repo-root for the cwd gc was invoked from.
+// Production: `git rev-parse --show-toplevel`. Returns null if
+// the cwd isn't inside a git working tree (gc is meaningless
+// without git context — the engine surfaces that as a warning
+// and returns an empty plan rather than risking unscoped
+// removal).
+const defaultResolveRepoRoot = async (parentCwd: string): Promise<string | null> => {
+  const proc = Bun.spawn({
+    cmd: ['git', '-C', parentCwd, 'rev-parse', '--show-toplevel'],
+    env: {
+      LC_ALL: 'C',
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_LITERAL_PATHSPECS: '1',
+      PATH: process.env.PATH ?? '',
+      HOME: process.env.HOME ?? '',
+    },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const [stdout, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  if (exitCode !== 0) return null;
+  const trimmed = stdout.trim();
+  return trimmed.length === 0 ? null : trimmed;
 };
 
 // Parse `git worktree list --porcelain` into a Map<path, branch>.
@@ -258,8 +291,34 @@ export const buildGcPlan = async (opts: BuildGcPlanOptions): Promise<WorktreeGcP
   const cacheRoot = opts.cacheRoot ?? defaultWorktreeRoot(opts.env);
   const runWorktreeList = opts.runGitWorktreeList ?? defaultRunGitWorktreeList;
   const checkStatus = opts.worktreeStatus ?? defaultWorktreeStatus;
+  const resolveRepoRoot = opts.resolveRepoRoot ?? defaultResolveRepoRoot;
 
-  const dbRows = listAllSubagentWorktrees(opts.db);
+  // Repo scoping: the DB and the cache root are global
+  // resources shared across every repository the operator
+  // works in. An unscoped query (the original implementation)
+  // would surface worktrees from OTHER repos as candidates;
+  // `--force` (or even auto-removal of clean preserved
+  // entries via the rmSync fallback) would silently destroy
+  // preserved work from repo B while operator runs gc in
+  // repo A.
+  //
+  // Resolve the parent's repo root via `git rev-parse
+  // --show-toplevel` and filter rows by their parent session's
+  // cwd. If git can't resolve (parentCwd not inside a git
+  // working tree, git not on PATH, etc.), fall back to the
+  // literal parentCwd as the scoping key — still scoped, just
+  // less precise. We surface that fallback as a warning so
+  // operators in non-git contexts know rows that come from
+  // sibling cwds aren't visible to this gc invocation.
+  let repoRoot = await resolveRepoRoot(opts.parentCwd);
+  const warnings: string[] = [];
+  if (repoRoot === null) {
+    repoRoot = opts.parentCwd;
+    warnings.push(
+      `gc: '${opts.parentCwd}' is not inside a git repository; scoping audit query to literal cwd. Sessions whose parent cwd doesn't match exactly won't be visible.`,
+    );
+  }
+  const dbRows = listSubagentWorktreesByRepo(opts.db, repoRoot);
   // Build the path-keyed maps using canonicalized keys so all
   // three sources (DB, git, cache) collapse to the same path
   // string when they refer to the same worktree. Without this,
@@ -288,16 +347,19 @@ export const buildGcPlan = async (opts: BuildGcPlanOptions): Promise<WorktreeGcP
   // operator's entire repository.
   //
   // Filter rule: a candidate path enters the plan only if
-  //   (a) the audit DB knows it (operator may have customized
-  //       `rootDir` so the path is outside the cache root —
-  //       the audit row is the authoritative "this is a Forja
-  //       worktree" signal), OR
-  //   (b) the path lives strictly under the cache root (the
-  //       cache scan picks up dirs we created; orphans and
-  //       leftover directories also live here).
-  // Anything else — the parent repo's main worktree, the
-  // operator's hand-rolled linked worktrees, etc. — is
-  // categorically out of scope for `agent --worktrees gc`.
+  //   (a) the audit DB (now scoped to the current repo) knows
+  //       the path — the authoritative "this is a Forja
+  //       worktree from THIS repo" signal, OR
+  //   (b) the current repo's git lists the path (path lives
+  //       under the cache root AND the parent's git knows it
+  //       as a linked worktree).
+  // Cache dirs that don't satisfy (a) or (b) are categorically
+  // out of scope: they may belong to other repos that share
+  // this cache root — emitting them would let `--force`
+  // destroy preserved work from another repository's gc
+  // surface. Operator runs gc per-repo to clean up each
+  // repo's leftovers; truly-orphan dirs from a deleted repo
+  // (no git, no DB anywhere) need manual operator action.
   const cacheDirs = listCacheDirs(cacheRoot);
   const allPaths = new Set<string>();
   for (const row of dbRows) allPaths.add(canonicalize(row.path));
@@ -308,13 +370,15 @@ export const buildGcPlan = async (opts: BuildGcPlanOptions): Promise<WorktreeGcP
   }
   for (const path of cacheDirs) {
     const canonical = canonicalize(path);
-    if (dbByPath.has(canonical) || isUnderRoot(canonical, canonicalCacheRoot)) {
+    // Only include cache dirs that the current repo's audit
+    // OR git knows about. Foreign repos sharing the cache
+    // root would otherwise leak into the plan.
+    if (dbByPath.has(canonical) || gitByPath.has(canonical)) {
       allPaths.add(canonical);
     }
   }
 
   const entries: WorktreeGcEntry[] = [];
-  const warnings: string[] = [];
 
   for (const path of allPaths) {
     const dbRow = dbByPath.get(path);
