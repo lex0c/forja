@@ -45,6 +45,13 @@ interface SyntaxNode {
 export interface ExtractResult {
   symbols: Omit<IndexSymbol, 'id'>[];
   imports: Omit<Import, 'id' | 'sourceFile' | 'targetPath'>[];
+  // True when tree-sitter recovered from one or more syntax
+  // errors in the source — the extractor still pulled the
+  // valid constructs surrounding ERROR/MISSING nodes, but the
+  // result is necessarily incomplete. Caller (the pipeline)
+  // persists this as files.parse_status='partial' so consumers
+  // can distinguish healthy indexes from edit-time partials.
+  partial: boolean;
 }
 
 // Build a fully-qualified name for a method by joining its
@@ -367,7 +374,12 @@ const extractImport = (
 // enumerated in our typings); we cast to a minimal structural
 // view of what we touch — `rootNode` is the only field we
 // pull out, and the query runs against its node-shape.
-type TreeShape = { rootNode: SyntaxNode };
+// `hasError` is exposed by tree-sitter's native Tree.rootNode
+// as a boolean property — true iff any descendant is an ERROR
+// or MISSING node (i.e. the parser recovered around bad syntax).
+// Declared optional so the structural cast tolerates non-tree-
+// sitter parsers in tests, where it defaults to false.
+type TreeShape = { rootNode: SyntaxNode & { hasError?: boolean } };
 type QueryShape = {
   matches(node: SyntaxNode): { captures: { name: string; node: SyntaxNode }[] }[];
 };
@@ -404,5 +416,5 @@ export const extractFromSource = (
     }
   }
 
-  return { symbols, imports };
+  return { symbols, imports, partial: tree.rootNode.hasError === true };
 };

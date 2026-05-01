@@ -104,19 +104,19 @@ const scanOneFile = async (entry: WalkedFile, indexedAt: number): Promise<ScanFi
   let parseError: string | null = null;
   let symbols: Omit<IndexSymbol, 'id'>[] = [];
   let imports: Omit<Import, 'sourceFile' | 'targetPath' | 'id'>[] = [];
-  const partial = false;
+  let partial = false;
   try {
     const extracted = extractFromSource(source, entry.language, entry.relPath, parseSource);
     symbols = extracted.symbols;
     imports = extracted.imports;
-    // Partial-parse signal comes from the tree-sitter root: if
-    // any ERROR node exists, the parser recovered around bad
-    // syntax. We don't surface ERROR detection through the
-    // extractor (queries skip ERROR nodes naturally), so for
-    // now `partial` flags are deferred to slice 4.3.1.c when
-    // the CLI surface needs to report them. For 4.3.1.b every
-    // extracted file is 'ok'; failed reads/parses become
-    // 'failed'. Honest accounting beats false confidence.
+    partial = extracted.partial;
+    // tree-sitter is permissive: invalid syntax produces ERROR
+    // and MISSING nodes but the surrounding constructs still
+    // extract. Mark the file as 'partial' so consumers can
+    // distinguish a healthy index from edit-time partials —
+    // queries against this file's symbols/imports may be
+    // incomplete relative to the operator's intent.
+    if (partial) parseStatus = 'partial';
   } catch (e) {
     parseStatus = 'failed';
     parseError = e instanceof Error ? e.message : String(e);
@@ -163,9 +163,13 @@ type BatchSlot =
 // indexed file is delete-then-inserted, so repeated runs
 // converge on the current FS state. Files that existed in a
 // prior scan but no longer appear in the walk are pruned at
-// the end (rows older than this scan's start time). Reference
-// resolution is NOT run here (slice 4.3.3); the caller can
-// re-run the scan after that lands without losing data.
+// the end via a path-set diff (NOT an `indexed_at <` window —
+// `Date.now()` ms resolution allows successive fast scans to
+// collide on the same value, which would let removed files
+// escape pruning until a later scan crossed the ms boundary).
+// Reference resolution is NOT run here (slice 4.3.3); the
+// caller can re-run the scan after that lands without losing
+// data.
 export const scanProject = async (db: DB, opts: ScanOptions): Promise<ScanResult> => {
   const files = await walkProject(opts);
   const result: ScanResult = {
@@ -177,6 +181,41 @@ export const scanProject = async (db: DB, opts: ScanOptions): Promise<ScanResult
   };
   const indexedAt = Date.now();
 
+  // Temp table holding every path observed by this scan's
+  // walker — successfully indexed AND read-failed alike. The
+  // final prune deletes `files` rows whose path is NOT in this
+  // set, so removed files (and only those) get cleaned up. Read
+  // failures preserve their prior row by virtue of being in the
+  // seen set even though no new row is written.
+  // Drop-if-exists guards against an interrupted prior scan
+  // that left the table behind on this connection (temp tables
+  // are connection-scoped and survive across calls until the DB
+  // closes).
+  db.exec('DROP TABLE IF EXISTS _scan_seen');
+  db.exec('CREATE TEMPORARY TABLE _scan_seen (path TEXT PRIMARY KEY)');
+  try {
+    withTransaction(db, () => {
+      const stmt = db.query('INSERT OR IGNORE INTO _scan_seen (path) VALUES (?)');
+      for (const f of files) stmt.run(f.relPath);
+    });
+    return await runScan(db, files, indexedAt, opts, result);
+  } finally {
+    try {
+      db.exec('DROP TABLE IF EXISTS _scan_seen');
+    } catch {
+      // Best-effort cleanup; if the connection is closing or
+      // the table never got created, swallow.
+    }
+  }
+};
+
+const runScan = async (
+  db: DB,
+  files: WalkedFile[],
+  indexedAt: number,
+  opts: ScanOptions,
+  result: ScanResult,
+): Promise<ScanResult> => {
   for (let i = 0; i < files.length; i += BATCH_SIZE) {
     const batch = files.slice(i, i + BATCH_SIZE);
     // Read + parse + extract for each file in PARALLEL outside
@@ -240,12 +279,10 @@ export const scanProject = async (db: DB, opts: ScanOptions): Promise<ScanResult
 
   // Prune rows for files that existed in a prior scan but
   // didn't appear in this one (deleted, renamed, moved into an
-  // exclude pattern). Every file we touched this scan got its
-  // `indexed_at` set to `indexedAt`; survivors of a previous
-  // scan still carry their older value. CASCADE cleans up
-  // their symbols/imports/references.
+  // exclude pattern). FK CASCADE cleans up their
+  // symbols/imports/references.
   withTransaction(db, () => {
-    db.query('DELETE FROM files WHERE indexed_at < ?').run(indexedAt);
+    db.query('DELETE FROM files WHERE path NOT IN (SELECT path FROM _scan_seen)').run();
   });
 
   setMeta(db, 'last_full_scan_at', String(indexedAt));

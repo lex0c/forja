@@ -156,18 +156,43 @@ describe('CodeIndex.scan', () => {
     expect(idx.fileMeta('src/gone.ts')).not.toBeNull();
     expect(idx.getSymbol('gone').length).toBe(1);
 
-    // Remove the file from disk and re-scan. The row for
-    // src/gone.ts (and its cascaded symbols) should disappear.
+    // Remove the file from disk and re-scan immediately — no
+    // sleep. The prune uses a path-set diff, NOT an indexed_at
+    // window, so it must work even when both scans share the
+    // same Date.now() ms value (coarse-grain clock collision).
     rmSync(join(root, 'src/gone.ts'));
-    // Sleep 5 ms so re-scan's `indexedAt` is strictly later
-    // than the prior scan's, even on coarse-grain clocks.
-    await new Promise((r) => setTimeout(r, 5));
     await idx.scan({ respectGitignore: false });
 
     expect(idx.fileMeta('src/gone.ts')).toBeNull();
     expect(idx.getSymbol('gone').length).toBe(0);
     expect(idx.fileMeta('src/keep.ts')).not.toBeNull();
     expect(idx.getSymbol('keep').length).toBe(1);
+    idx.close();
+  });
+
+  test('prune is timestamp-independent (same-ms successive scans)', async () => {
+    // Pin the contract: even when Date.now() returns the SAME
+    // value for two scans (possible on coarse-grain clocks or
+    // back-to-back fast runs), removed files are still pruned.
+    // Stub Date.now to return a constant value across both
+    // scans, exercising the path-set diff in isolation.
+    writeFile(root, 'src/keep.ts', 'export const keep = 1;');
+    writeFile(root, 'src/gone.ts', 'export const gone = 2;');
+    const idx = await CodeIndex.init({ projectRoot: root, dbOverride: openMemoryDb() });
+
+    const realNow = Date.now;
+    const FROZEN = realNow();
+    Date.now = () => FROZEN;
+    try {
+      await idx.scan({ respectGitignore: false });
+      rmSync(join(root, 'src/gone.ts'));
+      await idx.scan({ respectGitignore: false });
+    } finally {
+      Date.now = realNow;
+    }
+
+    expect(idx.fileMeta('src/gone.ts')).toBeNull();
+    expect(idx.fileMeta('src/keep.ts')).not.toBeNull();
     idx.close();
   });
 
@@ -198,6 +223,44 @@ describe('CodeIndex.scan', () => {
     const status = idx.status();
     expect(status.lastFullScanAt).not.toBeNull();
     expect(status.lastFullScanAt).toBeGreaterThanOrEqual(before);
+    idx.close();
+  });
+
+  test('marks files with syntax errors as parse_status=partial', async () => {
+    // tree-sitter recovers around invalid syntax: it emits
+    // ERROR / MISSING nodes but still produces an AST. The
+    // valid constructs around the breakage are still extracted.
+    // The pipeline must mark the file as partial, NOT ok, so
+    // consumers can distinguish a healthy index from an
+    // edit-time partial (CODE_INDEX.md §3 implies this and
+    // the schema's `partial` enum exists for it).
+    writeFile(
+      root,
+      'src/broken.ts',
+      `
+        export function ok() {}
+        export class Broken { ## invalid ##
+        export function maybeRecovered() {}
+      `,
+    );
+    writeFile(root, 'src/clean.ts', 'export function clean() {}');
+    const idx = await CodeIndex.init({ projectRoot: root, dbOverride: openMemoryDb() });
+    const result = await idx.scan({ respectGitignore: false });
+
+    expect(result.filesScanned).toBe(2);
+    expect(result.partials).toBe(1);
+
+    const broken = idx.fileMeta('src/broken.ts');
+    expect(broken?.parseStatus).toBe('partial');
+    expect(broken?.parseError).toBeNull();
+
+    const clean = idx.fileMeta('src/clean.ts');
+    expect(clean?.parseStatus).toBe('ok');
+
+    // Symbols around the syntax error still extract — partial
+    // is a quality signal, not a "drop everything" mode.
+    expect(idx.getSymbol('ok').length).toBe(1);
+    expect(idx.getSymbol('clean').length).toBe(1);
     idx.close();
   });
 
