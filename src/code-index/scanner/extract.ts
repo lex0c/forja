@@ -365,6 +365,82 @@ const extractImport = (
   };
 };
 
+// Extract the import structure from a `require('module')`
+// call. CommonJS interop — the call_expression captured by the
+// `@import.require` query already has function='require' (the
+// query's #eq? predicate filtered, plus a defensive recheck
+// here in case a binding ignores predicates).
+//
+// `importedNames` semantics for require:
+//   - Bare side-effect call `require('foo')` → []
+//   - Assigned to identifier OR bound to member access
+//     (`const x = require('foo')`, `require('foo').bar`)
+//     → ['default']. Destructuring `const { a } = require('foo')`
+//     also collapses to ['default'] for now — extracting individual
+//     property names would require walking the parent
+//     variable_declarator's name pattern, which we defer until
+//     CJS-heavy projects need finer-grained graph data.
+const extractRequire = (
+  defNode: SyntaxNode,
+): Omit<Import, 'id' | 'sourceFile' | 'targetPath'> | null => {
+  // Defense-in-depth: confirm function identifier is 'require'
+  // even though the query's #eq? predicate already filtered.
+  // Some tree-sitter bindings may silently ignore predicates;
+  // matching every call_expression as a require would be
+  // catastrophic.
+  const fnNode = fieldNode(defNode, 'function');
+  if (fnNode === null || fnNode.text !== 'require') return null;
+
+  const argsNode = fieldNode(defNode, 'arguments');
+  if (argsNode === null) return null;
+
+  // First (and only relevant) named child of `arguments` must
+  // be a `string` literal. Dynamic require — `require(name)` —
+  // can't resolve at index time, so we drop it.
+  const firstArg = (argsNode.namedChildren ?? [])[0];
+  if (firstArg === undefined || firstArg.type !== 'string') return null;
+
+  let targetModule: string | null = null;
+  for (const child of firstArg.namedChildren ?? []) {
+    if (child.type === 'string_fragment') {
+      targetModule = child.text;
+      break;
+    }
+  }
+  if (targetModule === null) return null;
+
+  // Determine importedNames from surrounding context. The call
+  // can be:
+  //   - directly a statement child (bare side effect): []
+  //   - the `value` of a `variable_declarator`: ['default']
+  //   - the `object` of a `member_expression` (`require('x').y`)
+  //     or `subscript_expression` (`require('x')[k]`): ['default']
+  // We don't try to extract specific names from destructuring
+  // patterns (see header comment).
+  const importedNames: string[] = [];
+  const parent = defNode.parent;
+  if (
+    parent !== null &&
+    (parent.type === 'variable_declarator' ||
+      parent.type === 'member_expression' ||
+      parent.type === 'subscript_expression')
+  ) {
+    importedNames.push('default');
+  }
+
+  const isExternal = !(
+    targetModule.startsWith('./') ||
+    targetModule.startsWith('../') ||
+    targetModule.startsWith('/')
+  );
+
+  return {
+    targetModule,
+    importedNames,
+    isExternal,
+  };
+};
+
 // Public surface: parse the source, run the language's query,
 // extract structured symbols + imports. Caller (the scanner
 // pipeline in slice 4.3.1.b) provides the project-relative
@@ -408,6 +484,9 @@ export const extractFromSource = (
         symbols.push(...extractConstSymbols(capture.node, filePath, exportedNames));
       } else if (capture.name === 'import.stmt') {
         const imp = extractImport(capture.node);
+        if (imp !== null) imports.push(imp);
+      } else if (capture.name === 'import.require') {
+        const imp = extractRequire(capture.node);
         if (imp !== null) imports.push(imp);
       } else if (capture.name in symbolDescriptor) {
         const sym = extractGenericSymbol(capture.name, capture.node, filePath, exportedNames);

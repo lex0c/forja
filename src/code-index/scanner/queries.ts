@@ -12,14 +12,15 @@
 // into the extractor where they're easier to test.
 //
 // Capture name conventions:
-//   @symbol.fn      — function_declaration
-//   @symbol.class   — class_declaration
-//   @symbol.method  — method_definition (inside class_body)
-//   @symbol.iface   — interface_declaration (TS only)
-//   @symbol.type    — type_alias_declaration (TS only)
-//   @symbol.enum    — enum_declaration (TS only)
-//   @symbol.const   — lexical_declaration with `const`
-//   @import.stmt    — import_statement (extractor walks for names + source)
+//   @symbol.fn       — function_declaration
+//   @symbol.class    — class_declaration
+//   @symbol.method   — method_definition (inside class_body)
+//   @symbol.iface    — interface_declaration (TS only)
+//   @symbol.type     — type_alias_declaration (TS only)
+//   @symbol.enum     — enum_declaration (TS only)
+//   @symbol.const    — lexical_declaration with `const`
+//   @import.stmt     — import_statement (extractor walks for names + source)
+//   @import.require  — `require('module')` call_expression (CJS interop)
 
 // ---------- TypeScript ----------
 
@@ -68,6 +69,20 @@ export const TS_QUERY = `
 (program (export_statement (lexical_declaration "const") @symbol.const))
 
 (import_statement) @import.stmt
+
+;; CommonJS interop: capture every call_expression whose
+;; function identifier is "require". Unscoped (matches anywhere
+;; in the program — lazy-load require inside functions is a
+;; real CJS pattern and a real edge in the import graph). The
+;; #eq? predicate keeps the match cost bounded; without it,
+;; every call_expression in the file would match and the
+;; extractor would have to filter every one. The extractor
+;; ALSO checks function.text === "require" defensively in case
+;; a tree-sitter binding silently ignores predicates.
+((call_expression
+  function: (identifier) @_fn
+  arguments: (arguments . (string)))
+ (#eq? @_fn "require")) @import.require
 `;
 
 // TSX (JSX-augmented TypeScript) shares every relevant
@@ -97,6 +112,12 @@ export const JS_QUERY = `
 (program (export_statement (lexical_declaration "const") @symbol.const))
 
 (import_statement) @import.stmt
+
+;; CJS require — see TS_QUERY for rationale.
+((call_expression
+  function: (identifier) @_fn
+  arguments: (arguments . (string)))
+ (#eq? @_fn "require")) @import.require
 `;
 
 import type { SupportedLanguage } from './language.ts';

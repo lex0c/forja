@@ -468,6 +468,79 @@ describe('extractFromSource — Imports', () => {
     expect(imports[0]?.importedNames).toEqual(['login']);
   });
 
+  test('CJS require — bare side-effect call records targetModule with empty names', () => {
+    const src = 'require("./polyfill");';
+    const { imports } = extractFromSource(src, 'javascript', 'src/x.js', parseSource);
+    expect(imports.length).toBe(1);
+    expect(imports[0]).toMatchObject({
+      targetModule: './polyfill',
+      isExternal: false,
+      importedNames: [],
+    });
+  });
+
+  test('CJS require — assigned to const records default name', () => {
+    const src = 'const fs = require("fs");';
+    const { imports } = extractFromSource(src, 'javascript', 'src/x.js', parseSource);
+    expect(imports.length).toBe(1);
+    expect(imports[0]).toMatchObject({
+      targetModule: 'fs',
+      isExternal: true,
+      importedNames: ['default'],
+    });
+  });
+
+  test('CJS require — destructuring assignment records default (not individual names)', () => {
+    // Documented limitation: destructuring collapses to ['default'].
+    // Extracting individual property names requires walking the
+    // parent variable_declarator's name pattern; deferred until
+    // the import graph needs finer-grained CJS data.
+    const src = 'const { readFile, writeFile } = require("fs");';
+    const { imports } = extractFromSource(src, 'javascript', 'src/x.js', parseSource);
+    expect(imports[0]?.targetModule).toBe('fs');
+    expect(imports[0]?.importedNames).toEqual(['default']);
+  });
+
+  test('CJS require — member access (`require("x").y`) still captures targetModule', () => {
+    const src = 'const x = require("./util").helper;';
+    const { imports } = extractFromSource(src, 'javascript', 'src/x.js', parseSource);
+    expect(imports.length).toBe(1);
+    expect(imports[0]?.targetModule).toBe('./util');
+    expect(imports[0]?.importedNames).toEqual(['default']);
+  });
+
+  test('CJS require — dynamic argument (variable, not string) is dropped', () => {
+    // `require(name)` can't resolve at index time. Skipping is
+    // honest — the import graph stays accurate to what we can
+    // statically determine.
+    const src = `
+      const name = "fs";
+      const fs = require(name);
+    `;
+    const { imports } = extractFromSource(src, 'javascript', 'src/x.js', parseSource);
+    expect(imports).toEqual([]);
+  });
+
+  test('CJS require — works in TypeScript files too (CJS interop)', () => {
+    const src = 'const fs = require("fs");';
+    const { imports } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    expect(imports[0]?.targetModule).toBe('fs');
+  });
+
+  test('CJS require — lazy-load inside function still captures', () => {
+    // Unlike top-level declarations, require() is captured
+    // unscoped — lazy-load patterns are real CJS dependencies.
+    const src = `
+      function load() {
+        const heavy = require("./heavy");
+        return heavy;
+      }
+    `;
+    const { imports } = extractFromSource(src, 'javascript', 'src/x.js', parseSource);
+    expect(imports.length).toBe(1);
+    expect(imports[0]?.targetModule).toBe('./heavy');
+  });
+
   test('type-only imports (`import type { X }`) extract names', () => {
     // TS `import type` produces an import_statement whose
     // import_clause carries a `type` keyword. The named_imports
