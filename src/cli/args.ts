@@ -347,7 +347,16 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
       }
       case '--subagent-bg-log-dir': {
         const value = argv[i + 1];
-        if (value === undefined || value.length === 0) {
+        // Reject flag-shaped values (`--subagent-bg-log-dir
+        // --subagent-depth 2`) — without the `--` check, the
+        // path consumer would silently swallow the next flag
+        // and start the child with the WRONG runtime state.
+        // Mirrors the guard on `--subagent-session-id`. Numeric
+        // flags (`--subagent-depth`, `--subagent-temperature`)
+        // get implicit protection via their stricter regex /
+        // Number() parse; the path flag accepts any string and
+        // needs the explicit guard.
+        if (value === undefined || value.length === 0 || value.startsWith('--')) {
           return {
             ok: false,
             message: '--subagent-bg-log-dir requires a directory path (internal flag)',

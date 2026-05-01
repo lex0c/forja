@@ -468,6 +468,37 @@ describe('--subagent-plan-mode', () => {
   });
 });
 
+describe('--subagent-bg-log-dir', () => {
+  test('captures path into args.subagentBgLogDir', () => {
+    const r = parseArgs(['--subagent-bg-log-dir', '/var/cache/agent/bg/sub-id']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentBgLogDir).toBe('/var/cache/agent/bg/sub-id');
+  });
+
+  test('rejects when value is missing or empty', () => {
+    expect(parseArgs(['--subagent-bg-log-dir']).ok).toBe(false);
+    expect(parseArgs(['--subagent-bg-log-dir', '']).ok).toBe(false);
+  });
+
+  test('rejects flag-shaped value (would otherwise eat the next internal flag)', () => {
+    // Without the startsWith('--') guard, the path consumer
+    // would silently swallow `--subagent-depth` and start the
+    // child with bgLogDir='--subagent-depth' AND no depth
+    // value — wrong runtime state with no error surfaced.
+    expect(parseArgs(['--subagent-bg-log-dir', '--subagent-depth', '2']).ok).toBe(false);
+    expect(parseArgs(['--subagent-bg-log-dir', '--json']).ok).toBe(false);
+    expect(parseArgs(['--subagent-bg-log-dir', '--']).ok).toBe(false);
+  });
+
+  test('absent by default — child runs without bg manager', () => {
+    const r = parseArgs(['hi']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentBgLogDir).toBeUndefined();
+  });
+});
+
 describe('usage', () => {
   test('mentions every recognized flag', () => {
     const u = usage();
