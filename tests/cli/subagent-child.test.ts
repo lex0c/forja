@@ -1008,6 +1008,31 @@ You are the worker.`,
     }
   }, 10_000);
 
+  test('codeIndex init failure surfaces a stderr warning, run still completes (slice 4.3.5)', async () => {
+    // Subagent-child opens its own CodeIndex (it bypasses
+    // bootstrap.ts). When init fails — here forced by seeding
+    // session.cwd at a non-existent path so realpathSync
+    // throws ENOENT — the error is logged via errSink and the
+    // run continues with codeIndex=undefined. Symbolic tools
+    // would surface `index.unavailable` in that state, but the
+    // run itself still exits 0 (graceful degradation, not
+    // session-killer).
+    const bogusCwd = join(dbDir, 'never-existed');
+    const { sessionId } = seedChildSession(bogusCwd);
+    const errMessages: string[] = [];
+    const exitCode = await runSubagentChild({
+      sessionId,
+      dbPath,
+      providerOverride: stubProvider('done'),
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      errSink: (s) => errMessages.push(s),
+    });
+    expect(exitCode).toBe(0);
+    expect(errMessages.join('')).toMatch(/code index unavailable/);
+    expect(errMessages.join('')).toContain('index.unavailable');
+  });
+
   test('non-existent session id surfaces a stderr line and exit 1', async () => {
     const errMessages: string[] = [];
     const exitCode = await runSubagentChild({

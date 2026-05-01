@@ -1,3 +1,5 @@
+import { CodeIndex } from '../code-index/index.ts';
+import { resolveProjectRoot } from '../code-index/project-root.ts';
 import { type HarnessResult, runAgent } from '../harness/index.ts';
 import { createPermissionEngine } from '../permissions/index.ts';
 import { type Provider, createDefaultRegistry } from '../providers/index.ts';
@@ -16,6 +18,7 @@ import {
 } from '../storage/index.ts';
 import { loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
+import { ERROR_CODES } from '../tools/types.ts';
 
 // M3 / Step 4.2b.ii.a — subagent-child entry path.
 //
@@ -202,6 +205,10 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
   // child's exit (Bun timers are ref'd by default; same reason
   // we unref the SIGKILL escalation in waitForChild).
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+
+  // Declared up here (instead of inside the try) so the outer
+  // finally can close it. Mirrors the heartbeatTimer pattern.
+  let codeIndex: CodeIndex | undefined;
 
   // Finalize the child session as error before any pre-harness
   // exit path returns 1. Without this, the row stays in
@@ -442,6 +449,24 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // empty user message — same as the resume path.
     const userPrompt = '';
 
+    // Initialize CodeIndex for the subagent run. Subagent
+    // children build their HarnessConfig directly (not via
+    // bootstrap.ts), so without this they'd run with
+    // codeIndex=undefined and the symbolic tools (read_symbol,
+    // find_references, …) would all surface
+    // `index.unavailable` — defeating the point of having
+    // them in the registry. Mirror bootstrap's pattern: open
+    // eagerly, swallow init failures (write to stderr; tools
+    // degrade gracefully), close in the outer finally above.
+    try {
+      const projectRoot = resolveProjectRoot(session.cwd);
+      codeIndex = await CodeIndex.init({ projectRoot });
+    } catch (e) {
+      errSink(
+        `forja: subagent-child: code index unavailable (${e instanceof Error ? e.message : String(e)}); symbolic tools will report ${ERROR_CODES.indexUnavailable}\n`,
+      );
+    }
+
     const config = {
       provider,
       toolRegistry: childRegistry,
@@ -517,6 +542,11 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // refuse at invocation time — same as a top-level run
       // without `bgLogDir`.
       ...(opts.bgLogDir !== undefined ? { bgLogDir: opts.bgLogDir } : {}),
+      // CodeIndex handle (slice 4.3.5). Threaded into
+      // ToolContext by the harness so the symbolic tools work
+      // in subagent runs. Undefined when init failed above —
+      // tools surface a clean error in that case.
+      ...(codeIndex !== undefined ? { codeIndex } : {}),
     };
 
     const result = await runAgent(config);
@@ -567,6 +597,13 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // throw on the next tick — swallowed inside the timer body
     // anyway, but the explicit ordering is cleaner.
     if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
+    // Close codeIndex before the session DB. Best-effort:
+    // close exceptions don't mask the run result.
+    try {
+      codeIndex?.close();
+    } catch {
+      // ignore — log noise on shutdown isn't useful
+    }
     db.close();
   }
 };
