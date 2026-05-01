@@ -155,57 +155,66 @@ describe('walkProject', () => {
     );
   });
 
-  test('preserves seenPaths when 100% of files fail lstat', async () => {
-    // Edge case of the previous test: every walked path fails
-    // lstat. files must be empty; seenPaths must hold both
-    // paths so the pipeline's prune does NOT delete the prior
-    // rows. Net effect of such a scan: zero changes.
-    spawnSync('git', ['init', '-q', root], { encoding: 'utf8' });
-    spawnSync('git', ['-C', root, 'config', 'user.email', 'test@example.com'], {
-      encoding: 'utf8',
-    });
-    spawnSync('git', ['-C', root, 'config', 'user.name', 'test'], { encoding: 'utf8' });
-    writeFile(root, 'src/a.ts', 'export const a = 1;');
-    writeFile(root, 'src/b.ts', 'export const b = 2;');
-    spawnSync('git', ['-C', root, 'add', '.'], { encoding: 'utf8' });
-    spawnSync('git', ['-C', root, 'commit', '-q', '-m', 'init'], { encoding: 'utf8' });
-    rmSync(join(root, 'src/a.ts'));
-    rmSync(join(root, 'src/b.ts'));
-
-    const { files, seenPaths } = await walkProject({
-      projectRoot: root,
-      respectGitignore: true,
-    });
-    expect(files).toEqual([]);
-    expect(seenPaths.sort()).toEqual(['src/a.ts', 'src/b.ts']);
-  });
-
-  test('keeps stat-failed paths in seenPaths (does not drop them)', async () => {
-    // Use git ls-files as the lister: we add and commit a file,
-    // then rm it from the working tree without `git rm`. The
-    // file stays in the git cache so ls-files still lists it,
-    // but lstat throws ENOENT. The walker MUST keep the path
-    // in seenPaths so the pipeline's prune doesn't treat the
-    // failure as a deletion (which would wipe the prior row).
+  test('drops ENOENT paths from seenPaths (real deletion via working-tree rm)', async () => {
+    // git ls-files --cached still emits files that were rm'd
+    // from the working tree (they remain in the git index until
+    // a commit removes them). Their lstat returns ENOENT —
+    // that's a definitive "file is gone", not a transient
+    // failure. seenPaths must NOT preserve such paths;
+    // otherwise the pipeline's prune would keep the row alive
+    // until a future commit, masking normal edit/delete flows.
+    if (isRoot) return;
     spawnSync('git', ['init', '-q', root], { encoding: 'utf8' });
     spawnSync('git', ['-C', root, 'config', 'user.email', 'test@example.com'], {
       encoding: 'utf8',
     });
     spawnSync('git', ['-C', root, 'config', 'user.name', 'test'], { encoding: 'utf8' });
     writeFile(root, 'src/keep.ts', 'export const keep = 1;');
-    writeFile(root, 'src/disappears.ts', 'export const x = 2;');
+    writeFile(root, 'src/deleted.ts', 'export const x = 2;');
     spawnSync('git', ['-C', root, 'add', '.'], { encoding: 'utf8' });
     spawnSync('git', ['-C', root, 'commit', '-q', '-m', 'init'], { encoding: 'utf8' });
-    rmSync(join(root, 'src/disappears.ts'));
+    rmSync(join(root, 'src/deleted.ts'));
 
     const { files, seenPaths } = await walkProject({
       projectRoot: root,
       respectGitignore: true,
     });
     expect(files.map((f) => f.relPath)).toEqual(['src/keep.ts']);
-    // disappears.ts: listed by git ls-files, lstat fails ENOENT,
-    // path lands in seenPaths to preserve any prior index row.
-    expect(seenPaths.sort()).toEqual(['src/disappears.ts', 'src/keep.ts']);
+    // ENOENT → drop, not preserve. Only keep.ts in seenPaths.
+    expect(seenPaths).toEqual(['src/keep.ts']);
+  });
+
+  test('preserves transient lstat failures (EACCES from unreadable parent)', async () => {
+    // EACCES on lstat means "we can't read this file's
+    // metadata RIGHT NOW" — the file may still exist. The
+    // walker MUST keep the path in seenPaths so the pipeline's
+    // prune doesn't treat the access error as a deletion. We
+    // simulate this by chmod 000 on the parent dir while the
+    // file is still tracked by git.
+    if (isRoot) return;
+    spawnSync('git', ['init', '-q', root], { encoding: 'utf8' });
+    spawnSync('git', ['-C', root, 'config', 'user.email', 'test@example.com'], {
+      encoding: 'utf8',
+    });
+    spawnSync('git', ['-C', root, 'config', 'user.name', 'test'], { encoding: 'utf8' });
+    writeFile(root, 'src/keep.ts', 'export const keep = 1;');
+    writeFile(root, 'locked/blocked.ts', 'export const x = 2;');
+    spawnSync('git', ['-C', root, 'add', '.'], { encoding: 'utf8' });
+    spawnSync('git', ['-C', root, 'commit', '-q', '-m', 'init'], { encoding: 'utf8' });
+
+    chmodSync(join(root, 'locked'), 0o000);
+    try {
+      const { files, seenPaths } = await walkProject({
+        projectRoot: root,
+        respectGitignore: true,
+      });
+      // Only keep.ts could be lstat'd; blocked.ts hit EACCES.
+      expect(files.map((f) => f.relPath)).toEqual(['src/keep.ts']);
+      // EACCES → preserve. blocked.ts in seenPaths.
+      expect(seenPaths.sort()).toEqual(['locked/blocked.ts', 'src/keep.ts']);
+    } finally {
+      chmodSync(join(root, 'locked'), 0o755);
+    }
   });
 
   test('reports unreadable directories in failedDirs (fallback walk)', async () => {

@@ -343,77 +343,110 @@ describe('CodeIndex.scan', () => {
     idx.close();
   });
 
-  test('preserves rows for paths whose lstat transiently fails', async () => {
-    // Simulate a transient lstat failure: track a file in git,
-    // index it, then `rm` it from the working tree without
-    // `git rm`. ls-files still lists the path; lstat fails
-    // ENOENT. The prune MUST NOT remove its prior row — that
-    // would turn an FS hiccup into permanent data loss.
+  test('preserves rows on transient lstat failures (EACCES from unreadable parent)', async () => {
+    // EACCES on lstat means the file may exist but its metadata
+    // is currently unreadable. The pipeline's prune must NOT
+    // delete its prior row — that would turn an FS hiccup into
+    // permanent data loss. Simulate via chmod 000 on a parent
+    // dir while git ls-files still emits the child path.
+    if (isRoot) return;
     spawnSync('git', ['init', '-q', root], { encoding: 'utf8' });
     spawnSync('git', ['-C', root, 'config', 'user.email', 'test@example.com'], {
       encoding: 'utf8',
     });
     spawnSync('git', ['-C', root, 'config', 'user.name', 'test'], { encoding: 'utf8' });
     writeFile(root, 'src/keep.ts', 'export const keep = 1;');
-    writeFile(root, 'src/flaky.ts', 'export const flaky = 2;');
+    writeFile(root, 'locked/flaky.ts', 'export const flaky = 2;');
     spawnSync('git', ['-C', root, 'add', '.'], { encoding: 'utf8' });
     spawnSync('git', ['-C', root, 'commit', '-q', '-m', 'init'], { encoding: 'utf8' });
 
     const idx = await CodeIndex.init({ projectRoot: root, dbOverride: openMemoryDb() });
     await idx.scan({ respectGitignore: true });
-    expect(idx.fileMeta('src/flaky.ts')).not.toBeNull();
+    expect(idx.fileMeta('locked/flaky.ts')).not.toBeNull();
     expect(idx.getSymbol('flaky').length).toBe(1);
 
-    // Disappear flaky.ts from the working tree but keep it in
-    // git cache. ls-files still lists it; lstat → ENOENT.
-    rmSync(join(root, 'src/flaky.ts'));
+    chmodSync(join(root, 'locked'), 0o000);
+    try {
+      await idx.scan({ respectGitignore: true });
+      // flaky's row preserved across the EACCES; keep
+      // re-indexed normally.
+      expect(idx.fileMeta('locked/flaky.ts')).not.toBeNull();
+      expect(idx.getSymbol('flaky').length).toBe(1);
+      expect(idx.fileMeta('src/keep.ts')).not.toBeNull();
+    } finally {
+      chmodSync(join(root, 'locked'), 0o755);
+    }
+    idx.close();
+  });
+
+  test('prunes rows when lstat returns ENOENT (working-tree delete without git rm)', async () => {
+    // A normal edit/delete flow: operator rm's a file from the
+    // working tree before committing. git ls-files still lists
+    // it; lstat returns ENOENT. The prune MUST remove the prior
+    // row immediately — keeping it would silently leave deleted
+    // code queryable until a future commit updated the index.
+    spawnSync('git', ['init', '-q', root], { encoding: 'utf8' });
+    spawnSync('git', ['-C', root, 'config', 'user.email', 'test@example.com'], {
+      encoding: 'utf8',
+    });
+    spawnSync('git', ['-C', root, 'config', 'user.name', 'test'], { encoding: 'utf8' });
+    writeFile(root, 'src/keep.ts', 'export const keep = 1;');
+    writeFile(root, 'src/deleted.ts', 'export const deleted = 2;');
+    spawnSync('git', ['-C', root, 'add', '.'], { encoding: 'utf8' });
+    spawnSync('git', ['-C', root, 'commit', '-q', '-m', 'init'], { encoding: 'utf8' });
+
+    const idx = await CodeIndex.init({ projectRoot: root, dbOverride: openMemoryDb() });
+    await idx.scan({ respectGitignore: true });
+    expect(idx.fileMeta('src/deleted.ts')).not.toBeNull();
+
+    rmSync(join(root, 'src/deleted.ts'));
     await idx.scan({ respectGitignore: true });
 
-    // flaky's row + symbols preserved across the transient
-    // failure. keep is still re-indexed normally.
-    expect(idx.fileMeta('src/flaky.ts')).not.toBeNull();
-    expect(idx.getSymbol('flaky').length).toBe(1);
+    expect(idx.fileMeta('src/deleted.ts')).toBeNull();
+    expect(idx.getSymbol('deleted').length).toBe(0);
     expect(idx.fileMeta('src/keep.ts')).not.toBeNull();
     idx.close();
   });
 
-  test('discriminates lstat-failed (preserve) from truly-removed (prune)', async () => {
-    // Mixed scenario proves the seenPaths discriminator: in a
-    // single scan we have one file whose lstat fails (preserve
-    // its row) AND one file that's been properly removed from
-    // git (prune its row). A single scan must produce both
-    // outcomes correctly.
+  test('discriminates transient lstat fail (preserve), ENOENT (prune), git rm (prune)', async () => {
+    // Three outcomes in a single scan:
+    //   - locked/flaky.ts: EACCES via chmod 000 → preserve
+    //   - src/missing.ts:  rm working tree (ENOENT) → prune
+    //   - src/gone.ts:     git rm → not in ls-files → prune
+    //   - src/keep.ts:     normal → re-index
+    if (isRoot) return;
     spawnSync('git', ['init', '-q', root], { encoding: 'utf8' });
     spawnSync('git', ['-C', root, 'config', 'user.email', 'test@example.com'], {
       encoding: 'utf8',
     });
     spawnSync('git', ['-C', root, 'config', 'user.name', 'test'], { encoding: 'utf8' });
     writeFile(root, 'src/keep.ts', 'export const keep = 1;');
-    writeFile(root, 'src/flaky.ts', 'export const flaky = 2;');
-    writeFile(root, 'src/gone.ts', 'export const gone = 3;');
+    writeFile(root, 'locked/flaky.ts', 'export const flaky = 2;');
+    writeFile(root, 'src/missing.ts', 'export const missing = 3;');
+    writeFile(root, 'src/gone.ts', 'export const gone = 4;');
     spawnSync('git', ['-C', root, 'add', '.'], { encoding: 'utf8' });
     spawnSync('git', ['-C', root, 'commit', '-q', '-m', 'init'], { encoding: 'utf8' });
 
     const idx = await CodeIndex.init({ projectRoot: root, dbOverride: openMemoryDb() });
     await idx.scan({ respectGitignore: true });
-    expect(idx.fileMeta('src/keep.ts')).not.toBeNull();
-    expect(idx.fileMeta('src/flaky.ts')).not.toBeNull();
-    expect(idx.fileMeta('src/gone.ts')).not.toBeNull();
+    expect(idx.status().filesIndexed).toBe(4);
 
-    // flaky.ts: rm working tree, keep in git cache. ls-files
-    // still lists it; lstat fails ENOENT → seenPaths preserves.
-    rmSync(join(root, 'src/flaky.ts'));
-    // gone.ts: properly remove from git cache. ls-files no
-    // longer lists it → not in seenPaths → prune deletes.
+    rmSync(join(root, 'src/missing.ts'));
     spawnSync('git', ['-C', root, 'rm', '-q', 'src/gone.ts'], { encoding: 'utf8' });
     spawnSync('git', ['-C', root, 'commit', '-q', '-m', 'remove gone'], { encoding: 'utf8' });
+    chmodSync(join(root, 'locked'), 0o000);
+    try {
+      await idx.scan({ respectGitignore: true });
+    } finally {
+      chmodSync(join(root, 'locked'), 0o755);
+    }
 
-    await idx.scan({ respectGitignore: true });
-
-    expect(idx.fileMeta('src/keep.ts')).not.toBeNull();
-    expect(idx.fileMeta('src/flaky.ts')).not.toBeNull(); // preserved
-    expect(idx.fileMeta('src/gone.ts')).toBeNull(); // pruned
+    expect(idx.fileMeta('src/keep.ts')).not.toBeNull(); // re-indexed
+    expect(idx.fileMeta('locked/flaky.ts')).not.toBeNull(); // preserved (EACCES)
+    expect(idx.fileMeta('src/missing.ts')).toBeNull(); // pruned (ENOENT)
+    expect(idx.fileMeta('src/gone.ts')).toBeNull(); // pruned (git rm)
     expect(idx.getSymbol('flaky').length).toBe(1);
+    expect(idx.getSymbol('missing').length).toBe(0);
     expect(idx.getSymbol('gone').length).toBe(0);
     idx.close();
   });

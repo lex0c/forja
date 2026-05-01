@@ -64,16 +64,16 @@ export interface WalkResult {
   files: WalkedFile[];
   // Every project-relative path the walker observed for which
   // the prior index row should be PRESERVED across this scan.
-  // Superset of `files.relPath` because it also includes paths
-  // whose lstat transiently failed (race / EACCES / NFS hiccup).
+  // Superset of `files.relPath`: also includes paths whose
+  // lstat failed with a TRANSIENT error (EACCES, EBUSY,
+  // ETIMEDOUT, NFS hiccup) — the file may still exist, so
+  // dropping its prior row would be destructive. NOT included:
+  //   - ENOENT lstat results (file definitively gone — prune
+  //     removes the row, matching the operator's `rm`)
+  //   - Symlinks / non-files / oversized files (intentional
+  //     drops; prune cleans up any leftover row)
   // The pipeline's stale-row prune deletes `files` rows whose
-  // path is NOT in this set, so swallowing transient lstat
-  // errors here would cause real data loss; instead we keep
-  // those paths in seenPaths and skip the re-index for this
-  // scan — next scan picks them up if the FS recovers.
-  // Symlinks / directories / oversized files are NOT in this
-  // set: they're intentional drops that the prune SHOULD
-  // resolve into deleting any leftover row.
+  // path is NOT in this set.
   seenPaths: string[];
   // Project-relative directory paths that the fallback walk
   // could not enumerate (readdir threw EACCES, ENOENT race,
@@ -176,20 +176,31 @@ export const walkProject = async (opts: WalkOptions): Promise<WalkResult> => {
   // and dropped — CODE_INDEX.md §8.2 sets follow_symlinks=false
   // as the default. A symlink whose target is a regular file
   // would otherwise sneak through the `s.isFile()` check.
+  // Three lstat outcomes, treated differently by the caller:
+  //   - 'ok'       → indexable file, write a new row
+  //   - 'preserve' → transient failure (EACCES, EBUSY,
+  //                   ETIMEDOUT…); file may exist, keep prior
+  //                   row alive
+  //   - 'drop'     → ENOENT; file definitively gone, let the
+  //                   prune remove the prior row
+  // Without the ENOENT distinction we'd indefinitely keep
+  // working-tree-removed-but-still-tracked files queryable
+  // (git ls-files surfaces them after `rm src/x.ts`; their
+  // lstat fails ENOENT). Treating that as transient would mask
+  // a normal edit/delete workflow.
   type StatSlot =
-    | { entry: (typeof eligible)[number]; stat: Stats; failed: false }
-    | { entry: (typeof eligible)[number]; failed: true };
+    | { entry: (typeof eligible)[number]; stat: Stats; outcome: 'ok' }
+    | { entry: (typeof eligible)[number]; outcome: 'preserve' }
+    | { entry: (typeof eligible)[number]; outcome: 'drop' };
   const stats: StatSlot[] = await Promise.all(
     eligible.map(async (e): Promise<StatSlot> => {
       try {
-        return { entry: e, stat: await lstat(e.absPath), failed: false };
-      } catch {
-        // Don't drop the path — return it as failed so the
-        // caller can keep its prior index row alive. Dropping
-        // here would let a transient lstat error propagate
-        // through to the pipeline's prune as "the file was
-        // deleted", causing false data loss.
-        return { entry: e, failed: true };
+        return { entry: e, stat: await lstat(e.absPath), outcome: 'ok' };
+      } catch (err) {
+        const code = (err as { code?: unknown }).code;
+        return code === 'ENOENT'
+          ? { entry: e, outcome: 'drop' }
+          : { entry: e, outcome: 'preserve' };
       }
     }),
   );
@@ -197,10 +208,11 @@ export const walkProject = async (opts: WalkOptions): Promise<WalkResult> => {
   const results: WalkedFile[] = [];
   const seenPaths: string[] = [];
   for (const r of stats) {
-    if (r.failed) {
-      // Preserve the path so the prune doesn't remove the
-      // prior row, but skip re-indexing — we have no metadata
-      // (size, mtime, content) to write a new row with.
+    if (r.outcome === 'drop') {
+      // File doesn't exist — let the prune remove its row.
+      continue;
+    }
+    if (r.outcome === 'preserve') {
       seenPaths.push(r.entry.relPath);
       continue;
     }
