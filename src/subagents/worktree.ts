@@ -89,6 +89,24 @@ const runGit = async (args: string[], cwd: string): Promise<RunGitResult> => {
     env: {
       LC_ALL: 'C',
       GIT_TERMINAL_PROMPT: '0',
+      // Force every pathspec argument to be taken as a literal
+      // pathname rather than a glob. The skip-worktree flow
+      // passes deny-listed paths to `git ls-files` and
+      // `git update-index`, both of which parse positional
+      // arguments as pathspecs by default — so a deny-listed
+      // file like `[abc].pem` (legal Linux filename, matches
+      // `*.pem` in the deny-list) would be interpreted as a
+      // bracket character class matching `a.pem`/`b.pem`/`c.pem`.
+      // The literal file would not be marked, and unrelated
+      // tracked files might be — the latter silently masks any
+      // real child edits to those files, which then disappear
+      // from `git status` and cause cleanupWorktree to discard
+      // the run output. Setting this env var globally for the
+      // helper is inert for the path-typed args of `git worktree
+      // add` / `branch -D` (they don't go through the pathspec
+      // engine) and matches our requirement everywhere we DO
+      // pass paths.
+      GIT_LITERAL_PATHSPECS: '1',
       PATH: process.env.PATH ?? '',
       HOME: process.env.HOME ?? '',
     },
@@ -372,6 +390,11 @@ const markValidatorDeletionsSkipWorktree = async (
     env: {
       LC_ALL: 'C',
       GIT_TERMINAL_PROMPT: '0',
+      // Same rationale as runGit: paths fed to update-index are
+      // pathspecs by default. A literal `[abc].pem` would be
+      // parsed as a bracket class, marking unrelated tracked
+      // files and missing the actual deny-listed entry.
+      GIT_LITERAL_PATHSPECS: '1',
       PATH: process.env.PATH ?? '',
       HOME: process.env.HOME ?? '',
     },

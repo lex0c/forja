@@ -324,6 +324,48 @@ describe('createWorktree', () => {
     expect(cleanup.preserved).toBe(false);
   });
 
+  test('deny-listed filename containing pathspec metacharacters is correctly masked (literal pathspec)', async () => {
+    // Without GIT_LITERAL_PATHSPECS, `git ls-files -- [abc].pem`
+    // interprets `[abc]` as a character class matching `a`,
+    // `b`, or `c`. The literal `[abc].pem` is NOT returned;
+    // unrelated files like `a.pem` would be marked
+    // skip-worktree instead, hiding any later child edits to
+    // them from `git status`. The literal `[abc].pem` would
+    // never get masked, so its tracked deletion shows as
+    // ` D [abc].pem`, the worktree is classified dirty, and
+    // cleanup preserves it forever.
+    //
+    // With the env-set fix, the path is passed verbatim and
+    // the literal file gets the skip-worktree flag — status
+    // empty, cleanup removes the worktree as expected.
+    writeFileSync(join(parentRepo, '[abc].pem'), 'BEGIN CERT');
+    // Also commit a non-overlapping `.pem` so the test
+    // doesn't accidentally pass on a setup quirk: both must
+    // get masked. Note `a.pem` would ALSO match `[abc].pem`
+    // as a non-literal pathspec.
+    writeFileSync(join(parentRepo, 'a.pem'), 'CERT A');
+    await runGit(parentRepo, ['add', '-A']);
+    await runGit(parentRepo, ['commit', '-m', 'add bracket-named pem']);
+
+    const handle = await createWorktree({
+      sessionId: '11111111-2222-3333-4444-aaaaaaaa1111',
+      prompt: 'pathspec metachars',
+      parentCwd: parentRepo,
+      rootDir: worktreeRoot,
+    });
+    // Both files were validator-removed (matched `*.pem`).
+    expect(existsSync(join(handle.path, '[abc].pem'))).toBe(false);
+    expect(existsSync(join(handle.path, 'a.pem'))).toBe(false);
+
+    // status is empty — both deletions are skip-worktree masked.
+    const status = await runGit(handle.path, ['status', '--porcelain']);
+    expect(status).toBe('');
+
+    const cleanup = await cleanupWorktree({ handle, parentCwd: parentRepo });
+    expect(cleanup.removed).toBe(true);
+    expect(cleanup.preserved).toBe(false);
+  });
+
   test('child re-creating a masked path is detected as dirty (regression: skip-worktree mutation hiding)', async () => {
     // Skip-worktree silences `git status` for the masked path
     // entirely — including re-writes. A child that recreates

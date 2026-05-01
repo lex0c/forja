@@ -15,6 +15,37 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.2b.iii follow-up #4 — force literal pathspecs in worktree git calls
+
+The skip-worktree threading from follow-up #1 fed validator-removed
+paths to `git ls-files` and `git update-index`, both of which parse
+positional arguments as pathspecs by default. A deny-listed filename
+with pathspec metacharacters (e.g. `[abc].pem`, a legal Linux
+filename matching `*.pem` in the deny-list) would be interpreted as
+a bracket character class — `[abc]` matches `a`/`b`/`c` — so
+`ls-files` returned `a.pem`/`b.pem`/`c.pem` (if present) instead of
+the literal `[abc].pem`. The literal file never got its
+skip-worktree flag, and unrelated tracked files COULD get marked,
+silently masking any real child edits to them at cleanup time.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/subagents/worktree.ts` | `runGit` and the bespoke `update-index --stdin` spawn both set `GIT_LITERAL_PATHSPECS=1` in their child env. The flag is global per git invocation: every pathspec argument is taken as a literal pathname, no glob/regex/bracket interpretation. Inert for path-typed args of `git worktree add` / `branch -D` (those don't pass through the pathspec engine), correct for `ls-files` / `update-index` / `status` / `worktree remove`. |
+| `tests/subagents/worktree.test.ts` | +1 regression test: commit `[abc].pem` (literal brackets) AND `a.pem`, run createWorktree, assert both validator-removed and `git status --porcelain` empty in the worktree, cleanup classifies removed. Without the fix, `[abc].pem` would show as ` D [abc].pem` (never masked) and cleanup would preserve indefinitely. |
+
+**Decisions:**
+
+- **`GIT_LITERAL_PATHSPECS=1` env-wide vs `:(literal)` per-arg.** Env wins on invariance: every git call from this module gets the same semantics, no risk of forgetting the prefix on a future call site. The flag is a no-op for non-pathspec args, so the blast radius is what we want.
+- **No alternative escape mechanism explored.** `git update-index --add --chmod` accepts pathspecs the same way; any future expansion of the validator's git ops will inherit the literal-pathspec posture automatically because they go through the same `runGit` helper.
+
+**Verification:** `bun test` 1373 pass / 10 skip / 0 fail (+1 new); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** unchanged — M3 / Step 4.2b.iv (`bgLogDir` per-worktree, lifts the `requiresBgManager` gate).
+
+---
+
 ## [2026-04-30] M3 / Step 4.2b.iii follow-up #3 — detect child re-writes hidden by skip-worktree
 
 The skip-worktree mask from follow-up #1 introduced an inverse
