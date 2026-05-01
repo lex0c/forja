@@ -228,6 +228,32 @@ describe('extractFromSource — TypeScript', () => {
     expect(consts.map((c) => c.name).sort()).toEqual(['a', 'b']);
   });
 
+  test('multi-binding const symbols carry distinct declarator spans', () => {
+    // Position metadata must point at each binding individually,
+    // not at the enclosing statement, so navigation can jump to
+    // `b` rather than always landing on the start of the
+    // declaration. The declarator span covers the identifier +
+    // initializer (e.g. `a = 1`), giving distinct coordinates
+    // per symbol.
+    const src = 'export const a = 1, b = 2;';
+    const { symbols } = extractFromSource(src, 'typescript', 'src/c.ts', parseSource);
+    const consts = symbols
+      .filter((s) => s.kind === 'const')
+      .sort((x, y) => x.startCol - y.startCol);
+    expect(consts.length).toBe(2);
+    const [a, b] = consts;
+    expect(a?.name).toBe('a');
+    expect(b?.name).toBe('b');
+    // Same line in this single-line declaration, but distinct
+    // column ranges — `a = 1` starts before `b = 2`.
+    expect(a?.startLine).toBe(b?.startLine);
+    expect(a?.startCol).toBeLessThan(b?.startCol ?? 0);
+    expect(a?.endCol).toBeLessThan(b?.endCol ?? 0);
+    // Each binding's span is tighter than the full statement
+    // (which would end at the trailing semicolon column).
+    expect(a?.endCol).toBeLessThan(b?.startCol ?? 0);
+  });
+
   test('destructuring patterns are skipped (not split into bindings)', () => {
     // Out of scope for v1 — `const { a } = obj` produces no
     // symbols because the name field is an object_pattern,

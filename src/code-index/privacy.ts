@@ -15,25 +15,34 @@
 // Patterns are glob-style, evaluated by the future scanner via
 // Bun.Glob (no regex per CLAUDE.md's hard rule). The slice that
 // adds the actual scanner (4.3.1) wires the matcher.
+//
+// All directory patterns are recursive (`**/<dir>/**`) so they
+// catch the same dir at any depth. Bare `node_modules/**` only
+// matches the root copy — in monorepos with
+// `packages/api/node_modules` it leaks. Same applies to build
+// outputs (`packages/foo/dist`), Python venvs nested under
+// service dirs, etc. The cost of being recursive is negligible;
+// the cost of leaking a third-party tree into the index is high.
 export const CODE_INDEX_DEFAULT_EXCLUDES: readonly string[] = [
   // Dependency / vendor trees — large, third-party, indexed at
   // upstream's whim, not the operator's.
-  'node_modules/**',
-  '.venv/**',
-  'venv/**',
-  '__pycache__/**',
-  'vendor/**',
+  '**/node_modules/**',
+  '**/.venv/**',
+  '**/venv/**',
+  '**/__pycache__/**',
+  '**/vendor/**',
   // Build artifacts — generated, not source-of-truth. Indexing
   // these wastes tokens and surfaces stale references.
-  'dist/**',
-  'build/**',
-  'target/**',
-  'out/**',
-  '.next/**',
-  // VCS internals — not source code.
-  '.git/**',
-  '.hg/**',
-  '.svn/**',
+  '**/dist/**',
+  '**/build/**',
+  '**/target/**',
+  '**/out/**',
+  '**/.next/**',
+  // VCS internals — not source code. Recursive form covers
+  // submodules and vendored repos.
+  '**/.git/**',
+  '**/.hg/**',
+  '**/.svn/**',
   // Credential conventions — same surface as
   // SECURITY_GUIDELINE.md §8.4. All patterns are recursive
   // (`**/` prefix) so monorepos like `apps/api/.env` are

@@ -68,3 +68,60 @@ describe('CODE_INDEX_DEFAULT_EXCLUDES — credential patterns are recursive', ()
     expect(matchesAny('.envtest')).resolves.toBeNull();
   });
 });
+
+describe('CODE_INDEX_DEFAULT_EXCLUDES — dependency/build globs are recursive', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'forja-privacy-deps-'));
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const matchesAny = async (relPath: string): Promise<string | null> => {
+    for (const pat of CODE_INDEX_DEFAULT_EXCLUDES) {
+      const g = new Bun.Glob(pat);
+      for await (const m of g.scan({ cwd: root, dot: true })) {
+        if (m === relPath) return pat;
+      }
+    }
+    return null;
+  };
+
+  test('matches `node_modules` at root and in nested workspace packages', () => {
+    // Monorepo case — packages/api/node_modules is the
+    // canonical leak; root-only `node_modules/**` would miss it.
+    mkdirSync(join(root, 'node_modules/lodash'), { recursive: true });
+    mkdirSync(join(root, 'packages/api/node_modules/react'), { recursive: true });
+    writeFileSync(join(root, 'node_modules/lodash/index.js'), '');
+    writeFileSync(join(root, 'packages/api/node_modules/react/index.js'), '');
+    expect(matchesAny('node_modules/lodash/index.js')).resolves.toBe('**/node_modules/**');
+    expect(matchesAny('packages/api/node_modules/react/index.js')).resolves.toBe(
+      '**/node_modules/**',
+    );
+  });
+
+  test('matches Python `__pycache__` nested under service dirs', () => {
+    mkdirSync(join(root, 'services/worker/__pycache__'), { recursive: true });
+    writeFileSync(join(root, 'services/worker/__pycache__/main.cpython-312.pyc'), '');
+    expect(matchesAny('services/worker/__pycache__/main.cpython-312.pyc')).resolves.toBe(
+      '**/__pycache__/**',
+    );
+  });
+
+  test('matches `dist` build outputs in monorepo packages', () => {
+    mkdirSync(join(root, 'packages/foo/dist'), { recursive: true });
+    writeFileSync(join(root, 'packages/foo/dist/bundle.js'), '');
+    expect(matchesAny('packages/foo/dist/bundle.js')).resolves.toBe('**/dist/**');
+  });
+
+  test('matches nested `.venv` directories', () => {
+    mkdirSync(join(root, 'tools/scripts/.venv/lib/python3.12/site-packages'), { recursive: true });
+    writeFileSync(join(root, 'tools/scripts/.venv/lib/python3.12/site-packages/foo.py'), '');
+    expect(matchesAny('tools/scripts/.venv/lib/python3.12/site-packages/foo.py')).resolves.toBe(
+      '**/.venv/**',
+    );
+  });
+});

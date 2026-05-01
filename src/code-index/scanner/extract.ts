@@ -233,6 +233,12 @@ const extractConstSymbols = (
     // bindings is acceptable for v1.
     if (nameNode.type !== 'identifier') continue;
     const visibility = resolveVisibility(defNode, nameNode.text, exportedNames);
+    // Position uses the variable_declarator span (the binding
+    // itself) rather than the enclosing lexical_declaration,
+    // so multi-binding declarations like `const a = 1, b = 2`
+    // produce distinct coordinates per symbol — otherwise both
+    // would share the whole-statement range and "go to symbol"
+    // navigation would always jump to the first binding.
     out.push({
       filePath,
       name: nameNode.text,
@@ -240,10 +246,10 @@ const extractConstSymbols = (
       kind: 'const',
       visibility,
       signature: null,
-      startLine: defNode.startPosition.row,
-      startCol: defNode.startPosition.column,
-      endLine: defNode.endPosition.row,
-      endCol: defNode.endPosition.column,
+      startLine: child.startPosition.row,
+      startCol: child.startPosition.column,
+      endLine: child.endPosition.row,
+      endCol: child.endPosition.column,
       parentSymbolId: null,
     });
   }
