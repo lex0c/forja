@@ -15,6 +15,55 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.2b.iv — per-subagent bg log dir, lifts requiresBgManager gate
+
+The 4.2a/b arc landed subagents with one capability hole: any
+tool declaring `metadata.requiresBgManager=true` was refused at
+both bootstrap (`validate.ts`) and runtime (`runtime.ts`). The
+refusal was correct given the runtime — the child harness ran
+without a bg manager, so `bash_background`/`bash_output`/
+`bash_kill` and the process-aware paths in `wait_for`/`monitor`
+would have surfaced confusing late errors. But it also meant
+subagents couldn't run dev servers, watchers, build daemons, or
+anything long-lived: a worktree refactor agent that wanted to
+boot the test suite as a bg process and tail its output had to
+abort and let the user do it. This slice closes that gap: each
+subagent run gets its own bg log directory, threaded across the
+subprocess boundary, so the child harness can wire a real bg
+manager without colliding with the parent's bg state.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/subagents/runtime.ts` | `SpawnChildProcessOptions` gains a `bgLogDir?: string` field; `defaultSpawnChildProcess` forwards it via `--subagent-bg-log-dir <path>`. `runSubagent` computes `<input.cwd>/.agent/bg/<childSessionId>/` (anchored to the parent's cwd, not the worktree, so the operator's `bg list` from the project root keeps showing only parent processes) and passes it on every spawn. End-of-run cleanup adds a best-effort `rmSync` of the directory after `cleanupWorktree` — the bg manager creates the dir lazily on first spawn, so subagents that never invoked a bg tool leave nothing to remove. The previous `requiresBgManager` refusal in `assertWhitelistValidForSubagent` is removed; the comment is reworded to reference the lift. |
+| `src/subagents/validate.ts` | Bootstrap-time `requiresBgManager` refusal removed; header comment shrinks from "three checks" to "two checks" plus a note about why the third was lifted. |
+| `src/cli/subagent-child.ts` | `SubagentChildOptions` gains `bgLogDir?: string`; the `HarnessConfig` build conditionally spreads it in. When omitted (older parents, tests routing around the spawn) the harness runs without a bg manager and `requiresBgManager` tools refuse at invocation time — same shape as a top-level run without `bgLogDir`. |
+| `src/cli/args.ts` | `--subagent-bg-log-dir <path>` recognized in the parser; `ParsedArgs.subagentBgLogDir?: string` added. Empty / missing value rejected with a parse error mirroring the other subagent-internal flags. |
+| `src/cli/index.ts` | The parsed `subagentBgLogDir` flows into `runSubagentChild` through the same conditional-spread pattern as the other subagent flags. |
+| `tests/subagents/validate.test.ts` | Three pre-existing tests that asserted refusal flipped to assert acceptance under the new contract: `bash_background` under `isolation: 'worktree'` accepted; `bash_output` (writes:false + requiresBgManager:true) accepted under both isolation modes. The "accept under worktree, reject under none via writes gate" path stayed (writes:true refusal still fires under `isolation: 'none'` — bg lift didn't relax that), with the message regex updated to match the writes-gate error. The pure `requiresBgManager error names the offending source path` test was deleted (the message no longer exists). |
+| `tests/subagents/runtime.test.ts` | The `requiresBgManager tool refused regardless of isolation` test inverted to `4.2b.iv: requiresBgManager tool no longer rejected by registry gate` — asserts that the runtime gets PAST the registry validation (the worktree creation still fails because the test cwd '/p' isn't a git repo, but the failure reason is `worktree_create_failed`, not the registry refusal). +2 new tests: `parent threads per-session bgLogDir into spawn opts` (path shape `<parentCwd>/.agent/bg/<sessionId>/`), and `cleanupWorktree end-of-run removes the bgLogDir if it exists` (spawn fake mkdirs the dir and writes a fake log file; runtime's end-of-run rmSync must remove it). |
+
+**Decisions:**
+
+- **bgLogDir anchored to parent's cwd, namespaced under `subagents/`.** Path: `<parentCwd>/.agent/bg/subagents/<childSessionId>/`. Anchoring to the parent (not the worktree) keeps the operator's `bg list` view consistent (project root shows parent's processes); the `subagents/` infix segregates the namespace so parent flat-file layout (`<bgId>.stdout.log`) and subagent dir layout don't mix in the same directory listing. The alternative (`<worktree>/.agent/bg/`) would auto-clean with worktree removal but risks polluting `git status` if the project doesn't have `.agent/.gitignore`.
+- **Lazy directory creation.** The bg manager already creates the directory on first spawn (existing `ensureDir(logDir)` in `bg/manager.ts`). The runtime doesn't pre-create it; subagents that never invoke a bg tool leave no directory to clean up. End-of-run `rmSync` uses `force: true` to swallow ENOENT in the no-spawn case.
+- **Cleanup is best-effort.** The directory holds stdout/stderr log files we no longer need after the run finishes; failing to remove them is operationally harmless (cache pollution, not correctness loss). ENOENT is silenced (common case); other errors (permission denied, disk full) get logged to stderr so the operator notices the cache leak. `agent worktree gc` (4.2d) will sweep stragglers together with stale worktrees.
+- **Reap orphan bg processes before rmSync (D10 from review).** Pre-review the cleanup pattern relied on the child harness's `bgManager.cleanup()` running in its own finally to kill live processes. That assumption holds for clean exits but FAILS for the SIGKILL paths 4.2b.ii.b made common (heartbeat stale, wall-clock kill, abort escalation) — finally is uncatchable past SIGKILL, processes get reparented to PID 1 and the rmSync would unlink log files they're still writing to. `reapChildBgProcesses` now runs before rmSync: queries `listBgProcessesBySession(status='running')`, SIGTERMs each PID, waits 500ms, SIGKILLs survivors, marks DB rows as 'killed'. Idempotent — no-op when the child's finally already cleaned up.
+- **Validation lift covers BOTH gates (`writes:true` AND `requiresBgManager`).** With worktree isolation, writes are contained; with the new bg log dir, bg tools are isolated. So a `bash_background` tool under `isolation: 'worktree'` is now fully accepted. Under `isolation: 'none'`, the writes gate still fires for `bash_background` because subagent-spawned processes can write to the parent's tree — that's a separate concern (tracked by writes:true), not a bg concern.
+
+**Pending / known limitations:**
+
+- **No `agent worktree gc` integration yet.** A subagent run that crashed mid-execution before the end-of-run rmSync ran would leave its bg log dir behind. Not a security issue (the dir is the parent's responsibility, not the child's), and the disk cost is bounded by the number of concurrent subagent crashes; 4.2d's gc command will sweep these alongside stale worktrees.
+- **Per-process resource isolation.** A subagent that spawns 10 long-lived bg processes still consumes the parent's process table and disk space for log files. Future limits (max-bg-per-subagent, max-log-size) would land in the subagent budget structure (`max_steps`, `max_cost_usd`, plus a future `max_bg_processes`). Out of scope for this slice — current usage profile shows even active subagents rarely exceed 1-2 bg processes at a time.
+- **Concurrent subagents on the same parent session.** Each subagent gets a unique `<sessionId>` subdirectory, so directory collisions are impossible. The bg manager's per-process IDs are also session-scoped (not global), so two subagents running concurrently can't see each other's processes through `bash_output` even if they had the same bg ID. ✓ Verified by construction.
+
+**Verification:** `bun test` 1375 pass / 10 skip / 0 fail (+3 new positive tests including the SIGKILL-orphan-reap regression, 4 inverted tests); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** With 4.2b.iv landed, the 4.2b arc is complete. M3 / Step 4.2c — checkpoints inside worktrees (per-step git snapshots on the agent branch so `/undo` works inside subagent runs). Then 4.2d — `agent worktree gc` + merge helpers (operator commands for stale worktree sweep and branch merge-back ergonomics).
+
+---
+
 ## [2026-04-30] M3 / Step 4.2b.iii follow-up #4 — force literal pathspecs in worktree git calls
 
 The skip-worktree threading from follow-up #1 fed validator-removed

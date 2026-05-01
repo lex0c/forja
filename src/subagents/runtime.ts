@@ -1,3 +1,5 @@
+import { rmSync } from 'node:fs';
+import { join } from 'node:path';
 import type { HarnessResult } from '../harness/index.ts';
 import type { PermissionEngine } from '../permissions/index.ts';
 import type { Provider } from '../providers/index.ts';
@@ -9,6 +11,8 @@ import {
   getSubagentOutput,
   insertSubagentRun,
   insertSubagentWorktree,
+  listBgProcessesBySession,
+  markRunningAsKilled,
 } from '../storage/index.ts';
 import { type ToolRegistry, createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import type { SubagentSet } from './load.ts';
@@ -27,12 +31,15 @@ import {
 // is defense in depth: bootstrap pre-validates via
 // `validateSubagentSet`, but a programmatic caller building a
 // `RunSubagentInput` without that step still gets refused on
-// the same grounds. We throw on three conditions:
+// the same grounds. We throw on two conditions:
 //   1. Tool name not registered with the parent's full toolset
 //      (typo — model would never recover)
 //   2. Tool declares writes:true but isolation is not worktree
-//   3. Tool declares requiresBgManager:true (Step 4.2a runtime
-//      doesn't wire bgManager into the child harness)
+//
+// 4.2b.iv lifted the previous third condition (`requiresBgManager`)
+// — every subagent now gets its own bg log dir threaded across
+// via `--subagent-bg-log-dir`, so background-process tools are
+// safe to expose.
 //
 // The validation runs only as a refusal gate — the returned
 // registry is unused on the subprocess path because the child
@@ -78,11 +85,6 @@ const assertWhitelistValidForSubagent = (
     if (tool.metadata.writes === true && !allowWrites) {
       throw new Error(
         `subagent '${subagentName}': tool '${toolName}' declares metadata.writes=true and cannot appear in subagent.tools[] without 'isolation: worktree'. Bootstrap should have caught this; if you see it at runtime you're constructing the child registry without going through validateSubagentSet first.`,
-      );
-    }
-    if (tool.metadata.requiresBgManager === true) {
-      throw new Error(
-        `subagent '${subagentName}': tool '${toolName}' declares metadata.requiresBgManager=true; the 4.2a subagent runtime does not wire ctx.bgManager (deferred to 4.2b). Bootstrap should have caught this via validateSubagentSet.`,
       );
     }
     if (builtins !== null && builtins.get(toolName) === null) {
@@ -170,6 +172,22 @@ export interface SpawnChildProcessOptions {
   // in its whitelist would execute. Boolean shape — undefined /
   // false omits the flag, true emits it.
   planMode?: boolean;
+  // Per-subagent background-process log directory. Threaded
+  // across via `--subagent-bg-log-dir`. Format:
+  // `<parentCwd>/.agent/bg/<childSessionId>/`. Each subagent
+  // gets its own directory so that:
+  //   - parent's `bg list` doesn't see (and doesn't accidentally
+  //     manage) the child's bg processes
+  //   - two concurrent subagents don't collide on log file names
+  //     (the bg manager generates unique IDs per-instance, but
+  //     sub-namespacing by sessionId removes any cross-instance
+  //     coupling)
+  //   - cleanup at end-of-run is a single recursive rm of the
+  //     dir, no need to enumerate by id
+  // Undefined when the runtime decided not to wire bg (none in
+  // the current design — every subagent gets one — but the
+  // optional shape leaves room for tests that want to skip it).
+  bgLogDir?: string;
 }
 
 export type SpawnChildProcess = (opts: SpawnChildProcessOptions) => ChildProcessHandle;
@@ -263,6 +281,9 @@ const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
   }
   if (opts.planMode === true) {
     appendArgs.push('--subagent-plan-mode');
+  }
+  if (opts.bgLogDir !== undefined) {
+    appendArgs.push('--subagent-bg-log-dir', opts.bgLogDir);
   }
   const cmd = resolveChildBinaryCmd({
     argv: Bun.argv,
@@ -387,6 +408,82 @@ const DEFAULT_WALL_CLOCK_MS = 10 * 60 * 1000;
 // to flush its terminal payload to `subagent_outputs` before the
 // kernel drops it.
 const WALL_CLOCK_GRACE_MS = 5_000;
+
+// Grace window between SIGTERM and SIGKILL when reaping the
+// child's leftover bg processes (the SIGKILL'd-child path; see
+// `reapChildBgProcesses`). Shorter than the harness-level
+// WALL_CLOCK_GRACE_MS because by the time we reap, the child is
+// already dead — we just need the bg subprocesses to flush log
+// buffers and exit. 500ms is generous for typical dev tools (npm
+// scripts, watchers) and short enough that a stuck process
+// doesn't dominate cleanup latency.
+const BG_REAP_GRACE_MS = 500;
+
+// Reap any bg processes the child spawned but failed to clean
+// up. Runs in `runSubagent` after the child has exited and
+// before the bg log dir is removed. The child's harness owns
+// happy-path cleanup (its bgManager.cleanup() hook in the outer
+// finally), so this reaper is the safety net for the paths
+// that bypass the child's finally — SIGKILL on heartbeat
+// staleness, wall-clock kill, abort escalation. In those cases
+// the bg subprocesses survive as orphans (reparented to PID 1)
+// with `status='running'` rows still in the DB; without this
+// reap, they'd consume CPU/RAM indefinitely AND the subsequent
+// `rmSync` of bgLogDir would unlink the log files they're still
+// writing to.
+const reapChildBgProcesses = async (db: DB, sessionId: string): Promise<void> => {
+  let running: ReturnType<typeof listBgProcessesBySession>;
+  try {
+    running = listBgProcessesBySession(db, sessionId, { status: 'running' });
+  } catch {
+    // Defensive — DB read shouldn't fail mid-cleanup, but if
+    // it does the safest move is to skip the reap and let the
+    // operator's worktree gc collect via OS-level inspection.
+    return;
+  }
+  if (running.length === 0) return;
+  // SIGTERM every PID first so they can flush. We accept that
+  // some may already be dead (race between child exit reaping
+  // grandchildren and our query); ESRCH from process.kill on
+  // a dead PID is expected and ignored.
+  for (const proc of running) {
+    if (proc.osPid === null) continue;
+    try {
+      process.kill(proc.osPid, 'SIGTERM');
+    } catch {
+      // ESRCH (already gone) / EPERM (race with reparenting):
+      // either way, nothing to do. Continue to the next.
+    }
+  }
+  // Single grace window for ALL of them in parallel, not
+  // per-process. The processes were already running; our SIGTERM
+  // is reliably async, and waiting per-PID would extend cleanup
+  // proportional to the count.
+  await new Promise<void>((r) => setTimeout(r, BG_REAP_GRACE_MS));
+  // SIGKILL anything still alive. We don't re-query; we just try
+  // again, and dead-PID errors are swallowed exactly like the
+  // SIGTERM pass.
+  for (const proc of running) {
+    if (proc.osPid === null) continue;
+    try {
+      process.kill(proc.osPid, 'SIGKILL');
+    } catch {
+      // Same as above — best-effort.
+    }
+  }
+  // Reflect the kill in the audit table. markRunningAsKilled is
+  // idempotent (only updates rows where `status='running'`), so
+  // a child that DID get to run its own cleanup hook before
+  // exiting is already terminal-status and the call no-ops.
+  try {
+    markRunningAsKilled(db, sessionId);
+  } catch {
+    // Defensive — DB write failures shouldn't block cleanup
+    // of the next subagent. The orphan kill already happened;
+    // the audit row drift is operationally minor and the
+    // operator's gc can reconcile.
+  }
+};
 
 // Polling cadence for `subagent_outputs.payload`. Backoff from
 // 50ms up to 500ms; the geometric ramp keeps fast runs cheap
@@ -862,12 +959,28 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // should be able to recover (retry without the subagent, or
   // diagnose a deployment misconfiguration).
   const spawn = input.spawnChildProcess ?? defaultSpawnChildProcess;
+  // Per-subagent bg log directory. Anchored to the PARENT's cwd
+  // (not the child's, which may be a worktree path) so the
+  // operator's `bg list` view from the project root continues to
+  // work; segregated under a `subagents/` infix so the namespace
+  // is self-documenting (parent's bg files live as
+  // `.agent/bg/<bgId>.stdout.log` directly in the dir; subagent
+  // bg files nest two more levels down at
+  // `.agent/bg/subagents/<sessionId>/<bgId>.stdout.log`); per-
+  // session subdirectory so concurrent subagents don't collide
+  // and cleanup is a single recursive rm. The dir is created
+  // lazily by the bg manager on first spawn — we only compute
+  // the path here and forward it. For tests that inject a fake
+  // spawn, the path is still computed (deterministic shape) but
+  // unused by the fake.
+  const bgLogDir = join(input.cwd, '.agent', 'bg', 'subagents', childSession.id);
   let handle: ChildProcessHandle;
   try {
     handle = spawn({
       sessionId: childSession.id,
       cwd: childCwd,
       depth,
+      bgLogDir,
       ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
       ...(input.planMode === true ? { planMode: true } : {}),
     });
@@ -943,6 +1056,57 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
         code: 'worktree_audit_insert_failed',
         message: e instanceof Error ? e.message : String(e),
       };
+    }
+  }
+
+  // Reap any bg processes the child spawned but didn't get to
+  // clean up. The happy path (child exits cleanly via published
+  // payload) already runs the child harness's bgManager.cleanup()
+  // hook before the subprocess ends — by the time we get here,
+  // the bg DB rows should be in terminal status. But the child
+  // can also exit via paths that bypass its own finally:
+  //
+  //   - SIGKILL on heartbeat staleness (4.2b.ii.b): the harness's
+  //     finally is uncatchable, the bg manager's cleanup never
+  //     runs, and bg processes the child spawned are reparented
+  //     to PID 1, kept alive by the kernel.
+  //   - SIGKILL on wall-clock budget exceeded.
+  //   - Caller abort that escalated past SIGTERM grace.
+  //
+  // In those paths the bg DB still has `status='running'` rows
+  // pointing at PIDs that are now orphaned. The subsequent
+  // `rmSync` of bgLogDir would also remove the log files those
+  // orphans are still writing to (Linux unlinks don't kill open
+  // FDs — bytes go to phantom file handles, disk space stays
+  // pinned, processes consume CPU/RAM until they exit on their
+  // own). We close the loop here:
+  //
+  //   1. Query the child's running rows.
+  //   2. SIGTERM each PID; wait BG_REAP_GRACE_MS.
+  //   3. SIGKILL any still alive.
+  //   4. markRunningAsKilled to reflect terminal status in audit.
+  //
+  // Best-effort throughout — if a kill fails (process already
+  // exited, EPERM, ESRCH), we move on. The reaper exists so the
+  // operator never sees zombies under a finished subagent's
+  // session ID, not as a security boundary.
+  await reapChildBgProcesses(input.db, childSession.id);
+
+  // Best-effort cleanup of the per-subagent bg log directory.
+  // ENOENT is expected (bg manager creates the dir lazily on
+  // first spawn — subagents that never invoked a bg tool leave
+  // no directory to remove), so we silence it; other errors
+  // (permission denied, disk full, etc.) get logged to stderr
+  // so the operator knows the cache is leaking. Cleanup failure
+  // never changes the run outcome — operator's `agent worktree
+  // gc` (4.2d) sweeps stragglers.
+  try {
+    rmSync(bgLogDir, { recursive: true, force: true });
+  } catch (e) {
+    if (e instanceof Error && (e as NodeJS.ErrnoException).code !== 'ENOENT') {
+      process.stderr.write(
+        `subagent ${childSession.id}: failed to remove bg log dir '${bgLogDir}': ${e.message}\n`,
+      );
     }
   }
 

@@ -697,31 +697,37 @@ describe('runSubagent — orchestration', () => {
     ).rejects.toThrow(/declares metadata\.writes=true/);
   });
 
-  test('requiresBgManager tool refused regardless of isolation', async () => {
+  test('4.2b.iv: requiresBgManager tool no longer rejected by registry gate', async () => {
     const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
       model: 'mock/m',
       cwd: '/p',
     });
-    // Worktree lifts the writes:true gate but NOT the bgmanager
-    // gate — the runtime still doesn't wire bgManager into the
-    // child harness, so a whitelisted bash_background would fail
-    // at runtime. Pulled forward to spawn-time as a refusal.
-    await expect(
-      runSubagent({
-        definition: definition({
-          tools: ['bash_background'],
-          isolation: 'worktree',
-        }),
-        prompt: 'go',
-        parentSessionId: parent.id,
-        provider: stubProvider(),
-        parentToolRegistry: buildParentRegistry(echoTool, bgTool),
-        permissionEngine: buildEngine(),
-        db,
-        cwd: '/p',
-        spawnChildProcess: fakeSpawnDone(),
+    // Pre-4.2b.iv this combination threw at spawn time because
+    // the child harness had no bgManager. The slice threads a
+    // per-session bg log directory across the subprocess
+    // boundary (`--subagent-bg-log-dir`), so background-process
+    // tools are now safe to expose. We assert specifically that
+    // the OLD `requiresBgManager` error message is no longer
+    // produced; the runtime still fails on worktree creation
+    // (cwd '/p' isn't a git repo), but with `worktree_create_failed`,
+    // not with the registry refusal — which is the property
+    // this slice changed.
+    const result = await runSubagent({
+      definition: definition({
+        tools: ['bash_background'],
+        isolation: 'worktree',
       }),
-    ).rejects.toThrow(/declares metadata\.requiresBgManager=true/);
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool, bgTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: fakeSpawnDone(),
+    });
+    expect(result.reason).not.toBe('subprocess_spawn_failed');
+    expect(result.worktreeError?.message ?? '').not.toMatch(/requiresBgManager/);
   });
 
   test('refuses non-builtin tool when spawning real subprocess (parent/child registry alignment)', async () => {
@@ -841,6 +847,214 @@ describe('runSubagent — orchestration', () => {
       spawnChildProcess: recordingSpawn,
     });
     expect(captured.depth).toBe(2);
+  });
+
+  test('4.2b.iv: parent threads per-session bgLogDir into spawn opts', async () => {
+    // Every subagent gets its own bg log directory so concurrent
+    // children don't collide and the operator's `bg list` view
+    // from the project root continues to show only the parent's
+    // processes. Path shape:
+    // `<parentCwd>/.agent/bg/subagents/<childSessionId>/`. The
+    // `subagents/` infix segregates the namespace from the
+    // parent's flat-file bg layout. The parent's runSubagent
+    // computes it deterministically; the spawn fake captures it
+    // for assertion.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const captured: { bgLogDir?: string; sessionId?: string } = {};
+    const recordingSpawn: SpawnChildProcess = (opts) => {
+      if (opts.bgLogDir !== undefined) captured.bgLogDir = opts.bgLogDir;
+      captured.sessionId = opts.sessionId;
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      setSubagentPayload(db, opts.sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'ok',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      });
+      return { exited: Promise.resolve({ exitCode: 0 }), kill: () => undefined };
+    };
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: recordingSpawn,
+    });
+    expect(captured.bgLogDir).toBe(`/p/.agent/bg/subagents/${captured.sessionId}`);
+  });
+
+  test('4.2b.iv: cleanupWorktree end-of-run removes the bgLogDir if it exists', async () => {
+    // Bg manager creates the directory lazily on first spawn.
+    // We simulate that here: the spawn fake mkdirs the dir +
+    // writes a fake log file. After runSubagent finishes, the
+    // runtime's end-of-run rmSync must delete the directory and
+    // its contents. Without this cleanup, the parent's
+    // `.agent/bg/` would accumulate per-session subdirectories
+    // on every subagent run.
+    const parentCwd = mkdtempSync(join(tmpdir(), 'forja-rt-bg-'));
+    try {
+      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+        model: 'mock/m',
+        cwd: parentCwd,
+      });
+      let observedDir: string | undefined;
+      const dirPlantingSpawn: SpawnChildProcess = (opts) => {
+        observedDir = opts.bgLogDir;
+        if (opts.bgLogDir !== undefined) {
+          mkdirSync(opts.bgLogDir, { recursive: true });
+          writeFileSync(join(opts.bgLogDir, 'fake-bg-output.log'), 'simulated bg output\n');
+        }
+        insertSubagentOutput(db, { sessionId: opts.sessionId });
+        setSubagentPayload(db, opts.sessionId, {
+          status: 'done',
+          reason: 'done',
+          output: 'ok',
+          cost_usd: 0,
+          steps: 1,
+          duration_ms: 1,
+        });
+        return { exited: Promise.resolve({ exitCode: 0 }), kill: () => undefined };
+      };
+      await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: parentCwd,
+        spawnChildProcess: dirPlantingSpawn,
+      });
+      expect(observedDir).toBeDefined();
+      if (observedDir !== undefined) {
+        // Path shape — anchored to the parent's cwd, not '/p',
+        // namespaced by session ID under .agent/bg/subagents/.
+        expect(observedDir.startsWith(`${parentCwd}/.agent/bg/subagents/`)).toBe(true);
+        // Cleanup MUST have removed the dir.
+        expect(existsSync(observedDir)).toBe(false);
+      }
+    } finally {
+      rmSync(parentCwd, { recursive: true, force: true });
+    }
+  });
+
+  test('4.2b.iv: SIGKILL-style child exit reaps orphan bg processes (DB + OS) before rmSync', async () => {
+    // Regression for the C1 finding from review: when the child
+    // exits without running its harness's bgManager.cleanup()
+    // hook (heartbeat stale → SIGKILL, wall_clock kill, abort
+    // escalation), bg processes the child spawned become
+    // orphans — alive on the OS, status='running' in the DB,
+    // and would have their log files unlinked out from under
+    // them by the parent's rmSync. The reaper closes the loop:
+    // kill OS-level + flip DB rows to 'killed' + rmSync.
+    const parentCwd = mkdtempSync(join(tmpdir(), 'forja-rt-bg-reap-'));
+    let sleepProc: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+        model: 'mock/m',
+        cwd: parentCwd,
+      });
+      const bgRepo = await import('../../src/storage/repos/bg-processes.ts');
+      let recordedBgRowId: string | undefined;
+      let recordedPid: number | undefined;
+      // Spawn fake that simulates a child registering a bg
+      // process AND then dying without cleaning up. We use a
+      // real `sleep 60` so the reaper has a real PID to send
+      // signals to; the test verifies after runSubagent that
+      // the OS process is gone and the DB row is 'killed'.
+      const orphanLeavingSpawn: SpawnChildProcess = (opts) => {
+        sleepProc = Bun.spawn({
+          cmd: ['sleep', '60'],
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        recordedPid = sleepProc.pid;
+        const row = bgRepo.insertBgProcess(db, {
+          sessionId: opts.sessionId,
+          osPid: sleepProc.pid,
+          command: 'sleep 60',
+          cwd: opts.cwd,
+          stdoutLogPath: '/tmp/fake-stdout.log',
+          stderrLogPath: '/tmp/fake-stderr.log',
+        });
+        recordedBgRowId = row.id;
+        // Mimic the bg manager creating its log directory.
+        if (opts.bgLogDir !== undefined) {
+          mkdirSync(opts.bgLogDir, { recursive: true });
+          writeFileSync(join(opts.bgLogDir, `${row.id}.stdout.log`), 'simulated\n');
+        }
+        // Insert outputs row but DO NOT publish payload — the
+        // outcome is 'crashed', mirroring the SIGKILL-without-
+        // finally path.
+        insertSubagentOutput(db, { sessionId: opts.sessionId });
+        // Return an immediately-exited handle with no payload.
+        return {
+          exited: Promise.resolve({ exitCode: 137 }),
+          kill: () => undefined,
+        };
+      };
+      const result = await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: parentCwd,
+        spawnChildProcess: orphanLeavingSpawn,
+      });
+      // Outcome is 'crashed' because the spawn fake skipped
+      // payload publication — exactly the post-SIGKILL shape.
+      expect(result.status).toBe('error');
+      expect(result.reason).toBe('subprocess_crashed');
+
+      // OS-level: the sleep PID must be dead. process.kill(pid, 0)
+      // probes existence; ESRCH means gone, 0 thrown means alive.
+      expect(recordedPid).toBeDefined();
+      if (recordedPid !== undefined) {
+        let alive = true;
+        try {
+          process.kill(recordedPid, 0);
+        } catch {
+          alive = false;
+        }
+        expect(alive).toBe(false);
+      }
+
+      // DB-level: the row flipped from 'running' to 'killed'
+      // via markRunningAsKilled.
+      expect(recordedBgRowId).toBeDefined();
+      if (recordedBgRowId !== undefined) {
+        const row = bgRepo.getBgProcess(db, recordedBgRowId);
+        expect(row?.status).toBe('killed');
+      }
+
+      // Disk-level: bgLogDir is gone (rmSync ran AFTER the reap).
+      const expectedDir = `${parentCwd}/.agent/bg/subagents/${result.sessionId}`;
+      expect(existsSync(expectedDir)).toBe(false);
+    } finally {
+      // Defensive: if the test failed before the reaper killed it,
+      // make sure the sleep doesn't outlive the test.
+      if (sleepProc !== undefined) {
+        try {
+          sleepProc.kill();
+        } catch {
+          // already dead
+        }
+      }
+      rmSync(parentCwd, { recursive: true, force: true });
+    }
   });
 
   test('parent forwards temperature to spawn opts when set', async () => {

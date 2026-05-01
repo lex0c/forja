@@ -141,28 +141,24 @@ describe('validateSubagentTools', () => {
     );
   });
 
-  test("rejects a requiresBgManager tool under isolation='worktree' (writes:true gate lifted, bg gate fires)", () => {
-    // C3 fix path under worktree: the writes:true refusal no
-    // longer applies (worktree contains the writes), but the
-    // bgmanager-missing gate must catch the same tool. The 4.2a
-    // runtime never wires ctx.bgManager for the child harness;
-    // pulling the failure forward to bootstrap saves the author
-    // a debugging round.
+  test("4.2b.iv: accepts a requiresBgManager tool under isolation='worktree' (gate lifted)", () => {
+    // Pre-4.2b.iv this combination was refused because the
+    // child harness had no bg manager. Now every subagent
+    // gets a per-session bg log directory threaded across via
+    // `--subagent-bg-log-dir`, so background-process tools
+    // are safe to expose. Worktree contains any writes the
+    // bg processes produce.
     const reg = buildRegistry(bgTool('bash_background'));
     const def = definition({ tools: ['bash_background'], isolation: 'worktree' });
-    expect(() => validateSubagentTools(def, reg)).toThrow(
-      /tool 'bash_background' declares metadata\.requiresBgManager=true/,
-    );
+    expect(() => validateSubagentTools(def, reg)).not.toThrow();
   });
 
-  test("rejects a requiresBgManager+writes tool under isolation='none' via the writes gate (first fail)", () => {
-    // Under default isolation, the writes:true gate fires first
-    // (it's checked before the bgmanager gate in validate.ts).
-    // The end result is the same — the tool is refused — but
-    // the message points at the more fundamental problem
-    // (mutating tool needs isolation) rather than the bgmanager
-    // wiring. Lock the gate ordering so a refactor doesn't flip
-    // the error path silently.
+  test("4.2b.iv: still rejects a requiresBgManager+writes tool under isolation='none' via the writes gate", () => {
+    // The writes:true refusal still fires under default
+    // isolation — bg lift didn't relax that constraint.
+    // bash_background writes (it spawns processes that may
+    // produce filesystem changes), so it still requires
+    // worktree containment when isolation is 'none'.
     const reg = buildRegistry(bgTool('bash_background'));
     const def = definition({ tools: ['bash_background'], isolation: 'none' });
     expect(() => validateSubagentTools(def, reg)).toThrow(
@@ -170,12 +166,11 @@ describe('validateSubagentTools', () => {
     );
   });
 
-  test('rejects a writes:false bg-only tool (e.g., bash_output) regardless of isolation', () => {
-    // bash_output has writes:false + requiresBgManager:true, so
-    // the writes gate doesn't fire. The bgmanager gate must catch
-    // it under both isolation modes. This is what protects a
-    // read-only subagent that whitelists bash_output without
-    // realizing the runtime can't dispatch it.
+  test('4.2b.iv: accepts a read-only bg tool (e.g. bash_output) under both isolation modes', () => {
+    // bash_output has writes:false + requiresBgManager:true.
+    // Pre-4.2b.iv it was refused everywhere because the bg
+    // gate was global. Post-lift, both modes accept it: the
+    // child gets its bg manager regardless of isolation.
     const readOnlyBg: Tool = {
       name: 'bash_output',
       description: 'read bg stdout',
@@ -193,22 +188,8 @@ describe('validateSubagentTools', () => {
     const reg = buildRegistry(readOnlyBg);
     for (const isolation of ['none', 'worktree'] as const) {
       const def = definition({ tools: ['bash_output'], isolation });
-      expect(() => validateSubagentTools(def, reg)).toThrow(
-        /tool 'bash_output' declares metadata\.requiresBgManager=true/,
-      );
+      expect(() => validateSubagentTools(def, reg)).not.toThrow();
     }
-  });
-
-  test('requiresBgManager error names the offending source path', () => {
-    const reg = buildRegistry(bgTool('bash_kill'));
-    const def = definition({
-      tools: ['bash_kill'],
-      isolation: 'worktree',
-      sourcePath: '/u/.config/agent/agents/runner.md',
-    });
-    expect(() => validateSubagentTools(def, reg)).toThrow(
-      /\(\/u\/\.config\/agent\/agents\/runner\.md\)/,
-    );
   });
 
   test("isolation: 'none' (default) keeps the writes:true refusal", () => {
