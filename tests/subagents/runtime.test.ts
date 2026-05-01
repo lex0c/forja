@@ -1241,6 +1241,85 @@ describe('runSubagent — orchestration', () => {
     }
   });
 
+  test('4.2b.iv: bash-wrapper match preserves trailing whitespace verbatim', async () => {
+    // Real production shape that the prior trim() broke: a
+    // recorded command with a trailing newline (very common —
+    // heredoc bodies, multi-line scripts). The bg manager
+    // passes `input.command` to bash AND to the DB verbatim,
+    // so /proc/<pid>/cmdline argv[2] equals the row's
+    // `command` field byte-for-byte. Trimming on either side
+    // before the comparison would mismatch and leak the
+    // process. Pin verbatim equality.
+    const parentCwd = mkdtempSync(join(tmpdir(), 'forja-rt-bg-ws-'));
+    let bashProc: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+        model: 'mock/m',
+        cwd: parentCwd,
+      });
+      const bgRepo = await import('../../src/storage/repos/bg-processes.ts');
+      // Trailing newline in argv[2] AND in the recorded
+      // command. The recorded command MUST equal what we pass
+      // to bash; matching is exact.
+      const cmdWithWhitespace = 'sleep 60\n';
+      const whitespaceSpawn: SpawnChildProcess = (opts) => {
+        bashProc = Bun.spawn({
+          cmd: ['bash', '-c', cmdWithWhitespace],
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        bgRepo.insertBgProcess(db, {
+          sessionId: opts.sessionId,
+          osPid: bashProc.pid,
+          command: cmdWithWhitespace,
+          cwd: opts.cwd,
+          stdoutLogPath: '/tmp/fake-stdout.log',
+          stderrLogPath: '/tmp/fake-stderr.log',
+        });
+        insertSubagentOutput(db, { sessionId: opts.sessionId });
+        return {
+          exited: Promise.resolve({ exitCode: 137 }),
+          kill: () => undefined,
+        };
+      };
+      const result = await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: parentCwd,
+        spawnChildProcess: whitespaceSpawn,
+      });
+      // Process must be dead. If trim had been re-applied,
+      // argv[2]='sleep 60\n' vs trimmed='sleep 60' would
+      // mismatch and the kill would be skipped.
+      expect(bashProc).toBeDefined();
+      if (bashProc !== undefined) {
+        let alive = true;
+        try {
+          process.kill(bashProc.pid, 0);
+        } catch {
+          alive = false;
+        }
+        expect(alive).toBe(false);
+      }
+      const childRows = bgRepo.listBgProcessesBySession(db, result.sessionId);
+      expect(childRows[0]?.status).toBe('killed');
+    } finally {
+      if (bashProc !== undefined) {
+        try {
+          bashProc.kill('SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
+      rmSync(parentCwd, { recursive: true, force: true });
+    }
+  });
+
   test('4.2b.iv: isStillSameProcess matches by basename (path-prefix tolerance)', async () => {
     // Internal-helper coverage: the cmdline check should
     // tolerate the common case where the recorded command was

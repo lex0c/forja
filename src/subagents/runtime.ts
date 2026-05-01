@@ -461,31 +461,44 @@ const isStillSameProcess = (pid: number, expectedCommand: string): boolean => {
     // PID is no longer one of ours.
     return false;
   }
-  // /proc cmdline is NUL-separated. Trailing NUL produces an
-  // empty final element; filter it out.
-  const argv = cmdlineRaw.split('\0').filter((s) => s.length > 0);
+  // /proc cmdline is NUL-separated. The terminating NUL after
+  // the last argument produces a trailing empty element when we
+  // split; drop only that trailing one (intermediate empty args
+  // are rare but legal — preserving them keeps the index math
+  // honest). NOT a global filter, which would shift indices and
+  // hide intermediate args.
+  const argv = cmdlineRaw.split('\0');
+  if (argv.length > 0 && argv[argv.length - 1] === '') argv.pop();
   if (argv.length === 0) return false;
-  const expectedTrimmed = expectedCommand.trim();
-  if (expectedTrimmed.length === 0) return false;
+  if (expectedCommand.length === 0) return false;
   const argv0Basename = (argv[0] ?? '').split('/').pop() ?? '';
 
   // Bash-wrapper case (production): bg manager runs every
   // command as `bash -c <command>`. argv[2] holds the user
-  // command verbatim — same string the row's `command` field
-  // stores. Exact match (after trim) is the strongest signal.
+  // command BYTE-FOR-BYTE — same string the row's `command`
+  // field stores, because the bg manager passes input.command
+  // verbatim into both bash and the DB. Trim / whitespace
+  // normalization here would falsely reject legitimate commands
+  // that carry meaningful whitespace (a heredoc body, a
+  // recorded trailing newline, an indented multi-line snippet).
+  // The match must be exact.
   if (
     (argv0Basename === 'bash' || argv0Basename === 'sh') &&
     argv[1] === '-c' &&
     argv.length >= 3
   ) {
-    return argv[2] === expectedTrimmed;
+    return argv[2] === expectedCommand;
   }
 
   // Direct-spawn case: argv[0] is the executable. Compare
   // basenames so `/usr/bin/sleep 60` (recorded) matches
   // argv[0]=`sleep` (live). Used by tests that bypass the bg
   // manager and by future programmatic callers that spawn
-  // directly without the shell wrapper.
+  // directly without the shell wrapper. Trim here is safe and
+  // necessary — we tokenize on whitespace, and a leading space
+  // would otherwise produce an empty first token.
+  const expectedTrimmed = expectedCommand.trim();
+  if (expectedTrimmed.length === 0) return false;
   const recordedFirstToken = expectedTrimmed.split(/\s+/)[0] ?? '';
   if (argv0Basename.length === 0 || recordedFirstToken.length === 0) return false;
   const recordedBasename = recordedFirstToken.split('/').pop() ?? recordedFirstToken;
@@ -515,6 +528,31 @@ const reapChildBgProcesses = async (db: DB, sessionId: string): Promise<void> =>
     return;
   }
   if (running.length === 0) return;
+
+  // Platform gate: identity verification depends on
+  // `/proc/<pid>/cmdline`, which only exists on Linux. On
+  // macOS / Windows / BSDs the read fails for every PID, both
+  // passes skip every signal, and the prior code path then
+  // ran `markRunningAsKilled` anyway — leaving real orphan
+  // processes alive on disk while audit state claimed they
+  // were terminated. Worse than the leak alone, because the
+  // operator looking at the audit row can't tell anything
+  // is wrong.
+  //
+  // Honest path: emit a warning so the operator knows the
+  // rows weren't reaped, and return WITHOUT marking anything
+  // killed. The audit stays truthful (rows remain 'running');
+  // operator can use OS-native tools (`ps`, `lsof`, Activity
+  // Monitor, Task Manager) to find and kill the actual
+  // processes. A future slice can add a ps-based fallback for
+  // macOS/BSD, but that needs careful platform-specific
+  // parsing of `ps` output and is out of scope here.
+  if (process.platform !== 'linux') {
+    process.stderr.write(
+      `subagent ${sessionId}: bg process reaper requires Linux /proc; ${running.length} row(s) left as 'running' on platform '${process.platform}' — investigate via OS-native tools\n`,
+    );
+    return;
+  }
   // SIGTERM every PID — but ONLY after verifying that the PID
   // still points at the process we recorded at spawn time. The
   // DB row's `os_pid` was captured when the bg manager spawned
