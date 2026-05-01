@@ -3,7 +3,9 @@ import { bashBackgroundTool } from './bash-background.ts';
 import { bashKillTool } from './bash-kill.ts';
 import { bashOutputTool } from './bash-output.ts';
 import { bashTool } from './bash.ts';
+import { dependentsOfTool } from './dependents-of.ts';
 import { editFileTool } from './edit-file.ts';
+import { findReferencesTool } from './find-references.ts';
 import { globTool } from './glob.ts';
 import { grepTool } from './grep.ts';
 import { importsOfTool } from './imports-of.ts';
@@ -24,8 +26,20 @@ export { bashKillTool } from './bash-kill.ts';
 export type { BashKillInput, BashKillOutput } from './bash-kill.ts';
 export { bashOutputTool } from './bash-output.ts';
 export type { BashOutputInput, BashOutputOutput } from './bash-output.ts';
+export { dependentsOfTool } from './dependents-of.ts';
+export type {
+  DependentEdge,
+  DependentsOfInput,
+  DependentsOfOutput,
+} from './dependents-of.ts';
 export { editFileTool } from './edit-file.ts';
 export type { EditFileInput, EditFileOutput } from './edit-file.ts';
+export { findReferencesTool } from './find-references.ts';
+export type {
+  FindReferenceHit,
+  FindReferencesInput,
+  FindReferencesOutput,
+} from './find-references.ts';
 export { globTool } from './glob.ts';
 export type { GlobInput, GlobOutput } from './glob.ts';
 export { grepTool } from './grep.ts';
@@ -58,6 +72,8 @@ export const BUILTIN_TOOLS = [
   readSymbolTool,
   outlineFileTool,
   importsOfTool,
+  dependentsOfTool,
+  findReferencesTool,
   globTool,
   grepTool,
   waitForTool,

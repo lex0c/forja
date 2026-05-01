@@ -497,6 +497,26 @@ const extractCallReference = (
   };
 };
 
+// Heritage references: the captured node IS the identifier-
+// bearing leaf (extends_clause's identifier or
+// member_expression.property; implements_clause's
+// type_identifier; extends_type_clause's type_identifier). The
+// extractor just reads .text and the position of the leaf
+// itself — no additional walking.
+const extractHeritageReference = (
+  node: SyntaxNode,
+  refKind: ReferenceKind,
+): Omit<Reference, 'id' | 'sourceFile' | 'targetSymbolId'> | null => {
+  const name = node.text;
+  if (name.length === 0) return null;
+  return {
+    sourceLine: node.startPosition.row,
+    sourceCol: node.startPosition.column,
+    targetSymbolName: name,
+    refKind,
+  };
+};
+
 // Public surface: parse the source, run the language's query,
 // extract structured symbols + imports. Caller (the scanner
 // pipeline in slice 4.3.1.b) provides the project-relative
@@ -547,6 +567,12 @@ export const extractFromSource = (
         if (imp !== null) imports.push(imp);
       } else if (capture.name === 'ref.call') {
         const ref = extractCallReference(capture.node);
+        if (ref !== null) references.push(ref);
+      } else if (capture.name === 'ref.extends') {
+        const ref = extractHeritageReference(capture.node, 'extends');
+        if (ref !== null) references.push(ref);
+      } else if (capture.name === 'ref.implements') {
+        const ref = extractHeritageReference(capture.node, 'implements');
         if (ref !== null) references.push(ref);
       } else if (capture.name in symbolDescriptor) {
         const sym = extractGenericSymbol(capture.name, capture.node, filePath, exportedNames);

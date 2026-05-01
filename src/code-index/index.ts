@@ -199,6 +199,15 @@ export class CodeIndex {
     return Array.from(new Set(rows.map((r) => r.sourceFile)));
   }
 
+  // Detailed variant retaining the full Import row(s) per
+  // dependent — names, isExternal, etc. The dependents_of tool
+  // uses this so the model sees WHAT each dependent imports,
+  // not just THAT it imports. Returns one row per import edge
+  // (a file importing the target twice yields two rows).
+  dependentsOfDetailed(path: string): Import[] {
+    return listDependentsOf(this.db, path);
+  }
+
   // ---------- Test mapping ----------
 
   testsFor(sourcePath: string): TestMapping[] {

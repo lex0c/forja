@@ -21,6 +21,9 @@
 //   @symbol.const    — lexical_declaration with `const`
 //   @import.stmt     — import_statement (extractor walks for names + source)
 //   @import.require  — `require('module')` call_expression (CJS interop)
+//   @ref.call        — call_expression target (function name)
+//   @ref.extends     — class/interface extends parent identifier
+//   @ref.implements  — class implements type_identifier (TS only)
 
 // ---------- TypeScript ----------
 
@@ -79,6 +82,22 @@ export const TS_QUERY = `
 ;; identifier "require".
 (call_expression) @ref.call
 
+;; Class extends — base class is either a bare identifier
+;; (Base) or a namespaced member_expression (ns.Base). Capture
+;; the identifier-bearing leaf so the extractor reads .text
+;; directly.
+(extends_clause (identifier) @ref.extends)
+(extends_clause
+  (member_expression property: (property_identifier) @ref.extends))
+
+;; Class implements — N type_identifiers. Each is its own ref.
+(implements_clause (type_identifier) @ref.implements)
+
+;; Interface extends — TS interfaces inherit from N other
+;; interfaces via extends_type_clause. Same ref_kind as class
+;; extends since the semantic is identical.
+(extends_type_clause (type_identifier) @ref.extends)
+
 ;; CommonJS interop: capture every call_expression whose
 ;; function identifier is "require". Unscoped (matches anywhere
 ;; in the program — lazy-load require inside functions is a
@@ -121,6 +140,15 @@ export const JS_QUERY = `
 (program (export_statement (lexical_declaration "const") @symbol.const))
 
 (import_statement) @import.stmt
+
+;; Call sites + class extends — see TS_QUERY for rationale.
+;; JS lacks implements and interface; ALSO the JS grammar
+;; differs from TS here: class_heritage directly contains the
+;; parent identifier, with no extends_clause wrapper.
+(call_expression) @ref.call
+(class_heritage (identifier) @ref.extends)
+(class_heritage
+  (member_expression property: (property_identifier) @ref.extends))
 
 ;; CJS require — see TS_QUERY for rationale.
 ((call_expression

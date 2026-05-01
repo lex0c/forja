@@ -675,6 +675,56 @@ describe('extractFromSource — call references', () => {
   });
 });
 
+describe('extractFromSource — heritage references', () => {
+  test('class extends emits a single ref with kind=extends (bare base)', () => {
+    const src = 'export class Auth extends Base {}';
+    const { references } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    const refs = references.filter((r) => r.refKind === 'extends');
+    expect(refs.length).toBe(1);
+    expect(refs[0]?.targetSymbolName).toBe('Base');
+  });
+
+  test('class extends with namespaced base captures the property name', () => {
+    const src = 'export class Auth extends ns.QualifiedBase {}';
+    const { references } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    const refs = references.filter((r) => r.refKind === 'extends');
+    expect(refs.length).toBe(1);
+    expect(refs[0]?.targetSymbolName).toBe('QualifiedBase');
+  });
+
+  test('class implements emits one ref per type_identifier', () => {
+    const src = 'export class Auth implements IFace1, IFace2 {}';
+    const { references } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    const refs = references.filter((r) => r.refKind === 'implements');
+    expect(refs.map((r) => r.targetSymbolName).sort()).toEqual(['IFace1', 'IFace2']);
+  });
+
+  test('class with extends + implements emits both kinds', () => {
+    const src = 'export class Auth extends Base implements IFace {}';
+    const { references } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    expect(references.find((r) => r.refKind === 'extends')?.targetSymbolName).toBe('Base');
+    expect(references.find((r) => r.refKind === 'implements')?.targetSymbolName).toBe('IFace');
+  });
+
+  test('interface extends emits refs with kind=extends (TS-only)', () => {
+    const src = 'export interface A extends B, C {}';
+    const { references } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    const refs = references.filter((r) => r.refKind === 'extends');
+    expect(refs.map((r) => r.targetSymbolName).sort()).toEqual(['B', 'C']);
+  });
+
+  test('JS class extends works (different grammar shape than TS)', () => {
+    // tree-sitter-javascript wraps the base directly in
+    // class_heritage with no extends_clause; the JS_QUERY uses
+    // a different pattern. Pin that the JS path produces an
+    // equivalent reference.
+    const src = 'export class Auth extends Base {}';
+    const { references } = extractFromSource(src, 'javascript', 'src/x.js', parseSource);
+    const refs = references.filter((r) => r.refKind === 'extends');
+    expect(refs[0]?.targetSymbolName).toBe('Base');
+  });
+});
+
 describe('non-ASCII source support', () => {
   test('extracts symbols from sources with non-ASCII identifiers and comments', () => {
     // Real-world i18n / multilingual codebases mix UTF-8 across
