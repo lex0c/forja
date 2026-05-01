@@ -6,8 +6,11 @@ import { bashTool } from './bash.ts';
 import { editFileTool } from './edit-file.ts';
 import { globTool } from './glob.ts';
 import { grepTool } from './grep.ts';
+import { importsOfTool } from './imports-of.ts';
 import { monitorTool } from './monitor.ts';
+import { outlineFileTool } from './outline-file.ts';
 import { readFileTool } from './read-file.ts';
+import { readSymbolTool } from './read-symbol.ts';
 import { taskTool } from './task.ts';
 import { todoWriteTool } from './todo-write.ts';
 import { waitForTool } from './wait-for.ts';
@@ -27,10 +30,16 @@ export { globTool } from './glob.ts';
 export type { GlobInput, GlobOutput } from './glob.ts';
 export { grepTool } from './grep.ts';
 export type { GrepInput, GrepMatch, GrepOutput } from './grep.ts';
+export { importsOfTool } from './imports-of.ts';
+export type { ImportEdge, ImportsOfInput, ImportsOfOutput } from './imports-of.ts';
 export { monitorTool } from './monitor.ts';
 export type { MonitorInput, MonitorOutput } from './monitor.ts';
+export { outlineFileTool } from './outline-file.ts';
+export type { OutlineFileInput, OutlineFileOutput, OutlineFileSymbol } from './outline-file.ts';
 export { readFileTool } from './read-file.ts';
 export type { ReadFileInput, ReadFileOutput } from './read-file.ts';
+export { readSymbolTool } from './read-symbol.ts';
+export type { ReadSymbolInput, ReadSymbolOutput } from './read-symbol.ts';
 export { taskTool } from './task.ts';
 export type { TaskInput, TaskOutput } from './task.ts';
 export { todoWriteTool } from './todo-write.ts';
@@ -46,6 +55,9 @@ export type { WriteFileInput, WriteFileOutput } from './write-file.ts';
 // state, not external mutation.
 export const BUILTIN_TOOLS = [
   readFileTool,
+  readSymbolTool,
+  outlineFileTool,
+  importsOfTool,
   globTool,
   grepTool,
   waitForTool,

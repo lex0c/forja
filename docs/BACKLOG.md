@@ -15,6 +15,110 @@ Format:
 
 ---
 
+## [2026-05-01] M3 / Step 4.3.2 — symbolic tools (registered, awaiting harness wiring)
+
+Three of the five spec tools from CODE_INDEX.md §5 ship as
+builtin Tool definitions: `read_symbol` (§5.1), `outline_file`
+(§5.3), `imports_of` (§5.4). The remaining two
+(`find_references` §5.2, `dependents_of` §5.4) are deferred to
+slice 4.3.3 because they need the reference resolver to populate
+`target_symbol_id` / `target_path` — both columns are null in
+the DB until that slice lands, so the tools would always return
+empty.
+
+**Honesty up front:** this slice ships the tool definitions +
+unit tests, NOT a fully-integrated path the harness drives in a
+real session. `ToolContext.codeIndex?` is optional and the
+harness never sets it today, so every invocation in production
+returns `index.unavailable`. The harness-wiring slice (likely
+4.3.5 or the "session bootstrap" pass) is what makes the tools
+actually run end-to-end. The gap is intentional: it lets the
+tool surface land, get reviewed, and stabilize before the
+harness changes that thread it in.
+
+**Decisions:**
+
+- **D1 — read_symbol uses `category: 'misc'` + self-gate.** The
+  fs.read engine gate requires `args.path`; read_symbol takes
+  `symbol` + `file?` instead, so the harness pre-call gate
+  would deny outright (resolveFsTarget → null → deny). Misc
+  bypasses the pre-gate; the tool then calls
+  `ctx.permissionCheck('read_file', 'fs.read', { path: absPath })`
+  AFTER resolving the file via the index. Self-gate uses tool
+  name `'read_file'` so existing read_file policy sections apply
+  unchanged (operators don't mirror rules). `decision.kind !==
+  'allow'` blocks both deny AND confirm — confirm flow needs a
+  prompt the tool can't produce. Mirrors the monitor/wait_for
+  pattern.
+- **D2 — outline_file + imports_of stay `category: 'fs.read'`.**
+  Both take `args.path` matching the engine convention; the
+  pre-gate works as-is. Caveat: these tools query the DB rather
+  than reading the file, so they leak file structure (symbols,
+  imports) even when the file would be denied for read_file.
+  Fixing that is a follow-up — surfacing the leak honestly
+  rather than papering over it.
+- **D3 — TS overload dedupe in read_symbol.**
+  `function foo(x:A):A; function foo(x:B):B; function foo(x){...}`
+  emits 3 IndexSymbol rows (same name + file + kind). Without
+  dedup the tool returns symbol.ambiguous even with `file:` set.
+  Pick the largest line span (the implementation has a body;
+  signatures are 1-line). Heuristic — works for canonical TS
+  overloads, untested for decorators or generics.
+- **D4 — `parent_symbol_id` is null today; outline_file derives
+  parent from FQN.** The extractor encodes methods as
+  `<file>:Class.method` (see extract.ts:buildFqn). Guarded by
+  `kind === 'method'` so future dotted-name kinds don't get
+  mis-assigned. Reference resolver in 4.3.3 will populate
+  `parent_symbol_id` and we can switch to the FK lookup.
+- **D5 — Path normalization via `path.relative` + `..`-rejection,
+  not string startsWith.** Robust against trailing slashes,
+  separator differences, and up-tree escapes. POSIX-only by
+  spec but the fix is platform-portable.
+- **D6 — `include_doc` field DROPPED from spec output schema.**
+  Index doesn't store docstrings (CODE_INDEX.md §1.2 explicitly
+  out of scope v1). Returning permanently-null doc would be
+  noise — better to not have the field. Deviation from §5.1's
+  output type; a future spec PR can drop the field officially
+  if v1 holds.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/tools/types.ts` | EXTENDED — `ToolContext.codeIndex?: CodeIndex` (optional). New error codes: `indexUnavailable`, `symbolNotFound`, `symbolAmbiguous`. |
+| `src/tools/builtin/read-symbol.ts` | NEW — `read_symbol(symbol, file?)`. Self-gates fs.read; dedupes overloads; rejects empty inputs; surfaces fs.read_failed when index points at a missing file. |
+| `src/tools/builtin/outline-file.ts` | NEW — `outline_file(path, include_internal?)`. Default filters to export+public. Parent class derived from FQN. 1-indexed lines. |
+| `src/tools/builtin/imports-of.ts` | NEW — `imports_of(path, hops?)`. BFS via target_path (null pre-resolver, so multi-hop degenerates to depth=1). Cap 500 edges + truncated flag. |
+| `src/tools/builtin/index.ts` | Registers the 3 tools in BUILTIN_TOOLS. |
+| `tests/tools/_helpers.ts` | makeCtx accepts codeIndex. |
+| `tests/tools/read-symbol.test.ts` | NEW — 12 tests: unique match, ambiguous, disambiguate, not found, index unavailable, empty arg, absolute path, overload dedup, permission denied, confirm-as-block, harness pre-call gate (regression for category=misc), stale index. |
+| `tests/tools/outline-file.test.ts` | NEW — 7 tests: default exports-only, include_internal, loc + imports_summary, fs.not_found, index unavailable, 1-indexed lines, parent class via FQN. |
+| `tests/tools/imports-of.test.ts` | NEW — 5 tests: direct edges, hops out-of-range, hops>1 with target_path null, no-imports file, index unavailable. |
+| `tests/cli/bootstrap.test.ts` | Updated pinned tool list. |
+
+**Pending / known gaps** (non-blocking but real — slice is honest about what it doesn't do):
+
+- **Harness wiring**: ToolContext.codeIndex never set in production. Tools registered but non-functional end-to-end.
+- **Integration test through harness loop**: only proxy test exists (engine.check directly).
+- **Information leak in outline/imports_of**: tools query DB, not disk, so file-deny policies don't apply. Fix lands with a re-think of the policy model for index-backed tools.
+- **No content_hash freshness check in read_symbol**: stale line ranges return wrong slices silently.
+- **TOCTOU between `file.exists()` and `file.text()`**: rare; uncaught throw bubbles to harness as internalError.
+- **No mid-read cancellation**: `ctx.signal.aborted` only checked at entry.
+- **Token cost claim ("5-20×")** unmeasured — borrowed from spec, no eval pinning it.
+- **find_references + dependents_of** require reference resolver (4.3.3).
+
+**Verification:** `bun test` 1587 pass / 10 skip / 0 fail
+(+24 new across the 3 tool tests); `tsc --noEmit` clean;
+`biome check` clean.
+
+**Next:** M3 / Step 4.3.3 — reference resolver. Populates
+`references_` and `imports.target_path` in a second pass after
+the scan. Unblocks `find_references` + `dependents_of`. After
+that, the harness-wiring sub-slice threads `CodeIndex` into
+`ToolContext` so the tools actually run in real sessions.
+
+---
+
 ## [2026-05-01] M3 / Step 4.3.1.c — code-index CLI surface
 
 End-to-end completion of the 4.3.1 sub-arc: 4.3.1.a delivered

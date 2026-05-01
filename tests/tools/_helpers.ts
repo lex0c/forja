@@ -22,5 +22,6 @@ export const makeCtx = (overrides: Partial<ToolContext> = {}): ToolContext => ({
   permissionCheck: overrides.permissionCheck ?? allowAll,
   ...(overrides.bgManager !== undefined ? { bgManager: overrides.bgManager } : {}),
   ...(overrides.todoStore !== undefined ? { todoStore: overrides.todoStore } : {}),
+  ...(overrides.codeIndex !== undefined ? { codeIndex: overrides.codeIndex } : {}),
   ...(overrides.spawnSubagent !== undefined ? { spawnSubagent: overrides.spawnSubagent } : {}),
 });

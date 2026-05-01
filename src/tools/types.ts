@@ -1,4 +1,5 @@
 import type { BgManager } from '../bg/index.ts';
+import type { CodeIndex } from '../code-index/index.ts';
 import type { Decision, PermissionsView, PolicyCategory, ToolArgs } from '../permissions/index.ts';
 import type { ProviderToolInputSchema } from '../providers/index.ts';
 import type { WorktreeOutcome } from '../subagents/types.ts';
@@ -118,6 +119,17 @@ export interface ToolContext {
   // harness loop. Tests inject an explicit allow-all (or a custom
   // predicate to exercise deny paths) via makeCtx.
   permissionCheck: (toolName: string, category: PolicyCategory, args: ToolArgs) => Decision;
+  // Code index instance (CODE_INDEX.md §4). Optional so existing
+  // tools that don't need symbolic queries aren't forced to
+  // declare a dependency. Symbolic tools (`read_symbol`,
+  // `outline_file`, `imports_of`, …) surface a clean
+  // `index.unavailable` tool error when absent rather than
+  // dereferencing undefined. The harness opens one CodeIndex
+  // per session (per-project DB resolved from cwd) and shares
+  // it across the loop's tool calls; failure to open
+  // (migrations, file-locked) leaves this undefined and tools
+  // degrade gracefully.
+  codeIndex?: CodeIndex;
   // Spawn a subagent (spec §11). Set by the harness when a subagent
   // registry was wired via HarnessConfig.subagentRegistry; absent
   // when no subagents are available. The `task` tool surfaces a
@@ -213,6 +225,10 @@ export const ERROR_CODES = {
   // the harness-level deny (which short-circuits before tool.execute
   // runs and uses the model-facing `tool_decided` event).
   permissionDenied: 'permission.denied',
+  // Code-index symbolic tools (CODE_INDEX.md §5).
+  indexUnavailable: 'index.unavailable',
+  symbolNotFound: 'symbol.not_found',
+  symbolAmbiguous: 'symbol.ambiguous',
 } as const;
 
 export const toolError = (
