@@ -490,19 +490,45 @@ const isStillSameProcess = (pid: number, expectedCommand: string): boolean => {
     return argv[2] === expectedCommand;
   }
 
-  // Direct-spawn case: argv[0] is the executable. Compare
-  // basenames so `/usr/bin/sleep 60` (recorded) matches
-  // argv[0]=`sleep` (live). Used by tests that bypass the bg
-  // manager and by future programmatic callers that spawn
-  // directly without the shell wrapper. Trim here is safe and
-  // necessary — we tokenize on whitespace, and a leading space
-  // would otherwise produce an empty first token.
+  // Direct-spawn case: argv[0] is the executable. Used by
+  // tests that bypass the bg manager and by future
+  // programmatic callers that spawn without the shell
+  // wrapper. Trim here is safe and necessary — we tokenize on
+  // whitespace, and a leading space would otherwise produce
+  // an empty first token.
+  //
+  // Comparing only argv[0]'s basename (the original shape of
+  // this branch) was too weak: a recycled PID that happens to
+  // belong to another invocation of the same binary with
+  // different args (e.g. recorded `sleep 60` recycled into
+  // `sleep 30`) would falsely match and earn SIGKILL. We now
+  // compare ALL tokens:
+  //   - argv length must equal the tokenized recorded length
+  //   - argv[0]'s basename must match recorded token 0's
+  //     basename (handles `/usr/bin/sleep` ↔ `sleep`)
+  //   - argv[i] === recorded[i] for every subsequent index
+  //
+  // Limitation: tokenization is naive whitespace split, so
+  // quoted args don't round-trip (a recorded `cmd "with
+  // space"` would split into 3 tokens but the live argv has
+  // 2). For direct-spawn callers that need quoting fidelity,
+  // route through bash-wrapper instead. Production already
+  // uses bash-wrapper exclusively; this path's primary user
+  // is the test suite, where commands are whitespace-clean
+  // by construction.
   const expectedTrimmed = expectedCommand.trim();
   if (expectedTrimmed.length === 0) return false;
-  const recordedFirstToken = expectedTrimmed.split(/\s+/)[0] ?? '';
+  const recordedTokens = expectedTrimmed.split(/\s+/);
+  if (recordedTokens.length === 0) return false;
+  const recordedFirstToken = recordedTokens[0] ?? '';
   if (argv0Basename.length === 0 || recordedFirstToken.length === 0) return false;
+  if (argv.length !== recordedTokens.length) return false;
   const recordedBasename = recordedFirstToken.split('/').pop() ?? recordedFirstToken;
-  return argv0Basename === recordedBasename;
+  if (argv0Basename !== recordedBasename) return false;
+  for (let i = 1; i < recordedTokens.length; i += 1) {
+    if (argv[i] !== recordedTokens[i]) return false;
+  }
+  return true;
 };
 
 // Reap any bg processes the child spawned but failed to clean
@@ -1223,23 +1249,56 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // session ID, not as a security boundary.
   await reapChildBgProcesses(input.db, childSession.id);
 
-  // Best-effort cleanup of the per-subagent bg log directory.
-  // ENOENT is expected (bg manager creates the dir lazily on
-  // first spawn — subagents that never invoked a bg tool leave
-  // no directory to remove), so we silence it; other errors
-  // (permission denied, disk full, etc.) get logged to stderr
-  // so the operator knows the cache is leaking. Cleanup failure
-  // never changes the run outcome — operator's `agent worktree
-  // gc` (4.2d) sweeps stragglers.
+  // Best-effort cleanup of the per-subagent bg log directory —
+  // BUT ONLY if every bg row reached terminal status. The
+  // reaper bails on non-Linux (no /proc, no identity check) and
+  // can also leave rows as 'running' if `markRunningAsKilled`
+  // hits a DB write error after the kills succeeded. In either
+  // case, removing the log dir would unlink files that processes
+  // (still alive on the OS) are actively writing to — the exact
+  // unlink-while-running behavior the reaper exists to prevent.
+  // The dir also holds artifacts the operator needs for manual
+  // investigation when the reap fell short.
+  //
+  // Re-query post-reap; if the DB shows no 'running' rows for
+  // this child session, every process is accounted for and the
+  // dir is safe to remove. Otherwise we leave it; `agent worktree
+  // gc` (4.2d) will reconcile alongside the audit table.
+  let stillRunningCount: number;
   try {
-    rmSync(bgLogDir, { recursive: true, force: true });
-  } catch (e) {
-    if (e instanceof Error && (e as NodeJS.ErrnoException).code !== 'ENOENT') {
-      process.stderr.write(
-        `subagent ${childSession.id}: failed to remove bg log dir '${bgLogDir}': ${e.message}\n`,
-      );
-    }
+    stillRunningCount = listBgProcessesBySession(input.db, childSession.id, {
+      status: 'running',
+    }).length;
+  } catch {
+    // Defensive: if the re-query fails (DB locked / corrupt),
+    // assume the worst and skip the rmSync. Operator
+    // investigates via gc.
+    stillRunningCount = -1;
   }
+  if (stillRunningCount === 0) {
+    // ENOENT is expected (bg manager creates the dir lazily on
+    // first spawn — subagents that never invoked a bg tool leave
+    // no directory to remove), so we silence it; other errors
+    // (permission denied, disk full, etc.) get logged to stderr
+    // so the operator knows the cache is leaking. Cleanup failure
+    // never changes the run outcome — operator's `agent worktree
+    // gc` (4.2d) sweeps stragglers.
+    try {
+      rmSync(bgLogDir, { recursive: true, force: true });
+    } catch (e) {
+      if (e instanceof Error && (e as NodeJS.ErrnoException).code !== 'ENOENT') {
+        process.stderr.write(
+          `subagent ${childSession.id}: failed to remove bg log dir '${bgLogDir}': ${e.message}\n`,
+        );
+      }
+    }
+  } else if (stillRunningCount > 0) {
+    process.stderr.write(
+      `subagent ${childSession.id}: bg log dir '${bgLogDir}' preserved — ${stillRunningCount} bg row(s) still 'running' (reaper deferred or kill incomplete); inspect via OS tools or 'agent worktree gc'\n`,
+    );
+  }
+  // stillRunningCount === -1: re-query failed; warning already
+  // implicit (operator will notice the leftover dir).
 
   // 8. Build the result envelope from the wait outcome.
   let result: RunSubagentResult;

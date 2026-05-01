@@ -1395,6 +1395,82 @@ describe('runSubagent — orchestration', () => {
     }
   });
 
+  test('4.2b.iv: direct-spawn match rejects same-binary different-args recycled PID', async () => {
+    // Tightening: the original direct-spawn branch only
+    // compared argv[0]'s basename. A recycled PID that lands
+    // on a different invocation of the same binary (e.g.
+    // recorded `sleep 60` exits, kernel hands the PID to a
+    // fresh `sleep 30`) would falsely match and earn SIGKILL.
+    // The new check compares argv length AND each token;
+    // mismatching args reject the match, preserving the
+    // recycled-PID safety property even for direct-spawn
+    // callers (the case used by tests and future programmatic
+    // bg managers that don't wrap commands in bash -c).
+    const parentCwd = mkdtempSync(join(tmpdir(), 'forja-rt-bg-args-'));
+    let liveSleep: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+        model: 'mock/m',
+        cwd: parentCwd,
+      });
+      const bgRepo = await import('../../src/storage/repos/bg-processes.ts');
+      // Live process is `sleep 30` (different args than
+      // recorded). With basename-only matching this would
+      // pass — the regression we fixed.
+      liveSleep = Bun.spawn({ cmd: ['sleep', '30'], stdout: 'pipe', stderr: 'pipe' });
+      const argMismatchSpawn: SpawnChildProcess = (opts) => {
+        bgRepo.insertBgProcess(db, {
+          sessionId: opts.sessionId,
+          osPid: liveSleep?.pid ?? null,
+          // Recorded args differ: live is `sleep 30`, recorded
+          // is `sleep 60`. argv length matches (2 vs 2),
+          // argv[0] basename matches ('sleep' vs 'sleep'),
+          // argv[1] differs ('30' vs '60'). Match must be
+          // refused.
+          command: 'sleep 60',
+          cwd: opts.cwd,
+          stdoutLogPath: '/tmp/fake-stdout.log',
+          stderrLogPath: '/tmp/fake-stderr.log',
+        });
+        insertSubagentOutput(db, { sessionId: opts.sessionId });
+        return {
+          exited: Promise.resolve({ exitCode: 137 }),
+          kill: () => undefined,
+        };
+      };
+      await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: parentCwd,
+        spawnChildProcess: argMismatchSpawn,
+      });
+      // sleep 30 must still be alive — the reaper refused to
+      // signal because the recorded command's tokens didn't
+      // match the live argv.
+      let alive = true;
+      try {
+        process.kill(liveSleep.pid, 0);
+      } catch {
+        alive = false;
+      }
+      expect(alive).toBe(true);
+    } finally {
+      if (liveSleep !== undefined) {
+        try {
+          liveSleep.kill('SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
+      rmSync(parentCwd, { recursive: true, force: true });
+    }
+  });
+
   test('parent forwards temperature to spawn opts when set', async () => {
     // Eval / automation pipelines pin temperature=0 for
     // determinism. Without forwarding, the subprocess child
