@@ -84,6 +84,15 @@ export const runWorktreesCli = async (input: WorktreesCliInput): Promise<number>
     if (input.dbOverride === undefined) migrate(db);
 
     if (verb === 'list') {
+      // `list` takes no positionals. The parser's verb-aware
+      // allowlist already stops collection on any non-allowed
+      // flag-shaped token, but a stray bare word ("agent
+      // --worktrees list xyz") would still come through. Reject
+      // loud so the operator sees the typo.
+      if (positionals.length > 0) {
+        err(`forja: --worktrees list takes no positionals; got: ${positionals.join(' ')}\n`);
+        return 1;
+      }
       const plan = await buildGcPlan({ db, parentCwd: cwd });
       if (json) writeListJson(plan, out);
       else writeListTable(plan, out);

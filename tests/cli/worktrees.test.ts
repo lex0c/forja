@@ -140,6 +140,23 @@ describe('runWorktreesCli — gc', () => {
     expect(errBuf).toContain('--bogus');
   });
 
+  test('list rejects positional arguments', async () => {
+    // list takes no positionals. Stray words sneaking through
+    // (e.g. operator typo `agent --worktrees list xyz`) must
+    // fail loud, not silently ignore.
+    const code = await runWorktreesCli({
+      verb: 'list',
+      positionals: ['xyz'],
+      json: false,
+      cwd: parentCwd,
+      dbOverride: db,
+      out,
+      err,
+    });
+    expect(code).toBe(1);
+    expect(errBuf).toContain('takes no positionals');
+  });
+
   test('rejects unknown verb', async () => {
     const code = await runWorktreesCli({
       verb: 'sneeze' as 'list',

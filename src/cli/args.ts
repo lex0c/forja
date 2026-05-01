@@ -203,19 +203,31 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
           };
         }
         // Greedy collection of positionals until the next
-        // top-level flag. `gc` accepts `--dry-run` and
-        // `--force` as positional flag-shaped tokens (the
-        // handler validates them); `list` takes no positionals.
-        // The early-stop on top-level flags (`--json`) keeps
-        // things consistent with --checkpoints.
+        // unrecognized flag-shaped token. The earlier
+        // implementation stopped only on `--json`/`--help`/`-h`,
+        // which silently swallowed every OTHER top-level flag
+        // (--yes, --model, etc.) into positionals — those tokens
+        // were then ignored by the handler, so `agent --worktrees
+        // list --model foo` ran the list with `foo` as a stray
+        // positional and the operator wondered why --model didn't
+        // do anything.
+        //
+        // Verb-aware allowlist: only the verb's known sub-flags
+        // are kept inside positional collection. Any other `-`
+        // / `--` prefixed token breaks the loop so the outer
+        // parser sees it on the next iteration. `list` has no
+        // sub-flags so it stops at every flag-shaped token.
+        const verbSubFlags: Readonly<Record<string, ReadonlySet<string>>> = {
+          gc: new Set(['--dry-run', '--force']),
+          list: new Set(),
+        };
+        const allowed = verbSubFlags[verb] ?? new Set<string>();
         const positionals: string[] = [];
         let j = i + 2;
         while (j < argv.length) {
           const next = argv[j];
           if (next === undefined) break;
-          // Stop on top-level flags only. We keep `--dry-run`
-          // and `--force` because they're sub-flags of `gc`.
-          if (next === '--json' || next === '--help' || next === '-h') break;
+          if (next.startsWith('-') && !allowed.has(next)) break;
           positionals.push(next);
           j += 1;
         }

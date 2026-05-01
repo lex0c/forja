@@ -251,6 +251,89 @@ describe('buildGcPlan — classification', () => {
   });
 });
 
+describe('buildGcPlan — security: parent repo + non-Forja worktrees never enter the plan', () => {
+  test('parent repo path from `git worktree list` is filtered (regression)', async () => {
+    // git worktree list --porcelain ALWAYS includes the
+    // repo's main worktree. Without the cache-root filter,
+    // that path would appear as `orphan` (no DB row) and
+    // `--force` would route it to defaultRunRemove. git's
+    // `worktree remove --force` correctly refuses for the
+    // main worktree, but the rmSync fallback would
+    // recursively delete the operator's repository. This
+    // test pins the filter behavior — only paths under the
+    // cache root (or DB-known) survive.
+    const sessionId = seedSession();
+    const subagentPath = join(cacheRoot, sessionId);
+    mkdirSync(subagentPath);
+    insertSubagentWorktree(db, {
+      sessionId,
+      path: subagentPath,
+      branch: 'agent/scoped-12345678',
+      status: 'preserved',
+    });
+    const plan = await buildGcPlan({
+      db,
+      parentCwd,
+      cacheRoot,
+      runGitWorktreeList: async () =>
+        `worktree ${parentCwd}\nbranch refs/heads/main\n\nworktree ${subagentPath}\nbranch refs/heads/agent/scoped-12345678\n\n`,
+      worktreeStatus: async () => 'clean',
+    });
+    expect(plan.entries.map((e) => e.path)).toEqual([subagentPath]);
+  });
+
+  test('non-Forja linked worktree (operator-created) is filtered', async () => {
+    // Operator may have unrelated linked worktrees off the
+    // same repo. They appear in `git worktree list` but live
+    // outside our cache root and have no audit row.
+    const operatorWorktree = mkdtempSync(join(tmpdir(), 'forja-gc-foreign-'));
+    try {
+      const plan = await buildGcPlan({
+        db,
+        parentCwd,
+        cacheRoot,
+        runGitWorktreeList: async () =>
+          `worktree ${parentCwd}\nbranch refs/heads/main\n\nworktree ${operatorWorktree}\nbranch refs/heads/feature\n\n`,
+        worktreeStatus: async () => 'clean',
+      });
+      expect(plan.entries).toEqual([]);
+    } finally {
+      rmSync(operatorWorktree, { recursive: true, force: true });
+    }
+  });
+
+  test('DB-known path outside cache root IS included (custom rootDir)', async () => {
+    // Operator who customized WorktreeOptions.rootDir at
+    // create time has audit rows pointing outside the
+    // default cache root. The audit row is authoritative —
+    // gc respects it.
+    const sessionId = seedSession();
+    const customRoot = mkdtempSync(join(tmpdir(), 'forja-gc-custom-'));
+    const customPath = join(customRoot, sessionId);
+    try {
+      mkdirSync(customPath);
+      insertSubagentWorktree(db, {
+        sessionId,
+        path: customPath,
+        branch: 'agent/custom-deadbeef',
+        status: 'preserved',
+      });
+      const plan = await buildGcPlan({
+        db,
+        parentCwd,
+        cacheRoot,
+        runGitWorktreeList: async () =>
+          `worktree ${customPath}\nbranch refs/heads/agent/custom-deadbeef\n\n`,
+        worktreeStatus: async () => 'clean',
+      });
+      expect(plan.entries.length).toBe(1);
+      expect(plan.entries[0]?.path).toBe(customPath);
+    } finally {
+      rmSync(customRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('applyGcPlan — outcomes', () => {
   test('ready_to_remove → removed, audit reconciled', async () => {
     const sessionId = seedSession();

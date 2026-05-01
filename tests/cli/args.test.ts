@@ -533,6 +533,41 @@ describe('--worktrees', () => {
     expect(r.args.worktrees?.positionals).toEqual(['--dry-run']);
     expect(r.args.json).toBe(true);
   });
+
+  test('regression: --yes after gc is NOT swallowed as positional', () => {
+    // Before the verb-aware allowlist fix, --yes / --model / any
+    // top-level flag past `gc` got swallowed into positionals,
+    // silently disappearing from the run. Now those flags break
+    // the gc capture and reach the outer parser. --yes parses
+    // into args.yes; gc.positionals contains only its own
+    // sub-flags.
+    const r = parseArgs(['--worktrees', 'gc', '--dry-run', '--yes']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.worktrees?.positionals).toEqual(['--dry-run']);
+    expect(r.args.yes).toBe(true);
+  });
+
+  test('regression: --model after list is NOT swallowed', () => {
+    // list has no sub-flags, so any flag-shaped token breaks
+    // the positional collection immediately. --model becomes
+    // available for the outer parser to handle.
+    const r = parseArgs(['--worktrees', 'list', '--model', 'mock/m']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.worktrees?.positionals).toEqual([]);
+    expect(r.args.model).toBe('mock/m');
+  });
+
+  test('list with unknown sub-flag breaks capture instead of swallowing', () => {
+    // --bogus is not a gc sub-flag and list has none. Capture
+    // stops; --bogus reaches the outer parser, which rejects
+    // it as unknown.
+    const r = parseArgs(['--worktrees', 'list', '--bogus']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--bogus');
+  });
 });
 
 describe('usage', () => {

@@ -25,7 +25,7 @@
 // fixtures driving every assertion.
 
 import { type Dirent, existsSync, lstatSync, readdirSync, realpathSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import {
   type DB,
   listAllSubagentWorktrees,
@@ -201,6 +201,26 @@ const canonicalize = (path: string): string => {
   }
 };
 
+// Guard: is `path` a proper child of `root`? Used by gc to
+// confine candidate paths to the cache root (Forja's worktree
+// territory) so that the parent repo's main worktree — which
+// `git worktree list --porcelain` ALWAYS includes — never
+// enters the plan. Without this filter, the parent repo's
+// own checkout shows up as `orphan`; `--force` then routes
+// it to `defaultRunRemove`, which falls back to `rmSync` if
+// `git worktree remove` refuses (and it WILL refuse for the
+// main worktree). The fallback would recursively delete the
+// operator's repository.
+//
+// Implementation pins `root + sep` so `/cache` doesn't accept
+// `/cache2/...` (the classic prefix-match pitfall) and
+// rejects `path === root` so a caller can't blow away the
+// cache root itself by passing it as a worktree path.
+const isUnderRoot = (path: string, root: string): boolean => {
+  if (path === root) return false;
+  return path.startsWith(root + sep);
+};
+
 // Walk the cache root to discover directories on disk. Returns
 // absolute paths of immediate children that are directories.
 // Sub-namespaces (e.g. `bg/`) under the cache root are out of
@@ -241,21 +261,49 @@ export const buildGcPlan = async (opts: BuildGcPlanOptions): Promise<WorktreeGcP
   const dbByPath = new Map<string, (typeof dbRows)[number]>();
   for (const row of dbRows) dbByPath.set(canonicalize(row.path), row);
 
+  const canonicalCacheRoot = canonicalize(cacheRoot);
+
   const gitOutput = await runWorktreeList(opts.parentCwd);
   const gitByPathRaw = parseWorktreeList(gitOutput);
   const gitByPath = new Map<string, string | null>();
   for (const [path, branch] of gitByPathRaw) gitByPath.set(canonicalize(path), branch);
 
-  // Union of all paths we know about: union(DB rows, git
-  // entries, cache dirs). The cache root scan catches orphans
-  // git itself doesn't track (admin entry pruned but dir left
-  // behind) AND directories that look like worktrees but were
-  // never registered (operator copy-paste, etc.).
+  // Build the union of candidate paths — but DON'T blindly
+  // include everything `git worktree list --porcelain` returns.
+  // That output ALWAYS contains the parent repo's main
+  // worktree, plus any unrelated linked worktrees the operator
+  // created outside Forja. Including those would surface them
+  // as `orphan` (no DB row) and `--force` would route them to
+  // `defaultRunRemove`. `git worktree remove` correctly
+  // refuses to remove the main worktree, but the rmSync
+  // fallback would still execute — recursively deleting the
+  // operator's entire repository.
+  //
+  // Filter rule: a candidate path enters the plan only if
+  //   (a) the audit DB knows it (operator may have customized
+  //       `rootDir` so the path is outside the cache root —
+  //       the audit row is the authoritative "this is a Forja
+  //       worktree" signal), OR
+  //   (b) the path lives strictly under the cache root (the
+  //       cache scan picks up dirs we created; orphans and
+  //       leftover directories also live here).
+  // Anything else — the parent repo's main worktree, the
+  // operator's hand-rolled linked worktrees, etc. — is
+  // categorically out of scope for `agent --worktrees gc`.
   const cacheDirs = listCacheDirs(cacheRoot);
   const allPaths = new Set<string>();
   for (const row of dbRows) allPaths.add(canonicalize(row.path));
-  for (const path of gitByPath.keys()) allPaths.add(path);
-  for (const path of cacheDirs) allPaths.add(canonicalize(path));
+  for (const path of gitByPath.keys()) {
+    if (dbByPath.has(path) || isUnderRoot(path, canonicalCacheRoot)) {
+      allPaths.add(path);
+    }
+  }
+  for (const path of cacheDirs) {
+    const canonical = canonicalize(path);
+    if (dbByPath.has(canonical) || isUnderRoot(canonical, canonicalCacheRoot)) {
+      allPaths.add(canonical);
+    }
+  }
 
   const entries: WorktreeGcEntry[] = [];
 
@@ -384,11 +432,15 @@ export interface ApplyGcPlanOptions {
   // worktrees and `orphan` entries. Without it, those classes
   // are skipped — operator must inspect first.
   force: boolean;
+  // Override the rmSync-safety check. Production should never
+  // pass this; tests that exercise non-cache paths against a
+  // mocked runRemove can use it to relax the guard.
+  allowPathOutsideCacheRoot?: boolean;
   // Test seam for the actual git removal. Production runs
   // `git worktree remove --force <path>` and `git branch -D
   // <branch>`. Tests pass a stub that records calls without
   // touching the real git.
-  runRemove?: (path: string, branch: string | null, parentCwd: string) => Promise<RemoveResult>;
+  runRemove?: RunRemoveFn;
 }
 
 export interface RemoveResult {
@@ -420,10 +472,29 @@ export interface ApplyGcSummary {
   reconciledCount: number;
 }
 
-const defaultRunRemove = async (
+// Runner is invoked with (path, branch, parentCwd, cacheRoot).
+// `cacheRoot` is needed by the production runner's rmSync
+// fallback — without it, a `git worktree remove` failure on
+// the parent repo's path would let the fallback recursively
+// delete the whole repository. The buildGcPlan filter SHOULD
+// have prevented that path from reaching here, but we
+// belt-and-suspenders the check inside the runner too.
+//
+// Tests passing a custom runRemove can ignore the cacheRoot
+// argument; the type signature stays compatible because TS
+// allows fewer-parameter callbacks at the call site.
+type RunRemoveFn = (
   path: string,
   branch: string | null,
   parentCwd: string,
+  cacheRoot: string,
+) => Promise<RemoveResult>;
+
+const defaultRunRemove: RunRemoveFn = async (
+  path,
+  branch,
+  parentCwd,
+  cacheRoot,
 ): Promise<RemoveResult> => {
   // `git worktree remove --force <path>` removes the dir + admin
   // entry. We follow with `git branch -D <branch>` for the
@@ -449,8 +520,17 @@ const defaultRunRemove = async (
   // still exists, try a plain rmSync. Covers the case where
   // git's admin entry was already pruned but the working tree
   // wasn't cleaned (orphans from crashed runs).
+  //
+  // SAFETY: rmSync only runs when the path is provably under
+  // the cache root. The buildGcPlan filter blocks non-cache
+  // paths from reaching here, so this guard is defense-in-depth
+  // — but it's the LAST line before a recursive disk delete, so
+  // we double-check. Without this, a malicious or corrupted DB
+  // row pointing at the parent repo would slip through if the
+  // upstream filter ever regressed; rmSync would then wipe the
+  // operator's repository.
   let removed = removeExit === 0;
-  if (!removed && existsSync(path)) {
+  if (!removed && existsSync(path) && isUnderRoot(canonicalize(path), canonicalize(cacheRoot))) {
     try {
       rmSync(path, { recursive: true, force: true });
       removed = !existsSync(path);
@@ -551,7 +631,7 @@ export const applyGcPlan = async (opts: ApplyGcPlanOptions): Promise<ApplyGcSumm
     // keep action='removed' because the disk-side work
     // succeeded.
     if (entry.kind === 'ready_to_remove') {
-      const result = await runRemove(entry.path, entry.branch, opts.parentCwd);
+      const result = await runRemove(entry.path, entry.branch, opts.parentCwd, opts.plan.cacheRoot);
       if (result.removed) {
         let dbError: string | undefined;
         try {
@@ -584,7 +664,7 @@ export const applyGcPlan = async (opts: ApplyGcPlanOptions): Promise<ApplyGcSumm
     // stale_cleaned: row says cleaned but dir is back.
     // Always retry (audit already authorized cleanup).
     if (entry.kind === 'stale_cleaned') {
-      const result = await runRemove(entry.path, entry.branch, opts.parentCwd);
+      const result = await runRemove(entry.path, entry.branch, opts.parentCwd, opts.plan.cacheRoot);
       if (result.removed) {
         outcomes.push({
           path: entry.path,
@@ -621,7 +701,7 @@ export const applyGcPlan = async (opts: ApplyGcPlanOptions): Promise<ApplyGcSumm
         skippedCount += 1;
         continue;
       }
-      const result = await runRemove(entry.path, entry.branch, opts.parentCwd);
+      const result = await runRemove(entry.path, entry.branch, opts.parentCwd, opts.plan.cacheRoot);
       if (result.removed) {
         let dbError: string | undefined;
         if (entry.sessionId !== null) {
