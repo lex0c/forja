@@ -337,6 +337,64 @@ describe('buildGcPlan — security: cross-repo isolation', () => {
     }
   });
 
+  test('regression: symlinked-checkout cwd matches canonical repo root', async () => {
+    // Operator running `cd /home/user/symlink-to-projA && agent`
+    // creates sessions with cwd = literal symlink path. Later
+    // `agent --worktrees gc` runs `git rev-parse --show-toplevel`
+    // which returns the CANONICAL path (`/home/user/projA`).
+    // Pre-fix the SQL query did string-equality on these two
+    // forms — symlink-equivalent rows were excluded from
+    // scope, mis-classified as `orphan` by downstream logic,
+    // and gc could neither remove nor reconcile them.
+    //
+    // After fix: the engine canonicalizes both repoRoot AND
+    // the parent's cwd via `realpathSync` and compares the
+    // resolved forms. Symlink-equivalent rows scope in.
+    const realRepo = mkdtempSync(join(tmpdir(), 'forja-gc-real-'));
+    const symlinkRepo = mkdtempSync(join(tmpdir(), 'forja-gc-symlinks-'));
+    const symlinkPath = join(symlinkRepo, 'link-to-real');
+    const { symlinkSync } = await import('node:fs');
+    try {
+      symlinkSync(realRepo, symlinkPath);
+      // Session created with the SYMLINK path as cwd. This is
+      // exactly what would happen if the operator cd'd into
+      // the symlink before invoking the agent.
+      const sessionId = seedSession(undefined, symlinkPath);
+      const wtPath = join(cacheRoot, sessionId);
+      mkdirSync(wtPath);
+      insertSubagentWorktree(db, {
+        sessionId,
+        path: wtPath,
+        branch: 'agent/symlinked-deadbeef',
+        status: 'preserved',
+      });
+
+      // gc resolves repoRoot to the CANONICAL realRepo path
+      // (mirrors git rev-parse --show-toplevel behavior).
+      const plan = await buildGcPlan({
+        db,
+        parentCwd: realRepo,
+        cacheRoot,
+        resolveRepoRoot: async () => realRepo,
+        runGitWorktreeList: async () => '',
+        worktreeStatus: async () => 'clean',
+      });
+      // Row scopes in via canonical equivalence; classification
+      // is ready_to_remove (preserved + clean), NOT orphan.
+      expect(plan.entries.length).toBe(1);
+      expect(plan.entries[0]?.kind).toBe('ready_to_remove');
+      expect(plan.entries[0]?.path).toBe(wtPath);
+    } finally {
+      for (const dir of [realRepo, symlinkRepo]) {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {
+          // ignore
+        }
+      }
+    }
+  });
+
   test('regression: SQLite LIKE wildcards in repoRoot are escaped (no cross-repo leak)', async () => {
     // SQLite LIKE treats `_` as match-single-char and `%` as
     // match-any-string. Without escaping, a parent cwd of

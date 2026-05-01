@@ -28,7 +28,7 @@ import { type Dirent, existsSync, lstatSync, readdirSync, realpathSync, rmSync }
 import { join, sep } from 'node:path';
 import {
   type DB,
-  listSubagentWorktreesByRepo,
+  listSubagentWorktreesWithParentCwd,
   markSubagentWorktreeCleaned,
 } from '../storage/index.ts';
 import { defaultWorktreeRoot } from './worktree.ts';
@@ -318,7 +318,32 @@ export const buildGcPlan = async (opts: BuildGcPlanOptions): Promise<WorktreeGcP
       `gc: '${opts.parentCwd}' is not inside a git repository; scoping audit query to literal cwd. Sessions whose parent cwd doesn't match exactly won't be visible.`,
     );
   }
-  const dbRows = listSubagentWorktreesByRepo(opts.db, repoRoot);
+  // Canonicalize the repo root once so the per-row check
+  // collapses symlink-equivalent paths (`/var` ↔ `/private/var`,
+  // `/home/user/symlink-to-projA` ↔ `/home/user/projA`).
+  const canonicalRepoRoot = canonicalize(repoRoot);
+
+  // Fetch ALL audit rows joined with their parent session's
+  // cwd, then filter at the JS layer via canonicalized
+  // comparison. SQL-only filtering would miss
+  // symlink-equivalent rows: `sessions.cwd` stores the literal
+  // path passed at session creation (often a symlink), while
+  // `git rev-parse --show-toplevel` returns the canonical
+  // path. A direct string match excludes legitimate rows;
+  // they're then mis-classified as `orphan` by downstream
+  // logic and audit drift accumulates.
+  //
+  // For typical operator scale (≤100 worktree rows over the
+  // DB's lifetime) the linear filter is negligible. If row
+  // count ever explodes, we can prefilter via prefix-match
+  // SQL + final canonical check — but premature optimization
+  // for an audit-table sweep that runs on operator demand.
+  const allRows = listSubagentWorktreesWithParentCwd(opts.db);
+  const dbRows = allRows.filter((row) => {
+    const canonicalParentCwd = canonicalize(row.parentCwd);
+    if (canonicalParentCwd === canonicalRepoRoot) return true;
+    return canonicalParentCwd.startsWith(`${canonicalRepoRoot}${sep}`);
+  });
   // Build the path-keyed maps using canonicalized keys so all
   // three sources (DB, git, cache) collapse to the same path
   // string when they refer to the same worktree. Without this,
