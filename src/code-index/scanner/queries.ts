@@ -41,7 +41,14 @@ export const TS_QUERY = `
 (program (class_declaration) @symbol.class)
 (program (export_statement (class_declaration) @symbol.class))
 
-(class_body (method_definition) @symbol.method)
+;; Methods must trace a direct path from program through a
+;; top-level class_declaration to satisfy module-level scope.
+;; Anchoring on class_body alone would also match classes
+;; nested inside function bodies / other local scopes — those
+;; class declarations are filtered out at the class capture, so
+;; their methods would surface as orphans.
+(program (class_declaration (class_body (method_definition) @symbol.method)))
+(program (export_statement (class_declaration (class_body (method_definition) @symbol.method))))
 
 (program (interface_declaration) @symbol.iface)
 (program (export_statement (interface_declaration) @symbol.iface))
@@ -52,8 +59,13 @@ export const TS_QUERY = `
 (program (enum_declaration) @symbol.enum)
 (program (export_statement (enum_declaration) @symbol.enum))
 
-(program (lexical_declaration) @symbol.const)
-(program (export_statement (lexical_declaration) @symbol.const))
+;; lexical_declaration covers both 'const' and 'let'; we only
+;; emit symbols for const (the extractor labels them
+;; kind='const'). Anchoring on the anonymous "const" keyword
+;; token filters out 'let' bindings — only const declarations
+;; carry that token in this position.
+(program (lexical_declaration "const") @symbol.const)
+(program (export_statement (lexical_declaration "const") @symbol.const))
 
 (import_statement) @import.stmt
 `;
@@ -76,10 +88,13 @@ export const JS_QUERY = `
 (program (class_declaration) @symbol.class)
 (program (export_statement (class_declaration) @symbol.class))
 
-(class_body (method_definition) @symbol.method)
+;; Methods anchored at module scope — see TS_QUERY for rationale.
+(program (class_declaration (class_body (method_definition) @symbol.method)))
+(program (export_statement (class_declaration (class_body (method_definition) @symbol.method))))
 
-(program (lexical_declaration) @symbol.const)
-(program (export_statement (lexical_declaration) @symbol.const))
+;; const-only — see TS_QUERY for rationale.
+(program (lexical_declaration "const") @symbol.const)
+(program (export_statement (lexical_declaration "const") @symbol.const))
 
 (import_statement) @import.stmt
 `;

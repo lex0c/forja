@@ -122,6 +122,23 @@ describe('extractFromSource — TypeScript', () => {
     expect(consts.find((c) => c.name === 'LOCAL')?.visibility).toBe('internal');
   });
 
+  test('top-level `let` declarations are excluded (const-only)', () => {
+    // `lexical_declaration` covers both `const` and `let`; the
+    // query filters via the anonymous "const" keyword token.
+    // Module-level `let` bindings would be misclassified as
+    // kind='const' if we captured every lexical_declaration, so
+    // we drop them. `var` uses `variable_declaration` (a
+    // different node type) and is already not captured.
+    const src = `
+      export const STABLE = 1;
+      export let mutable = 2;
+      let alsoMutable = 3;
+    `;
+    const { symbols } = extractFromSource(src, 'typescript', 'src/c.ts', parseSource);
+    const consts = symbols.filter((s) => s.kind === 'const');
+    expect(consts.map((c) => c.name)).toEqual(['STABLE']);
+  });
+
   test('multi-binding const expands to one symbol per binding', () => {
     const src = 'export const a = 1, b = 2;';
     const { symbols } = extractFromSource(src, 'typescript', 'src/c.ts', parseSource);
@@ -169,11 +186,16 @@ describe('extractFromSource — TypeScript', () => {
 
   test('nested class declarations are not indexed (module-scope only)', () => {
     // Same scope rule as functions — nested class declarations
-    // inside a method body don't make it.
+    // inside a method body don't make it. Critical: their
+    // methods must also be excluded, otherwise we'd emit
+    // orphan method symbols whose enclosing class isn't in
+    // the index.
     const src = `
       export class Outer {
         run() {
-          class Local {}
+          class Local {
+            innerMethod() {}
+          }
           return Local;
         }
       }
@@ -181,6 +203,29 @@ describe('extractFromSource — TypeScript', () => {
     const { symbols } = extractFromSource(src, 'typescript', 'src/c.ts', parseSource);
     const classes = symbols.filter((s) => s.kind === 'class');
     expect(classes.map((c) => c.name)).toEqual(['Outer']);
+    const methods = symbols.filter((s) => s.kind === 'method');
+    // Only `run` (Outer's method) is indexed; `innerMethod`
+    // on the nested Local class is dropped along with Local.
+    expect(methods.map((m) => m.name)).toEqual(['run']);
+  });
+
+  test('methods of function-local classes are not indexed', () => {
+    // Pure function-scoped class — no enclosing top-level class
+    // at all. Currently neither the class nor its methods may
+    // appear in the index.
+    const src = `
+      export function build() {
+        class Local {
+          step() {}
+          static helper() {}
+        }
+        return new Local();
+      }
+    `;
+    const { symbols } = extractFromSource(src, 'typescript', 'src/c.ts', parseSource);
+    expect(symbols.filter((s) => s.kind === 'class').length).toBe(0);
+    expect(symbols.filter((s) => s.kind === 'method').length).toBe(0);
+    expect(symbols.filter((s) => s.kind === 'function').map((f) => f.name)).toEqual(['build']);
   });
 
   test('static method visibility resolves via accessibility modifier', () => {
