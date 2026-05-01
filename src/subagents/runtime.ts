@@ -1,4 +1,4 @@
-import { rmSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import type { HarnessResult } from '../harness/index.ts';
 import type { PermissionEngine } from '../permissions/index.ts';
@@ -419,6 +419,53 @@ const WALL_CLOCK_GRACE_MS = 5_000;
 // doesn't dominate cleanup latency.
 const BG_REAP_GRACE_MS = 500;
 
+// Verify that PID is still the process we recorded at spawn time
+// before sending SIGKILL. PIDs can be recycled by the kernel
+// between our SIGTERM (which the original process may have
+// exited cleanly from) and our SIGKILL (500ms later). On a busy
+// host, the kernel may have handed the same PID to an unrelated
+// process — sending SIGKILL there would kill an innocent
+// workload and the operator would have no way to correlate.
+//
+// On Linux, `/proc/<pid>/cmdline` is the argv of the running
+// process (NUL-separated). We compare the basename of argv[0]
+// against the first whitespace-token of the row's `command`
+// field. Match → safe to SIGKILL; mismatch → PID was recycled,
+// skip. Read errors (ENOENT for a vanished pid, EACCES for a
+// process owned by another user we can't introspect) ALSO skip
+// — defaulting to safety.
+//
+// Linux-only: Forja's environment (per CLAUDE.md / project
+// invariants) targets Linux. macOS doesn't expose /proc the
+// same way; if we ever support it, this check would need a
+// platform branch (likely `ps -p <pid> -o command=`).
+const isStillSameProcess = (pid: number, expectedCommand: string): boolean => {
+  let cmdlineRaw: string;
+  try {
+    cmdlineRaw = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+  } catch {
+    // ENOENT → process gone. EACCES → not ours. Either way,
+    // we have no business sending it SIGKILL.
+    return false;
+  }
+  if (cmdlineRaw.length === 0) {
+    // Kernel thread or zombie with no cmdline. Bg processes
+    // we spawn always have argv; an empty result means the
+    // PID is no longer one of ours.
+    return false;
+  }
+  // /proc cmdline is NUL-separated. argv[0] is the executable
+  // (possibly with a path prefix). Use basename for the
+  // comparison so a recorded `npm run dev` matches an actual
+  // `/usr/local/bin/npm run dev` invocation.
+  const argv0 = cmdlineRaw.split('\0')[0] ?? '';
+  const recordedFirstToken = expectedCommand.trim().split(/\s+/)[0] ?? '';
+  if (argv0.length === 0 || recordedFirstToken.length === 0) return false;
+  const actualBasename = argv0.split('/').pop() ?? argv0;
+  const recordedBasename = recordedFirstToken.split('/').pop() ?? recordedFirstToken;
+  return actualBasename === recordedBasename;
+};
+
 // Reap any bg processes the child spawned but failed to clean
 // up. Runs in `runSubagent` after the child has exited and
 // before the bg log dir is removed. The child's harness owns
@@ -460,11 +507,19 @@ const reapChildBgProcesses = async (db: DB, sessionId: string): Promise<void> =>
   // is reliably async, and waiting per-PID would extend cleanup
   // proportional to the count.
   await new Promise<void>((r) => setTimeout(r, BG_REAP_GRACE_MS));
-  // SIGKILL anything still alive. We don't re-query; we just try
-  // again, and dead-PID errors are swallowed exactly like the
-  // SIGTERM pass.
+  // SIGKILL anything still alive — but FIRST verify the PID is
+  // still the process we recorded. The kernel can recycle PIDs
+  // within milliseconds on busy hosts; if our SIGTERM target
+  // exited cleanly during the grace window AND a fresh process
+  // got the same PID, an unconditional SIGKILL would target the
+  // unrelated process. `isStillSameProcess` reads
+  // /proc/<pid>/cmdline and compares argv[0]'s basename to the
+  // recorded command's first token; mismatch means PID was
+  // recycled, skip. Vanished pids ALSO skip (the SIGTERM was
+  // already sufficient).
   for (const proc of running) {
     if (proc.osPid === null) continue;
+    if (!isStillSameProcess(proc.osPid, proc.command)) continue;
     try {
       process.kill(proc.osPid, 'SIGKILL');
     } catch {
