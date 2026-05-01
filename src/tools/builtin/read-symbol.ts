@@ -140,15 +140,30 @@ export const readSymbolTool: Tool<ReadSymbolInput, ReadSymbolOutput> = {
     // ambiguous branch fires even with `file:` set. Pick the
     // candidate with the largest line span (the implementation
     // body; signatures are 1-line declarations) when all
-    // candidates share name + file + kind.
+    // candidates form a single overload group.
+    //
+    // Critical: we match on FQN, not just (file, kind, name).
+    // Two methods with the same name in DIFFERENT classes in
+    // the SAME file (e.g., `class A { start() {} }` and
+    // `class B { start() {} }`) share file+kind+name but their
+    // FQNs differ — `<file>:A.start` vs `<file>:B.start`. A
+    // file+kind+name match would silently collapse them and
+    // return one body, hiding the ambiguity. FQN identity
+    // catches only true overloads (function `<file>:foo` × N,
+    // or — once parent_symbol_id lands — methods of the same
+    // class).
     if (matches.length > 1) {
-      const sameFileKind = matches.every(
-        (m) =>
-          m.filePath === matches[0]?.filePath &&
-          m.kind === matches[0]?.kind &&
-          m.name === matches[0]?.name,
-      );
-      if (sameFileKind) {
+      const firstFqn = matches[0]?.fqn ?? null;
+      const sameOverloadGroup =
+        firstFqn !== null &&
+        matches.every(
+          (m) =>
+            m.filePath === matches[0]?.filePath &&
+            m.kind === matches[0]?.kind &&
+            m.name === matches[0]?.name &&
+            m.fqn === firstFqn,
+        );
+      if (sameOverloadGroup) {
         matches = [
           matches.reduce((largest, m) =>
             m.endLine - m.startLine > largest.endLine - largest.startLine ? m : largest,

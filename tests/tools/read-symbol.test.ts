@@ -112,6 +112,44 @@ describe('read_symbol tool', () => {
     expect(r.source).toContain('return 1');
   });
 
+  test('same-name methods in different classes within one file remain ambiguous', async () => {
+    // Two classes in the same file, each with a `start` method:
+    // file+kind+name match but FQNs differ (`A.start` vs
+    // `B.start`). The dedup heuristic must NOT collapse them —
+    // doing so would silently return one body and hide the
+    // ambiguity from the caller. The tool surfaces
+    // symbol.ambiguous and the model picks via the parent
+    // class (slice 4.3.3 will populate parent_symbol_id and a
+    // future tool surface can take a `class:` arg; for now,
+    // the model uses the candidates list to read both via
+    // separate calls).
+    writeFile(
+      root,
+      'src/two-classes.ts',
+      `
+export class A {
+  start() { return 'A'; }
+}
+export class B {
+  start() { return 'B'; }
+}
+`.trim(),
+    );
+    await idx.scan({ respectGitignore: false });
+    const r = await readSymbolTool.execute(
+      { symbol: 'start', file: 'src/two-classes.ts' },
+      makeCtx({ codeIndex: idx, cwd: root }),
+    );
+    expect(isToolError(r)).toBe(true);
+    if (!isToolError(r)) return;
+    expect(r.error_code).toBe('symbol.ambiguous');
+    const cands = r.details?.candidates as Array<{ file: string; line: number }>;
+    expect(cands.length).toBe(2);
+    // Both candidates point at src/two-classes.ts, distinct lines.
+    expect(cands.every((c) => c.file === 'src/two-classes.ts')).toBe(true);
+    expect(cands[0]?.line).not.toBe(cands[1]?.line);
+  });
+
   test('TS function overloads dedupe to the implementation (largest line span)', async () => {
     // Multiple `function_declaration` nodes for the same name +
     // file (overload signatures + implementation). Without
