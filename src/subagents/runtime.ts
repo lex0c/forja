@@ -420,32 +420,39 @@ const WALL_CLOCK_GRACE_MS = 5_000;
 const BG_REAP_GRACE_MS = 500;
 
 // Verify that PID is still the process we recorded at spawn time
-// before sending SIGKILL. PIDs can be recycled by the kernel
-// between our SIGTERM (which the original process may have
-// exited cleanly from) and our SIGKILL (500ms later). On a busy
-// host, the kernel may have handed the same PID to an unrelated
-// process — sending SIGKILL there would kill an innocent
-// workload and the operator would have no way to correlate.
+// before sending a signal. PIDs can be recycled by the kernel
+// between when the bg row was inserted (during the run) and
+// when the reaper queries the DB (after the child exits) — on
+// a busy host that window is wide enough for the original
+// process to exit and its PID be handed to an unrelated workload.
+// Without verification, the reaper would friendly-fire the
+// recycled process.
 //
-// On Linux, `/proc/<pid>/cmdline` is the argv of the running
-// process (NUL-separated). We compare the basename of argv[0]
-// against the first whitespace-token of the row's `command`
-// field. Match → safe to SIGKILL; mismatch → PID was recycled,
-// skip. Read errors (ENOENT for a vanished pid, EACCES for a
-// process owned by another user we can't introspect) ALSO skip
-// — defaulting to safety.
+// Two real-world shapes for the live argv:
 //
-// Linux-only: Forja's environment (per CLAUDE.md / project
-// invariants) targets Linux. macOS doesn't expose /proc the
-// same way; if we ever support it, this check would need a
-// platform branch (likely `ps -p <pid> -o command=`).
+//   1. Bash-wrapper (production path). The bg manager spawns
+//      via `bash -c "<user command>"` so argv[0]='bash',
+//      argv[1]='-c', argv[2]=the recorded command verbatim.
+//      We compare argv[2] to the trimmed expectedCommand —
+//      exact match because both sides come from the same
+//      input string the bg manager passed through.
+//
+//   2. Direct spawn (tests, programmatic callers that bypass
+//      the bg manager). argv[0] is the executable's path; we
+//      basename-match it against the recorded command's first
+//      whitespace token. Tolerates `/usr/bin/sleep` ↔ `sleep`.
+//
+// Linux-only: reads `/proc/<pid>/cmdline`. macOS doesn't
+// expose /proc the same way; if we ever support it, this
+// check needs a platform branch (likely `ps -p <pid> -o command=`).
+//
+// Read errors (ENOENT for a vanished pid, EACCES for a process
+// owned by another user) skip the kill — defaulting to safety.
 const isStillSameProcess = (pid: number, expectedCommand: string): boolean => {
   let cmdlineRaw: string;
   try {
     cmdlineRaw = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
   } catch {
-    // ENOENT → process gone. EACCES → not ours. Either way,
-    // we have no business sending it SIGKILL.
     return false;
   }
   if (cmdlineRaw.length === 0) {
@@ -454,16 +461,35 @@ const isStillSameProcess = (pid: number, expectedCommand: string): boolean => {
     // PID is no longer one of ours.
     return false;
   }
-  // /proc cmdline is NUL-separated. argv[0] is the executable
-  // (possibly with a path prefix). Use basename for the
-  // comparison so a recorded `npm run dev` matches an actual
-  // `/usr/local/bin/npm run dev` invocation.
-  const argv0 = cmdlineRaw.split('\0')[0] ?? '';
-  const recordedFirstToken = expectedCommand.trim().split(/\s+/)[0] ?? '';
-  if (argv0.length === 0 || recordedFirstToken.length === 0) return false;
-  const actualBasename = argv0.split('/').pop() ?? argv0;
+  // /proc cmdline is NUL-separated. Trailing NUL produces an
+  // empty final element; filter it out.
+  const argv = cmdlineRaw.split('\0').filter((s) => s.length > 0);
+  if (argv.length === 0) return false;
+  const expectedTrimmed = expectedCommand.trim();
+  if (expectedTrimmed.length === 0) return false;
+  const argv0Basename = (argv[0] ?? '').split('/').pop() ?? '';
+
+  // Bash-wrapper case (production): bg manager runs every
+  // command as `bash -c <command>`. argv[2] holds the user
+  // command verbatim — same string the row's `command` field
+  // stores. Exact match (after trim) is the strongest signal.
+  if (
+    (argv0Basename === 'bash' || argv0Basename === 'sh') &&
+    argv[1] === '-c' &&
+    argv.length >= 3
+  ) {
+    return argv[2] === expectedTrimmed;
+  }
+
+  // Direct-spawn case: argv[0] is the executable. Compare
+  // basenames so `/usr/bin/sleep 60` (recorded) matches
+  // argv[0]=`sleep` (live). Used by tests that bypass the bg
+  // manager and by future programmatic callers that spawn
+  // directly without the shell wrapper.
+  const recordedFirstToken = expectedTrimmed.split(/\s+/)[0] ?? '';
+  if (argv0Basename.length === 0 || recordedFirstToken.length === 0) return false;
   const recordedBasename = recordedFirstToken.split('/').pop() ?? recordedFirstToken;
-  return actualBasename === recordedBasename;
+  return argv0Basename === recordedBasename;
 };
 
 // Reap any bg processes the child spawned but failed to clean

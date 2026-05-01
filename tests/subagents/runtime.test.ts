@@ -1156,6 +1156,91 @@ describe('runSubagent — orchestration', () => {
     }
   });
 
+  test('4.2b.iv: reaper kills bash-wrapper bg processes (production spawn path)', async () => {
+    // The bg manager always spawns user commands via
+    // `bash -c <command>`, so the live argv[0] is `bash`, NOT
+    // the tool name (`npm`, `sleep`, etc.) the row's `command`
+    // field records. The first iteration of isStillSameProcess
+    // compared argv[0]'s basename against the recorded first
+    // token — which would be `bash` vs `sleep`, mismatch on
+    // EVERY production bg process. The reaper would skip every
+    // signal and the cleanup would silently leak every bg
+    // process the child spawned. This test pins the production
+    // shape: spawn matches what the bg manager does, recorded
+    // command is the user command, identity check must accept,
+    // both signals must fire, process must end up dead.
+    const parentCwd = mkdtempSync(join(tmpdir(), 'forja-rt-bg-bashwrap-'));
+    let bashProc: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+        model: 'mock/m',
+        cwd: parentCwd,
+      });
+      const bgRepo = await import('../../src/storage/repos/bg-processes.ts');
+      const bashWrapperSpawn: SpawnChildProcess = (opts) => {
+        // Mirror the bg manager: bash -c "<command>".
+        bashProc = Bun.spawn({
+          cmd: ['bash', '-c', 'sleep 60'],
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        bgRepo.insertBgProcess(db, {
+          sessionId: opts.sessionId,
+          osPid: bashProc.pid,
+          // Recorded command matches exactly what the bg manager
+          // would have stored — the user-facing command, not
+          // the wrapper.
+          command: 'sleep 60',
+          cwd: opts.cwd,
+          stdoutLogPath: '/tmp/fake-stdout.log',
+          stderrLogPath: '/tmp/fake-stderr.log',
+        });
+        insertSubagentOutput(db, { sessionId: opts.sessionId });
+        return {
+          exited: Promise.resolve({ exitCode: 137 }),
+          kill: () => undefined,
+        };
+      };
+      const result = await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: parentCwd,
+        spawnChildProcess: bashWrapperSpawn,
+      });
+
+      // Process must be dead. Identity check must have matched
+      // via argv[2] === 'sleep 60' against the live bash -c
+      // process's argv[2], NOT been deferred by the basename
+      // mismatch on argv[0]=bash.
+      expect(bashProc).toBeDefined();
+      if (bashProc !== undefined) {
+        let alive = true;
+        try {
+          process.kill(bashProc.pid, 0);
+        } catch {
+          alive = false;
+        }
+        expect(alive).toBe(false);
+      }
+      const childRows = bgRepo.listBgProcessesBySession(db, result.sessionId);
+      expect(childRows[0]?.status).toBe('killed');
+    } finally {
+      if (bashProc !== undefined) {
+        try {
+          bashProc.kill('SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
+      rmSync(parentCwd, { recursive: true, force: true });
+    }
+  });
+
   test('4.2b.iv: isStillSameProcess matches by basename (path-prefix tolerance)', async () => {
     // Internal-helper coverage: the cmdline check should
     // tolerate the common case where the recorded command was
