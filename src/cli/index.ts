@@ -68,10 +68,26 @@ const main = async (): Promise<number> => {
     args.listSessions ||
     args.undo !== undefined ||
     args.checkpoints !== undefined ||
-    args.worktrees !== undefined;
+    args.worktrees !== undefined ||
+    args.codeIndex !== undefined;
   if (args.prompt.length === 0 && !promptOptional) {
     process.stderr.write(`forja: missing prompt\n\n${usage()}\n`);
     return 1;
+  }
+
+  // `--code-index` short-circuits the run path. Independent of
+  // bootstrap (no provider, no harness), only DB + tree-sitter
+  // + FS. Mirrors the worktrees handler.
+  if (args.codeIndex !== undefined) {
+    const { runCodeIndexCli } = await import('./code-index.ts');
+    return runCodeIndexCli({
+      verb: args.codeIndex.verb as 'scan' | 'status' | 'rebuild',
+      positionals: args.codeIndex.positionals,
+      json: args.json === true,
+      cwd: process.cwd(),
+      out: (s) => process.stdout.write(s),
+      err: (s) => process.stderr.write(s),
+    });
   }
 
   // Lazy import: pulling `./run.ts` transitively loads provider SDKs,

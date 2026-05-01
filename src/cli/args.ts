@@ -48,6 +48,11 @@ export interface ParsedArgs {
   // 'gc'. `gc` accepts `--dry-run` and `--force` as
   // positionals (sub-flags); the handler interprets them.
   worktrees?: { verb: string; positionals: string[] };
+  // `--code-index <verb> [positionals]` — operator surface for
+  // the code-index subsystem (Step 4.3.1.c). Verbs: 'scan',
+  // 'status', 'rebuild'. `rebuild` accepts `--clean` to drop
+  // the on-disk DB before scanning.
+  codeIndex?: { verb: string; positionals: string[] };
   model?: string;
   maxSteps?: number;
   // Cap on rows returned by --list-sessions. Defaults to 20 in
@@ -232,6 +237,44 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
           j += 1;
         }
         args.worktrees = { verb, positionals };
+        i = j;
+        break;
+      }
+      case '--code-index': {
+        const verb = argv[i + 1];
+        const known = ['scan', 'status', 'rebuild'] as const;
+        if (verb === undefined || verb.startsWith('-')) {
+          return {
+            ok: false,
+            message: `--code-index requires a subcommand (${known.join('|')})`,
+          };
+        }
+        if (!known.includes(verb as (typeof known)[number])) {
+          return {
+            ok: false,
+            message: `unknown --code-index subcommand: ${verb}. Use one of ${known.join('|')}`,
+          };
+        }
+        // Verb-aware allowlist: only the verb's known sub-flags
+        // are kept inside positional collection. Mirrors the
+        // pattern from --worktrees so unrelated top-level flags
+        // (--json, --model, etc.) don't get silently swallowed.
+        const verbSubFlags: Readonly<Record<string, ReadonlySet<string>>> = {
+          scan: new Set(),
+          status: new Set(),
+          rebuild: new Set(['--clean']),
+        };
+        const allowed = verbSubFlags[verb] ?? new Set<string>();
+        const positionals: string[] = [];
+        let j = i + 2;
+        while (j < argv.length) {
+          const next = argv[j];
+          if (next === undefined) break;
+          if (next.startsWith('-') && !allowed.has(next)) break;
+          positionals.push(next);
+          j += 1;
+        }
+        args.codeIndex = { verb, positionals };
         i = j;
         break;
       }
@@ -472,6 +515,7 @@ export const usage = (): string =>
     '  --resume <id|last>     Continue a prior session; positional prompt is the follow-up',
     '  --undo <session>       Restore the latest checkpoint of a session',
     '  --worktrees <verb>     Inspect / gc subagent worktrees (verb: list, gc)',
+    '  --code-index <verb>    Manage the code index (verb: scan, status, rebuild [--clean])',
     '  --checkpoints <cmd>    Checkpoint subcommands: list <session> | diff <session> <ckpt>',
     '                          | restore <session> <ckpt> | purge <session>',
     '  --yes, -y              Skip the bash-side-effect confirm on undo/restore',

@@ -15,6 +15,85 @@ Format:
 
 ---
 
+## [2026-05-01] M3 / Step 4.3.1.c — code-index CLI surface
+
+End-to-end completion of the 4.3.1 sub-arc: 4.3.1.a delivered
+parser+extract on a string, 4.3.1.b wired walker→pipeline→DB,
+this slice exposes all of it through `agent --code-index <verb>`
+so operators (and CI) can index, inspect, and rebuild without
+launching the harness or holding an API key.
+
+The slice's smoke test against the Forja repo itself surfaced
+a pre-existing bug in the parser — tree-sitter's native binding
+silently bails on `parse(string)` inputs larger than ~32 KiB —
+that had been masking partial indexing of every >32 KiB source
+file. Fixed in a separate commit (chunked parse + surrogate-
+safe boundaries) so the bug history isn't tangled with the
+CLI feature.
+
+**Decisions:**
+
+- **D1 — `--code-index <verb>`, not a separate `agent code-index`
+  subcommand.** Matches the existing `--worktrees` / `--checkpoints`
+  pattern. Keeping a single binary entry point preserves the
+  args.ts/usage()/index.ts shape; promoting to a real subcommand
+  would force the run path to learn about it too.
+- **D2 — Project root resolution: `git rev-parse --show-toplevel`
+  with `realpathSync(cwd)` fallback.** Covers the dominant case
+  (operator runs from anywhere inside a git repo, scan still
+  hashes to the same DB). Non-git project roots get
+  `realpathSync(cwd)` so the absolute-path contract of
+  `defaultCodeIndexPath` holds.
+- **D3 — `rebuild --clean` only; `--since <commit>` deferred.**
+  `--since` needs a git-diff-aware walker pass and a
+  resolution-update path, both non-trivial. `--clean` covers the
+  practical "nuke and start over" use case operators reach for
+  when the index looks corrupt.
+- **D4 — Output: human table by default, NDJSON via `--json`.**
+  Status renders one object per status / one summary line per
+  scan; per-file errors emit as separate NDJSON lines so
+  streaming consumers can correlate. Non-zero exit on any read/
+  parse failure so CI scripts get the signal; partials are
+  warnings, not failures.
+- **D5 — Smoke test indexes the Forja repo itself.** Catches
+  regressions that micro-fixtures miss: real-world TS files,
+  org-typical file count, end-to-end pipeline correctness.
+  Spot-checks known top-level symbols (`CodeIndex`,
+  `walkProject`, …) so structural breaks (export detection,
+  query scope, walker filters) surface early. Found the
+  >32 KiB parser bug on first run.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/cli/code-index.ts` | NEW — `runCodeIndexCli({ verb, json, cwd, dbOverride?, env? })`. Resolves project root, opens CodeIndex, dispatches scan/status/rebuild. NDJSON + table output split. ENOENT on `rebuild --clean` is treated as success (idempotent). |
+| `src/cli/args.ts` | NEW flag `--code-index <verb> [positionals]`. Verb-aware allowlist (`--clean` only valid with `rebuild`). Usage line added. |
+| `src/cli/index.ts` | Dispatch `args.codeIndex` before the run path; added to `promptOptional` so `agent --code-index ...` doesn't require a prompt. |
+| `tests/cli/code-index.test.ts` | NEW — 7 tests: scan summary table, NDJSON summary, status fresh DB, status post-scan JSON, rebuild idempotent, ENOENT files don't trigger exit 1, unknown-verb defensive guard. |
+| `tests/code-index/smoke-forja.test.ts` | NEW — indexes the Forja repo, asserts zero hard errors, >50 files / >100 symbols, spot-checks known symbols + their visibility/kind. Skips when not in a git checkout. |
+
+**Pending:**
+
+- `--since <commit>` for incremental rebuild scoped to git diff
+  (slice 4.3.6 will likely subsume this with the FS watcher).
+- Progress callback / streaming events during scan for very large
+  repos; currently ScanResult is the only signal and arrives at
+  the end.
+- Reference resolution (slice 4.3.3) — `references_` table still
+  empty after a scan.
+
+**Verification:** `bun test` 1563 pass / 10 skip / 0 fail (+9 new
+across CLI + smoke); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** M3 / Step 4.3.2 — symbolic tools (`read_symbol`,
+`find_references`, `outline_file`, `imports_of`, `dependents_of`)
+exposed to the model. With 4.3.1 complete, the index is real and
+queryable; surfacing it as tools is the step that makes the
+agent loop benefit from it.
+
+---
+
 ## [2026-05-01] M3 / Step 4.3.1.b — FS walker + scanner pipeline + DB writes
 
 The 4.3.1.a slice landed `extractFromSource(source, language, path)`
