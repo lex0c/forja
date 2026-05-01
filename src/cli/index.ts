@@ -51,6 +51,10 @@ const main = async (): Promise<number> => {
       // programmatic caller that invokes runSubagent with
       // planMode:true.
       ...(args.subagentPlanMode === true ? { planMode: true } : {}),
+      // Per-subagent bg log directory. Threaded across by the
+      // parent so background-process tools work for the child
+      // without colliding with the parent's bg state.
+      ...(args.subagentBgLogDir !== undefined ? { bgLogDir: args.subagentBgLogDir } : {}),
     });
   }
 

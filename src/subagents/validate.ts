@@ -22,7 +22,7 @@ import type { SubagentDefinition } from './types.ts';
 // without polluting the parent's tree. The validator still rejects
 // unregistered tool names regardless of isolation.
 //
-// Three checks per tool:
+// Two checks per tool:
 //   1. The tool must be registered with the active registry. The
 //      runtime would catch this at child-registry construction
 //      time too, but pulling it forward gives the author a clean
@@ -31,15 +31,15 @@ import type { SubagentDefinition } from './types.ts';
 //      the definition opts into worktree isolation. Without
 //      worktree, mutating tools have no reverse path; with it,
 //      the worktree contains them.
-//   3. The tool's metadata must NOT declare `requiresBgManager`.
-//      The Step 4.2a runtime never wires `ctx.bgManager` into the
-//      child harness (worktree subagents would share the parent's
-//      bg log dir, which is unsafe — co-mingled stdout/stderr
-//      streams, no isolation in `bg list`). Without the gate the
-//      tool would surface the bgmanager-missing error on first
-//      invocation; pulling it forward catches the misconfiguration
-//      at bootstrap. Step 4.2b will lift this once each worktree
-//      gets its own bg log dir.
+//
+// Step 4.2b.iv lifted the third check (`requiresBgManager`):
+// every subagent now gets its own bg log directory namespaced
+// under `<parentCwd>/.agent/bg/<childSessionId>/`, so
+// `bash_background` / `bash_output` / `bash_kill` /
+// process-aware `wait_for` and `monitor` are safe to expose. The
+// child's harness wires the directory in via `--subagent-bg-log-dir`
+// and the bg manager creates it on first spawn; cleanup is a
+// recursive rm at end-of-run.
 //
 // Throws on the first violation with a source-aware message that
 // names the offending definition path. Bootstrap calls this for
@@ -62,11 +62,6 @@ export const validateSubagentTools = (
     if (tool.metadata.writes === true && !allowWrites) {
       throw new Error(
         `subagent '${definition.name}' (${definition.sourcePath}): tool '${toolName}' declares metadata.writes=true and cannot appear in subagent.tools[] without 'isolation: worktree' — write tools require worktree isolation so the parent's tree stays untouched. Add 'isolation: worktree' to the frontmatter or remove the tool.`,
-      );
-    }
-    if (tool.metadata.requiresBgManager === true) {
-      throw new Error(
-        `subagent '${definition.name}' (${definition.sourcePath}): tool '${toolName}' declares metadata.requiresBgManager=true and cannot appear in subagent.tools[] in Step 4.2a — the subagent runtime does not wire ctx.bgManager. Step 4.2b will lift this once worktree subagents get their own bg log dir. Remove the tool from the whitelist for now.`,
       );
     }
   }

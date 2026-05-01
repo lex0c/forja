@@ -91,6 +91,16 @@ export interface ParsedArgs {
   // gate also refuses writes under planMode, so a write tool
   // in the whitelist is doubly blocked.
   subagentPlanMode?: boolean;
+  // Internal: per-subagent bg log directory. The parent's
+  // runSubagent computes
+  // `<parentCwd>/.agent/bg/<childSessionId>/` and forwards via
+  // `--subagent-bg-log-dir <path>`. The child wires this into
+  // its harness's bg manager so background-process tools
+  // (`bash_background` / `bash_output` / `bash_kill` /
+  // process-aware `wait_for` and `monitor`) work without
+  // colliding with the parent's bg state. Undefined when the
+  // flag is absent (older parents, tests).
+  subagentBgLogDir?: string;
 }
 
 export interface ParseError {
@@ -332,6 +342,27 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
           };
         }
         args.subagentTemperature = parsed;
+        i += 2;
+        break;
+      }
+      case '--subagent-bg-log-dir': {
+        const value = argv[i + 1];
+        // Reject flag-shaped values (`--subagent-bg-log-dir
+        // --subagent-depth 2`) — without the `--` check, the
+        // path consumer would silently swallow the next flag
+        // and start the child with the WRONG runtime state.
+        // Mirrors the guard on `--subagent-session-id`. Numeric
+        // flags (`--subagent-depth`, `--subagent-temperature`)
+        // get implicit protection via their stricter regex /
+        // Number() parse; the path flag accepts any string and
+        // needs the explicit guard.
+        if (value === undefined || value.length === 0 || value.startsWith('--')) {
+          return {
+            ok: false,
+            message: '--subagent-bg-log-dir requires a directory path (internal flag)',
+          };
+        }
+        args.subagentBgLogDir = value;
         i += 2;
         break;
       }

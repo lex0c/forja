@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   readdirSync,
   rmSync,
   symlinkSync,
@@ -697,31 +698,37 @@ describe('runSubagent — orchestration', () => {
     ).rejects.toThrow(/declares metadata\.writes=true/);
   });
 
-  test('requiresBgManager tool refused regardless of isolation', async () => {
+  test('4.2b.iv: requiresBgManager tool no longer rejected by registry gate', async () => {
     const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
       model: 'mock/m',
       cwd: '/p',
     });
-    // Worktree lifts the writes:true gate but NOT the bgmanager
-    // gate — the runtime still doesn't wire bgManager into the
-    // child harness, so a whitelisted bash_background would fail
-    // at runtime. Pulled forward to spawn-time as a refusal.
-    await expect(
-      runSubagent({
-        definition: definition({
-          tools: ['bash_background'],
-          isolation: 'worktree',
-        }),
-        prompt: 'go',
-        parentSessionId: parent.id,
-        provider: stubProvider(),
-        parentToolRegistry: buildParentRegistry(echoTool, bgTool),
-        permissionEngine: buildEngine(),
-        db,
-        cwd: '/p',
-        spawnChildProcess: fakeSpawnDone(),
+    // Pre-4.2b.iv this combination threw at spawn time because
+    // the child harness had no bgManager. The slice threads a
+    // per-session bg log directory across the subprocess
+    // boundary (`--subagent-bg-log-dir`), so background-process
+    // tools are now safe to expose. We assert specifically that
+    // the OLD `requiresBgManager` error message is no longer
+    // produced; the runtime still fails on worktree creation
+    // (cwd '/p' isn't a git repo), but with `worktree_create_failed`,
+    // not with the registry refusal — which is the property
+    // this slice changed.
+    const result = await runSubagent({
+      definition: definition({
+        tools: ['bash_background'],
+        isolation: 'worktree',
       }),
-    ).rejects.toThrow(/declares metadata\.requiresBgManager=true/);
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool, bgTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: fakeSpawnDone(),
+    });
+    expect(result.reason).not.toBe('subprocess_spawn_failed');
+    expect(result.worktreeError?.message ?? '').not.toMatch(/requiresBgManager/);
   });
 
   test('refuses non-builtin tool when spawning real subprocess (parent/child registry alignment)', async () => {
@@ -841,6 +848,739 @@ describe('runSubagent — orchestration', () => {
       spawnChildProcess: recordingSpawn,
     });
     expect(captured.depth).toBe(2);
+  });
+
+  test('4.2b.iv: parent threads per-session bgLogDir into spawn opts', async () => {
+    // Every subagent gets its own bg log directory so concurrent
+    // children don't collide and the operator's `bg list` view
+    // from the project root continues to show only the parent's
+    // processes. Path shape:
+    // `<parentCwd>/.agent/bg/subagents/<childSessionId>/`. The
+    // `subagents/` infix segregates the namespace from the
+    // parent's flat-file bg layout. The parent's runSubagent
+    // computes it deterministically; the spawn fake captures it
+    // for assertion.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const captured: { bgLogDir?: string; sessionId?: string } = {};
+    const recordingSpawn: SpawnChildProcess = (opts) => {
+      if (opts.bgLogDir !== undefined) captured.bgLogDir = opts.bgLogDir;
+      captured.sessionId = opts.sessionId;
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      setSubagentPayload(db, opts.sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'ok',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      });
+      return { exited: Promise.resolve({ exitCode: 0 }), kill: () => undefined };
+    };
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: recordingSpawn,
+    });
+    expect(captured.bgLogDir).toBe(`/p/.agent/bg/subagents/${captured.sessionId}`);
+  });
+
+  test('4.2b.iv: cleanupWorktree end-of-run removes the bgLogDir if it exists', async () => {
+    // Bg manager creates the directory lazily on first spawn.
+    // We simulate that here: the spawn fake mkdirs the dir +
+    // writes a fake log file. After runSubagent finishes, the
+    // runtime's end-of-run rmSync must delete the directory and
+    // its contents. Without this cleanup, the parent's
+    // `.agent/bg/` would accumulate per-session subdirectories
+    // on every subagent run.
+    const parentCwd = mkdtempSync(join(tmpdir(), 'forja-rt-bg-'));
+    try {
+      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+        model: 'mock/m',
+        cwd: parentCwd,
+      });
+      let observedDir: string | undefined;
+      const dirPlantingSpawn: SpawnChildProcess = (opts) => {
+        observedDir = opts.bgLogDir;
+        if (opts.bgLogDir !== undefined) {
+          mkdirSync(opts.bgLogDir, { recursive: true });
+          writeFileSync(join(opts.bgLogDir, 'fake-bg-output.log'), 'simulated bg output\n');
+        }
+        insertSubagentOutput(db, { sessionId: opts.sessionId });
+        setSubagentPayload(db, opts.sessionId, {
+          status: 'done',
+          reason: 'done',
+          output: 'ok',
+          cost_usd: 0,
+          steps: 1,
+          duration_ms: 1,
+        });
+        return { exited: Promise.resolve({ exitCode: 0 }), kill: () => undefined };
+      };
+      await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: parentCwd,
+        spawnChildProcess: dirPlantingSpawn,
+      });
+      expect(observedDir).toBeDefined();
+      if (observedDir !== undefined) {
+        // Path shape — anchored to the parent's cwd, not '/p',
+        // namespaced by session ID under .agent/bg/subagents/.
+        expect(observedDir.startsWith(`${parentCwd}/.agent/bg/subagents/`)).toBe(true);
+        // Cleanup MUST have removed the dir.
+        expect(existsSync(observedDir)).toBe(false);
+      }
+    } finally {
+      rmSync(parentCwd, { recursive: true, force: true });
+    }
+  });
+
+  test('4.2b.iv: SIGKILL-style child exit reaps orphan bg processes (DB + OS) before rmSync', async () => {
+    // Regression for the C1 finding from review: when the child
+    // exits without running its harness's bgManager.cleanup()
+    // hook (heartbeat stale → SIGKILL, wall_clock kill, abort
+    // escalation), bg processes the child spawned become
+    // orphans — alive on the OS, status='running' in the DB,
+    // and would have their log files unlinked out from under
+    // them by the parent's rmSync. The reaper closes the loop:
+    // kill OS-level + flip DB rows to 'killed' + rmSync.
+    const parentCwd = mkdtempSync(join(tmpdir(), 'forja-rt-bg-reap-'));
+    let sleepProc: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+        model: 'mock/m',
+        cwd: parentCwd,
+      });
+      const bgRepo = await import('../../src/storage/repos/bg-processes.ts');
+      let recordedBgRowId: string | undefined;
+      let recordedPid: number | undefined;
+      // Spawn fake that simulates a child registering a bg
+      // process AND then dying without cleaning up. We use a
+      // real `sleep 60` so the reaper has a real PID to send
+      // signals to; the test verifies after runSubagent that
+      // the OS process is gone and the DB row is 'killed'.
+      const orphanLeavingSpawn: SpawnChildProcess = (opts) => {
+        sleepProc = Bun.spawn({
+          cmd: ['sleep', '60'],
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        recordedPid = sleepProc.pid;
+        const row = bgRepo.insertBgProcess(db, {
+          sessionId: opts.sessionId,
+          osPid: sleepProc.pid,
+          command: 'sleep 60',
+          cwd: opts.cwd,
+          stdoutLogPath: '/tmp/fake-stdout.log',
+          stderrLogPath: '/tmp/fake-stderr.log',
+        });
+        recordedBgRowId = row.id;
+        // Mimic the bg manager creating its log directory.
+        if (opts.bgLogDir !== undefined) {
+          mkdirSync(opts.bgLogDir, { recursive: true });
+          writeFileSync(join(opts.bgLogDir, `${row.id}.stdout.log`), 'simulated\n');
+        }
+        // Insert outputs row but DO NOT publish payload — the
+        // outcome is 'crashed', mirroring the SIGKILL-without-
+        // finally path.
+        insertSubagentOutput(db, { sessionId: opts.sessionId });
+        // Return an immediately-exited handle with no payload.
+        return {
+          exited: Promise.resolve({ exitCode: 137 }),
+          kill: () => undefined,
+        };
+      };
+      const result = await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: parentCwd,
+        spawnChildProcess: orphanLeavingSpawn,
+      });
+      // Outcome is 'crashed' because the spawn fake skipped
+      // payload publication — exactly the post-SIGKILL shape.
+      expect(result.status).toBe('error');
+      expect(result.reason).toBe('subprocess_crashed');
+
+      // OS-level: the sleep PID must be dead. process.kill(pid, 0)
+      // probes existence; ESRCH means gone, 0 thrown means alive.
+      expect(recordedPid).toBeDefined();
+      if (recordedPid !== undefined) {
+        let alive = true;
+        try {
+          process.kill(recordedPid, 0);
+        } catch {
+          alive = false;
+        }
+        expect(alive).toBe(false);
+      }
+
+      // DB-level: the row flipped from 'running' to 'killed'
+      // via markRunningAsKilled.
+      expect(recordedBgRowId).toBeDefined();
+      if (recordedBgRowId !== undefined) {
+        const row = bgRepo.getBgProcess(db, recordedBgRowId);
+        expect(row?.status).toBe('killed');
+      }
+
+      // Disk-level: bgLogDir is gone (rmSync ran AFTER the reap).
+      const expectedDir = `${parentCwd}/.agent/bg/subagents/${result.sessionId}`;
+      expect(existsSync(expectedDir)).toBe(false);
+    } finally {
+      // Defensive: if the test failed before the reaper killed it,
+      // make sure the sleep doesn't outlive the test.
+      if (sleepProc !== undefined) {
+        try {
+          sleepProc.kill();
+        } catch {
+          // already dead
+        }
+      }
+      rmSync(parentCwd, { recursive: true, force: true });
+    }
+  });
+
+  test('4.2b.iv: reaper skips BOTH passes when recorded command mismatches live PID (recycle defense)', async () => {
+    // Race the slice's review surfaced: between row insert and
+    // reaper, the kernel can recycle a PID to an unrelated
+    // workload (process exited, PID handed out to something
+    // else). Both passes — SIGTERM and SIGKILL — must verify
+    // identity before signaling, otherwise the reaper kills
+    // unrelated processes on the host. We simulate the race
+    // by recording a bg row with a PID that points at a real
+    // live process (`sleep 60`) but a recorded command that
+    // doesn't match. The reaper SHOULD skip both signals; the
+    // sleep stays alive throughout the run. We verify by
+    // probing the PID after runSubagent returns.
+    const parentCwd = mkdtempSync(join(tmpdir(), 'forja-rt-bg-recycle-'));
+    let sleepProc: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+        model: 'mock/m',
+        cwd: parentCwd,
+      });
+      const bgRepo = await import('../../src/storage/repos/bg-processes.ts');
+      sleepProc = Bun.spawn({ cmd: ['sleep', '60'], stdout: 'pipe', stderr: 'pipe' });
+      const recordedPid = sleepProc.pid;
+      const recyclingSpawn: SpawnChildProcess = (opts) => {
+        bgRepo.insertBgProcess(db, {
+          sessionId: opts.sessionId,
+          osPid: recordedPid,
+          // Mismatch on purpose: argv0 of the live process is
+          // 'sleep', but we record 'fake-different-binary'.
+          // Both passes' isStillSameProcess check sees
+          // cmdline basename 'sleep' vs recorded
+          // 'fake-different-binary' → skip both signals.
+          command: 'fake-different-binary --arg',
+          cwd: opts.cwd,
+          stdoutLogPath: '/tmp/fake-stdout.log',
+          stderrLogPath: '/tmp/fake-stderr.log',
+        });
+        insertSubagentOutput(db, { sessionId: opts.sessionId });
+        return {
+          exited: Promise.resolve({ exitCode: 137 }),
+          kill: () => undefined,
+        };
+      };
+      await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: parentCwd,
+        spawnChildProcess: recyclingSpawn,
+      });
+
+      // CRITICAL ASSERTION: the sleep is still alive. If
+      // either pass had ignored the mismatch, our SIGTERM
+      // (default=exit for sleep) or SIGKILL would have ended
+      // it. Identity gate held → process untouched.
+      let alive = false;
+      try {
+        process.kill(recordedPid, 0);
+        alive = true;
+      } catch {
+        alive = false;
+      }
+      expect(alive).toBe(true);
+
+      // The DB row STAYS 'running' because identity didn't
+      // match (mismatch result). Previous design unconditionally
+      // flipped it to 'killed' which lied — the process is
+      // demonstrably alive. Honest audit: row stays as-is so
+      // the operator's `bg list` shows it and they can
+      // investigate via OS tools.
+      const session = (await import('../../src/storage/repos/sessions.ts')).listChildSessions(
+        db,
+        parent.id,
+      );
+      expect(session.length).toBeGreaterThanOrEqual(1);
+      const childId = session[0]?.id;
+      if (childId !== undefined) {
+        const childRows = bgRepo.listBgProcessesBySession(db, childId);
+        expect(childRows.length).toBe(1);
+        expect(childRows[0]?.status).toBe('running');
+      }
+    } finally {
+      // Manually clean up the sleep (the reaper correctly
+      // refused to touch it).
+      if (sleepProc !== undefined) {
+        try {
+          sleepProc.kill('SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
+      rmSync(parentCwd, { recursive: true, force: true });
+    }
+  });
+
+  test('4.2b.iv: reaper kills bash-wrapper bg processes (production spawn path)', async () => {
+    // The bg manager always spawns user commands via
+    // `bash -c <command>`, so the live argv[0] is `bash`, NOT
+    // the tool name (`npm`, `sleep`, etc.) the row's `command`
+    // field records. The first iteration of isStillSameProcess
+    // compared argv[0]'s basename against the recorded first
+    // token — which would be `bash` vs `sleep`, mismatch on
+    // EVERY production bg process. The reaper would skip every
+    // signal and the cleanup would silently leak every bg
+    // process the child spawned. This test pins the production
+    // shape: spawn matches what the bg manager does, recorded
+    // command is the user command, identity check must accept,
+    // both signals must fire, process must end up dead.
+    const parentCwd = mkdtempSync(join(tmpdir(), 'forja-rt-bg-bashwrap-'));
+    let bashProc: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+        model: 'mock/m',
+        cwd: parentCwd,
+      });
+      const bgRepo = await import('../../src/storage/repos/bg-processes.ts');
+      const bashWrapperSpawn: SpawnChildProcess = (opts) => {
+        // Mirror the bg manager: bash -c "<command>".
+        bashProc = Bun.spawn({
+          cmd: ['bash', '-c', 'sleep 60'],
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        bgRepo.insertBgProcess(db, {
+          sessionId: opts.sessionId,
+          osPid: bashProc.pid,
+          // Recorded command matches exactly what the bg manager
+          // would have stored — the user-facing command, not
+          // the wrapper.
+          command: 'sleep 60',
+          cwd: opts.cwd,
+          stdoutLogPath: '/tmp/fake-stdout.log',
+          stderrLogPath: '/tmp/fake-stderr.log',
+        });
+        insertSubagentOutput(db, { sessionId: opts.sessionId });
+        return {
+          exited: Promise.resolve({ exitCode: 137 }),
+          kill: () => undefined,
+        };
+      };
+      const result = await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: parentCwd,
+        spawnChildProcess: bashWrapperSpawn,
+      });
+
+      // Process must be dead. Identity check must have matched
+      // via argv[2] === 'sleep 60' against the live bash -c
+      // process's argv[2], NOT been deferred by the basename
+      // mismatch on argv[0]=bash.
+      expect(bashProc).toBeDefined();
+      if (bashProc !== undefined) {
+        let alive = true;
+        try {
+          process.kill(bashProc.pid, 0);
+        } catch {
+          alive = false;
+        }
+        expect(alive).toBe(false);
+      }
+      const childRows = bgRepo.listBgProcessesBySession(db, result.sessionId);
+      expect(childRows[0]?.status).toBe('killed');
+    } finally {
+      if (bashProc !== undefined) {
+        try {
+          bashProc.kill('SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
+      rmSync(parentCwd, { recursive: true, force: true });
+    }
+  });
+
+  test('4.2b.iv: bash-wrapper match preserves trailing whitespace verbatim', async () => {
+    // Real production shape that the prior trim() broke: a
+    // recorded command with a trailing newline (very common —
+    // heredoc bodies, multi-line scripts). The bg manager
+    // passes `input.command` to bash AND to the DB verbatim,
+    // so /proc/<pid>/cmdline argv[2] equals the row's
+    // `command` field byte-for-byte. Trimming on either side
+    // before the comparison would mismatch and leak the
+    // process. Pin verbatim equality.
+    const parentCwd = mkdtempSync(join(tmpdir(), 'forja-rt-bg-ws-'));
+    let bashProc: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+        model: 'mock/m',
+        cwd: parentCwd,
+      });
+      const bgRepo = await import('../../src/storage/repos/bg-processes.ts');
+      // Trailing newline in argv[2] AND in the recorded
+      // command. The recorded command MUST equal what we pass
+      // to bash; matching is exact.
+      const cmdWithWhitespace = 'sleep 60\n';
+      const whitespaceSpawn: SpawnChildProcess = (opts) => {
+        bashProc = Bun.spawn({
+          cmd: ['bash', '-c', cmdWithWhitespace],
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        bgRepo.insertBgProcess(db, {
+          sessionId: opts.sessionId,
+          osPid: bashProc.pid,
+          command: cmdWithWhitespace,
+          cwd: opts.cwd,
+          stdoutLogPath: '/tmp/fake-stdout.log',
+          stderrLogPath: '/tmp/fake-stderr.log',
+        });
+        insertSubagentOutput(db, { sessionId: opts.sessionId });
+        return {
+          exited: Promise.resolve({ exitCode: 137 }),
+          kill: () => undefined,
+        };
+      };
+      const result = await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: parentCwd,
+        spawnChildProcess: whitespaceSpawn,
+      });
+      // Process must be dead. If trim had been re-applied,
+      // argv[2]='sleep 60\n' vs trimmed='sleep 60' would
+      // mismatch and the kill would be skipped.
+      expect(bashProc).toBeDefined();
+      if (bashProc !== undefined) {
+        let alive = true;
+        try {
+          process.kill(bashProc.pid, 0);
+        } catch {
+          alive = false;
+        }
+        expect(alive).toBe(false);
+      }
+      const childRows = bgRepo.listBgProcessesBySession(db, result.sessionId);
+      expect(childRows[0]?.status).toBe('killed');
+    } finally {
+      if (bashProc !== undefined) {
+        try {
+          bashProc.kill('SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
+      rmSync(parentCwd, { recursive: true, force: true });
+    }
+  });
+
+  test('4.2b.iv: isStillSameProcess matches by basename (path-prefix tolerance)', async () => {
+    // Internal-helper coverage: the cmdline check should
+    // tolerate the common case where the recorded command was
+    // logged as a basename (`npm run dev`) while the running
+    // argv[0] is the resolved absolute path
+    // (`/usr/local/bin/npm`). Both reduce to basename `npm`,
+    // match. We exercise via a real spawn we control: spawn
+    // `sleep 60`, look up /proc/<pid>/cmdline, run the helper.
+    // The helper isn't directly exported (internal); we cover
+    // its behavior end-to-end via the reaper instead. This
+    // test asserts the END behavior: a row whose recorded
+    // command is `/usr/bin/sleep 60` (full path) gets reaped
+    // when the live process's argv[0] is `sleep` (basename).
+    const parentCwd = mkdtempSync(join(tmpdir(), 'forja-rt-bg-basename-'));
+    let sleepProc: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+        model: 'mock/m',
+        cwd: parentCwd,
+      });
+      const bgRepo = await import('../../src/storage/repos/bg-processes.ts');
+      const basenameSpawn: SpawnChildProcess = (opts) => {
+        sleepProc = Bun.spawn({ cmd: ['sleep', '60'], stdout: 'pipe', stderr: 'pipe' });
+        bgRepo.insertBgProcess(db, {
+          sessionId: opts.sessionId,
+          osPid: sleepProc.pid,
+          // Path-prefixed form; basename is still `sleep`.
+          command: '/usr/bin/sleep 60',
+          cwd: opts.cwd,
+          stdoutLogPath: '/tmp/fake-stdout.log',
+          stderrLogPath: '/tmp/fake-stderr.log',
+        });
+        insertSubagentOutput(db, { sessionId: opts.sessionId });
+        return {
+          exited: Promise.resolve({ exitCode: 137 }),
+          kill: () => undefined,
+        };
+      };
+      const result = await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: parentCwd,
+        spawnChildProcess: basenameSpawn,
+      });
+      // sleep should be dead — SIGTERM kills it; cmdline check
+      // matches basename so SIGKILL would also have run had
+      // SIGTERM not sufficed.
+      let alive = true;
+      if (sleepProc !== undefined) {
+        try {
+          process.kill(sleepProc.pid, 0);
+        } catch {
+          alive = false;
+        }
+      }
+      expect(alive).toBe(false);
+      const childRows = bgRepo.listBgProcessesBySession(db, result.sessionId);
+      expect(childRows[0]?.status).toBe('killed');
+    } finally {
+      if (sleepProc !== undefined) {
+        try {
+          sleepProc.kill();
+        } catch {
+          // ignore
+        }
+      }
+      rmSync(parentCwd, { recursive: true, force: true });
+    }
+  });
+
+  test('4.2b.iv: direct-spawn match rejects same-binary different-args recycled PID', async () => {
+    // Tightening: the original direct-spawn branch only
+    // compared argv[0]'s basename. A recycled PID that lands
+    // on a different invocation of the same binary (e.g.
+    // recorded `sleep 60` exits, kernel hands the PID to a
+    // fresh `sleep 30`) would falsely match and earn SIGKILL.
+    // The new check compares argv length AND each token;
+    // mismatching args reject the match, preserving the
+    // recycled-PID safety property even for direct-spawn
+    // callers (the case used by tests and future programmatic
+    // bg managers that don't wrap commands in bash -c).
+    const parentCwd = mkdtempSync(join(tmpdir(), 'forja-rt-bg-args-'));
+    let liveSleep: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+        model: 'mock/m',
+        cwd: parentCwd,
+      });
+      const bgRepo = await import('../../src/storage/repos/bg-processes.ts');
+      // Live process is `sleep 30` (different args than
+      // recorded). With basename-only matching this would
+      // pass — the regression we fixed.
+      liveSleep = Bun.spawn({ cmd: ['sleep', '30'], stdout: 'pipe', stderr: 'pipe' });
+      const argMismatchSpawn: SpawnChildProcess = (opts) => {
+        bgRepo.insertBgProcess(db, {
+          sessionId: opts.sessionId,
+          osPid: liveSleep?.pid ?? null,
+          // Recorded args differ: live is `sleep 30`, recorded
+          // is `sleep 60`. argv length matches (2 vs 2),
+          // argv[0] basename matches ('sleep' vs 'sleep'),
+          // argv[1] differs ('30' vs '60'). Match must be
+          // refused.
+          command: 'sleep 60',
+          cwd: opts.cwd,
+          stdoutLogPath: '/tmp/fake-stdout.log',
+          stderrLogPath: '/tmp/fake-stderr.log',
+        });
+        insertSubagentOutput(db, { sessionId: opts.sessionId });
+        return {
+          exited: Promise.resolve({ exitCode: 137 }),
+          kill: () => undefined,
+        };
+      };
+      await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: parentCwd,
+        spawnChildProcess: argMismatchSpawn,
+      });
+      // sleep 30 must still be alive — the reaper refused to
+      // signal because the recorded command's tokens didn't
+      // match the live argv.
+      let alive = true;
+      try {
+        process.kill(liveSleep.pid, 0);
+      } catch {
+        alive = false;
+      }
+      expect(alive).toBe(true);
+    } finally {
+      if (liveSleep !== undefined) {
+        try {
+          liveSleep.kill('SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
+      rmSync(parentCwd, { recursive: true, force: true });
+    }
+  });
+
+  test('4.2b.iv: exec-replace mismatch leaves row running + bgLogDir preserved (regression)', async () => {
+    // Regression for review #9: a recorded `exec sleep 60` runs
+    // through bash -c, the `exec` builtin replaces the bash
+    // process with sleep, and now argv[0]='sleep' instead of
+    // bash. The bash-wrapper match doesn't apply, the
+    // direct-spawn match fails on token count (`exec sleep 60`
+    // has 3 tokens, live argv has 2), result is 'mismatch'.
+    //
+    // Old behavior: skipped both signals (correct) but
+    // `markRunningAsKilled` flipped the row to 'killed'
+    // anyway (audit lie) AND the runSubagent re-query saw 0
+    // running rows so the bgLogDir was rmSync'd (process still
+    // writing to phantom FDs).
+    //
+    // New behavior: row stays 'running', re-query sees the
+    // mismatch row, rmSync skipped, dir preserved for
+    // operator investigation.
+    const parentCwd = mkdtempSync(join(tmpdir(), 'forja-rt-bg-exec-'));
+    let bashProc: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+        model: 'mock/m',
+        cwd: parentCwd,
+      });
+      const bgRepo = await import('../../src/storage/repos/bg-processes.ts');
+      const recordedCommand = 'exec sleep 60';
+      const execReplaceSpawn: SpawnChildProcess = (opts) => {
+        // Mirror what the bg manager would do: bash -c with
+        // the user command. The `exec` causes the bash
+        // process to replace itself with sleep, so the live
+        // PID's argv[0] becomes 'sleep' instead of 'bash'.
+        bashProc = Bun.spawn({
+          cmd: ['bash', '-c', recordedCommand],
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        // Block synchronously until bash has actually exec'd
+        // into sleep. Without this wait, the test races: the
+        // reaper may catch bash mid-parse with argv[0]='bash'
+        // and argv[2]=recordedCommand (a perfect match), kill
+        // it before exec completes, and exercise the WRONG
+        // code path. /proc reads are blocking I/O — the loop
+        // paces itself naturally without needing a sleep
+        // primitive (Bun has no sync sleep). 2s ceiling is
+        // generous; bash-into-sleep typically takes <10ms.
+        const waitStart = Date.now();
+        while (Date.now() - waitStart < 2000) {
+          try {
+            const cmdline = readFileSync(`/proc/${bashProc.pid}/cmdline`, 'utf8');
+            const argv0Basename = (cmdline.split('\0')[0] ?? '').split('/').pop() ?? '';
+            if (argv0Basename === 'sleep') break;
+          } catch {
+            // /proc gone (process exited unexpectedly) — bail
+            // out of the wait; the test will fail on a
+            // separate assertion if this is bad.
+            break;
+          }
+        }
+        bgRepo.insertBgProcess(db, {
+          sessionId: opts.sessionId,
+          osPid: bashProc.pid,
+          command: recordedCommand,
+          cwd: opts.cwd,
+          stdoutLogPath: '/tmp/fake-stdout.log',
+          stderrLogPath: '/tmp/fake-stderr.log',
+        });
+        // Mimic the bg manager creating its log directory so
+        // the rmSync skip path has something to preserve.
+        if (opts.bgLogDir !== undefined) {
+          mkdirSync(opts.bgLogDir, { recursive: true });
+          writeFileSync(join(opts.bgLogDir, `${bashProc.pid}.log`), 'live\n');
+        }
+        insertSubagentOutput(db, { sessionId: opts.sessionId });
+        return {
+          exited: Promise.resolve({ exitCode: 137 }),
+          kill: () => undefined,
+        };
+      };
+
+      const result = await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: parentCwd,
+        spawnChildProcess: execReplaceSpawn,
+      });
+
+      // Row stays 'running' — mismatch outcome doesn't flip
+      // it to 'killed'.
+      const childRows = bgRepo.listBgProcessesBySession(db, result.sessionId);
+      expect(childRows.length).toBe(1);
+      expect(childRows[0]?.status).toBe('running');
+
+      // bgLogDir preserved because re-query saw a running row.
+      const expectedDir = `${parentCwd}/.agent/bg/subagents/${result.sessionId}`;
+      expect(existsSync(expectedDir)).toBe(true);
+    } finally {
+      if (bashProc !== undefined) {
+        try {
+          bashProc.kill('SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
+      rmSync(parentCwd, { recursive: true, force: true });
+    }
   });
 
   test('parent forwards temperature to spawn opts when set', async () => {

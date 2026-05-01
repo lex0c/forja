@@ -65,6 +65,7 @@ export {
   getBgProcess,
   insertBgProcess,
   listBgProcessesBySession,
+  markBgProcessAsKilled,
   markRunningAsKilled,
 } from './repos/bg-processes.ts';
 export type {

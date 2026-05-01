@@ -103,6 +103,19 @@ export interface SubagentChildOptions {
   // with planMode:true would see writing tools execute in the
   // child unchecked.
   planMode?: boolean;
+  // Per-subagent background-process log directory passed across
+  // via `--subagent-bg-log-dir <path>`. The harness wires it
+  // into the bg manager so `bash_background` / `bash_output` /
+  // `bash_kill` / process-aware `wait_for` and `monitor` work
+  // for subagent runs. The directory is namespaced under the
+  // PARENT's `.agent/bg/<sessionId>/` (computed by the parent's
+  // runSubagent), so concurrent children don't collide and the
+  // operator's `bg list` view from the project root continues
+  // to show only the parent's processes — a child's processes
+  // live under their session's subdirectory and never leak
+  // into the parent's bg state. Undefined when omitted (older
+  // parents, tests that exercise the bg-disabled path).
+  bgLogDir?: string;
 }
 
 // Cadence at which the child writes `last_heartbeat` to its
@@ -498,9 +511,12 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // already provides a separate branch for changes; per-step
       // checkpoint chain inside the worktree lands in 4.2c.
       enableCheckpoints: false,
-      // bgLogDir omitted: the validator + buildChildRegistry both
-      // refuse `requiresBgManager` tools, so the surface is empty.
-      // 4.2b.iv wires per-worktree bg logs.
+      // Per-subagent bg log directory. When omitted (older
+      // parents, tests that route around the spawn) the harness
+      // runs without a bg manager and `requiresBgManager` tools
+      // refuse at invocation time — same as a top-level run
+      // without `bgLogDir`.
+      ...(opts.bgLogDir !== undefined ? { bgLogDir: opts.bgLogDir } : {}),
     };
 
     const result = await runAgent(config);
