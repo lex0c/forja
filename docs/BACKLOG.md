@@ -15,6 +15,60 @@ Format:
 
 ---
 
+## [2026-05-01] M3 / Step 4.3.1.a — TS/JS parser core (tree-sitter)
+
+The 4.3.0 foundation slice landed schema + Query API surface but no parser
+— queries return empty until something writes rows. This sub-slice lays
+the parsing primitive: take a source string + language, return structured
+`IndexSymbol[]` and `Import[]`. Walker + DB writes + CLI surface land in
+4.3.1.b/c respectively, keeping reviews focused.
+
+After exploring `web-tree-sitter` (WASM, browser-oriented), pivoted to
+**native** `tree-sitter` bindings on user pushback: faster (~30-50% per
+parse), simpler integration, prebuilds available for linux/darwin/win
+via `node-gyp-build`. Trade-off: `bun build --compile` doesn't bundle
+`.node` files into the single binary as easily as it would WASM — single-
+binary distribution becomes a follow-up concern (slice 4.3.7+ if needed).
+The spec's "compiled into the binary" line was a suggestion, not a strict
+requirement; user-side rationale (CLI tool running locally, Bun supports
+node-api) wins on perf + simplicity.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `package.json` | NEW deps: `tree-sitter@^0.21`, `tree-sitter-typescript@^0.23`, `tree-sitter-javascript@^0.23`. Added to `trustedDependencies` so `node-gyp-build` postinstalls (which fetch prebuilt `.node` binaries) can run during `bun install`. |
+| `src/code-index/scanner/language.ts` | NEW — `detectLanguage(path)` maps file extensions to one of `typescript` / `tsx` / `javascript` / null. Lazy `loadGrammars()` defers native binding load until first parse, so the storage repos and Query API skeleton stay free of the native dependency at module init. |
+| `src/code-index/scanner/parser.ts` | NEW — wraps `tree-sitter` native module. Per-language `Parser` cache (reuses across files in a scan, ~5-10× faster than per-parse setup). Per-`(language, query-source)` `Query` cache (compile is ~1-5ms; we run the same query on every file, so caching is load-bearing). `__resetParserCacheForTests` test seam. |
+| `src/code-index/scanner/queries.ts` | NEW — S-expression queries for TS/TSX/JS. Strategy: queries identify the construct (`@symbol.fn`, `@symbol.class`, etc.) and capture the def node; the extractor walks the node for grammar-specific details. Keeps query strings readable; quirks (accessibility modifiers, multi-binding consts, import_clause shapes) live in JS where they're testable. JS query omits TS-only kinds (interface/type/enum). |
+| `src/code-index/scanner/extract.ts` | NEW — turns query matches into `IndexSymbol[]` + `Import[]`. Visibility resolves via parent type (`export_statement` → 'export') or accessibility modifier (TS class methods). FQN includes enclosing class name for methods. Multi-binding `const a = 1, b = 2;` expands to one symbol per binding via `variable_declarator` walk; destructuring patterns (`const { a } = obj`) skipped explicitly (out of scope v1). Import resolution is raw — relative-path heuristic flags external vs local; concrete `targetPath` resolution lands in slice 4.3.3. Signature truncation at 200 chars with `…` suffix to bound column size. |
+| `tests/code-index/scanner.test.ts` | NEW — 29 tests: language detection (case-insensitive, all extensions), TS extraction (function/class/method/interface/type/enum/const, exports, accessibility, multi-binding, FQN, line ranges), TSX (JSX components), JS (no TS-only kinds), imports (named/default/namespace/side-effect/mixed/aliased + isExternal heuristic), partial parse on invalid syntax, parser cache reuse + reset. |
+
+**Decisions:**
+
+- **D1 — Native `tree-sitter`, not `web-tree-sitter`.** User pushback against WASM for a CLI tool was correct: WASM is for browsers; native is the standard choice for Node/Bun CLIs. Perf gain is real (~30-50%); single-binary regression is acceptable trade-off. `tree-sitter-typescript` is even Bun-aware in its package.json — no friction.
+- **D2 — Three grammars: typescript, tsx, javascript.** Spec §1.3 lists more (Python, Go, Rust, Java); each adds ~200KB-1MB of binary + a parser-init cost. Ship the JS-family first since it's Forja's own stack. Slice 4.3.4 expands per-grammar.
+- **D3 — Capture-by-defnode + JS extraction (vs `field:` in queries).** Tree-sitter queries support `field: (node) @capture` to drill into named fields. Tempting but couples query shape to grammar internals — when grammar version bumps shift field names, queries break. Capturing the def node and walking children in JS is more verbose but localizes grammar-specific knowledge to the extractor module, where it's testable.
+- **D4 — Visibility = export | public | private | internal.** Spec §2.1's `SymbolVisibility` enum has `internal` and `unknown`. We use 'internal' for top-level non-exported decls AND TS `protected` (not all consumers care about the public/protected distinction for visibility gating; if they do, slice 4.3.4+ can expand the enum). 'unknown' is reserved for the parse-failed case.
+- **D5 — Imports: record source-export name, not local alias.** `import { login as signIn } from './auth'` records `login` (the source) in `importedNames`, not `signIn`. Cross-file resolution (slice 4.3.3) matches against source exports. The local alias is a consumer-side concern; the index is concerned with the import graph.
+- **D6 — Multi-binding const expansion + destructuring skip.** `const a = 1, b = 2;` produces two symbols (operator-natural). `const { a, b } = obj;` produces zero (would need pattern-walking; rare at module scope; documented in tests).
+
+**Pending / known limitations (deferred):**
+
+- **No FS walker yet.** Scanner takes a string; can't index a directory. Slice 4.3.1.b adds the walker (.gitignore + privacy excludes + size cap).
+- **No DB writes yet.** Insert helpers in `repo.ts` come with the walker slice — no point writing to schema until the scanner produces rows in production.
+- **No reference resolution.** Symbol name appears in `references_.target_symbol_name` but `target_symbol_id` stays null until slice 4.3.3's resolver runs a second pass after all files are indexed.
+- **Method extraction includes static methods unmarked.** TS `static`/`abstract` modifiers don't surface in visibility; treated as 'public'/'internal' per export status. Refine when consumer demand materializes.
+- **No JSDoc / docstring extraction.** Spec §1.2 says "Out of scope no v1; modelo lê via read_file quando relevante". Confirmed.
+- **No incremental parse.** Tree-sitter supports it via `Tree.edit()` but we always re-parse from scratch. Slice 4.3.3 + the FS watcher slice 4.3.6 may revisit if perf demands.
+- **Single-binary build (`bun build --compile`) likely needs accommodation** for the `.node` files. Defer to slice 4.3.7 or follow-up.
+
+**Verification:** `bun test` 1483 pass / 10 skip / 0 fail (+29 new); `tsc --noEmit` clean; `biome check` clean. Native deps install cleanly via `bun install` + `bun pm trust` (linux-x64 prebuilds confirmed).
+
+**Next:** M3 / Step 4.3.1.b — FS walker + scanner pipeline + DB write helpers. Walker respects `.gitignore` + `CODE_INDEX_DEFAULT_EXCLUDES` + `CODE_INDEX_MAX_FILE_SIZE_BYTES`. Pipeline wires walker → parser → extract → DB inserts. Initial scan triggered by a programmatic API (CLI command lands in 4.3.1.c).
+
+---
+
 ## [2026-05-01] M3 / Step 4.3.0 — Code Index foundation (schema + Query API skeleton)
 
 The 4.2 arc closed the subagent surface; M3 now turns to the code retrieval
