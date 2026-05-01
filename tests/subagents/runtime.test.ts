@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPermissionEngine } from '../../src/permissions/index.ts';
@@ -1728,9 +1736,71 @@ describe('runSubagent — worktree isolation', () => {
     expect(readdirSync(worktreeRoot)).toEqual([]);
   });
 
-  test.skip('symlink targeting outside the worktree is blocked at runtime', async () => {
-    // 4.2b.iii expectation. Spec SECURITY §8.4 deny-list +
-    // realpath validation; deferred per the slice scope of
-    // 4.2b.ii.a (subprocess only).
+  test('symlink targeting outside the worktree is blocked at runtime', async () => {
+    // Spec SECURITY §8.4 deny-list + realpath validation
+    // (4.2b.iii). The validator runs inside `createWorktree`
+    // after `git worktree add` succeeds; a symlink committed
+    // to HEAD that resolves outside the worktree must surface
+    // as `worktree_create_failed` with a rolled-back tree
+    // (cache root empty, parent branch list still pristine).
+    // The child session NEVER materializes — runSubagent's
+    // worktree-then-session ordering means the failure halts
+    // before any DB row gets inserted.
+    const outside = mkdtempSync(join(tmpdir(), 'forja-rt-outside-'));
+    try {
+      writeFileSync(join(outside, 'host-secret'), 'secret payload');
+      symlinkSync(join(outside, 'host-secret'), join(parentRepo, 'leak'));
+      await runGit(parentRepo, ['add', 'leak']);
+      await runGit(parentRepo, ['commit', '-m', 'add malicious symlink']);
+
+      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+        model: 'mock/m',
+        cwd: parentRepo,
+      });
+      const result = await runSubagent({
+        definition: definition({ tools: ['echo'], isolation: 'worktree' }),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: parentRepo,
+        worktreeRootDir: worktreeRoot,
+        spawnChildProcess: fakeSpawnDone(),
+      });
+      expect(result.status).toBe('error');
+      expect(result.reason).toBe('worktree_create_failed');
+      // Worktree root is empty — rollback removed the dir
+      // even though `git worktree add` had succeeded before
+      // validation tripped.
+      expect(readdirSync(worktreeRoot)).toEqual([]);
+      // No child session row materialized: createSession runs
+      // AFTER createWorktree, and createWorktree threw.
+      expect(listChildSessions(db, parent.id)).toEqual([]);
+      // Worktree audit row also absent (insert happens after
+      // both worktree and session creation succeed).
+      expect(getSubagentWorktree(db, result.sessionId)).toBeNull();
+      // Parent repo is still on `main` only — no orphan agent
+      // branch left behind by the rollback. (`runGit` in this
+      // describe block returns void; spawn directly to capture
+      // stdout for the assertion.)
+      const branchProc = Bun.spawn({
+        cmd: ['git', '-C', parentRepo, 'branch', '--list'],
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: {
+          LC_ALL: 'C',
+          GIT_TERMINAL_PROMPT: '0',
+          PATH: process.env.PATH ?? '',
+          HOME: process.env.HOME ?? '',
+        },
+      });
+      const branches = await new Response(branchProc.stdout).text();
+      await branchProc.exited;
+      expect(branches.trim()).toBe('* main');
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 });

@@ -1,6 +1,7 @@
-import { chmodSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { type ValidationResult, validateWorktreeContents } from './worktree-validation.ts';
 
 // Subagent worktree lifecycle (spec §11.2). When a definition
 // declares `isolation: worktree`, the harness creates a dedicated
@@ -18,9 +19,9 @@ import { dirname, join } from 'node:path';
 //     snapshots; pulling those into a shared surface would force
 //     a refactor that is not load-bearing for 4.2a.
 //   - No persistence here; the repo / migration owns that.
-//   - No symlink validation / SECURITY §8.4 hardening — out of
-//     scope for 4.2a per the alignment with the user. 4.2b adds
-//     it together with subprocess sandboxing.
+//   - SECURITY §8.4 hardening (symlink boundary + deny-list copy
+//     filter) lives in `worktree-validation.ts` and runs as a
+//     post-checkout step inside `createWorktree`.
 
 // Default cache root resolves through the standard precedence:
 //   1. $XDG_CACHE_HOME (per XDG Base Dir spec)
@@ -88,6 +89,24 @@ const runGit = async (args: string[], cwd: string): Promise<RunGitResult> => {
     env: {
       LC_ALL: 'C',
       GIT_TERMINAL_PROMPT: '0',
+      // Force every pathspec argument to be taken as a literal
+      // pathname rather than a glob. The skip-worktree flow
+      // passes deny-listed paths to `git ls-files` and
+      // `git update-index`, both of which parse positional
+      // arguments as pathspecs by default — so a deny-listed
+      // file like `[abc].pem` (legal Linux filename, matches
+      // `*.pem` in the deny-list) would be interpreted as a
+      // bracket character class matching `a.pem`/`b.pem`/`c.pem`.
+      // The literal file would not be marked, and unrelated
+      // tracked files might be — the latter silently masks any
+      // real child edits to those files, which then disappear
+      // from `git status` and cause cleanupWorktree to discard
+      // the run output. Setting this env var globally for the
+      // helper is inert for the path-typed args of `git worktree
+      // add` / `branch -D` (they don't go through the pathspec
+      // engine) and matches our requirement everywhere we DO
+      // pass paths.
+      GIT_LITERAL_PATHSPECS: '1',
       PATH: process.env.PATH ?? '',
       HOME: process.env.HOME ?? '',
     },
@@ -140,6 +159,17 @@ export interface CreateWorktreeOptions {
 export interface WorktreeHandle {
   path: string;
   branch: string;
+  // Paths the validator removed from this worktree at create
+  // time and masked from `git status` via `--skip-worktree`.
+  // cleanupWorktree stats each before running status — without
+  // that re-check, a child that re-creates or modifies a
+  // masked path (e.g. writes a new `.env`) would be hidden by
+  // the skip-worktree flag, classified as a clean worktree,
+  // and silently removed along with the child's writes.
+  // Empty array when the validator removed nothing — most
+  // worktrees end up with a zero-length list and the lstat
+  // sweep is a no-op.
+  maskedPaths: string[];
 }
 
 // Create a fresh git worktree for a subagent run. Throws on:
@@ -260,7 +290,121 @@ export const createWorktree = async (opts: CreateWorktreeOptions): Promise<Workt
       `git worktree add failed (exit ${add.exitCode}): ${add.stderr.trim() || add.stdout.trim()}`,
     );
   }
-  return { path, branch };
+  // Post-checkout validation (spec §8.4). The worktree is on
+  // disk with HEAD's tree checked out — any symlink committed
+  // to the parent repo is now an active symlink in the child's
+  // filesystem view. Two failures are possible:
+  //   (a) symlink whose realpath escapes the worktree boundary
+  //       — host-secrets exfil vector. Validator throws; we
+  //       roll back the worktree + branch so the run as a whole
+  //       reports `worktree_create_failed` rather than a half-
+  //       constructed sandbox.
+  //   (b) deny-listed file inside the tree (`.env`, `*.pem`,
+  //       etc.) — validator deletes silently; the run proceeds.
+  // Either way, the orphan-defense / branch cleanup mirrors the
+  // `git worktree add` failure path above so the cache state
+  // and the git refs stay consistent regardless of which step
+  // tripped.
+  let validation: ValidationResult;
+  try {
+    validation = validateWorktreeContents({ worktreePath: path });
+  } catch (e) {
+    await runGit(['worktree', 'remove', '--force', path], opts.parentCwd).catch(() => undefined);
+    await runGit(['branch', '-D', branch], opts.parentCwd).catch(() => undefined);
+    if (existsSync(path)) {
+      try {
+        rmSync(path, { recursive: true, force: true });
+      } catch {
+        // leave it — operator's gc sweep handles persistent leftovers
+      }
+    }
+    throw e;
+  }
+  // Mark the validator's deletions as `--skip-worktree` in the
+  // worktree's index so subsequent `git status` runs treat the
+  // worktree as clean even though tracked files (e.g. a
+  // committed `.env`) are now physically absent. Without this
+  // step, every cleanup pass would see ` D <file>` lines from
+  // the deny-list filter, classify the worktree as dirty, and
+  // preserve it indefinitely — the cache root would fill with
+  // leftovers and orphan agent branches on every run against
+  // any repo that commits deny-listed files.
+  //
+  // Why skip-worktree (and not `git rm`, status filtering, or
+  // chmod): see the slice's BACKLOG entry. Skip-worktree is
+  // surgical (only the deleted paths are affected), local to
+  // the worktree (no history mutation that would propagate via
+  // merge), and dies with `git worktree remove` so there is
+  // nothing to clean up later.
+  //
+  // Untracked deny-listed deletions (e.g. a `.env.local` the
+  // user wrote but never committed) don't show up in
+  // `git status --porcelain` after deletion — they were never
+  // in the index, so `git ls-files` returns empty for them and
+  // we skip the `update-index` call.
+  if (validation.deniedRemoved.length > 0) {
+    await markValidatorDeletionsSkipWorktree(path, validation.deniedRemoved);
+  }
+  return {
+    path,
+    branch,
+    // Surface the validator's removals so cleanupWorktree can
+    // detect child re-writes that skip-worktree would otherwise
+    // hide. We thread the canonical relative paths from the
+    // validator (a single entry per top-level removal — `.ssh`
+    // for the directory case, not its expanded tracked
+    // children) because the cleanup-side check only needs to
+    // know "did this entry come back" and lstat'ing a single
+    // dir is enough to detect any re-creation under it.
+    maskedPaths: validation.deniedRemoved.map((d) => d.path),
+  };
+};
+
+// Apply `--skip-worktree` to every tracked file under each path
+// the validator removed. For single files the `git ls-files`
+// query returns the path itself; for directory removals
+// (`.ssh/`, `.gnupg/`) it expands to every tracked file inside
+// — we mark them in batches via the `--stdin` form so we don't
+// blow argv on big directories. Failures here are NOT fatal:
+// the run already passed validation and the worktree is in a
+// secure state; the worst case from a skip-worktree failure is
+// a preserved-but-cleanable worktree at end of run, which the
+// operator's `agent worktree gc` (4.2d) reconciles.
+const markValidatorDeletionsSkipWorktree = async (
+  worktreePath: string,
+  deniedRemoved: ReadonlyArray<{ path: string; pattern: string }>,
+): Promise<void> => {
+  const tracked: string[] = [];
+  for (const { path: removedPath } of deniedRemoved) {
+    const ls = await runGit(['ls-files', '-z', '--', removedPath], worktreePath);
+    if (ls.exitCode !== 0) continue;
+    for (const file of ls.stdout.split('\0')) {
+      if (file.length > 0) tracked.push(file);
+    }
+  }
+  if (tracked.length === 0) return;
+  // `--stdin` + `-z` so paths with spaces / newlines work
+  // unchanged from `ls-files -z` output.
+  const proc = Bun.spawn({
+    cmd: ['git', '-C', worktreePath, 'update-index', '--skip-worktree', '-z', '--stdin'],
+    env: {
+      LC_ALL: 'C',
+      GIT_TERMINAL_PROMPT: '0',
+      // Same rationale as runGit: paths fed to update-index are
+      // pathspecs by default. A literal `[abc].pem` would be
+      // parsed as a bracket class, marking unrelated tracked
+      // files and missing the actual deny-listed entry.
+      GIT_LITERAL_PATHSPECS: '1',
+      PATH: process.env.PATH ?? '',
+      HOME: process.env.HOME ?? '',
+    },
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  proc.stdin.write(tracked.join('\0'));
+  proc.stdin.end();
+  await proc.exited;
 };
 
 export interface CleanupWorktreeOptions {
@@ -298,6 +442,29 @@ export interface CleanupResult {
 // `agent worktree gc` later (4.2d).
 export const cleanupWorktree = async (opts: CleanupWorktreeOptions): Promise<CleanupResult> => {
   const { handle, parentCwd } = opts;
+  // First check: did the child re-create or modify any path
+  // the validator removed at create time? Those paths are
+  // skip-worktree'd in the index, so `git status --porcelain`
+  // would NOT report a re-write — the worktree would look
+  // clean and the cleanup pass would silently drop the
+  // child's work along with the worktree.
+  //
+  // We `lstatSync` (not `existsSync`) so a child re-creating
+  // the path as a dangling symlink is also caught: existsSync
+  // dereferences and returns false for broken symlinks, but
+  // a broken symlink ENTRY is still a mutation the child
+  // performed that the operator should inspect.
+  for (const masked of handle.maskedPaths) {
+    const absPath = join(handle.path, masked);
+    try {
+      lstatSync(absPath);
+      // Path exists in some form — child mutated it.
+      return { dirty: true, preserved: true, removed: false };
+    } catch {
+      // ENOENT: still gone. Continue checking the rest.
+    }
+  }
+
   // `git status --porcelain` against the worktree itself. Empty
   // stdout means a clean tree (no tracked diff, no untracked
   // files). Any line of output means dirty.

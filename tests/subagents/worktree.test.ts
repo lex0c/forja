@@ -7,6 +7,7 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -195,6 +196,321 @@ describe('createWorktree', () => {
     } finally {
       rmSync(notGit, { recursive: true, force: true });
     }
+  });
+
+  test('rejects worktree whose HEAD has a symlink escaping the boundary', async () => {
+    // Commit a symlink that points outside the parent repo
+    // (and therefore outside any worktree branched off it).
+    // After `git worktree add`, the symlink is checked out
+    // intact in the worktree path — the validator must catch
+    // it BEFORE the run starts and roll back the worktree.
+    const outside = mkdtempSync(join(tmpdir(), 'forja-outside-'));
+    try {
+      writeFileSync(join(outside, 'host-secret.txt'), 'host data');
+      symlinkSync(join(outside, 'host-secret.txt'), join(parentRepo, 'leak'));
+      await runGit(parentRepo, ['add', 'leak']);
+      await runGit(parentRepo, ['commit', '-m', 'add malicious symlink']);
+
+      let threw = false;
+      try {
+        await createWorktree({
+          sessionId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+          prompt: 'symlink test',
+          parentCwd: parentRepo,
+          rootDir: worktreeRoot,
+        });
+      } catch {
+        threw = true;
+      }
+      expect(threw).toBe(true);
+      // Critical regression: the worktree dir was rolled back,
+      // so the cache root is empty. Without rollback, an
+      // operator running `agent worktree gc` would see a stale
+      // entry that the run never produced.
+      expect(readdirSync(worktreeRoot)).toEqual([]);
+      // Branch was deleted (the rollback path runs `branch -D`).
+      // We don't know the exact branch name (slug+suffix), but
+      // listing the parent's branches must show only `main`.
+      const branches = await runGit(parentRepo, ['branch', '--list']);
+      expect(branches.trim()).toBe('* main');
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test('worktree appears clean to git after deny-list deletions (regression: skip-worktree)', async () => {
+    // Without the skip-worktree marking, deleting tracked
+    // files (`.env`, `cert.pem`) leaves ` D <file>` lines in
+    // `git status --porcelain`. cleanupWorktree treats any
+    // non-empty status as dirty → preserves the worktree
+    // forever. Every subagent run on a repo with a committed
+    // `.env` would leak a leftover worktree + agent branch.
+    //
+    // With the fix, the validator's deletions are masked via
+    // `git update-index --skip-worktree`, so status reports a
+    // clean tree, cleanup removes the worktree, and the audit
+    // row records `cleaned`.
+    writeFileSync(join(parentRepo, '.env'), 'API_KEY=topsecret\n');
+    writeFileSync(join(parentRepo, 'cert.pem'), '----BEGIN----\n');
+    mkdirSync(join(parentRepo, '.ssh'));
+    writeFileSync(join(parentRepo, '.ssh/id_rsa'), 'private');
+    writeFileSync(join(parentRepo, '.ssh/known_hosts'), 'host');
+    await runGit(parentRepo, ['add', '-A']);
+    await runGit(parentRepo, ['commit', '-m', 'add sensitive files']);
+
+    const handle = await createWorktree({
+      sessionId: 'cccccccc-dddd-eeee-ffff-aaaaaaaaaaaa',
+      prompt: 'clean cycle test',
+      parentCwd: parentRepo,
+      rootDir: worktreeRoot,
+    });
+
+    // git status --porcelain in the worktree must be empty —
+    // deny-listed deletions are hidden by --skip-worktree.
+    const status = await runGit(handle.path, ['status', '--porcelain']);
+    expect(status).toBe('');
+
+    // Sanity: the deletions actually happened on disk.
+    expect(existsSync(join(handle.path, '.env'))).toBe(false);
+    expect(existsSync(join(handle.path, 'cert.pem'))).toBe(false);
+    expect(existsSync(join(handle.path, '.ssh'))).toBe(false);
+
+    // Cleanup with no child changes → must classify clean.
+    const cleanup = await cleanupWorktree({ handle, parentCwd: parentRepo });
+    expect(cleanup.dirty).toBe(false);
+    expect(cleanup.removed).toBe(true);
+    expect(cleanup.preserved).toBe(false);
+    expect(existsSync(handle.path)).toBe(false);
+    // Branch deleted too — no orphan agent/* branch left.
+    const branches = await runGit(parentRepo, ['branch', '--list', handle.branch]);
+    expect(branches.trim()).toBe('');
+  });
+
+  test('deny-listed symlink is removed AND masked via skip-worktree (no leftover dirty status)', async () => {
+    // End-to-end coverage for the symlink-name bypass + the
+    // skip-worktree masking: a `.env -> secrets.txt` committed
+    // to the parent gets its symlink entry removed by the
+    // validator, and the resulting tracked-symlink deletion is
+    // masked from `git status --porcelain`. Without either
+    // piece, the worktree would either leak the secret to the
+    // child (no name check) or be permanently dirty (no
+    // skip-worktree).
+    writeFileSync(join(parentRepo, 'secrets.txt'), 'API_KEY=topsecret');
+    // Relative target — git stores the symlink string verbatim.
+    // An absolute path here would still point at the parent repo
+    // when checked out into the worktree, escaping the boundary
+    // (a different bug, caught by pass 1). Relative `secrets.txt`
+    // resolves inside whichever working tree the symlink lands in.
+    symlinkSync('secrets.txt', join(parentRepo, '.env'));
+    await runGit(parentRepo, ['add', '-A']);
+    await runGit(parentRepo, ['commit', '-m', 'add symlink bypass attempt']);
+
+    const handle = await createWorktree({
+      sessionId: 'eeeeeeee-ffff-aaaa-bbbb-cccccccccccc',
+      prompt: 'symlink bypass cycle',
+      parentCwd: parentRepo,
+      rootDir: worktreeRoot,
+    });
+    // `.env` symlink is gone; `secrets.txt` survives.
+    expect(existsSync(join(handle.path, '.env'))).toBe(false);
+    expect(existsSync(join(handle.path, 'secrets.txt'))).toBe(true);
+    // status is clean — the tracked symlink deletion was
+    // skip-worktree'd.
+    const status = await runGit(handle.path, ['status', '--porcelain']);
+    expect(status).toBe('');
+
+    const cleanup = await cleanupWorktree({ handle, parentCwd: parentRepo });
+    expect(cleanup.removed).toBe(true);
+    expect(cleanup.preserved).toBe(false);
+  });
+
+  test('deny-listed filename containing pathspec metacharacters is correctly masked (literal pathspec)', async () => {
+    // Without GIT_LITERAL_PATHSPECS, `git ls-files -- [abc].pem`
+    // interprets `[abc]` as a character class matching `a`,
+    // `b`, or `c`. The literal `[abc].pem` is NOT returned;
+    // unrelated files like `a.pem` would be marked
+    // skip-worktree instead, hiding any later child edits to
+    // them from `git status`. The literal `[abc].pem` would
+    // never get masked, so its tracked deletion shows as
+    // ` D [abc].pem`, the worktree is classified dirty, and
+    // cleanup preserves it forever.
+    //
+    // With the env-set fix, the path is passed verbatim and
+    // the literal file gets the skip-worktree flag — status
+    // empty, cleanup removes the worktree as expected.
+    writeFileSync(join(parentRepo, '[abc].pem'), 'BEGIN CERT');
+    // Also commit a non-overlapping `.pem` so the test
+    // doesn't accidentally pass on a setup quirk: both must
+    // get masked. Note `a.pem` would ALSO match `[abc].pem`
+    // as a non-literal pathspec.
+    writeFileSync(join(parentRepo, 'a.pem'), 'CERT A');
+    await runGit(parentRepo, ['add', '-A']);
+    await runGit(parentRepo, ['commit', '-m', 'add bracket-named pem']);
+
+    const handle = await createWorktree({
+      sessionId: '11111111-2222-3333-4444-aaaaaaaa1111',
+      prompt: 'pathspec metachars',
+      parentCwd: parentRepo,
+      rootDir: worktreeRoot,
+    });
+    // Both files were validator-removed (matched `*.pem`).
+    expect(existsSync(join(handle.path, '[abc].pem'))).toBe(false);
+    expect(existsSync(join(handle.path, 'a.pem'))).toBe(false);
+
+    // status is empty — both deletions are skip-worktree masked.
+    const status = await runGit(handle.path, ['status', '--porcelain']);
+    expect(status).toBe('');
+
+    const cleanup = await cleanupWorktree({ handle, parentCwd: parentRepo });
+    expect(cleanup.removed).toBe(true);
+    expect(cleanup.preserved).toBe(false);
+  });
+
+  test('child re-creating a masked path is detected as dirty (regression: skip-worktree mutation hiding)', async () => {
+    // Skip-worktree silences `git status` for the masked path
+    // entirely — including re-writes. A child that recreates
+    // `.env` (with new content, or even as a dangling symlink)
+    // would otherwise vanish from the cleanup view: status
+    // empty, classify clean, remove worktree, lose the write.
+    //
+    // cleanupWorktree's lstat sweep over `handle.maskedPaths`
+    // catches this BEFORE running status. Detected → preserve
+    // worktree + branch, operator can inspect.
+    writeFileSync(join(parentRepo, '.env'), 'ORIGINAL=1');
+    await runGit(parentRepo, ['add', '.env']);
+    await runGit(parentRepo, ['commit', '-m', 'add env']);
+
+    const handle = await createWorktree({
+      sessionId: 'ffffffff-aaaa-bbbb-cccc-dddddddddddd',
+      prompt: 'rewrite test',
+      parentCwd: parentRepo,
+      rootDir: worktreeRoot,
+    });
+    expect(handle.maskedPaths).toContain('.env');
+    expect(existsSync(join(handle.path, '.env'))).toBe(false);
+
+    // Simulate the child re-creating `.env` with new content.
+    // Without the lstat sweep this write is invisible to
+    // `git status --porcelain` (skip-worktree set on `.env`).
+    writeFileSync(join(handle.path, '.env'), 'CHILD_INJECTED=1\n');
+    // Sanity: skip-worktree really does hide the change from git.
+    const status = await runGit(handle.path, ['status', '--porcelain']);
+    expect(status).toBe('');
+
+    // The lstat sweep MUST classify this as dirty regardless.
+    const cleanup = await cleanupWorktree({ handle, parentCwd: parentRepo });
+    expect(cleanup.dirty).toBe(true);
+    expect(cleanup.preserved).toBe(true);
+    expect(cleanup.removed).toBe(false);
+    // Child's content survives on disk for operator inspection.
+    expect(readFileSync(join(handle.path, '.env'), 'utf8')).toBe('CHILD_INJECTED=1\n');
+  });
+
+  test('child re-creating a masked path as a dangling symlink is also detected', async () => {
+    // existsSync follows symlinks and returns false for
+    // broken targets — a child crafting a dangling symlink
+    // at a masked path could escape the dirty check if the
+    // sweep used existsSync. lstatSync sees the symlink
+    // entry regardless of target validity.
+    writeFileSync(join(parentRepo, '.env'), 'ORIGINAL=1');
+    await runGit(parentRepo, ['add', '.env']);
+    await runGit(parentRepo, ['commit', '-m', 'add env']);
+
+    const handle = await createWorktree({
+      sessionId: 'aaaaaaaa-bbbb-cccc-dddd-000011112222',
+      prompt: 'dangling rewrite',
+      parentCwd: parentRepo,
+      rootDir: worktreeRoot,
+    });
+    // Create a dangling symlink at the masked location.
+    symlinkSync('does-not-exist', join(handle.path, '.env'));
+
+    const cleanup = await cleanupWorktree({ handle, parentCwd: parentRepo });
+    expect(cleanup.dirty).toBe(true);
+    expect(cleanup.preserved).toBe(true);
+  });
+
+  test('child re-creating a masked DIRECTORY is detected', async () => {
+    // Sensitive directories (`.ssh/`) get removed wholesale;
+    // a child rebuilding `.ssh/` (any contents) must be flagged.
+    mkdirSync(join(parentRepo, '.ssh'));
+    writeFileSync(join(parentRepo, '.ssh/id_rsa'), 'private');
+    await runGit(parentRepo, ['add', '-A']);
+    await runGit(parentRepo, ['commit', '-m', 'add ssh']);
+
+    const handle = await createWorktree({
+      sessionId: 'bbbbbbbb-cccc-dddd-eeee-000033334444',
+      prompt: 'rewrite ssh',
+      parentCwd: parentRepo,
+      rootDir: worktreeRoot,
+    });
+    expect(existsSync(join(handle.path, '.ssh'))).toBe(false);
+
+    // Child rebuilds the dir with new content.
+    mkdirSync(join(handle.path, '.ssh'));
+    writeFileSync(join(handle.path, '.ssh/key_planted_by_child'), 'malicious');
+
+    const cleanup = await cleanupWorktree({ handle, parentCwd: parentRepo });
+    expect(cleanup.dirty).toBe(true);
+    expect(cleanup.preserved).toBe(true);
+  });
+
+  test('child writes are still visible to git after skip-worktree masking (no false negative)', async () => {
+    // Defense-in-depth on the skip-worktree fix: masking the
+    // validator's deletions must NOT also mask genuine child
+    // writes elsewhere in the tree. A child writing
+    // `output.txt` after the validator deleted `.env` should
+    // still trip the dirty check at cleanup time so the
+    // worktree is preserved with the child's work.
+    writeFileSync(join(parentRepo, '.env'), 'SECRET');
+    await runGit(parentRepo, ['add', '.env']);
+    await runGit(parentRepo, ['commit', '-m', 'add env']);
+
+    const handle = await createWorktree({
+      sessionId: 'dddddddd-eeee-ffff-aaaa-bbbbbbbbbbbb',
+      prompt: 'child writes',
+      parentCwd: parentRepo,
+      rootDir: worktreeRoot,
+    });
+    // Simulate child writing output.
+    writeFileSync(join(handle.path, 'output.txt'), 'child wrote this\n');
+
+    const cleanup = await cleanupWorktree({ handle, parentCwd: parentRepo });
+    expect(cleanup.dirty).toBe(true);
+    expect(cleanup.preserved).toBe(true);
+    expect(cleanup.removed).toBe(false);
+    expect(readFileSync(join(handle.path, 'output.txt'), 'utf8')).toBe('child wrote this\n');
+  });
+
+  test('strips deny-listed files from the worktree before returning', async () => {
+    // Commit a `.env` and a `*.pem` to the parent repo. After
+    // `git worktree add` they appear in the worktree's
+    // checkout; the validator must remove them so the child's
+    // filesystem view never has the secrets, even via direct
+    // path access. Non-sensitive files survive untouched.
+    writeFileSync(join(parentRepo, '.env'), 'API_KEY=topsecret\n');
+    writeFileSync(join(parentRepo, 'cert.pem'), '----BEGIN----\n');
+    writeFileSync(join(parentRepo, 'safe.txt'), 'public\n');
+    await runGit(parentRepo, ['add', '-A']);
+    await runGit(parentRepo, ['commit', '-m', 'add sensitive files']);
+
+    const handle = await createWorktree({
+      sessionId: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff',
+      prompt: 'strip test',
+      parentCwd: parentRepo,
+      rootDir: worktreeRoot,
+    });
+
+    // Sensitive files gone from the worktree.
+    expect(existsSync(join(handle.path, '.env'))).toBe(false);
+    expect(existsSync(join(handle.path, 'cert.pem'))).toBe(false);
+    // Non-sensitive file remains.
+    expect(existsSync(join(handle.path, 'safe.txt'))).toBe(true);
+    expect(readFileSync(join(handle.path, 'safe.txt'), 'utf8')).toBe('public\n');
+    // Parent repo is untouched — the validator only mutates
+    // the worktree, never the source.
+    expect(existsSync(join(parentRepo, '.env'))).toBe(true);
+    expect(existsSync(join(parentRepo, 'cert.pem'))).toBe(true);
   });
 
   test('chmods the worktree root to 0700 even when pre-created looser', () => {

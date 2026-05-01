@@ -15,6 +15,196 @@ Format:
 
 ---
 
+## [2026-04-30] M3 / Step 4.2b.iii follow-up #4 — force literal pathspecs in worktree git calls
+
+The skip-worktree threading from follow-up #1 fed validator-removed
+paths to `git ls-files` and `git update-index`, both of which parse
+positional arguments as pathspecs by default. A deny-listed filename
+with pathspec metacharacters (e.g. `[abc].pem`, a legal Linux
+filename matching `*.pem` in the deny-list) would be interpreted as
+a bracket character class — `[abc]` matches `a`/`b`/`c` — so
+`ls-files` returned `a.pem`/`b.pem`/`c.pem` (if present) instead of
+the literal `[abc].pem`. The literal file never got its
+skip-worktree flag, and unrelated tracked files COULD get marked,
+silently masking any real child edits to them at cleanup time.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/subagents/worktree.ts` | `runGit` and the bespoke `update-index --stdin` spawn both set `GIT_LITERAL_PATHSPECS=1` in their child env. The flag is global per git invocation: every pathspec argument is taken as a literal pathname, no glob/regex/bracket interpretation. Inert for path-typed args of `git worktree add` / `branch -D` (those don't pass through the pathspec engine), correct for `ls-files` / `update-index` / `status` / `worktree remove`. |
+| `tests/subagents/worktree.test.ts` | +1 regression test: commit `[abc].pem` (literal brackets) AND `a.pem`, run createWorktree, assert both validator-removed and `git status --porcelain` empty in the worktree, cleanup classifies removed. Without the fix, `[abc].pem` would show as ` D [abc].pem` (never masked) and cleanup would preserve indefinitely. |
+
+**Decisions:**
+
+- **`GIT_LITERAL_PATHSPECS=1` env-wide vs `:(literal)` per-arg.** Env wins on invariance: every git call from this module gets the same semantics, no risk of forgetting the prefix on a future call site. The flag is a no-op for non-pathspec args, so the blast radius is what we want.
+- **No alternative escape mechanism explored.** `git update-index --add --chmod` accepts pathspecs the same way; any future expansion of the validator's git ops will inherit the literal-pathspec posture automatically because they go through the same `runGit` helper.
+
+**Verification:** `bun test` 1373 pass / 10 skip / 0 fail (+1 new); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** unchanged — M3 / Step 4.2b.iv (`bgLogDir` per-worktree, lifts the `requiresBgManager` gate).
+
+---
+
+## [2026-04-30] M3 / Step 4.2b.iii follow-up #3 — detect child re-writes hidden by skip-worktree
+
+The skip-worktree mask from follow-up #1 introduced an inverse
+hazard: it makes `git status` ignore EVERY change to the masked
+paths, not just the validator's deletion. A child that re-creates
+or modifies a masked file (writes a new `.env`, plants a new
+`.ssh/key_*`) would be invisible to `git status --porcelain`,
+classified as a clean worktree, and silently removed at cleanup
+along with the child's writes — losing run output and masking
+post-validation mutations on exactly the paths the deny-list
+flagged as sensitive.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/subagents/worktree.ts` | `WorktreeHandle` gains a `maskedPaths: string[]` field populated from `validation.deniedRemoved.map(d => d.path)`. `cleanupWorktree` runs an `lstatSync` sweep over each masked path BEFORE the `git status --porcelain` check; any path that exists in any form (regular file, symlink, directory, dangling symlink) classifies the worktree as dirty and triggers preserve. The lstat (not `existsSync`) is deliberate: `existsSync` follows symlinks and returns false for dangling targets, but a dangling-symlink ENTRY at a masked path is still a child mutation worth surfacing to the operator. |
+| `tests/subagents/worktree.test.ts` | +3 regression tests: child re-creates `.env` with new content (skip-worktree silences `git status` → only the lstat sweep catches it), child plants a dangling symlink at `.env` (lstat picks it up where existsSync wouldn't), child rebuilds `.ssh/` with new contents (directory case). All three assert dirty + preserved + content survives on disk for operator inspection. |
+
+**Decisions:**
+
+- **lstat, not existsSync.** Symlink-as-dangling-link is a child mutation that must be visible to the operator; existsSync would silently drop it. The cost (one extra branch in fs lookup) is irrelevant compared to correctness.
+- **Track top-level `deniedRemoved.path`, not the expanded tracked file list.** When the validator removes `.ssh/` it expands via `git ls-files -z` to mark every tracked file under `.ssh/` as skip-worktree, but the lstat sweep only needs to know "did this top-level entry come back" — a single lstat on `.ssh` detects any re-creation under it (file, dir, symlink). Storing the expanded list would bloat the handle for no gain.
+- **Sweep runs FIRST, before status.** The lstat check is cheap (handful of syscalls) and unambiguous (path exists or doesn't). Doing it ahead of `git status` means the dirty path is detected even if some other status query bug or git misbehavior also masked the change.
+- **No "unmask + re-status" path.** We could in principle `git update-index --no-skip-worktree` the paths and re-query status; the lstat sweep is simpler, doesn't mutate the index in cleanup, and gives the same answer. The current design treats the index as immutable in cleanupWorktree.
+
+**Verification:** `bun test` 1372 pass / 10 skip / 0 fail (+3 new); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** unchanged — M3 / Step 4.2b.iv (`bgLogDir` per-worktree, lifts the `requiresBgManager` gate).
+
+---
+
+## [2026-04-30] M3 / Step 4.2b.iii follow-up #2 — close deny-list bypass via symlink name
+
+Second review pass on 4.2b.iii surfaced another security gap that
+the two-pass walker introduced. Pass 2 originally skipped EVERY
+symlink (the rationale being that pass 1 had already enforced the
+boundary check). But the deny-list isn't only about boundary —
+it's about NAMES the child can read by path. A repo committing
+`.env -> secrets.txt` (target inside the worktree, target name
+not deny-listed) bypassed the filter completely: pass 1 accepted
+the symlink (target inside boundary), pass 2 skipped it, and the
+child reading `.env` resolved through the OS to `secrets.txt`
+and got the secret bytes.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/subagents/worktree-validation.ts` | Pass 2's symlink branch now matches the symlink's NAME against `matchSensitivePath` (file pattern) AND `isSensitiveDirectory` (`.ssh`-style dir patterns via the `_probe` heuristic). Either trip removes the symlink ENTRY without resolving the target — the resolved file (if inside the worktree) is processed independently when the walker reaches it. `rmSync(absPath, { force: true })` unlinks symlinks without following, so a `.ssh -> regular-dir/` symlink gets the link removed while the underlying directory is left for the walker's regular dir branch. Header comment updated to reflect the new pass-2 contract. |
+| `tests/subagents/worktree-validation.test.ts` | +4 tests under `symlink-name deny-list (bypass guard)`: `.env -> secrets.txt` regression, `.ssh -> regular-dir` (sensitive-dir name), `subdir/.env -> ../keep.txt` (any-depth), `link -> .env` (innocuous-name preserved with dangling target — proves the C1 case still holds under the new rules). |
+| `tests/subagents/worktree.test.ts` | +1 end-to-end integration test: commit `.env -> secrets.txt` (relative target so pass-1 boundary doesn't preempt the deny-list test), createWorktree + cleanup; asserts symlink removed, target survives, status clean (skip-worktree mask covers the tracked symlink deletion too), cleanup classifies removed. |
+
+**Decisions:**
+
+- **Match symlink name only, never resolve target.** Two reasons. (1) Resolution is pass-1 work; pass 2 must be deterministic w.r.t. file deletions and re-resolving would re-introduce order dependencies. (2) The semantic is "what can the child read at this path": the resolved file, evaluated by its own name, gets its own walker visit if it's inside the worktree. Keeping the responsibilities separate avoids double-deletion and keeps the deny-list logic uniform across files and symlinks.
+- **`force: true`, not `recursive: true` for symlink rm.** `rmSync` on a symlink unlinks the symlink entry without following it, even when the symlink targets a directory. `recursive: true` would invite the rare bug of accidentally walking THROUGH a symlink-to-dir; force=true is the minimal flag set that swallows ENOENT (defensive against double-removal that shouldn't happen but isn't worth a noisy throw).
+- **Skip-worktree masking already covers tracked symlink deletions.** The createWorktree post-processing runs `git ls-files -z -- <removedPath>` which returns the symlink path if tracked (git tracks symlink entries the same way it tracks regular files at the index level); the `update-index --skip-worktree` call then masks the deletion from `git status`. No additional plumbing needed for the symlink deletions to be cleanup-clean.
+
+**Verification:** `bun test` 1369 pass / 10 skip / 0 fail (+5 new); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** unchanged — M3 / Step 4.2b.iv (`bgLogDir` per-worktree, lifts the `requiresBgManager` gate).
+
+---
+
+## [2026-04-30] M3 / Step 4.2b.iii follow-up — skip-worktree mask for deny-list deletions
+
+The 4.2b.iii closing entry left a critical bug uncaught by the
+review: `validateWorktreeContents` deleted tracked files via
+`rmSync`, which surfaces as ` D <file>` lines in
+`git status --porcelain`. `cleanupWorktree` treats any non-empty
+status as dirty and preserves the worktree forever — every
+subagent run against any repo that commits a `.env` / `*.pem`
+/ SSH key would leak a worktree + agent branch indefinitely.
+Cache root would fill with leftovers and orphan branches on
+every run, defeating the slice's auto-cleanup contract.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/subagents/worktree.ts` | `createWorktree` now captures the `ValidationResult` from `validateWorktreeContents` and threads it into a new `markValidatorDeletionsSkipWorktree` helper. The helper enumerates tracked files under each removed path via `git ls-files -z` (single files return themselves; sensitive directories like `.ssh/` expand to every tracked descendant), then batch-marks them with `git update-index --skip-worktree -z --stdin`. Skip-worktree failures are non-fatal — the worst case is a preservation `agent worktree gc` (4.2d) reconciles. |
+| `tests/subagents/worktree.test.ts` | +2 regression tests: (a) full create + cleanup cycle on a repo committing `.env` + `cert.pem` + `.ssh/` asserts `git status --porcelain` empty in the worktree, cleanup classifies `removed=true`, no orphan branch left; (b) child writes through the worktree still trip the dirty check (skip-worktree mask is surgical, doesn't suppress genuine work). |
+
+**Decisions:**
+
+- **Why `--skip-worktree`** (and not `git rm` / status-output filter / chmod / leave-tracked-untouched):
+  - `git rm` + commit on the agent branch mutates history; a later merge of the agent branch back into main would propagate the deletion of `.env`. Wrong.
+  - Filtering `git status --porcelain` lines in `cleanupWorktree` against a known-removed list works but pushes validator semantics into cleanup; any future consumer that runs `git status` without going through cleanupWorktree (helpers, debug tooling, the `agent worktree gc` sweep) sees the dirty state and re-introduces the bug.
+  - `chmod 0000` doesn't physically remove the bytes (they sit on disk for the run's duration) and may or may not show as modified depending on `core.fileMode`.
+  - Leaving tracked deny-listed files in place defeats the deny-list's purpose (child can read them through the OS regardless of tool-level checks that are still M2 work).
+  - `--skip-worktree` is per-worktree (no history mutation), surgical (only the validator's removed paths), and dies with `git worktree remove` (no cleanup needed).
+- **Helper enumerates via `git ls-files -z` per removed path.** Handles single files (returns the path) and directory removals (`.ssh/` returns every tracked file inside) uniformly. Untracked deny-listed deletions (e.g. user's `.env.local` not committed) return empty from `ls-files` and skip the update-index call — no-op when the deletion never showed in status anyway.
+- **Batch via `--stdin -z`.** A `.gnupg/` with hundreds of keyfiles would risk argv overflow if we passed paths inline. `--stdin` + `-z` accepts NUL-separated paths from stdin and matches the format `ls-files -z` already produces, so we just join and write.
+- **skip-worktree failures non-fatal.** The validator already accepted the worktree as secure; failing the run because git refused to flip an index bit would be over-strict. The worst case (preserved-but-cleanable worktree at end of run) is exactly what the operator's `agent worktree gc` (4.2d) is for.
+
+**Verification:** `bun test` 1364 pass / 10 skip / 0 fail (+2 new); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** unchanged — M3 / Step 4.2b.iv (`bgLogDir` per-worktree, lifts the `requiresBgManager` gate).
+
+---
+
+## [2026-04-30] M3 / Step 4.2b.iii — symlink hardening + sensitive-path deny-list
+
+The 4.2b.ii.b closing entry left two SECURITY §8.4 rails open: a
+symlink committed to HEAD that resolves outside the worktree
+(host-secrets exfil), and `.env` / `*.pem` / SSH key material
+that lands inside the worktree just because git tracks it. The
+runtime created the worktree, the child got `cwd` pointed at it,
+and the child's read tools could resolve those paths through
+the OS without any defense in depth. This slice closes both
+rails with a pre-spawn validator that runs inside
+`createWorktree` after `git worktree add` succeeds but before
+the child gets `cwd`.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/subagents/sensitive-paths.ts` | NEW — `SENSITIVE_PATH_DENY_LIST` constant mirroring SECURITY_GUIDELINE §8.4 verbatim + `matchSensitivePath(relPath, patterns?)` matcher (Bun.Glob, two-probe normalization for any-depth matching). Lives in its own module so future read/write tool consumers (§8.4 points 1 and 2) import the same source of truth without pulling worktree code. |
+| `src/subagents/worktree-validation.ts` | NEW — `validateWorktreeContents({worktreePath, denyListPatterns?})` walks the worktree tree (manual recursion, NOT `readdirSync({recursive:true})` — that would silently follow directory symlinks). Per-entry `lstat` detects symlinks; `realpathSync` resolves and prefix-matches the worktree's realpath'd root. Files matching the deny-list are deleted; sensitive directories (`.ssh/**`, `.gnupg/**`) are removed wholesale via a `_probe` child-path test. `WorktreeValidationError` carries `code` + `path` for telemetry. |
+| `src/subagents/worktree.ts` | Validator wired in after `git worktree add` succeeds. Validator throw → rollback (`git worktree remove --force` + `git branch -D` + best-effort `rmSync`) before re-throw, mirroring the existing `add` failure path. Updated header comment to remove the "out of scope for 4.2a" note. |
+| `tests/subagents/sensitive-paths.test.ts` | NEW — 16 tests covering the matcher: anchored patterns, any-depth normalization, `.env.*` vs `.envoy` (false-positive guard), `.aws/credentials` exact match without sweeping `.aws/`, custom override list, posix normalization for Windows-style separators. Includes a snapshot of the canonical list as a regression guard against accidental edits. |
+| `tests/subagents/worktree-validation.test.ts` | NEW — 20 tests on the walker directly (no git): symlink boundary (allowed inside, rejected absolute-out, rejected `../../`-out, broken target, deeply nested), deny-list (root `.env`, multi-depth `*.pem`, `.ssh/` recursive removal, `.aws/credentials` without sweeping the whole dir, `**/credentials*.json` at any depth), edge cases (empty worktree, custom override, non-existent root, `.git` directory skipped). |
+| `tests/subagents/worktree.test.ts` | +2 integration tests through `createWorktree`: rejects worktree whose HEAD has an out-of-bounds symlink (asserts cache root empty + branch list pristine after rollback), strips deny-listed files (`.env` + `cert.pem`) while preserving non-sensitive files. |
+| `tests/subagents/runtime.test.ts` | Activated the `.skip` left by 4.2b.ii.a — symlink rejection surfaces at runtime as `status='error', reason='worktree_create_failed'` with no child session row, no audit row, no orphan branch. |
+
+**Decisions (D1-D7 locked):**
+
+- **D1 — Symlink escaping: REJECT, not sanitize.** Sanitizing silently mutates a worktree that reflects a commit the user authored; that masks a malicious commit. Rejection forces the user to inspect what's in the repo. Map: `WorktreeValidationError(symlink_escapes_worktree)` → rollback inside `createWorktree` → `runSubagent` returns `worktree_create_failed`.
+- **D2 — Deny-listed files: DELETE silently.** Not a malicious-vs-not violation; just scope segregation. The child has nothing legitimate to do with `.env` even if the project ships one. Throwing would block any project that legitimately commits a placeholder `.env`. The deletion is cheap; the parent's source tree is untouched.
+- **D3 — Manual recursive descent (not `readdirSync({recursive:true})`).** The recursive form follows directory symlinks without surfacing them as symlinks — a `dirty -> /etc/passwd` directory symlink would walk straight out of the worktree before the validator ever inspected it. Per-entry `lstat` is the only safe approach.
+- **D4 — Bun.Glob, no regex.** CLAUDE.md hard rule + spec uses globs natively. Two probes per pattern (literal + `**/`-prefixed) give any-depth semantics without inventing pattern syntax. The matcher's first-hit behavior means more-specific patterns can shadow less-specific ones (`id_rsa*` beats `.ssh/**` for `.ssh/id_rsa`); that's fine — both flag the file as sensitive.
+- **D5 — Sensitive *directory* detection via probe.** A `_probe` child path is matched against the deny-list; if any pattern hits, the whole directory is `rmSync` recursive. This handles `.ssh/**` cleanly while keeping `.aws/credentials` (file-level) from sweeping `.aws/` (which can ship legitimate non-sensitive content). The probe filename is unlikely to collide with any specific file pattern.
+- **D6 — `.git` always skipped.** In a linked worktree it's the gitlink file pointing at the admin dir; the parent repo owns admin state, never the validator. Skipping by name (not stat) is faster and tolerates the rare case where a fixture writes a `.git` directory.
+- **D7 — Override hierarchy DEFERRED.** Spec §8.4 lists four override layers (`/trust path`, playbook frontmatter, `agent.toml`, `~/.config/agent/security.toml`). Three of those depend on subsystems that don't exist yet (playbooks, agent.toml schema, global security config). The hardcoded canonical list is the safer floor; PRs that need overrides will land alongside the consuming subsystem (M5 playbooks for the playbook-level layer, M6 trust for `/trust path`).
+- **D8 (post-review) — Two-pass walker, NOT mixed pass.** Initial design walked the tree once, validating symlinks and deleting files in the same loop. Code review caught that `readdirSync` order made spawn nondeterministic when a repo committed both a deny-listed file (`.env`) AND a symlink pointing at it (`link -> .env`): if `.env` iterated first, deletion left the symlink dangling and `realpath` threw `symlink_unresolvable` on the next iteration; if the symlink came first, validation accepted and the run proceeded. Pass 1 now validates ALL symlinks against the boundary, pass 2 then deletes deny-listed files / sensitive directories. Symlinks that target soon-to-be-deleted files are accepted in pass 1 (target intact), then dangle after pass 2 — child can't follow ENOENT, security preserved, spawn deterministic. Same fix closes the symlink-into-sensitive-directory case (M1 from review).
+- **D9 (post-review) — Resolved target redacted from `symlink_escapes_worktree` message.** The message is the only text artifact that may flow into logs / audit / telemetry; the resolved target is the host-side secret path the symlink was trying to read, and embedding it would defeat the purpose of refusing to read the file. The operator gets the symlink path via `error.path` and can `readlink` it themselves for forensic investigation. Spec §6 redaction principle applied defensively even though the validator's caller doesn't currently log the message.
+
+**Out of scope (deferred):**
+
+- **Read/write tool runtime enforcement.** §8.4 points 1 and 2 mandate that `read_file`, `outline_file`, `read_symbol`, `write_file`, `edit_file` all check the deny-list at call time. The matcher is now ready for them to import; the wiring is M2 tool work, not 4.2b.
+- **§8.4 override hierarchy** (D7 above).
+- **Heuristic warning for `0600`/`0400` files with sensitive keywords.** Spec calls this a *warning* (not a block), needs a UX surface (operator notification channel). Lands with the operator-warnings infrastructure later in M3 or M4.
+- **Symlinks created by the child mid-run.** Pre-spawn validation catches HEAD state; a `write_file` that creates a malicious symlink during the run is the permission matcher's problem (already handles symlink resolution per `tests/permissions/symlink.test.ts`). Defense in depth, not redundant.
+- **Audit row capture of `deniedRemoved`.** The validator returns the list of removed files but `createWorktree` discards it. Wiring it into the worktree audit row (or a new `subagent_run.security_events` field) is forensic value, not security value — defer until operator workflows demand it.
+
+**Pending / known limitations:**
+
+- **Race between checkout and validation.** `git worktree add` writes the tree, then we validate. A privileged process modifying the worktree between those two steps could plant a symlink the validator never sees. Linux FS doesn't give us a clean atomic checkpoint; mitigation is the cache root's `0700` mode (already enforced) which makes the race a non-issue under any sane operator setup. Worth re-evaluating if the threat model expands to multi-tenant hosts.
+- **`realpath` requires the target to exist.** Broken symlinks are rejected (D1 generalization). A repo that legitimately commits a dangling symlink (placeholder for build-time generation) can't be a subagent worktree source until the target is created or the symlink removed. Acceptable trade-off; document via the error message.
+- **Probe filename collision (`_probe`).** A pattern like `**/_probe` would trip `isSensitiveDirectory` for every directory and wipe the whole worktree. The current canonical list has no such pattern; if a future addition gets close to this shape, the probe needs to be randomized or the implementation switched to literal-pattern inspection. Low priority.
+
+**Verification:** `bun test` 1362 pass / 10 skip / 0 fail (+43 new across matcher, walker, two-pass invariants, integration, and runtime activation); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** M3 / Step 4.2b.iv — `bgLogDir` per-worktree (lifts the `requiresBgManager` gate). Subagents currently can't run `bun run dev` or any background-managed tool; the gate refuses under any isolation because the bg log directory is global and would mix child output into operator workflows. Per-worktree `bg-logs/` directory + scoped manager closes the gap. After .iv, the 4.2b arc is done; 4.2c lands checkpoints inside worktrees and 4.2d ships `agent worktree gc` + merge helpers.
+
+---
+
 ## [2026-04-30] M3 / Step 4.2b.ii.b — heartbeat liveness for subprocess subagents
 
 The 4.2b.ii.a closing entry left wall-clock (10min default) as
