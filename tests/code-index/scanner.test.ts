@@ -615,6 +615,26 @@ describe('extractFromSource — invalid syntax', () => {
   });
 });
 
+describe('parser robustness', () => {
+  test('parses sources whose chunk boundary lands inside a surrogate pair', () => {
+    // The function-form parse callback chunks at 4 KiB units.
+    // A non-BMP char (emoji) is two UTF-16 code units; if its
+    // halves fall on either side of the 4096 boundary, splitting
+    // naively would corrupt the UTF-8 crossing into the native
+    // binding. Build a source where '🚀' lands exactly at
+    // offsets 4095 (high surrogate) + 4096 (low). 2 leading
+    // chars (`//`) + 4093 ASCII fillers + emoji.
+    const padding = ' '.repeat(4093);
+    const src = `//${padding}🚀\nexport function afterEmoji() {}`;
+    // Sanity-check the offset arithmetic — first '🚀' code unit
+    // sits at index 4095.
+    expect(src.charCodeAt(4095)).toBe(0xd83d); // high surrogate of 🚀
+    expect(src.charCodeAt(4096)).toBe(0xde80); // low surrogate of 🚀
+    const { symbols } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    expect(symbols.find((s) => s.name === 'afterEmoji')?.kind).toBe('function');
+  });
+});
+
 describe('parser cache', () => {
   test('parserCache reuse — second parse of same language is fast and correct', () => {
     const src1 = 'export function a() {}';

@@ -45,9 +45,16 @@ const treeSitter = (): TreeSitterModule => {
 // Minimal structural types for the parser/query instances we
 // actually call. The native module exposes much more; we
 // declare only what we touch. Cast at construction.
+//
+// `parse` accepts either a raw string OR a chunking callback.
+// We use the callback form because the native binding's
+// string overload bails with "Invalid argument" on inputs
+// larger than ~32 KiB — a hard limit not obviously documented.
+// The callback form streams the source in chunks and has no
+// such limit.
 type ParserInstance = {
   setLanguage(lang: unknown): void;
-  parse(source: string): unknown;
+  parse(input: string | ((index: number) => string)): unknown;
 };
 
 // Parser cache per language. Reusing avoids per-parse setup
@@ -78,9 +85,35 @@ const getParser = (language: SupportedLanguage): ParserInstance => {
 // Returns `unknown` because the native Tree shape has dozens
 // of methods we don't enumerate; consumers (extract.ts) cast
 // via the local `SyntaxNode = any` alias when walking nodes.
+// Chunk size for the function-form parse callback, measured in
+// JS string units (UTF-16 code units, NOT bytes — for ASCII
+// source the two coincide; for non-BMP characters they diverge).
+// 4 KiB amortizes JS↔native round-trips while staying
+// comfortably under any per-call buffer limit. Tree-sitter
+// stitches chunks internally and doesn't care about the
+// boundary, EXCEPT that we must not split a UTF-16 surrogate
+// pair: high+low halves of one Unicode code point need to
+// arrive together or the UTF-8 encoding crossing the native
+// boundary would corrupt that character.
+const PARSE_CHUNK_SIZE = 4096;
+
 export const parseSource = (source: string, language: SupportedLanguage): unknown => {
   const parser = getParser(language);
-  return parser.parse(source);
+  // Function-form input: avoids the ~32 KiB string-overload
+  // limit in the native binding (`Invalid argument` thrown by
+  // larger files like 35 KiB+ source modules).
+  return parser.parse((index: number) => {
+    if (index >= source.length) return '';
+    let end = Math.min(index + PARSE_CHUNK_SIZE, source.length);
+    // Don't split a surrogate pair across chunks. If the last
+    // code unit of the chunk is a high surrogate (0xD800-0xDBFF),
+    // extend by one so its trailing low surrogate joins it.
+    const lastCode = source.charCodeAt(end - 1);
+    if (lastCode >= 0xd800 && lastCode <= 0xdbff && end < source.length) {
+      end += 1;
+    }
+    return source.slice(index, end);
+  });
 };
 
 // Query cache. Key: `${language}::${querySource}`. Tree-sitter
