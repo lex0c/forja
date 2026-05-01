@@ -15,6 +15,153 @@ Format:
 
 ---
 
+## [2026-05-01] M3 / Step 4.3.6.a — incremental scan function
+
+`CodeIndex.scanFiles({ paths })` lands as the per-file update
+path (CODE_INDEX.md §3.2): caller hands in specific paths,
+function re-indexes each in place — no walker, no full prune.
+This is the building block the PostToolUse hook (slice 4.3.6.b)
+will fire after `write_file` / `edit_file` so the index doesn't
+go stale mid-session, and the future `agent --code-index scan
+--since` CLI exposes the same path.
+
+**Decisions:**
+
+- **D1 — Out-of-tree paths dropped silently, not error.** The
+  PostToolUse hook will pass arbitrary tool-arg paths; some
+  resolve outside the project root (sibling repo edits, /tmp
+  scratch). Crashing the index update because a tool wrote
+  somewhere else would be hostile. The function normalizes,
+  drops anything escaping `projectRoot`, and continues.
+- **D2 — Walker filters reapplied per file (lstat + ext + size +
+  symlink).** A file deleted, moved out of the language set,
+  grown past `CODE_INDEX_MAX_FILE_SIZE_BYTES`, or replaced by
+  a symlink gets its row pruned (CASCADE drops symbols /
+  imports / references). Mirrors what a full re-scan would do
+  for that path; keeps the index coherent without a sweep.
+- **D3 — content_hash hot-path.** Read + sha256 the file; if
+  the hash matches stored, only `indexed_at` is bumped — parse
+  is skipped entirely. Dominant case after no-op edits or
+  whitespace-only saves. Keeps PostToolUse cheap for
+  formatting passes.
+- **D4 — Resolver runs once at the end, gated on `updated > 0
+  || removed > 0`.** `resolveImports` / `resolveReferences`
+  filter on NULL targets, so re-running across the whole
+  index after an incremental pass is cheap. Skipping when
+  nothing changed avoids a needless transaction.
+- **D5 — Outcomes computed outside the transaction; writes
+  inside `withTransaction`.** Same pattern the full-scan
+  pipeline uses: parse + extract in parallel (Promise.all),
+  then a single short write phase. Avoids holding the SQLite
+  write lock across tree-sitter parses.
+- **D6 — Per-file try/catch isolates parse failures.** A
+  malformed file reports an error in the result and keeps
+  going; the rest of the batch still updates. `parse_status`
+  ends up `'partial'` (tree-sitter recovers most syntax
+  errors) or `'failed'` (true throw) — failed-only path skips
+  symbol/import/reference inserts but keeps the file row so
+  the index reflects "we tried".
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/code-index/scanner/incremental.ts` | NEW — `scanFiles(db, opts)` per-file update path. Normalize → probe → read+hash → reindex-or-touch → resolver. Wraps body in `withScanLock` so it serializes against `scanProject`. Returns `{ updated, unchanged, removed, errors }`. |
+| `src/code-index/scanner/_util.ts` | NEW — shared `CURRENT_SCHEMA_VERSION`, `sha256Hex`, `countLines` (deduped from pipeline.ts so the schema version can't drift between full-scan and incremental paths). |
+| `src/code-index/scanner/_lock.ts` | NEW — `withScanLock(db, fn)` extracted from `scanProject`'s mutex; both full and incremental paths now queue through it. |
+| `src/code-index/scanner/pipeline.ts` | Imports from `_util` / `_lock`; local helpers and `scanMutexes` removed. |
+| `src/code-index/index.ts` | Adds `CodeIndex.scanFiles(opts)` exposing the helper; defaults `projectRoot` to the one passed at init. |
+| `tests/code-index/incremental.test.ts` | NEW — 14 tests: re-indexes modified file, content_hash unchanged, removes deleted file, drops on extension change, adds new file, resolver rebinds refs, accepts absolute paths, drops out-of-tree, skips privacy excludes, dedupes back-to-back paths, empty-paths no-op, idempotent, parse_status='partial' for syntax errors, **serializes against concurrent full scan**. |
+
+**Review-driven changes** (post-review #1):
+
+- **scanFiles serializes against scanProject via `withScanLock`.**
+  Both paths share the connection's prepared-statement cache
+  and the full-scan path uses connection-scoped temp tables
+  (`_scan_seen`). Without serialization, PostToolUse + a
+  manual `agent --code-index scan` could interleave
+  transactions in observable ways. New concurrency test
+  hammers 5 ops in parallel and asserts deterministic state.
+- **Schema version + helpers extracted to `_util.ts`.**
+  `CURRENT_SCHEMA_VERSION` was duplicated in both scanner
+  modules; a future schema bump that updated only one would
+  silently corrupt re-indexed rows. `sha256Hex` and
+  `countLines` came along to keep the surface consistent.
+- **`EXCLUDE_GLOBS` cached at module scope.**
+  PostToolUse will fire `scanFiles` per edit; re-compiling
+  Bun.Glob instances every call was wasteful.
+- **`updated` counter semantics documented.**
+  A parse failure both bumps `updated` AND lands in `errors`
+  — same dual-counted behavior as `pipeline.ts`'s
+  `filesScanned` + `errors`. Comment was vague; now explicit.
+- **`Bun.file().text()` → `readFile(path, 'utf8')`.**
+  Matches pipeline.ts's read API; no functional difference.
+
+**Pending / next:**
+
+- **4.3.6.b** — harness PostToolUse hook integration: fire
+  `scanFiles` for `write_file` / `edit_file` with the touched
+  path. Needs to handle the parent-vs-subagent case (subagent
+  in subprocess has its own CodeIndex; parent's index is the
+  one the model queries from next turn).
+- **4.3.6.c** — bash detection via tree-hash diff: a `bash`
+  tool call can edit arbitrarily many files. Need a cheap
+  "what changed" pass before `scanFiles`. Likely git-status
+  parse for repos, fallback to nothing for non-git roots.
+
+**Verification:** `bun test` 1664 pass / 10 skip / 0 fail
+(post-review concurrency test added); `bun run typecheck`
+clean; `bun run lint` clean.
+
+**Next:** M3 / Step 4.3.6.b — PostToolUse hook integration.
+
+---
+
+## [2026-05-01] M3 / Step 4.3.5 — subagent codeIndex inheritance
+
+Closes the D5 gap from slice 4.3.4: subagent children bypass
+`bootstrap.ts` (they receive a pre-validated session row +
+audit snapshot from the parent), so the bootstrap-level
+codeIndex init never ran for them. Every subagent run had
+`codeIndex=undefined` and the symbolic tools surfaced
+`index.unavailable` — defeating the point of registering them
+in `BUILTIN_TOOLS`.
+
+**Decisions:**
+
+- **D1 — Mirror bootstrap's eager-init pattern in
+  `subagent-child.ts`.** `CodeIndex.init` via the shared
+  `resolveProjectRoot(session.cwd)` helper. On failure: log
+  to stderr, leave `codeIndex` undefined, continue (graceful
+  degradation — the subagent still runs, symbolic tools
+  return `index.unavailable` per call).
+- **D2 — `codeIndex` declared at outer scope alongside
+  `heartbeatTimer`.** First draft put it inside the inner
+  try; the outer finally couldn't see it for cleanup. Fixed
+  by hoisting. Closed in the outer finally BEFORE `db.close`.
+- **D3 — Parent + subprocess subagent both open the same
+  per-project DB (per-project hash).** SQLite WAL mode allows
+  concurrent readers + one writer. Symbolic tool queries from
+  the subagent are reads — no concurrency issue. The
+  PostToolUse hook (slice 4.3.6.b) will need to think about
+  which process owns the writer when both edit files; not a
+  problem yet.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/cli/subagent-child.ts` | Eager `CodeIndex.init` via `resolveProjectRoot(session.cwd)`; spread into HarnessConfig; close in outer finally. |
+| `tests/cli/subagent-child.test.ts` | New test forces init failure via non-existent `session.cwd`; asserts stderr warning + `index.unavailable` constant + exit 0 (graceful degradation). |
+
+**Verification:** `bun test` 1650 pass / 10 skip / 0 fail at
+commit time; typecheck + lint clean. Smoke session
+unchanged.
+
+**Next:** M3 / Step 4.3.6.a — incremental scan function.
+
+---
+
 ## [2026-05-01] M3 / Step 4.3.4 — wire ToolContext.codeIndex in harness
 
 Closes the gap from slice 4.3.2: tools registered in

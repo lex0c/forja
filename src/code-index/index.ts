@@ -41,6 +41,7 @@ import {
   listSymbolsInFile,
   listTestsForSource,
 } from './repo.ts';
+import { type ScanFilesResult, scanFiles } from './scanner/incremental.ts';
 import { type ScanOptions, type ScanResult, scanProject } from './scanner/pipeline.ts';
 import type {
   FileMeta,
@@ -247,6 +248,25 @@ export class CodeIndex {
   ): Promise<ScanResult> {
     return scanProject(this.db, {
       ...opts,
+      projectRoot: opts.projectRoot ?? this.projectRoot,
+    });
+  }
+
+  // Incremental update path (CODE_INDEX.md §3.2). Re-indexes
+  // a specific set of files in place — no walker, no prune.
+  // Drops rows for paths that no longer pass the walker's
+  // filters (deleted / symlink / oversized / wrong extension).
+  // Skips parse when content_hash matches stored. Used by the
+  // harness's PostToolUse hook so write_file / edit_file don't
+  // leave the index stale mid-session. Resolver runs at the
+  // end, scoped to NULL targets only, so cost is dominated by
+  // the per-file parse.
+  async scanFiles(opts: {
+    paths: string[];
+    projectRoot?: string;
+  }): Promise<ScanFilesResult> {
+    return scanFiles(this.db, {
+      paths: opts.paths,
       projectRoot: opts.projectRoot ?? this.projectRoot,
     });
   }

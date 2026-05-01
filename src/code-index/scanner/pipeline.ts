@@ -25,18 +25,13 @@ import {
 } from '../repo.ts';
 import { resolveImports, resolveReferences } from '../resolver.ts';
 import type { FileMeta, FileParseStatus, Import, IndexSymbol, Reference } from '../types.ts';
+import { withScanLock } from './_lock.ts';
+import { CURRENT_SCHEMA_VERSION, countLines, sha256Hex } from './_util.ts';
 import { extractFromSource } from './extract.ts';
 import { parseSource } from './parser.ts';
 import { type WalkOptions, type WalkedFile, walkProject } from './walker.ts';
 
 const BATCH_SIZE = 100;
-
-// Schema version persisted on every file row. Must match the
-// latest migration's id (slice 4.3.0 ships migration 1). When a
-// migration bumps the schema in a way that invalidates parser
-// output (new field, kind expansion), files indexed under the
-// older value are rebuilt by `agent code-index rebuild`.
-const CURRENT_SCHEMA_VERSION = 1;
 
 export interface ScanOptions extends WalkOptions {
   // Hash of the resolved project config — when it changes, the
@@ -68,34 +63,6 @@ export interface ScanResult {
   importsResolved: number;
   referencesResolved: number;
 }
-
-// Hash a string with SHA-256 via Bun's CryptoHasher. Hex is
-// 64 chars — slightly bigger than base64's 44, but
-// case-insensitive and JSON-safe by default.
-const sha256Hex = (text: string): string => {
-  const h = new Bun.CryptoHasher('sha256');
-  h.update(text);
-  return h.digest('hex');
-};
-
-// Count logical lines. Convention matches `wc -l`-style "files
-// ending in newline have N lines" — a trailing newline closes
-// the last line, it doesn't open a new empty one. Examples:
-//   ''            → 0
-//   'foo'         → 1   (no newline; final line has no terminator)
-//   'foo\n'       → 1   (one closed line)
-//   'foo\nbar'    → 2
-//   'foo\nbar\n'  → 2
-const countLines = (text: string): number => {
-  if (text.length === 0) return 0;
-  let newlines = 0;
-  for (let i = 0; i < text.length; i++) {
-    if (text.charCodeAt(i) === 10) newlines++;
-  }
-  // If the file doesn't end in a newline, the trailing partial
-  // line still counts as a line.
-  return text.charCodeAt(text.length - 1) === 10 ? newlines : newlines + 1;
-};
 
 interface ScanFileOutcome {
   file: FileMeta;
@@ -185,21 +152,6 @@ type BatchSlot =
   | { ok: true; outcome: ScanFileOutcome }
   | { ok: false; path: string; error: string };
 
-// Per-DB serialization. Concurrent scans on the same DB
-// connection are unsafe: they share the connection's temporary
-// table (`_scan_seen`), so one scan's CREATE/DROP would knock
-// the other's path-set out from underneath it. The mutex
-// queues calls so they run end-to-end one at a time, even when
-// the caller awaits the same `idx.scan()` from multiple
-// places. Walker-only work (FS reads in walkProject) inside a
-// scan still runs in parallel within that single scan.
-//
-// WeakMap-keyed by DB so closing the DB releases the entry.
-// The stored promise is `.catch`-swallowed so a rejection in
-// scan N doesn't poison scan N+1 — the rejection still
-// propagates to N's caller via `ours`.
-const scanMutexes = new WeakMap<DB, Promise<unknown>>();
-
 // Run a full scan against `projectRoot`. Idempotent — every
 // indexed file is delete-then-inserted, so repeated runs
 // converge on the current FS state. Files that existed in a
@@ -212,27 +164,11 @@ const scanMutexes = new WeakMap<DB, Promise<unknown>>();
 // caller can re-run the scan after that lands without losing
 // data.
 //
-// Concurrent calls on the same DB are serialized via mutex —
-// see `scanMutexes` above.
-export const scanProject = async (db: DB, opts: ScanOptions): Promise<ScanResult> => {
-  const prior = scanMutexes.get(db) ?? Promise.resolve();
-  const ours = (async () => {
-    await prior.catch(() => {
-      // Swallow prior's failure — independent scans don't
-      // share fate. The rejection already propagated to its
-      // own caller; we just need to know prior is done.
-    });
-    return doScan(db, opts);
-  })();
-  // Park the catch-swallowed handle so the next caller's
-  // `await prior` resolves regardless of our outcome. The real
-  // outcome is returned to OUR caller via `ours`.
-  scanMutexes.set(
-    db,
-    ours.catch(() => {}),
-  );
-  return ours;
-};
+// Concurrent calls on the same DB are serialized via the
+// scan-lock helper — full scans and incremental scans queue
+// behind each other (see `_lock.ts` for rationale).
+export const scanProject = (db: DB, opts: ScanOptions): Promise<ScanResult> =>
+  withScanLock(db, () => doScan(db, opts));
 
 const doScan = async (db: DB, opts: ScanOptions): Promise<ScanResult> => {
   const { files, seenPaths, failedDirs } = await walkProject(opts);
