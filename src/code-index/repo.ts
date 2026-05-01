@@ -326,6 +326,111 @@ export const listSourcesForTest = (db: DB, testFile: string): TestMapping[] => {
   return rows.map(fromTestMappingRow);
 };
 
+// ---------- WRITES ----------
+//
+// Bulk inserts run inside a transaction at the call site (the
+// pipeline batches per ~100 files per CODE_INDEX.md §3.1). The
+// helpers below assume the caller has wrapped them; opening a
+// transaction here would prevent batching across files.
+
+// Insert OR replace a file row. Symbols/imports/references that
+// belong to the prior version of the file should be deleted by
+// the caller BEFORE upsert (the FK ON DELETE CASCADE only fires
+// on a real DELETE, not on REPLACE — REPLACE behaves as
+// DELETE + INSERT but cascades on the OLD row only when the
+// row is removed by REPLACE conflict resolution; we don't rely
+// on that subtlety and call deleteFile explicitly when
+// re-indexing).
+export const upsertFile = (db: DB, file: FileMeta): void => {
+  db.query(
+    `INSERT INTO files
+       (path, language, content_hash, size_bytes, loc,
+        last_modified_at, indexed_at, parse_status, parse_error,
+        index_schema_version)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(path) DO UPDATE SET
+       language             = excluded.language,
+       content_hash         = excluded.content_hash,
+       size_bytes           = excluded.size_bytes,
+       loc                  = excluded.loc,
+       last_modified_at     = excluded.last_modified_at,
+       indexed_at           = excluded.indexed_at,
+       parse_status         = excluded.parse_status,
+       parse_error          = excluded.parse_error,
+       index_schema_version = excluded.index_schema_version`,
+  ).run(
+    file.path,
+    file.language,
+    file.contentHash,
+    file.sizeBytes,
+    file.loc,
+    file.lastModifiedAt,
+    file.indexedAt,
+    file.parseStatus,
+    file.parseError,
+    file.indexSchemaVersion,
+  );
+};
+
+// Remove a file and cascade to its symbols/references/imports.
+// Used by the pipeline before a re-scan (delete-then-insert
+// keeps the old/new transition atomic when wrapped in a tx).
+export const deleteFile = (db: DB, path: string): void => {
+  db.query('DELETE FROM files WHERE path = ?').run(path);
+};
+
+// Bulk insert symbols. Caller passes rows without `id` — SQLite
+// auto-assigns. We don't return the assigned IDs because the
+// reference resolver (slice 4.3.3) re-queries by name + file
+// after the second pass, and the import graph stores
+// target_path strings rather than IDs. Per-call overhead is one
+// prepared statement reused; OK for batches of any size.
+export const insertSymbols = (db: DB, symbols: Omit<IndexSymbol, 'id'>[]): void => {
+  if (symbols.length === 0) return;
+  const stmt = db.query(
+    `INSERT INTO symbols
+       (file_path, name, fqn, kind, visibility, signature,
+        start_line, start_col, end_line, end_col, parent_symbol_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const s of symbols) {
+    stmt.run(
+      s.filePath,
+      s.name,
+      s.fqn,
+      s.kind,
+      s.visibility,
+      s.signature,
+      s.startLine,
+      s.startCol,
+      s.endLine,
+      s.endCol,
+      s.parentSymbolId,
+    );
+  }
+};
+
+// Bulk insert imports. `importedNames` is stored as JSON text
+// per the schema choice in slice 4.3.0 — keeps imports' shape
+// flexible (named/default/namespace as a uniform string array).
+export const insertImports = (db: DB, rows: Omit<Import, 'id'>[]): void => {
+  if (rows.length === 0) return;
+  const stmt = db.query(
+    `INSERT INTO imports
+       (source_file, target_path, target_module, imported_names, is_external)
+     VALUES (?, ?, ?, ?, ?)`,
+  );
+  for (const imp of rows) {
+    stmt.run(
+      imp.sourceFile,
+      imp.targetPath,
+      imp.targetModule,
+      JSON.stringify(imp.importedNames),
+      imp.isExternal ? 1 : 0,
+    );
+  }
+};
+
 // ---------- META ----------
 
 export const getMeta = (db: DB, key: string): string | null => {

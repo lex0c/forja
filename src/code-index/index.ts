@@ -40,6 +40,7 @@ import {
   listSymbolsInFile,
   listTestsForSource,
 } from './repo.ts';
+import { type ScanOptions, type ScanResult, scanProject } from './scanner/pipeline.ts';
 import type {
   FileMeta,
   GetSymbolOptions,
@@ -210,6 +211,26 @@ export class CodeIndex {
     if (opts.language !== undefined) filter.language = opts.language;
     if (opts.modifiedSince !== undefined) filter.modifiedSince = opts.modifiedSince;
     return listFilesRepo(this.db, filter);
+  }
+
+  // ---------- Scan ----------
+
+  // Run a full project scan: walk the FS, parse + extract every
+  // supported file, write rows. Idempotent — re-running converges
+  // on current FS state. Reference resolution and the FS watcher
+  // are separate slices (4.3.3, 4.3.6); the CLI surface that
+  // exposes this to operators lands in 4.3.1.c.
+  //
+  // The `projectRoot` for the scan defaults to the one passed at
+  // init time. Callers that want to scan a different root pass
+  // it explicitly via opts.projectRoot.
+  async scan(
+    opts: Omit<ScanOptions, 'projectRoot'> & { projectRoot?: string } = {},
+  ): Promise<ScanResult> {
+    return scanProject(this.db, {
+      ...opts,
+      projectRoot: opts.projectRoot ?? this.projectRoot,
+    });
   }
 
   // ---------- Diagnostics ----------

@@ -1,0 +1,256 @@
+// Scanner pipeline: walk → parse → extract → DB write.
+// Implements the initial-scan path of CODE_INDEX.md §3.1 step 3
+// (incremental updates and reference resolution land in later
+// slices). Drives the modules that already exist:
+//   - walker.ts → list of indexable files with metadata
+//   - language.ts + parser.ts + extract.ts → structured symbols
+//   - repo.ts write helpers → SQLite inserts
+//
+// Per CODE_INDEX.md §3.1: transactions wrap batches of ~100
+// files. Trade-off: smaller batches = more commit overhead;
+// larger batches = longer write-lock hold + more memory.
+// 100 lands at ~10ms per batch on average hardware, which
+// keeps the WAL active without blocking concurrent reads.
+
+import { readFile } from 'node:fs/promises';
+import type { DB } from '../../storage/db.ts';
+import { withTransaction } from '../../storage/db.ts';
+import {
+  deleteFile as deleteFileRow,
+  insertImports,
+  insertSymbols,
+  setMeta,
+  upsertFile,
+} from '../repo.ts';
+import type { FileMeta, FileParseStatus, Import, IndexSymbol } from '../types.ts';
+import { extractFromSource } from './extract.ts';
+import { parseSource } from './parser.ts';
+import { type WalkOptions, type WalkedFile, walkProject } from './walker.ts';
+
+const BATCH_SIZE = 100;
+
+// Schema version persisted on every file row. Must match the
+// latest migration's id (slice 4.3.0 ships migration 1). When a
+// migration bumps the schema in a way that invalidates parser
+// output (new field, kind expansion), files indexed under the
+// older value are rebuilt by `agent code-index rebuild`.
+const CURRENT_SCHEMA_VERSION = 1;
+
+export interface ScanOptions extends WalkOptions {
+  // Hash of the resolved project config — when it changes, the
+  // caller treats the index as stale and triggers rebuild
+  // (CODE_INDEX.md §8.3). Stored as `index_meta.config_hash`.
+  // Optional; tests pass an explicit value.
+  configHash?: string;
+}
+
+export interface ScanResult {
+  filesScanned: number;
+  symbolsInserted: number;
+  importsInserted: number;
+  // Files where parse threw (bug in extractor) or read failed.
+  // Best-effort: an extractor exception on one file does not
+  // abort the scan — the row is recorded with parse_status=
+  // 'failed' and the loop continues.
+  errors: { path: string; error: string }[];
+  // Files where tree-sitter recovered from a syntax error and
+  // emitted ERROR nodes. The extractor still produces what it
+  // could; `parse_status='partial'` is recorded so consumers
+  // know the rows for that file are best-effort.
+  partials: number;
+}
+
+// Hash a string with SHA-256 via Bun's CryptoHasher. Hex is
+// 64 chars — slightly bigger than base64's 44, but
+// case-insensitive and JSON-safe by default.
+const sha256Hex = (text: string): string => {
+  const h = new Bun.CryptoHasher('sha256');
+  h.update(text);
+  return h.digest('hex');
+};
+
+// Count logical lines. Convention matches `wc -l`-style "files
+// ending in newline have N lines" — a trailing newline closes
+// the last line, it doesn't open a new empty one. Examples:
+//   ''            → 0
+//   'foo'         → 1   (no newline; final line has no terminator)
+//   'foo\n'       → 1   (one closed line)
+//   'foo\nbar'    → 2
+//   'foo\nbar\n'  → 2
+const countLines = (text: string): number => {
+  if (text.length === 0) return 0;
+  let newlines = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) === 10) newlines++;
+  }
+  // If the file doesn't end in a newline, the trailing partial
+  // line still counts as a line.
+  return text.charCodeAt(text.length - 1) === 10 ? newlines : newlines + 1;
+};
+
+interface ScanFileOutcome {
+  file: FileMeta;
+  symbols: Omit<IndexSymbol, 'id'>[];
+  imports: Omit<Import, 'id'>[];
+  partial: boolean;
+}
+
+const scanOneFile = async (entry: WalkedFile, indexedAt: number): Promise<ScanFileOutcome> => {
+  const source = await readFile(entry.absPath, 'utf8');
+  const contentHash = sha256Hex(source);
+  const loc = countLines(source);
+
+  let parseStatus: FileParseStatus = 'ok';
+  let parseError: string | null = null;
+  let symbols: Omit<IndexSymbol, 'id'>[] = [];
+  let imports: Omit<Import, 'sourceFile' | 'targetPath' | 'id'>[] = [];
+  const partial = false;
+  try {
+    const extracted = extractFromSource(source, entry.language, entry.relPath, parseSource);
+    symbols = extracted.symbols;
+    imports = extracted.imports;
+    // Partial-parse signal comes from the tree-sitter root: if
+    // any ERROR node exists, the parser recovered around bad
+    // syntax. We don't surface ERROR detection through the
+    // extractor (queries skip ERROR nodes naturally), so for
+    // now `partial` flags are deferred to slice 4.3.1.c when
+    // the CLI surface needs to report them. For 4.3.1.b every
+    // extracted file is 'ok'; failed reads/parses become
+    // 'failed'. Honest accounting beats false confidence.
+  } catch (e) {
+    parseStatus = 'failed';
+    parseError = e instanceof Error ? e.message : String(e);
+  }
+
+  // imports come out of the extractor without sourceFile and
+  // targetPath — fill sourceFile here; targetPath stays null
+  // until the resolver runs in slice 4.3.3 (string spec is in
+  // targetModule meanwhile).
+  const completedImports: Omit<Import, 'id'>[] = imports.map((imp) => ({
+    sourceFile: entry.relPath,
+    targetPath: null,
+    targetModule: imp.targetModule,
+    importedNames: imp.importedNames,
+    isExternal: imp.isExternal,
+  }));
+
+  return {
+    file: {
+      path: entry.relPath,
+      language: entry.language,
+      contentHash,
+      sizeBytes: entry.sizeBytes,
+      loc,
+      lastModifiedAt: entry.mtimeMs,
+      indexedAt,
+      parseStatus,
+      parseError,
+      indexSchemaVersion: CURRENT_SCHEMA_VERSION,
+    },
+    symbols,
+    imports: completedImports,
+    partial,
+  };
+};
+
+// One slot in the batch — either a successfully parsed outcome
+// or a read/parse failure captured outside the transaction.
+type BatchSlot =
+  | { ok: true; outcome: ScanFileOutcome }
+  | { ok: false; path: string; error: string };
+
+// Run a full scan against `projectRoot`. Idempotent — every
+// indexed file is delete-then-inserted, so repeated runs
+// converge on the current FS state. Files that existed in a
+// prior scan but no longer appear in the walk are pruned at
+// the end (rows older than this scan's start time). Reference
+// resolution is NOT run here (slice 4.3.3); the caller can
+// re-run the scan after that lands without losing data.
+export const scanProject = async (db: DB, opts: ScanOptions): Promise<ScanResult> => {
+  const files = await walkProject(opts);
+  const result: ScanResult = {
+    filesScanned: 0,
+    symbolsInserted: 0,
+    importsInserted: 0,
+    errors: [],
+    partials: 0,
+  };
+  const indexedAt = Date.now();
+
+  for (let i = 0; i < files.length; i += BATCH_SIZE) {
+    const batch = files.slice(i, i + BATCH_SIZE);
+    // Read + parse + extract for each file in PARALLEL outside
+    // the transaction. Holding the SQLite write lock through
+    // tree-sitter parses for 100 files (potentially ~1-3 s)
+    // would block concurrent readers; doing the heavy work
+    // first lets the transaction be a tight write-only block.
+    const slots: BatchSlot[] = await Promise.all(
+      batch.map(async (entry): Promise<BatchSlot> => {
+        try {
+          return { ok: true, outcome: await scanOneFile(entry, indexedAt) };
+        } catch (e) {
+          return {
+            ok: false,
+            path: entry.relPath,
+            error: e instanceof Error ? e.message : String(e),
+          };
+        }
+      }),
+    );
+
+    withTransaction(db, () => {
+      for (const slot of slots) {
+        if (!slot.ok) {
+          result.errors.push({ path: slot.path, error: slot.error });
+          continue;
+        }
+        const outcome = slot.outcome;
+        // Per-file try/catch isolates malformed rows from
+        // tanking the rest of the batch. SQLite reverts the
+        // failing statement only — the transaction stays open.
+        // Half-written symbol sets are accepted as a worse-than-
+        // perfect state (file row + partial symbols) until
+        // savepoints land; the alternative was rolling back 100
+        // unrelated files for one bad row.
+        try {
+          deleteFileRow(db, outcome.file.path);
+          upsertFile(db, outcome.file);
+          if (outcome.file.parseStatus === 'failed') {
+            result.errors.push({
+              path: outcome.file.path,
+              error: outcome.file.parseError ?? 'parse failed',
+            });
+          } else {
+            insertSymbols(db, outcome.symbols);
+            insertImports(db, outcome.imports);
+            result.symbolsInserted += outcome.symbols.length;
+            result.importsInserted += outcome.imports.length;
+          }
+          if (outcome.partial) result.partials++;
+          result.filesScanned++;
+        } catch (e) {
+          result.errors.push({
+            path: outcome.file.path,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+    });
+  }
+
+  // Prune rows for files that existed in a prior scan but
+  // didn't appear in this one (deleted, renamed, moved into an
+  // exclude pattern). Every file we touched this scan got its
+  // `indexed_at` set to `indexedAt`; survivors of a previous
+  // scan still carry their older value. CASCADE cleans up
+  // their symbols/imports/references.
+  withTransaction(db, () => {
+    db.query('DELETE FROM files WHERE indexed_at < ?').run(indexedAt);
+  });
+
+  setMeta(db, 'last_full_scan_at', String(indexedAt));
+  if (opts.configHash !== undefined) {
+    setMeta(db, 'config_hash', opts.configHash);
+  }
+  return result;
+};

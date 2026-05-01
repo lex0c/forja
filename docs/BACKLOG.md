@@ -15,6 +15,83 @@ Format:
 
 ---
 
+## [2026-05-01] M3 / Step 4.3.1.b — FS walker + scanner pipeline + DB writes
+
+The 4.3.1.a slice landed `extractFromSource(source, language, path)`
+returning structured `IndexSymbol[]` + `Import[]` from a string. To go
+end-to-end, this slice adds: a walker that lists indexable files
+under a project root, a pipeline that wires walker → parser → extract
+→ DB inserts, write helpers in `repo.ts`, and the `CodeIndex.scan()`
+public method. After this slice, `agent` can populate `code_index.db`
+from a real project tree — the CLI surface to trigger it lands in
+4.3.1.c.
+
+Reference resolution (slice 4.3.3), incremental updates (slice 4.3.6),
+and the FS watcher (also 4.3.6) are intentionally NOT in scope here.
+The pipeline is the full-rebuild path of CODE_INDEX.md §3.1; §3.2/§3.3
+get their own sub-slices once the basic flow is proven.
+
+**Decisions:**
+
+- **D1 — `.gitignore` via `git ls-files --cached --others --exclude-standard`.**
+  Reimplementing gitignore semantics (negation, nested files, attribute
+  pinning) is a known mistake — ripgrep, fd, and tree-sitter-cli all
+  delegate to git. Subprocess overhead is ~5-15ms which fits in the
+  ~500ms budget for 3k files. Falls back to manual fs.readdir walk when
+  not a git repo or git binary unavailable.
+- **D2 — `content_hash` via SHA-256 hex.** Bun's `CryptoHasher('sha256')`
+  ships with the runtime; no extra dep. Hex (64 chars) over base64 (44)
+  for case-insensitivity and JSON-safety; storage cost negligible vs
+  the row's other columns. BLAKE3 would be ~3× faster but isn't in
+  Bun's std lib and the hash is computed once per file per scan, so
+  perf is a non-issue.
+- **D3 — Transactions of 100 files.** Per CODE_INDEX.md §3.1 spec.
+  Smaller batches = more commit overhead; larger = longer write-lock
+  hold + more memory in Bun's WAL buffer. ~10ms per batch in practice.
+- **D4 — `delete-then-insert` for re-scans, not `INSERT OR REPLACE`.**
+  REPLACE doesn't fire FK ON DELETE CASCADE for the OLD row in all
+  SQLite versions. To guarantee symbols/imports/references are wiped
+  before the new file row goes in, the pipeline calls `deleteFile()`
+  first, then `upsertFile()`. Inside the same transaction, so observers
+  see the atomic switch.
+- **D5 — `parse_status='partial'` deferred to slice 4.3.1.c.**
+  tree-sitter is permissive: invalid syntax produces ERROR nodes in
+  the tree but the extractor still pulls valid constructs around them.
+  Detecting partial-parse requires walking the tree for ERROR nodes;
+  CLI surface needs to surface the count anyway, so coupling the two
+  changes is more economical. For 4.3.1.b every successful extract is
+  `parse_status='ok'`; read/extractor failures are `parse_status='failed'`.
+- **D6 — No reference resolution.** Imports get `target_path = null`
+  on insert (resolver in slice 4.3.3 fills it). References table stays
+  empty until 4.3.3 too.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/code-index/scanner/walker.ts` | NEW — `walkProject(opts): Promise<WalkedFile[]>`. Tries `git ls-files --cached --others --exclude-standard -z` first; falls back to `fs.readdir` recursion when git fails. Applies `CODE_INDEX_DEFAULT_EXCLUDES + additionalExcludes` via Bun.Glob. Drops files with unsupported extensions, files > 5MB, non-regular files. Returns `{ relPath, absPath, sizeBytes, mtimeMs, language }`. |
+| `src/code-index/scanner/pipeline.ts` | NEW — `scanProject(db, opts): Promise<ScanResult>`. Walks → for each file: read, sha256 hash, line count, extract → batches inserts in transactions of 100. Records `parse_status='failed'` when extractor throws (best-effort: failure on one file doesn't abort the scan). Writes `last_full_scan_at` + optional `config_hash` to `index_meta` at the end. |
+| `src/code-index/repo.ts` | EXTENDED — `upsertFile`, `deleteFile`, `insertSymbols`, `insertImports`. Bulk inserts run inside caller's transaction (no implicit BEGIN); the pipeline batches at the right granularity. |
+| `src/code-index/index.ts` | NEW method `CodeIndex.scan(opts)` → delegates to `scanProject`. Defaults `projectRoot` to the value passed at `init()`; tests override per-call. |
+| `tests/code-index/walker.test.ts` | NEW — 8 tests: extension filter, default excludes, additional excludes, size cap, gitignore (with real `git init`), non-git fallback, non-regular files, mtime population. |
+| `tests/code-index/pipeline.test.ts` | NEW — 7 tests: end-to-end small project, empty file → status='ok' / loc=0, idempotent re-scan, file content change drops old symbols, content_hash format + loc + sizeBytes, last_full_scan_at meta, default excludes integration. |
+
+**Pending:**
+
+- `parse_status='partial'` detection (slice 4.3.1.c bundles with CLI).
+- Progress reporting / observer pattern (CLI needs it).
+- Reference resolution → slice 4.3.3.
+- Incremental update + FS watcher → slice 4.3.6.
+
+**Verification:** `bun test` 1522 pass / 10 skip / 0 fail (+15 new
+across walker + pipeline); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** M3 / Step 4.3.1.c — CLI surface (`agent code-index scan`,
+`status`, `rebuild`) + partial-parse detection + smoke tests against
+the Forja repo itself.
+
+---
+
 ## [2026-05-01] M3 / Step 4.3.1.a — TS/JS parser core (tree-sitter)
 
 The 4.3.0 foundation slice landed schema + Query API surface but no parser
