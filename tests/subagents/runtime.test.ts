@@ -1057,47 +1057,37 @@ describe('runSubagent — orchestration', () => {
     }
   });
 
-  test('4.2b.iv: reaper skips SIGKILL when PID was recycled (cmdline mismatch)', async () => {
-    // Race the slice's review surfaced: SIGTERM exits the
-    // process; the kernel recycles the PID to an unrelated
-    // workload during the 500ms grace; an unconditional
-    // SIGKILL would then target the wrong process. The reaper
-    // verifies via /proc/<pid>/cmdline before SIGKILL — the
-    // recorded command's first-token basename must still match
-    // argv[0]'s basename. We simulate the race by recording a
-    // bg row with a PID that points at the test runner itself
-    // (very much alive) but a recorded command that doesn't
-    // match. The reaper SHOULD skip the SIGKILL — if it
-    // didn't, our test runner would die.
+  test('4.2b.iv: reaper skips BOTH passes when recorded command mismatches live PID (recycle defense)', async () => {
+    // Race the slice's review surfaced: between row insert and
+    // reaper, the kernel can recycle a PID to an unrelated
+    // workload (process exited, PID handed out to something
+    // else). Both passes — SIGTERM and SIGKILL — must verify
+    // identity before signaling, otherwise the reaper kills
+    // unrelated processes on the host. We simulate the race
+    // by recording a bg row with a PID that points at a real
+    // live process (`sleep 60`) but a recorded command that
+    // doesn't match. The reaper SHOULD skip both signals; the
+    // sleep stays alive throughout the run. We verify by
+    // probing the PID after runSubagent returns.
     const parentCwd = mkdtempSync(join(tmpdir(), 'forja-rt-bg-recycle-'));
+    let sleepProc: ReturnType<typeof Bun.spawn> | undefined;
     try {
       const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
         model: 'mock/m',
         cwd: parentCwd,
       });
       const bgRepo = await import('../../src/storage/repos/bg-processes.ts');
-      // Use the test runner's PID. After the SIGTERM (which
-      // process.kill(myPid, 'SIGTERM') would normally kill the
-      // test process), Bun catches it in test mode... actually
-      // no, SIGTERM to ourselves is dangerous. Use a PID for
-      // a DIFFERENT real process: a sleep we spawn, but record
-      // a command that doesn't match. After SIGTERM (which
-      // does kill the sleep), the reaper rechecks cmdline —
-      // the actual cmdline says "sleep" but we recorded
-      // "totally-different-command", so SIGKILL is skipped.
-      // We then verify the row was still marked killed (we
-      // DID send SIGTERM to the right process originally).
-      const sleepProc = Bun.spawn({ cmd: ['sleep', '60'], stdout: 'pipe', stderr: 'pipe' });
+      sleepProc = Bun.spawn({ cmd: ['sleep', '60'], stdout: 'pipe', stderr: 'pipe' });
+      const recordedPid = sleepProc.pid;
       const recyclingSpawn: SpawnChildProcess = (opts) => {
         bgRepo.insertBgProcess(db, {
           sessionId: opts.sessionId,
-          osPid: sleepProc.pid,
+          osPid: recordedPid,
           // Mismatch on purpose: argv0 of the live process is
           // 'sleep', but we record 'fake-different-binary'.
-          // The reaper's first pass (SIGTERM) sends the signal
-          // unconditionally; the second pass (SIGKILL) sees
-          // cmdline='sleep' vs recorded='fake-different-binary',
-          // basenames don't match → skip.
+          // Both passes' isStillSameProcess check sees
+          // cmdline basename 'sleep' vs recorded
+          // 'fake-different-binary' → skip both signals.
           command: 'fake-different-binary --arg',
           cwd: opts.cwd,
           stdoutLogPath: '/tmp/fake-stdout.log',
@@ -1109,18 +1099,6 @@ describe('runSubagent — orchestration', () => {
           kill: () => undefined,
         };
       };
-      // Track whether SIGKILL hit the sleep PID. If the reaper
-      // skipped SIGKILL (correct), the sleep would still be
-      // alive ONLY if SIGTERM didn't kill it (sleep handles
-      // SIGTERM with default = exit). So the sleep dies from
-      // SIGTERM regardless. To prove the SIGKILL skip path, we
-      // need a different angle: mark the row's command BEFORE
-      // SIGTERM runs so even SIGTERM is targeted by mismatch
-      // logic — but we don't gate SIGTERM on cmdline match,
-      // intentionally (window is microseconds, race
-      // unrealistic). So this test really exercises the SIGKILL
-      // skip; we observe via the side-effect that
-      // markRunningAsKilled still flipped the row.
       await runSubagent({
         definition: definition(),
         prompt: 'go',
@@ -1132,15 +1110,27 @@ describe('runSubagent — orchestration', () => {
         cwd: parentCwd,
         spawnChildProcess: recyclingSpawn,
       });
-      // sleep died from SIGTERM (sleep handles it as exit).
-      await sleepProc.exited;
-      // Row was marked killed by markRunningAsKilled — that
-      // step doesn't depend on SIGKILL succeeding.
-      const rows = bgRepo.listBgProcessesBySession(db, parent.id);
-      // Filter to rows for the child session (we don't have its
-      // ID directly here, but listBgProcessesBySession returns
-      // empty for the parent and we want the child's). Easier:
-      // query all rows whose status is killed and assert >= 1.
+
+      // CRITICAL ASSERTION: the sleep is still alive. If
+      // either pass had ignored the mismatch, our SIGTERM
+      // (default=exit for sleep) or SIGKILL would have ended
+      // it. Identity gate held → process untouched.
+      let alive = false;
+      try {
+        process.kill(recordedPid, 0);
+        alive = true;
+      } catch {
+        alive = false;
+      }
+      expect(alive).toBe(true);
+
+      // The DB row STILL flips to 'killed' because
+      // markRunningAsKilled is unconditional (audit reflects
+      // "we tried to terminate the run"). Operator sees the
+      // row as terminal; if they cross-reference and find a
+      // live PID, they know to investigate manually. The
+      // alternative (leaving it 'running' forever) would be
+      // worse — orphan rows pile up indefinitely.
       const session = (await import('../../src/storage/repos/sessions.ts')).listChildSessions(
         db,
         parent.id,
@@ -1152,9 +1142,16 @@ describe('runSubagent — orchestration', () => {
         expect(childRows.length).toBe(1);
         expect(childRows[0]?.status).toBe('killed');
       }
-      // Defensive: confirm parent rows didn't get touched.
-      expect(rows).toEqual([]);
     } finally {
+      // Manually clean up the sleep (the reaper correctly
+      // refused to touch it).
+      if (sleepProc !== undefined) {
+        try {
+          sleepProc.kill('SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
       rmSync(parentCwd, { recursive: true, force: true });
     }
   });

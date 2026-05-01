@@ -489,12 +489,24 @@ const reapChildBgProcesses = async (db: DB, sessionId: string): Promise<void> =>
     return;
   }
   if (running.length === 0) return;
-  // SIGTERM every PID first so they can flush. We accept that
-  // some may already be dead (race between child exit reaping
-  // grandchildren and our query); ESRCH from process.kill on
-  // a dead PID is expected and ignored.
+  // SIGTERM every PID — but ONLY after verifying that the PID
+  // still points at the process we recorded at spawn time. The
+  // DB row's `os_pid` was captured when the bg manager spawned
+  // the process; from there to here we crossed the entire
+  // lifetime of the run (potentially many seconds or minutes).
+  // The original process may have exited, and the kernel may
+  // have recycled the PID to an unrelated workload. Without the
+  // identity check we'd SIGTERM that innocent workload.
+  //
+  // The first review pass on this slice mistakenly only gated
+  // the SIGKILL loop, on the (incorrect) reasoning that the
+  // SIGTERM snapshot was microseconds fresh. It isn't — the
+  // snapshot is the spawn-time PID, and the window stretches
+  // over the entire bg row's lifetime. Both passes need the
+  // same `isStillSameProcess` guard.
   for (const proc of running) {
     if (proc.osPid === null) continue;
+    if (!isStillSameProcess(proc.osPid, proc.command)) continue;
     try {
       process.kill(proc.osPid, 'SIGTERM');
     } catch {
