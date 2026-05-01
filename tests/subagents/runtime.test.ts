@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   readdirSync,
   rmSync,
   symlinkSync,
@@ -1124,13 +1125,12 @@ describe('runSubagent — orchestration', () => {
       }
       expect(alive).toBe(true);
 
-      // The DB row STILL flips to 'killed' because
-      // markRunningAsKilled is unconditional (audit reflects
-      // "we tried to terminate the run"). Operator sees the
-      // row as terminal; if they cross-reference and find a
-      // live PID, they know to investigate manually. The
-      // alternative (leaving it 'running' forever) would be
-      // worse — orphan rows pile up indefinitely.
+      // The DB row STAYS 'running' because identity didn't
+      // match (mismatch result). Previous design unconditionally
+      // flipped it to 'killed' which lied — the process is
+      // demonstrably alive. Honest audit: row stays as-is so
+      // the operator's `bg list` shows it and they can
+      // investigate via OS tools.
       const session = (await import('../../src/storage/repos/sessions.ts')).listChildSessions(
         db,
         parent.id,
@@ -1140,7 +1140,7 @@ describe('runSubagent — orchestration', () => {
       if (childId !== undefined) {
         const childRows = bgRepo.listBgProcessesBySession(db, childId);
         expect(childRows.length).toBe(1);
-        expect(childRows[0]?.status).toBe('killed');
+        expect(childRows[0]?.status).toBe('running');
       }
     } finally {
       // Manually clean up the sleep (the reaper correctly
@@ -1463,6 +1463,118 @@ describe('runSubagent — orchestration', () => {
       if (liveSleep !== undefined) {
         try {
           liveSleep.kill('SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
+      rmSync(parentCwd, { recursive: true, force: true });
+    }
+  });
+
+  test('4.2b.iv: exec-replace mismatch leaves row running + bgLogDir preserved (regression)', async () => {
+    // Regression for review #9: a recorded `exec sleep 60` runs
+    // through bash -c, the `exec` builtin replaces the bash
+    // process with sleep, and now argv[0]='sleep' instead of
+    // bash. The bash-wrapper match doesn't apply, the
+    // direct-spawn match fails on token count (`exec sleep 60`
+    // has 3 tokens, live argv has 2), result is 'mismatch'.
+    //
+    // Old behavior: skipped both signals (correct) but
+    // `markRunningAsKilled` flipped the row to 'killed'
+    // anyway (audit lie) AND the runSubagent re-query saw 0
+    // running rows so the bgLogDir was rmSync'd (process still
+    // writing to phantom FDs).
+    //
+    // New behavior: row stays 'running', re-query sees the
+    // mismatch row, rmSync skipped, dir preserved for
+    // operator investigation.
+    const parentCwd = mkdtempSync(join(tmpdir(), 'forja-rt-bg-exec-'));
+    let bashProc: ReturnType<typeof Bun.spawn> | undefined;
+    try {
+      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+        model: 'mock/m',
+        cwd: parentCwd,
+      });
+      const bgRepo = await import('../../src/storage/repos/bg-processes.ts');
+      const recordedCommand = 'exec sleep 60';
+      const execReplaceSpawn: SpawnChildProcess = (opts) => {
+        // Mirror what the bg manager would do: bash -c with
+        // the user command. The `exec` causes the bash
+        // process to replace itself with sleep, so the live
+        // PID's argv[0] becomes 'sleep' instead of 'bash'.
+        bashProc = Bun.spawn({
+          cmd: ['bash', '-c', recordedCommand],
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        // Block synchronously until bash has actually exec'd
+        // into sleep. Without this wait, the test races: the
+        // reaper may catch bash mid-parse with argv[0]='bash'
+        // and argv[2]=recordedCommand (a perfect match), kill
+        // it before exec completes, and exercise the WRONG
+        // code path. /proc reads are blocking I/O — the loop
+        // paces itself naturally without needing a sleep
+        // primitive (Bun has no sync sleep). 2s ceiling is
+        // generous; bash-into-sleep typically takes <10ms.
+        const waitStart = Date.now();
+        while (Date.now() - waitStart < 2000) {
+          try {
+            const cmdline = readFileSync(`/proc/${bashProc.pid}/cmdline`, 'utf8');
+            const argv0Basename = (cmdline.split('\0')[0] ?? '').split('/').pop() ?? '';
+            if (argv0Basename === 'sleep') break;
+          } catch {
+            // /proc gone (process exited unexpectedly) — bail
+            // out of the wait; the test will fail on a
+            // separate assertion if this is bad.
+            break;
+          }
+        }
+        bgRepo.insertBgProcess(db, {
+          sessionId: opts.sessionId,
+          osPid: bashProc.pid,
+          command: recordedCommand,
+          cwd: opts.cwd,
+          stdoutLogPath: '/tmp/fake-stdout.log',
+          stderrLogPath: '/tmp/fake-stderr.log',
+        });
+        // Mimic the bg manager creating its log directory so
+        // the rmSync skip path has something to preserve.
+        if (opts.bgLogDir !== undefined) {
+          mkdirSync(opts.bgLogDir, { recursive: true });
+          writeFileSync(join(opts.bgLogDir, `${bashProc.pid}.log`), 'live\n');
+        }
+        insertSubagentOutput(db, { sessionId: opts.sessionId });
+        return {
+          exited: Promise.resolve({ exitCode: 137 }),
+          kill: () => undefined,
+        };
+      };
+
+      const result = await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: parentCwd,
+        spawnChildProcess: execReplaceSpawn,
+      });
+
+      // Row stays 'running' — mismatch outcome doesn't flip
+      // it to 'killed'.
+      const childRows = bgRepo.listBgProcessesBySession(db, result.sessionId);
+      expect(childRows.length).toBe(1);
+      expect(childRows[0]?.status).toBe('running');
+
+      // bgLogDir preserved because re-query saw a running row.
+      const expectedDir = `${parentCwd}/.agent/bg/subagents/${result.sessionId}`;
+      expect(existsSync(expectedDir)).toBe(true);
+    } finally {
+      if (bashProc !== undefined) {
+        try {
+          bashProc.kill('SIGKILL');
         } catch {
           // already gone
         }

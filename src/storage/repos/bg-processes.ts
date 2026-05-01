@@ -238,3 +238,25 @@ export const markRunningAsKilled = (db: DB, sessionId: string): number => {
     .run(now, sessionId);
   return Number(result.changes);
 };
+
+// Mark a single still-running row as killed. Used by callers that
+// need per-row control over which audit rows flip to terminal —
+// e.g. the subagent reaper, which kills only the rows whose PID
+// identity it could verify, and intentionally leaves rows where
+// identity was unverifiable as 'running' for the operator to
+// investigate. The `status='running'` guard makes the call
+// idempotent: a row that already terminated (via the bg
+// manager's own exit watcher, or a previous reap) stays put.
+// Returns true if the row was flipped, false if it was already
+// terminal (or doesn't exist).
+export const markBgProcessAsKilled = (db: DB, id: string): boolean => {
+  const now = Date.now();
+  const result = db
+    .query(
+      `UPDATE background_processes
+       SET status = 'killed', exited_at = ?
+       WHERE id = ? AND status = 'running'`,
+    )
+    .run(now, id);
+  return Number(result.changes) > 0;
+};

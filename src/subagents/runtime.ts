@@ -12,7 +12,7 @@ import {
   insertSubagentRun,
   insertSubagentWorktree,
   listBgProcessesBySession,
-  markRunningAsKilled,
+  markBgProcessAsKilled,
 } from '../storage/index.ts';
 import { type ToolRegistry, createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import type { SubagentSet } from './load.ts';
@@ -419,58 +419,67 @@ const WALL_CLOCK_GRACE_MS = 5_000;
 // doesn't dominate cleanup latency.
 const BG_REAP_GRACE_MS = 500;
 
-// Verify that PID is still the process we recorded at spawn time
-// before sending a signal. PIDs can be recycled by the kernel
-// between when the bg row was inserted (during the run) and
-// when the reaper queries the DB (after the child exits) — on
-// a busy host that window is wide enough for the original
-// process to exit and its PID be handed to an unrelated workload.
-// Without verification, the reaper would friendly-fire the
-// recycled process.
+// Tri-state result for the PID identity check. The reaper needs
+// to distinguish three outcomes that the previous boolean
+// signature collapsed:
 //
-// Two real-world shapes for the live argv:
-//
-//   1. Bash-wrapper (production path). The bg manager spawns
-//      via `bash -c "<user command>"` so argv[0]='bash',
-//      argv[1]='-c', argv[2]=the recorded command verbatim.
-//      We compare argv[2] to the trimmed expectedCommand —
-//      exact match because both sides come from the same
-//      input string the bg manager passed through.
-//
-//   2. Direct spawn (tests, programmatic callers that bypass
-//      the bg manager). argv[0] is the executable's path; we
-//      basename-match it against the recorded command's first
-//      whitespace token. Tolerates `/usr/bin/sleep` ↔ `sleep`.
-//
-// Linux-only: reads `/proc/<pid>/cmdline`. macOS doesn't
-// expose /proc the same way; if we ever support it, this
-// check needs a platform branch (likely `ps -p <pid> -o command=`).
-//
-// Read errors (ENOENT for a vanished pid, EACCES for a process
-// owned by another user) skip the kill — defaulting to safety.
-const isStillSameProcess = (pid: number, expectedCommand: string): boolean => {
+//   match     — PID still belongs to the recorded process; safe
+//               to signal AND to mark the row as 'killed' once
+//               the kill is sent.
+//   gone      — /proc/<pid>/cmdline ENOENT (process exited) or
+//               returned an empty cmdline (zombie / kernel
+//               thread). The original process is demonstrably
+//               no longer running. Don't signal (no-op anyway),
+//               BUT mark the row 'killed' — audit reflects the
+//               truth that the process is gone.
+//   mismatch  — PID exists but the cmdline doesn't match the
+//               recorded shape. Could be (a) PID recycled to an
+//               unrelated workload, (b) `exec sleep 60` style
+//               where the original bash-wrapped process replaced
+//               itself and now argv[0]='sleep' instead of bash,
+//               (c) read failure with EACCES (setuid drop).
+//               In every case we DON'T know whether OUR process
+//               is still alive somewhere; conservatively skip
+//               the signal AND skip the marker so the row stays
+//               'running' and the operator can investigate.
+type IdentityResult = 'match' | 'gone' | 'mismatch';
+
+// Linux-only: reads `/proc/<pid>/cmdline`. The reaper guards
+// `process.platform === 'linux'` upstream, so this helper is
+// only called on Linux. macOS doesn't expose /proc the same
+// way; supporting it would need a platform branch (likely
+// `ps -p <pid> -o command=`).
+const checkPidIdentity = (pid: number, expectedCommand: string): IdentityResult => {
   let cmdlineRaw: string;
   try {
     cmdlineRaw = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
-  } catch {
-    return false;
+  } catch (e) {
+    // ENOENT on /proc/<pid>/cmdline means the process exited
+    // and the kernel reaped its proc directory — the recorded
+    // process IS gone, audit row should flip terminal.
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return 'gone';
+    // EACCES (setuid'd) or any other I/O error: we can't
+    // verify. Conservative: treat as mismatch so we DON'T
+    // claim termination of a process whose state we don't
+    // know.
+    return 'mismatch';
   }
   if (cmdlineRaw.length === 0) {
-    // Kernel thread or zombie with no cmdline. Bg processes
+    // Empty cmdline = kernel thread or zombie. Bg processes
     // we spawn always have argv; an empty result means the
-    // PID is no longer one of ours.
-    return false;
+    // process has exited (zombie awaiting reap) — same audit
+    // semantics as ENOENT.
+    return 'gone';
   }
   // /proc cmdline is NUL-separated. The terminating NUL after
   // the last argument produces a trailing empty element when we
   // split; drop only that trailing one (intermediate empty args
   // are rare but legal — preserving them keeps the index math
-  // honest). NOT a global filter, which would shift indices and
-  // hide intermediate args.
+  // honest).
   const argv = cmdlineRaw.split('\0');
   if (argv.length > 0 && argv[argv.length - 1] === '') argv.pop();
-  if (argv.length === 0) return false;
-  if (expectedCommand.length === 0) return false;
+  if (argv.length === 0) return 'gone';
+  if (expectedCommand.length === 0) return 'mismatch';
   const argv0Basename = (argv[0] ?? '').split('/').pop() ?? '';
 
   // Bash-wrapper case (production): bg manager runs every
@@ -479,15 +488,22 @@ const isStillSameProcess = (pid: number, expectedCommand: string): boolean => {
   // field stores, because the bg manager passes input.command
   // verbatim into both bash and the DB. Trim / whitespace
   // normalization here would falsely reject legitimate commands
-  // that carry meaningful whitespace (a heredoc body, a
-  // recorded trailing newline, an indented multi-line snippet).
-  // The match must be exact.
+  // that carry meaningful whitespace.
+  //
+  // NOTE on `exec` usage: a command like `exec sleep 60` causes
+  // bash to replace itself with sleep, so argv[0] becomes
+  // `sleep` and the bash-wrapper match here doesn't apply.
+  // Falls through to direct-spawn path; if recorded tokens
+  // don't match (`exec` token absent in live argv), returns
+  // mismatch. The row stays 'running' and the operator
+  // investigates. Conservative is correct here — we genuinely
+  // don't know if the post-exec process is still running.
   if (
     (argv0Basename === 'bash' || argv0Basename === 'sh') &&
     argv[1] === '-c' &&
     argv.length >= 3
   ) {
-    return argv[2] === expectedCommand;
+    return argv[2] === expectedCommand ? 'match' : 'mismatch';
   }
 
   // Direct-spawn case: argv[0] is the executable. Used by
@@ -497,38 +513,30 @@ const isStillSameProcess = (pid: number, expectedCommand: string): boolean => {
   // whitespace, and a leading space would otherwise produce
   // an empty first token.
   //
-  // Comparing only argv[0]'s basename (the original shape of
-  // this branch) was too weak: a recycled PID that happens to
-  // belong to another invocation of the same binary with
-  // different args (e.g. recorded `sleep 60` recycled into
-  // `sleep 30`) would falsely match and earn SIGKILL. We now
-  // compare ALL tokens:
-  //   - argv length must equal the tokenized recorded length
-  //   - argv[0]'s basename must match recorded token 0's
-  //     basename (handles `/usr/bin/sleep` ↔ `sleep`)
-  //   - argv[i] === recorded[i] for every subsequent index
+  // Compare ALL tokens: argv length, argv[0] basename, then
+  // each subsequent token verbatim. Earlier basename-only
+  // comparison was too weak — a recycled PID landing on
+  // `sleep 30` would falsely match recorded `sleep 60`.
   //
   // Limitation: tokenization is naive whitespace split, so
-  // quoted args don't round-trip (a recorded `cmd "with
-  // space"` would split into 3 tokens but the live argv has
-  // 2). For direct-spawn callers that need quoting fidelity,
-  // route through bash-wrapper instead. Production already
-  // uses bash-wrapper exclusively; this path's primary user
-  // is the test suite, where commands are whitespace-clean
-  // by construction.
+  // quoted args don't round-trip (`cmd "with space"`). For
+  // direct-spawn callers that need quoting fidelity, route
+  // through bash-wrapper instead. Production uses bash-wrapper
+  // exclusively; this path's primary user is the test suite,
+  // where commands are whitespace-clean by construction.
   const expectedTrimmed = expectedCommand.trim();
-  if (expectedTrimmed.length === 0) return false;
+  if (expectedTrimmed.length === 0) return 'mismatch';
   const recordedTokens = expectedTrimmed.split(/\s+/);
-  if (recordedTokens.length === 0) return false;
+  if (recordedTokens.length === 0) return 'mismatch';
   const recordedFirstToken = recordedTokens[0] ?? '';
-  if (argv0Basename.length === 0 || recordedFirstToken.length === 0) return false;
-  if (argv.length !== recordedTokens.length) return false;
+  if (argv0Basename.length === 0 || recordedFirstToken.length === 0) return 'mismatch';
+  if (argv.length !== recordedTokens.length) return 'mismatch';
   const recordedBasename = recordedFirstToken.split('/').pop() ?? recordedFirstToken;
-  if (argv0Basename !== recordedBasename) return false;
+  if (argv0Basename !== recordedBasename) return 'mismatch';
   for (let i = 1; i < recordedTokens.length; i += 1) {
-    if (argv[i] !== recordedTokens[i]) return false;
+    if (argv[i] !== recordedTokens[i]) return 'mismatch';
   }
-  return true;
+  return 'match';
 };
 
 // Reap any bg processes the child spawned but failed to clean
@@ -579,66 +587,94 @@ const reapChildBgProcesses = async (db: DB, sessionId: string): Promise<void> =>
     );
     return;
   }
-  // SIGTERM every PID — but ONLY after verifying that the PID
-  // still points at the process we recorded at spawn time. The
-  // DB row's `os_pid` was captured when the bg manager spawned
-  // the process; from there to here we crossed the entire
-  // lifetime of the run (potentially many seconds or minutes).
-  // The original process may have exited, and the kernel may
-  // have recycled the PID to an unrelated workload. Without the
-  // identity check we'd SIGTERM that innocent workload.
+
+  // Partition rows by identity outcome. Three buckets:
+  //   - matched: PID is still the process we recorded; we'll
+  //     signal it AND mark the row killed.
+  //   - gone: process exited (ENOENT, or empty cmdline =
+  //     zombie/kernel-thread); no signal needed but mark
+  //     killed because the row's process IS no longer running.
+  //   - mismatched: PID exists but identity doesn't match
+  //     (recycled to unrelated workload, exec-replace
+  //     scenario, EACCES on cmdline read, etc.). DON'T signal
+  //     and DON'T mark — the row stays 'running' so the
+  //     operator can investigate via OS tools.
   //
-  // The first review pass on this slice mistakenly only gated
-  // the SIGKILL loop, on the (incorrect) reasoning that the
-  // SIGTERM snapshot was microseconds fresh. It isn't — the
-  // snapshot is the spawn-time PID, and the window stretches
-  // over the entire bg row's lifetime. Both passes need the
-  // same `isStillSameProcess` guard.
+  // The previous bulk `markRunningAsKilled(db, sessionId)`
+  // call mistakenly flipped mismatched rows too, leaving real
+  // orphan processes alive while audit state claimed termination
+  // (and downstream rmSync then unlinked their log files,
+  // re-introducing the orphan-with-deleted-FDs leak the reaper
+  // exists to prevent). Per-row marking via
+  // `markBgProcessAsKilled` keeps audit honest.
+  const matched: typeof running = [];
+  const gone: typeof running = [];
   for (const proc of running) {
+    if (proc.osPid === null) {
+      // No PID means we have no signal target. Conservatively
+      // treat as mismatch — operator audit decides.
+      continue;
+    }
+    const identity = checkPidIdentity(proc.osPid, proc.command);
+    if (identity === 'match') matched.push(proc);
+    else if (identity === 'gone') gone.push(proc);
+    // 'mismatch' rows: silently dropped from the working set;
+    // they stay 'running' in DB.
+  }
+
+  // SIGTERM every matched PID. Best-effort (ESRCH from a
+  // process that exited between identity check and signal is
+  // expected and ignored).
+  //
+  // Residual race we accept here: between the partition loop's
+  // `checkPidIdentity` call and this `process.kill`, the
+  // process can in principle exit + the kernel can recycle the
+  // PID, in which case our SIGTERM goes to a different
+  // process. The window is microseconds (no awaits between
+  // partition and signal); the friendly-fire blast radius is
+  // a single SIGTERM (which most processes handle as a clean
+  // exit rather than crash). The SIGKILL pass below
+  // re-runs the identity check, so an unrelated process that
+  // happens to ignore SIGTERM won't escalate to SIGKILL.
+  // Re-checking here too would close the window further but
+  // double the syscall cost on the typical happy path; we
+  // chose latency.
+  for (const proc of matched) {
     if (proc.osPid === null) continue;
-    if (!isStillSameProcess(proc.osPid, proc.command)) continue;
     try {
       process.kill(proc.osPid, 'SIGTERM');
     } catch {
-      // ESRCH (already gone) / EPERM (race with reparenting):
-      // either way, nothing to do. Continue to the next.
+      // ESRCH (already gone) / EPERM (race): nothing to do.
     }
   }
-  // Single grace window for ALL of them in parallel, not
-  // per-process. The processes were already running; our SIGTERM
-  // is reliably async, and waiting per-PID would extend cleanup
-  // proportional to the count.
+  // Single grace window for all matched processes in parallel.
+  // Per-process waits would extend cleanup latency
+  // proportional to count.
   await new Promise<void>((r) => setTimeout(r, BG_REAP_GRACE_MS));
-  // SIGKILL anything still alive — but FIRST verify the PID is
-  // still the process we recorded. The kernel can recycle PIDs
-  // within milliseconds on busy hosts; if our SIGTERM target
-  // exited cleanly during the grace window AND a fresh process
-  // got the same PID, an unconditional SIGKILL would target the
-  // unrelated process. `isStillSameProcess` reads
-  // /proc/<pid>/cmdline and compares argv[0]'s basename to the
-  // recorded command's first token; mismatch means PID was
-  // recycled, skip. Vanished pids ALSO skip (the SIGTERM was
-  // already sufficient).
-  for (const proc of running) {
+  // SIGKILL with re-verification. The PID may have been
+  // recycled during the grace window; re-running
+  // `checkPidIdentity` keeps the safety property even when the
+  // SIGTERM target exited cleanly and the kernel handed the
+  // PID to an unrelated workload.
+  for (const proc of matched) {
     if (proc.osPid === null) continue;
-    if (!isStillSameProcess(proc.osPid, proc.command)) continue;
+    if (checkPidIdentity(proc.osPid, proc.command) !== 'match') continue;
     try {
       process.kill(proc.osPid, 'SIGKILL');
     } catch {
-      // Same as above — best-effort.
+      // Best-effort.
     }
   }
-  // Reflect the kill in the audit table. markRunningAsKilled is
-  // idempotent (only updates rows where `status='running'`), so
-  // a child that DID get to run its own cleanup hook before
-  // exiting is already terminal-status and the call no-ops.
-  try {
-    markRunningAsKilled(db, sessionId);
-  } catch {
-    // Defensive — DB write failures shouldn't block cleanup
-    // of the next subagent. The orphan kill already happened;
-    // the audit row drift is operationally minor and the
-    // operator's gc can reconcile.
+  // Audit: flip ONLY matched and gone rows to 'killed'.
+  // Mismatched rows stay 'running' — operator investigates.
+  for (const proc of [...matched, ...gone]) {
+    try {
+      markBgProcessAsKilled(db, proc.id);
+    } catch {
+      // Defensive — DB write failure leaves the row 'running'.
+      // Worst-case the runSubagent's running-row recheck sees
+      // it and skips rmSync, which is the safe outcome.
+    }
   }
 };
 
