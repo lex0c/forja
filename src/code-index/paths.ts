@@ -23,11 +23,29 @@ import { isAbsolute, join } from 'node:path';
 // below. Tests use `defaultCodeIndexPath` directly with a known
 // root for determinism; production always pairs the two.
 
+// Resolve the data-root parent for the code-index DB. Each
+// candidate (XDG_DATA_HOME, HOME, homedir()) is treated as
+// "set" only if it's a non-empty absolute path — otherwise we
+// fall through to the next candidate. An empty HOME on certain
+// container/CI environments would previously be accepted, and
+// `join('', ...)` produces a RELATIVE path; the DB then lands
+// under the current working directory and silently scatters
+// across runs that cd around. We throw when no candidate
+// resolves rather than ever return a relative path.
+const isUsableAbsolute = (s: string | null | undefined): s is string =>
+  s !== null && s !== undefined && s.length > 0 && isAbsolute(s);
+
 export const codeIndexDir = (env: NodeJS.ProcessEnv = process.env): string => {
-  const xdg = env.XDG_DATA_HOME;
-  const home = env.HOME ?? homedir();
-  const dataRoot = xdg !== undefined && xdg.length > 0 ? xdg : join(home, '.local', 'share');
-  return join(dataRoot, 'agent', 'code-index');
+  if (isUsableAbsolute(env.XDG_DATA_HOME)) {
+    return join(env.XDG_DATA_HOME, 'agent', 'code-index');
+  }
+  const home = isUsableAbsolute(env.HOME) ? env.HOME : homedir();
+  if (!isUsableAbsolute(home)) {
+    throw new Error(
+      'codeIndexDir: cannot resolve a stable user data directory — XDG_DATA_HOME, HOME, and os.homedir() all unset/empty/relative. Set XDG_DATA_HOME or HOME to an absolute path.',
+    );
+  }
+  return join(home, '.local', 'share', 'agent', 'code-index');
 };
 
 // Hash the canonical project root path so the filename is fixed-length

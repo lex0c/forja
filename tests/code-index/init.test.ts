@@ -52,6 +52,48 @@ describe('defaultCodeIndexPath', () => {
     expect(() => defaultCodeIndexPath('../sibling', env)).toThrow(/must be absolute/);
   });
 
+  test('treats empty HOME as unset (falls back to homedir)', () => {
+    // Cleared HOME (`HOME=''`) on certain CI / container
+    // environments would otherwise be accepted, and
+    // `join('', '.local', 'share')` yields a RELATIVE path. The
+    // DB then lands under cwd and silently scatters across
+    // runs. Empty must behave like undefined and fall back to
+    // os.homedir() (which is set on this test host).
+    const env = { HOME: '', XDG_DATA_HOME: '' } as NodeJS.ProcessEnv;
+    const path = defaultCodeIndexPath('/home/user/projA', env);
+    // Result must be absolute regardless of the caller-supplied env.
+    expect(path.startsWith('/')).toBe(true);
+    expect(path).toContain('/agent/code-index/');
+  });
+
+  test('treats empty XDG_DATA_HOME as unset (falls back to HOME)', () => {
+    const env = { XDG_DATA_HOME: '', HOME: '/home/user' } as NodeJS.ProcessEnv;
+    const path = defaultCodeIndexPath('/home/user/projA', env);
+    expect(path.startsWith('/home/user/.local/share/agent/code-index/')).toBe(true);
+  });
+
+  test('relative HOME falls through to os.homedir() instead of producing a relative path', () => {
+    // A relative HOME would feed `join('relative', '.local', ...)`
+    // and land under cwd — same scatter bug as empty HOME. The
+    // resolver treats anything not-absolute as "unset" and falls
+    // through to `os.homedir()` (which IS absolute on any sane
+    // host). Result still must be absolute.
+    const env = { HOME: 'relative/home', XDG_DATA_HOME: '' } as NodeJS.ProcessEnv;
+    const path = defaultCodeIndexPath('/home/user/projA', env);
+    expect(path.startsWith('/')).toBe(true);
+    expect(path).toContain('/agent/code-index/');
+  });
+
+  test('rejects relative XDG_DATA_HOME by ignoring it (falls back to HOME)', () => {
+    // XDG spec: XDG_DATA_HOME must be absolute. Treating a
+    // relative value as "unset" matches the spec — and means
+    // the misconfigured operator still gets a usable index
+    // under their HOME instead of cwd-relative noise.
+    const env = { XDG_DATA_HOME: 'rel/xdg', HOME: '/home/user' } as NodeJS.ProcessEnv;
+    const path = defaultCodeIndexPath('/home/user/projA', env);
+    expect(path.startsWith('/home/user/.local/share/agent/code-index/')).toBe(true);
+  });
+
   test('encodes the hash, never the raw path', () => {
     // Project root with characters that would otherwise be
     // problematic in a filename — confirms the hash layer
