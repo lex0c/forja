@@ -94,8 +94,19 @@ export const runWorktreesCli = async (input: WorktreesCliInput): Promise<number>
         return 1;
       }
       const plan = await buildGcPlan({ db, parentCwd: cwd });
-      if (json) writeListJson(plan, out);
-      else writeListTable(plan, out);
+      // Surface non-fatal anomalies to stderr regardless of
+      // output mode. Spec §2.6: stdout is pure, stderr is for
+      // logs — including these on stdout would corrupt NDJSON.
+      for (const w of plan.warnings) err(`forja: ${w}\n`);
+      if (json) {
+        writeListJson(plan, out);
+        // Final NDJSON summary object so consumers parsing the
+        // stream get an explicit end-of-output signal. Symmetric
+        // with `gc` and `gc --dry-run` json paths.
+        out(`${JSON.stringify({ count: plan.entries.length, cache_root: plan.cacheRoot })}\n`);
+      } else {
+        writeListTable(plan, out);
+      }
       return 0;
     }
 
@@ -114,14 +125,26 @@ export const runWorktreesCli = async (input: WorktreesCliInput): Promise<number>
     }
 
     const plan = await buildGcPlan({ db, parentCwd: cwd });
+    // Same warning surface as the list path — stderr regardless
+    // of mode so NDJSON stays valid.
+    for (const w of plan.warnings) err(`forja: ${w}\n`);
     if (dryRun) {
       // Same shape as `list` — operator can compare what gc
-      // WOULD do against current state.
-      if (json) writeListJson(plan, out);
-      else writeListTable(plan, out);
-      out(
-        `\ndry-run summary: ${plan.entries.length} entr${plan.entries.length === 1 ? 'y' : 'ies'} considered\n`,
-      );
+      // WOULD do against current state. The trailing summary
+      // line MUST honor the json/table split: in --json mode
+      // we emit a final NDJSON object, never plain text. Spec
+      // §2.6 + CLAUDE.md "stdout is pure, stderr is for logs"
+      // — a single non-JSON line breaks every machine consumer
+      // that parses stdout as NDJSON.
+      if (json) {
+        writeListJson(plan, out);
+        out(`${JSON.stringify({ dry_run: true, considered: plan.entries.length })}\n`);
+      } else {
+        writeListTable(plan, out);
+        out(
+          `\ndry-run summary: ${plan.entries.length} entr${plan.entries.length === 1 ? 'y' : 'ies'} considered\n`,
+        );
+      }
       return 0;
     }
 

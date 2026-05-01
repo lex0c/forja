@@ -88,6 +88,14 @@ export interface WorktreeGcPlan {
   // The cache root that was scanned. Surfaced so error messages
   // and dry-run output can reference it precisely.
   cacheRoot: string;
+  // Non-fatal anomalies discovered during plan build —
+  // typically a path the engine couldn't introspect (EACCES,
+  // I/O error other than ENOENT). The engine keeps the plan
+  // valid by treating the path as on-disk-uncertain (which
+  // routes it to a safe classification: `preserved_dirty`
+  // for preserved rows, etc.), but the caller should surface
+  // these so the operator knows their gc view was partial.
+  warnings: string[];
 }
 
 export interface BuildGcPlanOptions {
@@ -306,11 +314,45 @@ export const buildGcPlan = async (opts: BuildGcPlanOptions): Promise<WorktreeGcP
   }
 
   const entries: WorktreeGcEntry[] = [];
+  const warnings: string[] = [];
 
   for (const path of allPaths) {
     const dbRow = dbByPath.get(path);
     const gitBranch = gitByPath.get(path) ?? null;
-    const onDisk = existsSync(path) && lstatSync(path).isDirectory();
+    // Single stat probe inside try/catch. The earlier
+    // `existsSync(path) && lstatSync(path).isDirectory()`
+    // shape was racy: between the two syscalls another
+    // process (a parallel gc run, the harness's own cleanup
+    // pass, or operator-side rm) could remove the path,
+    // causing lstat to throw ENOENT and aborting the entire
+    // buildGcPlan with an unhandled exception.
+    //
+    // We distinguish error kinds:
+    //   - ENOENT → path truly gone; onDisk=false. For
+    //     preserved/cleaned rows this routes correctly to the
+    //     `missing` / silently-consistent classification, with
+    //     audit flip authorized (the row's process IS gone).
+    //   - Anything else (EACCES on a setuid'd path, EIO on a
+    //     flaky mount, etc.) → we genuinely can't tell. Treat
+    //     as onDisk=true so downstream classification does NOT
+    //     route to `missing` (which would auto-flip the audit
+    //     to cleaned). The status check that follows will also
+    //     fail and surface as `preserved_dirty` /
+    //     `stale_cleaned`, which apply skips without --force.
+    //     Operator gets a stderr warning via the plan's
+    //     `warnings` so they know the view was partial.
+    const onDisk = ((): boolean => {
+      try {
+        return lstatSync(path).isDirectory();
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') return false;
+        warnings.push(
+          `gc: lstat('${path}') failed with ${code ?? 'unknown error'}; classification may be partial. Investigate via OS tools.`,
+        );
+        return true;
+      }
+    })();
 
     // Active rows are off-limits. The 4.2b subprocess path
     // inserts 'active' before spawn; gc must never touch a
@@ -421,7 +463,7 @@ export const buildGcPlan = async (opts: BuildGcPlanOptions): Promise<WorktreeGcP
   // operator confusion when re-running gc on the same state.
   entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
-  return { entries, cacheRoot };
+  return { entries, cacheRoot, warnings };
 };
 
 export interface ApplyGcPlanOptions {

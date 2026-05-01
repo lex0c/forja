@@ -65,6 +65,42 @@ describe('runWorktreesCli — list', () => {
     expect(outBuf).toContain('no worktrees found');
   });
 
+  test('json mode → final summary object closes the NDJSON stream (M1)', async () => {
+    // list --json should be symmetric with gc and dry-run:
+    // the final line is a summary object so consumers get an
+    // explicit end-of-stream marker. Without this, parsing
+    // libraries that expect a sentinel had to rely on EOF.
+    const session = createSession(db, { model: 'mock/m', cwd: parentCwd });
+    const path = join(cacheRoot, session.id);
+    mkdirSync(path);
+    insertSubagentWorktree(db, {
+      sessionId: session.id,
+      path,
+      branch: 'agent/explore-12345678',
+      status: 'preserved',
+    });
+    const code = await runWorktreesCli({
+      verb: 'list',
+      positionals: [],
+      json: true,
+      cwd: parentCwd,
+      dbOverride: db,
+      out,
+      err,
+    });
+    expect(code).toBe(0);
+    const lines = outBuf.split('\n').filter((l) => l.length > 0);
+    // Every line valid JSON.
+    for (const line of lines) {
+      expect(() => JSON.parse(line)).not.toThrow();
+    }
+    // Last line is the summary.
+    const last = JSON.parse(lines[lines.length - 1] ?? '{}');
+    expect(typeof last.count).toBe('number');
+    expect(typeof last.cache_root).toBe('string');
+    expect(last.count).toBe(1);
+  });
+
   test('json mode → NDJSON one entry per row', async () => {
     const session = createSession(db, { model: 'mock/m', cwd: parentCwd });
     const path = join(cacheRoot, session.id);
@@ -138,6 +174,44 @@ describe('runWorktreesCli — gc', () => {
     });
     expect(code).toBe(1);
     expect(errBuf).toContain('--bogus');
+  });
+
+  test('--json --dry-run emits valid NDJSON only (no plain-text summary)', async () => {
+    // CLAUDE.md / spec §2.6: --json means NDJSON on stdout,
+    // nothing else. A single non-JSON line (e.g. the human
+    // "dry-run summary: 1 entry considered") would break
+    // every machine consumer parsing stdout. Pin: every
+    // non-empty line in --json --dry-run output must
+    // JSON.parse without throwing.
+    const session = createSession(db, { model: 'mock/m', cwd: parentCwd });
+    const path = join(cacheRoot, session.id);
+    mkdirSync(path);
+    insertSubagentWorktree(db, {
+      sessionId: session.id,
+      path,
+      branch: 'agent/explore-12345678',
+      status: 'preserved',
+    });
+    const code = await runWorktreesCli({
+      verb: 'gc',
+      positionals: ['--dry-run'],
+      json: true,
+      cwd: parentCwd,
+      dbOverride: db,
+      out,
+      err,
+    });
+    expect(code).toBe(0);
+    const lines = outBuf.split('\n').filter((l) => l.length > 0);
+    expect(lines.length).toBeGreaterThan(0);
+    for (const line of lines) {
+      // Throws if any line is not valid JSON.
+      expect(() => JSON.parse(line)).not.toThrow();
+    }
+    // Final line should be the summary object.
+    const last = JSON.parse(lines[lines.length - 1] ?? '{}');
+    expect(last.dry_run).toBe(true);
+    expect(typeof last.considered).toBe('number');
   });
 
   test('list rejects positional arguments', async () => {
