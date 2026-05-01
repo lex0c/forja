@@ -15,6 +15,59 @@ Format:
 
 ---
 
+## [2026-05-01] M3 / Step 4.3.0 — Code Index foundation (schema + Query API skeleton)
+
+The 4.2 arc closed the subagent surface; M3 now turns to the code retrieval
+substrate per `docs/spec/AGENTIC_CLI.md` §18 (Repo Map / tree-sitter). The
+full code-index subsystem (`docs/spec/CODE_INDEX.md`) is large (~4-6k LoC
+across schema, scanners per language, tools, repo_map integration, FS
+watcher); we slice it. This first slice ships ONLY the foundation: SQL
+schema, storage repos, and the Query API surface returning empty results.
+Scanner / tools / repo_map integration land in subsequent slices (4.3.1+).
+
+The empty-but-functional Query API matters: callers (future
+`read_symbol`/`find_references` tools, repo_map renderer) can wire to the
+exact production interface today. The scanner slice (4.3.1) drops parser
+output into the same tables and the same queries start returning data —
+no API churn between foundation and first use.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/storage/code-index-migrations/001-initial.ts` | NEW — five-table schema per spec §2.1: `files`, `symbols`, `references_` (`references` is a SQLite reserved word), `imports`, `test_mapping`, `index_meta`. CHECK constraints enforce status/kind enums; CASCADE on file deletions; SET NULL on target_symbol_id so a row stays queryable as "unresolved" when the target gets re-indexed. Indexes match every hot path declared in §4.1 / §9.1. |
+| `src/storage/code-index-migrations/index.ts` | NEW — `CODE_INDEX_MIGRATIONS` array. Reuses the generic `migrate()` runner; the `_migrations` table is per-DB so the code-index DB tracks its own version chain independently of `sessions.db`. |
+| `src/code-index/paths.ts` | NEW — `defaultCodeIndexPath(projectRoot, env?)` resolves to `<XDG_DATA_HOME>/agent/code-index/<sha256(root):0..32>.db`. SHA-256 hash of the project root keeps filenames fixed-length and FS-safe regardless of project path content (spaces, `%`, `&` all collapse into hex). |
+| `src/code-index/privacy.ts` | NEW — `CODE_INDEX_DEFAULT_EXCLUDES` (spec §8.1) + `CODE_INDEX_MAX_FILE_SIZE_BYTES = 5MB`. Pure data; the future scanner consumes via `Bun.Glob`. Overlaps with `subagents/sensitive-paths.ts` intentionally — both derive from the same threat model but cover different concerns. |
+| `src/code-index/types.ts` | NEW — domain types: `IndexSymbol`, `Reference`, `Import`, `TestMapping`, `FileMeta`, plus filter/option shapes. CamelCase per Forja convention; row→object converters in `repo.ts` translate from SQLite snake_case. `IndexSymbol` (not `Symbol`) avoids shadowing the global. |
+| `src/code-index/repo.ts` | NEW — read helpers covering every Query API surface (file lookup, symbol-by-name/id, references-by-id/name, imports forward + dependents, test mapping both directions, meta get/set, count helpers). JSON parsing for `imports.imported_names` is defensive (corrupted JSON → empty array, not throw). |
+| `src/code-index/index.ts` | NEW — `CodeIndex` class. `init()` opens (or accepts) DB and runs migrations idempotently; `close()` is owns-aware (skips closing tests' override DB); query methods delegate to repo helpers. `dependentsOf()` deduplicates via Set so a file importing the same target twice (named + namespace) returns once. `status()` derives `dbSizeBytes` via `pragma_page_count * pragma_page_size` aliased through `SELECT … AS n` so the column shape is stable. |
+| `tests/code-index/init.test.ts` | NEW — 25 tests: path resolver determinism + hash safety, init idempotency, dbOverride lifecycle, every Query API surface returning empty under a fresh index, round-trip via direct SQL inserts (symbol, import JSON parsing, dependentsOf dedup), CASCADE delete + SET NULL invariants, meta round-trip, status reflects `last_full_scan_at` + `files_failed` honestly. |
+
+**Decisions:**
+
+- **D1 — Separate DB file (`code-index/<hash>.db`), not a table in `sessions.db`.** Per spec §2.1: the audit trail and the structural index have different retention concerns. `rm code-index/<hash>.db` resets a project's index without touching session history; conversely, deleting a session shouldn't drop the project's index. Independent migration chains via the `_migrations` table per-DB.
+- **D2 — Hash the project root for the filename.** Project paths can contain spaces, special chars, or be very long (`/home/user/.../deeply/nested/projects/...`). Hashing gives a fixed 32-hex filename + `.db`. SHA-256 truncated to 32 chars is 128 bits of collision space — irrelevant at operator-host scale.
+- **D3 — Query API returns empty/null in foundation slice, doesn't throw `index_unavailable`.** When the index DB is initialized but contains no parser output, queries succeed and return empty. The `index_unavailable` failure mode (spec §4.3) only fires when init fails (DB unreadable, schema mismatch). Tools that wrap the Query API surface ambiguity / not-found per their own contracts.
+- **D4 — `IndexSymbol` instead of `Symbol`.** `Symbol` shadows the JavaScript global (well-formed-symbol primitive). Lint flagged it; renaming preserves clarity even if `code-index/Symbol` would have been unambiguous within this module.
+- **D5 — Tree-sitter dep deferred to slice 4.3.1.** Adding `web-tree-sitter` (or native binding) without using it bloats `bun install` for no benefit. The scanner slice introduces the dependency at the same time it consumes the parser.
+- **D6 — Defensive parsing of `imports.imported_names` JSON.** Corrupted JSON could come from a future bug or manual DB edit. Surface as empty array rather than throw — the query path stays robust against schema drift.
+
+**Pending / known limitations (deferred to later slices):**
+
+- **No parser yet.** Slice 4.3.1 adds tree-sitter (TS/JS first), hooks the FS walker, populates the tables.
+- **No tools exposed to the model yet.** `read_symbol` / `find_references` / `outline_file` / `imports_of` (spec §5) land in slice 4.3.2.
+- **No incremental updates.** PostToolUse hook on `write_file`/`edit_file` lands in slice 4.3.3.
+- **No FS watcher.** Opt-in inotify/FSEvents lands in slice 4.3.6.
+- **No `agent code-index` CLI.** Status / rebuild / query (spec §10) lands when the parser is in place.
+- **Project root resolution upstream.** Callers MUST pass a canonical root (e.g., `git rev-parse --show-toplevel`); the path helper trusts the input.
+
+**Verification:** `bun test` 1454 pass / 10 skip / 0 fail (+25 new); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** M3 / Step 4.3.1 — TypeScript/JavaScript scanner. Adds `web-tree-sitter` dependency, FS walker that respects `CODE_INDEX_DEFAULT_EXCLUDES`, parser that extracts symbols + imports (references resolution deferred to 4.3.3 — needs second pass after all symbols indexed), and the initial-scan pipeline (spec §3.1).
+
+---
+
 ## [2026-04-30] M3 / Step 4.2d — `agent --worktrees` operator surface (gc + list)
 
 The 4.2b arc landed full subagent worktree lifecycle (create, isolate,
