@@ -18,10 +18,10 @@
 //                         `--since <commit>` is deferred (needs
 //                         a git-diff-aware walker pass).
 
-import { spawnSync } from 'node:child_process';
-import { realpathSync, unlinkSync } from 'node:fs';
+import { unlinkSync } from 'node:fs';
 import { CodeIndex } from '../code-index/index.ts';
 import { defaultCodeIndexPath } from '../code-index/paths.ts';
+import { resolveProjectRoot } from '../code-index/project-root.ts';
 import type { ScanResult } from '../code-index/scanner/pipeline.ts';
 import type { IndexStatus } from '../code-index/types.ts';
 import type { DB } from '../storage/db.ts';
@@ -43,22 +43,6 @@ export interface CodeIndexCliInput {
 }
 
 const VALID_VERBS = ['scan', 'status', 'rebuild'] as const;
-
-// Resolve the project root for this invocation.
-//   - When cwd is inside a git repo, return the toplevel —
-//     ensures every subdir of a project hashes to the same DB.
-//   - Otherwise, return realpath(cwd) — covers non-git
-//     experiments + matches the "absolute, canonical" contract
-//     `defaultCodeIndexPath` requires.
-const resolveProjectRoot = (cwd: string): string => {
-  const r = spawnSync('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], {
-    encoding: 'utf8',
-  });
-  if (r.error === undefined && r.status === 0) {
-    return r.stdout.trim();
-  }
-  return realpathSync(cwd);
-};
 
 const formatBytes = (n: number): string => {
   if (n < 1024) return `${n} B`;

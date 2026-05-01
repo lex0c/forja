@@ -3,7 +3,9 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_MODEL, bootstrap } from '../../src/cli/bootstrap.ts';
+import { CodeIndex } from '../../src/code-index/index.ts';
 import type { Provider } from '../../src/providers/index.ts';
+import { openMemoryDb } from '../../src/storage/db.ts';
 
 let workdir: string;
 let dbPath: string;
@@ -45,8 +47,8 @@ afterEach(() => {
 });
 
 describe('bootstrap', () => {
-  test('builds a config with provider override and a fresh DB', () => {
-    const { config, db, modelId, policyLayers } = bootstrap({
+  test('builds a config with provider override and a fresh DB', async () => {
+    const { config, db, modelId, policyLayers } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -89,8 +91,8 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('honors --model override', () => {
-    const { modelId, db } = bootstrap({
+  test('honors --model override', async () => {
+    const { modelId, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       modelId: 'mock/custom',
@@ -103,7 +105,7 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('throws on unknown model when no override is supplied', () => {
+  test('throws on unknown model when no override is supplied', async () => {
     process.env.ANTHROPIC_API_KEY = 'sk-test';
     expect(() =>
       bootstrap({
@@ -117,13 +119,13 @@ describe('bootstrap', () => {
     ).toThrow(/unknown model: fake\/nope/);
   });
 
-  test('loads project policy when .agent/permissions.yaml exists', () => {
+  test('loads project policy when .agent/permissions.yaml exists', async () => {
     mkdirSync(join(workdir, '.agent'), { recursive: true });
     writeFileSync(
       join(workdir, '.agent/permissions.yaml'),
       'defaults:\n  mode: acceptEdits\ntools:\n  bash:\n    allow:\n      - "ls *"\n',
     );
-    const { config, db, policyLayers } = bootstrap({
+    const { config, db, policyLayers } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -136,8 +138,8 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('falls back to default policy when no file', () => {
-    const { config, db, policyLayers } = bootstrap({
+  test('falls back to default policy when no file', async () => {
+    const { config, db, policyLayers } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -150,8 +152,8 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('plan: true sets harness planMode and injects plan-aware system prompt', () => {
-    const { config, db } = bootstrap({
+  test('plan: true sets harness planMode and injects plan-aware system prompt', async () => {
+    const { config, db } = await bootstrap({
       prompt: 'refactor auth',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -166,8 +168,8 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('plan omitted leaves planMode unset and no system prompt', () => {
-    const { config, db } = bootstrap({
+  test('plan omitted leaves planMode unset and no system prompt', async () => {
+    const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -180,8 +182,8 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('plan + caller systemPrompt composes (plan first, user after separator)', () => {
-    const { config, db } = bootstrap({
+  test('plan + caller systemPrompt composes (plan first, user after separator)', async () => {
+    const { config, db } = await bootstrap({
       prompt: 'refactor',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -201,8 +203,8 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('caller systemPrompt without plan passes through unchanged', () => {
-    const { config, db } = bootstrap({
+  test('caller systemPrompt without plan passes through unchanged', async () => {
+    const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -216,8 +218,8 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('forwards budget overrides into config', () => {
-    const { config, db } = bootstrap({
+  test('forwards budget overrides into config', async () => {
+    const { config, db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -230,8 +232,8 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('migrates the DB so the schema is ready to use', () => {
-    const { db } = bootstrap({
+  test('migrates the DB so the schema is ready to use', async () => {
+    const { db } = await bootstrap({
       prompt: 'hi',
       cwd: workdir,
       providerOverride: mockProvider,
@@ -249,7 +251,7 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('malformed permissions.yaml throws BEFORE the DB is opened (no leak)', () => {
+  test('malformed permissions.yaml throws BEFORE the DB is opened (no leak)', async () => {
     mkdirSync(join(workdir, '.agent'), { recursive: true });
     writeFileSync(join(workdir, '.agent/permissions.yaml'), 'defaults: { mode: [unterminated');
     expect(() =>
@@ -268,7 +270,68 @@ describe('bootstrap', () => {
     expect(existsSync(dbPath)).toBe(false);
   });
 
-  test('unknown model throws BEFORE the DB is opened (no leak)', () => {
+  test('threads codeIndex into HarnessConfig when init succeeds', async () => {
+    const idx = await CodeIndex.init({ projectRoot: workdir, dbOverride: openMemoryDb() });
+    const { config, db, codeIndexError } = await bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      codeIndexOverride: idx,
+    });
+    expect(config.codeIndex).toBe(idx);
+    expect(codeIndexError).toBeUndefined();
+    db.close();
+    idx.close();
+  });
+
+  test('reports codeIndexError on init failure (no stderr leak from bootstrap)', async () => {
+    // Capture stderr to confirm bootstrap doesn't write to it.
+    // Force init failure by passing an override built against
+    // an already-closed DB — any subsequent operation on it
+    // throws but we never call those operations, so we have to
+    // simulate a different way. Easiest: stub the override path
+    // by passing a non-existent DB path... that still works.
+    // Instead, simulate via a class-like object that throws on
+    // anything.
+    //
+    // Pragmatic approach: trigger via the real path by passing
+    // a cwd that resolveProjectRoot maps to a non-directory.
+    // realpathSync on a missing path throws → CodeIndex.init
+    // never runs → codeIndexError is set with the realpath
+    // failure message.
+    const stderrChunks: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    // biome-ignore lint/suspicious/noExplicitAny: stderr.write overload chaos
+    (process.stderr.write as any) = (chunk: string | Uint8Array): boolean => {
+      stderrChunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'));
+      return true;
+    };
+    try {
+      const bogusCwd = join(workdir, 'does-not-exist');
+      const { config, db, codeIndexError } = await bootstrap({
+        prompt: 'hi',
+        cwd: bogusCwd,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+      });
+      expect(config.codeIndex).toBeUndefined();
+      expect(codeIndexError).toBeDefined();
+      expect(codeIndexError).toContain('index.unavailable');
+      // Bootstrap itself MUST NOT write to stderr — that's the
+      // contract. Caller (CLI) decides whether to surface.
+      expect(stderrChunks.join('')).toBe('');
+      db.close();
+    } finally {
+      process.stderr.write = origWrite;
+    }
+  });
+
+  test('unknown model throws BEFORE the DB is opened (no leak)', async () => {
     process.env.ANTHROPIC_API_KEY = 'sk-test';
     expect(() =>
       bootstrap({

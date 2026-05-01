@@ -1,4 +1,6 @@
 import { join } from 'node:path';
+import { CodeIndex } from '../code-index/index.ts';
+import { resolveProjectRoot } from '../code-index/project-root.ts';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
 import { type LockConflict, createPermissionEngine, resolvePolicy } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/index.ts';
@@ -6,6 +8,7 @@ import type { Provider } from '../providers/index.ts';
 import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
+import { ERROR_CODES } from '../tools/types.ts';
 import { composeWithUserPrompt } from './plan-prompt.ts';
 
 export const DEFAULT_MODEL = 'anthropic/claude-sonnet-4-6';
@@ -48,6 +51,12 @@ export interface BootstrapInput {
   // the permission-layer test seams above.
   userAgentsDir?: string | null;
   projectAgentsDir?: string | null;
+  // Test seam: a pre-built CodeIndex (typically against an
+  // in-memory DB). When set, bootstrap skips its own
+  // CodeIndex.init call. Caller still gets ownership semantics
+  // — bootstrap doesn't close anything it didn't open, so
+  // tests close their own override.
+  codeIndexOverride?: CodeIndex;
 }
 
 export interface BootstrapResult {
@@ -68,6 +77,14 @@ export interface BootstrapResult {
   // `byName` for resolution. Empty when no .md files are found
   // anywhere.
   subagents: SubagentSet;
+  // CodeIndex initialization failed. Bootstrap leaves
+  // `config.codeIndex` undefined and stores the error message
+  // here so the CLI (or other caller) can decide whether to
+  // surface it on stderr — bootstrap itself doesn't write to
+  // process.stderr, keeping bootstrap testable + reusable for
+  // programmatic callers (eval executor, in-process subagents)
+  // that don't want unbidden console noise.
+  codeIndexError?: string;
 }
 
 // Build a HarnessConfig from environment + cwd + args. This is the main
@@ -76,7 +93,7 @@ export interface BootstrapResult {
 // if present, instantiate the provider from the registry. Any failure
 // (unknown model, missing API key) bubbles up — the caller decides whether
 // to print to stderr and exit 1.
-export const bootstrap = (input: BootstrapInput): BootstrapResult => {
+export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult> => {
   const cwd = input.cwd ?? process.cwd();
   const modelId = input.modelId ?? DEFAULT_MODEL;
 
@@ -165,6 +182,35 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   // collide with the parent repo's.
   const bgLogDir = join(cwd, '.agent', 'bg');
 
+  // Code-index handle (CODE_INDEX.md §4). Open eagerly so the
+  // harness can thread it through ToolContext for the symbolic
+  // tools (read_symbol / outline_file / find_references / …).
+  // Failure here (DB locked, migrations broken, project root
+  // not absolute, …) is NOT fatal: we leave codeIndex
+  // undefined and stash the error in `codeIndexError` for the
+  // caller to surface (CLI prints to stderr; tests/eval
+  // executor can ignore or assert on it). Tools surface a
+  // clean `index.unavailable` error in the meantime.
+  //
+  // Project root resolution mirrors the CLI handler so a scan
+  // run via `agent --code-index scan` and a session run from
+  // anywhere under the project both hash to the same DB path.
+  let codeIndex: CodeIndex | undefined;
+  let codeIndexError: string | undefined;
+  if (input.codeIndexOverride !== undefined) {
+    // Test seam — caller pre-built a CodeIndex (typically
+    // against an in-memory DB). Bootstrap takes ownership of
+    // closing it (see HarnessResult lifecycle in run.ts).
+    codeIndex = input.codeIndexOverride;
+  } else {
+    try {
+      const projectRoot = resolveProjectRoot(cwd);
+      codeIndex = await CodeIndex.init({ projectRoot });
+    } catch (e) {
+      codeIndexError = `code index unavailable (${e instanceof Error ? e.message : String(e)}); symbolic tools will report ${ERROR_CODES.indexUnavailable}`;
+    }
+  }
+
   const config: HarnessConfig = {
     provider,
     toolRegistry,
@@ -184,6 +230,7 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     // "no subagents defined" hint instead of "registry missing"
     // when there are simply no .md files yet.
     subagentRegistry: subagents,
+    ...(codeIndex !== undefined ? { codeIndex } : {}),
     ...(input.budget !== undefined ? { budget: input.budget } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.plan === true ? { planMode: true } : {}),
@@ -201,5 +248,6 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     policyLayers,
     lockConflicts: resolved.lockConflicts,
     subagents,
+    ...(codeIndexError !== undefined ? { codeIndexError } : {}),
   };
 };

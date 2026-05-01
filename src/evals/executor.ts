@@ -360,7 +360,7 @@ export const executeCase = async (
       ...(options.bootstrapOverride ?? {}),
     };
 
-    const { config, db } = bootstrap(bootstrapInput);
+    const { config, db } = await bootstrap(bootstrapInput);
     try {
       const cfg = {
         ...config,

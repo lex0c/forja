@@ -15,6 +15,85 @@ Format:
 
 ---
 
+## [2026-05-01] M3 / Step 4.3.4 — wire ToolContext.codeIndex in harness
+
+Closes the gap from slice 4.3.2: tools registered in
+BUILTIN_TOOLS but the harness never set `ToolContext.codeIndex`,
+so every invocation in production returned `index.unavailable`.
+This slice adds the wiring end-to-end so read_symbol /
+outline_file / imports_of / find_references / dependents_of
+all work in real sessions.
+
+**Decisions:**
+
+- **D1 — Eager init at bootstrap time, NOT lazy.** Matches the
+  bgManager / todoStore pattern; cost is ~5-20 ms (DB open +
+  migrations) which is negligible vs total session startup.
+  Lazy would require threading `getCodeIndex()` through
+  ToolContext + caching with double-checked locking, more
+  complexity for minimal benefit.
+- **D2 — Project root resolution shared between CLI and
+  bootstrap (`src/code-index/project-root.ts`).** Both must
+  agree or the `defaultCodeIndexPath` hash diverges and a
+  scan run via `agent --code-index scan` lands on a different
+  DB than a session uses. `git rev-parse --show-toplevel`
+  primary, `realpathSync(cwd)` fallback. Extracted because
+  duplication here is genuinely unsafe — not premature.
+- **D3 — Init failure NOT fatal.** When CodeIndex.init throws
+  (DB locked, project root unreadable, migration regression),
+  bootstrap leaves `config.codeIndex` undefined and stashes
+  the error message in `BootstrapResult.codeIndexError`.
+  Tools surface a clean `index.unavailable` error per call;
+  the session itself still runs. Bootstrap does NOT write to
+  process.stderr — the CLI decides whether to print
+  (test-friendly, no surprise output for programmatic
+  callers).
+- **D4 — Try/finally widened in run.ts.** Previously narrow
+  around `runAgent` only; throws in subagent-shadow warnings,
+  lock-conflict iteration, or the codeIndexError print would
+  have leaked the DB + CodeIndex handles. Now wraps everything
+  from bootstrap return through runAgent.
+- **D5 — Subagents do NOT inherit codeIndex.**
+  `runSubagent`'s input doesn't accept or thread codeIndex.
+  In-process subagents see `codeIndex=undefined` → tools
+  return `index.unavailable` for them. Subprocess subagents
+  re-bootstrap and open their own. Documented gap; symmetric
+  fix lands in a future slice (likely 4.3.5 or alongside the
+  in-process-subagent rework).
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/code-index/project-root.ts` | NEW — shared `resolveProjectRoot(cwd)` (CLI + bootstrap). |
+| `src/cli/code-index.ts` | Refactored to use the shared helper. |
+| `src/harness/types.ts` | `HarnessConfig.codeIndex?: CodeIndex` added. |
+| `src/cli/bootstrap.ts` | Now async. Eager init via `CodeIndex.init`; failure stashed in `BootstrapResult.codeIndexError`. New `BootstrapInput.codeIndexOverride` test seam. |
+| `src/cli/run.ts` | Surfaces `codeIndexError` via errSink. Try/finally widened. Cleanup closes `config.codeIndex` before `db`. |
+| `src/harness/loop.ts` | ToolContext threads `config.codeIndex`. |
+| `src/evals/executor.ts` | Updated to `await bootstrap(...)`. |
+| `tests/cli/bootstrap.test.ts` | All bootstrap callers async. New tests: `threads codeIndex into HarnessConfig` (override path) + `reports codeIndexError on init failure (no stderr leak)`. |
+
+**Known gaps:**
+- Subagents (D5 above).
+- Bootstrap test for init failure uses a non-existent cwd to
+  trigger `realpathSync` ENOENT; doesn't exercise other failure
+  modes (e.g., DB locked by another writer). Stub-based tests
+  could expand coverage.
+
+**Verification:** `bun test` 1649 pass / 10 skip / 0 fail; smoke
+session via `bun run dev --plan "use read_symbol to fetch the
+source of walkProject"` — model invokes read_symbol, tool
+resolves walkProject to `src/code-index/scanner/walker.ts`, fs.read
+self-gate fires (strict mode + no allow rule), tool returns
+`permission.denied` with file path. End-to-end working.
+
+**Next:** M3 / Step 4.3.5 — subagent codeIndex inheritance OR
+incremental scan path (depending on which gap matters more for
+the next playbook).
+
+---
+
 ## [2026-05-01] M3 / Step 4.3.2 — symbolic tools (registered, awaiting harness wiring)
 
 Three of the five spec tools from CODE_INDEX.md §5 ship as

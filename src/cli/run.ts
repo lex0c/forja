@@ -252,51 +252,72 @@ export const run = async (options: RunOptions): Promise<number> => {
       signal,
       ...(options.bootstrapOverride ?? {}),
     };
-    const { config, db, lockConflicts, subagents } = bootstrap(bootstrapInput);
+    const { config, db, lockConflicts, subagents, codeIndexError } =
+      await bootstrap(bootstrapInput);
 
-    // Surface cross-scope subagent shadows. A user's
-    // ~/.config/agent/agents/<name>.md silently being eclipsed by
-    // a project-scope file is the kind of misconfiguration that
-    // wastes hours when the author doesn't see it; one warning
-    // per shadow on stderr makes the precedence visible. Gated on
-    // non-JSON mode so NDJSON consumers get a pure stream — the
-    // information is recoverable from the project tree anyway.
-    if (!args.json) {
-      for (const shadow of subagents.shadows) {
+    // Wrap the entire post-bootstrap path so any throw between
+    // here and runAgent's return doesn't leak the DB / CodeIndex
+    // handles. The previous narrower try/finally only covered
+    // runAgent itself; a throw in the warning loops or
+    // shadows-iteration would have leaked both.
+    try {
+      // Surface cross-scope subagent shadows. A user's
+      // ~/.config/agent/agents/<name>.md silently being eclipsed
+      // by a project-scope file is the kind of misconfiguration
+      // that wastes hours when the author doesn't see it; one
+      // warning per shadow on stderr makes the precedence
+      // visible. Gated on non-JSON mode so NDJSON consumers get a
+      // pure stream — the information is recoverable from the
+      // project tree anyway.
+      if (!args.json) {
+        for (const shadow of subagents.shadows) {
+          errSink(
+            `forja: subagent '${shadow.name}' from ${shadow.shadowed.sourcePath} (user) is shadowed by ${shadow.winning.sourcePath} (project)\n`,
+          );
+        }
+      }
+
+      // Plan mode indicator on stderr — stdout stays a clean
+      // transcript / NDJSON. Skip in JSON mode (per spec §2.2
+      // stdout is NDJSON only; admin-style output goes to stderr
+      // regardless).
+      if (args.plan === true) {
+        errSink('[plan mode] read-only run; write tools are blocked at the harness\n');
+      }
+
+      // Surface lock-conflict warnings before the run starts.
+      // Each conflict means an enterprise/user/project layer
+      // marked a section as locked and a lower-precedence layer
+      // tried to override it; the override was dropped from the
+      // merged policy. Admins need this signal — silently
+      // swallowing it defeats the whole point of `locked: true`.
+      for (const c of lockConflicts) {
         errSink(
-          `forja: subagent '${shadow.name}' from ${shadow.shadowed.sourcePath} (user) is shadowed by ${shadow.winning.sourcePath} (project)\n`,
+          `⚠ permission policy: ${c.section} locked by ${c.lockedBy}; ${c.attemptedBy}'s override dropped\n`,
         );
       }
-    }
 
-    // Plan mode indicator on stderr — stdout stays a clean
-    // transcript / NDJSON. Skip in JSON mode (per spec §2.2 stdout
-    // is NDJSON only; admin-style output goes to stderr regardless).
-    if (args.plan === true) {
-      errSink('[plan mode] read-only run; write tools are blocked at the harness\n');
-    }
+      if (codeIndexError !== undefined) {
+        errSink(`⚠ ${codeIndexError}\n`);
+      }
 
-    // Surface lock-conflict warnings before the run starts. Each
-    // conflict means an enterprise/user/project layer marked a
-    // section as locked and a lower-precedence layer tried to
-    // override it; the override was dropped from the merged policy.
-    // Admins need this signal — silently swallowing it defeats the
-    // whole point of `locked: true`.
-    for (const c of lockConflicts) {
-      errSink(
-        `⚠ permission policy: ${c.section} locked by ${c.lockedBy}; ${c.attemptedBy}'s override dropped\n`,
-      );
-    }
-
-    const cfg = {
-      ...config,
-      onEvent: (e: Parameters<OutputRenderer['onEvent']>[0]) => renderer.onEvent(e),
-    };
-    try {
+      const cfg = {
+        ...config,
+        onEvent: (e: Parameters<OutputRenderer['onEvent']>[0]) => renderer.onEvent(e),
+      };
       const result = await runAgent(cfg);
       renderer.flush();
       return exitCodeFor(result);
     } finally {
+      // Close in reverse order of acquisition: codeIndex first
+      // (its DB is per-project and separate from sessions.db),
+      // then the session DB. Both are best-effort — close
+      // exceptions don't mask the run result.
+      try {
+        config.codeIndex?.close();
+      } catch {
+        // ignore — log noise on shutdown isn't useful
+      }
       db.close();
     }
   } catch (e) {

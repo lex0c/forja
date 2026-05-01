@@ -955,6 +955,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               config.permissionEngine.check(toolName, category, args),
             todoStore,
             ...(bgManager !== undefined ? { bgManager } : {}),
+            ...(config.codeIndex !== undefined ? { codeIndex: config.codeIndex } : {}),
             ...(spawnSubagentClosure !== undefined ? { spawnSubagent: spawnSubagentClosure } : {}),
           };
 

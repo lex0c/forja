@@ -1,3 +1,4 @@
+import type { CodeIndex } from '../code-index/index.ts';
 import type { Decision, PermissionEngine } from '../permissions/index.ts';
 import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
 import type { DB } from '../storage/index.ts';
@@ -165,6 +166,16 @@ export interface HarnessConfig {
   // createBgManager. When absent, bg-aware tools surface a clean
   // tool-error.
   bgLogDir?: string;
+  // Code-index handle for symbolic tools (CODE_INDEX.md §4).
+  // Optional so tests + minimal entry points can run without
+  // initializing the index. When set, the harness threads it
+  // through ToolContext so read_symbol / outline_file /
+  // imports_of / find_references / dependents_of can query.
+  // The bootstrap is responsible for opening AND closing it
+  // (the harness doesn't close DBs it didn't open). Init
+  // failure at bootstrap time leaves this undefined; tools
+  // surface a clean `index.unavailable` error in that case.
+  codeIndex?: CodeIndex;
   cwd: string;
   systemPrompt?: string;
   userPrompt: string;
