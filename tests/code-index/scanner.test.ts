@@ -114,6 +114,31 @@ describe('extractFromSource — TypeScript', () => {
     expect(symbols.find((s) => s.name === 'login')?.visibility).toBe('internal');
   });
 
+  test('`export default <identifier>` flips local visibility to export', () => {
+    // The function declaration is at program level (not wrapped
+    // in export_statement). The trailing `export default foo`
+    // contains the identifier `foo` as a direct child of the
+    // export_statement — collectLocalExportedNames must pick it
+    // up alongside named-export clauses.
+    const src = `
+      function foo() {}
+      function helper() {}
+      export default foo;
+    `;
+    const { symbols } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    expect(symbols.find((s) => s.name === 'foo')?.visibility).toBe('export');
+    expect(symbols.find((s) => s.name === 'helper')?.visibility).toBe('internal');
+  });
+
+  test('inline `export default function foo() {}` still classifies as export', () => {
+    // Sanity guard: the wrapped-parent path in resolveVisibility
+    // already covered this, but the new identifier collector
+    // must NOT regress it.
+    const src = 'export default function foo() {}';
+    const { symbols } = extractFromSource(src, 'typescript', 'src/x.ts', parseSource);
+    expect(symbols.find((s) => s.name === 'foo')?.visibility).toBe('export');
+  });
+
   test('per-binding visibility for multi-binding const + named export', () => {
     // `const a = 1, b = 2; export { a }` exports only a.
     // Visibility must be resolved per-binding, not per-declaration.

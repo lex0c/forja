@@ -111,28 +111,47 @@ const resolveVisibility = (
   return 'internal';
 };
 
-// Pre-scan the program for top-level named export clauses
-// (`export { foo, bar as baz }`) and collect the local names
-// they re-export. This populates the `exportedNames` set passed
-// into `resolveVisibility`. Re-exports with a `source` field
-// (`export { x } from "./other"`) are skipped because their
-// names refer to a foreign module's exports, not local symbols.
+// Pre-scan the program for top-level export statements that
+// re-name local symbols, and collect the local identifiers they
+// expose. Two forms are covered:
 //
-// We collect the `name` field of each export_specifier (the
-// LOCAL identifier), not the `alias` field — `export { foo as bar }`
-// means the local symbol `foo` is exported (under the name `bar`
-// to consumers), so `foo`'s visibility flips to 'export'.
+//   1. `export { foo, bar as baz }` — named export clauses.
+//      The LOCAL identifier (the `name` field of each
+//      export_specifier) is what flips to 'export'; `baz` is
+//      a foreign-facing alias and isn't a local symbol.
+//
+//   2. `export default foo` (and `export = foo`) — default
+//      exports of an existing identifier. The export_statement
+//      has the identifier as a direct named child rather than
+//      wrapping a declaration. Declarations exported inline
+//      (`export default function foo() {}`) are already handled
+//      by the wrapped-parent check in resolveVisibility, so we
+//      do NOT need to revisit declaration children here.
+//
+// Re-exports with a `source` field (`export { x } from "./other"`)
+// are skipped — their names refer to a foreign module's
+// exports, not local symbols.
 const collectLocalExportedNames = (root: SyntaxNode): Set<string> => {
   const names = new Set<string>();
   for (const child of root.namedChildren ?? []) {
     if (child.type !== 'export_statement') continue;
     if (fieldNode(child, 'source') !== null) continue;
     for (const inner of child.namedChildren ?? []) {
-      if (inner.type !== 'export_clause') continue;
-      for (const spec of inner.namedChildren ?? []) {
-        if (spec.type !== 'export_specifier') continue;
-        const localName = fieldNode(spec, 'name');
-        if (localName !== null) names.add(localName.text);
+      if (inner.type === 'export_clause') {
+        for (const spec of inner.namedChildren ?? []) {
+          if (spec.type !== 'export_specifier') continue;
+          const localName = fieldNode(spec, 'name');
+          if (localName !== null) names.add(localName.text);
+        }
+      } else if (inner.type === 'identifier') {
+        // `export default foo` / `export = foo` — direct
+        // identifier reference. Inline declarations
+        // (`export default function foo() {}`) appear as
+        // function_declaration / class_declaration children
+        // and don't take this branch; they're picked up via
+        // the `defNode.parent.type === 'export_statement'`
+        // check in resolveVisibility.
+        names.add(inner.text);
       }
     }
   }

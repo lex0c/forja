@@ -35,10 +35,15 @@ export const CODE_INDEX_DEFAULT_EXCLUDES: readonly string[] = [
   '.hg/**',
   '.svn/**',
   // Credential conventions — same surface as
-  // SECURITY_GUIDELINE.md §8.4.
-  '.env',
-  '.env.*',
-  '.envrc',
+  // SECURITY_GUIDELINE.md §8.4. All patterns are recursive
+  // (`**/` prefix) so monorepos like `apps/api/.env` are
+  // covered, not just the repo root. Bun.Glob's `**` matches
+  // zero or more directories, so `**/.env` matches root and
+  // nested files alike. The walker (slice 4.3.1.b) MUST scan
+  // with `dot: true` for dotfile patterns to apply.
+  '**/.env',
+  '**/.env.*',
+  '**/.envrc',
   '**/*.pem',
   '**/*.key',
   '**/*.p12',
