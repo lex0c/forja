@@ -98,7 +98,10 @@ export type {
 export {
   getSubagentWorktree,
   insertSubagentWorktree,
+  listAllSubagentWorktrees,
   listOnDiskSubagentWorktrees,
+  listSubagentWorktreesWithParentCwd,
+  markSubagentWorktreeCleaned,
 } from './repos/subagent-worktrees.ts';
 export type {
   InsertSubagentWorktreeInput,

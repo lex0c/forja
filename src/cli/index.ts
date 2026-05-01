@@ -65,7 +65,10 @@ const main = async (): Promise<number> => {
   // an instruction for the model. Resume's empty-prompt check fires
   // inside run() with a more specific error.
   const promptOptional =
-    args.listSessions || args.undo !== undefined || args.checkpoints !== undefined;
+    args.listSessions ||
+    args.undo !== undefined ||
+    args.checkpoints !== undefined ||
+    args.worktrees !== undefined;
   if (args.prompt.length === 0 && !promptOptional) {
     process.stderr.write(`forja: missing prompt\n\n${usage()}\n`);
     return 1;

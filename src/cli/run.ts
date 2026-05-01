@@ -157,6 +157,26 @@ export const run = async (options: RunOptions): Promise<number> => {
     // We dispatch BEFORE the resume branch because they're mutually
     // exclusive — combining `--undo` with `--resume` would be a
     // contradictory request and ambiguity here would surprise users.
+    // Worktrees subcommands: same DB-only short-circuit pattern as
+    // checkpoints. Runs before checkpoints/resume/run since it's
+    // independent of all of them.
+    if (args.worktrees !== undefined) {
+      const cwd = options.bootstrapOverride?.cwd ?? process.cwd();
+      const dbPathOverride = options.bootstrapOverride?.dbPath;
+      const out = (s: string) => process.stdout.write(s);
+      const err = (s: string) => errSink(s);
+      const { runWorktreesCli } = await import('./worktrees.ts');
+      return await runWorktreesCli({
+        verb: args.worktrees.verb as 'list' | 'gc',
+        positionals: args.worktrees.positionals,
+        json: args.json,
+        cwd,
+        ...(dbPathOverride !== undefined ? { dbPath: dbPathOverride } : {}),
+        out,
+        err,
+      });
+    }
+
     if (args.checkpoints !== undefined || args.undo !== undefined) {
       const cwd = options.bootstrapOverride?.cwd ?? process.cwd();
       const dbPathOverride = options.bootstrapOverride?.dbPath;
