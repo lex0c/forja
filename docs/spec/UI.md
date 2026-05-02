@@ -20,6 +20,7 @@ UI ruim mata adoção mais rápido que arquitetura ruim. Arquitetura ruim você 
 8. **Modal nunca surpreende.** Permission/trust/memory write sempre tem precedente lógico. Se não tem, é bug de arquitetura.
 9. **Quebra graciosamente.** Sem TTY, sem cor, sem Unicode → degrada (texto puro, ASCII glyphs). Nunca morre.
 10. **Reversibilidade visível.** Se algo é desfazível, a UI mostra (`Ctrl+Z` disponível, último checkpoint, etc.).
+11. **Vocabulário técnico, sem fluff.** O usuário-alvo é engenheiro. Verbos descrevem a ação real (`Generating`, `Reading`, `Executing`), não rótulos genéricos (`Working`, `Loading`). Sem cortesia (`Please wait…`), sem mascote, sem metáfora. Detalhe operacional concreto (duração, tokens, paths) sempre que cabe em uma linha. Ver §4.10.
 
 ---
 
@@ -168,6 +169,8 @@ Cada elemento é uma função pura. Recebe estado, devolve linhas (com ANSI inli
 
 ### 4.1 Tool card
 
+> **Supersedido pela §4.10 (operation chip + sub-content).** Esta seção descreve o esboço inicial; a forma canônica do tool card é o operation chip definido em §4.10.5. Mantida aqui como referência de transição até a implementação migrar.
+
 ```ts
 interface ToolCardState {
   id: string
@@ -236,6 +239,8 @@ Mais de 8 todos: trunca pra "▶ running + próximas 2 pending + ✗ failed", co
 
 ### 4.4 Status line (sempre presente, 1 linha)
 
+> **Supersedido pela §4.10.6 (footer dinâmico).** A "status line acima do input" foi reposicionada como **footer** abaixo do input box, com layout de duas colunas (hint + config). Conteúdo é equivalente; posição e shape mudaram. Esta seção fica como referência do conteúdo (model, steps, cost, badges) — a posição canônica é §4.10.6.
+
 ```
 [autonomous] · forja · sonnet-4.6 · 12/50 · $0.04 · mem 4u · bg 1
 ```
@@ -271,6 +276,8 @@ Affordance ao iniciar:
 (dim, some no primeiro keystroke).
 
 ### 4.6 Permission modal
+
+> **Supersedido por §4.10.13 (permission modal canônico).** Esta seção descreve o esboço inicial (2 ações em linha horizontal); a forma canônica usa título estruturado, preview tool-aware (diff/comando), lista numerada de 3 opções e hint footer interno. Mantida aqui como referência de transição.
 
 Substitui o input box. Status line permanece.
 
@@ -340,6 +347,343 @@ Com risk explanation (`w`):
 ─────────────────────────────────────────
 ```
 
+### 4.10 Layout-alvo (engenharia)
+
+> **Esta seção é a referência canônica do layout.** §4.1 (tool card) e §4.4 (status line position) foram supersedidas; demais componentes (modal, todo list, subagent row) compõem com este alvo sem conflito.
+
+#### 4.10.1 Insight central
+
+O layout não é "bonito" — é **observabilidade vestida de chat**. Cada elemento responde uma pergunta operacional concreta sem parecer dashboard:
+
+| Pergunta | Resposta na UI |
+|---|---|
+| Travou? | Counter live no operation chip (`12s · ↑ 234 tokens`) |
+| Quanto tempo passou? | Chip final no scrollback (`Generated in 8.2s`) vira landmark |
+| Em que tool? | Verbo + sub-content (`Reading file… └─ src/foo.ts`) |
+| Que config está em vigor? | Footer direito (`• sonnet-4.6 · 3/50 · $0.012`) |
+| O que posso fazer agora? | Footer esquerdo, contextual (`esc to interrupt` só quando interruptable) |
+| Onde foi que perguntei X? | User echo em barra invertida full-width — divisor visual no scrollback |
+
+Forja já tem todos os dados (sessão, custo, plan, tools, durations); a tarefa do layout-alvo é **apresentá-los na forma que o engenheiro absorve passivamente**.
+
+#### 4.10.2 Hierarquia visual
+
+- **Dim baseline.** ~80% do texto renderizado é dim grayscale. Bold/cor entram só onde precisam: títulos, chip ativo (cor quente), erro (cor de erro). Sem o baseline dim, nada se destaca.
+- **Cor reservada.** `success`, `warn`, `error` da paleta (§6.1) marcam estado terminal de operação. Nunca decoração. Chip ativo usa `warn` (cor quente) durante execução; chip final volta para dim.
+- **Âncora inferior estável.** Quatro elementos sempre na mesma posição, na mesma ordem: régua → input (cursor inline) → régua → footer. Live region cresce **acima**, nunca disturba o anchor.
+- **Scrollback como navegação.** User echo em barra invertida cumpre papel de heading sem inventar headings. Rolando, as barras orientam ("onde foi que perguntei X?").
+
+#### 4.10.3 Vocabulário técnico — operações
+
+Verbo no presente contínuo enquanto ativo. Particípio passado quando completo.
+
+| Operação | Ativo | Finalizado |
+|---|---|---|
+| Provider call (texto streaming) | `Generating… (8s · ↑ 234 tokens)` | `Generated 234 tokens in 8.2s` |
+| Extended thinking | `Thinking… (3s)` | `Thought for 3.1s` |
+| Tool execution | per-tool verb (§4.10.4) | per-tool verb (§4.10.4) |
+| Compaction | `Compacting context… (12s)` | `Compacted 12 messages in 850ms` |
+| Checkpoint | `Checkpointing… (50ms)` | `Checkpointed at step 3 (a1b2c3d)` |
+| Subagent run | `Delegating to <name>… (Xs)` | `Delegated to <name> (Ys · N steps)` |
+| Permission ask | `Awaiting approval…` | `Approved` / `Denied` |
+| Step boundary | (não é chip — é separador, §4.10.8) | `── step 3/50 ── $0.012 ──` |
+
+Princípio: **verbo é a ação real**, não rótulo genérico.
+
+#### 4.10.4 Vocabulário técnico — per-tool
+
+| Tool | Ativo | Finalizado | Sub-content |
+|---|---|---|---|
+| `read_file` | `Reading file…` | `Read 1 file (2.4kB)` | `└─ src/foo.ts` |
+| `write_file` | `Writing file…` | `Wrote src/foo.ts (+42 lines)` | `└─ src/foo.ts` |
+| `edit_file` | `Editing file…` | `Edited src/foo.ts (+3 −1)` | `└─ src/foo.ts:42` |
+| `bash` | `Executing…` | `Exited 0 in 1.2s` | `└─ rg "pattern" src/` |
+| `bash_background` | `Spawning…` | `Spawned pid 12345` | `└─ npm run dev` |
+| `bash_output` | `Polling pid 12345…` | `Read 234 bytes` | `└─ pid 12345` |
+| `bash_kill` | `Killing pid 12345…` | `Killed pid 12345 (SIGTERM)` | `└─ pid 12345` |
+| `glob` | `Globbing…` | `Matched 14 files` | `└─ src/**/*.ts` |
+| `grep` | `Grepping…` | `Matched 3 in 14 files` | `└─ "createBus" src/tui` |
+| `task` (subagent) | `Delegating to <name>…` | `Delegated to <name> (Xs · N steps)` | `└─ goal: review repl.ts` |
+| `memory_list` | `Listing memory…` | `Listed 7 entries` | `└─ scope: project_local` |
+| `memory_read` | `Reading memory…` | `Read user/<name>.md` | `└─ user/user_role.md` |
+| `memory_search` | `Searching memory…` | `Matched 2 entries` | `└─ "deployment"` |
+| `todo_*` | `Updating todos…` | `Updated 3 items` | `└─ +1 done, −1 pending` |
+
+Princípio: **subject = o argumento que diz o quê**. Path, command, query, pid. Nunca o JSON inteiro. JSON cru fica atrás de `(ctrl+o to expand)` (§4.10.5).
+
+Adicionar tool nova exige escolher (verb-active, verb-final, subject-extractor) — registrado em `src/tui/tool-vocab.ts` (criação documentada em backlog quando o slice landar). Sem entrada → fallback para `Calling <tool>… / Called <tool>` + JSON args truncado a 80 chars (intencionalmente feio para sinalizar "falta vocabulário").
+
+#### 4.10.5 Operation chip (lifecycle)
+
+```ts
+interface OperationChip {
+  id: string                      // toolUseId, messageId, etc.
+  state: 'active' | 'final'
+  verb: string                    // 'Reading file', 'Generating', ...
+  durationMs: number              // live enquanto active, fixo quando final
+  tokens?: number                 // ↑ output tokens (provider call)
+  subject?: string                // sub-content em uma linha
+  expandable?: boolean            // mostra '(ctrl+o to expand)' se true
+  status?: 'done' | 'error' | 'denied'  // só em state=final
+}
+```
+
+**Ativo (live, na live region):**
+```
+* Reading file… (1.2s)
+└─ src/foo.ts
+```
+
+**Ativo (com tokens, ex: provider call):**
+```
+* Generating… (8s · ↑ 234 tokens)
+```
+
+**Final (scrollback, dim):**
+```
+* Read 1 file (2.4kB)
+└─ src/foo.ts
+```
+
+**Final (error, cor de erro no glyph apenas):**
+```
+* Exited 1 in 2.1s
+└─ rg --invalid-flag
+```
+
+**Final (denied, cor warn no glyph):**
+```
+* Denied
+└─ bash command 'rm -rf /' matches deny rule
+```
+
+**Glyph** `*` em todos os estados (Unicode prefere `▸` ativo, `·` final; ASCII fallback `*`). Cor: ativo = `warn`; final done = dim; final error = `error`; final denied = `warn`.
+
+Counter format: `(Xs · ↑ N tokens)` quando há geração; `(Xs)` quando não há (thinking, tool sem stream). Símbolo `↑` literal pra "saída acumulada" — engenheiro reconhece como uplink/output direction.
+
+Expansion (`ctrl+o`) abre um painel scrollable com o JSON args completo + output bruto. Painel é **modal** (§4.6 shape, conteúdo livre); fecha com Esc. Não implementado em M1; o hint `(ctrl+o to expand)` aparece mas tecla não responde até o slice de expansion landar.
+
+#### 4.10.6 Footer (status surface dinâmico)
+
+Sempre 1 linha, dim, **abaixo do input box** (com régua entre eles).
+
+| Estado | Esquerda | Direita |
+|---|---|---|
+| Idle | `? for help` | `• <model> · <steps>/<max> · $<cost>` |
+| Running | `? for help · esc to interrupt` | `• <model> · <steps>/<max> · $<cost>` |
+| Soft-aborted (ainda processando) | `? for help · esc again to force` | (mesmo) |
+| Plan mode | `? for help` | `• <model> · plan · <steps>/<max> · $<cost>` |
+| Modal up | (suprimido — modal cobre footer) | (suprimido) |
+
+Esquerda = **"o que posso fazer agora?"**. Hint de help + interrupt **só quando interruptable**.
+
+Direita = **"o que está em vigor?"**. Model · [plan ·] steps/max · cost. Slash commands implícitos: `/model`, `/plan`, `/budget` mudam cada um. Memory badge / bg / mcp (§4.4 conteúdo original) entram conforme presentes; em < 100 cols, somem por ordem de prioridade: mcp → bg → mem → cost label.
+
+Princípio: footer é **status surface, não help surface**. Nada de listar atalhos ou opções de menu. Help fica atrás de `?`.
+
+#### 4.10.7 Sub-content connector
+
+Subordinação visual com `└─ ` (ASCII fallback `\- `). Sempre **uma linha**. Se não cabe, vira tool output e vai pra expansion (§4.10.5).
+
+Casos:
+- Path: `└─ src/foo.ts:42`
+- Command: `└─ rg "pattern" src/`
+- Query: `└─ "createBus" src/tui`
+- Pid: `└─ pid 12345`
+- Subagent goal: `└─ goal: review repl.ts`
+- Razão (denied/error): `└─ denied: bash command 'rm -rf /' matches deny rule`
+
+Multi-tool ops (ex: `glob` matched 14 files) cita o **padrão**, não a lista — lista vai pra expansion. Sub-content é dim em todos os estados.
+
+#### 4.10.8 User echo (inverse bar)
+
+```
+> a tui já funciona?
+```
+
+Renderizado com SGR `7` (reverse) full-width — branco em fundo escuro, ocupando toda a coluna do terminal. Vira **divisor estrutural** no scrollback: rolando, as barras servem de heading natural para localizar turnos.
+
+Régua dim acima e abaixo do echo é **opcional** (decisão final na implementação após smoke test visual). Default: sem régua adicional, deixa a inversa carregar o destaque sozinha.
+
+ASCII fallback: SGR `7` é universal em qualquer terminal — sem fallback necessário. Em cor desabilitada (`NO_COLOR`), reverse continua funcionando (não é cor, é atributo).
+
+#### 4.10.9 Welcome banner (scrollback)
+
+Emitido **uma vez** no boot do REPL, como `PermanentItem` kind `'session-banner'`. Quatro linhas, todas respondem uma pergunta concreta:
+
+```
+forja v0.0.0
+anthropic/claude-sonnet-4-6 · 200k ctx · max 4096 out
+/run/media/lex/.../forja
+policy: project (5 rules) · subagents: 2 · checkpoints: enabled · memory: 14 entries
+```
+
+| Linha | Pergunta |
+|---|---|
+| 1 | Qual versão. |
+| 2 | Qual modelo, com limites concretos (context window, max output). |
+| 3 | Em qual cwd. |
+| 4 | Ambiente: quantas regras, quantos subagents, checkpoints/memory ligados. |
+
+Vai pro scrollback — uma vez impresso, scrolla naturalmente conforme a conversa cresce. **Sem header fixo.** Sem logo. Sem mascot. (Se um dia identidade visual virar pauta, ASCII art opcional via flag — não default.)
+
+Em modo `--json`, o banner é emitido como `{type: 'session:banner', ...}` no NDJSON em vez de linhas formatadas.
+
+#### 4.10.10 Step separator
+
+```
+── step 3/50 ── $0.012 ──
+```
+
+Régua dim com state inline. Aparece quando um turno fecha e outro vai abrir (substitui o `session-footer` em modo REPL). Largura preenche a coluna do terminal com `─`.
+
+Em modo one-shot, o separator não aparece — o `session-footer` continua sendo o único marcador final (compatibilidade preservada).
+
+#### 4.10.11 Anti-vocabulário
+
+Banidos do vocabulário operacional:
+
+- `Working`, `Loading`, `Processing`, `Please wait` — vagos.
+- `Handling`, `Managing`, `Orchestrating` — abstratos.
+- `Just a moment…`, `Working on it…` — cortesia, desperdício de coluna.
+- `Ready!`, `Done!`, `Success!` — redundantes; ausência de chip ativo já comunica.
+- Emoji decorativo (✓ ✗ ⚠️ 🔧 💭 🚀) — depende de fonte/terminal, conflita com paleta dim. Glyphs canônicos da §6.2 são exceção (são informativos, não decorativos).
+- Metáforas culinárias/artesanais ("Baking", "Cooking", "Brewing", "Forging") — engenheiro lê verbo literal melhor que metáfora.
+- Mascote, ícones de marca, logo — fora de escopo do core; flag opcional se virar pauta.
+
+#### 4.10.12 Layout completo (referência ASCII)
+
+```
+┌─ scrollback (permanent items, dim baseline) ───────────────────────┐
+│ forja v0.0.0                                                        │
+│ anthropic/claude-sonnet-4-6 · 200k ctx · max 4096 out               │
+│ /run/media/lex/.../forja                                            │
+│ policy: project (5 rules) · subagents: 2 · checkpoints: enabled     │
+│                                                                     │
+│ > a tui já funciona?                            ← inverse bar       │
+│ * Reading file (2.4kB)                          ← chip final, dim   │
+│ └─ src/foo.ts                                                       │
+│ * Generated 234 tokens in 8.2s                                      │
+│ Sim, em teoria funciona...                      ← assistant text    │
+│ ── step 3/50 ── $0.012 ──                       ← step separator    │
+└─────────────────────────────────────────────────────────────────────┘
+─────────────────────────────────────────────────────────────────────  ← régua
+> ▌                                                                   ← input + cursor inline
+─────────────────────────────────────────────────────────────────────  ← régua
+? for help · esc to interrupt        • sonnet-4.6 · 3/50 · $0.012     ← footer
+```
+
+Live region (entre as réguas e a inferior):
+- Operation chips ativos (com counter live).
+- Todo list (§4.3) acima dos chips, se houver.
+- Modal (§4.6+) substitui o input box quando aberto; footer suprimido.
+
+#### 4.10.13 Permission modal canônico
+
+Substitui §4.6. Layout estruturado em 4 blocos (título, preview tool-aware, pergunta+opções, hint footer interno) com lista numerada vertical e cursor `>`.
+
+**Visual de referência (`edit_file` em `.gitignore`):**
+
+```
+─────────────────────────────────────────────────────────────────
+  Edit file
+  .gitignore
+─────────────────────────────────────────────────────────────────
+  25
+  26  # Bun
+  27  .bun/
+  28  +
+  29  +foobar
+─────────────────────────────────────────────────────────────────
+  Do you want to make this edit to .gitignore?
+    1. Yes
+    2. Yes, allow all edit_file during this session (shift+tab)
+  > 3. No
+  Esc to cancel
+```
+
+`>` marca a opção selecionada (default = `3. No`). Apertar `1`/`2`/`3` ativa direto sem navegar.
+
+**Visual `bash` destrutivo:**
+
+```
+─────────────────────────────────────────────────────────────────
+  Run command
+  rm -rf ./build
+─────────────────────────────────────────────────────────────────
+  $ rm -rf ./build
+  cwd: /run/media/lex/.../forja
+  matched policy rule: bash.rm.rf (deny by default)
+─────────────────────────────────────────────────────────────────
+  Do you want to run this command?
+    1. Yes
+    2. Yes, allow all bash during this session (shift+tab)
+  > 3. No
+  Esc to cancel
+```
+
+**Bloco 1 — Título.** Verbo bold + subject dim. Verbos canônicos por tool:
+- `read_file` → não pede permissão (read-only sempre passa).
+- `write_file` → `Write file` / `<path>`.
+- `edit_file` → `Edit file` / `<path>`.
+- `bash` → `Run command` / `<command, truncado>`.
+- `bash_background` → `Spawn process` / `<command, truncado>`.
+- `bash_kill` → `Kill process` / `pid <N>`.
+- `task` (subagent) → `Spawn subagent` / `<name>`.
+- `memory_write` → `Write memory` / `<scope>/<name>`.
+- Sem entrada → `Use <toolName>` / args truncados a 80 chars.
+
+**Bloco 2 — Preview tool-aware.** Cada tool registra `previewForApproval(args, ctx): string[]` no `ToolDef` (ver `CONTRACTS.md §2.6` — extensão a ser propagada). Conteúdo:
+
+| Tool | Preview |
+|---|---|
+| `edit_file` | Diff com line numbers, contexto ±3 linhas em torno das mudanças, `+`/`-` prefix |
+| `write_file` | Primeiras N linhas do conteúdo (cap em 20), com `(file is N lines, showing first 20)` se maior |
+| `bash` / `bash_background` | `$ <command>` + `cwd: <path>` + (opcional) `matched policy rule: <id>` se vier de `confirm` decision |
+| `bash_kill` | `pid <N>` + `command: <cmdline>` + `started: <relative time>` |
+| `task` | `goal: <text>` + `whitelist: <tools>` + `budget: <maxSteps>` |
+| `memory_write` | `scope: <s>` + `name: <n>` + corpo bruto (cap em 10 linhas) |
+
+Sem `previewForApproval` registrado → fallback para `args: <JSON.stringify(args, null, 2)>` truncado a 20 linhas (intencionalmente cru pra sinalizar "tool não declarou preview adequado"). Tools que invocam recursos externos (`bash`, `task`) **devem** registrar — falha de preview = falha de spec.
+
+**Bloco 3 — Pergunta + opções.** Pergunta em linguagem natural derivada do verbo (`Do you want to <verb-imperative> <subject>?`). Opções (3 fixas para permission, conforme D64):
+
+```
+  1. Yes
+  2. Yes, allow all <toolName> during this session (shift+tab)
+> 3. No
+```
+
+Atalhos:
+- `1`/`2`/`3` → ativam direto.
+- `↑`/`↓` ou `Tab`/`Shift+Tab` → navegam.
+- `Enter` → confirma a selecionada.
+- `Shift+Tab` → atalho secundário pra opção 2 (session-allow), exposto no label entre parênteses.
+- `Esc` → cancela (semântica distinta de `No`; ver D5 / regra 9 da §5.5).
+
+**Bloco 4 — Hint footer interno.** Linha dim com `Esc to cancel`. Em M1 só esse hint. Quando `Tab to amend` (v2) landar, vira `Esc to cancel · Tab to amend`. Hints são parte do `ConfirmState.hints` (§5.5) — caller controla.
+
+**Semântica das opções (`value` no `permission:answer`):**
+
+| Opção | `value` | Efeito |
+|---|---|---|
+| 1. Yes | `'yes'` | Aprova esta invocação. Sem efeito persistente. |
+| 2. Yes, allow all | `'session-allow'` | Aprova esta invocação **e** grava regra na session-layer da policy (`tools.<toolName>: allow`). Próximas invocações do mesmo tool nesta sessão não geram modal. Sessão fecha → regra evapora. |
+| 3. No | `'no'` | Rejeita explicitamente. Caller (harness) trata como `denied` no `tool_finished` (§HarnessEvent). |
+| Esc | `'cancel'` | Desistência. Audit-distinct de `'no'`; caller pode tratar diferente (ex: replay-friendly logs marcam cancel vs reject). Para o tool, idêntico a `'no'`. |
+
+**Decisões registradas:**
+
+- **D63 — Preview tool-aware obrigatório para tools com side-effect.** `edit_file`/`write_file`/`bash`/`bash_background`/`bash_kill`/`task`/`memory_write` precisam de `previewForApproval` registrado. Read-only tools nem chegam ao modal. Fallback de `JSON.stringify` é deliberadamente feio pra forçar o registro adequado em code review.
+- **D64 — Session-bypass scoped por tool name.** Opção 2 escreve `tools.<toolName>: { default: 'allow' }` na session-layer. Não é "approve everything" — é "approve all calls do mesmo tool". Engine respeita a hierarquia normal (enterprise/user/project ainda podem deny por glob/categoria). Sessão-wide escopo: morre quando a sessão fecha; não persiste para resume.
+- **D65 — Default-NO via `selectedIndex = options.length - 1`.** Generaliza D5 do esquema yes/no para listas de N opções. Convenção: a última opção é sempre a mais conservadora. Caller que precisar de outro default deve documentar a justificativa no BACKLOG (e a code review checa). Permission, trust, memory-write seguem; plan-review tem 3 opções (approve/edit/reject) onde reject = última.
+
+**O que ainda não está aqui (deferred):**
+
+- **`Tab to amend`** — feature v2. Edit-then-confirm exige input editor aninhado dentro do modal (focus stack 3-deep, persistência da edição, validação por tool). M1 não mostra a hint; quando landar, o producer adiciona `'Tab to amend'` em `hints` e o focus handler intercepta `Tab` antes da navegação.
+- **`Why?` explanation** — antiga `[w]` da §4.6. Preview tool-aware já carrega `matched policy rule: ...` quando o tool veio de uma `confirm` decision do engine; explicação adicional fica como expansion futura via `(ctrl+i for risk details)` ou similar.
+- **Outros flavors visuais** (trust, memory-write, plan-review, critique). Compartilham o `ConfirmState` shape de §5.5; layout específico de cada um lands no slice que conectar o producer correspondente.
+
 ---
 
 ## 5. Padrões de interação
@@ -395,96 +739,157 @@ Modal **não é popup**. É:
 
 Sem framework. Sem reconciler. Sem componentes reutilizáveis.
 
-#### Estado
+#### Estado (generalizado para N opções)
 
 ```ts
-interface ConfirmState {
-  message: string
-  details?: string[]
-  selected: 'yes' | 'no'
-  defaultsTo: 'no'         // safety: default sempre 'no'
-  timeoutMs?: number        // opcional; ausente = sem timeout
+interface ConfirmOption {
+  // Hotkey de ativação. Convencionalmente '1','2','3' para opções
+  // numeradas; pode ser letra ('a','r','e') para mnemônicos.
+  key: string
+  label: string                // 'Yes', 'Yes, allow all edits during this session', 'No'
+  // Semântica processada pelo caller — `value` viaja no
+  // permission:answer (ou flavor equivalente). Permission-flavor
+  // usa 'yes' | 'session-allow' | 'no'; outros flavors definem
+  // seu próprio union.
+  value: string
+  // Atalho secundário opcional (ex: 'shift+tab' para a opção
+  // session-allow no permission modal). Mostrado entre parênteses
+  // após o label; não bloqueia a hotkey numérica.
+  shortcut?: string
 }
 
-let confirm: ConfirmState | null = null
-let resolveConfirm: ((v: boolean) => void) | null = null
+interface ConfirmState {
+  promptId: string
+  flavor: 'permission' | 'trust' | 'memory-write' | 'plan-review' | 'critique'
+  // Bloco de título: verbo bold + subject dim na linha de baixo.
+  // Para permission: ('Edit file', '.gitignore'); para trust:
+  // ('Trust directory', '/path/to/repo'). Subject é opcional —
+  // ausente quando o modal não tem alvo único.
+  title: string
+  subject?: string
+  // Conteúdo tool-aware: diff (edit), comando (bash), corpo (memory),
+  // lista de steps (plan), etc. Lines já formatadas (cores, line
+  // numbers). O modal renderiza-as entre réguas; sem preview, omite
+  // o bloco inteiro (sem régua extra).
+  preview: string[]
+  // Pergunta em linguagem natural. Se ausente, o modal pula a linha
+  // antes da lista — útil quando o título já fechou a pergunta.
+  question?: string
+  options: ConfirmOption[]
+  // Default = última opção (convenção: última = NO/cancel/skip).
+  // Caller que precisar de outro default seta explicitamente —
+  // mas D5/D65 mandam usar `options.length - 1` salvo justificativa.
+  selectedIndex: number
+  // Hints renderizados no rodapé do modal (separados por ' · ').
+  // Sempre inclui 'Esc to cancel'; producers adicionam 'Tab to amend'
+  // (v2), 'shift+tab to bypass' etc. Ordem importa: esquerda → direita.
+  hints: string[]
+  timeoutMs?: number
+}
 ```
 
 #### Render (substitui o input dentro da região viva)
 
 ```ts
-function renderConfirm(c: ConfirmState): string[] {
+function renderConfirm(c: ConfirmState, caps: Capabilities): string[] {
+  const rule = caps.unicode ? '─'.repeat(caps.cols) : '-'.repeat(caps.cols)
+  const cursor = caps.unicode ? '>' : '>'  // mesmo glyph; placeholder
   return [
-    '─────────────────────────────────────────',
-    `  ${c.message}`,
-    ...(c.details?.length ? ['', ...c.details.map(d => `  ${d}`)] : []),
-    '',
-    `  ${c.selected === 'yes' ? '▶ YES' : '  YES'}    ${c.selected === 'no' ? '▶ NO' : '  NO'}`,
-    '─────────────────────────────────────────',
+    rule,
+    paint(caps, 'bold', `  ${c.title}`),
+    ...(c.subject ? [paint(caps, 'dim', `  ${c.subject}`)] : []),
+    rule,
+    ...c.preview.map(l => `  ${l}`),
+    rule,
+    ...(c.question ? [`  ${c.question}`] : []),
+    ...c.options.map((opt, i) => {
+      const marker = i === c.selectedIndex ? cursor : ' '
+      const shortcut = opt.shortcut ? paint(caps, 'dim', ` (${opt.shortcut})`) : ''
+      return `${marker} ${opt.key}. ${opt.label}${shortcut}`
+    }),
+    paint(caps, 'dim', `  ${c.hints.join(' · ')}`),
   ]
 }
 ```
 
-Modais substituem **o input**, não o histórico. Status line continua. `composeLive(state)` chama `renderConfirm()` em vez de `renderInput()` quando `confirm !== null`. Não há "overlay" sobre o histórico — região viva é dona dela mesma.
+Modais substituem **o input box e o footer global** (footer global é suprimido enquanto modal ativo — modal traz seu próprio footer interno via `c.hints`). Histórico (scrollback) permanece visível acima. `composeLive(state)` chama `renderConfirm()` em vez de `renderInput()` quando `state.modal !== null`. Não há "overlay" sobre o histórico — região viva é dona dela mesma.
 
 #### Focus handler (push no topo da stack)
 
 ```ts
 pushFocus(key => {
-  if (!confirm) return false
-  if (key === 'left' || key === 'right' || key === 'tab') {
-    confirm.selected = confirm.selected === 'yes' ? 'no' : 'yes'
+  if (!state.modal) return false
+  const m = state.modal
+  // Hotkey numérica/letra ativa diretamente.
+  const hit = m.options.findIndex(o => keyMatches(key, o.key))
+  if (hit >= 0) {
+    resolveModal(m.options[hit].value)
+    return true
+  }
+  // Atalho secundário (ex: shift+tab → session-allow).
+  const sc = m.options.findIndex(o => o.shortcut && keyMatches(key, o.shortcut))
+  if (sc >= 0) {
+    resolveModal(m.options[sc].value)
+    return true
+  }
+  if (key === 'up' || key === 'shift+tab') {
+    m.selectedIndex = Math.max(0, m.selectedIndex - 1)
+    bus.emit({type: 'modal:select', promptId: m.promptId, selectedIndex: m.selectedIndex})
+    return true
+  }
+  if (key === 'down' || key === 'tab') {
+    m.selectedIndex = Math.min(m.options.length - 1, m.selectedIndex + 1)
+    bus.emit({type: 'modal:select', promptId: m.promptId, selectedIndex: m.selectedIndex})
     return true
   }
   if (key === 'enter') {
-    const result = confirm.selected === 'yes'
-    confirm = null
-    popFocus()
-    resolveConfirm!(result)
+    resolveModal(m.options[m.selectedIndex].value)
     return true
   }
   if (key === 'escape') {
-    confirm = null
-    popFocus()
-    resolveConfirm!(false)
+    resolveModal('cancel')  // distinto de 'no' — cancel é desistência
     return true
   }
   return true  // bloqueia o resto enquanto modal ativo
 })
 ```
 
-#### API async
+#### API async (permission flavor)
 
 ```ts
-function askConfirm(message: string, details?: string[], timeoutMs?: number): Promise<boolean> {
-  return new Promise(resolve => {
-    confirm = { message, details, selected: 'no', defaultsTo: 'no', timeoutMs }
-    resolveConfirm = resolve
-    if (timeoutMs) {
-      setTimeout(() => {
-        if (confirm) { confirm = null; popFocus(); resolve(false) }
-      }, timeoutMs)
-    }
+function askPermission(args: PermissionAskArgs, opts?: ConfirmAskOptions): Promise<PermissionAnswer> {
+  return enqueueConfirm({
+    flavor: 'permission',
+    title: titleFor(args.toolName),         // 'Edit file', 'Run command', ...
+    subject: subjectFor(args),              // '.gitignore', 'rm -rf ./build', ...
+    preview: args.preview ?? [],            // tool registra via previewForApproval
+    question: questionFor(args.toolName, args),
+    options: [
+      { key: '1', label: 'Yes',                                         value: 'yes' },
+      { key: '2', label: `Yes, allow all ${args.toolName} during this session`,
+        value: 'session-allow', shortcut: 'shift+tab' },
+      { key: '3', label: 'No',                                          value: 'no' },
+    ],
+    selectedIndex: 2,                       // D5/D65 — default = NO (última opção)
+    hints: ['Esc to cancel'],               // 'Tab to amend' adicionado quando v2 landar
+    ...(opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
   })
 }
 ```
 
-Uso:
-
-```ts
-const ok = await askConfirm('Apply changes?', ['3 files will be modified'])
-if (ok) await applyDiff()
-```
+Outros flavors (trust, memory-write, plan-review, critique) constroem suas próprias listas de opções — geralmente 2 (yes/no) ou 3 (approve/edit/reject). `selectedIndex` default fica na última (rejeição/cancelamento) por convenção D65, com exceção justificada documentada na BACKLOG.
 
 #### Regras (não-negociáveis)
 
-1. **Default = NO.** `selected` inicia em `'no'`. Enter sem navegar = rejeita. Salva muita unha.
-2. **Highlight com seta** (`▶ YES`), não cor sólida. Cor só em status final (verde após accept, vermelho após reject) — opcional.
-3. **Bloqueio total do input normal** enquanto modal ativo. O `return true` no fim do handler garante que tecla nenhuma vaza pra baixo na focus stack.
-4. **Largura fixa** com `padEnd` em todas as linhas internas. Sem isso, ANSI errado quebra o redraw.
+1. **Default = última opção** (`selectedIndex = options.length - 1`). Convenção: a última opção é a mais conservadora (No / Reject / Skip / Cancel). Enter sem navegar = escolha conservadora. Salva muita unha. (Ver D5 e D65.)
+2. **Cursor `>` à esquerda da opção selecionada** (ASCII universal). Sem cor sólida no item — manter dim baseline. Cor só na borda de status final (`success` após accept, `error` após reject), opcional.
+3. **Bloqueio total do input normal** enquanto modal ativo. O `return true` no fim do handler garante que tecla nenhuma vaza pra baixo na focus stack. Footer global da app (§4.10.6) é suprimido — o modal traz seu próprio rodapé via `hints`.
+4. **Largura full-cols** com `padEnd` em todas as linhas internas. Sem isso, ANSI errado quebra o redraw.
 5. **Sem reflow durante input.** Resize (SIGWINCH) durante modal: reposiciona, não reflua texto.
 6. **Timeout opcional, default rejeita.** `permission:ask` sem timeout (espera o user). `trust:ask` com 5min (rejeita pra read-only). Plan review sem timeout.
-7. **Re-render mínimo.** Mudança de `selected` redesenha só a região viva, nunca o histórico.
+7. **Re-render mínimo.** Mudança de `selectedIndex` redesenha só a região viva, nunca o histórico.
+8. **Hotkey numérica direta.** Apertar `1`/`2`/`3` ativa a opção correspondente sem navegar primeiro. Atalhos secundários (`shortcut`) idem.
+9. **Esc é cancel, não NO.** O handler resolve com `'cancel'` (distinto de `'no'`) quando Esc é pressionado. Audit/telemetria diferencia "usuário rejeitou explicitamente" de "usuário desistiu sem decidir". Caller que não diferencia trata ambos como rejeição.
 
 ### 5.6 Modal queue
 
@@ -694,9 +1099,11 @@ Pty harness (`node-pty`) só pra fluxos que dependem de raw stdin parsing (paste
    Else:
      Start NDJSON serializer (subscribes to bus).
 5. Bootstrap subsystems (memory, checkpoints, providers, ...).
-6. Bus emit `session:start`.
-7. Loop: read input, dispatch to harness, emit events.
-8. On exit (any path): drain bus, restore stdin mode, cursor visible.
+6. Bus emit `session:banner` (§4.10.9 — em REPL; one-shot pula).
+7. Bus emit `session:start`.
+8. Loop: read input, dispatch to harness, emit events.
+9. Em transição de turno (REPL only): bus emit `step:separator` (§4.10.10).
+10. On exit (any path): drain bus, restore stdin mode, cursor visible.
 ```
 
 Restore de stdin mode é crítico — sem isso, o terminal do user fica em raw mode após crash. Use `process.on('exit'|'SIGINT'|'uncaughtException')` para garantir.
