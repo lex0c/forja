@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import type { UIEvent } from '../../src/tui/events.ts';
-import { type LiveState, applyEvent, createInitialState } from '../../src/tui/state.ts';
+import {
+  type LiveState,
+  type PermanentItem,
+  applyEvent,
+  createInitialState,
+} from '../../src/tui/state.ts';
 
 const start = (overrides: Partial<UIEvent> = {}): UIEvent =>
   ({
@@ -13,9 +18,9 @@ const start = (overrides: Partial<UIEvent> = {}): UIEvent =>
     ...overrides,
   }) as UIEvent;
 
-const drive = (events: UIEvent[]): { state: LiveState; permanent: string[] } => {
+const drive = (events: UIEvent[]): { state: LiveState; permanent: PermanentItem[] } => {
   let state = createInitialState();
-  const permanent: string[] = [];
+  const permanent: PermanentItem[] = [];
   for (const ev of events) {
     const r = applyEvent(state, ev);
     state = r.state;
@@ -25,19 +30,25 @@ const drive = (events: UIEvent[]): { state: LiveState; permanent: string[] } => 
 };
 
 describe('session lifecycle', () => {
-  test('session:start populates status fields and prints a header', () => {
+  test('session:start populates status fields and emits a header item', () => {
     const r = applyEvent(createInitialState(), start());
     expect(r.state.status.sessionId).toBe('s1');
     expect(r.state.status.profile).toBe('autonomous');
     expect(r.state.status.project).toBe('forja');
     expect(r.state.status.model).toBe('claude-opus-4-7');
     expect(r.state.ended).toBe(false);
-    expect(r.permanent).toHaveLength(1);
-    expect(r.permanent[0]).toContain('s1');
-    expect(r.permanent[0]).toContain('autonomous');
+    expect(r.permanent).toEqual([
+      {
+        kind: 'session-header',
+        sessionId: 's1',
+        profile: 'autonomous',
+        project: 'forja',
+        model: 'claude-opus-4-7',
+      },
+    ]);
   });
 
-  test('session:end marks state ended and emits summary', () => {
+  test('session:end marks state ended and emits footer item', () => {
     const r = applyEvent(createInitialState(), {
       type: 'session:end',
       ts: 2,
@@ -45,32 +56,32 @@ describe('session lifecycle', () => {
       reason: 'done',
     });
     expect(r.state.ended).toBe(true);
-    expect(r.permanent[0]).toContain('done');
+    expect(r.permanent).toEqual([{ kind: 'session-footer', reason: 'done' }]);
   });
 });
 
 describe('user input', () => {
-  test('user:submit echoes prompt to scrollback and clears input', () => {
+  test('user:submit emits user-submit item and clears input', () => {
     let state = createInitialState();
     state = { ...state, input: { value: 'pending', cursor: 7 } };
     const r = applyEvent(state, { type: 'user:submit', ts: 1, text: 'hello' });
     expect(r.state.input.value).toBe('');
     expect(r.state.input.cursor).toBe(0);
-    expect(r.permanent).toEqual(['> hello']);
+    expect(r.permanent).toEqual([{ kind: 'user-submit', text: 'hello' }]);
   });
 
-  test('multi-line submit indents continuation lines', () => {
+  test('multi-line submit preserves text raw (renderer formats indent)', () => {
     const r = applyEvent(createInitialState(), {
       type: 'user:submit',
       ts: 1,
       text: 'first\nsecond\nthird',
     });
-    expect(r.permanent).toEqual(['> first', '  second', '  third']);
+    expect(r.permanent).toEqual([{ kind: 'user-submit', text: 'first\nsecond\nthird' }]);
   });
 });
 
 describe('assistant streaming', () => {
-  test('start opens a buffer; deltas accumulate; end flushes to scrollback', () => {
+  test('start opens a buffer; deltas accumulate; end emits assistant item', () => {
     const result = drive([
       { type: 'assistant:start', ts: 1, messageId: 'm1' },
       { type: 'assistant:delta', ts: 2, messageId: 'm1', text: 'Hello, ' },
@@ -78,16 +89,16 @@ describe('assistant streaming', () => {
       { type: 'assistant:end', ts: 4, messageId: 'm1' },
     ]);
     expect(result.state.pendingAssistant).toBeNull();
-    expect(result.permanent).toEqual(['Hello, world!']);
+    expect(result.permanent).toEqual([{ kind: 'assistant', text: 'Hello, world!' }]);
   });
 
-  test('multi-line assistant flushes one permanent line per source line', () => {
+  test('multi-line assistant text is preserved as one item with newlines', () => {
     const result = drive([
       { type: 'assistant:start', ts: 1, messageId: 'm1' },
       { type: 'assistant:delta', ts: 2, messageId: 'm1', text: 'line1\nline2\nline3' },
       { type: 'assistant:end', ts: 3, messageId: 'm1' },
     ]);
-    expect(result.permanent).toEqual(['line1', 'line2', 'line3']);
+    expect(result.permanent).toEqual([{ kind: 'assistant', text: 'line1\nline2\nline3' }]);
   });
 
   test('delta without prior start opens a buffer on the fly', () => {
@@ -123,7 +134,7 @@ describe('thinking lifecycle', () => {
 });
 
 describe('tool lifecycle', () => {
-  test('start adds an active tool, end emits a permanent summary and removes it', () => {
+  test('start adds an active tool, end emits tool-end item and removes it', () => {
     const result = drive([
       { type: 'tool:start', ts: 1, toolId: 't1', name: 'bash', args: 'ls -la' },
       {
@@ -136,10 +147,28 @@ describe('tool lifecycle', () => {
       },
     ]);
     expect(result.state.activeTools.size).toBe(0);
-    expect(result.permanent).toHaveLength(2);
-    expect(result.permanent[0]).toContain('bash');
-    expect(result.permanent[0]).toContain('1.2s');
-    expect(result.permanent[1]).toBe('  47 entries');
+    expect(result.permanent).toEqual([
+      {
+        kind: 'tool-end',
+        name: 'bash',
+        args: 'ls -la',
+        status: 'done',
+        durationMs: 1200,
+        summary: '47 entries',
+      },
+    ]);
+  });
+
+  test('tool:end without summary emits item without summary field', () => {
+    const result = drive([
+      { type: 'tool:start', ts: 1, toolId: 't1', name: 'read', args: 'foo' },
+      { type: 'tool:end', ts: 200, toolId: 't1', status: 'done', durationMs: 50 },
+    ]);
+    const item = result.permanent[0];
+    if (item?.kind !== 'tool-end') {
+      throw new Error(`unexpected item kind: ${item?.kind}`);
+    }
+    expect(item.summary).toBeUndefined();
   });
 
   test('delta lines feed the preview window, capped at 5 lines', () => {
@@ -193,19 +222,7 @@ describe('tool lifecycle', () => {
     expect(r.permanent).toEqual([]);
   });
 
-  test('error status uses x glyph and ms units for sub-1s durations', () => {
-    const result = drive([
-      { type: 'tool:start', ts: 1, toolId: 't1', name: 'read', args: 'foo' },
-      { type: 'tool:end', ts: 200, toolId: 't1', status: 'error', durationMs: 850 },
-    ]);
-    expect(result.permanent[0]).toContain('x read');
-    expect(result.permanent[0]).toContain('850ms');
-  });
-
-  test('denied uses a different glyph from error', () => {
-    // Spec UI.md §4.1/§4.6: users must be able to tell "policy blocked
-    // me" from "tool crashed" at a glance. Same glyph would conflate
-    // them.
+  test('error and denied statuses are preserved on the item (renderer picks glyph)', () => {
     const errored = drive([
       { type: 'tool:start', ts: 1, toolId: 't1', name: 'bash', args: 'rm' },
       { type: 'tool:end', ts: 100, toolId: 't1', status: 'error', durationMs: 50 },
@@ -214,11 +231,13 @@ describe('tool lifecycle', () => {
       { type: 'tool:start', ts: 1, toolId: 't2', name: 'bash', args: 'rm' },
       { type: 'tool:end', ts: 100, toolId: 't2', status: 'denied', durationMs: 50 },
     ]);
-    const errorGlyph = errored.permanent[0]?.charAt(0);
-    const deniedGlyph = denied.permanent[0]?.charAt(0);
-    expect(errorGlyph).toBeDefined();
-    expect(deniedGlyph).toBeDefined();
-    expect(errorGlyph).not.toBe(deniedGlyph);
+    const e = errored.permanent[0];
+    const d = denied.permanent[0];
+    if (e?.kind !== 'tool-end' || d?.kind !== 'tool-end') {
+      throw new Error('expected tool-end items');
+    }
+    expect(e.status).toBe('error');
+    expect(d.status).toBe('denied');
   });
 });
 
@@ -239,22 +258,22 @@ describe('budget + diagnostics', () => {
     expect(r.permanent).toEqual([]);
   });
 
-  test('error event prints a permanent line', () => {
+  test('error event emits an error item', () => {
     const r = applyEvent(createInitialState(), {
       type: 'error',
       ts: 1,
       message: 'provider down',
     });
-    expect(r.permanent).toEqual(['error: provider down']);
+    expect(r.permanent).toEqual([{ kind: 'error', message: 'provider down' }]);
   });
 
-  test('warn event prints a permanent line', () => {
+  test('warn event emits a warn item', () => {
     const r = applyEvent(createInitialState(), {
       type: 'warn',
       ts: 1,
       message: 'budget at 80%',
     });
-    expect(r.permanent).toEqual(['warn: budget at 80%']);
+    expect(r.permanent).toEqual([{ kind: 'warn', message: 'budget at 80%' }]);
   });
 });
 

@@ -3,8 +3,10 @@
 // `LiveState` captures everything currently rendered in the bottom 3-15
 // lines of the terminal. The reducer (`applyEvent`) is pure: given a
 // state and a UIEvent, it returns the next state plus an array of
-// already-formatted lines to push into the scrollback (permanent
-// content). The renderer wires the I/O around this — see renderer.ts.
+// structured `PermanentItem` records the renderer turns into scrollback
+// lines. Glyph + color decisions live downstream in `formatPermanent`
+// (renderer.ts) — the reducer never sees `Capabilities`. The renderer
+// wires the I/O around this — see renderer.ts.
 //
 // Events for which UI rendering has not been wired yet (modals,
 // subagents, bg, todo, plan/critique/permission/trust/memory) are
@@ -91,12 +93,43 @@ export const createInitialState = (): LiveState => ({
 // shrink further per layout.
 const TOOL_PREVIEW_MAX_LINES = 5;
 
+// Structured records representing scrollback entries the reducer wants
+// the renderer to print. Glyph + color decisions live in the renderer
+// (which sees `caps`), not here — keeping the reducer free of capability
+// awareness. The renderer's `formatPermanent(item, caps)` turns each
+// record into one or more output strings.
+//
+// Adding a new kind: extend the union, handle it in `formatPermanent`
+// (renderer.ts), and emit from the relevant `applyEvent` branch.
+export type PermanentItem =
+  | {
+      kind: 'session-header';
+      sessionId: string;
+      profile: string;
+      project: string;
+      model: string;
+    }
+  | { kind: 'session-footer'; reason: string }
+  | { kind: 'user-submit'; text: string }
+  | { kind: 'assistant'; text: string }
+  | {
+      kind: 'tool-end';
+      name: string;
+      args: string;
+      status: 'done' | 'error' | 'denied';
+      durationMs: number;
+      summary?: string;
+    }
+  | { kind: 'error'; message: string }
+  | { kind: 'warn'; message: string };
+
 export interface ApplyResult {
   state: LiveState;
-  // Lines to emit to permanent stdout in order. Each string represents
-  // one line WITHOUT its trailing newline — the renderer adds `\n`.
-  // Empty array = no scrollback output for this event.
-  permanent: string[];
+  // Structured records for the renderer to emit as scrollback. Empty
+  // array = no scrollback output for this event. Strings happen later
+  // in `formatPermanent` (renderer.ts) — that's where `caps` decides
+  // glyphs (Unicode vs ASCII) and color (red error vs plain).
+  permanent: PermanentItem[];
 }
 
 // Append output lines to a tool's preview, keeping only the last N.
@@ -114,30 +147,6 @@ const appendPreview = (tool: ActiveTool, text: string): ActiveTool => {
 
 const cloneTools = (tools: Map<string, ActiveTool>): Map<string, ActiveTool> => new Map(tools);
 
-// Format a permanent line summarizing a finished tool call. Matches the
-// shape from UI.md §4.1 final form — one head line + optional summary.
-//
-// TODO(1.c structural): glyphs and color are capability-aware in the
-// spec (`▶`/`✓`/`✗` vs ASCII; red on error). The reducer can't see
-// `caps`, so this function emits ASCII-only and a separate `permanent`
-// shape (PermanentItem[]) is the cleaner long-term fix. Tracking under
-// "Decision #3" in the 1.b code review — held until the render-functions
-// slice lands so we don't churn the contract twice.
-const formatToolFinal = (
-  tool: ActiveTool,
-  status: 'done' | 'error' | 'denied',
-  durationMs: number,
-  summary: string | undefined,
-): string[] => {
-  // 'done' uses an asterisk (Unicode `✓` lands with the render
-  // functions). 'error' and 'denied' MUST be distinct so users can
-  // tell "policy blocked me" from "tool crashed" — UI.md §4.1/§4.6.
-  const glyph = status === 'done' ? '*' : status === 'error' ? 'x' : '!';
-  const ms = durationMs >= 1000 ? `${(durationMs / 1000).toFixed(1)}s` : `${durationMs}ms`;
-  const head = `${glyph} ${tool.name} · ${tool.args}    ${ms}`;
-  return summary ? [head, `  ${summary}`] : [head];
-};
-
 export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
   switch (event.type) {
     case 'session:start': {
@@ -148,24 +157,31 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
         project: event.project,
         model: event.model,
       };
-      const header = `── session ${event.sessionId} · ${event.profile} · ${event.model} ──`;
-      return { state: { ...state, status, ended: false }, permanent: [header] };
-    }
-
-    case 'session:end': {
-      const summary = `── session end · ${event.reason} ──`;
-      return { state: { ...state, ended: true }, permanent: [summary] };
-    }
-
-    case 'user:submit': {
-      // Echo the prompt to scrollback and clear the input box. Multi-line
-      // input is preserved with newlines; renderer joins for display.
-      const lines = event.text.split('\n').map((l, i) => (i === 0 ? `> ${l}` : `  ${l}`));
       return {
-        state: { ...state, input: { value: '', cursor: 0 } },
-        permanent: lines,
+        state: { ...state, status, ended: false },
+        permanent: [
+          {
+            kind: 'session-header',
+            sessionId: event.sessionId,
+            profile: event.profile,
+            project: event.project,
+            model: event.model,
+          },
+        ],
       };
     }
+
+    case 'session:end':
+      return {
+        state: { ...state, ended: true },
+        permanent: [{ kind: 'session-footer', reason: event.reason }],
+      };
+
+    case 'user:submit':
+      return {
+        state: { ...state, input: { value: '', cursor: 0 } },
+        permanent: [{ kind: 'user-submit', text: event.text }],
+      };
 
     case 'assistant:start':
       return {
@@ -188,7 +204,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
     case 'assistant:end': {
       const buf = state.pendingAssistant;
       const text = buf?.text ?? '';
-      const permanent = text.length > 0 ? text.split('\n') : [];
+      const permanent: PermanentItem[] = text.length > 0 ? [{ kind: 'assistant', text }] : [];
       return { state: { ...state, pendingAssistant: null }, permanent };
     }
 
@@ -233,8 +249,15 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       const next = cloneTools(state.activeTools);
       next.delete(event.toolId);
       if (tool === undefined) return { state: { ...state, activeTools: next }, permanent: [] };
-      const lines = formatToolFinal(tool, event.status, event.durationMs, event.summary);
-      return { state: { ...state, activeTools: next }, permanent: lines };
+      const item: PermanentItem = {
+        kind: 'tool-end',
+        name: tool.name,
+        args: tool.args,
+        status: event.status,
+        durationMs: event.durationMs,
+        ...(event.summary !== undefined ? { summary: event.summary } : {}),
+      };
+      return { state: { ...state, activeTools: next }, permanent: [item] };
     }
 
     case 'step:budget': {
@@ -254,10 +277,10 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       return { state, permanent: [] };
 
     case 'error':
-      return { state, permanent: [`error: ${event.message}`] };
+      return { state, permanent: [{ kind: 'error', message: event.message }] };
 
     case 'warn':
-      return { state, permanent: [`warn: ${event.message}`] };
+      return { state, permanent: [{ kind: 'warn', message: event.message }] };
 
     case 'interrupt':
       // Renderer surfaces interrupt prompt in the input box area;

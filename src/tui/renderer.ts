@@ -19,7 +19,13 @@
 
 import type { Bus } from './bus.ts';
 import type { UIEvent } from './events.ts';
-import { type ApplyResult, type LiveState, applyEvent, createInitialState } from './state.ts';
+import {
+  type ApplyResult,
+  type LiveState,
+  type PermanentItem,
+  applyEvent,
+  createInitialState,
+} from './state.ts';
 import {
   type Capabilities,
   type FrameSchedulerOptions,
@@ -31,7 +37,52 @@ import {
   disableRawMode,
   enableBracketedPasteOn,
   enableRawMode,
+  paint,
 } from './term.ts';
+
+// Glyph tables for `tool-end`. Two paths because the spec (UI.md §6.2)
+// caps Forja's palette to Unicode when locale supports it, ASCII
+// otherwise. 'denied' MUST differ from 'error' so users can tell
+// "policy blocked me" from "tool crashed" at a glance.
+const TOOL_END_GLYPHS = {
+  unicode: { done: '✓', error: '✗', denied: '⚠' },
+  ascii: { done: '*', error: 'x', denied: '!' },
+} as const;
+
+// Render a structured permanent record into one or more output lines.
+// This is where capability-aware decisions live: glyph (Unicode vs
+// ASCII per `caps.unicode`), color (paint() no-ops when `caps.color`
+// is 'none'). The reducer in `state.ts` never sees `caps` and emits
+// only structured items — see PermanentItem.
+export const formatPermanent = (item: PermanentItem, caps: Capabilities): string[] => {
+  switch (item.kind) {
+    case 'session-header':
+      return [`── session ${item.sessionId} · ${item.profile} · ${item.model} ──`];
+    case 'session-footer':
+      return [`── session end · ${item.reason} ──`];
+    case 'user-submit': {
+      // Echo the prompt with `> ` prefix on first line and 2-space
+      // continuation indent on subsequent ones.
+      return item.text.split('\n').map((l, i) => (i === 0 ? `> ${l}` : `  ${l}`));
+    }
+    case 'assistant':
+      return item.text.length > 0 ? item.text.split('\n') : [];
+    case 'tool-end': {
+      const glyph = TOOL_END_GLYPHS[caps.unicode ? 'unicode' : 'ascii'][item.status];
+      const sep = caps.unicode ? '·' : '-';
+      const ms =
+        item.durationMs >= 1000
+          ? `${(item.durationMs / 1000).toFixed(1)}s`
+          : `${item.durationMs}ms`;
+      const head = `${glyph} ${item.name} ${sep} ${item.args}    ${ms}`;
+      return item.summary !== undefined ? [head, `  ${item.summary}`] : [head];
+    }
+    case 'error':
+      return [paint(caps, 'error', `error: ${item.message}`)];
+    case 'warn':
+      return [paint(caps, 'warn', `warn: ${item.message}`)];
+  }
+};
 
 export type ComposeLive = (state: LiveState, caps: Capabilities) => string[];
 
@@ -40,12 +91,14 @@ export type ComposeLive = (state: LiveState, caps: Capabilities) => string[];
 // functions (`renderStatusLine`, `renderInput`, `renderToolCard`...) in
 // the next slice. Keeping it minimal here avoids tying renderer
 // mechanics to layout decisions that may yet shift.
-export const defaultComposeLive: ComposeLive = (state) => {
+export const defaultComposeLive: ComposeLive = (state, caps) => {
+  const sep = caps.unicode ? '·' : '-';
   const lines: string[] = [];
-  // Active-tool stub: one line per running tool, glyph + name + args.
-  // Final, formatted card output happens in `applyEvent` (permanent).
+  // Active-tool stub: one line per running tool, prefix + name + args.
+  // Final, formatted card output happens in `formatPermanent`.
   for (const tool of state.activeTools.values()) {
-    lines.push(`> ${tool.name} ${tool.args}`);
+    const prefix = caps.unicode ? '▶' : '>';
+    lines.push(`${prefix} ${tool.name} ${tool.args}`);
   }
   // Status line stub. Real render comes with the status-line function;
   // here we just surface enough state to verify wiring.
@@ -54,7 +107,7 @@ export const defaultComposeLive: ComposeLive = (state) => {
     const steps = s.maxSteps > 0 ? `${s.steps}/${s.maxSteps}` : `${s.steps}`;
     const cost = `$${s.costUsd.toFixed(4)}`;
     lines.push(
-      `[${s.profile ?? '-'}] ${s.project ?? '-'} · ${s.model ?? '-'} · ${steps} · ${cost}`,
+      `[${s.profile ?? '-'}] ${s.project ?? '-'} ${sep} ${s.model ?? '-'} ${sep} ${steps} ${sep} ${cost}`,
     );
   }
   // Input box.
@@ -151,14 +204,16 @@ export const createRenderer = (options: RendererOptions): Renderer => {
     liveHeight = truncated.length;
   };
 
-  const writePermanent = (lines: string[]): void => {
+  const writePermanent = (items: PermanentItem[]): void => {
+    if (items.length === 0) return;
+    // Format each item to lines via caps-aware `formatPermanent`,
+    // flatten, and emit. Permanent lines are NOT truncated — they're
+    // scrollback and the user can scroll horizontally / wrap-view in
+    // their terminal. (Live region is the only place width matters,
+    // because we have to cursor-up to erase.)
+    const lines = items.flatMap((item) => formatPermanent(item, caps));
     if (lines.length === 0) return;
-    // Permanent lines must NOT be truncated — they're scrollback and
-    // the user can scroll horizontally / wrap-view in their terminal.
-    // (Live region is the only place width matters, because we have
-    // to cursor-up to erase.)
-    const text = `${lines.join('\n')}\n`;
-    write(text);
+    write(`${lines.join('\n')}\n`);
   };
 
   // Public redraw — used by external triggers (resize, foreground
@@ -185,7 +240,7 @@ export const createRenderer = (options: RendererOptions): Renderer => {
       // actionable, and keep the renderer alive.
       const msg = err instanceof Error ? err.message : String(err);
       eraseLive();
-      writePermanent([`warn: renderer reducer error: ${msg}`]);
+      writePermanent([{ kind: 'warn', message: `renderer reducer error: ${msg}` }]);
       drawLive();
       return;
     }

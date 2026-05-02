@@ -15,6 +15,52 @@ Format:
 
 ---
 
+## [2026-05-02] M1 / Step 1.b.1 — Permanent records refactor (caps-aware formatting)
+
+Pre-emptive structural fix surfaced by the 1.b code review.
+Reducer was emitting already-formatted strings as `permanent:
+string[]` — pure but blind to capabilities. With ASCII-only
+glyphs hardcoded inside `formatToolFinal`, there was no path
+for Unicode `✓`/`✗`/`⚠` (UI.md §6.2) or for color-aware
+`error`/`warn` lines. Fixing later would have meant churning
+the contract twice, since the next slice (real render functions)
+needs caps-aware permanent output. Better to fix the shape
+once, now, while the consumer surface is small.
+
+Reducer now emits `permanent: PermanentItem[]` — a structured
+discriminated union (`session-header`, `session-footer`,
+`user-submit`, `assistant`, `tool-end`, `error`, `warn`).
+Renderer holds the new `formatPermanent(item, caps)` function
+which is the single place where caps influence output: glyph
+selection (Unicode vs ASCII) and color (paint() with SGR or
+plain).
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/tui/state.ts` | NEW exported type `PermanentItem` (7 kinds). `ApplyResult.permanent` now `PermanentItem[]` instead of `string[]`. Removed `formatToolFinal` helper (moved to renderer.ts as part of `formatPermanent`). Each event branch now constructs structured items: `session:start` → `session-header`, `session:end` → `session-footer`, `user:submit` → `user-submit` (raw multi-line text preserved; renderer does indent), `assistant:end` → `assistant` (full text in one item), `tool:end` → `tool-end` (status, durationMs, optional summary), `error`/`warn` → matching kind. The reducer no longer formats anything. |
+| `src/tui/renderer.ts` | NEW exported `formatPermanent(item: PermanentItem, caps: Capabilities): string[]`. Single switch on `item.kind`. Uses Unicode glyphs (`✓`/`✗`/`⚠`) when `caps.unicode === true`, ASCII (`*`/`x`/`!`) otherwise. Uses Unicode separator `·` vs ASCII `-`. Wraps `error`/`warn` in `paint(caps, ...)` so SGR codes only emit when color enabled. `writePermanent` now consumes `PermanentItem[]`, flattens via `items.flatMap(item => formatPermanent(item, caps))`, and emits the joined result. |
+| `tests/tui/state.test.ts` | Test assertions updated to inspect structured items instead of strings. Old "contains" string checks → exact `toEqual([...])` on the item array. The denied-vs-error test renamed to verify the reducer preserves both `status` values (the glyph differentiation is now a `formatPermanent` concern, tested separately). 25 tests, same coverage. |
+| `tests/tui/renderer.test.ts` | NEW `describe('formatPermanent')` block (13 tests): each item kind, ASCII vs Unicode glyph paths, ASCII vs Unicode separators, ms vs s duration units, summary continuation, color disabled (plain text passthrough), color enabled (SGR escapes for `error`/`warn`). The `reducer error becomes warn line` test continues to pass — it asserts the warn message text which both the reducer-error path and the formatter agree on. |
+
+**Decisions:**
+
+- **D18 — `PermanentItem` is a closed union, not extensible.** Adding a new kind requires extending the union in `state.ts` AND handling it in `formatPermanent`. TypeScript will flag a missing branch in the formatter (the switch's exhaustive return doesn't admit `never`). Closed union beats open-ended `{ kind: string; ... }` because the formatter has to know every kind to render. Producers can't define new kinds the formatter doesn't recognize.
+- **D19 — Reducer preserves raw text for `user-submit` / `assistant`.** It does NOT pre-split on newlines or pre-pend a `> ` prefix — that's formatting. The formatter does the split + prefix. This means a future change to indent style (e.g., adding ` ┃ ` continuation glyphs in Unicode mode) lives entirely in `formatPermanent`, not in two places.
+- **D20 — Renderer (not reducer) owns the formatter.** `formatPermanent` lives in `renderer.ts`, exported. Reasoning: it depends on `caps` and `paint` (term.ts SGR helpers) — both are I/O-tier concerns. `state.ts` stays free of `term.ts` dependencies. If a third file (`format.ts`) becomes warranted, the move is mechanical; until then, putting it in renderer.ts keeps the file count down.
+- **D21 — Tool-end glyph distinct for done/error/denied in BOTH ASCII and Unicode.** ASCII: `*`/`x`/`!`. Unicode: `✓`/`✗`/`⚠`. Tests assert both paths. Closes the gap from the 1.b code review (denied collided with error in ASCII path; Unicode was unspecified).
+- **D22 — Closed switch in `formatPermanent`, not a default branch.** TypeScript narrows `item` to `never` after every kind is handled; we don't need a default. If a new kind is added without a handler, the function fails to compile (return type narrows to `string[] | undefined`). Compile-time exhaustiveness, no runtime guard.
+- **D23 — Tests for the formatter live in `renderer.test.ts`, not a new file.** `formatPermanent` is exported from renderer.ts. One file, one source. If formatter complexity grows (combining caps + width + theme tokens), splitting into `format.ts` + `format.test.ts` becomes obvious — until then, locality wins.
+
+**Verification:** `bun test` → 1768 pass / 10 skip / 0 fail (+13 new from formatPermanent tests, after rewriting state.test.ts assertions to structured items). `tsc --noEmit` clean. `biome check .` clean.
+
+**Why this slice exists:** code review of 1.b flagged the structural debt explicitly (rec #3). Fixing pre-1.c spares duplicated formatting logic in render functions later. The diff is contained because no production code outside the TUI layer consumes `permanent: string[]` yet — the only callers are the renderer and tests.
+
+**Next:** Step 1.c — real render functions (`status.ts`, `input.ts`, `tool-card.ts`, `subagent-row.ts`, `todo-list.ts`, `thinking.ts`, plus a `compose.ts` that replaces `defaultComposeLive`). Add `string-width` + `wrap-ansi` deps. Wire the resize watcher.
+
+---
+
 ## [2026-05-02] M1 / Step 1.b — TUI state reducer + renderer
 
 Builds on 1.a's primitives. Splits the renderer into two concerns:
