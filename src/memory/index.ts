@@ -56,11 +56,13 @@ export type { MemoryFileResult, ScopeIndexResult } from './loader.ts';
 
 export { createMemoryRegistry } from './registry.ts';
 export type {
+  AuditOverride,
   CreateMemoryRegistryInput,
   ListOptions,
   MemoryListing,
   MemoryRegistry,
   MemorySearchHit,
+  ReadOptions,
   RegistryReadResult,
   ScopeOption,
   SearchOptions,

@@ -142,10 +142,18 @@ export const memorySearchTool: Tool<MemorySearchInput, MemorySearchOutput> = {
     // Ask for one extra hit so we can detect truncation accurately:
     // if we get back `limit+1`, we know there's at least one more
     // match. The reported `hits` is sliced to `limit`.
+    //
+    // Forward ctx.sessionId / ctx.cwd as audit overrides. The
+    // deep branch emits `read` events for body-match hits; without
+    // per-call attribution these would land with session_id NULL
+    // for top-level runs (bootstrap captures the registry before
+    // the session exists).
     const raw = ctx.memoryRegistry.search(args.query, {
       ...(scopeCheck !== null ? { scope: scopeCheck } : {}),
       ...(args.deep === true ? { deep: true } : {}),
       limit: limit + 1,
+      auditSessionId: ctx.sessionId,
+      auditCwd: ctx.cwd,
     });
 
     const truncated = raw.length > limit;

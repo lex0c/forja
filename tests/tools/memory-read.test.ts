@@ -157,6 +157,30 @@ describe('memory_read tool', () => {
     expect(isToolError(explicitRight)).toBe(false);
   });
 
+  test('audit row uses ctx.sessionId, not registry constructor session id (top-level path)', async () => {
+    // Regression: bootstrap builds the registry without a
+    // sessionId (the session doesn't exist at bootstrap time).
+    // The tool MUST forward ctx.sessionId so audit rows attribute
+    // to the active session, not NULL.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Role](role.md) — role\n');
+    writeMemory(roots.projectLocal, 'role', fmUser('role'), 'body\n');
+    // Registry constructed WITHOUT sessionId (bootstrap shape).
+    const reg = createMemoryRegistry({ roots, db, cwd: '/p' });
+    // ctx.sessionId is the active session — what bootstrap CAN'T
+    // provide at construction but the harness DOES populate when
+    // building ToolContext per step.
+    const ctx = makeCtx({ memoryRegistry: reg, sessionId, cwd: '/p' });
+    const result = await memoryReadTool.execute({ name: 'role' }, ctx);
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    const events = listMemoryEventsByName(db, 'role');
+    expect(events).toHaveLength(1);
+    // Pre-fix: events[0]?.sessionId === null. Post-fix: ctx.sessionId.
+    expect(events[0]?.sessionId).toBe(sessionId);
+    expect(events[0]?.cwd).toBe('/p');
+  });
+
   test('preserves optional frontmatter fields when present', async () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);

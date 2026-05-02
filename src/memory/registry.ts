@@ -60,7 +60,12 @@ export interface MemoryRegistry {
   //                                            to parse
   //   - { kind: 'unknown' }                  — no entry in any scope
   //                                            (or the requested scope)
-  read(name: string, opts?: ScopeOption): RegistryReadResult;
+  // `opts.auditSessionId` and `opts.auditCwd` override the
+  // constructor-captured values for THIS call's audit row;
+  // tools pass these from ToolContext so top-level runs (where
+  // bootstrap built the registry before the session existed) get
+  // accurate session attribution.
+  read(name: string, opts?: ReadOptions): RegistryReadResult;
 
   // Substring search. Case-insensitive. Matches against name,
   // description, and (when the body is already loaded OR opts.deep
@@ -85,7 +90,24 @@ export interface ScopeOption {
   scope?: MemoryScope;
 }
 
-export interface SearchOptions {
+// Audit attribution overrides. When these are set on a per-call
+// option object, they win over the registry's constructor-
+// captured `sessionId` / `cwd`. Top-level CLI runs must use this
+// path because bootstrap creates the registry BEFORE the harness
+// creates the session — at construction time the session id
+// doesn't exist yet, so the closure-captured value is undefined
+// and every `read` row would land with session_id NULL,
+// breaking listMemoryEventsBySession queries. The harness threads
+// the active session id through ToolContext; the memory_*
+// tools forward it on every call.
+export interface AuditOverride {
+  auditSessionId?: string;
+  auditCwd?: string;
+}
+
+export interface ReadOptions extends ScopeOption, AuditOverride {}
+
+export interface SearchOptions extends AuditOverride {
   scope?: MemoryScope;
   deep?: boolean;
   limit?: number;
@@ -228,9 +250,21 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
     return null;
   };
 
-  const auditRead = (listing: MemoryListing, fileResult: MemoryFileResult): void => {
+  const auditRead = (
+    listing: MemoryListing,
+    fileResult: MemoryFileResult,
+    override: AuditOverride = {},
+  ): void => {
     if (db === undefined) return;
     if (fileResult.kind !== 'present') return;
+    // Per-call override wins over constructor capture. Top-level
+    // bootstrap can't know the session id at construction time
+    // (session is created later by the harness loop), so it
+    // builds the registry without one and the tool layer passes
+    // ctx.sessionId on every call. Subagent-child knows the id
+    // at construction AND tools still pass it — both end at the
+    // same value, override is harmless.
+    //
     // Source of the read event mirrors the source of the read
     // memory itself. Without a frontmatter source field the audit
     // would lie about provenance.
@@ -242,14 +276,16 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
     // surfaced to the operator via stderr, mirroring the bg-reaper
     // pattern (subagents/runtime.ts D9: "AUDIT DRIFT" warnings)
     // where disk-side work is trusted over audit consistency.
+    const effectiveSessionId = override.auditSessionId ?? sessionId ?? null;
+    const effectiveCwd = override.auditCwd ?? cwd ?? null;
     try {
       createMemoryEvent(db, {
         scope: listing.scope,
         action: 'read',
         memoryName: listing.name,
         source: fileResult.file.frontmatter.source,
-        sessionId: sessionId ?? null,
-        cwd: cwd ?? null,
+        sessionId: effectiveSessionId,
+        cwd: effectiveCwd,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -281,12 +317,15 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
       return findListing(name, opts.scope);
     },
 
-    read(name, opts: ScopeOption = {}): RegistryReadResult {
+    read(name, opts: ReadOptions = {}): RegistryReadResult {
       const listing = findListing(name, opts.scope);
       if (listing === null) return { kind: 'unknown' };
       const fileResult = readMemoryByName(roots, listing.scope, name);
       if (fileResult.kind === 'present') {
-        auditRead(listing, fileResult);
+        auditRead(listing, fileResult, {
+          ...(opts.auditSessionId !== undefined ? { auditSessionId: opts.auditSessionId } : {}),
+          ...(opts.auditCwd !== undefined ? { auditCwd: opts.auditCwd } : {}),
+        });
         return { kind: 'present', scope: listing.scope, file: fileResult.file };
       }
       if (fileResult.kind === 'missing') {
@@ -351,8 +390,14 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
           // monitoring memory_events for content exposure would
           // miss search-deep hits entirely. Mirrors auditRead's
           // best-effort try/catch (DB failures don't deny the
-          // search hit).
-          auditRead(listing, fileResult);
+          // search hit). Per-call audit override forwarded so
+          // top-level reads get attributed to the active session
+          // rather than NULL (the bootstrap-time constructor's
+          // sessionId is undefined).
+          auditRead(listing, fileResult, {
+            ...(opts.auditSessionId !== undefined ? { auditSessionId: opts.auditSessionId } : {}),
+            ...(opts.auditCwd !== undefined ? { auditCwd: opts.auditCwd } : {}),
+          });
           hits.push({
             scope: listing.scope,
             name: listing.name,

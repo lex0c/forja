@@ -15,6 +15,52 @@ Format:
 
 ---
 
+## [2026-05-01] M3 / Step 5.2 follow-up — fix top-level audit attribution (NULL session_id)
+
+External review caught a real bug in 5.2.c. `bootstrap.ts`
+constructs the `MemoryRegistry` BEFORE the harness's `runAgent()`
+creates the session — at construction time the session id
+doesn't exist yet, so `createMemoryRegistry({ ..., db, cwd })`
+runs WITHOUT a `sessionId`. The registry's auditRead closure
+captures that undefined value once and emits every subsequent
+`read` event with `session_id = NULL`.
+
+Net effect: `listMemoryEventsBySession(currentRunSessionId)`
+returns nothing for top-level CLI runs, breaking the canonical
+"what memories did this session expose" forensic query. Only
+subagent-child runs got correct attribution today, because
+those built the registry AFTER the session id was known and
+passed it at construction.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/memory/registry.ts` | New `AuditOverride` type with `auditSessionId?` / `auditCwd?` fields. `ReadOptions extends ScopeOption, AuditOverride`; `SearchOptions` gains the same fields. `auditRead` accepts an override and uses it before falling back to the constructor-captured `sessionId` / `cwd`. `read()` and `search()`'s deep branch forward the override. The constructor's `sessionId` stays useful for callers that DO know it (subagent-child captures, tools also forward — both end at the same value, override is harmless). |
+| `src/memory/index.ts` | Re-export `AuditOverride` and `ReadOptions`. |
+| `src/tools/builtin/memory-read.ts` | Tool now passes `auditSessionId: ctx.sessionId` and `auditCwd: ctx.cwd` on every `registry.read` call. Tools have ctx.sessionId at every step (the harness constructs ToolContext with the live session id), so the override path always carries truth. |
+| `src/tools/builtin/memory-search.ts` | Same forwarding for the deep-search audit emissions. |
+| `tests/memory/registry.test.ts` | NEW describe block "per-call audit override" with 4 tests: per-call wins over undefined constructor, constructor is fallback when override absent, per-call beats constructor when both set, search deep-body emission uses override too. |
+| `tests/tools/memory-read.test.ts` | NEW regression test exercising the bootstrap shape: registry built without sessionId, ctx.sessionId set, audit row attributes to ctx.sessionId. Pre-fix this would record null; post-fix it records the right id. |
+
+**Decisions:**
+
+- **D1 — Per-call override path, not late binding via setter.** Two alternatives considered: (a) move `createSession` from harness loop to bootstrap (big refactor cascading through resume / preassigned / subagent paths), (b) `registry.setSessionId(id)` mutator the harness calls post-createSession (introduces mutable state in registry). Option (c) chosen here: tools have `ctx.sessionId` at every invocation already; passing it on every call is the smallest surface change AND keeps the registry stateless. The constructor's sessionId stays as a useful fallback for callers (CLI inspect, subagent-child) that know it at construction time.
+- **D2 — Override at the OPTIONS object, not as positional args.** Mirrors how scope is opt-in via `{ scope: ... }`. Adding positional args would force every call site to think about audit metadata; opt-in via spread keeps the simple "registry.read('foo')" form working for tests that don't care about audit fidelity (in-memory DB, no consumers of the audit table).
+- **D3 — `auditSessionId` / `auditCwd` field names, not `sessionId` / `cwd`.** The latter two would clash semantically — `cwd` could plausibly be a lookup parameter, and the registry's own constructor uses bare `cwd`. The `audit*` prefix makes intent unmistakable: this is metadata for the audit row, not lookup behavior.
+- **D4 — Constructor sessionId NOT removed from CreateMemoryRegistryInput.** Subagent-child still passes it (knows the session at construction); CLI `agent --memory show` still passes operator-driven cwd. Removing those would force ALL callers to use per-call override, which is overkill — only the bootstrap path has the chicken-and-egg with createSession. Keeping the constructor field as fallback handles both shapes cleanly.
+
+**Pending / known limitations:**
+
+- **No backfill of historical NULL rows.** Existing `memory_events` rows from runs that landed before this fix stay session_id=NULL; there's no way to recover the original session. Operators querying history will see a cliff between pre-fix and post-fix runs. Acceptable: audit history is forward-only, the table is in dev only at this point so the blast radius is the developer's own dogfood data.
+- **CLI `agent --memory show` still emits NULL session_id.** Intentional: operator-driven inspection has no session by design (the audit row's NULL is the marker that distinguishes operator from agent). Documented in 5.2.b D2.
+
+**Verification:** `bun test` 1624 pass / 10 skip / 0 fail (+5 new across registry override behavior + tool-level forwarding); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** No state change to the read arc roadmap. Branch ready for PR.
+
+---
+
 ## [2026-05-01] M3 / Step 5.2 follow-up — wire memory access for subagents
 
 The 5.2 read arc shipped with `memoryRegistry` undefined in

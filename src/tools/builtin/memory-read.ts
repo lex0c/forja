@@ -116,10 +116,17 @@ export const memoryReadTool: Tool<MemoryReadInput, MemoryReadOutput> = {
       return toolError(ERROR_CODES.invalidArg, scopeCheck.error);
     }
 
-    const result = ctx.memoryRegistry.read(
-      args.name,
-      scopeCheck !== null ? { scope: scopeCheck } : {},
-    );
+    // Forward ctx.sessionId / ctx.cwd as audit overrides. Top-
+    // level bootstrap can't capture sessionId at registry
+    // construction (the session is created later by the harness
+    // loop), so without this per-call attribution every read
+    // would land in memory_events with session_id NULL — breaking
+    // listMemoryEventsBySession queries for the active run.
+    const result = ctx.memoryRegistry.read(args.name, {
+      ...(scopeCheck !== null ? { scope: scopeCheck } : {}),
+      auditSessionId: ctx.sessionId,
+      auditCwd: ctx.cwd,
+    });
 
     if (result.kind === 'unknown') {
       const scopeQual = scopeCheck !== null ? ` in scope ${scopeCheck}` : '';

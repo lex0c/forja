@@ -268,6 +268,90 @@ describe('createMemoryRegistry — search', () => {
   });
 });
 
+describe('createMemoryRegistry — per-call audit override (regression: bootstrap session-id)', () => {
+  let db: DB;
+
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+  });
+
+  test('per-call auditSessionId wins over constructor (constructor undefined)', () => {
+    // The bootstrap path: constructor builds the registry BEFORE
+    // the harness creates the session, so constructor.sessionId
+    // is undefined. Tools forward ctx.sessionId via the per-call
+    // override so audit rows attribute correctly.
+    const session = createSession(db, { model: 'm', cwd: '/p' });
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Role](role.md) — role\n');
+    writeMemory(roots.user, 'role', fmUser('role'), 'body\n');
+    // Constructor without sessionId — mirrors bootstrap.ts.
+    const reg = createMemoryRegistry({ roots, db, cwd: '/p' });
+    const result = reg.read('role', { auditSessionId: session.id, auditCwd: '/p' });
+    expect(result.kind).toBe('present');
+    const events = listMemoryEventsByName(db, 'role');
+    expect(events).toHaveLength(1);
+    // Pre-fix this would have been null.
+    expect(events[0]?.sessionId).toBe(session.id);
+    expect(events[0]?.cwd).toBe('/p');
+  });
+
+  test('constructor sessionId is the fallback when override absent', () => {
+    // Subagent-child path: constructor knows the session id.
+    // Calls without explicit override use the captured value.
+    const session = createSession(db, { model: 'm', cwd: '/p' });
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Role](role.md) — role\n');
+    writeMemory(roots.user, 'role', fmUser('role'), 'body\n');
+    const reg = createMemoryRegistry({ roots, db, sessionId: session.id, cwd: '/p' });
+    reg.read('role'); // no override
+    const events = listMemoryEventsByName(db, 'role');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.sessionId).toBe(session.id);
+  });
+
+  test('per-call override beats constructor when both set', () => {
+    const constructorSession = createSession(db, { model: 'm', cwd: '/c' });
+    const callSession = createSession(db, { model: 'm', cwd: '/p' });
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Role](role.md) — role\n');
+    writeMemory(roots.user, 'role', fmUser('role'), 'body\n');
+    const reg = createMemoryRegistry({
+      roots,
+      db,
+      sessionId: constructorSession.id,
+      cwd: '/c',
+    });
+    reg.read('role', { auditSessionId: callSession.id, auditCwd: '/p' });
+    const events = listMemoryEventsByName(db, 'role');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.sessionId).toBe(callSession.id);
+    expect(events[0]?.cwd).toBe('/p');
+  });
+
+  test('search deep-body audit uses per-call override too', () => {
+    const session = createSession(db, { model: 'm', cwd: '/p' });
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — surface\n');
+    writeMemory(roots.user, 'a', fmUser('a'), 'body has zebra inside\n');
+    const reg = createMemoryRegistry({ roots, db, cwd: '/p' });
+    const hits = reg.search('zebra', {
+      deep: true,
+      auditSessionId: session.id,
+      auditCwd: '/p',
+    });
+    expect(hits).toHaveLength(1);
+    const events = listMemoryEventsByName(db, 'a');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.action).toBe('read');
+    expect(events[0]?.sessionId).toBe(session.id);
+  });
+});
+
 describe('createMemoryRegistry — search-deep audit (regression: S1)', () => {
   let db: DB;
   let sessionId: string;
