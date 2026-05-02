@@ -68,7 +68,8 @@ const main = async (): Promise<number> => {
     args.listSessions ||
     args.undo !== undefined ||
     args.checkpoints !== undefined ||
-    args.worktrees !== undefined;
+    args.worktrees !== undefined ||
+    args.memory !== undefined;
   if (args.prompt.length === 0 && !promptOptional) {
     process.stderr.write(`forja: missing prompt\n\n${usage()}\n`);
     return 1;

@@ -15,6 +15,59 @@ Format:
 
 ---
 
+## [2026-05-01] M3 / Step 5.2.b — `agent --memory` operator surface (list + show)
+
+5.2.a landed the registry + read tools (model-facing). 5.2.b adds
+the operator-facing CLI for inspecting memory directly: `agent
+--memory list [scope]` and `agent --memory show <name> [scope]`.
+Built on the same registry the model-facing tools use, so the
+operator's view and the agent's view stay consistent.
+
+Independent of bootstrap (no provider, no permissions, no tool
+registry — only DB + cwd) so memory inspection doesn't require an
+API key. Mirrors the structure of `runWorktreesCli` and
+`runCheckpointsCli` per the established CLI pattern.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/cli/memory.ts` | NEW — `runMemoryCli` thin wrapper. Validates verb, opens DB (or test override), builds a `MemoryRegistry` for the cwd via `resolveScopeRoots`, dispatches to `runList` or `runShow`. The registry's audit hook fires on `show` (read events) with `session_id=NULL` (operator-driven, not an agent action) and the cwd recorded — captures every read regardless of who triggered it. |
+| `src/cli/args.ts` | `--memory <verb> [positionals]` parser modeled on `--checkpoints`. Verbs `list` and `show`. Positionals stop at any flag-shaped token; arity is enforced by the handler (list: 0 or 1 scope; show: 1 name + optional scope). New `args.memory` field. Help text added. |
+| `src/cli/run.ts` | New short-circuit branch dispatches to `runMemoryCli` after worktrees, before checkpoints/resume/run. Same DB-only pattern as the other inspection commands. |
+| `src/cli/index.ts` | `promptOptional` now also covers `args.memory !== undefined` so the missing-prompt gate doesn't fire on inspection commands. |
+| `tests/cli/memory.test.ts` | NEW — 15 CLI-surface tests. Empty list (table + NDJSON), three-scope listing in precedence order, NDJSON shape with summary, scope filter, invalid scope, too many positionals, show happy path with audit emission, NDJSON show, unknown name / missing body / malformed paths, traversal name rejection, strict scope no-fallback, empty positionals, unknown verb. Uses `XDG_CONFIG_HOME` override to scope user-memory writes to a tmpdir. |
+| `tests/cli/args.test.ts` | +6 tests on `--memory` parsing: list with scope, show with name+scope, list with no positionals, missing verb rejection, unknown verb rejection, top-level flag boundary. |
+
+**Decisions (post-review polish bundled in):**
+
+- **D8 (post-review M1) — Removed gratuitous dynamic import of `resolveScopeRoots`.** Pre-review the handler did `await import('../memory/index.ts')` to fetch one symbol from a barrel that was ALREADY statically imported (for `FrontmatterError`, `MemoryListing`, `MemoryRegistry`, `createMemoryRegistry`, `validateName`). The "lazy import" yielded zero benefit — the module was already loaded — and the comment misleadingly compared it to the worktrees / checkpoints lazy imports in run.ts (those DO avoid loading the subsystem; this one didn't). Moved to a single static import alongside the others; removed the misleading comment.
+- **D9 (post-review L2) — Added regression test for empty body in `show`.** The handler has a special branch at the end of plain mode (`if (!body.endsWith('\n')) out('\n')`); test exercises body=`''` to confirm the trailing newline is still emitted (so consumers piping into `wc -l` get the expected count).
+
+**Decisions:**
+
+- **D1 — Flag style (`--memory`), matching the rest of the CLI surface.** Spec §6.3 lists the slash-command vocabulary as `/memory list`, `/memory show`, etc. — that's the future TUI surface (M4+ Ink picker). For pre-TUI headless invocation we mirror the operator commands as `--memory list/show`, same as `--checkpoints` and `--worktrees`. The verb names match (list/show) so the eventual slash-command port is mechanical.
+- **D2 — Audit emission with `session_id=NULL`.** Operator running `agent --memory show role` from CLI is NOT an agent action, but spec §5.3 mandates an audit log row for every `read`. Solution: emit the row with `session_id=NULL` so the audit captures the read while preserving the operator-vs-agent distinction (the FK SET NULL semantics already let us query "events without a session linkage" → operator-driven). The cwd column IS populated (anchors which project the operator was inspecting from).
+- **D3 — Defense-in-depth `validateName` at the CLI boundary.** Same rationale as in `memory_read` tool: the registry's `findListing` returns null silently for `../escape` because no listing matches by name, surfacing as `unknown`. That hides the path-traversal attempt. Calling `validateName` first turns `../escape` into a clean "invalid memory name" message, preserving the security signal in the audit / stderr.
+- **D4 — Strict scope on `show <name> <scope>`.** Mirrors `memory_read` tool behavior. An operator typing `agent --memory show role project_local` who actually has `role` only in `user` scope gets "no memory named role in scope project_local", not silent fallback. Consistency with the model-facing surface > convenience.
+- **D5 — Plain output is operator-readable, not parser-friendly.** Show output: `scope:` / `name:` / `type:` / `source:` / `description:` / optional `expires:`/`trust:`/`triggers:` lines, blank line, then verbatim body. Operators can `agent --memory show foo | less` or grep without parsing. NDJSON gives the structured shape for headless tooling. List uses a 3-column space-separated table — same low-ceremony layout as `--worktrees list`.
+- **D6 — `dedupe_by_name` not exposed on the CLI list.** The model-facing tool has it (the model needs to see shadowing explicitly to learn the precedence model). Operators inspecting the index typically WANT to see all scopes — that's what `agent --memory list` is for. Adding the flag is trivial later if a use case appears; YAGNI for now.
+- **D7 — Lazy-import the memory module in run.ts dispatch.** Same pattern as the `--worktrees` dispatch. Keeps the cold-start path light when memory isn't being inspected.
+
+**Pending / known limitations:**
+
+- **No `--memory edit/delete/save`.** Those are write surfaces and live in 5.3 (write tools + TUI confirmation). The CLI side waits until 5.6 (lifecycle slash commands) to round out `agent --memory edit/delete/expire/audit`.
+- **No `--memory audit`.** Spec §6.3 lists `/memory audit` to dump `memory_events`. Defer to 5.6 when the lifecycle pass + the audit surface land together.
+- **No `--memory promote/demote`.** 5.5 owns these; they need the secret/injection scanner.
+- **No interactive picker.** `agent --memory list` is a flat table; `agent --memory show <name>` requires the operator to know the name. The TUI picker (`/memory show` with fuzzy completion) waits for M4's Ink TUI. Headless CLI usage is fine.
+- **`show` output to stdout includes the body verbatim, including any control characters.** A malicious memory body with ANSI escape codes could disrupt terminal rendering. Defer to 5.4 trust integration where `[memory: untrusted]` markers ship.
+
+**Verification:** `bun test` 1597 pass / 10 skip / 0 fail (+22 new across CLI handler tests + args parsing + 1 review-driven empty-body regression); `tsc --noEmit` clean; `biome check` clean. No smoke eval — the CLI is a trivial wrapper around the already-tested registry.
+
+**Next:** M3 / Step 5.2.c — eager system prompt index injection. Spec §4.1 mandates the merged memory index be in the system prompt with a cache breakpoint after AGENTS.md. AGENTS.md isn't yet implemented in this codebase; 5.2.c either bundles it or ships memory-only injection with a placeholder anchor for the AGENTS.md slot. Will design the assembler shape (where to inject, how to format the section, cache breakpoint semantics) before cutting code.
+
+---
+
 ## [2026-05-01] M3 / Step 5.2.a — memory loader, registry, and read tools
 
 5.1 landed the storage primitives (types, frontmatter, index,
