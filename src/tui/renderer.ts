@@ -19,6 +19,7 @@
 
 import type { Bus } from './bus.ts';
 import type { UIEvent } from './events.ts';
+import { type Heartbeat, type HeartbeatOptions, createHeartbeat } from './heartbeat.ts';
 import { composeLive as defaultComposeLiveFn } from './render/compose.ts';
 import { formatPermanent } from './render/permanent.ts';
 import { truncateToWidth } from './render/width.ts';
@@ -77,6 +78,11 @@ export interface RendererOptions {
   // Time source for spinners + thinking duration. Defaults to
   // `Date.now`. Tests inject a constant or counter for determinism.
   now?: () => number;
+  // Heartbeat tuning. The renderer wires its own `isActive` and
+  // `onTick`; only `intervalMs` and the timer hooks are exposed.
+  // Pass `false` to disable the heartbeat entirely (useful in tests
+  // that don't want spinner animation noise).
+  heartbeat?: Pick<HeartbeatOptions, 'intervalMs' | 'setTimer' | 'clearTimer'> | false;
 }
 
 export interface Renderer {
@@ -161,6 +167,20 @@ export const createRenderer = (options: RendererOptions): Renderer => {
 
   const scheduler = createFrameScheduler(redraw, schedulerOptions);
 
+  // Heartbeat: while anything in the live region animates (spinner
+  // for a running tool, thinking duration counter), tick periodically
+  // so the frame scheduler keeps redrawing. Goes idle when no
+  // animated element is on screen — zero wakeups while waiting on
+  // user input.
+  const heartbeat: Heartbeat | null =
+    options.heartbeat === false
+      ? null
+      : createHeartbeat({
+          ...(options.heartbeat ?? {}),
+          isActive: () => state.activeTools.size > 0 || state.thinking !== null,
+          onTick: () => scheduler.request(),
+        });
+
   // Bus subscription: fold every event, emit permanent if any, then
   // request a frame. Permanent output requires erasing the live region
   // first (otherwise the new permanent text would land below it).
@@ -177,6 +197,7 @@ export const createRenderer = (options: RendererOptions): Renderer => {
       eraseLive();
       writePermanent([{ kind: 'warn', message: `renderer reducer error: ${msg}` }]);
       drawLive();
+      heartbeat?.bump();
       return;
     }
     state = result.state;
@@ -184,9 +205,13 @@ export const createRenderer = (options: RendererOptions): Renderer => {
       eraseLive();
       writePermanent(result.permanent);
       drawLive();
-      return;
+    } else {
+      scheduler.request();
     }
-    scheduler.request();
+    // Re-evaluate heartbeat after every event: a `tool:start` arms
+    // it; `tool:end` (the last running tool) leaves the predicate
+    // false, so the heartbeat stops on the next firing.
+    heartbeat?.bump();
   };
 
   // Resize watcher: keep `liveCaps.cols`/`rows` in sync with the
@@ -230,6 +255,7 @@ export const createRenderer = (options: RendererOptions): Renderer => {
       unsubscribe();
       unsubscribeResize();
       watcher?.close();
+      heartbeat?.close();
       scheduler.close();
       // Final clean live region so the prompt returns to a sane place.
       eraseLive();

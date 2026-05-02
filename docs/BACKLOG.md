@@ -15,6 +15,53 @@ Format:
 
 ---
 
+## [2026-05-02] M1 / Step 1.d.1 — Input editor + heartbeat tick
+
+Two pure modules that close out the foundation for the interactive
+REPL: the input editor (KeyEvent → InputState mutations) and the
+heartbeat (periodic frame requests while live elements animate).
+Neither touches I/O — both are state-in/state-out functions with
+injectable timers, so the tests don't need a real terminal.
+
+The editor is the part of the TUI a user feels every keystroke.
+The heartbeat is what makes a long-running tool feel alive instead
+of frozen between events.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/input-editor.ts` | `applyKey(input, key) → {next, submit?, cancelInput?, interruptSoft?, interruptHard?}`. Pure reducer over the full `KeyEvent` union (char/key/paste). Handles printable insertion at cursor, bracketed paste (multi-line preserved), backspace/delete, arrows (left/right/home/end), word jumps (Ctrl+Left/Right, Alt+B/F), Ctrl+A/E (line start/end, multi-line aware), Ctrl+U/K (delete to line start/end), Ctrl+W (delete previous word), Alt+D (delete next word), Ctrl+H (legacy backspace), Up/Down with column-preserving multi-line navigation. Enter submits non-empty buffers (signal only — reducer clears via existing `user:submit` path); empty buffer + Enter is a no-op. Shift+Enter inserts `\n`. Ctrl+C clears non-empty buffer; surfaces `cancelInput` when buffer empty. Ctrl+D as EOF (empty) or delete-forward (non-empty). Esc surfaces `interruptSoft` for the caller to interpret. Tab is a no-op (reserved for autocomplete in a later slice). |
+| `src/tui/heartbeat.ts` | `createHeartbeat({intervalMs, isActive, onTick, setTimer, clearTimer})`. Periodic ticker that arms a timer only when `isActive()` returns true. On each firing: calls `onTick`, re-evaluates `isActive`, re-arms if still active. `bump()` is the renderer's hook to force re-evaluation after an event (e.g., a `tool:start` arms it; `tool:end` of the last tool stops the cycle on the next firing). Idempotent: multiple `bump()` calls coalesce to one armed timer. `close()` cancels any pending timer; idempotent. `tickCount()` for tests. Default interval 80ms (matches Unicode spinner cadence per UI.md §5.2). |
+| `src/tui/renderer.ts` | Heartbeat wired in: `isActive` checks `state.activeTools.size > 0 \|\| state.thinking !== null`; `onTick` calls `scheduler.request()`. Bumped after every event handler run (including the reducer-error path). `close()` closes the heartbeat too. New `heartbeat?: Pick<HeartbeatOptions, 'intervalMs' \| 'setTimer' \| 'clearTimer'> \| false` option exposes timer hooks for tests; pass `false` to disable entirely. |
+| `tests/tui/input-editor.test.ts` | 36 tests across 9 describe blocks: printable insertion (start/middle/space-key), bracketed paste (single chunk, multi-line), backspace/delete (each direction + boundaries + Ctrl+H legacy), cursor movement (left/right/clamp + home/end multi-line + Ctrl+A/E + Ctrl+Left/Right + Alt+B/F), multi-line up/down (column-preserve, clamp, edge cases), line deletion (Ctrl+U/K/W + Alt+D), Enter (submit, empty no-op, Shift+Enter newline), Ctrl+C/D (clear vs cancel + EOF vs delete), Esc (interrupt signal, buffer intact), Tab (no-op). |
+| `tests/tui/heartbeat.test.ts` | 8 tests with deterministic timer harness: idle bump no-arm, active bump arms + re-arms, becomes-inactive stops on next firing, multi-bump coalesce, close cancels pending, close idempotent, intervalMs respected, tickCount cumulative. |
+
+**Decisions:**
+
+- **D33 — Editor is signal-emitting, not action-applying.** Enter doesn't clear the buffer — the reducer's `user:submit` branch does. The editor returns `{submit: {text}}` and the caller dispatches the bus event. Keeps the editor pure (no bus dependency) and lets the existing reducer path handle "echo to permanent + clear input" without duplication. Same shape for `cancelInput` / `interrupt*`.
+- **D34 — Multi-line is first-class.** Up/Down preserve column where the target line allows it (clamping to line length when the next line is shorter), matching readline / VS Code / vim insert-mode. Above-first-line goes to buffer start; below-last-line goes to buffer end. Home/End / Ctrl+A/E operate on the CURRENT line, not the whole buffer — same as vim and emacs in their default modes.
+- **D35 — Ctrl+C semantics: clear, then cancel.** Pressing Ctrl+C with a non-empty buffer clears the buffer and stays in input mode — a common pattern (bash, zsh, python REPL). Ctrl+C on an empty buffer surfaces `cancelInput` for the caller (REPL loop) to interpret as "exit" or "double-tap to confirm". This avoids accidentally killing a session because the user wanted to scrap their typed input.
+- **D36 — Esc is soft interrupt only at this layer.** Editor surfaces `interruptSoft`. Whether the harness gets the signal depends on whether anything's running — that's not the editor's call. Esc Esc (hard interrupt) lands in the REPL loop, not the editor: when the parser delivers two consecutive escape events within a window, the loop combines them. The editor only sees one Esc per call — which simplifies it.
+- **D37 — Tab is a no-op in the editor.** Slash command autocomplete (UI.md §5.3) intercepts Tab before the editor sees it. Putting "Tab inserts \t" in the editor would create an inconsistency the user has to remember; better to forbid it entirely and let upper layers decide.
+- **D38 — Heartbeat is bumped, not subscribed.** The renderer calls `bump()` after every event. We considered subscribing to `bus.onAny` directly inside the heartbeat; rejected because it would couple the heartbeat to the bus type and force every event to bump (waste). The current design: the renderer is the only thing that bumps, and bumps are cheap (one predicate call + one timer arm).
+- **D39 — Heartbeat goes idle aggressively.** The predicate is checked AFTER firing. If it returns false, the next tick is not scheduled. So an idle bus (no running tools) means zero wakeups while the user types — confirmed by the "becomes inactive" test.
+- **D40 — Default heartbeat interval = 80ms.** Spinner Unicode runs at 80ms per spec (UI.md §5.2); ASCII at 100ms. The heartbeat uses the lower bound so both paths animate smoothly. Faster than necessary for ASCII (one extra wakeup every 5th tick); not enough to matter.
+
+**Pending / out of scope this slice:**
+
+- **No raw stdin → editor wiring yet.** The REPL loop (next slice) hooks `process.stdin` (raw mode + parser → editor → state). This slice keeps the editor pure so the wiring is just plumbing.
+- **No interrupt accumulator.** Esc Esc (hard interrupt) detection (within ~500ms window) lives in the REPL loop, not the editor.
+- **Modal pattern still pending.** Step 1.d.2.
+- **HarnessEvent → UIEvent adapter still pending.** Step 1.d.3.
+- **REPL boot / `src/cli/index.ts` wiring still pending.** Step 1.d.4.
+
+**Verification:** `bun test` → 1865 pass / 10 skip / 0 fail (+44 new). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.d.2 — modal pattern (state + focus stack + async promise per UI.md §5.5). After that: HarnessEvent adapter, then REPL wiring.
+
+---
+
 ## [2026-05-02] M1 / Step 1.c — Live render functions + resize watcher
 
 The first two slices (1.a, 1.b) shipped the substrate; 1.b.1
