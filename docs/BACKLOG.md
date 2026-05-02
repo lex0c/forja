@@ -15,6 +15,70 @@ Format:
 
 ---
 
+## [2026-05-02] M1 / Step 1.e.3 — Tool indicator collapsed (verb + sub-content)
+
+The most invasive of the §4.10 polish slices: rewrites the tool
+display from `→ tool_name {json args}` (developer-targeted dump) into
+the chip + sub-content shape spec'd by §4.10.5/§4.10.7. Each tool
+gets a per-tool vocabulary entry mapping its internal name to the
+present-continuous active verb (`Reading file`), the past-tense
+final verb (`Read file`), and a subject extractor that pulls the
+salient argument (path, command, query, pid) out of args for the
+`└─ ` sub-content line. JSON args disappear from the default UI
+entirely; the (future) `(ctrl+o to expand)` flow surfaces them on
+demand.
+
+This touches the event contract (`tool:start` payload), the live
+state (`ActiveTool`), the adapter (vocab lookup + subject
+extraction), and both renderers (live chip + scrollback chip with
+sub-content). The harness loop and tools themselves don't change —
+the vocabulary lives entirely in the TUI layer.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/tool-vocab.ts` | NEW canonical vocabulary table covering all 16 builtin tools (`read_file`, `write_file`, `edit_file`, `bash`, `bash_background`, `bash_kill`, `bash_output`, `glob`, `grep`, `task`, `memory_*`, `todo_write`, `monitor`, `wait_for`). Each entry has `activeVerb`, `finalVerb`, and an optional `subject(args) → string \| null` extractor. Extractors call `str()` (non-empty string) or `nestedStr()` (for discriminated-union args like `monitor.condition.kind` and `wait_for.condition.kind`) — verified against the actual `input_schema` defs in `src/tools/builtin/*.ts`. `lookupToolVocab(name)` returns the entry or a generic fallback (`Calling <name>` / `Called <name>`) with no subject — the awkward fallback is intentional so reviewers notice when a new tool ships without a vocab entry. Subject extractors return `null` when args don't carry the expected field (malformed model output) — renderer drops the connector line. |
+| `src/tui/render/glyphs.ts` | NEW shared module for box-drawing/connector glyphs that travel across multiple renderers. Currently exports `subContentConnector(caps)` (`└─ ` Unicode / `\- ` ASCII) consumed by both `permanent.ts` (final chip) and `tool-card.ts` (live chip). Single source of truth so a spec change ("use ▸ instead of ·") lands in one file. |
+| `src/tui/events.ts` | `ToolStartEvent` payload reshaped: `{toolId, name, activeVerb, finalVerb, subject}` (drops `args: string`). `name` retained for audit / filtering; display reads from `activeVerb` / `finalVerb`. `subject` is `string \| null`. |
+| `src/tui/state.ts` | `ActiveTool` now stores `activeVerb`, `finalVerb`, `subject` instead of `args`. Reducer for `tool:start` reads them straight from the event; `tool:end` builds the `tool-end` `PermanentItem` with `verb: tool.finalVerb` + `subject: tool.subject` (renderer overrides verb for failure / denial states). |
+| `src/tui/render/permanent.ts` | `tool-end` formatter rewritten per §4.10.5: chip glyph (`·` Unicode / `*` ASCII) + `<verb> in <duration>` head + optional `└─ <subject>` sub-content via the shared `subContentConnector`. `finalVerbFor(status, vocabVerb)` maps `error → 'Failed'` and `denied → 'Denied'` regardless of the per-tool entry — failure modes use generic verbs because the harness doesn't surface exit codes / failure detail today. Color: dim for done, error palette for failure, warn palette for denial. Denied with a `summary` (policy reason) shows the reason as sub-content instead of the rejected subject. Empty-string subject treated as absent (defensive against future producers that emit `''`). |
+| `src/tui/render/tool-card.ts` | Live chip rewritten per §4.10.5: `<spinner> <activeVerb>… (<elapsed>)` head in the warn palette, with `└─ <subject>` dim sub-content (via the shared `subContentConnector`) when subject is non-null and non-empty, and the existing tree-branch preview (last few stdout lines) underneath. |
+| `src/tui/harness-adapter.ts` | `tool_invoking` handler resolves vocab via `lookupToolVocab(toolName)`, runs the subject extractor inside a try/catch (a buggy extractor on weird args shouldn't kill the whole `tool:start` emission), and emits the new event payload. Drops the legacy `formatArgs` JSON path + `ARGS_MAX_CHARS` constant — args no longer travel through the UI. `ToolTrack` shrinks to `{name, decision}`. |
+| `tests/tui/tool-vocab.test.ts` | NEW 11 tests: every builtin name has an entry (regression guard), known lookup returns vocab, unknown lookup returns generic fallback, subject extractor returns null on bad args, bash subject is the command, memory_list subject is `scope: <name>`, bash_output/kill format pid, task prefers `subagent` (real field name) and falls back to `prompt`, todo_write has no subject. NEW `describe('nested condition.kind extractors')` covering monitor + wait_for with shapes copied from real `input_schema` defs (`{condition: {kind: 'process_output_lines', ...}}`, `{condition: {kind: 'sleep', ...}}`, etc.) — catches the "made-up field name" class of bug. |
+| `tests/tui/render/permanent.test.ts` | Old `tool-end` glyph/separator tests (`✓`/`✗`/`⚠` for unicode, `*`/`x`/`!` for ascii) replaced by `describe('tool-end (operation chip + sub-content)')` with 11 tests covering the new shape: per-tool verb on done, no sub-content when subject null, error/denied verb override, denied with summary surfaces reason, summary fallback when subject null, glyph + connector glyph variants per caps, ms vs s units, error palette SGR, dim palette SGR. |
+| `tests/tui/render/tool-card.test.ts` | Old preview-tree tests adapted for the new `[chip head, subject, ...preview]` shape. NEW tests for chip head verb, elapsed in parens, subject as `└─ ` sub-content, subject ASCII connector fallback, null subject drops the line, warn SGR on chip head, dim SGR on subject + preview. |
+| `tests/tui/state.test.ts` | Tool lifecycle tests updated for the new `tool:start` event shape and `tool-end` permanent shape. NEW test confirming null subject from adapter survives the round-trip onto `tool-end`. |
+| `tests/tui/bus.test.ts` | The single `tool:start` emit in the bus tests gets the new payload shape. |
+| `tests/tui/harness-adapter.test.ts` | The two `tool_invoking → tool:start` tests rewritten to assert `activeVerb`/`finalVerb`/`subject` instead of the old `args` JSON string. NEW test covering unknown-tool fallback (`Calling made_up_tool` / `Called made_up_tool` / `subject: null`). |
+
+**Decisions:**
+
+- **D84 — Vocabulary lives in the TUI layer, not on `ToolDef`.** Putting `activeVerb`/`finalVerb`/`subject` on each tool's definition would scatter display concerns across 17 files and let the harness/permission/audit layers see it. Centralizing in `src/tui/tool-vocab.ts` keeps display stricly UI's problem and makes the table grep-able as one document. Cost: a new tool registration must update two files (the `ToolDef` and the vocab entry) — flagged by the "every builtin has an entry" regression test.
+- **D85 — Generic fallback verbs for unmapped tools.** `lookupToolVocab(name)` returns `Calling <name>` / `Called <name>` with no subject when there's no entry. The verb is intentionally awkward (uses the raw tool_name, not a humanized version) so it sticks out in the UI; reviewers seeing "Calling read_file_v2…" know to add the proper entry. The alternative — refusing to render the chip until vocab is registered — would hide tool runs entirely, which is worse than ugly verbs.
+- **D86 — Subject extractor returns `null` on shape mismatch, never throws.** Extractors run on adversarial input (a model can send anything); the contract is `(args) => string | null` and the `str()` helper enforces "must be a non-empty string". Adapter wraps the call in try/catch as belt-and-suspenders for a future extractor that's more complex (regex match, JSON walk). Renderer drops the connector line on null — no `└─ null` literal.
+- **D87 — Failure verbs are hardcoded ('Failed', 'Denied'), not per-tool.** The spec table includes rich verbs like `Exited 1 in 2.1s` for failed bash, but the harness emits `tool_finished { failed, durationMs }` without exit code, error message, or failure detail. Building per-tool failure verbs would require either guessing or surfacing tool-result metadata through HarnessEvent (a separate spec change). For 1.e.3, ship the framework with generic failure verbs; rich detail lands when the harness contract grows.
+- **D88 — Subject from args, sub-content priority order is `denied+summary > subject > summary`.** The denied case overrides because the operator wants the policy reason ("matches deny rule bash.rm.rf") more than the rejected command echo. Subject is the default — what the tool acted on. Summary is fallback for tools without a clean subject (todo_write doesn't have one — vocab returns no extractor — but a producer may still emit `summary: "3 items added"` via the existing `tool:end.summary` path). Deliberately conservative: never combine subject + summary on two lines (would clutter the chip).
+- **D89 — `name` retained on `tool:start` despite display reading from verb.** The audit / NDJSON consumers care WHICH tool ran, not how it was displayed. Filtering "all bash invocations" needs `name === 'bash'`; it should never need to reverse-map "Executing" back to bash. The renderer never reads `name` for display, but the field travels for everyone else.
+- **D90 — JSON args dropped from the UI, not relegated to a deferred `expandable` flag.** Earlier draft had `expandable?: boolean` on `tool:start` and `(ctrl+o to expand)` hint on the chip when set. Removed because: (a) ctrl+o expansion isn't implemented; (b) the hint without the action is dishonest; (c) when expansion lands, the producer can opt-in via a NEW field — backwards compat is cheap when the field doesn't exist yet.
+- **D91 — `ARGS_MAX_CHARS` and `formatArgs` deleted.** With `args` no longer in the event payload, the JSON-stringify-and-truncate path in the adapter has no caller. Deleted instead of kept-with-a-todo because dead code rots; reintroducing it (when expansion lands) is a 5-line change.
+- **D92 — `finalVerbFor` lives in `permanent.ts`, not in tool-vocab.** The mapping is render-policy ("how do we display failure?"), not vocabulary. Putting it in tool-vocab would let the adapter or reducer override it inconsistently per call site. Render owns the visual contract; vocab owns the words.
+- **D93 — Subject extractors validated against real `input_schema` defs.** Initial draft of the vocab guessed at field names (`subagent_name`/`goal` for task; flat `process_id` for monitor) — all silently broken because tests only exercised the extractor with shapes the test wrote, not shapes the tools actually receive. Code review caught it before commit. Fix: `nestedStr()` helper for discriminated-union args, real-shape tests in `tool-vocab.test.ts` per tool, and a process-rule that adding a vocab entry requires reading the corresponding `src/tools/builtin/<tool>.ts`.
+- **D94 — Sub-content connector glyph in a shared `glyphs.ts`.** First implementation duplicated the `└─ ` / `\- ` ternary across `permanent.ts` and `tool-card.ts`. Same glyph, two source-of-truth, drift-prone. Extracted to `subContentConnector(caps)` so future spec changes (different glyph, color treatment) land in one file. Other shared glyphs (chip prefix, spinner) stay where they are — they're not duplicated yet.
+
+**Pending / out of scope this slice:**
+
+- **Rich finalVerbs with tool-result detail** (`Read 1 file (2.4kB)`, `Edited foo.ts (+3 −1)`, `Exited 1`). Requires the harness to emit tool-result metadata (file size, line counts, exit code) in `tool_finished` or a new event. Spec change first, code after.
+- **`(ctrl+o to expand)` action.** The hint was deliberately not included in the chip (D90); the action itself (modal or scrollable panel showing JSON args + raw output) is its own slice.
+- **Spec §4.10.4 vocabulary table** still has `Read 1 file (2.4kB)` etc as the canonical finalVerb shape. The table assumes rich detail. Aligning vocab text with what we can actually emit lands when D87's source data is available.
+- **Subagent-row collapse** (UI.md §4.2). Spec mentions a multi-line live block for subagents that collapses to a one-liner on `subagent:end`. Today subagents are surfaced just as a `task` tool chip; the richer block is its own slice.
+
+**Verification:** `bun test` → 2006 pass / 10 skip / 0 fail (+21 new across tool-vocab, permanent, tool-card, state, harness-adapter). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.e.4 — footer below input + operation chip lifecycle for the live region. Footer (rule + dynamic status + interrupt hint) per §4.10.6. The `composeCursor` LAYOUT COUPLING TODO (D79) gets resolved in this slice — the footer's line count must subtract from `inputStartRow`. Operation chip live counter format (`Generating… (8s · ↑ 234 tokens)`) requires the adapter to stop dropping `usage` events.
+
+---
+
 ## [2026-05-02] M1 / Step 1.e.2 — User echo inverse bar + cursor inline
 
 Two visuals that finish the input box's polish: every user prompt is

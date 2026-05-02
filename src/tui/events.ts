@@ -102,13 +102,23 @@ export type ThinkingDeltaEvent = BaseEvent & {
 };
 export type ThinkingEndEvent = BaseEvent & { type: 'thinking:end'; messageId: string };
 
-// Tool calls. `args` is rendered already-formatted by the producer
-// (one line, truncated) so the renderer doesn't need to know schema.
+// Tool calls. The producer (adapter) resolves the tool's name into a
+// vocab pair (`activeVerb` shown while running, `finalVerb` after
+// completion) plus a `subject` line — typically the path / command /
+// query the tool acted on. Renderer never sees the raw JSON args by
+// default; the `(ctrl+o to expand)` flow surfaces them on demand.
+// See `src/tui/tool-vocab.ts` for the vocabulary table.
 export type ToolStartEvent = BaseEvent & {
   type: 'tool:start';
   toolId: string;
+  // Internal tool name (`read_file`, `bash`, …) — kept for audit /
+  // filtering. Renderer uses `activeVerb` / `finalVerb` for display.
   name: string;
-  args: string;
+  activeVerb: string;
+  finalVerb: string;
+  // One-line subject under `└─ `; null when args don't carry the
+  // expected field (renderer drops the connector line).
+  subject: string | null;
 };
 export type ToolDeltaEvent = BaseEvent & {
   type: 'tool:delta';

@@ -291,21 +291,25 @@ describe('harness-adapter — tool lifecycle', () => {
     const e = out[0] as Extract<UIEvent, { type: 'tool:start' }>;
     expect(e.toolId).toBe('t1');
     expect(e.name).toBe('read_file');
-    expect(e.args).toBe('{"path":"/a"}');
+    // Adapter resolves the tool name via tool-vocab → activeVerb,
+    // finalVerb, and a subject extracted from args.
+    expect(e.activeVerb).toBe('Reading file');
+    expect(e.finalVerb).toBe('Read file');
+    expect(e.subject).toBe('/a');
   });
 
-  test('tool_invoking truncates very long args', () => {
+  test('unknown tool falls back to generic Calling/Called verbs and null subject', () => {
     const a = createHarnessAdapter(baseCtx());
-    const big = 'x'.repeat(500);
     const out = a.translate({
       type: 'tool_invoking',
       toolUseId: 't1',
-      toolName: 'write_file',
-      args: { content: big },
+      toolName: 'made_up_tool',
+      args: { whatever: 'stuff' },
     });
     const e = out[0] as Extract<UIEvent, { type: 'tool:start' }>;
-    expect(e.args.length).toBeLessThan(big.length);
-    expect(e.args).toContain('more chars');
+    expect(e.activeVerb).toBe('Calling made_up_tool');
+    expect(e.finalVerb).toBe('Called made_up_tool');
+    expect(e.subject).toBeNull();
   });
 
   test('tool_decided is silent; outcome surfaces via tool_finished', () => {

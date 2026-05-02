@@ -51,19 +51,21 @@ describe('composeLive layout', () => {
     const tool: ActiveTool = {
       toolId: 't1',
       name: 'bash',
-      args: 'ls',
+      activeVerb: 'Executing',
+      finalVerb: 'Executed',
+      subject: 'ls',
       startedAt: 0,
       preview: [],
     };
     s.activeTools.set('t1', tool);
     const out = composeLive(s, caps, 1000);
-    // [tool head, status line, rule, input]
-    expect(out).toHaveLength(4);
-    expect(out[0]).toContain('bash');
-    expect(out[0]).toContain('ls');
-    expect(out[1]).toContain('forja');
-    expect(out[2]).toBe(expectedRule(caps.cols, true));
-    expect(out[3]).toBe('> ');
+    // [chip head, sub-content, status line, rule, input]
+    expect(out).toHaveLength(5);
+    expect(out[0]).toContain('Executing');
+    expect(out[1]).toContain('ls');
+    expect(out[2]).toContain('forja');
+    expect(out[3]).toBe(expectedRule(caps.cols, true));
+    expect(out[4]).toBe('> ');
   });
 
   test('multi-line input keeps input at the bottom and rule above first input line', () => {
@@ -80,14 +82,18 @@ describe('composeLive layout', () => {
     s.activeTools.set('t1', {
       toolId: 't1',
       name: 'first',
-      args: '',
+      activeVerb: 'Doing first',
+      finalVerb: 'Did first',
+      subject: null,
       startedAt: 0,
       preview: [],
     });
     s.activeTools.set('t2', {
       toolId: 't2',
       name: 'second',
-      args: '',
+      activeVerb: 'Doing second',
+      finalVerb: 'Did second',
+      subject: null,
       startedAt: 0,
       preview: [],
     });

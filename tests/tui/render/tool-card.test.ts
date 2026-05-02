@@ -12,10 +12,12 @@ const ascii: Capabilities = {
 };
 const unicode: Capabilities = { ...ascii, unicode: true };
 
-const tool = (preview: string[] = []): ActiveTool => ({
+const tool = (preview: string[] = [], subject: string | null = 'npm test'): ActiveTool => ({
   toolId: 't1',
   name: 'bash',
-  args: 'npm test',
+  activeVerb: 'Executing',
+  finalVerb: 'Executed',
+  subject,
   startedAt: 0,
   preview,
 });
@@ -37,62 +39,75 @@ describe('spinnerGlyph', () => {
   });
 });
 
-describe('renderToolCardLive', () => {
-  test('head line includes spinner, name, args, and elapsed', () => {
+describe('renderToolCardLive (operation chip, active state — UI.md §4.10.5)', () => {
+  test('head line is `<spinner> <activeVerb>… (<elapsed>)`', () => {
     const out = renderToolCardLive(tool(), unicode, 1234);
-    expect(out).toHaveLength(1);
-    expect(out[0]).toContain('bash');
-    expect(out[0]).toContain('npm test');
-    expect(out[0]).toContain('1.2s');
+    // [chip head, sub-content]
+    expect(out).toHaveLength(2);
+    expect(out[0]).toContain('Executing…');
+    expect(out[0]).toContain('(1.2s)');
+    // Spinner glyph leads the head — the specific frame depends on
+    // now (covered in spinnerGlyph tests); here we just check the
+    // first char is one of the cycle's frames.
+    const firstChar = (out[0] ?? '').charAt(0);
+    expect(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']).toContain(firstChar);
   });
 
-  test('elapsed under 1s uses ms units', () => {
-    expect(renderToolCardLive(tool(), unicode, 850)[0]).toContain('850ms');
+  test('elapsed under 1s uses ms units in the parens', () => {
+    expect(renderToolCardLive(tool(), unicode, 850)[0]).toContain('(850ms)');
   });
 
   test('elapsed clamps to 0s if now < startedAt', () => {
     const t: ActiveTool = { ...tool(), startedAt: 1000 };
-    expect(renderToolCardLive(t, unicode, 500)[0]).toContain('0s');
+    expect(renderToolCardLive(t, unicode, 500)[0]).toContain('(0s)');
   });
 
-  test('head uses Unicode separator when available', () => {
-    const out = renderToolCardLive(tool(), unicode, 0);
-    expect(out[0]).toContain(' · ');
+  test('subject renders as sub-content under `└─ ` (Unicode)', () => {
+    const out = renderToolCardLive(tool([], '/foo.ts'), unicode, 0);
+    expect(out).toHaveLength(2);
+    expect(out[1]).toBe(
+      `${CSI}2m└─ /foo.ts${CSI}0m`.replace(`${CSI}2m`, '').replace(`${CSI}0m`, ''),
+    );
+    // Color: 'none' for `unicode` here, so SGR strips off above; just
+    // assert the connector + subject content.
+    expect(out[1]).toBe('└─ /foo.ts');
   });
 
-  test('head uses ASCII separator when unicode disabled', () => {
-    const out = renderToolCardLive(tool(), ascii, 0);
-    expect(out[0]).toContain(' - ');
+  test('subject sub-content uses `\\- ` connector under ASCII', () => {
+    const out = renderToolCardLive(tool([], '/foo.ts'), ascii, 0);
+    expect(out[1]).toBe('\\- /foo.ts');
   });
 
-  test('preview lines render below head with tree branches', () => {
+  test('null subject drops the sub-content line entirely', () => {
+    const out = renderToolCardLive(tool([], null), unicode, 0);
+    expect(out).toHaveLength(1);
+  });
+
+  test('preview lines render below subject with tree branches', () => {
     const out = renderToolCardLive(tool(['line1', 'line2', 'line3']), unicode, 0);
-    expect(out).toHaveLength(4);
-    // Mid-branches use ├, last uses └.
-    expect(out[1]).toContain('├');
+    // [chip head, subject, branch+, branch+, branch└]
+    expect(out).toHaveLength(5);
     expect(out[2]).toContain('├');
-    expect(out[3]).toContain('└');
+    expect(out[3]).toContain('├');
+    expect(out[4]).toContain('└');
   });
 
   test('preview lines use ASCII branches when unicode disabled', () => {
     const out = renderToolCardLive(tool(['only']), ascii, 0);
-    expect(out[1]).toContain('\\');
+    expect(out[2]).toContain('\\');
   });
 
-  test('preview lines wrapped with dim SGR when color enabled', () => {
+  test('chip head wrapped with warn SGR when color enabled', () => {
+    const colorCaps = { ...unicode, color: 'basic' as const };
+    const out = renderToolCardLive(tool(), colorCaps, 0);
+    // warn = CSI 33 m
+    expect(out[0]).toContain(`${CSI}33m`);
+  });
+
+  test('subject and preview wrapped with dim SGR when color enabled', () => {
     const colorCaps = { ...unicode, color: 'basic' as const };
     const out = renderToolCardLive(tool(['hi']), colorCaps, 0);
-    expect(out[1]).toBe(`${CSI}2m  └ hi${CSI}0m`);
-  });
-
-  test('no preview → only head line', () => {
-    expect(renderToolCardLive(tool(), unicode, 0)).toHaveLength(1);
-  });
-
-  test('single preview line gets the closing branch', () => {
-    const out = renderToolCardLive(tool(['solo']), unicode, 0);
-    expect(out).toHaveLength(2);
-    expect(out[1]).toContain('└');
-    expect(out[1]).not.toContain('├');
+    expect(out[1]).toContain(`${CSI}2m`); // sub-content dim
+    expect(out[2]).toContain(`${CSI}2m`); // preview dim
   });
 });

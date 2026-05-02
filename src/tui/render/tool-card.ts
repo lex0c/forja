@@ -1,16 +1,18 @@
-// Tool card live render. Spec: UI.md §4.1 (running form).
+// Tool card live render. Spec: UI.md §4.10.5 (operation chip, active state).
 //
-// Single tool currently executing renders as a head line with spinner
-// + name + args + elapsed, optionally followed by indented preview
-// lines pulled from the last bytes of the tool's stdout/stderr.
+// Tool currently executing renders as the spinner + active verb +
+// elapsed counter, with the subject under a `└─ ` connector. The
+// chip uses the warn palette so it visually pops out of the dim
+// baseline while the operation runs.
 //
-// Final ("done") form lives in `formatPermanent` — that one writes to
-// scrollback once the tool finishes and gets out of the way. The
-// running form is the live one: it stays in the bottom region and
-// redraws on every frame.
+// Final state lives in `formatPermanent` — the chip collapses to
+// dim, gets the per-tool past-tense verb, and joins scrollback.
+// The streaming output preview (last few bytes of stdout) renders
+// indented under the chip, separately from the subject line.
 
 import type { ActiveTool } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
+import { subContentConnector } from './glyphs.ts';
 
 const SPINNER_UNICODE = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const;
 const SPINNER_ASCII = ['|', '/', '-', '\\'] as const;
@@ -34,21 +36,29 @@ const formatElapsed = (ms: number): string => {
 };
 
 export const renderToolCardLive = (tool: ActiveTool, caps: Capabilities, now: number): string[] => {
-  const sep = caps.unicode ? '·' : '-';
   const spinner = spinnerGlyph(caps, now);
   const elapsed = formatElapsed(now - tool.startedAt);
-  const head = `${spinner} ${tool.name} ${sep} ${tool.args}    ${elapsed}`;
+  const head = paint(caps, 'warn', `${spinner} ${tool.activeVerb}… (${elapsed})`);
+  const lines: string[] = [head];
 
-  if (tool.preview.length === 0) return [head];
+  // Sub-content: subject (per-tool extracted) under the shared
+  // connector glyph. Skipped when the vocab entry has no subject for
+  // this args shape (or a misbehaving producer emitted '').
+  if (tool.subject !== null && tool.subject !== '') {
+    lines.push(paint(caps, 'dim', `${subContentConnector(caps)}${tool.subject}`));
+  }
 
-  // Tree-style indent for preview lines. Last preview gets the
-  // closing branch glyph; others get the mid-branch.
-  const branchMid = caps.unicode ? '├' : '+';
-  const branchEnd = caps.unicode ? '└' : '\\';
-  const preview = tool.preview.map((line, i, arr) => {
-    const branch = i === arr.length - 1 ? branchEnd : branchMid;
-    return paint(caps, 'dim', `  ${branch} ${line}`);
-  });
+  // Streaming output preview (separate from the subject line). Tree
+  // glyphs distinguish "in-progress output" from the "subject" above.
+  if (tool.preview.length > 0) {
+    const branchMid = caps.unicode ? '├' : '+';
+    const branchEnd = caps.unicode ? '└' : '\\';
+    const preview = tool.preview.map((line, i, arr) => {
+      const branch = i === arr.length - 1 ? branchEnd : branchMid;
+      return paint(caps, 'dim', `  ${branch} ${line}`);
+    });
+    lines.push(...preview);
+  }
 
-  return [head, ...preview];
+  return lines;
 };

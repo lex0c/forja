@@ -73,7 +73,15 @@ describe('createBus', () => {
     const seen: string[] = [];
     bus.onAny((e) => seen.push(e.type));
     bus.emit(tickEvent);
-    bus.emit({ type: 'tool:start', ts: 2, toolId: 't1', name: 'bash', args: 'ls' });
+    bus.emit({
+      type: 'tool:start',
+      ts: 2,
+      toolId: 't1',
+      name: 'bash',
+      activeVerb: 'Executing',
+      finalVerb: 'Executed',
+      subject: 'ls',
+    });
     bus.emit({ type: 'session:end', ts: 3, sessionId: 's1', reason: 'done' });
     expect(seen).toEqual(['assistant:delta', 'tool:start', 'session:end']);
   });

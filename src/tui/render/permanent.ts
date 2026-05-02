@@ -12,16 +12,24 @@
 
 import type { PermanentItem } from '../state.ts';
 import { type Capabilities, paint, reverse } from '../term.ts';
+import { subContentConnector } from './glyphs.ts';
 import { visualWidth } from './width.ts';
 
-// Glyph tables for `tool-end`. Two paths because the spec (UI.md §6.2)
-// caps Forja's palette to Unicode when locale supports it, ASCII
-// otherwise. 'denied' MUST differ from 'error' so users can tell
-// "policy blocked me" from "tool crashed" at a glance.
-const TOOL_END_GLYPHS = {
-  unicode: { done: '✓', error: '✗', denied: '⚠' },
-  ascii: { done: '*', error: 'x', denied: '!' },
-} as const;
+// Final-state chip prefix glyph (UI.md §4.10.5). One glyph for all
+// statuses; status is communicated by the verb ('Failed' vs the
+// per-tool finalVerb) plus color (error / dim).
+const CHIP_FINAL_GLYPH = { unicode: '·', ascii: '*' } as const;
+
+// Override the per-tool finalVerb when the tool didn't succeed.
+// Spec UI.md §4.10.5: error → `Exited 1 in 2.1s`, denied → `Denied`.
+// We use generic verbs because the harness doesn't surface exit
+// codes / failure detail through HarnessEvent today; adapter ships
+// the framework, the rich detail lands when tool results expose it.
+const finalVerbFor = (status: 'done' | 'error' | 'denied', vocabVerb: string): string => {
+  if (status === 'denied') return 'Denied';
+  if (status === 'error') return 'Failed';
+  return vocabVerb;
+};
 
 export const formatPermanent = (item: PermanentItem, caps: Capabilities): string[] => {
   switch (item.kind) {
@@ -69,14 +77,39 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
     case 'assistant':
       return item.text.length > 0 ? item.text.split('\n') : [];
     case 'tool-end': {
-      const glyph = TOOL_END_GLYPHS[caps.unicode ? 'unicode' : 'ascii'][item.status];
-      const sep = caps.unicode ? '·' : '-';
+      // UI.md §4.10.5 — chip glyph + verb (status-aware) + duration.
+      // `· <verb> in <duration>` for Unicode; '* <verb> in <duration>'
+      // for ASCII. Color: dim for done, error palette for failed,
+      // warn palette for denied.
+      const glyph = caps.unicode ? CHIP_FINAL_GLYPH.unicode : CHIP_FINAL_GLYPH.ascii;
+      const verb = finalVerbFor(item.status, item.verb);
       const ms =
         item.durationMs >= 1000
           ? `${(item.durationMs / 1000).toFixed(1)}s`
           : `${item.durationMs}ms`;
-      const head = `${glyph} ${item.name} ${sep} ${item.args}    ${ms}`;
-      return item.summary !== undefined ? [head, `  ${item.summary}`] : [head];
+      const headRaw = `${glyph} ${verb} in ${ms}`;
+      const head =
+        item.status === 'error'
+          ? paint(caps, 'error', headRaw)
+          : item.status === 'denied'
+            ? paint(caps, 'warn', headRaw)
+            : paint(caps, 'dim', headRaw);
+      const lines = [head];
+      // Sub-content (subject) under the connector. Skipped when no
+      // subject (some tools have no obvious one — todo_write etc.).
+      // For denied, the subject is replaced by the policy reason if
+      // surfaced via summary; absent that, drop the connector.
+      // Treat empty-string subject as absent so a misbehaving producer
+      // doesn't render a bare `└─ ` line.
+      const sub = subContentConnector(caps);
+      const subText =
+        item.status === 'denied' && item.summary !== undefined
+          ? item.summary
+          : item.subject !== null && item.subject !== ''
+            ? item.subject
+            : (item.summary ?? null);
+      if (subText !== null) lines.push(paint(caps, 'dim', `${sub}${subText}`));
+      return lines;
     }
     case 'error':
       return [paint(caps, 'error', `error: ${item.message}`)];

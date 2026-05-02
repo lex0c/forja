@@ -158,77 +158,210 @@ describe('formatPermanent', () => {
     expect(formatPermanent({ kind: 'assistant', text: 'foo\n' }, ascii)).toEqual(['foo', '']);
   });
 
-  test('tool-end uses ASCII glyphs when unicode disabled', () => {
-    const done = formatPermanent(
-      { kind: 'tool-end', name: 'bash', args: 'ls', status: 'done', durationMs: 100 },
-      ascii,
-    );
-    const errored = formatPermanent(
-      { kind: 'tool-end', name: 'bash', args: 'rm', status: 'error', durationMs: 100 },
-      ascii,
-    );
-    const denied = formatPermanent(
-      { kind: 'tool-end', name: 'bash', args: 'rm', status: 'denied', durationMs: 100 },
-      ascii,
-    );
-    expect(done[0]?.charAt(0)).toBe('*');
-    expect(errored[0]?.charAt(0)).toBe('x');
-    expect(denied[0]?.charAt(0)).toBe('!');
-  });
+  describe('tool-end (operation chip + sub-content, UI.md §4.10.5/§4.10.7)', () => {
+    test('done status uses the per-tool finalVerb plus duration', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'read_file',
+          verb: 'Read file',
+          subject: '/foo.ts',
+          status: 'done',
+          durationMs: 850,
+        },
+        unicode,
+      );
+      // Chip head: `· Read file in 850ms`. Sub-content: `└─ /foo.ts`.
+      expect(out).toHaveLength(2);
+      expect(out[0]).toBe('· Read file in 850ms');
+      expect(out[1]).toBe('└─ /foo.ts');
+    });
 
-  test('tool-end uses Unicode glyphs when unicode enabled', () => {
-    const done = formatPermanent(
-      { kind: 'tool-end', name: 'bash', args: 'ls', status: 'done', durationMs: 100 },
-      unicode,
-    );
-    const errored = formatPermanent(
-      { kind: 'tool-end', name: 'bash', args: 'rm', status: 'error', durationMs: 100 },
-      unicode,
-    );
-    const denied = formatPermanent(
-      { kind: 'tool-end', name: 'bash', args: 'rm', status: 'denied', durationMs: 100 },
-      unicode,
-    );
-    expect(done[0]?.charAt(0)).toBe('✓');
-    expect(errored[0]?.charAt(0)).toBe('✗');
-    expect(denied[0]?.charAt(0)).toBe('⚠');
-  });
+    test('done status with no subject emits only the chip head (no connector line)', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'todo_write',
+          verb: 'Updated todos',
+          subject: null,
+          status: 'done',
+          durationMs: 50,
+        },
+        unicode,
+      );
+      expect(out).toEqual(['· Updated todos in 50ms']);
+    });
 
-  test('tool-end uses ms units below 1s and s units above', () => {
-    const fast = formatPermanent(
-      { kind: 'tool-end', name: 'r', args: 'a', status: 'done', durationMs: 850 },
-      ascii,
-    );
-    const slow = formatPermanent(
-      { kind: 'tool-end', name: 'r', args: 'a', status: 'done', durationMs: 1234 },
-      ascii,
-    );
-    expect(fast[0]).toContain('850ms');
-    expect(slow[0]).toContain('1.2s');
-  });
+    test('error status overrides verb to "Failed" regardless of vocab', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'rm -rf /tmp/x',
+          status: 'error',
+          durationMs: 200,
+        },
+        unicode,
+      );
+      expect(out[0]).toContain('Failed in 200ms');
+      expect(out[0]).not.toContain('Executed');
+      expect(out[1]).toBe('└─ rm -rf /tmp/x');
+    });
 
-  test('tool-end with summary emits a 2-space-indented continuation line', () => {
-    const out = formatPermanent(
-      {
-        kind: 'tool-end',
-        name: 'bash',
-        args: 'test',
-        status: 'done',
-        durationMs: 500,
-        summary: '47 entries',
-      },
-      ascii,
-    );
-    expect(out).toHaveLength(2);
-    expect(out[1]).toBe('  47 entries');
-  });
+    test('denied status overrides verb to "Denied"', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'rm -rf /',
+          status: 'denied',
+          durationMs: 1,
+        },
+        unicode,
+      );
+      expect(out[0]).toContain('Denied in 1ms');
+    });
 
-  test('tool-end uses ASCII separator when unicode disabled', () => {
-    const out = formatPermanent(
-      { kind: 'tool-end', name: 'bash', args: 'ls', status: 'done', durationMs: 50 },
-      ascii,
-    );
-    expect(out[0]).toContain(' - ');
+    test('denied status with summary surfaces the policy reason as sub-content', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: 'rm -rf /',
+          status: 'denied',
+          durationMs: 1,
+          summary: 'matches deny rule bash.rm.rf',
+        },
+        unicode,
+      );
+      // Summary takes precedence over subject for denied (the
+      // operator wants the reason, not the rejected command echo).
+      expect(out[1]).toBe('└─ matches deny rule bash.rm.rf');
+    });
+
+    test('summary fills in for sub-content when subject is null', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'todo_write',
+          verb: 'Updated todos',
+          subject: null,
+          status: 'done',
+          durationMs: 10,
+          summary: '3 items added',
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(2);
+      expect(out[1]).toBe('└─ 3 items added');
+    });
+
+    test('chip glyph is `·` under Unicode, `*` under ASCII', () => {
+      const u = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'r',
+          verb: 'Read file',
+          subject: null,
+          status: 'done',
+          durationMs: 1,
+        },
+        unicode,
+      );
+      const a = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'r',
+          verb: 'Read file',
+          subject: null,
+          status: 'done',
+          durationMs: 1,
+        },
+        ascii,
+      );
+      expect(u[0]?.charAt(0)).toBe('·');
+      expect(a[0]?.charAt(0)).toBe('*');
+    });
+
+    test('connector is `└─ ` under Unicode, `\\- ` under ASCII', () => {
+      const u = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'r',
+          verb: 'Read file',
+          subject: '/x',
+          status: 'done',
+          durationMs: 1,
+        },
+        unicode,
+      );
+      const a = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'r',
+          verb: 'Read file',
+          subject: '/x',
+          status: 'done',
+          durationMs: 1,
+        },
+        ascii,
+      );
+      expect(u[1]).toBe('└─ /x');
+      expect(a[1]).toBe('\\- /x');
+    });
+
+    test('duration uses ms below 1s, s above', () => {
+      const fast = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'r',
+          verb: 'Read',
+          subject: null,
+          status: 'done',
+          durationMs: 850,
+        },
+        ascii,
+      );
+      const slow = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'r',
+          verb: 'Read',
+          subject: null,
+          status: 'done',
+          durationMs: 1234,
+        },
+        ascii,
+      );
+      expect(fast[0]).toContain('850ms');
+      expect(slow[0]).toContain('1.2s');
+    });
+
+    test('error status applies error palette SGR to chip head when color enabled', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: null,
+          status: 'error',
+          durationMs: 1,
+        },
+        colored,
+      );
+      expect(out[0]).toContain(`${CSI}31m`);
+    });
+
+    test('done status applies dim palette SGR to chip head when color enabled', () => {
+      const out = formatPermanent(
+        { kind: 'tool-end', name: 'r', verb: 'Read', subject: null, status: 'done', durationMs: 1 },
+        colored,
+      );
+      expect(out[0]).toContain(`${CSI}2m`);
+    });
   });
 
   test('error and warn pass through as plain text when color disabled', () => {

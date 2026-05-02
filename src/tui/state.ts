@@ -29,7 +29,15 @@ export interface InputState {
 export interface ActiveTool {
   toolId: string;
   name: string;
-  args: string;
+  // Display vocabulary resolved by the adapter (UI.md §4.10.3-4).
+  // Stored on the active record so the tool-end branch of the reducer
+  // can pick the right verb without looking up tool-vocab again.
+  activeVerb: string;
+  finalVerb: string;
+  // One-line subject for the `└─ ` sub-content line. null when the
+  // tool's vocab entry has no extractor or args don't match the
+  // expected shape — renderer drops the connector entirely.
+  subject: string | null;
   startedAt: number;
   // Last few lines of streaming output. Capped so a tool that emits
   // a megabyte of stdout doesn't bloat the live region — the full
@@ -156,7 +164,12 @@ export type PermanentItem =
   | {
       kind: 'tool-end';
       name: string;
-      args: string;
+      // Final-state verb ('Read file', 'Executed', etc.) — picked by
+      // the reducer from the active record. For error / denied
+      // statuses, the renderer overrides with generic verbs ('Failed',
+      // 'Denied') regardless of what the producer registered.
+      verb: string;
+      subject: string | null;
       status: 'done' | 'error' | 'denied';
       durationMs: number;
       summary?: string;
@@ -293,7 +306,9 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       const tool: ActiveTool = {
         toolId: event.toolId,
         name: event.name,
-        args: event.args,
+        activeVerb: event.activeVerb,
+        finalVerb: event.finalVerb,
+        subject: event.subject,
         startedAt: event.ts,
         preview: [],
       };
@@ -321,7 +336,8 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       const item: PermanentItem = {
         kind: 'tool-end',
         name: tool.name,
-        args: tool.args,
+        verb: tool.finalVerb,
+        subject: tool.subject,
         status: event.status,
         durationMs: event.durationMs,
         ...(event.summary !== undefined ? { summary: event.summary } : {}),

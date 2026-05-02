@@ -163,9 +163,21 @@ describe('thinking lifecycle', () => {
 });
 
 describe('tool lifecycle', () => {
+  // Vocabulary fields are pre-resolved by the adapter; tests pass the
+  // resolved verb/subject directly to the events.
+  const startBash = (toolId = 't1') => ({
+    type: 'tool:start' as const,
+    ts: 1,
+    toolId,
+    name: 'bash',
+    activeVerb: 'Executing',
+    finalVerb: 'Executed',
+    subject: 'ls -la',
+  });
+
   test('start adds an active tool, end emits tool-end item and removes it', () => {
     const result = drive([
-      { type: 'tool:start', ts: 1, toolId: 't1', name: 'bash', args: 'ls -la' },
+      startBash(),
       {
         type: 'tool:end',
         ts: 1500,
@@ -180,7 +192,8 @@ describe('tool lifecycle', () => {
       {
         kind: 'tool-end',
         name: 'bash',
-        args: 'ls -la',
+        verb: 'Executed',
+        subject: 'ls -la',
         status: 'done',
         durationMs: 1200,
         summary: '47 entries',
@@ -190,7 +203,15 @@ describe('tool lifecycle', () => {
 
   test('tool:end without summary emits item without summary field', () => {
     const result = drive([
-      { type: 'tool:start', ts: 1, toolId: 't1', name: 'read', args: 'foo' },
+      {
+        type: 'tool:start',
+        ts: 1,
+        toolId: 't1',
+        name: 'read_file',
+        activeVerb: 'Reading file',
+        finalVerb: 'Read file',
+        subject: '/foo',
+      },
       { type: 'tool:end', ts: 200, toolId: 't1', status: 'done', durationMs: 50 },
     ]);
     const item = result.permanent[0];
@@ -198,17 +219,31 @@ describe('tool lifecycle', () => {
       throw new Error(`unexpected item kind: ${item?.kind}`);
     }
     expect(item.summary).toBeUndefined();
+    expect(item.verb).toBe('Read file');
+    expect(item.subject).toBe('/foo');
+  });
+
+  test('null subject from adapter survives the round-trip onto tool-end', () => {
+    const result = drive([
+      {
+        type: 'tool:start',
+        ts: 1,
+        toolId: 't1',
+        name: 'todo_write',
+        activeVerb: 'Updating todos',
+        finalVerb: 'Updated todos',
+        subject: null,
+      },
+      { type: 'tool:end', ts: 100, toolId: 't1', status: 'done', durationMs: 5 },
+    ]);
+    const item = result.permanent[0];
+    if (item?.kind !== 'tool-end') throw new Error('expected tool-end');
+    expect(item.subject).toBeNull();
   });
 
   test('delta lines feed the preview window, capped at 5 lines', () => {
     let state = createInitialState();
-    state = applyEvent(state, {
-      type: 'tool:start',
-      ts: 1,
-      toolId: 't1',
-      name: 'bash',
-      args: 'long-running',
-    }).state;
+    state = applyEvent(state, startBash()).state;
     const seven = Array.from({ length: 7 }, (_, i) => `line${i}`).join('\n');
     state = applyEvent(state, { type: 'tool:delta', ts: 2, toolId: 't1', text: seven }).state;
     const tool = state.activeTools.get('t1');
@@ -217,13 +252,7 @@ describe('tool lifecycle', () => {
 
   test('delta with trailing newline is not counted as an empty preview row', () => {
     let state = createInitialState();
-    state = applyEvent(state, {
-      type: 'tool:start',
-      ts: 1,
-      toolId: 't1',
-      name: 'bash',
-      args: 'echo',
-    }).state;
+    state = applyEvent(state, startBash()).state;
     state = applyEvent(state, { type: 'tool:delta', ts: 2, toolId: 't1', text: 'hi\n' }).state;
     const tool = state.activeTools.get('t1');
     expect(tool?.preview).toEqual(['hi']);
@@ -251,13 +280,13 @@ describe('tool lifecycle', () => {
     expect(r.permanent).toEqual([]);
   });
 
-  test('error and denied statuses are preserved on the item (renderer picks glyph)', () => {
+  test('error and denied statuses are preserved on the item (renderer picks verb)', () => {
     const errored = drive([
-      { type: 'tool:start', ts: 1, toolId: 't1', name: 'bash', args: 'rm' },
+      startBash('t1'),
       { type: 'tool:end', ts: 100, toolId: 't1', status: 'error', durationMs: 50 },
     ]);
     const denied = drive([
-      { type: 'tool:start', ts: 1, toolId: 't2', name: 'bash', args: 'rm' },
+      startBash('t2'),
       { type: 'tool:end', ts: 100, toolId: 't2', status: 'denied', durationMs: 50 },
     ]);
     const e = errored.permanent[0];
@@ -367,7 +396,15 @@ describe('state immutability', () => {
       ended: initial.ended,
     });
     applyEvent(initial, start());
-    applyEvent(initial, { type: 'tool:start', ts: 1, toolId: 't1', name: 'bash', args: 'ls' });
+    applyEvent(initial, {
+      type: 'tool:start',
+      ts: 1,
+      toolId: 't1',
+      name: 'bash',
+      activeVerb: 'Executing',
+      finalVerb: 'Executed',
+      subject: 'ls',
+    });
     const after = JSON.stringify({
       input: initial.input,
       status: initial.status,

@@ -19,6 +19,7 @@
 import type { ExitReason, HarnessEvent } from '../harness/types.ts';
 import type { Decision } from '../permissions/index.ts';
 import type { SessionEndEvent, UIEvent } from './events.ts';
+import { lookupToolVocab } from './tool-vocab.ts';
 
 export interface HarnessAdapterCtx {
   // Status-line metadata. Not derivable from HarnessEvent: the harness
@@ -52,7 +53,6 @@ export interface HarnessAdapter {
 
 interface ToolTrack {
   name: string;
-  args: string;
   decision: Decision | null;
 }
 
@@ -79,26 +79,6 @@ interface AdapterState {
   // running cost on step_start has a place to live.
   costUsd: number;
 }
-
-// Cap on the inline JSON.stringify of tool args. Long enough to read a
-// path or short command; short enough that a `write_file` with a 10KB
-// body doesn't blow up the line. Mirrors the plain renderer's default.
-const ARGS_MAX_CHARS = 200;
-
-const truncateArgs = (s: string): string =>
-  s.length <= ARGS_MAX_CHARS
-    ? s
-    : `${s.slice(0, ARGS_MAX_CHARS)}... (${s.length - ARGS_MAX_CHARS} more chars)`;
-
-const formatArgs = (args: Record<string, unknown>): string => {
-  try {
-    return truncateArgs(JSON.stringify(args));
-  } catch {
-    // JSON.stringify throws on circular refs or BigInt. Fall back to
-    // a placeholder rather than dropping the whole tool:start event.
-    return '<unserializable args>';
-  }
-};
 
 // Map the harness's exit reason to the renderer's `session:end.reason`.
 // The UI catalogue (events.ts) accepts a fixed set plus arbitrary
@@ -274,10 +254,21 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
       }
 
       case 'tool_invoking': {
-        const args = formatArgs(event.args);
+        const vocab = lookupToolVocab(event.toolName);
+        // Best-effort subject extraction. Subject extractors return
+        // null when args don't carry the expected field (malformed
+        // model output) — UI drops the connector line.
+        let subject: string | null = null;
+        try {
+          subject = vocab.subject?.(event.args) ?? null;
+        } catch {
+          // Defensive: a vocab extractor that throws on weird shapes
+          // shouldn't break the whole tool:start emission. Fall
+          // through with null subject.
+          subject = null;
+        }
         state.tools.set(event.toolUseId, {
           name: event.toolName,
-          args,
           decision: null,
         });
         out.push({
@@ -285,7 +276,9 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           ts,
           toolId: event.toolUseId,
           name: event.toolName,
-          args,
+          activeVerb: vocab.activeVerb,
+          finalVerb: vocab.finalVerb,
+          subject,
         });
         return out;
       }
