@@ -44,6 +44,19 @@ export type UserSubmitEvent = BaseEvent & {
   text: string;
 };
 
+// Input box edit. Emitted by the REPL loop on every keystroke that
+// mutated `InputState`, so the reducer keeps `state.input` current
+// and the renderer redraws. Cheap event — value/cursor straight from
+// `applyKey(...).next`. Producer (REPL editor handler) also drives
+// `user:submit` separately when Enter is hit; the reducer clears
+// `state.input` in that branch, so the post-submit `input:update`
+// (if any) lands on a fresh empty buffer.
+export type InputUpdateEvent = BaseEvent & {
+  type: 'input:update';
+  value: string;
+  cursor: number;
+};
+
 // Streaming assistant text.
 export type AssistantStartEvent = BaseEvent & {
   type: 'assistant:start';
@@ -235,6 +248,7 @@ export type UIEvent =
   | SessionStartEvent
   | SessionEndEvent
   | UserSubmitEvent
+  | InputUpdateEvent
   | AssistantStartEvent
   | AssistantDeltaEvent
   | AssistantEndEvent

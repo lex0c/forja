@@ -210,8 +210,19 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
 
     case 'user:submit':
       return {
-        state: { ...state, input: { value: '', cursor: 0 } },
+        // Clear the input AND reset `ended` so the REPL loop's next
+        // turn can keep drawing without needing a synthetic
+        // session:start to revive the renderer. One-shot callers
+        // close the renderer right after `session:end` anyway —
+        // `ended` was a soft guard, not a contract.
+        state: { ...state, input: { value: '', cursor: 0 }, ended: false },
         permanent: [{ kind: 'user-submit', text: event.text }],
+      };
+
+    case 'input:update':
+      return {
+        state: { ...state, input: { value: event.value, cursor: event.cursor } },
+        permanent: [],
       };
 
     case 'assistant:start':

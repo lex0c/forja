@@ -108,11 +108,15 @@ describe('cli entrypoint: prompt requirement', () => {
     expect(stderr).not.toContain('missing prompt');
   });
 
-  test('bare invocation without a prompt still errors with "missing prompt"', async () => {
-    // Sanity: the gate is still in place for every other path.
+  test('bare invocation without a TTY refuses to open the REPL', async () => {
+    // Empty prompt opens the interactive REPL (option (i) — see
+    // step 1.d.4 in BACKLOG); without a TTY (test runner has piped
+    // stdin) the REPL refuses. The old "missing prompt" gate was
+    // relaxed at the entry; failure now surfaces from the REPL's
+    // TTY check.
     const { exitCode, stderr } = await runCli([]);
     expect(exitCode).toBe(1);
-    expect(stderr).toContain('missing prompt');
+    expect(stderr).toContain('TTY');
   });
 
   test('--undo does NOT require a prompt', async () => {

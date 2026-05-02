@@ -48,7 +48,18 @@ export const createBus = (): Bus => {
       // Two channels: the typed channel (for handlers registered via
       // `on(type, ...)`) and the wildcard channel (for `onAny`). We
       // emit to both so each subscriber type stays simple.
-      emitter.emit(event.type, event);
+      //
+      // Node's EventEmitter has a special case for the 'error'
+      // channel — `emit('error', ...)` THROWS when no listener is
+      // registered on that exact channel, treating it as an
+      // unhandled error. The TUI bus uses the type tag purely as a
+      // routing key, not as Node's error sentinel, and the renderer
+      // typically subscribes via `onAny` (no listener on the 'error'
+      // channel itself). Skip the typed-channel emit for 'error'
+      // events when no one is on it; onAny still receives them.
+      if (event.type !== 'error' || emitter.listenerCount('error') > 0) {
+        emitter.emit(event.type, event);
+      }
       emitter.emit(ANY_CHANNEL, event);
     },
     on: (type, handler) => {

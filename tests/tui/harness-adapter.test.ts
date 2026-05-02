@@ -1,0 +1,529 @@
+import { describe, expect, test } from 'bun:test';
+import type { HarnessEvent, HarnessResult } from '../../src/harness/types.ts';
+import type { UIEvent } from '../../src/tui/events.ts';
+import { type HarnessAdapterCtx, createHarnessAdapter } from '../../src/tui/harness-adapter.ts';
+
+const baseCtx = (): HarnessAdapterCtx => {
+  let counter = 1000;
+  return {
+    profile: 'autonomous',
+    project: 'forja',
+    model: 'anthropic/claude-sonnet-4-6',
+    maxSteps: 50,
+    now: () => counter++,
+  };
+};
+
+const types = (events: UIEvent[]): string[] => events.map((e) => e.type);
+
+describe('harness-adapter — session lifecycle', () => {
+  test('session_start emits session:start + initial step:budget', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const ev: HarnessEvent = { type: 'session_start', sessionId: 'sess-1' };
+    const out = a.translate(ev);
+    expect(types(out)).toEqual(['session:start', 'step:budget']);
+    const start = out[0] as Extract<UIEvent, { type: 'session:start' }>;
+    expect(start.sessionId).toBe('sess-1');
+    expect(start.profile).toBe('autonomous');
+    expect(start.project).toBe('forja');
+    expect(start.model).toBe('anthropic/claude-sonnet-4-6');
+    const budget = out[1] as Extract<UIEvent, { type: 'step:budget' }>;
+    expect(budget.steps).toBe(0);
+    expect(budget.maxSteps).toBe(50);
+    expect(budget.costUsd).toBe(0);
+    expect(budget.maxCostUsd).toBeUndefined();
+  });
+
+  test('maxCostUsd is forwarded into step:budget when set', () => {
+    const a = createHarnessAdapter({ ...baseCtx(), maxCostUsd: 1.5 });
+    const out = a.translate({ type: 'session_start', sessionId: 's' });
+    const budget = out.find((e) => e.type === 'step:budget') as Extract<
+      UIEvent,
+      { type: 'step:budget' }
+    >;
+    expect(budget.maxCostUsd).toBe(1.5);
+  });
+
+  test('step_start bumps steps and emits step:budget', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({ type: 'step_start', stepN: 3 });
+    expect(out).toHaveLength(1);
+    const b = out[0] as Extract<UIEvent, { type: 'step:budget' }>;
+    expect(b.type).toBe('step:budget');
+    expect(b.steps).toBe(3);
+  });
+
+  test('session_finished emits final step:budget + session:end', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const result: HarnessResult = {
+      status: 'done',
+      reason: 'done',
+      sessionId: 'sess-1',
+      steps: 7,
+      durationMs: 1234,
+      usage: { input: 100, output: 50, cache_read: 0, cache_creation: 0 },
+      costUsd: 0.0123,
+      usageComplete: true,
+    };
+    const out = a.translate({ type: 'session_finished', result });
+    expect(types(out)).toEqual(['step:budget', 'session:end']);
+    const budget = out[0] as Extract<UIEvent, { type: 'step:budget' }>;
+    expect(budget.steps).toBe(7);
+    expect(budget.costUsd).toBe(0.0123);
+    const end = out[1] as Extract<UIEvent, { type: 'session:end' }>;
+    expect(end.reason).toBe('done');
+    expect(end.sessionId).toBe('sess-1');
+  });
+
+  test('adverse exit reason collapses to error + emits warn detail', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const result: HarnessResult = {
+      status: 'error',
+      reason: 'providerError',
+      sessionId: 'sess-2',
+      steps: 1,
+      durationMs: 10,
+      usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+      costUsd: 0,
+      usageComplete: true,
+      detail: '503 from upstream',
+    };
+    const out = a.translate({ type: 'session_finished', result });
+    expect(types(out)).toEqual(['step:budget', 'warn', 'session:end']);
+    const warn = out[1] as Extract<UIEvent, { type: 'warn' }>;
+    expect(warn.message).toContain('providerError');
+    expect(warn.message).toContain('503 from upstream');
+    const end = out[2] as Extract<UIEvent, { type: 'session:end' }>;
+    expect(end.reason).toBe('error');
+  });
+
+  test('session_finished closes a stranded streaming assistant', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'provider_event',
+      event: { kind: 'start', message_id: 'm1' },
+    });
+    const result: HarnessResult = {
+      status: 'interrupted',
+      reason: 'aborted',
+      sessionId: 'sess-3',
+      steps: 1,
+      durationMs: 5,
+      usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+      costUsd: 0,
+      usageComplete: true,
+    };
+    const out = a.translate({ type: 'session_finished', result });
+    // Order: assistant:end (close stranded) → step:budget → session:end
+    expect(types(out)).toEqual(['assistant:end', 'step:budget', 'session:end']);
+    const end = out[2] as Extract<UIEvent, { type: 'session:end' }>;
+    expect(end.reason).toBe('aborted');
+  });
+
+  test('resume_truncated → warn line', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'resume_truncated',
+      sessionId: 's',
+      kept: 30,
+      dropped: 20,
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]?.type).toBe('warn');
+    expect((out[0] as Extract<UIEvent, { type: 'warn' }>).message).toContain('30 of 50');
+  });
+});
+
+describe('harness-adapter — provider events: text streaming', () => {
+  test('start → assistant:start with messageId', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'start', message_id: 'msg-1' },
+    });
+    expect(types(out)).toEqual(['assistant:start']);
+    const e = out[0] as Extract<UIEvent, { type: 'assistant:start' }>;
+    expect(e.messageId).toBe('msg-1');
+  });
+
+  test('text_delta → assistant:delta inheriting current message', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'm' } });
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'text_delta', text: 'hi' },
+    });
+    expect(types(out)).toEqual(['assistant:delta']);
+    const e = out[0] as Extract<UIEvent, { type: 'assistant:delta' }>;
+    expect(e.messageId).toBe('m');
+    expect(e.text).toBe('hi');
+  });
+
+  test('text_delta with no prior start synthesizes assistant:start', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'text_delta', text: 'orphan' },
+    });
+    expect(types(out)).toEqual(['assistant:start', 'assistant:delta']);
+    const start = out[0] as Extract<UIEvent, { type: 'assistant:start' }>;
+    const delta = out[1] as Extract<UIEvent, { type: 'assistant:delta' }>;
+    expect(delta.messageId).toBe(start.messageId);
+  });
+
+  test('stop → assistant:end and clears state', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'm' } });
+    a.translate({ type: 'provider_event', event: { kind: 'text_delta', text: 'x' } });
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'stop', reason: 'end_turn' },
+    });
+    expect(types(out)).toEqual(['assistant:end']);
+    // A second stop is a no-op (idempotent endAssistant).
+    const out2 = a.translate({
+      type: 'provider_event',
+      event: { kind: 'stop', reason: 'end_turn' },
+    });
+    expect(out2).toEqual([]);
+  });
+
+  test('a new start closes the prior assistant before opening', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'm1' } });
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'start', message_id: 'm2' },
+    });
+    expect(types(out)).toEqual(['assistant:end', 'assistant:start']);
+    const end = out[0] as Extract<UIEvent, { type: 'assistant:end' }>;
+    expect(end.messageId).toBe('m1');
+  });
+
+  test('stream error → ui error event (fatal flag mirrors retryable)', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const retryable = a.translate({
+      type: 'provider_event',
+      event: { kind: 'error', code: '503', message: 'busy', retryable: true },
+    });
+    expect(retryable).toHaveLength(1);
+    const r = retryable[0] as Extract<UIEvent, { type: 'error' }>;
+    expect(r.fatal).toBeUndefined();
+    expect(r.message).toContain('503');
+    expect(r.message).toContain('busy');
+    const fatal = a.translate({
+      type: 'provider_event',
+      event: { kind: 'error', code: '400', message: 'bad request', retryable: false },
+    });
+    expect((fatal[0] as Extract<UIEvent, { type: 'error' }>).fatal).toBe(true);
+  });
+
+  test('usage event is silently dropped (no per-turn ui surface yet)', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'provider_event',
+      event: {
+        kind: 'usage',
+        usage: { input: 1, output: 2, cache_read: 0, cache_creation: 0 },
+      },
+    });
+    expect(out).toEqual([]);
+  });
+});
+
+describe('harness-adapter — thinking', () => {
+  test('first thinking_delta emits thinking:start + thinking:delta', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'm' } });
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'thinking_delta', text: 'hmm' },
+    });
+    expect(types(out)).toEqual(['thinking:start', 'thinking:delta']);
+    const s = out[0] as Extract<UIEvent, { type: 'thinking:start' }>;
+    expect(s.messageId).toBe('m');
+  });
+
+  test('subsequent thinking_delta does not re-emit thinking:start', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'm' } });
+    a.translate({ type: 'provider_event', event: { kind: 'thinking_delta', text: 'a' } });
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'thinking_delta', text: 'b' },
+    });
+    expect(types(out)).toEqual(['thinking:delta']);
+  });
+
+  test('text_delta after thinking closes the thinking window', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'm' } });
+    a.translate({ type: 'provider_event', event: { kind: 'thinking_delta', text: 'x' } });
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'text_delta', text: 'go' },
+    });
+    expect(types(out)).toEqual(['thinking:end', 'assistant:delta']);
+  });
+
+  test('stop also closes thinking', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'm' } });
+    a.translate({ type: 'provider_event', event: { kind: 'thinking_delta', text: 'x' } });
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'stop', reason: 'end_turn' },
+    });
+    expect(types(out)).toEqual(['thinking:end', 'assistant:end']);
+  });
+});
+
+describe('harness-adapter — tool lifecycle', () => {
+  test('tool_invoking → tool:start with stringified args', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'read_file',
+      args: { path: '/a' },
+    });
+    expect(types(out)).toEqual(['tool:start']);
+    const e = out[0] as Extract<UIEvent, { type: 'tool:start' }>;
+    expect(e.toolId).toBe('t1');
+    expect(e.name).toBe('read_file');
+    expect(e.args).toBe('{"path":"/a"}');
+  });
+
+  test('tool_invoking truncates very long args', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const big = 'x'.repeat(500);
+    const out = a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'write_file',
+      args: { content: big },
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:start' }>;
+    expect(e.args.length).toBeLessThan(big.length);
+    expect(e.args).toContain('more chars');
+  });
+
+  test('tool_decided is silent; outcome surfaces via tool_finished', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'bash',
+      args: { command: 'rm -rf /' },
+    });
+    const out = a.translate({
+      type: 'tool_decided',
+      toolUseId: 't1',
+      decision: { kind: 'deny', reason: 'rule blocked' },
+    });
+    expect(out).toEqual([]);
+  });
+
+  test('tool_finished after deny → tool:end status=denied', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'bash',
+      args: { command: 'rm' },
+    });
+    a.translate({
+      type: 'tool_decided',
+      toolUseId: 't1',
+      decision: { kind: 'deny', reason: 'no' },
+    });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'bash',
+      failed: true,
+      durationMs: 5,
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('denied');
+    expect(e.durationMs).toBe(5);
+  });
+
+  test('tool_finished after allow + failure → status=error', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'bash',
+      args: {},
+    });
+    a.translate({
+      type: 'tool_decided',
+      toolUseId: 't1',
+      decision: { kind: 'allow' },
+    });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'bash',
+      failed: true,
+      durationMs: 10,
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('error');
+  });
+
+  test('tool_finished without prior decision → status from failed flag', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'read_file',
+      args: { path: '/a' },
+    });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'read_file',
+      failed: false,
+      durationMs: 3,
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('done');
+  });
+
+  test('tool tracking is dropped after tool_finished', () => {
+    // A second tool_finished with the same id falls back to the
+    // failed-flag path — proves the per-id state was dropped.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'bash',
+      args: {},
+    });
+    a.translate({
+      type: 'tool_decided',
+      toolUseId: 't1',
+      decision: { kind: 'deny', reason: 'no' },
+    });
+    a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'bash',
+      failed: true,
+      durationMs: 1,
+    });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'bash',
+      failed: false,
+      durationMs: 1,
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('done');
+  });
+
+  test('provider tool_use_* events are silently dropped (avoids double cards)', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const e1 = a.translate({
+      type: 'provider_event',
+      event: { kind: 'tool_use_start', id: 't', name: 'bash' },
+    });
+    const e2 = a.translate({
+      type: 'provider_event',
+      event: { kind: 'tool_use_delta', id: 't', partial_args: '{' },
+    });
+    const e3 = a.translate({
+      type: 'provider_event',
+      event: { kind: 'tool_use_stop', id: 't', final_args: {} },
+    });
+    expect(e1).toEqual([]);
+    expect(e2).toEqual([]);
+    expect(e3).toEqual([]);
+  });
+});
+
+describe('harness-adapter — compaction & checkpoints', () => {
+  test('compaction_started → warn', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'compaction_started',
+      promptTokens: 90000,
+      threshold: 70000,
+      contextWindow: 100000,
+    });
+    expect(types(out)).toEqual(['warn']);
+  });
+
+  test('compaction_finished skipped → no event', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'compaction_finished',
+      strategy: 'skipped',
+      foldedCount: 0,
+      durationMs: 0,
+      usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+      costUsd: 0,
+    });
+    expect(out).toEqual([]);
+  });
+
+  test('compaction_finished llm → warn with details', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'compaction_finished',
+      strategy: 'llm',
+      foldedCount: 12,
+      durationMs: 850,
+      usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+      costUsd: 0.001,
+    });
+    expect(types(out)).toEqual(['warn']);
+    const w = out[0] as Extract<UIEvent, { type: 'warn' }>;
+    expect(w.message).toContain('llm');
+    expect(w.message).toContain('12');
+    expect(w.message).toContain('850ms');
+  });
+
+  test('checkpoint_created → checkpoint:create using current step count', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'step_start', stepN: 4 });
+    const out = a.translate({
+      type: 'checkpoint_created',
+      checkpointId: 'ckpt-aaaa',
+      gitRef: 'refs/checkpoints/x',
+      stepId: 'step-x',
+      hadBash: false,
+    });
+    expect(types(out)).toEqual(['checkpoint:create']);
+    const e = out[0] as Extract<UIEvent, { type: 'checkpoint:create' }>;
+    expect(e.checkpointId).toBe('ckpt-aaaa');
+    expect(e.stepN).toBe(4);
+  });
+
+  test('checkpoint_created with hadBash=true emits a follow-up warn', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'checkpoint_created',
+      checkpointId: 'aabbccddeeff',
+      gitRef: 'r',
+      stepId: 's',
+      hadBash: true,
+    });
+    expect(types(out)).toEqual(['checkpoint:create', 'warn']);
+    const w = out[1] as Extract<UIEvent, { type: 'warn' }>;
+    expect(w.message).toContain('bash');
+  });
+
+  test('checkpoints_unavailable → warn', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'checkpoints_unavailable',
+      reason: 'not a git repo',
+    });
+    expect(types(out)).toEqual(['warn']);
+    expect((out[0] as Extract<UIEvent, { type: 'warn' }>).message).toContain('not a git repo');
+  });
+});
