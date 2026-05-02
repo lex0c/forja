@@ -72,7 +72,13 @@ export const resolveScopeRoots = (
   };
 };
 
-const rootForScope = (roots: ScopeRoots, scope: MemoryScope): string => {
+// Pick the scope's root directory. Exported for callers that need
+// the directory itself (e.g. the loader's orphan walker, the writer's
+// mkdirSync target) without going through memoryFilePath. Returns
+// the un-resolved root verbatim — callers that need normalization
+// must resolve themselves; in this module we resolve right before
+// the sandbox check.
+export const rootForScope = (roots: ScopeRoots, scope: MemoryScope): string => {
   switch (scope) {
     case 'user':
       return roots.user;
