@@ -58,6 +58,35 @@ describe('session lifecycle', () => {
     expect(r.state.ended).toBe(true);
     expect(r.permanent).toEqual([{ kind: 'session-footer', reason: 'done' }]);
   });
+
+  test('session:banner emits a session-banner permanent without mutating LiveState', () => {
+    const initial = createInitialState();
+    const r = applyEvent(initial, {
+      type: 'session:banner',
+      ts: 5,
+      app: 'forja',
+      version: '0.0.0',
+      model: 'anthropic/claude-sonnet-4-6',
+      contextWindow: 200000,
+      maxOutputTokens: 4096,
+      cwd: '/home/lex/forja',
+      env: [{ key: 'subagents', value: '0' }],
+    });
+    // State unchanged — banner is pure scrollback.
+    expect(r.state).toEqual(initial);
+    expect(r.permanent).toEqual([
+      {
+        kind: 'session-banner',
+        app: 'forja',
+        version: '0.0.0',
+        model: 'anthropic/claude-sonnet-4-6',
+        contextWindow: 200000,
+        maxOutputTokens: 4096,
+        cwd: '/home/lex/forja',
+        env: [{ key: 'subagents', value: '0' }],
+      },
+    ]);
+  });
 });
 
 describe('user input', () => {

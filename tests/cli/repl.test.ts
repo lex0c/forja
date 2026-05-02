@@ -41,9 +41,10 @@ const makeStdin = (): NodeJS.ReadStream & { feed: (s: string) => void } => {
   return ee as unknown as NodeJS.ReadStream & { feed: (s: string) => void };
 };
 
-// Stub the heavy bits bootstrap normally constructs. The REPL only
-// touches `config`, `db.close`, `modelId`, `lockConflicts`,
-// `subagents`. The harness override means runAgent never reads
+// Stub the heavy bits bootstrap normally constructs. The REPL touches
+// `config`, `db.close`, `modelId`, `lockConflicts`, `subagents`, plus
+// `config.provider.capabilities` and `config.enableCheckpoints` for
+// the boot banner. The harness override means runAgent never reads
 // anything else, so a hollow config object is enough.
 const makeBootstrapStub = (cwd = '/tmp/forja-repl-test'): BootstrapResult => {
   const noop = (): void => undefined;
@@ -52,6 +53,10 @@ const makeBootstrapStub = (cwd = '/tmp/forja-repl-test'): BootstrapResult => {
     cwd,
     userPrompt: '',
     budget: { ...DEFAULT_BUDGET },
+    enableCheckpoints: false,
+    provider: {
+      capabilities: { context_window: 200000, output_max_tokens: 4096 },
+    },
   } as unknown as HarnessConfig;
   return {
     config,
@@ -163,6 +168,39 @@ describe('repl — boot + smoke', () => {
     const code = await promise;
     expect(code).toBe(0);
     expect(closes).toHaveLength(1);
+  });
+
+  test('boot emits welcome banner with correct content + omits empty env entries', async () => {
+    // Stub has subagents: 0 + enableCheckpoints: false → both env
+    // entries should be omitted (banner has 3 lines, no env).
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub('/path/to/repo'),
+      stdin,
+      skipTtyCheck: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    // Wait for the boot banner emit + initial frame to flush
+    // through the renderer's frame scheduler. Two ticks are enough
+    // for the bus → reducer → write chain.
+    await tick();
+    await tick();
+    const all = writes.join('');
+    expect(all).toContain('forja 0.0.0');
+    expect(all).toContain('mock/m');
+    expect(all).toContain('200,000 ctx');
+    expect(all).toContain('max 4096 out');
+    expect(all).toContain('/path/to/repo');
+    // No env line because both subagents and checkpoints were
+    // empty/disabled (D68 — omit when nothing to summarize).
+    expect(all).not.toContain('subagents');
+    expect(all).not.toContain('checkpoints');
+    stdin.feed('\x03');
+    expect(await promise).toBe(0);
   });
 
   test('typed prompt + Enter triggers runAgent with the typed text', async () => {

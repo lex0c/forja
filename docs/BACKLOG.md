@@ -15,6 +15,60 @@ Format:
 
 ---
 
+## [2026-05-02] M1 / Step 1.e.1 — Welcome banner + rule above input
+
+First slice of the §4.10 layout-target implementation. Two cheap
+visuals that anchor the boot experience: a four-line banner at the
+top of every REPL session (so the operator sees model + cwd + env
+before typing anything), and a horizontal rule between the live
+region and the input box (so the input has visual separation from
+the running operations above it). No vocabulary changes, no new
+state — just layout polish that makes the screen no longer "blank
+with `> `".
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/events.ts` | NEW `SessionBannerEvent` (type `'session:banner'`): `app`, `version`, `model`, `contextWindow`, `maxOutputTokens`, `cwd`, `env: {key,value}[]`. Producer-only event — emitted once at REPL boot, never re-emitted. Added to the `UIEvent` union. |
+| `src/tui/state.ts` | NEW `'session-banner'` kind in `PermanentItem` union (mirrors the event payload). Reducer branch for `session:banner` emits the permanent and leaves `LiveState` untouched (banner is pure scrollback, doesn't animate or get re-read). |
+| `src/tui/render/permanent.ts` | NEW `formatPermanent` case for `session-banner`: 4 lines per UI.md §4.10.9 — bold `app version`, dim `model · ctxN · max N out`, dim cwd, dim env joined by ` · ` (Unicode) / ` - ` (ASCII). Empty env array → line omitted entirely (producer signal of "nothing to summarize"). `contextWindow` formatted with `toLocaleString()` for thousands separator. |
+| `src/tui/render/compose.ts` | Insert a full-width rule line between status line / tool cards and the input box. Unicode `─`, ASCII `-`, repeated `caps.cols` times, dim. Suppressed when modal is up (modal owns its own structure). Lives ABOVE the input so the bottom anchor is `[rule, > input]`. |
+| `src/cli/version.ts` | NEW shared `APP_NAME` + `VERSION` constants. Both `index.ts` (for `--version`) and `repl.ts` (for the banner) import from here, killing the inline `const VERSION = '0.0.0'` duplication. |
+| `src/cli/index.ts` | Imports `VERSION` from `./version.ts` instead of declaring inline. |
+| `src/cli/repl.ts` | After bootstrap, before the initial `input:update`, emits `session:banner` with the collected metadata: `APP_NAME`/`VERSION` from version.ts, `modelId` from bootstrap result, `contextWindow`/`maxOutputTokens` from `baseConfig.provider.capabilities` (with `budget.maxOutputTokensPerCall` overriding when set), `cwd` from `baseConfig`. Env entries land conditionally per D68: `subagents: <N>` only when count > 0; `checkpoints: enabled` only when `enableCheckpoints && (await isGitRepo(cwd))` (i.e., the feature will actually fire — silent when disabled OR when the cwd isn't a git repo). Memory entry count omitted until the registry exposes a sync count method. Two new RunReplOptions test seams: `now?: () => number` (threaded through every bus.emit's `ts`) and `rendererWrite?: (s: string) => void` (passed to createRenderer for stdout capture). |
+| `tests/tui/state.test.ts` | NEW test for `session:banner` reducer branch: emits the permanent, preserves `LiveState` exactly. |
+| `tests/tui/render/permanent.test.ts` | NEW `describe('session-banner')` block: 6 tests covering Unicode separator output, ASCII fallback, empty-env line omission, bold/dim SGR application with color, no SGR with color disabled, and `toLocaleString()` formatting on a 1M context window. |
+| `tests/tui/render/compose.test.ts` | Existing 5 tests updated for the new `[..., rule, input]` bottom shape. NEW 4 tests: ASCII rule fallback, rule width via `visualWidth` (ANSI-aware, robust under color), rule width holds with color enabled (SGR codes don't bloat visible width), rule suppressed when modal is up. |
+| `tests/cli/repl.test.ts` | `makeBootstrapStub` extended with `provider.capabilities` (context_window, output_max_tokens) and `enableCheckpoints: false` so the REPL's banner-emit code path doesn't crash on the hollow stub. NEW test using `rendererWrite` seam: captures stdout, asserts banner content (`forja 0.0.0`, model, ctx, cwd) and confirms `subagents` / `checkpoints` strings absent when both env entries omit (D68 happy path through the REPL boot). |
+
+**Decisions:**
+
+- **D66 — Banner is `PermanentItem`, not live region.** The banner is information you read once and then the conversation grows above it. Putting it in `LiveState` would mean re-rendering it every frame and (worse) clearing it on resize. As a permanent, it goes to scrollback once and is owned by the terminal — copy-paste and mouse-scroll work normally on it.
+- **D67 — Banner is one-shot, producer responsibility.** No machinery prevents double-emit; the contract is documented in the event's TSDoc and the REPL boot code calls it exactly once. Tests don't enforce singularity (would require global event-counter state); code review is the gate.
+- **D68 — Empty env line is omitted, not rendered as "(none)".** Producers that don't have anything to summarize pass `env: []` and the renderer skips the line entirely. A "(none)" placeholder would be noise. If a producer wants to surface "we tried but found nothing", it passes `env: [{key: 'memory', value: '0 entries'}]` explicitly.
+- **D69 — Rule between status and input, not between input and footer.** The footer doesn't exist yet (lands in 1.e.4); when it does, a second rule will go between input and footer. For now, the single rule above input gives the input box visual separation from whatever's running above it (status line, tool cards). Without the rule, the `> ` blends into the status line and the eye loses the input's anchor.
+- **D70 — Rule suppressed when modal is up.** The modal already has its own top/bottom rule (renderModal §5.5); adding a third rule above it would visually stack 2-3 horizontal lines in 5 vertical lines. The modal owns the bottom of the live region while open — composer skips the rule alongside the input.
+- **D71 — `maxOutputTokens` reads from budget first, capabilities second.** The provider exposes its hard cap; the budget can lower it for the run. Showing the lower number ("max 1024 out" with provider cap of 4096) reflects what the operator actually has, not what the model could theoretically emit. When budget is unset, falls back to provider's `output_max_tokens`.
+- **D72 — `version.ts` shared module.** Two callers (`index.ts`, `repl.ts`) need the same constants; an inline `const VERSION = '0.0.0'` in two places would drift on the first bump. The module is 4 lines but earns its keep — future build-time injection (`bun build --define VERSION=$(git describe)`) lands in one place.
+- **D73 — Banner test via `rendererWrite` seam, not bus snooper.** Threading test data through stdout capture (the renderer's `write` option) tests the END-TO-END contract: emit → reducer → permanent → format → write. A bus-snooper would only verify the emit happened; missing the format step. The seam is a 1-line option in RunReplOptions and a 1-line passthrough into createRenderer.
+- **D74 — Env entries land conditionally, not as `<key>: 0` / `<key>: disabled`.** Generalizes D68 from "empty env array → omit line" to "entry-by-entry omit when value isn't actionable". `subagents: 0` tells the operator nothing useful — they don't have any defined; pushing the entry is noise. `checkpoints: enabled` when the cwd isn't a git repo is worse than noise — it's a lie that the harness contradicts seconds later. The REPL probes `isGitRepo(cwd)` before pushing the checkpoints entry. Cost: one async call (~10-50ms) at boot, dwarfed by the rest of bootstrap.
+- **D75 — `now` and `rendererWrite` test seams.** The REPL has been emitting `Date.now()` literals across 5+ call sites; tests had no way to control timestamps for ordering assertions or capture rendered output. Both options (`now?: () => number`, `rendererWrite?: (s: string) => void`) cost 2 lines each in the REPL signature, replace zero production behavior, and unlock a class of tests that were previously impossible (output-capture without monkey-patching process.stdout).
+
+**Pending / out of scope this slice:**
+
+- **Memory entry count in env summary.** Requires a sync `MemoryRegistry.count()` method (or async with a snapshot-cache). Lands when the memory subsystem exposes it.
+- **Policy layer summary** (e.g., `policy: project (5 rules) · user (2 rules)` from spec §4.10.9). Requires `PermissionEngine.view()` to return a layer→rule-count map. Lands with that API extension.
+- **Footer (rule below input + dynamic status).** Step 1.e.4. The current rule is just above input; the footer slice adds the second rule and the contextual hint line.
+- **User echo inverse bar + cursor inline.** Step 1.e.2.
+- **Tool indicator collapsed (verb + sub-content).** Step 1.e.3.
+
+**Verification:** `bun test` → 1971 pass / 10 skip / 0 fail (+12 new across permanent, compose, state, and repl). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.e.2 — user-submit echo with SGR-7 inverse bar (full-width) + cursor inline in the input box (cursor positioned at `state.input.cursor` instead of always at end-of-line). Both touch `formatPermanent` / `renderInput` and need ANSI cursor-back math.
+
+---
+
 ## [2026-05-02] M1 / Steps 1.d.3 + 1.d.4 — Harness→UI adapter + interactive REPL
 
 Two slices land together because they're load-bearing for each

@@ -141,6 +141,16 @@ export type PermanentItem =
       model: string;
     }
   | { kind: 'session-footer'; reason: string }
+  | {
+      kind: 'session-banner';
+      app: string;
+      version: string;
+      model: string;
+      contextWindow: number;
+      maxOutputTokens: number;
+      cwd: string;
+      env: { key: string; value: string }[];
+    }
   | { kind: 'user-submit'; text: string }
   | { kind: 'assistant'; text: string }
   | {
@@ -206,6 +216,23 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       return {
         state: { ...state, ended: true },
         permanent: [{ kind: 'session-footer', reason: event.reason }],
+      };
+
+    case 'session:banner':
+      return {
+        state,
+        permanent: [
+          {
+            kind: 'session-banner',
+            app: event.app,
+            version: event.version,
+            model: event.model,
+            contextWindow: event.contextWindow,
+            maxOutputTokens: event.maxOutputTokens,
+            cwd: event.cwd,
+            env: event.env,
+          },
+        ],
       };
 
     case 'user:submit':

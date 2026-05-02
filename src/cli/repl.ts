@@ -20,6 +20,7 @@
 // AbortController for the running turn, and the exit promise.
 
 import { basename } from 'node:path';
+import { isGitRepo } from '../checkpoints/git.ts';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
 import { DEFAULT_BUDGET } from '../harness/types.ts';
 import {
@@ -38,6 +39,7 @@ import {
 } from '../tui/index.ts';
 import type { ParsedArgs } from './args.ts';
 import { type BootstrapInput, type BootstrapResult, bootstrap } from './bootstrap.ts';
+import { APP_NAME, VERSION } from './version.ts';
 
 export interface RunReplOptions {
   args: ParsedArgs;
@@ -59,6 +61,14 @@ export interface RunReplOptions {
   // a real terminal. Production leaves it false so REPL refuses on
   // pipes (UI.md §2: REPL requires a TTY).
   skipTtyCheck?: boolean;
+  // Wall-clock source threaded through every UIEvent the REPL emits.
+  // Defaults to Date.now; tests inject a counter for deterministic ts
+  // ordering (and to keep timestamp assertions stable).
+  now?: () => number;
+  // Renderer stdout sink. When set, threaded into createRenderer in
+  // place of process.stdout.write. Tests pass a string collector to
+  // capture the banner / live frames without touching real stdio.
+  rendererWrite?: (s: string) => void;
 }
 
 // One-shot subscriber: drops `session:end` so the renderer doesn't
@@ -74,6 +84,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const { args } = options;
   const errSink = options.errSink ?? ((s: string) => process.stderr.write(s));
   const stdin = options.stdin ?? process.stdin;
+  const now = options.now ?? ((): number => Date.now());
 
   const caps = detectCapabilities();
   if (!caps.isTTY && options.skipTtyCheck !== true) {
@@ -135,6 +146,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     bus,
     caps,
     stdin,
+    ...(options.rendererWrite !== undefined ? { write: options.rendererWrite } : {}),
   });
   // Modal manager wired but no producer calls it yet — the harness's
   // permission engine doesn't bridge to the bus in this slice. Lands
@@ -166,7 +178,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      bus.emit({ type: 'warn', ts: Date.now(), message: `adapter error: ${msg}` });
+      bus.emit({ type: 'warn', ts: now(), message: `adapter error: ${msg}` });
     }
   };
 
@@ -189,7 +201,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       })
       .catch((e) => {
         const msg = e instanceof Error ? e.message : String(e);
-        bus.emit({ type: 'error', ts: Date.now(), message: msg });
+        bus.emit({ type: 'error', ts: now(), message: msg });
       })
       .finally(() => {
         running = false;
@@ -230,7 +242,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     if (result.next.value !== current.value || result.next.cursor !== current.cursor) {
       bus.emit({
         type: 'input:update',
-        ts: Date.now(),
+        ts: now(),
         value: result.next.value,
         cursor: result.next.cursor,
       });
@@ -241,7 +253,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // user:submit reducer would, which we're not emitting). The user
     // can hit Enter again once the turn ends.
     if (result.submit !== undefined && !running) {
-      bus.emit({ type: 'user:submit', ts: Date.now(), text: result.submit.text });
+      bus.emit({ type: 'user:submit', ts: now(), text: result.submit.text });
       startTurn(result.submit.text);
     }
 
@@ -287,10 +299,40 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   };
   process.on('SIGINT', sigintHandler);
 
+  // Welcome banner (UI.md §4.10.9). Goes to scrollback before any
+  // live frame so it sits at the top of the conversation transcript.
+  // Env summary entries land conditionally — D68 says omit when
+  // there's nothing useful to communicate. Memory entry count
+  // omitted until the registry exposes a sync count method.
+  const providerCaps = baseConfig.provider.capabilities;
+  const env: { key: string; value: string }[] = [];
+  if (subagents.byName.size > 0) {
+    env.push({ key: 'subagents', value: String(subagents.byName.size) });
+  }
+  // Checkpoints only show when they'll actually fire. Both halves
+  // matter: enableCheckpoints=false (plan mode, opt-out) and
+  // enableCheckpoints=true with non-git cwd both result in no
+  // rollback at runtime — banner stays silent rather than promising
+  // a feature that won't deliver.
+  if (baseConfig.enableCheckpoints === true && (await isGitRepo(baseConfig.cwd))) {
+    env.push({ key: 'checkpoints', value: 'enabled' });
+  }
+  bus.emit({
+    type: 'session:banner',
+    ts: now(),
+    app: APP_NAME,
+    version: VERSION,
+    model: modelId,
+    contextWindow: providerCaps.context_window,
+    maxOutputTokens: baseConfig.budget?.maxOutputTokensPerCall ?? providerCaps.output_max_tokens,
+    cwd: baseConfig.cwd,
+    env,
+  });
+
   // Initial frame: emit one input:update with the empty buffer so the
   // renderer draws the `> ` prompt before the user types. Without
   // this the screen sits blank until the first keystroke.
-  bus.emit({ type: 'input:update', ts: Date.now(), value: '', cursor: 0 });
+  bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
 
   await exitPromise;
   process.removeListener('SIGINT', sigintHandler);

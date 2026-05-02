@@ -31,6 +31,62 @@ describe('formatPermanent', () => {
     ]);
   });
 
+  describe('session-banner', () => {
+    const baseBanner = {
+      kind: 'session-banner' as const,
+      app: 'forja',
+      version: '0.1.0',
+      model: 'anthropic/claude-sonnet-4-6',
+      contextWindow: 200000,
+      maxOutputTokens: 4096,
+      cwd: '/home/lex/forja',
+      env: [
+        { key: 'subagents', value: '2' },
+        { key: 'checkpoints', value: 'enabled' },
+      ],
+    };
+
+    test('emits 4 lines (title, model+limits, cwd, env) with Unicode separators', () => {
+      expect(formatPermanent(baseBanner, unicode)).toEqual([
+        'forja 0.1.0',
+        'anthropic/claude-sonnet-4-6 · 200,000 ctx · max 4096 out',
+        '/home/lex/forja',
+        'subagents: 2 · checkpoints: enabled',
+      ]);
+    });
+
+    test('falls back to ASCII separator when unicode disabled', () => {
+      const out = formatPermanent(baseBanner, ascii);
+      expect(out[1]).toBe('anthropic/claude-sonnet-4-6 - 200,000 ctx - max 4096 out');
+      expect(out[3]).toBe('subagents: 2 - checkpoints: enabled');
+    });
+
+    test('omits env line entirely when env is empty (no placeholder)', () => {
+      const out = formatPermanent({ ...baseBanner, env: [] }, ascii);
+      expect(out).toHaveLength(3);
+      expect(out[0]).toBe('forja 0.1.0');
+      expect(out[2]).toBe('/home/lex/forja');
+    });
+
+    test('applies bold SGR to title and dim SGR to other lines when color enabled', () => {
+      const out = formatPermanent(baseBanner, colored);
+      expect(out[0]).toContain(`${CSI}1m`);
+      expect(out[1]).toContain(`${CSI}2m`);
+      expect(out[2]).toContain(`${CSI}2m`);
+      expect(out[3]).toContain(`${CSI}2m`);
+    });
+
+    test('emits no SGR when color disabled', () => {
+      const out = formatPermanent(baseBanner, unicode);
+      for (const line of out) expect(line).not.toContain(CSI);
+    });
+
+    test('formats large context window with locale-aware thousands separator', () => {
+      const out = formatPermanent({ ...baseBanner, contextWindow: 1_000_000 }, ascii);
+      expect(out[1]).toContain('1,000,000 ctx');
+    });
+  });
+
   test('user-submit renders > prefix and 2-space continuation indent', () => {
     expect(formatPermanent({ kind: 'user-submit', text: 'first\nsecond\nthird' }, ascii)).toEqual([
       '> first',

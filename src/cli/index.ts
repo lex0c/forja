@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 import { parseArgs, usage } from './args.ts';
-
-const VERSION = '0.0.0';
+import { VERSION } from './version.ts';
 
 const main = async (): Promise<number> => {
   const parsed = parseArgs(Bun.argv.slice(2));

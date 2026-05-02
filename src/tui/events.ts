@@ -31,6 +31,24 @@ export type SessionStartEvent = BaseEvent & {
   project: string;
   model: string;
 };
+
+// One-shot welcome banner (UI.md §4.10.9). Emitted by the REPL at
+// boot; producers MUST NOT emit twice. Pure permanent — the reducer
+// pushes it to scrollback and never references it again. Each line
+// answers a concrete question (version / model+limits / cwd / env).
+export type SessionBannerEvent = BaseEvent & {
+  type: 'session:banner';
+  app: string;
+  version: string;
+  model: string;
+  contextWindow: number;
+  maxOutputTokens: number;
+  cwd: string;
+  // Producers populate what they know; renderer joins entries with
+  // the locale-appropriate separator. Empty array → renderer omits
+  // the line entirely (no "N/A" placeholder).
+  env: { key: string; value: string }[];
+};
 export type SessionEndEvent = BaseEvent & {
   type: 'session:end';
   sessionId: string;
@@ -246,6 +264,7 @@ export type InterruptEvent = BaseEvent & {
 // compiler narrows the payload.
 export type UIEvent =
   | SessionStartEvent
+  | SessionBannerEvent
   | SessionEndEvent
   | UserSubmitEvent
   | InputUpdateEvent

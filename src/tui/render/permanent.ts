@@ -28,6 +28,27 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       return [`── session ${item.sessionId} · ${item.profile} · ${item.model} ──`];
     case 'session-footer':
       return [`── session end · ${item.reason} ──`];
+    case 'session-banner': {
+      // UI.md §4.10.9. Title bold, model/cwd/env dim. Empty env →
+      // skip the line (producer signal of "nothing to summarize",
+      // not "render empty bar").
+      const sep = caps.unicode ? '·' : '-';
+      const lines: string[] = [
+        paint(caps, 'bold', `${item.app} ${item.version}`),
+        paint(
+          caps,
+          'dim',
+          `${item.model} ${sep} ${item.contextWindow.toLocaleString()} ctx ${sep} max ${item.maxOutputTokens} out`,
+        ),
+        paint(caps, 'dim', item.cwd),
+      ];
+      if (item.env.length > 0) {
+        lines.push(
+          paint(caps, 'dim', item.env.map((e) => `${e.key}: ${e.value}`).join(` ${sep} `)),
+        );
+      }
+      return lines;
+    }
     case 'user-submit': {
       // Echo the prompt with `> ` prefix on first line and 2-space
       // continuation indent on subsequent ones.
