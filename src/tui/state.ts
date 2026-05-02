@@ -8,11 +8,12 @@
 // (renderer.ts) — the reducer never sees `Capabilities`. The renderer
 // wires the I/O around this — see renderer.ts.
 //
-// Events for which UI rendering has not been wired yet (modals,
-// subagents, bg, todo, plan/critique/permission/trust/memory) are
-// accepted by the reducer as no-ops with a TODO marker. They land
-// fully when the modal pattern (UI.md §5.5) and render functions
-// arrive in the next slices.
+// Wired so far: session lifecycle, user submit, assistant streaming,
+// thinking, tool lifecycle (start/delta/end with preview cap), step
+// budget, error/warn, interrupt, checkpoint, and the modal pattern
+// (`*:ask` / `permission:answer` / `modal:select`). Subagent / bg /
+// todo events accept silently and land alongside their render
+// functions.
 
 import type { UIEvent } from './events.ts';
 
@@ -56,6 +57,31 @@ export interface PendingAssistant {
   text: string;
 }
 
+// Confirm-style modal. Spec: UI.md §5.5. Lives in `LiveState` so the
+// renderer composes it; the modal-manager (src/tui/modal-manager.ts)
+// owns the async lifecycle (promise + queue + bus dispatch). Default
+// selected = 'no' is enforced by the manager when it constructs the
+// state, never by individual setters — keeps the safety invariant in
+// one place.
+export interface ConfirmState {
+  // ID assigned by the producer; threaded through `permission:ask` and
+  // matched by `permission:answer` to resolve the right promise.
+  promptId: string;
+  // Flavor lets the renderer pick a heading and the reducer route to
+  // the right "answer" event. We keep all confirm-shaped modals
+  // (permission, trust, memory write, plan review, critique) in this
+  // single state field to simplify focus + render — only one modal
+  // visible at a time anyway. Their per-flavor payloads live alongside.
+  flavor: 'permission' | 'trust' | 'memory-write' | 'plan-review' | 'critique';
+  // Lines the modal renders. First entry is the headline; rest are
+  // dim continuation lines (paths, code excerpts, etc.).
+  message: string;
+  details: string[];
+  // User's current selection. Default = 'no' (UI.md §5.5 D5 — safety:
+  // Enter without navigating rejects).
+  selected: 'yes' | 'no';
+}
+
 export interface LiveState {
   input: InputState;
   status: StatusState;
@@ -64,6 +90,10 @@ export interface LiveState {
   activeTools: Map<string, ActiveTool>;
   pendingAssistant: PendingAssistant | null;
   thinking: { startedAt: number } | null;
+  // Active modal, or null when no modal is up. Composer (compose.ts)
+  // replaces the input box with `renderModal(modal, caps)` whenever
+  // this is non-null. Status line + tool cards stay visible.
+  modal: ConfirmState | null;
   // Set true after `session:end`; renderer uses to decide whether to
   // accept further input or stop redrawing.
   ended: boolean;
@@ -84,6 +114,7 @@ export const createInitialState = (): LiveState => ({
   activeTools: new Map(),
   pendingAssistant: null,
   thinking: null,
+  modal: null,
   ended: false,
 });
 
@@ -288,16 +319,125 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       // event the producer emits afterwards.
       return { state, permanent: [] };
 
-    // ─── Not yet wired (modal pattern + render functions arrive in
-    // subsequent slices). Accept silently so producers can emit them
-    // without crashing the renderer; permanent output stays empty
-    // until each is properly handled. ──────────────────────────────
+    // ─── Modal events ──────────────────────────────────────────────
+    // Each `*:ask` raises a confirm-shaped modal with `selected = 'no'`
+    // by default (UI.md §5.5 D5). The matching `*:answer` (or
+    // `permission:answer` for the permission flavor) clears the modal.
+    // Producer (modal-manager) is responsible for re-emitting if
+    // multiple modals queue up; the reducer never queues itself.
     case 'permission:ask':
-    case 'permission:answer':
+      return {
+        state: {
+          ...state,
+          modal: {
+            promptId: event.promptId,
+            flavor: 'permission',
+            message: `${event.toolName}: ${event.command}`,
+            details: [
+              `cwd: ${event.cwd}`,
+              ...(event.rule !== undefined ? [`rule: ${event.rule}`] : []),
+              ...(event.reason !== undefined ? [`reason: ${event.reason}`] : []),
+            ],
+            selected: 'no',
+          },
+        },
+        permanent: [],
+      };
+
+    case 'permission:answer': {
+      // Only clear the modal when the answer matches the open prompt.
+      // A late answer from a stale prompt (e.g. cancelled then a new
+      // ask raised before the cancel propagated) shouldn't dismiss
+      // the wrong modal.
+      if (state.modal === null || state.modal.promptId !== event.promptId) {
+        return { state, permanent: [] };
+      }
+      return { state: { ...state, modal: null }, permanent: [] };
+    }
+
+    case 'modal:select': {
+      // In-modal toggle. Updates only `selected`; never reconstructs
+      // contents. Stale events (mismatched promptId, or arrived after
+      // the modal closed) are dropped silently.
+      if (state.modal === null || state.modal.promptId !== event.promptId) {
+        return { state, permanent: [] };
+      }
+      return {
+        state: { ...state, modal: { ...state.modal, selected: event.selected } },
+        permanent: [],
+      };
+    }
+
     case 'trust:ask':
+      return {
+        state: {
+          ...state,
+          modal: {
+            promptId: event.promptId,
+            flavor: 'trust',
+            message: 'unknown directory',
+            details: [
+              event.path,
+              ...(event.agentsMd ? ['AGENTS.md present (not yet trusted)'] : []),
+            ],
+            selected: 'no',
+          },
+        },
+        permanent: [],
+      };
+
     case 'memory:write:ask':
+      return {
+        state: {
+          ...state,
+          modal: {
+            promptId: event.promptId,
+            flavor: 'memory-write',
+            message: `memory write proposed (${event.scope})`,
+            details: [`name: ${event.name}`, '', ...event.body.split('\n')],
+            selected: 'no',
+          },
+        },
+        permanent: [],
+      };
+
     case 'plan:review':
+      return {
+        state: {
+          ...state,
+          modal: {
+            promptId: event.promptId,
+            flavor: 'plan-review',
+            message: `plan review · ${event.steps.length} steps`,
+            details: [
+              ...event.steps.map((s, i) => `${i + 1}. ${s}`),
+              '',
+              `estimated: ${event.estimatedCalls} tool calls · $${event.estimatedCostUsd.toFixed(2)}`,
+            ],
+            selected: 'no',
+          },
+        },
+        permanent: [],
+      };
+
     case 'critique:ask':
+      return {
+        state: {
+          ...state,
+          modal: {
+            promptId: event.promptId,
+            flavor: 'critique',
+            message: `critique · ${event.issues.length} issue(s)`,
+            details: event.issues.map(
+              (i) => `[${i.severity}] (${i.confidence.toFixed(2)}) ${i.message}`,
+            ),
+            selected: 'no',
+          },
+        },
+        permanent: [],
+      };
+
+    // ─── Not yet wired (subagent / bg / todo render arrives later) ──
     case 'todo:update':
     case 'subagent:start':
     case 'subagent:update':

@@ -15,6 +15,7 @@ import type { ComposeLive } from '../renderer-types.ts';
 import type { LiveState } from '../state.ts';
 import type { Capabilities } from '../term.ts';
 import { renderInput } from './input.ts';
+import { renderModal } from './modal.ts';
 import { renderStatusLine } from './status.ts';
 import { renderToolCardLive } from './tool-card.ts';
 
@@ -35,8 +36,14 @@ export const composeLive: ComposeLive = (
   const status = renderStatusLine(state, caps, { now });
   if (status !== null) lines.push(status);
 
-  // 3. Input box — always present.
-  lines.push(...renderInput(state.input, caps));
+  // 3. Modal OR input box — never both. The modal owns the bottom of
+  // the live region while it's up; status line and tool cards stay
+  // visible above so the user keeps context.
+  if (state.modal !== null) {
+    lines.push(...renderModal(state.modal, caps));
+  } else {
+    lines.push(...renderInput(state.input, caps));
+  }
 
   return lines;
 };

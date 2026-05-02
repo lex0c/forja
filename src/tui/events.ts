@@ -114,6 +114,15 @@ export type PermissionAnswerEvent = BaseEvent & {
   promptId: string;
   decision: 'accept' | 'reject' | 'edit';
 };
+// In-modal selection toggle. Cheap event the manager fires on
+// left/right/tab; reducer updates only `state.modal.selected` when
+// the promptId matches the open modal. Avoids re-emitting `*:ask`
+// (which would rebuild the modal contents from scratch).
+export type ModalSelectEvent = BaseEvent & {
+  type: 'modal:select';
+  promptId: string;
+  selected: 'yes' | 'no';
+};
 export type TrustAskEvent = BaseEvent & {
   type: 'trust:ask';
   promptId: string;
@@ -237,6 +246,7 @@ export type UIEvent =
   | ToolEndEvent
   | PermissionAskEvent
   | PermissionAnswerEvent
+  | ModalSelectEvent
   | TrustAskEvent
   | MemoryWriteAskEvent
   | PlanReviewEvent

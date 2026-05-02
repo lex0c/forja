@@ -15,6 +15,58 @@ Format:
 
 ---
 
+## [2026-05-02] M1 / Step 1.d.2 — Modal pattern (state + render + focus + async manager)
+
+The full modal pattern from UI.md §5.5 lands in one slice because
+the four pieces (state field, render function, focus stack, async
+manager) are tightly coupled — splitting them creates dead code at
+intermediate steps. After this, the harness can call
+`manager.askPermission({...})` and `await` a `Promise<boolean>`;
+under the hood, modal events flow through the bus, the reducer
+shows the box, the focus stack routes ←/→/Enter/Esc to the
+manager, and the manager resolves the promise + emits the answer
+event + clears the focus handler.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/state.ts` | NEW exported `ConfirmState` (promptId, flavor: permission/trust/memory-write/plan-review/critique, message, details, selected). NEW `LiveState.modal: ConfirmState \| null` field. Reducer wires all five `*:ask` events: builds the modal with `selected: 'no'` (D5 safety), routing per-flavor payload into headline + details. `permission:answer` clears the modal — but only when `promptId` matches the open prompt (a stale answer can't dismiss a fresh modal). Removed five entries from the parametric "not yet wired" list. |
+| `src/tui/render/modal.ts` | NEW `renderModal(modal, caps): string[]`. Layout: top rule, headline (bold), blank, details (dim, indented), blank, selector (`▶ YES        NO` / `  YES      ▶ NO`), bottom rule. Unicode rules use `─`; ASCII uses `-`. Pointer is `▶` Unicode / `>` ASCII. Empty details collapse the section (5 lines instead of 7); empty entries within details become spacer rows. No green/red on YES/NO — coloring approval would undermine "default = NO" (D42). |
+| `src/tui/render/compose.ts` | Compose now picks modal OR input — never both. Status line + tool cards still render above. The modal owns the bottom of the live region while up. |
+| `src/tui/focus-stack.ts` | NEW `createFocusStack()` returning `{push, remove, dispatch, size, clear}`. Top of stack runs first (LIFO); falls through if a handler returns false. Dispatch returns whether ANY handler consumed. `remove(handler)` searches top-down by reference (LIFO common case). Pure data structure — no I/O, single instance owned by the REPL loop. |
+| `src/tui/modal-manager.ts` | NEW `createModalManager({bus, focusStack, now?, newPromptId?, setTimer?, clearTimer?})`. `askPermission(args, opts?)` returns `Promise<boolean>`. Under the hood: enqueue → drain (one modal at a time, FIFO) → emit `permission:ask` → push focus handler. Handler: `left/right/tab` toggle selected (re-emit ask with same promptId), `enter` resolve to `selected === 'yes'`, `escape` resolve to `false`, anything else swallowed (modal never surprises). On resolve: emit `permission:answer` BEFORE the promise resolves (audit/telemetry sees ordering), pop focus handler, drain next. Optional `timeoutMs` rejects-as-false — works whether the modal is active or still queued. `close()` rejects everything outstanding. `pendingCount()` for tests. |
+| `tests/tui/focus-stack.test.ts` | 9 tests: empty stack, single handler, top runs first, fall-through on false, all-false dispatch, remove specific handler, remove non-existent returns false, top-down search, clear empties. |
+| `tests/tui/render/modal.test.ts` | 10 tests: full layout, ASCII vs Unicode rules, default selector points to NO, yes-selected points to YES, ASCII pointer is `>`, no-details collapses, empty-detail-entry becomes spacer, headline gets bold SGR with color, details get dim SGR with color, color disabled emits no SGR. |
+| `tests/tui/modal-manager.test.ts` | 13 tests: emits ask + pushes handler, default Enter resolves false, right-then-Enter resolves true, Tab toggles, Esc resolves false even after right, answer event emitted before promise resolves, focus handler removed after resolution, swallows printable chars while up, queue (two asks: first opens, second waits, both resolve), timeout fires while active rejects false, explicit answer clears timeout, timeout while queued rejects without opening, close rejects all + clears stack. |
+
+**Decisions:**
+
+- **D41 — One modal at a time, queued.** UI.md §5.5 mandates "modal queue: FIFO". The manager enforces — `pendingCount()` reflects total (active + queued); `drain()` opens the next when the active resolves. Two-modals-at-once would require nested focus handlers and dual rendering — punted by spec.
+- **D42 — No green YES, no red NO.** Default = NO is the safety invariant; coloring YES green (approval-positive) would undermine it. The selector is plain text, only the pointer (`▶` / `>`) signals state. If the user wants color, they get it post-resolve via `permission:answer` audit lines.
+- **D43 — Modal state lives in `LiveState`, not the manager.** The manager owns the async lifecycle (queue, promises, timeouts); the state owns the visual. This split lets the renderer read `state.modal` without depending on the manager, and lets the manager run without holding render state. Communication is via the bus: manager emits `*:ask` → reducer mutates state → renderer composes.
+- **D44 — Toggle re-emits the same `*:ask` event with the same promptId.** Instead of a separate `*:select` event, we re-issue the ask with new `selected` (carried via the same bus shape). Pro: one event for both creation and updates — fewer schema additions. Con: details/headline are recomputed each time, but they're cheap to assemble. Reducer detects same `promptId` and overwrites; no race condition since both events serialize through the bus.
+- **D45 — `permission:answer` emitted BEFORE promise resolves.** Order matters: audit listeners (telemetry, transcript writer) need to see the answer in scrollback before any `.then()` chain runs. The manager calls `bus.emit` first, `pending.resolve` second — both synchronous, but the ordering is documented in the test.
+- **D46 — Focus handler removed by exact reference.** The manager pushes `activeHandler` and removes by passing the same reference back. `remove(handler)` returns false if the handler was already gone (popped externally), which the manager ignores. Idempotent close path.
+- **D47 — Stale answer drops silently.** `permission:answer` with a `promptId` that doesn't match the open modal is a no-op in the reducer. Avoids "wrong modal dismisses" when a producer cancels then re-asks before the cancel propagated.
+- **D48 — `askPermission` is the only public ask method (for now).** `askTrust` / `askMemoryWrite` / `askPlanReview` / `askCritique` will land alongside their producers. The reducer already accepts the events (so the bus path works end-to-end), but the convenience wrappers are deferred — keeps the API surface small until each flavor's producer is real.
+- **D49 — Single confirm shape across flavors.** Permission, trust, memory-write, plan-review, critique all reuse `ConfirmState` (yes/no, message + details). Per-flavor specifics get rendered into `details` text. We considered separate state per flavor (e.g., a memory-write modal could show a diff inline); deferred to when a flavor outgrows the shared shape. Most modals are "you sure? (y/n)" anyway.
+- **D50 — Manager sees the bus but not the renderer.** No `composeLive` import, no scheduler awareness. The renderer wakes on bus events naturally; the manager doesn't need to bump it. Keeps the dep graph one-way: manager → bus, renderer → bus, no manager → renderer.
+
+**Pending / out of scope this slice:**
+
+- **Convenience wrappers `askTrust` / `askMemoryWrite` / `askPlanReview` / `askCritique`** — bus events accepted by the reducer but no public method on the manager. Lands when the producer for each one wires up.
+- **REPL loop wiring** — focus stack + manager exist, but nothing yet pumps `process.stdin` → key parser → focus.dispatch. Step 1.d.4.
+- **HarnessEvent → UIEvent adapter** — translates the harness's `HarnessEvent` shape into `UIEvent`. Step 1.d.3.
+- **Per-flavor headline microcopy.** Reducer just renders the bus payload as message + details strings; spec UI.md §4.6-4.9 has more polish (e.g., "[a]ccept [r]eject [e]dit [w]hy?" style hint lines). Deferred.
+- **Why-explanation expansion** (`[w]hy?` action). Spec mentions; not wired.
+
+**Verification:** `bun test` → 1904 pass / 10 skip / 0 fail (+32 new across focus-stack, modal render, modal-manager). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.d.3 — `HarnessEvent → UIEvent` adapter. The existing harness emits `HarnessEvent` (see `src/harness/types.ts`); the adapter translates it into the `UIEvent` shape the renderer + reducer consume. After that: REPL loop in `src/cli/index.ts` (1.d.4) — pumps stdin into the key parser → focus stack, hooks the renderer to a real harness run.
+
+---
+
 ## [2026-05-02] M1 / Step 1.d.1 — Input editor + heartbeat tick
 
 Two pure modules that close out the foundation for the interactive
