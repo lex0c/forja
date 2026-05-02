@@ -1,0 +1,184 @@
+import type { DB } from '../db.ts';
+
+// Repo for `memory_events` (migration 016). Audit-only — content
+// of memories lives in markdown files, not here. This table
+// answers "when/where/by-whom did a memory operation happen?".
+//
+// 5.1 lands the schema + helpers; 5.2 starts emitting `read`
+// events from the lazy-load tool, 5.3 emits proposed/created/
+// refused/edited/deleted from the write surface, 5.4 emits the
+// trust-related rows, 5.5 emits promoted/demoted, and 5.6 emits
+// expired.
+
+export type MemoryEventScope = 'user' | 'project_local' | 'project_shared';
+export type MemoryEventAction =
+  | 'proposed'
+  | 'created'
+  | 'edited'
+  | 'deleted'
+  | 'read'
+  | 'refused'
+  | 'promoted'
+  | 'demoted'
+  | 'expired';
+export type MemoryEventSource = 'user_explicit' | 'inferred' | 'imported';
+
+export interface MemoryEvent {
+  id: string;
+  scope: MemoryEventScope;
+  action: MemoryEventAction;
+  memoryName: string;
+  source: MemoryEventSource;
+  sessionId: string | null;
+  cwd: string | null;
+  createdAt: number;
+  // Action-specific extras. The repo neither validates nor
+  // interprets the shape; consumers (UI, lifecycle, trust audit)
+  // own the per-action contract. Returned as null when the row
+  // had no details OR when the persisted JSON was malformed —
+  // callers needing to distinguish "absent" from "corrupted"
+  // should query the raw column directly.
+  details: Record<string, unknown> | null;
+}
+
+interface MemoryEventRow {
+  id: string;
+  scope: MemoryEventScope;
+  action: MemoryEventAction;
+  memory_name: string;
+  source: MemoryEventSource;
+  session_id: string | null;
+  cwd: string | null;
+  created_at: number;
+  details: string | null;
+}
+
+// Mirrors the defensive parse pattern in subagent-outputs /
+// subagent-runs. Storage corruption shouldn't crash an audit
+// listing; we surface a null `details` and let the consumer
+// decide.
+const parseDetails = (raw: string | null): Record<string, unknown> | null => {
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+};
+
+const fromRow = (row: MemoryEventRow): MemoryEvent => ({
+  id: row.id,
+  scope: row.scope,
+  action: row.action,
+  memoryName: row.memory_name,
+  source: row.source,
+  sessionId: row.session_id,
+  cwd: row.cwd,
+  createdAt: row.created_at,
+  details: parseDetails(row.details),
+});
+
+export interface CreateMemoryEventInput {
+  // Optional: caller can supply an id when batching events from
+  // a deterministic source (e.g. a replay tool). Defaults to a
+  // fresh UUID.
+  id?: string;
+  scope: MemoryEventScope;
+  action: MemoryEventAction;
+  memoryName: string;
+  source: MemoryEventSource;
+  sessionId?: string | null;
+  cwd?: string | null;
+  createdAt?: number;
+  details?: Record<string, unknown> | null;
+}
+
+export const createMemoryEvent = (db: DB, input: CreateMemoryEventInput): MemoryEvent => {
+  const id = input.id ?? crypto.randomUUID();
+  const sessionId = input.sessionId ?? null;
+  const cwd = input.cwd ?? null;
+  const createdAt = input.createdAt ?? Date.now();
+  const details = input.details ?? null;
+  const detailsJson = details === null ? null : JSON.stringify(details);
+  db.query(
+    `INSERT INTO memory_events
+       (id, scope, action, memory_name, source, session_id, cwd, created_at, details)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    id,
+    input.scope,
+    input.action,
+    input.memoryName,
+    input.source,
+    sessionId,
+    cwd,
+    createdAt,
+    detailsJson,
+  );
+  return {
+    id,
+    scope: input.scope,
+    action: input.action,
+    memoryName: input.memoryName,
+    source: input.source,
+    sessionId,
+    cwd,
+    createdAt,
+    details,
+  };
+};
+
+// Audit feed for the current session. Ordered chronologically
+// (created_at ASC, id ASC as a stable tiebreak) so the timeline
+// view doesn't shuffle on equal timestamps. The partial index on
+// (session_id) WHERE NOT NULL covers this query. Rows whose
+// session was purged remain in the table (FK SET NULL preserves
+// them) but their session_id is now NULL, so the
+// `WHERE session_id = ?` filter excludes them — the audit
+// history is reachable instead via listMemoryEventsByName.
+export const listMemoryEventsBySession = (db: DB, sessionId: string): MemoryEvent[] => {
+  const rows = db
+    .query<MemoryEventRow, [string]>(
+      `SELECT id, scope, action, memory_name, source, session_id, cwd, created_at, details
+         FROM memory_events
+        WHERE session_id = ?
+        ORDER BY created_at ASC, id ASC`,
+    )
+    .all(sessionId);
+  return rows.map(fromRow);
+};
+
+// History of one memory across its full lifetime. Ordered most-
+// recent first (matching the composite index direction) so the
+// caller can `LIMIT N` to get the latest activity.
+export const listMemoryEventsByName = (
+  db: DB,
+  memoryName: string,
+  limit?: number,
+): MemoryEvent[] => {
+  if (limit !== undefined) {
+    const rows = db
+      .query<MemoryEventRow, [string, number]>(
+        `SELECT id, scope, action, memory_name, source, session_id, cwd, created_at, details
+           FROM memory_events
+          WHERE memory_name = ?
+          ORDER BY created_at DESC, id DESC
+          LIMIT ?`,
+      )
+      .all(memoryName, limit);
+    return rows.map(fromRow);
+  }
+  const rows = db
+    .query<MemoryEventRow, [string]>(
+      `SELECT id, scope, action, memory_name, source, session_id, cwd, created_at, details
+         FROM memory_events
+        WHERE memory_name = ?
+        ORDER BY created_at DESC, id DESC`,
+    )
+    .all(memoryName);
+  return rows.map(fromRow);
+};
