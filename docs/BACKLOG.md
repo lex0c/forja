@@ -15,6 +15,68 @@ Format:
 
 ---
 
+## [2026-05-02] M1 prep — TUI respec: drop Ink, switch to inline raw-ANSI render
+
+Rethinking the UI/UX layer before any implementation. The
+existing `UI.md` (1939 lines) and `DESIGN_SYSTEM.md` (715
+lines) speced an Ink-based TUI with 26 components, a 5-region
+formal layout, semantic color palette, and a full design
+system. That was over-engineered for what the agent actually
+needs to render: a streaming chat with tool cards, a status
+line, and the occasional modal. We don't need React in the
+terminal.
+
+**The shift:** inline rendering, no framework. Output goes to
+stdout permanently (becomes terminal scrollback — copy-paste,
+mouse-scroll, redirection all work for free). Only the bottom
+3-15 lines are "live" — the renderer moves the cursor up,
+clears down, and rewrites them on each frame. The "live
+region" is small enough that virtual-DOM reconciliation buys
+nothing; clear+redraw at 30fps is faster than React + Ink's
+diff. Spine is a typed event bus (EventEmitter): harness emits,
+renderer subscribes, `--json` mode serializes the same bus as
+NDJSON. Tests assert on events.
+
+**Done (spec only — no `src/` code yet):**
+
+| File | Change |
+|---|---|
+| `docs/spec/AGENTIC_CLI.md` | §3 stack table: `Ink (React)` → `Internal (raw ANSI + raw stdin)`, deps minimal (`string-width`, `wrap-ansi`). §4 topology diagram: `CLI / TUI (Ink)` → `CLI / TUI (raw ANSI + event bus)`. §5.1 plan flow: `<PlanReview>`/`<DiffView>` refs replaced by `plan:review` event + modal pattern. §5.4 self-critique: `<CritiqueOverlay>` → `critique:ask` event. §7.3 background: `<BackgroundProcessTray>` → status line tray description. §7.3.1 monitor: `<ToolCallCard>` ref replaced by "live tool card streaming". §17 fully rewritten: was a 26-Ink-component catalog, now a short summary of the new model with pointers to UI.md. §18 M1 roadmap: "Ink mínimo" → "TUI mínima (raw ANSI + event bus)". §0.1 doc index: drop DESIGN_SYSTEM row, expand UI row description. |
+| `docs/spec/UI.md` | Full rewrite. From 1939 → ~570 lines. New sections: §0 principles (inline > alt-screen, no framework, event bus as spine, render functional, stdout sacred), §1 stack (only `string-width` + `wrap-ansi`, no `picocolors`/`prompts`/`ora`), §2 inline screen model (scrollback vs live region, breakpoints, modal overlay semantics), §3 event bus contract (catalog of events: `assistant:*`, `tool:*`, `permission:ask`, `trust:ask`, `memory:write:ask`, `plan:review`, `todo:update`, `subagent:*`, `bg:*`, `step:budget`, `checkpoint:create`, `interrupt`, etc.), §4 functional render examples (tool card, subagent row, todo list, status line, input box, permission/trust/memory-write/plan-review modals), §5 interaction patterns (input handling, spinner, slash commands, keybindings, **modal pattern canonical: state + focus handler + promise + default=NO + timeout**, modal queue, focus stack), §6 minimal palette (grayscale + 1 accent for error, no blue/cyan/magenta), glyphs with ASCII fallback, §7 headless `--json` (bus → NDJSON), §8 capability detection, §9 microcopy, §10 perf, §11 testing, §12 boot sequence, §13 non-goals. |
+| `docs/spec/DESIGN_SYSTEM.md` | **Deleted.** All visual foundations (palette, glyphs, typography, spacing, density) absorbed into UI.md §6. Separate doc was redundant given the minimalism mandate. |
+| `docs/spec/ANTI_PATTERNS.md` | New §4.4 "Reintroduzir framework de UI" (React/Ink/blessed banned — clear+redraw beats reconciliation for 3-15 live lines, framework adds lifecycle/focus/dep cost without proportional gain). New §4.5 "Alt-screen / full-screen TUI" banned (breaks scrollback, mouse-copy, pipe composition; agent is a shell tool, not an app). Existing §4.1 reference "DESIGN_SYSTEM.md" updated to "UI.md §9". |
+| `docs/spec/PERFORMANCE.md` | §2.6 retitled `UI rendering (Ink)` → `UI rendering (TUI inline)` with updated budgets (added "Modal open/close" row, updated wording). §9 "Lazy imports" changed to mention `renderer/raw-stdin` instead of `Ink`. §19.1 "Frame budget" rewritten: history never redraws, live region 3-15 lines coalesces deltas in 33ms windows. §19.2 "Input lag" rewritten with raw-stdin parser separate from render loop, bracketed paste batching. |
+| `docs/spec/AUDIT.md` | §6.2 audit CLI output: "tabela compacta colorida (Ink)" → "tabela compacta em texto (cor mínima — só dim em meta, sem highlight colorido)". |
+| `docs/spec/CONTRACTS.md` | §2.6 display hint reference: pointer changed from `<ToolCallCard>` to `tool card (UI.md §4.1)`. §2.6.5d wait/monitor UI integration rewritten without component names — now "status line shows tray", "events are streamed as live lines". §3 streaming pipeline step 4: component refs (`<StreamingMessage>`/`<ToolCallCard>`/`<ThinkingIndicator>`) replaced by event names (`assistant:delta`/`tool:start`/`thinking:delta`). §10 non-contract list: "Ink components são internos" → "funções de render do TUI são internas; apenas o catálogo de eventos do bus (UI.md §3) é contrato". |
+| `docs/spec/CHECKPOINTS.md` | §2.3 reference: "M4 (Ink)" → "TUI (M4)". |
+| `docs/spec/ORCHESTRATION.md` | §1.4 thinking indicator: `<ThinkingIndicator>` → `thinking:delta` event + status line description. §6 self-critique flow: `<CritiqueOverlay>` → `critique:ask` event (modal pattern). |
+| `docs/spec/STATE_MACHINE.md` | §6 sub-states table: `<WaitIndicator>` / `<MonitorStream>` columns rewritten as status line substitution and live event streaming. §7.5 listing visibility: `<SessionPicker>` ref → "session picker CLI". |
+| `docs/spec/TOKEN_TUNING.md` | §4.3 reasoning UI: `<ThinkingIndicator>` ref replaced by `thinking:delta` event in status line. |
+| `docs/spec/RECAP.md` | §3.1 schema scope: `<SessionPicker>` ref → "session picker (CLI separada, fora da TUI viva)". |
+| `CLAUDE.md` | Doc-pointer table: row "UI (Ink), microcopy, design tokens → AGENTIC_CLI §17, UI, DESIGN_SYSTEM" replaced by "TUI (inline render, event bus, microcopy, palette/glyphs) → AGENTIC_CLI §17, UI". Locked stack line: `TUI: Ink (React in the terminal)` → `TUI: Internal (raw ANSI + raw stdin), no framework — inline render`. |
+
+**Decisions:**
+
+- **D1 — Inline > alt-screen.** Alt-screen (vim/htop style) breaks scrollback, mouse-copy, redirection — costs that can't be paid back by any in-app reimplementation. The agent is a shell tool, not a TUI app. Inline rendering matches the principle that "the terminal is a medium, not a screen" (UI.md §14).
+- **D2 — No framework.** The live region is 3-15 lines. React/Ink's reconciliation is engineered for problems we don't have (large dynamic trees with overlapping updates). For our case, `clear+redraw` of the live region in a single `process.stdout.write` is both faster and simpler. Cost of framework: lifecycle cognitive load, focus-stack reinvention by the framework, ~10 transitive deps. Cost of from-scratch: ~500 lines of TS with `string-width` + `wrap-ansi` as the only dep (banned `picocolors`/`prompts`/`ora` — they each replace ~5 lines).
+- **D3 — Event bus as the spine.** Decouples harness from renderer cleanly. Same bus feeds `--json` mode (NDJSON in stdout) and tests (assert on events). No conditional rendering paths, no "headless mode" branch in the render code — just "renderer subscribes" vs "serializer subscribes".
+- **D4 — Render functions, not components.** `render(state): string[]`. Pure functions. No JSX, no hooks, no props. Snapshot-testable. The cognitive savings here are bigger than they look — every "component" was forcing us to think about lifecycle, prop drilling, refs.
+- **D5 — Default = NO on confirm modals.** Safety. Enter without navigating = reject. The `selected` field initializes to `'no'`, and the focus handler is the canonical pattern in UI.md §5.5 (state + handler-on-top-of-focus-stack + async-promise API).
+- **D6 — Grayscale + 1 accent.** Only `dim`, `bold`, `error (red)`, `warn (yellow)`, `success (green, only in pipeline badges)`. No blue/cyan/magenta/truecolor/gradients. If layout needs color to disambiguate, the layout failed. `NO_COLOR` env disables all escapes.
+- **D7 — Delete DESIGN_SYSTEM.md, not stub it.** The minimalism makes a separate design doc redundant. UI.md §6 fits in ~80 lines. Two-doc indirection costs more than it saves.
+- **D8 — Component names in CONTRACTS.md were never contract.** Replacing `<ToolCallCard>`/`<StreamingMessage>` with event names (`tool:start`/`assistant:delta`) reflects what's actually stable: the bus event catalog, not internal render functions.
+
+**Pending:**
+
+- No source code yet — `src/tui/` will be born in M1 step 1 (TBD: split into `term.ts` for raw stdin/ANSI, `bus.ts` for events, `renderer.ts` for live region composition, `render/*.ts` for tool card / status line / modals).
+- M4 milestone (was "Ink mínimo") needs renaming/rescoping in `AGENTIC_CLI.md §18` Roadmap. Deferred to a follow-up entry once the M1 implementation lands.
+
+**Verification:** Spec-only diff. No `bun test` / `tsc` impact (no source touched). Manual review: `grep -rn "Ink\|<.*Card>\|<.*Bar>\|<.*Tray>\|<.*Badge>" docs/spec/` returns zero matches across active spec files.
+
+**Next:** Implement M1 step 1 — `src/tui/term.ts` (raw stdin parser, ANSI writer, SIGWINCH, frame scheduler) + `src/tui/bus.ts` (typed EventEmitter wrapper) + minimal renderer that subscribes to a fake harness emitting events, hooked to the existing `agent` entry point. Born with tests.
+
+---
+
 ## [2026-05-01] M3 / Step 5.2 follow-up — anchor memory roots at repo root (subdir blindspot)
 
 External review caught a second real bug. Bootstrap and CLI

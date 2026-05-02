@@ -285,7 +285,7 @@ A última query é o **gatilho de reconsideração** declarado em `CONTRACTS.md 
 
 #### 1.4.7 Limites
 
-- **Não captura "intent" do modelo, só o que ele declarou.** Plano implícito (sem checklist) fica invisível. Aceitável: mesma limitação de Claude Code com `todo_write` opcional.
+- **Não captura "intent" do modelo, só o que ele declarou.** Plano implícito (sem checklist) fica invisível. Aceitável: mesma limitação de qualquer agente com `todo_write` opcional.
 - **Parser confidence é heurística.** False positives (UI list markdown que não é todo) são possíveis; mitigado por contexto (parser só ativa em respostas pós-prompt do tipo "plan", "list steps", ou explicit slash command).
 - **Modelos locais podem ter alta `fail_rate`.** Se inviável em `LOCAL_MODELS.md`, profile `orchestrated` pode promover `todo_write` a tool **só nesse profile**. Decisão deferida pra v1.1.
 
@@ -979,7 +979,7 @@ agent audit gc --apply                      # aplica retention cleanup
 
 ### 6.2 Output formats
 
-- Default: tabela compacta colorida (Ink)
+- Default: tabela compacta em texto (cor mínima — só `dim` em meta, sem highlight colorido)
 - `--json`: NDJSON pra scripting
 - `--csv`: pra Excel/sheets
 - `--markdown`: pra reports

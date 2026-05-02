@@ -49,7 +49,7 @@ Aceitável porque (a) target primário é repos de código, (b)
 ### 2.3 UX pré-TUI
 
 **Pergunta:** slash commands (`/undo`, `/checkpoint list`) dependem
-do M4 (Ink). O que existe pré-M4?
+da TUI (M4). O que existe pré-M4?
 
 **Proposta:** flags equivalentes no CLI:
 
