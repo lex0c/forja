@@ -268,6 +268,56 @@ describe('createMemoryRegistry — search', () => {
   });
 });
 
+describe('createMemoryRegistry — search-deep audit (regression: S1)', () => {
+  let db: DB;
+  let sessionId: string;
+
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+    sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+  });
+
+  test('deep body match emits a read audit event', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — surface text\n');
+    writeMemory(roots.user, 'a', fmUser('a'), 'body has zebra inside\n');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+    const hits = reg.search('zebra', { deep: true });
+    expect(hits).toHaveLength(1);
+    expect(hits[0]?.matchedIn).toBe('body');
+    const events = listMemoryEventsByName(db, 'a');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.action).toBe('read');
+    expect(events[0]?.sessionId).toBe(sessionId);
+  });
+
+  test('shallow match does NOT emit a read event', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Commit](commit-style.md) — verbs\n');
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const hits = reg.search('commit');
+    expect(hits).toHaveLength(1);
+    expect(hits[0]?.matchedIn).toBe('name');
+    expect(listMemoryEventsByName(db, 'commit-style')).toEqual([]);
+  });
+
+  test('deep match that does not hit body still does NOT emit', () => {
+    // Body is read from disk during deep mode but no match found.
+    // No `read` event should fire — the model never sees the body.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — surface\n');
+    writeMemory(roots.user, 'a', fmUser('a'), 'body without the keyword\n');
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const hits = reg.search('zebra', { deep: true });
+    expect(hits).toEqual([]);
+    expect(listMemoryEventsByName(db, 'a')).toEqual([]);
+  });
+});
+
 describe('createMemoryRegistry — malformed href tolerance (regression: C1)', () => {
   test('list / search skip entries whose href is not a .md file instead of crashing', () => {
     const repo = makeTmp();

@@ -15,6 +15,41 @@ Format:
 
 ---
 
+## [2026-05-01] M3 / Step 5.2 follow-up — close audit gap on memory_search deep-body matches
+
+Holistic review of the 5.1+5.2 arc surfaced one issue that
+escaped per-slice review because it sat between two slices: the
+registry's `search({ deep: true })` path calls `readMemoryByName`
+directly to scan body content, but does NOT route through
+`registry.read()` — so a body that matches via deep search
+exposes a snippet to the model without a corresponding `read`
+event in `memory_events`. An audit consumer querying "what
+content has the model seen?" would miss every search-deep hit.
+
+Severity is moderate: the snippet is bounded (~160 chars,
+single line), the body itself isn't fully exposed, and deep mode
+is opt-in. But it's still content reaching the model without an
+audit row, which violates the spec §5.3 contract that every
+read leaves a trace.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/memory/registry.ts` | The deep branch in `search` now invokes `auditRead(listing, fileResult)` immediately after a snippet match — same audit emission and same try/catch best-effort semantics as the direct `read()` path. Drop the audit when the body load fails (kind ≠ 'present') OR when the body was loaded but no snippet matched (the body never flowed to the model — no read happened from the audit's perspective). |
+| `tests/memory/registry.test.ts` | NEW describe block "search-deep audit (regression: S1)" with 3 tests: deep body match emits a `read` event with the right scope/sessionId; shallow name match does NOT emit (already true, regression-pinning); deep mode that DOESN'T match the body does NOT emit (the body load happened but no content went to the model). |
+
+**Decisions:**
+
+- **D1 — Audit on snippet match, not on body load.** The deep branch reads the body unconditionally to test for a match, but the model only sees a body excerpt when a snippet IS extracted. Audit fires on snippet success, not on disk read. Mirrors the principle from `read()`: "audit when content actually reached the consumer, not on intermediate operations".
+- **D2 — Reuse `auditRead` directly.** Same closure, same DB+session+cwd binding as the `read()` path. Adding a parallel emit would risk drift; one helper, one source of truth.
+
+**Verification:** `bun test` 1613 pass / 10 skip / 0 fail (+3 new audit-gap regression tests); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** Unchanged from 5.2.c — write surface (5.3) parked until TUI scaffolding (M4 / Ink) lands per the design discussion. The read-only arc is operationally complete.
+
+---
+
 ## [2026-05-01] M3 / Step 5.2.c — eager memory index injection in system prompt
 
 5.2.a/b shipped the read tools and CLI surface but the model only

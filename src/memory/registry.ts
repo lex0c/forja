@@ -344,6 +344,15 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
           if (fileResult.kind !== 'present') continue;
           const snippet = matchSnippet(splitBodyLines(fileResult.file.body), q);
           if (snippet === null) continue;
+          // Audit emission for body-match hits. The model receives
+          // a snippet of the body content via the search result, so
+          // for audit purposes this IS a read — same accountability
+          // as a direct memory_read call. Without this, an attacker
+          // monitoring memory_events for content exposure would
+          // miss search-deep hits entirely. Mirrors auditRead's
+          // best-effort try/catch (DB failures don't deny the
+          // search hit).
+          auditRead(listing, fileResult);
           hits.push({
             scope: listing.scope,
             name: listing.name,
