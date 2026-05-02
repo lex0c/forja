@@ -15,6 +15,60 @@ Format:
 
 ---
 
+## [2026-05-02] M1 / Step 1.b — TUI state reducer + renderer
+
+Builds on 1.a's primitives. Splits the renderer into two concerns:
+a pure event-folding reducer (`state.ts`) and the I/O cycle owner
+(`renderer.ts`). Reducer is testable without any I/O; renderer
+mechanics are testable without any UI shape (default `composeLive`
+is a placeholder). Together they wire the bus → live region path
+end-to-end so the next slice can drop in real render functions
+without touching plumbing.
+
+The split came from a deliberate concern separation: when render
+functions land, they live in a third group of pure functions
+(`renderToolCard`, `renderStatusLine`, …) consumed by the
+`composeLive` callback. Renderer doesn't grow; reducer doesn't
+grow; only the catalog of render functions does.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/state.ts` | `LiveState` (input box, status fields, `Map<string, ActiveTool>`, `pendingAssistant` buffer, `thinking` indicator timestamp, `ended` flag) + `createInitialState()` + `applyEvent(state, event) → {state, permanent}`. Pure reducer over the full UIEvent union: handles `session:start/end`, `user:submit`, `assistant:start/delta/end` (with on-the-fly buffer for orphan deltas), `thinking:start/delta/end`, `tool:start/delta/end` (preview window capped at 5 lines, trailing newline skipped, unknown-toolId deltas dropped), `step:budget`, `error`, `warn`, `interrupt`, `checkpoint:create`. Modal/subagent/bg/todo/permission/trust/memory/plan/critique events accepted as no-ops with comment markers — they wire when render functions arrive. Default branch is an exhaustiveness guard that throws on unknown UIEvent kinds, surfaced by the renderer as a warn line. |
+| `src/tui/renderer.ts` | `createRenderer({bus, caps, write?, composeLive?, stdin?, schedulerOptions?, bracketedPaste?})` returns `{redraw, state, close}`. Subscribes via `bus.onAny`; folds events through `applyEvent`; on `permanent` lines: erase live → write permanent → redraw live; on no-permanent: schedule a coalesced frame. Tracks `liveHeight` to compute `cursorUp + clearDown` on next erase. `close()` unsubscribes, stops scheduler, erases the live region, disables bracketed paste, and restores stdin mode — all idempotent. Reducer-thrown errors are caught and surfaced as `warn:` lines instead of killing the renderer. Default `composeLive` is a placeholder (`> input`, optional 1-line status); the proper status-line + tool-card + modal renderers slot in next. Defensive line truncation by JS code-unit length until `string-width` arrives. |
+| `src/tui/index.ts` | Re-exports `state.ts` + `renderer.ts`. |
+| `tests/tui/state.test.ts` | 25 tests across 7 describe blocks: session lifecycle, user submit (single + multi-line echo with continuation indent), assistant streaming (start/delta/end happy path + multi-line + orphan delta + empty buffer), thinking lifecycle, tool lifecycle (full happy path + preview cap + trailing-newline + unknown-toolId drop + orphan end + glyph/units selection), budget + error + warn permanent emission, parametric "not-yet-wired events accept silently" across all stub events, and an immutability check (apply doesn't mutate input). |
+| `tests/tui/renderer.test.ts` | 9 tests: session:start emits header + draws live; non-permanent event schedules a frame; redraw between permanent lines erases prior live region (assert escape order: cursor-up + clearDown precedes warn text); multiple state-only events coalesce into one redraw; `state()` snapshot accessor; `redraw()` forces immediate render; `close()` unsubscribes from bus; `close()` is idempotent; events after `session:end` skip drawing. Plus 2 side-effect tests for bracketed-paste opt-out and stdin raw-mode wiring (tolerant of module-flag bleed across tests by design). |
+
+**Decisions:**
+
+- **D9 — Reducer is pure and total.** `applyEvent` returns the next state; never throws (except the exhaustiveness guard for unknown kinds, which the renderer catches). All branching on event types lives in one place. The alternative — registering per-event handlers on the bus — would scatter the state shape across many files and make reasoning about "what events have been wired" much harder.
+- **D10 — Permanent vs live is decided by the reducer, not the renderer.** The reducer returns `{state, permanent: string[]}`. Permanent lines are emitted IMMEDIATELY (eraseLive → write → redraw); live-only events go through the frame scheduler. This lets us preserve the "history is permanent stdout, live is bottom region" invariant from UI.md §2 in a single place. Renderer is just the I/O cycle.
+- **D11 — Active tool preview capped at 5 lines.** UI.md §2.2 caps the live region at 15 lines. With multiple active tools + status + input, anything more than 5 preview lines per tool would push the region over budget on the second concurrent tool. The cap is a fixed constant in `state.ts`; layout-time truncation can shrink further as needed.
+- **D12 — Orphan delta opens a buffer on the fly.** If `assistant:delta` arrives without a prior `assistant:start`, the reducer creates the buffer with the delta's `messageId` instead of dropping. Reasoning: producers may emit out-of-order events during resume; the user's loss surface for a dropped delta is "missing tokens in scrollback", which is worse than a slightly weaker invariant. Tested.
+- **D13 — Tool delta for unknown toolId is dropped.** Unlike orphan asistant deltas, tool deltas without a matching `tool:start` lack name/args — synthesizing a tool would make the final card lie. Cleaner to drop. Tested.
+- **D14 — Default `composeLive` is a placeholder.** Renderer wiring is its own concern; layout decisions belong in render functions (next slice). Putting them here would conflate "did the bus deliver?" with "does the layout look right?". The placeholder is good enough for end-to-end smoke (status placeholder, input prompt, one-line tool stubs) and gets fully replaced.
+- **D15 — Reducer errors become warn lines, not crashes.** When the reducer throws (only path: unhandled new UIEvent kind), the renderer surfaces a `warn: renderer reducer error: <msg>` line in scrollback and continues. Same philosophy as the existing `OutputRenderer` in `src/cli/output/plain.ts` (line 174 of types.ts: "throws are caught and discarded so a buggy renderer doesn't kill the loop"). The user sees something actionable; the rest of the session keeps working.
+- **D16 — Renderer doesn't draw on construction.** First frame is triggered by the first emitted event. Lets a renderer attach to a quiet bus without producing output and avoids "cursor jumps when you start the program" UX. Also keeps `createRenderer` synchronous and side-effect-light.
+- **D17 — Permanent lines NOT truncated.** Only the live region is cursor-managed; permanent lines go to scrollback where the terminal handles wrap/scroll natively. Truncating would break long error messages, multi-line assistant responses, etc. Width matters in the live region only because we have to cursor-up to erase.
+
+**Pending / out of scope this slice:**
+
+- **Real render functions.** `renderStatusLine(state, caps)`, `renderInput(state, caps)`, `renderToolCard(tool, caps)`, `renderTodoList(...)`, `renderSubagentRow(...)` — all the UI.md §4 functions land in step 1.c. Default `composeLive` is the placeholder.
+- **Modal pattern.** State + focus handler + promise (UI.md §5.5). The reducer accepts `permission:ask` / `trust:ask` / etc. as no-ops; the modal state field hasn't been added to `LiveState` yet.
+- **HarnessEvent → UIEvent adapter.** Comes when interactive mode wires a real harness run.
+- **String-width-aware truncation.** Renderer uses JS code-unit length; CJK and emoji that occupy 2 columns may visually overflow. Documented as a layout bug, not a correctness bug — the cursor math always knows the line count it wrote because it counted lines, not glyphs.
+- **Resize handling.** `createResizeWatcher` exists from 1.a but isn't wired to the renderer yet. When a resize happens mid-run the renderer should redraw (and possibly reflow input). Hooks in step 1.c with the input render function.
+- **Spinner animation.** `state.ts` doesn't track spinner ticks; render functions will compute spinner glyphs from elapsed wall-clock. The renderer will need a heartbeat (every 80ms while anything animates) to request frames — added with the spinner render function.
+- **Interactive REPL wiring.** `src/cli/index.ts` still requires a prompt arg. The TUI mode (no prompt → REPL) is the last slice before this milestone is shippable.
+
+**Verification:** `bun test` → 1749 pass / 10 skip / 0 fail (+45 new across state and renderer tests). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.c — real render functions. Move into `src/tui/render/`: `status.ts`, `input.ts`, `tool-card.ts`, `subagent-row.ts`, `todo-list.ts`, `thinking.ts`, plus a top-level `compose.ts` that replaces `defaultComposeLive`. Add `string-width` + `wrap-ansi` deps. Wire the resize watcher. After that: modal pattern (state + focus handler + promise), HarnessEvent adapter, interactive REPL.
+
+---
+
 ## [2026-05-02] M1 / Step 1.a — TUI primitives: term, keys, bus
 
 First implementation slice on the new inline TUI. The respec
