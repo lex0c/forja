@@ -15,6 +15,63 @@ Format:
 
 ---
 
+## [2026-05-02] M1 / Step 1.a — TUI primitives: term, keys, bus
+
+First implementation slice on the new inline TUI. The respec
+(see prior entry today) traded Ink and DESIGN_SYSTEM.md for raw
+ANSI + a typed event bus; this commit lands the foundation that
+everything else (renderer, render functions, modal pattern,
+interactive REPL) will sit on. Three modules, all pure, all
+deterministic: capability detection + ANSI helpers + frame
+scheduler (`term.ts`); raw stdin parser (`keys.ts`); typed
+event bus (`bus.ts` + `events.ts`).
+
+Scope was drawn deliberately small — no renderer, no render
+functions, no harness wiring, no interactive REPL yet. The goal
+of this slice is "primitives a renderer can be built on,
+testable in isolation, no I/O coupling". Each module hands the
+caller an injectable surface for tests so we never have to
+monkey-patch globals or run a real PTY.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/term.ts` | `detectCapabilities(opts)` (TTY/cols/rows/color/unicode); ANSI helpers (`cursorUp/Down/Back/To`, `clearLine/Down`, `cursorHide/Show`, bracketed paste enable/disable strings); `SGR` palette (reset/dim/bold/error/warn/success — no blue/cyan/magenta per UI.md §6.1); `paint(caps, token, text)`; raw mode toggle (`enableRawMode`/`disableRawMode` — process-wide flag, idempotent, defaults to `process.stdin`); bracketed paste sink-driven toggle; `createResizeWatcher` (stream `resize` event + SIGWINCH belt-and-suspenders); `createFrameScheduler(render, {fps, setTimer, clearTimer})` with coalescing + `flush()` + `close()` and injectable timer for tests. |
+| `src/tui/keys.ts` | Stateful escape-sequence parser: `createKeyParser()` returns `{feed(buf), drain(), bufferLength()}`. Recognizes printable ASCII + multibyte UTF-8 (incl. surrogate-pair codepoints), control bytes (Enter/Tab/Backspace/Space/Ctrl+a..z), CSI arrows + modifiers (`1;5C` → ctrl+right), CSI tilde-form (Home/End/Insert/Delete/PageUp/Down/F1-F12), SS3 (`ESC O P` for F1-F4), Alt+letter (`ESC c`), Shift+Tab (`CSI Z`), bracketed paste markers including split-across-feeds reassembly. Lone ESC is buffered until `drain()` to avoid swallowing the start of a delayed sequence. ESC ESC emits one escape immediately and buffers the second. |
+| `src/tui/events.ts` | Discriminated `UIEvent` union — full catalog from UI.md §3.2: `session:start/end`, `user:submit`, `assistant:start/delta/end`, `thinking:start/delta/end`, `tool:start/delta/end`, `permission:ask/answer`, `trust:ask`, `memory:write:ask`, `plan:review`, `critique:ask`, `todo:update`, `subagent:start/update/end`, `bg:start/update/end`, `step:budget`, `checkpoint:create`, `error`, `warn`, `interrupt`. Plus `UIEventOf<T>` helper for narrowed payload extraction. |
+| `src/tui/bus.ts` | `createBus()` returns typed wrapper around `EventEmitter`. `on<T>(type, handler)` returns unsubscribe. `once`, `onAny`, `removeAll`, `listenerCount`. Internal `__any__` channel for wildcard subscribers (used later by NDJSON serializer per UI.md §7). MaxListeners bumped to 100 (renderer + serializer + multiple feature listeners). |
+| `src/tui/index.ts` | Barrel re-export so callers `import { ... } from 'src/tui'`. |
+| `tests/tui/term.test.ts` | 22 tests: capability matrix (TTY/no-TTY/NO_COLOR/CLICOLOR_FORCE/locale UTF-8/LC_CTYPE/LANG fallbacks); ANSI helper output; `paint` color-on/off; raw mode flag idempotence + missing-setRawMode fallback; bracketed paste write idempotence; resize watcher emit + unsubscribe; frame scheduler coalesce + flush + close + fps→intervalMs. Deterministic timer harness (no real `setTimeout` in tests). |
+| `tests/tui/keys.test.ts` | 26 tests: printable ASCII / uppercase / multibyte / emoji / multi-char feeds; control bytes (CR/LF/Tab/DEL/0x08/Space/Ctrl+a..z); CSI arrows w/ + w/o modifiers; CSI tilde forms (Home/End/Delete/PgUp/PgDn/F1-F12); SS3 F1; Alt+letter; ESC ESC double-tap; lone ESC buffered+drained; CSI split across feeds; unknown CSI dropped without blocking trailing input; bracketed paste single chunk + split feeds + embedded newline + partial end-marker buffering + post-paste keystroke continuity. |
+| `tests/tui/bus.test.ts` | 10 tests: typed delivery + narrowing; `on()` unsubscribe; type isolation (delta listener doesn't see end events); `once()` self-detach; `onAny()` order + unsubscribe; `removeAll()`; `listenerCount` per-type vs wildcard; multi-subscriber registration order; same instance to typed + onAny + emit. |
+
+**Decisions:**
+
+- **D1 — Inject everything timer/stream-related into tests.** Frame scheduler takes `setTimer`/`clearTimer`; resize watcher takes a stream shape; raw mode takes a stdin shape. Default to production globals; tests pass deterministic fakes. Avoids `vi.useFakeTimers`-style global mutation that bleeds across tests. This pattern matches the existing `bootstrap.ts` test harness (`mockProvider`, `tmpdir`).
+- **D2 — UIEvent is a separate union from HarnessEvent.** Spec UI.md §3.2 names events with `domain:lifecycle` shapes (`assistant:delta`, `tool:start`); the existing `HarnessEvent` in `src/harness/types.ts` uses `tool_invoking`/`tool_decided`/`tool_finished` plus a nested `provider_event`. Translating one to the other is a separate adapter (next slice). Reasons: (a) UI.md §3 is the rendering contract and other consumers (NDJSON, tests) shouldn't depend on harness internals; (b) the harness can refactor its event shape without the TUI noticing; (c) the audit trail keeps using HarnessEvent unchanged. Cost is the adapter — accepted.
+- **D3 — Lone ESC is buffered until `drain()`.** Terminals send escape sequences as ESC + bytes that may arrive in two chunks. If we emitted the lone ESC immediately, we'd inject a spurious "escape pressed" event whenever a slow paste happened. Buffering until `drain()` matches readline / blessed / node-pty behavior. The user-visible "press Esc twice for hard interrupt" works because `ESC ESC` resolves immediately on the second byte (we check for `0x1b` after `0x1b` and emit before buffering would even try).
+- **D4 — Bracketed paste reassembly is byte-aware.** When a feed ends mid-end-marker (`\x1b[20`), the parser must not flush yet — it would emit those bytes as paste content and lose the end marker. We keep the trailing `BRACKETED_PASTE_END.length - 1` bytes buffered specifically to cover this. Tested against the realistic split case.
+- **D5 — No `picocolors`/`ora`/`prompts`.** UI.md §1 banned them in the respec; this slice obeys. SGR codes are 5 strings in a const; spinner/prompt come later but won't pull deps either.
+- **D6 — `bus.ts` uses Node's `EventEmitter`, not `mitt` or a custom map.** Saves ~50 lines and a dep. The cast at the boundary (`event: unknown` → `UIEventOf<T>`) is sound because emit only sends the typed event, but it's tagged with a comment so future readers don't think we're being lazy with `any`.
+- **D7 — `paint` returns `text` unchanged when color disabled (vs returning `''`).** Same surface as colorized, no special-casing in callers. Costs nothing because `caps.color === 'none'` is checked once per call.
+- **D8 — Module state for raw-mode/bracketed-paste flags.** Process-wide invariant: only one renderer can hold raw mode. Putting the flag in module scope makes the recovery path (uncaughtException → disableRawMode) trivial. The alternative — per-renderer instance — would complicate restoration when the renderer object is gone.
+
+**Pending / out of scope this slice:**
+
+- **No renderer composition.** No `composeLive(state)`, no actual writes to stdout via these primitives. That's the next slice.
+- **No render functions.** No `renderToolCard`, `renderStatusLine`, etc. — pure render `state → string[]` will live in `src/tui/render/*.ts` once the renderer exists.
+- **No modal pattern implementation.** State + focus handler + promise (UI.md §5.5) lands with the renderer.
+- **No HarnessEvent → UIEvent adapter.** Comes when we wire the bus to a real harness run.
+- **No interactive mode in `src/cli/index.ts`.** Currently `agent` requires a prompt; the TUI mode (no prompt → REPL) hooks in last.
+- **No exit-path hardening.** `uncaughtException`/`SIGINT` handlers that call `disableRawMode` belong with the renderer that owns the live region.
+
+**Verification:** `bun test` → 1698 pass / 10 skip / 0 fail (+68 new). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.b — `src/tui/renderer.ts` (composes live region from a `LiveState`, writes via raw ANSI, owns the frame scheduler, restores stdin mode on exit) + a minimal driver that subscribes to the bus and updates `LiveState`. After that: render functions for tool card, status line, input box; then modal pattern; then HarnessEvent adapter; then interactive REPL wiring in `src/cli/index.ts`.
+
+---
+
 ## [2026-05-02] M1 prep — TUI respec: drop Ink, switch to inline raw-ANSI render
 
 Rethinking the UI/UX layer before any implementation. The
