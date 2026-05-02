@@ -1,4 +1,5 @@
 import { type HarnessResult, runAgent } from '../harness/index.ts';
+import { createMemoryRegistry, resolveRepoRoot, resolveScopeRoots } from '../memory/index.ts';
 import { createPermissionEngine } from '../permissions/index.ts';
 import { type Provider, createDefaultRegistry } from '../providers/index.ts';
 import {
@@ -16,6 +17,7 @@ import {
 } from '../storage/index.ts';
 import { loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
+import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 
 // M3 / Step 4.2b.ii.a — subagent-child entry path.
 //
@@ -116,6 +118,18 @@ export interface SubagentChildOptions {
   // into the parent's bg state. Undefined when omitted (older
   // parents, tests that exercise the bg-disabled path).
   bgLogDir?: string;
+  // Parent's cwd, used to anchor the child's MemoryRegistry roots.
+  // Memory is per-repo logically, not per-worktree — without this
+  // forwarding, a worktree-isolated subagent would build its
+  // registry from the worktree path and lose access to
+  // project_local (gitignored, not replicated). When set, the
+  // child resolves `resolveScopeRoots(<this path>)` for the roots
+  // but anchors the audit `cwd` field to its OWN session.cwd so
+  // forensic queries can distinguish "where the read happened"
+  // from "which project's memory tree". Undefined disables memory
+  // wiring (memory_* tools surface registry_unavailable, system
+  // prompt has no memory section).
+  memoryCwd?: string;
 }
 
 // Cadence at which the child writes `last_heartbeat` to its
@@ -442,6 +456,54 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // empty user message — same as the resume path.
     const userPrompt = '';
 
+    // Memory subsystem wiring. Two preconditions:
+    //
+    //   1. The parent forwarded `memoryCwd` (older parents and
+    //      tests that route around the parent runtime omit it).
+    //   2. The subagent's whitelist includes at least one
+    //      memory_* tool. A subagent with `tools: [read_file]`
+    //      has no way to invoke memory_read/list/search — the
+    //      tools aren't in its narrowed registry — so injecting
+    //      the memory section would advertise tools the model
+    //      can't call AND inflate the prompt with up to ~2k
+    //      tokens of irrelevant index. Lean subagents stay lean.
+    //
+    // When wired, the registry's `roots` anchor at the PARENT's
+    // cwd so worktree-isolated subagents see the parent's
+    // project_local + project_shared trees (worktrees don't
+    // replicate those — local is gitignored, shared is
+    // operator-curated state at the project root). The
+    // registry's `cwd` for audit emissions anchors at the
+    // CHILD's session.cwd so forensic queries can distinguish
+    // "where the read happened" (child's worktree) from "which
+    // project the memory belongs to" (parent's repo).
+    //
+    // The injection appends the merged memory section to the
+    // audit-snapshot system prompt. The audit snapshot was
+    // captured at definition-load time and reflects the parent's
+    // policy + the subagent's identity prompt; memory section is
+    // dynamic per-run and goes after.
+    const wantsMemory = audit.toolsWhitelist.some((t) => t.startsWith('memory_'));
+    let memoryRegistry: ReturnType<typeof createMemoryRegistry> | undefined;
+    let resolvedSystemPrompt = audit.systemPrompt;
+    if (opts.memoryCwd !== undefined && wantsMemory) {
+      // Resolve repo root from the parent's cwd. Same fix as
+      // bootstrap.ts: parent's invocation cwd may be a subdir
+      // within its repo, so anchoring memory roots there would
+      // miss every project memory. resolveRepoRoot calls git
+      // rev-parse and falls back to the input path when not in
+      // a git repo.
+      const memoryRoots = resolveScopeRoots(resolveRepoRoot(opts.memoryCwd));
+      memoryRegistry = createMemoryRegistry({
+        roots: memoryRoots,
+        db,
+        sessionId: opts.sessionId,
+        cwd: session.cwd,
+      });
+      const memorySection = assembleMemorySection({ registry: memoryRegistry });
+      resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text) ?? '';
+    }
+
     const config = {
       provider,
       toolRegistry: childRegistry,
@@ -456,7 +518,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       permissionEngine,
       db,
       cwd: session.cwd,
-      systemPrompt: audit.systemPrompt,
+      systemPrompt: resolvedSystemPrompt,
       userPrompt,
       preassignedSessionId: opts.sessionId,
       // Carry through budget caps from the audit row.
@@ -517,6 +579,13 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // refuse at invocation time — same as a top-level run
       // without `bgLogDir`.
       ...(opts.bgLogDir !== undefined ? { bgLogDir: opts.bgLogDir } : {}),
+      // Memory registry. When the parent forwarded `memoryCwd`
+      // we constructed the registry above; thread it through so
+      // memory_* tools can dispatch and the system prompt's
+      // memory section matches what the model sees in the index.
+      // Conditional spread: omitted ⇒ registry stays undefined
+      // ⇒ memory tools surface `registry_unavailable`.
+      ...(memoryRegistry !== undefined ? { memoryRegistry } : {}),
     };
 
     const result = await runAgent(config);

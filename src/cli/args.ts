@@ -48,6 +48,13 @@ export interface ParsedArgs {
   // 'gc'. `gc` accepts `--dry-run` and `--force` as
   // positionals (sub-flags); the handler interprets them.
   worktrees?: { verb: string; positionals: string[] };
+  // `--memory <verb> [positionals]` — operator surface for
+  // inspecting cross-session memory (Step 5.2.b). Verbs:
+  // 'list' (optional scope positional), 'show' (name + optional
+  // scope). DB-only path; no provider call needed. The handler
+  // builds a memory registry from the cwd and renders entries /
+  // body via the same registry the model-facing tools use.
+  memory?: { verb: string; positionals: string[] };
   model?: string;
   maxSteps?: number;
   // Cap on rows returned by --list-sessions. Defaults to 20 in
@@ -106,6 +113,21 @@ export interface ParsedArgs {
   // colliding with the parent's bg state. Undefined when the
   // flag is absent (older parents, tests).
   subagentBgLogDir?: string;
+  // Internal: parent's cwd carried across the subprocess boundary
+  // so the child's MemoryRegistry uses the parent's memory tree
+  // (project_local + project_shared anchored at the parent's
+  // repo) rather than the worktree's. Memory is per-repo
+  // logically, not per-worktree — a worktree-isolated subagent
+  // shouldn't lose access to project_local just because its cwd
+  // is the cache directory. The child resolves
+  // `resolveScopeRoots(<this path>)` to anchor roots, but anchors
+  // audit `cwd` events to its own session.cwd so forensic
+  // queries can distinguish "where the read happened" from
+  // "which project the memory belongs to". Undefined when the
+  // flag is absent (older parents, in-process tests, or
+  // operator-driven `--subagent-session-id` invocations without
+  // a parent runtime to set it).
+  subagentMemoryCwd?: string;
 }
 
 export interface ParseError {
@@ -232,6 +254,37 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
           j += 1;
         }
         args.worktrees = { verb, positionals };
+        i = j;
+        break;
+      }
+      case '--memory': {
+        const verb = argv[i + 1];
+        const known = ['list', 'show'] as const;
+        if (verb === undefined || verb.startsWith('-')) {
+          return {
+            ok: false,
+            message: `--memory requires a subcommand (${known.join('|')})`,
+          };
+        }
+        if (!known.includes(verb as (typeof known)[number])) {
+          return {
+            ok: false,
+            message: `unknown --memory subcommand: ${verb}. Use one of ${known.join('|')}`,
+          };
+        }
+        // Positionals stop at any flag-shaped token. `list` takes
+        // an optional scope positional; `show` takes name +
+        // optional scope. Arity is enforced by the handler.
+        const positionals: string[] = [];
+        let j = i + 2;
+        while (j < argv.length) {
+          const next = argv[j];
+          if (next === undefined) break;
+          if (next.startsWith('-')) break;
+          positionals.push(next);
+          j += 1;
+        }
+        args.memory = { verb, positionals };
         i = j;
         break;
       }
@@ -419,6 +472,20 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         i += 2;
         break;
       }
+      case '--subagent-memory-cwd': {
+        const value = argv[i + 1];
+        // Same guard as --subagent-bg-log-dir — flag-shaped
+        // values would silently swallow the next flag.
+        if (value === undefined || value.length === 0 || value.startsWith('--')) {
+          return {
+            ok: false,
+            message: '--subagent-memory-cwd requires a directory path (internal flag)',
+          };
+        }
+        args.subagentMemoryCwd = value;
+        i += 2;
+        break;
+      }
       default:
         // Anything still starting with `--` after the explicit cases above
         // is an unknown flag. Single-dash tokens (`-foo`) fall through as
@@ -472,6 +539,7 @@ export const usage = (): string =>
     '  --resume <id|last>     Continue a prior session; positional prompt is the follow-up',
     '  --undo <session>       Restore the latest checkpoint of a session',
     '  --worktrees <verb>     Inspect / gc subagent worktrees (verb: list, gc)',
+    '  --memory <verb>        Inspect cross-session memory (verb: list [scope] | show <name> [scope])',
     '  --checkpoints <cmd>    Checkpoint subcommands: list <session> | diff <session> <ckpt>',
     '                          | restore <session> <ckpt> | purge <session>',
     '  --yes, -y              Skip the bash-side-effect confirm on undo/restore',

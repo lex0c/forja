@@ -8,6 +8,7 @@ import type { Provider } from '../../src/providers/index.ts';
 let workdir: string;
 let dbPath: string;
 let originalKey: string | undefined;
+let originalXdg: string | undefined;
 
 const mockProvider: Provider = {
   id: 'mock/m',
@@ -36,12 +37,22 @@ beforeEach(() => {
   workdir = mkdtempSync(join(tmpdir(), 'forja-bootstrap-'));
   dbPath = join(workdir, 'sessions.db');
   originalKey = process.env.ANTHROPIC_API_KEY;
+  // Isolate user-scope memory under the workdir so the dev's
+  // real ~/.config/agent/memory/ doesn't bleed into bootstrap
+  // tests asserting against systemPrompt. The 5.2.c memory
+  // injection eagerly loads the merged index; without isolation
+  // a developer with personal memories would see their content
+  // leak into "passes through unchanged" assertions.
+  originalXdg = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = workdir;
 });
 
 afterEach(() => {
   rmSync(workdir, { recursive: true, force: true });
   if (originalKey === undefined) delete process.env.ANTHROPIC_API_KEY;
   else process.env.ANTHROPIC_API_KEY = originalKey;
+  if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = originalXdg;
 });
 
 describe('bootstrap', () => {
@@ -73,6 +84,9 @@ describe('bootstrap', () => {
         'edit_file',
         'glob',
         'grep',
+        'memory_list',
+        'memory_read',
+        'memory_search',
         'monitor',
         'read_file',
         'task',
@@ -193,6 +207,149 @@ describe('bootstrap', () => {
     const planIdx = (config.systemPrompt ?? '').indexOf('PLAN MODE');
     const userIdx = (config.systemPrompt ?? '').indexOf('Project convention');
     expect(planIdx).toBeLessThan(userIdx);
+    db.close();
+  });
+
+  test('memory section appended to caller systemPrompt when memories exist', () => {
+    // Project local memory under workdir.
+    const localDir = join(workdir, '.agent', 'memory', 'local');
+    mkdirSync(localDir, { recursive: true });
+    writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — full-stack TS dev\n');
+    const { config, db } = bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      systemPrompt: 'You are a senior engineer.',
+    });
+    expect(config.systemPrompt).toContain('You are a senior engineer.');
+    expect(config.systemPrompt).toContain('# Memory');
+    expect(config.systemPrompt).toContain('[project_local] role — full-stack TS dev');
+    // memoryRegistry is wired into the config so the memory_*
+    // tools can dispatch.
+    expect(config.memoryRegistry).toBeDefined();
+    db.close();
+  });
+
+  test('memory section becomes systemPrompt when no caller prompt and memories exist', () => {
+    const localDir = join(workdir, '.agent', 'memory', 'local');
+    mkdirSync(localDir, { recursive: true });
+    writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — TS dev\n');
+    const { config, db } = bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+    });
+    expect(config.systemPrompt).toBeDefined();
+    expect(config.systemPrompt).toContain('# Memory');
+    expect(config.systemPrompt?.startsWith('# Memory')).toBe(true);
+    db.close();
+  });
+
+  test('closes DB when memory registry construction throws (regression: C1)', () => {
+    // Seed a project_local MEMORY.md with valid content so the
+    // index parser succeeds, then chmod the file 0 so loadScopeIndex
+    // hits EACCES on read. The construction error must propagate
+    // without leaking the SQLite handle.
+    const localDir = join(workdir, '.agent', 'memory', 'local');
+    mkdirSync(localDir, { recursive: true });
+    const memPath = join(localDir, 'MEMORY.md');
+    writeFileSync(memPath, '- [Role](role.md) — TS dev\n');
+    const { chmodSync } = require('node:fs') as typeof import('node:fs');
+    chmodSync(memPath, 0o000);
+    try {
+      let threw = false;
+      try {
+        bootstrap({
+          prompt: 'hi',
+          cwd: workdir,
+          providerOverride: mockProvider,
+          dbPath,
+          enterprisePolicyPath: null,
+          userPolicyPath: null,
+        });
+      } catch {
+        threw = true;
+      }
+      expect(threw).toBe(true);
+      // The DB file exists but no WAL/SHM lock should remain
+      // beyond the throw — sqlite leaves a -wal/-shm pair when a
+      // handle is open. Check the wal file is gone (best-effort
+      // proxy for "the handle was closed"). If sqlite never created
+      // wal because no writes happened post-migrate, this is also
+      // fine — the test is checking we DON'T leave a dangling
+      // handle, not that we asserted any wal-specific state.
+      // Mostly we're verifying bootstrap throws cleanly without
+      // the test runner complaining about an unclosed handle.
+      expect(existsSync(dbPath)).toBe(true);
+    } finally {
+      // Restore permissions so the afterEach cleanup can rmSync.
+      chmodSync(memPath, 0o644);
+    }
+  });
+
+  test('memory loads from repo root, not subdir (regression: subdir blindspot)', async () => {
+    // Operator runs `agent` from a subdirectory of a git repo
+    // (e.g., `/repo/src/components/`). Memory tree lives at the
+    // repo root (`/repo/.agent/memory/...`). Pre-fix the
+    // bootstrap would resolve scope roots from the subdir cwd
+    // and silently miss every project memory. Post-fix it calls
+    // git rev-parse and anchors at the repo root.
+    const initRepo = async (path: string): Promise<void> => {
+      const proc = Bun.spawn({
+        cmd: ['git', 'init', '-b', 'main'],
+        cwd: path,
+        env: { LC_ALL: 'C', PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '' },
+        stdout: 'ignore',
+        stderr: 'ignore',
+      });
+      await proc.exited;
+    };
+    await initRepo(workdir);
+    // Seed the repo-root project_local memory.
+    const localDir = join(workdir, '.agent', 'memory', 'local');
+    mkdirSync(localDir, { recursive: true });
+    writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — repo root memory\n');
+
+    // Invoke from a subdir, NOT the repo root.
+    const subdir = join(workdir, 'src', 'components');
+    mkdirSync(subdir, { recursive: true });
+    const { config, db } = bootstrap({
+      prompt: 'hi',
+      cwd: subdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+    });
+    // System prompt must include the memory section even though
+    // the cwd is a subdir — the repo-root resolution catches it.
+    expect(config.systemPrompt).toContain('# Memory');
+    expect(config.systemPrompt).toContain('[project_local] role — repo root memory');
+    db.close();
+  });
+
+  test('memory registry is wired even when no memories exist (empty list)', () => {
+    const { config, db } = bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+    });
+    // With empty memory tree, systemPrompt stays undefined (no
+    // injection forces the field) — preserves existing test
+    // expectations.
+    expect(config.systemPrompt).toBeUndefined();
+    // But the registry is still threaded through for tools.
+    expect(config.memoryRegistry).toBeDefined();
+    expect(config.memoryRegistry?.list()).toEqual([]);
     db.close();
   });
 

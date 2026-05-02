@@ -55,6 +55,11 @@ const main = async (): Promise<number> => {
       // parent so background-process tools work for the child
       // without colliding with the parent's bg state.
       ...(args.subagentBgLogDir !== undefined ? { bgLogDir: args.subagentBgLogDir } : {}),
+      // Parent's cwd. Anchors the child's MemoryRegistry roots so
+      // worktree-isolated subagents share the parent's memory
+      // tree (project_local + project_shared anchored at the
+      // parent's repo, not the worktree's cache dir).
+      ...(args.subagentMemoryCwd !== undefined ? { memoryCwd: args.subagentMemoryCwd } : {}),
     });
   }
 
@@ -68,7 +73,8 @@ const main = async (): Promise<number> => {
     args.listSessions ||
     args.undo !== undefined ||
     args.checkpoints !== undefined ||
-    args.worktrees !== undefined;
+    args.worktrees !== undefined ||
+    args.memory !== undefined;
   if (args.prompt.length === 0 && !promptOptional) {
     process.stderr.write(`forja: missing prompt\n\n${usage()}\n`);
     return 1;

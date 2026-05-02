@@ -1,4 +1,5 @@
 import type { BgManager } from '../bg/index.ts';
+import type { MemoryRegistry } from '../memory/index.ts';
 import type { Decision, PermissionsView, PolicyCategory, ToolArgs } from '../permissions/index.ts';
 import type { ProviderToolInputSchema } from '../providers/index.ts';
 import type { WorktreeOutcome } from '../subagents/types.ts';
@@ -125,6 +126,14 @@ export interface ToolContext {
   // The harness binds parent_session_id from this context's
   // sessionId so the link is captured automatically.
   spawnSubagent?: (args: SpawnSubagentArgs) => Promise<SpawnSubagentResult>;
+  // Memory subsystem registry (spec MEMORY.md). Set by the harness
+  // when memory was wired via HarnessConfig.memoryRegistry. The
+  // memory_read / memory_list / memory_search tools surface a
+  // clean error when absent rather than dereferencing undefined,
+  // matching the bgManager / todoStore patterns. Read events are
+  // logged to memory_events at the registry layer; the tool just
+  // dispatches.
+  memoryRegistry?: MemoryRegistry;
 }
 
 // Inputs the `task` tool passes through to the harness's subagent

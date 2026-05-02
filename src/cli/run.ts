@@ -177,6 +177,27 @@ export const run = async (options: RunOptions): Promise<number> => {
       });
     }
 
+    // Memory inspection: same DB-only short-circuit pattern as
+    // worktrees / checkpoints. Built on top of the registry the
+    // model-facing memory_* tools use, so what the operator sees
+    // and what the model sees stay consistent.
+    if (args.memory !== undefined) {
+      const cwd = options.bootstrapOverride?.cwd ?? process.cwd();
+      const dbPathOverride = options.bootstrapOverride?.dbPath;
+      const out = (s: string) => process.stdout.write(s);
+      const err = (s: string) => errSink(s);
+      const { runMemoryCli } = await import('./memory.ts');
+      return await runMemoryCli({
+        verb: args.memory.verb as 'list' | 'show',
+        positionals: args.memory.positionals,
+        json: args.json,
+        cwd,
+        ...(dbPathOverride !== undefined ? { dbPath: dbPathOverride } : {}),
+        out,
+        err,
+      });
+    }
+
     if (args.checkpoints !== undefined || args.undo !== undefined) {
       const cwd = options.bootstrapOverride?.cwd ?? process.cwd();
       const dbPathOverride = options.bootstrapOverride?.dbPath;

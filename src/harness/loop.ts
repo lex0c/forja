@@ -956,6 +956,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             todoStore,
             ...(bgManager !== undefined ? { bgManager } : {}),
             ...(spawnSubagentClosure !== undefined ? { spawnSubagent: spawnSubagentClosure } : {}),
+            ...(config.memoryRegistry !== undefined
+              ? { memoryRegistry: config.memoryRegistry }
+              : {}),
           };
 
           safeEmit(config.onEvent, {

@@ -13,6 +13,7 @@ import { migration012SubagentRuns } from './012-subagent-runs.ts';
 import { migration013SubagentWorktrees } from './013-subagent-worktrees.ts';
 import { migration014SubagentOutputs } from './014-subagent-outputs.ts';
 import { migration015SubagentRunsPolicy } from './015-subagent-runs-policy.ts';
+import { migration016MemoryEvents } from './016-memory-events.ts';
 
 export interface Migration {
   id: number;
@@ -36,4 +37,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration013SubagentWorktrees,
   migration014SubagentOutputs,
   migration015SubagentRunsPolicy,
+  migration016MemoryEvents,
 ];

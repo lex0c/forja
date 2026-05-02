@@ -120,3 +120,16 @@ export type {
   InsertSubagentOutputInput,
   SubagentOutput,
 } from './repos/subagent-outputs.ts';
+
+export {
+  createMemoryEvent,
+  listMemoryEventsByName,
+  listMemoryEventsBySession,
+} from './repos/memory-events.ts';
+export type {
+  CreateMemoryEventInput,
+  MemoryEvent,
+  MemoryEventAction,
+  MemoryEventScope,
+  MemoryEventSource,
+} from './repos/memory-events.ts';

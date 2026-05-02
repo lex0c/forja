@@ -1,11 +1,13 @@
 import { join } from 'node:path';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
+import { createMemoryRegistry, resolveRepoRoot, resolveScopeRoots } from '../memory/index.ts';
 import { type LockConflict, createPermissionEngine, resolvePolicy } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
 import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
+import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithUserPrompt } from './plan-prompt.ts';
 
 export const DEFAULT_MODEL = 'anthropic/claude-sonnet-4-6';
@@ -137,25 +139,51 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   // task() invocation.
   validateSubagentSet(subagents.byName.values(), toolRegistry);
 
-  // From here on, anything that throws must close the DB. `migrate` is
-  // the only realistic offender — schema-version drift surfaces here.
+  // From here on, anything that throws must close the DB.
+  // `migrate` and `createMemoryRegistry` are the realistic
+  // offenders — schema-version drift surfaces in migrate, and
+  // the registry's eager index load can hit fs errors other than
+  // ENOENT (EACCES on a misconfigured user scope, EIO, etc.).
+  // ENOENT is already handled inside loadScopeIndex as `absent`.
   const dbPath = input.dbPath ?? defaultDbPath();
   const db = openDb(dbPath);
+
+  let resolvedSystemPrompt: string | undefined;
+  let memoryRegistry: ReturnType<typeof createMemoryRegistry>;
   try {
     migrate(db);
+
+    // Resolve the effective system prompt. Plan mode prepends its
+    // own prompt to whatever the caller supplied; without plan mode,
+    // the caller's prompt passes through unchanged.
+    if (input.plan === true) {
+      resolvedSystemPrompt = composeWithUserPrompt(input.systemPrompt);
+    } else if (input.systemPrompt !== undefined) {
+      resolvedSystemPrompt = input.systemPrompt;
+    }
+
+    // Memory subsystem (spec MEMORY.md / §4.1). Build the registry
+    // from the REPO root, not the invocation cwd: project memory
+    // lives at `<repo>/.agent/memory/{shared,local}/` and an
+    // operator running `agent` from a subdir (the common case)
+    // would otherwise see empty project scopes. `resolveRepoRoot`
+    // calls `git rev-parse --show-toplevel`; falls back to cwd
+    // when not in a git repo (memory then lives wherever the
+    // operator invoked from — same fallback as the pre-fix
+    // behavior). User scope is unaffected (lives at
+    // ~/.config/agent/memory/, scope-roots derives it from env).
+    //
+    // Registry construction is unconditional in the production
+    // path — an absent or empty memory subtree just produces an
+    // empty section that composeSystemPrompt passes through,
+    // leaving the base prompt unchanged.
+    const memoryRoots = resolveScopeRoots(resolveRepoRoot(cwd));
+    memoryRegistry = createMemoryRegistry({ roots: memoryRoots, db, cwd });
+    const memorySection = assembleMemorySection({ registry: memoryRegistry });
+    resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text);
   } catch (e) {
     db.close();
     throw e;
-  }
-
-  // Resolve the effective system prompt. Plan mode prepends its
-  // own prompt to whatever the caller supplied; without plan mode,
-  // the caller's prompt passes through unchanged.
-  let resolvedSystemPrompt: string | undefined;
-  if (input.plan === true) {
-    resolvedSystemPrompt = composeWithUserPrompt(input.systemPrompt);
-  } else if (input.systemPrompt !== undefined) {
-    resolvedSystemPrompt = input.systemPrompt;
   }
 
   // Background-process log directory. Lives under `.agent/bg/`
@@ -184,6 +212,7 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     // "no subagents defined" hint instead of "registry missing"
     // when there are simply no .md files yet.
     subagentRegistry: subagents,
+    memoryRegistry,
     ...(input.budget !== undefined ? { budget: input.budget } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.plan === true ? { planMode: true } : {}),

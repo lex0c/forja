@@ -1,3 +1,4 @@
+import type { MemoryRegistry } from '../memory/index.ts';
 import type { Decision, PermissionEngine } from '../permissions/index.ts';
 import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
 import type { DB } from '../storage/index.ts';
@@ -280,6 +281,14 @@ export interface HarnessConfig {
   // Set by the runtime, NOT by callers — programmatic users build
   // top-level configs and let the runtime manage chain state.
   subagentDepth?: number;
+  // Memory subsystem registry (spec MEMORY.md). When set, the
+  // harness threads it through ToolContext so memory_list /
+  // memory_read / memory_search can dispatch. Absent = those tools
+  // surface a clean tool-error when invoked. The registry is
+  // constructed by the CLI bootstrap (or by tests building a
+  // HarnessConfig directly) and owns its own audit/persistence
+  // wiring; the harness just hands it through.
+  memoryRegistry?: MemoryRegistry;
 }
 
 export interface HarnessResult {

@@ -570,6 +570,71 @@ describe('--worktrees', () => {
   });
 });
 
+describe('--subagent-memory-cwd', () => {
+  test('captures the path value', () => {
+    const r = parseArgs(['--subagent-session-id', 'abc', '--subagent-memory-cwd', '/repo/parent']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentMemoryCwd).toBe('/repo/parent');
+  });
+
+  test('rejects flag-shaped values', () => {
+    const r = parseArgs(['--subagent-memory-cwd', '--subagent-depth', '2']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--subagent-memory-cwd');
+  });
+
+  test('rejects empty value', () => {
+    const r = parseArgs(['--subagent-memory-cwd', '']);
+    expect(r.ok).toBe(false);
+  });
+});
+
+describe('--memory', () => {
+  test('captures verb + scope positional for list', () => {
+    const r = parseArgs(['--memory', 'list', 'user']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memory?.verb).toBe('list');
+    expect(r.args.memory?.positionals).toEqual(['user']);
+  });
+
+  test('captures verb + name + scope for show', () => {
+    const r = parseArgs(['--memory', 'show', 'role', 'project_local']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memory?.verb).toBe('show');
+    expect(r.args.memory?.positionals).toEqual(['role', 'project_local']);
+  });
+
+  test('list with no positionals is valid', () => {
+    const r = parseArgs(['--memory', 'list']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memory?.positionals).toEqual([]);
+  });
+
+  test('rejects when verb is missing', () => {
+    const r = parseArgs(['--memory']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--memory');
+  });
+
+  test('rejects unknown verb', () => {
+    expect(parseArgs(['--memory', 'sneeze']).ok).toBe(false);
+  });
+
+  test('stops positional collection at top-level flag', () => {
+    const r = parseArgs(['--memory', 'show', 'role', '--json']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.memory?.positionals).toEqual(['role']);
+    expect(r.args.json).toBe(true);
+  });
+});
+
 describe('usage', () => {
   test('mentions every recognized flag', () => {
     const u = usage();

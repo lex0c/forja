@@ -15,6 +15,441 @@ Format:
 
 ---
 
+## [2026-05-01] M3 / Step 5.2 follow-up — anchor memory roots at repo root (subdir blindspot)
+
+External review caught a second real bug. Bootstrap and CLI
+`--memory` resolved scope roots from `cwd` directly: an operator
+invoking `agent` from a subdirectory inside a repo (the common
+case — `cd src/components/ && agent "..."`) would have project
+memories searched under `<subdir>/.agent/memory/...` instead of
+the repo's `<repo>/.agent/memory/...`. Result: the injected
+`# Memory` section came out empty, every `memory_*` tool read
+silently missed existing memories, and operators saw no symptom
+beyond "the agent doesn't seem to know things it should".
+
+The pattern was internally inconsistent too: `paths.ts`
+documents in its header that "the caller passes the absolute
+repoRoot (resolved via `git rev-parse --show-toplevel`
+upstream)", but bootstrap was passing the invocation cwd
+unchanged. `resolveScopeRoots`'s contract was correct;
+bootstrap was the wrong caller.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/memory/paths.ts` | NEW `resolveRepoRoot(cwd)` — sync helper using `Bun.spawnSync` over `git rev-parse --show-toplevel`. Returns the resolved repo root when in a git working tree; falls back to the input cwd when git is missing OR the path isn't inside a repo (operator gets per-cwd memory then — same fallback behavior the buggy code had, just now explicit). Mirrors the async `defaultResolveRepoRoot` pattern in `subagents/worktree-gc.ts` but sync because bootstrap is sync. |
+| `src/memory/index.ts` | Re-export `resolveRepoRoot`. |
+| `src/cli/bootstrap.ts` | `resolveScopeRoots(resolveRepoRoot(cwd))` instead of `resolveScopeRoots(cwd)`. The HarnessConfig.cwd field stays as the operator's invocation cwd (other subsystems anchor on that); only the memory roots resolution uses the repo root. |
+| `src/cli/memory.ts` | Same fix for the operator-facing CLI. `agent --memory list` / `show` from a subdir now finds project memories at the repo root. |
+| `src/cli/subagent-child.ts` | Same fix on the subagent path. The parent forwards `memoryCwd: input.cwd` (parent's invocation cwd, may be a subdir); the child must resolve that to the repo root before anchoring its registry. Without this fix, subagents inherited the parent's broken anchor. |
+| `tests/memory/paths.test.ts` | NEW describe block for `resolveRepoRoot`: returns repo root from a subdir of a git repo, returns repo root from the repo root itself, falls back to cwd outside a git repo, falls back to cwd for non-existent paths. Uses real `git init` in tmpdirs (matches the `tests/checkpoints/detect.test.ts` pattern). `realpathSync` on tmpdirs because macOS `/var → /private/var` would otherwise mismatch the canonical form `git rev-parse` returns. |
+| `tests/cli/bootstrap.test.ts` | NEW regression test: git init the workdir, seed `<workdir>/.agent/memory/local/role.md`, invoke bootstrap from `<workdir>/src/components/`. Assert the system prompt includes the memory section. Pre-fix this would assert empty. |
+| `tests/cli/memory.test.ts` | NEW regression test for `runMemoryCli`: same shape — git init the workdir, seed memory at repo root, invoke `--memory list` from a subdir, assert one entry returned (not empty). |
+
+**Decisions:**
+
+- **D1 — Sync helper, not async.** Bootstrap is synchronous and async-conversion would cascade through its callers (`run.ts`, every test that calls bootstrap directly). `Bun.spawnSync` adds ~1-5ms to bootstrap time per session; dominated by SQLite migrate already on the same path. Worth the simplicity.
+- **D2 — Helper falls back to cwd, not throws.** Operator running `agent` outside a git repo (rare but legitimate — playground dirs, CI scratch volumes) shouldn't see a hard error; they should get per-cwd memory, which is the same shape pre-fix code had. The fallback also covers test scenarios that don't bother to git-init.
+- **D3 — Apply at every call site, not at the registry layer.** Pushing repo-root resolution INTO `createMemoryRegistry` was tempting but wrong: the registry's `roots` parameter has a clear contract ("absolute scope roots"); coupling it to git would make the API surface impure and hard to test. Each entry path (bootstrap, CLI memory, subagent-child) explicitly resolves before passing to `resolveScopeRoots` — inverse of how the spec docs already framed it.
+- **D4 — `HarnessConfig.cwd` stays as invocation cwd.** Only the MEMORY roots use the repo root. Other subsystems (bgLogDir, checkpoints, working-tree probes) anchor on the operator's invocation cwd intentionally — `bgLogDir` is `<cwd>/.agent/bg/...`, checkpoints probe `<cwd>` for git, etc. Switching all of those to repo root would change behavior in directions not motivated by this bug. Memory is the exception because per-repo is its semantic.
+
+**Pending / known limitations:**
+
+- **Symlinked repo paths** — `git rev-parse --show-toplevel` returns the canonical (realpath-resolved) form. If the operator invokes from a symlinked path that aliases the repo, the resolved root is the canonical path, not the symlink. Memory loads correctly either way; only path comparisons in the operator's mental model might surprise (e.g., `pwd` shows the symlink, audit row shows the canonical). Acceptable.
+- **`worktree` directories return their main repo's root.** Inside a `git worktree add`-created tree, `git rev-parse --show-toplevel` returns the worktree's path. For subagent worktrees this is the desired behavior; the parent's bootstrap unaffected (parent never invokes from inside its own subagent's worktree).
+- **Git binary missing.** Falls back to cwd silently. An operator without git installed gets per-cwd memory; consistent with the worktree-gc fallback semantics. Documented in the helper comment.
+
+**Verification:** `bun test` 1630 pass / 10 skip / 0 fail (+6 new across the helper unit tests, bootstrap subdir-integration, and CLI subdir-integration); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** No state change to the read arc roadmap. Branch ready for PR.
+
+---
+
+## [2026-05-01] M3 / Step 5.2 follow-up — fix top-level audit attribution (NULL session_id)
+
+External review caught a real bug in 5.2.c. `bootstrap.ts`
+constructs the `MemoryRegistry` BEFORE the harness's `runAgent()`
+creates the session — at construction time the session id
+doesn't exist yet, so `createMemoryRegistry({ ..., db, cwd })`
+runs WITHOUT a `sessionId`. The registry's auditRead closure
+captures that undefined value once and emits every subsequent
+`read` event with `session_id = NULL`.
+
+Net effect: `listMemoryEventsBySession(currentRunSessionId)`
+returns nothing for top-level CLI runs, breaking the canonical
+"what memories did this session expose" forensic query. Only
+subagent-child runs got correct attribution today, because
+those built the registry AFTER the session id was known and
+passed it at construction.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/memory/registry.ts` | New `AuditOverride` type with `auditSessionId?` / `auditCwd?` fields. `ReadOptions extends ScopeOption, AuditOverride`; `SearchOptions` gains the same fields. `auditRead` accepts an override and uses it before falling back to the constructor-captured `sessionId` / `cwd`. `read()` and `search()`'s deep branch forward the override. The constructor's `sessionId` stays useful for callers that DO know it (subagent-child captures, tools also forward — both end at the same value, override is harmless). |
+| `src/memory/index.ts` | Re-export `AuditOverride` and `ReadOptions`. |
+| `src/tools/builtin/memory-read.ts` | Tool now passes `auditSessionId: ctx.sessionId` and `auditCwd: ctx.cwd` on every `registry.read` call. Tools have ctx.sessionId at every step (the harness constructs ToolContext with the live session id), so the override path always carries truth. |
+| `src/tools/builtin/memory-search.ts` | Same forwarding for the deep-search audit emissions. |
+| `tests/memory/registry.test.ts` | NEW describe block "per-call audit override" with 4 tests: per-call wins over undefined constructor, constructor is fallback when override absent, per-call beats constructor when both set, search deep-body emission uses override too. |
+| `tests/tools/memory-read.test.ts` | NEW regression test exercising the bootstrap shape: registry built without sessionId, ctx.sessionId set, audit row attributes to ctx.sessionId. Pre-fix this would record null; post-fix it records the right id. |
+
+**Decisions:**
+
+- **D1 — Per-call override path, not late binding via setter.** Two alternatives considered: (a) move `createSession` from harness loop to bootstrap (big refactor cascading through resume / preassigned / subagent paths), (b) `registry.setSessionId(id)` mutator the harness calls post-createSession (introduces mutable state in registry). Option (c) chosen here: tools have `ctx.sessionId` at every invocation already; passing it on every call is the smallest surface change AND keeps the registry stateless. The constructor's sessionId stays as a useful fallback for callers (CLI inspect, subagent-child) that know it at construction time.
+- **D2 — Override at the OPTIONS object, not as positional args.** Mirrors how scope is opt-in via `{ scope: ... }`. Adding positional args would force every call site to think about audit metadata; opt-in via spread keeps the simple "registry.read('foo')" form working for tests that don't care about audit fidelity (in-memory DB, no consumers of the audit table).
+- **D3 — `auditSessionId` / `auditCwd` field names, not `sessionId` / `cwd`.** The latter two would clash semantically — `cwd` could plausibly be a lookup parameter, and the registry's own constructor uses bare `cwd`. The `audit*` prefix makes intent unmistakable: this is metadata for the audit row, not lookup behavior.
+- **D4 — Constructor sessionId NOT removed from CreateMemoryRegistryInput.** Subagent-child still passes it (knows the session at construction); CLI `agent --memory show` still passes operator-driven cwd. Removing those would force ALL callers to use per-call override, which is overkill — only the bootstrap path has the chicken-and-egg with createSession. Keeping the constructor field as fallback handles both shapes cleanly.
+
+**Pending / known limitations:**
+
+- **No backfill of historical NULL rows.** Existing `memory_events` rows from runs that landed before this fix stay session_id=NULL; there's no way to recover the original session. Operators querying history will see a cliff between pre-fix and post-fix runs. Acceptable: audit history is forward-only, the table is in dev only at this point so the blast radius is the developer's own dogfood data.
+- **CLI `agent --memory show` still emits NULL session_id.** Intentional: operator-driven inspection has no session by design (the audit row's NULL is the marker that distinguishes operator from agent). Documented in 5.2.b D2.
+
+**Verification:** `bun test` 1624 pass / 10 skip / 0 fail (+5 new across registry override behavior + tool-level forwarding); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** No state change to the read arc roadmap. Branch ready for PR.
+
+---
+
+## [2026-05-01] M3 / Step 5.2 follow-up — wire memory access for subagents
+
+The 5.2 read arc shipped with `memoryRegistry` undefined in
+subagent runs — the holistic review (post-5.2.c) pinned this as
+inconsistent: `memory_*` tools appeared in the subagent's tool
+schema (because BUILTIN_TOOLS is global) but at runtime returned
+`memory.registry_unavailable`, AND the subagent's system prompt
+had no memory section. Modelo subagente recebia tools no schema,
+descobria em runtime que não funcionavam. Confused state.
+
+Architectural decision: subagents SHOULD have read access to the
+parent's memory tree. Spec §11 says "stateless tasks" but that
+means "no carry-over between invocations of the same subagent",
+not "no read access to operator-curated cross-session context".
+Reference / shared-feedback / project memories are exactly the
+kind of operator-curated knowledge any task class benefits from.
+Withholding forces the parent to re-inject conventions via
+prompt — defeating the whole point of cross-session memory.
+
+Write side (5.3) stays restricted to the parent: subagent's
+future `memory_write` will refuse the same way `--allow-memory-write`
+opt-out works headless, because confirmation must be the parent's
+loop, not the subagent's.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/cli/args.ts` | New internal flag `--subagent-memory-cwd <path>` mirroring the `--subagent-bg-log-dir` pattern. Same flag-shape guard rejecting empty / `--`-prefixed values. New `args.subagentMemoryCwd?: string` field. |
+| `src/subagents/runtime.ts` | `SpawnChildProcessOptions` gains `memoryCwd?: string`; `defaultSpawnChildProcess` forwards via `--subagent-memory-cwd`. The runtime passes `input.cwd` (the parent's cwd, which is the parent's repo root for both worktree and non-worktree subagents — the subagent's own cwd may be a worktree path that's missing project_local) so the child's registry resolves to the same scope roots the parent saw. |
+| `src/cli/subagent-child.ts` | `SubagentChildOptions` gains `memoryCwd?: string`. When set, the child constructs `MemoryRegistry({ roots: resolveScopeRoots(memoryCwd), db, sessionId, cwd: session.cwd })` and threads it into HarnessConfig. The `roots` anchor at the parent's repo (correct memory tree); the registry's `cwd` field anchors at the child's session.cwd so audit emissions show "where the read happened" (worktree path) instead of conflating with "which project's memory" (parent's repo). System prompt resolution composes `audit.systemPrompt + memorySection` via the same `composeSystemPrompt` helper bootstrap uses — same shape, same `# Memory` header, same dedup-by-name semantics. When omitted, falls through to the existing path: registry undefined, system prompt = audit verbatim, tools surface `registry_unavailable`. |
+| `src/cli/index.ts` | Forwards `args.subagentMemoryCwd` into `runSubagentChild` opts via the same conditional-spread pattern as the other subagent flags. |
+| `tests/cli/args.test.ts` | +3 tests on `--subagent-memory-cwd` parsing: capture, flag-shape rejection, empty-value rejection. |
+| `tests/cli/subagent-child.test.ts` | +2 integration tests with a recording provider that captures `req.system`. First: subagent in a worktree-path cwd, parent's memory under a different cwd, with `memoryCwd: parentRepo` — assert system prompt contains both `You are explore.` (audit) AND `# Memory` + `[project_local] role` (memory section). XDG_CONFIG_HOME isolated to parentRepo so user scope doesn't leak. Second: same setup but `memoryCwd` omitted — system prompt is the audit snapshot verbatim, no `# Memory`, registry stays undefined. |
+
+**Decisions (post-review polish bundled in):**
+
+- **D6 (post-review S1) — Whitelist-gated memory injection.** Pre-review the section was injected unconditionally whenever `memoryCwd` was forwarded — which is always in production. Problem: a subagent definition with `tools: [read_file]` (no memory_*) STILL got the `# Memory ... use memory_read ...` block in its system prompt, advertising tools the model couldn't call AND inflating the prompt by up to ~2k tokens of irrelevant index. Lean subagents got fat for no reason. Added `wantsMemory = audit.toolsWhitelist.some(t => t.startsWith('memory_'))` gate; registry construction + section injection both fire only when the gate passes. Updated the existing happy-path test to add `memory_read` to its whitelist (so it actually exercises the integration), and added a new counterfactual test confirming subagents with `tools: ['read_file']` don't see the memory section even when `memoryCwd` is forwarded.
+
+**Decisions:**
+
+- **D1 — `roots` from parent's cwd, audit `cwd` from child's session.cwd.** Two distinct anchors. The roots determine WHICH memory tree to read; the audit cwd records WHERE the read happened. For non-worktree subagents both equal the parent's cwd (no observable difference). For worktree subagents the audit row shows the worktree path while the memory comes from the parent's repo — forensic queries can answer "what worktree path triggered this read?" AND "which project's memory was exposed?" without conflation.
+- **D2 — `input.cwd` (the parent's cwd) is the right `memoryCwd` value.** `runSubagent` receives `input.cwd` from the parent's harness — that's the PARENT's session.cwd, which IS the repo root. The child's `childCwd` may be a worktree path. Passing the parent's cwd keeps memory consistent: same project_local + project_shared the parent sees, regardless of whether the child is isolated.
+- **D3 — Memory section appended to `audit.systemPrompt`, not to a fresh prompt.** The audit snapshot was captured at definition-load and reflects the subagent's identity prompt + parent policy snapshot. Memory section is dynamic per-run. `composeSystemPrompt(audit.systemPrompt, memorySection.text)` puts memory after — same convention as bootstrap (memory after caller-supplied / plan prompt).
+- **D4 — Whitelist still gates which subagents see memory tools.** A subagent definition that doesn't list `memory_read` etc. in its `tools:` whitelist won't have them, period. Default-on with opt-out via whitelist is the right shape because operator-curated subagent definitions ARE the trust boundary; they decide what their agents can do.
+- **D5 — Write side intentionally NOT enabled here.** When 5.3 lands `memory_write`, the subagent's invocation must always reject (same as headless mode per spec §5.6). Subagent proposing memory writes is a injection vector — operator can't confirm interactively because the subagent loop is fire-and-forget from the parent's perspective. The wiring scaffolds READ only; write surface in 5.3 will explicitly check "is this a subagent session?" via session.isSubagent and refuse.
+
+**Pending / known limitations:**
+
+- **Subagent memory section is computed at child startup.** Dynamic in the sense that it reflects the live registry state when the child boots. If the parent writes a memory mid-run AFTER spawning the subagent, the running subagent doesn't see the new entry until next spawn. Acceptable: spec §4.1 mandates per-session stability; subagent IS its own session.
+- **No way to disable per subagent definition.** A subagent author that wants their subagent to run with NO memory access (for reproducibility / hermeticity reasons) can drop `memory_*` from the whitelist, but the system prompt section still appears. Adding a `memory: 'disabled'` field in the subagent definition frontmatter would close this; defer until demand exists.
+- **Trust filter still missing** (5.4 owns). When 5.4 lands, the subagent's view should also exclude untrusted memories — the registry's filter already runs uniformly so subagents inherit the gate for free.
+
+**Verification:** `bun test` 1619 pass / 10 skip / 0 fail (+6 new: 3 args parsing + 2 child integration + 1 review-driven counterfactual for the lean-subagent gate); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** With this follow-up, the read-only arc is operationally complete AND consistent across top-level + subagent runs. Branch ready for PR. Write surface (5.3) stays parked until TUI scaffolding (M4 / Ink) lands.
+
+---
+
+## [2026-05-01] M3 / Step 5.2 follow-up — close audit gap on memory_search deep-body matches
+
+Holistic review of the 5.1+5.2 arc surfaced one issue that
+escaped per-slice review because it sat between two slices: the
+registry's `search({ deep: true })` path calls `readMemoryByName`
+directly to scan body content, but does NOT route through
+`registry.read()` — so a body that matches via deep search
+exposes a snippet to the model without a corresponding `read`
+event in `memory_events`. An audit consumer querying "what
+content has the model seen?" would miss every search-deep hit.
+
+Severity is moderate: the snippet is bounded (~160 chars,
+single line), the body itself isn't fully exposed, and deep mode
+is opt-in. But it's still content reaching the model without an
+audit row, which violates the spec §5.3 contract that every
+read leaves a trace.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/memory/registry.ts` | The deep branch in `search` now invokes `auditRead(listing, fileResult)` immediately after a snippet match — same audit emission and same try/catch best-effort semantics as the direct `read()` path. Drop the audit when the body load fails (kind ≠ 'present') OR when the body was loaded but no snippet matched (the body never flowed to the model — no read happened from the audit's perspective). |
+| `tests/memory/registry.test.ts` | NEW describe block "search-deep audit (regression: S1)" with 3 tests: deep body match emits a `read` event with the right scope/sessionId; shallow name match does NOT emit (already true, regression-pinning); deep mode that DOESN'T match the body does NOT emit (the body load happened but no content went to the model). |
+
+**Decisions:**
+
+- **D1 — Audit on snippet match, not on body load.** The deep branch reads the body unconditionally to test for a match, but the model only sees a body excerpt when a snippet IS extracted. Audit fires on snippet success, not on disk read. Mirrors the principle from `read()`: "audit when content actually reached the consumer, not on intermediate operations".
+- **D2 — Reuse `auditRead` directly.** Same closure, same DB+session+cwd binding as the `read()` path. Adding a parallel emit would risk drift; one helper, one source of truth.
+
+**Verification:** `bun test` 1613 pass / 10 skip / 0 fail (+3 new audit-gap regression tests); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** Unchanged from 5.2.c — write surface (5.3) parked until TUI scaffolding (M4 / Ink) lands per the design discussion. The read-only arc is operationally complete.
+
+---
+
+## [2026-05-01] M3 / Step 5.2.c — eager memory index injection in system prompt
+
+5.2.a/b shipped the read tools and CLI surface but the model only
+sees memory if it explicitly calls `memory_list` / `memory_search`
+— and Sonnet/Haiku rarely do that without a prompt nudge. Spec
+§4.1 mandates "index eager, content lazy": the merged per-scope
+index goes into the system prompt at session start so the model
+sees what's available without paying a tool round-trip. This sub-
+slice closes that gap. With memory injection in place, 5.2 is
+operationally complete — the model has full read access (visible
+index + lazy bodies + grep) cross-session.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/cli/memory-prompt.ts` | NEW — `assembleMemorySection({ registry })` returns `{ text, entryCount }`. Empty when no memories exist (no scaffolding tokens wasted). With entries, emits a `# Memory` header + one-sentence usage hint (call `memory_read` / `memory_list` / `memory_search`) + bullet list `- [<scope>] <name> — <hook>`. Dedup is on by default so a name shadowed across all three scopes appears once at its most-specific scope (project_local > project_shared > user) — saves tokens and removes the resolution ambiguity the model would otherwise have to reason through. `composeSystemPrompt(base, section)` helper handles the four cases (both empty / one empty / both set), preserving `undefined` when memory is empty so existing tests asserting `systemPrompt === undefined` still pass. |
+| `src/cli/bootstrap.ts` | Bootstrap now constructs a `MemoryRegistry` post-migrate (with the live DB + cwd), assembles the section via `assembleMemorySection`, composes onto the resolved system prompt with `composeSystemPrompt`, and wires the registry into `HarnessConfig.memoryRegistry`. Construction is unconditional in production; an absent or empty memory subtree just produces empty section text and `composeSystemPrompt` passes the base through untouched. |
+| `tests/cli/bootstrap.test.ts` | beforeEach now sets `XDG_CONFIG_HOME = workdir`, restoring in afterEach. Without the override the bootstrap's eager memory load would pick up the developer's real `~/.config/agent/memory/` and bleed into every "passes through unchanged" assertion. Three new tests cover the integration: memory appended to caller systemPrompt; memory becomes systemPrompt when caller didn't supply one; registry wired even with empty memories (so the tools dispatch correctly). The existing 13 tests remain green because empty user scope (workdir has no `agent/memory/` subtree) yields an empty section. |
+| `tests/cli/memory-prompt.test.ts` | NEW — 10 unit tests on `assembleMemorySection` and `composeSystemPrompt`: empty registry, three-scope rendering, scope-precedence ordering, dedup-by-name, all four base+section combinations of compose. |
+
+**Decisions (post-review polish bundled in):**
+
+- **D8 (post-review C1) — Bootstrap try/catch extended to cover memory registry construction.** Pre-review the try/catch only wrapped `migrate(db)`. After migrate succeeded, `createMemoryRegistry` ran outside the catch — and that path can throw on fs errors other than ENOENT (EACCES, EIO on a misconfigured user scope or unreadable index file). A throw there leaked the open SQLite handle (and its -wal/-shm file pair). Extended the try block to wrap both `migrate` and the entire memory composition flow; any failure now closes the DB before propagating. Added a regression test that chmods MEMORY.md to 0o000 to force a read error and verifies bootstrap throws cleanly.
+- **D9 (post-review M1) — Resume mode loads the CURRENT memory tree, not the session-original snapshot.** Spec §4.1 says the index is "estável entre turnos da MESMA sessão"; cross-session it's free to drift. So `agent --resume <id>` running today shows whatever's in `~/.config/agent/memory/` and `<repo>/.agent/memory/{shared,local}/` NOW, not what was there when the session originally started. Persisted assistant messages may reference memories that no longer exist; the model handles this fine in practice (the body is reachable via memory_read failure → "memory.not_found" tool error, which the model can interpret). Documented as expected behavior; not fixing.
+
+**Decisions:**
+
+- **D1 — Memory section APPENDED to systemPrompt, not prepended.** Spec §4.1 places the memory index after AGENTS.md / project context. We don't have AGENTS.md yet, so the caller-supplied systemPrompt is the closest analogue to "project context"; memory follows. When AGENTS.md lands the layout extends as: `<plan-or-caller-prompt> + <AGENTS.md> + <memory section>` — consistent direction.
+- **D2 — Empty section means no scaffolding tokens.** `assembleMemorySection` returns `{ text: '', entryCount: 0 }` for an empty registry, and `composeSystemPrompt` short-circuits the empty-empty case to `undefined`. Operators with no memories pay zero token overhead. The alternative (always emit the `# Memory` header even with zero entries) would cost ~30 tokens per session for nothing.
+- **D3 — Dedup on by default in injection (opposite of `memory_list` tool default).** The MODEL-FACING tool surface keeps shadowing visible (the model needs to see "this name exists in 3 scopes; local wins" to learn the precedence model). The SYSTEM PROMPT injection collapses to the most-specific scope because: (a) the model only NEEDS to know which entry is active for "name X"; (b) showing all three triples context length without adding signal. The two surfaces have different audiences; different defaults are correct.
+- **D4 — Cache breakpoint optimization deferred.** Spec §4.1 says "Cache breakpoint depois do index". Anthropic's SDK supports per-block `cache_control` markers when `system` is an array, not a string. Currently the harness passes `system: string` raw. Wiring cache breakpoints requires a provider-adapter refactor (and tests) for a benefit that's measurable only on multi-turn sessions with stable indexes. Defer until eval / cost data shows the gain. The injection works correctly without it; only re-caching efficiency is left on the table.
+- **D5 — `XDG_CONFIG_HOME` env override in bootstrap tests, not a new test seam.** Adding `memoryRoots?: ScopeRoots | null` to BootstrapInput would have meant updating 13 existing tests with an opt-out flag. Setting `XDG_CONFIG_HOME = workdir` in the existing beforeEach is one place, matches production behavior (env-driven scope resolution), and parallels the same pattern already used in `tests/cli/memory.test.ts`. The new memory-bootstrap tests write to the project-local subtree (`<workdir>/.agent/memory/local/`) which is already isolated by the workdir tmpdir.
+- **D6 — Trust filter NOT applied yet.** Spec §7.2 mitigation 2 says `trust: untrusted` memories must NOT enter the base context. Filtering by trust requires reading every body's frontmatter (the index doesn't carry trust info), which violates the eager-index principle. Until 5.4 lands the trust integration (which will add an index-side trust marker OR a body preload pass), no production path writes `trust: untrusted` (only the writer in 5.4 does), so the gate is a no-op. The 5.4 design will close this; the 5.2.c injection passes every entry through.
+- **D7 — Section header is `# Memory` (markdown H1), not a sentinel comment.** Models pre-trained on prose recognize markdown structure; an H1 header makes the section visually distinct from the rest of the system prompt without adding parse-only ceremony. Section body uses prose + bullet list, same shape models see in user content.
+
+**Pending / known limitations:**
+
+- **No cache breakpoint marker.** Re-rendering the section every turn means the system prompt's hash changes only when the registry's underlying indexes change, but providers without per-block cache_control re-process the full prompt on every turn anyway. Cache hit rate is identical to today (the prompt ITSELF is stable per session, just not marked); we just don't get the "explicitly cache up to here" optimization Anthropic offers. Future work.
+- **No trust filter.** See D6. The injection includes every entry the registry sees. 5.4 closes this.
+- **No size cap on the section.** A pathological repo with 200 memory entries (the index hard cap) would inject ~200 lines into the system prompt — ~2k tokens by spec estimate. Acceptable: spec §3.2 already enforces the 200-line cap on `MEMORY.md`. The model's effective context budget can absorb 2k for cross-session memory; CONTEXT_TUNING will tune this if eval data warrants.
+- **Per-scope subsections deferred.** The current rendering is one flat list with `[scope]` prefixes. A future iteration could group by scope (`## Project (local)`, `## Project (shared)`, `## User`) for clearer visual structure when there are many entries. Today's flat form keeps the section short.
+- **Read-event spam from in-session re-loads not yet addressed.** The eager injection doesn't trigger `memory_read` events (it's index-only). But once the model starts calling `memory_read` repeatedly, each call writes a row. 5.6 audit pass may add a per-session dedup window if the rows turn out to be noisy.
+
+**Verification:** `bun test` 1610 pass / 10 skip / 0 fail (+13 new across the assembler unit tests + bootstrap integration tests + 1 environment-isolation update + 1 review-driven DB-leak regression test); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** With 5.2.a/b/c landed, the entire 5.2 (read-only surface) arc is COMPLETE. The model can list, search, and read memories cross-session, sees the index eagerly in the system prompt, and operators can inspect via `agent --memory`. M3 / Step 5.3 is the write surface — `memory_write` tool with TUI confirmation, the injection scanner (heuristic + secret-pattern detection), and headless-mode rejection. After that, 5.4 (trust integration), 5.5 (promote/demote), 5.6 (lifecycle).
+
+---
+
+## [2026-05-01] M3 / Step 5.2.b — `agent --memory` operator surface (list + show)
+
+5.2.a landed the registry + read tools (model-facing). 5.2.b adds
+the operator-facing CLI for inspecting memory directly: `agent
+--memory list [scope]` and `agent --memory show <name> [scope]`.
+Built on the same registry the model-facing tools use, so the
+operator's view and the agent's view stay consistent.
+
+Independent of bootstrap (no provider, no permissions, no tool
+registry — only DB + cwd) so memory inspection doesn't require an
+API key. Mirrors the structure of `runWorktreesCli` and
+`runCheckpointsCli` per the established CLI pattern.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/cli/memory.ts` | NEW — `runMemoryCli` thin wrapper. Validates verb, opens DB (or test override), builds a `MemoryRegistry` for the cwd via `resolveScopeRoots`, dispatches to `runList` or `runShow`. The registry's audit hook fires on `show` (read events) with `session_id=NULL` (operator-driven, not an agent action) and the cwd recorded — captures every read regardless of who triggered it. |
+| `src/cli/args.ts` | `--memory <verb> [positionals]` parser modeled on `--checkpoints`. Verbs `list` and `show`. Positionals stop at any flag-shaped token; arity is enforced by the handler (list: 0 or 1 scope; show: 1 name + optional scope). New `args.memory` field. Help text added. |
+| `src/cli/run.ts` | New short-circuit branch dispatches to `runMemoryCli` after worktrees, before checkpoints/resume/run. Same DB-only pattern as the other inspection commands. |
+| `src/cli/index.ts` | `promptOptional` now also covers `args.memory !== undefined` so the missing-prompt gate doesn't fire on inspection commands. |
+| `tests/cli/memory.test.ts` | NEW — 15 CLI-surface tests. Empty list (table + NDJSON), three-scope listing in precedence order, NDJSON shape with summary, scope filter, invalid scope, too many positionals, show happy path with audit emission, NDJSON show, unknown name / missing body / malformed paths, traversal name rejection, strict scope no-fallback, empty positionals, unknown verb. Uses `XDG_CONFIG_HOME` override to scope user-memory writes to a tmpdir. |
+| `tests/cli/args.test.ts` | +6 tests on `--memory` parsing: list with scope, show with name+scope, list with no positionals, missing verb rejection, unknown verb rejection, top-level flag boundary. |
+
+**Decisions (post-review polish bundled in):**
+
+- **D8 (post-review M1) — Removed gratuitous dynamic import of `resolveScopeRoots`.** Pre-review the handler did `await import('../memory/index.ts')` to fetch one symbol from a barrel that was ALREADY statically imported (for `FrontmatterError`, `MemoryListing`, `MemoryRegistry`, `createMemoryRegistry`, `validateName`). The "lazy import" yielded zero benefit — the module was already loaded — and the comment misleadingly compared it to the worktrees / checkpoints lazy imports in run.ts (those DO avoid loading the subsystem; this one didn't). Moved to a single static import alongside the others; removed the misleading comment.
+- **D9 (post-review L2) — Added regression test for empty body in `show`.** The handler has a special branch at the end of plain mode (`if (!body.endsWith('\n')) out('\n')`); test exercises body=`''` to confirm the trailing newline is still emitted (so consumers piping into `wc -l` get the expected count).
+
+**Decisions:**
+
+- **D1 — Flag style (`--memory`), matching the rest of the CLI surface.** Spec §6.3 lists the slash-command vocabulary as `/memory list`, `/memory show`, etc. — that's the future TUI surface (M4+ Ink picker). For pre-TUI headless invocation we mirror the operator commands as `--memory list/show`, same as `--checkpoints` and `--worktrees`. The verb names match (list/show) so the eventual slash-command port is mechanical.
+- **D2 — Audit emission with `session_id=NULL`.** Operator running `agent --memory show role` from CLI is NOT an agent action, but spec §5.3 mandates an audit log row for every `read`. Solution: emit the row with `session_id=NULL` so the audit captures the read while preserving the operator-vs-agent distinction (the FK SET NULL semantics already let us query "events without a session linkage" → operator-driven). The cwd column IS populated (anchors which project the operator was inspecting from).
+- **D3 — Defense-in-depth `validateName` at the CLI boundary.** Same rationale as in `memory_read` tool: the registry's `findListing` returns null silently for `../escape` because no listing matches by name, surfacing as `unknown`. That hides the path-traversal attempt. Calling `validateName` first turns `../escape` into a clean "invalid memory name" message, preserving the security signal in the audit / stderr.
+- **D4 — Strict scope on `show <name> <scope>`.** Mirrors `memory_read` tool behavior. An operator typing `agent --memory show role project_local` who actually has `role` only in `user` scope gets "no memory named role in scope project_local", not silent fallback. Consistency with the model-facing surface > convenience.
+- **D5 — Plain output is operator-readable, not parser-friendly.** Show output: `scope:` / `name:` / `type:` / `source:` / `description:` / optional `expires:`/`trust:`/`triggers:` lines, blank line, then verbatim body. Operators can `agent --memory show foo | less` or grep without parsing. NDJSON gives the structured shape for headless tooling. List uses a 3-column space-separated table — same low-ceremony layout as `--worktrees list`.
+- **D6 — `dedupe_by_name` not exposed on the CLI list.** The model-facing tool has it (the model needs to see shadowing explicitly to learn the precedence model). Operators inspecting the index typically WANT to see all scopes — that's what `agent --memory list` is for. Adding the flag is trivial later if a use case appears; YAGNI for now.
+- **D7 — Lazy-import the memory module in run.ts dispatch.** Same pattern as the `--worktrees` dispatch. Keeps the cold-start path light when memory isn't being inspected.
+
+**Pending / known limitations:**
+
+- **No `--memory edit/delete/save`.** Those are write surfaces and live in 5.3 (write tools + TUI confirmation). The CLI side waits until 5.6 (lifecycle slash commands) to round out `agent --memory edit/delete/expire/audit`.
+- **No `--memory audit`.** Spec §6.3 lists `/memory audit` to dump `memory_events`. Defer to 5.6 when the lifecycle pass + the audit surface land together.
+- **No `--memory promote/demote`.** 5.5 owns these; they need the secret/injection scanner.
+- **No interactive picker.** `agent --memory list` is a flat table; `agent --memory show <name>` requires the operator to know the name. The TUI picker (`/memory show` with fuzzy completion) waits for M4's Ink TUI. Headless CLI usage is fine.
+- **`show` output to stdout includes the body verbatim, including any control characters.** A malicious memory body with ANSI escape codes could disrupt terminal rendering. Defer to 5.4 trust integration where `[memory: untrusted]` markers ship.
+
+**Verification:** `bun test` 1597 pass / 10 skip / 0 fail (+22 new across CLI handler tests + args parsing + 1 review-driven empty-body regression); `tsc --noEmit` clean; `biome check` clean. No smoke eval — the CLI is a trivial wrapper around the already-tested registry.
+
+**Next:** M3 / Step 5.2.c — eager system prompt index injection. Spec §4.1 mandates the merged memory index be in the system prompt with a cache breakpoint after AGENTS.md. AGENTS.md isn't yet implemented in this codebase; 5.2.c either bundles it or ships memory-only injection with a placeholder anchor for the AGENTS.md slot. Will design the assembler shape (where to inject, how to format the section, cache breakpoint semantics) before cutting code.
+
+---
+
+## [2026-05-01] M3 / Step 5.2.a — memory loader, registry, and read tools
+
+5.1 landed the storage primitives (types, frontmatter, index,
+sandbox, audit table). 5.2 adds the read-only surface for the
+agent to actually consult memory cross-session. Splitting 5.2 into
+sub-slices because the full scope (loader + 3 tools + CLI +
+system prompt injection) is ~1500+ LoC and CLI/system-prompt are
+independent concerns. This sub-slice (a) ships the disk-side
+loader, the in-process registry with scope merge + audit, and the
+three read-only tools. Sub-slices b (CLI `agent --memory list|show`)
+and c (system prompt index injection) follow.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/memory/loader.ts` | NEW — `loadScopeIndex(roots, scope)` returns `{ kind: 'present' \| 'absent' \| 'malformed' }` per scope; `readMemoryByName(roots, scope, name)` returns `{ kind: 'present' \| 'missing' \| 'malformed' }`. ENOENT on the scope dir or `MEMORY.md` is `absent` (not error — just "no memory yet"); ENOENT on a body file referenced by the index is `missing` (operator deleted body but kept index entry; surfaced so the registry can show both states). Parse failures surface as `malformed` with the underlying error string. `listOrphanFiles(roots, scope)` walks the scope dir for `.md` files not in the index — top-level only, excludes `MEMORY.md` and dotfiles. `memoryNameFromPath` strips the `.md` suffix. |
+| `src/memory/paths.ts` | Exported `rootForScope` (was internal) so the loader's orphan walker can target the scope dir without re-implementing the switch. Behavior unchanged. |
+| `src/memory/registry.ts` | NEW — `createMemoryRegistry({ roots, db?, sessionId?, cwd? })` eager-loads all three indexes at construction (cheap; ~150 lines each at most), holds the snapshot in memory, lazy-loads bodies on `read(name)`. `list(opts)` returns entries in precedence order (`project_local` > `project_shared` > `user`); `deduplicateByName: true` collapses shadowing to most-specific scope. `lookup(name, opts?)` walks scopes in precedence order or pins to one with no fallback. `read(name)` emits a `memory_events` row with `action='read'`, `source` = the read memory's frontmatter source — only fires when persistence is configured AND the body load succeeded. `search(query, opts)` substring-matches case-insensitively against name → description by default; `deep: true` adds body matching with one disk read per candidate (gated to keep default search cheap). `reload()` re-reads indexes for tests + post-external-mutation refresh. |
+| `src/memory/index.ts` | +re-exports loader + registry + their types. |
+| `src/storage/repos/memory-events.ts` | (No change — created in 5.1; the registry is its first writer.) |
+| `src/tools/types.ts` | `ToolContext` gains `memoryRegistry?: MemoryRegistry` (optional; absent ⇒ memory tools surface clean error). Same shape as `bgManager` and `todoStore`. |
+| `src/tools/builtin/memory-list.ts` | NEW — `memory_list({ scope?, dedupe_by_name? })` returns `{ entries: [{ scope, name, description, href }], count }`. Index-only; no body reads. category=misc, writes=false, idempotent=true, planSafe=true. |
+| `src/tools/builtin/memory-read.ts` | NEW — `memory_read({ name, scope? })` returns `{ scope, name, description, type, source, expires?, trust?, triggers?, body }`. Re-runs `validateName` at the tool boundary so path-traversal attempts surface as `tool.invalid_arg` instead of silently missing. Maps registry outcomes to discrete error codes: `memory.not_found` (unknown name), `memory.body_missing` (index has it but file gone), `memory.malformed` (parse failed). Optional frontmatter fields are spread only when present so model output mirrors the on-disk shape. |
+| `src/tools/builtin/memory-search.ts` | NEW — `memory_search({ query, scope?, deep?, limit? })` with limit default 50, max 200. Returns `{ query, hits: [{ scope, name, matched_in, snippet }], count, truncated }`. Asks the registry for `limit + 1` and reports `truncated` accurately. |
+| `src/tools/builtin/index.ts` | +imports + `BUILTIN_TOOLS` registration of the three new tools, grouped with the read-only family. |
+| `src/harness/types.ts` | `HarnessConfig` gains `memoryRegistry?: MemoryRegistry` so callers (CLI bootstrap, programmatic users, tests) can wire one in. |
+| `src/harness/loop.ts` | Threads `config.memoryRegistry` into the per-step `ToolContext` via the established conditional-spread pattern — absent doesn't pollute the object. |
+| `tests/tools/_helpers.ts` | `makeCtx` honors `memoryRegistry` overrides via the same pattern as `bgManager`/`todoStore`/`spawnSubagent`. |
+| `tests/cli/bootstrap.test.ts` | Updated the registered-tools snapshot to include `memory_list`, `memory_read`, `memory_search` (otherwise the bootstrap test fails because `BUILTIN_TOOLS` grew). |
+| `tests/memory/loader.test.ts` | NEW — 13 tests: absent/present/malformed paths for `loadScopeIndex`, missing/present/malformed for `readMemoryByName`, traversal name rejection, orphan file detection (incl. excluding `MEMORY.md`/dotfiles/subdirs), `memoryNameFromPath`. |
+| `tests/memory/registry.test.ts` | NEW — 18 tests: empty-state, three-scope precedence order, scope filter, dedupe-by-name shadowing, lookup with/without scope (strict-no-fallback), read with audit (emits `read` event with correct scope/source/sessionId/cwd), no-audit on missing/malformed/no-DB paths, search shallow vs deep, search limit, empty-query, scope filter, `reload` picks up filesystem changes. |
+| `tests/tools/memory-list.test.ts` | NEW — 8 tests: registry-unavailable error, empty list, three-scope listing, scope filter, dedupe, invalid scope/dedupe types, abort-already-fired. |
+| `tests/tools/memory-read.test.ts` | NEW — 8 tests: registry-unavailable, body+audit happy path, not_found / body_missing / malformed error codes, traversal name rejection, strict scope no-fallback, optional frontmatter fields preserved. |
+| `tests/tools/memory-search.test.ts` | NEW — 11 tests: registry-unavailable, empty query rejection, name match, description match, shallow vs deep body matching, limit+truncated, invalid limit/scope. |
+
+**Decisions (post-review polish bundled in):**
+
+- **D13 (post-review C1) — `allListings` skips entries with non-`.md` href instead of crashing.** Pre-review the function called `memoryNameFromPath(entry.href)` directly. The index-file parser accepts arbitrary non-paren content as href (per the SECURITY CONTRACT in index-file.ts — operators hand-edit and the storage layer doesn't gate path syntax), so a single entry like `[Title](https://example.com)` made `memoryNameFromPath` throw "expected .md file", taking the whole `list()` / `search()` call with it. The crash propagated through the tools and the model received an internal error. `findListing` already had the try/catch; `allListings` was missing it. Wrapped the same way: skip silently, the malformed entry is still reachable for the future `/memory audit` surface (5.6) via `loadScopeIndex(...).index.malformedLines`.
+- **D14 (post-review M1) — Audit DB failure does NOT propagate as exception.** Pre-review `auditRead` called `createMemoryEvent` raw; a SQLite failure (disk full, FK lock, corrupt DB) would propagate up through `read()` and the model would lose the body it had already loaded. Contract violation: a successful body load must return the body. Wrapped the insert in try/catch with a stderr `AUDIT DRIFT` warning, mirroring the bg-reaper pattern from 4.2b.iv (D9): disk-side work is authoritative, audit best-effort. Operators monitoring stderr see the drift; sessions don't lose data.
+- **D15 (post-review L1) — Removed dead `MemoryReadResult` type.** Was declared and exported in registry.ts but the actual return type is `RegistryReadResult` (with `kind` discriminator). YAGNI cleanup; barrel export updated to match.
+
+- **D1 — Loader is stateless; registry holds the snapshot.** The loader has no caching layer — every call hits disk. The registry calls the loader once at construction, stores the parsed indexes, and exposes `reload()` for explicit invalidation. This keeps the loader trivially testable (pure functions over tmpdirs) and concentrates cache-invalidation policy in one place. Bodies are NOT cached even at the registry layer: bodies are short, operator hand-edits are common, and a body cache would require fs-watcher complexity for a benefit that doesn't exist at the entry counts memory operates at (dozens, per spec §3.3).
+- **D2 — Tri-state outcomes everywhere.** `loadScopeIndex` returns `present | absent | malformed`; `readMemoryByName` returns `present | missing | malformed`; `MemoryRegistry.read` returns `present | missing | malformed | unknown`. Two-state (success / error) would conflate "the operator hasn't initialized memory yet" with "their file is corrupted", and the consumer surfaces (UI / tools / audit) need to distinguish: absent is silent, malformed surfaces a warning, missing surfaces the body-gone diagnostic.
+- **D3 — Audit `read` events fire only on successful body loads.** Failed reads (missing / malformed) don't get audit rows. Two reasons: (a) the read didn't actually expose any memory content, so there's nothing the audit needs to track; (b) `memory.not_found` and `memory.body_missing` would otherwise spam the audit log if a model thrashes against a non-existent name. The registry-level `read()` makes the audit decision; the tool just dispatches.
+- **D4 — `source` field on the audit row mirrors the read memory's frontmatter source.** Spec §5.2 says source tracks provenance: `user_explicit` / `inferred` / `imported`. For a `read` event the natural read is "the memory I read was provenance X" — that's what the audit answers. An alternative would be "the source of the read action itself" (always `user_explicit` for the model invoking the tool), but that's redundant with the session_id linkage and loses the provenance signal that matters for trust-boundary forensics (5.4).
+- **D5 — Scope precedence `project_local > project_shared > user`.** Direct from spec §2.4. Implemented as a constant tuple `SCOPE_ORDER` and used by both `list` and `lookup`. The `lookup(name, { scope })` form is strict — no fallback — so a model declaring "I want the shared one specifically" can't be silently shadowed by a local override. Without strict mode the lookup-with-scope would be redundant with the unscoped form and the model couldn't disambiguate.
+- **D6 — `memory_search` defaults to shallow (no body reads).** Spec §11 lists `memory_search(query, scope?)` without distinguishing shallow vs deep. We default to shallow (name + description only) so a model probing "is anything matching?" pays O(1) cost per memory regardless of body size. `deep: true` opts into the O(N) disk scan; the future `/memory audit` and `/memory show --search` paths (5.6) will pass it for forensic queries. Documented in the tool description so the model knows the trade-off.
+- **D7 — Registry `search` short-circuits at limit before deep reads.** Pre-fix the limit check ran AFTER the deep read so a full hit list still spent disk reads on later candidates. Reordering to top-of-loop matches the bash-reaper pattern from 4.2b.iv: bail before doing avoidable work.
+- **D8 — `memory_list` `dedupe_by_name` is opt-in, not default.** A model exploring memory benefits from seeing shadowing explicitly (it learns "the team has a `commit-style` shared, but my local overrides it"). Hiding shadowed entries by default would mask the resolution behavior. Operators consuming the list via the future CLI may want dedup; the flag covers that case without changing the default surface.
+- **D9 — Tool naming: `memory_*` (snake_case), matching the `bash_*` and `todo_write` family.** Models receive the tool name verbatim; consistency keeps the convention learnable. The tool descriptions explicitly say "Substring search ... no fuzziness — this is grep, not vector retrieval" to discourage models from treating `memory_search` as semantic.
+- **D10 — `validateName` in `memory_read` is defense-in-depth.** The registry's `lookup` already rejects unknown names with `null`. But a path-traversal attempt (`../etc/passwd`) would be a "name not found" rather than a "rejected as invalid", which masks the intent. Re-running the validator at the tool boundary surfaces the rejection as `tool.invalid_arg` with the validator's specific error message; the audit log then records the attempt under the right shape.
+- **D11 — `memory.*` error codes, distinct from `tool.*` general codes.** Following the same convention as `bash.timeout`, `glob.pattern_escapes_root`. The discriminated codes let policy / metric layers route memory-specific failures (e.g. "alert when a session sees N consecutive `memory.body_missing`s — operator broke their index").
+- **D12 — `metadata.category: 'misc'` for all three tools.** Same rationale as `todo_write` (todo-write.ts:107): the tools have no fs/network/bash side effects routed through the policy engine. Reads go through the registry's in-memory snapshot + audit table; the policy engine has no per-memory permission concept yet. A future "deny memory read by scope" rule would want a dedicated `memory.read` category, not `fs.read` (memory paths are inside `~/.config/agent/memory/`, not the cwd's fs surface). Defer until policy demand exists.
+
+**Pending / known limitations:**
+
+- **No system prompt injection yet.** Spec §4.1 mandates the memory index be eager in the system prompt with a cache breakpoint after AGENTS.md. This sub-slice (a) does NOT wire that — the model has to invoke `memory_list` explicitly to discover available memories. Practical impact: lower memory-utilization ergonomics until 5.2.c lands. Functional impact: zero — the tools work correctly, the model just doesn't know to call them without prompting. AGENTS.md isn't implemented in this codebase yet either, so there's no anchor for the cache breakpoint anyway; both probably land together.
+- **No CLI surface yet.** `agent --memory list` and `agent --memory show <name>` are 5.2.b. Operators inspect memories today either via the tools (in a session) or via raw `cat ./.agent/memory/local/MEMORY.md`.
+- **Body reads don't cache.** Same memory read 100 times in a session = 100 disk reads + 100 audit rows. Acceptable: bodies are short, audit rows are the contract (every read leaves a trace), and a cache would either need fs-watcher complexity or a per-session window that confuses model-user mental model. If it becomes a hot path the registry can grow a per-session memo with explicit invalidation; defer until measurable.
+- **Search is substring-only, single pass, no ranking.** Spec is explicit: grep, not vector. The hit order is precedence order (local first), then encounter order within scope. No relevance scoring. If two entries match the query, the one in `project_local` always comes first regardless of how strong the match is. Operators wanting BM25-ish ranking would need to reach for ripgrep; defer.
+- **Scope precedence is hard-coded.** No way for an operator to invert (e.g. "user beats local in this run"). Doesn't match any spec or use case yet; mention so the future hook surface knows the constraint.
+- **`memory_search` deep mode pays one disk read per non-matching candidate.** With 50 memories and a name/description match in only the last one, deep mode reads the first 49 bodies. Acceptable for the spec's "dozens of entries" target; if memory grows past a few hundred entries the deep search would benefit from an in-memory body cache (see above).
+
+**Verification:** `bun test` 1575 pass / 10 skip / 0 fail (+62 new across loader, registry, three tool tests, plus the bootstrap snapshot bump and 2 review-driven regression tests for C1/M1); `tsc --noEmit` clean; `biome check` clean. No smoke eval — the tools have no end-to-end LLM coupling yet (`memory_search` and friends only matter once the model can see them via system prompt index, deferred to 5.2.c). The unit + integration coverage exercises every audit path and every error branch.
+
+**Next:** M3 / Step 5.2.b — `agent --memory <verb>` CLI handlers (`list [scope]`, `show <name>`). Independent of bootstrap (no provider needed, mirrors `--checkpoints` / `--worktrees` shape). Then 5.2.c — system prompt assembler that injects the merged memory index header. AGENTS.md integration may bundle into 5.2.c or land separately depending on scope.
+
+---
+
+## [2026-05-01] M3 / Step 5.1 — memory storage primitives (greenfield)
+
+The 4.2 arc closed M3's subagent surface. M3-tail items per
+`AGENTIC_CLI` §13 are MCP, recap, code index, memory. Operator
+prioritized memory next (skipping MCP and code index for now).
+Memory is foundational for context engineering — every session
+loads the per-scope index into the system prompt; without it
+the agent has no cross-session continuity.
+
+This slice (5.1 of 6) lands the storage-layer primitives —
+nothing user-visible yet, but the entire vocabulary the rest of
+the memory subsystem (5.2 read tools, 5.3 write surface, 5.4
+trust integration, 5.5 promote/demote, 5.6 lifecycle) builds
+on. Scope intentionally narrow: types, file format,
+filesystem layout, audit table, and the auto-generated
+`.agent/.gitignore`. No tools, no CLI, no LLM coupling.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/memory/types.ts` | NEW — vocabulary: `MemoryType` (user/feedback/project/reference), `MemorySource` (user_explicit/inferred/imported), `MemoryTrust` (trusted/untrusted), `MemoryScope` (user/project_shared/project_local), `MemoryFrontmatter`, `MemoryFile`, `IndexEntry`. Strict shapes; optional fields preserved as absent (not coerced) on round-trip per `exactOptionalPropertyTypes`. |
+| `src/memory/frontmatter.ts` | NEW — parser/writer for the YAML frontmatter block (re-uses existing `yaml` dep already in package.json for permissions config). Strict validation: name kebab-case `[a-z0-9][a-z0-9_-]*` ≤120 chars, description single-line ≤200 chars, type/source/trust enum-checked, expires `YYYY-MM-DD` shape, triggers kebab-case ≤64 chars. Unknown fields rejected (forward compat: future spec rev with `tags`/`priority` shouldn't silently round-trip-drop). Canonical writer emits fields in spec order regardless of insertion order; serialize re-validates so callers can't smuggle invalid state. CRLF normalized on parse. |
+| `src/memory/index-file.ts` | NEW — `MEMORY.md` per-scope index parser/writer. Entry shape `- [<title>](<href>) — <hook>`; em-dash canonical, ASCII ` - ` accepted as fallback for hand-edited files. `parseIndex` returns entries + `malformedLines` (1-based line numbers) for forensic surfaces; comments/headings (`#`/`>`) and blank lines silently skipped. `serializeIndex` reports `oversizedEntries` (>150 chars per spec §3.2 soft cap) and throws `IndexError` if total lines exceed the 200 hard cap (the storage primitive doesn't pick eviction policy — that lives in 5.2). `upsertIndexEntry`/`removeIndexEntry` are immutable. |
+| `src/memory/paths.ts` | NEW — scope path resolver + write sandbox. `userScopeRoot` honors `XDG_CONFIG_HOME` (per spec convention; falls back to `~/.config`). `projectScopeRoots(repoRoot)` produces `<repoRoot>/.agent/memory/{shared,local}`. `memoryFilePath` validates name then re-resolves the joined path and verifies it sits strictly under the scope root (defense-in-depth even after `validateName` already rejects `..`/separators/leading dots). `scopeOfPath` does the inverse for UI/audit; checks local first so the sub-path doesn't accidentally match shared. Strict prefix check uses `root + sep` so `/cache` doesn't accept `/cache2/`. |
+| `src/memory/gitignore.ts` | NEW — `ensureAgentGitignore(repoRoot)` writes default `.agent/.gitignore` per spec §2.5 on first invocation, never overwrites. Uses `wx` flag so a concurrent agent racing on first init is a no-op rather than a clobber. Defaults: `sessions.db`, `sessions.db-*`, `traces/`, `checkpoints/`, `memory/local/`, `*.log`. |
+| `src/memory/index.ts` | NEW — barrel re-export. |
+| `src/storage/migrations/016-memory-events.ts` | NEW — `memory_events` table per spec §5.3. Columns: id (UUID PK), scope (CHECK), action (CHECK over 9 verbs incl. expired pre-reserved for 5.6), memory_name, source (CHECK), session_id (FK ON DELETE SET NULL — audit survives session purge), cwd, created_at, details (JSON TEXT). Two indexes: partial on `(session_id) WHERE NOT NULL` for the per-session audit feed, composite `(memory_name, created_at DESC)` for the per-memory history view. |
+| `src/storage/migrations/index.ts` | +import + array entry for migration 016. |
+| `src/storage/repos/memory-events.ts` | NEW — `createMemoryEvent`, `listMemoryEventsBySession` (chronological, used by `/memory audit` in 5.6), `listMemoryEventsByName` (most-recent first, optional limit). Defensive `parseDetails` mirrors subagent-outputs/runs convention: malformed JSON surfaces as `null` instead of crashing the listing. |
+| `src/storage/index.ts` | +re-exports for the new repo + types. |
+| `tests/memory/frontmatter.test.ts` | NEW — 24 tests: canonical parse + round-trip, optional field preservation in spec order, empty body, CRLF normalization, all rejection paths (missing fences, invalid type/source/trust, multi-line description, unknown fields, expires shape, bad triggers), `validateName` accept/reject matrix, serializer guard. |
+| `tests/memory/index-file.test.ts` | NEW — 14 tests: em-dash + ASCII separator, comments/headings skipped, malformed-line reporting, CRLF, canonical round-trip, header rendering, empty input, soft-max + hard-cap reporting, upsert/remove immutability. |
+| `tests/memory/paths.test.ts` | NEW — 16 tests: XDG honoring (absolute only — relative ignored), default fallback, scope path construction, traversal rejection via name validation, index file paths, scope-of-path resolution including the local-vs-shared precedence and the sibling-prefix non-match. |
+| `tests/memory/gitignore.test.ts` | NEW — 5 tests: first-call creation, default contents, idempotent re-call, never-overwrite operator-edited file, parent dir auto-create. |
+| `tests/storage/memory-events.test.ts` | NEW — 11 tests: insert + read-back, chronological session feed, recency-ordered name feed with limit, FK SET NULL preservation across session delete, null session/cwd path, three CHECK rejections (scope/action/source), malformed-JSON details surfaces null, all 9 action verbs accepted. |
+
+**Decisions (post-review polish bundled in):**
+
+- **D12 (post-review C1) — `memoryFilePath` resolves BOTH root and candidate before sandbox check.** Pre-review the function only `resolve()`'d the candidate; if a caller passed a non-canonical `repoRoot` (e.g. `/repo/.agent/..`), the unnormalized root prefix wouldn't match the normalized candidate and the sandbox would falsely reject a semantically-correct path. Fix: `resolve(rootForScope(...))` before the prefix comparison. Same fix applied to `scopeOfPath` for symmetry — non-canonical `roots` (trailing slashes, `..` segments) now classify correctly. Defense-in-depth even though `repoRoot` upstream comes from `git rev-parse --show-toplevel` (canonical); the storage layer doesn't get to assume.
+- **D13 (post-review C2) — Comment in `isUnderRoot` was inverted on symlink semantics.** Pre-review: "we don't re-resolve here because that would silently follow symlinks and defeat the sandbox." Wrong: `resolve()` is path-shape normalization (collapses `..`/`.` segments), it does NOT follow symlinks; that's `realpathSync`. Reading the wrong comment would lead future iterations to skip normalization for the wrong reason and re-introduce C1. Rewrote to clarify: `resolve()` normalizes shape, symlink defense is the writer's job (5.3) per the existing worktree-validator pattern.
+- **D14 (post-review M1) — Misleading comment in `listMemoryEventsBySession` rewritten.** Pre-review said purged-session rows "drop out via the SET NULL FK", which conflates "row is excluded by the WHERE clause" with "row is deleted". Clarified: rows survive (FK SET NULL preserves audit history); the per-session filter excludes them, but they remain reachable via `listMemoryEventsByName`.
+- **D15 (post-review M2) — Index-file parser security contract documented.** The `ENTRY_RE` regex accepts any non-paren content as `href`, so a malicious or hand-mangled MEMORY.md could embed `../../../etc/passwd`. Risk is currently zero because the storage layer doesn't compute paths from hrefs (5.2 lazy-loader uses `memoryFilePath(scope, name)` from a name-keyed map), but the contract was implicit and a future caller could regress. Added a SECURITY CONTRACT block to the file header making the rule explicit: callers MUST resolve paths via `memoryFilePath`, never by joining `entry.href`. The writer (5.4+) emits canonical `href = "${name}.md"` so agent-driven rewrites converge toward safe state.
+
+- **D1 — Markdown body + SQLite audit, never the inverse.** Spec §5.3 is explicit: "Conteúdo das memórias **não vai pro SQLite** — fica em arquivo. SQLite só rastreia eventos." Memory content stays diffable/grep'able/git-trackable; the DB only records who/when/why an event happened. This is the line that separates the design from a vector-DB redo (`ANTI_PATTERNS` §2.2). Migration 016 enforces it: there's no `body` or `content` column anywhere.
+- **D2 — Strict `name` kebab-case at the storage boundary.** Spec line 220 says "kebab-case, único no scope" but a few earlier examples informally show `name: user role` with a space. The storage layer must pick one — going strict (`^[a-z0-9][a-z0-9_-]*$`) so the `name` doubles as the filename basename without escaping, and the index can quote it without ambiguity. If an operator wants a pretty title, they put it in `description`. The frontmatter's `name` is identity, not display.
+- **D3 — Unknown frontmatter fields are hard errors, not silently dropped.** Forward-compat hazard: a future spec adds `tags`. An older binary parses the file, discards the unknown field, and writes back without it — silent data loss. Failing loud forces the operator to upgrade or hand-edit the field out. The cost (hard error on legitimate operator typos) is acceptable because frontmatter mistakes should always surface visibly.
+- **D4 — Optional fields stay absent on round-trip, not coerced to defaults.** `trust` omitted on input means `trust` omitted on output. The decision logic ("absent ⇒ trusted") lives in the read-side consumer (5.4), not the parser. This keeps the file format minimal — operators reading the file can see the actual frontmatter, not a serializer-injected default. Aligns with `exactOptionalPropertyTypes` strictness.
+- **D5 — Sandbox is two-layered.** `validateName` blocks 99% of attacks (no separators, no `..`, no leading dot, kebab-case only). The post-resolve `isUnderRoot` check is defense-in-depth: if a future change ever loosens `validateName`, the sandbox still catches the escape. Same posture as the worktree gc cache-root scoping (§4.2d D7).
+- **D6 — `expired` action verb pre-reserved.** Adding it to the CHECK clause in migration 016 costs nothing and avoids a follow-up migration when 5.6 lands the lifecycle pass. The repo helpers in 5.1 don't emit it yet — it's just reserved vocabulary. Same pattern as the two-pass M3 staging that pre-allocated `policy_snapshot` before 4.2b.ii actually used it.
+- **D7 — `session_id` is FK ON DELETE SET NULL, not CASCADE.** Audit history outlives the session that produced it. After session purge ("rotate out sessions older than 90d"), the audit row stays so operators can still answer "this memory was created via inferred write at this time" — they just lose the link to the originating session. CASCADE would silently delete audit history on a routine cleanup, which defeats the audit's purpose. Same rationale as `subagent_runs` keeping rows after parent session deletion.
+- **D8 — No content column in `memory_events.details`.** The temptation: stash the body alongside the event so `/memory audit` can show "what changed". Resisted: bodies live in markdown files, git tracks shared changes, and inferred writes ship a content hash in `details` (5.3) for forensic traceability without duplicating bytes. If the operator wants to see what the body was, they `git show <commit>:.agent/memory/shared/<name>.md`.
+- **D9 — `MEMORY.md` is canonical state owned by the agent, NOT preserve-prose-on-write.** The parser silently drops non-entry lines (other than `#`/`>` headings and blanks); the writer regenerates clean. Operator prose belongs in individual memory bodies, where it's properly framed by frontmatter. An "ambient comment" in the index would have nowhere durable to live.
+- **D10 — `userScopeRoot` honors XDG_CONFIG_HOME but ignores XDG_DATA_HOME.** Memory is curated config, not generated data. The spec path `~/.config/agent/memory/` aligns with config; routing it through `defaultDataDir()` (which uses XDG_DATA_HOME and `~/.local/share`) would put memory under the same root as `sessions.db` — convenient for one-tarball backups but semantically wrong, and the spec is explicit about the path. We also ignore relative XDG values (specs say MUST be absolute) rather than silently normalizing.
+- **D11 — Em-dash is canonical separator; ASCII fallback accepted on read only.** Spec uses `—` consistently. We emit it on write; we accept ` - ` (space-hyphen-space) on read because operators editing by hand on a US keyboard rarely have `—` at fingertips, and the alternative (fail-on-parse) creates user friction in a primary edit path. Round-tripping converts `-` to `—`, which is harmless — the index is regenerated from canonical state on every write anyway.
+
+**Pending / known limitations:**
+
+- **No tools / CLI / context injection yet.** This slice is purely the storage layer. `memory_read`/`memory_list`/`memory_search` arrive in 5.2; the eager-index injection into the system prompt (cache breakpoint after AGENTS.md) also lives in 5.2.
+- **No write surface yet.** `memory_write`, the TUI confirmation prompt, the injection scanner (heuristic + secret-pattern detection), and the headless-mode rejection all land in 5.3.
+- **No trust integration yet.** `trust: untrusted` frontmatter is parsed and round-tripped; the read-side gate that excludes untrusted memories from the base context arrives in 5.4 alongside the trust-prompt encadeamento, the hash-of-source recording, and the `MemoryWrite` hook.
+- **No promote/demote.** 5.5 wires `/memory promote shared|user` and `/memory demote local` with the additional secret/injection scanner.
+- **No lifecycle pass.** 5.6 ships expiry sweep, default `+90d` for project-scope inferred memories, `verify-before-act` helper, `/memory expire`, `/memory diff`, `/memory audit`.
+- **Filename convention is operator's responsibility.** Spec examples show type-prefixed filenames (`feedback_commit_style.md`, `user_role.md`); we keep this as a convention the operator follows when picking `name` (e.g. operator picks `feedback-commit-style`, file becomes `feedback-commit-style.md`). Forcing a type prefix would require the storage layer to read the frontmatter `type` to compute the path, creating a chicken-and-egg with the writer.
+
+**Verification:** `bun test` 1513 pass / 10 skip / 0 fail (+85 new across the five test files including 3 review-driven regression tests for non-canonical roots); `tsc --noEmit` clean; `biome check` clean. No production code reads memory yet, so no smoke eval — adds in 5.2 when the eager-index injection lands.
+
+**Next:** M3 / Step 5.2 — read-only surface. Resolve the three scopes per cwd, merge indexes (precedence local > shared > user), inject the merged index into the system prompt with a cache breakpoint after AGENTS.md, ship `memory_read` (lazy load with audit `read` event), `memory_list` (returns scoped summaries), `memory_search` (grep over bodies, no vector — `ANTI_PATTERNS` §2.2), and `/memory list` + `/memory show` slash commands.
+
+---
+
 ## [2026-04-30] M3 / Step 4.2d — `agent --worktrees` operator surface (gc + list)
 
 The 4.2b arc landed full subagent worktree lifecycle (create, isolate,
