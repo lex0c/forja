@@ -113,6 +113,21 @@ export interface ParsedArgs {
   // colliding with the parent's bg state. Undefined when the
   // flag is absent (older parents, tests).
   subagentBgLogDir?: string;
+  // Internal: parent's cwd carried across the subprocess boundary
+  // so the child's MemoryRegistry uses the parent's memory tree
+  // (project_local + project_shared anchored at the parent's
+  // repo) rather than the worktree's. Memory is per-repo
+  // logically, not per-worktree — a worktree-isolated subagent
+  // shouldn't lose access to project_local just because its cwd
+  // is the cache directory. The child resolves
+  // `resolveScopeRoots(<this path>)` to anchor roots, but anchors
+  // audit `cwd` events to its own session.cwd so forensic
+  // queries can distinguish "where the read happened" from
+  // "which project the memory belongs to". Undefined when the
+  // flag is absent (older parents, in-process tests, or
+  // operator-driven `--subagent-session-id` invocations without
+  // a parent runtime to set it).
+  subagentMemoryCwd?: string;
 }
 
 export interface ParseError {
@@ -454,6 +469,20 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
           };
         }
         args.subagentBgLogDir = value;
+        i += 2;
+        break;
+      }
+      case '--subagent-memory-cwd': {
+        const value = argv[i + 1];
+        // Same guard as --subagent-bg-log-dir — flag-shaped
+        // values would silently swallow the next flag.
+        if (value === undefined || value.length === 0 || value.startsWith('--')) {
+          return {
+            ok: false,
+            message: '--subagent-memory-cwd requires a directory path (internal flag)',
+          };
+        }
+        args.subagentMemoryCwd = value;
         i += 2;
         break;
       }

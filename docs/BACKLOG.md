@@ -15,6 +15,65 @@ Format:
 
 ---
 
+## [2026-05-01] M3 / Step 5.2 follow-up — wire memory access for subagents
+
+The 5.2 read arc shipped with `memoryRegistry` undefined in
+subagent runs — the holistic review (post-5.2.c) pinned this as
+inconsistent: `memory_*` tools appeared in the subagent's tool
+schema (because BUILTIN_TOOLS is global) but at runtime returned
+`memory.registry_unavailable`, AND the subagent's system prompt
+had no memory section. Modelo subagente recebia tools no schema,
+descobria em runtime que não funcionavam. Confused state.
+
+Architectural decision: subagents SHOULD have read access to the
+parent's memory tree. Spec §11 says "stateless tasks" but that
+means "no carry-over between invocations of the same subagent",
+not "no read access to operator-curated cross-session context".
+Reference / shared-feedback / project memories are exactly the
+kind of operator-curated knowledge any task class benefits from.
+Withholding forces the parent to re-inject conventions via
+prompt — defeating the whole point of cross-session memory.
+
+Write side (5.3) stays restricted to the parent: subagent's
+future `memory_write` will refuse the same way `--allow-memory-write`
+opt-out works headless, because confirmation must be the parent's
+loop, not the subagent's.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/cli/args.ts` | New internal flag `--subagent-memory-cwd <path>` mirroring the `--subagent-bg-log-dir` pattern. Same flag-shape guard rejecting empty / `--`-prefixed values. New `args.subagentMemoryCwd?: string` field. |
+| `src/subagents/runtime.ts` | `SpawnChildProcessOptions` gains `memoryCwd?: string`; `defaultSpawnChildProcess` forwards via `--subagent-memory-cwd`. The runtime passes `input.cwd` (the parent's cwd, which is the parent's repo root for both worktree and non-worktree subagents — the subagent's own cwd may be a worktree path that's missing project_local) so the child's registry resolves to the same scope roots the parent saw. |
+| `src/cli/subagent-child.ts` | `SubagentChildOptions` gains `memoryCwd?: string`. When set, the child constructs `MemoryRegistry({ roots: resolveScopeRoots(memoryCwd), db, sessionId, cwd: session.cwd })` and threads it into HarnessConfig. The `roots` anchor at the parent's repo (correct memory tree); the registry's `cwd` field anchors at the child's session.cwd so audit emissions show "where the read happened" (worktree path) instead of conflating with "which project's memory" (parent's repo). System prompt resolution composes `audit.systemPrompt + memorySection` via the same `composeSystemPrompt` helper bootstrap uses — same shape, same `# Memory` header, same dedup-by-name semantics. When omitted, falls through to the existing path: registry undefined, system prompt = audit verbatim, tools surface `registry_unavailable`. |
+| `src/cli/index.ts` | Forwards `args.subagentMemoryCwd` into `runSubagentChild` opts via the same conditional-spread pattern as the other subagent flags. |
+| `tests/cli/args.test.ts` | +3 tests on `--subagent-memory-cwd` parsing: capture, flag-shape rejection, empty-value rejection. |
+| `tests/cli/subagent-child.test.ts` | +2 integration tests with a recording provider that captures `req.system`. First: subagent in a worktree-path cwd, parent's memory under a different cwd, with `memoryCwd: parentRepo` — assert system prompt contains both `You are explore.` (audit) AND `# Memory` + `[project_local] role` (memory section). XDG_CONFIG_HOME isolated to parentRepo so user scope doesn't leak. Second: same setup but `memoryCwd` omitted — system prompt is the audit snapshot verbatim, no `# Memory`, registry stays undefined. |
+
+**Decisions (post-review polish bundled in):**
+
+- **D6 (post-review S1) — Whitelist-gated memory injection.** Pre-review the section was injected unconditionally whenever `memoryCwd` was forwarded — which is always in production. Problem: a subagent definition with `tools: [read_file]` (no memory_*) STILL got the `# Memory ... use memory_read ...` block in its system prompt, advertising tools the model couldn't call AND inflating the prompt by up to ~2k tokens of irrelevant index. Lean subagents got fat for no reason. Added `wantsMemory = audit.toolsWhitelist.some(t => t.startsWith('memory_'))` gate; registry construction + section injection both fire only when the gate passes. Updated the existing happy-path test to add `memory_read` to its whitelist (so it actually exercises the integration), and added a new counterfactual test confirming subagents with `tools: ['read_file']` don't see the memory section even when `memoryCwd` is forwarded.
+
+**Decisions:**
+
+- **D1 — `roots` from parent's cwd, audit `cwd` from child's session.cwd.** Two distinct anchors. The roots determine WHICH memory tree to read; the audit cwd records WHERE the read happened. For non-worktree subagents both equal the parent's cwd (no observable difference). For worktree subagents the audit row shows the worktree path while the memory comes from the parent's repo — forensic queries can answer "what worktree path triggered this read?" AND "which project's memory was exposed?" without conflation.
+- **D2 — `input.cwd` (the parent's cwd) is the right `memoryCwd` value.** `runSubagent` receives `input.cwd` from the parent's harness — that's the PARENT's session.cwd, which IS the repo root. The child's `childCwd` may be a worktree path. Passing the parent's cwd keeps memory consistent: same project_local + project_shared the parent sees, regardless of whether the child is isolated.
+- **D3 — Memory section appended to `audit.systemPrompt`, not to a fresh prompt.** The audit snapshot was captured at definition-load and reflects the subagent's identity prompt + parent policy snapshot. Memory section is dynamic per-run. `composeSystemPrompt(audit.systemPrompt, memorySection.text)` puts memory after — same convention as bootstrap (memory after caller-supplied / plan prompt).
+- **D4 — Whitelist still gates which subagents see memory tools.** A subagent definition that doesn't list `memory_read` etc. in its `tools:` whitelist won't have them, period. Default-on with opt-out via whitelist is the right shape because operator-curated subagent definitions ARE the trust boundary; they decide what their agents can do.
+- **D5 — Write side intentionally NOT enabled here.** When 5.3 lands `memory_write`, the subagent's invocation must always reject (same as headless mode per spec §5.6). Subagent proposing memory writes is a injection vector — operator can't confirm interactively because the subagent loop is fire-and-forget from the parent's perspective. The wiring scaffolds READ only; write surface in 5.3 will explicitly check "is this a subagent session?" via session.isSubagent and refuse.
+
+**Pending / known limitations:**
+
+- **Subagent memory section is computed at child startup.** Dynamic in the sense that it reflects the live registry state when the child boots. If the parent writes a memory mid-run AFTER spawning the subagent, the running subagent doesn't see the new entry until next spawn. Acceptable: spec §4.1 mandates per-session stability; subagent IS its own session.
+- **No way to disable per subagent definition.** A subagent author that wants their subagent to run with NO memory access (for reproducibility / hermeticity reasons) can drop `memory_*` from the whitelist, but the system prompt section still appears. Adding a `memory: 'disabled'` field in the subagent definition frontmatter would close this; defer until demand exists.
+- **Trust filter still missing** (5.4 owns). When 5.4 lands, the subagent's view should also exclude untrusted memories — the registry's filter already runs uniformly so subagents inherit the gate for free.
+
+**Verification:** `bun test` 1619 pass / 10 skip / 0 fail (+6 new: 3 args parsing + 2 child integration + 1 review-driven counterfactual for the lean-subagent gate); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** With this follow-up, the read-only arc is operationally complete AND consistent across top-level + subagent runs. Branch ready for PR. Write surface (5.3) stays parked until TUI scaffolding (M4 / Ink) lands.
+
+---
+
 ## [2026-05-01] M3 / Step 5.2 follow-up — close audit gap on memory_search deep-body matches
 
 Holistic review of the 5.1+5.2 arc surfaced one issue that

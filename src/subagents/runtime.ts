@@ -188,6 +188,19 @@ export interface SpawnChildProcessOptions {
   // the current design — every subagent gets one — but the
   // optional shape leaves room for tests that want to skip it).
   bgLogDir?: string;
+  // Parent's cwd, threaded across so the child can build a
+  // MemoryRegistry anchored at the parent's repo. Memory is
+  // per-repo logically (project_local + project_shared), not
+  // per-worktree — a worktree-isolated subagent that resolved
+  // memory from its own cwd (a cache directory) would lose
+  // access to project_local entirely (gitignored, never copied
+  // to worktrees). Forwarding the parent's cwd via
+  // `--subagent-memory-cwd` lets the child resolve roots from
+  // the right anchor while still recording its own session.cwd
+  // on every audit row. Undefined disables memory wiring (tests,
+  // older callers); the child surfaces `memory.registry_unavailable`
+  // on tool calls.
+  memoryCwd?: string;
 }
 
 export type SpawnChildProcess = (opts: SpawnChildProcessOptions) => ChildProcessHandle;
@@ -284,6 +297,9 @@ const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
   }
   if (opts.bgLogDir !== undefined) {
     appendArgs.push('--subagent-bg-log-dir', opts.bgLogDir);
+  }
+  if (opts.memoryCwd !== undefined) {
+    appendArgs.push('--subagent-memory-cwd', opts.memoryCwd);
   }
   const cmd = resolveChildBinaryCmd({
     argv: Bun.argv,
@@ -1174,6 +1190,13 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       cwd: childCwd,
       depth,
       bgLogDir,
+      // Memory anchor — parent's cwd, not childCwd. Worktree-
+      // isolated subagents have a cache-directory cwd that
+      // doesn't carry the parent's project_local subtree
+      // (gitignored, never replicated to worktrees). Using the
+      // parent's cwd keeps the child's view consistent with the
+      // parent's: same shared, same local, same user scope.
+      memoryCwd: input.cwd,
       ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
       ...(input.planMode === true ? { planMode: true } : {}),
     });

@@ -649,6 +649,316 @@ You are the worker.`,
     expect(recordedRequests[0]?.temperature).toBe(0);
   });
 
+  test('memoryCwd anchors the registry at the parent repo even for worktree-cwd children', async () => {
+    // Subagent runs in a worktree (different cwd from parent's
+    // repo). Without memoryCwd forwarding, the child would build
+    // its registry from the worktree path and miss project_local
+    // (gitignored, never replicated). With it, the child sees
+    // the parent's memory tree intact AND the audit row anchors
+    // to the child's session.cwd.
+    const fs = await import('node:fs');
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    // Two distinct cwds: parent_repo holds the memory tree; the
+    // child's session.cwd points at a "worktree" subdirectory.
+    const parentRepo = mkdtempSync(join(tmpdir(), 'forja-mem-parent-'));
+    const worktreeCwd = mkdtempSync(join(tmpdir(), 'forja-mem-worktree-'));
+    // Isolate user scope under the parent repo so the dev's real
+    // ~/.config/agent/memory/ doesn't bleed in.
+    const originalXdg = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = parentRepo;
+    try {
+      // Seed parent's project_local memory.
+      const localDir = join(parentRepo, '.agent', 'memory', 'local');
+      fs.mkdirSync(localDir, { recursive: true });
+      fs.writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — full-stack TS dev\n');
+      fs.writeFileSync(
+        join(localDir, 'role.md'),
+        '---\nname: role\ndescription: hook\ntype: user\nsource: user_explicit\n---\n\nbody\n',
+      );
+
+      let childId: string;
+      const db = openDb(dbPath);
+      try {
+        migrate(db);
+        const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: parentRepo });
+        const child = sessionsRepo.createSession(db, {
+          model: 'mock/m',
+          cwd: worktreeCwd,
+          parentSessionId: parent.id,
+        });
+        childId = child.id;
+        subagentRunsRepo.insertSubagentRun(db, {
+          sessionId: child.id,
+          name: 'explore',
+          scope: 'project',
+          sourcePath: '/fake/explore.md',
+          sourceSha256: 'a'.repeat(64),
+          systemPrompt: 'You are explore.',
+          // Whitelist must include at least one memory_* tool for
+          // the registry construction + section injection to fire
+          // (S1 fix: lean subagents without memory access don't
+          // get the prompt bloat).
+          toolsWhitelist: ['memory_read'],
+          budgetMaxSteps: 5,
+          budgetMaxCostUsd: 0.1,
+        });
+        messagesRepo.appendMessage(db, {
+          sessionId: child.id,
+          role: 'user',
+          content: 'go',
+        });
+      } finally {
+        db.close();
+      }
+
+      const recordedSystem: Array<string | undefined> = [];
+      const recordingProvider: Provider = {
+        id: 'mock/m',
+        family: 'anthropic',
+        capabilities: {
+          tools: 'native',
+          cache: false,
+          vision: false,
+          streaming: true,
+          constrained: 'tools',
+          context_window: 1000,
+          output_max_tokens: 100,
+          cost_per_1k_input: 0,
+          cost_per_1k_output: 0,
+          notes: [],
+        },
+        async *generate(req): AsyncGenerator<StreamEvent> {
+          recordedSystem.push(req.system);
+          yield { kind: 'start', message_id: 'mock-msg' };
+          yield { kind: 'text_delta', text: 'done' };
+          yield { kind: 'stop', reason: 'end_turn' };
+        },
+        generateConstrained: () => Promise.reject(new Error('n/a')),
+        countTokens: () => Promise.resolve(0),
+      };
+
+      const exitCode = await runSubagentChild({
+        sessionId: childId,
+        dbPath,
+        providerOverride: recordingProvider,
+        userAgentsDir: null,
+        projectAgentsDir: null,
+        memoryCwd: parentRepo,
+        errSink: () => undefined,
+      });
+      expect(exitCode).toBe(0);
+      // System prompt must include both the audit's identity
+      // prompt AND the memory section anchored at the parent's
+      // memory tree.
+      expect(recordedSystem.length).toBeGreaterThan(0);
+      const sys = recordedSystem[0];
+      expect(sys).toContain('You are explore.');
+      expect(sys).toContain('# Memory');
+      expect(sys).toContain('[project_local] role — full-stack TS dev');
+    } finally {
+      if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = originalXdg;
+      try {
+        rmSync(parentRepo, { recursive: true, force: true });
+      } catch {}
+      try {
+        rmSync(worktreeCwd, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+
+  test('whitelist without memory_* tools skips the section even when memoryCwd is forwarded (regression: S1)', async () => {
+    // Lean-subagent guard: a subagent that only lists `read_file`
+    // in its whitelist has no way to invoke memory_read /
+    // memory_list / memory_search. Injecting the memory section
+    // would advertise tools the model can't call AND inflate the
+    // prompt with up to ~2k tokens of irrelevant index. The
+    // injection must fire only when the whitelist includes at
+    // least one memory_* tool.
+    const fs = await import('node:fs');
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    const parentRepo = mkdtempSync(join(tmpdir(), 'forja-mem-skip-'));
+    const originalXdg = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = parentRepo;
+    try {
+      // Memory IS present in the parent's tree — but the
+      // subagent's whitelist excludes memory tools, so it must
+      // NOT see the section.
+      const localDir = join(parentRepo, '.agent', 'memory', 'local');
+      fs.mkdirSync(localDir, { recursive: true });
+      fs.writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — TS dev\n');
+
+      let childId: string;
+      const db = openDb(dbPath);
+      try {
+        migrate(db);
+        const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: parentRepo });
+        const child = sessionsRepo.createSession(db, {
+          model: 'mock/m',
+          cwd: parentRepo,
+          parentSessionId: parent.id,
+        });
+        childId = child.id;
+        subagentRunsRepo.insertSubagentRun(db, {
+          sessionId: child.id,
+          name: 'explore',
+          scope: 'project',
+          sourcePath: '/fake/explore.md',
+          sourceSha256: 'a'.repeat(64),
+          systemPrompt: 'You are explore.',
+          // No memory tools — only read_file.
+          toolsWhitelist: ['read_file'],
+          budgetMaxSteps: 5,
+          budgetMaxCostUsd: 0.1,
+        });
+        messagesRepo.appendMessage(db, {
+          sessionId: child.id,
+          role: 'user',
+          content: 'go',
+        });
+      } finally {
+        db.close();
+      }
+
+      const recordedSystem: Array<string | undefined> = [];
+      const recordingProvider: Provider = {
+        id: 'mock/m',
+        family: 'anthropic',
+        capabilities: {
+          tools: 'native',
+          cache: false,
+          vision: false,
+          streaming: true,
+          constrained: 'tools',
+          context_window: 1000,
+          output_max_tokens: 100,
+          cost_per_1k_input: 0,
+          cost_per_1k_output: 0,
+          notes: [],
+        },
+        async *generate(req): AsyncGenerator<StreamEvent> {
+          recordedSystem.push(req.system);
+          yield { kind: 'start', message_id: 'mock-msg' };
+          yield { kind: 'text_delta', text: 'done' };
+          yield { kind: 'stop', reason: 'end_turn' };
+        },
+        generateConstrained: () => Promise.reject(new Error('n/a')),
+        countTokens: () => Promise.resolve(0),
+      };
+
+      const exitCode = await runSubagentChild({
+        sessionId: childId,
+        dbPath,
+        providerOverride: recordingProvider,
+        userAgentsDir: null,
+        projectAgentsDir: null,
+        // memoryCwd IS forwarded, but the whitelist gate above
+        // suppresses the injection.
+        memoryCwd: parentRepo,
+        errSink: () => undefined,
+      });
+      expect(exitCode).toBe(0);
+      expect(recordedSystem.length).toBeGreaterThan(0);
+      const sys = recordedSystem[0];
+      expect(sys).toBe('You are explore.');
+      expect(sys).not.toContain('# Memory');
+    } finally {
+      if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = originalXdg;
+      try {
+        rmSync(parentRepo, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+
+  test('memoryCwd absent leaves the child without memory wiring (registry_unavailable)', async () => {
+    // Older parent / direct invocation that didn't forward
+    // memoryCwd: the child runs without the registry, system
+    // prompt is the audit snapshot verbatim, no memory section.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    let childId: string;
+    const db = openDb(dbPath);
+    try {
+      migrate(db);
+      const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+      const child = sessionsRepo.createSession(db, {
+        model: 'mock/m',
+        cwd: dbDir,
+        parentSessionId: parent.id,
+      });
+      childId = child.id;
+      subagentRunsRepo.insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'project',
+        sourcePath: '/fake/explore.md',
+        sourceSha256: 'a'.repeat(64),
+        systemPrompt: 'You are explore.',
+        toolsWhitelist: [],
+        budgetMaxSteps: 5,
+        budgetMaxCostUsd: 0.1,
+      });
+      messagesRepo.appendMessage(db, {
+        sessionId: child.id,
+        role: 'user',
+        content: 'go',
+      });
+    } finally {
+      db.close();
+    }
+
+    const recordedSystem: Array<string | undefined> = [];
+    const recordingProvider: Provider = {
+      id: 'mock/m',
+      family: 'anthropic',
+      capabilities: {
+        tools: 'native',
+        cache: false,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 1000,
+        output_max_tokens: 100,
+        cost_per_1k_input: 0,
+        cost_per_1k_output: 0,
+        notes: [],
+      },
+      async *generate(req): AsyncGenerator<StreamEvent> {
+        recordedSystem.push(req.system);
+        yield { kind: 'start', message_id: 'mock-msg' };
+        yield { kind: 'text_delta', text: 'done' };
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+
+    const exitCode = await runSubagentChild({
+      sessionId: childId,
+      dbPath,
+      providerOverride: recordingProvider,
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      // No memoryCwd — simulates older parent or programmatic
+      // caller that didn't forward.
+      errSink: () => undefined,
+    });
+    expect(exitCode).toBe(0);
+    expect(recordedSystem.length).toBeGreaterThan(0);
+    const sys = recordedSystem[0];
+    expect(sys).toBe('You are explore.');
+    expect(sys).not.toContain('# Memory');
+  });
+
   test('temperature undefined → provider request has no temperature pin', async () => {
     // Counterpart: when the parent didn't pin a temperature,
     // the harness should leave req.temperature undefined so the

@@ -570,6 +570,27 @@ describe('--worktrees', () => {
   });
 });
 
+describe('--subagent-memory-cwd', () => {
+  test('captures the path value', () => {
+    const r = parseArgs(['--subagent-session-id', 'abc', '--subagent-memory-cwd', '/repo/parent']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentMemoryCwd).toBe('/repo/parent');
+  });
+
+  test('rejects flag-shaped values', () => {
+    const r = parseArgs(['--subagent-memory-cwd', '--subagent-depth', '2']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--subagent-memory-cwd');
+  });
+
+  test('rejects empty value', () => {
+    const r = parseArgs(['--subagent-memory-cwd', '']);
+    expect(r.ok).toBe(false);
+  });
+});
+
 describe('--memory', () => {
   test('captures verb + scope positional for list', () => {
     const r = parseArgs(['--memory', 'list', 'user']);
