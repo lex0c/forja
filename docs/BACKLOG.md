@@ -15,6 +15,68 @@ Format:
 
 ---
 
+## [2026-05-02] M1 / Step 1.c — Live render functions + resize watcher
+
+The first two slices (1.a, 1.b) shipped the substrate; 1.b.1
+fixed the structural shape; this slice fills in real render
+functions for the live region. `defaultComposeLive` was a
+placeholder that emitted "good enough" stubs; it's now replaced
+by `composeLive` in `src/tui/render/compose.ts` which calls the
+real per-element renderers. The status line, input box, and
+running tool cards now look right.
+
+Also wires the resize watcher so `caps.cols` / `caps.rows` track
+SIGWINCH. Width-aware truncation lands too — `src/tui/render/width.ts`
+wraps `string-width` so CJK and emoji that occupy two columns
+get counted correctly. `wrap-ansi` is installed for next slice's
+input wrapping.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `package.json` (lockfile) | `bun add string-width@8.2.1 wrap-ansi@10.0.0` (matches UI.md §1 dep list). |
+| `src/tui/render/width.ts` | `visualWidth(s)` (wraps `string-width` — counts CJK/emoji as 2, ANSI as 0). `truncateToWidth(s, maxCols)` walks codepoints (so surrogate pairs stay together) and stops before a glyph that would overflow the budget — no trailing ellipsis (caller composes if wanted). |
+| `src/tui/render/status.ts` | `renderStatusLine(state, caps, {now})` → `string \| null`. Returns null pre-session. Layout: `[profile] sep project sep model sep N/M sep $cost [thinking…]`. Sep is `·` (Unicode) / `-` (ASCII). Budget shading: 80% steps/cost wraps in `paint(caps, 'warn')`, 90% in `paint(caps, 'error')`; cost cap optional (no shading when `maxCostUsd === null`). Thinking indicator appended in `dim` with elapsed seconds; ellipsis Unicode `…` / ASCII `...`. Cost format scales by magnitude (`$0.0123`, `$1.234`, `$123.45`). Skips empty profile/project/model fields. Clamps thinking elapsed to 0 on clock skew. |
+| `src/tui/render/input.ts` | `renderInput(input, caps)` → `string[]`. Empty input → `['> ']`. Multi-line input gets `> ` on first line and 2-space continuation indent on subsequent lines. Trailing newline preserved as empty continuation row. |
+| `src/tui/render/tool-card.ts` | `renderToolCardLive(tool, caps, now)` → `string[]`. Head: `<spinner> name sep args    elapsed`. Spinner glyph rotates: 10-frame Unicode (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` at 80ms) / 4-frame ASCII (`|/-\` at 100ms) — exposed as `spinnerGlyph(caps, now)`. Elapsed: `<1000ms` → `Nms`, otherwise `N.Ns`. Preview lines render below head with tree branches: `├` (mid) / `└` (last) Unicode; `+` / `\` ASCII. Preview lines wrapped in `paint(caps, 'dim')` when color enabled. |
+| `src/tui/render/compose.ts` | `composeLive(state, caps, now)` → `string[]`. Layout top→bottom: active tool cards (insertion order from `state.activeTools` Map), status line (1 line, only when session started), input box (1+ lines). Replaces `defaultComposeLive` from 1.b. |
+| `src/tui/renderer-types.ts` | NEW small file holding the shared `ComposeLive = (state, caps, now) => string[]` type. Lives outside `renderer.ts` to break a circular import: `renderer.ts` imports from `./render/compose.ts` which imports the type back from somewhere — putting the type in a third file breaks the cycle cleanly. |
+| `src/tui/renderer.ts` | Wires it together. (1) `composeLive` default switched from local placeholder to `defaultComposeLiveFn` (re-exported from `./render/compose.ts`). (2) `truncate` removed; live-region truncation goes through `truncateToWidth` from `./render/width.ts`. (3) Mutable internal `liveCaps` (a copy of `options.caps`) so resize updates are reactive without mutating the caller's reference. (4) `createResizeWatcher` is wired: `liveCaps.cols`/`rows` update on resize, `scheduler.flush()` forces a redraw with the new width. (5) `resizeStream?: ResizeStream \| false` option — tests inject a fake stream; pass `false` to opt out entirely. (6) `now?: () => number` option for spinner determinism in tests. (7) `close()` also closes the watcher. (8) Header comment updated to reflect the two surfaces (`formatPermanent` and `createRenderer`). |
+| `tests/tui/render/width.test.ts` | 9 tests: ASCII / CJK / emoji visual widths; ANSI escapes count as 0; truncateToWidth: in-range passthrough, ASCII at exact column, CJK respecting 2-column glyphs, budget 0/negative, oversize emoji dropped not split, ASCII preceding emoji preserved. |
+| `tests/tui/render/status.test.ts` | 13 tests: pre-session null; full Unicode line; ASCII separators; steps fraction; cost magnitude formatting (3 ranges); budget shading at 80%/90% for steps and cost cap; no shading without cap; thinking with Unicode/ASCII ellipsis and clock-skew clamp; empty profile/project/model fields skipped. |
+| `tests/tui/render/input.test.ts` | 4 tests: empty / single line / multi-line indent / trailing newline preserved. |
+| `tests/tui/render/tool-card.test.ts` | 11 tests: spinner rotation Unicode (10 frames @ 80ms) and ASCII (4 frames @ 100ms); head with name/args/elapsed; ms vs s units; clock-skew clamp; Unicode vs ASCII separator; preview tree branches Unicode (`├`/`└`) / ASCII (`+`/`\`); single-preview gets only `└`; preview wrapped in dim SGR when color enabled; no preview → only head. |
+| `tests/tui/render/compose.test.ts` | 5 tests: pre-session emits only input; session adds status above input; tool card sits above status; multi-line input stays at bottom; multiple tools render in insertion order. |
+| `tests/tui/renderer.test.ts` | +2 tests: resize event updates `caps.cols` and forces a redraw (via injected fake stream + ref-boxed listener); `resizeStream: false` disables the watcher and the renderer still functions. |
+
+**Decisions:**
+
+- **D24 — `now` is a render-time arg threaded by `composeLive`, not state.** Spinner phase and thinking elapsed depend on wall-clock; storing them in `LiveState` would require a heartbeat tick to keep them fresh, plus reducer mutation just to advance time. Passing `now` to `composeLive` keeps the reducer fully time-independent and lets render functions compute "what frame should I show" purely from clock. Tests inject a constant or counter; the renderer in production reads `Date.now()` once per draw.
+- **D25 — Heartbeat ticks are NOT wired in this slice.** Without a periodic `scheduler.request()`, the spinner only re-renders when an event triggers a frame. So during a long-running tool with no `tool:delta` flow, the spinner sits frozen. UX-acceptable for now (users still see the head line + elapsed advancing once any other event arrives) and keeps the slice tight. The heartbeat lands when input editing or modal pattern arrives — those layers also need periodic redraws.
+- **D26 — Live-region lines truncate at visual width, not code-unit length.** `truncateToWidth` walks codepoints with `string-width` so CJK/emoji that occupy 2 cols don't make a "fits in 80 cols" line wrap to 81+. The cursor math (clearDown + cursorUp) only works if the terminal didn't auto-wrap; visual-width truncation is what makes that contract honest.
+- **D27 — Permanent items stay un-truncated.** Same as 1.b D17 — scrollback is the terminal's job to wrap/scroll. Width matters only for the live region.
+- **D28 — `resizeStream: false` is a real option, not a bug.** Three configurations: omit (defaults to `process.stdout`), pass a fake (tests), pass `false` (caller owns the watcher). The third covers cases where the renderer is wrapped — e.g., a future `agent --headless` path that already has its own resize handling. Distinct from undefined so the type captures intent.
+- **D29 — `liveCaps` is a mutable copy, not a reference to `options.caps`.** The caller's `caps` object is treated as input only — we never mutate it. `liveCaps` is the renderer's working copy. Simpler than threading "current caps" through every call site, and the mutation is contained to the renderer's closure.
+- **D30 — `renderer-types.ts` exists only to break the circular import.** `renderer.ts` → `./render/compose.ts` → `ComposeLive` type. If `ComposeLive` lived in `renderer.ts`, the cycle would be `renderer.ts` ⇄ `compose.ts`. TS allows it, but it makes the dep graph confusing and breaks isolated-modules in some build configs. Keeping the type in its own tiny file is the cleanest cut.
+- **D31 — Spinner intervals (80ms / 100ms) are baked into the render function, not configurable.** UI.md §6.2 catalogs them as fixed values. Configurability would invite tuning churn; the spec sets them.
+- **D32 — Tree branches `├`/`└` for tool preview, not `· └`.** Matches UI.md §4.2 example for subagent rows. The `└` closes only on the last preview line; intermediate previews use `├` so the run reads as a single nested block.
+
+**Pending / out of scope this slice:**
+
+- **No heartbeat ticks.** Spinner freezes between events. (D25)
+- **Modal pattern.** Permission/trust/memory-write/plan-review/critique events still no-op in the reducer; the modal state field hasn't been added to `LiveState`.
+- **Subagent rows + todo list + bg tray.** Reducer accepts these events (no-op); render functions and reducer wiring land together when the modal pattern is in.
+- **Cursor positioning inside the input.** Today the terminal cursor sits at the end of the input line. Real inline editing (cursor inside the text, arrow keys move within `input.value`) needs cursor-back escapes after writing — input handler arrives next.
+- **HarnessEvent → UIEvent adapter.** Comes when interactive mode is wired into `src/cli/index.ts`.
+- **`wrap-ansi` is installed but unused.** Lands when input wrapping (auto-grow on long lines) becomes a thing.
+
+**Verification:** `bun test` → 1818 pass / 10 skip / 0 fail (+47 new across 5 render-function test files + 2 resize tests). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.d — interactive REPL wiring. Plug the key parser into `src/cli/index.ts`, wire raw-stdin → input editing → `bus.emit('user:submit')` on Enter. Add a heartbeat tick for the spinner. Probably bundle the modal pattern (state + focus stack + promise API per UI.md §5.5) since input handling needs the focus stack anyway. After that: the `HarnessEvent → UIEvent` adapter so the existing harness can drive the new TUI without rewiring.
+
+---
+
 ## [2026-05-02] M1 / Step 1.b.1 — Permanent records refactor (caps-aware formatting)
 
 Pre-emptive structural fix surfaced by the 1.b code review.

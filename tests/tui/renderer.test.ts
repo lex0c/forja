@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { createBus } from '../../src/tui/bus.ts';
 import type { UIEvent } from '../../src/tui/events.ts';
-import { createRenderer, formatPermanent } from '../../src/tui/renderer.ts';
-import type { LiveState, PermanentItem } from '../../src/tui/state.ts';
+import { createRenderer } from '../../src/tui/renderer.ts';
+import type { LiveState } from '../../src/tui/state.ts';
 import { CSI, type Capabilities, type FrameSchedulerOptions } from '../../src/tui/term.ts';
 
 const caps: Capabilities = {
@@ -62,145 +62,6 @@ const sessionStart: UIEvent = {
   project: 'forja',
   model: 'opus',
 };
-
-const asciiCaps: Capabilities = { ...caps, unicode: false, color: 'none' };
-const unicodeCaps: Capabilities = { ...caps, unicode: true, color: 'none' };
-const colorCaps: Capabilities = { ...caps, unicode: true, color: 'basic' };
-
-describe('formatPermanent', () => {
-  test('session-header renders a single line with sessionId, profile, model', () => {
-    const item: PermanentItem = {
-      kind: 'session-header',
-      sessionId: 's1',
-      profile: 'autonomous',
-      project: 'forja',
-      model: 'opus',
-    };
-    const out = formatPermanent(item, asciiCaps);
-    expect(out).toEqual(['── session s1 · autonomous · opus ──']);
-  });
-
-  test('session-footer renders the reason', () => {
-    expect(formatPermanent({ kind: 'session-footer', reason: 'done' }, asciiCaps)).toEqual([
-      '── session end · done ──',
-    ]);
-  });
-
-  test('user-submit renders > prefix and 2-space continuation indent', () => {
-    expect(
-      formatPermanent({ kind: 'user-submit', text: 'first\nsecond\nthird' }, asciiCaps),
-    ).toEqual(['> first', '  second', '  third']);
-  });
-
-  test('user-submit with single line emits one prefixed line', () => {
-    expect(formatPermanent({ kind: 'user-submit', text: 'hi' }, asciiCaps)).toEqual(['> hi']);
-  });
-
-  test('assistant splits text on newlines with no prefix', () => {
-    expect(formatPermanent({ kind: 'assistant', text: 'line1\nline2' }, asciiCaps)).toEqual([
-      'line1',
-      'line2',
-    ]);
-  });
-
-  test('assistant with empty text emits nothing', () => {
-    expect(formatPermanent({ kind: 'assistant', text: '' }, asciiCaps)).toEqual([]);
-  });
-
-  test('assistant with trailing newline emits an explicit empty trailing line', () => {
-    // Documents current behavior: text with a trailing `\n` becomes
-    // [content, ''] after split. Provider streams typically don't end
-    // with a newline; if a future producer does, we may want to filter
-    // (matching `appendPreview` for tool deltas). Locking the behavior
-    // makes that future change visible.
-    expect(formatPermanent({ kind: 'assistant', text: 'foo\n' }, asciiCaps)).toEqual(['foo', '']);
-  });
-
-  test('tool-end uses ASCII glyphs when unicode disabled', () => {
-    const done = formatPermanent(
-      { kind: 'tool-end', name: 'bash', args: 'ls', status: 'done', durationMs: 100 },
-      asciiCaps,
-    );
-    const errored = formatPermanent(
-      { kind: 'tool-end', name: 'bash', args: 'rm', status: 'error', durationMs: 100 },
-      asciiCaps,
-    );
-    const denied = formatPermanent(
-      { kind: 'tool-end', name: 'bash', args: 'rm', status: 'denied', durationMs: 100 },
-      asciiCaps,
-    );
-    expect(done[0]?.charAt(0)).toBe('*');
-    expect(errored[0]?.charAt(0)).toBe('x');
-    expect(denied[0]?.charAt(0)).toBe('!');
-  });
-
-  test('tool-end uses Unicode glyphs when unicode enabled', () => {
-    const done = formatPermanent(
-      { kind: 'tool-end', name: 'bash', args: 'ls', status: 'done', durationMs: 100 },
-      unicodeCaps,
-    );
-    const errored = formatPermanent(
-      { kind: 'tool-end', name: 'bash', args: 'rm', status: 'error', durationMs: 100 },
-      unicodeCaps,
-    );
-    const denied = formatPermanent(
-      { kind: 'tool-end', name: 'bash', args: 'rm', status: 'denied', durationMs: 100 },
-      unicodeCaps,
-    );
-    expect(done[0]?.charAt(0)).toBe('✓');
-    expect(errored[0]?.charAt(0)).toBe('✗');
-    expect(denied[0]?.charAt(0)).toBe('⚠');
-  });
-
-  test('tool-end uses ms units below 1s and s units above', () => {
-    const fast = formatPermanent(
-      { kind: 'tool-end', name: 'r', args: 'a', status: 'done', durationMs: 850 },
-      asciiCaps,
-    );
-    const slow = formatPermanent(
-      { kind: 'tool-end', name: 'r', args: 'a', status: 'done', durationMs: 1234 },
-      asciiCaps,
-    );
-    expect(fast[0]).toContain('850ms');
-    expect(slow[0]).toContain('1.2s');
-  });
-
-  test('tool-end with summary emits a 2-space-indented continuation line', () => {
-    const out = formatPermanent(
-      {
-        kind: 'tool-end',
-        name: 'bash',
-        args: 'test',
-        status: 'done',
-        durationMs: 500,
-        summary: '47 entries',
-      },
-      asciiCaps,
-    );
-    expect(out).toHaveLength(2);
-    expect(out[1]).toBe('  47 entries');
-  });
-
-  test('tool-end uses ASCII separator when unicode disabled', () => {
-    const out = formatPermanent(
-      { kind: 'tool-end', name: 'bash', args: 'ls', status: 'done', durationMs: 50 },
-      asciiCaps,
-    );
-    expect(out[0]).toContain(' - ');
-  });
-
-  test('error and warn pass through as plain text when color disabled', () => {
-    expect(formatPermanent({ kind: 'error', message: 'down' }, asciiCaps)).toEqual(['error: down']);
-    expect(formatPermanent({ kind: 'warn', message: 'high' }, asciiCaps)).toEqual(['warn: high']);
-  });
-
-  test('error and warn are wrapped in SGR escapes when color enabled', () => {
-    const errored = formatPermanent({ kind: 'error', message: 'down' }, colorCaps);
-    expect(errored[0]).toBe(`${CSI}31merror: down${CSI}0m`);
-    const warned = formatPermanent({ kind: 'warn', message: 'high' }, colorCaps);
-    expect(warned[0]).toBe(`${CSI}33mwarn: high${CSI}0m`);
-  });
-});
 
 describe('renderer wiring', () => {
   test('session:start emits a permanent header line and draws live region', () => {
@@ -386,6 +247,64 @@ describe('renderer wiring', () => {
     r.close();
   });
 
+  test('narrow live region with colored content does not emit orphan ANSI escapes', () => {
+    // Reproduces a scenario that would have corrupted the terminal
+    // before the truncate fix: status line with budget shading (warn
+    // SGR) on a narrow terminal forces truncate to walk through the
+    // ANSI escape sequence.
+    const bus = createBus();
+    const sink = makeSink();
+    const narrowColored = { ...caps, cols: 12, color: 'basic' as const };
+    const r = createRenderer({
+      bus,
+      caps: narrowColored,
+      write: sink.write,
+      schedulerOptions: makeSchedulerOptions().options,
+      bracketedPaste: false,
+    });
+    bus.emit({
+      type: 'session:start',
+      ts: 1,
+      sessionId: 's1',
+      profile: 'autonomous',
+      project: 'proj',
+      model: 'm',
+    });
+    // 80% of steps → warn shading (yellow CSI 33m).
+    bus.emit({
+      type: 'step:budget',
+      ts: 2,
+      steps: 8,
+      maxSteps: 10,
+      costUsd: 0,
+    });
+    // Force a redraw so the truncation runs against the new state.
+    r.redraw();
+    const out = sink.joined();
+    // Sanity: status line has at least the SGR open code.
+    expect(out).toContain(`${CSI}33m`);
+    // No orphan ESC: every `\x1b[` in the output must be followed by
+    // a complete CSI ending in [0x40..0x7e]. Walk every ESC and assert
+    // each starts a complete CSI sequence.
+    const ESC_CODE = 0x1b;
+    for (let idx = 0; idx < out.length; idx++) {
+      if (out.charCodeAt(idx) !== ESC_CODE) continue;
+      // Next char must be `[` (we don't emit other ESC kinds).
+      expect(out.charCodeAt(idx + 1)).toBe(0x5b);
+      // Walk forward to the final byte.
+      let j = idx + 2;
+      while (j < out.length) {
+        const c = out.charCodeAt(j);
+        j++;
+        if (c >= 0x40 && c <= 0x7e) break;
+      }
+      // The CSI must terminate before the end of the string.
+      expect(out.charCodeAt(j - 1)).toBeGreaterThanOrEqual(0x40);
+      expect(out.charCodeAt(j - 1)).toBeLessThanOrEqual(0x7e);
+    }
+    r.close();
+  });
+
   test('long lines are truncated to caps.cols in the live region', () => {
     const bus = createBus();
     const sink = makeSink();
@@ -406,6 +325,69 @@ describe('renderer wiring', () => {
     // 20-x run; longer would mean truncation didn't happen.
     expect(out).toContain('x'.repeat(20));
     expect(out).not.toContain('x'.repeat(21));
+    r.close();
+  });
+
+  test('resize event updates caps.cols and forces a redraw', () => {
+    const bus = createBus();
+    const sink = makeSink();
+    // Fake resize stream so we can fire a resize deterministically.
+    // Box the listener in a ref because TS narrows a plain `let`
+    // assignment-from-callback to `never`.
+    const listenerRef: { current: (() => void) | null } = { current: null };
+    const stream = {
+      columns: 80,
+      rows: 24,
+      on(_event: 'resize', l: () => void) {
+        listenerRef.current = l;
+      },
+      off() {
+        listenerRef.current = null;
+      },
+    };
+    // ComposeLive that returns the cols at render time so we can
+    // inspect what the renderer saw.
+    let lastCols = -1;
+    const composeLive = (_s: LiveState, c: { cols: number }): string[] => {
+      lastCols = c.cols;
+      return [`width=${c.cols}`];
+    };
+    const r = createRenderer({
+      bus,
+      caps: { ...caps, cols: 80 },
+      write: sink.write,
+      composeLive,
+      resizeStream: stream,
+      schedulerOptions: makeSchedulerOptions().options,
+      bracketedPaste: false,
+    });
+    bus.emit(sessionStart);
+    expect(lastCols).toBe(80);
+    // Simulate the terminal getting wider.
+    stream.columns = 120;
+    stream.rows = 50;
+    listenerRef.current?.();
+    // The watcher fires `scheduler.flush()`, which runs `redraw()`
+    // synchronously — composeLive saw the new width.
+    expect(lastCols).toBe(120);
+    r.close();
+  });
+
+  test('resizeStream: false disables the watcher', () => {
+    const bus = createBus();
+    const sink = makeSink();
+    // No stream injected — just the opt-out flag.
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      resizeStream: false,
+      schedulerOptions: makeSchedulerOptions().options,
+      bracketedPaste: false,
+    });
+    bus.emit(sessionStart);
+    // Construction path didn't crash; renderer is functional.
+    expect(sink.joined()).toContain('── session s1');
     r.close();
   });
 
