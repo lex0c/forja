@@ -1,5 +1,5 @@
 import { type HarnessResult, runAgent } from '../harness/index.ts';
-import { createMemoryRegistry, resolveScopeRoots } from '../memory/index.ts';
+import { createMemoryRegistry, resolveRepoRoot, resolveScopeRoots } from '../memory/index.ts';
 import { createPermissionEngine } from '../permissions/index.ts';
 import { type Provider, createDefaultRegistry } from '../providers/index.ts';
 import {
@@ -487,7 +487,13 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     let memoryRegistry: ReturnType<typeof createMemoryRegistry> | undefined;
     let resolvedSystemPrompt = audit.systemPrompt;
     if (opts.memoryCwd !== undefined && wantsMemory) {
-      const memoryRoots = resolveScopeRoots(opts.memoryCwd);
+      // Resolve repo root from the parent's cwd. Same fix as
+      // bootstrap.ts: parent's invocation cwd may be a subdir
+      // within its repo, so anchoring memory roots there would
+      // miss every project memory. resolveRepoRoot calls git
+      // rev-parse and falls back to the input path when not in
+      // a git repo.
+      const memoryRoots = resolveScopeRoots(resolveRepoRoot(opts.memoryCwd));
       memoryRegistry = createMemoryRegistry({
         roots: memoryRoots,
         db,

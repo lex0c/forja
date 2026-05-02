@@ -23,6 +23,7 @@ import {
   type MemoryRegistry,
   type MemoryScope,
   createMemoryRegistry,
+  resolveRepoRoot,
   resolveScopeRoots,
   validateName,
 } from '../memory/index.ts';
@@ -223,13 +224,17 @@ export const runMemoryCli = async (input: MemoryCliInput): Promise<number> => {
   try {
     if (input.dbOverride === undefined) migrate(db);
 
-    // Build the registry from cwd. The CLI doesn't have a session
+    // Build the registry from the REPO root, not the invocation
+    // cwd. Project memory lives at `<repo>/.agent/memory/...`;
+    // an operator running `agent --memory list` from a subdir
+    // would otherwise see empty project scopes. Falls back to
+    // cwd when not in a git repo. The CLI doesn't have a session
     // (operator-driven inspection); the registry's audit hook
     // tolerates `sessionId: undefined` and persists a row with
     // session_id=NULL — the audit log still captures the read,
     // but the operator-vs-agent distinction is preserved by the
     // null session linkage.
-    const roots = resolveScopeRoots(cwd);
+    const roots = resolveScopeRoots(resolveRepoRoot(cwd));
     const registry = createMemoryRegistry({ roots, db, cwd });
 
     if (verb === 'list') {

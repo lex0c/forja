@@ -15,6 +15,57 @@ Format:
 
 ---
 
+## [2026-05-01] M3 / Step 5.2 follow-up — anchor memory roots at repo root (subdir blindspot)
+
+External review caught a second real bug. Bootstrap and CLI
+`--memory` resolved scope roots from `cwd` directly: an operator
+invoking `agent` from a subdirectory inside a repo (the common
+case — `cd src/components/ && agent "..."`) would have project
+memories searched under `<subdir>/.agent/memory/...` instead of
+the repo's `<repo>/.agent/memory/...`. Result: the injected
+`# Memory` section came out empty, every `memory_*` tool read
+silently missed existing memories, and operators saw no symptom
+beyond "the agent doesn't seem to know things it should".
+
+The pattern was internally inconsistent too: `paths.ts`
+documents in its header that "the caller passes the absolute
+repoRoot (resolved via `git rev-parse --show-toplevel`
+upstream)", but bootstrap was passing the invocation cwd
+unchanged. `resolveScopeRoots`'s contract was correct;
+bootstrap was the wrong caller.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/memory/paths.ts` | NEW `resolveRepoRoot(cwd)` — sync helper using `Bun.spawnSync` over `git rev-parse --show-toplevel`. Returns the resolved repo root when in a git working tree; falls back to the input cwd when git is missing OR the path isn't inside a repo (operator gets per-cwd memory then — same fallback behavior the buggy code had, just now explicit). Mirrors the async `defaultResolveRepoRoot` pattern in `subagents/worktree-gc.ts` but sync because bootstrap is sync. |
+| `src/memory/index.ts` | Re-export `resolveRepoRoot`. |
+| `src/cli/bootstrap.ts` | `resolveScopeRoots(resolveRepoRoot(cwd))` instead of `resolveScopeRoots(cwd)`. The HarnessConfig.cwd field stays as the operator's invocation cwd (other subsystems anchor on that); only the memory roots resolution uses the repo root. |
+| `src/cli/memory.ts` | Same fix for the operator-facing CLI. `agent --memory list` / `show` from a subdir now finds project memories at the repo root. |
+| `src/cli/subagent-child.ts` | Same fix on the subagent path. The parent forwards `memoryCwd: input.cwd` (parent's invocation cwd, may be a subdir); the child must resolve that to the repo root before anchoring its registry. Without this fix, subagents inherited the parent's broken anchor. |
+| `tests/memory/paths.test.ts` | NEW describe block for `resolveRepoRoot`: returns repo root from a subdir of a git repo, returns repo root from the repo root itself, falls back to cwd outside a git repo, falls back to cwd for non-existent paths. Uses real `git init` in tmpdirs (matches the `tests/checkpoints/detect.test.ts` pattern). `realpathSync` on tmpdirs because macOS `/var → /private/var` would otherwise mismatch the canonical form `git rev-parse` returns. |
+| `tests/cli/bootstrap.test.ts` | NEW regression test: git init the workdir, seed `<workdir>/.agent/memory/local/role.md`, invoke bootstrap from `<workdir>/src/components/`. Assert the system prompt includes the memory section. Pre-fix this would assert empty. |
+| `tests/cli/memory.test.ts` | NEW regression test for `runMemoryCli`: same shape — git init the workdir, seed memory at repo root, invoke `--memory list` from a subdir, assert one entry returned (not empty). |
+
+**Decisions:**
+
+- **D1 — Sync helper, not async.** Bootstrap is synchronous and async-conversion would cascade through its callers (`run.ts`, every test that calls bootstrap directly). `Bun.spawnSync` adds ~1-5ms to bootstrap time per session; dominated by SQLite migrate already on the same path. Worth the simplicity.
+- **D2 — Helper falls back to cwd, not throws.** Operator running `agent` outside a git repo (rare but legitimate — playground dirs, CI scratch volumes) shouldn't see a hard error; they should get per-cwd memory, which is the same shape pre-fix code had. The fallback also covers test scenarios that don't bother to git-init.
+- **D3 — Apply at every call site, not at the registry layer.** Pushing repo-root resolution INTO `createMemoryRegistry` was tempting but wrong: the registry's `roots` parameter has a clear contract ("absolute scope roots"); coupling it to git would make the API surface impure and hard to test. Each entry path (bootstrap, CLI memory, subagent-child) explicitly resolves before passing to `resolveScopeRoots` — inverse of how the spec docs already framed it.
+- **D4 — `HarnessConfig.cwd` stays as invocation cwd.** Only the MEMORY roots use the repo root. Other subsystems (bgLogDir, checkpoints, working-tree probes) anchor on the operator's invocation cwd intentionally — `bgLogDir` is `<cwd>/.agent/bg/...`, checkpoints probe `<cwd>` for git, etc. Switching all of those to repo root would change behavior in directions not motivated by this bug. Memory is the exception because per-repo is its semantic.
+
+**Pending / known limitations:**
+
+- **Symlinked repo paths** — `git rev-parse --show-toplevel` returns the canonical (realpath-resolved) form. If the operator invokes from a symlinked path that aliases the repo, the resolved root is the canonical path, not the symlink. Memory loads correctly either way; only path comparisons in the operator's mental model might surprise (e.g., `pwd` shows the symlink, audit row shows the canonical). Acceptable.
+- **`worktree` directories return their main repo's root.** Inside a `git worktree add`-created tree, `git rev-parse --show-toplevel` returns the worktree's path. For subagent worktrees this is the desired behavior; the parent's bootstrap unaffected (parent never invokes from inside its own subagent's worktree).
+- **Git binary missing.** Falls back to cwd silently. An operator without git installed gets per-cwd memory; consistent with the worktree-gc fallback semantics. Documented in the helper comment.
+
+**Verification:** `bun test` 1630 pass / 10 skip / 0 fail (+6 new across the helper unit tests, bootstrap subdir-integration, and CLI subdir-integration); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** No state change to the read arc roadmap. Branch ready for PR.
+
+---
+
 ## [2026-05-01] M3 / Step 5.2 follow-up — fix top-level audit attribution (NULL session_id)
 
 External review caught a real bug in 5.2.c. `bootstrap.ts`

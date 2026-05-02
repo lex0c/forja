@@ -36,6 +36,7 @@ export {
   indexFilePath,
   memoryFilePath,
   projectScopeRoots,
+  resolveRepoRoot,
   resolveScopeRoots,
   rootForScope,
   scopeOfPath,

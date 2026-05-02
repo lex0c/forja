@@ -1,15 +1,79 @@
-import { describe, expect, test } from 'bun:test';
-import { homedir } from 'node:os';
+import { afterEach, describe, expect, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   ScopeError,
   indexFilePath,
   memoryFilePath,
   projectScopeRoots,
+  resolveRepoRoot,
   resolveScopeRoots,
   scopeOfPath,
   userScopeRoot,
 } from '../../src/memory/paths.ts';
+
+const tmpDirs: string[] = [];
+
+const makeTmp = (): string => {
+  const dir = mkdtempSync(join(tmpdir(), 'forja-paths-test-'));
+  tmpDirs.push(dir);
+  // Resolve realpath because macOS routinely symlinks /var → /private/var
+  // and git rev-parse returns the canonical form; comparing the result
+  // against an unresolved tmpdir path would fail there.
+  return realpathSync(dir);
+};
+
+const initRepo = async (cwd: string): Promise<void> => {
+  const proc = Bun.spawn({
+    cmd: ['git', 'init', '-b', 'main'],
+    cwd,
+    env: { LC_ALL: 'C', PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '' },
+    stdout: 'ignore',
+    stderr: 'ignore',
+  });
+  await proc.exited;
+};
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    const dir = tmpDirs.pop();
+    if (dir !== undefined) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {}
+    }
+  }
+});
+
+describe('resolveRepoRoot', () => {
+  test('returns the repo root when invoked from a subdir of a git repo', async () => {
+    const repo = makeTmp();
+    await initRepo(repo);
+    const subdir = join(repo, 'src', 'components');
+    mkdirSync(subdir, { recursive: true });
+    expect(resolveRepoRoot(subdir)).toBe(repo);
+  });
+
+  test('returns the repo root when invoked from the repo root itself', async () => {
+    const repo = makeTmp();
+    await initRepo(repo);
+    expect(resolveRepoRoot(repo)).toBe(repo);
+  });
+
+  test('falls back to cwd when not in a git repo', () => {
+    const dir = makeTmp();
+    expect(resolveRepoRoot(dir)).toBe(dir);
+  });
+
+  test('falls back to cwd when path does not exist', () => {
+    // git rev-parse fails with non-zero exit; the helper returns
+    // the input unchanged. The caller's downstream loadScopeIndex
+    // will then return `absent` for any scope under that path.
+    const ghost = '/definitely/does/not/exist/anywhere';
+    expect(resolveRepoRoot(ghost)).toBe(ghost);
+  });
+});
 
 describe('userScopeRoot', () => {
   test('honors XDG_CONFIG_HOME when set absolute', () => {

@@ -367,6 +367,46 @@ describe('runMemoryCli — show', () => {
   });
 });
 
+describe('runMemoryCli — repo-root resolution (regression: subdir blindspot)', () => {
+  test('list from a subdir still finds project memories at the repo root', async () => {
+    // Operator runs `agent --memory list` from a subdir of a
+    // git repo. Memories live at <repo>/.agent/memory/...; the
+    // CLI must resolve repo root via git rev-parse rather than
+    // anchoring at the invocation cwd. Pre-fix this returned
+    // an empty list silently.
+    const proc = Bun.spawn({
+      cmd: ['git', 'init', '-b', 'main'],
+      cwd,
+      env: { LC_ALL: 'C', PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '' },
+      stdout: 'ignore',
+      stderr: 'ignore',
+    });
+    await proc.exited;
+
+    writeIndex(projectLocalDir(), '- [Role](role.md) — repo memory\n');
+    writeMemory(projectLocalDir(), 'role', fmUser('role'), 'b\n');
+
+    const subdir = join(cwd, 'src', 'components');
+    mkdirSync(subdir, { recursive: true });
+
+    const code = await runMemoryCli({
+      verb: 'list',
+      positionals: [],
+      json: true,
+      cwd: subdir, // invocation from subdir, NOT repo root
+      dbOverride: db,
+      out,
+      err,
+    });
+    expect(code).toBe(0);
+    const lines = outBuf.trim().split('\n');
+    // 1 entry + summary.
+    expect(lines).toHaveLength(2);
+    expect(JSON.parse(lines[0] ?? '{}').name).toBe('role');
+    expect(JSON.parse(lines[1] ?? '{}').count).toBe(1);
+  });
+});
+
 describe('runMemoryCli — verbs', () => {
   test('rejects unknown verb', async () => {
     const code = await runMemoryCli({

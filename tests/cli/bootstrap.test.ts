@@ -293,6 +293,47 @@ describe('bootstrap', () => {
     }
   });
 
+  test('memory loads from repo root, not subdir (regression: subdir blindspot)', async () => {
+    // Operator runs `agent` from a subdirectory of a git repo
+    // (e.g., `/repo/src/components/`). Memory tree lives at the
+    // repo root (`/repo/.agent/memory/...`). Pre-fix the
+    // bootstrap would resolve scope roots from the subdir cwd
+    // and silently miss every project memory. Post-fix it calls
+    // git rev-parse and anchors at the repo root.
+    const initRepo = async (path: string): Promise<void> => {
+      const proc = Bun.spawn({
+        cmd: ['git', 'init', '-b', 'main'],
+        cwd: path,
+        env: { LC_ALL: 'C', PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '' },
+        stdout: 'ignore',
+        stderr: 'ignore',
+      });
+      await proc.exited;
+    };
+    await initRepo(workdir);
+    // Seed the repo-root project_local memory.
+    const localDir = join(workdir, '.agent', 'memory', 'local');
+    mkdirSync(localDir, { recursive: true });
+    writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — repo root memory\n');
+
+    // Invoke from a subdir, NOT the repo root.
+    const subdir = join(workdir, 'src', 'components');
+    mkdirSync(subdir, { recursive: true });
+    const { config, db } = bootstrap({
+      prompt: 'hi',
+      cwd: subdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+    });
+    // System prompt must include the memory section even though
+    // the cwd is a subdir — the repo-root resolution catches it.
+    expect(config.systemPrompt).toContain('# Memory');
+    expect(config.systemPrompt).toContain('[project_local] role — repo root memory');
+    db.close();
+  });
+
   test('memory registry is wired even when no memories exist (empty list)', () => {
     const { config, db } = bootstrap({
       prompt: 'hi',

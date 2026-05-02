@@ -35,6 +35,46 @@ export interface ScopeRoots {
   projectLocal: string;
 }
 
+// Resolve the repo root for a given cwd via
+// `git rev-parse --show-toplevel`. Returns the cwd unchanged when
+// the cwd isn't inside a git working tree (or git itself is
+// missing) — in that case the operator's invocation cwd IS the
+// project anchor. Sync because bootstrap is sync; the spawn cost
+// is one-shot per session and dominated by SQLite migrate.
+//
+// Why we need this: project memory is per-REPO, not per-cwd. An
+// operator invoking `agent` from `src/components/` inside a
+// repo at `/repo` must still see memories at
+// `/repo/.agent/memory/{shared,local}/` — without resolving the
+// repo root, we'd look under `/repo/src/components/.agent/...`
+// (which doesn't exist) and silently miss every project memory.
+// The user scope is unaffected because it lives outside the repo
+// (at `~/.config/agent/memory/` or `$XDG_CONFIG_HOME/agent/memory/`).
+export const resolveRepoRoot = (cwd: string): string => {
+  try {
+    const proc = Bun.spawnSync({
+      cmd: ['git', '-C', cwd, 'rev-parse', '--show-toplevel'],
+      env: {
+        LC_ALL: 'C',
+        GIT_TERMINAL_PROMPT: '0',
+        PATH: process.env.PATH ?? '',
+        HOME: process.env.HOME ?? '',
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    if (proc.exitCode !== 0) return cwd;
+    const trimmed = proc.stdout.toString().trim();
+    return trimmed.length === 0 ? cwd : trimmed;
+  } catch {
+    // git binary missing or spawn failure. Fall back to cwd —
+    // operator running outside a repo gets per-cwd memory which
+    // is the same fallback behavior `resolveScopeRoots` had
+    // before this helper existed.
+    return cwd;
+  }
+};
+
 // User-scope root. Spec uses `~/.config/agent/memory/` literally;
 // that path follows the XDG convention, so we honor
 // `XDG_CONFIG_HOME` when set. Falls back to `~/.config` otherwise.
