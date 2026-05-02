@@ -58,6 +58,10 @@ export interface StatusState {
   // null = no cap configured. Renderer shows steps/cost without budget
   // shading when cap absent.
   maxCostUsd: number | null;
+  // Plan mode (read-only profile). Surfaced in the footer's right
+  // column as a `plan` token between model and budget. Default false
+  // on createInitialState; flipped by `session:start.planMode`.
+  planMode: boolean;
 }
 
 export interface PendingAssistant {
@@ -118,6 +122,7 @@ export const createInitialState = (): LiveState => ({
     maxSteps: 0,
     costUsd: 0,
     maxCostUsd: null,
+    planMode: false,
   },
   activeTools: new Map(),
   pendingAssistant: null,
@@ -210,6 +215,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
         profile: event.profile,
         project: event.project,
         model: event.model,
+        planMode: event.planMode === true,
       };
       return {
         state: { ...state, status, ended: false },

@@ -30,6 +30,11 @@ export type SessionStartEvent = BaseEvent & {
   profile: 'autonomous' | 'orchestrated' | 'hybrid';
   project: string;
   model: string;
+  // Plan mode (read-only profile, harness refuses write tools).
+  // Surfaced in the footer's right column. Optional — absent is
+  // equivalent to false; producers that don't know plan-mode state
+  // can omit the field.
+  planMode?: boolean;
 };
 
 // One-shot welcome banner (UI.md §4.10.9). Emitted by the REPL at

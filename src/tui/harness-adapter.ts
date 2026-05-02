@@ -37,6 +37,10 @@ export interface HarnessAdapterCtx {
   // Optional spend cap. Mirrored into `step:budget.maxCostUsd`. Absent
   // means no cap — renderer shows steps/cost without budget shading.
   maxCostUsd?: number;
+  // Plan mode — read-only profile, harness refuses write tools.
+  // Forwarded into `session:start.planMode` so the footer can show
+  // the `plan` indicator. Defaults to false (full-write profile).
+  planMode?: boolean;
   // Wall-clock source. Production = Date.now; tests inject a counter.
   // Every emitted UIEvent stamps `ts` from this so renderers can show
   // "elapsed" without holding their own clock.
@@ -138,6 +142,7 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           profile: ctx.profile,
           project: ctx.project,
           model: ctx.model,
+          ...(ctx.planMode === true ? { planMode: true } : {}),
         });
         // Initial step:budget so the status line shows "0/N · $0" from
         // the very first frame instead of waiting on step_start.

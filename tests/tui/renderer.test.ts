@@ -181,22 +181,35 @@ describe('renderer wiring', () => {
 
   test('eraseLive emits cursorUp(N-1) matching the previous live height', () => {
     // Compose function returns a fixed number of live lines so we can
-    // assert the cursorUp count precisely. 3 live lines → on the next
-    // erase we expect `\r\x1b[2A\x1b[J`.
+    // assert the cursorUp count precisely. Modal kept up so cursor
+    // positioning is suppressed (composeCursor returns null) and
+    // eraseLive's cursorRow equals liveHeight-1. We have to flush the
+    // scheduler after the modal opens so the next drawLive observes
+    // the modal state and parks cursorRow at liveHeight-1.
     const bus = createBus();
     const sink = makeSink();
+    const sched = makeSchedulerOptions();
     const composeLive = (): string[] => ['line a', 'line b', 'line c'];
     const r = createRenderer({
       bus,
       caps,
       write: sink.write,
       composeLive,
-      schedulerOptions: makeSchedulerOptions().options,
+      schedulerOptions: sched.options,
       bracketedPaste: false,
     });
     bus.emit(sessionStart);
+    bus.emit({
+      type: 'permission:ask',
+      ts: 2,
+      promptId: 'p1',
+      toolName: 'bash',
+      command: 'x',
+      cwd: '/',
+    });
+    sched.flushAll();
     sink.writes.length = 0;
-    bus.emit({ type: 'warn', ts: 2, message: 'after' });
+    bus.emit({ type: 'warn', ts: 3, message: 'after' });
     const out = sink.joined();
     expect(out).toContain(`\r${CSI}2A${CSI}J`);
     r.close();
@@ -504,14 +517,14 @@ describe('renderer wiring', () => {
     bus.emit({ type: 'input:update', ts: 2, value: 'hello', cursor: 2 });
     sched.flushAll();
     const out = sink.joined();
-    // Live region after flush is [status, rule, '> hello']. Cursor should
-    // land on row 2 (the input row) at col 4 (2 prefix + 2 offset).
-    // After write, terminal cursor is at end of '> hello' (col 7 of row 2).
-    // So renderer emits: \r (col 0), no cursorUp (already on row 2),
+    // Live region after flush is [status, rule, '> hello', rule,
+    // footer] = 5 lines. Cursor lands on row 2 (the input row) at
+    // col 4 (2 prefix + 2 offset). Terminal cursor after write is at
+    // end of row 4 (footer); cursorUp(2) walks to row 2, then \r +
     // cursorForward(4).
+    expect(out).toContain(`${CSI}2A`); // cursorUp(2)
     expect(out).toContain('\r');
     expect(out).toContain(`${CSI}4C`);
-    // No cursorUp expected here (already on the right row).
     r.close();
   });
 
@@ -528,14 +541,15 @@ describe('renderer wiring', () => {
     });
     bus.emit(sessionStart);
     sink.writes.length = 0;
-    // Multi-line input with cursor on the FIRST line. Live region after
-    // flush is [status, rule, '> first', '  second']. Cursor (offset 3)
-    // sits on row 2 ('> first'); terminal cursor after write is at end
-    // of row 3. Need to cursorUp(1) to reach the input's first row.
+    // Multi-line input with cursor on the FIRST line. Live region
+    // after flush is [status, rule, '> first', '  second', rule,
+    // footer] = 6 lines. Cursor (offset 3) sits on row 2 ('> first');
+    // terminal cursor after write is at end of row 5. Need
+    // cursorUp(3) to reach the input's first row.
     bus.emit({ type: 'input:update', ts: 2, value: 'first\nsecond', cursor: 3 });
     sched.flushAll();
     const out = sink.joined();
-    expect(out).toContain(`${CSI}1A`); // cursorUp(1)
+    expect(out).toContain(`${CSI}3A`); // cursorUp(3)
     expect(out).toContain(`${CSI}5C`); // cursorForward(2 prefix + 3 offset)
     r.close();
   });

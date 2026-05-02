@@ -15,6 +15,64 @@ Format:
 
 ---
 
+## [2026-05-02] M1 / Step 1.e.4 — Footer below input + plan mode indicator
+
+Closes the bottom anchor: rule + input + rule + footer (UI.md
+§4.10.6 / §4.10.12). The footer surfaces `? for help` on the left
+(adds `· esc to interrupt` while a tool / thinking / streaming
+assistant is live) and `• <model> · [plan ·] <steps>/<max> · $<cost>`
+on the right, padded so the right column anchors to the terminal
+edge. The `composeCursor` LAYOUT COUPLING TODO from D79 is resolved
+in the same slice — the cursor math now subtracts the trailing
+2-line block (rule + footer) from `inputStartRow`, so the cursor
+lands inside the input box instead of on the footer line.
+
+`planMode` joins `StatusState` (and the `session:start` event payload),
+threaded from the REPL through the adapter ctx so the footer reflects
+plan mode immediately on the first turn.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/state.ts` | `StatusState.planMode: boolean` (initial false). Reducer for `session:start` reads `event.planMode === true` (defaults to false when omitted). |
+| `src/tui/events.ts` | `SessionStartEvent.planMode?: boolean` (optional — omit means false). |
+| `src/tui/render/footer.ts` | NEW `renderFooter(state, caps): string \| null`. Returns null when modal is up (modal owns the bottom slot). Otherwise builds left column (`? for help` + optional `esc to interrupt` when running), right column gated by `status.sessionId !== null` as a single proxy (avoids half-state where model rendered but cost/budget didn't): `• <model> · [plan ·] <steps>/<max> · $<cost>`. Per-segment dim paint (rather than wrapping the whole line) so a future budget-shading layer can override individual tokens without fighting the outer wrap. Pad math clamps to 0 on overflow — long content collapses left+right together and the renderer's truncateToWidth clips the right end (acceptable degradation; future polish drops low-priority tokens). `isRunning(state)` checks `activeTools.size > 0 \|\| thinking !== null \|\| pendingAssistant !== null` — covers tools, extended thinking, and assistant streaming as the three "interruptible" states. Cost formatter degrades with magnitude (4 decimals < $1, 3 decimals < $100, 2 decimals ≥ $100). |
+| `src/tui/render/compose.ts` | Bottom anchor now emits `[..., rule, input, rule, footer]` (4 lines below the upper region) when no modal. Modal still substitutes the entire anchor. NEW exported `FOOTER_BLOCK_LINES = 2` constant shared between `composeLive` (which appends the trailing rule + footer) and `composeCursor` (which subtracts them when computing input start row). The `ruleAboveInput` helper renamed to `horizontalRule` since it's now reused for both rules. Strict: `renderFooter` returning null in the no-modal path throws — fail loudly instead of drifting silently if the renderFooter contract loosens. The constant is exported so a regression test can guard against drift between the value and what composeLive actually emits below the input. |
+| `src/tui/harness-adapter.ts` | `HarnessAdapterCtx` gains `planMode?: boolean`. `session_start` translation conditionally includes `planMode: true` in the emitted `session:start` event. Falsy values (undefined/false) drop the field entirely so headless NDJSON consumers don't see a noise `planMode: false`. |
+| `src/cli/repl.ts` | `adapterCtxBase` reads `baseConfig.planMode` and threads it through. CLI's `--plan` flag → bootstrap sets `HarnessConfig.planMode` → REPL surfaces it in the footer. |
+| `tests/tui/render/footer.test.ts` | NEW 12 tests: idle vs running cue, thinking and pendingAssistant trigger interrupt, plan mode segment, modal-suppressed null, pre-session shape (no model = no right column), full-width pad, dim SGR, cost-format magnitude tiers, overflow degrades to >caps.cols (truncation upstream handles), sessionId-only gate (model+maxSteps without sessionId still pre-session). |
+| `tests/tui/render/compose.test.ts` | Existing layout tests updated for the new bottom anchor: `pre-session: rule + input + rule + footer` (4 lines), `after session start` (5 lines), `active tool card` (7 lines), multi-line input still indexes from the trailing rule. composeCursor tests bumped lineCount by 2 to account for the footer block — expected rows unchanged. NEW assertion in modal-suppressed test that the footer hint is also absent. NEW drift guard: composeLive output length matches `1 (rule above) + inputLines + FOOTER_BLOCK_LINES` — silent breakage if anyone changes the trailing block size without bumping the constant. |
+| `tests/tui/state.test.ts` | NEW 2 tests for planMode: session:start with planMode=true flips status; omitted field defaults false. |
+| `tests/tui/renderer.test.ts` | "cursor inline on multi-line input" updated for the new layout: cursorUp(3) instead of cursorUp(1) (input row 2 → terminal at end of row 5 = footer's row). "single-line input" assertion adds cursorUp(2). "eraseLive cursorUp(N-1)" test now opens a modal and flushes the scheduler before measuring eraseLive — without that, composeCursor would position cursorRow to 0 on the fake compose's lines. |
+
+**Decisions:**
+
+- **D95 — `renderFooter` returns `null` only on modal.** Other "no footer" cases (pre-session, ended) still emit the line — the help hint is useful even before a session starts (operator types `?` to learn what's available). Distinguishing "I have nothing useful to show" from "I'm being suppressed by another element" gives the caller the right semantics; modal is the only true suppression today.
+- **D96 — Right column omits segments instead of showing placeholders.** Pre-session has no model, so the right column is empty (left column carries the help hint solo). Plan mode shows `plan` as a token between model and budget; absent = no `plan` token (not `plan: false`). Same principle as banner env (D68/D74) — silence is the absence of meaning, not "value is false/zero".
+- **D97 — `isRunning(state)` covers three signals: activeTools, thinking, pendingAssistant.** Each independently drives the interrupt cue. Missing any one would leave the user typing while something runs without "esc to interrupt" telling them they CAN interrupt. The three signals match the three things that animate in the live region today — when subagent / bg slices land, they get added to the predicate.
+- **D98 — `FOOTER_BLOCK_LINES = 2` constant shared by composeLive + composeCursor.** Earlier attempt to make the constant live in `compose.ts` was ad-hoc; the value is the contract between the two functions. Documented at the top of the file (assumption). When 1.e.5+ adds elements below the footer (status bar tray, multi-line footer for warnings), this constant grows accordingly.
+- **D99 — Resolves D79 (LAYOUT COUPLING TODO).** composeCursor's previous `lineCount - inputLineCount` formula was a TODO marker for "input is the last block; will break when footer lands". Footer landed; constant added; math fixed. Tests bumped lineCount by 2. The coupling between composeLive and composeCursor is now explicit (shared constant + comment) instead of implicit (cursor reads layout via line counting).
+- **D100 — `planMode` flows REPL → adapter ctx → session:start, not via a separate event.** A `mode:plan` event would be more general (toggle plan mode mid-session?), but plan mode is a boot-time profile decision today; toggling mid-session would require reconfiguring the harness's tool gates. Until that flexibility exists, threading through `session:start` is the simplest path that gets the indicator in the footer.
+- **D101 — `eraseLive(N-1)` test opens a modal first.** With cursor positioning landing in 1.e.2, drawLive's cursorRow depends on whether composeCursor returns null. The fake composeLive in this test has nothing to do with input but composeCursor doesn't know that — it computes `inputStartRow` mechanically. Setting state.modal makes composeCursor return null, restoring the "cursorRow = liveHeight - 1" invariant the test asserts. Required schedule flush so the modal-aware drawLive runs before eraseLive measurement.
+- **D102 — Per-segment dim paint, not outer wrap.** Initial draft wrapped the whole assembled footer in `paint(caps, 'dim', ...)`. That blocks future per-token shading (cost warn at 80%, error at 90% per spec §4.4) — the outer wrap forces every segment to dim. Refactored to call `dim()` per segment so a budget shading layer can replace individual tokens (e.g., `paint(caps, 'warn', '$0.045')`) without fighting the surrounding wrap. Cost: marginally more SGR escapes per line; benefit: shading slot is now open.
+- **D103 — Single sessionId proxy for the right column.** Initial draft used `status.model !== null` for model+cost segments and `status.maxSteps > 0` for steps. With the current adapter both flip at session_start so it worked, but a future producer setting one without the other would render a half-state. Collapsed into a single `status.sessionId !== null` gate — all right-column segments appear together or none at all. Caught in code review.
+- **D104 — Overflow pad clamps to 0; truncation upstream.** Initial draft computed `cols = Math.max(content_width + 1, caps.cols)` to "preserve a space between left and right" — but the line then ran past `caps.cols` and the renderer's `truncateToWidth` clipped the right end (losing cost info, the most useful right-column segment). Simplified to `Math.max(0, caps.cols - left - right)`: when content overflows, pad collapses to 0, left and right collapse together, truncation clips the right (acceptable degradation). Future polish: drop low-priority right tokens (cost label → steps → plan) before truncation kicks in. Caught in code review.
+- **D105 — composeLive throws on renderFooter null in non-modal path.** Initial draft fell back to a padded blank line (defensive). But the only call site that returns null IS the modal branch, which is already handled above by an early return. The fallback was dead code; if a future renderFooter loosens the contract to return null in other cases, composeCursor's `FOOTER_BLOCK_LINES` math would silently drift. Replaced the fallback with a thrown error that fails loudly. The exported `FOOTER_BLOCK_LINES` constant + the test guard make the contract explicit.
+
+**Pending / out of scope this slice:**
+
+- **Soft-aborted footer state** (`esc again to force` cue from spec table). Requires the REPL to communicate "soft-abort pending" to the renderer — needs either a new event (`interrupt:soft`) or a state field. Plan mode lands now; soft-abort lands when the harness exposes the corresponding state.
+- **Memory / bg / mcp tray segments in the right column.** Spec §4.10.6 lists them as conditional tokens. Status state already carries memory/bg surfaces but they're not yet plumbed to the footer renderer. Lands when the producers ship.
+- **Operation chip live counter with tokens** (`Generating… (8s · ↑ 234 tokens)`). Requires the adapter to stop dropping `usage` events and store running output-token totals on a chip. Needs an "assistant chip" concept (the model-generating equivalent of a tool chip) — none today; assistant text streams flat into pendingAssistant.text. Defer to a dedicated slice; the framework here is enough that adding `tokens?: number` to ActiveTool and surfacing on the chip head is a small change once the assistant chip lands.
+- **Slash command activation from footer hints** (`/effort`, `/model`, `/plan`). The right column shows the configs but typing `/plan` doesn't toggle anything yet — slash commands are a separate subsystem.
+
+**Verification:** `bun test` → 2024 pass / 10 skip / 0 fail (+18 new across footer, state, compose, renderer, harness-adapter). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.d.5 — wire the harness's permission engine to the modal manager so `confirm` decisions surface as the canonical permission modal (UI.md §4.10.13). Currently `confirm` decisions bypass the UI; bridging requires a hook in the harness loop (or in `invokeTool`) that calls `modalManager.askPermission` and resolves the decision based on the user's choice. After that: tool-aware `previewForApproval` registration on each `ToolDef` (D63 from §4.10.13), so the modal shows the diff for `edit_file`, the command for `bash`, etc. Largest UX gain remaining in the M1 series.
+
+---
+
 ## [2026-05-02] M1 / Step 1.e.3 — Tool indicator collapsed (verb + sub-content)
 
 The most invasive of the §4.10 polish slices: rewrites the tool

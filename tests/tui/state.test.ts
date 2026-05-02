@@ -36,6 +36,7 @@ describe('session lifecycle', () => {
     expect(r.state.status.profile).toBe('autonomous');
     expect(r.state.status.project).toBe('forja');
     expect(r.state.status.model).toBe('claude-opus-4-7');
+    expect(r.state.status.planMode).toBe(false);
     expect(r.state.ended).toBe(false);
     expect(r.permanent).toEqual([
       {
@@ -46,6 +47,17 @@ describe('session lifecycle', () => {
         model: 'claude-opus-4-7',
       },
     ]);
+  });
+
+  test('session:start with planMode=true flips status.planMode', () => {
+    const r = applyEvent(createInitialState(), start({ planMode: true }));
+    expect(r.state.status.planMode).toBe(true);
+  });
+
+  test('session:start without planMode field defaults planMode to false', () => {
+    // Producer omitted the optional field — reducer treats as false.
+    const r = applyEvent(createInitialState(), start());
+    expect(r.state.status.planMode).toBe(false);
   });
 
   test('session:end marks state ended and emits footer item', () => {

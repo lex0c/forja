@@ -138,6 +138,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     ...(baseConfig.budget?.maxCostUsd !== undefined
       ? { maxCostUsd: baseConfig.budget.maxCostUsd }
       : {}),
+    ...(baseConfig.planMode === true ? { planMode: true } : {}),
   };
 
   const bus = createBus();

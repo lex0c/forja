@@ -5,24 +5,41 @@
 // Layout (top → bottom of live region):
 //   1. Active tool cards (running form, with preview).
 //   2. Status line (1 line — only when session has started).
-//   3. Rule above input (full-width, dim) + input box (1+ lines)
-//      — OR modal (when up), which owns the bottom slot entirely
-//      and carries its own structure (no rule above it).
+//   3. Bottom anchor block:
+//      - rule above input
+//      - input box (1+ lines)
+//      - rule below input
+//      - footer (1 line)
+//      OR modal (when up), which owns the bottom slot entirely
+//      and carries its own structure.
 //
 // Order matches the spec: history above (scrollback), then live tool
-// activity, then status, then either the rule+input pair or the
-// modal. Todos arrive in subsequent slices.
+// activity, then status, then the bottom anchor (rule/input/rule/
+// footer). Todos and the assistant chip arrive in subsequent slices.
 
 import type { ComposeLive } from '../renderer-types.ts';
 import type { LiveState } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
+import { renderFooter } from './footer.ts';
 import { renderInput } from './input.ts';
 import { renderModal } from './modal.ts';
 import { renderStatusLine } from './status.ts';
 import { renderToolCardLive } from './tool-card.ts';
 
-const ruleAboveInput = (caps: Capabilities): string =>
+const horizontalRule = (caps: Capabilities): string =>
   paint(caps, 'dim', (caps.unicode ? '─' : '-').repeat(caps.cols));
+
+// Number of lines between the input's last row and the bottom of the
+// live region (the rule below input + the footer line). composeCursor
+// subtracts this so the cursor lands inside the input, not on the
+// footer. Only matters in the no-modal path — when a modal is up,
+// composeCursor returns null and the constant goes unused. Grow
+// alongside any future expansion of the bottom block (multi-line
+// footer, secondary tray under it, etc.).
+//
+// Exported so a regression test can guard against drift between the
+// constant and what composeLive actually emits below the input.
+export const FOOTER_BLOCK_LINES = 2;
 
 // Position the cursor wants to land inside the live region, so the
 // renderer can issue cursor-back escapes after writing. Coordinates
@@ -33,13 +50,10 @@ const ruleAboveInput = (caps: Capabilities): string =>
 // state. We pass it instead of recomputing because the renderer
 // already has it.
 //
-// LAYOUT COUPLING — composeCursor assumes the input box is the LAST
-// block emitted by composeLive (so `lineCount - inputLineCount` =
-// input start row). True today; breaks the moment 1.e.4 lands a
-// footer below the input. When that slice arrives, either subtract
-// the footer's line count here too, or refactor composeLive to
-// return `{lines, inputStartRow}` so this function reads the value
-// directly. TODO(1.e.4): revisit.
+// Layout assumption: when no modal, the bottom anchor is
+// `[..., rule, input, rule, footer]` — input ends `FOOTER_BLOCK_LINES`
+// rows above the last live line. composeLive and composeCursor must
+// stay in lockstep on this constant.
 //
 // Visual columns assume single-width text (ASCII). CJK/emoji would
 // under-count by 1 col per double-width glyph; producers don't emit
@@ -56,7 +70,9 @@ export const composeCursor = (
   if (state.modal !== null) return null;
   const value = state.input.value;
   const inputLineCount = value === '' ? 1 : value.split('\n').length;
-  const inputStartRow = lineCount - inputLineCount;
+  // Last input row is FOOTER_BLOCK_LINES above the bottom of the
+  // live region; subtract input's own height to get the first row.
+  const inputStartRow = lineCount - FOOTER_BLOCK_LINES - inputLineCount;
   const before = value.slice(0, state.input.cursor);
   const linesBefore = before.split('\n');
   const cursorLineIdx = linesBefore.length - 1;
@@ -92,16 +108,24 @@ export const composeLive: ComposeLive = (
   const status = renderStatusLine(state, caps, { now });
   if (status !== null) lines.push(status);
 
-  // 3. Modal OR (rule + input) — never both. The modal owns the
-  // bottom of the live region while it's up (no rule above it; the
-  // modal carries its own structure). Status line + tool cards stay
-  // visible above so the user keeps context.
+  // 3. Modal OR bottom anchor — never both. Bottom anchor is rule +
+  // input + rule + footer (4-block stack); modal substitutes the
+  // whole anchor and carries its own structure. Status line + tool
+  // cards stay visible above so the user keeps context.
   if (state.modal !== null) {
     lines.push(...renderModal(state.modal, caps));
-  } else {
-    lines.push(ruleAboveInput(caps));
-    lines.push(...renderInput(state.input, caps));
+    return lines;
   }
+  lines.push(horizontalRule(caps));
+  lines.push(...renderInput(state.input, caps));
+  lines.push(horizontalRule(caps));
+  // renderFooter only returns null on modal (handled above); the
+  // non-null assert keeps the contract explicit — if a future
+  // renderFooter loosens it, composeCursor's FOOTER_BLOCK_LINES math
+  // would silently drift. Fail loudly here instead.
+  const footer = renderFooter(state, caps);
+  if (footer === null) throw new Error('composeLive: renderFooter returned null in non-modal path');
+  lines.push(footer);
 
   return lines;
 };
