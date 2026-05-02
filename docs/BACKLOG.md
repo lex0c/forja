@@ -15,6 +15,56 @@ Format:
 
 ---
 
+## [2026-05-01] M3 / Step 5.2.c — eager memory index injection in system prompt
+
+5.2.a/b shipped the read tools and CLI surface but the model only
+sees memory if it explicitly calls `memory_list` / `memory_search`
+— and Sonnet/Haiku rarely do that without a prompt nudge. Spec
+§4.1 mandates "index eager, content lazy": the merged per-scope
+index goes into the system prompt at session start so the model
+sees what's available without paying a tool round-trip. This sub-
+slice closes that gap. With memory injection in place, 5.2 is
+operationally complete — the model has full read access (visible
+index + lazy bodies + grep) cross-session.
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/cli/memory-prompt.ts` | NEW — `assembleMemorySection({ registry })` returns `{ text, entryCount }`. Empty when no memories exist (no scaffolding tokens wasted). With entries, emits a `# Memory` header + one-sentence usage hint (call `memory_read` / `memory_list` / `memory_search`) + bullet list `- [<scope>] <name> — <hook>`. Dedup is on by default so a name shadowed across all three scopes appears once at its most-specific scope (project_local > project_shared > user) — saves tokens and removes the resolution ambiguity the model would otherwise have to reason through. `composeSystemPrompt(base, section)` helper handles the four cases (both empty / one empty / both set), preserving `undefined` when memory is empty so existing tests asserting `systemPrompt === undefined` still pass. |
+| `src/cli/bootstrap.ts` | Bootstrap now constructs a `MemoryRegistry` post-migrate (with the live DB + cwd), assembles the section via `assembleMemorySection`, composes onto the resolved system prompt with `composeSystemPrompt`, and wires the registry into `HarnessConfig.memoryRegistry`. Construction is unconditional in production; an absent or empty memory subtree just produces empty section text and `composeSystemPrompt` passes the base through untouched. |
+| `tests/cli/bootstrap.test.ts` | beforeEach now sets `XDG_CONFIG_HOME = workdir`, restoring in afterEach. Without the override the bootstrap's eager memory load would pick up the developer's real `~/.config/agent/memory/` and bleed into every "passes through unchanged" assertion. Three new tests cover the integration: memory appended to caller systemPrompt; memory becomes systemPrompt when caller didn't supply one; registry wired even with empty memories (so the tools dispatch correctly). The existing 13 tests remain green because empty user scope (workdir has no `agent/memory/` subtree) yields an empty section. |
+| `tests/cli/memory-prompt.test.ts` | NEW — 10 unit tests on `assembleMemorySection` and `composeSystemPrompt`: empty registry, three-scope rendering, scope-precedence ordering, dedup-by-name, all four base+section combinations of compose. |
+
+**Decisions (post-review polish bundled in):**
+
+- **D8 (post-review C1) — Bootstrap try/catch extended to cover memory registry construction.** Pre-review the try/catch only wrapped `migrate(db)`. After migrate succeeded, `createMemoryRegistry` ran outside the catch — and that path can throw on fs errors other than ENOENT (EACCES, EIO on a misconfigured user scope or unreadable index file). A throw there leaked the open SQLite handle (and its -wal/-shm file pair). Extended the try block to wrap both `migrate` and the entire memory composition flow; any failure now closes the DB before propagating. Added a regression test that chmods MEMORY.md to 0o000 to force a read error and verifies bootstrap throws cleanly.
+- **D9 (post-review M1) — Resume mode loads the CURRENT memory tree, not the session-original snapshot.** Spec §4.1 says the index is "estável entre turnos da MESMA sessão"; cross-session it's free to drift. So `agent --resume <id>` running today shows whatever's in `~/.config/agent/memory/` and `<repo>/.agent/memory/{shared,local}/` NOW, not what was there when the session originally started. Persisted assistant messages may reference memories that no longer exist; the model handles this fine in practice (the body is reachable via memory_read failure → "memory.not_found" tool error, which the model can interpret). Documented as expected behavior; not fixing.
+
+**Decisions:**
+
+- **D1 — Memory section APPENDED to systemPrompt, not prepended.** Spec §4.1 places the memory index after AGENTS.md / project context. We don't have AGENTS.md yet, so the caller-supplied systemPrompt is the closest analogue to "project context"; memory follows. When AGENTS.md lands the layout extends as: `<plan-or-caller-prompt> + <AGENTS.md> + <memory section>` — consistent direction.
+- **D2 — Empty section means no scaffolding tokens.** `assembleMemorySection` returns `{ text: '', entryCount: 0 }` for an empty registry, and `composeSystemPrompt` short-circuits the empty-empty case to `undefined`. Operators with no memories pay zero token overhead. The alternative (always emit the `# Memory` header even with zero entries) would cost ~30 tokens per session for nothing.
+- **D3 — Dedup on by default in injection (opposite of `memory_list` tool default).** The MODEL-FACING tool surface keeps shadowing visible (the model needs to see "this name exists in 3 scopes; local wins" to learn the precedence model). The SYSTEM PROMPT injection collapses to the most-specific scope because: (a) the model only NEEDS to know which entry is active for "name X"; (b) showing all three triples context length without adding signal. The two surfaces have different audiences; different defaults are correct.
+- **D4 — Cache breakpoint optimization deferred.** Spec §4.1 says "Cache breakpoint depois do index". Anthropic's SDK supports per-block `cache_control` markers when `system` is an array, not a string. Currently the harness passes `system: string` raw. Wiring cache breakpoints requires a provider-adapter refactor (and tests) for a benefit that's measurable only on multi-turn sessions with stable indexes. Defer until eval / cost data shows the gain. The injection works correctly without it; only re-caching efficiency is left on the table.
+- **D5 — `XDG_CONFIG_HOME` env override in bootstrap tests, not a new test seam.** Adding `memoryRoots?: ScopeRoots | null` to BootstrapInput would have meant updating 13 existing tests with an opt-out flag. Setting `XDG_CONFIG_HOME = workdir` in the existing beforeEach is one place, matches production behavior (env-driven scope resolution), and parallels the same pattern already used in `tests/cli/memory.test.ts`. The new memory-bootstrap tests write to the project-local subtree (`<workdir>/.agent/memory/local/`) which is already isolated by the workdir tmpdir.
+- **D6 — Trust filter NOT applied yet.** Spec §7.2 mitigation 2 says `trust: untrusted` memories must NOT enter the base context. Filtering by trust requires reading every body's frontmatter (the index doesn't carry trust info), which violates the eager-index principle. Until 5.4 lands the trust integration (which will add an index-side trust marker OR a body preload pass), no production path writes `trust: untrusted` (only the writer in 5.4 does), so the gate is a no-op. The 5.4 design will close this; the 5.2.c injection passes every entry through.
+- **D7 — Section header is `# Memory` (markdown H1), not a sentinel comment.** Models pre-trained on prose recognize markdown structure; an H1 header makes the section visually distinct from the rest of the system prompt without adding parse-only ceremony. Section body uses prose + bullet list, same shape models see in user content.
+
+**Pending / known limitations:**
+
+- **No cache breakpoint marker.** Re-rendering the section every turn means the system prompt's hash changes only when the registry's underlying indexes change, but providers without per-block cache_control re-process the full prompt on every turn anyway. Cache hit rate is identical to today (the prompt ITSELF is stable per session, just not marked); we just don't get the "explicitly cache up to here" optimization Anthropic offers. Future work.
+- **No trust filter.** See D6. The injection includes every entry the registry sees. 5.4 closes this.
+- **No size cap on the section.** A pathological repo with 200 memory entries (the index hard cap) would inject ~200 lines into the system prompt — ~2k tokens by spec estimate. Acceptable: spec §3.2 already enforces the 200-line cap on `MEMORY.md`. The model's effective context budget can absorb 2k for cross-session memory; CONTEXT_TUNING will tune this if eval data warrants.
+- **Per-scope subsections deferred.** The current rendering is one flat list with `[scope]` prefixes. A future iteration could group by scope (`## Project (local)`, `## Project (shared)`, `## User`) for clearer visual structure when there are many entries. Today's flat form keeps the section short.
+- **Read-event spam from in-session re-loads not yet addressed.** The eager injection doesn't trigger `memory_read` events (it's index-only). But once the model starts calling `memory_read` repeatedly, each call writes a row. 5.6 audit pass may add a per-session dedup window if the rows turn out to be noisy.
+
+**Verification:** `bun test` 1610 pass / 10 skip / 0 fail (+13 new across the assembler unit tests + bootstrap integration tests + 1 environment-isolation update + 1 review-driven DB-leak regression test); `tsc --noEmit` clean; `biome check` clean.
+
+**Next:** With 5.2.a/b/c landed, the entire 5.2 (read-only surface) arc is COMPLETE. The model can list, search, and read memories cross-session, sees the index eagerly in the system prompt, and operators can inspect via `agent --memory`. M3 / Step 5.3 is the write surface — `memory_write` tool with TUI confirmation, the injection scanner (heuristic + secret-pattern detection), and headless-mode rejection. After that, 5.4 (trust integration), 5.5 (promote/demote), 5.6 (lifecycle).
+
+---
+
 ## [2026-05-01] M3 / Step 5.2.b — `agent --memory` operator surface (list + show)
 
 5.2.a landed the registry + read tools (model-facing). 5.2.b adds
