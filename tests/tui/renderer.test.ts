@@ -486,6 +486,94 @@ describe('renderer wiring', () => {
     expect(r.state().ended).toBe(true);
     r.close();
   });
+
+  test('cursor inline positioning emits cursorUp + carriage return + cursorForward after live write', () => {
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+    });
+    bus.emit(sessionStart);
+    sink.writes.length = 0;
+    // Type 'hello' then move cursor to position 2 (between 'he' and 'llo').
+    bus.emit({ type: 'input:update', ts: 2, value: 'hello', cursor: 2 });
+    sched.flushAll();
+    const out = sink.joined();
+    // Live region after flush is [status, rule, '> hello']. Cursor should
+    // land on row 2 (the input row) at col 4 (2 prefix + 2 offset).
+    // After write, terminal cursor is at end of '> hello' (col 7 of row 2).
+    // So renderer emits: \r (col 0), no cursorUp (already on row 2),
+    // cursorForward(4).
+    expect(out).toContain('\r');
+    expect(out).toContain(`${CSI}4C`);
+    // No cursorUp expected here (already on the right row).
+    r.close();
+  });
+
+  test('cursor inline on multi-line input emits cursorUp to reach the right row', () => {
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+    });
+    bus.emit(sessionStart);
+    sink.writes.length = 0;
+    // Multi-line input with cursor on the FIRST line. Live region after
+    // flush is [status, rule, '> first', '  second']. Cursor (offset 3)
+    // sits on row 2 ('> first'); terminal cursor after write is at end
+    // of row 3. Need to cursorUp(1) to reach the input's first row.
+    bus.emit({ type: 'input:update', ts: 2, value: 'first\nsecond', cursor: 3 });
+    sched.flushAll();
+    const out = sink.joined();
+    expect(out).toContain(`${CSI}1A`); // cursorUp(1)
+    expect(out).toContain(`${CSI}5C`); // cursorForward(2 prefix + 3 offset)
+    r.close();
+  });
+
+  test('modal up suppresses cursor positioning (no cursorUp/cursorForward after write)', () => {
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+    });
+    bus.emit(sessionStart);
+    bus.emit({
+      type: 'permission:ask',
+      ts: 2,
+      promptId: 'p1',
+      toolName: 'bash',
+      command: 'ls',
+      cwd: '/',
+    });
+    sched.flushAll();
+    sink.writes.length = 0;
+    // Trigger another draw (e.g., a noop step:budget) so we capture
+    // a fresh frame's writes.
+    bus.emit({ type: 'step:budget', ts: 3, steps: 1, maxSteps: 50, costUsd: 0 });
+    sched.flushAll();
+    const out = sink.joined();
+    // No cursorForward should appear in this frame (modal owns the
+    // cursor; composeCursor returns null, renderer skips positioning).
+    // Build the CSI prefix from the constant to dodge biome's no-control-
+    // characters-in-regex rule.
+    expect(out.match(new RegExp(`${CSI.replace('[', '\\[')}\\d+C`))).toBeNull();
+    r.close();
+  });
 });
 
 describe('renderer side effects', () => {

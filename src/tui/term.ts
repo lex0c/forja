@@ -65,6 +65,7 @@ export const CSI = `${ESC}[`;
 export const cursorUp = (n: number): string => (n <= 0 ? '' : `${CSI}${n}A`);
 export const cursorDown = (n: number): string => (n <= 0 ? '' : `${CSI}${n}B`);
 export const cursorBack = (n: number): string => (n <= 0 ? '' : `${CSI}${n}D`);
+export const cursorForward = (n: number): string => (n <= 0 ? '' : `${CSI}${n}C`);
 // 1-indexed (terminal convention). row=1,col=1 = top-left.
 export const cursorTo = (row: number, col: number): string => `${CSI}${row};${col}H`;
 export const cursorHide = `${CSI}?25l`;
@@ -102,6 +103,13 @@ export type SgrToken = keyof typeof SGR;
 // of per-color wrappers because every renderer flows through one path.
 export const paint = (caps: Pick<Capabilities, 'color'>, token: SgrToken, text: string): string =>
   caps.color === 'none' ? text : `${SGR[token]}${text}${SGR.reset}`;
+
+// Reverse video (SGR 7). Spec UI.md §4.10.8: reverse is an attribute,
+// not a color — it works under NO_COLOR (a black-on-white bar still
+// renders, just without color). Always emits the escape regardless of
+// `caps.color` because the use case (user-submit echo as scrollback
+// divider) depends on the visual contrast even in plain terminals.
+export const reverse = (text: string): string => `${CSI}7m${text}${SGR.reset}`;
 
 // ─── Mode toggles ─────────────────────────────────────────────────────────
 //

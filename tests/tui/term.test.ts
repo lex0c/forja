@@ -8,6 +8,7 @@ import {
   createResizeWatcher,
   cursorBack,
   cursorDown,
+  cursorForward,
   cursorTo,
   cursorUp,
   detectCapabilities,
@@ -18,6 +19,7 @@ import {
   isBracketedPasteActive,
   isRawModeActive,
   paint,
+  reverse,
 } from '../../src/tui/term.ts';
 
 describe('detectCapabilities', () => {
@@ -122,6 +124,18 @@ describe('ANSI helpers', () => {
   test('paint passes through when color disabled', () => {
     const caps: Pick<Capabilities, 'color'> = { color: 'none' };
     expect(paint(caps, 'error', 'oops')).toBe('oops');
+  });
+
+  test('cursorForward(N) emits CSI N C', () => {
+    expect(cursorForward(5)).toBe(`${CSI}5C`);
+    expect(cursorForward(0)).toBe('');
+    expect(cursorForward(-2)).toBe('');
+  });
+
+  test('reverse wraps with SGR 7 unconditionally (works under NO_COLOR)', () => {
+    // Spec UI.md §4.10.8: reverse is an attribute, not a color —
+    // emits the escape regardless of caps.color.
+    expect(reverse('hello')).toBe(`${CSI}7mhello${CSI}0m`);
   });
 });
 

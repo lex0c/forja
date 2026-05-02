@@ -24,6 +24,57 @@ import { renderToolCardLive } from './tool-card.ts';
 const ruleAboveInput = (caps: Capabilities): string =>
   paint(caps, 'dim', (caps.unicode ? '─' : '-').repeat(caps.cols));
 
+// Position the cursor wants to land inside the live region, so the
+// renderer can issue cursor-back escapes after writing. Coordinates
+// are 0-based from the top-left of the live region. Returns null when
+// no input is rendered (modal is up — modal owns the bottom slot).
+//
+// `lineCount` is the size of `composeLive`'s output for the same
+// state. We pass it instead of recomputing because the renderer
+// already has it.
+//
+// LAYOUT COUPLING — composeCursor assumes the input box is the LAST
+// block emitted by composeLive (so `lineCount - inputLineCount` =
+// input start row). True today; breaks the moment 1.e.4 lands a
+// footer below the input. When that slice arrives, either subtract
+// the footer's line count here too, or refactor composeLive to
+// return `{lines, inputStartRow}` so this function reads the value
+// directly. TODO(1.e.4): revisit.
+//
+// Visual columns assume single-width text (ASCII). CJK/emoji would
+// under-count by 1 col per double-width glyph; producers don't emit
+// multi-col text in the input today.
+export interface CursorPos {
+  row: number;
+  col: number;
+}
+export const composeCursor = (
+  state: LiveState,
+  caps: Capabilities,
+  lineCount: number,
+): CursorPos | null => {
+  if (state.modal !== null) return null;
+  const value = state.input.value;
+  const inputLineCount = value === '' ? 1 : value.split('\n').length;
+  const inputStartRow = lineCount - inputLineCount;
+  const before = value.slice(0, state.input.cursor);
+  const linesBefore = before.split('\n');
+  const cursorLineIdx = linesBefore.length - 1;
+  const cursorColInLine = (linesBefore[cursorLineIdx] ?? '').length;
+  // Both '> ' (first line) and '  ' (continuation) are 2 chars wide.
+  const prefixWidth = 2;
+  // Clamp to caps.cols - 1 so cursor stays on-screen for buffers
+  // wider than the terminal. Without this, cursorForward overshoots
+  // and either the terminal clamps (cursor "lost" at edge) or
+  // auto-wraps to the next row (eraseLive math then walks the wrong
+  // number of rows back). Buffer scrolling within the input box
+  // is future polish; clamp is the safety floor.
+  return {
+    row: inputStartRow + cursorLineIdx,
+    col: Math.min(prefixWidth + cursorColInLine, Math.max(0, caps.cols - 1)),
+  };
+};
+
 export const composeLive: ComposeLive = (
   state: LiveState,
   caps: Capabilities,

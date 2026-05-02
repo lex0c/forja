@@ -20,7 +20,7 @@
 import type { Bus } from './bus.ts';
 import type { UIEvent } from './events.ts';
 import { type Heartbeat, type HeartbeatOptions, createHeartbeat } from './heartbeat.ts';
-import { composeLive as defaultComposeLiveFn } from './render/compose.ts';
+import { composeCursor, composeLive as defaultComposeLiveFn } from './render/compose.ts';
 import { formatPermanent } from './render/permanent.ts';
 import { truncateToWidth } from './render/width.ts';
 import type { ComposeLive } from './renderer-types.ts';
@@ -39,6 +39,7 @@ import {
   clearDown,
   createFrameScheduler,
   createResizeWatcher,
+  cursorForward,
   cursorUp,
   disableBracketedPasteOn,
   disableRawMode,
@@ -120,16 +121,21 @@ export const createRenderer = (options: RendererOptions): Renderer => {
   // Number of lines written by the last `drawLive`. Used to compute
   // how many lines to clear on the next redraw.
   let liveHeight = 0;
+  // Row (0-based from top of live region) where the cursor currently
+  // sits. After drawLive without inline cursor positioning this equals
+  // `liveHeight - 1` (cursor at end of last line). When cursor inline
+  // positioning fires, this matches the cursor row so eraseLive walks
+  // the right number of lines back to row 0.
+  let cursorRow = 0;
   let closed = false;
 
   const eraseLive = (): void => {
     if (liveHeight === 0) return;
-    // After the last drawLive, the cursor sits at the END of the last
-    // live line (no trailing newline). To erase we need to:
-    //   1. Carriage return — move to column 1 of the current line.
-    //   2. Move up (liveHeight - 1) lines.
-    //   3. Clear from cursor down to the bottom of the screen.
-    write(`\r${cursorUp(liveHeight - 1)}${clearDown}`);
+    // \r → col 0; cursorUp(cursorRow) → row 0 of live region;
+    // clearDown wipes everything below. cursorRow may be < liveHeight-1
+    // when inline cursor positioning moved the cursor into the input
+    // buffer mid-write.
+    write(`\r${cursorUp(cursorRow)}${clearDown}`);
     liveHeight = 0;
   };
 
@@ -143,6 +149,18 @@ export const createRenderer = (options: RendererOptions): Renderer => {
     const truncated = raw.map((l) => truncateToWidth(l, liveCaps.cols));
     write(truncated.join('\n'));
     liveHeight = truncated.length;
+    cursorRow = truncated.length - 1;
+    // Inline cursor positioning. After the join+write the terminal
+    // cursor sits at end of the last line; back it up to where the
+    // input box wants it (cursorUp + carriage return + cursorForward).
+    // The helpers no-op on n <= 0, so single concat handles "already
+    // on the right row" / "col 0" without branching.
+    const cursor = composeCursor(state, liveCaps, truncated.length);
+    if (cursor !== null) {
+      const linesUp = truncated.length - 1 - cursor.row;
+      write(`${cursorUp(linesUp)}\r${cursorForward(cursor.col)}`);
+      cursorRow = cursor.row;
+    }
   };
 
   const writePermanent = (items: PermanentItem[]): void => {

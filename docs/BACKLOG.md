@@ -15,6 +15,52 @@ Format:
 
 ---
 
+## [2026-05-02] M1 / Step 1.e.2 — User echo inverse bar + cursor inline
+
+Two visuals that finish the input box's polish: every user prompt is
+echoed back as a full-width SGR-7 (reverse video) bar in scrollback,
+turning each turn into a visual landmark you can find by scrolling
+alone (UI.md §4.10.8). And the cursor inside the input box now sits
+where `state.input.cursor` says it does — not always at the end of
+the line — so editing mid-buffer (Home, ←, Ctrl+A, multi-line up/
+down) finally feels like a real input.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/term.ts` | NEW `reverse(text)` helper that wraps text in `CSI 7m` + reset. Always emits regardless of `caps.color` — reverse is an attribute, not a color, and the user-echo bar needs the visual contrast even under NO_COLOR (UI.md §4.10.8). NEW `cursorForward(n)` ANSI helper (`CSI N C`); same shape as `cursorBack`/`cursorUp`/`cursorDown`. |
+| `src/tui/render/permanent.ts` | `user-submit` case rewritten: split text on `\n`, prefix first line with `> ` and continuations with two spaces, pad each line to `caps.cols` (clamping when the text already exceeds), wrap in `reverse()`. The result is a stack of edge-to-edge inverse bars — one per input line. Each line gets its own `CSI 7m`/`CSI 0m` pair so terminal re-flow on resize doesn't strand inverse state across boundaries. |
+| `src/tui/render/compose.ts` | NEW `composeCursor(state, lineCount): {row, col} \| null` helper. Returns null when `state.modal !== null` (modal owns the cursor). Otherwise computes the cursor's logical position within the live region: counts the input's line index (newlines before `state.input.cursor`), adds the 2-char prefix width to get the visual column, and combines with the input's start row (derived from `lineCount - inputLineCount`). |
+| `src/tui/renderer.ts` | `drawLive` now tracks a `cursorRow` field (0-based from top of live region) and applies the inline cursor positioning after writing all live lines: `cursorUp(linesUp)` (only when target row is above the last line), `\r` (col 0), `cursorForward(col)`. `eraseLive` parameterizes its cursor-up count by `cursorRow` instead of the previous `liveHeight - 1` constant — necessary because the cursor may sit inside the input mid-row, not at end of last line. |
+| `tests/tui/term.test.ts` | NEW 2 tests: `cursorForward(N)` shape (CSI N C, no-op on n ≤ 0); `reverse()` always wraps (UI.md §4.10.8 attribute-vs-color). |
+| `tests/tui/render/permanent.test.ts` | Old `user-submit` block (2 tests) replaced by `describe('user-submit (inverse bar)')` with 4 tests: single-line padding + SGR wrap, multi-line shape (each line independently wrapped), reverse fires under `color: 'none'`, text wider than `caps.cols` is not padded (clamps to 0). |
+| `tests/tui/render/compose.test.ts` | NEW `describe('composeCursor')` with 7 tests: null on modal, empty input → row=last/col=2, mid-buffer offset → col reflects offset, end-of-input, multi-line cursor on second line, cursor at offset 0, cursor right after a newline (continuation start). |
+| `tests/tui/renderer.test.ts` | NEW 3 integration tests covering the cursor pipeline end-to-end through the renderer: single-line cursor emits `\r` + `cursorForward(N)` (no `cursorUp` because target row matches last line); multi-line cursor on the FIRST input row emits `cursorUp(1)` + `cursorForward(5)` (2 prefix + 3 offset); modal up suppresses cursor positioning entirely (no `CSI N C` escapes in the frame's writes). |
+
+**Decisions:**
+
+- **D76 — `reverse()` always emits, regardless of `caps.color`.** The spec (UI.md §4.10.8) explicitly carves reverse out as an attribute that survives NO_COLOR. A black-on-white inverted bar still divides scrollback meaningfully even when the user disables color; gating reverse on `caps.color` would silently kill the divider for the audience that needs it most (terminals without color, dim CI logs preserved). Implementation: bare `${CSI}7m...${CSI}0m` template, no caps inspection.
+- **D77 — Each user-submit line wraps in its OWN reverse pair.** A single outer `${CSI}7m...lines.join('\n')...${CSI}0m` would be shorter, but a terminal resize / re-flow could strand the open SGR across newlines (some terminals reset attributes on `\n`, some don't — undefined). Per-line wrap is robust regardless of terminal quirk, costs ~7 bytes of escape per line.
+- **D78 — Padding uses `' '.repeat(caps.cols - visualWidth(line))`, not `padEnd`.** The string's `padEnd` pads code units; for plain ASCII text that matches visual columns, but CJK / emoji content would over-pad. Using `visualWidth` in the math future-proofs for multi-col text in input (none today, but the input editor accepts arbitrary Unicode). The `Math.max(0, ...)` clamps so over-wide text gets no padding instead of negative `repeat()` arg (which throws in modern engines).
+- **D79 — `composeCursor` lives in `compose.ts`, not the renderer.** The cursor position is derived from the same state + layout that produces `composeLive`'s output. Keeping both in `compose.ts` means future layout changes (footer below input, todo list interleaved) update one file: composeLive's line layout AND composeCursor's row math stay in sync. Putting it in the renderer would couple cursor logic to the writer and fragment layout knowledge.
+- **D80 — `lineCount` passed in, not recomputed.** `composeCursor` could re-call `composeLive` (or duplicate parts of its traversal) to know the total line count. Passing the number the renderer already has avoids a second pass through state.activeTools and a second renderInput invocation. Trade: caller MUST pass the actual count from `composeLive`'s output; mismatch produces a wrong row. Acceptable — there's exactly one caller (the renderer).
+- **D81 — `cursorRow` is renderer-internal state, mutated by drawLive, consumed by eraseLive.** Pre-1.e.2, `eraseLive` assumed the cursor was always at the end of the last live line (`cursorUp(liveHeight - 1)` math). With inline cursor positioning, the cursor may sit mid-input mid-row. The renderer tracks `cursorRow` so eraseLive knows how many lines to walk back. Default after drawLive without inline cursor = `liveHeight - 1` (preserves the old behavior). Default before any drawLive = 0 (irrelevant; eraseLive bails when liveHeight is 0).
+- **D82 — Single-width assumption for cursor visual column.** `composeCursor` uses `(linesBefore[idx] ?? '').length` for the offset within the input line — code units, not visual width. CJK / emoji input would mis-count by 1 col per double-width glyph. Producers don't emit multi-col text in the input today (the editor accepts it but typical use is ASCII). Documented limitation; lands when visualWidth-aware cursor math is needed.
+- **D83 — Cursor positioning runs INSIDE drawLive, not as a post-write hook.** JS is single-threaded so "atomic write+position" isn't preemption protection — the value is single-responsibility: drawLive owns the live region top-to-bottom and callers can't forget to position. A separate `positionCursor()` would split the concern across two methods and the next refactor would break ordering. Inline keeps the contract trivially correct.
+
+**Pending / out of scope this slice:**
+
+- **CJK / emoji cursor accuracy** (D82). The cursor offset assumes single-width per code-unit. Multi-col text in input mis-positions by 1-2 cols per glyph.
+- **Cursor visibility toggle.** Spec UI.md §6.2 has `cursorHide`/`cursorShow` constants but the renderer doesn't toggle them; cursor is always visible (terminal default). If we ever want to hide during long live region transitions, the hooks exist.
+- **Input scroll for very long buffers.** When `state.input.cursor` exceeds `caps.cols`, the cursor positioning math sends the cursor past the terminal edge. Modern terminals clamp; behavior is OK but ugly. Horizontal scroll within the input box (showing a window of the buffer around the cursor) is future polish.
+
+**Verification:** `bun test` → 1985 pass / 10 skip / 0 fail (+14 new across term, permanent, compose, renderer). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.e.3 — tool indicator collapsed (verb + sub-content per spec §4.10.3-7). Refactor of `tool:start`/`tool:end` payload to carry `verb` + `subject` instead of raw JSON args, new `src/tui/tool-vocab.ts` mapping tool names to their active/final verbs and subject extractors, and `formatPermanent` / `tool-card` rewrite to use the `└─` connector. Most invasive of the 1.e.X slices because it touches the harness adapter (verb registration) and every tool's metadata.
+
+---
+
 ## [2026-05-02] M1 / Step 1.e.1 — Welcome banner + rule above input
 
 First slice of the §4.10 layout-target implementation. Two cheap

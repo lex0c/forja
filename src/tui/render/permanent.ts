@@ -11,7 +11,8 @@
 // never sees `caps`.
 
 import type { PermanentItem } from '../state.ts';
-import { type Capabilities, paint } from '../term.ts';
+import { type Capabilities, paint, reverse } from '../term.ts';
+import { visualWidth } from './width.ts';
 
 // Glyph tables for `tool-end`. Two paths because the spec (UI.md §6.2)
 // caps Forja's palette to Unicode when locale supports it, ASCII
@@ -50,9 +51,20 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       return lines;
     }
     case 'user-submit': {
-      // Echo the prompt with `> ` prefix on first line and 2-space
-      // continuation indent on subsequent ones.
-      return item.text.split('\n').map((l, i) => (i === 0 ? `> ${l}` : `  ${l}`));
+      // UI.md §4.10.8 — full-width inverse bar acts as a structural
+      // divider in scrollback (rolling back, the bars locate turns
+      // without inventing headings). Each line is padded to the
+      // terminal width then wrapped in SGR 7 so the inversion
+      // extends edge-to-edge regardless of text length.
+      const prefixed = item.text.split('\n').map((l, i) => (i === 0 ? `> ${l}` : `  ${l}`));
+      return prefixed.map((line) => {
+        // padEnd pads code units; for plain ASCII text that matches
+        // visual columns. CJK / emoji content would over-pad —
+        // accept the small inconsistency until visualWidth-aware
+        // padding lands (no producer emits multi-col text today).
+        const padded = line + ' '.repeat(Math.max(0, caps.cols - visualWidth(line)));
+        return reverse(padded);
+      });
     }
     case 'assistant':
       return item.text.length > 0 ? item.text.split('\n') : [];

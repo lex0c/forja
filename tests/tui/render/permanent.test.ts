@@ -87,16 +87,55 @@ describe('formatPermanent', () => {
     });
   });
 
-  test('user-submit renders > prefix and 2-space continuation indent', () => {
-    expect(formatPermanent({ kind: 'user-submit', text: 'first\nsecond\nthird' }, ascii)).toEqual([
-      '> first',
-      '  second',
-      '  third',
-    ]);
-  });
+  describe('user-submit (inverse bar, UI.md §4.10.8)', () => {
+    // SGR 7 (reverse) emits unconditionally — it's an attribute, not
+    // a color (works under NO_COLOR). Each line is padded to caps.cols
+    // before reversal so the bar extends edge-to-edge.
+    const REVERSE_OPEN = '\x1b[7m';
+    const RESET = '\x1b[0m';
 
-  test('user-submit with single line emits one prefixed line', () => {
-    expect(formatPermanent({ kind: 'user-submit', text: 'hi' }, ascii)).toEqual(['> hi']);
+    test('single-line submit pads to caps.cols and wraps the line in SGR 7', () => {
+      const out = formatPermanent({ kind: 'user-submit', text: 'hi' }, ascii);
+      expect(out).toHaveLength(1);
+      const line = out[0] ?? '';
+      expect(line.startsWith(REVERSE_OPEN)).toBe(true);
+      expect(line.endsWith(RESET)).toBe(true);
+      // Strip SGR to inspect the padded content.
+      const inner = line.slice(REVERSE_OPEN.length, -RESET.length);
+      expect(inner).toBe('> hi'.padEnd(ascii.cols));
+    });
+
+    test('multi-line submit applies > on first line, two-space continuation, full-width bar each', () => {
+      const out = formatPermanent({ kind: 'user-submit', text: 'first\nsecond\nthird' }, ascii);
+      expect(out).toHaveLength(3);
+      const inners = out.map((l) => l.slice(REVERSE_OPEN.length, -RESET.length));
+      expect(inners).toEqual([
+        '> first'.padEnd(ascii.cols),
+        '  second'.padEnd(ascii.cols),
+        '  third'.padEnd(ascii.cols),
+      ]);
+      // Each line independently wrapped in SGR 7 + reset (so terminal
+      // resize / re-flow doesn't strand inverse state across lines).
+      for (const l of out) {
+        expect(l.startsWith(REVERSE_OPEN)).toBe(true);
+        expect(l.endsWith(RESET)).toBe(true);
+      }
+    });
+
+    test('reverse is emitted even when caps.color is "none" (attribute, not color)', () => {
+      // ascii uses color: 'none'. Reverse must still emit per spec.
+      const out = formatPermanent({ kind: 'user-submit', text: 'x' }, ascii);
+      expect((out[0] ?? '').includes(REVERSE_OPEN)).toBe(true);
+    });
+
+    test('text wider than caps.cols is not padded (negative pad clamps to 0)', () => {
+      const narrow: Capabilities = { ...ascii, cols: 5 };
+      const out = formatPermanent({ kind: 'user-submit', text: 'a long input' }, narrow);
+      // Inner content keeps the original text without truncation;
+      // truncation is the renderer's job (truncateToWidth).
+      const inner = (out[0] ?? '').slice(REVERSE_OPEN.length, -RESET.length);
+      expect(inner).toBe('> a long input');
+    });
   });
 
   test('assistant splits text on newlines with no prefix', () => {

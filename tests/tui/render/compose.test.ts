@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { composeLive } from '../../../src/tui/render/compose.ts';
+import { composeCursor, composeLive } from '../../../src/tui/render/compose.ts';
 import { visualWidth } from '../../../src/tui/render/width.ts';
 import type { ActiveTool, LiveState } from '../../../src/tui/state.ts';
 import { createInitialState } from '../../../src/tui/state.ts';
@@ -135,5 +135,88 @@ describe('composeLive layout', () => {
     expect(out.includes(ruleA)).toBe(false);
     // No `> ` input either; modal renders instead.
     expect(out.includes('> ')).toBe(false);
+  });
+});
+
+describe('composeCursor', () => {
+  test('null when modal is up (modal owns the cursor)', () => {
+    const s = startedSession();
+    s.modal = {
+      promptId: 'p1',
+      flavor: 'permission',
+      message: 'm',
+      details: [],
+      selected: 'no',
+    };
+    expect(composeCursor(s, caps, 5)).toBeNull();
+  });
+
+  test('empty input → cursor at last row, col=2 (after `> ` prefix)', () => {
+    // Pre-session: lines = [rule, '> ']. lineCount = 2.
+    const s = createInitialState();
+    expect(composeCursor(s, caps, 2)).toEqual({ row: 1, col: 2 });
+  });
+
+  test('single-line input mid-buffer → col reflects offset within line', () => {
+    const s = startedSession();
+    s.input.value = 'hello world';
+    s.input.cursor = 5; // between hello and space
+    // After session start: lines = [status, rule, '> hello world']. lineCount = 3.
+    // Cursor sits on the input line (row 2), col = 2 (prefix) + 5 = 7.
+    expect(composeCursor(s, caps, 3)).toEqual({ row: 2, col: 7 });
+  });
+
+  test('cursor at end of single-line input', () => {
+    const s = startedSession();
+    s.input.value = 'abc';
+    s.input.cursor = 3;
+    expect(composeCursor(s, caps, 3)).toEqual({ row: 2, col: 5 }); // 2 prefix + 3
+  });
+
+  test('multi-line input → cursor on the line containing the offset', () => {
+    const s = startedSession();
+    s.input.value = 'first\nsecond\nthird';
+    // Cursor inside "second" at offset 9 (after "first\nsec").
+    s.input.cursor = 9;
+    // lines = [status, rule, '> first', '  second', '  third']. lineCount = 5.
+    // Input occupies rows 2,3,4. Cursor is on the 2nd input line (row 3).
+    // Within "second", offset is 3 (s,e,c|ond → after 'sec'). Visual col = 2 + 3 = 5.
+    expect(composeCursor(s, caps, 5)).toEqual({ row: 3, col: 5 });
+  });
+
+  test('cursor at start of buffer (offset 0) is at first input line, col=2', () => {
+    const s = startedSession();
+    s.input.value = 'hello';
+    s.input.cursor = 0;
+    expect(composeCursor(s, caps, 3)).toEqual({ row: 2, col: 2 });
+  });
+
+  test('cursor at start of a continuation line maps to col=2 of that row', () => {
+    const s = startedSession();
+    s.input.value = 'a\nb';
+    s.input.cursor = 2; // right after the newline, before 'b'
+    // lines = [status, rule, '> a', '  b']. lineCount = 4.
+    expect(composeCursor(s, caps, 4)).toEqual({ row: 3, col: 2 });
+  });
+
+  test('col clamps to caps.cols-1 when buffer is wider than the terminal', () => {
+    const narrow: Capabilities = { ...caps, cols: 10 };
+    const s = startedSession();
+    s.input.value = 'a'.repeat(50);
+    s.input.cursor = 50; // far past the right edge
+    // Without clamping, col would be 52 (2 prefix + 50 offset). The
+    // terminal would clamp visually OR auto-wrap to the next row,
+    // breaking eraseLive's row math. composeCursor floors at cols-1.
+    const cur = composeCursor(s, narrow, 3);
+    expect(cur).not.toBeNull();
+    expect(cur?.col).toBe(narrow.cols - 1);
+  });
+
+  test('col clamp does not mangle short inputs that already fit', () => {
+    const narrow: Capabilities = { ...caps, cols: 20 };
+    const s = startedSession();
+    s.input.value = 'short';
+    s.input.cursor = 5;
+    expect(composeCursor(s, narrow, 3)).toEqual({ row: 2, col: 7 });
   });
 });
