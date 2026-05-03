@@ -173,7 +173,7 @@ describe('createBuiltinRegistry', () => {
     if (help === undefined) return;
     const result = await help.exec([], makeCtx().ctx);
     if (result.kind !== 'ok') return;
-    // 9 commands → 10 lines (header + 9 rows).
-    expect(result.notes?.length).toBe(10);
+    // 9 commands → header + 9 rows + blank + emergency-exit footer = 12.
+    expect(result.notes?.length).toBe(12);
   });
 });

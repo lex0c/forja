@@ -15,6 +15,79 @@ Format:
 
 ---
 
+## [2026-05-03] M2 / fix — strip ANSI from assistant text (terminal-mode hijack defense)
+
+Operator reportou que o input continuava travando depois do drain fix anterior, especificamente "após ler arquivo e me responder". Investigação aprofundada revelou um vetor independente: texto do assistant é renderizado raw, sem strip de escape sequences. Provider output passando por `harness-adapter.ts:232` (`text: ev.text`) → reducer acumula → permanent emite literal → `truncateToWidth` preserva CSI sequences (comentário em `width.ts:33` confirma: "We don't try to balance emitted escapes — the caller is responsible") → terminal recebe.
+
+Vetores específicos que causam "input travado":
+- `\x1b[?25l` (hide cursor) — operator digita, nada visível, parece travado.
+- `\x1b[?2004h` (bracketed paste) — keystrokes viram payload de paste.
+- `\x1b[?1049h` (alt screen) — perde todo o layout do REPL.
+- `\x1b[?2026h` sem `l` (sync output sem fim) — terminal buffer sem flush.
+- `\x1b[?1h` (DECCKM) — setas mudam de codificação.
+
+Que isso aconteça especificamente após `read_file` bate exatamente: file content → modelo cita bytes na resposta (especialmente arquivos com colored output, terminal logs, shell captures) → terminal absorbs.
+
+**Done:**
+
+- `src/tui/harness-adapter.ts`: `text_delta` agora passa `ev.text` por `stripAnsi()` antes de emitir `assistant:delta`. Strip total (não selectivo) porque SGR colors também leak (sem reset no fim → terminal fica vermelho permanente), OSC pode mexer com title/clipboard, e escape parsing imperfeito é footgun maior que perda de cores que o modelo "queria". Renderer tem suas próprias regras de cor via `paint()`; modelo não decide.
+- `tests/tui/harness-adapter.test.ts`: regression test combinando SGR + DEC private mode + OSC + texto benign — verifica que `\x1b` desaparece e prosa permanece.
+
+**Decisions:**
+
+- **Strip na entrada (adapter), não na saída (renderer).** Single boundary onde untrusted content entra na TUI. Se striparmos no renderer, cada surface (live chip preview, permanent block, recap snapshots) precisaria lembrar de fazer; uma única omissão = vetor reaberto.
+- **Strip total, não selectivo de DEC modes.** Filtro selectivo seria mais cirúrgico mas é complexo (várias famílias: CSI, OSC, DCS, SS3, APC, PM) e cada uma com final-byte rules diferentes. Usar `stripAnsi` existente é mais simples e mais defensivo.
+- **`thinking_delta` text NÃO foi stripado.** Spec atual descarta o texto (reducer só usa o delta como ping pra manter indicator visível); strip seria trabalho desnecessário até alguma feature futura render thinking text inline.
+- **Tool subject (vocab.subject(args)) NÃO foi stripado nesta passada.** Theoretical vector mas modelo precisa colocar bytes ANSI num campo estruturado (path, command) o que é muito menos provável que em texto livre. Defense in depth pra próxima slice se aparecer no campo.
+- **Tool preview (`tool:delta`) NÃO foi stripado.** Confirmado no grep que evento é definido mas nenhum producer emite hoje — preview vazio na produção. Quando algum producer começar a emitir, repetir o strip aí.
+
+**Não-causas (rastreadas e descartadas):**
+
+- Drain de lone ESC (slice anterior) — fix correto mas era vetor independente; não cobria o caso de modelo emitindo escape sequences.
+- Modal handler leak — `resolveActive` bem comportado.
+- Janela `session_finished` ↔ `running := false` — submilliseconds, não causa freeze visível.
+- Bracketed paste no parser — pareado corretamente em `feed`.
+- Raw mode toggling — só na criação/close do renderer.
+
+**Pending:** observar em uso. Se ainda houver freezes, candidatos próximos: tool subject sanitize, OSC handling no `wrapSync`, instrumentation pra capturar stuck-state.
+
+---
+
+## [2026-05-03] M2 / fix — drain lone ESC after stdin idle (input-stuck repro)
+
+Bug report: input "fica travado" depois do `Cogitated` (turn end), às vezes; Ctrl+C também não responde. Investigação rastreou pra um defeito real no pump de keystroke: `parser.drain()` existia (`src/tui/keys.ts:363-376`) e o teste `'lone ESC is buffered until drain'` documentava o contrato, mas o REPL nunca chamava `drain`. Resultado:
+
+1. Operador aperta Esc só (pra soft-interrupt) → terminal manda `\x1b` → parser bufferiza esperando disambiguar (CSI leader vs Escape key).
+2. Sem follow-up bytes, sem drain, o ESC fica preso no buffer pra sempre. Soft-interrupt cue nunca aparece.
+3. Próximo keystroke (depois do turn finalizar, por exemplo) combina com o ESC pendente — `\x1b a` vira **Alt+a**, não `'a'`. Editor recebe Alt+letter, no-op. Input visualmente "travado".
+4. Ctrl+C também sofre quando há sequência parcial (`\x1b[` etc.) — buffer drena via path "drop ESC" eventualmente, mas o estado é frágil.
+
+**Done:**
+
+- `src/cli/repl.ts`: pump de stdin agora arma drainTimer de 30ms a cada `parser.feed()` quando `parser.bufferLength() > 0`. Próximo keystroke cancela o timer (`cancelDrain()`) antes de feedar — multi-byte sequences (CSI / SS3) entregues em chunks separados continuam a funcionar; só lone ESCs que ficam idle pelo timeout viram Escape keypresses. Convenção xterm: 25-100ms; 30 é o ponto que cobre latência SSH sem operator perceber lag em Esc deliberado.
+- `cancelDrain()` chamado no `shutdown` pra não vazar o handle (Bun reportaria como "open handle" em testes; produção atrasaria exit por até 30ms).
+- Test `tests/cli/repl.test.ts:'second Esc while soft already in flight emits interrupt:hard'` reescrito pra usar lone `\x1b` (matching real terminal output) + flushFrame (50ms > 30ms drain) — o teste antigo passava por sorte (mandava `\x1b\x1b` que emitia 1 escape imediato e bufferizava o resto, depois mandava outro `\x1b\x1b` que drenava o buffer remanescente). Pré-fix o canonical "Esc Esc = hard" da spec §5.4 nunca funcionou pra um operador real apertando Esc duas vezes; só funcionava se ele apertasse rapidamente o suficiente pra mandar 4 ESCs no mesmo chunk.
+
+**Decisions:**
+
+- **30ms drain timeout.** Mais curto (10ms) corre risco de drainar durante entrega de CSI sobre SSH lento. Mais longo (100ms+) cria lag perceptível em Esc isolado. xterm-keyboard convention modal range é 25-100ms; pego o limite inferior + folga.
+- **Cancel-and-rearm em todo feed.** Alternativa seria deixar o timer rodar e drainar mesmo após chegada de novos bytes — mas isso emitiria escapes errados quando uma CSI multi-byte é entregue em 2 feeds com gap > 30ms. Cancel-and-rearm garante que CSI completas (entregues no MESMO feed) nunca disparam drain, e CSIs split por SSH lag têm `parser.bufferLength()` > 0 que mantém o timer armado.
+- **Drain no shutdown, não no SIGCONT/SIGWINCH.** Diferentes sinais não invalidam o buffer do parser; o drain timer só precisa morrer quando o REPL morre.
+
+**Não-causas descartadas na investigação:**
+
+- Raw mode toggling — setado uma vez na criação do renderer, desligado só no close.
+- Bracketed paste lifecycle — enable/disable bem pareados.
+- DECSET 2026 BSU/ESU — sempre emitidos em par via `wrapSync`.
+- Modal manager handler leak — `resolveActive` limpa corretamente.
+- Heartbeat — só drives spinner, não bloqueia typing.
+- Janela entre `session_finished` UIEvent e `running := false`: existe (sub-millisecond), mas não pode causar input visualmente travado.
+- Focus events — não habilitamos `CSI ? 1004 h`, terminais não emitem.
+
+**Next:** observar em uso pra confirmar que o bug reportado está resolvido.
+
+---
+
 ## [2026-05-03] M2 / fix — input soft-wrap respects surrogate pairs
 
 Bug report do operator: o soft-wrap introduzido em slice anterior usava `line.slice(pos, pos + innerWidth)` que cortava code units sem respeitar pares de surrogate UTF-16. Em uma linha com 😀 (U+1F600) caindo exatamente no boundary, o chunk emitia o high surrogate solto e o próximo começava com o low surrogate solto — terminal renderiza como replacement glyph (U+FFFD) e o tracking de coluna do cursor drifta pelo resto da linha.

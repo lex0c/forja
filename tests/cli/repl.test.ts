@@ -119,6 +119,17 @@ const makeRunAgent = (
     finish: (idx, override) => {
       const r = pendingResolves[idx];
       if (r === undefined) throw new Error(`no pending run at ${idx}`);
+      // Mirror the real harness's emit-then-return order: session_finished
+      // fires synchronously BEFORE the runAgent Promise resolves
+      // (loop.ts calls `safeEmit` inside `finish()` before returning the
+      // result up the stack). The REPL's onHarnessEvent reads
+      // `result.sessionId` / costs from the event payload — bookkeeping
+      // moved off the runAgent .then() so the operator isn't gated on
+      // the harness's outer-finally cleanup (checkpoint purge + bg
+      // cleanup, see repl.ts comment). Tests need the same ordering.
+      const result = buildResult(resolveSession(idx + 1), override ?? {});
+      const cap = captured[idx];
+      if (cap !== undefined) cap.emit({ type: 'session_finished', result });
       r(override ?? {});
     },
   };
@@ -528,8 +539,10 @@ describe('repl — boot + smoke', () => {
   test('second Esc while soft already in flight emits interrupt:hard', async () => {
     // Operator escalates: first Esc → soft (softStopController.abort
     // only), second Esc → hard (abortController.abort, preempts
-    // in-flight work). Asserts the post-1.g.1 contract by reading
-    // both controllers' signal state directly.
+    // in-flight work). Each physical Esc keypress sends a single
+    // `\x1b`; the parser holds it briefly to disambiguate from a CSI
+    // leader, then the lone-ESC drain (REPL-side, ~30ms) flushes it
+    // as an Escape keypress. flushFrame's 50ms wait covers the drain.
     const stdin = makeStdin();
     const ra = makeRunAgent((n) => `sess-${n}`);
     const promise = runRepl({
@@ -558,13 +571,13 @@ describe('repl — boot + smoke', () => {
     const softSignal = cfg?.softStopSignal;
     expect(signal?.aborted).toBe(false);
     expect(softSignal?.aborted).toBe(false);
-    // First Esc: soft fires (cooperative), hard signal untouched.
-    stdin.feed('\x1b\x1b');
+    // First Esc: lone \x1b → drain emits escape after ~30ms → soft.
+    stdin.feed('\x1b');
     await flushFrame();
     expect(softSignal?.aborted).toBe(true);
     expect(signal?.aborted).toBe(false);
-    // Second Esc: escalates to hard — preempts in-flight work.
-    stdin.feed('\x1b\x1b');
+    // Second Esc: same path → drain emits second escape → hard.
+    stdin.feed('\x1b');
     await flushFrame();
     expect(signal?.aborted).toBe(true);
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });

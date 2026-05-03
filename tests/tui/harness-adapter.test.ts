@@ -233,6 +233,36 @@ describe('harness-adapter — provider events: text streaming', () => {
     expect(delta.messageId).toBe(start.messageId);
   });
 
+  test('text_delta strips ANSI escapes (terminal-mode hijack defense)', () => {
+    // Provider output containing escape sequences (model quoting a
+    // file's bytes, code about terminal codes, prompt-injection)
+    // would otherwise be written raw to the operator's terminal.
+    // The most damaging classes are DEC private modes — `\x1b[?2004h`
+    // toggles bracketed paste, `\x1b[?25l` hides the cursor,
+    // `\x1b[?1049h` switches to the alt screen. From the operator's
+    // POV the input "freezes" because feedback goes invisible or
+    // keystrokes get reinterpreted. The adapter strips on entry so
+    // every downstream consumer (live chip, permanent block, recap
+    // snapshots) sees clean text without each having to remember.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'm' } });
+    const out = a.translate({
+      type: 'provider_event',
+      event: {
+        kind: 'text_delta',
+        // Mix the worst offenders: SGR color, DEC mode, OSC, plus
+        // benign prose that must survive.
+        text: 'hello \x1b[31mred\x1b[0m and \x1b[?2004h danger \x1b]0;title\x07 done',
+      },
+    });
+    const delta = out[0] as Extract<UIEvent, { type: 'assistant:delta' }>;
+    expect(delta.text).not.toContain('\x1b');
+    expect(delta.text).toContain('hello');
+    expect(delta.text).toContain('red');
+    expect(delta.text).toContain('danger');
+    expect(delta.text).toContain('done');
+  });
+
   test('stop → assistant:end and clears state', () => {
     const a = createHarnessAdapter(baseCtx());
     a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'm' } });

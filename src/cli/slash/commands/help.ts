@@ -19,6 +19,18 @@ export const buildHelpCommand = (listCommands: () => SlashCommand[]): SlashComma
     // Two-column layout: `/<name>` padded to the longest, then desc.
     const longest = cmds.reduce((max, c) => Math.max(max, c.name.length), 0);
     const lines = cmds.map((c) => `/${c.name.padEnd(longest)}  ${c.description}`);
-    return { kind: 'ok', notes: ['Slash commands:', ...lines] };
+    // Panic key. Documented here (not in the footer) because it's an
+    // emergency escape — surfacing it on every frame would clutter
+    // the cue without value, but an operator searching for "how do
+    // I exit when stuck" should find it via /help.
+    return {
+      kind: 'ok',
+      notes: [
+        'Slash commands:',
+        ...lines,
+        '',
+        'Emergency exit: Ctrl+\\ (bypasses every gate, exits 130).',
+      ],
+    };
   },
 });

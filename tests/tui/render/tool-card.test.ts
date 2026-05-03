@@ -104,10 +104,15 @@ describe('renderToolCardLive (operation chip, active state — UI.md §4.10.5)',
     expect(out[0]).toContain(`${CSI}33m`);
   });
 
-  test('subject and preview wrapped with dim SGR when color enabled', () => {
+  test('subject uses secondary SGR (visibly grey); preview stays dim', () => {
+    // Sub-content carries the path / arg the operator scans for and
+    // needs to be readable; SGR 90 (bright-black) renders as grey in
+    // default terminals, while SGR 2 (faint) is frequently invisible.
+    // Preview output keeps SGR 2 — it's bulk streaming content, not a
+    // primary signal.
     const colorCaps = { ...unicode, color: 'basic' as const };
     const out = renderToolCardLive(tool(['hi']), colorCaps, 0);
-    expect(out[1]).toContain(`${CSI}2m`); // sub-content dim
+    expect(out[1]).toContain(`${CSI}90m`); // sub-content secondary
     expect(out[2]).toContain(`${CSI}2m`); // preview dim
   });
 });

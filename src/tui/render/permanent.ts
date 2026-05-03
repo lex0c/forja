@@ -217,7 +217,12 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
           : item.subject !== null && item.subject !== ''
             ? item.subject
             : (item.summary ?? null);
-      if (subText !== null) lines.push(paint(caps, 'dim', `${sub}${subText}`));
+      // Sub-content uses `secondary` (SGR 90 bright-black, visibly
+      // grey) rather than `dim` (SGR 2 faint, frequently invisible
+      // in default xterm/i3 setups) so the operator can actually
+      // read the subject — same rationale as the session-footer
+      // `Cogitated for X` marker (UI.md §6.1).
+      if (subText !== null) lines.push(paint(caps, 'secondary', `${sub}${subText}`));
       return lines.map(padFrame);
     }
     case 'error':

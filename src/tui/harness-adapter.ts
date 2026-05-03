@@ -18,6 +18,7 @@
 
 import type { ExitReason, HarnessEvent } from '../harness/types.ts';
 import type { Decision } from '../permissions/index.ts';
+import { stripAnsi } from '../sanitize/index.ts';
 import type { TodoItem, TodoStatus } from '../todo/index.ts';
 import type { SessionEndEvent, TodoItemForUI, TodoStatusForUI, UIEvent } from './events.ts';
 import { lookupToolVocab } from './tool-vocab.ts';
@@ -225,11 +226,23 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
               state.currentMessageId = synthId;
               out.push({ type: 'assistant:start', ts, messageId: synthId });
             }
+            // Strip ANSI before the text reaches the reducer / renderer.
+            // Provider output can carry escape sequences (model quoting
+            // file contents, code about terminal codes, prompt-injection
+            // attempts) which would otherwise be written raw to the
+            // terminal. The most damaging classes are DEC private modes
+            // (`\x1b[?2004h` enables bracketed paste, `\x1b[?25l` hides
+            // the cursor, `\x1b[?1049h` switches to the alt screen, etc.)
+            // — operator perceives input as frozen because keystrokes
+            // get reinterpreted or feedback goes invisible. Strip on
+            // entry so every downstream surface (live chip preview,
+            // permanent assistant block, recap snapshots) sees clean
+            // text without each having to remember to sanitize.
             out.push({
               type: 'assistant:delta',
               ts,
               messageId: state.currentMessageId,
-              text: ev.text,
+              text: stripAnsi(ev.text),
             });
             return out;
           }

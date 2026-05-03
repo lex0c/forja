@@ -246,6 +246,29 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       const msg = err instanceof Error ? err.message : String(err);
       bus.emit({ type: 'warn', ts: now(), message: `adapter error: ${msg}` });
     }
+    // Flip user-facing turn state on session_finished, NOT on the
+    // runAgent Promise resolve. The harness's outer finally awaits
+    // checkpoint purge + bg cleanup (CHECKPOINTS §2.5: "could spend
+    // seconds in ref deletion") AFTER session_finished is emitted —
+    // those are bookkeeping, not turn-visible work. Pre-fix the
+    // Promise chain held `running=true` through that window, so the
+    // operator who saw `Cogitated for Xs` rendered and started typing
+    // immediately found that Enter was silently gated and Ctrl+C
+    // routed to triggerInterrupt-on-resolved-abort (no-op). Visibly
+    // identical to "input frozen" for several seconds.
+    //
+    // Cumulative totals + lastSessionId are also rolled up here so a
+    // back-to-back submit (operator hits Enter the moment Cogitated
+    // appears) sees the correct prior session id for resume — the
+    // runAgent Promise's `.then` would not have fired yet under the
+    // old timing.
+    if (event.type === 'session_finished') {
+      running = false;
+      lastSessionId = event.result.sessionId;
+      cumulative.costUsd += event.result.costUsd;
+      cumulative.steps += event.result.steps;
+      cumulative.turns += 1;
+    }
   };
 
   // Bridge for the harness's confirm decisions: extracts a one-line
@@ -307,21 +330,25 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       ...(lastSessionId !== null ? { resumeFromSessionId: lastSessionId } : {}),
     };
     const runAgentImpl = options.runAgentOverride ?? runAgent;
+    // Cumulative totals + lastSessionId are rolled up in
+    // `onHarnessEvent` on `session_finished` (synchronous with
+    // Cogitated rendering) — see the comment there. The .then()
+    // here intentionally does no bookkeeping; it exists only so
+    // .catch can intercept rejections from runAgent itself
+    // (provider crash before any harness event, etc.).
     runningPromise = runAgentImpl(cfg)
-      .then((result) => {
-        lastSessionId = result.sessionId;
-        // Roll up running totals for /cost. Each turn contributes
-        // its own steps + cost; turns increments once per resolved
-        // run regardless of status.
-        cumulative.costUsd += result.costUsd;
-        cumulative.steps += result.steps;
-        cumulative.turns += 1;
-      })
+      .then(() => undefined)
       .catch((e) => {
         const msg = e instanceof Error ? e.message : String(e);
         bus.emit({ type: 'error', ts: now(), message: msg });
       })
       .finally(() => {
+        // Defensive: under normal flow `running` was already flipped
+        // false on session_finished. But a runAgent rejection BEFORE
+        // any session event (provider init failure, DB open error
+        // surfaced inside the harness) would never emit
+        // session_finished — the operator would otherwise be stuck
+        // with running=true forever. Belt-and-suspenders.
         running = false;
         abortController = null;
         softStopController = null;
@@ -351,6 +378,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     modalManager.close();
     renderer.close();
     stdin.removeListener('data', onData);
+    // Drop the lone-ESC drain timer if it's pending — leaks otherwise
+    // (Bun would surface as an "open handle" warning in tests; in
+    // production it'd just delay process exit by up to ESC_DRAIN_MS).
+    cancelDrain();
     if (typeof stdin.pause === 'function') stdin.pause();
     db.close();
     resolveExit();
@@ -732,11 +763,70 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // Stdin pump: feed bytes into the parser, dispatch each parsed key
   // through the focus stack. Bracketed paste handled inside the
   // parser (one `paste` event per chunk).
+  //
+  // Lone-ESC drain. The parser holds a single `\x1b` waiting to
+  // disambiguate between an Escape keypress and the start of a CSI
+  // / SS3 / Alt+char sequence — both begin with `\x1b`. Without a
+  // delayed drain, an Esc keystroke alone never resolves: the
+  // buffer holds it indefinitely, the soft-interrupt cue never
+  // fires, AND the next keystroke combines with the held ESC to
+  // emit Alt+<char> instead of `<char>` — input visibly stops
+  // accepting input. Convention (xterm KeyboardWait): if no follow-
+  // up byte arrives within ~25-100ms, treat the held ESC as a
+  // standalone Escape keypress. We pick 30ms — short enough that
+  // the operator doesn't notice the delay on a deliberate Esc,
+  // long enough to absorb the latency between the leader and the
+  // params of a multi-byte sequence delivered across two `data`
+  // events (e.g., over SSH).
   const parser = createKeyParser();
+  const ESC_DRAIN_MS = 30;
+  let drainTimer: ReturnType<typeof setTimeout> | null = null;
+  const cancelDrain = (): void => {
+    if (drainTimer !== null) {
+      clearTimeout(drainTimer);
+      drainTimer = null;
+    }
+  };
   const onData = (chunk: Buffer): void => {
+    // Panic key (Ctrl+\\, byte 0x1c). Bypasses every gate (running,
+    // modal, focus stack, exit-arm timer, shutdown awaits) and exits
+    // immediately. Convention from POSIX SIGQUIT — "I really want
+    // out". In raw mode the terminal driver delivers 0x1c as a
+    // literal byte (signal generation disabled by setRawMode), so
+    // Node never sees a SIGQUIT — we have to recognize the byte
+    // ourselves. Trade-off accepted: any in-flight turn's audit/DB
+    // state may stay 'running' since we skip shutdown's cleanup
+    // chain. That's the explicit cost of having a guaranteed
+    // escape hatch when the normal interrupt ladder doesn't work.
+    //
+    // Checked BEFORE the exiting guard / parser / focusStack so it
+    // works even when the rest of the pipeline is wedged.
+    if (chunk.includes(0x1c)) {
+      try {
+        if (typeof stdin.setRawMode === 'function') stdin.setRawMode(false);
+        // Disable bracketed paste so the operator's shell isn't
+        // left in paste mode after our exit. `\x1b[?2004l` is the
+        // standard sequence; written directly to bypass any
+        // higher-level wrapper that might be in a broken state.
+        process.stdout.write('\x1b[?2004l');
+        process.stderr.write('\nforja: panic exit (Ctrl+\\)\n');
+      } catch {
+        // Ignore — we're exiting regardless.
+      }
+      process.exit(130);
+    }
     if (exiting) return;
+    cancelDrain();
     const events = parser.feed(chunk);
     for (const ev of events) focusStack.dispatch(ev);
+    if (parser.bufferLength() > 0) {
+      drainTimer = setTimeout(() => {
+        drainTimer = null;
+        if (exiting) return;
+        const drained = parser.drain();
+        for (const ev of drained) focusStack.dispatch(ev);
+      }, ESC_DRAIN_MS);
+    }
   };
   stdin.on('data', onData);
   if (typeof stdin.resume === 'function') stdin.resume();
