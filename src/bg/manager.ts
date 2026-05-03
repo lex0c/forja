@@ -413,8 +413,15 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
           // session end as the safety net. Still emit `ended` with
           // best-effort status so the TUI tray clears — the operator
           // shouldn't see a phantom counter just because the audit
-          // path failed.
-          safeEmit({ kind: 'ended', processId: id, status: 'exited', exitCode: null });
+          // path failed. Status mirrors the happy-path discriminator:
+          // honor `killing` so a kill()/cleanup()-induced termination
+          // surfaces as 'killed' even when the DB write blew up. Pre-
+          // fix this branch hardcoded 'exited', which lied about the
+          // cause for exactly the scenario this fallback is meant to
+          // cover (terminate-then-DB-fail). exitCode stays null
+          // because we couldn't read it past the throw.
+          const fallbackStatus: 'exited' | 'killed' = killing.has(id) ? 'killed' : 'exited';
+          safeEmit({ kind: 'ended', processId: id, status: fallbackStatus, exitCode: null });
         }
       } finally {
         live.delete(id);

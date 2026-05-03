@@ -577,12 +577,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // Ctrl+C lands as a `cancelInput` key event (byte 0x03 read from
     // stdin) rather than a process SIGINT — the SIGINT handler can't
     // be the only path. With buffer empty + idle, fall through to
-    // shutdown. Synchronous gate (`exiting` set in requestShutdown)
-    // keeps a follow-up keystroke from racing past the check.
+    // shutdown with POSIX exit 130 (matches the SIGINT handler so
+    // shells / CI / automation see interrupt-driven exits as
+    // interrupt regardless of whether stdin was raw). Synchronous
+    // gate (`exiting` set in requestShutdown) keeps a follow-up
+    // keystroke from racing past the check.
     if (result.cancelInput === true) {
       if (running) {
         triggerInterrupt();
       } else {
+        exitCode = 130;
         requestShutdown();
       }
     }

@@ -563,6 +563,78 @@ describe('bg manager: onEvent', () => {
     expect(ended?.status).toBe('killed');
   });
 
+  test('ended fallback after DB failure preserves killed status (regression)', async () => {
+    // When kill() terminates the process AND the DB write inside the
+    // exitedSettled handler throws (e.g. concurrent close, migration
+    // mid-flight), the catch branch must still report status='killed'
+    // — the `killing` marker is the source of truth, not the DB row.
+    // Pre-fix the fallback hardcoded 'exited', which lied about the
+    // cause for exactly the scenario this fallback is meant to cover
+    // (terminate-then-DB-fail).
+    //
+    // Wrap the DB with a Proxy that throws on the SECOND getBgProcess
+    // call: the first lets kill() pass its own status check; the
+    // second (inside exitedSettled) trips the fallback path.
+    let getCallCount = 0;
+    const wrappedDb = new Proxy(db, {
+      get(target, prop) {
+        if (prop === 'query') {
+          return (sql: string): unknown => {
+            const stmt = (target as { query: (s: string) => unknown }).query(sql);
+            // Only sabotage the SELECT used by getBgProcess; let
+            // everything else (UPDATE, INSERT in finalize, etc.)
+            // pass so kill() can still complete cleanup.
+            if (sql.includes('SELECT') && sql.includes('FROM background_processes')) {
+              return new Proxy(stmt as object, {
+                get(s, p): unknown {
+                  if (p === 'get') {
+                    return (...args: unknown[]): unknown => {
+                      getCallCount += 1;
+                      if (getCallCount >= 2) {
+                        throw new Error('simulated DB failure mid-flight');
+                      }
+                      return (s as { get: (...a: unknown[]) => unknown }).get(...args);
+                    };
+                  }
+                  return (s as Record<string | symbol, unknown>)[p];
+                },
+              });
+            }
+            return stmt;
+          };
+        }
+        return (target as unknown as Record<string | symbol, unknown>)[prop];
+      },
+    }) as DB;
+
+    const events: BgManagerEvent[] = [];
+    const observed = createBgManager({
+      db: wrappedDb,
+      sessionId,
+      logDir,
+      onEvent: (e) => events.push(e),
+    });
+    const r = await observed.spawn({ command: 'sleep 30' });
+    await observed.kill(r.id).catch(() => {
+      // kill's own finalizeBgProcess may throw because the wrapped
+      // db is now in failure mode — that's expected; this test is
+      // about the EMIT shape, not kill's return value.
+    });
+    await new Promise((res) => setTimeout(res, 25));
+    const ended = events.find(
+      (e): e is Extract<BgManagerEvent, { kind: 'ended' }> =>
+        e.kind === 'ended' && e.processId === r.id,
+    );
+    expect(ended).toBeDefined();
+    // The bug was status='exited' here; the fix mirrors the happy-
+    // path discriminator and reports 'killed' since `killing` was
+    // set by kill().
+    expect(ended?.status).toBe('killed');
+    // exitCode is null in the fallback path (couldn't read past the
+    // throw) — sanity check the contract.
+    expect(ended?.exitCode).toBeNull();
+  });
+
   test('observer that throws does not break process lifecycle', async () => {
     const observed = createBgManager({
       db,

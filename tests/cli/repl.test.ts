@@ -212,7 +212,7 @@ describe('repl — boot + smoke', () => {
       // Boot succeeded. Drive Ctrl+C to exit cleanly.
       await tick();
       stdin.feed('\x03');
-      expect(await promise).toBe(0);
+      expect(await promise).toBe(130);
     } finally {
       Object.defineProperty(process.stdout, 'isTTY', {
         value: originalStdoutIsTTY,
@@ -221,7 +221,27 @@ describe('repl — boot + smoke', () => {
     }
   });
 
-  test('skipTtyCheck=true lets the REPL boot and exits on empty Ctrl+C', async () => {
+  test('idle raw-mode Ctrl+C exits 130 (matches SIGINT path, not 0)', async () => {
+    // Pre-fix the cancelInput path called requestShutdown() without
+    // setting exitCode, so raw-mode Ctrl+C from idle exited 0 — making
+    // interrupt-driven exits look like success in shells / CI /
+    // automation that check exit status. The SIGINT handler explicitly
+    // set exitCode=130 (POSIX convention); the cancelInput path should
+    // match. Direct test of the new contract isolated from broader
+    // smoke teardowns.
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+    });
+    await tick();
+    stdin.feed('\x03');
+    expect(await promise).toBe(130);
+  });
+
+  test('skipTtyCheck=true lets the REPL boot and exits on empty Ctrl+C with code 130', async () => {
     const stdin = makeStdin();
     const closes: number[] = [];
     const stub = makeBootstrapStub();
@@ -234,11 +254,13 @@ describe('repl — boot + smoke', () => {
       stdin,
       skipTtyCheck: true,
     });
-    // Empty buffer + Ctrl+C → exit with code 0.
+    // Empty buffer + raw-mode Ctrl+C (\x03) → POSIX SIGINT exit 130.
+    // Matches the SIGINT handler's exit code so shells / CI / automation
+    // see interrupt-driven exits as interrupt regardless of stdin mode.
     await tick();
     stdin.feed('\x03');
     const code = await promise;
-    expect(code).toBe(0);
+    expect(code).toBe(130);
     expect(closes).toHaveLength(1);
   });
 
@@ -272,7 +294,7 @@ describe('repl — boot + smoke', () => {
     expect(all).not.toContain('subagents');
     expect(all).not.toContain('checkpoints');
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('typed prompt + Enter triggers runAgent with the typed text', async () => {
@@ -296,7 +318,7 @@ describe('repl — boot + smoke', () => {
     ra.finish(0);
     await tick();
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('subsequent turns thread the prior sessionId via resumeFromSessionId', async () => {
@@ -324,7 +346,7 @@ describe('repl — boot + smoke', () => {
     ra.finish(1);
     await tick();
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('Enter is ignored while a turn is in flight (no double-run)', async () => {
@@ -359,7 +381,7 @@ describe('repl — boot + smoke', () => {
     ra.finish(1);
     await tick();
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('first Esc during a turn aborts the soft signal (cooperative), NOT the hard one', async () => {
@@ -395,7 +417,7 @@ describe('repl — boot + smoke', () => {
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('second Esc while soft already in flight emits interrupt:hard', async () => {
@@ -443,7 +465,7 @@ describe('repl — boot + smoke', () => {
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('raw-mode Ctrl+C (\\x03) during a turn aborts via the cancelInput path', async () => {
@@ -482,7 +504,7 @@ describe('repl — boot + smoke', () => {
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('Ctrl+C during a turn also flips footer to "esc again to force"', async () => {
@@ -525,7 +547,7 @@ describe('repl — boot + smoke', () => {
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('Esc during a turn flips footer to "esc again to force"', async () => {
@@ -577,7 +599,7 @@ describe('repl — boot + smoke', () => {
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('shutdown during a running turn awaits the run before closing the DB', async () => {
@@ -687,7 +709,7 @@ describe('repl — boot + smoke', () => {
     ra.finish(0);
     await tick();
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('error thrown by runAgent surfaces as an error UIEvent and lets the REPL continue', async () => {
@@ -735,7 +757,7 @@ describe('repl — boot + smoke', () => {
     });
     await tick();
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 });
 
@@ -775,7 +797,7 @@ describe('repl — slash commands integration', () => {
     expect(all).toContain('/quit');
     // Wrap up.
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('arrow Down navigates between suggestions', async () => {
@@ -806,7 +828,7 @@ describe('repl — slash commands integration', () => {
     stdin.feed('\x1b\x1b');
     await tick();
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('/quit triggers shutdown and exits cleanly', async () => {
@@ -842,7 +864,7 @@ describe('repl — slash commands integration', () => {
     expect(all).not.toContain('unknown command');
     expect(all).toContain('Slash commands:');
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('bare / + Enter clears the buffer instead of sending "/" to the LLM', async () => {
@@ -863,7 +885,7 @@ describe('repl — slash commands integration', () => {
     // No turn started — runAgent override never called.
     expect(ra.captured).toHaveLength(0);
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('slash mode is closed after typing a non-slash character at the start', async () => {
@@ -891,9 +913,11 @@ describe('repl — slash commands integration', () => {
     // Popover not in the latest writes (would contain /help).
     const recent = writes.join('');
     expect(recent).not.toContain('/help');
-    // Buffer is 'hello'; first Ctrl+C clears it, second exits.
+    // Buffer is 'hello'; first Ctrl+C clears it, second exits with
+    // POSIX SIGINT code 130 (raw-mode Ctrl+C now matches SIGINT
+    // semantics — interrupt-driven exit).
     stdin.feed('\x03\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('/budget steps N propagates to the next turn adapter ctx (no stale maxSteps)', async () => {
@@ -948,7 +972,7 @@ describe('repl — slash commands integration', () => {
     ra.finish(1);
     await tick();
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('/plan on propagates planMode to the next turn adapter ctx', async () => {
@@ -987,7 +1011,7 @@ describe('repl — slash commands integration', () => {
     ra.finish(0);
     await tick();
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('unknown slash command + Enter does NOT call runAgent (regression)', async () => {
@@ -1023,7 +1047,7 @@ describe('repl — slash commands integration', () => {
     expect(writes.join('')).toContain('unknown command');
     expect(writes.join('')).toContain('/doesnotexist');
     stdin.feed('\x03');
-    expect(await promise).toBe(0);
+    expect(await promise).toBe(130);
   });
 
   test('Enter after /quit is suppressed (shutdown gate is synchronous)', async () => {
