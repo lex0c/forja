@@ -195,7 +195,7 @@ export interface LiveState {
   softInterrupted: boolean;
   // Idle Ctrl+C double-tap gate (UI.md §5.4 + §4.10.6). Non-null means
   // the operator pressed Ctrl+C once at idle with an empty buffer;
-  // footer flips to `ctrl+c again to exit` (warn). The REPL owns the
+  // footer flips to `Press Ctrl-C again to exit` (warn). The REPL owns the
   // 2s timer + the second-press detection — the reducer just flips
   // the flag in response to `interrupt:exit-arm` / `:exit-cancel`.
   // `at` is the timestamp when armed (carried for tests / future

@@ -389,7 +389,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
 
   // Idle Ctrl+C double-tap exit gate (UI.md §5.4). First press at
   // idle/empty-buffer arms the gate; the footer flips to
-  // `ctrl+c again to exit` (warn) for the EXIT_ARM_WINDOW_MS window.
+  // `Press Ctrl-C again to exit` (warn) for the EXIT_ARM_WINDOW_MS window.
   // A second press inside the window exits 130; any other keystroke
   // disarms (handled by the editor handler), and a timeout cancels.
   // Closure-local `exitArmedAt` is the source of truth for the

@@ -226,11 +226,11 @@ describe('renderFooter', () => {
   });
 
   describe('idle exit-armed cue (UI.md §5.4 + §4.10.6)', () => {
-    test('exitArmed swaps left column to "ctrl+c again to exit"', () => {
+    test('exitArmed swaps left column to "Press Ctrl-C again to exit"', () => {
       const s = startedSession();
       s.exitArmed = { at: 1000 };
       const out = renderFooter(s, caps);
-      expect(out).toContain('ctrl+c again to exit');
+      expect(out).toContain('Press Ctrl-C again to exit');
       // Help hint and any interrupt cue are suppressed — the gate
       // is the only thing the operator should be reading.
       expect(out).not.toContain('? for help');
@@ -257,7 +257,7 @@ describe('renderFooter', () => {
       };
       s.activeTools.set('t1', tool);
       const out = renderFooter(s, caps);
-      expect(out).toContain('ctrl+c again to exit');
+      expect(out).toContain('Press Ctrl-C again to exit');
       expect(out).not.toContain('esc to interrupt');
       expect(out).not.toContain('esc again to force');
     });
@@ -269,7 +269,7 @@ describe('renderFooter', () => {
       const out = renderFooter(s, colored);
       // SGR 33 (yellow / warn) per term.ts SGR.warn.
       expect(out).toContain(`${CSI}33m`);
-      expect(out).toContain('ctrl+c again to exit');
+      expect(out).toContain('Press Ctrl-C again to exit');
     });
 
     test('exitArmed null restores the help hint (no leftover cue)', () => {
@@ -277,7 +277,7 @@ describe('renderFooter', () => {
       s.exitArmed = null;
       const out = renderFooter(s, caps);
       expect(out).toContain('? for help');
-      expect(out).not.toContain('ctrl+c again to exit');
+      expect(out).not.toContain('Press Ctrl-C again to exit');
     });
 
     test('right column unchanged when exitArmed is set (status surface stays honest)', () => {

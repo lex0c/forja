@@ -223,7 +223,7 @@ describe('repl — boot + smoke', () => {
 
   test('idle raw-mode Ctrl+C double-tap exits 130 (UI.md §5.4 gate)', async () => {
     // Spec §5.4: first Ctrl+C at idle/empty-buffer arms the gate
-    // (footer flips to `ctrl+c again to exit`); a second press inside
+    // (footer flips to `Press Ctrl-C again to exit`); a second press inside
     // the 2s window exits 130 (POSIX SIGINT). Pre-spec a single press
     // exited immediately; the gate prevents accidental drops.
     // exitCode=130 (not 0) keeps shells / CI / automation seeing
@@ -272,7 +272,7 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
-  test('first Ctrl+C flips footer to "ctrl+c again to exit" cue (e2e producer→render)', async () => {
+  test('first Ctrl+C flips footer to "Press Ctrl-C again to exit" cue (e2e producer→render)', async () => {
     // Coverage gap: prior tests verify the gate's exit code AND
     // verify the reducer/footer in isolation, but nothing ties the
     // producer's bus emit to the rendered output. This pins the
@@ -295,7 +295,7 @@ describe('repl — boot + smoke', () => {
     stdin.feed('\x03');
     await flushFrame();
     const afterArm = writes.slice(beforeArm).join('');
-    expect(afterArm).toContain('ctrl+c again to exit');
+    expect(afterArm).toContain('Press Ctrl-C again to exit');
     // Cleanup via EOF.
     stdin.feed('\x04');
     expect(await promise).toBe(130);

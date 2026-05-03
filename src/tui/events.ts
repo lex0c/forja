@@ -384,7 +384,7 @@ export type InterruptEvent = BaseEvent & {
 
 // Idle Ctrl+C double-tap exit gate (UI.md §5.4 + §4.10.6 footer cue).
 // First press at idle/empty-buffer arms the gate; the footer flips to
-// `ctrl+c again to exit` (warn) for a 2s window. A second press inside
+// `Press Ctrl-C again to exit` (warn) for a 2s window. A second press inside
 // the window exits 130; any other input or the timeout cancels.
 //
 // Producer responsibility: REPL emits `interrupt:exit-arm` on the first

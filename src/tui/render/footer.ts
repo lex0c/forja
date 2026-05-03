@@ -54,7 +54,7 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   const sep = dim(caps, ' · ');
   let left: string;
   if (state.exitArmed !== null) {
-    left = paint(caps, 'warn', 'ctrl+c again to exit');
+    left = paint(caps, 'warn', 'Press Ctrl-C again to exit');
   } else {
     const leftParts = [dim(caps, '? for help')];
     if (isRunning(state)) {

@@ -472,7 +472,7 @@ Sempre 1 linha, dim, **abaixo do input box** (com régua entre eles).
 | Estado | Esquerda | Direita |
 |---|---|---|
 | Idle | `? for help` | `• <model> · <steps>/<max> · $<cost>` |
-| Idle, exit armed (§5.4) | `ctrl+c again to exit` (`warn`) | (mesmo) |
+| Idle, exit armed (§5.4) | `Press Ctrl-C again to exit` (`warn`) | (mesmo) |
 | Running | `? for help · esc to interrupt` | `• <model> · <steps>/<max> · $<cost>` |
 | Soft-aborted (ainda processando) | `? for help · esc again to force` | (mesmo) |
 | Plan mode | `? for help` | `• <model> · plan · <steps>/<max> · $<cost>` |
@@ -736,7 +736,7 @@ Renderer reage a `tick` igual a qualquer evento (redraw da região viva).
 | Enter | input | submit |
 | Shift+Enter | input | nova linha |
 | Ctrl+C | input não vazio | limpa o buffer (não sai) |
-| Ctrl+C | idle, buffer vazio | **arma exit** — footer mostra `ctrl+c again to exit` (cue em `warn`); janela de 2s |
+| Ctrl+C | idle, buffer vazio | **arma exit** — footer mostra `Press Ctrl-C again to exit` (cue em `warn`); janela de 2s |
 | Ctrl+C (2x dentro de 2s) | idle, buffer vazio | exit 130 (POSIX SIGINT) |
 | Ctrl+C | running | cancela step atual (graceful) |
 | Ctrl+C (2x) | running | hard kill |
