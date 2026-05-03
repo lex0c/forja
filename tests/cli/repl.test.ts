@@ -55,6 +55,7 @@ const makeBootstrapStub = (cwd = '/tmp/forja-repl-test'): BootstrapResult => {
     budget: { ...DEFAULT_BUDGET },
     enableCheckpoints: false,
     provider: {
+      id: 'mock/m',
       capabilities: { context_window: 200000, output_max_tokens: 4096 },
     },
   } as unknown as HarnessConfig;
@@ -826,6 +827,100 @@ describe('repl — slash commands integration', () => {
     expect(recent).not.toContain('/help');
     // Buffer is 'hello'; first Ctrl+C clears it, second exits.
     stdin.feed('\x03\x03');
+    expect(await promise).toBe(0);
+  });
+
+  test('/budget steps N propagates to the next turn adapter ctx (no stale maxSteps)', async () => {
+    // Regression: adapterCtxBase used to be built ONCE at REPL boot
+    // and reused for every createHarnessAdapter call. /budget mutated
+    // baseConfig.budget but the adapter kept emitting step:budget
+    // with the boot-time maxSteps — footer/status line diverged from
+    // the cap the harness actually enforced. Fix rebuilds the ctx
+    // per turn from baseConfig.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    // Turn 1: drive session_start, observe boot-time maxSteps (50 from
+    // DEFAULT_BUDGET) in the rendered status line.
+    stdin.feed('go\r');
+    await tick();
+    ra.emitInto(0, { type: 'session_start', sessionId: 'sess-1' });
+    await flushFrame();
+    expect(writes.join('')).toContain('0/50');
+    ra.finish(0);
+    await tick();
+    // Mutate via slash command, then turn 2. The cutoff sits AFTER
+    // the new session_start fires, so any lingering "0/50" frames
+    // from session 1's idle render are excluded — we only check
+    // frames produced once the new turn's adapter ctx has emitted.
+    stdin.feed('/budget steps 99\r');
+    await flushFrame();
+    stdin.feed('next\r');
+    await tick();
+    const cutoff = writes.length;
+    ra.emitInto(1, { type: 'session_start', sessionId: 'sess-2' });
+    await flushFrame();
+    const post = writes.slice(cutoff).join('');
+    // Adapter ctx for turn 2 must carry the post-mutation maxSteps.
+    // (A transient `0/50` frame may slip between session:start and the
+    // following step:budget — the renderer paints session:start's
+    // model/sessionId update before step:budget's maxSteps lands. The
+    // contract is that the new value DOES appear; intermediate
+    // frames are renderer scheduling, not regression.)
+    expect(post).toContain('0/99');
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x03');
+    expect(await promise).toBe(0);
+  });
+
+  test('/plan on propagates planMode to the next turn adapter ctx', async () => {
+    // Same regression class as /budget: pre-fix the planMode flag was
+    // captured from baseConfig at boot. /plan on mutated baseConfig
+    // but the adapter kept emitting session:start without planMode —
+    // footer's `plan` token never appeared. Post-fix the ctx is rebuilt
+    // per turn so the next session:start carries the new flag.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    // Enable plan mode BEFORE any turn so we exercise the most likely
+    // operator flow (toggle + immediately prompt).
+    stdin.feed('/plan on\r');
+    await flushFrame();
+    const cutoff = writes.length;
+    stdin.feed('go\r');
+    await tick();
+    ra.emitInto(0, { type: 'session_start', sessionId: 'sess-1' });
+    await flushFrame();
+    // Footer renders `· plan ·` between model and steps when planMode
+    // landed in session:start. Pre-fix the token was missing.
+    const post = writes.slice(cutoff).join('');
+    expect(post).toContain('plan');
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x03');
     expect(await promise).toBe(0);
   });
 

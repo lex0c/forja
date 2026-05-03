@@ -137,17 +137,30 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   }
 
   const project = basename(baseConfig.cwd) || baseConfig.cwd;
-  const maxSteps = baseConfig.budget?.maxSteps ?? DEFAULT_BUDGET.maxSteps;
-  const adapterCtxBase = {
+
+  // Snapshot the adapter context fresh for every turn. Mutation slash
+  // commands (/model, /budget, /plan) edit baseConfig at runtime —
+  // capturing model/budget/planMode at boot would freeze the
+  // adapter's view, so subsequent session:start and step:budget
+  // events would surface the OLD values while the harness executes
+  // with the NEW ones. The footer / status indicators would then
+  // diverge from actual run behavior. Reading baseConfig + provider
+  // at startTurn time keeps the displayed cap and model honest.
+  //
+  // `model` reads from baseConfig.provider.id rather than the
+  // boot-time `modelId` local because /model swaps the provider
+  // object; the local goes stale immediately after the first
+  // /model invocation.
+  const buildAdapterCtx = () => ({
     profile: 'autonomous' as const,
     project,
-    model: modelId,
-    maxSteps,
+    model: baseConfig.provider.id,
+    maxSteps: baseConfig.budget?.maxSteps ?? DEFAULT_BUDGET.maxSteps,
     ...(baseConfig.budget?.maxCostUsd !== undefined
       ? { maxCostUsd: baseConfig.budget.maxCostUsd }
       : {}),
     ...(baseConfig.planMode === true ? { planMode: true } : {}),
-  };
+  });
 
   const bus = createBus();
   const focusStack = createFocusStack();
@@ -251,7 +264,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     running = true;
     abortController = new AbortController();
     softStopController = new AbortController();
-    const adapter = createHarnessAdapter(adapterCtxBase);
+    const adapter = createHarnessAdapter(buildAdapterCtx());
     const cfg: HarnessConfig = {
       ...baseConfig,
       userPrompt: text,
