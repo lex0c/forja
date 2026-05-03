@@ -27,21 +27,24 @@ const startedSession = (): LiveState => {
   };
 };
 
-// Rule above input (UI.md §4.10). Full-width (caps.cols), Unicode '─'
-// or ASCII '-'. The exact glyph repeated `cols` times is what the
-// composer emits.
+// Rule above/below input (UI.md §6.3 "bloco do input" exception).
+// Edge-to-edge — the rules + the input line form a 3-row unit that
+// breaks out of the frame margin so the operator's eye reads it as
+// a coherent typing zone.
 const expectedRule = (cols: number, unicode: boolean): string => (unicode ? '─' : '-').repeat(cols);
 
 describe('composeLive layout', () => {
-  // Bottom anchor (no modal): [..., rule, input(s), rule, footer].
+  // Bottom anchor (no modal): [..., rule_above, input(s), rule_below, footer].
   // Trailing 2 lines = rule + footer. Input occupies the N rows
-  // above the trailing rule.
+  // above the trailing rule. Per UI.md §6.3 the input-block rules
+  // are edge-to-edge (start with `─`/`-` directly, no margin), so
+  // we detect the rule above by leading-glyph match.
   const countInputLines = (out: string[]): number => {
     let n = 0;
     for (let i = out.length - 3; i >= 0; i--) {
       const l = out[i] ?? '';
-      if (l.startsWith('> ') || l.startsWith('  ')) n++;
-      else break;
+      if (l.startsWith('─') || l.startsWith('-')) break;
+      n++;
     }
     return Math.max(1, n);
   };
@@ -243,6 +246,48 @@ describe('composeLive layout', () => {
     // = 1 (rule above) + 1 (input) + FOOTER_BLOCK_LINES.
     const expectedLength = 1 /* rule above */ + 1 /* input lines */ + FOOTER_BLOCK_LINES;
     expect(out).toHaveLength(expectedLength);
+  });
+
+  test('frame margin (UI.md §6.3): the input block (rule + input + rule) is edge-to-edge; everything else padded', () => {
+    // UI.md §6.3 "bloco do input" exception — the 3 rows that form
+    // the typing zone (rule above + input + rule below) all live at
+    // col 0 so they read as a coherent unit. Banner, status, footer,
+    // tool cards, modal, etc. all get the 2sp frame margin.
+    const s = startedSession();
+    s.input.value = 'hi';
+    const out = composeLive(s, caps, 0);
+    // Shape: [status, rule, '> hi', rule, footer].
+    const inputIdx = out.findIndex((l) => l.startsWith('> '));
+    expect(inputIdx).toBeGreaterThan(-1);
+    const ruleAboveIdx = inputIdx - 1;
+    const ruleBelowIdx = inputIdx + 1;
+    // The 3-row input block: none start with '  ' (they start with '─'
+    // for the rules and '> ' for the input).
+    expect(out[ruleAboveIdx]?.startsWith('  ')).toBe(false);
+    expect(out[inputIdx]?.startsWith('  ')).toBe(false);
+    expect(out[ruleBelowIdx]?.startsWith('  ')).toBe(false);
+    // Everything outside the block is padded.
+    out.forEach((line, i) => {
+      if (i >= ruleAboveIdx && i <= ruleBelowIdx) return;
+      expect(line.startsWith('  ')).toBe(true);
+    });
+  });
+
+  test('multi-line input: ALL input lines (prompt + continuations) skip the frame margin', () => {
+    // Continuations render as `  body` — superficially identical to
+    // a padded line. The composer must NOT pad them because the
+    // operator typed them as one logical input block; padding would
+    // produce `    body` and break alignment with the `> ` prompt.
+    const s = startedSession();
+    s.input.value = 'a\nb';
+    const out = composeLive(s, caps, 0);
+    // Find input by `> ` prompt; continuations sit immediately after.
+    const promptIdx = out.findIndex((l) => l.startsWith('> '));
+    expect(promptIdx).toBeGreaterThan(-1);
+    expect(out[promptIdx]).toBe('> a');
+    // Continuation: `  b` — exactly 2 spaces (renderInput's prefix),
+    // not 4 (which would be padding + renderInput prefix).
+    expect(out[promptIdx + 1]).toBe('  b');
   });
 
   test('composeLive throws when the bottom anchor is malformed (defensive)', () => {

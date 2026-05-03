@@ -13,6 +13,11 @@ const ascii: Capabilities = {
 const unicode: Capabilities = { ...ascii, unicode: true };
 const colored: Capabilities = { ...unicode, color: 'basic' };
 
+// Frame margin (UI.md §6.3): every permanent kind emits 2sp-padded
+// lines. Helper makes the expected strings readable without inlining
+// the prefix everywhere.
+const pad = (s: string): string => `  ${s}`;
+
 describe('formatPermanent', () => {
   test('session-header renders a single line with sessionId, profile, model', () => {
     const item: PermanentItem = {
@@ -22,22 +27,22 @@ describe('formatPermanent', () => {
       project: 'forja',
       model: 'opus',
     };
-    expect(formatPermanent(item, ascii)).toEqual(['── session s1 · autonomous · opus ──']);
+    expect(formatPermanent(item, ascii)).toEqual([pad('── session s1 · autonomous · opus ──')]);
   });
 
   test('session-footer renders the reason', () => {
     expect(formatPermanent({ kind: 'session-footer', reason: 'done' }, ascii)).toEqual([
-      '── session end · done ──',
+      pad('── session end · done ──'),
     ]);
   });
 
   test('session-footer with abortCause appends the discriminator (1.g.3)', () => {
     expect(
       formatPermanent({ kind: 'session-footer', reason: 'aborted', abortCause: 'soft' }, ascii),
-    ).toEqual(['── session end · aborted (soft) ──']);
+    ).toEqual([pad('── session end · aborted (soft) ──')]);
     expect(
       formatPermanent({ kind: 'session-footer', reason: 'aborted', abortCause: 'hard' }, ascii),
-    ).toEqual(['── session end · aborted (hard) ──']);
+    ).toEqual([pad('── session end · aborted (hard) ──')]);
   });
 
   test('session-footer abortCause on a non-abort reason is dropped (defensive)', () => {
@@ -46,7 +51,7 @@ describe('formatPermanent', () => {
     // shouldn't render misleading text like `done (soft)`.
     expect(
       formatPermanent({ kind: 'session-footer', reason: 'done', abortCause: 'soft' }, ascii),
-    ).toEqual(['── session end · done ──']);
+    ).toEqual([pad('── session end · done ──')]);
   });
 
   describe('session-banner (UI.md §4.10.9 — 3 blocks)', () => {
@@ -65,35 +70,37 @@ describe('formatPermanent', () => {
     };
 
     test('emits 6 lines: title / blank / model+cwd (2) / blank / env (Unicode)', () => {
+      // Each line padded with the §6.3 frame margin (2sp). Blank
+      // separators get padded too — `'  '` still reads as blank.
       expect(formatPermanent(baseBanner, unicode)).toEqual([
-        'forja v0.1.0',
-        '',
-        'anthropic/claude-sonnet-4-6 · 200,000 ctx · max 4096 out',
-        '/home/lex/forja',
-        '',
-        'subagents: 2 · ✓ checkpoints',
+        pad('forja v0.1.0'),
+        pad(''),
+        pad('anthropic/claude-sonnet-4-6 · 200,000 ctx · max 4096 out'),
+        pad('/home/lex/forja'),
+        pad(''),
+        pad('subagents: 2 · ✓ checkpoints'),
       ]);
     });
 
     test('version already prefixed with v is not double-prefixed', () => {
       const out = formatPermanent({ ...baseBanner, version: 'v2.3.4' }, unicode);
-      expect(out[0]).toBe('forja v2.3.4');
+      expect(out[0]).toBe(pad('forja v2.3.4'));
     });
 
     test('falls back to ASCII glyphs (* for ✓, - for ·) when unicode disabled', () => {
       const out = formatPermanent(baseBanner, ascii);
-      expect(out[2]).toBe('anthropic/claude-sonnet-4-6 - 200,000 ctx - max 4096 out');
-      expect(out[5]).toBe('subagents: 2 - * checkpoints');
+      expect(out[2]).toBe(pad('anthropic/claude-sonnet-4-6 - 200,000 ctx - max 4096 out'));
+      expect(out[5]).toBe(pad('subagents: 2 - * checkpoints'));
     });
 
     test('omits env block entirely when env is empty (no trailing blank line)', () => {
       const out = formatPermanent({ ...baseBanner, env: [] }, ascii);
       // title + blank + model + cwd. Banner ends after identity block.
       expect(out).toEqual([
-        'forja v0.1.0',
-        '',
-        'anthropic/claude-sonnet-4-6 - 200,000 ctx - max 4096 out',
-        '/home/lex/forja',
+        pad('forja v0.1.0'),
+        pad(''),
+        pad('anthropic/claude-sonnet-4-6 - 200,000 ctx - max 4096 out'),
+        pad('/home/lex/forja'),
       ]);
     });
 
@@ -105,7 +112,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[5]).toBe('✓ memory (14)');
+      expect(out[5]).toBe(pad('✓ memory (14)'));
     });
 
     test('mixes flag + meta entries joined by dim · separator', () => {
@@ -122,7 +129,7 @@ describe('formatPermanent', () => {
         unicode,
       );
       expect(out[5]).toBe(
-        'policy: project (5 rules) · subagents: 2 · ✓ checkpoints · ✓ memory (14)',
+        pad('policy: project (5 rules) · subagents: 2 · ✓ checkpoints · ✓ memory (14)'),
       );
     });
 
@@ -130,10 +137,10 @@ describe('formatPermanent', () => {
       const out = formatPermanent(baseBanner, colored);
       // 0: title (bold), 1: blank, 2-3: identity (dim), 4: blank, 5: env mix
       expect(out[0]).toContain(`${CSI}1m`);
-      expect(out[1]).toBe('');
+      expect(out[1]).toBe(pad(''));
       expect(out[2]).toContain(`${CSI}2m`);
       expect(out[3]).toContain(`${CSI}2m`);
-      expect(out[4]).toBe('');
+      expect(out[4]).toBe(pad(''));
       // env line: meta entry dim, flag entry success.
       expect(out[5]).toContain(`${CSI}2m`); // dim runs (meta + separator)
       expect(out[5]).toContain(`${CSI}32m`); // success run (flag)
@@ -152,35 +159,39 @@ describe('formatPermanent', () => {
 
   describe('user-submit (inverse bar, UI.md §4.10.8)', () => {
     // SGR 7 (reverse) emits unconditionally — it's an attribute, not
-    // a color (works under NO_COLOR). Each line is padded to caps.cols
-    // before reversal so the bar extends edge-to-edge.
+    // a color (works under NO_COLOR). Each line is padded internally
+    // to `cols - 2` (frame margin §6.3) before reversal so the bar
+    // runs from col 2 to col cols-1. The 2sp prefix is OUTSIDE the
+    // SGR 7 wrap (normal-bg space, not inverse) so the bar starts
+    // visibly at col 2, aligned with the rest of the padded content.
     const REVERSE_OPEN = '\x1b[7m';
     const RESET = '\x1b[0m';
+    // Line shape: '  ' (frame margin) + REVERSE_OPEN + content + RESET.
+    // Helper strips the wrap to inspect the inner padded content.
+    const innerOf = (line: string): string =>
+      line.slice('  '.length + REVERSE_OPEN.length, -RESET.length);
 
-    test('single-line submit pads to caps.cols and wraps the line in SGR 7', () => {
+    test('line is `frame margin + reversed (cols-2)-padded content`', () => {
       const out = formatPermanent({ kind: 'user-submit', text: 'hi' }, ascii);
       expect(out).toHaveLength(1);
       const line = out[0] ?? '';
-      expect(line.startsWith(REVERSE_OPEN)).toBe(true);
+      expect(line.startsWith(`  ${REVERSE_OPEN}`)).toBe(true);
       expect(line.endsWith(RESET)).toBe(true);
-      // Strip SGR to inspect the padded content.
-      const inner = line.slice(REVERSE_OPEN.length, -RESET.length);
-      expect(inner).toBe('> hi'.padEnd(ascii.cols));
+      expect(innerOf(line)).toBe('> hi'.padEnd(ascii.cols - 2));
     });
 
-    test('multi-line submit applies > on first line, two-space continuation, full-width bar each', () => {
+    test('multi-line submit applies > on first line, two-space continuation, padded each', () => {
       const out = formatPermanent({ kind: 'user-submit', text: 'first\nsecond\nthird' }, ascii);
       expect(out).toHaveLength(3);
-      const inners = out.map((l) => l.slice(REVERSE_OPEN.length, -RESET.length));
+      const inners = out.map(innerOf);
       expect(inners).toEqual([
-        '> first'.padEnd(ascii.cols),
-        '  second'.padEnd(ascii.cols),
-        '  third'.padEnd(ascii.cols),
+        '> first'.padEnd(ascii.cols - 2),
+        '  second'.padEnd(ascii.cols - 2),
+        '  third'.padEnd(ascii.cols - 2),
       ]);
-      // Each line independently wrapped in SGR 7 + reset (so terminal
-      // resize / re-flow doesn't strand inverse state across lines).
+      // Each line independently wrapped in frame margin + SGR 7 + reset.
       for (const l of out) {
-        expect(l.startsWith(REVERSE_OPEN)).toBe(true);
+        expect(l.startsWith(`  ${REVERSE_OPEN}`)).toBe(true);
         expect(l.endsWith(RESET)).toBe(true);
       }
     });
@@ -196,8 +207,7 @@ describe('formatPermanent', () => {
       const out = formatPermanent({ kind: 'user-submit', text: 'a long input' }, narrow);
       // Inner content keeps the original text without truncation;
       // truncation is the renderer's job (truncateToWidth).
-      const inner = (out[0] ?? '').slice(REVERSE_OPEN.length, -RESET.length);
-      expect(inner).toBe('> a long input');
+      expect(innerOf(out[0] ?? '')).toBe('> a long input');
     });
   });
 
@@ -207,7 +217,7 @@ describe('formatPermanent', () => {
         { kind: 'assistant', text: 'line1\nline2', durationMs: null, outputTokens: null },
         ascii,
       ),
-    ).toEqual(['line1', 'line2']);
+    ).toEqual([pad('line1'), pad('line2')]);
   });
 
   test('assistant with empty text + chip metadata emits header only (tool-only turn)', () => {
@@ -216,7 +226,7 @@ describe('formatPermanent', () => {
     // line. Header alone, no text lines.
     expect(
       formatPermanent({ kind: 'assistant', text: '', durationMs: 8200, outputTokens: 234 }, ascii),
-    ).toEqual(['* Generated 234 tokens in 8.2s']);
+    ).toEqual([pad('* Generated 234 tokens in 8.2s')]);
   });
 
   test('assistant with empty text + no metadata emits nothing (degenerate guard)', () => {
@@ -236,7 +246,7 @@ describe('formatPermanent', () => {
         { kind: 'assistant', text: 'foo\n', durationMs: null, outputTokens: null },
         ascii,
       ),
-    ).toEqual(['foo', '']);
+    ).toEqual([pad('foo'), pad('')]);
   });
 
   test('assistant with duration + tokens emits chip header above text (UI.md §4.10.5)', () => {
@@ -246,8 +256,8 @@ describe('formatPermanent', () => {
     );
     // Header + text. ASCII glyph for the chip is `*`.
     expect(out).toHaveLength(2);
-    expect(out[0]).toBe('* Generated 234 tokens in 8.2s');
-    expect(out[1]).toBe('hello');
+    expect(out[0]).toBe(pad('* Generated 234 tokens in 8.2s'));
+    expect(out[1]).toBe(pad('hello'));
   });
 
   test('assistant with duration only (no usage) drops the token clause', () => {
@@ -256,8 +266,8 @@ describe('formatPermanent', () => {
       ascii,
     );
     // Sub-second duration renders in ms.
-    expect(out[0]).toBe('* Generated in 450ms');
-    expect(out[1]).toBe('hi');
+    expect(out[0]).toBe(pad('* Generated in 450ms'));
+    expect(out[1]).toBe(pad('hi'));
   });
 
   test('assistant with tokens only (no duration) drops the duration clause', () => {
@@ -265,8 +275,8 @@ describe('formatPermanent', () => {
       { kind: 'assistant', text: 'hi', durationMs: null, outputTokens: 50 },
       ascii,
     );
-    expect(out[0]).toBe('* Generated 50 tokens');
-    expect(out[1]).toBe('hi');
+    expect(out[0]).toBe(pad('* Generated 50 tokens'));
+    expect(out[1]).toBe(pad('hi'));
   });
 
   describe('tool-end (operation chip + sub-content, UI.md §4.10.5/§4.10.7)', () => {
@@ -283,9 +293,10 @@ describe('formatPermanent', () => {
         unicode,
       );
       // Chip head: `· Read file in 850ms`. Sub-content: `└─ /foo.ts`.
+      // Both lines padded with the §6.3 frame margin.
       expect(out).toHaveLength(2);
-      expect(out[0]).toBe('· Read file in 850ms');
-      expect(out[1]).toBe('└─ /foo.ts');
+      expect(out[0]).toBe(pad('· Read file in 850ms'));
+      expect(out[1]).toBe(pad('└─ /foo.ts'));
     });
 
     test('done status with no subject emits only the chip head (no connector line)', () => {
@@ -300,7 +311,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out).toEqual(['· Updated todos in 50ms']);
+      expect(out).toEqual([pad('· Updated todos in 50ms')]);
     });
 
     test('error status overrides verb to "Failed" regardless of vocab', () => {
@@ -317,7 +328,7 @@ describe('formatPermanent', () => {
       );
       expect(out[0]).toContain('Failed in 200ms');
       expect(out[0]).not.toContain('Executed');
-      expect(out[1]).toBe('└─ rm -rf /tmp/x');
+      expect(out[1]).toBe(pad('└─ rm -rf /tmp/x'));
     });
 
     test('denied status overrides verb to "Denied"', () => {
@@ -350,7 +361,7 @@ describe('formatPermanent', () => {
       );
       // Summary takes precedence over subject for denied (the
       // operator wants the reason, not the rejected command echo).
-      expect(out[1]).toBe('└─ matches deny rule bash.rm.rf');
+      expect(out[1]).toBe(pad('└─ matches deny rule bash.rm.rf'));
     });
 
     test('summary fills in for sub-content when subject is null', () => {
@@ -367,10 +378,10 @@ describe('formatPermanent', () => {
         unicode,
       );
       expect(out).toHaveLength(2);
-      expect(out[1]).toBe('└─ 3 items added');
+      expect(out[1]).toBe(pad('└─ 3 items added'));
     });
 
-    test('chip glyph is `·` under Unicode, `*` under ASCII', () => {
+    test('chip glyph is `·` under Unicode, `*` under ASCII (after frame margin)', () => {
       const u = formatPermanent(
         {
           kind: 'tool-end',
@@ -393,8 +404,9 @@ describe('formatPermanent', () => {
         },
         ascii,
       );
-      expect(u[0]?.charAt(0)).toBe('·');
-      expect(a[0]?.charAt(0)).toBe('*');
+      // Glyph sits at column 2 (after the 2sp frame margin).
+      expect(u[0]?.charAt(2)).toBe('·');
+      expect(a[0]?.charAt(2)).toBe('*');
     });
 
     test('connector is `└─ ` under Unicode, `\\- ` under ASCII', () => {
@@ -420,8 +432,8 @@ describe('formatPermanent', () => {
         },
         ascii,
       );
-      expect(u[1]).toBe('└─ /x');
-      expect(a[1]).toBe('\\- /x');
+      expect(u[1]).toBe(pad('└─ /x'));
+      expect(a[1]).toBe(pad('\\- /x'));
     });
 
     test('duration uses ms below 1s, s above', () => {
@@ -476,14 +488,16 @@ describe('formatPermanent', () => {
   });
 
   test('error and warn pass through as plain text when color disabled', () => {
-    expect(formatPermanent({ kind: 'error', message: 'down' }, ascii)).toEqual(['error: down']);
-    expect(formatPermanent({ kind: 'warn', message: 'high' }, ascii)).toEqual(['warn: high']);
+    expect(formatPermanent({ kind: 'error', message: 'down' }, ascii)).toEqual([
+      pad('error: down'),
+    ]);
+    expect(formatPermanent({ kind: 'warn', message: 'high' }, ascii)).toEqual([pad('warn: high')]);
   });
 
   test('error and warn are wrapped in SGR escapes when color enabled', () => {
     const errored = formatPermanent({ kind: 'error', message: 'down' }, colored);
-    expect(errored[0]).toBe(`${CSI}31merror: down${CSI}0m`);
+    expect(errored[0]).toBe(pad(`${CSI}31merror: down${CSI}0m`));
     const warned = formatPermanent({ kind: 'warn', message: 'high' }, colored);
-    expect(warned[0]).toBe(`${CSI}33mwarn: high${CSI}0m`);
+    expect(warned[0]).toBe(pad(`${CSI}33mwarn: high${CSI}0m`));
   });
 });

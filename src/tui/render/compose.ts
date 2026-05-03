@@ -25,6 +25,7 @@ import type { LiveState } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
 import { renderAssistantChip } from './assistant-chip.ts';
 import { renderFooter } from './footer.ts';
+import { padFrame } from './frame.ts';
 import { renderInput } from './input.ts';
 import { renderModal } from './modal.ts';
 import { renderSlashPopover } from './slash-popover.ts';
@@ -32,6 +33,12 @@ import { renderStatusLine } from './status.ts';
 import { renderTodoList } from './todo-list.ts';
 import { renderToolCardLive } from './tool-card.ts';
 
+// Horizontal rules around the input go edge-to-edge (UI.md §6.3
+// "bloco do input" exception). Together with the input line they
+// form a 3-row unit that visually breaks away from the indented
+// content above and the indented footer below — operator's eye reads
+// the block as "this is where you type" without the rules pretending
+// to belong to the padded frame.
 const horizontalRule = (caps: Capabilities): string =>
   paint(caps, 'dim', (caps.unicode ? '─' : '-').repeat(caps.cols));
 
@@ -104,35 +111,43 @@ export const composeLive: ComposeLive = (
 ): string[] => {
   const lines: string[] = [];
 
+  // Frame margin (UI.md §6.3): every line in the live region gets 2sp
+  // left padding EXCEPT the input row. The composer applies `padFrame`
+  // to each renderer's output here; the renderers themselves emit
+  // unpadded content, which keeps them composable with anything else
+  // (tests, headless replay) that wants the raw content. The two
+  // width-aware paths — `horizontalRule` (computed locally) and
+  // `renderFooter` (anchor math) — already produce padded output.
+
   // 1. Live TodoList (above the operation chips per spec §4.10.6:
   // "Todo list (§4.3) acima dos chips, se houver"). renderTodoList
   // returns [] when state.todos is empty — section drops entirely.
-  lines.push(...renderTodoList(state.todos, caps));
+  lines.push(...renderTodoList(state.todos, caps).map(padFrame));
 
   // 2. Live "Generating…" chip. Spec §4.10.5: the assistant turn is
   // an operation chip just like a tool call. Renders above the tool
   // cards because the assistant is the parent operation — tool calls
   // it spawns sit beneath it visually.
   if (state.pendingAssistant !== null) {
-    lines.push(...renderAssistantChip(state.pendingAssistant, caps, now));
+    lines.push(...renderAssistantChip(state.pendingAssistant, caps, now).map(padFrame));
   }
 
   // 3. Active tool cards (running). Map insertion order is preserved,
   // so the visual order matches the order tools were started.
   for (const tool of state.activeTools.values()) {
-    lines.push(...renderToolCardLive(tool, caps, now));
+    lines.push(...renderToolCardLive(tool, caps, now).map(padFrame));
   }
 
   // 4. Status line — only when session has started.
   const status = renderStatusLine(state, caps, { now });
-  if (status !== null) lines.push(status);
+  if (status !== null) lines.push(padFrame(status));
 
   // 5. Modal OR bottom anchor — never both. Bottom anchor is rule +
   // input + rule + footer (4-block stack); modal substitutes the
   // whole anchor and carries its own structure. Status line + tool
   // cards stay visible above so the user keeps context.
   if (state.modal !== null) {
-    lines.push(...renderModal(state.modal, caps));
+    lines.push(...renderModal(state.modal, caps).map(padFrame));
     return lines;
   }
   // Slash autocomplete popover sits above the rule, between status
@@ -140,9 +155,13 @@ export const composeLive: ComposeLive = (
   // the upper region — composeCursor's math (FOOTER_BLOCK_LINES +
   // inputLines from the bottom) stays correct regardless.
   if (state.slash !== null) {
-    lines.push(...renderSlashPopover(state.slash, caps));
+    lines.push(...renderSlashPopover(state.slash, caps).map(padFrame));
   }
   lines.push(horizontalRule(caps));
+  // Input is the single OUTDENTED element (UI.md §6.3 frame margin
+  // exception). No padFrame here — the prompt `> ` lives at col 0
+  // and the cursor lands at col 2, naturally anchored to the rest
+  // of the indented content's left edge.
   lines.push(...renderInput(state.input, caps));
   lines.push(horizontalRule(caps));
   // renderFooter only returns null on modal (handled above); the

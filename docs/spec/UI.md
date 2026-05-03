@@ -504,7 +504,7 @@ Multi-tool ops (ex: `glob` matched 14 files) cita o **padrão**, não a lista �
 > a tui já funciona?
 ```
 
-Renderizado com SGR `7` (reverse) full-width — branco em fundo escuro, ocupando toda a coluna do terminal. Vira **divisor estrutural** no scrollback: rolando, as barras servem de heading natural para localizar turnos.
+Renderizado com SGR `7` (reverse) preenchendo da col 2 até `cols-1` — branco em fundo escuro como divisor estrutural no scrollback. Os 2sp à esquerda são a frame margin (§6.3); a barra fica visualmente alinhada ao resto do conteúdo recuado. Rolando, as barras servem de heading natural para localizar turnos.
 
 Régua dim acima e abaixo do echo é **opcional** (decisão final na implementação após smoke test visual). Default: sem régua adicional, deixa a inversa carregar o destaque sozinha.
 
@@ -567,25 +567,25 @@ Banidos do vocabulário operacional:
 #### 4.10.12 Layout completo (referência ASCII)
 
 ```
-┌─ scrollback (permanent items, dim baseline) ───────────────────────┐
-│ forja v0.0.0                                    ← title (bold)      │
+┌─ scrollback (permanent items, 2sp left margin §6.3) ────────────────┐
+│   forja v0.0.0                                  ← title (bold)      │
 │                                                                     │
-│ anthropic/claude-sonnet-4-6 · 200k ctx · max 4096 out  ← identity   │
-│ /run/media/lex/.../forja                                            │
+│   anthropic/claude-sonnet-4-6 · 200k ctx · max 4096 out ← identity  │
+│   /run/media/lex/.../forja                                          │
 │                                                                     │
-│ policy: project (5 rules) · subagents: 2 · ✓ checkpoints · ✓ memory │
+│   policy: project (5 rules) · subagents: 2 · ✓ checkpoints          │
 │                                                                     │
-│ > a tui já funciona?                            ← inverse bar       │
-│ * Reading file (2.4kB)                          ← chip final, dim   │
-│ └─ src/foo.ts                                                       │
-│ * Generated 234 tokens in 8.2s                                      │
-│ Sim, em teoria funciona...                      ← assistant text    │
-│ ── step 3/50 ── $0.012 ──                       ← step separator    │
+│   > a tui já funciona?                          ← inverse bar (§4.10.8) │
+│   * Reading file (2.4kB)                        ← chip final, dim   │
+│   └─ src/foo.ts                                                     │
+│   * Generated 234 tokens in 8.2s                                    │
+│   Sim, em teoria funciona...                    ← assistant text    │
+│   ── step 3/50 ── $0.012 ──                     ← step separator    │
 └─────────────────────────────────────────────────────────────────────┘
-─────────────────────────────────────────────────────────────────────  ← régua
-> ▌                                                                   ← input + cursor inline
-─────────────────────────────────────────────────────────────────────  ← régua
-? for help · esc to interrupt        • sonnet-4.6 · 3/50 · $0.012     ← footer
+─────────────────────────────────────────────────────────────────────  ← régua (full width, col 0)
+> ▌                                                                   ← input + cursor (col 0)
+─────────────────────────────────────────────────────────────────────  ← régua (full width, col 0)
+  ? for help · esc to interrupt        • sonnet-4.6 · 3/50 · $0.012   ← footer (padded)
 ```
 
 Live region (entre as réguas e a inferior):
@@ -967,10 +967,13 @@ Detecção: locale-aware (`LANG`/`LC_ALL` contém `UTF-8`) + check de width via 
 
 ### 6.3 Espaçamento
 
-- Indent fixo: 2 espaços por nível.
-- Não há padding interno em modais (linhas vazias acima/abaixo do conteúdo, sem espaços laterais — borda fica em `─`).
-- Separador horizontal: `─` (40 chars) ou `-` (ASCII).
+- **Frame margin (UX)**: 2 espaços à esquerda em **todos os elementos visíveis** — banner, scrollback (assistant, tool-end, info/warn/error), status line, tool cards (live + permanent), todo list, slash popover, footer, modal, inverse bar do user-submit (§4.10.8).
+  - **Exceção: bloco do input** (régua acima + linha(s) do prompt `> ` + régua abaixo). As 3 linhas formam uma unidade visual e ficam edge-to-edge (col 0 a `cols-1`). Recuar só o input com as réguas padded faria a entrada "vazar" pra fora do frame visual; recuar tudo apagaria a hierarquia ("isto é onde você digita"). Edge-to-edge nas 3 linhas dá um bloco coerente que rompe com o conteúdo recuado acima e com o footer recuado abaixo. O cursor naturalmente cai em col 2 (após `> `), alinhado à margem de 2sp do resto.
+  - Largura útil de cada elemento padded é `cols - 2`. Margem direita não existe — alinhar à direita ainda usa col `cols-1`.
+- **Indent de conteúdo**: 2 espaços por nível adicional dentro de um elemento (ex.: sub-content connector `└─` sob um chip vai em col 4 = frame margin 2 + nível 2). Não confundir com frame margin (separa conteúdo da borda) vs. indent (separa hierarquia interna).
+- Separador horizontal: `─` (Unicode) ou `-` (ASCII). Largura depende do contexto: réguas que cercam o input (acima + abaixo) ficam edge-to-edge (`cols` colunas, sem margin); qualquer outra régua que apareça em scrollback/permanente respeita a frame margin (2sp prefix + `cols - 2` glyphs).
 - Linhas em branco entre blocos permanentes: 1 (apenas). Aplica-se também a sub-blocos dentro de um único `PermanentItem` quando a hierarquia visual exige (ex.: banner com 3 sub-blocos, §4.10.9). Nunca 2 ou mais — duplo respiro vira ruído.
+- Modais respeitam a frame margin como qualquer outro elemento. (O esboço inicial pré-§4.10.13 dizia "sem padding lateral em modais" — revisto pra coerência visual; modal sem margem destacaria contra o resto recuado e quebraria a leitura).
 
 ### 6.4 Tipografia
 

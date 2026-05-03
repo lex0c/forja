@@ -12,6 +12,7 @@
 
 import type { PermanentItem } from '../state.ts';
 import { type Capabilities, paint, reverse } from '../term.ts';
+import { FRAME_MARGIN, frameWidth, padFrame } from './frame.ts';
 import { subContentConnector } from './glyphs.ts';
 import { visualWidth } from './width.ts';
 
@@ -32,9 +33,17 @@ const finalVerbFor = (status: 'done' | 'error' | 'denied', vocabVerb: string): s
 };
 
 export const formatPermanent = (item: PermanentItem, caps: Capabilities): string[] => {
+  // Frame margin (UI.md §6.3): every permanent kind emits 2sp-padded
+  // lines. The `user-submit` reverse bar handles its own padding
+  // internally (the prefix sits OUTSIDE the SGR 7 wrap so the inverse
+  // bar starts at col 2 rather than col 0); every other kind builds
+  // raw content and lets the bottom switch arm apply `padFrame` to
+  // each line. Banner's blank-line separators get padded too — `'  '`
+  // still reads as a blank line visually but keeps cursor accounting
+  // honest if the renderer ever uses these for column math.
   switch (item.kind) {
     case 'session-header':
-      return [`── session ${item.sessionId} · ${item.profile} · ${item.model} ──`];
+      return [`── session ${item.sessionId} · ${item.profile} · ${item.model} ──`].map(padFrame);
     case 'session-footer': {
       // 1.g.3 closes D171: when the run aborted, append the cause
       // discriminator so the operator sees `aborted (soft)` vs
@@ -44,7 +53,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // a non-abort reason shouldn't render misleading text.
       const cause =
         item.reason === 'aborted' && item.abortCause !== undefined ? ` (${item.abortCause})` : '';
-      return [`── session end · ${item.reason}${cause} ──`];
+      return [`── session end · ${item.reason}${cause} ──`].map(padFrame);
     }
     case 'session-banner': {
       // UI.md §4.10.9. Three blocks separated by blank lines:
@@ -80,22 +89,24 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         lines.push('');
         lines.push(parts.join(dimSep));
       }
-      return lines;
+      return lines.map(padFrame);
     }
     case 'user-submit': {
-      // UI.md §4.10.8 — full-width inverse bar acts as a structural
-      // divider in scrollback (rolling back, the bars locate turns
-      // without inventing headings). Each line is padded to the
-      // terminal width then wrapped in SGR 7 so the inversion
-      // extends edge-to-edge regardless of text length.
+      // UI.md §4.10.8 — inverse bar acts as a structural divider in
+      // scrollback (rolling back, the bars locate turns without
+      // inventing headings). The frame margin (§6.3) sits OUTSIDE the
+      // SGR 7 wrap: 2sp of normal-bg space, then the inverse bar
+      // from col 2 to col cols-1. The bar is padded internally to
+      // `cols - 2` so the inverse extends to the right edge.
       const prefixed = item.text.split('\n').map((l, i) => (i === 0 ? `> ${l}` : `  ${l}`));
+      const innerWidth = frameWidth(caps);
       return prefixed.map((line) => {
         // padEnd pads code units; for plain ASCII text that matches
         // visual columns. CJK / emoji content would over-pad —
         // accept the small inconsistency until visualWidth-aware
         // padding lands (no producer emits multi-col text today).
-        const padded = line + ' '.repeat(Math.max(0, caps.cols - visualWidth(line)));
-        return reverse(padded);
+        const padded = line + ' '.repeat(Math.max(0, innerWidth - visualWidth(line)));
+        return `${FRAME_MARGIN}${reverse(padded)}`;
       });
     }
     case 'assistant': {
@@ -112,7 +123,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       const hasMetadata = item.durationMs !== null || item.outputTokens !== null;
       if (item.text.length === 0 && !hasMetadata) return [];
       const textLines = item.text.length === 0 ? [] : item.text.split('\n');
-      if (!hasMetadata) return textLines;
+      if (!hasMetadata) return textLines.map(padFrame);
       const glyph = caps.unicode ? CHIP_FINAL_GLYPH.unicode : CHIP_FINAL_GLYPH.ascii;
       const ms =
         item.durationMs === null
@@ -129,7 +140,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       const inClause = ms === null ? '' : `in ${ms}`;
       const tail = [tokenClause, inClause].filter((s) => s.length > 0).join(' ');
       const header = paint(caps, 'dim', `${glyph} Generated${tail.length > 0 ? ` ${tail}` : ''}`);
-      return [header, ...textLines];
+      return [header, ...textLines].map(padFrame);
     }
     case 'tool-end': {
       // UI.md §4.10.5 — chip glyph + verb (status-aware) + duration.
@@ -164,16 +175,16 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
             ? item.subject
             : (item.summary ?? null);
       if (subText !== null) lines.push(paint(caps, 'dim', `${sub}${subText}`));
-      return lines;
+      return lines.map(padFrame);
     }
     case 'error':
-      return [paint(caps, 'error', `error: ${item.message}`)];
+      return [paint(caps, 'error', `error: ${item.message}`)].map(padFrame);
     case 'warn':
-      return [paint(caps, 'warn', `warn: ${item.message}`)];
+      return [paint(caps, 'warn', `warn: ${item.message}`)].map(padFrame);
     case 'info':
       // Plain — no SGR. Info isn't an alert; coloring it would
       // collide with the warn channel's "actually pay attention"
       // signal (lock conflicts, compaction notices, etc.).
-      return [item.message];
+      return [item.message].map(padFrame);
   }
 };

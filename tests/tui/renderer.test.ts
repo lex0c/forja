@@ -492,12 +492,12 @@ describe('renderer wiring', () => {
     const out = sink.joined();
     expect(out).toContain('── session');
     // Strip the synchronized-output wrap (DECSET 2026) and assert
-    // what's inside is exactly the permanent line. Without an empty
-    // live region the inner payload would also include cursorUp /
-    // clearDown / live content escapes, which is what this test
-    // guards against.
+    // what's inside is exactly the permanent line (with §6.3 frame
+    // margin). Without an empty live region the inner payload would
+    // also include cursorUp / clearDown / live content escapes, which
+    // is what this test guards against.
     const inner = out.replace(`${CSI}?2026h`, '').replace(`${CSI}?2026l`, '');
-    expect(inner).toBe('── session s1 · autonomous · opus ──\n');
+    expect(inner).toBe('  ── session s1 · autonomous · opus ──\n');
     r.close();
   });
 

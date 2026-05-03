@@ -15,6 +15,41 @@ Format:
 
 ---
 
+## [2026-05-03] M2 / spec+impl — frame margin (2sp left, input outdented)
+
+Operator pediu padding lateral pra texto não ficar colado na borda. Spec §6.3 antes definia "indent fixo: 2 espaços por nível" — indent **hierárquico** (sub-content sob chip), não margem de frame. Adicionar margin global era extensão de spec, não divergência.
+
+Decisão sobre escopo veio em duas iterações com o operator:
+1. Primeira tentativa: "tudo exceto a linha do input". Resultado visual: input em col 0 com réguas padded em col 2 — input "vazava" pra fora do frame visual das réguas, ficou solto.
+2. Iteração: o **bloco do input** (régua acima + linha(s) do input + régua abaixo) é uma unidade visual. As 3 linhas vão edge-to-edge (col 0 a `cols-1`); todo o resto (banner, scrollback, status, tool cards, todo list, slash popover, footer, modal, inverse bar) fica padded em col 2.
+
+Resultado: scrollback recuado lê como "histórico"; o bloco edge-to-edge no fundo lê como "zona de digitação"; footer recuado embaixo lê como "status auxiliar". Hierarquia em 3 camadas, não 2.
+
+**Done:**
+
+- §6.3 reescrita com definição explícita de "frame margin" + exceção do **bloco do input** (3 linhas: rule acima + input + rule abaixo, todas edge-to-edge) + nota sobre indent vs. margin (hierarquia interna vs. distância da borda) + remoção da regra antiga "sem padding lateral em modais" (pré-canônico §4.10.13). Nota separada sobre largura de réguas: réguas do bloco do input ficam edge-to-edge (`cols`); réguas de scrollback (se algum dia houver) respeitam a frame margin (`cols-2` + 2sp prefix).
+- §4.10.8 inverse bar atualizado: SGR 7 cobre col 2 a cols-1; o 2sp da margem fica fora do wrap reverse (normal-bg), bar visualmente inset 2sp.
+- §4.10.12 reference layout redesenhado mostrando indent + outdent.
+- Novo módulo `src/tui/render/frame.ts` com `FRAME_MARGIN`, `FRAME_MARGIN_WIDTH`, `frameWidth(caps)`, `padFrame(line)` — fonte única para a constante, fácil de bumpar pra 3sp/4sp se a UX evoluir.
+- `compose.ts`: `padFrame` aplicado em cada renderer output exceto `renderInput`. Régua usa `frameWidth(caps)` pra largura de `cols-2` + prefix.
+- `permanent.ts`: cada `kind` retorna lines `.map(padFrame)`. `user-submit` reverse bar especial — pad interno a `frameWidth(caps)` antes do reverse, prefix `'  '` fora do SGR 7.
+- `footer.ts`: anchor math subtrai `FRAME_MARGIN_WIDTH` da largura disponível, prefix sai padded.
+- 2 testes de regressão novos em `compose.test.ts` pinando o contrato: "every line starts with 2sp EXCEPT input" e "multi-line input continuations skip the frame margin" (pega o caso enganoso onde continuação `'  body'` parece linha padded mas é input).
+
+**Decisions:**
+
+- **Diferenciar input de continuação de input**: continuation lines começam com `'  '` (renderInput's prefix pra alinhar sob `>`). Padding global também é `'  '`. O composer evita o problema chamando `renderInput` SEM `.map(padFrame)`, então linhas de input ficam com 2sp totais (renderInput's prefix), enquanto outras ficam com 4 totais (frame margin + content's natural prefix). Diferença visual: input em col 0, conteúdo em col 2.
+- **Reverse bar com prefix fora do SGR**: 2 normal-bg spaces, depois reverse de col 2 a cols-1. Mantém propriedade de "divisor estrutural" sem comer os 2sp da margem.
+- **Modal também padded**, contra a regra original "sem padding interno em modais". Justificativa: incoerência visual entre modal e o resto seria pior que rever uma regra pré-canônica que nunca foi reavaliada após §4.10.13.
+
+**Pending:**
+
+- Smoke visual em xterm + i3wm (terminal do operator) — confirmar que o respiro lateral fica como esperado e que o cursor após `> ` realmente cai em col 2 alinhado ao resto.
+
+**Next:** smoke + commit.
+
+---
+
 ## [2026-05-03] M2 / fix — renderer flicker (single write + DECSET 2026 + differential)
 
 Operator notou linhas ao redor do input piscando ao digitar; pior sob key repeat (`eeeeeeeeee`). Operator usa xterm vanilla sob i3wm — terminal mais antigo sem DECSET 2026. Foi preciso atacar em três camadas, e a operator-side observation foi load-bearing: *"o banner não pisca"* — ou seja, conteúdo permanente (que vai pra scrollback nativo do terminal e nunca é revisitado) é estável; só a região viva pisca, porque ela é redesenhada a cada frame.

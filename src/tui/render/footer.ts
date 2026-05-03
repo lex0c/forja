@@ -11,6 +11,7 @@
 
 import type { LiveState } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
+import { FRAME_MARGIN, FRAME_MARGIN_WIDTH } from './frame.ts';
 import { visualWidth } from './width.ts';
 
 const formatCost = (usd: number): string => {
@@ -84,14 +85,16 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   }
   const right = rightParts.join(sep);
 
-  // Pad middle so right anchors to caps.cols. When content overflows
-  // (long model name + budget pushing past the terminal width), the
-  // pad clamps to 0 (left and right collapse together) and the
-  // renderer's truncateToWidth clips the right end. Acceptable
-  // degradation; future polish can drop low-priority tokens (cost
-  // label, then steps, then plan) before truncation kicks in.
+  // Pad middle so right anchors to col `caps.cols - 1`. The frame
+  // margin (UI.md §6.3, 2sp left) is prepended outside this math:
+  // total line width stays caps.cols, with FRAME_MARGIN + left + middle
+  // padding + right. When content overflows the available width
+  // (cols - margin), the pad clamps to 0 (left and right collapse
+  // together) and the renderer's truncateToWidth clips the right end.
+  // Acceptable degradation; future polish can drop low-priority
+  // tokens (cost label, then steps, then plan) before truncation.
   const leftW = visualWidth(left);
   const rightW = visualWidth(right);
-  const padding = ' '.repeat(Math.max(0, caps.cols - leftW - rightW));
-  return `${left}${padding}${right}`;
+  const padding = ' '.repeat(Math.max(0, caps.cols - FRAME_MARGIN_WIDTH - leftW - rightW));
+  return `${FRAME_MARGIN}${left}${padding}${right}`;
 };
