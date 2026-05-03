@@ -514,21 +514,18 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       const text = buf?.text ?? '';
       const durationMs = buf !== null ? event.ts - buf.startedAt : null;
       const outputTokens = buf?.outputTokens ?? null;
-      // Emit a permanent when EITHER text is present OR we have chip
-      // metadata worth surfacing. Tool-only turns (Anthropic emits
-      // tool_use blocks without accompanying text) consume real
-      // output tokens — the operator should still see the per-turn
-      // cost signal as a chip line above whatever tool chips fired.
-      // Without this, only step:budget aggregates the cost and the
-      // per-turn breakdown is invisible. formatPermanent handles the
-      // text-empty + chip-metadata combination by emitting just the
-      // header.
-      const hasMeaningfulMetadata =
-        outputTokens !== null && outputTokens > 0 && durationMs !== null;
-      const shouldEmit = text.length > 0 || hasMeaningfulMetadata;
-      const permanent: PermanentItem[] = shouldEmit
-        ? [{ kind: 'assistant', text, durationMs, outputTokens }]
-        : [];
+      // Emit a permanent ONLY when there's prose to land in
+      // scrollback. Tool-only turns (Anthropic emits tool_use
+      // blocks without accompanying text) used to also emit so the
+      // formatter could render a `· Generated N tokens` chip above
+      // the tool chips — that chip header was removed (UI.md §4.10.5,
+      // duration goes to the turn-end marker §3.2 / tokens go to the
+      // footer). Emitting an item the formatter would render as []
+      // anyway forces the renderer through writeTransition (erase +
+      // full-frame redraw) for no scrollback gain — wasteful under
+      // tool-heavy flows and undermines the differential anti-flicker.
+      const permanent: PermanentItem[] =
+        text.length > 0 ? [{ kind: 'assistant', text, durationMs, outputTokens }] : [];
       return { state: { ...state, pendingAssistant: null }, permanent };
     }
 

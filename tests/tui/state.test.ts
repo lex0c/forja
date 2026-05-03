@@ -206,11 +206,16 @@ describe('assistant streaming', () => {
     expect(result.permanent).toEqual([]);
   });
 
-  test('end with empty buffer + usage emits chip-only permanent (tool-only turn)', () => {
-    // Provider call that returned tool_use blocks but no text still
-    // consumed real output tokens — operator sees the cost signal as
-    // a chip line. text stays '' so formatPermanent emits header
-    // alone.
+  test('end with empty buffer + usage emits NO permanent (tool-only turn)', () => {
+    // Provider call that returned tool_use blocks but no text used to
+    // emit a metadata-only permanent so formatPermanent could render
+    // a `· Generated N tokens` chip header above the tool chips.
+    // The chip header was removed (UI.md §4.10.5) — duration shows
+    // up in the turn-end marker (§3.2 `Cogitated for X`), tokens
+    // roll up into the footer cost. Emitting a metadata-only
+    // permanent the formatter would render as [] forces the
+    // renderer through writeTransition (erase + full redraw) for no
+    // scrollback gain — wasteful in tool-heavy flows. So: don't emit.
     const result = drive([
       { type: 'assistant:start', ts: 1000, messageId: 'm1' },
       {
@@ -224,9 +229,7 @@ describe('assistant streaming', () => {
       },
       { type: 'assistant:end', ts: 4200, messageId: 'm1' },
     ]);
-    expect(result.permanent).toEqual([
-      { kind: 'assistant', text: '', durationMs: 3200, outputTokens: 47 },
-    ]);
+    expect(result.permanent).toEqual([]);
   });
 
   test('assistant:usage merges token counts onto pendingAssistant', () => {
