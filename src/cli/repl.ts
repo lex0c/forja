@@ -182,9 +182,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     stdin,
     ...(options.rendererWrite !== undefined ? { write: options.rendererWrite } : {}),
   });
-  // Modal manager wired but no producer calls it yet — the harness's
-  // permission engine doesn't bridge to the bus in this slice. Lands
-  // when the permission/trust producers connect.
+  // Modal manager owns the permission/trust/etc modal lifecycle.
+  // The harness ↔ modal bridge runs through `confirmPermission` (defined
+  // below): the harness's permission engine returns `{kind: 'confirm'}`,
+  // invokeTool calls `cfg.confirmPermission(...)`, that bridge calls
+  // `modalManager.askPermission(...)`, modal-manager emits `permission:ask`
+  // → reducer paints → operator answers via focus stack → modal-manager
+  // resolves the askPermission promise → confirmPermission returns
+  // boolean to the harness. End-to-end wiring is exercised by the
+  // confirmPermission-bridge test in tests/cli/repl.test.ts.
   //
   // onInterrupt is a forward reference: triggerInterrupt is defined
   // further down (it depends on abortController + softStopController

@@ -15,6 +15,31 @@ Format:
 
 ---
 
+## [2026-05-03] M1 audit — TUI ↔ harness integration coverage (~77%)
+
+End-to-end audit of every `HarnessEvent` and `UIEvent` after the M1 series landed. 17 of 22 producer/render paths are wired and exercised against real Anthropic streaming (smoke runs in this session: text-only response, tool deny + multi-step recovery, tool allow path, --list-sessions). 5 producer gaps + 1 incomplete render are tracked below as explicit debt — none block the merge of what currently works, but each is a contract the spec promises and the operator-visible UI doesn't fully deliver yet.
+
+The wired-and-working surface (no debt): session lifecycle, user input, assistant streaming + tokens chip, thinking, tool lifecycle (with `denied` discriminator), todos, bg counter, step:budget + cost, compaction warnings, abort soft/hard ladder + footer cue, screen:clear, slash autocomplete + 8 builtin commands (3 mutation), info/warn/error scrollback, **permission modal** (the only modal flavor with a producer today).
+
+Acknowledged-elsewhere gaps NOT in this audit: subagent observability + soft-abort propagation + abortCause for subagents (D159 / D168 / 1.f.2 — all blocked on IPC, spec landed in `docs/spec/IPC.md`), `bg:update` UIEvent (D149).
+
+**Decisions:**
+
+- **D181 — `trust:ask` modal has no producer (security-relevant).** Spec UI.md §4.6 + AGENTIC_CLI §9 require a trust prompt when entering an untrusted directory or when an unknown `AGENTS.md` is present. The reducer + render are wired in `state.ts:702`; the modal-manager exposes only `askPermission`, no `askTrust`. The harness's `isTrustedCwd` check exists but doesn't bridge to the bus. Operator entering an untrusted cwd today gets no confirm — defaults to whatever the trust subsystem decides without operator input. Most security-sensitive of the 6 gaps; should land in its own slice that adds `modalManager.askTrust(...)` + the harness-side bridge mirroring confirmPermission's shape.
+- **D182 — `memory:write:ask` modal has no producer.** Memory subsystem (MEMORY.md) proposes writes (inferred memories from conversation) that should require operator confirm before persisting. Reducer/render wired in `state.ts:728`; no producer. Today inferred-write proposals either auto-write (security risk) or are silently dropped (UX gap) depending on the memory module path. Slice that lands `modalManager.askMemoryWrite(...)` + memory-subsystem bridge will close it.
+- **D183 — `plan:review` modal has no producer.** Plan mode today is "harness refuses write tools" — there's no review step where the operator approves a proposed plan before execution. Reducer/render wired in `state.ts:752`. The plan-review flow is what makes plan mode useful (operator inspects proposed steps + cost estimate before commit). Without it, plan mode is half a feature.
+- **D184 — `critique:ask` modal has no producer.** Critique pipeline (CODER_PLAYBOOK §6) is supposed to surface low-confidence steps to the operator before commit. Reducer/render wired in `state.ts:782`. Today no path emits the event; critique signals get logged but not interactive. Lower priority than D181-D183 because critique is per-playbook, not per-session.
+- **D185 — `checkpoint:create` reducer is no-op; status-line flash missing.** Producer fires the event correctly (verified in harness/loop.ts), reducer at `state.ts:581` returns silently with the comment "checkpoint flash on status line lands with the status-line render function" — but `status.ts` doesn't render any checkpoint indicator. Operator gets zero visual signal that a checkpoint was just created, only that one ran (because the next step continues normally). Spec UI.md §4.10.6 mentions checkpoint as a footer/status surface candidate. Smaller slice than the modal flavors — just a transient indicator (e.g. `· checkpoint @ step N` for 2s) consumed by the existing status-line renderer.
+- **D186 — `session-allow` modal answer doesn't persist a session-layer rule.** Operator answering "Yes, allow all <toolName> during this session" via the permission modal (option 2) currently routes through `confirmPermission` → returns `true` → harness allows the call. But no session-layer permission rule is written, so the NEXT call of the same tool re-prompts. Effectively `session-allow` is just a verbose `yes`. The TODO is in `repl.ts:280-283` — when the policy mutation lands (writes a session-scoped rule into the engine), the operator's expectation finally matches behavior.
+
+**Coverage estimate:** 17 of 22 HarnessEvent → UIEvent → render paths wired and exercised end-to-end. The 5 missing producers + 1 incomplete render are operator-facing features the spec promises; the absence is graceful (no crashes, no wrong behavior — just missing capability). Branch is mergeable as "TUI surface for what's wired"; the 6 D entries here track the road to "TUI surface for the full spec".
+
+**Pending:** 6 producer/render slices above; subagent observability (1.f.2, blocked on IPC); end-to-end audit by the operator under a real terminal (slash mid-turn, modal during real tool, /model swap mid-session).
+
+**Next:** operator-driven 30-min smoke under a real terminal; if clean, merge. The 6 producer gaps land as their own slices (likely M2 priority — the wired surface is sufficient for M1 single-prompt and basic REPL flows).
+
+---
+
 ## [2026-05-03] M1 / Step 1.f.8 — `/model <id>` mutation
 
 Closes the last mutation slash command deferred from 1.f.1. `/plan on|off` and `/budget steps|cost` landed in 1.f.7; `/model <id>` was held back because it requires re-resolving the provider via the registry's factory (key check, capability re-init), which has more failure modes than a simple field swap. This slice fills it in.
