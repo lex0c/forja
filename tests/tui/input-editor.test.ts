@@ -272,6 +272,68 @@ describe('surrogate-pair safety (emoji / non-BMP)', () => {
     const r = applyKey({ value: '日本', cursor: 1 }, named('backspace'));
     expect(r.next).toEqual({ value: '本', cursor: 0 });
   });
+
+  test('left arrow steps over a full emoji codepoint, never lands mid-pair', () => {
+    // Cursor=3 sits after the emoji (between low surrogate and 'b').
+    // Left should jump to position 1 (before the high surrogate),
+    // NOT to position 2 (mid-pair) which would corrupt the next
+    // insert / delete by splitting the surrogates.
+    const r = applyKey({ value: 'a😀b', cursor: 3 }, named('left'));
+    expect(r.next).toEqual({ value: 'a😀b', cursor: 1 });
+  });
+
+  test('right arrow steps over a full emoji codepoint, never lands mid-pair', () => {
+    // Cursor=1 (after 'a', before the high surrogate). Right should
+    // jump to position 3 (after the low surrogate), NOT 2.
+    const r = applyKey({ value: 'a😀b', cursor: 1 }, named('right'));
+    expect(r.next).toEqual({ value: 'a😀b', cursor: 3 });
+  });
+
+  test('left arrow at position 0 stays at 0 (no underflow)', () => {
+    // Regression: stepBack returns 0 when cursor <= 0, no Math.max
+    // needed at the call site.
+    const r = applyKey({ value: '😀', cursor: 0 }, named('left'));
+    expect(r.next).toEqual({ value: '😀', cursor: 0 });
+  });
+
+  test('right arrow at end of buffer stays at length (no overflow)', () => {
+    const r = applyKey({ value: '😀', cursor: 2 }, named('right'));
+    expect(r.next).toEqual({ value: '😀', cursor: 2 });
+  });
+
+  test('left → insert after emoji produces well-formed string (regression cover)', () => {
+    // The bug shape: cursor at 3 (after emoji), Left to 2 (mid-pair),
+    // then insert 'X' would yield 'a\ud83dX\ude00b' — lone surrogates
+    // both ways, breaks any UTF-8 encoder downstream. Post-fix the
+    // Left lands at 1, insert lands BEFORE the emoji: 'aX😀b'.
+    const left = applyKey({ value: 'a😀b', cursor: 3 }, named('left'));
+    const inserted = applyKey(left.next, ch('X'));
+    expect(inserted.next.value).toBe('aX😀b');
+    // Sanity: no lone surrogates anywhere in the result.
+    for (let i = 0; i < inserted.next.value.length; i++) {
+      const code = inserted.next.value.charCodeAt(i);
+      const isHigh = code >= 0xd800 && code <= 0xdbff;
+      const isLow = code >= 0xdc00 && code <= 0xdfff;
+      if (isHigh) {
+        const next = inserted.next.value.charCodeAt(i + 1);
+        expect(next >= 0xdc00 && next <= 0xdfff).toBe(true);
+      }
+      if (isLow) {
+        const prev = inserted.next.value.charCodeAt(i - 1);
+        expect(prev >= 0xd800 && prev <= 0xdbff).toBe(true);
+      }
+    }
+  });
+
+  test('CJK BMP arrows still move one code unit (no surrogate to skip)', () => {
+    // BMP codepoints fit in one code unit each. stepBack/stepForward
+    // should fall through to the cursor ± 1 path without invoking
+    // surrogate logic.
+    const left = applyKey({ value: '日本', cursor: 2 }, named('left'));
+    expect(left.next.cursor).toBe(1);
+    const right = applyKey({ value: '日本', cursor: 0 }, named('right'));
+    expect(right.next.cursor).toBe(1);
+  });
 });
 
 describe('immutability', () => {

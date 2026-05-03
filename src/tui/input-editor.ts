@@ -186,11 +186,19 @@ const applyNamedKey = (
 
     case 'left':
       if (key.ctrl || key.alt) return { next: { ...input, cursor: prevWordBoundary(input) } };
-      return { next: { ...input, cursor: Math.max(0, input.cursor - 1) } };
+      // Step by codepoint, not UTF-16 code unit. `cursor - 1` would
+      // land mid-surrogate-pair on emoji or non-BMP CJK (😀 is two
+      // code units); a subsequent insert/delete would then split the
+      // pair and produce a lone surrogate, corrupting the buffer and
+      // any downstream encoding. stepBack already handles the surrogate
+      // detection used by Backspace.
+      return { next: { ...input, cursor: stepBack(input.value, input.cursor) } };
 
     case 'right':
       if (key.ctrl || key.alt) return { next: { ...input, cursor: nextWordBoundary(input) } };
-      return { next: { ...input, cursor: Math.min(input.value.length, input.cursor + 1) } };
+      // Step by codepoint (see Left case for rationale). stepForward
+      // handles the surrogate-pair detection used by Delete.
+      return { next: { ...input, cursor: stepForward(input.value, input.cursor) } };
 
     case 'home':
       return { next: { ...input, cursor: lineStart(input) } };
