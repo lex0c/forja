@@ -106,7 +106,13 @@ export const BRACKETED_PASTE_END = `${CSI}201~`;
 // error, warn, success). No blue/cyan/magenta — the spec forbids them.
 export const SGR = {
   reset: `${CSI}0m`,
-  dim: `${CSI}2m`,
+  // `dim` uses SGR 90 (bright-black foreground) instead of SGR 2
+  // (faint). SGR 2 is opt-in for many terminals — xterm with default
+  // config renders it identically to the default foreground, so meta
+  // text didn't visually separate from primary content. SGR 90 is a
+  // standard 16-color value (bright-black ≈ grey) that every terminal
+  // distinguishes from the default. Spec UI.md §6.1 updated.
+  dim: `${CSI}90m`,
   bold: `${CSI}1m`,
   error: `${CSI}31m`,
   warn: `${CSI}33m`,

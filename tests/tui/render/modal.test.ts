@@ -83,7 +83,7 @@ describe('renderModal (UI.md §4.10.13 layout)', () => {
     const out = renderModal(baseModal(), colored);
     // option 2 has shortcut 'shift+tab'; rendered with dim SGR.
     expect(out[9]).toContain('(shift+tab)');
-    expect(out[9]).toContain(`${CSI}2m`);
+    expect(out[9]).toContain(`${CSI}90m`);
   });
 
   test('preview block omitted entirely when preview array is empty', () => {
@@ -128,8 +128,8 @@ describe('renderModal (UI.md §4.10.13 layout)', () => {
 
   test('subject + preview wrapped in dim SGR when color enabled', () => {
     const out = renderModal(baseModal(), colored);
-    expect(out[2]).toContain(`${CSI}2m`); // subject dim
-    expect(out[4]).toContain(`${CSI}2m`); // preview line dim
+    expect(out[2]).toContain(`${CSI}90m`); // subject dim
+    expect(out[4]).toContain(`${CSI}90m`); // preview line dim
   });
 
   test('color disabled emits no SGR escapes', () => {

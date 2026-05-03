@@ -98,6 +98,6 @@ describe('renderSlashPopover', () => {
 
   test('lines use dim SGR when color enabled', () => {
     const out = renderSlashPopover(slash([{ name: 'help', description: 'show help' }]), colored);
-    expect(out[0]).toContain(`${CSI}2m`);
+    expect(out[0]).toContain(`${CSI}90m`);
   });
 });
