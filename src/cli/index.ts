@@ -24,6 +24,23 @@ const main = async (): Promise<number> => {
     return 0;
   }
 
+  // `agent init` — scaffold .agent/permissions.yaml. Pure
+  // filesystem work, no provider/DB needed; same lazy-import
+  // posture as the other handlers below so a broken provider
+  // dep can't break this. Lands BEFORE the subagent-child
+  // branch because init is mutually exclusive with every
+  // other run mode and the parser already rejected combos.
+  if (args.init !== undefined) {
+    const { runInit } = await import('./init.ts');
+    return runInit({
+      cwd: process.cwd(),
+      force: args.init.force,
+      mode: args.init.mode,
+      out: (s) => process.stdout.write(s),
+      err: (s) => process.stderr.write(s),
+    });
+  }
+
   // Subagent-child mode (Step 4.2b.ii.a). The parent process
   // spawns the same binary with this flag set; the value is the
   // pre-created child session id. Short-circuits ALL other entry

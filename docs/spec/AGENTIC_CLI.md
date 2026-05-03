@@ -98,6 +98,7 @@ A maioria dos projetos coloca "CLI" no nome e entrega uma interface web mal port
 | **List sessions** | `agent --list-sessions [opções]` | lista sessões com filtros; JSON-friendly via `--json` |
 | **Replay** | `agent --replay <id>` | re-executa sessão (debug/eval) |
 | **Doctor** | `agent doctor` | diagnóstico do ambiente: runtime, providers, sandbox, capabilities, disk, configs, hooks, memory |
+| **Init** | `agent init [--force] [--mode strict\|acceptEdits]` | escreve `.agent/permissions.yaml` com baseline de policy editável; refuse-on-exists sem `--force`. Sem este passo o operador roda em strict default-deny (§8). |
 
 ### 2.2 Composição (Unix philosophy)
 
@@ -890,6 +891,8 @@ Modos:
 Hierarquia: **enterprise** (`/etc/agent/`) → **user** (`~/.config/agent/`) → **project** (`./.agent/`) → **session** (flag). Enterprise pode marcar regras como `locked` (impede override).
 
 Cada decisão vai pra tabela `approvals` (auditoria).
+
+**Bootstrap path.** A engine não inventa allow rules — sem `.agent/permissions.yaml` o projeto roda em strict default-deny e toda gated tool retorna `kind: 'deny'`. O operador escreve o arquivo manualmente OU roda `agent init` (§2.1), que gera um baseline editável: strict mode, allow whitelist conservador (`git status`, `ls`, `rg`), confirm pra ações observáveis (`git push`, `rm`, `*install`), deny pra padrões catastróficos (`rm -rf /*`, `sudo`, `curl|sh`), e protections de path/host óbvias (`.env*`, `.git/`, loopback). O REPL detecta a ausência do arquivo no boot e emite uma linha vermelha apontando pra `agent init` / `/perms` (§17).
 
 ---
 

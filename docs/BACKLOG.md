@@ -15,6 +15,36 @@ Format:
 
 ---
 
+## [2026-05-03] M2 / spec+impl — `agent init` (scaffold .agent/permissions.yaml)
+
+Slice anterior expôs o gap: REPL avisa em vermelho "no permission policy found" e direciona pro `/perms`, mas não tinha jeito de criar o arquivo sem o operator copiar exemplo da spec à mão. `agent init` fecha o ciclo: escreve um baseline editável strict + whitelist conservador num comando.
+
+**Done:**
+
+- Spec `AGENTIC_CLI.md §2.1` ganha linha pra modo Init na tabela de operação. §8 ganha parágrafo "Bootstrap path" descrevendo o init e referenciando o cue do REPL (§17).
+- `src/cli/init-template.ts` (novo): template inline com comentários inline pra cada section. Strict default, allow whitelist coberto (`git status/diff/log/show/branch`, `ls/rg/cat/head/tail/wc/pwd/echo`), confirm pra mutações observáveis (`git add/commit/push/pull/checkout/merge/rebase`, `rm/mv/mkdir`, `npm/bun install/run/test`), deny pra catastróficas (`rm -rf /*`, `rm -rf ~*`, `sudo*`, `curl|sh`, `wget|sh`, fork bomb literal). Path-shape: read/glob/grep allow `./**` deny `.git/objects` + secrets (`.env*`, `*.pem`, `*.key`); write/edit confirm `./**` deny `.env*`/`.git/`/`node_modules`. fetch_url deny só loopback (`localhost`, `127.0.0.1`, `::1`, `0.0.0.0`) — private nets exigiriam CIDR que matcher não tem; comentário no template explica a expansão manual.
+- `src/cli/init.ts` (novo): handler `runInit({ cwd, force, mode, out, err })`. Pure FS, zero dependência de provider/DB/engine. Refuse-on-exists (exit 1) sem `--force`; com `--force` overwrites. Mensagem de sucesso aponta pro próximo passo (`run 'agent'`).
+- `src/cli/args.ts`: positional subcommand `init` reconhecido só quando `argv[0] === 'init'` — `agent "review init"` segue como prompt regular. Sub-flags `--force` e `--mode <strict|acceptEdits>`. Bypass não é scaffoldável via init (footgun; spec mantém `bypass` mas força edição manual). Usage block ganha "Subcommands:" section.
+- `src/cli/index.ts`: dispatch via `args.init !== undefined` antes do subagent-child branch e do REPL/run lazy import. Usa `process.cwd()`, sinks de stdout/stderr.
+- Tests:
+  - `tests/cli/args.test.ts`: 7 novos testes pinando bare init, `--force`, `--mode acceptEdits`, rejeição de `--mode bypass`, `--mode` sem valor, flag desconhecido com scope `init:`, init-só-no-primeiro-positional (`agent "review init"` segue prompt), `init --help` roteia pro top-level help.
+  - `tests/cli/init.test.ts` (novo): 7 cenários sobre o handler — escreve, parsa via `loadPolicyFromString` (round-trip protege contra divergência template ↔ schema), `--mode acceptEdits` reflete no `defaults.mode`, refuse-on-exists preserva conteúdo original byte-a-byte, `--force` overwrites, `mkdir -p .agent/` quando ausente, success message orienta próximo passo.
+- Smoke test no binário real (`bun src/cli/index.ts init` em `/tmp`): cria, refuse-on-exists, `--force` overwrites — todos exit codes corretos, mensagens corretas.
+
+**Decisions:**
+
+- **Positional `agent init`, não `--init <verb>`.** Trade-off de consistência (resto do parser é `--<flag>`) por muscle memory (`git init`, `npm init`, `cargo init`, `bun init`, `cargo init`). Spec §2.1 já tinha `agent doctor` positional como precedente. Custo: prompts não podem começar com a palavra literal `init`. Workaround do operador: `agent "init the build"` (quoting evita a colisão pelo shell, mas o parser ainda dispatch'a init). Documentado o constraint via test.
+- **Init nunca scaffolda `bypass`.** Spec mantém os 3 modos, mas init aceita só `strict|acceptEdits` — bypass exige edição manual + flag `--dangerous` em runtime. Init é a porta da frente; uma porta da frente que oferece "no gating" como opção é uma porta da frente quebrada.
+- **fetch_url só loopback no default.** Private nets (10/8, 172.16/12, 192.168/16) precisariam CIDR; matcher é prefix+glob (CLAUDE.md hard rule). Glob `10.*` casaria `10.somewhere.com` literal — pior que não ter nada. Comentário no template aponta o caminho de adicionar hosts explícitos.
+- **Round-trip via `loadPolicyFromString` no test.** Sem isso o template podia divergir do schema da engine (uma renomeação de campo viraria erro silencioso até alguém rodar `agent init` em produção).
+- **`runInit` é pure FS, sem bootstrap.** Bootstrapar a engine pra escrever o arquivo da engine seria circular dependência simbólica (e prática: sem `permissions.yaml` o bootstrap usa default; com erro de parse falharia antes de poder reescrever).
+
+**Pending:** `agent doctor` (também positional, spec §2.1) ainda não impl. Não bloqueia.
+
+**Next:** PR de `feat/m2-tui-ux` quando operador autorizar.
+
+---
+
 ## [2026-05-03] M2 / impl — surface deny reason + `/perms` + boot-time policy hint
 
 Operator pediu pra ler `.gitignore` na TUI e levou `Denied` sem nenhuma explicação. A engine de permissão estava integrada (modal abria pra `confirm`), mas o default policy é `strict + tools: {}` — todo gated tool deny direto, sem modal, sem motivo. Três UX gaps endereçados num slice só:
