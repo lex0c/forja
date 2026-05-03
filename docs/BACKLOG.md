@@ -15,6 +15,40 @@ Format:
 
 ---
 
+## [2026-05-02] M1 / Step 1.f.4 — Todo observability
+
+Closes a real production gap: the operator could see the agent ran `todo_write` (a chip with no subject) but had no view of *what* the model planned. Spec §4.3 always positioned the TodoList as a live region above the operation chips, but until now the event surface had no producer. This slice adds the producer (a wrapped `TodoStore.set`), the wire (`HarnessEvent.todo_updated` → `UIEvent.todo:update`), and the renderer (live `Tasks` block with the canonical glyph set).
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/events.ts` | `TodoUpdateEvent.items` realigned to the TodoStore shape: `{content, activeForm, status: 'pending' \| 'in_progress' \| 'done'}`. The previous shape (`{id, text, status: pending\|running\|done\|failed}`) was speculative and didn't match what the producer would actually have on hand — `id` doesn't exist in the store, `failed` can't happen (the tool rejects invalid lists at write time, not at render time), and `text` had to be derived from one of two fields. Direct shape sidesteps a useless adapter pass. |
+| `src/harness/types.ts` | NEW `HarnessEvent` variant `todo_updated` carrying `sessionId: string` + `items: TodoItem[]`. Fires INSIDE the wrapped `TodoStore.set` — operationally between `tool_invoking` and `tool_finished` for the `todo_write` call. Renderer ordering: chip stays in its "Updating todos…" form while the list block above materializes/changes; chip then resolves to "Updated N items" on `tool_finished`. |
+| `src/harness/loop.ts` | Wraps `createTodoStore()` so `set(sessionId, items)` emits `todo_updated` after persisting. Wrapper, not store mutation: the in-memory store stays a pure data structure; observability is layered on at the harness boundary. Wrap is per-session (created inline at the same site as the bare store) so test contexts that bypass the harness still get the unobserved store. |
+| `src/tui/harness-adapter.ts` | NEW `todo_updated` translation → `todo:update` UIEvent. Items pass through verbatim (shapes match by construction). |
+| `src/tui/state.ts` | NEW `LiveState.todos: TodoItem[]` field; reducer's `todo:update` branch overwrites (full-replace per spec §7.4). `createInitialState` seeds `[]`. |
+| `src/tui/render/todo-list.ts` | NEW `renderTodoList(todos, caps): string[]`. Empty list → empty array (compose drops the section). `Tasks` header followed by per-item rows. Glyphs: `✓` done, `▶` in_progress, `○` pending (ASCII fallback `[x]`/`[*]`/`[ ]`); `failed` glyph defined for forward-compat but never rendered today (store can't produce it). Up to 8 visible per spec §4.3; over 8 collapses to `▶ in-progress + next 2 pending + done count` with a discreet `(+N more)` line. |
+| `src/tui/render/compose.ts` | Inserts `renderTodoList` ABOVE the active tool cards when `state.todos.length > 0`. Per spec §4.10.6: "Todo list (§4.3) acima dos chips, se houver." composeCursor's bottom-anchor math is unaffected (todo list lines add to the upper region). |
+| `tests/tui/state.test.ts` | NEW 4 tests: empty list initial, todo:update populates state, second update full-replaces, compose includes rendered block when todos present. |
+| `tests/tui/render/todo-list.test.ts` | NEW 7 tests: empty returns []; header + 1 row each per status; glyph fallback to ASCII when caps.unicode=false; truncation kicks in at >8 items with `(+N more)` suffix; truncation keeps the in_progress item even when it's beyond position 3. |
+| `tests/tui/harness-adapter.test.ts` | NEW test: `todo_updated` HarnessEvent → single `todo:update` UIEvent with items pass-through. |
+| `tests/harness/events.test.ts` | NEW 3 tests on top of the existing onEvent suite: ordering (`tool_invoking < todo_updated < tool_finished`), plan-mode + `todo_write` still emits (regression cover for `metadata.planSafe = true`), observer mutating `event.items` does NOT corrupt the next emission (defends the `baseStore.get()` readthrough in the wrap from a future "optimization" that drops the deep-clone discipline). |
+
+**Decisions:**
+
+- **D131 — Producer is a `TodoStore.set` wrapper, not a mutation in the store itself.** The store is `src/todo/index.ts` — a pure data structure with one job (in-memory list, deep-clone on read/write). Adding an event hook to `createTodoStore` would couple the data structure to the harness's emission contract; tests that need a store without the wire would have to opt out. The wrapper lives at the call site (loop.ts line 159), composes with `createTodoStore`, and is invisible to anything that constructs the store directly.
+- **D132 — Hook is on `set`, not on `clear`.** Today only `todo_write` writes to the store, so emission timing is determined by where the wrap lives. Wrap is on `set` only — `clear` (the harness's session-end cleanup path) does NOT trigger emission, because list teardown at session-end is not a planning event the operator should see. Operationally `todo_updated` fires between `tool_invoking` and `tool_finished` for `todo_write` (the tool calls `set` mid-execute), not after the tool returns. The renderer sees the list materialize while the chip is still "Updating todos…", then the chip resolves on `tool_finished`. That ordering is asserted by `tests/harness/events.test.ts`.
+- **D133 — `failed` status defined in the renderer but not in the store.** Spec §4.3 lists `✗` as one of four glyphs; the TodoStore enum is only three statuses. Choices were (a) drop the glyph from the renderer (loses spec compliance for a future feature) or (b) keep the case wired but unreachable today. Picked (b) — the renderer's switch is exhaustive, a future extension that adds `failed` to the store enum lights up the glyph automatically. Today's tests assert the three reachable statuses; the failed branch is dead code by design.
+- **D134 — Status-set fence in the adapter (post-review).** Code review surfaced that the adapter's pass-through `items: event.items` would silently accept a future `TodoStatus` variant (e.g. `'blocked'`) that the renderer's `GLYPHS` table can't handle, producing literal `"undefined "` glyphs. Mitigation: explicit `mapTodoItem` per-field map plus a `satisfies TodoStatus[]` fence constant in the adapter. Adding a fourth variant to `TodoStatus` without also widening `TodoStatusForUI` now fails to type-check at the fence — build breaks instead of UI rendering garbage.
+- **D135 — Renderer scrubs embedded `\n`/`\r` in todo content.** `todo_write`'s `validateStringField` doesn't reject newlines, so a model could write `content: "line1\nline2"` and the rendered string would split into two terminal rows when written. The renderer's `liveHeight = truncated.length` math assumes one input string == one terminal line; under-counting leaves ghost rows after `eraseLive`. Renderer-side scrub (`renderRow` strips `[\r\n]+`) is defense-in-depth — fixing the validator would also work but the renderer's contract with `composeLive` is the load-bearing invariant. Tabs are kept (single-cell render in most terminals).
+
+**Pending:** mutation slash commands; subagent observability (1.f.2, blocked on IPC); bg observability (1.f.3); assistant chip + tokens (1.f.5); soft-aborted footer (1.f.6).
+
+**Next:** 1.f.5 (assistant chip + tokens) — the adapter currently drops `usage` events; the footer / a live chip should show "Generating… (Xs · ↑ N tokens)" while the model streams.
+
+---
+
 ## [2026-05-02] M1 / Step 1.f.1 — Slash command subsystem
 
 Closes one of the production gaps: the footer's `? for help` no

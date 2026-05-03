@@ -3,6 +3,7 @@ import type { Decision, PermissionEngine } from '../permissions/index.ts';
 import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
 import type { DB } from '../storage/index.ts';
 import type { SubagentSet } from '../subagents/load.ts';
+import type { TodoItem } from '../todo/index.ts';
 import type { ToolRegistry } from '../tools/index.ts';
 
 // Lifecycle events the harness emits during a run. Synchronous (fire and
@@ -84,6 +85,21 @@ export type HarnessEvent =
       // from `enableCheckpoints=false` (no event emitted).
       type: 'checkpoints_unavailable';
       reason: string;
+    }
+  | {
+      // Emitted whenever the session-bound TodoStore is mutated via
+      // `set` — i.e. INSIDE the `todo_write` tool's execute(), right
+      // after the list lands in the store and BEFORE the tool returns.
+      // The harness sees `todo_updated` fire between `tool_invoking`
+      // and `tool_finished` for the same toolUseId. Producer is the
+      // harness loop (wraps the bare store with an emitting set;
+      // clear() is intentionally NOT wired — spec §7.4 treats list
+      // teardown at session-end as cleanup, not a planning event).
+      // Items are deep-cloned by the store before emission so
+      // observers can't reach back into store state.
+      type: 'todo_updated';
+      sessionId: string;
+      items: TodoItem[];
     }
   | { type: 'session_finished'; result: HarnessResult };
 

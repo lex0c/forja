@@ -347,6 +347,61 @@ describe('budget + diagnostics', () => {
   });
 });
 
+describe('todo:update', () => {
+  test('initial state has empty todo list', () => {
+    expect(createInitialState().todos).toEqual([]);
+  });
+
+  test('todo:update populates state.todos and emits no permanent', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'todo:update',
+      ts: 1,
+      items: [
+        { content: 'Implement', activeForm: 'Implementing', status: 'in_progress' },
+        { content: 'Test', activeForm: 'Testing', status: 'pending' },
+      ],
+    });
+    expect(r.permanent).toEqual([]);
+    expect(r.state.todos).toHaveLength(2);
+    expect(r.state.todos[0]?.status).toBe('in_progress');
+    expect(r.state.todos[1]?.content).toBe('Test');
+  });
+
+  test('second update full-replaces (no merge)', () => {
+    const { state } = drive([
+      {
+        type: 'todo:update',
+        ts: 1,
+        items: [
+          { content: 'A', activeForm: 'A-ing', status: 'pending' },
+          { content: 'B', activeForm: 'B-ing', status: 'pending' },
+          { content: 'C', activeForm: 'C-ing', status: 'pending' },
+        ],
+      },
+      {
+        type: 'todo:update',
+        ts: 2,
+        items: [{ content: 'A', activeForm: 'A-ing', status: 'done' }],
+      },
+    ]);
+    // Full-replace: B and C are gone, A's status flipped to done.
+    expect(state.todos).toHaveLength(1);
+    expect(state.todos[0]?.status).toBe('done');
+  });
+
+  test('todo:update with empty items clears the list', () => {
+    const { state } = drive([
+      {
+        type: 'todo:update',
+        ts: 1,
+        items: [{ content: 'X', activeForm: 'Xing', status: 'pending' }],
+      },
+      { type: 'todo:update', ts: 2, items: [] },
+    ]);
+    expect(state.todos).toEqual([]);
+  });
+});
+
 describe('not-yet-wired events accept silently', () => {
   test.each([
     [
@@ -378,7 +433,6 @@ describe('not-yet-wired events accept silently', () => {
       },
     ],
     ['critique:ask', { type: 'critique:ask', ts: 1, promptId: 'p1', issues: [] }],
-    ['todo:update', { type: 'todo:update', ts: 1, items: [] }],
     ['subagent:start', { type: 'subagent:start', ts: 1, subagentId: 'a1', name: 'r', goal: 'g' }],
     ['subagent:update', { type: 'subagent:update', ts: 1, subagentId: 'a1', progress: '...' }],
     [

@@ -210,11 +210,31 @@ export type CritiqueAskEvent = BaseEvent & {
   issues: { severity: 'low' | 'medium' | 'high'; confidence: number; message: string }[];
 };
 
-// Todo list (live region above the status line). The full list is
-// sent on every update — small enough that delta tracking buys nothing.
+// Todo list (live region above the operation chips, spec §4.3 / §4.10.6).
+// The full list is sent on every update — small enough that delta
+// tracking buys nothing, and the producer (TodoStore.set wrapper in
+// the harness loop) already deals in full lists per spec §7.4 ("o
+// model passa a lista intencionada inteira; sem semantics de merge").
+//
+// Shape mirrors `TodoItem` in `src/todo/index.ts` exactly. Re-declared
+// here instead of imported so the TUI layer doesn't depend on the
+// todo subsystem's types — but the values must stay in sync. If the
+// TodoStore enum changes, this union changes too.
+//
+// `failed` is reserved for forward-compat: spec §4.3 lists `✗ failed`
+// as a glyph, the renderer wires it, but the TodoStore enum doesn't
+// expose it today (the tool rejects invalid lists at write time, not
+// at render time). A future extension that lets a step mark a todo as
+// failed will surface here without a renderer change.
+export type TodoStatusForUI = 'pending' | 'in_progress' | 'done' | 'failed';
+export interface TodoItemForUI {
+  content: string;
+  activeForm: string;
+  status: TodoStatusForUI;
+}
 export type TodoUpdateEvent = BaseEvent & {
   type: 'todo:update';
-  items: { id: string; status: 'pending' | 'running' | 'done' | 'failed'; text: string }[];
+  items: TodoItemForUI[];
 };
 
 // Subagent lifecycle. The renderer groups by subagentId in the live

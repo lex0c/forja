@@ -15,7 +15,7 @@
 // todo events accept silently and land alongside their render
 // functions.
 
-import type { UIEvent } from './events.ts';
+import type { TodoItemForUI, UIEvent } from './events.ts';
 
 export interface InputState {
   // Current value of the input box (multi-line allowed via `\n`).
@@ -160,6 +160,10 @@ export interface LiveState {
   // Slash autocomplete popover, or null when not in slash mode.
   // Composer renders above the input box (between status and rule).
   slash: SlashAutocomplete | null;
+  // Live TodoList. Empty array = no list section in compose. Replaced
+  // wholesale on every `todo:update` per spec §7.4 ("o model passa a
+  // lista intencionada inteira; sem semantics de merge").
+  todos: TodoItemForUI[];
   // Set true after `session:end`; renderer uses to decide whether to
   // accept further input or stop redrawing.
   ended: boolean;
@@ -183,6 +187,7 @@ export const createInitialState = (): LiveState => ({
   thinking: null,
   modal: null,
   slash: null,
+  todos: [],
   ended: false,
 });
 
@@ -639,8 +644,18 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       };
     }
 
-    // ─── Not yet wired (subagent / bg / todo render arrives later) ──
     case 'todo:update':
+      // Full-replace per spec §7.4. Producer (TodoStore.set wrapper)
+      // already deep-clones via get(), but the reducer copies the
+      // outer array anyway — without the spread, two LiveStates
+      // produced from the same event (e.g. headless NDJSON replay,
+      // tests applying the same event twice) would alias the same
+      // array, and mutation in one would leak into the other. Inner
+      // items remain shared by reference; the renderer treats them
+      // read-only and we don't expose a mutation API.
+      return { state: { ...state, todos: [...event.items] }, permanent: [] };
+
+    // ─── Not yet wired (subagent / bg render arrives later) ─────────
     case 'subagent:start':
     case 'subagent:update':
     case 'subagent:end':

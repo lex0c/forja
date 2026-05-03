@@ -550,4 +550,32 @@ describe('harness-adapter — compaction & checkpoints', () => {
     expect(types(out)).toEqual(['warn']);
     expect((out[0] as Extract<UIEvent, { type: 'warn' }>).message).toContain('not a git repo');
   });
+
+  test('todo_updated → todo:update with items pass-through', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'todo_updated',
+      sessionId: 'sess-1',
+      items: [
+        { content: 'Implement', activeForm: 'Implementing', status: 'in_progress' },
+        { content: 'Test', activeForm: 'Testing', status: 'pending' },
+      ],
+    });
+    expect(types(out)).toEqual(['todo:update']);
+    const ev = out[0] as Extract<UIEvent, { type: 'todo:update' }>;
+    expect(ev.items).toHaveLength(2);
+    expect(ev.items[0]).toEqual({
+      content: 'Implement',
+      activeForm: 'Implementing',
+      status: 'in_progress',
+    });
+    expect(ev.items[1]?.status).toBe('pending');
+  });
+
+  test('todo_updated with empty items still translates (full-replace clear)', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({ type: 'todo_updated', sessionId: 's', items: [] });
+    expect(types(out)).toEqual(['todo:update']);
+    expect((out[0] as Extract<UIEvent, { type: 'todo:update' }>).items).toEqual([]);
+  });
 });

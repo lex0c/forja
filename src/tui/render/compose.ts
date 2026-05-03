@@ -3,9 +3,10 @@
 // renderer writes. Spec: UI.md §2, §4, §4.10.
 //
 // Layout (top → bottom of live region):
-//   1. Active tool cards (running form, with preview).
-//   2. Status line (1 line — only when session has started).
-//   3. Bottom anchor block:
+//   1. TodoList (1 + N lines — only when state.todos is non-empty).
+//   2. Active tool cards (running form, with preview).
+//   3. Status line (1 line — only when session has started).
+//   4. Bottom anchor block:
 //      - rule above input
 //      - input box (1+ lines)
 //      - rule below input
@@ -13,9 +14,9 @@
 //      OR modal (when up), which owns the bottom slot entirely
 //      and carries its own structure.
 //
-// Order matches the spec: history above (scrollback), then live tool
-// activity, then status, then the bottom anchor (rule/input/rule/
-// footer). Todos and the assistant chip arrive in subsequent slices.
+// Order matches the spec: history above (scrollback), then todos,
+// then live tool activity, then status, then the bottom anchor
+// (rule/input/rule/footer). The assistant chip arrives in 1.f.5.
 
 import type { ComposeLive } from '../renderer-types.ts';
 import type { LiveState } from '../state.ts';
@@ -25,6 +26,7 @@ import { renderInput } from './input.ts';
 import { renderModal } from './modal.ts';
 import { renderSlashPopover } from './slash-popover.ts';
 import { renderStatusLine } from './status.ts';
+import { renderTodoList } from './todo-list.ts';
 import { renderToolCardLive } from './tool-card.ts';
 
 const horizontalRule = (caps: Capabilities): string =>
@@ -99,7 +101,12 @@ export const composeLive: ComposeLive = (
 ): string[] => {
   const lines: string[] = [];
 
-  // 1. Active tool cards (running). Map insertion order is preserved,
+  // 1. Live TodoList (above the operation chips per spec §4.10.6:
+  // "Todo list (§4.3) acima dos chips, se houver"). renderTodoList
+  // returns [] when state.todos is empty — section drops entirely.
+  lines.push(...renderTodoList(state.todos, caps));
+
+  // 2. Active tool cards (running). Map insertion order is preserved,
   // so the visual order matches the order tools were started.
   for (const tool of state.activeTools.values()) {
     lines.push(...renderToolCardLive(tool, caps, now));

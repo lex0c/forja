@@ -156,7 +156,36 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // todo_write tool sees a fresh list, and torn down in the outer
   // finally so accumulated state from a long-lived process doesn't
   // leak across sessions. Spec §7.4: not persisted, work-state only.
-  const todoStore: TodoStore = createTodoStore();
+  //
+  // The bare store is a pure data structure; observability is layered
+  // on at the harness boundary by wrapping `set` to emit a
+  // `todo_updated` HarnessEvent after the write lands. Wrapping rather
+  // than mutating the store keeps test contexts that build a store
+  // directly free of the emit dependency. `clear` is NOT wrapped —
+  // session-end cleanup is not a planning event (D132).
+  const baseTodoStore = createTodoStore();
+  // Wrap each method through a fresh closure rather than aliasing the
+  // method reference. Today `createTodoStore` returns plain arrows
+  // bound by closure (no `this`), so direct aliasing would work — but
+  // a future refactor to a class with `this`-bound methods would
+  // silently break get/clear at runtime without TS catching it. The
+  // extra layer costs nothing and keeps the contract explicit.
+  const todoStore: TodoStore = {
+    get: (sid) => baseTodoStore.get(sid),
+    set: (sid, items) => {
+      baseTodoStore.set(sid, items);
+      // Read back through the store so the event carries the same
+      // deep-cloned snapshot a fresh `get` would return — observers
+      // can't poison stored state, and the items they see are
+      // structurally identical to what the next call to get() yields.
+      safeEmit(config.onEvent, {
+        type: 'todo_updated',
+        sessionId: sid,
+        items: baseTodoStore.get(sid),
+      });
+    },
+    clear: (sid) => baseTodoStore.clear(sid),
+  };
   // Per-run totals. Each completed provider turn adds its usage and
   // its computed cost; HarnessResult.usage / costUsd report THIS
   // RUN's numbers — caller telemetry that has to stay self-

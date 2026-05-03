@@ -18,8 +18,29 @@
 
 import type { ExitReason, HarnessEvent } from '../harness/types.ts';
 import type { Decision } from '../permissions/index.ts';
-import type { SessionEndEvent, UIEvent } from './events.ts';
+import type { TodoItem, TodoStatus } from '../todo/index.ts';
+import type { SessionEndEvent, TodoItemForUI, TodoStatusForUI, UIEvent } from './events.ts';
 import { lookupToolVocab } from './tool-vocab.ts';
+
+// Compile-time fence: every TodoStore status must be representable as
+// a TodoItemForUI status. The `satisfies` makes the relationship
+// explicit — if `src/todo/index.ts` adds a new variant (e.g. 'blocked')
+// without also adding it to `TodoStatusForUI`, this constant fails to
+// type-check and the build breaks. The runtime value is unused; the
+// presence of the assertion is the contract.
+const _STATUS_FENCE: TodoStatus[] = ['pending', 'in_progress', 'done'] satisfies TodoStatus[];
+void (_STATUS_FENCE as TodoStatusForUI[]);
+
+// Explicit per-field map. The shapes happen to be structurally
+// identical today but pass-through assignment (`items: event.items`)
+// would silently accept a future store extension that adds a status
+// the renderer's GLYPHS table can't handle, producing `undefined`
+// glyph strings. Mapping per-field keeps the contract narrow.
+const mapTodoItem = (item: TodoItem): TodoItemForUI => ({
+  content: item.content,
+  activeForm: item.activeForm,
+  status: item.status,
+});
 
 export interface HarnessAdapterCtx {
   // Status-line metadata. Not derivable from HarnessEvent: the harness
@@ -349,6 +370,18 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         }
         return out;
       }
+
+      case 'todo_updated':
+        // Per-field map via mapTodoItem so a future TodoStore status
+        // variant fails to type-check rather than silently rendering
+        // `undefined` glyphs. Renderer's reducer handles full-replace
+        // semantics (spec §7.4).
+        out.push({
+          type: 'todo:update',
+          ts,
+          items: event.items.map(mapTodoItem),
+        });
+        return out;
 
       case 'checkpoints_unavailable':
         out.push({
