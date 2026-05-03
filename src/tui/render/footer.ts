@@ -26,11 +26,19 @@ const formatCost = (usd: number): string => {
 const isRunning = (state: LiveState): boolean =>
   state.activeTools.size > 0 || state.thinking !== null || state.pendingAssistant !== null;
 
-// Per-segment paint helper. Each token gets its own dim wrap so a
-// future shading layer (e.g., budget warn at 80%, error at 90% per
-// spec §4.4) can replace individual tokens without fighting an outer
-// dim wrap that paints over everything.
-const dim = (caps: Capabilities, s: string): string => paint(caps, 'dim', s);
+// Per-segment paint helper. Each token gets its own `secondary`
+// wrap (UI.md §6.1, SGR 90 / bright-black ≈ grey) so a future
+// shading layer (budget warn at 80%, error at 90% per §4.4) can
+// replace individual tokens without fighting an outer wrap.
+//
+// Token used to be `dim` (SGR 2, faint), but xterm with default
+// config renders SGR 2 identical to the default foreground —
+// operators couldn't tell the footer cue from primary content,
+// and the `? for help` hint visually disappeared. `secondary`
+// renders as visible grey on every terminal. Local helper name
+// stayed `dim` for prose-readability — every line below `dim(...)`
+// is the footer's "secondary" token applied to one token.
+const dim = (caps: Capabilities, s: string): string => paint(caps, 'secondary', s);
 
 export const renderFooter = (state: LiveState, caps: Capabilities): string | null => {
   // Modal owns the bottom slot — composeLive already suppresses the
@@ -56,7 +64,16 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   if (state.exitArmed !== null) {
     left = paint(caps, 'warn', 'Press Ctrl-C again to exit');
   } else {
-    const leftParts = [dim(caps, '? for help')];
+    const leftParts = [
+      dim(caps, '? for help'),
+      // `\+Enter` newline hint pairs with the input editor's
+      // backslash-continuation feature (UI.md §5.4): operators on
+      // terminals/WMs that eat Shift+Enter need a discoverable way
+      // to insert a newline mid-buffer, so the cue lives in the
+      // footer next to `? for help` (the other "things you can
+      // press" entry).
+      dim(caps, '\\+Enter newline'),
+    ];
     if (isRunning(state)) {
       leftParts.push(dim(caps, state.softInterrupted ? 'esc again to force' : 'esc to interrupt'));
     }

@@ -35,6 +35,11 @@ describe('renderFooter', () => {
     const out = renderFooter(startedSession(), caps);
     expect(out).not.toBeNull();
     expect(out).toContain('? for help');
+    // Newline hint pairs with the input editor's backslash
+    // continuation (UI.md §5.4). Visible alongside `? for help`
+    // in every non-armed state so operators on terminals/WMs that
+    // eat Shift+Enter can discover the alternative.
+    expect(out).toContain('\\+Enter newline');
     expect(out).toContain('• sonnet-4.6');
     expect(out).toContain('3/50');
     expect(out).toContain('$0.0120');
@@ -55,7 +60,7 @@ describe('renderFooter', () => {
     };
     s.activeTools.set('t1', tool);
     const out = renderFooter(s, caps);
-    expect(out).toContain('? for help · esc to interrupt');
+    expect(out).toContain('? for help · \\+Enter newline · esc to interrupt');
   });
 
   test('thinking state also triggers interrupt cue', () => {
@@ -189,10 +194,13 @@ describe('renderFooter', () => {
     expect(visualWidth(out ?? '')).toBe(caps.cols);
   });
 
-  test('renders dim SGR when color enabled', () => {
+  test('renders secondary SGR (bright-black grey) when color enabled', () => {
+    // Footer uses `secondary` (SGR 90) instead of `dim` (SGR 2) so
+    // the hint stays visible on terminals that render faint as
+    // default (xterm, screen, urxvt). Spec UI.md §6.1.
     const colored: Capabilities = { ...caps, color: 'basic' };
     const out = renderFooter(startedSession(), colored);
-    expect(out).toContain(`${CSI}2m`);
+    expect(out).toContain(`${CSI}90m`);
   });
 
   test('cost format degrades with magnitude (under $1 = 4 decimals)', () => {

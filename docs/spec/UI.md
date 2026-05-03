@@ -471,11 +471,11 @@ Sempre 1 linha, dim, **abaixo do input box** (com régua entre eles).
 
 | Estado | Esquerda | Direita |
 |---|---|---|
-| Idle | `? for help` | `• <model> · <steps>/<max> · $<cost>` |
+| Idle | `? for help · \+Enter newline` | `• <model> · <steps>/<max> · $<cost>` |
 | Idle, exit armed (§5.4) | `Press Ctrl-C again to exit` (`warn`) | (mesmo) |
-| Running | `? for help · esc to interrupt` | `• <model> · <steps>/<max> · $<cost>` |
-| Soft-aborted (ainda processando) | `? for help · esc again to force` | (mesmo) |
-| Plan mode | `? for help` | `• <model> · plan · <steps>/<max> · $<cost>` |
+| Running | `? for help · \+Enter newline · esc to interrupt` | `• <model> · <steps>/<max> · $<cost>` |
+| Soft-aborted (ainda processando) | `? for help · \+Enter newline · esc again to force` | (mesmo) |
+| Plan mode | `? for help · \+Enter newline` | `• <model> · plan · <steps>/<max> · $<cost>` |
 | Modal up | (suprimido — modal cobre footer) | (suprimido) |
 
 Esquerda = **"o que posso fazer agora?"**. Hint de help + interrupt **só quando interruptable**.
@@ -588,7 +588,7 @@ Banidos do vocabulário operacional:
 ─────────────────────────────────────────────────────────────────────  ← régua (full width, col 0)
 > ▌                                                                   ← input + cursor (col 0)
 ─────────────────────────────────────────────────────────────────────  ← régua (full width, col 0)
-  ? for help · esc to interrupt        • sonnet-4.6 · 3/50 · $0.012   ← footer (padded)
+  ? for help · \+Enter newline · esc to interrupt   • sonnet-4.6 · 3/50 · $0.012  ← footer (padded)
 ```
 
 Live region (entre as réguas e a inferior):
