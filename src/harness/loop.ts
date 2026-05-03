@@ -412,6 +412,29 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // finally to fire — matters when the loop is mid-provider-
           // request, where finally can be seconds away.
           abortSignal: signal,
+          // Lifecycle observer: translate bg manager events into
+          // HarnessEvents so the renderer can update its `bg N`
+          // footer counter (spec UI.md §4.10.6) and audit captures
+          // the same lifecycle the user sees. Event shape mirrors
+          // BgManagerEvent's `kind` discriminant onto distinct
+          // HarnessEvent types so the adapter's switch stays flat.
+          onEvent: (event) => {
+            if (event.kind === 'started') {
+              safeEmit(config.onEvent, {
+                type: 'bg_started',
+                processId: event.processId,
+                command: event.command,
+                label: event.label,
+              });
+            } else {
+              safeEmit(config.onEvent, {
+                type: 'bg_ended',
+                processId: event.processId,
+                status: event.status,
+                exitCode: event.exitCode,
+              });
+            }
+          },
         });
       }
 

@@ -393,6 +393,35 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         return out;
       }
 
+      case 'bg_started':
+        // Pass-through: UIEvent.bg:start mirrors the HarnessEvent
+        // shape one-for-one (processId + command). Label is dropped
+        // — the renderer's footer counter doesn't surface it today;
+        // a future "expanded bg tray" panel would extend the
+        // UIEvent and re-thread it.
+        out.push({
+          type: 'bg:start',
+          ts,
+          processId: event.processId,
+          command: event.command,
+        });
+        return out;
+
+      case 'bg_ended':
+        // Pass-through: HarnessEvent.bg_ended.status (intent) maps
+        // 1:1 to UIEvent.bg:end.cause. The `signal` field on the
+        // UIEvent is reserved for actual POSIX signal names (e.g.
+        // 'SIGTERM') — today the manager doesn't carry that, so
+        // we leave it undefined.
+        out.push({
+          type: 'bg:end',
+          ts,
+          processId: event.processId,
+          cause: event.status,
+          exitCode: event.exitCode,
+        });
+        return out;
+
       case 'todo_updated':
         // Per-field map via mapTodoItem so a future TodoStore status
         // variant fails to type-check rather than silently rendering

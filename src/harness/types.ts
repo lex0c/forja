@@ -87,6 +87,29 @@ export type HarnessEvent =
       reason: string;
     }
   | {
+      // Background process started. Fires once per process right
+      // after `bash_background` (or any future bg-spawning tool)
+      // succeeds in `BgManager.spawn`. The TUI uses this to
+      // increment its `bg N` footer counter; persistence captures
+      // the same row through audit.
+      type: 'bg_started';
+      processId: string;
+      command: string;
+      label: string | null;
+    }
+  | {
+      // Background process exited. Fires once per process from
+      // inside the manager's `exitedSettled` handler — natural exit
+      // and kill-induced exit converge here exactly once. `exitCode`
+      // is null when the OS reaped before we could read it (e.g.
+      // DB error swallow path). Spawn-time failure does not emit
+      // (D147); the caller sees the exception synchronously.
+      type: 'bg_ended';
+      processId: string;
+      status: 'exited' | 'killed';
+      exitCode: number | null;
+    }
+  | {
       // Emitted whenever the session-bound TodoStore is mutated via
       // `set` — i.e. INSIDE the `todo_write` tool's execute(), right
       // after the list lands in the store and BEFORE the tool returns.

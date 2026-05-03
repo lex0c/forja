@@ -397,6 +397,73 @@ describe('runAgent onEvent', () => {
     expect(usageEvents[0]?.usage.output).toBe(234);
   });
 
+  test('bash_background tool surfaces bg_started + bg_ended through onEvent', async () => {
+    // E2E for the bg observability wire: loop's createBgManager
+    // gets onEvent injected, manager fires on spawn + exit, harness
+    // safeEmit translates to HarnessEvent. Skipping the bash_background
+    // tool registration because it's wired in src/tools/builtin/index;
+    // test uses the bare bg manager via the loop's bgLogDir config.
+    // We instead drive a fake tool that calls ctx.bgManager directly.
+    const events: HarnessEvent[] = [];
+    const r = createToolRegistry();
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const tmpLogDir = mkdtempSync(join(tmpdir(), 'forja-bg-e2e-'));
+    try {
+      const fakeSpawn: Tool = {
+        name: 'fake_spawn',
+        description: 'spawns a quick bg process',
+        inputSchema: { type: 'object' },
+        metadata: { category: 'misc', writes: false, idempotent: false },
+        execute: async (_args, ctx) => {
+          if (ctx.bgManager === undefined) {
+            return { ok: false };
+          }
+          const spawned = await ctx.bgManager.spawn({ command: 'echo bg-e2e' });
+          // Wait for the natural exit so the test sees both events
+          // before the harness tears down at session end.
+          await new Promise((res) => setTimeout(res, 50));
+          return { id: spawned.id };
+        },
+      };
+      r.register(fakeSpawn as unknown as Tool);
+      await runAgent({
+        provider: mockProvider([
+          {
+            tool_uses: [{ id: 'tu1', name: 'fake_spawn', input: {} }],
+            stop_reason: 'tool_use',
+          },
+          { text: 'done', stop_reason: 'end_turn' },
+        ]),
+        toolRegistry: r,
+        permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        bgLogDir: tmpLogDir,
+        onEvent: (e) => events.push(e),
+      });
+      const started = events.find((e) => e.type === 'bg_started');
+      const ended = events.find((e) => e.type === 'bg_ended');
+      expect(started).toBeDefined();
+      expect(ended).toBeDefined();
+      if (started?.type === 'bg_started') {
+        expect(started.command).toBe('echo bg-e2e');
+      }
+      if (ended?.type === 'bg_ended') {
+        expect(ended.status).toBe('exited');
+        expect(ended.exitCode).toBe(0);
+      }
+    } finally {
+      try {
+        rmSync(tmpLogDir, { recursive: true, force: true });
+      } catch {
+        // best effort
+      }
+    }
+  });
+
   test('a throwing onEvent does not derail the loop', async () => {
     let calls = 0;
     const result = await runAgent({

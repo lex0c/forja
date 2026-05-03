@@ -594,6 +594,55 @@ describe('harness-adapter — compaction & checkpoints', () => {
     expect((out[0] as Extract<UIEvent, { type: 'warn' }>).message).toContain('not a git repo');
   });
 
+  test('bg_started → bg:start with processId + command', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'bg_started',
+      processId: 'p1',
+      command: 'npm run dev',
+      label: 'devserver',
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as Extract<UIEvent, { type: 'bg:start' }>;
+    expect(ev.type).toBe('bg:start');
+    expect(ev.processId).toBe('p1');
+    expect(ev.command).toBe('npm run dev');
+  });
+
+  test('bg_ended natural exit → bg:end with cause=exited and no signal', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'bg_ended',
+      processId: 'p1',
+      status: 'exited',
+      exitCode: 0,
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as Extract<UIEvent, { type: 'bg:end' }>;
+    expect(ev.type).toBe('bg:end');
+    expect(ev.processId).toBe('p1');
+    expect(ev.cause).toBe('exited');
+    expect(ev.exitCode).toBe(0);
+    // signal stays undefined — manager doesn't carry POSIX signal
+    // names today (D146 followup); the field is reserved for when
+    // it does.
+    expect(ev.signal).toBeUndefined();
+  });
+
+  test('bg_ended killed → bg:end with cause=killed', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'bg_ended',
+      processId: 'p1',
+      status: 'killed',
+      exitCode: 143,
+    });
+    const ev = out[0] as Extract<UIEvent, { type: 'bg:end' }>;
+    expect(ev.cause).toBe('killed');
+    expect(ev.exitCode).toBe(143);
+    expect(ev.signal).toBeUndefined();
+  });
+
   test('todo_updated → todo:update with items pass-through', () => {
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({

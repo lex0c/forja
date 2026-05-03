@@ -136,6 +136,36 @@ interface LiveHandle {
   exitedSettled: Promise<void>;
 }
 
+// Lifecycle observation. Fires once per process for `started` (right
+// after spawn succeeds and the live handle is registered) and once
+// for `ended` (from inside the exitedSettled handler, regardless of
+// whether the exit was natural or kill-induced — kill() awaits the
+// same promise, so a single source of truth keeps the contract
+// "one started, one ended" without dedup logic on the consumer).
+//
+// Skipped paths (intentional, no emit):
+//   - Spawn failure (Bun.spawn throws): no live process exists, the
+//     audit row exists but the TUI tray would show a phantom entry.
+//     Caller sees the exception synchronously.
+//   - kill() with no live handle (race: spawn happened, exited before
+//     kill could attach): no live process to track in the tray.
+//
+// Status discriminates intent:
+//   - 'exited': natural exit (process returned without external signal).
+//   - 'killed': operator-initiated termination (kill() or cleanup()).
+// 'failed' (spawn-time / DB-write errors) is intentionally NOT in the
+// union — those paths skip emit per D147. If a future producer needs
+// to surface failure for audit, add the variant + a producer in the
+// same slice.
+export type BgManagerEvent =
+  | { kind: 'started'; processId: string; command: string; label: string | null }
+  | {
+      kind: 'ended';
+      processId: string;
+      status: 'exited' | 'killed';
+      exitCode: number | null;
+    };
+
 export interface CreateBgManagerOptions {
   db: DB;
   sessionId: string;
@@ -150,6 +180,12 @@ export interface CreateBgManagerOptions {
   // loop is mid-stream). Cleanup is idempotent so the explicit
   // call in `runAgent`'s outer finally is harmless after this fires.
   abortSignal?: AbortSignal;
+  // Lifecycle observer. Fires `started` after spawn succeeds and
+  // `ended` after the OS reaped the process. Optional — managers
+  // built without it run unobserved (tests, headless audits). Throws
+  // are caught and discarded so a buggy observer can't break the
+  // process lifecycle (mirrors HarnessConfig.onEvent's contract).
+  onEvent?: (event: BgManagerEvent) => void;
 }
 
 const ensureDir = (dir: string): void => {
@@ -208,12 +244,35 @@ const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
   });
 
 export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
-  const { db, sessionId, logDir, abortSignal } = options;
+  const { db, sessionId, logDir, abortSignal, onEvent } = options;
   // In-memory map of live handles, keyed by internal process id. The
   // DB is the source of truth for status across restarts; this map
   // is the in-flight reference we need to actually call .kill() on
   // a Bun subprocess.
   const live = new Map<string, LiveHandle>();
+
+  // Tracks ids whose termination was operator-initiated (kill() or
+  // cleanup()), so the exitedSettled handler can emit `ended` with
+  // status='killed' instead of 'exited'. Without this, the natural-
+  // exit branch always sees status='running' in the DB row (kill()
+  // finalizes AFTER awaiting exitedSettled) and the emit lies about
+  // the cause. Cleared in the exitedSettled finally so a process id
+  // recycled across runs (theoretical with crypto.randomUUID — vanishingly
+  // unlikely) wouldn't carry the killed marker.
+  const killing = new Set<string>();
+
+  // Single emit point. Throws are caught so a buggy observer can't
+  // break the process lifecycle — same contract as HarnessConfig
+  // .onEvent. Inlined helper rather than a wrapper module to keep
+  // the manager's surface self-contained.
+  const safeEmit = (event: BgManagerEvent): void => {
+    if (onEvent === undefined) return;
+    try {
+      onEvent(event);
+    } catch {
+      // observer crashed; lifecycle continues
+    }
+  };
 
   const spawn = async (input: SpawnInput): Promise<SpawnResult> => {
     ensureDir(logDir);
@@ -337,18 +396,41 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
           if (current?.status === 'running') {
             finalizeBgProcess(db, { id, status: 'exited', exitCode: code });
           }
+          // Single ended emit, regardless of natural-vs-killed —
+          // kill() awaits exitedSettled, so this branch fires
+          // exactly once per spawned handle. Status discriminates
+          // operator-initiated termination (`killing` set) from
+          // natural exit; we can't read it from the DB row because
+          // kill() finalizes AFTER this handler runs. exitCode is
+          // the OS-reported value; for SIGTERM/SIGKILL it carries
+          // the signal-derived code (143/137).
+          const finalStatus: 'exited' | 'killed' = killing.has(id) ? 'killed' : 'exited';
+          safeEmit({ kind: 'ended', processId: id, status: finalStatus, exitCode: code });
         } catch {
           // DB closed / migration mid-flight / disk error. The OS
           // already reaped the process; we can't update the audit
           // row but cleanup() will run markRunningAsKilled at
-          // session end as the safety net.
+          // session end as the safety net. Still emit `ended` with
+          // best-effort status so the TUI tray clears — the operator
+          // shouldn't see a phantom counter just because the audit
+          // path failed.
+          safeEmit({ kind: 'ended', processId: id, status: 'exited', exitCode: null });
         }
       } finally {
         live.delete(id);
+        killing.delete(id);
       }
     })();
 
     live.set(id, { proc, exitedSettled });
+    // Emit AFTER live.set so getStatus() called from within the
+    // observer is consistent with the in-memory state.
+    safeEmit({
+      kind: 'started',
+      processId: id,
+      command: input.command,
+      label: row.label,
+    });
 
     return {
       id,
@@ -461,6 +543,12 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     const initialSignal = opts.signal ?? 'SIGTERM';
     const gracePeriodMs = opts.gracePeriodMs ?? DEFAULT_KILL_GRACE_MS;
 
+    // Mark BEFORE sending the signal so the exitedSettled handler
+    // (which races us to the finish line) sees the marker and emits
+    // status='killed' instead of 'exited'. Cleared in exitedSettled's
+    // finally — no leak even if kill() throws between here and the
+    // signal taking effect.
+    killing.add(id);
     handle.proc.kill(initialSignal);
 
     if (initialSignal !== 'SIGKILL') {

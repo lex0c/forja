@@ -178,6 +178,12 @@ export interface LiveState {
   // wholesale on every `todo:update` per spec §7.4 ("o model passa a
   // lista intencionada inteira; sem semantics de merge").
   todos: TodoItemForUI[];
+  // Background processes currently running, keyed by processId.
+  // Footer (spec UI.md §4.10.6) renders a `bg N` token when size > 0.
+  // Insertion via bg:start, removal via bg:end. Map preserves
+  // insertion order so a future expanded tray can list in
+  // chronological order. session:start clears (per-session scope).
+  bgProcesses: Map<string, { processId: string; command: string }>;
   // Operator hit Esc once during a running turn (spec UI.md §4.10.6
   // "Soft-aborted (ainda processando)"). The footer swaps its
   // interrupt cue from "esc to interrupt" to "esc again to force"
@@ -211,6 +217,7 @@ export const createInitialState = (): LiveState => ({
   modal: null,
   slash: null,
   todos: [],
+  bgProcesses: new Map(),
   softInterrupted: false,
   ended: false,
 });
@@ -316,12 +323,28 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
         model: event.model,
         planMode: event.planMode === true,
       };
-      // Boundary cleanup: soft-interrupt state is a within-turn
-      // signal. A fresh session starts clean even if the prior one
-      // ended mid-soft (operator hit Esc, then the run terminated
-      // for another reason before interrupting).
+      // Boundary cleanup: soft-interrupt state and bg processes are
+      // both per-session. A fresh session starts clean even if the
+      // prior one ended mid-soft (operator hit Esc, then the run
+      // terminated for another reason) or if the prior bg manager
+      // somehow left dangling entries.
+      //
+      // TODO (D150): when daemon mode / `--keep-bg` lands and bg
+      // processes survive across turn/session boundaries, this reset
+      // becomes a regression — the operator would lose the counter
+      // for processes still running in the background. Replace the
+      // unconditional reset with a producer-driven repopulation (the
+      // bg manager would re-emit `bg:start` for surviving processes
+      // on the new session_start). Today no path keeps bg alive
+      // across sessions, so the reset is correct.
       return {
-        state: { ...state, status, softInterrupted: false, ended: false },
+        state: {
+          ...state,
+          status,
+          softInterrupted: false,
+          bgProcesses: new Map(),
+          ended: false,
+        },
         permanent: [
           {
             kind: 'session-header',
@@ -339,8 +362,21 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       // footer's "esc again to force" cue stops surfacing once the
       // run actually terminates (regardless of WHY it ended — could
       // be the soft-abort succeeding, could be done/error/maxSteps).
+      // Also zero the bg counter: the harness emits `session_finished`
+      // BEFORE its outer finally runs `bgManager.cleanup()`, so the
+      // bg_ended events from cleanup land AFTER the operator has
+      // already seen `session:end` in the footer. Without zeroing
+      // here, the cue would briefly show `bg N` for processes the
+      // harness already committed to killing — visually a zombie
+      // tray. The late bg:end events still flow through (they're
+      // dropped as no-ops by the unknown-processId branch).
       return {
-        state: { ...state, softInterrupted: false, ended: true },
+        state: {
+          ...state,
+          softInterrupted: false,
+          bgProcesses: new Map(),
+          ended: true,
+        },
         permanent: [{ kind: 'session-footer', reason: event.reason }],
       };
 
@@ -775,13 +811,35 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       // read-only and we don't expose a mutation API.
       return { state: { ...state, todos: [...event.items] }, permanent: [] };
 
-    // ─── Not yet wired (subagent / bg render arrives later) ─────────
+    case 'bg:start': {
+      // Insert into the live map. Duplicate processId from a
+      // misbehaving producer overwrites silently — Map.set is the
+      // natural semantic and the renderer's count stays correct.
+      const next = new Map(state.bgProcesses);
+      next.set(event.processId, { processId: event.processId, command: event.command });
+      return { state: { ...state, bgProcesses: next }, permanent: [] };
+    }
+
+    case 'bg:end': {
+      // Remove from the live map. Unknown processId is a no-op —
+      // out-of-order events (end without prior start) shouldn't
+      // crash, and the count stays correct without the entry.
+      if (!state.bgProcesses.has(event.processId)) return { state, permanent: [] };
+      const next = new Map(state.bgProcesses);
+      next.delete(event.processId);
+      return { state: { ...state, bgProcesses: next }, permanent: [] };
+    }
+
+    case 'bg:update':
+      // Free-form status string with no producer today. Reserved for
+      // a future "process tray" panel that surfaces per-process
+      // status changes without flapping the counter.
+      return { state, permanent: [] };
+
+    // ─── Not yet wired (subagent render arrives later) ──────────────
     case 'subagent:start':
     case 'subagent:update':
     case 'subagent:end':
-    case 'bg:start':
-    case 'bg:update':
-    case 'bg:end':
       return { state, permanent: [] };
 
     default: {

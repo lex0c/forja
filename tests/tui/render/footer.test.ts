@@ -138,6 +138,30 @@ describe('renderFooter', () => {
     expect(out).toContain('• sonnet-4.6 · plan · 3/50');
   });
 
+  test('bg processes show as `bg N` after cost (spec UI.md §4.4 line 245)', () => {
+    const s = startedSession();
+    s.bgProcesses.set('p1', { processId: 'p1', command: 'npm run dev' });
+    s.bgProcesses.set('p2', { processId: 'p2', command: 'pytest' });
+    const out = renderFooter(s, caps);
+    // Order: model · steps/max · cost · bg N.
+    expect(out).toContain('• sonnet-4.6 · 3/50 · $0.0120 · bg 2');
+  });
+
+  test('bg counter only surfaces when size > 0 (zero processes drops the token)', () => {
+    const s = startedSession();
+    expect(s.bgProcesses.size).toBe(0);
+    const out = renderFooter(s, caps);
+    expect(out).not.toContain('bg ');
+    expect(out).toContain('• sonnet-4.6 · 3/50');
+  });
+
+  test('bg + plan mode coexist in correct order (model · plan · steps · cost · bg)', () => {
+    const s = startedSession({ planMode: true });
+    s.bgProcesses.set('p1', { processId: 'p1', command: 'x' });
+    const out = renderFooter(s, caps);
+    expect(out).toContain('• sonnet-4.6 · plan · 3/50 · $0.0120 · bg 1');
+  });
+
   test('null when modal is up', () => {
     const s = startedSession();
     s.modal = {

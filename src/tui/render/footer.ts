@@ -55,6 +55,11 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   // sessionId gate so all segments appear or none — avoids the
   // "model present but steps/cost missing" half-state). When absent,
   // the line is just the help hint on the left.
+  // Order tracks spec UI.md §4.4 line 245 (the only concrete example
+  // with bg present): `model · [plan] · steps/max · cost · [bg N]`.
+  // Spec §4.10.6 line 480 lists bg's removal priority as "less sticky
+  // than cost" (drops before cost when terminal is narrow), reinforcing
+  // the trailing position.
   const status = state.status;
   const rightParts: string[] = [];
   if (status.sessionId !== null) {
@@ -62,6 +67,9 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
     if (status.planMode) rightParts.push(dim(caps, 'plan'));
     if (status.maxSteps > 0) rightParts.push(dim(caps, `${status.steps}/${status.maxSteps}`));
     rightParts.push(dim(caps, formatCost(status.costUsd)));
+    if (state.bgProcesses.size > 0) {
+      rightParts.push(dim(caps, `bg ${state.bgProcesses.size}`));
+    }
   }
   const right = rightParts.join(sep);
 

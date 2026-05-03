@@ -284,13 +284,18 @@ export type SubagentEndEvent = BaseEvent & {
 // Background processes.
 export type BgStartEvent = BaseEvent & { type: 'bg:start'; processId: string; command: string };
 export type BgUpdateEvent = BaseEvent & { type: 'bg:update'; processId: string; status: string };
-// `exitCode` is null when the process was killed by a signal or never
-// produced an exit (crash before exec, OOM kill); `signal` carries the
-// POSIX signal name in those cases. Renderer chooses summary text from
-// the combination.
+// `cause` discriminates HOW the process ended:
+//   - 'exited': natural exit (process returned without external signal).
+//   - 'killed': operator-initiated termination (kill() or cleanup()).
+// `exitCode` is the OS-reported value; null when the OS reaped before
+// we could read it. `signal` (when present) carries the actual POSIX
+// signal name (e.g. 'SIGTERM') — distinct from `cause`, which describes
+// intent. Today no producer fills `signal`; the field is reserved for
+// when the manager surfaces signal-derived exits explicitly.
 export type BgEndEvent = BaseEvent & {
   type: 'bg:end';
   processId: string;
+  cause: 'exited' | 'killed';
   exitCode: number | null;
   signal?: string;
 };

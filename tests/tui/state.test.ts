@@ -597,6 +597,58 @@ describe('interrupt (soft / hard)', () => {
   });
 });
 
+describe('bg lifecycle', () => {
+  test('initial state has empty bgProcesses', () => {
+    expect(createInitialState().bgProcesses.size).toBe(0);
+  });
+
+  test('bg:start adds an entry, bg:end removes it', () => {
+    const { state } = drive([
+      { type: 'bg:start', ts: 1, processId: 'p1', command: 'npm run dev' },
+      { type: 'bg:start', ts: 2, processId: 'p2', command: 'pytest --watch' },
+      { type: 'bg:end', ts: 3, processId: 'p1', cause: 'exited', exitCode: 0 },
+    ]);
+    expect(state.bgProcesses.size).toBe(1);
+    expect(state.bgProcesses.has('p2')).toBe(true);
+    expect(state.bgProcesses.get('p2')?.command).toBe('pytest --watch');
+  });
+
+  test('bg:end for unknown processId is a no-op', () => {
+    const { state } = drive([
+      { type: 'bg:end', ts: 1, processId: 'never-started', cause: 'exited', exitCode: 0 },
+    ]);
+    expect(state.bgProcesses.size).toBe(0);
+  });
+
+  test('bg:start with duplicate processId overwrites silently', () => {
+    // Producer bug shouldn't crash — Map.set semantics keep the
+    // count correct (still 1) and the renderer shows the latest
+    // command on a future per-process tray.
+    const { state } = drive([
+      { type: 'bg:start', ts: 1, processId: 'p1', command: 'first' },
+      { type: 'bg:start', ts: 2, processId: 'p1', command: 'second' },
+    ]);
+    expect(state.bgProcesses.size).toBe(1);
+    expect(state.bgProcesses.get('p1')?.command).toBe('second');
+  });
+
+  test('bg:update does not flap the count (no producer today)', () => {
+    const { state } = drive([
+      { type: 'bg:start', ts: 1, processId: 'p1', command: 'x' },
+      { type: 'bg:update', ts: 2, processId: 'p1', status: 'cpu high' },
+    ]);
+    expect(state.bgProcesses.size).toBe(1);
+  });
+
+  test('session:start clears bgProcesses (fresh session boundary)', () => {
+    const { state } = drive([
+      { type: 'bg:start', ts: 1, processId: 'p1', command: 'x' },
+      start({ ts: 2, sessionId: 's2' }),
+    ]);
+    expect(state.bgProcesses.size).toBe(0);
+  });
+});
+
 describe('not-yet-wired events accept silently', () => {
   test.each([
     [
@@ -636,7 +688,7 @@ describe('not-yet-wired events accept silently', () => {
     ],
     ['bg:start', { type: 'bg:start', ts: 1, processId: 'b1', command: 'sleep' }],
     ['bg:update', { type: 'bg:update', ts: 1, processId: 'b1', status: 'running' }],
-    ['bg:end', { type: 'bg:end', ts: 1, processId: 'b1', exitCode: 0 }],
+    ['bg:end', { type: 'bg:end', ts: 1, processId: 'b1', cause: 'exited', exitCode: 0 }],
     ['interrupt', { type: 'interrupt', ts: 1, level: 'soft' }],
     ['checkpoint:create', { type: 'checkpoint:create', ts: 1, checkpointId: 'c1', stepN: 3 }],
   ] as const)('%s does not throw and emits no permanent', (_name, event) => {

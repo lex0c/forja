@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { type BgManager, createBgManager } from '../../src/bg/index.ts';
+import { type BgManager, type BgManagerEvent, createBgManager } from '../../src/bg/index.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import type { DB } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
@@ -515,5 +515,67 @@ describe('bg manager: cleanup', () => {
       expect(row.osPid).toBeGreaterThan(0);
       expect(row.cwd).toBeString();
     }
+  });
+});
+
+describe('bg manager: onEvent', () => {
+  test('fires started + ended for natural exit, exactly once each', async () => {
+    const events: BgManagerEvent[] = [];
+    const observed = createBgManager({
+      db,
+      sessionId,
+      logDir,
+      onEvent: (e) => events.push(e),
+    });
+    const r = await observed.spawn({ command: 'echo natural', label: 'n' });
+    await waitForExit(r.id);
+    // Wait one extra tick — exitedSettled emits inside its own
+    // microtask after the OS reaps; waitForExit returns when the DB
+    // row flips, which can be the same tick as the emit.
+    await new Promise((res) => setTimeout(res, 25));
+    const forThisProcess = events.filter((e) => e.processId === r.id);
+    expect(forThisProcess.map((e) => e.kind)).toEqual(['started', 'ended']);
+    const startedEv = forThisProcess[0] as Extract<BgManagerEvent, { kind: 'started' }>;
+    expect(startedEv.command).toBe('echo natural');
+    expect(startedEv.label).toBe('n');
+    const endedEv = forThisProcess[1] as Extract<BgManagerEvent, { kind: 'ended' }>;
+    expect(endedEv.status).toBe('exited');
+    expect(endedEv.exitCode).toBe(0);
+  });
+
+  test('ended fires with status=killed when kill() terminates the process', async () => {
+    const events: BgManagerEvent[] = [];
+    const observed = createBgManager({
+      db,
+      sessionId,
+      logDir,
+      onEvent: (e) => events.push(e),
+    });
+    const r = await observed.spawn({ command: 'sleep 30' });
+    await observed.kill(r.id);
+    // Give exitedSettled a moment to fire its emit after the kill.
+    await new Promise((res) => setTimeout(res, 25));
+    const ended = events.find(
+      (e): e is Extract<BgManagerEvent, { kind: 'ended' }> =>
+        e.kind === 'ended' && e.processId === r.id,
+    );
+    expect(ended).toBeDefined();
+    expect(ended?.status).toBe('killed');
+  });
+
+  test('observer that throws does not break process lifecycle', async () => {
+    const observed = createBgManager({
+      db,
+      sessionId,
+      logDir,
+      onEvent: () => {
+        throw new Error('observer crashed');
+      },
+    });
+    const r = await observed.spawn({ command: 'echo ok' });
+    // No throw despite observer raising — spawn returned and the
+    // process exits naturally.
+    await waitForExit(r.id);
+    expect(getBgProcess(db, r.id)?.status).toBe('exited');
   });
 });
