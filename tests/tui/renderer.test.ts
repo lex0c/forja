@@ -141,6 +141,244 @@ describe('renderer wiring', () => {
     r.close();
   });
 
+  test('differential redraw: unchanged lines are NOT re-emitted (anti-flicker)', () => {
+    // The flicker fix's load-bearing claim: under key repeat the
+    // surrounding lines (status / footer / rules) stay pixel-stable
+    // because we don't re-emit their content. This test pins it.
+    //
+    // Setup: a deterministic compose function that returns 3 lines
+    // — two static, one "dynamic" (the input echo). We drive
+    // session:start to establish a baseline frame, then fire
+    // input:update events (which only change the dynamic line) and
+    // assert the captured writes after the baseline contain the
+    // changed line content but NEVER the static line content again.
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    const compose = (s: LiveState): string[] => [
+      'STATIC-HEADER',
+      `INPUT: ${s.input.value}`,
+      'STATIC-FOOTER',
+    ];
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      composeLive: compose,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+    });
+    bus.emit(sessionStart);
+    // Baseline frame contains all three lines (full draw).
+    expect(sink.joined()).toContain('STATIC-HEADER');
+    expect(sink.joined()).toContain('STATIC-FOOTER');
+    expect(sink.joined()).toContain('INPUT: ');
+    sink.writes.length = 0;
+    // Fire a state-only update that changes only the input line.
+    bus.emit({ type: 'input:update', ts: 2, value: 'h', cursor: 1 });
+    sched.flushAll();
+    const second = sink.joined();
+    // The new input value MUST appear (the line that changed).
+    expect(second).toContain('INPUT: h');
+    // The static lines MUST NOT appear in the second frame — they
+    // didn't change, so the differential renderer skipped them.
+    // If this regresses, the flicker comes back: every keystroke
+    // would re-emit the static rows and the operator sees them
+    // wiped + repainted at frame rate.
+    expect(second).not.toContain('STATIC-HEADER');
+    expect(second).not.toContain('STATIC-FOOTER');
+    // Subsequent typing keeps the same property.
+    sink.writes.length = 0;
+    bus.emit({ type: 'input:update', ts: 3, value: 'he', cursor: 2 });
+    sched.flushAll();
+    const third = sink.joined();
+    expect(third).toContain('INPUT: he');
+    expect(third).not.toContain('STATIC-HEADER');
+    expect(third).not.toContain('STATIC-FOOTER');
+    r.close();
+  });
+
+  test('differential redraw: multiple changed lines walk between rows correctly', () => {
+    // The single-changed-line case is easy; this exercises the
+    // inter-row walk. Two lines change (rows 0 and 2), the middle
+    // row is static and must NOT be re-emitted, AND the cursor must
+    // land back on the input row (the last) after both writes.
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    let counter = 0;
+    const compose = (s: LiveState): string[] => [
+      `DYNAMIC-A: ${counter}`,
+      'STATIC-MIDDLE',
+      `INPUT: ${s.input.value}`,
+    ];
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      composeLive: compose,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+    });
+    bus.emit(sessionStart);
+    sink.writes.length = 0;
+    // Bump both row 0 (counter) and row 2 (input). Middle row stays.
+    counter = 1;
+    bus.emit({ type: 'input:update', ts: 2, value: 'h', cursor: 1 });
+    sched.flushAll();
+    const out = sink.joined();
+    expect(out).toContain('DYNAMIC-A: 1');
+    expect(out).toContain('INPUT: h');
+    // Static middle row was NOT re-emitted.
+    expect(out).not.toContain('STATIC-MIDDLE');
+    // The renderer walked between rows: at minimum a cursorDown
+    // should appear (from row 0 after writing row 0, walking to
+    // row 2 to write the input). cursorDown(2) is `\x1b[2B`.
+    expect(out).toContain(`${CSI}2B`);
+    r.close();
+  });
+
+  test('differential redraw: cursor reposition fires even when no line content changed', () => {
+    // Edge case: the input value didn't change, but the cursor
+    // position within the buffer did (e.g., the operator pressed an
+    // arrow key, or backspace+retype lands the same chars). The
+    // composed lines are identical to the previous frame — diff
+    // emits nothing for content — but the cursor must still walk
+    // to its new column. Without the final reposition the operator
+    // sees the cursor stuck at the previous spot.
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+    });
+    bus.emit(sessionStart);
+    bus.emit({ type: 'input:update', ts: 2, value: 'abc', cursor: 3 });
+    sched.flushAll();
+    sink.writes.length = 0;
+    // Same value, cursor moves left by one. No line content changes.
+    bus.emit({ type: 'input:update', ts: 3, value: 'abc', cursor: 1 });
+    sched.flushAll();
+    const out = sink.joined();
+    // No content from the input row — same string.
+    expect(out).not.toContain('> abc');
+    // But cursorForward MUST appear (positioning the cursor at the
+    // new column). The exact value is `prefix(2) + cursor(1) = 3`.
+    expect(out).toContain(`${CSI}3C`);
+    r.close();
+  });
+
+  test('layout change (height differs) falls back to full erase + redraw', () => {
+    // Differential only applies when prev and next have the same
+    // number of lines. When the layout changes (e.g., a tool card
+    // appears, modal opens, status line gains a row), we must do
+    // a full erase + redraw so the terminal lays out the new shape
+    // correctly. Pinning this so a future "always-differential"
+    // refactor doesn't leave ghost rows.
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    let extra = false;
+    const compose = (s: LiveState): string[] => {
+      const base = ['HEADER', `INPUT: ${s.input.value}`, 'FOOTER'];
+      return extra ? [...base, 'EXTRA-ROW'] : base;
+    };
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      composeLive: compose,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+    });
+    bus.emit(sessionStart);
+    sink.writes.length = 0;
+    // Now grow the layout. Trigger a redraw.
+    extra = true;
+    bus.emit({ type: 'input:update', ts: 2, value: '', cursor: 0 });
+    sched.flushAll();
+    const out = sink.joined();
+    // Full redraw → all rows present, including the static ones,
+    // because we erased + redrew the whole thing.
+    expect(out).toContain('HEADER');
+    expect(out).toContain('FOOTER');
+    expect(out).toContain('EXTRA-ROW');
+    // Erase escape (clearDown) is present too.
+    expect(out).toContain(`${CSI}J`);
+    r.close();
+  });
+
+  test('redraw payload is wrapped in DECSET 2026 (synchronized output)', () => {
+    // UI.md §2.2: each frame is wrapped in BSU/ESU so terminals
+    // present it atomically (no incremental rasterization mid-frame).
+    // Single-write coalesce alone wasn't enough — under key repeat
+    // the operator still saw the static lines (status / footer /
+    // rules) flicker as the terminal painted cursor-up + clear →
+    // content in visible steps. The wrap fixes that on supporting
+    // terminals (kitty, iTerm2, alacritty, wezterm) and is a no-op
+    // private mode on the rest.
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+    });
+    bus.emit(sessionStart);
+    const firstFrame = sink.joined();
+    expect(firstFrame.startsWith(`${CSI}?2026h`)).toBe(true);
+    expect(firstFrame.endsWith(`${CSI}?2026l`)).toBe(true);
+    // Scheduled redraw on a state-only event also wraps.
+    sink.writes.length = 0;
+    bus.emit({ type: 'input:update', ts: 2, value: 'h', cursor: 1 });
+    sched.flushAll();
+    const second = sink.joined();
+    expect(second.startsWith(`${CSI}?2026h`)).toBe(true);
+    expect(second.endsWith(`${CSI}?2026l`)).toBe(true);
+    r.close();
+  });
+
+  test('one redraw is one write() call (anti-flicker — UI.md §2.2 step 4)', () => {
+    // Spec §2.2 requires the redraw cycle (erase + content + cursor)
+    // to land in a single `process.stdout.write(...)`. Splitting it
+    // across multiple writes flushes the terminal between them — the
+    // operator sees the live region momentarily wiped before the
+    // new frame paints, perceived as flicker. Prior versions did
+    // 2-3 separate writes per redraw; this test pins the contract.
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+    });
+    // First frame (after session:start) lands as one write.
+    bus.emit(sessionStart);
+    expect(sink.writes).toHaveLength(1);
+    sink.writes.length = 0;
+    // Subsequent state-only event → scheduled redraw, also one write.
+    bus.emit({ type: 'input:update', ts: 2, value: 'h', cursor: 1 });
+    sched.flushAll();
+    expect(sink.writes).toHaveLength(1);
+    // Permanent transition (warn) — erase + permanent text + draw all
+    // get coalesced into one write too. Without coalesce this would
+    // be 3+ writes (erase, permanent line, draw, cursor reposition).
+    sink.writes.length = 0;
+    bus.emit({ type: 'warn', ts: 3, message: 'careful' });
+    expect(sink.writes).toHaveLength(1);
+    r.close();
+  });
+
   test('subsequent state-only events coalesce into one redraw', () => {
     const bus = createBus();
     const sink = makeSink();
@@ -253,10 +491,13 @@ describe('renderer wiring', () => {
     // Permanent header writes one line; live region writes nothing.
     const out = sink.joined();
     expect(out).toContain('── session');
-    // The live-region join would have been an empty string; with no
-    // entries to write, we should see only the permanent line plus
-    // its trailing newline.
-    expect(out).toBe('── session s1 · autonomous · opus ──\n');
+    // Strip the synchronized-output wrap (DECSET 2026) and assert
+    // what's inside is exactly the permanent line. Without an empty
+    // live region the inner payload would also include cursorUp /
+    // clearDown / live content escapes, which is what this test
+    // guards against.
+    const inner = out.replace(`${CSI}?2026h`, '').replace(`${CSI}?2026l`, '');
+    expect(inner).toBe('── session s1 · autonomous · opus ──\n');
     r.close();
   });
 

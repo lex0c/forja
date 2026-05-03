@@ -79,10 +79,12 @@ Reside em memória como `LiveState`. A cada mudança (evento do bus ou tick de s
 1. Move cursor: `\x1b[<n>A` (sobe N linhas, N = altura do último frame).
 2. Limpa: `\x1b[J` (apaga do cursor pra baixo).
 3. Compõe `string[]` via funções de render.
-4. Escreve em uma única `process.stdout.write(...)`.
+4. Escreve em uma única `process.stdout.write(...)`, envelopada em **synchronized output** (DECSET 2026): `\x1b[?2026h` no início + `\x1b[?2026l` no fim. Terminais que suportam (kitty, iTerm2, alacritty, wezterm, recent gnome-terminal/konsole) bufferam o conteúdo entre BSU/ESU e renderizam como **frame atômico** — sem o flicker de "cursor-up + clear → conteúdo" sendo pintado em passos visíveis. Terminais sem suporte ignoram (modo privado, comportamento spec-compliant). Aplica-se também ao path permanente (erase + scrollback line + draw): a transição inteira é uma frame.
 5. Reposiciona cursor dentro do input.
 
 Frame budget: **30fps soft, 60fps em bursts** (ver `PERFORMANCE.md`). Coalescer eventos dentro de um frame: vários `assistant:delta` em < 33ms viram um único redraw.
+
+Single write + synchronized output são camadas independentes: um syscall (passo 4) garante que o kernel não fragmenta no fd; BSU/ESU garantem que o terminal não fragmenta no rasterizador. Ambos são necessários — sob key repeat (~30 chars/s), a falta de qualquer um produz flicker visível nas linhas estáticas (status, footer, réguas) que cercam o input.
 
 ### 2.3 Largura e altura
 

@@ -15,6 +15,43 @@ Format:
 
 ---
 
+## [2026-05-03] M2 / fix — renderer flicker (single write + DECSET 2026 + differential)
+
+Operator notou linhas ao redor do input piscando ao digitar; pior sob key repeat (`eeeeeeeeee`). Operator usa xterm vanilla sob i3wm — terminal mais antigo sem DECSET 2026. Foi preciso atacar em três camadas, e a operator-side observation foi load-bearing: *"o banner não pisca"* — ou seja, conteúdo permanente (que vai pra scrollback nativo do terminal e nunca é revisitado) é estável; só a região viva pisca, porque ela é redesenhada a cada frame.
+
+1. **Camada syscall.** Redraw fazia 2-3 `write()` separados (erase → draw → cursor reposition). TTY flusha sync, terminal via cada write como update separado.
+2. **Camada terminal.** Mesmo após coalescer pra 1 syscall, terminais como xterm rasterizam ANSI **incrementalmente** — `cursor-up` executa, `clear-down` executa (gap vazio visível), só depois conteúdo. Resolve em terminais modernos com **synchronized output (DECSET 2026)** — wrap `\x1b[?2026h` … `\x1b[?2026l`. Em xterm vanilla é no-op silencioso, então a fix não chega.
+3. **Camada de redraw model.** O renderer reconstruía a região INTEIRA a cada frame: input + status + réguas + footer juntos. Sob key repeat só o input muda; reescrever os outros 30x/s era visível como flicker mesmo com syscall + DECSET 2026 corretos. Resolve com **diferencial line-by-line**: comparar lines do frame novo com o anterior, só reemitir o que mudou. Linhas estáticas ficam pixel-stable porque o terminal nunca recebe instrução pra revisitar.
+
+**Done:**
+
+- §2.2 step 4 estendida: além de single write, manda wrapping em BSU/ESU (DECSET 2026); explica as duas camadas (syscall + rasterização) e por que ambas são necessárias sob key repeat. Lista terminais com suporte. Sem suporte = no-op silencioso.
+- `term.ts` ganhou constantes `beginSyncOutput` / `endSyncOutput` / `clearLine` (essa última já existia, agora é importada pelo renderer).
+- `src/tui/renderer.ts` refatorado em 3 build helpers (`buildErase`, `buildFullDraw`, `buildDifferentialDraw`, `buildPermanent`) — todos retornam string. `redraw` decide entre full e diferencial via `prevLines.length === truncated.length`. Layout mudou? Full erase + draw. Mesma altura? Diferencial: walk to row 0, walk down to each changed row, `\r${clearLine}<content>`, skip rows iguais. Cursor reposicionado no fim.
+- `prevLines: string[]` rastreia o frame anterior. Reset em: layout change, permanent transition, screen:clear, session end, close. Reset força próximo frame pelo full path pra renderer state ficar em lockstep com o que o terminal mostra.
+- Tudo wrapped em BSU/ESU; tudo num `write()` por ciclo. Empty payloads não wrappam.
+- 4 testes de regressão novos:
+  - "1 redraw = 1 write()" pina o contrato syscall.
+  - "redraw payload wrapped em DECSET 2026" pina o contrato de apresentação.
+  - **"unchanged lines NOT re-emitted"** pina o contrato diferencial — composer fake com 3 lines (header estático, input dinâmico, footer estático), assertion `not.toContain` nos estáticos após o primeiro frame. Esse é o teste load-bearing pra anti-flicker em xterm.
+  - "layout change falls back to full erase + redraw" pina o fallback quando altura muda (ghost rows seriam o failure mode se faltasse).
+
+**Decisions:**
+
+- **DECSET 2026 emitido incondicionalmente.** Modo privado spec-compliant: terminais sem suporte ignoram. Detecção runtime adicionaria complexidade sem ganho — emitir é seguro, e detecção via query ESC seria assíncrona e laggy ao boot.
+- **Wrap só payloads não-vazios.** BSU+ESU em volta de string vazia é no-op mas pollui assertions e gasta bytes.
+- **Nomes internos `build*`** (não `make`/`compute`) deixam claro que retornam string, não escrevem.
+- **Diferencial via igualdade exata de string.** `truncated[i] !== prevLines[i]` decide se reemite. Isso pega 100% das mudanças relevantes (status counter, footer cue, input value); falsos positivos só aconteceriam se algum composer retornasse strings semanticamente iguais mas literalmente diferentes (e.g., timestamp em ms num spinner) — caso real é o spinner de tool ativo, mas esse já é uma linha que MUDA legitimamente, então comparação certa.
+- **Layout change → full erase + draw.** A alternativa seria diferencial híbrido com inserção/remoção de linhas, mas a complexidade não compensa: layout muda em transições (modal abre, tool inicia, session end) onde uma full repaint é aceitável e o operador não está sob key repeat naquele instante.
+
+**Pending:**
+
+- Smoke visual sob key repeat em xterm + i3wm (terminal do operator) e num terminal com DECSET 2026 (alacritty/kitty). Em ambos a região viva deve estar 100% lisa após o diferencial.
+
+**Next:** smoke + commit.
+
+---
+
 ## [2026-05-03] M2 / spec+impl — idle Ctrl+C double-tap exit gate (UI.md §5.4)
 
 Operator queixou: single Ctrl+C no idle saía do REPL imediatamente. Com a TUI inline e tarefas longas em curso, o "tap acidental" era custoso — sair perde draft, contexto de slash em curso, foco. A spec hoje (§5.4) só cobria Ctrl+C `running` (cancela / hard kill) e silenciava sobre idle, deixando o comportamento "exit imediato" implícito. Lacuna de spec, não divergência.

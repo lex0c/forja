@@ -82,6 +82,21 @@ export const clearDown = `${CSI}J`;
 export const enableBracketedPaste = `${CSI}?2004h`;
 export const disableBracketedPaste = `${CSI}?2004l`;
 
+// Synchronized output (DECSET 2026). Wraps a write so the terminal
+// buffers the bytes between BSU/ESU and presents the resulting frame
+// atomically — no incremental rasterization of "cursor-up + clear →
+// content" pinned to the redraw cycle, which the operator perceives
+// as flicker on the static lines (status, footer, rules) surrounding
+// the input box. Terminals without support silently ignore (it's a
+// private mode; safe to emit unconditionally per the spec).
+//
+// Spec: https://gist.github.com/christianparpart/d8a62cc1ab659194337d73e399004036
+// Supported by: kitty, iTerm2, alacritty, wezterm, recent gnome-terminal,
+// recent konsole. Unsupported (no-op): xterm without patches, screen,
+// most older emulators.
+export const beginSyncOutput = `${CSI}?2026h`;
+export const endSyncOutput = `${CSI}?2026l`;
+
 // Paste marker constants for the key parser. Kept here so paste handling
 // stays adjacent to its escape-code definition.
 export const BRACKETED_PASTE_START = `${CSI}200~`;
