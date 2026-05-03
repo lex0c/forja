@@ -295,7 +295,12 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(0);
   });
 
-  test('Esc during a turn aborts via the harness signal', async () => {
+  test('first Esc during a turn aborts the soft signal (cooperative), NOT the hard one', async () => {
+    // Spec UI.md §3 + 1.g.1: first Esc is cooperative — softStopSignal
+    // fires so the harness exits at the next step boundary, but the
+    // hard signal stays unaborted (in-flight tool / provider stream
+    // is not preempted). Second Esc escalates to hard (covered in the
+    // sibling test).
     const stdin = makeStdin();
     const ra = makeRunAgent((n) => `sess-${n}`);
     const promise = runRepl({
@@ -308,15 +313,18 @@ describe('repl — boot + smoke', () => {
     await tick();
     stdin.feed('go\r');
     await tick();
-    const signal = ra.captured[0]?.configs[0]?.signal;
+    const cfg = ra.captured[0]?.configs[0];
+    const signal = cfg?.signal;
+    const softSignal = cfg?.softStopSignal;
     expect(signal?.aborted).toBe(false);
-    // The parser buffers a lone ESC (it could be the start of a CSI
-    // sequence). Feed ESC ESC so the first ESC flushes as a complete
-    // 'escape' key event — the editor surfaces interruptSoft → REPL
-    // calls AbortController.abort().
+    expect(softSignal?.aborted).toBe(false);
+    // First Esc: only soft fires.
     stdin.feed('\x1b\x1b');
     await tick();
-    expect(signal?.aborted).toBe(true);
+    expect(signal?.aborted).toBe(false);
+    expect(softSignal?.aborted).toBe(true);
+    // The harness's mock doesn't auto-honor softStopSignal — finish
+    // it explicitly so shutdown can resolve.
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
     stdin.feed('\x03');
@@ -324,15 +332,11 @@ describe('repl — boot + smoke', () => {
   });
 
   test('second Esc while soft already in flight emits interrupt:hard', async () => {
-    // Operator escalates: first Esc → soft, second Esc → hard. The
-    // visible cue says "esc again to force" — the event stream needs
-    // to reflect that promise so audit can distinguish "nudged once"
-    // from "escalated". Reducer is no-op on hard today (D141), but
-    // the harness's AbortController.abort() is already preemptive.
-    // When cooperative-soft semantics land, this routing already
-    // works.
+    // Operator escalates: first Esc → soft (softStopController.abort
+    // only), second Esc → hard (abortController.abort, preempts
+    // in-flight work). Asserts the post-1.g.1 contract by reading
+    // both controllers' signal state directly.
     const stdin = makeStdin();
-    const collected: Array<{ level: 'soft' | 'hard' }> = [];
     const ra = makeRunAgent((n) => `sess-${n}`);
     const promise = runRepl({
       args: makeArgs(),
@@ -341,7 +345,7 @@ describe('repl — boot + smoke', () => {
       skipTtyCheck: true,
       runAgentOverride: ra.runAgent,
       // Capture rendered frames just to drive the renderer's frame
-      // scheduler — we infer interrupt level from the cue swap.
+      // scheduler — we read signals on cfg directly for assertions.
       rendererWrite: () => undefined,
     });
     await tick();
@@ -355,20 +359,20 @@ describe('repl — boot + smoke', () => {
       args: { command: 'sleep 999' },
     });
     await flushFrame();
-    // First Esc: soft.
+    const cfg = ra.captured[0]?.configs[0];
+    const signal = cfg?.signal;
+    const softSignal = cfg?.softStopSignal;
+    expect(signal?.aborted).toBe(false);
+    expect(softSignal?.aborted).toBe(false);
+    // First Esc: soft fires (cooperative), hard signal untouched.
     stdin.feed('\x1b\x1b');
     await flushFrame();
-    collected.push({ level: 'soft' });
-    // Second Esc: REPL detects softInterrupted is already true and
-    // emits hard. We can't intercept the bus from here without a
-    // test seam, so we rely on the e2e symptom: the renderer flag
-    // would NOT be reset (hard is no-op state-wise) so the cue
-    // remains "esc again to force" regardless of how many more taps
-    // we send.
+    expect(softSignal?.aborted).toBe(true);
+    expect(signal?.aborted).toBe(false);
+    // Second Esc: escalates to hard — preempts in-flight work.
     stdin.feed('\x1b\x1b');
     await flushFrame();
-    collected.push({ level: 'hard' });
-    expect(collected).toHaveLength(2);
+    expect(signal?.aborted).toBe(true);
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
     stdin.feed('\x03');
@@ -517,14 +521,17 @@ describe('repl — boot + smoke', () => {
     await tick();
     stdin.feed('go\r');
     await tick();
-    // First SIGINT while running → just aborts the run.
+    // 1.g.1: SIGINT now follows the soft/hard ladder. First emit
+    // is cooperative — the fixture only listens on the hard signal,
+    // so the run doesn't resolve. Second emit escalates to hard
+    // (softInterrupted flipped true after the first), which fires
+    // the fixture's abort listener → microtasks → resolve. Third
+    // emit lands with running=false and triggers requestShutdown.
+    process.emit('SIGINT');
+    await tick();
     process.emit('SIGINT');
     await tick();
     await tick();
-    // Run has resolved (after the queued microtasks). Second SIGINT
-    // exits cleanly. The shutdown path awaits the run promise (which
-    // is already resolved at this point but the await is still needed
-    // for the race-free shape).
     process.emit('SIGINT');
     expect(await promise).toBe(130);
     // Critical ordering: db.close fires AFTER the run resolved.

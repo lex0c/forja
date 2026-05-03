@@ -617,6 +617,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (signal.aborted) {
           return finish(isWallClockTimeout() ? 'maxWallClockMs' : 'aborted');
         }
+        // Cooperative stop: spec UI.md §3 soft interrupt. The check
+        // sits at the top of the loop so the just-completed step's
+        // tool calls + their results are persisted before exiting.
+        // This gives the operator the "model finishes the step then
+        // stops" semantic without burning tokens on a re-prompt the
+        // operator already cancelled. Distinct from the hard signal
+        // above — soft never preempts in-flight work.
+        if (config.softStopSignal?.aborted) {
+          return finish('aborted');
+        }
         if (steps >= budget.maxSteps) return finish('maxSteps');
         // Cost cap pre-check. Critical on resume: a session whose
         // priorCostUsd already crossed budget.maxCostUsd would
@@ -872,6 +882,24 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           if (signal.aborted) {
             return finish(isWallClockTimeout() ? 'maxWallClockMs' : 'aborted');
           }
+          // Cooperative-stop also honored mid-step (1.g.1, D158): if
+          // the model returned multiple tool_uses and soft fired
+          // after the first one ran, don't keep executing the rest.
+          // Already-executed tools' results were appended to the
+          // message log via the prior iterations; the loop exits
+          // before the next provider call (which would have asked
+          // the model to react to a partial set, but the operator
+          // already cancelled the conversation). Symmetry with the
+          // top-of-loop soft check.
+          // Re-check via local assignment forces TS to re-narrow on
+          // every iteration — without this, the outer top-of-loop
+          // check would have narrowed `aborted` to false at this
+          // scope. The Set/get is on a live AbortSignal so the value
+          // genuinely changes between iterations.
+          const softAborted = config.softStopSignal?.aborted;
+          if (softAborted) {
+            return finish('aborted');
+          }
 
           // Degenerate-loop detection: hash this call and check the sliding
           // window. We do this BEFORE invocation so we can refuse cheaply.
@@ -953,6 +981,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     // the child run too. The child builds its own
                     // wall-clock on top of this.
                     signal,
+                    // Forward the cooperative-stop signal — wired
+                    // here so that when the in-process subagent path
+                    // lands (IPC slice unblocks 1.f.2), Esc-during-
+                    // task already routes correctly. Today the
+                    // subprocess path can't act on a soft signal (no
+                    // IPC); the parent blocks on `await runSubagent`
+                    // until the child finishes its full budget, then
+                    // the parent's top-of-loop soft check exits.
+                    // Documented gap (D159).
+                    ...(config.softStopSignal !== undefined
+                      ? { softStopSignal: config.softStopSignal }
+                      : {}),
                     // Forward the registry so the child can task()
                     // further children. Same set, same names.
                     subagentRegistry: registry,

@@ -15,6 +15,44 @@ Format:
 
 ---
 
+## [2026-05-03] M1 / Step 1.g.1 — Hard-abort cooperative semantics
+
+Closes D141: until now, the footer's "esc again to force" cue was lying. Spec UI.md §3 distinguishes:
+
+| Level | Behavior |
+|---|---|
+| `soft` | Model finishes the step then stops — cooperative |
+| `hard` | Cancel tool in flight immediately — preemptive |
+
+Pre-1.g.1 the harness only had ONE signal (preemptive `AbortController.abort()`); first Esc and second Esc both hit the same path, just different audit labels. This slice adds a separate `softStopSignal` to `HarnessConfig` checked at the loop's step boundary, so first Esc lets in-flight work finish and exits cleanly before the next provider call; second Esc still preempts via the existing hard signal.
+
+Operator UX impact: an operator who hits Esc during a `bash sleep 30` now waits up to 30 seconds for the tool to complete, then the loop exits. The previous behavior killed mid-sleep. Spec is explicit that this is the right tradeoff — the cooperative path saves token budget on a re-prompt the operator would have cancelled anyway, and the escalation path (second Esc) is a single keystroke away. Reflected in the existing footer cue: "esc to interrupt" → "esc again to force".
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/harness/types.ts` | NEW `HarnessConfig.softStopSignal?: AbortSignal`. Optional — when absent, the loop only honors the hard `signal`, preserving pre-1.g.1 behavior so non-REPL callers (programmatic, tests, batch) opt in deliberately. |
+| `src/harness/loop.ts` | Step boundary check at the top of the while loop: `if (config.softStopSignal?.aborted) return finish('aborted')`. Sits AFTER the hard `signal.aborted` check (so simultaneous fires resolve as hard, which is more informative for `isWallClockTimeout` discrimination) and BEFORE budget checks (so a soft fire takes precedence over `maxSteps`/`maxCostUsd` exits — the operator's intent wins). |
+| `src/cli/repl.ts` | Two controllers per turn (`abortController` for hard, `softStopController` for soft). Both reset in `startTurn` so a soft fire from a prior turn can't leak. Editor's interrupt handler routes by level: first tap → `softStopController.abort()` only; second tap → `abortController.abort()`. Same split mirrored on the SIGINT handler so Ctrl+C and Esc share a single ladder per spec UI.md §5.4. The hard controller stays the source of truth for the shutdown path (immediate teardown). |
+| `tests/harness/loop.test.ts` | NEW 3 tests: pre-aborted softStopSignal exits with `aborted` and zero provider calls; soft fired mid-tool execution lets the tool complete then exits without the next provider call (asserted via toolFinished flag + handle.requests.length); regression cover that hard abort still preempts in-flight tools (`ctx.signal.aborted` observed inside the tool). |
+| `tests/cli/repl.test.ts` | Existing "Esc during a turn aborts" test rewritten to assert the new contract: first Esc fires soft signal only, hard signal stays unaborted. "Second Esc → hard" test strengthened to assert the underlying signal shapes (was previously inferring from the renderer cue alone). "Shutdown awaits run" test updated for the three-SIGINT ladder (1: soft, 2: hard → fixture resolves, 3: requestShutdown). "Ctrl+C flips footer" still works as-is — the soft path emits the same UIEvent. |
+
+**Decisions:**
+
+- **D154 — Separate AbortSignal, not a flag.** Considered adding `interruptCooperative: () => void` to HarnessConfig or a mutable flag. AbortSignal won because: (a) it composes with the existing `signal` field — same primitive, same shape, callers that already maintain controllers just add a second; (b) the loop's check is structurally identical to the hard check (`signal.aborted` vs `softStopSignal?.aborted`); (c) AbortSignal supports the no-op default (undefined) without a sentinel. Cost: a second AbortController allocation per turn. Trivial.
+- **D155 — Soft check sits AFTER hard, BEFORE budget.** Ordering matters when multiple gates fire simultaneously. Hard before soft so a wall-clock-timeout-induced abort (which fires `signal.aborted` AND is detectable via `isWallClockTimeout()`) reports `maxWallClockMs`, not `aborted` — preserves the existing diagnostic value. Soft before budget so a cooperative stop overrides a coincident `maxSteps`/`maxCostUsd` boundary — the operator's intent should land in the audit log even when budget caps would have terminated the same step.
+- **D156 — Both controllers reset per turn.** The `softStopController` lives at the same scope as `abortController` and resets in the same `startTurn`. A soft fire from turn N should not bleed into turn N+1 — the operator already saw their cancellation honored. Asserted indirectly by every existing multi-turn test that didn't break (none did).
+- **D157 — Shutdown still uses hard.** `shutdown()` calls `abortController.abort()` (not soft) — when the REPL is exiting, the operator isn't asking for a graceful step boundary, they're asking to leave NOW. Cooperative for in-session interrupts; preemptive for shutdown. Edge case: if soft is already in flight when the operator triggers shutdown (e.g., types `/quit` while a tool is finishing), the hard signal preempts the cooperative path mid-tool. `HarnessResult.reason` reports `'aborted'` in both cases — audit can't distinguish "soft completed naturally" from "hard preempted soft" today. Tracked alongside D141's audit-cause discriminator follow-up.
+- **D158 — Soft check inside the per-step tool loop, not just at step boundary (post-review).** Initial cut placed the soft check only at the top of the outer `while (true)`. Code review caught: when the model returns multiple `tool_use` blocks in a single step, soft fires after tool 1 → harness still runs tool 2 → tools 3..N → only THEN exits at the next outer iteration. Side effects + wall-clock + budget all burned on work the operator already cancelled. Fix: mirror the top-of-loop soft check into the inner `for (const tu of collected.tool_uses)` so soft short-circuits between tools. Already-executed tools' results stay in the message log (audit-correct); the unfired tools never run; loop exits with `reason: 'aborted'`.
+- **D159 — Subagent path forwards `softStopSignal` but the subprocess child can't act on it (post-review).** Code review caught the subagent gap: the subagent runtime is subprocess-based, so the parent has no IPC channel to deliver a soft signal to the child's harness loop. The OS only carries hard signals (SIGTERM/SIGKILL), which are inherently preemptive. Today: parent's `softStopSignal` IS forwarded to `runSubagent` (wired for forward-compat with the future in-process subagent path), but the subprocess wait loop ignores it. Operator UX impact: an Esc-during-task lets the subagent run its full budget; the parent's top-of-loop soft check fires only after `await runSubagent` returns. Closes when the IPC slice (same one that unblocks 1.f.2 subagent observability) lands — at that point, the in-process child path will honor soft directly, and the subprocess path will route soft via a published-message protocol.
+
+**Pending:** mutation slash commands; subagent observability (1.f.2, blocked on IPC); end-to-end audit with a real provider before locking M1.
+
+**Next:** end-to-end audit with a real provider — the M1 TUI series is functionally complete on every in-process surface (slash, todos, assistant chip, soft+hard abort, bg). Real-provider validation surfaces integration bugs unit tests can't reach.
+
+---
+
 ## [2026-05-03] M1 / Step 1.f.3 — Background process observability
 
 Closes the last in-process gap on the live region: until now, `bash_background` would spawn a process and the operator had no visible signal — no chip, no count, nothing. Spec UI.md §4.10.6 + §4.4 define a `bg N` counter token in the footer's right column; this slice wires the producer (BgManager → harness → adapter → reducer) and renders it.

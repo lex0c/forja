@@ -163,7 +163,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
 
   let running = false;
   let lastSessionId: string | null = null;
+  // Two controllers per turn (spec UI.md §3 soft/hard distinction):
+  //   abortController     → hard, preempts in-flight work (mid-tool kill,
+  //                         provider-stream cancel). Fires on second
+  //                         Esc/Ctrl+C, or first when the operator
+  //                         explicitly wants immediate cancellation.
+  //   softStopController  → cooperative, asks the loop to exit at the
+  //                         next step boundary. Fires on first Esc/Ctrl+C.
+  //                         Tool in flight finishes, results land,
+  //                         no next provider call.
+  // Both reset per-turn in startTurn so a soft-stop from a prior turn
+  // can't leak forward.
   let abortController: AbortController | null = null;
+  let softStopController: AbortController | null = null;
   // The promise returned by the in-flight runAgent (already wrapped
   // in `.catch().finally()`, so awaiting never throws). `shutdown`
   // awaits this before closing the DB so the harness's async cleanup
@@ -237,11 +249,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     if (running || exiting) return;
     running = true;
     abortController = new AbortController();
+    softStopController = new AbortController();
     const adapter = createHarnessAdapter(adapterCtxBase);
     const cfg: HarnessConfig = {
       ...baseConfig,
       userPrompt: text,
       signal: abortController.signal,
+      softStopSignal: softStopController.signal,
       onEvent: (e) => onHarnessEvent(adapter, e),
       confirmPermission,
       ...(lastSessionId !== null ? { resumeFromSessionId: lastSessionId } : {}),
@@ -264,6 +278,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       .finally(() => {
         running = false;
         abortController = null;
+        softStopController = null;
         runningPromise = null;
       });
   };
@@ -480,27 +495,27 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       requestShutdown();
     }
 
-    // Soft interrupt (single Esc) → emit interrupt UIEvent + abort
-    // the running turn. The UIEvent flips the footer cue from
-    // "esc to interrupt" to "esc again to force" via the reducer's
-    // softInterrupted flag (spec UI.md §4.10.6); the abort triggers
-    // the existing harness teardown path. Esc with no run in
-    // progress is a no-op (the editor's own slash-mode Esc handler
-    // already intercepted the keystroke before it reaches here).
+    // First Esc → cooperative soft stop: emit interrupt UIEvent
+    // (footer flips to "esc again to force") and abort the
+    // softStopController. Harness checks softStopSignal at the next
+    // step boundary — current tool finishes, results land, no next
+    // provider call (spec UI.md §3 soft semantics).
     //
-    // Second Esc while soft is already in flight promotes to a hard
-    // interrupt — honors the "esc again to FORCE" cue's promise on
-    // the event stream so audit can distinguish "operator nudged
-    // once" from "operator escalated". The reducer is no-op on
-    // hard today (D141); the harness's AbortController.abort() is
-    // already preemptive (cancels mid-tool at the next yield),
-    // matching what spec calls "hard". The cooperative
-    // step-boundary "soft" semantics live in a future slice — when
-    // they land, this branch already routes the right intent.
-    if (result.interruptSoft === true && running && abortController !== null) {
+    // Second Esc while softInterrupted is already true → hard
+    // interrupt: aborts the underlying signal, preempting in-flight
+    // work (mid-tool kill, provider stream cancel). Honors the
+    // "esc again to FORCE" cue's promise.
+    //
+    // Esc with no run in progress is a no-op (the editor's own
+    // slash-mode Esc handler intercepted before reaching here).
+    if (result.interruptSoft === true && running) {
       const level: 'soft' | 'hard' = renderer.state().softInterrupted ? 'hard' : 'soft';
       bus.emit({ type: 'interrupt', ts: now(), level });
-      abortController.abort();
+      if (level === 'hard' && abortController !== null) {
+        abortController.abort();
+      } else if (level === 'soft' && softStopController !== null) {
+        softStopController.abort();
+      }
     }
 
     return true;
@@ -524,17 +539,21 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // Ctrl+C in raw mode lands as a `cancelInput` editor signal,
   // SIGINT lands here. Both routes converge on the same outcome.
   //
-  // Mirror the Esc path's interrupt event so Ctrl+C and Esc reach
-  // parity on the footer cue (spec UI.md §5.4 treats both as
-  // soft-cancel; second tap as hard). Without the emit, Ctrl+C
-  // aborts silently and the operator never sees "esc again to force"
-  // — strictly worse UX than Esc and inconsistent with the spec's
-  // single-keybinding-pair model.
+  // Mirror the Esc path's soft/hard split so Ctrl+C and Esc share
+  // a single ladder (spec UI.md §5.4): first tap is cooperative
+  // (softStopController.abort), second tap is preemptive
+  // (abortController.abort). Without the parity, Ctrl+C would
+  // either always preempt (worse than Esc's cooperative first tap)
+  // or always be cooperative (no escape from a hung tool).
   const sigintHandler = (): void => {
-    if (running && abortController !== null) {
+    if (running) {
       const level: 'soft' | 'hard' = renderer.state().softInterrupted ? 'hard' : 'soft';
       bus.emit({ type: 'interrupt', ts: now(), level });
-      abortController.abort();
+      if (level === 'hard' && abortController !== null) {
+        abortController.abort();
+      } else if (level === 'soft' && softStopController !== null) {
+        softStopController.abort();
+      }
     } else {
       exitCode = 130;
       requestShutdown();
