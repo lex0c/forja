@@ -247,13 +247,14 @@ const TOOL_PREVIEW_MAX_LINES = 5;
 // (renderer.ts), and emit from the relevant `applyEvent` branch.
 export type PermanentItem =
   | {
-      kind: 'session-header';
-      sessionId: string;
-      profile: string;
-      project: string;
-      model: string;
+      kind: 'session-footer';
+      reason: string;
+      // Wall-clock duration of the run; mirrors SessionEndEvent.
+      // Renderer formats as `Cogitated for 1m23s` for `done`.
+      // Optional for legacy paths that don't track timing.
+      durationMs?: number;
+      abortCause?: 'soft' | 'hard';
     }
-  | { kind: 'session-footer'; reason: string; abortCause?: 'soft' | 'hard' }
   | {
       kind: 'session-banner';
       app: string;
@@ -348,6 +349,13 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       // bg manager would re-emit `bg:start` for surviving processes
       // on the new session_start). Today no path keeps bg alive
       // across sessions, so the reset is correct.
+      // No permanent emission (UI.md §3.2). The user-submit inverse
+      // bar (§4.10.8) already marks turn boundaries; emitting a
+      // session-header line per turn just clutters scrollback with
+      // the session UUID, which is operator-irrelevant in REPL mode
+      // (relevant only for offline resume / audit, looked up via
+      // separate CLI). Status state still updates so the footer
+      // shows the current model / steps / cost.
       return {
         state: {
           ...state,
@@ -362,15 +370,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
           bgProcesses: new Map(),
           ended: false,
         },
-        permanent: [
-          {
-            kind: 'session-header',
-            sessionId: event.sessionId,
-            profile: event.profile,
-            project: event.project,
-            model: event.model,
-          },
-        ],
+        permanent: [],
       };
     }
 
@@ -400,6 +400,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
           {
             kind: 'session-footer',
             reason: event.reason,
+            ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
             ...(event.abortCause !== undefined ? { abortCause: event.abortCause } : {}),
           },
         ],

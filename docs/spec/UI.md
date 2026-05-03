@@ -131,8 +131,8 @@ Implementação: `EventEmitter` nativo do Node/Bun. Não usar `mitt` ou similar 
 
 | Evento | Quando | Renderer reage |
 |---|---|---|
-| `session:start` | Início da sessão | imprime cabeçalho permanente |
-| `session:end` | Fim da sessão | imprime sumário permanente |
+| `session:start` | Início da sessão (cada turn em REPL, único em one-shot) | atualiza status interno (sessionId, profile, model, planMode, projeto); reseta flags per-session (softInterrupted, exitArmed, bgProcesses). **Sem permanente em scrollback** — o user-submit inverse bar (§4.10.8) já marca início de turno; cabeçalho com session UUID seria ruído por turno em REPL e não agrega info útil ao operator (UUID interessa só pra resume/audit, lookup feito via CLI separada). |
+| `session:end` | Fim da sessão | imprime marcador final em scrollback: linha em branco + verbo terminal com **duração wall-clock** quando disponível: `Cogitated for 1m23s` (done) / `Aborted (soft) after 12s` / `Failed after 8s` / `Stopped (max steps) after 1m` / `Stopped (max cost) after 1m`. Sem duração (legacy/replay): cai pra forma curta `Cogitated.` / `Aborted.` / `Failed.` etc. Formato curto, sem régua decorativa nem session UUID — o boundary é visível e a duração responde "quanto tempo isso levou?" sem o operator ter que olhar o footer ou procurar elsewhere. |
 | `user:submit` | User pressiona Enter | imprime echo permanente; limpa input |
 | `assistant:start` | Provider começa a streamar | abre buffer vivo de mensagem |
 | `assistant:delta` | Cada chunk de texto | append no buffer; redraw |
@@ -241,7 +241,7 @@ Mais de 8 todos: trunca pra "▶ running + próximas 2 pending + ✗ failed", co
 
 ### 4.4 Status line (sempre presente, 1 linha)
 
-> **Supersedido pela §4.10.6 (footer dinâmico).** A "status line acima do input" foi reposicionada como **footer** abaixo do input box, com layout de duas colunas (hint + config). Conteúdo é equivalente; posição e shape mudaram. Esta seção fica como referência do conteúdo (model, steps, cost, badges) — a posição canônica é §4.10.6.
+> **Removida.** A "status line acima do input" foi absorvida pelo footer §4.10.6, que já mostra `model · [plan] · steps/max · cost · [bg N]` no canto direito. Renderer não emite mais uma linha separada — duplicar info em duas posições só consome espaço vertical (e em REPL com input outdented §6.3, a linha de status no fim da live region competia visualmente com o próprio input, sem ganho informativo). Seção mantida aqui como histórico de design; conteúdo canônico está em §4.10.6.
 
 ```
 [autonomous] · forja · sonnet-4.6 · 12/50 · $0.04 · mem 4u · bg 1
@@ -381,7 +381,7 @@ Verbo no presente contínuo enquanto ativo. Particípio passado quando completo.
 
 | Operação | Ativo | Finalizado |
 |---|---|---|
-| Provider call (texto streaming) | `Generating… (8s · ↑ 234 tokens)` | `Generated 234 tokens in 8.2s` |
+| Provider call (texto streaming) | `Generating… (8s · ↑ 234 tokens)` | (suprimido — assistant turn não imprime chip final, só a prosa direto; duração vai no marcador de fim de turno §3.2 `Cogitated for X`, contagem de tokens vai no footer §4.10.6) |
 | Extended thinking | `Thinking… (3s)` | `Thought for 3.1s` |
 | Tool execution | per-tool verb (§4.10.4) | per-tool verb (§4.10.4) |
 | Compaction | `Compacting context… (12s)` | `Compacted 12 messages in 850ms` |
@@ -559,7 +559,7 @@ Banidos do vocabulário operacional:
 - `Working`, `Loading`, `Processing`, `Please wait` — vagos.
 - `Handling`, `Managing`, `Orchestrating` — abstratos.
 - `Just a moment…`, `Working on it…` — cortesia, desperdício de coluna.
-- `Ready!`, `Done!`, `Success!` — redundantes; ausência de chip ativo já comunica.
+- `Ready!`, `Done!`, `Success!` (com **exclamação**) — banidos como **status messages durante operação**. O **marcador de fim de turno** em scrollback (§3.2 `session:end`) usa verbo no particípio passado + duração wall-clock: `Cogitated for 1m23s` (done) / `Aborted after 12s` / `Failed after 8s` / `Stopped (max steps) after 1m`. Verbo concreto + número responde "quanto tempo o turno levou?" sem entusiasmo nem duplicação com o footer. Sem duração disponível (legacy/replay): forma curta `Cogitated.` / `Aborted.` / `Failed.`
 - Emoji decorativo (✓ ✗ ⚠️ 🔧 💭 🚀) — depende de fonte/terminal, conflita com paleta dim. Glyphs canônicos da §6.2 são exceção (são informativos, não decorativos).
 - Metáforas culinárias/artesanais ("Baking", "Cooking", "Brewing", "Forging") — engenheiro lê verbo literal melhor que metáfora.
 - Mascote, ícones de marca, logo — fora de escopo do core; flag opcional se virar pauta.
@@ -575,12 +575,15 @@ Banidos do vocabulário operacional:
 │                                                                     │
 │   policy: project (5 rules) · subagents: 2 · ✓ checkpoints          │
 │                                                                     │
+│                                                 ← blank (turn boundary) │
 │   > a tui já funciona?                          ← inverse bar (§4.10.8) │
+│                                                 ← blank             │
 │   * Reading file (2.4kB)                        ← chip final, dim   │
 │   └─ src/foo.ts                                                     │
-│   * Generated 234 tokens in 8.2s                                    │
+│                                                 ← blank             │
 │   Sim, em teoria funciona...                    ← assistant text    │
-│   ── step 3/50 ── $0.012 ──                     ← step separator    │
+│                                                 ← blank             │
+│   Cogitated for 8.2s                            ← turn-end (§3.2)   │
 └─────────────────────────────────────────────────────────────────────┘
 ─────────────────────────────────────────────────────────────────────  ← régua (full width, col 0)
 > ▌                                                                   ← input + cursor (col 0)

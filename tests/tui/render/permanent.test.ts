@@ -1,6 +1,5 @@
 import { describe, expect, test } from 'bun:test';
 import { formatPermanent } from '../../../src/tui/render/permanent.ts';
-import type { PermanentItem } from '../../../src/tui/state.ts';
 import { CSI, type Capabilities } from '../../../src/tui/term.ts';
 
 const ascii: Capabilities = {
@@ -19,39 +18,127 @@ const colored: Capabilities = { ...unicode, color: 'basic' };
 const pad = (s: string): string => `  ${s}`;
 
 describe('formatPermanent', () => {
-  test('session-header renders a single line with sessionId, profile, model', () => {
-    const item: PermanentItem = {
-      kind: 'session-header',
-      sessionId: 's1',
-      profile: 'autonomous',
-      project: 'forja',
-      model: 'opus',
-    };
-    expect(formatPermanent(item, ascii)).toEqual([pad('── session s1 · autonomous · opus ──')]);
-  });
+  // session-header was removed (UI.md §3.2): emitting a UUID-bearing
+  // header per turn just clutters scrollback. The kind is gone from
+  // PermanentItem entirely; producer (state.ts session:start) emits
+  // an empty permanent array. No render coverage needed.
 
-  test('session-footer renders the reason', () => {
-    expect(formatPermanent({ kind: 'session-footer', reason: 'done' }, ascii)).toEqual([
-      pad('── session end · done ──'),
-    ]);
-  });
+  describe('session-footer (turn-end marker, UI.md §3.2)', () => {
+    // Spec change: session-footer renders as a blank line + verb +
+    // wall-clock duration (`Cogitated for 1m23s`, `Aborted after 12s`,
+    // etc). Both lines respect the §6.3 frame margin. When `durationMs`
+    // is absent (legacy / replay), falls back to short form.
 
-  test('session-footer with abortCause appends the discriminator (1.g.3)', () => {
-    expect(
-      formatPermanent({ kind: 'session-footer', reason: 'aborted', abortCause: 'soft' }, ascii),
-    ).toEqual([pad('── session end · aborted (soft) ──')]);
-    expect(
-      formatPermanent({ kind: 'session-footer', reason: 'aborted', abortCause: 'hard' }, ascii),
-    ).toEqual([pad('── session end · aborted (hard) ──')]);
-  });
+    test('done with duration → `Cogitated for X`', () => {
+      // 8.2s: 8200ms ≈ 8s rounded.
+      expect(
+        formatPermanent({ kind: 'session-footer', reason: 'done', durationMs: 8200 }, ascii),
+      ).toEqual([pad(''), pad('Cogitated for 8s')]);
+    });
 
-  test('session-footer abortCause on a non-abort reason is dropped (defensive)', () => {
-    // Producer guarantees abortCause is only set when reason==='aborted',
-    // but the renderer doesn't trust that — a mis-routed combination
-    // shouldn't render misleading text like `done (soft)`.
-    expect(
-      formatPermanent({ kind: 'session-footer', reason: 'done', abortCause: 'soft' }, ascii),
-    ).toEqual([pad('── session end · done ──')]);
+    test('done with sub-second duration → `Cogitated for Xms`', () => {
+      expect(
+        formatPermanent({ kind: 'session-footer', reason: 'done', durationMs: 450 }, ascii),
+      ).toEqual([pad(''), pad('Cogitated for 450ms')]);
+    });
+
+    test('done with multi-minute duration → `Cogitated for XmYs`', () => {
+      // 13m21s = 801000ms.
+      expect(
+        formatPermanent({ kind: 'session-footer', reason: 'done', durationMs: 801000 }, ascii),
+      ).toEqual([pad(''), pad('Cogitated for 13m21s')]);
+    });
+
+    test('done with exact-minute duration drops the seconds clause', () => {
+      // 2m exactly = 120000ms.
+      expect(
+        formatPermanent({ kind: 'session-footer', reason: 'done', durationMs: 120000 }, ascii),
+      ).toEqual([pad(''), pad('Cogitated for 2m')]);
+    });
+
+    test('done WITHOUT duration → short `Cogitated.` fallback', () => {
+      expect(formatPermanent({ kind: 'session-footer', reason: 'done' }, ascii)).toEqual([
+        pad(''),
+        pad('Cogitated.'),
+      ]);
+    });
+
+    test('aborted (soft) with duration → `Aborted (soft) after X`', () => {
+      expect(
+        formatPermanent(
+          { kind: 'session-footer', reason: 'aborted', abortCause: 'soft', durationMs: 12000 },
+          ascii,
+        ),
+      ).toEqual([pad(''), pad('Aborted (soft) after 12s')]);
+    });
+
+    test('aborted (hard) with duration → `Aborted (hard) after X`', () => {
+      expect(
+        formatPermanent(
+          { kind: 'session-footer', reason: 'aborted', abortCause: 'hard', durationMs: 12000 },
+          ascii,
+        ),
+      ).toEqual([pad(''), pad('Aborted (hard) after 12s')]);
+    });
+
+    test('aborted without cause WITH duration → `Aborted after X` (no parens)', () => {
+      expect(
+        formatPermanent({ kind: 'session-footer', reason: 'aborted', durationMs: 5000 }, ascii),
+      ).toEqual([pad(''), pad('Aborted after 5s')]);
+    });
+
+    test('aborted WITHOUT duration → short `Aborted.` fallback', () => {
+      expect(formatPermanent({ kind: 'session-footer', reason: 'aborted' }, ascii)).toEqual([
+        pad(''),
+        pad('Aborted.'),
+      ]);
+    });
+
+    test('error with duration → `Failed after X`', () => {
+      expect(
+        formatPermanent({ kind: 'session-footer', reason: 'error', durationMs: 8000 }, ascii),
+      ).toEqual([pad(''), pad('Failed after 8s')]);
+    });
+
+    test('maxSteps with duration → `Stopped (max steps) after X`', () => {
+      expect(
+        formatPermanent({ kind: 'session-footer', reason: 'maxSteps', durationMs: 60000 }, ascii),
+      ).toEqual([pad(''), pad('Stopped (max steps) after 1m')]);
+    });
+
+    test('maxCostUsd with duration → `Stopped (max cost) after X`', () => {
+      expect(
+        formatPermanent({ kind: 'session-footer', reason: 'maxCostUsd', durationMs: 60000 }, ascii),
+      ).toEqual([pad(''), pad('Stopped (max cost) after 1m')]);
+    });
+
+    test('abortCause on a non-abort reason is dropped (defensive)', () => {
+      // Producer guarantees abortCause is only set when
+      // reason==='aborted', but the renderer doesn't trust that —
+      // a stray cause on `done` shouldn't leak into the output.
+      expect(
+        formatPermanent(
+          { kind: 'session-footer', reason: 'done', abortCause: 'soft', durationMs: 1000 },
+          ascii,
+        ),
+      ).toEqual([pad(''), pad('Cogitated for 1s')]);
+    });
+
+    test('unknown reason capitalizes + duration (graceful unknown)', () => {
+      // If a future producer emits a reason this renderer doesn't
+      // know, capitalize and append duration. Without duration, fall
+      // back to `Capitalized.` so the marker stays grammatical.
+      expect(
+        formatPermanent(
+          { kind: 'session-footer', reason: 'somethingNew', durationMs: 3000 },
+          ascii,
+        ),
+      ).toEqual([pad(''), pad('SomethingNew after 3s')]);
+      expect(formatPermanent({ kind: 'session-footer', reason: 'somethingNew' }, ascii)).toEqual([
+        pad(''),
+        pad('SomethingNew.'),
+      ]);
+    });
   });
 
   describe('session-banner (UI.md §4.10.9 — 3 blocks)', () => {
@@ -164,6 +251,10 @@ describe('formatPermanent', () => {
     // runs from col 2 to col cols-1. The 2sp prefix is OUTSIDE the
     // SGR 7 wrap (normal-bg space, not inverse) so the bar starts
     // visibly at col 2, aligned with the rest of the padded content.
+    //
+    // Leading blank line per UI.md §6.3 — separates each turn from
+    // the previous one (Done. → blank → > prompt). out[0] is the
+    // blank (just the frame margin); out[1..] are the inverse bars.
     const REVERSE_OPEN = '\x1b[7m';
     const RESET = '\x1b[0m';
     // Line shape: '  ' (frame margin) + REVERSE_OPEN + content + RESET.
@@ -171,26 +262,28 @@ describe('formatPermanent', () => {
     const innerOf = (line: string): string =>
       line.slice('  '.length + REVERSE_OPEN.length, -RESET.length);
 
-    test('line is `frame margin + reversed (cols-2)-padded content`', () => {
+    test('emits leading blank + reversed (cols-2)-padded content', () => {
       const out = formatPermanent({ kind: 'user-submit', text: 'hi' }, ascii);
-      expect(out).toHaveLength(1);
-      const line = out[0] ?? '';
+      expect(out).toHaveLength(2);
+      expect(out[0]).toBe(pad(''));
+      const line = out[1] ?? '';
       expect(line.startsWith(`  ${REVERSE_OPEN}`)).toBe(true);
       expect(line.endsWith(RESET)).toBe(true);
       expect(innerOf(line)).toBe('> hi'.padEnd(ascii.cols - 2));
     });
 
-    test('multi-line submit applies > on first line, two-space continuation, padded each', () => {
+    test('multi-line submit: blank + first line with `>`, continuations with `  `', () => {
       const out = formatPermanent({ kind: 'user-submit', text: 'first\nsecond\nthird' }, ascii);
-      expect(out).toHaveLength(3);
-      const inners = out.map(innerOf);
+      expect(out).toHaveLength(4);
+      expect(out[0]).toBe(pad(''));
+      const inners = out.slice(1).map(innerOf);
       expect(inners).toEqual([
         '> first'.padEnd(ascii.cols - 2),
         '  second'.padEnd(ascii.cols - 2),
         '  third'.padEnd(ascii.cols - 2),
       ]);
-      // Each line independently wrapped in frame margin + SGR 7 + reset.
-      for (const l of out) {
+      // Each bar line independently wrapped in frame margin + SGR 7 + reset.
+      for (const l of out.slice(1)) {
         expect(l.startsWith(`  ${REVERSE_OPEN}`)).toBe(true);
         expect(l.endsWith(RESET)).toBe(true);
       }
@@ -199,7 +292,7 @@ describe('formatPermanent', () => {
     test('reverse is emitted even when caps.color is "none" (attribute, not color)', () => {
       // ascii uses color: 'none'. Reverse must still emit per spec.
       const out = formatPermanent({ kind: 'user-submit', text: 'x' }, ascii);
-      expect((out[0] ?? '').includes(REVERSE_OPEN)).toBe(true);
+      expect((out[1] ?? '').includes(REVERSE_OPEN)).toBe(true);
     });
 
     test('text wider than caps.cols is not padded (negative pad clamps to 0)', () => {
@@ -207,29 +300,42 @@ describe('formatPermanent', () => {
       const out = formatPermanent({ kind: 'user-submit', text: 'a long input' }, narrow);
       // Inner content keeps the original text without truncation;
       // truncation is the renderer's job (truncateToWidth).
-      expect(innerOf(out[0] ?? '')).toBe('> a long input');
+      expect(innerOf(out[1] ?? '')).toBe('> a long input');
     });
   });
 
-  test('assistant without duration/tokens just splits text (legacy/replay path)', () => {
+  // Assistant kind emits just the AI prose, prepended with a blank
+  // line (UI.md §6.3). The legacy `· Generated N tokens in Xs` chip
+  // header was removed — duration lives in the turn-end marker
+  // (`Cogitated for Xs`) and tokens live in the footer's right
+  // column. The chip header was duplicating both signals.
+
+  test('assistant emits blank + text lines (single-line)', () => {
+    const out = formatPermanent(
+      { kind: 'assistant', text: 'hello', durationMs: 8200, outputTokens: 234 },
+      ascii,
+    );
+    // Blank + text. Chip header gone — durationMs / outputTokens
+    // come through but render path ignores them.
+    expect(out).toEqual([pad(''), pad('hello')]);
+  });
+
+  test('assistant emits blank + each text line (multi-line)', () => {
     expect(
       formatPermanent(
-        { kind: 'assistant', text: 'line1\nline2', durationMs: null, outputTokens: null },
+        { kind: 'assistant', text: 'line1\nline2', durationMs: 1000, outputTokens: 50 },
         ascii,
       ),
-    ).toEqual([pad('line1'), pad('line2')]);
+    ).toEqual([pad(''), pad('line1'), pad('line2')]);
   });
 
-  test('assistant with empty text + chip metadata emits header only (tool-only turn)', () => {
-    // A turn that streamed tool_use blocks but no prose still spent
-    // output tokens — operator should see the cost signal as a chip
-    // line. Header alone, no text lines.
+  test('assistant with empty text emits nothing (regardless of metadata)', () => {
+    // Tool-only turn: the model produced tool_use blocks but no
+    // prose. Cost is in the footer + tool-end chips already; no
+    // need for a permanent chip-only line in scrollback.
     expect(
       formatPermanent({ kind: 'assistant', text: '', durationMs: 8200, outputTokens: 234 }, ascii),
-    ).toEqual([pad('* Generated 234 tokens in 8.2s')]);
-  });
-
-  test('assistant with empty text + no metadata emits nothing (degenerate guard)', () => {
+    ).toEqual([]);
     expect(
       formatPermanent({ kind: 'assistant', text: '', durationMs: null, outputTokens: null }, ascii),
     ).toEqual([]);
@@ -238,49 +344,37 @@ describe('formatPermanent', () => {
   test('assistant with trailing newline emits an explicit empty trailing line', () => {
     // Documents current behavior: text with a trailing `\n` becomes
     // [content, ''] after split. Provider streams typically don't end
-    // with a newline; if a future producer does, we may want to filter
-    // (matching `appendPreview` for tool deltas). Locking the behavior
-    // makes that future change visible.
+    // with a newline; if a future producer does, we may want to filter.
     expect(
       formatPermanent(
         { kind: 'assistant', text: 'foo\n', durationMs: null, outputTokens: null },
         ascii,
       ),
-    ).toEqual([pad('foo'), pad('')]);
+    ).toEqual([pad(''), pad('foo'), pad('')]);
   });
 
-  test('assistant with duration + tokens emits chip header above text (UI.md §4.10.5)', () => {
+  test('assistant ignores durationMs/outputTokens (chip header removed)', () => {
+    // Before the spec change a turn with metadata produced a
+    // `· Generated N tokens in Xs` header above the text. Pin the
+    // contract that the header is gone — if a future refactor
+    // brings it back, this test catches it.
     const out = formatPermanent(
-      { kind: 'assistant', text: 'hello', durationMs: 8200, outputTokens: 234 },
+      { kind: 'assistant', text: 'hi', durationMs: 8200, outputTokens: 234 },
       ascii,
     );
-    // Header + text. ASCII glyph for the chip is `*`.
-    expect(out).toHaveLength(2);
-    expect(out[0]).toBe(pad('* Generated 234 tokens in 8.2s'));
-    expect(out[1]).toBe(pad('hello'));
-  });
-
-  test('assistant with duration only (no usage) drops the token clause', () => {
-    const out = formatPermanent(
-      { kind: 'assistant', text: 'hi', durationMs: 450, outputTokens: null },
-      ascii,
-    );
-    // Sub-second duration renders in ms.
-    expect(out[0]).toBe(pad('* Generated in 450ms'));
-    expect(out[1]).toBe(pad('hi'));
-  });
-
-  test('assistant with tokens only (no duration) drops the duration clause', () => {
-    const out = formatPermanent(
-      { kind: 'assistant', text: 'hi', durationMs: null, outputTokens: 50 },
-      ascii,
-    );
-    expect(out[0]).toBe(pad('* Generated 50 tokens'));
-    expect(out[1]).toBe(pad('hi'));
+    expect(out.join('\n')).not.toContain('Generated');
+    expect(out.join('\n')).not.toContain('tokens');
+    expect(out.join('\n')).not.toContain('8.2s');
   });
 
   describe('tool-end (operation chip + sub-content, UI.md §4.10.5/§4.10.7)', () => {
-    test('done status uses the per-tool finalVerb plus duration', () => {
+    // Tool-end prepends a leading blank (UI.md §6.3) — each tool
+    // finalization is its own "session" block. out[0] is the blank,
+    // out[1] is the chip head, out[2] (when present) is the
+    // sub-content connector. Sub-content stays tight under the
+    // chip — it's the chip's "subsession", not a sibling block.
+
+    test('done status: blank + chip head + sub-content', () => {
       const out = formatPermanent(
         {
           kind: 'tool-end',
@@ -292,14 +386,13 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      // Chip head: `· Read file in 850ms`. Sub-content: `└─ /foo.ts`.
-      // Both lines padded with the §6.3 frame margin.
-      expect(out).toHaveLength(2);
-      expect(out[0]).toBe(pad('· Read file in 850ms'));
-      expect(out[1]).toBe(pad('└─ /foo.ts'));
+      expect(out).toHaveLength(3);
+      expect(out[0]).toBe(pad(''));
+      expect(out[1]).toBe(pad('· Read file in 850ms'));
+      expect(out[2]).toBe(pad('└─ /foo.ts'));
     });
 
-    test('done status with no subject emits only the chip head (no connector line)', () => {
+    test('done status with no subject emits blank + chip head only', () => {
       const out = formatPermanent(
         {
           kind: 'tool-end',
@@ -311,7 +404,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out).toEqual([pad('· Updated todos in 50ms')]);
+      expect(out).toEqual([pad(''), pad('· Updated todos in 50ms')]);
     });
 
     test('error status overrides verb to "Failed" regardless of vocab', () => {
@@ -326,9 +419,10 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[0]).toContain('Failed in 200ms');
-      expect(out[0]).not.toContain('Executed');
-      expect(out[1]).toBe(pad('└─ rm -rf /tmp/x'));
+      expect(out[0]).toBe(pad(''));
+      expect(out[1]).toContain('Failed in 200ms');
+      expect(out[1]).not.toContain('Executed');
+      expect(out[2]).toBe(pad('└─ rm -rf /tmp/x'));
     });
 
     test('denied status overrides verb to "Denied"', () => {
@@ -343,7 +437,7 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out[0]).toContain('Denied in 1ms');
+      expect(out[1]).toContain('Denied in 1ms');
     });
 
     test('denied status with summary surfaces the policy reason as sub-content', () => {
@@ -361,7 +455,7 @@ describe('formatPermanent', () => {
       );
       // Summary takes precedence over subject for denied (the
       // operator wants the reason, not the rejected command echo).
-      expect(out[1]).toBe(pad('└─ matches deny rule bash.rm.rf'));
+      expect(out[2]).toBe(pad('└─ matches deny rule bash.rm.rf'));
     });
 
     test('summary fills in for sub-content when subject is null', () => {
@@ -377,8 +471,8 @@ describe('formatPermanent', () => {
         },
         unicode,
       );
-      expect(out).toHaveLength(2);
-      expect(out[1]).toBe(pad('└─ 3 items added'));
+      expect(out).toHaveLength(3);
+      expect(out[2]).toBe(pad('└─ 3 items added'));
     });
 
     test('chip glyph is `·` under Unicode, `*` under ASCII (after frame margin)', () => {
@@ -404,9 +498,10 @@ describe('formatPermanent', () => {
         },
         ascii,
       );
-      // Glyph sits at column 2 (after the 2sp frame margin).
-      expect(u[0]?.charAt(2)).toBe('·');
-      expect(a[0]?.charAt(2)).toBe('*');
+      // Glyph sits at column 2 (after the 2sp frame margin) on the
+      // chip head row (out[1] — out[0] is the leading blank).
+      expect(u[1]?.charAt(2)).toBe('·');
+      expect(a[1]?.charAt(2)).toBe('*');
     });
 
     test('connector is `└─ ` under Unicode, `\\- ` under ASCII', () => {
@@ -432,8 +527,8 @@ describe('formatPermanent', () => {
         },
         ascii,
       );
-      expect(u[1]).toBe(pad('└─ /x'));
-      expect(a[1]).toBe(pad('\\- /x'));
+      expect(u[2]).toBe(pad('└─ /x'));
+      expect(a[2]).toBe(pad('\\- /x'));
     });
 
     test('duration uses ms below 1s, s above', () => {
@@ -459,8 +554,8 @@ describe('formatPermanent', () => {
         },
         ascii,
       );
-      expect(fast[0]).toContain('850ms');
-      expect(slow[0]).toContain('1.2s');
+      expect(fast[1]).toContain('850ms');
+      expect(slow[1]).toContain('1.2s');
     });
 
     test('error status applies error palette SGR to chip head when color enabled', () => {
@@ -475,7 +570,7 @@ describe('formatPermanent', () => {
         },
         colored,
       );
-      expect(out[0]).toContain(`${CSI}31m`);
+      expect(out[1]).toContain(`${CSI}31m`);
     });
 
     test('done status applies dim palette SGR to chip head when color enabled', () => {
@@ -483,21 +578,30 @@ describe('formatPermanent', () => {
         { kind: 'tool-end', name: 'r', verb: 'Read', subject: null, status: 'done', durationMs: 1 },
         colored,
       );
-      expect(out[0]).toContain(`${CSI}2m`);
+      expect(out[1]).toContain(`${CSI}2m`);
     });
   });
 
+  // error / warn / info also prepend a leading blank — each is a
+  // top-level "session" block deserving its own breathing space.
+
   test('error and warn pass through as plain text when color disabled', () => {
     expect(formatPermanent({ kind: 'error', message: 'down' }, ascii)).toEqual([
+      pad(''),
       pad('error: down'),
     ]);
-    expect(formatPermanent({ kind: 'warn', message: 'high' }, ascii)).toEqual([pad('warn: high')]);
+    expect(formatPermanent({ kind: 'warn', message: 'high' }, ascii)).toEqual([
+      pad(''),
+      pad('warn: high'),
+    ]);
   });
 
   test('error and warn are wrapped in SGR escapes when color enabled', () => {
     const errored = formatPermanent({ kind: 'error', message: 'down' }, colored);
-    expect(errored[0]).toBe(pad(`${CSI}31merror: down${CSI}0m`));
+    expect(errored[0]).toBe(pad(''));
+    expect(errored[1]).toBe(pad(`${CSI}31merror: down${CSI}0m`));
     const warned = formatPermanent({ kind: 'warn', message: 'high' }, colored);
-    expect(warned[0]).toBe(pad(`${CSI}33mwarn: high${CSI}0m`));
+    expect(warned[0]).toBe(pad(''));
+    expect(warned[1]).toBe(pad(`${CSI}33mwarn: high${CSI}0m`));
   });
 });

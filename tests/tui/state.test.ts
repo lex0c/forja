@@ -30,7 +30,12 @@ const drive = (events: UIEvent[]): { state: LiveState; permanent: PermanentItem[
 };
 
 describe('session lifecycle', () => {
-  test('session:start populates status fields and emits a header item', () => {
+  test('session:start populates status fields and emits NO permanent (UI.md §3.2)', () => {
+    // Spec change: session:start no longer prints a session-header
+    // line. The user-submit inverse bar (§4.10.8) marks turn
+    // boundaries; UUID-bearing rules per turn just clutter scrollback.
+    // Status state still updates so the footer can show model / steps
+    // / cost on the right column.
     const r = applyEvent(createInitialState(), start());
     expect(r.state.status.sessionId).toBe('s1');
     expect(r.state.status.profile).toBe('autonomous');
@@ -38,15 +43,7 @@ describe('session lifecycle', () => {
     expect(r.state.status.model).toBe('claude-opus-4-7');
     expect(r.state.status.planMode).toBe(false);
     expect(r.state.ended).toBe(false);
-    expect(r.permanent).toEqual([
-      {
-        kind: 'session-header',
-        sessionId: 's1',
-        profile: 'autonomous',
-        project: 'forja',
-        model: 'claude-opus-4-7',
-      },
-    ]);
+    expect(r.permanent).toEqual([]);
   });
 
   test('session:start with planMode=true flips status.planMode', () => {

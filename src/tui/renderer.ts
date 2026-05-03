@@ -294,11 +294,14 @@ export const createRenderer = (options: RendererOptions): Renderer => {
     if (closed) return;
     let buf = buildErase();
     buf += buildPermanent(permanent);
-    if (state.ended) {
-      prevLines = [];
-      if (buf.length > 0) write(wrapSync(buf));
-      return;
-    }
+    // Always redraw the live region after a permanent emit. Earlier
+    // this branch short-circuited on `state.ended` so session:end
+    // wouldn't redraw input/footer, but that left the input box
+    // invisible for the gap between session:end and the next
+    // user:submit (operator typing in the dark). Now the live region
+    // stays present; the next user prompt naturally lands on a
+    // visible input box. The renderer's `closed` flag handles
+    // teardown for one-shot mode (close() erases the live region).
     const raw = composeLive(state, liveCaps, now());
     const truncated = raw.map((l) => truncateToWidth(l, liveCaps.cols));
     buf += buildFullDraw(truncated);
@@ -319,16 +322,10 @@ export const createRenderer = (options: RendererOptions): Renderer => {
   // stay untouched and the terminal never repaints them.
   const redraw = (): void => {
     if (closed) return;
-    if (state.ended) {
-      const buf = buildErase();
-      if (buf.length > 0) write(wrapSync(buf));
-      prevLines = [];
-      return;
-    }
     const raw = composeLive(state, liveCaps, now());
     const truncated = raw.map((l) => truncateToWidth(l, liveCaps.cols));
 
-    // Empty live region — same as ended.
+    // Empty live region — just erase.
     if (truncated.length === 0) {
       const buf = buildErase();
       if (buf.length > 0) write(wrapSync(buf));

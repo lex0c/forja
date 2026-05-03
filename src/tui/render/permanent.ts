@@ -42,18 +42,60 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
   // still reads as a blank line visually but keeps cursor accounting
   // honest if the renderer ever uses these for column math.
   switch (item.kind) {
-    case 'session-header':
-      return [`── session ${item.sessionId} · ${item.profile} · ${item.model} ──`].map(padFrame);
     case 'session-footer': {
-      // 1.g.3 closes D171: when the run aborted, append the cause
-      // discriminator so the operator sees `aborted (soft)` vs
-      // `aborted (hard)` in scrollback. The producer guarantees
-      // abortCause is only set when reason === 'aborted', but the
-      // render branches defensively on both — a stray abortCause on
-      // a non-abort reason shouldn't render misleading text.
-      const cause =
-        item.reason === 'aborted' && item.abortCause !== undefined ? ` (${item.abortCause})` : '';
-      return [`── session end · ${item.reason}${cause} ──`].map(padFrame);
+      // UI.md §3.2 turn-end marker: blank line + the terminal verb.
+      // The verb shape depends on `reason`:
+      //
+      //   done       → `Cogitated for 1m23s`     (or `Cogitated for 450ms` short turns)
+      //   aborted    → `Aborted (soft) after 12s` / `Aborted (hard) after 12s`
+      //                or `Aborted after 12s` if cause unknown
+      //   error      → `Failed after 12s`        (operator-speak)
+      //   maxSteps   → `Stopped (max steps) after 1m23s`
+      //   maxCostUsd → `Stopped (max cost) after 1m23s`
+      //   unknown    → `Capitalized after Xs`
+      //
+      // Duration is plumbed from `HarnessResult.durationMs` via the
+      // session:end event. When it's missing (legacy / replay), we
+      // fall back to the bare verb (`Cogitated.`, `Aborted.` etc)
+      // so the marker stays grammatical.
+      //
+      // §4.10.11 anti-vocabulario: `Done!` (with !) is banido. The
+      // `Cogitated for X` shape avoids the static "Done." while
+      // surfacing useful info — wall-clock time the model spent on
+      // the turn — which the operator likely wants to see anyway.
+      const dur = item.durationMs;
+      const formatDuration = (ms: number): string => {
+        if (ms < 1000) return `${ms}ms`;
+        const totalSec = Math.round(ms / 1000);
+        if (totalSec < 60) return `${totalSec}s`;
+        const m = Math.floor(totalSec / 60);
+        const s = totalSec % 60;
+        return s === 0 ? `${m}m` : `${m}m${s}s`;
+      };
+      const tail = dur !== undefined ? ` ${formatDuration(dur)}` : '';
+      const verb = (() => {
+        switch (item.reason) {
+          case 'done':
+            return dur !== undefined ? `Cogitated for ${formatDuration(dur)}` : 'Cogitated.';
+          case 'aborted': {
+            const cause = item.abortCause !== undefined ? ` (${item.abortCause})` : '';
+            return dur !== undefined ? `Aborted${cause} after${tail}` : `Aborted${cause}.`;
+          }
+          case 'error':
+            return dur !== undefined ? `Failed after${tail}` : 'Failed.';
+          case 'maxSteps':
+            return dur !== undefined ? `Stopped (max steps) after${tail}` : 'Stopped (max steps).';
+          case 'maxCostUsd':
+            return dur !== undefined ? `Stopped (max cost) after${tail}` : 'Stopped (max cost).';
+          default: {
+            // Unknown reason — capitalize first letter; append
+            // duration if known, period otherwise.
+            const cap = `${item.reason.charAt(0).toUpperCase()}${item.reason.slice(1)}`;
+            return dur !== undefined ? `${cap} after${tail}` : `${cap}.`;
+          }
+        }
+      })();
+      return ['', verb].map(padFrame);
     }
     case 'session-banner': {
       // UI.md §4.10.9. Three blocks separated by blank lines:
@@ -98,9 +140,16 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // SGR 7 wrap: 2sp of normal-bg space, then the inverse bar
       // from col 2 to col cols-1. The bar is padded internally to
       // `cols - 2` so the inverse extends to the right edge.
+      //
+      // Leading blank line per UI.md §6.3 ("1 blank line entre blocos
+      // permanentes") — separates the new turn from whatever came
+      // before (previous turn's `Done.`, the welcome banner, an
+      // error). Combined with session-footer's leading blank, the
+      // turn rhythm becomes `Done. → blank → > prompt → content`,
+      // which scans cleanly when the operator scrolls.
       const prefixed = item.text.split('\n').map((l, i) => (i === 0 ? `> ${l}` : `  ${l}`));
       const innerWidth = frameWidth(caps);
-      return prefixed.map((line) => {
+      const bars = prefixed.map((line) => {
         // padEnd pads code units; for plain ASCII text that matches
         // visual columns. CJK / emoji content would over-pad —
         // accept the small inconsistency until visualWidth-aware
@@ -108,39 +157,24 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         const padded = line + ' '.repeat(Math.max(0, innerWidth - visualWidth(line)));
         return `${FRAME_MARGIN}${reverse(padded)}`;
       });
+      return [padFrame(''), ...bars];
     }
     case 'assistant': {
-      // Spec UI.md §4.10.5: final scrollback line is
-      // `· Generated 234 tokens in 8.2s` above the assistant text.
-      // Three modes:
-      //   1. text + chip metadata → header line + text lines (standard turn).
-      //   2. text + no metadata    → text only (headless replay / synthetic).
-      //   3. empty text + metadata → header only (tool-only turn — model
-      //      spent tokens generating tool_use blocks but no prose; the
-      //      operator should still see the cost signal as a chip line).
-      //   4. empty text + no metadata → nothing (degenerate; reducer
-      //      should never emit this combo, but guard anyway).
-      const hasMetadata = item.durationMs !== null || item.outputTokens !== null;
-      if (item.text.length === 0 && !hasMetadata) return [];
-      const textLines = item.text.length === 0 ? [] : item.text.split('\n');
-      if (!hasMetadata) return textLines.map(padFrame);
-      const glyph = caps.unicode ? CHIP_FINAL_GLYPH.unicode : CHIP_FINAL_GLYPH.ascii;
-      const ms =
-        item.durationMs === null
-          ? null
-          : item.durationMs >= 1000
-            ? `${(item.durationMs / 1000).toFixed(1)}s`
-            : `${item.durationMs}ms`;
-      // "Generated N tokens in Xs" / "Generated in Xs" / "Generated".
-      // The bare "Generated" form should be unreachable today
-      // (assistant:end always knows event.ts) but the conditional
-      // structure stays explicit so a future producer that drops
-      // duration on purpose doesn't render a syntax-broken header.
-      const tokenClause = item.outputTokens === null ? '' : `${item.outputTokens} tokens`;
-      const inClause = ms === null ? '' : `in ${ms}`;
-      const tail = [tokenClause, inClause].filter((s) => s.length > 0).join(' ');
-      const header = paint(caps, 'dim', `${glyph} Generated${tail.length > 0 ? ` ${tail}` : ''}`);
-      return [header, ...textLines].map(padFrame);
+      // The assistant block is just the AI's prose, prepended with a
+      // blank line (UI.md §6.3) so it visually separates from the
+      // user-submit bar / tool blocks above. The legacy
+      // `· Generated N tokens in Xs` chip header was removed —
+      // duration is in the turn-end marker (`Cogitated for Xs`) and
+      // token count lives in the footer's right column. A per-turn
+      // chip header just duplicates info the operator already sees
+      // and clutters scrollback.
+      //
+      // Empty text → emit nothing. Tool-only turns (model produced
+      // tool_use blocks but no prose) used to surface a header-only
+      // chip for cost visibility; the footer cost counter and the
+      // tool-end chips already cover that signal.
+      if (item.text.length === 0) return [];
+      return ['', ...item.text.split('\n')].map(padFrame);
     }
     case 'tool-end': {
       // UI.md §4.10.5 — chip glyph + verb (status-aware) + duration.
@@ -160,7 +194,12 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
           : item.status === 'denied'
             ? paint(caps, 'warn', headRaw)
             : paint(caps, 'dim', headRaw);
-      const lines = [head];
+      // Leading blank (UI.md §6.3) — each tool finalization is its
+      // own "session" block; the operator scrolls and sees each tool
+      // (chip + sub-content) as a self-contained unit instead of a
+      // wall of contiguous chips. Sub-content stays tight under the
+      // chip (it's the chip's "subsession").
+      const lines = ['', head];
       // Sub-content (subject) under the connector. Skipped when no
       // subject (some tools have no obvious one — todo_write etc.).
       // For denied, the subject is replaced by the policy reason if
@@ -178,13 +217,18 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       return lines.map(padFrame);
     }
     case 'error':
-      return [paint(caps, 'error', `error: ${item.message}`)].map(padFrame);
+      // Leading blank — alerts are top-level "session" blocks and
+      // deserve emphasis; whatever printed above shouldn't bleed
+      // into the alert visually.
+      return ['', paint(caps, 'error', `error: ${item.message}`)].map(padFrame);
     case 'warn':
-      return [paint(caps, 'warn', `warn: ${item.message}`)].map(padFrame);
+      return ['', paint(caps, 'warn', `warn: ${item.message}`)].map(padFrame);
     case 'info':
       // Plain — no SGR. Info isn't an alert; coloring it would
       // collide with the warn channel's "actually pay attention"
-      // signal (lock conflicts, compaction notices, etc.).
-      return [item.message].map(padFrame);
+      // signal (lock conflicts, compaction notices, etc.). Same
+      // leading blank as error/warn so consecutive info lines from
+      // different sources don't blob together.
+      return ['', item.message].map(padFrame);
   }
 };

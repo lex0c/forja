@@ -68,6 +68,12 @@ export type SessionEndEvent = BaseEvent & {
   type: 'session:end';
   sessionId: string;
   reason: 'done' | 'maxSteps' | 'maxCostUsd' | 'aborted' | 'error' | string;
+  // Wall-clock duration of the run, in ms (mirrors
+  // `HarnessResult.durationMs`). Powers the turn-end marker's
+  // "Cogitated for 1m23s" rendering (UI.md §3.2). Optional only for
+  // legacy / replay paths that don't have timing — production
+  // emitters always set it.
+  durationMs?: number;
   // Mirrors HarnessResult.abortCause (1.g.2). Only meaningful when
   // reason === 'aborted' — discriminates operator-initiated cooperative
   // ('soft') from preemptive ('hard'). NDJSON consumers and the

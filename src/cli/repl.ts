@@ -20,7 +20,6 @@
 // AbortController for the running turn, and the exit promise.
 
 import { basename } from 'node:path';
-import { isGitRepo } from '../checkpoints/git.ts';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
 import { DEFAULT_BUDGET } from '../harness/types.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
@@ -80,14 +79,15 @@ export interface RunReplOptions {
   rendererWrite?: (s: string) => void;
 }
 
-// One-shot subscriber: drops `session:end` so the renderer doesn't
-// flip into the "ended" state between turns. The reducer's
-// `user:submit` branch already resets `ended` (so a stray late event
-// wouldn't strand us), but skipping `session:end` entirely keeps the
-// scrollback cleaner — the next user prompt is the natural divider
-// between turns. If callers want a footer line on every turn, we can
-// add a `warn` divider here later; deliberately dropping for now.
-const filterUiEvent = (event: UIEvent): boolean => event.type !== 'session:end';
+// All UIEvents flow through to the bus. Earlier this filter dropped
+// `session:end` so the renderer wouldn't flip into `ended` state
+// between REPL turns and hide the input box. With `state.ended` no
+// longer gating draws (renderer.ts), the filter became unnecessary —
+// session:end now produces the turn-end marker (`Cogitated for X`,
+// UI.md §3.2) on every turn, the input stays visible during the
+// gap between session:end and the next user:submit, and one-shot
+// callers still get their final marker.
+const filterUiEvent = (_event: UIEvent): boolean => true;
 
 export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const { args } = options;
@@ -751,14 +751,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   if (subagents.byName.size > 0) {
     env.push({ kind: 'meta', key: 'subagents', value: String(subagents.byName.size) });
   }
-  // Checkpoints only show when they'll actually fire. Both halves
-  // matter: enableCheckpoints=false (plan mode, opt-out) and
-  // enableCheckpoints=true with non-git cwd both result in no
-  // rollback at runtime — banner stays silent rather than promising
-  // a feature that won't deliver.
-  if (baseConfig.enableCheckpoints === true && (await isGitRepo(baseConfig.cwd))) {
-    env.push({ kind: 'flag', name: 'checkpoints' });
-  }
+  // `checkpoints` flag was removed from the banner — operator
+  // marked it as not useful. The capability still works (harness
+  // creates checkpoints when conditions are met); it just doesn't
+  // announce itself at boot. If a future smoke audit wants the
+  // signal back, push another flag entry here.
   bus.emit({
     type: 'session:banner',
     ts: now(),

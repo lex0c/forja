@@ -29,7 +29,6 @@ import { padFrame } from './frame.ts';
 import { renderInput } from './input.ts';
 import { renderModal } from './modal.ts';
 import { renderSlashPopover } from './slash-popover.ts';
-import { renderStatusLine } from './status.ts';
 import { renderTodoList } from './todo-list.ts';
 import { renderToolCardLive } from './tool-card.ts';
 
@@ -119,28 +118,43 @@ export const composeLive: ComposeLive = (
   // width-aware paths — `horizontalRule` (computed locally) and
   // `renderFooter` (anchor math) — already produce padded output.
 
+  // Live region "session" blocks (UI.md §6.3): each top-level element
+  // (TodoList, assistant chip, each tool card) gets a blank line above
+  // it for scannability. Sub-content within an element (todo rows
+  // under "Tasks", `└─` connector under a tool chip) stays tight —
+  // it's the parent block's "subsession". Helper appends with a
+  // leading blank UNLESS this is the very first block in the live
+  // region (no need to prepend a blank when there's nothing above).
+  const appendBlock = (block: string[]): void => {
+    if (block.length === 0) return;
+    if (lines.length > 0) lines.push(padFrame(''));
+    lines.push(...block.map(padFrame));
+  };
+
   // 1. Live TodoList (above the operation chips per spec §4.10.6:
   // "Todo list (§4.3) acima dos chips, se houver"). renderTodoList
   // returns [] when state.todos is empty — section drops entirely.
-  lines.push(...renderTodoList(state.todos, caps).map(padFrame));
+  appendBlock(renderTodoList(state.todos, caps));
 
   // 2. Live "Generating…" chip. Spec §4.10.5: the assistant turn is
   // an operation chip just like a tool call. Renders above the tool
   // cards because the assistant is the parent operation — tool calls
   // it spawns sit beneath it visually.
   if (state.pendingAssistant !== null) {
-    lines.push(...renderAssistantChip(state.pendingAssistant, caps, now).map(padFrame));
+    appendBlock(renderAssistantChip(state.pendingAssistant, caps, now));
   }
 
   // 3. Active tool cards (running). Map insertion order is preserved,
   // so the visual order matches the order tools were started.
   for (const tool of state.activeTools.values()) {
-    lines.push(...renderToolCardLive(tool, caps, now).map(padFrame));
+    appendBlock(renderToolCardLive(tool, caps, now));
   }
 
-  // 4. Status line — only when session has started.
-  const status = renderStatusLine(state, caps, { now });
-  if (status !== null) lines.push(padFrame(status));
+  // 4. (was status line) — removed (UI.md §4.4 absorbed into §4.10.6
+  // footer). Same info `model · [plan] · steps/max · cost · [bg N]`
+  // appears in the footer's right column, so a separate line above
+  // the input would just duplicate it. Position kept as a numbered
+  // step so future additions slot in without renumbering downstream.
 
   // 5. Modal OR bottom anchor — never both. Bottom anchor is rule +
   // input + rule + footer (4-block stack); modal substitutes the
@@ -155,8 +169,16 @@ export const composeLive: ComposeLive = (
   // the upper region — composeCursor's math (FOOTER_BLOCK_LINES +
   // inputLines from the bottom) stays correct regardless.
   if (state.slash !== null) {
-    lines.push(...renderSlashPopover(state.slash, caps).map(padFrame));
+    appendBlock(renderSlashPopover(state.slash, caps));
   }
+  // Always 1 blank line between whatever content sits above and the
+  // input block (rule + input + rule). Without it, the rule_above
+  // butts against the last upper element and the operator's eye
+  // can't tell where the typing zone starts. The blank only fires
+  // when there IS content above; on a fresh session with no chips /
+  // tools / todos, the input block renders flush at the top of the
+  // live region as before.
+  if (lines.length > 0) lines.push(padFrame(''));
   lines.push(horizontalRule(caps));
   // Input is the single OUTDENTED element (UI.md §6.3 frame margin
   // exception). No padFrame here — the prompt `> ` lives at col 0

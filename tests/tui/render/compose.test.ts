@@ -61,18 +61,18 @@ describe('composeLive layout', () => {
     expect(out[3]).toContain('? for help');
   });
 
-  test('after session start: status line, rule, input, rule, footer', () => {
+  test('after session start: rule, input, rule, footer (status line removed)', () => {
+    // Status line was absorbed into footer (UI.md §4.4 superseded by
+    // §4.10.6). Layout is now [rule, '> ', rule, footer]. Length = 4.
     const out = composeLive(startedSession(), caps, 0);
-    // [status, rule, '> ', rule, footer]. Length = 5.
-    expect(out).toHaveLength(5);
-    expect(out[0]).toContain('forja');
-    expect(out[1]).toBe(expectedRule(caps.cols, true));
-    expect(out[2]).toBe('> ');
-    expect(out[3]).toBe(expectedRule(caps.cols, true));
-    expect(out[4]).toContain('opus');
+    expect(out).toHaveLength(4);
+    expect(out[0]).toBe(expectedRule(caps.cols, true));
+    expect(out[1]).toBe('> ');
+    expect(out[2]).toBe(expectedRule(caps.cols, true));
+    expect(out[3]).toContain('opus');
   });
 
-  test('active tool card sits ABOVE status line + bottom anchor', () => {
+  test('active tool card sits ABOVE bottom anchor', () => {
     const s = startedSession();
     const tool: ActiveTool = {
       toolId: 't1',
@@ -85,14 +85,16 @@ describe('composeLive layout', () => {
     };
     s.activeTools.set('t1', tool);
     const out = composeLive(s, caps, 1000);
-    // [chip head, sub-content, status, rule, input, rule, footer] = 7.
+    // [chip head, sub-content, BLANK, rule, input, rule, footer] = 7.
+    // Blank between upper region and bottom anchor (UI.md §6.3).
     expect(out).toHaveLength(7);
     expect(out[0]).toContain('Executing');
     expect(out[1]).toContain('ls');
-    expect(out[2]).toContain('forja');
+    expect(out[2]).toBe('  '); // blank between content and input rule
     expect(out[3]).toBe(expectedRule(caps.cols, true));
     expect(out[4]).toBe('> ');
     expect(out[5]).toBe(expectedRule(caps.cols, true));
+    expect(out[6]).toContain('opus');
   });
 
   test('layered live region: TodoList → assistant chip → tool cards (top→bottom)', () => {
@@ -121,22 +123,32 @@ describe('composeLive layout', () => {
     };
     s.activeTools.set('t1', tool);
     const out = composeLive(s, caps, 100);
-    // Expected layout (top→bottom):
-    //   [Tasks header, todo row, assistant chip, tool head, sub, status, rule, input, rule, footer]
+    // Expected layout (top→bottom): each top-level "session" block is
+    // separated from its neighbor by a blank line (UI.md §6.3); the
+    // sub-content connector under a tool chip stays tight (subsession).
+    // An additional blank sits between the upper region and the input
+    // block (rule + input + rule).
+    //   [Tasks header, todo row,
+    //    BLANK, assistant chip,
+    //    BLANK, tool head, sub-content,
+    //    BLANK,                   ← input-block separator
+    //    rule, input, rule, footer]
     expect(out[0]).toContain('Tasks');
     expect(out[1]).toContain('plan it');
-    expect(out[2]).toContain('Generating…');
-    expect(out[3]).toContain('Executing');
-    expect(out[4]).toContain('ls');
-    expect(out[5]).toContain('forja');
-    expect(out[6]).toBe(expectedRule(caps.cols, true));
-    expect(out[7]).toBe('> ');
+    expect(out[2]).toBe('  '); // blank separator before assistant chip
+    expect(out[3]).toContain('Generating…');
+    expect(out[4]).toBe('  '); // blank separator before tool card
+    expect(out[5]).toContain('Executing');
+    expect(out[6]).toContain('ls');
+    expect(out[7]).toBe('  '); // blank between content and input rule
     expect(out[8]).toBe(expectedRule(caps.cols, true));
-    expect(out[9]).toContain('? for help');
-    expect(out).toHaveLength(10);
+    expect(out[9]).toBe('> ');
+    expect(out[10]).toBe(expectedRule(caps.cols, true));
+    expect(out[11]).toContain('? for help');
+    expect(out).toHaveLength(12);
   });
 
-  test('assistant chip alone (no todos, no tools) renders between status anchor and live tools slot', () => {
+  test('assistant chip alone (no todos, no tools) renders above bottom anchor', () => {
     const s = startedSession();
     s.pendingAssistant = {
       messageId: 'm1',
@@ -148,10 +160,11 @@ describe('composeLive layout', () => {
       cacheCreation: null,
     };
     const out = composeLive(s, caps, 1000);
-    // [chip, status, rule, input, rule, footer] = 6.
+    // [chip, BLANK, rule, input, rule, footer] = 6.
     expect(out).toHaveLength(6);
     expect(out[0]).toContain('Generating…');
-    expect(out[1]).toContain('forja');
+    expect(out[1]).toBe('  '); // blank between chip and input rule
+    expect(out[2]).toBe(expectedRule(caps.cols, true));
   });
 
   test('multi-line input keeps input above the trailing rule + footer', () => {
