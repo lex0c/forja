@@ -131,6 +131,7 @@ const buildConfig = (
     extraTools?: Tool[];
     policy?: Partial<Policy>;
     signal?: AbortSignal;
+    softStopSignal?: AbortSignal;
     budget?: Partial<{
       maxSteps: number;
       maxToolErrors: number;
@@ -156,6 +157,7 @@ const buildConfig = (
       cwd: '/p',
       userPrompt: 'hi',
       ...(options.signal !== undefined ? { signal: options.signal } : {}),
+      ...(options.softStopSignal !== undefined ? { softStopSignal: options.softStopSignal } : {}),
       ...(options.budget !== undefined ? { budget: options.budget } : {}),
     },
   };
@@ -211,7 +213,7 @@ describe('runAgent', () => {
     expect(result.steps).toBe(3);
   });
 
-  test('aborted signal: exits as interrupted', async () => {
+  test('aborted signal: exits as interrupted with abortCause=hard', async () => {
     const ctrl = new AbortController();
     ctrl.abort();
     const { config } = buildConfig([{ text: 'x' }], { signal: ctrl.signal });
@@ -219,6 +221,198 @@ describe('runAgent', () => {
     expect(result.status).toBe('interrupted');
     expect(result.reason).toBe('aborted');
     expect(result.steps).toBe(0);
+    // Hard signal → abortCause discriminator carries 'hard' so audit
+    // / telemetry can distinguish from cooperative soft (1.g.2).
+    expect(result.abortCause).toBe('hard');
+  });
+
+  test('non-abort exits do NOT set abortCause (undefined for done/maxSteps/etc.)', async () => {
+    // Sanity: the discriminator is only meaningful for reason==='aborted'.
+    // A done turn shouldn't carry a hard/soft label.
+    const { config } = buildConfig([{ text: 'hi', stop_reason: 'end_turn' }]);
+    const result = await runAgent(config);
+    expect(result.reason).toBe('done');
+    expect(result.abortCause).toBeUndefined();
+  });
+
+  test('softStopSignal pre-aborted exits aborted at step boundary, no provider call', async () => {
+    // Spec UI.md §3 cooperative-stop: soft signal already fired before
+    // the loop starts → the first step boundary check exits cleanly
+    // without burning a provider call. Status mirrors hard abort.
+    const soft = new AbortController();
+    soft.abort();
+    const { config, handle } = buildConfig([{ text: 'should not run' }], {
+      softStopSignal: soft.signal,
+    });
+    const result = await runAgent(config);
+    expect(result.status).toBe('interrupted');
+    expect(result.reason).toBe('aborted');
+    expect(result.steps).toBe(0);
+    // Soft signal → abortCause='soft' (1.g.2 discriminator).
+    expect(result.abortCause).toBe('soft');
+    // Critical contract: provider was never called.
+    expect(handle.requests).toHaveLength(0);
+  });
+
+  test('softStopSignal mid-tool: tool completes, loop exits at next boundary', async () => {
+    // The cooperative semantic: soft signal fires WHILE a tool is
+    // running. The current step's tool execution finishes (in-flight
+    // work not preempted), result lands in the message log, then the
+    // top-of-loop check exits with reason='aborted' without issuing
+    // the next provider request. Distinguishes from hard abort, which
+    // would kill the tool mid-execution.
+    //
+    // Verifiable contract: the tool blocks on a Promise that ONLY
+    // resolves when the test (outside the harness) explicitly
+    // releases it. If the harness preempted the tool on soft, the
+    // tool would never reach `toolFinished = true` because the
+    // Promise stays pending — `expect(toolFinished).toBe(true)`
+    // would fail. Stronger than `setTimeout(10)` which only
+    // measured time, not actual non-preemption.
+    const soft = new AbortController();
+    let toolStarted = false;
+    let toolFinished = false;
+    let releaseTool: () => void = () => {};
+    const toolGate = new Promise<void>((r) => {
+      releaseTool = r;
+    });
+    const slowTool: Tool = {
+      name: 'slow_tool',
+      description: 'fires soft mid-flight, blocks until released',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: false },
+      execute: async () => {
+        toolStarted = true;
+        soft.abort();
+        // Block until the test verifies that the harness has NOT
+        // preempted us, then releases the gate. A preemptive harness
+        // would leave us hanging forever (test would time out).
+        await toolGate;
+        toolFinished = true;
+        return { ok: true };
+      },
+    };
+    const { config, handle } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 'tu1', name: 'slow_tool', input: {} }],
+          stop_reason: 'tool_use',
+        },
+        // Second step would run if soft didn't trip; soft must short-circuit.
+        { text: 'should not reach here', stop_reason: 'end_turn' },
+      ],
+      { extraTools: [slowTool], softStopSignal: soft.signal },
+    );
+    // Run + release gate concurrently. The release fires after one
+    // tick so we observe that the tool was started AND blocked AND
+    // soft fired AND no preemption happened — if any of those broke,
+    // the gate-blocking shape would surface it.
+    const runPromise = runAgent(config);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(toolStarted).toBe(true);
+    expect(toolFinished).toBe(false);
+    expect(soft.signal.aborted).toBe(true);
+    releaseTool();
+    const result = await runPromise;
+    expect(toolFinished).toBe(true);
+    expect(result.status).toBe('interrupted');
+    expect(result.reason).toBe('aborted');
+    expect(result.abortCause).toBe('soft');
+    // Exactly one provider request fired (the first step that
+    // produced the tool_use); the second step's provider call was
+    // skipped by the soft check.
+    expect(handle.requests).toHaveLength(1);
+    expect(result.steps).toBe(1);
+  });
+
+  test('softStopSignal between tool_uses of the same step short-circuits remaining tools', async () => {
+    // Spec UI.md §3 + D158: the model returned multiple tool_uses
+    // in one step. Soft fires after the FIRST tool runs. The second
+    // tool must NOT execute — operator already cancelled. Without
+    // this check (the inner-loop soft guard), the bash tool 2 would
+    // run, side effects would land, wall-clock burned. Asserts the
+    // post-D158 contract.
+    const soft = new AbortController();
+    let firstRan = false;
+    let secondRan = false;
+    const firstTool: Tool = {
+      name: 'first_tool',
+      description: 'fires soft after running',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: false },
+      execute: async () => {
+        firstRan = true;
+        soft.abort();
+        return { ok: true };
+      },
+    };
+    const secondTool: Tool = {
+      name: 'second_tool',
+      description: 'should NOT run because soft fired between tools',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: false },
+      execute: async () => {
+        secondRan = true;
+        return { ok: true };
+      },
+    };
+    const { config, handle } = buildConfig(
+      [
+        {
+          tool_uses: [
+            { id: 'tu1', name: 'first_tool', input: {} },
+            { id: 'tu2', name: 'second_tool', input: {} },
+          ],
+          stop_reason: 'tool_use',
+        },
+        { text: 'unreached', stop_reason: 'end_turn' },
+      ],
+      { extraTools: [firstTool, secondTool], softStopSignal: soft.signal },
+    );
+    const result = await runAgent(config);
+    expect(firstRan).toBe(true);
+    expect(secondRan).toBe(false);
+    expect(result.status).toBe('interrupted');
+    expect(result.reason).toBe('aborted');
+    expect(result.abortCause).toBe('soft');
+    // No second provider call — soft short-circuited inside step 1.
+    expect(handle.requests).toHaveLength(1);
+  });
+
+  test('hard abort still preempts in-flight tool (regression cover)', async () => {
+    // Make sure the soft path additions didn't regress the existing
+    // hard-preemption behavior. Hard signal fires mid-tool → tool's
+    // ctx.signal.aborted is true while it's still running.
+    const hard = new AbortController();
+    let observedAbort = false;
+    const slowTool: Tool = {
+      name: 'slow_tool_hard',
+      description: 'fires hard mid-execution',
+      inputSchema: { type: 'object' },
+      metadata: { category: 'misc', writes: false, idempotent: false },
+      execute: async (_args, ctx) => {
+        hard.abort();
+        // One microtask tick: the abort propagates through ctx.signal.
+        await new Promise((r) => setTimeout(r, 5));
+        observedAbort = ctx.signal.aborted;
+        return { ok: true };
+      },
+    };
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [{ id: 'tu1', name: 'slow_tool_hard', input: {} }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'unreached', stop_reason: 'end_turn' },
+      ],
+      { extraTools: [slowTool], signal: hard.signal },
+    );
+    const result = await runAgent(config);
+    expect(observedAbort).toBe(true);
+    expect(result.status).toBe('interrupted');
+    expect(result.reason).toBe('aborted');
+    expect(result.abortCause).toBe('hard');
   });
 
   test('unknown tool: error result, loop continues until done', async () => {
@@ -757,6 +951,9 @@ describe('runAgent', () => {
     });
     expect(result.status).toBe('interrupted');
     expect(result.reason).toBe('aborted');
+    // Hard signal aborted mid-provider-stream: cause is 'hard' even
+    // though the abort was caught from inside the provider SDK error.
+    expect(result.abortCause).toBe('hard');
   });
 
   test('hung provider stream is interrupted by maxWallClockMs', async () => {
@@ -1594,6 +1791,25 @@ describe('runAgent', () => {
     const result = await runAgent(config);
     expect(result.reason).toBe('internalError');
     expect(result.usageComplete).toBe(false);
+  });
+
+  test('guardedFinish remaps aborted exceptions to reason=aborted with cause=hard (1.g.2)', async () => {
+    // Pre-1.g.2 behavior: a SQLite write failing because signal.aborted
+    // mid-flight was caught and reported as `internalError` — looked
+    // like a harness bug instead of operator-initiated termination.
+    // Now: guardedFinish detects signal.aborted at throw time and
+    // routes to finish('aborted', ..., 'hard'). Forces this path by
+    // closing the DB AND pre-aborting the signal so the init throw
+    // lands while signal is aborted.
+    const ctrl = new AbortController();
+    ctrl.abort();
+    db.close();
+    const { config } = buildConfig([{ text: 'never reached', stop_reason: 'end_turn' }], {
+      signal: ctrl.signal,
+    });
+    const result = await runAgent(config);
+    expect(result.reason).toBe('aborted');
+    expect(result.abortCause).toBe('hard');
   });
 
   describe('preassignedSessionId', () => {

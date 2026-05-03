@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Instructions for Claude Code working on Forja — the agentic CLI specified in `docs/spec/`.
+Instructions for AI assistants working on Forja — the agentic CLI specified in `docs/spec/`.
 
 ## Root premise
 
@@ -21,11 +21,12 @@ The architectural spec lives in `docs/spec/AGENTIC_CLI.md`. Each subsystem has a
 | Trust / sandbox / threat model | `AGENTIC_CLI` §9, `SECURITY_GUIDELINE` |
 | Hooks | `AGENTIC_CLI` §10, `CONTRACTS` |
 | Subagents / playbooks | `AGENTIC_CLI` §11, `PLAYBOOKS` |
+| Subagent IPC (parent↔child channel) | `IPC`, `AGENTIC_CLI` §11 |
 | Checkpoints / undo | `AGENTIC_CLI` §12 |
 | Storage / schema / audit | `AGENTIC_CLI` §13, `AUDIT` |
 | Context engine, compaction | `AGENTIC_CLI` §6, `CONTEXT_TUNING` |
 | Sampling, output budgets | `TOKEN_TUNING` |
-| UI (Ink), microcopy, design tokens | `AGENTIC_CLI` §17, `UI`, `DESIGN_SYSTEM` |
+| TUI (inline render, event bus, microcopy, palette/glyphs) | `AGENTIC_CLI` §17, `UI` |
 | Cross-session memory | `MEMORY` |
 | Recap | `RECAP` |
 | Code index (tree-sitter) | `CODE_INDEX` |
@@ -43,7 +44,7 @@ The spec is a protocol, not a suggestion. Diverging from the spec requires a PR 
 - Language: **TypeScript** strict
 - Runtime: **Bun** (single binary via `bun build --compile`)
 - Storage: **SQLite via `bun:sqlite`** — raw SQL with types, **no ORM**
-- TUI: **Ink** (React in the terminal)
+- TUI: **Internal (raw ANSI + raw stdin), no framework** — inline render
 - Lint/format: **Biome**
 - Test: **`bun test`** (built-in)
 - Provider SDKs: `@anthropic-ai/sdk` (M1), `@modelcontextprotocol/sdk` (M3+)

@@ -26,6 +26,13 @@ export interface Session {
   // back to "top-level user session". This is the predicate the
   // default listSessions filter (and `--resume last`) uses.
   isSubagent: boolean;
+  // Discriminator for sessions that ended via abort. Mirrors
+  // HarnessResult.abortCause: 'soft' = cooperative (let in-flight
+  // work finish); 'hard' = preemptive (kill mid-tool). Null for any
+  // other terminal status — the value is meaningless when the
+  // session didn't exit through the abort path. Audit queries use
+  // this to distinguish "operator nudged" from "operator escalated".
+  abortCause: 'soft' | 'hard' | null;
 }
 
 interface SessionRow {
@@ -39,6 +46,7 @@ interface SessionRow {
   usage_complete: number;
   parent_session_id: string | null;
   is_subagent: number;
+  abort_cause: 'soft' | 'hard' | null;
 }
 
 const fromRow = (row: SessionRow): Session => ({
@@ -52,6 +60,7 @@ const fromRow = (row: SessionRow): Session => ({
   usageComplete: row.usage_complete === 1,
   parentSessionId: row.parent_session_id,
   isSubagent: row.is_subagent === 1,
+  abortCause: row.abort_cause,
 });
 
 export interface CreateSessionInput {
@@ -97,13 +106,14 @@ export const createSession = (db: DB, input: CreateSessionInput): Session => {
     usageComplete: true,
     parentSessionId,
     isSubagent,
+    abortCause: null,
   };
 };
 
 export const getSession = (db: DB, id: string): Session | null => {
   const row = db
     .query(
-      `SELECT id, started_at, ended_at, model, cwd, status, total_cost_usd, usage_complete, parent_session_id, is_subagent
+      `SELECT id, started_at, ended_at, model, cwd, status, total_cost_usd, usage_complete, parent_session_id, is_subagent, abort_cause
        FROM sessions WHERE id = ?`,
     )
     .get(id) as SessionRow | null;
@@ -150,7 +160,7 @@ export const listSessions = (db: DB, options: ListSessionsOptions = {}): Session
   // implementation-defined fallback — and `--resume last` then
   // attaches to the wrong conversation. seq is monotonically
   // increasing per insert, so DESC gives newest-first.
-  const sql = `SELECT id, started_at, ended_at, model, cwd, status, total_cost_usd, usage_complete, parent_session_id, is_subagent
+  const sql = `SELECT id, started_at, ended_at, model, cwd, status, total_cost_usd, usage_complete, parent_session_id, is_subagent, abort_cause
                FROM sessions
                ${where}
                ORDER BY started_at DESC, seq DESC
@@ -232,7 +242,7 @@ export const cumulativeCostUsd = (db: DB, rootSessionId: string): number => {
 export const listChildSessions = (db: DB, parentSessionId: string): Session[] => {
   const rows = db
     .query(
-      `SELECT id, started_at, ended_at, model, cwd, status, total_cost_usd, usage_complete, parent_session_id, is_subagent
+      `SELECT id, started_at, ended_at, model, cwd, status, total_cost_usd, usage_complete, parent_session_id, is_subagent, abort_cause
        FROM sessions
        WHERE parent_session_id = ?
        ORDER BY started_at ASC, seq ASC`,
@@ -248,14 +258,22 @@ export const completeSession = (
   totalCostUsd: number,
   usageComplete: boolean,
   endedAt: number = Date.now(),
+  // Optional discriminator for status='interrupted'. Caller (the
+  // harness loop's finish() helper) passes 'soft' or 'hard' when
+  // reason was 'aborted', undefined otherwise. The CHECK constraint
+  // on the column rejects any other value, so a future caller that
+  // typos 'cooperative' fails at SQLite write time rather than
+  // silently storing junk.
+  abortCause?: 'soft' | 'hard',
 ): void => {
   const result = db
     .query(
       `UPDATE sessions
-       SET status = ?, ended_at = ?, total_cost_usd = ?, usage_complete = ?
+       SET status = ?, ended_at = ?, total_cost_usd = ?, usage_complete = ?,
+           abort_cause = ?
        WHERE id = ? AND status = 'running'`,
     )
-    .run(status, endedAt, totalCostUsd, usageComplete ? 1 : 0, id);
+    .run(status, endedAt, totalCostUsd, usageComplete ? 1 : 0, abortCause ?? null, id);
   if (result.changes === 0) {
     const exists = getSession(db, id);
     if (exists === null) throw new Error(`session ${id} not found`);

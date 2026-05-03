@@ -38,7 +38,7 @@ Cada item: **o que é → por que rejeita → quando reconsiderar**.
 **O que é:** ajustar verbosity do output via instruções vagas no system prompt ("be concise", "explain thoroughly").
 
 **Por que rejeita:**
-- Drift silencioso entre versões de modelo (Anthropic admitiu publicamente em 2026 que Claude Code regressou em verbosity sem mudança intencional).
+- Drift silencioso entre versões de modelo (regressões de verbosity sem mudança intencional já foram admitidas publicamente por providers em 2026).
 - Não-mensurável sem eval dedicado.
 - Sintoma de não saber qual é o output esperado.
 
@@ -130,7 +130,7 @@ Cada item: **o que é → por que rejeita → quando reconsiderar**.
 **O que é:** "Thinking..." / "Working..." sem dizer **o quê**.
 
 **Por que rejeita:**
-- `UI.md` e `DESIGN_SYSTEM.md` exigem progress label informativo. Spinner mudo é UI placebo.
+- `UI.md` §9 exige progress label informativo. Spinner mudo é UI placebo.
 - Em sessão > 10s, usuário precisa saber se vale interromper.
 
 **Substituição:** label do step atual ("running tests...", "reading src/auth.ts...").
@@ -155,6 +155,31 @@ Cada item: **o que é → por que rejeita → quando reconsiderar**.
 - Sintoma de RLHF mal calibrado herdado do modelo base.
 
 **Substituição:** uma frase de status quando há mudança de direção; senão, ferramenta direto.
+
+### 4.4 Reintroduzir framework de UI (React/Ink/blessed/neo-blessed)
+
+**O que é:** "vamos só voltar pra Ink, é mais fácil pros componentes". Ou trazer `blessed`, `neo-blessed`, `ratatui-port`, `terminal-kit`, qualquer framework de TUI.
+
+**Por que rejeita:**
+- `UI.md §0.2` e `AGENTIC_CLI.md §3` travam: TUI é raw ANSI + raw stdin, sem framework.
+- A região viva tem 3-15 linhas. Reconciliação é overkill — clear+redraw é mais rápido que diff de virtual DOM/widget tree.
+- Framework adiciona ciclo de vida (mount/unmount), focus stack proprietário, ecossistema de deps. Tudo o que ele resolve, ~500 linhas de TS já resolvem com mais controle.
+- "Componentização" no terminal vira culto: cada nova tela quer um wrapper, props, theme provider. O custo cognitivo cresce sem o equivalente em ganho visual.
+
+**Substituição:** funções puras `render(state): string[]`. Estado em variáveis simples. Focus stack ~30 linhas. Event bus tipado (EventEmitter). Ver `UI.md §3-§5`.
+
+### 4.5 Alt-screen / full-screen TUI
+
+**O que é:** entrar em alt-screen buffer (`\x1b[?1049h`), tomar conta da tela inteira, restaurar ao sair. Estilo `vim`/`htop`/`tmux`.
+
+**Por que rejeita:**
+- Quebra **scrollback nativo** do terminal: histórico vira responsabilidade nossa, e nunca vai ser tão bom quanto o do terminal.
+- Quebra **copy-paste com mouse**: seleção em alt-screen não cola fora do agent.
+- Quebra **redirecionamento e composição Unix** (`agent ... | tee log.txt` perde o ponto).
+- Exige reimplementar resize-reflow, scroll, search-in-buffer — mil pequenos bugs.
+- O agent é uma ferramenta de shell, não um app. Modelo inline é alinhado com `AGENTIC_CLI §2`.
+
+**Substituição:** inline rendering. Histórico vai pro stdout permanente (= scrollback nativo). Região viva pequena no fundo redesenha por escape codes. Ver `UI.md §2`.
 
 ---
 

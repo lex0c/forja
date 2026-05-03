@@ -15,6 +15,1178 @@ Format:
 
 ---
 
+## [2026-05-03] M1 audit — TUI ↔ harness integration coverage (~77%)
+
+End-to-end audit of every `HarnessEvent` and `UIEvent` after the M1 series landed. 17 of 22 producer/render paths are wired and exercised against real Anthropic streaming (smoke runs in this session: text-only response, tool deny + multi-step recovery, tool allow path, --list-sessions). 5 producer gaps + 1 incomplete render are tracked below as explicit debt — none block the merge of what currently works, but each is a contract the spec promises and the operator-visible UI doesn't fully deliver yet.
+
+The wired-and-working surface (no debt): session lifecycle, user input, assistant streaming + tokens chip, thinking, tool lifecycle (with `denied` discriminator), todos, bg counter, step:budget + cost, compaction warnings, abort soft/hard ladder + footer cue, screen:clear, slash autocomplete + 8 builtin commands (3 mutation), info/warn/error scrollback, **permission modal** (the only modal flavor with a producer today).
+
+Acknowledged-elsewhere gaps NOT in this audit: subagent observability + soft-abort propagation + abortCause for subagents (D159 / D168 / 1.f.2 — all blocked on IPC, spec landed in `docs/spec/IPC.md`), `bg:update` UIEvent (D149).
+
+**Decisions:**
+
+- **D181 — `trust:ask` modal has no producer (security-relevant).** Spec UI.md §4.6 + AGENTIC_CLI §9 require a trust prompt when entering an untrusted directory or when an unknown `AGENTS.md` is present. The reducer + render are wired in `state.ts:702`; the modal-manager exposes only `askPermission`, no `askTrust`. The harness's `isTrustedCwd` check exists but doesn't bridge to the bus. Operator entering an untrusted cwd today gets no confirm — defaults to whatever the trust subsystem decides without operator input. Most security-sensitive of the 6 gaps; should land in its own slice that adds `modalManager.askTrust(...)` + the harness-side bridge mirroring confirmPermission's shape.
+- **D182 — `memory:write:ask` modal has no producer.** Memory subsystem (MEMORY.md) proposes writes (inferred memories from conversation) that should require operator confirm before persisting. Reducer/render wired in `state.ts:728`; no producer. Today inferred-write proposals either auto-write (security risk) or are silently dropped (UX gap) depending on the memory module path. Slice that lands `modalManager.askMemoryWrite(...)` + memory-subsystem bridge will close it.
+- **D183 — `plan:review` modal has no producer.** Plan mode today is "harness refuses write tools" — there's no review step where the operator approves a proposed plan before execution. Reducer/render wired in `state.ts:752`. The plan-review flow is what makes plan mode useful (operator inspects proposed steps + cost estimate before commit). Without it, plan mode is half a feature.
+- **D184 — `critique:ask` modal has no producer.** Critique pipeline (CODER_PLAYBOOK §6) is supposed to surface low-confidence steps to the operator before commit. Reducer/render wired in `state.ts:782`. Today no path emits the event; critique signals get logged but not interactive. Lower priority than D181-D183 because critique is per-playbook, not per-session.
+- **D185 — `checkpoint:create` reducer is no-op; status-line flash missing.** Producer fires the event correctly (verified in harness/loop.ts), reducer at `state.ts:581` returns silently with the comment "checkpoint flash on status line lands with the status-line render function" — but `status.ts` doesn't render any checkpoint indicator. Operator gets zero visual signal that a checkpoint was just created, only that one ran (because the next step continues normally). Spec UI.md §4.10.6 mentions checkpoint as a footer/status surface candidate. Smaller slice than the modal flavors — just a transient indicator (e.g. `· checkpoint @ step N` for 2s) consumed by the existing status-line renderer.
+- **D186 — `session-allow` modal answer doesn't persist a session-layer rule.** Operator answering "Yes, allow all <toolName> during this session" via the permission modal (option 2) currently routes through `confirmPermission` → returns `true` → harness allows the call. But no session-layer permission rule is written, so the NEXT call of the same tool re-prompts. Effectively `session-allow` is just a verbose `yes`. The TODO is in `repl.ts:280-283` — when the policy mutation lands (writes a session-scoped rule into the engine), the operator's expectation finally matches behavior.
+
+**Coverage estimate:** 17 of 22 HarnessEvent → UIEvent → render paths wired and exercised end-to-end. The 5 missing producers + 1 incomplete render are operator-facing features the spec promises; the absence is graceful (no crashes, no wrong behavior — just missing capability). Branch is mergeable as "TUI surface for what's wired"; the 6 D entries here track the road to "TUI surface for the full spec".
+
+**Pending:** 6 producer/render slices above; subagent observability (1.f.2, blocked on IPC); end-to-end audit by the operator under a real terminal (slash mid-turn, modal during real tool, /model swap mid-session).
+
+**Next:** operator-driven 30-min smoke under a real terminal; if clean, merge. The 6 producer gaps land as their own slices (likely M2 priority — the wired surface is sufficient for M1 single-prompt and basic REPL flows).
+
+---
+
+## [2026-05-03] M1 / Step 1.f.8 — `/model <id>` mutation
+
+Closes the last mutation slash command deferred from 1.f.1. `/plan on|off` and `/budget steps|cost` landed in 1.f.7; `/model <id>` was held back because it requires re-resolving the provider via the registry's factory (key check, capability re-init), which has more failure modes than a simple field swap. This slice fills it in.
+
+`/model` with no args remains read-only (model id + capability ceilings). `/model <id>` looks up the entry in the registry, calls its factory to instantiate a fresh `Provider`, and replaces `baseConfig.provider`. Takes effect on the NEXT turn, matching the other mutation commands.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/cli/slash/types.ts` | NEW `SlashContext.modelRegistry: ModelRegistry`. Threaded through so `/model` can lookup + factory without re-importing the registry module — keeps the command unit-testable with a fixture registry instead of the full default set. |
+| `src/cli/repl.ts` | Builds the registry once at boot via `createDefaultRegistry()` and threads into `slashCtx`. Bootstrap built its own at boot for initial provider resolution; both call sites are independent (the registry is a pure Map of entries, no shared state — two instances are functionally equivalent). |
+| `src/cli/slash/commands/model.ts` | NEW `/model <id>` mutation path. Lookup miss → "Known: <list>" error so the operator doesn't grep docs. Idempotent: matching id returns "already" without the next-turn cue. Factory throw caught and reported with the SDK's message verbatim (`failed to instantiate '<id>': ANTHROPIC_API_KEY not set`) — typical for switching to a family the operator hasn't configured. `isRunning()` cue when running. |
+| `tests/cli/slash/dispatch.test.ts` | Fixture gains `modelRegistry: createModelRegistry()` (empty, since dispatch tests don't exercise model mutation). The "/model with mutation arg returns kind:error" test updated to use a clearly-bogus id (`'no-such-model-xxx'`) — under 1.f.7 mutation IS supported now, only unknown-id falls through to error. |
+| `tests/cli/slash/commands.test.ts` | Pre-existing "rejects mutation args (read-only)" test removed — no longer the contract. NEW 6 tests: unknown id rejects with Known list; valid id swaps `baseConfig.provider`; idempotent on no-change; factory throw produces clean error; running cue appended; too many args rejects. Fake provider/entry construction explicit (`as const` for capabilities to satisfy the strict `cache: CacheMode \| false` union). |
+
+**Decisions:**
+
+- **D176 — Registry threaded via SlashContext, not imported in the command.** Considered `import { createDefaultRegistry }` directly in `model.ts` and calling it inline. Rejected because: (a) tests would need to mock the import or accept the full default set (which calls the SDK adapter's register functions — eager and noisy), (b) future "custom registry" use cases (enterprise allow-list of approved models, restricted profile) have nowhere to inject without a context handle, (c) the pattern matches `db`, `bus`, `modalManager` — every external dependency on SlashContext is injectable for the same reason. Cost: one more field on SlashContext; benefit: testability + future flexibility.
+- **D177 — Factory throw caught at the command boundary, not propagated to `dispatch`.** `entry.factory()` can throw on missing API key (Anthropic adapter checks `process.env.ANTHROPIC_API_KEY`). Letting that propagate would land in `dispatch`'s generic crash handler ("command 'model' crashed: ..."), losing the specific signal. Catching at the command and returning `kind: 'error'` with the SDK's message verbatim gives the operator the actionable hint. Trade-off: another factory failure mode (e.g., the SDK's constructor having unrelated invariant failures) also gets reported as if it were "config" — acceptable because the SDK constructors are very narrow.
+- **D178 — `/model anthropic/<x>` validation is delegated to the registry.** The command doesn't parse the id format itself (no regex on `family/<modelName>`). The registry is the source of truth: if `registry.get(id)` returns null, reject. This means the command works identically across families — Anthropic's `anthropic/claude-sonnet-4-6`, OpenAI's `openai/gpt-4o`, etc. The user sees a Known list with whatever the registry actually supports, not a hardcoded subset.
+- **D179 — Provider swap does NOT dispose the prior client (assumed stateless).** When `/model` replaces `baseConfig.provider`, the prior `Provider` instance loses its only reference from the REPL and is left to GC. Today's M1 providers (Anthropic, OpenAI, Google) are stateless beyond their SDK clients, which use the global `fetch` API — no persistent sockets, no recurring timers, no file handles. So the GC handles cleanup correctly without an explicit dispose. **However**, the `Provider` interface (`src/providers/types.ts`) does not carry a `dispose?()` method, so there's no contract enforcing this premise. When a future adapter introduces stateful resources (HTTP keep-alive agents, child processes for local models like llama.cpp, persistent gRPC connections), the swap path becomes a silent leak. Mitigation when that lands: add `Provider.dispose?(): void | Promise<void>` and call it in the swap path before reassignment. Tracked here so the next provider adapter PR doesn't slip past the contract.
+- **D180 — `/cost` cumulative aggregates across provider swaps without breakdown.** The REPL's `cumulative.costUsd` accumulator (`src/cli/repl.ts`) sums every turn's cost into a single number. After `/model anthropic→openai`, `/cost` shows the aggregate spend computed against two different price tables — accurate as a total but confusing as a per-provider attribution. The operator who wants "spent $X on anthropic-sonnet, $Y on openai-4o" needs a breakdown that doesn't exist today. Out of scope for 1.f.8 (slice was about mutation, not cost telemetry); breakdown is a future telemetry slice that would also reach SQLite (per-turn cost rows already exist; the aggregator just doesn't group by provider).
+
+**Pending:** subagent observability (1.f.2, blocked on IPC); end-to-end audit with a real provider before locking M1.
+
+**Next:** end-to-end audit with a real provider, OR the IPC subsystem.
+
+---
+
+## [2026-05-03] M1 / Step 1.g.3 — Surface abortCause through the UIEvent chain (closes D171)
+
+Closes D171 — the gap 1.g.2 left open. The discriminator landed on `HarnessResult` and persisted to SQLite, but every consumer downstream of the harness (TUI, NDJSON output, hooks) lost it: `mapExitReason` collapsed soft and hard into the same `session:end reason='aborted'`. This slice threads `abortCause` through `SessionEndEvent` → reducer → permanent → `formatPermanent`, surfacing the discriminator in the scrollback footer and on the bus for any future consumer.
+
+Operator-visible result: a soft-aborted run prints `── session end · aborted (soft) ──`; a hard one prints `── session end · aborted (hard) ──`. NDJSON consumers see `{"type":"session:end","reason":"aborted","abortCause":"soft"}`. Non-abort exits (done, maxSteps, error) don't carry the field at all — the discriminator is meaningless in those cases.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/events.ts` | `SessionEndEvent.abortCause?: 'soft' \| 'hard'` (optional). Mirrors `HarnessResult.abortCause` shape exactly so the adapter pass-through is structurally trivial. |
+| `src/tui/harness-adapter.ts` | `session_finished` translation now reads `result.abortCause` and conditionally spreads it onto the emitted `session:end` (only when defined — preserves the pre-1.g.3 absence semantics for runs that didn't carry one). |
+| `src/tui/state.ts` | `PermanentItem.session-footer` gains optional `abortCause`. Reducer's `session:end` branch threads it from the event onto the permanent record. Conditional spread (not always-present-as-undefined) so consumers that assert on the permanent shape see absence == absence. |
+| `src/tui/render/permanent.ts` | `session-footer` branch appends `(soft)` or `(hard)` to the rendered reason when `reason === 'aborted' && abortCause !== undefined`. Defensive both-conditions check: a stray `abortCause` on a non-abort reason is dropped (renderer doesn't trust the producer's invariant; misleading text would be worse than silent drop). |
+| `tests/tui/harness-adapter.test.ts` | NEW 2 tests: `session_finished` with `abortCause` threads it onto `session:end`; without `abortCause` the field is omitted entirely (no synthetic value). |
+| `tests/tui/state.test.ts` | NEW 2 tests: `session:end` with `abortCause` threads onto the permanent; without it the key is absent from the record (asserted via `'abortCause' in item` so a future regression that adds `undefined` instead of omitting fails). |
+| `tests/tui/render/permanent.test.ts` | NEW 2 tests: `session-footer` with `abortCause: 'soft'` / `'hard'` renders the discriminator inline; with `abortCause` on a non-abort reason the discriminator is dropped (defensive renderer). |
+
+**Decisions:**
+
+- **D173 — Field name parity across all four layers (`HarnessResult` → `HarnessEvent.session_finished.result` → `UIEvent.session:end` → `PermanentItem.session-footer`).** Considered renaming on the way out (e.g., `cause`, `interrupt_kind`) for shorter UIEvent payloads. Rejected — the mental model is "this is the same discriminator, just at different levels of the consumer pipeline". One name keeps the trace from operator action to scrollback line short enough to grep. The cost is one slightly-longer field name in serialized output; the benefit is no translation table to remember.
+- **D174 — Defensive renderer drops `abortCause` on non-abort reasons.** The producer (`finish()` in the harness loop) guarantees `abortCause` is only set when `reason === 'aborted'`, but the renderer doesn't trust that. A future producer regression (or a hand-crafted PermanentItem in a test) that sets `abortCause: 'soft', reason: 'done'` would render `done (soft)` — confusing and wrong. The renderer's conditional check (`reason === 'aborted' && abortCause !== undefined`) belongs there because the renderer is the last line of defense before the operator's eyes.
+- **D175 — Conditional spread, not unconditional `undefined`.** Adapter and reducer use `...(abortCause !== undefined ? { abortCause } : {})` rather than `abortCause`. Two reasons: (a) tests assert the key is absent (not just `undefined`) on non-abort paths via `'abortCause' in item`, catching a regression where a producer started always-emitting the key; (b) JSON serialization treats absent and undefined identically but consumer-side `Object.keys` and Object.entries differ. The conditional spread keeps the wire format minimal for non-abort cases.
+
+**Pending:** `/model <id>` mutation; subagent observability (1.f.2, blocked on IPC); end-to-end audit with a real provider.
+
+**Next:** end-to-end audit with a real provider, OR `/model` mutation, OR the IPC subsystem.
+
+---
+
+## [2026-05-03] M1 / Step 1.g.2 — Audit cause discriminator (HarnessResult.abortCause)
+
+Closes D157. Until now, `HarnessResult.reason === 'aborted'` was the only signal an audit consumer had — soft and hard interrupts produced structurally identical results. Operator that hit Esc once vs Esc-Esc looked the same in audit, telemetry, and any future replay tooling.
+
+This slice adds a parallel `abortCause?: 'soft' | 'hard'` field that's threaded through `finish()` from the abort site that knew which signal fired. Existing surface stays intact (`reason: 'aborted'` continues to mean "operator interrupted"); new field is opt-in for consumers that care.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/harness/types.ts` | NEW `HarnessResult.abortCause?: 'soft' \| 'hard'`. Optional and only meaningful when `reason === 'aborted'` — undefined for done/maxSteps/maxWallClockMs/error/etc. (the discriminator is meaningless when the loop didn't exit via the abort path). |
+| `src/harness/loop.ts` | `finish()` helper signature gains optional third arg `abortCause`. The 4 abort exit sites in the loop now pass it: top-of-loop hard check (`'hard'`), top-of-loop soft check (`'soft'`), tool-loop inner hard check (`'hard'`), tool-loop inner soft check (`'soft'`). Wall-clock paths (`finish('maxWallClockMs')`) intentionally don't carry a cause — wall-clock is its own reason. The provider-error abort branch (catches SDK throws when `signal.aborted`) marks `'hard'` since soft can't preempt a provider call. |
+| `tests/harness/loop.test.ts` | Existing soft/hard tests strengthened with explicit `abortCause` assertions (4 tests: pre-aborted hard, soft pre-aborted, soft mid-tool, soft between tool_uses, hard regression cover, hard mid-stream). NEW baseline test asserting `abortCause` is undefined for non-abort exits (done turn). |
+
+**Decisions:**
+
+- **D166 — Parallel field, not split ExitReason.** Considered `'aborted_soft' \| 'aborted_hard'` as ExitReason variants. Rejected because: (a) every existing consumer that switches on `reason === 'aborted'` would have to handle two cases or risk a silent fallthrough, (b) the adapter's `mapExitReason` (and any future audit query) would need to special-case both, (c) the two represent the same outcome ("operator interrupted") with different mechanism — `reason` describes what; `abortCause` describes how. Parallel field is additive, type-safe (the discriminator only exists on aborted results), and trivially ignorable for consumers that don't care.
+- **D167 — Threaded via `finish()`, not per-call-site.** Considered post-processing the result in `runAgent`'s outer return. Rejected — the cause is known at the call site (which signal fired), not derivable from the result shape. Threading through `finish()` keeps the discriminator close to the truth source. The optional third param means existing `finish('maxSteps')` calls don't change.
+- **D168 — Subagent runtime not extended (out of scope).** `RunSubagentResult` (in `src/subagents/runtime.ts`) has its own `reason: 'aborted'` path for the subprocess wait loop. Not extended in this slice because: (a) subprocess subagents only honor hard signals today (D159 — soft can't propagate without IPC), so the discriminator would always be `'hard'` and is information-free, (b) `RunSubagentResult` and `HarnessResult` are different types — adding the field on both would force consumers to duplicate the narrowing logic. When the IPC slice lands and subagents honor soft, this field gets added in the same change.
+- **D169 — `abortCause` persisted to SQLite (post-review).** Initial cut had the discriminator only in-memory: `HarnessResult.abortCause` died at the process boundary, so `agent --session <id>` queries and replay tools couldn't recover whether an abort was soft or hard. That defeated the slice's stated purpose ("audit / telemetry / replay"). Migration 017 adds an `abort_cause TEXT CHECK (NULL OR 'soft'|'hard')` column to `sessions`. `completeSession` accepts the new optional `abortCause` arg; the harness's `finish()` threads it through alongside the in-memory result. Existing rows backfill to NULL — the check accepts NULL as the explicit "no discriminator" value.
+- **D170 — `guardedFinish` remaps aborted exceptions (post-review).** Pre-1.g.2 a SQLite write failing because `signal.aborted` mid-flight was caught and reported as `internalError` — looked like a harness bug instead of operator-initiated termination. The chance to fix it landed in this slice but the initial cut missed. `guardedFinish` now checks `signal.aborted` at throw time and routes to `finish('aborted', detail, 'hard')` (or `maxWallClockMs` if the wall-clock controller fired) before falling back to `internalError`. Soft never reaches this path — the soft signal only fires at step boundaries, never inside an exception throw window.
+- **D171 — Adapter does NOT consume `abortCause` (deferred).** `harness-adapter.ts` translates `session_finished` → `session:end` UIEvent. The UIEvent's `reason` field is `string`-typed (with a fixed-set hint) and doesn't carry `abortCause`. Operator in the TUI sees the same `session:end reason=interrupted` for both soft and hard. Closing this gap requires either (a) extending `SessionEndEvent` with an optional `abortCause` field and threading through the adapter, or (b) passing the discriminator via a separate UIEvent (audit-only). Out of scope here — TUI surface is mostly stable for M1, and the operator-visible signal is already in the footer cue (`esc to interrupt` → `esc again to force`). Closes when the audit panel / NDJSON output slice lands.
+- **D172 — `HarnessResult.abortCause` could be a discriminated union (deferred).** Today: `abortCause?: 'soft' | 'hard'` on the unified `HarnessResult` shape — TS allows `{reason: 'done', abortCause: 'soft'}` by construction, defended only by `finish()`'s runtime guard. A discriminated union (`{reason: 'aborted', abortCause: ...} | {reason: Exclude<...>; }`) would push the constraint into the type system. Refactor is significant: every consumer that destructures `HarnessResult` needs to narrow before reading `abortCause`. Defer until there's a concrete consumer that benefits (audit panel, replay query). Today the in-house guard + the SQLite CHECK constraint cover the production paths.
+
+**Pending:** `/model <id>` mutation; subagent observability (1.f.2, blocked on IPC); end-to-end audit with a real provider before locking M1.
+
+**Next:** end-to-end audit with a real provider, OR the IPC subsystem that unblocks 1.f.2 + D159 + D168, OR `/model` mutation.
+
+---
+
+## [2026-05-03] M1 / Step 1.f.7 — Mutation slash commands (/plan, /budget)
+
+Closes a gap deferred from 1.f.1: `/plan on`, `/plan off`, `/budget steps N`, `/budget cost X`. The infrastructure (parser, registry, dispatcher, autocomplete UI) was complete in 1.f.1 with mutation paths intentionally rejecting; this slice fills them in. `/model <id>` stays deferred — re-resolving the provider mid-session is structurally heavier (key check, capability re-init, cost-table re-load) and warrants its own slice.
+
+Mutation lands in `baseConfig` (the harness config the REPL bootstraps with) and takes effect on the NEXT turn. The current turn (if any) already snapshot its config when `startTurn` ran; live cancellation for a config flip would surprise the operator. Confirmation note makes timing explicit.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/cli/slash/commands/plan.ts` | NEW `/plan on` and `/plan off` paths. Read-only `/plan` preserved. Idempotent: `/plan on` when already enabled returns "already enabled" without the next-turn cue (so the operator doesn't see a misleading "takes effect" message for a no-op). Unknown args ('/plan maybe') and too-many-args paths return error. |
+| `src/cli/slash/commands/budget.ts` | NEW `/budget steps <N>` (positive integer cap on maxSteps) and `/budget cost <USD\|none\|off>` (positive decimal cap on maxCostUsd; `none`/`off` clears the cap entirely). Both subcommands validate the value with explicit regex (rejects negatives, NaN, decimals for steps, multiple decimal points, empty string). Other budget fields (maxWallClockMs, maxToolErrors) stay non-tunable from the slash surface — they're internal safety budgets, not operator UX. |
+| `tests/cli/slash/commands.test.ts` | The pre-existing "rejects mutation args" tests for /plan and /budget were now wrong (those paths succeed). Replaced with the new positive + negative coverage: 6 tests for /plan (read disabled / read enabled / on flips / off flips / on idempotent / unknown arg / too many args), 11 tests for /budget (read shape / no cap render / steps positive / steps negative cases / steps arity / cost positive / cost zero allowed / cost none clears / cost off alias / cost negative+NaN / unknown subcommand / partial mutations preserve unrelated fields). |
+
+**Decisions:**
+
+- **D160 — Mutation lands in baseConfig; current turn unaffected.** Considered (a) injecting the mutation into the in-flight HarnessConfig snapshot, or (b) rejecting the command while a turn is running, or (c) the chosen path: mutate baseConfig in place, take effect next turn. (a) was rejected because the harness loop reads its config exactly once at startup and reflects changes inconsistently mid-step (provider params already snapshotted, budget gates already evaluated). (b) was rejected because operator UX of "wait for the turn to finish before reconfiguring" is annoying — operators frequently queue up `/plan on` while a long turn is running so the next prompt picks it up. (c) is the simplest: mutation is an immediate state change on the shared config object, applied at the next startTurn boundary. The confirmation note tells the operator when to expect the change.
+- **D161 — `/budget cost 0` is a valid "no spend" mode.** A literal-zero cap means "the first paid turn trips the gate". Different from `none` (no cap at all). `none` is the operator saying "stop enforcing"; `0` is the operator saying "stop spending". Tested explicitly to prevent a future "treat 0 as falsy" regression that would silently widen the cap.
+- **D162 — `/budget cost none` deletes the field rather than setting `undefined`.** RunBudget's `maxCostUsd?: number` treats `undefined` as "no cap" via the docstring contract. `delete` preserves boot-time absence semantics — diff tools and JSON serializers treat absent vs `undefined` differently, and the harness's spread-merge could reintroduce the key in a future refactor. Object destructuring + spread idiom (`{ maxCostUsd: _drop, ...rest }`) keeps the mutation cheap and explicit.
+- **D163 — Footer drift on `/plan` is acceptable.** `state.status.planMode` reflects the last `session_start` event payload, not `baseConfig` directly. Operator types `/plan on` and sees the confirmation note, but the footer's `plan` token doesn't appear until the next turn's `session_start` fires. The next-turn note in the confirmation makes this explicit. Future polish: a synthetic `session:status:update` event could refresh the footer immediately, but that's a UIEvent shape addition and a separate slice.
+- **D164 — Idempotency aligned across `/plan` and `/budget` (post-review).** Initial cut had `/plan` short-circuit on no-op (returns "already" without the next-turn cue) but `/budget steps 50` and `/budget cost 5` always wrote and always announced "next turn" — even on no-op repeats. Inconsistent UX: operator who repeats a budget command thinks something changed. Both subcommands now check `current === requested` and return "already X (no change)" without the next-turn cue, matching `/plan`. `cost none` also gets the idempotent path when the cap is already absent.
+- **D165 — `isRunning` cue when mutating mid-turn (post-review).** D160 chose "mutation lands now, takes effect next turn" but the confirmation note was the same regardless of whether a turn was actually running. Operator mutating `/budget cost 1` while a turn that's about to spend $50 is mid-execution had no cue that the in-flight prompt ignores the new cap. SlashContext gained `isRunning: () => boolean` (closure over the REPL's `running` flag, fresh per call). Mutation commands append `(current turn already snapshot its config; new value applies starting next prompt)` to the notes when running. Idle path stays single-line.
+
+**Pending:** `/model <id>` mutation (separate slice — provider re-resolution); subagent observability (1.f.2, blocked on IPC); end-to-end audit with a real provider before locking M1.
+
+**Next:** end-to-end audit with a real provider, OR the IPC subsystem that unblocks 1.f.2 + D159, OR `/model` mutation.
+
+---
+
+## [2026-05-03] M1 / Step 1.g.1 — Hard-abort cooperative semantics
+
+Closes D141: until now, the footer's "esc again to force" cue was lying. Spec UI.md §3 distinguishes:
+
+| Level | Behavior |
+|---|---|
+| `soft` | Model finishes the step then stops — cooperative |
+| `hard` | Cancel tool in flight immediately — preemptive |
+
+Pre-1.g.1 the harness only had ONE signal (preemptive `AbortController.abort()`); first Esc and second Esc both hit the same path, just different audit labels. This slice adds a separate `softStopSignal` to `HarnessConfig` checked at the loop's step boundary, so first Esc lets in-flight work finish and exits cleanly before the next provider call; second Esc still preempts via the existing hard signal.
+
+Operator UX impact: an operator who hits Esc during a `bash sleep 30` now waits up to 30 seconds for the tool to complete, then the loop exits. The previous behavior killed mid-sleep. Spec is explicit that this is the right tradeoff — the cooperative path saves token budget on a re-prompt the operator would have cancelled anyway, and the escalation path (second Esc) is a single keystroke away. Reflected in the existing footer cue: "esc to interrupt" → "esc again to force".
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/harness/types.ts` | NEW `HarnessConfig.softStopSignal?: AbortSignal`. Optional — when absent, the loop only honors the hard `signal`, preserving pre-1.g.1 behavior so non-REPL callers (programmatic, tests, batch) opt in deliberately. |
+| `src/harness/loop.ts` | Step boundary check at the top of the while loop: `if (config.softStopSignal?.aborted) return finish('aborted')`. Sits AFTER the hard `signal.aborted` check (so simultaneous fires resolve as hard, which is more informative for `isWallClockTimeout` discrimination) and BEFORE budget checks (so a soft fire takes precedence over `maxSteps`/`maxCostUsd` exits — the operator's intent wins). |
+| `src/cli/repl.ts` | Two controllers per turn (`abortController` for hard, `softStopController` for soft). Both reset in `startTurn` so a soft fire from a prior turn can't leak. Editor's interrupt handler routes by level: first tap → `softStopController.abort()` only; second tap → `abortController.abort()`. Same split mirrored on the SIGINT handler so Ctrl+C and Esc share a single ladder per spec UI.md §5.4. The hard controller stays the source of truth for the shutdown path (immediate teardown). |
+| `tests/harness/loop.test.ts` | NEW 3 tests: pre-aborted softStopSignal exits with `aborted` and zero provider calls; soft fired mid-tool execution lets the tool complete then exits without the next provider call (asserted via toolFinished flag + handle.requests.length); regression cover that hard abort still preempts in-flight tools (`ctx.signal.aborted` observed inside the tool). |
+| `tests/cli/repl.test.ts` | Existing "Esc during a turn aborts" test rewritten to assert the new contract: first Esc fires soft signal only, hard signal stays unaborted. "Second Esc → hard" test strengthened to assert the underlying signal shapes (was previously inferring from the renderer cue alone). "Shutdown awaits run" test updated for the three-SIGINT ladder (1: soft, 2: hard → fixture resolves, 3: requestShutdown). "Ctrl+C flips footer" still works as-is — the soft path emits the same UIEvent. |
+
+**Decisions:**
+
+- **D154 — Separate AbortSignal, not a flag.** Considered adding `interruptCooperative: () => void` to HarnessConfig or a mutable flag. AbortSignal won because: (a) it composes with the existing `signal` field — same primitive, same shape, callers that already maintain controllers just add a second; (b) the loop's check is structurally identical to the hard check (`signal.aborted` vs `softStopSignal?.aborted`); (c) AbortSignal supports the no-op default (undefined) without a sentinel. Cost: a second AbortController allocation per turn. Trivial.
+- **D155 — Soft check sits AFTER hard, BEFORE budget.** Ordering matters when multiple gates fire simultaneously. Hard before soft so a wall-clock-timeout-induced abort (which fires `signal.aborted` AND is detectable via `isWallClockTimeout()`) reports `maxWallClockMs`, not `aborted` — preserves the existing diagnostic value. Soft before budget so a cooperative stop overrides a coincident `maxSteps`/`maxCostUsd` boundary — the operator's intent should land in the audit log even when budget caps would have terminated the same step.
+- **D156 — Both controllers reset per turn.** The `softStopController` lives at the same scope as `abortController` and resets in the same `startTurn`. A soft fire from turn N should not bleed into turn N+1 — the operator already saw their cancellation honored. Asserted indirectly by every existing multi-turn test that didn't break (none did).
+- **D157 — Shutdown still uses hard.** `shutdown()` calls `abortController.abort()` (not soft) — when the REPL is exiting, the operator isn't asking for a graceful step boundary, they're asking to leave NOW. Cooperative for in-session interrupts; preemptive for shutdown. Edge case: if soft is already in flight when the operator triggers shutdown (e.g., types `/quit` while a tool is finishing), the hard signal preempts the cooperative path mid-tool. `HarnessResult.reason` reports `'aborted'` in both cases — audit can't distinguish "soft completed naturally" from "hard preempted soft" today. Tracked alongside D141's audit-cause discriminator follow-up.
+- **D158 — Soft check inside the per-step tool loop, not just at step boundary (post-review).** Initial cut placed the soft check only at the top of the outer `while (true)`. Code review caught: when the model returns multiple `tool_use` blocks in a single step, soft fires after tool 1 → harness still runs tool 2 → tools 3..N → only THEN exits at the next outer iteration. Side effects + wall-clock + budget all burned on work the operator already cancelled. Fix: mirror the top-of-loop soft check into the inner `for (const tu of collected.tool_uses)` so soft short-circuits between tools. Already-executed tools' results stay in the message log (audit-correct); the unfired tools never run; loop exits with `reason: 'aborted'`.
+- **D159 — Subagent path forwards `softStopSignal` but the subprocess child can't act on it (post-review).** Code review caught the subagent gap: the subagent runtime is subprocess-based, so the parent has no IPC channel to deliver a soft signal to the child's harness loop. The OS only carries hard signals (SIGTERM/SIGKILL), which are inherently preemptive. Today: parent's `softStopSignal` IS forwarded to `runSubagent` (wired for forward-compat with the future in-process subagent path), but the subprocess wait loop ignores it. Operator UX impact: an Esc-during-task lets the subagent run its full budget; the parent's top-of-loop soft check fires only after `await runSubagent` returns. Closes when the IPC slice (same one that unblocks 1.f.2 subagent observability) lands — at that point, the in-process child path will honor soft directly, and the subprocess path will route soft via a published-message protocol.
+
+**Pending:** mutation slash commands; subagent observability (1.f.2, blocked on IPC); end-to-end audit with a real provider before locking M1.
+
+**Next:** end-to-end audit with a real provider — the M1 TUI series is functionally complete on every in-process surface (slash, todos, assistant chip, soft+hard abort, bg). Real-provider validation surfaces integration bugs unit tests can't reach.
+
+---
+
+## [2026-05-03] M1 / Step 1.f.3 — Background process observability
+
+Closes the last in-process gap on the live region: until now, `bash_background` would spawn a process and the operator had no visible signal — no chip, no count, nothing. Spec UI.md §4.10.6 + §4.4 define a `bg N` counter token in the footer's right column; this slice wires the producer (BgManager → harness → adapter → reducer) and renders it.
+
+The slice scope is intentionally a counter, not a tray. Spec §4.10.6 right column lists "model · plan · bg · steps/max · cost" — a single token showing the live count, not per-process detail. A future expanded-tray panel (ctrl+o-style) would extend the BgManagerEvent shape and the reducer's `bgProcesses` map (which is already keyed by processId so per-process detail lives there); today the footer just reads `.size`.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/bg/manager.ts` | NEW `BgManagerEvent` discriminated union (`{kind: 'started'\|'ended', ...}`). `CreateBgManagerOptions.onEvent?` callback fires once per `started` (after spawn succeeds, after live.set so getStatus is consistent inside the observer) and once per `ended` (from inside exitedSettled, after the OS reaped, regardless of natural-vs-killed cause). `safeEmit` swallows observer throws so a buggy renderer can't break process lifecycle (mirrors HarnessConfig.onEvent's contract). NEW `killing: Set<string>` tracks operator-initiated termination so the exitedSettled handler can emit `status: 'killed'` instead of 'exited' — necessary because kill() finalizes the DB row AFTER awaiting exitedSettled, so the natural-exit branch can't read the killed status from the row. Cleared in finally. |
+| `src/bg/index.ts` | Re-exports the new `BgManagerEvent` type. |
+| `src/harness/types.ts` | NEW `bg_started` and `bg_ended` HarnessEvent variants (no `bg_updated` today — manager emits start/end only). `bg_started` carries processId, command, label; `bg_ended` carries processId, status, exitCode. |
+| `src/harness/loop.ts` | `createBgManager` call site now wires `onEvent` to `safeEmit(config.onEvent, ...)` translating BgManagerEvent → HarnessEvent shape-for-shape. |
+| `src/tui/harness-adapter.ts` | NEW translation cases `bg_started → bg:start` (pass-through) and `bg_ended → bg:end` (status maps to optional `signal` field: `'KILLED'`/`'FAILED'` for non-natural exits, undefined for clean). |
+| `src/tui/state.ts` | NEW `LiveState.bgProcesses: Map<string, {processId, command}>`. Reducer: `bg:start` adds (Map.set semantics — duplicate processId silently overwrites, count stays correct); `bg:end` removes (unknown processId is a no-op for out-of-order safety); `bg:update` is silent (no producer today, reserved for a future per-process tray). `session:start` clears the map (per-session boundary). |
+| `src/tui/render/footer.ts` | Right column gains `bg N` token between `plan` and `steps/max` per spec §4.10.6 ordering. Token only surfaces when `bgProcesses.size > 0` — zero processes drops it entirely (no `bg 0` noise). |
+| `tests/bg/manager.test.ts` | NEW 3 tests in a new `onEvent` describe block: started + ended pair fires for natural exit (exactly once each, with command/label preserved); kill() flips status to 'killed' on the ended event; observer throws don't break the process lifecycle. |
+| `tests/tui/state.test.ts` | NEW 6 tests on bg lifecycle: initial empty map; bg:start/bg:end add/remove; unknown processId on end is a no-op; duplicate processId on start overwrites silently; bg:update doesn't flap the count; session:start clears the map. |
+| `tests/tui/render/footer.test.ts` | NEW 3 tests: `bg N` shows between plan and steps; counter drops when size is 0; bg + plan mode coexist in spec order. |
+| `tests/tui/harness-adapter.test.ts` | NEW 4 tests: bg_started → bg:start with full payload; bg_ended natural exit → bg:end without signal; killed → signal=KILLED; failed → signal=FAILED. |
+| `tests/harness/events.test.ts` | NEW e2e test: register a fake tool that calls `ctx.bgManager.spawn()`, drive a session, assert both `bg_started` and `bg_ended` HarnessEvents land in `onEvent`. Locks the loop's onEvent wiring against future regressions. |
+
+**Decisions:**
+
+- **D146 — Single emit point in exitedSettled, not from kill() / cleanup() finalize sites.** Initial design considered emitting from each `finalizeBgProcess` call. Problem: kill() awaits exitedSettled BEFORE its own finalize, so the natural-exit handler runs first with the row still showing 'running' and would emit `status: 'exited'` for what's actually a kill. Solution: track operator-initiated termination via a `killing` Set, marked in kill() before sending the signal, read in exitedSettled to choose 'killed' vs 'exited'. Single emit point keeps the contract "exactly one started, exactly one ended" without per-call-site dedup logic.
+- **D147 — Skip emit on spawn failure and on kill-without-handle.** Both paths represent processes that never had a live OS handle (spawn threw, or the process exited before kill could attach). The audit row exists with status='failed'/'killed' for forensics, but the TUI tray would show a phantom counter entry. The contract is "tray reflects live processes", not "tray reflects every audit row". Caller of spawn sees the synchronous exception; consumers downstream of the bus don't see ghost entries.
+- **D148 — Counter, not tray, in the footer.** Spec UI.md §4.10.6 explicitly lists `bg N` as a single token in the right column ("model · plan · bg · steps/max · cost"). A per-process tray (showing each command, status, runtime) is a future panel — likely the same expand-chip mechanism that ctrl+o opens for tool calls. The reducer's `bgProcesses` map is already keyed by processId carrying the command, so when the panel lands the data is there; today only `.size` is read.
+- **D149 — `bg:update` UIEvent silent in reducer (no producer).** The event shape exists in `events.ts` (carries `status: string`), but no producer fires it today — the manager only emits started/ended. Spec §4.10.6 doesn't define what an "update" would change in the footer counter (the count doesn't flap on per-process state changes). The reducer's no-op branch is wired for type exhaustiveness; when a future signal lands (CPU spike, log line surfaced), this is the natural integration point.
+- **D150 — Footer order: `bg N` after cost (post-review).** Initial cut put `bg N` between `plan` and `steps/max` ("drift is early-warning, budget is constraint"). Code review caught the divergence: spec §4.4 line 245 (the only concrete bg example) orders `model · steps/max · cost · mem · bg` — bg trailing. Spec §4.10.6 line 480's removal-priority list ("mcp → bg → mem → cost label drop in this order on narrow terminals") reinforces bg as less-sticky than cost. Aligned to the spec example without a spec PR — the early-warning rationale is real but should land via PR-against-spec, not as a quiet code divergence.
+- **D151 — `signal: 'KILLED'/'FAILED'` removed; `cause` field added (post-review).** Initial cut overloaded `BgEndEvent.signal` (documented as POSIX signal name) with sentinel strings `'KILLED'`/`'FAILED'` to discriminate cause. Type-correct but semantically wrong — any consumer that maps `signal` against `kill -l` would break. Added explicit `cause: 'exited' \| 'killed'` field; `signal` stays optional and reserved for actual POSIX names (manager doesn't carry them today). Also dropped the `'failed'` variant from `BgManagerEvent.ended.status` — D147 says the spawn-fail path doesn't emit, so the variant was dead code with a phantom test exercising a path no producer fires. Add it back when a real producer lands.
+- **D152 — Reducer also clears `bgProcesses` on `session:end` (post-review).** The harness emits `session_finished` BEFORE its outer finally runs `bgManager.cleanup()` — meaning `bg_ended` events from cleanup arrive AFTER `session:end`. Without zeroing the map on session:end, the operator briefly sees `bg N` in the footer for processes the harness has already committed to killing — a visual zombie tray. The late `bg:end` events still flow through, dropped as no-ops by the unknown-processId branch.
+- **D153 — `markRunningAsKilled` doesn't emit (future scope).** `bgManager.cleanup()` calls `markRunningAsKilled(db, sessionId)` as a safety net for rows the manager doesn't have live handles for (resume edge case, prior-session orphans). That path doesn't emit `bg_ended` because no live OS process corresponds to it. Today this is fine — the resume path doesn't hydrate `bgProcesses` in the tray. When/if resume hydrates per-process state from the DB at session_start, this gap becomes real (rows would show as "alive" forever in the counter). Tracked here for the resume slice that lights up.
+
+**Pending:** mutation slash commands; subagent observability (1.f.2, blocked on IPC); hard-abort cooperative semantics (D141 in 1.f.6); end-to-end audit with a real provider before locking M1.
+
+**Next:** the M1 TUI series is now functionally complete on every in-process surface (slash, todos, assistant chip, soft-abort, bg). Natural next steps are (a) hard-abort cooperative semantics, (b) end-to-end audit with a real provider, (c) the IPC subsystem that unblocks 1.f.2.
+
+---
+
+## [2026-05-03] M1 / Step 1.f.6 — Soft-aborted footer state
+
+Closes the missing footer state from spec UI.md §4.10.6. Until now, hitting Esc mid-turn aborted the run via `AbortController.abort()`, but the footer's interrupt cue stayed at "esc to interrupt" — the operator had no signal that the loop had acknowledged. Spec table:
+
+| State | Cue |
+|---|---|
+| Running | `esc to interrupt` |
+| **Soft-aborted (still processing)** | `esc again to force` |
+
+This slice wires the missing transition: REPL emits an `interrupt` UIEvent on the bus when soft Esc fires, the reducer flips a `softInterrupted` flag, the footer renderer reads it and swaps the cue. Boundary cleanup (session:start / session:end) clears the flag so the next turn starts clean.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/state.ts` | NEW `LiveState.softInterrupted: boolean` (defaults false). Reducer's `interrupt` case (was no-op) sets the flag on `level: 'soft'`; `level: 'hard'` is a no-op state-wise (purely diagnostic until hard-abort semantics land). `session:start` and `session:end` both clear the flag — boundary cleanup so a fresh turn starts clean and a stale flag from one session can't leak into another. |
+| `src/cli/repl.ts` | Editor's `interruptSoft` signal now emits `bus.emit({type: 'interrupt', ts: now(), level: 'soft'})` BEFORE calling `abortController.abort()`. The bus emission flows through the reducer (flips the flag) and the renderer (re-paints the footer) in the same tick the abort fires. Existing abort behavior preserved — this slice adds the visible signal, doesn't change the cancellation mechanics. |
+| `src/tui/render/footer.ts` | When `state.softInterrupted && isRunning(state)`, the left-column cue swaps from `esc to interrupt` to `esc again to force`. When `isRunning` is false, neither cue surfaces — "esc again to force" against nothing is meaningless, and the flag self-clears on `session:end` anyway. |
+| `tests/tui/state.test.ts` | NEW 6 tests on the interrupt branch: initial state has flag false; soft sets true (no permanent); hard does not flip the flag; repeated soft is idempotent; `session:end` clears the flag; `session:start` clears the flag. The "not-yet-wired" interrupt row stays — its assertion (no permanent emitted) is still correct. |
+| `tests/tui/render/footer.test.ts` | NEW 2 tests: soft-aborted + running shows the new cue and replaces (not duplicates) the old one; soft-aborted + idle drops both cues entirely. |
+| `tests/cli/repl.test.ts` | NEW end-to-end test driving the full bus → reducer → footer chain: send `go\r`, drive `session_start` + `tool_invoking` (the footer's `isRunning` checks `activeTools.size`), feed `\x1b\x1b` so the parser flushes a complete escape key, assert the captured rendererWrite frames flip from `esc to interrupt` to `esc again to force`. |
+
+**Decisions:**
+
+- **D141 — Backend cancellation is already hard; soft-cooperative is the missing slice.** Spec UI.md §3 distinguishes `level: 'soft'` (model finishes the step then stops) from `level: 'hard'` (cancel tool in flight immediately). Auditing `src/harness/loop.ts` (signal.aborted check at the loop boundary) + `invoke-tool.ts` (signal propagated into the tool) + `abortable.ts` (rejects the iterator immediately): what exists today preempts the tool in flight and the provider stream — that's HARD by spec definition. The cue ladder `esc to interrupt → esc again to force` therefore implies a soft→hard escalation that the backend doesn't actually implement. This slice surfaces the visible signal and routes the right intent on the bus (second Esc emits `level: 'hard'`); the COOPERATIVE soft path (drain at step boundary, let the model finish the current step before stopping) is the missing future slice that touches the harness loop. The reducer's `interrupt` branch is exhaustive on `level` so the soft-cooperative semantic can light up without renderer churn when it lands.
+- **D144 — SIGINT (Ctrl+C) emits the same interrupt UIEvent as Esc.** Initial cut wired only the Esc path. Code review caught the asymmetry: Ctrl+C aborted via SIGINT but the footer never flipped, so operators using Ctrl+C (the more common Unix muscle memory) got strictly worse UX than Esc users. SIGINT handler now mirrors the Esc path: emit `interrupt:soft` (or `:hard` if soft already in flight) before calling `abortController.abort()`. Spec UI.md §5.4 treats both keybindings as a single soft/hard ladder — the implementation now matches.
+- **D145 — Second Esc/Ctrl+C while soft already in flight emits `level: 'hard'`.** Initial cut re-emitted `soft` on every press, lying to audit about whether the operator escalated. The cue text "esc again to force" promises an escalation; the event stream now reflects it. Detection reads `renderer.state().softInterrupted` rather than maintaining a parallel REPL-side flag — single source of truth, automatic clear on session boundaries via the reducer. The reducer's hard branch is no-op state-wise today (D141), but audit/persistence layers (when wired) will see the right intent.
+- **D142 — Boundary clear on both session:start AND session:end.** Either alone would be sufficient in the happy path, but they cover different failure modes. `session:end` clear: ensures a turn that ended without tearing down the soft flag (because the run terminated for another reason — `done`, `maxSteps`) doesn't leave a stale "esc again to force" hanging in the footer. `session:start` clear: defends against a resume where the prior session ended mid-soft and the persistence path didn't clear it. Belt + suspenders for a small flag.
+- **D143 — Idle + soft drops the cue entirely (defensive).** `softInterrupted` should self-clear via `session:end` before the operator sees an idle frame. But if the flag somehow lingers without an active operation (test-injected state, replay path, future bug), the footer surfaces neither cue — "esc again to force" against nothing is misleading. The renderer is the last line of defense; the flag's correctness is the reducer's job.
+
+**Pending:** mutation slash commands; subagent observability (1.f.2, blocked on IPC); bg observability (1.f.3); hard-abort semantics (separate slice — distinguishes `interrupt:soft` "let the step finish" from `interrupt:hard` "kill mid-tool" at the harness loop layer).
+
+**Next:** the M1 TUI series is now functionally complete on the live-region surface. Next natural step is either (a) hard-abort semantics, (b) bg observability (1.f.3, in-process), or (c) auditing the slice end-to-end with a real provider before locking M1.
+
+---
+
+## [2026-05-02] M1 / Step 1.f.5 — Assistant chip + tokens
+
+Closes the second "operation chip" the live region was missing: the assistant turn itself. Until now the operator could see tools execute (chips) and the assistant text (raw scrollback) but had no live signal that the model was actively generating — and the per-turn token count was discarded by the adapter. Spec UI.md §4.10.5 always positioned the assistant turn as a first-class operation chip (`▸ Generating… (8s · ↑ 234 tokens)` while live; `· Generated 234 tokens in 8.2s` once final). This slice wires the producer (provider `usage` events the adapter was dropping), the chip render, and a header above the assistant text in scrollback.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/events.ts` | NEW `AssistantUsageEvent` carrying `inputTokens`, `outputTokens`, `cacheRead`, `cacheCreation` for the current message id. Added to the `UIEvent` discriminated union. The renderer pulls only `outputTokens` for the chip counter today; cache fields are surfaced for future per-turn cost breakdown / expand-chip panel. |
+| `src/tui/harness-adapter.ts` | The `provider_event` `usage` case stops dropping. Translates to `assistant:usage` UIEvent inheriting `state.currentMessageId`. Out-of-order arrival (no prior `assistant:start`) is dropped silently — better lose one counter than spawn an unattributable assistant lifecycle. |
+| `src/tui/state.ts` | `PendingAssistant` extended with `startedAt: number` (stamped from `assistant:start.ts`; falls back to first delta's `ts` for orphan-delta arrivals) plus `inputTokens`/`outputTokens`/`cacheRead`/`cacheCreation` (each `number \| null`). Reducer cases: `assistant:start` initializes all counters to null; `assistant:usage` merges via `Math.max` (monotonic — Anthropic emits cumulative, OpenAI emits one-shot, both shapes safe); `assistant:end` finalizes the scrollback record with `event.ts - startedAt` and the final token count. `PermanentItem.assistant` extended with `durationMs: number \| null` and `outputTokens: number \| null`. |
+| `src/tui/render/permanent.ts` | `assistant` branch now emits a chip header above the text when either `durationMs` or `outputTokens` is non-null. Format: `· Generated N tokens in Xs` (Unicode) / `* Generated N tokens in Xs` (ASCII). Token clause and duration clause each drop independently when their field is null — supports headless replay paths that don't surface usage. Bare-text path (both fields null) preserved verbatim for the legacy / synthetic-event call sites. |
+| `src/tui/render/assistant-chip.ts` | NEW `renderAssistantChip(pending, caps, now): string[]`. Live chip uses the same spinner glyphs as `tool-card.ts` (imported `spinnerGlyph`). Counter format follows spec §4.10.5: `(Xs · ↑ N tokens)` once usage arrived, `(Xs)` until then. ASCII fallback `^` for `↑`. Negative elapsed clamps to `0s` (defends against a buggy producer that sets `startedAt > now`). |
+| `src/tui/render/compose.ts` | Inserts the live assistant chip between TodoList and active tool cards. Layout comment updated to 5 numbered sections. Composer's cursor math (`FOOTER_BLOCK_LINES`) unaffected — the chip lives in the upper region. |
+| `tests/tui/render/assistant-chip.test.ts` | NEW 6 tests: counter without usage (duration only), counter with usage (`↑ N tokens` clause), sub-second elapsed in ms, ASCII fallback (`^` instead of `↑`), `outputTokens === 0` still renders (distinct from null), negative elapsed clamps to `0s`. |
+| `tests/tui/state.test.ts` | Existing assistant tests updated for new `PermanentItem` shape (`durationMs` is now end.ts - start.ts; `outputTokens` is null without a usage event). NEW 5 tests on the `assistant:usage` branch: merges fields onto pendingAssistant; monotonic max over multiple usage events; unknown messageId dropped; `assistant:end` produces full chip metadata when usage arrived; orphan delta stamps `startedAt` from delta.ts (not 0). |
+| `tests/tui/render/permanent.test.ts` | Existing 3 assistant tests updated to pass the new `durationMs`/`outputTokens` fields explicitly. NEW 3 tests for the chip header: full form (duration + tokens), duration-only, tokens-only. |
+| `tests/tui/render/footer.test.ts` | One existing test updated to construct `pendingAssistant` with the new fields. |
+| `tests/tui/harness-adapter.test.ts` | NEW 2 tests on the `usage` case: with prior `assistant:start` → emits `assistant:usage` with current messageId + all fields; without prior start → drops silently (no synthetic turn). The previous "usage is silently dropped" test was rewritten — the drop path now applies only to the no-start branch. |
+| `tests/harness/events.test.ts` | NEW test verifying the harness still forwards the raw provider `usage` event (the adapter consumes from this stream). The mock `replayStep` was extended to optionally yield a `usage` event when a script step declares one. |
+
+**Decisions:**
+
+- **D136 — No estimated tokens during streaming.** Spec §4.10.5 shows `(8s · ↑ 234 tokens)` as the active chip format, but Anthropic only emits `usage` once at `message_stop`. We could approximate from `pendingAssistant.text.length / 4` (chars-per-token rule of thumb) but that drift compounds badly on code-heavy turns and is exactly the kind of "looks precise, is wrong" signal the project's measure-twice-cut-once stance avoids (CLAUDE.md root premise). Live chip falls back to `(Xs)` until a usage event lands; once it does, the counter shows the real running count. Anthropic's cumulative streaming means the count updates in step with the stream when `usage` events DO arrive interim; OpenAI gets a single update at the end. Both honest.
+- **D137 — Chip header lives in `formatPermanent`, not as a separate `PermanentItem` kind.** Two approaches were valid: (a) extend the `assistant` kind with optional `durationMs`/`outputTokens` and conditionally prepend a header, or (b) emit a separate `assistant-chip` `PermanentItem` before the text. Picked (a) so callers that don't care about chip metadata (synthetic events, headless replay tools, future NDJSON consumers) keep working unchanged — passing `null` for both fields reproduces the pre-1.f.5 "bare text" behavior exactly. The price is a slightly fatter `assistant` shape; the win is no extra event ordering rule for producers ("emit chip THEN text? or interleave?").
+- **D138 — `outputTokens === 0` is distinct from `outputTokens === null`.** A turn with zero output tokens (pure tool-use turn that ended without text) should still render the counter (`↑ 0 tokens`) because that's an honest measurement. `null` means "we never received a usage event for this turn" — different signal. The renderer's branching uses strict `=== null`, not falsy checks, to keep that distinction load-bearing. Tests assert it.
+- **D139 — Tool-only turns surface a chip-only scrollback line (post-review).** Initial cut had `assistant:end` skip the permanent emission whenever `text === ''`, which lost the per-turn cost signal for Anthropic's frequent "tool_use without prose" pattern. Reducer now emits when `text.length > 0` OR `(outputTokens !== null && outputTokens > 0 && durationMs !== null)`; `formatPermanent` handles the empty-text-with-metadata case as "header alone, no text lines". Step:budget still aggregates the same numbers — this slice just exposes the per-turn breakdown in scrollback so the operator sees `· Generated 47 tokens in 3.2s` above the tool chips that turn fired.
+- **D140 — Negative-elapsed clamp uses ms units (post-review).** `formatElapsed` was returning `'0s'` for negative input; sub-second positive returns `'350ms'`. A clock-skew tick visually jumped from "(350ms)" to "(0s)". Now clamps to `'0ms'` so the unit stays consistent across the boundary. Same divergence exists in `tool-card.ts:32` — left for a future unification slice (out of scope here).
+
+**Pending:** mutation slash commands; subagent observability (1.f.2, blocked on IPC); bg observability (1.f.3); soft-aborted footer state (1.f.6).
+
+**Next:** 1.f.6 (soft-aborted footer) — REPL emits `interrupt` event, footer shifts to "esc again to force" while the model finishes the current step.
+
+---
+
+## [2026-05-02] M1 / Step 1.f.4 — Todo observability
+
+Closes a real production gap: the operator could see the agent ran `todo_write` (a chip with no subject) but had no view of *what* the model planned. Spec §4.3 always positioned the TodoList as a live region above the operation chips, but until now the event surface had no producer. This slice adds the producer (a wrapped `TodoStore.set`), the wire (`HarnessEvent.todo_updated` → `UIEvent.todo:update`), and the renderer (live `Tasks` block with the canonical glyph set).
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/events.ts` | `TodoUpdateEvent.items` realigned to the TodoStore shape: `{content, activeForm, status: 'pending' \| 'in_progress' \| 'done'}`. The previous shape (`{id, text, status: pending\|running\|done\|failed}`) was speculative and didn't match what the producer would actually have on hand — `id` doesn't exist in the store, `failed` can't happen (the tool rejects invalid lists at write time, not at render time), and `text` had to be derived from one of two fields. Direct shape sidesteps a useless adapter pass. |
+| `src/harness/types.ts` | NEW `HarnessEvent` variant `todo_updated` carrying `sessionId: string` + `items: TodoItem[]`. Fires INSIDE the wrapped `TodoStore.set` — operationally between `tool_invoking` and `tool_finished` for the `todo_write` call. Renderer ordering: chip stays in its "Updating todos…" form while the list block above materializes/changes; chip then resolves to "Updated N items" on `tool_finished`. |
+| `src/harness/loop.ts` | Wraps `createTodoStore()` so `set(sessionId, items)` emits `todo_updated` after persisting. Wrapper, not store mutation: the in-memory store stays a pure data structure; observability is layered on at the harness boundary. Wrap is per-session (created inline at the same site as the bare store) so test contexts that bypass the harness still get the unobserved store. |
+| `src/tui/harness-adapter.ts` | NEW `todo_updated` translation → `todo:update` UIEvent. Items pass through verbatim (shapes match by construction). |
+| `src/tui/state.ts` | NEW `LiveState.todos: TodoItem[]` field; reducer's `todo:update` branch overwrites (full-replace per spec §7.4). `createInitialState` seeds `[]`. |
+| `src/tui/render/todo-list.ts` | NEW `renderTodoList(todos, caps): string[]`. Empty list → empty array (compose drops the section). `Tasks` header followed by per-item rows. Glyphs: `✓` done, `▶` in_progress, `○` pending (ASCII fallback `[x]`/`[*]`/`[ ]`); `failed` glyph defined for forward-compat but never rendered today (store can't produce it). Up to 8 visible per spec §4.3; over 8 collapses to `▶ in-progress + next 2 pending + done count` with a discreet `(+N more)` line. |
+| `src/tui/render/compose.ts` | Inserts `renderTodoList` ABOVE the active tool cards when `state.todos.length > 0`. Per spec §4.10.6: "Todo list (§4.3) acima dos chips, se houver." composeCursor's bottom-anchor math is unaffected (todo list lines add to the upper region). |
+| `tests/tui/state.test.ts` | NEW 4 tests: empty list initial, todo:update populates state, second update full-replaces, compose includes rendered block when todos present. |
+| `tests/tui/render/todo-list.test.ts` | NEW 7 tests: empty returns []; header + 1 row each per status; glyph fallback to ASCII when caps.unicode=false; truncation kicks in at >8 items with `(+N more)` suffix; truncation keeps the in_progress item even when it's beyond position 3. |
+| `tests/tui/harness-adapter.test.ts` | NEW test: `todo_updated` HarnessEvent → single `todo:update` UIEvent with items pass-through. |
+| `tests/harness/events.test.ts` | NEW 3 tests on top of the existing onEvent suite: ordering (`tool_invoking < todo_updated < tool_finished`), plan-mode + `todo_write` still emits (regression cover for `metadata.planSafe = true`), observer mutating `event.items` does NOT corrupt the next emission (defends the `baseStore.get()` readthrough in the wrap from a future "optimization" that drops the deep-clone discipline). |
+
+**Decisions:**
+
+- **D131 — Producer is a `TodoStore.set` wrapper, not a mutation in the store itself.** The store is `src/todo/index.ts` — a pure data structure with one job (in-memory list, deep-clone on read/write). Adding an event hook to `createTodoStore` would couple the data structure to the harness's emission contract; tests that need a store without the wire would have to opt out. The wrapper lives at the call site (loop.ts line 159), composes with `createTodoStore`, and is invisible to anything that constructs the store directly.
+- **D132 — Hook is on `set`, not on `clear`.** Today only `todo_write` writes to the store, so emission timing is determined by where the wrap lives. Wrap is on `set` only — `clear` (the harness's session-end cleanup path) does NOT trigger emission, because list teardown at session-end is not a planning event the operator should see. Operationally `todo_updated` fires between `tool_invoking` and `tool_finished` for `todo_write` (the tool calls `set` mid-execute), not after the tool returns. The renderer sees the list materialize while the chip is still "Updating todos…", then the chip resolves on `tool_finished`. That ordering is asserted by `tests/harness/events.test.ts`.
+- **D133 — `failed` status defined in the renderer but not in the store.** Spec §4.3 lists `✗` as one of four glyphs; the TodoStore enum is only three statuses. Choices were (a) drop the glyph from the renderer (loses spec compliance for a future feature) or (b) keep the case wired but unreachable today. Picked (b) — the renderer's switch is exhaustive, a future extension that adds `failed` to the store enum lights up the glyph automatically. Today's tests assert the three reachable statuses; the failed branch is dead code by design.
+- **D134 — Status-set fence in the adapter (post-review).** Code review surfaced that the adapter's pass-through `items: event.items` would silently accept a future `TodoStatus` variant (e.g. `'blocked'`) that the renderer's `GLYPHS` table can't handle, producing literal `"undefined "` glyphs. Mitigation: explicit `mapTodoItem` per-field map plus a `satisfies TodoStatus[]` fence constant in the adapter. Adding a fourth variant to `TodoStatus` without also widening `TodoStatusForUI` now fails to type-check at the fence — build breaks instead of UI rendering garbage.
+- **D135 — Renderer scrubs embedded `\n`/`\r` in todo content.** `todo_write`'s `validateStringField` doesn't reject newlines, so a model could write `content: "line1\nline2"` and the rendered string would split into two terminal rows when written. The renderer's `liveHeight = truncated.length` math assumes one input string == one terminal line; under-counting leaves ghost rows after `eraseLive`. Renderer-side scrub (`renderRow` strips `[\r\n]+`) is defense-in-depth — fixing the validator would also work but the renderer's contract with `composeLive` is the load-bearing invariant. Tabs are kept (single-cell render in most terminals).
+
+**Pending:** mutation slash commands; subagent observability (1.f.2, blocked on IPC); bg observability (1.f.3); assistant chip + tokens (1.f.5); soft-aborted footer (1.f.6).
+
+**Next:** 1.f.5 (assistant chip + tokens) — the adapter currently drops `usage` events; the footer / a live chip should show "Generating… (Xs · ↑ N tokens)" while the model streams.
+
+---
+
+## [2026-05-02] M1 / Step 1.f.1 — Slash command subsystem
+
+Closes one of the production gaps: the footer's `? for help` no
+longer lies, the user has a clean exit path (`/quit`) instead of
+double Ctrl+C, and the operator can introspect runtime state
+without dropping to a separate CLI invocation. 8 builtin commands
+ship complete. Mutation commands (`/model <id>`, `/plan on`,
+`/budget cost 5.0`) are deliberately deferred — they need
+mid-session reconfiguration of the harness, a different design
+class than the read commands.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/cli/slash/types.ts` | NEW `SlashCommand`, `SlashContext`, `SlashResult` types. Commands receive a context with handles to bus, modal manager, DB, base config, cumulative stats (for `/cost`), wall-clock source, and a `requestShutdown` callback (for `/quit`). Returning `{kind: 'ok' \| 'error' \| 'exit', notes?, message?}` lets the dispatcher gate side effects through one path. |
+| `src/cli/slash/parse.ts` | NEW `parseSlashInput(string): {name, args} \| null`. Detects slash invocations: must start with `/` (leading whitespace = normal user message); empty body = bare `/` for autocomplete. Args split on whitespace, name preserved case-sensitively (paths/IDs in arguments stay intact). |
+| `src/cli/slash/registry.ts` | NEW `createRegistry(commands[])` returns `{lookup, complete, list}`. Lookup is exact-match (no fuzzy). `complete` does prefix matching, sorted, case-insensitive on the prefix. Duplicate registration throws at construction. |
+| `src/cli/slash/index.ts` | NEW `createBuiltinRegistry()` assembles all 8 commands; `dispatch(parsed, opts)` runs the lookup-and-execute path. Bare slash (name empty) is a no-op. Unknown name surfaces "unknown command: /<name> (try /help)" via `errorSink` (defaults to bus error event; tests inject collectors). Crash in `cmd.exec` collapses to a labeled error without propagating. Successful command notes get emitted as warn lines on the bus so they land in scrollback. |
+| `src/cli/slash/commands/help.ts` | NEW `/help` — lists every command in two-column format (`/<name>  <description>`). Output goes through the dispatcher's notes mechanism (warns in scrollback). Closure-builder so `/help` can list itself + every other command without circular import. |
+| `src/cli/slash/commands/quit.ts` | NEW `/quit` — calls `ctx.requestShutdown()` and returns `kind: 'exit'`. The REPL's shutdown path drains a running turn before closing the DB (per 1.d.4 D81). |
+| `src/cli/slash/commands/clear.ts` | NEW `/clear` — emits a `screen:clear` UIEvent. The renderer (not the reducer) handles it: writes `\x1b[2J\x1b[H` to wipe visible area + redraws the live region. Terminal scrollback above the visible area is preserved (xterm Ctrl+L behavior). |
+| `src/cli/slash/commands/cost.ts` | NEW `/cost` — single-line summary `cumulative: $X · N steps · M turns`. Cost format degrades with magnitude (4 decimals < $1, 3 < $100, 2 ≥ $100) — same formatter shape as the footer's right column. |
+| `src/cli/slash/commands/sessions.ts` | NEW `/sessions [limit]` — reads recent sessions from the DB (scoped to current cwd; default limit 10). Each row: 8-char id prefix · ISO timestamp · status · cost · model. Rejects non-positive / non-numeric limit args. Empty result surfaces `no sessions found for <cwd>`. |
+| `src/cli/slash/commands/model.ts` | NEW `/model` — read-only show of provider id + context window + max output tokens. Mutation arg surfaces "changing the model mid-session is not supported yet (read-only)". |
+| `src/cli/slash/commands/plan.ts` | NEW `/plan` — read-only status (enabled / disabled with the implication for write tools). Mutation arg surfaces the equivalent error. |
+| `src/cli/slash/commands/budget.ts` | NEW `/budget` — read-only summary of all four caps: maxSteps, maxWallClockMs (formatted as `Xs`/`Nmin`), maxToolErrors, maxCostUsd ("no cap" when unset). Mutation arg rejected. |
+| `src/tui/events.ts` | NEW `ScreenClearEvent` (`screen:clear`) — renderer-side concern; reducer no-ops. NEW `SlashUpdateEvent` (`slash:update`): `suggestions[]` + `selectedIdx`. Empty suggestions + idx -1 = "exit slash mode" (reducer clears `state.slash` to null). |
+| `src/tui/state.ts` | NEW `SlashAutocomplete` interface + `LiveState.slash: SlashAutocomplete \| null`. Reducer for `slash:update` mirrors the payload onto state (or clears on the empty-empty signal). Reducer for `screen:clear` is a no-op (renderer handles the I/O directly). |
+| `src/tui/render/slash-popover.ts` | NEW `renderSlashPopover(slash, caps): string[]`. Up to 8 visible rows (spec §5.3 cap). Cursor `>` on `selectedIdx`; names padded to align descriptions. Window slides so the highlighted row stays visible when there are more than 8 commands. Footer hint `(N more — scroll with ↑/↓)` when overflowing. Empty suggestions show `(no matches — try /help)`. Dim throughout. |
+| `src/tui/render/compose.ts` | Slash popover renders BETWEEN status line and the input rule when `state.slash !== null`. composeCursor's bottom-anchor math (`lineCount - FOOTER_BLOCK_LINES - inputLineCount`) stays correct because the popover lines add to the upper region. Modal still suppresses everything below it (popover included). |
+| `src/tui/renderer.ts` | NEW handler for `screen:clear` events: writes ANSI clear-screen + home, resets `liveHeight`/`cursorRow` to 0, redraws the live region. Bypasses the reducer because the side effect is I/O, not state. |
+| `src/cli/repl.ts` | Builds `slashRegistry` once at boot. Maintains `cumulative: {costUsd, steps, turns}` rolled up after each successful turn (for `/cost`). Editor handler intercepts ↑/↓/Tab/Enter/Esc when `state.slash !== null`: ↑/↓ navigate, Tab completes `/<name> `, Esc clears slash mode + input, Enter dispatches via `dispatch(parsed, ...)` (echoing the slash command as `user:submit` first so the operator sees what they ran in scrollback). Other keystrokes fall through to the editor and trigger `updateSlashSuggestions(value)` to refresh the popover. |
+| `tests/cli/slash/parse.test.ts` | NEW 8 tests: non-slash returns null (incl. leading-whitespace edge), bare `/` returns empty name, args split on whitespace, multi-space collapse, case preservation in args, trailing whitespace trimmed, command name kept case-sensitive. |
+| `tests/cli/slash/registry.test.ts` | NEW 8 tests: lookup hits and misses, case-sensitive lookup, duplicate registration throws, list preserves registration order, empty prefix returns all, prefix matching + sort, case-insensitive prefix matching, no-match returns empty. |
+| `tests/cli/slash/dispatch.test.ts` | NEW 8 tests: bare slash no-op, unknown command emits error, notes become warns, command crash collapses to error, /quit triggers shutdown + returns exit, command-returned error sinks through errorSink, custom errorSink overrides bus emit, builtin registry contains all 8 expected commands in order, help can list every command (closure works). |
+| `tests/cli/slash/commands.test.ts` | NEW 18 tests with in-memory DB fixtures: /help notes shape, /quit shutdown + exit kind, /clear emits screen:clear, /cost format + magnitude tiers, /sessions empty / populated / limit / reject-bad-limit / cwd-scope, /model shows id+caps + rejects mutation, /plan reports enabled/disabled + rejects mutation, /budget shows all 4 caps + "no cap" + rejects mutation. |
+| `tests/tui/render/slash-popover.test.ts` | NEW 8 tests: cursor on selectedIdx, cursor moves with index, name padding aligns descriptions, no-matches placeholder, 8-item cap with overflow footer, window slides for highlighted row, dim SGR with color enabled. |
+
+**Decisions:**
+
+- **D124 — Read commands ship complete; mutation commands are a different slice.** `/model anthropic/sonnet-4.6` would need to: pause any running turn, re-resolve the provider via the registry (key check, cost re-init), reconfigure the harness's per-turn config, and audit the change. That's a state-mutation subsystem unto itself — mixing it with the slash infra would have made review impossibly large. This slice ships the FULL infrastructure (parser, registry, dispatcher, autocomplete UI, 8 commands) and the read-only commands. Mutation is its own production slice with its own contract.
+- **D125 — `/help` output goes via warn lines, not a modal.** The existing modal infrastructure is built around "ask user for decision" — a single OK button on a bigger preview block would require an `info` flavor (different state shape, different render path). For 8 commands × 1 description line, scrollback warns are functional and dismiss-by-scrolling. When `/help` outgrows this (per-command detail, search), an `info` modal lands as its own pattern.
+- **D126 — `screen:clear` is a renderer concern, not a state concern.** Reducer is a no-op for the event; renderer subscribes separately and writes the ANSI escape directly. Putting it through reducer-then-permanent-print would either require a new permanent kind ("clear screen" — semantically odd) or split the I/O across two layers. Direct write keeps the side effect colocated with the cursor-tracking math (resets `liveHeight` + `cursorRow` to 0) so the next eraseLive doesn't walk over wiped content.
+- **D127 — Slash popover is a SEPARATE bus event, not derived in compose.** Popover state could be computed on the fly from `state.input.value` (parse + registry.complete) inside composeLive — but the renderer would need a registry handle, and the lookup runs every frame. Pushing computation up to the REPL (one `slash:update` emit per buffer change) keeps compose layer registry-agnostic and lets the renderer cache the result via state. Trade: one extra event per keystroke when in slash mode; cheap.
+- **D128 — Popover renders ABOVE the input, not below.** Spec §5.3 says "popover acima do input". Architecturally this matters because composeCursor's row math anchors to `lineCount - FOOTER_BLOCK_LINES - inputLineCount` from the bottom — putting the popover above the input means the popover's line count automatically pushes up the overall height without disturbing the bottom anchor. Below would have required the popover lines to count toward `FOOTER_BLOCK_LINES` (broken contract).
+- **D129 — Cumulative tracker is REPL state, not LiveState.** `/cost` reads `costUsd / steps / turns` accumulated across turns. Putting these in `StatusState` would make the reducer responsible for incrementing per `step:budget` event, but the harness emits `step:budget` MULTIPLE times per turn (once at session_start, once per step_start, once at session_finished); the cumulative isn't sum-of-deltas, it's the FINAL value per turn × N turns. REPL holds it directly and updates exactly once per turn-end (in startTurn's `.then`). Single source of truth, no double-counting.
+- **D130 — Hotkey for slash menu is "type a name and press Tab".** Spec §5.3 / §5.4: "Tab in input com `/`" → autocomplete. The popover surfaces matches as you type; Tab completes the highlighted name; Enter dispatches if name is fully typed. No separate "open slash menu" keybinding — the `/` keystroke IS the open. ↑/↓ navigate within an open popover.
+- **D131 — Esc inside slash mode clears BOTH popover and input buffer.** First instinct was "Esc clears popover, leaves input intact". But a half-typed `/help` left in the buffer is a footgun: Enter would attempt to parse it as a normal user message (it's not — leading slash makes the model think it's a directive). Wiping the buffer makes Esc a clean reset. User can re-type from scratch. Matches the modal-Esc-cancels invariant.
+- **D132 — `/sessions` scoped to current cwd by default.** Mirrors `--resume last` behavior (which already cwd-filters per `tests/cli/index.test.ts`'s "list-sessions doesn't require a prompt"). Operators running multiple repos don't want unrelated sessions cluttering the list. Future arg `/sessions all` could expand scope; for now, current-cwd is the only mode.
+- **D133 — Case-insensitive command name resolution at dispatch.** Initial draft: `parseSlashInput` preserved case + `registry.lookup` was case-sensitive. Code review found: `/Help` autocompletes to `help` (popover shows it via case-insensitive `complete`) but Enter dispatches the typed `Help` → "unknown command". Fixed by adding `resolveCommandName` in REPL that falls back to a case-insensitive match through `complete()` when exact lookup fails. Args stay case-sensitive (paths/IDs).
+- **D134 — Bare `/` + Enter clears buffer instead of dispatching.** Initial draft fell through to the editor's submit path "as a no-op", but `applyKey` Enter on a non-empty buffer (`/`) returns `submit:'/'`, which the REPL would have sent to the LLM as a turn. Fixed by consuming the keystroke + clearing input + clearing slash mode when `parsed.name === ''`.
+- **D135 — Synchronous shutdown gate via `requestShutdown` wrapper.** Initial draft called `void shutdown()` from /quit + Ctrl+C; `shutdown()` is async and only flips `exiting=true` after its first await. A second Enter typed before the await landed could slip past the running/exiting check and start another turn / dispatch another slash. Fixed by introducing `requestShutdown()` (sync wrapper that sets `exiting=true` immediately, then `void shutdown()`), and adding an `if (exiting) return true` swallow at the top of the editor handler. The async `shutdown()` lost its own `if (exiting) return` guard since the sync gate is now the source of truth (otherwise the new flag immediately blocked shutdown's own cleanup).
+- **D136 — Reject extra args uniformly across all 8 commands.** Initial draft: `/help`, `/quit`, `/clear`, `/cost` accepted extra args silently (signature `_args`); `/model`, `/plan`, `/budget` rejected them. Inconsistent. Now all 8 reject extra args with `{kind: 'error', message: '/<name>: takes no arguments'}` (or the existing per-command messages for the read-only-mutation ones).
+- **D137 — `screen:clear` refused when modal up; warn-line surfaced instead.** A `/clear` while a modal is open would write the ANSI escape under the modal frame, leaving cursor-row tracking out of sync after the inevitable redraw. The slash path is structurally unreachable while a modal is open (modal handler swallows keys), but a future producer emitting `screen:clear` directly would hit this. Renderer-side guard: when `state.modal !== null`, refuse the wipe and emit a warn explaining why.
+- **D138 — `registry.complete` returns registration order in BOTH paths.** Initial draft: empty prefix returned registration order; non-empty prefix sorted alphabetically. The popover sequence reshuffled the moment the user typed one character — disorienting. Now both paths return registration order so the visible list stays predictable.
+- **D139 — `info` event for plain scrollback (separate from `warn`).** `/help`, `/cost`, `/sessions`, `/model`, `/plan`, `/budget` output is informational, not a warning. Initial draft routed all command notes through the warn channel; help text appeared in the same yellow as lock-conflict warnings — semantic mismatch. Added a third `info` event + permanent kind, paint-free in the formatter (plain scrollback). Dispatcher emits `info` for command notes; `warn` is reserved for "actually pay attention" signals.
+- **D140 — `slashOpen` tracked locally in REPL, not via `renderer.state().slash` reads.** Editor handler used to read `renderer.state().slash` to decide whether to emit a "clear" slash:update — relying on the bus's synchronous-emit semantics for state to be fresh. Coupling makes the REPL fragile to bus impl changes. Now a local `slashOpen: boolean` mirrors the reducer's view, updated alongside our emits. No out-of-band reads; if the bus ever batches, the REPL's view stays self-consistent.
+- **D141 — Shared `format.ts` for cost / ms formatters.** `formatCost` was duplicated across `cost.ts`, `sessions.ts`, `budget.ts` (three copies, two slightly different signatures). Extracted to `src/cli/slash/format.ts`. `sessions.ts` keeps its own `formatSessionCost(usd, complete)` wrapper that prefixes `~` for incomplete usage telemetry, but reuses the shared base.
+
+**Pending / out of scope this slice:**
+
+- **Mutation commands** (`/model <id>`, `/plan on|off`, `/budget cost 5.0`, `/budget steps 100`). Each requires harness reconfiguration logic + audit + tests. Separate production slice.
+- **`/effort` command.** No `effort` config field exists in `HarnessConfig`. Spec §4.10.6 mentions it as a footer indicator; landing it requires a spec PR adding the field + a ParsedArgs entry + bootstrap wiring.
+- **`Ctrl+R` history reverse search** (spec §5.4). Input history persistence + reverse search UI is a separate feature, not slash-command scope.
+- **Slash commands in the modal-suppressed state.** When a modal is up, the modal handler swallows all keys before the editor handler runs — slash mode is unreachable while a modal is open. Acceptable: confirm modals are short-lived; user can wait for resolution then run /help.
+- **Tab autocomplete within an arg position** (e.g., `/sessions <Tab>` shows allowed args). Args are command-specific; would require each command to expose an arg-completion function. Future.
+
+**Verification:** `bun test` → 2103 pass / 10 skip / 0 fail (+57 new across parse, registry, dispatch, commands, popover render, REPL slash integration). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.f.2 — subagent observability through the harness. Add `SubagentEvent` variants to `HarnessEvent` (subagent_start / subagent_progress / subagent_finished); emit from the runtime in `src/subagents/`; translate via the adapter; render the "subagent row" pattern from spec §4.2 (collapsed group of in-progress steps + final summary line). Without this, the `task` tool is a silent black box for the operator while the subagent runs.
+
+---
+
+## [2026-05-02] M1 / Step 1.d.6 — Modal spec-shape refactor (N options, Esc=cancel, layout)
+
+Generalizes the modal infrastructure from binary yes/no to the
+canonical §4.10.13 shape: 3-option list (yes / yes-allow-session /
+no), `selectedIndex` with default = last (D5/D65 safety),
+hotkey activation (1/2/3 + shortcuts), Esc returns 'cancel' distinct
+from 'no', and the spec layout (title + tool-aware preview + options
++ hints footer in 4 horizontal-rule-separated blocks). Trust /
+memory-write / plan-review / critique flavors get their own option
+lists too.
+
+Scope deliberately stops at the modal layer. `previewForApproval`
+on each `ToolDef` (D63) and the actual session-layer policy
+mutation for `session-allow` are deferred to follow-up slices —
+the modal SHOWS the option, the bridge RESOLVES it as `'yes'` for
+now (TODO marker in REPL).
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/state.ts` | NEW `ConfirmOption {key, label, value, shortcut?}` interface. `ConfirmState` rewritten: drops `{message, details, selected}`, adds `{title, subject, preview[], question, options[], selectedIndex, hints[]}`. NEW `PermissionAnswer = 'yes' \| 'session-allow' \| 'no' \| 'cancel'` exported union. Reducer constructs flavor-specific option lists in each `*:ask` branch (permission gets 3 options; trust/memory-write get 2; plan-review gets 3 with edit; critique gets 2). `modal:select` reducer now updates `selectedIndex` (clamped to a valid range) instead of toggling `selected`. |
+| `src/tui/events.ts` | `PermissionAnswerEvent` renamed to `ModalAnswerEvent` (type literal `permission:answer` → `modal:answer`); `decision` is now `string` because the modal carries 5 flavors with non-overlapping value sets (permission emits `'yes' \| 'session-allow' \| 'no' \| 'cancel'`; plan-review emits `'yes' \| 'edit' \| 'no' \| 'cancel'`; trust/memory-write/critique emit `'yes' \| 'no' \| 'cancel'`). Consumers narrow per-flavor by reading the original `*:ask` event. `ModalSelectEvent.selected` → `selectedIndex: number`. |
+| `src/tui/modal-manager.ts` | `askPermission` returns `Promise<PermissionAnswer>` instead of `Promise<boolean>`. Manager tracks `selectedIndex` (default = `options.length - 1`). Focus handler: hotkey direct activation (matches each option's `key` or `shortcut` against the KeyEvent), ↑/↓ + Tab/Shift+Tab navigate, Enter resolves the highlighted option's value, Esc resolves `'cancel'`. `matchesKey()` helper handles char-key + named-key + shift+tab chord. `moveSelection(delta)` clamps to a valid range. `close()` and timeouts now resolve `'cancel'` instead of `false`. Emits `modal:answer` (renamed from `permission:answer` to reflect that all 5 flavors flow through the same event). |
+| `src/tui/render/modal.ts` | Rewrite per §4.10.13: 4 blocks separated by full-cols horizontal rules — title (bold) + optional subject (dim); optional preview (dim, skipped block + rule when empty); optional question + numbered options (cursor `>` marks `selectedIndex`, options with `shortcut` show it in dim parens after label); optional hints footer (joined by ` · `, dim). Cursor `>` always (ASCII universal — no Unicode pretty variant). |
+| `src/cli/repl.ts` | Bridge updated: `modalManager.askPermission(...)` now returns the richer answer; REPL maps `'yes'` and `'session-allow'` → `true` (with a TODO that `session-allow` will write a session-layer policy rule when 1.d.7 lands), `'no'` and `'cancel'` → `false` for the harness's boolean contract. |
+| `tests/tui/modal-manager.test.ts` | Rewritten end-to-end for the new semantics. NEW 16 tests covering: default `selectedIndex` (last option = no), Esc=cancel, hotkey 1/2/3 direct activation, Shift+Tab as session-allow shortcut, ↑/↓ navigation with clamping at edges, modal:select event payload (selectedIndex), `modal:answer` carries the user's decision string and emits before the promise resolves, `modal:answer` decision is `'cancel'` on Esc (distinct from `'no'`), focus removal, swallow non-matching chars, queue serialization, timeout resolves cancel, close drains everything as cancel. |
+| `tests/tui/modal-integration.test.ts` | Rewritten for new layout. End-to-end: title/subject/preview/options all render, navigation preserves all 4 blocks, hotkey resolves, Esc resolves cancel, queue replaces contents cleanly, modal:select reducer updates selectedIndex, mismatched promptId dropped, out-of-range clamped, no-op on no-modal. NEW `describe('per-flavor reducer option lists')`: 4 tests confirming `trust:ask` (yes/no, AGENTS.md note in preview), `memory:write:ask` (yes/no, body as preview, scope/name as subject), `plan:review` (yes/edit/no, numbered steps + estimate in preview), `critique:ask` (yes/no, issues as preview) all build the right shape. |
+| `tests/tui/render/modal.test.ts` | Rewritten for new layout. NEW 15 tests: 4-block emission, ASCII rule fallback, cursor on selectedIndex, cursor moves with index, shortcut shown dim, preview block omitted when empty, subject omitted when null, question omitted when null, hints omitted when empty, multi-hint join, bold/dim SGR application, no SGR with color disabled, rule width tracks caps.cols, empty preview entry as blank spacer. |
+| `tests/tui/render/compose.test.ts` | Modal stubs updated to new shape. The "rule + footer suppressed when modal is up" assertion relaxed: modal carries its own rules so we can't blanket-assert "no rule" — instead check the specific input prompt + footer hint signals are absent. |
+| `tests/tui/render/footer.test.ts` | Modal stub in the modal-suppressed test updated. |
+
+**Decisions:**
+
+- **D114 — Reducer constructs flavor-specific option lists, not the manager.** Modal-manager calls `askPermission(args)` with permission-specific args; reducer builds the 3-option list in the `permission:ask` branch. Trust/memory-write/plan-review/critique branches each construct their own lists. Alternative was to have the manager build options and pass them via a fatter `*:ask` event, but: (a) the manager already knows the flavor, (b) the reducer already knows the flavor, (c) duplicating option-construction in both places drifts. Keeping it in the reducer means flavor-specific UX changes are one-file changes. The manager passes `optionsList` to its enqueue function so the focus handler knows what to match against — that's its only options awareness.
+- **D115 — Esc returns `'cancel'`, not `'no'`.** D5/D65 default-to-conservative made Enter-without-navigating safe; this decision goes one step further. Audit consumers (telemetry, replay) can now distinguish "user explicitly rejected" from "user closed the modal without deciding". Producers that don't care collapse both to "rejected" — REPL bridge does this for the harness's boolean contract.
+- **D116 — `selectedIndex` clamps in BOTH the reducer and the manager.** Defensive: a buggy producer could emit `modal:select` with a wild index, or a future flavor could ship with an off-by-one option count. Reducer clamps `Math.max(0, Math.min(max, idx))`; manager's `moveSelection` does the same on each ↑/↓. Result: the modal can never enter an invalid state where `selectedIndex` points past the option list.
+- **D117 — Hotkey activation skips printable chars with modifiers.** `matchesKey()` for char keys checks `!key.alt && !key.ctrl && key.char === keyOrShortcut`. Plain `1` activates option 1; Ctrl+1 / Alt+1 don't. The intent: the modal's hotkeys are typed-character actions, not chord-based. Future trust modal could use mnemonics ('t' for trust, 'n' for no) without ambiguity with Ctrl+T being a terminal escape.
+- **D118 — Modal rules are full-cols, same as the bottom anchor's rules.** Earlier modal renderer had a `DEFAULT_RULE_LEN = 41` constant — modal felt visually "boxy" but disconnected from the surrounding live region. Spec §4.10.13 layout images show full-width rules; matching makes the modal feel like a structural extension of the live region's bottom anchor instead of a floating popup. Cost: the "rule + footer suppressed when modal is up" test had to relax its "no rule" assertion (modal has its own rules — count-based assertion would fight the spec).
+- **D119 — Cursor `>` always (no Unicode pretty variant).** Earlier draft had `▶` Unicode / `>` ASCII. `>` is universal and the modal's structural elements (rules, options) carry the Unicode-or-ASCII signal. The cursor's job is to LOCATE selection, not to differentiate visual era. Single glyph keeps the focus-handler test asserting `'> '` regardless of caps.
+- **D120 — `session-allow` defers actual policy mutation to 1.d.7.** The option is in the modal, the bridge resolves it, but it currently behaves identically to `'yes'`. The session-layer mutation requires (a) `PermissionEngine.addSessionRule()` API (doesn't exist), (b) deciding scope (per-tool vs per-tool+args), (c) audit row for the session rule's creation. Each is a small slice; combining with the modal refactor would have made review impossibly large. TODO in repl.ts marks the spot.
+- **D121 — Plan-review's `'edit'` option resolves as a string but no producer reads it yet.** Spec §4.9 has plan-review with approve/edit/reject options. Reducer constructs them; manager forwards the value. Future plan-review producer maps `'edit'` to "open the plan in $EDITOR". For now the value just rides along — no harm, no consumer.
+- **D122 — `permission:answer` renamed to `modal:answer` (decision: string).** First draft kept the original name with a `decision: PermissionAnswer` union, but the manager emits the same event for plan-review (`'edit'`), trust (`'yes'`/`'no'`), etc. — values outside the union. The cast `value as PermissionAnswer` lied at the type level. Renaming the event reflects what the manager actually does (one event per modal flavor), and widening `decision` to `string` documents the truth (consumers narrow per-flavor by reading the original `*:ask` event). Caught in code review.
+- **D123 — Per-flavor reducer option lists tested explicitly.** Originally only `permission:ask` had a reducer test; the other 4 flavors (trust, memory-write, plan-review, critique) had hardcoded option lists in `state.ts` with zero coverage. A drift in any of them — wrong option count, swapped values, missing 'edit' on plan-review — would have shipped silent. Added 4 tests, one per flavor, asserting the documented option `value` list, `selectedIndex` default, and the title/subject/preview shape.
+
+**Pending / out of scope this slice:**
+
+- **`previewForApproval(args, ctx): string[]` on each `ToolDef`** (D63). Modal currently constructs preview from the engine's prompt + cwd + rule — not the rich tool-aware diff. Per-tool extraction lands as 1.d.7 alongside session-bypass (both touch tool internals).
+- **Session-layer policy mutation** for `session-allow` (D120). Engine API + REPL bridge wiring + tests. Probably 1.d.7.
+- **`Tab to amend`** flow (edit-then-confirm). Spec §4.10.13 mentions it; defer to v2 when there's a pattern for nested input editor inside modal.
+- **Per-flavor answer events.** `permission:answer` carries the union; trust/memory-write/critique would benefit from their own answer events with flavor-specific shapes. Today they all share `permission:answer` semantics. Lands when each producer is wired (currently only permission has a producer).
+
+**Verification:** `bun test` → 2046 pass / 10 skip / 0 fail (+14 net new across modal-manager, modal-integration, modal render). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.d.7 — `previewForApproval` per-tool implementations (edit_file → unified diff, write_file → first 20 lines of new content, bash → command + cwd, etc.) + session-layer policy mutation for `session-allow`. Both touch tool/permission internals; finishing them closes §4.10.13 entirely.
+
+---
+
+## [2026-05-02] M1 / Step 1.d.5 — Permission engine ↔ modal manager bridge
+
+Closes the long-standing UX gap: a `confirm` decision from the
+permission engine no longer falls back to silent denial in
+interactive mode. The harness now accepts an async
+`confirmPermission` callback in `HarnessConfig`, threads it down
+into `invokeTool`, and awaits the user's choice between the
+permission engine's `confirm` step and the tool execution. The REPL
+provides the callback, bridging into the existing `modalManager.
+askPermission` (which has been wired since 1.d.2 but had no producer
+calling it).
+
+Scope deliberately incremental. The spec §4.10.13 / §5.5 generalized
+modal (3 options, tool-aware preview, Esc=cancel-distinct-from-No,
+session-bypass) is the future canonical shape, but landing it here
+would require a parallel refactor of `ConfirmState`, `modalManager`,
+and `renderModal`. This slice ships the BRIDGE — yes/no via the
+existing 2-option modal — so the user-visible gap closes now; the
+modal refactor lands as its own slice.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/harness/invoke-tool.ts` | NEW `ConfirmPermissionRequest` interface + `InvokeToolDeps.confirmPermission?: (req) => Promise<boolean>` + `InvokeToolDeps.signal?: AbortSignal`. New `Setup` phase `'confirm_pending'` for the async branch: when a `confirm` decision is reached AND the callback is set, the setup transaction creates the tool_call row but leaves it in `pending` (no approval row yet); the post-transaction code awaits the user via `raceAgainstAbort()` (settles immediately as denied if the harness signal aborts mid-modal — Ctrl+C closes both the run and the modal in one step), then commits a second transaction with the approval (`confirm_yes` or `confirm_no`, `decidedBy: 'user'`) plus start/finish. Callback throw collapses to denied. Audit row reason: engine prompt on `confirm_no` (explains why the user was asked); null on `confirm_yes` (decision speaks for itself). Tool result on denial is bare `denied by user` — no engine-prompt suffix, since the prompt is why the engine ASKED, not why the user rejected; passing it would misrepresent the user's reasoning to the model. NEW `raceAgainstAbort()` helper module-private. Legacy headless behavior (no callback set) preserved verbatim — message updated from "no UI in M1" to "no UI configured" to reflect that one-shot mode also takes this path. |
+| `src/harness/types.ts` | NEW `HarnessConfig.confirmPermission` field, mirrored shape from `InvokeToolDeps`. |
+| `src/harness/loop.ts` | Loop's `invokeTool` call threads `confirmPermission` and `signal` into deps. |
+| `src/cli/repl.ts` | NEW REPL-level `confirmPermission` bridge. Extracts a one-line `command` from args via `lookupToolVocab(toolName).subject?.(args)` so the modal carries something readable; falls back to truncated JSON when the tool has no subject extractor. Calls `modalManager.askPermission({toolName, command, cwd, reason: prompt})` and returns its boolean. The bridge lives in the REPL because crossing the harness/TUI seam is its job — `invoke-tool.ts` has no business importing `tool-vocab.ts`. Threaded through `HarnessConfig` per turn alongside `signal` / `onEvent`. |
+| `src/tui/index.ts` | Re-exports `tool-vocab.ts` so `cli/repl.ts` can `import { lookupToolVocab } from '../tui/index.ts'` instead of reaching into the module path directly. |
+| `tests/harness/invoke-tool.test.ts` | Existing "M1 has no UI" test renamed to "confirm without callback: legacy behavior" with assertion text bumped to match the new message. NEW 7 tests covering the bridged path: callback resolves true → tool runs + `confirm_yes` by user; callback resolves false → denied + `confirm_no` by user; callback throws → denied (defensive); callback receives the right shape (toolName, args, cwd, prompt); signal aborts while modal pending → invocation settles as denied without waiting on the (never-resolving) callback; `confirm_yes` audit row's reason is null; denied tool_result is bare "denied by user" (no engine-prompt suffix). |
+| `tests/cli/repl.test.ts` | NEW REPL bridge test: drives `cfg.confirmPermission` directly (capturing it via the `runAgentOverride` seam) with a real tool name + args, feeds Esc Esc to the modal handler, asserts the bridge resolves false. Exercises the seam end-to-end: vocab lookup → modalManager.askPermission → focus handler → bus → reducer → manager resolution. |
+
+**Decisions:**
+
+- **D106 — Incremental bridge over spec-aligned refactor.** The §4.10.13 modal (3 options, tool-aware preview, Esc=cancel) is the future canonical shape but lands as its own slice. Refactoring `ConfirmState` + `modalManager` + `renderModal` AND the harness bridge in one slice would have been ~4× the work and risked landing a half-done refactor. Yes/no via the existing modal closes the user-visible gap NOW; the spec-shape upgrade follows.
+- **D107 — Callback returns `boolean`, not the spec's `'yes' \| 'session-allow' \| 'no' \| 'cancel'`.** Mirrors the current modal manager's API. When session-allow lands (with the modal refactor), the callback signature widens — old callers map to `boolean` cleanly (`!== 'no' && !== 'cancel'` = allow). Forward-compatible without breaking the harness contract today.
+- **D108 — Setup transaction split for the async branch.** The pre-1.d.5 invariant was "every tool_call row has at least one approval row, atomic via `withTransaction`". Async user input forces a split: tx1 creates the row (no approval yet), then await user, then tx2 records the approval + start/finish. Crash window: process death between tx1 and the user's answer leaves an orphan `pending` row. Acceptable for M1 — orphan rows surface in audit as "started but never finished" and can be reaped manually. Closing the window properly would need either a synchronous prompt (impossible without TUI involvement) or an atomic "create-call-with-pending-user-approval" row shape (storage schema change).
+- **D109 — Callback throw collapses to denied, doesn't propagate.** A throw from `confirmPermission` is rare (modal manager normally resolves `false` on Esc / close / timeout), but if the modal infrastructure crashes mid-prompt the run shouldn't hang on a stuck pending row. The catch records `confirm_no` by user with the original prompt as the reason — operator sees "denied by user" in scrollback even though the rejection was internal to the UI. Trade-off documented; alternative was to escalate the throw into a tool error, which would be more confusing because the tool didn't actually fail.
+- **D110 — `decidedBy: 'user'` distinguishes bridged decisions in audit.** The legacy headless deny path uses `decidedBy: 'policy'` with reason "no UI configured". The bridged path uses `decidedBy: 'user'` with the engine's prompt as the reason. Audit consumers can filter "show me all the times the user explicitly approved/rejected something" without false positives from the headless deny path.
+- **D111 — Subject extraction lives in the REPL, not in `invoke-tool.ts`.** `invoke-tool.ts` is in `src/harness/`; importing `tool-vocab.ts` from `src/tui/` would cross the layer seam. The REPL is already the seam-crossing module — it builds the harness config + owns the modal manager. Putting the vocab lookup there keeps the harness vocab-agnostic. Cost: REPL repeats the vocab+JSON-fallback shape that the adapter does for `tool:start` events; if a third call site appears, extract a helper.
+- **D112 — `signal` raced against the bridged confirm callback.** Without it, Ctrl+C while a modal is open required two steps: signal aborts the run state but the harness was blocked on `await askUser(...)`; user had to Esc out of the modal manually before the harness's top-of-loop signal check fired. Adding the abort race makes Ctrl+C single-step: signal aborts → race rejects → catch collapses to denied → loop continues to its top-of-iteration signal check → exit. `raceAgainstAbort()` helper takes a producer + signal and returns whichever settles first; cleans up the abort listener in both branches so we don't leak.
+- **D113 — Bare "denied by user" in the model-facing tool_result; engine prompt only on the audit row's reason.** Initial draft used `denied by user: ${prompt}` — the prompt was the engine's question ("matches deny rule X"), not the user's reason. Telling the model "user said no because of rule X" misrepresents the reasoning. Bare message; the prompt still lives on the audit row's `reason` field for `confirm_no` (where it explains the engine's role). For `confirm_yes`, the audit row's reason is null — the decision (`confirm_yes` by user) is self-explanatory.
+
+**Pending / out of scope this slice:**
+
+- **3-option modal layout** (yes / yes-session-allow / no) per §4.10.13. Requires `ConfirmState` + `modalManager` + `renderModal` refactor. Distinct slice.
+- **`previewForApproval(args, ctx): string[]` on each `ToolDef`** (D63) — diff for edit_file, command for bash, etc. Modal currently shows the bare `command` (subject) + cwd + reason; the rich preview lands with the modal-shape refactor.
+- **Session-bypass** (`Yes, allow all <toolName> during this session`) — D64. Requires the 3-option modal AND a session-layer policy mutation (engine support exists; producer doesn't).
+- **`Tab to amend`** (edit-then-confirm) — feature v2 per spec §4.10.13.
+- **One-shot mode confirm UI.** `--prompt "x"` mode still has no callback (D106 says only REPL bridges). One-shot users get the legacy "no UI configured" denial. Could be unlocked via a `--yes` flag (auto-approve all confirms) or a stdin-prompt fallback (read y/n from stdin).
+- **Multiple confirm decisions in flight.** modalManager handles queueing internally (FIFO); harness fires confirms serially per tool, so queue depth shouldn't exceed 1 in practice. Not exercised.
+
+**Verification:** `bun test` → 2032 pass / 10 skip / 0 fail (+8 new across invoke-tool and repl, +1 renamed). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Spec-shape modal refactor — generalize `ConfirmState` to N-option list with `selectedIndex`, `previewForApproval` contract on `ToolDef`, session-bypass option, Esc-as-cancel-distinct-from-No. The biggest visual UX upgrade after this; sets up the rest of §4.10.13 for landing without further harness changes.
+
+---
+
+## [2026-05-02] M1 / Step 1.e.4 — Footer below input + plan mode indicator
+
+Closes the bottom anchor: rule + input + rule + footer (UI.md
+§4.10.6 / §4.10.12). The footer surfaces `? for help` on the left
+(adds `· esc to interrupt` while a tool / thinking / streaming
+assistant is live) and `• <model> · [plan ·] <steps>/<max> · $<cost>`
+on the right, padded so the right column anchors to the terminal
+edge. The `composeCursor` LAYOUT COUPLING TODO from D79 is resolved
+in the same slice — the cursor math now subtracts the trailing
+2-line block (rule + footer) from `inputStartRow`, so the cursor
+lands inside the input box instead of on the footer line.
+
+`planMode` joins `StatusState` (and the `session:start` event payload),
+threaded from the REPL through the adapter ctx so the footer reflects
+plan mode immediately on the first turn.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/state.ts` | `StatusState.planMode: boolean` (initial false). Reducer for `session:start` reads `event.planMode === true` (defaults to false when omitted). |
+| `src/tui/events.ts` | `SessionStartEvent.planMode?: boolean` (optional — omit means false). |
+| `src/tui/render/footer.ts` | NEW `renderFooter(state, caps): string \| null`. Returns null when modal is up (modal owns the bottom slot). Otherwise builds left column (`? for help` + optional `esc to interrupt` when running), right column gated by `status.sessionId !== null` as a single proxy (avoids half-state where model rendered but cost/budget didn't): `• <model> · [plan ·] <steps>/<max> · $<cost>`. Per-segment dim paint (rather than wrapping the whole line) so a future budget-shading layer can override individual tokens without fighting the outer wrap. Pad math clamps to 0 on overflow — long content collapses left+right together and the renderer's truncateToWidth clips the right end (acceptable degradation; future polish drops low-priority tokens). `isRunning(state)` checks `activeTools.size > 0 \|\| thinking !== null \|\| pendingAssistant !== null` — covers tools, extended thinking, and assistant streaming as the three "interruptible" states. Cost formatter degrades with magnitude (4 decimals < $1, 3 decimals < $100, 2 decimals ≥ $100). |
+| `src/tui/render/compose.ts` | Bottom anchor now emits `[..., rule, input, rule, footer]` (4 lines below the upper region) when no modal. Modal still substitutes the entire anchor. NEW exported `FOOTER_BLOCK_LINES = 2` constant shared between `composeLive` (which appends the trailing rule + footer) and `composeCursor` (which subtracts them when computing input start row). The `ruleAboveInput` helper renamed to `horizontalRule` since it's now reused for both rules. Strict: `renderFooter` returning null in the no-modal path throws — fail loudly instead of drifting silently if the renderFooter contract loosens. The constant is exported so a regression test can guard against drift between the value and what composeLive actually emits below the input. |
+| `src/tui/harness-adapter.ts` | `HarnessAdapterCtx` gains `planMode?: boolean`. `session_start` translation conditionally includes `planMode: true` in the emitted `session:start` event. Falsy values (undefined/false) drop the field entirely so headless NDJSON consumers don't see a noise `planMode: false`. |
+| `src/cli/repl.ts` | `adapterCtxBase` reads `baseConfig.planMode` and threads it through. CLI's `--plan` flag → bootstrap sets `HarnessConfig.planMode` → REPL surfaces it in the footer. |
+| `tests/tui/render/footer.test.ts` | NEW 12 tests: idle vs running cue, thinking and pendingAssistant trigger interrupt, plan mode segment, modal-suppressed null, pre-session shape (no model = no right column), full-width pad, dim SGR, cost-format magnitude tiers, overflow degrades to >caps.cols (truncation upstream handles), sessionId-only gate (model+maxSteps without sessionId still pre-session). |
+| `tests/tui/render/compose.test.ts` | Existing layout tests updated for the new bottom anchor: `pre-session: rule + input + rule + footer` (4 lines), `after session start` (5 lines), `active tool card` (7 lines), multi-line input still indexes from the trailing rule. composeCursor tests bumped lineCount by 2 to account for the footer block — expected rows unchanged. NEW assertion in modal-suppressed test that the footer hint is also absent. NEW drift guard: composeLive output length matches `1 (rule above) + inputLines + FOOTER_BLOCK_LINES` — silent breakage if anyone changes the trailing block size without bumping the constant. |
+| `tests/tui/state.test.ts` | NEW 2 tests for planMode: session:start with planMode=true flips status; omitted field defaults false. |
+| `tests/tui/renderer.test.ts` | "cursor inline on multi-line input" updated for the new layout: cursorUp(3) instead of cursorUp(1) (input row 2 → terminal at end of row 5 = footer's row). "single-line input" assertion adds cursorUp(2). "eraseLive cursorUp(N-1)" test now opens a modal and flushes the scheduler before measuring eraseLive — without that, composeCursor would position cursorRow to 0 on the fake compose's lines. |
+
+**Decisions:**
+
+- **D95 — `renderFooter` returns `null` only on modal.** Other "no footer" cases (pre-session, ended) still emit the line — the help hint is useful even before a session starts (operator types `?` to learn what's available). Distinguishing "I have nothing useful to show" from "I'm being suppressed by another element" gives the caller the right semantics; modal is the only true suppression today.
+- **D96 — Right column omits segments instead of showing placeholders.** Pre-session has no model, so the right column is empty (left column carries the help hint solo). Plan mode shows `plan` as a token between model and budget; absent = no `plan` token (not `plan: false`). Same principle as banner env (D68/D74) — silence is the absence of meaning, not "value is false/zero".
+- **D97 — `isRunning(state)` covers three signals: activeTools, thinking, pendingAssistant.** Each independently drives the interrupt cue. Missing any one would leave the user typing while something runs without "esc to interrupt" telling them they CAN interrupt. The three signals match the three things that animate in the live region today — when subagent / bg slices land, they get added to the predicate.
+- **D98 — `FOOTER_BLOCK_LINES = 2` constant shared by composeLive + composeCursor.** Earlier attempt to make the constant live in `compose.ts` was ad-hoc; the value is the contract between the two functions. Documented at the top of the file (assumption). When 1.e.5+ adds elements below the footer (status bar tray, multi-line footer for warnings), this constant grows accordingly.
+- **D99 — Resolves D79 (LAYOUT COUPLING TODO).** composeCursor's previous `lineCount - inputLineCount` formula was a TODO marker for "input is the last block; will break when footer lands". Footer landed; constant added; math fixed. Tests bumped lineCount by 2. The coupling between composeLive and composeCursor is now explicit (shared constant + comment) instead of implicit (cursor reads layout via line counting).
+- **D100 — `planMode` flows REPL → adapter ctx → session:start, not via a separate event.** A `mode:plan` event would be more general (toggle plan mode mid-session?), but plan mode is a boot-time profile decision today; toggling mid-session would require reconfiguring the harness's tool gates. Until that flexibility exists, threading through `session:start` is the simplest path that gets the indicator in the footer.
+- **D101 — `eraseLive(N-1)` test opens a modal first.** With cursor positioning landing in 1.e.2, drawLive's cursorRow depends on whether composeCursor returns null. The fake composeLive in this test has nothing to do with input but composeCursor doesn't know that — it computes `inputStartRow` mechanically. Setting state.modal makes composeCursor return null, restoring the "cursorRow = liveHeight - 1" invariant the test asserts. Required schedule flush so the modal-aware drawLive runs before eraseLive measurement.
+- **D102 — Per-segment dim paint, not outer wrap.** Initial draft wrapped the whole assembled footer in `paint(caps, 'dim', ...)`. That blocks future per-token shading (cost warn at 80%, error at 90% per spec §4.4) — the outer wrap forces every segment to dim. Refactored to call `dim()` per segment so a budget shading layer can replace individual tokens (e.g., `paint(caps, 'warn', '$0.045')`) without fighting the surrounding wrap. Cost: marginally more SGR escapes per line; benefit: shading slot is now open.
+- **D103 — Single sessionId proxy for the right column.** Initial draft used `status.model !== null` for model+cost segments and `status.maxSteps > 0` for steps. With the current adapter both flip at session_start so it worked, but a future producer setting one without the other would render a half-state. Collapsed into a single `status.sessionId !== null` gate — all right-column segments appear together or none at all. Caught in code review.
+- **D104 — Overflow pad clamps to 0; truncation upstream.** Initial draft computed `cols = Math.max(content_width + 1, caps.cols)` to "preserve a space between left and right" — but the line then ran past `caps.cols` and the renderer's `truncateToWidth` clipped the right end (losing cost info, the most useful right-column segment). Simplified to `Math.max(0, caps.cols - left - right)`: when content overflows, pad collapses to 0, left and right collapse together, truncation clips the right (acceptable degradation). Future polish: drop low-priority right tokens (cost label → steps → plan) before truncation kicks in. Caught in code review.
+- **D105 — composeLive throws on renderFooter null in non-modal path.** Initial draft fell back to a padded blank line (defensive). But the only call site that returns null IS the modal branch, which is already handled above by an early return. The fallback was dead code; if a future renderFooter loosens the contract to return null in other cases, composeCursor's `FOOTER_BLOCK_LINES` math would silently drift. Replaced the fallback with a thrown error that fails loudly. The exported `FOOTER_BLOCK_LINES` constant + the test guard make the contract explicit.
+
+**Pending / out of scope this slice:**
+
+- **Soft-aborted footer state** (`esc again to force` cue from spec table). Requires the REPL to communicate "soft-abort pending" to the renderer — needs either a new event (`interrupt:soft`) or a state field. Plan mode lands now; soft-abort lands when the harness exposes the corresponding state.
+- **Memory / bg / mcp tray segments in the right column.** Spec §4.10.6 lists them as conditional tokens. Status state already carries memory/bg surfaces but they're not yet plumbed to the footer renderer. Lands when the producers ship.
+- **Operation chip live counter with tokens** (`Generating… (8s · ↑ 234 tokens)`). Requires the adapter to stop dropping `usage` events and store running output-token totals on a chip. Needs an "assistant chip" concept (the model-generating equivalent of a tool chip) — none today; assistant text streams flat into pendingAssistant.text. Defer to a dedicated slice; the framework here is enough that adding `tokens?: number` to ActiveTool and surfacing on the chip head is a small change once the assistant chip lands.
+- **Slash command activation from footer hints** (`/effort`, `/model`, `/plan`). The right column shows the configs but typing `/plan` doesn't toggle anything yet — slash commands are a separate subsystem.
+
+**Verification:** `bun test` → 2024 pass / 10 skip / 0 fail (+18 new across footer, state, compose, renderer, harness-adapter). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.d.5 — wire the harness's permission engine to the modal manager so `confirm` decisions surface as the canonical permission modal (UI.md §4.10.13). Currently `confirm` decisions bypass the UI; bridging requires a hook in the harness loop (or in `invokeTool`) that calls `modalManager.askPermission` and resolves the decision based on the user's choice. After that: tool-aware `previewForApproval` registration on each `ToolDef` (D63 from §4.10.13), so the modal shows the diff for `edit_file`, the command for `bash`, etc. Largest UX gain remaining in the M1 series.
+
+---
+
+## [2026-05-02] M1 / Step 1.e.3 — Tool indicator collapsed (verb + sub-content)
+
+The most invasive of the §4.10 polish slices: rewrites the tool
+display from `→ tool_name {json args}` (developer-targeted dump) into
+the chip + sub-content shape spec'd by §4.10.5/§4.10.7. Each tool
+gets a per-tool vocabulary entry mapping its internal name to the
+present-continuous active verb (`Reading file`), the past-tense
+final verb (`Read file`), and a subject extractor that pulls the
+salient argument (path, command, query, pid) out of args for the
+`└─ ` sub-content line. JSON args disappear from the default UI
+entirely; the (future) `(ctrl+o to expand)` flow surfaces them on
+demand.
+
+This touches the event contract (`tool:start` payload), the live
+state (`ActiveTool`), the adapter (vocab lookup + subject
+extraction), and both renderers (live chip + scrollback chip with
+sub-content). The harness loop and tools themselves don't change —
+the vocabulary lives entirely in the TUI layer.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/tool-vocab.ts` | NEW canonical vocabulary table covering all 16 builtin tools (`read_file`, `write_file`, `edit_file`, `bash`, `bash_background`, `bash_kill`, `bash_output`, `glob`, `grep`, `task`, `memory_*`, `todo_write`, `monitor`, `wait_for`). Each entry has `activeVerb`, `finalVerb`, and an optional `subject(args) → string \| null` extractor. Extractors call `str()` (non-empty string) or `nestedStr()` (for discriminated-union args like `monitor.condition.kind` and `wait_for.condition.kind`) — verified against the actual `input_schema` defs in `src/tools/builtin/*.ts`. `lookupToolVocab(name)` returns the entry or a generic fallback (`Calling <name>` / `Called <name>`) with no subject — the awkward fallback is intentional so reviewers notice when a new tool ships without a vocab entry. Subject extractors return `null` when args don't carry the expected field (malformed model output) — renderer drops the connector line. |
+| `src/tui/render/glyphs.ts` | NEW shared module for box-drawing/connector glyphs that travel across multiple renderers. Currently exports `subContentConnector(caps)` (`└─ ` Unicode / `\- ` ASCII) consumed by both `permanent.ts` (final chip) and `tool-card.ts` (live chip). Single source of truth so a spec change ("use ▸ instead of ·") lands in one file. |
+| `src/tui/events.ts` | `ToolStartEvent` payload reshaped: `{toolId, name, activeVerb, finalVerb, subject}` (drops `args: string`). `name` retained for audit / filtering; display reads from `activeVerb` / `finalVerb`. `subject` is `string \| null`. |
+| `src/tui/state.ts` | `ActiveTool` now stores `activeVerb`, `finalVerb`, `subject` instead of `args`. Reducer for `tool:start` reads them straight from the event; `tool:end` builds the `tool-end` `PermanentItem` with `verb: tool.finalVerb` + `subject: tool.subject` (renderer overrides verb for failure / denial states). |
+| `src/tui/render/permanent.ts` | `tool-end` formatter rewritten per §4.10.5: chip glyph (`·` Unicode / `*` ASCII) + `<verb> in <duration>` head + optional `└─ <subject>` sub-content via the shared `subContentConnector`. `finalVerbFor(status, vocabVerb)` maps `error → 'Failed'` and `denied → 'Denied'` regardless of the per-tool entry — failure modes use generic verbs because the harness doesn't surface exit codes / failure detail today. Color: dim for done, error palette for failure, warn palette for denial. Denied with a `summary` (policy reason) shows the reason as sub-content instead of the rejected subject. Empty-string subject treated as absent (defensive against future producers that emit `''`). |
+| `src/tui/render/tool-card.ts` | Live chip rewritten per §4.10.5: `<spinner> <activeVerb>… (<elapsed>)` head in the warn palette, with `└─ <subject>` dim sub-content (via the shared `subContentConnector`) when subject is non-null and non-empty, and the existing tree-branch preview (last few stdout lines) underneath. |
+| `src/tui/harness-adapter.ts` | `tool_invoking` handler resolves vocab via `lookupToolVocab(toolName)`, runs the subject extractor inside a try/catch (a buggy extractor on weird args shouldn't kill the whole `tool:start` emission), and emits the new event payload. Drops the legacy `formatArgs` JSON path + `ARGS_MAX_CHARS` constant — args no longer travel through the UI. `ToolTrack` shrinks to `{name, decision}`. |
+| `tests/tui/tool-vocab.test.ts` | NEW 11 tests: every builtin name has an entry (regression guard), known lookup returns vocab, unknown lookup returns generic fallback, subject extractor returns null on bad args, bash subject is the command, memory_list subject is `scope: <name>`, bash_output/kill format pid, task prefers `subagent` (real field name) and falls back to `prompt`, todo_write has no subject. NEW `describe('nested condition.kind extractors')` covering monitor + wait_for with shapes copied from real `input_schema` defs (`{condition: {kind: 'process_output_lines', ...}}`, `{condition: {kind: 'sleep', ...}}`, etc.) — catches the "made-up field name" class of bug. |
+| `tests/tui/render/permanent.test.ts` | Old `tool-end` glyph/separator tests (`✓`/`✗`/`⚠` for unicode, `*`/`x`/`!` for ascii) replaced by `describe('tool-end (operation chip + sub-content)')` with 11 tests covering the new shape: per-tool verb on done, no sub-content when subject null, error/denied verb override, denied with summary surfaces reason, summary fallback when subject null, glyph + connector glyph variants per caps, ms vs s units, error palette SGR, dim palette SGR. |
+| `tests/tui/render/tool-card.test.ts` | Old preview-tree tests adapted for the new `[chip head, subject, ...preview]` shape. NEW tests for chip head verb, elapsed in parens, subject as `└─ ` sub-content, subject ASCII connector fallback, null subject drops the line, warn SGR on chip head, dim SGR on subject + preview. |
+| `tests/tui/state.test.ts` | Tool lifecycle tests updated for the new `tool:start` event shape and `tool-end` permanent shape. NEW test confirming null subject from adapter survives the round-trip onto `tool-end`. |
+| `tests/tui/bus.test.ts` | The single `tool:start` emit in the bus tests gets the new payload shape. |
+| `tests/tui/harness-adapter.test.ts` | The two `tool_invoking → tool:start` tests rewritten to assert `activeVerb`/`finalVerb`/`subject` instead of the old `args` JSON string. NEW test covering unknown-tool fallback (`Calling made_up_tool` / `Called made_up_tool` / `subject: null`). |
+
+**Decisions:**
+
+- **D84 — Vocabulary lives in the TUI layer, not on `ToolDef`.** Putting `activeVerb`/`finalVerb`/`subject` on each tool's definition would scatter display concerns across 17 files and let the harness/permission/audit layers see it. Centralizing in `src/tui/tool-vocab.ts` keeps display stricly UI's problem and makes the table grep-able as one document. Cost: a new tool registration must update two files (the `ToolDef` and the vocab entry) — flagged by the "every builtin has an entry" regression test.
+- **D85 — Generic fallback verbs for unmapped tools.** `lookupToolVocab(name)` returns `Calling <name>` / `Called <name>` with no subject when there's no entry. The verb is intentionally awkward (uses the raw tool_name, not a humanized version) so it sticks out in the UI; reviewers seeing "Calling read_file_v2…" know to add the proper entry. The alternative — refusing to render the chip until vocab is registered — would hide tool runs entirely, which is worse than ugly verbs.
+- **D86 — Subject extractor returns `null` on shape mismatch, never throws.** Extractors run on adversarial input (a model can send anything); the contract is `(args) => string | null` and the `str()` helper enforces "must be a non-empty string". Adapter wraps the call in try/catch as belt-and-suspenders for a future extractor that's more complex (regex match, JSON walk). Renderer drops the connector line on null — no `└─ null` literal.
+- **D87 — Failure verbs are hardcoded ('Failed', 'Denied'), not per-tool.** The spec table includes rich verbs like `Exited 1 in 2.1s` for failed bash, but the harness emits `tool_finished { failed, durationMs }` without exit code, error message, or failure detail. Building per-tool failure verbs would require either guessing or surfacing tool-result metadata through HarnessEvent (a separate spec change). For 1.e.3, ship the framework with generic failure verbs; rich detail lands when the harness contract grows.
+- **D88 — Subject from args, sub-content priority order is `denied+summary > subject > summary`.** The denied case overrides because the operator wants the policy reason ("matches deny rule bash.rm.rf") more than the rejected command echo. Subject is the default — what the tool acted on. Summary is fallback for tools without a clean subject (todo_write doesn't have one — vocab returns no extractor — but a producer may still emit `summary: "3 items added"` via the existing `tool:end.summary` path). Deliberately conservative: never combine subject + summary on two lines (would clutter the chip).
+- **D89 — `name` retained on `tool:start` despite display reading from verb.** The audit / NDJSON consumers care WHICH tool ran, not how it was displayed. Filtering "all bash invocations" needs `name === 'bash'`; it should never need to reverse-map "Executing" back to bash. The renderer never reads `name` for display, but the field travels for everyone else.
+- **D90 — JSON args dropped from the UI, not relegated to a deferred `expandable` flag.** Earlier draft had `expandable?: boolean` on `tool:start` and `(ctrl+o to expand)` hint on the chip when set. Removed because: (a) ctrl+o expansion isn't implemented; (b) the hint without the action is dishonest; (c) when expansion lands, the producer can opt-in via a NEW field — backwards compat is cheap when the field doesn't exist yet.
+- **D91 — `ARGS_MAX_CHARS` and `formatArgs` deleted.** With `args` no longer in the event payload, the JSON-stringify-and-truncate path in the adapter has no caller. Deleted instead of kept-with-a-todo because dead code rots; reintroducing it (when expansion lands) is a 5-line change.
+- **D92 — `finalVerbFor` lives in `permanent.ts`, not in tool-vocab.** The mapping is render-policy ("how do we display failure?"), not vocabulary. Putting it in tool-vocab would let the adapter or reducer override it inconsistently per call site. Render owns the visual contract; vocab owns the words.
+- **D93 — Subject extractors validated against real `input_schema` defs.** Initial draft of the vocab guessed at field names (`subagent_name`/`goal` for task; flat `process_id` for monitor) — all silently broken because tests only exercised the extractor with shapes the test wrote, not shapes the tools actually receive. Code review caught it before commit. Fix: `nestedStr()` helper for discriminated-union args, real-shape tests in `tool-vocab.test.ts` per tool, and a process-rule that adding a vocab entry requires reading the corresponding `src/tools/builtin/<tool>.ts`.
+- **D94 — Sub-content connector glyph in a shared `glyphs.ts`.** First implementation duplicated the `└─ ` / `\- ` ternary across `permanent.ts` and `tool-card.ts`. Same glyph, two source-of-truth, drift-prone. Extracted to `subContentConnector(caps)` so future spec changes (different glyph, color treatment) land in one file. Other shared glyphs (chip prefix, spinner) stay where they are — they're not duplicated yet.
+
+**Pending / out of scope this slice:**
+
+- **Rich finalVerbs with tool-result detail** (`Read 1 file (2.4kB)`, `Edited foo.ts (+3 −1)`, `Exited 1`). Requires the harness to emit tool-result metadata (file size, line counts, exit code) in `tool_finished` or a new event. Spec change first, code after.
+- **`(ctrl+o to expand)` action.** The hint was deliberately not included in the chip (D90); the action itself (modal or scrollable panel showing JSON args + raw output) is its own slice.
+- **Spec §4.10.4 vocabulary table** still has `Read 1 file (2.4kB)` etc as the canonical finalVerb shape. The table assumes rich detail. Aligning vocab text with what we can actually emit lands when D87's source data is available.
+- **Subagent-row collapse** (UI.md §4.2). Spec mentions a multi-line live block for subagents that collapses to a one-liner on `subagent:end`. Today subagents are surfaced just as a `task` tool chip; the richer block is its own slice.
+
+**Verification:** `bun test` → 2006 pass / 10 skip / 0 fail (+21 new across tool-vocab, permanent, tool-card, state, harness-adapter). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.e.4 — footer below input + operation chip lifecycle for the live region. Footer (rule + dynamic status + interrupt hint) per §4.10.6. The `composeCursor` LAYOUT COUPLING TODO (D79) gets resolved in this slice — the footer's line count must subtract from `inputStartRow`. Operation chip live counter format (`Generating… (8s · ↑ 234 tokens)`) requires the adapter to stop dropping `usage` events.
+
+---
+
+## [2026-05-02] M1 / Step 1.e.2 — User echo inverse bar + cursor inline
+
+Two visuals that finish the input box's polish: every user prompt is
+echoed back as a full-width SGR-7 (reverse video) bar in scrollback,
+turning each turn into a visual landmark you can find by scrolling
+alone (UI.md §4.10.8). And the cursor inside the input box now sits
+where `state.input.cursor` says it does — not always at the end of
+the line — so editing mid-buffer (Home, ←, Ctrl+A, multi-line up/
+down) finally feels like a real input.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/term.ts` | NEW `reverse(text)` helper that wraps text in `CSI 7m` + reset. Always emits regardless of `caps.color` — reverse is an attribute, not a color, and the user-echo bar needs the visual contrast even under NO_COLOR (UI.md §4.10.8). NEW `cursorForward(n)` ANSI helper (`CSI N C`); same shape as `cursorBack`/`cursorUp`/`cursorDown`. |
+| `src/tui/render/permanent.ts` | `user-submit` case rewritten: split text on `\n`, prefix first line with `> ` and continuations with two spaces, pad each line to `caps.cols` (clamping when the text already exceeds), wrap in `reverse()`. The result is a stack of edge-to-edge inverse bars — one per input line. Each line gets its own `CSI 7m`/`CSI 0m` pair so terminal re-flow on resize doesn't strand inverse state across boundaries. |
+| `src/tui/render/compose.ts` | NEW `composeCursor(state, lineCount): {row, col} \| null` helper. Returns null when `state.modal !== null` (modal owns the cursor). Otherwise computes the cursor's logical position within the live region: counts the input's line index (newlines before `state.input.cursor`), adds the 2-char prefix width to get the visual column, and combines with the input's start row (derived from `lineCount - inputLineCount`). |
+| `src/tui/renderer.ts` | `drawLive` now tracks a `cursorRow` field (0-based from top of live region) and applies the inline cursor positioning after writing all live lines: `cursorUp(linesUp)` (only when target row is above the last line), `\r` (col 0), `cursorForward(col)`. `eraseLive` parameterizes its cursor-up count by `cursorRow` instead of the previous `liveHeight - 1` constant — necessary because the cursor may sit inside the input mid-row, not at end of last line. |
+| `tests/tui/term.test.ts` | NEW 2 tests: `cursorForward(N)` shape (CSI N C, no-op on n ≤ 0); `reverse()` always wraps (UI.md §4.10.8 attribute-vs-color). |
+| `tests/tui/render/permanent.test.ts` | Old `user-submit` block (2 tests) replaced by `describe('user-submit (inverse bar)')` with 4 tests: single-line padding + SGR wrap, multi-line shape (each line independently wrapped), reverse fires under `color: 'none'`, text wider than `caps.cols` is not padded (clamps to 0). |
+| `tests/tui/render/compose.test.ts` | NEW `describe('composeCursor')` with 7 tests: null on modal, empty input → row=last/col=2, mid-buffer offset → col reflects offset, end-of-input, multi-line cursor on second line, cursor at offset 0, cursor right after a newline (continuation start). |
+| `tests/tui/renderer.test.ts` | NEW 3 integration tests covering the cursor pipeline end-to-end through the renderer: single-line cursor emits `\r` + `cursorForward(N)` (no `cursorUp` because target row matches last line); multi-line cursor on the FIRST input row emits `cursorUp(1)` + `cursorForward(5)` (2 prefix + 3 offset); modal up suppresses cursor positioning entirely (no `CSI N C` escapes in the frame's writes). |
+
+**Decisions:**
+
+- **D76 — `reverse()` always emits, regardless of `caps.color`.** The spec (UI.md §4.10.8) explicitly carves reverse out as an attribute that survives NO_COLOR. A black-on-white inverted bar still divides scrollback meaningfully even when the user disables color; gating reverse on `caps.color` would silently kill the divider for the audience that needs it most (terminals without color, dim CI logs preserved). Implementation: bare `${CSI}7m...${CSI}0m` template, no caps inspection.
+- **D77 — Each user-submit line wraps in its OWN reverse pair.** A single outer `${CSI}7m...lines.join('\n')...${CSI}0m` would be shorter, but a terminal resize / re-flow could strand the open SGR across newlines (some terminals reset attributes on `\n`, some don't — undefined). Per-line wrap is robust regardless of terminal quirk, costs ~7 bytes of escape per line.
+- **D78 — Padding uses `' '.repeat(caps.cols - visualWidth(line))`, not `padEnd`.** The string's `padEnd` pads code units; for plain ASCII text that matches visual columns, but CJK / emoji content would over-pad. Using `visualWidth` in the math future-proofs for multi-col text in input (none today, but the input editor accepts arbitrary Unicode). The `Math.max(0, ...)` clamps so over-wide text gets no padding instead of negative `repeat()` arg (which throws in modern engines).
+- **D79 — `composeCursor` lives in `compose.ts`, not the renderer.** The cursor position is derived from the same state + layout that produces `composeLive`'s output. Keeping both in `compose.ts` means future layout changes (footer below input, todo list interleaved) update one file: composeLive's line layout AND composeCursor's row math stay in sync. Putting it in the renderer would couple cursor logic to the writer and fragment layout knowledge.
+- **D80 — `lineCount` passed in, not recomputed.** `composeCursor` could re-call `composeLive` (or duplicate parts of its traversal) to know the total line count. Passing the number the renderer already has avoids a second pass through state.activeTools and a second renderInput invocation. Trade: caller MUST pass the actual count from `composeLive`'s output; mismatch produces a wrong row. Acceptable — there's exactly one caller (the renderer).
+- **D81 — `cursorRow` is renderer-internal state, mutated by drawLive, consumed by eraseLive.** Pre-1.e.2, `eraseLive` assumed the cursor was always at the end of the last live line (`cursorUp(liveHeight - 1)` math). With inline cursor positioning, the cursor may sit mid-input mid-row. The renderer tracks `cursorRow` so eraseLive knows how many lines to walk back. Default after drawLive without inline cursor = `liveHeight - 1` (preserves the old behavior). Default before any drawLive = 0 (irrelevant; eraseLive bails when liveHeight is 0).
+- **D82 — Single-width assumption for cursor visual column.** `composeCursor` uses `(linesBefore[idx] ?? '').length` for the offset within the input line — code units, not visual width. CJK / emoji input would mis-count by 1 col per double-width glyph. Producers don't emit multi-col text in the input today (the editor accepts it but typical use is ASCII). Documented limitation; lands when visualWidth-aware cursor math is needed.
+- **D83 — Cursor positioning runs INSIDE drawLive, not as a post-write hook.** JS is single-threaded so "atomic write+position" isn't preemption protection — the value is single-responsibility: drawLive owns the live region top-to-bottom and callers can't forget to position. A separate `positionCursor()` would split the concern across two methods and the next refactor would break ordering. Inline keeps the contract trivially correct.
+
+**Pending / out of scope this slice:**
+
+- **CJK / emoji cursor accuracy** (D82). The cursor offset assumes single-width per code-unit. Multi-col text in input mis-positions by 1-2 cols per glyph.
+- **Cursor visibility toggle.** Spec UI.md §6.2 has `cursorHide`/`cursorShow` constants but the renderer doesn't toggle them; cursor is always visible (terminal default). If we ever want to hide during long live region transitions, the hooks exist.
+- **Input scroll for very long buffers.** When `state.input.cursor` exceeds `caps.cols`, the cursor positioning math sends the cursor past the terminal edge. Modern terminals clamp; behavior is OK but ugly. Horizontal scroll within the input box (showing a window of the buffer around the cursor) is future polish.
+
+**Verification:** `bun test` → 1985 pass / 10 skip / 0 fail (+14 new across term, permanent, compose, renderer). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.e.3 — tool indicator collapsed (verb + sub-content per spec §4.10.3-7). Refactor of `tool:start`/`tool:end` payload to carry `verb` + `subject` instead of raw JSON args, new `src/tui/tool-vocab.ts` mapping tool names to their active/final verbs and subject extractors, and `formatPermanent` / `tool-card` rewrite to use the `└─` connector. Most invasive of the 1.e.X slices because it touches the harness adapter (verb registration) and every tool's metadata.
+
+---
+
+## [2026-05-02] M1 / Step 1.e.1 — Welcome banner + rule above input
+
+First slice of the §4.10 layout-target implementation. Two cheap
+visuals that anchor the boot experience: a four-line banner at the
+top of every REPL session (so the operator sees model + cwd + env
+before typing anything), and a horizontal rule between the live
+region and the input box (so the input has visual separation from
+the running operations above it). No vocabulary changes, no new
+state — just layout polish that makes the screen no longer "blank
+with `> `".
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/events.ts` | NEW `SessionBannerEvent` (type `'session:banner'`): `app`, `version`, `model`, `contextWindow`, `maxOutputTokens`, `cwd`, `env: {key,value}[]`. Producer-only event — emitted once at REPL boot, never re-emitted. Added to the `UIEvent` union. |
+| `src/tui/state.ts` | NEW `'session-banner'` kind in `PermanentItem` union (mirrors the event payload). Reducer branch for `session:banner` emits the permanent and leaves `LiveState` untouched (banner is pure scrollback, doesn't animate or get re-read). |
+| `src/tui/render/permanent.ts` | NEW `formatPermanent` case for `session-banner`: 4 lines per UI.md §4.10.9 — bold `app version`, dim `model · ctxN · max N out`, dim cwd, dim env joined by ` · ` (Unicode) / ` - ` (ASCII). Empty env array → line omitted entirely (producer signal of "nothing to summarize"). `contextWindow` formatted with `toLocaleString()` for thousands separator. |
+| `src/tui/render/compose.ts` | Insert a full-width rule line between status line / tool cards and the input box. Unicode `─`, ASCII `-`, repeated `caps.cols` times, dim. Suppressed when modal is up (modal owns its own structure). Lives ABOVE the input so the bottom anchor is `[rule, > input]`. |
+| `src/cli/version.ts` | NEW shared `APP_NAME` + `VERSION` constants. Both `index.ts` (for `--version`) and `repl.ts` (for the banner) import from here, killing the inline `const VERSION = '0.0.0'` duplication. |
+| `src/cli/index.ts` | Imports `VERSION` from `./version.ts` instead of declaring inline. |
+| `src/cli/repl.ts` | After bootstrap, before the initial `input:update`, emits `session:banner` with the collected metadata: `APP_NAME`/`VERSION` from version.ts, `modelId` from bootstrap result, `contextWindow`/`maxOutputTokens` from `baseConfig.provider.capabilities` (with `budget.maxOutputTokensPerCall` overriding when set), `cwd` from `baseConfig`. Env entries land conditionally per D68: `subagents: <N>` only when count > 0; `checkpoints: enabled` only when `enableCheckpoints && (await isGitRepo(cwd))` (i.e., the feature will actually fire — silent when disabled OR when the cwd isn't a git repo). Memory entry count omitted until the registry exposes a sync count method. Two new RunReplOptions test seams: `now?: () => number` (threaded through every bus.emit's `ts`) and `rendererWrite?: (s: string) => void` (passed to createRenderer for stdout capture). |
+| `tests/tui/state.test.ts` | NEW test for `session:banner` reducer branch: emits the permanent, preserves `LiveState` exactly. |
+| `tests/tui/render/permanent.test.ts` | NEW `describe('session-banner')` block: 6 tests covering Unicode separator output, ASCII fallback, empty-env line omission, bold/dim SGR application with color, no SGR with color disabled, and `toLocaleString()` formatting on a 1M context window. |
+| `tests/tui/render/compose.test.ts` | Existing 5 tests updated for the new `[..., rule, input]` bottom shape. NEW 4 tests: ASCII rule fallback, rule width via `visualWidth` (ANSI-aware, robust under color), rule width holds with color enabled (SGR codes don't bloat visible width), rule suppressed when modal is up. |
+| `tests/cli/repl.test.ts` | `makeBootstrapStub` extended with `provider.capabilities` (context_window, output_max_tokens) and `enableCheckpoints: false` so the REPL's banner-emit code path doesn't crash on the hollow stub. NEW test using `rendererWrite` seam: captures stdout, asserts banner content (`forja 0.0.0`, model, ctx, cwd) and confirms `subagents` / `checkpoints` strings absent when both env entries omit (D68 happy path through the REPL boot). |
+
+**Decisions:**
+
+- **D66 — Banner is `PermanentItem`, not live region.** The banner is information you read once and then the conversation grows above it. Putting it in `LiveState` would mean re-rendering it every frame and (worse) clearing it on resize. As a permanent, it goes to scrollback once and is owned by the terminal — copy-paste and mouse-scroll work normally on it.
+- **D67 — Banner is one-shot, producer responsibility.** No machinery prevents double-emit; the contract is documented in the event's TSDoc and the REPL boot code calls it exactly once. Tests don't enforce singularity (would require global event-counter state); code review is the gate.
+- **D68 — Empty env line is omitted, not rendered as "(none)".** Producers that don't have anything to summarize pass `env: []` and the renderer skips the line entirely. A "(none)" placeholder would be noise. If a producer wants to surface "we tried but found nothing", it passes `env: [{key: 'memory', value: '0 entries'}]` explicitly.
+- **D69 — Rule between status and input, not between input and footer.** The footer doesn't exist yet (lands in 1.e.4); when it does, a second rule will go between input and footer. For now, the single rule above input gives the input box visual separation from whatever's running above it (status line, tool cards). Without the rule, the `> ` blends into the status line and the eye loses the input's anchor.
+- **D70 — Rule suppressed when modal is up.** The modal already has its own top/bottom rule (renderModal §5.5); adding a third rule above it would visually stack 2-3 horizontal lines in 5 vertical lines. The modal owns the bottom of the live region while open — composer skips the rule alongside the input.
+- **D71 — `maxOutputTokens` reads from budget first, capabilities second.** The provider exposes its hard cap; the budget can lower it for the run. Showing the lower number ("max 1024 out" with provider cap of 4096) reflects what the operator actually has, not what the model could theoretically emit. When budget is unset, falls back to provider's `output_max_tokens`.
+- **D72 — `version.ts` shared module.** Two callers (`index.ts`, `repl.ts`) need the same constants; an inline `const VERSION = '0.0.0'` in two places would drift on the first bump. The module is 4 lines but earns its keep — future build-time injection (`bun build --define VERSION=$(git describe)`) lands in one place.
+- **D73 — Banner test via `rendererWrite` seam, not bus snooper.** Threading test data through stdout capture (the renderer's `write` option) tests the END-TO-END contract: emit → reducer → permanent → format → write. A bus-snooper would only verify the emit happened; missing the format step. The seam is a 1-line option in RunReplOptions and a 1-line passthrough into createRenderer.
+- **D74 — Env entries land conditionally, not as `<key>: 0` / `<key>: disabled`.** Generalizes D68 from "empty env array → omit line" to "entry-by-entry omit when value isn't actionable". `subagents: 0` tells the operator nothing useful — they don't have any defined; pushing the entry is noise. `checkpoints: enabled` when the cwd isn't a git repo is worse than noise — it's a lie that the harness contradicts seconds later. The REPL probes `isGitRepo(cwd)` before pushing the checkpoints entry. Cost: one async call (~10-50ms) at boot, dwarfed by the rest of bootstrap.
+- **D75 — `now` and `rendererWrite` test seams.** The REPL has been emitting `Date.now()` literals across 5+ call sites; tests had no way to control timestamps for ordering assertions or capture rendered output. Both options (`now?: () => number`, `rendererWrite?: (s: string) => void`) cost 2 lines each in the REPL signature, replace zero production behavior, and unlock a class of tests that were previously impossible (output-capture without monkey-patching process.stdout).
+
+**Pending / out of scope this slice:**
+
+- **Memory entry count in env summary.** Requires a sync `MemoryRegistry.count()` method (or async with a snapshot-cache). Lands when the memory subsystem exposes it.
+- **Policy layer summary** (e.g., `policy: project (5 rules) · user (2 rules)` from spec §4.10.9). Requires `PermissionEngine.view()` to return a layer→rule-count map. Lands with that API extension.
+- **Footer (rule below input + dynamic status).** Step 1.e.4. The current rule is just above input; the footer slice adds the second rule and the contextual hint line.
+- **User echo inverse bar + cursor inline.** Step 1.e.2.
+- **Tool indicator collapsed (verb + sub-content).** Step 1.e.3.
+
+**Verification:** `bun test` → 1971 pass / 10 skip / 0 fail (+12 new across permanent, compose, state, and repl). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.e.2 — user-submit echo with SGR-7 inverse bar (full-width) + cursor inline in the input box (cursor positioned at `state.input.cursor` instead of always at end-of-line). Both touch `formatPermanent` / `renderInput` and need ANSI cursor-back math.
+
+---
+
+## [2026-05-02] M1 / Steps 1.d.3 + 1.d.4 — Harness→UI adapter + interactive REPL
+
+Two slices land together because they're load-bearing for each
+other: the adapter is dead code without a bus to feed (the renderer
+needs a producer), and the REPL is a renderer with nothing to render
+without the adapter wiring `HarnessEvent` → `UIEvent`. Together they
+close the loop: typed prompt → `runAgent` → harness lifecycle →
+adapter → bus → reducer → renderer back to the user's terminal.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/harness-adapter.ts` | NEW `createHarnessAdapter(ctx) → {translate(HarnessEvent): UIEvent[]}`. Stateful per-run: tracks the current assistant message id (so `text_delta` events with no id can be attributed), the live thinking flag (so `thinking:end` fires at text boundaries and stop), per-`toolUseId` tool tracking (name + args + decision so `tool:end` knows whether to render `denied` vs `error` vs `done`), and a running step counter. Translation rules: `session_start` → `session:start` + initial `step:budget`; `step_start` → `step:budget`; `provider_event:start` → `assistant:start`; `provider_event:text_delta` → close any thinking + `assistant:delta` (auto-synthesizes a start when the stream is malformed); `provider_event:thinking_delta` → `thinking:start` (lazy) + `thinking:delta`; `provider_event:stop` → close thinking + close assistant; `provider_event:tool_use_*` → DROPPED (would double the tool card); `provider_event:error` → `error` (fatal flag mirrors retryable=false); `tool_invoking` → `tool:start` (args JSON.stringified + truncated to 200 chars); `tool_decided` → silent (decision stored, surfaces via `tool_finished`); `tool_finished` → `tool:end` (status from decision/failed); `compaction_started` → `warn`; `compaction_finished` (non-skipped) → `warn` with strategy + foldedCount + ms + reason; `checkpoint_created` → `checkpoint:create` (+ `warn` when `hadBash:true` so user knows `--undo` won't reverse bash side effects); `checkpoints_unavailable` → `warn`; `resume_truncated` → `warn`; `session_finished` → close any stranded streaming state, final `step:budget`, optional `warn` for adverse exits, then `session:end` with `ExitReason` mapped to `'done' \| 'aborted' \| 'maxSteps' \| 'maxCostUsd' \| 'error'`. |
+| `src/tui/events.ts` | NEW `InputUpdateEvent` (type: `'input:update'`, value, cursor) added to the `UIEvent` union. The REPL's input editor emits this after every keystroke so the reducer keeps `state.input` current and the renderer redraws. Cheap event — straight from `applyKey(...).next`. |
+| `src/tui/state.ts` | Reducer absorbs `input:update` (sets `state.input` to the new value/cursor). `user:submit` branch now also resets `ended: false` — the prior one-shot semantics where `session:end` froze the renderer don't fit a multi-turn REPL, and the safety guard moved to `renderer.close()` (already handled). |
+| `src/tui/bus.ts` | `emit()` now skips the typed-channel emit for `'error'` events when no listener is registered on the `'error'` channel. Node's `EventEmitter` has a special case where `emit('error', ...)` THROWS without a typed-channel listener; the TUI bus uses the type tag as a routing key, not as Node's error sentinel, and the renderer subscribes via `onAny` (no listener on the typed `'error'` channel). Without this fix, any non-fatal stream error tipped through the bus crashed the process. The wildcard channel still receives the event, so the renderer/audit see it normally. |
+| `src/tui/index.ts` | Exports added for `focus-stack`, `harness-adapter`, `input-editor`, `modal-manager` so REPL callers don't reach into individual modules. |
+| `src/cli/repl.ts` | NEW `runRepl({args, ...}) → Promise<number>`. TTY guard (refuses non-TTY unless `skipTtyCheck`); single bootstrap with empty placeholder prompt (the harness loop tolerates `userPrompt === ''` and skips appending a user message — we override per turn instead). Per turn: rebuilds a HarnessConfig from `baseConfig`, swapping in `userPrompt` + (after the first turn) `resumeFromSessionId`, threading a fresh `AbortController.signal`, and routing `onEvent` through the adapter onto the bus. The bus emits drop `session:end` so the renderer doesn't freeze between turns. Input editor handler (bottom of focus stack) processes every keystroke through `applyKey`, emits `input:update` for every result, and on `submit` checks `running` — emits `user:submit` and starts a turn only when idle (typed text accumulates while running so the user can compose the next prompt). `cancelInput` (Ctrl+C with empty buffer) shuts down with exit 0; `interruptSoft` (single Esc during a turn) calls `abortController.abort()`. SIGINT routed the same way: abort if running, exit 130 if idle. Test seams: `bootstrapOverride`, `runAgentOverride`, `stdin`, `errSink`, `skipTtyCheck`. |
+| `src/cli/index.ts` | Empty prompt now opens the REPL (via lazy import of `./repl.ts`) instead of erroring `missing prompt` (option (i)). `--json` + empty prompt is rejected upfront — NDJSON consumers don't have a TTY to type into. `--resume` with no prompt continues to fail through the existing run.ts path with a more specific message. |
+| `tests/tui/harness-adapter.test.ts` | NEW 32 tests across 4 describe blocks: session lifecycle (start emits status + initial budget, step_start increments, session_finished emits final budget + reason mapping, adverse exit produces warn + 'error', stranded streaming state closed at end, resume_truncated → warn); provider events (start/delta/end, late-delta synthesizes start, second start closes prior, tool_use_* dropped, usage dropped, error event with retryable flag); thinking (lazy start, no double-start, text_delta closes thinking, stop closes thinking); tool lifecycle (args stringification + truncation, decided silent, deny → status='denied', allow + failed → 'error', no decision → status from failed flag, state cleanup after finish); compaction & checkpoints (started → warn, skipped → no event, llm → warn with details, checkpoint with hadBash → checkpoint + warn, checkpoints_unavailable → warn). |
+| `tests/cli/repl.test.ts` | NEW 7 tests with EventEmitter-backed fake stdin + injected `runAgentOverride`: TTY refusal, boot + Ctrl+C exit, typed prompt triggers runAgent with the typed text + no resume on first turn, second turn threads `resumeFromSessionId`, Enter ignored mid-run (with input accumulation across turns), Esc Esc aborts via the harness signal, runAgent rejection surfaces as error event and the REPL keeps running. |
+| `tests/cli.test.ts`, `tests/cli/index.test.ts` | Two existing "missing prompt" tests rewritten — the entry-level gate was relaxed; the REPL's TTY check is the new failure surface for `forja` invoked without a prompt and without a TTY. |
+
+**Decisions:**
+
+- **D51 — Adapter is per-session stateful, constructed in the REPL/caller.** `HarnessEvent` carries no message id on `text_delta` and no decision on `tool_finished`; we'd otherwise lose the ability to render assistant deltas inline or distinguish denied from errored. The state lives in a closure built per `runAgent` call, dropped at session_finished. One adapter per harness run — keeps the bookkeeping isolated and avoids cross-session bleed of toolUseId tracking.
+- **D52 — Adapter never throws.** `JSON.stringify` of args wrapped in try/catch (BigInt, circular refs); unknown event kinds fall through to the exhaustiveness check; the REPL's `onHarnessEvent` wraps `translate` in another try/catch and emits a `warn` if anything escapes. The harness loop's `safeEmit` swallows callback throws anyway, but defense in depth — a buggy adapter shouldn't kill the run.
+- **D53 — Provider `tool_use_*` events dropped at the adapter.** The harness emits `tool_invoking` AFTER the provider stream concludes, with the full args payload + the assigned `toolUseId`. Surfacing both would render the same tool card twice (once partial, once complete). Drop the provider stream's tool_use events; the renderer sees only the post-decision lifecycle.
+- **D54 — Adverse exit → `warn` + `session:end` reason='error'.** `ExitReason` has 10 variants; `SessionEndEvent.reason` collapses them into `done | aborted | maxSteps | maxCostUsd | error`. The detail string from `HarnessResult.detail` rides along as a `warn` permanent line emitted BEFORE `session:end`, so the user sees the "why" even though the session-footer reducer only knows the collapsed reason. Keeps the renderer's footer shape stable and gives full information to scrollback.
+- **D55 — Step:budget emitted on session_start AND session_finished AND every step_start.** Three triggers because: session_start sets the initial 0/N display; step_start updates the running count; session_finished overwrites with the actual final cost (the harness reports cost only at session end, so mid-run the cost stays 0 in the status line). Consumers that care about live cost will need a per-turn usage signal — explicitly out of scope for this slice.
+- **D56 — Single bootstrap per REPL session, per-turn HarnessConfig override.** Bootstrap allocates the DB, opens the provider, resolves the policy hierarchy, loads subagents — all stable across turns within a session. Re-bootstrapping per turn would re-read .agent/permissions.yaml, re-load every subagent .md, re-probe git for checkpoints — minutes of redundant work over a long session. Per turn we just spread `baseConfig` and override `userPrompt` + `signal` + `onEvent` + `resumeFromSessionId`. Surfacing lock conflicts and subagent shadows happens once at boot, not per turn.
+- **D57 — REPL drops `session:end` from the bus stream.** The reducer's old `session:end` semantics set `state.ended = true` and the renderer froze. That's correct for one-shot mode; in REPL the user types between turns and needs the renderer alive. Two paths considered: (a) reset `ended` on the next `session:start` (works but the typing-between-turns interval is dead); (b) drop `session:end` entirely in REPL, lose the session-footer scrollback line. (b) chosen — the next user prompt is a natural visual divider, and the cumulative `step:budget` already rolled forward to the final values. The reducer's `user:submit` branch ALSO resets `ended` as belt-and-suspenders for any callers that don't filter.
+- **D58 — Empty prompt enters REPL; `--json` + empty prompt is an error.** NDJSON consumers (CI, scripts, `forja … | jq`) have no TTY; opening a REPL there is a UX trap. Refuse upfront with a clean diagnostic. Also: `--resume` without a prompt continues to error inside `run.ts` with the more specific "follow-up prompt required" message — REPL doesn't need to special-case resume.
+- **D59 — Bus `emit('error', ...)` skips the typed channel when no listener exists.** Node's `EventEmitter` has the special `emit('error', ...)` throw-when-unhandled behavior. The TUI bus uses the type tag as a routing key, not as Node's error sentinel; the renderer subscribes via `onAny`. Without the carve-out, any UIEvent of type `'error'` crashed the process unless someone explicitly subscribed to the typed channel. The wildcard channel still receives the event so the renderer/audit see it normally.
+- **D60 — Editor surfaces `submit` even while running; the REPL chooses not to act.** While a turn is in flight, the user can keep typing the next prompt. Enter during a run doesn't submit — but `applyKey` still produces a `submit` signal because the editor is decoupled from REPL state. The REPL's gate is `if (running) skip`; the typed text stays in the buffer, and the next post-turn Enter submits it. Considered clearing the buffer on rejected Enter — rejected (loses user input).
+- **D61 — `Esc Esc` is the only working Esc abort path in tests.** The key parser intentionally buffers a lone ESC (it could be the start of a CSI sequence — see keys.ts:213). To produce a synthetic `escape` key event from a test, feed `\x1b\x1b`: the first ESC flushes as `escape`, the second stays buffered. Production gets the same behavior — a real terminal sends ESC in isolation only when the user actually pressed Esc, but our tests don't have a flush timer to lean on. Documented in the test comments.
+- **D62 — Modal manager wired but not yet driven.** The REPL constructs a `createModalManager({bus, focusStack})` so the focus + bus plumbing is in place; no producer calls `askPermission` yet. The harness's permission engine doesn't bridge to the bus in this slice — it lands when the permission/trust producers connect (a later step). Keeping the manager constructed (vs deferring) avoids a future PR rewriting the REPL boot.
+
+**Pending / out of scope this slice:**
+
+- **Permission producer → modal manager bridge.** The harness's `permissionEngine.check` returns `confirm` decisions today but no producer calls `modalManager.askPermission` to surface them as modals. Until wired, `confirm` decisions in REPL behave the same as in one-shot mode (denial via the existing fall-through path). Lands when the permission producer ships.
+- **Live cost on the status line.** The adapter passes `costUsd: 0` on `step:budget` until the harness emits `session_finished` (the only event that reports session cost). A future per-turn usage signal could update mid-run.
+- **Scrollback for subagent / bg / todo events.** Adapter doesn't translate them — those events flow through `onEvent` in the harness today only when subagents/bg/todos are wired into harness emission (some are; the adapter doesn't surface them yet). Lands alongside the producers that surface them.
+- **Cursor positioning inside the input.** `renderInput` writes the buffer but the cursor sits at end-of-line, not at the actual cursor index. UI.md §4.5 D11 — deferred.
+- **Slash-command autocomplete + history.** Tab is a no-op in the editor today (D37). `/up` / `/down` history navigation not wired. Both land in their own slices.
+
+**Verification:** `bun test` → 1958 pass / 10 skip / 0 fail (+39 new across harness-adapter and repl). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Wire the permission engine's `confirm` decisions to `modalManager.askPermission` so the REPL surfaces permission prompts as modals. After that, surface subagent / todo / bg events through the adapter so the live region reflects everything the harness is doing.
+
+---
+
+## [2026-05-02] M1 / Step 1.d.2 — Modal pattern (state + render + focus + async manager)
+
+The full modal pattern from UI.md §5.5 lands in one slice because
+the four pieces (state field, render function, focus stack, async
+manager) are tightly coupled — splitting them creates dead code at
+intermediate steps. After this, the harness can call
+`manager.askPermission({...})` and `await` a `Promise<boolean>`;
+under the hood, modal events flow through the bus, the reducer
+shows the box, the focus stack routes ←/→/Enter/Esc to the
+manager, and the manager resolves the promise + emits the answer
+event + clears the focus handler.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/state.ts` | NEW exported `ConfirmState` (promptId, flavor: permission/trust/memory-write/plan-review/critique, message, details, selected). NEW `LiveState.modal: ConfirmState \| null` field. Reducer wires all five `*:ask` events: builds the modal with `selected: 'no'` (D5 safety), routing per-flavor payload into headline + details. `permission:answer` clears the modal — but only when `promptId` matches the open prompt (a stale answer can't dismiss a fresh modal). Removed five entries from the parametric "not yet wired" list. |
+| `src/tui/render/modal.ts` | NEW `renderModal(modal, caps): string[]`. Layout: top rule, headline (bold), blank, details (dim, indented), blank, selector (`▶ YES        NO` / `  YES      ▶ NO`), bottom rule. Unicode rules use `─`; ASCII uses `-`. Pointer is `▶` Unicode / `>` ASCII. Empty details collapse the section (5 lines instead of 7); empty entries within details become spacer rows. No green/red on YES/NO — coloring approval would undermine "default = NO" (D42). |
+| `src/tui/render/compose.ts` | Compose now picks modal OR input — never both. Status line + tool cards still render above. The modal owns the bottom of the live region while up. |
+| `src/tui/focus-stack.ts` | NEW `createFocusStack()` returning `{push, remove, dispatch, size, clear}`. Top of stack runs first (LIFO); falls through if a handler returns false. Dispatch returns whether ANY handler consumed. `remove(handler)` searches top-down by reference (LIFO common case). Pure data structure — no I/O, single instance owned by the REPL loop. |
+| `src/tui/modal-manager.ts` | NEW `createModalManager({bus, focusStack, now?, newPromptId?, setTimer?, clearTimer?})`. `askPermission(args, opts?)` returns `Promise<boolean>`. Under the hood: enqueue → drain (one modal at a time, FIFO) → emit `permission:ask` → push focus handler. Handler: `left/right/tab` toggle selected (re-emit ask with same promptId), `enter` resolve to `selected === 'yes'`, `escape` resolve to `false`, anything else swallowed (modal never surprises). On resolve: emit `permission:answer` BEFORE the promise resolves (audit/telemetry sees ordering), pop focus handler, drain next. Optional `timeoutMs` rejects-as-false — works whether the modal is active or still queued. `close()` rejects everything outstanding. `pendingCount()` for tests. |
+| `tests/tui/focus-stack.test.ts` | 9 tests: empty stack, single handler, top runs first, fall-through on false, all-false dispatch, remove specific handler, remove non-existent returns false, top-down search, clear empties. |
+| `tests/tui/render/modal.test.ts` | 10 tests: full layout, ASCII vs Unicode rules, default selector points to NO, yes-selected points to YES, ASCII pointer is `>`, no-details collapses, empty-detail-entry becomes spacer, headline gets bold SGR with color, details get dim SGR with color, color disabled emits no SGR. |
+| `tests/tui/modal-manager.test.ts` | 13 tests: emits ask + pushes handler, default Enter resolves false, right-then-Enter resolves true, Tab toggles, Esc resolves false even after right, answer event emitted before promise resolves, focus handler removed after resolution, swallows printable chars while up, queue (two asks: first opens, second waits, both resolve), timeout fires while active rejects false, explicit answer clears timeout, timeout while queued rejects without opening, close rejects all + clears stack. |
+
+**Decisions:**
+
+- **D41 — One modal at a time, queued.** UI.md §5.5 mandates "modal queue: FIFO". The manager enforces — `pendingCount()` reflects total (active + queued); `drain()` opens the next when the active resolves. Two-modals-at-once would require nested focus handlers and dual rendering — punted by spec.
+- **D42 — No green YES, no red NO.** Default = NO is the safety invariant; coloring YES green (approval-positive) would undermine it. The selector is plain text, only the pointer (`▶` / `>`) signals state. If the user wants color, they get it post-resolve via `permission:answer` audit lines.
+- **D43 — Modal state lives in `LiveState`, not the manager.** The manager owns the async lifecycle (queue, promises, timeouts); the state owns the visual. This split lets the renderer read `state.modal` without depending on the manager, and lets the manager run without holding render state. Communication is via the bus: manager emits `*:ask` → reducer mutates state → renderer composes.
+- **D44 — Toggle re-emits the same `*:ask` event with the same promptId.** Instead of a separate `*:select` event, we re-issue the ask with new `selected` (carried via the same bus shape). Pro: one event for both creation and updates — fewer schema additions. Con: details/headline are recomputed each time, but they're cheap to assemble. Reducer detects same `promptId` and overwrites; no race condition since both events serialize through the bus.
+- **D45 — `permission:answer` emitted BEFORE promise resolves.** Order matters: audit listeners (telemetry, transcript writer) need to see the answer in scrollback before any `.then()` chain runs. The manager calls `bus.emit` first, `pending.resolve` second — both synchronous, but the ordering is documented in the test.
+- **D46 — Focus handler removed by exact reference.** The manager pushes `activeHandler` and removes by passing the same reference back. `remove(handler)` returns false if the handler was already gone (popped externally), which the manager ignores. Idempotent close path.
+- **D47 — Stale answer drops silently.** `permission:answer` with a `promptId` that doesn't match the open modal is a no-op in the reducer. Avoids "wrong modal dismisses" when a producer cancels then re-asks before the cancel propagated.
+- **D48 — `askPermission` is the only public ask method (for now).** `askTrust` / `askMemoryWrite` / `askPlanReview` / `askCritique` will land alongside their producers. The reducer already accepts the events (so the bus path works end-to-end), but the convenience wrappers are deferred — keeps the API surface small until each flavor's producer is real.
+- **D49 — Single confirm shape across flavors.** Permission, trust, memory-write, plan-review, critique all reuse `ConfirmState` (yes/no, message + details). Per-flavor specifics get rendered into `details` text. We considered separate state per flavor (e.g., a memory-write modal could show a diff inline); deferred to when a flavor outgrows the shared shape. Most modals are "you sure? (y/n)" anyway.
+- **D50 — Manager sees the bus but not the renderer.** No `composeLive` import, no scheduler awareness. The renderer wakes on bus events naturally; the manager doesn't need to bump it. Keeps the dep graph one-way: manager → bus, renderer → bus, no manager → renderer.
+
+**Pending / out of scope this slice:**
+
+- **Convenience wrappers `askTrust` / `askMemoryWrite` / `askPlanReview` / `askCritique`** — bus events accepted by the reducer but no public method on the manager. Lands when the producer for each one wires up.
+- **REPL loop wiring** — focus stack + manager exist, but nothing yet pumps `process.stdin` → key parser → focus.dispatch. Step 1.d.4.
+- **HarnessEvent → UIEvent adapter** — translates the harness's `HarnessEvent` shape into `UIEvent`. Step 1.d.3.
+- **Per-flavor headline microcopy.** Reducer just renders the bus payload as message + details strings; spec UI.md §4.6-4.9 has more polish (e.g., "[a]ccept [r]eject [e]dit [w]hy?" style hint lines). Deferred.
+- **Why-explanation expansion** (`[w]hy?` action). Spec mentions; not wired.
+
+**Verification:** `bun test` → 1904 pass / 10 skip / 0 fail (+32 new across focus-stack, modal render, modal-manager). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.d.3 — `HarnessEvent → UIEvent` adapter. The existing harness emits `HarnessEvent` (see `src/harness/types.ts`); the adapter translates it into the `UIEvent` shape the renderer + reducer consume. After that: REPL loop in `src/cli/index.ts` (1.d.4) — pumps stdin into the key parser → focus stack, hooks the renderer to a real harness run.
+
+---
+
+## [2026-05-02] M1 / Step 1.d.1 — Input editor + heartbeat tick
+
+Two pure modules that close out the foundation for the interactive
+REPL: the input editor (KeyEvent → InputState mutations) and the
+heartbeat (periodic frame requests while live elements animate).
+Neither touches I/O — both are state-in/state-out functions with
+injectable timers, so the tests don't need a real terminal.
+
+The editor is the part of the TUI a user feels every keystroke.
+The heartbeat is what makes a long-running tool feel alive instead
+of frozen between events.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/input-editor.ts` | `applyKey(input, key) → {next, submit?, cancelInput?, interruptSoft?, interruptHard?}`. Pure reducer over the full `KeyEvent` union (char/key/paste). Handles printable insertion at cursor, bracketed paste (multi-line preserved), backspace/delete, arrows (left/right/home/end), word jumps (Ctrl+Left/Right, Alt+B/F), Ctrl+A/E (line start/end, multi-line aware), Ctrl+U/K (delete to line start/end), Ctrl+W (delete previous word), Alt+D (delete next word), Ctrl+H (legacy backspace), Up/Down with column-preserving multi-line navigation. Enter submits non-empty buffers (signal only — reducer clears via existing `user:submit` path); empty buffer + Enter is a no-op. Shift+Enter inserts `\n`. Ctrl+C clears non-empty buffer; surfaces `cancelInput` when buffer empty. Ctrl+D as EOF (empty) or delete-forward (non-empty). Esc surfaces `interruptSoft` for the caller to interpret. Tab is a no-op (reserved for autocomplete in a later slice). |
+| `src/tui/heartbeat.ts` | `createHeartbeat({intervalMs, isActive, onTick, setTimer, clearTimer})`. Periodic ticker that arms a timer only when `isActive()` returns true. On each firing: calls `onTick`, re-evaluates `isActive`, re-arms if still active. `bump()` is the renderer's hook to force re-evaluation after an event (e.g., a `tool:start` arms it; `tool:end` of the last tool stops the cycle on the next firing). Idempotent: multiple `bump()` calls coalesce to one armed timer. `close()` cancels any pending timer; idempotent. `tickCount()` for tests. Default interval 80ms (matches Unicode spinner cadence per UI.md §5.2). |
+| `src/tui/renderer.ts` | Heartbeat wired in: `isActive` checks `state.activeTools.size > 0 \|\| state.thinking !== null`; `onTick` calls `scheduler.request()`. Bumped after every event handler run (including the reducer-error path). `close()` closes the heartbeat too. New `heartbeat?: Pick<HeartbeatOptions, 'intervalMs' \| 'setTimer' \| 'clearTimer'> \| false` option exposes timer hooks for tests; pass `false` to disable entirely. |
+| `tests/tui/input-editor.test.ts` | 36 tests across 9 describe blocks: printable insertion (start/middle/space-key), bracketed paste (single chunk, multi-line), backspace/delete (each direction + boundaries + Ctrl+H legacy), cursor movement (left/right/clamp + home/end multi-line + Ctrl+A/E + Ctrl+Left/Right + Alt+B/F), multi-line up/down (column-preserve, clamp, edge cases), line deletion (Ctrl+U/K/W + Alt+D), Enter (submit, empty no-op, Shift+Enter newline), Ctrl+C/D (clear vs cancel + EOF vs delete), Esc (interrupt signal, buffer intact), Tab (no-op). |
+| `tests/tui/heartbeat.test.ts` | 8 tests with deterministic timer harness: idle bump no-arm, active bump arms + re-arms, becomes-inactive stops on next firing, multi-bump coalesce, close cancels pending, close idempotent, intervalMs respected, tickCount cumulative. |
+
+**Decisions:**
+
+- **D33 — Editor is signal-emitting, not action-applying.** Enter doesn't clear the buffer — the reducer's `user:submit` branch does. The editor returns `{submit: {text}}` and the caller dispatches the bus event. Keeps the editor pure (no bus dependency) and lets the existing reducer path handle "echo to permanent + clear input" without duplication. Same shape for `cancelInput` / `interrupt*`.
+- **D34 — Multi-line is first-class.** Up/Down preserve column where the target line allows it (clamping to line length when the next line is shorter), matching readline / VS Code / vim insert-mode. Above-first-line goes to buffer start; below-last-line goes to buffer end. Home/End / Ctrl+A/E operate on the CURRENT line, not the whole buffer — same as vim and emacs in their default modes.
+- **D35 — Ctrl+C semantics: clear, then cancel.** Pressing Ctrl+C with a non-empty buffer clears the buffer and stays in input mode — a common pattern (bash, zsh, python REPL). Ctrl+C on an empty buffer surfaces `cancelInput` for the caller (REPL loop) to interpret as "exit" or "double-tap to confirm". This avoids accidentally killing a session because the user wanted to scrap their typed input.
+- **D36 — Esc is soft interrupt only at this layer.** Editor surfaces `interruptSoft`. Whether the harness gets the signal depends on whether anything's running — that's not the editor's call. Esc Esc (hard interrupt) lands in the REPL loop, not the editor: when the parser delivers two consecutive escape events within a window, the loop combines them. The editor only sees one Esc per call — which simplifies it.
+- **D37 — Tab is a no-op in the editor.** Slash command autocomplete (UI.md §5.3) intercepts Tab before the editor sees it. Putting "Tab inserts \t" in the editor would create an inconsistency the user has to remember; better to forbid it entirely and let upper layers decide.
+- **D38 — Heartbeat is bumped, not subscribed.** The renderer calls `bump()` after every event. We considered subscribing to `bus.onAny` directly inside the heartbeat; rejected because it would couple the heartbeat to the bus type and force every event to bump (waste). The current design: the renderer is the only thing that bumps, and bumps are cheap (one predicate call + one timer arm).
+- **D39 — Heartbeat goes idle aggressively.** The predicate is checked AFTER firing. If it returns false, the next tick is not scheduled. So an idle bus (no running tools) means zero wakeups while the user types — confirmed by the "becomes inactive" test.
+- **D40 — Default heartbeat interval = 80ms.** Spinner Unicode runs at 80ms per spec (UI.md §5.2); ASCII at 100ms. The heartbeat uses the lower bound so both paths animate smoothly. Faster than necessary for ASCII (one extra wakeup every 5th tick); not enough to matter.
+
+**Pending / out of scope this slice:**
+
+- **No raw stdin → editor wiring yet.** The REPL loop (next slice) hooks `process.stdin` (raw mode + parser → editor → state). This slice keeps the editor pure so the wiring is just plumbing.
+- **No interrupt accumulator.** Esc Esc (hard interrupt) detection (within ~500ms window) lives in the REPL loop, not the editor.
+- **Modal pattern still pending.** Step 1.d.2.
+- **HarnessEvent → UIEvent adapter still pending.** Step 1.d.3.
+- **REPL boot / `src/cli/index.ts` wiring still pending.** Step 1.d.4.
+
+**Verification:** `bun test` → 1865 pass / 10 skip / 0 fail (+44 new). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.d.2 — modal pattern (state + focus stack + async promise per UI.md §5.5). After that: HarnessEvent adapter, then REPL wiring.
+
+---
+
+## [2026-05-02] M1 / Step 1.c — Live render functions + resize watcher
+
+The first two slices (1.a, 1.b) shipped the substrate; 1.b.1
+fixed the structural shape; this slice fills in real render
+functions for the live region. `defaultComposeLive` was a
+placeholder that emitted "good enough" stubs; it's now replaced
+by `composeLive` in `src/tui/render/compose.ts` which calls the
+real per-element renderers. The status line, input box, and
+running tool cards now look right.
+
+Also wires the resize watcher so `caps.cols` / `caps.rows` track
+SIGWINCH. Width-aware truncation lands too — `src/tui/render/width.ts`
+wraps `string-width` so CJK and emoji that occupy two columns
+get counted correctly. `wrap-ansi` is installed for next slice's
+input wrapping.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `package.json` (lockfile) | `bun add string-width@8.2.1 wrap-ansi@10.0.0` (matches UI.md §1 dep list). |
+| `src/tui/render/width.ts` | `visualWidth(s)` (wraps `string-width` — counts CJK/emoji as 2, ANSI as 0). `truncateToWidth(s, maxCols)` walks codepoints (so surrogate pairs stay together) and stops before a glyph that would overflow the budget — no trailing ellipsis (caller composes if wanted). |
+| `src/tui/render/status.ts` | `renderStatusLine(state, caps, {now})` → `string \| null`. Returns null pre-session. Layout: `[profile] sep project sep model sep N/M sep $cost [thinking…]`. Sep is `·` (Unicode) / `-` (ASCII). Budget shading: 80% steps/cost wraps in `paint(caps, 'warn')`, 90% in `paint(caps, 'error')`; cost cap optional (no shading when `maxCostUsd === null`). Thinking indicator appended in `dim` with elapsed seconds; ellipsis Unicode `…` / ASCII `...`. Cost format scales by magnitude (`$0.0123`, `$1.234`, `$123.45`). Skips empty profile/project/model fields. Clamps thinking elapsed to 0 on clock skew. |
+| `src/tui/render/input.ts` | `renderInput(input, caps)` → `string[]`. Empty input → `['> ']`. Multi-line input gets `> ` on first line and 2-space continuation indent on subsequent lines. Trailing newline preserved as empty continuation row. |
+| `src/tui/render/tool-card.ts` | `renderToolCardLive(tool, caps, now)` → `string[]`. Head: `<spinner> name sep args    elapsed`. Spinner glyph rotates: 10-frame Unicode (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` at 80ms) / 4-frame ASCII (`|/-\` at 100ms) — exposed as `spinnerGlyph(caps, now)`. Elapsed: `<1000ms` → `Nms`, otherwise `N.Ns`. Preview lines render below head with tree branches: `├` (mid) / `└` (last) Unicode; `+` / `\` ASCII. Preview lines wrapped in `paint(caps, 'dim')` when color enabled. |
+| `src/tui/render/compose.ts` | `composeLive(state, caps, now)` → `string[]`. Layout top→bottom: active tool cards (insertion order from `state.activeTools` Map), status line (1 line, only when session started), input box (1+ lines). Replaces `defaultComposeLive` from 1.b. |
+| `src/tui/renderer-types.ts` | NEW small file holding the shared `ComposeLive = (state, caps, now) => string[]` type. Lives outside `renderer.ts` to break a circular import: `renderer.ts` imports from `./render/compose.ts` which imports the type back from somewhere — putting the type in a third file breaks the cycle cleanly. |
+| `src/tui/renderer.ts` | Wires it together. (1) `composeLive` default switched from local placeholder to `defaultComposeLiveFn` (re-exported from `./render/compose.ts`). (2) `truncate` removed; live-region truncation goes through `truncateToWidth` from `./render/width.ts`. (3) Mutable internal `liveCaps` (a copy of `options.caps`) so resize updates are reactive without mutating the caller's reference. (4) `createResizeWatcher` is wired: `liveCaps.cols`/`rows` update on resize, `scheduler.flush()` forces a redraw with the new width. (5) `resizeStream?: ResizeStream \| false` option — tests inject a fake stream; pass `false` to opt out entirely. (6) `now?: () => number` option for spinner determinism in tests. (7) `close()` also closes the watcher. (8) Header comment updated to reflect the two surfaces (`formatPermanent` and `createRenderer`). |
+| `tests/tui/render/width.test.ts` | 9 tests: ASCII / CJK / emoji visual widths; ANSI escapes count as 0; truncateToWidth: in-range passthrough, ASCII at exact column, CJK respecting 2-column glyphs, budget 0/negative, oversize emoji dropped not split, ASCII preceding emoji preserved. |
+| `tests/tui/render/status.test.ts` | 13 tests: pre-session null; full Unicode line; ASCII separators; steps fraction; cost magnitude formatting (3 ranges); budget shading at 80%/90% for steps and cost cap; no shading without cap; thinking with Unicode/ASCII ellipsis and clock-skew clamp; empty profile/project/model fields skipped. |
+| `tests/tui/render/input.test.ts` | 4 tests: empty / single line / multi-line indent / trailing newline preserved. |
+| `tests/tui/render/tool-card.test.ts` | 11 tests: spinner rotation Unicode (10 frames @ 80ms) and ASCII (4 frames @ 100ms); head with name/args/elapsed; ms vs s units; clock-skew clamp; Unicode vs ASCII separator; preview tree branches Unicode (`├`/`└`) / ASCII (`+`/`\`); single-preview gets only `└`; preview wrapped in dim SGR when color enabled; no preview → only head. |
+| `tests/tui/render/compose.test.ts` | 5 tests: pre-session emits only input; session adds status above input; tool card sits above status; multi-line input stays at bottom; multiple tools render in insertion order. |
+| `tests/tui/renderer.test.ts` | +2 tests: resize event updates `caps.cols` and forces a redraw (via injected fake stream + ref-boxed listener); `resizeStream: false` disables the watcher and the renderer still functions. |
+
+**Decisions:**
+
+- **D24 — `now` is a render-time arg threaded by `composeLive`, not state.** Spinner phase and thinking elapsed depend on wall-clock; storing them in `LiveState` would require a heartbeat tick to keep them fresh, plus reducer mutation just to advance time. Passing `now` to `composeLive` keeps the reducer fully time-independent and lets render functions compute "what frame should I show" purely from clock. Tests inject a constant or counter; the renderer in production reads `Date.now()` once per draw.
+- **D25 — Heartbeat ticks are NOT wired in this slice.** Without a periodic `scheduler.request()`, the spinner only re-renders when an event triggers a frame. So during a long-running tool with no `tool:delta` flow, the spinner sits frozen. UX-acceptable for now (users still see the head line + elapsed advancing once any other event arrives) and keeps the slice tight. The heartbeat lands when input editing or modal pattern arrives — those layers also need periodic redraws.
+- **D26 — Live-region lines truncate at visual width, not code-unit length.** `truncateToWidth` walks codepoints with `string-width` so CJK/emoji that occupy 2 cols don't make a "fits in 80 cols" line wrap to 81+. The cursor math (clearDown + cursorUp) only works if the terminal didn't auto-wrap; visual-width truncation is what makes that contract honest.
+- **D27 — Permanent items stay un-truncated.** Same as 1.b D17 — scrollback is the terminal's job to wrap/scroll. Width matters only for the live region.
+- **D28 — `resizeStream: false` is a real option, not a bug.** Three configurations: omit (defaults to `process.stdout`), pass a fake (tests), pass `false` (caller owns the watcher). The third covers cases where the renderer is wrapped — e.g., a future `agent --headless` path that already has its own resize handling. Distinct from undefined so the type captures intent.
+- **D29 — `liveCaps` is a mutable copy, not a reference to `options.caps`.** The caller's `caps` object is treated as input only — we never mutate it. `liveCaps` is the renderer's working copy. Simpler than threading "current caps" through every call site, and the mutation is contained to the renderer's closure.
+- **D30 — `renderer-types.ts` exists only to break the circular import.** `renderer.ts` → `./render/compose.ts` → `ComposeLive` type. If `ComposeLive` lived in `renderer.ts`, the cycle would be `renderer.ts` ⇄ `compose.ts`. TS allows it, but it makes the dep graph confusing and breaks isolated-modules in some build configs. Keeping the type in its own tiny file is the cleanest cut.
+- **D31 — Spinner intervals (80ms / 100ms) are baked into the render function, not configurable.** UI.md §6.2 catalogs them as fixed values. Configurability would invite tuning churn; the spec sets them.
+- **D32 — Tree branches `├`/`└` for tool preview, not `· └`.** Matches UI.md §4.2 example for subagent rows. The `└` closes only on the last preview line; intermediate previews use `├` so the run reads as a single nested block.
+
+**Pending / out of scope this slice:**
+
+- **No heartbeat ticks.** Spinner freezes between events. (D25)
+- **Modal pattern.** Permission/trust/memory-write/plan-review/critique events still no-op in the reducer; the modal state field hasn't been added to `LiveState`.
+- **Subagent rows + todo list + bg tray.** Reducer accepts these events (no-op); render functions and reducer wiring land together when the modal pattern is in.
+- **Cursor positioning inside the input.** Today the terminal cursor sits at the end of the input line. Real inline editing (cursor inside the text, arrow keys move within `input.value`) needs cursor-back escapes after writing — input handler arrives next.
+- **HarnessEvent → UIEvent adapter.** Comes when interactive mode is wired into `src/cli/index.ts`.
+- **`wrap-ansi` is installed but unused.** Lands when input wrapping (auto-grow on long lines) becomes a thing.
+
+**Verification:** `bun test` → 1818 pass / 10 skip / 0 fail (+47 new across 5 render-function test files + 2 resize tests). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.d — interactive REPL wiring. Plug the key parser into `src/cli/index.ts`, wire raw-stdin → input editing → `bus.emit('user:submit')` on Enter. Add a heartbeat tick for the spinner. Probably bundle the modal pattern (state + focus stack + promise API per UI.md §5.5) since input handling needs the focus stack anyway. After that: the `HarnessEvent → UIEvent` adapter so the existing harness can drive the new TUI without rewiring.
+
+---
+
+## [2026-05-02] M1 / Step 1.b.1 — Permanent records refactor (caps-aware formatting)
+
+Pre-emptive structural fix surfaced by the 1.b code review.
+Reducer was emitting already-formatted strings as `permanent:
+string[]` — pure but blind to capabilities. With ASCII-only
+glyphs hardcoded inside `formatToolFinal`, there was no path
+for Unicode `✓`/`✗`/`⚠` (UI.md §6.2) or for color-aware
+`error`/`warn` lines. Fixing later would have meant churning
+the contract twice, since the next slice (real render functions)
+needs caps-aware permanent output. Better to fix the shape
+once, now, while the consumer surface is small.
+
+Reducer now emits `permanent: PermanentItem[]` — a structured
+discriminated union (`session-header`, `session-footer`,
+`user-submit`, `assistant`, `tool-end`, `error`, `warn`).
+Renderer holds the new `formatPermanent(item, caps)` function
+which is the single place where caps influence output: glyph
+selection (Unicode vs ASCII) and color (paint() with SGR or
+plain).
+
+**Done:**
+
+| File | Change |
+|---|---|
+| `src/tui/state.ts` | NEW exported type `PermanentItem` (7 kinds). `ApplyResult.permanent` now `PermanentItem[]` instead of `string[]`. Removed `formatToolFinal` helper (moved to renderer.ts as part of `formatPermanent`). Each event branch now constructs structured items: `session:start` → `session-header`, `session:end` → `session-footer`, `user:submit` → `user-submit` (raw multi-line text preserved; renderer does indent), `assistant:end` → `assistant` (full text in one item), `tool:end` → `tool-end` (status, durationMs, optional summary), `error`/`warn` → matching kind. The reducer no longer formats anything. |
+| `src/tui/renderer.ts` | NEW exported `formatPermanent(item: PermanentItem, caps: Capabilities): string[]`. Single switch on `item.kind`. Uses Unicode glyphs (`✓`/`✗`/`⚠`) when `caps.unicode === true`, ASCII (`*`/`x`/`!`) otherwise. Uses Unicode separator `·` vs ASCII `-`. Wraps `error`/`warn` in `paint(caps, ...)` so SGR codes only emit when color enabled. `writePermanent` now consumes `PermanentItem[]`, flattens via `items.flatMap(item => formatPermanent(item, caps))`, and emits the joined result. |
+| `tests/tui/state.test.ts` | Test assertions updated to inspect structured items instead of strings. Old "contains" string checks → exact `toEqual([...])` on the item array. The denied-vs-error test renamed to verify the reducer preserves both `status` values (the glyph differentiation is now a `formatPermanent` concern, tested separately). 25 tests, same coverage. |
+| `tests/tui/renderer.test.ts` | NEW `describe('formatPermanent')` block (13 tests): each item kind, ASCII vs Unicode glyph paths, ASCII vs Unicode separators, ms vs s duration units, summary continuation, color disabled (plain text passthrough), color enabled (SGR escapes for `error`/`warn`). The `reducer error becomes warn line` test continues to pass — it asserts the warn message text which both the reducer-error path and the formatter agree on. |
+
+**Decisions:**
+
+- **D18 — `PermanentItem` is a closed union, not extensible.** Adding a new kind requires extending the union in `state.ts` AND handling it in `formatPermanent`. TypeScript will flag a missing branch in the formatter (the switch's exhaustive return doesn't admit `never`). Closed union beats open-ended `{ kind: string; ... }` because the formatter has to know every kind to render. Producers can't define new kinds the formatter doesn't recognize.
+- **D19 — Reducer preserves raw text for `user-submit` / `assistant`.** It does NOT pre-split on newlines or pre-pend a `> ` prefix — that's formatting. The formatter does the split + prefix. This means a future change to indent style (e.g., adding ` ┃ ` continuation glyphs in Unicode mode) lives entirely in `formatPermanent`, not in two places.
+- **D20 — Renderer (not reducer) owns the formatter.** `formatPermanent` lives in `renderer.ts`, exported. Reasoning: it depends on `caps` and `paint` (term.ts SGR helpers) — both are I/O-tier concerns. `state.ts` stays free of `term.ts` dependencies. If a third file (`format.ts`) becomes warranted, the move is mechanical; until then, putting it in renderer.ts keeps the file count down.
+- **D21 — Tool-end glyph distinct for done/error/denied in BOTH ASCII and Unicode.** ASCII: `*`/`x`/`!`. Unicode: `✓`/`✗`/`⚠`. Tests assert both paths. Closes the gap from the 1.b code review (denied collided with error in ASCII path; Unicode was unspecified).
+- **D22 — Closed switch in `formatPermanent`, not a default branch.** TypeScript narrows `item` to `never` after every kind is handled; we don't need a default. If a new kind is added without a handler, the function fails to compile (return type narrows to `string[] | undefined`). Compile-time exhaustiveness, no runtime guard.
+- **D23 — Tests for the formatter live in `renderer.test.ts`, not a new file.** `formatPermanent` is exported from renderer.ts. One file, one source. If formatter complexity grows (combining caps + width + theme tokens), splitting into `format.ts` + `format.test.ts` becomes obvious — until then, locality wins.
+
+**Verification:** `bun test` → 1768 pass / 10 skip / 0 fail (+13 new from formatPermanent tests, after rewriting state.test.ts assertions to structured items). `tsc --noEmit` clean. `biome check .` clean.
+
+**Why this slice exists:** code review of 1.b flagged the structural debt explicitly (rec #3). Fixing pre-1.c spares duplicated formatting logic in render functions later. The diff is contained because no production code outside the TUI layer consumes `permanent: string[]` yet — the only callers are the renderer and tests.
+
+**Next:** Step 1.c — real render functions (`status.ts`, `input.ts`, `tool-card.ts`, `subagent-row.ts`, `todo-list.ts`, `thinking.ts`, plus a `compose.ts` that replaces `defaultComposeLive`). Add `string-width` + `wrap-ansi` deps. Wire the resize watcher.
+
+---
+
+## [2026-05-02] M1 / Step 1.b — TUI state reducer + renderer
+
+Builds on 1.a's primitives. Splits the renderer into two concerns:
+a pure event-folding reducer (`state.ts`) and the I/O cycle owner
+(`renderer.ts`). Reducer is testable without any I/O; renderer
+mechanics are testable without any UI shape (default `composeLive`
+is a placeholder). Together they wire the bus → live region path
+end-to-end so the next slice can drop in real render functions
+without touching plumbing.
+
+The split came from a deliberate concern separation: when render
+functions land, they live in a third group of pure functions
+(`renderToolCard`, `renderStatusLine`, …) consumed by the
+`composeLive` callback. Renderer doesn't grow; reducer doesn't
+grow; only the catalog of render functions does.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/state.ts` | `LiveState` (input box, status fields, `Map<string, ActiveTool>`, `pendingAssistant` buffer, `thinking` indicator timestamp, `ended` flag) + `createInitialState()` + `applyEvent(state, event) → {state, permanent}`. Pure reducer over the full UIEvent union: handles `session:start/end`, `user:submit`, `assistant:start/delta/end` (with on-the-fly buffer for orphan deltas), `thinking:start/delta/end`, `tool:start/delta/end` (preview window capped at 5 lines, trailing newline skipped, unknown-toolId deltas dropped), `step:budget`, `error`, `warn`, `interrupt`, `checkpoint:create`. Modal/subagent/bg/todo/permission/trust/memory/plan/critique events accepted as no-ops with comment markers — they wire when render functions arrive. Default branch is an exhaustiveness guard that throws on unknown UIEvent kinds, surfaced by the renderer as a warn line. |
+| `src/tui/renderer.ts` | `createRenderer({bus, caps, write?, composeLive?, stdin?, schedulerOptions?, bracketedPaste?})` returns `{redraw, state, close}`. Subscribes via `bus.onAny`; folds events through `applyEvent`; on `permanent` lines: erase live → write permanent → redraw live; on no-permanent: schedule a coalesced frame. Tracks `liveHeight` to compute `cursorUp + clearDown` on next erase. `close()` unsubscribes, stops scheduler, erases the live region, disables bracketed paste, and restores stdin mode — all idempotent. Reducer-thrown errors are caught and surfaced as `warn:` lines instead of killing the renderer. Default `composeLive` is a placeholder (`> input`, optional 1-line status); the proper status-line + tool-card + modal renderers slot in next. Defensive line truncation by JS code-unit length until `string-width` arrives. |
+| `src/tui/index.ts` | Re-exports `state.ts` + `renderer.ts`. |
+| `tests/tui/state.test.ts` | 25 tests across 7 describe blocks: session lifecycle, user submit (single + multi-line echo with continuation indent), assistant streaming (start/delta/end happy path + multi-line + orphan delta + empty buffer), thinking lifecycle, tool lifecycle (full happy path + preview cap + trailing-newline + unknown-toolId drop + orphan end + glyph/units selection), budget + error + warn permanent emission, parametric "not-yet-wired events accept silently" across all stub events, and an immutability check (apply doesn't mutate input). |
+| `tests/tui/renderer.test.ts` | 9 tests: session:start emits header + draws live; non-permanent event schedules a frame; redraw between permanent lines erases prior live region (assert escape order: cursor-up + clearDown precedes warn text); multiple state-only events coalesce into one redraw; `state()` snapshot accessor; `redraw()` forces immediate render; `close()` unsubscribes from bus; `close()` is idempotent; events after `session:end` skip drawing. Plus 2 side-effect tests for bracketed-paste opt-out and stdin raw-mode wiring (tolerant of module-flag bleed across tests by design). |
+
+**Decisions:**
+
+- **D9 — Reducer is pure and total.** `applyEvent` returns the next state; never throws (except the exhaustiveness guard for unknown kinds, which the renderer catches). All branching on event types lives in one place. The alternative — registering per-event handlers on the bus — would scatter the state shape across many files and make reasoning about "what events have been wired" much harder.
+- **D10 — Permanent vs live is decided by the reducer, not the renderer.** The reducer returns `{state, permanent: string[]}`. Permanent lines are emitted IMMEDIATELY (eraseLive → write → redraw); live-only events go through the frame scheduler. This lets us preserve the "history is permanent stdout, live is bottom region" invariant from UI.md §2 in a single place. Renderer is just the I/O cycle.
+- **D11 — Active tool preview capped at 5 lines.** UI.md §2.2 caps the live region at 15 lines. With multiple active tools + status + input, anything more than 5 preview lines per tool would push the region over budget on the second concurrent tool. The cap is a fixed constant in `state.ts`; layout-time truncation can shrink further as needed.
+- **D12 — Orphan delta opens a buffer on the fly.** If `assistant:delta` arrives without a prior `assistant:start`, the reducer creates the buffer with the delta's `messageId` instead of dropping. Reasoning: producers may emit out-of-order events during resume; the user's loss surface for a dropped delta is "missing tokens in scrollback", which is worse than a slightly weaker invariant. Tested.
+- **D13 — Tool delta for unknown toolId is dropped.** Unlike orphan asistant deltas, tool deltas without a matching `tool:start` lack name/args — synthesizing a tool would make the final card lie. Cleaner to drop. Tested.
+- **D14 — Default `composeLive` is a placeholder.** Renderer wiring is its own concern; layout decisions belong in render functions (next slice). Putting them here would conflate "did the bus deliver?" with "does the layout look right?". The placeholder is good enough for end-to-end smoke (status placeholder, input prompt, one-line tool stubs) and gets fully replaced.
+- **D15 — Reducer errors become warn lines, not crashes.** When the reducer throws (only path: unhandled new UIEvent kind), the renderer surfaces a `warn: renderer reducer error: <msg>` line in scrollback and continues. Same philosophy as the existing `OutputRenderer` in `src/cli/output/plain.ts` (line 174 of types.ts: "throws are caught and discarded so a buggy renderer doesn't kill the loop"). The user sees something actionable; the rest of the session keeps working.
+- **D16 — Renderer doesn't draw on construction.** First frame is triggered by the first emitted event. Lets a renderer attach to a quiet bus without producing output and avoids "cursor jumps when you start the program" UX. Also keeps `createRenderer` synchronous and side-effect-light.
+- **D17 — Permanent lines NOT truncated.** Only the live region is cursor-managed; permanent lines go to scrollback where the terminal handles wrap/scroll natively. Truncating would break long error messages, multi-line assistant responses, etc. Width matters in the live region only because we have to cursor-up to erase.
+
+**Pending / out of scope this slice:**
+
+- **Real render functions.** `renderStatusLine(state, caps)`, `renderInput(state, caps)`, `renderToolCard(tool, caps)`, `renderTodoList(...)`, `renderSubagentRow(...)` — all the UI.md §4 functions land in step 1.c. Default `composeLive` is the placeholder.
+- **Modal pattern.** State + focus handler + promise (UI.md §5.5). The reducer accepts `permission:ask` / `trust:ask` / etc. as no-ops; the modal state field hasn't been added to `LiveState` yet.
+- **HarnessEvent → UIEvent adapter.** Comes when interactive mode wires a real harness run.
+- **String-width-aware truncation.** Renderer uses JS code-unit length; CJK and emoji that occupy 2 columns may visually overflow. Documented as a layout bug, not a correctness bug — the cursor math always knows the line count it wrote because it counted lines, not glyphs.
+- **Resize handling.** `createResizeWatcher` exists from 1.a but isn't wired to the renderer yet. When a resize happens mid-run the renderer should redraw (and possibly reflow input). Hooks in step 1.c with the input render function.
+- **Spinner animation.** `state.ts` doesn't track spinner ticks; render functions will compute spinner glyphs from elapsed wall-clock. The renderer will need a heartbeat (every 80ms while anything animates) to request frames — added with the spinner render function.
+- **Interactive REPL wiring.** `src/cli/index.ts` still requires a prompt arg. The TUI mode (no prompt → REPL) is the last slice before this milestone is shippable.
+
+**Verification:** `bun test` → 1749 pass / 10 skip / 0 fail (+45 new across state and renderer tests). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.c — real render functions. Move into `src/tui/render/`: `status.ts`, `input.ts`, `tool-card.ts`, `subagent-row.ts`, `todo-list.ts`, `thinking.ts`, plus a top-level `compose.ts` that replaces `defaultComposeLive`. Add `string-width` + `wrap-ansi` deps. Wire the resize watcher. After that: modal pattern (state + focus handler + promise), HarnessEvent adapter, interactive REPL.
+
+---
+
+## [2026-05-02] M1 / Step 1.a — TUI primitives: term, keys, bus
+
+First implementation slice on the new inline TUI. The respec
+(see prior entry today) traded Ink and DESIGN_SYSTEM.md for raw
+ANSI + a typed event bus; this commit lands the foundation that
+everything else (renderer, render functions, modal pattern,
+interactive REPL) will sit on. Three modules, all pure, all
+deterministic: capability detection + ANSI helpers + frame
+scheduler (`term.ts`); raw stdin parser (`keys.ts`); typed
+event bus (`bus.ts` + `events.ts`).
+
+Scope was drawn deliberately small — no renderer, no render
+functions, no harness wiring, no interactive REPL yet. The goal
+of this slice is "primitives a renderer can be built on,
+testable in isolation, no I/O coupling". Each module hands the
+caller an injectable surface for tests so we never have to
+monkey-patch globals or run a real PTY.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/term.ts` | `detectCapabilities(opts)` (TTY/cols/rows/color/unicode); ANSI helpers (`cursorUp/Down/Back/To`, `clearLine/Down`, `cursorHide/Show`, bracketed paste enable/disable strings); `SGR` palette (reset/dim/bold/error/warn/success — no blue/cyan/magenta per UI.md §6.1); `paint(caps, token, text)`; raw mode toggle (`enableRawMode`/`disableRawMode` — process-wide flag, idempotent, defaults to `process.stdin`); bracketed paste sink-driven toggle; `createResizeWatcher` (stream `resize` event + SIGWINCH belt-and-suspenders); `createFrameScheduler(render, {fps, setTimer, clearTimer})` with coalescing + `flush()` + `close()` and injectable timer for tests. |
+| `src/tui/keys.ts` | Stateful escape-sequence parser: `createKeyParser()` returns `{feed(buf), drain(), bufferLength()}`. Recognizes printable ASCII + multibyte UTF-8 (incl. surrogate-pair codepoints), control bytes (Enter/Tab/Backspace/Space/Ctrl+a..z), CSI arrows + modifiers (`1;5C` → ctrl+right), CSI tilde-form (Home/End/Insert/Delete/PageUp/Down/F1-F12), SS3 (`ESC O P` for F1-F4), Alt+letter (`ESC c`), Shift+Tab (`CSI Z`), bracketed paste markers including split-across-feeds reassembly. Lone ESC is buffered until `drain()` to avoid swallowing the start of a delayed sequence. ESC ESC emits one escape immediately and buffers the second. |
+| `src/tui/events.ts` | Discriminated `UIEvent` union — full catalog from UI.md §3.2: `session:start/end`, `user:submit`, `assistant:start/delta/end`, `thinking:start/delta/end`, `tool:start/delta/end`, `permission:ask/answer`, `trust:ask`, `memory:write:ask`, `plan:review`, `critique:ask`, `todo:update`, `subagent:start/update/end`, `bg:start/update/end`, `step:budget`, `checkpoint:create`, `error`, `warn`, `interrupt`. Plus `UIEventOf<T>` helper for narrowed payload extraction. |
+| `src/tui/bus.ts` | `createBus()` returns typed wrapper around `EventEmitter`. `on<T>(type, handler)` returns unsubscribe. `once`, `onAny`, `removeAll`, `listenerCount`. Internal `__any__` channel for wildcard subscribers (used later by NDJSON serializer per UI.md §7). MaxListeners bumped to 100 (renderer + serializer + multiple feature listeners). |
+| `src/tui/index.ts` | Barrel re-export so callers `import { ... } from 'src/tui'`. |
+| `tests/tui/term.test.ts` | 22 tests: capability matrix (TTY/no-TTY/NO_COLOR/CLICOLOR_FORCE/locale UTF-8/LC_CTYPE/LANG fallbacks); ANSI helper output; `paint` color-on/off; raw mode flag idempotence + missing-setRawMode fallback; bracketed paste write idempotence; resize watcher emit + unsubscribe; frame scheduler coalesce + flush + close + fps→intervalMs. Deterministic timer harness (no real `setTimeout` in tests). |
+| `tests/tui/keys.test.ts` | 26 tests: printable ASCII / uppercase / multibyte / emoji / multi-char feeds; control bytes (CR/LF/Tab/DEL/0x08/Space/Ctrl+a..z); CSI arrows w/ + w/o modifiers; CSI tilde forms (Home/End/Delete/PgUp/PgDn/F1-F12); SS3 F1; Alt+letter; ESC ESC double-tap; lone ESC buffered+drained; CSI split across feeds; unknown CSI dropped without blocking trailing input; bracketed paste single chunk + split feeds + embedded newline + partial end-marker buffering + post-paste keystroke continuity. |
+| `tests/tui/bus.test.ts` | 10 tests: typed delivery + narrowing; `on()` unsubscribe; type isolation (delta listener doesn't see end events); `once()` self-detach; `onAny()` order + unsubscribe; `removeAll()`; `listenerCount` per-type vs wildcard; multi-subscriber registration order; same instance to typed + onAny + emit. |
+
+**Decisions:**
+
+- **D1 — Inject everything timer/stream-related into tests.** Frame scheduler takes `setTimer`/`clearTimer`; resize watcher takes a stream shape; raw mode takes a stdin shape. Default to production globals; tests pass deterministic fakes. Avoids `vi.useFakeTimers`-style global mutation that bleeds across tests. This pattern matches the existing `bootstrap.ts` test harness (`mockProvider`, `tmpdir`).
+- **D2 — UIEvent is a separate union from HarnessEvent.** Spec UI.md §3.2 names events with `domain:lifecycle` shapes (`assistant:delta`, `tool:start`); the existing `HarnessEvent` in `src/harness/types.ts` uses `tool_invoking`/`tool_decided`/`tool_finished` plus a nested `provider_event`. Translating one to the other is a separate adapter (next slice). Reasons: (a) UI.md §3 is the rendering contract and other consumers (NDJSON, tests) shouldn't depend on harness internals; (b) the harness can refactor its event shape without the TUI noticing; (c) the audit trail keeps using HarnessEvent unchanged. Cost is the adapter — accepted.
+- **D3 — Lone ESC is buffered until `drain()`.** Terminals send escape sequences as ESC + bytes that may arrive in two chunks. If we emitted the lone ESC immediately, we'd inject a spurious "escape pressed" event whenever a slow paste happened. Buffering until `drain()` matches readline / blessed / node-pty behavior. The user-visible "press Esc twice for hard interrupt" works because `ESC ESC` resolves immediately on the second byte (we check for `0x1b` after `0x1b` and emit before buffering would even try).
+- **D4 — Bracketed paste reassembly is byte-aware.** When a feed ends mid-end-marker (`\x1b[20`), the parser must not flush yet — it would emit those bytes as paste content and lose the end marker. We keep the trailing `BRACKETED_PASTE_END.length - 1` bytes buffered specifically to cover this. Tested against the realistic split case.
+- **D5 — No `picocolors`/`ora`/`prompts`.** UI.md §1 banned them in the respec; this slice obeys. SGR codes are 5 strings in a const; spinner/prompt come later but won't pull deps either.
+- **D6 — `bus.ts` uses Node's `EventEmitter`, not `mitt` or a custom map.** Saves ~50 lines and a dep. The cast at the boundary (`event: unknown` → `UIEventOf<T>`) is sound because emit only sends the typed event, but it's tagged with a comment so future readers don't think we're being lazy with `any`.
+- **D7 — `paint` returns `text` unchanged when color disabled (vs returning `''`).** Same surface as colorized, no special-casing in callers. Costs nothing because `caps.color === 'none'` is checked once per call.
+- **D8 — Module state for raw-mode/bracketed-paste flags.** Process-wide invariant: only one renderer can hold raw mode. Putting the flag in module scope makes the recovery path (uncaughtException → disableRawMode) trivial. The alternative — per-renderer instance — would complicate restoration when the renderer object is gone.
+
+**Pending / out of scope this slice:**
+
+- **No renderer composition.** No `composeLive(state)`, no actual writes to stdout via these primitives. That's the next slice.
+- **No render functions.** No `renderToolCard`, `renderStatusLine`, etc. — pure render `state → string[]` will live in `src/tui/render/*.ts` once the renderer exists.
+- **No modal pattern implementation.** State + focus handler + promise (UI.md §5.5) lands with the renderer.
+- **No HarnessEvent → UIEvent adapter.** Comes when we wire the bus to a real harness run.
+- **No interactive mode in `src/cli/index.ts`.** Currently `agent` requires a prompt; the TUI mode (no prompt → REPL) hooks in last.
+- **No exit-path hardening.** `uncaughtException`/`SIGINT` handlers that call `disableRawMode` belong with the renderer that owns the live region.
+
+**Verification:** `bun test` → 1698 pass / 10 skip / 0 fail (+68 new). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.b — `src/tui/renderer.ts` (composes live region from a `LiveState`, writes via raw ANSI, owns the frame scheduler, restores stdin mode on exit) + a minimal driver that subscribes to the bus and updates `LiveState`. After that: render functions for tool card, status line, input box; then modal pattern; then HarnessEvent adapter; then interactive REPL wiring in `src/cli/index.ts`.
+
+---
+
+## [2026-05-02] M1 prep — TUI respec: drop Ink, switch to inline raw-ANSI render
+
+Rethinking the UI/UX layer before any implementation. The
+existing `UI.md` (1939 lines) and `DESIGN_SYSTEM.md` (715
+lines) speced an Ink-based TUI with 26 components, a 5-region
+formal layout, semantic color palette, and a full design
+system. That was over-engineered for what the agent actually
+needs to render: a streaming chat with tool cards, a status
+line, and the occasional modal. We don't need React in the
+terminal.
+
+**The shift:** inline rendering, no framework. Output goes to
+stdout permanently (becomes terminal scrollback — copy-paste,
+mouse-scroll, redirection all work for free). Only the bottom
+3-15 lines are "live" — the renderer moves the cursor up,
+clears down, and rewrites them on each frame. The "live
+region" is small enough that virtual-DOM reconciliation buys
+nothing; clear+redraw at 30fps is faster than React + Ink's
+diff. Spine is a typed event bus (EventEmitter): harness emits,
+renderer subscribes, `--json` mode serializes the same bus as
+NDJSON. Tests assert on events.
+
+**Done (spec only — no `src/` code yet):**
+
+| File | Change |
+|---|---|
+| `docs/spec/AGENTIC_CLI.md` | §3 stack table: `Ink (React)` → `Internal (raw ANSI + raw stdin)`, deps minimal (`string-width`, `wrap-ansi`). §4 topology diagram: `CLI / TUI (Ink)` → `CLI / TUI (raw ANSI + event bus)`. §5.1 plan flow: `<PlanReview>`/`<DiffView>` refs replaced by `plan:review` event + modal pattern. §5.4 self-critique: `<CritiqueOverlay>` → `critique:ask` event. §7.3 background: `<BackgroundProcessTray>` → status line tray description. §7.3.1 monitor: `<ToolCallCard>` ref replaced by "live tool card streaming". §17 fully rewritten: was a 26-Ink-component catalog, now a short summary of the new model with pointers to UI.md. §18 M1 roadmap: "Ink mínimo" → "TUI mínima (raw ANSI + event bus)". §0.1 doc index: drop DESIGN_SYSTEM row, expand UI row description. |
+| `docs/spec/UI.md` | Full rewrite. From 1939 → ~570 lines. New sections: §0 principles (inline > alt-screen, no framework, event bus as spine, render functional, stdout sacred), §1 stack (only `string-width` + `wrap-ansi`, no `picocolors`/`prompts`/`ora`), §2 inline screen model (scrollback vs live region, breakpoints, modal overlay semantics), §3 event bus contract (catalog of events: `assistant:*`, `tool:*`, `permission:ask`, `trust:ask`, `memory:write:ask`, `plan:review`, `todo:update`, `subagent:*`, `bg:*`, `step:budget`, `checkpoint:create`, `interrupt`, etc.), §4 functional render examples (tool card, subagent row, todo list, status line, input box, permission/trust/memory-write/plan-review modals), §5 interaction patterns (input handling, spinner, slash commands, keybindings, **modal pattern canonical: state + focus handler + promise + default=NO + timeout**, modal queue, focus stack), §6 minimal palette (grayscale + 1 accent for error, no blue/cyan/magenta), glyphs with ASCII fallback, §7 headless `--json` (bus → NDJSON), §8 capability detection, §9 microcopy, §10 perf, §11 testing, §12 boot sequence, §13 non-goals. |
+| `docs/spec/DESIGN_SYSTEM.md` | **Deleted.** All visual foundations (palette, glyphs, typography, spacing, density) absorbed into UI.md §6. Separate doc was redundant given the minimalism mandate. |
+| `docs/spec/ANTI_PATTERNS.md` | New §4.4 "Reintroduzir framework de UI" (React/Ink/blessed banned — clear+redraw beats reconciliation for 3-15 live lines, framework adds lifecycle/focus/dep cost without proportional gain). New §4.5 "Alt-screen / full-screen TUI" banned (breaks scrollback, mouse-copy, pipe composition; agent is a shell tool, not an app). Existing §4.1 reference "DESIGN_SYSTEM.md" updated to "UI.md §9". |
+| `docs/spec/PERFORMANCE.md` | §2.6 retitled `UI rendering (Ink)` → `UI rendering (TUI inline)` with updated budgets (added "Modal open/close" row, updated wording). §9 "Lazy imports" changed to mention `renderer/raw-stdin` instead of `Ink`. §19.1 "Frame budget" rewritten: history never redraws, live region 3-15 lines coalesces deltas in 33ms windows. §19.2 "Input lag" rewritten with raw-stdin parser separate from render loop, bracketed paste batching. |
+| `docs/spec/AUDIT.md` | §6.2 audit CLI output: "tabela compacta colorida (Ink)" → "tabela compacta em texto (cor mínima — só dim em meta, sem highlight colorido)". |
+| `docs/spec/CONTRACTS.md` | §2.6 display hint reference: pointer changed from `<ToolCallCard>` to `tool card (UI.md §4.1)`. §2.6.5d wait/monitor UI integration rewritten without component names — now "status line shows tray", "events are streamed as live lines". §3 streaming pipeline step 4: component refs (`<StreamingMessage>`/`<ToolCallCard>`/`<ThinkingIndicator>`) replaced by event names (`assistant:delta`/`tool:start`/`thinking:delta`). §10 non-contract list: "Ink components são internos" → "funções de render do TUI são internas; apenas o catálogo de eventos do bus (UI.md §3) é contrato". |
+| `docs/spec/CHECKPOINTS.md` | §2.3 reference: "M4 (Ink)" → "TUI (M4)". |
+| `docs/spec/ORCHESTRATION.md` | §1.4 thinking indicator: `<ThinkingIndicator>` → `thinking:delta` event + status line description. §6 self-critique flow: `<CritiqueOverlay>` → `critique:ask` event (modal pattern). |
+| `docs/spec/STATE_MACHINE.md` | §6 sub-states table: `<WaitIndicator>` / `<MonitorStream>` columns rewritten as status line substitution and live event streaming. §7.5 listing visibility: `<SessionPicker>` ref → "session picker CLI". |
+| `docs/spec/TOKEN_TUNING.md` | §4.3 reasoning UI: `<ThinkingIndicator>` ref replaced by `thinking:delta` event in status line. |
+| `docs/spec/RECAP.md` | §3.1 schema scope: `<SessionPicker>` ref → "session picker (CLI separada, fora da TUI viva)". |
+| `CLAUDE.md` | Doc-pointer table: row "UI (Ink), microcopy, design tokens → AGENTIC_CLI §17, UI, DESIGN_SYSTEM" replaced by "TUI (inline render, event bus, microcopy, palette/glyphs) → AGENTIC_CLI §17, UI". Locked stack line: `TUI: Ink (React in the terminal)` → `TUI: Internal (raw ANSI + raw stdin), no framework — inline render`. |
+
+**Decisions:**
+
+- **D1 — Inline > alt-screen.** Alt-screen (vim/htop style) breaks scrollback, mouse-copy, redirection — costs that can't be paid back by any in-app reimplementation. The agent is a shell tool, not a TUI app. Inline rendering matches the principle that "the terminal is a medium, not a screen" (UI.md §14).
+- **D2 — No framework.** The live region is 3-15 lines. React/Ink's reconciliation is engineered for problems we don't have (large dynamic trees with overlapping updates). For our case, `clear+redraw` of the live region in a single `process.stdout.write` is both faster and simpler. Cost of framework: lifecycle cognitive load, focus-stack reinvention by the framework, ~10 transitive deps. Cost of from-scratch: ~500 lines of TS with `string-width` + `wrap-ansi` as the only dep (banned `picocolors`/`prompts`/`ora` — they each replace ~5 lines).
+- **D3 — Event bus as the spine.** Decouples harness from renderer cleanly. Same bus feeds `--json` mode (NDJSON in stdout) and tests (assert on events). No conditional rendering paths, no "headless mode" branch in the render code — just "renderer subscribes" vs "serializer subscribes".
+- **D4 — Render functions, not components.** `render(state): string[]`. Pure functions. No JSX, no hooks, no props. Snapshot-testable. The cognitive savings here are bigger than they look — every "component" was forcing us to think about lifecycle, prop drilling, refs.
+- **D5 — Default = NO on confirm modals.** Safety. Enter without navigating = reject. The `selected` field initializes to `'no'`, and the focus handler is the canonical pattern in UI.md §5.5 (state + handler-on-top-of-focus-stack + async-promise API).
+- **D6 — Grayscale + 1 accent.** Only `dim`, `bold`, `error (red)`, `warn (yellow)`, `success (green, only in pipeline badges)`. No blue/cyan/magenta/truecolor/gradients. If layout needs color to disambiguate, the layout failed. `NO_COLOR` env disables all escapes.
+- **D7 — Delete DESIGN_SYSTEM.md, not stub it.** The minimalism makes a separate design doc redundant. UI.md §6 fits in ~80 lines. Two-doc indirection costs more than it saves.
+- **D8 — Component names in CONTRACTS.md were never contract.** Replacing `<ToolCallCard>`/`<StreamingMessage>` with event names (`tool:start`/`assistant:delta`) reflects what's actually stable: the bus event catalog, not internal render functions.
+
+**Pending:**
+
+- No source code yet — `src/tui/` will be born in M1 step 1 (TBD: split into `term.ts` for raw stdin/ANSI, `bus.ts` for events, `renderer.ts` for live region composition, `render/*.ts` for tool card / status line / modals).
+- M4 milestone (was "Ink mínimo") needs renaming/rescoping in `AGENTIC_CLI.md §18` Roadmap. Deferred to a follow-up entry once the M1 implementation lands.
+
+**Verification:** Spec-only diff. No `bun test` / `tsc` impact (no source touched). Manual review: `grep -rn "Ink\|<.*Card>\|<.*Bar>\|<.*Tray>\|<.*Badge>" docs/spec/` returns zero matches across active spec files.
+
+**Next:** Implement M1 step 1 — `src/tui/term.ts` (raw stdin parser, ANSI writer, SIGWINCH, frame scheduler) + `src/tui/bus.ts` (typed EventEmitter wrapper) + minimal renderer that subscribes to a fake harness emitting events, hooked to the existing `agent` entry point. Born with tests.
+
+---
+
 ## [2026-05-01] M3 / Step 5.2 follow-up — anchor memory roots at repo root (subdir blindspot)
 
 External review caught a second real bug. Bootstrap and CLI

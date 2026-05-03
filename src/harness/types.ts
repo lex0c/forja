@@ -3,6 +3,7 @@ import type { Decision, PermissionEngine } from '../permissions/index.ts';
 import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
 import type { DB } from '../storage/index.ts';
 import type { SubagentSet } from '../subagents/load.ts';
+import type { TodoItem } from '../todo/index.ts';
 import type { ToolRegistry } from '../tools/index.ts';
 
 // Lifecycle events the harness emits during a run. Synchronous (fire and
@@ -37,6 +38,13 @@ export type HarnessEvent =
       toolName: string;
       failed: boolean;
       durationMs: number;
+      // True specifically when the failure was a denial (policy `deny`
+      // or user rejected a `confirm` modal). Disambiguates from
+      // execution errors after an allowed/confirmed tool — without
+      // this, a user-rejected confirm and a tool that crashed AFTER
+      // approval are both `failed: true` and audit/UI can't tell
+      // them apart. Absent for non-failure outcomes.
+      denied?: boolean;
     }
   | {
       type: 'compaction_started';
@@ -84,6 +92,44 @@ export type HarnessEvent =
       // from `enableCheckpoints=false` (no event emitted).
       type: 'checkpoints_unavailable';
       reason: string;
+    }
+  | {
+      // Background process started. Fires once per process right
+      // after `bash_background` (or any future bg-spawning tool)
+      // succeeds in `BgManager.spawn`. The TUI uses this to
+      // increment its `bg N` footer counter; persistence captures
+      // the same row through audit.
+      type: 'bg_started';
+      processId: string;
+      command: string;
+      label: string | null;
+    }
+  | {
+      // Background process exited. Fires once per process from
+      // inside the manager's `exitedSettled` handler — natural exit
+      // and kill-induced exit converge here exactly once. `exitCode`
+      // is null when the OS reaped before we could read it (e.g.
+      // DB error swallow path). Spawn-time failure does not emit
+      // (D147); the caller sees the exception synchronously.
+      type: 'bg_ended';
+      processId: string;
+      status: 'exited' | 'killed';
+      exitCode: number | null;
+    }
+  | {
+      // Emitted whenever the session-bound TodoStore is mutated via
+      // `set` — i.e. INSIDE the `todo_write` tool's execute(), right
+      // after the list lands in the store and BEFORE the tool returns.
+      // The harness sees `todo_updated` fire between `tool_invoking`
+      // and `tool_finished` for the same toolUseId. Producer is the
+      // harness loop (wraps the bare store with an emitting set;
+      // clear() is intentionally NOT wired — spec §7.4 treats list
+      // teardown at session-end as cleanup, not a planning event).
+      // Items are deep-cloned by the store before emission so
+      // observers can't reach back into store state.
+      type: 'todo_updated';
+      sessionId: string;
+      items: TodoItem[];
     }
   | { type: 'session_finished'; result: HarnessResult };
 
@@ -171,6 +217,16 @@ export interface HarnessConfig {
   userPrompt: string;
   budget?: Partial<RunBudget>;
   signal?: AbortSignal;
+  // Cooperative-stop signal (spec UI.md §3, soft interrupt). When
+  // aborted, the harness completes the current step (provider call
+  // + any tool execution that was already in flight) and exits with
+  // `reason: 'aborted'` BEFORE issuing the next provider request.
+  // Distinct from `signal` (hard abort) which preempts in-flight
+  // work — operator UX: first Esc/Ctrl+C asks the loop to stop at
+  // the next safe boundary, second Esc/Ctrl+C kills mid-tool.
+  // Optional — when absent, the loop only honors the hard signal,
+  // preserving the pre-1.g.1 behavior.
+  softStopSignal?: AbortSignal;
   // Synchronous observer for lifecycle events. Throws are caught and
   // discarded so a buggy renderer doesn't kill the loop.
   onEvent?: (event: HarnessEvent) => void;
@@ -289,6 +345,18 @@ export interface HarnessConfig {
   // HarnessConfig directly) and owns its own audit/persistence
   // wiring; the harness just hands it through.
   memoryRegistry?: MemoryRegistry;
+  // Async hook the harness calls when the permission engine returns
+  // a `confirm` decision. Caller resolves true to allow the call
+  // (recorded as confirm_yes) or false to deny (confirm_no). When
+  // unset, `confirm` decisions fall back to deny-with-reason — the
+  // legacy headless behavior. Interactive callers (REPL) wire this
+  // to their modal manager; one-shot mode leaves it unset.
+  confirmPermission?: (req: {
+    toolName: string;
+    args: Record<string, unknown>;
+    cwd: string;
+    prompt: string;
+  }) => Promise<boolean>;
 }
 
 export interface HarnessResult {
@@ -314,4 +382,13 @@ export interface HarnessResult {
   // Optional human-readable detail for diagnostics (e.g., the provider
   // error message, or which tool exhausted the error budget).
   detail?: string;
+  // When `reason === 'aborted'`, discriminates whether the abort was
+  // operator-initiated cooperative ('soft' — let in-flight work
+  // finish then exit cleanly) or preemptive ('hard' — kill mid-tool
+  // / mid-stream). Undefined for any other reason — the discriminator
+  // is meaningless when the loop exited for budget caps, done, or a
+  // non-abort error. Audit log + future telemetry need this to
+  // distinguish "operator nudged" from "operator escalated";
+  // pre-1.g.2 both Esc and Esc-Esc produced identical HarnessResults.
+  abortCause?: 'soft' | 'hard';
 }

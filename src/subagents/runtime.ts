@@ -344,6 +344,16 @@ export interface RunSubagentInput {
   db: DB;
   cwd: string;
   signal?: AbortSignal;
+  // Cooperative-stop signal (1.g.1). Parent forwards its own
+  // softStopSignal here so the future in-process subagent path can
+  // honor it directly. Today's subprocess path CANNOT — there's no
+  // IPC channel between parent and child, only OS signals (which
+  // are inherently preemptive). When a parent's soft fires while a
+  // task() is in flight, the parent blocks until the child finishes
+  // its full budget, then the parent's top-of-loop soft check
+  // exits. Documented gap (BACKLOG D159); will close when IPC
+  // lands (same slice that unblocks 1.f.2 subagent observability).
+  softStopSignal?: AbortSignal;
   // Lifecycle observer. The subprocess child can't stream events
   // directly to the parent (no IPC channel for that); the parent
   // sees only the terminal payload. Reserved for parity with the

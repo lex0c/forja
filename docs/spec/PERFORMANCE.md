@@ -113,15 +113,16 @@ Provider domina; nosso overhead ≤ 5% de step LLM típico.
 | Repo map update (1 file changed) | 30ms | 100ms |
 | Repo map full rebuild (10k arquivos) | 5s | 15s |
 
-### 2.6 UI rendering (Ink)
+### 2.6 UI rendering (TUI inline)
 
 | Operação | P50 | P99 |
 |---|---|---|
 | First paint após layout change | 16ms | 33ms (= 1 frame) |
-| Stream token render | 1ms | 5ms |
-| Tool card update | 5ms | 20ms |
-| Diff render (100 hunks) | 30ms | 100ms |
-| TodoList update | 5ms | 20ms |
+| Stream token render (coalescido) | 1ms | 5ms |
+| Tool card update (região viva) | 5ms | 20ms |
+| Diff render (100 hunks, permanente) | 30ms | 100ms |
+| TodoList update (região viva) | 5ms | 20ms |
+| Modal open/close | 8ms | 20ms |
 
 ---
 
@@ -269,7 +270,7 @@ Total típico: 500MB–2GB para usuário normal.
 Pra atingir os 80ms P50 cold:
 
 1. **Bun runtime** (~30ms cold vs Node ~100ms)
-2. **Lazy imports** — só carrega módulos quando usados (Ink só se interactive, OTEL só se enabled, etc)
+2. **Lazy imports** — só carrega módulos quando usados (renderer/raw-stdin só se TTY, OTEL só se enabled, etc)
 3. **Config cached** — `~/.config/agent/.cache/` com config compilada (TTL by mtime)
 4. **SQLite prepared statements** cached entre runs (via cached statements file)
 5. **Repo map skipped on startup** — só constrói se requested ou em DAG (incremental updates após)
@@ -637,15 +638,15 @@ Cada release:
 
 ### 12.1 Frame budget
 
-Ink target 60fps em re-renders → 16ms/frame.
+Região viva (3-15 linhas) redesenha a 30fps soft / 60fps em bursts → 16ms/frame P99.
 
-Re-render full screen é evitado. Componentes memoizam aggressively. `<DiffView>` com 1000 linhas é virtualizado.
+Histórico **nunca redesenha** (vai pra scrollback do terminal e fica imutável). Coalescer de `assistant:delta` em janela de 33ms: vários chunks viram 1 redraw. Diffs grandes (>100 hunks) imprimem permanente, não vivem na região viva.
 
 ### 12.2 Input lag
 
-Tecla pressionada → caractere na tela: < 10ms P99.
+Tecla pressionada → caractere na tela: < 16ms P99 (1 frame).
 
-Stream de modelo + input concorrente: input lag não pode degradar (input loop separado de render loop).
+Input loop (raw stdin parser) é separado do render loop. Stream de modelo + digitação concorrente: input nunca trava. Bracketed paste processa em batch antes de redraw.
 
 ---
 

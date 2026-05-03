@@ -505,8 +505,8 @@ Step com `wait_for` ou `monitor` ativos: estado canônico continua `executing` (
 
 | Sub-state | Quando | UI render |
 |---|---|---|
-| `executing.waiting_for` | tool `wait_for` em flight | `<WaitIndicator>` com condition + elapsed + timeout |
-| `executing.monitoring` | tool `monitor` em flight | `<MonitorStream>` com events conforme chegam |
+| `executing.waiting_for` | tool `wait_for` em flight | status line substituído: `wait: <condition> · <elapsed>s/<timeout>s` (UI.md §4.4) |
+| `executing.monitoring` | tool `monitor` em flight | eventos streamados como linhas vivas conforme chegam (UI.md §4.4) |
 
 **Características:**
 - LLM **não é chamado** durante o wait/monitor (zero LLM cost)
@@ -755,7 +755,7 @@ Custo: ~5ms por step. Ganho: power-loss não corrompe.
 - Subagent worktree pendurado — `worktree gc` no SessionStart limpa
 - Stream parcial de tokens — descartado; modelo re-gera
 
-### 7.5 Visibilidade em listagem (`agent --list-sessions`, `<SessionPicker>`)
+### 7.5 Visibilidade em listagem (`agent --list-sessions`, session picker CLI)
 
 Sessões em estados não-terminais (`running`, `tool_exec`, `compacting`, `awaiting_user`) que não foram resumidas aparecem em listagem com **flag visual** distinto:
 

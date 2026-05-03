@@ -144,7 +144,7 @@ Campos **sempre presentes** mesmo se vazios (array `[]`, string `""`). Ausência
 
 ### 3.1 Schema `recap_mini` (subset pra listagens)
 
-Pra `agent --list-sessions --with-recap`, `/recap list`, e `<SessionPicker>`, projeção menor + barata:
+Pra `agent --list-sessions --with-recap`, `/recap list`, e o session picker (CLI separada, fora da TUI viva), projeção menor + barata:
 
 ```yaml
 recap_mini:

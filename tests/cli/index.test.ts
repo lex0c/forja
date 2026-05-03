@@ -12,6 +12,7 @@ import { join, resolve } from 'node:path';
 const repoRoot = resolve(import.meta.dir, '../..');
 const entry = resolve(repoRoot, 'src/cli/index.ts');
 const preload = resolve(repoRoot, 'tests/cli/fixtures/block-run-load.ts');
+const blockReplPreload = resolve(repoRoot, 'tests/cli/fixtures/block-repl-load.ts');
 
 interface CliResult {
   exitCode: number;
@@ -108,11 +109,41 @@ describe('cli entrypoint: prompt requirement', () => {
     expect(stderr).not.toContain('missing prompt');
   });
 
-  test('bare invocation without a prompt still errors with "missing prompt"', async () => {
-    // Sanity: the gate is still in place for every other path.
+  test('bare invocation without a TTY refuses to open the REPL', async () => {
+    // Empty prompt opens the interactive REPL (option (i) — see
+    // step 1.d.4 in BACKLOG); without a TTY (test runner has piped
+    // stdin) the REPL refuses. The old "missing prompt" gate was
+    // relaxed at the entry; failure now surfaces from the REPL's
+    // TTY check.
     const { exitCode, stderr } = await runCli([]);
     expect(exitCode).toBe(1);
-    expect(stderr).toContain('missing prompt');
+    expect(stderr).toContain('TTY');
+  });
+
+  test('bare invocation without a TTY does NOT load cli/repl.ts (regression)', async () => {
+    // Pre-fix the entry imported ./repl.ts BEFORE any TTY check, so a
+    // broken provider/storage transitive dep would surface as
+    // "unexpected error" via the outer catch instead of the clean
+    // "interactive mode requires a TTY" diagnostic. The CI / piped-
+    // stdin install-troubleshooting path requires that bare
+    // invocation fail fast without touching the runtime stack.
+    //
+    // Spawn with a preload that throws if cli/repl.ts loads. Pre-fix
+    // the throw fires (exit code != 1, stderr contains the loader
+    // hook's message); post-fix the entry-level TTY check returns 1
+    // with the clean message and the import never runs.
+    const proc = Bun.spawn(['bun', '--preload', blockReplPreload, entry], {
+      cwd: repoRoot,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [stderr, exitCode] = await Promise.all([
+      new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+      proc.exited,
+    ]);
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('TTY');
+    expect(stderr).not.toContain('cli/repl.ts was loaded');
   });
 
   test('--undo does NOT require a prompt', async () => {

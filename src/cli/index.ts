@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 import { parseArgs, usage } from './args.ts';
-
-const VERSION = '0.0.0';
+import { VERSION } from './version.ts';
 
 const main = async (): Promise<number> => {
   const parsed = parseArgs(Bun.argv.slice(2));
@@ -66,18 +65,52 @@ const main = async (): Promise<number> => {
   // Inspection / lifecycle modes don't need a prompt:
   //   - --list-sessions: pure DB read.
   //   - --undo / --checkpoints: DB + git only, no provider call.
-  // Every other entry path (normal run, --plan, --resume) does need
-  // an instruction for the model. Resume's empty-prompt check fires
-  // inside run() with a more specific error.
+  // For everything else, an empty prompt enters the interactive
+  // REPL (UI.md §2 — `forja` with no prompt opens the inline TUI).
+  // Resume's empty-prompt check fires inside run() with a more
+  // specific error so the user knows --resume needs a follow-up.
   const promptOptional =
     args.listSessions ||
     args.undo !== undefined ||
     args.checkpoints !== undefined ||
     args.worktrees !== undefined ||
     args.memory !== undefined;
-  if (args.prompt.length === 0 && !promptOptional) {
-    process.stderr.write(`forja: missing prompt\n\n${usage()}\n`);
-    return 1;
+  if (args.prompt.length === 0 && !promptOptional && args.resume === undefined) {
+    // JSON mode + REPL is meaningless (NDJSON consumers don't have
+    // a TTY to type into) — refuse rather than open a TTY-only loop
+    // that nobody can drive.
+    if (args.json) {
+      process.stderr.write(
+        `forja: --json requires a prompt (REPL mode is TTY only)\n\n${usage()}\n`,
+      );
+      return 1;
+    }
+    // TTY gate BEFORE loading the REPL. ./repl.ts has top-level
+    // imports of the harness/provider/storage stack — if any of
+    // those fail to load (broken native binding, missing peer dep,
+    // partial install), the dynamic import throws and the outer
+    // catch surfaces "unexpected error" instead of the clean TTY
+    // diagnostic. The fail-fast path matters most for non-
+    // interactive invocations (CI / piped stdin / `forja` typed by
+    // accident in a tmux scratch buffer) — exactly the cases where
+    // the install-troubleshooting message should land without
+    // touching the runtime stack.
+    //
+    // The check is duplicated inside repl.ts (defense in depth and
+    // for callers that import runRepl programmatically). Keep both
+    // — pre-import and inside-the-function — emitting the IDENTICAL
+    // message so behavior doesn't shift when the import does
+    // succeed.
+    const stdinIsTTY = (process.stdin as { isTTY?: boolean }).isTTY === true;
+    const stdoutIsTTY = (process.stdout as { isTTY?: boolean }).isTTY === true;
+    if (!stdinIsTTY || !stdoutIsTTY) {
+      process.stderr.write(
+        'forja: interactive mode requires a TTY (stdin/stdout must be a terminal)\n',
+      );
+      return 1;
+    }
+    const { runRepl } = await import('./repl.ts');
+    return runRepl({ args });
   }
 
   // Lazy import: pulling `./run.ts` transitively loads provider SDKs,

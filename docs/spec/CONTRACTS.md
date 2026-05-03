@@ -76,7 +76,7 @@ Direção: A → B (A invoca tool)
   - `write_file`/`edit_file`: declara `writes: true` em metadata → harness cria checkpoint **antes**
   - `bash`: declara `writes: true` (pessimista) salvo `bash:read_only` flag
   - `web_fetch`: network access; respeita `deny_hosts`
-- **Display hint opcional** em metadata: `display: 'table' | 'list' | 'diff' | 'raw' | 'auto'` (default `auto`). Override do auto-detect do `<ToolCallCard>` (`UI.md §3.1`/§3.2). Tools com output `Array<object>` homogêneo se beneficiam de `display: 'table'` explícito; outputs de `bash` usam `display: 'raw'` para preservar formatação de terminal.
+- **Display hint opcional** em metadata: `display: 'table' | 'list' | 'diff' | 'raw' | 'auto'` (default `auto`). Override do auto-detect do tool card (`UI.md §4.1`). Tools com output `Array<object>` homogêneo se beneficiam de `display: 'table'` explícito; outputs de `bash` usam `display: 'raw'` para preservar formatação de terminal.
 - Erros são **estruturados** seguindo schema canônico (não exception bare):
   ```ts
   interface ToolError {
@@ -242,7 +242,7 @@ Família para processos de longa duração e coordenação não-blocking. Tools 
 - `wait.cancelled` — Ctrl+C/Esc Esc cascateando AbortSignal
 - `monitor.cancelled` — mesmo
 
-UI integration: `<BackgroundProcessTray>` mostra `bash_*` ativos; `<WaitIndicator>` substitui `<LoopStatusLine>` durante `wait_for`; `<MonitorStream>` durante `monitor` (todos em `UI.md §3.2`).
+UI integration: status line mostra tray de `bash_*` ativos (`bg N`); status line substitui por `wait` indicator durante `wait_for`; eventos de `monitor` são streamados como linhas vivas conforme chegam. Ver `UI.md §4.4`.
 
 **Hibernation:** `wait_for` bloqueia o agente process. Daemon-based hibernation (agente sai durante wait, daemon dispara hook em wakeup) é **deferred v2** (`AGENTIC_CLI.md §7.3.1`).
 
@@ -299,14 +299,14 @@ Tools que **estouraria o teto** se promovidas (mantidas em domínios separados):
 - `memory_write` exige confirmação humana — slash command, não tool.
 - `format_file` / `lint_file` / `test` são gates do `CODE_GENERATION.md` pipeline, rodados em `PostToolUse`, não decididos pelo modelo.
 
-Cargo-cult check: nenhuma tool do catálogo foi adicionada porque "Claude Code tem". Cada uma resolve uma falha enumerada em `FAILURE_MODES.md` ou um caso de uso documentado em §2.6.8 / §2.6.9 / §7.3 do `AGENTIC_CLI.md`.
+Cargo-cult check: nenhuma tool do catálogo foi adicionada porque "outro agente tem". Cada uma resolve uma falha enumerada em `FAILURE_MODES.md` ou um caso de uso documentado em §2.6.8 / §2.6.9 / §7.3 do `AGENTIC_CLI.md`.
 
 Adicionar `todo_write`, `checkpoint_*`, ou `recap_*` como tools expostas ao modelo **estouraria** o teto — por isso ficam em domínios separados:
 - `todo_write` é UI affordance (ver `UI.md`), não tool de modelo (escreve via stream parsing). Audit gap endereçado por tabela `todos` em vez de promoção a tool — ver §2.6.8 decisão B.
 - `checkpoint` é operação do harness, exposta via slash command.
 - `recap` é projeção SQL, exposto via CLI.
 
-Cargo-cult check: nenhuma das tools acima foi adicionada porque "Claude Code tem". Cada uma resolve uma falha enumerada em `FAILURE_MODES.md` ou um caso de uso documentado em §2.6.8 / §2.6.9.
+Cargo-cult check: nenhuma das tools acima foi adicionada porque "outro agente tem". Cada uma resolve uma falha enumerada em `FAILURE_MODES.md` ou um caso de uso documentado em §2.6.8 / §2.6.9.
 
 ### 2.6.7 Tools deliberadamente ausentes
 
@@ -328,7 +328,7 @@ O leak da Anthropic em 2026 expôs as categorias de tools que outras CLIs agenti
 
 **Princípio guia:** *meta-cognição não é tool*. Modelo decide ações **no mundo** (FS, shell, subagent, memory_search, fetch). Decisões **sobre o modelo** (planejar, lembrar, comprimir contexto, gerenciar atenção) são responsabilidade do harness, não do catálogo. Sem essa fronteira, o tool budget é consumido por ferramentas que não mexem em nada — e auditabilidade não compensa o bloat.
 
-Esta posição é uma **inversão deliberada** vs Claude Code, onde o modelo invoca `todo_write`, planeja explicitamente, e é responsável por sumarizar a própria história. As três decisões abaixo aplicam o princípio.
+Esta posição é uma **inversão deliberada** vs agentes que delegam planejamento ao modelo (onde o modelo invoca `todo_write`, planeja explicitamente, e é responsável por sumarizar a própria história). As três decisões abaixo aplicam o princípio.
 
 | # | Tool proposta | Decisão | Tool count após |
 |---|---|---|---|
@@ -805,10 +805,10 @@ Step 3: Buffer (pra UI batching)
   - tool_use_delta acumulado até tool_use_stop
   - Outros: emit imediato
   ↓
-Step 4: Emit pra UI (streaming visible)
-  - <StreamingMessage> recebe text_delta batched
-  - <ToolCallCard> recebe tool_use_start
-  - thinking_delta → <ThinkingIndicator>
+Step 4: Emit pra UI bus (streaming visible) — eventos canônicos em UI.md §3
+  - text_delta batched → emit `assistant:delta`
+  - tool_use_start → emit `tool:start`
+  - thinking_delta → emit `thinking:delta`
   ↓
 Step 5: Em tool_use_stop OU stop event:
   - Validate args estruturado (JSON parse + schema)
@@ -1190,7 +1190,7 @@ Coisas que ficam de fora dos contratos por design:
 
 - **Conteúdo dos prompts** — pode mudar a qualquer momento; eval cobre
 - **Tool descriptions** — texto que o modelo lê; mudanças não quebram contrato (só métricas)
-- **UI rendering** — Ink components são internos; mudam livremente
+- **UI rendering** — funções de render do TUI são internas; mudam livremente. Apenas o catálogo de eventos do bus (UI.md §3) é contrato.
 - **Schema interno do SQLite além das tabelas declaradas** — índices, triggers, vacuum strategy
 - **Latência em microbenchmarks** — coberto em `PERFORMANCE.md`, não aqui
 - **Heurísticas** (detection de injection, capability detection) — best-effort, sem garantia formal

@@ -156,7 +156,36 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // todo_write tool sees a fresh list, and torn down in the outer
   // finally so accumulated state from a long-lived process doesn't
   // leak across sessions. Spec §7.4: not persisted, work-state only.
-  const todoStore: TodoStore = createTodoStore();
+  //
+  // The bare store is a pure data structure; observability is layered
+  // on at the harness boundary by wrapping `set` to emit a
+  // `todo_updated` HarnessEvent after the write lands. Wrapping rather
+  // than mutating the store keeps test contexts that build a store
+  // directly free of the emit dependency. `clear` is NOT wrapped —
+  // session-end cleanup is not a planning event (D132).
+  const baseTodoStore = createTodoStore();
+  // Wrap each method through a fresh closure rather than aliasing the
+  // method reference. Today `createTodoStore` returns plain arrows
+  // bound by closure (no `this`), so direct aliasing would work — but
+  // a future refactor to a class with `this`-bound methods would
+  // silently break get/clear at runtime without TS catching it. The
+  // extra layer costs nothing and keeps the contract explicit.
+  const todoStore: TodoStore = {
+    get: (sid) => baseTodoStore.get(sid),
+    set: (sid, items) => {
+      baseTodoStore.set(sid, items);
+      // Read back through the store so the event carries the same
+      // deep-cloned snapshot a fresh `get` would return — observers
+      // can't poison stored state, and the items they see are
+      // structurally identical to what the next call to get() yields.
+      safeEmit(config.onEvent, {
+        type: 'todo_updated',
+        sessionId: sid,
+        items: baseTodoStore.get(sid),
+      });
+    },
+    clear: (sid) => baseTodoStore.clear(sid),
+  };
   // Per-run totals. Each completed provider turn adds its usage and
   // its computed cost; HarnessResult.usage / costUsd report THIS
   // RUN's numbers — caller telemetry that has to stay self-
@@ -199,7 +228,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     return `cumulative cost $${cumulative.toFixed(6)} exceeded cap $${budget.maxCostUsd.toFixed(6)}`;
   };
 
-  const finish = (reason: ExitReason, detail?: string): HarnessResult => {
+  // `abortCause` is only meaningful when reason === 'aborted'; ignored
+  // otherwise. Callers thread it from the abort site that knew which
+  // signal fired (hard signal.aborted vs softStopSignal.aborted) so
+  // the result carries the discriminator audit / telemetry needs.
+  const finish = (
+    reason: ExitReason,
+    detail?: string,
+    abortCause?: 'soft' | 'hard',
+  ): HarnessResult => {
     clearTimeout(wallClockTimer);
     // Skip completeSession when init failed before createSession — there's
     // no row to mark and SQLite would just throw a foreign-key error.
@@ -207,13 +244,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       try {
         // Persist CUMULATIVE totals (prior + this run) so the row
         // reflects the session's lifetime cost. The result returned
-        // below stays per-run (caller telemetry).
+        // below stays per-run (caller telemetry). abortCause is
+        // threaded through so audit / replay tools can recover the
+        // discriminator after the process exits — without this, the
+        // in-memory HarnessResult.abortCause died at the boundary.
         completeSession(
           config.db,
           sessionId,
           exitToStatus[reason],
           priorCostUsd + totalCostUsd,
           priorUsageComplete && usageComplete,
+          undefined,
+          abortCause,
         );
       } catch {
         // Storage already broken; nothing useful to do beyond return the
@@ -232,6 +274,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       lastMessageId,
     };
     if (detail !== undefined) result.detail = detail;
+    if (reason === 'aborted' && abortCause !== undefined) {
+      result.abortCause = abortCause;
+    }
     safeEmit(config.onEvent, { type: 'session_finished', result });
     return result;
   };
@@ -242,9 +287,22 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // is for the persistence path that surrounds it. We don't know what
   // turns were measured at the throw site, so the safe call is to mark
   // aggregate totals as incomplete.
+  //
+  // Special case: if `signal.aborted` at throw time, the underlying
+  // exception is most likely AbortError (SQLite write interrupted by
+  // the abort signal, async iteration cancelled, etc.). Map to
+  // `aborted` with `cause='hard'` instead of burying it as
+  // `internalError` — operator-initiated termination shouldn't look
+  // like a harness bug in audit. Wall-clock timeout takes precedence
+  // (matches the in-loop check).
   const guardedFinish = (e: unknown): HarnessResult => {
     usageComplete = false;
     const detail = e instanceof Error ? e.message || e.name || String(e) : String(e);
+    if (signal.aborted) {
+      return isWallClockTimeout()
+        ? finish('maxWallClockMs', detail)
+        : finish('aborted', detail, 'hard');
+    }
     return finish('internalError', detail);
   };
 
@@ -383,6 +441,29 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // finally to fire — matters when the loop is mid-provider-
           // request, where finally can be seconds away.
           abortSignal: signal,
+          // Lifecycle observer: translate bg manager events into
+          // HarnessEvents so the renderer can update its `bg N`
+          // footer counter (spec UI.md §4.10.6) and audit captures
+          // the same lifecycle the user sees. Event shape mirrors
+          // BgManagerEvent's `kind` discriminant onto distinct
+          // HarnessEvent types so the adapter's switch stays flat.
+          onEvent: (event) => {
+            if (event.kind === 'started') {
+              safeEmit(config.onEvent, {
+                type: 'bg_started',
+                processId: event.processId,
+                command: event.command,
+                label: event.label,
+              });
+            } else {
+              safeEmit(config.onEvent, {
+                type: 'bg_ended',
+                processId: event.processId,
+                status: event.status,
+                exitCode: event.exitCode,
+              });
+            }
+          },
         });
       }
 
@@ -563,7 +644,19 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
 
       while (true) {
         if (signal.aborted) {
-          return finish(isWallClockTimeout() ? 'maxWallClockMs' : 'aborted');
+          return isWallClockTimeout()
+            ? finish('maxWallClockMs')
+            : finish('aborted', undefined, 'hard');
+        }
+        // Cooperative stop: spec UI.md §3 soft interrupt. The check
+        // sits at the top of the loop so the just-completed step's
+        // tool calls + their results are persisted before exiting.
+        // This gives the operator the "model finishes the step then
+        // stops" semantic without burning tokens on a re-prompt the
+        // operator already cancelled. Distinct from the hard signal
+        // above — soft never preempts in-flight work.
+        if (config.softStopSignal?.aborted) {
+          return finish('aborted', undefined, 'soft');
         }
         if (steps >= budget.maxSteps) return finish('maxSteps');
         // Cost cap pre-check. Critical on resume: a session whose
@@ -639,9 +732,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // SDK throws when the abort signal fires mid-call (Ctrl+C or
           // wall-clock timeout). Reroute to the matching ExitReason so the
           // user sees `interrupted` exit code 130 instead of a generic
-          // `error` from `providerError`.
+          // `error` from `providerError`. Hard signal by definition —
+          // soft can't preempt a provider call (it only fires at the
+          // next step boundary).
           if (signal.aborted) {
-            return finish(isWallClockTimeout() ? 'maxWallClockMs' : 'aborted');
+            return isWallClockTimeout()
+              ? finish('maxWallClockMs')
+              : finish('aborted', undefined, 'hard');
           }
           const cause = e instanceof CollectStepError ? e.cause : e;
           const detail =
@@ -818,7 +915,27 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // check; otherwise a wall-clock timeout that lands between tool
           // invocations gets misreported as a user abort.
           if (signal.aborted) {
-            return finish(isWallClockTimeout() ? 'maxWallClockMs' : 'aborted');
+            return isWallClockTimeout()
+              ? finish('maxWallClockMs')
+              : finish('aborted', undefined, 'hard');
+          }
+          // Cooperative-stop also honored mid-step (1.g.1, D158): if
+          // the model returned multiple tool_uses and soft fired
+          // after the first one ran, don't keep executing the rest.
+          // Already-executed tools' results were appended to the
+          // message log via the prior iterations; the loop exits
+          // before the next provider call (which would have asked
+          // the model to react to a partial set, but the operator
+          // already cancelled the conversation). Symmetry with the
+          // top-of-loop soft check.
+          // Re-check via local assignment forces TS to re-narrow on
+          // every iteration — without this, the outer top-of-loop
+          // check would have narrowed `aborted` to false at this
+          // scope. The Set/get is on a live AbortSignal so the value
+          // genuinely changes between iterations.
+          const softAborted = config.softStopSignal?.aborted;
+          if (softAborted) {
+            return finish('aborted', undefined, 'soft');
           }
 
           // Degenerate-loop detection: hash this call and check the sliding
@@ -901,6 +1018,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     // the child run too. The child builds its own
                     // wall-clock on top of this.
                     signal,
+                    // Forward the cooperative-stop signal — wired
+                    // here so that when the in-process subagent path
+                    // lands (IPC slice unblocks 1.f.2), Esc-during-
+                    // task already routes correctly. Today the
+                    // subprocess path can't act on a soft signal (no
+                    // IPC); the parent blocks on `await runSubagent`
+                    // until the child finishes its full budget, then
+                    // the parent's top-of-loop soft check exits.
+                    // Documented gap (D159).
+                    ...(config.softStopSignal !== undefined
+                      ? { softStopSignal: config.softStopSignal }
+                      : {}),
                     // Forward the registry so the child can task()
                     // further children. Same set, same names.
                     subagentRegistry: registry,
@@ -981,6 +1110,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               engine: config.permissionEngine,
               ctx,
               ...(config.planMode === true ? { planMode: true } : {}),
+              ...(config.confirmPermission !== undefined
+                ? { confirmPermission: config.confirmPermission }
+                : {}),
+              signal,
             },
           );
 
@@ -997,6 +1130,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             toolName: tu.name,
             failed: inv.failed,
             durationMs: inv.durationMs,
+            ...(inv.denied === true ? { denied: true } : {}),
           });
 
           toolResults.push(inv.toolResult);

@@ -131,7 +131,7 @@ Anthropic com thinking enabled (Opus 4.x) emite `thinking_delta` antes do output
 - **Compaction:** descarta automaticamente (não vai pro summary)
 - **Replay:** re-gera (não-determinístico mesmo com `temperature=0`)
 
-UI: `<ThinkingIndicator>` opcional no rodapé mostra `🧠 thinking... (12s)` durante `thinking_delta` events. Removido quando output começa.
+UI: thinking indicator opcional na status line mostra `thinking... (12s)` durante `thinking:delta` events (ver UI.md §3.2). Some quando output começa.
 
 ### 1.5 Provider error mid-stream
 
@@ -543,7 +543,7 @@ if critique.mode applicable to this step:
     Filter por threshold (default 0.7)
       ↓
     if issues filtered:
-        Show <CritiqueOverlay>
+        Emit `critique:ask` (modal pattern, UI.md §5.5)
         User: ignore | redo | abort
           ↓
         if ignore: persist buffer → context (registra `critique.warning_ignored`)

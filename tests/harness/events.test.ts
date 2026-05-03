@@ -7,6 +7,7 @@ import type { Policy } from '../../src/permissions/index.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
+import { todoWriteTool } from '../../src/tools/builtin/todo-write.ts';
 import { createToolRegistry } from '../../src/tools/registry.ts';
 import type { Tool } from '../../src/tools/types.ts';
 
@@ -21,6 +22,7 @@ interface ScriptedStep {
   tool_uses?: { id: string; name: string; input: Record<string, unknown> }[];
   stop_reason?: CollectedStep['stop_reason'];
   message_id?: string;
+  usage?: { input: number; output: number; cache_read?: number; cache_creation?: number };
 }
 
 const replayStep = function* (step: ScriptedStep): Iterable<StreamEvent> {
@@ -31,6 +33,17 @@ const replayStep = function* (step: ScriptedStep): Iterable<StreamEvent> {
   for (const tu of step.tool_uses ?? []) {
     yield { kind: 'tool_use_start', id: tu.id, name: tu.name };
     yield { kind: 'tool_use_stop', id: tu.id, final_args: tu.input };
+  }
+  if (step.usage !== undefined) {
+    yield {
+      kind: 'usage',
+      usage: {
+        input: step.usage.input,
+        output: step.usage.output,
+        cache_read: step.usage.cache_read ?? 0,
+        cache_creation: step.usage.cache_creation ?? 0,
+      },
+    };
   }
   yield {
     kind: 'stop',
@@ -193,6 +206,262 @@ describe('runAgent onEvent', () => {
     expect(types).toContain('tool_invoking');
     expect(types).not.toContain('tool_decided');
     expect(types).toContain('tool_finished');
+  });
+
+  test('todo_write run emits todo_updated between tool_invoking and tool_finished', async () => {
+    const events: HarnessEvent[] = [];
+    const r = createToolRegistry();
+    r.register(todoWriteTool as unknown as Tool);
+    const items = [
+      {
+        content: 'Implement payment flow',
+        status: 'in_progress',
+        active_form: 'Implementing payment flow',
+      },
+      { content: 'Add regression test', status: 'pending', active_form: 'Adding regression test' },
+    ];
+    await runAgent({
+      provider: mockProvider([
+        {
+          tool_uses: [{ id: 'tu1', name: 'todo_write', input: { items } }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ]),
+      toolRegistry: r,
+      // todo_write is category 'misc' — engine allows it by default
+      // (no per-category gate). No policy override needed.
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      onEvent: (e) => events.push(e),
+    });
+    const toolInvokingIdx = events.findIndex(
+      (e) => e.type === 'tool_invoking' && e.toolUseId === 'tu1',
+    );
+    const toolFinishedIdx = events.findIndex(
+      (e) => e.type === 'tool_finished' && e.toolUseId === 'tu1',
+    );
+    const todoUpdatedIdx = events.findIndex((e) => e.type === 'todo_updated');
+    expect(toolInvokingIdx).toBeGreaterThanOrEqual(0);
+    expect(toolFinishedIdx).toBeGreaterThanOrEqual(0);
+    expect(todoUpdatedIdx).toBeGreaterThanOrEqual(0);
+    // todo_updated fires DURING tool execution: the tool calls
+    // ctx.todoStore.set(), the wrapped set persists then emits, the
+    // tool then returns and the harness emits tool_finished. This is
+    // the natural flow for the renderer — the operator sees the list
+    // materialize while the chip is still in its "Updating todos..."
+    // form, then the chip resolves to "Updated N items".
+    expect(todoUpdatedIdx).toBeGreaterThan(toolInvokingIdx);
+    expect(todoUpdatedIdx).toBeLessThan(toolFinishedIdx);
+    const updated = events[todoUpdatedIdx] as Extract<HarnessEvent, { type: 'todo_updated' }>;
+    expect(updated.items).toHaveLength(2);
+    expect(updated.items[0]?.content).toBe('Implement payment flow');
+    expect(updated.items[0]?.status).toBe('in_progress');
+    expect(updated.items[0]?.activeForm).toBe('Implementing payment flow');
+  });
+
+  test('todo_write under planMode still emits todo_updated (planSafe path)', async () => {
+    // todo_write declares metadata.planSafe = true (todo-write.ts:122)
+    // so the harness's plan-mode write-tool gate must let it through.
+    // Regression: a future change that flips planSafe to false (or
+    // removes the flag) would silently break TodoList observability
+    // for plan-mode sessions, which are a primary use of the planning
+    // signal in the first place.
+    const events: HarnessEvent[] = [];
+    const r = createToolRegistry();
+    r.register(todoWriteTool as unknown as Tool);
+    await runAgent({
+      provider: mockProvider([
+        {
+          tool_uses: [
+            {
+              id: 'tu1',
+              name: 'todo_write',
+              input: {
+                items: [{ content: 'plan it', status: 'pending', active_form: 'Planning it' }],
+              },
+            },
+          ],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ]),
+      toolRegistry: r,
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      planMode: true,
+      onEvent: (e) => events.push(e),
+    });
+    const updated = events.find((e) => e.type === 'todo_updated');
+    expect(updated).toBeDefined();
+    if (updated === undefined || updated.type !== 'todo_updated') return;
+    expect(updated.items).toHaveLength(1);
+    expect(updated.items[0]?.content).toBe('plan it');
+  });
+
+  test('observer mutating todo_updated.items does not corrupt the next emission', async () => {
+    // Asserts the wrap reads back through baseStore.get() (deep
+    // clone) instead of forwarding the input array directly. Without
+    // this, an observer mutation would poison the store and the next
+    // todo_write would surface the corrupted state. Regression cover
+    // for a future "optimization" that swaps the get() back to raw
+    // items.
+    const events: HarnessEvent[] = [];
+    const r = createToolRegistry();
+    r.register(todoWriteTool as unknown as Tool);
+    await runAgent({
+      provider: mockProvider([
+        {
+          tool_uses: [
+            {
+              id: 'tu1',
+              name: 'todo_write',
+              input: {
+                items: [{ content: 'first', status: 'pending', active_form: 'Doing first' }],
+              },
+            },
+          ],
+          stop_reason: 'tool_use',
+        },
+        {
+          tool_uses: [
+            {
+              id: 'tu2',
+              name: 'todo_write',
+              input: {
+                items: [{ content: 'second', status: 'pending', active_form: 'Doing second' }],
+              },
+            },
+          ],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ]),
+      toolRegistry: r,
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      onEvent: (e) => {
+        // Mutate the FIRST event's items to try to poison whatever
+        // the store holds. The wrap's get()-readthrough means this
+        // mutation hits a deep clone and dies in the observer's
+        // local array.
+        if (e.type === 'todo_updated' && e.items[0]?.content === 'first') {
+          e.items[0].content = 'POISONED';
+          e.items.push({ content: 'INJECTED', status: 'done', activeForm: 'evil' });
+        }
+        events.push(e);
+      },
+    });
+    const updates = events.filter(
+      (e): e is Extract<HarnessEvent, { type: 'todo_updated' }> => e.type === 'todo_updated',
+    );
+    expect(updates).toHaveLength(2);
+    // Second emission reflects only the second tool's payload — no
+    // trace of the first observer's mutation.
+    expect(updates[1]?.items).toHaveLength(1);
+    expect(updates[1]?.items[0]?.content).toBe('second');
+  });
+
+  test('provider usage event surfaces verbatim in onEvent (consumed by adapter)', async () => {
+    // The adapter (separate from the harness) translates this into
+    // assistant:usage UIEvents — see tests/tui/harness-adapter.test.ts.
+    // Here we just verify the harness still forwards the raw provider
+    // event so the adapter has something to translate.
+    const events: HarnessEvent[] = [];
+    await runAgent({
+      provider: mockProvider([
+        {
+          text: 'reply',
+          stop_reason: 'end_turn',
+          usage: { input: 12, output: 234, cache_read: 5, cache_creation: 0 },
+        },
+      ]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      onEvent: (e) => events.push(e),
+    });
+    const usageEvents = events
+      .filter((e) => e.type === 'provider_event')
+      .map((e) => (e.type === 'provider_event' ? e.event : null))
+      .filter((ev): ev is Extract<StreamEvent, { kind: 'usage' }> => ev?.kind === 'usage');
+    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents[0]?.usage.output).toBe(234);
+  });
+
+  test('bash_background tool surfaces bg_started + bg_ended through onEvent', async () => {
+    // E2E for the bg observability wire: loop's createBgManager
+    // gets onEvent injected, manager fires on spawn + exit, harness
+    // safeEmit translates to HarnessEvent. Skipping the bash_background
+    // tool registration because it's wired in src/tools/builtin/index;
+    // test uses the bare bg manager via the loop's bgLogDir config.
+    // We instead drive a fake tool that calls ctx.bgManager directly.
+    const events: HarnessEvent[] = [];
+    const r = createToolRegistry();
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const tmpLogDir = mkdtempSync(join(tmpdir(), 'forja-bg-e2e-'));
+    try {
+      const fakeSpawn: Tool = {
+        name: 'fake_spawn',
+        description: 'spawns a quick bg process',
+        inputSchema: { type: 'object' },
+        metadata: { category: 'misc', writes: false, idempotent: false },
+        execute: async (_args, ctx) => {
+          if (ctx.bgManager === undefined) {
+            return { ok: false };
+          }
+          const spawned = await ctx.bgManager.spawn({ command: 'echo bg-e2e' });
+          // Wait for the natural exit so the test sees both events
+          // before the harness tears down at session end.
+          await new Promise((res) => setTimeout(res, 50));
+          return { id: spawned.id };
+        },
+      };
+      r.register(fakeSpawn as unknown as Tool);
+      await runAgent({
+        provider: mockProvider([
+          {
+            tool_uses: [{ id: 'tu1', name: 'fake_spawn', input: {} }],
+            stop_reason: 'tool_use',
+          },
+          { text: 'done', stop_reason: 'end_turn' },
+        ]),
+        toolRegistry: r,
+        permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+        db,
+        cwd: '/p',
+        userPrompt: 'hi',
+        bgLogDir: tmpLogDir,
+        onEvent: (e) => events.push(e),
+      });
+      const started = events.find((e) => e.type === 'bg_started');
+      const ended = events.find((e) => e.type === 'bg_ended');
+      expect(started).toBeDefined();
+      expect(ended).toBeDefined();
+      if (started?.type === 'bg_started') {
+        expect(started.command).toBe('echo bg-e2e');
+      }
+      if (ended?.type === 'bg_ended') {
+        expect(ended.status).toBe('exited');
+        expect(ended.exitCode).toBe(0);
+      }
+    } finally {
+      try {
+        rmSync(tmpLogDir, { recursive: true, force: true });
+      } catch {
+        // best effort
+      }
+    }
   });
 
   test('a throwing onEvent does not derail the loop', async () => {

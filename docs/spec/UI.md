@@ -1,1939 +1,1132 @@
 # UI
 
-Spec da camada de interface terminal do `AGENTIC_CLI`. Componentes, layout, theme, padrões de interação, microcopy, headless mode.
+Spec da camada de interface terminal do `AGENTIC_CLI`. Modelo inline, event bus, render funcional, microcopy, headless, fallbacks.
 
 UI ruim mata adoção mais rápido que arquitetura ruim. Arquitetura ruim você sente em 6 meses. UI ruim você sente em 30 segundos.
 
----
-
-## 0. Princípios de UX (não-negociáveis)
-
-1. **Latência percebida > latência real.** Streaming + spinner em < 200ms é melhor que resposta completa em 1s sem feedback.
-2. **Affordância antes de poder.** Se o user não sabe que pode fazer X, X não existe. Discoverability via `/`, `--help`, `Tab` competition é obrigatório.
-3. **Cada estado tem feedback visível.** Pensando, executando, erro, sucesso — sem ambiguidade.
-4. **Reversibilidade visível.** Se algo é desfazível, mostre. `Ctrl+Z` / `/undo` são primeiros class citizens, não easter eggs.
-5. **Densidade calibrada por contexto.** Sessão longa = high density (econômico em pixels); modal = low density (foco).
-6. **Quebra graciosamente.** Sem truecolor, sem Unicode, sem TTY — agente não morre, degrada.
-7. **Microcopy importa tanto quanto componente.** "Algo deu errado" é bug. "Tool `bash` excedeu 30s; output abaixo, decisão sua" é UX.
-8. **Inputs do humano são sagrados.** Nunca perdê-los. Nunca duplicá-los. Nunca pisotear o cursor durante digitação.
-9. **Modal nunca surpreende.** Permission/trust/memory write sempre tem precedente lógico. Se não tem, é bug de arquitetura, não de UI.
-10. **Consistência > criatividade.** Atalhos, cores, ícones, microcopy seguem padrões; novidade só onde resolve dor real.
+> Modelo: **inline rendering**, sem alt-screen, sem framework. Histórico vai pro scrollback do terminal; região viva no fundo redesenha em cada frame.
 
 ---
 
-## 1. Stack & deps (canônica, versão pinada)
+## 0. Princípios (não-negociáveis)
+
+1. **Inline > alt-screen.** Output normal vai pro stdout e rola com o scrollback do terminal. Copy-paste, mouse-scroll, redirecionamento, Ctrl+C — tudo funciona sem código. Alt-screen quebra esses comportamentos e exige reimplementar scrollback.
+2. **Sem framework.** Zero React/Ink/blessed. A região viva tem 3-15 linhas; clear+redraw é mais rápido que reconciliação. Ver `ANTI_PATTERNS.md`.
+3. **Event bus tipado é a espinha dorsal.** Harness emite eventos (§3); renderer escuta e atualiza a região viva. Mesmo bus alimenta `--json` (NDJSON em stdout) e testes (assert sobre eventos).
+4. **Render funcional.** Cada elemento (`tool card`, `todo list`, `permission modal`) é uma função pura `render(state): string[]`. Sem ciclo de vida, sem props, sem hooks.
+5. **stdout é sagrado.** Histórico (mensagens completas, tool cards finalizados) vai pra stdout permanente — vira scrollback. Região viva escreve no mesmo stdout mas se "apaga" antes de cada redraw. `stderr` é só log estruturado.
+6. **Microcopy importa tanto quanto código.** "Algo deu errado" é bug. "Tool `bash` excedeu 30s; output abaixo, decisão sua" é UX.
+7. **Inputs do humano são sagrados.** Nunca perdê-los. Nunca duplicá-los. Nunca pisotear o cursor durante digitação.
+8. **Modal nunca surpreende.** Permission/trust/memory write sempre tem precedente lógico. Se não tem, é bug de arquitetura.
+9. **Quebra graciosamente.** Sem TTY, sem cor, sem Unicode → degrada (texto puro, ASCII glyphs). Nunca morre.
+10. **Reversibilidade visível.** Se algo é desfazível, a UI mostra (`Ctrl+Z` disponível, último checkpoint, etc.).
+11. **Vocabulário técnico, sem fluff.** O usuário-alvo é engenheiro. Verbos descrevem a ação real (`Generating`, `Reading`, `Executing`), não rótulos genéricos (`Working`, `Loading`). Sem cortesia (`Please wait…`), sem mascote, sem metáfora. Detalhe operacional concreto (duração, tokens, paths) sempre que cabe em uma linha. Ver §4.10.
+
+---
+
+## 1. Stack
 
 ```jsonc
 {
-  // core
-  "ink": "5.x",
-  "react": "18.x",
-
-  // ink ecosystem (oficiais ou semi-oficiais)
-  "ink-text-input": "6.x",
-  "ink-select-input": "6.x",
-  "ink-spinner": "5.x",
-  "ink-link": "4.x",
-
-  // capability detection
-  "supports-color": "9.x",
-  "supports-hyperlinks": "3.x",
-  "is-unicode-supported": "2.x",
-
-  // text/string
-  "string-width": "7.x",
-  "wrap-ansi": "9.x",
-  "cli-truncate": "4.x",
-  "strip-ansi": "7.x",
-
-  // domain
-  "diff": "5.x",
-  "shikiji": "0.9.x",
-  "picocolors": "1.x",
-
-  // testing
-  "ink-testing-library": "4.x"
+  // utilitários pontuais (NÃO framework)
+  "string-width": "7.x",   // largura visual de strings com unicode/CJK/emoji
+  "wrap-ansi": "9.x"       // quebra de linha ANSI-aware
 }
 ```
 
-**Regras de mudança:**
+Capability detection é manual e pequena (~30 linhas — `process.stdout.isTTY`, `NO_COLOR`, `TERM`, `LANG`/locale para Unicode). Sem deps de detecção.
+
+**Regras:**
 - Adicionar dep nova requer justificativa (substitui o quê? cobre quanto código?).
-- Major bump de Ink só com migration guide testado.
-- Lib morta (sem release > 12 meses) é candidata a fork interno, não substituição em pânico.
+- `picocolors`/`chalk`/`kleur` proibidos: cor é gerada por escape codes inline (~5 helpers).
+- `cli-spinners`/`ora` proibidos: spinner é trivial (§5.2).
+- `prompts`/`inquirer` proibidos: input é nosso (§5.1).
 
 ---
 
-## 2. Layout regions (formal)
+## 2. Modelo de tela (inline)
 
-Tela dividida em **5 regiões fixas**, ordem top-to-bottom:
+A tela tem **duas zonas, uma temporal e outra espacial**:
 
 ```
-┌─ Header (1 linha, opcional) ─────────────────────────────────────┐
-│ [profile] [strict?] [plan?] · [project] · [model]                 │
-├─ History pane (Static, append-only) ─────────────────────────────┤
-│ user: ...                                                         │
-│ ─                                                                 │
-│ ▶ tool call                            [fmt ✓ lint ⚠ test ✓]      │
-│   output                                                          │
-│ ─                                                                 │
-│ assistant: ...                                                    │
-│ ─                                                                 │
-├─ Live region (dinâmica, opcional) ───────────────────────────────┤
-│ Plan / TodoList / DAG progress                                    │
-├─ Input pane (1-3 linhas) ────────────────────────────────────────┤
-│ > _                                                               │
-├─ Footer (1 linha, sempre presente) ──────────────────────────────┤
-│ steps · cost · model · mem · bg · mcp · idx?                      │
-└──────────────────────────────────────────────────────────────────┘
+─── scrollback (terminal nativo) ──────────────────────
+  [permanente] user message
+  [permanente] tool card finalizado
+  [permanente] assistant message
+  [permanente] tool card finalizado
+─── região viva (últimas 3-15 linhas, redesenhada) ────
+  [vivo] tool em execução / spinner
+  [vivo] todo list ativa (se houver)
+  [vivo] status line (steps · cost · model · mem · bg)
+  [vivo] input box
+─── cursor ───────────────────────────────────────────
 ```
 
-**Header components (left to right):** `<ProfileBadge>` + `<ModeBadges>` (vazio em default mode) · project label · model label.
+### 2.1 Conteúdo permanente (scrollback)
 
-**Tool card components:** `<ToolCallCard>` + `<PipelineBadges>` inline (apenas em tools de write quando pipeline rodou).
+Sai do `stdout` via `printPermanent(lines: string[])`. Uma vez impresso, **nunca é redesenhado**. Vira parte do scrollback do terminal — copia, busca, mouse-scroll funcionam.
 
-**Footer components (left to right):** `<BudgetBar>` (steps/cost) · model · `<MemoryBadge>` · `<BackgroundProcessTray>` · `<MCPTray>` · `<IndexStatus>` (silencioso em ready). `<LoopStatusLine>` substitui temporariamente em estados não-idle.
+Vai pra scrollback:
+- Mensagens do usuário (echo após submit).
+- Mensagens completas do assistant (após `assistant:end`).
+- Tool cards no estado final (após `tool:end`).
+- Cabeçalhos de sessão e separadores discretos.
 
-### 2.1 Breakpoints de largura
+### 2.2 Conteúdo vivo (região no fundo)
 
-| Largura terminal | Comportamento |
+Reside em memória como `LiveState`. A cada mudança (evento do bus ou tick de spinner), o renderer:
+
+1. Move cursor: `\x1b[<n>A` (sobe N linhas, N = altura do último frame).
+2. Limpa: `\x1b[J` (apaga do cursor pra baixo).
+3. Compõe `string[]` via funções de render.
+4. Escreve em uma única `process.stdout.write(...)`.
+5. Reposiciona cursor dentro do input.
+
+Frame budget: **30fps soft, 60fps em bursts** (ver `PERFORMANCE.md`). Coalescer eventos dentro de um frame: vários `assistant:delta` em < 33ms viram um único redraw.
+
+### 2.3 Largura e altura
+
+- Largura: `process.stdout.columns`. Re-detect em `SIGWINCH`.
+- Altura da região viva: dinâmica, calculada por `composeLive(state) → string[]`. Mínimo 1 linha (input), máximo 15 linhas — acima disso, conteúdo extra (ex.: 50 todos) vira scrollback permanente em vez de viver na região.
+- Re-layout em SIGWINCH: < 16ms (1 frame de 60fps).
+
+### 2.4 Breakpoints
+
+| Largura | Comportamento |
 |---|---|
-| ≥ 120 cols | layout completo, todas as regiões com max content |
-| 80-119 cols | layout completo, footer com abreviações (`steps` → `s`, `cost` → `$`) |
-| 60-79 cols | esconde header (profile vai pra footer); diff em 1 coluna; tool cards comprimidos |
+| ≥ 100 cols | layout completo, status line full |
+| 60-99 cols | status line abreviado (`steps` → `s`, `cost` → `$`); tool cards mais compactos |
 | < 60 cols | warning único: "terminal estreito (< 60 cols), UX degradada"; segue funcionando |
 
-Detecção via `process.stdout.columns` + listener `SIGWINCH`. Re-layout em < 16ms (1 frame).
+### 2.5 Modal overlay
 
-### 2.2 Quando cada região aparece
-
-- **Header**: sempre, exceto se largura < 60 cols
-- **History**: sempre (mesmo vazia, mostra `(sessão nova)`)
-- **Live region**: condicional — só aparece se há TodoList ativo ou DAG em execução
-- **Input**: sempre, exceto durante execução headless ou modal sobreposto
-- **Footer**: sempre, mesmo em estados terminais (preserva info)
-
-### 2.3 Modal overlay
-
-Modais (permission/trust/memory write/plan approval) **sobrepõem o Input pane**. Nunca overlay sobre History (preserva contexto visual). Footer continua visível durante modal.
-
-```
-├─ History pane ───────────────────────────────────┤
-│ ...                                               │
-├──────────────────────────────────────────────────┤
-│ ┌─ Permission required ────────────────────────┐ │
-│ │ tool: bash                                    │ │
-│ │ command: rm -rf ./build                       │ │
-│ │                                               │ │
-│ │ [a]ccept  [r]eject  [e]dit  [w]hy?            │ │
-│ └───────────────────────────────────────────────┘ │
-├─ Footer ─────────────────────────────────────────┤
-│ steps 7/50 · $0.04 · ...                          │
-└──────────────────────────────────────────────────┘
-```
+Modais (permission/trust/memory write/plan approval) substituem o input dentro da região viva — não criam nova região. Status line continua. Histórico nunca é coberto.
 
 ---
 
-## 3. Catálogo de componentes (26 + 6 primitivas)
+## 3. Event bus (contrato)
 
-Para cada: **props**, **estados**, **comportamento**, **fallbacks**.
+Source-of-truth do que está acontecendo. Harness emite, renderer escuta, `--json` mode serializa.
 
-### 3.1 Primitivas
-
-#### `<Card>`
-Box com borda, opcional título e status icon.
+### 3.1 Tipo
 
 ```ts
-interface CardProps {
-  title?: string
-  status?: 'pending' | 'running' | 'done' | 'error' | 'denied'
-  collapsed?: boolean
-  borderStyle?: 'single' | 'round' | 'bold'  // ASCII fallback: '+'/'|'/'─'
-  children: ReactNode
+interface UIEvent {
+  type: string
+  ts: number       // ms desde epoch
+  // payload por tipo, ver §3.2
+}
+
+interface Bus {
+  emit<T extends UIEvent>(e: T): void
+  on<T extends UIEvent>(type: T['type'], handler: (e: T) => void): () => void
 }
 ```
 
-Status icon: `○` pending, `⏳` running, `✓` done, `✗` error, `⊘` denied. ASCII: `[ ]`, `[~]`, `[x]`, `[!]`, `[/]`.
+Implementação: `EventEmitter` nativo do Node/Bun. Não usar `mitt` ou similar — uma dependência a menos.
 
-#### `<Modal>`
-Box centralizado overlay; foco automático; fecha em Esc ou via `onResolve`.
+### 3.2 Catálogo de eventos
 
-```ts
-interface ModalProps {
-  title: string
-  variant: 'info' | 'warn' | 'danger' | 'success'
-  shortcuts: { key: string; label: string; action: () => void }[]
-  queuePosition?: { current: number; total: number }   // ex: { 1, 3 }
-  children: ReactNode
-  onCancel?: () => void   // Esc
-  onCancelAll?: () => void   // Esc Esc — cancela todos os modais enfileirados
-}
-```
-
-Cores por variant: info azul, warn amarelo, danger vermelho, success verde. NO_COLOR: prefixo `[!]`/`[?]`/`[X]`.
-
-**Queue indicator:** quando `queuePosition.total > 1`, título do modal mostra `(N de M)`:
-
-```
-┌─ Tool requires confirmation (1 de 3) ───────────────┐
-```
-
-Esc cancela só o atual (próximo modal vira ativo). Esc Esc oferece "cancelar todos os 3?" com confirmação inline. Razão: 3 permission prompts em fila viram fadiga; usuário precisa de saída clara sem decidir 3 vezes.
-
-Atalhos extras quando em queue:
-- `n` (next): adia atual sem decisão; vai pro fim da fila (cap 1× re-ordenação por modal).
-- `?` mostra contagem + tipos pendentes ("2 permission, 1 trust").
-
-#### `<Bar>`
-Barra horizontal de progresso (steps, budget, etc).
-
-```ts
-interface BarProps {
-  value: number
-  max: number
-  width?: number
-  label?: string
-  warningThreshold?: number  // muda cor pra amarelo
-  dangerThreshold?: number   // muda cor pra vermelho
-}
-```
-
-Render: `▆▆▆▆▁▁▁▁` (Unicode) / `####....` (ASCII).
-
-#### `<Badge>`
-Pill curta com texto + cor.
-
-```ts
-interface BadgeProps {
-  text: string
-  variant: 'profile' | 'model' | 'count' | 'warning' | 'neutral'
-}
-```
-
-Render: `[orchestrated]`, `[qwen2.5-coder:14b]`, `mem:12u`.
-
-#### `<Diff>`
-Diff colorido inline.
-
-```ts
-interface DiffProps {
-  before: string
-  after: string
-  format: 'unified' | 'split'    // unified em ≤ 80 cols, split em ≥ 120
-  contextLines?: number          // default 3
-  maxLines?: number              // truncate com "[N more lines]"
-  language?: string              // pra syntax highlight via shikiji
-}
-```
-
-Render: linhas `+` em verde, `-` em vermelho, contexto neutro. Hunks separados por `─`.
-
-#### `<Table>`
-Renderização tabular para arrays de records. Resolve gap de UI quando tools simbólicas (`find_references`, `outline_file`, `code_graph`), slash commands (`/mcp list`, `/memory list`, `/cost`), e outputs de query SQL retornam dados estruturados — antes destes, fallback era dump multi-linha ou JSON cru.
-
-```ts
-interface TableProps<T> {
-  rows: T[]
-  columns: TableColumn<T>[]
-  density?: 'compact' | 'comfortable'   // default 'compact' (1 linha/row)
-  maxRows?: number                       // truncate com "[N more rows]"
-  navigable?: boolean                    // ↑↓ + Enter; default false (estático)
-  selectedIndex?: number                 // controlled cursor quando navigable
-  onRowSelect?: (row: T, index: number) => void
-  onRowHover?: (row: T, index: number) => void   // opt-in; útil pra preview pane
-  emptyMessage?: string                  // default "(no results)"
-  groupBy?: keyof T                      // opcional: section headers por valor
-  sortBy?: { key: keyof T; direction: 'asc'|'desc' }
-  caption?: string                       // descrição acima do header
-}
-
-interface TableColumn<T> {
-  key: keyof T
-  label: string                          // header text
-  width?: number | 'auto' | 'flex'       // chars fixos, auto-fit, ou consume restante
-  minWidth?: number                      // floor pra auto/flex
-  align?: 'left' | 'right' | 'center'    // default 'left'
-  truncate?: 'end' | 'middle' | 'none'   // default 'end'; 'middle' pra paths longos
-  format?: (val: any, row: T) => string  // formatter custom
-  color?: (val: any, row: T) => string   // color name por valor (ex: status)
-}
-```
-
-**Render compact (não-navigable):**
-
-```
-file                  line  kind   text
-────────────────────  ────  ─────  ──────────────────────────────
-src/api/auth.ts       42    call   await validateOrder(order)
-src/api/auth.ts       88    type   Result<typeof validateOrder>
-tests/auth.test.ts    15    call   expect(validateOrder({...}))
-tests/auth.test.ts    22    call   await validateOrder(invalid)
-                                                  [3 more rows]
-```
-
-**Render navigable (cursor + selected row destacada):**
-
-```
-file                  line  kind   text
-────────────────────  ────  ─────  ──────────────────────────────
-  src/api/auth.ts     42    call   await validateOrder(order)
-▶ src/api/auth.ts     88    type   Result<typeof validateOrder>
-  tests/auth.test.ts  15    call   expect(validateOrder({...}))
-  ↑↓ navegar  ↵ selecionar  Esc cancelar
-```
-
-**Render empty:**
-
-```
-file  line  kind  text
-────  ────  ────  ────
-                          (no results)
-```
-
-**Render com groupBy (ex: agrupar por `kind`):**
-
-```
-file                  line  text
-─── kind: call (5) ────────────────────────────────────────
-src/api/auth.ts       42    await validateOrder(order)
-tests/auth.test.ts    15    expect(validateOrder({...}))
-...
-─── kind: type (2) ────────────────────────────────────────
-src/api/auth.ts       88    Result<typeof validateOrder>
-src/types.ts          12    OrderValidator = typeof ...
-```
-
-### Auto-fit de largura
-
-Estratégia em ordem de precedência:
-
-1. Coluna com `width: number` → fixed.
-2. Coluna com `width: 'auto'` (default se omitido) → max do label + max do conteúdo medido (cap em 50 chars).
-3. Coluna com `width: 'flex'` → consome largura restante; se múltiplas, divide proporcional.
-4. Total > terminal cols: colunas `auto` shrinkam a `minWidth` (default 8); ainda excede → última `flex` (ou última `auto`) recebe truncate `end`.
-
-Cálculo é re-feito em `SIGWINCH`. Re-render < 16ms (1 frame).
-
-### Densidade
-
-| Density | Comportamento |
-|---|---|
-| `compact` | 1 linha por row, separator `─` única após header, sem padding extra. Default |
-| `comfortable` | 1 linha vazia entre rows; bordas `│` opcionais |
-
-Em `< 80 cols`: `comfortable` força `compact` (não cabe).
-
-### Truncation por célula
-
-| Mode | Resultado em 20 chars de "src/api/auth-validation.ts:42" |
-|---|---|
-| `end` (default) | `src/api/auth-valid…` |
-| `middle` | `src/api/…idation.ts` |
-| `none` | overflow horizontal (quebra layout — uso só com colunas curtas) |
-
-`middle` é o modo recomendado pra paths e identifiers longos.
-
-### Color por valor
-
-```ts
-columns: [{
-  key: 'status',
-  label: 'Status',
-  color: (val) => val === 'failed' ? 'red' : val === 'warn' ? 'yellow' : 'green'
-}]
-```
-
-NO_COLOR: `color` é ignorado; status pode ganhar prefixo via `format`:
-
-```ts
-format: (val) => val === 'failed' ? '[!]' + val : val
-```
-
-### Atalhos (modo navigable)
-
-| Tecla | Ação |
-|---|---|
-| `↑/↓` | move cursor |
-| `↵` | `onRowSelect(row)` |
-| `g` / `G` | go to first / last row |
-| `Esc` | cancela (sai sem selection) |
-| `/` | inline filter (filtra linhas em-place; Esc limpa) |
-
-### ASCII fallback
-
-```
-file               | line | kind  | text
--------------------+------+-------+------------------------------
-src/api/auth.ts    | 42   | call  | await validateOrder(order)
-src/api/auth.ts    | 88   | type  | Result<typeof validateOrder>
-tests/auth.test.ts | 15   | call  | expect(validateOrder({...}))
-                                                   [3 more rows]
-```
-
-Cursor em ASCII: `>` ao invés de `▶`.
-
-### Performance
-
-- Render de 100 rows × 5 colunas: < 30ms.
-- Em `navigable` com 1000+ rows: virtualização (renderiza só visíveis); `↑↓` paginates automaticamente.
-- Re-flow em `SIGWINCH`: < 16ms.
-
-### Quando usar `<Table>` vs `<SessionPicker>` vs lista plana
-
-| Caso | Componente |
-|---|---|
-| 5+ campos por row, dados homogêneos | `<Table>` |
-| 1-3 campos + free-form text + expansão inline | `<SessionPicker>` (custom, não generalizado) |
-| 1-2 campos curtos | lista plana com bullet/cursor |
-| Dados de árvore (parent/child) | `<DAGProgress>` ou indented list |
-
-`<Table>` **não substitui** `<SessionPicker>` — esse é especializado pra mini-recap inline. Tabela é grid uniforme.
-
-### 3.2 Domain components
-
-#### `<StreamingMessage>`
-Renderiza assistant message com streaming token-by-token. Suporta tool_use blocks intercalados.
-
-```ts
-interface StreamingMessageProps {
-  steps: Step[]
-  currentStream?: AsyncIterable<StreamEvent>
-  onToolUse: (toolUse: ToolCall) => void
-}
-```
-
-**Estados:**
-- idle: histórico inteiro static
-- streaming: último step dynamic, anterior static
-- error: último step com erro mostrado em vermelho discreto
-
-**Performance:** batching de tokens — re-render no máximo 30fps mesmo se stream emite 200 tokens/s. Buffer interno descarrega a cada 33ms.
-
-#### `<ToolCallCard>`
-Card colapsável com tool call + output. Inclui `<PipelineBadges>` inline quando aplicável.
-
-```ts
-interface ToolCallCardProps {
-  toolCall: ToolCall                 // inclui pipeline_result se write_file/edit_file
-  collapsed: boolean                 // default: true se output > 10 linhas
-  onToggle?: () => void
-}
-```
-
-Render condensado (read tool):
-```
-▶ glob "src/**/*.ts"
-  ✓ 14 files (collapsed; press ↵ to expand)
-```
-
-Render condensado (write tool com pipeline):
-```
-▶ edit_file src/auth.ts                 [fmt ✓ lint ⚠ 2  test ✓ 8/8]
-  ✓ 3 changes (collapsed; press ↵ to expand)
-```
-
-Render expandido:
-```
-▶ edit_file src/auth.ts                 [fmt ✓ lint ⚠ 2  test ✓ 8/8]
-  ✓ 3 changes
-    src/auth.ts:42-47 (3 lines)
-  pipeline:
-    fmt:  prettier 145ms · 3 lines reformatted
-    lint: eslint 480ms · 0 errors, 2 warnings (no-unused-vars × 2)
-    test: jest 2.3s · 8 passed, 0 failed
-```
-
-Status icons + progressive disclosure. PipelineBadges aparece **só** em tools com `pipeline_result` populado (`CODE_GENERATION.md §4.1`).
-
-**Render do output expandido — heurística por shape:**
-
-| Output shape | Render |
-|---|---|
-| `string` (multi-linha) | dump indentado dentro do card |
-| `Array<string>` | bullet list |
-| `Array<object>` com ≥ 2 campos partilhados | `<Table>` (auto-detect colunas dos campos comuns) |
-| `Array<object>` com 1 campo ou heterogêneo | bullet list ou JSON pretty |
-| `object` (single record) | key-value (mesmo padrão que `<ValidatorTrace>`) |
-| `{ diff: string, language?: string }` | `<Diff>` |
-| `{ status, content, ... }` (tool result MCP) | unwrap `content`, recursão na heurística |
-
-**Override por tool metadata** (opcional, em `CONTRACTS.md §2.6`):
-
-```yaml
-metadata:
-  display: 'table' | 'list' | 'diff' | 'raw' | 'auto'   # default 'auto'
-```
-
-`display: 'raw'` força dump cru (pra outputs de `bash` que devem aparecer como saída de terminal).
-
-Tools que se beneficiam de table render automático: `find_references`, `outline_file`, `code_graph`, `glob` (lista de paths agrupada por diretório como groupBy), `grep` (file/line/text colunas).
-
-#### `<PipelineBadges>`
-Badges inline com resultado do pipeline de geração (`CODE_GENERATION.md §1`). Renderizado por `<ToolCallCard>` em tools de write; pode ser usado standalone em recap.
-
-```ts
-interface PipelineBadgesProps {
-  result: PipelineResult              // pipeline_result schema, CODE_GENERATION §4.1
-  variant?: 'inline' | 'expanded'     // default: 'inline'
-}
-
-type StageStatus = 'ok' | 'warn' | 'failed' | 'skipped' | 'disabled' | 'crashed' | 'timeout'
-
-interface PipelineResult {
-  format?: { status: StageStatus; duration_ms?: number; diff_lines?: number }
-  lint?:   { status: StageStatus; duration_ms?: number; errors?: number; warnings?: number }
-  test?:   { status: StageStatus; duration_ms?: number; passed?: number; failed?: number }
-}
-```
-
-Render inline (compact):
-```
-[fmt ✓  lint ⚠ 2  test ✓ 8/8]
-[fmt ✓  lint ✗ 3  test ⏭]               # 3 errors em strict bloqueia accept
-[fmt ⊘  lint ⊘  test ⊘]                  # --no-pipeline
-[fmt ⏭  lint ⏭  test ⏭]                  # disabled per language (sem config)
-```
-
-Render expandido (em tool card aberto):
-```
-pipeline:
-  fmt:  prettier 145ms · 3 lines reformatted
-  lint: eslint 480ms · 0 errors, 2 warnings
-  test: jest 2.3s · 8 passed, 0 failed
-```
-
-**Status icons (status do estágio):**
-| Status | Unicode | ASCII | Cor |
-|---|---|---|---|
-| `ok` | `✓` | `[ok]` | verde |
-| `warn` | `⚠` | `[!]` | amarelo |
-| `failed` | `✗` | `[x]` | vermelho |
-| `skipped` | `⏭` | `[/]` | cinza |
-| `disabled` | `⊘` | `[-]` | cinza fraco |
-| `crashed` / `timeout` | `⚡` | `[?]` | vermelho |
-
-**Comportamento:**
-- Inline: sempre presente em tools com `writes: true` quando pipeline rodou.
-- Click/Enter no card expande para variante `expanded`.
-- Em strict mode com `failed`: badge **pisca** 1×; padrão de cor reforçado em vermelho profundo.
-- `disabled` vs `skipped`: `skipped` é "estágio rodou mas pulou esse arquivo" (ex: lint sem mapping); `disabled` é "estágio off no config".
-
-Cross-ref: integração com modo `--strict` em `CODE_GENERATION.md §2`.
-
-#### `<PermissionPrompt>` (modal)
-
-```ts
-interface PermissionPromptProps {
-  toolCall: ToolCall
-  preview: string                    // tool.preview(args)
-  policy: 'confirm'                  // só aparece em modo confirm
-  nonReversible?: NonReversibleHint  // detected; nullable
-  onResolve: (decision: 'allow' | 'deny' | 'edit') => void
-}
-
-interface NonReversibleHint {
-  reason: 'network_write'            // bash com push/deploy/curl POST/PUT/DELETE
-        | 'external_state'           // tool MCP que muda DB externa
-        | 'destructive'              // rm/drop/truncate/wipe
-        | 'shared_state'             // git push, git tag, npm publish
-  pattern_matched?: string           // regex/heurística que disparou
-}
-```
-
-Microcopy normal:
-```
-Tool requires confirmation
-
-  bash
-  rm -rf ./build
-
-  Why confirm? Matched rule: "rm *" → confirm
-
-  [a]ccept  [r]eject  [e]dit  [w]hy?
-```
-
-Microcopy com `nonReversible` (badge vermelho-sangue no topo):
-```
-┌─ Tool requires confirmation ────────────────── [non-reversible] ─┐
-
-  bash
-  git push origin main
-
-  Why confirm? Matched rule: "git push *" → confirm
-  Why non-reversible? Pattern: "git push" → shared state mutation
-                      /undo NÃO cobre (alteração de remote)
-
-  [a]ccept  [r]eject  [e]dit  [w]hy?
-
-```
-
-**Detecção de `nonReversible`** (heurística em harness, não modelo):
-
-| Reason | Patterns típicos |
-|---|---|
-| `destructive` | `rm -rf /`, `dd of=`, `truncate`, `DROP TABLE`, `DELETE FROM` (sem WHERE) |
-| `network_write` | `curl -X (POST|PUT|DELETE)`, `wget --post`, `http POST/PUT/DELETE` |
-| `shared_state` | `git push`, `git tag`, `npm publish`, `cargo publish`, `docker push` |
-| `external_state` | tool MCP com `_meta.agentic_cli.writes:true` E `network:true` |
-
-Match → flag aparece **antes** do modal ser dismissed. Usuário tem chance extra de pensar.
-
-**Comportamento de `[a]ccept` em non-reversible:**
-- Modal **não fecha imediatamente** com `a`/`y`/Enter.
-- Pede segunda confirmação inline: "Tem certeza? `[y]es / [n]o`".
-- Esc cancela. `y` confirma. Sem opção de "remember decision" — não-reversível não vira allow rule.
-
-Atalhos: `a/y/Enter` accept (com double-confirm se non-reversible), `r/n/Esc` reject, `e` edit args (abre input), `w` mostra detalhe da rule matched + reason de non-reversibility se aplicável.
-
-#### `<TrustPrompt>` (modal)
-
-```ts
-interface TrustPromptProps {
-  cwd: string
-  filesToRead: string[]   // AGENTS.md, .agent/config.toml, etc
-  changedSinceLastTrust?: { file: string; lastHash: string; newHash: string }[]
-  onResolve: (decision: 'trust' | 'reject' | 'inspect') => void
-}
-```
-
-Microcopy primeira vez:
-```
-⚠ Diretório não-confiável detectado
-
-  /home/lex/work/some-repo
-
-  Vou ler:
-    AGENTS.md         (12 KB)
-    .agent/config.toml (não existe)
-
-  [t]rust  [r]eject  [i]nspect  [w]hy?
-```
-
-Microcopy re-prompt (mudança detectada):
-```
-⚠ Conteúdo confiável mudou
-
-  /home/lex/work/some-repo
-
-  AGENTS.md mudou desde último trust:
-    + 47 lines added
-    - 3 lines removed
-
-  Re-confirmar? [y]es  [n]o  [d]iff  [r]eject
-```
-
-#### `<MemoryWritePrompt>` (modal)
-
-```ts
-interface MemoryWritePromptProps {
-  proposed: ProposedMemory
-  source: 'user_explicit' | 'inferred'
-  scope: 'user' | 'project'
-  onResolve: (decision: 'accept' | 'edit' | 'reject') => void
-}
-```
-
-Microcopy:
-```
-📝 Propor nova memória  [feedback / project]
-
-  name: no-console-log
-  description: console.log proibido em src/; usar logger
-  body:
-    Em arquivos `src/**/*.ts`, console.log/warn/error proibidos.
-    **Why:** logs estruturados são exportados pra Datadog;
-            console.* fura observabilidade.
-    **How to apply:** ao editar arquivo em src/, usar
-                     `import { logger } from "@/lib/logger"`.
-
-  Source: inferred (de correção do usuário no turn 4)
-
-  [a]ccept  [e]dit  [r]eject  [w]hy?
-```
-
-Inferred writes em diretório não-confiável: **prompt extra** "este diretório não-confiável; aceitar mesmo assim? [y/N]".
-
-#### `<TodoListView>`
-Checklist live no live region. **Lê de SQLite, não do stream cru** — fonte de verdade é a tabela `todos` (ver `AUDIT.md §1.4`); stream parser do harness escreve, UI lê. Garante consistência entre o que audit registra e o que o usuário vê.
-
-```ts
-interface TodoListViewProps {
-  items: TodoItem[]
-  parseConfidence?: number    // último parse_confidence; abaixo de 0.8 → indicador discreto
-}
-
-interface TodoItem {
-  content: string
-  status: 'pending' | 'in_progress' | 'completed' | 'cancelled'
-  activeForm?: string         // ex: "extracting function..."
-  parentTodoId?: number       // subtask
-}
-```
-
-Data flow canônico:
-
-```
-modelo emite checklist em prosa
-    ↓
-harness stream parser extrai
-    ↓
-INSERT/UPDATE em todos table (AUDIT.md §1.4)
-    ↓
-React state SELECT'a; <TodoListView> renderiza
-```
-
-UI **não parse de novo** o stream cru — quem viu o stream foi o parser do harness. Falha de parse → `failure_event` (`AUDIT §1.4.3`); UI continua mostrando últimos itens válidos.
-
-Render:
-```
-Plan:
-  ✓ map callers de validateToken
-  ▶ extract function pra src/auth/validate.ts
-  ○ run tests src/auth/
-```
-
-Item em `in_progress` mostra `activeForm` ("extracting function..." em itálico se suportado).
-
-Render com low parse confidence (parser teve dificuldade no último update):
-```
-Plan:                                       (~ parse confidence 0.6)
-  ✓ map callers
-  ▶ extract function
-```
-
-Indicador `~` à direita do header sinaliza "modelo pode ter um plano ligeiramente diferente do mostrado". Sem confidence < 0.5 (item nem persiste; fail_event).
-
-Atualização **smooth** — adicionar/remover item anima por 1 frame; mudança de status sem scroll do histórico.
-
-**Cancelled items:** ficam visíveis com riscado (`s͟t͟r͟i͟k͟e`) ou prefixo `~~`; sumir silenciosamente engana.
-
-#### `<BudgetBar>`
-Footer left section.
-
-```ts
-interface BudgetBarProps {
-  steps: { used: number; max: number }
-  cost: { usd: number; max: number }
-  showBars?: boolean   // mini-bars em ≥ 100 cols
-}
-```
-
-Render normal:
-```
-steps 7/50 · $0.04/$5.00
-```
-
-Render warning (steps > 70%):
-```
-steps 36/50 ⚠ · $0.04/$5.00
-```
-
-Render danger (>90%):
-```
-steps 47/50 ✗ · $4.85/$5.00 ✗
-```
-
-#### `<DiffView>`
-Diff em mensagens de tool / proposta de edit.
-
-(Já especificado em primitivas como `<Diff>`; este é wrapper com syntax highlight via shikiji.)
-
-#### `<BackgroundProcessTray>`
-Footer right section.
-
-```ts
-interface BackgroundProcessTrayProps {
-  processes: BackgroundProcess[]
-}
-```
-
-Render:
-```
-bg: 2 (npm-dev ✓, pytest ⏳)
-```
-
-Mouseable em terminais que suportam? Não. Atalho: `/bg` lista detalhada.
-
-#### `<MCPTray>`
-Footer right section, ao lado de `<BackgroundProcessTray>`. Mostra MCP servers ativos com estado agregado.
-
-```ts
-interface MCPTrayProps {
-  servers: MCPServerStatus[]
-}
-
-interface MCPServerStatus {
-  name: string
-  state: 'disconnected' | 'handshaking' | 'trust_pending'
-        | 'trusted' | 'active' | 'degraded' | 'denied' | 'error'
-  toolCount: number             // tools visíveis ao modelo (zero se não-trusted)
-  lastError?: string
-}
-```
-
-Render compacto (sessão sem servers):
-```
-                                                    # vazio (footer não mostra mcp:)
-```
-
-Render normal (1-3 servers):
-```
-mcp: 2 (postgres ✓, github ✓)
-```
-
-Render com warning (server `degraded`):
-```
-mcp: 3 (postgres ✓, github ⚠, slack ✓)
-```
-
-Render com `trust_pending` (manifest mudou ou novo server):
-```
-mcp: 2 (postgres ✓, github ⊕)              ⊕ = trust_pending; modal queue não-vazio
-```
-
-Render compacto (4+ servers):
-```
-mcp: 5 (3 ✓, 1 ⚠, 1 ⊕)
-```
-
-**Estado → ícone:**
-| Estado | Unicode | ASCII | Cor |
-|---|---|---|---|
-| `active` / `trusted` | `✓` | `[ok]` | verde |
-| `degraded` | `⚠` | `[!]` | amarelo |
-| `disconnected` | `↯` | `[/]` | cinza |
-| `trust_pending` | `⊕` | `[?]` | azul (chama atenção) |
-| `denied` / `error` | `✗` | `[x]` | vermelho |
-
-**Comportamento:**
-- Servers em `disconnected` lazy (estado normal pré-primeiro-call) **não aparecem** no tray. Aparecem só após primeiro `tools/call` na sessão (mesma lazy semantic do contrato `MCP.md §1.3`).
-- Server em `denied` ou `error` aparece persistente — sinaliza configuração quebrada visível.
-- `trust_pending` é gatilho de atenção: ícone `⊕` em azul; modal de trust prompt está enfileirado (ver `<Modal>` queue).
-- Atalho: `/mcp list` lista detalhada; `/mcp show <name>` foco em um server.
-
-**Truncação por largura:**
-| Largura | Render |
-|---|---|
-| ≥ 100 cols | `mcp: N (server1 ✓, server2 ⚠, server3 ✓)` |
-| 80-99 cols | `mcp: N (≤2 servers + ...)` |
-| < 80 cols | `mcp: N (3✓ 1⚠)` (só counts) |
-
-Cross-ref: data source em `AUDIT.md §1.5` (`mcp_servers.state`); state machine em `STATE_MACHINE.md §6.5`.
-
-#### `<CheckpointBar>`
-Indicador de checkpoints disponíveis pra undo.
-
-```ts
-interface CheckpointBarProps {
-  checkpoints: Checkpoint[]
-  currentIndex: number
-}
-```
-
-Render compacto:
-```
-checkpoints: 4 · undo: Ctrl+Z
-```
-
-#### `<DAGProgress>` (profile orchestrated)
-Visualização do DAG em execução.
-
-```ts
-interface DAGProgressProps {
-  graph: DAGGraph
-  nodeStates: Map<NodeId, NodeState>
-}
-```
-
-Render:
-```
-DAG: edit_function
-  ✓ locate          (file: src/auth.ts:42)
-  ✓ read_context
-  ▶ propose_edit    (retry 1/2)
-  ○ validate_edit
-  ○ apply
-```
-
-Node em retry mostra contador. Falha persistente em vermelho.
-
-#### `<ValidatorTrace>`
-Aparece quando validator falha; mostra hint e progress de retry.
-
-```ts
-interface ValidatorTraceProps {
-  validator: string
-  error: string
-  retryHint?: string
-  retryCount: number
-  maxRetries: number
-}
-```
-
-Render:
-```
-✗ JSONSchemaValidator failed (retry 1/2)
-  expected: { file: string, line: int }
-  got:      { file: string }
-  hint:     Adicionar campo "line" com posição da função
-```
-
-#### `<ProfileBadge>`
-Header indicator.
-
-```ts
-interface ProfileBadgeProps {
-  profile: 'autonomous' | 'orchestrated' | 'hybrid'
-}
-```
-
-Render: `[autonomous]` (azul) / `[orchestrated]` (verde) / `[hybrid]` (roxo).
-
-#### `<ModeBadges>`
-Header indicator sequencial à direita do `<ProfileBadge>`. Renderiza badges adicionais para flags de execução **não-default** que mudam comportamento materialmente. Default mode → vazio (silencioso).
-
-```ts
-interface ModeBadgesProps {
-  strict?: boolean              // --strict: format/lint/test bloqueiam accept
-  plan?: boolean                // --plan: read-only; nada escreve
-  noPipeline?: boolean          // --no-pipeline: format/lint/test desativados
-  autoApproveMcp?: string[]     // CI: lista de servers MCP pré-aprovados
-  budgetEnforce?: boolean       // --budget-enforce: violations viram exception
-  showThinking?: boolean        // /thinking on (extended thinking visível)
-}
-```
-
-Render padrão (default mode):
-```
-[orchestrated]                             # nada além do profile
-```
-
-Render com flags:
-```
-[orchestrated] [strict]                    # strict ativo
-[orchestrated] [plan]                      # plan mode (read-only)
-[autonomous] [strict] [thinking]
-[autonomous] [no-pipeline]                 # escape hatch óbvio
-[autonomous] [auto-mcp:postgres,github]    # CI; lista visível
-```
-
-**Cores e prioridades visuais:**
-| Badge | Cor | Razão |
+| Evento | Quando | Renderer reage |
 |---|---|---|
-| `[strict]` | amarelo bold | gates ativos; bom saber |
-| `[plan]` | azul | read-only safety |
-| `[no-pipeline]` | **vermelho** | escape hatch visivelmente perigoso |
-| `[auto-mcp:...]` | **vermelho** | CI bypass; gritar |
-| `[budget-enforce]` | amarelo | violations → exception |
-| `[thinking]` | cinza | informacional |
+| `session:start` | Início da sessão | imprime cabeçalho permanente |
+| `session:end` | Fim da sessão | imprime sumário permanente |
+| `user:submit` | User pressiona Enter | imprime echo permanente; limpa input |
+| `assistant:start` | Provider começa a streamar | abre buffer vivo de mensagem |
+| `assistant:delta` | Cada chunk de texto | append no buffer; redraw |
+| `assistant:end` | Mensagem completa | move buffer para scrollback (permanente) |
+| `thinking:start/delta/end` | Extended thinking ativo | indicador discreto (`thinking… 12s`); never persiste |
+| `tool:start` | Tool call inicia | adiciona card vivo |
+| `tool:delta` | Output incremental (bash stdout, etc.) | append no card vivo |
+| `tool:end` | Tool call termina | move card para scrollback |
+| `permission:ask` | Permission engine pede confirmação | abre modal (substitui input) |
+| `permission:answer` | User responde | fecha modal |
+| `trust:ask` | Diretório/AGENTS.md desconhecido | abre modal de trust |
+| `memory:write:ask` | Tool `memory_write` propõe | abre modal de memory write |
+| `plan:review` | Profile orchestrated apresenta plano | abre review modal |
+| `todo:update` | TodoList muda | redesenha bloco de todos vivo |
+| `subagent:start/update/end` | Subagent rodando | linha viva agrupada por subagent_id |
+| `bg:start/update/end` | Background process | atualiza tray na status line |
+| `step:budget` | Budget warning (80%, 90%) | status line muda cor (dim → bold) |
+| `checkpoint:create` | Novo checkpoint | breve flash na status line (1s) |
+| `error` | Erro fatal | linha vermelha permanente; mantém sessão se possível |
+| `warn` | Aviso não-fatal | linha dim permanente |
+| `interrupt` | Ctrl+C / Esc Esc | mostra prompt de cancelamento |
 
-Razão de cor para `[no-pipeline]` e `[auto-mcp]`: são escape hatches que silenciosamente removem segurança. Visualmente alarmantes para evitar uso inadvertido em PR / CI / prod-touching.
+Esquemas detalhados de payload vivem em `CONTRACTS.md` §2.6.
 
-**Comportamento:**
-- Render zero badges em default mode → header é mínimo.
-- Em < 80 cols: abreviam (`[strict]` → `[s]`, `[plan]` → `[p]`, etc.). Hover/help: `?` em footer mostra significados.
-- Mudança de mode mid-session (ex: `/strict on`): badge **anima** entrando (1 frame fade-in se truecolor); audit registra transição.
+### 3.3 Garantias
 
-**Decisão de design — por que não fundir com ProfileBadge:**
-- Profile é orientação **estável** (autonomous vs orchestrated muda raro).
-- Mode badges são **flags efêmeras** (toggle por sessão ou por slash command).
-- Separados: usuário lê profile → entende qual loop está ativo; lê modes → entende quais gates estão fora do default.
+- **Ordem causal preservada por (session_id, tool_id, subagent_id).** Eventos de uma mesma origem chegam na ordem em que foram emitidos.
+- **Idempotência.** `tool:end` após `tool:end` é no-op no renderer.
+- **Sem perda silenciosa.** Eventos descartados (ex.: provider crash) viram `error` ou `warn` explícitos.
 
-#### `<MemoryBadge>`
-Footer right section discreto.
+---
 
-```ts
-interface MemoryBadgeProps {
-  userCount: number
-  projectCount: number
-  pendingCount?: number       // proposed memories sem decisão (não-zero → mostrar)
-  loaded: boolean
-}
-```
+## 4. Componentes funcionais (render → string[])
 
-Render normal:
-```
-mem 12u 4p
-```
+Cada elemento é uma função pura. Recebe estado, devolve linhas (com ANSI inline). Sem classes, sem reuso por herança — composição direta.
 
-Render com pending (memories propostas aguardando decisão):
-```
-mem 12u 4p (3 pending)         # cor amarela em "(3 pending)"
-```
+### 4.1 Tool card
 
-Click/hover não disponível em terminal; `/memory list` ou `/memory pending` pra detalhes. Pending count > 0 é affordance para o usuário lembrar de revisar memórias inferidas; senão somem na sessão e propostas viram lixo.
-
-Threshold visual: pending > 5 vira **bold amarelo** (sinal de backlog acumulando).
-
-#### `<IndexStatus>`
-Footer right section, ao lado de `<MemoryBadge>`. Mostra estado do code index — visível apenas quando **não-saudável** ou em warming.
+> **Supersedido pela §4.10 (operation chip + sub-content).** Esta seção descreve o esboço inicial; a forma canônica do tool card é o operation chip definido em §4.10.5. Mantida aqui como referência de transição até a implementação migrar.
 
 ```ts
-interface IndexStatusProps {
-  state: 'unavailable' | 'warming' | 'ready' | 'stale' | 'error'
-  warmingProgress?: { indexed: number; total: number }
-  staleCount?: number
-  lastError?: string
-}
-```
-
-Render por estado:
-
-| Estado | Render | Cor |
-|---|---|---|
-| `ready` | (vazio — silencioso) | — |
-| `warming` | `idx 1.2k/3.4k` | cinza (informacional) |
-| `stale` | `idx ⚠ 12% stale` | amarelo |
-| `unavailable` | `idx ↯ unavail` | vermelho discreto |
-| `error` | `idx ✗ <code>` | vermelho |
-
-**Comportamento:**
-- `ready` é o estado normal; badge invisível para reduzir noise.
-- `warming` aparece durante initial scan; some quando 100%.
-- `stale` aparece se threshold de §16.4 atingido; sugere `agent code-index rebuild --since`.
-- `unavailable` é alerta persistente: tools simbólicas (`read_symbol`, `find_references`, etc) ficam off; modelo recai em `read_file`/`grep`.
-
-**Atalho:** `/code-index status` mostra detalhes; `agent code-index rebuild` força rebuild.
-
-Cross-ref: data source em `CODE_INDEX.md §4.1` (`index_status()`); failure modes em `FAILURE_MODES.md §16`.
-
-#### `<SymbolicToolsTip>`
-Tip discreta inline mostrada **uma vez por sessão** quando code index transita de `warming/unavailable` → `ready`. Sinaliza ao usuário que tools simbólicas ficaram disponíveis.
-
-```ts
-interface SymbolicToolsTipProps {
-  shown: boolean              // local state; persiste em sessions table como flag
-  onDismiss: () => void
-}
-```
-
-Render (rodapé dinâmico, abaixo do `<LoopStatusLine>`):
-```
-  ↳ tip: code index ready · tools simbólicas disponíveis
-        (read_symbol, find_references, outline_file, code_graph)
-        modelo escolhe automaticamente; veja /tools
-```
-
-Aparece por **um frame** depois do primeiro turn pós-`ready`, depois desaparece. Audit registra primeira aparição em `sessions.flags.symbolic_tools_tip_shown_at`.
-
-Razão de ser separado e não em `<IndexStatus>`: este é **affordance de descoberta** (modelo aprendeu), o outro é **affordance de health** (estado operacional). Separar evita noise quando index é always-ready em sessões subsequentes.
-
-#### `<LoopStatusLine>`
-
-Rodapé granular durante step ativo. Substitui o rodapé default quando loop está em estado não-trivial (não-idle, com info útil pra mostrar).
-
-```ts
-interface LoopStatusLineProps {
-  step: { current: number; max: number }
-  elapsedMs: number
-  state: enum [generating, tool_exec, compacting, validating, retrying, awaiting_user]
-  detail?: string                          // ex: "tool: bash", "validator: JSONSchema"
-  retryCount?: number
-  upcomingCompaction?: number              // steps até compaction trigger
-  turnCost?: TurnCostInfo                  // cost-of-this-turn em comparação a histórico
-}
-
-interface TurnCostInfo {
-  currentUsd: number                       // custo acumulado do turn corrente
-  sessionUsd: number                       // custo total da sessão
-  percentile?: number                      // percentil do turn vs histórico do user (p50, p90, p99)
-                                            // computado contra últimos 30d de turns
-}
-```
-
-**Renders por estado:**
-
-```
-[step 7/50 · 2m31s · generating · 1.2k tokens]
-[step 7/50 · 2m31s · tool: bash (npm test)]
-[step 7/50 · 2m31s · validating: JSONSchema · retry 1/2]
-[step 7/50 · 2m31s · compacting context (~70%)]
-[step 7/50 · 2m31s · ↻ provider retry 1/3 (5xx)]
-[step 7/50 · 2m31s · idle · compaction in 3 steps]
-```
-
-**Cost spike warning** (turn no percentil ≥ 90 do histórico):
-
-```
-[step 7/50 · 2m31s · generating · 1.2k tokens · $0.42 turn ⚠ p95]
-```
-
-`$0.42 turn` em **amarelo** quando p90-p99; **vermelho** quando ≥ p99. Razão: dá ao usuário chance de interromper turn caro **antes** dele completar, em vez de descobrir post-hoc no `/cost`. Threshold p90 evita falsos positivos em sessões legitimamente caras (audit playbook, refactor grande).
-
-Sem histórico suficiente (< 50 turns gravados): comparação suprimida; só mostra em alerta absoluto (turn > $1).
-
-Cross-ref: dados de `tool_calls` agregados; query em `AUDIT.md`.
-
-Substitui temporariamente `<BudgetBar>` no rodapé; volta ao normal em `idle`.
-
-#### `<PlanReview>`
-
-Modal renderizado ao sair de plan mode (§5.1 do AGENTIC_CLI.md).
-
-```ts
-interface PlanReviewProps {
-  plan: PlanSchema
-  onAccept: () => void
-  onEdit: () => void                       // abre $EDITOR no plan YAML
-  onReject: () => void
-}
-```
-
-Render:
-
-```
-┌─ Plan ────────────────────────────────────────────────────┐
-│                                                            │
-│  Goal: extract validateToken to pure function             │
-│                                                            │
-│  Scope:                                                    │
-│    in: src/auth.ts, src/auth/validate.ts (new),           │
-│        tests/auth/validate.test.ts (new)                  │
-│    out: src/auth-middleware.ts (callers, not in scope)    │
-│                                                            │
-│  Steps:                                                    │
-│    1. Extract `validateToken` to src/auth/validate.ts     │
-│       (semantic-preserving; runs tests after)             │
-│    2. Add tests/auth/validate.test.ts (5 cases)           │
-│       (semantic-preserving; runs tests)                   │
-│    3. Update src/auth.ts to import (1-line change)        │
-│       (semantic-preserving; runs tests)                   │
-│                                                            │
-│  Risks:                                                    │
-│    - validateToken tem side effect (logs); preservar      │
-│                                                            │
-│  Estimated cost: ~$0.15 · 8-12 steps                      │
-│                                                            │
-│  [a]ccept  [e]dit  [r]eject  [w]hy?                       │
-└────────────────────────────────────────────────────────────┘
-```
-
-#### `<WaitIndicator>`
-
-Indicador discreto durante `wait_for` ativo. Mostra condition + elapsed + timeout remaining.
-
-```ts
-interface WaitIndicatorProps {
-  condition: WaitCondition
-  elapsedMs: number
-  timeoutMs: number
-}
-```
-
-Renders por kind:
-
-```
-⏳ waiting for: process_output (npm run dev) · pattern "ready on port" · 12s · timeout in 48s
-⏳ waiting for: process_exit (pid 12345) · 1m23s · timeout in 8m37s
-⏳ waiting for: file_exists (/tmp/build/done) · 5s · timeout in 1m55s
-⏳ waiting for: port_open (localhost:3000) · 2s · timeout in 28s
-⏳ waiting for: http_response (https://api.example.com/health, status=200) · 8s · timeout in 22s
-⏳ waiting for: sleep · 30s remaining
-⏳ waiting for: any_of (port_open OR file_exists) · 5s · timeout in 55s
-```
-
-Substitui `<LoopStatusLine>` durante wait_for ativo. Volta ao normal quando wait completa.
-
-#### `<MonitorStream>`
-
-Container que mostra eventos de `monitor` ativo conforme chegam. Cada evento renderiza como linha.
-
-```ts
-interface MonitorStreamProps {
-  condition: MonitorCondition
-  events: MonitorEvent[]
-  capturedCount: number
-  maxEvents?: number
-  durationMs?: number
-}
-```
-
-Render:
-
-```
-📡 monitor: process_output_pattern (npm run watch, /WARN|ERROR/) · 3/10 events · 12s
-  → WARN: deprecated import in src/foo.ts:12
-  → WARN: unused variable in src/bar.ts:45
-  → ERROR: type mismatch in src/baz.ts:88
-  (waiting for more...)
-```
-
-Cancellable via Ctrl+C.
-
-#### `<ThinkingIndicator>`
-
-Indicador discreto durante eventos `thinking_delta` (extended thinking em Anthropic Opus 4.x ou OpenAI o1/o3).
-
-```ts
-interface ThinkingIndicatorProps {
-  active: boolean
-  elapsedMs: number
-}
-```
-
-Render: `🧠 thinking... (12s)` no rodapé direito (próximo ao `<BudgetBar>`).
-
-Some quando primeiro `text_delta` ou `tool_use_start` chega.
-
-Não mostra conteúdo do thinking por default (toggle via `--show-thinking` ou `/thinking on`).
-
-#### `<SessionPicker>`
-
-Listagem virtualizada de sessões com mini-recap expansível inline. Renderizado em modo full-screen (não modal) quando user invoca `agent --resume` (sem args) ou `/sessions list`.
-
-```ts
-interface SessionPickerProps {
-  sessions: SessionSummary[]              // ordenado desc por started_at
-  initialFilter?: SessionFilter
-  onResume: (sessionId: string) => void
-  onShow: (sessionId: string) => void     // expand mini-recap inline
-  onCancel: () => void
-}
-
-interface SessionSummary {
+interface ToolCardState {
   id: string
-  goal: string                            // primeira linha do user prompt
-  status: SessionStatus
-  startedAt: number
-  endedAt?: number
-  durationMs: number
-  steps: number
-  costUsd: number
-  cwd: string
-  cwdLabel: string                        // ex: "blablabla"
-  hasErrors: boolean
-  incomplete: boolean                     // status não-terminal
-  miniRecap?: string                      // pré-renderizado; carregado lazy se ausente
+  name: string         // 'bash', 'read', 'edit', ...
+  args: string         // já formatado (uma linha, truncado)
+  status: 'running' | 'done' | 'error' | 'denied'
+  durationMs?: number
+  outputPreview?: string[]  // até 5 linhas, truncadas
+  pipeline?: { name: string; status: 'pass' | 'warn' | 'fail' }[]
 }
 
-interface SessionFilter {
-  project?: string
-  since?: Date
-  status?: SessionStatus
-  search?: string
-}
+function renderToolCard(s: ToolCardState): string[]
 ```
 
-**Layout:**
-
+**Vivo (running):**
 ```
-┌─ Resumir sessão ──────────────────────────────────────────────────┐
-│  [/] filtrar  [s] status  [p] projeto  [d] data                   │
-│                                                                    │
-│  ▶ sess_8a3f2b · 2 days ago · blablabla                           │
-│    ✓ done · $0.04 · 15 steps                                      │
-│    "refactor queue retry logic"                                    │
-│                                                                    │
-│    sess_7c1d09 · 3 days ago · blablabla                           │
-│    ⚠ exhausted · $4.92 · 50 steps                                 │
-│    "audit auth flow for OWASP top 10"                             │
-│                                                                    │
-│    sess_6b2e44 · 5 days ago · other-proj                          │
-│    ✓ done · $0.18 · 8 steps                                       │
-│    "/debug failing test in auth.test.ts"                          │
-│                                                                    │
-│  [↑↓] navegar  [↵] resume  [r] mini-recap  [Esc] sair              │
-└────────────────────────────────────────────────────────────────────┘
+⠋ bash · npm test                                    8s
 ```
 
-**Comportamento:**
-
-- `↑↓`: navegação; cursor `▶`
-- `↵` (Enter): resume selecionada
-- `r`: expande mini-recap **inline** sob a sessão selecionada (não muda de tela)
-- `s`/`p`/`d`: filtros via picker secundário
-- `/`: fuzzy search em `goal` + `cwdLabel`
-- `Esc`: cancela; volta pro shell
-- Lista virtualizada (renderiza só visíveis); paginação automática em `↑↓`
-
-**Mini-recap expandido (inline):**
-
+**Final (done):**
 ```
-│    ▶ sess_8a3f2b · 2 days ago · blablabla                          │
-│      ✓ done · $0.04 · 15 steps                                     │
-│      "refactor queue retry logic"                                  │
-│      ┌──────────────────────────────────────────────────────────┐  │
-│      │ Resumo:                                                  │  │
-│      │ Extraiu computeBackoff em src/queue/backoff.ts; adicionou│  │
-│      │ 5 testes; removeu código morto. 4 etapas, todas verdes.  │  │
-│      │                                                          │  │
-│      │ Files: src/queue.ts, src/queue/backoff.ts, queue.test.ts │  │
-│      │ Decisões: extrair pra função pura (testabilidade)        │  │
-│      │ Não feito: src/queue-consumer.ts (fora do escopo)        │  │
-│      └──────────────────────────────────────────────────────────┘  │
+▶ bash · npm test                                    1.2s
+  └ 47 passed, 0 failed                  fmt ✓ lint ✓ test ✓
 ```
 
-**Performance:**
-
-- Lista de 100 sessões pré-cached: render < 50ms
-- Mini-recap pré-renderizado em hook `Stop` (cacheado em `recap_cache`); carregamento lazy se ausente (~500ms-1s pra LLM render)
-- Sem mini-recap pré-renderizado: fallback determinístico (`<status>: {steps} steps, {files} files, {goal}`)
-
-**Estados visuais:**
-
-- Sessão `incomplete: true` → indicador `⚠ interrupted by crash` (visualmente distinto)
-- Sessão `running` (in another instance, raro) → cinza + label `(active in PID N)`
-- Sessão `hasErrors: true` mas `done` → ícone secundário discreto
-
-#### `<Interrupt>`
-State machine do Ctrl+C.
-
-```ts
-interface InterruptHandlerProps {
-  state: 'idle' | 'first_press' | 'tool_running'
-  toolInProgress?: string
-  onInterrupt: () => void
-  onForceExit: () => void
-}
+**Final (error):**
+```
+✗ bash · npm test                                    2.1s
+  └ exit 1: 3 tests failed (see output above)
 ```
 
-Comportamento:
-- 1× Ctrl+C em idle: cancela input atual, mantém sessão
-- 1× Ctrl+C em running (sem tool): cancela geração, volta a idle
-- 1× Ctrl+C em tool_running: mostra prompt "tool em execução; press Ctrl+C de novo pra forçar"; 5s timeout volta ao normal
-- 2× Ctrl+C em tool_running: SIGTERM no tool; 1× mais Ctrl+C: SIGKILL; mais um: exit do agente
+Output completo de bash já saiu como conteúdo permanente via `tool:delta`. O card final é só sumário.
 
-Microcopy do double-press:
+### 4.2 Subagent row (na região viva, agrupada)
+
 ```
-⚠ tool em execução: bash (rm -rf ./build)
-  Press Ctrl+C novamente para abortar tool.
-  Aguardando 5s...
+⠋ code-reviewer · analyzing src/harness/loop.ts     8s
+  ├ ✓ read 4 files
+  ├ ✓ ran tsc
+  └ … running biome
 ```
 
----
+Quando o subagent termina (`subagent:end`), as linhas viram um único bloco permanente compacto:
 
-## 4. Theme & capability matrix
+```
+▶ code-reviewer · 12 files reviewed · 2 issues       42s
+```
 
-### 4.1 Camadas de cor
+Detalhes ficam acessíveis via `agent --session <id> --subagent <name>` (CLI separada, fora da TUI).
 
-| Detected | Comportamento |
+### 4.3 Todo list (vivo, opcional)
+
+Aparece se houver TodoList ativa. Acima da status line.
+
+```
+Tasks
+  ✓ Resolve scope roots from repo root
+  ▶ Update bootstrap.ts callers
+  ○ Add regression test
+  ○ Run typecheck
+```
+
+Glyphs: `✓` done, `▶` running, `○` pending, `✗` failed (fallback ASCII: `[x]`/`[*]`/`[ ]`/`[!]`).
+
+Mais de 8 todos: trunca pra "▶ running + próximas 2 pending + ✗ failed", com `(+12 more)` discreto.
+
+### 4.4 Status line (sempre presente, 1 linha)
+
+> **Supersedido pela §4.10.6 (footer dinâmico).** A "status line acima do input" foi reposicionada como **footer** abaixo do input box, com layout de duas colunas (hint + config). Conteúdo é equivalente; posição e shape mudaram. Esta seção fica como referência do conteúdo (model, steps, cost, badges) — a posição canônica é §4.10.6.
+
+```
+[autonomous] · forja · sonnet-4.6 · 12/50 · $0.04 · mem 4u · bg 1
+```
+
+Componentes (esquerda → direita):
+- `[profile]` (vazio se default)
+- nome do projeto (basename do repo root)
+- modelo
+- steps (`12/50`, `⚠ 40/50` se ≥ 80%, `‼ 48/50` se ≥ 90%)
+- cost (`$0.04`, amarelo a 80% do max, vermelho a 90%)
+- memory badge (`mem 4u 2p` — 4 user, 2 project carregadas)
+- background tray (`bg 1` se houver, somem se zero)
+- MCP tray (`mcp 2` se conectados)
+
+Em < 100 cols: abreviações (`steps` → omite label, mostra `12/50`; `cost` → `$0.04`; etc.).
+
+Substituições temporárias:
+- Em estado não-idle (`waiting`, `interrupting`, `compacting`): `LoopStatusLine` substitui completamente — `⠋ waiting for user response (Ctrl+C cancel)`.
+- Em interrupt confirm: `interrupt? press Esc again to cancel · Enter to continue`.
+
+### 4.5 Input box (sempre presente, 1-3 linhas)
+
+```
+> _
+```
+
+Multi-linha: shift+Enter ou auto-grow ao colar texto com `\n`. Limite de display: 3 linhas; conteúdo maior abre modo "expanded" (ver §5.1).
+
+Affordance ao iniciar:
+```
+> Ask anything. /help for commands. Ctrl+C to cancel, Esc Esc to interrupt.
+```
+(dim, some no primeiro keystroke).
+
+### 4.6 Permission modal
+
+> **Supersedido por §4.10.13 (permission modal canônico).** Esta seção descreve o esboço inicial (2 ações em linha horizontal); a forma canônica usa título estruturado, preview tool-aware (diff/comando), lista numerada de 3 opções e hint footer interno. Mantida aqui como referência de transição.
+
+Substitui o input box. Status line permanece.
+
+```
+─────────────────────────────────────────
+  bash · rm -rf ./build
+  cwd: /home/lex/forja
+
+  [a] accept   [r] reject   [e] edit   [w] why?
+─────────────────────────────────────────
+```
+
+Com risk explanation (`w`):
+```
+─────────────────────────────────────────
+  bash · rm -rf ./build
+  cwd: /home/lex/forja
+
+  ⚠ destructive write outside known build artifacts
+    matched policy rule: bash.rm.rf
+
+  [a] accept   [r] reject   [e] edit
+─────────────────────────────────────────
+```
+
+### 4.7 Trust prompt
+
+```
+─────────────────────────────────────────
+  ⚠ unknown directory
+
+  /home/lex/some-repo
+  AGENTS.md present (not yet trusted)
+
+  [t] trust this dir   [s] trust + remember
+  [n] no, read-only this session
+─────────────────────────────────────────
+```
+
+### 4.8 Memory write prompt
+
+```
+─────────────────────────────────────────
+  memory write proposed
+
+  scope: project
+  name: build-command
+  body: "Use 'bun run build' (not npm). Bun is the only supported runtime."
+
+  [a] accept   [e] edit   [s] skip
+─────────────────────────────────────────
+```
+
+### 4.9 Plan review (profile orchestrated)
+
+```
+─────────────────────────────────────────
+  plan review · 3 steps
+
+  1. read src/harness/loop.ts
+  2. edit src/harness/loop.ts (add interrupt handler)
+  3. run bun test tests/harness/loop.test.ts
+
+  estimated: 4 tool calls · ~$0.02
+
+  [a] approve   [e] edit   [r] reject
+─────────────────────────────────────────
+```
+
+### 4.10 Layout-alvo (engenharia)
+
+> **Esta seção é a referência canônica do layout.** §4.1 (tool card) e §4.4 (status line position) foram supersedidas; demais componentes (modal, todo list, subagent row) compõem com este alvo sem conflito.
+
+#### 4.10.1 Insight central
+
+O layout não é "bonito" — é **observabilidade vestida de chat**. Cada elemento responde uma pergunta operacional concreta sem parecer dashboard:
+
+| Pergunta | Resposta na UI |
 |---|---|
-| Truecolor (24-bit) | Paleta cheia, gradientes |
-| 256 colors | Paleta curada (16 base + 32 acentos) |
-| 16 colors | Apenas básicas (red/green/yellow/blue/magenta/cyan + bright) |
-| `NO_COLOR=1` | Zero cor; ASCII puro com prefixos `[!]`, `[?]`, `[OK]`, `[FAIL]` |
-| Pipe (não-TTY) | Idem NO_COLOR; output em formato compatível com grep/awk |
+| Travou? | Counter live no operation chip (`12s · ↑ 234 tokens`) |
+| Quanto tempo passou? | Chip final no scrollback (`Generated in 8.2s`) vira landmark |
+| Em que tool? | Verbo + sub-content (`Reading file… └─ src/foo.ts`) |
+| Que config está em vigor? | Footer direito (`• sonnet-4.6 · 3/50 · $0.012`) |
+| O que posso fazer agora? | Footer esquerdo, contextual (`esc to interrupt` só quando interruptable) |
+| Onde foi que perguntei X? | User echo em barra invertida full-width — divisor visual no scrollback |
 
-Detecção via `supports-color`. Override via env (`FORCE_COLOR=0|1|2|3`, `NO_COLOR`).
+Forja já tem todos os dados (sessão, custo, plan, tools, durations); a tarefa do layout-alvo é **apresentá-los na forma que o engenheiro absorve passivamente**.
 
-### 4.2 Paleta canônica
+#### 4.10.2 Hierarquia visual
+
+- **Dim baseline.** ~80% do texto renderizado é dim grayscale. Bold/cor entram só onde precisam: títulos, chip ativo (cor quente), erro (cor de erro). Sem o baseline dim, nada se destaca.
+- **Cor reservada.** `success`, `warn`, `error` da paleta (§6.1) marcam estado terminal de operação. Nunca decoração. Chip ativo usa `warn` (cor quente) durante execução; chip final volta para dim.
+- **Âncora inferior estável.** Quatro elementos sempre na mesma posição, na mesma ordem: régua → input (cursor inline) → régua → footer. Live region cresce **acima**, nunca disturba o anchor.
+- **Scrollback como navegação.** User echo em barra invertida cumpre papel de heading sem inventar headings. Rolando, as barras orientam ("onde foi que perguntei X?").
+
+#### 4.10.3 Vocabulário técnico — operações
+
+Verbo no presente contínuo enquanto ativo. Particípio passado quando completo.
+
+| Operação | Ativo | Finalizado |
+|---|---|---|
+| Provider call (texto streaming) | `Generating… (8s · ↑ 234 tokens)` | `Generated 234 tokens in 8.2s` |
+| Extended thinking | `Thinking… (3s)` | `Thought for 3.1s` |
+| Tool execution | per-tool verb (§4.10.4) | per-tool verb (§4.10.4) |
+| Compaction | `Compacting context… (12s)` | `Compacted 12 messages in 850ms` |
+| Checkpoint | `Checkpointing… (50ms)` | `Checkpointed at step 3 (a1b2c3d)` |
+| Subagent run | `Delegating to <name>… (Xs)` | `Delegated to <name> (Ys · N steps)` |
+| Permission ask | `Awaiting approval…` | `Approved` / `Denied` |
+| Step boundary | (não é chip — é separador, §4.10.8) | `── step 3/50 ── $0.012 ──` |
+
+Princípio: **verbo é a ação real**, não rótulo genérico.
+
+#### 4.10.4 Vocabulário técnico — per-tool
+
+| Tool | Ativo | Finalizado | Sub-content |
+|---|---|---|---|
+| `read_file` | `Reading file…` | `Read 1 file (2.4kB)` | `└─ src/foo.ts` |
+| `write_file` | `Writing file…` | `Wrote src/foo.ts (+42 lines)` | `└─ src/foo.ts` |
+| `edit_file` | `Editing file…` | `Edited src/foo.ts (+3 −1)` | `└─ src/foo.ts:42` |
+| `bash` | `Executing…` | `Exited 0 in 1.2s` | `└─ rg "pattern" src/` |
+| `bash_background` | `Spawning…` | `Spawned pid 12345` | `└─ npm run dev` |
+| `bash_output` | `Polling pid 12345…` | `Read 234 bytes` | `└─ pid 12345` |
+| `bash_kill` | `Killing pid 12345…` | `Killed pid 12345 (SIGTERM)` | `└─ pid 12345` |
+| `glob` | `Globbing…` | `Matched 14 files` | `└─ src/**/*.ts` |
+| `grep` | `Grepping…` | `Matched 3 in 14 files` | `└─ "createBus" src/tui` |
+| `task` (subagent) | `Delegating to <name>…` | `Delegated to <name> (Xs · N steps)` | `└─ goal: review repl.ts` |
+| `memory_list` | `Listing memory…` | `Listed 7 entries` | `└─ scope: project_local` |
+| `memory_read` | `Reading memory…` | `Read user/<name>.md` | `└─ user/user_role.md` |
+| `memory_search` | `Searching memory…` | `Matched 2 entries` | `└─ "deployment"` |
+| `todo_*` | `Updating todos…` | `Updated 3 items` | `└─ +1 done, −1 pending` |
+
+Princípio: **subject = o argumento que diz o quê**. Path, command, query, pid. Nunca o JSON inteiro. JSON cru fica atrás de `(ctrl+o to expand)` (§4.10.5).
+
+Adicionar tool nova exige escolher (verb-active, verb-final, subject-extractor) — registrado em `src/tui/tool-vocab.ts` (criação documentada em backlog quando o slice landar). Sem entrada → fallback para `Calling <tool>… / Called <tool>` + JSON args truncado a 80 chars (intencionalmente feio para sinalizar "falta vocabulário").
+
+#### 4.10.5 Operation chip (lifecycle)
 
 ```ts
-// theme/colors.ts
-export const colors = {
-  // Status
-  pending:   { trueColor: '#888', ansi256: 245, ansi16: 'gray' },
-  running:   { trueColor: '#5fafd7', ansi256: 74, ansi16: 'cyan' },
-  done:      { trueColor: '#5faf5f', ansi256: 70, ansi16: 'green' },
-  error:     { trueColor: '#d75f5f', ansi256: 167, ansi16: 'red' },
-  denied:    { trueColor: '#d7af5f', ansi256: 179, ansi16: 'yellow' },
-
-  // Profile
-  autonomous:   { trueColor: '#5fafff', ansi256: 75, ansi16: 'blue' },
-  orchestrated: { trueColor: '#5faf5f', ansi256: 70, ansi16: 'green' },
-  hybrid:       { trueColor: '#af5fd7', ansi256: 134, ansi16: 'magenta' },
-
-  // Modal variants
-  info: ..., warn: ..., danger: ..., success: ...,
-
-  // Diff
-  diffAdd: ..., diffRemove: ..., diffContext: ...,
-};
+interface OperationChip {
+  id: string                      // toolUseId, messageId, etc.
+  state: 'active' | 'final'
+  verb: string                    // 'Reading file', 'Generating', ...
+  durationMs: number              // live enquanto active, fixo quando final
+  tokens?: number                 // ↑ output tokens (provider call)
+  subject?: string                // sub-content em uma linha
+  expandable?: boolean            // mostra '(ctrl+o to expand)' se true
+  status?: 'done' | 'error' | 'denied'  // só em state=final
+}
 ```
 
-Aplicação via `useTheme()` hook que consulta capabilities + retorna função `color('done')`.
-
-### 4.3 Ícones
-
-```ts
-// theme/icons.ts
-export const icons = {
-  pending:   { unicode: '○', ascii: '[ ]' },
-  running:   { unicode: '⏳', ascii: '[~]' },
-  done:      { unicode: '✓', ascii: '[x]' },
-  error:     { unicode: '✗', ascii: '[!]' },
-  denied:    { unicode: '⊘', ascii: '[/]' },
-  spinner:   { unicode: ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'], ascii: ['|','/','-','\\'] },
-  bullet:    { unicode: '·', ascii: '*' },
-  arrow:     { unicode: '▶', ascii: '>' },
-  // ...
-};
+**Ativo (live, na live region):**
+```
+* Reading file… (1.2s)
+└─ src/foo.ts
 ```
 
-### 4.4 Detecção e fallback
-
-```ts
-const caps = useCapabilities(); // { color, unicode, hyperlinks, width, isTTY, terminal }
-caps.color === 0 ? plainText() : caps.color === 1 ? color16() : truecolor();
-caps.unicode ? icons.done.unicode : icons.done.ascii;
+**Ativo (com tokens, ex: provider call):**
+```
+* Generating… (8s · ↑ 234 tokens)
 ```
 
-Centralizado. Componentes não detectam por conta própria.
+**Final (scrollback, dim):**
+```
+* Read 1 file (2.4kB)
+└─ src/foo.ts
+```
+
+**Final (error, cor de erro no glyph apenas):**
+```
+* Exited 1 in 2.1s
+└─ rg --invalid-flag
+```
+
+**Final (denied, cor warn no glyph):**
+```
+* Denied
+└─ bash command 'rm -rf /' matches deny rule
+```
+
+**Glyph** `*` em todos os estados (Unicode prefere `▸` ativo, `·` final; ASCII fallback `*`). Cor: ativo = `warn`; final done = dim; final error = `error`; final denied = `warn`.
+
+Counter format: `(Xs · ↑ N tokens)` quando há geração; `(Xs)` quando não há (thinking, tool sem stream). Símbolo `↑` literal pra "saída acumulada" — engenheiro reconhece como uplink/output direction.
+
+Expansion (`ctrl+o`) abre um painel scrollable com o JSON args completo + output bruto. Painel é **modal** (§4.6 shape, conteúdo livre); fecha com Esc. Não implementado em M1; o hint `(ctrl+o to expand)` aparece mas tecla não responde até o slice de expansion landar.
+
+#### 4.10.6 Footer (status surface dinâmico)
+
+Sempre 1 linha, dim, **abaixo do input box** (com régua entre eles).
+
+| Estado | Esquerda | Direita |
+|---|---|---|
+| Idle | `? for help` | `• <model> · <steps>/<max> · $<cost>` |
+| Running | `? for help · esc to interrupt` | `• <model> · <steps>/<max> · $<cost>` |
+| Soft-aborted (ainda processando) | `? for help · esc again to force` | (mesmo) |
+| Plan mode | `? for help` | `• <model> · plan · <steps>/<max> · $<cost>` |
+| Modal up | (suprimido — modal cobre footer) | (suprimido) |
+
+Esquerda = **"o que posso fazer agora?"**. Hint de help + interrupt **só quando interruptable**.
+
+Direita = **"o que está em vigor?"**. Model · [plan ·] steps/max · cost. Slash commands implícitos: `/model`, `/plan`, `/budget` mudam cada um. Memory badge / bg / mcp (§4.4 conteúdo original) entram conforme presentes; em < 100 cols, somem por ordem de prioridade: mcp → bg → mem → cost label.
+
+Princípio: footer é **status surface, não help surface**. Nada de listar atalhos ou opções de menu. Help fica atrás de `?`.
+
+#### 4.10.7 Sub-content connector
+
+Subordinação visual com `└─ ` (ASCII fallback `\- `). Sempre **uma linha**. Se não cabe, vira tool output e vai pra expansion (§4.10.5).
+
+Casos:
+- Path: `└─ src/foo.ts:42`
+- Command: `└─ rg "pattern" src/`
+- Query: `└─ "createBus" src/tui`
+- Pid: `└─ pid 12345`
+- Subagent goal: `└─ goal: review repl.ts`
+- Razão (denied/error): `└─ denied: bash command 'rm -rf /' matches deny rule`
+
+Multi-tool ops (ex: `glob` matched 14 files) cita o **padrão**, não a lista — lista vai pra expansion. Sub-content é dim em todos os estados.
+
+#### 4.10.8 User echo (inverse bar)
+
+```
+> a tui já funciona?
+```
+
+Renderizado com SGR `7` (reverse) full-width — branco em fundo escuro, ocupando toda a coluna do terminal. Vira **divisor estrutural** no scrollback: rolando, as barras servem de heading natural para localizar turnos.
+
+Régua dim acima e abaixo do echo é **opcional** (decisão final na implementação após smoke test visual). Default: sem régua adicional, deixa a inversa carregar o destaque sozinha.
+
+ASCII fallback: SGR `7` é universal em qualquer terminal — sem fallback necessário. Em cor desabilitada (`NO_COLOR`), reverse continua funcionando (não é cor, é atributo).
+
+#### 4.10.9 Welcome banner (scrollback)
+
+Emitido **uma vez** no boot do REPL, como `PermanentItem` kind `'session-banner'`. Quatro linhas, todas respondem uma pergunta concreta:
+
+```
+forja v0.0.0
+anthropic/claude-sonnet-4-6 · 200k ctx · max 4096 out
+/run/media/lex/.../forja
+policy: project (5 rules) · subagents: 2 · checkpoints: enabled · memory: 14 entries
+```
+
+| Linha | Pergunta |
+|---|---|
+| 1 | Qual versão. |
+| 2 | Qual modelo, com limites concretos (context window, max output). |
+| 3 | Em qual cwd. |
+| 4 | Ambiente: quantas regras, quantos subagents, checkpoints/memory ligados. |
+
+Vai pro scrollback — uma vez impresso, scrolla naturalmente conforme a conversa cresce. **Sem header fixo.** Sem logo. Sem mascot. (Se um dia identidade visual virar pauta, ASCII art opcional via flag — não default.)
+
+Em modo `--json`, o banner é emitido como `{type: 'session:banner', ...}` no NDJSON em vez de linhas formatadas.
+
+#### 4.10.10 Step separator
+
+```
+── step 3/50 ── $0.012 ──
+```
+
+Régua dim com state inline. Aparece quando um turno fecha e outro vai abrir (substitui o `session-footer` em modo REPL). Largura preenche a coluna do terminal com `─`.
+
+Em modo one-shot, o separator não aparece — o `session-footer` continua sendo o único marcador final (compatibilidade preservada).
+
+#### 4.10.11 Anti-vocabulário
+
+Banidos do vocabulário operacional:
+
+- `Working`, `Loading`, `Processing`, `Please wait` — vagos.
+- `Handling`, `Managing`, `Orchestrating` — abstratos.
+- `Just a moment…`, `Working on it…` — cortesia, desperdício de coluna.
+- `Ready!`, `Done!`, `Success!` — redundantes; ausência de chip ativo já comunica.
+- Emoji decorativo (✓ ✗ ⚠️ 🔧 💭 🚀) — depende de fonte/terminal, conflita com paleta dim. Glyphs canônicos da §6.2 são exceção (são informativos, não decorativos).
+- Metáforas culinárias/artesanais ("Baking", "Cooking", "Brewing", "Forging") — engenheiro lê verbo literal melhor que metáfora.
+- Mascote, ícones de marca, logo — fora de escopo do core; flag opcional se virar pauta.
+
+#### 4.10.12 Layout completo (referência ASCII)
+
+```
+┌─ scrollback (permanent items, dim baseline) ───────────────────────┐
+│ forja v0.0.0                                                        │
+│ anthropic/claude-sonnet-4-6 · 200k ctx · max 4096 out               │
+│ /run/media/lex/.../forja                                            │
+│ policy: project (5 rules) · subagents: 2 · checkpoints: enabled     │
+│                                                                     │
+│ > a tui já funciona?                            ← inverse bar       │
+│ * Reading file (2.4kB)                          ← chip final, dim   │
+│ └─ src/foo.ts                                                       │
+│ * Generated 234 tokens in 8.2s                                      │
+│ Sim, em teoria funciona...                      ← assistant text    │
+│ ── step 3/50 ── $0.012 ──                       ← step separator    │
+└─────────────────────────────────────────────────────────────────────┘
+─────────────────────────────────────────────────────────────────────  ← régua
+> ▌                                                                   ← input + cursor inline
+─────────────────────────────────────────────────────────────────────  ← régua
+? for help · esc to interrupt        • sonnet-4.6 · 3/50 · $0.012     ← footer
+```
+
+Live region (entre as réguas e a inferior):
+- Operation chips ativos (com counter live).
+- Todo list (§4.3) acima dos chips, se houver.
+- Modal (§4.6+) substitui o input box quando aberto; footer suprimido.
+
+#### 4.10.13 Permission modal canônico
+
+Substitui §4.6. Layout estruturado em 4 blocos (título, preview tool-aware, pergunta+opções, hint footer interno) com lista numerada vertical e cursor `>`.
+
+**Visual de referência (`edit_file` em `.gitignore`):**
+
+```
+─────────────────────────────────────────────────────────────────
+  Edit file
+  .gitignore
+─────────────────────────────────────────────────────────────────
+  25
+  26  # Bun
+  27  .bun/
+  28  +
+  29  +foobar
+─────────────────────────────────────────────────────────────────
+  Do you want to make this edit to .gitignore?
+    1. Yes
+    2. Yes, allow all edit_file during this session (shift+tab)
+  > 3. No
+  Esc to cancel
+```
+
+`>` marca a opção selecionada (default = `3. No`). Apertar `1`/`2`/`3` ativa direto sem navegar.
+
+**Visual `bash` destrutivo:**
+
+```
+─────────────────────────────────────────────────────────────────
+  Run command
+  rm -rf ./build
+─────────────────────────────────────────────────────────────────
+  $ rm -rf ./build
+  cwd: /run/media/lex/.../forja
+  matched policy rule: bash.rm.rf (deny by default)
+─────────────────────────────────────────────────────────────────
+  Do you want to run this command?
+    1. Yes
+    2. Yes, allow all bash during this session (shift+tab)
+  > 3. No
+  Esc to cancel
+```
+
+**Bloco 1 — Título.** Verbo bold + subject dim. Verbos canônicos por tool:
+- `read_file` → não pede permissão (read-only sempre passa).
+- `write_file` → `Write file` / `<path>`.
+- `edit_file` → `Edit file` / `<path>`.
+- `bash` → `Run command` / `<command, truncado>`.
+- `bash_background` → `Spawn process` / `<command, truncado>`.
+- `bash_kill` → `Kill process` / `pid <N>`.
+- `task` (subagent) → `Spawn subagent` / `<name>`.
+- `memory_write` → `Write memory` / `<scope>/<name>`.
+- Sem entrada → `Use <toolName>` / args truncados a 80 chars.
+
+**Bloco 2 — Preview tool-aware.** Cada tool registra `previewForApproval(args, ctx): string[]` no `ToolDef` (ver `CONTRACTS.md §2.6` — extensão a ser propagada). Conteúdo:
+
+| Tool | Preview |
+|---|---|
+| `edit_file` | Diff com line numbers, contexto ±3 linhas em torno das mudanças, `+`/`-` prefix |
+| `write_file` | Primeiras N linhas do conteúdo (cap em 20), com `(file is N lines, showing first 20)` se maior |
+| `bash` / `bash_background` | `$ <command>` + `cwd: <path>` + (opcional) `matched policy rule: <id>` se vier de `confirm` decision |
+| `bash_kill` | `pid <N>` + `command: <cmdline>` + `started: <relative time>` |
+| `task` | `goal: <text>` + `whitelist: <tools>` + `budget: <maxSteps>` |
+| `memory_write` | `scope: <s>` + `name: <n>` + corpo bruto (cap em 10 linhas) |
+
+Sem `previewForApproval` registrado → fallback para `args: <JSON.stringify(args, null, 2)>` truncado a 20 linhas (intencionalmente cru pra sinalizar "tool não declarou preview adequado"). Tools que invocam recursos externos (`bash`, `task`) **devem** registrar — falha de preview = falha de spec.
+
+**Bloco 3 — Pergunta + opções.** Pergunta em linguagem natural derivada do verbo (`Do you want to <verb-imperative> <subject>?`). Opções (3 fixas para permission, conforme D64):
+
+```
+  1. Yes
+  2. Yes, allow all <toolName> during this session (shift+tab)
+> 3. No
+```
+
+Atalhos:
+- `1`/`2`/`3` → ativam direto.
+- `↑`/`↓` ou `Tab`/`Shift+Tab` → navegam.
+- `Enter` → confirma a selecionada.
+- `Shift+Tab` → atalho secundário pra opção 2 (session-allow), exposto no label entre parênteses.
+- `Esc` → cancela (semântica distinta de `No`; ver D5 / regra 9 da §5.5).
+
+**Bloco 4 — Hint footer interno.** Linha dim com `Esc to cancel`. Em M1 só esse hint. Quando `Tab to amend` (v2) landar, vira `Esc to cancel · Tab to amend`. Hints são parte do `ConfirmState.hints` (§5.5) — caller controla.
+
+**Semântica das opções (`value` no `permission:answer`):**
+
+| Opção | `value` | Efeito |
+|---|---|---|
+| 1. Yes | `'yes'` | Aprova esta invocação. Sem efeito persistente. |
+| 2. Yes, allow all | `'session-allow'` | Aprova esta invocação **e** grava regra na session-layer da policy (`tools.<toolName>: allow`). Próximas invocações do mesmo tool nesta sessão não geram modal. Sessão fecha → regra evapora. |
+| 3. No | `'no'` | Rejeita explicitamente. Caller (harness) trata como `denied` no `tool_finished` (§HarnessEvent). |
+| Esc | `'cancel'` | Desistência. Audit-distinct de `'no'`; caller pode tratar diferente (ex: replay-friendly logs marcam cancel vs reject). Para o tool, idêntico a `'no'`. |
+
+**Decisões registradas:**
+
+- **D63 — Preview tool-aware obrigatório para tools com side-effect.** `edit_file`/`write_file`/`bash`/`bash_background`/`bash_kill`/`task`/`memory_write` precisam de `previewForApproval` registrado. Read-only tools nem chegam ao modal. Fallback de `JSON.stringify` é deliberadamente feio pra forçar o registro adequado em code review.
+- **D64 — Session-bypass scoped por tool name.** Opção 2 escreve `tools.<toolName>: { default: 'allow' }` na session-layer. Não é "approve everything" — é "approve all calls do mesmo tool". Engine respeita a hierarquia normal (enterprise/user/project ainda podem deny por glob/categoria). Sessão-wide escopo: morre quando a sessão fecha; não persiste para resume.
+- **D65 — Default-NO via `selectedIndex = options.length - 1`.** Generaliza D5 do esquema yes/no para listas de N opções. Convenção: a última opção é sempre a mais conservadora. Caller que precisar de outro default deve documentar a justificativa no BACKLOG (e a code review checa). Permission, trust, memory-write seguem; plan-review tem 3 opções (approve/edit/reject) onde reject = última.
+
+**O que ainda não está aqui (deferred):**
+
+- **`Tab to amend`** — feature v2. Edit-then-confirm exige input editor aninhado dentro do modal (focus stack 3-deep, persistência da edição, validação por tool). M1 não mostra a hint; quando landar, o producer adiciona `'Tab to amend'` em `hints` e o focus handler intercepta `Tab` antes da navegação.
+- **`Why?` explanation** — antiga `[w]` da §4.6. Preview tool-aware já carrega `matched policy rule: ...` quando o tool veio de uma `confirm` decision do engine; explicação adicional fica como expansion futura via `(ctrl+i for risk details)` ou similar.
+- **Outros flavors visuais** (trust, memory-write, plan-review, critique). Compartilham o `ConfirmState` shape de §5.5; layout específico de cada um lands no slice que conectar o producer correspondente.
 
 ---
 
 ## 5. Padrões de interação
 
-### 5.1 Modal queue
+### 5.1 Input handling
 
-Quando estado é `awaiting_user`, exatamente **1 modal** ativo (invariante de §8 STATE_MACHINE.md). Modal próximo só aparece após anterior resolver.
+- `process.stdin.setRawMode(true)` no boot (TTY only). Restore em qualquer exit path (incl. Ctrl+C, exceptions).
+- Parser de escape sequences manual: setas, Home/End, Delete, Ctrl+A/E/U/W/K, Alt+B/F (word jumps), Ctrl+Backspace, Enter, Shift+Enter.
+- **Bracketed paste** (`\x1b[200~...\x1b[201~`): habilitado no boot, processado em batch (sem disparar redraw por char).
+- Histórico de input: persistido em `<repo>/.agent/state/input-history.txt` (últimas 1000 entradas), navegável com seta-pra-cima/baixo. Ctrl+R = reverse search.
+- Expanded input mode: paste com >3 linhas abre buffer de N linhas no lugar do input, com `[Esc] cancel · [Ctrl+D] submit · [Ctrl+E] open $EDITOR`.
 
-Implementação:
+### 5.2 Spinner
+
 ```ts
-const useModalQueue = (): { current: PendingDecision | null; resolve: (...) => void };
+const FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']
+let i = 0
+setInterval(() => { i = (i+1) % FRAMES.length; bus.emit({ type:'tick', ts:Date.now() }) }, 80)
 ```
 
-Render condicional: `{current ? <ModalFor(current) /> : <InputPane />}`.
+ASCII fallback: `['|','/','-','\\']` em 100ms.
 
-### 5.2 Focus management
+Renderer reage a `tick` igual a qualquer evento (redraw da região viva).
 
-Em modal: foco no modal, input pane congela (mostra `_` mas não capturando tecla).
-Sem modal: foco no input pane.
+### 5.3 Slash commands
 
-Ink `useFocus` hook + `<FocusManager>` wrapper.
+- `/` no início do input ativa autocomplete inline (lista a < 8 itens em popover acima do input, dentro da região viva).
+- Tab completa o item destacado. Setas navegam. Esc fecha.
+- Comandos descobertos via registry (mesmo registry do `--help`).
 
-### 5.3 Keybindings (cheat sheet)
+### 5.4 Keybindings (cheat sheet)
 
-| Tecla | Comportamento |
+| Tecla | Estado | Ação |
+|---|---|---|
+| Enter | input | submit |
+| Shift+Enter | input | nova linha |
+| Ctrl+C | running | cancela step atual (graceful) |
+| Ctrl+C (2x) | running | hard kill |
+| Esc | running | request soft interrupt (LLM termina passo, depois para) |
+| Esc Esc | running | hard interrupt (cancela tool em curso) |
+| Ctrl+L | qualquer | clear screen (mantém histórico no scrollback) |
+| Ctrl+R | input | reverse search no histórico |
+| Ctrl+D | input vazio | exit |
+| Tab | input com `/` | autocomplete |
+| Ctrl+Z | qualquer | suspend (SIGTSTP), retorna com `fg` |
+| ↑/↓ | input | navegar histórico de inputs |
+
+### 5.5 Modal pattern (canônico)
+
+Modal **não é popup**. É:
+
+> estado + handler no topo da focus stack + promise.
+
+Sem framework. Sem reconciler. Sem componentes reutilizáveis.
+
+#### Estado (generalizado para N opções)
+
+```ts
+interface ConfirmOption {
+  // Hotkey de ativação. Convencionalmente '1','2','3' para opções
+  // numeradas; pode ser letra ('a','r','e') para mnemônicos.
+  key: string
+  label: string                // 'Yes', 'Yes, allow all edits during this session', 'No'
+  // Semântica processada pelo caller — `value` viaja no
+  // permission:answer (ou flavor equivalente). Permission-flavor
+  // usa 'yes' | 'session-allow' | 'no'; outros flavors definem
+  // seu próprio union.
+  value: string
+  // Atalho secundário opcional (ex: 'shift+tab' para a opção
+  // session-allow no permission modal). Mostrado entre parênteses
+  // após o label; não bloqueia a hotkey numérica.
+  shortcut?: string
+}
+
+interface ConfirmState {
+  promptId: string
+  flavor: 'permission' | 'trust' | 'memory-write' | 'plan-review' | 'critique'
+  // Bloco de título: verbo bold + subject dim na linha de baixo.
+  // Para permission: ('Edit file', '.gitignore'); para trust:
+  // ('Trust directory', '/path/to/repo'). Subject é opcional —
+  // ausente quando o modal não tem alvo único.
+  title: string
+  subject?: string
+  // Conteúdo tool-aware: diff (edit), comando (bash), corpo (memory),
+  // lista de steps (plan), etc. Lines já formatadas (cores, line
+  // numbers). O modal renderiza-as entre réguas; sem preview, omite
+  // o bloco inteiro (sem régua extra).
+  preview: string[]
+  // Pergunta em linguagem natural. Se ausente, o modal pula a linha
+  // antes da lista — útil quando o título já fechou a pergunta.
+  question?: string
+  options: ConfirmOption[]
+  // Default = última opção (convenção: última = NO/cancel/skip).
+  // Caller que precisar de outro default seta explicitamente —
+  // mas D5/D65 mandam usar `options.length - 1` salvo justificativa.
+  selectedIndex: number
+  // Hints renderizados no rodapé do modal (separados por ' · ').
+  // Sempre inclui 'Esc to cancel'; producers adicionam 'Tab to amend'
+  // (v2), 'shift+tab to bypass' etc. Ordem importa: esquerda → direita.
+  hints: string[]
+  timeoutMs?: number
+}
+```
+
+#### Render (substitui o input dentro da região viva)
+
+```ts
+function renderConfirm(c: ConfirmState, caps: Capabilities): string[] {
+  const rule = caps.unicode ? '─'.repeat(caps.cols) : '-'.repeat(caps.cols)
+  const cursor = caps.unicode ? '>' : '>'  // mesmo glyph; placeholder
+  return [
+    rule,
+    paint(caps, 'bold', `  ${c.title}`),
+    ...(c.subject ? [paint(caps, 'dim', `  ${c.subject}`)] : []),
+    rule,
+    ...c.preview.map(l => `  ${l}`),
+    rule,
+    ...(c.question ? [`  ${c.question}`] : []),
+    ...c.options.map((opt, i) => {
+      const marker = i === c.selectedIndex ? cursor : ' '
+      const shortcut = opt.shortcut ? paint(caps, 'dim', ` (${opt.shortcut})`) : ''
+      return `${marker} ${opt.key}. ${opt.label}${shortcut}`
+    }),
+    paint(caps, 'dim', `  ${c.hints.join(' · ')}`),
+  ]
+}
+```
+
+Modais substituem **o input box e o footer global** (footer global é suprimido enquanto modal ativo — modal traz seu próprio footer interno via `c.hints`). Histórico (scrollback) permanece visível acima. `composeLive(state)` chama `renderConfirm()` em vez de `renderInput()` quando `state.modal !== null`. Não há "overlay" sobre o histórico — região viva é dona dela mesma.
+
+#### Focus handler (push no topo da stack)
+
+```ts
+pushFocus(key => {
+  if (!state.modal) return false
+  const m = state.modal
+  // Hotkey numérica/letra ativa diretamente.
+  const hit = m.options.findIndex(o => keyMatches(key, o.key))
+  if (hit >= 0) {
+    resolveModal(m.options[hit].value)
+    return true
+  }
+  // Atalho secundário (ex: shift+tab → session-allow).
+  const sc = m.options.findIndex(o => o.shortcut && keyMatches(key, o.shortcut))
+  if (sc >= 0) {
+    resolveModal(m.options[sc].value)
+    return true
+  }
+  if (key === 'up' || key === 'shift+tab') {
+    m.selectedIndex = Math.max(0, m.selectedIndex - 1)
+    bus.emit({type: 'modal:select', promptId: m.promptId, selectedIndex: m.selectedIndex})
+    return true
+  }
+  if (key === 'down' || key === 'tab') {
+    m.selectedIndex = Math.min(m.options.length - 1, m.selectedIndex + 1)
+    bus.emit({type: 'modal:select', promptId: m.promptId, selectedIndex: m.selectedIndex})
+    return true
+  }
+  if (key === 'enter') {
+    resolveModal(m.options[m.selectedIndex].value)
+    return true
+  }
+  if (key === 'escape') {
+    resolveModal('cancel')  // distinto de 'no' — cancel é desistência
+    return true
+  }
+  return true  // bloqueia o resto enquanto modal ativo
+})
+```
+
+#### API async (permission flavor)
+
+```ts
+function askPermission(args: PermissionAskArgs, opts?: ConfirmAskOptions): Promise<PermissionAnswer> {
+  return enqueueConfirm({
+    flavor: 'permission',
+    title: titleFor(args.toolName),         // 'Edit file', 'Run command', ...
+    subject: subjectFor(args),              // '.gitignore', 'rm -rf ./build', ...
+    preview: args.preview ?? [],            // tool registra via previewForApproval
+    question: questionFor(args.toolName, args),
+    options: [
+      { key: '1', label: 'Yes',                                         value: 'yes' },
+      { key: '2', label: `Yes, allow all ${args.toolName} during this session`,
+        value: 'session-allow', shortcut: 'shift+tab' },
+      { key: '3', label: 'No',                                          value: 'no' },
+    ],
+    selectedIndex: 2,                       // D5/D65 — default = NO (última opção)
+    hints: ['Esc to cancel'],               // 'Tab to amend' adicionado quando v2 landar
+    ...(opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+  })
+}
+```
+
+Outros flavors (trust, memory-write, plan-review, critique) constroem suas próprias listas de opções — geralmente 2 (yes/no) ou 3 (approve/edit/reject). `selectedIndex` default fica na última (rejeição/cancelamento) por convenção D65, com exceção justificada documentada na BACKLOG.
+
+#### Regras (não-negociáveis)
+
+1. **Default = última opção** (`selectedIndex = options.length - 1`). Convenção: a última opção é a mais conservadora (No / Reject / Skip / Cancel). Enter sem navegar = escolha conservadora. Salva muita unha. (Ver D5 e D65.)
+2. **Cursor `>` à esquerda da opção selecionada** (ASCII universal). Sem cor sólida no item — manter dim baseline. Cor só na borda de status final (`success` após accept, `error` após reject), opcional.
+3. **Bloqueio total do input normal** enquanto modal ativo. O `return true` no fim do handler garante que tecla nenhuma vaza pra baixo na focus stack. Footer global da app (§4.10.6) é suprimido — o modal traz seu próprio rodapé via `hints`.
+4. **Largura full-cols** com `padEnd` em todas as linhas internas. Sem isso, ANSI errado quebra o redraw.
+5. **Sem reflow durante input.** Resize (SIGWINCH) durante modal: reposiciona, não reflua texto.
+6. **Timeout opcional, default rejeita.** `permission:ask` sem timeout (espera o user). `trust:ask` com 5min (rejeita pra read-only). Plan review sem timeout.
+7. **Re-render mínimo.** Mudança de `selectedIndex` redesenha só a região viva, nunca o histórico.
+8. **Hotkey numérica direta.** Apertar `1`/`2`/`3` ativa a opção correspondente sem navegar primeiro. Atalhos secundários (`shortcut`) idem.
+9. **Esc é cancel, não NO.** O handler resolve com `'cancel'` (distinto de `'no'`) quando Esc é pressionado. Audit/telemetria diferencia "usuário rejeitou explicitamente" de "usuário desistiu sem decidir". Caller que não diferencia trata ambos como rejeição.
+
+### 5.6 Modal queue
+
+Múltiplos prompts simultâneos: enfileiram. Renderer mostra um por vez, FIFO. Status line indica `(2 more)` quando há fila. Cada modal traz seu próprio `timeoutMs` (regra 6 acima).
+
+### 5.7 Focus stack
+
+```ts
+type FocusHandler = (key: Key) => boolean  // retorna true se consumiu
+
+const stack: FocusHandler[] = [inputHandler]
+function pushFocus(h: FocusHandler) { stack.push(h) }
+function popFocus() { stack.pop() }
+function dispatch(k: Key) { for (let i=stack.length-1; i>=0; i--) if (stack[i](k)) return }
+```
+
+~30 linhas resolvem. Ordem (top → bottom): modal ativo, input.
+
+---
+
+## 6. Cor, glyphs, tipografia
+
+### 6.1 Paleta (mínima)
+
+| Token | Uso | ANSI |
+|---|---|---|
+| `default` | texto normal | (sem escape) |
+| `dim` | meta, hints, separadores | `\x1b[2m` |
+| `bold` | ênfase, header de modal | `\x1b[1m` |
+| `error` | mensagens de erro, status falho | `\x1b[31m` |
+| `warn` | avisos, budget 80% | `\x1b[33m` |
+| `success` | apenas em pipeline badges (`✓`) | `\x1b[32m` |
+
+**Sem mais cores.** Sem azul, sem ciano, sem magenta, sem gradientes, sem 256-color, sem truecolor. Profile/model/etc. ficam em `default`. Se você precisa de cor pra distinguir, o layout falhou.
+
+`NO_COLOR` env var ou `--no-color`: desativa todos os escapes. `CLICOLOR_FORCE=1` ignora `!isTTY` e força cores (útil em log capture).
+
+### 6.2 Glyphs
+
+| Semântica | Unicode | ASCII fallback |
+|---|---|---|
+| done / pass | `✓` | `*` |
+| running / in-progress | `▶` | `>` |
+| error / fail | `✗` | `x` |
+| warn | `⚠` | `!` |
+| pending | `○` | `o` |
+| spinner | `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` | `|/-\` |
+| tree branch | `├` | `+` |
+| tree last | `└` | `\` |
+| tree vert | `│` | `|` |
+| separator | `·` | `-` |
+| ellipsis | `…` | `...` |
+
+Detecção: locale-aware (`LANG`/`LC_ALL` contém `UTF-8`) + check de width via `string-width` em sample. Decide uma vez no boot, cacheia.
+
+### 6.3 Espaçamento
+
+- Indent fixo: 2 espaços por nível.
+- Não há padding interno em modais (linhas vazias acima/abaixo do conteúdo, sem espaços laterais — borda fica em `─`).
+- Separador horizontal: `─` (40 chars) ou `-` (ASCII).
+- Linhas em branco entre blocos permanentes: 1 (apenas).
+
+### 6.4 Tipografia
+
+Terminal só tem uma fonte. Hierarquia vem de:
+- `bold` para títulos de modal e ênfase forte (1-2 palavras).
+- `dim` para meta (timestamps, paths secundários, hints).
+- `default` para tudo o mais.
+
+Combinações proibidas: `bold + dim` (briga visual), `bold + colorido` (exceto `error`).
+
+### 6.5 Densidade
+
+| Contexto | Política |
 |---|---|
-| `Ctrl+C` | Interrupt cascading (ver tabela abaixo por estado) |
-| `Ctrl+D` | Exit (em idle) ou cancela input (digitando) |
-| `Ctrl+L` | Limpa tela (não contexto) |
-| `Ctrl+Z` | `/undo` shortcut |
-| `Ctrl+R` | Search no histórico de prompts |
-| `Esc Esc` | Interrupt suave (ver tabela abaixo por estado) |
-| `Tab` | Completion (slash commands, paths) |
-| `↑/↓` | Histórico de prompts |
-| `Alt+Enter` | Newline em input |
-| `Enter` | Envia |
-| `?` em modal | Mostra help do modal |
-| `/` | Abre slash command picker |
-
-Conflitos com terminal/shell (ex: `Ctrl+S` em alguns terminais): documentar e oferecer alternativa.
-
-#### Esc Esc vs Ctrl+C por estado da loop
-
-Diferença chave: **Esc Esc é suave** (preserva texto visível, recupera input editável); **Ctrl+C é cancel total** (cascading, limpa tela).
-
-| Atalho | Estado loop | Ação |
-|---|---|---|
-| `Esc Esc` | streaming | interrompe stream; tokens parciais permanecem com label `[interrupted at token N]`; input editável com prompt original carregado |
-| `Esc Esc` | tool_exec | interrompe tool (graceful 5s + SIGKILL); tool_result sintético `{ status: 'interrupted' }`; volta a `idle` |
-| `Esc Esc` | compacting | **ignorado** (compaction é atomic, ≤ 3s; aguarda) |
-| `Esc Esc` | awaiting_user | fecha modal sem decidir; volta a `idle` |
-| `Ctrl+C` 1× | streaming | full interrupt cascading; tokens parciais somem da tela; cost dos parciais em `failed_attempts.cost_usd` |
-| `Ctrl+C` 1× | tool_exec | mostra prompt "tool em execução; press de novo pra forçar"; 5s timeout volta ao normal |
-| `Ctrl+C` 1× | running (sem tool) | cancela geração; volta a `idle` |
-| `Ctrl+C` 1× | idle | cancela input atual, mantém sessão |
-| `Ctrl+C` 2× rápido | qualquer | force SIGKILL imediato (skip 5s graceful) |
-| `Ctrl+C` 3× | qualquer | exit do agent (mata bg processes incluso) |
-
-Detalhe formal em [`ORCHESTRATION.md`](./ORCHESTRATION.md) §7.5.
-
-### 5.4 Slash command picker
-
-Ao digitar `/` em input pane, abre picker:
-
-```
-/ ▼
-  /help
-  /resume
-  /compact
-  /cost
-  /model
-  /clear
-  ...
-```
-
-Filtragem fuzzy (`Ctrl+R` style). Tab completa parcial. Esc fecha.
-
-Custom commands de `~/.config/agent/commands/` aparecem misturados, com indicador `[user]`.
-
-### 5.4.1 Render canônico de outputs de slash command
-
-Slash commands que retornam **dados estruturados** (listagens, agregados, queries) renderizam via [`<Table>`](#3.1) por default. Isso elimina drift entre comandos similares e dá ao usuário affordance consistente (cursor, filtro inline, paginação).
-
-| Slash command | Source | Render |
-|---|---|---|
-| `agent audit timeline <session>` | `audit_timeline` view (`AUDIT.md §2.1`) | `<Table>` colunas: ts, kind, payload (compact JSON) |
-| `agent audit failures` | `failure_events` | `<Table>` colunas: ts, code, classe, severity, recovery_action |
-| `agent audit prompts list` | `prompt_versions` | `<Table>` colunas: hash, name, created_at, sessions_using |
-| `agent audit mcp list` | `mcp_servers` | `<Table>` colunas: name, state, total_calls, last_error |
-| `agent audit mcp history <name>` | `mcp_manifest_history` | `<Table>` colunas: decided_at, decision, hash (curto), decided_by |
-| `agent code-index query <sql>` | ad-hoc (`CODE_INDEX.md §10.1`) | `<Table>` colunas: dinâmicas do `SELECT`; cap 1000 rows |
-| `agent --list-flags` | flag registry + `feature_flags_active` (`FEATURE_FLAGS.md §5.1`) | `<Table>` colunas: flag, kind, stage, default, active?, doc |
-| `/mcp list` | `mcp_servers` | `<Table>` colunas: name, state, tools, last_error |
-| `/memory list` | memory store | `<Table>` colunas: type, scope, name, description |
-| `/memory pending` | memory propostas | `<Table>` colunas: source, type, name, snippet |
-| `/cost` | aggregate de `tool_calls` + `messages` | `<Table>` colunas: dimension, tokens_in, tokens_out, usd; groupBy `provider` ou `tool_name` |
-| `/flags` (active) | `feature_flags_active` da sessão atual | `<Table>` colunas: flag, kind, value, set_by |
-| `/sessions list` | sessions + recap_cache | **`<SessionPicker>`** (não Table — caso especial com mini-recap inline; ver `§3.2`) |
-
-**Regras de aplicação:**
-
-- Output ≥ 3 colunas estruturadas → `<Table>`.
-- Output 1-2 colunas curtas → bullet list.
-- Output single-record com muitos campos → key-value style (`<ValidatorTrace>` style, `§3.2`).
-- Tree-shaped (parent/child) → `<DAGProgress>` ou indented list.
-
-**Em `--json` mode:** Table NDJSON `{ row: { col1, col2, ... } }` por linha. Compatível com `jq`, scripting. **Nunca** texto pretty-printed em `--json`.
-
-### 5.5 Scroll & history
-
-Terminal não tem scroll programático confiável (cada terminal trata diferente). Estratégia:
-
-- **Não tentar fazer scroll lógico interno.** History pane é append-only via `<Static>`; terminal nativo cuida do scroll.
-- **Comando `/replay <step_id>`** em vez de scroll — re-renderiza step específico no rodapé com `<Less>`-style nav.
-- **Aviso quando historico passa de N tokens**: "(scroll terminal pra cima pra ver early steps)" — explícito.
-
-### 5.6 Copy/paste
-
-Terminal cuida (mouse selection ou keyboard). Não interceptamos.
-
-Exception: tool output muito longo é truncated; "press `c` to copy full output to clipboard" via `pbcopy`/`xclip`/`wl-copy` com detecção. Fallback: "save to file" via `/save <step_id> <path>`.
-
-### 5.7 Mouse
-
-**Não usado.** Princípio #4 da §1 do AGENTIC_CLI.md (keyboard-only). Mouse selection nativa do terminal funciona pra copy; nada mais.
+| Histórico (scrollback) | denso. 1 linha por evento quando possível. |
+| Região viva | média. Sumários, não detalhes. |
+| Modal | espaçada. Conteúdo + opções, sem ruído. |
 
 ---
 
-## 6. Microcopy (templates versionados)
+## 7. Headless mode (`--json`)
 
-Mensagens ao usuário são **dados**, não strings hardcoded. Template files em `~/.config/agent/messages/<lang>/<code>.md`.
-
-### 6.1 Estrutura comum
-
-```
-<emoji> <título curto, ≤ 50 chars>
-
-<o que aconteceu, 1-2 linhas>
-
-<o que tentar — comando concreto OU ação humana>
-
-(detalhes: <code> | /help <code>)
-```
-
-### 6.2 Exemplos canônicos
-
-**Provider lento:**
-```
-⚠ Provider lento (3 timeouts)
-
-Anthropic API não respondeu em 60s × 3 tentativas.
-Continuando com aviso. Próximo step pode degradar.
-
-Tente: /model haiku   (modelo mais rápido)
-       /pause          (continuar depois)
-
-(detalhes: provider.timeout.streaming | /help provider.timeout)
-```
-
-**Tool denied:**
-```
-✗ Tool bloqueada
-
-bash: "rm -rf /tmp/build"
-Negada por: deny rule "rm -rf /*"
-
-Sugestão: rode manualmente e use /resume.
-
-(detalhes: permission.runtime.deny)
-```
-
-**Memory write proposed:**
-```
-📝 Memória proposta (não salva ainda)
-
-feedback / project-scope:
-  "console.log proibido em src/; usar logger"
-
-[a]ccept  [e]dit  [r]eject  [w]hy?
-```
-
-**Compaction triggered:**
-```
-⚙ Compactando contexto...
-
-Histórico atingiu 70% do limite.
-Resumindo turns antigos. Goal preservado literal.
-
-(~3s)
-```
-
-**Crash recovered:**
-```
-✓ Sessão recuperada
-
-Crash detectado em step 14 (mid-tool). Tool result perdido;
-modelo vai re-tentar. Estado consistente.
-
-(detalhes: recovery.tool_exec | trace: traces/sess_abc.ndjson)
-```
-
-### 6.3 Tom e estilo
-
-- **Direto**, sem hedge ("might be possible to" → "tente")
-- **Acionável**, sem prosa explicativa demais
-- **Honesto** sobre falha — "API down" não "hum, parece que..."
-- **Sem emoji excessivo** — 1 por mensagem, opcional via `--no-emoji`
-- **Português ou inglês** consistente por sessão (`AGENT_LANG=pt|en`)
-
-### 6.4 Anti-microcopy (exemplos do que **não** fazer)
-
-❌ "Algo deu errado, tente novamente"
-✅ "Tool `bash` excedeu timeout (30s). Cancelada. Resultado: erro."
-
-❌ "Iniciando..."
-✅ "Carregando 14 memórias do escopo project (~50ms)..."
-
-❌ "Operation completed successfully!"
-✅ "✓ 4 etapas aplicadas, testes passando."
-
-❌ "Você quer realmente fazer isso?"
-✅ "Confirmar: `rm -rf ./build` (deleta 234 arquivos)? [y/N]"
-
----
-
-## 7. Information density
-
-Calibragem por contexto:
-
-### 7.1 Sessão ativa (high-density)
-
-- Tool cards condensados por default
-- Footer compacto
-- Diff inline curto (3 lines context)
-- TodoList compacto
-- Sem decoração extra
-
-### 7.2 Modal (low-density)
-
-- Padding generoso
-- Texto centralizado quando faz sentido
-- Atalhos visíveis
-- Help text (`[w]hy?`) sempre disponível
-
-### 7.3 First-run (medium-density)
-
-- Mensagem de boas-vindas: 5 linhas máximo
-- Tip rotativa por sessão (uma de ~20 tips)
-- Pointer pra `/help`
-
-### 7.4 Erro fatal (high-emphasis, low-density)
-
-- Centralizado
-- Cor de alerta
-- Instruções de recovery
-- Path pra logs
-
-### 7.5 Streaming (steady-state)
-
-- Cursor de digitação visível
-- Spinner em região que não polui
-- Throughput não importa pro user; latência percebida sim
-
----
-
-## 8. First-run UX (do install ao primeiro prompt)
-
-### 8.1 Primeira invocação
-
-Detecção: `~/.config/agent/` não existe.
-
-Fluxo:
-```
-$ agent
-
-Bem-vindo ao agent (v0.1.0)
-
-Configuração inicial (uma vez só):
-
-  [1/3] API key da Anthropic? (sk-ant-...)
-        > _
-
-  [2/3] Modelo padrão?
-        ▶ claude-sonnet-4-6 (recomendado)
-          claude-haiku-4-5 (mais rápido, mais barato)
-          claude-opus-4-7 (mais inteligente, mais caro)
-          ollama/qwen2.5-coder:14b (local; profile orchestrated)
-
-  [3/3] Permitir telemetria local? (NDJSON em ~/.local/share/agent/traces/)
-        ▶ sim, local apenas
-          sim, exportar pra OTEL collector
-          não
-
-✓ Configurado. Run `agent` pra começar.
-   Tip: `/help` mostra comandos. Ctrl+C cancela. Ctrl+D sai.
-```
-
-Sem nada disso em mode CI / `--json` / non-TTY — config via env vars (`AGENT_API_KEY`, etc). Erro fatal claro se faltam.
-
-### 8.2 Primeira sessão num diretório
-
-`<TrustPrompt>` aparece. Mensagem clara, não-aterrorizante.
-
-### 8.3 Primeira tarefa
-
-Após primeiro prompt do user, tip discreta no footer:
-```
-tip: Ctrl+Z desfaz o último step · /undo · /help
-```
-
-Mostra 3× depois some.
-
-### 8.4 Onboarding por "discovery", não tutorial
-
-Sem tutorial guiado obrigatório. Aprendizado por:
-- `/help` sempre disponível
-- Tab completion mostra comandos
-- Footer mostra atalho relevante por contexto
-- Mensagens de erro têm "tente: ..."
-
-Tutorial é fricção; descoberta contextual é UX.
-
----
-
-## 9. Headless mode (NDJSON contract)
-
-`agent --json "prompt"` ou `cmd | agent --json` bypassa Ink completamente.
-
-### 9.1 Output schema
-
-Cada linha em stdout é um JSON object:
+Quando `!isTTY` ou flag `--json`: **bus serializa cada evento como NDJSON em stdout**, nada mais.
 
 ```jsonl
-{"type":"session_start","session_id":"sess_abc","model":"sonnet-4-6","ts":1714138800}
-{"type":"step_start","step_id":"step_1","ts":1714138801}
-{"type":"assistant_text","step_id":"step_1","text":"Vou começar lendo..."}
-{"type":"tool_call","step_id":"step_1","tool":"glob","input":{"pattern":"*.ts"}}
-{"type":"tool_result","step_id":"step_1","output":["src/a.ts","src/b.ts"],"duration_ms":42}
-{"type":"step_end","step_id":"step_1","tokens_in":1234,"tokens_out":56,"cost_usd":0.003}
-{"type":"session_end","session_id":"sess_abc","status":"done","total_cost_usd":0.012}
+{"type":"session:start","ts":1735689600000,"sessionId":"abc"}
+{"type":"user:submit","ts":1735689601000,"text":"fix bug"}
+{"type":"assistant:delta","ts":1735689602000,"text":"Looking..."}
+{"type":"tool:start","ts":1735689603000,"id":"t1","name":"read","args":"src/foo.ts"}
+{"type":"tool:end","ts":1735689604000,"id":"t1","status":"done","durationMs":120}
+{"type":"assistant:end","ts":1735689605000}
+{"type":"session:end","ts":1735689606000,"reason":"done"}
 ```
 
-Schema versionado em `schema_version: "v1"` no primeiro objeto.
+Garantias:
+- **stdout puro.** Nada além de NDJSON. Logs, diagnostics, prompts → stderr.
+- **Schema versionado.** `{"v":1, ...}` em `session:start`.
+- **Sem prompts interativos.** Permission/trust/memory write em headless: rejeitados por default ou aceitos via `--yes`/policy.
+- **Mesmo bus do TUI.** Renderer apenas opcional; bus é a fonte.
 
-### 9.2 Stderr
-
-`stderr` recebe **logs progressuais** (não estruturados):
-```
-[14:32:01] starting session...
-[14:32:02] streaming response...
-[14:32:03] tool: glob (42ms)
-```
-
-Pode ser silenciado com `-q`.
-
-### 9.3 Modais em headless
-
-Não existem. Todas decisões viram **erro** ou **comportamento default** definido por flag:
-
-```bash
-agent --json --on-permission=allow|deny|fail "prompt"
-agent --json --on-trust=fail "prompt"           # nunca silenciosamente confia
-agent --json --on-memory-write=skip|fail "prompt"
-```
-
-Default: `fail` em tudo. CI explícita o que quer.
-
-### 9.4 Exit codes
-
-- `0` — sucesso (sessão `done`)
-- `1` — erro de tarefa (sessão `error_fatal`)
-- `2` — budget exausto (`exhausted`)
-- `3` — denied por policy ou modal sem flag
-- `4` — config inválida
-- `130` — interrompido (SIGINT, mesmo em headless via timeout)
+Ver `CONTRACTS.md` §2.6 para schemas completos.
 
 ---
 
-## 10. Acessibilidade
+## 8. Capability detection & fallbacks
 
-### 10.1 NO_COLOR (obrigatório)
-
-`NO_COLOR=1` ou `--no-color`: zero cor. Prefixos textuais (`[!]`, `[OK]`, etc).
-
-### 10.2 ASCII-only (obrigatório)
-
-Locale C ou `--ascii`: sem Unicode. Spinners ASCII (`|/-\`), bullets `*`, status `[x]`/`[ ]`.
-
-### 10.3 Screen reader friendly (best-effort)
-
-- Não usar caracteres decorativos sem propósito (sem `═══════` separadores; usa `---` ou whitespace)
-- Toda informação importante em texto, não só cor
-- Modal com role implícito via texto ("Permission required: ...")
-- Sem ANSI escape em stdout em modo `--accessible` (forces fully plain text)
-
-### 10.4 Daltonismo
-
-- Status nunca depende **só** de cor — sempre tem ícone/prefixo
-- `done` = ✓ verde, mas `✓` é o sinal primário
-- `error` = ✗ vermelho, mas `✗` é o sinal primário
-
-### 10.5 Low-vision
-
-- Suporte a `FORCE_LARGE_FONT` (env var custom): aumenta espaçamento, simplifica layout
-- Modo `--simple`: layout linear, sem boxes/cards/tables
-
-### 10.6 Latência cognitiva
-
-- Streaming previsível (tokens aparecendo) reduz ansiedade vs spinner opaco
-- Cancel sempre visível (`Ctrl+C` no footer)
-- Estado atual sempre visível (`▶ glob "*.ts"` enquanto executa)
-
----
-
-## 11. Internacionalização (placeholder strategy)
-
-v1 suporta apenas **`pt-BR`** e **`en`** (mistos no código atual). Strings em arquivos `messages/<lang>/<code>.md`.
-
-Detecção: `$LANG`, `$LC_ALL`. Override: `--lang pt|en`.
-
-Padrão em projeto: usuário diz "fala português" → memory `feedback` → próxima sessão respeita.
-
-V2: estrutura aberta pra mais idiomas se houver demanda. Não suportar todas as do `gettext` — escopo grande sem ROI.
-
----
-
-## 12. Performance budget (slice de UX)
-
-Do `PERFORMANCE.md` §2.6, com explicação UX:
-
-| Métrica | P99 | Por que importa |
-|---|---|---|
-| Input echo (tecla → tela) | < 10ms | < 16ms é "instantâneo"; > 30ms é "laggy" |
-| Streaming token render | < 5ms | Frames perdidos = sensação de travamento |
-| Modal abre | < 50ms | Modal lento = perde sincronia com decisão |
-| Tab completion | < 100ms | Usuário esquece o que digitou |
-| Resize re-layout | < 33ms (1 frame) | Resize visual deve ser smooth |
-| First paint após startup | < 200ms | "Demora" começa em 250ms |
-
-Violação = regressão de UX, mesmo se funcional ainda funciona.
-
----
-
-## 13. Testing strategy
-
-### 13.1 Unit (componente isolado)
-
-`ink-testing-library`:
+Detectado uma vez no boot, cacheado em `caps`:
 
 ```ts
-import { render } from 'ink-testing-library';
-import { ToolCallCard } from './ToolCallCard';
-
-test('collapses long output by default', () => {
-  const { lastFrame } = render(
-    <ToolCallCard
-      toolCall={{
-        tool: 'grep',
-        status: 'done',
-        output: Array(50).fill('match').join('\n'),
-      }}
-    />
-  );
-  expect(lastFrame()).not.toContain('match\nmatch\nmatch\nmatch\nmatch');
-  expect(lastFrame()).toMatch(/collapsed.*expand/i);
-});
+interface Capabilities {
+  isTTY: boolean              // process.stdout.isTTY
+  cols: number                // process.stdout.columns ?? 80
+  rows: number                // process.stdout.rows ?? 24
+  color: 'none' | '16'        // só 16 cores; sem detecção de truecolor
+  unicode: boolean            // locale + sample width check
+  hyperlinks: boolean         // OSC 8 — opcional, default off
+}
 ```
 
-### 13.2 Integration (interação)
+Decisões:
+- `!isTTY` → headless mode automático (NDJSON).
+- `cols < 60` → warning único; segue funcionando.
+- `color === 'none'` → todos os escapes ANSI viram no-op.
+- `unicode === false` → fallback ASCII em todos os glyphs.
+- `hyperlinks` → não usado em v1. Reservado.
 
-```ts
-test('Ctrl+C in tool_running shows abort prompt', async () => {
-  const { stdin, lastFrame } = render(<App initialState={...} />);
-  stdin.write('\x03'); // Ctrl+C
-  await delay(50);
-  expect(lastFrame()).toMatch(/press Ctrl\+C novamente/i);
-});
-```
-
-### 13.3 Visual snapshots
-
-```ts
-test('PermissionPrompt matches snapshot', () => {
-  const { lastFrame } = render(<PermissionPrompt {...props} />);
-  expect(lastFrame()).toMatchSnapshot();
-});
-```
-
-Snapshots em `__snapshots__/`. PR diff visual mostra mudanças antes de merge.
-
-### 13.4 Capability matrix
-
-Roda mesmos componentes com:
-- Truecolor + Unicode + hyperlinks
-- 256 + Unicode
-- 16 + Unicode
-- NO_COLOR + ASCII
-
-Eval automatic confirma que **nenhum componente quebra** em qualquer combo.
-
-### 13.5 Headless contract
-
-Eval roda agent em `--json` mode com prompts canônicos; valida JSON Schema do output line-by-line.
-
-### 13.6 Manual playtest
-
-Antes de release: 30min de uso real com cada profile. Loga friction points em `evals/playtest/<version>/notes.md`. Não substituível por test automatizado.
+Re-detect: `SIGWINCH` atualiza `cols`/`rows`. Demais caps são fixas pela vida da sessão.
 
 ---
 
-## 14. Anti-patterns (não cometa)
+## 9. Microcopy
 
-| Anti-pattern | Por quê |
+### 9.1 Princípios
+
+- **Diga o que aconteceu, onde, e o que decidir.** "Tool X falhou" é ruim. "Tool X (bash) excedeu 30s. Output abaixo. Decisão sua: continuar / cancelar / inspecionar." é UX.
+- **Sem desculpa.** Não escreva "Sorry,...". Mostre o problema e a saída.
+- **Sem jargão de implementação.** "AbortController disparou" não. "Cancelado pelo user" sim.
+- **Imperativo > passivo.** "Run `bun test`" > "Tests should be run".
+
+### 9.2 Catálogo de erros canônico
+
+| Situação | Texto |
 |---|---|
-| Animação ASCII-art bonita no startup | Atraso em SSH; some valor real |
-| Spinner customizado por componente | Inconsistência visual; usa primitiva |
-| Modal sem `[w]hy?` opção | User não entende o que está confirmando |
-| Cores sem ícones/prefixos | Daltonismo; NO_COLOR; pipe |
-| Tool card sem status visível | "Tá rodando?" "Acabou?" | confusion |
-| Footer que muda largura/altura | Salta layout; quebra mental model |
-| History scrollable internamente | Conflita com terminal nativo; nunca certo em todos os terminais |
-| Mouse interactions | Não-portável; quebra em SSH/tmux |
-| Mensagens longas multi-parágrafo em modal | Modal é decisão; texto longo vai pra `--why` |
-| Microcopy genérica ("erro", "operação completada") | Inacionável |
-| Componente que detecta capability sozinho | Inconsistente; centraliza em `useCapabilities` |
-| Re-render de history a cada token | Mata perf; usa `<Static>` |
-| Modal stack de 3 níveis | Spec não permite (invariante); se cair aqui, é bug |
-| Mostrar caminhos absolutos com username (`/home/lex/...`) | PII em screenshot/share; usa `~` ou relativo |
-| "Press any key" | Nunca. Especifique a tecla. |
+| Tool timeout | `tool '<name>' exceeded <Ns>. output above. continue / cancel / inspect?` |
+| Tool denied | `tool '<name>' denied by policy: <rule>. edit args / cancel?` |
+| Provider down | `provider '<name>' unreachable. retry / switch / cancel?` |
+| Budget hit | `step budget hit (<n>/<max>). session ending. /resume to continue.` |
+| Trust missing | `unknown directory: <path>. trust to proceed.` |
+| Compaction triggered | `context full. compacting last <n> messages…` |
+
+### 9.3 Banidos
+
+- "Oops!", "Sorry!", "Whoops!", "Uh oh!"
+- "Loading..." sem indicador de progresso
+- "Done!" sem o que foi feito
+- Emojis em mensagens funcionais (✓/✗ ok como glyph estrutural)
+- Reticências sem ação (`...` final sem indicar próximo passo)
 
 ---
 
-## 15. Insight final
+## 10. Performance
 
-Arquitetura define o que o agente **pode** fazer.
-UI define o que o usuário **percebe** que ele faz.
-Cada uma sem a outra é metade do produto.
+| Métrica | Budget | Notas |
+|---|---|---|
+| First paint após `agent` | < 50ms | render do prompt vazio |
+| Frame redraw (região viva) | < 16ms p99 | 60fps soft cap |
+| Spinner frame interval | 80ms (Unicode) / 100ms (ASCII) | |
+| Coalescer de `assistant:delta` | janela de 33ms | múltiplos chunks viram 1 redraw |
+| Latência percebida (input → echo) | < 16ms | 1 frame |
+| Memory (UI state) | < 5MB | região viva é minúscula |
 
-A diferença entre uma CLI agentic que vira hábito e uma que vira screenshot no Twitter é UX.
-
-Não tem novidade técnica aqui — Ink resolve a parte React, terminal resolve a parte de output. O trabalho é nas **decisões pequenas e consistentes**: que cor usa pra status, como modal queue, qual microcopy de erro, quanto detalhe no footer, quando colapsar tool card, quando mostrar tip.
-
-Cada decisão pequena soma. Cinquenta decisões pequenas certas = produto que dá vontade de usar. Cinquenta erradas = wrapper de API com terminal feio.
-
-A regra é: **cada componente é uma decisão feita uma vez bem; replicada perfeita em todo lugar.**
+Ver `PERFORMANCE.md` para SLOs de subsistemas adjacentes.
 
 ---
 
-## 16. Próximos passos (quando partir pra implementação)
+## 11. Testing
 
-1. Definir tema (paleta + ícones) e `useCapabilities` antes de tudo
-2. Construir 5 primitivas (`Card`, `Modal`, `Bar`, `Badge`, `Diff`) — base de tudo
-3. Layout regions (`<App>` + `<Header>` + `<HistoryPane>` + `<InputPane>` + `<Footer>`)
-4. Componentes domain por ordem de criticidade UX:
-   - `<ToolCallCard>` + `<StreamingMessage>` (essencial pro loop)
-   - `<PermissionPrompt>` + `<TrustPrompt>` (segurança)
-   - `<BudgetBar>` + `<MemoryBadge>` (info constante)
-   - `<TodoListView>` (UX killer pra tarefas longas)
-   - `<DiffView>` (write-heavy workflows)
-   - `<MemoryWritePrompt>` (UX correto previne injection)
-   - `<DAGProgress>` + `<ValidatorTrace>` (orchestrated only)
-   - `<BackgroundProcessTray>` + `<CheckpointBar>` (qualidade-de-vida)
-5. Headless path em paralelo (NDJSON writer, sem Ink)
-6. Microcopy templates pra todos os codes em `FAILURE_MODES.md`
-7. Snapshot tests + capability matrix tests
-8. Playtest manual antes de cada milestone
+### 11.1 Bus-level
 
-Sem (1)-(2), o resto fica inconsistente. Sem (5), CI quebra silenciosamente. Sem (8), regride no escuro.
+Mocka `Bus`, dispara sequência de eventos, assert no estado final do `LiveState`. Cobertura: 100% dos eventos do §3.2.
+
+### 11.2 Render functions
+
+`renderToolCard(state)` e similares são puras. Snapshot tests. ASCII fallback testado igual.
+
+### 11.3 Render integrado
+
+Captura `process.stdout.write` em buffer, dispara eventos, assert no buffer final (com strip-ansi pra readability). Não simula resize / capability detection nesse nível.
+
+### 11.4 E2E TTY
+
+Pty harness (`node-pty`) só pra fluxos que dependem de raw stdin parsing (paste, escape sequences, resize). Mantido pequeno.
+
+---
+
+## 12. Boot sequence
+
+```
+1. Parse argv, env, profile.
+2. Detect capabilities (caps).
+3. Open bus (EventEmitter).
+4. If isTTY:
+     a. Enable raw mode, bracketed paste.
+     b. Install SIGWINCH, SIGINT handlers.
+     c. Start renderer (subscribes to bus).
+   Else:
+     Start NDJSON serializer (subscribes to bus).
+5. Bootstrap subsystems (memory, checkpoints, providers, ...).
+6. Bus emit `session:banner` (§4.10.9 — em REPL; one-shot pula).
+7. Bus emit `session:start`.
+8. Loop: read input, dispatch to harness, emit events.
+9. Em transição de turno (REPL only): bus emit `step:separator` (§4.10.10).
+10. On exit (any path): drain bus, restore stdin mode, cursor visible.
+```
+
+Restore de stdin mode é crítico — sem isso, o terminal do user fica em raw mode após crash. Use `process.on('exit'|'SIGINT'|'uncaughtException')` para garantir.
+
+---
+
+## 13. Não-objetivos
+
+- **Mouse support** (clique, scroll). Terminal nativo já scrolla. v2+ se houver demanda.
+- **Themes plugáveis.** Paleta é fixa.
+- **Layouts split.** Uma coluna, ponto.
+- **Painéis fixos** (top bar permanente, sidebar). Tudo é inline.
+- **Hyperlinks (OSC 8).** Reservado pra v2.
+- **Imagens (Sixel/Kitty graphics).** Fora de escopo.
+- **Animações.** Só spinner. Nada de fade, slide, transition.
+- **Tabela navegável** (`<Table>` cursor mode). Listas longas viram scrollback; navegação fica em CLI separada (`agent --session`, `agent --memory`).
+
+---
+
+## 14. Insight final
+
+A diferença entre uma TUI agentic boa e ruim não está nos componentes: está no fato de que o terminal é tratado como **um meio**, não como uma tela. Histórico é scrollback do terminal. Cancelamento é Ctrl+C nativo. Cópia é seleção do terminal. Tudo o que o user já sabe fazer com um shell continua funcionando.
+
+Framework de UI tenta resolver problemas que o terminal não tem. A região viva é pequena demais pra justificar React; o histórico é grande demais pra colocar dentro de um framework.
+
+> Inline. Funcional. Pequeno. Boring.

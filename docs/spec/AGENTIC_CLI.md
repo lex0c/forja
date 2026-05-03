@@ -1,6 +1,6 @@
 # AGENTIC_CLI
 
-Projeto de uma CLI agentic open-source. **Terminal-first**, multi-provider, self-hostable, sem vendor lock-in. Inspirada no Claude Code, mas sem suas amarras.
+Projeto de uma CLI agentic open-source. **Terminal-first**, multi-provider, self-hostable, sem vendor lock-in.
 
 Não é wrapper de API. Não é chatbot com `bash`. É um agente real, com loop controlado, tools auditáveis, contexto engenheirado e observabilidade nativa.
 
@@ -41,11 +41,11 @@ Este documento (`AGENTIC_CLI.md`) é a spec arquitetural de alto nível. Detalhe
 | [`TOKEN_TUNING.md`](./TOKEN_TUNING.md) | Sampling params (temperature, top_p, top_k, penalties, seed), output budget per call, stop sequences, reasoning effort, multi-sample, truncation strategies, tokenizer accuracy, per-workflow defaults, eval-driven tuning | Ao definir sampling em playbook novo; ao adicionar provider; ao tunar workflow com eval |
 | [`CONTEXT_TUNING.md`](./CONTEXT_TUNING.md) | Shape do prompt: system prompt architecture, layout + cache breakpoints, memory loading, tool palette, few-shot strategy, format choices, attention positioning, per-step shaping, goal re-injection, repo map injection, selective inclusion, per-workflow recipes | Ao desenhar/tunar contexto de prompt; pareceria com TOKEN_TUNING (tuning de generation) |
 | [`PERFORMANCE.md`](./PERFORMANCE.md) | SLOs, budgets de latência, custo por tarefa, regression strategy | Ao otimizar hot path, ou definir threshold de regressão em CI |
-| [`DESIGN_SYSTEM.md`](./DESIGN_SYSTEM.md) | Foundations visuais — color tokens semânticos, glyph catalog (Unicode + ASCII fallback), typography, spacing, motion, capability matrix, a11y, naming conventions | Antes de qualquer componente novo. UI.md consome este doc. |
-| [`UI.md`](./UI.md) | Componentes Ink, layout, microcopy, headless contract, padrões de interação | Ao implementar qualquer componente UI, ou definir microcopy de erro |
+| [`UI.md`](./UI.md) | Modelo inline, event bus, render funcional, componentes (tool card, modais, status line), paleta/glyphs/microcopy, headless `--json`, fallbacks. Sem framework. | Ao implementar qualquer parte da TUI ou definir microcopy de erro |
 | [`RECAP.md`](./RECAP.md) | Vista projetada de sessões (PR/changelog/slack/etc), source-of-truth determinística + LLM renderer | Ao implementar `/recap`, ou gerar artefato a partir de sessão |
 | [`ANTI_PATTERNS.md`](./ANTI_PATTERNS.md) | Padrões deliberadamente rejeitados (undercover mode, prompt-as-IP, persona tuning, vector DB, multi-model router, auto-commit, anti-patterns de MCP) com motivo e gatilho de reconsideração | Antes de adicionar feature que parece útil mas conflita com princípios; ao revisar PR de scope creep |
 | [`MCP.md`](./MCP.md) | Spec consolidada de MCP — lifecycle, transport (stdio/SSE/HTTP), capability negotiation, manifest format e hash, namespacing, per-server budget, sandbox, cache impact, slash commands, observabilidade | Ao integrar MCP server novo; ao implementar cliente MCP; ao auditar trust history |
+| [`IPC.md`](./IPC.md) | Canal vivo pai↔filho (subagent) via stdin/stdout NDJSON — message taxonomy, lifecycle, soft-stop propagation, backwards compat com one-shot, anti-patterns, migration por slice | Ao implementar subagent observability (1.f.2); ao propagar soft-stop pra subagents (D159); ao desenhar permission proxy entre pai e filho |
 | [`CODE_INDEX.md`](./CODE_INDEX.md) | Subsistema de indexação de código — schema SQLite (symbols/references/imports), pipeline (initial scan + incremental + FS watcher opt-in), API queryable, multi-language tree-sitter, integração com repo map, tools simbólicas candidatas, invalidação, privacy | Ao implementar code index; ao adicionar tool simbólica nova; ao tunar repo map ou estratégia de retrieval |
 | [`CODE_GENERATION.md`](./CODE_GENERATION.md) | Pipeline canônico de geração — generate → format → lint → test → checkpoint → accept; modos de strictness; integração com playbooks; per-language config; audit footprint; anti-patterns | Ao implementar PostToolUse hooks de generation; ao definir strict mode em playbook; ao debugar pipeline failure |
 | [`FEATURE_FLAGS.md`](./FEATURE_FLAGS.md) | Governance mínima de flags — categorias (CLI/config/slash/state), lifecycle (experimental→staged→stable→deprecated), inventário canônico, audit (`feature_flags_active`), discovery (`agent --list-flags`, `/flags`), eval integration, anti-patterns | Ao introduzir flag nova; ao promover/depreciar; ao auditar bypass flags em CI |
@@ -264,7 +264,7 @@ XDG Base Dir respeitado. Override por env var (`AGENT_CONFIG_DIR`).
 | Linguagem | **TypeScript** | Melhor SDK Anthropic + MCP TS-first + ecossistema agent denso |
 | Runtime | **Bun** | Single-binary compile, fast startup, fetch nativo, SQLite embutido |
 | Storage | **SQLite (`bun:sqlite`)** | Zero-setup, transacional, suficiente até 100M linhas |
-| TUI | **Ink** (React no terminal) | Streaming + componentização real; readline puro envelhece mal |
+| TUI | **Interno (raw ANSI + raw stdin)** | Inline render: histórico vai pro scrollback do terminal, só ~3-15 linhas vivas no fundo. Sem framework (sem React/Ink/blessed) — região viva é pequena demais pra justificar reconciliação. Deps mínimas: `string-width`, `wrap-ansi`. Ver [`UI.md`](./UI.md). |
 | Provider | **Pluggable adapters** | Cada provider em módulo isolado conforme `Provider` interface. v1 inclui: Anthropic, OpenAI, Ollama, llama.cpp. Ver [`PROVIDERS.md`](./PROVIDERS.md). |
 | Local backend | **Ollama** + **llama.cpp** (via HTTP) | Mais maduro pra modelos locais; GBNF grammar nativo no llama.cpp |
 | Constrained gen | **GBNF** (llama.cpp) / **JSON mode** (Ollama) / **tools** (Anthropic) | Force schema adherence em modelo pequeno |
@@ -284,7 +284,7 @@ Distribuição: `bun build --compile` gera binário único por plataforma. Sem `
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  CLI / TUI (Ink)                                        │  I/O, streaming, interrupts
+│  CLI / TUI (raw ANSI + event bus)                       │  I/O, streaming, interrupts
 ├─────────────────────────────────────────────────────────┤
 │  Session Manager                                        │  lifecycle, persist, resume
 ├─────────────────────────────────────────────────────────┤
@@ -409,14 +409,14 @@ Schema é **subset do `refactor` playbook** (§5 PLAYBOOKS.md) — reutiliza con
 
 1. User entra em plan mode (`/plan` ou `agent --plan "..."`)
 2. Modelo explora (read-only) e produz `plan` no schema acima
-3. Harness apresenta como markdown estruturado em `<PlanReview>` UI
+3. Harness apresenta como markdown estruturado via modal de plan review (UI.md §4.9)
 4. User decide:
    - `[a]ccept` — sai de plan mode; reentra em `run` com plan injetado como goal estruturado; harness executa **etapa por etapa** (cada step do plan vira sub-goal), com checkpoint entre etapas
    - `[e]dit` — abre `$EDITOR` no plan YAML; user modifica; volta pra escolha
    - `[r]eject` — descarta plan; sessão volta a `idle`
 5. Em modo `run` pós-accept: harness usa **mesma mecânica do refactor playbook** (etapas com test-gate)
 
-UI: novo componente `<PlanReview>` (extensão de `<DiffView>` com schema YAML).
+UI: modal de plan review renderizado via `plan:review` event + modal pattern canônico (UI.md §5.5). Diff é impresso como conteúdo permanente acima do modal.
 
 ### 5.2 Execution Profiles
 
@@ -540,7 +540,7 @@ max_overhead_ms = 3000             # se ultrapassa, skip critique (não bloqueia
       ```
 3. Filtra issues com `confidence ≥ threshold`
 4. Se há issues filtradas:
-   - **Apresenta `<CritiqueOverlay>`** (UI.md §3.2) ao user **antes** de proceder
+   - **Emite `critique:ask`** (modal pattern, UI.md §5.5) ao user **antes** de proceder
    - User pode: `[i]gnore`, `[r]edo with hint`, `[a]bort step`, `[w]hy?`
 5. Audit: critique runs vão pra `failure_events` com `code: critique.warning_shown` ou `critique.skipped`
 
@@ -702,7 +702,7 @@ Para processos longos (`npm run dev`, `pytest --watch`, builds), tools dedicadas
 
 Estado dos processos: tabela `background_processes`. Persistido entre steps. Limpo no fim da sessão (ou via `/bg cleanup`).
 
-UI mostra `<BackgroundProcessTray>` no rodapé com status de cada processo.
+UI: status line mostra tray de background processes (`bg N` com counts; detalhes via `/bg list`). Ver UI.md §4.4.
 
 ### 7.3.1 Wait & Monitor primitives
 
@@ -775,7 +775,7 @@ type MonitorCondition =
 
 **Comportamento:**
 - Tool **streama eventos** durante a duração
-- Cada evento aparece em `<ToolCallCard>` UI ou hook `Notification`
+- Cada evento aparece como linha viva (via tool card streaming) ou hook `Notification`
 - LLM **não é chamado** entre eventos — apenas UI atualiza
 - LLM roda no fim (max_events hit, duration end, ou cancellation)
 - Útil em: watch builds, log tailing, file watching
@@ -1495,41 +1495,35 @@ Eval específicos pra:
 
 ---
 
-## 17. CLI/UI (Ink)
+## 17. CLI/UI (TUI interno)
 
-Componentes:
+Modelo: **inline rendering, sem framework**. Histórico vai pro scrollback do terminal; região viva (3-15 linhas no fundo) redesenha em cada frame. Spec completo em [`UI.md`](./UI.md).
 
-- `<StreamingMessage>` — token-by-token
-- `<ToolCallCard>` — preview + status (running/done/error), colapsável
-- `<PermissionPrompt>` — modal de confirmação
-- `<TrustPrompt>` — modal de primeira-vez-no-dir
-- `<TodoListView>` — checklist live
-- `<BudgetBar>` — custo/steps em rodapé, sempre visível
-- `<DiffView>` — diff inline colorido
-- `<BackgroundProcessTray>` — status de bg processes
-- `<CheckpointBar>` — indicador de pontos de undo
-- `<DAGProgress>` — em profile `orchestrated`, mostra nós do graph com status (pending/running/done/failed)
-- `<ValidatorTrace>` — quando validator falha, mostra hint e retry counter
-- `<ProfileBadge>` — `[autonomous]` / `[orchestrated]` / `[hybrid]` no header — usuário sempre sabe qual orquestrador está ativo
-- `<MemoryWritePrompt>` — modal de confirmação para `memory_write` proposto, com diff do body, fonte (`user_explicit`/`inferred`), e atalhos `[a]ccept [e]dit [r]eject [w]hy?`
-- `<MemoryBadge>` — indicador discreto no rodapé: `mem: 12u 4p` (12 user, 4 project carregadas)
-- `<SessionPicker>` — listagem virtualizada de sessões com mini-recap expansível inline, filtro fuzzy por `/`, navegação `↑↓`, atalho `r` pra expandir mini-recap; renderizado em `agent --resume` sem args ou via `/sessions list`
-- `<CritiqueOverlay>` — modal opt-in (config `critique.mode`) que mostra warnings do self-critique pass antes de proceder; lista issues por severidade + confidence; atalhos `[i]gnore [r]edo [a]bort [w]hy?`
-- `<PlanReview>` — modal renderizado ao sair de plan mode; mostra plan YAML estruturado + risks + assumptions; atalhos `[a]ccept [e]dit [r]eject`
-- `<LoopStatusLine>` — rodapé granular durante step ativo: `[step 7/50 · 2m31s · validating output · compaction in 3 steps]`; substitui rodapé default quando loop em estado não-trivial
-- `<ThinkingIndicator>` — indicador discreto durante eventos `thinking_delta` (extended thinking): `🧠 thinking... (12s)`; some quando output começa
-- `<WaitIndicator>` — durante `wait_for` ativo, mostra condition + elapsed + timeout remaining; substitui `<LoopStatusLine>` temporariamente
-- `<MonitorStream>` — container streaming de eventos durante `monitor` ativo; cada match aparece como linha conforme chega
-- `<Interrupt>` — Ctrl+C com confirmação dupla se tool em execução
+Espinha dorsal: **event bus tipado**. Harness emite, renderer escuta, `--json` mode serializa o mesmo bus como NDJSON em stdout. Eventos canônicos: `assistant:start|delta|end`, `tool:start|delta|end`, `permission:ask`, `trust:ask`, `memory:write:ask`, `plan:review`, `todo:update`, `subagent:start|update|end`, `bg:start|update|end`, `step:budget`, `checkpoint:create`, `interrupt`, `error`, `warn`. Catálogo completo em `UI.md` §3.
 
-Sem TUI "modal" complicado. Linha simples > Vim mode mal feito.
+Render: cada elemento é função pura `render(state): string[]`. Sem componentes reutilizáveis no sentido de framework. Os elementos canônicos da região viva:
+
+- **Streaming message** — assistant token-by-token; vira permanente em `assistant:end`.
+- **Tool card** — vivo durante execução (spinner + nome + args + elapsed); compacto em scrollback ao terminar.
+- **Subagent row** — agrupa eventos do subagent ativo; vira sumário 1-linha ao terminar.
+- **Todo list** — bloco vivo opcional acima da status line.
+- **Status line** — 1 linha sempre presente: `[profile] · project · model · steps · cost · mem · bg · mcp`. Versões substituídas em estados não-idle (`waiting`, `interrupting`, `compacting`, `wait_for`, `monitor`, plan mode).
+- **Modais** — permission, trust, memory write, plan review, critique overlay. Substituem o input dentro da região viva. Pattern: state + focus handler + promise (`UI.md` §5).
+- **Thinking indicator** — discreto, durante `thinking:delta`. Some quando output começa.
+- **Interrupt prompt** — Ctrl+C com confirmação dupla quando tool em curso.
+
+Princípios de cor/glyph (`UI.md` §6): grayscale + 1 accent (erro vermelho). Sem azul/ciano/magenta/gradiente. Fallback ASCII automático.
+
+Headless (`!isTTY` ou `--json`): bus serializa NDJSON em stdout, renderer não roda. Schemas em `CONTRACTS.md` §2.6.
+
+Não-objetivos: alt-screen, mouse, themes, painéis fixos, layouts split, tabela navegável, hyperlinks (OSC 8), animações além de spinner.
 
 ---
 
 ## 18. Roadmap v1
 
 **M1 — Fundação (semana 1-2)**
-Provider Anthropic + loop básico (autonomous) + 6 tools (`read/write/edit/grep/glob/bash`) + SQLite + Ink mínimo + one-shot mode + Model Registry skeleton.
+Provider Anthropic + loop básico (autonomous) + 6 tools (`read/write/edit/grep/glob/bash`) + SQLite + TUI mínima (raw ANSI + event bus, ver UI.md) + one-shot mode + Model Registry skeleton.
 
 **M2 — Robustez (semana 3-4)**
 Permission engine + compaction + telemetry + abort/budget + eval smoke + headless `--json` + plan mode + trust prompt + output sanitization.

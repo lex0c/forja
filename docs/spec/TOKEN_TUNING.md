@@ -259,7 +259,7 @@ Reasoning tokens são **cobrados** mesmo se ocultos:
 - Anthropic: `reasoning.cost_usd` em traces
 - OpenAI: aparece em billing como tokens normais
 
-UI mostra `🧠 thinking... (Xs, $Y)` durante reasoning ativo (LOCAL_MODELS via UI.md `<ThinkingIndicator>`).
+UI mostra `thinking... (Xs, $Y)` na status line durante reasoning ativo (evento `thinking:delta`, UI.md §3.2).
 
 ### 4.4 Per playbook
 
@@ -618,7 +618,7 @@ Hash do conteúdo final (template + frontmatter + sampling) é registrado em `pr
 
 ### 13.4 System prompt regression eval
 
-A fonte mais comum de regressão silenciosa não é mudança de modelo nem de sampling — é mudança de **system prompt** ou **playbook**. A Anthropic admitiu publicamente em 2026 que Claude Code regressou em qualidade após uma mudança de prompt que ninguém marcou como breaking. Sem eval dedicado, o erro deles é o erro padrão.
+A fonte mais comum de regressão silenciosa não é mudança de modelo nem de sampling — é mudança de **system prompt** ou **playbook**. Casos públicos de 2026 mostram agentes regredindo em qualidade após mudanças de prompt que ninguém marcou como breaking. Sem eval dedicado, o erro deles é o erro padrão.
 
 Princípio 4 ("Eval é load-bearing") fica vazio se o caminho mais quente de regressão não tem cobertura.
 

@@ -24,6 +24,16 @@ export interface InvokeToolInput {
   messageId: string;
 }
 
+export interface ConfirmPermissionRequest {
+  toolName: string;
+  args: Record<string, unknown>;
+  cwd: string;
+  // Engine-supplied prompt explaining why confirmation is needed
+  // ("matches deny rule bash.rm.rf", "tool runs outside workspace",
+  // etc.). Renderer surfaces it as the modal's `reason`/`rule`.
+  prompt: string;
+}
+
 export interface InvokeToolDeps {
   db: DB;
   registry: ToolRegistry;
@@ -35,6 +45,22 @@ export interface InvokeToolDeps {
   // the engine so even a session-layer policy that allows writes
   // can't subvert the read-only profile.
   planMode?: boolean;
+  // Async hook the harness calls when the engine returns a `confirm`
+  // decision. The callback resolves with the user's answer:
+  //   true  → execute the tool (recorded as confirm_yes)
+  //   false → deny the tool (recorded as confirm_no)
+  // When unset, `confirm` decisions fall back to deny-with-reason
+  // (legacy headless behavior). The REPL provides this hook to bridge
+  // the engine to the modal manager; one-shot mode leaves it unset
+  // (no TTY to prompt).
+  confirmPermission?: (req: ConfirmPermissionRequest) => Promise<boolean>;
+  // Abort signal observed during the bridged confirm path. When the
+  // user hits Ctrl+C while a permission modal is open, abort fires
+  // and the await on confirmPermission settles immediately as denied
+  // (instead of blocking until the user manually closes the modal).
+  // Loop already has the signal; threads it here so the abort
+  // propagates one level deeper.
+  signal?: AbortSignal;
 }
 
 export interface InvokeToolResult {
@@ -49,6 +75,13 @@ export interface InvokeToolResult {
   // found (no decision happened). The loop uses this to emit a
   // `tool_decided` event for renderers.
   decision: Decision | null;
+  // True specifically when the failure was a denial (policy `deny` or
+  // user rejected a `confirm` modal). False/absent for other failure
+  // shapes (unknown tool, execution error, exception). Disambiguates
+  // the `decision.kind === 'confirm' && failed === true` ambiguity at
+  // the renderer/audit boundary — without this, a confirm-no looks
+  // identical to a tool that errored AFTER the user said yes.
+  denied?: boolean;
 }
 
 const buildErrorBlock = (
@@ -85,6 +118,33 @@ const wrapException = (e: unknown): ToolError => ({
   error_message: `tool crashed: ${errorMessage(e)}`,
   retryable: false,
 });
+
+// Race a producer Promise against an AbortSignal — whichever settles
+// first wins. When `signal` is undefined or absent, just calls the
+// producer (no race). Used by the bridged confirm path to surface
+// Ctrl+C abort while a modal is open without waiting for the user
+// to manually close it.
+const raceAgainstAbort = <T>(
+  produce: () => Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> => {
+  if (signal === undefined) return produce();
+  if (signal.aborted) return Promise.reject(new Error('aborted'));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new Error('aborted'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    produce().then(
+      (v) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(e);
+      },
+    );
+  });
+};
 
 // Single-tool pipeline:
 //   1. Look up the tool. Unknown name → error tool_result, no DB rows.
@@ -215,6 +275,7 @@ export const invokeTool = async (
       toolCallId: toolCall.id,
       durationMs: Date.now() - start,
       failed: true,
+      denied: true,
       decision: { kind: 'deny', reason },
     };
   }
@@ -233,6 +294,10 @@ export const invokeTool = async (
   type Setup =
     | { phase: 'denied'; toolCall: { id: string }; reason: string }
     | { phase: 'confirm_no'; toolCall: { id: string }; prompt: string }
+    // Async branch: tool_call row created, awaiting user's answer.
+    // The post-transaction code awaits confirmPermission and then
+    // commits a second transaction with the approval + start/finish.
+    | { phase: 'confirm_pending'; toolCall: { id: string }; prompt: string }
     | { phase: 'started'; toolCall: { id: string } };
 
   const setup = withTransaction(deps.db, (): Setup => {
@@ -259,22 +324,34 @@ export const invokeTool = async (
     }
 
     if (decision.kind === 'confirm') {
-      // M1 has no UI to ask the user, so we treat `confirm` as denied with a
-      // dedicated reason. Step 6 (TUI) will wire a real confirm prompt and
-      // change `decision` to `confirm_yes`/`confirm_no` based on user input.
-      recordApproval(deps.db, {
-        toolCallId: toolCall.id,
-        decision: 'confirm_no',
-        decidedBy: 'policy',
-        reason: 'confirmation required, no UI in M1',
-      });
-      finishToolCall(deps.db, {
-        id: toolCall.id,
-        status: 'denied',
-        durationMs: Date.now() - start,
-        error: `confirmation required: ${decision.prompt}`,
-      });
-      return { phase: 'confirm_no', toolCall, prompt: decision.prompt };
+      // No UI bridge → fall back to the legacy headless behavior:
+      // record as denied with a dedicated reason. The async branch
+      // below handles the bridged case after this transaction
+      // commits.
+      if (deps.confirmPermission === undefined) {
+        recordApproval(deps.db, {
+          toolCallId: toolCall.id,
+          decision: 'confirm_no',
+          decidedBy: 'policy',
+          reason: 'confirmation required, no UI configured',
+        });
+        finishToolCall(deps.db, {
+          id: toolCall.id,
+          status: 'denied',
+          durationMs: Date.now() - start,
+          error: `confirmation required: ${decision.prompt}`,
+        });
+        return { phase: 'confirm_no', toolCall, prompt: decision.prompt };
+      }
+      // Bridged confirm: leave the row in `pending` (no approval yet)
+      // and route through the async branch below. The audit invariant
+      // "every tool_call has an approval row" is restored when the
+      // user answers and the second transaction records the approval.
+      // Crash window: if the process dies between this commit and the
+      // approval write, the row stays orphan in `pending`. Acceptable
+      // for M1 — orphan rows show up in audit as "started but never
+      // finished" and can be reaped manually or ignored.
+      return { phase: 'confirm_pending', toolCall, prompt: decision.prompt };
     }
 
     // allow
@@ -294,6 +371,7 @@ export const invokeTool = async (
       toolCallId: setup.toolCall.id,
       durationMs: Date.now() - start,
       failed: true,
+      denied: true,
       decision,
     };
   }
@@ -308,8 +386,90 @@ export const invokeTool = async (
       toolCallId: setup.toolCall.id,
       durationMs: Date.now() - start,
       failed: true,
+      denied: true,
       decision,
     };
+  }
+
+  // Bridged confirm path. The setup branch only returns
+  // 'confirm_pending' when confirmPermission is defined, but TS
+  // can't track that across the `withTransaction` closure boundary
+  // — re-bind the callback to a non-optional local. A throw from
+  // the callback (rare — modal manager normally resolves false on
+  // close/timeout) collapses to denied so the run doesn't hang on
+  // a stuck pending row.
+  if (setup.phase === 'confirm_pending') {
+    const askUser = deps.confirmPermission;
+    if (askUser === undefined) {
+      // Defensive: should be unreachable per setup contract.
+      throw new Error('invokeTool: confirm_pending without confirmPermission');
+    }
+    const callId = setup.toolCall.id;
+    // Race the user's answer against the abort signal so Ctrl+C
+    // while a modal is open settles invokeTool immediately as
+    // denied — no two-step "Esc out of modal then signal-check"
+    // dance. The catch collapses both rejection paths (callback
+    // throw, abort) to a denied answer.
+    let answer = false;
+    try {
+      answer = await raceAgainstAbort(
+        () =>
+          askUser({
+            toolName: input.toolName,
+            args: input.args,
+            cwd: deps.ctx.cwd,
+            prompt: setup.prompt,
+          }),
+        deps.signal,
+      );
+    } catch {
+      answer = false;
+    }
+    if (!answer) {
+      withTransaction(deps.db, () => {
+        recordApproval(deps.db, {
+          toolCallId: callId,
+          decision: 'confirm_no',
+          decidedBy: 'user',
+          // Audit reason: the engine's prompt explains WHY the
+          // user was asked. The user's actual reason for rejecting
+          // isn't captured (modal returns boolean only); separate
+          // free-form reject-with-reason is a future feature.
+          reason: setup.prompt,
+        });
+        finishToolCall(deps.db, {
+          id: callId,
+          status: 'denied',
+          durationMs: Date.now() - start,
+          error: 'denied by user',
+        });
+      });
+      return {
+        // Bare "denied by user" — no engine-prompt suffix because
+        // the prompt is why the engine ASKED, not why the user
+        // rejected. Telling the model "user said no because of
+        // rule X" misrepresents the user's reasoning.
+        toolResult: buildErrorBlock(input.toolUseId, input.toolName, 'denied by user'),
+        toolCallId: callId,
+        durationMs: Date.now() - start,
+        failed: true,
+        denied: true,
+        decision,
+      };
+    }
+    // User approved — record the approval and start the call so the
+    // execution path below treats it like the policy-allow case.
+    // Approval reason left null: the decision (`confirm_yes` by user)
+    // is self-explanatory; engine prompt belongs in the deny path.
+    withTransaction(deps.db, () => {
+      recordApproval(deps.db, {
+        toolCallId: callId,
+        decision: 'confirm_yes',
+        decidedBy: 'user',
+        reason: null,
+      });
+      startToolCall(deps.db, callId);
+    });
   }
 
   const toolCall = setup.toolCall;

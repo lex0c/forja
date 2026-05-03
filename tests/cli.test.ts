@@ -35,11 +35,14 @@ describe('cli entry', () => {
     expect(parsed).toEqual({ version: '0.0.0' });
   });
 
-  test('no args exits 1 with usage', () => {
+  test('no args without a TTY exits 1 (REPL refuses non-interactive stdin)', () => {
+    // Bare `forja` with stdin piped (the test runner case) opens
+    // the REPL — which refuses without a TTY. The "missing prompt"
+    // gate was relaxed when REPL mode landed; the new failure
+    // surface is the REPL's TTY check.
     const { code, stderr } = run();
     expect(code).toBe(1);
-    expect(stderr).toContain('missing prompt');
-    expect(stderr).toContain('Usage:');
+    expect(stderr).toContain('TTY');
   });
 
   test('--help exits 0 and prints usage to stdout', () => {
