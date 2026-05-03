@@ -134,7 +134,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     errSink(`forja: ${msg}\n`);
     return 1;
   }
-  const { config: baseConfig, db, modelId, lockConflicts, subagents } = bootstrapped;
+  const { config: baseConfig, db, modelId, lockConflicts, subagents, policyLayers } = bootstrapped;
 
   // Surface the same warnings the one-shot path does. Operators get
   // them once at REPL boot rather than per turn.
@@ -799,6 +799,26 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     cwd: baseConfig.cwd,
     env,
   });
+
+  // Permission posture hint. When no project policy file
+  // contributed, the operator runs under strict + empty rules
+  // (default-deny everything). Without this cue, the first
+  // tool call returns `Denied` and looks like a bug — surface
+  // the configuration gap up front. Only fires when no project
+  // layer was found AND no enterprise/user layer either; if any
+  // layer exists, the operator already opted in to a custom
+  // posture and doesn't need the hint. Routed as `error` (not
+  // `info` or `warn`) because under default-deny the very next
+  // tool call fails — severity matches the red palette and the
+  // operator scans the boot scrollback for red first.
+  if (policyLayers.length === 0) {
+    bus.emit({
+      type: 'error',
+      ts: now(),
+      message:
+        "no permission policy found — strict default-deny is active. Create '.agent/permissions.yaml' or run /perms to inspect.",
+    });
+  }
 
   // Initial frame: emit one input:update with the empty buffer so the
   // renderer draws the `> ` prompt before the user types. Without

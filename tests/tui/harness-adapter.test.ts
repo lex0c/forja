@@ -456,6 +456,40 @@ describe('harness-adapter — tool lifecycle', () => {
     const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
     expect(e.status).toBe('denied');
     expect(e.durationMs).toBe(5);
+    // Engine's deny reason flows through as `summary` so the
+    // scrollback chip renders the explanation under the chip
+    // (`└─ no rule matched ...`) instead of just "Denied".
+    expect(e.summary).toBe('no');
+  });
+
+  test('user-rejected confirm surfaces an explicit summary on tool:end', () => {
+    // For decision.kind === 'confirm' the engine's reason describes
+    // the matching rule, not the user's choice — adapter overrides
+    // with a fixed string so the operator sees that THEY rejected,
+    // not that the policy denied.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'edit_file',
+      args: { path: '/foo' },
+    });
+    a.translate({
+      type: 'tool_decided',
+      toolUseId: 't1',
+      decision: { kind: 'confirm', prompt: 'edit /foo?', reason: 'matched confirm rule: **' },
+    });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'edit_file',
+      failed: true,
+      durationMs: 3,
+      denied: true,
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('denied');
+    expect(e.summary).toBe('rejected at confirmation prompt');
   });
 
   test('tool_finished with denied=true after confirm → tool:end status=denied (regression)', () => {

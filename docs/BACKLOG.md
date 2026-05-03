@@ -15,6 +15,35 @@ Format:
 
 ---
 
+## [2026-05-03] M2 / impl — surface deny reason + `/perms` + boot-time policy hint
+
+Operator pediu pra ler `.gitignore` na TUI e levou `Denied` sem nenhuma explicação. A engine de permissão estava integrada (modal abria pra `confirm`), mas o default policy é `strict + tools: {}` — todo gated tool deny direto, sem modal, sem motivo. Três UX gaps endereçados num slice só:
+
+**Done:**
+
+- `src/tui/harness-adapter.ts`: `tool_finished` denied agora propaga `decision.reason` como `summary` no `tool:end`. O renderer (`render/permanent.ts:215`) já roteava `summary` pro connector `└─ ` em chips denied — só faltava popular. Confirm rejeitado pelo usuário recebe override fixo `'rejected at confirmation prompt'` (engine's reason descreve match da regra, não a escolha humana — surfaces a decisão, não o gatekeeper).
+- `src/cli/slash/commands/perms.ts` (novo): `/perms` exibe a policy ativa via `permissionEngine.policy()`. Lista mode + cada section com regras inline (cap de 5 entries por lista; > 5 colapsa pra `(N entries — see policy file)` pra não floodar scrollback). Strict + sections vazias dispara hint específico ("Create '.agent/permissions.yaml' with allow/confirm rules"). Strict mode com sections sempre fecha com `(unlisted tools default-deny in strict mode)` pra evitar a interpretação errada "no entry = allowed". Read-only — edição continua sendo via YAML files.
+- `src/cli/slash/index.ts`: `permsCommand` registrado (slot 9 após `budget`). Já estava no spec `AGENTIC_CLI §160`, então sem amendment necessário.
+- `src/cli/repl.ts`: detecta `policyLayers.length === 0` no boot e emite info line "no permission policy found — strict default-deny is active. Create '.agent/permissions.yaml' or run /perms to inspect.". Só dispara quando NENHUM layer (enterprise/user/project) contribuiu — operador com policy customizada já optou pelo posture e não precisa do cue. Lê `policyLayers` (já exposto por `BootstrapResult` desde commit anterior, mas ninguém consumia).
+
+**Tests:**
+
+- `tests/tui/harness-adapter.test.ts`: deny → summary com `decision.reason`; user-rejected confirm → summary `'rejected at confirmation prompt'` (NÃO o reason original do engine).
+- `tests/cli/slash/commands.test.ts`: `/perms` rejeita args; default-strict empty inclui hint do how-to-fix; bash + read_file rules renderizam corretamente; `> RULE_LIST_CAP` colapsa pra count-only; mode=acceptEdits omite o footer strict.
+- `tests/cli/slash/dispatch.test.ts`: builtin count atualizado de 8 → 9 (rows do `/help` correspondentes).
+
+**Decisions:**
+
+- **Por que não um banner de "first-run nag" persistente?** Hint no banner basta — repete a cada boot que não tem `.agent/permissions.yaml`, então o operador não esquece. Marker de "já viu" exigiria escrita em disco, e o trigger é trivialmente reversível (criar o arquivo) — UX overengineered.
+- **Por que `summary` em vez de modificar `subject`?** `subject` é o "subject of the tool call" (`bash $command`, `read_file $path`), invariável de fluxo de denial; `summary` foi desenhado pro connector exibir o pós-fato ("read 12 lines", "exited 0"). Denied chip já preferia `summary` quando presente — só faltava a fonte.
+- **Por que não auto-criar `.agent/permissions.yaml`?** Spec §8 aspira `agent init-policy` num slice futuro; auto-criar arbitrariamente seria opinião sobre default ruleset que não tem consenso ainda. Hint guia o operador a criar manualmente até esse comando existir.
+
+**Pending:** comando `agent init-policy` pra scaffolding (spec §8 list line 160). Não bloqueia este slice — operator já tem hint + `/perms` pra inspecionar.
+
+**Next:** PR de `feat/m2-tui-ux` quando operador autorizar.
+
+---
+
 ## [2026-05-03] M2 / spec — `docs/spec/HISTORY.md` (REPL input history subsystem)
 
 UI.md §5.4 já tinha as keybindings de ↑/↓ e Ctrl+R listadas, mas o subsistema completo (storage, privacy, sync, slash command, reverse-search widget) merecia doc próprio em vez de incharcar UI.md. Spec landa standalone; impl fica pra slice subsequente.
