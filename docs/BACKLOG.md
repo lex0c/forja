@@ -15,6 +15,44 @@ Format:
 
 ---
 
+## [2026-05-03] M2 / spec — `docs/spec/HISTORY.md` (REPL input history subsystem)
+
+UI.md §5.4 já tinha as keybindings de ↑/↓ e Ctrl+R listadas, mas o subsistema completo (storage, privacy, sync, slash command, reverse-search widget) merecia doc próprio em vez de incharcar UI.md. Spec landa standalone; impl fica pra slice subsequente.
+
+**Done (apenas spec):**
+
+- `docs/spec/HISTORY.md` (~250 linhas) cobrindo:
+  - §0 princípios (per-project, append-only, privacy-first com default, substring search só, concorrência tolerada).
+  - §1 storage (SQLite reusing bootstrap db, schema `repl_history(id, ts, project_root, prompt)`, API `appendHistory/loadHistory/clearHistory`, cap de 10k via env override, dup-of-last suppression, trim em append).
+  - §2 UI (↑/↓ nav com scratch buffer, slash precedence, Ctrl+R reverse-search widget over input box, slash command `/history` com subcommands list/clear/on/off).
+  - §3 privacy (default-on matching shell convention, first-run banner com ack marker per-project, opt-out 3-níveis env > file marker > slash, posture explícito sobre secrets).
+  - §4 cross-cutting (multi-line prompts, separação de `messages` table, resume não popula history, headless mode skip).
+  - §5 estimativa de impl (~700-900 LoC + ~600 tests, ~3 dias).
+  - §6 não-objetivos (busca semântica, history expansion bash-style, sync cross-machine, edição inline, fish-style auto-suggest).
+- UI.md §5.1 + §5.4 cross-ref pra HISTORY.md (substituiu o stub antigo "persistido em .agent/state/input-history.txt" que ficou divergente do design real SQLite-based).
+- CLAUDE.md tabela de "Implementing X → Read Y" ganha linha pra HISTORY.
+
+**Decisions:**
+
+- **Tabela própria, não reuso de `messages`.** `messages` é estado da sessão (system + user + assistant + tool roles em ordem de turno); `repl_history` é fila de prompts user-only. Reuso exigiria filter `WHERE role='user'` + reconstruir noção de "submission" e tem lifetimes diferentes (resume é por session; history é por project).
+- **Substring search, sem embedding.** Spec §0 ponto 4: prompts antigos com palavra-chave única → match exato resolve. Embedding seria 1000× a complexidade pra ganho marginal.
+- **Per-project isolado, não global.** `cwd` resolved → project_root como chave. `repo-A` e `repo-B` na mesma máquina nunca cruzam prompts. Spec §0 ponto 1.
+- **Default-on com first-run banner.** Posture matching bash/zsh/fish; opt-in seria feature que ninguém liga. Privacy mitigado via banner once-shown + opt-out 3-níveis.
+- **Append-only no storage; edits via slash command.** Sem mutação direta no disco. Audit trail implícito (cada escrita é insert com ts).
+- **Bash `!!` / `!N` expansion explicitamente fora.** Ambíguo com `!` literal em prompts; ↑ + edit cobre o caso real.
+
+**Pending (futuros slices, ordem sugerida):**
+
+1. Migration + storage layer (`src/storage/history.ts` + tests).
+2. REPL nav (↑/↓ + scratch + submit hook em `src/cli/repl.ts`).
+3. Slash `/history` subcommands.
+4. Privacy banner + opt-out env/file/slash.
+5. Reverse-search widget (UI.md §4.10.X também ganha layout quando esse slice landar).
+
+**Next:** sem impl agora — operator quer fechar a branch atual `feat/m2-tui-ux` com PR primeiro. History fica como standalone branch quando virar prioridade.
+
+---
+
 ## [2026-05-03] M2 / spec+impl — frame margin (2sp left, input outdented)
 
 Operator pediu padding lateral pra texto não ficar colado na borda. Spec §6.3 antes definia "indent fixo: 2 espaços por nível" — indent **hierárquico** (sub-content sob chip), não margem de frame. Adicionar margin global era extensão de spec, não divergência.

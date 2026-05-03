@@ -711,7 +711,7 @@ Atalhos:
 - `process.stdin.setRawMode(true)` no boot (TTY only). Restore em qualquer exit path (incl. Ctrl+C, exceptions).
 - Parser de escape sequences manual: setas, Home/End, Delete, Ctrl+A/E/U/W/K, Alt+B/F (word jumps), Ctrl+Backspace, Enter, Shift+Enter.
 - **Bracketed paste** (`\x1b[200~...\x1b[201~`): habilitado no boot, processado em batch (sem disparar redraw por char).
-- Histórico de input: persistido em `<repo>/.agent/state/input-history.txt` (últimas 1000 entradas), navegável com seta-pra-cima/baixo. Ctrl+R = reverse search.
+- Histórico de input: ver `HISTORY.md` (subsistema próprio — SQLite-backed, per-project, com privacy opt-out, slash command `/history`, navegação ↑/↓ e reverse-search `Ctrl+R`).
 - Expanded input mode: paste com >3 linhas abre buffer de N linhas no lugar do input, com `[Esc] cancel · [Ctrl+D] submit · [Ctrl+E] open $EDITOR`.
 
 ### 5.2 Spinner
@@ -747,11 +747,11 @@ Renderer reage a `tick` igual a qualquer evento (redraw da região viva).
 | Esc | running | request soft interrupt (LLM termina passo, depois para) |
 | Esc Esc | running | hard interrupt (cancela tool em curso) |
 | Ctrl+L | qualquer | clear screen (mantém histórico no scrollback) |
-| Ctrl+R | input | reverse search no histórico |
+| Ctrl+R | input | reverse search no histórico (ver `HISTORY.md` §2.2) |
 | Ctrl+D | input vazio | exit imediato (EOF — convenção shell, sem gate) |
 | Tab | input com `/` | autocomplete |
 | Ctrl+Z | qualquer | suspend (SIGTSTP), retorna com `fg` |
-| ↑/↓ | input | navegar histórico de inputs |
+| ↑/↓ | input | navegar histórico de inputs (ver `HISTORY.md` §2.1) |
 
 **Idle Ctrl+C double-tap:** o gate só aplica em `idle + buffer empty + sem run em curso`. Outros estados têm seus próprios paths (running tem o ladder soft/hard separado §3; buffer não vazio limpa). Janela de 2s é desarmada por: timeout, qualquer tecla (incluindo digitação), submit, abertura de modal, ou início de turno. Ctrl+D **não** passa pelo gate — EOF é convenção de shell para "I'm done", uma única tecla equivale a uma decisão explícita; aplicar double-tap aqui surpreende.
 
