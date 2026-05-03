@@ -213,7 +213,7 @@ describe('runAgent', () => {
     expect(result.steps).toBe(3);
   });
 
-  test('aborted signal: exits as interrupted', async () => {
+  test('aborted signal: exits as interrupted with abortCause=hard', async () => {
     const ctrl = new AbortController();
     ctrl.abort();
     const { config } = buildConfig([{ text: 'x' }], { signal: ctrl.signal });
@@ -221,6 +221,18 @@ describe('runAgent', () => {
     expect(result.status).toBe('interrupted');
     expect(result.reason).toBe('aborted');
     expect(result.steps).toBe(0);
+    // Hard signal → abortCause discriminator carries 'hard' so audit
+    // / telemetry can distinguish from cooperative soft (1.g.2).
+    expect(result.abortCause).toBe('hard');
+  });
+
+  test('non-abort exits do NOT set abortCause (undefined for done/maxSteps/etc.)', async () => {
+    // Sanity: the discriminator is only meaningful for reason==='aborted'.
+    // A done turn shouldn't carry a hard/soft label.
+    const { config } = buildConfig([{ text: 'hi', stop_reason: 'end_turn' }]);
+    const result = await runAgent(config);
+    expect(result.reason).toBe('done');
+    expect(result.abortCause).toBeUndefined();
   });
 
   test('softStopSignal pre-aborted exits aborted at step boundary, no provider call', async () => {
@@ -236,6 +248,8 @@ describe('runAgent', () => {
     expect(result.status).toBe('interrupted');
     expect(result.reason).toBe('aborted');
     expect(result.steps).toBe(0);
+    // Soft signal → abortCause='soft' (1.g.2 discriminator).
+    expect(result.abortCause).toBe('soft');
     // Critical contract: provider was never called.
     expect(handle.requests).toHaveLength(0);
   });
@@ -303,6 +317,7 @@ describe('runAgent', () => {
     expect(toolFinished).toBe(true);
     expect(result.status).toBe('interrupted');
     expect(result.reason).toBe('aborted');
+    expect(result.abortCause).toBe('soft');
     // Exactly one provider request fired (the first step that
     // produced the tool_use); the second step's provider call was
     // skipped by the soft check.
@@ -359,6 +374,7 @@ describe('runAgent', () => {
     expect(secondRan).toBe(false);
     expect(result.status).toBe('interrupted');
     expect(result.reason).toBe('aborted');
+    expect(result.abortCause).toBe('soft');
     // No second provider call — soft short-circuited inside step 1.
     expect(handle.requests).toHaveLength(1);
   });
@@ -396,6 +412,7 @@ describe('runAgent', () => {
     expect(observedAbort).toBe(true);
     expect(result.status).toBe('interrupted');
     expect(result.reason).toBe('aborted');
+    expect(result.abortCause).toBe('hard');
   });
 
   test('unknown tool: error result, loop continues until done', async () => {
@@ -934,6 +951,9 @@ describe('runAgent', () => {
     });
     expect(result.status).toBe('interrupted');
     expect(result.reason).toBe('aborted');
+    // Hard signal aborted mid-provider-stream: cause is 'hard' even
+    // though the abort was caught from inside the provider SDK error.
+    expect(result.abortCause).toBe('hard');
   });
 
   test('hung provider stream is interrupted by maxWallClockMs', async () => {
@@ -1771,6 +1791,25 @@ describe('runAgent', () => {
     const result = await runAgent(config);
     expect(result.reason).toBe('internalError');
     expect(result.usageComplete).toBe(false);
+  });
+
+  test('guardedFinish remaps aborted exceptions to reason=aborted with cause=hard (1.g.2)', async () => {
+    // Pre-1.g.2 behavior: a SQLite write failing because signal.aborted
+    // mid-flight was caught and reported as `internalError` — looked
+    // like a harness bug instead of operator-initiated termination.
+    // Now: guardedFinish detects signal.aborted at throw time and
+    // routes to finish('aborted', ..., 'hard'). Forces this path by
+    // closing the DB AND pre-aborting the signal so the init throw
+    // lands while signal is aborted.
+    const ctrl = new AbortController();
+    ctrl.abort();
+    db.close();
+    const { config } = buildConfig([{ text: 'never reached', stop_reason: 'end_turn' }], {
+      signal: ctrl.signal,
+    });
+    const result = await runAgent(config);
+    expect(result.reason).toBe('aborted');
+    expect(result.abortCause).toBe('hard');
   });
 
   describe('preassignedSessionId', () => {

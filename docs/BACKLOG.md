@@ -15,6 +15,36 @@ Format:
 
 ---
 
+## [2026-05-03] M1 / Step 1.g.2 — Audit cause discriminator (HarnessResult.abortCause)
+
+Closes D157. Until now, `HarnessResult.reason === 'aborted'` was the only signal an audit consumer had — soft and hard interrupts produced structurally identical results. Operator that hit Esc once vs Esc-Esc looked the same in audit, telemetry, and any future replay tooling.
+
+This slice adds a parallel `abortCause?: 'soft' | 'hard'` field that's threaded through `finish()` from the abort site that knew which signal fired. Existing surface stays intact (`reason: 'aborted'` continues to mean "operator interrupted"); new field is opt-in for consumers that care.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/harness/types.ts` | NEW `HarnessResult.abortCause?: 'soft' \| 'hard'`. Optional and only meaningful when `reason === 'aborted'` — undefined for done/maxSteps/maxWallClockMs/error/etc. (the discriminator is meaningless when the loop didn't exit via the abort path). |
+| `src/harness/loop.ts` | `finish()` helper signature gains optional third arg `abortCause`. The 4 abort exit sites in the loop now pass it: top-of-loop hard check (`'hard'`), top-of-loop soft check (`'soft'`), tool-loop inner hard check (`'hard'`), tool-loop inner soft check (`'soft'`). Wall-clock paths (`finish('maxWallClockMs')`) intentionally don't carry a cause — wall-clock is its own reason. The provider-error abort branch (catches SDK throws when `signal.aborted`) marks `'hard'` since soft can't preempt a provider call. |
+| `tests/harness/loop.test.ts` | Existing soft/hard tests strengthened with explicit `abortCause` assertions (4 tests: pre-aborted hard, soft pre-aborted, soft mid-tool, soft between tool_uses, hard regression cover, hard mid-stream). NEW baseline test asserting `abortCause` is undefined for non-abort exits (done turn). |
+
+**Decisions:**
+
+- **D166 — Parallel field, not split ExitReason.** Considered `'aborted_soft' \| 'aborted_hard'` as ExitReason variants. Rejected because: (a) every existing consumer that switches on `reason === 'aborted'` would have to handle two cases or risk a silent fallthrough, (b) the adapter's `mapExitReason` (and any future audit query) would need to special-case both, (c) the two represent the same outcome ("operator interrupted") with different mechanism — `reason` describes what; `abortCause` describes how. Parallel field is additive, type-safe (the discriminator only exists on aborted results), and trivially ignorable for consumers that don't care.
+- **D167 — Threaded via `finish()`, not per-call-site.** Considered post-processing the result in `runAgent`'s outer return. Rejected — the cause is known at the call site (which signal fired), not derivable from the result shape. Threading through `finish()` keeps the discriminator close to the truth source. The optional third param means existing `finish('maxSteps')` calls don't change.
+- **D168 — Subagent runtime not extended (out of scope).** `RunSubagentResult` (in `src/subagents/runtime.ts`) has its own `reason: 'aborted'` path for the subprocess wait loop. Not extended in this slice because: (a) subprocess subagents only honor hard signals today (D159 — soft can't propagate without IPC), so the discriminator would always be `'hard'` and is information-free, (b) `RunSubagentResult` and `HarnessResult` are different types — adding the field on both would force consumers to duplicate the narrowing logic. When the IPC slice lands and subagents honor soft, this field gets added in the same change.
+- **D169 — `abortCause` persisted to SQLite (post-review).** Initial cut had the discriminator only in-memory: `HarnessResult.abortCause` died at the process boundary, so `agent --session <id>` queries and replay tools couldn't recover whether an abort was soft or hard. That defeated the slice's stated purpose ("audit / telemetry / replay"). Migration 017 adds an `abort_cause TEXT CHECK (NULL OR 'soft'|'hard')` column to `sessions`. `completeSession` accepts the new optional `abortCause` arg; the harness's `finish()` threads it through alongside the in-memory result. Existing rows backfill to NULL — the check accepts NULL as the explicit "no discriminator" value.
+- **D170 — `guardedFinish` remaps aborted exceptions (post-review).** Pre-1.g.2 a SQLite write failing because `signal.aborted` mid-flight was caught and reported as `internalError` — looked like a harness bug instead of operator-initiated termination. The chance to fix it landed in this slice but the initial cut missed. `guardedFinish` now checks `signal.aborted` at throw time and routes to `finish('aborted', detail, 'hard')` (or `maxWallClockMs` if the wall-clock controller fired) before falling back to `internalError`. Soft never reaches this path — the soft signal only fires at step boundaries, never inside an exception throw window.
+- **D171 — Adapter does NOT consume `abortCause` (deferred).** `harness-adapter.ts` translates `session_finished` → `session:end` UIEvent. The UIEvent's `reason` field is `string`-typed (with a fixed-set hint) and doesn't carry `abortCause`. Operator in the TUI sees the same `session:end reason=interrupted` for both soft and hard. Closing this gap requires either (a) extending `SessionEndEvent` with an optional `abortCause` field and threading through the adapter, or (b) passing the discriminator via a separate UIEvent (audit-only). Out of scope here — TUI surface is mostly stable for M1, and the operator-visible signal is already in the footer cue (`esc to interrupt` → `esc again to force`). Closes when the audit panel / NDJSON output slice lands.
+- **D172 — `HarnessResult.abortCause` could be a discriminated union (deferred).** Today: `abortCause?: 'soft' | 'hard'` on the unified `HarnessResult` shape — TS allows `{reason: 'done', abortCause: 'soft'}` by construction, defended only by `finish()`'s runtime guard. A discriminated union (`{reason: 'aborted', abortCause: ...} | {reason: Exclude<...>; }`) would push the constraint into the type system. Refactor is significant: every consumer that destructures `HarnessResult` needs to narrow before reading `abortCause`. Defer until there's a concrete consumer that benefits (audit panel, replay query). Today the in-house guard + the SQLite CHECK constraint cover the production paths.
+
+**Pending:** `/model <id>` mutation; subagent observability (1.f.2, blocked on IPC); end-to-end audit with a real provider before locking M1.
+
+**Next:** end-to-end audit with a real provider, OR the IPC subsystem that unblocks 1.f.2 + D159 + D168, OR `/model` mutation.
+
+---
+
 ## [2026-05-03] M1 / Step 1.f.7 — Mutation slash commands (/plan, /budget)
 
 Closes a gap deferred from 1.f.1: `/plan on`, `/plan off`, `/budget steps N`, `/budget cost X`. The infrastructure (parser, registry, dispatcher, autocomplete UI) was complete in 1.f.1 with mutation paths intentionally rejecting; this slice fills them in. `/model <id>` stays deferred — re-resolving the provider mid-session is structurally heavier (key check, capability re-init, cost-table re-load) and warrants its own slice.

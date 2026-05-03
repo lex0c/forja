@@ -228,7 +228,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     return `cumulative cost $${cumulative.toFixed(6)} exceeded cap $${budget.maxCostUsd.toFixed(6)}`;
   };
 
-  const finish = (reason: ExitReason, detail?: string): HarnessResult => {
+  // `abortCause` is only meaningful when reason === 'aborted'; ignored
+  // otherwise. Callers thread it from the abort site that knew which
+  // signal fired (hard signal.aborted vs softStopSignal.aborted) so
+  // the result carries the discriminator audit / telemetry needs.
+  const finish = (
+    reason: ExitReason,
+    detail?: string,
+    abortCause?: 'soft' | 'hard',
+  ): HarnessResult => {
     clearTimeout(wallClockTimer);
     // Skip completeSession when init failed before createSession — there's
     // no row to mark and SQLite would just throw a foreign-key error.
@@ -236,13 +244,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       try {
         // Persist CUMULATIVE totals (prior + this run) so the row
         // reflects the session's lifetime cost. The result returned
-        // below stays per-run (caller telemetry).
+        // below stays per-run (caller telemetry). abortCause is
+        // threaded through so audit / replay tools can recover the
+        // discriminator after the process exits — without this, the
+        // in-memory HarnessResult.abortCause died at the boundary.
         completeSession(
           config.db,
           sessionId,
           exitToStatus[reason],
           priorCostUsd + totalCostUsd,
           priorUsageComplete && usageComplete,
+          undefined,
+          abortCause,
         );
       } catch {
         // Storage already broken; nothing useful to do beyond return the
@@ -261,6 +274,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       lastMessageId,
     };
     if (detail !== undefined) result.detail = detail;
+    if (reason === 'aborted' && abortCause !== undefined) {
+      result.abortCause = abortCause;
+    }
     safeEmit(config.onEvent, { type: 'session_finished', result });
     return result;
   };
@@ -271,9 +287,22 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // is for the persistence path that surrounds it. We don't know what
   // turns were measured at the throw site, so the safe call is to mark
   // aggregate totals as incomplete.
+  //
+  // Special case: if `signal.aborted` at throw time, the underlying
+  // exception is most likely AbortError (SQLite write interrupted by
+  // the abort signal, async iteration cancelled, etc.). Map to
+  // `aborted` with `cause='hard'` instead of burying it as
+  // `internalError` — operator-initiated termination shouldn't look
+  // like a harness bug in audit. Wall-clock timeout takes precedence
+  // (matches the in-loop check).
   const guardedFinish = (e: unknown): HarnessResult => {
     usageComplete = false;
     const detail = e instanceof Error ? e.message || e.name || String(e) : String(e);
+    if (signal.aborted) {
+      return isWallClockTimeout()
+        ? finish('maxWallClockMs', detail)
+        : finish('aborted', detail, 'hard');
+    }
     return finish('internalError', detail);
   };
 
@@ -615,7 +644,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
 
       while (true) {
         if (signal.aborted) {
-          return finish(isWallClockTimeout() ? 'maxWallClockMs' : 'aborted');
+          return isWallClockTimeout()
+            ? finish('maxWallClockMs')
+            : finish('aborted', undefined, 'hard');
         }
         // Cooperative stop: spec UI.md §3 soft interrupt. The check
         // sits at the top of the loop so the just-completed step's
@@ -625,7 +656,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // operator already cancelled. Distinct from the hard signal
         // above — soft never preempts in-flight work.
         if (config.softStopSignal?.aborted) {
-          return finish('aborted');
+          return finish('aborted', undefined, 'soft');
         }
         if (steps >= budget.maxSteps) return finish('maxSteps');
         // Cost cap pre-check. Critical on resume: a session whose
@@ -701,9 +732,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // SDK throws when the abort signal fires mid-call (Ctrl+C or
           // wall-clock timeout). Reroute to the matching ExitReason so the
           // user sees `interrupted` exit code 130 instead of a generic
-          // `error` from `providerError`.
+          // `error` from `providerError`. Hard signal by definition —
+          // soft can't preempt a provider call (it only fires at the
+          // next step boundary).
           if (signal.aborted) {
-            return finish(isWallClockTimeout() ? 'maxWallClockMs' : 'aborted');
+            return isWallClockTimeout()
+              ? finish('maxWallClockMs')
+              : finish('aborted', undefined, 'hard');
           }
           const cause = e instanceof CollectStepError ? e.cause : e;
           const detail =
@@ -880,7 +915,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // check; otherwise a wall-clock timeout that lands between tool
           // invocations gets misreported as a user abort.
           if (signal.aborted) {
-            return finish(isWallClockTimeout() ? 'maxWallClockMs' : 'aborted');
+            return isWallClockTimeout()
+              ? finish('maxWallClockMs')
+              : finish('aborted', undefined, 'hard');
           }
           // Cooperative-stop also honored mid-step (1.g.1, D158): if
           // the model returned multiple tool_uses and soft fired
@@ -898,7 +935,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // genuinely changes between iterations.
           const softAborted = config.softStopSignal?.aborted;
           if (softAborted) {
-            return finish('aborted');
+            return finish('aborted', undefined, 'soft');
           }
 
           // Degenerate-loop detection: hash this call and check the sliding

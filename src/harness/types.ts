@@ -375,4 +375,13 @@ export interface HarnessResult {
   // Optional human-readable detail for diagnostics (e.g., the provider
   // error message, or which tool exhausted the error budget).
   detail?: string;
+  // When `reason === 'aborted'`, discriminates whether the abort was
+  // operator-initiated cooperative ('soft' — let in-flight work
+  // finish then exit cleanly) or preemptive ('hard' — kill mid-tool
+  // / mid-stream). Undefined for any other reason — the discriminator
+  // is meaningless when the loop exited for budget caps, done, or a
+  // non-abort error. Audit log + future telemetry need this to
+  // distinguish "operator nudged" from "operator escalated";
+  // pre-1.g.2 both Esc and Esc-Esc produced identical HarnessResults.
+  abortCause?: 'soft' | 'hard';
 }

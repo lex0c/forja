@@ -93,6 +93,36 @@ describe('sessions repo', () => {
     expect(() => completeSession(db, 'nope', 'done', 0, true)).toThrow(/not found/);
   });
 
+  test('completeSession persists abortCause when provided (1.g.2)', () => {
+    const sSoft = createSession(db, { model: 'm', cwd: '/p' });
+    completeSession(db, sSoft.id, 'interrupted', 0.1, true, undefined, 'soft');
+    expect(getSession(db, sSoft.id)?.abortCause).toBe('soft');
+
+    const sHard = createSession(db, { model: 'm', cwd: '/p' });
+    completeSession(db, sHard.id, 'interrupted', 0.2, true, undefined, 'hard');
+    expect(getSession(db, sHard.id)?.abortCause).toBe('hard');
+  });
+
+  test('completeSession leaves abortCause null when not provided', () => {
+    // Non-abort terminal status (done) shouldn't carry the discriminator.
+    const s = createSession(db, { model: 'm', cwd: '/p' });
+    completeSession(db, s.id, 'done', 0, true);
+    expect(getSession(db, s.id)?.abortCause).toBeNull();
+  });
+
+  test('completeSession CHECK constraint rejects invalid abortCause values', () => {
+    // The CHECK constraint on the column is the last line of defense
+    // against a typo or a future producer regression. Bypass the
+    // typed completeSession helper and write the bad value directly
+    // to verify SQLite catches it.
+    const s = createSession(db, { model: 'm', cwd: '/p' });
+    expect(() => {
+      db.query(
+        "UPDATE sessions SET status='interrupted', abort_cause='cooperative' WHERE id = ?",
+      ).run(s.id);
+    }).toThrow();
+  });
+
   test('updateSessionCost overwrites the cost field', () => {
     const s = createSession(db, { model: 'm', cwd: '/p' });
     updateSessionCost(db, s.id, 0.01);
