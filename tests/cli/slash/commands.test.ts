@@ -163,6 +163,21 @@ describe('/sessions', () => {
     expect(r3.kind).toBe('error');
   });
 
+  test('rejects partially-numeric and decimal limits (no silent coercion)', async () => {
+    // Number.parseInt would coerce '10foo' → 10 and '1.5' → 1, but
+    // the command's error message advertises "must be a positive
+    // integer" — those inputs need to fail explicitly so a typo
+    // doesn't silently return an unexpected number of rows.
+    const ctx = makeCtx();
+    for (const bad of ['10foo', '1.5', '1e3', '0x10', ' 5', '5 ', '+5', '5.0']) {
+      const result = await sessionsCommand.exec([bad], ctx);
+      expect(result.kind).toBe('error');
+      if (result.kind !== 'error') continue;
+      expect(result.message).toContain(bad);
+      expect(result.message).toContain('positive integer');
+    }
+  });
+
   test('scopes to current cwd', async () => {
     const ctx = makeCtx();
     createSession(ctx.db, { model: 'm-here', cwd: '/test/cwd' });

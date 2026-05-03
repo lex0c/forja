@@ -155,6 +155,72 @@ describe('repl — boot + smoke', () => {
     expect(stderr).toContain('TTY');
   });
 
+  test('refuses to start when stdin is non-TTY even if stdout is TTY (regression)', async () => {
+    // Pre-fix the gate only checked caps.isTTY (derived from stdout),
+    // so a pipe-stdin / TTY-stdout combo (e.g. `echo prompt | agent`
+    // run from an interactive shell) would enter REPL mode with no
+    // usable keyboard. This test pins stdout.isTTY=true on the live
+    // process for the duration of the call so we exercise the
+    // new stdin branch in isolation.
+    const originalStdoutIsTTY = process.stdout.isTTY;
+    Object.defineProperty(process.stdout, 'isTTY', {
+      value: true,
+      configurable: true,
+    });
+    try {
+      let stderr = '';
+      // makeStdin returns an EventEmitter without isTTY — exactly the
+      // shape a piped stdin presents.
+      const code = await runRepl({
+        args: makeArgs(),
+        bootstrapOverride: makeBootstrapStub(),
+        stdin: makeStdin(),
+        errSink: (s) => {
+          stderr += s;
+        },
+      });
+      expect(code).toBe(1);
+      expect(stderr).toContain('TTY');
+    } finally {
+      Object.defineProperty(process.stdout, 'isTTY', {
+        value: originalStdoutIsTTY,
+        configurable: true,
+      });
+    }
+  });
+
+  test('accepts when both stdin and stdout report isTTY (positive control)', async () => {
+    // Inverse of the above: stdin DOES expose isTTY=true and stdout
+    // is forced to TTY. Without skipTtyCheck the gate must let the
+    // REPL boot. Confirms the new check isn't over-strict — a real
+    // interactive terminal still works.
+    const originalStdoutIsTTY = process.stdout.isTTY;
+    Object.defineProperty(process.stdout, 'isTTY', {
+      value: true,
+      configurable: true,
+    });
+    try {
+      const stdin = makeStdin();
+      Object.defineProperty(stdin, 'isTTY', { value: true, configurable: true });
+      const promise = runRepl({
+        args: makeArgs(),
+        bootstrapOverride: makeBootstrapStub(),
+        stdin,
+        // skipTtyCheck deliberately omitted — we want the REAL gate
+        // to evaluate both checks and return TRUE for both.
+      });
+      // Boot succeeded. Drive Ctrl+C to exit cleanly.
+      await tick();
+      stdin.feed('\x03');
+      expect(await promise).toBe(0);
+    } finally {
+      Object.defineProperty(process.stdout, 'isTTY', {
+        value: originalStdoutIsTTY,
+        configurable: true,
+      });
+    }
+  });
+
   test('skipTtyCheck=true lets the REPL boot and exits on empty Ctrl+C', async () => {
     const stdin = makeStdin();
     const closes: number[] = [];

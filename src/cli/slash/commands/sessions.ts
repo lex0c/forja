@@ -28,11 +28,23 @@ export const sessionsCommand: SlashCommand = {
   exec: async (args, ctx) => {
     let limit = 10;
     if (args.length > 0 && args[0] !== undefined) {
-      const parsed = Number.parseInt(args[0], 10);
+      // Strict integer match — Number.parseInt would silently accept
+      // partially-numeric strings ('10foo' → 10) and decimals
+      // ('1.5' → 1), making typos look like valid input and
+      // returning an unexpected number of sessions. Same pattern
+      // /budget steps uses for the same reason.
+      const raw = args[0];
+      if (!/^\d+$/.test(raw)) {
+        return {
+          kind: 'error',
+          message: `/sessions: invalid limit '${raw}' (must be a positive integer)`,
+        };
+      }
+      const parsed = Number.parseInt(raw, 10);
       if (!Number.isFinite(parsed) || parsed <= 0) {
         return {
           kind: 'error',
-          message: `/sessions: invalid limit '${args[0]}' (must be a positive integer)`,
+          message: `/sessions: invalid limit '${raw}' (must be a positive integer)`,
         };
       }
       limit = parsed;

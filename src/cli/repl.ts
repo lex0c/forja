@@ -95,7 +95,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const now = options.now ?? ((): number => Date.now());
 
   const caps = detectCapabilities();
-  if (!caps.isTTY && options.skipTtyCheck !== true) {
+  // Both ends must be TTYs. caps.isTTY is derived from stdout only
+  // (UI.md §1: "rendering target"); stdin is a separate concern
+  // because raw-mode keystroke parsing requires an actual terminal
+  // — a piped/redirected stdin (e.g. `echo prompt | agent`) has no
+  // keyboard at all, so entering REPL mode would land in an
+  // unusable interactive loop with no way to type. Fail fast with
+  // the advertised error rather than wedging the process.
+  //
+  // Production stdin is `process.stdin` which exposes `isTTY?: boolean`
+  // (undefined when not a TTY, true when it is). Test fixtures bypass
+  // both checks via skipTtyCheck.
+  const stdinIsTTY = (stdin as { isTTY?: boolean }).isTTY === true;
+  if (options.skipTtyCheck !== true && (!caps.isTTY || !stdinIsTTY)) {
     errSink('forja: interactive mode requires a TTY (stdin/stdout must be a terminal)\n');
     return 1;
   }
