@@ -136,7 +136,7 @@ describe('invokeTool', () => {
     expect(approvals[0]?.decision).toBe('deny');
   });
 
-  test('confirm: M1 has no UI → records confirm_no, denied tool_result mentions prompt', async () => {
+  test('confirm without callback: legacy behavior — confirm_no + denied result', async () => {
     const deps = buildDeps(restrictedTool, {
       tools: { write_file: { confirm_paths: ['x.ts'] } },
     });
@@ -152,7 +152,169 @@ describe('invokeTool', () => {
     expect(tc?.status).toBe('denied');
     const approvals = listApprovalsByToolCall(db, inv.toolCallId);
     expect(approvals[0]?.decision).toBe('confirm_no');
-    expect(approvals[0]?.reason).toContain('no UI');
+    expect(approvals[0]?.decidedBy).toBe('policy');
+    expect(approvals[0]?.reason).toContain('no UI configured');
+  });
+
+  test('confirm with callback resolving true: tool runs, recorded as confirm_yes by user', async () => {
+    const deps = {
+      ...buildDeps(restrictedTool, {
+        tools: { write_file: { confirm_paths: ['x.ts'] } },
+      }),
+      confirmPermission: async () => true,
+    };
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'x.ts' }, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(false);
+    expect(inv.toolResult.is_error).toBeUndefined();
+
+    const tc = getToolCall(db, inv.toolCallId);
+    expect(tc?.status).toBe('done');
+    const approvals = listApprovalsByToolCall(db, inv.toolCallId);
+    expect(approvals[0]?.decision).toBe('confirm_yes');
+    expect(approvals[0]?.decidedBy).toBe('user');
+  });
+
+  test('confirm with callback resolving false: tool denied, recorded as confirm_no by user', async () => {
+    const deps = {
+      ...buildDeps(restrictedTool, {
+        tools: { write_file: { confirm_paths: ['x.ts'] } },
+      }),
+      confirmPermission: async () => false,
+    };
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'x.ts' }, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(true);
+    expect(inv.toolResult.is_error).toBe(true);
+    expect(inv.toolResult.content).toContain('denied by user');
+
+    const tc = getToolCall(db, inv.toolCallId);
+    expect(tc?.status).toBe('denied');
+    const approvals = listApprovalsByToolCall(db, inv.toolCallId);
+    expect(approvals[0]?.decision).toBe('confirm_no');
+    expect(approvals[0]?.decidedBy).toBe('user');
+  });
+
+  test('confirm with callback that throws: collapses to denied (defensive)', async () => {
+    const deps = {
+      ...buildDeps(restrictedTool, {
+        tools: { write_file: { confirm_paths: ['x.ts'] } },
+      }),
+      confirmPermission: async () => {
+        throw new Error('modal closed unexpectedly');
+      },
+    };
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'x.ts' }, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(true);
+    const approvals = listApprovalsByToolCall(db, inv.toolCallId);
+    expect(approvals[0]?.decision).toBe('confirm_no');
+    expect(approvals[0]?.decidedBy).toBe('user');
+  });
+
+  test('confirm with callback receives toolName, args, cwd, prompt', async () => {
+    let captured: unknown;
+    const deps = {
+      ...buildDeps(restrictedTool, {
+        tools: { write_file: { confirm_paths: ['x.ts'] } },
+      }),
+      confirmPermission: async (req: unknown): Promise<boolean> => {
+        captured = req;
+        return false;
+      },
+    };
+    await invokeTool(
+      { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'x.ts' }, messageId },
+      deps,
+    );
+    expect(captured).toEqual({
+      toolName: 'write_file',
+      args: { path: 'x.ts' },
+      cwd: '/p',
+      prompt: expect.any(String) as unknown as string,
+    });
+  });
+
+  test('confirm: signal aborts while modal is pending → denied without waiting on callback', async () => {
+    // The callback never resolves — only the abort can settle the
+    // race. Without the abort plumbing, this test would time out.
+    const controller = new AbortController();
+    let callbackInvoked = false;
+    const deps = {
+      ...buildDeps(restrictedTool, {
+        tools: { write_file: { confirm_paths: ['x.ts'] } },
+      }),
+      confirmPermission: () => {
+        callbackInvoked = true;
+        return new Promise<boolean>(() => {
+          /* intentionally never resolves */
+        });
+      },
+      signal: controller.signal,
+    };
+    const invocation = invokeTool(
+      { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'x.ts' }, messageId },
+      deps,
+    );
+    // Give the bridged path a microtask to call the callback before
+    // we abort — confirms the signal cuts in WHILE the callback is
+    // already in flight.
+    await Promise.resolve();
+    controller.abort();
+    const inv = await invocation;
+    expect(callbackInvoked).toBe(true);
+    expect(inv.failed).toBe(true);
+    expect(inv.toolResult.content).toContain('denied by user');
+    const approvals = listApprovalsByToolCall(db, inv.toolCallId);
+    expect(approvals[0]?.decision).toBe('confirm_no');
+    expect(approvals[0]?.decidedBy).toBe('user');
+  });
+
+  test('confirm_yes: audit row reason left null (decision speaks for itself)', () => {
+    // Synchronous sub-test to keep matrix small: one async invocation,
+    // assertions on the audit row.
+    return (async () => {
+      const deps = {
+        ...buildDeps(restrictedTool, {
+          tools: { write_file: { confirm_paths: ['x.ts'] } },
+        }),
+        confirmPermission: async () => true,
+      };
+      const inv = await invokeTool(
+        { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'x.ts' }, messageId },
+        deps,
+      );
+      const approvals = listApprovalsByToolCall(db, inv.toolCallId);
+      expect(approvals[0]?.decision).toBe('confirm_yes');
+      expect(approvals[0]?.reason).toBeNull();
+    })();
+  });
+
+  test('confirm_no: tool_result is bare "denied by user" (no engine prompt suffix)', async () => {
+    const deps = {
+      ...buildDeps(restrictedTool, {
+        tools: { write_file: { confirm_paths: ['x.ts'] } },
+      }),
+      confirmPermission: async () => false,
+    };
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'x.ts' }, messageId },
+      deps,
+    );
+    // Model-facing message must not pretend to know the user's
+    // reason — that's why we don't append the engine's prompt.
+    expect(inv.toolResult.content).toBe('denied by user');
+    // The engine's prompt still lives in the audit row's reason
+    // (explains why the user was asked).
+    const approvals = listApprovalsByToolCall(db, inv.toolCallId);
+    expect(approvals[0]?.reason).not.toBeNull();
+    expect(typeof approvals[0]?.reason).toBe('string');
   });
 
   test('tool returns ToolError: persists status=error, surfaces error result', async () => {

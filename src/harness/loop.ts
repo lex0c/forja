@@ -981,6 +981,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               engine: config.permissionEngine,
               ctx,
               ...(config.planMode === true ? { planMode: true } : {}),
+              ...(config.confirmPermission !== undefined
+                ? { confirmPermission: config.confirmPermission }
+                : {}),
+              signal,
             },
           );
 

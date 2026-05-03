@@ -289,6 +289,18 @@ export interface HarnessConfig {
   // HarnessConfig directly) and owns its own audit/persistence
   // wiring; the harness just hands it through.
   memoryRegistry?: MemoryRegistry;
+  // Async hook the harness calls when the permission engine returns
+  // a `confirm` decision. Caller resolves true to allow the call
+  // (recorded as confirm_yes) or false to deny (confirm_no). When
+  // unset, `confirm` decisions fall back to deny-with-reason — the
+  // legacy headless behavior. Interactive callers (REPL) wire this
+  // to their modal manager; one-shot mode leaves it unset.
+  confirmPermission?: (req: {
+    toolName: string;
+    args: Record<string, unknown>;
+    cwd: string;
+    prompt: string;
+  }) => Promise<boolean>;
 }
 
 export interface HarnessResult {

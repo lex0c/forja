@@ -382,6 +382,49 @@ describe('repl — boot + smoke', () => {
     expect(dbCloseIdx).toBeGreaterThan(runResolveIdx);
   });
 
+  test('confirmPermission bridge translates args via vocab into modalManager.askPermission', async () => {
+    // Drive a confirmPermission call through the REPL's bridge and
+    // capture whatever the harness saw. Since modalManager is internal
+    // to the REPL, we exercise the bridge by calling cfg.confirmPermission
+    // directly and asserting it returns a boolean (resolved via the
+    // bus → reducer → manager loop). The modal-manager test covers the
+    // queue / hotkey behavior; this covers the seam.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    expect(cfg?.confirmPermission).toBeDefined();
+    // Fire the bridge with read_file args — vocab extracts `path` as
+    // the subject. Then immediately resolve "no" by feeding Esc to the
+    // modal handler so the promise settles.
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'read_file',
+      args: { path: '/x.ts' },
+      cwd: '/tmp',
+      prompt: 'access outside workspace?',
+    });
+    await tick();
+    // Modal up — Esc rejects (false).
+    stdin.feed('\x1b\x1b');
+    await tick();
+    const answer = await askPromise;
+    expect(answer).toBe(false);
+    // Wrap up.
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x03');
+    expect(await promise).toBe(0);
+  });
+
   test('error thrown by runAgent surfaces as an error UIEvent and lets the REPL continue', async () => {
     const stdin = makeStdin();
     const resolvers: Array<(r: HarnessResult) => void> = [];

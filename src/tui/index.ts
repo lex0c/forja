@@ -13,3 +13,4 @@ export * from './modal-manager.ts';
 export * from './renderer.ts';
 export * from './state.ts';
 export * from './term.ts';
+export * from './tool-vocab.ts';

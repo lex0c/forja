@@ -36,6 +36,7 @@ import {
   createModalManager,
   createRenderer,
   detectCapabilities,
+  lookupToolVocab,
 } from '../tui/index.ts';
 import type { ParsedArgs } from './args.ts';
 import { type BootstrapInput, type BootstrapResult, bootstrap } from './bootstrap.ts';
@@ -183,6 +184,43 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     }
   };
 
+  // Bridge for the harness's confirm decisions: extracts a one-line
+  // subject from args via the per-tool vocab so the modal carries
+  // something readable as the command, then awaits the user's choice
+  // through modalManager. Lives at the REPL layer because it crosses
+  // the harness/TUI seam — the harness has no business importing
+  // tool-vocab.ts.
+  const confirmPermission = async (req: {
+    toolName: string;
+    args: Record<string, unknown>;
+    cwd: string;
+    prompt: string;
+  }): Promise<boolean> => {
+    const vocab = lookupToolVocab(req.toolName);
+    let command = '';
+    try {
+      command = vocab.subject?.(req.args) ?? '';
+    } catch {
+      command = '';
+    }
+    if (command === '') {
+      // Fallback: cap a JSON dump so the modal at least has something
+      // to display when the vocab has no extractor for this tool.
+      try {
+        command = JSON.stringify(req.args);
+      } catch {
+        command = '<unserializable args>';
+      }
+      if (command.length > 80) command = `${command.slice(0, 80)}…`;
+    }
+    return modalManager.askPermission({
+      toolName: req.toolName,
+      command,
+      cwd: req.cwd,
+      reason: req.prompt,
+    });
+  };
+
   const startTurn = (text: string): void => {
     if (running || exiting) return;
     running = true;
@@ -193,6 +231,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       userPrompt: text,
       signal: abortController.signal,
       onEvent: (e) => onHarnessEvent(adapter, e),
+      confirmPermission,
       ...(lastSessionId !== null ? { resumeFromSessionId: lastSessionId } : {}),
     };
     const runAgentImpl = options.runAgentOverride ?? runAgent;

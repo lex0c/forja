@@ -15,6 +15,64 @@ Format:
 
 ---
 
+## [2026-05-02] M1 / Step 1.d.5 — Permission engine ↔ modal manager bridge
+
+Closes the long-standing UX gap: a `confirm` decision from the
+permission engine no longer falls back to silent denial in
+interactive mode. The harness now accepts an async
+`confirmPermission` callback in `HarnessConfig`, threads it down
+into `invokeTool`, and awaits the user's choice between the
+permission engine's `confirm` step and the tool execution. The REPL
+provides the callback, bridging into the existing `modalManager.
+askPermission` (which has been wired since 1.d.2 but had no producer
+calling it).
+
+Scope deliberately incremental. The spec §4.10.13 / §5.5 generalized
+modal (3 options, tool-aware preview, Esc=cancel-distinct-from-No,
+session-bypass) is the future canonical shape, but landing it here
+would require a parallel refactor of `ConfirmState`, `modalManager`,
+and `renderModal`. This slice ships the BRIDGE — yes/no via the
+existing 2-option modal — so the user-visible gap closes now; the
+modal refactor lands as its own slice.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/harness/invoke-tool.ts` | NEW `ConfirmPermissionRequest` interface + `InvokeToolDeps.confirmPermission?: (req) => Promise<boolean>` + `InvokeToolDeps.signal?: AbortSignal`. New `Setup` phase `'confirm_pending'` for the async branch: when a `confirm` decision is reached AND the callback is set, the setup transaction creates the tool_call row but leaves it in `pending` (no approval row yet); the post-transaction code awaits the user via `raceAgainstAbort()` (settles immediately as denied if the harness signal aborts mid-modal — Ctrl+C closes both the run and the modal in one step), then commits a second transaction with the approval (`confirm_yes` or `confirm_no`, `decidedBy: 'user'`) plus start/finish. Callback throw collapses to denied. Audit row reason: engine prompt on `confirm_no` (explains why the user was asked); null on `confirm_yes` (decision speaks for itself). Tool result on denial is bare `denied by user` — no engine-prompt suffix, since the prompt is why the engine ASKED, not why the user rejected; passing it would misrepresent the user's reasoning to the model. NEW `raceAgainstAbort()` helper module-private. Legacy headless behavior (no callback set) preserved verbatim — message updated from "no UI in M1" to "no UI configured" to reflect that one-shot mode also takes this path. |
+| `src/harness/types.ts` | NEW `HarnessConfig.confirmPermission` field, mirrored shape from `InvokeToolDeps`. |
+| `src/harness/loop.ts` | Loop's `invokeTool` call threads `confirmPermission` and `signal` into deps. |
+| `src/cli/repl.ts` | NEW REPL-level `confirmPermission` bridge. Extracts a one-line `command` from args via `lookupToolVocab(toolName).subject?.(args)` so the modal carries something readable; falls back to truncated JSON when the tool has no subject extractor. Calls `modalManager.askPermission({toolName, command, cwd, reason: prompt})` and returns its boolean. The bridge lives in the REPL because crossing the harness/TUI seam is its job — `invoke-tool.ts` has no business importing `tool-vocab.ts`. Threaded through `HarnessConfig` per turn alongside `signal` / `onEvent`. |
+| `src/tui/index.ts` | Re-exports `tool-vocab.ts` so `cli/repl.ts` can `import { lookupToolVocab } from '../tui/index.ts'` instead of reaching into the module path directly. |
+| `tests/harness/invoke-tool.test.ts` | Existing "M1 has no UI" test renamed to "confirm without callback: legacy behavior" with assertion text bumped to match the new message. NEW 7 tests covering the bridged path: callback resolves true → tool runs + `confirm_yes` by user; callback resolves false → denied + `confirm_no` by user; callback throws → denied (defensive); callback receives the right shape (toolName, args, cwd, prompt); signal aborts while modal pending → invocation settles as denied without waiting on the (never-resolving) callback; `confirm_yes` audit row's reason is null; denied tool_result is bare "denied by user" (no engine-prompt suffix). |
+| `tests/cli/repl.test.ts` | NEW REPL bridge test: drives `cfg.confirmPermission` directly (capturing it via the `runAgentOverride` seam) with a real tool name + args, feeds Esc Esc to the modal handler, asserts the bridge resolves false. Exercises the seam end-to-end: vocab lookup → modalManager.askPermission → focus handler → bus → reducer → manager resolution. |
+
+**Decisions:**
+
+- **D106 — Incremental bridge over spec-aligned refactor.** The §4.10.13 modal (3 options, tool-aware preview, Esc=cancel) is the future canonical shape but lands as its own slice. Refactoring `ConfirmState` + `modalManager` + `renderModal` AND the harness bridge in one slice would have been ~4× the work and risked landing a half-done refactor. Yes/no via the existing modal closes the user-visible gap NOW; the spec-shape upgrade follows.
+- **D107 — Callback returns `boolean`, not the spec's `'yes' \| 'session-allow' \| 'no' \| 'cancel'`.** Mirrors the current modal manager's API. When session-allow lands (with the modal refactor), the callback signature widens — old callers map to `boolean` cleanly (`!== 'no' && !== 'cancel'` = allow). Forward-compatible without breaking the harness contract today.
+- **D108 — Setup transaction split for the async branch.** The pre-1.d.5 invariant was "every tool_call row has at least one approval row, atomic via `withTransaction`". Async user input forces a split: tx1 creates the row (no approval yet), then await user, then tx2 records the approval + start/finish. Crash window: process death between tx1 and the user's answer leaves an orphan `pending` row. Acceptable for M1 — orphan rows surface in audit as "started but never finished" and can be reaped manually. Closing the window properly would need either a synchronous prompt (impossible without TUI involvement) or an atomic "create-call-with-pending-user-approval" row shape (storage schema change).
+- **D109 — Callback throw collapses to denied, doesn't propagate.** A throw from `confirmPermission` is rare (modal manager normally resolves `false` on Esc / close / timeout), but if the modal infrastructure crashes mid-prompt the run shouldn't hang on a stuck pending row. The catch records `confirm_no` by user with the original prompt as the reason — operator sees "denied by user" in scrollback even though the rejection was internal to the UI. Trade-off documented; alternative was to escalate the throw into a tool error, which would be more confusing because the tool didn't actually fail.
+- **D110 — `decidedBy: 'user'` distinguishes bridged decisions in audit.** The legacy headless deny path uses `decidedBy: 'policy'` with reason "no UI configured". The bridged path uses `decidedBy: 'user'` with the engine's prompt as the reason. Audit consumers can filter "show me all the times the user explicitly approved/rejected something" without false positives from the headless deny path.
+- **D111 — Subject extraction lives in the REPL, not in `invoke-tool.ts`.** `invoke-tool.ts` is in `src/harness/`; importing `tool-vocab.ts` from `src/tui/` would cross the layer seam. The REPL is already the seam-crossing module — it builds the harness config + owns the modal manager. Putting the vocab lookup there keeps the harness vocab-agnostic. Cost: REPL repeats the vocab+JSON-fallback shape that the adapter does for `tool:start` events; if a third call site appears, extract a helper.
+- **D112 — `signal` raced against the bridged confirm callback.** Without it, Ctrl+C while a modal is open required two steps: signal aborts the run state but the harness was blocked on `await askUser(...)`; user had to Esc out of the modal manually before the harness's top-of-loop signal check fired. Adding the abort race makes Ctrl+C single-step: signal aborts → race rejects → catch collapses to denied → loop continues to its top-of-iteration signal check → exit. `raceAgainstAbort()` helper takes a producer + signal and returns whichever settles first; cleans up the abort listener in both branches so we don't leak.
+- **D113 — Bare "denied by user" in the model-facing tool_result; engine prompt only on the audit row's reason.** Initial draft used `denied by user: ${prompt}` — the prompt was the engine's question ("matches deny rule X"), not the user's reason. Telling the model "user said no because of rule X" misrepresents the reasoning. Bare message; the prompt still lives on the audit row's `reason` field for `confirm_no` (where it explains the engine's role). For `confirm_yes`, the audit row's reason is null — the decision (`confirm_yes` by user) is self-explanatory.
+
+**Pending / out of scope this slice:**
+
+- **3-option modal layout** (yes / yes-session-allow / no) per §4.10.13. Requires `ConfirmState` + `modalManager` + `renderModal` refactor. Distinct slice.
+- **`previewForApproval(args, ctx): string[]` on each `ToolDef`** (D63) — diff for edit_file, command for bash, etc. Modal currently shows the bare `command` (subject) + cwd + reason; the rich preview lands with the modal-shape refactor.
+- **Session-bypass** (`Yes, allow all <toolName> during this session`) — D64. Requires the 3-option modal AND a session-layer policy mutation (engine support exists; producer doesn't).
+- **`Tab to amend`** (edit-then-confirm) — feature v2 per spec §4.10.13.
+- **One-shot mode confirm UI.** `--prompt "x"` mode still has no callback (D106 says only REPL bridges). One-shot users get the legacy "no UI configured" denial. Could be unlocked via a `--yes` flag (auto-approve all confirms) or a stdin-prompt fallback (read y/n from stdin).
+- **Multiple confirm decisions in flight.** modalManager handles queueing internally (FIFO); harness fires confirms serially per tool, so queue depth shouldn't exceed 1 in practice. Not exercised.
+
+**Verification:** `bun test` → 2032 pass / 10 skip / 0 fail (+8 new across invoke-tool and repl, +1 renamed). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Spec-shape modal refactor — generalize `ConfirmState` to N-option list with `selectedIndex`, `previewForApproval` contract on `ToolDef`, session-bypass option, Esc-as-cancel-distinct-from-No. The biggest visual UX upgrade after this; sets up the rest of §4.10.13 for landing without further harness changes.
+
+---
+
 ## [2026-05-02] M1 / Step 1.e.4 — Footer below input + plan mode indicator
 
 Closes the bottom anchor: rule + input + rule + footer (UI.md
