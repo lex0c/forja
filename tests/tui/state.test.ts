@@ -552,6 +552,51 @@ describe('todo:update', () => {
   });
 });
 
+describe('interrupt (soft / hard)', () => {
+  test('initial state has softInterrupted false', () => {
+    expect(createInitialState().softInterrupted).toBe(false);
+  });
+
+  test('interrupt soft sets softInterrupted true (no permanent)', () => {
+    const r = applyEvent(createInitialState(), { type: 'interrupt', ts: 1, level: 'soft' });
+    expect(r.state.softInterrupted).toBe(true);
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('interrupt hard does not flip softInterrupted (purely diagnostic today)', () => {
+    const r = applyEvent(createInitialState(), { type: 'interrupt', ts: 1, level: 'hard' });
+    expect(r.state.softInterrupted).toBe(false);
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('repeated soft interrupts are idempotent (already true stays true)', () => {
+    const { state } = drive([
+      { type: 'interrupt', ts: 1, level: 'soft' },
+      { type: 'interrupt', ts: 2, level: 'soft' },
+      { type: 'interrupt', ts: 3, level: 'soft' },
+    ]);
+    expect(state.softInterrupted).toBe(true);
+  });
+
+  test('session:end clears softInterrupted (ready for next turn)', () => {
+    const { state } = drive([
+      start(),
+      { type: 'interrupt', ts: 2, level: 'soft' },
+      { type: 'session:end', ts: 3, sessionId: 's1', reason: 'aborted' },
+    ]);
+    expect(state.softInterrupted).toBe(false);
+    expect(state.ended).toBe(true);
+  });
+
+  test('session:start clears softInterrupted (boundary cleanup before resume)', () => {
+    const { state } = drive([
+      { type: 'interrupt', ts: 1, level: 'soft' },
+      start({ ts: 2, sessionId: 's2' }),
+    ]);
+    expect(state.softInterrupted).toBe(false);
+  });
+});
+
 describe('not-yet-wired events accept silently', () => {
   test.each([
     [

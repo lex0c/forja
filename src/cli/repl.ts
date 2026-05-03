@@ -480,9 +480,26 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       requestShutdown();
     }
 
-    // Soft interrupt (single Esc) → abort the running turn. Esc with
-    // no run in progress is a no-op.
+    // Soft interrupt (single Esc) → emit interrupt UIEvent + abort
+    // the running turn. The UIEvent flips the footer cue from
+    // "esc to interrupt" to "esc again to force" via the reducer's
+    // softInterrupted flag (spec UI.md §4.10.6); the abort triggers
+    // the existing harness teardown path. Esc with no run in
+    // progress is a no-op (the editor's own slash-mode Esc handler
+    // already intercepted the keystroke before it reaches here).
+    //
+    // Second Esc while soft is already in flight promotes to a hard
+    // interrupt — honors the "esc again to FORCE" cue's promise on
+    // the event stream so audit can distinguish "operator nudged
+    // once" from "operator escalated". The reducer is no-op on
+    // hard today (D141); the harness's AbortController.abort() is
+    // already preemptive (cancels mid-tool at the next yield),
+    // matching what spec calls "hard". The cooperative
+    // step-boundary "soft" semantics live in a future slice — when
+    // they land, this branch already routes the right intent.
     if (result.interruptSoft === true && running && abortController !== null) {
+      const level: 'soft' | 'hard' = renderer.state().softInterrupted ? 'hard' : 'soft';
+      bus.emit({ type: 'interrupt', ts: now(), level });
       abortController.abort();
     }
 
@@ -506,8 +523,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // editor's Ctrl+C handling overlaps but isn't redundant: keyboard
   // Ctrl+C in raw mode lands as a `cancelInput` editor signal,
   // SIGINT lands here. Both routes converge on the same outcome.
+  //
+  // Mirror the Esc path's interrupt event so Ctrl+C and Esc reach
+  // parity on the footer cue (spec UI.md §5.4 treats both as
+  // soft-cancel; second tap as hard). Without the emit, Ctrl+C
+  // aborts silently and the operator never sees "esc again to force"
+  // — strictly worse UX than Esc and inconsistent with the spec's
+  // single-keybinding-pair model.
   const sigintHandler = (): void => {
     if (running && abortController !== null) {
+      const level: 'soft' | 'hard' = renderer.state().softInterrupted ? 'hard' : 'soft';
+      bus.emit({ type: 'interrupt', ts: now(), level });
       abortController.abort();
     } else {
       exitCode = 130;

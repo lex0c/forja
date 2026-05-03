@@ -15,6 +15,42 @@ Format:
 
 ---
 
+## [2026-05-03] M1 / Step 1.f.6 — Soft-aborted footer state
+
+Closes the missing footer state from spec UI.md §4.10.6. Until now, hitting Esc mid-turn aborted the run via `AbortController.abort()`, but the footer's interrupt cue stayed at "esc to interrupt" — the operator had no signal that the loop had acknowledged. Spec table:
+
+| State | Cue |
+|---|---|
+| Running | `esc to interrupt` |
+| **Soft-aborted (still processing)** | `esc again to force` |
+
+This slice wires the missing transition: REPL emits an `interrupt` UIEvent on the bus when soft Esc fires, the reducer flips a `softInterrupted` flag, the footer renderer reads it and swaps the cue. Boundary cleanup (session:start / session:end) clears the flag so the next turn starts clean.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/state.ts` | NEW `LiveState.softInterrupted: boolean` (defaults false). Reducer's `interrupt` case (was no-op) sets the flag on `level: 'soft'`; `level: 'hard'` is a no-op state-wise (purely diagnostic until hard-abort semantics land). `session:start` and `session:end` both clear the flag — boundary cleanup so a fresh turn starts clean and a stale flag from one session can't leak into another. |
+| `src/cli/repl.ts` | Editor's `interruptSoft` signal now emits `bus.emit({type: 'interrupt', ts: now(), level: 'soft'})` BEFORE calling `abortController.abort()`. The bus emission flows through the reducer (flips the flag) and the renderer (re-paints the footer) in the same tick the abort fires. Existing abort behavior preserved — this slice adds the visible signal, doesn't change the cancellation mechanics. |
+| `src/tui/render/footer.ts` | When `state.softInterrupted && isRunning(state)`, the left-column cue swaps from `esc to interrupt` to `esc again to force`. When `isRunning` is false, neither cue surfaces — "esc again to force" against nothing is meaningless, and the flag self-clears on `session:end` anyway. |
+| `tests/tui/state.test.ts` | NEW 6 tests on the interrupt branch: initial state has flag false; soft sets true (no permanent); hard does not flip the flag; repeated soft is idempotent; `session:end` clears the flag; `session:start` clears the flag. The "not-yet-wired" interrupt row stays — its assertion (no permanent emitted) is still correct. |
+| `tests/tui/render/footer.test.ts` | NEW 2 tests: soft-aborted + running shows the new cue and replaces (not duplicates) the old one; soft-aborted + idle drops both cues entirely. |
+| `tests/cli/repl.test.ts` | NEW end-to-end test driving the full bus → reducer → footer chain: send `go\r`, drive `session_start` + `tool_invoking` (the footer's `isRunning` checks `activeTools.size`), feed `\x1b\x1b` so the parser flushes a complete escape key, assert the captured rendererWrite frames flip from `esc to interrupt` to `esc again to force`. |
+
+**Decisions:**
+
+- **D141 — Backend cancellation is already hard; soft-cooperative is the missing slice.** Spec UI.md §3 distinguishes `level: 'soft'` (model finishes the step then stops) from `level: 'hard'` (cancel tool in flight immediately). Auditing `src/harness/loop.ts` (signal.aborted check at the loop boundary) + `invoke-tool.ts` (signal propagated into the tool) + `abortable.ts` (rejects the iterator immediately): what exists today preempts the tool in flight and the provider stream — that's HARD by spec definition. The cue ladder `esc to interrupt → esc again to force` therefore implies a soft→hard escalation that the backend doesn't actually implement. This slice surfaces the visible signal and routes the right intent on the bus (second Esc emits `level: 'hard'`); the COOPERATIVE soft path (drain at step boundary, let the model finish the current step before stopping) is the missing future slice that touches the harness loop. The reducer's `interrupt` branch is exhaustive on `level` so the soft-cooperative semantic can light up without renderer churn when it lands.
+- **D144 — SIGINT (Ctrl+C) emits the same interrupt UIEvent as Esc.** Initial cut wired only the Esc path. Code review caught the asymmetry: Ctrl+C aborted via SIGINT but the footer never flipped, so operators using Ctrl+C (the more common Unix muscle memory) got strictly worse UX than Esc users. SIGINT handler now mirrors the Esc path: emit `interrupt:soft` (or `:hard` if soft already in flight) before calling `abortController.abort()`. Spec UI.md §5.4 treats both keybindings as a single soft/hard ladder — the implementation now matches.
+- **D145 — Second Esc/Ctrl+C while soft already in flight emits `level: 'hard'`.** Initial cut re-emitted `soft` on every press, lying to audit about whether the operator escalated. The cue text "esc again to force" promises an escalation; the event stream now reflects it. Detection reads `renderer.state().softInterrupted` rather than maintaining a parallel REPL-side flag — single source of truth, automatic clear on session boundaries via the reducer. The reducer's hard branch is no-op state-wise today (D141), but audit/persistence layers (when wired) will see the right intent.
+- **D142 — Boundary clear on both session:start AND session:end.** Either alone would be sufficient in the happy path, but they cover different failure modes. `session:end` clear: ensures a turn that ended without tearing down the soft flag (because the run terminated for another reason — `done`, `maxSteps`) doesn't leave a stale "esc again to force" hanging in the footer. `session:start` clear: defends against a resume where the prior session ended mid-soft and the persistence path didn't clear it. Belt + suspenders for a small flag.
+- **D143 — Idle + soft drops the cue entirely (defensive).** `softInterrupted` should self-clear via `session:end` before the operator sees an idle frame. But if the flag somehow lingers without an active operation (test-injected state, replay path, future bug), the footer surfaces neither cue — "esc again to force" against nothing is misleading. The renderer is the last line of defense; the flag's correctness is the reducer's job.
+
+**Pending:** mutation slash commands; subagent observability (1.f.2, blocked on IPC); bg observability (1.f.3); hard-abort semantics (separate slice — distinguishes `interrupt:soft` "let the step finish" from `interrupt:hard` "kill mid-tool" at the harness loop layer).
+
+**Next:** the M1 TUI series is now functionally complete on the live-region surface. Next natural step is either (a) hard-abort semantics, (b) bg observability (1.f.3, in-process), or (c) auditing the slice end-to-end with a real provider before locking M1.
+
+---
+
 ## [2026-05-02] M1 / Step 1.f.5 — Assistant chip + tokens
 
 Closes the second "operation chip" the live region was missing: the assistant turn itself. Until now the operator could see tools execute (chips) and the assistant text (raw scrollback) but had no live signal that the model was actively generating — and the per-turn token count was discarded by the adapter. Spec UI.md §4.10.5 always positioned the assistant turn as a first-class operation chip (`▸ Generating… (8s · ↑ 234 tokens)` while live; `· Generated 234 tokens in 8.2s` once final). This slice wires the producer (provider `usage` events the adapter was dropping), the chip render, and a header above the assistant text in scrollback.

@@ -8,8 +8,11 @@
 //   - interruptSoft: single Esc — caller decides whether to forward
 //     to the harness based on loop state
 //
-// Hard interrupt (Esc Esc within a window) is detected by the REPL
-// loop, not here — the editor only sees one key per call.
+// Hard interrupt (second Esc while soft already in flight) is
+// detected by the REPL loop, not here — the editor only sees one key
+// per call and is stateless across calls. The REPL reads the
+// renderer's softInterrupted flag to distinguish first Esc from
+// second.
 //
 // The editor is `state in, state out` — no side effects. The caller
 // (REPL loop) owns the bus, the harness, the cursor visibility. This

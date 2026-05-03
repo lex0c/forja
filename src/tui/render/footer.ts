@@ -37,9 +37,17 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   // by an unrelated status line.
   if (state.modal !== null) return null;
 
-  // Left column: hint + interrupt cue (interrupt only when running).
+  // Left column: hint + interrupt cue. While running, the cue starts
+  // as "esc to interrupt"; once the operator hits Esc once
+  // (softInterrupted flips true via the reducer), it swaps to
+  // "esc again to force" per spec §4.10.6 — telling the operator
+  // the loop has acknowledged the request and is winding down.
+  // softInterrupted clears on session boundaries, so a fresh turn
+  // starts back on "esc to interrupt".
   const leftParts = [dim(caps, '? for help')];
-  if (isRunning(state)) leftParts.push(dim(caps, 'esc to interrupt'));
+  if (isRunning(state)) {
+    leftParts.push(dim(caps, state.softInterrupted ? 'esc again to force' : 'esc to interrupt'));
+  }
   const sep = dim(caps, ' · ');
   const left = leftParts.join(sep);
 

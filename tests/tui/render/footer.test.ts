@@ -78,6 +78,60 @@ describe('renderFooter', () => {
     expect(renderFooter(s, caps)).toContain('esc to interrupt');
   });
 
+  test('soft-aborted + running swaps cue to "esc again to force"', () => {
+    // Spec UI.md §4.10.6: once the operator hit Esc once mid-turn,
+    // the footer signals that the loop has acknowledged and is
+    // winding down — pressing Esc again will force.
+    const s = startedSession();
+    const tool: ActiveTool = {
+      toolId: 't1',
+      name: 'bash',
+      activeVerb: 'Executing',
+      finalVerb: 'Executed',
+      subject: null,
+      startedAt: 0,
+      preview: [],
+    };
+    s.activeTools.set('t1', tool);
+    s.softInterrupted = true;
+    const out = renderFooter(s, caps);
+    expect(out).toContain('esc again to force');
+    // Original "esc to interrupt" cue is replaced, not duplicated.
+    expect(out).not.toContain('esc to interrupt');
+  });
+
+  test('soft-aborted + streaming pendingAssistant also swaps the cue', () => {
+    // The cue must swap regardless of WHICH operation is keeping
+    // isRunning true (tool, thinking, or assistant streaming). Tool
+    // path is covered above; this test locks the streaming-only path.
+    const s = startedSession();
+    s.softInterrupted = true;
+    s.pendingAssistant = {
+      messageId: 'm1',
+      text: '',
+      startedAt: 0,
+      inputTokens: null,
+      outputTokens: null,
+      cacheRead: null,
+      cacheCreation: null,
+    };
+    const out = renderFooter(s, caps);
+    expect(out).toContain('esc again to force');
+    expect(out).not.toContain('esc to interrupt');
+  });
+
+  test('soft-aborted + idle drops the cue entirely (run already done)', () => {
+    // softInterrupted should self-clear via session:end, but a guard:
+    // if it somehow lingers in the absence of a running operation,
+    // the footer doesn't surface either cue. The "esc again to force"
+    // signal is meaningless when there's nothing to force against.
+    const s = startedSession();
+    s.softInterrupted = true;
+    const out = renderFooter(s, caps);
+    expect(out).not.toContain('esc again to force');
+    expect(out).not.toContain('esc to interrupt');
+  });
+
   test('plan mode adds `plan` between model and budget', () => {
     const s = startedSession({ planMode: true });
     const out = renderFooter(s, caps);

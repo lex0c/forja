@@ -178,6 +178,15 @@ export interface LiveState {
   // wholesale on every `todo:update` per spec §7.4 ("o model passa a
   // lista intencionada inteira; sem semantics de merge").
   todos: TodoItemForUI[];
+  // Operator hit Esc once during a running turn (spec UI.md §4.10.6
+  // "Soft-aborted (ainda processando)"). The footer swaps its
+  // interrupt cue from "esc to interrupt" to "esc again to force"
+  // until the run terminates. Cleared on session boundaries
+  // (start/end) so a fresh turn begins clean. Hard interrupts have
+  // no state effect today — they're emitted for audit but the
+  // immediate-vs-cooperative cancellation distinction lives in a
+  // future hard-abort slice.
+  softInterrupted: boolean;
   // Set true after `session:end`; renderer uses to decide whether to
   // accept further input or stop redrawing.
   ended: boolean;
@@ -202,6 +211,7 @@ export const createInitialState = (): LiveState => ({
   modal: null,
   slash: null,
   todos: [],
+  softInterrupted: false,
   ended: false,
 });
 
@@ -306,8 +316,12 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
         model: event.model,
         planMode: event.planMode === true,
       };
+      // Boundary cleanup: soft-interrupt state is a within-turn
+      // signal. A fresh session starts clean even if the prior one
+      // ended mid-soft (operator hit Esc, then the run terminated
+      // for another reason before interrupting).
       return {
-        state: { ...state, status, ended: false },
+        state: { ...state, status, softInterrupted: false, ended: false },
         permanent: [
           {
             kind: 'session-header',
@@ -321,8 +335,12 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
     }
 
     case 'session:end':
+      // Boundary cleanup: clear the soft-interrupt flag so the
+      // footer's "esc again to force" cue stops surfacing once the
+      // run actually terminates (regardless of WHY it ended — could
+      // be the soft-abort succeeding, could be done/error/maxSteps).
       return {
-        state: { ...state, ended: true },
+        state: { ...state, softInterrupted: false, ended: true },
         permanent: [{ kind: 'session-footer', reason: event.reason }],
       };
 
@@ -551,9 +569,16 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       return { state, permanent: [{ kind: 'info', message: event.message }] };
 
     case 'interrupt':
-      // Renderer surfaces interrupt prompt in the input box area;
-      // permanent log only on confirmation, handled by a separate
-      // event the producer emits afterwards.
+      // Spec UI.md §4.10.6: soft interrupt flips the footer cue from
+      // "esc to interrupt" to "esc again to force". Hard interrupt
+      // has no state effect today — it's emitted for audit, but the
+      // immediate-vs-cooperative cancellation distinction lives in
+      // a future hard-abort slice. Idempotent: a second soft event
+      // (operator hit Esc twice rapidly while the loop is still
+      // tearing down) leaves softInterrupted true.
+      if (event.level === 'soft') {
+        return { state: { ...state, softInterrupted: true }, permanent: [] };
+      }
       return { state, permanent: [] };
 
     // ─── Modal events ──────────────────────────────────────────────
