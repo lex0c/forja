@@ -23,6 +23,7 @@
 
 import type { InputState } from '../state.ts';
 import type { Capabilities } from '../term.ts';
+import { wrapInputLine } from './wrap.ts';
 
 const PROMPT_PREFIX = '> ';
 const CONT_PREFIX = '  ';
@@ -38,17 +39,19 @@ export const renderInput = (input: InputState, caps: Capabilities): string[] => 
       out.push(linePrefix);
       continue;
     }
-    // Chunk by code-unit length. CJK / emoji that occupy 2 columns
-    // would over-flow the visual budget by 1 col per double-width
-    // glyph; accept the small inconsistency until visualWidth-aware
-    // chunking lands (most input today is ASCII commands / code).
-    let pos = 0;
-    let firstSub = true;
-    while (pos < line.length) {
-      const chunk = line.slice(pos, pos + innerWidth);
-      out.push((firstSub ? linePrefix : CONT_PREFIX) + chunk);
-      pos += innerWidth;
-      firstSub = false;
+    // Chunking via wrapInputLine — keeps surrogate pairs intact
+    // (a `slice` mid-pair would render U+FFFD and drift the
+    // visible column for the rest of the line). composeCursor
+    // uses the SAME chunker so cursor row/col stays consistent
+    // with what's drawn here. Visual width of CJK / emoji (2
+    // cols per glyph) still over-flows the column budget; that's
+    // a separate wcwidth-aware-chunking concern.
+    const chunks = wrapInputLine(line, innerWidth);
+    for (let c = 0; c < chunks.length; c++) {
+      const chunk = chunks[c];
+      if (chunk === undefined) continue;
+      const prefix = c === 0 ? linePrefix : CONT_PREFIX;
+      out.push(prefix + line.slice(chunk.start, chunk.end));
     }
   }
   return out;

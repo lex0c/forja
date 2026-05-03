@@ -513,4 +513,43 @@ describe('composeCursor', () => {
     const cur = composeCursor(s, narrow, 6);
     expect(cur).toEqual({ row: 6 - 2 - 2 + 1, col: 3 });
   });
+
+  test('soft-wrap with surrogate pair at boundary keeps cursor aligned with renderInput chunks', () => {
+    // Regression: when a non-BMP codepoint sat at the wrap
+    // boundary, renderInput pulls the chunk back by one code unit
+    // to keep the surrogate pair intact (so the rendered row 0 is
+    // 7 chars, not 8). composeCursor used uniform `offsetInLine
+    // % innerWidth` math and computed col = prefix + 7 = 9, past
+    // the actual content of the row — the cursor visually drifted
+    // off the end of the rendered text. After the fix both consult
+    // `wrapInputLine`: a cursor at the chunk boundary lands at the
+    // START of the next sub-row (col 2), the same canonical
+    // behavior as a cursor at any other wrap boundary (compare
+    // the `at sub-row boundary lands at start of next sub-row`
+    // test above).
+    const narrow: Capabilities = { ...caps, cols: 10 }; // innerWidth = 8
+    const s = startedSession();
+    // 7 ASCII + emoji + 'b'. First chunk = 7 chars (pulled back),
+    // second chunk = '😀b' (4 code units). 2 sub-rows total.
+    s.input.value = `${'a'.repeat(7)}😀b`;
+    s.input.cursor = 7;
+    const cur = composeCursor(s, narrow, 6);
+    // Pre-fix: { row: 2, col: 9 } — col past the 7-char row content.
+    // Post-fix: cursor at chunk-0-end / chunk-1-start → sub-row 1,
+    // col = prefix(2). row = 6 - 2 - 2 + 1 = 3.
+    expect(cur).toEqual({ row: 3, col: 2 });
+  });
+
+  test('soft-wrap with surrogate pair: cursor mid-first-chunk maps within row 0', () => {
+    // Same line shape as above; cursor in the middle of the
+    // pulled-back first chunk lands at the natural prefix + offset
+    // column on row 0 — proves the fix doesn't drift cursors that
+    // had no boundary issue in the first place.
+    const narrow: Capabilities = { ...caps, cols: 10 };
+    const s = startedSession();
+    s.input.value = `${'a'.repeat(7)}😀b`;
+    s.input.cursor = 4;
+    const cur = composeCursor(s, narrow, 6);
+    expect(cur).toEqual({ row: 6 - 2 - 2, col: 2 + 4 });
+  });
 });

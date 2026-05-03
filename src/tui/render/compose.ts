@@ -31,6 +31,7 @@ import { renderModal } from './modal.ts';
 import { renderSlashPopover } from './slash-popover.ts';
 import { renderTodoList } from './todo-list.ts';
 import { renderToolCardLive } from './tool-card.ts';
+import { wrapInputLine } from './wrap.ts';
 
 // Horizontal rules around the input go edge-to-edge (UI.md §6.3
 // "bloco do input" exception). Together with the input line they
@@ -83,18 +84,22 @@ export const composeCursor = (
   const value = state.input.value;
   // Both '> ' (first line) and '  ' (continuation) are 2 chars wide;
   // soft-wrap chunks each `\n`-separated buffer line into chunks of
-  // `caps.cols - prefixWidth`. composeCursor must mirror renderInput's
-  // wrap math to land on the right visual sub-row.
+  // up to `caps.cols - prefixWidth` code units, with surrogate-pair
+  // boundaries kept intact (see render/wrap.ts). composeCursor must
+  // walk the SAME chunk list renderInput produced — uniform-width
+  // arithmetic (`offsetInLine % innerWidth`) breaks when chunks are
+  // shrunk by one to avoid splitting a non-BMP codepoint.
   const prefixWidth = 2;
   const innerWidth = Math.max(1, caps.cols - prefixWidth);
 
-  // Visual row count for one buffer line under soft-wrap. Empty lines
-  // still occupy 1 row.
-  const rowsForLine = (lineLen: number): number =>
-    lineLen === 0 ? 1 : Math.ceil(lineLen / innerWidth);
-
+  // Per-buffer-line chunk list. Empty buffer lines wrap to a single
+  // empty sub-row (the prefix-only `> ` / `  ` line that renderInput
+  // emits) — the chunk list is `[]` in that case and the
+  // sub-row/col math below special-cases it.
   const lines = value === '' ? [''] : value.split('\n');
-  const inputLineCount = lines.reduce((acc, l) => acc + rowsForLine(l.length), 0);
+  const lineChunks = lines.map((l) => wrapInputLine(l, innerWidth));
+  const rowsForChunks = (n: number): number => (n === 0 ? 1 : n);
+  const inputLineCount = lineChunks.reduce((acc, cs) => acc + rowsForChunks(cs.length), 0);
 
   // Find which buffer line + offset within it contains the cursor.
   const cursorAbs = state.input.cursor;
@@ -114,22 +119,42 @@ export const composeCursor = (
   // Visual rows occupied by buffer lines BEFORE the cursor's line.
   let visualRowsBefore = 0;
   for (let i = 0; i < bufferLineIdx; i++) {
-    visualRowsBefore += rowsForLine((lines[i] ?? '').length);
+    visualRowsBefore += rowsForChunks((lineChunks[i] ?? []).length);
   }
-  const cursorLineLen = (lines[bufferLineIdx] ?? '').length;
-  const numSubRows = rowsForLine(cursorLineLen);
-  let subRowInLine = Math.floor(offsetInLine / innerWidth);
-  let col = prefixWidth + (offsetInLine % innerWidth);
+  const cursorChunks = lineChunks[bufferLineIdx] ?? [];
+  const numSubRows = rowsForChunks(cursorChunks.length);
+  // Locate the chunk whose code-unit range covers `offsetInLine`.
+  // Linear walk is fine: typical input has < 30 chunks per line.
+  // Cursor at the exact end of a chunk lands on that chunk's last
+  // column (the next chunk's start === this chunk's end), which the
+  // boundary clamp below resolves; same shape as the old
+  // exact-wrap-boundary case where cursor was at offset = N*innerWidth.
+  let subRowInLine = 0;
+  let col = prefixWidth + offsetInLine;
+  for (let c = 0; c < cursorChunks.length; c++) {
+    const chunk = cursorChunks[c];
+    if (chunk === undefined) continue;
+    if (offsetInLine < chunk.end) {
+      subRowInLine = c;
+      col = prefixWidth + (offsetInLine - chunk.start);
+      break;
+    }
+    // Past the last chunk's end — fall through; the clamp below
+    // pins to the right edge of the last sub-row.
+    if (c === cursorChunks.length - 1) {
+      subRowInLine = c;
+      col = prefixWidth + (offsetInLine - chunk.start);
+    }
+  }
 
-  // Exact-wrap-boundary clamp: cursor at offset = N * innerWidth at
-  // the end of a non-empty buffer line wants to land on sub-row N
-  // (one past the last allocated). renderInput only emits ceil(len /
-  // innerWidth) sub-rows, so sub-row N would visually overlap the
-  // rule below the input. Clamp to the right edge of the last
-  // existing sub-row instead — typical editor behavior at the wrap
-  // boundary. As soon as the operator types one more char, the input
-  // grows by a sub-row and the cursor moves naturally to col 2 of
-  // the new row (no special-casing needed there).
+  // Exact-wrap-boundary clamp: cursor at offset = chunk.end of a
+  // non-final chunk wants to land on the next sub-row, but
+  // renderInput only emits `chunks.length` sub-rows so a cursor
+  // past the last would visually overlap the rule below the input.
+  // Clamp to the right edge of the last existing sub-row instead —
+  // typical editor behavior. As soon as the operator types one
+  // more char, a new chunk allocates and the cursor moves naturally
+  // to col 2 of the new row.
   if (subRowInLine >= numSubRows) {
     subRowInLine = numSubRows - 1;
     col = caps.cols - 1;

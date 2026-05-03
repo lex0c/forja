@@ -15,6 +15,28 @@ Format:
 
 ---
 
+## [2026-05-03] M2 / fix — input soft-wrap respects surrogate pairs
+
+Bug report do operator: o soft-wrap introduzido em slice anterior usava `line.slice(pos, pos + innerWidth)` que cortava code units sem respeitar pares de surrogate UTF-16. Em uma linha com 😀 (U+1F600) caindo exatamente no boundary, o chunk emitia o high surrogate solto e o próximo começava com o low surrogate solto — terminal renderiza como replacement glyph (U+FFFD) e o tracking de coluna do cursor drifta pelo resto da linha.
+
+**Done:**
+
+- `src/tui/render/wrap.ts` (novo): `wrapInputLine(line, innerWidth)` retorna lista de `{start, end}` ranges em code units. Quando o chunk-end cairia em high surrogate (0xD800-0xDBFF), recua 1 unit pra deixar o par inteiro pro próximo chunk. Caso patológico (innerWidth=1 + non-BMP no `pos`) emite chunk over-wide de 2 units pra garantir forward progress — pior um row over-budget que loop infinito.
+- `src/tui/render/input.ts`: usa `wrapInputLine` em vez do slice direto.
+- `src/tui/render/compose.ts`: `composeCursor` usa o MESMO `wrapInputLine` em vez de `Math.floor(offsetInLine / innerWidth)` + `% innerWidth`. Antes os dois discordavam em chunks pulled-back: renderInput emite 7 chars na primeira sub-row, composeCursor calcula `col = prefix + 7 = 9` pra cursor offset 7 — ponteiro vazia em coluna fora do content rendered. Agora ambos consultam a mesma chunk list; cursor at boundary vai pra `col=2` da próxima sub-row (mesma semântica canônica do "boundary goes to start of next row" que já tinha pra ASCII).
+- Tests: `tests/tui/render/wrap.test.ts` (7 cenários — empty, exact-fit, multi-chunk uniform, surrogate boundary pull-back, surrogate non-boundary untouched, innerWidth=1 patológico, multiple consecutive emoji); `input.test.ts` ganha regression test pinando o caso 7 ASCII + 😀 no boundary; `compose.test.ts` ganha 2 testes (cursor at boundary post-pullback → start of next row; cursor mid-pullback-chunk → row 0 sem drift).
+
+**Decisions:**
+
+- **Code-unit ranges, não code-point arrays.** Manter o cursor em code units (igual ao `input.value`'s `.length` e ao `input.cursor`) evita refazer toda a math do editor. Surrogate-pair safety basta — graphemes via Intl.Segmenter (ZWJ sequences, family emoji, skin tones) seria fix mais correto mas com cost-benefit pior pra um workflow de prompt onde emoji é raro e ASCII domina.
+- **Width visual continua não-tratado.** Emoji renderiza como 2 cols na maioria dos terminais; chunks de N code units podem ainda overflow visual budget. Comentário existente já reconhecia isso. Fix correto seria wcwidth-aware chunking; deferred.
+- **`wrapInputLine` retorna `[]` pra empty line.** Caller (renderInput emite prefix-only line; composeCursor trata como 1 sub-row de length 0) precisa lidar com o caso. Alternativa seria retornar `[{start:0, end:0}]` e simplificar caller, mas adicionar chunks vazios polui o protocolo.
+- **Forward-progress guarantee no `innerWidth=1`.** Detecção do caso degenerado evita loop infinito. Em produção `caps.cols >= 2` sempre, então o edge case nunca deveria disparar — mas o test pina o contrato pra defesa contra regressão.
+
+**Pending:** wcwidth-aware chunking (visual width vs code-unit width) e grapheme cluster awareness via Intl.Segmenter. Não bloqueia.
+
+---
+
 ## [2026-05-03] M2 / spec+impl — `agent init` (scaffold .agent/permissions.yaml)
 
 Slice anterior expôs o gap: REPL avisa em vermelho "no permission policy found" e direciona pro `/perms`, mas não tinha jeito de criar o arquivo sem o operator copiar exemplo da spec à mão. `agent init` fecha o ciclo: escreve um baseline editável strict + whitelist conservador num comando.
