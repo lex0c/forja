@@ -185,7 +185,20 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // Modal manager wired but no producer calls it yet — the harness's
   // permission engine doesn't bridge to the bus in this slice. Lands
   // when the permission/trust producers connect.
-  const modalManager = createModalManager({ bus, focusStack });
+  //
+  // onInterrupt is a forward reference: triggerInterrupt is defined
+  // further down (it depends on abortController + softStopController
+  // which are declared per-turn). The let-binding indirection lets
+  // modal-manager call into the real interrupt path lazily — by the
+  // time a modal opens and the operator hits Ctrl+C, the per-turn
+  // controllers exist and triggerInterrupt does the right thing.
+  // No-op default for the (rare) call-before-startTurn race.
+  let onModalInterrupt: () => void = () => undefined;
+  const modalManager = createModalManager({
+    bus,
+    focusStack,
+    onInterrupt: () => onModalInterrupt(),
+  });
 
   let running = false;
   let lastSessionId: string | null = null;
@@ -358,6 +371,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       softStopController.abort();
     }
   };
+  // Resolve the modal-manager's forward reference now that the real
+  // interrupt path is defined. From here on, Ctrl+C with a modal up
+  // resolves the modal AND fires the interrupt ladder atomically —
+  // no draft loss, no second-tap requirement.
+  onModalInterrupt = triggerInterrupt;
 
   // Slash command registry + cumulative tracker for /cost. Built once
   // per REPL session — the registry is stable; cumulative is mutated

@@ -63,7 +63,7 @@ interface Setup {
 }
 
 let promptCounter = 0;
-const make = (): Setup => {
+const make = (overrides: { onInterrupt?: () => void } = {}): Setup => {
   const bus = createBus();
   const fs = createFocusStack();
   const events: UIEvent[] = [];
@@ -82,6 +82,7 @@ const make = (): Setup => {
     },
     setTimer: timer.setTimer,
     clearTimer: timer.clearTimer,
+    ...(overrides.onInterrupt !== undefined ? { onInterrupt: overrides.onInterrupt } : {}),
   });
   return { bus, fs, manager, events, timer, ids: () => ids.slice() };
 };
@@ -118,19 +119,24 @@ describe('askPermission (3-option modal per UI.md §4.10.13)', () => {
     await expect(promise).resolves.toBe('cancel');
   });
 
-  test('Ctrl+C resolves "cancel" AND falls through to lower handler (regression)', async () => {
-    // Pre-fix the modal swallowed all char events (line `if (key.kind
-    // !== 'key') return true`), and Ctrl+C is parsed as char/ctrl=true,
-    // so the operator's interrupt got eaten by the modal. They had to
-    // dismiss the modal by hand before any abort path could run —
-    // exactly the wrong UX during a slow tool that raised the modal.
+  test('Ctrl+C resolves "cancel" AND fires onInterrupt without falling through', async () => {
+    // Modal handles Ctrl+C atomically: resolve the modal AND trigger
+    // the REPL's interrupt ladder via onInterrupt, then consume the
+    // keystroke. The earlier "fall through to editor" approach was
+    // broken — the editor's Ctrl+C only fires cancelInput when the
+    // input buffer is empty, so a draft mid-typing dismissed the
+    // modal AND cleared the buffer but FAILED to abort the run.
+    // The operator was stuck pressing Ctrl+C twice (losing draft).
     //
-    // Post-fix: Ctrl+C resolves the modal as 'cancel' (same as Esc)
-    // AND returns false from the focus handler so the dispatcher
-    // tries the next handler down. We verify the second half by
-    // pushing a sentinel handler BELOW the modal's; it must observe
-    // the Ctrl+C event after the modal removes itself.
-    const s = make();
+    // New contract: onInterrupt is the single hook for the abort
+    // path; lower handlers don't see the keystroke (return true =
+    // consumed). Buffer is preserved.
+    let interruptFired = 0;
+    const s = make({
+      onInterrupt: () => {
+        interruptFired += 1;
+      },
+    });
     let observedByLower = false;
     const lowerHandler = (k: KeyEvent): boolean => {
       if (k.kind === 'char' && k.char === 'c' && k.ctrl) observedByLower = true;
@@ -140,7 +146,21 @@ describe('askPermission (3-option modal per UI.md §4.10.13)', () => {
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
     s.fs.dispatch(charKey('c', { ctrl: true }));
     await expect(promise).resolves.toBe('cancel');
-    expect(observedByLower).toBe(true);
+    expect(interruptFired).toBe(1);
+    // Lower handler must NOT have observed the keystroke — it was
+    // fully consumed by the modal handler.
+    expect(observedByLower).toBe(false);
+  });
+
+  test('Ctrl+C without onInterrupt still resolves the modal (callback optional)', async () => {
+    // Tests / headless flows that build a modal-manager without a
+    // REPL still get the "dismiss on Ctrl+C" behavior — abort just
+    // doesn't fire because there's nothing to abort. Documented
+    // contract.
+    const s = make(); // no onInterrupt
+    const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
+    s.fs.dispatch(charKey('c', { ctrl: true }));
+    await expect(promise).resolves.toBe('cancel');
   });
 
   test('hotkey "1" resolves "yes" directly (no navigate-then-Enter)', async () => {

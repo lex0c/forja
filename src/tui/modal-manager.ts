@@ -88,6 +88,17 @@ export interface ModalManagerOptions {
   newPromptId?: () => string;
   setTimer?: (fn: () => void, ms: number) => unknown;
   clearTimer?: (h: unknown) => void;
+  // Called when the operator presses Ctrl+C with a modal open.
+  // The REPL wires this to its triggerInterrupt() so the abort
+  // ladder fires alongside the modal's 'cancel' resolution. Without
+  // this seam, modal-manager would have to fall through to the
+  // editor's cancelInput path — which only fires when the input
+  // buffer is empty, so a draft mid-typing would dismiss the modal
+  // and clear the buffer but FAIL to abort the run (operator stuck
+  // having to press Ctrl+C again, draft lost). Optional: callers
+  // that don't run inside a REPL (tests, headless modal flows)
+  // omit it and accept that Ctrl+C only resolves the modal.
+  onInterrupt?: () => void;
 }
 
 let promptCounter = 0;
@@ -144,17 +155,25 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         return true;
       }
 
-      // Ctrl+C escapes the modal — falls through to the editor's
-      // cancelInput path so the REPL's interrupt ladder can abort
-      // the run that the modal was waiting on. Without this, an
-      // operator who hit a slow tool that raised a permission modal
-      // would have to dismiss the modal first (losing the question)
-      // before being able to abort. The modal returns 'cancel' (same
-      // semantic as Esc) on its own resolution path; abort fires on
-      // top so the harness tears down the in-flight tool too.
+      // Ctrl+C escapes the modal AND triggers the REPL's interrupt
+      // ladder. Three things happen, in order:
+      //   1. Modal resolves with 'cancel' (same semantic as Esc).
+      //   2. onInterrupt callback fires (REPL aborts the run).
+      //   3. Return TRUE — keystroke fully consumed, editor never
+      //      sees it. Critical: the editor's Ctrl+C only fires
+      //      cancelInput when its buffer is empty; a draft mid-
+      //      typing would otherwise dismiss the modal and clear
+      //      the buffer but NOT abort the run, leaving the operator
+      //      stuck (and draft lost). Returning true preserves the
+      //      buffer; onInterrupt does the abort directly.
+      //
+      // When onInterrupt isn't wired (tests, headless flows), the
+      // modal still resolves and the keystroke is consumed — abort
+      // simply doesn't fire, matching the documented contract.
       if (key.kind === 'char' && key.ctrl && key.char === 'c') {
         resolveActive('cancel');
-        return false; // let the editor handler see the Ctrl+C
+        options.onInterrupt?.();
+        return true;
       }
 
       if (key.kind !== 'key') return true; // swallow other chars while modal up
