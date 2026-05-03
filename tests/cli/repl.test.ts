@@ -990,6 +990,42 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(0);
   });
 
+  test('unknown slash command + Enter does NOT call runAgent (regression)', async () => {
+    // Pre-fix the slash mode gate keyed on state.slash !== null. The
+    // reducer clears state.slash to null when the popover has zero
+    // matches (typing `/doesnotexist` produces no completions), so
+    // the Enter branch fell through to the editor's normal submit
+    // path. That sent `/doesnotexist` to the provider as a turn —
+    // unintended token spend on every typo. The fix gates on the
+    // buffer prefix too, so Enter still routes through the slash
+    // dispatcher even when the popover collapsed.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('/doesnotexist\r');
+    await flushFrame();
+    // Critical contract: NO turn was started — runAgent must not see
+    // a config from this Enter.
+    expect(ra.captured).toHaveLength(0);
+    // Dispatcher emits "unknown command" as a bus error → renders
+    // as a scrollback `error: ...` line. Surface check.
+    expect(writes.join('')).toContain('unknown command');
+    expect(writes.join('')).toContain('/doesnotexist');
+    stdin.feed('\x03');
+    expect(await promise).toBe(0);
+  });
+
   test('Enter after /quit is suppressed (shutdown gate is synchronous)', async () => {
     const stdin = makeStdin();
     const ra = makeRunAgent((n) => `sess-${n}`);

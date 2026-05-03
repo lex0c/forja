@@ -445,10 +445,27 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // Slash mode intercepts navigation / Tab / Enter / Esc BEFORE
     // the editor sees them. Other keys (printables, backspace, etc.)
     // fall through so the user can keep typing the command name.
+    //
+    // Two signals matter independently:
+    //
+    //   - `slashState` (renderer state) is non-null while the
+    //     popover has at least one match. Drives Up/Down/Tab —
+    //     those keys only make sense when there's something to
+    //     navigate.
+    //
+    //   - `bufferIsSlash` is true while the input buffer starts
+    //     with `/`. Drives Enter and Escape — pressing Enter on
+    //     a slash command must NEVER fall through to user:submit
+    //     (would dispatch `/doesnotexist` to the provider, burning
+    //     tokens), even when the popover collapsed because the
+    //     typed name has zero matches.
     const slashState = renderer.state().slash;
-    if (slashState !== null && key.kind === 'key') {
+    const currentBuffer = renderer.state().input.value;
+    const bufferIsSlash = parseSlashInput(currentBuffer) !== null;
+    if ((slashState !== null || bufferIsSlash) && key.kind === 'key') {
       const k = key.name;
-      if (k === 'tab' && slashState.selectedIdx >= 0) {
+      // Navigation keys require a live popover (matches present).
+      if (slashState !== null && k === 'tab' && slashState.selectedIdx >= 0) {
         const pick = slashState.suggestions[slashState.selectedIdx];
         if (pick !== undefined) {
           const newValue = `/${pick.name} `;
@@ -457,7 +474,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         }
         return true;
       }
-      if (k === 'up') {
+      if (slashState !== null && k === 'up') {
         const idx = Math.max(0, slashState.selectedIdx - 1);
         if (idx !== slashState.selectedIdx) {
           bus.emit({
@@ -469,7 +486,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         }
         return true;
       }
-      if (k === 'down') {
+      if (slashState !== null && k === 'down') {
         const idx = Math.min(slashState.suggestions.length - 1, slashState.selectedIdx + 1);
         if (idx !== slashState.selectedIdx) {
           bus.emit({
@@ -481,14 +498,20 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         }
         return true;
       }
+      // Escape clears slash mode regardless of popover state — also
+      // covers the unknown-command case where the buffer starts with
+      // `/` but slashState is null.
       if (k === 'escape') {
-        // Esc clears slash mode AND wipes the input. Equivalent to
-        // user backing out of the slash autocomplete entirely.
         bus.emit({ type: 'slash:update', ts: now(), suggestions: [], selectedIdx: -1 });
         slashOpen = false;
         bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
         return true;
       }
+      // Enter dispatches the slash command. Critical: this branch
+      // fires even when slashState is null (zero matches) — the
+      // dispatcher surfaces "unknown command" as scrollback instead
+      // of letting the buffer fall through to user:submit and burn
+      // a provider call.
       if (k === 'enter') {
         const val = renderer.state().input.value;
         const parsed = parseSlashInput(val);
@@ -504,10 +527,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         }
         // Echo the slash command as a user-submit (visual divider
         // in scrollback so the operator sees what they ran), then
-        // dispatch. Resolve the typed name through the registry's
-        // case-insensitive matcher so `/Help` lands on `help`
-        // (autocomplete already shows `help`; bug if the dispatcher
-        // disagrees).
+        // dispatch. The reducer's user:submit branch clears the
+        // input — including the unknown-command case, so a typo
+        // like `/doesnotexist` doesn't linger in the buffer for
+        // the next Enter to retry. Resolve the typed name through
+        // the registry's case-insensitive matcher so `/Help` lands
+        // on `help` (autocomplete already shows `help`; bug if the
+        // dispatcher disagrees).
         const resolvedName = resolveCommandName(parsed.name);
         bus.emit({ type: 'user:submit', ts: now(), text: val });
         bus.emit({ type: 'slash:update', ts: now(), suggestions: [], selectedIdx: -1 });
