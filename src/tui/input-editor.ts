@@ -172,14 +172,27 @@ const applyNamedKey = (
   key: Extract<KeyEvent, { kind: 'key' }>,
 ): ApplyKeyResult => {
   switch (key.name) {
-    case 'enter':
+    case 'enter': {
       // Shift+Enter inserts a newline; plain Enter submits non-empty
       // input. Empty buffer + Enter is a no-op (doesn't bubble as a
       // submit signal — pressing Enter at an empty prompt should not
       // round-trip through the harness).
       if (key.shift) return { next: insertText(input, '\n') };
       if (input.value === '') return NOOP(input);
+      // Backslash continuation (UI.md §5.4): if the char immediately
+      // before the cursor is `\`, drop the backslash and insert a
+      // newline in its place. Bash convention — the operator marks
+      // "I want a newline, not a submit" without needing Shift+Enter
+      // (useful on terminals/keyboards where Shift+Enter is awkward
+      // or eaten by a window manager). Cursor stays at the same
+      // index — the `\n` fills the position the `\` vacated.
+      const beforeCursor = input.value.slice(0, input.cursor);
+      if (beforeCursor.endsWith('\\')) {
+        const value = `${beforeCursor.slice(0, -1)}\n${input.value.slice(input.cursor)}`;
+        return { next: { value, cursor: input.cursor } };
+      }
       return { next: input, submit: { text: input.value } };
+    }
 
     case 'backspace':
       return { next: deleteRange(input, stepBack(input.value, input.cursor), input.cursor) };

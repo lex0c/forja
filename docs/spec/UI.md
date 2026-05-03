@@ -738,6 +738,7 @@ Renderer reage a `tick` igual a qualquer evento (redraw da região viva).
 |---|---|---|
 | Enter | input | submit |
 | Shift+Enter | input | nova linha |
+| `\` + Enter | input | nova linha — backslash continuation (convenção shell). Útil em terminais/WMs que comem Shift+Enter. Char antes do cursor era `\` → renderer troca pelo `\n` (cursor fica no mesmo índice, agora à direita do `\n`). |
 | Ctrl+C | input não vazio | limpa o buffer (não sai) |
 | Ctrl+C | idle, buffer vazio | **arma exit** — footer mostra `Press Ctrl-C again to exit` (cue em `warn`); janela de 2s |
 | Ctrl+C (2x dentro de 2s) | idle, buffer vazio | exit 130 (POSIX SIGINT) |
