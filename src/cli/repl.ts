@@ -313,6 +313,27 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     void shutdown();
   };
 
+  // Soft/hard interrupt ladder shared by Esc (editor's interruptSoft
+  // signal), Ctrl+C in raw mode (editor's cancelInput signal), and
+  // SIGINT (process signal — fires when stdin is NOT in raw mode, or
+  // from a kill -INT). All three converge here so the spec's
+  // single-keybinding-pair semantics (UI.md §5.4) hold uniformly:
+  // first tap is cooperative (softStopController.abort), second tap
+  // is preemptive (abortController.abort). Caller decides when to
+  // invoke (gated on `running`); this helper assumes a turn is in
+  // flight and the controllers are non-null. The reducer's
+  // softInterrupted flag is the single source of truth for
+  // distinguishing first tap from second.
+  const triggerInterrupt = (): void => {
+    const level: 'soft' | 'hard' = renderer.state().softInterrupted ? 'hard' : 'soft';
+    bus.emit({ type: 'interrupt', ts: now(), level });
+    if (level === 'hard' && abortController !== null) {
+      abortController.abort();
+    } else if (level === 'soft' && softStopController !== null) {
+      softStopController.abort();
+    }
+  };
+
   // Slash command registry + cumulative tracker for /cost. Built once
   // per REPL session — the registry is stable; cumulative is mutated
   // by startTurn's success branch and read by /cost.
@@ -500,12 +521,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       startTurn(result.submit.text);
     }
 
-    // Ctrl+C with empty buffer → exit (only when idle; while a run is
-    // in progress, the SIGINT handler aborts instead). Use the
-    // synchronous gate so a follow-up keystroke after Ctrl+C doesn't
-    // slip past the running/exiting check.
-    if (result.cancelInput === true && !running) {
-      requestShutdown();
+    // Ctrl+C while running → soft/hard interrupt ladder, same as Esc
+    // and the SIGINT handler. The renderer puts stdin in raw mode, so
+    // Ctrl+C lands as a `cancelInput` key event (byte 0x03 read from
+    // stdin) rather than a process SIGINT — the SIGINT handler can't
+    // be the only path. With buffer empty + idle, fall through to
+    // shutdown. Synchronous gate (`exiting` set in requestShutdown)
+    // keeps a follow-up keystroke from racing past the check.
+    if (result.cancelInput === true) {
+      if (running) {
+        triggerInterrupt();
+      } else {
+        requestShutdown();
+      }
     }
 
     // First Esc → cooperative soft stop: emit interrupt UIEvent
@@ -522,13 +550,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // Esc with no run in progress is a no-op (the editor's own
     // slash-mode Esc handler intercepted before reaching here).
     if (result.interruptSoft === true && running) {
-      const level: 'soft' | 'hard' = renderer.state().softInterrupted ? 'hard' : 'soft';
-      bus.emit({ type: 'interrupt', ts: now(), level });
-      if (level === 'hard' && abortController !== null) {
-        abortController.abort();
-      } else if (level === 'soft' && softStopController !== null) {
-        softStopController.abort();
-      }
+      triggerInterrupt();
     }
 
     return true;
@@ -547,26 +569,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   stdin.on('data', onData);
   if (typeof stdin.resume === 'function') stdin.resume();
 
-  // SIGINT: while a run is in flight, abort it; otherwise exit. The
-  // editor's Ctrl+C handling overlaps but isn't redundant: keyboard
-  // Ctrl+C in raw mode lands as a `cancelInput` editor signal,
-  // SIGINT lands here. Both routes converge on the same outcome.
-  //
-  // Mirror the Esc path's soft/hard split so Ctrl+C and Esc share
-  // a single ladder (spec UI.md §5.4): first tap is cooperative
-  // (softStopController.abort), second tap is preemptive
-  // (abortController.abort). Without the parity, Ctrl+C would
-  // either always preempt (worse than Esc's cooperative first tap)
-  // or always be cooperative (no escape from a hung tool).
+  // SIGINT path. Fires when stdin is NOT in raw mode (e.g., during
+  // certain modal lifecycles where the renderer pauses raw input) or
+  // from an external `kill -INT`. Most operator Ctrl+C while running
+  // lands as `cancelInput` via the editor (raw mode is on); both
+  // routes converge on `triggerInterrupt`. Idle SIGINT exits with
+  // 130 — POSIX convention.
   const sigintHandler = (): void => {
     if (running) {
-      const level: 'soft' | 'hard' = renderer.state().softInterrupted ? 'hard' : 'soft';
-      bus.emit({ type: 'interrupt', ts: now(), level });
-      if (level === 'hard' && abortController !== null) {
-        abortController.abort();
-      } else if (level === 'soft' && softStopController !== null) {
-        softStopController.abort();
-      }
+      triggerInterrupt();
     } else {
       exitCode = 130;
       requestShutdown();

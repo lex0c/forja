@@ -379,6 +379,45 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(0);
   });
 
+  test('raw-mode Ctrl+C (\\x03) during a turn aborts via the cancelInput path', async () => {
+    // The renderer puts stdin in raw mode → Ctrl+C lands as byte 0x03
+    // read from stdin (parsed as ch('c', {ctrl: true}) → editor
+    // cancelInput signal) instead of a process SIGINT. Pre-fix the
+    // REPL only acted on cancelInput when idle, so a running turn
+    // could only be aborted via SIGINT — which raw mode often
+    // suppresses. Operator left unable to interrupt.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const signal = cfg?.signal;
+    const softSignal = cfg?.softStopSignal;
+    expect(signal?.aborted).toBe(false);
+    expect(softSignal?.aborted).toBe(false);
+    // First Ctrl+C: soft fires (cooperative), hard untouched.
+    stdin.feed('\x03');
+    await tick();
+    expect(softSignal?.aborted).toBe(true);
+    expect(signal?.aborted).toBe(false);
+    // Second Ctrl+C: escalates to hard (matches Esc Esc semantics).
+    stdin.feed('\x03');
+    await tick();
+    expect(signal?.aborted).toBe(true);
+    ra.finish(0, { status: 'interrupted', reason: 'aborted' });
+    await tick();
+    stdin.feed('\x03');
+    expect(await promise).toBe(0);
+  });
+
   test('Ctrl+C during a turn also flips footer to "esc again to force"', async () => {
     // Spec UI.md §5.4: Ctrl+C and Esc are paired keybindings for the
     // same soft/hard ladder. Without the SIGINT path emitting the
