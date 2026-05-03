@@ -130,7 +130,12 @@ describe('assistant streaming', () => {
       { type: 'assistant:end', ts: 4, messageId: 'm1' },
     ]);
     expect(result.state.pendingAssistant).toBeNull();
-    expect(result.permanent).toEqual([{ kind: 'assistant', text: 'Hello, world!' }]);
+    // duration = end.ts (4) - start.ts (1) = 3; no usage event so
+    // outputTokens stays null. Renderer (formatPermanent) will show
+    // "Generated in 3ms" without the token clause.
+    expect(result.permanent).toEqual([
+      { kind: 'assistant', text: 'Hello, world!', durationMs: 3, outputTokens: null },
+    ]);
   });
 
   test('multi-line assistant text is preserved as one item with newlines', () => {
@@ -139,7 +144,14 @@ describe('assistant streaming', () => {
       { type: 'assistant:delta', ts: 2, messageId: 'm1', text: 'line1\nline2\nline3' },
       { type: 'assistant:end', ts: 3, messageId: 'm1' },
     ]);
-    expect(result.permanent).toEqual([{ kind: 'assistant', text: 'line1\nline2\nline3' }]);
+    expect(result.permanent).toEqual([
+      {
+        kind: 'assistant',
+        text: 'line1\nline2\nline3',
+        durationMs: 2,
+        outputTokens: null,
+      },
+    ]);
   });
 
   test('delta without prior start opens a buffer on the fly', () => {
@@ -153,12 +165,150 @@ describe('assistant streaming', () => {
     expect(r.permanent).toEqual([]);
   });
 
-  test('end with empty buffer emits nothing', () => {
+  test('end with empty buffer + no usage emits nothing', () => {
+    // Pure "no-op" turn (no text, no tokens reported) produces no
+    // scrollback noise. Distinct from the tool-only turn below.
     const result = drive([
       { type: 'assistant:start', ts: 1, messageId: 'm1' },
       { type: 'assistant:end', ts: 2, messageId: 'm1' },
     ]);
     expect(result.permanent).toEqual([]);
+  });
+
+  test('end with empty buffer + usage emits chip-only permanent (tool-only turn)', () => {
+    // Provider call that returned tool_use blocks but no text still
+    // consumed real output tokens — operator sees the cost signal as
+    // a chip line. text stays '' so formatPermanent emits header
+    // alone.
+    const result = drive([
+      { type: 'assistant:start', ts: 1000, messageId: 'm1' },
+      {
+        type: 'assistant:usage',
+        ts: 4200,
+        messageId: 'm1',
+        inputTokens: 50,
+        outputTokens: 47,
+        cacheRead: 0,
+        cacheCreation: 0,
+      },
+      { type: 'assistant:end', ts: 4200, messageId: 'm1' },
+    ]);
+    expect(result.permanent).toEqual([
+      { kind: 'assistant', text: '', durationMs: 3200, outputTokens: 47 },
+    ]);
+  });
+
+  test('assistant:usage merges token counts onto pendingAssistant', () => {
+    const result = drive([
+      { type: 'assistant:start', ts: 1, messageId: 'm1' },
+      { type: 'assistant:delta', ts: 2, messageId: 'm1', text: 'hi' },
+      {
+        type: 'assistant:usage',
+        ts: 3,
+        messageId: 'm1',
+        inputTokens: 12,
+        outputTokens: 234,
+        cacheRead: 5,
+        cacheCreation: 0,
+      },
+    ]);
+    expect(result.state.pendingAssistant?.outputTokens).toBe(234);
+    expect(result.state.pendingAssistant?.inputTokens).toBe(12);
+    expect(result.state.pendingAssistant?.cacheRead).toBe(5);
+    expect(result.state.pendingAssistant?.cacheCreation).toBe(0);
+  });
+
+  test('multiple assistant:usage events take the running max (monotonic)', () => {
+    // Anthropic emits cumulative; a later partial event with smaller
+    // counts (hypothetical) must not shrink the totals.
+    const result = drive([
+      { type: 'assistant:start', ts: 1, messageId: 'm1' },
+      {
+        type: 'assistant:usage',
+        ts: 2,
+        messageId: 'm1',
+        inputTokens: 10,
+        outputTokens: 100,
+        cacheRead: 0,
+        cacheCreation: 0,
+      },
+      {
+        type: 'assistant:usage',
+        ts: 3,
+        messageId: 'm1',
+        inputTokens: 5,
+        outputTokens: 50,
+        cacheRead: 0,
+        cacheCreation: 0,
+      },
+    ]);
+    expect(result.state.pendingAssistant?.outputTokens).toBe(100);
+    expect(result.state.pendingAssistant?.inputTokens).toBe(10);
+  });
+
+  test('assistant:usage for unknown messageId is dropped silently', () => {
+    const result = drive([
+      { type: 'assistant:start', ts: 1, messageId: 'm1' },
+      {
+        type: 'assistant:usage',
+        ts: 2,
+        messageId: 'wrong',
+        inputTokens: 1,
+        outputTokens: 999,
+        cacheRead: 0,
+        cacheCreation: 0,
+      },
+    ]);
+    expect(result.state.pendingAssistant?.outputTokens).toBeNull();
+  });
+
+  test('assistant:end emits permanent with duration + tokens when usage arrived', () => {
+    const result = drive([
+      { type: 'assistant:start', ts: 1000, messageId: 'm1' },
+      { type: 'assistant:delta', ts: 1100, messageId: 'm1', text: 'reply' },
+      {
+        type: 'assistant:usage',
+        ts: 9100,
+        messageId: 'm1',
+        inputTokens: 12,
+        outputTokens: 234,
+        cacheRead: 0,
+        cacheCreation: 0,
+      },
+      { type: 'assistant:end', ts: 9200, messageId: 'm1' },
+    ]);
+    // Duration = end.ts (9200) - start.ts (1000) = 8200ms.
+    expect(result.permanent).toEqual([
+      { kind: 'assistant', text: 'reply', durationMs: 8200, outputTokens: 234 },
+    ]);
+  });
+
+  test('consecutive assistant:start events open a fresh turn (startedAt reset)', () => {
+    // Provider re-stream / retry: a second assistant:start after the
+    // first should anchor a new clock, not inherit the prior turn's
+    // startedAt. Otherwise the chip elapsed counter reads the wrong
+    // duration for the second turn.
+    const r = drive([
+      { type: 'assistant:start', ts: 1000, messageId: 'm1' },
+      { type: 'assistant:delta', ts: 1100, messageId: 'm1', text: 'first try' },
+      { type: 'assistant:start', ts: 5000, messageId: 'm2' },
+    ]);
+    expect(r.state.pendingAssistant?.messageId).toBe('m2');
+    expect(r.state.pendingAssistant?.startedAt).toBe(5000);
+    // Text from the first turn does not survive — fresh buffer.
+    expect(r.state.pendingAssistant?.text).toBe('');
+  });
+
+  test('delta-only path (no start) gets startedAt from delta.ts', () => {
+    // Out-of-order arrival shouldn't stamp startedAt at 0 (would
+    // render absurd elapsed time on the chip).
+    const r = applyEvent(createInitialState(), {
+      type: 'assistant:delta',
+      ts: 12345,
+      messageId: 'm1',
+      text: 'orphan',
+    });
+    expect(r.state.pendingAssistant?.startedAt).toBe(12345);
   });
 });
 

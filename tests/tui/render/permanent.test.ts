@@ -138,15 +138,28 @@ describe('formatPermanent', () => {
     });
   });
 
-  test('assistant splits text on newlines with no prefix', () => {
-    expect(formatPermanent({ kind: 'assistant', text: 'line1\nline2' }, ascii)).toEqual([
-      'line1',
-      'line2',
-    ]);
+  test('assistant without duration/tokens just splits text (legacy/replay path)', () => {
+    expect(
+      formatPermanent(
+        { kind: 'assistant', text: 'line1\nline2', durationMs: null, outputTokens: null },
+        ascii,
+      ),
+    ).toEqual(['line1', 'line2']);
   });
 
-  test('assistant with empty text emits nothing', () => {
-    expect(formatPermanent({ kind: 'assistant', text: '' }, ascii)).toEqual([]);
+  test('assistant with empty text + chip metadata emits header only (tool-only turn)', () => {
+    // A turn that streamed tool_use blocks but no prose still spent
+    // output tokens — operator should see the cost signal as a chip
+    // line. Header alone, no text lines.
+    expect(
+      formatPermanent({ kind: 'assistant', text: '', durationMs: 8200, outputTokens: 234 }, ascii),
+    ).toEqual(['* Generated 234 tokens in 8.2s']);
+  });
+
+  test('assistant with empty text + no metadata emits nothing (degenerate guard)', () => {
+    expect(
+      formatPermanent({ kind: 'assistant', text: '', durationMs: null, outputTokens: null }, ascii),
+    ).toEqual([]);
   });
 
   test('assistant with trailing newline emits an explicit empty trailing line', () => {
@@ -155,7 +168,42 @@ describe('formatPermanent', () => {
     // with a newline; if a future producer does, we may want to filter
     // (matching `appendPreview` for tool deltas). Locking the behavior
     // makes that future change visible.
-    expect(formatPermanent({ kind: 'assistant', text: 'foo\n' }, ascii)).toEqual(['foo', '']);
+    expect(
+      formatPermanent(
+        { kind: 'assistant', text: 'foo\n', durationMs: null, outputTokens: null },
+        ascii,
+      ),
+    ).toEqual(['foo', '']);
+  });
+
+  test('assistant with duration + tokens emits chip header above text (UI.md §4.10.5)', () => {
+    const out = formatPermanent(
+      { kind: 'assistant', text: 'hello', durationMs: 8200, outputTokens: 234 },
+      ascii,
+    );
+    // Header + text. ASCII glyph for the chip is `*`.
+    expect(out).toHaveLength(2);
+    expect(out[0]).toBe('* Generated 234 tokens in 8.2s');
+    expect(out[1]).toBe('hello');
+  });
+
+  test('assistant with duration only (no usage) drops the token clause', () => {
+    const out = formatPermanent(
+      { kind: 'assistant', text: 'hi', durationMs: 450, outputTokens: null },
+      ascii,
+    );
+    // Sub-second duration renders in ms.
+    expect(out[0]).toBe('* Generated in 450ms');
+    expect(out[1]).toBe('hi');
+  });
+
+  test('assistant with tokens only (no duration) drops the duration clause', () => {
+    const out = formatPermanent(
+      { kind: 'assistant', text: 'hi', durationMs: null, outputTokens: 50 },
+      ascii,
+    );
+    expect(out[0]).toBe('* Generated 50 tokens');
+    expect(out[1]).toBe('hi');
   });
 
   describe('tool-end (operation chip + sub-content, UI.md §4.10.5/§4.10.7)', () => {

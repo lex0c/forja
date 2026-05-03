@@ -90,6 +90,29 @@ export type AssistantDeltaEvent = BaseEvent & {
   messageId: string;
   text: string;
 };
+// Per-turn token usage. Spec UI.md §4.10.5 — the live "Generating…"
+// chip shows `(Xs · ↑ N tokens)` when this lands; the final
+// scrollback line shows `Generated N tokens in Xs`. Producers that
+// don't expose token counts (or providers that emit usage only at
+// stop) just don't emit this — the chip falls back to `(Xs)`.
+//
+// Anthropic emits cumulative running totals; OpenAI emits the final
+// total only at stop. We treat the latest non-null field as canonical
+// (max over the stream) so a hypothetical incremental shape stays
+// monotonic.
+//
+// `cacheRead` and `cacheCreation` are surfaced but not rendered today
+// — they fold into the cost computation downstream and may surface
+// in a future "expand chip" panel. The renderer only pulls
+// `outputTokens` for the chip counter.
+export type AssistantUsageEvent = BaseEvent & {
+  type: 'assistant:usage';
+  messageId: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheRead: number;
+  cacheCreation: number;
+};
 export type AssistantEndEvent = BaseEvent & {
   type: 'assistant:end';
   messageId: string;
@@ -346,6 +369,7 @@ export type UIEvent =
   | InputUpdateEvent
   | AssistantStartEvent
   | AssistantDeltaEvent
+  | AssistantUsageEvent
   | AssistantEndEvent
   | ThinkingStartEvent
   | ThinkingDeltaEvent

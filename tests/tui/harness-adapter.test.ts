@@ -238,8 +238,51 @@ describe('harness-adapter — provider events: text streaming', () => {
     expect((fatal[0] as Extract<UIEvent, { type: 'error' }>).fatal).toBe(true);
   });
 
-  test('usage event is silently dropped (no per-turn ui surface yet)', () => {
+  test('usage event with prior assistant:start emits assistant:usage with current messageId', () => {
     const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'mid-7' } });
+    const out = a.translate({
+      type: 'provider_event',
+      event: {
+        kind: 'usage',
+        usage: { input: 12, output: 234, cache_read: 5, cache_creation: 3 },
+      },
+    });
+    expect(out).toHaveLength(1);
+    const ev = out[0] as Extract<UIEvent, { type: 'assistant:usage' }>;
+    expect(ev.type).toBe('assistant:usage');
+    expect(ev.messageId).toBe('mid-7');
+    expect(ev.inputTokens).toBe(12);
+    expect(ev.outputTokens).toBe(234);
+    expect(ev.cacheRead).toBe(5);
+    expect(ev.cacheCreation).toBe(3);
+  });
+
+  test('usage event without a prior start is dropped (no synthetic turn)', () => {
+    // Out-of-order: better lose one counter than spawn an
+    // unattributable assistant lifecycle.
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'provider_event',
+      event: {
+        kind: 'usage',
+        usage: { input: 1, output: 2, cache_read: 0, cache_creation: 0 },
+      },
+    });
+    expect(out).toEqual([]);
+  });
+
+  test('usage event AFTER stop is dropped (currentMessageId already cleared)', () => {
+    // Anthropic emits usage before stop (verified in
+    // providers/anthropic/stream.ts), so this path is defensive
+    // against providers (or hypothetical future adapters) that emit
+    // usage in the wrong order. Once stop fires, the assistant
+    // lifecycle is closed — late usage has nowhere to land.
+    // Tracked separately if it becomes a real-world concern with
+    // OpenAI/Google.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'm1' } });
+    a.translate({ type: 'provider_event', event: { kind: 'stop', reason: 'end_turn' } });
     const out = a.translate({
       type: 'provider_event',
       event: {

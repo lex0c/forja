@@ -22,6 +22,7 @@ interface ScriptedStep {
   tool_uses?: { id: string; name: string; input: Record<string, unknown> }[];
   stop_reason?: CollectedStep['stop_reason'];
   message_id?: string;
+  usage?: { input: number; output: number; cache_read?: number; cache_creation?: number };
 }
 
 const replayStep = function* (step: ScriptedStep): Iterable<StreamEvent> {
@@ -32,6 +33,17 @@ const replayStep = function* (step: ScriptedStep): Iterable<StreamEvent> {
   for (const tu of step.tool_uses ?? []) {
     yield { kind: 'tool_use_start', id: tu.id, name: tu.name };
     yield { kind: 'tool_use_stop', id: tu.id, final_args: tu.input };
+  }
+  if (step.usage !== undefined) {
+    yield {
+      kind: 'usage',
+      usage: {
+        input: step.usage.input,
+        output: step.usage.output,
+        cache_read: step.usage.cache_read ?? 0,
+        cache_creation: step.usage.cache_creation ?? 0,
+      },
+    };
   }
   yield {
     kind: 'stop',
@@ -354,6 +366,35 @@ describe('runAgent onEvent', () => {
     // trace of the first observer's mutation.
     expect(updates[1]?.items).toHaveLength(1);
     expect(updates[1]?.items[0]?.content).toBe('second');
+  });
+
+  test('provider usage event surfaces verbatim in onEvent (consumed by adapter)', async () => {
+    // The adapter (separate from the harness) translates this into
+    // assistant:usage UIEvents — see tests/tui/harness-adapter.test.ts.
+    // Here we just verify the harness still forwards the raw provider
+    // event so the adapter has something to translate.
+    const events: HarnessEvent[] = [];
+    await runAgent({
+      provider: mockProvider([
+        {
+          text: 'reply',
+          stop_reason: 'end_turn',
+          usage: { input: 12, output: 234, cache_read: 5, cache_creation: 0 },
+        },
+      ]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      onEvent: (e) => events.push(e),
+    });
+    const usageEvents = events
+      .filter((e) => e.type === 'provider_event')
+      .map((e) => (e.type === 'provider_event' ? e.event : null))
+      .filter((ev): ev is Extract<StreamEvent, { kind: 'usage' }> => ev?.kind === 'usage');
+    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents[0]?.usage.output).toBe(234);
   });
 
   test('a throwing onEvent does not derail the loop', async () => {

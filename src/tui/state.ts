@@ -67,6 +67,20 @@ export interface StatusState {
 export interface PendingAssistant {
   messageId: string;
   text: string;
+  // Wall-clock when assistant:start fired. Live chip uses this to
+  // render the duration counter (now - startedAt). Producer (adapter)
+  // stamps event.ts from the same clock; we copy it onto the pending
+  // record so the renderer doesn't need separate per-message timing.
+  startedAt: number;
+  // Latest known token counts for the turn. Null until the first
+  // assistant:usage event lands. Anthropic streams cumulative; OpenAI
+  // emits once at stop — both shapes resolve to "latest is canonical".
+  // Reducer merges with `Math.max` so a hypothetical incremental
+  // payload can't shrink the count.
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cacheRead: number | null;
+  cacheCreation: number | null;
 }
 
 // One option in a confirm modal. Spec: UI.md §5.5 / §4.10.13.
@@ -225,7 +239,21 @@ export type PermanentItem =
       env: { key: string; value: string }[];
     }
   | { kind: 'user-submit'; text: string }
-  | { kind: 'assistant'; text: string }
+  | {
+      kind: 'assistant';
+      text: string;
+      // Wall-clock duration of the assistant turn. Renderer uses it to
+      // print the `Generated N tokens in Xs` chip header. null when the
+      // producer didn't track timing (headless replay, synthetic
+      // events) — renderer falls back to plain text only.
+      durationMs: number | null;
+      // Output tokens reported by `assistant:usage`. null when the
+      // provider didn't emit a usage event (or the run ended before
+      // one arrived). When null, the chip header omits the token clause
+      // and reads `Generated in Xs`; when both are null, no header
+      // line is printed at all.
+      outputTokens: number | null;
+    }
   | {
       kind: 'tool-end';
       name: string;
@@ -334,7 +362,18 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
 
     case 'assistant:start':
       return {
-        state: { ...state, pendingAssistant: { messageId: event.messageId, text: '' } },
+        state: {
+          ...state,
+          pendingAssistant: {
+            messageId: event.messageId,
+            text: '',
+            startedAt: event.ts,
+            inputTokens: null,
+            outputTokens: null,
+            cacheRead: null,
+            cacheCreation: null,
+          },
+        },
         permanent: [],
       };
 
@@ -342,10 +381,50 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       const current = state.pendingAssistant;
       // Late delta with no matching start — happens if the producer
       // emitted out of order or session resumed mid-stream. We open
-      // a buffer on the fly rather than dropping content.
-      const buf = current ?? { messageId: event.messageId, text: '' };
+      // a buffer on the fly rather than dropping content. startedAt
+      // falls back to the delta's ts so the live duration counter
+      // reads "from when we first knew about this turn" instead of
+      // anchoring at 0 (which would render an absurd elapsed time).
+      const buf = current ?? {
+        messageId: event.messageId,
+        text: '',
+        startedAt: event.ts,
+        inputTokens: null,
+        outputTokens: null,
+        cacheRead: null,
+        cacheCreation: null,
+      };
       return {
         state: { ...state, pendingAssistant: { ...buf, text: buf.text + event.text } },
+        permanent: [],
+      };
+    }
+
+    case 'assistant:usage': {
+      const buf = state.pendingAssistant;
+      // Out-of-order / unknown turn: drop. Synthesizing a pending
+      // assistant from a usage event would render a chip with no text
+      // and no startedAt anchor — worse than ignoring the count.
+      if (buf === null || buf.messageId !== event.messageId) {
+        return { state, permanent: [] };
+      }
+      // Monotonic merge: protects against a hypothetical provider
+      // that emits a partial count after a complete one. Today
+      // Anthropic is cumulative and OpenAI is one-shot — both shapes
+      // are safe under Math.max.
+      const merge = (prev: number | null, next: number): number =>
+        prev === null ? next : Math.max(prev, next);
+      return {
+        state: {
+          ...state,
+          pendingAssistant: {
+            ...buf,
+            inputTokens: merge(buf.inputTokens, event.inputTokens),
+            outputTokens: merge(buf.outputTokens, event.outputTokens),
+            cacheRead: merge(buf.cacheRead, event.cacheRead),
+            cacheCreation: merge(buf.cacheCreation, event.cacheCreation),
+          },
+        },
         permanent: [],
       };
     }
@@ -353,7 +432,23 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
     case 'assistant:end': {
       const buf = state.pendingAssistant;
       const text = buf?.text ?? '';
-      const permanent: PermanentItem[] = text.length > 0 ? [{ kind: 'assistant', text }] : [];
+      const durationMs = buf !== null ? event.ts - buf.startedAt : null;
+      const outputTokens = buf?.outputTokens ?? null;
+      // Emit a permanent when EITHER text is present OR we have chip
+      // metadata worth surfacing. Tool-only turns (Anthropic emits
+      // tool_use blocks without accompanying text) consume real
+      // output tokens — the operator should still see the per-turn
+      // cost signal as a chip line above whatever tool chips fired.
+      // Without this, only step:budget aggregates the cost and the
+      // per-turn breakdown is invisible. formatPermanent handles the
+      // text-empty + chip-metadata combination by emitting just the
+      // header.
+      const hasMeaningfulMetadata =
+        outputTokens !== null && outputTokens > 0 && durationMs !== null;
+      const shouldEmit = text.length > 0 || hasMeaningfulMetadata;
+      const permanent: PermanentItem[] = shouldEmit
+        ? [{ kind: 'assistant', text, durationMs, outputTokens }]
+        : [];
       return { state: { ...state, pendingAssistant: null }, permanent };
     }
 

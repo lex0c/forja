@@ -92,6 +92,65 @@ describe('composeLive layout', () => {
     expect(out[5]).toBe(expectedRule(caps.cols, true));
   });
 
+  test('layered live region: TodoList → assistant chip → tool cards (top→bottom)', () => {
+    // Spec UI.md §4.10.6: TodoList sits above the operation chips,
+    // and the assistant turn is itself an operation chip rendered
+    // above tool cards (parent → child visual hierarchy).
+    const s = startedSession();
+    s.todos = [{ content: 'plan it', activeForm: 'Planning it', status: 'pending' }];
+    s.pendingAssistant = {
+      messageId: 'm1',
+      text: '',
+      startedAt: 0,
+      inputTokens: null,
+      outputTokens: null,
+      cacheRead: null,
+      cacheCreation: null,
+    };
+    const tool: ActiveTool = {
+      toolId: 't1',
+      name: 'bash',
+      activeVerb: 'Executing',
+      finalVerb: 'Executed',
+      subject: 'ls',
+      startedAt: 0,
+      preview: [],
+    };
+    s.activeTools.set('t1', tool);
+    const out = composeLive(s, caps, 100);
+    // Expected layout (top→bottom):
+    //   [Tasks header, todo row, assistant chip, tool head, sub, status, rule, input, rule, footer]
+    expect(out[0]).toContain('Tasks');
+    expect(out[1]).toContain('plan it');
+    expect(out[2]).toContain('Generating…');
+    expect(out[3]).toContain('Executing');
+    expect(out[4]).toContain('ls');
+    expect(out[5]).toContain('forja');
+    expect(out[6]).toBe(expectedRule(caps.cols, true));
+    expect(out[7]).toBe('> ');
+    expect(out[8]).toBe(expectedRule(caps.cols, true));
+    expect(out[9]).toContain('? for help');
+    expect(out).toHaveLength(10);
+  });
+
+  test('assistant chip alone (no todos, no tools) renders between status anchor and live tools slot', () => {
+    const s = startedSession();
+    s.pendingAssistant = {
+      messageId: 'm1',
+      text: '',
+      startedAt: 0,
+      inputTokens: null,
+      outputTokens: null,
+      cacheRead: null,
+      cacheCreation: null,
+    };
+    const out = composeLive(s, caps, 1000);
+    // [chip, status, rule, input, rule, footer] = 6.
+    expect(out).toHaveLength(6);
+    expect(out[0]).toContain('Generating…');
+    expect(out[1]).toContain('forja');
+  });
+
   test('multi-line input keeps input above the trailing rule + footer', () => {
     const s = startedSession();
     s.input.value = 'a\nb';

@@ -254,13 +254,35 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
             // double-render the tool card.
             return out;
 
-          case 'usage':
-            // Cost folding belongs to the harness; the adapter only
-            // sees per-turn token counts here, which we don't surface
-            // directly (step:budget carries cost, not tokens). Drop
-            // for now — a future per-turn token indicator would land
-            // here.
+          case 'usage': {
+            // Spec UI.md §4.10.5: live "Generating…" chip shows
+            // `(Xs · ↑ N tokens)` once usage lands; final scrollback
+            // line shows `Generated N tokens in Xs`. Cost folding is
+            // still a harness concern (step:budget carries cost),
+            // but token counts deserve their own UIEvent so the
+            // renderer can drive both the live counter and the
+            // scrollback chip from the same signal.
+            //
+            // Anthropic emits this on message_start AND message_stop
+            // (cumulative); OpenAI emits once at stop. Both shapes
+            // collapse to "latest count is canonical" — the reducer
+            // monotonic-merges if multiple events arrive within a
+            // turn. Inherits the current message id; if usage somehow
+            // arrives before assistant:start (out-of-order), we drop
+            // it rather than synthesizing a turn — better to lose
+            // one counter update than to spawn a stub assistant.
+            if (state.currentMessageId === null) return out;
+            out.push({
+              type: 'assistant:usage',
+              ts,
+              messageId: state.currentMessageId,
+              inputTokens: ev.usage.input,
+              outputTokens: ev.usage.output,
+              cacheRead: ev.usage.cache_read,
+              cacheCreation: ev.usage.cache_creation,
+            });
             return out;
+          }
 
           case 'stop':
             endThinking(ts, out);

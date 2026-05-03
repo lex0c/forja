@@ -74,8 +74,39 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         return reverse(padded);
       });
     }
-    case 'assistant':
-      return item.text.length > 0 ? item.text.split('\n') : [];
+    case 'assistant': {
+      // Spec UI.md §4.10.5: final scrollback line is
+      // `· Generated 234 tokens in 8.2s` above the assistant text.
+      // Three modes:
+      //   1. text + chip metadata → header line + text lines (standard turn).
+      //   2. text + no metadata    → text only (headless replay / synthetic).
+      //   3. empty text + metadata → header only (tool-only turn — model
+      //      spent tokens generating tool_use blocks but no prose; the
+      //      operator should still see the cost signal as a chip line).
+      //   4. empty text + no metadata → nothing (degenerate; reducer
+      //      should never emit this combo, but guard anyway).
+      const hasMetadata = item.durationMs !== null || item.outputTokens !== null;
+      if (item.text.length === 0 && !hasMetadata) return [];
+      const textLines = item.text.length === 0 ? [] : item.text.split('\n');
+      if (!hasMetadata) return textLines;
+      const glyph = caps.unicode ? CHIP_FINAL_GLYPH.unicode : CHIP_FINAL_GLYPH.ascii;
+      const ms =
+        item.durationMs === null
+          ? null
+          : item.durationMs >= 1000
+            ? `${(item.durationMs / 1000).toFixed(1)}s`
+            : `${item.durationMs}ms`;
+      // "Generated N tokens in Xs" / "Generated in Xs" / "Generated".
+      // The bare "Generated" form should be unreachable today
+      // (assistant:end always knows event.ts) but the conditional
+      // structure stays explicit so a future producer that drops
+      // duration on purpose doesn't render a syntax-broken header.
+      const tokenClause = item.outputTokens === null ? '' : `${item.outputTokens} tokens`;
+      const inClause = ms === null ? '' : `in ${ms}`;
+      const tail = [tokenClause, inClause].filter((s) => s.length > 0).join(' ');
+      const header = paint(caps, 'dim', `${glyph} Generated${tail.length > 0 ? ` ${tail}` : ''}`);
+      return [header, ...textLines];
+    }
     case 'tool-end': {
       // UI.md §4.10.5 — chip glyph + verb (status-aware) + duration.
       // `· <verb> in <duration>` for Unicode; '* <verb> in <duration>'

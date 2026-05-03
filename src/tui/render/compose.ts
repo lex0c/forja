@@ -4,9 +4,11 @@
 //
 // Layout (top → bottom of live region):
 //   1. TodoList (1 + N lines — only when state.todos is non-empty).
-//   2. Active tool cards (running form, with preview).
-//   3. Status line (1 line — only when session has started).
-//   4. Bottom anchor block:
+//   2. Live assistant chip ("Generating…") — only while
+//      pendingAssistant is set.
+//   3. Active tool cards (running form, with preview).
+//   4. Status line (1 line — only when session has started).
+//   5. Bottom anchor block:
 //      - rule above input
 //      - input box (1+ lines)
 //      - rule below input
@@ -15,12 +17,13 @@
 //      and carries its own structure.
 //
 // Order matches the spec: history above (scrollback), then todos,
-// then live tool activity, then status, then the bottom anchor
-// (rule/input/rule/footer). The assistant chip arrives in 1.f.5.
+// then the live assistant chip, then live tool activity, then status,
+// then the bottom anchor (rule/input/rule/footer).
 
 import type { ComposeLive } from '../renderer-types.ts';
 import type { LiveState } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
+import { renderAssistantChip } from './assistant-chip.ts';
 import { renderFooter } from './footer.ts';
 import { renderInput } from './input.ts';
 import { renderModal } from './modal.ts';
@@ -106,17 +109,25 @@ export const composeLive: ComposeLive = (
   // returns [] when state.todos is empty — section drops entirely.
   lines.push(...renderTodoList(state.todos, caps));
 
-  // 2. Active tool cards (running). Map insertion order is preserved,
+  // 2. Live "Generating…" chip. Spec §4.10.5: the assistant turn is
+  // an operation chip just like a tool call. Renders above the tool
+  // cards because the assistant is the parent operation — tool calls
+  // it spawns sit beneath it visually.
+  if (state.pendingAssistant !== null) {
+    lines.push(...renderAssistantChip(state.pendingAssistant, caps, now));
+  }
+
+  // 3. Active tool cards (running). Map insertion order is preserved,
   // so the visual order matches the order tools were started.
   for (const tool of state.activeTools.values()) {
     lines.push(...renderToolCardLive(tool, caps, now));
   }
 
-  // 2. Status line — only when session has started.
+  // 4. Status line — only when session has started.
   const status = renderStatusLine(state, caps, { now });
   if (status !== null) lines.push(status);
 
-  // 3. Modal OR bottom anchor — never both. Bottom anchor is rule +
+  // 5. Modal OR bottom anchor — never both. Bottom anchor is rule +
   // input + rule + footer (4-block stack); modal substitutes the
   // whole anchor and carries its own structure. Status line + tool
   // cards stay visible above so the user keeps context.

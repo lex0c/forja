@@ -66,7 +66,15 @@ describe('renderFooter', () => {
 
   test('pendingAssistant (streaming text) also triggers interrupt cue', () => {
     const s = startedSession();
-    s.pendingAssistant = { messageId: 'm1', text: '' };
+    s.pendingAssistant = {
+      messageId: 'm1',
+      text: '',
+      startedAt: 0,
+      inputTokens: null,
+      outputTokens: null,
+      cacheRead: null,
+      cacheCreation: null,
+    };
     expect(renderFooter(s, caps)).toContain('esc to interrupt');
   });
 
