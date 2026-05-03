@@ -66,7 +66,7 @@ describe('renderToolCardLive (operation chip, active state — UI.md §4.10.5)',
     const out = renderToolCardLive(tool([], '/foo.ts'), unicode, 0);
     expect(out).toHaveLength(2);
     expect(out[1]).toBe(
-      `${CSI}90m└─ /foo.ts${CSI}0m`.replace(`${CSI}90m`, '').replace(`${CSI}0m`, ''),
+      `${CSI}2m└─ /foo.ts${CSI}0m`.replace(`${CSI}2m`, '').replace(`${CSI}0m`, ''),
     );
     // Color: 'none' for `unicode` here, so SGR strips off above; just
     // assert the connector + subject content.
@@ -107,7 +107,7 @@ describe('renderToolCardLive (operation chip, active state — UI.md §4.10.5)',
   test('subject and preview wrapped with dim SGR when color enabled', () => {
     const colorCaps = { ...unicode, color: 'basic' as const };
     const out = renderToolCardLive(tool(['hi']), colorCaps, 0);
-    expect(out[1]).toContain(`${CSI}90m`); // sub-content dim
-    expect(out[2]).toContain(`${CSI}90m`); // preview dim
+    expect(out[1]).toContain(`${CSI}2m`); // sub-content dim
+    expect(out[2]).toContain(`${CSI}2m`); // preview dim
   });
 });

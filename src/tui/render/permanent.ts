@@ -95,11 +95,11 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
           }
         }
       })();
-      // Marker rendered in `dim` (UI.md §6.1) — it's meta, the
-      // boundary signal between turns, not the operator's primary
-      // content. Plain palette would compete with the AI text above
-      // for attention.
-      return ['', paint(caps, 'dim', verb)].map(padFrame);
+      // Marker rendered in `secondary` (UI.md §6.1) — visible grey,
+      // distinct from primary content but not a content-class color.
+      // Using `dim` (SGR 2) here was invisible on many xterm
+      // configs, defeating the point.
+      return ['', paint(caps, 'secondary', verb)].map(padFrame);
     }
     case 'session-banner': {
       // UI.md §4.10.9. Three blocks separated by blank lines:

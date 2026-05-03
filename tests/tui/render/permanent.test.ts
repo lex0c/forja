@@ -225,11 +225,11 @@ describe('formatPermanent', () => {
       // 0: title (bold), 1: blank, 2-3: identity (dim), 4: blank, 5: env mix
       expect(out[0]).toContain(`${CSI}1m`);
       expect(out[1]).toBe(pad(''));
-      expect(out[2]).toContain(`${CSI}90m`);
-      expect(out[3]).toContain(`${CSI}90m`);
+      expect(out[2]).toContain(`${CSI}2m`);
+      expect(out[3]).toContain(`${CSI}2m`);
       expect(out[4]).toBe(pad(''));
       // env line: meta entry dim, flag entry success.
-      expect(out[5]).toContain(`${CSI}90m`); // dim runs (meta + separator)
+      expect(out[5]).toContain(`${CSI}2m`); // dim runs (meta + separator)
       expect(out[5]).toContain(`${CSI}32m`); // success run (flag)
     });
 
@@ -578,7 +578,7 @@ describe('formatPermanent', () => {
         { kind: 'tool-end', name: 'r', verb: 'Read', subject: null, status: 'done', durationMs: 1 },
         colored,
       );
-      expect(out[1]).toContain(`${CSI}90m`);
+      expect(out[1]).toContain(`${CSI}2m`);
     });
   });
 

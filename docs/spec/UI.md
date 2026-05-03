@@ -940,7 +940,8 @@ function dispatch(k: Key) { for (let i=stack.length-1; i>=0; i--) if (stack[i](k
 | Token | Uso | ANSI |
 |---|---|---|
 | `default` | texto normal | (sem escape) |
-| `dim` | meta, hints, separadores | `\x1b[90m` (bright-black ≈ grey) |
+| `dim` | meta, hints, separadores (réguas, footer, sub-content `└─`) | `\x1b[2m` (faint) |
+| `secondary` | marker visivelmente grey que precisa se separar do conteúdo primário (turn-end `Cogitated for X`, §3.2) | `\x1b[90m` (bright-black ≈ grey) |
 | `bold` | ênfase, header de modal | `\x1b[1m` |
 | `error` | mensagens de erro, status falho | `\x1b[31m` |
 | `warn` | avisos, budget 80% | `\x1b[33m` |
@@ -948,7 +949,7 @@ function dispatch(k: Key) { for (let i=stack.length-1; i>=0; i--) if (stack[i](k
 
 **Sem mais cores.** Sem azul, sem ciano, sem magenta, sem gradientes, sem 256-color, sem truecolor. Profile/model/etc. ficam em `default`. Se você precisa de cor pra distinguir, o layout falhou.
 
-**Nota sobre `dim`:** o token usa SGR 90 (bright-black, ≈ cinza), não SGR 2 (faint). SGR 2 depende do terminal implementar half-bright como atributo visível, e xterm com config padrão renderiza idêntico ao default — meta-text não se separava do conteúdo primário. SGR 90 é uma cor 16-color universal (cinza). Não é "mais uma cor" no sentido das proibidas (azul/ciano/magenta) — é a versão visível do que `dim` sempre quis dizer.
+**Nota sobre `dim` vs `secondary`:** `dim` (SGR 2 faint) é o token tradicional para meta — réguas, hints, sub-content. Em xterm com config padrão, SGR 2 renderiza idêntico ao default; aceito porque no contexto desses elementos a posição já carrega a hierarquia. **`secondary`** (SGR 90 bright-black) é o variante explicitamente visível, reservado pra marker que PRECISA destacar do conteúdo primário (turn-end `Cogitated for X` da §3.2). SGR 90 é uma cor 16-color (cinza), não "mais uma cor" no sentido das proibidas (azul/ciano/magenta).
 
 `NO_COLOR` env var ou `--no-color`: desativa todos os escapes. `CLICOLOR_FORCE=1` ignora `!isTTY` e força cores (útil em log capture).
 

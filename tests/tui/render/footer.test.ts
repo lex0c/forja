@@ -192,7 +192,7 @@ describe('renderFooter', () => {
   test('renders dim SGR when color enabled', () => {
     const colored: Capabilities = { ...caps, color: 'basic' };
     const out = renderFooter(startedSession(), colored);
-    expect(out).toContain(`${CSI}90m`);
+    expect(out).toContain(`${CSI}2m`);
   });
 
   test('cost format degrades with magnitude (under $1 = 4 decimals)', () => {

@@ -22,9 +22,7 @@ export interface PlainRendererOptions {
 }
 
 const RESET = '\x1b[0m';
-// SGR 90 (bright-black) instead of SGR 2 (faint) — see term.ts
-// for the rationale; keeping plain-mode in sync with the TUI palette.
-const DIM = '\x1b[90m';
+const DIM = '\x1b[2m';
 const RED = '\x1b[31m';
 const GREEN = '\x1b[32m';
 const YELLOW = '\x1b[33m';
