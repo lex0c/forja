@@ -21,6 +21,7 @@ The architectural spec lives in `docs/spec/AGENTIC_CLI.md`. Each subsystem has a
 | Trust / sandbox / threat model | `AGENTIC_CLI` §9, `SECURITY_GUIDELINE` |
 | Hooks | `AGENTIC_CLI` §10, `CONTRACTS` |
 | Subagents / playbooks | `AGENTIC_CLI` §11, `PLAYBOOKS` |
+| Subagent IPC (parent↔child channel) | `IPC`, `AGENTIC_CLI` §11 |
 | Checkpoints / undo | `AGENTIC_CLI` §12 |
 | Storage / schema / audit | `AGENTIC_CLI` §13, `AUDIT` |
 | Context engine, compaction | `AGENTIC_CLI` §6, `CONTEXT_TUNING` |
