@@ -256,6 +256,46 @@ describe('composeLive layout', () => {
     expect(out.some((l) => l.includes('? for help'))).toBe(false); // footer hint
   });
 
+  test('modal lines are NOT padded (renderModal already bakes the §6.3 frame margin)', () => {
+    // Regression guard: composeLive must NOT run modal output through
+    // padFrame. renderModal already emits content with `'  '` indent
+    // (its own §6.3 frame margin) AND emits rules at the full
+    // caps.cols width. Padding would double-indent content (4sp) and
+    // push rules to caps.cols+2, which truncateToWidth then clips
+    // by 2 columns on the right — visible as the modal box losing
+    // its right edge on every row.
+    const s = startedSession();
+    s.modal = {
+      promptId: 'p1',
+      flavor: 'permission',
+      title: 'Run command',
+      subject: 'rm -rf /',
+      preview: [],
+      question: 'Allow?',
+      options: [{ key: '1', label: 'Yes', value: 'yes' }],
+      selectedIndex: 0,
+      hints: ['Esc to cancel'],
+    };
+    const out = composeLive(s, caps, 0);
+    // A rule line starts with `─` (or `-`). After padFrame it would
+    // start with `'  ─'`. Find the rule rows and assert col 0 is
+    // the rule glyph, not a space.
+    const ruleLines = out.filter((l) => l.startsWith('─') || l.startsWith('-'));
+    expect(ruleLines.length).toBeGreaterThan(0);
+    for (const line of ruleLines) {
+      // First char must be the rule glyph itself (no leading pad).
+      expect(line.startsWith('  ')).toBe(false);
+      // Visual width matches caps.cols (full edge-to-edge).
+      // String length ≈ visual width because rule chars are 1 col each.
+      expect(line.length).toBe(caps.cols);
+    }
+    // Content rows (title/subject/question/options/hints) carry the
+    // modal's own internal `'  '` indent — that's the frame margin
+    // already, NOT a doubled `'    '`.
+    expect(out.some((l) => l.startsWith('  Run command'))).toBe(true);
+    expect(out.some((l) => l.startsWith('    Run command'))).toBe(false);
+  });
+
   // FOOTER_BLOCK_LINES guard: composeCursor's row math depends on
   // composeLive emitting exactly that many lines below the input.
   // Drift here = silent cursor mispositioning. Test catches additions

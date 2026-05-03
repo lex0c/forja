@@ -205,8 +205,17 @@ export const composeLive: ComposeLive = (
   // input + rule + footer (4-block stack); modal substitutes the
   // whole anchor and carries its own structure. Status line + tool
   // cards stay visible above so the user keeps context.
+  //
+  // Modal lines are NOT run through padFrame: renderModal already
+  // bakes the §6.3 frame margin into content rows (each block
+  // emits `'  ' + text`) AND its rule rows are intentionally
+  // edge-to-edge at caps.cols (matching the input block's full-
+  // width rule convention §6.3). Adding another 2sp prefix would
+  // double-indent content AND push rules past caps.cols, which
+  // truncateToWidth then clips on the right edge — visible as the
+  // box losing its last 2 columns on every row of every modal.
   if (state.modal !== null) {
-    lines.push(...renderModal(state.modal, caps).map(padFrame));
+    lines.push(...renderModal(state.modal, caps));
     return lines;
   }
   // Slash autocomplete popover sits above the rule, between status
