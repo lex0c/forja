@@ -627,6 +627,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     }
 
     const current = renderer.state().input;
+
+    // Footer's `? for help` cue (UI.md §4.10.6) needs to actually
+    // do something. Pressing `?` with an empty buffer dispatches the
+    // /help slash command — same effect as typing `/help` + Enter,
+    // but with a single keystroke. Once there's any content in the
+    // buffer (operator started typing a question that begins with
+    // `?`), `?` falls through as a literal character.
+    if (current.value === '' && key.kind === 'char' && key.char === '?' && !key.ctrl && !key.alt) {
+      void dispatchSlash({ name: 'help', args: [] }, { registry: slashRegistry, ctx: slashCtx });
+      return true;
+    }
+
     const result = applyKey(current, key);
 
     // Disarm the exit gate on any keystroke that ISN'T a fresh Ctrl+C.

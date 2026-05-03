@@ -879,6 +879,57 @@ describe('repl — slash commands integration', () => {
     process.removeAllListeners('SIGINT');
   });
 
+  test('`?` on empty buffer dispatches /help (footer cue activation)', async () => {
+    // The footer's `? for help` hint promised the operator a single
+    // keystroke would surface the command list. Pre-fix `?` was a
+    // literal char and the hint lied. With an empty buffer, `?`
+    // dispatches /help directly; same effect as typing /help+Enter.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('?');
+    await flushFrame();
+    // Help command rendered the slash command list to scrollback.
+    expect(writes.some((w) => w.includes('Slash commands:'))).toBe(true);
+    expect(writes.some((w) => w.includes('/quit'))).toBe(true);
+    // `?` did NOT land in the input buffer.
+    stdin.feed('\x04'); // Ctrl+D EOF cleanup
+    expect(await promise).toBe(130);
+  });
+
+  test('`?` mid-buffer is a literal char (no /help hijack)', async () => {
+    // Operator types a question that begins with `?` mid-thought:
+    // the keystroke must NOT trigger /help. Only the EMPTY-buffer
+    // case dispatches.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('hi?\r'); // type "hi?" + Enter — submit literal "hi?"
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    expect(ra.captured[0]?.configs[0]?.userPrompt).toBe('hi?');
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('typing /he opens the popover; Tab completes to /help; Enter dispatches', async () => {
     const stdin = makeStdin();
     const writes: string[] = [];
