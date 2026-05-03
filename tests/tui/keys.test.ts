@@ -219,6 +219,28 @@ describe('bracketed paste', () => {
     expect(events).toEqual([{ kind: 'paste', text: 'line1\nline2' }]);
   });
 
+  test('paste with bare CR (xterm-style newline) is normalized to LF', () => {
+    // xterm and many terminals emit `\r` for line breaks inside
+    // bracketed paste content (Enter convention). Without the
+    // parser-side normalization the buffer would land `\r` in the
+    // input and the renderer would interpret it as carriage-return
+    // mid-line, visually collapsing the multi-line paste.
+    const events = feed(`${BRACKETED_PASTE_START}line1\rline2\rline3${BRACKETED_PASTE_END}`);
+    expect(events).toEqual([{ kind: 'paste', text: 'line1\nline2\nline3' }]);
+  });
+
+  test('paste with CRLF (Windows-origin) is normalized to single LF', () => {
+    // Replacing bare CR after CRLF would split a single line break
+    // into two — the parser does CRLF first, then bare CR.
+    const events = feed(`${BRACKETED_PASTE_START}line1\r\nline2\r\nline3${BRACKETED_PASTE_END}`);
+    expect(events).toEqual([{ kind: 'paste', text: 'line1\nline2\nline3' }]);
+  });
+
+  test('paste with mixed CR / LF / CRLF normalizes consistently', () => {
+    const events = feed(`${BRACKETED_PASTE_START}a\rb\nc\r\nd${BRACKETED_PASTE_END}`);
+    expect(events).toEqual([{ kind: 'paste', text: 'a\nb\nc\nd' }]);
+  });
+
   test('paste end marker buffered: incoming chunk holds partial end', () => {
     // Feed the start marker, some content, then a prefix of the end
     // marker — the parser must NOT emit yet (would lose the marker

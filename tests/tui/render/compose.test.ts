@@ -394,21 +394,83 @@ describe('composeCursor', () => {
     expect(composeCursor(s, caps, 6)).toEqual({ row: 3, col: 2 });
   });
 
-  test('col clamps to caps.cols-1 when buffer is wider than the terminal', () => {
+  test('soft-wrap: long buffer line spans multiple visual rows; cursor lands on the right sub-row', () => {
+    // Buffer that overflows the terminal width wraps into multiple
+    // visual rows (renderInput soft-wraps; composeCursor mirrors the
+    // wrap math). The cursor never gets clamped at the right edge —
+    // it lands at the actual sub-row + col where the next char would
+    // appear. Pre-fix the cursor pinned to caps.cols-1 and the
+    // operator typed past the visible edge unable to track position.
     const narrow: Capabilities = { ...caps, cols: 10 };
+    // innerWidth = cols - prefix(2) = 8.
+    // 50 chars: ceil(50/8) = 7 visual rows. Char 50 is at offset 50,
+    // sub-row floor(50/8) = 6, col within sub-row = 50%8 = 2 → col 4.
     const s = startedSession();
     s.input.value = 'a'.repeat(50);
-    s.input.cursor = 50; // far past the right edge
-    const cur = composeCursor(s, narrow, 5);
-    expect(cur).not.toBeNull();
-    expect(cur?.col).toBe(narrow.cols - 1);
+    s.input.cursor = 50;
+    // Layout (no upper region in this test): the input occupies rows
+    // [inputStartRow .. +6]. lineCount must be enough to fit input +
+    // FOOTER_BLOCK_LINES; we pass a generous 12. inputStartRow = 12 - 2 - 7 = 3.
+    const cur = composeCursor(s, narrow, 12);
+    expect(cur).toEqual({ row: 3 + 6, col: 4 });
   });
 
-  test('col clamp does not mangle short inputs that already fit', () => {
+  test('soft-wrap: cursor at sub-row boundary lands at start of next sub-row', () => {
+    // Char immediately after a wrap boundary belongs to the NEXT
+    // visual sub-row, col 2 (right after the continuation prefix).
+    const narrow: Capabilities = { ...caps, cols: 10 };
+    // innerWidth = 8. Cursor at offset 8 → sub-row 1, col 2.
+    const s = startedSession();
+    s.input.value = 'a'.repeat(20);
+    s.input.cursor = 8;
+    // 20 chars: ceil(20/8) = 3 sub-rows. lineCount = 3 + 2 + 1 (status) = generous 8.
+    const cur = composeCursor(s, narrow, 8);
+    // visualRowsBefore = 0 (single buffer line). subRow = 1. col = 2.
+    expect(cur?.row).toBe(8 - 2 - 3 + 1);
+    expect(cur?.col).toBe(2);
+  });
+
+  test('short inputs that already fit emit cursor without sub-row math kicking in', () => {
     const narrow: Capabilities = { ...caps, cols: 20 };
     const s = startedSession();
     s.input.value = 'short';
     s.input.cursor = 5;
     expect(composeCursor(s, narrow, 5)).toEqual({ row: 2, col: 7 });
+  });
+
+  test('cursor at exact wrap boundary at end of line clamps to right edge of last sub-row', () => {
+    // Without the clamp, cursor at offset = innerWidth (end of a line
+    // whose length is exactly innerWidth) would compute as sub-row 1
+    // — but renderInput only emits 1 sub-row for an 8-char line in
+    // an 8-innerWidth setup. The phantom sub-row would visually
+    // overlap the rule below the input. Clamp puts the cursor at the
+    // right edge of the last actual sub-row; next char typed grows
+    // the input naturally.
+    const narrow: Capabilities = { ...caps, cols: 10 }; // innerWidth = 8
+    const s = startedSession();
+    s.input.value = 'a'.repeat(8); // exactly innerWidth
+    s.input.cursor = 8;
+    // 1 sub-row: lineCount = 1 (status) + 1 (rule) + 1 (input) + 2 (rule+footer) = 5.
+    // Wait, composeCursor takes lineCount from caller; pass generous 5 here.
+    const cur = composeCursor(s, narrow, 5);
+    // numSubRows = ceil(8/8) = 1. subRow would be 1 → clamped to 0.
+    // col clamped to cols - 1 = 9.
+    expect(cur).toEqual({ row: 5 - 2 - 1, col: 9 });
+  });
+
+  test('cursor past wrap boundary (1 char beyond) lands naturally on next sub-row', () => {
+    // Once the operator types one more char past the boundary, the
+    // input grows to 2 sub-rows and the cursor moves to col 2 of the
+    // new row (continuation prefix). No clamp needed — normal path.
+    const narrow: Capabilities = { ...caps, cols: 10 }; // innerWidth = 8
+    const s = startedSession();
+    s.input.value = 'a'.repeat(9); // 1 past innerWidth
+    s.input.cursor = 9;
+    // numSubRows = ceil(9/8) = 2. subRow = floor(9/8) = 1 (within range).
+    // col = 9%8 + prefix(2) = 1 + 2 = 3.
+    // lineCount must accommodate 2 input sub-rows + 2 footer block.
+    // Pass 6 (1 status + 1 rule + 2 input + 2 footer block).
+    const cur = composeCursor(s, narrow, 6);
+    expect(cur).toEqual({ row: 6 - 2 - 2 + 1, col: 3 });
   });
 });

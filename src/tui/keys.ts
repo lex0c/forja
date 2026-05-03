@@ -160,7 +160,16 @@ export const createKeyParser = (): KeyParser => {
   const decoder = createDecoder();
 
   const flushPaste = (events: KeyEvent[]): void => {
-    events.push({ kind: 'paste', text: pasteBuf });
+    // Normalize line endings: terminals like xterm emit `\r` (CR) for
+    // pasted newlines (Enter convention applied to bracketed-paste
+    // content), and Windows-origin sources send `\r\n` (CRLF). Both
+    // would land in the input buffer as control chars — `\r` makes
+    // the renderer think "carriage return to col 0", visually
+    // collapsing multi-line paste onto one line. Map every variant
+    // to a single `\n`. CRLF is replaced first so the bare-CR pass
+    // doesn't see split `\n\n`.
+    const text = pasteBuf.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    events.push({ kind: 'paste', text });
     pasteBuf = '';
     pasteActive = false;
   };

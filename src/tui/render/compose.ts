@@ -81,25 +81,67 @@ export const composeCursor = (
 ): CursorPos | null => {
   if (state.modal !== null) return null;
   const value = state.input.value;
-  const inputLineCount = value === '' ? 1 : value.split('\n').length;
-  // Last input row is FOOTER_BLOCK_LINES above the bottom of the
-  // live region; subtract input's own height to get the first row.
-  const inputStartRow = lineCount - FOOTER_BLOCK_LINES - inputLineCount;
-  const before = value.slice(0, state.input.cursor);
-  const linesBefore = before.split('\n');
-  const cursorLineIdx = linesBefore.length - 1;
-  const cursorColInLine = (linesBefore[cursorLineIdx] ?? '').length;
-  // Both '> ' (first line) and '  ' (continuation) are 2 chars wide.
+  // Both '> ' (first line) and '  ' (continuation) are 2 chars wide;
+  // soft-wrap chunks each `\n`-separated buffer line into chunks of
+  // `caps.cols - prefixWidth`. composeCursor must mirror renderInput's
+  // wrap math to land on the right visual sub-row.
   const prefixWidth = 2;
-  // Clamp to caps.cols - 1 so cursor stays on-screen for buffers
-  // wider than the terminal. Without this, cursorForward overshoots
-  // and either the terminal clamps (cursor "lost" at edge) or
-  // auto-wraps to the next row (eraseLive math then walks the wrong
-  // number of rows back). Buffer scrolling within the input box
-  // is future polish; clamp is the safety floor.
+  const innerWidth = Math.max(1, caps.cols - prefixWidth);
+
+  // Visual row count for one buffer line under soft-wrap. Empty lines
+  // still occupy 1 row.
+  const rowsForLine = (lineLen: number): number =>
+    lineLen === 0 ? 1 : Math.ceil(lineLen / innerWidth);
+
+  const lines = value === '' ? [''] : value.split('\n');
+  const inputLineCount = lines.reduce((acc, l) => acc + rowsForLine(l.length), 0);
+
+  // Find which buffer line + offset within it contains the cursor.
+  const cursorAbs = state.input.cursor;
+  let charsBefore = 0;
+  let bufferLineIdx = 0;
+  let offsetInLine = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const lineLen = (lines[i] ?? '').length;
+    if (cursorAbs <= charsBefore + lineLen) {
+      bufferLineIdx = i;
+      offsetInLine = cursorAbs - charsBefore;
+      break;
+    }
+    charsBefore += lineLen + 1; // +1 for the '\n' separator
+  }
+
+  // Visual rows occupied by buffer lines BEFORE the cursor's line.
+  let visualRowsBefore = 0;
+  for (let i = 0; i < bufferLineIdx; i++) {
+    visualRowsBefore += rowsForLine((lines[i] ?? '').length);
+  }
+  const cursorLineLen = (lines[bufferLineIdx] ?? '').length;
+  const numSubRows = rowsForLine(cursorLineLen);
+  let subRowInLine = Math.floor(offsetInLine / innerWidth);
+  let col = prefixWidth + (offsetInLine % innerWidth);
+
+  // Exact-wrap-boundary clamp: cursor at offset = N * innerWidth at
+  // the end of a non-empty buffer line wants to land on sub-row N
+  // (one past the last allocated). renderInput only emits ceil(len /
+  // innerWidth) sub-rows, so sub-row N would visually overlap the
+  // rule below the input. Clamp to the right edge of the last
+  // existing sub-row instead — typical editor behavior at the wrap
+  // boundary. As soon as the operator types one more char, the input
+  // grows by a sub-row and the cursor moves naturally to col 2 of
+  // the new row (no special-casing needed there).
+  if (subRowInLine >= numSubRows) {
+    subRowInLine = numSubRows - 1;
+    col = caps.cols - 1;
+  }
+
+  // Last input row is FOOTER_BLOCK_LINES above the bottom of the
+  // live region; subtract input's own (wrapped) height to get the
+  // first row.
+  const inputStartRow = lineCount - FOOTER_BLOCK_LINES - inputLineCount;
   return {
-    row: inputStartRow + cursorLineIdx,
-    col: Math.min(prefixWidth + cursorColInLine, Math.max(0, caps.cols - 1)),
+    row: inputStartRow + visualRowsBefore + subRowInLine,
+    col: Math.min(col, Math.max(0, caps.cols - 1)),
   };
 };
 
