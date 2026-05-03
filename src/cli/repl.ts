@@ -635,6 +635,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // buffer (operator started typing a question that begins with
     // `?`), `?` falls through as a literal character.
     if (current.value === '' && key.kind === 'char' && key.char === '?' && !key.ctrl && !key.alt) {
+      // Disarm the exit gate before returning. UI.md §5.4 says any
+      // non-Ctrl+C key disarms; the `?` shortcut is one of those keys
+      // and the early return below skips the cancelExitArm() call
+      // that lives further down in this handler. Without this,
+      // pressing Ctrl+C → `?` → Ctrl+C inside the 2s window would
+      // still exit 130 — the operator hit a non-interrupt key
+      // expecting to cancel the gate, but the gate stayed armed.
+      cancelExitArm();
       void dispatchSlash({ name: 'help', args: [] }, { registry: slashRegistry, ctx: slashCtx });
       return true;
     }

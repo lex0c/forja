@@ -906,6 +906,45 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(130);
   });
 
+  test('`?` shortcut disarms the exit gate before dispatching /help', async () => {
+    // Regression: the `?` shortcut early-returns before the
+    // editor's general disarm path runs. Without an explicit
+    // cancelExitArm() in the shortcut branch, this sequence would
+    // exit 130 unexpectedly:
+    //   1. Ctrl+C (idle) → arms gate, footer flips to "Press Ctrl-C
+    //      again to exit".
+    //   2. `?` → operator hits a non-interrupt key. UI.md §5.4 says
+    //      ANY non-Ctrl+C key disarms; gate must be cancelled.
+    //      Pre-fix the shortcut returned with the gate still armed.
+    //   3. Ctrl+C inside the 2s window → still detects gate as
+    //      armed and exits 130, dropping in-progress context.
+    // With the fix, step 2 disarms; step 3 re-arms instead of
+    // exiting. The operator's protection holds.
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+    });
+    await tick();
+    // Arm the exit gate.
+    stdin.feed('\x03');
+    await tick();
+    // Press `?` — should dispatch /help AND disarm the gate.
+    stdin.feed('?');
+    await tick();
+    // A single Ctrl+C now must arm fresh (NOT exit). If the gate
+    // had stayed armed across the `?`, this Ctrl+C would have
+    // exited 130 immediately.
+    stdin.feed('\x03');
+    await tick();
+    // Cleanup with EOF — proves the REPL is still alive after the
+    // sequence (process didn't exit unexpectedly).
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('`?` mid-buffer is a literal char (no /help hijack)', async () => {
     // Operator types a question that begins with `?` mid-thought:
     // the keystroke must NOT trigger /help. Only the EMPTY-buffer
