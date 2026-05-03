@@ -15,6 +15,38 @@ Format:
 
 ---
 
+## [2026-05-03] M2 / spec+impl — idle Ctrl+C double-tap exit gate (UI.md §5.4)
+
+Operator queixou: single Ctrl+C no idle saía do REPL imediatamente. Com a TUI inline e tarefas longas em curso, o "tap acidental" era custoso — sair perde draft, contexto de slash em curso, foco. A spec hoje (§5.4) só cobria Ctrl+C `running` (cancela / hard kill) e silenciava sobre idle, deixando o comportamento "exit imediato" implícito. Lacuna de spec, não divergência.
+
+**Done:**
+
+- §5.4 ganhou 4 linhas explícitas: `Ctrl+C / input não vazio` (limpa), `Ctrl+C / idle vazio` (arma + footer cue), `Ctrl+C 2x dentro de 2s / idle` (exit 130), `Ctrl+D / vazio` (EOF, sem gate). Parágrafo de notas explica o que desarma (qualquer tecla, timeout, submit, modal, turn start) e por que `^D` fica fora do gate (convenção de shell para "I'm done", duplo-tap surpreende).
+- §4.10.6 footer table ganhou linha `Idle, exit armed`: esquerda vira `ctrl+c again to exit` em `warn`, direita inalterada.
+- `input-editor.ts` discrimina Ctrl+C de Ctrl+D: `cancelInput?: 'interrupt' | 'eof'`. Caller decide o roteamento.
+- 2 UIEvents novos: `interrupt:exit-arm` (define `LiveState.exitArmed = { at: ts }`) e `interrupt:exit-cancel` (limpa). Reducer dumb: producer dirige.
+- `LiveState.exitArmed: { at: number } | null` adicionado, com boundary cleanup em `session:start` e `session:end` (defesa em profundidade contra leak entre turns).
+- `renderFooter` swapa o left-column inteiro pra cue `warn` quando `exitArmed !== null`. Precedence: gate > running interrupt cue > help hint.
+- `repl.ts` ganhou `armExit` / `cancelExitArm` / `handleIdleInterrupt` helpers em closure scope. Editor handler desarma em qualquer keystroke ≠ `interrupt`; SIGINT path passa pelo mesmo gate. Janela 2s via `setTimeout`; `shutdown()` cancela o timer pra evitar leak.
+
+**Decisions:**
+
+- **Gate só no idle.** Running tem o ladder soft/hard próprio (Esc/Ctrl+C → soft, segundo tap → hard). Misturar gates seria UX incoerente — operador running quer parar a tool, não fechar o agent.
+- **Ctrl+D fora do gate.** Convenção POSIX/shell: EOF é "I'm done". Aplicar double-tap aqui contraria 40 anos de muscle memory. Tests dedicados pra ambos os paths.
+- **Footer cue em `warn`, não `bold`.** Consistente com §6.4 ("bold + colorido" proibido exceto `error`). `warn` (yellow) carrega o "atenção: próxima tecla é load-bearing" sem virar alerta de erro.
+- **Producer-driven cancel, reducer dumb.** REPL emite `interrupt:exit-cancel` em qualquer disarm-condition; reducer só flipa flag. Reduzir lógica no reducer mantém o teste de unidade trivial e evita drift entre o que o REPL acha que está armado e o que o renderer mostra.
+- **Cleanup de tests via `\x04` (EOF), não `\x03`.** 21 dos 23 testes em `repl.test.ts` usavam `\x03` como "exit me, test acabou" — sed-replace para `\x04` mantém intent (exit imediato) sem depender do gate. Os 2 testes dedicados ao path de Ctrl+C ganharam reescrita explícita pra exercitar o novo contrato (single arm vs double-tap exit).
+- **Janela de 2s.** Padrão observado em fish, bash readline, e outros REPLs com gate similar. Curta o suficiente pra não deixar ambiguidade ("apertei agora, esqueci?"), longa o bastante pra um humano confirmar conscientemente.
+
+**Pending:**
+
+- Smoke visual: rodar `bun run dev`, verificar que footer mostra `ctrl+c again to exit` em yellow real e que após 2s desarma (cue some).
+- Documentar no welcome help (`/help` / `?`) o gate, pra novo operador descobrir sem precisar errar uma vez.
+
+**Next:** smoke + commit.
+
+---
+
 ## [2026-05-03] M2 / spec — UI.md welcome banner restructure (3 blocks + ✓ flags)
 
 Operator review of the boot screen flagged it as "denso, sem hierarquia" — banner colava no input, todos os blocos com mesmo peso, primeira impressão era "dump de terminal". Spec dizia 4 linhas tight; sem espaço pra respirar entre versão / identity / env. Receita externa sugeria cores acentuadas (cyan path, etc.) — proibidas pela §6.1 ("se precisa de cor pra distinguir, o layout falhou"), então a divergência teve que ir pela rota de spacing + glyph canônico, não paleta.

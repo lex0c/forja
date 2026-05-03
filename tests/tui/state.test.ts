@@ -631,6 +631,54 @@ describe('interrupt (soft / hard)', () => {
   });
 });
 
+describe('idle Ctrl+C exit gate (UI.md §5.4)', () => {
+  test('initial state has exitArmed null', () => {
+    expect(createInitialState().exitArmed).toBeNull();
+  });
+
+  test('interrupt:exit-arm sets exitArmed with the event timestamp', () => {
+    const r = applyEvent(createInitialState(), { type: 'interrupt:exit-arm', ts: 42 });
+    expect(r.state.exitArmed).toEqual({ at: 42 });
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('interrupt:exit-cancel clears exitArmed', () => {
+    const { state } = drive([
+      { type: 'interrupt:exit-arm', ts: 1 },
+      { type: 'interrupt:exit-cancel', ts: 2 },
+    ]);
+    expect(state.exitArmed).toBeNull();
+  });
+
+  test('interrupt:exit-cancel on null state is idempotent (no permanent emit)', () => {
+    const r = applyEvent(createInitialState(), { type: 'interrupt:exit-cancel', ts: 1 });
+    expect(r.state.exitArmed).toBeNull();
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('repeated interrupt:exit-arm refreshes the timestamp (latest press wins)', () => {
+    const { state } = drive([
+      { type: 'interrupt:exit-arm', ts: 100 },
+      { type: 'interrupt:exit-arm', ts: 250 },
+    ]);
+    expect(state.exitArmed).toEqual({ at: 250 });
+  });
+
+  test('session:start clears exitArmed (boundary cleanup before turn)', () => {
+    const { state } = drive([{ type: 'interrupt:exit-arm', ts: 1 }, start({ ts: 2 })]);
+    expect(state.exitArmed).toBeNull();
+  });
+
+  test('session:end clears exitArmed (boundary cleanup after turn)', () => {
+    const { state } = drive([
+      start(),
+      { type: 'interrupt:exit-arm', ts: 2 },
+      { type: 'session:end', ts: 3, sessionId: 's1', reason: 'done' },
+    ]);
+    expect(state.exitArmed).toBeNull();
+  });
+});
+
 describe('bg lifecycle', () => {
   test('initial state has empty bgProcesses', () => {
     expect(createInitialState().bgProcesses.size).toBe(0);

@@ -470,6 +470,7 @@ Sempre 1 linha, dim, **abaixo do input box** (com régua entre eles).
 | Estado | Esquerda | Direita |
 |---|---|---|
 | Idle | `? for help` | `• <model> · <steps>/<max> · $<cost>` |
+| Idle, exit armed (§5.4) | `ctrl+c again to exit` (`warn`) | (mesmo) |
 | Running | `? for help · esc to interrupt` | `• <model> · <steps>/<max> · $<cost>` |
 | Soft-aborted (ainda processando) | `? for help · esc again to force` | (mesmo) |
 | Plan mode | `? for help` | `• <model> · plan · <steps>/<max> · $<cost>` |
@@ -732,16 +733,21 @@ Renderer reage a `tick` igual a qualquer evento (redraw da região viva).
 |---|---|---|
 | Enter | input | submit |
 | Shift+Enter | input | nova linha |
+| Ctrl+C | input não vazio | limpa o buffer (não sai) |
+| Ctrl+C | idle, buffer vazio | **arma exit** — footer mostra `ctrl+c again to exit` (cue em `warn`); janela de 2s |
+| Ctrl+C (2x dentro de 2s) | idle, buffer vazio | exit 130 (POSIX SIGINT) |
 | Ctrl+C | running | cancela step atual (graceful) |
 | Ctrl+C (2x) | running | hard kill |
 | Esc | running | request soft interrupt (LLM termina passo, depois para) |
 | Esc Esc | running | hard interrupt (cancela tool em curso) |
 | Ctrl+L | qualquer | clear screen (mantém histórico no scrollback) |
 | Ctrl+R | input | reverse search no histórico |
-| Ctrl+D | input vazio | exit |
+| Ctrl+D | input vazio | exit imediato (EOF — convenção shell, sem gate) |
 | Tab | input com `/` | autocomplete |
 | Ctrl+Z | qualquer | suspend (SIGTSTP), retorna com `fg` |
 | ↑/↓ | input | navegar histórico de inputs |
+
+**Idle Ctrl+C double-tap:** o gate só aplica em `idle + buffer empty + sem run em curso`. Outros estados têm seus próprios paths (running tem o ladder soft/hard separado §3; buffer não vazio limpa). Janela de 2s é desarmada por: timeout, qualquer tecla (incluindo digitação), submit, abertura de modal, ou início de turno. Ctrl+D **não** passa pelo gate — EOF é convenção de shell para "I'm done", uma única tecla equivale a uma decisão explícita; aplicar double-tap aqui surpreende.
 
 ### 5.5 Modal pattern (canônico)
 

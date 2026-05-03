@@ -211,7 +211,7 @@ describe('repl — boot + smoke', () => {
       });
       // Boot succeeded. Drive Ctrl+C to exit cleanly.
       await tick();
-      stdin.feed('\x03');
+      stdin.feed('\x04');
       expect(await promise).toBe(130);
     } finally {
       Object.defineProperty(process.stdout, 'isTTY', {
@@ -221,14 +221,13 @@ describe('repl — boot + smoke', () => {
     }
   });
 
-  test('idle raw-mode Ctrl+C exits 130 (matches SIGINT path, not 0)', async () => {
-    // Pre-fix the cancelInput path called requestShutdown() without
-    // setting exitCode, so raw-mode Ctrl+C from idle exited 0 — making
-    // interrupt-driven exits look like success in shells / CI /
-    // automation that check exit status. The SIGINT handler explicitly
-    // set exitCode=130 (POSIX convention); the cancelInput path should
-    // match. Direct test of the new contract isolated from broader
-    // smoke teardowns.
+  test('idle raw-mode Ctrl+C double-tap exits 130 (UI.md §5.4 gate)', async () => {
+    // Spec §5.4: first Ctrl+C at idle/empty-buffer arms the gate
+    // (footer flips to `ctrl+c again to exit`); a second press inside
+    // the 2s window exits 130 (POSIX SIGINT). Pre-spec a single press
+    // exited immediately; the gate prevents accidental drops.
+    // exitCode=130 (not 0) keeps shells / CI / automation seeing
+    // interrupt-driven exits as interrupt.
     const stdin = makeStdin();
     const promise = runRepl({
       args: makeArgs(),
@@ -237,11 +236,74 @@ describe('repl — boot + smoke', () => {
       skipTtyCheck: true,
     });
     await tick();
+    // First press arms — no exit.
+    stdin.feed('\x03');
+    await tick();
+    // Second press within window exits 130.
     stdin.feed('\x03');
     expect(await promise).toBe(130);
   });
 
-  test('skipTtyCheck=true lets the REPL boot and exits on empty Ctrl+C with code 130', async () => {
+  test('idle raw-mode single Ctrl+C does NOT exit (gate armed, awaits second tap)', async () => {
+    // Direct negative control: a single press must NOT trigger
+    // shutdown. Confirms the gate isn't a no-op (would silently
+    // exit on first tap if the cancelInput → handleIdleInterrupt
+    // path skipped the armed check).
+    const stdin = makeStdin();
+    let resolved = false;
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+    }).then((code) => {
+      resolved = true;
+      return code;
+    });
+    await tick();
+    stdin.feed('\x03');
+    // Tick a few times to give any erroneous shutdown path a chance
+    // to fire. The promise should remain pending.
+    await tick();
+    await tick();
+    expect(resolved).toBe(false);
+    // Cleanup via EOF (no gate).
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('first Ctrl+C flips footer to "ctrl+c again to exit" cue (e2e producer→render)', async () => {
+    // Coverage gap: prior tests verify the gate's exit code AND
+    // verify the reducer/footer in isolation, but nothing ties the
+    // producer's bus emit to the rendered output. This pins the
+    // contract end-to-end — if armExit() ever stops emitting
+    // `interrupt:exit-arm`, the footer goes silent and the
+    // operator loses the cue, but exit codes still pass.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    const beforeArm = writes.length;
+    stdin.feed('\x03');
+    await flushFrame();
+    const afterArm = writes.slice(beforeArm).join('');
+    expect(afterArm).toContain('ctrl+c again to exit');
+    // Cleanup via EOF.
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('idle Ctrl+D (EOF) exits 130 immediately, no gate (shell convention)', async () => {
+    // §5.4: Ctrl+D is the explicit "I'm done" signal at empty buffer
+    // and bypasses the double-tap gate. Single press exits.
     const stdin = makeStdin();
     const closes: number[] = [];
     const stub = makeBootstrapStub();
@@ -254,14 +316,57 @@ describe('repl — boot + smoke', () => {
       stdin,
       skipTtyCheck: true,
     });
-    // Empty buffer + raw-mode Ctrl+C (\x03) → POSIX SIGINT exit 130.
-    // Matches the SIGINT handler's exit code so shells / CI / automation
-    // see interrupt-driven exits as interrupt regardless of stdin mode.
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     const code = await promise;
     expect(code).toBe(130);
     expect(closes).toHaveLength(1);
+  });
+
+  test('typing between two Ctrl+C disarms the gate (spec §5.4 "qualquer tecla")', async () => {
+    // Sequence: C+C arms → 'a' disarms → C+C re-arms → C+C exits.
+    // Three C+C in a row would also exit on the second; this tests
+    // the cancel-on-other-key path. Without the disarm, the second
+    // C+C in `^C a ^C` would exit prematurely.
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+    });
+    await tick();
+    stdin.feed('\x03'); // arms
+    await tick();
+    stdin.feed('a'); // disarms (input changed → cancelExitArm)
+    await tick();
+    stdin.feed('\x03'); // buffer 'a' → clears (no cancelInput)
+    await tick();
+    stdin.feed('\x03'); // empty buffer → arms fresh
+    await tick();
+    stdin.feed('\x03'); // empty buffer + armed → exits
+    expect(await promise).toBe(130);
+  });
+
+  test('SIGINT (process signal) at idle goes through the same gate', async () => {
+    // SIGINT path mirrors the editor's cancelInput=interrupt path —
+    // both converge on handleIdleInterrupt. A single SIGINT at idle
+    // arms; a second within the window exits 130. Confirms the
+    // operator's experience is consistent regardless of whether
+    // raw mode happened to capture the byte or the kernel delivered
+    // the signal.
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+    });
+    await tick();
+    process.emit('SIGINT'); // arms
+    await tick();
+    process.emit('SIGINT'); // exits
+    expect(await promise).toBe(130);
   });
 
   test('boot emits welcome banner with correct content + omits empty env entries', async () => {
@@ -294,7 +399,7 @@ describe('repl — boot + smoke', () => {
     // empty/disabled (D68 — omit when nothing to summarize).
     expect(all).not.toContain('subagents');
     expect(all).not.toContain('checkpoints');
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -318,7 +423,7 @@ describe('repl — boot + smoke', () => {
     // Wrap up.
     ra.finish(0);
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -346,7 +451,7 @@ describe('repl — boot + smoke', () => {
     expect(ra.captured[1]?.configs[0]?.resumeFromSessionId).toBe('sess-1');
     ra.finish(1);
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -381,7 +486,7 @@ describe('repl — boot + smoke', () => {
     expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('b');
     ra.finish(1);
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -417,7 +522,7 @@ describe('repl — boot + smoke', () => {
     // it explicitly so shutdown can resolve.
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -465,7 +570,7 @@ describe('repl — boot + smoke', () => {
     expect(signal?.aborted).toBe(true);
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -504,7 +609,10 @@ describe('repl — boot + smoke', () => {
     expect(signal?.aborted).toBe(true);
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
-    stdin.feed('\x03');
+    // Cleanup: Ctrl+D (EOF) is the direct-exit signal at idle. Ctrl+C
+    // would arm the new double-tap gate (UI.md §5.4) and stall the
+    // test — `\x04` matches the operator's "I'm done" intent.
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -547,7 +655,7 @@ describe('repl — boot + smoke', () => {
     expect(writes.slice(cutoff).join('')).toContain('esc again to force');
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -599,7 +707,7 @@ describe('repl — boot + smoke', () => {
     // Cleanup: resolve the run + exit.
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -654,14 +762,18 @@ describe('repl — boot + smoke', () => {
     // is cooperative — the fixture only listens on the hard signal,
     // so the run doesn't resolve. Second emit escalates to hard
     // (softInterrupted flipped true after the first), which fires
-    // the fixture's abort listener → microtasks → resolve. Third
-    // emit lands with running=false and triggers requestShutdown.
+    // the fixture's abort listener → microtasks → resolve. After
+    // resolution, running=false and a third SIGINT would only ARM
+    // the new idle double-tap gate (UI.md §5.4) — it wouldn't exit.
+    // We use Ctrl+D (EOF) instead for the cleanup shutdown: it
+    // bypasses the gate per spec and triggers requestShutdown
+    // directly, exiting 130.
     process.emit('SIGINT');
     await tick();
     process.emit('SIGINT');
     await tick();
     await tick();
-    process.emit('SIGINT');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
     // Critical ordering: db.close fires AFTER the run resolved.
     const dbCloseIdx = events.indexOf('db.close');
@@ -709,7 +821,7 @@ describe('repl — boot + smoke', () => {
     // Wrap up.
     ra.finish(0);
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -757,7 +869,7 @@ describe('repl — boot + smoke', () => {
       usageComplete: true,
     });
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 });
@@ -797,7 +909,7 @@ describe('repl — slash commands integration', () => {
     expect(all).toContain('Slash commands:');
     expect(all).toContain('/quit');
     // Wrap up.
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -828,7 +940,7 @@ describe('repl — slash commands integration', () => {
     // Esc to exit slash mode without dispatching, then quit.
     stdin.feed('\x1b\x1b');
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -864,7 +976,7 @@ describe('repl — slash commands integration', () => {
     const all = writes.join('');
     expect(all).not.toContain('unknown command');
     expect(all).toContain('Slash commands:');
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -885,7 +997,7 @@ describe('repl — slash commands integration', () => {
     await tick();
     // No turn started — runAgent override never called.
     expect(ra.captured).toHaveLength(0);
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -914,10 +1026,14 @@ describe('repl — slash commands integration', () => {
     // Popover not in the latest writes (would contain /help).
     const recent = writes.join('');
     expect(recent).not.toContain('/help');
-    // Buffer is 'hello'; first Ctrl+C clears it, second exits with
-    // POSIX SIGINT code 130 (raw-mode Ctrl+C now matches SIGINT
-    // semantics — interrupt-driven exit).
-    stdin.feed('\x03\x03');
+    // Cleanup. Buffer is 'hello'; Ctrl+D would forward-delete (buffer
+    // non-empty), so we use first Ctrl+C to clear (input-editor.ts
+    // empties on non-empty buffer), then Ctrl+D to EOF-exit at idle.
+    // Three Ctrl+C in a row would also work (clear → arm → exit) but
+    // EOF is more direct and doesn't depend on the gate's window.
+    stdin.feed('\x03');
+    await flushFrame();
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -972,7 +1088,7 @@ describe('repl — slash commands integration', () => {
     expect(post).toContain('0/99');
     ra.finish(1);
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -1011,7 +1127,7 @@ describe('repl — slash commands integration', () => {
     expect(post).toContain('plan');
     ra.finish(0);
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -1047,7 +1163,7 @@ describe('repl — slash commands integration', () => {
     // as a scrollback `error: ...` line. Surface check.
     expect(writes.join('')).toContain('unknown command');
     expect(writes.join('')).toContain('/doesnotexist');
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 

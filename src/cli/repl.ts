@@ -334,6 +334,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // function does the work without needing its own guard.
   const shutdown = async (): Promise<void> => {
     if (abortController !== null) abortController.abort();
+    // Cancel any pending idle-exit-gate timer so a 2s setTimeout
+    // doesn't outlive the REPL and leak a node handle (visible in
+    // tests as Bun's "open handles" warning, and in production as
+    // a delayed `interrupt:exit-cancel` emit on a closed bus).
+    if (exitArmTimer !== null) {
+      clearTimeout(exitArmTimer);
+      exitArmTimer = null;
+    }
     // Let the harness's async cleanup settle on the aborted signal
     // before tearing down the DB. Without this await, db.close() can
     // land before the harness flushes its final message/audit rows
@@ -377,6 +385,53 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     } else if (level === 'soft' && softStopController !== null) {
       softStopController.abort();
     }
+  };
+
+  // Idle Ctrl+C double-tap exit gate (UI.md §5.4). First press at
+  // idle/empty-buffer arms the gate; the footer flips to
+  // `ctrl+c again to exit` (warn) for the EXIT_ARM_WINDOW_MS window.
+  // A second press inside the window exits 130; any other keystroke
+  // disarms (handled by the editor handler), and a timeout cancels.
+  // Closure-local `exitArmedAt` is the source of truth for the
+  // window check; the reducer's `state.exitArmed` is just for the
+  // footer cue. They drift only briefly — the boundary resets in
+  // session:start/end keep the reducer side honest, and the local
+  // staleness self-resolves via the timestamp comparison.
+  const EXIT_ARM_WINDOW_MS = 2000;
+  let exitArmedAt: number | null = null;
+  let exitArmTimer: ReturnType<typeof setTimeout> | null = null;
+  const armExit = (): void => {
+    exitArmedAt = Date.now();
+    bus.emit({ type: 'interrupt:exit-arm', ts: now() });
+    if (exitArmTimer !== null) clearTimeout(exitArmTimer);
+    exitArmTimer = setTimeout(() => {
+      exitArmTimer = null;
+      if (exitArmedAt !== null) {
+        exitArmedAt = null;
+        bus.emit({ type: 'interrupt:exit-cancel', ts: now() });
+      }
+    }, EXIT_ARM_WINDOW_MS);
+  };
+  const cancelExitArm = (): void => {
+    if (exitArmedAt === null) return;
+    exitArmedAt = null;
+    if (exitArmTimer !== null) {
+      clearTimeout(exitArmTimer);
+      exitArmTimer = null;
+    }
+    bus.emit({ type: 'interrupt:exit-cancel', ts: now() });
+  };
+  // Idle Ctrl+C handler shared by editor (raw mode) and SIGINT
+  // (non-raw / external kill). Returns true when the call resulted
+  // in an exit decision (caller should consume / not fall through).
+  const handleIdleInterrupt = (): boolean => {
+    if (exitArmedAt !== null && Date.now() - exitArmedAt <= EXIT_ARM_WINDOW_MS) {
+      exitCode = 130;
+      requestShutdown();
+      return true;
+    }
+    armExit();
+    return false;
   };
   // Resolve the modal-manager's forward reference now that the real
   // interrupt path is defined. From here on, Ctrl+C with a modal up
@@ -574,6 +629,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     const current = renderer.state().input;
     const result = applyKey(current, key);
 
+    // Disarm the exit gate on any keystroke that ISN'T a fresh Ctrl+C.
+    // The interrupt branch below handles arm/exit itself; everything
+    // else (typing, Enter, Esc, Ctrl+D, etc.) is "operator did
+    // something other than re-press Ctrl+C", which the spec says
+    // disarms (§5.4 "qualquer tecla, incluindo digitação").
+    if (result.cancelInput !== 'interrupt') {
+      cancelExitArm();
+    }
+
     // Skip input:update when the buffer didn't change (Enter, Esc,
     // Ctrl+C with empty input, etc). The reducer's user:submit branch
     // clears state.input on its own — no need to first set it then
@@ -597,17 +661,25 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       startTurn(result.submit.text);
     }
 
-    // Ctrl+C while running → soft/hard interrupt ladder, same as Esc
-    // and the SIGINT handler. The renderer puts stdin in raw mode, so
-    // Ctrl+C lands as a `cancelInput` key event (byte 0x03 read from
-    // stdin) rather than a process SIGINT — the SIGINT handler can't
-    // be the only path. With buffer empty + idle, fall through to
-    // shutdown with POSIX exit 130 (matches the SIGINT handler so
-    // shells / CI / automation see interrupt-driven exits as
-    // interrupt regardless of whether stdin was raw). Synchronous
-    // gate (`exiting` set in requestShutdown) keeps a follow-up
-    // keystroke from racing past the check.
-    if (result.cancelInput === true) {
+    // Ctrl+C with empty buffer:
+    //   - running → soft/hard interrupt ladder (same as Esc and SIGINT).
+    //   - idle → double-tap gate (UI.md §5.4): first press arms,
+    //     second within 2s exits 130. Synchronous shutdown gate
+    //     (`exiting` set in requestShutdown) keeps a stray follow-up
+    //     keystroke from racing past the check.
+    if (result.cancelInput === 'interrupt') {
+      if (running) {
+        triggerInterrupt();
+      } else {
+        handleIdleInterrupt();
+      }
+    }
+
+    // Ctrl+D with empty buffer: shell EOF convention — direct exit, no
+    // double-tap gate. Operators expect `^D` as an explicit "I'm done"
+    // signal; making them press it twice would surprise. While running,
+    // route to the interrupt ladder for consistency with `^C` + Esc.
+    if (result.cancelInput === 'eof') {
       if (running) {
         triggerInterrupt();
       } else {
@@ -653,14 +725,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // certain modal lifecycles where the renderer pauses raw input) or
   // from an external `kill -INT`. Most operator Ctrl+C while running
   // lands as `cancelInput` via the editor (raw mode is on); both
-  // routes converge on `triggerInterrupt`. Idle SIGINT exits with
-  // 130 — POSIX convention.
+  // routes converge on `triggerInterrupt`. Idle SIGINT goes through
+  // the same double-tap gate as the editor path (UI.md §5.4) so the
+  // operator's experience is consistent regardless of whether raw
+  // mode happened to be active when they hit Ctrl+C.
   const sigintHandler = (): void => {
     if (running) {
       triggerInterrupt();
     } else {
-      exitCode = 130;
-      requestShutdown();
+      handleIdleInterrupt();
     }
   };
   process.on('SIGINT', sigintHandler);

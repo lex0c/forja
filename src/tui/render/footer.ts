@@ -44,12 +44,23 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
   // the loop has acknowledged the request and is winding down.
   // softInterrupted clears on session boundaries, so a fresh turn
   // starts back on "esc to interrupt".
-  const leftParts = [dim(caps, '? for help')];
-  if (isRunning(state)) {
-    leftParts.push(dim(caps, state.softInterrupted ? 'esc again to force' : 'esc to interrupt'));
-  }
+  //
+  // Idle exit-armed (UI.md §5.4 + §4.10.6 row "Idle, exit armed")
+  // takes over the entire left column with a `warn`-painted cue.
+  // Higher precedence than the help hint because the operator's
+  // next action is now load-bearing — they're 1 keystroke from a
+  // 130 exit, and we owe them the loudest signal we have.
   const sep = dim(caps, ' · ');
-  const left = leftParts.join(sep);
+  let left: string;
+  if (state.exitArmed !== null) {
+    left = paint(caps, 'warn', 'ctrl+c again to exit');
+  } else {
+    const leftParts = [dim(caps, '? for help')];
+    if (isRunning(state)) {
+      leftParts.push(dim(caps, state.softInterrupted ? 'esc again to force' : 'esc to interrupt'));
+    }
+    left = leftParts.join(sep);
+  }
 
   // Right column: shown only when a session is running (single
   // sessionId gate so all segments appear or none — avoids the

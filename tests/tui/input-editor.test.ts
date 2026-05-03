@@ -204,15 +204,15 @@ describe('Ctrl+C and Ctrl+D semantics', () => {
     expect(r.cancelInput).toBeUndefined();
   });
 
-  test('Ctrl+C with empty buffer surfaces cancelInput signal', () => {
+  test('Ctrl+C with empty buffer surfaces cancelInput=interrupt (gate-arming signal)', () => {
     const r = applyKey(empty(), ch('c', { ctrl: true }));
-    expect(r.cancelInput).toBe(true);
+    expect(r.cancelInput).toBe('interrupt');
     expect(r.next).toEqual({ value: '', cursor: 0 });
   });
 
-  test('Ctrl+D with empty buffer surfaces cancelInput (EOF)', () => {
+  test('Ctrl+D with empty buffer surfaces cancelInput=eof (direct EOF)', () => {
     const r = applyKey(empty(), ch('d', { ctrl: true }));
-    expect(r.cancelInput).toBe(true);
+    expect(r.cancelInput).toBe('eof');
   });
 
   test('Ctrl+D with non-empty buffer deletes forward (like Delete)', () => {

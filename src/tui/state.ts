@@ -193,6 +193,14 @@ export interface LiveState {
   // immediate-vs-cooperative cancellation distinction lives in a
   // future hard-abort slice.
   softInterrupted: boolean;
+  // Idle Ctrl+C double-tap gate (UI.md §5.4 + §4.10.6). Non-null means
+  // the operator pressed Ctrl+C once at idle with an empty buffer;
+  // footer flips to `ctrl+c again to exit` (warn). The REPL owns the
+  // 2s timer + the second-press detection — the reducer just flips
+  // the flag in response to `interrupt:exit-arm` / `:exit-cancel`.
+  // `at` is the timestamp when armed (carried for tests / future
+  // animation; not currently consulted by the renderer).
+  exitArmed: { at: number } | null;
   // Set true after `session:end`; renderer uses to decide whether to
   // accept further input or stop redrawing.
   ended: boolean;
@@ -219,6 +227,7 @@ export const createInitialState = (): LiveState => ({
   todos: [],
   bgProcesses: new Map(),
   softInterrupted: false,
+  exitArmed: null,
   ended: false,
 });
 
@@ -344,6 +353,12 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
           ...state,
           status,
           softInterrupted: false,
+          // Defense in depth: a fresh turn starting clears any
+          // armed-exit gate from before. The REPL also emits
+          // `interrupt:exit-cancel` on submit, but a session can
+          // start via paths that bypass the editor (resume, headless
+          // bridge), so the boundary reset closes the gap.
+          exitArmed: null,
           bgProcesses: new Map(),
           ended: false,
         },
@@ -376,6 +391,8 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
         state: {
           ...state,
           softInterrupted: false,
+          // Same boundary reset rationale as session:start (above).
+          exitArmed: null,
           bgProcesses: new Map(),
           ended: true,
         },
@@ -624,6 +641,20 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
         return { state: { ...state, softInterrupted: true }, permanent: [] };
       }
       return { state, permanent: [] };
+
+    case 'interrupt:exit-arm':
+      // UI.md §5.4 idle Ctrl+C gate. Idempotent: re-arming while
+      // already armed refreshes `at` so the operator's most recent
+      // press is the one whose 2s window counts (the producer also
+      // resets the timer; this is just defensive consistency).
+      return { state: { ...state, exitArmed: { at: event.ts } }, permanent: [] };
+
+    case 'interrupt:exit-cancel':
+      // Disarm. Producer emits this on: any other key, timeout
+      // expiry, submit, modal open, session boundary. Idempotent
+      // when already null.
+      if (state.exitArmed === null) return { state, permanent: [] };
+      return { state: { ...state, exitArmed: null }, permanent: [] };
 
     // ─── Modal events ──────────────────────────────────────────────
     // Each `*:ask` raises a confirm-shaped modal with `selected = 'no'`

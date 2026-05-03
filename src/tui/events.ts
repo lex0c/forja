@@ -382,6 +382,22 @@ export type InterruptEvent = BaseEvent & {
   level: 'soft' | 'hard';
 };
 
+// Idle Ctrl+C double-tap exit gate (UI.md §5.4 + §4.10.6 footer cue).
+// First press at idle/empty-buffer arms the gate; the footer flips to
+// `ctrl+c again to exit` (warn) for a 2s window. A second press inside
+// the window exits 130; any other input or the timeout cancels.
+//
+// Producer responsibility: REPL emits `interrupt:exit-arm` on the first
+// press, schedules a timer that emits `interrupt:exit-cancel` on
+// expiry, and emits `interrupt:exit-cancel` on any other key/event
+// that should disarm. Reducer is dumb — it just flips state.exitArmed.
+export type InterruptExitArmEvent = BaseEvent & {
+  type: 'interrupt:exit-arm';
+};
+export type InterruptExitCancelEvent = BaseEvent & {
+  type: 'interrupt:exit-cancel';
+};
+
 // Discriminated union — the renderer matches on `type` and the
 // compiler narrows the payload.
 export type UIEvent =
@@ -421,7 +437,9 @@ export type UIEvent =
   | InfoEvent
   | ErrorEvent
   | WarnEvent
-  | InterruptEvent;
+  | InterruptEvent
+  | InterruptExitArmEvent
+  | InterruptExitCancelEvent;
 
 export type UIEventType = UIEvent['type'];
 
