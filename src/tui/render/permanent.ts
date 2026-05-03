@@ -95,7 +95,11 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
           }
         }
       })();
-      return ['', verb].map(padFrame);
+      // Marker rendered in `dim` (UI.md §6.1) — it's meta, the
+      // boundary signal between turns, not the operator's primary
+      // content. Plain palette would compete with the AI text above
+      // for attention.
+      return ['', paint(caps, 'dim', verb)].map(padFrame);
     }
     case 'session-banner': {
       // UI.md §4.10.9. Three blocks separated by blank lines:

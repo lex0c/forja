@@ -51,25 +51,29 @@ describe('composeLive layout', () => {
   const inputRow = (out: string[], inputLineIdx = 0): string =>
     out[out.length - 2 - countInputLines(out) + inputLineIdx] ?? '';
 
-  test('pre-session: rule + input + rule + footer (status line absent)', () => {
+  test('pre-session: BLANK + rule + input + rule + footer', () => {
+    // The blank above the rule (UI.md §6.3) always fires — it
+    // separates the input block from whatever scrollback ends
+    // immediately above the live region.
     const out = composeLive(createInitialState(), caps, 0);
-    // [rule, '> ', rule, footer]. Length = 4.
-    expect(out).toHaveLength(4);
-    expect(out[0]).toBe(expectedRule(caps.cols, true));
-    expect(out[1]).toBe('> ');
-    expect(out[2]).toBe(expectedRule(caps.cols, true));
-    expect(out[3]).toContain('? for help');
+    expect(out).toHaveLength(5);
+    expect(out[0]).toBe('  '); // forced blank above input rule
+    expect(out[1]).toBe(expectedRule(caps.cols, true));
+    expect(out[2]).toBe('> ');
+    expect(out[3]).toBe(expectedRule(caps.cols, true));
+    expect(out[4]).toContain('? for help');
   });
 
-  test('after session start: rule, input, rule, footer (status line removed)', () => {
+  test('after session start: BLANK + rule + input + rule + footer', () => {
     // Status line was absorbed into footer (UI.md §4.4 superseded by
-    // §4.10.6). Layout is now [rule, '> ', rule, footer]. Length = 4.
+    // §4.10.6). Layout is now [BLANK, rule, '> ', rule, footer].
     const out = composeLive(startedSession(), caps, 0);
-    expect(out).toHaveLength(4);
-    expect(out[0]).toBe(expectedRule(caps.cols, true));
-    expect(out[1]).toBe('> ');
-    expect(out[2]).toBe(expectedRule(caps.cols, true));
-    expect(out[3]).toContain('opus');
+    expect(out).toHaveLength(5);
+    expect(out[0]).toBe('  ');
+    expect(out[1]).toBe(expectedRule(caps.cols, true));
+    expect(out[2]).toBe('> ');
+    expect(out[3]).toBe(expectedRule(caps.cols, true));
+    expect(out[4]).toContain('opus');
   });
 
   test('active tool card sits ABOVE bottom anchor', () => {
@@ -85,16 +89,19 @@ describe('composeLive layout', () => {
     };
     s.activeTools.set('t1', tool);
     const out = composeLive(s, caps, 1000);
-    // [chip head, sub-content, BLANK, rule, input, rule, footer] = 7.
-    // Blank between upper region and bottom anchor (UI.md §6.3).
-    expect(out).toHaveLength(7);
-    expect(out[0]).toContain('Executing');
-    expect(out[1]).toContain('ls');
-    expect(out[2]).toBe('  '); // blank between content and input rule
-    expect(out[3]).toBe(expectedRule(caps.cols, true));
-    expect(out[4]).toBe('> ');
-    expect(out[5]).toBe(expectedRule(caps.cols, true));
-    expect(out[6]).toContain('opus');
+    // Each top-level block (here: tool card) gets a leading BLANK.
+    // Plus the forced BLANK above the input rule.
+    //   [BLANK, chip head, sub-content, BLANK, rule, input, rule, footer]
+    // Length = 8.
+    expect(out).toHaveLength(8);
+    expect(out[0]).toBe('  '); // leading blank before tool card
+    expect(out[1]).toContain('Executing');
+    expect(out[2]).toContain('ls');
+    expect(out[3]).toBe('  '); // blank between content and input rule
+    expect(out[4]).toBe(expectedRule(caps.cols, true));
+    expect(out[5]).toBe('> ');
+    expect(out[6]).toBe(expectedRule(caps.cols, true));
+    expect(out[7]).toContain('opus');
   });
 
   test('layered live region: TodoList → assistant chip → tool cards (top→bottom)', () => {
@@ -123,29 +130,28 @@ describe('composeLive layout', () => {
     };
     s.activeTools.set('t1', tool);
     const out = composeLive(s, caps, 100);
-    // Expected layout (top→bottom): each top-level "session" block is
-    // separated from its neighbor by a blank line (UI.md §6.3); the
-    // sub-content connector under a tool chip stays tight (subsession).
-    // An additional blank sits between the upper region and the input
-    // block (rule + input + rule).
-    //   [Tasks header, todo row,
+    // Expected layout (top→bottom): EVERY top-level "session" block
+    // gets a leading BLANK so each is bounded by breathing space on
+    // both sides. Sub-content (rows under "Tasks", `└─` under chips)
+    // stays tight — it's the parent's subsession.
+    //   [BLANK, Tasks header, todo row,
     //    BLANK, assistant chip,
     //    BLANK, tool head, sub-content,
-    //    BLANK,                   ← input-block separator
-    //    rule, input, rule, footer]
-    expect(out[0]).toContain('Tasks');
-    expect(out[1]).toContain('plan it');
-    expect(out[2]).toBe('  '); // blank separator before assistant chip
-    expect(out[3]).toContain('Generating…');
-    expect(out[4]).toBe('  '); // blank separator before tool card
-    expect(out[5]).toContain('Executing');
-    expect(out[6]).toContain('ls');
-    expect(out[7]).toBe('  '); // blank between content and input rule
-    expect(out[8]).toBe(expectedRule(caps.cols, true));
-    expect(out[9]).toBe('> ');
-    expect(out[10]).toBe(expectedRule(caps.cols, true));
-    expect(out[11]).toContain('? for help');
-    expect(out).toHaveLength(12);
+    //    BLANK, rule, input, rule, footer]
+    expect(out[0]).toBe('  '); // leading blank before TodoList
+    expect(out[1]).toContain('Tasks');
+    expect(out[2]).toContain('plan it');
+    expect(out[3]).toBe('  '); // before assistant chip
+    expect(out[4]).toContain('Generating…');
+    expect(out[5]).toBe('  '); // before tool card
+    expect(out[6]).toContain('Executing');
+    expect(out[7]).toContain('ls');
+    expect(out[8]).toBe('  '); // before input rule
+    expect(out[9]).toBe(expectedRule(caps.cols, true));
+    expect(out[10]).toBe('> ');
+    expect(out[11]).toBe(expectedRule(caps.cols, true));
+    expect(out[12]).toContain('? for help');
+    expect(out).toHaveLength(13);
   });
 
   test('assistant chip alone (no todos, no tools) renders above bottom anchor', () => {
@@ -160,11 +166,12 @@ describe('composeLive layout', () => {
       cacheCreation: null,
     };
     const out = composeLive(s, caps, 1000);
-    // [chip, BLANK, rule, input, rule, footer] = 6.
-    expect(out).toHaveLength(6);
-    expect(out[0]).toContain('Generating…');
-    expect(out[1]).toBe('  '); // blank between chip and input rule
-    expect(out[2]).toBe(expectedRule(caps.cols, true));
+    // [BLANK, chip, BLANK, rule, input, rule, footer] = 7.
+    expect(out).toHaveLength(7);
+    expect(out[0]).toBe('  '); // leading blank before chip
+    expect(out[1]).toContain('Generating…');
+    expect(out[2]).toBe('  '); // blank between chip and input rule
+    expect(out[3]).toBe(expectedRule(caps.cols, true));
   });
 
   test('multi-line input keeps input above the trailing rule + footer', () => {
@@ -208,7 +215,8 @@ describe('composeLive layout', () => {
   test('ASCII fallback uses dashes for the rule', () => {
     const ascii: Capabilities = { ...caps, unicode: false };
     const out = composeLive(createInitialState(), ascii, 0);
-    expect(out[0]).toBe(expectedRule(ascii.cols, false));
+    // out[0] is the forced blank; rule sits at out[1].
+    expect(out[1]).toBe(expectedRule(ascii.cols, false));
   });
 
   test('rule width tracks caps.cols (measured visually, ANSI-aware)', () => {
@@ -216,13 +224,14 @@ describe('composeLive layout', () => {
     const out = composeLive(createInitialState(), narrow, 0);
     // visualWidth strips ANSI escapes — robust whether color is on
     // or off. .length would break the moment color flipped to basic.
-    expect(visualWidth(out[0] ?? '')).toBe(20);
+    // Rule sits at out[1] (out[0] is the forced blank above input).
+    expect(visualWidth(out[1] ?? '')).toBe(20);
   });
 
   test('rule width holds with color enabled (SGR codes do not bloat visual width)', () => {
     const colored: Capabilities = { ...caps, cols: 30, color: 'basic' };
     const out = composeLive(createInitialState(), colored, 0);
-    expect(visualWidth(out[0] ?? '')).toBe(30);
+    expect(visualWidth(out[1] ?? '')).toBe(30);
   });
 
   test('rule + footer suppressed when modal is up (modal owns its own structure)', () => {
@@ -255,9 +264,11 @@ describe('composeLive layout', () => {
     const s = createInitialState();
     s.input.value = 'abc';
     const out = composeLive(s, caps, 0);
-    // out shape (no upper region, no modal): [rule, '> abc', rule, footer]
-    // = 1 (rule above) + 1 (input) + FOOTER_BLOCK_LINES.
-    const expectedLength = 1 /* rule above */ + 1 /* input lines */ + FOOTER_BLOCK_LINES;
+    // out shape (no upper region, no modal):
+    //   [BLANK, rule, '> abc', rule, footer]
+    // = 1 (blank) + 1 (rule above) + 1 (input) + FOOTER_BLOCK_LINES.
+    const expectedLength =
+      1 /* blank */ + 1 /* rule above */ + 1 /* input lines */ + FOOTER_BLOCK_LINES;
     expect(out).toHaveLength(expectedLength);
   });
 

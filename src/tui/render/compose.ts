@@ -122,12 +122,15 @@ export const composeLive: ComposeLive = (
   // (TodoList, assistant chip, each tool card) gets a blank line above
   // it for scannability. Sub-content within an element (todo rows
   // under "Tasks", `└─` connector under a tool chip) stays tight —
-  // it's the parent block's "subsession". Helper appends with a
-  // leading blank UNLESS this is the very first block in the live
-  // region (no need to prepend a blank when there's nothing above).
+  // it's the parent block's "subsession". Helper ALWAYS prepends a
+  // blank: combined with the forced blank above the input rule,
+  // every top-level block ends up bounded by blanks on both sides
+  // — so the operator's eye scans live content as discrete units
+  // (e.g., "Generating..." chip with breathing space top + bottom)
+  // without the bottom edge fusing with the rule above the input.
   const appendBlock = (block: string[]): void => {
     if (block.length === 0) return;
-    if (lines.length > 0) lines.push(padFrame(''));
+    lines.push(padFrame(''));
     lines.push(...block.map(padFrame));
   };
 
@@ -171,14 +174,14 @@ export const composeLive: ComposeLive = (
   if (state.slash !== null) {
     appendBlock(renderSlashPopover(state.slash, caps));
   }
-  // Always 1 blank line between whatever content sits above and the
-  // input block (rule + input + rule). Without it, the rule_above
-  // butts against the last upper element and the operator's eye
-  // can't tell where the typing zone starts. The blank only fires
-  // when there IS content above; on a fresh session with no chips /
-  // tools / todos, the input block renders flush at the top of the
-  // live region as before.
-  if (lines.length > 0) lines.push(padFrame(''));
+  // Always 1 blank line above the input block (rule + input + rule),
+  // regardless of whether the upper live region has content. This
+  // line ALSO separates the top of the input rule from whatever
+  // permanent content sits in scrollback right above the live
+  // region: the bottom of the assistant text (or any other
+  // permanent line) ends up adjacent to the rule otherwise, and
+  // the typing zone visually fuses with the conversation.
+  lines.push(padFrame(''));
   lines.push(horizontalRule(caps));
   // Input is the single OUTDENTED element (UI.md §6.3 frame margin
   // exception). No padFrame here — the prompt `> ` lives at col 0
