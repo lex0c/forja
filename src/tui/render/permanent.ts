@@ -115,5 +115,10 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       return [paint(caps, 'error', `error: ${item.message}`)];
     case 'warn':
       return [paint(caps, 'warn', `warn: ${item.message}`)];
+    case 'info':
+      // Plain — no SGR. Info isn't an alert; coloring it would
+      // collide with the warn channel's "actually pay attention"
+      // signal (lock conflicts, compaction notices, etc.).
+      return [item.message];
   }
 };

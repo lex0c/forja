@@ -266,6 +266,37 @@ export type CheckpointCreateEvent = BaseEvent & {
   stepN: number;
 };
 
+// Wipe the visible scrollback (terminal Ctrl+L behavior). Renderer
+// writes ANSI clear-screen + redraws the live region. Scrollback
+// above the visible area stays accessible (xterm `\x1b[2J\x1b[H`
+// doesn't touch it). Distinct from a session reset — LiveState is
+// untouched.
+export type ScreenClearEvent = BaseEvent & {
+  type: 'screen:clear';
+};
+
+// Slash autocomplete state update. Spec UI.md §5.3. Producer (REPL
+// editor handler) emits when input enters / exits slash mode or
+// when navigation changes the highlighted suggestion. `suggestions`
+// empty + selectedIdx -1 means "exit slash mode" (reducer clears
+// state.slash to null). Otherwise the reducer mirrors the payload
+// onto state.slash for the renderer.
+export type SlashUpdateEvent = BaseEvent & {
+  type: 'slash:update';
+  suggestions: { name: string; description: string }[];
+  selectedIdx: number;
+};
+
+// Informational scrollback line. Spec UI.md §6.1 — not an error,
+// not a warning; just plain output the renderer should not paint
+// in any alarm color. Slash command output (/help, /sessions,
+// /cost, etc.) uses this so the operator doesn't see help text in
+// the same yellow as a lock-conflict warning.
+export type InfoEvent = BaseEvent & {
+  type: 'info';
+  message: string;
+};
+
 // Diagnostics + interrupts.
 export type ErrorEvent = BaseEvent & {
   type: 'error';
@@ -318,6 +349,9 @@ export type UIEvent =
   | BgEndEvent
   | StepBudgetEvent
   | CheckpointCreateEvent
+  | ScreenClearEvent
+  | SlashUpdateEvent
+  | InfoEvent
   | ErrorEvent
   | WarnEvent
   | InterruptEvent;

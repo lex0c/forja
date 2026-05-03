@@ -204,6 +204,42 @@ export const createRenderer = (options: RendererOptions): Renderer => {
   // first (otherwise the new permanent text would land below it).
   const handleEvent = (event: UIEvent): void => {
     if (closed) return;
+    // `screen:clear` is a renderer-side concern (writes ANSI escape,
+    // forces redraw); the reducer is a no-op for it. Handle here so
+    // the clear escape lands at the right moment in the I/O stream
+    // (before drawLive's subsequent redraw so the live region is the
+    // only thing on screen post-clear).
+    //
+    // Modal-up guard: refuse the wipe while a modal is active. The
+    // clear-escape would erase the modal frame mid-decision and the
+    // subsequent redraw would put it back, but the cursor-row
+    // tracking and any focus-stack state could end up out of sync.
+    // Operator can answer the modal first, then /clear.
+    if (event.type === 'screen:clear') {
+      if (state.modal !== null) {
+        // Surface as a warn so the operator sees the refusal
+        // explicitly instead of silently doing nothing.
+        eraseLive();
+        writePermanent([
+          { kind: 'warn', message: 'screen:clear refused: a modal is open (answer it first)' },
+        ]);
+        drawLive();
+        heartbeat?.bump();
+        return;
+      }
+      // \x1b[2J  — clear visible area
+      // \x1b[H   — move cursor to home (top-left)
+      // The terminal preserves the scrollback buffer above; the
+      // live region's `liveHeight` is now stale (cursor is at row 0,
+      // not at the end of last live line) — reset to 0 so eraseLive
+      // doesn't try to walk back over content we just wiped.
+      write('\x1b[2J\x1b[H');
+      liveHeight = 0;
+      cursorRow = 0;
+      drawLive();
+      heartbeat?.bump();
+      return;
+    }
     let result: ApplyResult;
     try {
       result = applyEvent(state, event);

@@ -127,6 +127,11 @@ const makeRunAgent = (
 // runAgent; awaiting `tick` between actions lets those handlers fire.
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
+// Wait long enough for the renderer's frame scheduler to fire
+// (default 33ms at 30fps). Use this when assertions depend on a
+// live-region redraw being observable in `rendererWrite` captures.
+const flushFrame = (): Promise<void> => new Promise((r) => setTimeout(r, 50));
+
 describe('repl — boot + smoke', () => {
   // process.on('SIGINT', ...) leaks across tests if we don't clean
   // up. The REPL removes its handler on shutdown, but a test that
@@ -471,5 +476,183 @@ describe('repl — boot + smoke', () => {
     await tick();
     stdin.feed('\x03');
     expect(await promise).toBe(0);
+  });
+});
+
+describe('repl — slash commands integration', () => {
+  // Same SIGINT cleanup as the smoke describe above.
+  afterEach(() => {
+    process.removeAllListeners('SIGINT');
+  });
+
+  test('typing /he opens the popover; Tab completes to /help; Enter dispatches', async () => {
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('/he');
+    await flushFrame();
+    // Popover should show /help row; output captured includes the
+    // popover line.
+    expect(writes.some((w) => w.includes('/help'))).toBe(true);
+    // Tab completes the highlighted suggestion.
+    stdin.feed('\t');
+    await flushFrame();
+    // Enter dispatches /help. Help renders 9 info lines (header +
+    // 8 commands) into scrollback.
+    stdin.feed('\r');
+    await flushFrame();
+    const all = writes.join('');
+    expect(all).toContain('Slash commands:');
+    expect(all).toContain('/quit');
+    // Wrap up.
+    stdin.feed('\x03');
+    expect(await promise).toBe(0);
+  });
+
+  test('arrow Down navigates between suggestions', async () => {
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('/');
+    await flushFrame();
+    // Default selectedIdx = 0 (highlight on /help). Arrow Down →
+    // highlight moves to /quit (registration order).
+    stdin.feed('\x1b[B'); // Down arrow
+    await flushFrame();
+    // Tab completes the new selection — /quit.
+    stdin.feed('\t');
+    await flushFrame();
+    const all = writes.join('');
+    expect(all).toContain('/quit');
+    // Esc to exit slash mode without dispatching, then quit.
+    stdin.feed('\x1b\x1b');
+    await tick();
+    stdin.feed('\x03');
+    expect(await promise).toBe(0);
+  });
+
+  test('/quit triggers shutdown and exits cleanly', async () => {
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+    });
+    await tick();
+    stdin.feed('/quit\r');
+    expect(await promise).toBe(0);
+  });
+
+  test('/Help (mixed case) resolves to /help via case-insensitive lookup', async () => {
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('/Help\r');
+    await flushFrame();
+    // Should NOT surface "unknown command" — should dispatch /help.
+    const all = writes.join('');
+    expect(all).not.toContain('unknown command');
+    expect(all).toContain('Slash commands:');
+    stdin.feed('\x03');
+    expect(await promise).toBe(0);
+  });
+
+  test('bare / + Enter clears the buffer instead of sending "/" to the LLM', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('/');
+    await tick();
+    stdin.feed('\r');
+    await tick();
+    // No turn started — runAgent override never called.
+    expect(ra.captured).toHaveLength(0);
+    stdin.feed('\x03');
+    expect(await promise).toBe(0);
+  });
+
+  test('slash mode is closed after typing a non-slash character at the start', async () => {
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('/he');
+    await flushFrame();
+    expect(writes.some((w) => w.includes('/help'))).toBe(true);
+    // Backspace 3 times to clear, then type a normal letter.
+    stdin.feed('\x7f\x7f\x7f');
+    await flushFrame();
+    writes.length = 0;
+    stdin.feed('hello');
+    await flushFrame();
+    // Popover not in the latest writes (would contain /help).
+    const recent = writes.join('');
+    expect(recent).not.toContain('/help');
+    // Buffer is 'hello'; first Ctrl+C clears it, second exits.
+    stdin.feed('\x03\x03');
+    expect(await promise).toBe(0);
+  });
+
+  test('Enter after /quit is suppressed (shutdown gate is synchronous)', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    // Hit /quit AND a follow-up Enter in the same dispatch burst —
+    // the second Enter must NOT slip past the shutdown gate and
+    // start a turn. requestShutdown sets `exiting=true` synchronously
+    // so subsequent keystrokes are swallowed by the editor handler.
+    stdin.feed('/quit\rhello\r');
+    expect(await promise).toBe(0);
+    expect(ra.captured).toHaveLength(0);
   });
 });

@@ -131,6 +131,20 @@ export interface ConfirmState {
 // own semantic union; this one's union is the most common.
 export type PermissionAnswer = 'yes' | 'session-allow' | 'no' | 'cancel';
 
+// Slash command autocomplete state. Spec UI.md §5.3. Set when the
+// input buffer starts with `/`; cleared when the user submits, Esc,
+// or types a non-slash character. Suggestions come pre-sorted from
+// the registry; renderer just displays the top entries with
+// `selectedIdx` highlighted.
+export interface SlashAutocomplete {
+  // {name, description} per command — flat shape so the reducer
+  // doesn't import from the slash subsystem (cycle avoidance).
+  suggestions: { name: string; description: string }[];
+  // Highlighted index within `suggestions`. -1 means "no selection"
+  // (e.g., empty suggestions list when input is `/<unknown>`).
+  selectedIdx: number;
+}
+
 export interface LiveState {
   input: InputState;
   status: StatusState;
@@ -143,6 +157,9 @@ export interface LiveState {
   // replaces the input box with `renderModal(modal, caps)` whenever
   // this is non-null. Status line + tool cards stay visible.
   modal: ConfirmState | null;
+  // Slash autocomplete popover, or null when not in slash mode.
+  // Composer renders above the input box (between status and rule).
+  slash: SlashAutocomplete | null;
   // Set true after `session:end`; renderer uses to decide whether to
   // accept further input or stop redrawing.
   ended: boolean;
@@ -165,6 +182,7 @@ export const createInitialState = (): LiveState => ({
   pendingAssistant: null,
   thinking: null,
   modal: null,
+  slash: null,
   ended: false,
 });
 
@@ -217,7 +235,8 @@ export type PermanentItem =
       summary?: string;
     }
   | { kind: 'error'; message: string }
-  | { kind: 'warn'; message: string };
+  | { kind: 'warn'; message: string }
+  | { kind: 'info'; message: string };
 
 export interface ApplyResult {
   state: LiveState;
@@ -404,11 +423,32 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       // with the status-line render function.
       return { state, permanent: [] };
 
+    case 'screen:clear':
+      // Pure renderer concern — state untouched. Renderer subscribes
+      // separately and writes the ANSI clear escape.
+      return { state, permanent: [] };
+
+    case 'slash:update': {
+      // Empty suggestions + selectedIdx -1 → exit slash mode. Any
+      // other shape is "(re)open with these suggestions".
+      const empty = event.suggestions.length === 0 && event.selectedIdx === -1;
+      return {
+        state: {
+          ...state,
+          slash: empty ? null : { suggestions: event.suggestions, selectedIdx: event.selectedIdx },
+        },
+        permanent: [],
+      };
+    }
+
     case 'error':
       return { state, permanent: [{ kind: 'error', message: event.message }] };
 
     case 'warn':
       return { state, permanent: [{ kind: 'warn', message: event.message }] };
+
+    case 'info':
+      return { state, permanent: [{ kind: 'info', message: event.message }] };
 
     case 'interrupt':
       // Renderer surfaces interrupt prompt in the input box area;

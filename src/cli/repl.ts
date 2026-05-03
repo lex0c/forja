@@ -40,6 +40,12 @@ import {
 } from '../tui/index.ts';
 import type { ParsedArgs } from './args.ts';
 import { type BootstrapInput, type BootstrapResult, bootstrap } from './bootstrap.ts';
+import {
+  type SlashContext,
+  createBuiltinRegistry,
+  dispatch as dispatchSlash,
+  parseSlashInput,
+} from './slash/index.ts';
 import { APP_NAME, VERSION } from './version.ts';
 
 export interface RunReplOptions {
@@ -244,6 +250,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     runningPromise = runAgentImpl(cfg)
       .then((result) => {
         lastSessionId = result.sessionId;
+        // Roll up running totals for /cost. Each turn contributes
+        // its own steps + cost; turns increments once per resolved
+        // run regardless of status.
+        cumulative.costUsd += result.costUsd;
+        cumulative.steps += result.steps;
+        cumulative.turns += 1;
       })
       .catch((e) => {
         const msg = e instanceof Error ? e.message : String(e);
@@ -256,9 +268,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       });
   };
 
+  // Async cleanup. Only called via `requestShutdown` below — the
+  // sync gate is the source of truth for "we're exiting"; this
+  // function does the work without needing its own guard.
   const shutdown = async (): Promise<void> => {
-    if (exiting) return;
-    exiting = true;
     if (abortController !== null) abortController.abort();
     // Let the harness's async cleanup settle on the aborted signal
     // before tearing down the DB. Without this await, db.close() can
@@ -274,10 +287,165 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     resolveExit();
   };
 
+  // Synchronous shutdown gate. Sets `exiting=true` BEFORE any await
+  // so a follow-up keystroke (Enter after /quit, second Ctrl+C)
+  // can't slip past the running/exiting check in the editor handler
+  // / startTurn. Idempotent — second call no-ops.
+  const requestShutdown = (): void => {
+    if (exiting) return;
+    exiting = true;
+    void shutdown();
+  };
+
+  // Slash command registry + cumulative tracker for /cost. Built once
+  // per REPL session — the registry is stable; cumulative is mutated
+  // by startTurn's success branch and read by /cost.
+  const slashRegistry = createBuiltinRegistry();
+  const cumulative = { costUsd: 0, steps: 0, turns: 0 };
+  const slashCtx: SlashContext = {
+    baseConfig,
+    db,
+    bus,
+    modalManager,
+    cumulative,
+    now,
+    requestShutdown,
+  };
+
+  // Tracks whether the popover is currently open. Local to the REPL
+  // so the editor handler doesn't need to read renderer.state().slash
+  // out of band — that's an implicit coupling on the bus's
+  // synchronous-emit semantics. Mirrors the reducer's view of slash
+  // state but updated synchronously alongside our emits.
+  let slashOpen = false;
+
+  // Recompute slash autocomplete after every input change. Emits the
+  // suggestion list (or empty + -1 to clear) so the reducer mirrors
+  // it onto state.slash for the renderer.
+  const updateSlashSuggestions = (value: string): void => {
+    const parsed = parseSlashInput(value);
+    if (parsed === null) {
+      // Not slash mode. Only emit a clear when slash was previously
+      // open — avoids spamming the bus on every plain keystroke.
+      if (slashOpen) {
+        bus.emit({ type: 'slash:update', ts: now(), suggestions: [], selectedIdx: -1 });
+        slashOpen = false;
+      }
+      return;
+    }
+    const matches = slashRegistry.complete(parsed.name);
+    bus.emit({
+      type: 'slash:update',
+      ts: now(),
+      suggestions: matches.map((c) => ({ name: c.name, description: c.description })),
+      selectedIdx: matches.length > 0 ? 0 : -1,
+    });
+    slashOpen = true;
+  };
+
+  // Lookup a command by name with fallback to the registry's
+  // case-sensitive lookup AND a case-insensitive fallback through
+  // complete(). Operator typing `/Help` should hit the `help`
+  // command (autocomplete already showed `help`); without this
+  // fallback the dispatcher gets `Help` and returns "unknown".
+  const resolveCommandName = (typedName: string): string => {
+    if (slashRegistry.lookup(typedName) !== undefined) return typedName;
+    const matches = slashRegistry.complete(typedName);
+    // Exact (case-insensitive) match takes precedence over prefix —
+    // `/Help` should resolve to `help`, not to whichever `helpfoo`
+    // command might exist later.
+    const exact = matches.find((c) => c.name.toLowerCase() === typedName.toLowerCase());
+    if (exact !== undefined) return exact.name;
+    return typedName; // dispatcher will surface "unknown command"
+  };
+
   // Input editor focus handler. Sits at the bottom of the focus
   // stack — modal-manager pushes its own handler on top when a modal
   // opens, intercepting keys before the editor sees them.
   const editorHandler: FocusHandler = (key: KeyEvent): boolean => {
+    // Shutdown gate: while exiting, swallow all keys so a follow-up
+    // keystroke after /quit / Ctrl+C doesn't slip through and start
+    // a new turn.
+    if (exiting) return true;
+
+    // Slash mode intercepts navigation / Tab / Enter / Esc BEFORE
+    // the editor sees them. Other keys (printables, backspace, etc.)
+    // fall through so the user can keep typing the command name.
+    const slashState = renderer.state().slash;
+    if (slashState !== null && key.kind === 'key') {
+      const k = key.name;
+      if (k === 'tab' && slashState.selectedIdx >= 0) {
+        const pick = slashState.suggestions[slashState.selectedIdx];
+        if (pick !== undefined) {
+          const newValue = `/${pick.name} `;
+          bus.emit({ type: 'input:update', ts: now(), value: newValue, cursor: newValue.length });
+          updateSlashSuggestions(newValue);
+        }
+        return true;
+      }
+      if (k === 'up') {
+        const idx = Math.max(0, slashState.selectedIdx - 1);
+        if (idx !== slashState.selectedIdx) {
+          bus.emit({
+            type: 'slash:update',
+            ts: now(),
+            suggestions: slashState.suggestions,
+            selectedIdx: idx,
+          });
+        }
+        return true;
+      }
+      if (k === 'down') {
+        const idx = Math.min(slashState.suggestions.length - 1, slashState.selectedIdx + 1);
+        if (idx !== slashState.selectedIdx) {
+          bus.emit({
+            type: 'slash:update',
+            ts: now(),
+            suggestions: slashState.suggestions,
+            selectedIdx: idx,
+          });
+        }
+        return true;
+      }
+      if (k === 'escape') {
+        // Esc clears slash mode AND wipes the input. Equivalent to
+        // user backing out of the slash autocomplete entirely.
+        bus.emit({ type: 'slash:update', ts: now(), suggestions: [], selectedIdx: -1 });
+        slashOpen = false;
+        bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
+        return true;
+      }
+      if (k === 'enter') {
+        const val = renderer.state().input.value;
+        const parsed = parseSlashInput(val);
+        if (parsed === null || parsed.name === '') {
+          // Bare `/` + Enter: nothing to execute. Falling through
+          // would let applyKey emit submit:'/' and dispatch a turn
+          // sending '/' to the model. Clear input + slash mode and
+          // consume the keystroke.
+          bus.emit({ type: 'slash:update', ts: now(), suggestions: [], selectedIdx: -1 });
+          slashOpen = false;
+          bus.emit({ type: 'input:update', ts: now(), value: '', cursor: 0 });
+          return true;
+        }
+        // Echo the slash command as a user-submit (visual divider
+        // in scrollback so the operator sees what they ran), then
+        // dispatch. Resolve the typed name through the registry's
+        // case-insensitive matcher so `/Help` lands on `help`
+        // (autocomplete already shows `help`; bug if the dispatcher
+        // disagrees).
+        const resolvedName = resolveCommandName(parsed.name);
+        bus.emit({ type: 'user:submit', ts: now(), text: val });
+        bus.emit({ type: 'slash:update', ts: now(), suggestions: [], selectedIdx: -1 });
+        slashOpen = false;
+        void dispatchSlash(
+          { name: resolvedName, args: parsed.args },
+          { registry: slashRegistry, ctx: slashCtx },
+        );
+        return true;
+      }
+    }
+
     const current = renderer.state().input;
     const result = applyKey(current, key);
 
@@ -292,6 +460,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         value: result.next.value,
         cursor: result.next.cursor,
       });
+      updateSlashSuggestions(result.next.value);
     }
 
     // Enter while a turn is running is ignored — no double-submit. The
@@ -304,9 +473,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     }
 
     // Ctrl+C with empty buffer → exit (only when idle; while a run is
-    // in progress, the SIGINT handler aborts instead).
+    // in progress, the SIGINT handler aborts instead). Use the
+    // synchronous gate so a follow-up keystroke after Ctrl+C doesn't
+    // slip past the running/exiting check.
     if (result.cancelInput === true && !running) {
-      void shutdown();
+      requestShutdown();
     }
 
     // Soft interrupt (single Esc) → abort the running turn. Esc with
@@ -340,7 +511,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       abortController.abort();
     } else {
       exitCode = 130;
-      void shutdown();
+      requestShutdown();
     }
   };
   process.on('SIGINT', sigintHandler);

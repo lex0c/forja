@@ -23,6 +23,7 @@ import { type Capabilities, paint } from '../term.ts';
 import { renderFooter } from './footer.ts';
 import { renderInput } from './input.ts';
 import { renderModal } from './modal.ts';
+import { renderSlashPopover } from './slash-popover.ts';
 import { renderStatusLine } from './status.ts';
 import { renderToolCardLive } from './tool-card.ts';
 
@@ -115,6 +116,13 @@ export const composeLive: ComposeLive = (
   if (state.modal !== null) {
     lines.push(...renderModal(state.modal, caps));
     return lines;
+  }
+  // Slash autocomplete popover sits above the rule, between status
+  // line / tool cards and the bottom anchor. Its line count adds to
+  // the upper region — composeCursor's math (FOOTER_BLOCK_LINES +
+  // inputLines from the bottom) stays correct regardless.
+  if (state.slash !== null) {
+    lines.push(...renderSlashPopover(state.slash, caps));
   }
   lines.push(horizontalRule(caps));
   lines.push(...renderInput(state.input, caps));
