@@ -15,6 +15,36 @@ Format:
 
 ---
 
+## [2026-05-03] M1 / Step 1.f.8 — `/model <id>` mutation
+
+Closes the last mutation slash command deferred from 1.f.1. `/plan on|off` and `/budget steps|cost` landed in 1.f.7; `/model <id>` was held back because it requires re-resolving the provider via the registry's factory (key check, capability re-init), which has more failure modes than a simple field swap. This slice fills it in.
+
+`/model` with no args remains read-only (model id + capability ceilings). `/model <id>` looks up the entry in the registry, calls its factory to instantiate a fresh `Provider`, and replaces `baseConfig.provider`. Takes effect on the NEXT turn, matching the other mutation commands.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/cli/slash/types.ts` | NEW `SlashContext.modelRegistry: ModelRegistry`. Threaded through so `/model` can lookup + factory without re-importing the registry module — keeps the command unit-testable with a fixture registry instead of the full default set. |
+| `src/cli/repl.ts` | Builds the registry once at boot via `createDefaultRegistry()` and threads into `slashCtx`. Bootstrap built its own at boot for initial provider resolution; both call sites are independent (the registry is a pure Map of entries, no shared state — two instances are functionally equivalent). |
+| `src/cli/slash/commands/model.ts` | NEW `/model <id>` mutation path. Lookup miss → "Known: <list>" error so the operator doesn't grep docs. Idempotent: matching id returns "already" without the next-turn cue. Factory throw caught and reported with the SDK's message verbatim (`failed to instantiate '<id>': ANTHROPIC_API_KEY not set`) — typical for switching to a family the operator hasn't configured. `isRunning()` cue when running. |
+| `tests/cli/slash/dispatch.test.ts` | Fixture gains `modelRegistry: createModelRegistry()` (empty, since dispatch tests don't exercise model mutation). The "/model with mutation arg returns kind:error" test updated to use a clearly-bogus id (`'no-such-model-xxx'`) — under 1.f.7 mutation IS supported now, only unknown-id falls through to error. |
+| `tests/cli/slash/commands.test.ts` | Pre-existing "rejects mutation args (read-only)" test removed — no longer the contract. NEW 6 tests: unknown id rejects with Known list; valid id swaps `baseConfig.provider`; idempotent on no-change; factory throw produces clean error; running cue appended; too many args rejects. Fake provider/entry construction explicit (`as const` for capabilities to satisfy the strict `cache: CacheMode \| false` union). |
+
+**Decisions:**
+
+- **D176 — Registry threaded via SlashContext, not imported in the command.** Considered `import { createDefaultRegistry }` directly in `model.ts` and calling it inline. Rejected because: (a) tests would need to mock the import or accept the full default set (which calls the SDK adapter's register functions — eager and noisy), (b) future "custom registry" use cases (enterprise allow-list of approved models, restricted profile) have nowhere to inject without a context handle, (c) the pattern matches `db`, `bus`, `modalManager` — every external dependency on SlashContext is injectable for the same reason. Cost: one more field on SlashContext; benefit: testability + future flexibility.
+- **D177 — Factory throw caught at the command boundary, not propagated to `dispatch`.** `entry.factory()` can throw on missing API key (Anthropic adapter checks `process.env.ANTHROPIC_API_KEY`). Letting that propagate would land in `dispatch`'s generic crash handler ("command 'model' crashed: ..."), losing the specific signal. Catching at the command and returning `kind: 'error'` with the SDK's message verbatim gives the operator the actionable hint. Trade-off: another factory failure mode (e.g., the SDK's constructor having unrelated invariant failures) also gets reported as if it were "config" — acceptable because the SDK constructors are very narrow.
+- **D178 — `/model anthropic/<x>` validation is delegated to the registry.** The command doesn't parse the id format itself (no regex on `family/<modelName>`). The registry is the source of truth: if `registry.get(id)` returns null, reject. This means the command works identically across families — Anthropic's `anthropic/claude-sonnet-4-6`, OpenAI's `openai/gpt-4o`, etc. The user sees a Known list with whatever the registry actually supports, not a hardcoded subset.
+- **D179 — Provider swap does NOT dispose the prior client (assumed stateless).** When `/model` replaces `baseConfig.provider`, the prior `Provider` instance loses its only reference from the REPL and is left to GC. Today's M1 providers (Anthropic, OpenAI, Google) are stateless beyond their SDK clients, which use the global `fetch` API — no persistent sockets, no recurring timers, no file handles. So the GC handles cleanup correctly without an explicit dispose. **However**, the `Provider` interface (`src/providers/types.ts`) does not carry a `dispose?()` method, so there's no contract enforcing this premise. When a future adapter introduces stateful resources (HTTP keep-alive agents, child processes for local models like llama.cpp, persistent gRPC connections), the swap path becomes a silent leak. Mitigation when that lands: add `Provider.dispose?(): void | Promise<void>` and call it in the swap path before reassignment. Tracked here so the next provider adapter PR doesn't slip past the contract.
+- **D180 — `/cost` cumulative aggregates across provider swaps without breakdown.** The REPL's `cumulative.costUsd` accumulator (`src/cli/repl.ts`) sums every turn's cost into a single number. After `/model anthropic→openai`, `/cost` shows the aggregate spend computed against two different price tables — accurate as a total but confusing as a per-provider attribution. The operator who wants "spent $X on anthropic-sonnet, $Y on openai-4o" needs a breakdown that doesn't exist today. Out of scope for 1.f.8 (slice was about mutation, not cost telemetry); breakdown is a future telemetry slice that would also reach SQLite (per-turn cost rows already exist; the aggregator just doesn't group by provider).
+
+**Pending:** subagent observability (1.f.2, blocked on IPC); end-to-end audit with a real provider before locking M1.
+
+**Next:** end-to-end audit with a real provider, OR the IPC subsystem.
+
+---
+
 ## [2026-05-03] M1 / Step 1.g.3 — Surface abortCause through the UIEvent chain (closes D171)
 
 Closes D171 — the gap 1.g.2 left open. The discriminator landed on `HarnessResult` and persisted to SQLite, but every consumer downstream of the harness (TUI, NDJSON output, hooks) lost it: `mapExitReason` collapsed soft and hard into the same `session:end reason='aborted'`. This slice threads `abortCause` through `SessionEndEvent` → reducer → permanent → `formatPermanent`, surfacing the discriminator in the scrollback footer and on the bus for any future consumer.

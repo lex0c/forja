@@ -23,6 +23,7 @@ import { basename } from 'node:path';
 import { isGitRepo } from '../checkpoints/git.ts';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
 import { DEFAULT_BUDGET } from '../harness/types.ts';
+import { createDefaultRegistry } from '../providers/registry.ts';
 import {
   type FocusHandler,
   type HarnessAdapter,
@@ -317,6 +318,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // by startTurn's success branch and read by /cost.
   const slashRegistry = createBuiltinRegistry();
   const cumulative = { costUsd: 0, steps: 0, turns: 0 };
+  // Single registry instance for the REPL's lifetime. /model uses it
+  // for the lookup + factory; bootstrap built its own at boot for
+  // initial provider resolution. Both call sites are independent —
+  // there's no shared state, so two instances are functionally
+  // equivalent (the registry is just a Map of model entries).
+  const modelRegistry = createDefaultRegistry();
+
   const slashCtx: SlashContext = {
     baseConfig,
     db,
@@ -329,6 +337,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // a slash command queued before a turn starts but executed after
     // observes the post-startTurn state.
     isRunning: () => running,
+    modelRegistry,
   };
 
   // Tracks whether the popover is currently open. Local to the REPL

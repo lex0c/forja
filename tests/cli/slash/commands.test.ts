@@ -10,6 +10,7 @@ import { sessionsCommand } from '../../../src/cli/slash/commands/sessions.ts';
 import type { SlashCommand, SlashContext } from '../../../src/cli/slash/types.ts';
 import type { HarnessConfig } from '../../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../../src/harness/types.ts';
+import { createRegistry as createModelRegistry } from '../../../src/providers/registry.ts';
 import { openMemoryDb } from '../../../src/storage/db.ts';
 import { migrate } from '../../../src/storage/migrate.ts';
 import { createSession } from '../../../src/storage/repos/sessions.ts';
@@ -45,6 +46,7 @@ const makeCtx = (overrides: Partial<SlashContext> = {}): SlashContext => {
     now: () => 1,
     requestShutdown: () => undefined,
     isRunning: () => false,
+    modelRegistry: createModelRegistry(),
     ...overrides,
   };
 };
@@ -183,11 +185,131 @@ describe('/model', () => {
     expect(result.notes?.some((l) => l.includes('4,096'))).toBe(true);
   });
 
-  test('rejects mutation args (read-only in this slice)', async () => {
-    const result = await modelCommand.exec(['anthropic/other'], makeCtx());
+  test('/model unknown id rejects with Known list', async () => {
+    const ctx = makeCtx();
+    // Seed the registry with one known entry so the error message
+    // proves the Known suggestion came from the registry.
+    ctx.modelRegistry.register({
+      id: 'fake/sonnet',
+      family: 'anthropic',
+      modelName: 'sonnet',
+      capabilities: {
+        tools: 'native',
+        cache: false as const,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 1000,
+        output_max_tokens: 100,
+        cost_per_1k_input: 0,
+        cost_per_1k_output: 0,
+        notes: [],
+      },
+      factory: () => ({}) as never,
+    });
+    const result = await modelCommand.exec(['no-such-model'], ctx);
     expect(result.kind).toBe('error');
     if (result.kind !== 'error') return;
-    expect(result.message).toContain('read-only');
+    expect(result.message).toContain('unknown model');
+    expect(result.message).toContain('fake/sonnet');
+  });
+
+  test('/model <id> swaps baseConfig.provider and notes next-turn pickup', async () => {
+    const ctx = makeCtx();
+    const newProvider = {
+      id: 'fake/swap',
+      family: 'anthropic' as const,
+      capabilities: {
+        tools: 'native' as const,
+        cache: false as const,
+        vision: false,
+        streaming: true,
+        constrained: 'tools' as const,
+        context_window: 500,
+        output_max_tokens: 200,
+        cost_per_1k_input: 0,
+        cost_per_1k_output: 0,
+        notes: [] as string[],
+      },
+      generate: async function* () {},
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+    ctx.modelRegistry.register({
+      id: 'fake/swap',
+      family: 'anthropic',
+      modelName: 'swap',
+      capabilities: newProvider.capabilities,
+      factory: () => newProvider,
+    });
+    const result = await modelCommand.exec(['fake/swap'], ctx);
+    if (result.kind !== 'ok') {
+      throw new Error(`expected ok, got ${result.kind}: ${JSON.stringify(result)}`);
+    }
+    expect(ctx.baseConfig.provider).toBe(newProvider);
+    expect(result.notes?.[0]).toContain('fake/swap');
+    expect(result.notes?.[0]).toContain('next turn');
+  });
+
+  test('/model <id> idempotent when already on that model', async () => {
+    const ctx = makeCtx();
+    // baseConfig.provider.id is 'test/m' from the test fixture; register
+    // a registry entry under the same id so the lookup succeeds before
+    // the idempotency check fires.
+    ctx.modelRegistry.register({
+      id: 'test/m',
+      family: 'anthropic',
+      modelName: 'm',
+      capabilities: ctx.baseConfig.provider.capabilities,
+      factory: () => ctx.baseConfig.provider,
+    });
+    const result = await modelCommand.exec(['test/m'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(result.notes?.[0]).toContain('already');
+    expect(result.notes?.[0]).not.toContain('next turn');
+  });
+
+  test('/model <id> reports a clean error when the factory throws', async () => {
+    // Typical: missing API key. The SDK throws at construction time.
+    const ctx = makeCtx();
+    ctx.modelRegistry.register({
+      id: 'fake/no-key',
+      family: 'anthropic',
+      modelName: 'no-key',
+      capabilities: ctx.baseConfig.provider.capabilities,
+      factory: () => {
+        throw new Error('ANTHROPIC_API_KEY not set');
+      },
+    });
+    const result = await modelCommand.exec(['fake/no-key'], ctx);
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('failed to instantiate');
+    expect(result.message).toContain('ANTHROPIC_API_KEY not set');
+  });
+
+  test('/model <id> appends current-turn cue when running', async () => {
+    const ctx = makeCtx({ isRunning: () => true });
+    const newProvider = {
+      ...ctx.baseConfig.provider,
+      id: 'fake/cue',
+    };
+    ctx.modelRegistry.register({
+      id: 'fake/cue',
+      family: 'anthropic',
+      modelName: 'cue',
+      capabilities: newProvider.capabilities,
+      factory: () => newProvider,
+    });
+    const result = await modelCommand.exec(['fake/cue'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(result.notes?.length).toBe(2);
+    expect(result.notes?.[1]).toContain('current turn');
+  });
+
+  test('/model with too many args returns error', async () => {
+    const result = await modelCommand.exec(['a', 'b'], makeCtx());
+    expect(result.kind).toBe('error');
   });
 });
 

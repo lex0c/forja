@@ -4,6 +4,7 @@ import { createRegistry } from '../../../src/cli/slash/registry.ts';
 import type { SlashCommand, SlashContext } from '../../../src/cli/slash/types.ts';
 import type { HarnessConfig } from '../../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../../src/harness/types.ts';
+import { createRegistry as createModelRegistry } from '../../../src/providers/registry.ts';
 import { type DB, openMemoryDb } from '../../../src/storage/db.ts';
 import { migrate } from '../../../src/storage/migrate.ts';
 import { createBus } from '../../../src/tui/bus.ts';
@@ -47,6 +48,7 @@ const makeCtx = (): {
         shutdownFired = true;
       },
       isRunning: () => false,
+      modelRegistry: createModelRegistry(),
     },
     events,
     db,
@@ -122,9 +124,11 @@ describe('dispatch', () => {
 
   test('error result from a command is sunk through errorSink', async () => {
     const { ctx, events } = makeCtx();
-    // /model with mutation arg returns kind:error
+    // /model with an unknown id returns kind:error (registry lookup
+    // miss). Default registry has real entries, so use a clearly
+    // bogus id that won't collide with any real provider.
     const result = await dispatch(
-      { name: 'model', args: ['anthropic/x'] },
+      { name: 'model', args: ['no-such-model-xxx'] },
       { registry: createBuiltinRegistry(), ctx },
     );
     expect(result.kind).toBe('error');

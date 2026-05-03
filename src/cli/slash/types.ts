@@ -12,6 +12,7 @@
 // `bus.emit` calls across every command.
 
 import type { HarnessConfig } from '../../harness/index.ts';
+import type { ModelRegistry } from '../../providers/registry.ts';
 import type { DB } from '../../storage/index.ts';
 import type { Bus } from '../../tui/bus.ts';
 import type { ModalManager } from '../../tui/modal-manager.ts';
@@ -23,6 +24,12 @@ export interface SlashContext {
   baseConfig: HarnessConfig;
   // Persistent DB handle for commands that read history (/sessions).
   db: DB;
+  // Model registry for /model <id> mutation. Threaded from the REPL
+  // (which builds it once at boot via createDefaultRegistry) so the
+  // command can lookup + factory the new provider without re-importing
+  // the registry module — keeps the command unit-testable with a
+  // fixture registry instead of the full default set.
+  modelRegistry: ModelRegistry;
   // Bus for emitting scrollback warns, errors, info, status updates.
   bus: Bus;
   // Modal manager for /help (and future flavors that need a modal).
