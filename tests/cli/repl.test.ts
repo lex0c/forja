@@ -348,13 +348,14 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
-  test('SIGINT (process signal) at idle goes through the same gate', async () => {
-    // SIGINT path mirrors the editor's cancelInput=interrupt path —
-    // both converge on handleIdleInterrupt. A single SIGINT at idle
-    // arms; a second within the window exits 130. Confirms the
-    // operator's experience is consistent regardless of whether
-    // raw mode happened to capture the byte or the kernel delivered
-    // the signal.
+  test('SIGINT (process signal) at idle exits immediately, no gate', async () => {
+    // The double-tap exit gate (UI.md §5.4) is interactive UX —
+    // protects the operator from a stray Ctrl+C keystroke. External
+    // SIGINT senders (supervisors, automation, IDE stop buttons,
+    // `kill -INT $pid`) expect one signal to stop the process; if
+    // SIGINT routed through the gate, a single `kill -INT` would
+    // arm + silently disarm 2s later, leaving the process alive.
+    // Single SIGINT at idle MUST exit 130 (POSIX SIGINT).
     const stdin = makeStdin();
     const promise = runRepl({
       args: makeArgs(),
@@ -363,9 +364,7 @@ describe('repl — boot + smoke', () => {
       skipTtyCheck: true,
     });
     await tick();
-    process.emit('SIGINT'); // arms
-    await tick();
-    process.emit('SIGINT'); // exits
+    process.emit('SIGINT');
     expect(await promise).toBe(130);
   });
 

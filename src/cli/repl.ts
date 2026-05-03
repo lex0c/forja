@@ -722,18 +722,30 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   if (typeof stdin.resume === 'function') stdin.resume();
 
   // SIGINT path. Fires when stdin is NOT in raw mode (e.g., during
-  // certain modal lifecycles where the renderer pauses raw input) or
-  // from an external `kill -INT`. Most operator Ctrl+C while running
-  // lands as `cancelInput` via the editor (raw mode is on); both
-  // routes converge on `triggerInterrupt`. Idle SIGINT goes through
-  // the same double-tap gate as the editor path (UI.md §5.4) so the
-  // operator's experience is consistent regardless of whether raw
-  // mode happened to be active when they hit Ctrl+C.
+  // certain modal lifecycles where the renderer pauses raw input)
+  // or from an external `kill -INT` / supervisor / `trap` handler.
+  //
+  // Running: route to the interrupt ladder (same as editor's
+  // cancelInput=interrupt path). Soft → hard escalation works
+  // identically whether the signal arrived via raw stdin or via
+  // the kernel.
+  //
+  // Idle: terminate immediately with exit 130 (POSIX SIGINT). The
+  // double-tap exit gate (UI.md §5.4) is interactive UX — it
+  // protects the operator from a stray Ctrl+C keystroke. External
+  // SIGINT senders (supervisors, automation, IDE stop buttons,
+  // `kill -INT $pid`) expect one signal to stop the process; if
+  // we routed those through the gate, a single `kill -INT` would
+  // arm the gate and silently disarm 2s later, leaving the process
+  // alive — a regression for any caller that wraps the agent. Raw
+  // Ctrl+C keystrokes still land as `cancelInput=interrupt` via
+  // the editor handler, which DOES use the gate.
   const sigintHandler = (): void => {
     if (running) {
       triggerInterrupt();
     } else {
-      handleIdleInterrupt();
+      exitCode = 130;
+      requestShutdown();
     }
   };
   process.on('SIGINT', sigintHandler);
