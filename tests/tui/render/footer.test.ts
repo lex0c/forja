@@ -81,9 +81,13 @@ describe('renderFooter', () => {
     s.modal = {
       promptId: 'p1',
       flavor: 'permission',
-      message: 'm',
-      details: [],
-      selected: 'no',
+      title: 'm',
+      subject: null,
+      preview: [],
+      question: null,
+      options: [{ key: '1', label: 'OK', value: 'yes' }],
+      selectedIndex: 0,
+      hints: [],
     };
     expect(renderFooter(s, caps)).toBeNull();
   });

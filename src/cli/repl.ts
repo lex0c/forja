@@ -213,12 +213,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       }
       if (command.length > 80) command = `${command.slice(0, 80)}…`;
     }
-    return modalManager.askPermission({
+    const answer = await modalManager.askPermission({
       toolName: req.toolName,
       command,
       cwd: req.cwd,
       reason: req.prompt,
     });
+    // Map the spec-shape answer to the harness's boolean contract.
+    // 'session-allow' currently behaves like 'yes' — the policy
+    // mutation that would persist a session-layer rule is deferred
+    // (TODO 1.d.7). When that lands, this branch writes the rule
+    // before returning true.
+    return answer === 'yes' || answer === 'session-allow';
   };
 
   const startTurn = (text: string): void => {

@@ -11,7 +11,7 @@
 // Wired so far: session lifecycle, user submit, assistant streaming,
 // thinking, tool lifecycle (start/delta/end with preview cap), step
 // budget, error/warn, interrupt, checkpoint, and the modal pattern
-// (`*:ask` / `permission:answer` / `modal:select`). Subagent / bg /
+// (`*:ask` / `modal:answer` / `modal:select`). Subagent / bg /
 // todo events accept silently and land alongside their render
 // functions.
 
@@ -69,30 +69,67 @@ export interface PendingAssistant {
   text: string;
 }
 
-// Confirm-style modal. Spec: UI.md §5.5. Lives in `LiveState` so the
-// renderer composes it; the modal-manager (src/tui/modal-manager.ts)
-// owns the async lifecycle (promise + queue + bus dispatch). Default
-// selected = 'no' is enforced by the manager when it constructs the
-// state, never by individual setters — keeps the safety invariant in
-// one place.
+// One option in a confirm modal. Spec: UI.md §5.5 / §4.10.13.
+//
+// `key` is the hotkey that activates the option directly (typically
+// '1','2','3' for numbered lists; can be a letter for mnemonics).
+// `value` is the semantic answer the manager resolves with — a
+// string union per flavor; permission uses 'yes' | 'session-allow' |
+// 'no'. Cancel (Esc) is NOT a regular option — it returns 'cancel'
+// distinct from 'no' so audit can tell explicit rejection from
+// "user closed the modal without deciding".
+//
+// `shortcut` is an optional secondary key (e.g. 'shift+tab' for the
+// session-allow option). Renderer shows it in parens after the label.
+export interface ConfirmOption {
+  key: string;
+  label: string;
+  value: string;
+  shortcut?: string;
+}
+
+// Confirm-style modal. Spec: UI.md §5.5 / §4.10.13. Lives in
+// `LiveState` so the renderer composes it; the modal-manager
+// (src/tui/modal-manager.ts) owns the async lifecycle (promise +
+// queue + bus dispatch). Default `selectedIndex` = last option per
+// D5/D65 — last is conventionally the most conservative choice
+// (No/Reject/Skip), so Enter without navigating triggers the safe
+// outcome.
 export interface ConfirmState {
   // ID assigned by the producer; threaded through `permission:ask` and
-  // matched by `permission:answer` to resolve the right promise.
+  // matched by `modal:answer` to resolve the right promise.
   promptId: string;
-  // Flavor lets the renderer pick a heading and the reducer route to
-  // the right "answer" event. We keep all confirm-shaped modals
-  // (permission, trust, memory write, plan review, critique) in this
-  // single state field to simplify focus + render — only one modal
-  // visible at a time anyway. Their per-flavor payloads live alongside.
+  // Flavor lets the renderer pick layout details and the reducer
+  // route to the right answer shape. All confirm-shaped modals
+  // (permission, trust, memory write, plan review, critique) share
+  // this single state field — only one modal visible at a time.
   flavor: 'permission' | 'trust' | 'memory-write' | 'plan-review' | 'critique';
-  // Lines the modal renders. First entry is the headline; rest are
-  // dim continuation lines (paths, code excerpts, etc.).
-  message: string;
-  details: string[];
-  // User's current selection. Default = 'no' (UI.md §5.5 D5 — safety:
-  // Enter without navigating rejects).
-  selected: 'yes' | 'no';
+  // Title block: bold first line + dim subject. `subject` is
+  // optional — null when the modal has no single target (some
+  // critique modals).
+  title: string;
+  subject: string | null;
+  // Tool-aware preview lines (diff for edit_file, command for bash,
+  // etc.). Producer formats them; renderer just emits between rules.
+  // Empty array → preview block omitted entirely.
+  preview: string[];
+  // Question in natural language ("Do you want to make this edit
+  // to .gitignore?"). Optional — when absent, the title carries the
+  // full question.
+  question: string | null;
+  options: ConfirmOption[];
+  // Default = options.length - 1 per D5/D65. Caller that needs a
+  // different default sets it explicitly.
+  selectedIndex: number;
+  // Footer hints, joined by ' · '. Always includes 'Esc to cancel';
+  // producers add 'Tab to amend' etc. when the corresponding
+  // features land.
+  hints: string[];
 }
+
+// Permission flavor's answer values. Other flavors define their
+// own semantic union; this one's union is the most common.
+export type PermissionAnswer = 'yes' | 'session-allow' | 'no' | 'cancel';
 
 export interface LiveState {
   input: InputState;
@@ -382,29 +419,52 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
     // ─── Modal events ──────────────────────────────────────────────
     // Each `*:ask` raises a confirm-shaped modal with `selected = 'no'`
     // by default (UI.md §5.5 D5). The matching `*:answer` (or
-    // `permission:answer` for the permission flavor) clears the modal.
+    // `modal:answer`) clears the modal.
     // Producer (modal-manager) is responsible for re-emitting if
     // multiple modals queue up; the reducer never queues itself.
-    case 'permission:ask':
+    case 'permission:ask': {
+      // 3 options per UI.md §4.10.13: yes, session-allow, no.
+      // Default selectedIndex points to the last option (No) per
+      // D5/D65 — Enter without navigating triggers the safe choice.
+      // Esc returns 'cancel' (handled by manager, not in options
+      // list).
+      const options: ConfirmOption[] = [
+        { key: '1', label: 'Yes', value: 'yes' },
+        {
+          key: '2',
+          label: `Yes, allow all ${event.toolName} during this session`,
+          value: 'session-allow',
+          shortcut: 'shift+tab',
+        },
+        { key: '3', label: 'No', value: 'no' },
+      ];
+      const previewLines: string[] = [];
+      previewLines.push(`$ ${event.command}`);
+      previewLines.push(`cwd: ${event.cwd}`);
+      if (event.rule !== undefined) previewLines.push(`matched rule: ${event.rule}`);
       return {
         state: {
           ...state,
           modal: {
             promptId: event.promptId,
             flavor: 'permission',
-            message: `${event.toolName}: ${event.command}`,
-            details: [
-              `cwd: ${event.cwd}`,
-              ...(event.rule !== undefined ? [`rule: ${event.rule}`] : []),
-              ...(event.reason !== undefined ? [`reason: ${event.reason}`] : []),
-            ],
-            selected: 'no',
+            title: 'Run command',
+            subject: event.command,
+            preview: previewLines,
+            question:
+              event.reason !== undefined
+                ? event.reason
+                : `Do you want to run this ${event.toolName} command?`,
+            options,
+            selectedIndex: options.length - 1,
+            hints: ['Esc to cancel'],
           },
         },
         permanent: [],
       };
+    }
 
-    case 'permission:answer': {
+    case 'modal:answer': {
       // Only clear the modal when the answer matches the open prompt.
       // A late answer from a stale prompt (e.g. cancelled then a new
       // ask raised before the cancel propagated) shouldn't dismiss
@@ -416,86 +476,128 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
     }
 
     case 'modal:select': {
-      // In-modal toggle. Updates only `selected`; never reconstructs
-      // contents. Stale events (mismatched promptId, or arrived after
-      // the modal closed) are dropped silently.
+      // In-modal navigation. Updates only `selectedIndex`; never
+      // reconstructs contents. Stale events (mismatched promptId, or
+      // arrived after the modal closed) are dropped silently. Out-of-
+      // range index clamps to a valid bound so a buggy producer can't
+      // poison the modal.
       if (state.modal === null || state.modal.promptId !== event.promptId) {
         return { state, permanent: [] };
       }
+      const max = state.modal.options.length - 1;
+      const clamped = Math.max(0, Math.min(max, event.selectedIndex));
       return {
-        state: { ...state, modal: { ...state.modal, selected: event.selected } },
+        state: { ...state, modal: { ...state.modal, selectedIndex: clamped } },
         permanent: [],
       };
     }
 
-    case 'trust:ask':
+    case 'trust:ask': {
+      const options: ConfirmOption[] = [
+        { key: '1', label: 'Yes, trust this directory', value: 'yes' },
+        { key: '2', label: 'No, read-only this session', value: 'no' },
+      ];
+      const previewLines = [event.path];
+      if (event.agentsMd) previewLines.push('AGENTS.md present (not yet trusted)');
       return {
         state: {
           ...state,
           modal: {
             promptId: event.promptId,
             flavor: 'trust',
-            message: 'unknown directory',
-            details: [
-              event.path,
-              ...(event.agentsMd ? ['AGENTS.md present (not yet trusted)'] : []),
-            ],
-            selected: 'no',
+            title: 'Trust directory',
+            subject: event.path,
+            preview: previewLines,
+            question: 'Trust this directory and run with full permissions?',
+            options,
+            selectedIndex: options.length - 1,
+            hints: ['Esc to cancel'],
           },
         },
         permanent: [],
       };
+    }
 
-    case 'memory:write:ask':
+    case 'memory:write:ask': {
+      const options: ConfirmOption[] = [
+        { key: '1', label: 'Yes, write memory', value: 'yes' },
+        { key: '2', label: 'No, skip', value: 'no' },
+      ];
       return {
         state: {
           ...state,
           modal: {
             promptId: event.promptId,
             flavor: 'memory-write',
-            message: `memory write proposed (${event.scope})`,
-            details: [`name: ${event.name}`, '', ...event.body.split('\n')],
-            selected: 'no',
+            title: 'Write memory',
+            subject: `${event.scope}/${event.name}`,
+            preview: event.body.split('\n'),
+            question: 'Save this memory entry?',
+            options,
+            selectedIndex: options.length - 1,
+            hints: ['Esc to cancel'],
           },
         },
         permanent: [],
       };
+    }
 
-    case 'plan:review':
+    case 'plan:review': {
+      const options: ConfirmOption[] = [
+        { key: '1', label: 'Approve', value: 'yes' },
+        { key: '2', label: 'Edit', value: 'edit' },
+        { key: '3', label: 'Reject', value: 'no' },
+      ];
+      const previewLines = [
+        ...event.steps.map((s, i) => `${i + 1}. ${s}`),
+        '',
+        `estimated: ${event.estimatedCalls} tool calls · $${event.estimatedCostUsd.toFixed(2)}`,
+      ];
       return {
         state: {
           ...state,
           modal: {
             promptId: event.promptId,
             flavor: 'plan-review',
-            message: `plan review · ${event.steps.length} steps`,
-            details: [
-              ...event.steps.map((s, i) => `${i + 1}. ${s}`),
-              '',
-              `estimated: ${event.estimatedCalls} tool calls · $${event.estimatedCostUsd.toFixed(2)}`,
-            ],
-            selected: 'no',
+            title: 'Plan review',
+            subject: `${event.steps.length} steps`,
+            preview: previewLines,
+            question: 'Approve this plan?',
+            options,
+            selectedIndex: options.length - 1,
+            hints: ['Esc to cancel'],
           },
         },
         permanent: [],
       };
+    }
 
-    case 'critique:ask':
+    case 'critique:ask': {
+      const options: ConfirmOption[] = [
+        { key: '1', label: 'Acknowledge', value: 'yes' },
+        { key: '2', label: 'Reject', value: 'no' },
+      ];
+      const previewLines = event.issues.map(
+        (i) => `[${i.severity}] (${i.confidence.toFixed(2)}) ${i.message}`,
+      );
       return {
         state: {
           ...state,
           modal: {
             promptId: event.promptId,
             flavor: 'critique',
-            message: `critique · ${event.issues.length} issue(s)`,
-            details: event.issues.map(
-              (i) => `[${i.severity}] (${i.confidence.toFixed(2)}) ${i.message}`,
-            ),
-            selected: 'no',
+            title: 'Critique',
+            subject: `${event.issues.length} issue(s)`,
+            preview: previewLines,
+            question: null,
+            options,
+            selectedIndex: options.length - 1,
+            hints: ['Esc to cancel'],
           },
         },
         permanent: [],
       };
+    }
 
     // ─── Not yet wired (subagent / bg / todo render arrives later) ──
     case 'todo:update':

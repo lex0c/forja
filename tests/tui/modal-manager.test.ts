@@ -33,13 +33,24 @@ const makeTimer = (): {
   };
 };
 
-const key = (name: KeyName): KeyEvent => ({
+const key = (
+  name: KeyName,
+  mods: { shift?: boolean; ctrl?: boolean; alt?: boolean } = {},
+): KeyEvent => ({
   kind: 'key',
   name,
+  ctrl: mods.ctrl ?? false,
+  alt: mods.alt ?? false,
+  shift: mods.shift ?? false,
+  raw: '',
+});
+
+const charKey = (char: string): KeyEvent => ({
+  kind: 'char',
+  char,
   ctrl: false,
   alt: false,
-  shift: false,
-  raw: '',
+  raw: char,
 });
 
 interface Setup {
@@ -75,7 +86,7 @@ const make = (): Setup => {
   return { bus, fs, manager, events, timer, ids: () => ids.slice() };
 };
 
-describe('askPermission', () => {
+describe('askPermission (3-option modal per UI.md §4.10.13)', () => {
   test('emits permission:ask, pushes a focus handler', () => {
     const s = make();
     const promise = s.manager.askPermission({
@@ -85,12 +96,11 @@ describe('askPermission', () => {
     });
     expect(s.fs.size()).toBe(1);
     expect(s.events.some((e) => e.type === 'permission:ask')).toBe(true);
-    // Resolve immediately so the test doesn't hang.
     s.fs.dispatch(key('escape'));
     return promise;
   });
 
-  test('Enter on default selection (no) resolves to false', async () => {
+  test('default selectedIndex = last option (No); Enter without navigating resolves "no"', async () => {
     const s = make();
     const promise = s.manager.askPermission({
       toolName: 'bash',
@@ -98,78 +108,133 @@ describe('askPermission', () => {
       cwd: '/',
     });
     s.fs.dispatch(key('enter'));
-    await expect(promise).resolves.toBe(false);
+    await expect(promise).resolves.toBe('no');
   });
 
-  test('Right arrow toggles to yes; Enter resolves to true', async () => {
+  test('Esc resolves "cancel" (distinct from "no")', async () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
-    s.fs.dispatch(key('right'));
+    s.fs.dispatch(key('escape'));
+    await expect(promise).resolves.toBe('cancel');
+  });
+
+  test('hotkey "1" resolves "yes" directly (no navigate-then-Enter)', async () => {
+    const s = make();
+    const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
+    s.fs.dispatch(charKey('1'));
+    await expect(promise).resolves.toBe('yes');
+  });
+
+  test('hotkey "2" resolves "session-allow"', async () => {
+    const s = make();
+    const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
+    s.fs.dispatch(charKey('2'));
+    await expect(promise).resolves.toBe('session-allow');
+  });
+
+  test('hotkey "3" resolves "no" (same as default Enter)', async () => {
+    const s = make();
+    const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
+    s.fs.dispatch(charKey('3'));
+    await expect(promise).resolves.toBe('no');
+  });
+
+  test('Shift+Tab as secondary shortcut activates session-allow option', async () => {
+    const s = make();
+    const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
+    s.fs.dispatch(key('tab', { shift: true }));
+    await expect(promise).resolves.toBe('session-allow');
+  });
+
+  test('Up arrow moves selection up by one; Enter resolves the new selection', async () => {
+    const s = make();
+    const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
+    // Default is index 2 ('no'). Up → 1 ('session-allow'). Enter resolves it.
+    s.fs.dispatch(key('up'));
     s.fs.dispatch(key('enter'));
-    await expect(promise).resolves.toBe(true);
+    await expect(promise).resolves.toBe('session-allow');
   });
 
-  test('Right arrow emits modal:select (NOT a re-emit of permission:ask)', () => {
+  test('Down arrow at the bottom is a no-op (clamps to last index)', async () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
-    // Drop events from the initial ask so we only see what the toggle
-    // emits.
-    const beforeToggle = s.events.length;
-    s.fs.dispatch(key('right'));
-    const emitted = s.events.slice(beforeToggle);
+    // Default = last (index 2). Down should clamp.
+    s.fs.dispatch(key('down'));
+    s.fs.dispatch(key('enter'));
+    await expect(promise).resolves.toBe('no');
+  });
+
+  test('Up at the top is a no-op (clamps to index 0)', async () => {
+    const s = make();
+    const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
+    s.fs.dispatch(key('up')); // 2 → 1
+    s.fs.dispatch(key('up')); // 1 → 0
+    s.fs.dispatch(key('up')); // clamps at 0
+    s.fs.dispatch(key('up')); // still 0
+    s.fs.dispatch(key('enter'));
+    await expect(promise).resolves.toBe('yes');
+  });
+
+  test('Up arrow emits modal:select with the new selectedIndex', () => {
+    const s = make();
+    const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
+    const beforeNav = s.events.length;
+    s.fs.dispatch(key('up'));
+    const emitted = s.events.slice(beforeNav);
     expect(emitted).toHaveLength(1);
-    expect(emitted[0]).toMatchObject({
-      type: 'modal:select',
-      selected: 'yes',
-    });
-    expect(emitted[0]?.type).not.toBe('permission:ask');
+    expect(emitted[0]).toMatchObject({ type: 'modal:select', selectedIndex: 1 });
     s.fs.dispatch(key('escape'));
     return promise;
   });
 
-  test('multiple toggles emit alternating modal:select events', async () => {
+  test('Multiple navigations emit a modal:select per move with the right index', async () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
-    const beforeToggle = s.events.length;
-    s.fs.dispatch(key('right')); // → yes
-    s.fs.dispatch(key('left')); // → no
-    s.fs.dispatch(key('tab')); // → yes
-    const emitted = s.events.slice(beforeToggle).filter((e) => e.type === 'modal:select');
-    expect(emitted.map((e) => e.type === 'modal:select' && e.selected)).toEqual([
-      'yes',
-      'no',
-      'yes',
-    ]);
+    const beforeNav = s.events.length;
+    s.fs.dispatch(key('up')); // 2 → 1
+    s.fs.dispatch(key('up')); // 1 → 0
+    s.fs.dispatch(key('down')); // 0 → 1
+    const indices = s.events
+      .slice(beforeNav)
+      .filter((e): e is Extract<UIEvent, { type: 'modal:select' }> => e.type === 'modal:select')
+      .map((e) => e.selectedIndex);
+    expect(indices).toEqual([1, 0, 1]);
     s.fs.dispatch(key('escape'));
     await promise;
   });
 
-  test('Tab toggles selection same as left/right', async () => {
-    const s = make();
-    const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
-    s.fs.dispatch(key('tab'));
-    s.fs.dispatch(key('enter'));
-    await expect(promise).resolves.toBe(true);
-  });
-
-  test('Escape resolves to false even when yes is selected', async () => {
-    const s = make();
-    const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
-    s.fs.dispatch(key('right'));
-    s.fs.dispatch(key('escape'));
-    await expect(promise).resolves.toBe(false);
-  });
-
-  test('emits permission:answer before the promise resolves', async () => {
+  test('emits modal:answer before the promise resolves', async () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
     let answerEmittedBeforeResolve = false;
     void promise.then(() => {
-      answerEmittedBeforeResolve = s.events.some((e) => e.type === 'permission:answer');
+      answerEmittedBeforeResolve = s.events.some((e) => e.type === 'modal:answer');
     });
     s.fs.dispatch(key('enter'));
     await promise;
     expect(answerEmittedBeforeResolve).toBe(true);
+  });
+
+  test('modal:answer carries the user-selected decision string', async () => {
+    const s = make();
+    const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
+    s.fs.dispatch(charKey('2')); // session-allow
+    await promise;
+    const answer = s.events.find(
+      (e): e is Extract<UIEvent, { type: 'modal:answer' }> => e.type === 'modal:answer',
+    );
+    expect(answer?.decision).toBe('session-allow');
+  });
+
+  test('modal:answer carries "cancel" on Esc (distinct from "no")', async () => {
+    const s = make();
+    const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
+    s.fs.dispatch(key('escape'));
+    await promise;
+    const answer = s.events.find(
+      (e): e is Extract<UIEvent, { type: 'modal:answer' }> => e.type === 'modal:answer',
+    );
+    expect(answer?.decision).toBe('cancel');
   });
 
   test('focus handler is removed after resolution', async () => {
@@ -181,7 +246,7 @@ describe('askPermission', () => {
     expect(s.fs.size()).toBe(0);
   });
 
-  test('printable char while modal is up is swallowed (handler returns true)', async () => {
+  test('non-matching printable char is swallowed (no fall-through to editor)', async () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
     const consumed = s.fs.dispatch({
@@ -204,19 +269,18 @@ describe('queue', () => {
     const p2 = s.manager.askPermission({ toolName: 'b', command: 'c2', cwd: '/' });
     expect(s.manager.pendingCount()).toBe(2);
     expect(s.fs.size()).toBe(1); // only one handler at a time
-    s.fs.dispatch(key('enter')); // resolves p1 with no
+    s.fs.dispatch(key('enter')); // resolves p1 with 'no' (default)
     await p1;
     // After draining, the second modal is now active.
     expect(s.fs.size()).toBe(1);
-    s.fs.dispatch(key('right'));
-    s.fs.dispatch(key('enter'));
-    await expect(p2).resolves.toBe(true);
+    s.fs.dispatch(charKey('1')); // resolves p2 with 'yes'
+    await expect(p2).resolves.toBe('yes');
     expect(s.manager.pendingCount()).toBe(0);
   });
 });
 
 describe('timeout', () => {
-  test('timeout fires while active: rejects as false', async () => {
+  test('timeout fires while active: resolves "cancel"', async () => {
     const s = make();
     const promise = s.manager.askPermission(
       { toolName: 'b', command: 'c', cwd: '/' },
@@ -225,7 +289,7 @@ describe('timeout', () => {
     expect(s.timer.pending()).toHaveLength(1);
     const handle = s.timer.pending()[0];
     s.timer.fire(handle);
-    await expect(promise).resolves.toBe(false);
+    await expect(promise).resolves.toBe('cancel');
     expect(s.fs.size()).toBe(0);
   });
 
@@ -235,14 +299,13 @@ describe('timeout', () => {
       { toolName: 'b', command: 'c', cwd: '/' },
       { timeoutMs: 100 },
     );
-    s.fs.dispatch(key('right'));
-    s.fs.dispatch(key('enter'));
+    s.fs.dispatch(charKey('1'));
     await promise;
     // Timer was canceled before firing.
     expect(s.timer.pending()).toHaveLength(0);
   });
 
-  test('timeout while still queued: rejects without ever opening', async () => {
+  test('timeout while still queued: resolves "cancel" without ever opening', async () => {
     const s = make();
     const p1 = s.manager.askPermission({ toolName: 'b', command: 'a', cwd: '/' });
     const p2 = s.manager.askPermission(
@@ -252,7 +315,7 @@ describe('timeout', () => {
     // p2's timer is in the queue while p1 is active.
     const handle = s.timer.pending().find((h) => h !== undefined);
     s.timer.fire(handle);
-    await expect(p2).resolves.toBe(false);
+    await expect(p2).resolves.toBe('cancel');
     // p1 still open; resolve to drain.
     s.fs.dispatch(key('enter'));
     await p1;
@@ -260,24 +323,22 @@ describe('timeout', () => {
 });
 
 describe('close', () => {
-  test('rejects active and queued modals as false; clears focus stack', async () => {
+  test('resolves active and queued modals as "cancel"; clears focus stack', async () => {
     const s = make();
     const p1 = s.manager.askPermission({ toolName: 'b', command: 'a', cwd: '/' });
     const p2 = s.manager.askPermission({ toolName: 'b', command: 'b', cwd: '/' });
     s.manager.close();
-    await expect(p1).resolves.toBe(false);
-    await expect(p2).resolves.toBe(false);
+    await expect(p1).resolves.toBe('cancel');
+    await expect(p2).resolves.toBe('cancel');
     expect(s.fs.size()).toBe(0);
     expect(s.manager.pendingCount()).toBe(0);
   });
 
-  test('askPermission after close resolves false immediately (no orphan promise)', async () => {
+  test('askPermission after close resolves "cancel" immediately (no orphan promise)', async () => {
     const s = make();
     s.manager.close();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
-    await expect(promise).resolves.toBe(false);
-    // Nothing pushed onto the focus stack, no events emitted for this
-    // call (just the close path's no-op).
+    await expect(promise).resolves.toBe('cancel');
     expect(s.fs.size()).toBe(0);
     expect(s.manager.pendingCount()).toBe(0);
   });

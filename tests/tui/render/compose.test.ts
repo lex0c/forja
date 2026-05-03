@@ -155,20 +155,21 @@ describe('composeLive layout', () => {
     s.modal = {
       promptId: 'p1',
       flavor: 'permission',
-      message: 'Run command',
-      details: ['rm -rf /'],
-      selected: 'no',
+      title: 'Run command',
+      subject: 'rm -rf /',
+      preview: [],
+      question: null,
+      options: [{ key: '1', label: 'No', value: 'no' }],
+      selectedIndex: 0,
+      hints: ['Esc to cancel'],
     };
     const out = composeLive(s, caps, 0);
-    // No rule line equal to a full-cols dash/em-rule.
-    const ruleU = expectedRule(caps.cols, true);
-    const ruleA = expectedRule(caps.cols, false);
-    expect(out.includes(ruleU)).toBe(false);
-    expect(out.includes(ruleA)).toBe(false);
-    // No `> ` input either; modal renders instead.
-    expect(out.includes('> ')).toBe(false);
-    // No footer hint either — modal carries its own bottom block.
-    expect(out.some((l) => l.includes('? for help'))).toBe(false);
+    // The modal substitutes the entire bottom anchor — input box,
+    // bottom rule, footer all gone. The modal carries its own rules
+    // (block separators) so we can't assert "no rules"; instead
+    // check the specific signals that should be absent.
+    expect(out.some((l) => l === '> ')).toBe(false); // input prompt
+    expect(out.some((l) => l.includes('? for help'))).toBe(false); // footer hint
   });
 
   // FOOTER_BLOCK_LINES guard: composeCursor's row math depends on
@@ -202,9 +203,13 @@ describe('composeCursor', () => {
     s.modal = {
       promptId: 'p1',
       flavor: 'permission',
-      message: 'm',
-      details: [],
-      selected: 'no',
+      title: 'm',
+      subject: null,
+      preview: [],
+      question: null,
+      options: [{ key: '1', label: 'OK', value: 'yes' }],
+      selectedIndex: 0,
+      hints: [],
     };
     expect(composeCursor(s, caps, 5)).toBeNull();
   });

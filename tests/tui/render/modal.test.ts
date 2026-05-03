@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { renderModal } from '../../../src/tui/render/modal.ts';
-import type { ConfirmState } from '../../../src/tui/state.ts';
+import type { ConfirmOption, ConfirmState } from '../../../src/tui/state.ts';
 import { CSI, type Capabilities } from '../../../src/tui/term.ts';
 
 const ascii: Capabilities = {
@@ -13,108 +13,140 @@ const ascii: Capabilities = {
 const unicode: Capabilities = { ...ascii, unicode: true };
 const colored: Capabilities = { ...unicode, color: 'basic' };
 
+const PERM_OPTIONS: ConfirmOption[] = [
+  { key: '1', label: 'Yes', value: 'yes' },
+  {
+    key: '2',
+    label: 'Yes, allow all bash during this session',
+    value: 'session-allow',
+    shortcut: 'shift+tab',
+  },
+  { key: '3', label: 'No', value: 'no' },
+];
+
 const baseModal = (overrides: Partial<ConfirmState> = {}): ConfirmState => ({
   promptId: 'p1',
   flavor: 'permission',
-  message: 'bash: rm -rf ./build',
-  details: ['cwd: /home/lex/forja'],
-  selected: 'no',
+  title: 'Run command',
+  subject: 'rm -rf ./build',
+  preview: ['$ rm -rf ./build', 'cwd: /home/lex/forja'],
+  question: 'Do you want to run this bash command?',
+  options: PERM_OPTIONS,
+  selectedIndex: PERM_OPTIONS.length - 1,
+  hints: ['Esc to cancel'],
   ...overrides,
 });
 
-describe('renderModal', () => {
-  test('emits headline + details + selector + horizontal rules', () => {
+describe('renderModal (UI.md §4.10.13 layout)', () => {
+  test('emits 4 blocks separated by horizontal rules', () => {
     const out = renderModal(baseModal(), unicode);
-    // Top rule, headline, blank, details, blank, selector, bottom rule.
-    expect(out).toHaveLength(7);
-    expect(out[0]).toMatch(/^─+$/);
-    expect(out[1]).toContain('bash: rm -rf ./build');
-    expect(out[3]).toContain('cwd: /home/lex/forja');
-    expect(out[5]).toContain('YES');
-    expect(out[5]).toContain('NO');
-    expect(out[6]).toMatch(/^─+$/);
+    // Block 1: rule + title + subject (3 lines)
+    // Block 2: rule + 2 preview lines (3 lines)
+    // Block 3: rule + question + 3 options (5 lines)
+    // Block 4: hint footer (1 line)
+    // Total = 12.
+    expect(out).toHaveLength(12);
+    expect(out[0]).toMatch(/^─+$/); // rule 1
+    expect(out[1]).toContain('Run command'); // title
+    expect(out[2]).toContain('rm -rf ./build'); // subject
+    expect(out[3]).toMatch(/^─+$/); // rule 2
+    expect(out[4]).toContain('$ rm -rf ./build'); // preview 1
+    expect(out[5]).toContain('cwd: /home/lex/forja'); // preview 2
+    expect(out[6]).toMatch(/^─+$/); // rule 3
+    expect(out[7]).toContain('Do you want to run this bash command?');
+    expect(out[8]).toContain('1. Yes');
+    expect(out[9]).toContain('2. Yes, allow all bash during this session');
+    expect(out[10]).toContain('3. No');
+    expect(out[11]).toContain('Esc to cancel');
   });
 
   test('rules use ASCII dashes when unicode disabled', () => {
     const out = renderModal(baseModal(), ascii);
     expect(out[0]).toMatch(/^-+$/);
-    expect(out[out.length - 1]).toMatch(/^-+$/);
+    expect(out[3]).toMatch(/^-+$/);
+    expect(out[6]).toMatch(/^-+$/);
   });
 
-  test('selected="no" puts the pointer next to NO (default safety)', () => {
-    const out = renderModal(baseModal({ selected: 'no' }), unicode);
-    const sel = out[5] ?? '';
-    // Pointer (▶) precedes NO; YES has a leading space placeholder.
-    expect(sel).toContain('▶ NO');
-    expect(sel).toContain('  YES');
-    expect(sel).not.toContain('▶ YES');
+  test('cursor `>` marks the selectedIndex (default = last)', () => {
+    const out = renderModal(baseModal(), unicode);
+    expect(out[8]).toMatch(/^ {2} {2}1\. /); // '   1. ' (no cursor)
+    expect(out[10]).toMatch(/^ {2}> 3\. /); // '  > 3. ' (cursor)
   });
 
-  test('selected="yes" puts the pointer next to YES', () => {
-    const out = renderModal(baseModal({ selected: 'yes' }), unicode);
-    const sel = out[5] ?? '';
-    expect(sel).toContain('▶ YES');
-    expect(sel).toContain('  NO');
-    expect(sel).not.toContain('▶ NO');
+  test('cursor moves with selectedIndex', () => {
+    const out = renderModal(baseModal({ selectedIndex: 0 }), unicode);
+    expect(out[8]).toMatch(/^ {2}> 1\. /);
+    expect(out[10]).toMatch(/^ {2} {2}3\. /);
   });
 
-  test('ASCII pointer is ">"', () => {
-    const out = renderModal(baseModal({ selected: 'yes' }), ascii);
-    const sel = out[5] ?? '';
-    expect(sel).toContain('> YES');
+  test('option with shortcut shows it in dim parens after the label', () => {
+    const out = renderModal(baseModal(), colored);
+    // option 2 has shortcut 'shift+tab'; rendered with dim SGR.
+    expect(out[9]).toContain('(shift+tab)');
+    expect(out[9]).toContain(`${CSI}2m`);
   });
 
-  test('no details: collapses the empty section', () => {
-    const out = renderModal(baseModal({ details: [] }), unicode);
-    // Top rule, headline, blank, selector, bottom rule = 5 lines.
-    expect(out).toHaveLength(5);
+  test('preview block omitted entirely when preview array is empty', () => {
+    const out = renderModal(baseModal({ preview: [] }), unicode);
+    // Block 1 (3 lines) → block 3 (5 lines) → footer (1 line) = 9.
+    // No second rule, no preview lines.
+    expect(out).toHaveLength(9);
+    // Two rules total instead of three.
+    expect(out.filter((l) => /^─+$/.test(l))).toHaveLength(2);
   });
 
-  test('empty details entry becomes a blank spacer (no indent, no content)', () => {
-    const out = renderModal(baseModal({ details: ['line one', '', 'line three'] }), unicode);
-    // Find the section after the headline+blank.
-    const fragment = out.slice(3, 6);
-    expect(fragment[0]).toContain('line one');
-    expect(fragment[1]).toBe('');
-    expect(fragment[2]).toContain('line three');
+  test('subject omitted when null (title-only block)', () => {
+    const out = renderModal(baseModal({ subject: null }), unicode);
+    // Block 1 = rule + title only (2 lines). Total = 11.
+    expect(out).toHaveLength(11);
+    expect(out[1]).toContain('Run command');
+    expect(out[2]).toMatch(/^─+$/); // next rule immediately
   });
 
-  test('headline wrapped in bold SGR when color enabled', () => {
+  test('question omitted when null (block 3 = options only)', () => {
+    const out = renderModal(baseModal({ question: null }), unicode);
+    // Block 3 loses the question line: rule + 3 options.
+    // Total: 3 + 3 + 4 + 1 = 11.
+    expect(out).toHaveLength(11);
+  });
+
+  test('hints omitted when array is empty', () => {
+    const out = renderModal(baseModal({ hints: [] }), unicode);
+    // Total = 12 - 1 footer line = 11.
+    expect(out).toHaveLength(11);
+  });
+
+  test('multiple hints joined by " · "', () => {
+    const out = renderModal(baseModal({ hints: ['Esc to cancel', 'Tab to amend'] }), unicode);
+    expect(out[out.length - 1]).toContain('Esc to cancel · Tab to amend');
+  });
+
+  test('title wrapped in bold SGR when color enabled', () => {
     const out = renderModal(baseModal(), colored);
     expect(out[1]).toContain(`${CSI}1m`);
-    expect(out[1]).toContain('bash: rm -rf ./build');
   });
 
-  test('details wrapped in dim SGR when color enabled', () => {
+  test('subject + preview wrapped in dim SGR when color enabled', () => {
     const out = renderModal(baseModal(), colored);
-    expect(out[3]).toContain(`${CSI}2m`);
+    expect(out[2]).toContain(`${CSI}2m`); // subject dim
+    expect(out[4]).toContain(`${CSI}2m`); // preview line dim
   });
 
-  test('color disabled: no SGR escapes anywhere', () => {
-    const out = renderModal(baseModal(), ascii);
-    for (const line of out) {
-      expect(line).not.toContain(CSI);
-    }
+  test('color disabled emits no SGR escapes', () => {
+    const out = renderModal(baseModal(), unicode);
+    for (const line of out) expect(line).not.toContain(CSI);
   });
 
-  test('rule adapts to caps.cols when narrower than the default 41', () => {
+  test('rule width tracks caps.cols', () => {
     const narrow: Capabilities = { ...unicode, cols: 30 };
     const out = renderModal(baseModal(), narrow);
-    // cols - 2 = 28 (the indent). Rule is 28 wide, not the default 41.
-    expect(out[0]?.length).toBe(28);
-    expect(out[out.length - 1]?.length).toBe(28);
+    expect(out[0]).toBe('─'.repeat(30));
   });
 
-  test('rule honors the minimum width when caps.cols is tiny', () => {
-    const tiny: Capabilities = { ...unicode, cols: 4 };
-    const out = renderModal(baseModal(), tiny);
-    // Min rule width = 8 (constant in renderer).
-    expect(out[0]?.length).toBe(8);
-  });
-
-  test('rule does not exceed the default width on wide terminals', () => {
-    const wide: Capabilities = { ...unicode, cols: 200 };
-    const out = renderModal(baseModal(), wide);
-    expect(out[0]?.length).toBe(41);
+  test('empty preview entry becomes a blank spacer (no indent)', () => {
+    const out = renderModal(baseModal({ preview: ['line a', '', 'line c'] }), unicode);
+    // Find the spacer line — it should be exactly '' (not '  ').
+    const spacerIdx = out.findIndex((l) => l === '');
+    expect(spacerIdx).toBeGreaterThan(-1);
   });
 });

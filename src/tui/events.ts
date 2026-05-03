@@ -155,19 +155,29 @@ export type PermissionAskEvent = BaseEvent & {
   rule?: string;
   reason?: string;
 };
-export type PermissionAnswerEvent = BaseEvent & {
-  type: 'permission:answer';
+// Modal resolution event. Renamed from `permission:answer` because
+// the same event flows for every modal flavor (trust answers `yes`/
+// `no`, plan-review answers `yes`/`edit`/`no`, etc.) — naming it
+// after just the permission flavor was misleading. Decision is a
+// flavor-specific string; consumers that care about the union
+// narrow per-flavor by reading the original `*:ask` event.
+//
+// `cancel` is the universal "user closed without deciding" value
+// across flavors (returned on Esc); audit can tell it from explicit
+// rejection.
+export type ModalAnswerEvent = BaseEvent & {
+  type: 'modal:answer';
   promptId: string;
-  decision: 'accept' | 'reject' | 'edit';
+  decision: string;
 };
-// In-modal selection toggle. Cheap event the manager fires on
-// left/right/tab; reducer updates only `state.modal.selected` when
-// the promptId matches the open modal. Avoids re-emitting `*:ask`
-// (which would rebuild the modal contents from scratch).
+// In-modal navigation event. The manager fires on ↑/↓/Tab/Shift+Tab;
+// reducer updates only `state.modal.selectedIndex` when the promptId
+// matches the open modal. Avoids re-emitting `*:ask` (which would
+// rebuild the modal contents from scratch).
 export type ModalSelectEvent = BaseEvent & {
   type: 'modal:select';
   promptId: string;
-  selected: 'yes' | 'no';
+  selectedIndex: number;
 };
 export type TrustAskEvent = BaseEvent & {
   type: 'trust:ask';
@@ -293,7 +303,7 @@ export type UIEvent =
   | ToolDeltaEvent
   | ToolEndEvent
   | PermissionAskEvent
-  | PermissionAnswerEvent
+  | ModalAnswerEvent
   | ModalSelectEvent
   | TrustAskEvent
   | MemoryWriteAskEvent

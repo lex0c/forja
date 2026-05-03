@@ -353,7 +353,7 @@ describe('not-yet-wired events accept silently', () => {
       'permission:ask',
       { type: 'permission:ask', ts: 1, promptId: 'p1', toolName: 'bash', command: 'rm', cwd: '/' },
     ],
-    ['permission:answer', { type: 'permission:answer', ts: 1, promptId: 'p1', decision: 'reject' }],
+    ['modal:answer', { type: 'modal:answer', ts: 1, promptId: 'p1', decision: 'no' }],
     ['trust:ask', { type: 'trust:ask', ts: 1, promptId: 'p1', path: '/repo', agentsMd: false }],
     [
       'memory:write:ask',

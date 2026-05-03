@@ -15,6 +15,64 @@ Format:
 
 ---
 
+## [2026-05-02] M1 / Step 1.d.6 — Modal spec-shape refactor (N options, Esc=cancel, layout)
+
+Generalizes the modal infrastructure from binary yes/no to the
+canonical §4.10.13 shape: 3-option list (yes / yes-allow-session /
+no), `selectedIndex` with default = last (D5/D65 safety),
+hotkey activation (1/2/3 + shortcuts), Esc returns 'cancel' distinct
+from 'no', and the spec layout (title + tool-aware preview + options
++ hints footer in 4 horizontal-rule-separated blocks). Trust /
+memory-write / plan-review / critique flavors get their own option
+lists too.
+
+Scope deliberately stops at the modal layer. `previewForApproval`
+on each `ToolDef` (D63) and the actual session-layer policy
+mutation for `session-allow` are deferred to follow-up slices —
+the modal SHOWS the option, the bridge RESOLVES it as `'yes'` for
+now (TODO marker in REPL).
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/state.ts` | NEW `ConfirmOption {key, label, value, shortcut?}` interface. `ConfirmState` rewritten: drops `{message, details, selected}`, adds `{title, subject, preview[], question, options[], selectedIndex, hints[]}`. NEW `PermissionAnswer = 'yes' \| 'session-allow' \| 'no' \| 'cancel'` exported union. Reducer constructs flavor-specific option lists in each `*:ask` branch (permission gets 3 options; trust/memory-write get 2; plan-review gets 3 with edit; critique gets 2). `modal:select` reducer now updates `selectedIndex` (clamped to a valid range) instead of toggling `selected`. |
+| `src/tui/events.ts` | `PermissionAnswerEvent` renamed to `ModalAnswerEvent` (type literal `permission:answer` → `modal:answer`); `decision` is now `string` because the modal carries 5 flavors with non-overlapping value sets (permission emits `'yes' \| 'session-allow' \| 'no' \| 'cancel'`; plan-review emits `'yes' \| 'edit' \| 'no' \| 'cancel'`; trust/memory-write/critique emit `'yes' \| 'no' \| 'cancel'`). Consumers narrow per-flavor by reading the original `*:ask` event. `ModalSelectEvent.selected` → `selectedIndex: number`. |
+| `src/tui/modal-manager.ts` | `askPermission` returns `Promise<PermissionAnswer>` instead of `Promise<boolean>`. Manager tracks `selectedIndex` (default = `options.length - 1`). Focus handler: hotkey direct activation (matches each option's `key` or `shortcut` against the KeyEvent), ↑/↓ + Tab/Shift+Tab navigate, Enter resolves the highlighted option's value, Esc resolves `'cancel'`. `matchesKey()` helper handles char-key + named-key + shift+tab chord. `moveSelection(delta)` clamps to a valid range. `close()` and timeouts now resolve `'cancel'` instead of `false`. Emits `modal:answer` (renamed from `permission:answer` to reflect that all 5 flavors flow through the same event). |
+| `src/tui/render/modal.ts` | Rewrite per §4.10.13: 4 blocks separated by full-cols horizontal rules — title (bold) + optional subject (dim); optional preview (dim, skipped block + rule when empty); optional question + numbered options (cursor `>` marks `selectedIndex`, options with `shortcut` show it in dim parens after label); optional hints footer (joined by ` · `, dim). Cursor `>` always (ASCII universal — no Unicode pretty variant). |
+| `src/cli/repl.ts` | Bridge updated: `modalManager.askPermission(...)` now returns the richer answer; REPL maps `'yes'` and `'session-allow'` → `true` (with a TODO that `session-allow` will write a session-layer policy rule when 1.d.7 lands), `'no'` and `'cancel'` → `false` for the harness's boolean contract. |
+| `tests/tui/modal-manager.test.ts` | Rewritten end-to-end for the new semantics. NEW 16 tests covering: default `selectedIndex` (last option = no), Esc=cancel, hotkey 1/2/3 direct activation, Shift+Tab as session-allow shortcut, ↑/↓ navigation with clamping at edges, modal:select event payload (selectedIndex), `modal:answer` carries the user's decision string and emits before the promise resolves, `modal:answer` decision is `'cancel'` on Esc (distinct from `'no'`), focus removal, swallow non-matching chars, queue serialization, timeout resolves cancel, close drains everything as cancel. |
+| `tests/tui/modal-integration.test.ts` | Rewritten for new layout. End-to-end: title/subject/preview/options all render, navigation preserves all 4 blocks, hotkey resolves, Esc resolves cancel, queue replaces contents cleanly, modal:select reducer updates selectedIndex, mismatched promptId dropped, out-of-range clamped, no-op on no-modal. NEW `describe('per-flavor reducer option lists')`: 4 tests confirming `trust:ask` (yes/no, AGENTS.md note in preview), `memory:write:ask` (yes/no, body as preview, scope/name as subject), `plan:review` (yes/edit/no, numbered steps + estimate in preview), `critique:ask` (yes/no, issues as preview) all build the right shape. |
+| `tests/tui/render/modal.test.ts` | Rewritten for new layout. NEW 15 tests: 4-block emission, ASCII rule fallback, cursor on selectedIndex, cursor moves with index, shortcut shown dim, preview block omitted when empty, subject omitted when null, question omitted when null, hints omitted when empty, multi-hint join, bold/dim SGR application, no SGR with color disabled, rule width tracks caps.cols, empty preview entry as blank spacer. |
+| `tests/tui/render/compose.test.ts` | Modal stubs updated to new shape. The "rule + footer suppressed when modal is up" assertion relaxed: modal carries its own rules so we can't blanket-assert "no rule" — instead check the specific input prompt + footer hint signals are absent. |
+| `tests/tui/render/footer.test.ts` | Modal stub in the modal-suppressed test updated. |
+
+**Decisions:**
+
+- **D114 — Reducer constructs flavor-specific option lists, not the manager.** Modal-manager calls `askPermission(args)` with permission-specific args; reducer builds the 3-option list in the `permission:ask` branch. Trust/memory-write/plan-review/critique branches each construct their own lists. Alternative was to have the manager build options and pass them via a fatter `*:ask` event, but: (a) the manager already knows the flavor, (b) the reducer already knows the flavor, (c) duplicating option-construction in both places drifts. Keeping it in the reducer means flavor-specific UX changes are one-file changes. The manager passes `optionsList` to its enqueue function so the focus handler knows what to match against — that's its only options awareness.
+- **D115 — Esc returns `'cancel'`, not `'no'`.** D5/D65 default-to-conservative made Enter-without-navigating safe; this decision goes one step further. Audit consumers (telemetry, replay) can now distinguish "user explicitly rejected" from "user closed the modal without deciding". Producers that don't care collapse both to "rejected" — REPL bridge does this for the harness's boolean contract.
+- **D116 — `selectedIndex` clamps in BOTH the reducer and the manager.** Defensive: a buggy producer could emit `modal:select` with a wild index, or a future flavor could ship with an off-by-one option count. Reducer clamps `Math.max(0, Math.min(max, idx))`; manager's `moveSelection` does the same on each ↑/↓. Result: the modal can never enter an invalid state where `selectedIndex` points past the option list.
+- **D117 — Hotkey activation skips printable chars with modifiers.** `matchesKey()` for char keys checks `!key.alt && !key.ctrl && key.char === keyOrShortcut`. Plain `1` activates option 1; Ctrl+1 / Alt+1 don't. The intent: the modal's hotkeys are typed-character actions, not chord-based. Future trust modal could use mnemonics ('t' for trust, 'n' for no) without ambiguity with Ctrl+T being a terminal escape.
+- **D118 — Modal rules are full-cols, same as the bottom anchor's rules.** Earlier modal renderer had a `DEFAULT_RULE_LEN = 41` constant — modal felt visually "boxy" but disconnected from the surrounding live region. Spec §4.10.13 layout images show full-width rules; matching makes the modal feel like a structural extension of the live region's bottom anchor instead of a floating popup. Cost: the "rule + footer suppressed when modal is up" test had to relax its "no rule" assertion (modal has its own rules — count-based assertion would fight the spec).
+- **D119 — Cursor `>` always (no Unicode pretty variant).** Earlier draft had `▶` Unicode / `>` ASCII. `>` is universal and the modal's structural elements (rules, options) carry the Unicode-or-ASCII signal. The cursor's job is to LOCATE selection, not to differentiate visual era. Single glyph keeps the focus-handler test asserting `'> '` regardless of caps.
+- **D120 — `session-allow` defers actual policy mutation to 1.d.7.** The option is in the modal, the bridge resolves it, but it currently behaves identically to `'yes'`. The session-layer mutation requires (a) `PermissionEngine.addSessionRule()` API (doesn't exist), (b) deciding scope (per-tool vs per-tool+args), (c) audit row for the session rule's creation. Each is a small slice; combining with the modal refactor would have made review impossibly large. TODO in repl.ts marks the spot.
+- **D121 — Plan-review's `'edit'` option resolves as a string but no producer reads it yet.** Spec §4.9 has plan-review with approve/edit/reject options. Reducer constructs them; manager forwards the value. Future plan-review producer maps `'edit'` to "open the plan in $EDITOR". For now the value just rides along — no harm, no consumer.
+- **D122 — `permission:answer` renamed to `modal:answer` (decision: string).** First draft kept the original name with a `decision: PermissionAnswer` union, but the manager emits the same event for plan-review (`'edit'`), trust (`'yes'`/`'no'`), etc. — values outside the union. The cast `value as PermissionAnswer` lied at the type level. Renaming the event reflects what the manager actually does (one event per modal flavor), and widening `decision` to `string` documents the truth (consumers narrow per-flavor by reading the original `*:ask` event). Caught in code review.
+- **D123 — Per-flavor reducer option lists tested explicitly.** Originally only `permission:ask` had a reducer test; the other 4 flavors (trust, memory-write, plan-review, critique) had hardcoded option lists in `state.ts` with zero coverage. A drift in any of them — wrong option count, swapped values, missing 'edit' on plan-review — would have shipped silent. Added 4 tests, one per flavor, asserting the documented option `value` list, `selectedIndex` default, and the title/subject/preview shape.
+
+**Pending / out of scope this slice:**
+
+- **`previewForApproval(args, ctx): string[]` on each `ToolDef`** (D63). Modal currently constructs preview from the engine's prompt + cwd + rule — not the rich tool-aware diff. Per-tool extraction lands as 1.d.7 alongside session-bypass (both touch tool internals).
+- **Session-layer policy mutation** for `session-allow` (D120). Engine API + REPL bridge wiring + tests. Probably 1.d.7.
+- **`Tab to amend`** flow (edit-then-confirm). Spec §4.10.13 mentions it; defer to v2 when there's a pattern for nested input editor inside modal.
+- **Per-flavor answer events.** `permission:answer` carries the union; trust/memory-write/critique would benefit from their own answer events with flavor-specific shapes. Today they all share `permission:answer` semantics. Lands when each producer is wired (currently only permission has a producer).
+
+**Verification:** `bun test` → 2046 pass / 10 skip / 0 fail (+14 net new across modal-manager, modal-integration, modal render). `tsc --noEmit` clean. `biome check .` clean.
+
+**Next:** Step 1.d.7 — `previewForApproval` per-tool implementations (edit_file → unified diff, write_file → first 20 lines of new content, bash → command + cwd, etc.) + session-layer policy mutation for `session-allow`. Both touch tool/permission internals; finishing them closes §4.10.13 entirely.
+
+---
+
 ## [2026-05-02] M1 / Step 1.d.5 — Permission engine ↔ modal manager bridge
 
 Closes the long-standing UX gap: a `confirm` decision from the
