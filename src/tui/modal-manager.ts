@@ -144,7 +144,20 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         return true;
       }
 
-      if (key.kind !== 'key') return true; // swallow chars while modal up
+      // Ctrl+C escapes the modal — falls through to the editor's
+      // cancelInput path so the REPL's interrupt ladder can abort
+      // the run that the modal was waiting on. Without this, an
+      // operator who hit a slow tool that raised a permission modal
+      // would have to dismiss the modal first (losing the question)
+      // before being able to abort. The modal returns 'cancel' (same
+      // semantic as Esc) on its own resolution path; abort fires on
+      // top so the harness tears down the in-flight tool too.
+      if (key.kind === 'char' && key.ctrl && key.char === 'c') {
+        resolveActive('cancel');
+        return false; // let the editor handler see the Ctrl+C
+      }
+
+      if (key.kind !== 'key') return true; // swallow other chars while modal up
       const k = key.name;
 
       if (k === 'up' || (k === 'tab' && key.shift === true)) {

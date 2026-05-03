@@ -45,11 +45,11 @@ const key = (
   raw: '',
 });
 
-const charKey = (char: string): KeyEvent => ({
+const charKey = (char: string, mods: { ctrl?: boolean; alt?: boolean } = {}): KeyEvent => ({
   kind: 'char',
   char,
-  ctrl: false,
-  alt: false,
+  ctrl: mods.ctrl ?? false,
+  alt: mods.alt ?? false,
   raw: char,
 });
 
@@ -116,6 +116,31 @@ describe('askPermission (3-option modal per UI.md §4.10.13)', () => {
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
     s.fs.dispatch(key('escape'));
     await expect(promise).resolves.toBe('cancel');
+  });
+
+  test('Ctrl+C resolves "cancel" AND falls through to lower handler (regression)', async () => {
+    // Pre-fix the modal swallowed all char events (line `if (key.kind
+    // !== 'key') return true`), and Ctrl+C is parsed as char/ctrl=true,
+    // so the operator's interrupt got eaten by the modal. They had to
+    // dismiss the modal by hand before any abort path could run —
+    // exactly the wrong UX during a slow tool that raised the modal.
+    //
+    // Post-fix: Ctrl+C resolves the modal as 'cancel' (same as Esc)
+    // AND returns false from the focus handler so the dispatcher
+    // tries the next handler down. We verify the second half by
+    // pushing a sentinel handler BELOW the modal's; it must observe
+    // the Ctrl+C event after the modal removes itself.
+    const s = make();
+    let observedByLower = false;
+    const lowerHandler = (k: KeyEvent): boolean => {
+      if (k.kind === 'char' && k.char === 'c' && k.ctrl) observedByLower = true;
+      return true;
+    };
+    s.fs.push(lowerHandler);
+    const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
+    s.fs.dispatch(charKey('c', { ctrl: true }));
+    await expect(promise).resolves.toBe('cancel');
+    expect(observedByLower).toBe(true);
   });
 
   test('hotkey "1" resolves "yes" directly (no navigate-then-Enter)', async () => {
