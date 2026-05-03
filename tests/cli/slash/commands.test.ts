@@ -163,6 +163,23 @@ describe('/sessions', () => {
     expect(r3.kind).toBe('error');
   });
 
+  test('renders timestamps in local wall-clock time (regression: not UTC)', async () => {
+    // Pre-fix the formatter was toISOString().slice(...) which emits
+    // UTC while LOOKING like a local timestamp. An operator in UTC-3
+    // saw every session shifted +3h and would scan recency wrong.
+    // The fix uses local getters; this test pins the contract by
+    // constructing the Date via local-component constructor (the
+    // mirror of the local getters the formatter uses), so the
+    // assertion holds regardless of the test env's timezone.
+    const ctx = makeCtx();
+    const localStartedAt = new Date(2026, 4, 3, 14, 30, 45).getTime(); // May 3, 2026 14:30:45 LOCAL
+    createSession(ctx.db, { model: 'm-tz', cwd: '/test/cwd', startedAt: localStartedAt });
+    const result = await sessionsCommand.exec([], ctx);
+    if (result.kind !== 'ok') return;
+    const row = result.notes?.find((l) => l.includes('m-tz')) ?? '';
+    expect(row).toContain('2026-05-03 14:30:45');
+  });
+
   test('rejects partially-numeric and decimal limits (no silent coercion)', async () => {
     // Number.parseInt would coerce '10foo' → 10 and '1.5' → 1, but
     // the command's error message advertises "must be a positive

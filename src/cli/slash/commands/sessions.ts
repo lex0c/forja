@@ -10,11 +10,25 @@ import { listSessions } from '../../../storage/index.ts';
 import { formatCost } from '../format.ts';
 import type { SlashCommand } from '../types.ts';
 
+// Pad a small integer to two digits for the timestamp format.
+const pad2 = (n: number): string => String(n).padStart(2, '0');
+
 const formatTimestamp = (ms: number): string => {
+  // Local wall-clock format, second precision, no TZ suffix. The
+  // operator scans session times against their own clock — using
+  // toISOString().slice() would render UTC while LOOKING like local
+  // time, so a 14:00 session in UTC-3 would show as 17:00 and the
+  // operator would pick the wrong row by recency. Manual local
+  // getters (vs toLocaleString) avoid locale-dependent formatting:
+  // YYYY-MM-DD HH:MM:SS regardless of the operator's locale.
   const d = new Date(ms);
-  // ISO date+time, second precision, no TZ suffix (operator reads
-  // session times relative to wall clock, not UTC).
-  return `${d.toISOString().slice(0, 19).replace('T', ' ')}`;
+  const yyyy = d.getFullYear();
+  const mm = pad2(d.getMonth() + 1);
+  const dd = pad2(d.getDate());
+  const hh = pad2(d.getHours());
+  const mi = pad2(d.getMinutes());
+  const ss = pad2(d.getSeconds());
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
 };
 
 // Sessions can have incomplete usage telemetry — prefix with `~`
