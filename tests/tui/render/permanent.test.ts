@@ -49,7 +49,7 @@ describe('formatPermanent', () => {
     ).toEqual(['── session end · done ──']);
   });
 
-  describe('session-banner', () => {
+  describe('session-banner (UI.md §4.10.9 — 3 blocks)', () => {
     const baseBanner = {
       kind: 'session-banner' as const,
       app: 'forja',
@@ -59,49 +59,94 @@ describe('formatPermanent', () => {
       maxOutputTokens: 4096,
       cwd: '/home/lex/forja',
       env: [
-        { key: 'subagents', value: '2' },
-        { key: 'checkpoints', value: 'enabled' },
+        { kind: 'meta' as const, key: 'subagents', value: '2' },
+        { kind: 'flag' as const, name: 'checkpoints' },
       ],
     };
 
-    test('emits 4 lines (title, model+limits, cwd, env) with Unicode separators', () => {
+    test('emits 6 lines: title / blank / model+cwd (2) / blank / env (Unicode)', () => {
       expect(formatPermanent(baseBanner, unicode)).toEqual([
-        'forja 0.1.0',
+        'forja v0.1.0',
+        '',
         'anthropic/claude-sonnet-4-6 · 200,000 ctx · max 4096 out',
         '/home/lex/forja',
-        'subagents: 2 · checkpoints: enabled',
+        '',
+        'subagents: 2 · ✓ checkpoints',
       ]);
     });
 
-    test('falls back to ASCII separator when unicode disabled', () => {
+    test('version already prefixed with v is not double-prefixed', () => {
+      const out = formatPermanent({ ...baseBanner, version: 'v2.3.4' }, unicode);
+      expect(out[0]).toBe('forja v2.3.4');
+    });
+
+    test('falls back to ASCII glyphs (* for ✓, - for ·) when unicode disabled', () => {
       const out = formatPermanent(baseBanner, ascii);
-      expect(out[1]).toBe('anthropic/claude-sonnet-4-6 - 200,000 ctx - max 4096 out');
-      expect(out[3]).toBe('subagents: 2 - checkpoints: enabled');
+      expect(out[2]).toBe('anthropic/claude-sonnet-4-6 - 200,000 ctx - max 4096 out');
+      expect(out[5]).toBe('subagents: 2 - * checkpoints');
     });
 
-    test('omits env line entirely when env is empty (no placeholder)', () => {
+    test('omits env block entirely when env is empty (no trailing blank line)', () => {
       const out = formatPermanent({ ...baseBanner, env: [] }, ascii);
-      expect(out).toHaveLength(3);
-      expect(out[0]).toBe('forja 0.1.0');
-      expect(out[2]).toBe('/home/lex/forja');
+      // title + blank + model + cwd. Banner ends after identity block.
+      expect(out).toEqual([
+        'forja v0.1.0',
+        '',
+        'anthropic/claude-sonnet-4-6 - 200,000 ctx - max 4096 out',
+        '/home/lex/forja',
+      ]);
     });
 
-    test('applies bold SGR to title and dim SGR to other lines when color enabled', () => {
+    test('flag with count renders as ✓ name (count)', () => {
+      const out = formatPermanent(
+        {
+          ...baseBanner,
+          env: [{ kind: 'flag' as const, name: 'memory', count: 14 }],
+        },
+        unicode,
+      );
+      expect(out[5]).toBe('✓ memory (14)');
+    });
+
+    test('mixes flag + meta entries joined by dim · separator', () => {
+      const out = formatPermanent(
+        {
+          ...baseBanner,
+          env: [
+            { kind: 'meta' as const, key: 'policy', value: 'project (5 rules)' },
+            { kind: 'meta' as const, key: 'subagents', value: '2' },
+            { kind: 'flag' as const, name: 'checkpoints' },
+            { kind: 'flag' as const, name: 'memory', count: 14 },
+          ],
+        },
+        unicode,
+      );
+      expect(out[5]).toBe(
+        'policy: project (5 rules) · subagents: 2 · ✓ checkpoints · ✓ memory (14)',
+      );
+    });
+
+    test('applies bold to title, dim to identity, success to flags, dim to meta when color enabled', () => {
       const out = formatPermanent(baseBanner, colored);
+      // 0: title (bold), 1: blank, 2-3: identity (dim), 4: blank, 5: env mix
       expect(out[0]).toContain(`${CSI}1m`);
-      expect(out[1]).toContain(`${CSI}2m`);
+      expect(out[1]).toBe('');
       expect(out[2]).toContain(`${CSI}2m`);
       expect(out[3]).toContain(`${CSI}2m`);
+      expect(out[4]).toBe('');
+      // env line: meta entry dim, flag entry success.
+      expect(out[5]).toContain(`${CSI}2m`); // dim runs (meta + separator)
+      expect(out[5]).toContain(`${CSI}32m`); // success run (flag)
     });
 
-    test('emits no SGR when color disabled', () => {
+    test('emits no SGR (other than the empty blank lines) when color disabled', () => {
       const out = formatPermanent(baseBanner, unicode);
       for (const line of out) expect(line).not.toContain(CSI);
     });
 
     test('formats large context window with locale-aware thousands separator', () => {
       const out = formatPermanent({ ...baseBanner, contextWindow: 1_000_000 }, ascii);
-      expect(out[1]).toContain('1,000,000 ctx');
+      expect(out[2]).toContain('1,000,000 ctx');
     });
   });
 

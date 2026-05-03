@@ -39,8 +39,21 @@ export type SessionStartEvent = BaseEvent & {
 
 // One-shot welcome banner (UI.md §4.10.9). Emitted by the REPL at
 // boot; producers MUST NOT emit twice. Pure permanent — the reducer
-// pushes it to scrollback and never references it again. Each line
-// answers a concrete question (version / model+limits / cwd / env).
+// pushes it to scrollback and never references it again. Three blocks
+// (title / identity / env) separated by blank lines.
+//
+// Env entries discriminate on `kind` so the renderer can apply the
+// right palette per spec §4.10.9:
+//   - `flag` → `✓ {name}` (or `✓ {name} ({count})`) painted `success`
+//     for binary capability indicators (checkpoints, memory). Items
+//     in the off state are NOT emitted — the line lists what exists,
+//     never what's missing.
+//   - `meta` → `{key}: {value}` painted `dim` for non-binary metadata
+//     (subagents count, policy descriptor).
+// Empty array → renderer omits the env block entirely.
+export type SessionBannerEnvEntry =
+  | { kind: 'flag'; name: string; count?: number }
+  | { kind: 'meta'; key: string; value: string };
 export type SessionBannerEvent = BaseEvent & {
   type: 'session:banner';
   app: string;
@@ -49,10 +62,7 @@ export type SessionBannerEvent = BaseEvent & {
   contextWindow: number;
   maxOutputTokens: number;
   cwd: string;
-  // Producers populate what they know; renderer joins entries with
-  // the locale-appropriate separator. Empty array → renderer omits
-  // the line entirely (no "N/A" placeholder).
-  env: { key: string; value: string }[];
+  env: SessionBannerEnvEntry[];
 };
 export type SessionEndEvent = BaseEvent & {
   type: 'session:end';

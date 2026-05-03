@@ -284,12 +284,13 @@ describe('repl — boot + smoke', () => {
     await tick();
     await tick();
     const all = writes.join('');
-    expect(all).toContain('forja 0.0.0');
+    // Banner now uses the v-prefixed version (UI.md §4.10.9).
+    expect(all).toContain('forja v0.0.0');
     expect(all).toContain('mock/m');
     expect(all).toContain('200,000 ctx');
     expect(all).toContain('max 4096 out');
     expect(all).toContain('/path/to/repo');
-    // No env line because both subagents and checkpoints were
+    // No env block because both subagents and checkpoints were
     // empty/disabled (D68 — omit when nothing to summarize).
     expect(all).not.toContain('subagents');
     expect(all).not.toContain('checkpoints');

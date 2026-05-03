@@ -28,6 +28,7 @@ import {
   type FocusHandler,
   type HarnessAdapter,
   type KeyEvent,
+  type SessionBannerEvent,
   type UIEvent,
   applyKey,
   createBus,
@@ -670,9 +671,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // there's nothing useful to communicate. Memory entry count
   // omitted until the registry exposes a sync count method.
   const providerCaps = baseConfig.provider.capabilities;
-  const env: { key: string; value: string }[] = [];
+  // UI.md §4.10.9 discriminates env entries: `flag` for binary
+  // capability indicators (rendered as `✓ name` in success palette),
+  // `meta` for non-binary key:value (rendered dim).
+  const env: SessionBannerEvent['env'] = [];
   if (subagents.byName.size > 0) {
-    env.push({ key: 'subagents', value: String(subagents.byName.size) });
+    env.push({ kind: 'meta', key: 'subagents', value: String(subagents.byName.size) });
   }
   // Checkpoints only show when they'll actually fire. Both halves
   // matter: enableCheckpoints=false (plan mode, opt-out) and
@@ -680,7 +684,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // rollback at runtime — banner stays silent rather than promising
   // a feature that won't deliver.
   if (baseConfig.enableCheckpoints === true && (await isGitRepo(baseConfig.cwd))) {
-    env.push({ key: 'checkpoints', value: 'enabled' });
+    env.push({ kind: 'flag', name: 'checkpoints' });
   }
   bus.emit({
     type: 'session:banner',

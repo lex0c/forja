@@ -509,21 +509,31 @@ ASCII fallback: SGR `7` é universal em qualquer terminal — sem fallback neces
 
 #### 4.10.9 Welcome banner (scrollback)
 
-Emitido **uma vez** no boot do REPL, como `PermanentItem` kind `'session-banner'`. Quatro linhas, todas respondem uma pergunta concreta:
+Emitido **uma vez** no boot do REPL, como `PermanentItem` kind `'session-banner'`. Estruturado em **3 blocos** separados por linha em branco — banner em densidade alta colava no input e violava o princípio "hierarquia vem de spacing/peso, não de cor" (§6.4). Spacing carrega a estrutura; paleta segue mínima.
 
 ```
 forja v0.0.0
+
 anthropic/claude-sonnet-4-6 · 200k ctx · max 4096 out
 /run/media/lex/.../forja
-policy: project (5 rules) · subagents: 2 · checkpoints: enabled · memory: 14 entries
+
+policy: project (5 rules) · subagents: 2 · ✓ checkpoints · ✓ memory (14)
 ```
 
-| Linha | Pergunta |
-|---|---|
-| 1 | Qual versão. |
-| 2 | Qual modelo, com limites concretos (context window, max output). |
-| 3 | Em qual cwd. |
-| 4 | Ambiente: quantas regras, quantos subagents, checkpoints/memory ligados. |
+| Bloco | Linhas | Estilo | Pergunta |
+|---|---|---|---|
+| 1 (title) | 1 | `bold` | Qual versão? |
+| 2 (identity) | 2 | `dim` | Qual modelo (limites concretos: context window, max output) e em qual cwd? |
+| 3 (env) | 0 ou 1 | misto | O que está ligado nesta sessão? |
+
+**Versão prefixada com `v`** (`forja v0.0.0`, não `forja 0.0.0`) — convenção semver, identifica a string como versão à primeira leitura.
+
+**Bloco 3 (env)** mistura dois estilos numa única linha, separados por ` · `:
+
+- **Indicadores de capability binária habilitada** (`checkpoints`, `memory`) usam o glyph `✓` (§6.2) pintado com token `success` (§6.1); o nome do indicador fica em `default`. Contagem opcional entre parênteses (`✓ memory (14)`). Itens em estado desligado **não são impressos** — a linha lista o que existe, não o que não existe.
+- **Metadata key:value não-binária** (`policy: project (N rules)`, `subagents: N`) fica em `dim`. Sem glyph.
+
+Quando nenhum indicador binário estaria true e nenhuma metadata útil existe (sem subagents, sem checkpoints, sem memory, sem policy customizada), o **bloco 3 é omitido inteiro** — banner termina após o bloco 2, sem linha em branco terminal vazia. Producer (`session:banner`) sinaliza isso enviando `env: []`.
 
 Vai pro scrollback — uma vez impresso, scrolla naturalmente conforme a conversa cresce. **Sem header fixo.** Sem logo. Sem mascot. (Se um dia identidade visual virar pauta, ASCII art opcional via flag — não default.)
 
@@ -555,10 +565,12 @@ Banidos do vocabulário operacional:
 
 ```
 ┌─ scrollback (permanent items, dim baseline) ───────────────────────┐
-│ forja v0.0.0                                                        │
-│ anthropic/claude-sonnet-4-6 · 200k ctx · max 4096 out               │
+│ forja v0.0.0                                    ← title (bold)      │
+│                                                                     │
+│ anthropic/claude-sonnet-4-6 · 200k ctx · max 4096 out  ← identity   │
 │ /run/media/lex/.../forja                                            │
-│ policy: project (5 rules) · subagents: 2 · checkpoints: enabled     │
+│                                                                     │
+│ policy: project (5 rules) · subagents: 2 · ✓ checkpoints · ✓ memory │
 │                                                                     │
 │ > a tui já funciona?                            ← inverse bar       │
 │ * Reading file (2.4kB)                          ← chip final, dim   │
@@ -921,7 +933,7 @@ function dispatch(k: Key) { for (let i=stack.length-1; i>=0; i--) if (stack[i](k
 | `bold` | ênfase, header de modal | `\x1b[1m` |
 | `error` | mensagens de erro, status falho | `\x1b[31m` |
 | `warn` | avisos, budget 80% | `\x1b[33m` |
-| `success` | apenas em pipeline badges (`✓`) | `\x1b[32m` |
+| `success` | pipeline badges (`✓`) e indicadores binários de capability habilitada no banner env (§4.10.9) | `\x1b[32m` |
 
 **Sem mais cores.** Sem azul, sem ciano, sem magenta, sem gradientes, sem 256-color, sem truecolor. Profile/model/etc. ficam em `default`. Se você precisa de cor pra distinguir, o layout falhou.
 
@@ -950,7 +962,7 @@ Detecção: locale-aware (`LANG`/`LC_ALL` contém `UTF-8`) + check de width via 
 - Indent fixo: 2 espaços por nível.
 - Não há padding interno em modais (linhas vazias acima/abaixo do conteúdo, sem espaços laterais — borda fica em `─`).
 - Separador horizontal: `─` (40 chars) ou `-` (ASCII).
-- Linhas em branco entre blocos permanentes: 1 (apenas).
+- Linhas em branco entre blocos permanentes: 1 (apenas). Aplica-se também a sub-blocos dentro de um único `PermanentItem` quando a hierarquia visual exige (ex.: banner com 3 sub-blocos, §4.10.9). Nunca 2 ou mais — duplo respiro vira ruído.
 
 ### 6.4 Tipografia
 

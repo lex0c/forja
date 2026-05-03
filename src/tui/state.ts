@@ -15,7 +15,7 @@
 // todo events accept silently and land alongside their render
 // functions.
 
-import type { TodoItemForUI, UIEvent } from './events.ts';
+import type { SessionBannerEnvEntry, TodoItemForUI, UIEvent } from './events.ts';
 
 export interface InputState {
   // Current value of the input box (multi-line allowed via `\n`).
@@ -253,7 +253,9 @@ export type PermanentItem =
       contextWindow: number;
       maxOutputTokens: number;
       cwd: string;
-      env: { key: string; value: string }[];
+      // Mirror of SessionBannerEvent.env (UI.md §4.10.9). Renderer
+      // discriminates on `kind` to pick the right palette per entry.
+      env: SessionBannerEnvEntry[];
     }
   | { kind: 'user-submit'; text: string }
   | {

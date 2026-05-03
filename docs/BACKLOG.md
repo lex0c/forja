@@ -15,6 +15,35 @@ Format:
 
 ---
 
+## [2026-05-03] M2 / spec — UI.md welcome banner restructure (3 blocks + ✓ flags)
+
+Operator review of the boot screen flagged it as "denso, sem hierarquia" — banner colava no input, todos os blocos com mesmo peso, primeira impressão era "dump de terminal". Spec dizia 4 linhas tight; sem espaço pra respirar entre versão / identity / env. Receita externa sugeria cores acentuadas (cyan path, etc.) — proibidas pela §6.1 ("se precisa de cor pra distinguir, o layout falhou"), então a divergência teve que ir pela rota de spacing + glyph canônico, não paleta.
+
+**Done:**
+
+- §4.10.9 reescrito: banner agora tem 3 blocos separados por linha em branco (title / identity / env). Spacing carrega a hierarquia, paleta segue mínima.
+- Versão prefixada com `v` (`forja v0.0.0`) — convenção semver, alinha com o exemplo já existente da spec que estava drift do código.
+- Bloco 3 (env) ganhou semântica dupla: indicadores de capability binária habilitada usam `✓` (§6.2) + `success` (§6.1) com nome em default; metadata k:v não-binária permanece em dim. Itens binários desligados não imprimem (a linha lista o que existe, não o que falta).
+- §6.1 estendeu o uso do token `success` pra cobrir o novo caso do banner env.
+- §6.3 esclareceu que a regra "1 linha em branco entre blocos permanentes" aplica também a sub-blocos dentro de um único `PermanentItem`.
+- §4.10.12 reference layout atualizado.
+
+**Decisions:**
+
+- **Spacing > cor.** A crítica externa sugeria `chalk.cyan(path)` e padding lateral global; ambos violam restrições deliberadas (§6.1 sem azul/ciano, §6.3 indent é por nível não margem). A amenda prova que respiro vertical resolve "tudo colado" sem mexer paleta.
+- **`✓` como discriminador semântico, não decoração.** Spec §4.10.11 bane emoji decorativo, mas `✓` é canônico (§6.2) — o caso novo é "indicador binário de capability", consistente com pipeline badge (que já era a única licença do `success`). Itens desligados não aparecem com `✗` — a ausência já comunica.
+- **Schema do `session:banner` event preservado em forma**, mas a env entry vai precisar de discriminador `kind: 'flag' | 'meta'` no impl-side pra renderer escolher entre `✓ {key} (count)` e `{key}: {value}`. Producer (repl.ts:670+) agora popula ambas as formas.
+
+**Pending:**
+
+- Render impl em `src/tui/render/permanent.ts` (case `session-banner`).
+- Producer em `src/cli/repl.ts` ajusta as env entries (memory + policy ainda não emitidas hoje).
+- Tests de snapshot (3 blocos, ASCII fallback, NO_COLOR, env vazio omitido).
+
+**Next:** corte código nesta mesma branch (`feat/m2-tui-ux`) — spec landou primeiro, impl segue. Smoke visual num terminal real após o build.
+
+---
+
 ## [2026-05-03] M1 audit — TUI ↔ harness integration coverage (~77%)
 
 End-to-end audit of every `HarnessEvent` and `UIEvent` after the M1 series landed. 17 of 22 producer/render paths are wired and exercised against real Anthropic streaming (smoke runs in this session: text-only response, tool deny + multi-step recovery, tool allow path, --list-sessions). 5 producer gaps + 1 incomplete render are tracked below as explicit debt — none block the merge of what currently works, but each is a contract the spec promises and the operator-visible UI doesn't fully deliver yet.

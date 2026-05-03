@@ -110,7 +110,10 @@ describe('session lifecycle', () => {
       contextWindow: 200000,
       maxOutputTokens: 4096,
       cwd: '/home/lex/forja',
-      env: [{ key: 'subagents', value: '0' }],
+      env: [
+        { kind: 'meta', key: 'subagents', value: '0' },
+        { kind: 'flag', name: 'checkpoints' },
+      ],
     });
     // State unchanged — banner is pure scrollback.
     expect(r.state).toEqual(initial);
@@ -123,7 +126,10 @@ describe('session lifecycle', () => {
         contextWindow: 200000,
         maxOutputTokens: 4096,
         cwd: '/home/lex/forja',
-        env: [{ key: 'subagents', value: '0' }],
+        env: [
+          { kind: 'meta', key: 'subagents', value: '0' },
+          { kind: 'flag', name: 'checkpoints' },
+        ],
       },
     ]);
   });
