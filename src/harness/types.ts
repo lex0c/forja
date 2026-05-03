@@ -38,6 +38,13 @@ export type HarnessEvent =
       toolName: string;
       failed: boolean;
       durationMs: number;
+      // True specifically when the failure was a denial (policy `deny`
+      // or user rejected a `confirm` modal). Disambiguates from
+      // execution errors after an allowed/confirmed tool — without
+      // this, a user-rejected confirm and a tool that crashed AFTER
+      // approval are both `failed: true` and audit/UI can't tell
+      // them apart. Absent for non-failure outcomes.
+      denied?: boolean;
     }
   | {
       type: 'compaction_started';

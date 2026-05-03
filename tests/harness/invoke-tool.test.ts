@@ -169,6 +169,10 @@ describe('invokeTool', () => {
     );
     expect(inv.failed).toBe(false);
     expect(inv.toolResult.is_error).toBeUndefined();
+    // Successful confirm-yes path is not a denial — keep `denied`
+    // absent so the adapter's branching ("denied takes precedence")
+    // doesn't misclassify a healthy execution.
+    expect(inv.denied).toBeUndefined();
 
     const tc = getToolCall(db, inv.toolCallId);
     expect(tc?.status).toBe('done');
@@ -191,6 +195,11 @@ describe('invokeTool', () => {
     expect(inv.failed).toBe(true);
     expect(inv.toolResult.is_error).toBe(true);
     expect(inv.toolResult.content).toContain('denied by user');
+    // denied=true disambiguates user-rejected-confirm from execution
+    // errors at the renderer/audit boundary. Without it the adapter
+    // would have to guess via decision.kind === 'confirm' && failed,
+    // which collides with "user said yes but tool errored after".
+    expect(inv.denied).toBe(true);
 
     const tc = getToolCall(db, inv.toolCallId);
     expect(tc?.status).toBe('denied');

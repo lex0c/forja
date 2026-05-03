@@ -344,8 +344,21 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
       case 'tool_finished': {
         const tool = state.tools.get(event.toolUseId);
         const decisionKind = tool?.decision?.kind;
-        const status: 'done' | 'error' | 'denied' =
-          decisionKind === 'deny' ? 'denied' : event.failed ? 'error' : 'done';
+        // `denied` is authoritative — set true for ANY denial path
+        // (policy deny, user-rejected confirm). Without it, a
+        // user-rejected confirm has decision.kind === 'confirm' and
+        // failed === true, and the legacy decision-kind check would
+        // map to 'error' — wrong: it's a denial, not a tool failure.
+        // Falls back to decision.kind === 'deny' so older producers
+        // (events synthesized in tests, future replay paths) still
+        // resolve correctly.
+        const status: 'done' | 'error' | 'denied' = event.denied
+          ? 'denied'
+          : decisionKind === 'deny'
+            ? 'denied'
+            : event.failed
+              ? 'error'
+              : 'done';
         state.tools.delete(event.toolUseId);
         out.push({
           type: 'tool:end',

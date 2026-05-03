@@ -458,6 +458,68 @@ describe('harness-adapter — tool lifecycle', () => {
     expect(e.durationMs).toBe(5);
   });
 
+  test('tool_finished with denied=true after confirm → tool:end status=denied (regression)', () => {
+    // Pre-fix the adapter only checked decision.kind === 'deny'. A
+    // user-rejected confirm modal returns failed=true with the
+    // ORIGINAL decision still {kind: 'confirm'}, so the adapter
+    // mapped it to 'error' — misstating a permission denial as a
+    // tool execution failure. The harness now sets denied=true on
+    // the tool_finished event for any denial path; the adapter
+    // honors that ahead of the legacy decision-kind check.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'edit_file',
+      args: { path: '/foo' },
+    });
+    a.translate({
+      type: 'tool_decided',
+      toolUseId: 't1',
+      decision: { kind: 'confirm', prompt: 'edit /foo?' },
+    });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'edit_file',
+      failed: true,
+      durationMs: 12,
+      denied: true,
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('denied');
+  });
+
+  test('tool_finished with denied absent + decision=confirm + failed → falls through to error', () => {
+    // Confirm flow where the user APPROVED but the tool errored
+    // after execution. denied is absent on the event (because the
+    // failure was a real error, not a denial), decision.kind stays
+    // 'confirm'. Must map to 'error', not 'denied'. Without this
+    // distinction the new branch would over-claim denials.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'bash',
+      args: { command: 'false' },
+    });
+    a.translate({
+      type: 'tool_decided',
+      toolUseId: 't1',
+      decision: { kind: 'confirm', prompt: 'run?' },
+    });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'bash',
+      failed: true,
+      durationMs: 7,
+      // denied intentionally omitted — this was an execution error.
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('error');
+  });
+
   test('tool_finished after allow + failure → status=error', () => {
     const a = createHarnessAdapter(baseCtx());
     a.translate({

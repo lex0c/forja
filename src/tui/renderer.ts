@@ -186,16 +186,27 @@ export const createRenderer = (options: RendererOptions): Renderer => {
   const scheduler = createFrameScheduler(redraw, schedulerOptions);
 
   // Heartbeat: while anything in the live region animates (spinner
-  // for a running tool, thinking duration counter), tick periodically
-  // so the frame scheduler keeps redrawing. Goes idle when no
-  // animated element is on screen — zero wakeups while waiting on
-  // user input.
+  // for a running tool, thinking duration counter, the assistant
+  // chip's "Generating… (Xs · ↑ N tokens)" elapsed counter), tick
+  // periodically so the frame scheduler keeps redrawing. Goes idle
+  // when no animated element is on screen — zero wakeups while
+  // waiting on user input.
+  //
+  // pendingAssistant matters even when no thinking/tool is in flight:
+  // a long quiet gap between provider deltas (model reasoning, slow
+  // network) would otherwise freeze the spinner and the elapsed
+  // timer until the next delta lands. From the operator's POV the
+  // run looks hung. Including pendingAssistant here keeps the chip
+  // animating during pure text-generation turns.
   const heartbeat: Heartbeat | null =
     options.heartbeat === false
       ? null
       : createHeartbeat({
           ...(options.heartbeat ?? {}),
-          isActive: () => state.activeTools.size > 0 || state.thinking !== null,
+          isActive: () =>
+            state.activeTools.size > 0 ||
+            state.thinking !== null ||
+            state.pendingAssistant !== null,
           onTick: () => scheduler.request(),
         });
 

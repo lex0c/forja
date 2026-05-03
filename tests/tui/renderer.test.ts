@@ -613,6 +613,55 @@ describe('renderer side effects', () => {
     expect(sink.joined()).not.toContain('?2004l');
   });
 
+  test('heartbeat ticks while pendingAssistant is set (regression)', () => {
+    // Pre-fix the heartbeat predicate only checked activeTools and
+    // thinking. A pure assistant streaming turn (model emitting text
+    // without thinking blocks or tool calls) left the spinner frozen
+    // between provider deltas — long quiet gaps looked like the run
+    // hung. Including pendingAssistant in the predicate keeps the
+    // chip animating during quiet generation.
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    type HbPending = { fn: () => void };
+    let hbPending: HbPending[] = [];
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+      heartbeat: {
+        setTimer: (fn) => {
+          const p: HbPending = { fn };
+          hbPending.push(p);
+          return p;
+        },
+        clearTimer: (h) => {
+          hbPending = hbPending.filter((p) => p !== h);
+        },
+      },
+    });
+    // Open a streaming turn with NO tool / thinking activity.
+    bus.emit({ type: 'assistant:start', ts: 1, messageId: 'm1' });
+    sched.flushAll();
+    // Heartbeat must have armed a tick — proves the predicate
+    // recognized pendingAssistant as "active".
+    expect(hbPending.length).toBeGreaterThan(0);
+    // Close the turn → predicate goes false on the next firing,
+    // heartbeat stops re-arming.
+    bus.emit({ type: 'assistant:end', ts: 2, messageId: 'm1' });
+    sched.flushAll();
+    // Drain the pending heartbeat tick; predicate is now false so
+    // it should NOT re-arm.
+    const snapshot = hbPending.slice();
+    hbPending = [];
+    snapshot.forEach((p) => p.fn());
+    sched.flushAll();
+    expect(hbPending.length).toBe(0);
+    r.close();
+  });
+
   test('stdin enableRawMode is invoked when stdin is provided', () => {
     const bus = createBus();
     const sink = makeSink();

@@ -75,6 +75,13 @@ export interface InvokeToolResult {
   // found (no decision happened). The loop uses this to emit a
   // `tool_decided` event for renderers.
   decision: Decision | null;
+  // True specifically when the failure was a denial (policy `deny` or
+  // user rejected a `confirm` modal). False/absent for other failure
+  // shapes (unknown tool, execution error, exception). Disambiguates
+  // the `decision.kind === 'confirm' && failed === true` ambiguity at
+  // the renderer/audit boundary — without this, a confirm-no looks
+  // identical to a tool that errored AFTER the user said yes.
+  denied?: boolean;
 }
 
 const buildErrorBlock = (
@@ -268,6 +275,7 @@ export const invokeTool = async (
       toolCallId: toolCall.id,
       durationMs: Date.now() - start,
       failed: true,
+      denied: true,
       decision: { kind: 'deny', reason },
     };
   }
@@ -363,6 +371,7 @@ export const invokeTool = async (
       toolCallId: setup.toolCall.id,
       durationMs: Date.now() - start,
       failed: true,
+      denied: true,
       decision,
     };
   }
@@ -377,6 +386,7 @@ export const invokeTool = async (
       toolCallId: setup.toolCall.id,
       durationMs: Date.now() - start,
       failed: true,
+      denied: true,
       decision,
     };
   }
@@ -443,6 +453,7 @@ export const invokeTool = async (
         toolCallId: callId,
         durationMs: Date.now() - start,
         failed: true,
+        denied: true,
         decision,
       };
     }

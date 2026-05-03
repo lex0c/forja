@@ -1130,6 +1130,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             toolName: tu.name,
             failed: inv.failed,
             durationMs: inv.durationMs,
+            ...(inv.denied === true ? { denied: true } : {}),
           });
 
           toolResults.push(inv.toolResult);
