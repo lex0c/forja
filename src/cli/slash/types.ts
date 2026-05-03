@@ -40,6 +40,14 @@ export interface SlashContext {
   // Trigger REPL shutdown (cleanly: aborts running turn if any,
   // closes db, removes listeners). Used by /quit.
   requestShutdown: () => void;
+  // True when a turn is in flight. Used by mutation commands to
+  // append a "current turn already snapshot its config" cue to the
+  // confirmation note — without this, an operator who mutates mid-
+  // turn might assume the new value applies to the in-flight prompt
+  // (it doesn't; the harness reads its config exactly once at
+  // startTurn). Read fresh per-call so a turn that started AFTER
+  // the slash command was queued still reports correctly.
+  isRunning: () => boolean;
 }
 
 // Outcome of executing a command. The dispatcher emits any messages

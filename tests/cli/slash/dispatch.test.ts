@@ -46,6 +46,7 @@ const makeCtx = (): {
       requestShutdown: () => {
         shutdownFired = true;
       },
+      isRunning: () => false,
     },
     events,
     db,

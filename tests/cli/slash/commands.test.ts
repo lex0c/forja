@@ -44,6 +44,7 @@ const makeCtx = (overrides: Partial<SlashContext> = {}): SlashContext => {
     cumulative: { costUsd: 0, steps: 0, turns: 0 },
     now: () => 1,
     requestShutdown: () => undefined,
+    isRunning: () => false,
     ...overrides,
   };
 };
@@ -205,9 +206,53 @@ describe('/plan', () => {
     expect(result.notes?.[0]).toContain('enabled');
   });
 
-  test('rejects mutation args', async () => {
-    const result = await planCommand.exec(['on'], makeCtx());
+  test('/plan on flips planMode true and notes next-turn pickup', async () => {
+    const ctx = makeCtx();
+    expect(ctx.baseConfig.planMode).toBeFalsy();
+    const result = await planCommand.exec(['on'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(ctx.baseConfig.planMode).toBe(true);
+    expect(result.notes?.[0]).toContain('enabled');
+    expect(result.notes?.[0]).toContain('next turn');
+  });
+
+  test('/plan off flips planMode false', async () => {
+    const ctx = makeCtx();
+    (ctx.baseConfig as { planMode: boolean }).planMode = true;
+    const result = await planCommand.exec(['off'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(ctx.baseConfig.planMode).toBe(false);
+    expect(result.notes?.[0]).toContain('disabled');
+  });
+
+  test('/plan on when already enabled is a no-op (idempotent note)', async () => {
+    const ctx = makeCtx();
+    (ctx.baseConfig as { planMode: boolean }).planMode = true;
+    const result = await planCommand.exec(['on'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(result.notes?.[0]).toContain('already');
+    // No mutation note; the next-turn cue only appears on actual flips.
+    expect(result.notes?.[0]).not.toContain('next turn');
+  });
+
+  test('/plan with unknown arg returns error', async () => {
+    const result = await planCommand.exec(['maybe'], makeCtx());
     expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('unknown arg');
+  });
+
+  test('/plan with too many args returns error', async () => {
+    const result = await planCommand.exec(['on', 'extra'], makeCtx());
+    expect(result.kind).toBe('error');
+  });
+
+  test('/plan on appends current-turn cue when a turn is running', async () => {
+    const ctx = makeCtx({ isRunning: () => true });
+    const result = await planCommand.exec(['on'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(result.notes?.length).toBe(2);
+    expect(result.notes?.[1]).toContain('current turn');
   });
 });
 
@@ -229,8 +274,121 @@ describe('/budget', () => {
     expect(result.notes?.some((l) => l.includes('no cap'))).toBe(true);
   });
 
-  test('rejects mutation args', async () => {
-    const result = await budgetCommand.exec(['cost', '5'], makeCtx());
+  test('/budget steps N updates maxSteps and notes next-turn pickup', async () => {
+    const ctx = makeCtx();
+    const result = await budgetCommand.exec(['steps', '120'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(ctx.baseConfig.budget?.maxSteps).toBe(120);
+    expect(result.notes?.[0]).toContain('120');
+    expect(result.notes?.[0]).toContain('next turn');
+  });
+
+  test('/budget steps rejects non-positive integers', async () => {
+    for (const bad of ['0', '-5', 'abc', '3.5', '']) {
+      const ctx = makeCtx();
+      const result = await budgetCommand.exec(['steps', bad], ctx);
+      expect(result.kind).toBe('error');
+      // Original maxSteps untouched.
+      expect(ctx.baseConfig.budget?.maxSteps).not.toBe(0);
+    }
+  });
+
+  test('/budget steps requires exactly one value', async () => {
+    expect((await budgetCommand.exec(['steps'], makeCtx())).kind).toBe('error');
+    expect((await budgetCommand.exec(['steps', '1', '2'], makeCtx())).kind).toBe('error');
+  });
+
+  test('/budget cost X.XX updates maxCostUsd', async () => {
+    const ctx = makeCtx();
+    const result = await budgetCommand.exec(['cost', '5.50'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(ctx.baseConfig.budget?.maxCostUsd).toBeCloseTo(5.5);
+    expect(result.notes?.[0]).toContain('next turn');
+  });
+
+  test('/budget cost 0 is allowed (no-spend mode)', async () => {
+    const ctx = makeCtx();
+    const result = await budgetCommand.exec(['cost', '0'], ctx);
+    expect(result.kind).toBe('ok');
+    expect(ctx.baseConfig.budget?.maxCostUsd).toBe(0);
+  });
+
+  test('/budget cost none clears the cap entirely', async () => {
+    const ctx = makeCtx();
+    // Seed a cap first so the clear has something to remove.
+    await budgetCommand.exec(['cost', '5'], ctx);
+    expect(ctx.baseConfig.budget?.maxCostUsd).toBe(5);
+    const result = await budgetCommand.exec(['cost', 'none'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(ctx.baseConfig.budget?.maxCostUsd).toBeUndefined();
+    expect(result.notes?.[0]).toContain('no cap');
+  });
+
+  test('/budget cost off is an alias for none', async () => {
+    const ctx = makeCtx();
+    await budgetCommand.exec(['cost', '5'], ctx);
+    const result = await budgetCommand.exec(['cost', 'OFF'], ctx);
+    expect(result.kind).toBe('ok');
+    expect(ctx.baseConfig.budget?.maxCostUsd).toBeUndefined();
+  });
+
+  test('/budget cost rejects negatives and NaN', async () => {
+    for (const bad of ['-1', 'abc', '1.2.3', '']) {
+      const ctx = makeCtx();
+      const result = await budgetCommand.exec(['cost', bad], ctx);
+      expect(result.kind).toBe('error');
+    }
+  });
+
+  test('/budget with unknown subcommand returns error', async () => {
+    const result = await budgetCommand.exec(['wallclock', '60000'], makeCtx());
     expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('unknown subcommand');
+  });
+
+  test('/budget steps idempotent: same value returns "already" without next-turn cue', async () => {
+    const ctx = makeCtx();
+    await budgetCommand.exec(['steps', '50'], ctx);
+    const result = await budgetCommand.exec(['steps', '50'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(result.notes?.[0]).toContain('already');
+    expect(result.notes?.[0]).not.toContain('next turn');
+  });
+
+  test('/budget cost idempotent: same value returns "already"', async () => {
+    const ctx = makeCtx();
+    await budgetCommand.exec(['cost', '5'], ctx);
+    const result = await budgetCommand.exec(['cost', '5'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(result.notes?.[0]).toContain('already');
+  });
+
+  test('/budget cost none idempotent when already uncapped', async () => {
+    const ctx = makeCtx();
+    // baseConfig starts without maxCostUsd in DEFAULT_BUDGET.
+    const result = await budgetCommand.exec(['cost', 'none'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(result.notes?.[0]).toContain('already uncapped');
+  });
+
+  test('/budget mutations append current-turn cue when a turn is running', async () => {
+    const ctx = makeCtx({ isRunning: () => true });
+    const result = await budgetCommand.exec(['steps', '120'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(result.notes?.length).toBe(2);
+    expect(result.notes?.[1]).toContain('current turn');
+  });
+
+  test('/budget mutations preserve unrelated cap fields', async () => {
+    const ctx = makeCtx();
+    // Seed two distinct fields, mutate one, assert the other survived.
+    await budgetCommand.exec(['steps', '50'], ctx);
+    await budgetCommand.exec(['cost', '2.0'], ctx);
+    expect(ctx.baseConfig.budget?.maxSteps).toBe(50);
+    expect(ctx.baseConfig.budget?.maxCostUsd).toBe(2.0);
+    await budgetCommand.exec(['cost', 'none'], ctx);
+    expect(ctx.baseConfig.budget?.maxSteps).toBe(50);
+    expect(ctx.baseConfig.budget?.maxCostUsd).toBeUndefined();
   });
 });

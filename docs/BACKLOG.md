@@ -15,6 +15,35 @@ Format:
 
 ---
 
+## [2026-05-03] M1 / Step 1.f.7 — Mutation slash commands (/plan, /budget)
+
+Closes a gap deferred from 1.f.1: `/plan on`, `/plan off`, `/budget steps N`, `/budget cost X`. The infrastructure (parser, registry, dispatcher, autocomplete UI) was complete in 1.f.1 with mutation paths intentionally rejecting; this slice fills them in. `/model <id>` stays deferred — re-resolving the provider mid-session is structurally heavier (key check, capability re-init, cost-table re-load) and warrants its own slice.
+
+Mutation lands in `baseConfig` (the harness config the REPL bootstraps with) and takes effect on the NEXT turn. The current turn (if any) already snapshot its config when `startTurn` ran; live cancellation for a config flip would surprise the operator. Confirmation note makes timing explicit.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/cli/slash/commands/plan.ts` | NEW `/plan on` and `/plan off` paths. Read-only `/plan` preserved. Idempotent: `/plan on` when already enabled returns "already enabled" without the next-turn cue (so the operator doesn't see a misleading "takes effect" message for a no-op). Unknown args ('/plan maybe') and too-many-args paths return error. |
+| `src/cli/slash/commands/budget.ts` | NEW `/budget steps <N>` (positive integer cap on maxSteps) and `/budget cost <USD\|none\|off>` (positive decimal cap on maxCostUsd; `none`/`off` clears the cap entirely). Both subcommands validate the value with explicit regex (rejects negatives, NaN, decimals for steps, multiple decimal points, empty string). Other budget fields (maxWallClockMs, maxToolErrors) stay non-tunable from the slash surface — they're internal safety budgets, not operator UX. |
+| `tests/cli/slash/commands.test.ts` | The pre-existing "rejects mutation args" tests for /plan and /budget were now wrong (those paths succeed). Replaced with the new positive + negative coverage: 6 tests for /plan (read disabled / read enabled / on flips / off flips / on idempotent / unknown arg / too many args), 11 tests for /budget (read shape / no cap render / steps positive / steps negative cases / steps arity / cost positive / cost zero allowed / cost none clears / cost off alias / cost negative+NaN / unknown subcommand / partial mutations preserve unrelated fields). |
+
+**Decisions:**
+
+- **D160 — Mutation lands in baseConfig; current turn unaffected.** Considered (a) injecting the mutation into the in-flight HarnessConfig snapshot, or (b) rejecting the command while a turn is running, or (c) the chosen path: mutate baseConfig in place, take effect next turn. (a) was rejected because the harness loop reads its config exactly once at startup and reflects changes inconsistently mid-step (provider params already snapshotted, budget gates already evaluated). (b) was rejected because operator UX of "wait for the turn to finish before reconfiguring" is annoying — operators frequently queue up `/plan on` while a long turn is running so the next prompt picks it up. (c) is the simplest: mutation is an immediate state change on the shared config object, applied at the next startTurn boundary. The confirmation note tells the operator when to expect the change.
+- **D161 — `/budget cost 0` is a valid "no spend" mode.** A literal-zero cap means "the first paid turn trips the gate". Different from `none` (no cap at all). `none` is the operator saying "stop enforcing"; `0` is the operator saying "stop spending". Tested explicitly to prevent a future "treat 0 as falsy" regression that would silently widen the cap.
+- **D162 — `/budget cost none` deletes the field rather than setting `undefined`.** RunBudget's `maxCostUsd?: number` treats `undefined` as "no cap" via the docstring contract. `delete` preserves boot-time absence semantics — diff tools and JSON serializers treat absent vs `undefined` differently, and the harness's spread-merge could reintroduce the key in a future refactor. Object destructuring + spread idiom (`{ maxCostUsd: _drop, ...rest }`) keeps the mutation cheap and explicit.
+- **D163 — Footer drift on `/plan` is acceptable.** `state.status.planMode` reflects the last `session_start` event payload, not `baseConfig` directly. Operator types `/plan on` and sees the confirmation note, but the footer's `plan` token doesn't appear until the next turn's `session_start` fires. The next-turn note in the confirmation makes this explicit. Future polish: a synthetic `session:status:update` event could refresh the footer immediately, but that's a UIEvent shape addition and a separate slice.
+- **D164 — Idempotency aligned across `/plan` and `/budget` (post-review).** Initial cut had `/plan` short-circuit on no-op (returns "already" without the next-turn cue) but `/budget steps 50` and `/budget cost 5` always wrote and always announced "next turn" — even on no-op repeats. Inconsistent UX: operator who repeats a budget command thinks something changed. Both subcommands now check `current === requested` and return "already X (no change)" without the next-turn cue, matching `/plan`. `cost none` also gets the idempotent path when the cap is already absent.
+- **D165 — `isRunning` cue when mutating mid-turn (post-review).** D160 chose "mutation lands now, takes effect next turn" but the confirmation note was the same regardless of whether a turn was actually running. Operator mutating `/budget cost 1` while a turn that's about to spend $50 is mid-execution had no cue that the in-flight prompt ignores the new cap. SlashContext gained `isRunning: () => boolean` (closure over the REPL's `running` flag, fresh per call). Mutation commands append `(current turn already snapshot its config; new value applies starting next prompt)` to the notes when running. Idle path stays single-line.
+
+**Pending:** `/model <id>` mutation (separate slice — provider re-resolution); subagent observability (1.f.2, blocked on IPC); end-to-end audit with a real provider before locking M1.
+
+**Next:** end-to-end audit with a real provider, OR the IPC subsystem that unblocks 1.f.2 + D159, OR `/model` mutation.
+
+---
+
 ## [2026-05-03] M1 / Step 1.g.1 — Hard-abort cooperative semantics
 
 Closes D141: until now, the footer's "esc again to force" cue was lying. Spec UI.md §3 distinguishes:

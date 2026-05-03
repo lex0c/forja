@@ -325,6 +325,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     cumulative,
     now,
     requestShutdown,
+    // Closure over the REPL's `running` flag — fresh read per call so
+    // a slash command queued before a turn starts but executed after
+    // observes the post-startTurn state.
+    isRunning: () => running,
   };
 
   // Tracks whether the popover is currently open. Local to the REPL
