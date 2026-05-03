@@ -35,8 +35,17 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
   switch (item.kind) {
     case 'session-header':
       return [`── session ${item.sessionId} · ${item.profile} · ${item.model} ──`];
-    case 'session-footer':
-      return [`── session end · ${item.reason} ──`];
+    case 'session-footer': {
+      // 1.g.3 closes D171: when the run aborted, append the cause
+      // discriminator so the operator sees `aborted (soft)` vs
+      // `aborted (hard)` in scrollback. The producer guarantees
+      // abortCause is only set when reason === 'aborted', but the
+      // render branches defensively on both — a stray abortCause on
+      // a non-abort reason shouldn't render misleading text.
+      const cause =
+        item.reason === 'aborted' && item.abortCause !== undefined ? ` (${item.abortCause})` : '';
+      return [`── session end · ${item.reason}${cause} ──`];
+    }
     case 'session-banner': {
       // UI.md §4.10.9. Title bold, model/cwd/env dim. Empty env →
       // skip the line (producer signal of "nothing to summarize",

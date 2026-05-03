@@ -71,6 +71,34 @@ describe('session lifecycle', () => {
     expect(r.permanent).toEqual([{ kind: 'session-footer', reason: 'done' }]);
   });
 
+  test('session:end with abortCause threads it onto the footer item (1.g.3)', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'session:end',
+      ts: 2,
+      sessionId: 's1',
+      reason: 'aborted',
+      abortCause: 'hard',
+    });
+    expect(r.permanent).toEqual([
+      { kind: 'session-footer', reason: 'aborted', abortCause: 'hard' },
+    ]);
+  });
+
+  test('session:end without abortCause omits the field (no synthetic value)', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'session:end',
+      ts: 2,
+      sessionId: 's1',
+      reason: 'done',
+    });
+    expect(r.permanent).toEqual([{ kind: 'session-footer', reason: 'done' }]);
+    // Type-level: assert the abortCause key is absent (not just undefined).
+    const item = r.permanent[0];
+    if (item?.kind === 'session-footer') {
+      expect('abortCause' in item).toBe(false);
+    }
+  });
+
   test('session:banner emits a session-banner permanent without mutating LiveState', () => {
     const initial = createInitialState();
     const r = applyEvent(initial, {

@@ -244,7 +244,7 @@ export type PermanentItem =
       project: string;
       model: string;
     }
-  | { kind: 'session-footer'; reason: string }
+  | { kind: 'session-footer'; reason: string; abortCause?: 'soft' | 'hard' }
   | {
       kind: 'session-banner';
       app: string;
@@ -377,7 +377,13 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
           bgProcesses: new Map(),
           ended: true,
         },
-        permanent: [{ kind: 'session-footer', reason: event.reason }],
+        permanent: [
+          {
+            kind: 'session-footer',
+            reason: event.reason,
+            ...(event.abortCause !== undefined ? { abortCause: event.abortCause } : {}),
+          },
+        ],
       };
 
     case 'session:banner':

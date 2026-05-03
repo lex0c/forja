@@ -31,6 +31,24 @@ describe('formatPermanent', () => {
     ]);
   });
 
+  test('session-footer with abortCause appends the discriminator (1.g.3)', () => {
+    expect(
+      formatPermanent({ kind: 'session-footer', reason: 'aborted', abortCause: 'soft' }, ascii),
+    ).toEqual(['── session end · aborted (soft) ──']);
+    expect(
+      formatPermanent({ kind: 'session-footer', reason: 'aborted', abortCause: 'hard' }, ascii),
+    ).toEqual(['── session end · aborted (hard) ──']);
+  });
+
+  test('session-footer abortCause on a non-abort reason is dropped (defensive)', () => {
+    // Producer guarantees abortCause is only set when reason==='aborted',
+    // but the renderer doesn't trust that — a mis-routed combination
+    // shouldn't render misleading text like `done (soft)`.
+    expect(
+      formatPermanent({ kind: 'session-footer', reason: 'done', abortCause: 'soft' }, ascii),
+    ).toEqual(['── session end · done ──']);
+  });
+
   describe('session-banner', () => {
     const baseBanner = {
       kind: 'session-banner' as const,

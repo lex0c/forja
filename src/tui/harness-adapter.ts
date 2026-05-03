@@ -478,6 +478,11 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           ts,
           sessionId: r.sessionId,
           reason: mapped,
+          // Pass-through abortCause when the harness produced one
+          // (1.g.3 closes D171). Meaningful only when reason ==='aborted'
+          // — the harness's finish() helper guarantees this invariant
+          // by setting abortCause exclusively on the abort path.
+          ...(r.abortCause !== undefined ? { abortCause: r.abortCause } : {}),
         });
         return out;
       }

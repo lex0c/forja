@@ -15,6 +15,36 @@ Format:
 
 ---
 
+## [2026-05-03] M1 / Step 1.g.3 — Surface abortCause through the UIEvent chain (closes D171)
+
+Closes D171 — the gap 1.g.2 left open. The discriminator landed on `HarnessResult` and persisted to SQLite, but every consumer downstream of the harness (TUI, NDJSON output, hooks) lost it: `mapExitReason` collapsed soft and hard into the same `session:end reason='aborted'`. This slice threads `abortCause` through `SessionEndEvent` → reducer → permanent → `formatPermanent`, surfacing the discriminator in the scrollback footer and on the bus for any future consumer.
+
+Operator-visible result: a soft-aborted run prints `── session end · aborted (soft) ──`; a hard one prints `── session end · aborted (hard) ──`. NDJSON consumers see `{"type":"session:end","reason":"aborted","abortCause":"soft"}`. Non-abort exits (done, maxSteps, error) don't carry the field at all — the discriminator is meaningless in those cases.
+
+**Done:**
+
+| File | Purpose |
+|---|---|
+| `src/tui/events.ts` | `SessionEndEvent.abortCause?: 'soft' \| 'hard'` (optional). Mirrors `HarnessResult.abortCause` shape exactly so the adapter pass-through is structurally trivial. |
+| `src/tui/harness-adapter.ts` | `session_finished` translation now reads `result.abortCause` and conditionally spreads it onto the emitted `session:end` (only when defined — preserves the pre-1.g.3 absence semantics for runs that didn't carry one). |
+| `src/tui/state.ts` | `PermanentItem.session-footer` gains optional `abortCause`. Reducer's `session:end` branch threads it from the event onto the permanent record. Conditional spread (not always-present-as-undefined) so consumers that assert on the permanent shape see absence == absence. |
+| `src/tui/render/permanent.ts` | `session-footer` branch appends `(soft)` or `(hard)` to the rendered reason when `reason === 'aborted' && abortCause !== undefined`. Defensive both-conditions check: a stray `abortCause` on a non-abort reason is dropped (renderer doesn't trust the producer's invariant; misleading text would be worse than silent drop). |
+| `tests/tui/harness-adapter.test.ts` | NEW 2 tests: `session_finished` with `abortCause` threads it onto `session:end`; without `abortCause` the field is omitted entirely (no synthetic value). |
+| `tests/tui/state.test.ts` | NEW 2 tests: `session:end` with `abortCause` threads onto the permanent; without it the key is absent from the record (asserted via `'abortCause' in item` so a future regression that adds `undefined` instead of omitting fails). |
+| `tests/tui/render/permanent.test.ts` | NEW 2 tests: `session-footer` with `abortCause: 'soft'` / `'hard'` renders the discriminator inline; with `abortCause` on a non-abort reason the discriminator is dropped (defensive renderer). |
+
+**Decisions:**
+
+- **D173 — Field name parity across all four layers (`HarnessResult` → `HarnessEvent.session_finished.result` → `UIEvent.session:end` → `PermanentItem.session-footer`).** Considered renaming on the way out (e.g., `cause`, `interrupt_kind`) for shorter UIEvent payloads. Rejected — the mental model is "this is the same discriminator, just at different levels of the consumer pipeline". One name keeps the trace from operator action to scrollback line short enough to grep. The cost is one slightly-longer field name in serialized output; the benefit is no translation table to remember.
+- **D174 — Defensive renderer drops `abortCause` on non-abort reasons.** The producer (`finish()` in the harness loop) guarantees `abortCause` is only set when `reason === 'aborted'`, but the renderer doesn't trust that. A future producer regression (or a hand-crafted PermanentItem in a test) that sets `abortCause: 'soft', reason: 'done'` would render `done (soft)` — confusing and wrong. The renderer's conditional check (`reason === 'aborted' && abortCause !== undefined`) belongs there because the renderer is the last line of defense before the operator's eyes.
+- **D175 — Conditional spread, not unconditional `undefined`.** Adapter and reducer use `...(abortCause !== undefined ? { abortCause } : {})` rather than `abortCause`. Two reasons: (a) tests assert the key is absent (not just `undefined`) on non-abort paths via `'abortCause' in item`, catching a regression where a producer started always-emitting the key; (b) JSON serialization treats absent and undefined identically but consumer-side `Object.keys` and Object.entries differ. The conditional spread keeps the wire format minimal for non-abort cases.
+
+**Pending:** `/model <id>` mutation; subagent observability (1.f.2, blocked on IPC); end-to-end audit with a real provider.
+
+**Next:** end-to-end audit with a real provider, OR `/model` mutation, OR the IPC subsystem.
+
+---
+
 ## [2026-05-03] M1 / Step 1.g.2 — Audit cause discriminator (HarnessResult.abortCause)
 
 Closes D157. Until now, `HarnessResult.reason === 'aborted'` was the only signal an audit consumer had — soft and hard interrupts produced structurally identical results. Operator that hit Esc once vs Esc-Esc looked the same in audit, telemetry, and any future replay tooling.

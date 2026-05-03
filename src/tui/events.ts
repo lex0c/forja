@@ -58,6 +58,14 @@ export type SessionEndEvent = BaseEvent & {
   type: 'session:end';
   sessionId: string;
   reason: 'done' | 'maxSteps' | 'maxCostUsd' | 'aborted' | 'error' | string;
+  // Mirrors HarnessResult.abortCause (1.g.2). Only meaningful when
+  // reason === 'aborted' — discriminates operator-initiated cooperative
+  // ('soft') from preemptive ('hard'). NDJSON consumers and the
+  // scrollback footer use this to distinguish "operator nudged" from
+  // "operator escalated"; the in-flight footer cue (`esc to interrupt`
+  // → `esc again to force`) was the live signal, this is its
+  // post-session counterpart.
+  abortCause?: 'soft' | 'hard';
 };
 
 // User input was submitted. Renderer flushes the input box and

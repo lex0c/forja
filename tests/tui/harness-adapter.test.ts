@@ -117,6 +117,48 @@ describe('harness-adapter — session lifecycle', () => {
     expect(end.reason).toBe('error');
   });
 
+  test('session_finished with abortCause threads it onto session:end (1.g.3)', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const result: HarnessResult = {
+      status: 'interrupted',
+      reason: 'aborted',
+      sessionId: 'sess-3',
+      steps: 2,
+      durationMs: 50,
+      usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+      costUsd: 0,
+      usageComplete: true,
+      abortCause: 'soft',
+    };
+    const out = a.translate({ type: 'session_finished', result });
+    const end = out.find((e) => e.type === 'session:end') as Extract<
+      UIEvent,
+      { type: 'session:end' }
+    >;
+    expect(end.reason).toBe('aborted');
+    expect(end.abortCause).toBe('soft');
+  });
+
+  test('session_finished without abortCause omits the field (no synthetic value)', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const result: HarnessResult = {
+      status: 'done',
+      reason: 'done',
+      sessionId: 'sess-4',
+      steps: 1,
+      durationMs: 10,
+      usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+      costUsd: 0,
+      usageComplete: true,
+    };
+    const out = a.translate({ type: 'session_finished', result });
+    const end = out.find((e) => e.type === 'session:end') as Extract<
+      UIEvent,
+      { type: 'session:end' }
+    >;
+    expect(end.abortCause).toBeUndefined();
+  });
+
   test('session_finished closes a stranded streaming assistant', () => {
     const a = createHarnessAdapter(baseCtx());
     a.translate({
