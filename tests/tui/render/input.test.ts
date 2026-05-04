@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { renderInput } from '../../../src/tui/render/input.ts';
-import type { Capabilities } from '../../../src/tui/term.ts';
+import { CSI, type Capabilities } from '../../../src/tui/term.ts';
 
 const caps: Capabilities = {
   isTTY: true,
@@ -9,6 +9,7 @@ const caps: Capabilities = {
   color: 'none',
   unicode: true,
 };
+const colored: Capabilities = { ...caps, color: 'basic' };
 
 describe('renderInput', () => {
   test('empty input shows just the prompt prefix', () => {
@@ -53,5 +54,25 @@ describe('renderInput', () => {
     expect(out[0]).toBe('> aaaaaaa');
     // Second sub-row carries the full emoji intact.
     expect(out[1]).toBe('  😀b');
+  });
+
+  test('dimmed: every row wraps with dim SGR (HISTORY.md §2.2)', () => {
+    const out = renderInput({ value: 'first\nsecond', cursor: 0 }, colored, { dimmed: true });
+    expect(out).toHaveLength(2);
+    // Each row carries the dim CSI escape AND the SGR reset.
+    for (const row of out) {
+      expect(row).toContain(`${CSI}2m`);
+      expect(row).toContain(`${CSI}0m`);
+    }
+  });
+
+  test('dimmed: under color=none, paint is a no-op (no SGR escapes leak)', () => {
+    const out = renderInput({ value: 'x', cursor: 1 }, caps, { dimmed: true });
+    expect(out).toEqual(['> x']);
+  });
+
+  test('non-dimmed (default) emits no SGR even with color enabled', () => {
+    const out = renderInput({ value: 'x', cursor: 1 }, colored);
+    expect(out[0]).not.toContain(`${CSI}2m`);
   });
 });

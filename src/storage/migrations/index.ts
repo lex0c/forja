@@ -15,6 +15,7 @@ import { migration014SubagentOutputs } from './014-subagent-outputs.ts';
 import { migration015SubagentRunsPolicy } from './015-subagent-runs-policy.ts';
 import { migration016MemoryEvents } from './016-memory-events.ts';
 import { migration017SessionsAbortCause } from './017-sessions-abort-cause.ts';
+import { migration018ReplHistory } from './018-repl-history.ts';
 
 export interface Migration {
   id: number;
@@ -40,4 +41,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration015SubagentRunsPolicy,
   migration016MemoryEvents,
   migration017SessionsAbortCause,
+  migration018ReplHistory,
 ];

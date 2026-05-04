@@ -8,6 +8,8 @@ import type { BootstrapResult } from '../../src/cli/bootstrap.ts';
 import { runRepl } from '../../src/cli/repl.ts';
 import type { HarnessConfig, HarnessEvent, HarnessResult } from '../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
+import { openMemoryDb } from '../../src/storage/db.ts';
+import { migrate } from '../../src/storage/migrate.ts';
 import { addTrustedDir, loadTrustedDirs } from '../../src/trust/index.ts';
 
 // Build a ParsedArgs shape with all the flags the REPL inspects set
@@ -48,11 +50,13 @@ const makeStdin = (): NodeJS.ReadStream & { feed: (s: string) => void } => {
 // Stub the heavy bits bootstrap normally constructs. The REPL touches
 // `config`, `db.close`, `modelId`, `lockConflicts`, `subagents`, plus
 // `config.provider.capabilities` and `config.enableCheckpoints` for
-// the boot banner. The harness override means runAgent never reads
-// anything else, so a hollow config object is enough.
+// the boot banner. `db` is a real migrated in-memory SQLite handle so
+// boot-time loadHistory and submit-time appendHistory work; the
+// harness override means runAgent never touches messages/tool_calls,
+// so the rest of the config object can stay hollow.
 const makeBootstrapStub = (cwd = '/tmp/forja-repl-test'): BootstrapResult => {
-  const noop = (): void => undefined;
-  const fakeDb = { close: noop } as unknown as BootstrapResult['db'];
+  const realDb = openMemoryDb();
+  migrate(realDb);
   const config = {
     cwd,
     userPrompt: '',
@@ -65,7 +69,7 @@ const makeBootstrapStub = (cwd = '/tmp/forja-repl-test'): BootstrapResult => {
   } as unknown as HarnessConfig;
   return {
     config,
-    db: fakeDb,
+    db: realDb,
     modelId: 'mock/m',
     policyLayers: [],
     lockConflicts: [],

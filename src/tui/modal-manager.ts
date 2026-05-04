@@ -64,11 +64,31 @@ export interface TrustAskArgs {
 
 export type TrustAnswer = 'yes' | 'no' | 'cancel';
 
+// History-clear flavor (HISTORY.md §2.3 `/history clear` modal).
+// `yes` = clear only, `yes-disable` = clear + write the
+// `.agent/no-history` marker (permanent per-project opt-out), `no` =
+// reject explicitly, `cancel` = closed via Esc / timeout. The
+// dispatcher is the place that distinguishes 'no' vs 'cancel' for
+// audit; for history specifically both are no-ops on disk.
+export interface HistoryClearAskArgs {
+  entryCount: number;
+  projectRoot: string;
+}
+export type HistoryClearAnswer = 'yes' | 'yes-disable' | 'no' | 'cancel';
+
 // Trust flavor's option list. Kept in sync with the reducer's
 // `trust:ask` ConfirmState construction in state.ts.
 const TRUST_OPTIONS: readonly ConfirmOption[] = [
   { key: '1', label: 'Yes, I trust this folder', value: 'yes' },
   { key: '2', label: 'No, exit', value: 'no' },
+];
+
+// History-clear flavor (HISTORY.md §2.3). Kept in sync with the
+// reducer's `history-clear:ask` ConfirmState construction.
+const HISTORY_CLEAR_OPTIONS: readonly ConfirmOption[] = [
+  { key: '1', label: 'Yes, wipe', value: 'yes' },
+  { key: '2', label: 'Yes, wipe and disable persistence', value: 'yes-disable' },
+  { key: '3', label: 'No', value: 'no' },
 ];
 
 // Permission flavor's option list, kept in sync with the reducer's
@@ -97,6 +117,12 @@ export interface ModalManager {
   // §9.1 calls for a 5-minute timeout that defaults to read-only —
   // we forward that via `opts.timeoutMs` so the producer decides.
   askTrust: (args: TrustAskArgs, opts?: ConfirmAskOptions) => Promise<TrustAnswer>;
+  // History-clear flavor (HISTORY.md §2.3). Surfaces the entry count
+  // and project root so the modal can render blast radius up front.
+  askHistoryClear: (
+    args: HistoryClearAskArgs,
+    opts?: ConfirmAskOptions,
+  ) => Promise<HistoryClearAnswer>;
   // Number of pending modals (active + queued). Tests inspect.
   pendingCount: () => number;
   // Drop the queue and resolve any pending promise as `cancel`. Used
@@ -338,6 +364,18 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           agentsMd: args.agentsMd === true,
         }),
         TRUST_OPTIONS,
+        opts?.timeoutMs,
+      ),
+    askHistoryClear: (args, opts) =>
+      enqueueConfirm<HistoryClearAnswer>(
+        (promptId) => ({
+          type: 'history-clear:ask',
+          ts: now(),
+          promptId,
+          entryCount: args.entryCount,
+          projectRoot: args.projectRoot,
+        }),
+        HISTORY_CLEAR_OPTIONS,
         opts?.timeoutMs,
       ),
     pendingCount: () => (active !== null ? 1 : 0) + queue.length,

@@ -257,6 +257,23 @@ export type CritiqueAskEvent = BaseEvent & {
   issues: { severity: 'low' | 'medium' | 'high'; confidence: number; message: string }[];
 };
 
+// History wipe confirmation (HISTORY.md §2.3 `/history clear`). Three
+// options: Yes (clear) / Yes-and-disable (clear + write
+// `.agent/no-history`) / No. Default selection is the last (No),
+// matching the conservative-default convention used by every other
+// confirm flavor (D5/D65). `entryCount` lets the modal render the
+// blast radius up front ("wipe N entries permanently") so the
+// operator can't misclick into losing more than they meant to.
+export type HistoryClearAskEvent = BaseEvent & {
+  type: 'history-clear:ask';
+  promptId: string;
+  entryCount: number;
+  // Absolute path of the project whose history would be wiped —
+  // surfaced in the modal subject so an operator with multiple
+  // REPLs open can tell which one they're confirming against.
+  projectRoot: string;
+};
+
 // Todo list (live region above the operation chips, spec §4.3 / §4.10.6).
 // The full list is sent on every update — small enough that delta
 // tracking buys nothing, and the producer (TodoStore.set wrapper in
@@ -359,6 +376,30 @@ export type SlashUpdateEvent = BaseEvent & {
   selectedIdx: number;
 };
 
+// Reverse-search overlay open/update. Spec HISTORY.md §2.2. Producer
+// (REPL editor handler) emits on Ctrl+R (open / cycle), keystroke (re-
+// search with the new query), or backspace (re-search with shorter
+// query). Renderer mirrors the payload onto state.reverseSearch.
+//
+// `selectedIdx === -1` is the no-match shape — the line still renders
+// with the typed query but appends `<empty>`. Closing the overlay is
+// a separate event so producers don't need a sentinel shape.
+export type ReverseSearchUpdateEvent = BaseEvent & {
+  type: 'reverse-search:update';
+  query: string;
+  results: string[];
+  selectedIdx: number;
+};
+
+// Reverse-search overlay close. Producer emits on Esc (cancel),
+// Enter (accept + submit), or Tab (accept-to-edit). The reducer just
+// drops state.reverseSearch — buffer mutation / submit are separate
+// `input:update` / `user:submit` events the producer emits before
+// closing.
+export type ReverseSearchCloseEvent = BaseEvent & {
+  type: 'reverse-search:close';
+};
+
 // Informational scrollback line. Spec UI.md §6.1 — not an error,
 // not a warning; just plain output the renderer should not paint
 // in any alarm color. Slash command output (/help, /sessions,
@@ -429,6 +470,7 @@ export type UIEvent =
   | MemoryWriteAskEvent
   | PlanReviewEvent
   | CritiqueAskEvent
+  | HistoryClearAskEvent
   | TodoUpdateEvent
   | SubagentStartEvent
   | SubagentUpdateEvent
@@ -440,6 +482,8 @@ export type UIEvent =
   | CheckpointCreateEvent
   | ScreenClearEvent
   | SlashUpdateEvent
+  | ReverseSearchUpdateEvent
+  | ReverseSearchCloseEvent
   | InfoEvent
   | ErrorEvent
   | WarnEvent

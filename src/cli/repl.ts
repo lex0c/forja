@@ -24,6 +24,12 @@ import { basename, join } from 'node:path';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
 import { DEFAULT_BUDGET } from '../harness/types.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
+import {
+  appendHistory,
+  historyOptOutReason,
+  loadHistory,
+  searchHistory,
+} from '../storage/history.ts';
 import { addTrustedDir, isTrusted, trustListPath } from '../trust/index.ts';
 import {
   type FocusHandler,
@@ -43,6 +49,7 @@ import {
 } from '../tui/index.ts';
 import type { ParsedArgs } from './args.ts';
 import { type BootstrapInput, type BootstrapResult, bootstrap } from './bootstrap.ts';
+import { maybeEmitHistoryBanner } from './history-banner.ts';
 import {
   type SlashContext,
   createBuiltinRegistry,
@@ -434,6 +441,135 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // above the trust prompt — see "Pre-bootstrap stack" earlier in
   // this function.
   let lastSessionId: string | null = null;
+
+  // ─── Input history (HISTORY.md §2.1) ───────────────────────────────
+  // In-memory mirror of repl_history for the current project, oldest-
+  // first. Loaded once at boot — concurrent REPLs in the same project
+  // won't see each other's appends until the next reopen (spec §1.4
+  // visibility lag is explicit).
+  //
+  //   historyIdx === null    → operator is editing the live buffer
+  //   historyIdx >= 0        → operator is recalling; index points
+  //                            into historyEntries (entries[idx] is on
+  //                            screen). ↑ decrements, ↓ increments;
+  //                            stepping past entries.length-1 restores
+  //                            scratch and goes back to null.
+  //
+  // historyEnabled mirrors `/history off` / `/history on` — session-
+  // volatile (HISTORY.md §3.3 level 3); permanent disable lives in
+  // env / file marker, both honored inside storage/history.ts.
+  let historyEntries: string[] = loadHistory(db, baseConfig.cwd);
+  let historyIdx: number | null = null;
+  let historyScratch: string | null = null;
+  // Seed `historyEnabled` from the storage-level opt-out so the
+  // REPL flag agrees with what storage will actually accept. With
+  // `FORJA_NO_HISTORY=1` or `.agent/no-history` set, `appendHistory`
+  // already no-ops; without this seed the flag would say "on" while
+  // every submit silently dropped, leaving the in-memory mirror
+  // and the table out of sync. `/history on` re-checks this on
+  // attempted re-enable so the operator can't override env.
+  let historyEnabled = historyOptOutReason(baseConfig.cwd) === null;
+
+  const recordHistorySubmit = (text: string): void => {
+    // Reset nav state regardless of persistence — next ↑ should walk
+    // from the newest entry even if the operator just toggled
+    // /history off, otherwise the scratch from a prior recall would
+    // resurface unexpectedly on the next press.
+    historyIdx = null;
+    historyScratch = null;
+    if (!historyEnabled) return;
+    // Mirror the dup-of-last suppression that storage applies, so the
+    // in-memory array stays consistent with the table without a
+    // re-load. (storage's `appendHistory` is the source of truth on
+    // disk; this just keeps recall responsive.) Empty text never
+    // reaches this path — applyKey gates submit on `value === ''`
+    // and the slash dispatcher gates on parsed.name === '' — so we
+    // don't defend against it here.
+    if (historyEntries[historyEntries.length - 1] !== text) {
+      historyEntries.push(text);
+    }
+    appendHistory(db, baseConfig.cwd, text);
+  };
+
+  // ─── Reverse-search overlay (HISTORY.md §2.2) ──────────────────────
+  // Local state mirrors the renderer's view so the editor handler
+  // doesn't have to read it back via renderer.state(). Producer-side
+  // truth: the operator types into this query, every keystroke
+  // re-runs searchHistory against the project's table; Ctrl+R while
+  // open cycles to older matches with the same query.
+  //
+  // Cap match list at 200 — operator scrolls via Ctrl+R, which means
+  // visiting more than ~10 entries is rare; 200 is generous enough
+  // to cover heavy typists without keeping a 10k-row mirror in JS
+  // for every keystroke.
+  const REVERSE_SEARCH_LIMIT = 200;
+  let reverseSearchQuery: string | null = null;
+  let reverseSearchResults: string[] = [];
+  let reverseSearchIdx = -1;
+
+  const isReverseSearchOpen = (): boolean => reverseSearchQuery !== null;
+
+  // Sanitize a query before it lands in state. The overlay renders as
+  // a single visual row (HISTORY.md §2.2); embedded newlines from a
+  // multi-line paste would otherwise spill into multiple rows and
+  // break the live region's row accounting. Collapse `\r?\n` → space,
+  // matching the same treatment we apply to recalled multi-line
+  // matches in render/reverse-search.ts.
+  const sanitizeReverseSearchQuery = (raw: string): string => raw.replace(/\r?\n/g, ' ');
+
+  const refreshReverseSearch = (query: string): void => {
+    const clean = sanitizeReverseSearchQuery(query);
+    reverseSearchQuery = clean;
+    reverseSearchResults =
+      clean === '' ? [] : searchHistory(db, baseConfig.cwd, clean, REVERSE_SEARCH_LIMIT);
+    reverseSearchIdx = reverseSearchResults.length > 0 ? 0 : -1;
+    bus.emit({
+      type: 'reverse-search:update',
+      ts: now(),
+      query: clean,
+      results: reverseSearchResults,
+      selectedIdx: reverseSearchIdx,
+    });
+  };
+
+  const openReverseSearch = (): void => {
+    if (isReverseSearchOpen()) return;
+    refreshReverseSearch('');
+  };
+
+  const closeReverseSearch = (): void => {
+    if (!isReverseSearchOpen()) return;
+    reverseSearchQuery = null;
+    reverseSearchResults = [];
+    reverseSearchIdx = -1;
+    bus.emit({ type: 'reverse-search:close', ts: now() });
+  };
+
+  const cycleReverseSearchOlder = (): void => {
+    if (!isReverseSearchOpen() || reverseSearchResults.length === 0) return;
+    // Clamp at the oldest match (last index). Ctrl+R past the bottom
+    // is a no-op rather than a wrap — bash beeps in this case; we
+    // just stop. Cycling past oldest would surprise an operator who
+    // expects "more presses → older".
+    if (reverseSearchIdx < reverseSearchResults.length - 1) {
+      reverseSearchIdx += 1;
+    }
+    bus.emit({
+      type: 'reverse-search:update',
+      ts: now(),
+      query: reverseSearchQuery ?? '',
+      results: reverseSearchResults,
+      selectedIdx: reverseSearchIdx,
+    });
+  };
+
+  // The match the operator is currently looking at, or null when the
+  // overlay has zero matches. Used by accept (Enter / Tab) to know
+  // what to drop into the input buffer.
+  const currentReverseSearchMatch = (): string | null => {
+    if (reverseSearchIdx < 0) return null;
+    return reverseSearchResults[reverseSearchIdx] ?? null;
+  };
   // Two controllers per turn (spec UI.md §3 soft/hard distinction):
   //   abortController     → hard, preempts in-flight work (mid-tool kill,
   //                         provider-stream cancel). Fires on second
@@ -753,6 +889,27 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // observes the post-startTurn state.
     isRunning: () => running,
     modelRegistry,
+    // History controls (HISTORY.md §2.3). `/history clear` calls
+    // `clearLocal` AFTER `clearHistory` against the db so the in-
+    // memory mirror used by ↑/↓ recall stays consistent — without
+    // this, a wipe followed by ↑ would surface entries from the
+    // pre-wipe mirror that no longer exist on disk.
+    history: {
+      isEnabled: () => historyEnabled,
+      setEnabled: (enabled) => {
+        historyEnabled = enabled;
+      },
+      clearLocal: () => {
+        historyEntries = [];
+        historyIdx = null;
+        historyScratch = null;
+      },
+      // Re-probe each call: a `yes-disable` from /history clear
+      // writes the file marker mid-session, which should immediately
+      // be visible to `/history on` even though the env never
+      // changes. Cheap (single existsSync against `.agent/no-history`).
+      optOutReason: () => historyOptOutReason(baseConfig.cwd),
+    },
   };
 
   // Tracks whether the popover is currently open. Local to the REPL
@@ -810,6 +967,123 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // keystroke after /quit / Ctrl+C doesn't slip through and start
     // a new turn.
     if (exiting) return true;
+
+    // Reverse-search overlay (HISTORY.md §2.2). When the overlay is
+    // open it owns the keyboard absolutely — the operator's draft
+    // buffer is preserved in `state.input` (rendered dim below the
+    // overlay) and only the search query mutates here. Mutually
+    // exclusive with slash mode at the producer level: openReverseSearch
+    // refuses while slashOpen is true, so we never hit both branches
+    // on the same keystroke.
+    if (isReverseSearchOpen()) {
+      // Ctrl+R while open: cycle to older matches with the same query.
+      if (key.kind === 'char' && key.ctrl && key.char === 'r') {
+        cycleReverseSearchOlder();
+        cancelExitArm();
+        return true;
+      }
+      if (key.kind === 'key') {
+        // Esc cancels: close overlay, leave buffer untouched (operator
+        // returns to whatever draft they had before opening Ctrl+R).
+        if (key.name === 'escape') {
+          closeReverseSearch();
+          cancelExitArm();
+          return true;
+        }
+        // Enter accepts: substitute buffer with the current match
+        // and submit. With no match, Enter is a no-op (won't submit
+        // an empty match; let the operator backspace and try again).
+        if (key.name === 'enter') {
+          const match = currentReverseSearchMatch();
+          if (match === null) return true;
+          if (running) {
+            // Mid-turn protection: same gate the normal Enter path
+            // honors (`!running`). Operator gets the recalled buffer
+            // staged but no submit until the turn ends.
+            bus.emit({ type: 'input:update', ts: now(), value: match, cursor: match.length });
+            closeReverseSearch();
+            return true;
+          }
+          bus.emit({ type: 'input:update', ts: now(), value: match, cursor: match.length });
+          bus.emit({ type: 'user:submit', ts: now(), text: match });
+          recordHistorySubmit(match);
+          closeReverseSearch();
+          startTurn(match);
+          cancelExitArm();
+          return true;
+        }
+        // Tab accepts to edit: substitute buffer, close overlay,
+        // cursor at end of recalled prompt. No submit — operator
+        // edits and presses Enter when ready.
+        if (key.name === 'tab') {
+          const match = currentReverseSearchMatch();
+          if (match !== null) {
+            bus.emit({ type: 'input:update', ts: now(), value: match, cursor: match.length });
+          }
+          closeReverseSearch();
+          cancelExitArm();
+          return true;
+        }
+        // Backspace shortens the query and re-runs the search.
+        if (key.name === 'backspace') {
+          const q = reverseSearchQuery ?? '';
+          refreshReverseSearch(q.slice(0, -1));
+          cancelExitArm();
+          return true;
+        }
+        // ↑ / ↓ inside the overlay: ignored. Spec §2.2 lists Ctrl+R
+        // as the only cycle key — arrows would conflict with the
+        // top-line / bottom-line semantics of the editor's history
+        // nav, and operators who want to walk the history outside a
+        // search query should Esc first.
+        if (key.name === 'up' || key.name === 'down') {
+          return true;
+        }
+        // Other named keys (left, right, home, end, delete, etc.)
+        // are swallowed too — none of them have meaningful semantics
+        // inside the overlay, and forwarding to the editor would
+        // mutate the (preserved) buffer, defeating the point of
+        // "draft preserved below".
+        return true;
+      }
+      // Printable chars (incl. Alt+letter, ignored modifiers): append
+      // to the query and re-search. We swallow Ctrl+letter combos
+      // OTHER than Ctrl+R so a stray Ctrl+W (delete word) doesn't
+      // accidentally mutate anything; operator can Esc to leave.
+      if (key.kind === 'char') {
+        if (key.ctrl) return true;
+        const q = reverseSearchQuery ?? '';
+        refreshReverseSearch(q + key.char);
+        cancelExitArm();
+        return true;
+      }
+      // Paste: append the pasted text wholesale and re-search.
+      if (key.kind === 'paste') {
+        const q = reverseSearchQuery ?? '';
+        refreshReverseSearch(q + key.text);
+        cancelExitArm();
+        return true;
+      }
+      return true;
+    }
+
+    // Ctrl+R outside the overlay opens it. Slash mode wins (operator
+    // typing a command shouldn't have Ctrl+R yanked away as an
+    // accidental side effect of a fresh history feature). Empty
+    // history short-circuits — opening an overlay against zero
+    // entries surfaces nothing to search.
+    if (
+      key.kind === 'char' &&
+      key.ctrl &&
+      key.char === 'r' &&
+      historyEnabled &&
+      historyEntries.length > 0 &&
+      renderer.state().slash === null
+    ) {
+      openReverseSearch();
+      cancelExitArm();
+      return true;
+    }
 
     // Slash mode intercepts navigation / Tab / Enter / Esc BEFORE
     // the editor sees them. Other keys (printables, backspace, etc.)
@@ -905,6 +1179,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // dispatcher disagrees).
         const resolvedName = resolveCommandName(parsed.name);
         bus.emit({ type: 'user:submit', ts: now(), text: val });
+        recordHistorySubmit(val);
         bus.emit({ type: 'slash:update', ts: now(), suggestions: [], selectedIdx: -1 });
         slashOpen = false;
         void dispatchSlash(
@@ -916,6 +1191,65 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     }
 
     const current = renderer.state().input;
+
+    // History navigation (HISTORY.md §2.1). Slash precedence is
+    // governed by `state.slash !== null` (live popover) per spec §2.1
+    // — handled in the slashState branch above. With slash mode off
+    // (or popover collapsed), ↑/↓ either walk history or move the
+    // cursor, depending on whether the cursor sits on the topmost
+    // (↑) / bottommost (↓) line of a multi-line buffer. Once we're
+    // already navigating history (`historyIdx !== null`), every ↑/↓
+    // stays in history mode until ↓ steps past the newest entry and
+    // restores the scratch buffer — operators who walked back several
+    // entries can keep walking without their column position in a
+    // recalled multi-line buffer accidentally redirecting the keys
+    // back into vertical cursor motion.
+    if (
+      historyEnabled &&
+      historyEntries.length > 0 &&
+      key.kind === 'key' &&
+      (key.name === 'up' || key.name === 'down')
+    ) {
+      const buf = current;
+      const navigatingHistory = historyIdx !== null;
+      const cursorAtTopLine = buf.value.slice(0, buf.cursor).indexOf('\n') === -1;
+
+      if (key.name === 'up' && (navigatingHistory || cursorAtTopLine)) {
+        if (historyIdx === null) {
+          historyScratch = buf.value;
+          historyIdx = historyEntries.length - 1;
+        } else if (historyIdx > 0) {
+          historyIdx -= 1;
+        }
+        // else: clamp at oldest (HISTORY.md §2.1 "Clamp no oldest").
+        const pick = historyEntries[historyIdx] ?? '';
+        bus.emit({ type: 'input:update', ts: now(), value: pick, cursor: pick.length });
+        cancelExitArm();
+        return true;
+      }
+
+      if (key.name === 'down' && navigatingHistory) {
+        const nextIdx = (historyIdx ?? 0) + 1;
+        if (nextIdx >= historyEntries.length) {
+          // Past newest → restore the live buffer the operator was
+          // typing before they started navigating.
+          historyIdx = null;
+          const restore = historyScratch ?? '';
+          historyScratch = null;
+          bus.emit({ type: 'input:update', ts: now(), value: restore, cursor: restore.length });
+        } else {
+          historyIdx = nextIdx;
+          const pick = historyEntries[nextIdx] ?? '';
+          bus.emit({ type: 'input:update', ts: now(), value: pick, cursor: pick.length });
+        }
+        cancelExitArm();
+        return true;
+      }
+      // ↓ on bottom line of the live buffer (not navigating) is a
+      // no-op for history but still useful for the editor (matches
+      // readline behavior — moves cursor to end of buffer). Fall
+      // through.
+    }
 
     // Footer's `? for help` cue (UI.md §4.10.6) needs to actually
     // do something. Pressing `?` with an empty buffer dispatches the
@@ -967,6 +1301,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // can hit Enter again once the turn ends.
     if (result.submit !== undefined && !running) {
       bus.emit({ type: 'user:submit', ts: now(), text: result.submit.text });
+      recordHistorySubmit(result.submit.text);
       startTurn(result.submit.text);
     }
 
@@ -1108,6 +1443,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         "no permission policy found — strict default-deny is active. Create '.agent/permissions.yaml' or run /perms to inspect.",
     });
   }
+
+  // History first-run privacy banner (HISTORY.md §3.2). Drops two
+  // info lines into scrollback the first time the operator REPLs in
+  // a project; subsequent boots stay quiet thanks to the ack marker.
+  // `errSink` doubles as the warn sink for marker-write failures —
+  // matches the trust prompt's posture (operator sees the diagnostic
+  // without losing the boot).
+  maybeEmitHistoryBanner({
+    bus,
+    cwd: baseConfig.cwd,
+    now,
+    warn: (m) => errSink(`forja: ${m}\n`),
+  });
 
   // Initial frame: emit one input:update with the empty buffer so the
   // renderer draws the `> ` prompt before the user types. Without

@@ -779,6 +779,92 @@ describe('not-yet-wired events accept silently', () => {
   });
 });
 
+describe('history-clear modal (HISTORY.md §2.3)', () => {
+  test('history-clear:ask opens a modal with three options + last selected', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'history-clear:ask',
+      ts: 1,
+      promptId: 'hc-1',
+      entryCount: 42,
+      projectRoot: '/project/root',
+    });
+    expect(r.state.modal).not.toBeNull();
+    if (r.state.modal === null) return;
+    expect(r.state.modal.flavor).toBe('history-clear');
+    // projectRoot lives in preview (matching trust-modal layout) so a
+    // long path clips cleanly via truncateToWidth; subject is null.
+    expect(r.state.modal.subject).toBeNull();
+    expect(r.state.modal.preview[0]).toBe('/project/root');
+    expect(r.state.modal.options.map((o) => o.value)).toEqual(['yes', 'yes-disable', 'no']);
+    // Conservative-default: last option (No) selected.
+    expect(r.state.modal.selectedIndex).toBe(2);
+    // Blast radius surfaces in the preview.
+    expect(r.state.modal.preview.join(' ')).toContain('42 entries');
+  });
+
+  test('singular entry count uses singular phrasing', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'history-clear:ask',
+      ts: 1,
+      promptId: 'hc-2',
+      entryCount: 1,
+      projectRoot: '/p',
+    });
+    if (r.state.modal === null) return;
+    expect(r.state.modal.preview.join(' ')).toContain('1 entry');
+  });
+});
+
+describe('reverse-search overlay (HISTORY.md §2.2)', () => {
+  test('reverse-search:update opens the overlay with the payload shape', () => {
+    const initial = createInitialState();
+    expect(initial.reverseSearch).toBeNull();
+    const r = applyEvent(initial, {
+      type: 'reverse-search:update',
+      ts: 1,
+      query: 'que',
+      results: ['como rodar bun em watch?'],
+      selectedIdx: 0,
+    });
+    expect(r.state.reverseSearch).toEqual({
+      query: 'que',
+      results: ['como rodar bun em watch?'],
+      selectedIdx: 0,
+    });
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('reverse-search:update with no matches keeps overlay open + selectedIdx -1', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'reverse-search:update',
+      ts: 1,
+      query: 'xyz',
+      results: [],
+      selectedIdx: -1,
+    });
+    expect(r.state.reverseSearch).toEqual({ query: 'xyz', results: [], selectedIdx: -1 });
+  });
+
+  test('reverse-search:close clears state.reverseSearch', () => {
+    const opened = applyEvent(createInitialState(), {
+      type: 'reverse-search:update',
+      ts: 1,
+      query: 'a',
+      results: ['x'],
+      selectedIdx: 0,
+    }).state;
+    const r = applyEvent(opened, { type: 'reverse-search:close', ts: 2 });
+    expect(r.state.reverseSearch).toBeNull();
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('reverse-search:close on already-closed state is idempotent', () => {
+    const r = applyEvent(createInitialState(), { type: 'reverse-search:close', ts: 1 });
+    expect(r.state.reverseSearch).toBeNull();
+    expect(r.permanent).toEqual([]);
+  });
+});
+
 describe('state immutability', () => {
   test('applyEvent does not mutate the input state', () => {
     const initial = createInitialState();

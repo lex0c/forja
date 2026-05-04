@@ -117,7 +117,7 @@ export interface ConfirmState {
   // route to the right answer shape. All confirm-shaped modals
   // (permission, trust, memory write, plan review, critique) share
   // this single state field — only one modal visible at a time.
-  flavor: 'permission' | 'trust' | 'memory-write' | 'plan-review' | 'critique';
+  flavor: 'permission' | 'trust' | 'memory-write' | 'plan-review' | 'critique' | 'history-clear';
   // Title block: bold first line + dim subject. `subject` is
   // optional — null when the modal has no single target (some
   // critique modals).
@@ -159,6 +159,26 @@ export interface SlashAutocomplete {
   selectedIdx: number;
 }
 
+// Reverse-search overlay (HISTORY.md §2.2). Active while the operator
+// holds the search bar open with Ctrl+R; appears as a single line
+// above the input box and absorbs keystrokes (the REPL editor handler
+// gates its own logic when this is non-null).
+//
+// `results` is the most-recent-first list of history entries matching
+// `query` (substring, case-insensitive). `selectedIdx` is which match
+// is currently displayed in the search line; Ctrl+R pressed again
+// cycles to older entries (selectedIdx + 1, clamped at results.length).
+// Typing or backspace re-runs the search and resets selectedIdx to 0.
+//
+// `selectedIdx === -1` means "no selection" — happens when the query
+// has zero matches; the search line still shows the (now editable)
+// query but appends `<empty>` to signal nothing matched.
+export interface ReverseSearchState {
+  query: string;
+  results: string[];
+  selectedIdx: number;
+}
+
 export interface LiveState {
   input: InputState;
   status: StatusState;
@@ -174,6 +194,11 @@ export interface LiveState {
   // Slash autocomplete popover, or null when not in slash mode.
   // Composer renders above the input box (between status and rule).
   slash: SlashAutocomplete | null;
+  // Reverse-search overlay (HISTORY.md §2.2). Null when closed; a
+  // ReverseSearchState while the operator is searching with Ctrl+R.
+  // Mutually exclusive with slash mode at the producer level — REPL
+  // refuses to open it while `state.slash !== null`.
+  reverseSearch: ReverseSearchState | null;
   // Live TodoList. Empty array = no list section in compose. Replaced
   // wholesale on every `todo:update` per spec §7.4 ("o model passa a
   // lista intencionada inteira; sem semantics de merge").
@@ -224,6 +249,7 @@ export const createInitialState = (): LiveState => ({
   thinking: null,
   modal: null,
   slash: null,
+  reverseSearch: null,
   todos: [],
   bgProcesses: new Map(),
   softInterrupted: false,
@@ -618,6 +644,26 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       };
     }
 
+    case 'reverse-search:update':
+      return {
+        state: {
+          ...state,
+          reverseSearch: {
+            query: event.query,
+            results: event.results,
+            selectedIdx: event.selectedIdx,
+          },
+        },
+        permanent: [],
+      };
+
+    case 'reverse-search:close':
+      // Idempotent: if already closed, the reducer no-ops. Producer
+      // emits unconditionally on Esc/Enter/Tab so the close path
+      // doesn't need to track whether the overlay is up.
+      if (state.reverseSearch === null) return { state, permanent: [] };
+      return { state: { ...state, reverseSearch: null }, permanent: [] };
+
     case 'error':
       return { state, permanent: [{ kind: 'error', message: event.message }] };
 
@@ -769,6 +815,49 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
             // default. Operator hitting Enter without reading
             // chooses "No, exit" — the safer outcome here.
             options,
+            selectedIndex: options.length - 1,
+            hints: ['Enter to confirm', 'Esc to cancel'],
+          },
+        },
+        permanent: [],
+      };
+    }
+
+    case 'history-clear:ask': {
+      // Three options per HISTORY.md §2.3: clear-only, clear-and-
+      // disable-permanently, no. `yes-disable` writes the
+      // `.agent/no-history` marker (spec §3.3 level 2) on top of
+      // the wipe so subsequent REPLs in this project never
+      // re-enable persistence without explicit operator action.
+      const options: ConfirmOption[] = [
+        { key: '1', label: 'Yes, wipe', value: 'yes' },
+        { key: '2', label: 'Yes, wipe and disable persistence', value: 'yes-disable' },
+        { key: '3', label: 'No', value: 'no' },
+      ];
+      const blast =
+        event.entryCount === 1
+          ? '1 entry will be permanently removed.'
+          : `${event.entryCount} entries will be permanently removed.`;
+      // Layout follows the trust-modal pattern: the path goes into
+      // `preview` as its own row (where the renderer's truncate-to-
+      // width pass clips long paths cleanly) rather than into
+      // `subject` (where a >80-char path would visually overflow
+      // without recourse). Subject stays null because the title
+      // already names the action.
+      return {
+        state: {
+          ...state,
+          modal: {
+            promptId: event.promptId,
+            flavor: 'history-clear',
+            title: 'Clear input history',
+            subject: null,
+            preview: [event.projectRoot, '', blast],
+            question: 'Are you sure you want to wipe the input history for this project?',
+            options,
+            // Default = last (No), per the same conservative-default
+            // convention as trust / permission. An operator hitting
+            // Enter without reading shouldn't lose history.
             selectedIndex: options.length - 1,
             hints: ['Enter to confirm', 'Esc to cancel'],
           },

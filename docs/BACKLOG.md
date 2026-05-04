@@ -15,6 +15,55 @@ Format:
 
 ---
 
+## [2026-05-04] M2 / impl — REPL input history (HISTORY.md)
+
+Spec já existia desde 2026-05-03 (entrada `M2 / spec`); operator marcou como prioridade pra fechar o gap "rodar ↑ no REPL e recuperar prompt anterior". Slice atravessa storage / TUI / REPL inteira.
+
+**Done:**
+
+- **Storage layer** (HISTORY.md §1): migration `018-repl-history` cria `repl_history(id PK AUTOINCREMENT, ts, project_root, prompt)` + `INDEX (project_root, ts DESC)`. `src/storage/history.ts` expõe `appendHistory` (insert + dup-of-last suppression + cap-trim em uma transação), `loadHistory` (oldest-first slice, ts DESC interno + reverse), `searchHistory` (substring case-insensitive com escape de wildcards LIKE pra Ctrl+R), `clearHistory`, `countHistory`. Cap default 10k via `HISTORY_CAP_DEFAULT`, override via `FORJA_HISTORY_SIZE`.
+- **REPL navegação ↑/↓** (HISTORY.md §2.1): state local em `repl.ts` (`historyEntries` mirror in-memory carregado no boot, `historyIdx` + `historyScratch` + `historyEnabled` flag de sessão). Editor handler intercepta ↑/↓ ANTES de `applyKey` quando o cursor está na top-line / bottom-line do buffer (multi-line preserved); slash precedence honrada via `state.slash !== null`. Submit chama `recordHistorySubmit` que faz dup-suppress in-memory + delegates pra `appendHistory`.
+- **Reverse-search overlay** (HISTORY.md §2.2): novo `ReverseSearchState` em `LiveState`, eventos `reverse-search:update` / `:close`, render `src/tui/render/reverse-search.ts` (single-line `(reverse-i-search)\`q\`: <match>` com `<empty>` dim quando sem matches, multi-line collapse, truncate a `caps.cols`). Compose insere no mesmo slot do slash popover (mutuamente exclusivos no producer level). REPL handler trata Ctrl+R (open / cycle), Esc (cancel), Enter (substitute + submit), Tab (substitute + close, no submit), Backspace (encurta query), printable (estende), Ctrl+letter swallowed.
+- **Slash `/history`** (HISTORY.md §2.3): comando com subcommands `summary` / `list` / `clear [--yes|-y]` / `off` / `on`. Modal `history-clear:ask` com 3 opções (Yes / Yes-and-disable / No, default último). `yes-disable` escreve `.agent/no-history` + flipa flag de sessão pra ficar consistente. `SlashContext.history` (opcional) plumba `isEnabled` / `setEnabled` / `clearLocal` da REPL.
+- **First-run privacy banner** (HISTORY.md §3.2): `src/cli/history-banner.ts` com `maybeEmitHistoryBanner` puro. Skip em qualquer dos: `FORJA_NO_HISTORY=1`, `.agent/no-history`, `.agent/forja-history-acked`. Caso contrário emite 2 info lines (path da db + cap, hints de off/clear) e dropa marker `.agent/forja-history-acked` com warn-on-failure.
+- **Tests:** 23 (storage) + 4 (state reverse-search) + 2 (state history-clear) + 9 (render reverse-search) + 15 (cmd /history) + 7 (banner) + 7 novos (REPL ↑/↓ flow) + 7 novos (REPL reverse-search flow) + counts ajustados em `tests/cli/slash/dispatch.test.ts` (9→10 builtins). Stub `makeBootstrapStub` em `tests/cli/repl.test.ts` agora usa db real migrado (a fake só com `close` quebrava ao primeiro `loadHistory` no boot).
+
+**Decisions:**
+
+- **Arquivo standalone `src/storage/history.ts`, não `repos/`.** Spec §1.2 chama o caminho explicitamente. Não há shape de "row record" pública (storage só expõe strings via `loadHistory`); meter num `repos/` seria conformidade superficial sem ganho.
+- **Trim em append, não load.** Cap enforcement na escrita mantém load index-only (hot path). `DELETE WHERE id IN (SELECT ... LIMIT total - cap)` em uma transação evita janela onde leitura concorrente pegaria estado over-cap.
+- **Dup-of-last via SELECT da row mais recente, não cache local.** Operador rodando duas REPLs no mesmo projeto teria caches divergentes; a tabela é o único árbitro. Custo: 1 query a mais por submit (negligível com o índice composite).
+- **Top-line / bottom-line check pra ↑/↓.** Spec não desambigua multi-line vs history nav. Convenção do readline (`previous-history` em single-line) + zsh `up-line-or-history` é o que operadores esperam: ↑ no topo do buffer = history, no meio = cursor up. Quando já navegando (`historyIdx !== null`), todas as ↑/↓ ficam em history mode até ↓ passar o newest e restaurar scratch.
+- **Reverse-search e slash popover mutuamente exclusivos no producer.** Spec §2.1 cita só `state.slash !== null` como precedência; resolvi extender pro outro lado (Ctrl+R com slash aberto não abre overlay) pra evitar overlap visual num único slot do compose. Ambos drenam o mesmo block; renderizar dois ao mesmo tempo seria confuso.
+- **`(reverse-i-search)` line trunca matches a 1 linha visual.** Multi-line prompts armazenados verbatim só importam no recall; mostrar 5 linhas no overlay quebraria a invariante de altura do live region. Match completo ainda land no buffer no Enter/Tab.
+- **`/history clear` flavor próprio (`history-clear`), não generic confirm modal.** Mesmo padrão de `permission` / `trust` / `memory-write`: each ask tem o próprio Event type + reducer case + askMethod. Generic `askConfirm` reduziria boilerplate mas acoplaria todo modal a um schema único — preferi consistency com o que já existia.
+- **`yes-disable` escreve `.agent/no-history` (level 2 da §3.3), não `FORJA_NO_HISTORY` env.** Env é process-global, file marker é per-project. "Wipe and disable for this project" só faz sentido como per-project; mexer em env pra desligar em um projeto afetaria outras REPLs em outros projetos.
+- **`recordHistorySubmit` chama append em AMBOS os submit paths (slash + normal).** Bash/zsh persistem comandos slash-prefixados em history; recall via ↑ é útil tanto pra prompts ao modelo quanto pra `/budget 50` / `/sessions 30`. Footgun teórico — recall um `/history clear` antigo pode wipar — mitigado pelo modal de confirm com default No.
+- **In-memory mirror NÃO se atualiza via concurrent REPL writes.** Visibility lag explícito (HISTORY.md §1.4): a outra REPL só aparece no boot da próxima. Locking entre processos pra um nice-to-have de recall seria over-engineering — dup explícito limpa via `/history clear`.
+
+**Pending:**
+
+- **`/history list` sem timestamps.** Storage só expõe `loadHistory(): string[]`; adicionar `loadHistoryWithMeta` dobraria a superfície pra um único cmd. Hoje listagem é `recent history (oldest first, max 20)` + linhas. Slice futura quando outro cmd precisar do meta.
+- **`/history off` em `--json` mode.** Spec §3.4 cita headless skip; one-shot path (run.ts) ainda não tem hook equivalente — fica pra slice headless.
+- **Modal de clear sem teste e2e via focus-stack.** `tests/cli/slash/history.test.ts` injeta override de `askHistoryClear` pra evitar focus dance. Cobre lógica do command e do reducer em separado, mas o caminho real (key dispatch → modal-manager → resolveActive) só é exercido por modal-manager.test.ts (e indiretamente pelo trust prompt).
+- **`/history` no /help.** Help output já lista por descobrir o command no registry, então o comando aparece automaticamente. Texto de descrição está pronto — sem polish pendente.
+- **Ctrl+L universal (UI.md §5.4).** O bind não é wired no editor handler em lugar nenhum — só `/clear` slash command emite `screen:clear`. Pre-existing gap, não introduzido por esta slice. Ficou na conta de uma slice de TUI follow-up.
+
+**Review fixes (mesmo dia):**
+
+- **#1** — `/history` summary inclui `cap N` (matching spec §2.3 literal).
+- **#2** — Input box renderiza dim quando `state.reverseSearch !== null` (spec §2.2 "draft preservado abaixo, dim"). `renderInput` ganhou opção `dimmed`; compose passa o flag.
+- **#4** — `refreshReverseSearch` sanitiza `\r?\n → ' '` antes de armar state. Paste multi-line não quebra mais o row count do live region.
+- **#5+#6** — REPL seed `historyEnabled` via `historyOptOutReason(cwd)` no boot, mantendo o flag em sincronia com o que storage vai aceitar. `/history on` agora consulta `optOutReason` via `SlashContext.history` e recusa com mensagem específica ('FORJA_NO_HISTORY=1 is set in env' / '.agent/no-history marker is present') em vez de mentir "persistence: on".
+- **#7** — Modal `history-clear` move `projectRoot` de `subject` pra `preview[0]`, alinhando com trust-modal pattern (long paths cliparem cleanly via truncateToWidth do renderer).
+- **#10+#11** — Imports de `node:fs` mergidos em uma linha (biome auto-fixed). Dead-code `text === ''` guard em `recordHistorySubmit` removido (gate já existe upstream em applyKey + slash dispatcher).
+
+Tests adicionados: 2 (renderInput dimmed) + 1 (paste multi-line collapse) + 2 (`/history on` env / file-marker refusal). Total slice: 67 testes novos (+20 vs pré-review).
+
+**Next:** branch `feat/m2-history`, PR pra `develop` quando o operator validar UX em produção.
+
+---
+
 ## [2026-05-03] M2 / impl — first-run trust prompt (AGENTIC_CLI §9.1)
 
 Operator reportou que o forja não pergunta se a pasta é confiável na primeira vez que abre. A modal `trust:ask` já existia (reducer + render), mas faltava o producer. Bug de discoverability + segurança: qualquer cwd executa tools sem o gate de "operator approved this directory".
