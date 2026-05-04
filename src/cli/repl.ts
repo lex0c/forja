@@ -167,6 +167,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     bus,
     caps,
     stdin,
+    // Defer raw mode + bracketed paste until we have a focus
+    // handler ready (see `subscribeStdin` below). Activating raw
+    // mode at construction would suppress Ctrl+C → SIGINT for the
+    // entire bootstrap window — operator couldn't break out of a
+    // hung policy parse, slow `git rev-parse`, etc. Manual mode
+    // keeps the cooked-mode SIGINT path live until we're ready
+    // to take stdin.
+    inputMode: 'manual',
     ...(options.rendererWrite !== undefined ? { write: options.rendererWrite } : {}),
   });
   // Forward reference: triggerInterrupt is defined post-bootstrap
@@ -244,6 +252,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const subscribeStdin = (): void => {
     if (stdinSubscribed) return;
     stdinSubscribed = true;
+    // Activate raw mode + bracketed paste at the SAME boundary as
+    // the data listener. Before this point a Ctrl+C keystroke
+    // still generates SIGINT (cooked-mode terminal driver), so an
+    // operator can break out of a slow bootstrap. After this point
+    // raw mode is on and Ctrl+C arrives as a literal `\x03` byte
+    // — handled by the editor / focus stack we just installed.
+    renderer.enableInput();
     stdin.on('data', onData);
     if (typeof stdin.resume === 'function') stdin.resume();
   };
