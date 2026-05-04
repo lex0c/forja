@@ -74,3 +74,20 @@ export type {
 
 export { writeMemory } from './writer.ts';
 export type { WriteMemoryInput, WriteMemoryResult, WriteWarning } from './writer.ts';
+
+export { findExpiredMemories, gcExpiredMemories, removeMemory } from './lifecycle.ts';
+export type {
+  ExpiredMemory,
+  GcExpiredAuditOverride,
+  GcExpiredOptions,
+  GcExpiredResult,
+  RemoveMemoryInput,
+  RemoveMemoryResult,
+} from './lifecycle.ts';
+
+export {
+  EMPTY_BOOT_CONTEXT,
+  evaluateBootTriggers,
+  shouldEagerLoadByTriggers,
+} from './triggers.ts';
+export type { BootContext, BootTrigger } from './triggers.ts';

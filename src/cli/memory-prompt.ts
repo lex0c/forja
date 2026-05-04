@@ -1,4 +1,9 @@
-import type { MemoryRegistry } from '../memory/index.ts';
+import {
+  type BootContext,
+  EMPTY_BOOT_CONTEXT,
+  type MemoryRegistry,
+  shouldEagerLoadByTriggers,
+} from '../memory/index.ts';
 
 // Eager memory index injection into the system prompt.
 //
@@ -59,6 +64,19 @@ import type { MemoryRegistry } from '../memory/index.ts';
 //     /memory list when it lands).
 //   - 'present' + frontmatter.trust === 'untrusted' → SKIP.
 //   - 'present' + trust absent or 'trusted' → INCLUDE.
+//
+// Boot-time triggers (spec §4.3) — memories with `triggers:` in
+// their frontmatter are conditional eager-loads. The caller passes
+// a `BootContext` (built by `evaluateBootTriggers(cwd)`); memories
+// match per `shouldEagerLoadByTriggers`. Callers that don't want
+// trigger filtering (tests, programmatic SDK use without a cwd)
+// pass `EMPTY_BOOT_CONTEXT` — which makes well-known-tagged
+// memories invisible until the corresponding context probe fires.
+// The default for `bootContext` in this module is the empty
+// context, so existing call sites without trigger awareness keep
+// their pre-this-slice behavior MODULO the rule-2 escape hatch:
+// memories tagged with operator-defined runtime tags pass through
+// unconditionally. See `triggers.ts` for the full rule set.
 
 const MEMORY_SECTION_HEADER = `# Memory
 
@@ -66,6 +84,13 @@ Cross-session memories you can use. Call memory_read(name) to load a body, memor
 
 export interface AssembleMemorySectionInput {
   registry: MemoryRegistry;
+  // Boot-time trigger context (spec §4.3). When omitted, the
+  // empty context is used: well-known-tagged memories are
+  // filtered out, untagged and operator-runtime-tagged memories
+  // pass through. Callers (production: bootstrap;
+  // production: subagent-child) pass the result of
+  // `evaluateBootTriggers(cwd)`.
+  bootContext?: BootContext;
 }
 
 export interface AssembleMemorySectionResult {
@@ -100,25 +125,30 @@ export const assembleMemorySection = (
   if (all.length === 0) {
     return { text: '', entryCount: 0 };
   }
-  // Spec §7.2.2 trust filter. peek() loads the body without
-  // emitting an audit row. See module header for the failure-mode
-  // rationale (uncertain → include).
-  const trusted = all.filter((l) => {
+  const bootContext = input.bootContext ?? EMPTY_BOOT_CONTEXT;
+  // Combined per-memory filter: spec §7.2.2 trust + spec §4.3
+  // boot-time triggers. Single peek per memory delivers both
+  // pieces of state (frontmatter.trust + frontmatter.triggers),
+  // saving disk reads vs filtering in two passes. See module
+  // header for failure-mode rationale (uncertain peek → include).
+  const eligible = all.filter((l) => {
     const peek = input.registry.peek(l.name, { scope: l.scope });
-    return !(peek.kind === 'present' && peek.file.frontmatter.trust === 'untrusted');
+    if (peek.kind !== 'present') return true; // uncertainty → include
+    if (peek.file.frontmatter.trust === 'untrusted') return false;
+    return shouldEagerLoadByTriggers(peek.file.frontmatter.triggers, bootContext);
   });
-  if (trusted.length === 0) {
+  if (eligible.length === 0) {
     // Every memory was filtered out. Same empty-shape as a
     // registry that never had entries — bootstrap's length-zero
     // check passes through cleanly.
     return { text: '', entryCount: 0 };
   }
-  // Dedupe by name on the trust-filtered list. precedence order
-  // is preserved (most-specific surviving scope wins).
+  // Dedupe by name on the eligible list. precedence order is
+  // preserved (most-specific surviving scope wins).
   const seen = new Set<string>();
   const lines: string[] = [MEMORY_SECTION_HEADER, ''];
   let included = 0;
-  for (const l of trusted) {
+  for (const l of eligible) {
     if (seen.has(l.name)) continue;
     seen.add(l.name);
     lines.push(`- [${l.scope}] ${l.name} — ${l.entry.hook}`);

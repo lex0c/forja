@@ -1,6 +1,12 @@
 import { join } from 'node:path';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
-import { createMemoryRegistry, resolveRepoRoot, resolveScopeRoots } from '../memory/index.ts';
+import {
+  createMemoryRegistry,
+  evaluateBootTriggers,
+  gcExpiredMemories,
+  resolveRepoRoot,
+  resolveScopeRoots,
+} from '../memory/index.ts';
 import { type LockConflict, createPermissionEngine, resolvePolicy } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
@@ -190,7 +196,45 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     // leaving the base prompt unchanged.
     const memoryRoots = resolveScopeRoots(resolveRepoRoot(cwd));
     memoryRegistry = createMemoryRegistry({ roots: memoryRoots, db, cwd });
-    const memorySection = assembleMemorySection({ registry: memoryRegistry });
+    // SessionStart expiry GC (spec MEMORY.md §6.2). Auto-removes
+    // memories whose `expires:` field is on or before today. Each
+    // removal emits a `memory_events` row with `action: 'expired'`
+    // so the operator can audit "what disappeared and when". We
+    // run this BEFORE assembling the eager prompt section so the
+    // model never sees stale entries that vanish mid-session. The
+    // session id isn't known yet (the harness loop creates it
+    // later), so the audit rows here land with sessionId NULL —
+    // the lifecycle GC is conceptually a session-bootstrap event,
+    // not a per-session-conversation one. cwd is forwarded so
+    // `/memory audit` can group GC events by working directory.
+    //
+    // Failures (sandbox / io / unknown) get a `refused` audit row
+    // with stage='lifecycle_gc' AND a stderr line so the operator
+    // sees them in two places: the persistent audit table (for
+    // forensic review) and the live stderr stream (for "something
+    // unusual happened on this boot"). A bootstrap-blocking
+    // failure would be wrong — one bad memory shouldn't gate the
+    // session — but silently dropping the failure is worse.
+    const gcResult = gcExpiredMemories(memoryRegistry, memoryRoots, { auditCwd: cwd });
+    for (const failure of gcResult.failures) {
+      process.stderr.write(
+        `forja: memory gc: failed to expire ${failure.memory.scope}/${failure.memory.name} (expires ${failure.memory.expires}): ${failure.reason}\n`,
+      );
+    }
+    // Boot-time trigger context (spec §4.3). evaluateBootTriggers
+    // probes the cwd for well-known files (.git, .env, package.json,
+    // AGENTS.md, etc.); each present file is added to a Set that
+    // assembleMemorySection consults when filtering memories tagged
+    // with `triggers:` in their frontmatter. Memories without
+    // triggers are always included; tagged memories load only if a
+    // matching trigger fired. Operator-defined runtime tags pass
+    // through unconditionally per the rule documented in
+    // `src/memory/triggers.ts`.
+    const bootContext = evaluateBootTriggers(cwd);
+    const memorySection = assembleMemorySection({
+      registry: memoryRegistry,
+      bootContext,
+    });
     resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text);
   } catch (e) {
     db.close();

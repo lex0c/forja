@@ -15,6 +15,172 @@ Format:
 
 ---
 
+## [2026-05-04] M3 / impl — memory lifecycle hooks (expiry GC + boot-time triggers)
+
+Continues the memory subsystem on the same branch. Closes spec §6.2
+(SessionStart expiry GC) and the boot-time half of §4.3 (auto-injection
+via frontmatter `triggers:`). Hash check shared (§7.2.8) is still
+deferred — needs the trust-storage extension that AGENTS.md hash check
+(§9.1) also depends on; both belong in a future "trust storage v2"
+slice.
+
+**Done:**
+
+- **Lifecycle module** (`src/memory/lifecycle.ts`, new):
+  - `removeMemory(roots, scope, name) → RemoveMemoryResult` —
+    pure file+index deletion primitive, parallel to `writeMemory`.
+    Discriminated outcomes (`removed` / `sandbox_violation` /
+    `unknown` / `io_error`). Body unlink + index rewrite via the
+    same atomic temp-rename pattern as the writer. Idempotent on
+    each side: missing body still removes the index entry,
+    missing entry still unlinks the body. Order: index FIRST then
+    body, so a crash leaves an orphan body (reachable via
+    `listOrphanFiles`) rather than a dangling entry.
+  - `findExpiredMemories(registry, today)` — peek-based scan
+    across all scopes (no audit rows during system-internal
+    discovery). Lex-compares ISO `expires:` against today's UTC
+    date — operator's `expires: 2026-05-04` removes the memory
+    on 2026-05-04 boot.
+  - `gcExpiredMemories(registry, roots, opts)` — orchestrates
+    find + remove + audit. Emits `memory_events` `action: 'expired'`
+    per removal with frontmatter `source` forwarded so audit
+    consumers can distinguish "+90d-default expired" from
+    "user-set expiry". Single `registry.reload()` after the batch.
+- **Bootstrap wires the GC** (spec §6.2 SessionStart): runs after
+  `createMemoryRegistry`, before `assembleMemorySection`. Auto-
+  removes everything expired — operator's `expires:` was
+  deliberate, audit row gives visibility, no modal friction at
+  boot. Spec's "com confirmação se houver muitas" is deferred to
+  a follow-up modal slice when an operator pattern surfaces.
+  Bootstrap forwards `auditCwd: cwd`; `auditSessionId` is omitted
+  because the harness loop creates the session id later — GC
+  rows land with `session_id NULL` (lifecycle is a pre-session
+  bootstrap event, distinguishable from per-conversation rows).
+- **Boot-time trigger primitive** (`src/memory/triggers.ts`, new):
+  - `BootTrigger` closed union — `git`, `env`, `package`,
+    `agents-md`, `tsconfig`, `cargo`. Adding a well-known
+    trigger is a one-line append + `existsSync` probe.
+  - `evaluateBootTriggers(cwd) → BootContext` — single-shot
+    `existsSync` probes per trigger. Non-recursive (`.env` in a
+    subdir does NOT trigger `secrets`); session cwd is the root.
+  - `shouldEagerLoadByTriggers(memTriggers, ctx)` — three rules:
+    (1) no triggers → unconditional load; (2) all-operator-defined
+    runtime tags (no well-known overlap) → unconditional load
+    (rule 2: don't silently hide memories tagged for runtime-only
+    until the runtime trigger machinery lands); (3) any well-known
+    trigger present → load IFF that trigger fired.
+  - Spec §4.3 examples include "tool bash called" and "user
+    message mentions git commit" which are RUNTIME triggers
+    needing harness-loop hooks; deferred. Boot-time half ships
+    today.
+- **`assembleMemorySection` accepts `BootContext`**. Single peek
+  per memory now drives BOTH trust filter (§7.2.2) and trigger
+  filter (§4.3) — one disk read serves both. Default
+  `bootContext` is `EMPTY_BOOT_CONTEXT` — preserves pre-this-
+  slice behavior modulo rule 2 (operator runtime tags pass
+  through). Subagent-child evaluates triggers against the
+  subagent's cwd (worktree root or parent cwd depending on
+  isolation), not parent's — matches "session cwd is the trigger
+  root" principle uniformly.
+- **Tests:** 6 removeMemory (happy path / preserves others / unknown
+  noop / orphan body or index / bad name), 4 findExpiredMemories
+  (today inclusive / no expires skipped / cross-scope / no audit
+  during scan), 5 gcExpiredMemories (audit emission / snapshot
+  refresh / no-op / source forwarding / multi-scope), 13 triggers
+  (probe each well-known type, multiple, no recursion, rule
+  combinations), 6 memory-prompt with bootContext (untagged
+  unconditional, matched / unmatched well-known, operator runtime
+  tag rule 2, mixed list, omitted bootContext default). +34 tests
+  total; suite at 2519 pass / 0 fail.
+
+**Decisions:**
+
+- **Auto-remove with no modal threshold.** Spec §6.2 says "com
+  confirmação se houver muitas". I shipped unconditional auto-
+  remove + audit row instead. Reasons: (1) operator opted in by
+  setting `expires:`; (2) audit row IS the visibility signal;
+  (3) modal at boot is friction the average operator won't want.
+  If an operator pattern emerges where bulk expiry surprises
+  them, modal lands as a follow-up.
+- **GC audit rows have NULL session_id.** Bootstrap doesn't know
+  the session id (harness creates it later). Lifecycle GC is
+  conceptually a pre-session event; the session_id-NULL marker
+  distinguishes "expired during boot" from "expired during a
+  named session". Future `/memory audit` UI groups these
+  separately.
+- **Triggers single peek per memory.** assembleMemorySection
+  consults `frontmatter.trust` AND `frontmatter.triggers` from
+  ONE peek call per listing. Two-pass filtering (filter trust
+  first, then triggers) would double the disk reads with no win.
+- **Rule 2 (operator runtime tags pass through unconditionally).**
+  Alternative was strict: any non-empty triggers list must match a
+  well-known fired trigger or be hidden. That creates a foot-gun:
+  operator tags `triggers: [bash]` (a runtime tag) and the memory
+  silently disappears from base context. Rule 2 keeps it visible
+  until the runtime trigger machinery actually runs, then the
+  matching narrows. Trades silent-hide for slightly-noisier-base-
+  context — acceptable tradeoff.
+- **Per-trigger probes are `existsSync`, not stat-mode-aware.**
+  `.git` is a directory, `.env` is a file, both register the
+  trigger. operator with `.git` as a file (worktree gitdir
+  pointer) still gets the `git` trigger, which is correct. Fine
+  to relax later if a probe needs file-vs-dir distinction.
+- **Boot-time triggers evaluate against subagent's cwd, not
+  parent's.** A worktree subagent has its own filesystem root;
+  triggers should reflect THAT environment. Matches "session
+  cwd is the trigger root" applied at every level.
+
+**Post-review fixes (2026-05-04):**
+
+- **`removeMemory` instanceof discrimination.** First cut used
+  `as ScopeError` cast + duck-type "has .message" check, which
+  caught FrontmatterError too and reported it as
+  `sandbox_violation`. Mirrors writer.ts now: explicit
+  `instanceof ScopeError` → sandbox_violation, `instanceof
+  FrontmatterError` → io_error, anything else rethrows.
+  Tightened tests: bad-name `../traversal` and `.hidden` both
+  pin `io_error` specifically (not the loose either-or).
+- **GC failures audit + stderr-warn.** First cut silently dropped
+  `gcExpiredMemories` failures — bootstrap discarded the result,
+  no audit row, only "absence of expected `expired` row" as
+  signal. Now: failures emit a `memory_events` `refused` row
+  with `details.stage='lifecycle_gc'`, `kind`, `reason`, and
+  `expires`. Bootstrap consumes `result.failures` and writes a
+  stderr line per failure (`forja: memory gc: failed to expire
+  <scope>/<name> (expires DATE): REASON`). Two-place visibility:
+  persistent audit for forensic review, live stderr for
+  per-boot anomaly. Test engineers a real EACCES via chmod 0o500
+  on the scope dir; skips silently when running as root.
+- **`ALL_BOOT_TRIGGERS` derived from `TRIGGER_PROBES`.** First
+  cut hand-maintained both — adding a trigger required two
+  edits. Now derived as `new Set(TRIGGER_PROBES.map(([n]) => n))`
+  so the type union, probe table, and lookup can't desync.
+- **UTC trade-off documented explicitly.** Comment now lays out
+  the two viable timezone interpretations (operator-local vs
+  UTC), why we picked UTC (cross-machine determinism > last-day
+  precision), and the operator workaround (subtract a day, or
+  wait for `/memory expire` slash with explicit TZ handling).
+  Audit row carries the literal `expires` string for forensic
+  reconstruction.
+
+**Out of scope (still tracked):**
+
+- **§4.3 runtime triggers.** "Tool bash called" / "user message
+  mentions phrase" / "checkpoint created" need harness-loop hooks
+  (per-event eager-load injection). Deferred; needs design seam
+  in §6.4 PreCompact / harness onEvent surface.
+- **§6.2 modal-confirm for bulk expiry.** Today auto-removes
+  unconditionally. Lands when operator pattern surfaces.
+- **§7.2.8 hash check shared.** Depends on a hash-storage
+  primitive in trust subsystem (the same primitive AGENTS.md hash
+  check needs per §9.1). Belongs in a "trust storage v2" slice.
+- **`/memory expire <name> <date>` slash command** (§6.3).
+  Skipped per user direction (slash commands deferred).
+- **`expired` event grouping in `/memory audit`.** UI surface,
+  Slice F.
+
+---
+
 ## [2026-05-04] M3 / impl — memory trust integration (closes spec §7.2.1, §7.2.2, §7.2.7-eager)
 
 Continues the memory subsystem in the same branch

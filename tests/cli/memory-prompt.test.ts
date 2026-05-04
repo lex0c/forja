@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { assembleMemorySection, composeSystemPrompt } from '../../src/cli/memory-prompt.ts';
 import type { ScopeRoots } from '../../src/memory/paths.ts';
 import { createMemoryRegistry } from '../../src/memory/registry.ts';
+import type { BootContext, BootTrigger } from '../../src/memory/triggers.ts';
 
 const tmpDirs: string[] = [];
 
@@ -255,5 +256,159 @@ describe('composeSystemPrompt', () => {
   test('appends memory after base with blank line separator', () => {
     const out = composeSystemPrompt('You are an agent.', '# Memory\n- entry');
     expect(out).toBe('You are an agent.\n\n# Memory\n- entry');
+  });
+});
+
+describe('assembleMemorySection — boot trigger filter (spec §4.3)', () => {
+  const makeCtx = (...triggers: BootTrigger[]): BootContext => ({
+    triggers: new Set(triggers),
+  });
+
+  test('untagged memories load regardless of boot context', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Plain](plain.md) — h\n');
+    writeBody(roots.projectLocal, 'plain'); // no triggers
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry, bootContext: makeCtx() });
+    expect(result.entryCount).toBe(1);
+    expect(result.text).toContain('plain');
+  });
+
+  test('tagged memory with matching trigger loads', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [GitOps](git-ops.md) — h\n');
+    // Use the trigger-aware writeBody helper via inline body write.
+    mkdirSync(roots.projectLocal, { recursive: true });
+    writeFileSync(
+      join(roots.projectLocal, 'git-ops.md'),
+      [
+        '---',
+        'name: git-ops',
+        'description: hook for git-ops',
+        'type: feedback',
+        'source: user_explicit',
+        'triggers:',
+        '  - git',
+        '---',
+        '',
+        'body',
+      ].join('\n'),
+    );
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry, bootContext: makeCtx('git') });
+    expect(result.entryCount).toBe(1);
+    expect(result.text).toContain('git-ops');
+  });
+
+  test('tagged memory without matching trigger does NOT load', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [GitOps](git-ops.md) — h\n');
+    mkdirSync(roots.projectLocal, { recursive: true });
+    writeFileSync(
+      join(roots.projectLocal, 'git-ops.md'),
+      [
+        '---',
+        'name: git-ops',
+        'description: hook for git-ops',
+        'type: feedback',
+        'source: user_explicit',
+        'triggers:',
+        '  - git',
+        '---',
+        '',
+        'body',
+      ].join('\n'),
+    );
+    const registry = createMemoryRegistry({ roots });
+    // boot context has no `git` trigger
+    const result = assembleMemorySection({ registry, bootContext: makeCtx('env') });
+    expect(result.entryCount).toBe(0);
+    expect(result.text).toBe('');
+  });
+
+  test('operator-defined runtime tag (no well-known): unconditional load (rule 2)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Bash](bash-tips.md) — h\n');
+    mkdirSync(roots.projectLocal, { recursive: true });
+    writeFileSync(
+      join(roots.projectLocal, 'bash-tips.md'),
+      [
+        '---',
+        'name: bash-tips',
+        'description: hook for bash-tips',
+        'type: feedback',
+        'source: user_explicit',
+        'triggers:',
+        '  - bash', // not a well-known boot trigger
+        '---',
+        '',
+        'body',
+      ].join('\n'),
+    );
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry, bootContext: makeCtx() });
+    // Rule 2: all-operator-defined triggers pass through
+    // unconditionally at boot.
+    expect(result.entryCount).toBe(1);
+    expect(result.text).toContain('bash-tips');
+  });
+
+  test('mixed well-known + operator-defined: matches on well-known half', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Mixed](mixed.md) — h\n');
+    mkdirSync(roots.projectLocal, { recursive: true });
+    writeFileSync(
+      join(roots.projectLocal, 'mixed.md'),
+      [
+        '---',
+        'name: mixed',
+        'description: hook for mixed',
+        'type: feedback',
+        'source: user_explicit',
+        'triggers:',
+        '  - git',
+        '  - bash',
+        '---',
+        '',
+        'body',
+      ].join('\n'),
+    );
+    const registry = createMemoryRegistry({ roots });
+    // Without git trigger fired: filtered out (well-known half wins
+    // when present).
+    expect(assembleMemorySection({ registry, bootContext: makeCtx() }).entryCount).toBe(0);
+    // With git fired: loaded.
+    expect(assembleMemorySection({ registry, bootContext: makeCtx('git') }).entryCount).toBe(1);
+  });
+
+  test('omitted bootContext defaults to empty (only well-known-tagged filtered)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [GitOps](git-ops.md) — h\n');
+    mkdirSync(roots.projectLocal, { recursive: true });
+    writeFileSync(
+      join(roots.projectLocal, 'git-ops.md'),
+      [
+        '---',
+        'name: git-ops',
+        'description: hook for git-ops',
+        'type: feedback',
+        'source: user_explicit',
+        'triggers:',
+        '  - git',
+        '---',
+        '',
+        'body',
+      ].join('\n'),
+    );
+    const registry = createMemoryRegistry({ roots });
+    // No bootContext arg → EMPTY_BOOT_CONTEXT default.
+    const result = assembleMemorySection({ registry });
+    expect(result.entryCount).toBe(0);
   });
 });

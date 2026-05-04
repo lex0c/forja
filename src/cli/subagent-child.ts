@@ -1,5 +1,10 @@
 import { type HarnessResult, runAgent } from '../harness/index.ts';
-import { createMemoryRegistry, resolveRepoRoot, resolveScopeRoots } from '../memory/index.ts';
+import {
+  createMemoryRegistry,
+  evaluateBootTriggers,
+  resolveRepoRoot,
+  resolveScopeRoots,
+} from '../memory/index.ts';
 import { createPermissionEngine } from '../permissions/index.ts';
 import { type Provider, createDefaultRegistry } from '../providers/index.ts';
 import {
@@ -500,7 +505,19 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         sessionId: opts.sessionId,
         cwd: session.cwd,
       });
-      const memorySection = assembleMemorySection({ registry: memoryRegistry });
+      // Boot triggers evaluate against the subagent's cwd, NOT
+      // the parent's. A worktree subagent has its own filesystem
+      // root, so `.git`, `.env`, `package.json` probes belong
+      // there. Memories tagged with `triggers:` thus eager-load
+      // when the subagent's worktree mirrors the corresponding
+      // condition. Spec §4.3 doesn't distinguish parent vs
+      // subagent; per-cwd evaluation is the principle of "the
+      // session's cwd defines the trigger root" applied uniformly.
+      const bootContext = evaluateBootTriggers(session.cwd);
+      const memorySection = assembleMemorySection({
+        registry: memoryRegistry,
+        bootContext,
+      });
       resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text) ?? '';
     }
 
