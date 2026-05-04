@@ -227,6 +227,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // awaits this before closing the DB so the harness's async cleanup
   // (final persistence, audit) doesn't race a closed handle.
   let runningPromise: Promise<void> | null = null;
+  // Per-turn token. Each `startTurn` mints a fresh Symbol and stores
+  // it as both the closure-local id of that turn AND `activeTurnToken`
+  // (the slot for "which turn currently owns the shared state below").
+  // Finalizers compare their captured id against this slot and bail
+  // if a newer turn has taken over. Without the gate, the optimization
+  // that flips `running=false` on session_finished (so the operator
+  // can submit/interrupt without waiting for the harness's outer-
+  // finally cleanup) creates a window where Turn N+1 can start
+  // before Turn N's runAgent Promise settles — when N's finalizer
+  // eventually runs, it would otherwise clobber N+1's `running`,
+  // `abortController`, etc., breaking interrupts and allowing
+  // concurrent submits.
+  let activeTurnToken: symbol | null = null;
   let exiting = false;
   let exitCode = 0;
   let resolveExit: () => void = () => {};
@@ -317,6 +330,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const startTurn = (text: string): void => {
     if (running || exiting) return;
     running = true;
+    // Mint a fresh token for this turn and claim ownership of the
+    // shared state slots (running / abortController / runningPromise).
+    // The finalizer below compares against `activeTurnToken` to refuse
+    // mutations once a newer turn has taken over.
+    const myToken = Symbol('turn');
+    activeTurnToken = myToken;
     abortController = new AbortController();
     softStopController = new AbortController();
     const adapter = createHarnessAdapter(buildAdapterCtx());
@@ -343,16 +362,25 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         bus.emit({ type: 'error', ts: now(), message: msg });
       })
       .finally(() => {
-        // Defensive: under normal flow `running` was already flipped
-        // false on session_finished. But a runAgent rejection BEFORE
-        // any session event (provider init failure, DB open error
-        // surfaced inside the harness) would never emit
-        // session_finished — the operator would otherwise be stuck
-        // with running=true forever. Belt-and-suspenders.
+        // Token gate: only mutate shared state if THIS turn is still
+        // the active one. If `session_finished` already flipped
+        // `running=false` and the operator submitted a follow-up
+        // turn, `activeTurnToken` now belongs to that newer turn —
+        // resetting `running`/abortController here would mid-flight
+        // clobber its state, breaking interrupts and allowing
+        // concurrent submits. Bail in that case; the newer turn's
+        // own finalizer will clean up when its own time comes.
+        //
+        // The defensive `running=false` (for the rare path where
+        // runAgent rejects before any session event) is still
+        // covered: in that case session_finished never fired, so
+        // this turn IS still active, and the cleanup runs.
+        if (activeTurnToken !== myToken) return;
         running = false;
         abortController = null;
         softStopController = null;
         runningPromise = null;
+        activeTurnToken = null;
       });
   };
 

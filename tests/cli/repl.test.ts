@@ -86,6 +86,14 @@ const makeRunAgent = (
   captured: CapturedRun[];
   emitInto: (idx: number, event: HarnessEvent) => void;
   finish: (idx: number, override?: Partial<HarnessResult>) => void;
+  // Resolve the pending runAgent promise WITHOUT re-emitting
+  // session_finished. Lets a test simulate the overlap window
+  // where session_finished was already delivered synchronously
+  // (flipping `running=false`), the operator started a follow-up
+  // turn, and only THEN the prior runAgent's outer-finally
+  // cleanup completes — the moment the .finally() chain in
+  // startTurn runs against shared state owned by a newer turn.
+  settle: (idx: number, override?: Partial<HarnessResult>) => void;
 } => {
   const captured: CapturedRun[] = [];
   let nextN = 1;
@@ -130,6 +138,11 @@ const makeRunAgent = (
       const result = buildResult(resolveSession(idx + 1), override ?? {});
       const cap = captured[idx];
       if (cap !== undefined) cap.emit({ type: 'session_finished', result });
+      r(override ?? {});
+    },
+    settle: (idx, override) => {
+      const r = pendingResolves[idx];
+      if (r === undefined) throw new Error(`no pending run at ${idx}`);
       r(override ?? {});
     },
   };
@@ -432,6 +445,74 @@ describe('repl — boot + smoke', () => {
     expect(ra.captured[0]?.configs[0]?.resumeFromSessionId).toBeUndefined();
     // Wrap up.
     ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('late finalizer of a prior turn does not clobber the active turn state', async () => {
+    // Regression: `running=false` flips on `session_finished` so the
+    // operator can submit a follow-up turn without waiting for the
+    // harness's outer-finally cleanup (checkpoint purge + bg cleanup
+    // can take seconds). But the prior turn's runAgent Promise is
+    // still pending — when its .finally() chain eventually runs, it
+    // would otherwise reset shared turn state (running, abort
+    // controllers, runningPromise) and clobber the newer active
+    // turn. Per-turn token gate refuses the mutation when a newer
+    // turn has taken over.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    // Turn 1 starts.
+    stdin.feed('first\r');
+    await tick();
+    // Emit session_finished for turn 1 (flips running=false in the
+    // REPL) WITHOUT resolving turn 1's runAgent Promise yet — the
+    // overlap window where the harness's outer-finally cleanup is
+    // still in flight.
+    const result1: HarnessResult = {
+      status: 'done',
+      reason: 'done',
+      sessionId: 'sess-1',
+      steps: 1,
+      durationMs: 1,
+      usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+      costUsd: 0,
+      usageComplete: true,
+    };
+    ra.emitInto(0, { type: 'session_finished', result: result1 });
+    await tick();
+    // Turn 2 starts in the overlap window.
+    stdin.feed('second\r');
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    const turn2Cfg = ra.captured[1]?.configs[0];
+    const turn2Signal = turn2Cfg?.signal;
+    const turn2SoftSignal = turn2Cfg?.softStopSignal;
+    expect(turn2Signal?.aborted).toBe(false);
+    expect(turn2SoftSignal?.aborted).toBe(false);
+    // NOW turn 1's runAgent Promise settles (late finalizer). Pre-fix
+    // the .finally() would clear `running`, `abortController`, and
+    // `runningPromise` — for turn 2's state. Post-fix the token gate
+    // bails: turn 2 stays the active owner.
+    ra.settle(0);
+    await tick();
+    // Verify turn 2 is still active and its abort controller still
+    // works. If the token gate was missing, abortController would be
+    // null here and Esc/Ctrl+C would route to idle handlers.
+    stdin.feed('\x1b'); // Esc — soft interrupt for the active turn.
+    await flushFrame();
+    expect(turn2SoftSignal?.aborted).toBe(true);
+    // Cleanup.
+    ra.finish(1);
     await tick();
     stdin.feed('\x04');
     expect(await promise).toBe(130);
