@@ -64,6 +64,26 @@ describe('harness-adapter — session lifecycle', () => {
     expect(start.planMode).toBeUndefined();
   });
 
+  test('memoryCount in ctx surfaces on session:start.memoryCount', () => {
+    const a = createHarnessAdapter({ ...baseCtx(), memoryCount: 5 });
+    const out = a.translate({ type: 'session_start', sessionId: 's' });
+    const start = out.find((e) => e.type === 'session:start') as Extract<
+      UIEvent,
+      { type: 'session:start' }
+    >;
+    expect(start.memoryCount).toBe(5);
+  });
+
+  test('omitted memoryCount does not include the field on session:start', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({ type: 'session_start', sessionId: 's' });
+    const start = out.find((e) => e.type === 'session:start') as Extract<
+      UIEvent,
+      { type: 'session:start' }
+    >;
+    expect(start.memoryCount).toBeUndefined();
+  });
+
   test('step_start bumps steps and emits step:budget', () => {
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({ type: 'step_start', stepN: 3 });
@@ -625,6 +645,20 @@ describe('harness-adapter — tool lifecycle', () => {
     });
     const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
     expect(e.status).toBe('done');
+  });
+
+  test('tool_warning translates to a generic warn UIEvent', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'tool_warning',
+      toolUseId: 't42',
+      toolName: 'memory_read',
+      message: '[memory: untrusted] loaded user/foo',
+    });
+    expect(out).toHaveLength(1);
+    const e = out[0] as Extract<UIEvent, { type: 'warn' }>;
+    expect(e.type).toBe('warn');
+    expect(e.message).toContain('[memory: untrusted]');
   });
 
   test('tool tracking is dropped after tool_finished', () => {

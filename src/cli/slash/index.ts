@@ -10,6 +10,7 @@ import { clearCommand } from './commands/clear.ts';
 import { costCommand } from './commands/cost.ts';
 import { buildHelpCommand } from './commands/help.ts';
 import { historyCommand } from './commands/history.ts';
+import { memoryCommand } from './commands/memory.ts';
 import { modelCommand } from './commands/model.ts';
 import { permsCommand } from './commands/perms.ts';
 import { planCommand } from './commands/plan.ts';
@@ -42,6 +43,7 @@ export const createBuiltinRegistry = (): SlashRegistry => {
     budgetCommand,
     permsCommand,
     historyCommand,
+    memoryCommand,
   ];
   const helpCommand = buildHelpCommand(() => [helpCommand, ...withoutHelp]);
   return createRegistry([helpCommand, ...withoutHelp]);

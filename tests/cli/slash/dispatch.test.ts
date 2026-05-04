@@ -48,6 +48,7 @@ const makeCtx = (): {
         shutdownFired = true;
       },
       isRunning: () => false,
+      currentSessionId: () => null,
       modelRegistry: createModelRegistry(),
     },
     events,
@@ -150,7 +151,7 @@ describe('dispatch', () => {
 });
 
 describe('createBuiltinRegistry', () => {
-  test('contains all 10 builtins', () => {
+  test('contains all 11 builtins', () => {
     const r = createBuiltinRegistry();
     const names = r.list().map((c) => c.name);
     expect(names).toEqual([
@@ -164,6 +165,7 @@ describe('createBuiltinRegistry', () => {
       'budget',
       'perms',
       'history',
+      'memory',
     ]);
   });
 
@@ -174,7 +176,7 @@ describe('createBuiltinRegistry', () => {
     if (help === undefined) return;
     const result = await help.exec([], makeCtx().ctx);
     if (result.kind !== 'ok') return;
-    // 10 commands → header + 10 rows + blank + emergency-exit footer = 13.
-    expect(result.notes?.length).toBe(13);
+    // 11 commands → header + 11 rows + blank + emergency-exit footer = 14.
+    expect(result.notes?.length).toBe(14);
   });
 });

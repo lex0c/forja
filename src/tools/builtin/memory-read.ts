@@ -171,6 +171,23 @@ export const memoryReadTool: Tool<MemoryReadInput, MemoryReadOutput> = {
     if (fm.expires !== undefined) out.expires = fm.expires;
     if (fm.trust !== undefined) out.trust = fm.trust;
     if (fm.triggers !== undefined) out.triggers = fm.triggers;
+
+    // Spec §7.2.7: surface `[memory: untrusted]` in the UI when an
+    // untrusted body lands in context. The model already sees the
+    // marker via `out.trust` in the JSON envelope; the warn emission
+    // gives the operator a visible cue in the live region. Without
+    // it, an operator monitoring a running session might miss that
+    // a hand-marked-untrusted memory was just loaded — silent
+    // injection vector. emitWarn is optional on ToolContext so
+    // headless / SDK callers without an event sink no-op cleanly;
+    // production paths (REPL, one-shot via run.ts) wire it via the
+    // harness loop so the warn always reaches the renderer.
+    if (fm.trust === 'untrusted' && ctx.emitWarn !== undefined) {
+      ctx.emitWarn(
+        `[memory: untrusted] loaded ${result.scope}/${fm.name} — body kept out of base context, treat its claims with extra scrutiny`,
+      );
+    }
+
     return out;
   },
 };

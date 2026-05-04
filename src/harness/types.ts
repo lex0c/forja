@@ -33,6 +33,22 @@ export type HarnessEvent =
     }
   | { type: 'tool_decided'; toolUseId: string; decision: Decision }
   | {
+      // Operator-facing warning emitted by a tool MID-execution
+      // (no failure — the tool still returns success). Used today
+      // by `memory_read` to surface `[memory: untrusted]` per
+      // spec §7.2.7 ("UI mostra `[memory: untrusted]` em qualquer
+      // memória `untrusted` carregada"). Adapter translates to a
+      // `warn` UIEvent in the live region; NDJSON consumers see
+      // the harness-side shape verbatim. Distinct from `warn`
+      // events the harness emits for non-tool concerns (resume
+      // truncation, etc.) so audit can attribute them to a
+      // specific tool call.
+      type: 'tool_warning';
+      toolUseId: string;
+      toolName: string;
+      message: string;
+    }
+  | {
       type: 'tool_finished';
       toolUseId: string;
       toolName: string;
@@ -357,7 +373,67 @@ export interface HarnessConfig {
     cwd: string;
     prompt: string;
   }) => Promise<boolean>;
+  // Trust state of `cwd` (AGENTIC_CLI.md §9.1, MEMORY.md §7.2.1).
+  // True when the cwd is in the persisted `trusted_dirs.json` at
+  // bootstrap time. False when storage is unavailable, the file
+  // is missing/corrupt, or the cwd hasn't been confirmed yet.
+  // Threaded through to `ToolContext.isCwdTrusted` so tools can
+  // self-gate when a path's trust matters (today only
+  // `memory_write` consumes it — refuses `inferred` writes in
+  // untrusted cwds). Defaults to false at the harness layer
+  // (fail-closed); production callers always set it from
+  // bootstrap, tests opt in via the makeCtx helper which
+  // defaults to true (post-trust-prompt reality).
+  isCwdTrusted?: boolean;
+  // Async hook for memory_write modal confirmation (MEMORY.md §5.1).
+  // Caller resolves with the operator's decision so the tool layer
+  // can map it onto an audit row + the writer call. Per spec: 'yes'
+  // proceeds with the persist, 'no' is an explicit reject (audit
+  // gets `refused`), 'cancel' is an Esc/timeout (audit gets
+  // `refused` with reason='cancelled'). When unset, the
+  // memory_write tool falls back to "headless / no-modal", which
+  // per spec §5.1.6 means the write is rejected. Interactive
+  // callers (REPL) wire this to `modalManager.askMemoryWrite`;
+  // one-shot mode leaves it unset.
+  confirmMemoryWrite?: (req: ConfirmMemoryWriteRequest) => Promise<MemoryWriteAnswer>;
+  // Async hook for the user-scope second-confirm modal (MEMORY.md
+  // §7.2.5). The `memory_write` tool fires this AFTER
+  // `confirmMemoryWrite` returns yes AND the proposed scope is
+  // `user`. Caller (REPL) wires it to
+  // `modalManager.askMemoryUserScope`. When unset, the tool
+  // refuses user-scope writes with `headless_mode` (paired with
+  // confirmMemoryWrite — production wires both, headless wires
+  // neither). Body is included so the modal can re-render the
+  // exact bytes; spec doesn't require it but it gives the
+  // operator a second look at the content before the
+  // cross-session blast hits.
+  confirmMemoryUserScope?: (req: ConfirmMemoryUserScopeRequest) => Promise<MemoryWriteAnswer>;
 }
+
+// Producer-facing args for `confirmMemoryWrite`. Mirrors
+// `MemoryWriteAskArgs` from modal-manager.ts but lives in the
+// harness layer so tools don't import the TUI module. The body is
+// the EXACT bytes about to land on disk; the modal renders it
+// verbatim so the operator can spot prompt-injection attempts
+// before approving.
+export interface ConfirmMemoryWriteRequest {
+  scope: 'user' | 'project_shared' | 'project_local';
+  name: string;
+  body: string;
+}
+
+// Producer-facing args for `confirmMemoryUserScope`. No `scope`
+// field by construction — the caller has already established
+// it's a user-scope write before invoking this. Mirrors
+// `MemoryUserScopeAskArgs` from modal-manager.ts.
+export interface ConfirmMemoryUserScopeRequest {
+  name: string;
+  body: string;
+}
+
+// Same union as `MemoryWriteAnswer` in modal-manager.ts. Re-declared
+// here so the harness layer doesn't pull on the TUI module.
+export type MemoryWriteAnswer = 'yes' | 'no' | 'cancel';
 
 export interface HarnessResult {
   status: 'done' | 'interrupted' | 'exhausted' | 'error';

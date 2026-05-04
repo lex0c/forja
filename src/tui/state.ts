@@ -62,6 +62,13 @@ export interface StatusState {
   // column as a `plan` token between model and budget. Default false
   // on createInitialState; flipped by `session:start.planMode`.
   planMode: boolean;
+  // Distinct-name memory count for the footer's `mem N` segment
+  // (BACKLOG D68 follow-up). Snapshot at session:start; mid-session
+  // memory_write success could bump the count, but we keep the
+  // value boot-fresh for now (operators don't expect the footer to
+  // animate per-memory-write — too much noise for too little
+  // signal). 0 == no segment rendered.
+  memoryCount: number;
 }
 
 export interface PendingAssistant {
@@ -117,7 +124,15 @@ export interface ConfirmState {
   // route to the right answer shape. All confirm-shaped modals
   // (permission, trust, memory write, plan review, critique) share
   // this single state field — only one modal visible at a time.
-  flavor: 'permission' | 'trust' | 'memory-write' | 'plan-review' | 'critique' | 'history-clear';
+  flavor:
+    | 'permission'
+    | 'trust'
+    | 'memory-write'
+    | 'memory-user-scope'
+    | 'memory-action'
+    | 'plan-review'
+    | 'critique'
+    | 'history-clear';
   // Title block: bold first line + dim subject. `subject` is
   // optional — null when the modal has no single target (some
   // critique modals).
@@ -243,6 +258,7 @@ export const createInitialState = (): LiveState => ({
     costUsd: 0,
     maxCostUsd: null,
     planMode: false,
+    memoryCount: 0,
   },
   activeTools: new Map(),
   pendingAssistant: null,
@@ -360,6 +376,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
         project: event.project,
         model: event.model,
         planMode: event.planMode === true,
+        memoryCount: event.memoryCount ?? 0,
       };
       // Boundary cleanup: soft-interrupt state and bg processes are
       // both per-session. A fresh session starts clean even if the
@@ -881,6 +898,78 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
             subject: `${event.scope}/${event.name}`,
             preview: event.body.split('\n'),
             question: 'Save this memory entry?',
+            options,
+            selectedIndex: options.length - 1,
+            hints: ['Esc to cancel'],
+          },
+        },
+        permanent: [],
+      };
+    }
+
+    case 'memory:action:ask': {
+      // Generic confirm flavor for /memory delete | promote | demote
+      // (spec §5.4 / §5.5 / §6.3). Producer (slash command) supplies
+      // the title / subject / preview / question — reducer just
+      // mounts them. Conservative-default last-option (No) mirrors
+      // every other modal flavor.
+      const options: ConfirmOption[] = [
+        { key: '1', label: 'Yes, proceed', value: 'yes' },
+        { key: '2', label: 'No, cancel', value: 'no' },
+      ];
+      return {
+        state: {
+          ...state,
+          modal: {
+            promptId: event.promptId,
+            flavor: 'memory-action',
+            title: event.title,
+            subject: event.subject,
+            preview: event.preview,
+            question: event.question,
+            options,
+            selectedIndex: options.length - 1,
+            hints: ['Esc to cancel'],
+          },
+        },
+        permanent: [],
+      };
+    }
+
+    case 'memory:user-scope:ask': {
+      // Spec §7.2.5 second-confirm modal. Wording leans heavy on
+      // the cross-session blast radius — the operator just said
+      // "yes" to writing this memory; the only reason to ask
+      // again is to make them think about "and EVERY future
+      // session" before persisting. Same option shape as the
+      // first prompt (yes/no, default no) so muscle memory carries
+      // over, but title/subject/preview emphasize the scope risk.
+      //
+      // Preview lines are kept as natural sentences (not pre-
+      // wrapped at fixed columns) — the renderer wraps via
+      // wrap-ansi at terminal width, and pre-wrapping here would
+      // either truncate in narrow terminals or produce a
+      // fragmented look in wide ones. Trust modal and plan-review
+      // follow the same convention.
+      const options: ConfirmOption[] = [
+        { key: '1', label: 'Yes, persist to user scope', value: 'yes' },
+        { key: '2', label: 'No, cancel write', value: 'no' },
+      ];
+      return {
+        state: {
+          ...state,
+          modal: {
+            promptId: event.promptId,
+            flavor: 'memory-user-scope',
+            title: 'Confirm user-scope memory',
+            subject: event.name,
+            preview: [
+              'This memory will load in EVERY session on this machine, regardless of project.',
+              'Confirm only if the content is genuinely cross-project context.',
+              '',
+              ...event.body.split('\n'),
+            ],
+            question: 'Persist to user scope?',
             options,
             selectedIndex: options.length - 1,
             hints: ['Esc to cancel'],

@@ -1,4 +1,9 @@
-import type { MemoryRegistry } from '../memory/index.ts';
+import {
+  type BootContext,
+  EMPTY_BOOT_CONTEXT,
+  type MemoryRegistry,
+  shouldEagerLoadByTriggers,
+} from '../memory/index.ts';
 
 // Eager memory index injection into the system prompt.
 //
@@ -36,21 +41,80 @@ import type { MemoryRegistry } from '../memory/index.ts';
 // about which one wins — wasted tokens, wasted attention.
 //
 // Trust filtering (spec §7.2 mitigation 2) — memories with
-// `trust: untrusted` MUST NOT enter the base context. 5.2.c
-// does NOT load bodies during section assembly (eager-index
-// principle), so we can't read frontmatter to check trust per
-// entry. 5.4 lands the trust integration with index-side trust
-// markers OR a body preload pass; until then no production path
-// writes `trust: untrusted` (only the writer in 5.4 does), so
-// the gate is effectively a no-op now. Documented as a known
-// limitation in the BACKLOG entry.
+// `trust: untrusted` MUST NOT enter the base context, only on
+// demand via `memory_read`. The index file (`MEMORY.md`) has
+// no trust column per spec §3.2 ("uma linha por memória, sem
+// frontmatter próprio"), so the only way to know a memory's
+// trust state is to read the body. We accept the per-session
+// boot cost: N small disk reads at session start (memories are
+// short and few — typical operator has <50 entries across all
+// scopes) is negligible compared to the security win of
+// keeping untrusted content out of the eager prompt cache.
+// Reads go through `peek` instead of `read` so this filter
+// pass doesn't flood `memory_events` with system-internal
+// `read` rows.
+//
+// Failure modes when peek doesn't return a parseable file:
+//   - 'missing' / 'malformed' / 'unknown' → INCLUDE the index
+//     entry. Defaulting to "exclude on uncertainty" would
+//     silently hide hand-edited memories the operator created
+//     but couldn't have intended to mark untrusted (since
+//     we couldn't read the trust marker). The operator already
+//     sees malformed-body diagnostics elsewhere (audit table,
+//     /memory list when it lands).
+//   - 'present' + frontmatter.trust === 'untrusted' → SKIP.
+//   - 'present' + trust absent or 'trusted' → INCLUDE.
+//
+// Boot-time triggers (spec §4.3) — memories with `triggers:` in
+// their frontmatter are conditional eager-loads. The caller passes
+// a `BootContext` (built by `evaluateBootTriggers(cwd)`); memories
+// match per `shouldEagerLoadByTriggers`. Callers that don't want
+// trigger filtering (tests, programmatic SDK use without a cwd)
+// pass `EMPTY_BOOT_CONTEXT` — which makes well-known-tagged
+// memories invisible until the corresponding context probe fires.
+// The default for `bootContext` in this module is the empty
+// context, so existing call sites without trigger awareness keep
+// their pre-this-slice behavior MODULO the rule-2 escape hatch:
+// memories tagged with operator-defined runtime tags pass through
+// unconditionally. See `triggers.ts` for the full rule set.
 
+// Verify-before-act guidance (spec §6.1). Memories may have been
+// written days, weeks, or months ago — code drifts in between.
+// Factual claims (file paths, exported names, schema shape) need
+// to be re-checked against the current tree before the model acts
+// on them; preference claims ("we use Title Case in commits")
+// have no "current state" to verify against, so the verification
+// step is wasted work.
+//
+// The guidance lives in the eager prompt section (always loaded
+// when memories exist) rather than per-memory: the model needs
+// to know the rule before reading any specific memory body, and
+// repeating the rule at every memory_read call would burn tokens
+// for no incremental signal. Spec's example (`memória diz X
+// exporta Y → grep antes de agir`) is preserved verbatim in
+// concept; concrete tools (grep, read_file) named so the model
+// knows which tool to invoke for verification.
+//
+// Section text is two paragraphs: tool list + verification rule.
+// Tools first because that's what the model needs for orientation
+// ("what can I do with these memories?"); verification rule second
+// because it's the safety nuance that needs to land BEFORE the
+// list of names ("oh, and don't blindly trust the contents").
 const MEMORY_SECTION_HEADER = `# Memory
 
-Cross-session memories you can use. Call memory_read(name) to load a body, memory_list / memory_search to explore.`;
+Cross-session memories you can use. Call memory_read(name) to load a body, memory_list / memory_search to explore.
+
+Before acting on a FACTUAL memory (file paths, exported names, schema shape), verify it against the current code with grep / read_file. If reality has drifted from the memory, update or discard the memory rather than acting on stale info. PREFERENCE memories (commit style, naming conventions) have no "current state" to verify against — proceed without re-checking.`;
 
 export interface AssembleMemorySectionInput {
   registry: MemoryRegistry;
+  // Boot-time trigger context (spec §4.3). When omitted, the
+  // empty context is used: well-known-tagged memories are
+  // filtered out, untagged and operator-runtime-tagged memories
+  // pass through. Callers (production: bootstrap;
+  // production: subagent-child) pass the result of
+  // `evaluateBootTriggers(cwd)`.
+  bootContext?: BootContext;
 }
 
 export interface AssembleMemorySectionResult {
@@ -68,19 +132,53 @@ export interface AssembleMemorySectionResult {
 export const assembleMemorySection = (
   input: AssembleMemorySectionInput,
 ): AssembleMemorySectionResult => {
-  // Dedup so a `commit-style` shadowed across all three scopes
-  // shows up once (most-specific scope only). Model gets a clean
-  // view of "what's actually active for this session".
-  const listings = input.registry.list({ deduplicateByName: true });
-  if (listings.length === 0) {
+  // Order matters: filter trust BEFORE dedupe. Spec §7.2.2 marks
+  // trust per-MEMORY (not per-name), so an untrusted entry in
+  // `project_local` should NOT eclipse a trusted entry of the
+  // same name in `user`. Reversing the order (dedupe first) would
+  // keep the most-specific scope, drop it as untrusted, and
+  // silently lose the trusted shadow — wrong per spec.
+  //
+  // The non-deduped list comes back in precedence order
+  // (project_local → project_shared → user), so filtering then
+  // deduping by name keeps the first SURVIVING scope per name —
+  // which is the most-specific TRUSTED scope. That matches the
+  // user's intent: "promote the trusted shadow to active when the
+  // more-specific scope is marked untrusted".
+  const all = input.registry.list();
+  if (all.length === 0) {
     return { text: '', entryCount: 0 };
   }
-
-  const lines: string[] = [MEMORY_SECTION_HEADER, ''];
-  for (const l of listings) {
-    lines.push(`- [${l.scope}] ${l.name} — ${l.entry.hook}`);
+  const bootContext = input.bootContext ?? EMPTY_BOOT_CONTEXT;
+  // Combined per-memory filter: spec §7.2.2 trust + spec §4.3
+  // boot-time triggers. Single peek per memory delivers both
+  // pieces of state (frontmatter.trust + frontmatter.triggers),
+  // saving disk reads vs filtering in two passes. See module
+  // header for failure-mode rationale (uncertain peek → include).
+  const eligible = all.filter((l) => {
+    const peek = input.registry.peek(l.name, { scope: l.scope });
+    if (peek.kind !== 'present') return true; // uncertainty → include
+    if (peek.file.frontmatter.trust === 'untrusted') return false;
+    return shouldEagerLoadByTriggers(peek.file.frontmatter.triggers, bootContext);
+  });
+  if (eligible.length === 0) {
+    // Every memory was filtered out. Same empty-shape as a
+    // registry that never had entries — bootstrap's length-zero
+    // check passes through cleanly.
+    return { text: '', entryCount: 0 };
   }
-  return { text: lines.join('\n'), entryCount: listings.length };
+  // Dedupe by name on the eligible list. precedence order is
+  // preserved (most-specific surviving scope wins).
+  const seen = new Set<string>();
+  const lines: string[] = [MEMORY_SECTION_HEADER, ''];
+  let included = 0;
+  for (const l of eligible) {
+    if (seen.has(l.name)) continue;
+    seen.add(l.name);
+    lines.push(`- [${l.scope}] ${l.name} — ${l.entry.hook}`);
+    included++;
+  }
+  return { text: lines.join('\n'), entryCount: included };
 };
 
 // Compose the memory section onto an optional base prompt. The

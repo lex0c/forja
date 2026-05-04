@@ -22,7 +22,7 @@ import type { SubagentDefinition } from './types.ts';
 // without polluting the parent's tree. The validator still rejects
 // unregistered tool names regardless of isolation.
 //
-// Two checks per tool:
+// Three checks per tool:
 //   1. The tool must be registered with the active registry. The
 //      runtime would catch this at child-registry construction
 //      time too, but pulling it forward gives the author a clean
@@ -31,6 +31,17 @@ import type { SubagentDefinition } from './types.ts';
 //      the definition opts into worktree isolation. Without
 //      worktree, mutating tools have no reverse path; with it,
 //      the worktree contains them.
+//   3. The tool's metadata must NOT declare `requiresOperatorConfirm`
+//      regardless of isolation. These tools (today only
+//      `memory_write`) need a modal pipe to the parent's operator
+//      REPL; subagents are headless from the operator's perspective
+//      and have no IPC channel for confirms. Worktree isolation
+//      doesn't help here — the missing piece is the modal callback,
+//      not filesystem containment. A future slice that grows IPC's
+//      surface (spec §11) to thread confirms back through the parent
+//      will lift this gate; until then, we reject at validate time
+//      so the author gets a clean error instead of a deferred
+//      `headless_mode` rejection at first invocation.
 //
 // Step 4.2b.iv lifted the third check (`requiresBgManager`):
 // every subagent now gets its own bg log directory namespaced
@@ -57,6 +68,17 @@ export const validateSubagentTools = (
     if (tool === null) {
       throw new Error(
         `subagent '${definition.name}' (${definition.sourcePath}): tool '${toolName}' is not registered with the active toolset`,
+      );
+    }
+    // requiresOperatorConfirm is stricter than writes — checked
+    // first so the operator gets the more specific reason. A
+    // confirm-bound tool that ALSO declares writes=true would
+    // otherwise surface the writes-without-worktree error and
+    // mislead the operator into adding `isolation: worktree`,
+    // which doesn't unblock anything.
+    if (tool.metadata.requiresOperatorConfirm === true) {
+      throw new Error(
+        `subagent '${definition.name}' (${definition.sourcePath}): tool '${toolName}' declares metadata.requiresOperatorConfirm=true and cannot appear in subagent.tools[] — the tool needs a modal-confirmation pipe to the parent REPL, which subagents do not have today. Remove the tool from this subagent's whitelist.`,
       );
     }
     if (tool.metadata.writes === true && !allowWrites) {

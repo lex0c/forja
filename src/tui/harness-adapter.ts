@@ -63,6 +63,13 @@ export interface HarnessAdapterCtx {
   // Forwarded into `session:start.planMode` so the footer can show
   // the `plan` indicator. Defaults to false (full-write profile).
   planMode?: boolean;
+  // Distinct-name memory count at session boot (BACKLOG D68
+  // follow-up). Forwarded into `session:start.memoryCount` so the
+  // footer can render the `mem N` segment. Caller (REPL) reads
+  // it from `MemoryRegistry.count({ deduplicateByName: true })`.
+  // Optional: when memory wasn't wired (one-shot SDK without
+  // memoryRegistry), the segment is suppressed.
+  memoryCount?: number;
   // Wall-clock source. Production = Date.now; tests inject a counter.
   // Every emitted UIEvent stamps `ts` from this so renderers can show
   // "elapsed" without holding their own clock.
@@ -165,6 +172,7 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           project: ctx.project,
           model: ctx.model,
           ...(ctx.planMode === true ? { planMode: true } : {}),
+          ...(ctx.memoryCount !== undefined ? { memoryCount: ctx.memoryCount } : {}),
         });
         // Initial step:budget so the status line shows "0/N · $0" from
         // the very first frame instead of waiting on step_start.
@@ -351,6 +359,24 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         // outcome surfaces on `tool_finished` (status: 'denied' for
         // deny, 'done'/'error' otherwise). This avoids adding an
         // event the reducer would have to no-op.
+        return out;
+      }
+
+      case 'tool_warning': {
+        // Tool surfaced a non-error notice mid-execution (today:
+        // memory_read flagging an untrusted body per spec §7.2.7).
+        // Translate to a generic `warn` UIEvent so the live region
+        // renders it in the warn palette. The toolUseId stays in
+        // the harness-side event for NDJSON consumers; the UI
+        // event is intentionally generic so the renderer doesn't
+        // need per-tool branches. Operators see "[memory:
+        // untrusted] loaded foo" inline in scrollback, the same
+        // shape as any other warn line.
+        out.push({
+          type: 'warn',
+          ts,
+          message: event.message,
+        });
         return out;
       }
 

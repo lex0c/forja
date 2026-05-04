@@ -55,6 +55,17 @@ export interface SlashContext {
   // startTurn). Read fresh per-call so a turn that started AFTER
   // the slash command was queued still reports correctly.
   isRunning: () => boolean;
+  // Most recent session id, or null when no turn has run yet in
+  // this REPL instance. Slash commands that emit audit rows
+  // (today only `/memory show` via `registry.read`) forward this
+  // as `auditSessionId` so the row groups with the operator's
+  // current session in `/memory audit` queries. Closure / getter
+  // (not static field) because the SlashContext is built once at
+  // REPL boot but the session id only exists after the first
+  // turn's `session_finished` event lands. Returns null between
+  // boot and first turn — callers MUST treat null as "skip the
+  // attribution override" rather than passing it through.
+  currentSessionId: () => string | null;
   // History controls (HISTORY.md §2.3). `/history off` / `/history on`
   // toggle the session-volatile flag; `/history clear` invokes
   // `clearLocal` AFTER the storage layer wipe so the in-memory

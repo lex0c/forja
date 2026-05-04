@@ -770,6 +770,147 @@ You are the worker.`,
     }
   });
 
+  test('boot triggers probe the subagent repo root, not the raw session.cwd (regression)', async () => {
+    // Bug: subagent-child evaluated boot triggers from
+    // `session.cwd`. For an isolation:none subagent inheriting
+    // the parent's invocation cwd, that cwd may be a repo subdir
+    // (`/repo/src/components/`). Probing there missed root-level
+    // files (`.git`, `package.json`, `tsconfig.json`) and silently
+    // filtered out trigger-tagged memories — even though those
+    // memories were loaded from the parent's repo root. Fix:
+    // probe `resolveRepoRoot(session.cwd)` so the trigger anchor
+    // matches the memory anchor.
+    //
+    // Setup: parentRepo with `git init` + memory tagged
+    // `triggers: [git]`. Subagent.cwd points at a subdir within
+    // parentRepo. Memory MUST appear in the subagent's system
+    // prompt.
+    const fs = await import('node:fs');
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    const parentRepo = mkdtempSync(join(tmpdir(), 'forja-trigger-'));
+    Bun.spawnSync({
+      cmd: ['git', 'init', parentRepo],
+      stdout: 'ignore',
+      stderr: 'ignore',
+    });
+    fs.writeFileSync(join(parentRepo, 'package.json'), '{}');
+    const subdir = join(parentRepo, 'src', 'components');
+    fs.mkdirSync(subdir, { recursive: true });
+
+    const originalXdg = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = parentRepo;
+    try {
+      // Memory tagged with both well-known boot triggers.
+      const localDir = join(parentRepo, '.agent', 'memory', 'local');
+      fs.mkdirSync(localDir, { recursive: true });
+      fs.writeFileSync(
+        join(localDir, 'MEMORY.md'),
+        '- [Tagged](git-tagged.md) — git-tagged memory\n',
+      );
+      fs.writeFileSync(
+        join(localDir, 'git-tagged.md'),
+        [
+          '---',
+          'name: git-tagged',
+          'description: hook for git-tagged',
+          'type: feedback',
+          'source: user_explicit',
+          'triggers:',
+          '  - git',
+          '  - package',
+          '---',
+          '',
+          'body',
+        ].join('\n'),
+      );
+
+      let childId: string;
+      const db = openDb(dbPath);
+      try {
+        migrate(db);
+        const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: parentRepo });
+        const child = sessionsRepo.createSession(db, {
+          model: 'mock/m',
+          // Subagent runs from a subdir of parentRepo (simulates
+          // isolation:none with parent at subdir).
+          cwd: subdir,
+          parentSessionId: parent.id,
+        });
+        childId = child.id;
+        subagentRunsRepo.insertSubagentRun(db, {
+          sessionId: child.id,
+          name: 'explore',
+          scope: 'project',
+          sourcePath: '/fake/explore.md',
+          sourceSha256: 'a'.repeat(64),
+          systemPrompt: 'You are explore.',
+          toolsWhitelist: ['memory_read'],
+          budgetMaxSteps: 5,
+          budgetMaxCostUsd: 0.1,
+        });
+        messagesRepo.appendMessage(db, {
+          sessionId: child.id,
+          role: 'user',
+          content: 'go',
+        });
+      } finally {
+        db.close();
+      }
+
+      const recordedSystem: Array<string | undefined> = [];
+      const recordingProvider: Provider = {
+        id: 'mock/m',
+        family: 'anthropic',
+        capabilities: {
+          tools: 'native',
+          cache: false,
+          vision: false,
+          streaming: true,
+          constrained: 'tools',
+          context_window: 1000,
+          output_max_tokens: 100,
+          cost_per_1k_input: 0,
+          cost_per_1k_output: 0,
+          notes: [],
+        },
+        async *generate(req): AsyncGenerator<StreamEvent> {
+          recordedSystem.push(req.system);
+          yield { kind: 'start', message_id: 'mock-msg' };
+          yield { kind: 'text_delta', text: 'done' };
+          yield { kind: 'stop', reason: 'end_turn' };
+        },
+        generateConstrained: () => Promise.reject(new Error('n/a')),
+        countTokens: () => Promise.resolve(0),
+      };
+
+      const exitCode = await runSubagentChild({
+        sessionId: childId,
+        dbPath,
+        providerOverride: recordingProvider,
+        userAgentsDir: null,
+        projectAgentsDir: null,
+        memoryCwd: parentRepo,
+        errSink: () => undefined,
+      });
+      expect(exitCode).toBe(0);
+      // Memory MUST be present — `git` and `package` triggers
+      // fired because the probe found `resolveRepoRoot(subdir) ===
+      // parentRepo` and probed the root files there.
+      const sys = recordedSystem[0] ?? '';
+      expect(sys).toContain('# Memory');
+      expect(sys).toContain('git-tagged');
+    } finally {
+      if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = originalXdg;
+      try {
+        rmSync(parentRepo, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+
   test('whitelist without memory_* tools skips the section even when memoryCwd is forwarded (regression: S1)', async () => {
     // Lean-subagent guard: a subagent that only lists `read_file`
     // in its whitelist has no way to invoke memory_read /

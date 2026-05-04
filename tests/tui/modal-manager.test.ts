@@ -388,3 +388,88 @@ describe('close', () => {
     expect(s.manager.pendingCount()).toBe(0);
   });
 });
+
+describe('askMemoryWrite (memory:write:ask producer)', () => {
+  test('emits memory:write:ask with scope/name/body and pushes focus handler', () => {
+    const s = make();
+    s.manager.askMemoryWrite({
+      scope: 'project_local',
+      name: 'no-console-log',
+      body: 'Lorem ipsum.',
+    });
+    expect(s.fs.size()).toBe(1);
+    const ask = s.events.find((e) => e.type === 'memory:write:ask');
+    expect(ask).toBeDefined();
+    if (ask?.type !== 'memory:write:ask') throw new Error('wrong event type');
+    expect(ask.scope).toBe('project_local');
+    expect(ask.name).toBe('no-console-log');
+    expect(ask.body).toBe('Lorem ipsum.');
+  });
+
+  test('default selectedIndex = last (No); plain Enter resolves "no"', async () => {
+    const s = make();
+    const promise = s.manager.askMemoryWrite({
+      scope: 'user',
+      name: 'pref',
+      body: 'b',
+    });
+    s.fs.dispatch(key('enter'));
+    await expect(promise).resolves.toBe('no');
+  });
+
+  test('hotkey "1" resolves "yes"', async () => {
+    const s = make();
+    const promise = s.manager.askMemoryWrite({
+      scope: 'project_local',
+      name: 'x',
+      body: 'b',
+    });
+    s.fs.dispatch(charKey('1'));
+    await expect(promise).resolves.toBe('yes');
+  });
+
+  test('Esc resolves "cancel" (distinct from "no")', async () => {
+    const s = make();
+    const promise = s.manager.askMemoryWrite({
+      scope: 'project_local',
+      name: 'x',
+      body: 'b',
+    });
+    s.fs.dispatch(key('escape'));
+    await expect(promise).resolves.toBe('cancel');
+  });
+});
+
+describe('askMemoryUserScope (memory:user-scope:ask producer, spec §7.2.5)', () => {
+  test('emits memory:user-scope:ask and pushes focus handler', () => {
+    const s = make();
+    s.manager.askMemoryUserScope({ name: 'pref', body: 'b' });
+    expect(s.fs.size()).toBe(1);
+    const ask = s.events.find((e) => e.type === 'memory:user-scope:ask');
+    expect(ask).toBeDefined();
+    if (ask?.type !== 'memory:user-scope:ask') throw new Error('wrong type');
+    expect(ask.name).toBe('pref');
+    expect(ask.body).toBe('b');
+  });
+
+  test('default selectedIndex = last (No); plain Enter resolves "no"', async () => {
+    const s = make();
+    const promise = s.manager.askMemoryUserScope({ name: 'p', body: 'b' });
+    s.fs.dispatch(key('enter'));
+    await expect(promise).resolves.toBe('no');
+  });
+
+  test('hotkey "1" resolves "yes"', async () => {
+    const s = make();
+    const promise = s.manager.askMemoryUserScope({ name: 'p', body: 'b' });
+    s.fs.dispatch(charKey('1'));
+    await expect(promise).resolves.toBe('yes');
+  });
+
+  test('Esc resolves "cancel"', async () => {
+    const s = make();
+    const promise = s.manager.askMemoryUserScope({ name: 'p', body: 'b' });
+    s.fs.dispatch(key('escape'));
+    await expect(promise).resolves.toBe('cancel');
+  });
+});

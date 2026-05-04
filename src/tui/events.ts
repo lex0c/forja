@@ -35,6 +35,12 @@ export type SessionStartEvent = BaseEvent & {
   // equivalent to false; producers that don't know plan-mode state
   // can omit the field.
   planMode?: boolean;
+  // Distinct-name memory count surfaced in the footer's right
+  // column as `mem N`. Dedupe-by-name matches what the operator
+  // sees in the eager prompt section. Optional: producers that
+  // didn't wire memory (one-shot SDK, replay tools) omit the
+  // field; renderer skips the segment when undefined or zero.
+  memoryCount?: number;
 };
 
 // One-shot welcome banner (UI.md §4.10.9). Emitted by the REPL at
@@ -243,6 +249,48 @@ export type MemoryWriteAskEvent = BaseEvent & {
   scope: MemoryScopeForUI;
   name: string;
   body: string;
+};
+
+// User-scope second-confirm modal (spec MEMORY.md §7.2.5: "Memória
+// user-global precisa dois prompts (write + escopo) — vai afetar
+// todas as sessões, exige fricção extra"). Producer: `memory_write`
+// tool fires this AFTER the first `memory:write:ask` resolves yes
+// AND the proposed scope is `user`. Distinct event type rather than
+// reusing `memory:write:ask` so the modal can render a
+// scope-specific warning ("this memory will load in EVERY session
+// on this machine") and the audit trail can distinguish first-
+// vs-second-prompt rejection.
+export type MemoryUserScopeAskEvent = BaseEvent & {
+  type: 'memory:user-scope:ask';
+  promptId: string;
+  name: string;
+  body: string;
+};
+
+// Generic confirmation modal for memory destructive / move
+// operations (spec MEMORY.md §6.3 + §5.4 + §5.5). One flavor with
+// caller-supplied copy lets `/memory delete`, `/memory promote
+// shared`, and `/memory demote local` share the modal pipeline
+// without each carrying a dedicated event type. The producer
+// (slash command) constructs `title` / `subject` / `preview` to
+// match the action; reducer just renders them. `action` lets
+// audit trace which operator path opened the modal — distinct
+// from `memory:write:ask` so the audit row's stage tag stays
+// unambiguous.
+export type MemoryActionAskEvent = BaseEvent & {
+  type: 'memory:action:ask';
+  promptId: string;
+  // Discriminator for audit + telemetry. Reducer doesn't branch
+  // on it; the slash command does to pick the right `action`
+  // value when emitting the resulting `memory_events` row.
+  action: 'delete' | 'promote' | 'demote';
+  title: string;
+  subject: string;
+  preview: string[];
+  // Question line under the preview ("Confirm delete?", "Promote
+  // to shared?", etc.). Producer-supplied so the wording matches
+  // the operation's verb tense.
+  question: string;
 };
 export type PlanReviewEvent = BaseEvent & {
   type: 'plan:review';
@@ -468,6 +516,8 @@ export type UIEvent =
   | ModalSelectEvent
   | TrustAskEvent
   | MemoryWriteAskEvent
+  | MemoryUserScopeAskEvent
+  | MemoryActionAskEvent
   | PlanReviewEvent
   | CritiqueAskEvent
   | HistoryClearAskEvent

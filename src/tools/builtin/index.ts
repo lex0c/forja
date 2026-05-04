@@ -9,6 +9,7 @@ import { grepTool } from './grep.ts';
 import { memoryListTool } from './memory-list.ts';
 import { memoryReadTool } from './memory-read.ts';
 import { memorySearchTool } from './memory-search.ts';
+import { memoryWriteTool } from './memory-write.ts';
 import { monitorTool } from './monitor.ts';
 import { readFileTool } from './read-file.ts';
 import { taskTool } from './task.ts';
@@ -40,6 +41,8 @@ export type {
   MemorySearchInput,
   MemorySearchOutput,
 } from './memory-search.ts';
+export { memoryWriteTool } from './memory-write.ts';
+export type { MemoryWriteInput, MemoryWriteOutput } from './memory-write.ts';
 export { monitorTool } from './monitor.ts';
 export type { MonitorInput, MonitorOutput } from './monitor.ts';
 export { readFileTool } from './read-file.ts';
@@ -56,8 +59,10 @@ export type { WriteFileInput, WriteFileOutput } from './write-file.ts';
 // Order is intentional: read-only tools first, then writes, then exec.
 // Useful when scanning a `agent --list-tools` output. todo_write
 // sits with the read-only group — its 'write' is harness-internal
-// state, not external mutation. The memory_* family is read-only
-// (audit logs are internal), grouped here.
+// state, not external mutation. memory_list / read / search are
+// read-only (audit logs are internal); memory_write sits with the
+// other write tools because it persists to disk and is gated by
+// plan mode + operator confirm modal.
 export const BUILTIN_TOOLS = [
   readFileTool,
   globTool,
@@ -71,6 +76,7 @@ export const BUILTIN_TOOLS = [
   taskTool,
   writeFileTool,
   editFileTool,
+  memoryWriteTool,
   bashTool,
   bashBackgroundTool,
   bashOutputTool,

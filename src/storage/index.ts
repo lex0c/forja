@@ -125,6 +125,7 @@ export {
   createMemoryEvent,
   listMemoryEventsByName,
   listMemoryEventsBySession,
+  listRecentMemoryEvents,
 } from './repos/memory-events.ts';
 export type {
   CreateMemoryEventInput,

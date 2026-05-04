@@ -64,7 +64,40 @@ export type {
   MemoryRegistry,
   MemorySearchHit,
   ReadOptions,
+  RegistryEventInput,
   RegistryReadResult,
+  RegistryWriteResult,
   ScopeOption,
   SearchOptions,
+  WriteOptions,
 } from './registry.ts';
+
+export { writeMemory } from './writer.ts';
+export type { WriteMemoryInput, WriteMemoryResult, WriteWarning } from './writer.ts';
+
+export {
+  findExpiredMemories,
+  gcExpiredMemories,
+  moveMemory,
+  removeMemory,
+} from './lifecycle.ts';
+export type {
+  ExpiredMemory,
+  GcExpiredAuditOverride,
+  GcExpiredOptions,
+  GcExpiredResult,
+  MoveMemoryInput,
+  MoveMemoryResult,
+  RemoveMemoryInput,
+  RemoveMemoryResult,
+} from './lifecycle.ts';
+
+export {
+  EMPTY_BOOT_CONTEXT,
+  evaluateBootTriggers,
+  shouldEagerLoadByTriggers,
+} from './triggers.ts';
+export type { BootContext, BootTrigger } from './triggers.ts';
+
+export { SHARED_BODY_LINE_CAP, scanForInjection, scanForPromotion } from './scanner.ts';
+export type { ScanResult } from './scanner.ts';

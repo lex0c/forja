@@ -15,6 +15,952 @@ Format:
 
 ---
 
+## [2026-05-04] M3 / impl — /memory slash commands (list/show/audit/delete/promote/demote)
+
+Continues the memory subsystem on the same branch. Two commits in
+sequence:
+- `187f40d` — Tier 1: read-only inspection (`list`, `show`,
+  `audit` + summary). Closes the operator-inspection gap that was
+  the largest remaining deliverable for the autonomous-profile +
+  interactive-REPL scenario.
+- This entry — Tier 2: destructive + team-sharing (`delete`,
+  `promote shared`, `demote local`). Closes spec §5.4 + §5.5 + the
+  destructive half of §6.3.
+
+**Done (Tier 2):**
+
+- **Scanner extracted** to `src/memory/scanner.ts`. Two consumers:
+  `memory_write` tool (regular injection + secret check) and
+  `/memory promote shared` (`scanForPromotion` superset adds path-
+  traversal regex + 200-line cap per spec §5.4 "scanner adicional").
+- **`moveMemory` primitive** in `src/memory/lifecycle.ts`:
+  discriminated result, write-target-then-remove-source ordering
+  (a crash between leaves the source intact + a target copy —
+  recoverable via re-running, since writer's `exists` reject
+  short-circuits step 2 the second time). Special `moveToShared`
+  inline path because writer.ts rejects direct shared writes per
+  §5.1.3; that branch uses the same atomic-write + index-upsert
+  pattern as writer but targets `project_shared`. Code duplication
+  documented in the comment block — future cleanup is
+  `writeMemory({ allowShared: true })` opt-in.
+- **`/memory delete <name> [scope]`** — peek loads the body for
+  modal preview (operator sees what disappears), confirm via the
+  generic `memory:action:ask` modal, then `removeMemory` + audit
+  `deleted`. Frontmatter `source` threaded through to the audit
+  row so the delete row groups with the memory's history.
+  Malformed / missing peek paths use 'imported' as the source
+  fallback (real source unrecoverable; most-neutral marker).
+- **`/memory promote shared <name>`** — peek source from
+  `project_local`, run `scanForPromotion`, modal-confirm with body
+  preview + cross-team-impact warning, `moveMemory` on accept,
+  audit `promoted` with from/to scope details. Scanner runs BEFORE
+  modal opens — operator never confirms content the scanner would
+  block. Spec §5.4 line 390 "Não roda `git add` ou `git commit`":
+  verified — move primitive only writes files, no git invocation.
+- **`/memory demote local <name>`** — peek source from
+  `project_shared`, modal-confirm, `moveMemory`, audit `demoted`.
+  No additional scanner per §5.5 (going to less-trusted scope).
+- **Generic `memory:action:ask` modal flavor** — caller-supplied
+  title / subject / preview / question. Three subcommands share
+  one pipeline; reducer renders without per-action branches.
+- **`MemoryRegistry.roots`** exposed as `readonly ScopeRoots` so
+  slash callers use the same roots the registry was constructed
+  with — re-deriving via `resolveScopeRoots(resolveRepoRoot(cwd))`
+  diverges in tests with non-canonical fixture paths AND in any
+  future entrypoint with custom roots (admin tooling pointing at a
+  backup).
+- **Tests:** +24 (memory.test.ts spans 50 → 72 with delete +
+  promote + demote + failure paths) + 8 lifecycle (moveMemory
+  primitive coverage). Suite at 2613 pass / 0 fail.
+
+**Decisions:**
+
+- **Generic `memory-action` modal vs flavor-per-action.** Three
+  destructive subcommands have distinct copy but identical option
+  shape (yes/no, default last). Generic flavor with caller-supplied
+  strings = one event type, one reducer case, three callers.
+  Trade-off: reducer can't enforce per-action invariants (e.g.,
+  "promote modal must show source warning"); caller has full
+  control. Acceptable because each handler is small and
+  thoroughly tested.
+- **`moveMemory` write-then-delete instead of `renameSync`.** Spec
+  §5.4 line 387 says "Move arquivo: local/<name>.md → shared/
+  <name>.md" — phrasing suggests rename. We do write+delete
+  because (a) cross-scope renames may cross filesystems
+  (project_shared and project_local under same `.agent/` are
+  same-fs; user scope under `~/.config/agent/memory/` may be
+  different), (b) the writer's atomicity defenses (sandbox,
+  symlink) would have to be reimplemented in a rename path.
+  Two-step ordering means a crash window leaves source intact +
+  target copy. Operator can re-run; writer's `exists` reject is
+  the dedup gate. Documented in moveMemory comment.
+- **Scanner is binary-block, no warning tier.** Spec §5.4 line
+  383 mentions "rejeita se forte; warning se fraco" for
+  injection — we ship binary block for all matches. Warning tier
+  needs a "fuzzy match score" the scanner doesn't compute. Tracked
+  as deferred.
+
+**Out of scope (deferred):**
+
+- **`/memory edit <name>`** — needs `$EDITOR` spawn primitive.
+- **`/memory diff`** — needs git invocation surface.
+- **`/memory save`** — semantics underspecified ("baseado em
+  sessão atual" — propose a memory from the current conversation).
+- **`/memory expire <name> <date>`** — needs frontmatter-rewrite
+  primitive.
+- **`/memory promote user <name>`** — double-prompt promotion to
+  user scope. Spec §5.4 line 447 wants confirmation dupla.
+- **Scanner warning tier** (§5.4 "fraco"). Hard binary block now;
+  fuzzy match scoring lands when an operator pattern justifies it.
+- **Atomic rename move path** — current impl is write+delete with
+  a documented crash window. `renameSync` for same-fs scope pairs
+  + write+delete fallback is a future hardening.
+
+**Post-review fixes (2026-05-04):**
+
+- **`finalizeMove` regex bug.** First cut produced `/memory promotee:` /
+  `/memory demotee:` for failure paths via `action.replace(/d$/,
+  'e')` — strips the trailing 'd' of "promoted" instead of the
+  full "-ed" suffix. Replaced by explicit `pastTense` /
+  `infinitive` field pair. Tests (target_exists for both promote
+  and demote) now assert the message uses the verb form
+  explicitly.
+- **`memoryFilePath` resolution moved BEFORE the destructive
+  write** in both `moveMemory` and `moveToShared`. Defense-in-
+  depth against hypothetical FrontmatterError leaving the target
+  written with no return path tracked. Slash command already
+  validates name; the lifecycle primitive now does too.
+- **ESM imports** in `moveToShared` — converted from
+  `require('node:fs')` mid-function (commonJS-style) to top-level
+  ESM imports matching the rest of the codebase.
+- **Spread-of-array hack** in `handleDelete` peek call replaced
+  with explicit conditional. Two-character cost, much clearer.
+- **Real frontmatter `source` threaded through delete audit** —
+  earlier cut hardcoded `'imported'` for all delete rows; now
+  passes `peek.file.frontmatter.source` so the delete row groups
+  with the memory's history. Malformed/missing peek paths still
+  fall back to 'imported' (real source unrecoverable).
+- **Coverage:** +8 tests across `moveMemory` (source_malformed +
+  io_error via chmod), `/memory delete shared`, `/memory promote
+  shared` (secret pattern + path traversal + 200-line cap), and
+  failure-message asserts for both promote and demote
+  target_exists (regression guards for the `promotee` /
+  `demotee` typos).
+
+---
+
+## [2026-05-04] M3 / impl — memory visibility (count tray + untrusted warn marker)
+
+Continues the memory subsystem on the same branch. Two visibility
+deliverables paired in one slice:
+
+- BACKLOG D68 follow-up: `memory: N` in the boot env summary AND
+  the footer's right column tray segment, so an operator at-a-
+  glance knows how many cross-session memories the model can pull.
+- Spec §7.2.7 visual marker: when memory_read returns a body with
+  `trust: untrusted`, surface `[memory: untrusted]` as a warn line
+  in the live region so the operator sees what's entering context
+  even though the body itself stayed out of the eager prompt
+  section.
+
+**Done:**
+
+- **`MemoryRegistry.count(opts?)`** — sync method returning the
+  total entry count over the cached snapshot. `deduplicateByName`
+  collapses same-name shadows across scopes, matching the "active
+  memories" semantic the operator sees in the eager section.
+  Reuses `list()` so dedupe / scope-filter logic stays single-
+  source. Production call sites pass `deduplicateByName: true`;
+  raw-count callers (admin tooling, future /memory list) can opt
+  out.
+- **Boot env summary** (`src/cli/repl.ts`): banner emits
+  `{kind: 'meta', key: 'memory', value: '<count>'}` when the
+  registry has at least one entry. Closes the open BACKLOG D68
+  ("Memory entry count in env summary. Requires a sync
+  `MemoryRegistry.count()` method"). Suppressed at zero per the
+  "no useful info" rule.
+- **Footer tray segment** (`src/tui/render/footer.ts`):
+  `mem N` token appended after `bg N` in the right column.
+  Shorter prefix (`mem` not `memory`) keeps the right column
+  navigable on 80-col terminals. Suppressed when count is zero so
+  operators without memories don't see a dead segment. Drop
+  priority lower than bg (matches spec §4.10.6 "less sticky than
+  cost" trend — memory drops second when the column overflows).
+  Snapshot at adapter construction time (per-turn): a memory_write
+  succeeding mid-turn updates next turn's tray, not this one. Two
+  reasons: (a) per-write footer animation is too noisy for too
+  little signal; (b) the alternative (subscribe to memory_events
+  bus) couples renderer to audit-table semantics.
+- **`session:start.memoryCount` plumbing**: REPL builds the
+  adapter ctx with `memoryRegistry.count({ deduplicateByName: true })`,
+  adapter forwards into `session:start` event, reducer lands it on
+  `LiveState.status.memoryCount`. Optional all the way through —
+  one-shot SDK callers without a registry omit cleanly, footer
+  segment suppressed.
+- **`tool_warning` HarnessEvent + ToolContext.emitWarn**: new
+  generic seam for tools to surface non-error notices in the live
+  region. `tool_warning` carries `toolUseId` + `toolName` +
+  `message` (so NDJSON consumers can attribute), adapter
+  translates to a generic `warn` UIEvent (renderer doesn't need
+  per-tool branches). Loop wires `emitWarn(message)` per-call
+  with the active toolUseId/toolName captured in closure.
+- **`memory_read` consumes `emitWarn`** when `frontmatter.trust ===
+  'untrusted'`. Message: `[memory: untrusted] loaded
+  <scope>/<name> — body kept out of base context, treat its
+  claims with extra scrutiny`. Operator sees the warn line in
+  scrollback alongside the tool output card. Tool's JSON envelope
+  STILL carries `trust: 'untrusted'` (model-facing carrier); the
+  warn is the human-facing carrier.
+- **Tests:** 4 registry.count (empty / cross-scope total /
+  dedupe / refresh-on-write), 3 memory_read untrusted (warn
+  fires + carries scope/name / no warn for trusted / no-throw
+  when emitWarn absent), 3 footer (mem N renders / zero drops
+  segment / coexists with bg in correct order), 1 adapter
+  tool_warning translation, 2 adapter session_start
+  memoryCount (forwarded / omitted). +13 tests across the
+  slice; suite at 2548 pass / 0 fail.
+
+**Decisions:**
+
+- **`emitWarn` is a generic ToolContext seam, not memory-specific.**
+  Other tools have legitimate non-error notices (e.g., `bash`
+  could warn on slow commands, `grep` on hits truncated by limit).
+  Building the seam now means future tools don't have to invent
+  their own warn channel. memory_read is the first consumer.
+- **`tool_warning` HarnessEvent vs reusing `warn` field on
+  `tool_finished`.** Considered piggybacking on tool_finished but
+  rejected — tool_finished fires AT END of execution; warns can
+  fire mid-execution (long-running tool wants to surface progress
+  warns). Distinct event keeps the semantic clean and gives
+  NDJSON consumers per-tool attribution.
+- **Adapter translates `tool_warning` to generic `warn`** rather
+  than introducing a new UIEvent. The renderer already has a warn
+  palette (yellow); duplicating with a "tool warn" variant would
+  be visual noise. The `toolName` lives in the harness-side
+  event for telemetry; UI is intentionally generic.
+- **`mem` not `memory` in the footer.** 80-col terminals get
+  cramped fast — the right column already has model + plan +
+  steps + cost + bg. 3-letter prefix matches `bg` (the existing
+  shortest segment) and stays under the radar visually.
+- **Snapshot count at adapter construction (per-turn) instead of
+  live updates.** Live updates would require subscribing the
+  reducer to memory_events, coupling TUI to audit semantics. Per-
+  turn snapshot is good-enough fidelity (memory_write is rare
+  mid-session) and keeps layers cleanly separated.
+
+**Post-review fixes (2026-05-04):**
+
+- **Footer test cast cleaned up.** First cut used a bizantine
+  `as LiveState['bgProcesses'] extends Map<string, infer V> ? V :
+  never` cast with extra invented fields (status, startedAt) that
+  don't exist on the actual map value type (`{ processId: string;
+  command: string }`). Now matches the existing bg test pattern:
+  plain `{ processId: 'p1', command: 'sleep' }` literal.
+- **Banner emit coverage.** Added 2 REPL tests asserting
+  `memory: N` lands in the banner when the registry reports >0
+  entries, and that the entry is suppressed at zero. Required
+  extending `makeBootstrapStub` with an optional `memoryCount`
+  param (positional `cwd` argument still works for backward-
+  compat). New `makeStubRegistry` helper exposes the minimal
+  surface the boot path consumes — adding the surface here
+  rather than per-test keeps the test suite consistent if more
+  registry calls land in boot later.
+- **Per-turn snapshot rationale tightened in code.** Comment in
+  `buildAdapterCtx` now lays out the trade-off explicitly (per-
+  write live updates would couple the reducer to memory_events
+  bus; per-turn fidelity is acceptable because writes are
+  interactive and next turn picks up within seconds). The
+  "revisit if operator data shows confusion" trigger lives in
+  the comment so a future maintainer doesn't have to dig the
+  decision out of BACKLOG.
+
+**Known gaps (deferred):**
+
+- **Subagent emitWarn propagation to parent renderer.** Subagent
+  contexts get emitWarn wired in `loop.ts` (every ToolContext
+  does), but the warn UIEvent lands on the SUBAGENT's onEvent
+  sink (subagent runtime), not the parent's bus directly. A
+  subagent's `memory_read` on an untrusted body fires
+  `tool_warning`, the subagent's adapter translates to a `warn`
+  UIEvent within its own frame — but that warn doesn't
+  propagate to the parent operator. Subagent IPC envelope
+  currently captures status/output, not arbitrary live events.
+  Lands when IPC channel grows live-event forwarding (spec
+  §11). Documented; not blocking for top-level memory_read.
+
+**Out of scope:**
+
+- **Visual mark on the tool chip itself for untrusted reads**
+  (e.g., a `[untrusted]` annotation next to the tool name in the
+  active-tool list). Today the warn line above/below the chip is
+  the marker; the chip stays visually uniform. Lands when the
+  tool-output rendering surface grows per-tool decoration.
+- **Memory tray that updates mid-session.** See "Decisions"
+  rationale above. Future operator pattern (e.g., heavy
+  memory_write during a session) could justify subscribing the
+  reducer to bus.
+- **Per-scope memory counts in the footer** (`mem 5/2/1`). Single
+  number is simpler and matches the dedupe-by-name semantic. If
+  operators want per-scope, `/memory list` is the right surface
+  (slated for a future slash-commands slice).
+
+---
+
+## [2026-05-04] M3 / impl — verify-before-act guidance (closes spec §6.1)
+
+Continues the memory subsystem on the same branch. Closes spec §6.1
+("Verify before act"): memories may have been written long ago and
+the underlying code drifts in between. The model needs to know that
+factual claims (file paths, exported names, schema shape) require
+re-verification against the current tree before action, while
+preference claims (style, conventions) don't have a "current state"
+to verify against.
+
+**Done:**
+
+- **Verification guidance in the eager memory section header**
+  (`src/cli/memory-prompt.ts`). One paragraph, two parts:
+    - *Factual memories*: verify with `grep` / `read_file`; if
+      reality drifted, update or discard the memory rather than
+      acting on stale info.
+    - *Preference memories*: don't need re-checking — proceed.
+  Spec's example phrasing (`memória diz X exporta Y → grep antes
+  de agir`) preserved in concept; concrete tool names (grep,
+  read_file) so the model has an actionable verification path.
+- **Section-level placement, not per-memory.** The rule applies
+  uniformly across every memory the model reads; repeating it
+  per `memory_read` call would burn tokens without adding signal.
+  Lives in the eager section so it lands in the prompt cache
+  alongside the index.
+- **Empty-section short-circuit preserved.** When zero memories
+  load (none on disk, all trust-filtered, or all trigger-filtered),
+  the section text is empty — no guidance rendered when there's
+  nothing to verify.
+- **Tests:** verify-before-act guidance present (asserts FACTUAL,
+  PREFERENCE, grep, read_file, "drift" all appear in header);
+  empty-section regression guard. +2 tests; suite at 2535 pass /
+  0 fail.
+
+**Decisions:**
+
+- **Two paragraphs, not bullets.** Bullet-list of rules reads as
+  "checklist to mechanically apply"; the verification rule is a
+  judgment call (factual vs preference axis). Prose forces the
+  model to read it as guidance, not as steps.
+- **Tool names spelled out (grep, read_file).** Alternative: "use
+  the available tools to verify". Concrete names give the model a
+  cheaper path from "should verify" to "actually verify" — no
+  ambiguity about which tool to invoke.
+- **PREFERENCE is named explicitly with caveat ("no current
+  state to verify against").** Without the caveat the model might
+  try to verify preferences too — which always succeeds vacuously
+  and burns tool calls.
+
+**Out of scope:**
+
+- **Runtime hint when the model uses memory_read.** Could surface
+  a short reminder ("verify factual claims") in the tool's output
+  envelope. Today the eager section is the only carrier; runtime
+  hint would duplicate. Defer until operator data shows the model
+  ignoring the eager guidance.
+
+---
+
+## [2026-05-04] M3 / impl — user-scope double-prompt (closes spec §7.2.5)
+
+Continues the memory subsystem on the same branch. Closes spec §7.2.5
+("Memória user-global precisa dois prompts (write + escopo) — vai
+afetar todas as sessões, exige fricção extra"). User-scope writes
+now fire TWO modals instead of one: the standard write confirm
+followed by a scope-specific blast-radius reminder.
+
+**Done:**
+
+- **New event + reducer flavor**: `memory:user-scope:ask` event in
+  `src/tui/events.ts` with `{name, body}`. `LiveState.modal.flavor`
+  union grows `'memory-user-scope'`. Reducer renders modal with
+  distinct copy: title "Confirm user-scope memory", subject is
+  the bare name (no `user/` prefix — by definition we're in user
+  scope), preview leads with three lines warning "this memory
+  will load in EVERY session on this machine, regardless of
+  project" before the body content. Two options (yes / no),
+  default last (No) per the conservative-default convention.
+- **Modal manager**: `askMemoryUserScope({name, body})` mirrors
+  `askMemoryWrite` shape but no `scope` arg (always user). New
+  `MEMORY_USER_SCOPE_OPTIONS` with relabeled buttons ("Yes,
+  persist to user scope" / "No, cancel write") so muscle memory
+  doesn't carry from the first prompt.
+- **HarnessConfig + ToolContext threading**: new optional
+  `confirmMemoryUserScope` callback paired with
+  `confirmMemoryWrite`. Production wires both via REPL bridge;
+  headless wires neither. When `confirmMemoryWrite` IS wired but
+  `confirmMemoryUserScope` is missing (programmer error or
+  partial test wiring), user-scope writes refuse with
+  `headless_mode` and audit row stage='headless_gate_user_scope'
+  — fail-closed fences against silent security downgrade.
+- **`memory_write` second gate**: after the first modal returns
+  yes AND `scope === 'user'`, fires the second modal. Audit
+  outcomes:
+    - first yes + second yes → persist + `created` audit (existing
+      flow, unchanged)
+    - first yes + second no/cancel → audit `refused` with
+      `stage='user_scope_modal'`, reason='declined'/'cancelled'
+    - first no/cancel → unchanged (`stage='modal'`); second
+      modal NEVER fires (sibling test pins this)
+    - first yes + headless gate (no callback) →
+      `stage='headless_gate_user_scope'`
+- **Tests:** 6 memory_write user-scope (both yes persists / both
+  modals fire / second-no audit / second-cancel audit / first-no
+  short-circuits / project_local skips second / half-wired headless
+  reject), 4 modal-manager (event emission, default selection,
+  hotkey, Esc), 1 reducer (modal-integration: title/subject/preview
+  shape), 1 reducer no-throw (state.test parametric branch). +12
+  tests across the slice; suite at 2533 pass / 0 fail.
+
+**Decisions:**
+
+- **Distinct event type, not a flag on `memory:write:ask`.** Two
+  reasons: (1) the second modal renders different copy (warning
+  text, scope-emphasizing labels) — a flag-controlled branch in
+  the reducer would diverge into a state-machine the renderer has
+  to hold; (2) the audit trail benefits from
+  `stage='user_scope_modal'` being distinct from the first
+  `stage='modal'` row, so an operator inspecting `/memory audit`
+  sees which prompt fired the rejection.
+- **Pair `confirmMemoryUserScope` with `confirmMemoryWrite` rather
+  than make it required.** Required at the type level would force
+  every test that exercises non-user-scope writes to wire BOTH.
+  Optional + fail-closed gate ("if scope=user and callback
+  missing → headless reject") is the same security invariant with
+  less ceremony.
+- **Body re-rendered in second modal preview** even though the
+  operator already saw it in the first. Two prompts back-to-back
+  on the same content is a usability hazard — the operator's
+  reflex is to hit "yes" again. Re-rendering keeps the bytes
+  visible so a body that snuck through the first review still has
+  a chance of catching the eye on the second.
+- **Wording emphasizes blast radius, not scope name.** "EVERY
+  session on this machine" is more concrete than "user scope" —
+  matches the spec's intent ("vai afetar todas as sessões")
+  rather than re-stating the scope label.
+- **Cancel paths short-circuit the persist call** — the registry
+  is never reached when either modal returns no/cancel. Avoids
+  the registry's writer-side audit (`created` / `refused`) from
+  competing with the tool's stage-tagged refused rows. Audit table
+  ends up with `proposed` + ONE `refused` row per attempt, never
+  two refusals for the same logical decision.
+
+**Post-review fixes (2026-05-04):**
+
+- **Pre-wrapped warning replaced with sentence-natural lines.**
+  First cut split the blast-radius warning into 40-col fragments
+  that would either truncate (narrow terminals) or look
+  fragmented (wide). Now: two natural sentences, renderer wraps
+  via wrap-ansi at terminal width. Matches the trust-modal /
+  plan-review convention. Test asserts both "EVERY session" and
+  "regardless of project" appear in the leading preview line.
+- **Regression guards: persist must NOT run on second-modal
+  rejection paths.** Added `expect(events.find(e => e.action ===
+  'created')).toBeUndefined()` to the second-no, second-cancel,
+  and headless-gate-user-scope tests. The file-absence check was
+  the strongest signal (file present = persist actually ran),
+  but a registry-only regression that emits `created` without
+  hitting disk would have slipped past. Three new assertions
+  pin down the audit-trail invariant directly.
+
+**Out of scope:**
+
+- **Reusing `MemoryWriteAnswer` instead of a new
+  `MemoryUserScopeAnswer` union.** Same yes/no/cancel triad, same
+  semantics — one type covers both. If the second modal grows a
+  third option (e.g., "promote to project_shared instead") later,
+  introduce the new union then.
+- **Skipping the second prompt for `user_explicit` source.**
+  Operator might argue "I already typed it, no need for a second
+  click". Rejected — the spec's "fricção extra" is the point.
+  user_explicit at user scope is exactly the case where the
+  operator's first action is on autopilot ("save this") and the
+  cross-session impact deserves a beat to consider.
+
+---
+
+## [2026-05-04] M3 / impl — memory lifecycle hooks (expiry GC + boot-time triggers)
+
+Continues the memory subsystem on the same branch. Closes spec §6.2
+(SessionStart expiry GC) and the boot-time half of §4.3 (auto-injection
+via frontmatter `triggers:`). Hash check shared (§7.2.8) is still
+deferred — needs the trust-storage extension that AGENTS.md hash check
+(§9.1) also depends on; both belong in a future "trust storage v2"
+slice.
+
+**Done:**
+
+- **Lifecycle module** (`src/memory/lifecycle.ts`, new):
+  - `removeMemory(roots, scope, name) → RemoveMemoryResult` —
+    pure file+index deletion primitive, parallel to `writeMemory`.
+    Discriminated outcomes (`removed` / `sandbox_violation` /
+    `unknown` / `io_error`). Body unlink + index rewrite via the
+    same atomic temp-rename pattern as the writer. Idempotent on
+    each side: missing body still removes the index entry,
+    missing entry still unlinks the body. Order: index FIRST then
+    body, so a crash leaves an orphan body (reachable via
+    `listOrphanFiles`) rather than a dangling entry.
+  - `findExpiredMemories(registry, today)` — peek-based scan
+    across all scopes (no audit rows during system-internal
+    discovery). Lex-compares ISO `expires:` against today's UTC
+    date — operator's `expires: 2026-05-04` removes the memory
+    on 2026-05-04 boot.
+  - `gcExpiredMemories(registry, roots, opts)` — orchestrates
+    find + remove + audit. Emits `memory_events` `action: 'expired'`
+    per removal with frontmatter `source` forwarded so audit
+    consumers can distinguish "+90d-default expired" from
+    "user-set expiry". Single `registry.reload()` after the batch.
+- **Bootstrap wires the GC** (spec §6.2 SessionStart): runs after
+  `createMemoryRegistry`, before `assembleMemorySection`. Auto-
+  removes everything expired — operator's `expires:` was
+  deliberate, audit row gives visibility, no modal friction at
+  boot. Spec's "com confirmação se houver muitas" is deferred to
+  a follow-up modal slice when an operator pattern surfaces.
+  Bootstrap forwards `auditCwd: cwd`; `auditSessionId` is omitted
+  because the harness loop creates the session id later — GC
+  rows land with `session_id NULL` (lifecycle is a pre-session
+  bootstrap event, distinguishable from per-conversation rows).
+- **Boot-time trigger primitive** (`src/memory/triggers.ts`, new):
+  - `BootTrigger` closed union — `git`, `env`, `package`,
+    `agents-md`, `tsconfig`, `cargo`. Adding a well-known
+    trigger is a one-line append + `existsSync` probe.
+  - `evaluateBootTriggers(cwd) → BootContext` — single-shot
+    `existsSync` probes per trigger. Non-recursive (`.env` in a
+    subdir does NOT trigger `secrets`); session cwd is the root.
+  - `shouldEagerLoadByTriggers(memTriggers, ctx)` — three rules:
+    (1) no triggers → unconditional load; (2) all-operator-defined
+    runtime tags (no well-known overlap) → unconditional load
+    (rule 2: don't silently hide memories tagged for runtime-only
+    until the runtime trigger machinery lands); (3) any well-known
+    trigger present → load IFF that trigger fired.
+  - Spec §4.3 examples include "tool bash called" and "user
+    message mentions git commit" which are RUNTIME triggers
+    needing harness-loop hooks; deferred. Boot-time half ships
+    today.
+- **`assembleMemorySection` accepts `BootContext`**. Single peek
+  per memory now drives BOTH trust filter (§7.2.2) and trigger
+  filter (§4.3) — one disk read serves both. Default
+  `bootContext` is `EMPTY_BOOT_CONTEXT` — preserves pre-this-
+  slice behavior modulo rule 2 (operator runtime tags pass
+  through). Subagent-child evaluates triggers against the
+  subagent's cwd (worktree root or parent cwd depending on
+  isolation), not parent's — matches "session cwd is the trigger
+  root" principle uniformly.
+- **Tests:** 6 removeMemory (happy path / preserves others / unknown
+  noop / orphan body or index / bad name), 4 findExpiredMemories
+  (today inclusive / no expires skipped / cross-scope / no audit
+  during scan), 5 gcExpiredMemories (audit emission / snapshot
+  refresh / no-op / source forwarding / multi-scope), 13 triggers
+  (probe each well-known type, multiple, no recursion, rule
+  combinations), 6 memory-prompt with bootContext (untagged
+  unconditional, matched / unmatched well-known, operator runtime
+  tag rule 2, mixed list, omitted bootContext default). +34 tests
+  total; suite at 2519 pass / 0 fail.
+
+**Decisions:**
+
+- **Auto-remove with no modal threshold.** Spec §6.2 says "com
+  confirmação se houver muitas". I shipped unconditional auto-
+  remove + audit row instead. Reasons: (1) operator opted in by
+  setting `expires:`; (2) audit row IS the visibility signal;
+  (3) modal at boot is friction the average operator won't want.
+  If an operator pattern emerges where bulk expiry surprises
+  them, modal lands as a follow-up.
+- **GC audit rows have NULL session_id.** Bootstrap doesn't know
+  the session id (harness creates it later). Lifecycle GC is
+  conceptually a pre-session event; the session_id-NULL marker
+  distinguishes "expired during boot" from "expired during a
+  named session". Future `/memory audit` UI groups these
+  separately.
+- **Triggers single peek per memory.** assembleMemorySection
+  consults `frontmatter.trust` AND `frontmatter.triggers` from
+  ONE peek call per listing. Two-pass filtering (filter trust
+  first, then triggers) would double the disk reads with no win.
+- **Rule 2 (operator runtime tags pass through unconditionally).**
+  Alternative was strict: any non-empty triggers list must match a
+  well-known fired trigger or be hidden. That creates a foot-gun:
+  operator tags `triggers: [bash]` (a runtime tag) and the memory
+  silently disappears from base context. Rule 2 keeps it visible
+  until the runtime trigger machinery actually runs, then the
+  matching narrows. Trades silent-hide for slightly-noisier-base-
+  context — acceptable tradeoff.
+- **Per-trigger probes are `existsSync`, not stat-mode-aware.**
+  `.git` is a directory, `.env` is a file, both register the
+  trigger. operator with `.git` as a file (worktree gitdir
+  pointer) still gets the `git` trigger, which is correct. Fine
+  to relax later if a probe needs file-vs-dir distinction.
+- **Boot-time triggers evaluate against subagent's cwd, not
+  parent's.** A worktree subagent has its own filesystem root;
+  triggers should reflect THAT environment. Matches "session
+  cwd is the trigger root" applied at every level.
+
+**Post-review fixes (2026-05-04):**
+
+- **`removeMemory` instanceof discrimination.** First cut used
+  `as ScopeError` cast + duck-type "has .message" check, which
+  caught FrontmatterError too and reported it as
+  `sandbox_violation`. Mirrors writer.ts now: explicit
+  `instanceof ScopeError` → sandbox_violation, `instanceof
+  FrontmatterError` → io_error, anything else rethrows.
+  Tightened tests: bad-name `../traversal` and `.hidden` both
+  pin `io_error` specifically (not the loose either-or).
+- **GC failures audit + stderr-warn.** First cut silently dropped
+  `gcExpiredMemories` failures — bootstrap discarded the result,
+  no audit row, only "absence of expected `expired` row" as
+  signal. Now: failures emit a `memory_events` `refused` row
+  with `details.stage='lifecycle_gc'`, `kind`, `reason`, and
+  `expires`. Bootstrap consumes `result.failures` and writes a
+  stderr line per failure (`forja: memory gc: failed to expire
+  <scope>/<name> (expires DATE): REASON`). Two-place visibility:
+  persistent audit for forensic review, live stderr for
+  per-boot anomaly. Test engineers a real EACCES via chmod 0o500
+  on the scope dir; skips silently when running as root.
+- **`ALL_BOOT_TRIGGERS` derived from `TRIGGER_PROBES`.** First
+  cut hand-maintained both — adding a trigger required two
+  edits. Now derived as `new Set(TRIGGER_PROBES.map(([n]) => n))`
+  so the type union, probe table, and lookup can't desync.
+- **UTC trade-off documented explicitly.** Comment now lays out
+  the two viable timezone interpretations (operator-local vs
+  UTC), why we picked UTC (cross-machine determinism > last-day
+  precision), and the operator workaround (subtract a day, or
+  wait for `/memory expire` slash with explicit TZ handling).
+  Audit row carries the literal `expires` string for forensic
+  reconstruction.
+
+**Out of scope (still tracked):**
+
+- **§4.3 runtime triggers.** "Tool bash called" / "user message
+  mentions phrase" / "checkpoint created" need harness-loop hooks
+  (per-event eager-load injection). Deferred; needs design seam
+  in §6.4 PreCompact / harness onEvent surface.
+- **§6.2 modal-confirm for bulk expiry.** Today auto-removes
+  unconditionally. Lands when operator pattern surfaces.
+- **§7.2.8 hash check shared.** Depends on a hash-storage
+  primitive in trust subsystem (the same primitive AGENTS.md hash
+  check needs per §9.1). Belongs in a "trust storage v2" slice.
+- **`/memory expire <name> <date>` slash command** (§6.3).
+  Skipped per user direction (slash commands deferred).
+- **`expired` event grouping in `/memory audit`.** UI surface,
+  Slice F.
+
+---
+
+## [2026-05-04] M3 / impl — memory trust integration (closes spec §7.2.1, §7.2.2, §7.2.7-eager)
+
+Continues the memory subsystem in the same branch
+(`feat/m3-memory-write-modal`). The previous slice closed D182 (modal
+producer); this one closes the trust-related gates left as deferred
+gaps.
+
+**Done:**
+
+- **`HarnessConfig.isCwdTrusted` + `ToolContext.isCwdTrusted` threading.**
+  Bootstrap reads the live trust list (`trust_dirs.json`) at session
+  start and resolves `isCwdTrusted` from it. New `BootstrapInput.
+  trustListPathOverride?: string | null` test seam mirrors the REPL's
+  override pattern: `null` disables storage (fail-closed false),
+  string overrides the default `trustListPath()`. Harness loop
+  forwards the value into every `ToolContext`. ToolContext makes the
+  field REQUIRED (not optional) so any future ToolContext
+  construction has to think about it explicitly. Tests' `makeCtx`
+  defaults to `true` — mirrors the post-trust-prompt reality of the
+  REPL boot path.
+- **`memory_write` trust gate (§7.2.1).** New gate fires after the
+  `project_shared` reject and BEFORE the injection scanner. Logic:
+  if `!ctx.isCwdTrusted && source === 'inferred'` → refuse with
+  `memory.untrusted_cwd`, audit `refused` with stage='trust_gate',
+  reason='cwd_untrusted'. `user_explicit` source proceeds regardless
+  of trust state — the operator typed the proposal, so the trust
+  risk is moot. Modal is NOT opened on this path; refusing earlier
+  saves the operator a confirm they would have hit a brick wall on.
+  Defense-in-depth: the REPL boot path already forces trust before
+  reaching the harness, but one-shot mode (`agent "prompt"`) skips
+  the modal — without this gate a model running in a freshly-cloned
+  untrusted repo could persist `inferred` memories that future
+  sessions auto-load.
+- **Trust filter for eager-load (§7.2.2).** New `MemoryRegistry.peek`
+  loads bodies WITHOUT emitting a `read` audit row — used by
+  `assembleMemorySection` to filter `trust: untrusted` entries from
+  the system prompt. Index-format (§3.2) has no trust column, so
+  the only way to know a memory's trust state is to read the body;
+  we accept the per-session-boot cost (typical operator <50
+  memories total, all small files). System-internal load through
+  `peek` instead of `read` keeps `memory_events` clean of rows the
+  operator didn't trigger. Filter outcomes:
+    * `present` + `trust === 'untrusted'` → SKIP (memory still
+      reachable via explicit `memory_read`).
+    * `missing` / `malformed` / `unknown` → INCLUDE (uncertainty
+      defaults to "show", not "hide"; the alternative would silently
+      vanish hand-edited memories).
+    * `present` + trust absent or 'trusted' → INCLUDE.
+- **Tests:** 4 bootstrap (trust list resolution: in-list, absent-from-
+  list, missing file, override null), 8 memory-prompt (trust filter:
+  skip untrusted, include explicit-trusted, all-untrusted → empty
+  section, missing-body uncertainty includes, peek doesn't audit,
+  untrusted shadow doesn't eclipse trusted shadow in less-specific
+  scope, more-specific trusted scope still wins when less-specific
+  is untrusted, every-shadow-untrusted produces empty section), 3
+  registry (peek returns body without audit, peek unknown without
+  audit, strict scope opt-in), 3 memory_write (untrusted+inferred
+  refused before scanner, untrusted+user_explicit proceeds,
+  trusted+inferred proceeds). Total +17 across the slice; suite at
+  2485 pass / 0 fail.
+
+**Post-review fixes (2026-05-04):**
+
+- **Filter-before-dedupe in `assembleMemorySection`.** Initial cut
+  did `list({ deduplicateByName: true })` then trust-filter — but
+  spec §7.2.2 marks trust per-MEMORY (not per-name), so an
+  untrusted entry in `project_local` was eclipsing a trusted
+  entry of the same name in `user`, dropping BOTH from eager
+  context. Reordered to filter first then dedupe on the survivors;
+  precedence walk preserved (most-specific TRUSTED scope wins).
+  Added 3 regression tests covering the shadow cases (trusted
+  user shadow surfaces when local is untrusted; trusted local
+  wins when only user is untrusted; all-shadows-untrusted →
+  empty section).
+- **REPL forwards `trustListPathOverride` to bootstrap.** Test
+  paths using `runRepl({ trustListPathOverride })` with real
+  bootstrap (no `bootstrapOverride`) had divergence: REPL trusted
+  the test fixture, bootstrap used the dev's real
+  `~/.config/agent/trusted_dirs.json`, so `isCwdTrusted`
+  disagreed and memory_write rejected inferred unexpectedly.
+  Conditional spread keeps the prod default semantics
+  (undefined → bootstrap uses `trustListPath()`); null/string
+  forward verbatim.
+
+**Decisions:**
+
+- **`peek` as a separate method, not a `read({ noAudit: true })`
+  flag.** Audit-emission is a load-bearing semantic in this
+  subsystem — `read` always audits because the operator's
+  expectation is "every body load shows up in `/memory audit`". A
+  flag would invite "silent" reads that drift; a separate method
+  forces the caller to commit to "this is system-internal, never
+  surfaces in operator audit". Single source of truth for `read`'s
+  contract.
+- **`isCwdTrusted` REQUIRED on `ToolContext`, not optional.** Trust
+  state is a security input; defaulting to `false` (fail-closed) at
+  the type level would be safer, but tests would have to opt in
+  everywhere. Defaulting to `true` would silently allow
+  privileged behavior. Required + explicit `makeCtx` default
+  forces the test author to think about it OR accept the helper's
+  documented assumption (post-trust-prompt → trusted).
+- **`user_explicit` writes proceed in untrusted cwd.** Spec §7.2.1
+  reads "inferred writes ficam disabled by default" — explicit
+  writes are out of scope of the gate. The operator's act of
+  typing the proposal IS the trust signal. Audit table still gets
+  the row so /memory audit can spot "operator saved memories in
+  untrusted cwd" patterns.
+- **Trust filter happens at peek-time, not at index-load time.**
+  `loadScopeIndex` doesn't read bodies; we don't change that
+  invariant. The filter is layered on at the consumer
+  (`assembleMemorySection`). Future consumers (memory_search
+  results, /memory list output) get the same primitive when they
+  want it.
+- **`assembleMemorySection` returns empty when EVERY entry is
+  untrusted.** Header + zero entries would render as a misleading
+  "memory section exists but is empty"; empty text + bootstrap's
+  length-zero check passes through cleanly so the operator's
+  base prompt is unchanged. Mirrors the no-registry-entries path.
+
+**Out of scope (still tracked):**
+
+- **§7.2.7 visual marker on loaded untrusted** (`[memory: untrusted]`
+  in UI). Today untrusted memories don't reach base context (this
+  slice). When operator explicitly `memory_read`s an untrusted
+  memory, the UI should mark it. Lands in Slice F (footer / UI
+  visibility).
+- **Trust-untrusted marking on inferred-write-in-untrusted (§7.2.2
+  half 2).** The "if accept inferred in untrusted, frontmatter gets
+  trust: untrusted" path requires an opt-in flag like
+  `--allow-inferred-writes-in-untrusted` that doesn't exist yet.
+  Today we hard-block inferred writes in untrusted cwd; the marking
+  path is unreachable. Lands when an opt-in flag arrives.
+- **§7.2.5 Double-prompt user-scope.** Slice C territory.
+
+---
+
+## [2026-05-04] M3 / impl — memory write modal producer (closes D182)
+
+Modal `memory:write:ask` had reducer + render wired since the M2 modal-
+flavors slice but no producer. `memory_write` tool didn't exist; inferred-
+write proposals couldn't reach disk. This slice ships the producer end-to-
+end and persists confirmed memories.
+
+**Done:**
+
+- **Writer** (`src/memory/writer.ts`): pure `writeMemory(input) →
+  WriteMemoryResult` discriminated union. Path resolves through
+  `memoryFilePath` (re-applies sandbox per spec §7.2.6). Symlink defense
+  via `lstatSync` before any write — refuses to follow links at the
+  target path. Existence check via `lstatSync` (no overwrite; edits land
+  in 5.5). Body + index serialized in memory then written via
+  temp-rename for atomic body, sequential atomic write for the index.
+  Index regenerated from parsed entries (drift toward canonical hrefs
+  per index-file.ts SECURITY CONTRACT). `serializeIndex` 200-line cap
+  caught BEFORE either disk write so the cap-fail path leaves no
+  orphan body. `project_shared` rejected up front — promotion is the
+  only path into shared scope.
+- **Registry surface** (`src/memory/registry.ts`): `write()` method
+  dispatches to writer + emits `memory_events` (`created` on success,
+  `refused` with kind+reason in details on every non-success). Auto-
+  refreshes the in-memory snapshot on success so `list` / `lookup` see
+  the new entry. `recordEvent()` method for events not tied to a
+  `write()` call (`proposed` when modal opens, `refused` when scanner /
+  headless gate / modal-no fires).
+- **Tool** (`src/tools/builtin/memory-write.ts`): schema (name, scope,
+  type, source, description, body, optional expires). Source restricted
+  to `user_explicit` / `inferred` — `imported` is reserved for promotion
+  flow. Pipeline: aborted check → registry available → schema/shape
+  (re-runs `validateFrontmatter`) → `project_shared` reject (audit
+  refused stage=tool_gate) → injection/secret scanner (audit refused
+  stage=scanner; matched pattern hidden from model output to avoid
+  teaching bypass) → headless reject when `confirmMemoryWrite` absent
+  (audit refused stage=headless_gate) → emit `proposed` → modal confirm
+  → on yes, build frontmatter (apply +90d default for inferred + project
+  scope per spec §6.2) and call `registry.write()` → on no/cancel emit
+  `refused` stage=modal with reason=declined/cancelled. Outcome
+  surfaces as `{outcome: 'created'|'rejected', scope, name, path?,
+  reason}` so the model gets a structured response either way (vs
+  toolError on hard rejects).
+- **Injection scanner** (spec §7.3): substring match for "ignore
+  previous instructions", "ignore all previous", "you are now",
+  "from now on, always", "disregard prior", "forget previous".
+  Regex match for AWS access key id (`AKIA[0-9A-Z]{16}`), GitHub PATs
+  (`ghp_…`, `github_pat_…`), Anthropic keys (`sk-ant-…`), generic
+  OpenAI-shape (`sk-…{40,}`), Slack tokens (`xox[baprs]-…`). Match =
+  block + audit; `details.reason` carries the matched class for
+  operator review without echoing the literal pattern to the model.
+- **Modal manager** (`src/tui/modal-manager.ts`): `askMemoryWrite()` +
+  `MEMORY_WRITE_OPTIONS` (Yes / No, default last = No per D5
+  conservative convention). Args carry scope/name/body so the modal
+  renders the exact bytes about to land on disk.
+- **Threading**: `HarnessConfig.confirmMemoryWrite` →
+  `ToolContext.confirmMemoryWrite` via `loop.ts:1090`. Subagent child
+  intentionally NOT wired — subagents are headless from the operator's
+  perspective, so `memory_write` rejects with `headless_mode` if a
+  subagent calls it. Top-level REPL bridges via
+  `modalManager.askMemoryWrite` in `repl.ts:734`.
+- **Tool vocab**: `memory_write` → "Proposing memory" / "Proposed
+  memory", subject extracts `scope/name`.
+- **Tests:** 9 writer (happy path / project_shared reject / dup file /
+  symlink defense / sandbox / atomicity), 5 registry.write
+  (created+audit / shared_forbidden audit / exists audit / per-call
+  override / no-db no-throw), 18 tool (registry-unavailable, headless,
+  shared_forbidden, injection phrase, AWS key, GH PAT, modal yes
+  persists, modal no audits declined, modal cancel audits cancelled,
+  +90d default applied / not applied for user_explicit / honored when
+  explicit, user-scope writes don't touch project paths, registry list
+  refreshes, bad name rejected, imported source rejected, empty body
+  rejected, exists collision surfaced as memory.exists), 4 modal-
+  manager (event emission, default selection, hotkey "1" yes, Esc
+  cancel). Bootstrap tool count regression bumped 16 → 17. Tool-vocab
+  builtin list bumped to include memory_write. Total 2463 pass / 0
+  fail across 136 files; lint + typecheck clean.
+
+**Decisions:**
+
+- **No overwrite at writer level.** `exists` reject is a hard rule
+  even though the audit row makes the operator's edit history
+  visible. Spec §5.1 doesn't mention overwrite, and a "model proposes
+  the same name twice" path silently dropping the second proposal
+  would be a worse failure mode than an explicit reject. Edit /
+  upsert lands when `/memory edit` arrives in 5.5.
+- **`refused` carries `details.kind` + `details.reason` rather than
+  per-kind action enum.** `MemoryEventAction` is a closed union and
+  adding `refused_exists`, `refused_scanner`, etc. would be a
+  migration. The discriminator in details carries the same
+  information without schema churn; consumers (audit UI, future
+  `/memory audit` slash command) read `details.kind` to bucket.
+- **Tool returns structured `{outcome: 'rejected'}` for modal no /
+  cancel, NOT a tool error.** Modal-no is a normal lifecycle outcome
+  the model can reason about ("operator declined; don't propose this
+  again"); modeling it as an error would suggest the model retry,
+  which is wrong. Hard rejects (shared_forbidden, scanner, headless,
+  exists) DO surface as tool errors because they're shape-level
+  problems the model can fix on retry.
+- **Subagent child stays unwired for `memory_write`.** Modal-less
+  subagents shouldn't write to a global memory store the operator
+  hasn't reviewed. Per-subagent confirmation funneling through the
+  parent is plausible later (would require extending the IPC
+  channel) but adds surface area without a concrete operator
+  request behind it. For now: subagents read/list/search; only the
+  parent REPL writes.
+- **Audit row at `proposed` stage even when modal is dismissed
+  immediately.** Anchors the chronology — a `refused` row without a
+  prior `proposed` row would make the audit trail confusing
+  (refused-without-proposal looks like a scanner block, but only
+  scanner blocks have stage=scanner). The pair is the canonical
+  shape.
+
+**Post-review additions (2026-05-04):**
+
+- **Index drift warning (writer)**: `WriteMemoryResult.created` now
+  carries `warnings: WriteWarning[]`. `parseIndex` flags malformed
+  lines that get dropped on re-serialize; the writer surfaces them
+  as a `malformed_index_lines` warning. Registry's `write()`
+  forwards to stderr (`memory: index drift: dropped malformed lines
+  N, M in <scope>/MEMORY.md while upserting <name>`) so an operator
+  hand-edit in non-canonical shape doesn't silently disappear.
+  Failing the write would surprise the operator at the worst moment;
+  warning + persist is the right trade.
+- **Description scanner (tool)**: spec §7.3 names body as the scanner
+  surface, but description ALSO lands in MEMORY.md and is read eager
+  into the next session's system prompt — strictly more dangerous
+  than body content (which is lazy-loaded). Tool now scans both;
+  audit row carries `details.field` (`body` | `description`) so
+  operator-side investigation knows where the offending content was.
+- **Subagent validator (`requiresOperatorConfirm` flag)**: new
+  `ToolMetadata.requiresOperatorConfirm` flag set on `memory_write`.
+  Subagent validator (`src/subagents/validate.ts`) rejects whitelists
+  that include such tools regardless of isolation — worktree
+  contains filesystem effects but the missing piece is the modal
+  pipe to the parent's operator REPL, which subagents don't have
+  today. Catches the foot-gun at config / bootstrap time instead of
+  surfacing as a deferred `headless_mode` rejection at first
+  invocation. Will lift when spec §11 IPC grows a confirm channel.
+  Validator checks `requiresOperatorConfirm` BEFORE `writes` so the
+  more specific reason wins in the error message (a confirm-bound
+  tool that's also writes:true otherwise misleads the operator into
+  adding `isolation: worktree`, which doesn't unblock anything).
+
+**Out of scope (tracked):**
+
+- Hook `MemoryWrite` blocking event (spec §7.2.4): wires later when
+  the hooks subsystem grows the corresponding event point. Today the
+  scanner is the only programmatic gate.
+- Double-prompt for user-scope writes (spec §7.2.5): single modal
+  now. User-scope memories DO ship today; the second prompt for
+  scope confirmation arrives in a follow-up.
+- Hash-of-source-diff in `memory_events.details` (spec §7.2.3):
+  requires threading conversation hash through the tool layer.
+- `/memory save` slash command (spec §6.3, `user_explicit` source
+  path): this slice covers the tool-call producer for `inferred` /
+  `user_explicit` via tool args. Slash command lands separately.
+- Trust integration (spec §7.2.1: `inferred` writes blocked in
+  untrusted cwd). Decided against including in this slice — the
+  trust subsystem already runs at REPL boot and downstream `inferred`
+  writes can be filtered at the modal-bridge layer in a follow-up
+  without changing the tool's contract. Two-line change once the
+  Trust state is visible at `confirmMemoryWrite` time.
+- `MemoryRegistry.count()` for footer env-summary (BACKLOG D68
+  follow-up): unrelated to write.
+- Symlink defense at scope ROOT (not just target path): writer
+  validates the target via `lstatSync` but doesn't `realpathSync`
+  the scope root itself. Mitigation lives at config layer
+  (operator opt-in to non-default scope roots is rare); revisit if
+  the threat surfaces.
+
+**Branch:** `feat/m3-memory-write-modal`.
+
+---
+
 ## [2026-05-04] M2 / impl — REPL input history (HISTORY.md)
 
 Spec já existia desde 2026-05-03 (entrada `M2 / spec`); operator marcou como prioridade pra fechar o gap "rodar ↑ no REPL e recuperar prompt anterior". Slice atravessa storage / TUI / REPL inteira.

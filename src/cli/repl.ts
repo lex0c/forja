@@ -389,6 +389,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         ...(args.model !== undefined ? { modelId: args.model } : {}),
         ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
         ...(args.plan === true ? { plan: true } : {}),
+        // Forward the trust-list override so REPL and bootstrap
+        // agree on which file is authoritative. Without this,
+        // a test that pins `trustListPathOverride` for the boot
+        // modal would still see bootstrap fall through to the
+        // dev's real `~/.config/agent/trusted_dirs.json` —
+        // bootstrap's `isCwdTrusted` would be wrong, and the
+        // memory_write trust gate would surprise the test author.
+        // `undefined` (production default) lets bootstrap use its
+        // own default; `null` and string both forward verbatim.
+        ...(options.trustListPathOverride !== undefined
+          ? { trustListPathOverride: options.trustListPathOverride }
+          : {}),
       } satisfies BootstrapInput);
   } catch (e) {
     const msg = e instanceof Error ? e.message || e.name || String(e) : String(e);
@@ -441,6 +453,22 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       ? { maxCostUsd: baseConfig.budget.maxCostUsd }
       : {}),
     ...(baseConfig.planMode === true ? { planMode: true } : {}),
+    // Distinct-name memory count for the footer's `mem N` segment.
+    // Snapshot at adapter-construction time (per-turn) — if a
+    // memory_write succeeds mid-turn, the next turn's adapter
+    // picks up the new count. Within a turn the footer doesn't
+    // animate per-write; the `mem N` token reflects "what was
+    // available when this turn began". Trade-off: per-write live
+    // updates would couple the reducer to the memory_events bus
+    // (every write would have to fire a status:update event the
+    // reducer maps onto status.memoryCount). Per-turn fidelity is
+    // acceptable today because writes are interactive (operator
+    // confirms each one) and the next turn picks up the bump
+    // within seconds. Revisit if operator data shows confusion
+    // ("I just confirmed a write but the counter didn't move").
+    ...(baseConfig.memoryRegistry !== undefined
+      ? { memoryCount: baseConfig.memoryRegistry.count({ deduplicateByName: true }) }
+      : {}),
   });
 
   // bus / focusStack / renderer / modalManager / parser / `running`
@@ -725,6 +753,29 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     return answer === 'yes' || answer === 'session-allow';
   };
 
+  // Bridge for the `memory_write` tool's confirm modal (MEMORY.md
+  // §5.1). Forwards scope/name/body straight into the modal and
+  // returns the operator's choice. The tool layer maps 'yes' onto
+  // a writer call, 'no'/'cancel' onto the audit row's
+  // refused-reason. We don't translate the answer here because
+  // the tool layer needs the raw discriminator for telemetry
+  // (no vs cancel distinction).
+  const confirmMemoryWrite = async (req: {
+    scope: 'user' | 'project_shared' | 'project_local';
+    name: string;
+    body: string;
+  }): Promise<'yes' | 'no' | 'cancel'> => modalManager.askMemoryWrite(req);
+
+  // Second-confirm bridge for user-scope writes (MEMORY.md §7.2.5).
+  // Same one-liner shape as confirmMemoryWrite — the modal
+  // manager handles wording differences. The tool layer fires this
+  // only when the proposed scope is `user`; we don't gate scope
+  // here, just forward.
+  const confirmMemoryUserScope = async (req: {
+    name: string;
+    body: string;
+  }): Promise<'yes' | 'no' | 'cancel'> => modalManager.askMemoryUserScope(req);
+
   const startTurn = (text: string): void => {
     if (running || exiting) return;
     running = true;
@@ -744,6 +795,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       softStopSignal: softStopController.signal,
       onEvent: (e) => onHarnessEvent(adapter, e),
       confirmPermission,
+      confirmMemoryWrite,
+      confirmMemoryUserScope,
       ...(lastSessionId !== null ? { resumeFromSessionId: lastSessionId } : {}),
     };
     const runAgentImpl = options.runAgentOverride ?? runAgent;
@@ -931,6 +984,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // a slash command queued before a turn starts but executed after
     // observes the post-startTurn state.
     isRunning: () => running,
+    // Most recent session id (closure so it's read fresh per slash
+    // call). Set after the first turn's session_finished event;
+    // null between boot and first turn. /memory show forwards this
+    // as auditSessionId so its read rows group with the operator's
+    // current session.
+    currentSessionId: () => lastSessionId,
     modelRegistry,
     // History controls (HISTORY.md §2.3). `/history clear` calls
     // `clearLocal` AFTER `clearHistory` against the db so the in-
@@ -1508,8 +1567,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // Welcome banner (UI.md §4.10.9). Goes to scrollback before any
   // live frame so it sits at the top of the conversation transcript.
   // Env summary entries land conditionally — D68 says omit when
-  // there's nothing useful to communicate. Memory entry count
-  // omitted until the registry exposes a sync count method.
+  // there's nothing useful to communicate.
   const providerCaps = baseConfig.provider.capabilities;
   // UI.md §4.10.9 discriminates env entries: `flag` for binary
   // capability indicators (rendered as `✓ name` in success palette),
@@ -1517,6 +1575,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const env: SessionBannerEvent['env'] = [];
   if (subagents.byName.size > 0) {
     env.push({ kind: 'meta', key: 'subagents', value: String(subagents.byName.size) });
+  }
+  // Memory count (D68 follow-up, closed by Slice F'). Dedupe-by-name
+  // matches the "active memories" semantic — operator sees the count
+  // of distinct names available, not the raw cross-scope total. Zero
+  // omits the entry per the env-summary "no useful info" rule.
+  if (baseConfig.memoryRegistry !== undefined) {
+    const memoryCount = baseConfig.memoryRegistry.count({ deduplicateByName: true });
+    if (memoryCount > 0) {
+      env.push({ kind: 'meta', key: 'memory', value: String(memoryCount) });
+    }
   }
   // `checkpoints` flag was removed from the banner — operator
   // marked it as not useful. The capability still works (harness

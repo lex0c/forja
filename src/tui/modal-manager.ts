@@ -76,6 +76,45 @@ export interface HistoryClearAskArgs {
 }
 export type HistoryClearAnswer = 'yes' | 'yes-disable' | 'no' | 'cancel';
 
+// Memory-write flavor (MEMORY.md §5.1 modal). Producer is the
+// `memory_write` tool. The modal renders the `body` verbatim
+// (multi-line) plus the `scope/name` subject so the operator
+// reviews the exact bytes about to land on disk. `yes` =
+// persist via MemoryRegistry.write, `no` = explicit reject (audit
+// row gets `refused`), `cancel` = Esc/timeout (audit row gets
+// `refused` with reason='cancelled').
+export interface MemoryWriteAskArgs {
+  // Mirrors `MemoryScopeForUI` in events.ts. The values must stay
+  // in sync with `MemoryScope` from `src/memory/types.ts`.
+  scope: 'user' | 'project_shared' | 'project_local';
+  name: string;
+  body: string;
+}
+export type MemoryWriteAnswer = 'yes' | 'no' | 'cancel';
+
+// User-scope second-confirm flavor (MEMORY.md §7.2.5). Producer:
+// `memory_write` after the first modal returns yes AND the
+// proposed scope is `user`. Distinct args from MemoryWriteAskArgs
+// (no scope — by definition we're at user scope when this fires)
+// so the type system makes the call sites un-confusable.
+export interface MemoryUserScopeAskArgs {
+  name: string;
+  body: string;
+}
+
+// Generic memory-action confirm (MEMORY.md §5.4 / §5.5 / §6.3).
+// Producers: `/memory delete`, `/memory promote shared`,
+// `/memory demote local`. Caller constructs the copy; manager
+// just queues the modal. `action` is forwarded to the event for
+// audit / telemetry.
+export interface MemoryActionAskArgs {
+  action: 'delete' | 'promote' | 'demote';
+  title: string;
+  subject: string;
+  preview: string[];
+  question: string;
+}
+
 // Trust flavor's option list. Kept in sync with the reducer's
 // `trust:ask` ConfirmState construction in state.ts.
 const TRUST_OPTIONS: readonly ConfirmOption[] = [
@@ -89,6 +128,34 @@ const HISTORY_CLEAR_OPTIONS: readonly ConfirmOption[] = [
   { key: '1', label: 'Yes, wipe', value: 'yes' },
   { key: '2', label: 'Yes, wipe and disable persistence', value: 'yes-disable' },
   { key: '3', label: 'No', value: 'no' },
+];
+
+// Memory-write flavor (MEMORY.md §5.1). Two options — persist the
+// proposed memory or skip. Default is the last (No), matching the
+// conservative-default convention used by every other confirm
+// flavor (D5/D65). Labels match what the reducer constructs in
+// `state.ts:869` so the manager's option list and the rendered
+// modal stay in sync.
+const MEMORY_WRITE_OPTIONS: readonly ConfirmOption[] = [
+  { key: '1', label: 'Yes, write memory', value: 'yes' },
+  { key: '2', label: 'No, skip', value: 'no' },
+];
+
+// User-scope second-confirm options (MEMORY.md §7.2.5). Same
+// shape as memory-write but distinct labels so the operator
+// re-reads the question rather than habitually pressing 1.
+// Reducer matches at `state.ts` `memory:user-scope:ask`.
+const MEMORY_USER_SCOPE_OPTIONS: readonly ConfirmOption[] = [
+  { key: '1', label: 'Yes, persist to user scope', value: 'yes' },
+  { key: '2', label: 'No, cancel write', value: 'no' },
+];
+
+// Generic memory-action options (delete / promote / demote).
+// Reducer matches at `state.ts` `memory:action:ask`. Generic
+// labels — caller's title carries the verb-tense specificity.
+const MEMORY_ACTION_OPTIONS: readonly ConfirmOption[] = [
+  { key: '1', label: 'Yes, proceed', value: 'yes' },
+  { key: '2', label: 'No, cancel', value: 'no' },
 ];
 
 // Permission flavor's option list, kept in sync with the reducer's
@@ -123,6 +190,33 @@ export interface ModalManager {
     args: HistoryClearAskArgs,
     opts?: ConfirmAskOptions,
   ) => Promise<HistoryClearAnswer>;
+  // Memory-write flavor (MEMORY.md §5.1). Producer is the
+  // `memory_write` tool. Caller (ToolContext.confirmMemoryWrite) maps
+  // the answer onto the writer: yes → MemoryRegistry.write,
+  // no/cancel → audit row `refused` (caller distinguishes 'no' from
+  // 'cancel' for telemetry).
+  askMemoryWrite: (
+    args: MemoryWriteAskArgs,
+    opts?: ConfirmAskOptions,
+  ) => Promise<MemoryWriteAnswer>;
+  // User-scope second-confirm flavor (MEMORY.md §7.2.5). Fires
+  // AFTER `askMemoryWrite` resolves yes for a `user`-scope
+  // proposal. Reuses `MemoryWriteAnswer` since the answer
+  // semantics are identical (yes=proceed, no=explicit reject,
+  // cancel=Esc/timeout); the wording in the modal is what
+  // changes per spec ("vai afetar todas as sessões").
+  askMemoryUserScope: (
+    args: MemoryUserScopeAskArgs,
+    opts?: ConfirmAskOptions,
+  ) => Promise<MemoryWriteAnswer>;
+  // Generic memory-action confirm (delete / promote / demote).
+  // Producer (slash command) constructs the copy; reducer renders
+  // it. Reuses `MemoryWriteAnswer` since the answer triad is
+  // identical (yes/no/cancel).
+  askMemoryAction: (
+    args: MemoryActionAskArgs,
+    opts?: ConfirmAskOptions,
+  ) => Promise<MemoryWriteAnswer>;
   // Number of pending modals (active + queued). Tests inspect.
   pendingCount: () => number;
   // Drop the queue and resolve any pending promise as `cancel`. Used
@@ -376,6 +470,46 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           projectRoot: args.projectRoot,
         }),
         HISTORY_CLEAR_OPTIONS,
+        opts?.timeoutMs,
+      ),
+    askMemoryWrite: (args, opts) =>
+      enqueueConfirm<MemoryWriteAnswer>(
+        (promptId) => ({
+          type: 'memory:write:ask',
+          ts: now(),
+          promptId,
+          scope: args.scope,
+          name: args.name,
+          body: args.body,
+        }),
+        MEMORY_WRITE_OPTIONS,
+        opts?.timeoutMs,
+      ),
+    askMemoryUserScope: (args, opts) =>
+      enqueueConfirm<MemoryWriteAnswer>(
+        (promptId) => ({
+          type: 'memory:user-scope:ask',
+          ts: now(),
+          promptId,
+          name: args.name,
+          body: args.body,
+        }),
+        MEMORY_USER_SCOPE_OPTIONS,
+        opts?.timeoutMs,
+      ),
+    askMemoryAction: (args, opts) =>
+      enqueueConfirm<MemoryWriteAnswer>(
+        (promptId) => ({
+          type: 'memory:action:ask',
+          ts: now(),
+          promptId,
+          action: args.action,
+          title: args.title,
+          subject: args.subject,
+          preview: args.preview,
+          question: args.question,
+        }),
+        MEMORY_ACTION_OPTIONS,
         opts?.timeoutMs,
       ),
     pendingCount: () => (active !== null ? 1 : 0) + queue.length,

@@ -1088,6 +1088,31 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ...(config.memoryRegistry !== undefined
               ? { memoryRegistry: config.memoryRegistry }
               : {}),
+            ...(config.confirmMemoryWrite !== undefined
+              ? { confirmMemoryWrite: config.confirmMemoryWrite }
+              : {}),
+            ...(config.confirmMemoryUserScope !== undefined
+              ? { confirmMemoryUserScope: config.confirmMemoryUserScope }
+              : {}),
+            // Trust state — required on ToolContext, optional on
+            // HarnessConfig. Default-false at the harness layer is
+            // the fail-closed answer when bootstrap (or a test
+            // harness) didn't supply one.
+            isCwdTrusted: config.isCwdTrusted ?? false,
+            // Operator-facing warn channel. Closure captures the
+            // current tool call's id + name so the adapter can
+            // attribute the warning to the right invocation.
+            // Always wired — tools that don't use it just don't
+            // call it. Optional in ToolContext for headless / SDK
+            // contexts that don't construct via the harness; here
+            // we always set it because we know the onEvent sink.
+            emitWarn: (message: string) =>
+              safeEmit(config.onEvent, {
+                type: 'tool_warning',
+                toolUseId: tu.id,
+                toolName: tu.name,
+                message,
+              }),
           };
 
           safeEmit(config.onEvent, {

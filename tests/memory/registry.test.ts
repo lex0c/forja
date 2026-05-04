@@ -474,3 +474,227 @@ describe('createMemoryRegistry — reload', () => {
     expect(reg.list()).toHaveLength(2);
   });
 });
+
+describe('createMemoryRegistry — count', () => {
+  test('returns 0 when no scope has an index', () => {
+    const repo = makeTmp();
+    const reg = createMemoryRegistry({ roots: makeRoots(repo) });
+    expect(reg.count()).toBe(0);
+  });
+
+  test('returns total entries across all scopes by default', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — h\n- [B](b.md) — h\n');
+    writeIndex(roots.projectShared, '- [C](c.md) — h\n');
+    writeIndex(roots.projectLocal, '- [D](d.md) — h\n');
+    const reg = createMemoryRegistry({ roots });
+    expect(reg.count()).toBe(4);
+  });
+
+  test('deduplicateByName collapses shadowed names', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Style](commit-style.md) — h\n');
+    writeIndex(roots.projectShared, '- [Style](commit-style.md) — h\n');
+    writeIndex(roots.projectLocal, '- [Style](commit-style.md) — h\n');
+    const reg = createMemoryRegistry({ roots });
+    expect(reg.count()).toBe(3);
+    expect(reg.count({ deduplicateByName: true })).toBe(1);
+  });
+
+  test('count reflects post-write state without explicit reload', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const db = openMemoryDb();
+    migrate(db);
+    const sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    expect(reg.count()).toBe(0);
+    reg.write({
+      scope: 'project_local',
+      frontmatter: {
+        name: 'fresh',
+        description: 'h',
+        type: 'feedback',
+        source: 'inferred',
+      },
+      body: 'b',
+    });
+    // write() auto-refreshes the snapshot, so count reflects it.
+    expect(reg.count()).toBe(1);
+  });
+});
+
+describe('createMemoryRegistry — peek', () => {
+  let db: DB;
+  let sessionId: string;
+
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+    sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+  });
+
+  test('returns the file body without emitting a read audit row', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Role](role.md) — role\n');
+    writeMemory(roots.projectLocal, 'role', fmUser('role'), 'Body of role.\n');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+    const result = reg.peek('role');
+    if (result.kind !== 'present') throw new Error(`expected present, got ${result.kind}`);
+    expect(result.scope).toBe('project_local');
+    expect(result.file.body).toBe('Body of role.\n');
+    // Crucially: NO audit row.
+    expect(listMemoryEventsByName(db, 'role')).toEqual([]);
+  });
+
+  test('returns unknown for missing name (no audit)', () => {
+    const repo = makeTmp();
+    const reg = createMemoryRegistry({ roots: makeRoots(repo), db, sessionId });
+    expect(reg.peek('nope').kind).toBe('unknown');
+    expect(listMemoryEventsByName(db, 'nope')).toEqual([]);
+  });
+
+  test('strict scope opt-in (no fallback)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Role](role.md) — user-scope\n');
+    writeMemory(roots.user, 'role', fmUser('role'), 'b');
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    expect(reg.peek('role', { scope: 'project_local' }).kind).toBe('unknown');
+    expect(reg.peek('role').kind).toBe('present');
+  });
+});
+
+describe('createMemoryRegistry — write', () => {
+  let db: DB;
+  let sessionId: string;
+
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+    sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+  });
+
+  test('persists, emits `created` audit, and refreshes snapshot', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+    const before = reg.list();
+    expect(before).toHaveLength(0);
+
+    const result = reg.write({
+      scope: 'project_local',
+      frontmatter: {
+        name: 'no-console-log',
+        description: 'no console.log in src/',
+        type: 'feedback',
+        source: 'inferred',
+      },
+      body: 'Body content here.',
+    });
+    expect(result.kind).toBe('created');
+
+    // Snapshot refreshed automatically.
+    const after = reg.list();
+    expect(after).toHaveLength(1);
+    expect(after[0]?.name).toBe('no-console-log');
+
+    const events = listMemoryEventsByName(db, 'no-console-log');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.action).toBe('created');
+    expect(events[0]?.scope).toBe('project_local');
+    expect(events[0]?.source).toBe('inferred');
+    expect(events[0]?.sessionId).toBe(sessionId);
+    expect(events[0]?.cwd).toBe('/p');
+    expect(events[0]?.details?.type).toBe('feedback');
+  });
+
+  test('emits `refused` with reason for shared_forbidden', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const result = reg.write({
+      scope: 'project_shared',
+      frontmatter: {
+        name: 'team-mem',
+        description: 'd',
+        type: 'feedback',
+        source: 'inferred',
+      },
+      body: 'b',
+    });
+    expect(result.kind).toBe('shared_forbidden');
+    const events = listMemoryEventsByName(db, 'team-mem');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.action).toBe('refused');
+    expect(events[0]?.details?.kind).toBe('shared_forbidden');
+    expect(events[0]?.details?.reason).toContain('promote');
+  });
+
+  test('emits `refused` for exists collision', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    mkdirSync(roots.projectLocal, { recursive: true });
+    writeFileSync(join(roots.projectLocal, 'dup.md'), 'something');
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const result = reg.write({
+      scope: 'project_local',
+      frontmatter: {
+        name: 'dup',
+        description: 'd',
+        type: 'feedback',
+        source: 'inferred',
+      },
+      body: 'b',
+    });
+    expect(result.kind).toBe('exists');
+    const events = listMemoryEventsByName(db, 'dup');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.action).toBe('refused');
+    expect(events[0]?.details?.kind).toBe('exists');
+  });
+
+  test('per-call audit override wins over constructor-captured ids', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+    const otherSession = createSession(db, { model: 'm2', cwd: '/q' }).id;
+    reg.write({
+      scope: 'user',
+      frontmatter: {
+        name: 'pref-x',
+        description: 'd',
+        type: 'user',
+        source: 'inferred',
+      },
+      body: 'b',
+      auditSessionId: otherSession,
+      auditCwd: '/q',
+    });
+    const events = listMemoryEventsByName(db, 'pref-x');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.sessionId).toBe(otherSession);
+    expect(events[0]?.cwd).toBe('/q');
+  });
+
+  test('does not emit audit when constructed without DB', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots });
+    const result = reg.write({
+      scope: 'project_local',
+      frontmatter: {
+        name: 'no-db',
+        description: 'd',
+        type: 'feedback',
+        source: 'inferred',
+      },
+      body: 'b',
+    });
+    expect(result.kind).toBe('created');
+    // No db handle to assert on — just exercise the no-throw path.
+  });
+});

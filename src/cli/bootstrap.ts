@@ -1,12 +1,19 @@
 import { join } from 'node:path';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
-import { createMemoryRegistry, resolveRepoRoot, resolveScopeRoots } from '../memory/index.ts';
+import {
+  createMemoryRegistry,
+  evaluateBootTriggers,
+  gcExpiredMemories,
+  resolveRepoRoot,
+  resolveScopeRoots,
+} from '../memory/index.ts';
 import { type LockConflict, createPermissionEngine, resolvePolicy } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
 import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
+import { isTrusted, trustListPath } from '../trust/index.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithUserPrompt } from './plan-prompt.ts';
 
@@ -50,6 +57,16 @@ export interface BootstrapInput {
   // the permission-layer test seams above.
   userAgentsDir?: string | null;
   projectAgentsDir?: string | null;
+  // Test seam for trust-list discovery. Mirrors the REPL's
+  // `trustListPathOverride`:
+  //   - undefined → use `trustListPath()` (production default)
+  //   - null      → trust storage unavailable (cwd treated as
+  //                 untrusted, fail-closed)
+  //   - string    → use this path (test fixtures isolate from the
+  //                 user's real `~/.config/agent/trusted_dirs.json`)
+  // The resolved value drives `HarnessConfig.isCwdTrusted`, which
+  // memory_write's trust gate consumes (spec MEMORY.md §7.2.1).
+  trustListPathOverride?: string | null;
 }
 
 export interface BootstrapResult {
@@ -177,9 +194,60 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     // path — an absent or empty memory subtree just produces an
     // empty section that composeSystemPrompt passes through,
     // leaving the base prompt unchanged.
-    const memoryRoots = resolveScopeRoots(resolveRepoRoot(cwd));
+    // Resolve the repo root once and reuse for memory scope roots
+    // AND boot trigger probes. Earlier cut called
+    // `evaluateBootTriggers(cwd)` separately, which broke the
+    // common case of running `agent` from a repo subdirectory:
+    // memory was loaded from the repo root (`resolveRepoRoot(cwd)`)
+    // but trigger probes scanned `cwd`, missing root-level
+    // `.git` / `package.json` / `tsconfig.json` etc. Memories
+    // tagged with those triggers got filtered out even though
+    // the same session loaded the project memory containing them.
+    // Single `repoRoot` value keeps the two consumers aligned.
+    const repoRoot = resolveRepoRoot(cwd);
+    const memoryRoots = resolveScopeRoots(repoRoot);
     memoryRegistry = createMemoryRegistry({ roots: memoryRoots, db, cwd });
-    const memorySection = assembleMemorySection({ registry: memoryRegistry });
+    // SessionStart expiry GC (spec MEMORY.md §6.2). Auto-removes
+    // memories whose `expires:` field is on or before today. Each
+    // removal emits a `memory_events` row with `action: 'expired'`
+    // so the operator can audit "what disappeared and when". We
+    // run this BEFORE assembling the eager prompt section so the
+    // model never sees stale entries that vanish mid-session. The
+    // session id isn't known yet (the harness loop creates it
+    // later), so the audit rows here land with sessionId NULL —
+    // the lifecycle GC is conceptually a session-bootstrap event,
+    // not a per-session-conversation one. cwd is forwarded so
+    // `/memory audit` can group GC events by working directory.
+    //
+    // Failures (sandbox / io / unknown) get a `refused` audit row
+    // with stage='lifecycle_gc' AND a stderr line so the operator
+    // sees them in two places: the persistent audit table (for
+    // forensic review) and the live stderr stream (for "something
+    // unusual happened on this boot"). A bootstrap-blocking
+    // failure would be wrong — one bad memory shouldn't gate the
+    // session — but silently dropping the failure is worse.
+    const gcResult = gcExpiredMemories(memoryRegistry, memoryRoots, { auditCwd: cwd });
+    for (const failure of gcResult.failures) {
+      process.stderr.write(
+        `forja: memory gc: failed to expire ${failure.memory.scope}/${failure.memory.name} (expires ${failure.memory.expires}): ${failure.reason}\n`,
+      );
+    }
+    // Boot-time trigger context (spec §4.3). evaluateBootTriggers
+    // probes the REPO ROOT for well-known files (.git, .env,
+    // package.json, AGENTS.md, etc.); each present file is added
+    // to a Set that assembleMemorySection consults when filtering
+    // memories tagged with `triggers:` in their frontmatter.
+    // Probing the repo root (not the invocation cwd) matches the
+    // memory roots resolved above — same anchor for both. An
+    // operator running `agent` from `/repo/src/components/`
+    // expects `git` / `package` triggers to fire because the
+    // project memory loaded from `/repo` mentions them; probing
+    // cwd would silently miss every project-root file.
+    const bootContext = evaluateBootTriggers(repoRoot);
+    const memorySection = assembleMemorySection({
+      registry: memoryRegistry,
+      bootContext,
+    });
     resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text);
   } catch (e) {
     db.close();
@@ -192,6 +260,26 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   // to put log files. Per-cwd: a worktree's bg processes don't
   // collide with the parent repo's.
   const bgLogDir = join(cwd, '.agent', 'bg');
+
+  // Resolve cwd trust state for downstream gates (today: memory_write
+  // refuses inferred writes in untrusted cwd, MEMORY.md §7.2.1). The
+  // REPL boot path runs the trust modal BEFORE calling bootstrap, so
+  // by the time we get here cwd is already in the persisted list (or
+  // the boot exited). One-shot mode (`agent "prompt"`) calls bootstrap
+  // directly with no trust modal — cwd may genuinely be untrusted.
+  // Either way, recompute here so the answer matches the live state
+  // of `trusted_dirs.json` at this moment.
+  //
+  // Fail-closed semantics:
+  //   - trustListPathOverride === null         → no trust storage
+  //                                              → isCwdTrusted=false
+  //   - trustListPath() returned null (XDG     → idem
+  //     paths unavailable on weird platform)
+  //   - file missing / corrupt / not in list   → false
+  //   - cwd in list                            → true
+  const trustPath =
+    input.trustListPathOverride !== undefined ? input.trustListPathOverride : trustListPath();
+  const isCwdTrusted = trustPath !== null && isTrusted(trustPath, cwd);
 
   const config: HarnessConfig = {
     provider,
@@ -213,6 +301,7 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     // when there are simply no .md files yet.
     subagentRegistry: subagents,
     memoryRegistry,
+    isCwdTrusted,
     ...(input.budget !== undefined ? { budget: input.budget } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.plan === true ? { planMode: true } : {}),

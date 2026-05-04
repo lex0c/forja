@@ -87,6 +87,7 @@ describe('bootstrap', () => {
         'memory_list',
         'memory_read',
         'memory_search',
+        'memory_write',
         'monitor',
         'read_file',
         'task',
@@ -230,6 +231,63 @@ describe('bootstrap', () => {
     // memoryRegistry is wired into the config so the memory_*
     // tools can dispatch.
     expect(config.memoryRegistry).toBeDefined();
+    db.close();
+  });
+
+  test('boot triggers probe the repo root, not the invocation cwd (regression)', () => {
+    // Bug: bootstrap evaluated boot triggers from the invocation
+    // cwd, not the repo root. Operator running `agent` from
+    // `/repo/src/components/` saw `git` / `package` / `tsconfig`
+    // triggers fail to fire because the probe scanned the subdir
+    // (no root-level files there), even though memories were
+    // loaded from `/repo`. Fix: probe from `resolveRepoRoot(cwd)`.
+    //
+    // Setup: workdir/.git + workdir/package.json (repo-level
+    // trigger files), a project_local memory tagged `triggers:
+    // [git, package]`, then bootstrap from workdir/src/sub. The
+    // memory must surface in the eager prompt section.
+    Bun.spawnSync({
+      cmd: ['git', 'init', workdir],
+      stdout: 'ignore',
+      stderr: 'ignore',
+    });
+    writeFileSync(join(workdir, 'package.json'), '{}');
+    const subDir = join(workdir, 'src', 'sub');
+    mkdirSync(subDir, { recursive: true });
+    const localDir = join(workdir, '.agent', 'memory', 'local');
+    mkdirSync(localDir, { recursive: true });
+    writeFileSync(
+      join(localDir, 'MEMORY.md'),
+      '- [GitTagged](git-tagged.md) — git-tagged memory\n',
+    );
+    writeFileSync(
+      join(localDir, 'git-tagged.md'),
+      [
+        '---',
+        'name: git-tagged',
+        'description: hook for git-tagged',
+        'type: feedback',
+        'source: user_explicit',
+        'triggers:',
+        '  - git',
+        '  - package',
+        '---',
+        '',
+        'body',
+      ].join('\n'),
+    );
+    const { config, db } = bootstrap({
+      prompt: 'hi',
+      cwd: subDir, // invocation cwd is the SUBDIR, not the repo root
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+    });
+    // Memory should be present — `git` / `package` triggers fired
+    // because we probed the repo root.
+    expect(config.systemPrompt).toBeDefined();
+    expect(config.systemPrompt).toContain('git-tagged');
     db.close();
   });
 
@@ -433,5 +491,68 @@ describe('bootstrap', () => {
       }),
     ).toThrow(/unknown model/);
     expect(existsSync(dbPath)).toBe(false);
+  });
+
+  describe('isCwdTrusted resolution (MEMORY.md §7.2.1)', () => {
+    test('returns true when cwd is in the trust list', () => {
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(config.isCwdTrusted).toBe(true);
+      db.close();
+    });
+
+    test('returns false when cwd is absent from trust list', () => {
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: ['/other/path'] }));
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      db.close();
+    });
+
+    test('returns false when trust file is missing (storage absent)', () => {
+      const trustPath = join(workdir, 'never-created.json');
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      db.close();
+    });
+
+    test('returns false when trustListPathOverride is null (storage disabled)', () => {
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: null,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      db.close();
+    });
   });
 });

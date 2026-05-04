@@ -80,6 +80,18 @@ export interface ToolMetadata {
   // the parent's bg log dir, which is unsafe); 4.2b will revisit
   // by giving worktree subagents their own bg dir.
   requiresBgManager?: boolean;
+  // Tool needs an interactive operator confirmation surface to run
+  // (today only `memory_write`, which awaits the modal-bridge
+  // callback before persisting). Subagents are headless from the
+  // operator's perspective — they have no modal pipe back to the
+  // parent REPL — so a tool flagged this way has no path to run
+  // inside a subagent and the subagent validator rejects whitelists
+  // that include it. Distinct axis from `writes`: a write tool can
+  // run in a worktree-isolated subagent, but a confirm-bound tool
+  // can't run in ANY subagent until parent↔child IPC grows a
+  // confirm channel (spec §11). Defaults to false; only memory_write
+  // opts in today.
+  requiresOperatorConfirm?: boolean;
   idempotent: boolean;
   display?: DisplayHint;
   // Optional cost hints; informational only in M1.
@@ -134,6 +146,44 @@ export interface ToolContext {
   // logged to memory_events at the registry layer; the tool just
   // dispatches.
   memoryRegistry?: MemoryRegistry;
+  // Modal confirm hook for the `memory_write` tool (MEMORY.md §5.1).
+  // Set by the harness when `HarnessConfig.confirmMemoryWrite` is
+  // wired. Absent in headless / non-interactive runs — the
+  // memory_write tool then rejects with `headless_mode` per spec
+  // §5.1.6, mirroring the bgManager-absent pattern.
+  confirmMemoryWrite?: (req: {
+    scope: 'user' | 'project_shared' | 'project_local';
+    name: string;
+    body: string;
+  }) => Promise<'yes' | 'no' | 'cancel'>;
+  // Second-confirm hook for user-scope writes (MEMORY.md §7.2.5).
+  // Fired by `memory_write` AFTER `confirmMemoryWrite` returns
+  // yes AND the proposed scope is `user`. Pairs with
+  // `confirmMemoryWrite` in production: REPL wires both, headless
+  // wires neither. When `confirmMemoryWrite` is set but this is
+  // NOT (programmer error or partial test wiring), user-scope
+  // writes are refused with `headless_mode` to fail-closed.
+  confirmMemoryUserScope?: (req: {
+    name: string;
+    body: string;
+  }) => Promise<'yes' | 'no' | 'cancel'>;
+  // Trust state of `cwd` resolved at session start (AGENTIC_CLI.md
+  // §9.1). Required so any future tool that needs trust info gets
+  // an explicit value rather than an undefined fallback that could
+  // silently allow privileged behavior. memory_write consumes this
+  // (MEMORY.md §7.2.1: `inferred` writes refused in untrusted
+  // cwds); `user_explicit` writes go through regardless. The
+  // default-true convention in tests' makeCtx mirrors the
+  // post-trust-prompt reality of the REPL flow.
+  isCwdTrusted: boolean;
+  // Operator-facing warning channel. Tools call this to surface
+  // non-error notices that should land in the live region as a
+  // `warn` line. Today only memory_read uses it (spec §7.2.7:
+  // `[memory: untrusted]` marker when a body with
+  // `trust: untrusted` is returned). Optional — when absent (one-
+  // shot SDK without an event sink), the call is a no-op and the
+  // tool's normal output remains the only carrier.
+  emitWarn?: (message: string) => void;
 }
 
 // Inputs the `task` tool passes through to the harness's subagent
