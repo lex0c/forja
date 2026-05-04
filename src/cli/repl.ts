@@ -56,6 +56,14 @@ export interface RunReplOptions {
   // result instead of calling `bootstrap()` itself. Same shape the
   // real bootstrap returns.
   bootstrapOverride?: BootstrapResult;
+  // Test seam: replace the `bootstrap` function call. Defaults to
+  // the real `bootstrap` import. Used by the regression test for
+  // pre-bootstrap-stack cleanup on bootstrap throw — passes a fn
+  // that throws so the catch path runs without standing up real
+  // provider/DB/registries. `bootstrapOverride` (a precomputed
+  // result) takes precedence when set; this seam only fires when
+  // the override is absent.
+  bootstrapFn?: (input: BootstrapInput) => BootstrapResult;
   // Test seam: replace the harness entry. Defaults to `runAgent`.
   // Tests inject a fake that drives a scripted set of HarnessEvents
   // through `cfg.onEvent` and resolves a HarnessResult.
@@ -220,6 +228,29 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   stdin.on('data', onData);
   if (typeof stdin.resume === 'function') stdin.resume();
 
+  // Tear-down for early-exit paths that DON'T have a db / harness
+  // to close (trust decline, bootstrap throw before reaching the
+  // full shutdown(): both leave the pre-bootstrap stack live —
+  // renderer holding raw mode + bracketed paste, stdin data
+  // listener attached, drain timer possibly armed). Centralized
+  // because both paths leak the same set of handles if any one
+  // step is forgotten.
+  //
+  // Idempotent against repeat calls — renderer.close and
+  // modalManager.close already guard via internal `closed` flags;
+  // removeListener / clearTimeout are no-ops on missing
+  // listeners / null timers.
+  let preBootstrapTornDown = false;
+  const tearDownPreBootstrap = (): void => {
+    if (preBootstrapTornDown) return;
+    preBootstrapTornDown = true;
+    cancelDrain();
+    modalManager.close();
+    renderer.close();
+    stdin.removeListener('data', onData);
+    if (typeof stdin.pause === 'function') stdin.pause();
+  };
+
   // ─── Trust prompt (AGENTIC_CLI §9.1) ─────────────────────────────
   // First-run gate. The cwd checked here MUST match the cwd
   // bootstrap will subsequently read project files from — same
@@ -244,15 +275,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     const trustTimeoutMs = options.trustPromptTimeoutMs ?? 5 * 60 * 1000;
     const answer = await modalManager.askTrust({ path: cwd }, { timeoutMs: trustTimeoutMs });
     if (answer !== 'yes') {
-      // Operator declined. Cleanup the partial setup — no DB, no
-      // harness, no editor handler to tear down. Manual cleanup
-      // because shutdown() (defined post-bootstrap) references
-      // db/runningPromise/etc. that don't exist yet.
-      cancelDrain();
-      modalManager.close();
-      renderer.close();
-      stdin.removeListener('data', onData);
-      if (typeof stdin.pause === 'function') stdin.pause();
+      tearDownPreBootstrap();
       return 0;
     }
     if (trustPath !== null) {
@@ -278,9 +301,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // turns within a session.
   let bootstrapped: BootstrapResult;
   try {
+    const bootstrapFn = options.bootstrapFn ?? bootstrap;
     bootstrapped =
       options.bootstrapOverride ??
-      bootstrap({
+      bootstrapFn({
         prompt: '',
         // Pin bootstrap's cwd to the same string we trust-checked
         // above. Without this they'd both default to process.cwd()
@@ -294,6 +318,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   } catch (e) {
     const msg = e instanceof Error ? e.message || e.name || String(e) : String(e);
     errSink(`forja: ${msg}\n`);
+    // Pre-bootstrap stack (renderer, stdin listener, drain timer)
+    // is live by this point — see comment near `tearDownPreBootstrap`.
+    // Without this call an embedded caller (tests, agent SDK) that
+    // keeps running after runRepl returns would leak the listener
+    // and observe a terminal stuck in raw mode + bracketed paste
+    // until process exit.
+    tearDownPreBootstrap();
     return 1;
   }
   const { config: baseConfig, db, modelId, lockConflicts, subagents, policyLayers } = bootstrapped;

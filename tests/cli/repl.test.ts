@@ -1057,6 +1057,33 @@ describe('repl — trust prompt (AGENTIC_CLI §9.1)', () => {
     expect(loadTrustedDirs(trustPath)).toEqual([]);
   });
 
+  test('bootstrap error after trust acceptance tears down the pre-bootstrap stack', async () => {
+    // Regression: pre-fix the bootstrap catch path returned 1
+    // immediately, leaving the renderer (raw mode + bracketed
+    // paste) and the stdin data listener live. An embedded caller
+    // (tests, agent SDK) that kept running after runRepl returned
+    // would inherit those handles. The fix routes through
+    // tearDownPreBootstrap before returning. We pin the contract
+    // by counting the stdin 'data' listeners after runRepl resolves.
+    const stdin = makeStdin();
+    const before = stdin.listenerCount('data');
+    const code = await runRepl({
+      args: makeArgs(),
+      // No bootstrapOverride — let bootstrapFn run the throwing fn.
+      bootstrapFn: () => {
+        throw new Error('synthetic bootstrap failure');
+      },
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: () => undefined,
+    });
+    expect(code).toBe(1);
+    // Listener was attached pre-bootstrap; after the catch path's
+    // teardown it must be removed (count back at the baseline).
+    expect(stdin.listenerCount('data')).toBe(before);
+  });
+
   test('unattended trust modal auto-rejects after the timeout (fail-closed)', async () => {
     // Spec UI.md §5.5 rule 6: trust:ask is the one *:ask flavor with
     // a bounded window. Without the timeout the modal would hold
