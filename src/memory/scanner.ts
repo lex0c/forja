@@ -88,11 +88,17 @@ export const scanForInjection = (text: string): ScanResult => {
   return { ok: true };
 };
 
-// Hard cap on body line count for promotion. Spec §5.4 "Content
-// fica < 200 lines (limite hard)". Counted as `\n`-separated
-// lines including a trailing empty line if the body ends with
-// `\n` (standard line-count). We compare strict-less-than so a
-// body of exactly 200 lines passes; 201 fails.
+// Hard cap on body line count for promotion (spec §5.4 line 384
+// "Content fica < 200 lines"). The cap value names the maximum
+// ALLOWED line count: 200 lines passes, 201 fails. Compare
+// strictly greater-than so the boundary value is treated as
+// "valid at the limit" — earlier cut used `>=` and rejected
+// exactly-200-line bodies while reporting "exceeds 200-line cap
+// (got 200)", which is internally contradictory (200 doesn't
+// exceed 200). Counted as `\n`-separated lines including a
+// trailing empty line if the body ends with `\n` (standard
+// line-count semantics; matches `wc -l`-equivalent for
+// newline-terminated files).
 export const SHARED_BODY_LINE_CAP = 200;
 
 // Path-traversal heuristic for promotion. Spec §5.4 calls for a
@@ -105,7 +111,16 @@ export const SHARED_BODY_LINE_CAP = 200;
 // (e.g., `the tool reads ../config/foo.yaml`).
 const PATH_TRAVERSAL_PATTERNS: readonly RegExp[] = [
   /\.\.[\\/]/, // ../ or ..\
-  /\b\/etc\/(passwd|shadow|hosts)\b/i,
+  // `\b/etc/...` won't match `to /etc/shadow` because `\b` needs a
+  // word char immediately before the `/`, and `/` itself is
+  // non-word, so the leading boundary fires only at start-of-
+  // string. Drop the leading `\b` and rely on the literal
+  // `/etc/` prefix as the anchor; trailing `\b` after the
+  // sensitive name still keeps `/etc/passwordless` from
+  // matching.
+  /\/etc\/(passwd|shadow|hosts)\b/i,
+  // Same correction for the Windows literal — the leading `[A-Z]:`
+  // begins with a word char, so `\b` is fine. Kept verbatim.
   /\b[A-Z]:\\Windows\\System32\b/i,
 ];
 
@@ -122,7 +137,7 @@ export const scanForPromotion = (body: string): ScanResult => {
     }
   }
   const lineCount = body.split('\n').length;
-  if (lineCount >= SHARED_BODY_LINE_CAP) {
+  if (lineCount > SHARED_BODY_LINE_CAP) {
     return {
       ok: false,
       reason: `body exceeds ${SHARED_BODY_LINE_CAP}-line cap (got ${lineCount})`,
