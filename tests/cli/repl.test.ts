@@ -1057,6 +1057,31 @@ describe('repl — trust prompt (AGENTIC_CLI §9.1)', () => {
     expect(loadTrustedDirs(trustPath)).toEqual([]);
   });
 
+  test('unattended trust modal auto-rejects after the timeout (fail-closed)', async () => {
+    // Spec UI.md §5.5 rule 6: trust:ask is the one *:ask flavor with
+    // a bounded window. Without the timeout the modal would hold
+    // raw-mode stdio open indefinitely on an unattended terminal —
+    // a process spawned by automation that hits an unfamiliar cwd
+    // would just hang. Tiny `trustPromptTimeoutMs` so the test
+    // fires fast.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+      trustListPathOverride: trustPath,
+      trustPromptTimeoutMs: 30,
+    });
+    // No keystroke fed — let the timeout fire.
+    expect(await promise).toBe(0);
+    expect(ra.captured).toHaveLength(0);
+    // Trust list NOT mutated on timeout.
+    expect(loadTrustedDirs(trustPath)).toEqual([]);
+  });
+
   test('Esc on the trust modal cancels and exits 0', async () => {
     const stdin = makeStdin();
     const ra = makeRunAgent((n) => `sess-${n}`);

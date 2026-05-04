@@ -93,6 +93,12 @@ export interface RunReplOptions {
   // leaves it undefined — REPL falls through to the platform
   // default via `trustListPath()`.
   trustListPathOverride?: string | null;
+  // Test seam: shrink the trust modal's auto-reject window.
+  // Production uses 5 minutes (spec UI.md §5.5 rule 6); tests need
+  // a tiny value (~50ms) so a regression test for the timeout path
+  // doesn't have to wait that long. Undefined leaves the spec
+  // default in place.
+  trustPromptTimeoutMs?: number;
 }
 
 // All UIEvents flow through to the bus. Earlier this filter dropped
@@ -227,7 +233,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     options.trustListPathOverride !== undefined ? options.trustListPathOverride : trustListPath();
   const cwdAlreadyTrusted = trustPath !== null && isTrusted(trustPath, cwd);
   if (options.skipTrustPrompt !== true && !cwdAlreadyTrusted) {
-    const answer = await modalManager.askTrust({ path: cwd });
+    // Fail-closed timeout. Spec UI.md §5.5 rule 6 calls for trust:ask
+    // to auto-reject after 5 minutes — modal-manager exposes the
+    // window via `timeoutMs` but the producer (this caller) has to
+    // arm it. Without the explicit pass, an unattended terminal at
+    // the trust modal would block runRepl forever, holding raw
+    // mode + bracketed paste open. The timeout resolves to 'cancel',
+    // which falls through to the same decline path below — exit 0
+    // without ever entering the REPL.
+    const trustTimeoutMs = options.trustPromptTimeoutMs ?? 5 * 60 * 1000;
+    const answer = await modalManager.askTrust({ path: cwd }, { timeoutMs: trustTimeoutMs });
     if (answer !== 'yes') {
       // Operator declined. Cleanup the partial setup — no DB, no
       // harness, no editor handler to tear down. Manual cleanup
