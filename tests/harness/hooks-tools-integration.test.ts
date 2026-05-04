@@ -587,8 +587,9 @@ describe('hooks Slice 3 — PostToolUse', () => {
     const result = await runAgent(config);
     expect(result.status).toBe('done');
 
-    // Wait briefly for fire-and-forget hook to settle.
-    await new Promise((r) => setTimeout(r, 200));
+    // No setTimeout needed — runAgent drains pending fire-and-
+    // forget chains in finish() before returning, so the hook
+    // subprocess + audit row are guaranteed to have landed.
 
     const parsed = JSON.parse(await readFile(marker, 'utf8'));
     expect(parsed.event).toBe('PostToolUse');
@@ -672,10 +673,9 @@ describe('hooks Slice 3 — PostToolUse', () => {
     };
     const result = await runAgent(config);
 
-    // Wait for any fire-and-forget hooks to settle (so a stray
-    // PostToolUse would land before we assert).
-    await new Promise((r) => setTimeout(r, 200));
-
+    // No sleep — finish()'s drain awaits every in-flight chain
+    // before returning, so a stray PostToolUse (if it had been
+    // dispatched) would already be in `hook_runs` here.
     const runs = listHookRunsBySession(db, result.sessionId);
     const pre = runs.filter((r) => r.event === 'PreToolUse');
     const post = runs.filter((r) => r.event === 'PostToolUse');

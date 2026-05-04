@@ -1973,4 +1973,110 @@ You are the worker.`,
       db2.close();
     }
   });
+
+  test('subagent-child loads and dispatches hooks from the parent repo (regression)', async () => {
+    // Sanity-revert: an earlier cut built HarnessConfig without
+    // `hooks` so every `task`-spawned child silently bypassed
+    // every hook — defeating spec §10's `locked: true` claim
+    // (an enterprise PreToolUse hook protecting `bash` would be
+    // enforced in the parent but bypassed in any subagent that
+    // listed `bash` in its whitelist). Fix anchors the project
+    // hooks.toml at the parent's repo (via `memoryCwd`); we
+    // verify the SessionStart hook fires inside the child by
+    // having it touch a marker file.
+    const fs = await import('node:fs');
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+    const hookRunsRepo = await import('../../src/storage/repos/hook-runs.ts');
+
+    const parentRepo = mkdtempSync(join(tmpdir(), 'forja-child-hook-parent-'));
+    const worktreeCwd = mkdtempSync(join(tmpdir(), 'forja-child-hook-worktree-'));
+    const marker = join(parentRepo, 'session-start-fired.txt');
+    // Stage a SessionStart hook in the parent's project layer.
+    // The subagent-child must re-resolve from this same path.
+    const hookDir = join(parentRepo, '.agent');
+    fs.mkdirSync(hookDir, { recursive: true });
+    fs.writeFileSync(
+      join(hookDir, 'hooks.toml'),
+      ['[[hooks]]', 'event = "SessionStart"', `command = "cat > ${marker}"`, ''].join('\n'),
+    );
+
+    // Isolate enterprise + user layers so the runner machine's
+    // own /etc or ~/.config files don't bleed into the test.
+    const originalXdg = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = parentRepo; // /etc layer is system-wide; parent repo's project layer is what we test against
+
+    try {
+      let childId: string;
+      const db = openDb(dbPath);
+      try {
+        migrate(db);
+        const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: parentRepo });
+        const child = sessionsRepo.createSession(db, {
+          model: 'mock/m',
+          cwd: worktreeCwd,
+          parentSessionId: parent.id,
+        });
+        childId = child.id;
+        subagentRunsRepo.insertSubagentRun(db, {
+          sessionId: child.id,
+          name: 'explore',
+          scope: 'project',
+          sourcePath: '/fake/explore.md',
+          sourceSha256: 'a'.repeat(64),
+          systemPrompt: 'You are explore.',
+          toolsWhitelist: [],
+          budgetMaxSteps: 5,
+          budgetMaxCostUsd: 0.1,
+        });
+        messagesRepo.appendMessage(db, {
+          sessionId: child.id,
+          role: 'user',
+          content: 'go',
+        });
+      } finally {
+        db.close();
+      }
+
+      const exitCode = await runSubagentChild({
+        sessionId: childId,
+        dbPath,
+        providerOverride: stubProvider('done'),
+        userAgentsDir: null,
+        projectAgentsDir: null,
+        memoryCwd: parentRepo,
+        errSink: () => undefined,
+      });
+      expect(exitCode).toBe(0);
+
+      // The hook subprocess wrote its payload to the marker.
+      // File presence proves: (a) the child resolved hooks
+      // from the parent's repo, (b) the harness dispatched
+      // SessionStart, (c) the operator command ran.
+      expect(fs.existsSync(marker)).toBe(true);
+
+      // Audit: hook_runs has the SessionStart row attributed
+      // to the child's session.
+      const dbCheck = openDb(dbPath);
+      try {
+        const runs = hookRunsRepo.listHookRunsBySession(dbCheck, childId);
+        const ss = runs.filter((r) => r.event === 'SessionStart');
+        expect(ss).toHaveLength(1);
+        expect(ss[0]?.outcome).toBe('allow');
+        expect(ss[0]?.layer).toBe('project');
+      } finally {
+        dbCheck.close();
+      }
+    } finally {
+      if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = originalXdg;
+      try {
+        rmSync(parentRepo, { recursive: true, force: true });
+      } catch {}
+      try {
+        rmSync(worktreeCwd, { recursive: true, force: true });
+      } catch {}
+    }
+  });
 });

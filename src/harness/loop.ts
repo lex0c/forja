@@ -256,23 +256,38 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // a legitimate hook can disappear from `hook_runs` because
   // the DB closes underneath it. The wall-clock cap (15s) inside
   // the dispatcher protects against runaway hooks adding latency.
+  //
+  // In-flight chain promises are tracked in `pendingHookChains`
+  // so the outer finally can drain them before the caller closes
+  // the DB. Without the drain, a fire-and-forget Notification
+  // / PreCheckpoint / PostToolUse can race db.close() and the
+  // dispatcher's createHookRun call hits a closed handle —
+  // surfacing as a stderr "AUDIT DRIFT" line instead of a
+  // landed row. Awaited dispatches resolve before settling
+  // here too, so adding them to the set is a no-op cost.
+  const pendingHookChains = new Set<Promise<unknown>>();
   const dispatchHooks = async (payload: HookEventPayload): Promise<HookChainResult | null> => {
     if (config.hooks === undefined || config.hooks.length === 0) return null;
-    try {
-      return await dispatchChain(config.hooks, payload, config.cwd, {
-        db: config.db,
-        sessionId: sessionId.length > 0 ? sessionId : null,
-      });
-    } catch (err) {
-      // Defense-in-depth: dispatchChain wraps each hook's error
-      // already, but a programming bug in the dispatcher itself
-      // (or a synchronous throw before the per-hook try/catch
-      // started) shouldn't crash the harness. Log to stderr so
-      // the operator notices.
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`hooks: chain dispatch failed for ${payload.event}: ${msg}\n`);
-      return null;
-    }
+    const chain = (async (): Promise<HookChainResult | null> => {
+      try {
+        return await dispatchChain(config.hooks ?? [], payload, config.cwd, {
+          db: config.db,
+          sessionId: sessionId.length > 0 ? sessionId : null,
+        });
+      } catch (err) {
+        // Defense-in-depth: dispatchChain wraps each hook's
+        // error already, but a programming bug in the dispatcher
+        // itself (or a synchronous throw before the per-hook
+        // try/catch started) shouldn't crash the harness. Log
+        // to stderr so the operator notices.
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`hooks: chain dispatch failed for ${payload.event}: ${msg}\n`);
+        return null;
+      }
+    })();
+    pendingHookChains.add(chain);
+    chain.finally(() => pendingHookChains.delete(chain));
+    return chain;
   };
 
   // `abortCause` is only meaningful when reason === 'aborted'; ignored
@@ -351,6 +366,20 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           steps: result.steps,
         },
       });
+    }
+    // Drain any fire-and-forget chains still in flight
+    // (PostToolUse from the last tool of the run, Notification
+    // from a confirm modal that opened mid-step, PreCheckpoint
+    // from the last writes-true step). Without this, a chain
+    // that hadn't yet reached its `createHookRun` call by the
+    // time runAgent returns races `db.close()` in the CLI
+    // driver — surfacing as stderr "AUDIT DRIFT" lines instead
+    // of a landed row. The dispatcher's per-hook + chain
+    // timeouts already bound how long this can take. Use
+    // allSettled so a rogue chain that throws here doesn't
+    // crash the harness's exit path.
+    if (pendingHookChains.size > 0) {
+      await Promise.allSettled([...pendingHookChains]);
     }
     safeEmit(config.onEvent, { type: 'session_finished', result });
     return result;

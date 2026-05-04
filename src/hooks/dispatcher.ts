@@ -323,10 +323,17 @@ export const dispatchOne = async (
   // and audit emission.
   let exitCode: number;
   if (winner.kind === 'exited') {
-    // Natural exit — cancel the pending timer. killHandle can
-    // only exist after the timer fired, so it must be undefined
-    // here. Defensive clear anyway.
+    // Natural exit — cancel the pending timer. There IS a race
+    // window where `proc.exited` and the timer callback both
+    // fire in the same tick: the timer's callback runs
+    // (calling SIGTERM on a now-dead pid + scheduling
+    // `killHandle` for the +1s SIGKILL) BEFORE Promise.race
+    // settles, then exitedPromise wins by microtask order.
+    // The dead-pid SIGTERM is harmless (ESRCH) but `killHandle`
+    // is now a 1s pending timer that holds the event loop
+    // open. Clear BOTH handles defensively in this branch.
     if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+    if (killHandle !== undefined) clearTimeout(killHandle);
     exitCode = winner.code;
   } else {
     // Timer fired — wait for the kill ladder to complete.
@@ -338,6 +345,7 @@ export const dispatchOne = async (
     // actually returned (typically 143 for SIGTERM, 137 for
     // SIGKILL — neither is meaningful as a "decision").
     await proc.exited;
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
     if (killHandle !== undefined) clearTimeout(killHandle);
     exitCode = 124;
   }

@@ -350,13 +350,11 @@ describe('hooks Slice 2 — Notification', () => {
     expect(result.status).toBe('done');
     expect(confirmCalls).toHaveLength(1);
 
-    // Notification dispatch is fire-and-forget. The dispatcher
-    // still awaits the spawned process internally; with sh -c
-    // writing to a small file the wall clock is well under the
-    // harness's run length, so the row lands by the time we
-    // assert. Wait briefly to let the fire-and-forget promise
-    // settle — we don't hold a handle to it (per spec).
-    await new Promise((r) => setTimeout(r, 200));
+    // Notification dispatch is fire-and-forget WRT decisions
+    // (the modal opens immediately), but the harness's outer
+    // finally drains all in-flight chain promises before
+    // runAgent returns — so the audit row + marker file are
+    // guaranteed to have landed at this point. No sleep.
 
     const parsed = JSON.parse(await readFile(marker, 'utf8'));
     expect(parsed.event).toBe('Notification');
@@ -471,9 +469,7 @@ describe('hooks Slice 2 — PreCheckpoint', () => {
     const result = await runAgent(config);
     expect(result.status).toBe('done');
 
-    // Wait briefly for fire-and-forget hook to settle.
-    await new Promise((r) => setTimeout(r, 200));
-
+    // No sleep — drain in finish() guarantees the chain settled.
     const parsed = JSON.parse(await readFile(marker, 'utf8'));
     expect(parsed.event).toBe('PreCheckpoint');
     expect(parsed.sessionId).toBe(result.sessionId);
