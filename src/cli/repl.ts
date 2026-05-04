@@ -19,7 +19,8 @@
 // paste lifecycle. The REPL owns stdin data subscription, SIGINT,
 // AbortController for the running turn, and the exit promise.
 
-import { basename } from 'node:path';
+import { existsSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
 import { DEFAULT_BUDGET } from '../harness/types.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
@@ -310,6 +311,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // which falls through to the same decline path below — exit 0
     // without ever entering the REPL.
     const trustTimeoutMs = options.trustPromptTimeoutMs ?? 5 * 60 * 1000;
+    // Probe for AGENTS.md at the cwd root (spec AGENTIC_CLI.md
+    // line 75: "AGENTS.md é input não-confiável até prova em
+    // contrário"). The reducer surfaces an explicit notice in the
+    // modal preview when the flag is set so the operator knows
+    // the file's instructions will be loaded on first use — a
+    // safety cue worth seeing before they grant trust. existsSync
+    // is fine here: cheap stat call on a single fixed path,
+    // synchronous fits the boot flow, and missing-permissions /
+    // ENOENT cleanly resolve to false.
+    const agentsMdPresent = existsSync(join(cwd, 'AGENTS.md'));
     // Two-step ordering matters: askTrust SYNCHRONOUSLY pushes its
     // handler onto the focus stack (see modalManager's
     // `enqueueConfirm` → `drain`) before returning the promise.
@@ -317,7 +328,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // landing post-resume() finds a handler waiting; subscribing
     // first would race against the OS delivering buffered bytes
     // ahead of the focus push.
-    const answerPromise = modalManager.askTrust({ path: cwd }, { timeoutMs: trustTimeoutMs });
+    const answerPromise = modalManager.askTrust(
+      { path: cwd, agentsMd: agentsMdPresent },
+      { timeoutMs: trustTimeoutMs },
+    );
     subscribeStdin();
     const answer = await answerPromise;
     if (answer !== 'yes') {

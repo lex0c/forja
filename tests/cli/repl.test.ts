@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ParsedArgs } from '../../src/cli/args.ts';
@@ -1055,6 +1055,81 @@ describe('repl — trust prompt (AGENTIC_CLI §9.1)', () => {
     expect(ra.captured).toHaveLength(0);
     // Trust list NOT mutated.
     expect(loadTrustedDirs(trustPath)).toEqual([]);
+  });
+
+  test('AGENTS.md presence in cwd is surfaced in the trust modal preview', async () => {
+    // Spec AGENTIC_CLI.md line 75: AGENTS.md is untrusted input
+    // until proven otherwise. The reducer adds an explicit
+    // "AGENTS.md present — its instructions will be loaded on
+    // first use" preview line when the flag is set; the producer
+    // (this REPL flow) has to detect the file and forward the
+    // flag. Pre-fix we always passed agentsMd=false, hiding the
+    // safety cue from the operator.
+    //
+    // Cwd is a real temp dir (NOT the synthetic
+    // `/tmp/forja-repl-test`) because the AGENTS.md probe runs a
+    // real `existsSync`. The bootstrap stub is configured to
+    // match.
+    const cwdWithAgents = mkdtempSync(join(tmpdir(), 'forja-agentsmd-'));
+    writeFileSync(join(cwdWithAgents, 'AGENTS.md'), 'project context\n');
+    try {
+      const stdin = makeStdin();
+      const captured: string[] = [];
+      const ra = makeRunAgent((n) => `sess-${n}`);
+      const promise = runRepl({
+        args: makeArgs(),
+        bootstrapOverride: makeBootstrapStub(cwdWithAgents),
+        stdin,
+        skipTtyCheck: true,
+        runAgentOverride: ra.runAgent,
+        trustListPathOverride: trustPath,
+        rendererWrite: (s) => {
+          captured.push(s);
+        },
+      });
+      // Wait for the frame scheduler to draw the modal — the
+      // renderer's onAny subscription accumulates events but the
+      // first paint goes through scheduler.request which fires on
+      // the next ~33ms tick. flushFrame's 50ms is enough.
+      await flushFrame();
+      const rendered = captured.join('');
+      expect(rendered).toContain('AGENTS.md present');
+      // Decline so we exit cleanly without a runAgent invocation.
+      stdin.feed('2');
+      expect(await promise).toBe(0);
+    } finally {
+      rmSync(cwdWithAgents, { recursive: true, force: true });
+    }
+  });
+
+  test('AGENTS.md absent in cwd suppresses the preview line', async () => {
+    // Inverse of the test above: when no AGENTS.md exists the
+    // reducer must NOT push the notice. Guards against a regression
+    // where the producer always forwards true.
+    const cwdNoAgents = mkdtempSync(join(tmpdir(), 'forja-noagents-'));
+    try {
+      const stdin = makeStdin();
+      const captured: string[] = [];
+      const ra = makeRunAgent((n) => `sess-${n}`);
+      const promise = runRepl({
+        args: makeArgs(),
+        bootstrapOverride: makeBootstrapStub(cwdNoAgents),
+        stdin,
+        skipTtyCheck: true,
+        runAgentOverride: ra.runAgent,
+        trustListPathOverride: trustPath,
+        rendererWrite: (s) => {
+          captured.push(s);
+        },
+      });
+      await flushFrame();
+      const rendered = captured.join('');
+      expect(rendered).not.toContain('AGENTS.md present');
+      stdin.feed('2');
+      expect(await promise).toBe(0);
+    } finally {
+      rmSync(cwdNoAgents, { recursive: true, force: true });
+    }
   });
 
   test('stdin subscription is deferred until a focus handler exists', async () => {
