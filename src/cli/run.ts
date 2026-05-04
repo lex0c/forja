@@ -273,7 +273,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       signal,
       ...(options.bootstrapOverride ?? {}),
     };
-    const { config, db, lockConflicts, subagents } = bootstrap(bootstrapInput);
+    const { config, db, lockConflicts, subagents, hookWarnings } = bootstrap(bootstrapInput);
 
     // Surface cross-scope subagent shadows. A user's
     // ~/.config/agent/agents/<name>.md silently being eclipsed by
@@ -307,6 +307,23 @@ export const run = async (options: RunOptions): Promise<number> => {
       errSink(
         `⚠ permission policy: ${c.section} locked by ${c.lockedBy}; ${c.attemptedBy}'s override dropped\n`,
       );
+    }
+
+    // Surface hook config warnings (spec AGENTIC_CLI.md §10.4).
+    // A malformed hooks.toml entry, an unknown event name, or an
+    // unreadable file silently drops hooks from the chain — the
+    // operator needs to know on stderr or they spend hours
+    // wondering why their lint hook never fires. Gated on
+    // non-JSON mode so NDJSON consumers get a pure stream — same
+    // rationale as the subagent-shadow warnings above. The
+    // information is recoverable from the hooks.toml files
+    // themselves; admin-grade text doesn't belong in machine-
+    // readable mode.
+    if (!args.json) {
+      for (const w of hookWarnings) {
+        const layerFrag = w.layer !== null ? `${w.layer} ` : '';
+        errSink(`forja: ${layerFrag}hook ${w.sourcePath}: ${w.message}\n`);
+      }
     }
 
     const cfg = {

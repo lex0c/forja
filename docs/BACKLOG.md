@@ -100,6 +100,17 @@ the hooks subsystem is feature-complete; ready to merge.
 
 **Closing notes:**
 
+Post-slice integration follow-up (same commit batch): the CLI driver
+(`src/cli/run.ts` + `src/cli/repl.ts`) now surfaces `hookWarnings`
+on stderr at boot, mirroring the existing `lockConflicts` and
+subagent-shadow warnings. Without this fix, a malformed
+`hooks.toml` entry (bad event name, unreadable file) would
+silently drop the offending hook from the chain — operator left
+guessing why their lint hook never fires. JSON mode skips the
+warnings (NDJSON contract: stdout is pure, stderr-admin-text
+suppressed). Two new `tests/cli/run.test.ts` cases prove the
+surfacing + the JSON-mode suppression.
+
 The hooks subsystem now covers all 9 events from spec §10.1:
 
 | Event | Slice | Blocking |

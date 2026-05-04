@@ -414,7 +414,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     tearDownPreBootstrap();
     return 1;
   }
-  const { config: baseConfig, db, modelId, lockConflicts, subagents, policyLayers } = bootstrapped;
+  const {
+    config: baseConfig,
+    db,
+    modelId,
+    lockConflicts,
+    subagents,
+    policyLayers,
+    hookWarnings,
+  } = bootstrapped;
 
   // Surface the same warnings the one-shot path does. Operators get
   // them once at REPL boot rather than per turn.
@@ -427,6 +435,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     errSink(
       `forja: permission policy: ${c.section} locked by ${c.lockedBy}; ${c.attemptedBy}'s override dropped\n`,
     );
+  }
+  // Hook config warnings (spec AGENTIC_CLI.md §10.4) — see same
+  // surfacing in src/cli/run.ts. Operator gets one warning per
+  // dropped entry / unreadable file at REPL boot.
+  for (const w of hookWarnings) {
+    const layerFrag = w.layer !== null ? `${w.layer} ` : '';
+    errSink(`forja: ${layerFrag}hook ${w.sourcePath}: ${w.message}\n`);
   }
 
   const project = basename(baseConfig.cwd) || baseConfig.cwd;
