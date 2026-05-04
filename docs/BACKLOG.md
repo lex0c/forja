@@ -15,6 +15,113 @@ Format:
 
 ---
 
+## [2026-05-04] M3 / impl — hooks Slice 5: /hooks slash command + locked enforcement E2E
+
+Same branch (`feat/m3-hooks`). Closes the hooks subsystem per spec
+AGENTIC_CLI.md §10. Adds the operator-facing introspection surface
+(`/hooks` with `list` + `audit` subcommands) and an end-to-end test
+that exercises the three meanings of `locked`. After this slice
+the hooks subsystem is feature-complete; ready to merge.
+
+**Done:**
+
+- **`/hooks` slash command** (`src/cli/slash/commands/hooks.ts`):
+  - Bare `/hooks` → summary: total count, by-layer counts, by-
+    event counts, hint to the two subcommands.
+  - `/hooks list [--layer <l>] [--event <e>]` → grouped listing
+    in resolution order (enterprise → user → project) with
+    `event`, `matcher.tool`, `timeout`, locked / fail_closed
+    flags, command preview (truncated at 60 chars), source path.
+    Filters reject unknown layers / events with a usage error
+    instead of silently applying bogus values.
+  - `/hooks audit [--session] [--event <e>] [--limit N]` →
+    recent `hook_runs` rows, newest first. Default limit 20,
+    cap 200. `--session` scopes to the current REPL session via
+    `currentSessionId()`; surfaces "no session yet" when run
+    before the first turn instead of silently dumping cross-
+    session rows.
+  - Read-only by design — mutations go through the on-disk
+    `hooks.toml` hierarchy. Mirrors the `/perms` and `/memory`
+    pattern.
+
+- **Registered in `createBuiltinRegistry`** alongside the other
+  11 builtins (now 12). Help command picks it up via the closure
+  pattern automatically. Existing dispatch test bumped to expect
+  12 rows.
+
+- **Locked-enforcement E2E** (`tests/hooks/locked-enforcement.test.ts`,
+  9 cases). Real on-disk hooks.toml fixtures across three
+  isolated subdirs (passed explicitly to `resolveHookConfig` so
+  the runner's own /etc/agent / ~/.config/agent files don't
+  pollute). Coverage:
+  - Config layer: enterprise can declare `locked: true`; user/
+    project declarations are downgraded to `locked=false` with
+    a `lock_ignored` warning.
+  - Resolution order: enterprise → user → project preserved;
+    multiple entries within a layer keep declaration order.
+  - Dispatcher first-block-wins: enterprise blocking hook
+    short-circuits the chain BEFORE user/project would run; if
+    enterprise allows but user blocks, project never runs;
+    all-allow runs the full chain.
+  - Non-blocking events (PostToolUse) ignore "would-block" exit
+    codes — every layer runs regardless.
+
+- **Tests** (27 new across two files): 18 slash-command unit tests
+  + 9 locked-enforcement E2E tests. Existing
+  `tests/cli/slash/dispatch.test.ts` bumped to count 12 builtins.
+
+**Decisions:**
+
+1. **Locked is a layered-access control, not a runtime gate.**
+   Once you can declare `locked: true` only from the enterprise
+   layer (which lives in `/etc/agent` and requires root), the
+   spec's "lower layers cannot remove or override" property
+   follows from the filesystem permissions + the dispatcher's
+   first-block-wins. The lock flag itself is a marker for audit
+   (`/hooks list` shows `[locked]`); no extra runtime check
+   needed.
+
+2. **`/hooks list` groups by layer in resolution order.** Reading
+   top-to-bottom, the operator sees enterprise first, then user,
+   then project — same order the dispatcher iterates. Reading
+   the file matches reading the runtime behavior.
+
+3. **`/hooks audit` newest-first, ISO timestamps.** Matches
+   `listRecentHookRuns`'s ordering and the operator's "what just
+   happened" mental model. ISO is unambiguous (no locale
+   surprises) and trivially greppable.
+
+4. **Audit rows show `outcome`, `exit_code`, `matched_tool`, and
+   `duration_ms`** in the one-liner. That's the forensic minimum
+   (was the chain blocked? which tool was being gated? how long
+   did it take?) without flooding the scrollback. Operator
+   queries `hook_runs` directly for stdout/stderr/expanded
+   command.
+
+**Closing notes:**
+
+The hooks subsystem now covers all 9 events from spec §10.1:
+
+| Event | Slice | Blocking |
+|---|---|---|
+| SessionStart | 2 | no |
+| UserPromptSubmit | 4 | yes |
+| PreToolUse | 3 | yes |
+| PostToolUse | 3 | no |
+| PreCompact | 4 | yes |
+| Notification | 2 | no |
+| PreCheckpoint | 2 | no |
+| MemoryWrite | 4 | yes |
+| Stop | 2 | no |
+
+**Pending:** none. The hooks subsystem is feature-complete per
+spec. Ready to merge into `develop`.
+
+**Next:** review the branch and merge. Subsequent work moves to
+the next M3 deliverable (TBD).
+
+---
+
 ## [2026-05-04] M3 / impl — hooks Slice 4: UserPromptSubmit + PreCompact + MemoryWrite
 
 Same branch (`feat/m3-hooks`). Closes the remaining 3 blocking events
