@@ -1,0 +1,22 @@
+name: PreToolUse hook block_silent denies the tool
+prompt: |
+  Use the write_file tool to create `out.txt` with content `landed`.
+  Report whatever the tool returns, even if it's an error. Do NOT
+  retry under a different name, do NOT switch to a different tool.
+setup:
+  files:
+    .agent/permissions.yaml: |
+      defaults:
+        mode: bypass
+    .agent/hooks.toml: |
+      [[hooks]]
+      event = "PreToolUse"
+      command = "exit 1"
+expect:
+  - tool_called: write_file
+  - tool_denied: write_file
+  - file_not_exists: out.txt
+  - status: done
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10
