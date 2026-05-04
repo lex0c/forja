@@ -505,15 +505,23 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         sessionId: opts.sessionId,
         cwd: session.cwd,
       });
-      // Boot triggers evaluate against the subagent's cwd, NOT
-      // the parent's. A worktree subagent has its own filesystem
-      // root, so `.git`, `.env`, `package.json` probes belong
-      // there. Memories tagged with `triggers:` thus eager-load
-      // when the subagent's worktree mirrors the corresponding
-      // condition. Spec §4.3 doesn't distinguish parent vs
-      // subagent; per-cwd evaluation is the principle of "the
-      // session's cwd defines the trigger root" applied uniformly.
-      const bootContext = evaluateBootTriggers(session.cwd);
+      // Boot triggers probe the subagent's REPO ROOT, not the
+      // raw `session.cwd`. Same fix shape as bootstrap.ts: an
+      // isolation:none subagent inherits the parent's invocation
+      // cwd, which may be a repo subdir (`/repo/src/components/`),
+      // so probing there misses root-level files (`.git`,
+      // `package.json`, `tsconfig.json`) and silently filters out
+      // any project memory tagged with those triggers — even
+      // though those memories were loaded from the parent's repo
+      // root above. `resolveRepoRoot(session.cwd)` finds the
+      // canonical anchor for both isolation modes:
+      //   - none:     subagent.cwd === parent's cwd; resolveRepoRoot
+      //               walks up to the parent's repo top-level.
+      //   - worktree: subagent.cwd === worktree path; rev-parse
+      //               from inside a worktree returns the worktree
+      //               itself (its own top-level), which carries
+      //               the checked-out files like the original.
+      const bootContext = evaluateBootTriggers(resolveRepoRoot(session.cwd));
       const memorySection = assembleMemorySection({
         registry: memoryRegistry,
         bootContext,
