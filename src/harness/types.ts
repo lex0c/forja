@@ -212,7 +212,8 @@ export type ExitReason =
   | 'aborted' // user cancelled via signal
   | 'providerError' // unrecoverable provider failure (network, 4xx)
   | 'internalError' // uncaught throw in the harness path (typically SQLite)
-  | 'scriptExhausted'; // mock provider drained — only seen in tests
+  | 'scriptExhausted' // mock provider drained — only seen in tests
+  | 'userPromptBlocked'; // a UserPromptSubmit hook refused this turn
 
 export interface HarnessConfig {
   provider: Provider;

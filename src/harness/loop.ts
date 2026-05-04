@@ -86,6 +86,11 @@ const exitToStatus: Record<ExitReason, TerminalSessionStatus> = {
   providerError: 'error',
   internalError: 'error',
   scriptExhausted: 'error',
+  // Hook-blocked prompts terminate the turn at session boot. The
+  // operator's hook decision is closer to a soft cancel than to
+  // an error — interrupted matches the existing 'aborted' shape
+  // (operator-initiated termination).
+  userPromptBlocked: 'interrupted',
 };
 
 const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
@@ -100,6 +105,7 @@ const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
   providerError: 'error',
   internalError: 'error',
   scriptExhausted: 'error',
+  userPromptBlocked: 'interrupted',
 };
 
 const buildToolDefs = (config: HarnessConfig): ProviderToolDef[] =>
@@ -727,6 +733,37 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         },
       });
 
+      // UserPromptSubmit (spec AGENTIC_CLI.md §10.1, blocking).
+      // Fires when the run carries a fresh user prompt — operator
+      // hook can scan for secrets, inject context, or refuse the
+      // turn outright. Skipped on resume runs that just re-execute
+      // the prior tail without new content (`config.userPrompt ===
+      // ''`); there's nothing for an operator hook to gate.
+      //
+      // The user message has ALREADY been persisted (above, before
+      // session_start emit) so the audit trail captures what the
+      // operator's hook refused — operator can review attempts in
+      // the messages table even when the LLM never saw them.
+      // Block path: short-circuits to finish('userPromptBlocked',
+      // reason). Stop hooks still fire (they're inside finish);
+      // the session row is finalized as 'interrupted'.
+      if (config.userPrompt.length > 0) {
+        const ups = await dispatchHooks({
+          schema: 'v1',
+          event: 'UserPromptSubmit',
+          sessionId,
+          data: { prompt: config.userPrompt },
+        });
+        if (ups !== null && ups.blockedBy !== null) {
+          const block = ups.blockedBy;
+          const detail =
+            block.reason === 'message' && block.message !== null && block.message.length > 0
+              ? `denied by hook: ${block.message}`
+              : `denied by ${block.spec.layer} hook ${block.spec.sourcePath}`;
+          return await finish('userPromptBlocked', detail);
+        }
+      }
+
       while (true) {
         if (signal.aborted) {
           return isWallClockTimeout()
@@ -1213,6 +1250,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                 toolName: tu.name,
                 message,
               }),
+            // Hook chain — bound to the same dispatcher invoke-tool
+            // already uses. Tools fire blocking events (today only
+            // memory_write fires MemoryWrite); chain failure is
+            // null-returned so tools fail-open per spec line 1057.
+            fireHook: dispatchHooks,
           };
 
           safeEmit(config.onEvent, {
@@ -1336,6 +1378,28 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // module performs — naive `1 + tail` could pass even when
           // the alignment shift collapses the middle to empty.
           if (promptTokens > triggerAt && messages.length >= budget.compactionPreserveTail + 3) {
+            // PreCompact hook chain (spec AGENTIC_CLI.md §10.1,
+            // blocking). Fired BEFORE the compaction_started event
+            // so an operator hook that refuses compaction (e.g.,
+            // policy: preserve full transcript for audit) skips
+            // both the LLM call AND the renderer's "compacting…"
+            // signal — the operator's intent is the compaction
+            // never happened. block_silent / block_message both
+            // skip; failClosed error/timeout same. fail-open on
+            // dispatch error per spec line 1057.
+            const preCompact = await dispatchHooks({
+              schema: 'v1',
+              event: 'PreCompact',
+              sessionId,
+              data: { promptTokens, threshold: triggerAt },
+            });
+            if (preCompact !== null && preCompact.blockedBy !== null) {
+              // Skip compaction this turn. Loop continues with the
+              // un-compacted message list; if tokens still over
+              // threshold next turn, the hook fires again. The
+              // hook_runs row is the audit trail.
+              continue;
+            }
             safeEmit(config.onEvent, {
               type: 'compaction_started',
               promptTokens,

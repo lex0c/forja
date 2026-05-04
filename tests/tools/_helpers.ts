@@ -36,4 +36,5 @@ export const makeCtx = (overrides: Partial<ToolContext> = {}): ToolContext => ({
     ? { confirmMemoryUserScope: overrides.confirmMemoryUserScope }
     : {}),
   ...(overrides.emitWarn !== undefined ? { emitWarn: overrides.emitWarn } : {}),
+  ...(overrides.fireHook !== undefined ? { fireHook: overrides.fireHook } : {}),
 });

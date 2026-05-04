@@ -402,6 +402,53 @@ export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
       }
     }
 
+    // 6c. MemoryWrite hook chain (spec AGENTIC_CLI.md §10.1,
+    // blocking). Last gate before persist — an operator hook can
+    // refuse a memory the operator just confirmed (e.g.,
+    // organization-wide policy: never persist a memory whose body
+    // matches a corporate-secret pattern, regardless of operator
+    // habit). Fires AFTER the modal confirms and BEFORE the disk
+    // write, so the hook sees the exact shape that's about to
+    // land. block_silent → generic refusal; block_message →
+    // operator's stdout is the audit reason. error+failClosed /
+    // timeout+failClosed treated as block (fail-closed for
+    // policy-driven rules).
+    if (ctx.fireHook !== undefined) {
+      const chain = await ctx.fireHook({
+        schema: 'v1',
+        event: 'MemoryWrite',
+        sessionId: ctx.sessionId,
+        data: {
+          scope,
+          name: args.name,
+          source,
+          body: args.body,
+        },
+      });
+      if (chain !== null && chain.blockedBy !== null) {
+        const block = chain.blockedBy;
+        const auditReason = `blocked by ${block.spec.layer} hook ${block.spec.sourcePath}: ${block.message ?? '(silent)'}`;
+        registry.recordEvent({
+          action: 'refused',
+          scope,
+          memoryName: args.name,
+          source,
+          details: { stage: 'hook', reason: auditReason },
+          auditSessionId: ctx.sessionId,
+          auditCwd: ctx.cwd,
+        });
+        return {
+          outcome: 'rejected',
+          scope,
+          name: args.name,
+          reason:
+            block.reason === 'message' && block.message !== null && block.message.length > 0
+              ? `denied by hook: ${block.message}`
+              : 'denied by hook',
+        };
+      }
+    }
+
     // 7. Persist. Apply the +90d default for inferred + project
     // scope when no explicit expires was supplied (spec §6.2).
     const frontmatter = buildFrontmatter(args, scope, source);

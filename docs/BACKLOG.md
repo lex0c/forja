@@ -15,6 +15,108 @@ Format:
 
 ---
 
+## [2026-05-04] M3 / impl — hooks Slice 4: UserPromptSubmit + PreCompact + MemoryWrite
+
+Same branch (`feat/m3-hooks`). Closes the remaining 3 blocking events
+(spec AGENTIC_CLI.md §10.1 table). With Slices 1–4 the subsystem
+covers 8 of 9 events (Notification stays log-only by design); only
+the operator-facing `/hooks` slash commands remain (Slice 5).
+
+**Done:**
+
+- **`UserPromptSubmit` wired in `runAgent`** between SessionStart
+  hook and the main `while (true)` loop. Fires on every fresh user
+  prompt (skipped when `userPrompt === ''`, the resume re-execute
+  shape). Block path short-circuits via a new exit reason
+  `userPromptBlocked` mapped to status=`interrupted`. Stop hook
+  still fires inside `finish` so the lifecycle bracket
+  `session_start … session_finished` is honored even on a refused
+  turn. The user message is persisted BEFORE the hook fires so
+  the audit trail captures what was attempted.
+
+- **`PreCompact` wired in `runAgent`** at the existing compaction
+  trigger site, BEFORE the `compaction_started` event. Block path
+  skips the entire compaction pass: no LLM call, no started/
+  finished events emitted. Loop re-tries compaction on the next
+  step's tail check (if tokens stay over threshold). The hook
+  audit row is the operator's signal.
+
+- **`MemoryWrite` wired in the `memory_write` tool** as the LAST
+  gate before persist (after modal confirm + user-scope second
+  confirm). Block path records `refused` audit row with
+  `details.stage='hook'` and returns the rejected outcome with
+  the operator's stdout as the reason (`block_message`) or a
+  generic `'denied by hook'` (`block_silent` / failClosed). Tool
+  returns the standard `outcome='rejected'` shape so the model
+  sees the same denial pattern as user-cancelled writes.
+
+- **`ToolContext.fireHook` field** — generic per-event funnel
+  exposed on every tool's context. Today only `memory_write`
+  consumes it; future tools that need to fire blocking events
+  (e.g., a hypothetical `web_fetch` with a `BeforeFetch` event)
+  inherit the contract. Wired from the harness via the same
+  `dispatchHooks` closure used by the loop and invoke-tool, so
+  one definition of "what's a chain block?" applies everywhere.
+
+- **`ExitReason.userPromptBlocked`** added to the union;
+  `exitToStatus` and `exitToHarnessStatus` map it to
+  `interrupted` (mirrors `aborted` — operator-initiated
+  termination, not error).
+
+- **Tests** (13 cases total across two files):
+  - `tests/harness/hooks-blocking-events.test.ts` (8 cases):
+    UserPromptSubmit allow/block_silent/block_message; resume
+    with empty prompt → no hook; Stop fires on block
+    (lifecycle); PreCompact allow/block; PreCompact payload has
+    promptTokens + threshold > triggerAt
+  - `tests/tools/memory-write-hook.test.ts` (5 cases):
+    block_silent → audit stage=hook + no file; block_message →
+    operator stdout becomes reason; allow → file lands;
+    fireHook returns null → write proceeds; modal yes + hook
+    block → still rejects (modal IS NOT enough)
+
+**Decisions:**
+
+1. **UserPromptSubmit fires AFTER message persist.** Persisting
+   the user prompt BEFORE the hook means a blocked prompt still
+   shows up in the messages table — the operator can audit "what
+   did the model try to ask the LLM?" even when the LLM never
+   saw it. Alternative (skip persist on block) would erase the
+   operator's audit trail. Spec doesn't mandate either order; we
+   pick visibility.
+
+2. **PreCompact block skips compaction events entirely** (not
+   started + skipped finished). The compaction lifecycle
+   conceptually didn't happen — emitting started + finished
+   would be a phantom event for renderers. The `hook_runs` row
+   is the audit trail; skip semantics are a clean no-op.
+
+3. **MemoryWrite fires AFTER the modal**, not before. Spec wording
+   "Antes de gravar nova memória" allows both, but firing after
+   the modal lets the operator's hook be a SECOND gate (corp
+   policy) on top of the operator's habit (modal). Firing before
+   the modal would let a hook silently swallow proposals the
+   operator wanted to see. Our order: validation → trust →
+   scanner → modal → user-scope-modal → **hook** → persist.
+
+4. **`exitToStatus.userPromptBlocked = 'interrupted'`**, not a
+   new session_status. The session row's status field has a CHECK
+   constraint that would need a migration to add a new value;
+   `interrupted` is semantically closest (operator-initiated
+   non-error termination).
+
+**Pending:**
+
+- **Slice 5**: `/hooks list` + `/hooks audit` slash commands;
+  end-to-end locked-enforcement test (enterprise > user >
+  project hierarchy honored).
+
+**Next:** Slice 5 — operator-facing slash commands and locked
+enforcement. After Slice 5, the hooks subsystem is feature-
+complete per spec.
+
+---
+
 ## [2026-05-04] M3 / impl — hooks Slice 3: PreToolUse + PostToolUse (blocking flow + audit)
 
 Same branch (`feat/m3-hooks`). Adds the two events that turn the

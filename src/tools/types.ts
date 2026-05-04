@@ -1,4 +1,5 @@
 import type { BgManager } from '../bg/index.ts';
+import type { HookChainResult, HookEventPayload } from '../hooks/index.ts';
 import type { MemoryRegistry } from '../memory/index.ts';
 import type { Decision, PermissionsView, PolicyCategory, ToolArgs } from '../permissions/index.ts';
 import type { ProviderToolInputSchema } from '../providers/index.ts';
@@ -184,6 +185,14 @@ export interface ToolContext {
   // shot SDK without an event sink), the call is a no-op and the
   // tool's normal output remains the only carrier.
   emitWarn?: (message: string) => void;
+  // Hook chain dispatch — generic per-event funnel built in the
+  // harness loop. Tools fire blocking events (MemoryWrite, future
+  // event-bearing tools) and inspect `blockedBy` on the result.
+  // Returns null when no hooks are configured OR the dispatcher
+  // itself failed (fail-open per spec line 1057). Optional —
+  // headless / one-shot ToolContexts without a wired-through
+  // harness leave it unset; tools degrade to "no hook gate".
+  fireHook?: (payload: HookEventPayload) => Promise<HookChainResult | null>;
 }
 
 // Inputs the `task` tool passes through to the harness's subagent
