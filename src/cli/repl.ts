@@ -1178,13 +1178,23 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // accidental side effect of a fresh history feature). Empty
     // history short-circuits — opening an overlay against zero
     // entries surfaces nothing to search.
+    //
+    // Two slash signals must both be clear, mirroring the
+    // slash-precedence block above: `state.slash` (live popover) AND
+    // `parseSlashInput(buffer)` (raw buffer starts with `/`). The
+    // popover goes null when the typed command has zero autocomplete
+    // matches (e.g. `/doesnotexist` mid-edit) — checking only the
+    // popover would let Ctrl+R hijack a slash buffer that's still
+    // mid-composition, which the §2.1 "slash mode wins" rule is
+    // meant to forbid.
     if (
       key.kind === 'char' &&
       key.ctrl &&
       key.char === 'r' &&
       historyEnabled &&
       historyEntries.length > 0 &&
-      renderer.state().slash === null
+      renderer.state().slash === null &&
+      parseSlashInput(renderer.state().input.value) === null
     ) {
       openReverseSearch();
       cancelExitArm();

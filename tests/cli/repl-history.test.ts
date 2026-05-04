@@ -557,6 +557,78 @@ describe('repl — reverse-search overlay (HISTORY.md §2.2)', () => {
     await promise;
   });
 
+  test('Ctrl+R does NOT open overlay while buffer starts with `/` (slash mode wins)', async () => {
+    appendHistory(db, PROJECT_CWD, 'something', { ts: 1 });
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    // Type a slash command name that has zero autocomplete matches —
+    // collapses the popover (state.slash → null) but keeps the buffer
+    // slash-prefixed. Pre-fix, Ctrl+R here opened the overlay and
+    // hijacked the slash composition. Post-fix, both gates hold and
+    // Ctrl+R is consumed as a no-op (Ctrl+R has no editor binding,
+    // so the buffer stays exactly as the operator typed it).
+    stdin.feed('/doesnotexist');
+    await tick();
+    stdin.feed(CTRL_R);
+    await tick();
+    // Pressing Enter should now dispatch the slash command (which
+    // returns "unknown command" — the dispatcher's normal failure
+    // mode), confirming the buffer reached Enter intact.
+    stdin.feed('\r');
+    await tick();
+    // No turn started — a real /unknown command surfaces an error
+    // event but never calls runAgent.
+    expect(ra.captured).toHaveLength(0);
+    stdin.feed('\x04');
+    await promise;
+  });
+
+  test('Ctrl+R also blocked while typing a known slash command (popover live)', async () => {
+    // Sanity: the original `state.slash !== null` gate already covered
+    // this case, but pin it here so a future refactor that loosens
+    // the slash-buffer gate doesn't silently open Ctrl+R during a
+    // mid-edit `/help`.
+    appendHistory(db, PROJECT_CWD, 'something', { ts: 1 });
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    stdin.feed('/he'); // popover should match /help
+    await tick();
+    stdin.feed(CTRL_R);
+    await tick();
+    // Cancel slash mode + verify nothing escaped to the overlay.
+    // Esc Esc — the parser's lone-ESC drain would otherwise keep the
+    // first byte buffered until a follow-up arrives, leaving the
+    // shutdown gate unable to land. Two escapes flush both as
+    // discrete `escape` events: first clears slash mode + buffer,
+    // second is a no-op while idle.
+    stdin.feed('\x1b\x1b');
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+
   test('Ctrl+R with empty history is a no-op (does not open overlay)', async () => {
     // No appendHistory calls — table is empty.
     const stdin = makeStdin();
