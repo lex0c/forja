@@ -103,6 +103,18 @@ export interface RendererOptions {
   // Pass `false` to disable the heartbeat entirely (useful in tests
   // that don't want spinner animation noise).
   heartbeat?: Pick<HeartbeatOptions, 'intervalMs' | 'setTimer' | 'clearTimer'> | false;
+  // When `'eager'` (default), the renderer flips stdin to raw mode
+  // and emits the bracketed-paste enable on construction. When
+  // `'manual'`, the caller is expected to call `enableInput()`
+  // before relying on any stdin events. The manual mode exists for
+  // callers that have a window between renderer creation and
+  // input-handler readiness — the REPL's pre-bootstrap stack is
+  // the motivating case: enabling raw mode immediately would
+  // suppress Ctrl+C → SIGINT during bootstrap (raw mode disables
+  // ISIG), making a slow / hanging bootstrap uninterruptible. With
+  // `manual`, raw mode arms only at the moment a focus handler is
+  // ready to receive keystrokes.
+  inputMode?: 'eager' | 'manual';
 }
 
 export interface Renderer {
@@ -112,6 +124,12 @@ export interface Renderer {
   // Read-only snapshot of the current LiveState. Tests inspect this;
   // production rarely needs it.
   state: () => LiveState;
+  // Activates raw mode (stdin) + bracketed paste (stdout). No-op
+  // when already enabled or when constructed with `inputMode:
+  // 'eager'`. Pair with the existing `close` for teardown — close
+  // restores stdin / bracketed paste regardless of when (or
+  // whether) `enableInput` was called.
+  enableInput: () => void;
   // Tear down everything: unsubscribe, drop listeners, restore stdin
   // mode, disable bracketed paste, stop scheduler. Idempotent.
   close: () => void;
@@ -468,22 +486,33 @@ export const createRenderer = (options: RendererOptions): Renderer => {
       })
     : () => {};
 
-  // Side-effects on construction: enable raw mode + bracketed paste
-  // BEFORE subscribing to the bus, so the first event handler sees the
-  // terminal already in the right mode. Defensive ordering — emits
-  // through synchronous EventEmitters can't race ahead of subscription
-  // anyway, but third-party bus impls might.
+  // Input activation: raw mode (stdin) + bracketed paste (stdout).
+  // Idempotent — `enableRawMode` / `enableBracketedPasteOn` already
+  // guard via module-level flags. Eager callers fire it during
+  // construction (preserves pre-existing behavior); manual callers
+  // delay until they have a focus handler ready and want to take
+  // ownership of stdin.
+  let inputEnabled = false;
+  const enableInput = (): void => {
+    if (inputEnabled) return;
+    inputEnabled = true;
+    if (stdin !== undefined) enableRawMode(stdin);
+    if (bracketedPaste) enableBracketedPasteOn(write);
+  };
+
   // We do NOT initial-draw here — the first `bus.emit('session:start')`
   // (or any other event) triggers the first frame. Quietly waiting
   // means a renderer attached to an empty bus produces no output.
-  if (stdin !== undefined) enableRawMode(stdin);
-  if (bracketedPaste) enableBracketedPasteOn(write);
+  if ((options.inputMode ?? 'eager') === 'eager') {
+    enableInput();
+  }
 
   const unsubscribe = bus.onAny(handleEvent);
 
   return {
     redraw: () => scheduler.flush(),
     state: () => state,
+    enableInput,
     close: () => {
       if (closed) return;
       closed = true;
@@ -497,6 +526,9 @@ export const createRenderer = (options: RendererOptions): Renderer => {
       const eraseBuf = buildErase();
       if (eraseBuf.length > 0) write(eraseBuf);
       prevLines = [];
+      // Disable regardless of whether enableInput was called — close
+      // is the canonical "restore terminal" call, and the underlying
+      // helpers already no-op if the mode wasn't active.
       if (bracketedPaste) disableBracketedPasteOn(write);
       if (stdin !== undefined) disableRawMode(stdin);
     },

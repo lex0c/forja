@@ -1132,4 +1132,42 @@ describe('renderer side effects', () => {
     // The contract is that close() leaves stdin not-in-raw-mode.
     expect(calls.length).toBeGreaterThanOrEqual(0);
   });
+
+  test('inputMode: manual defers raw mode + bracketed paste until enableInput()', () => {
+    // Regression: the REPL needs a window where the renderer is up
+    // (so it can paint the trust modal / bootstrap warnings) but
+    // raw mode is still off — keeping Ctrl+C → SIGINT alive so an
+    // operator can break out of a slow bootstrap. Pre-fix the
+    // renderer enabled raw mode at construction unconditionally.
+    const bus = createBus();
+    const sink = makeSink();
+    const rawModeCalls: boolean[] = [];
+    const stdin = {
+      setRawMode: (mode: boolean) => {
+        rawModeCalls.push(mode);
+      },
+    };
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      stdin,
+      schedulerOptions: makeSchedulerOptions().options,
+      bracketedPaste: true,
+      inputMode: 'manual',
+    });
+    // Construction did NOT enable raw mode. The bracketed-paste
+    // enable sequence (`\x1b[?2004h`) also stayed unwritten.
+    expect(rawModeCalls).not.toContain(true);
+    expect(sink.joined()).not.toContain('\x1b[?2004h');
+    // Caller activates explicitly.
+    r.enableInput();
+    expect(rawModeCalls).toContain(true);
+    expect(sink.joined()).toContain('\x1b[?2004h');
+    // Idempotent on repeat call.
+    rawModeCalls.length = 0;
+    r.enableInput();
+    expect(rawModeCalls).toEqual([]);
+    r.close();
+  });
 });

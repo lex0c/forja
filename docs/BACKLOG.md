@@ -15,6 +15,39 @@ Format:
 
 ---
 
+## [2026-05-03] M2 / impl — first-run trust prompt (AGENTIC_CLI §9.1)
+
+Operator reportou que o forja não pergunta se a pasta é confiável na primeira vez que abre. A modal `trust:ask` já existia (reducer + render), mas faltava o producer. Bug de discoverability + segurança: qualquer cwd executa tools sem o gate de "operator approved this directory".
+
+**Done:**
+
+- `src/trust/` (novo módulo): `paths.ts` espelhando `userPolicyPath` (XDG > APPDATA > HOME), `storage.ts` com load/add/isTrusted contra `~/.config/agent/trusted_dirs.json`, `index.ts` barrel.
+- `src/tui/modal-manager.ts`: novo `askTrust(args, opts) → Promise<TrustAnswer>`. Mesma forma que `askPermission`, opções `[Yes, No]` matching o reducer existente.
+- `src/cli/repl.ts`: depois do banner, antes da posture hint, checa `isTrusted(trustPath, cwd)`. Se não trusted → `await modalManager.askTrust({ path: cwd })`. Yes → `addTrustedDir` (com `try/catch` que vira warn em falha de persistência); no/cancel → `requestShutdown` + return exitCode=0 (sem entrar no REPL).
+- Test seams: `skipTrustPrompt` (test fixtures legacy não driveriam o modal) + `trustListPathOverride` (cada test usa um tmp dir, dev machine não polui).
+- `tests/trust/paths.test.ts` + `tests/trust/storage.test.ts`: 14 cenários sobre path discovery (XDG, HOME, APPDATA, USERPROFILE, null when no abs path) e storage (missing file → empty, corrupt JSON → empty, mkdir -p antes de write, idempotent add, exact-string match no isTrusted).
+- `tests/cli/repl.test.ts`: 4 cenários novos pro fluxo do prompt — yes enter REPL + persiste, no exits 0 sem captured runs, Esc Esc cancela, already-trusted skips totalmente. Plus existing 32+ tests ganham `skipTrustPrompt: true` via awk-batched insertion.
+
+**Decisions:**
+
+- **Storage por path absoluto puro, sem aggregate hash.** Spec §9.1 line 926-936 pede hash agregado de `.agent/`, `AGENTS.md`, `.agent/playbooks/**` etc., com re-prompt em mudanças. Hardening importante mas não bloqueia o "primeiro acesso pergunta?" reportado pelo operator. Deferido pra slice futura quando team-shared trust storage também landar.
+- **JSON plain (não SQLite).** Trust list é lookup-on-boot + append-on-confirm: micro escala, < 100 entries em qualquer máquina realista. JSON é human-editable (operator pode hand-edit pra revogar trust); SQLite seria over-engineering.
+- **Strip de symlinks NÃO aplicado.** `cwd` já vem absoluto via bootstrap (Node resolve internamente). Realpath defense (canonicalizar antes de comparar) seria correto pra blocar symlink swap entre boots — adiar pra hash slice (mesma classe de hardening).
+- **No/Esc → exit 0, não 130.** Operator opted out conscientemente. Não é abort de operação em curso; é "não, este projeto não é meu". Exit 0 evita poluir scripts envolventes com falso "comando falhou".
+- **Persistência failure não fatal.** `addTrustedDir` em try/catch — operator já aprovou na sessão atual. Falha de write (read-only HOME, disk full) vira warn explícito sobre re-prompt no próximo boot, mas não bloqueia esta sessão.
+
+**Pending (próximas slices):**
+
+- Aggregate hash de `.agent/` + `AGENTS.md` + `.agent/playbooks/**` (§9.1 line 926-936). Re-prompt quando hash muda.
+- File listing no preview do modal (claude-style "agent will read: AGENTS.md 12KB, .agent/permissions.yaml 8KB, ..."). Hoje preview mostra só o path.
+- `--json` mode: spec §9.1 line 938 manda exit 3 fatal sem prompt em headless. REPL é TTY-only, então não dispara hoje; rota one-shot precisa de gate equivalente em `run.ts`.
+- MCP server trust (§9.4) — outra superfície, outra slice.
+- `/trust list/forget/forget-all` slash commands pra inspeção/revogação.
+
+**Next:** branch separada `feat/m2-trust-prompt` (esta), PR pra main quando o operator validar UX em produção.
+
+---
+
 ## [2026-05-03] M2 / fix — strip ANSI from assistant text (terminal-mode hijack defense)
 
 Operator reportou que o input continuava travando depois do drain fix anterior, especificamente "após ler arquivo e me responder". Investigação aprofundada revelou um vetor independente: texto do assistant é renderizado raw, sem strip de escape sequences. Provider output passando por `harness-adapter.ts:232` (`text: ev.text`) → reducer acumula → permanent emite literal → `truncateToWidth` preserva CSI sequences (comentário em `width.ts:33` confirma: "We don't try to balance emitted escapes — the caller is responsible") → terminal recebe.

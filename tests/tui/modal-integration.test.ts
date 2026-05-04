@@ -195,9 +195,13 @@ describe('per-flavor reducer option lists', () => {
     expect(state.modal).not.toBeNull();
     if (state.modal === null) return;
     expect(state.modal.flavor).toBe('trust');
-    expect(state.modal.title).toBe('Trust directory');
-    expect(state.modal.subject).toBe('/some/repo');
+    expect(state.modal.title).toBe('Accessing workspace:');
+    // Path moved out of `subject` and into the preview so a long
+    // cwd doesn't crowd the bold title.
+    expect(state.modal.subject).toBeNull();
+    expect(state.modal.preview[0]).toBe('/some/repo');
     expect(state.modal.options.map((o) => o.value)).toEqual(['yes', 'no']);
+    // D65 (UI.md §6.5): last option is the conservative default.
     expect(state.modal.selectedIndex).toBe(1);
     // AGENTS.md note appears in preview when present.
     expect(state.modal.preview.some((l) => l.includes('AGENTS.md'))).toBe(true);

@@ -1,10 +1,14 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { ParsedArgs } from '../../src/cli/args.ts';
 import type { BootstrapResult } from '../../src/cli/bootstrap.ts';
 import { runRepl } from '../../src/cli/repl.ts';
 import type { HarnessConfig, HarnessEvent, HarnessResult } from '../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
+import { addTrustedDir, loadTrustedDirs } from '../../src/trust/index.ts';
 
 // Build a ParsedArgs shape with all the flags the REPL inspects set
 // to safe defaults. The args parser populates the rest with defaults
@@ -232,6 +236,7 @@ describe('repl — boot + smoke', () => {
         stdin,
         // skipTtyCheck deliberately omitted — we want the REAL gate
         // to evaluate both checks and return TRUE for both.
+        skipTrustPrompt: true,
       });
       // Boot succeeded. Drive Ctrl+C to exit cleanly.
       await tick();
@@ -258,6 +263,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
     });
     await tick();
     // First press arms — no exit.
@@ -280,6 +286,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
     }).then((code) => {
       resolved = true;
       return code;
@@ -310,6 +317,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       rendererWrite: (s) => {
         writes.push(s);
       },
@@ -339,6 +347,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: stub,
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
     });
     await tick();
     stdin.feed('\x04');
@@ -358,6 +367,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
     });
     await tick();
     stdin.feed('\x03'); // arms
@@ -386,6 +396,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
     });
     await tick();
     process.emit('SIGINT');
@@ -402,6 +413,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub('/path/to/repo'),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       rendererWrite: (s) => {
         writes.push(s);
       },
@@ -434,6 +446,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
     });
     await tick();
@@ -467,6 +480,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
       rendererWrite: () => undefined,
     });
@@ -526,6 +540,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
     });
     await tick();
@@ -554,6 +569,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
     });
     await tick();
@@ -594,6 +610,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
     });
     await tick();
@@ -631,6 +648,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
       // Capture rendered frames just to drive the renderer's frame
       // scheduler — we read signals on cfg directly for assertions.
@@ -681,6 +699,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
     });
     await tick();
@@ -722,6 +741,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
       rendererWrite: (s) => {
         writes.push(s);
@@ -767,6 +787,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
       rendererWrite: (s) => {
         writes.push(s);
@@ -846,6 +867,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: stub,
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: fakeRunAgent,
     });
     await tick();
@@ -889,6 +911,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
     });
     await tick();
@@ -935,6 +958,7 @@ describe('repl — boot + smoke', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: fakeRunAgent,
     });
     await tick();
@@ -967,6 +991,314 @@ describe('repl — boot + smoke', () => {
   });
 });
 
+describe('repl — trust prompt (AGENTIC_CLI §9.1)', () => {
+  // Each test points the trust file at a fresh temp path so the
+  // dev machine's real `~/.config/agent/trusted_dirs.json` isn't
+  // mutated and tests don't share state across runs.
+  let trustDir: string;
+  let trustPath: string;
+  beforeEach(() => {
+    trustDir = mkdtempSync(join(tmpdir(), 'forja-trust-test-'));
+    trustPath = join(trustDir, 'trusted_dirs.json');
+  });
+  afterEach(() => {
+    process.removeAllListeners('SIGINT');
+    rmSync(trustDir, { recursive: true, force: true });
+  });
+
+  test('first-run prompt fires, "yes" answer enters the REPL', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+      trustListPathOverride: trustPath,
+    });
+    await tick();
+    // '1' is the hotkey for "Yes, I trust this folder".
+    stdin.feed('1');
+    await tick();
+    // REPL is now live. Submit a turn to confirm the normal flow
+    // resumes after the modal closes.
+    stdin.feed('hi\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    expect(ra.captured[0]?.configs[0]?.userPrompt).toBe('hi');
+    // Cwd was persisted to the trust list — pin via the storage
+    // module so the assertion isn't a JSON-shape coincidence.
+    expect(loadTrustedDirs(trustPath)).toEqual(['/tmp/forja-repl-test']);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('"no" answer exits 0 without entering the REPL', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+      trustListPathOverride: trustPath,
+    });
+    await tick();
+    // '2' is the hotkey for "No, exit". REPL exits without ever
+    // calling runAgent.
+    stdin.feed('2');
+    expect(await promise).toBe(0);
+    expect(ra.captured).toHaveLength(0);
+    // Trust list NOT mutated.
+    expect(loadTrustedDirs(trustPath)).toEqual([]);
+  });
+
+  test('AGENTS.md presence in cwd is surfaced in the trust modal preview', async () => {
+    // Spec AGENTIC_CLI.md line 75: AGENTS.md is untrusted input
+    // until proven otherwise. The reducer adds an explicit
+    // "AGENTS.md present — its instructions will be loaded on
+    // first use" preview line when the flag is set; the producer
+    // (this REPL flow) has to detect the file and forward the
+    // flag. Pre-fix we always passed agentsMd=false, hiding the
+    // safety cue from the operator.
+    //
+    // Cwd is a real temp dir (NOT the synthetic
+    // `/tmp/forja-repl-test`) because the AGENTS.md probe runs a
+    // real `existsSync`. The bootstrap stub is configured to
+    // match.
+    const cwdWithAgents = mkdtempSync(join(tmpdir(), 'forja-agentsmd-'));
+    writeFileSync(join(cwdWithAgents, 'AGENTS.md'), 'project context\n');
+    try {
+      const stdin = makeStdin();
+      const captured: string[] = [];
+      const ra = makeRunAgent((n) => `sess-${n}`);
+      const promise = runRepl({
+        args: makeArgs(),
+        bootstrapOverride: makeBootstrapStub(cwdWithAgents),
+        stdin,
+        skipTtyCheck: true,
+        runAgentOverride: ra.runAgent,
+        trustListPathOverride: trustPath,
+        rendererWrite: (s) => {
+          captured.push(s);
+        },
+      });
+      // Wait for the frame scheduler to draw the modal — the
+      // renderer's onAny subscription accumulates events but the
+      // first paint goes through scheduler.request which fires on
+      // the next ~33ms tick. flushFrame's 50ms is enough.
+      await flushFrame();
+      const rendered = captured.join('');
+      expect(rendered).toContain('AGENTS.md present');
+      // Decline so we exit cleanly without a runAgent invocation.
+      stdin.feed('2');
+      expect(await promise).toBe(0);
+    } finally {
+      rmSync(cwdWithAgents, { recursive: true, force: true });
+    }
+  });
+
+  test('AGENTS.md absent in cwd suppresses the preview line', async () => {
+    // Inverse of the test above: when no AGENTS.md exists the
+    // reducer must NOT push the notice. Guards against a regression
+    // where the producer always forwards true.
+    const cwdNoAgents = mkdtempSync(join(tmpdir(), 'forja-noagents-'));
+    try {
+      const stdin = makeStdin();
+      const captured: string[] = [];
+      const ra = makeRunAgent((n) => `sess-${n}`);
+      const promise = runRepl({
+        args: makeArgs(),
+        bootstrapOverride: makeBootstrapStub(cwdNoAgents),
+        stdin,
+        skipTtyCheck: true,
+        runAgentOverride: ra.runAgent,
+        trustListPathOverride: trustPath,
+        rendererWrite: (s) => {
+          captured.push(s);
+        },
+      });
+      await flushFrame();
+      const rendered = captured.join('');
+      expect(rendered).not.toContain('AGENTS.md present');
+      stdin.feed('2');
+      expect(await promise).toBe(0);
+    } finally {
+      rmSync(cwdNoAgents, { recursive: true, force: true });
+    }
+  });
+
+  test('stdin subscription is deferred until a focus handler exists', async () => {
+    // Regression: pre-fix runRepl subscribed to stdin during the
+    // pre-bootstrap stack setup, BEFORE any focus handler was
+    // pushed. In the already-trusted path the modal never opens,
+    // so the focus stack stays empty until the editor is registered
+    // post-bootstrap. Any keystroke that hit the wire in that
+    // window was parsed and dispatched into an empty stack, then
+    // silently dropped. Fix subscribes lazily — only after
+    // `modalManager.askTrust` queues its handler (trust path) or
+    // `focusStack.push(editorHandler)` runs (post-bootstrap).
+    //
+    // We pin the contract via the `data` listener count: it must
+    // be 0 immediately after `stdin` is set up by the test, then
+    // jump to 1 only once a handler is on the focus stack. The
+    // shape we exercise here is the already-trusted path (no modal
+    // → only the editor push triggers subscribe).
+    const stdin = makeStdin();
+    addTrustedDir(trustPath, '/tmp/forja-repl-test'); // bypass modal
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    expect(stdin.listenerCount('data')).toBe(0);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+      trustListPathOverride: trustPath,
+    });
+    await tick();
+    // Editor is registered now → onData attached → listener count 1.
+    expect(stdin.listenerCount('data')).toBe(1);
+    // Submit a turn to verify input still flows after the deferred
+    // subscribe (no regression on the happy path).
+    stdin.feed('hi\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    expect(ra.captured[0]?.configs[0]?.userPrompt).toBe('hi');
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('bootstrap error after trust acceptance tears down the pre-bootstrap stack', async () => {
+    // Regression: pre-fix the bootstrap catch path returned 1
+    // immediately, leaving the renderer (raw mode + bracketed
+    // paste) and the stdin data listener live. An embedded caller
+    // (tests, agent SDK) that kept running after runRepl returned
+    // would inherit those handles. The fix routes through
+    // tearDownPreBootstrap before returning. We pin the contract
+    // by counting the stdin 'data' listeners after runRepl resolves.
+    const stdin = makeStdin();
+    const before = stdin.listenerCount('data');
+    const code = await runRepl({
+      args: makeArgs(),
+      // No bootstrapOverride — let bootstrapFn run the throwing fn.
+      bootstrapFn: () => {
+        throw new Error('synthetic bootstrap failure');
+      },
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      errSink: () => undefined,
+    });
+    expect(code).toBe(1);
+    // Listener was attached pre-bootstrap; after the catch path's
+    // teardown it must be removed (count back at the baseline).
+    expect(stdin.listenerCount('data')).toBe(before);
+  });
+
+  test('unattended trust modal auto-rejects after the timeout (fail-closed)', async () => {
+    // Spec UI.md §5.5 rule 6: trust:ask is the one *:ask flavor with
+    // a bounded window. Without the timeout the modal would hold
+    // raw-mode stdio open indefinitely on an unattended terminal —
+    // a process spawned by automation that hits an unfamiliar cwd
+    // would just hang. Tiny `trustPromptTimeoutMs` so the test
+    // fires fast.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+      trustListPathOverride: trustPath,
+      trustPromptTimeoutMs: 30,
+    });
+    // No keystroke fed — let the timeout fire.
+    expect(await promise).toBe(0);
+    expect(ra.captured).toHaveLength(0);
+    // Trust list NOT mutated on timeout.
+    expect(loadTrustedDirs(trustPath)).toEqual([]);
+  });
+
+  test('Esc on the trust modal cancels and exits 0', async () => {
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+      trustListPathOverride: trustPath,
+    });
+    await tick();
+    stdin.feed('\x1b\x1b'); // Esc Esc — modal manager treats Esc as cancel.
+    await flushFrame();
+    expect(await promise).toBe(0);
+    expect(ra.captured).toHaveLength(0);
+  });
+
+  test('already-trusted cwd skips the prompt entirely', async () => {
+    // Pre-populate the trust list so the first-run path is
+    // suppressed. Without `skipTrustPrompt`, the modal must NOT
+    // fire — the very first keystroke goes straight to the editor.
+    addTrustedDir(trustPath, '/tmp/forja-repl-test');
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+      trustListPathOverride: trustPath,
+    });
+    await tick();
+    stdin.feed('hi\r'); // No modal answer — straight to editor.
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    expect(ra.captured[0]?.configs[0]?.userPrompt).toBe('hi');
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('null trustListPath bypasses persistence but still prompts', async () => {
+    // Pathological env: HOME / XDG_CONFIG_HOME unset → trustListPath
+    // returns null → REPL falls through to per-session trust (prompt
+    // still fires for the safety property; approval just doesn't
+    // memoize). Verifies the null-path branch.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+      trustListPathOverride: null,
+    });
+    await tick();
+    stdin.feed('1'); // Yes.
+    await tick();
+    stdin.feed('hi\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+});
+
 describe('repl — slash commands integration', () => {
   // Same SIGINT cleanup as the smoke describe above.
   afterEach(() => {
@@ -985,6 +1317,7 @@ describe('repl — slash commands integration', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       rendererWrite: (s) => {
         writes.push(s);
       },
@@ -1020,6 +1353,7 @@ describe('repl — slash commands integration', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
     });
     await tick();
     // Arm the exit gate.
@@ -1050,6 +1384,7 @@ describe('repl — slash commands integration', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
     });
     await tick();
@@ -1071,6 +1406,7 @@ describe('repl — slash commands integration', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       rendererWrite: (s) => {
         writes.push(s);
       },
@@ -1104,6 +1440,7 @@ describe('repl — slash commands integration', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       rendererWrite: (s) => {
         writes.push(s);
       },
@@ -1134,6 +1471,7 @@ describe('repl — slash commands integration', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
     });
     await tick();
     stdin.feed('/quit\r');
@@ -1148,6 +1486,7 @@ describe('repl — slash commands integration', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       rendererWrite: (s) => {
         writes.push(s);
       },
@@ -1171,6 +1510,7 @@ describe('repl — slash commands integration', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
     });
     await tick();
@@ -1192,6 +1532,7 @@ describe('repl — slash commands integration', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       rendererWrite: (s) => {
         writes.push(s);
       },
@@ -1235,6 +1576,7 @@ describe('repl — slash commands integration', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
       rendererWrite: (s) => {
         writes.push(s);
@@ -1289,6 +1631,7 @@ describe('repl — slash commands integration', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
       rendererWrite: (s) => {
         writes.push(s);
@@ -1331,6 +1674,7 @@ describe('repl — slash commands integration', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
       rendererWrite: (s) => {
         writes.push(s);
@@ -1358,6 +1702,7 @@ describe('repl — slash commands integration', () => {
       bootstrapOverride: makeBootstrapStub(),
       stdin,
       skipTtyCheck: true,
+      skipTrustPrompt: true,
       runAgentOverride: ra.runAgent,
     });
     await tick();
