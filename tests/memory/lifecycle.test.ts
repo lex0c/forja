@@ -2,10 +2,12 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -128,6 +130,65 @@ describe('removeMemory — primitive', () => {
     if (result.kind !== 'removed') return;
     expect(result.indexEntryRemoved).toBe(false);
     expect(existsSync(join(roots.projectLocal, 'orphan.md'))).toBe(false);
+  });
+
+  test('removes a symlinked body file (regression: lstatSync.isFile false → unlink skipped)', () => {
+    // Earlier cut classified a symlink at the body path as
+    // bodyExists=false (because `stat.isFile()` returns false on a
+    // symlink — lstatSync doesn't follow). The index entry was
+    // rewritten away while the symlink stayed on disk, so a
+    // subsequent writeMemory of the same name would trip the
+    // writer's symlink_refused gate. The fix: include symlinks
+    // in the removable set; unlinkSync operates on the link, not
+    // its target.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const decoyTarget = join(repo, 'decoy.txt');
+    writeFileSync(decoyTarget, 'decoy');
+    writeIndex(roots.projectLocal, '- [Linked](linked.md) — h\n');
+    mkdirSync(roots.projectLocal, { recursive: true });
+    symlinkSync(decoyTarget, join(roots.projectLocal, 'linked.md'));
+    const result = removeMemory({
+      roots,
+      scope: 'project_local',
+      name: 'linked',
+    });
+    expect(result.kind).toBe('removed');
+    if (result.kind !== 'removed') return;
+    expect(result.indexEntryRemoved).toBe(true);
+    // Symlink itself is gone (lstatSync should ENOENT now).
+    expect(existsSync(join(roots.projectLocal, 'linked.md'))).toBe(false);
+    expect(() => lstatSync(join(roots.projectLocal, 'linked.md'))).toThrow();
+    // Decoy target untouched — unlinkSync removed the LINK, not
+    // the file the link pointed at.
+    expect(readFileSync(decoyTarget, 'utf-8')).toBe('decoy');
+    // Index entry cleared.
+    const idx = readFileSync(join(roots.projectLocal, 'MEMORY.md'), 'utf-8');
+    expect(idx).not.toContain('linked.md');
+  });
+
+  test('non-file/non-symlink inode at body path: io_error, index untouched', () => {
+    // Operator (or external script) put a directory where a memory
+    // body should be. removeMemory MUST NOT rewrite the index in
+    // that case — leaving the directory orphaned is less surprising
+    // than leaving an inconsistent state where the index claims
+    // the memory is gone but the path still has an inode.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Weird](weird.md) — h\n');
+    mkdirSync(roots.projectLocal, { recursive: true });
+    // Directory at the body path. lstatSync.isFile() returns false,
+    // isSymbolicLink() returns false → 'other'.
+    mkdirSync(join(roots.projectLocal, 'weird.md'));
+    const result = removeMemory({
+      roots,
+      scope: 'project_local',
+      name: 'weird',
+    });
+    expect(result.kind).toBe('io_error');
+    // Index NOT mutated when 'other' fires up front.
+    const idx = readFileSync(join(roots.projectLocal, 'MEMORY.md'), 'utf-8');
+    expect(idx).toContain('weird.md');
   });
 
   test('bad name (path traversal) routes through validateName as io_error', () => {

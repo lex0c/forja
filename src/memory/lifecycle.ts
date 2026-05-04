@@ -134,19 +134,51 @@ export const removeMemory = (input: RemoveMemoryInput): RemoveMemoryResult => {
     throw err;
   }
 
-  // Verify body exists before mutating the index. Removing the
-  // index entry for a never-existed memory would be a silent
-  // operator-confusion — surface as `unknown`.
-  let bodyExists = false;
+  // Classify the inode at the body path. Three outcomes the
+  // caller cares about:
+  //   - 'absent'   → no inode (ENOENT). Index-only cleanup path.
+  //   - 'file'     → regular memory file written by writeMemory.
+  //                  unlinkSync removes it.
+  //   - 'symlink'  → operator (or an attacker, spec §7.2.6) dropped
+  //                  a symlink at the path. Earlier cut treated this
+  //                  as 'absent' because `stat.isFile()` returns
+  //                  false on symlinks (lstatSync doesn't follow);
+  //                  the unlink was skipped, leaving the symlink on
+  //                  disk while the index entry was rewritten away.
+  //                  Re-creating the same name would then trip the
+  //                  writer's `symlink_refused` gate, making the
+  //                  name permanently unwritable until manual
+  //                  cleanup. Fix: include symlinks in the
+  //                  removable set — `unlinkSync` operates on the
+  //                  link itself, not the target, so removing it
+  //                  is the right cleanup regardless of where the
+  //                  link pointed.
+  //   - 'other'    → directory, socket, fifo, etc. Refuse up front
+  //                  BEFORE mutating the index so we don't leave
+  //                  the index half-cleaned with a weird inode
+  //                  still occupying the path. lstatSync returning
+  //                  these kinds at a memory path means external
+  //                  filesystem state has gone weird; surface as
+  //                  io_error so the operator investigates.
+  let bodyState: 'absent' | 'file' | 'symlink' | 'other' = 'absent';
   try {
     const stat = lstatSync(bodyPath);
-    bodyExists = stat.isFile();
+    if (stat.isFile()) bodyState = 'file';
+    else if (stat.isSymbolicLink()) bodyState = 'symlink';
+    else bodyState = 'other';
   } catch (err) {
     if (!isEnoent(err)) {
       const msg = err instanceof Error ? err.message : String(err);
       return { kind: 'io_error', reason: msg };
     }
   }
+  if (bodyState === 'other') {
+    return {
+      kind: 'io_error',
+      reason: `non-file/non-symlink at memory path: ${bodyPath}`,
+    };
+  }
+  const bodyExists = bodyState === 'file' || bodyState === 'symlink';
 
   // Update the index: remove the entry whose href matches `<name>.md`.
   // Spec §3.2 SECURITY CONTRACT mandates href is a UI hint, not
