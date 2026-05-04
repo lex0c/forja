@@ -751,6 +751,16 @@ describe('not-yet-wired events accept silently', () => {
       },
     ],
     [
+      'memory:user-scope:ask',
+      {
+        type: 'memory:user-scope:ask',
+        ts: 1,
+        promptId: 'p1',
+        name: 'x',
+        body: 'y',
+      },
+    ],
+    [
       'plan:review',
       {
         type: 'plan:review',

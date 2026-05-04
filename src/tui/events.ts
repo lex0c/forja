@@ -244,6 +244,22 @@ export type MemoryWriteAskEvent = BaseEvent & {
   name: string;
   body: string;
 };
+
+// User-scope second-confirm modal (spec MEMORY.md §7.2.5: "Memória
+// user-global precisa dois prompts (write + escopo) — vai afetar
+// todas as sessões, exige fricção extra"). Producer: `memory_write`
+// tool fires this AFTER the first `memory:write:ask` resolves yes
+// AND the proposed scope is `user`. Distinct event type rather than
+// reusing `memory:write:ask` so the modal can render a
+// scope-specific warning ("this memory will load in EVERY session
+// on this machine") and the audit trail can distinguish first-
+// vs-second-prompt rejection.
+export type MemoryUserScopeAskEvent = BaseEvent & {
+  type: 'memory:user-scope:ask';
+  promptId: string;
+  name: string;
+  body: string;
+};
 export type PlanReviewEvent = BaseEvent & {
   type: 'plan:review';
   promptId: string;
@@ -468,6 +484,7 @@ export type UIEvent =
   | ModalSelectEvent
   | TrustAskEvent
   | MemoryWriteAskEvent
+  | MemoryUserScopeAskEvent
   | PlanReviewEvent
   | CritiqueAskEvent
   | HistoryClearAskEvent

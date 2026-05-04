@@ -380,6 +380,18 @@ export interface HarnessConfig {
   // callers (REPL) wire this to `modalManager.askMemoryWrite`;
   // one-shot mode leaves it unset.
   confirmMemoryWrite?: (req: ConfirmMemoryWriteRequest) => Promise<MemoryWriteAnswer>;
+  // Async hook for the user-scope second-confirm modal (MEMORY.md
+  // §7.2.5). The `memory_write` tool fires this AFTER
+  // `confirmMemoryWrite` returns yes AND the proposed scope is
+  // `user`. Caller (REPL) wires it to
+  // `modalManager.askMemoryUserScope`. When unset, the tool
+  // refuses user-scope writes with `headless_mode` (paired with
+  // confirmMemoryWrite — production wires both, headless wires
+  // neither). Body is included so the modal can re-render the
+  // exact bytes; spec doesn't require it but it gives the
+  // operator a second look at the content before the
+  // cross-session blast hits.
+  confirmMemoryUserScope?: (req: ConfirmMemoryUserScopeRequest) => Promise<MemoryWriteAnswer>;
 }
 
 // Producer-facing args for `confirmMemoryWrite`. Mirrors
@@ -390,6 +402,15 @@ export interface HarnessConfig {
 // before approving.
 export interface ConfirmMemoryWriteRequest {
   scope: 'user' | 'project_shared' | 'project_local';
+  name: string;
+  body: string;
+}
+
+// Producer-facing args for `confirmMemoryUserScope`. No `scope`
+// field by construction — the caller has already established
+// it's a user-scope write before invoking this. Mirrors
+// `MemoryUserScopeAskArgs` from modal-manager.ts.
+export interface ConfirmMemoryUserScopeRequest {
   name: string;
   body: string;
 }

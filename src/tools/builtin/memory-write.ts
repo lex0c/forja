@@ -395,6 +395,69 @@ export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
       };
     }
 
+    // 6b. User-scope second confirm (MEMORY.md §7.2.5). User-
+    // global memories load in EVERY session on the machine — the
+    // first prompt asked about the WRITE; this one asks about
+    // the SCOPE. Distinct modal text ("vai afetar todas as
+    // sessões") forces the operator to re-engage rather than
+    // habit-press 1.
+    //
+    // Headless variant: if `confirmMemoryWrite` was wired but
+    // `confirmMemoryUserScope` is missing (programmer error or
+    // partial test wiring), refuse fail-closed. We don't reach
+    // this branch in production paths because REPL wires both
+    // together; the gate exists so a future entrypoint that
+    // forgets one of the two doesn't silently downgrade
+    // user-scope security.
+    if (scope === 'user') {
+      const confirmScope = ctx.confirmMemoryUserScope;
+      if (confirmScope === undefined) {
+        registry.recordEvent({
+          action: 'refused',
+          scope,
+          memoryName: args.name,
+          source,
+          details: { stage: 'headless_gate_user_scope' },
+          auditSessionId: ctx.sessionId,
+          auditCwd: ctx.cwd,
+        });
+        return toolError(
+          'memory.headless_mode',
+          'memory_write rejected: user-scope writes require a second confirmation surface that is not attached',
+          {
+            hint: 'Run inside an interactive REPL or write to project_local instead.',
+          },
+        );
+      }
+      const scopeAnswer = await confirmScope({
+        name: args.name,
+        body: args.body,
+      });
+      if (scopeAnswer !== 'yes') {
+        registry.recordEvent({
+          action: 'refused',
+          scope,
+          memoryName: args.name,
+          source,
+          details: {
+            stage: 'user_scope_modal',
+            reason: scopeAnswer === 'no' ? 'declined' : 'cancelled',
+          },
+          auditSessionId: ctx.sessionId,
+          auditCwd: ctx.cwd,
+        });
+        return {
+          outcome: 'rejected',
+          scope,
+          name: args.name,
+          reason:
+            scopeAnswer === 'no'
+              ? 'operator declined user-scope persistence'
+              : 'operator cancelled user-scope confirm (esc/timeout)',
+        };
+      }
+    }
+
     // 7. Persist. Apply the +90d default for inferred + project
     // scope when no explicit expires was supplied (spec §6.2).
     const frontmatter = buildFrontmatter(args, scope, source);

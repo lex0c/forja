@@ -156,6 +156,17 @@ export interface ToolContext {
     name: string;
     body: string;
   }) => Promise<'yes' | 'no' | 'cancel'>;
+  // Second-confirm hook for user-scope writes (MEMORY.md §7.2.5).
+  // Fired by `memory_write` AFTER `confirmMemoryWrite` returns
+  // yes AND the proposed scope is `user`. Pairs with
+  // `confirmMemoryWrite` in production: REPL wires both, headless
+  // wires neither. When `confirmMemoryWrite` is set but this is
+  // NOT (programmer error or partial test wiring), user-scope
+  // writes are refused with `headless_mode` to fail-closed.
+  confirmMemoryUserScope?: (req: {
+    name: string;
+    body: string;
+  }) => Promise<'yes' | 'no' | 'cancel'>;
   // Trust state of `cwd` resolved at session start (AGENTIC_CLI.md
   // §9.1). Required so any future tool that needs trust info gets
   // an explicit value rather than an undefined fallback that could

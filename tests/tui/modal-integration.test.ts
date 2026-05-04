@@ -225,6 +225,29 @@ describe('per-flavor reducer option lists', () => {
     expect(state.modal.selectedIndex).toBe(1);
   });
 
+  test('memory:user-scope:ask builds 2 options + scope warning preview', () => {
+    const state = applyEvent(createInitialState(), {
+      type: 'memory:user-scope:ask',
+      ts: 1,
+      promptId: 'p1',
+      name: 'global-pref',
+      body: 'body line',
+    }).state;
+    if (state.modal === null) throw new Error('modal not set');
+    expect(state.modal.flavor).toBe('memory-user-scope');
+    expect(state.modal.title).toBe('Confirm user-scope memory');
+    expect(state.modal.subject).toBe('global-pref');
+    // Warning text comes BEFORE the body content so the operator
+    // reads the blast-radius reminder first. Preview is sentences,
+    // not column-wrapped — renderer handles wrap-to-width.
+    expect(state.modal.preview[0]).toContain('EVERY session');
+    expect(state.modal.preview[0]).toContain('regardless of project');
+    expect(state.modal.preview).toContain('body line');
+    expect(state.modal.options.map((o) => o.value)).toEqual(['yes', 'no']);
+    // Default = last (No), per D5 conservative-default convention.
+    expect(state.modal.selectedIndex).toBe(1);
+  });
+
   test('plan:review builds 3 options (approve / edit / reject), default = last (reject)', () => {
     const state = applyEvent(createInitialState(), {
       type: 'plan:review',

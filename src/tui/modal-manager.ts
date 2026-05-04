@@ -92,6 +92,16 @@ export interface MemoryWriteAskArgs {
 }
 export type MemoryWriteAnswer = 'yes' | 'no' | 'cancel';
 
+// User-scope second-confirm flavor (MEMORY.md §7.2.5). Producer:
+// `memory_write` after the first modal returns yes AND the
+// proposed scope is `user`. Distinct args from MemoryWriteAskArgs
+// (no scope — by definition we're at user scope when this fires)
+// so the type system makes the call sites un-confusable.
+export interface MemoryUserScopeAskArgs {
+  name: string;
+  body: string;
+}
+
 // Trust flavor's option list. Kept in sync with the reducer's
 // `trust:ask` ConfirmState construction in state.ts.
 const TRUST_OPTIONS: readonly ConfirmOption[] = [
@@ -116,6 +126,15 @@ const HISTORY_CLEAR_OPTIONS: readonly ConfirmOption[] = [
 const MEMORY_WRITE_OPTIONS: readonly ConfirmOption[] = [
   { key: '1', label: 'Yes, write memory', value: 'yes' },
   { key: '2', label: 'No, skip', value: 'no' },
+];
+
+// User-scope second-confirm options (MEMORY.md §7.2.5). Same
+// shape as memory-write but distinct labels so the operator
+// re-reads the question rather than habitually pressing 1.
+// Reducer matches at `state.ts` `memory:user-scope:ask`.
+const MEMORY_USER_SCOPE_OPTIONS: readonly ConfirmOption[] = [
+  { key: '1', label: 'Yes, persist to user scope', value: 'yes' },
+  { key: '2', label: 'No, cancel write', value: 'no' },
 ];
 
 // Permission flavor's option list, kept in sync with the reducer's
@@ -157,6 +176,16 @@ export interface ModalManager {
   // 'cancel' for telemetry).
   askMemoryWrite: (
     args: MemoryWriteAskArgs,
+    opts?: ConfirmAskOptions,
+  ) => Promise<MemoryWriteAnswer>;
+  // User-scope second-confirm flavor (MEMORY.md §7.2.5). Fires
+  // AFTER `askMemoryWrite` resolves yes for a `user`-scope
+  // proposal. Reuses `MemoryWriteAnswer` since the answer
+  // semantics are identical (yes=proceed, no=explicit reject,
+  // cancel=Esc/timeout); the wording in the modal is what
+  // changes per spec ("vai afetar todas as sessões").
+  askMemoryUserScope: (
+    args: MemoryUserScopeAskArgs,
     opts?: ConfirmAskOptions,
   ) => Promise<MemoryWriteAnswer>;
   // Number of pending modals (active + queued). Tests inspect.
@@ -425,6 +454,18 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           body: args.body,
         }),
         MEMORY_WRITE_OPTIONS,
+        opts?.timeoutMs,
+      ),
+    askMemoryUserScope: (args, opts) =>
+      enqueueConfirm<MemoryWriteAnswer>(
+        (promptId) => ({
+          type: 'memory:user-scope:ask',
+          ts: now(),
+          promptId,
+          name: args.name,
+          body: args.body,
+        }),
+        MEMORY_USER_SCOPE_OPTIONS,
         opts?.timeoutMs,
       ),
     pendingCount: () => (active !== null ? 1 : 0) + queue.length,

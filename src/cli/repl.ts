@@ -750,6 +750,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     body: string;
   }): Promise<'yes' | 'no' | 'cancel'> => modalManager.askMemoryWrite(req);
 
+  // Second-confirm bridge for user-scope writes (MEMORY.md §7.2.5).
+  // Same one-liner shape as confirmMemoryWrite — the modal
+  // manager handles wording differences. The tool layer fires this
+  // only when the proposed scope is `user`; we don't gate scope
+  // here, just forward.
+  const confirmMemoryUserScope = async (req: {
+    name: string;
+    body: string;
+  }): Promise<'yes' | 'no' | 'cancel'> => modalManager.askMemoryUserScope(req);
+
   const startTurn = (text: string): void => {
     if (running || exiting) return;
     running = true;
@@ -770,6 +780,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       onEvent: (e) => onHarnessEvent(adapter, e),
       confirmPermission,
       confirmMemoryWrite,
+      confirmMemoryUserScope,
       ...(lastSessionId !== null ? { resumeFromSessionId: lastSessionId } : {}),
     };
     const runAgentImpl = options.runAgentOverride ?? runAgent;

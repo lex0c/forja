@@ -336,6 +336,201 @@ describe('memory_write tool — modal flow', () => {
   });
 });
 
+describe('memory_write tool — user-scope second confirm (spec §7.2.5)', () => {
+  let db: DB;
+  let sessionId: string;
+
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+    sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+  });
+
+  test('user scope: fires both modals; both yes → persists', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const writeArgs: { scope: string }[] = [];
+    const scopeArgs: { name: string }[] = [];
+    const ctx = makeCtx({
+      memoryRegistry: reg,
+      sessionId,
+      confirmMemoryWrite: async (req) => {
+        writeArgs.push(req);
+        return 'yes';
+      },
+      confirmMemoryUserScope: async (req) => {
+        scopeArgs.push(req);
+        return 'yes';
+      },
+    });
+    const result = await memoryWriteTool.execute(
+      validInput({
+        scope: 'user',
+        name: 'global-pref',
+        type: 'user',
+        source: 'user_explicit',
+      }),
+      ctx,
+    );
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    expect(result.outcome).toBe('created');
+    expect(writeArgs).toHaveLength(1);
+    expect(scopeArgs).toHaveLength(1);
+    expect(scopeArgs[0]?.name).toBe('global-pref');
+    expect(existsSync(join(roots.user, 'global-pref.md'))).toBe(true);
+  });
+
+  test('user scope: first yes + second no → not persisted, audit user_scope_modal', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    let scopeCalls = 0;
+    const ctx = makeCtx({
+      memoryRegistry: reg,
+      sessionId,
+      confirmMemoryWrite: async () => 'yes',
+      confirmMemoryUserScope: async () => {
+        scopeCalls++;
+        return 'no';
+      },
+    });
+    const result = await memoryWriteTool.execute(
+      validInput({
+        scope: 'user',
+        name: 'rejected-pref',
+        type: 'user',
+        source: 'user_explicit',
+      }),
+      ctx,
+    );
+    if (isToolError(result)) throw new Error(`unexpected error: ${result.error_message}`);
+    expect(result.outcome).toBe('rejected');
+    expect(result.reason).toContain('declined user-scope');
+    expect(scopeCalls).toBe(1);
+    expect(existsSync(join(roots.user, 'rejected-pref.md'))).toBe(false);
+    const events = listMemoryEventsByName(db, 'rejected-pref');
+    const refused = events.find((e) => e.action === 'refused');
+    expect(refused?.details?.stage).toBe('user_scope_modal');
+    expect(refused?.details?.reason).toBe('declined');
+    // Regression guard: persist must NOT have run despite the
+    // first-yes signal — no `created` row in the audit trail.
+    expect(events.find((e) => e.action === 'created')).toBeUndefined();
+  });
+
+  test('user scope: first yes + second cancel → audit user_scope_modal cancelled', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const ctx = makeCtx({
+      memoryRegistry: reg,
+      sessionId,
+      confirmMemoryWrite: async () => 'yes',
+      confirmMemoryUserScope: async () => 'cancel',
+    });
+    const result = await memoryWriteTool.execute(
+      validInput({
+        scope: 'user',
+        name: 'cancelled-pref',
+        type: 'user',
+        source: 'user_explicit',
+      }),
+      ctx,
+    );
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    expect(result.outcome).toBe('rejected');
+    expect(result.reason).toContain('cancelled user-scope');
+    const events = listMemoryEventsByName(db, 'cancelled-pref');
+    const refused = events.find((e) => e.action === 'refused');
+    expect(refused?.details?.stage).toBe('user_scope_modal');
+    expect(refused?.details?.reason).toBe('cancelled');
+    // Regression guard: cancel must short-circuit before persist.
+    expect(events.find((e) => e.action === 'created')).toBeUndefined();
+    expect(existsSync(join(roots.user, 'cancelled-pref.md'))).toBe(false);
+  });
+
+  test('user scope: first no aborts before second modal fires', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    let scopeCalls = 0;
+    const ctx = makeCtx({
+      memoryRegistry: reg,
+      sessionId,
+      confirmMemoryWrite: async () => 'no',
+      confirmMemoryUserScope: async () => {
+        scopeCalls++;
+        return 'yes';
+      },
+    });
+    const result = await memoryWriteTool.execute(
+      validInput({
+        scope: 'user',
+        name: 'aborted-pref',
+        type: 'user',
+        source: 'user_explicit',
+      }),
+      ctx,
+    );
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    expect(result.outcome).toBe('rejected');
+    expect(scopeCalls).toBe(0);
+    const events = listMemoryEventsByName(db, 'aborted-pref');
+    const refused = events.find((e) => e.action === 'refused');
+    expect(refused?.details?.stage).toBe('modal'); // not user_scope_modal
+  });
+
+  test('user scope without confirmMemoryUserScope wired → headless reject', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const ctx = makeCtx({
+      memoryRegistry: reg,
+      sessionId,
+      confirmMemoryWrite: async () => 'yes',
+      // confirmMemoryUserScope intentionally omitted.
+    });
+    const result = await memoryWriteTool.execute(
+      validInput({
+        scope: 'user',
+        name: 'half-wired',
+        type: 'user',
+        source: 'user_explicit',
+      }),
+      ctx,
+    );
+    expect(isToolError(result)).toBe(true);
+    if (isToolError(result)) expect(result.error_code).toBe('memory.headless_mode');
+    const events = listMemoryEventsByName(db, 'half-wired');
+    const refused = events.find((e) => e.action === 'refused');
+    expect(refused?.details?.stage).toBe('headless_gate_user_scope');
+    expect(existsSync(join(roots.user, 'half-wired.md'))).toBe(false);
+    // Persist must not have run; even though first modal said yes
+    // and registry has a write() method, the gate fired before it.
+    expect(events.find((e) => e.action === 'created')).toBeUndefined();
+  });
+
+  test('project_local scope does NOT trigger second modal', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    let scopeCalls = 0;
+    const ctx = makeCtx({
+      memoryRegistry: reg,
+      sessionId,
+      confirmMemoryWrite: async () => 'yes',
+      confirmMemoryUserScope: async () => {
+        scopeCalls++;
+        return 'yes';
+      },
+    });
+    const result = await memoryWriteTool.execute(validInput(), ctx);
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    expect(result.outcome).toBe('created');
+    expect(scopeCalls).toBe(0); // project_local: no second prompt
+  });
+});
+
 describe('memory_write tool — defaults and lookups', () => {
   test('inferred + project_local without expires gets +90d default', async () => {
     const repo = makeTmp();
@@ -386,6 +581,8 @@ describe('memory_write tool — defaults and lookups', () => {
     const ctx = makeCtx({
       memoryRegistry: reg,
       confirmMemoryWrite: async () => 'yes',
+      // user-scope writes require the second confirm too (§7.2.5).
+      confirmMemoryUserScope: async () => 'yes',
     });
     const result = await memoryWriteTool.execute(
       validInput({

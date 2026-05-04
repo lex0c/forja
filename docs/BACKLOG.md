@@ -15,6 +15,124 @@ Format:
 
 ---
 
+## [2026-05-04] M3 / impl — user-scope double-prompt (closes spec §7.2.5)
+
+Continues the memory subsystem on the same branch. Closes spec §7.2.5
+("Memória user-global precisa dois prompts (write + escopo) — vai
+afetar todas as sessões, exige fricção extra"). User-scope writes
+now fire TWO modals instead of one: the standard write confirm
+followed by a scope-specific blast-radius reminder.
+
+**Done:**
+
+- **New event + reducer flavor**: `memory:user-scope:ask` event in
+  `src/tui/events.ts` with `{name, body}`. `LiveState.modal.flavor`
+  union grows `'memory-user-scope'`. Reducer renders modal with
+  distinct copy: title "Confirm user-scope memory", subject is
+  the bare name (no `user/` prefix — by definition we're in user
+  scope), preview leads with three lines warning "this memory
+  will load in EVERY session on this machine, regardless of
+  project" before the body content. Two options (yes / no),
+  default last (No) per the conservative-default convention.
+- **Modal manager**: `askMemoryUserScope({name, body})` mirrors
+  `askMemoryWrite` shape but no `scope` arg (always user). New
+  `MEMORY_USER_SCOPE_OPTIONS` with relabeled buttons ("Yes,
+  persist to user scope" / "No, cancel write") so muscle memory
+  doesn't carry from the first prompt.
+- **HarnessConfig + ToolContext threading**: new optional
+  `confirmMemoryUserScope` callback paired with
+  `confirmMemoryWrite`. Production wires both via REPL bridge;
+  headless wires neither. When `confirmMemoryWrite` IS wired but
+  `confirmMemoryUserScope` is missing (programmer error or
+  partial test wiring), user-scope writes refuse with
+  `headless_mode` and audit row stage='headless_gate_user_scope'
+  — fail-closed fences against silent security downgrade.
+- **`memory_write` second gate**: after the first modal returns
+  yes AND `scope === 'user'`, fires the second modal. Audit
+  outcomes:
+    - first yes + second yes → persist + `created` audit (existing
+      flow, unchanged)
+    - first yes + second no/cancel → audit `refused` with
+      `stage='user_scope_modal'`, reason='declined'/'cancelled'
+    - first no/cancel → unchanged (`stage='modal'`); second
+      modal NEVER fires (sibling test pins this)
+    - first yes + headless gate (no callback) →
+      `stage='headless_gate_user_scope'`
+- **Tests:** 6 memory_write user-scope (both yes persists / both
+  modals fire / second-no audit / second-cancel audit / first-no
+  short-circuits / project_local skips second / half-wired headless
+  reject), 4 modal-manager (event emission, default selection,
+  hotkey, Esc), 1 reducer (modal-integration: title/subject/preview
+  shape), 1 reducer no-throw (state.test parametric branch). +12
+  tests across the slice; suite at 2533 pass / 0 fail.
+
+**Decisions:**
+
+- **Distinct event type, not a flag on `memory:write:ask`.** Two
+  reasons: (1) the second modal renders different copy (warning
+  text, scope-emphasizing labels) — a flag-controlled branch in
+  the reducer would diverge into a state-machine the renderer has
+  to hold; (2) the audit trail benefits from
+  `stage='user_scope_modal'` being distinct from the first
+  `stage='modal'` row, so an operator inspecting `/memory audit`
+  sees which prompt fired the rejection.
+- **Pair `confirmMemoryUserScope` with `confirmMemoryWrite` rather
+  than make it required.** Required at the type level would force
+  every test that exercises non-user-scope writes to wire BOTH.
+  Optional + fail-closed gate ("if scope=user and callback
+  missing → headless reject") is the same security invariant with
+  less ceremony.
+- **Body re-rendered in second modal preview** even though the
+  operator already saw it in the first. Two prompts back-to-back
+  on the same content is a usability hazard — the operator's
+  reflex is to hit "yes" again. Re-rendering keeps the bytes
+  visible so a body that snuck through the first review still has
+  a chance of catching the eye on the second.
+- **Wording emphasizes blast radius, not scope name.** "EVERY
+  session on this machine" is more concrete than "user scope" —
+  matches the spec's intent ("vai afetar todas as sessões")
+  rather than re-stating the scope label.
+- **Cancel paths short-circuit the persist call** — the registry
+  is never reached when either modal returns no/cancel. Avoids
+  the registry's writer-side audit (`created` / `refused`) from
+  competing with the tool's stage-tagged refused rows. Audit table
+  ends up with `proposed` + ONE `refused` row per attempt, never
+  two refusals for the same logical decision.
+
+**Post-review fixes (2026-05-04):**
+
+- **Pre-wrapped warning replaced with sentence-natural lines.**
+  First cut split the blast-radius warning into 40-col fragments
+  that would either truncate (narrow terminals) or look
+  fragmented (wide). Now: two natural sentences, renderer wraps
+  via wrap-ansi at terminal width. Matches the trust-modal /
+  plan-review convention. Test asserts both "EVERY session" and
+  "regardless of project" appear in the leading preview line.
+- **Regression guards: persist must NOT run on second-modal
+  rejection paths.** Added `expect(events.find(e => e.action ===
+  'created')).toBeUndefined()` to the second-no, second-cancel,
+  and headless-gate-user-scope tests. The file-absence check was
+  the strongest signal (file present = persist actually ran),
+  but a registry-only regression that emits `created` without
+  hitting disk would have slipped past. Three new assertions
+  pin down the audit-trail invariant directly.
+
+**Out of scope:**
+
+- **Reusing `MemoryWriteAnswer` instead of a new
+  `MemoryUserScopeAnswer` union.** Same yes/no/cancel triad, same
+  semantics — one type covers both. If the second modal grows a
+  third option (e.g., "promote to project_shared instead") later,
+  introduce the new union then.
+- **Skipping the second prompt for `user_explicit` source.**
+  Operator might argue "I already typed it, no need for a second
+  click". Rejected — the spec's "fricção extra" is the point.
+  user_explicit at user scope is exactly the case where the
+  operator's first action is on autopilot ("save this") and the
+  cross-session impact deserves a beat to consider.
+
+---
+
 ## [2026-05-04] M3 / impl — memory lifecycle hooks (expiry GC + boot-time triggers)
 
 Continues the memory subsystem on the same branch. Closes spec §6.2
