@@ -95,11 +95,32 @@ export const scanForInjection = (text: string): ScanResult => {
 // "valid at the limit" — earlier cut used `>=` and rejected
 // exactly-200-line bodies while reporting "exceeds 200-line cap
 // (got 200)", which is internally contradictory (200 doesn't
-// exceed 200). Counted as `\n`-separated lines including a
-// trailing empty line if the body ends with `\n` (standard
-// line-count semantics; matches `wc -l`-equivalent for
-// newline-terminated files).
+// exceed 200). See `countLines` below for the trailing-newline
+// normalization that keeps editor-written 200-line files from
+// counting as 201.
 export const SHARED_BODY_LINE_CAP = 200;
+
+// Count logical lines in a memory body. Most editors end files
+// with a trailing `\n`, which means `body.split('\n').length`
+// over-counts by one: `"a\nb\n"` splits as `["a", "b", ""]`
+// (length 3) but represents 2 lines. A 200-line body with the
+// canonical trailing newline would be flagged as 201 by the
+// raw split, falsely tripping the cap.
+//
+// Normalize by stripping ONE trailing `\n` before splitting.
+// Empty body collapses to 0 lines (defensive — writeMemory
+// rejects empty bodies up front, but the scanner shouldn't trust
+// upstream gates).
+//
+// CRLF on Windows: `body.endsWith('\n')` matches both `\n` and
+// `\r\n`. After slicing off the `\n`, a leftover `\r` becomes
+// trailing data on the prior line — counted correctly as part
+// of that line, not as a separator.
+const countLines = (body: string): number => {
+  if (body.length === 0) return 0;
+  const normalized = body.endsWith('\n') ? body.slice(0, -1) : body;
+  return normalized.split('\n').length;
+};
 
 // Path-traversal heuristic for promotion. Spec §5.4 calls for a
 // path-traversal check on shared bodies — a shared memory that
@@ -136,7 +157,7 @@ export const scanForPromotion = (body: string): ScanResult => {
       return { ok: false, reason: 'path traversal pattern' };
     }
   }
-  const lineCount = body.split('\n').length;
+  const lineCount = countLines(body);
   if (lineCount > SHARED_BODY_LINE_CAP) {
     return {
       ok: false,

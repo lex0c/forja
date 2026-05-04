@@ -122,6 +122,34 @@ describe('scanForPromotion — line-cap boundary (spec §5.4)', () => {
     expect(r.ok).toBe(true);
   });
 
+  test('200 lines with trailing newline: passes (regression: editor-style \\n)', () => {
+    // Most editors end files with `\n`. Earlier cut counted
+    // `body.split('\n').length` raw, which turned a 200-line
+    // body + trailing newline into 201 entries (the empty
+    // tail) and tripped the cap. Operator's "200-line file
+    // saved by editor" should pass; trailing-newline
+    // normalization makes it so.
+    const r = scanForPromotion(`${bodyWithLines(200)}\n`);
+    expect(r.ok).toBe(true);
+  });
+
+  test('201 lines with trailing newline: fails with got 201 (not 202)', () => {
+    // Symmetric to the regression above: a 201-line body should
+    // still report 201, not be inflated to 202 by the trailing
+    // newline.
+    const r = scanForPromotion(`${bodyWithLines(201)}\n`);
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain('got 201');
+  });
+
+  test('CRLF body: trailing \\r\\n normalized like \\n', () => {
+    // Windows-style line endings — endsWith('\\n') matches both
+    // `\n` and `\r\n`, slicing off the `\n` leaves the `\r` on
+    // the previous line (counted as content, not separator).
+    const body = bodyWithLines(200).replace(/\n/g, '\r\n');
+    expect(scanForPromotion(`${body}\r\n`).ok).toBe(true);
+  });
+
   test('201 lines: fails with descriptive reason', () => {
     const r = scanForPromotion(bodyWithLines(201));
     expect(r.ok).toBe(false);
