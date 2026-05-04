@@ -28,6 +28,7 @@ import {
   type MemoryScope,
   moveMemory,
   removeMemory,
+  scanForInjection,
   scanForPromotion,
 } from '../../../memory/index.ts';
 import {
@@ -628,24 +629,39 @@ const handlePromote = async (
     };
   }
 
-  // Spec §5.4 additional scanner — body content checks BEYOND the
-  // base injection scan that ran when the memory was first
-  // proposed. Catches operator-edited content that bypassed the
-  // initial gate.
-  const scan = scanForPromotion(peek.file.body);
-  if (!scan.ok) {
+  // Spec §5.4 additional scanner. Two passes:
+  //   1. Body via `scanForPromotion` — full superset (injection +
+  //      secrets + path-traversal + 200-line cap).
+  //   2. Description via `scanForInjection` — same pass
+  //      memory_write runs on description (line 311-ish in the
+  //      tool). The description is single-line and capped by
+  //      `validateDescription` so the line-count + path-traversal
+  //      branches of `scanForPromotion` don't add value here, but
+  //      the injection + secret checks DO: the description is
+  //      copied verbatim into `project_shared/MEMORY.md` as the
+  //      hook text that future sessions load eagerly. An operator
+  //      who hand-edits a local memory's description after
+  //      creation could inject prompt-control phrases through
+  //      that path; without this scan, promotion would silently
+  //      ship them to the team's shared context.
+  for (const [field, text, scanner] of [
+    ['body', peek.file.body, scanForPromotion] as const,
+    ['description', peek.file.frontmatter.description, scanForInjection] as const,
+  ]) {
+    const scan = scanner(text);
+    if (scan.ok) continue;
     registry.recordEvent({
       action: 'refused',
       scope: 'project_local',
       memoryName: name,
       source: peek.file.frontmatter.source,
-      details: { stage: 'promote_scanner', reason: scan.reason ?? 'unknown' },
+      details: { stage: 'promote_scanner', field, reason: scan.reason ?? 'unknown' },
       auditCwd: ctx.baseConfig.cwd,
       ...attribution(ctx),
     });
     return {
       kind: 'error',
-      message: `/memory promote: scanner blocked promotion (${scan.reason ?? 'unknown'})`,
+      message: `/memory promote: scanner blocked promotion on ${field} (${scan.reason ?? 'unknown'})`,
     };
   }
 
