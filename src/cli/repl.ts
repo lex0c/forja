@@ -984,6 +984,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // a slash command queued before a turn starts but executed after
     // observes the post-startTurn state.
     isRunning: () => running,
+    // Most recent session id (closure so it's read fresh per slash
+    // call). Set after the first turn's session_finished event;
+    // null between boot and first turn. /memory show forwards this
+    // as auditSessionId so its read rows group with the operator's
+    // current session.
+    currentSessionId: () => lastSessionId,
     modelRegistry,
     // History controls (HISTORY.md §2.3). `/history clear` calls
     // `clearLocal` AFTER `clearHistory` against the db so the in-

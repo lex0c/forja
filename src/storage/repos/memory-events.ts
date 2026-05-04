@@ -152,6 +152,24 @@ export const listMemoryEventsBySession = (db: DB, sessionId: string): MemoryEven
   return rows.map(fromRow);
 };
 
+// Recent memory events, no name/session filter. Used by
+// `/memory audit` to render "what happened lately" across the
+// whole table. Ordered most-recent first (matches the index
+// direction), capped by `limit` (default 50). Sub-50 spans the
+// last few sessions in typical use; operators wanting full
+// history pass a higher cap explicitly.
+export const listRecentMemoryEvents = (db: DB, limit = 50): MemoryEvent[] => {
+  const rows = db
+    .query<MemoryEventRow, [number]>(
+      `SELECT id, scope, action, memory_name, source, session_id, cwd, created_at, details
+         FROM memory_events
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?`,
+    )
+    .all(limit);
+  return rows.map(fromRow);
+};
+
 // History of one memory across its full lifetime. Ordered most-
 // recent first (matching the composite index direction) so the
 // caller can `LIMIT N` to get the latest activity.

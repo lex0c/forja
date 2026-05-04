@@ -72,6 +72,7 @@ const makeCtx = (
       now: () => 1,
       requestShutdown: () => {},
       isRunning: () => false,
+      currentSessionId: () => null,
       modelRegistry: createModelRegistry(),
       history: {
         isEnabled: () => stub.enabled,
