@@ -389,6 +389,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         ...(args.model !== undefined ? { modelId: args.model } : {}),
         ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
         ...(args.plan === true ? { plan: true } : {}),
+        // Forward the trust-list override so REPL and bootstrap
+        // agree on which file is authoritative. Without this,
+        // a test that pins `trustListPathOverride` for the boot
+        // modal would still see bootstrap fall through to the
+        // dev's real `~/.config/agent/trusted_dirs.json` —
+        // bootstrap's `isCwdTrusted` would be wrong, and the
+        // memory_write trust gate would surprise the test author.
+        // `undefined` (production default) lets bootstrap use its
+        // own default; `null` and string both forward verbatim.
+        ...(options.trustListPathOverride !== undefined
+          ? { trustListPathOverride: options.trustListPathOverride }
+          : {}),
       } satisfies BootstrapInput);
   } catch (e) {
     const msg = e instanceof Error ? e.message || e.name || String(e) : String(e);

@@ -156,6 +156,15 @@ export interface ToolContext {
     name: string;
     body: string;
   }) => Promise<'yes' | 'no' | 'cancel'>;
+  // Trust state of `cwd` resolved at session start (AGENTIC_CLI.md
+  // §9.1). Required so any future tool that needs trust info gets
+  // an explicit value rather than an undefined fallback that could
+  // silently allow privileged behavior. memory_write consumes this
+  // (MEMORY.md §7.2.1: `inferred` writes refused in untrusted
+  // cwds); `user_explicit` writes go through regardless. The
+  // default-true convention in tests' makeCtx mirrors the
+  // post-trust-prompt reality of the REPL flow.
+  isCwdTrusted: boolean;
 }
 
 // Inputs the `task` tool passes through to the harness's subagent

@@ -142,6 +142,69 @@ describe('memory_write tool — gating', () => {
     if (isToolError(result)) expect(result.error_code).toBe('memory.scanner_blocked');
   });
 
+  test('untrusted cwd + inferred source rejected before scanner', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const db = openMemoryDb();
+    migrate(db);
+    const sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    let modalCalls = 0;
+    const ctx = makeCtx({
+      memoryRegistry: reg,
+      sessionId,
+      isCwdTrusted: false,
+      confirmMemoryWrite: async () => {
+        modalCalls++;
+        return 'yes' as const;
+      },
+    });
+    const result = await memoryWriteTool.execute(validInput(), ctx);
+    expect(isToolError(result)).toBe(true);
+    if (isToolError(result)) expect(result.error_code).toBe('memory.untrusted_cwd');
+    // Modal must NOT have been opened — gate fires before modal step.
+    expect(modalCalls).toBe(0);
+    const events = listMemoryEventsByName(db, 'no-console-log');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.action).toBe('refused');
+    expect(events[0]?.details?.stage).toBe('trust_gate');
+    expect(events[0]?.details?.reason).toBe('cwd_untrusted');
+  });
+
+  test('untrusted cwd + user_explicit source PROCEEDS (operator-driven save)', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const db = openMemoryDb();
+    migrate(db);
+    const sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const ctx = makeCtx({
+      memoryRegistry: reg,
+      sessionId,
+      isCwdTrusted: false,
+      confirmMemoryWrite: async () => 'yes' as const,
+    });
+    const result = await memoryWriteTool.execute(validInput({ source: 'user_explicit' }), ctx);
+    if (isToolError(result)) {
+      throw new Error(`expected success, got ${result.error_code}: ${result.error_message}`);
+    }
+    expect(result.outcome).toBe('created');
+  });
+
+  test('trusted cwd + inferred source proceeds normally', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots });
+    const ctx = makeCtx({
+      memoryRegistry: reg,
+      isCwdTrusted: true,
+      confirmMemoryWrite: async () => 'yes' as const,
+    });
+    const result = await memoryWriteTool.execute(validInput(), ctx);
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    expect(result.outcome).toBe('created');
+  });
+
   test('injection phrase in description blocked (description goes into eager-loaded MEMORY.md)', async () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);

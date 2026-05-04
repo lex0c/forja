@@ -36,14 +36,29 @@ import type { MemoryRegistry } from '../memory/index.ts';
 // about which one wins — wasted tokens, wasted attention.
 //
 // Trust filtering (spec §7.2 mitigation 2) — memories with
-// `trust: untrusted` MUST NOT enter the base context. 5.2.c
-// does NOT load bodies during section assembly (eager-index
-// principle), so we can't read frontmatter to check trust per
-// entry. 5.4 lands the trust integration with index-side trust
-// markers OR a body preload pass; until then no production path
-// writes `trust: untrusted` (only the writer in 5.4 does), so
-// the gate is effectively a no-op now. Documented as a known
-// limitation in the BACKLOG entry.
+// `trust: untrusted` MUST NOT enter the base context, only on
+// demand via `memory_read`. The index file (`MEMORY.md`) has
+// no trust column per spec §3.2 ("uma linha por memória, sem
+// frontmatter próprio"), so the only way to know a memory's
+// trust state is to read the body. We accept the per-session
+// boot cost: N small disk reads at session start (memories are
+// short and few — typical operator has <50 entries across all
+// scopes) is negligible compared to the security win of
+// keeping untrusted content out of the eager prompt cache.
+// Reads go through `peek` instead of `read` so this filter
+// pass doesn't flood `memory_events` with system-internal
+// `read` rows.
+//
+// Failure modes when peek doesn't return a parseable file:
+//   - 'missing' / 'malformed' / 'unknown' → INCLUDE the index
+//     entry. Defaulting to "exclude on uncertainty" would
+//     silently hide hand-edited memories the operator created
+//     but couldn't have intended to mark untrusted (since
+//     we couldn't read the trust marker). The operator already
+//     sees malformed-body diagnostics elsewhere (audit table,
+//     /memory list when it lands).
+//   - 'present' + frontmatter.trust === 'untrusted' → SKIP.
+//   - 'present' + trust absent or 'trusted' → INCLUDE.
 
 const MEMORY_SECTION_HEADER = `# Memory
 
@@ -68,19 +83,48 @@ export interface AssembleMemorySectionResult {
 export const assembleMemorySection = (
   input: AssembleMemorySectionInput,
 ): AssembleMemorySectionResult => {
-  // Dedup so a `commit-style` shadowed across all three scopes
-  // shows up once (most-specific scope only). Model gets a clean
-  // view of "what's actually active for this session".
-  const listings = input.registry.list({ deduplicateByName: true });
-  if (listings.length === 0) {
+  // Order matters: filter trust BEFORE dedupe. Spec §7.2.2 marks
+  // trust per-MEMORY (not per-name), so an untrusted entry in
+  // `project_local` should NOT eclipse a trusted entry of the
+  // same name in `user`. Reversing the order (dedupe first) would
+  // keep the most-specific scope, drop it as untrusted, and
+  // silently lose the trusted shadow — wrong per spec.
+  //
+  // The non-deduped list comes back in precedence order
+  // (project_local → project_shared → user), so filtering then
+  // deduping by name keeps the first SURVIVING scope per name —
+  // which is the most-specific TRUSTED scope. That matches the
+  // user's intent: "promote the trusted shadow to active when the
+  // more-specific scope is marked untrusted".
+  const all = input.registry.list();
+  if (all.length === 0) {
     return { text: '', entryCount: 0 };
   }
-
-  const lines: string[] = [MEMORY_SECTION_HEADER, ''];
-  for (const l of listings) {
-    lines.push(`- [${l.scope}] ${l.name} — ${l.entry.hook}`);
+  // Spec §7.2.2 trust filter. peek() loads the body without
+  // emitting an audit row. See module header for the failure-mode
+  // rationale (uncertain → include).
+  const trusted = all.filter((l) => {
+    const peek = input.registry.peek(l.name, { scope: l.scope });
+    return !(peek.kind === 'present' && peek.file.frontmatter.trust === 'untrusted');
+  });
+  if (trusted.length === 0) {
+    // Every memory was filtered out. Same empty-shape as a
+    // registry that never had entries — bootstrap's length-zero
+    // check passes through cleanly.
+    return { text: '', entryCount: 0 };
   }
-  return { text: lines.join('\n'), entryCount: listings.length };
+  // Dedupe by name on the trust-filtered list. precedence order
+  // is preserved (most-specific surviving scope wins).
+  const seen = new Set<string>();
+  const lines: string[] = [MEMORY_SECTION_HEADER, ''];
+  let included = 0;
+  for (const l of trusted) {
+    if (seen.has(l.name)) continue;
+    seen.add(l.name);
+    lines.push(`- [${l.scope}] ${l.name} — ${l.entry.hook}`);
+    included++;
+  }
+  return { text: lines.join('\n'), entryCount: included };
 };
 
 // Compose the memory section onto an optional base prompt. The

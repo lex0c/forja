@@ -475,6 +475,48 @@ describe('createMemoryRegistry — reload', () => {
   });
 });
 
+describe('createMemoryRegistry — peek', () => {
+  let db: DB;
+  let sessionId: string;
+
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+    sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+  });
+
+  test('returns the file body without emitting a read audit row', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Role](role.md) — role\n');
+    writeMemory(roots.projectLocal, 'role', fmUser('role'), 'Body of role.\n');
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+    const result = reg.peek('role');
+    if (result.kind !== 'present') throw new Error(`expected present, got ${result.kind}`);
+    expect(result.scope).toBe('project_local');
+    expect(result.file.body).toBe('Body of role.\n');
+    // Crucially: NO audit row.
+    expect(listMemoryEventsByName(db, 'role')).toEqual([]);
+  });
+
+  test('returns unknown for missing name (no audit)', () => {
+    const repo = makeTmp();
+    const reg = createMemoryRegistry({ roots: makeRoots(repo), db, sessionId });
+    expect(reg.peek('nope').kind).toBe('unknown');
+    expect(listMemoryEventsByName(db, 'nope')).toEqual([]);
+  });
+
+  test('strict scope opt-in (no fallback)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Role](role.md) — user-scope\n');
+    writeMemory(roots.user, 'role', fmUser('role'), 'b');
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    expect(reg.peek('role', { scope: 'project_local' }).kind).toBe('unknown');
+    expect(reg.peek('role').kind).toBe('present');
+  });
+});
+
 describe('createMemoryRegistry — write', () => {
   let db: DB;
   let sessionId: string;

@@ -7,6 +7,7 @@ import type { Provider } from '../providers/index.ts';
 import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
+import { isTrusted, trustListPath } from '../trust/index.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithUserPrompt } from './plan-prompt.ts';
 
@@ -50,6 +51,16 @@ export interface BootstrapInput {
   // the permission-layer test seams above.
   userAgentsDir?: string | null;
   projectAgentsDir?: string | null;
+  // Test seam for trust-list discovery. Mirrors the REPL's
+  // `trustListPathOverride`:
+  //   - undefined → use `trustListPath()` (production default)
+  //   - null      → trust storage unavailable (cwd treated as
+  //                 untrusted, fail-closed)
+  //   - string    → use this path (test fixtures isolate from the
+  //                 user's real `~/.config/agent/trusted_dirs.json`)
+  // The resolved value drives `HarnessConfig.isCwdTrusted`, which
+  // memory_write's trust gate consumes (spec MEMORY.md §7.2.1).
+  trustListPathOverride?: string | null;
 }
 
 export interface BootstrapResult {
@@ -193,6 +204,26 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   // collide with the parent repo's.
   const bgLogDir = join(cwd, '.agent', 'bg');
 
+  // Resolve cwd trust state for downstream gates (today: memory_write
+  // refuses inferred writes in untrusted cwd, MEMORY.md §7.2.1). The
+  // REPL boot path runs the trust modal BEFORE calling bootstrap, so
+  // by the time we get here cwd is already in the persisted list (or
+  // the boot exited). One-shot mode (`agent "prompt"`) calls bootstrap
+  // directly with no trust modal — cwd may genuinely be untrusted.
+  // Either way, recompute here so the answer matches the live state
+  // of `trusted_dirs.json` at this moment.
+  //
+  // Fail-closed semantics:
+  //   - trustListPathOverride === null         → no trust storage
+  //                                              → isCwdTrusted=false
+  //   - trustListPath() returned null (XDG     → idem
+  //     paths unavailable on weird platform)
+  //   - file missing / corrupt / not in list   → false
+  //   - cwd in list                            → true
+  const trustPath =
+    input.trustListPathOverride !== undefined ? input.trustListPathOverride : trustListPath();
+  const isCwdTrusted = trustPath !== null && isTrusted(trustPath, cwd);
+
   const config: HarnessConfig = {
     provider,
     toolRegistry,
@@ -213,6 +244,7 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     // when there are simply no .md files yet.
     subagentRegistry: subagents,
     memoryRegistry,
+    isCwdTrusted,
     ...(input.budget !== undefined ? { budget: input.budget } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.plan === true ? { planMode: true } : {}),

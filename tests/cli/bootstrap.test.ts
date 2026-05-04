@@ -435,4 +435,67 @@ describe('bootstrap', () => {
     ).toThrow(/unknown model/);
     expect(existsSync(dbPath)).toBe(false);
   });
+
+  describe('isCwdTrusted resolution (MEMORY.md §7.2.1)', () => {
+    test('returns true when cwd is in the trust list', () => {
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(config.isCwdTrusted).toBe(true);
+      db.close();
+    });
+
+    test('returns false when cwd is absent from trust list', () => {
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: ['/other/path'] }));
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      db.close();
+    });
+
+    test('returns false when trust file is missing (storage absent)', () => {
+      const trustPath = join(workdir, 'never-created.json');
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      db.close();
+    });
+
+    test('returns false when trustListPathOverride is null (storage disabled)', () => {
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: null,
+      });
+      expect(config.isCwdTrusted).toBe(false);
+      db.close();
+    });
+  });
 });

@@ -357,6 +357,18 @@ export interface HarnessConfig {
     cwd: string;
     prompt: string;
   }) => Promise<boolean>;
+  // Trust state of `cwd` (AGENTIC_CLI.md §9.1, MEMORY.md §7.2.1).
+  // True when the cwd is in the persisted `trusted_dirs.json` at
+  // bootstrap time. False when storage is unavailable, the file
+  // is missing/corrupt, or the cwd hasn't been confirmed yet.
+  // Threaded through to `ToolContext.isCwdTrusted` so tools can
+  // self-gate when a path's trust matters (today only
+  // `memory_write` consumes it — refuses `inferred` writes in
+  // untrusted cwds). Defaults to false at the harness layer
+  // (fail-closed); production callers always set it from
+  // bootstrap, tests opt in via the makeCtx helper which
+  // defaults to true (post-trust-prompt reality).
+  isCwdTrusted?: boolean;
   // Async hook for memory_write modal confirmation (MEMORY.md §5.1).
   // Caller resolves with the operator's decision so the tool layer
   // can map it onto an audit row + the writer call. Per spec: 'yes'

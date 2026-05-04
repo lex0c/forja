@@ -15,6 +15,142 @@ Format:
 
 ---
 
+## [2026-05-04] M3 / impl — memory trust integration (closes spec §7.2.1, §7.2.2, §7.2.7-eager)
+
+Continues the memory subsystem in the same branch
+(`feat/m3-memory-write-modal`). The previous slice closed D182 (modal
+producer); this one closes the trust-related gates left as deferred
+gaps.
+
+**Done:**
+
+- **`HarnessConfig.isCwdTrusted` + `ToolContext.isCwdTrusted` threading.**
+  Bootstrap reads the live trust list (`trust_dirs.json`) at session
+  start and resolves `isCwdTrusted` from it. New `BootstrapInput.
+  trustListPathOverride?: string | null` test seam mirrors the REPL's
+  override pattern: `null` disables storage (fail-closed false),
+  string overrides the default `trustListPath()`. Harness loop
+  forwards the value into every `ToolContext`. ToolContext makes the
+  field REQUIRED (not optional) so any future ToolContext
+  construction has to think about it explicitly. Tests' `makeCtx`
+  defaults to `true` — mirrors the post-trust-prompt reality of the
+  REPL boot path.
+- **`memory_write` trust gate (§7.2.1).** New gate fires after the
+  `project_shared` reject and BEFORE the injection scanner. Logic:
+  if `!ctx.isCwdTrusted && source === 'inferred'` → refuse with
+  `memory.untrusted_cwd`, audit `refused` with stage='trust_gate',
+  reason='cwd_untrusted'. `user_explicit` source proceeds regardless
+  of trust state — the operator typed the proposal, so the trust
+  risk is moot. Modal is NOT opened on this path; refusing earlier
+  saves the operator a confirm they would have hit a brick wall on.
+  Defense-in-depth: the REPL boot path already forces trust before
+  reaching the harness, but one-shot mode (`agent "prompt"`) skips
+  the modal — without this gate a model running in a freshly-cloned
+  untrusted repo could persist `inferred` memories that future
+  sessions auto-load.
+- **Trust filter for eager-load (§7.2.2).** New `MemoryRegistry.peek`
+  loads bodies WITHOUT emitting a `read` audit row — used by
+  `assembleMemorySection` to filter `trust: untrusted` entries from
+  the system prompt. Index-format (§3.2) has no trust column, so
+  the only way to know a memory's trust state is to read the body;
+  we accept the per-session-boot cost (typical operator <50
+  memories total, all small files). System-internal load through
+  `peek` instead of `read` keeps `memory_events` clean of rows the
+  operator didn't trigger. Filter outcomes:
+    * `present` + `trust === 'untrusted'` → SKIP (memory still
+      reachable via explicit `memory_read`).
+    * `missing` / `malformed` / `unknown` → INCLUDE (uncertainty
+      defaults to "show", not "hide"; the alternative would silently
+      vanish hand-edited memories).
+    * `present` + trust absent or 'trusted' → INCLUDE.
+- **Tests:** 4 bootstrap (trust list resolution: in-list, absent-from-
+  list, missing file, override null), 8 memory-prompt (trust filter:
+  skip untrusted, include explicit-trusted, all-untrusted → empty
+  section, missing-body uncertainty includes, peek doesn't audit,
+  untrusted shadow doesn't eclipse trusted shadow in less-specific
+  scope, more-specific trusted scope still wins when less-specific
+  is untrusted, every-shadow-untrusted produces empty section), 3
+  registry (peek returns body without audit, peek unknown without
+  audit, strict scope opt-in), 3 memory_write (untrusted+inferred
+  refused before scanner, untrusted+user_explicit proceeds,
+  trusted+inferred proceeds). Total +17 across the slice; suite at
+  2485 pass / 0 fail.
+
+**Post-review fixes (2026-05-04):**
+
+- **Filter-before-dedupe in `assembleMemorySection`.** Initial cut
+  did `list({ deduplicateByName: true })` then trust-filter — but
+  spec §7.2.2 marks trust per-MEMORY (not per-name), so an
+  untrusted entry in `project_local` was eclipsing a trusted
+  entry of the same name in `user`, dropping BOTH from eager
+  context. Reordered to filter first then dedupe on the survivors;
+  precedence walk preserved (most-specific TRUSTED scope wins).
+  Added 3 regression tests covering the shadow cases (trusted
+  user shadow surfaces when local is untrusted; trusted local
+  wins when only user is untrusted; all-shadows-untrusted →
+  empty section).
+- **REPL forwards `trustListPathOverride` to bootstrap.** Test
+  paths using `runRepl({ trustListPathOverride })` with real
+  bootstrap (no `bootstrapOverride`) had divergence: REPL trusted
+  the test fixture, bootstrap used the dev's real
+  `~/.config/agent/trusted_dirs.json`, so `isCwdTrusted`
+  disagreed and memory_write rejected inferred unexpectedly.
+  Conditional spread keeps the prod default semantics
+  (undefined → bootstrap uses `trustListPath()`); null/string
+  forward verbatim.
+
+**Decisions:**
+
+- **`peek` as a separate method, not a `read({ noAudit: true })`
+  flag.** Audit-emission is a load-bearing semantic in this
+  subsystem — `read` always audits because the operator's
+  expectation is "every body load shows up in `/memory audit`". A
+  flag would invite "silent" reads that drift; a separate method
+  forces the caller to commit to "this is system-internal, never
+  surfaces in operator audit". Single source of truth for `read`'s
+  contract.
+- **`isCwdTrusted` REQUIRED on `ToolContext`, not optional.** Trust
+  state is a security input; defaulting to `false` (fail-closed) at
+  the type level would be safer, but tests would have to opt in
+  everywhere. Defaulting to `true` would silently allow
+  privileged behavior. Required + explicit `makeCtx` default
+  forces the test author to think about it OR accept the helper's
+  documented assumption (post-trust-prompt → trusted).
+- **`user_explicit` writes proceed in untrusted cwd.** Spec §7.2.1
+  reads "inferred writes ficam disabled by default" — explicit
+  writes are out of scope of the gate. The operator's act of
+  typing the proposal IS the trust signal. Audit table still gets
+  the row so /memory audit can spot "operator saved memories in
+  untrusted cwd" patterns.
+- **Trust filter happens at peek-time, not at index-load time.**
+  `loadScopeIndex` doesn't read bodies; we don't change that
+  invariant. The filter is layered on at the consumer
+  (`assembleMemorySection`). Future consumers (memory_search
+  results, /memory list output) get the same primitive when they
+  want it.
+- **`assembleMemorySection` returns empty when EVERY entry is
+  untrusted.** Header + zero entries would render as a misleading
+  "memory section exists but is empty"; empty text + bootstrap's
+  length-zero check passes through cleanly so the operator's
+  base prompt is unchanged. Mirrors the no-registry-entries path.
+
+**Out of scope (still tracked):**
+
+- **§7.2.7 visual marker on loaded untrusted** (`[memory: untrusted]`
+  in UI). Today untrusted memories don't reach base context (this
+  slice). When operator explicitly `memory_read`s an untrusted
+  memory, the UI should mark it. Lands in Slice F (footer / UI
+  visibility).
+- **Trust-untrusted marking on inferred-write-in-untrusted (§7.2.2
+  half 2).** The "if accept inferred in untrusted, frontmatter gets
+  trust: untrusted" path requires an opt-in flag like
+  `--allow-inferred-writes-in-untrusted` that doesn't exist yet.
+  Today we hard-block inferred writes in untrusted cwd; the marking
+  path is unreachable. Lands when an opt-in flag arrives.
+- **§7.2.5 Double-prompt user-scope.** Slice C territory.
+
+---
+
 ## [2026-05-04] M3 / impl — memory write modal producer (closes D182)
 
 Modal `memory:write:ask` had reducer + render wired since the M2 modal-

@@ -87,6 +87,16 @@ export interface MemoryRegistry {
   // session and wants the current session's view to refresh).
   reload(): void;
 
+  // Load a body WITHOUT emitting a `read` audit row. Used by
+  // session-internal callers (today: `assembleMemorySection` in
+  // memory-prompt.ts, which checks `trust: untrusted` to filter
+  // eager-load — spec MEMORY.md §7.2.2). Auditing every system-
+  // internal load would flood `memory_events` with rows the
+  // operator didn't trigger, defeating the audit table's purpose
+  // (signal the operator's interactions). Returns the same
+  // discriminated shape as `read()`.
+  peek(name: string, opts?: ScopeOption): RegistryReadResult;
+
   // Persist a new memory after the producer (tool layer) has
   // already gated injection scanning + headless rejection +
   // operator confirmation. Calls `writeMemory` (sandbox-checked,
@@ -399,6 +409,23 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
           ...(opts.auditSessionId !== undefined ? { auditSessionId: opts.auditSessionId } : {}),
           ...(opts.auditCwd !== undefined ? { auditCwd: opts.auditCwd } : {}),
         });
+        return { kind: 'present', scope: listing.scope, file: fileResult.file };
+      }
+      if (fileResult.kind === 'missing') {
+        return { kind: 'missing', scope: listing.scope };
+      }
+      return { kind: 'malformed', scope: listing.scope, error: fileResult.error };
+    },
+
+    peek(name, opts: ScopeOption = {}): RegistryReadResult {
+      // Mirrors `read` but skips `auditRead`. Same lookup
+      // semantics (precedence walk if `opts.scope` absent, strict
+      // single-scope when set). Same discriminated outcome shape
+      // so callers can branch identically.
+      const listing = findListing(name, opts.scope);
+      if (listing === null) return { kind: 'unknown' };
+      const fileResult = readMemoryByName(roots, listing.scope, name);
+      if (fileResult.kind === 'present') {
         return { kind: 'present', scope: listing.scope, file: fileResult.file };
       }
       if (fileResult.kind === 'missing') {

@@ -1091,6 +1091,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ...(config.confirmMemoryWrite !== undefined
               ? { confirmMemoryWrite: config.confirmMemoryWrite }
               : {}),
+            // Trust state — required on ToolContext, optional on
+            // HarnessConfig. Default-false at the harness layer is
+            // the fail-closed answer when bootstrap (or a test
+            // harness) didn't supply one.
+            isCwdTrusted: config.isCwdTrusted ?? false,
           };
 
           safeEmit(config.onEvent, {

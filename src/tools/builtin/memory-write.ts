@@ -266,6 +266,36 @@ export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
       );
     }
 
+    // 4b'. Trust gate (MEMORY.md §7.2.1): inferred writes refused
+    // when cwd is untrusted. The fired-at-boot trust modal usually
+    // makes this unreachable in REPL flows (cwd gets persisted
+    // BEFORE bootstrap runs), but one-shot mode (`agent "prompt"`)
+    // bypasses the modal — without this gate, a model running in
+    // a freshly-cloned untrusted repo could persist `inferred`
+    // memories that future sessions auto-load. user_explicit
+    // writes proceed regardless: the operator typed the proposal
+    // themselves, so the trust risk is moot. Audited as
+    // `refused` stage='trust_gate' so an operator inspecting
+    // /memory audit can spot the pattern.
+    if (!ctx.isCwdTrusted && source === 'inferred') {
+      registry.recordEvent({
+        action: 'refused',
+        scope,
+        memoryName: args.name,
+        source,
+        details: { stage: 'trust_gate', reason: 'cwd_untrusted' },
+        auditSessionId: ctx.sessionId,
+        auditCwd: ctx.cwd,
+      });
+      return toolError(
+        'memory.untrusted_cwd',
+        `cwd is not trusted; refusing to persist inferred memory ${JSON.stringify(args.name)}`,
+        {
+          hint: 'Trust the directory at boot, or have the operator phrase the save as user_explicit.',
+        },
+      );
+    }
+
     // 4b. Injection / secret scanner. Spec §7.3 names the body as
     // the scanned surface, but the description ALSO lands in
     // MEMORY.md and is read eager into the next session's system
