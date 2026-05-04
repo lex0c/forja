@@ -445,11 +445,20 @@ export const dispatchChain = async (
       break;
     }
     if ((result.kind === 'error' || result.kind === 'timeout') && result.shouldBlock) {
-      blockedBy = {
-        spec,
-        reason: result.kind === 'timeout' ? 'silent' : 'message',
-        message: result.kind === 'error' ? result.reason : null,
-      };
+      // Fail-closed error / timeout → block as `silent`. Per
+      // `HookRunResult.shouldBlock` contract in types.ts:198 +
+      // 204: "caller treats this as block_silent for blockable
+      // events". A misbehaving hook that crashed or hung is an
+      // OPERATIONAL signal — leaking its internal exit-code or
+      // crash reason into the model-facing message would (a)
+      // break the silent-block contract documented for
+      // failClosed and (b) hand the model arbitrary operator-
+      // side text it has no business consuming. Audit row in
+      // hook_runs still carries the full reason / exit code for
+      // the operator's forensic queries; only the
+      // `chain.blockedBy.message` (which propagates to the
+      // model) is sanitized to null.
+      blockedBy = { spec, reason: 'silent', message: null };
       break;
     }
     // allow / non-failClosed error — continue to next.

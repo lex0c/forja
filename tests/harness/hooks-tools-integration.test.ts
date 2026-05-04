@@ -283,6 +283,71 @@ describe('hooks Slice 3 — PreToolUse', () => {
     const pre = runs.filter((r) => r.event === 'PreToolUse');
     expect(pre[0]?.outcome).toBe('error');
     expect(pre[0]?.exitCode).toBe(7);
+
+    // Sanity-revert: fail-closed errors must propagate as
+    // SILENT blocks (HookRunResult.shouldBlock contract,
+    // types.ts:198). An earlier cut leaked the dispatcher's
+    // internal `result.reason` ("hook exited with code 7")
+    // into chain.blockedBy.message — operator hook misbehavior
+    // would surface inside the model-facing "denied by hook:
+    // ..." string and inside the audit-reason tail.
+    //
+    // Audit reason should END with "(silent)" not with the
+    // exit-code text; the approval row mirrors what the model
+    // saw.
+    const messages = listMessagesBySession(db, result.sessionId);
+    const assistant = messages.find((m) => m.role === 'assistant');
+    const toolCalls = listToolCallsByMessage(db, assistant?.id ?? '');
+    const approvals = listApprovalsByToolCall(db, toolCalls[0]?.id ?? '');
+    const hookApproval = approvals.find((a) => a.decidedBy === 'hook');
+    expect(hookApproval?.reason).toContain('(silent)');
+    expect(hookApproval?.reason).not.toContain('exit');
+    expect(hookApproval?.reason).not.toContain('code 7');
+  });
+
+  test('timeout + failClosed=true → blocks as silent (no internal text leak)', async () => {
+    const calls: { args: Record<string, unknown> }[] = [];
+    const tool = makeRecordingTool(calls);
+    const registry = createToolRegistry();
+    registry.register(tool);
+
+    const hooks: HookSpec[] = [
+      baseSpec({
+        event: 'PreToolUse',
+        command: 'sleep 5',
+        timeoutMs: 100,
+        failClosed: true,
+      }),
+    ];
+    const config: HarnessConfig = {
+      provider: mockProvider([
+        {
+          tool_uses: [{ id: 'tu1', name: 'echo', input: {} }],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ]),
+      toolRegistry: registry,
+      permissionEngine: createPermissionEngine(policy(), { cwd: scratch }),
+      db,
+      cwd: scratch,
+      userPrompt: 'go',
+      hooks,
+    };
+    const result = await runAgent(config);
+    expect(result.status).toBe('done');
+    expect(calls).toEqual([]);
+
+    const runs = listHookRunsBySession(db, result.sessionId);
+    const pre = runs.filter((r) => r.event === 'PreToolUse');
+    expect(pre[0]?.outcome).toBe('timeout');
+    // Same sanity-revert as the error+failClosed case.
+    const messages = listMessagesBySession(db, result.sessionId);
+    const assistant = messages.find((m) => m.role === 'assistant');
+    const toolCalls = listToolCallsByMessage(db, assistant?.id ?? '');
+    const approvals = listApprovalsByToolCall(db, toolCalls[0]?.id ?? '');
+    const hookApproval = approvals.find((a) => a.decidedBy === 'hook');
+    expect(hookApproval?.reason).toContain('(silent)');
   });
 
   test('error + failClosed=false → does NOT block (log only)', async () => {

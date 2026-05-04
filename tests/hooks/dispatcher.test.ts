@@ -435,7 +435,12 @@ describe('dispatchChain — blocking events', () => {
     expect(result.blockedBy?.message).toBe('forbidden tool');
   });
 
-  test('failClosed error blocks the chain on a blocking event', async () => {
+  test('failClosed error blocks the chain on a blocking event (silent)', async () => {
+    // Per HookRunResult.shouldBlock contract (types.ts:198), a
+    // fail-closed error must propagate as `block_silent` — never
+    // leak the dispatcher's internal `result.reason` text into
+    // the model-facing chain.blockedBy.message. Internal exit
+    // codes / crash strings stay in the audit row only.
     const fake = makeFakeSpawn({ exitCode: 5 });
     const hooks = [
       makeSpec({ event: 'PreToolUse', command: 'h1', failClosed: true }),
@@ -450,7 +455,8 @@ describe('dispatchChain — blocking events', () => {
     const result = await dispatchChain(hooks, payload, '/cwd', { spawn: fake });
     expect(result.runs).toHaveLength(1);
     expect(result.blockedBy?.spec.command).toBe('h1');
-    expect(result.blockedBy?.message).toContain('exited with code 5');
+    expect(result.blockedBy?.reason).toBe('silent');
+    expect(result.blockedBy?.message).toBeNull();
   });
 
   test('non-failClosed error continues to next hook', async () => {
