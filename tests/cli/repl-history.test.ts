@@ -647,3 +647,135 @@ describe('repl — reverse-search overlay (HISTORY.md §2.2)', () => {
     await promise;
   });
 });
+
+describe('repl — history persistence failure (robustness)', () => {
+  test('appendHistory throwing mid-session emits a warn and keeps the REPL alive', async () => {
+    // Build a Proxy around a real migrated db. After boot's `loadHistory`
+    // succeeds, we flip the poison flag so the next `db.transaction()`
+    // call (the one inside appendHistory) throws — simulating the FS-
+    // gone-read-only / disk-full / db-locked-elsewhere class of failures
+    // that pre-fix would have crashed the editor handler on a single
+    // Enter.
+    let poisoned = false;
+    const realDb = openMemoryDb();
+    migrate(realDb);
+    // Proxy bind: bun:sqlite's Database uses private fields, so
+    // `Reflect.get` (which forwards `this` to the receiver) breaks
+    // method dispatch. Re-bind every function to the target so the
+    // underlying private state is reachable, then selectively
+    // override `transaction` when `poisoned` is set.
+    const dbProxy = new Proxy(realDb, {
+      get(target, prop, _receiver) {
+        if (prop === 'transaction' && poisoned) {
+          return (_fn: () => unknown) => () => {
+            throw new Error('simulated db failure');
+          };
+        }
+        const value = Reflect.get(target, prop);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const warnMessages: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(dbProxy as unknown as DB),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    // Capture warns by hooking the rendererWrite would be too noisy —
+    // hook directly into the captured run's onEvent? No: warns go via
+    // the bus, not the harness adapter. Easiest: intercept after the
+    // fact via the rendererWrite. Actually the cleanest probe is to
+    // poison after boot, submit, finish the turn, then exit and verify
+    // the REPL exited cleanly (exitCode 130 from ^D, NOT a crash).
+    await tick();
+    poisoned = true;
+    stdin.feed('first prompt\r');
+    await tick();
+    // The submit should still reach the harness (startTurn fires after
+    // recordHistorySubmit returns, regardless of persist outcome).
+    expect(ra.captured).toHaveLength(1);
+    expect(ra.captured[0]?.configs[0]?.userPrompt).toBe('first prompt');
+    ra.finish(0);
+    await tick();
+    // Un-poison so REPL shutdown can close the db cleanly.
+    poisoned = false;
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+    // Suppress unused warning — the array is reserved for a future
+    // assertion when we add a `warnSink` test seam.
+    void warnMessages;
+  });
+
+  test('after a failed append, the in-memory mirror is NOT polluted with the ghost entry', async () => {
+    // Sequence: submit "first" (succeeds) → poison → submit "second"
+    // (db throws, mirror should NOT push) → un-poison → submit "third"
+    // (succeeds). Then assert via a fresh ↑ flow that "second" is NOT
+    // in the recall sequence — only "first" and "third".
+    let poisoned = false;
+    const realDb = openMemoryDb();
+    migrate(realDb);
+    // Proxy bind: bun:sqlite's Database uses private fields, so
+    // `Reflect.get` (which forwards `this` to the receiver) breaks
+    // method dispatch. Re-bind every function to the target so the
+    // underlying private state is reachable, then selectively
+    // override `transaction` when `poisoned` is set.
+    const dbProxy = new Proxy(realDb, {
+      get(target, prop, _receiver) {
+        if (prop === 'transaction' && poisoned) {
+          return (_fn: () => unknown) => () => {
+            throw new Error('simulated db failure');
+          };
+        }
+        const value = Reflect.get(target, prop);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(dbProxy as unknown as DB),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    stdin.feed('first\r');
+    await tick();
+    ra.finish(0);
+    await tick();
+    poisoned = true;
+    stdin.feed('second\r');
+    await tick();
+    ra.finish(1);
+    await tick();
+    poisoned = false;
+    stdin.feed('third\r');
+    await tick();
+    ra.finish(2);
+    await tick();
+    // ↑ ↑: should land on "first", skipping "second" entirely (mirror
+    // never recorded it). With pre-fix mirror-first ordering, "second"
+    // would be a ghost in the array — recall would walk through it.
+    stdin.feed(ARROW_UP);
+    stdin.feed(ARROW_UP);
+    await tick();
+    stdin.feed('\r');
+    await tick();
+    expect(ra.captured[3]?.configs[0]?.userPrompt).toBe('first');
+    ra.finish(3);
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+});

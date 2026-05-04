@@ -478,17 +478,39 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     historyIdx = null;
     historyScratch = null;
     if (!historyEnabled) return;
-    // Mirror the dup-of-last suppression that storage applies, so the
-    // in-memory array stays consistent with the table without a
-    // re-load. (storage's `appendHistory` is the source of truth on
-    // disk; this just keeps recall responsive.) Empty text never
-    // reaches this path — applyKey gates submit on `value === ''`
-    // and the slash dispatcher gates on parsed.name === '' — so we
-    // don't defend against it here.
+
+    // Persist FIRST, then mirror in memory. Two robustness reasons:
+    //
+    //   1. SQLite can throw mid-session — disk full, db locked by an
+    //      external process, FS gone read-only. The pre-fix code let
+    //      that throw bubble out to the editor handler and crash the
+    //      REPL on a single Enter. Wrapping with try/catch keeps the
+    //      session alive: operator sees a warn, the submit still
+    //      reaches the harness (startTurn fires after this helper
+    //      returns), but the prompt isn't recallable on next boot.
+    //
+    //   2. Mirror-after-success means a failed db append leaves the
+    //      mirror untouched. Without that, the array would carry a
+    //      ghost entry the operator could recall via ↑ — entries that
+    //      vanish silently on REPL restart, which is exactly the kind
+    //      of "did I really type that?" surprise we want to avoid.
+    //
+    // Empty text never reaches this path — applyKey gates submit on
+    // `value === ''` and the slash dispatcher gates on parsed.name === ''.
+    try {
+      appendHistory(db, baseConfig.cwd, text);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      bus.emit({
+        type: 'warn',
+        ts: now(),
+        message: `history not persisted: ${msg} (this submit will not be recallable next boot)`,
+      });
+      return;
+    }
     if (historyEntries[historyEntries.length - 1] !== text) {
       historyEntries.push(text);
     }
-    appendHistory(db, baseConfig.cwd, text);
   };
 
   // ─── Reverse-search overlay (HISTORY.md §2.2) ──────────────────────
