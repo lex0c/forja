@@ -919,7 +919,31 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     history: {
       isEnabled: () => historyEnabled,
       setEnabled: (enabled) => {
+        // Transition disabled → enabled has to re-sync the in-memory
+        // mirror with storage, otherwise ↑/↓ and Ctrl+R stay empty
+        // until process restart. Two scenarios this fixes:
+        //
+        //   1. Boot with `.agent/no-history` marker present →
+        //      `loadHistory` no-opped, mirror seeded as []. Operator
+        //      removes the marker (or it was created by some other
+        //      REPL post-boot), runs /history on. Without the
+        //      reload, recall would show nothing even though the
+        //      table holds the project's full history.
+        //
+        //   2. /history off → another REPL appends a few entries →
+        //      /history on. The reload also captures concurrent
+        //      writes that landed during the off window.
+        //
+        // Cap-bounded query, so the reload cost is the same as the
+        // boot's initial load. Nav state is reset so a recall begun
+        // before /history off doesn't carry into the new mirror.
+        const becomingEnabled = !historyEnabled && enabled;
         historyEnabled = enabled;
+        if (becomingEnabled) {
+          historyEntries = loadHistory(db, baseConfig.cwd);
+          historyIdx = null;
+          historyScratch = null;
+        }
       },
       clearLocal: () => {
         historyEntries = [];

@@ -9,6 +9,9 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { EventEmitter } from 'node:events';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { ParsedArgs } from '../../src/cli/args.ts';
 import type { BootstrapResult } from '../../src/cli/bootstrap.ts';
 import { runRepl } from '../../src/cli/repl.ts';
@@ -648,6 +651,124 @@ describe('repl — reverse-search overlay (HISTORY.md §2.2)', () => {
   });
 });
 
+describe('repl — /history on reload (boot disabled → re-enable)', () => {
+  test('boot with .agent/no-history present + entries in db; /history on after marker removal repopulates the mirror', async () => {
+    // Pre-stage: entries already in the db (operator was using history
+    // before opting out via the marker), then create the marker so
+    // boot starts with persistence disabled.
+    const realRoot = mkdtempSync(join(tmpdir(), 'forja-history-reload-'));
+    try {
+      const dbForBoot = openMemoryDb();
+      migrate(dbForBoot);
+      appendHistory(dbForBoot, realRoot, 'old-prompt-one', { ts: 1 });
+      appendHistory(dbForBoot, realRoot, 'old-prompt-two', { ts: 2 });
+      mkdirSync(join(realRoot, '.agent'), { recursive: true });
+      writeFileSync(join(realRoot, '.agent', 'no-history'), '');
+
+      // Build a bootstrap stub pointing at this real path so storage's
+      // file-marker check resolves correctly.
+      const bootstrapForReload: BootstrapResult = {
+        config: {
+          cwd: realRoot,
+          userPrompt: '',
+          budget: { ...DEFAULT_BUDGET },
+          enableCheckpoints: false,
+          provider: {
+            id: 'mock/m',
+            capabilities: { context_window: 200000, output_max_tokens: 4096 },
+          },
+        } as unknown as HarnessConfig,
+        db: dbForBoot,
+        modelId: 'mock/m',
+        policyLayers: [],
+        lockConflicts: [],
+        subagents: { byName: new Map(), shadows: [] } as unknown as BootstrapResult['subagents'],
+      };
+
+      const stdin = makeStdin();
+      const ra = makeRunAgent();
+      const promise = runRepl({
+        args: makeArgs(),
+        bootstrapOverride: bootstrapForReload,
+        stdin,
+        skipTtyCheck: true,
+        skipTrustPrompt: true,
+        runAgentOverride: ra.runAgent,
+        rendererWrite: () => undefined,
+      });
+      await tick();
+      // Sanity: ↑ at this point would be a no-op since the mirror is
+      // empty (storage's loadHistory honored the marker). Skip the
+      // explicit assertion — the post-on recall is the load-bearing
+      // signal.
+      // Operator removes the marker (out-of-band, e.g. via shell) and
+      // runs /history on; the command must reload the mirror.
+      rmSync(join(realRoot, '.agent', 'no-history'));
+      stdin.feed('/history on\r');
+      await tick();
+      // ↑ should now recall the most-recent pre-existing entry.
+      stdin.feed(ARROW_UP);
+      await tick();
+      stdin.feed('\r');
+      await tick();
+      expect(ra.captured[0]?.configs[0]?.userPrompt).toBe('old-prompt-two');
+      ra.finish(0);
+      await tick();
+      stdin.feed('\x04');
+      await promise;
+    } finally {
+      rmSync(realRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('off → concurrent write by another REPL → on reloads and surfaces the new entry', async () => {
+    // Single shared db simulates two REPLs in the same project. We
+    // don't actually boot REPL B; we simulate its writes by calling
+    // appendHistory directly while REPL A has /history off.
+    //
+    // Slash-command submits persist (recordHistorySubmit fires for
+    // both `/history off` and the rest), so the simulated REPL B
+    // write needs a ts strictly greater than Date.now() to remain
+    // newest after the load reorders by `ts DESC, id DESC`. Using
+    // `Date.now() + 1e6` (~16 minutes in the future) safely beats
+    // anything the slash submits can stamp during this test.
+    const farFutureTs = Date.now() + 1_000_000;
+    appendHistory(db, PROJECT_CWD, 'baseline', { ts: 1 });
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    // /history off — REPL A's flag goes false.
+    stdin.feed('/history off\r');
+    await tick();
+    // Simulated REPL B append while A is off — ts pinned beyond any
+    // wall-clock value the slash submits use, so it's strictly newest.
+    appendHistory(db, PROJECT_CWD, 'from-other-repl', { ts: farFutureTs });
+    // /history on — A's mirror reloads, picking up B's entry.
+    stdin.feed('/history on\r');
+    await tick();
+    // ↑ should surface the most-recent (other REPL's write).
+    stdin.feed(ARROW_UP);
+    await tick();
+    stdin.feed('\r');
+    await tick();
+    expect(ra.captured[0]?.configs[0]?.userPrompt).toBe('from-other-repl');
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+});
+
 describe('repl — reverse-search emergency stop (Ctrl+C / Ctrl+D)', () => {
   test('Ctrl+D while overlay is open + idle: exits 130, overlay closes', async () => {
     appendHistory(db, PROJECT_CWD, 'something', { ts: 1 });
@@ -705,7 +826,7 @@ describe('repl — reverse-search emergency stop (Ctrl+C / Ctrl+D)', () => {
     await tick();
     expect(softSignal?.aborted).toBe(true);
     // Cleanup.
-    ra.finish(0, { status: 'interrupted', reason: 'aborted' });
+    ra.finish(0);
     await tick();
     stdin.feed('\x04');
     await promise;
