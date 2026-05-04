@@ -68,6 +68,7 @@ const makeBootstrapStubWithDb = (db: DB): BootstrapResult => {
     policyLayers: [],
     lockConflicts: [],
     subagents: { byName: new Map(), shadows: [] } as unknown as BootstrapResult['subagents'],
+    hookWarnings: [],
   };
 };
 
@@ -846,6 +847,7 @@ describe('repl — /history on reload (boot disabled → re-enable)', () => {
         policyLayers: [],
         lockConflicts: [],
         subagents: { byName: new Map(), shadows: [] } as unknown as BootstrapResult['subagents'],
+        hookWarnings: [],
       };
 
       const stdin = makeStdin();

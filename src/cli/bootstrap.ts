@@ -1,5 +1,6 @@
 import { join } from 'node:path';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
+import { type HookConfigWarning, resolveHookConfig, resolveHookPaths } from '../hooks/index.ts';
 import {
   createMemoryRegistry,
   evaluateBootTriggers,
@@ -87,6 +88,12 @@ export interface BootstrapResult {
   // `byName` for resolution. Empty when no .md files are found
   // anywhere.
   subagents: SubagentSet;
+  // Per-layer warnings emitted by the hooks loader (spec
+  // AGENTIC_CLI.md §10.4): missing matcher fields, unknown event
+  // names, locked-section conflicts, parse errors. Empty in the
+  // happy path. CLI driver renders them on stderr alongside the
+  // policy lockConflicts warnings.
+  hookWarnings: readonly HookConfigWarning[];
 }
 
 // Build a HarnessConfig from environment + cwd + args. This is the main
@@ -167,6 +174,7 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
 
   let resolvedSystemPrompt: string | undefined;
   let memoryRegistry: ReturnType<typeof createMemoryRegistry>;
+  let resolvedHooks: ReturnType<typeof resolveHookConfig>;
   try {
     migrate(db);
 
@@ -249,6 +257,16 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
       bootContext,
     });
     resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text);
+
+    // Hooks subsystem (spec AGENTIC_CLI.md §10). Resolved inside
+    // the same try-block as memory so any throw — TOML parse
+    // error, fs EACCES on the user-scope hook file, etc. — is
+    // funneled into db.close() before the rethrow. Otherwise
+    // the SQLite handle (and its WAL files) leak. Reuses the
+    // `repoRoot` already computed for memory; the project layer
+    // probes `<repoRoot>/.agent/hooks.toml`.
+    const hookPaths = resolveHookPaths(repoRoot);
+    resolvedHooks = resolveHookConfig(hookPaths);
   } catch (e) {
     db.close();
     throw e;
@@ -302,6 +320,12 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     subagentRegistry: subagents,
     memoryRegistry,
     isCwdTrusted,
+    // Hooks resolved at boot (spec AGENTIC_CLI.md §10). When the
+    // list is empty (no config files exist) we still pass the
+    // empty array — the harness's loop is unconditional, the
+    // chain-filter is the no-op when there are no hooks for the
+    // event.
+    hooks: resolvedHooks.hooks,
     ...(input.budget !== undefined ? { budget: input.budget } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.plan === true ? { planMode: true } : {}),
@@ -319,5 +343,6 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     policyLayers,
     lockConflicts: resolved.lockConflicts,
     subagents,
+    hookWarnings: resolvedHooks.warnings,
   };
 };

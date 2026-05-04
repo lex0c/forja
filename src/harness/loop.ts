@@ -5,6 +5,7 @@ import {
   createCheckpointManager,
   detectCheckpointSupport,
 } from '../checkpoints/index.ts';
+import { type HookEventPayload, dispatchChain } from '../hooks/index.ts';
 import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
@@ -228,15 +229,44 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     return `cumulative cost $${cumulative.toFixed(6)} exceeded cap $${budget.maxCostUsd.toFixed(6)}`;
   };
 
+  // Hook chain dispatch (spec AGENTIC_CLI.md §10). All sites
+  // funnel through this helper so the dispatcher's deps (db,
+  // sessionId, cwd) are bound consistently and stray exceptions
+  // never leak past the harness boundary. Spec §10.3 line 1041:
+  // non-blocking events run fire-and-forget WRT decisions, but
+  // we still await here so the audit row lands before the
+  // session row is closed at finish() — without that, a
+  // legitimate hook execution can disappear from `hook_runs`
+  // because the DB closes underneath it. The wall-clock cap
+  // (15s) inside the dispatcher protects against runaway hooks
+  // adding latency to session boot or shutdown.
+  const fireHookChain = async (payload: HookEventPayload): Promise<void> => {
+    if (config.hooks === undefined || config.hooks.length === 0) return;
+    try {
+      await dispatchChain(config.hooks, payload, config.cwd, {
+        db: config.db,
+        sessionId: sessionId.length > 0 ? sessionId : null,
+      });
+    } catch (err) {
+      // Defense-in-depth: dispatchChain wraps each hook's error
+      // already, but a programming bug in the dispatcher itself
+      // (or a synchronous throw before the per-hook try/catch
+      // started) shouldn't crash the harness. Log to stderr so
+      // the operator notices.
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`hooks: chain dispatch failed for ${payload.event}: ${msg}\n`);
+    }
+  };
+
   // `abortCause` is only meaningful when reason === 'aborted'; ignored
   // otherwise. Callers thread it from the abort site that knew which
   // signal fired (hard signal.aborted vs softStopSignal.aborted) so
   // the result carries the discriminator audit / telemetry needs.
-  const finish = (
+  const finish = async (
     reason: ExitReason,
     detail?: string,
     abortCause?: 'soft' | 'hard',
-  ): HarnessResult => {
+  ): Promise<HarnessResult> => {
     clearTimeout(wallClockTimer);
     // Skip completeSession when init failed before createSession — there's
     // no row to mark and SQLite would just throw a foreign-key error.
@@ -277,6 +307,34 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     if (reason === 'aborted' && abortCause !== undefined) {
       result.abortCause = abortCause;
     }
+    // Stop hooks (spec AGENTIC_CLI.md §10.1). Fired AFTER the
+    // session row is marked complete and the result struct is
+    // built — so the operator's hook can read the final row /
+    // status as authoritative — but BEFORE the renderer sees
+    // session_finished, so any "session ended at $cost"
+    // notification from a Stop hook lands while the UI is still
+    // around. Audit is awaited; latency is bounded by the
+    // dispatcher's MAX_HOOK_CHAIN_MS.
+    //
+    // Skipped on init-fail paths where createSession never
+    // landed (`sessionId === ''`) — the spec contract on
+    // HookEventPayload promises a non-empty sessionId, and
+    // there's no real session for the operator's Stop hook to
+    // act on. Mirrors the symmetric guard around SessionStart
+    // (which only fires after the session_start emit, by which
+    // point sessionId is guaranteed set).
+    if (sessionId.length > 0) {
+      await fireHookChain({
+        schema: 'v1',
+        event: 'Stop',
+        sessionId,
+        data: {
+          durationMs: result.durationMs,
+          costUsd: result.costUsd,
+          steps: result.steps,
+        },
+      });
+    }
     safeEmit(config.onEvent, { type: 'session_finished', result });
     return result;
   };
@@ -295,15 +353,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // `internalError` — operator-initiated termination shouldn't look
   // like a harness bug in audit. Wall-clock timeout takes precedence
   // (matches the in-loop check).
-  const guardedFinish = (e: unknown): HarnessResult => {
+  const guardedFinish = async (e: unknown): Promise<HarnessResult> => {
     usageComplete = false;
     const detail = e instanceof Error ? e.message || e.name || String(e) : String(e);
     if (signal.aborted) {
       return isWallClockTimeout()
-        ? finish('maxWallClockMs', detail)
-        : finish('aborted', detail, 'hard');
+        ? await finish('maxWallClockMs', detail)
+        : await finish('aborted', detail, 'hard');
     }
-    return finish('internalError', detail);
+    return await finish('internalError', detail);
   };
 
   // Init writes (createSession + initial appendMessage) live INSIDE the
@@ -641,12 +699,28 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           reason: checkpointsUnavailableReason,
         });
       }
+      // SessionStart hooks (spec AGENTIC_CLI.md §10.1). Fired
+      // AFTER the renderer sees session_start so the operator's
+      // hook is bracketed inside the visible session — a hook
+      // that prints to stdout doesn't land before the UI's
+      // session header. Awaited so audit lands; latency capped
+      // by the dispatcher's chain timeout.
+      await fireHookChain({
+        schema: 'v1',
+        event: 'SessionStart',
+        sessionId,
+        data: {
+          cwd: config.cwd,
+          model: config.provider.id,
+          profile: config.planMode === true ? 'plan' : 'default',
+        },
+      });
 
       while (true) {
         if (signal.aborted) {
           return isWallClockTimeout()
-            ? finish('maxWallClockMs')
-            : finish('aborted', undefined, 'hard');
+            ? await finish('maxWallClockMs')
+            : await finish('aborted', undefined, 'hard');
         }
         // Cooperative stop: spec UI.md §3 soft interrupt. The check
         // sits at the top of the loop so the just-completed step's
@@ -656,9 +730,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // operator already cancelled. Distinct from the hard signal
         // above — soft never preempts in-flight work.
         if (config.softStopSignal?.aborted) {
-          return finish('aborted', undefined, 'soft');
+          return await finish('aborted', undefined, 'soft');
         }
-        if (steps >= budget.maxSteps) return finish('maxSteps');
+        if (steps >= budget.maxSteps) return await finish('maxSteps');
         // Cost cap pre-check. Critical on resume: a session whose
         // priorCostUsd already crossed budget.maxCostUsd would
         // otherwise issue one billed provider call before the
@@ -669,7 +743,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // and never reach this branch on a subsequent iteration.
         {
           const overage = costCapDetailIfExceeded();
-          if (overage !== null) return finish('maxCostUsd', overage);
+          if (overage !== null) return await finish('maxCostUsd', overage);
         }
 
         steps += 1;
@@ -737,13 +811,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // next step boundary).
           if (signal.aborted) {
             return isWallClockTimeout()
-              ? finish('maxWallClockMs')
-              : finish('aborted', undefined, 'hard');
+              ? await finish('maxWallClockMs')
+              : await finish('aborted', undefined, 'hard');
           }
           const cause = e instanceof CollectStepError ? e.cause : e;
           const detail =
             cause instanceof Error ? cause.message || cause.name || String(cause) : String(cause);
-          return finish('providerError', detail);
+          return await finish('providerError', detail);
         }
 
         // Build assistant content blocks: text first, then tool_uses, mirroring
@@ -807,7 +881,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // trail keeps whatever text did come through.
         if (collected.errors.length > 0) {
           const detail = collected.errors.map((e) => `${e.code}: ${e.message}`).join('; ');
-          return finish('providerError', `stream errors: ${detail}`);
+          return await finish('providerError', `stream errors: ${detail}`);
         }
 
         // Cost cap check after the assistant turn lands and is persisted.
@@ -817,7 +891,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // for clean spend, not for surfacing already-broken turns.
         {
           const overage = costCapDetailIfExceeded();
-          if (overage !== null) return finish('maxCostUsd', overage);
+          if (overage !== null) return await finish('maxCostUsd', overage);
         }
 
         // No tool uses → check the stop_reason before declaring success.
@@ -830,12 +904,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // route to compaction (M2).
         if (collected.tool_uses.length === 0) {
           if (collected.stop_reason === 'max_tokens') {
-            return finish(
+            return await finish(
               'maxOutputTokens',
               `provider truncated at max_tokens (cap=${budget.maxOutputTokensPerCall})`,
             );
           }
-          return finish('done');
+          return await finish('done');
         }
 
         // Snapshot before any of this step's tool_uses run. Spec §12 +
@@ -880,6 +954,21 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             }
           }
           if (hasWrites) {
+            // PreCheckpoint hooks (spec AGENTIC_CLI.md §10.1).
+            // Fired BEFORE the snapshot so an operator hook can
+            // record context (e.g., dump tree of dirty paths,
+            // tag the working tree with a marker). Fire-and-
+            // forget per spec line 1041 — non-blocking events
+            // don't gate the snapshot. The snapshot's git ops
+            // (add/commit on the shadow ref) are already
+            // optimized; bound any operator latency to their
+            // own hook timeout.
+            void fireHookChain({
+              schema: 'v1',
+              event: 'PreCheckpoint',
+              sessionId,
+              data: { stepN: steps },
+            });
             try {
               const outcome = await checkpointManager.snapshot({
                 stepId: assistantMsg.id,
@@ -916,8 +1005,8 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // invocations gets misreported as a user abort.
           if (signal.aborted) {
             return isWallClockTimeout()
-              ? finish('maxWallClockMs')
-              : finish('aborted', undefined, 'hard');
+              ? await finish('maxWallClockMs')
+              : await finish('aborted', undefined, 'hard');
           }
           // Cooperative-stop also honored mid-step (1.g.1, D158): if
           // the model returned multiple tool_uses and soft fired
@@ -935,7 +1024,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // genuinely changes between iterations.
           const softAborted = config.softStopSignal?.aborted;
           if (softAborted) {
-            return finish('aborted', undefined, 'soft');
+            return await finish('aborted', undefined, 'soft');
           }
 
           // Degenerate-loop detection: hash this call and check the sliding
@@ -945,7 +1034,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           if (recentToolHashes.length > HASH_WINDOW) recentToolHashes.shift();
           const repeats = recentToolHashes.filter((x) => x === h).length;
           if (repeats >= budget.maxRepeatedToolHash) {
-            return finish(
+            return await finish(
               'degenerateLoop',
               `tool ${tu.name} called ${repeats} times with identical args in last ${HASH_WINDOW} calls`,
             );
@@ -1138,6 +1227,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               ...(config.confirmPermission !== undefined
                 ? { confirmPermission: config.confirmPermission }
                 : {}),
+              fireHook: fireHookChain,
               signal,
             },
           );
@@ -1179,7 +1269,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             });
             lastMessageId = partialMsg.id;
             messages.push({ role: 'user', content: toolResults });
-            return finish('maxToolErrors', `${consecutiveErrors} consecutive tool errors`);
+            return await finish('maxToolErrors', `${consecutiveErrors} consecutive tool errors`);
           }
         }
 
@@ -1287,12 +1377,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             // compaction_finished event) but before the next
             // top-of-loop iteration would issue a provider call.
             const overage = costCapDetailIfExceeded();
-            if (overage !== null) return finish('maxCostUsd', overage);
+            if (overage !== null) return await finish('maxCostUsd', overage);
           }
         }
       }
     } catch (e) {
-      return guardedFinish(e);
+      return await guardedFinish(e);
     }
   } finally {
     // Drain the lazy retention sweep BEFORE anything else in the

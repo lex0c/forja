@@ -15,6 +15,129 @@ Format:
 
 ---
 
+## [2026-05-04] M3 / impl — hooks Slice 2: 4 non-blocking events wired into harness
+
+Branch `feat/m3-hooks`. Builds on Slice 1 (foundation: types, paths, template,
+config loader, dispatcher, audit table 019, 68 tests at `b4acae5`). This slice
+threads the dispatcher through the harness lifecycle for the four non-blocking
+events the spec marks as "log-only" (`AGENTIC_CLI.md §10.1` table line 980,
+`CONTRACTS.md §3` line 742): `SessionStart`, `Stop`, `Notification`,
+`PreCheckpoint`. Decisions don't gate (per spec line 1041) — these are
+operator hooks for desktop notifications, slack pings, working-tree tagging,
+forensic logging.
+
+**Done:**
+
+- **`HarnessConfig.hooks`**: optional `readonly HookSpec[]` threaded
+  through. Empty/undefined = no-op (every dispatch site falls through
+  the chain filter). Bootstrap resolves the three-layer hierarchy at
+  boot via `resolveHookConfig(resolveHookPaths(repoRoot))` and surfaces
+  warnings on `BootstrapResult.hookWarnings` for the CLI driver to
+  render alongside policy lock-conflict warnings.
+
+- **`SessionStart` + `Stop` (harness loop)**: `runAgent` now hosts a
+  shared `fireHookChain(payload)` helper that wraps `dispatchChain`
+  with the bound deps (db, sessionId, cwd) and a stderr fallback for
+  defense-in-depth. SessionStart fires AFTER the `session_start` event
+  so renderers see it bracketing the visible session; Stop fires
+  BEFORE `session_finished` so a "session ended at $cost" hook lands
+  while the UI is still visible. Both awaited so audit lands before
+  the DB closes; latency capped by the dispatcher's
+  `MAX_HOOK_CHAIN_MS` (15s).
+
+- **`Notification` (invoke-tool)**: fired when the permission engine
+  returns `confirm` and BEFORE `confirmPermission` is invoked, so
+  desktop alerts beat the modal opening. Fire-and-forget per spec
+  (the modal shouldn't wait on a slack ping). Wired via a generic
+  `deps.fireHook?: (payload) => Promise<void>` callback in
+  `InvokeToolDeps` so future events from this scope (PreToolUse,
+  PostToolUse — Slice 3) reuse the same pipe.
+
+- **`PreCheckpoint` (harness loop)**: fired just before
+  `checkpointManager.snapshot(...)` whenever the step had a
+  writes-true tool. Fire-and-forget — non-blocking events can't
+  gate the snapshot, and the snapshot's git ops are already
+  optimized; bounding operator latency to their own hook timeout
+  is the right tradeoff.
+
+- **`finish` is now async**. Every `return finish(...)` updated to
+  `return await finish(...)` (mechanical change across ~20 call sites
+  including `guardedFinish`). This is what lets Stop hooks complete
+  before `session_finished` is emitted.
+
+- **Tests** (`tests/harness/hooks-integration.test.ts`, 11 cases):
+  end-to-end through `runAgent` with real `sh -c` hook commands that
+  write payloads to temp files. Asserts both audit-row presence and
+  payload shape. Coverage:
+  - SessionStart: schema=v1, sessionId, cwd, model, profile=`default`
+  - SessionStart: profile=`plan` when `planMode=true`
+  - Stop: payload carries `durationMs`, `costUsd`, `steps`; lifecycle
+    order `session_start` → `session_finished` preserved
+  - Stop: still fires when the run exits via `providerError`
+  - Stop: zero hooks → zero rows, no error
+  - Notification: confirm decision (via `read_file` + `confirm_paths`)
+    triggers Notification with `kind=permission_prompt`; modal opens
+    after dispatch
+  - Notification: bypass mode (no confirm) → no Notification rows
+  - PreCheckpoint: writes-true tool in step → row landed with
+    `stepN` in the payload
+  - PreCheckpoint: read-only step → no row (gate is `hasWrites`)
+  - Error path: hook command `exit 7` → outcome=`error`, exit_code=7,
+    harness still completes
+  - Timeout path: `sleep 5` with `timeoutMs=100` → outcome=`timeout`,
+    exit_code=124 (POSIX `timeout(1)` convention)
+
+**Decisions:**
+
+1. **Await for SessionStart + Stop, fire-and-forget for Notification +
+   PreCheckpoint.** Spec says non-blocking events are fire-and-forget,
+   meaning decisions don't gate. We interpret "fire-and-forget" at two
+   levels:
+   - DECISION-LEVEL: never. None of the four block.
+   - EXECUTION-LEVEL: lifecycle events (SessionStart/Stop) await so
+     audit lands before DB closes; intra-step events
+     (Notification/PreCheckpoint) don't await so user-facing latency
+     stays low (modal opens promptly, snapshot proceeds without delay).
+
+2. **Stop fires BEFORE `session_finished` emission**. Symmetry with
+   SessionStart-after-session_start: the spec wants hooks bracketed
+   inside the visible session window. A "session ended" hook running
+   AFTER renderers tear down the screen is invisible; running before
+   gives the operator time to see the message.
+
+3. **Generic `fireHook` callback in `InvokeToolDeps`** instead of an
+   event-specific `fireNotification`. Slice 3 (PreToolUse +
+   PostToolUse) will land in invoke-tool too; the generic shape lets
+   that slice add events without renegotiating the deps interface.
+
+4. **Bootstrap-side warnings on `BootstrapResult.hookWarnings`**, not
+   inline stderr. Mirrors how policy `lockConflicts` and subagent
+   shadows surface — the CLI driver decides rendering. Tests stubbing
+   bootstrap need a 1-line `hookWarnings: []` addition; existing
+   tests in `tests/cli/repl*.test.ts` updated.
+
+**Pending:**
+
+- **Slice 3** (PreToolUse + PostToolUse). Blocking event semantics:
+  PreToolUse decisions can deny a tool call BEFORE invocation;
+  PostToolUse fires after. Fits the same `deps.fireHook` pipe added
+  here; the dispatcher already supports the blocking flow (Slice 1's
+  30 dispatcher tests cover it). Needs harness logic to interpret
+  `block_silent`/`block_message` outcomes and turn them into a
+  `confirm_no`-shape failure with the operator's message surfaced.
+
+- **Slice 4**: `UserPromptSubmit`, `PreCompact`, `MemoryWrite` —
+  remaining blocking events. Wires through the REPL (UserPromptSubmit
+  before harness gets the prompt), the harness compaction path
+  (PreCompact), and the memory_write tool (MemoryWrite).
+
+- **Slice 5**: `/hooks list` + `/hooks audit` slash commands; locked
+  enforcement (enterprise > user > project) verified end-to-end.
+
+**Next:** Slice 3 — PreToolUse + PostToolUse blocking flow.
+
+---
+
 ## [2026-05-04] M3 / impl — /memory slash commands (list/show/audit/delete/promote/demote)
 
 Continues the memory subsystem on the same branch. Two commits in

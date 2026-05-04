@@ -1,3 +1,4 @@
+import type { HookEventPayload } from '../hooks/index.ts';
 import type { Decision, PermissionEngine, ToolArgs } from '../permissions/index.ts';
 import type { ProviderToolResultBlock } from '../providers/index.ts';
 import { sanitizeToolOutput, stripAnsi } from '../sanitize/index.ts';
@@ -61,6 +62,13 @@ export interface InvokeToolDeps {
   // Loop already has the signal; threads it here so the abort
   // propagates one level deeper.
   signal?: AbortSignal;
+  // Hook chain dispatch — generic per-event funnel built in
+  // loop.ts. invoke-tool.ts calls this for events that originate
+  // inside its scope (Notification on permission modal,
+  // PreToolUse / PostToolUse in later slices). Optional because
+  // headless / one-shot calls don't necessarily wire it; absence
+  // is a no-op.
+  fireHook?: (payload: HookEventPayload) => Promise<void>;
 }
 
 export interface InvokeToolResult {
@@ -410,6 +418,26 @@ export const invokeTool = async (
     // denied — no two-step "Esc out of modal then signal-check"
     // dance. The catch collapses both rejection paths (callback
     // throw, abort) to a denied answer.
+    // Notification hook (spec AGENTIC_CLI.md §10.1, table:
+    // permission_prompt). Fired BEFORE the modal opens so the
+    // operator's hook (desktop notify, slack ping, etc.) can
+    // alert them that a confirmation is pending. Fire-and-forget
+    // per spec line 1041 — we don't want a slow notification
+    // command to delay the modal that's about to appear, since
+    // the operator is sitting in front of the terminal already.
+    // No await; the dispatcher's per-hook timeout still bounds
+    // each child process's wall clock.
+    if (deps.fireHook !== undefined) {
+      void deps.fireHook({
+        schema: 'v1',
+        event: 'Notification',
+        sessionId: deps.ctx.sessionId,
+        data: {
+          kind: 'permission_prompt',
+          message: `permission requested: ${input.toolName}`,
+        },
+      });
+    }
     let answer = false;
     try {
       answer = await raceAgainstAbort(
