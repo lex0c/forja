@@ -823,7 +823,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       drainTimer = setTimeout(() => {
         drainTimer = null;
         if (exiting) return;
-        const drained = parser.drain();
+        // Narrow drain: ONLY resolve the lone-ESC ambiguity. The
+        // full `parser.drain()` (used at shutdown) clears paste
+        // state too — calling it here would truncate a paste
+        // delivered in chunks separated by more than ESC_DRAIN_MS
+        // (slow SSH links, large clipboard payloads), silently
+        // corrupting submitted input. `tryResolveLoneEsc` is the
+        // surgical version: emits Escape iff the buffer is exactly
+        // `\x1b` outside of paste mode, no-op otherwise.
+        const drained = parser.tryResolveLoneEsc();
         for (const ev of drained) focusStack.dispatch(ev);
       }, ESC_DRAIN_MS);
     }

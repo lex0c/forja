@@ -148,7 +148,22 @@ export interface KeyParser {
   feed: (input: Buffer | string) => KeyEvent[];
   // Drains any buffered sequence as best-effort raw chars. Used at
   // shutdown so a half-typed paste doesn't get silently lost.
+  // DESTRUCTIVE: clears paste state too, so callers that only want
+  // to resolve the lone-ESC ambiguity (idle drain after short
+  // timeout) should use `tryResolveLoneEsc` instead — that one
+  // leaves paste state alone.
   drain: () => KeyEvent[];
+  // Idle-timeout helper. Resolves the "is this lone byte an Escape
+  // keypress, or the start of a multi-byte sequence we haven't
+  // seen the rest of yet?" ambiguity by emitting Escape iff the
+  // buffer is exactly `\x1b` and the parser is NOT mid-paste. In
+  // every other state (longer prefix accumulated, paste in
+  // flight, empty buffer) it's a no-op — bytes stay buffered for
+  // the next feed. Designed to be safe to call on any tick of the
+  // pump's idle timer without truncating paste content delivered
+  // across multiple chunks (which happens routinely on slow SSH
+  // links and on large clipboard payloads).
+  tryResolveLoneEsc: () => KeyEvent[];
   // Internal buffer length, exposed for tests.
   bufferLength: () => number;
 }
@@ -373,6 +388,15 @@ export const createKeyParser = (): KeyParser => {
       pasteActive = false;
       pasteBuf = '';
       return events;
+    },
+    tryResolveLoneEsc: () => {
+      // Strict gate: ONLY the exact lone-ESC ambiguity. Anything
+      // else (paste in flight, longer multi-byte prefix accumulated)
+      // stays untouched so the next feed can complete it.
+      if (pasteActive) return [];
+      if (buf.length !== 1 || buf.charCodeAt(0) !== 0x1b) return [];
+      buf = '';
+      return [{ kind: 'key', name: 'escape', ...NO_MODS, raw: '\x1b' }];
     },
     bufferLength: () => buf.length,
   };
