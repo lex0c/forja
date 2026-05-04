@@ -47,6 +47,81 @@ afterEach(() => {
   }
 });
 
+describe('memory_read — untrusted warning (spec §7.2.7)', () => {
+  let db: DB;
+  let sessionId: string;
+
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+    sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+  });
+
+  test('emits warn via emitWarn when body has trust: untrusted', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Untrusted](untrusted-mem.md) — h\n');
+    writeMemory(
+      roots.user,
+      'untrusted-mem',
+      'name: untrusted-mem\ndescription: h\ntype: user\nsource: inferred\ntrust: untrusted\n',
+      'body',
+    );
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const warnings: string[] = [];
+    const ctx = makeCtx({
+      memoryRegistry: reg,
+      sessionId,
+      emitWarn: (msg) => warnings.push(msg),
+    });
+    const result = await memoryReadTool.execute({ name: 'untrusted-mem' }, ctx);
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    expect(result.trust).toBe('untrusted');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('[memory: untrusted]');
+    expect(warnings[0]).toContain('user/untrusted-mem');
+  });
+
+  test('does NOT emit warn for trusted memory', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Trusted](trusted-mem.md) — h\n');
+    writeMemory(
+      roots.user,
+      'trusted-mem',
+      'name: trusted-mem\ndescription: h\ntype: user\nsource: user_explicit\n',
+      'body',
+    );
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const warnings: string[] = [];
+    const ctx = makeCtx({
+      memoryRegistry: reg,
+      sessionId,
+      emitWarn: (msg) => warnings.push(msg),
+    });
+    await memoryReadTool.execute({ name: 'trusted-mem' }, ctx);
+    expect(warnings).toEqual([]);
+  });
+
+  test('untrusted load without emitWarn wired: tool succeeds, no throw', async () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [U](u.md) — h\n');
+    writeMemory(
+      roots.user,
+      'u',
+      'name: u\ndescription: h\ntype: user\nsource: inferred\ntrust: untrusted\n',
+      'body',
+    );
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    // Headless / SDK context: no emitWarn supplied.
+    const ctx = makeCtx({ memoryRegistry: reg, sessionId });
+    const result = await memoryReadTool.execute({ name: 'u' }, ctx);
+    if (isToolError(result)) throw new Error(`unexpected: ${result.error_message}`);
+    expect(result.trust).toBe('untrusted');
+  });
+});
+
 describe('memory_read tool', () => {
   let db: DB;
   let sessionId: string;

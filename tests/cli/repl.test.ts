@@ -54,7 +54,47 @@ const makeStdin = (): NodeJS.ReadStream & { feed: (s: string) => void } => {
 // boot-time loadHistory and submit-time appendHistory work; the
 // harness override means runAgent never touches messages/tool_calls,
 // so the rest of the config object can stay hollow.
-const makeBootstrapStub = (cwd = '/tmp/forja-repl-test'): BootstrapResult => {
+// Minimal stub registry — exposes only the surface the REPL boot
+// path consumes (count for the banner env entry; list/peek for
+// the memory section assembly which is also called at boot via
+// bootstrap, but bootstrapOverride bypasses bootstrap so this
+// stub is invoked only via baseConfig.memoryRegistry.count()).
+// Returns 0 by default; tests asserting the banner's memory entry
+// override the count.
+const makeStubRegistry = (count = 0): unknown => ({
+  count: ({ deduplicateByName }: { deduplicateByName?: boolean } = {}) =>
+    deduplicateByName === true ? count : count,
+  list: () => [],
+  lookup: () => null,
+  read: () => ({ kind: 'unknown' as const }),
+  peek: () => ({ kind: 'unknown' as const }),
+  search: () => [],
+  reload: () => {
+    /* no-op */
+  },
+  write: () => {
+    throw new Error('stub registry: write not used');
+  },
+  recordEvent: () => {
+    /* no-op */
+  },
+});
+
+interface MakeBootstrapStubOptions {
+  cwd?: string;
+  // Memory entry count surfaced by `MemoryRegistry.count`. Drives
+  // both the boot banner env entry and the footer's `mem N` token.
+  // Omit (default 0) to test the omit-on-zero paths.
+  memoryCount?: number;
+}
+
+const makeBootstrapStub = (
+  cwdOrOpts: string | MakeBootstrapStubOptions = '/tmp/forja-repl-test',
+): BootstrapResult => {
+  const opts: MakeBootstrapStubOptions =
+    typeof cwdOrOpts === 'string' ? { cwd: cwdOrOpts } : cwdOrOpts;
+  const cwd = opts.cwd ?? '/tmp/forja-repl-test';
+  const memoryCount = opts.memoryCount ?? 0;
   const realDb = openMemoryDb();
   migrate(realDb);
   const config = {
@@ -66,6 +106,7 @@ const makeBootstrapStub = (cwd = '/tmp/forja-repl-test'): BootstrapResult => {
       id: 'mock/m',
       capabilities: { context_window: 200000, output_max_tokens: 4096 },
     },
+    memoryRegistry: makeStubRegistry(memoryCount),
   } as unknown as HarnessConfig;
   return {
     config,
@@ -404,6 +445,52 @@ describe('repl — boot + smoke', () => {
     });
     await tick();
     process.emit('SIGINT');
+    expect(await promise).toBe(130);
+  });
+
+  test('boot banner includes memory env entry when registry has entries (D68 follow-up)', async () => {
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ memoryCount: 3 }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    await tick();
+    const all = writes.join('');
+    // `meta` env entry renders as `key: value` in the banner block
+    // (UI.md §4.10.9 envelopes the key in the `dim` palette but the
+    // raw text still contains the literal "memory: 3").
+    expect(all).toContain('memory: 3');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('boot banner omits memory env entry when registry is empty', async () => {
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub({ memoryCount: 0 }),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    await tick();
+    const all = writes.join('');
+    // Zero memories → no env entry; the "memory:" key never appears.
+    expect(all).not.toContain('memory:');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 

@@ -453,6 +453,22 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       ? { maxCostUsd: baseConfig.budget.maxCostUsd }
       : {}),
     ...(baseConfig.planMode === true ? { planMode: true } : {}),
+    // Distinct-name memory count for the footer's `mem N` segment.
+    // Snapshot at adapter-construction time (per-turn) — if a
+    // memory_write succeeds mid-turn, the next turn's adapter
+    // picks up the new count. Within a turn the footer doesn't
+    // animate per-write; the `mem N` token reflects "what was
+    // available when this turn began". Trade-off: per-write live
+    // updates would couple the reducer to the memory_events bus
+    // (every write would have to fire a status:update event the
+    // reducer maps onto status.memoryCount). Per-turn fidelity is
+    // acceptable today because writes are interactive (operator
+    // confirms each one) and the next turn picks up the bump
+    // within seconds. Revisit if operator data shows confusion
+    // ("I just confirmed a write but the counter didn't move").
+    ...(baseConfig.memoryRegistry !== undefined
+      ? { memoryCount: baseConfig.memoryRegistry.count({ deduplicateByName: true }) }
+      : {}),
   });
 
   // bus / focusStack / renderer / modalManager / parser / `running`
@@ -1545,8 +1561,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // Welcome banner (UI.md §4.10.9). Goes to scrollback before any
   // live frame so it sits at the top of the conversation transcript.
   // Env summary entries land conditionally — D68 says omit when
-  // there's nothing useful to communicate. Memory entry count
-  // omitted until the registry exposes a sync count method.
+  // there's nothing useful to communicate.
   const providerCaps = baseConfig.provider.capabilities;
   // UI.md §4.10.9 discriminates env entries: `flag` for binary
   // capability indicators (rendered as `✓ name` in success palette),
@@ -1554,6 +1569,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const env: SessionBannerEvent['env'] = [];
   if (subagents.byName.size > 0) {
     env.push({ kind: 'meta', key: 'subagents', value: String(subagents.byName.size) });
+  }
+  // Memory count (D68 follow-up, closed by Slice F'). Dedupe-by-name
+  // matches the "active memories" semantic — operator sees the count
+  // of distinct names available, not the raw cross-scope total. Zero
+  // omits the entry per the env-summary "no useful info" rule.
+  if (baseConfig.memoryRegistry !== undefined) {
+    const memoryCount = baseConfig.memoryRegistry.count({ deduplicateByName: true });
+    if (memoryCount > 0) {
+      env.push({ kind: 'meta', key: 'memory', value: String(memoryCount) });
+    }
   }
   // `checkpoints` flag was removed from the banner — operator
   // marked it as not useful. The capability still works (harness

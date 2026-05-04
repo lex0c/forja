@@ -87,6 +87,23 @@ export interface MemoryRegistry {
   // session and wants the current session's view to refresh).
   reload(): void;
 
+  // Sync count of registered entries. O(1) over the cached
+  // snapshot — does NOT walk disk. Two consumers today:
+  //   1. Boot banner env summary: shows `memory: N` so operators
+  //      know how many memories the session loaded (D68
+  //      follow-up).
+  //   2. Footer tray segment: live "memory N" token in the right
+  //      column for at-a-glance presence.
+  // Both are pre-trust-filter / pre-trigger-filter counts — i.e.
+  // the raw set of entries the registry knows about, NOT the
+  // post-filter count that ends up in the eager prompt section.
+  // The eager-loaded count is `assembleMemorySection.entryCount`
+  // and is plumbed separately when callers need that flavor.
+  // Pass `deduplicateByName: true` to collapse same-name shadows
+  // across scopes — matches the "active memories" semantic the
+  // operator sees in the eager section.
+  count(opts?: { deduplicateByName?: boolean }): number;
+
   // Load a body WITHOUT emitting a `read` audit row. Used by
   // session-internal callers (today: `assembleMemorySection` in
   // memory-prompt.ts, which checks `trust: untrusted` to filter
@@ -512,6 +529,13 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
 
     reload(): void {
       refresh();
+    },
+
+    count(opts: { deduplicateByName?: boolean } = {}): number {
+      // Reuse `list()` so the dedupe logic stays single-source:
+      // future changes to scope precedence / filtering live in
+      // one place.
+      return this.list({ deduplicateByName: opts.deduplicateByName === true }).length;
     },
 
     write(opts: WriteOptions): RegistryWriteResult {

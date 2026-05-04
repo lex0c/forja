@@ -160,6 +160,28 @@ describe('renderFooter', () => {
     expect(out).toContain('• sonnet-4.6 · 3/50');
   });
 
+  test('memoryCount > 0 surfaces as `mem N` after cost (BACKLOG D68 follow-up)', () => {
+    const state = startedSession({ memoryCount: 7 });
+    const out = renderFooter(state, caps) ?? '';
+    expect(out).toContain('mem 7');
+    // Ordering: cost comes before mem.
+    expect(out.indexOf('$')).toBeLessThan(out.indexOf('mem 7'));
+  });
+
+  test('memoryCount === 0 drops the token entirely', () => {
+    const out = renderFooter(startedSession({ memoryCount: 0 }), caps) ?? '';
+    expect(out).not.toContain('mem ');
+  });
+
+  test('memoryCount and bg coexist (bg before mem per spec §4.10.6 priority)', () => {
+    const state = startedSession({ memoryCount: 3 });
+    state.bgProcesses.set('p1', { processId: 'p1', command: 'sleep' });
+    const out = renderFooter(state, caps) ?? '';
+    expect(out).toContain('bg 1');
+    expect(out).toContain('mem 3');
+    expect(out.indexOf('bg 1')).toBeLessThan(out.indexOf('mem 3'));
+  });
+
   test('bg + plan mode coexist in correct order (model · plan · steps · cost · bg)', () => {
     const s = startedSession({ planMode: true });
     s.bgProcesses.set('p1', { processId: 'p1', command: 'x' });

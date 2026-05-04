@@ -33,6 +33,22 @@ export type HarnessEvent =
     }
   | { type: 'tool_decided'; toolUseId: string; decision: Decision }
   | {
+      // Operator-facing warning emitted by a tool MID-execution
+      // (no failure — the tool still returns success). Used today
+      // by `memory_read` to surface `[memory: untrusted]` per
+      // spec §7.2.7 ("UI mostra `[memory: untrusted]` em qualquer
+      // memória `untrusted` carregada"). Adapter translates to a
+      // `warn` UIEvent in the live region; NDJSON consumers see
+      // the harness-side shape verbatim. Distinct from `warn`
+      // events the harness emits for non-tool concerns (resume
+      // truncation, etc.) so audit can attribute them to a
+      // specific tool call.
+      type: 'tool_warning';
+      toolUseId: string;
+      toolName: string;
+      message: string;
+    }
+  | {
       type: 'tool_finished';
       toolUseId: string;
       toolName: string;

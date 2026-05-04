@@ -176,6 +176,14 @@ export interface ToolContext {
   // default-true convention in tests' makeCtx mirrors the
   // post-trust-prompt reality of the REPL flow.
   isCwdTrusted: boolean;
+  // Operator-facing warning channel. Tools call this to surface
+  // non-error notices that should land in the live region as a
+  // `warn` line. Today only memory_read uses it (spec §7.2.7:
+  // `[memory: untrusted]` marker when a body with
+  // `trust: untrusted` is returned). Optional — when absent (one-
+  // shot SDK without an event sink), the call is a no-op and the
+  // tool's normal output remains the only carrier.
+  emitWarn?: (message: string) => void;
 }
 
 // Inputs the `task` tool passes through to the harness's subagent

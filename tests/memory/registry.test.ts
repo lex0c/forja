@@ -475,6 +475,57 @@ describe('createMemoryRegistry — reload', () => {
   });
 });
 
+describe('createMemoryRegistry — count', () => {
+  test('returns 0 when no scope has an index', () => {
+    const repo = makeTmp();
+    const reg = createMemoryRegistry({ roots: makeRoots(repo) });
+    expect(reg.count()).toBe(0);
+  });
+
+  test('returns total entries across all scopes by default', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [A](a.md) — h\n- [B](b.md) — h\n');
+    writeIndex(roots.projectShared, '- [C](c.md) — h\n');
+    writeIndex(roots.projectLocal, '- [D](d.md) — h\n');
+    const reg = createMemoryRegistry({ roots });
+    expect(reg.count()).toBe(4);
+  });
+
+  test('deduplicateByName collapses shadowed names', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.user, '- [Style](commit-style.md) — h\n');
+    writeIndex(roots.projectShared, '- [Style](commit-style.md) — h\n');
+    writeIndex(roots.projectLocal, '- [Style](commit-style.md) — h\n');
+    const reg = createMemoryRegistry({ roots });
+    expect(reg.count()).toBe(3);
+    expect(reg.count({ deduplicateByName: true })).toBe(1);
+  });
+
+  test('count reflects post-write state without explicit reload', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const db = openMemoryDb();
+    migrate(db);
+    const sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    expect(reg.count()).toBe(0);
+    reg.write({
+      scope: 'project_local',
+      frontmatter: {
+        name: 'fresh',
+        description: 'h',
+        type: 'feedback',
+        source: 'inferred',
+      },
+      body: 'b',
+    });
+    // write() auto-refreshes the snapshot, so count reflects it.
+    expect(reg.count()).toBe(1);
+  });
+});
+
 describe('createMemoryRegistry — peek', () => {
   let db: DB;
   let sessionId: string;

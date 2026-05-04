@@ -35,6 +35,12 @@ export type SessionStartEvent = BaseEvent & {
   // equivalent to false; producers that don't know plan-mode state
   // can omit the field.
   planMode?: boolean;
+  // Distinct-name memory count surfaced in the footer's right
+  // column as `mem N`. Dedupe-by-name matches what the operator
+  // sees in the eager prompt section. Optional: producers that
+  // didn't wire memory (one-shot SDK, replay tools) omit the
+  // field; renderer skips the segment when undefined or zero.
+  memoryCount?: number;
 };
 
 // One-shot welcome banner (UI.md §4.10.9). Emitted by the REPL at

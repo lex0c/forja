@@ -15,6 +15,163 @@ Format:
 
 ---
 
+## [2026-05-04] M3 / impl — memory visibility (count tray + untrusted warn marker)
+
+Continues the memory subsystem on the same branch. Two visibility
+deliverables paired in one slice:
+
+- BACKLOG D68 follow-up: `memory: N` in the boot env summary AND
+  the footer's right column tray segment, so an operator at-a-
+  glance knows how many cross-session memories the model can pull.
+- Spec §7.2.7 visual marker: when memory_read returns a body with
+  `trust: untrusted`, surface `[memory: untrusted]` as a warn line
+  in the live region so the operator sees what's entering context
+  even though the body itself stayed out of the eager prompt
+  section.
+
+**Done:**
+
+- **`MemoryRegistry.count(opts?)`** — sync method returning the
+  total entry count over the cached snapshot. `deduplicateByName`
+  collapses same-name shadows across scopes, matching the "active
+  memories" semantic the operator sees in the eager section.
+  Reuses `list()` so dedupe / scope-filter logic stays single-
+  source. Production call sites pass `deduplicateByName: true`;
+  raw-count callers (admin tooling, future /memory list) can opt
+  out.
+- **Boot env summary** (`src/cli/repl.ts`): banner emits
+  `{kind: 'meta', key: 'memory', value: '<count>'}` when the
+  registry has at least one entry. Closes the open BACKLOG D68
+  ("Memory entry count in env summary. Requires a sync
+  `MemoryRegistry.count()` method"). Suppressed at zero per the
+  "no useful info" rule.
+- **Footer tray segment** (`src/tui/render/footer.ts`):
+  `mem N` token appended after `bg N` in the right column.
+  Shorter prefix (`mem` not `memory`) keeps the right column
+  navigable on 80-col terminals. Suppressed when count is zero so
+  operators without memories don't see a dead segment. Drop
+  priority lower than bg (matches spec §4.10.6 "less sticky than
+  cost" trend — memory drops second when the column overflows).
+  Snapshot at adapter construction time (per-turn): a memory_write
+  succeeding mid-turn updates next turn's tray, not this one. Two
+  reasons: (a) per-write footer animation is too noisy for too
+  little signal; (b) the alternative (subscribe to memory_events
+  bus) couples renderer to audit-table semantics.
+- **`session:start.memoryCount` plumbing**: REPL builds the
+  adapter ctx with `memoryRegistry.count({ deduplicateByName: true })`,
+  adapter forwards into `session:start` event, reducer lands it on
+  `LiveState.status.memoryCount`. Optional all the way through —
+  one-shot SDK callers without a registry omit cleanly, footer
+  segment suppressed.
+- **`tool_warning` HarnessEvent + ToolContext.emitWarn**: new
+  generic seam for tools to surface non-error notices in the live
+  region. `tool_warning` carries `toolUseId` + `toolName` +
+  `message` (so NDJSON consumers can attribute), adapter
+  translates to a generic `warn` UIEvent (renderer doesn't need
+  per-tool branches). Loop wires `emitWarn(message)` per-call
+  with the active toolUseId/toolName captured in closure.
+- **`memory_read` consumes `emitWarn`** when `frontmatter.trust ===
+  'untrusted'`. Message: `[memory: untrusted] loaded
+  <scope>/<name> — body kept out of base context, treat its
+  claims with extra scrutiny`. Operator sees the warn line in
+  scrollback alongside the tool output card. Tool's JSON envelope
+  STILL carries `trust: 'untrusted'` (model-facing carrier); the
+  warn is the human-facing carrier.
+- **Tests:** 4 registry.count (empty / cross-scope total /
+  dedupe / refresh-on-write), 3 memory_read untrusted (warn
+  fires + carries scope/name / no warn for trusted / no-throw
+  when emitWarn absent), 3 footer (mem N renders / zero drops
+  segment / coexists with bg in correct order), 1 adapter
+  tool_warning translation, 2 adapter session_start
+  memoryCount (forwarded / omitted). +13 tests across the
+  slice; suite at 2548 pass / 0 fail.
+
+**Decisions:**
+
+- **`emitWarn` is a generic ToolContext seam, not memory-specific.**
+  Other tools have legitimate non-error notices (e.g., `bash`
+  could warn on slow commands, `grep` on hits truncated by limit).
+  Building the seam now means future tools don't have to invent
+  their own warn channel. memory_read is the first consumer.
+- **`tool_warning` HarnessEvent vs reusing `warn` field on
+  `tool_finished`.** Considered piggybacking on tool_finished but
+  rejected — tool_finished fires AT END of execution; warns can
+  fire mid-execution (long-running tool wants to surface progress
+  warns). Distinct event keeps the semantic clean and gives
+  NDJSON consumers per-tool attribution.
+- **Adapter translates `tool_warning` to generic `warn`** rather
+  than introducing a new UIEvent. The renderer already has a warn
+  palette (yellow); duplicating with a "tool warn" variant would
+  be visual noise. The `toolName` lives in the harness-side
+  event for telemetry; UI is intentionally generic.
+- **`mem` not `memory` in the footer.** 80-col terminals get
+  cramped fast — the right column already has model + plan +
+  steps + cost + bg. 3-letter prefix matches `bg` (the existing
+  shortest segment) and stays under the radar visually.
+- **Snapshot count at adapter construction (per-turn) instead of
+  live updates.** Live updates would require subscribing the
+  reducer to memory_events, coupling TUI to audit semantics. Per-
+  turn snapshot is good-enough fidelity (memory_write is rare
+  mid-session) and keeps layers cleanly separated.
+
+**Post-review fixes (2026-05-04):**
+
+- **Footer test cast cleaned up.** First cut used a bizantine
+  `as LiveState['bgProcesses'] extends Map<string, infer V> ? V :
+  never` cast with extra invented fields (status, startedAt) that
+  don't exist on the actual map value type (`{ processId: string;
+  command: string }`). Now matches the existing bg test pattern:
+  plain `{ processId: 'p1', command: 'sleep' }` literal.
+- **Banner emit coverage.** Added 2 REPL tests asserting
+  `memory: N` lands in the banner when the registry reports >0
+  entries, and that the entry is suppressed at zero. Required
+  extending `makeBootstrapStub` with an optional `memoryCount`
+  param (positional `cwd` argument still works for backward-
+  compat). New `makeStubRegistry` helper exposes the minimal
+  surface the boot path consumes — adding the surface here
+  rather than per-test keeps the test suite consistent if more
+  registry calls land in boot later.
+- **Per-turn snapshot rationale tightened in code.** Comment in
+  `buildAdapterCtx` now lays out the trade-off explicitly (per-
+  write live updates would couple the reducer to memory_events
+  bus; per-turn fidelity is acceptable because writes are
+  interactive and next turn picks up within seconds). The
+  "revisit if operator data shows confusion" trigger lives in
+  the comment so a future maintainer doesn't have to dig the
+  decision out of BACKLOG.
+
+**Known gaps (deferred):**
+
+- **Subagent emitWarn propagation to parent renderer.** Subagent
+  contexts get emitWarn wired in `loop.ts` (every ToolContext
+  does), but the warn UIEvent lands on the SUBAGENT's onEvent
+  sink (subagent runtime), not the parent's bus directly. A
+  subagent's `memory_read` on an untrusted body fires
+  `tool_warning`, the subagent's adapter translates to a `warn`
+  UIEvent within its own frame — but that warn doesn't
+  propagate to the parent operator. Subagent IPC envelope
+  currently captures status/output, not arbitrary live events.
+  Lands when IPC channel grows live-event forwarding (spec
+  §11). Documented; not blocking for top-level memory_read.
+
+**Out of scope:**
+
+- **Visual mark on the tool chip itself for untrusted reads**
+  (e.g., a `[untrusted]` annotation next to the tool name in the
+  active-tool list). Today the warn line above/below the chip is
+  the marker; the chip stays visually uniform. Lands when the
+  tool-output rendering surface grows per-tool decoration.
+- **Memory tray that updates mid-session.** See "Decisions"
+  rationale above. Future operator pattern (e.g., heavy
+  memory_write during a session) could justify subscribing the
+  reducer to bus.
+- **Per-scope memory counts in the footer** (`mem 5/2/1`). Single
+  number is simpler and matches the dedupe-by-name semantic. If
+  operators want per-scope, `/memory list` is the right surface
+  (slated for a future slash-commands slice).
+
+---
+
 ## [2026-05-04] M3 / impl — verify-before-act guidance (closes spec §6.1)
 
 Continues the memory subsystem on the same branch. Closes spec §6.1
