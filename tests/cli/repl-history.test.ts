@@ -648,6 +648,98 @@ describe('repl — reverse-search overlay (HISTORY.md §2.2)', () => {
   });
 });
 
+describe('repl — reverse-search emergency stop (Ctrl+C / Ctrl+D)', () => {
+  test('Ctrl+D while overlay is open + idle: exits 130, overlay closes', async () => {
+    appendHistory(db, PROJECT_CWD, 'something', { ts: 1 });
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    stdin.feed(CTRL_R);
+    await tick();
+    stdin.feed('some'); // type query so we know overlay is open
+    await tick();
+    // Pre-fix: Ctrl+D was swallowed by the `if (key.ctrl) return true`
+    // branch — operator stuck inside the overlay until they Esc out.
+    // Post-fix: shell-EOF convention fires unconditionally.
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Ctrl+C while overlay is open + running: triggers soft interrupt', async () => {
+    appendHistory(db, PROJECT_CWD, 'preexisting', { ts: 1 });
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    // Start a turn, then open the overlay mid-run, then Ctrl+C —
+    // the soft signal must fire even though the overlay swallows
+    // most other keys.
+    stdin.feed('go\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    const cfg = ra.captured[0]?.configs[0];
+    const softSignal = cfg?.softStopSignal;
+    expect(softSignal?.aborted).toBe(false);
+    stdin.feed(CTRL_R);
+    await tick();
+    stdin.feed('\x03'); // raw-mode Ctrl+C
+    await tick();
+    expect(softSignal?.aborted).toBe(true);
+    // Cleanup.
+    ra.finish(0, { status: 'interrupted', reason: 'aborted' });
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+
+  test('Ctrl+C while overlay is open + idle: arms the exit gate (matches outer Ctrl+C semantics)', async () => {
+    appendHistory(db, PROJECT_CWD, 'something', { ts: 1 });
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    stdin.feed(CTRL_R);
+    await tick();
+    // First Ctrl+C inside overlay: should close the overlay AND arm
+    // the idle exit gate (NOT exit yet — same double-tap convention).
+    stdin.feed('\x03');
+    await tick();
+    // Second Ctrl+C within the 2s window: confirms the gate was armed
+    // (not just consumed). Since overlay closed on the first, this
+    // press lands in the regular editor handler.
+    stdin.feed('\x03');
+    expect(await promise).toBe(130);
+  });
+});
+
 describe('repl — history persistence failure (robustness)', () => {
   test('appendHistory throwing mid-session emits a warn and keeps the REPL alive', async () => {
     // Build a Proxy around a real migrated db. After boot's `loadHistory`

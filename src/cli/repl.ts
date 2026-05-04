@@ -1069,10 +1069,49 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         return true;
       }
       // Printable chars (incl. Alt+letter, ignored modifiers): append
-      // to the query and re-search. We swallow Ctrl+letter combos
-      // OTHER than Ctrl+R so a stray Ctrl+W (delete word) doesn't
-      // accidentally mutate anything; operator can Esc to leave.
+      // to the query and re-search. Most Ctrl+letter combos are
+      // swallowed — forwarding Ctrl+W / Ctrl+U / Ctrl+K to the editor
+      // would mutate the (preserved) input buffer, defeating the
+      // "draft preserved below" contract of the overlay. But the
+      // emergency-stop keys MUST keep working: Ctrl+C aborts the
+      // current run (or arms the idle exit gate) and Ctrl+D exits
+      // shell-style. The overlay can be opened mid-turn (Ctrl+R is
+      // valid during running), so an operator who's regretting a
+      // long-running tool must still be able to interrupt without
+      // first remembering to press Esc — that's exactly the kind of
+      // friction Ctrl+C is supposed to bypass.
       if (key.kind === 'char') {
+        if (key.ctrl && key.char === 'c') {
+          // Close the overlay, then route through the same ladder
+          // the editor handler uses for raw-mode Ctrl+C: running →
+          // soft/hard interrupt; idle → arm/exit double-tap gate
+          // (UI.md §5.4). cancelExitArm is implicit in
+          // handleIdleInterrupt's arm path.
+          closeReverseSearch();
+          if (running) {
+            triggerInterrupt();
+          } else {
+            handleIdleInterrupt();
+          }
+          return true;
+        }
+        if (key.ctrl && key.char === 'd') {
+          // EOF convention. running → interrupt (consistent with the
+          // editor handler's `result.cancelInput === 'eof'` branch);
+          // idle → direct exit 130, no double-tap (shell EOF is one
+          // explicit decision per spec UI.md §5.4).
+          closeReverseSearch();
+          if (running) {
+            triggerInterrupt();
+          } else {
+            exitCode = 130;
+            requestShutdown();
+          }
+          return true;
+        }
+        // Other Ctrl+letter combos stay swallowed — operator presses
+        // Esc to leave the overlay and then has the full editor
+        // shortcut palette available again.
         if (key.ctrl) return true;
         const q = reverseSearchQuery ?? '';
         refreshReverseSearch(q + key.char);
