@@ -53,6 +53,7 @@ const fakeBlock = (reason: 'silent' | 'message', message: string | null): HookCh
       timeoutMs: 5000,
       failClosed: false,
       locked: false,
+      entryIndex: 0,
     } as HookSpec,
     reason,
     message,

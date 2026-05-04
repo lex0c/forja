@@ -430,7 +430,13 @@ export const dispatchChain = async (
       break;
     }
 
-    const result = await dispatchOne(spec, i, payload, cwd, deps);
+    // Pass the SPEC'S OWN entryIndex, not `i` (the index in the
+    // filtered `matching` array). With matcher filtering, `i`
+    // would mismatch the operator's source-file position
+    // whenever a non-matching hook appeared earlier in the
+    // file — the audit row's `sourcePath#hookIndex` reference
+    // would point at the wrong rule.
+    const result = await dispatchOne(spec, spec.entryIndex, payload, cwd, deps);
     runs.push({ spec, result });
 
     if (!isBlocking) continue;

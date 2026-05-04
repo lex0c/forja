@@ -87,6 +87,7 @@ const baseSpec = (
   timeoutMs: DEFAULT_HOOK_TIMEOUT_MS,
   failClosed: false,
   locked: false,
+  entryIndex: 0,
   ...overrides,
 });
 

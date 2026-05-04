@@ -217,6 +217,7 @@ const validateEntry = (
     timeoutMs,
     failClosed,
     locked,
+    entryIndex: index,
   };
   // Both warnings are mutually exclusive in practice (timeout
   // vs lock), but if a future field grows a third warning we'd

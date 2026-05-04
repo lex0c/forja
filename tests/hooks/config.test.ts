@@ -88,6 +88,45 @@ describe('resolveHookConfig — happy path', () => {
       'project',
     ]);
   });
+
+  test('entryIndex captures the hook position WITHIN its source file', () => {
+    // entryIndex is the canonical identity for hook_runs.hook_index
+    // (paired with sourcePath). Per-layer 0-based, NOT global flat
+    // index — each layer's array is indexed independently. Keeps
+    // operator references like `<sourcePath>#<index>` correct
+    // regardless of how other layers shift the global ordering.
+    const tmp = makeTmp();
+    const ent = join(tmp, 'enterprise.toml');
+    const prj = join(tmp, 'project.toml');
+    writeToml(
+      ent,
+      `[[hooks]]
+       event = "Stop"
+       command = "ent_a"
+
+       [[hooks]]
+       event = "Stop"
+       command = "ent_b"`,
+    );
+    writeToml(
+      prj,
+      `[[hooks]]
+       event = "Stop"
+       command = "prj_a"
+
+       [[hooks]]
+       event = "Stop"
+       command = "prj_b"`,
+    );
+    const result = resolveHookConfig({ enterprise: ent, user: '/nope', project: prj });
+    expect(result.hooks.map((h) => `${h.layer}:${h.command}:${h.entryIndex}`)).toEqual([
+      'enterprise:ent_a:0',
+      'enterprise:ent_b:1',
+      // Project starts back at 0 — per-layer indexing.
+      'project:prj_a:0',
+      'project:prj_b:1',
+    ]);
+  });
 });
 
 describe('resolveHookConfig — validation', () => {

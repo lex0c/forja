@@ -98,6 +98,13 @@ export interface HookSpec {
   // true`. Validated at config-load time; ignored on user/project
   // layers (any locking declaration there is a no-op + warn).
   locked: boolean;
+  // Position of this hook within its originating layer's
+  // `[[hooks]]` array (0-based). Captured at config-load time
+  // so the dispatcher's audit row carries the operator-visible
+  // index even when matcher filters drop earlier entries from
+  // the chain. With `sourcePath`, this is the canonical
+  // identity pair for `hook_runs.hook_index` (migration 019).
+  entryIndex: number;
 }
 
 // Resolved config for a session — the full ordered list of hooks

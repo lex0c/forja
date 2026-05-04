@@ -97,6 +97,7 @@ const makeSpec = (overrides: Partial<HookSpec> = {}): HookSpec => ({
   sourcePath: '/repo/.agent/hooks.toml',
   event: 'PostToolUse',
   matcher: {},
+  entryIndex: 0,
   command: 'echo {{event}}',
   timeoutMs: 5000,
   failClosed: false,
@@ -543,5 +544,40 @@ describe('dispatchChain — blocking events', () => {
     expect(result.runs).toHaveLength(1);
     expect(result.runs[0]?.spec.command).toBe('h2');
     expect(result.blockedBy?.spec.command).toBe('h2');
+  });
+
+  test('hook_index in audit reflects source-file position, not filter index', async () => {
+    // Earlier cut passed `i` (the filtered-array index) into
+    // dispatchOne. With matcher filtering, the audit row's
+    // hook_index would mismatch the operator's source-file
+    // position whenever a non-matching hook appeared earlier
+    // in the file. Sanity-revert: spec.entryIndex is now the
+    // canonical source — must propagate to hook_runs.
+    const db = openMemoryDb();
+    migrate(db);
+    const sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+    const fake = makeFakeSpawn({ exitCode: 0 });
+
+    // Hooks as they appear in hooks.toml:
+    //   #0 → write_file matcher (won't match bash)
+    //   #1 → no matcher (matches bash)
+    // After filter: only #1 runs. Naive iteration would record
+    // hook_index=0 (the index in `matching`); correct is 1
+    // (entryIndex from the source file).
+    const hooks = [
+      makeSpec({ event: 'PreToolUse', matcher: { tool: 'write_file' }, entryIndex: 0 }),
+      makeSpec({ event: 'PreToolUse', matcher: {}, entryIndex: 1 }),
+    ];
+    const payload = {
+      schema: 'v1',
+      event: 'PreToolUse',
+      sessionId,
+      data: { tool: { name: 'bash', input: {} } },
+    } as HookEventPayload;
+    await dispatchChain(hooks, payload, '/p', { db, sessionId, spawn: fake });
+
+    const rows = listHookRunsBySession(db, sessionId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.hookIndex).toBe(1);
   });
 });
