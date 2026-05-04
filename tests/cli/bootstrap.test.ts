@@ -234,6 +234,63 @@ describe('bootstrap', () => {
     db.close();
   });
 
+  test('boot triggers probe the repo root, not the invocation cwd (regression)', () => {
+    // Bug: bootstrap evaluated boot triggers from the invocation
+    // cwd, not the repo root. Operator running `agent` from
+    // `/repo/src/components/` saw `git` / `package` / `tsconfig`
+    // triggers fail to fire because the probe scanned the subdir
+    // (no root-level files there), even though memories were
+    // loaded from `/repo`. Fix: probe from `resolveRepoRoot(cwd)`.
+    //
+    // Setup: workdir/.git + workdir/package.json (repo-level
+    // trigger files), a project_local memory tagged `triggers:
+    // [git, package]`, then bootstrap from workdir/src/sub. The
+    // memory must surface in the eager prompt section.
+    Bun.spawnSync({
+      cmd: ['git', 'init', workdir],
+      stdout: 'ignore',
+      stderr: 'ignore',
+    });
+    writeFileSync(join(workdir, 'package.json'), '{}');
+    const subDir = join(workdir, 'src', 'sub');
+    mkdirSync(subDir, { recursive: true });
+    const localDir = join(workdir, '.agent', 'memory', 'local');
+    mkdirSync(localDir, { recursive: true });
+    writeFileSync(
+      join(localDir, 'MEMORY.md'),
+      '- [GitTagged](git-tagged.md) — git-tagged memory\n',
+    );
+    writeFileSync(
+      join(localDir, 'git-tagged.md'),
+      [
+        '---',
+        'name: git-tagged',
+        'description: hook for git-tagged',
+        'type: feedback',
+        'source: user_explicit',
+        'triggers:',
+        '  - git',
+        '  - package',
+        '---',
+        '',
+        'body',
+      ].join('\n'),
+    );
+    const { config, db } = bootstrap({
+      prompt: 'hi',
+      cwd: subDir, // invocation cwd is the SUBDIR, not the repo root
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+    });
+    // Memory should be present — `git` / `package` triggers fired
+    // because we probed the repo root.
+    expect(config.systemPrompt).toBeDefined();
+    expect(config.systemPrompt).toContain('git-tagged');
+    db.close();
+  });
+
   test('memory section becomes systemPrompt when no caller prompt and memories exist', () => {
     const localDir = join(workdir, '.agent', 'memory', 'local');
     mkdirSync(localDir, { recursive: true });

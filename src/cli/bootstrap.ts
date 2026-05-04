@@ -194,7 +194,18 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     // path — an absent or empty memory subtree just produces an
     // empty section that composeSystemPrompt passes through,
     // leaving the base prompt unchanged.
-    const memoryRoots = resolveScopeRoots(resolveRepoRoot(cwd));
+    // Resolve the repo root once and reuse for memory scope roots
+    // AND boot trigger probes. Earlier cut called
+    // `evaluateBootTriggers(cwd)` separately, which broke the
+    // common case of running `agent` from a repo subdirectory:
+    // memory was loaded from the repo root (`resolveRepoRoot(cwd)`)
+    // but trigger probes scanned `cwd`, missing root-level
+    // `.git` / `package.json` / `tsconfig.json` etc. Memories
+    // tagged with those triggers got filtered out even though
+    // the same session loaded the project memory containing them.
+    // Single `repoRoot` value keeps the two consumers aligned.
+    const repoRoot = resolveRepoRoot(cwd);
+    const memoryRoots = resolveScopeRoots(repoRoot);
     memoryRegistry = createMemoryRegistry({ roots: memoryRoots, db, cwd });
     // SessionStart expiry GC (spec MEMORY.md §6.2). Auto-removes
     // memories whose `expires:` field is on or before today. Each
@@ -222,15 +233,17 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
       );
     }
     // Boot-time trigger context (spec §4.3). evaluateBootTriggers
-    // probes the cwd for well-known files (.git, .env, package.json,
-    // AGENTS.md, etc.); each present file is added to a Set that
-    // assembleMemorySection consults when filtering memories tagged
-    // with `triggers:` in their frontmatter. Memories without
-    // triggers are always included; tagged memories load only if a
-    // matching trigger fired. Operator-defined runtime tags pass
-    // through unconditionally per the rule documented in
-    // `src/memory/triggers.ts`.
-    const bootContext = evaluateBootTriggers(cwd);
+    // probes the REPO ROOT for well-known files (.git, .env,
+    // package.json, AGENTS.md, etc.); each present file is added
+    // to a Set that assembleMemorySection consults when filtering
+    // memories tagged with `triggers:` in their frontmatter.
+    // Probing the repo root (not the invocation cwd) matches the
+    // memory roots resolved above — same anchor for both. An
+    // operator running `agent` from `/repo/src/components/`
+    // expects `git` / `package` triggers to fire because the
+    // project memory loaded from `/repo` mentions them; probing
+    // cwd would silently miss every project-root file.
+    const bootContext = evaluateBootTriggers(repoRoot);
     const memorySection = assembleMemorySection({
       registry: memoryRegistry,
       bootContext,
