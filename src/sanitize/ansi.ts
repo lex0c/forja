@@ -1,23 +1,35 @@
-// ANSI escape stripping for tool output sanitization.
+// Control-sequence stripping for tool / model output sanitization.
+//
+// Despite the file name, `stripAnsi` removes ANSI escape sequences
+// AND raw control bytes (C0 / C1 / DEL) that would otherwise hijack
+// terminal state if echoed back: BEL beeps the user, BS rewinds the
+// cursor, XOFF (\x13) pauses the terminal's input delivery to our
+// process, etc. The three TUI-safe whitespace controls (TAB \x09,
+// LF \x0a, CR \x0d) survive untouched — they appear legitimately in
+// file content and don't disrupt cursor state.
 //
 // Per SECURITY_GUIDELINE.md §3.2 (line 161) and §5 invariant 4: tool
-// output reaches the model context (and the audit log) only after the
-// sanitization layer runs. The threat model:
-//   - "Esconde texto, fakes confirmação, redireciona terminal" — a tool
-//     that returns "\x1b[2K\x1b[1AOK" lets a malicious file lie about
-//     what happened when its output is later echoed back to a terminal
-//     (verbose mode, audit replay, recap).
-//   - Token waste — ANSI codes inflate the model's input context with
-//     bytes the model can't render.
+// output reaches the model context (and the audit log) only after
+// the sanitization layer runs. The threat model:
+//   - "Esconde texto, fakes confirmação, redireciona terminal" — a
+//     tool that returns "\x1b[2K\x1b[1AOK" lets a malicious file
+//     lie about what happened when its output is later echoed back
+//     to a terminal (verbose mode, audit replay, recap).
+//   - Token waste — escape codes inflate the model's input context
+//     with bytes the model can't render.
 //   - Prompt-injection vector via embedded text inside escape blocks.
+//   - Terminal-state hijack — control bytes can pause input
+//     delivery, hide the cursor, switch alt-screen, etc.; reproduced
+//     as "frozen REPL" when assistant text echoed file content back
+//     through stdout without the C0 strip applied.
 //
-// The spec language is "Strip CSI controle, preservar SGR seguro" — a
-// terminal-renderer concern. For tool output flowing to the MODEL we
-// strip everything: the model has no terminal to render colors into,
-// and a future renderer that wants to display tool output to the user
-// can re-decide at its own layer (with its own safe-SGR allowlist).
-// Stripping at intake means audit/DB rows never store live escape
-// bytes that could later leak into a terminal.
+// The spec language is "Strip CSI controle, preservar SGR seguro" —
+// a terminal-renderer concern. For tool output flowing to the MODEL
+// we strip everything: the model has no terminal to render colors
+// into, and a future renderer that wants to display tool output to
+// the user can re-decide at its own layer (with its own safe-SGR
+// allowlist). Stripping at intake means audit/DB rows never store
+// live escape bytes that could later leak into a terminal.
 
 // Recognized ANSI patterns:
 //
@@ -70,6 +82,34 @@ const ANSI_PATTERN = new RegExp(
     // where nextChunk starts with `[31m`). Always strip. Comes last
     // so structured sequences match first.
     '\\x1b',
+    // C0 control bytes (everything in 0x00-0x1F except the three
+    // safe-for-TUI whitespace controls: TAB \x09, LF \x0a, CR \x0d)
+    // plus DEL \x7F. The dangerous ones for terminal-state hijacking:
+    //   - BEL  \x07: makes the terminal beep / flash on every byte
+    //   - BS   \x08: backspace; rewinds the cursor
+    //   - VT/FF \x0b/\x0c: vertical tab / form feed; some terminals
+    //                     scroll the screen (xterm clears past prompt)
+    //   - SO/SI \x0e/\x0f: shift in/out alternate character set
+    //   - XON/XOFF \x11/\x13: software flow control. XOFF makes the
+    //                        terminal pause sending bytes back to us
+    //                        (raw mode disables the kernel's IXON
+    //                        handling but the terminal driver's
+    //                        bidirectional flow control still applies
+    //                        on some platforms — operator perceives it
+    //                        as "input froze")
+    //   - SUB  \x1a: substitute; some terminals interpret as "abort"
+    //   - DEL  \x7F: delete; behaves like backspace on many terminals
+    // Stripping the whole non-whitespace C0 range catches these and
+    // any future control we don't know about. Cheaper than maintaining
+    // an enumerated allow-list and equally safe — model output has no
+    // legitimate use for C0 controls in prose.
+    //
+    // Range explicitly excludes \x1b (covered by the structured
+    // CSI/OSC/SS3 patterns above and the bare-ESC fallback). Splitting
+    // 0x0e-0x1a + 0x1c-0x1f leaves no gap for ESC to be redundantly
+    // matched here — the control flow is "structured ESC sequence
+    // first, then any other dangerous byte" without overlap.
+    '[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1a\\x1c-\\x1f\\x7f]',
   ].join('|'),
   'g',
 );
