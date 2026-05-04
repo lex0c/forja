@@ -20,7 +20,7 @@
 // here — the caller is expected to pass a canonical absolute path
 // (REPL passes `baseConfig.cwd`, which bootstrap already resolved).
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 interface TrustFile {
@@ -59,17 +59,34 @@ export const isTrusted = (path: string, cwd: string): boolean =>
 // duplicates). Creates the parent directory as needed (e.g., first
 // ever forja boot when `~/.config/agent/` doesn't exist).
 //
-// Atomic-ish via write-then-rename would be safer against partial
-// writes, but Bun's `Bun.file().write()` is sync-write to the same
-// path — a SIGINT mid-write could leave a partial file. For the
-// trust list (small, infrequent writes) the practical risk is low
-// and a corrupted file just wipes back to empty (next boot
-// re-prompts). Accept the simpler implementation; tighten if a
-// real incident surfaces.
+// Atomic write via tmp-then-rename. POSIX `rename(2)` is atomic
+// when source and destination are on the same filesystem (always
+// true here — same parent dir). Two concurrent `agent` invocations
+// approving from different terminals can still race the read
+// portion (A reads, B reads, A writes, B writes — B clobbers A's
+// new entry), but the file itself never lands in a corrupt half-
+// written state. The clobber is recoverable: next time the lost
+// cwd is opened, the operator just re-confirms; trust is additive
+// without delete semantics, so a missed entry is a re-prompt, not
+// a leaked allowance.
+//
+// File mode 0o600 (owner read/write only). The trust list isn't
+// secret in the credential sense, but it is operator-private
+// project context — on a shared multi-user box the default 0644
+// would let other users enumerate the directories you work in.
+// Cheap defensive narrowing.
 export const addTrustedDir = (path: string, cwd: string): void => {
   const current = loadTrustedDirs(path);
   if (current.includes(cwd)) return;
   const next: TrustFile = { directories: [...current, cwd] };
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, { encoding: 'utf8' });
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true });
+  // Suffix with PID so two concurrent processes don't fight over
+  // the same tmp filename.
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(next, null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
+  renameSync(tmp, path);
 };

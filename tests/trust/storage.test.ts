@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { addTrustedDir, isTrusted, loadTrustedDirs } from '../../src/trust/storage.ts';
@@ -69,5 +77,20 @@ describe('trust/storage', () => {
     expect(raw).toContain('/projects/foo');
     // Has trailing newline (POSIX text-file convention).
     expect(raw.endsWith('\n')).toBe(true);
+  });
+
+  test('written file is owner-private (mode 0o600)', () => {
+    addTrustedDir(path, '/projects/foo');
+    const mode = statSync(path).mode & 0o777;
+    expect(mode).toBe(0o600);
+  });
+
+  test('atomic write leaves no .tmp artifact behind', () => {
+    // tmp-then-rename: after a successful add, only the final file
+    // should exist in the dir. A leftover `.pid.tmp` would mean the
+    // rename never happened.
+    addTrustedDir(path, '/projects/foo');
+    const entries = readdirSync(dir);
+    expect(entries).toEqual(['trusted_dirs.json']);
   });
 });

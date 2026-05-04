@@ -512,7 +512,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // interrupt path is defined. From here on, Ctrl+C with a modal up
   // resolves the modal AND fires the interrupt ladder atomically —
   // no draft loss, no second-tap requirement.
-  onModalInterrupt = triggerInterrupt;
+  //
+  // Gate on `running`: triggerInterrupt's contract assumes a turn
+  // is in flight (it emits an `interrupt` UIEvent that flips
+  // `softInterrupted` in the renderer). When a modal opens BEFORE
+  // any turn started — the boot-time trust prompt does this — and
+  // the operator hits Ctrl+C, calling triggerInterrupt unconditionally
+  // would paint the "esc again to force" footer cue with no run
+  // behind it. Modal still resolves 'cancel' via the manager's own
+  // path; we just skip the spurious interrupt emit.
+  onModalInterrupt = () => {
+    if (running) triggerInterrupt();
+  };
 
   // Slash command registry + cumulative tracker for /cost. Built once
   // per REPL session — the registry is stable; cumulative is mutated
