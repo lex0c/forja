@@ -53,6 +53,24 @@ export interface PermissionAskArgs {
   reason?: string;
 }
 
+// Trust flavor — first-run "is this directory safe to operate in?"
+// prompt (AGENTIC_CLI.md §9.1). Answer maps to: yes → persist
+// the cwd to trusted_dirs.json and continue; no/cancel → exit
+// cleanly without entering the REPL.
+export interface TrustAskArgs {
+  path: string;
+  agentsMd?: boolean;
+}
+
+export type TrustAnswer = 'yes' | 'no' | 'cancel';
+
+// Trust flavor's option list. Kept in sync with the reducer's
+// `trust:ask` ConfirmState construction in state.ts.
+const TRUST_OPTIONS: readonly ConfirmOption[] = [
+  { key: '1', label: 'Yes, I trust this folder', value: 'yes' },
+  { key: '2', label: 'No, exit', value: 'no' },
+];
+
 // Permission flavor's option list, kept in sync with the reducer's
 // ConfirmState construction. Exported so producers can introspect /
 // override (future trust/memory variants do their own lists).
@@ -73,6 +91,12 @@ export interface ModalManager {
   // session-allow → execute + write session-layer rule (deferred,
   // see 1.d.7), no/cancel → deny.
   askPermission: (args: PermissionAskArgs, opts?: ConfirmAskOptions) => Promise<PermissionAnswer>;
+  // Trust flavor. Returns the operator's choice (or 'cancel' on Esc /
+  // close / timeout). Caller (REPL boot) translates: yes → persist
+  // and continue, no/cancel → exit before entering the REPL. Spec
+  // §9.1 calls for a 5-minute timeout that defaults to read-only —
+  // we forward that via `opts.timeoutMs` so the producer decides.
+  askTrust: (args: TrustAskArgs, opts?: ConfirmAskOptions) => Promise<TrustAnswer>;
   // Number of pending modals (active + queued). Tests inspect.
   pendingCount: () => number;
   // Drop the queue and resolve any pending promise as `cancel`. Used
@@ -302,6 +326,18 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           ...(args.reason !== undefined ? { reason: args.reason } : {}),
         }),
         PERMISSION_OPTIONS(args.toolName),
+        opts?.timeoutMs,
+      ),
+    askTrust: (args, opts) =>
+      enqueueConfirm<TrustAnswer>(
+        (promptId) => ({
+          type: 'trust:ask',
+          ts: now(),
+          promptId,
+          path: args.path,
+          agentsMd: args.agentsMd === true,
+        }),
+        TRUST_OPTIONS,
         opts?.timeoutMs,
       ),
     pendingCount: () => (active !== null ? 1 : 0) + queue.length,

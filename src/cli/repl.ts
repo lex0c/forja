@@ -23,6 +23,7 @@ import { basename } from 'node:path';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
 import { DEFAULT_BUDGET } from '../harness/types.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
+import { addTrustedDir, isTrusted, trustListPath } from '../trust/index.ts';
 import {
   type FocusHandler,
   type HarnessAdapter,
@@ -77,6 +78,21 @@ export interface RunReplOptions {
   // place of process.stdout.write. Tests pass a string collector to
   // capture the banner / live frames without touching real stdio.
   rendererWrite?: (s: string) => void;
+  // Test seam: skip the first-run trust prompt (AGENTIC_CLI §9.1).
+  // Production never sets this — operator always sees the prompt
+  // on first cwd visit. Tests don't drive the trust modal (the
+  // existing fixtures predate it), so leaving the gate active
+  // would block every REPL test on an unanswered modal.
+  skipTrustPrompt?: boolean;
+  // Test seam: override the trust list file path. Without this,
+  // the trust-prompt tests would persist across runs in the dev
+  // machine's real `~/.config/agent/trusted_dirs.json` and
+  // interfere with each other (run 1 trusts /tmp/forja-repl-test,
+  // run 2 finds it already trusted, modal never fires). Tests
+  // point this at a temp file unique to the test. Production
+  // leaves it undefined — REPL falls through to the platform
+  // default via `trustListPath()`.
+  trustListPathOverride?: string | null;
 }
 
 // All UIEvents flow through to the bus. Earlier this filter dropped
@@ -925,6 +941,54 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     cwd: baseConfig.cwd,
     env,
   });
+
+  // Trust prompt (AGENTIC_CLI.md §9.1). First time the operator
+  // opens forja in a directory, ask before running anything that
+  // could touch the filesystem. The list of trusted dirs persists
+  // in `~/.config/agent/trusted_dirs.json` (or the platform
+  // equivalent); subsequent boots from the same cwd skip the
+  // prompt.
+  //
+  // Headless / pipe modes: skip the prompt entirely. The REPL is
+  // gated to TTY-only earlier (line ~150), so by the time we land
+  // here we know an interactive terminal is available. If trust
+  // storage path can't be derived (no HOME, no XDG_CONFIG_HOME,
+  // no APPDATA — pathological env), fall through to per-session
+  // trust: the prompt fires on every boot and approval doesn't
+  // persist. Caller still gets the safety prompt; only the
+  // memoization is lost.
+  const trustPath =
+    options.trustListPathOverride !== undefined ? options.trustListPathOverride : trustListPath();
+  const cwdAlreadyTrusted = trustPath !== null && isTrusted(trustPath, baseConfig.cwd);
+  if (options.skipTrustPrompt !== true && !cwdAlreadyTrusted) {
+    const answer = await modalManager.askTrust({ path: baseConfig.cwd });
+    if (answer !== 'yes') {
+      // Operator declined or pressed Esc. Exit cleanly without
+      // entering the REPL: db.close, renderer.close, raw mode off.
+      // Use the shutdown path so every cleanup hook runs (mirror of
+      // /quit). exitCode=0 for "user opted out", not an error.
+      exitCode = 0;
+      requestShutdown();
+      await exitPromise;
+      return exitCode;
+    }
+    if (trustPath !== null) {
+      try {
+        addTrustedDir(trustPath, baseConfig.cwd);
+      } catch (e) {
+        // Persistence failure shouldn't block the session — operator
+        // already approved, just lose the memoization. Surface as
+        // a warn so a chronic config issue (read-only HOME, full
+        // disk) is visible without being fatal.
+        const msg = e instanceof Error ? e.message : String(e);
+        bus.emit({
+          type: 'warn',
+          ts: now(),
+          message: `failed to persist trust for ${baseConfig.cwd}: ${msg} (will re-prompt next boot)`,
+        });
+      }
+    }
+  }
 
   // Permission posture hint. When no project policy file
   // contributed, the operator runs under strict + empty rules

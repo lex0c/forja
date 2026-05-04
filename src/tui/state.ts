@@ -732,24 +732,45 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
 
     case 'trust:ask': {
       const options: ConfirmOption[] = [
-        { key: '1', label: 'Yes, trust this directory', value: 'yes' },
-        { key: '2', label: 'No, read-only this session', value: 'no' },
+        { key: '1', label: 'Yes, I trust this folder', value: 'yes' },
+        { key: '2', label: 'No, exit', value: 'no' },
       ];
-      const previewLines = [event.path];
-      if (event.agentsMd) previewLines.push('AGENTS.md present (not yet trusted)');
+      // Layout intentionally mirrors the IDE-style "accessing
+      // workspace" prompt: title is the action, the cwd lives on
+      // its own preview row (so a long path doesn't crowd the
+      // title), and the prose explains the safety question + the
+      // capabilities the operator is granting. Question slot stays
+      // null because the prose already does that job; pushing both
+      // would double-state the ask.
+      const previewLines: string[] = [
+        event.path,
+        '',
+        'Quick safety check: is this a project you created or one you trust?',
+        '(Your own code, a well-known open source project, or work from your team.)',
+        "If not, take a moment to review what's in this folder first.",
+        '',
+        'Forja will be able to read, edit, and execute files here.',
+      ];
+      if (event.agentsMd) {
+        previewLines.push('');
+        previewLines.push('AGENTS.md present — its instructions will be loaded on first use.');
+      }
       return {
         state: {
           ...state,
           modal: {
             promptId: event.promptId,
             flavor: 'trust',
-            title: 'Trust directory',
-            subject: event.path,
+            title: 'Accessing workspace:',
+            subject: null,
             preview: previewLines,
-            question: 'Trust this directory and run with full permissions?',
+            question: null,
+            // D65 (UI.md §6.5): last option is the conservative
+            // default. Operator hitting Enter without reading
+            // chooses "No, exit" — the safer outcome here.
             options,
             selectedIndex: options.length - 1,
-            hints: ['Esc to cancel'],
+            hints: ['Enter to confirm', 'Esc to cancel'],
           },
         },
         permanent: [],
