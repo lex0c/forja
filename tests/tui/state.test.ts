@@ -30,7 +30,12 @@ const drive = (events: UIEvent[]): { state: LiveState; permanent: PermanentItem[
 };
 
 describe('session lifecycle', () => {
-  test('session:start populates status fields and emits a header item', () => {
+  test('session:start populates status fields and emits NO permanent (UI.md §3.2)', () => {
+    // Spec change: session:start no longer prints a session-header
+    // line. The user-submit inverse bar (§4.10.8) marks turn
+    // boundaries; UUID-bearing rules per turn just clutter scrollback.
+    // Status state still updates so the footer can show model / steps
+    // / cost on the right column.
     const r = applyEvent(createInitialState(), start());
     expect(r.state.status.sessionId).toBe('s1');
     expect(r.state.status.profile).toBe('autonomous');
@@ -38,15 +43,7 @@ describe('session lifecycle', () => {
     expect(r.state.status.model).toBe('claude-opus-4-7');
     expect(r.state.status.planMode).toBe(false);
     expect(r.state.ended).toBe(false);
-    expect(r.permanent).toEqual([
-      {
-        kind: 'session-header',
-        sessionId: 's1',
-        profile: 'autonomous',
-        project: 'forja',
-        model: 'claude-opus-4-7',
-      },
-    ]);
+    expect(r.permanent).toEqual([]);
   });
 
   test('session:start with planMode=true flips status.planMode', () => {
@@ -110,7 +107,10 @@ describe('session lifecycle', () => {
       contextWindow: 200000,
       maxOutputTokens: 4096,
       cwd: '/home/lex/forja',
-      env: [{ key: 'subagents', value: '0' }],
+      env: [
+        { kind: 'meta', key: 'subagents', value: '0' },
+        { kind: 'flag', name: 'checkpoints' },
+      ],
     });
     // State unchanged — banner is pure scrollback.
     expect(r.state).toEqual(initial);
@@ -123,7 +123,10 @@ describe('session lifecycle', () => {
         contextWindow: 200000,
         maxOutputTokens: 4096,
         cwd: '/home/lex/forja',
-        env: [{ key: 'subagents', value: '0' }],
+        env: [
+          { kind: 'meta', key: 'subagents', value: '0' },
+          { kind: 'flag', name: 'checkpoints' },
+        ],
       },
     ]);
   });
@@ -203,11 +206,16 @@ describe('assistant streaming', () => {
     expect(result.permanent).toEqual([]);
   });
 
-  test('end with empty buffer + usage emits chip-only permanent (tool-only turn)', () => {
-    // Provider call that returned tool_use blocks but no text still
-    // consumed real output tokens — operator sees the cost signal as
-    // a chip line. text stays '' so formatPermanent emits header
-    // alone.
+  test('end with empty buffer + usage emits NO permanent (tool-only turn)', () => {
+    // Provider call that returned tool_use blocks but no text used to
+    // emit a metadata-only permanent so formatPermanent could render
+    // a `· Generated N tokens` chip header above the tool chips.
+    // The chip header was removed (UI.md §4.10.5) — duration shows
+    // up in the turn-end marker (§3.2 `Cogitated for X`), tokens
+    // roll up into the footer cost. Emitting a metadata-only
+    // permanent the formatter would render as [] forces the
+    // renderer through writeTransition (erase + full redraw) for no
+    // scrollback gain — wasteful in tool-heavy flows. So: don't emit.
     const result = drive([
       { type: 'assistant:start', ts: 1000, messageId: 'm1' },
       {
@@ -221,9 +229,7 @@ describe('assistant streaming', () => {
       },
       { type: 'assistant:end', ts: 4200, messageId: 'm1' },
     ]);
-    expect(result.permanent).toEqual([
-      { kind: 'assistant', text: '', durationMs: 3200, outputTokens: 47 },
-    ]);
+    expect(result.permanent).toEqual([]);
   });
 
   test('assistant:usage merges token counts onto pendingAssistant', () => {
@@ -622,6 +628,54 @@ describe('interrupt (soft / hard)', () => {
       start({ ts: 2, sessionId: 's2' }),
     ]);
     expect(state.softInterrupted).toBe(false);
+  });
+});
+
+describe('idle Ctrl+C exit gate (UI.md §5.4)', () => {
+  test('initial state has exitArmed null', () => {
+    expect(createInitialState().exitArmed).toBeNull();
+  });
+
+  test('interrupt:exit-arm sets exitArmed with the event timestamp', () => {
+    const r = applyEvent(createInitialState(), { type: 'interrupt:exit-arm', ts: 42 });
+    expect(r.state.exitArmed).toEqual({ at: 42 });
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('interrupt:exit-cancel clears exitArmed', () => {
+    const { state } = drive([
+      { type: 'interrupt:exit-arm', ts: 1 },
+      { type: 'interrupt:exit-cancel', ts: 2 },
+    ]);
+    expect(state.exitArmed).toBeNull();
+  });
+
+  test('interrupt:exit-cancel on null state is idempotent (no permanent emit)', () => {
+    const r = applyEvent(createInitialState(), { type: 'interrupt:exit-cancel', ts: 1 });
+    expect(r.state.exitArmed).toBeNull();
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('repeated interrupt:exit-arm refreshes the timestamp (latest press wins)', () => {
+    const { state } = drive([
+      { type: 'interrupt:exit-arm', ts: 100 },
+      { type: 'interrupt:exit-arm', ts: 250 },
+    ]);
+    expect(state.exitArmed).toEqual({ at: 250 });
+  });
+
+  test('session:start clears exitArmed (boundary cleanup before turn)', () => {
+    const { state } = drive([{ type: 'interrupt:exit-arm', ts: 1 }, start({ ts: 2 })]);
+    expect(state.exitArmed).toBeNull();
+  });
+
+  test('session:end clears exitArmed (boundary cleanup after turn)', () => {
+    const { state } = drive([
+      start(),
+      { type: 'interrupt:exit-arm', ts: 2 },
+      { type: 'session:end', ts: 3, sessionId: 's1', reason: 'done' },
+    ]);
+    expect(state.exitArmed).toBeNull();
   });
 });
 

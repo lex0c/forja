@@ -86,6 +86,14 @@ const makeRunAgent = (
   captured: CapturedRun[];
   emitInto: (idx: number, event: HarnessEvent) => void;
   finish: (idx: number, override?: Partial<HarnessResult>) => void;
+  // Resolve the pending runAgent promise WITHOUT re-emitting
+  // session_finished. Lets a test simulate the overlap window
+  // where session_finished was already delivered synchronously
+  // (flipping `running=false`), the operator started a follow-up
+  // turn, and only THEN the prior runAgent's outer-finally
+  // cleanup completes — the moment the .finally() chain in
+  // startTurn runs against shared state owned by a newer turn.
+  settle: (idx: number, override?: Partial<HarnessResult>) => void;
 } => {
   const captured: CapturedRun[] = [];
   let nextN = 1;
@@ -117,6 +125,22 @@ const makeRunAgent = (
     captured,
     emitInto: (idx, event) => captured[idx]?.emit(event),
     finish: (idx, override) => {
+      const r = pendingResolves[idx];
+      if (r === undefined) throw new Error(`no pending run at ${idx}`);
+      // Mirror the real harness's emit-then-return order: session_finished
+      // fires synchronously BEFORE the runAgent Promise resolves
+      // (loop.ts calls `safeEmit` inside `finish()` before returning the
+      // result up the stack). The REPL's onHarnessEvent reads
+      // `result.sessionId` / costs from the event payload — bookkeeping
+      // moved off the runAgent .then() so the operator isn't gated on
+      // the harness's outer-finally cleanup (checkpoint purge + bg
+      // cleanup, see repl.ts comment). Tests need the same ordering.
+      const result = buildResult(resolveSession(idx + 1), override ?? {});
+      const cap = captured[idx];
+      if (cap !== undefined) cap.emit({ type: 'session_finished', result });
+      r(override ?? {});
+    },
+    settle: (idx, override) => {
       const r = pendingResolves[idx];
       if (r === undefined) throw new Error(`no pending run at ${idx}`);
       r(override ?? {});
@@ -211,7 +235,7 @@ describe('repl — boot + smoke', () => {
       });
       // Boot succeeded. Drive Ctrl+C to exit cleanly.
       await tick();
-      stdin.feed('\x03');
+      stdin.feed('\x04');
       expect(await promise).toBe(130);
     } finally {
       Object.defineProperty(process.stdout, 'isTTY', {
@@ -221,14 +245,13 @@ describe('repl — boot + smoke', () => {
     }
   });
 
-  test('idle raw-mode Ctrl+C exits 130 (matches SIGINT path, not 0)', async () => {
-    // Pre-fix the cancelInput path called requestShutdown() without
-    // setting exitCode, so raw-mode Ctrl+C from idle exited 0 — making
-    // interrupt-driven exits look like success in shells / CI /
-    // automation that check exit status. The SIGINT handler explicitly
-    // set exitCode=130 (POSIX convention); the cancelInput path should
-    // match. Direct test of the new contract isolated from broader
-    // smoke teardowns.
+  test('idle raw-mode Ctrl+C double-tap exits 130 (UI.md §5.4 gate)', async () => {
+    // Spec §5.4: first Ctrl+C at idle/empty-buffer arms the gate
+    // (footer flips to `Press Ctrl-C again to exit`); a second press inside
+    // the 2s window exits 130 (POSIX SIGINT). Pre-spec a single press
+    // exited immediately; the gate prevents accidental drops.
+    // exitCode=130 (not 0) keeps shells / CI / automation seeing
+    // interrupt-driven exits as interrupt.
     const stdin = makeStdin();
     const promise = runRepl({
       args: makeArgs(),
@@ -237,11 +260,74 @@ describe('repl — boot + smoke', () => {
       skipTtyCheck: true,
     });
     await tick();
+    // First press arms — no exit.
+    stdin.feed('\x03');
+    await tick();
+    // Second press within window exits 130.
     stdin.feed('\x03');
     expect(await promise).toBe(130);
   });
 
-  test('skipTtyCheck=true lets the REPL boot and exits on empty Ctrl+C with code 130', async () => {
+  test('idle raw-mode single Ctrl+C does NOT exit (gate armed, awaits second tap)', async () => {
+    // Direct negative control: a single press must NOT trigger
+    // shutdown. Confirms the gate isn't a no-op (would silently
+    // exit on first tap if the cancelInput → handleIdleInterrupt
+    // path skipped the armed check).
+    const stdin = makeStdin();
+    let resolved = false;
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+    }).then((code) => {
+      resolved = true;
+      return code;
+    });
+    await tick();
+    stdin.feed('\x03');
+    // Tick a few times to give any erroneous shutdown path a chance
+    // to fire. The promise should remain pending.
+    await tick();
+    await tick();
+    expect(resolved).toBe(false);
+    // Cleanup via EOF (no gate).
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('first Ctrl+C flips footer to "Press Ctrl-C again to exit" cue (e2e producer→render)', async () => {
+    // Coverage gap: prior tests verify the gate's exit code AND
+    // verify the reducer/footer in isolation, but nothing ties the
+    // producer's bus emit to the rendered output. This pins the
+    // contract end-to-end — if armExit() ever stops emitting
+    // `interrupt:exit-arm`, the footer goes silent and the
+    // operator loses the cue, but exit codes still pass.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    const beforeArm = writes.length;
+    stdin.feed('\x03');
+    await flushFrame();
+    const afterArm = writes.slice(beforeArm).join('');
+    expect(afterArm).toContain('Press Ctrl-C again to exit');
+    // Cleanup via EOF.
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('idle Ctrl+D (EOF) exits 130 immediately, no gate (shell convention)', async () => {
+    // §5.4: Ctrl+D is the explicit "I'm done" signal at empty buffer
+    // and bypasses the double-tap gate. Single press exits.
     const stdin = makeStdin();
     const closes: number[] = [];
     const stub = makeBootstrapStub();
@@ -254,14 +340,56 @@ describe('repl — boot + smoke', () => {
       stdin,
       skipTtyCheck: true,
     });
-    // Empty buffer + raw-mode Ctrl+C (\x03) → POSIX SIGINT exit 130.
-    // Matches the SIGINT handler's exit code so shells / CI / automation
-    // see interrupt-driven exits as interrupt regardless of stdin mode.
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     const code = await promise;
     expect(code).toBe(130);
     expect(closes).toHaveLength(1);
+  });
+
+  test('typing between two Ctrl+C disarms the gate (spec §5.4 "qualquer tecla")', async () => {
+    // Sequence: C+C arms → 'a' disarms → C+C re-arms → C+C exits.
+    // Three C+C in a row would also exit on the second; this tests
+    // the cancel-on-other-key path. Without the disarm, the second
+    // C+C in `^C a ^C` would exit prematurely.
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+    });
+    await tick();
+    stdin.feed('\x03'); // arms
+    await tick();
+    stdin.feed('a'); // disarms (input changed → cancelExitArm)
+    await tick();
+    stdin.feed('\x03'); // buffer 'a' → clears (no cancelInput)
+    await tick();
+    stdin.feed('\x03'); // empty buffer → arms fresh
+    await tick();
+    stdin.feed('\x03'); // empty buffer + armed → exits
+    expect(await promise).toBe(130);
+  });
+
+  test('SIGINT (process signal) at idle exits immediately, no gate', async () => {
+    // The double-tap exit gate (UI.md §5.4) is interactive UX —
+    // protects the operator from a stray Ctrl+C keystroke. External
+    // SIGINT senders (supervisors, automation, IDE stop buttons,
+    // `kill -INT $pid`) expect one signal to stop the process; if
+    // SIGINT routed through the gate, a single `kill -INT` would
+    // arm + silently disarm 2s later, leaving the process alive.
+    // Single SIGINT at idle MUST exit 130 (POSIX SIGINT).
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+    });
+    await tick();
+    process.emit('SIGINT');
+    expect(await promise).toBe(130);
   });
 
   test('boot emits welcome banner with correct content + omits empty env entries', async () => {
@@ -284,16 +412,17 @@ describe('repl — boot + smoke', () => {
     await tick();
     await tick();
     const all = writes.join('');
-    expect(all).toContain('forja 0.0.0');
+    // Banner now uses the v-prefixed version (UI.md §4.10.9).
+    expect(all).toContain('forja v0.0.0');
     expect(all).toContain('mock/m');
     expect(all).toContain('200,000 ctx');
     expect(all).toContain('max 4096 out');
     expect(all).toContain('/path/to/repo');
-    // No env line because both subagents and checkpoints were
+    // No env block because both subagents and checkpoints were
     // empty/disabled (D68 — omit when nothing to summarize).
     expect(all).not.toContain('subagents');
     expect(all).not.toContain('checkpoints');
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -317,7 +446,75 @@ describe('repl — boot + smoke', () => {
     // Wrap up.
     ra.finish(0);
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('late finalizer of a prior turn does not clobber the active turn state', async () => {
+    // Regression: `running=false` flips on `session_finished` so the
+    // operator can submit a follow-up turn without waiting for the
+    // harness's outer-finally cleanup (checkpoint purge + bg cleanup
+    // can take seconds). But the prior turn's runAgent Promise is
+    // still pending — when its .finally() chain eventually runs, it
+    // would otherwise reset shared turn state (running, abort
+    // controllers, runningPromise) and clobber the newer active
+    // turn. Per-turn token gate refuses the mutation when a newer
+    // turn has taken over.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+    });
+    await tick();
+    // Turn 1 starts.
+    stdin.feed('first\r');
+    await tick();
+    // Emit session_finished for turn 1 (flips running=false in the
+    // REPL) WITHOUT resolving turn 1's runAgent Promise yet — the
+    // overlap window where the harness's outer-finally cleanup is
+    // still in flight.
+    const result1: HarnessResult = {
+      status: 'done',
+      reason: 'done',
+      sessionId: 'sess-1',
+      steps: 1,
+      durationMs: 1,
+      usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+      costUsd: 0,
+      usageComplete: true,
+    };
+    ra.emitInto(0, { type: 'session_finished', result: result1 });
+    await tick();
+    // Turn 2 starts in the overlap window.
+    stdin.feed('second\r');
+    await tick();
+    expect(ra.captured).toHaveLength(2);
+    const turn2Cfg = ra.captured[1]?.configs[0];
+    const turn2Signal = turn2Cfg?.signal;
+    const turn2SoftSignal = turn2Cfg?.softStopSignal;
+    expect(turn2Signal?.aborted).toBe(false);
+    expect(turn2SoftSignal?.aborted).toBe(false);
+    // NOW turn 1's runAgent Promise settles (late finalizer). Pre-fix
+    // the .finally() would clear `running`, `abortController`, and
+    // `runningPromise` — for turn 2's state. Post-fix the token gate
+    // bails: turn 2 stays the active owner.
+    ra.settle(0);
+    await tick();
+    // Verify turn 2 is still active and its abort controller still
+    // works. If the token gate was missing, abortController would be
+    // null here and Esc/Ctrl+C would route to idle handlers.
+    stdin.feed('\x1b'); // Esc — soft interrupt for the active turn.
+    await flushFrame();
+    expect(turn2SoftSignal?.aborted).toBe(true);
+    // Cleanup.
+    ra.finish(1);
+    await tick();
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -345,7 +542,7 @@ describe('repl — boot + smoke', () => {
     expect(ra.captured[1]?.configs[0]?.resumeFromSessionId).toBe('sess-1');
     ra.finish(1);
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -380,7 +577,7 @@ describe('repl — boot + smoke', () => {
     expect(ra.captured[1]?.configs[0]?.userPrompt).toBe('b');
     ra.finish(1);
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -416,15 +613,17 @@ describe('repl — boot + smoke', () => {
     // it explicitly so shutdown can resolve.
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
   test('second Esc while soft already in flight emits interrupt:hard', async () => {
     // Operator escalates: first Esc → soft (softStopController.abort
     // only), second Esc → hard (abortController.abort, preempts
-    // in-flight work). Asserts the post-1.g.1 contract by reading
-    // both controllers' signal state directly.
+    // in-flight work). Each physical Esc keypress sends a single
+    // `\x1b`; the parser holds it briefly to disambiguate from a CSI
+    // leader, then the lone-ESC drain (REPL-side, ~30ms) flushes it
+    // as an Escape keypress. flushFrame's 50ms wait covers the drain.
     const stdin = makeStdin();
     const ra = makeRunAgent((n) => `sess-${n}`);
     const promise = runRepl({
@@ -453,18 +652,18 @@ describe('repl — boot + smoke', () => {
     const softSignal = cfg?.softStopSignal;
     expect(signal?.aborted).toBe(false);
     expect(softSignal?.aborted).toBe(false);
-    // First Esc: soft fires (cooperative), hard signal untouched.
-    stdin.feed('\x1b\x1b');
+    // First Esc: lone \x1b → drain emits escape after ~30ms → soft.
+    stdin.feed('\x1b');
     await flushFrame();
     expect(softSignal?.aborted).toBe(true);
     expect(signal?.aborted).toBe(false);
-    // Second Esc: escalates to hard — preempts in-flight work.
-    stdin.feed('\x1b\x1b');
+    // Second Esc: same path → drain emits second escape → hard.
+    stdin.feed('\x1b');
     await flushFrame();
     expect(signal?.aborted).toBe(true);
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -503,7 +702,10 @@ describe('repl — boot + smoke', () => {
     expect(signal?.aborted).toBe(true);
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
-    stdin.feed('\x03');
+    // Cleanup: Ctrl+D (EOF) is the direct-exit signal at idle. Ctrl+C
+    // would arm the new double-tap gate (UI.md §5.4) and stall the
+    // test — `\x04` matches the operator's "I'm done" intent.
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -546,7 +748,7 @@ describe('repl — boot + smoke', () => {
     expect(writes.slice(cutoff).join('')).toContain('esc again to force');
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -598,7 +800,7 @@ describe('repl — boot + smoke', () => {
     // Cleanup: resolve the run + exit.
     ra.finish(0, { status: 'interrupted', reason: 'aborted' });
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -653,14 +855,18 @@ describe('repl — boot + smoke', () => {
     // is cooperative — the fixture only listens on the hard signal,
     // so the run doesn't resolve. Second emit escalates to hard
     // (softInterrupted flipped true after the first), which fires
-    // the fixture's abort listener → microtasks → resolve. Third
-    // emit lands with running=false and triggers requestShutdown.
+    // the fixture's abort listener → microtasks → resolve. After
+    // resolution, running=false and a third SIGINT would only ARM
+    // the new idle double-tap gate (UI.md §5.4) — it wouldn't exit.
+    // We use Ctrl+D (EOF) instead for the cleanup shutdown: it
+    // bypasses the gate per spec and triggers requestShutdown
+    // directly, exiting 130.
     process.emit('SIGINT');
     await tick();
     process.emit('SIGINT');
     await tick();
     await tick();
-    process.emit('SIGINT');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
     // Critical ordering: db.close fires AFTER the run resolved.
     const dbCloseIdx = events.indexOf('db.close');
@@ -708,7 +914,7 @@ describe('repl — boot + smoke', () => {
     // Wrap up.
     ra.finish(0);
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -756,7 +962,7 @@ describe('repl — boot + smoke', () => {
       usageComplete: true,
     });
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 });
@@ -765,6 +971,96 @@ describe('repl — slash commands integration', () => {
   // Same SIGINT cleanup as the smoke describe above.
   afterEach(() => {
     process.removeAllListeners('SIGINT');
+  });
+
+  test('`?` on empty buffer dispatches /help (footer cue activation)', async () => {
+    // The footer's `? for help` hint promised the operator a single
+    // keystroke would surface the command list. Pre-fix `?` was a
+    // literal char and the hint lied. With an empty buffer, `?`
+    // dispatches /help directly; same effect as typing /help+Enter.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('?');
+    await flushFrame();
+    // Help command rendered the slash command list to scrollback.
+    expect(writes.some((w) => w.includes('Slash commands:'))).toBe(true);
+    expect(writes.some((w) => w.includes('/quit'))).toBe(true);
+    // `?` did NOT land in the input buffer.
+    stdin.feed('\x04'); // Ctrl+D EOF cleanup
+    expect(await promise).toBe(130);
+  });
+
+  test('`?` shortcut disarms the exit gate before dispatching /help', async () => {
+    // Regression: the `?` shortcut early-returns before the
+    // editor's general disarm path runs. Without an explicit
+    // cancelExitArm() in the shortcut branch, this sequence would
+    // exit 130 unexpectedly:
+    //   1. Ctrl+C (idle) → arms gate, footer flips to "Press Ctrl-C
+    //      again to exit".
+    //   2. `?` → operator hits a non-interrupt key. UI.md §5.4 says
+    //      ANY non-Ctrl+C key disarms; gate must be cancelled.
+    //      Pre-fix the shortcut returned with the gate still armed.
+    //   3. Ctrl+C inside the 2s window → still detects gate as
+    //      armed and exits 130, dropping in-progress context.
+    // With the fix, step 2 disarms; step 3 re-arms instead of
+    // exiting. The operator's protection holds.
+    const stdin = makeStdin();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+    });
+    await tick();
+    // Arm the exit gate.
+    stdin.feed('\x03');
+    await tick();
+    // Press `?` — should dispatch /help AND disarm the gate.
+    stdin.feed('?');
+    await tick();
+    // A single Ctrl+C now must arm fresh (NOT exit). If the gate
+    // had stayed armed across the `?`, this Ctrl+C would have
+    // exited 130 immediately.
+    stdin.feed('\x03');
+    await tick();
+    // Cleanup with EOF — proves the REPL is still alive after the
+    // sequence (process didn't exit unexpectedly).
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('`?` mid-buffer is a literal char (no /help hijack)', async () => {
+    // Operator types a question that begins with `?` mid-thought:
+    // the keystroke must NOT trigger /help. Only the EMPTY-buffer
+    // case dispatches.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('hi?\r'); // type "hi?" + Enter — submit literal "hi?"
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    expect(ra.captured[0]?.configs[0]?.userPrompt).toBe('hi?');
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
   });
 
   test('typing /he opens the popover; Tab completes to /help; Enter dispatches', async () => {
@@ -796,7 +1092,7 @@ describe('repl — slash commands integration', () => {
     expect(all).toContain('Slash commands:');
     expect(all).toContain('/quit');
     // Wrap up.
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -827,7 +1123,7 @@ describe('repl — slash commands integration', () => {
     // Esc to exit slash mode without dispatching, then quit.
     stdin.feed('\x1b\x1b');
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -863,7 +1159,7 @@ describe('repl — slash commands integration', () => {
     const all = writes.join('');
     expect(all).not.toContain('unknown command');
     expect(all).toContain('Slash commands:');
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -884,7 +1180,7 @@ describe('repl — slash commands integration', () => {
     await tick();
     // No turn started — runAgent override never called.
     expect(ra.captured).toHaveLength(0);
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -913,10 +1209,14 @@ describe('repl — slash commands integration', () => {
     // Popover not in the latest writes (would contain /help).
     const recent = writes.join('');
     expect(recent).not.toContain('/help');
-    // Buffer is 'hello'; first Ctrl+C clears it, second exits with
-    // POSIX SIGINT code 130 (raw-mode Ctrl+C now matches SIGINT
-    // semantics — interrupt-driven exit).
-    stdin.feed('\x03\x03');
+    // Cleanup. Buffer is 'hello'; Ctrl+D would forward-delete (buffer
+    // non-empty), so we use first Ctrl+C to clear (input-editor.ts
+    // empties on non-empty buffer), then Ctrl+D to EOF-exit at idle.
+    // Three Ctrl+C in a row would also work (clear → arm → exit) but
+    // EOF is more direct and doesn't depend on the gate's window.
+    stdin.feed('\x03');
+    await flushFrame();
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -971,7 +1271,7 @@ describe('repl — slash commands integration', () => {
     expect(post).toContain('0/99');
     ra.finish(1);
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -1010,7 +1310,7 @@ describe('repl — slash commands integration', () => {
     expect(post).toContain('plan');
     ra.finish(0);
     await tick();
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 
@@ -1046,7 +1346,7 @@ describe('repl — slash commands integration', () => {
     // as a scrollback `error: ...` line. Surface check.
     expect(writes.join('')).toContain('unknown command');
     expect(writes.join('')).toContain('/doesnotexist');
-    stdin.feed('\x03');
+    stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
 

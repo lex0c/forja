@@ -27,10 +27,13 @@ export interface ApplyKeyResult {
   // User pressed Enter on a non-empty buffer. Caller emits
   // `user:submit` and clears via the reducer's existing path.
   submit?: { text: string };
-  // User pressed Ctrl+C with an empty buffer. Caller treats as
-  // "cancel input mode" or "exit"; with non-empty buffer Ctrl+C
-  // clears the buffer (handled internally) instead of bubbling.
-  cancelInput?: true;
+  // User pressed Ctrl+C ('interrupt') or Ctrl+D ('eof') with an empty
+  // buffer. Caller distinguishes: 'interrupt' goes through the
+  // double-tap exit gate (UI.md §5.4 — first arms, second within 2s
+  // exits 130); 'eof' is a direct shell-style exit, no gate.
+  // With non-empty buffer Ctrl+C clears the buffer internally — never
+  // surfaces — and Ctrl+D forward-deletes one char.
+  cancelInput?: 'interrupt' | 'eof';
   // Soft interrupt request: Esc once. Caller decides whether to
   // forward to the harness — only meaningful while running.
   interruptSoft?: true;
@@ -128,14 +131,14 @@ const applyCtrlChar = (input: InputState, char: string): ApplyKeyResult => {
       return { next: deleteRange(input, prevWordBoundary(input), input.cursor) };
     case 'c':
       // With non-empty buffer: clear it (no submit, just reset). With
-      // empty buffer: surface as cancel signal so the caller can
-      // decide (exit, double-Ctrl+C, etc.).
-      if (input.value === '') return { next: input, cancelInput: true };
+      // empty buffer: surface 'interrupt' so the caller can route
+      // through the double-tap exit gate (§5.4).
+      if (input.value === '') return { next: input, cancelInput: 'interrupt' };
       return { next: { value: '', cursor: 0 } };
     case 'd':
-      // EOF when buffer empty — surface as cancelInput. Otherwise
-      // delete forward (same as Delete key).
-      if (input.value === '') return { next: input, cancelInput: true };
+      // EOF when buffer empty — surface 'eof' (direct exit, no gate;
+      // shell convention). Otherwise delete forward (same as Delete).
+      if (input.value === '') return { next: input, cancelInput: 'eof' };
       return { next: deleteRange(input, input.cursor, stepForward(input.value, input.cursor)) };
     case 'h':
       // Same byte as Backspace on most terminals; the key parser
@@ -169,14 +172,27 @@ const applyNamedKey = (
   key: Extract<KeyEvent, { kind: 'key' }>,
 ): ApplyKeyResult => {
   switch (key.name) {
-    case 'enter':
+    case 'enter': {
       // Shift+Enter inserts a newline; plain Enter submits non-empty
       // input. Empty buffer + Enter is a no-op (doesn't bubble as a
       // submit signal — pressing Enter at an empty prompt should not
       // round-trip through the harness).
       if (key.shift) return { next: insertText(input, '\n') };
       if (input.value === '') return NOOP(input);
+      // Backslash continuation (UI.md §5.4): if the char immediately
+      // before the cursor is `\`, drop the backslash and insert a
+      // newline in its place. Bash convention — the operator marks
+      // "I want a newline, not a submit" without needing Shift+Enter
+      // (useful on terminals/keyboards where Shift+Enter is awkward
+      // or eaten by a window manager). Cursor stays at the same
+      // index — the `\n` fills the position the `\` vacated.
+      const beforeCursor = input.value.slice(0, input.cursor);
+      if (beforeCursor.endsWith('\\')) {
+        const value = `${beforeCursor.slice(0, -1)}\n${input.value.slice(input.cursor)}`;
+        return { next: { value, cursor: input.cursor } };
+      }
       return { next: input, submit: { text: input.value } };
+    }
 
     case 'backspace':
       return { next: deleteRange(input, stepBack(input.value, input.cursor), input.cursor) };

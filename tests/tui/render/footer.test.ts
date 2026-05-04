@@ -35,6 +35,11 @@ describe('renderFooter', () => {
     const out = renderFooter(startedSession(), caps);
     expect(out).not.toBeNull();
     expect(out).toContain('? for help');
+    // Newline hint pairs with the input editor's backslash
+    // continuation (UI.md §5.4). Visible alongside `? for help`
+    // in every non-armed state so operators on terminals/WMs that
+    // eat Shift+Enter can discover the alternative.
+    expect(out).toContain('\\+Enter newline');
     expect(out).toContain('• sonnet-4.6');
     expect(out).toContain('3/50');
     expect(out).toContain('$0.0120');
@@ -55,7 +60,7 @@ describe('renderFooter', () => {
     };
     s.activeTools.set('t1', tool);
     const out = renderFooter(s, caps);
-    expect(out).toContain('? for help · esc to interrupt');
+    expect(out).toContain('? for help · \\+Enter newline · esc to interrupt');
   });
 
   test('thinking state also triggers interrupt cue', () => {
@@ -189,10 +194,13 @@ describe('renderFooter', () => {
     expect(visualWidth(out ?? '')).toBe(caps.cols);
   });
 
-  test('renders dim SGR when color enabled', () => {
+  test('renders secondary SGR (bright-black grey) when color enabled', () => {
+    // Footer uses `secondary` (SGR 90) instead of `dim` (SGR 2) so
+    // the hint stays visible on terminals that render faint as
+    // default (xterm, screen, urxvt). Spec UI.md §6.1.
     const colored: Capabilities = { ...caps, color: 'basic' };
     const out = renderFooter(startedSession(), colored);
-    expect(out).toContain(`${CSI}2m`);
+    expect(out).toContain(`${CSI}90m`);
   });
 
   test('cost format degrades with magnitude (under $1 = 4 decimals)', () => {
@@ -223,5 +231,72 @@ describe('renderFooter', () => {
     const out = renderFooter(half, caps);
     expect(out).not.toContain('•');
     expect(out).not.toContain('sonnet-4.6');
+  });
+
+  describe('idle exit-armed cue (UI.md §5.4 + §4.10.6)', () => {
+    test('exitArmed swaps left column to "Press Ctrl-C again to exit"', () => {
+      const s = startedSession();
+      s.exitArmed = { at: 1000 };
+      const out = renderFooter(s, caps);
+      expect(out).toContain('Press Ctrl-C again to exit');
+      // Help hint and any interrupt cue are suppressed — the gate
+      // is the only thing the operator should be reading.
+      expect(out).not.toContain('? for help');
+      expect(out).not.toContain('esc to interrupt');
+    });
+
+    test('exit cue takes precedence over running interrupt cue (operator priority)', () => {
+      // Edge case: gate armed AND a tool is running. Producer
+      // shouldn't normally arm during a run (handleIdleInterrupt
+      // gates on `running`), but defense in depth — if both flags
+      // are true, the exit cue wins because it's a 1-tap-to-exit
+      // hazard and the operator's next keystroke is the most
+      // load-bearing.
+      const s = startedSession();
+      s.exitArmed = { at: 1000 };
+      const tool: ActiveTool = {
+        toolId: 't1',
+        name: 'bash',
+        activeVerb: 'Executing',
+        finalVerb: 'Executed',
+        subject: null,
+        startedAt: 0,
+        preview: [],
+      };
+      s.activeTools.set('t1', tool);
+      const out = renderFooter(s, caps);
+      expect(out).toContain('Press Ctrl-C again to exit');
+      expect(out).not.toContain('esc to interrupt');
+      expect(out).not.toContain('esc again to force');
+    });
+
+    test('exit cue is painted in warn palette when color enabled', () => {
+      const colored: Capabilities = { ...caps, color: 'basic' };
+      const s = startedSession();
+      s.exitArmed = { at: 1000 };
+      const out = renderFooter(s, colored);
+      // SGR 33 (yellow / warn) per term.ts SGR.warn.
+      expect(out).toContain(`${CSI}33m`);
+      expect(out).toContain('Press Ctrl-C again to exit');
+    });
+
+    test('exitArmed null restores the help hint (no leftover cue)', () => {
+      const s = startedSession();
+      s.exitArmed = null;
+      const out = renderFooter(s, caps);
+      expect(out).toContain('? for help');
+      expect(out).not.toContain('Press Ctrl-C again to exit');
+    });
+
+    test('right column unchanged when exitArmed is set (status surface stays honest)', () => {
+      const s = startedSession();
+      s.exitArmed = { at: 1000 };
+      const out = renderFooter(s, caps);
+      // The model/steps/cost remain in the right column — the gate
+      // only takes over the left.
+      expect(out).toContain('• sonnet-4.6');
+      expect(out).toContain('3/50');
+      expect(out).toContain('$0.0120');
+    });
   });
 });

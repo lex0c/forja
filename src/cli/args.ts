@@ -128,6 +128,17 @@ export interface ParsedArgs {
   // operator-driven `--subagent-session-id` invocations without
   // a parent runtime to set it).
   subagentMemoryCwd?: string;
+  // `agent init` mode (AGENTIC_CLI §2.1). Scaffolds
+  // `.agent/permissions.yaml` and exits. The first positional
+  // arg `init` triggers it — diverging from the `--<flag>`
+  // convention every other subcommand uses, but matching shell
+  // muscle memory (`git init`, `npm init`, `cargo init`). When
+  // set, the parser stops collecting prompt fragments and
+  // accepts only the init-specific sub-flags (`--force`,
+  // `--mode`). Mutually exclusive with --json (init is
+  // operator-facing, not scriptable yet) and every other run
+  // mode; the dispatcher checks.
+  init?: { force: boolean; mode: 'strict' | 'acceptEdits' };
 }
 
 export interface ParseError {
@@ -139,7 +150,84 @@ export type ParseResult = { ok: true; args: ParsedArgs } | ParseError;
 
 const POSITIVE_INT = /^[1-9][0-9]*$/;
 
+// Positional subcommand dispatch. The verb has to be the very
+// first token on the command line — anywhere else it's a prompt
+// fragment (the operator can write `agent "review the init
+// script"` without it being mis-parsed as a verb). Returns null
+// when argv[0] isn't a known subcommand, so the caller falls
+// through to the main flag-parser. Sub-flags allowed inside the
+// verb's tail are validated here; unknown flags surface a verb-
+// scoped error so the diagnostic points at the right surface.
+const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
+  if (argv.length === 0 || argv[0] !== 'init') return null;
+  let force = false;
+  let mode: 'strict' | 'acceptEdits' = 'strict';
+  let i = 1;
+  while (i < argv.length) {
+    const token = argv[i];
+    if (token === undefined) {
+      i += 1;
+      continue;
+    }
+    if (token === '--force') {
+      force = true;
+      i += 1;
+      continue;
+    }
+    if (token === '--mode') {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith('--')) {
+        return { ok: false, message: '--mode requires a value (strict|acceptEdits)' };
+      }
+      if (value !== 'strict' && value !== 'acceptEdits') {
+        return {
+          ok: false,
+          message: `--mode must be one of strict|acceptEdits, got '${value}'`,
+        };
+      }
+      mode = value;
+      i += 2;
+      continue;
+    }
+    if (token === '--help' || token === '-h') {
+      // Threaded through args so the dispatcher's --help branch
+      // still fires (pre-existing top-level behavior). Init has no
+      // separate help text — the global usage already lists it.
+      return {
+        ok: true,
+        args: {
+          prompt: '',
+          json: false,
+          version: false,
+          help: true,
+          plan: false,
+          listSessions: false,
+          includeSubagents: false,
+          yes: false,
+        },
+      };
+    }
+    return { ok: false, message: `init: unknown argument '${token}'` };
+  }
+  return {
+    ok: true,
+    args: {
+      prompt: '',
+      json: false,
+      version: false,
+      help: false,
+      plan: false,
+      listSessions: false,
+      includeSubagents: false,
+      yes: false,
+      init: { force, mode },
+    },
+  };
+};
+
 export const parseArgs = (argv: readonly string[]): ParseResult => {
+  const initParsed = parseInitSubcommand(argv);
+  if (initParsed !== null) return initParsed;
   const args: ParsedArgs = {
     prompt: '',
     json: false,
@@ -527,6 +615,10 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
 export const usage = (): string =>
   [
     'Usage: agent [options] <prompt>',
+    '       agent init [--force] [--mode strict|acceptEdits]',
+    '',
+    'Subcommands:',
+    '  init                   Scaffold .agent/permissions.yaml (refuse-on-exists; --force overwrites)',
     '',
     'Options:',
     '  --version, -v          Print version and exit',
@@ -547,6 +639,7 @@ export const usage = (): string =>
     '  --max-steps <n>        Override harness step budget',
     '',
     'Examples:',
+    '  agent init',
     '  agent "summarize the README"',
     '  agent --model openai/gpt-4o "list the source files"',
     '  agent --json "what changed in the last commit?" > events.ndjson',

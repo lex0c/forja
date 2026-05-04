@@ -44,8 +44,11 @@ export const renderToolCardLive = (tool: ActiveTool, caps: Capabilities, now: nu
   // Sub-content: subject (per-tool extracted) under the shared
   // connector glyph. Skipped when the vocab entry has no subject for
   // this args shape (or a misbehaving producer emitted '').
+  // `secondary` (SGR 90) instead of `dim` (SGR 2) so the subject is
+  // actually readable in default terminals — see permanent.ts for
+  // the matching choice on the finalized chip.
   if (tool.subject !== null && tool.subject !== '') {
-    lines.push(paint(caps, 'dim', `${subContentConnector(caps)}${tool.subject}`));
+    lines.push(paint(caps, 'secondary', `${subContentConnector(caps)}${tool.subject}`));
   }
 
   // Streaming output preview (separate from the subject line). Tree

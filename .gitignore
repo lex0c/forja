@@ -25,3 +25,4 @@ dist/
 
 # Bun
 .bun/
+.agent/

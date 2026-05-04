@@ -5,8 +5,16 @@
 //   2. fold each event into LiveState via applyEvent
 //   3. emit permanent items to stdout (they become scrollback) via
 //      `formatPermanent` (lives in `./render/permanent.ts`)
-//   4. clear the previous live region and write the new one (layout
-//      via `composeLive` in `./render/compose.ts`)
+//   4. update the live region. Two paths:
+//        - layout change (height differs from prev frame, first frame,
+//          or after a permanent transition wiped the region) → full
+//          erase + redraw all lines.
+//        - same height → differential: walk to row 0, only emit
+//          content for lines that actually changed, skip the rest,
+//          reposition cursor at the end. This is what makes typing
+//          flicker-free under key repeat: the static lines (status,
+//          rules, footer) aren't touched, so the terminal never
+//          repaints them.
 //
 // Mechanics-only: every formatting decision (glyphs, color, line
 // shape) lives in `./render/`. The renderer just calls whatever
@@ -16,6 +24,13 @@
 // produce a single redraw. Permanent items bypass the scheduler — they
 // must hit stdout before the new live state, since they shape the
 // scrollback above the live region.
+//
+// Each redraw is a single `write()` (UI.md §2.2 step 4) wrapped in
+// DECSET 2026 (synchronized output) so terminals that support it
+// present the frame atomically. The single-write + synchronized-output
+// + differential triple is what keeps the live region stable under
+// 30fps key repeat across both modern (kitty/wezterm/alacritty) and
+// older (xterm vanilla) terminal emulators.
 
 import type { Bus } from './bus.ts';
 import type { UIEvent } from './events.ts';
@@ -36,15 +51,19 @@ import {
   type FrameSchedulerOptions,
   type RawModeStdin,
   type ResizeStream,
+  beginSyncOutput,
   clearDown,
+  clearLine,
   createFrameScheduler,
   createResizeWatcher,
+  cursorDown,
   cursorForward,
   cursorUp,
   disableBracketedPasteOn,
   disableRawMode,
   enableBracketedPasteOn,
   enableRawMode,
+  endSyncOutput,
 } from './term.ts';
 
 // Re-export the canonical compose function, its type, and the
@@ -118,69 +137,214 @@ export const createRenderer = (options: RendererOptions): Renderer => {
   const liveCaps: Capabilities = { ...options.caps };
 
   let state = createInitialState();
-  // Number of lines written by the last `drawLive`. Used to compute
-  // how many lines to clear on the next redraw.
+  // Number of lines written by the last full draw. Used to compute
+  // how many lines to clear on the next full redraw.
   let liveHeight = 0;
   // Row (0-based from top of live region) where the cursor currently
-  // sits. After drawLive without inline cursor positioning this equals
-  // `liveHeight - 1` (cursor at end of last line). When cursor inline
-  // positioning fires, this matches the cursor row so eraseLive walks
-  // the right number of lines back to row 0.
+  // sits. After a full draw without inline cursor positioning this
+  // equals `liveHeight - 1` (cursor at end of last line). When cursor
+  // inline positioning fires, this matches the cursor row so erase
+  // walks the right number of lines back to row 0.
   let cursorRow = 0;
+  // Last frame's truncated lines, kept so the next redraw can diff
+  // line-by-line and only emit what changed (UI.md §2.2). Without
+  // this every keystroke under key repeat would repaint the static
+  // lines (status / footer / rules) 30x/s — even with a single
+  // syscall + DECSET 2026 wrap, terminals like xterm vanilla render
+  // ANSI incrementally and the operator perceives flicker on those
+  // lines. Differential rendering skips them entirely when their
+  // content didn't change.
+  //
+  // Reset on: layout change (height differs), permanent emit (live
+  // region was erased to make room), screen:clear, session end,
+  // close. The reset forces the next frame through the full-draw
+  // path so the renderer's layout state stays in lockstep with what
+  // the terminal actually shows.
+  let prevLines: string[] = [];
   let closed = false;
 
-  const eraseLive = (): void => {
-    if (liveHeight === 0) return;
+  // ─── Build helpers ────────────────────────────────────────────────
+  //
+  // Each helper produces ANSI/text output as a string and updates
+  // internal layout state (`liveHeight`, `cursorRow`) in place. The
+  // orchestrators (`redraw`, the permanent-emit path) concatenate the
+  // pieces and emit them in **one** `write()` per redraw cycle.
+  //
+  // Spec contract (UI.md §2.2 step 4): a frame is a single
+  // `process.stdout.write(...)`. Splitting erase + draw across two
+  // writes flushes the terminal between them — for ~1ms the live
+  // region is gone, which the operator perceives as flicker. Keeping
+  // the whole sequence in one syscall makes the update atomic from
+  // the terminal's POV.
+
+  const buildErase = (): string => {
+    if (liveHeight === 0) return '';
     // \r → col 0; cursorUp(cursorRow) → row 0 of live region;
     // clearDown wipes everything below. cursorRow may be < liveHeight-1
     // when inline cursor positioning moved the cursor into the input
-    // buffer mid-write.
-    write(`\r${cursorUp(cursorRow)}${clearDown}`);
+    // buffer mid-frame.
+    const s = `\r${cursorUp(cursorRow)}${clearDown}`;
     liveHeight = 0;
+    return s;
   };
 
-  const drawLive = (): void => {
-    if (closed || state.ended) return;
-    const raw = composeLive(state, liveCaps, now());
-    if (raw.length === 0) {
+  // Full draw: write every line from scratch. Used after an erase
+  // (first frame, layout change, permanent transition). Updates
+  // `liveHeight` / `cursorRow` to reflect the new layout.
+  const buildFullDraw = (truncated: string[]): string => {
+    if (truncated.length === 0) {
       liveHeight = 0;
-      return;
+      return '';
     }
-    const truncated = raw.map((l) => truncateToWidth(l, liveCaps.cols));
-    write(truncated.join('\n'));
     liveHeight = truncated.length;
     cursorRow = truncated.length - 1;
-    // Inline cursor positioning. After the join+write the terminal
-    // cursor sits at end of the last line; back it up to where the
+    let s = truncated.join('\n');
+    // Inline cursor positioning. After the join the terminal cursor
+    // would sit at end of the last line; back it up to where the
     // input box wants it (cursorUp + carriage return + cursorForward).
     // The helpers no-op on n <= 0, so single concat handles "already
     // on the right row" / "col 0" without branching.
     const cursor = composeCursor(state, liveCaps, truncated.length);
     if (cursor !== null) {
       const linesUp = truncated.length - 1 - cursor.row;
-      write(`${cursorUp(linesUp)}\r${cursorForward(cursor.col)}`);
+      s += `${cursorUp(linesUp)}\r${cursorForward(cursor.col)}`;
       cursorRow = cursor.row;
     }
+    return s;
   };
 
-  const writePermanent = (items: PermanentItem[]): void => {
-    if (items.length === 0) return;
+  // Differential draw: assumes the live region is currently rendered
+  // at the same height as `truncated`. Walks to row 0, then for each
+  // changed line walks down + clearLine + writes the new content.
+  // Unchanged lines are NEVER touched — that's the whole point: under
+  // key repeat the only line that changes is the input row, so the
+  // surrounding static lines stay pixel-stable instead of getting
+  // wiped+repainted 30x/s.
+  const buildDifferentialDraw = (truncated: string[]): string => {
+    if (truncated.length === 0) return '';
+    // Start at row 0 of the live region.
+    let buf = `\r${cursorUp(cursorRow)}`;
+    let curRow = 0;
+    for (let i = 0; i < truncated.length; i++) {
+      if (truncated[i] !== prevLines[i]) {
+        if (curRow !== i) {
+          buf += cursorDown(i - curRow);
+          curRow = i;
+        }
+        // \r + clearLine + content. clearLine wipes the whole row
+        // (CSI 2K), so leftover columns from the previous frame's
+        // longer content disappear correctly.
+        buf += `\r${clearLine}${truncated[i]}`;
+      }
+    }
+    // Reposition cursor to the input target.
+    const cursor = composeCursor(state, liveCaps, truncated.length);
+    if (cursor !== null) {
+      if (curRow !== cursor.row) {
+        buf +=
+          cursor.row > curRow ? cursorDown(cursor.row - curRow) : cursorUp(curRow - cursor.row);
+      }
+      buf += `\r${cursorForward(cursor.col)}`;
+      cursorRow = cursor.row;
+    } else {
+      // No cursor target (modal up) → land at the bottom row of the
+      // live region. We don't bother positioning to end-of-line like
+      // the full-draw path does (where the join's natural drift puts
+      // the cursor at the last line's end column) — the next frame's
+      // erase only consumes `cursorRow`, and its leading `\r` resets
+      // col 0 before the cursor-up walk. So col 0 vs end-of-line is
+      // observationally identical.
+      const target = truncated.length - 1;
+      if (curRow !== target) {
+        buf += cursorDown(target - curRow);
+      }
+      cursorRow = target;
+    }
+    return buf;
+  };
+
+  const buildPermanent = (items: PermanentItem[]): string => {
+    if (items.length === 0) return '';
     // Format each item to lines via caps-aware `formatPermanent`,
     // flatten, and emit. Permanent lines are NOT truncated — they're
     // scrollback and the user can scroll horizontally / wrap-view in
     // their terminal. (Live region is the only place width matters,
     // because we have to cursor-up to erase.)
     const lines = items.flatMap((item) => formatPermanent(item, liveCaps));
-    if (lines.length === 0) return;
-    write(`${lines.join('\n')}\n`);
+    if (lines.length === 0) return '';
+    return `${lines.join('\n')}\n`;
+  };
+
+  // Wrap a non-empty payload with synchronized output (DECSET 2026)
+  // so terminals that support it present the frame atomically. Empty
+  // payloads bypass the wrap to avoid emitting BSU+ESU around nothing
+  // (would still be no-op on the terminal, but pollutes test fixtures
+  // and wastes a couple of bytes per spurious tick).
+  const wrapSync = (buf: string): string =>
+    buf.length === 0 ? '' : `${beginSyncOutput}${buf}${endSyncOutput}`;
+
+  // Compose a full erase + permanent + draw transition into one buffer
+  // and emit it. Used by every path that prints permanent items
+  // (regular event with `result.permanent`, reducer-error fallback,
+  // screen:clear-while-modal warning) so the operator never sees an
+  // intermediate "erased, no permanent yet" state. After this path
+  // the live region is fully redrawn from scratch — `prevLines` is
+  // updated so the next differential redraw has a correct baseline.
+  const writeTransition = (permanent: PermanentItem[]): void => {
+    if (closed) return;
+    let buf = buildErase();
+    buf += buildPermanent(permanent);
+    // Always redraw the live region after a permanent emit. Earlier
+    // this branch short-circuited on `state.ended` so session:end
+    // wouldn't redraw input/footer, but that left the input box
+    // invisible for the gap between session:end and the next
+    // user:submit (operator typing in the dark). Now the live region
+    // stays present; the next user prompt naturally lands on a
+    // visible input box. The renderer's `closed` flag handles
+    // teardown for one-shot mode (close() erases the live region).
+    const raw = composeLive(state, liveCaps, now());
+    const truncated = raw.map((l) => truncateToWidth(l, liveCaps.cols));
+    buf += buildFullDraw(truncated);
+    prevLines = truncated;
+    if (buf.length > 0) write(wrapSync(buf));
   };
 
   // Public redraw — used by external triggers (resize, foreground
   // resume) and by the scheduler.
+  //
+  // Two paths:
+  //   - First frame OR layout change (height differs from prev) →
+  //     erase + full draw. Resets `prevLines` to the new content.
+  //   - Same height → differential: only changed lines emit content.
+  //
+  // Differential is the anti-flicker path. Under key repeat, only
+  // the input line changes per frame; the surrounding static lines
+  // stay untouched and the terminal never repaints them.
   const redraw = (): void => {
     if (closed) return;
-    eraseLive();
-    drawLive();
+    const raw = composeLive(state, liveCaps, now());
+    const truncated = raw.map((l) => truncateToWidth(l, liveCaps.cols));
+
+    // Empty live region — just erase.
+    if (truncated.length === 0) {
+      const buf = buildErase();
+      if (buf.length > 0) write(wrapSync(buf));
+      prevLines = [];
+      return;
+    }
+
+    // First frame OR height change → full erase + draw.
+    if (liveHeight === 0 || prevLines.length !== truncated.length) {
+      const buf = buildErase() + buildFullDraw(truncated);
+      if (buf.length > 0) write(wrapSync(buf));
+      prevLines = truncated;
+      return;
+    }
+
+    // Differential — same height, only changed rows emit.
+    const buf = buildDifferentialDraw(truncated);
+    if (buf.length > 0) write(wrapSync(buf));
+    prevLines = truncated;
   };
 
   const scheduler = createFrameScheduler(redraw, schedulerOptions);
@@ -230,11 +394,9 @@ export const createRenderer = (options: RendererOptions): Renderer => {
       if (state.modal !== null) {
         // Surface as a warn so the operator sees the refusal
         // explicitly instead of silently doing nothing.
-        eraseLive();
-        writePermanent([
+        writeTransition([
           { kind: 'warn', message: 'screen:clear refused: a modal is open (answer it first)' },
         ]);
-        drawLive();
         heartbeat?.bump();
         return;
       }
@@ -242,12 +404,24 @@ export const createRenderer = (options: RendererOptions): Renderer => {
       // \x1b[H   — move cursor to home (top-left)
       // The terminal preserves the scrollback buffer above; the
       // live region's `liveHeight` is now stale (cursor is at row 0,
-      // not at the end of last live line) — reset to 0 so eraseLive
-      // doesn't try to walk back over content we just wiped.
-      write('\x1b[2J\x1b[H');
+      // not at the end of last live line) — reset to 0 so the next
+      // erase doesn't try to walk back over content we just wiped.
+      // Wipe + draw are coalesced into one write AND wrapped in
+      // synchronized output so the operator sees the post-clear
+      // frame appear instantly, without a perceived empty flash.
+      // `prevLines` reset because the screen was wiped — the next
+      // redraw must go through the full-draw path.
       liveHeight = 0;
       cursorRow = 0;
-      drawLive();
+      prevLines = [];
+      const raw = composeLive(state, liveCaps, now());
+      const truncated = raw.map((l) => truncateToWidth(l, liveCaps.cols));
+      let buf = '\x1b[2J\x1b[H';
+      if (truncated.length > 0) {
+        buf += buildFullDraw(truncated);
+        prevLines = truncated;
+      }
+      write(wrapSync(buf));
       heartbeat?.bump();
       return;
     }
@@ -259,17 +433,13 @@ export const createRenderer = (options: RendererOptions): Renderer => {
       // as a warn line in scrollback so the user sees something
       // actionable, and keep the renderer alive.
       const msg = err instanceof Error ? err.message : String(err);
-      eraseLive();
-      writePermanent([{ kind: 'warn', message: `renderer reducer error: ${msg}` }]);
-      drawLive();
+      writeTransition([{ kind: 'warn', message: `renderer reducer error: ${msg}` }]);
       heartbeat?.bump();
       return;
     }
     state = result.state;
     if (result.permanent.length > 0) {
-      eraseLive();
-      writePermanent(result.permanent);
-      drawLive();
+      writeTransition(result.permanent);
     } else {
       scheduler.request();
     }
@@ -323,7 +493,10 @@ export const createRenderer = (options: RendererOptions): Renderer => {
       heartbeat?.close();
       scheduler.close();
       // Final clean live region so the prompt returns to a sane place.
-      eraseLive();
+      // Single write is fine here — no follow-up draw to coalesce with.
+      const eraseBuf = buildErase();
+      if (eraseBuf.length > 0) write(eraseBuf);
+      prevLines = [];
       if (bracketedPaste) disableBracketedPasteOn(write);
       if (stdin !== undefined) disableRawMode(stdin);
     },

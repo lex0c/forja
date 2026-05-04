@@ -27,49 +27,56 @@ const startedSession = (): LiveState => {
   };
 };
 
-// Rule above input (UI.md §4.10). Full-width (caps.cols), Unicode '─'
-// or ASCII '-'. The exact glyph repeated `cols` times is what the
-// composer emits.
+// Rule above/below input (UI.md §6.3 "bloco do input" exception).
+// Edge-to-edge — the rules + the input line form a 3-row unit that
+// breaks out of the frame margin so the operator's eye reads it as
+// a coherent typing zone.
 const expectedRule = (cols: number, unicode: boolean): string => (unicode ? '─' : '-').repeat(cols);
 
 describe('composeLive layout', () => {
-  // Bottom anchor (no modal): [..., rule, input(s), rule, footer].
+  // Bottom anchor (no modal): [..., rule_above, input(s), rule_below, footer].
   // Trailing 2 lines = rule + footer. Input occupies the N rows
-  // above the trailing rule.
+  // above the trailing rule. Per UI.md §6.3 the input-block rules
+  // are edge-to-edge (start with `─`/`-` directly, no margin), so
+  // we detect the rule above by leading-glyph match.
   const countInputLines = (out: string[]): number => {
     let n = 0;
     for (let i = out.length - 3; i >= 0; i--) {
       const l = out[i] ?? '';
-      if (l.startsWith('> ') || l.startsWith('  ')) n++;
-      else break;
+      if (l.startsWith('─') || l.startsWith('-')) break;
+      n++;
     }
     return Math.max(1, n);
   };
   const inputRow = (out: string[], inputLineIdx = 0): string =>
     out[out.length - 2 - countInputLines(out) + inputLineIdx] ?? '';
 
-  test('pre-session: rule + input + rule + footer (status line absent)', () => {
+  test('pre-session: BLANK + rule + input + rule + footer', () => {
+    // The blank above the rule (UI.md §6.3) always fires — it
+    // separates the input block from whatever scrollback ends
+    // immediately above the live region.
     const out = composeLive(createInitialState(), caps, 0);
-    // [rule, '> ', rule, footer]. Length = 4.
-    expect(out).toHaveLength(4);
-    expect(out[0]).toBe(expectedRule(caps.cols, true));
-    expect(out[1]).toBe('> ');
-    expect(out[2]).toBe(expectedRule(caps.cols, true));
-    expect(out[3]).toContain('? for help');
+    expect(out).toHaveLength(5);
+    expect(out[0]).toBe('  '); // forced blank above input rule
+    expect(out[1]).toBe(expectedRule(caps.cols, true));
+    expect(out[2]).toBe('> ');
+    expect(out[3]).toBe(expectedRule(caps.cols, true));
+    expect(out[4]).toContain('? for help');
   });
 
-  test('after session start: status line, rule, input, rule, footer', () => {
+  test('after session start: BLANK + rule + input + rule + footer', () => {
+    // Status line was absorbed into footer (UI.md §4.4 superseded by
+    // §4.10.6). Layout is now [BLANK, rule, '> ', rule, footer].
     const out = composeLive(startedSession(), caps, 0);
-    // [status, rule, '> ', rule, footer]. Length = 5.
     expect(out).toHaveLength(5);
-    expect(out[0]).toContain('forja');
+    expect(out[0]).toBe('  ');
     expect(out[1]).toBe(expectedRule(caps.cols, true));
     expect(out[2]).toBe('> ');
     expect(out[3]).toBe(expectedRule(caps.cols, true));
     expect(out[4]).toContain('opus');
   });
 
-  test('active tool card sits ABOVE status line + bottom anchor', () => {
+  test('active tool card sits ABOVE bottom anchor', () => {
     const s = startedSession();
     const tool: ActiveTool = {
       toolId: 't1',
@@ -82,14 +89,19 @@ describe('composeLive layout', () => {
     };
     s.activeTools.set('t1', tool);
     const out = composeLive(s, caps, 1000);
-    // [chip head, sub-content, status, rule, input, rule, footer] = 7.
-    expect(out).toHaveLength(7);
-    expect(out[0]).toContain('Executing');
-    expect(out[1]).toContain('ls');
-    expect(out[2]).toContain('forja');
-    expect(out[3]).toBe(expectedRule(caps.cols, true));
-    expect(out[4]).toBe('> ');
-    expect(out[5]).toBe(expectedRule(caps.cols, true));
+    // Each top-level block (here: tool card) gets a leading BLANK.
+    // Plus the forced BLANK above the input rule.
+    //   [BLANK, chip head, sub-content, BLANK, rule, input, rule, footer]
+    // Length = 8.
+    expect(out).toHaveLength(8);
+    expect(out[0]).toBe('  '); // leading blank before tool card
+    expect(out[1]).toContain('Executing');
+    expect(out[2]).toContain('ls');
+    expect(out[3]).toBe('  '); // blank between content and input rule
+    expect(out[4]).toBe(expectedRule(caps.cols, true));
+    expect(out[5]).toBe('> ');
+    expect(out[6]).toBe(expectedRule(caps.cols, true));
+    expect(out[7]).toContain('opus');
   });
 
   test('layered live region: TodoList → assistant chip → tool cards (top→bottom)', () => {
@@ -118,22 +130,31 @@ describe('composeLive layout', () => {
     };
     s.activeTools.set('t1', tool);
     const out = composeLive(s, caps, 100);
-    // Expected layout (top→bottom):
-    //   [Tasks header, todo row, assistant chip, tool head, sub, status, rule, input, rule, footer]
-    expect(out[0]).toContain('Tasks');
-    expect(out[1]).toContain('plan it');
-    expect(out[2]).toContain('Generating…');
-    expect(out[3]).toContain('Executing');
-    expect(out[4]).toContain('ls');
-    expect(out[5]).toContain('forja');
-    expect(out[6]).toBe(expectedRule(caps.cols, true));
-    expect(out[7]).toBe('> ');
-    expect(out[8]).toBe(expectedRule(caps.cols, true));
-    expect(out[9]).toContain('? for help');
-    expect(out).toHaveLength(10);
+    // Expected layout (top→bottom): EVERY top-level "session" block
+    // gets a leading BLANK so each is bounded by breathing space on
+    // both sides. Sub-content (rows under "Tasks", `└─` under chips)
+    // stays tight — it's the parent's subsession.
+    //   [BLANK, Tasks header, todo row,
+    //    BLANK, assistant chip,
+    //    BLANK, tool head, sub-content,
+    //    BLANK, rule, input, rule, footer]
+    expect(out[0]).toBe('  '); // leading blank before TodoList
+    expect(out[1]).toContain('Tasks');
+    expect(out[2]).toContain('plan it');
+    expect(out[3]).toBe('  '); // before assistant chip
+    expect(out[4]).toContain('Generating…');
+    expect(out[5]).toBe('  '); // before tool card
+    expect(out[6]).toContain('Executing');
+    expect(out[7]).toContain('ls');
+    expect(out[8]).toBe('  '); // before input rule
+    expect(out[9]).toBe(expectedRule(caps.cols, true));
+    expect(out[10]).toBe('> ');
+    expect(out[11]).toBe(expectedRule(caps.cols, true));
+    expect(out[12]).toContain('? for help');
+    expect(out).toHaveLength(13);
   });
 
-  test('assistant chip alone (no todos, no tools) renders between status anchor and live tools slot', () => {
+  test('assistant chip alone (no todos, no tools) renders above bottom anchor', () => {
     const s = startedSession();
     s.pendingAssistant = {
       messageId: 'm1',
@@ -145,10 +166,12 @@ describe('composeLive layout', () => {
       cacheCreation: null,
     };
     const out = composeLive(s, caps, 1000);
-    // [chip, status, rule, input, rule, footer] = 6.
-    expect(out).toHaveLength(6);
-    expect(out[0]).toContain('Generating…');
-    expect(out[1]).toContain('forja');
+    // [BLANK, chip, BLANK, rule, input, rule, footer] = 7.
+    expect(out).toHaveLength(7);
+    expect(out[0]).toBe('  '); // leading blank before chip
+    expect(out[1]).toContain('Generating…');
+    expect(out[2]).toBe('  '); // blank between chip and input rule
+    expect(out[3]).toBe(expectedRule(caps.cols, true));
   });
 
   test('multi-line input keeps input above the trailing rule + footer', () => {
@@ -192,7 +215,8 @@ describe('composeLive layout', () => {
   test('ASCII fallback uses dashes for the rule', () => {
     const ascii: Capabilities = { ...caps, unicode: false };
     const out = composeLive(createInitialState(), ascii, 0);
-    expect(out[0]).toBe(expectedRule(ascii.cols, false));
+    // out[0] is the forced blank; rule sits at out[1].
+    expect(out[1]).toBe(expectedRule(ascii.cols, false));
   });
 
   test('rule width tracks caps.cols (measured visually, ANSI-aware)', () => {
@@ -200,13 +224,14 @@ describe('composeLive layout', () => {
     const out = composeLive(createInitialState(), narrow, 0);
     // visualWidth strips ANSI escapes — robust whether color is on
     // or off. .length would break the moment color flipped to basic.
-    expect(visualWidth(out[0] ?? '')).toBe(20);
+    // Rule sits at out[1] (out[0] is the forced blank above input).
+    expect(visualWidth(out[1] ?? '')).toBe(20);
   });
 
   test('rule width holds with color enabled (SGR codes do not bloat visual width)', () => {
     const colored: Capabilities = { ...caps, cols: 30, color: 'basic' };
     const out = composeLive(createInitialState(), colored, 0);
-    expect(visualWidth(out[0] ?? '')).toBe(30);
+    expect(visualWidth(out[1] ?? '')).toBe(30);
   });
 
   test('rule + footer suppressed when modal is up (modal owns its own structure)', () => {
@@ -231,6 +256,46 @@ describe('composeLive layout', () => {
     expect(out.some((l) => l.includes('? for help'))).toBe(false); // footer hint
   });
 
+  test('modal lines are NOT padded (renderModal already bakes the §6.3 frame margin)', () => {
+    // Regression guard: composeLive must NOT run modal output through
+    // padFrame. renderModal already emits content with `'  '` indent
+    // (its own §6.3 frame margin) AND emits rules at the full
+    // caps.cols width. Padding would double-indent content (4sp) and
+    // push rules to caps.cols+2, which truncateToWidth then clips
+    // by 2 columns on the right — visible as the modal box losing
+    // its right edge on every row.
+    const s = startedSession();
+    s.modal = {
+      promptId: 'p1',
+      flavor: 'permission',
+      title: 'Run command',
+      subject: 'rm -rf /',
+      preview: [],
+      question: 'Allow?',
+      options: [{ key: '1', label: 'Yes', value: 'yes' }],
+      selectedIndex: 0,
+      hints: ['Esc to cancel'],
+    };
+    const out = composeLive(s, caps, 0);
+    // A rule line starts with `─` (or `-`). After padFrame it would
+    // start with `'  ─'`. Find the rule rows and assert col 0 is
+    // the rule glyph, not a space.
+    const ruleLines = out.filter((l) => l.startsWith('─') || l.startsWith('-'));
+    expect(ruleLines.length).toBeGreaterThan(0);
+    for (const line of ruleLines) {
+      // First char must be the rule glyph itself (no leading pad).
+      expect(line.startsWith('  ')).toBe(false);
+      // Visual width matches caps.cols (full edge-to-edge).
+      // String length ≈ visual width because rule chars are 1 col each.
+      expect(line.length).toBe(caps.cols);
+    }
+    // Content rows (title/subject/question/options/hints) carry the
+    // modal's own internal `'  '` indent — that's the frame margin
+    // already, NOT a doubled `'    '`.
+    expect(out.some((l) => l.startsWith('  Run command'))).toBe(true);
+    expect(out.some((l) => l.startsWith('    Run command'))).toBe(false);
+  });
+
   // FOOTER_BLOCK_LINES guard: composeCursor's row math depends on
   // composeLive emitting exactly that many lines below the input.
   // Drift here = silent cursor mispositioning. Test catches additions
@@ -239,10 +304,54 @@ describe('composeLive layout', () => {
     const s = createInitialState();
     s.input.value = 'abc';
     const out = composeLive(s, caps, 0);
-    // out shape (no upper region, no modal): [rule, '> abc', rule, footer]
-    // = 1 (rule above) + 1 (input) + FOOTER_BLOCK_LINES.
-    const expectedLength = 1 /* rule above */ + 1 /* input lines */ + FOOTER_BLOCK_LINES;
+    // out shape (no upper region, no modal):
+    //   [BLANK, rule, '> abc', rule, footer]
+    // = 1 (blank) + 1 (rule above) + 1 (input) + FOOTER_BLOCK_LINES.
+    const expectedLength =
+      1 /* blank */ + 1 /* rule above */ + 1 /* input lines */ + FOOTER_BLOCK_LINES;
     expect(out).toHaveLength(expectedLength);
+  });
+
+  test('frame margin (UI.md §6.3): the input block (rule + input + rule) is edge-to-edge; everything else padded', () => {
+    // UI.md §6.3 "bloco do input" exception — the 3 rows that form
+    // the typing zone (rule above + input + rule below) all live at
+    // col 0 so they read as a coherent unit. Banner, status, footer,
+    // tool cards, modal, etc. all get the 2sp frame margin.
+    const s = startedSession();
+    s.input.value = 'hi';
+    const out = composeLive(s, caps, 0);
+    // Shape: [status, rule, '> hi', rule, footer].
+    const inputIdx = out.findIndex((l) => l.startsWith('> '));
+    expect(inputIdx).toBeGreaterThan(-1);
+    const ruleAboveIdx = inputIdx - 1;
+    const ruleBelowIdx = inputIdx + 1;
+    // The 3-row input block: none start with '  ' (they start with '─'
+    // for the rules and '> ' for the input).
+    expect(out[ruleAboveIdx]?.startsWith('  ')).toBe(false);
+    expect(out[inputIdx]?.startsWith('  ')).toBe(false);
+    expect(out[ruleBelowIdx]?.startsWith('  ')).toBe(false);
+    // Everything outside the block is padded.
+    out.forEach((line, i) => {
+      if (i >= ruleAboveIdx && i <= ruleBelowIdx) return;
+      expect(line.startsWith('  ')).toBe(true);
+    });
+  });
+
+  test('multi-line input: ALL input lines (prompt + continuations) skip the frame margin', () => {
+    // Continuations render as `  body` — superficially identical to
+    // a padded line. The composer must NOT pad them because the
+    // operator typed them as one logical input block; padding would
+    // produce `    body` and break alignment with the `> ` prompt.
+    const s = startedSession();
+    s.input.value = 'a\nb';
+    const out = composeLive(s, caps, 0);
+    // Find input by `> ` prompt; continuations sit immediately after.
+    const promptIdx = out.findIndex((l) => l.startsWith('> '));
+    expect(promptIdx).toBeGreaterThan(-1);
+    expect(out[promptIdx]).toBe('> a');
+    // Continuation: `  b` — exactly 2 spaces (renderInput's prefix),
+    // not 4 (which would be padding + renderInput prefix).
+    expect(out[promptIdx + 1]).toBe('  b');
   });
 
   test('composeLive throws when the bottom anchor is malformed (defensive)', () => {
@@ -325,21 +434,122 @@ describe('composeCursor', () => {
     expect(composeCursor(s, caps, 6)).toEqual({ row: 3, col: 2 });
   });
 
-  test('col clamps to caps.cols-1 when buffer is wider than the terminal', () => {
+  test('soft-wrap: long buffer line spans multiple visual rows; cursor lands on the right sub-row', () => {
+    // Buffer that overflows the terminal width wraps into multiple
+    // visual rows (renderInput soft-wraps; composeCursor mirrors the
+    // wrap math). The cursor never gets clamped at the right edge —
+    // it lands at the actual sub-row + col where the next char would
+    // appear. Pre-fix the cursor pinned to caps.cols-1 and the
+    // operator typed past the visible edge unable to track position.
     const narrow: Capabilities = { ...caps, cols: 10 };
+    // innerWidth = cols - prefix(2) = 8.
+    // 50 chars: ceil(50/8) = 7 visual rows. Char 50 is at offset 50,
+    // sub-row floor(50/8) = 6, col within sub-row = 50%8 = 2 → col 4.
     const s = startedSession();
     s.input.value = 'a'.repeat(50);
-    s.input.cursor = 50; // far past the right edge
-    const cur = composeCursor(s, narrow, 5);
-    expect(cur).not.toBeNull();
-    expect(cur?.col).toBe(narrow.cols - 1);
+    s.input.cursor = 50;
+    // Layout (no upper region in this test): the input occupies rows
+    // [inputStartRow .. +6]. lineCount must be enough to fit input +
+    // FOOTER_BLOCK_LINES; we pass a generous 12. inputStartRow = 12 - 2 - 7 = 3.
+    const cur = composeCursor(s, narrow, 12);
+    expect(cur).toEqual({ row: 3 + 6, col: 4 });
   });
 
-  test('col clamp does not mangle short inputs that already fit', () => {
+  test('soft-wrap: cursor at sub-row boundary lands at start of next sub-row', () => {
+    // Char immediately after a wrap boundary belongs to the NEXT
+    // visual sub-row, col 2 (right after the continuation prefix).
+    const narrow: Capabilities = { ...caps, cols: 10 };
+    // innerWidth = 8. Cursor at offset 8 → sub-row 1, col 2.
+    const s = startedSession();
+    s.input.value = 'a'.repeat(20);
+    s.input.cursor = 8;
+    // 20 chars: ceil(20/8) = 3 sub-rows. lineCount = 3 + 2 + 1 (status) = generous 8.
+    const cur = composeCursor(s, narrow, 8);
+    // visualRowsBefore = 0 (single buffer line). subRow = 1. col = 2.
+    expect(cur?.row).toBe(8 - 2 - 3 + 1);
+    expect(cur?.col).toBe(2);
+  });
+
+  test('short inputs that already fit emit cursor without sub-row math kicking in', () => {
     const narrow: Capabilities = { ...caps, cols: 20 };
     const s = startedSession();
     s.input.value = 'short';
     s.input.cursor = 5;
     expect(composeCursor(s, narrow, 5)).toEqual({ row: 2, col: 7 });
+  });
+
+  test('cursor at exact wrap boundary at end of line clamps to right edge of last sub-row', () => {
+    // Without the clamp, cursor at offset = innerWidth (end of a line
+    // whose length is exactly innerWidth) would compute as sub-row 1
+    // — but renderInput only emits 1 sub-row for an 8-char line in
+    // an 8-innerWidth setup. The phantom sub-row would visually
+    // overlap the rule below the input. Clamp puts the cursor at the
+    // right edge of the last actual sub-row; next char typed grows
+    // the input naturally.
+    const narrow: Capabilities = { ...caps, cols: 10 }; // innerWidth = 8
+    const s = startedSession();
+    s.input.value = 'a'.repeat(8); // exactly innerWidth
+    s.input.cursor = 8;
+    // 1 sub-row: lineCount = 1 (status) + 1 (rule) + 1 (input) + 2 (rule+footer) = 5.
+    // Wait, composeCursor takes lineCount from caller; pass generous 5 here.
+    const cur = composeCursor(s, narrow, 5);
+    // numSubRows = ceil(8/8) = 1. subRow would be 1 → clamped to 0.
+    // col clamped to cols - 1 = 9.
+    expect(cur).toEqual({ row: 5 - 2 - 1, col: 9 });
+  });
+
+  test('cursor past wrap boundary (1 char beyond) lands naturally on next sub-row', () => {
+    // Once the operator types one more char past the boundary, the
+    // input grows to 2 sub-rows and the cursor moves to col 2 of the
+    // new row (continuation prefix). No clamp needed — normal path.
+    const narrow: Capabilities = { ...caps, cols: 10 }; // innerWidth = 8
+    const s = startedSession();
+    s.input.value = 'a'.repeat(9); // 1 past innerWidth
+    s.input.cursor = 9;
+    // numSubRows = ceil(9/8) = 2. subRow = floor(9/8) = 1 (within range).
+    // col = 9%8 + prefix(2) = 1 + 2 = 3.
+    // lineCount must accommodate 2 input sub-rows + 2 footer block.
+    // Pass 6 (1 status + 1 rule + 2 input + 2 footer block).
+    const cur = composeCursor(s, narrow, 6);
+    expect(cur).toEqual({ row: 6 - 2 - 2 + 1, col: 3 });
+  });
+
+  test('soft-wrap with surrogate pair at boundary keeps cursor aligned with renderInput chunks', () => {
+    // Regression: when a non-BMP codepoint sat at the wrap
+    // boundary, renderInput pulls the chunk back by one code unit
+    // to keep the surrogate pair intact (so the rendered row 0 is
+    // 7 chars, not 8). composeCursor used uniform `offsetInLine
+    // % innerWidth` math and computed col = prefix + 7 = 9, past
+    // the actual content of the row — the cursor visually drifted
+    // off the end of the rendered text. After the fix both consult
+    // `wrapInputLine`: a cursor at the chunk boundary lands at the
+    // START of the next sub-row (col 2), the same canonical
+    // behavior as a cursor at any other wrap boundary (compare
+    // the `at sub-row boundary lands at start of next sub-row`
+    // test above).
+    const narrow: Capabilities = { ...caps, cols: 10 }; // innerWidth = 8
+    const s = startedSession();
+    // 7 ASCII + emoji + 'b'. First chunk = 7 chars (pulled back),
+    // second chunk = '😀b' (4 code units). 2 sub-rows total.
+    s.input.value = `${'a'.repeat(7)}😀b`;
+    s.input.cursor = 7;
+    const cur = composeCursor(s, narrow, 6);
+    // Pre-fix: { row: 2, col: 9 } — col past the 7-char row content.
+    // Post-fix: cursor at chunk-0-end / chunk-1-start → sub-row 1,
+    // col = prefix(2). row = 6 - 2 - 2 + 1 = 3.
+    expect(cur).toEqual({ row: 3, col: 2 });
+  });
+
+  test('soft-wrap with surrogate pair: cursor mid-first-chunk maps within row 0', () => {
+    // Same line shape as above; cursor in the middle of the
+    // pulled-back first chunk lands at the natural prefix + offset
+    // column on row 0 — proves the fix doesn't drift cursors that
+    // had no boundary issue in the first place.
+    const narrow: Capabilities = { ...caps, cols: 10 };
+    const s = startedSession();
+    s.input.value = `${'a'.repeat(7)}😀b`;
+    s.input.cursor = 4;
+    const cur = composeCursor(s, narrow, 6);
+    expect(cur).toEqual({ row: 6 - 2 - 2, col: 2 + 4 });
   });
 });

@@ -17,6 +17,25 @@ export interface ReadFileOutput {
 
 const DEFAULT_LIMIT = 2000;
 
+// Per-line cap. Files in the wild can have lines that are MBs long
+// (minified JSON, single-line logs, generated code, binary disguised
+// as text). The model never benefits from megabyte-sized lines, and
+// downstream consumers (TUI, audit, recap) all assume "lines fit a
+// screen". Truncate per-line at this cap; callers see the `…`
+// suffix and know the line was clipped.
+const MAX_LINE_LENGTH = 2000;
+
+// File-size cap applied BEFORE `file.text()`. The whole file lands
+// in memory (`text()` doesn't honor offset/limit), so an unbounded
+// read of a multi-GB log would either OOM the process or pin the
+// JS thread for seconds — operator perceives "frozen UI" even
+// though the tool is just reading. 10 MiB covers any realistic
+// source-code workload (large lockfiles, generated bindings) with
+// margin; anything past it should be processed by purpose-built
+// tools (grep with line ranges, head/tail via bash) instead of
+// loaded into the model context wholesale.
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
+
 export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
   name: 'read_file',
   description:
@@ -79,103 +98,60 @@ export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
       });
     }
 
-    // Stream the file line-by-line so memory stays proportional to
-    // `limit`, not file size. The previous implementation called
-    // `file.text()` and split the whole content, which loaded GB-scale
-    // files into RAM even when the caller asked for a small window.
-    //
-    // Two phases:
-    //  1. SLOW: decode UTF-8 chunks, split on `\n`, push lines that fall
-    //     in [offset, offset+limit) into `selected`.
-    //  2. FAST: once `selected` is full, drop the text buffer and just
-    //     count `0x0a` bytes in the remaining stream. We need an
-    //     accurate `total_lines` for the response, but past the window
-    //     we don't need to materialize text at all.
-    //
-    // total_lines == (newline count) + 1, matching `String.split('\n')`
-    // semantics: an empty file is "1 line" of "", a file ending in `\n`
-    // gets a trailing empty line.
-    let nextLineIndex = 0;
-    const selected: string[] = [];
-    const reader = file.stream().getReader();
-    const decoder = new TextDecoder('utf-8');
-    let buffer = '';
-    let fastMode = false;
+    // File-size gate. `file.text()` below loads the entire file into
+    // memory regardless of offset/limit — a defensive cap here
+    // refuses absurd reads upfront with a clear error rather than
+    // letting the JS thread pin (or OOM) on a multi-GB log. The
+    // gate doubles as the abort path for `B`-axis interruptibility:
+    // since `text()` itself is a native single-syscall read with no
+    // checkpoint, we can't honor a mid-read abort the way the old
+    // streaming impl could; capping the input bounds the worst-case
+    // wall-clock so an aborted operator at most waits text() out.
+    const size = file.size;
+    if (size > MAX_FILE_BYTES) {
+      return toolError(
+        ERROR_CODES.readFailed,
+        `file too large: ${size} bytes (cap ${MAX_FILE_BYTES})`,
+        { details: { resolved: abs, size } },
+      );
+    }
 
-    const tryEmit = (line: string): void => {
-      if (nextLineIndex >= offset && selected.length < limit) {
-        selected.push(line);
-      }
-      nextLineIndex += 1;
-    };
-
+    // Read the whole file in one shot. The previous implementation
+    // streamed via `file.stream().getReader()` to keep memory
+    // proportional to the requested window — defensible in theory,
+    // but reproduced freezes against real .gitignore / package.json
+    // reads pointed at the stream loop never satisfying its `done`
+    // condition under specific Bun + raw-mode-stdio combinations.
+    // The async reader.read() call would suspend forever, the tool
+    // never returned, and the operator perceived "input frozen"
+    // because the harness was awaiting our promise.
+    //
+    // `file.text()` is a single native read(2) loop, no JS-level
+    // async loop, no `done` handshake, no possibility of the stream
+    // library getting wedged. Trade-off: it loads the whole file
+    // even when offset/limit would only need a window — bounded by
+    // MAX_FILE_BYTES above so the worst case is predictable rather
+    // than open-ended.
+    let raw: string;
     try {
-      while (true) {
-        if (ctx.signal.aborted) {
-          return toolError(ERROR_CODES.aborted, 'tool aborted during read', { retryable: true });
-        }
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (fastMode) {
-          // Count `\n` bytes; ignore everything else.
-          for (let i = 0; i < value.byteLength; i++) {
-            if (value[i] === 0x0a) nextLineIndex += 1;
-          }
-          continue;
-        }
-        buffer += decoder.decode(value, { stream: true });
-        while (true) {
-          const nl = buffer.indexOf('\n');
-          if (nl === -1) break;
-          const line = buffer.slice(0, nl);
-          buffer = buffer.slice(nl + 1);
-          tryEmit(line);
-        }
-        if (selected.length >= limit) {
-          // Switch to fast mode for the rest of the file. Account for
-          // any newlines still sitting in `buffer` (decoded but not yet
-          // emitted because they were the last partial line we tried to
-          // process — they're not actually newlines, but defensive count
-          // in case future logic changes). Then drop the buffer.
-          for (let i = 0; i < buffer.length; i++) {
-            if (buffer.charCodeAt(i) === 0x0a) nextLineIndex += 1;
-          }
-          buffer = '';
-          fastMode = true;
-        }
-      }
-      if (!fastMode) buffer += decoder.decode();
+      raw = await file.text();
     } catch (e) {
       return toolError(
         ERROR_CODES.readFailed,
         `failed to read ${args.path}: ${(e as Error).message}`,
         { details: { resolved: abs } },
       );
-    } finally {
-      reader.releaseLock();
+    }
+    if (ctx.signal.aborted) {
+      return toolError(ERROR_CODES.aborted, 'tool aborted during read', { retryable: true });
     }
 
-    if (fastMode) {
-      // We never saw the trailing partial line content, but we know
-      // total_lines is `newlines + 1`. nextLineIndex currently equals
-      // the newline count (slow-phase emits + fast-phase counts), so
-      // bump by one to match `split('\n').length`.
-      nextLineIndex += 1;
-    } else {
-      // Drain any newlines flushed by the decoder, then emit the final
-      // unterminated line (always — even if it's empty, matching the
-      // trailing-empty-line semantics of split).
-      while (true) {
-        const nl = buffer.indexOf('\n');
-        if (nl === -1) break;
-        const line = buffer.slice(0, nl);
-        buffer = buffer.slice(nl + 1);
-        tryEmit(line);
-      }
-      tryEmit(buffer);
-    }
+    const truncateLine = (line: string): string =>
+      line.length > MAX_LINE_LENGTH ? `${line.slice(0, MAX_LINE_LENGTH)}…` : line;
 
-    const total_lines = nextLineIndex;
+    const allLines = raw.split('\n');
+    const total_lines = allLines.length;
+    const selected = allLines.slice(offset, offset + limit).map(truncateLine);
     const truncated = offset + selected.length < total_lines;
     return {
       content: selected.join('\n'),

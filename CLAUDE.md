@@ -28,6 +28,7 @@ The architectural spec lives in `docs/spec/AGENTIC_CLI.md`. Each subsystem has a
 | Sampling, output budgets | `TOKEN_TUNING` |
 | TUI (inline render, event bus, microcopy, palette/glyphs) | `AGENTIC_CLI` §17, `UI` |
 | Cross-session memory | `MEMORY` |
+| REPL input history (↑/↓, Ctrl+R reverse search, /history) | `HISTORY`, `UI` §5.1/§5.4 |
 | Recap | `RECAP` |
 | Code index (tree-sitter) | `CODE_INDEX` |
 | Code generation pipeline | `CODE_GENERATION` |

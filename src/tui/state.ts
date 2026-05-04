@@ -15,7 +15,7 @@
 // todo events accept silently and land alongside their render
 // functions.
 
-import type { TodoItemForUI, UIEvent } from './events.ts';
+import type { SessionBannerEnvEntry, TodoItemForUI, UIEvent } from './events.ts';
 
 export interface InputState {
   // Current value of the input box (multi-line allowed via `\n`).
@@ -193,6 +193,14 @@ export interface LiveState {
   // immediate-vs-cooperative cancellation distinction lives in a
   // future hard-abort slice.
   softInterrupted: boolean;
+  // Idle Ctrl+C double-tap gate (UI.md §5.4 + §4.10.6). Non-null means
+  // the operator pressed Ctrl+C once at idle with an empty buffer;
+  // footer flips to `Press Ctrl-C again to exit` (warn). The REPL owns the
+  // 2s timer + the second-press detection — the reducer just flips
+  // the flag in response to `interrupt:exit-arm` / `:exit-cancel`.
+  // `at` is the timestamp when armed (carried for tests / future
+  // animation; not currently consulted by the renderer).
+  exitArmed: { at: number } | null;
   // Set true after `session:end`; renderer uses to decide whether to
   // accept further input or stop redrawing.
   ended: boolean;
@@ -219,6 +227,7 @@ export const createInitialState = (): LiveState => ({
   todos: [],
   bgProcesses: new Map(),
   softInterrupted: false,
+  exitArmed: null,
   ended: false,
 });
 
@@ -238,13 +247,14 @@ const TOOL_PREVIEW_MAX_LINES = 5;
 // (renderer.ts), and emit from the relevant `applyEvent` branch.
 export type PermanentItem =
   | {
-      kind: 'session-header';
-      sessionId: string;
-      profile: string;
-      project: string;
-      model: string;
+      kind: 'session-footer';
+      reason: string;
+      // Wall-clock duration of the run; mirrors SessionEndEvent.
+      // Renderer formats as `Cogitated for 1m23s` for `done`.
+      // Optional for legacy paths that don't track timing.
+      durationMs?: number;
+      abortCause?: 'soft' | 'hard';
     }
-  | { kind: 'session-footer'; reason: string; abortCause?: 'soft' | 'hard' }
   | {
       kind: 'session-banner';
       app: string;
@@ -253,7 +263,9 @@ export type PermanentItem =
       contextWindow: number;
       maxOutputTokens: number;
       cwd: string;
-      env: { key: string; value: string }[];
+      // Mirror of SessionBannerEvent.env (UI.md §4.10.9). Renderer
+      // discriminates on `kind` to pick the right palette per entry.
+      env: SessionBannerEnvEntry[];
     }
   | { kind: 'user-submit'; text: string }
   | {
@@ -337,23 +349,28 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       // bg manager would re-emit `bg:start` for surviving processes
       // on the new session_start). Today no path keeps bg alive
       // across sessions, so the reset is correct.
+      // No permanent emission (UI.md §3.2). The user-submit inverse
+      // bar (§4.10.8) already marks turn boundaries; emitting a
+      // session-header line per turn just clutters scrollback with
+      // the session UUID, which is operator-irrelevant in REPL mode
+      // (relevant only for offline resume / audit, looked up via
+      // separate CLI). Status state still updates so the footer
+      // shows the current model / steps / cost.
       return {
         state: {
           ...state,
           status,
           softInterrupted: false,
+          // Defense in depth: a fresh turn starting clears any
+          // armed-exit gate from before. The REPL also emits
+          // `interrupt:exit-cancel` on submit, but a session can
+          // start via paths that bypass the editor (resume, headless
+          // bridge), so the boundary reset closes the gap.
+          exitArmed: null,
           bgProcesses: new Map(),
           ended: false,
         },
-        permanent: [
-          {
-            kind: 'session-header',
-            sessionId: event.sessionId,
-            profile: event.profile,
-            project: event.project,
-            model: event.model,
-          },
-        ],
+        permanent: [],
       };
     }
 
@@ -374,6 +391,8 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
         state: {
           ...state,
           softInterrupted: false,
+          // Same boundary reset rationale as session:start (above).
+          exitArmed: null,
           bgProcesses: new Map(),
           ended: true,
         },
@@ -381,6 +400,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
           {
             kind: 'session-footer',
             reason: event.reason,
+            ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
             ...(event.abortCause !== undefined ? { abortCause: event.abortCause } : {}),
           },
         ],
@@ -494,21 +514,18 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       const text = buf?.text ?? '';
       const durationMs = buf !== null ? event.ts - buf.startedAt : null;
       const outputTokens = buf?.outputTokens ?? null;
-      // Emit a permanent when EITHER text is present OR we have chip
-      // metadata worth surfacing. Tool-only turns (Anthropic emits
-      // tool_use blocks without accompanying text) consume real
-      // output tokens — the operator should still see the per-turn
-      // cost signal as a chip line above whatever tool chips fired.
-      // Without this, only step:budget aggregates the cost and the
-      // per-turn breakdown is invisible. formatPermanent handles the
-      // text-empty + chip-metadata combination by emitting just the
-      // header.
-      const hasMeaningfulMetadata =
-        outputTokens !== null && outputTokens > 0 && durationMs !== null;
-      const shouldEmit = text.length > 0 || hasMeaningfulMetadata;
-      const permanent: PermanentItem[] = shouldEmit
-        ? [{ kind: 'assistant', text, durationMs, outputTokens }]
-        : [];
+      // Emit a permanent ONLY when there's prose to land in
+      // scrollback. Tool-only turns (Anthropic emits tool_use
+      // blocks without accompanying text) used to also emit so the
+      // formatter could render a `· Generated N tokens` chip above
+      // the tool chips — that chip header was removed (UI.md §4.10.5,
+      // duration goes to the turn-end marker §3.2 / tokens go to the
+      // footer). Emitting an item the formatter would render as []
+      // anyway forces the renderer through writeTransition (erase +
+      // full-frame redraw) for no scrollback gain — wasteful under
+      // tool-heavy flows and undermines the differential anti-flicker.
+      const permanent: PermanentItem[] =
+        text.length > 0 ? [{ kind: 'assistant', text, durationMs, outputTokens }] : [];
       return { state: { ...state, pendingAssistant: null }, permanent };
     }
 
@@ -622,6 +639,20 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
         return { state: { ...state, softInterrupted: true }, permanent: [] };
       }
       return { state, permanent: [] };
+
+    case 'interrupt:exit-arm':
+      // UI.md §5.4 idle Ctrl+C gate. Idempotent: re-arming while
+      // already armed refreshes `at` so the operator's most recent
+      // press is the one whose 2s window counts (the producer also
+      // resets the timer; this is just defensive consistency).
+      return { state: { ...state, exitArmed: { at: event.ts } }, permanent: [] };
+
+    case 'interrupt:exit-cancel':
+      // Disarm. Producer emits this on: any other key, timeout
+      // expiry, submit, modal open, session boundary. Idempotent
+      // when already null.
+      if (state.exitArmed === null) return { state, permanent: [] };
+      return { state: { ...state, exitArmed: null }, permanent: [] };
 
     // ─── Modal events ──────────────────────────────────────────────
     // Each `*:ask` raises a confirm-shaped modal with `selected = 'no'`

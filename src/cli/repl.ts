@@ -20,7 +20,6 @@
 // AbortController for the running turn, and the exit promise.
 
 import { basename } from 'node:path';
-import { isGitRepo } from '../checkpoints/git.ts';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
 import { DEFAULT_BUDGET } from '../harness/types.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
@@ -28,6 +27,7 @@ import {
   type FocusHandler,
   type HarnessAdapter,
   type KeyEvent,
+  type SessionBannerEvent,
   type UIEvent,
   applyKey,
   createBus,
@@ -79,14 +79,15 @@ export interface RunReplOptions {
   rendererWrite?: (s: string) => void;
 }
 
-// One-shot subscriber: drops `session:end` so the renderer doesn't
-// flip into the "ended" state between turns. The reducer's
-// `user:submit` branch already resets `ended` (so a stray late event
-// wouldn't strand us), but skipping `session:end` entirely keeps the
-// scrollback cleaner — the next user prompt is the natural divider
-// between turns. If callers want a footer line on every turn, we can
-// add a `warn` divider here later; deliberately dropping for now.
-const filterUiEvent = (event: UIEvent): boolean => event.type !== 'session:end';
+// All UIEvents flow through to the bus. Earlier this filter dropped
+// `session:end` so the renderer wouldn't flip into `ended` state
+// between REPL turns and hide the input box. With `state.ended` no
+// longer gating draws (renderer.ts), the filter became unnecessary —
+// session:end now produces the turn-end marker (`Cogitated for X`,
+// UI.md §3.2) on every turn, the input stays visible during the
+// gap between session:end and the next user:submit, and one-shot
+// callers still get their final marker.
+const filterUiEvent = (_event: UIEvent): boolean => true;
 
 export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const { args } = options;
@@ -133,7 +134,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     errSink(`forja: ${msg}\n`);
     return 1;
   }
-  const { config: baseConfig, db, modelId, lockConflicts, subagents } = bootstrapped;
+  const { config: baseConfig, db, modelId, lockConflicts, subagents, policyLayers } = bootstrapped;
 
   // Surface the same warnings the one-shot path does. Operators get
   // them once at REPL boot rather than per turn.
@@ -226,6 +227,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // awaits this before closing the DB so the harness's async cleanup
   // (final persistence, audit) doesn't race a closed handle.
   let runningPromise: Promise<void> | null = null;
+  // Per-turn token. Each `startTurn` mints a fresh Symbol and stores
+  // it as both the closure-local id of that turn AND `activeTurnToken`
+  // (the slot for "which turn currently owns the shared state below").
+  // Finalizers compare their captured id against this slot and bail
+  // if a newer turn has taken over. Without the gate, the optimization
+  // that flips `running=false` on session_finished (so the operator
+  // can submit/interrupt without waiting for the harness's outer-
+  // finally cleanup) creates a window where Turn N+1 can start
+  // before Turn N's runAgent Promise settles — when N's finalizer
+  // eventually runs, it would otherwise clobber N+1's `running`,
+  // `abortController`, etc., breaking interrupts and allowing
+  // concurrent submits.
+  let activeTurnToken: symbol | null = null;
   let exiting = false;
   let exitCode = 0;
   let resolveExit: () => void = () => {};
@@ -244,6 +258,29 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       bus.emit({ type: 'warn', ts: now(), message: `adapter error: ${msg}` });
+    }
+    // Flip user-facing turn state on session_finished, NOT on the
+    // runAgent Promise resolve. The harness's outer finally awaits
+    // checkpoint purge + bg cleanup (CHECKPOINTS §2.5: "could spend
+    // seconds in ref deletion") AFTER session_finished is emitted —
+    // those are bookkeeping, not turn-visible work. Pre-fix the
+    // Promise chain held `running=true` through that window, so the
+    // operator who saw `Cogitated for Xs` rendered and started typing
+    // immediately found that Enter was silently gated and Ctrl+C
+    // routed to triggerInterrupt-on-resolved-abort (no-op). Visibly
+    // identical to "input frozen" for several seconds.
+    //
+    // Cumulative totals + lastSessionId are also rolled up here so a
+    // back-to-back submit (operator hits Enter the moment Cogitated
+    // appears) sees the correct prior session id for resume — the
+    // runAgent Promise's `.then` would not have fired yet under the
+    // old timing.
+    if (event.type === 'session_finished') {
+      running = false;
+      lastSessionId = event.result.sessionId;
+      cumulative.costUsd += event.result.costUsd;
+      cumulative.steps += event.result.steps;
+      cumulative.turns += 1;
     }
   };
 
@@ -293,6 +330,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const startTurn = (text: string): void => {
     if (running || exiting) return;
     running = true;
+    // Mint a fresh token for this turn and claim ownership of the
+    // shared state slots (running / abortController / runningPromise).
+    // The finalizer below compares against `activeTurnToken` to refuse
+    // mutations once a newer turn has taken over.
+    const myToken = Symbol('turn');
+    activeTurnToken = myToken;
     abortController = new AbortController();
     softStopController = new AbortController();
     const adapter = createHarnessAdapter(buildAdapterCtx());
@@ -306,25 +349,38 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       ...(lastSessionId !== null ? { resumeFromSessionId: lastSessionId } : {}),
     };
     const runAgentImpl = options.runAgentOverride ?? runAgent;
+    // Cumulative totals + lastSessionId are rolled up in
+    // `onHarnessEvent` on `session_finished` (synchronous with
+    // Cogitated rendering) — see the comment there. The .then()
+    // here intentionally does no bookkeeping; it exists only so
+    // .catch can intercept rejections from runAgent itself
+    // (provider crash before any harness event, etc.).
     runningPromise = runAgentImpl(cfg)
-      .then((result) => {
-        lastSessionId = result.sessionId;
-        // Roll up running totals for /cost. Each turn contributes
-        // its own steps + cost; turns increments once per resolved
-        // run regardless of status.
-        cumulative.costUsd += result.costUsd;
-        cumulative.steps += result.steps;
-        cumulative.turns += 1;
-      })
+      .then(() => undefined)
       .catch((e) => {
         const msg = e instanceof Error ? e.message : String(e);
         bus.emit({ type: 'error', ts: now(), message: msg });
       })
       .finally(() => {
+        // Token gate: only mutate shared state if THIS turn is still
+        // the active one. If `session_finished` already flipped
+        // `running=false` and the operator submitted a follow-up
+        // turn, `activeTurnToken` now belongs to that newer turn —
+        // resetting `running`/abortController here would mid-flight
+        // clobber its state, breaking interrupts and allowing
+        // concurrent submits. Bail in that case; the newer turn's
+        // own finalizer will clean up when its own time comes.
+        //
+        // The defensive `running=false` (for the rare path where
+        // runAgent rejects before any session event) is still
+        // covered: in that case session_finished never fired, so
+        // this turn IS still active, and the cleanup runs.
+        if (activeTurnToken !== myToken) return;
         running = false;
         abortController = null;
         softStopController = null;
         runningPromise = null;
+        activeTurnToken = null;
       });
   };
 
@@ -333,6 +389,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // function does the work without needing its own guard.
   const shutdown = async (): Promise<void> => {
     if (abortController !== null) abortController.abort();
+    // Cancel any pending idle-exit-gate timer so a 2s setTimeout
+    // doesn't outlive the REPL and leak a node handle (visible in
+    // tests as Bun's "open handles" warning, and in production as
+    // a delayed `interrupt:exit-cancel` emit on a closed bus).
+    if (exitArmTimer !== null) {
+      clearTimeout(exitArmTimer);
+      exitArmTimer = null;
+    }
     // Let the harness's async cleanup settle on the aborted signal
     // before tearing down the DB. Without this await, db.close() can
     // land before the harness flushes its final message/audit rows
@@ -342,6 +406,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     modalManager.close();
     renderer.close();
     stdin.removeListener('data', onData);
+    // Drop the lone-ESC drain timer if it's pending — leaks otherwise
+    // (Bun would surface as an "open handle" warning in tests; in
+    // production it'd just delay process exit by up to ESC_DRAIN_MS).
+    cancelDrain();
     if (typeof stdin.pause === 'function') stdin.pause();
     db.close();
     resolveExit();
@@ -376,6 +444,53 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     } else if (level === 'soft' && softStopController !== null) {
       softStopController.abort();
     }
+  };
+
+  // Idle Ctrl+C double-tap exit gate (UI.md §5.4). First press at
+  // idle/empty-buffer arms the gate; the footer flips to
+  // `Press Ctrl-C again to exit` (warn) for the EXIT_ARM_WINDOW_MS window.
+  // A second press inside the window exits 130; any other keystroke
+  // disarms (handled by the editor handler), and a timeout cancels.
+  // Closure-local `exitArmedAt` is the source of truth for the
+  // window check; the reducer's `state.exitArmed` is just for the
+  // footer cue. They drift only briefly — the boundary resets in
+  // session:start/end keep the reducer side honest, and the local
+  // staleness self-resolves via the timestamp comparison.
+  const EXIT_ARM_WINDOW_MS = 2000;
+  let exitArmedAt: number | null = null;
+  let exitArmTimer: ReturnType<typeof setTimeout> | null = null;
+  const armExit = (): void => {
+    exitArmedAt = Date.now();
+    bus.emit({ type: 'interrupt:exit-arm', ts: now() });
+    if (exitArmTimer !== null) clearTimeout(exitArmTimer);
+    exitArmTimer = setTimeout(() => {
+      exitArmTimer = null;
+      if (exitArmedAt !== null) {
+        exitArmedAt = null;
+        bus.emit({ type: 'interrupt:exit-cancel', ts: now() });
+      }
+    }, EXIT_ARM_WINDOW_MS);
+  };
+  const cancelExitArm = (): void => {
+    if (exitArmedAt === null) return;
+    exitArmedAt = null;
+    if (exitArmTimer !== null) {
+      clearTimeout(exitArmTimer);
+      exitArmTimer = null;
+    }
+    bus.emit({ type: 'interrupt:exit-cancel', ts: now() });
+  };
+  // Idle Ctrl+C handler shared by editor (raw mode) and SIGINT
+  // (non-raw / external kill). Returns true when the call resulted
+  // in an exit decision (caller should consume / not fall through).
+  const handleIdleInterrupt = (): boolean => {
+    if (exitArmedAt !== null && Date.now() - exitArmedAt <= EXIT_ARM_WINDOW_MS) {
+      exitCode = 130;
+      requestShutdown();
+      return true;
+    }
+    armExit();
+    return false;
   };
   // Resolve the modal-manager's forward reference now that the real
   // interrupt path is defined. From here on, Ctrl+C with a modal up
@@ -571,7 +686,36 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     }
 
     const current = renderer.state().input;
+
+    // Footer's `? for help` cue (UI.md §4.10.6) needs to actually
+    // do something. Pressing `?` with an empty buffer dispatches the
+    // /help slash command — same effect as typing `/help` + Enter,
+    // but with a single keystroke. Once there's any content in the
+    // buffer (operator started typing a question that begins with
+    // `?`), `?` falls through as a literal character.
+    if (current.value === '' && key.kind === 'char' && key.char === '?' && !key.ctrl && !key.alt) {
+      // Disarm the exit gate before returning. UI.md §5.4 says any
+      // non-Ctrl+C key disarms; the `?` shortcut is one of those keys
+      // and the early return below skips the cancelExitArm() call
+      // that lives further down in this handler. Without this,
+      // pressing Ctrl+C → `?` → Ctrl+C inside the 2s window would
+      // still exit 130 — the operator hit a non-interrupt key
+      // expecting to cancel the gate, but the gate stayed armed.
+      cancelExitArm();
+      void dispatchSlash({ name: 'help', args: [] }, { registry: slashRegistry, ctx: slashCtx });
+      return true;
+    }
+
     const result = applyKey(current, key);
+
+    // Disarm the exit gate on any keystroke that ISN'T a fresh Ctrl+C.
+    // The interrupt branch below handles arm/exit itself; everything
+    // else (typing, Enter, Esc, Ctrl+D, etc.) is "operator did
+    // something other than re-press Ctrl+C", which the spec says
+    // disarms (§5.4 "qualquer tecla, incluindo digitação").
+    if (result.cancelInput !== 'interrupt') {
+      cancelExitArm();
+    }
 
     // Skip input:update when the buffer didn't change (Enter, Esc,
     // Ctrl+C with empty input, etc). The reducer's user:submit branch
@@ -596,17 +740,25 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       startTurn(result.submit.text);
     }
 
-    // Ctrl+C while running → soft/hard interrupt ladder, same as Esc
-    // and the SIGINT handler. The renderer puts stdin in raw mode, so
-    // Ctrl+C lands as a `cancelInput` key event (byte 0x03 read from
-    // stdin) rather than a process SIGINT — the SIGINT handler can't
-    // be the only path. With buffer empty + idle, fall through to
-    // shutdown with POSIX exit 130 (matches the SIGINT handler so
-    // shells / CI / automation see interrupt-driven exits as
-    // interrupt regardless of whether stdin was raw). Synchronous
-    // gate (`exiting` set in requestShutdown) keeps a follow-up
-    // keystroke from racing past the check.
-    if (result.cancelInput === true) {
+    // Ctrl+C with empty buffer:
+    //   - running → soft/hard interrupt ladder (same as Esc and SIGINT).
+    //   - idle → double-tap gate (UI.md §5.4): first press arms,
+    //     second within 2s exits 130. Synchronous shutdown gate
+    //     (`exiting` set in requestShutdown) keeps a stray follow-up
+    //     keystroke from racing past the check.
+    if (result.cancelInput === 'interrupt') {
+      if (running) {
+        triggerInterrupt();
+      } else {
+        handleIdleInterrupt();
+      }
+    }
+
+    // Ctrl+D with empty buffer: shell EOF convention — direct exit, no
+    // double-tap gate. Operators expect `^D` as an explicit "I'm done"
+    // signal; making them press it twice would surprise. While running,
+    // route to the interrupt ladder for consistency with `^C` + Esc.
+    if (result.cancelInput === 'eof') {
       if (running) {
         triggerInterrupt();
       } else {
@@ -639,21 +791,101 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // Stdin pump: feed bytes into the parser, dispatch each parsed key
   // through the focus stack. Bracketed paste handled inside the
   // parser (one `paste` event per chunk).
+  //
+  // Lone-ESC drain. The parser holds a single `\x1b` waiting to
+  // disambiguate between an Escape keypress and the start of a CSI
+  // / SS3 / Alt+char sequence — both begin with `\x1b`. Without a
+  // delayed drain, an Esc keystroke alone never resolves: the
+  // buffer holds it indefinitely, the soft-interrupt cue never
+  // fires, AND the next keystroke combines with the held ESC to
+  // emit Alt+<char> instead of `<char>` — input visibly stops
+  // accepting input. Convention (xterm KeyboardWait): if no follow-
+  // up byte arrives within ~25-100ms, treat the held ESC as a
+  // standalone Escape keypress. We pick 30ms — short enough that
+  // the operator doesn't notice the delay on a deliberate Esc,
+  // long enough to absorb the latency between the leader and the
+  // params of a multi-byte sequence delivered across two `data`
+  // events (e.g., over SSH).
   const parser = createKeyParser();
+  const ESC_DRAIN_MS = 30;
+  let drainTimer: ReturnType<typeof setTimeout> | null = null;
+  const cancelDrain = (): void => {
+    if (drainTimer !== null) {
+      clearTimeout(drainTimer);
+      drainTimer = null;
+    }
+  };
   const onData = (chunk: Buffer): void => {
+    // Panic key (Ctrl+\\, byte 0x1c). Bypasses every gate (running,
+    // modal, focus stack, exit-arm timer, shutdown awaits) and exits
+    // immediately. Convention from POSIX SIGQUIT — "I really want
+    // out". In raw mode the terminal driver delivers 0x1c as a
+    // literal byte (signal generation disabled by setRawMode), so
+    // Node never sees a SIGQUIT — we have to recognize the byte
+    // ourselves. Trade-off accepted: any in-flight turn's audit/DB
+    // state may stay 'running' since we skip shutdown's cleanup
+    // chain. That's the explicit cost of having a guaranteed
+    // escape hatch when the normal interrupt ladder doesn't work.
+    //
+    // Checked BEFORE the exiting guard / parser / focusStack so it
+    // works even when the rest of the pipeline is wedged.
+    if (chunk.includes(0x1c)) {
+      try {
+        if (typeof stdin.setRawMode === 'function') stdin.setRawMode(false);
+        // Disable bracketed paste so the operator's shell isn't
+        // left in paste mode after our exit. `\x1b[?2004l` is the
+        // standard sequence; written directly to bypass any
+        // higher-level wrapper that might be in a broken state.
+        process.stdout.write('\x1b[?2004l');
+        process.stderr.write('\nforja: panic exit (Ctrl+\\)\n');
+      } catch {
+        // Ignore — we're exiting regardless.
+      }
+      process.exit(130);
+    }
     if (exiting) return;
+    cancelDrain();
     const events = parser.feed(chunk);
     for (const ev of events) focusStack.dispatch(ev);
+    if (parser.bufferLength() > 0) {
+      drainTimer = setTimeout(() => {
+        drainTimer = null;
+        if (exiting) return;
+        // Narrow drain: ONLY resolve the lone-ESC ambiguity. The
+        // full `parser.drain()` (used at shutdown) clears paste
+        // state too — calling it here would truncate a paste
+        // delivered in chunks separated by more than ESC_DRAIN_MS
+        // (slow SSH links, large clipboard payloads), silently
+        // corrupting submitted input. `tryResolveLoneEsc` is the
+        // surgical version: emits Escape iff the buffer is exactly
+        // `\x1b` outside of paste mode, no-op otherwise.
+        const drained = parser.tryResolveLoneEsc();
+        for (const ev of drained) focusStack.dispatch(ev);
+      }, ESC_DRAIN_MS);
+    }
   };
   stdin.on('data', onData);
   if (typeof stdin.resume === 'function') stdin.resume();
 
   // SIGINT path. Fires when stdin is NOT in raw mode (e.g., during
-  // certain modal lifecycles where the renderer pauses raw input) or
-  // from an external `kill -INT`. Most operator Ctrl+C while running
-  // lands as `cancelInput` via the editor (raw mode is on); both
-  // routes converge on `triggerInterrupt`. Idle SIGINT exits with
-  // 130 — POSIX convention.
+  // certain modal lifecycles where the renderer pauses raw input)
+  // or from an external `kill -INT` / supervisor / `trap` handler.
+  //
+  // Running: route to the interrupt ladder (same as editor's
+  // cancelInput=interrupt path). Soft → hard escalation works
+  // identically whether the signal arrived via raw stdin or via
+  // the kernel.
+  //
+  // Idle: terminate immediately with exit 130 (POSIX SIGINT). The
+  // double-tap exit gate (UI.md §5.4) is interactive UX — it
+  // protects the operator from a stray Ctrl+C keystroke. External
+  // SIGINT senders (supervisors, automation, IDE stop buttons,
+  // `kill -INT $pid`) expect one signal to stop the process; if
+  // we routed those through the gate, a single `kill -INT` would
+  // arm the gate and silently disarm 2s later, leaving the process
+  // alive — a regression for any caller that wraps the agent. Raw
+  // Ctrl+C keystrokes still land as `cancelInput=interrupt` via
+  // the editor handler, which DOES use the gate.
   const sigintHandler = (): void => {
     if (running) {
       triggerInterrupt();
@@ -670,18 +902,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // there's nothing useful to communicate. Memory entry count
   // omitted until the registry exposes a sync count method.
   const providerCaps = baseConfig.provider.capabilities;
-  const env: { key: string; value: string }[] = [];
+  // UI.md §4.10.9 discriminates env entries: `flag` for binary
+  // capability indicators (rendered as `✓ name` in success palette),
+  // `meta` for non-binary key:value (rendered dim).
+  const env: SessionBannerEvent['env'] = [];
   if (subagents.byName.size > 0) {
-    env.push({ key: 'subagents', value: String(subagents.byName.size) });
+    env.push({ kind: 'meta', key: 'subagents', value: String(subagents.byName.size) });
   }
-  // Checkpoints only show when they'll actually fire. Both halves
-  // matter: enableCheckpoints=false (plan mode, opt-out) and
-  // enableCheckpoints=true with non-git cwd both result in no
-  // rollback at runtime — banner stays silent rather than promising
-  // a feature that won't deliver.
-  if (baseConfig.enableCheckpoints === true && (await isGitRepo(baseConfig.cwd))) {
-    env.push({ key: 'checkpoints', value: 'enabled' });
-  }
+  // `checkpoints` flag was removed from the banner — operator
+  // marked it as not useful. The capability still works (harness
+  // creates checkpoints when conditions are met); it just doesn't
+  // announce itself at boot. If a future smoke audit wants the
+  // signal back, push another flag entry here.
   bus.emit({
     type: 'session:banner',
     ts: now(),
@@ -693,6 +925,26 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     cwd: baseConfig.cwd,
     env,
   });
+
+  // Permission posture hint. When no project policy file
+  // contributed, the operator runs under strict + empty rules
+  // (default-deny everything). Without this cue, the first
+  // tool call returns `Denied` and looks like a bug — surface
+  // the configuration gap up front. Only fires when no project
+  // layer was found AND no enterprise/user layer either; if any
+  // layer exists, the operator already opted in to a custom
+  // posture and doesn't need the hint. Routed as `error` (not
+  // `info` or `warn`) because under default-deny the very next
+  // tool call fails — severity matches the red palette and the
+  // operator scans the boot scrollback for red first.
+  if (policyLayers.length === 0) {
+    bus.emit({
+      type: 'error',
+      ts: now(),
+      message:
+        "no permission policy found — strict default-deny is active. Create '.agent/permissions.yaml' or run /perms to inspect.",
+    });
+  }
 
   // Initial frame: emit one input:update with the empty buffer so the
   // renderer draws the `> ` prompt before the user types. Without

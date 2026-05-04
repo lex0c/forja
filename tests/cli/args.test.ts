@@ -649,5 +649,69 @@ describe('usage', () => {
     expect(u).toContain('--undo');
     expect(u).toContain('--checkpoints');
     expect(u).toContain('--yes');
+    expect(u).toContain('init');
+  });
+});
+
+describe('parseArgs — init subcommand', () => {
+  test('bare `init` produces strict-mode init descriptor', () => {
+    const r = parseArgs(['init']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.init).toEqual({ force: false, mode: 'strict' });
+    expect(r.args.prompt).toBe('');
+  });
+
+  test('--force flips the force bit', () => {
+    const r = parseArgs(['init', '--force']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.init?.force).toBe(true);
+  });
+
+  test('--mode acceptEdits is accepted', () => {
+    const r = parseArgs(['init', '--mode', 'acceptEdits']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.init?.mode).toBe('acceptEdits');
+  });
+
+  test('--mode bypass is rejected (init never scaffolds bypass)', () => {
+    const r = parseArgs(['init', '--mode', 'bypass']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('strict|acceptEdits');
+  });
+
+  test('--mode without value is rejected', () => {
+    const r = parseArgs(['init', '--mode']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--mode requires a value');
+  });
+
+  test('unknown init flag is rejected with init scope', () => {
+    const r = parseArgs(['init', '--bogus']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('init: unknown argument');
+  });
+
+  test('init only triggers as the FIRST positional', () => {
+    // `agent "review init"` should pass through as a regular prompt;
+    // the operator must be able to use the literal word 'init' in
+    // free-form prompts.
+    const r = parseArgs(['review', 'init']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.init).toBeUndefined();
+    expect(r.args.prompt).toBe('review init');
+  });
+
+  test('init --help routes to top-level help (no separate help text)', () => {
+    const r = parseArgs(['init', '--help']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.help).toBe(true);
   });
 });

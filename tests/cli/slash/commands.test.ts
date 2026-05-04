@@ -4,6 +4,7 @@ import { clearCommand } from '../../../src/cli/slash/commands/clear.ts';
 import { costCommand } from '../../../src/cli/slash/commands/cost.ts';
 import { buildHelpCommand } from '../../../src/cli/slash/commands/help.ts';
 import { modelCommand } from '../../../src/cli/slash/commands/model.ts';
+import { permsCommand, renderPolicy } from '../../../src/cli/slash/commands/perms.ts';
 import { planCommand } from '../../../src/cli/slash/commands/plan.ts';
 import { quitCommand } from '../../../src/cli/slash/commands/quit.ts';
 import { sessionsCommand } from '../../../src/cli/slash/commands/sessions.ts';
@@ -544,5 +545,90 @@ describe('/budget', () => {
     await budgetCommand.exec(['cost', 'none'], ctx);
     expect(ctx.baseConfig.budget?.maxSteps).toBe(50);
     expect(ctx.baseConfig.budget?.maxCostUsd).toBeUndefined();
+  });
+});
+
+describe('/perms', () => {
+  // Build a ctx whose baseConfig carries a stubbed engine returning
+  // the supplied policy. Lets us exercise the renderer's branches
+  // (default-strict empty, mode=acceptEdits, populated tool sections,
+  // rule-list elision) without spinning up the real hierarchy.
+  const ctxWith = (policy: unknown): SlashContext => {
+    const ctx = makeCtx();
+    (ctx.baseConfig as { permissionEngine: unknown }).permissionEngine = {
+      policy: () => policy,
+    };
+    return ctx;
+  };
+
+  test('rejects positional arguments', async () => {
+    const ctx = ctxWith({ defaults: { mode: 'strict' }, tools: {} });
+    const result = await permsCommand.exec(['foo'], ctx);
+    expect(result.kind).toBe('error');
+  });
+
+  test('default-strict empty policy includes how-to-fix hint', async () => {
+    const ctx = ctxWith({ defaults: { mode: 'strict' }, tools: {} });
+    const result = await permsCommand.exec([], ctx);
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = (result.notes ?? []).join('\n');
+    expect(text).toContain('mode=strict');
+    expect(text).toContain('no tool sections defined');
+    expect(text).toContain('.agent/permissions.yaml');
+  });
+
+  test('renders bash + read_file rule sections', async () => {
+    const ctx = ctxWith({
+      defaults: { mode: 'strict' },
+      tools: {
+        bash: { allow: ['ls *', 'rg *'], deny: ['rm -rf *'] },
+        read_file: { allow_paths: ['./**'], deny_paths: ['**/.env*'] },
+      },
+    });
+    const result = await permsCommand.exec([], ctx);
+    if (result.kind !== 'ok') return;
+    const lines = result.notes ?? [];
+    expect(lines.some((l) => l.includes('bash:'))).toBe(true);
+    expect(lines.some((l) => l.includes("'ls *'"))).toBe(true);
+    expect(lines.some((l) => l.includes("'rm -rf *'"))).toBe(true);
+    expect(lines.some((l) => l.includes('read_file:'))).toBe(true);
+    expect(lines.some((l) => l.includes('default-deny in strict mode'))).toBe(true);
+  });
+
+  test('elides large rule lists with a count', () => {
+    const lines = renderPolicy({
+      defaults: { mode: 'strict' },
+      tools: {
+        bash: {
+          allow: ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l'],
+        },
+      },
+    });
+    expect(lines.some((l) => /allow:.*12 entries/.test(l))).toBe(true);
+    expect(lines.some((l) => l.includes("'a'"))).toBe(false);
+  });
+
+  test('section with only locked (no rules) emits no header', () => {
+    // Higher-layer enterprise/user can lock a section by setting
+    // `{ locked: true }` with no rule lists — lower layers can't
+    // override, but there are no rules to display either. Pre-fix
+    // the formatter pushed a bare `bash:` header followed by
+    // nothing, which read like a render bug.
+    const lines = renderPolicy({
+      defaults: { mode: 'strict' },
+      tools: { bash: { locked: true } },
+    });
+    expect(lines.some((l) => l.trim() === 'bash:')).toBe(false);
+    expect(lines[0]).toBe('policy: mode=strict');
+  });
+
+  test('mode=acceptEdits omits the strict-mode footer', () => {
+    const lines = renderPolicy({
+      defaults: { mode: 'acceptEdits' },
+      tools: { bash: { allow: ['ls'] } },
+    });
+    expect(lines[0]).toBe('policy: mode=acceptEdits');
+    expect(lines.some((l) => l.includes('default-deny in strict mode'))).toBe(false);
   });
 });

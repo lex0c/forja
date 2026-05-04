@@ -15,6 +15,331 @@ Format:
 
 ---
 
+## [2026-05-03] M2 / fix — strip ANSI from assistant text (terminal-mode hijack defense)
+
+Operator reportou que o input continuava travando depois do drain fix anterior, especificamente "após ler arquivo e me responder". Investigação aprofundada revelou um vetor independente: texto do assistant é renderizado raw, sem strip de escape sequences. Provider output passando por `harness-adapter.ts:232` (`text: ev.text`) → reducer acumula → permanent emite literal → `truncateToWidth` preserva CSI sequences (comentário em `width.ts:33` confirma: "We don't try to balance emitted escapes — the caller is responsible") → terminal recebe.
+
+Vetores específicos que causam "input travado":
+- `\x1b[?25l` (hide cursor) — operator digita, nada visível, parece travado.
+- `\x1b[?2004h` (bracketed paste) — keystrokes viram payload de paste.
+- `\x1b[?1049h` (alt screen) — perde todo o layout do REPL.
+- `\x1b[?2026h` sem `l` (sync output sem fim) — terminal buffer sem flush.
+- `\x1b[?1h` (DECCKM) — setas mudam de codificação.
+
+Que isso aconteça especificamente após `read_file` bate exatamente: file content → modelo cita bytes na resposta (especialmente arquivos com colored output, terminal logs, shell captures) → terminal absorbs.
+
+**Done:**
+
+- `src/tui/harness-adapter.ts`: `text_delta` agora passa `ev.text` por `stripAnsi()` antes de emitir `assistant:delta`. Strip total (não selectivo) porque SGR colors também leak (sem reset no fim → terminal fica vermelho permanente), OSC pode mexer com title/clipboard, e escape parsing imperfeito é footgun maior que perda de cores que o modelo "queria". Renderer tem suas próprias regras de cor via `paint()`; modelo não decide.
+- `tests/tui/harness-adapter.test.ts`: regression test combinando SGR + DEC private mode + OSC + texto benign — verifica que `\x1b` desaparece e prosa permanece.
+
+**Decisions:**
+
+- **Strip na entrada (adapter), não na saída (renderer).** Single boundary onde untrusted content entra na TUI. Se striparmos no renderer, cada surface (live chip preview, permanent block, recap snapshots) precisaria lembrar de fazer; uma única omissão = vetor reaberto.
+- **Strip total, não selectivo de DEC modes.** Filtro selectivo seria mais cirúrgico mas é complexo (várias famílias: CSI, OSC, DCS, SS3, APC, PM) e cada uma com final-byte rules diferentes. Usar `stripAnsi` existente é mais simples e mais defensivo.
+- **`thinking_delta` text NÃO foi stripado.** Spec atual descarta o texto (reducer só usa o delta como ping pra manter indicator visível); strip seria trabalho desnecessário até alguma feature futura render thinking text inline.
+- **Tool subject (vocab.subject(args)) NÃO foi stripado nesta passada.** Theoretical vector mas modelo precisa colocar bytes ANSI num campo estruturado (path, command) o que é muito menos provável que em texto livre. Defense in depth pra próxima slice se aparecer no campo.
+- **Tool preview (`tool:delta`) NÃO foi stripado.** Confirmado no grep que evento é definido mas nenhum producer emite hoje — preview vazio na produção. Quando algum producer começar a emitir, repetir o strip aí.
+
+**Não-causas (rastreadas e descartadas):**
+
+- Drain de lone ESC (slice anterior) — fix correto mas era vetor independente; não cobria o caso de modelo emitindo escape sequences.
+- Modal handler leak — `resolveActive` bem comportado.
+- Janela `session_finished` ↔ `running := false` — submilliseconds, não causa freeze visível.
+- Bracketed paste no parser — pareado corretamente em `feed`.
+- Raw mode toggling — só na criação/close do renderer.
+
+**Pending:** observar em uso. Se ainda houver freezes, candidatos próximos: tool subject sanitize, OSC handling no `wrapSync`, instrumentation pra capturar stuck-state.
+
+---
+
+## [2026-05-03] M2 / fix — drain lone ESC after stdin idle (input-stuck repro)
+
+Bug report: input "fica travado" depois do `Cogitated` (turn end), às vezes; Ctrl+C também não responde. Investigação rastreou pra um defeito real no pump de keystroke: `parser.drain()` existia (`src/tui/keys.ts:363-376`) e o teste `'lone ESC is buffered until drain'` documentava o contrato, mas o REPL nunca chamava `drain`. Resultado:
+
+1. Operador aperta Esc só (pra soft-interrupt) → terminal manda `\x1b` → parser bufferiza esperando disambiguar (CSI leader vs Escape key).
+2. Sem follow-up bytes, sem drain, o ESC fica preso no buffer pra sempre. Soft-interrupt cue nunca aparece.
+3. Próximo keystroke (depois do turn finalizar, por exemplo) combina com o ESC pendente — `\x1b a` vira **Alt+a**, não `'a'`. Editor recebe Alt+letter, no-op. Input visualmente "travado".
+4. Ctrl+C também sofre quando há sequência parcial (`\x1b[` etc.) — buffer drena via path "drop ESC" eventualmente, mas o estado é frágil.
+
+**Done:**
+
+- `src/cli/repl.ts`: pump de stdin agora arma drainTimer de 30ms a cada `parser.feed()` quando `parser.bufferLength() > 0`. Próximo keystroke cancela o timer (`cancelDrain()`) antes de feedar — multi-byte sequences (CSI / SS3) entregues em chunks separados continuam a funcionar; só lone ESCs que ficam idle pelo timeout viram Escape keypresses. Convenção xterm: 25-100ms; 30 é o ponto que cobre latência SSH sem operator perceber lag em Esc deliberado.
+- `cancelDrain()` chamado no `shutdown` pra não vazar o handle (Bun reportaria como "open handle" em testes; produção atrasaria exit por até 30ms).
+- Test `tests/cli/repl.test.ts:'second Esc while soft already in flight emits interrupt:hard'` reescrito pra usar lone `\x1b` (matching real terminal output) + flushFrame (50ms > 30ms drain) — o teste antigo passava por sorte (mandava `\x1b\x1b` que emitia 1 escape imediato e bufferizava o resto, depois mandava outro `\x1b\x1b` que drenava o buffer remanescente). Pré-fix o canonical "Esc Esc = hard" da spec §5.4 nunca funcionou pra um operador real apertando Esc duas vezes; só funcionava se ele apertasse rapidamente o suficiente pra mandar 4 ESCs no mesmo chunk.
+
+**Decisions:**
+
+- **30ms drain timeout.** Mais curto (10ms) corre risco de drainar durante entrega de CSI sobre SSH lento. Mais longo (100ms+) cria lag perceptível em Esc isolado. xterm-keyboard convention modal range é 25-100ms; pego o limite inferior + folga.
+- **Cancel-and-rearm em todo feed.** Alternativa seria deixar o timer rodar e drainar mesmo após chegada de novos bytes — mas isso emitiria escapes errados quando uma CSI multi-byte é entregue em 2 feeds com gap > 30ms. Cancel-and-rearm garante que CSI completas (entregues no MESMO feed) nunca disparam drain, e CSIs split por SSH lag têm `parser.bufferLength()` > 0 que mantém o timer armado.
+- **Drain no shutdown, não no SIGCONT/SIGWINCH.** Diferentes sinais não invalidam o buffer do parser; o drain timer só precisa morrer quando o REPL morre.
+
+**Não-causas descartadas na investigação:**
+
+- Raw mode toggling — setado uma vez na criação do renderer, desligado só no close.
+- Bracketed paste lifecycle — enable/disable bem pareados.
+- DECSET 2026 BSU/ESU — sempre emitidos em par via `wrapSync`.
+- Modal manager handler leak — `resolveActive` limpa corretamente.
+- Heartbeat — só drives spinner, não bloqueia typing.
+- Janela entre `session_finished` UIEvent e `running := false`: existe (sub-millisecond), mas não pode causar input visualmente travado.
+- Focus events — não habilitamos `CSI ? 1004 h`, terminais não emitem.
+
+**Next:** observar em uso pra confirmar que o bug reportado está resolvido.
+
+---
+
+## [2026-05-03] M2 / fix — input soft-wrap respects surrogate pairs
+
+Bug report do operator: o soft-wrap introduzido em slice anterior usava `line.slice(pos, pos + innerWidth)` que cortava code units sem respeitar pares de surrogate UTF-16. Em uma linha com 😀 (U+1F600) caindo exatamente no boundary, o chunk emitia o high surrogate solto e o próximo começava com o low surrogate solto — terminal renderiza como replacement glyph (U+FFFD) e o tracking de coluna do cursor drifta pelo resto da linha.
+
+**Done:**
+
+- `src/tui/render/wrap.ts` (novo): `wrapInputLine(line, innerWidth)` retorna lista de `{start, end}` ranges em code units. Quando o chunk-end cairia em high surrogate (0xD800-0xDBFF), recua 1 unit pra deixar o par inteiro pro próximo chunk. Caso patológico (innerWidth=1 + non-BMP no `pos`) emite chunk over-wide de 2 units pra garantir forward progress — pior um row over-budget que loop infinito.
+- `src/tui/render/input.ts`: usa `wrapInputLine` em vez do slice direto.
+- `src/tui/render/compose.ts`: `composeCursor` usa o MESMO `wrapInputLine` em vez de `Math.floor(offsetInLine / innerWidth)` + `% innerWidth`. Antes os dois discordavam em chunks pulled-back: renderInput emite 7 chars na primeira sub-row, composeCursor calcula `col = prefix + 7 = 9` pra cursor offset 7 — ponteiro vazia em coluna fora do content rendered. Agora ambos consultam a mesma chunk list; cursor at boundary vai pra `col=2` da próxima sub-row (mesma semântica canônica do "boundary goes to start of next row" que já tinha pra ASCII).
+- Tests: `tests/tui/render/wrap.test.ts` (7 cenários — empty, exact-fit, multi-chunk uniform, surrogate boundary pull-back, surrogate non-boundary untouched, innerWidth=1 patológico, multiple consecutive emoji); `input.test.ts` ganha regression test pinando o caso 7 ASCII + 😀 no boundary; `compose.test.ts` ganha 2 testes (cursor at boundary post-pullback → start of next row; cursor mid-pullback-chunk → row 0 sem drift).
+
+**Decisions:**
+
+- **Code-unit ranges, não code-point arrays.** Manter o cursor em code units (igual ao `input.value`'s `.length` e ao `input.cursor`) evita refazer toda a math do editor. Surrogate-pair safety basta — graphemes via Intl.Segmenter (ZWJ sequences, family emoji, skin tones) seria fix mais correto mas com cost-benefit pior pra um workflow de prompt onde emoji é raro e ASCII domina.
+- **Width visual continua não-tratado.** Emoji renderiza como 2 cols na maioria dos terminais; chunks de N code units podem ainda overflow visual budget. Comentário existente já reconhecia isso. Fix correto seria wcwidth-aware chunking; deferred.
+- **`wrapInputLine` retorna `[]` pra empty line.** Caller (renderInput emite prefix-only line; composeCursor trata como 1 sub-row de length 0) precisa lidar com o caso. Alternativa seria retornar `[{start:0, end:0}]` e simplificar caller, mas adicionar chunks vazios polui o protocolo.
+- **Forward-progress guarantee no `innerWidth=1`.** Detecção do caso degenerado evita loop infinito. Em produção `caps.cols >= 2` sempre, então o edge case nunca deveria disparar — mas o test pina o contrato pra defesa contra regressão.
+
+**Pending:** wcwidth-aware chunking (visual width vs code-unit width) e grapheme cluster awareness via Intl.Segmenter. Não bloqueia.
+
+---
+
+## [2026-05-03] M2 / spec+impl — `agent init` (scaffold .agent/permissions.yaml)
+
+Slice anterior expôs o gap: REPL avisa em vermelho "no permission policy found" e direciona pro `/perms`, mas não tinha jeito de criar o arquivo sem o operator copiar exemplo da spec à mão. `agent init` fecha o ciclo: escreve um baseline editável strict + whitelist conservador num comando.
+
+**Done:**
+
+- Spec `AGENTIC_CLI.md §2.1` ganha linha pra modo Init na tabela de operação. §8 ganha parágrafo "Bootstrap path" descrevendo o init e referenciando o cue do REPL (§17).
+- `src/cli/init-template.ts` (novo): template inline com comentários inline pra cada section. Strict default, allow whitelist coberto (`git status/diff/log/show/branch`, `ls/rg/cat/head/tail/wc/pwd/echo`), confirm pra mutações observáveis (`git add/commit/push/pull/checkout/merge/rebase`, `rm/mv/mkdir`, `npm/bun install/run/test`), deny pra catastróficas (`rm -rf /*`, `rm -rf ~*`, `sudo*`, `curl|sh`, `wget|sh`, fork bomb literal). Path-shape: read/glob/grep allow `./**` deny `.git/objects` + secrets (`.env*`, `*.pem`, `*.key`); write/edit confirm `./**` deny `.env*`/`.git/`/`node_modules`. fetch_url deny só loopback (`localhost`, `127.0.0.1`, `::1`, `0.0.0.0`) — private nets exigiriam CIDR que matcher não tem; comentário no template explica a expansão manual.
+- `src/cli/init.ts` (novo): handler `runInit({ cwd, force, mode, out, err })`. Pure FS, zero dependência de provider/DB/engine. Refuse-on-exists (exit 1) sem `--force`; com `--force` overwrites. Mensagem de sucesso aponta pro próximo passo (`run 'agent'`).
+- `src/cli/args.ts`: positional subcommand `init` reconhecido só quando `argv[0] === 'init'` — `agent "review init"` segue como prompt regular. Sub-flags `--force` e `--mode <strict|acceptEdits>`. Bypass não é scaffoldável via init (footgun; spec mantém `bypass` mas força edição manual). Usage block ganha "Subcommands:" section.
+- `src/cli/index.ts`: dispatch via `args.init !== undefined` antes do subagent-child branch e do REPL/run lazy import. Usa `process.cwd()`, sinks de stdout/stderr.
+- Tests:
+  - `tests/cli/args.test.ts`: 7 novos testes pinando bare init, `--force`, `--mode acceptEdits`, rejeição de `--mode bypass`, `--mode` sem valor, flag desconhecido com scope `init:`, init-só-no-primeiro-positional (`agent "review init"` segue prompt), `init --help` roteia pro top-level help.
+  - `tests/cli/init.test.ts` (novo): 7 cenários sobre o handler — escreve, parsa via `loadPolicyFromString` (round-trip protege contra divergência template ↔ schema), `--mode acceptEdits` reflete no `defaults.mode`, refuse-on-exists preserva conteúdo original byte-a-byte, `--force` overwrites, `mkdir -p .agent/` quando ausente, success message orienta próximo passo.
+- Smoke test no binário real (`bun src/cli/index.ts init` em `/tmp`): cria, refuse-on-exists, `--force` overwrites — todos exit codes corretos, mensagens corretas.
+
+**Decisions:**
+
+- **Positional `agent init`, não `--init <verb>`.** Trade-off de consistência (resto do parser é `--<flag>`) por muscle memory (`git init`, `npm init`, `cargo init`, `bun init`, `cargo init`). Spec §2.1 já tinha `agent doctor` positional como precedente. Custo: prompts não podem começar com a palavra literal `init`. Workaround do operador: `agent "init the build"` (quoting evita a colisão pelo shell, mas o parser ainda dispatch'a init). Documentado o constraint via test.
+- **Init nunca scaffolda `bypass`.** Spec mantém os 3 modos, mas init aceita só `strict|acceptEdits` — bypass exige edição manual + flag `--dangerous` em runtime. Init é a porta da frente; uma porta da frente que oferece "no gating" como opção é uma porta da frente quebrada.
+- **fetch_url só loopback no default.** Private nets (10/8, 172.16/12, 192.168/16) precisariam CIDR; matcher é prefix+glob (CLAUDE.md hard rule). Glob `10.*` casaria `10.somewhere.com` literal — pior que não ter nada. Comentário no template aponta o caminho de adicionar hosts explícitos.
+- **Round-trip via `loadPolicyFromString` no test.** Sem isso o template podia divergir do schema da engine (uma renomeação de campo viraria erro silencioso até alguém rodar `agent init` em produção).
+- **`runInit` é pure FS, sem bootstrap.** Bootstrapar a engine pra escrever o arquivo da engine seria circular dependência simbólica (e prática: sem `permissions.yaml` o bootstrap usa default; com erro de parse falharia antes de poder reescrever).
+
+**Pending:** `agent doctor` (também positional, spec §2.1) ainda não impl. Não bloqueia.
+
+**Next:** PR de `feat/m2-tui-ux` quando operador autorizar.
+
+---
+
+## [2026-05-03] M2 / impl — surface deny reason + `/perms` + boot-time policy hint
+
+Operator pediu pra ler `.gitignore` na TUI e levou `Denied` sem nenhuma explicação. A engine de permissão estava integrada (modal abria pra `confirm`), mas o default policy é `strict + tools: {}` — todo gated tool deny direto, sem modal, sem motivo. Três UX gaps endereçados num slice só:
+
+**Done:**
+
+- `src/tui/harness-adapter.ts`: `tool_finished` denied agora propaga `decision.reason` como `summary` no `tool:end`. O renderer (`render/permanent.ts:215`) já roteava `summary` pro connector `└─ ` em chips denied — só faltava popular. Confirm rejeitado pelo usuário recebe override fixo `'rejected at confirmation prompt'` (engine's reason descreve match da regra, não a escolha humana — surfaces a decisão, não o gatekeeper).
+- `src/cli/slash/commands/perms.ts` (novo): `/perms` exibe a policy ativa via `permissionEngine.policy()`. Lista mode + cada section com regras inline (cap de 5 entries por lista; > 5 colapsa pra `(N entries — see policy file)` pra não floodar scrollback). Strict + sections vazias dispara hint específico ("Create '.agent/permissions.yaml' with allow/confirm rules"). Strict mode com sections sempre fecha com `(unlisted tools default-deny in strict mode)` pra evitar a interpretação errada "no entry = allowed". Read-only — edição continua sendo via YAML files.
+- `src/cli/slash/index.ts`: `permsCommand` registrado (slot 9 após `budget`). Já estava no spec `AGENTIC_CLI §160`, então sem amendment necessário.
+- `src/cli/repl.ts`: detecta `policyLayers.length === 0` no boot e emite info line "no permission policy found — strict default-deny is active. Create '.agent/permissions.yaml' or run /perms to inspect.". Só dispara quando NENHUM layer (enterprise/user/project) contribuiu — operador com policy customizada já optou pelo posture e não precisa do cue. Lê `policyLayers` (já exposto por `BootstrapResult` desde commit anterior, mas ninguém consumia).
+
+**Tests:**
+
+- `tests/tui/harness-adapter.test.ts`: deny → summary com `decision.reason`; user-rejected confirm → summary `'rejected at confirmation prompt'` (NÃO o reason original do engine).
+- `tests/cli/slash/commands.test.ts`: `/perms` rejeita args; default-strict empty inclui hint do how-to-fix; bash + read_file rules renderizam corretamente; `> RULE_LIST_CAP` colapsa pra count-only; mode=acceptEdits omite o footer strict.
+- `tests/cli/slash/dispatch.test.ts`: builtin count atualizado de 8 → 9 (rows do `/help` correspondentes).
+
+**Decisions:**
+
+- **Por que não um banner de "first-run nag" persistente?** Hint no banner basta — repete a cada boot que não tem `.agent/permissions.yaml`, então o operador não esquece. Marker de "já viu" exigiria escrita em disco, e o trigger é trivialmente reversível (criar o arquivo) — UX overengineered.
+- **Por que `summary` em vez de modificar `subject`?** `subject` é o "subject of the tool call" (`bash $command`, `read_file $path`), invariável de fluxo de denial; `summary` foi desenhado pro connector exibir o pós-fato ("read 12 lines", "exited 0"). Denied chip já preferia `summary` quando presente — só faltava a fonte.
+- **Por que não auto-criar `.agent/permissions.yaml`?** Spec §8 aspira `agent init-policy` num slice futuro; auto-criar arbitrariamente seria opinião sobre default ruleset que não tem consenso ainda. Hint guia o operador a criar manualmente até esse comando existir.
+
+**Pending:** comando `agent init-policy` pra scaffolding (spec §8 list line 160). Não bloqueia este slice — operator já tem hint + `/perms` pra inspecionar.
+
+**Next:** PR de `feat/m2-tui-ux` quando operador autorizar.
+
+---
+
+## [2026-05-03] M2 / spec — `docs/spec/HISTORY.md` (REPL input history subsystem)
+
+UI.md §5.4 já tinha as keybindings de ↑/↓ e Ctrl+R listadas, mas o subsistema completo (storage, privacy, sync, slash command, reverse-search widget) merecia doc próprio em vez de incharcar UI.md. Spec landa standalone; impl fica pra slice subsequente.
+
+**Done (apenas spec):**
+
+- `docs/spec/HISTORY.md` (~250 linhas) cobrindo:
+  - §0 princípios (per-project, append-only, privacy-first com default, substring search só, concorrência tolerada).
+  - §1 storage (SQLite reusing bootstrap db, schema `repl_history(id, ts, project_root, prompt)`, API `appendHistory/loadHistory/clearHistory`, cap de 10k via env override, dup-of-last suppression, trim em append).
+  - §2 UI (↑/↓ nav com scratch buffer, slash precedence, Ctrl+R reverse-search widget over input box, slash command `/history` com subcommands list/clear/on/off).
+  - §3 privacy (default-on matching shell convention, first-run banner com ack marker per-project, opt-out 3-níveis env > file marker > slash, posture explícito sobre secrets).
+  - §4 cross-cutting (multi-line prompts, separação de `messages` table, resume não popula history, headless mode skip).
+  - §5 estimativa de impl (~700-900 LoC + ~600 tests, ~3 dias).
+  - §6 não-objetivos (busca semântica, history expansion bash-style, sync cross-machine, edição inline, fish-style auto-suggest).
+- UI.md §5.1 + §5.4 cross-ref pra HISTORY.md (substituiu o stub antigo "persistido em .agent/state/input-history.txt" que ficou divergente do design real SQLite-based).
+- CLAUDE.md tabela de "Implementing X → Read Y" ganha linha pra HISTORY.
+
+**Decisions:**
+
+- **Tabela própria, não reuso de `messages`.** `messages` é estado da sessão (system + user + assistant + tool roles em ordem de turno); `repl_history` é fila de prompts user-only. Reuso exigiria filter `WHERE role='user'` + reconstruir noção de "submission" e tem lifetimes diferentes (resume é por session; history é por project).
+- **Substring search, sem embedding.** Spec §0 ponto 4: prompts antigos com palavra-chave única → match exato resolve. Embedding seria 1000× a complexidade pra ganho marginal.
+- **Per-project isolado, não global.** `cwd` resolved → project_root como chave. `repo-A` e `repo-B` na mesma máquina nunca cruzam prompts. Spec §0 ponto 1.
+- **Default-on com first-run banner.** Posture matching bash/zsh/fish; opt-in seria feature que ninguém liga. Privacy mitigado via banner once-shown + opt-out 3-níveis.
+- **Append-only no storage; edits via slash command.** Sem mutação direta no disco. Audit trail implícito (cada escrita é insert com ts).
+- **Bash `!!` / `!N` expansion explicitamente fora.** Ambíguo com `!` literal em prompts; ↑ + edit cobre o caso real.
+
+**Pending (futuros slices, ordem sugerida):**
+
+1. Migration + storage layer (`src/storage/history.ts` + tests).
+2. REPL nav (↑/↓ + scratch + submit hook em `src/cli/repl.ts`).
+3. Slash `/history` subcommands.
+4. Privacy banner + opt-out env/file/slash.
+5. Reverse-search widget (UI.md §4.10.X também ganha layout quando esse slice landar).
+
+**Next:** sem impl agora — operator quer fechar a branch atual `feat/m2-tui-ux` com PR primeiro. History fica como standalone branch quando virar prioridade.
+
+---
+
+## [2026-05-03] M2 / spec+impl — frame margin (2sp left, input outdented)
+
+Operator pediu padding lateral pra texto não ficar colado na borda. Spec §6.3 antes definia "indent fixo: 2 espaços por nível" — indent **hierárquico** (sub-content sob chip), não margem de frame. Adicionar margin global era extensão de spec, não divergência.
+
+Decisão sobre escopo veio em duas iterações com o operator:
+1. Primeira tentativa: "tudo exceto a linha do input". Resultado visual: input em col 0 com réguas padded em col 2 — input "vazava" pra fora do frame visual das réguas, ficou solto.
+2. Iteração: o **bloco do input** (régua acima + linha(s) do input + régua abaixo) é uma unidade visual. As 3 linhas vão edge-to-edge (col 0 a `cols-1`); todo o resto (banner, scrollback, status, tool cards, todo list, slash popover, footer, modal, inverse bar) fica padded em col 2.
+
+Resultado: scrollback recuado lê como "histórico"; o bloco edge-to-edge no fundo lê como "zona de digitação"; footer recuado embaixo lê como "status auxiliar". Hierarquia em 3 camadas, não 2.
+
+**Done:**
+
+- §6.3 reescrita com definição explícita de "frame margin" + exceção do **bloco do input** (3 linhas: rule acima + input + rule abaixo, todas edge-to-edge) + nota sobre indent vs. margin (hierarquia interna vs. distância da borda) + remoção da regra antiga "sem padding lateral em modais" (pré-canônico §4.10.13). Nota separada sobre largura de réguas: réguas do bloco do input ficam edge-to-edge (`cols`); réguas de scrollback (se algum dia houver) respeitam a frame margin (`cols-2` + 2sp prefix).
+- §4.10.8 inverse bar atualizado: SGR 7 cobre col 2 a cols-1; o 2sp da margem fica fora do wrap reverse (normal-bg), bar visualmente inset 2sp.
+- §4.10.12 reference layout redesenhado mostrando indent + outdent.
+- Novo módulo `src/tui/render/frame.ts` com `FRAME_MARGIN`, `FRAME_MARGIN_WIDTH`, `frameWidth(caps)`, `padFrame(line)` — fonte única para a constante, fácil de bumpar pra 3sp/4sp se a UX evoluir.
+- `compose.ts`: `padFrame` aplicado em cada renderer output exceto `renderInput`. Régua usa `frameWidth(caps)` pra largura de `cols-2` + prefix.
+- `permanent.ts`: cada `kind` retorna lines `.map(padFrame)`. `user-submit` reverse bar especial — pad interno a `frameWidth(caps)` antes do reverse, prefix `'  '` fora do SGR 7.
+- `footer.ts`: anchor math subtrai `FRAME_MARGIN_WIDTH` da largura disponível, prefix sai padded.
+- 2 testes de regressão novos em `compose.test.ts` pinando o contrato: "every line starts with 2sp EXCEPT input" e "multi-line input continuations skip the frame margin" (pega o caso enganoso onde continuação `'  body'` parece linha padded mas é input).
+
+**Decisions:**
+
+- **Diferenciar input de continuação de input**: continuation lines começam com `'  '` (renderInput's prefix pra alinhar sob `>`). Padding global também é `'  '`. O composer evita o problema chamando `renderInput` SEM `.map(padFrame)`, então linhas de input ficam com 2sp totais (renderInput's prefix), enquanto outras ficam com 4 totais (frame margin + content's natural prefix). Diferença visual: input em col 0, conteúdo em col 2.
+- **Reverse bar com prefix fora do SGR**: 2 normal-bg spaces, depois reverse de col 2 a cols-1. Mantém propriedade de "divisor estrutural" sem comer os 2sp da margem.
+- **Modal também padded**, contra a regra original "sem padding interno em modais". Justificativa: incoerência visual entre modal e o resto seria pior que rever uma regra pré-canônica que nunca foi reavaliada após §4.10.13.
+
+**Pending:**
+
+- Smoke visual em xterm + i3wm (terminal do operator) — confirmar que o respiro lateral fica como esperado e que o cursor após `> ` realmente cai em col 2 alinhado ao resto.
+
+**Next:** smoke + commit.
+
+---
+
+## [2026-05-03] M2 / fix — renderer flicker (single write + DECSET 2026 + differential)
+
+Operator notou linhas ao redor do input piscando ao digitar; pior sob key repeat (`eeeeeeeeee`). Operator usa xterm vanilla sob i3wm — terminal mais antigo sem DECSET 2026. Foi preciso atacar em três camadas, e a operator-side observation foi load-bearing: *"o banner não pisca"* — ou seja, conteúdo permanente (que vai pra scrollback nativo do terminal e nunca é revisitado) é estável; só a região viva pisca, porque ela é redesenhada a cada frame.
+
+1. **Camada syscall.** Redraw fazia 2-3 `write()` separados (erase → draw → cursor reposition). TTY flusha sync, terminal via cada write como update separado.
+2. **Camada terminal.** Mesmo após coalescer pra 1 syscall, terminais como xterm rasterizam ANSI **incrementalmente** — `cursor-up` executa, `clear-down` executa (gap vazio visível), só depois conteúdo. Resolve em terminais modernos com **synchronized output (DECSET 2026)** — wrap `\x1b[?2026h` … `\x1b[?2026l`. Em xterm vanilla é no-op silencioso, então a fix não chega.
+3. **Camada de redraw model.** O renderer reconstruía a região INTEIRA a cada frame: input + status + réguas + footer juntos. Sob key repeat só o input muda; reescrever os outros 30x/s era visível como flicker mesmo com syscall + DECSET 2026 corretos. Resolve com **diferencial line-by-line**: comparar lines do frame novo com o anterior, só reemitir o que mudou. Linhas estáticas ficam pixel-stable porque o terminal nunca recebe instrução pra revisitar.
+
+**Done:**
+
+- §2.2 step 4 estendida: além de single write, manda wrapping em BSU/ESU (DECSET 2026); explica as duas camadas (syscall + rasterização) e por que ambas são necessárias sob key repeat. Lista terminais com suporte. Sem suporte = no-op silencioso.
+- `term.ts` ganhou constantes `beginSyncOutput` / `endSyncOutput` / `clearLine` (essa última já existia, agora é importada pelo renderer).
+- `src/tui/renderer.ts` refatorado em 3 build helpers (`buildErase`, `buildFullDraw`, `buildDifferentialDraw`, `buildPermanent`) — todos retornam string. `redraw` decide entre full e diferencial via `prevLines.length === truncated.length`. Layout mudou? Full erase + draw. Mesma altura? Diferencial: walk to row 0, walk down to each changed row, `\r${clearLine}<content>`, skip rows iguais. Cursor reposicionado no fim.
+- `prevLines: string[]` rastreia o frame anterior. Reset em: layout change, permanent transition, screen:clear, session end, close. Reset força próximo frame pelo full path pra renderer state ficar em lockstep com o que o terminal mostra.
+- Tudo wrapped em BSU/ESU; tudo num `write()` por ciclo. Empty payloads não wrappam.
+- 4 testes de regressão novos:
+  - "1 redraw = 1 write()" pina o contrato syscall.
+  - "redraw payload wrapped em DECSET 2026" pina o contrato de apresentação.
+  - **"unchanged lines NOT re-emitted"** pina o contrato diferencial — composer fake com 3 lines (header estático, input dinâmico, footer estático), assertion `not.toContain` nos estáticos após o primeiro frame. Esse é o teste load-bearing pra anti-flicker em xterm.
+  - "layout change falls back to full erase + redraw" pina o fallback quando altura muda (ghost rows seriam o failure mode se faltasse).
+
+**Decisions:**
+
+- **DECSET 2026 emitido incondicionalmente.** Modo privado spec-compliant: terminais sem suporte ignoram. Detecção runtime adicionaria complexidade sem ganho — emitir é seguro, e detecção via query ESC seria assíncrona e laggy ao boot.
+- **Wrap só payloads não-vazios.** BSU+ESU em volta de string vazia é no-op mas pollui assertions e gasta bytes.
+- **Nomes internos `build*`** (não `make`/`compute`) deixam claro que retornam string, não escrevem.
+- **Diferencial via igualdade exata de string.** `truncated[i] !== prevLines[i]` decide se reemite. Isso pega 100% das mudanças relevantes (status counter, footer cue, input value); falsos positivos só aconteceriam se algum composer retornasse strings semanticamente iguais mas literalmente diferentes (e.g., timestamp em ms num spinner) — caso real é o spinner de tool ativo, mas esse já é uma linha que MUDA legitimamente, então comparação certa.
+- **Layout change → full erase + draw.** A alternativa seria diferencial híbrido com inserção/remoção de linhas, mas a complexidade não compensa: layout muda em transições (modal abre, tool inicia, session end) onde uma full repaint é aceitável e o operador não está sob key repeat naquele instante.
+
+**Pending:**
+
+- Smoke visual sob key repeat em xterm + i3wm (terminal do operator) e num terminal com DECSET 2026 (alacritty/kitty). Em ambos a região viva deve estar 100% lisa após o diferencial.
+
+**Next:** smoke + commit.
+
+---
+
+## [2026-05-03] M2 / spec+impl — idle Ctrl+C double-tap exit gate (UI.md §5.4)
+
+Operator queixou: single Ctrl+C no idle saía do REPL imediatamente. Com a TUI inline e tarefas longas em curso, o "tap acidental" era custoso — sair perde draft, contexto de slash em curso, foco. A spec hoje (§5.4) só cobria Ctrl+C `running` (cancela / hard kill) e silenciava sobre idle, deixando o comportamento "exit imediato" implícito. Lacuna de spec, não divergência.
+
+**Done:**
+
+- §5.4 ganhou 4 linhas explícitas: `Ctrl+C / input não vazio` (limpa), `Ctrl+C / idle vazio` (arma + footer cue), `Ctrl+C 2x dentro de 2s / idle` (exit 130), `Ctrl+D / vazio` (EOF, sem gate). Parágrafo de notas explica o que desarma (qualquer tecla, timeout, submit, modal, turn start) e por que `^D` fica fora do gate (convenção de shell para "I'm done", duplo-tap surpreende).
+- §4.10.6 footer table ganhou linha `Idle, exit armed`: esquerda vira `ctrl+c again to exit` em `warn`, direita inalterada.
+- `input-editor.ts` discrimina Ctrl+C de Ctrl+D: `cancelInput?: 'interrupt' | 'eof'`. Caller decide o roteamento.
+- 2 UIEvents novos: `interrupt:exit-arm` (define `LiveState.exitArmed = { at: ts }`) e `interrupt:exit-cancel` (limpa). Reducer dumb: producer dirige.
+- `LiveState.exitArmed: { at: number } | null` adicionado, com boundary cleanup em `session:start` e `session:end` (defesa em profundidade contra leak entre turns).
+- `renderFooter` swapa o left-column inteiro pra cue `warn` quando `exitArmed !== null`. Precedence: gate > running interrupt cue > help hint.
+- `repl.ts` ganhou `armExit` / `cancelExitArm` / `handleIdleInterrupt` helpers em closure scope. Editor handler desarma em qualquer keystroke ≠ `interrupt`; SIGINT path passa pelo mesmo gate. Janela 2s via `setTimeout`; `shutdown()` cancela o timer pra evitar leak.
+
+**Decisions:**
+
+- **Gate só no idle.** Running tem o ladder soft/hard próprio (Esc/Ctrl+C → soft, segundo tap → hard). Misturar gates seria UX incoerente — operador running quer parar a tool, não fechar o agent.
+- **Ctrl+D fora do gate.** Convenção POSIX/shell: EOF é "I'm done". Aplicar double-tap aqui contraria 40 anos de muscle memory. Tests dedicados pra ambos os paths.
+- **Footer cue em `warn`, não `bold`.** Consistente com §6.4 ("bold + colorido" proibido exceto `error`). `warn` (yellow) carrega o "atenção: próxima tecla é load-bearing" sem virar alerta de erro.
+- **Producer-driven cancel, reducer dumb.** REPL emite `interrupt:exit-cancel` em qualquer disarm-condition; reducer só flipa flag. Reduzir lógica no reducer mantém o teste de unidade trivial e evita drift entre o que o REPL acha que está armado e o que o renderer mostra.
+- **Cleanup de tests via `\x04` (EOF), não `\x03`.** 21 dos 23 testes em `repl.test.ts` usavam `\x03` como "exit me, test acabou" — sed-replace para `\x04` mantém intent (exit imediato) sem depender do gate. Os 2 testes dedicados ao path de Ctrl+C ganharam reescrita explícita pra exercitar o novo contrato (single arm vs double-tap exit).
+- **Janela de 2s.** Padrão observado em fish, bash readline, e outros REPLs com gate similar. Curta o suficiente pra não deixar ambiguidade ("apertei agora, esqueci?"), longa o bastante pra um humano confirmar conscientemente.
+
+**Pending:**
+
+- Smoke visual: rodar `bun run dev`, verificar que footer mostra `ctrl+c again to exit` em yellow real e que após 2s desarma (cue some).
+- Documentar no welcome help (`/help` / `?`) o gate, pra novo operador descobrir sem precisar errar uma vez.
+
+**Next:** smoke + commit.
+
+---
+
+## [2026-05-03] M2 / spec — UI.md welcome banner restructure (3 blocks + ✓ flags)
+
+Operator review of the boot screen flagged it as "denso, sem hierarquia" — banner colava no input, todos os blocos com mesmo peso, primeira impressão era "dump de terminal". Spec dizia 4 linhas tight; sem espaço pra respirar entre versão / identity / env. Receita externa sugeria cores acentuadas (cyan path, etc.) — proibidas pela §6.1 ("se precisa de cor pra distinguir, o layout falhou"), então a divergência teve que ir pela rota de spacing + glyph canônico, não paleta.
+
+**Done:**
+
+- §4.10.9 reescrito: banner agora tem 3 blocos separados por linha em branco (title / identity / env). Spacing carrega a hierarquia, paleta segue mínima.
+- Versão prefixada com `v` (`forja v0.0.0`) — convenção semver, alinha com o exemplo já existente da spec que estava drift do código.
+- Bloco 3 (env) ganhou semântica dupla: indicadores de capability binária habilitada usam `✓` (§6.2) + `success` (§6.1) com nome em default; metadata k:v não-binária permanece em dim. Itens binários desligados não imprimem (a linha lista o que existe, não o que falta).
+- §6.1 estendeu o uso do token `success` pra cobrir o novo caso do banner env.
+- §6.3 esclareceu que a regra "1 linha em branco entre blocos permanentes" aplica também a sub-blocos dentro de um único `PermanentItem`.
+- §4.10.12 reference layout atualizado.
+
+**Decisions:**
+
+- **Spacing > cor.** A crítica externa sugeria `chalk.cyan(path)` e padding lateral global; ambos violam restrições deliberadas (§6.1 sem azul/ciano, §6.3 indent é por nível não margem). A amenda prova que respiro vertical resolve "tudo colado" sem mexer paleta.
+- **`✓` como discriminador semântico, não decoração.** Spec §4.10.11 bane emoji decorativo, mas `✓` é canônico (§6.2) — o caso novo é "indicador binário de capability", consistente com pipeline badge (que já era a única licença do `success`). Itens desligados não aparecem com `✗` — a ausência já comunica.
+- **Schema do `session:banner` event preservado em forma**, mas a env entry vai precisar de discriminador `kind: 'flag' | 'meta'` no impl-side pra renderer escolher entre `✓ {key} (count)` e `{key}: {value}`. Producer (repl.ts:670+) agora popula ambas as formas.
+
+**Pending:**
+
+- Render impl em `src/tui/render/permanent.ts` (case `session-banner`).
+- Producer em `src/cli/repl.ts` ajusta as env entries (memory + policy ainda não emitidas hoje).
+- Tests de snapshot (3 blocos, ASCII fallback, NO_COLOR, env vazio omitido).
+
+**Next:** corte código nesta mesma branch (`feat/m2-tui-ux`) — spec landou primeiro, impl segue. Smoke visual num terminal real após o build.
+
+---
+
 ## [2026-05-03] M1 audit — TUI ↔ harness integration coverage (~77%)
 
 End-to-end audit of every `HarnessEvent` and `UIEvent` after the M1 series landed. 17 of 22 producer/render paths are wired and exercised against real Anthropic streaming (smoke runs in this session: text-only response, tool deny + multi-step recovery, tool allow path, --list-sessions). 5 producer gaps + 1 incomplete render are tracked below as explicit debt — none block the merge of what currently works, but each is a contract the spec promises and the operator-visible UI doesn't fully deliver yet.

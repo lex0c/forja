@@ -79,10 +79,12 @@ Reside em memória como `LiveState`. A cada mudança (evento do bus ou tick de s
 1. Move cursor: `\x1b[<n>A` (sobe N linhas, N = altura do último frame).
 2. Limpa: `\x1b[J` (apaga do cursor pra baixo).
 3. Compõe `string[]` via funções de render.
-4. Escreve em uma única `process.stdout.write(...)`.
+4. Escreve em uma única `process.stdout.write(...)`, envelopada em **synchronized output** (DECSET 2026): `\x1b[?2026h` no início + `\x1b[?2026l` no fim. Terminais que suportam (kitty, iTerm2, alacritty, wezterm, recent gnome-terminal/konsole) bufferam o conteúdo entre BSU/ESU e renderizam como **frame atômico** — sem o flicker de "cursor-up + clear → conteúdo" sendo pintado em passos visíveis. Terminais sem suporte ignoram (modo privado, comportamento spec-compliant). Aplica-se também ao path permanente (erase + scrollback line + draw): a transição inteira é uma frame.
 5. Reposiciona cursor dentro do input.
 
 Frame budget: **30fps soft, 60fps em bursts** (ver `PERFORMANCE.md`). Coalescer eventos dentro de um frame: vários `assistant:delta` em < 33ms viram um único redraw.
+
+Single write + synchronized output são camadas independentes: um syscall (passo 4) garante que o kernel não fragmenta no fd; BSU/ESU garantem que o terminal não fragmenta no rasterizador. Ambos são necessários — sob key repeat (~30 chars/s), a falta de qualquer um produz flicker visível nas linhas estáticas (status, footer, réguas) que cercam o input.
 
 ### 2.3 Largura e altura
 
@@ -129,8 +131,8 @@ Implementação: `EventEmitter` nativo do Node/Bun. Não usar `mitt` ou similar 
 
 | Evento | Quando | Renderer reage |
 |---|---|---|
-| `session:start` | Início da sessão | imprime cabeçalho permanente |
-| `session:end` | Fim da sessão | imprime sumário permanente |
+| `session:start` | Início da sessão (cada turn em REPL, único em one-shot) | atualiza status interno (sessionId, profile, model, planMode, projeto); reseta flags per-session (softInterrupted, exitArmed, bgProcesses). **Sem permanente em scrollback** — o user-submit inverse bar (§4.10.8) já marca início de turno; cabeçalho com session UUID seria ruído por turno em REPL e não agrega info útil ao operator (UUID interessa só pra resume/audit, lookup feito via CLI separada). |
+| `session:end` | Fim da sessão | imprime marcador final em scrollback: linha em branco + verbo terminal com **duração wall-clock** quando disponível: `Cogitated for 1m23s` (done) / `Aborted (soft) after 12s` / `Failed after 8s` / `Stopped (max steps) after 1m` / `Stopped (max cost) after 1m`. Sem duração (legacy/replay): cai pra forma curta `Cogitated.` / `Aborted.` / `Failed.` etc. Formato curto, sem régua decorativa nem session UUID — o boundary é visível e a duração responde "quanto tempo isso levou?" sem o operator ter que olhar o footer ou procurar elsewhere. |
 | `user:submit` | User pressiona Enter | imprime echo permanente; limpa input |
 | `assistant:start` | Provider começa a streamar | abre buffer vivo de mensagem |
 | `assistant:delta` | Cada chunk de texto | append no buffer; redraw |
@@ -239,7 +241,7 @@ Mais de 8 todos: trunca pra "▶ running + próximas 2 pending + ✗ failed", co
 
 ### 4.4 Status line (sempre presente, 1 linha)
 
-> **Supersedido pela §4.10.6 (footer dinâmico).** A "status line acima do input" foi reposicionada como **footer** abaixo do input box, com layout de duas colunas (hint + config). Conteúdo é equivalente; posição e shape mudaram. Esta seção fica como referência do conteúdo (model, steps, cost, badges) — a posição canônica é §4.10.6.
+> **Removida.** A "status line acima do input" foi absorvida pelo footer §4.10.6, que já mostra `model · [plan] · steps/max · cost · [bg N]` no canto direito. Renderer não emite mais uma linha separada — duplicar info em duas posições só consome espaço vertical (e em REPL com input outdented §6.3, a linha de status no fim da live region competia visualmente com o próprio input, sem ganho informativo). Seção mantida aqui como histórico de design; conteúdo canônico está em §4.10.6.
 
 ```
 [autonomous] · forja · sonnet-4.6 · 12/50 · $0.04 · mem 4u · bg 1
@@ -379,7 +381,7 @@ Verbo no presente contínuo enquanto ativo. Particípio passado quando completo.
 
 | Operação | Ativo | Finalizado |
 |---|---|---|
-| Provider call (texto streaming) | `Generating… (8s · ↑ 234 tokens)` | `Generated 234 tokens in 8.2s` |
+| Provider call (texto streaming) | `Generating… (8s · ↑ 234 tokens)` | (suprimido — assistant turn não imprime chip final, só a prosa direto; duração vai no marcador de fim de turno §3.2 `Cogitated for X`, contagem de tokens vai no footer §4.10.6) |
 | Extended thinking | `Thinking… (3s)` | `Thought for 3.1s` |
 | Tool execution | per-tool verb (§4.10.4) | per-tool verb (§4.10.4) |
 | Compaction | `Compacting context… (12s)` | `Compacted 12 messages in 850ms` |
@@ -469,10 +471,11 @@ Sempre 1 linha, dim, **abaixo do input box** (com régua entre eles).
 
 | Estado | Esquerda | Direita |
 |---|---|---|
-| Idle | `? for help` | `• <model> · <steps>/<max> · $<cost>` |
-| Running | `? for help · esc to interrupt` | `• <model> · <steps>/<max> · $<cost>` |
-| Soft-aborted (ainda processando) | `? for help · esc again to force` | (mesmo) |
-| Plan mode | `? for help` | `• <model> · plan · <steps>/<max> · $<cost>` |
+| Idle | `? for help · \+Enter newline` | `• <model> · <steps>/<max> · $<cost>` |
+| Idle, exit armed (§5.4) | `Press Ctrl-C again to exit` (`warn`) | (mesmo) |
+| Running | `? for help · \+Enter newline · esc to interrupt` | `• <model> · <steps>/<max> · $<cost>` |
+| Soft-aborted (ainda processando) | `? for help · \+Enter newline · esc again to force` | (mesmo) |
+| Plan mode | `? for help · \+Enter newline` | `• <model> · plan · <steps>/<max> · $<cost>` |
 | Modal up | (suprimido — modal cobre footer) | (suprimido) |
 
 Esquerda = **"o que posso fazer agora?"**. Hint de help + interrupt **só quando interruptable**.
@@ -501,7 +504,7 @@ Multi-tool ops (ex: `glob` matched 14 files) cita o **padrão**, não a lista �
 > a tui já funciona?
 ```
 
-Renderizado com SGR `7` (reverse) full-width — branco em fundo escuro, ocupando toda a coluna do terminal. Vira **divisor estrutural** no scrollback: rolando, as barras servem de heading natural para localizar turnos.
+Renderizado com SGR `7` (reverse) preenchendo da col 2 até `cols-1` — branco em fundo escuro como divisor estrutural no scrollback. Os 2sp à esquerda são a frame margin (§6.3); a barra fica visualmente alinhada ao resto do conteúdo recuado. Rolando, as barras servem de heading natural para localizar turnos.
 
 Régua dim acima e abaixo do echo é **opcional** (decisão final na implementação após smoke test visual). Default: sem régua adicional, deixa a inversa carregar o destaque sozinha.
 
@@ -509,21 +512,31 @@ ASCII fallback: SGR `7` é universal em qualquer terminal — sem fallback neces
 
 #### 4.10.9 Welcome banner (scrollback)
 
-Emitido **uma vez** no boot do REPL, como `PermanentItem` kind `'session-banner'`. Quatro linhas, todas respondem uma pergunta concreta:
+Emitido **uma vez** no boot do REPL, como `PermanentItem` kind `'session-banner'`. Estruturado em **3 blocos** separados por linha em branco — banner em densidade alta colava no input e violava o princípio "hierarquia vem de spacing/peso, não de cor" (§6.4). Spacing carrega a estrutura; paleta segue mínima.
 
 ```
 forja v0.0.0
+
 anthropic/claude-sonnet-4-6 · 200k ctx · max 4096 out
 /run/media/lex/.../forja
-policy: project (5 rules) · subagents: 2 · checkpoints: enabled · memory: 14 entries
+
+policy: project (5 rules) · subagents: 2 · ✓ checkpoints · ✓ memory (14)
 ```
 
-| Linha | Pergunta |
-|---|---|
-| 1 | Qual versão. |
-| 2 | Qual modelo, com limites concretos (context window, max output). |
-| 3 | Em qual cwd. |
-| 4 | Ambiente: quantas regras, quantos subagents, checkpoints/memory ligados. |
+| Bloco | Linhas | Estilo | Pergunta |
+|---|---|---|---|
+| 1 (title) | 1 | `bold` | Qual versão? |
+| 2 (identity) | 2 | `dim` | Qual modelo (limites concretos: context window, max output) e em qual cwd? |
+| 3 (env) | 0 ou 1 | misto | O que está ligado nesta sessão? |
+
+**Versão prefixada com `v`** (`forja v0.0.0`, não `forja 0.0.0`) — convenção semver, identifica a string como versão à primeira leitura.
+
+**Bloco 3 (env)** mistura dois estilos numa única linha, separados por ` · `:
+
+- **Indicadores de capability binária habilitada** (`checkpoints`, `memory`) usam o glyph `✓` (§6.2) pintado com token `success` (§6.1); o nome do indicador fica em `default`. Contagem opcional entre parênteses (`✓ memory (14)`). Itens em estado desligado **não são impressos** — a linha lista o que existe, não o que não existe.
+- **Metadata key:value não-binária** (`policy: project (N rules)`, `subagents: N`) fica em `dim`. Sem glyph.
+
+Quando nenhum indicador binário estaria true e nenhuma metadata útil existe (sem subagents, sem checkpoints, sem memory, sem policy customizada), o **bloco 3 é omitido inteiro** — banner termina após o bloco 2, sem linha em branco terminal vazia. Producer (`session:banner`) sinaliza isso enviando `env: []`.
 
 Vai pro scrollback — uma vez impresso, scrolla naturalmente conforme a conversa cresce. **Sem header fixo.** Sem logo. Sem mascot. (Se um dia identidade visual virar pauta, ASCII art opcional via flag — não default.)
 
@@ -546,7 +559,7 @@ Banidos do vocabulário operacional:
 - `Working`, `Loading`, `Processing`, `Please wait` — vagos.
 - `Handling`, `Managing`, `Orchestrating` — abstratos.
 - `Just a moment…`, `Working on it…` — cortesia, desperdício de coluna.
-- `Ready!`, `Done!`, `Success!` — redundantes; ausência de chip ativo já comunica.
+- `Ready!`, `Done!`, `Success!` (com **exclamação**) — banidos como **status messages durante operação**. O **marcador de fim de turno** em scrollback (§3.2 `session:end`) usa verbo no particípio passado + duração wall-clock: `Cogitated for 1m23s` (done) / `Aborted after 12s` / `Failed after 8s` / `Stopped (max steps) after 1m`. Verbo concreto + número responde "quanto tempo o turno levou?" sem entusiasmo nem duplicação com o footer. Sem duração disponível (legacy/replay): forma curta `Cogitated.` / `Aborted.` / `Failed.`
 - Emoji decorativo (✓ ✗ ⚠️ 🔧 💭 🚀) — depende de fonte/terminal, conflita com paleta dim. Glyphs canônicos da §6.2 são exceção (são informativos, não decorativos).
 - Metáforas culinárias/artesanais ("Baking", "Cooking", "Brewing", "Forging") — engenheiro lê verbo literal melhor que metáfora.
 - Mascote, ícones de marca, logo — fora de escopo do core; flag opcional se virar pauta.
@@ -554,23 +567,28 @@ Banidos do vocabulário operacional:
 #### 4.10.12 Layout completo (referência ASCII)
 
 ```
-┌─ scrollback (permanent items, dim baseline) ───────────────────────┐
-│ forja v0.0.0                                                        │
-│ anthropic/claude-sonnet-4-6 · 200k ctx · max 4096 out               │
-│ /run/media/lex/.../forja                                            │
-│ policy: project (5 rules) · subagents: 2 · checkpoints: enabled     │
+┌─ scrollback (permanent items, 2sp left margin §6.3) ────────────────┐
+│   forja v0.0.0                                  ← title (bold)      │
 │                                                                     │
-│ > a tui já funciona?                            ← inverse bar       │
-│ * Reading file (2.4kB)                          ← chip final, dim   │
-│ └─ src/foo.ts                                                       │
-│ * Generated 234 tokens in 8.2s                                      │
-│ Sim, em teoria funciona...                      ← assistant text    │
-│ ── step 3/50 ── $0.012 ──                       ← step separator    │
+│   anthropic/claude-sonnet-4-6 · 200k ctx · max 4096 out ← identity  │
+│   /run/media/lex/.../forja                                          │
+│                                                                     │
+│   policy: project (5 rules) · subagents: 2 · ✓ checkpoints          │
+│                                                                     │
+│                                                 ← blank (turn boundary) │
+│   > a tui já funciona?                          ← inverse bar (§4.10.8) │
+│                                                 ← blank             │
+│   * Reading file (2.4kB)                        ← chip final, dim   │
+│   └─ src/foo.ts                                                     │
+│                                                 ← blank             │
+│   Sim, em teoria funciona...                    ← assistant text    │
+│                                                 ← blank             │
+│   Cogitated for 8.2s                            ← turn-end (§3.2)   │
 └─────────────────────────────────────────────────────────────────────┘
-─────────────────────────────────────────────────────────────────────  ← régua
-> ▌                                                                   ← input + cursor inline
-─────────────────────────────────────────────────────────────────────  ← régua
-? for help · esc to interrupt        • sonnet-4.6 · 3/50 · $0.012     ← footer
+─────────────────────────────────────────────────────────────────────  ← régua (full width, col 0)
+> ▌                                                                   ← input + cursor (col 0)
+─────────────────────────────────────────────────────────────────────  ← régua (full width, col 0)
+  ? for help · \+Enter newline · esc to interrupt   • sonnet-4.6 · 3/50 · $0.012  ← footer (padded)
 ```
 
 Live region (entre as réguas e a inferior):
@@ -693,7 +711,7 @@ Atalhos:
 - `process.stdin.setRawMode(true)` no boot (TTY only). Restore em qualquer exit path (incl. Ctrl+C, exceptions).
 - Parser de escape sequences manual: setas, Home/End, Delete, Ctrl+A/E/U/W/K, Alt+B/F (word jumps), Ctrl+Backspace, Enter, Shift+Enter.
 - **Bracketed paste** (`\x1b[200~...\x1b[201~`): habilitado no boot, processado em batch (sem disparar redraw por char).
-- Histórico de input: persistido em `<repo>/.agent/state/input-history.txt` (últimas 1000 entradas), navegável com seta-pra-cima/baixo. Ctrl+R = reverse search.
+- Histórico de input: ver `HISTORY.md` (subsistema próprio — SQLite-backed, per-project, com privacy opt-out, slash command `/history`, navegação ↑/↓ e reverse-search `Ctrl+R`).
 - Expanded input mode: paste com >3 linhas abre buffer de N linhas no lugar do input, com `[Esc] cancel · [Ctrl+D] submit · [Ctrl+E] open $EDITOR`.
 
 ### 5.2 Spinner
@@ -720,16 +738,22 @@ Renderer reage a `tick` igual a qualquer evento (redraw da região viva).
 |---|---|---|
 | Enter | input | submit |
 | Shift+Enter | input | nova linha |
+| `\` + Enter | input | nova linha — backslash continuation (convenção shell). Útil em terminais/WMs que comem Shift+Enter. Char antes do cursor era `\` → renderer troca pelo `\n` (cursor fica no mesmo índice, agora à direita do `\n`). |
+| Ctrl+C | input não vazio | limpa o buffer (não sai) |
+| Ctrl+C | idle, buffer vazio | **arma exit** — footer mostra `Press Ctrl-C again to exit` (cue em `warn`); janela de 2s |
+| Ctrl+C (2x dentro de 2s) | idle, buffer vazio | exit 130 (POSIX SIGINT) |
 | Ctrl+C | running | cancela step atual (graceful) |
 | Ctrl+C (2x) | running | hard kill |
 | Esc | running | request soft interrupt (LLM termina passo, depois para) |
 | Esc Esc | running | hard interrupt (cancela tool em curso) |
 | Ctrl+L | qualquer | clear screen (mantém histórico no scrollback) |
-| Ctrl+R | input | reverse search no histórico |
-| Ctrl+D | input vazio | exit |
+| Ctrl+R | input | reverse search no histórico (ver `HISTORY.md` §2.2) |
+| Ctrl+D | input vazio | exit imediato (EOF — convenção shell, sem gate) |
 | Tab | input com `/` | autocomplete |
 | Ctrl+Z | qualquer | suspend (SIGTSTP), retorna com `fg` |
-| ↑/↓ | input | navegar histórico de inputs |
+| ↑/↓ | input | navegar histórico de inputs (ver `HISTORY.md` §2.1) |
+
+**Idle Ctrl+C double-tap:** o gate só aplica em `idle + buffer empty + sem run em curso`. Outros estados têm seus próprios paths (running tem o ladder soft/hard separado §3; buffer não vazio limpa). Janela de 2s é desarmada por: timeout, qualquer tecla (incluindo digitação), submit, abertura de modal, ou início de turno. Ctrl+D **não** passa pelo gate — EOF é convenção de shell para "I'm done", uma única tecla equivale a uma decisão explícita; aplicar double-tap aqui surpreende.
 
 ### 5.5 Modal pattern (canônico)
 
@@ -917,13 +941,16 @@ function dispatch(k: Key) { for (let i=stack.length-1; i>=0; i--) if (stack[i](k
 | Token | Uso | ANSI |
 |---|---|---|
 | `default` | texto normal | (sem escape) |
-| `dim` | meta, hints, separadores | `\x1b[2m` |
+| `dim` | meta, hints, separadores (réguas, footer, sub-content `└─`) | `\x1b[2m` (faint) |
+| `secondary` | marker visivelmente grey que precisa se separar do conteúdo primário (turn-end `Cogitated for X`, §3.2) | `\x1b[90m` (bright-black ≈ grey) |
 | `bold` | ênfase, header de modal | `\x1b[1m` |
 | `error` | mensagens de erro, status falho | `\x1b[31m` |
 | `warn` | avisos, budget 80% | `\x1b[33m` |
-| `success` | apenas em pipeline badges (`✓`) | `\x1b[32m` |
+| `success` | pipeline badges (`✓`) e indicadores binários de capability habilitada no banner env (§4.10.9) | `\x1b[32m` |
 
 **Sem mais cores.** Sem azul, sem ciano, sem magenta, sem gradientes, sem 256-color, sem truecolor. Profile/model/etc. ficam em `default`. Se você precisa de cor pra distinguir, o layout falhou.
+
+**Nota sobre `dim` vs `secondary`:** `dim` (SGR 2 faint) é o token tradicional para meta — réguas, hints, sub-content. Em xterm com config padrão, SGR 2 renderiza idêntico ao default; aceito porque no contexto desses elementos a posição já carrega a hierarquia. **`secondary`** (SGR 90 bright-black) é o variante explicitamente visível, reservado pra marker que PRECISA destacar do conteúdo primário (turn-end `Cogitated for X` da §3.2). SGR 90 é uma cor 16-color (cinza), não "mais uma cor" no sentido das proibidas (azul/ciano/magenta).
 
 `NO_COLOR` env var ou `--no-color`: desativa todos os escapes. `CLICOLOR_FORCE=1` ignora `!isTTY` e força cores (útil em log capture).
 
@@ -947,10 +974,13 @@ Detecção: locale-aware (`LANG`/`LC_ALL` contém `UTF-8`) + check de width via 
 
 ### 6.3 Espaçamento
 
-- Indent fixo: 2 espaços por nível.
-- Não há padding interno em modais (linhas vazias acima/abaixo do conteúdo, sem espaços laterais — borda fica em `─`).
-- Separador horizontal: `─` (40 chars) ou `-` (ASCII).
-- Linhas em branco entre blocos permanentes: 1 (apenas).
+- **Frame margin (UX)**: 2 espaços à esquerda em **todos os elementos visíveis** — banner, scrollback (assistant, tool-end, info/warn/error), status line, tool cards (live + permanent), todo list, slash popover, footer, modal, inverse bar do user-submit (§4.10.8).
+  - **Exceção: bloco do input** (régua acima + linha(s) do prompt `> ` + régua abaixo). As 3 linhas formam uma unidade visual e ficam edge-to-edge (col 0 a `cols-1`). Recuar só o input com as réguas padded faria a entrada "vazar" pra fora do frame visual; recuar tudo apagaria a hierarquia ("isto é onde você digita"). Edge-to-edge nas 3 linhas dá um bloco coerente que rompe com o conteúdo recuado acima e com o footer recuado abaixo. O cursor naturalmente cai em col 2 (após `> `), alinhado à margem de 2sp do resto.
+  - Largura útil de cada elemento padded é `cols - 2`. Margem direita não existe — alinhar à direita ainda usa col `cols-1`.
+- **Indent de conteúdo**: 2 espaços por nível adicional dentro de um elemento (ex.: sub-content connector `└─` sob um chip vai em col 4 = frame margin 2 + nível 2). Não confundir com frame margin (separa conteúdo da borda) vs. indent (separa hierarquia interna).
+- Separador horizontal: `─` (Unicode) ou `-` (ASCII). Largura depende do contexto: réguas que cercam o input (acima + abaixo) ficam edge-to-edge (`cols` colunas, sem margin); qualquer outra régua que apareça em scrollback/permanente respeita a frame margin (2sp prefix + `cols - 2` glyphs).
+- Linhas em branco entre blocos permanentes: 1 (apenas). Aplica-se também a sub-blocos dentro de um único `PermanentItem` quando a hierarquia visual exige (ex.: banner com 3 sub-blocos, §4.10.9). Nunca 2 ou mais — duplo respiro vira ruído.
+- Modais respeitam a frame margin como qualquer outro elemento. (O esboço inicial pré-§4.10.13 dizia "sem padding lateral em modais" — revisto pra coerência visual; modal sem margem destacaria contra o resto recuado e quebraria a leitura).
 
 ### 6.4 Tipografia
 

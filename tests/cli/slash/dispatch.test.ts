@@ -150,10 +150,20 @@ describe('dispatch', () => {
 });
 
 describe('createBuiltinRegistry', () => {
-  test('contains all 8 builtins', () => {
+  test('contains all 9 builtins', () => {
     const r = createBuiltinRegistry();
     const names = r.list().map((c) => c.name);
-    expect(names).toEqual(['help', 'quit', 'clear', 'cost', 'sessions', 'model', 'plan', 'budget']);
+    expect(names).toEqual([
+      'help',
+      'quit',
+      'clear',
+      'cost',
+      'sessions',
+      'model',
+      'plan',
+      'budget',
+      'perms',
+    ]);
   });
 
   test('help can list every other command (closure works)', async () => {
@@ -163,7 +173,7 @@ describe('createBuiltinRegistry', () => {
     if (help === undefined) return;
     const result = await help.exec([], makeCtx().ctx);
     if (result.kind !== 'ok') return;
-    // 8 commands → 9 lines (header + 8 rows).
-    expect(result.notes?.length).toBe(9);
+    // 9 commands → header + 9 rows + blank + emergency-exit footer = 12.
+    expect(result.notes?.length).toBe(12);
   });
 });

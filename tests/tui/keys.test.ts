@@ -179,6 +179,63 @@ describe('escape sequences', () => {
     expect(parser.bufferLength()).toBe(0);
   });
 
+  describe('tryResolveLoneEsc', () => {
+    test('emits Escape and clears buffer when buf is exactly \\x1b', () => {
+      const parser = createKeyParser();
+      parser.feed('\x1b');
+      const out = parser.tryResolveLoneEsc();
+      expect(out).toEqual([
+        { kind: 'key', name: 'escape', ctrl: false, alt: false, shift: false, raw: '\x1b' },
+      ]);
+      expect(parser.bufferLength()).toBe(0);
+    });
+
+    test('no-op on empty buffer', () => {
+      const parser = createKeyParser();
+      expect(parser.tryResolveLoneEsc()).toEqual([]);
+      expect(parser.bufferLength()).toBe(0);
+    });
+
+    test('no-op on multi-byte ESC prefix (CSI in flight)', () => {
+      // `\x1b[` is the leader of a CSI sequence. The next feed is
+      // expected to bring params + final byte. tryResolveLoneEsc
+      // must NOT eat the `\x1b` because doing so would orphan the
+      // `[` and the next feed would fail to parse the sequence.
+      const parser = createKeyParser();
+      parser.feed('\x1b[');
+      expect(parser.tryResolveLoneEsc()).toEqual([]);
+      expect(parser.bufferLength()).toBe(2);
+      // Subsequent feed completes the sequence.
+      expect(parser.feed('A')).toEqual([
+        { kind: 'key', name: 'up', ctrl: false, alt: false, shift: false, raw: '\x1b[A' },
+      ]);
+    });
+
+    test('no-op while paste is in flight (does not truncate paste content)', () => {
+      // Regression: previously the idle drain timer in repl.ts
+      // called `parser.drain()` whenever bufferLength > 0, which
+      // unconditionally cleared pasteActive + pasteBuf. A paste
+      // delivered in chunks separated by > ESC_DRAIN_MS (slow SSH,
+      // large clipboard payloads) got truncated, and subsequent
+      // bytes were parsed as keystrokes — silently corrupting
+      // submitted input. tryResolveLoneEsc must leave paste state
+      // alone.
+      const parser = createKeyParser();
+      // Open the paste, deliver some content, but no end marker yet.
+      // Keep the trailing buffer length within the safety window so
+      // bufferLength() > 0 and the timer would fire.
+      parser.feed('\x1b[200~hello world');
+      const lenBeforeIdle = parser.bufferLength();
+      // Idle drain fires.
+      expect(parser.tryResolveLoneEsc()).toEqual([]);
+      // Buffer untouched.
+      expect(parser.bufferLength()).toBe(lenBeforeIdle);
+      // Finish the paste. The accumulated content survived.
+      const out = parser.feed('!\x1b[201~');
+      expect(out).toEqual([{ kind: 'paste', text: 'hello world!' }]);
+    });
+  });
+
   test('split CSI across two feeds', () => {
     const parser = createKeyParser();
     expect(parser.feed('\x1b[')).toEqual([]);
@@ -217,6 +274,28 @@ describe('bracketed paste', () => {
   test('paste with embedded newline is preserved verbatim', () => {
     const events = feed(`${BRACKETED_PASTE_START}line1\nline2${BRACKETED_PASTE_END}`);
     expect(events).toEqual([{ kind: 'paste', text: 'line1\nline2' }]);
+  });
+
+  test('paste with bare CR (xterm-style newline) is normalized to LF', () => {
+    // xterm and many terminals emit `\r` for line breaks inside
+    // bracketed paste content (Enter convention). Without the
+    // parser-side normalization the buffer would land `\r` in the
+    // input and the renderer would interpret it as carriage-return
+    // mid-line, visually collapsing the multi-line paste.
+    const events = feed(`${BRACKETED_PASTE_START}line1\rline2\rline3${BRACKETED_PASTE_END}`);
+    expect(events).toEqual([{ kind: 'paste', text: 'line1\nline2\nline3' }]);
+  });
+
+  test('paste with CRLF (Windows-origin) is normalized to single LF', () => {
+    // Replacing bare CR after CRLF would split a single line break
+    // into two — the parser does CRLF first, then bare CR.
+    const events = feed(`${BRACKETED_PASTE_START}line1\r\nline2\r\nline3${BRACKETED_PASTE_END}`);
+    expect(events).toEqual([{ kind: 'paste', text: 'line1\nline2\nline3' }]);
+  });
+
+  test('paste with mixed CR / LF / CRLF normalizes consistently', () => {
+    const events = feed(`${BRACKETED_PASTE_START}a\rb\nc\r\nd${BRACKETED_PASTE_END}`);
+    expect(events).toEqual([{ kind: 'paste', text: 'a\nb\nc\nd' }]);
   });
 
   test('paste end marker buffered: incoming chunk holds partial end', () => {

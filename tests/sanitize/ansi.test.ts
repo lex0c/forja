@@ -42,9 +42,28 @@ describe('stripAnsi', () => {
     expect(stripAnsi('a\x9bb\x9dc')).toBe('abc');
   });
 
+  test('removes C0 control bytes that hijack terminal state', () => {
+    // The dangerous ones, one per pass to make failure messages
+    // pinpoint which char survived.
+    expect(stripAnsi('a\x07b')).toBe('ab'); // BEL
+    expect(stripAnsi('a\x08b')).toBe('ab'); // BS
+    expect(stripAnsi('a\x0bb')).toBe('ab'); // VT
+    expect(stripAnsi('a\x0cb')).toBe('ab'); // FF
+    expect(stripAnsi('a\x0eb')).toBe('ab'); // SO
+    expect(stripAnsi('a\x0fb')).toBe('ab'); // SI
+    expect(stripAnsi('a\x11b')).toBe('ab'); // XON — would resume terminal output
+    expect(stripAnsi('a\x13b')).toBe('ab'); // XOFF — would pause terminal input
+    expect(stripAnsi('a\x1ab')).toBe('ab'); // SUB
+    expect(stripAnsi('a\x7fb')).toBe('ab'); // DEL
+    expect(stripAnsi('a\x00b')).toBe('ab'); // NUL
+  });
+
   test('preserves plain text and whitespace', () => {
     expect(stripAnsi('hello world\n\ttab')).toBe('hello world\n\ttab');
     expect(stripAnsi('')).toBe('');
+    // The three TUI-safe whitespace C0s explicitly survive — common
+    // in file content and never disrupt cursor state.
+    expect(stripAnsi('a\tb\nc\rd')).toBe('a\tb\nc\rd');
   });
 
   test('does not strip lone backslash or square bracket', () => {

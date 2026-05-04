@@ -195,6 +195,40 @@ describe('Enter and Shift+Enter', () => {
     expect(r.next).toEqual({ value: 'foo\n', cursor: 4 });
     expect(r.submit).toBeUndefined();
   });
+
+  // Backslash continuation (UI.md §5.4): trailing `\` before the
+  // cursor + Enter → drop the backslash, insert a newline. Bash
+  // convention; useful when Shift+Enter is awkward / eaten by WM.
+
+  test('`\\` immediately before cursor + Enter inserts newline (drops the backslash)', () => {
+    const r = applyKey(at('foo\\', 4), named('enter'));
+    expect(r.next).toEqual({ value: 'foo\n', cursor: 4 });
+    expect(r.submit).toBeUndefined();
+  });
+
+  test('backslash continuation works mid-buffer (cursor between `\\` and rest)', () => {
+    // `f\|oo` (cursor at idx 2) + Enter → `f\noo`, cursor stays at 2.
+    const r = applyKey(at('f\\oo', 2), named('enter'));
+    expect(r.next).toEqual({ value: 'f\noo', cursor: 2 });
+    expect(r.submit).toBeUndefined();
+  });
+
+  test('Enter with cursor NOT immediately after `\\` still submits', () => {
+    // `\foo|` (cursor at end, `\` is not the last char before cursor)
+    // submits as-is; the backslash is just a literal character.
+    const r = applyKey(at('\\foo', 4), named('enter'));
+    expect(r.submit).toEqual({ text: '\\foo' });
+    expect(r.next).toEqual({ value: '\\foo', cursor: 4 });
+  });
+
+  test('backslash continuation respects Shift+Enter precedence', () => {
+    // Shift+Enter always inserts a newline, even if the char before
+    // the cursor happens to be `\` — the explicit modifier wins, and
+    // the `\` stays as a literal.
+    const r = applyKey(at('foo\\', 4), named('enter', { shift: true }));
+    expect(r.next).toEqual({ value: 'foo\\\n', cursor: 5 });
+    expect(r.submit).toBeUndefined();
+  });
 });
 
 describe('Ctrl+C and Ctrl+D semantics', () => {
@@ -204,15 +238,15 @@ describe('Ctrl+C and Ctrl+D semantics', () => {
     expect(r.cancelInput).toBeUndefined();
   });
 
-  test('Ctrl+C with empty buffer surfaces cancelInput signal', () => {
+  test('Ctrl+C with empty buffer surfaces cancelInput=interrupt (gate-arming signal)', () => {
     const r = applyKey(empty(), ch('c', { ctrl: true }));
-    expect(r.cancelInput).toBe(true);
+    expect(r.cancelInput).toBe('interrupt');
     expect(r.next).toEqual({ value: '', cursor: 0 });
   });
 
-  test('Ctrl+D with empty buffer surfaces cancelInput (EOF)', () => {
+  test('Ctrl+D with empty buffer surfaces cancelInput=eof (direct EOF)', () => {
     const r = applyKey(empty(), ch('d', { ctrl: true }));
-    expect(r.cancelInput).toBe(true);
+    expect(r.cancelInput).toBe('eof');
   });
 
   test('Ctrl+D with non-empty buffer deletes forward (like Delete)', () => {

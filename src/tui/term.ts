@@ -82,6 +82,21 @@ export const clearDown = `${CSI}J`;
 export const enableBracketedPaste = `${CSI}?2004h`;
 export const disableBracketedPaste = `${CSI}?2004l`;
 
+// Synchronized output (DECSET 2026). Wraps a write so the terminal
+// buffers the bytes between BSU/ESU and presents the resulting frame
+// atomically — no incremental rasterization of "cursor-up + clear →
+// content" pinned to the redraw cycle, which the operator perceives
+// as flicker on the static lines (status, footer, rules) surrounding
+// the input box. Terminals without support silently ignore (it's a
+// private mode; safe to emit unconditionally per the spec).
+//
+// Spec: https://gist.github.com/christianparpart/d8a62cc1ab659194337d73e399004036
+// Supported by: kitty, iTerm2, alacritty, wezterm, recent gnome-terminal,
+// recent konsole. Unsupported (no-op): xterm without patches, screen,
+// most older emulators.
+export const beginSyncOutput = `${CSI}?2026h`;
+export const endSyncOutput = `${CSI}?2026l`;
+
 // Paste marker constants for the key parser. Kept here so paste handling
 // stays adjacent to its escape-code definition.
 export const BRACKETED_PASTE_START = `${CSI}200~`;
@@ -92,6 +107,15 @@ export const BRACKETED_PASTE_END = `${CSI}201~`;
 export const SGR = {
   reset: `${CSI}0m`,
   dim: `${CSI}2m`,
+  // `secondary` is the visible-grey variant of dim, used for meta
+  // that must stand out from the primary content (turn-end marker
+  // `Cogitated for X`). SGR 2 (faint) is invisible on many xterm
+  // configs; SGR 90 (bright-black ≈ grey) is universal. Distinct
+  // token from `dim` so we don't recolor every dim element on the
+  // screen — rules, footer hints, sub-content connectors stay in
+  // SGR 2 (rendered same as default on terminals that don't
+  // distinguish faint, but that's deliberate).
+  secondary: `${CSI}90m`,
   bold: `${CSI}1m`,
   error: `${CSI}31m`,
   warn: `${CSI}33m`,

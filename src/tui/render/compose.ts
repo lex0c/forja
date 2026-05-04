@@ -25,13 +25,20 @@ import type { LiveState } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
 import { renderAssistantChip } from './assistant-chip.ts';
 import { renderFooter } from './footer.ts';
+import { padFrame } from './frame.ts';
 import { renderInput } from './input.ts';
 import { renderModal } from './modal.ts';
 import { renderSlashPopover } from './slash-popover.ts';
-import { renderStatusLine } from './status.ts';
 import { renderTodoList } from './todo-list.ts';
 import { renderToolCardLive } from './tool-card.ts';
+import { wrapInputLine } from './wrap.ts';
 
+// Horizontal rules around the input go edge-to-edge (UI.md §6.3
+// "bloco do input" exception). Together with the input line they
+// form a 3-row unit that visually breaks away from the indented
+// content above and the indented footer below — operator's eye reads
+// the block as "this is where you type" without the rules pretending
+// to belong to the padded frame.
 const horizontalRule = (caps: Capabilities): string =>
   paint(caps, 'dim', (caps.unicode ? '─' : '-').repeat(caps.cols));
 
@@ -75,25 +82,91 @@ export const composeCursor = (
 ): CursorPos | null => {
   if (state.modal !== null) return null;
   const value = state.input.value;
-  const inputLineCount = value === '' ? 1 : value.split('\n').length;
-  // Last input row is FOOTER_BLOCK_LINES above the bottom of the
-  // live region; subtract input's own height to get the first row.
-  const inputStartRow = lineCount - FOOTER_BLOCK_LINES - inputLineCount;
-  const before = value.slice(0, state.input.cursor);
-  const linesBefore = before.split('\n');
-  const cursorLineIdx = linesBefore.length - 1;
-  const cursorColInLine = (linesBefore[cursorLineIdx] ?? '').length;
-  // Both '> ' (first line) and '  ' (continuation) are 2 chars wide.
+  // Both '> ' (first line) and '  ' (continuation) are 2 chars wide;
+  // soft-wrap chunks each `\n`-separated buffer line into chunks of
+  // up to `caps.cols - prefixWidth` code units, with surrogate-pair
+  // boundaries kept intact (see render/wrap.ts). composeCursor must
+  // walk the SAME chunk list renderInput produced — uniform-width
+  // arithmetic (`offsetInLine % innerWidth`) breaks when chunks are
+  // shrunk by one to avoid splitting a non-BMP codepoint.
   const prefixWidth = 2;
-  // Clamp to caps.cols - 1 so cursor stays on-screen for buffers
-  // wider than the terminal. Without this, cursorForward overshoots
-  // and either the terminal clamps (cursor "lost" at edge) or
-  // auto-wraps to the next row (eraseLive math then walks the wrong
-  // number of rows back). Buffer scrolling within the input box
-  // is future polish; clamp is the safety floor.
+  const innerWidth = Math.max(1, caps.cols - prefixWidth);
+
+  // Per-buffer-line chunk list. Empty buffer lines wrap to a single
+  // empty sub-row (the prefix-only `> ` / `  ` line that renderInput
+  // emits) — the chunk list is `[]` in that case and the
+  // sub-row/col math below special-cases it.
+  const lines = value === '' ? [''] : value.split('\n');
+  const lineChunks = lines.map((l) => wrapInputLine(l, innerWidth));
+  const rowsForChunks = (n: number): number => (n === 0 ? 1 : n);
+  const inputLineCount = lineChunks.reduce((acc, cs) => acc + rowsForChunks(cs.length), 0);
+
+  // Find which buffer line + offset within it contains the cursor.
+  const cursorAbs = state.input.cursor;
+  let charsBefore = 0;
+  let bufferLineIdx = 0;
+  let offsetInLine = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const lineLen = (lines[i] ?? '').length;
+    if (cursorAbs <= charsBefore + lineLen) {
+      bufferLineIdx = i;
+      offsetInLine = cursorAbs - charsBefore;
+      break;
+    }
+    charsBefore += lineLen + 1; // +1 for the '\n' separator
+  }
+
+  // Visual rows occupied by buffer lines BEFORE the cursor's line.
+  let visualRowsBefore = 0;
+  for (let i = 0; i < bufferLineIdx; i++) {
+    visualRowsBefore += rowsForChunks((lineChunks[i] ?? []).length);
+  }
+  const cursorChunks = lineChunks[bufferLineIdx] ?? [];
+  const numSubRows = rowsForChunks(cursorChunks.length);
+  // Locate the chunk whose code-unit range covers `offsetInLine`.
+  // Linear walk is fine: typical input has < 30 chunks per line.
+  // Cursor at the exact end of a chunk lands on that chunk's last
+  // column (the next chunk's start === this chunk's end), which the
+  // boundary clamp below resolves; same shape as the old
+  // exact-wrap-boundary case where cursor was at offset = N*innerWidth.
+  let subRowInLine = 0;
+  let col = prefixWidth + offsetInLine;
+  for (let c = 0; c < cursorChunks.length; c++) {
+    const chunk = cursorChunks[c];
+    if (chunk === undefined) continue;
+    if (offsetInLine < chunk.end) {
+      subRowInLine = c;
+      col = prefixWidth + (offsetInLine - chunk.start);
+      break;
+    }
+    // Past the last chunk's end — fall through; the clamp below
+    // pins to the right edge of the last sub-row.
+    if (c === cursorChunks.length - 1) {
+      subRowInLine = c;
+      col = prefixWidth + (offsetInLine - chunk.start);
+    }
+  }
+
+  // Exact-wrap-boundary clamp: cursor at offset = chunk.end of a
+  // non-final chunk wants to land on the next sub-row, but
+  // renderInput only emits `chunks.length` sub-rows so a cursor
+  // past the last would visually overlap the rule below the input.
+  // Clamp to the right edge of the last existing sub-row instead —
+  // typical editor behavior. As soon as the operator types one
+  // more char, a new chunk allocates and the cursor moves naturally
+  // to col 2 of the new row.
+  if (subRowInLine >= numSubRows) {
+    subRowInLine = numSubRows - 1;
+    col = caps.cols - 1;
+  }
+
+  // Last input row is FOOTER_BLOCK_LINES above the bottom of the
+  // live region; subtract input's own (wrapped) height to get the
+  // first row.
+  const inputStartRow = lineCount - FOOTER_BLOCK_LINES - inputLineCount;
   return {
-    row: inputStartRow + cursorLineIdx,
-    col: Math.min(prefixWidth + cursorColInLine, Math.max(0, caps.cols - 1)),
+    row: inputStartRow + visualRowsBefore + subRowInLine,
+    col: Math.min(col, Math.max(0, caps.cols - 1)),
   };
 };
 
@@ -104,33 +177,68 @@ export const composeLive: ComposeLive = (
 ): string[] => {
   const lines: string[] = [];
 
+  // Frame margin (UI.md §6.3): every line in the live region gets 2sp
+  // left padding EXCEPT the input row. The composer applies `padFrame`
+  // to each renderer's output here; the renderers themselves emit
+  // unpadded content, which keeps them composable with anything else
+  // (tests, headless replay) that wants the raw content. The two
+  // width-aware paths — `horizontalRule` (computed locally) and
+  // `renderFooter` (anchor math) — already produce padded output.
+
+  // Live region "session" blocks (UI.md §6.3): each top-level element
+  // (TodoList, assistant chip, each tool card) gets a blank line above
+  // it for scannability. Sub-content within an element (todo rows
+  // under "Tasks", `└─` connector under a tool chip) stays tight —
+  // it's the parent block's "subsession". Helper ALWAYS prepends a
+  // blank: combined with the forced blank above the input rule,
+  // every top-level block ends up bounded by blanks on both sides
+  // — so the operator's eye scans live content as discrete units
+  // (e.g., "Generating..." chip with breathing space top + bottom)
+  // without the bottom edge fusing with the rule above the input.
+  const appendBlock = (block: string[]): void => {
+    if (block.length === 0) return;
+    lines.push(padFrame(''));
+    lines.push(...block.map(padFrame));
+  };
+
   // 1. Live TodoList (above the operation chips per spec §4.10.6:
   // "Todo list (§4.3) acima dos chips, se houver"). renderTodoList
   // returns [] when state.todos is empty — section drops entirely.
-  lines.push(...renderTodoList(state.todos, caps));
+  appendBlock(renderTodoList(state.todos, caps));
 
   // 2. Live "Generating…" chip. Spec §4.10.5: the assistant turn is
   // an operation chip just like a tool call. Renders above the tool
   // cards because the assistant is the parent operation — tool calls
   // it spawns sit beneath it visually.
   if (state.pendingAssistant !== null) {
-    lines.push(...renderAssistantChip(state.pendingAssistant, caps, now));
+    appendBlock(renderAssistantChip(state.pendingAssistant, caps, now));
   }
 
   // 3. Active tool cards (running). Map insertion order is preserved,
   // so the visual order matches the order tools were started.
   for (const tool of state.activeTools.values()) {
-    lines.push(...renderToolCardLive(tool, caps, now));
+    appendBlock(renderToolCardLive(tool, caps, now));
   }
 
-  // 4. Status line — only when session has started.
-  const status = renderStatusLine(state, caps, { now });
-  if (status !== null) lines.push(status);
+  // 4. (was status line) — removed (UI.md §4.4 absorbed into §4.10.6
+  // footer). Same info `model · [plan] · steps/max · cost · [bg N]`
+  // appears in the footer's right column, so a separate line above
+  // the input would just duplicate it. Position kept as a numbered
+  // step so future additions slot in without renumbering downstream.
 
   // 5. Modal OR bottom anchor — never both. Bottom anchor is rule +
   // input + rule + footer (4-block stack); modal substitutes the
   // whole anchor and carries its own structure. Status line + tool
   // cards stay visible above so the user keeps context.
+  //
+  // Modal lines are NOT run through padFrame: renderModal already
+  // bakes the §6.3 frame margin into content rows (each block
+  // emits `'  ' + text`) AND its rule rows are intentionally
+  // edge-to-edge at caps.cols (matching the input block's full-
+  // width rule convention §6.3). Adding another 2sp prefix would
+  // double-indent content AND push rules past caps.cols, which
+  // truncateToWidth then clips on the right edge — visible as the
+  // box losing its last 2 columns on every row of every modal.
   if (state.modal !== null) {
     lines.push(...renderModal(state.modal, caps));
     return lines;
@@ -140,9 +248,21 @@ export const composeLive: ComposeLive = (
   // the upper region — composeCursor's math (FOOTER_BLOCK_LINES +
   // inputLines from the bottom) stays correct regardless.
   if (state.slash !== null) {
-    lines.push(...renderSlashPopover(state.slash, caps));
+    appendBlock(renderSlashPopover(state.slash, caps));
   }
+  // Always 1 blank line above the input block (rule + input + rule),
+  // regardless of whether the upper live region has content. This
+  // line ALSO separates the top of the input rule from whatever
+  // permanent content sits in scrollback right above the live
+  // region: the bottom of the assistant text (or any other
+  // permanent line) ends up adjacent to the rule otherwise, and
+  // the typing zone visually fuses with the conversation.
+  lines.push(padFrame(''));
   lines.push(horizontalRule(caps));
+  // Input is the single OUTDENTED element (UI.md §6.3 frame margin
+  // exception). No padFrame here — the prompt `> ` lives at col 0
+  // and the cursor lands at col 2, naturally anchored to the rest
+  // of the indented content's left edge.
   lines.push(...renderInput(state.input, caps));
   lines.push(horizontalRule(caps));
   // renderFooter only returns null on modal (handled above); the

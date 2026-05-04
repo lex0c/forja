@@ -18,6 +18,7 @@
 
 import type { ExitReason, HarnessEvent } from '../harness/types.ts';
 import type { Decision } from '../permissions/index.ts';
+import { stripAnsi } from '../sanitize/index.ts';
 import type { TodoItem, TodoStatus } from '../todo/index.ts';
 import type { SessionEndEvent, TodoItemForUI, TodoStatusForUI, UIEvent } from './events.ts';
 import { lookupToolVocab } from './tool-vocab.ts';
@@ -225,11 +226,23 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
               state.currentMessageId = synthId;
               out.push({ type: 'assistant:start', ts, messageId: synthId });
             }
+            // Strip ANSI before the text reaches the reducer / renderer.
+            // Provider output can carry escape sequences (model quoting
+            // file contents, code about terminal codes, prompt-injection
+            // attempts) which would otherwise be written raw to the
+            // terminal. The most damaging classes are DEC private modes
+            // (`\x1b[?2004h` enables bracketed paste, `\x1b[?25l` hides
+            // the cursor, `\x1b[?1049h` switches to the alt screen, etc.)
+            // — operator perceives input as frozen because keystrokes
+            // get reinterpreted or feedback goes invisible. Strip on
+            // entry so every downstream surface (live chip preview,
+            // permanent assistant block, recap snapshots) sees clean
+            // text without each having to remember to sanitize.
             out.push({
               type: 'assistant:delta',
               ts,
               messageId: state.currentMessageId,
-              text: ev.text,
+              text: stripAnsi(ev.text),
             });
             return out;
           }
@@ -359,6 +372,24 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
             : event.failed
               ? 'error'
               : 'done';
+        // Surface the engine's deny reason in the scrollback chip's
+        // sub-line. Without this, the operator sees "Denied" with no
+        // explanation — a strict default-deny policy looks like a
+        // bug, not a configured posture. The renderer routes
+        // `summary` to the `└─` connector for denied chips
+        // (render/permanent.ts §4.1).
+        let summary: string | undefined;
+        if (status === 'denied' && tool?.decision !== undefined && tool.decision !== null) {
+          const decision = tool.decision;
+          if (decision.kind === 'deny') {
+            summary = decision.reason;
+          } else if (decision.kind === 'confirm') {
+            // User said no at the modal. The decision's `reason` (if
+            // any) describes the engine's match, not the user's
+            // choice — surface the choice instead.
+            summary = 'rejected at confirmation prompt';
+          }
+        }
         state.tools.delete(event.toolUseId);
         out.push({
           type: 'tool:end',
@@ -366,6 +397,7 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           toolId: event.toolUseId,
           status,
           durationMs: event.durationMs,
+          ...(summary !== undefined ? { summary } : {}),
         });
         return out;
       }
@@ -491,6 +523,9 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           ts,
           sessionId: r.sessionId,
           reason: mapped,
+          // Wall-clock duration of the turn, plumbed to the
+          // turn-end marker (UI.md §3.2 → "Cogitated for 1m23s").
+          durationMs: r.durationMs,
           // Pass-through abortCause when the harness produced one
           // (1.g.3 closes D171). Meaningful only when reason ==='aborted'
           // — the harness's finish() helper guarantees this invariant

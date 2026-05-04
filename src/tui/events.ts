@@ -39,8 +39,21 @@ export type SessionStartEvent = BaseEvent & {
 
 // One-shot welcome banner (UI.md §4.10.9). Emitted by the REPL at
 // boot; producers MUST NOT emit twice. Pure permanent — the reducer
-// pushes it to scrollback and never references it again. Each line
-// answers a concrete question (version / model+limits / cwd / env).
+// pushes it to scrollback and never references it again. Three blocks
+// (title / identity / env) separated by blank lines.
+//
+// Env entries discriminate on `kind` so the renderer can apply the
+// right palette per spec §4.10.9:
+//   - `flag` → `✓ {name}` (or `✓ {name} ({count})`) painted `success`
+//     for binary capability indicators (checkpoints, memory). Items
+//     in the off state are NOT emitted — the line lists what exists,
+//     never what's missing.
+//   - `meta` → `{key}: {value}` painted `dim` for non-binary metadata
+//     (subagents count, policy descriptor).
+// Empty array → renderer omits the env block entirely.
+export type SessionBannerEnvEntry =
+  | { kind: 'flag'; name: string; count?: number }
+  | { kind: 'meta'; key: string; value: string };
 export type SessionBannerEvent = BaseEvent & {
   type: 'session:banner';
   app: string;
@@ -49,15 +62,18 @@ export type SessionBannerEvent = BaseEvent & {
   contextWindow: number;
   maxOutputTokens: number;
   cwd: string;
-  // Producers populate what they know; renderer joins entries with
-  // the locale-appropriate separator. Empty array → renderer omits
-  // the line entirely (no "N/A" placeholder).
-  env: { key: string; value: string }[];
+  env: SessionBannerEnvEntry[];
 };
 export type SessionEndEvent = BaseEvent & {
   type: 'session:end';
   sessionId: string;
   reason: 'done' | 'maxSteps' | 'maxCostUsd' | 'aborted' | 'error' | string;
+  // Wall-clock duration of the run, in ms (mirrors
+  // `HarnessResult.durationMs`). Powers the turn-end marker's
+  // "Cogitated for 1m23s" rendering (UI.md §3.2). Optional only for
+  // legacy / replay paths that don't have timing — production
+  // emitters always set it.
+  durationMs?: number;
   // Mirrors HarnessResult.abortCause (1.g.2). Only meaningful when
   // reason === 'aborted' — discriminates operator-initiated cooperative
   // ('soft') from preemptive ('hard'). NDJSON consumers and the
@@ -372,6 +388,22 @@ export type InterruptEvent = BaseEvent & {
   level: 'soft' | 'hard';
 };
 
+// Idle Ctrl+C double-tap exit gate (UI.md §5.4 + §4.10.6 footer cue).
+// First press at idle/empty-buffer arms the gate; the footer flips to
+// `Press Ctrl-C again to exit` (warn) for a 2s window. A second press inside
+// the window exits 130; any other input or the timeout cancels.
+//
+// Producer responsibility: REPL emits `interrupt:exit-arm` on the first
+// press, schedules a timer that emits `interrupt:exit-cancel` on
+// expiry, and emits `interrupt:exit-cancel` on any other key/event
+// that should disarm. Reducer is dumb — it just flips state.exitArmed.
+export type InterruptExitArmEvent = BaseEvent & {
+  type: 'interrupt:exit-arm';
+};
+export type InterruptExitCancelEvent = BaseEvent & {
+  type: 'interrupt:exit-cancel';
+};
+
 // Discriminated union — the renderer matches on `type` and the
 // compiler narrows the payload.
 export type UIEvent =
@@ -411,7 +443,9 @@ export type UIEvent =
   | InfoEvent
   | ErrorEvent
   | WarnEvent
-  | InterruptEvent;
+  | InterruptEvent
+  | InterruptExitArmEvent
+  | InterruptExitCancelEvent;
 
 export type UIEventType = UIEvent['type'];
 

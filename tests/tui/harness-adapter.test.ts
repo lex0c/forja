@@ -233,6 +233,36 @@ describe('harness-adapter — provider events: text streaming', () => {
     expect(delta.messageId).toBe(start.messageId);
   });
 
+  test('text_delta strips ANSI escapes (terminal-mode hijack defense)', () => {
+    // Provider output containing escape sequences (model quoting a
+    // file's bytes, code about terminal codes, prompt-injection)
+    // would otherwise be written raw to the operator's terminal.
+    // The most damaging classes are DEC private modes — `\x1b[?2004h`
+    // toggles bracketed paste, `\x1b[?25l` hides the cursor,
+    // `\x1b[?1049h` switches to the alt screen. From the operator's
+    // POV the input "freezes" because feedback goes invisible or
+    // keystrokes get reinterpreted. The adapter strips on entry so
+    // every downstream consumer (live chip, permanent block, recap
+    // snapshots) sees clean text without each having to remember.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'm' } });
+    const out = a.translate({
+      type: 'provider_event',
+      event: {
+        kind: 'text_delta',
+        // Mix the worst offenders: SGR color, DEC mode, OSC, plus
+        // benign prose that must survive.
+        text: 'hello \x1b[31mred\x1b[0m and \x1b[?2004h danger \x1b]0;title\x07 done',
+      },
+    });
+    const delta = out[0] as Extract<UIEvent, { type: 'assistant:delta' }>;
+    expect(delta.text).not.toContain('\x1b');
+    expect(delta.text).toContain('hello');
+    expect(delta.text).toContain('red');
+    expect(delta.text).toContain('danger');
+    expect(delta.text).toContain('done');
+  });
+
   test('stop → assistant:end and clears state', () => {
     const a = createHarnessAdapter(baseCtx());
     a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'm' } });
@@ -456,6 +486,40 @@ describe('harness-adapter — tool lifecycle', () => {
     const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
     expect(e.status).toBe('denied');
     expect(e.durationMs).toBe(5);
+    // Engine's deny reason flows through as `summary` so the
+    // scrollback chip renders the explanation under the chip
+    // (`└─ no rule matched ...`) instead of just "Denied".
+    expect(e.summary).toBe('no');
+  });
+
+  test('user-rejected confirm surfaces an explicit summary on tool:end', () => {
+    // For decision.kind === 'confirm' the engine's reason describes
+    // the matching rule, not the user's choice — adapter overrides
+    // with a fixed string so the operator sees that THEY rejected,
+    // not that the policy denied.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'edit_file',
+      args: { path: '/foo' },
+    });
+    a.translate({
+      type: 'tool_decided',
+      toolUseId: 't1',
+      decision: { kind: 'confirm', prompt: 'edit /foo?', reason: 'matched confirm rule: **' },
+    });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'edit_file',
+      failed: true,
+      durationMs: 3,
+      denied: true,
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('denied');
+    expect(e.summary).toBe('rejected at confirmation prompt');
   });
 
   test('tool_finished with denied=true after confirm → tool:end status=denied (regression)', () => {
