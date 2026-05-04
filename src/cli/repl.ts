@@ -225,16 +225,36 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       }, ESC_DRAIN_MS);
     }
   };
-  stdin.on('data', onData);
-  if (typeof stdin.resume === 'function') stdin.resume();
+
+  // Lazy stdin subscription. The pump is fully wired (parser, drain,
+  // panic key) but we DON'T attach to stdin yet — `focusStack` is
+  // empty during pre-bootstrap, and dispatching to an empty stack
+  // silently drops the event. Subscribing now would race against
+  // any I/O tick that fires between `stdin.resume()` and the
+  // editor handler joining the stack: a key typed during bootstrap
+  // would be parsed and lost instead of buffered for the editor.
+  //
+  // Two real subscription sites: (1) inside the trust prompt block
+  // AFTER `modalManager.askTrust` queues its handler (askTrust
+  // pushes onto the focus stack synchronously before returning the
+  // promise), and (2) post-bootstrap right after
+  // `focusStack.push(editorHandler)`. The flag prevents a double-
+  // subscribe when both paths run in the same boot.
+  let stdinSubscribed = false;
+  const subscribeStdin = (): void => {
+    if (stdinSubscribed) return;
+    stdinSubscribed = true;
+    stdin.on('data', onData);
+    if (typeof stdin.resume === 'function') stdin.resume();
+  };
 
   // Tear-down for early-exit paths that DON'T have a db / harness
   // to close (trust decline, bootstrap throw before reaching the
   // full shutdown(): both leave the pre-bootstrap stack live —
   // renderer holding raw mode + bracketed paste, stdin data
-  // listener attached, drain timer possibly armed). Centralized
-  // because both paths leak the same set of handles if any one
-  // step is forgotten.
+  // listener attached if subscribed, drain timer possibly armed).
+  // Centralized because both paths leak the same set of handles if
+  // any one step is forgotten.
   //
   // Idempotent against repeat calls — renderer.close and
   // modalManager.close already guard via internal `closed` flags;
@@ -247,8 +267,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     cancelDrain();
     modalManager.close();
     renderer.close();
-    stdin.removeListener('data', onData);
-    if (typeof stdin.pause === 'function') stdin.pause();
+    if (stdinSubscribed) {
+      stdin.removeListener('data', onData);
+      if (typeof stdin.pause === 'function') stdin.pause();
+    }
   };
 
   // ─── Trust prompt (AGENTIC_CLI §9.1) ─────────────────────────────
@@ -273,7 +295,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // which falls through to the same decline path below — exit 0
     // without ever entering the REPL.
     const trustTimeoutMs = options.trustPromptTimeoutMs ?? 5 * 60 * 1000;
-    const answer = await modalManager.askTrust({ path: cwd }, { timeoutMs: trustTimeoutMs });
+    // Two-step ordering matters: askTrust SYNCHRONOUSLY pushes its
+    // handler onto the focus stack (see modalManager's
+    // `enqueueConfirm` → `drain`) before returning the promise.
+    // Subscribing stdin AFTER that call guarantees any keystroke
+    // landing post-resume() finds a handler waiting; subscribing
+    // first would race against the OS delivering buffered bytes
+    // ahead of the focus push.
+    const answerPromise = modalManager.askTrust({ path: cwd }, { timeoutMs: trustTimeoutMs });
+    subscribeStdin();
+    const answer = await answerPromise;
     if (answer !== 'yes') {
       tearDownPreBootstrap();
       return 0;
@@ -958,10 +989,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   };
   focusStack.push(editorHandler);
 
-  // Stdin pump (parser, drain timer, panic-key check, lone-ESC
-  // resolution) is hoisted to the pre-bootstrap stack — it's
-  // already attached to stdin by the time we reach here, with the
-  // editor handler joining the focus stack just above.
+  // Stdin pump (parser, drain, panic-key, lone-ESC) was prepared
+  // pre-bootstrap but its subscription was DEFERRED so events
+  // didn't drop into an empty focus stack. Now that the editor
+  // handler is on top, attach. Idempotent (`subscribeStdin` no-ops
+  // when the trust-prompt path already subscribed).
+  subscribeStdin();
 
   // SIGINT path. Fires when stdin is NOT in raw mode (e.g., during
   // certain modal lifecycles where the renderer pauses raw input)

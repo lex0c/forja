@@ -1057,6 +1057,49 @@ describe('repl — trust prompt (AGENTIC_CLI §9.1)', () => {
     expect(loadTrustedDirs(trustPath)).toEqual([]);
   });
 
+  test('stdin subscription is deferred until a focus handler exists', async () => {
+    // Regression: pre-fix runRepl subscribed to stdin during the
+    // pre-bootstrap stack setup, BEFORE any focus handler was
+    // pushed. In the already-trusted path the modal never opens,
+    // so the focus stack stays empty until the editor is registered
+    // post-bootstrap. Any keystroke that hit the wire in that
+    // window was parsed and dispatched into an empty stack, then
+    // silently dropped. Fix subscribes lazily — only after
+    // `modalManager.askTrust` queues its handler (trust path) or
+    // `focusStack.push(editorHandler)` runs (post-bootstrap).
+    //
+    // We pin the contract via the `data` listener count: it must
+    // be 0 immediately after `stdin` is set up by the test, then
+    // jump to 1 only once a handler is on the focus stack. The
+    // shape we exercise here is the already-trusted path (no modal
+    // → only the editor push triggers subscribe).
+    const stdin = makeStdin();
+    addTrustedDir(trustPath, '/tmp/forja-repl-test'); // bypass modal
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    expect(stdin.listenerCount('data')).toBe(0);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      runAgentOverride: ra.runAgent,
+      trustListPathOverride: trustPath,
+    });
+    await tick();
+    // Editor is registered now → onData attached → listener count 1.
+    expect(stdin.listenerCount('data')).toBe(1);
+    // Submit a turn to verify input still flows after the deferred
+    // subscribe (no regression on the happy path).
+    stdin.feed('hi\r');
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    expect(ra.captured[0]?.configs[0]?.userPrompt).toBe('hi');
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('bootstrap error after trust acceptance tears down the pre-bootstrap stack', async () => {
     // Regression: pre-fix the bootstrap catch path returned 1
     // immediately, leaving the renderer (raw mode + bracketed
