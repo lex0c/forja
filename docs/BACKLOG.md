@@ -15,6 +15,66 @@ Format:
 
 ---
 
+## [2026-05-04] M3 / impl — verify-before-act guidance (closes spec §6.1)
+
+Continues the memory subsystem on the same branch. Closes spec §6.1
+("Verify before act"): memories may have been written long ago and
+the underlying code drifts in between. The model needs to know that
+factual claims (file paths, exported names, schema shape) require
+re-verification against the current tree before action, while
+preference claims (style, conventions) don't have a "current state"
+to verify against.
+
+**Done:**
+
+- **Verification guidance in the eager memory section header**
+  (`src/cli/memory-prompt.ts`). One paragraph, two parts:
+    - *Factual memories*: verify with `grep` / `read_file`; if
+      reality drifted, update or discard the memory rather than
+      acting on stale info.
+    - *Preference memories*: don't need re-checking — proceed.
+  Spec's example phrasing (`memória diz X exporta Y → grep antes
+  de agir`) preserved in concept; concrete tool names (grep,
+  read_file) so the model has an actionable verification path.
+- **Section-level placement, not per-memory.** The rule applies
+  uniformly across every memory the model reads; repeating it
+  per `memory_read` call would burn tokens without adding signal.
+  Lives in the eager section so it lands in the prompt cache
+  alongside the index.
+- **Empty-section short-circuit preserved.** When zero memories
+  load (none on disk, all trust-filtered, or all trigger-filtered),
+  the section text is empty — no guidance rendered when there's
+  nothing to verify.
+- **Tests:** verify-before-act guidance present (asserts FACTUAL,
+  PREFERENCE, grep, read_file, "drift" all appear in header);
+  empty-section regression guard. +2 tests; suite at 2535 pass /
+  0 fail.
+
+**Decisions:**
+
+- **Two paragraphs, not bullets.** Bullet-list of rules reads as
+  "checklist to mechanically apply"; the verification rule is a
+  judgment call (factual vs preference axis). Prose forces the
+  model to read it as guidance, not as steps.
+- **Tool names spelled out (grep, read_file).** Alternative: "use
+  the available tools to verify". Concrete names give the model a
+  cheaper path from "should verify" to "actually verify" — no
+  ambiguity about which tool to invoke.
+- **PREFERENCE is named explicitly with caveat ("no current
+  state to verify against").** Without the caveat the model might
+  try to verify preferences too — which always succeeds vacuously
+  and burns tool calls.
+
+**Out of scope:**
+
+- **Runtime hint when the model uses memory_read.** Could surface
+  a short reminder ("verify factual claims") in the tool's output
+  envelope. Today the eager section is the only carrier; runtime
+  hint would duplicate. Defer until operator data shows the model
+  ignoring the eager guidance.
+
+---
+
 ## [2026-05-04] M3 / impl — user-scope double-prompt (closes spec §7.2.5)
 
 Continues the memory subsystem on the same branch. Closes spec §7.2.5

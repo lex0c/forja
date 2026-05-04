@@ -78,9 +78,33 @@ import {
 // memories tagged with operator-defined runtime tags pass through
 // unconditionally. See `triggers.ts` for the full rule set.
 
+// Verify-before-act guidance (spec §6.1). Memories may have been
+// written days, weeks, or months ago — code drifts in between.
+// Factual claims (file paths, exported names, schema shape) need
+// to be re-checked against the current tree before the model acts
+// on them; preference claims ("we use Title Case in commits")
+// have no "current state" to verify against, so the verification
+// step is wasted work.
+//
+// The guidance lives in the eager prompt section (always loaded
+// when memories exist) rather than per-memory: the model needs
+// to know the rule before reading any specific memory body, and
+// repeating the rule at every memory_read call would burn tokens
+// for no incremental signal. Spec's example (`memória diz X
+// exporta Y → grep antes de agir`) is preserved verbatim in
+// concept; concrete tools (grep, read_file) named so the model
+// knows which tool to invoke for verification.
+//
+// Section text is two paragraphs: tool list + verification rule.
+// Tools first because that's what the model needs for orientation
+// ("what can I do with these memories?"); verification rule second
+// because it's the safety nuance that needs to land BEFORE the
+// list of names ("oh, and don't blindly trust the contents").
 const MEMORY_SECTION_HEADER = `# Memory
 
-Cross-session memories you can use. Call memory_read(name) to load a body, memory_list / memory_search to explore.`;
+Cross-session memories you can use. Call memory_read(name) to load a body, memory_list / memory_search to explore.
+
+Before acting on a FACTUAL memory (file paths, exported names, schema shape), verify it against the current code with grep / read_file. If reality has drifted from the memory, update or discard the memory rather than acting on stale info. PREFERENCE memories (commit style, naming conventions) have no "current state" to verify against — proceed without re-checking.`;
 
 export interface AssembleMemorySectionInput {
   registry: MemoryRegistry;

@@ -77,6 +77,33 @@ describe('assembleMemorySection', () => {
     expect(result.text).toContain('[user] role — full-stack TS dev');
   });
 
+  test('header carries verify-before-act guidance (spec §6.1)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [X](x.md) — h\n');
+    const registry = createMemoryRegistry({ roots });
+    const text = assembleMemorySection({ registry }).text;
+    // Verification rule names the right axis (factual vs preference).
+    expect(text).toContain('FACTUAL');
+    expect(text).toContain('PREFERENCE');
+    // Names a concrete verification tool so the model knows what
+    // to invoke (grep / read_file are the canonical pair).
+    expect(text).toContain('grep');
+    expect(text).toContain('read_file');
+    // The "drift → discard" rule is part of the guidance.
+    expect(text.toLowerCase()).toContain('drift');
+  });
+
+  test('verify-before-act guidance does NOT render when the memory section is empty', () => {
+    // No memories → no section, hence no guidance. Avoids
+    // wasting tokens on a verification rule with nothing to
+    // verify.
+    const repo = makeTmp();
+    const registry = createMemoryRegistry({ roots: makeRoots(repo) });
+    const result = assembleMemorySection({ registry });
+    expect(result.text).toBe('');
+  });
+
   test('orders entries by scope precedence (local > shared > user)', () => {
     const repo = makeTmp();
     const roots = makeRoots(repo);
