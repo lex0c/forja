@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import {
   findExpiredMemories,
   gcExpiredMemories,
+  moveMemory,
   removeMemory,
 } from '../../src/memory/lifecycle.ts';
 import type { ScopeRoots } from '../../src/memory/paths.ts';
@@ -353,5 +354,151 @@ describe('gcExpiredMemories', () => {
     expect(result.removed).toHaveLength(2);
     expect(existsSync(join(roots.user, 'u-mem.md'))).toBe(false);
     expect(existsSync(join(roots.projectLocal, 'l-mem.md'))).toBe(false);
+  });
+});
+
+describe('moveMemory — primitive (promote / demote)', () => {
+  test('promote: project_local → project_shared, source removed, target written', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    const result = moveMemory({
+      roots,
+      fromScope: 'project_local',
+      toScope: 'project_shared',
+      name: 'mem',
+    });
+    expect(result.kind).toBe('moved');
+    if (result.kind !== 'moved') return;
+    expect(existsSync(join(roots.projectLocal, 'mem.md'))).toBe(false);
+    expect(existsSync(join(roots.projectShared, 'mem.md'))).toBe(true);
+    // Source frontmatter forwarded for audit row.
+    expect(result.source).toBe('inferred');
+    // Body content survives.
+    const onDisk = readFileSync(join(roots.projectShared, 'mem.md'), 'utf-8');
+    expect(onDisk).toContain('body of mem');
+    // Both indexes updated: target gets the entry, source loses it.
+    const sharedIdx = readFileSync(join(roots.projectShared, 'MEMORY.md'), 'utf-8');
+    expect(sharedIdx).toContain('mem.md');
+    const localIdx = readFileSync(join(roots.projectLocal, 'MEMORY.md'), 'utf-8');
+    expect(localIdx).not.toContain('mem.md');
+  });
+
+  test('demote: project_shared → project_local, source removed, target written', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectShared, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectShared, 'mem', { source: 'imported' });
+    const result = moveMemory({
+      roots,
+      fromScope: 'project_shared',
+      toScope: 'project_local',
+      name: 'mem',
+    });
+    expect(result.kind).toBe('moved');
+    if (result.kind !== 'moved') return;
+    expect(existsSync(join(roots.projectShared, 'mem.md'))).toBe(false);
+    expect(existsSync(join(roots.projectLocal, 'mem.md'))).toBe(true);
+    expect(result.source).toBe('imported');
+  });
+
+  test('source_unknown when source body is missing', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    // No body file written.
+    const result = moveMemory({
+      roots,
+      fromScope: 'project_local',
+      toScope: 'project_shared',
+      name: 'ghost',
+    });
+    expect(result.kind).toBe('source_unknown');
+  });
+
+  test('target_exists when destination already has the same name', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    writeIndex(roots.projectShared, '- [Mem](mem.md) — pre-existing\n');
+    writeBody(roots.projectShared, 'mem', { source: 'imported' });
+    const result = moveMemory({
+      roots,
+      fromScope: 'project_local',
+      toScope: 'project_shared',
+      name: 'mem',
+    });
+    expect(result.kind).toBe('target_exists');
+    // Source stays in place when target reject fires.
+    expect(existsSync(join(roots.projectLocal, 'mem.md'))).toBe(true);
+    // Target unchanged.
+    const sharedBody = readFileSync(join(roots.projectShared, 'mem.md'), 'utf-8');
+    expect(sharedBody).toContain('body of mem');
+  });
+
+  test('promote preserves frontmatter source field on disk', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem', { source: 'user_explicit' });
+    moveMemory({
+      roots,
+      fromScope: 'project_local',
+      toScope: 'project_shared',
+      name: 'mem',
+    });
+    const onDisk = readFileSync(join(roots.projectShared, 'mem.md'), 'utf-8');
+    expect(onDisk).toContain('source: user_explicit');
+  });
+
+  test('source_malformed when source body has corrupt frontmatter', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Bad](bad.md) — h\n');
+    // Body file with frontmatter that fails parse — no `source`
+    // field, which validateFrontmatter rejects.
+    mkdirSync(roots.projectLocal, { recursive: true });
+    writeFileSync(
+      join(roots.projectLocal, 'bad.md'),
+      '---\nname: bad\ndescription: h\ntype: feedback\n---\n\nbody\n',
+    );
+    const result = moveMemory({
+      roots,
+      fromScope: 'project_local',
+      toScope: 'project_shared',
+      name: 'bad',
+    });
+    expect(result.kind).toBe('source_malformed');
+    if (result.kind !== 'source_malformed') return;
+    expect(result.reason).toContain('source');
+    // Source file untouched on malformed.
+    expect(existsSync(join(roots.projectLocal, 'bad.md'))).toBe(true);
+    expect(existsSync(join(roots.projectShared, 'bad.md'))).toBe(false);
+  });
+
+  test('io_error when target dir is unwritable (POSIX-only, skip as root)', () => {
+    if (process.getuid?.() === 0) return;
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [Mem](mem.md) — h\n');
+    writeBody(roots.projectLocal, 'mem');
+    // Create the project_shared dir with no write bit so the
+    // atomicWrite of body / index inside it fails with EACCES.
+    mkdirSync(roots.projectShared, { recursive: true });
+    chmodSync(roots.projectShared, 0o500);
+    try {
+      const result = moveMemory({
+        roots,
+        fromScope: 'project_local',
+        toScope: 'project_shared',
+        name: 'mem',
+      });
+      expect(result.kind).toBe('io_error');
+      // Source untouched on target write failure.
+      expect(existsSync(join(roots.projectLocal, 'mem.md'))).toBe(true);
+    } finally {
+      chmodSync(roots.projectShared, 0o700);
+    }
   });
 });

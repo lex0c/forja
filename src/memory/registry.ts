@@ -47,6 +47,17 @@ export interface MemoryListing {
 }
 
 export interface MemoryRegistry {
+  // Scope roots the registry was constructed with. Exposed so
+  // privileged callers (lifecycle primitives via slash commands)
+  // can call `removeMemory` / `moveMemory` against the SAME roots
+  // the registry's snapshot was built from. Re-deriving via
+  // `resolveScopeRoots(resolveRepoRoot(cwd))` would diverge in
+  // tests that use non-canonical fixture paths AND in any future
+  // entrypoint that constructs a registry with custom roots
+  // (e.g., admin tooling pointing at a backup). Read-only — the
+  // registry doesn't mutate roots after construction.
+  readonly roots: ScopeRoots;
+
   // All entries from all three scopes, in precedence order
   // (local first, then shared, then user). When the same `name`
   // exists in multiple scopes, ALL appearances are returned;
@@ -396,6 +407,7 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
   };
 
   return {
+    roots,
     list(opts: ListOptions = {}): MemoryListing[] {
       const all = allListings();
       let filtered = all;

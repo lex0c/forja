@@ -102,6 +102,19 @@ export interface MemoryUserScopeAskArgs {
   body: string;
 }
 
+// Generic memory-action confirm (MEMORY.md §5.4 / §5.5 / §6.3).
+// Producers: `/memory delete`, `/memory promote shared`,
+// `/memory demote local`. Caller constructs the copy; manager
+// just queues the modal. `action` is forwarded to the event for
+// audit / telemetry.
+export interface MemoryActionAskArgs {
+  action: 'delete' | 'promote' | 'demote';
+  title: string;
+  subject: string;
+  preview: string[];
+  question: string;
+}
+
 // Trust flavor's option list. Kept in sync with the reducer's
 // `trust:ask` ConfirmState construction in state.ts.
 const TRUST_OPTIONS: readonly ConfirmOption[] = [
@@ -135,6 +148,14 @@ const MEMORY_WRITE_OPTIONS: readonly ConfirmOption[] = [
 const MEMORY_USER_SCOPE_OPTIONS: readonly ConfirmOption[] = [
   { key: '1', label: 'Yes, persist to user scope', value: 'yes' },
   { key: '2', label: 'No, cancel write', value: 'no' },
+];
+
+// Generic memory-action options (delete / promote / demote).
+// Reducer matches at `state.ts` `memory:action:ask`. Generic
+// labels — caller's title carries the verb-tense specificity.
+const MEMORY_ACTION_OPTIONS: readonly ConfirmOption[] = [
+  { key: '1', label: 'Yes, proceed', value: 'yes' },
+  { key: '2', label: 'No, cancel', value: 'no' },
 ];
 
 // Permission flavor's option list, kept in sync with the reducer's
@@ -186,6 +207,14 @@ export interface ModalManager {
   // changes per spec ("vai afetar todas as sessões").
   askMemoryUserScope: (
     args: MemoryUserScopeAskArgs,
+    opts?: ConfirmAskOptions,
+  ) => Promise<MemoryWriteAnswer>;
+  // Generic memory-action confirm (delete / promote / demote).
+  // Producer (slash command) constructs the copy; reducer renders
+  // it. Reuses `MemoryWriteAnswer` since the answer triad is
+  // identical (yes/no/cancel).
+  askMemoryAction: (
+    args: MemoryActionAskArgs,
     opts?: ConfirmAskOptions,
   ) => Promise<MemoryWriteAnswer>;
   // Number of pending modals (active + queued). Tests inspect.
@@ -466,6 +495,21 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           body: args.body,
         }),
         MEMORY_USER_SCOPE_OPTIONS,
+        opts?.timeoutMs,
+      ),
+    askMemoryAction: (args, opts) =>
+      enqueueConfirm<MemoryWriteAnswer>(
+        (promptId) => ({
+          type: 'memory:action:ask',
+          ts: now(),
+          promptId,
+          action: args.action,
+          title: args.title,
+          subject: args.subject,
+          preview: args.preview,
+          question: args.question,
+        }),
+        MEMORY_ACTION_OPTIONS,
         opts?.timeoutMs,
       ),
     pendingCount: () => (active !== null ? 1 : 0) + queue.length,

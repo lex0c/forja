@@ -5,6 +5,7 @@ import {
   type MemorySource,
   type MemoryType,
   type WriteMemoryResult,
+  scanForInjection,
   validateFrontmatter,
 } from '../../memory/index.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
@@ -76,68 +77,11 @@ export interface MemoryWriteOutput {
   reason: string;
 }
 
-// Regex-style patterns for the injection / secret scanner. Match
-// the substring case-insensitively against the body. These are
-// HEURISTIC defenses, not airtight — a determined attacker can
-// rephrase. The bar is "raise the cost of the obvious vector"
-// (AGENTS.md drop-in injection per §7.1), not "stop a human red
-// team". Keep the list short so false positives stay rare.
-//
-// Spec §7.3:
-//   - "ignore previous instructions"
-//   - "you are now"
-//   - "from now on, always"
-//   - secret patterns (AWS keys, GitHub tokens, etc.)
-const INJECTION_PHRASES: readonly string[] = [
-  'ignore previous instructions',
-  'ignore all previous',
-  'you are now',
-  'from now on, always',
-  'disregard prior',
-  'forget previous',
-];
-
-// Secret-pattern regexes. Anchored on common high-entropy prefixes
-// so a memory body that mentions "AKIA" in prose without the full
-// key doesn't trigger. Patterns:
-//   - AWS access key id: `AKIA` + 16 [A-Z0-9]
-//   - GitHub PAT (classic): `ghp_` + 36 chars
-//   - GitHub fine-grained: `github_pat_` + ...
-//   - Anthropic key: `sk-ant-` + ...
-//   - OpenAI key: `sk-` + 40+ alnum (kept loose; these key formats churn)
-//   - Slack token: `xox[baprs]-...`
-const SECRET_PATTERNS: readonly RegExp[] = [
-  /AKIA[0-9A-Z]{16}/,
-  /ghp_[A-Za-z0-9]{30,}/,
-  /github_pat_[A-Za-z0-9_]{20,}/,
-  /sk-ant-[A-Za-z0-9_-]{20,}/,
-  /\bsk-[A-Za-z0-9]{40,}\b/,
-  /xox[baprs]-[A-Za-z0-9-]{10,}/,
-];
-
-interface ScanResult {
-  ok: boolean;
-  // The first matched phrase / pattern label, used in the audit
-  // row's `details.reason`. We don't enumerate every match — one
-  // is enough to refuse, and surfacing more would reveal which
-  // patterns we ship to an attacker.
-  reason?: string;
-}
-
-const scanForInjection = (body: string): ScanResult => {
-  const lower = body.toLowerCase();
-  for (const phrase of INJECTION_PHRASES) {
-    if (lower.includes(phrase)) {
-      return { ok: false, reason: `injection phrase: ${JSON.stringify(phrase)}` };
-    }
-  }
-  for (const pat of SECRET_PATTERNS) {
-    if (pat.test(body)) {
-      return { ok: false, reason: 'secret pattern matched' };
-    }
-  }
-  return { ok: true };
-};
+// Injection / secret scanner is shared across memory write surfaces;
+// see `src/memory/scanner.ts`. Both `memory_write` (this file) and
+// `/memory promote shared` (slash command) call `scanForInjection`
+// for the standard pass; promote also runs `scanForPromotion` for
+// the path-traversal + 200-line-cap superset spec §5.4 mandates.
 
 const isoDateForOffset = (offsetDays: number, now: Date = new Date()): string => {
   const ms = now.getTime() + offsetDays * 24 * 60 * 60 * 1000;

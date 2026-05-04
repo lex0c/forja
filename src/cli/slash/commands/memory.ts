@@ -21,11 +21,14 @@
 // the dispatcher's `notes` channel; mutation subcommands (Tier 2)
 // add modal-confirm + audit-row emission paths.
 
-import type {
-  MemoryFile,
-  MemoryListing,
-  MemoryRegistry,
-  MemoryScope,
+import {
+  type MemoryFile,
+  type MemoryListing,
+  type MemoryRegistry,
+  type MemoryScope,
+  moveMemory,
+  removeMemory,
+  scanForPromotion,
 } from '../../../memory/index.ts';
 import {
   listMemoryEventsByName,
@@ -412,16 +415,439 @@ const handleSummary = (registry: MemoryRegistry): SlashResult => {
     kind: 'ok',
     notes: [
       `${total} active ${pluralize('memory', 'memories', total)} (post-dedup) · raw: ${user} user · ${shared} shared · ${local} local`,
-      'subcommands: list [scope] · show <name> [scope] · audit [--limit N | --name <name> | --all]',
+      'subcommands: list · show · audit · delete · promote shared · demote local',
     ],
   };
+};
+
+// ─── /memory delete ──────────────────────────────────────────────────
+//
+// Spec MEMORY.md §6.3 line 441: `/memory delete <name>   # com confirmação`.
+// Reads the body for the modal preview (so the operator sees what's
+// about to disappear), confirms via the generic memory-action modal,
+// then calls `removeMemory` and emits a `deleted` audit event. Body
+// is loaded via `peek` to avoid emitting a `read` row for what's
+// effectively a system-internal pre-delete display.
+
+const handleDelete = async (
+  registry: MemoryRegistry,
+  ctx: SlashContext,
+  args: string[],
+): Promise<SlashResult> => {
+  if (args.length === 0) {
+    return { kind: 'error', message: '/memory delete: missing name argument' };
+  }
+  if (args.length > 2) {
+    return {
+      kind: 'error',
+      message: `/memory delete: too many args (got ${args.length}, expected name [scope])`,
+    };
+  }
+  const name = args[0] as string;
+  const scopeArg = args[1];
+  let scope: MemoryScope | undefined;
+  if (scopeArg !== undefined) {
+    if (!VALID_SINGLE_SCOPES.has(scopeArg)) {
+      return {
+        kind: 'error',
+        message: `/memory delete: invalid scope '${scopeArg}' (expected: user, local, shared)`,
+      };
+    }
+    scope = memoryScopeFromSingleArg(scopeArg) ?? undefined;
+  }
+
+  // Locate the memory; with no scope, registry walks precedence so
+  // the operator's `name` resolves to the most-specific scope. peek
+  // (no audit) since this is a pre-delete probe, not an operator-
+  // initiated read.
+  const peek = scope !== undefined ? registry.peek(name, { scope }) : registry.peek(name);
+  if (peek.kind === 'unknown') {
+    const scopeQual = scope !== undefined ? ` in scope ${scopeArg}` : '';
+    return {
+      kind: 'error',
+      message: `/memory delete: no memory named '${name}'${scopeQual}`,
+    };
+  }
+  if (peek.kind === 'malformed') {
+    // Body parse failure shouldn't block deletion — the operator
+    // probably wants to remove a corrupted entry. Show an empty
+    // preview and proceed; remove path doesn't care about content.
+    // Source unknown when the body can't parse — fall back to
+    // 'imported' for the audit row (most neutral provenance
+    // marker).
+    return await confirmAndDelete(
+      ctx,
+      registry,
+      peek.scope,
+      name,
+      [`(body parse failed: ${peek.error})`],
+      'imported',
+    );
+  }
+  if (peek.kind === 'missing') {
+    // Index entry exists, body file is gone. Confirm anyway —
+    // operator's intent is to clean up the dangling entry. Source
+    // unrecoverable; same 'imported' fallback as malformed.
+    return await confirmAndDelete(
+      ctx,
+      registry,
+      peek.scope,
+      name,
+      ['(body file missing — only the index entry will be cleared)'],
+      'imported',
+    );
+  }
+
+  // Happy path: real source from frontmatter so audit groups with
+  // the memory's history (created/refused/etc rows carry the
+  // same provenance).
+  return await confirmAndDelete(
+    ctx,
+    registry,
+    peek.scope,
+    name,
+    peek.file.body.split('\n'),
+    peek.file.frontmatter.source,
+  );
+};
+
+const confirmAndDelete = async (
+  ctx: SlashContext,
+  registry: MemoryRegistry,
+  scope: MemoryScope,
+  name: string,
+  preview: string[],
+  source: string,
+): Promise<SlashResult> => {
+  const answer = await ctx.modalManager.askMemoryAction({
+    action: 'delete',
+    title: 'Delete memory',
+    subject: `${scope}/${name}`,
+    preview,
+    question: 'Permanently delete this memory? (file + index entry)',
+  });
+  if (answer !== 'yes') {
+    return {
+      kind: 'ok',
+      notes: [`/memory delete cancelled (operator answered ${answer})`],
+    };
+  }
+
+  // Resolve roots from cwd so we can call the lifecycle primitive.
+  // The registry was constructed from the same roots at bootstrap;
+  // we re-derive here rather than threading roots through
+  // SlashContext (every other slash command would gain a field for
+  // one caller).
+  const roots = registry.roots;
+  const result = removeMemory({ roots, scope, name });
+  if (result.kind === 'sandbox_violation') {
+    registry.recordEvent({
+      action: 'refused',
+      scope,
+      memoryName: name,
+      source: source as 'user_explicit' | 'inferred' | 'imported',
+      details: { stage: 'slash_delete', reason: result.reason },
+      auditCwd: ctx.baseConfig.cwd,
+      ...attribution(ctx),
+    });
+    return { kind: 'error', message: `/memory delete: sandbox violation: ${result.reason}` };
+  }
+  if (result.kind === 'io_error') {
+    registry.recordEvent({
+      action: 'refused',
+      scope,
+      memoryName: name,
+      source: source as 'user_explicit' | 'inferred' | 'imported',
+      details: { stage: 'slash_delete', reason: result.reason },
+      auditCwd: ctx.baseConfig.cwd,
+      ...attribution(ctx),
+    });
+    return { kind: 'error', message: `/memory delete: ${result.reason}` };
+  }
+  if (result.kind === 'unknown') {
+    return { kind: 'error', message: `/memory delete: no traces of '${name}' on disk` };
+  }
+
+  // Successful removal. Audit `deleted` with the real frontmatter
+  // source so the row groups with the memory's history. Refresh
+  // the registry so subsequent /memory list calls reflect the
+  // delete without explicit reload.
+  registry.recordEvent({
+    action: 'deleted',
+    scope,
+    memoryName: name,
+    source: source as 'user_explicit' | 'inferred' | 'imported',
+    details: { bodyPath: result.bodyPath },
+    auditCwd: ctx.baseConfig.cwd,
+    ...attribution(ctx),
+  });
+  registry.reload();
+  return { kind: 'ok', notes: [`deleted ${scope}/${name}`] };
+};
+
+// Audit-attribution spread helper. SlashContext exposes
+// currentSessionId() — null between boot and first turn — so the
+// caller-side spread keeps the recordEvent input narrow.
+const attribution = (ctx: SlashContext): { auditSessionId?: string } => {
+  const sid = ctx.currentSessionId();
+  return sid !== null ? { auditSessionId: sid } : {};
+};
+
+// ─── /memory promote shared ──────────────────────────────────────────
+//
+// Spec MEMORY.md §5.4: project_local → project_shared with an
+// additional scanner (path traversal, secret patterns, injection
+// heuristic, 200-line cap). Modal-confirm precedes the move; on
+// accept, `moveMemory` writes target + removes source. Audit
+// `promoted` event with from/to scopes in details.
+
+const handlePromote = async (
+  registry: MemoryRegistry,
+  ctx: SlashContext,
+  args: string[],
+): Promise<SlashResult> => {
+  // Spec §6.3 line 445 spells the syntax `promote shared <name>`.
+  // Strict — reject `promote <name>` (missing target) and other
+  // targets to keep parsing unambiguous.
+  if (args.length !== 2 || args[0] !== 'shared') {
+    return {
+      kind: 'error',
+      message: '/memory promote: syntax is `promote shared <name>` (only shared target supported)',
+    };
+  }
+  const name = args[1] as string;
+
+  // Locate the memory in project_local. peek so the audit table
+  // doesn't grow a `read` row for what's effectively a pre-promote
+  // probe.
+  const peek = registry.peek(name, { scope: 'project_local' });
+  if (peek.kind !== 'present') {
+    return {
+      kind: 'error',
+      message: `/memory promote: '${name}' not found in project_local (only local memories can be promoted)`,
+    };
+  }
+
+  // Spec §5.4 additional scanner — body content checks BEYOND the
+  // base injection scan that ran when the memory was first
+  // proposed. Catches operator-edited content that bypassed the
+  // initial gate.
+  const scan = scanForPromotion(peek.file.body);
+  if (!scan.ok) {
+    registry.recordEvent({
+      action: 'refused',
+      scope: 'project_local',
+      memoryName: name,
+      source: peek.file.frontmatter.source,
+      details: { stage: 'promote_scanner', reason: scan.reason ?? 'unknown' },
+      auditCwd: ctx.baseConfig.cwd,
+      ...attribution(ctx),
+    });
+    return {
+      kind: 'error',
+      message: `/memory promote: scanner blocked promotion (${scan.reason ?? 'unknown'})`,
+    };
+  }
+
+  const answer = await ctx.modalManager.askMemoryAction({
+    action: 'promote',
+    title: 'Promote memory to shared',
+    subject: `project_local/${name} → project_shared/${name}`,
+    preview: [
+      'Promoting to shared makes this memory visible to the whole team',
+      'on next pull. The body lands in `.agent/memory/shared/` as a',
+      'tracked git change — no auto-commit; you commit manually.',
+      '',
+      ...peek.file.body.split('\n'),
+    ],
+    question: 'Promote to project_shared?',
+  });
+  if (answer !== 'yes') {
+    return {
+      kind: 'ok',
+      notes: [`/memory promote cancelled (operator answered ${answer})`],
+    };
+  }
+
+  const roots = registry.roots;
+  const result = moveMemory({
+    roots,
+    fromScope: 'project_local',
+    toScope: 'project_shared',
+    name,
+  });
+  return finalizeMove({
+    ctx,
+    registry,
+    result,
+    name,
+    fromScope: 'project_local',
+    toScope: 'project_shared',
+    pastTense: 'promoted',
+    infinitive: 'promote',
+    sourceFallback: peek.file.frontmatter.source,
+  });
+};
+
+// ─── /memory demote local ────────────────────────────────────────────
+//
+// Spec MEMORY.md §5.5: project_shared → project_local. Inverse of
+// promote, NO additional scanner (going to less-trusted scope is
+// less restrictive). Modal confirms; moveMemory persists; audit
+// `demoted` event.
+
+const handleDemote = async (
+  registry: MemoryRegistry,
+  ctx: SlashContext,
+  args: string[],
+): Promise<SlashResult> => {
+  if (args.length !== 2 || args[0] !== 'local') {
+    return {
+      kind: 'error',
+      message: '/memory demote: syntax is `demote local <name>` (only local target supported)',
+    };
+  }
+  const name = args[1] as string;
+
+  const peek = registry.peek(name, { scope: 'project_shared' });
+  if (peek.kind !== 'present') {
+    return {
+      kind: 'error',
+      message: `/memory demote: '${name}' not found in project_shared`,
+    };
+  }
+
+  const answer = await ctx.modalManager.askMemoryAction({
+    action: 'demote',
+    title: 'Demote memory to local',
+    subject: `project_shared/${name} → project_local/${name}`,
+    preview: [
+      'Demoting to local removes this memory from the team-shared set.',
+      'The shared/ entry will be deleted (visible as a git change);',
+      'a copy lands in local/ for your future sessions.',
+      '',
+      ...peek.file.body.split('\n'),
+    ],
+    question: 'Demote to project_local?',
+  });
+  if (answer !== 'yes') {
+    return {
+      kind: 'ok',
+      notes: [`/memory demote cancelled (operator answered ${answer})`],
+    };
+  }
+
+  const roots = registry.roots;
+  const result = moveMemory({
+    roots,
+    fromScope: 'project_shared',
+    toScope: 'project_local',
+    name,
+  });
+  return finalizeMove({
+    ctx,
+    registry,
+    result,
+    name,
+    fromScope: 'project_shared',
+    toScope: 'project_local',
+    pastTense: 'demoted',
+    infinitive: 'demote',
+    sourceFallback: peek.file.frontmatter.source,
+  });
+};
+
+// Shared finalizer for promote / demote. Maps moveMemory's
+// discriminated result onto the audit row + slash result.
+interface FinalizeMoveInput {
+  ctx: SlashContext;
+  registry: MemoryRegistry;
+  result: ReturnType<typeof moveMemory>;
+  name: string;
+  fromScope: MemoryScope;
+  toScope: MemoryScope;
+  // Verb pair: past tense for the audit `action` enum (memory_events
+  // accepts `promoted` / `demoted`); infinitive for operator-facing
+  // error messages (`/memory promote: ...` reads better than
+  // `/memory promoted: ...`). Earlier cut tried to derive infinitive
+  // via `action.replace(/d$/, 'e')` — which produced "promotee" /
+  // "demotee" because the trailing 'd' got swapped for 'e' (the
+  // last 'd' isn't part of the past-tense suffix). Explicit pair
+  // here removes the regex hack.
+  pastTense: 'promoted' | 'demoted';
+  infinitive: 'promote' | 'demote';
+  // Source field from the pre-move peek — used as the audit row's
+  // `source` for both success and failure paths so the row
+  // groups correctly with the memory's other history.
+  sourceFallback: string;
+}
+
+const finalizeMove = (input: FinalizeMoveInput): SlashResult => {
+  const { ctx, registry, result, name, fromScope, toScope, pastTense, infinitive, sourceFallback } =
+    input;
+  const auditCwd = ctx.baseConfig.cwd;
+  const audit = attribution(ctx);
+
+  if (result.kind === 'moved') {
+    registry.recordEvent({
+      action: pastTense,
+      scope: toScope,
+      memoryName: name,
+      source: result.source as 'user_explicit' | 'inferred' | 'imported',
+      details: {
+        from_scope: fromScope,
+        to_scope: toScope,
+        from_path: result.fromPath,
+        to_path: result.toPath,
+      },
+      auditCwd,
+      ...audit,
+    });
+    registry.reload();
+    return {
+      kind: 'ok',
+      notes: [`${pastTense} ${fromScope}/${name} → ${toScope}/${name}`],
+    };
+  }
+
+  // Failure paths — audit refused with stage tag and reason. Use
+  // the sourceFallback we captured pre-move since `result` doesn't
+  // carry it on failure variants.
+  let reason: string;
+  switch (result.kind) {
+    case 'source_unknown':
+      reason = `source body missing in ${fromScope}`;
+      break;
+    case 'source_malformed':
+      reason = `source body malformed: ${result.reason}`;
+      break;
+    case 'target_exists':
+      reason = `target already exists at ${result.path}`;
+      break;
+    case 'sandbox_violation':
+      reason = result.reason;
+      break;
+    case 'io_error':
+      reason = result.reason;
+      break;
+  }
+  registry.recordEvent({
+    action: 'refused',
+    scope: fromScope,
+    memoryName: name,
+    source: sourceFallback as 'user_explicit' | 'inferred' | 'imported',
+    details: { stage: `slash_${pastTense}`, kind: result.kind, reason },
+    auditCwd,
+    ...audit,
+  });
+  return { kind: 'error', message: `/memory ${infinitive}: ${reason}` };
 };
 
 // ─── command export ──────────────────────────────────────────────────
 
 export const memoryCommand: SlashCommand = {
   name: 'memory',
-  description: 'inspect cross-session memories (list/show/audit)',
+  description: 'manage cross-session memories (list/show/audit/delete/promote/demote)',
   exec: async (args, ctx) => {
     const registry = ctx.baseConfig.memoryRegistry;
     if (registry === undefined) {
@@ -439,10 +865,16 @@ export const memoryCommand: SlashCommand = {
         return handleShow(registry, ctx, args.slice(1));
       case 'audit':
         return handleAudit(ctx, args.slice(1));
+      case 'delete':
+        return handleDelete(registry, ctx, args.slice(1));
+      case 'promote':
+        return handlePromote(registry, ctx, args.slice(1));
+      case 'demote':
+        return handleDemote(registry, ctx, args.slice(1));
       default:
         return {
           kind: 'error',
-          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit)`,
+          message: `/memory: unknown subcommand '${sub}' (try: list, show, audit, delete, promote, demote)`,
         };
     }
   },

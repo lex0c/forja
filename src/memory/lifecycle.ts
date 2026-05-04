@@ -1,16 +1,20 @@
-import { lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { FrontmatterError } from './frontmatter.ts';
+import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { FrontmatterError, serializeMemoryFile } from './frontmatter.ts';
 import {
   IndexError,
   type ParsedIndex,
   parseIndex,
   removeIndexEntry,
   serializeIndex,
+  upsertIndexEntry,
 } from './index-file.ts';
+import { readMemoryByName } from './loader.ts';
 import { ScopeError, indexFilePath, memoryFilePath } from './paths.ts';
 import type { ScopeRoots } from './paths.ts';
 import type { MemoryRegistry } from './registry.ts';
-import type { MemoryScope } from './types.ts';
+import type { MemoryFile, MemoryScope } from './types.ts';
+import { type WriteMemoryResult, writeMemory } from './writer.ts';
 
 // Lifecycle primitives for the memory subsystem (spec MEMORY.md §5.5,
 // §6.2). This module owns:
@@ -384,4 +388,316 @@ export const gcExpiredMemories = (
   // listings now match disk.
   if (removed.length > 0) registry.reload();
   return { removed, failures };
+};
+
+// ─── moveMemory (promote / demote primitive) ─────────────────────────
+//
+// Spec MEMORY.md §5.4 (promote local → shared) and §5.5 (demote
+// shared → local) both reduce to "atomically relocate a memory
+// from one scope to another". This primitive is direction-agnostic
+// — promote/demote are thin wrappers over it that pin from/to and
+// add direction-specific scanner gates.
+//
+// Concurrency / atomicity:
+//   1. Read source body (`readMemoryByName`). Failures here mean
+//      the operator's input is wrong — surface as `unknown` /
+//      `malformed`.
+//   2. Write target via `writeMemory`. Reuses the writer's
+//      sandbox + symlink + index-cap defenses. If the target
+//      already exists at the destination scope, writer returns
+//      `exists` and we abort BEFORE touching the source — no
+//      duplicate, no half-state.
+//   3. Remove source via `removeMemory`. Crash between step 2
+//      and step 3 leaves a copy at both scopes; the loader's
+//      "all listings" output surfaces that, and a re-run of
+//      promote/demote is a no-op on the duplicate (writer's
+//      `exists` rejects step 2 the second time). Operator can
+//      reconcile via `removeMemory`.
+//
+// Discriminated outcomes mirror writer.ts conventions: `moved`
+// on success (with both paths so the caller can audit which
+// files were touched), and the failure variants reachable from
+// the underlying writer / remover. `source_unknown` is distinct
+// from `source_malformed` so the audit row carries actionable
+// detail without rerunning a probe.
+
+export interface MoveMemoryInput {
+  roots: ScopeRoots;
+  fromScope: MemoryScope;
+  toScope: MemoryScope;
+  name: string;
+}
+
+export type MoveMemoryResult =
+  | {
+      kind: 'moved';
+      fromPath: string;
+      toPath: string;
+      // Frontmatter `source` field, forwarded to the audit row
+      // by the caller — the move primitive itself doesn't audit
+      // (the slash command does, with promoted/demoted action).
+      source: string;
+    }
+  | { kind: 'source_unknown' }
+  | { kind: 'source_malformed'; reason: string }
+  | { kind: 'target_exists'; path: string }
+  | { kind: 'sandbox_violation'; reason: string }
+  | { kind: 'io_error'; reason: string };
+
+export const moveMemory = (input: MoveMemoryInput): MoveMemoryResult => {
+  const { roots, fromScope, toScope, name } = input;
+
+  // Step 1: read source body.
+  let sourceFile: MemoryFile;
+  try {
+    const result = readMemoryByName(roots, fromScope, name);
+    if (result.kind === 'missing') return { kind: 'source_unknown' };
+    if (result.kind === 'malformed') {
+      return { kind: 'source_malformed', reason: result.error };
+    }
+    sourceFile = result.file;
+  } catch (err) {
+    if (err instanceof ScopeError) {
+      return { kind: 'sandbox_violation', reason: err.message };
+    }
+    if (err instanceof FrontmatterError) {
+      return { kind: 'io_error', reason: err.message };
+    }
+    throw err;
+  }
+
+  // Step 2: write target. Writer enforces project_shared rejection
+  // for direct writes — but `moveMemory` is a privileged caller
+  // that legitimately targets shared scope, so we use the writer
+  // directly. To bypass the writer's `shared_forbidden` gate when
+  // toScope='project_shared', the caller (slash command) must
+  // verify the move is intentional (modal confirm + scanner pass).
+  // Today the writer hard-rejects shared writes; we work around by
+  // using the index-update + body-write path through `writeMemory`
+  // for non-shared moves and a direct path for shared.
+  //
+  // Pragmatic alternative shipped here: writer accepts shared via
+  // an opt-in. We don't have that yet, so we structure the move so
+  // the writer's reject is treated as a special case the move
+  // primitive translates into a direct write. To minimize code
+  // duplication, the move primitive bypasses writer.ts when
+  // toScope=project_shared — using the same atomic-rename + index
+  // upsert pattern in this file.
+  if (toScope === 'project_shared') {
+    return moveToShared(input, sourceFile);
+  }
+
+  // Resolve `fromPath` BEFORE the destructive write so a hypothetical
+  // `FrontmatterError` from `validateName` (defense-in-depth — slash
+  // command already validated) doesn't leave the target written
+  // with no return path tracked. ScopeError / FrontmatterError both
+  // map to the discriminated result here; the actual write
+  // proceeds only after path resolution succeeds.
+  let fromPath: string;
+  try {
+    fromPath = memoryFilePath(roots, fromScope, name);
+  } catch (err) {
+    if (err instanceof ScopeError) {
+      return { kind: 'sandbox_violation', reason: err.message };
+    }
+    if (err instanceof FrontmatterError) {
+      return { kind: 'io_error', reason: err.message };
+    }
+    throw err;
+  }
+
+  const writeResult = writeMemory({
+    roots,
+    scope: toScope,
+    frontmatter: sourceFile.frontmatter,
+    body: sourceFile.body,
+  });
+  if (writeResult.kind !== 'created') {
+    return mapWriteFailure(writeResult);
+  }
+
+  // Step 3: remove source.
+  const removeResult = removeMemory({ roots, scope: fromScope, name });
+  if (removeResult.kind === 'sandbox_violation') {
+    return { kind: 'sandbox_violation', reason: removeResult.reason };
+  }
+  if (removeResult.kind === 'io_error') {
+    // Body was written to target but source removal failed.
+    // Caller will see two copies until they reconcile manually.
+    // Surface the io_error so the audit row carries the disk
+    // failure detail.
+    return {
+      kind: 'io_error',
+      reason: `target wrote OK, source remove failed: ${removeResult.reason}`,
+    };
+  }
+
+  return {
+    kind: 'moved',
+    fromPath,
+    toPath: writeResult.path,
+    source: sourceFile.frontmatter.source,
+  };
+};
+
+// Direct shared-scope write path. Mirrors `writeMemory` but
+// targets `project_shared` (which writer.ts rejects up front per
+// spec §5.1.3). Used only by `moveMemory` when promoting; never
+// reachable from the tool surface because tool->writer goes
+// through writer.ts and gets the reject. Operator-facing scanner
+// gates are the slash command's responsibility (spec §5.4
+// "scanner adicional"); this helper just persists.
+const moveToShared = (input: MoveMemoryInput, sourceFile: MemoryFile): MoveMemoryResult => {
+  const { roots, fromScope, name } = input;
+  // We can't call writeMemory(toScope=project_shared) — it rejects.
+  // Inline the atomic write + index upsert pattern matching
+  // writer.ts. Future refactor: writer.ts accepts an
+  // `allowShared: true` flag from privileged callers. Until then
+  // this duplication is contained.
+  let bodyPath: string;
+  try {
+    bodyPath = memoryFilePath(roots, 'project_shared', name);
+  } catch (err) {
+    if (err instanceof ScopeError) {
+      return { kind: 'sandbox_violation', reason: err.message };
+    }
+    if (err instanceof FrontmatterError) {
+      return { kind: 'io_error', reason: err.message };
+    }
+    throw err;
+  }
+
+  // Symlink + existence checks mirror writer.ts.
+  try {
+    const stat = lstatSync(bodyPath);
+    if (stat.isSymbolicLink()) {
+      return { kind: 'sandbox_violation', reason: `target path is a symlink: ${bodyPath}` };
+    }
+    if (stat.isFile()) return { kind: 'target_exists', path: bodyPath };
+    return { kind: 'io_error', reason: `non-file at memory path: ${bodyPath}` };
+  } catch (err) {
+    if (!isEnoent(err)) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { kind: 'io_error', reason: msg };
+    }
+  }
+
+  try {
+    mkdirSync(dirname(bodyPath), { recursive: true });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { kind: 'io_error', reason: `mkdir failed: ${msg}` };
+  }
+
+  // Index update. Same pattern as writer.ts buildIndexEntry.
+  const indexPath = indexFilePath(roots, 'project_shared');
+  let parsed: ParsedIndex;
+  try {
+    parsed = loadOrEmptyIndex(indexPath);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { kind: 'io_error', reason: `read index: ${msg}` };
+  }
+  const newEntry = {
+    title: sourceFile.frontmatter.name,
+    href: `${name}.md`,
+    hook: sourceFile.frontmatter.description,
+  };
+  const nextEntries = upsertIndexEntry(parsed.entries, newEntry);
+
+  let serialized: ReturnType<typeof serializeIndex>;
+  try {
+    serialized = serializeIndex(nextEntries, { header: '# Memory index' });
+  } catch (err) {
+    if (err instanceof IndexError) {
+      return { kind: 'io_error', reason: err.message };
+    }
+    throw err;
+  }
+
+  // Resolve fromPath BEFORE the destructive write — same rationale
+  // as the non-shared path above (defense-in-depth against
+  // hypothetical FrontmatterError leaving target written with no
+  // return path tracked).
+  let fromPath: string;
+  try {
+    fromPath = memoryFilePath(roots, fromScope, name);
+  } catch (err) {
+    if (err instanceof ScopeError) {
+      return { kind: 'sandbox_violation', reason: err.message };
+    }
+    if (err instanceof FrontmatterError) {
+      return { kind: 'io_error', reason: err.message };
+    }
+    throw err;
+  }
+
+  // Body serialization.
+  let bodyText: string;
+  try {
+    bodyText = serializeMemoryFile(sourceFile);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { kind: 'io_error', reason: `serialize body: ${msg}` };
+  }
+
+  try {
+    atomicWrite(bodyPath, bodyText);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { kind: 'io_error', reason: `write body: ${msg}` };
+  }
+  try {
+    atomicWrite(indexPath, serialized.text);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { kind: 'io_error', reason: `write index: ${msg}` };
+  }
+
+  // Remove source.
+  const removeResult = removeMemory({ roots, scope: fromScope, name });
+  if (removeResult.kind === 'io_error') {
+    return {
+      kind: 'io_error',
+      reason: `target wrote OK, source remove failed: ${removeResult.reason}`,
+    };
+  }
+  if (removeResult.kind === 'sandbox_violation') {
+    return { kind: 'sandbox_violation', reason: removeResult.reason };
+  }
+
+  return {
+    kind: 'moved',
+    fromPath,
+    toPath: bodyPath,
+    source: sourceFile.frontmatter.source,
+  };
+};
+
+const mapWriteFailure = (result: WriteMemoryResult): MoveMemoryResult => {
+  switch (result.kind) {
+    case 'created':
+      // Caller already handled this branch — defensive default.
+      return { kind: 'io_error', reason: 'unreachable: created passed to mapWriteFailure' };
+    case 'exists':
+      return { kind: 'target_exists', path: result.path };
+    case 'shared_forbidden':
+      // moveMemory routes shared targets to moveToShared before
+      // calling writeMemory, so this is unreachable in production.
+      return {
+        kind: 'io_error',
+        reason: 'unreachable: shared_forbidden in non-shared move path',
+      };
+    case 'sandbox_violation':
+      return { kind: 'sandbox_violation', reason: result.reason };
+    case 'symlink_refused':
+      return { kind: 'sandbox_violation', reason: `target path is a symlink: ${result.path}` };
+    case 'index_full':
+      return {
+        kind: 'io_error',
+        reason: `MEMORY.md hard cap reached at target (${result.current}/${result.cap})`,
+      };
+    case 'io_error':
+      return { kind: 'io_error', reason: result.reason };
+  }
 };

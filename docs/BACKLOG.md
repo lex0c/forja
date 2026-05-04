@@ -15,6 +15,140 @@ Format:
 
 ---
 
+## [2026-05-04] M3 / impl — /memory slash commands (list/show/audit/delete/promote/demote)
+
+Continues the memory subsystem on the same branch. Two commits in
+sequence:
+- `187f40d` — Tier 1: read-only inspection (`list`, `show`,
+  `audit` + summary). Closes the operator-inspection gap that was
+  the largest remaining deliverable for the autonomous-profile +
+  interactive-REPL scenario.
+- This entry — Tier 2: destructive + team-sharing (`delete`,
+  `promote shared`, `demote local`). Closes spec §5.4 + §5.5 + the
+  destructive half of §6.3.
+
+**Done (Tier 2):**
+
+- **Scanner extracted** to `src/memory/scanner.ts`. Two consumers:
+  `memory_write` tool (regular injection + secret check) and
+  `/memory promote shared` (`scanForPromotion` superset adds path-
+  traversal regex + 200-line cap per spec §5.4 "scanner adicional").
+- **`moveMemory` primitive** in `src/memory/lifecycle.ts`:
+  discriminated result, write-target-then-remove-source ordering
+  (a crash between leaves the source intact + a target copy —
+  recoverable via re-running, since writer's `exists` reject
+  short-circuits step 2 the second time). Special `moveToShared`
+  inline path because writer.ts rejects direct shared writes per
+  §5.1.3; that branch uses the same atomic-write + index-upsert
+  pattern as writer but targets `project_shared`. Code duplication
+  documented in the comment block — future cleanup is
+  `writeMemory({ allowShared: true })` opt-in.
+- **`/memory delete <name> [scope]`** — peek loads the body for
+  modal preview (operator sees what disappears), confirm via the
+  generic `memory:action:ask` modal, then `removeMemory` + audit
+  `deleted`. Frontmatter `source` threaded through to the audit
+  row so the delete row groups with the memory's history.
+  Malformed / missing peek paths use 'imported' as the source
+  fallback (real source unrecoverable; most-neutral marker).
+- **`/memory promote shared <name>`** — peek source from
+  `project_local`, run `scanForPromotion`, modal-confirm with body
+  preview + cross-team-impact warning, `moveMemory` on accept,
+  audit `promoted` with from/to scope details. Scanner runs BEFORE
+  modal opens — operator never confirms content the scanner would
+  block. Spec §5.4 line 390 "Não roda `git add` ou `git commit`":
+  verified — move primitive only writes files, no git invocation.
+- **`/memory demote local <name>`** — peek source from
+  `project_shared`, modal-confirm, `moveMemory`, audit `demoted`.
+  No additional scanner per §5.5 (going to less-trusted scope).
+- **Generic `memory:action:ask` modal flavor** — caller-supplied
+  title / subject / preview / question. Three subcommands share
+  one pipeline; reducer renders without per-action branches.
+- **`MemoryRegistry.roots`** exposed as `readonly ScopeRoots` so
+  slash callers use the same roots the registry was constructed
+  with — re-deriving via `resolveScopeRoots(resolveRepoRoot(cwd))`
+  diverges in tests with non-canonical fixture paths AND in any
+  future entrypoint with custom roots (admin tooling pointing at a
+  backup).
+- **Tests:** +24 (memory.test.ts spans 50 → 72 with delete +
+  promote + demote + failure paths) + 8 lifecycle (moveMemory
+  primitive coverage). Suite at 2613 pass / 0 fail.
+
+**Decisions:**
+
+- **Generic `memory-action` modal vs flavor-per-action.** Three
+  destructive subcommands have distinct copy but identical option
+  shape (yes/no, default last). Generic flavor with caller-supplied
+  strings = one event type, one reducer case, three callers.
+  Trade-off: reducer can't enforce per-action invariants (e.g.,
+  "promote modal must show source warning"); caller has full
+  control. Acceptable because each handler is small and
+  thoroughly tested.
+- **`moveMemory` write-then-delete instead of `renameSync`.** Spec
+  §5.4 line 387 says "Move arquivo: local/<name>.md → shared/
+  <name>.md" — phrasing suggests rename. We do write+delete
+  because (a) cross-scope renames may cross filesystems
+  (project_shared and project_local under same `.agent/` are
+  same-fs; user scope under `~/.config/agent/memory/` may be
+  different), (b) the writer's atomicity defenses (sandbox,
+  symlink) would have to be reimplemented in a rename path.
+  Two-step ordering means a crash window leaves source intact +
+  target copy. Operator can re-run; writer's `exists` reject is
+  the dedup gate. Documented in moveMemory comment.
+- **Scanner is binary-block, no warning tier.** Spec §5.4 line
+  383 mentions "rejeita se forte; warning se fraco" for
+  injection — we ship binary block for all matches. Warning tier
+  needs a "fuzzy match score" the scanner doesn't compute. Tracked
+  as deferred.
+
+**Out of scope (deferred):**
+
+- **`/memory edit <name>`** — needs `$EDITOR` spawn primitive.
+- **`/memory diff`** — needs git invocation surface.
+- **`/memory save`** — semantics underspecified ("baseado em
+  sessão atual" — propose a memory from the current conversation).
+- **`/memory expire <name> <date>`** — needs frontmatter-rewrite
+  primitive.
+- **`/memory promote user <name>`** — double-prompt promotion to
+  user scope. Spec §5.4 line 447 wants confirmation dupla.
+- **Scanner warning tier** (§5.4 "fraco"). Hard binary block now;
+  fuzzy match scoring lands when an operator pattern justifies it.
+- **Atomic rename move path** — current impl is write+delete with
+  a documented crash window. `renameSync` for same-fs scope pairs
+  + write+delete fallback is a future hardening.
+
+**Post-review fixes (2026-05-04):**
+
+- **`finalizeMove` regex bug.** First cut produced `/memory promotee:` /
+  `/memory demotee:` for failure paths via `action.replace(/d$/,
+  'e')` — strips the trailing 'd' of "promoted" instead of the
+  full "-ed" suffix. Replaced by explicit `pastTense` /
+  `infinitive` field pair. Tests (target_exists for both promote
+  and demote) now assert the message uses the verb form
+  explicitly.
+- **`memoryFilePath` resolution moved BEFORE the destructive
+  write** in both `moveMemory` and `moveToShared`. Defense-in-
+  depth against hypothetical FrontmatterError leaving the target
+  written with no return path tracked. Slash command already
+  validates name; the lifecycle primitive now does too.
+- **ESM imports** in `moveToShared` — converted from
+  `require('node:fs')` mid-function (commonJS-style) to top-level
+  ESM imports matching the rest of the codebase.
+- **Spread-of-array hack** in `handleDelete` peek call replaced
+  with explicit conditional. Two-character cost, much clearer.
+- **Real frontmatter `source` threaded through delete audit** —
+  earlier cut hardcoded `'imported'` for all delete rows; now
+  passes `peek.file.frontmatter.source` so the delete row groups
+  with the memory's history. Malformed/missing peek paths still
+  fall back to 'imported' (real source unrecoverable).
+- **Coverage:** +8 tests across `moveMemory` (source_malformed +
+  io_error via chmod), `/memory delete shared`, `/memory promote
+  shared` (secret pattern + path traversal + 200-line cap), and
+  failure-message asserts for both promote and demote
+  target_exists (regression guards for the `promotee` /
+  `demotee` typos).
+
+---
+
 ## [2026-05-04] M3 / impl — memory visibility (count tray + untrusted warn marker)
 
 Continues the memory subsystem on the same branch. Two visibility

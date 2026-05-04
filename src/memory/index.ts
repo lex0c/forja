@@ -75,12 +75,19 @@ export type {
 export { writeMemory } from './writer.ts';
 export type { WriteMemoryInput, WriteMemoryResult, WriteWarning } from './writer.ts';
 
-export { findExpiredMemories, gcExpiredMemories, removeMemory } from './lifecycle.ts';
+export {
+  findExpiredMemories,
+  gcExpiredMemories,
+  moveMemory,
+  removeMemory,
+} from './lifecycle.ts';
 export type {
   ExpiredMemory,
   GcExpiredAuditOverride,
   GcExpiredOptions,
   GcExpiredResult,
+  MoveMemoryInput,
+  MoveMemoryResult,
   RemoveMemoryInput,
   RemoveMemoryResult,
 } from './lifecycle.ts';
@@ -91,3 +98,6 @@ export {
   shouldEagerLoadByTriggers,
 } from './triggers.ts';
 export type { BootContext, BootTrigger } from './triggers.ts';
+
+export { SHARED_BODY_LINE_CAP, scanForInjection, scanForPromotion } from './scanner.ts';
+export type { ScanResult } from './scanner.ts';

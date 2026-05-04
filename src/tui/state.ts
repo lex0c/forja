@@ -129,6 +129,7 @@ export interface ConfirmState {
     | 'trust'
     | 'memory-write'
     | 'memory-user-scope'
+    | 'memory-action'
     | 'plan-review'
     | 'critique'
     | 'history-clear';
@@ -897,6 +898,35 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
             subject: `${event.scope}/${event.name}`,
             preview: event.body.split('\n'),
             question: 'Save this memory entry?',
+            options,
+            selectedIndex: options.length - 1,
+            hints: ['Esc to cancel'],
+          },
+        },
+        permanent: [],
+      };
+    }
+
+    case 'memory:action:ask': {
+      // Generic confirm flavor for /memory delete | promote | demote
+      // (spec §5.4 / §5.5 / §6.3). Producer (slash command) supplies
+      // the title / subject / preview / question — reducer just
+      // mounts them. Conservative-default last-option (No) mirrors
+      // every other modal flavor.
+      const options: ConfirmOption[] = [
+        { key: '1', label: 'Yes, proceed', value: 'yes' },
+        { key: '2', label: 'No, cancel', value: 'no' },
+      ];
+      return {
+        state: {
+          ...state,
+          modal: {
+            promptId: event.promptId,
+            flavor: 'memory-action',
+            title: event.title,
+            subject: event.subject,
+            preview: event.preview,
+            question: event.question,
             options,
             selectedIndex: options.length - 1,
             hints: ['Esc to cancel'],

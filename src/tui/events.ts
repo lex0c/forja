@@ -266,6 +266,32 @@ export type MemoryUserScopeAskEvent = BaseEvent & {
   name: string;
   body: string;
 };
+
+// Generic confirmation modal for memory destructive / move
+// operations (spec MEMORY.md §6.3 + §5.4 + §5.5). One flavor with
+// caller-supplied copy lets `/memory delete`, `/memory promote
+// shared`, and `/memory demote local` share the modal pipeline
+// without each carrying a dedicated event type. The producer
+// (slash command) constructs `title` / `subject` / `preview` to
+// match the action; reducer just renders them. `action` lets
+// audit trace which operator path opened the modal — distinct
+// from `memory:write:ask` so the audit row's stage tag stays
+// unambiguous.
+export type MemoryActionAskEvent = BaseEvent & {
+  type: 'memory:action:ask';
+  promptId: string;
+  // Discriminator for audit + telemetry. Reducer doesn't branch
+  // on it; the slash command does to pick the right `action`
+  // value when emitting the resulting `memory_events` row.
+  action: 'delete' | 'promote' | 'demote';
+  title: string;
+  subject: string;
+  preview: string[];
+  // Question line under the preview ("Confirm delete?", "Promote
+  // to shared?", etc.). Producer-supplied so the wording matches
+  // the operation's verb tense.
+  question: string;
+};
 export type PlanReviewEvent = BaseEvent & {
   type: 'plan:review';
   promptId: string;
@@ -491,6 +517,7 @@ export type UIEvent =
   | TrustAskEvent
   | MemoryWriteAskEvent
   | MemoryUserScopeAskEvent
+  | MemoryActionAskEvent
   | PlanReviewEvent
   | CritiqueAskEvent
   | HistoryClearAskEvent
