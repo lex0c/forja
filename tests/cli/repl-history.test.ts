@@ -651,6 +651,97 @@ describe('repl — reverse-search overlay (HISTORY.md §2.2)', () => {
   });
 });
 
+describe('repl — mirror trim (cap enforcement)', () => {
+  test('mirror evicts oldest entries when submits exceed cap; recall walks only the surviving window', async () => {
+    // historyCapOverride threads the same cap into both storage and
+    // the mirror. With cap=3, after 5 submits the surviving slice is
+    // [p2, p3, p4]; ↑ keeps walking older until clamped at p2.
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+      historyCapOverride: 3,
+    });
+    await tick();
+    for (let i = 0; i < 5; i++) {
+      stdin.feed(`p${i}\r`);
+      await tick();
+      ra.finish(i);
+      await tick();
+    }
+    // Sanity vs persistence: storage trimmed to [p2, p3, p4]. Check
+    // BEFORE driving the recall path — Enter on a recalled entry
+    // submits and itself appends, which would reshape the table.
+    expect(loadHistory(db, PROJECT_CWD)).toEqual(['p2', 'p3', 'p4']);
+    // Pre-fix the mirror still held all 5 entries, so ↑×5 would land
+    // on p0 — which storage no longer has. Post-fix, ↑×5 clamps at p2.
+    stdin.feed(ARROW_UP);
+    stdin.feed(ARROW_UP);
+    stdin.feed(ARROW_UP);
+    stdin.feed(ARROW_UP);
+    stdin.feed(ARROW_UP);
+    await tick();
+    stdin.feed('\r');
+    await tick();
+    expect(ra.captured[5]?.configs[0]?.userPrompt).toBe('p2');
+    ra.finish(5);
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+
+  test('mirror cap matches storage cap exactly — no off-by-one drift', async () => {
+    // After exactly cap submits, the mirror should hold cap entries
+    // (no eviction yet). After cap+1, eviction kicks in and the
+    // mirror is back to cap.
+    const cap = 4;
+    const stdin = makeStdin();
+    const ra = makeRunAgent();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStubWithDb(db),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: () => undefined,
+      historyCapOverride: cap,
+    });
+    await tick();
+    for (let i = 0; i < cap; i++) {
+      stdin.feed(`x${i}\r`);
+      await tick();
+      ra.finish(i);
+      await tick();
+    }
+    // Submit one more — pushes mirror to cap+1, then trim back to cap.
+    stdin.feed(`x${cap}\r`);
+    await tick();
+    ra.finish(cap);
+    await tick();
+    // Verify by walking ↑ exactly `cap` times: the cap-th press
+    // should land on the oldest surviving entry (`x1`), not `x0`
+    // (which was evicted).
+    for (let i = 0; i < cap + 2; i++) {
+      stdin.feed(ARROW_UP);
+    }
+    await tick();
+    stdin.feed('\r');
+    await tick();
+    expect(ra.captured[cap + 1]?.configs[0]?.userPrompt).toBe('x1');
+    ra.finish(cap + 1);
+    await tick();
+    stdin.feed('\x04');
+    await promise;
+  });
+});
+
 describe('repl — /history on reload (boot disabled → re-enable)', () => {
   test('boot with .agent/no-history present + entries in db; /history on after marker removal repopulates the mirror', async () => {
     // Pre-stage: entries already in the db (operator was using history

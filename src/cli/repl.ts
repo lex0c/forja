@@ -25,6 +25,7 @@ import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/ind
 import { DEFAULT_BUDGET } from '../harness/types.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
 import {
+  HISTORY_CAP,
   appendHistory,
   historyOptOutReason,
   loadHistory,
@@ -115,6 +116,13 @@ export interface RunReplOptions {
   // doesn't have to wait that long. Undefined leaves the spec
   // default in place.
   trustPromptTimeoutMs?: number;
+  // Test seam: shrink the history cap so a regression test for
+  // mirror-trim doesn't need to drive 10k+ submits. Threaded into
+  // every appendHistory / loadHistory call AND the in-memory mirror
+  // trim so the two stay in lockstep. Production omits this and
+  // inherits HISTORY_CAP from `src/storage/history.ts` (env-overridable
+  // via FORJA_HISTORY_SIZE at module load).
+  historyCapOverride?: number;
 }
 
 // All UIEvents flow through to the bus. Earlier this filter dropped
@@ -458,7 +466,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // historyEnabled mirrors `/history off` / `/history on` — session-
   // volatile (HISTORY.md §3.3 level 3); permanent disable lives in
   // env / file marker, both honored inside storage/history.ts.
-  let historyEntries: string[] = loadHistory(db, baseConfig.cwd);
+  // Cap shared by storage and mirror — keeps both trims aligned so
+  // the in-memory recall pool never surfaces entries that have
+  // already been evicted from the table.
+  const historyCap = options.historyCapOverride ?? HISTORY_CAP;
+  let historyEntries: string[] = loadHistory(db, baseConfig.cwd, historyCap);
   let historyIdx: number | null = null;
   let historyScratch: string | null = null;
   // Seed `historyEnabled` from the storage-level opt-out so the
@@ -498,7 +510,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // Empty text never reaches this path — applyKey gates submit on
     // `value === ''` and the slash dispatcher gates on parsed.name === ''.
     try {
-      appendHistory(db, baseConfig.cwd, text);
+      appendHistory(db, baseConfig.cwd, text, { cap: historyCap });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       bus.emit({
@@ -510,6 +522,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     }
     if (historyEntries[historyEntries.length - 1] !== text) {
       historyEntries.push(text);
+      // Cap the mirror to match storage's trim. Without this, a
+      // long-running session accumulates an unbounded array, and
+      // ↑/Ctrl+R surface entries that storage has already evicted
+      // — recall succeeds in-session, then the same prompt vanishes
+      // on next REPL boot. splice(0, overflow) is in-place; cheap
+      // even at the 10k cap because it only fires on the boundary
+      // crossing (post-fix, length is always ≤ historyCap).
+      const overflow = historyEntries.length - historyCap;
+      if (overflow > 0) historyEntries.splice(0, overflow);
     }
   };
 
@@ -940,7 +961,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         const becomingEnabled = !historyEnabled && enabled;
         historyEnabled = enabled;
         if (becomingEnabled) {
-          historyEntries = loadHistory(db, baseConfig.cwd);
+          historyEntries = loadHistory(db, baseConfig.cwd, historyCap);
           historyIdx = null;
           historyScratch = null;
         }
