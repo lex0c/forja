@@ -5,7 +5,7 @@ import {
   createCheckpointManager,
   detectCheckpointSupport,
 } from '../checkpoints/index.ts';
-import { type HookEventPayload, dispatchChain } from '../hooks/index.ts';
+import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
 import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
@@ -232,18 +232,28 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // Hook chain dispatch (spec AGENTIC_CLI.md §10). All sites
   // funnel through this helper so the dispatcher's deps (db,
   // sessionId, cwd) are bound consistently and stray exceptions
-  // never leak past the harness boundary. Spec §10.3 line 1041:
-  // non-blocking events run fire-and-forget WRT decisions, but
-  // we still await here so the audit row lands before the
-  // session row is closed at finish() — without that, a
-  // legitimate hook execution can disappear from `hook_runs`
-  // because the DB closes underneath it. The wall-clock cap
-  // (15s) inside the dispatcher protects against runaway hooks
-  // adding latency to session boot or shutdown.
-  const fireHookChain = async (payload: HookEventPayload): Promise<void> => {
-    if (config.hooks === undefined || config.hooks.length === 0) return;
+  // never leak past the harness boundary. Returns the chain
+  // result so blocking-event call sites can inspect `blockedBy`
+  // and short-circuit; non-blocking sites just `void` the
+  // promise.
+  //
+  // Returns `null` when there are no hooks OR when the
+  // dispatcher itself throws — both surface as "no operator
+  // decision was made", which CONTRACTS.md §10 line 1057
+  // mandates as the fail-open behavior on chain failure
+  // ("continuação assume 'ninguém bloqueou' para eventos
+  // bloqueáveis; warning loggado").
+  //
+  // Spec §10.3 line 1041: non-blocking events run fire-and-
+  // forget WRT decisions, but we still await here in lifecycle
+  // sites so audit lands before the DB closes — without that,
+  // a legitimate hook can disappear from `hook_runs` because
+  // the DB closes underneath it. The wall-clock cap (15s) inside
+  // the dispatcher protects against runaway hooks adding latency.
+  const dispatchHooks = async (payload: HookEventPayload): Promise<HookChainResult | null> => {
+    if (config.hooks === undefined || config.hooks.length === 0) return null;
     try {
-      await dispatchChain(config.hooks, payload, config.cwd, {
+      return await dispatchChain(config.hooks, payload, config.cwd, {
         db: config.db,
         sessionId: sessionId.length > 0 ? sessionId : null,
       });
@@ -255,6 +265,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // the operator notices.
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`hooks: chain dispatch failed for ${payload.event}: ${msg}\n`);
+      return null;
     }
   };
 
@@ -324,7 +335,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     // (which only fires after the session_start emit, by which
     // point sessionId is guaranteed set).
     if (sessionId.length > 0) {
-      await fireHookChain({
+      await dispatchHooks({
         schema: 'v1',
         event: 'Stop',
         sessionId,
@@ -705,7 +716,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // that prints to stdout doesn't land before the UI's
       // session header. Awaited so audit lands; latency capped
       // by the dispatcher's chain timeout.
-      await fireHookChain({
+      await dispatchHooks({
         schema: 'v1',
         event: 'SessionStart',
         sessionId,
@@ -963,7 +974,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             // (add/commit on the shadow ref) are already
             // optimized; bound any operator latency to their
             // own hook timeout.
-            void fireHookChain({
+            void dispatchHooks({
               schema: 'v1',
               event: 'PreCheckpoint',
               sessionId,
@@ -1227,7 +1238,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               ...(config.confirmPermission !== undefined
                 ? { confirmPermission: config.confirmPermission }
                 : {}),
-              fireHook: fireHookChain,
+              fireHook: dispatchHooks,
               signal,
             },
           );

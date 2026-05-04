@@ -15,6 +15,130 @@ Format:
 
 ---
 
+## [2026-05-04] M3 / impl — hooks Slice 3: PreToolUse + PostToolUse (blocking flow + audit)
+
+Same branch (`feat/m3-hooks`). Adds the two events that turn the
+hooks subsystem into a real production gate: PreToolUse can BLOCK a
+tool call before invocation (first-block-wins, CONTRACTS.md §10
+line 1046), and PostToolUse logs after with the full result.
+Together they cover the "lint hook denies a `bash rm -rf`" /
+"prettier reformats after every write_file" use cases.
+
+**Done:**
+
+- **`dispatchHooks` returns `HookChainResult | null`** (replaces
+  the previous `fireHookChain` void shape). Non-blocking sites
+  `void` the promise; blocking sites await and inspect
+  `blockedBy`. Returns null when no hooks are configured OR the
+  dispatcher throws — fail-open per spec line 1057 ("continuação
+  assume 'ninguém bloqueou' para eventos bloqueáveis").
+
+- **PreToolUse wired in `invoke-tool.ts`** between the
+  permission-engine allow / user-confirm-yes branch and
+  `tool.execute`. When `chain.blockedBy !== null`:
+  - records a SECOND approval row with `decidedBy='hook'` +
+    `decision='deny'` so the audit trail shows BOTH the policy
+    allow AND the hook deny (operator can grep approvals to find
+    hook-blocked tool_calls)
+  - `finishToolCall(status='denied', error=hookReason)` so the
+    row's terminal state matches the outcome
+  - returns `failed: true, denied: true` so the harness's
+    `consecutive_errors` budget counts the block against the
+    model — same as a policy deny
+  - synthesizes a model-facing error block: operator's stdout
+    when `block_message`, generic `'denied by hook'` for
+    `block_silent` / `error+failClosed` / `timeout+failClosed`
+
+- **PostToolUse wired in `invoke-tool.ts`** as a fire-and-forget
+  `firePostToolUse(failed)` helper called AFTER the tool_call
+  row's terminal status persists. Two call sites: the
+  `isToolError || crashed` branch (failed=true) and the success
+  branch (failed=false). Operator hook receives `tool.name`,
+  `tool.input`, sanitized `tool.output`, plus the `failed` flag
+  for failure-case forensics.
+
+- **PostToolUse skipped on PreToolUse-block paths**. The block
+  branch returns before `tool.execute` runs, so no
+  `firePostToolUse` call is reachable. Test asserts: when
+  PreToolUse blocks, only PreToolUse rows land in `hook_runs` —
+  PostToolUse does not fire because there's no result to report.
+
+- **Tests** (`tests/harness/hooks-tools-integration.test.ts`,
+  12 cases). End-to-end through `runAgent` with real `sh -c`
+  commands. Coverage:
+  - PreToolUse exit 0 → tool runs; hook_runs row carries
+    `outcome=allow`, `matchedTool`
+  - PreToolUse exit 1 (block_silent) → tool body NEVER runs;
+    approvals shows `[policy:allow, hook:deny]`; tool_call
+    status=`denied`
+  - PreToolUse exit 2 (block_message) → operator stdout becomes
+    the audit reason; surfaces in approval.reason
+  - PreToolUse exit 7 + failClosed=true → blocks (treated as
+    silent)
+  - PreToolUse exit 7 + failClosed=false → does NOT block (log
+    only)
+  - First-block-wins: 3-hook chain `allow → block → allow` runs
+    only the first 2; third never executes
+  - Matcher `tool="echo"` → only fires for echo, leaves `other`
+    alone
+  - Matcher `tool="bash*"` → wildcard prefix matches `bash_run`
+  - PreToolUse stdin: payload includes
+    `data.tool.{name,input}` reaching the operator's command
+  - PostToolUse fires on success; payload has output + failed=false
+  - PostToolUse fires on tool error; payload.failed=true,
+    output carries the ToolError shape
+  - PostToolUse skipped when PreToolUse blocks
+
+**Decisions:**
+
+1. **Two approval rows on a hook-block, not one row updated.** The
+   approvals table has no UNIQUE on `tool_call_id`; multiple rows
+   per call are valid. Policy=allow + hook=deny tells a coherent
+   story for forensic queries: "the policy allowed this, but a
+   hook caught it". Updating the existing row to `deny` would
+   erase the policy decision.
+
+2. **Engine `decision` returned by invokeTool stays as engine's
+   answer.** Hook block sets `denied: true` instead. Renderers
+   can disambiguate via the (decision, denied) pair — same shape
+   they already use for confirm_no (`decision.kind=confirm,
+   denied=true` ≡ user said no).
+
+3. **PostToolUse doesn't fire when PreToolUse blocked.** Spec
+   doesn't mandate either way, but the operator's PostToolUse hook
+   exists to react to a tool's RESULT — there is no result when
+   the tool was blocked. Firing it with empty output would be a
+   contract violation; recording the block in `hook_runs` already
+   covers the audit need.
+
+4. **Sanitized output in PostToolUse payload.** The sanitization
+   (ANSI strip) that `sanitizeToolOutput` applies between the tool
+   body and the model context also lands in the hook payload —
+   operator's hook sees the same bytes the model sees (and the same
+   bytes that go in the tool_call row).
+
+**Pending:**
+
+- **Slice 4**: `UserPromptSubmit`, `PreCompact`, `MemoryWrite` —
+  remaining blocking events. UserPromptSubmit fires at the REPL
+  before the harness gets the prompt; PreCompact fires inside
+  `compactMessages`; MemoryWrite fires inside the `memory_write`
+  tool.
+
+- **Slice 5**: `/hooks list` + `/hooks audit` slash commands;
+  end-to-end locked-enforcement test (enterprise > user >
+  project).
+
+- **Subagent hook coverage**: in-process subagent path doesn't
+  see parent's hooks (test-only path). Subprocess subagents
+  re-bootstrap and get their own — production path. Documented
+  as a deliberate boundary; revisit if operators ask for parent
+  hooks to bracket subagent invocations.
+
+**Next:** Slice 4 — UserPromptSubmit + PreCompact + MemoryWrite.
+
+---
+
 ## [2026-05-04] M3 / impl — hooks Slice 2: 4 non-blocking events wired into harness
 
 Branch `feat/m3-hooks`. Builds on Slice 1 (foundation: types, paths, template,
