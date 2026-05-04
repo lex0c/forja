@@ -28,6 +28,7 @@ import { renderFooter } from './footer.ts';
 import { padFrame } from './frame.ts';
 import { renderInput } from './input.ts';
 import { renderModal } from './modal.ts';
+import { renderReverseSearch } from './reverse-search.ts';
 import { renderSlashPopover } from './slash-popover.ts';
 import { renderTodoList } from './todo-list.ts';
 import { renderToolCardLive } from './tool-card.ts';
@@ -250,6 +251,15 @@ export const composeLive: ComposeLive = (
   if (state.slash !== null) {
     appendBlock(renderSlashPopover(state.slash, caps));
   }
+  // Reverse-search overlay (HISTORY.md §2.2). Same slot as slash —
+  // they're mutually exclusive at the producer level (REPL refuses
+  // to open Ctrl+R while slash is active), so this branch and the
+  // one above never fire on the same frame. The input box below
+  // stays visible: operator's draft is preserved untouched while
+  // the overlay is up.
+  if (state.reverseSearch !== null) {
+    appendBlock(renderReverseSearch(state.reverseSearch, caps));
+  }
   // Always 1 blank line above the input block (rule + input + rule),
   // regardless of whether the upper live region has content. This
   // line ALSO separates the top of the input rule from whatever
@@ -262,8 +272,10 @@ export const composeLive: ComposeLive = (
   // Input is the single OUTDENTED element (UI.md §6.3 frame margin
   // exception). No padFrame here — the prompt `> ` lives at col 0
   // and the cursor lands at col 2, naturally anchored to the rest
-  // of the indented content's left edge.
-  lines.push(...renderInput(state.input, caps));
+  // of the indented content's left edge. When the reverse-search
+  // overlay is up, the input rows render dim (HISTORY.md §2.2) so
+  // the operator's draft is visibly preserved-but-secondary.
+  lines.push(...renderInput(state.input, caps, { dimmed: state.reverseSearch !== null }));
   lines.push(horizontalRule(caps));
   // renderFooter only returns null on modal (handled above); the
   // non-null assert keeps the contract explicit — if a future

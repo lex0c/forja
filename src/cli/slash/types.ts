@@ -55,6 +55,24 @@ export interface SlashContext {
   // startTurn). Read fresh per-call so a turn that started AFTER
   // the slash command was queued still reports correctly.
   isRunning: () => boolean;
+  // History controls (HISTORY.md §2.3). `/history off` / `/history on`
+  // toggle the session-volatile flag; `/history clear` invokes
+  // `clearLocal` AFTER the storage layer wipe so the in-memory
+  // mirror used by ↑/↓ recall is dropped in lockstep. Optional so
+  // tests / headless contexts that don't run the REPL editor can
+  // omit the wiring.
+  //
+  // `optOutReason` exposes the storage-level opt-out (env / file
+  // marker, HISTORY.md §3.3 levels 1+2) so `/history on` can refuse
+  // a no-op re-enable: if env says "off", flipping the session flag
+  // to "on" is a lie because the storage layer will keep no-opping.
+  // `null` = persistence is on at the storage level.
+  history?: {
+    isEnabled: () => boolean;
+    setEnabled: (enabled: boolean) => void;
+    clearLocal: () => void;
+    optOutReason: () => 'env' | 'file-marker' | null;
+  };
 }
 
 // Outcome of executing a command. The dispatcher emits any messages

@@ -22,21 +22,41 @@
 // width inconsistencies.
 
 import type { InputState } from '../state.ts';
-import type { Capabilities } from '../term.ts';
+import { type Capabilities, paint } from '../term.ts';
 import { wrapInputLine } from './wrap.ts';
 
 const PROMPT_PREFIX = '> ';
 const CONT_PREFIX = '  ';
 
-export const renderInput = (input: InputState, caps: Capabilities): string[] => {
+export interface RenderInputOptions {
+  // Render every row painted dim. Used when the reverse-search
+  // overlay is open (HISTORY.md §2.2 — the operator's draft is
+  // preserved below the overlay but visually faded so attention
+  // stays on the search line). Default false leaves the input in
+  // its normal palette.
+  dimmed?: boolean;
+}
+
+export const renderInput = (
+  input: InputState,
+  caps: Capabilities,
+  options: RenderInputOptions = {},
+): string[] => {
   const innerWidth = Math.max(1, caps.cols - PROMPT_PREFIX.length);
   const lines = input.value === '' ? [''] : input.value.split('\n');
   const out: string[] = [];
+  // When dimmed, every emitted row is wrapped with the dim SGR. We
+  // wrap the whole row (including the prompt prefix) so the prompt
+  // glyph fades along with the buffer — otherwise the bright `> `
+  // would still pull the operator's eye. paint() no-ops under
+  // color='none', so ASCII-only terminals stay unchanged.
+  const finish = (line: string): string =>
+    options.dimmed === true ? paint(caps, 'dim', line) : line;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] ?? '';
     const linePrefix = i === 0 ? PROMPT_PREFIX : CONT_PREFIX;
     if (line.length === 0) {
-      out.push(linePrefix);
+      out.push(finish(linePrefix));
       continue;
     }
     // Chunking via wrapInputLine — keeps surrogate pairs intact
@@ -51,7 +71,7 @@ export const renderInput = (input: InputState, caps: Capabilities): string[] => 
       const chunk = chunks[c];
       if (chunk === undefined) continue;
       const prefix = c === 0 ? linePrefix : CONT_PREFIX;
-      out.push(prefix + line.slice(chunk.start, chunk.end));
+      out.push(finish(prefix + line.slice(chunk.start, chunk.end)));
     }
   }
   return out;

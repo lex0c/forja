@@ -150,7 +150,7 @@ describe('dispatch', () => {
 });
 
 describe('createBuiltinRegistry', () => {
-  test('contains all 9 builtins', () => {
+  test('contains all 10 builtins', () => {
     const r = createBuiltinRegistry();
     const names = r.list().map((c) => c.name);
     expect(names).toEqual([
@@ -163,6 +163,7 @@ describe('createBuiltinRegistry', () => {
       'plan',
       'budget',
       'perms',
+      'history',
     ]);
   });
 
@@ -173,7 +174,7 @@ describe('createBuiltinRegistry', () => {
     if (help === undefined) return;
     const result = await help.exec([], makeCtx().ctx);
     if (result.kind !== 'ok') return;
-    // 9 commands → header + 9 rows + blank + emergency-exit footer = 12.
-    expect(result.notes?.length).toBe(12);
+    // 10 commands → header + 10 rows + blank + emergency-exit footer = 13.
+    expect(result.notes?.length).toBe(13);
   });
 });
