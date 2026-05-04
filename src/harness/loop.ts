@@ -1088,6 +1088,9 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ...(config.memoryRegistry !== undefined
               ? { memoryRegistry: config.memoryRegistry }
               : {}),
+            ...(config.confirmMemoryWrite !== undefined
+              ? { confirmMemoryWrite: config.confirmMemoryWrite }
+              : {}),
           };
 
           safeEmit(config.onEvent, {

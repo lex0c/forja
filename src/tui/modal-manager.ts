@@ -76,6 +76,22 @@ export interface HistoryClearAskArgs {
 }
 export type HistoryClearAnswer = 'yes' | 'yes-disable' | 'no' | 'cancel';
 
+// Memory-write flavor (MEMORY.md §5.1 modal). Producer is the
+// `memory_write` tool. The modal renders the `body` verbatim
+// (multi-line) plus the `scope/name` subject so the operator
+// reviews the exact bytes about to land on disk. `yes` =
+// persist via MemoryRegistry.write, `no` = explicit reject (audit
+// row gets `refused`), `cancel` = Esc/timeout (audit row gets
+// `refused` with reason='cancelled').
+export interface MemoryWriteAskArgs {
+  // Mirrors `MemoryScopeForUI` in events.ts. The values must stay
+  // in sync with `MemoryScope` from `src/memory/types.ts`.
+  scope: 'user' | 'project_shared' | 'project_local';
+  name: string;
+  body: string;
+}
+export type MemoryWriteAnswer = 'yes' | 'no' | 'cancel';
+
 // Trust flavor's option list. Kept in sync with the reducer's
 // `trust:ask` ConfirmState construction in state.ts.
 const TRUST_OPTIONS: readonly ConfirmOption[] = [
@@ -89,6 +105,17 @@ const HISTORY_CLEAR_OPTIONS: readonly ConfirmOption[] = [
   { key: '1', label: 'Yes, wipe', value: 'yes' },
   { key: '2', label: 'Yes, wipe and disable persistence', value: 'yes-disable' },
   { key: '3', label: 'No', value: 'no' },
+];
+
+// Memory-write flavor (MEMORY.md §5.1). Two options — persist the
+// proposed memory or skip. Default is the last (No), matching the
+// conservative-default convention used by every other confirm
+// flavor (D5/D65). Labels match what the reducer constructs in
+// `state.ts:869` so the manager's option list and the rendered
+// modal stay in sync.
+const MEMORY_WRITE_OPTIONS: readonly ConfirmOption[] = [
+  { key: '1', label: 'Yes, write memory', value: 'yes' },
+  { key: '2', label: 'No, skip', value: 'no' },
 ];
 
 // Permission flavor's option list, kept in sync with the reducer's
@@ -123,6 +150,15 @@ export interface ModalManager {
     args: HistoryClearAskArgs,
     opts?: ConfirmAskOptions,
   ) => Promise<HistoryClearAnswer>;
+  // Memory-write flavor (MEMORY.md §5.1). Producer is the
+  // `memory_write` tool. Caller (ToolContext.confirmMemoryWrite) maps
+  // the answer onto the writer: yes → MemoryRegistry.write,
+  // no/cancel → audit row `refused` (caller distinguishes 'no' from
+  // 'cancel' for telemetry).
+  askMemoryWrite: (
+    args: MemoryWriteAskArgs,
+    opts?: ConfirmAskOptions,
+  ) => Promise<MemoryWriteAnswer>;
   // Number of pending modals (active + queued). Tests inspect.
   pendingCount: () => number;
   // Drop the queue and resolve any pending promise as `cancel`. Used
@@ -376,6 +412,19 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           projectRoot: args.projectRoot,
         }),
         HISTORY_CLEAR_OPTIONS,
+        opts?.timeoutMs,
+      ),
+    askMemoryWrite: (args, opts) =>
+      enqueueConfirm<MemoryWriteAnswer>(
+        (promptId) => ({
+          type: 'memory:write:ask',
+          ts: now(),
+          promptId,
+          scope: args.scope,
+          name: args.name,
+          body: args.body,
+        }),
+        MEMORY_WRITE_OPTIONS,
         opts?.timeoutMs,
       ),
     pendingCount: () => (active !== null ? 1 : 0) + queue.length,

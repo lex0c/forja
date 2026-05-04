@@ -47,6 +47,25 @@ const bgTool = (name: string): Tool => ({
   },
 });
 
+// Tool factory for `requiresOperatorConfirm` flag tests. Mirrors
+// the shape of `memory_write` (writes:true, escapesCwd:true,
+// requiresOperatorConfirm:true) without pulling on its real impl.
+const confirmTool = (name: string): Tool => ({
+  name,
+  description: name,
+  inputSchema: { type: 'object' },
+  metadata: {
+    category: 'misc',
+    writes: true,
+    escapesCwd: true,
+    requiresOperatorConfirm: true,
+    idempotent: false,
+  },
+  async execute() {
+    return { ok: true };
+  },
+});
+
 const buildRegistry = (...tools: Tool[]) => {
   const r = createToolRegistry();
   for (const t of tools) r.register(t);
@@ -190,6 +209,22 @@ describe('validateSubagentTools', () => {
       const def = definition({ tools: ['bash_output'], isolation });
       expect(() => validateSubagentTools(def, reg)).not.toThrow();
     }
+  });
+
+  test('rejects requiresOperatorConfirm tools regardless of isolation', () => {
+    const reg = buildRegistry(confirmTool('memory_write'));
+    // Without isolation: rejected.
+    const defNone = definition({ tools: ['memory_write'] });
+    expect(() => validateSubagentTools(defNone, reg)).toThrow(
+      /tool 'memory_write' declares metadata\.requiresOperatorConfirm=true/,
+    );
+    // With worktree isolation: still rejected — worktree only
+    // contains filesystem effects; the missing piece is the modal
+    // pipe to the parent REPL.
+    const defWorktree = definition({ tools: ['memory_write'], isolation: 'worktree' });
+    expect(() => validateSubagentTools(defWorktree, reg)).toThrow(
+      /tool 'memory_write' declares metadata\.requiresOperatorConfirm=true/,
+    );
   });
 
   test("isolation: 'none' (default) keeps the writes:true refusal", () => {

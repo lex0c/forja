@@ -87,6 +87,7 @@ describe('bootstrap', () => {
         'memory_list',
         'memory_read',
         'memory_search',
+        'memory_write',
         'monitor',
         'read_file',
         'task',

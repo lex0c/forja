@@ -725,6 +725,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     return answer === 'yes' || answer === 'session-allow';
   };
 
+  // Bridge for the `memory_write` tool's confirm modal (MEMORY.md
+  // §5.1). Forwards scope/name/body straight into the modal and
+  // returns the operator's choice. The tool layer maps 'yes' onto
+  // a writer call, 'no'/'cancel' onto the audit row's
+  // refused-reason. We don't translate the answer here because
+  // the tool layer needs the raw discriminator for telemetry
+  // (no vs cancel distinction).
+  const confirmMemoryWrite = async (req: {
+    scope: 'user' | 'project_shared' | 'project_local';
+    name: string;
+    body: string;
+  }): Promise<'yes' | 'no' | 'cancel'> => modalManager.askMemoryWrite(req);
+
   const startTurn = (text: string): void => {
     if (running || exiting) return;
     running = true;
@@ -744,6 +757,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       softStopSignal: softStopController.signal,
       onEvent: (e) => onHarnessEvent(adapter, e),
       confirmPermission,
+      confirmMemoryWrite,
       ...(lastSessionId !== null ? { resumeFromSessionId: lastSessionId } : {}),
     };
     const runAgentImpl = options.runAgentOverride ?? runAgent;

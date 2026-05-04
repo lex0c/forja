@@ -16,6 +16,7 @@ describe('tool-vocab', () => {
       'memory_list',
       'memory_read',
       'memory_search',
+      'memory_write',
       'monitor',
       'read_file',
       'task',
@@ -57,6 +58,16 @@ describe('tool-vocab', () => {
     expect(TOOL_VOCAB.memory_list?.subject?.({ scope: 'project_local' })).toBe(
       'scope: project_local',
     );
+  });
+
+  test('memory_write surfaces scope/name as subject', () => {
+    expect(
+      TOOL_VOCAB.memory_write?.subject?.({ scope: 'project_local', name: 'no-console-log' }),
+    ).toBe('project_local/no-console-log');
+    // Falls back to whichever side is present.
+    expect(TOOL_VOCAB.memory_write?.subject?.({ name: 'just-name' })).toBe('just-name');
+    expect(TOOL_VOCAB.memory_write?.subject?.({ scope: 'user' })).toBe('user');
+    expect(TOOL_VOCAB.memory_write?.subject?.({})).toBeNull();
   });
 
   test('bash_output / bash_kill format pid as `pid <id>`', () => {

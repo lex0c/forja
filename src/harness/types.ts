@@ -357,7 +357,34 @@ export interface HarnessConfig {
     cwd: string;
     prompt: string;
   }) => Promise<boolean>;
+  // Async hook for memory_write modal confirmation (MEMORY.md §5.1).
+  // Caller resolves with the operator's decision so the tool layer
+  // can map it onto an audit row + the writer call. Per spec: 'yes'
+  // proceeds with the persist, 'no' is an explicit reject (audit
+  // gets `refused`), 'cancel' is an Esc/timeout (audit gets
+  // `refused` with reason='cancelled'). When unset, the
+  // memory_write tool falls back to "headless / no-modal", which
+  // per spec §5.1.6 means the write is rejected. Interactive
+  // callers (REPL) wire this to `modalManager.askMemoryWrite`;
+  // one-shot mode leaves it unset.
+  confirmMemoryWrite?: (req: ConfirmMemoryWriteRequest) => Promise<MemoryWriteAnswer>;
 }
+
+// Producer-facing args for `confirmMemoryWrite`. Mirrors
+// `MemoryWriteAskArgs` from modal-manager.ts but lives in the
+// harness layer so tools don't import the TUI module. The body is
+// the EXACT bytes about to land on disk; the modal renders it
+// verbatim so the operator can spot prompt-injection attempts
+// before approving.
+export interface ConfirmMemoryWriteRequest {
+  scope: 'user' | 'project_shared' | 'project_local';
+  name: string;
+  body: string;
+}
+
+// Same union as `MemoryWriteAnswer` in modal-manager.ts. Re-declared
+// here so the harness layer doesn't pull on the TUI module.
+export type MemoryWriteAnswer = 'yes' | 'no' | 'cancel';
 
 export interface HarnessResult {
   status: 'done' | 'interrupted' | 'exhausted' | 'error';

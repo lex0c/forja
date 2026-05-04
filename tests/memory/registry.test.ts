@@ -474,3 +474,134 @@ describe('createMemoryRegistry — reload', () => {
     expect(reg.list()).toHaveLength(2);
   });
 });
+
+describe('createMemoryRegistry — write', () => {
+  let db: DB;
+  let sessionId: string;
+
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+    sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+  });
+
+  test('persists, emits `created` audit, and refreshes snapshot', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+    const before = reg.list();
+    expect(before).toHaveLength(0);
+
+    const result = reg.write({
+      scope: 'project_local',
+      frontmatter: {
+        name: 'no-console-log',
+        description: 'no console.log in src/',
+        type: 'feedback',
+        source: 'inferred',
+      },
+      body: 'Body content here.',
+    });
+    expect(result.kind).toBe('created');
+
+    // Snapshot refreshed automatically.
+    const after = reg.list();
+    expect(after).toHaveLength(1);
+    expect(after[0]?.name).toBe('no-console-log');
+
+    const events = listMemoryEventsByName(db, 'no-console-log');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.action).toBe('created');
+    expect(events[0]?.scope).toBe('project_local');
+    expect(events[0]?.source).toBe('inferred');
+    expect(events[0]?.sessionId).toBe(sessionId);
+    expect(events[0]?.cwd).toBe('/p');
+    expect(events[0]?.details?.type).toBe('feedback');
+  });
+
+  test('emits `refused` with reason for shared_forbidden', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const result = reg.write({
+      scope: 'project_shared',
+      frontmatter: {
+        name: 'team-mem',
+        description: 'd',
+        type: 'feedback',
+        source: 'inferred',
+      },
+      body: 'b',
+    });
+    expect(result.kind).toBe('shared_forbidden');
+    const events = listMemoryEventsByName(db, 'team-mem');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.action).toBe('refused');
+    expect(events[0]?.details?.kind).toBe('shared_forbidden');
+    expect(events[0]?.details?.reason).toContain('promote');
+  });
+
+  test('emits `refused` for exists collision', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    mkdirSync(roots.projectLocal, { recursive: true });
+    writeFileSync(join(roots.projectLocal, 'dup.md'), 'something');
+    const reg = createMemoryRegistry({ roots, db, sessionId });
+    const result = reg.write({
+      scope: 'project_local',
+      frontmatter: {
+        name: 'dup',
+        description: 'd',
+        type: 'feedback',
+        source: 'inferred',
+      },
+      body: 'b',
+    });
+    expect(result.kind).toBe('exists');
+    const events = listMemoryEventsByName(db, 'dup');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.action).toBe('refused');
+    expect(events[0]?.details?.kind).toBe('exists');
+  });
+
+  test('per-call audit override wins over constructor-captured ids', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots, db, sessionId, cwd: '/p' });
+    const otherSession = createSession(db, { model: 'm2', cwd: '/q' }).id;
+    reg.write({
+      scope: 'user',
+      frontmatter: {
+        name: 'pref-x',
+        description: 'd',
+        type: 'user',
+        source: 'inferred',
+      },
+      body: 'b',
+      auditSessionId: otherSession,
+      auditCwd: '/q',
+    });
+    const events = listMemoryEventsByName(db, 'pref-x');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.sessionId).toBe(otherSession);
+    expect(events[0]?.cwd).toBe('/q');
+  });
+
+  test('does not emit audit when constructed without DB', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    const reg = createMemoryRegistry({ roots });
+    const result = reg.write({
+      scope: 'project_local',
+      frontmatter: {
+        name: 'no-db',
+        description: 'd',
+        type: 'feedback',
+        source: 'inferred',
+      },
+      body: 'b',
+    });
+    expect(result.kind).toBe('created');
+    // No db handle to assert on — just exercise the no-throw path.
+  });
+});

@@ -64,7 +64,13 @@ export type {
   MemoryRegistry,
   MemorySearchHit,
   ReadOptions,
+  RegistryEventInput,
   RegistryReadResult,
+  RegistryWriteResult,
   ScopeOption,
   SearchOptions,
+  WriteOptions,
 } from './registry.ts';
+
+export { writeMemory } from './writer.ts';
+export type { WriteMemoryInput, WriteMemoryResult, WriteWarning } from './writer.ts';

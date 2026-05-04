@@ -80,6 +80,18 @@ export interface ToolMetadata {
   // the parent's bg log dir, which is unsafe); 4.2b will revisit
   // by giving worktree subagents their own bg dir.
   requiresBgManager?: boolean;
+  // Tool needs an interactive operator confirmation surface to run
+  // (today only `memory_write`, which awaits the modal-bridge
+  // callback before persisting). Subagents are headless from the
+  // operator's perspective — they have no modal pipe back to the
+  // parent REPL — so a tool flagged this way has no path to run
+  // inside a subagent and the subagent validator rejects whitelists
+  // that include it. Distinct axis from `writes`: a write tool can
+  // run in a worktree-isolated subagent, but a confirm-bound tool
+  // can't run in ANY subagent until parent↔child IPC grows a
+  // confirm channel (spec §11). Defaults to false; only memory_write
+  // opts in today.
+  requiresOperatorConfirm?: boolean;
   idempotent: boolean;
   display?: DisplayHint;
   // Optional cost hints; informational only in M1.
@@ -134,6 +146,16 @@ export interface ToolContext {
   // logged to memory_events at the registry layer; the tool just
   // dispatches.
   memoryRegistry?: MemoryRegistry;
+  // Modal confirm hook for the `memory_write` tool (MEMORY.md §5.1).
+  // Set by the harness when `HarnessConfig.confirmMemoryWrite` is
+  // wired. Absent in headless / non-interactive runs — the
+  // memory_write tool then rejects with `headless_mode` per spec
+  // §5.1.6, mirroring the bgManager-absent pattern.
+  confirmMemoryWrite?: (req: {
+    scope: 'user' | 'project_shared' | 'project_local';
+    name: string;
+    body: string;
+  }) => Promise<'yes' | 'no' | 'cancel'>;
 }
 
 // Inputs the `task` tool passes through to the harness's subagent

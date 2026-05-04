@@ -126,6 +126,23 @@ export const TOOL_VOCAB: Readonly<Record<string, ToolVocab>> = {
     finalVerb: 'Searched memory',
     subject: (a) => str(a.query),
   },
+  memory_write: {
+    // Active verb says "proposing" because the tool only opens a
+    // confirm modal at this stage — nothing has hit disk yet. The
+    // final verb flips to "Wrote memory" on yes / "Skipped memory"
+    // — but the chip vocabulary is fixed per-tool and doesn't
+    // branch on the outcome (consistent with the rest of the
+    // table); the renderer surfaces the actual result via the
+    // tool's output envelope.
+    activeVerb: 'Proposing memory',
+    finalVerb: 'Proposed memory',
+    subject: (a) => {
+      const scope = str(a.scope);
+      const name = str(a.name);
+      if (scope !== null && name !== null) return `${scope}/${name}`;
+      return name ?? scope;
+    },
+  },
   todo_write: {
     activeVerb: 'Updating todos',
     finalVerb: 'Updated todos',

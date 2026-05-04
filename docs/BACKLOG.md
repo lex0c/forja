@@ -15,6 +15,181 @@ Format:
 
 ---
 
+## [2026-05-04] M3 / impl — memory write modal producer (closes D182)
+
+Modal `memory:write:ask` had reducer + render wired since the M2 modal-
+flavors slice but no producer. `memory_write` tool didn't exist; inferred-
+write proposals couldn't reach disk. This slice ships the producer end-to-
+end and persists confirmed memories.
+
+**Done:**
+
+- **Writer** (`src/memory/writer.ts`): pure `writeMemory(input) →
+  WriteMemoryResult` discriminated union. Path resolves through
+  `memoryFilePath` (re-applies sandbox per spec §7.2.6). Symlink defense
+  via `lstatSync` before any write — refuses to follow links at the
+  target path. Existence check via `lstatSync` (no overwrite; edits land
+  in 5.5). Body + index serialized in memory then written via
+  temp-rename for atomic body, sequential atomic write for the index.
+  Index regenerated from parsed entries (drift toward canonical hrefs
+  per index-file.ts SECURITY CONTRACT). `serializeIndex` 200-line cap
+  caught BEFORE either disk write so the cap-fail path leaves no
+  orphan body. `project_shared` rejected up front — promotion is the
+  only path into shared scope.
+- **Registry surface** (`src/memory/registry.ts`): `write()` method
+  dispatches to writer + emits `memory_events` (`created` on success,
+  `refused` with kind+reason in details on every non-success). Auto-
+  refreshes the in-memory snapshot on success so `list` / `lookup` see
+  the new entry. `recordEvent()` method for events not tied to a
+  `write()` call (`proposed` when modal opens, `refused` when scanner /
+  headless gate / modal-no fires).
+- **Tool** (`src/tools/builtin/memory-write.ts`): schema (name, scope,
+  type, source, description, body, optional expires). Source restricted
+  to `user_explicit` / `inferred` — `imported` is reserved for promotion
+  flow. Pipeline: aborted check → registry available → schema/shape
+  (re-runs `validateFrontmatter`) → `project_shared` reject (audit
+  refused stage=tool_gate) → injection/secret scanner (audit refused
+  stage=scanner; matched pattern hidden from model output to avoid
+  teaching bypass) → headless reject when `confirmMemoryWrite` absent
+  (audit refused stage=headless_gate) → emit `proposed` → modal confirm
+  → on yes, build frontmatter (apply +90d default for inferred + project
+  scope per spec §6.2) and call `registry.write()` → on no/cancel emit
+  `refused` stage=modal with reason=declined/cancelled. Outcome
+  surfaces as `{outcome: 'created'|'rejected', scope, name, path?,
+  reason}` so the model gets a structured response either way (vs
+  toolError on hard rejects).
+- **Injection scanner** (spec §7.3): substring match for "ignore
+  previous instructions", "ignore all previous", "you are now",
+  "from now on, always", "disregard prior", "forget previous".
+  Regex match for AWS access key id (`AKIA[0-9A-Z]{16}`), GitHub PATs
+  (`ghp_…`, `github_pat_…`), Anthropic keys (`sk-ant-…`), generic
+  OpenAI-shape (`sk-…{40,}`), Slack tokens (`xox[baprs]-…`). Match =
+  block + audit; `details.reason` carries the matched class for
+  operator review without echoing the literal pattern to the model.
+- **Modal manager** (`src/tui/modal-manager.ts`): `askMemoryWrite()` +
+  `MEMORY_WRITE_OPTIONS` (Yes / No, default last = No per D5
+  conservative convention). Args carry scope/name/body so the modal
+  renders the exact bytes about to land on disk.
+- **Threading**: `HarnessConfig.confirmMemoryWrite` →
+  `ToolContext.confirmMemoryWrite` via `loop.ts:1090`. Subagent child
+  intentionally NOT wired — subagents are headless from the operator's
+  perspective, so `memory_write` rejects with `headless_mode` if a
+  subagent calls it. Top-level REPL bridges via
+  `modalManager.askMemoryWrite` in `repl.ts:734`.
+- **Tool vocab**: `memory_write` → "Proposing memory" / "Proposed
+  memory", subject extracts `scope/name`.
+- **Tests:** 9 writer (happy path / project_shared reject / dup file /
+  symlink defense / sandbox / atomicity), 5 registry.write
+  (created+audit / shared_forbidden audit / exists audit / per-call
+  override / no-db no-throw), 18 tool (registry-unavailable, headless,
+  shared_forbidden, injection phrase, AWS key, GH PAT, modal yes
+  persists, modal no audits declined, modal cancel audits cancelled,
+  +90d default applied / not applied for user_explicit / honored when
+  explicit, user-scope writes don't touch project paths, registry list
+  refreshes, bad name rejected, imported source rejected, empty body
+  rejected, exists collision surfaced as memory.exists), 4 modal-
+  manager (event emission, default selection, hotkey "1" yes, Esc
+  cancel). Bootstrap tool count regression bumped 16 → 17. Tool-vocab
+  builtin list bumped to include memory_write. Total 2463 pass / 0
+  fail across 136 files; lint + typecheck clean.
+
+**Decisions:**
+
+- **No overwrite at writer level.** `exists` reject is a hard rule
+  even though the audit row makes the operator's edit history
+  visible. Spec §5.1 doesn't mention overwrite, and a "model proposes
+  the same name twice" path silently dropping the second proposal
+  would be a worse failure mode than an explicit reject. Edit /
+  upsert lands when `/memory edit` arrives in 5.5.
+- **`refused` carries `details.kind` + `details.reason` rather than
+  per-kind action enum.** `MemoryEventAction` is a closed union and
+  adding `refused_exists`, `refused_scanner`, etc. would be a
+  migration. The discriminator in details carries the same
+  information without schema churn; consumers (audit UI, future
+  `/memory audit` slash command) read `details.kind` to bucket.
+- **Tool returns structured `{outcome: 'rejected'}` for modal no /
+  cancel, NOT a tool error.** Modal-no is a normal lifecycle outcome
+  the model can reason about ("operator declined; don't propose this
+  again"); modeling it as an error would suggest the model retry,
+  which is wrong. Hard rejects (shared_forbidden, scanner, headless,
+  exists) DO surface as tool errors because they're shape-level
+  problems the model can fix on retry.
+- **Subagent child stays unwired for `memory_write`.** Modal-less
+  subagents shouldn't write to a global memory store the operator
+  hasn't reviewed. Per-subagent confirmation funneling through the
+  parent is plausible later (would require extending the IPC
+  channel) but adds surface area without a concrete operator
+  request behind it. For now: subagents read/list/search; only the
+  parent REPL writes.
+- **Audit row at `proposed` stage even when modal is dismissed
+  immediately.** Anchors the chronology — a `refused` row without a
+  prior `proposed` row would make the audit trail confusing
+  (refused-without-proposal looks like a scanner block, but only
+  scanner blocks have stage=scanner). The pair is the canonical
+  shape.
+
+**Post-review additions (2026-05-04):**
+
+- **Index drift warning (writer)**: `WriteMemoryResult.created` now
+  carries `warnings: WriteWarning[]`. `parseIndex` flags malformed
+  lines that get dropped on re-serialize; the writer surfaces them
+  as a `malformed_index_lines` warning. Registry's `write()`
+  forwards to stderr (`memory: index drift: dropped malformed lines
+  N, M in <scope>/MEMORY.md while upserting <name>`) so an operator
+  hand-edit in non-canonical shape doesn't silently disappear.
+  Failing the write would surprise the operator at the worst moment;
+  warning + persist is the right trade.
+- **Description scanner (tool)**: spec §7.3 names body as the scanner
+  surface, but description ALSO lands in MEMORY.md and is read eager
+  into the next session's system prompt — strictly more dangerous
+  than body content (which is lazy-loaded). Tool now scans both;
+  audit row carries `details.field` (`body` | `description`) so
+  operator-side investigation knows where the offending content was.
+- **Subagent validator (`requiresOperatorConfirm` flag)**: new
+  `ToolMetadata.requiresOperatorConfirm` flag set on `memory_write`.
+  Subagent validator (`src/subagents/validate.ts`) rejects whitelists
+  that include such tools regardless of isolation — worktree
+  contains filesystem effects but the missing piece is the modal
+  pipe to the parent's operator REPL, which subagents don't have
+  today. Catches the foot-gun at config / bootstrap time instead of
+  surfacing as a deferred `headless_mode` rejection at first
+  invocation. Will lift when spec §11 IPC grows a confirm channel.
+  Validator checks `requiresOperatorConfirm` BEFORE `writes` so the
+  more specific reason wins in the error message (a confirm-bound
+  tool that's also writes:true otherwise misleads the operator into
+  adding `isolation: worktree`, which doesn't unblock anything).
+
+**Out of scope (tracked):**
+
+- Hook `MemoryWrite` blocking event (spec §7.2.4): wires later when
+  the hooks subsystem grows the corresponding event point. Today the
+  scanner is the only programmatic gate.
+- Double-prompt for user-scope writes (spec §7.2.5): single modal
+  now. User-scope memories DO ship today; the second prompt for
+  scope confirmation arrives in a follow-up.
+- Hash-of-source-diff in `memory_events.details` (spec §7.2.3):
+  requires threading conversation hash through the tool layer.
+- `/memory save` slash command (spec §6.3, `user_explicit` source
+  path): this slice covers the tool-call producer for `inferred` /
+  `user_explicit` via tool args. Slash command lands separately.
+- Trust integration (spec §7.2.1: `inferred` writes blocked in
+  untrusted cwd). Decided against including in this slice — the
+  trust subsystem already runs at REPL boot and downstream `inferred`
+  writes can be filtered at the modal-bridge layer in a follow-up
+  without changing the tool's contract. Two-line change once the
+  Trust state is visible at `confirmMemoryWrite` time.
+- `MemoryRegistry.count()` for footer env-summary (BACKLOG D68
+  follow-up): unrelated to write.
+- Symlink defense at scope ROOT (not just target path): writer
+  validates the target via `lstatSync` but doesn't `realpathSync`
+  the scope root itself. Mitigation lives at config layer
+  (operator opt-in to non-default scope roots is rare); revisit if
+  the threat surfaces.
+
+**Branch:** `feat/m3-memory-write-modal`.
+
+---
+
 ## [2026-05-04] M2 / impl — REPL input history (HISTORY.md)
 
 Spec já existia desde 2026-05-03 (entrada `M2 / spec`); operator marcou como prioridade pra fechar o gap "rodar ↑ no REPL e recuperar prompt anterior". Slice atravessa storage / TUI / REPL inteira.

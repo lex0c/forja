@@ -1,5 +1,5 @@
 import type { DB } from '../storage/db.ts';
-import { createMemoryEvent } from '../storage/repos/memory-events.ts';
+import { type MemoryEventAction, createMemoryEvent } from '../storage/repos/memory-events.ts';
 import {
   type MemoryFileResult,
   type ScopeIndexResult,
@@ -8,7 +8,14 @@ import {
   readMemoryByName,
 } from './loader.ts';
 import type { ScopeRoots } from './paths.ts';
-import type { IndexEntry, MemoryFile, MemoryScope } from './types.ts';
+import type {
+  IndexEntry,
+  MemoryFile,
+  MemoryFrontmatter,
+  MemoryScope,
+  MemorySource,
+} from './types.ts';
+import { type WriteMemoryResult, writeMemory } from './writer.ts';
 
 // In-process snapshot of resolved memories across the three scopes.
 //
@@ -79,6 +86,30 @@ export interface MemoryRegistry {
   // (e.g. operator just ran `/memory promote shared` in another
   // session and wants the current session's view to refresh).
   reload(): void;
+
+  // Persist a new memory after the producer (tool layer) has
+  // already gated injection scanning + headless rejection +
+  // operator confirmation. Calls `writeMemory` (sandbox-checked,
+  // atomic body+index write) and emits `memory_events` with
+  // action=`created` on success or `refused` on any non-success
+  // outcome (with the kind + reason in `details`). Auto-reloads
+  // the in-memory snapshot on success so subsequent `list` /
+  // `lookup` / `read` calls see the new entry without an explicit
+  // `reload()`.
+  //
+  // Per-call audit overrides forward `sessionId` / `cwd` like the
+  // read path; the tool layer always passes them from ToolContext.
+  write(input: WriteOptions): RegistryWriteResult;
+
+  // Emit a `memory_events` row WITHOUT touching disk. Used by the
+  // tool layer for events that happen alongside (or instead of) a
+  // write: the `proposed` row when the modal opens, the `refused`
+  // row when the operator rejects via modal answer, and the
+  // `refused` row when the injection scanner / headless gate
+  // blocks the write before it reaches `write()`. Best-effort —
+  // silently no-ops when the registry was constructed without a
+  // db handle.
+  recordEvent(input: RegistryEventInput): void;
 }
 
 export interface ListOptions {
@@ -111,6 +142,48 @@ export interface SearchOptions extends AuditOverride {
   scope?: MemoryScope;
   deep?: boolean;
   limit?: number;
+}
+
+// Inputs to `MemoryRegistry.write()`. The registry layer is
+// agnostic about whether the proposal came from a tool call,
+// `/memory save`, or a future import flow — its only job is to
+// dispatch to `writeMemory` and emit the audit row. The tool
+// layer (and slash command, when it lands) is responsible for
+// any pre-write gating: injection scanner, headless rejection,
+// trust-untrusted-cwd guard, modal confirmation. Reaching this
+// method without those gates is a programmer bug, not a
+// runtime condition the registry can recover from.
+export interface WriteOptions extends AuditOverride {
+  scope: MemoryScope;
+  frontmatter: MemoryFrontmatter;
+  body: string;
+  // Optional MEMORY.md row overrides; defaults derived from
+  // frontmatter.name / frontmatter.description. See
+  // writer.ts buildIndexEntry.
+  indexTitle?: string;
+  indexHook?: string;
+}
+
+// Discriminated outcome of `MemoryRegistry.write()`. Mirrors
+// `WriteMemoryResult` but is exported under the registry surface
+// so callers don't import the writer directly. The tool layer
+// uses the `kind` to map onto a model-facing tool error and the
+// audit row's `details.reason`.
+export type RegistryWriteResult = WriteMemoryResult;
+
+// Generic audit emission. Used by the tool layer for `proposed`
+// (modal opened) and `refused` (modal answered no/cancel,
+// injection scanner blocked, headless gate blocked) — events
+// that are NOT tied to a `write()` call. The registry's `write()`
+// method already emits `created` / `refused` for the persist
+// path; callers should NOT use `recordEvent` for those cases or
+// the row will double-up.
+export interface RegistryEventInput extends AuditOverride {
+  action: MemoryEventAction;
+  scope: MemoryScope;
+  memoryName: string;
+  source: MemorySource;
+  details?: Record<string, unknown>;
 }
 
 export type RegistryReadResult =
@@ -413,5 +486,149 @@ export const createMemoryRegistry = (input: CreateMemoryRegistryInput): MemoryRe
     reload(): void {
       refresh();
     },
+
+    write(opts: WriteOptions): RegistryWriteResult {
+      // Dispatch to the writer. All path / sandbox / atomic-write
+      // logic lives there; the registry only adds audit + snapshot
+      // refresh.
+      const result = writeMemory({
+        roots,
+        scope: opts.scope,
+        frontmatter: opts.frontmatter,
+        body: opts.body,
+        ...(opts.indexTitle !== undefined ? { indexTitle: opts.indexTitle } : {}),
+        ...(opts.indexHook !== undefined ? { indexHook: opts.indexHook } : {}),
+      });
+
+      // Audit emission. Same defensive try/catch as `auditRead`:
+      // an audit failure must not invalidate a successful write
+      // (the body + index already hit disk). For `refused`
+      // outcomes the audit IS the operator's only signal, but
+      // the writer also returned the result to the caller so the
+      // tool layer can still surface a model-facing error if the
+      // db write fails. AUDIT DRIFT mirrors the same stderr
+      // pattern.
+      const effectiveSessionId = opts.auditSessionId ?? sessionId ?? null;
+      const effectiveCwd = opts.auditCwd ?? cwd ?? null;
+      if (db !== undefined) {
+        try {
+          if (result.kind === 'created') {
+            createMemoryEvent(db, {
+              scope: opts.scope,
+              action: 'created',
+              memoryName: opts.frontmatter.name,
+              source: opts.frontmatter.source,
+              sessionId: effectiveSessionId,
+              cwd: effectiveCwd,
+              details: {
+                path: result.path,
+                href: result.href,
+                type: opts.frontmatter.type,
+                ...(opts.frontmatter.expires !== undefined
+                  ? { expires: opts.frontmatter.expires }
+                  : {}),
+                ...(opts.frontmatter.trust !== undefined ? { trust: opts.frontmatter.trust } : {}),
+              },
+            });
+          } else {
+            // Every non-success outcome lands as `refused` with the
+            // kind discriminator + a human-readable reason. The
+            // alternative was a per-kind action (`exists` →
+            // `refused_exists`, etc.) but `MemoryEventAction` is a
+            // closed union and adding entries is a migration; the
+            // discriminator in `details.reason` carries the same
+            // information without schema churn.
+            const reason = describeWriteFailure(result);
+            createMemoryEvent(db, {
+              scope: opts.scope,
+              action: 'refused',
+              memoryName: opts.frontmatter.name,
+              source: opts.frontmatter.source,
+              sessionId: effectiveSessionId,
+              cwd: effectiveCwd,
+              details: { kind: result.kind, reason },
+            });
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          process.stderr.write(
+            `memory: AUDIT DRIFT: failed to record ${result.kind === 'created' ? 'created' : 'refused'} event for ${opts.frontmatter.name} (${opts.scope}): ${msg}\n`,
+          );
+        }
+      }
+
+      // Refresh the in-memory snapshot on success so the new
+      // entry shows up in subsequent `list` / `lookup` calls
+      // within the same session. On failure the snapshot is
+      // unchanged.
+      if (result.kind === 'created') {
+        refresh();
+        // Non-fatal warnings (today: malformed MEMORY.md lines that
+        // were dropped on re-serialize) go to stderr so the operator
+        // sees them. Silent drop would be data loss; failing the
+        // write would surprise the operator at the worst moment
+        // (model just proposed a useful memory). The audit row's
+        // `details` doesn't carry these because the warning is
+        // about lines OPERATOR wrote, not about this write — but
+        // the stderr line gives the line numbers for hand-fix.
+        for (const warning of result.warnings) {
+          if (warning.kind === 'malformed_index_lines') {
+            process.stderr.write(
+              `memory: index drift: dropped malformed lines ${warning.lines.join(', ')} in ${opts.scope}/MEMORY.md while upserting ${opts.frontmatter.name}; hand-fix the file shape\n`,
+            );
+          }
+        }
+      }
+
+      return result;
+    },
+
+    recordEvent(input: RegistryEventInput): void {
+      if (db === undefined) return;
+      const effectiveSessionId = input.auditSessionId ?? sessionId ?? null;
+      const effectiveCwd = input.auditCwd ?? cwd ?? null;
+      try {
+        createMemoryEvent(db, {
+          scope: input.scope,
+          action: input.action,
+          memoryName: input.memoryName,
+          source: input.source,
+          sessionId: effectiveSessionId,
+          cwd: effectiveCwd,
+          ...(input.details !== undefined ? { details: input.details } : {}),
+        });
+      } catch (err) {
+        // Same defensive pattern as auditRead — audit failures
+        // must not throw past this seam. The caller has no
+        // recovery path; surfacing on stderr is the convention.
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(
+          `memory: AUDIT DRIFT: failed to record ${input.action} event for ${input.memoryName} (${input.scope}): ${msg}\n`,
+        );
+      }
+    },
   };
+};
+
+// Map a `WriteMemoryResult` non-success variant to a one-line
+// reason string. Stable across releases — UI / audit consumers
+// may match on these strings. Hoisted out of the closure so
+// tests can import it.
+const describeWriteFailure = (result: WriteMemoryResult): string => {
+  switch (result.kind) {
+    case 'created':
+      return 'created';
+    case 'exists':
+      return `memory already exists at ${result.path}`;
+    case 'shared_forbidden':
+      return 'direct writes to project_shared are forbidden; use /memory promote';
+    case 'sandbox_violation':
+      return result.reason;
+    case 'symlink_refused':
+      return `target path is a symlink: ${result.path}`;
+    case 'index_full':
+      return `MEMORY.md hard cap reached (${result.current}/${result.cap}); evict before writing`;
+    case 'io_error':
+      return result.reason;
+  }
 };

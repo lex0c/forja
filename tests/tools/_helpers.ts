@@ -24,4 +24,7 @@ export const makeCtx = (overrides: Partial<ToolContext> = {}): ToolContext => ({
   ...(overrides.todoStore !== undefined ? { todoStore: overrides.todoStore } : {}),
   ...(overrides.spawnSubagent !== undefined ? { spawnSubagent: overrides.spawnSubagent } : {}),
   ...(overrides.memoryRegistry !== undefined ? { memoryRegistry: overrides.memoryRegistry } : {}),
+  ...(overrides.confirmMemoryWrite !== undefined
+    ? { confirmMemoryWrite: overrides.confirmMemoryWrite }
+    : {}),
 });
