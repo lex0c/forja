@@ -134,3 +134,17 @@ export type {
   MemoryEventScope,
   MemoryEventSource,
 } from './repos/memory-events.ts';
+
+export {
+  createHookRun,
+  listHookRunsByEvent,
+  listHookRunsBySession,
+  listRecentHookRuns,
+} from './repos/hook-runs.ts';
+export type {
+  CreateHookRunInput,
+  HookRun,
+  HookRunsEvent,
+  HookRunsLayer,
+  HookRunsOutcome,
+} from './repos/hook-runs.ts';
