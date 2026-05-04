@@ -129,6 +129,132 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     return 1;
   }
 
+  // ─── Pre-bootstrap stack ─────────────────────────────────────────
+  // Renderer + bus + modal-manager are constructed BEFORE bootstrap
+  // so the first-run trust prompt can render without bootstrap
+  // having read any cwd-rooted files. Spec §9.1 makes the trust
+  // gate an upstream check: an untrusted workspace must not
+  // influence startup parsing (project policy.yaml, subagent
+  // markdown, memory tree) before the operator approves the
+  // directory. Reproduced bug shape: `bootstrap()` calls
+  // `resolvePolicy({ cwd })` and `loadSubagents({ cwd })` which
+  // both read files from the (possibly malicious) cwd; with the
+  // prompt landing AFTER bootstrap, the operator's "no" answer
+  // happened only after those parses had already executed.
+  //
+  // None of these constructors depend on bootstrap output —
+  // verified by inspection. The stdin pump's onData closure
+  // references `running`, `exiting`, etc. which we declare upfront
+  // with safe defaults; bootstrap-dependent state (running turn,
+  // abort controllers, slash registry) is registered later.
+  const bus = createBus();
+  const focusStack = createFocusStack();
+  const renderer = createRenderer({
+    bus,
+    caps,
+    stdin,
+    ...(options.rendererWrite !== undefined ? { write: options.rendererWrite } : {}),
+  });
+  // Forward reference: triggerInterrupt is defined post-bootstrap
+  // (it depends on per-turn abortController). Default no-op covers
+  // calls that arrive during the trust modal — there's no run to
+  // interrupt yet.
+  let onModalInterrupt: () => void = () => undefined;
+  const modalManager = createModalManager({
+    bus,
+    focusStack,
+    onInterrupt: () => onModalInterrupt(),
+  });
+
+  // Stdin pump + parser. The same `onData` covers both the trust
+  // prompt phase and the full REPL — only the focus-stack
+  // contents differ between phases (trust modal pushes a handler
+  // during askTrust; the editor handler is registered later).
+  // Lifecycle state (`exiting`, `running`) is hoisted here too so
+  // both phases share one source of truth.
+  let exiting = false;
+  let exitCode = 0;
+  let resolveExit: () => void = () => {};
+  const exitPromise = new Promise<void>((r) => {
+    resolveExit = r;
+  });
+  let running = false;
+
+  const ESC_DRAIN_MS = 30;
+  let drainTimer: ReturnType<typeof setTimeout> | null = null;
+  const cancelDrain = (): void => {
+    if (drainTimer !== null) {
+      clearTimeout(drainTimer);
+      drainTimer = null;
+    }
+  };
+  const parser = createKeyParser();
+  const onData = (chunk: Buffer): void => {
+    if (chunk.includes(0x1c)) {
+      try {
+        if (typeof stdin.setRawMode === 'function') stdin.setRawMode(false);
+        process.stdout.write('\x1b[?2004l');
+        process.stderr.write('\nforja: panic exit (Ctrl+\\)\n');
+      } catch {}
+      process.exit(130);
+    }
+    if (exiting) return;
+    cancelDrain();
+    const events = parser.feed(chunk);
+    for (const ev of events) focusStack.dispatch(ev);
+    if (parser.bufferLength() > 0) {
+      drainTimer = setTimeout(() => {
+        drainTimer = null;
+        if (exiting) return;
+        const drained = parser.tryResolveLoneEsc();
+        for (const ev of drained) focusStack.dispatch(ev);
+      }, ESC_DRAIN_MS);
+    }
+  };
+  stdin.on('data', onData);
+  if (typeof stdin.resume === 'function') stdin.resume();
+
+  // ─── Trust prompt (AGENTIC_CLI §9.1) ─────────────────────────────
+  // First-run gate. The cwd checked here MUST match the cwd
+  // bootstrap will subsequently read project files from — same
+  // string trusts the same directory. When bootstrapOverride is
+  // injected (test fixtures), pull cwd from its already-resolved
+  // config; otherwise derive it the same way bootstrap will
+  // (process.cwd() default). Threaded into bootstrap below so the
+  // values stay coherent.
+  const cwd = options.bootstrapOverride?.config.cwd ?? process.cwd();
+  const trustPath =
+    options.trustListPathOverride !== undefined ? options.trustListPathOverride : trustListPath();
+  const cwdAlreadyTrusted = trustPath !== null && isTrusted(trustPath, cwd);
+  if (options.skipTrustPrompt !== true && !cwdAlreadyTrusted) {
+    const answer = await modalManager.askTrust({ path: cwd });
+    if (answer !== 'yes') {
+      // Operator declined. Cleanup the partial setup — no DB, no
+      // harness, no editor handler to tear down. Manual cleanup
+      // because shutdown() (defined post-bootstrap) references
+      // db/runningPromise/etc. that don't exist yet.
+      cancelDrain();
+      modalManager.close();
+      renderer.close();
+      stdin.removeListener('data', onData);
+      if (typeof stdin.pause === 'function') stdin.pause();
+      return 0;
+    }
+    if (trustPath !== null) {
+      try {
+        addTrustedDir(trustPath, cwd);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        bus.emit({
+          type: 'warn',
+          ts: now(),
+          message: `failed to persist trust for ${cwd}: ${msg} (will re-prompt next boot)`,
+        });
+      }
+    }
+  }
+
+  // ─── Bootstrap ───────────────────────────────────────────────────
   // Bootstrap once. The empty initial prompt is a placeholder — the
   // harness loop tolerates an empty `userPrompt` (skips appending the
   // user message), and we override `userPrompt` per turn before
@@ -141,6 +267,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       options.bootstrapOverride ??
       bootstrap({
         prompt: '',
+        // Pin bootstrap's cwd to the same string we trust-checked
+        // above. Without this they'd both default to process.cwd()
+        // independently and stay coherent in practice, but pinning
+        // makes the invariant load-bearing rather than coincidental.
+        cwd,
         ...(args.model !== undefined ? { modelId: args.model } : {}),
         ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
         ...(args.plan === true ? { plan: true } : {}),
@@ -191,39 +322,11 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     ...(baseConfig.planMode === true ? { planMode: true } : {}),
   });
 
-  const bus = createBus();
-  const focusStack = createFocusStack();
-  const renderer = createRenderer({
-    bus,
-    caps,
-    stdin,
-    ...(options.rendererWrite !== undefined ? { write: options.rendererWrite } : {}),
-  });
-  // Modal manager owns the permission/trust/etc modal lifecycle.
-  // The harness ↔ modal bridge runs through `confirmPermission` (defined
-  // below): the harness's permission engine returns `{kind: 'confirm'}`,
-  // invokeTool calls `cfg.confirmPermission(...)`, that bridge calls
-  // `modalManager.askPermission(...)`, modal-manager emits `permission:ask`
-  // → reducer paints → operator answers via focus stack → modal-manager
-  // resolves the askPermission promise → confirmPermission returns
-  // boolean to the harness. End-to-end wiring is exercised by the
-  // confirmPermission-bridge test in tests/cli/repl.test.ts.
-  //
-  // onInterrupt is a forward reference: triggerInterrupt is defined
-  // further down (it depends on abortController + softStopController
-  // which are declared per-turn). The let-binding indirection lets
-  // modal-manager call into the real interrupt path lazily — by the
-  // time a modal opens and the operator hits Ctrl+C, the per-turn
-  // controllers exist and triggerInterrupt does the right thing.
-  // No-op default for the (rare) call-before-startTurn race.
-  let onModalInterrupt: () => void = () => undefined;
-  const modalManager = createModalManager({
-    bus,
-    focusStack,
-    onInterrupt: () => onModalInterrupt(),
-  });
-
-  let running = false;
+  // bus / focusStack / renderer / modalManager / parser / `running`
+  // / `exiting` / `exitCode` / `resolveExit` / `exitPromise` /
+  // `onData` / `cancelDrain` / `onModalInterrupt` are all hoisted
+  // above the trust prompt — see "Pre-bootstrap stack" earlier in
+  // this function.
   let lastSessionId: string | null = null;
   // Two controllers per turn (spec UI.md §3 soft/hard distinction):
   //   abortController     → hard, preempts in-flight work (mid-tool kill,
@@ -256,12 +359,6 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // `abortController`, etc., breaking interrupts and allowing
   // concurrent submits.
   let activeTurnToken: symbol | null = null;
-  let exiting = false;
-  let exitCode = 0;
-  let resolveExit: () => void = () => {};
-  const exitPromise = new Promise<void>((r) => {
-    resolveExit = r;
-  });
 
   const onHarnessEvent = (
     adapter: HarnessAdapter,
@@ -815,84 +912,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   };
   focusStack.push(editorHandler);
 
-  // Stdin pump: feed bytes into the parser, dispatch each parsed key
-  // through the focus stack. Bracketed paste handled inside the
-  // parser (one `paste` event per chunk).
-  //
-  // Lone-ESC drain. The parser holds a single `\x1b` waiting to
-  // disambiguate between an Escape keypress and the start of a CSI
-  // / SS3 / Alt+char sequence — both begin with `\x1b`. Without a
-  // delayed drain, an Esc keystroke alone never resolves: the
-  // buffer holds it indefinitely, the soft-interrupt cue never
-  // fires, AND the next keystroke combines with the held ESC to
-  // emit Alt+<char> instead of `<char>` — input visibly stops
-  // accepting input. Convention (xterm KeyboardWait): if no follow-
-  // up byte arrives within ~25-100ms, treat the held ESC as a
-  // standalone Escape keypress. We pick 30ms — short enough that
-  // the operator doesn't notice the delay on a deliberate Esc,
-  // long enough to absorb the latency between the leader and the
-  // params of a multi-byte sequence delivered across two `data`
-  // events (e.g., over SSH).
-  const parser = createKeyParser();
-  const ESC_DRAIN_MS = 30;
-  let drainTimer: ReturnType<typeof setTimeout> | null = null;
-  const cancelDrain = (): void => {
-    if (drainTimer !== null) {
-      clearTimeout(drainTimer);
-      drainTimer = null;
-    }
-  };
-  const onData = (chunk: Buffer): void => {
-    // Panic key (Ctrl+\\, byte 0x1c). Bypasses every gate (running,
-    // modal, focus stack, exit-arm timer, shutdown awaits) and exits
-    // immediately. Convention from POSIX SIGQUIT — "I really want
-    // out". In raw mode the terminal driver delivers 0x1c as a
-    // literal byte (signal generation disabled by setRawMode), so
-    // Node never sees a SIGQUIT — we have to recognize the byte
-    // ourselves. Trade-off accepted: any in-flight turn's audit/DB
-    // state may stay 'running' since we skip shutdown's cleanup
-    // chain. That's the explicit cost of having a guaranteed
-    // escape hatch when the normal interrupt ladder doesn't work.
-    //
-    // Checked BEFORE the exiting guard / parser / focusStack so it
-    // works even when the rest of the pipeline is wedged.
-    if (chunk.includes(0x1c)) {
-      try {
-        if (typeof stdin.setRawMode === 'function') stdin.setRawMode(false);
-        // Disable bracketed paste so the operator's shell isn't
-        // left in paste mode after our exit. `\x1b[?2004l` is the
-        // standard sequence; written directly to bypass any
-        // higher-level wrapper that might be in a broken state.
-        process.stdout.write('\x1b[?2004l');
-        process.stderr.write('\nforja: panic exit (Ctrl+\\)\n');
-      } catch {
-        // Ignore — we're exiting regardless.
-      }
-      process.exit(130);
-    }
-    if (exiting) return;
-    cancelDrain();
-    const events = parser.feed(chunk);
-    for (const ev of events) focusStack.dispatch(ev);
-    if (parser.bufferLength() > 0) {
-      drainTimer = setTimeout(() => {
-        drainTimer = null;
-        if (exiting) return;
-        // Narrow drain: ONLY resolve the lone-ESC ambiguity. The
-        // full `parser.drain()` (used at shutdown) clears paste
-        // state too — calling it here would truncate a paste
-        // delivered in chunks separated by more than ESC_DRAIN_MS
-        // (slow SSH links, large clipboard payloads), silently
-        // corrupting submitted input. `tryResolveLoneEsc` is the
-        // surgical version: emits Escape iff the buffer is exactly
-        // `\x1b` outside of paste mode, no-op otherwise.
-        const drained = parser.tryResolveLoneEsc();
-        for (const ev of drained) focusStack.dispatch(ev);
-      }, ESC_DRAIN_MS);
-    }
-  };
-  stdin.on('data', onData);
-  if (typeof stdin.resume === 'function') stdin.resume();
+  // Stdin pump (parser, drain timer, panic-key check, lone-ESC
+  // resolution) is hoisted to the pre-bootstrap stack — it's
+  // already attached to stdin by the time we reach here, with the
+  // editor handler joining the focus stack just above.
 
   // SIGINT path. Fires when stdin is NOT in raw mode (e.g., during
   // certain modal lifecycles where the renderer pauses raw input)
@@ -953,53 +976,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     env,
   });
 
-  // Trust prompt (AGENTIC_CLI.md §9.1). First time the operator
-  // opens forja in a directory, ask before running anything that
-  // could touch the filesystem. The list of trusted dirs persists
-  // in `~/.config/agent/trusted_dirs.json` (or the platform
-  // equivalent); subsequent boots from the same cwd skip the
-  // prompt.
-  //
-  // Headless / pipe modes: skip the prompt entirely. The REPL is
-  // gated to TTY-only earlier (line ~150), so by the time we land
-  // here we know an interactive terminal is available. If trust
-  // storage path can't be derived (no HOME, no XDG_CONFIG_HOME,
-  // no APPDATA — pathological env), fall through to per-session
-  // trust: the prompt fires on every boot and approval doesn't
-  // persist. Caller still gets the safety prompt; only the
-  // memoization is lost.
-  const trustPath =
-    options.trustListPathOverride !== undefined ? options.trustListPathOverride : trustListPath();
-  const cwdAlreadyTrusted = trustPath !== null && isTrusted(trustPath, baseConfig.cwd);
-  if (options.skipTrustPrompt !== true && !cwdAlreadyTrusted) {
-    const answer = await modalManager.askTrust({ path: baseConfig.cwd });
-    if (answer !== 'yes') {
-      // Operator declined or pressed Esc. Exit cleanly without
-      // entering the REPL: db.close, renderer.close, raw mode off.
-      // Use the shutdown path so every cleanup hook runs (mirror of
-      // /quit). exitCode=0 for "user opted out", not an error.
-      exitCode = 0;
-      requestShutdown();
-      await exitPromise;
-      return exitCode;
-    }
-    if (trustPath !== null) {
-      try {
-        addTrustedDir(trustPath, baseConfig.cwd);
-      } catch (e) {
-        // Persistence failure shouldn't block the session — operator
-        // already approved, just lose the memoization. Surface as
-        // a warn so a chronic config issue (read-only HOME, full
-        // disk) is visible without being fatal.
-        const msg = e instanceof Error ? e.message : String(e);
-        bus.emit({
-          type: 'warn',
-          ts: now(),
-          message: `failed to persist trust for ${baseConfig.cwd}: ${msg} (will re-prompt next boot)`,
-        });
-      }
-    }
-  }
+  // Trust prompt was already handled in the pre-bootstrap stack —
+  // see "Trust prompt (AGENTIC_CLI §9.1)" earlier in this function.
+  // Reaching this line means the operator either accepted or the
+  // cwd was already trusted.
 
   // Permission posture hint. When no project policy file
   // contributed, the operator runs under strict + empty rules
