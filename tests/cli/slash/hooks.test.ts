@@ -310,6 +310,65 @@ describe('/hooks audit', () => {
     }
   });
 
+  test('--event + --limit: filter pushes down BEFORE limit', async () => {
+    // Sanity-revert: an earlier cut fetched `--limit` rows first
+    // and applied the event filter in memory afterward. With
+    // mixed events crowding the recent tail, `audit --event Stop
+    // --limit 5` would return zero rows even though older Stop
+    // rows existed. The fix pushes the filter into SQL so LIMIT
+    // applies to MATCHING rows only.
+    const { ctx, db, sessionId } = makeCtx([]);
+    // 10 PreToolUse rows (the recent crowd)
+    for (let i = 0; i < 10; i += 1) {
+      createHookRun(db, {
+        sessionId,
+        event: 'PreToolUse',
+        layer: 'project',
+        sourcePath: '/p',
+        hookIndex: 0,
+        command: 't',
+        expanded: 't',
+        exitCode: 0,
+        outcome: 'allow',
+        durationMs: 1,
+        stdout: null,
+        stderr: null,
+        matchedTool: null,
+        createdAt: 1_000 + i,
+      });
+    }
+    // 3 older Stop rows
+    for (let i = 0; i < 3; i += 1) {
+      createHookRun(db, {
+        sessionId,
+        event: 'Stop',
+        layer: 'project',
+        sourcePath: '/p',
+        hookIndex: 0,
+        command: 't',
+        expanded: 't',
+        exitCode: 0,
+        outcome: 'allow',
+        durationMs: 1,
+        stdout: null,
+        stderr: null,
+        matchedTool: null,
+        // Older than the PreToolUse crowd (createdAt 100..102)
+        createdAt: 100 + i,
+      });
+    }
+    // With limit=5 + event=Stop, all 3 Stop rows should land
+    // (limit > matching count). Pre-fix: 0 rows because the
+    // first 5 fetched were all PreToolUse and got filtered out.
+    const r = await hooksCommand.exec(['audit', '--event', 'Stop', '--limit', '5'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const text = r.notes?.join('\n') ?? '';
+      expect(text).toContain('hooks audit: 3 run(s)');
+      expect(text).not.toContain('PreToolUse');
+    }
+  });
+
   test('--limit caps output', async () => {
     const { ctx, db, sessionId } = makeCtx([]);
     for (let i = 0; i < 5; i += 1) {

@@ -18,11 +18,7 @@
 //     [--limit N]        cap output (default 20, max 200)
 
 import type { HookEvent, HookLayer, HookSpec } from '../../../hooks/index.ts';
-import {
-  type HookRun,
-  listHookRunsBySession,
-  listRecentHookRuns,
-} from '../../../storage/repos/hook-runs.ts';
+import { type HookRun, queryHookRuns } from '../../../storage/repos/hook-runs.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
 const ALL_EVENTS: readonly HookEvent[] = [
@@ -237,7 +233,15 @@ const handleAudit = (ctx: SlashContext, args: readonly string[]): SlashResult =>
   // --session uses currentSessionId() which can return null between
   // boot and first turn (no session yet). Surface a clean message
   // instead of silently dumping cross-session rows.
-  let rows: HookRun[];
+  //
+  // Both session AND event filters push down to SQL via
+  // queryHookRuns — fetching `--limit` rows first and filtering
+  // in memory would silently truncate matching rows whenever
+  // non-matching events crowded the recent tail (`/hooks audit
+  // --event Stop --limit 20` returning zero rows when the last
+  // 20 hook runs were all PreToolUse, even though older Stop
+  // rows exist).
+  let sessionFilter: string | undefined;
   if (parsed.session) {
     const sid = ctx.currentSessionId();
     if (sid === null) {
@@ -246,14 +250,13 @@ const handleAudit = (ctx: SlashContext, args: readonly string[]): SlashResult =>
         notes: ['hooks audit: no session yet (run a turn first to populate)'],
       };
     }
-    rows = listHookRunsBySession(ctx.db, sid, parsed.limit);
-  } else {
-    rows = listRecentHookRuns(ctx.db, parsed.limit);
+    sessionFilter = sid;
   }
-  if (parsed.event !== undefined) {
-    const event = parsed.event;
-    rows = rows.filter((r) => r.event === event);
-  }
+  const rows: HookRun[] = queryHookRuns(ctx.db, {
+    ...(sessionFilter !== undefined ? { sessionId: sessionFilter } : {}),
+    ...(parsed.event !== undefined ? { event: parsed.event } : {}),
+    limit: parsed.limit,
+  });
 
   if (rows.length === 0) {
     const scopeFrag = parsed.session ? ' in current session' : '';

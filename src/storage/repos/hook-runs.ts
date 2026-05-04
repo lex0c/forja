@@ -211,3 +211,46 @@ export const listHookRunsByEvent = (db: DB, event: HookRunsEvent, limit = 50): H
     .all(event, limit);
   return rows.map(fromRow);
 };
+
+// Combined-filter query for `/hooks audit` (slash command). Both
+// session AND event filters are optional; when set, they're
+// pushed down to the SQL WHERE clause so `LIMIT ?` runs AFTER
+// filtering — fetching the limit first and filtering in memory
+// would silently truncate matching rows whenever non-matching
+// events crowded the recent tail.
+//
+// Returns rows newest-first (matches `listRecent…` ordering); the
+// session-partial index covers the session-scoped path, the
+// event index covers the cross-session path.
+export interface HookRunsQuery {
+  sessionId?: string;
+  event?: HookRunsEvent;
+  limit?: number;
+}
+export const queryHookRuns = (db: DB, opts: HookRunsQuery = {}): HookRun[] => {
+  const limit = opts.limit ?? 50;
+  const where: string[] = [];
+  const params: (string | number)[] = [];
+  if (opts.sessionId !== undefined) {
+    where.push('session_id = ?');
+    params.push(opts.sessionId);
+  }
+  if (opts.event !== undefined) {
+    where.push('event = ?');
+    params.push(opts.event);
+  }
+  const whereClause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+  params.push(limit);
+  const rows = db
+    .query<HookRunRow, (string | number)[]>(
+      `SELECT id, session_id, event, layer, source_path, hook_index,
+              command, expanded, exit_code, outcome, duration_ms,
+              stdout, stderr, matched_tool, created_at
+         FROM hook_runs
+         ${whereClause}
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?`,
+    )
+    .all(...params);
+  return rows.map(fromRow);
+};
