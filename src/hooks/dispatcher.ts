@@ -348,6 +348,31 @@ const splitOverride = (raw: string): string[] => {
   return out;
 };
 
+// Detect a "command-leading" flag — one whose IMMEDIATELY-NEXT
+// arg is interpreted as the command string by the shell. The
+// dispatcher always APPENDS the expanded hook command at the
+// end, so a command-leading flag MUST be the last token in
+// `argv` for the appended command to land in the right slot.
+// Examples:
+//   - sh / bash / dash / zsh: `-c <command>`
+//   - cmd.exe: `/c <command>` (or `/k`)
+//   - powershell: `-Command <command>` / `-EncodedCommand <b64>`
+//                 (PowerShell is case-insensitive)
+const isCommandLeadingFlag = (token: string): boolean => {
+  // POSIX `-c` is case-sensitive (`-C` is bash's noclobber).
+  // Powershell ALSO accepts `-c` lower- or upper-case as alias
+  // for `-Command`; flagging both `-c` and `-C` here is OK
+  // because operator using bash with `-C` (noclobber) for hook
+  // dispatch is exotic — happy-path operators don't trip on
+  // this.
+  if (token === '-c' || token === '-C') return true;
+  // cmd.exe case-insensitive `/c` / `/k`.
+  if (/^\/[ck]$/i.test(token)) return true;
+  // Powershell long-form, case-insensitive.
+  if (/^-(?:command|encodedcommand)$/i.test(token)) return true;
+  return false;
+};
+
 export const resolveHookShell = (opts: ResolveHookShellOpts = {}): HookShellResolution => {
   const platform = opts.platform ?? process.platform;
   const which = opts.which ?? ((bin: string) => Bun.which(bin));
@@ -371,6 +396,24 @@ export const resolveHookShell = (opts: ResolveHookShellOpts = {}): HookShellReso
         kind: 'unavailable',
         reason: `FORJA_HOOK_SHELL='${override}' but '${bin}' is not on PATH`,
       };
+    }
+    // Reject overrides that pre-fill the command slot. The
+    // dispatcher appends the expanded hook command after the
+    // operator's argv, so a command-leading flag (`-c`, `/c`,
+    // `-Command`, etc.) MUST be the last token. If it isn't —
+    // e.g. operator wrote `FORJA_HOOK_SHELL='sh -c "echo hi"'`
+    // — the shell would treat `"echo hi"` as the command and
+    // the actual hook becomes `$0` (positional, ignored), so
+    // every dispatch silently runs `echo hi` and operator
+    // policy is bypassed. Refuse loudly with guidance.
+    for (let j = 1; j < parts.length - 1; j++) {
+      const tok = parts[j] as string;
+      if (isCommandLeadingFlag(tok)) {
+        return {
+          kind: 'unavailable',
+          reason: `FORJA_HOOK_SHELL='${override}' has tokens after command flag '${tok}'; the hook command is appended at dispatch time, so any text past the flag pre-empts it. Move the flag to the end (or remove the trailing tokens).`,
+        };
+      }
     }
     // Cmd-vs-POSIX heuristic from the binary name. Match the
     // basename across either path separator so /wine/cmd.exe

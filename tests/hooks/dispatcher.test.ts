@@ -870,15 +870,18 @@ describe('resolveHookShell', () => {
     // Operator may quote a single arg (e.g. one with embedded
     // spaces) while leaving others bare. Splitter must keep
     // each quoted span as a single token regardless of
-    // position.
+    // position. Use --rcfile (a non-command-leading flag) so
+    // the example doesn't conflate "quote handling" with
+    // "tokens-after-command-flag rejection" — covered
+    // separately below.
     const r = resolveHookShell({
       platform: 'linux',
-      which: (b) => (b === 'sh' ? '/bin/sh' : null),
-      env: { FORJA_HOOK_SHELL: 'sh -c "echo hello"' },
+      which: (b) => (b === 'bash' ? '/bin/bash' : null),
+      env: { FORJA_HOOK_SHELL: 'bash --rcfile "/path with spaces/.rc" -c' },
     });
     expect(r.kind).toBe('posix');
     if (r.kind === 'posix') {
-      expect(r.argv).toEqual(['/bin/sh', '-c', 'echo hello']);
+      expect(r.argv).toEqual(['/bin/bash', '--rcfile', '/path with spaces/.rc', '-c']);
     }
   });
 
@@ -899,6 +902,68 @@ describe('resolveHookShell', () => {
     expect(r.kind).toBe('cmd');
     if (r.kind === 'cmd') {
       expect(r.argv).toEqual(['C:\\Windows\\System32\\cmd.exe', '/c']);
+    }
+  });
+
+  test('FORJA_HOOK_SHELL with command text after -c is rejected', () => {
+    // Sanity-revert: pre-fix, splitOverride preserved every
+    // token after the binary, so an override like
+    // `FORJA_HOOK_SHELL='sh -c "echo hello"'` produced argv
+    // `['sh', '-c', 'echo hello']`. dispatchOne then appended
+    // the expanded hook command, yielding
+    // `sh -c 'echo hello' <expanded>` — sh treats the FIRST
+    // arg after `-c` as the command string, so every dispatch
+    // ran `echo hello` and the hook command became `$0`
+    // (positional, ignored). Operator policy was silently
+    // bypassed. Refuse loudly with guidance.
+    const r = resolveHookShell({
+      platform: 'linux',
+      which: (b) => (b === 'sh' ? '/bin/sh' : null),
+      env: { FORJA_HOOK_SHELL: 'sh -c "echo hello"' },
+    });
+    expect(r.kind).toBe('unavailable');
+    if (r.kind === 'unavailable') {
+      expect(r.reason).toContain("'-c'");
+      expect(r.reason).toContain('appended at dispatch time');
+    }
+  });
+
+  test('FORJA_HOOK_SHELL with command text after /c (cmd) is rejected', () => {
+    const r = resolveHookShell({
+      platform: 'win32',
+      which: (b) => (b === 'cmd.exe' ? 'C:\\Windows\\System32\\cmd.exe' : null),
+      env: { FORJA_HOOK_SHELL: 'cmd.exe /c "echo hi"' },
+    });
+    expect(r.kind).toBe('unavailable');
+    if (r.kind === 'unavailable') {
+      expect(r.reason).toContain("'/c'");
+    }
+  });
+
+  test('FORJA_HOOK_SHELL with command text after -Command (powershell) is rejected', () => {
+    const r = resolveHookShell({
+      platform: 'win32',
+      which: (b) => (b === 'powershell' ? 'C:\\Windows\\System32\\powershell.exe' : null),
+      env: { FORJA_HOOK_SHELL: 'powershell -Command "Get-Process"' },
+    });
+    expect(r.kind).toBe('unavailable');
+    if (r.kind === 'unavailable') {
+      expect(r.reason).toContain('-Command');
+    }
+  });
+
+  test('FORJA_HOOK_SHELL command flag at end (canonical) is accepted', () => {
+    // The canonical valid form: command flag is the LAST
+    // token. Dispatcher appends the hook command after,
+    // yielding `sh -c <expanded>`.
+    const r = resolveHookShell({
+      platform: 'linux',
+      which: (b) => (b === 'sh' ? '/bin/sh' : null),
+      env: { FORJA_HOOK_SHELL: 'sh -c' },
+    });
+    expect(r.kind).toBe('posix');
+    if (r.kind === 'posix') {
+      expect(r.argv).toEqual(['/bin/sh', '-c']);
     }
   });
 
