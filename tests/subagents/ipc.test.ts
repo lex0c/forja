@@ -302,6 +302,37 @@ describe('IPC channel', () => {
     expect(second.map((m) => m.type)).toEqual(['session_start', 'shutdown']);
   });
 
+  test('transport-level errors (e.g. line_too_long) surface via channel.onError', () => {
+    // Channel subscribes to the transport's onTransportError and
+    // routes through the same `onError` emitter as parser
+    // failures. Operators get one diagnostic stream; the reason
+    // code is stable and grep-able.
+    let stdoutController!: ReadableStreamDefaultController<Uint8Array>;
+    const stdout = new ReadableStream<Uint8Array>({
+      start(c) {
+        stdoutController = c;
+      },
+    });
+    const stdin = new WritableStream<Uint8Array>({ write() {} });
+    const transport = subprocessTransport({ stdin, stdout });
+    const channel = createChannel(transport);
+    const errors: { line: string; reason: string }[] = [];
+    channel.onError((e) => errors.push(e));
+
+    const enc = new TextEncoder();
+    stdoutController.enqueue(enc.encode('A'.repeat(1_100_000)));
+    stdoutController.enqueue(enc.encode('\n'));
+    return new Promise<void>((resolve) =>
+      setTimeout(() => {
+        expect(errors.length).toBeGreaterThanOrEqual(1);
+        const first = errors[0];
+        expect(first?.line).toBe('');
+        expect(first?.reason.startsWith('line_too_long')).toBe(true);
+        resolve();
+      }, 20),
+    );
+  });
+
   test('subscriber attaching AFTER first real-time emit sees only real-time (buffer committed)', () => {
     // Once the buffer commits (first real-time message lands on
     // an attached subscriber), it can't be replayed — late
@@ -458,6 +489,49 @@ describe('IPC subprocessTransport — framer', () => {
     t.close();
     await new Promise((r) => setTimeout(r, 10));
     expect(closed).toBe(true);
+  });
+
+  test('over-cap line is dropped + transport surfaces line_too_long; framer resyncs on next LF', async () => {
+    // OOM seatbelt: a peer that sends bytes without a `\n` would
+    // otherwise grow the framer's buffer indefinitely until the
+    // JS heap dies. The cap clamps the partial-line buffer; the
+    // framer fires onOverflow, the transport routes that as a
+    // `line_too_long` IpcTransportError, the channel surfaces it
+    // through `onError`, and framing resumes after the next LF.
+    let stdoutController!: ReadableStreamDefaultController<Uint8Array>;
+    const stdout = new ReadableStream<Uint8Array>({
+      start(c) {
+        stdoutController = c;
+      },
+    });
+    const stdin = new WritableStream<Uint8Array>({ write() {} });
+    const t = subprocessTransport({ stdin, stdout });
+    const lines: string[] = [];
+    const transportErrors: { reason: string; detail?: string }[] = [];
+    t.onLine((l) => lines.push(l));
+    t.onTransportError((err) => transportErrors.push(err));
+
+    // The default cap is 1 MiB; we can't easily flood that fast in
+    // a unit test without making the suite slow. The framer
+    // exposes `lineCap` for direct calls; the transport doesn't
+    // surface it as an option (production wants the spec'd 1 MiB).
+    // We work around by sending just over 1 MiB of payload bytes
+    // without a `\n`, then a recovery line. Total chunk fits in
+    // memory comfortably.
+    const enc = new TextEncoder();
+    const overSized = 'A'.repeat(1_100_000); // ≈ 1.05 MiB > cap
+    stdoutController.enqueue(enc.encode(overSized));
+    // Now signal end of bad line + a fresh, in-budget line.
+    stdoutController.enqueue(enc.encode('\nrecovered\n'));
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Bad line dropped, recovery line landed.
+    expect(lines).toEqual(['recovered']);
+    // Transport error surfaced with stable reason code.
+    expect(transportErrors.length).toBeGreaterThanOrEqual(1);
+    const first = transportErrors[0];
+    expect(first?.reason).toBe('line_too_long');
+    expect(first?.detail).toContain('dropped');
   });
 
   test('close() flushes and ends the WritableStream stdin (peer sees EOF)', async () => {

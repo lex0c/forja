@@ -223,6 +223,21 @@ const createEmitter = <T>() => {
 // uniform "lines in, lines out" interface. The Channel layer
 // above doesn't know whether it's talking to a real subprocess
 // or a fake pair.
+// Transport-level diagnostic shape. Today's only producer is the
+// line framer's overflow path (peer sent > 1 MiB without a `\n`
+// — OOM seatbelt fired, line dropped, framer resyncing). Future
+// transports may add their own (decoder errors, signal-induced
+// pipe breaks, etc.) without changing the channel API.
+export interface IpcTransportError {
+  reason: string;
+  detail?: string;
+}
+
+// Line-oriented duplex. Implementations own platform glue (Bun
+// streams, Node process I/O, in-memory queues) and expose a
+// uniform "lines in, lines out" interface. The Channel layer
+// above doesn't know whether it's talking to a real subprocess
+// or a fake pair.
 export interface IpcTransport {
   // Emit a fully-framed line (caller's responsibility — should
   // already include the trailing LF when going onto a real
@@ -231,9 +246,30 @@ export interface IpcTransport {
   // `encodeMessage` directly.
   write(line: string): void;
   onLine(cb: (line: string) => void): () => void;
+  // Diagnostic stream for transport-level errors that don't have
+  // a parseable line to surface through `onLine`. The channel
+  // layer routes these through the same `onError` surface as
+  // parser failures so operators see one diagnostic stream
+  // regardless of which layer caught the issue.
+  onTransportError(cb: (err: IpcTransportError) => void): () => void;
   onClose(cb: () => void): () => void;
   close(): void;
 }
+
+// Per-line cap (UTF-16 code units in the partial-line buffer).
+// Spec §2.2: "Limite por mensagem: 1 MB. Acima disso, fragmentar
+// em chunks ou referenciar via SQLite." 1Mi chars holds the spec
+// cap with ASCII-heavy JSON (≈ 1 byte/char) and ~2-4 MiB UTF-16
+// in RAM in the worst case — bounded.
+//
+// Without this cap, a peer that sends bytes without a `\n` (buggy
+// child in a loop, or compromised binary crafting an OOM
+// payload) would grow the framer's buffer indefinitely until the
+// JS heap dies. The cap is the OOM seatbelt.
+//
+// Tunable via `lineCap` argument for tests that want to exercise
+// the resync path quickly without allocating a megabyte.
+const DEFAULT_LINE_CAP = 1 << 20; // 1 MiB (UTF-16 code units)
 
 // Frame raw byte chunks into complete UTF-8 lines. Stateful — the
 // caller pushes chunks (which may span line boundaries arbitrarily)
@@ -245,12 +281,44 @@ export interface IpcTransport {
 // multi-byte sequences split across chunks. Without `stream: true`
 // a single 4-byte emoji split across two chunks would corrupt
 // into U+FFFD replacement chars.
-const createLineFramer = (onLine: (line: string) => void) => {
+//
+// Overflow safety: the partial-line buffer is capped (default
+// 1 MiB UTF-16 code units). When a line exceeds the cap the
+// framer drops the buffer, fires `onOverflow(droppedChars)`, and
+// enters a resync state — discarding bytes until the next `\n`,
+// then resuming normal framing. Spec §4.5 mandates the channel
+// survives a malformed line; "line too long" is the same shape
+// of survivable diagnostic.
+const createLineFramer = (
+  onLine: (line: string) => void,
+  options: { onOverflow?: (droppedChars: number) => void; lineCap?: number } = {},
+) => {
   const decoder = new TextDecoder('utf-8');
+  const lineCap = options.lineCap ?? DEFAULT_LINE_CAP;
   let buf = '';
+  // True after an overflow, until we observe the next `\n` and
+  // resume framing. While resyncing, every chunk is scanned for
+  // the boundary and discarded otherwise.
+  let resyncing = false;
   return {
     push(chunk: Uint8Array): void {
-      buf += decoder.decode(chunk, { stream: true });
+      const decoded = decoder.decode(chunk, { stream: true });
+      let pending: string;
+      if (resyncing) {
+        const boundary = decoded.indexOf('\n');
+        if (boundary === -1) {
+          // Still hunting for the end of the over-cap line.
+          // Don't grow the buffer — we know we're discarding.
+          return;
+        }
+        // Found end of bad line; resume normal framing from
+        // after it. Anything before is dropped.
+        resyncing = false;
+        pending = decoded.slice(boundary + 1);
+      } else {
+        pending = decoded;
+      }
+      buf += pending;
       // Walk buffer for LFs. The remainder after the last LF is
       // the partial line; keep it for the next push. A buffer
       // with no LF this round just accumulates.
@@ -261,6 +329,16 @@ const createLineFramer = (onLine: (line: string) => void) => {
         if (line.length > 0) onLine(line);
         nl = buf.indexOf('\n');
       }
+      // Cap check: if the trailing partial line outgrew the cap
+      // without finding `\n`, drop it and resync. The dropped
+      // count goes through the diagnostic channel so operators
+      // can investigate; the wire stays open.
+      if (buf.length > lineCap) {
+        const dropped = buf.length;
+        buf = '';
+        resyncing = true;
+        options.onOverflow?.(dropped);
+      }
     },
     flush(): void {
       // Stream end may or may not include a trailing LF. If a
@@ -269,6 +347,9 @@ const createLineFramer = (onLine: (line: string) => void) => {
       // (Spec §2.2: "Mensagens com caracteres binários" are
       // base64-encoded — partial UTF-8 sequences at flush time
       // are decoder errors, not silent drops.)
+      // If we ended mid-resync (peer broke the pipe before the
+      // next `\n` boundary), the remaining buffer is empty —
+      // nothing to flush, no diagnostic to repeat.
       const tail = buf + decoder.decode();
       if (tail.length > 0) onLine(tail);
       buf = '';
@@ -317,12 +398,19 @@ export const fakeTransportPair = (): { a: IpcTransport; b: IpcTransport } => {
     bClose.emit();
   };
 
+  // Fake pair has no framer — caller writes already-framed lines
+  // and we split on `\n`. There's no overflow surface to model;
+  // transport-error subscribers just get no events.
+  const aErrors = createEmitter<IpcTransportError>();
+  const bErrors = createEmitter<IpcTransportError>();
+
   const a: IpcTransport = {
     write(line) {
       if (closed) return;
       for (const piece of splitFramedPayload(line)) bIn.emit(piece);
     },
     onLine: (cb) => aIn.subscribe(cb),
+    onTransportError: (cb) => aErrors.subscribe(cb),
     onClose: (cb) => aClose.subscribe(cb),
     close: closeAll,
   };
@@ -332,6 +420,7 @@ export const fakeTransportPair = (): { a: IpcTransport; b: IpcTransport } => {
       for (const piece of splitFramedPayload(line)) aIn.emit(piece);
     },
     onLine: (cb) => bIn.subscribe(cb),
+    onTransportError: (cb) => bErrors.subscribe(cb),
     onClose: (cb) => bClose.subscribe(cb),
     close: closeAll,
   };
@@ -374,6 +463,7 @@ const isWhatwgStream = (s: FileSinkLike | WritableStreamLike): s is WritableStre
 
 export const subprocessTransport = (streams: SubprocessStreams): IpcTransport => {
   const lines = createEmitter<string>();
+  const transportErrors = createEmitter<IpcTransportError>();
   const closed = createEmitter<void>();
   let isClosed = false;
   const closeOnce = () => {
@@ -382,7 +472,14 @@ export const subprocessTransport = (streams: SubprocessStreams): IpcTransport =>
     closed.emit();
   };
 
-  const framer = createLineFramer((line) => lines.emit(line));
+  const framer = createLineFramer((line) => lines.emit(line), {
+    onOverflow: (droppedChars) => {
+      transportErrors.emit({
+        reason: 'line_too_long',
+        detail: `dropped ${droppedChars} chars; resyncing on next LF`,
+      });
+    },
+  });
   const reader = streams.stdout.getReader();
   const encoder = new TextEncoder();
   // Branch on stdin shape ONCE at construction so the write +
@@ -455,6 +552,7 @@ export const subprocessTransport = (streams: SubprocessStreams): IpcTransport =>
       writeBytes(encoder.encode(line));
     },
     onLine: (cb) => lines.subscribe(cb),
+    onTransportError: (cb) => transportErrors.subscribe(cb),
     onClose: (cb) => closed.subscribe(cb),
     close() {
       if (isClosed) return;
@@ -499,6 +597,7 @@ export const processTransport = (streams?: ProcessStreams): IpcTransport => {
   const stdout: WritableStdout = streams?.stdout ?? (process.stdout as unknown as WritableStdout);
 
   const lines = createEmitter<string>();
+  const transportErrors = createEmitter<IpcTransportError>();
   const closed = createEmitter<void>();
   let isClosed = false;
   const closeOnce = () => {
@@ -507,7 +606,14 @@ export const processTransport = (streams?: ProcessStreams): IpcTransport => {
     closed.emit();
   };
 
-  const framer = createLineFramer((line) => lines.emit(line));
+  const framer = createLineFramer((line) => lines.emit(line), {
+    onOverflow: (droppedChars) => {
+      transportErrors.emit({
+        reason: 'line_too_long',
+        detail: `dropped ${droppedChars} chars; resyncing on next LF`,
+      });
+    },
+  });
 
   const onData = (chunk: Buffer | string) => {
     // Bun's process.stdin emits Buffer when no encoding is set;
@@ -544,6 +650,7 @@ export const processTransport = (streams?: ProcessStreams): IpcTransport => {
       }
     },
     onLine: (cb) => lines.subscribe(cb),
+    onTransportError: (cb) => transportErrors.subscribe(cb),
     onClose: (cb) => closed.subscribe(cb),
     close() {
       if (isClosed) return;
@@ -651,6 +758,31 @@ export const createChannel = (transport: IpcTransport): IpcChannel => {
       }
       errors.emit(err);
     }
+  });
+
+  // Transport-level errors (line_too_long from the framer's
+  // overflow path; future variants land here too) route through
+  // the same `errors` emitter as parser failures so operators
+  // see one diagnostic stream. The `line` field stays empty
+  // because there's no parseable payload — operators can grep
+  // on the reason code alone.
+  transport.onTransportError((err) => {
+    const wrapped = {
+      line: '',
+      reason: err.detail !== undefined ? `${err.reason}:${err.detail}` : err.reason,
+    };
+    if (errors.size() === 0 && pendingErrors !== null) {
+      if (pendingErrors.length < REPLAY_BUFFER_CAP) {
+        pendingErrors.push(wrapped);
+      } else {
+        droppedFromOverflow += 1;
+      }
+      return;
+    }
+    if (pendingErrors !== null) {
+      pendingErrors = null;
+    }
+    errors.emit(wrapped);
   });
 
   return {

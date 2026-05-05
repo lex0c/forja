@@ -2213,6 +2213,7 @@ describe('runSubagentChild — IPC', () => {
         return {
           write: () => undefined,
           onLine: () => () => undefined,
+          onTransportError: () => () => undefined,
           onClose: () => () => undefined,
           close: () => undefined,
         };

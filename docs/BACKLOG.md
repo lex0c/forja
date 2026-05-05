@@ -15,6 +15,107 @@ Format:
 
 ---
 
+## [2026-05-05] M3 / harden — IPC line-framer OOM seatbelt + transport error surface
+
+Same branch (`feat/m3-subagent-ipc`). Closes the one remaining
+robustness/security gap surfaced in the maturity audit: the line
+framer's partial-line buffer was unbounded, so a peer that wrote
+bytes without a `\n` (buggy child in a loop, or compromised
+binary crafting an OOM payload) would grow the buffer until the
+JS heap died. Spec §2.2 caps messages at 1 MB; we now enforce.
+
+**Done:**
+
+- **`createLineFramer`** gains a per-line cap (default
+  `DEFAULT_LINE_CAP = 1 << 20` UTF-16 code units, ≈ 1 MiB which
+  matches spec §2.2's 1 MB byte cap for ASCII-heavy JSON). When
+  the partial-line buffer outgrows the cap WITHOUT finding a
+  `\n`, the framer drops the buffer, fires `onOverflow(droppedChars)`,
+  and enters a resync state — discarding bytes from the
+  incoming chunks until the next `\n`, then resuming normal
+  framing. Spec §4.5 mandates the channel survives a malformed
+  line; "line too long" is the same shape of survivable
+  diagnostic.
+
+- **`IpcTransport`** gains `onTransportError(cb)` for transport-
+  level diagnostics that don't have a parseable line to surface
+  via `onLine`. Today's only producer is the framer's overflow
+  path; future variants (decoder errors, signal-induced pipe
+  breaks, etc.) land here without changing the channel API.
+  `IpcTransportError` shape is `{ reason: string; detail?: string }`
+  — reason codes stay stable + grep-able, detail carries
+  human-readable specifics.
+
+- **subprocessTransport + processTransport** wire the framer's
+  `onOverflow` to a `transportErrors` emitter and expose it via
+  the new `onTransportError` method. fakeTransportPair has no
+  framer (caller passes already-framed lines) so its
+  `onTransportError` is a no-op subscriber surface — kept for
+  interface uniformity.
+
+- **`createChannel`** subscribes to `transport.onTransportError`
+  and routes diagnostics through the same `errors` emitter as
+  parser failures. Operators see one diagnostic stream; the
+  `line` field is empty for transport errors (no parseable
+  payload), the `reason` carries `line_too_long:dropped 1100000
+  chars; resyncing on next LF` (or future variants).
+
+- **Tests** (2 new):
+  - `tests/subagents/ipc.test.ts` "over-cap line is dropped +
+    transport surfaces line_too_long; framer resyncs on next
+    LF": pushes 1.1 MiB without `\n`, then a fresh line. Bad
+    line dropped, recovery line lands, transport error shape
+    correct.
+  - `tests/subagents/ipc.test.ts` "transport-level errors
+    surface via channel.onError": channel-layer assertion that
+    the framer's overflow flows through the same diagnostic
+    surface as parser failures.
+
+**Decisions:**
+
+1. **1 MiB cap, not larger.** Spec §2.2 is explicit: "Limite por
+   mensagem: 1 MB. Acima disso, fragmentar em chunks ou
+   referenciar via SQLite." A producer that legitimately needs
+   more should chunk, not pump. Operators who need a higher cap
+   for a specific deployment can override via `lineCap` (the
+   framer accepts it as an option; the production transports
+   don't surface it to keep the spec contract stable).
+
+2. **Resync, not channel-close, on overflow.** Spec §4.5: "uma
+   linha ruim não invalida a próxima." Same philosophy applies
+   to "line too long" — a single overflow shouldn't kill the
+   wire. The framer drops the bad line + resyncs, the channel
+   stays open. Operators who want stricter behavior can install
+   an `onError` handler that calls `channel.close()` on
+   `line_too_long`.
+
+3. **Transport-level errors flow through the same `onError`
+   surface as parser failures.** Two reasons: (1) operators see
+   one diagnostic stream, not two; (2) downstream consumers
+   (audit log, telemetry) only need to subscribe to one place.
+   The reason-code prefix (`line_too_long`, `json_parse_failed`,
+   `unknown_type:<t>`, etc.) is stable enough to filter by
+   category.
+
+4. **Cap is on UTF-16 string length, not byte count.** Bun's
+   `TextDecoder` returns JS strings (UTF-16 code units); the
+   string length in chars is what consumes RAM in the framer's
+   buffer. 1 MiB chars → ≈ 2-4 MiB UTF-16 in the worst case
+   (heavy non-BMP) or ≈ 1 MiB (ASCII-heavy JSON, the realistic
+   case). Bounded either way. Translating spec's "1 MB" to char
+   count is the close-enough tradeoff for an OOM seatbelt.
+
+**This closes the only real robustness/security hole the
+maturity audit surfaced.** Other deferreds (Map cap on TUI
+state, soft routing harness e2e, permission proxy, cross-
+process hook dispatch) stay deferred with their own rationales.
+
+**Pending:** none. The IPC stack is now genuinely robust against
+a buggy/compromised peer, not just against accidental
+misbehavior.
+
+---
+
 ## [2026-05-05] M3 / harden — subagent hook chain snapshot (migration 020)
 
 Same branch (`feat/m3-subagent-ipc`). Mirror of migration 015
