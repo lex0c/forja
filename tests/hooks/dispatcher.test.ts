@@ -1,6 +1,16 @@
 import { describe, expect, test } from 'bun:test';
-import { dispatchChain, dispatchOne, filterMatchingHooks } from '../../src/hooks/dispatcher.ts';
-import type { DispatchedProcess, SpawnFn, SpawnOpts } from '../../src/hooks/dispatcher.ts';
+import {
+  dispatchChain,
+  dispatchOne,
+  filterMatchingHooks,
+  resolveHookShell,
+} from '../../src/hooks/dispatcher.ts';
+import type {
+  DispatchedProcess,
+  HookShellResolution,
+  SpawnFn,
+  SpawnOpts,
+} from '../../src/hooks/dispatcher.ts';
 import type { HookEventPayload, HookSpec } from '../../src/hooks/types.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
@@ -332,10 +342,38 @@ describe('dispatchOne — env / stdin / cwd contract', () => {
   test('command is run via sh -c with template-expanded literal', async () => {
     const capture = { calls: [] as { cmd: string[]; opts: SpawnOpts; stdin: string }[] };
     const fake = makeFakeSpawn({ exitCode: 0 }, capture);
+    // Inject a shell so the test doesn't depend on the
+    // module-level cached resolution (which probes the real
+    // PATH and returns absolute paths).
+    const shell: HookShellResolution = {
+      kind: 'posix',
+      argv: ['sh', '-c'],
+      sourcePath: 'sh',
+    };
     await dispatchOne(makeSpec({ command: 'echo {{event}}' }), 0, makePayload(), '/cwd', {
       spawn: fake,
+      shell,
     });
     expect(capture.calls[0]?.cmd).toEqual(['sh', '-c', "echo 'PostToolUse'"]);
+  });
+
+  test('cmd.exe shell wraps with /c and the expanded command', async () => {
+    // Verifies the Windows fallback path threads through
+    // dispatchOne. The fake spawn captures the argv shape so
+    // we can assert without actually running cmd.exe (test
+    // runs on Linux).
+    const capture = { calls: [] as { cmd: string[]; opts: SpawnOpts; stdin: string }[] };
+    const fake = makeFakeSpawn({ exitCode: 0 }, capture);
+    const shell: HookShellResolution = {
+      kind: 'cmd',
+      argv: ['C:\\Windows\\System32\\cmd.exe', '/c'],
+      sourcePath: 'C:\\Windows\\System32\\cmd.exe',
+    };
+    await dispatchOne(makeSpec({ command: 'echo hello' }), 0, makePayload(), '/cwd', {
+      spawn: fake,
+      shell,
+    });
+    expect(capture.calls[0]?.cmd).toEqual(['C:\\Windows\\System32\\cmd.exe', '/c', 'echo hello']);
   });
 });
 
@@ -579,5 +617,180 @@ describe('dispatchChain — blocking events', () => {
     const rows = listHookRunsBySession(db, sessionId);
     expect(rows).toHaveLength(1);
     expect(rows[0]?.hookIndex).toBe(1);
+  });
+});
+
+describe('resolveHookShell', () => {
+  // Tests inject `which` and `platform` so a Linux runner can
+  // verify the Windows-fallback path without actually being on
+  // Windows.
+
+  test('POSIX host with sh on PATH → posix kind, sh -c', () => {
+    const r = resolveHookShell({
+      platform: 'linux',
+      which: (b) => (b === 'sh' ? '/bin/sh' : null),
+      env: {},
+    });
+    expect(r.kind).toBe('posix');
+    if (r.kind === 'posix') {
+      expect(r.argv).toEqual(['/bin/sh', '-c']);
+    }
+  });
+
+  test('POSIX host without sh, falls back to bash', () => {
+    const r = resolveHookShell({
+      platform: 'linux',
+      which: (b) => (b === 'bash' ? '/usr/bin/bash' : null),
+      env: {},
+    });
+    expect(r.kind).toBe('posix');
+    if (r.kind === 'posix') {
+      expect(r.argv).toEqual(['/usr/bin/bash', '-c']);
+    }
+  });
+
+  test('POSIX host without sh OR bash → unavailable', () => {
+    const r = resolveHookShell({
+      platform: 'linux',
+      which: () => null,
+      env: {},
+    });
+    expect(r.kind).toBe('unavailable');
+  });
+
+  test('Windows host with Git Bash sh on PATH → posix kind', () => {
+    const r = resolveHookShell({
+      platform: 'win32',
+      which: (b) => (b === 'sh' ? 'C:\\Program Files\\Git\\bin\\sh.exe' : null),
+      env: {},
+    });
+    expect(r.kind).toBe('posix');
+  });
+
+  test('Windows host without sh/bash → cmd.exe fallback', () => {
+    const r = resolveHookShell({
+      platform: 'win32',
+      which: (b) => (b === 'cmd.exe' ? 'C:\\Windows\\System32\\cmd.exe' : null),
+      env: {},
+    });
+    expect(r.kind).toBe('cmd');
+    if (r.kind === 'cmd') {
+      expect(r.argv).toEqual(['C:\\Windows\\System32\\cmd.exe', '/c']);
+    }
+  });
+
+  test('FORJA_HOOK_SHELL override wins (custom binary on PATH)', () => {
+    const r = resolveHookShell({
+      platform: 'linux',
+      which: (b) => (b === '/opt/dash' ? '/opt/dash' : b === 'sh' ? '/bin/sh' : null),
+      env: { FORJA_HOOK_SHELL: '/opt/dash -c' },
+    });
+    // Auto-detect would have picked /bin/sh; override forces dash.
+    expect(r.kind).toBe('posix');
+    if (r.kind === 'posix') {
+      expect(r.argv).toEqual(['/opt/dash', '-c']);
+    }
+  });
+
+  test('FORJA_HOOK_SHELL override pointing at missing binary → unavailable', () => {
+    const r = resolveHookShell({
+      platform: 'linux',
+      which: () => null,
+      env: { FORJA_HOOK_SHELL: '/nope' },
+    });
+    expect(r.kind).toBe('unavailable');
+    if (r.kind === 'unavailable') {
+      expect(r.reason).toContain('FORJA_HOOK_SHELL');
+    }
+  });
+
+  test('FORJA_HOOK_SHELL pointing at cmd → cmd kind regardless of platform', () => {
+    const r = resolveHookShell({
+      platform: 'linux',
+      which: (b) => (b === 'cmd.exe' ? '/wine/cmd.exe' : null),
+      env: { FORJA_HOOK_SHELL: 'cmd.exe /c' },
+    });
+    expect(r.kind).toBe('cmd');
+  });
+
+  test('FORJA_HOOK_SHELL preserves multi-arg flags (powershell case)', () => {
+    // PowerShell needs `-NoProfile -Command` BEFORE the command
+    // string for the next arg to be evaluated as code instead
+    // of a script-file path. An earlier cut split on
+    // whitespace and only kept parts[0] + parts[1] — the
+    // `-Command` flag would silently disappear, breaking
+    // PowerShell-as-shell entirely.
+    const r = resolveHookShell({
+      platform: 'win32',
+      which: (b) => (b === 'powershell' ? 'C:\\Windows\\System32\\powershell.exe' : null),
+      env: { FORJA_HOOK_SHELL: 'powershell -NoProfile -Command' },
+    });
+    expect(r.kind).toBe('posix');
+    if (r.kind === 'posix') {
+      expect(r.argv).toEqual(['C:\\Windows\\System32\\powershell.exe', '-NoProfile', '-Command']);
+    }
+  });
+});
+
+describe('dispatchChain — shell unavailable short-circuits', () => {
+  test('hooks present but shell unavailable → empty chain, no audit row, no spawn', async () => {
+    // Sanity-revert: pre-fix, sh-not-found on Windows would
+    // throw ENOENT mid-dispatch, surface as kind='error', and
+    // failClosed=true would wrongly deny normal operations.
+    // The chain now detects shell-unavailable and returns an
+    // empty result — failClosed has nothing to gate against.
+    const db = openMemoryDb();
+    migrate(db);
+    const sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+    let spawnCalled = 0;
+    const fakeSpawn: SpawnFn = (() => {
+      spawnCalled += 1;
+      throw new Error('spawn must NOT be called when shell is unavailable');
+    }) as SpawnFn;
+    const unavailable: HookShellResolution = {
+      kind: 'unavailable',
+      reason: 'no POSIX shell on PATH',
+    };
+    const hooks = [makeSpec({ event: 'PreToolUse', command: 'rm -rf /', failClosed: true })];
+    const payload = {
+      schema: 'v1',
+      event: 'PreToolUse',
+      sessionId,
+      data: { tool: { name: 'bash', input: {} } },
+    } as HookEventPayload;
+    const result = await dispatchChain(hooks, payload, '/p', {
+      db,
+      sessionId,
+      spawn: fakeSpawn,
+      shell: unavailable,
+    });
+    expect(spawnCalled).toBe(0);
+    expect(result.runs).toEqual([]);
+    // Critically: blockedBy stays null even though the spec had
+    // failClosed=true. Operator's failClosed hook does NOT
+    // wrongly deny because the hook simply did not run.
+    expect(result.blockedBy).toBeNull();
+    // No audit row written for skipped hooks.
+    expect(listHookRunsBySession(db, sessionId)).toEqual([]);
+  });
+
+  test('zero matching hooks → no warning, no spawn (no false alarm)', async () => {
+    const db = openMemoryDb();
+    migrate(db);
+    const sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+    const unavailable: HookShellResolution = {
+      kind: 'unavailable',
+      reason: 'no shell',
+    };
+    const hooks: HookSpec[] = [];
+    const payload = {
+      schema: 'v1',
+      event: 'PreToolUse',
+      sessionId,
+      data: { tool: { name: 'bash', input: {} } },
+    } as HookEventPayload;
+    const result = await dispatchChain(hooks, payload, '/p', { db, sessionId, shell: unavailable });
+    expect(result.runs).toEqual([]);
+    expect(result.blockedBy).toBeNull();
   });
 });

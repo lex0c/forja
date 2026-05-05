@@ -122,7 +122,18 @@ export interface ResolvedHookConfig {
 }
 
 export interface HookConfigWarning {
-  kind: 'invalid_entry' | 'lock_violation' | 'lock_ignored' | 'unreadable_file';
+  kind:
+    | 'invalid_entry'
+    | 'lock_violation'
+    | 'lock_ignored'
+    | 'unreadable_file'
+    // Hooks loaded from disk but no shell available to dispatch
+    // them (Windows host without sh/bash AND without cmd.exe in
+    // PATH, exotic but possible in stripped containers). Layer
+    // is null because the gap is host-level, not file-level.
+    // Operator querying warnings by kind treats this distinctly
+    // from a malformed file.
+    | 'shell_unavailable';
   layer: HookLayer | null; // null when the file itself is unreadable
   sourcePath: string;
   message: string;

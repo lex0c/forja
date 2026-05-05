@@ -75,6 +75,11 @@ export interface DispatcherDeps {
   // spawn. The shape mirrors `Bun.spawn` so tests can swap a
   // synthetic process driver without rewriting the dispatcher.
   spawn?: SpawnFn;
+  // Shell resolution override. Production uses the cached
+  // `resolveHookShell()` result; tests inject a fixture so a
+  // Linux runner can verify the Windows-fallback path without
+  // actually running on Windows.
+  shell?: HookShellResolution;
 }
 
 // Spawn signature the dispatcher uses. Returns an interface
@@ -182,6 +187,141 @@ const buildHookEnv = (sessionCwd: string, sessionId: string | null): Record<stri
   AGENT_SESSION_ID: sessionId ?? '',
 });
 
+// Shell selection per platform (spec AGENTIC_CLI.md §10.3:
+// "comando: shell line"). The dispatcher historically hardcoded
+// `['sh', '-c', ...]`. On Windows hosts without Git Bash / WSL /
+// MSYS the `sh` binary isn't on PATH — Bun.spawn throws ENOENT,
+// dispatchOne propagates, and operators with `failClosed: true`
+// hooks get every blocking event treated as "shell unavailable
+// → block". Since paths.ts already resolves
+// %PROGRAMDATA%\agent\hooks.toml on Windows, this layer must
+// match: hooks need to dispatch on the same hosts where their
+// config gets loaded.
+//
+// Strategy:
+//   1. Operator override via `FORJA_HOOK_SHELL` env (split on
+//      whitespace; first token is the binary). Power-users pin
+//      the shell when auto-detect picks the wrong one.
+//   2. Auto-detect: prefer `sh` (POSIX template quoting from
+//      template.ts works under any sh-compatible shell — that's
+//      bash, dash, zsh, busybox, Git Bash on Windows). Fall
+//      back to `bash` (some minimal Linux containers don't
+//      install `/bin/sh` but always have `/bin/bash`). On
+//      Windows, fall back to `cmd.exe /c` as a last resort.
+//   3. If no shell is found, the dispatcher returns
+//      `kind: 'unavailable'` and dispatchChain short-circuits
+//      to a no-op (no spawn, no audit row, no block). Boot-time
+//      caller (CLI run.ts / repl.ts) logs the warning so the
+//      operator sees the cause; failClosed hooks WON'T wrongly
+//      deny normal operations because no hook ever runs.
+//
+// Cmd.exe quoting caveat: template.ts emits POSIX single-
+// quoted args (`'value'`). Cmd treats single quotes as
+// LITERAL characters — `echo 'hello'` outputs `'hello'` (with
+// quotes). Operators on Windows-without-sh should either (a)
+// install Git Bash / WSL for portable templates, or (b) write
+// hook commands that don't depend on POSIX quoting and use
+// `{{!key}}` raw with manual escape.
+export type HookShellResolution =
+  | {
+      kind: 'posix' | 'cmd';
+      // The shell prefix appended in front of the expanded
+      // command. Multi-element to accommodate shells that need
+      // more than one flag (e.g., `powershell -NoProfile
+      // -Command` requires both before the command string is
+      // accepted as code rather than a script-file path).
+      argv: readonly string[];
+      sourcePath: string;
+    }
+  | { kind: 'unavailable'; reason: string };
+
+export interface ResolveHookShellOpts {
+  platform?: NodeJS.Platform;
+  which?: (bin: string) => string | null;
+  env?: NodeJS.ProcessEnv;
+}
+
+const splitOverride = (raw: string): string[] =>
+  raw
+    .trim()
+    .split(/\s+/)
+    .filter((s) => s.length > 0);
+
+export const resolveHookShell = (opts: ResolveHookShellOpts = {}): HookShellResolution => {
+  const platform = opts.platform ?? process.platform;
+  const which = opts.which ?? ((bin: string) => Bun.which(bin));
+  const env = opts.env ?? process.env;
+
+  // 1. Explicit override wins. Operator picks what they want.
+  // Override can carry multiple args after the binary —
+  // `powershell -NoProfile -Command` needs all three before the
+  // command string is treated as code. We pass everything past
+  // index 0 through unchanged.
+  const override = env.FORJA_HOOK_SHELL;
+  if (override !== undefined && override.length > 0) {
+    const parts = splitOverride(override);
+    const bin = parts[0];
+    const flagArgs = parts.length > 1 ? parts.slice(1) : ['-c'];
+    if (bin === undefined) {
+      return { kind: 'unavailable', reason: 'FORJA_HOOK_SHELL is set but empty after split' };
+    }
+    const found = which(bin);
+    if (found === null) {
+      return {
+        kind: 'unavailable',
+        reason: `FORJA_HOOK_SHELL='${override}' but '${bin}' is not on PATH`,
+      };
+    }
+    // Cmd-vs-POSIX heuristic from the binary name. Match the
+    // basename across either path separator so /wine/cmd.exe
+    // (POSIX path style) and C:\\Windows\\cmd.exe (Windows
+    // style) both classify correctly. Anything else assumes
+    // POSIX semantics — operator override is expected to know
+    // what they're doing.
+    const looksLikeCmd = /(?:^|[/\\])cmd(?:\.exe)?$/i.test(found);
+    return {
+      kind: looksLikeCmd ? 'cmd' : 'posix',
+      argv: [found, ...flagArgs],
+      sourcePath: found,
+    };
+  }
+
+  // 2. Auto-detect.
+  for (const bin of ['sh', 'bash']) {
+    const found = which(bin);
+    if (found !== null) {
+      return { kind: 'posix', argv: [found, '-c'], sourcePath: found };
+    }
+  }
+
+  // 3. Windows fallback: cmd.exe is always present.
+  if (platform === 'win32') {
+    const found = which('cmd.exe') ?? 'cmd.exe';
+    return { kind: 'cmd', argv: [found, '/c'], sourcePath: found };
+  }
+
+  return {
+    kind: 'unavailable',
+    reason: 'no POSIX shell on PATH (looked for sh, bash); set FORJA_HOOK_SHELL to override',
+  };
+};
+
+// Cached at module load; one resolution per process. Operators
+// changing PATH mid-process won't re-detect (would need a
+// restart) — acceptable since the harness is one-process-per-
+// session today.
+let cachedShell: HookShellResolution | null = null;
+const getCachedShell = (): HookShellResolution => {
+  if (cachedShell === null) cachedShell = resolveHookShell();
+  return cachedShell;
+};
+
+// Test seam: reset the module-level cache so tests can swap
+// platform/which fixtures between cases.
+export const _resetHookShellCacheForTests = (): void => {
+  cachedShell = null;
+};
+
 // Decide whether a hook spec applies given an event + optional
 // tool name. Today only `tool` matchers exist; matcher succeeds
 // when spec.matcher.tool either equals or glob-prefix-matches
@@ -262,10 +402,30 @@ export const dispatchOne = async (
   // default — see template.ts for the contract.
   const { expanded } = expandTemplate(spec.command, payload);
 
-  // Spawn `sh -c "<expanded>"` so operators get pipelines,
-  // redirections, and env-var interp. We DON'T inherit env;
-  // strict allow-list per CONTRACTS.md §3.
-  const proc = spawn(['sh', '-c', expanded], {
+  // Spawn `<shell> <flag> "<expanded>"` so operators get
+  // pipelines, redirections, and env-var interp. We DON'T
+  // inherit env; strict allow-list per CONTRACTS.md §3. Shell
+  // selection is platform-aware (resolveHookShell): `sh` /
+  // `bash` on POSIX, `cmd.exe /c` as Windows fallback when no
+  // POSIX shell is on PATH. When NEITHER is available, the
+  // chain short-circuits in dispatchChain — we should never
+  // reach here.
+  const shell = deps.shell ?? getCachedShell();
+  if (shell.kind === 'unavailable') {
+    // Defensive — dispatchChain filters this out before calling
+    // dispatchOne, but the test seam may pass an unavailable
+    // shell directly. Synthesize an error result with
+    // shouldBlock=false so failClosed hooks don't wrongly deny.
+    const durationMs = now() - startedAt;
+    return {
+      kind: 'error',
+      exitCode: -1,
+      reason: `shell unavailable: ${shell.reason}`,
+      durationMs,
+      shouldBlock: false,
+    };
+  }
+  const proc = spawn([...shell.argv, expanded], {
     env: buildHookEnv(cwd, deps.sessionId ?? null),
     cwd,
     stdin: 'pipe',
@@ -423,6 +583,21 @@ export const dispatchChain = async (
   const runs: { spec: HookSpec; result: HookRunResult }[] = [];
   let blockedBy: HookChainResult['blockedBy'] = null;
 
+  // Short-circuit when no shell is available (Windows host
+  // without sh/bash AND without cmd.exe — exotic, but possible
+  // in container builds). Returning early with an empty chain
+  // means failClosed hooks DO NOT wrongly deny normal
+  // operations: the chain looks identical to "no hooks
+  // configured". Boot-time warning lives in resolveHookShell's
+  // caller (CLI driver).
+  const shell = deps.shell ?? getCachedShell();
+  if (matching.length > 0 && shell.kind === 'unavailable') {
+    process.stderr.write(
+      `hooks: ${matching.length} hook(s) for ${payload.event} skipped — ${shell.reason}\n`,
+    );
+    return { blockedBy: null, runs };
+  }
+
   for (let i = 0; i < matching.length; i++) {
     const spec = matching[i];
     if (spec === undefined) continue;
@@ -444,7 +619,10 @@ export const dispatchChain = async (
     // whenever a non-matching hook appeared earlier in the
     // file — the audit row's `sourcePath#hookIndex` reference
     // would point at the wrong rule.
-    const result = await dispatchOne(spec, spec.entryIndex, payload, cwd, deps);
+    // Thread the already-resolved shell through to dispatchOne
+    // so the chain doesn't re-resolve per hook. Passes the same
+    // value already cached or test-injected at the chain layer.
+    const result = await dispatchOne(spec, spec.entryIndex, payload, cwd, { ...deps, shell });
     runs.push({ spec, result });
 
     if (!isBlocking) continue;

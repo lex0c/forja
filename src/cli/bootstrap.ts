@@ -1,6 +1,11 @@
 import { join } from 'node:path';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
-import { type HookConfigWarning, resolveHookConfig, resolveHookPaths } from '../hooks/index.ts';
+import {
+  type HookConfigWarning,
+  resolveHookConfig,
+  resolveHookPaths,
+  resolveHookShell,
+} from '../hooks/index.ts';
 import {
   createMemoryRegistry,
   evaluateBootTriggers,
@@ -267,6 +272,32 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     // probes `<repoRoot>/.agent/hooks.toml`.
     const hookPaths = resolveHookPaths(repoRoot);
     resolvedHooks = resolveHookConfig(hookPaths);
+    // Probe the shell the dispatcher will use. If hooks are
+    // configured but no usable shell is on PATH (Windows host
+    // without Git Bash / WSL / cmd.exe — exotic but possible
+    // in some container builds), synthesize a HookConfigWarning
+    // so the CLI driver surfaces the cause on stderr alongside
+    // the loader warnings. Without this signal, an operator
+    // configures hooks, hits the dispatcher's shell-unavailable
+    // short-circuit, and sees mysteriously-skipped hooks with
+    // no audit row to debug from.
+    if (resolvedHooks.hooks.length > 0) {
+      const shell = resolveHookShell();
+      if (shell.kind === 'unavailable') {
+        resolvedHooks = {
+          ...resolvedHooks,
+          warnings: [
+            ...resolvedHooks.warnings,
+            {
+              kind: 'shell_unavailable',
+              layer: null,
+              sourcePath: '<host>',
+              message: `${resolvedHooks.hooks.length} hook(s) loaded but no shell available: ${shell.reason} — hooks will be skipped at dispatch`,
+            },
+          ],
+        };
+      }
+    }
   } catch (e) {
     db.close();
     throw e;

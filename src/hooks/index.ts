@@ -42,5 +42,12 @@ export type { TemplateExpansionResult } from './template.ts';
 
 export { resolveHookConfig } from './config.ts';
 
-export { dispatchChain, dispatchOne, filterMatchingHooks } from './dispatcher.ts';
-export type { DispatchedProcess, DispatcherDeps, SpawnFn, SpawnOpts } from './dispatcher.ts';
+export { dispatchChain, dispatchOne, filterMatchingHooks, resolveHookShell } from './dispatcher.ts';
+export type {
+  DispatchedProcess,
+  DispatcherDeps,
+  HookShellResolution,
+  ResolveHookShellOpts,
+  SpawnFn,
+  SpawnOpts,
+} from './dispatcher.ts';
