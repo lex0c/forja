@@ -178,7 +178,7 @@ export interface SubagentChildOptions {
 // Cadence at which the child writes `last_heartbeat` to its
 // `subagent_outputs` row. The parent's poller compares the
 // most recent value against `Date.now()` and treats a gap >
-// HEARTBEAT_STALE_THRESHOLD_MS (defined in runtime.ts) as
+// HEARTBEAT_STALE_THRESHOLD_MS (defined in subagents/wait-loop.ts) as
 // evidence the child has hung — typically inside a wedged
 // provider call or a long sync block — and escalates SIGTERM →
 // grace → SIGKILL. The cadence must be substantially smaller
@@ -201,11 +201,10 @@ const buildEnvelope = (result: HarnessResult, output: string): Record<string, un
   cost_usd: result.costUsd,
   steps: result.steps,
   duration_ms: result.durationMs,
-  // last_message_id surfaced for parity with the in-process
-  // path's `extractFinalOutput` reconstruction. The parent
-  // doesn't strictly need it (the output is already extracted
-  // here on the child side), but keeping it in the envelope
-  // makes payload-only diagnostics more useful.
+  // last_message_id surfaced for payload-only diagnostics —
+  // the output is already extracted on the child side, so the
+  // parent doesn't strictly need the id, but it's useful when
+  // inspecting the envelope post-hoc.
   ...(result.lastMessageId !== undefined ? { last_message_id: result.lastMessageId } : {}),
   // Abort discriminator (S3, BACKLOG D168). Populated only when
   // the harness's loop exited via `reason === 'aborted'`. Lets
@@ -217,13 +216,9 @@ const buildEnvelope = (result: HarnessResult, output: string): Record<string, un
   ...(result.abortCause !== undefined ? { abort_cause: result.abortCause } : {}),
 });
 
-// Pull the child's terminal assistant text from messages by
-// lastMessageId. Mirrors the in-process `extractFinalOutput`
-// logic from subagents/runtime.ts — same parse rules so the
-// envelope's `output` field matches across in-process and
-// subprocess paths byte-for-byte. The repo already JSON-parses
-// `content`, so we receive the structured form directly (string,
-// array of blocks, or unparseable falls through to '').
+// `content` is JSON-parsed at the row layer, so we receive the
+// structured form directly: string, array of blocks, or
+// unparseable falls through to ''.
 const extractFinalOutput = (db: DB, lastMessageId: string | undefined): string => {
   if (lastMessageId === undefined || lastMessageId.length === 0) return '';
   const msg = getMessage(db, lastMessageId);
