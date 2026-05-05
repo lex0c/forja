@@ -522,6 +522,66 @@ describe('dispatchChain — blocking events', () => {
     expect(result.blockedBy).toBeNull();
   });
 
+  test('per-hook timeout clamped to remaining chain budget', async () => {
+    // Sanity-revert: pre-fix, the chain checked `elapsed > 15s`
+    // before launching each hook but never bounded that hook's
+    // own timeout against the remaining budget. A hook starting
+    // at t=14.9s with `timeout_ms=30000` would run to t=44.9s,
+    // 30s past the advertised wall-clock cap.
+    //
+    // Inject a clock that lies about elapsed time so we can
+    // verify the clamp without sleeping 14.9s in the test:
+    //   - chainStarted: 0
+    //   - iter 0 elapsed check: 0     (h1 starts)
+    //   - h1 dispatchOne now ×2: 0, 0 (instant exit)
+    //   - iter 1 elapsed check: 14900 (under cap, but remaining=100ms)
+    //   - h2 dispatchOne now ×2: 14900, 14900 (timeout fires)
+    let callIdx = 0;
+    const clockValues = [0, 0, 0, 0, 14_900, 14_900, 14_900];
+    const now = (): number => clockValues[callIdx++] ?? 14_900;
+
+    // h1: returns immediately. h2: would never exit naturally
+    // (delayMs huge); killImmediate=true means our SIGTERM kill
+    // resolves the fake. WITHOUT the clamp, h2's
+    // spec.timeoutMs=30000 timer would fire 30s real-time later.
+    // WITH the clamp, h2's effectiveTimeoutMs=100ms fires fast.
+    const fakeH1 = makeFakeSpawn({ exitCode: 0, delayMs: 0 });
+    const fakeH2 = makeFakeSpawn({ exitCode: 0, delayMs: 60_000, killImmediate: true });
+    let spawnCount = 0;
+    const fake: SpawnFn = (cmd, opts) => {
+      spawnCount += 1;
+      return spawnCount === 1 ? fakeH1(cmd, opts) : fakeH2(cmd, opts);
+    };
+
+    const hooks = [
+      makeSpec({ event: 'PreToolUse', command: 'h1', timeoutMs: 5_000 }),
+      makeSpec({ event: 'PreToolUse', command: 'h2', timeoutMs: 30_000, failClosed: true }),
+    ];
+    const payload = {
+      schema: 'v1',
+      event: 'PreToolUse',
+      sessionId: 'sess',
+      data: { tool: { name: 'bash', input: {} } },
+    } as HookEventPayload;
+
+    const start = Date.now();
+    const result = await dispatchChain(hooks, payload, '/cwd', { spawn: fake, now });
+    const realElapsed = Date.now() - start;
+
+    expect(result.runs).toHaveLength(2);
+    const h2 = result.runs[1]?.result;
+    expect(h2?.kind).toBe('timeout');
+    if (h2?.kind === 'timeout') {
+      // Clamped to remaining = 15000 - 14900 = 100ms (NOT 30000).
+      expect(h2.timeoutMs).toBe(100);
+    }
+    // Real wall-clock should be around the clamped timeout +
+    // dispatcher overhead — orders of magnitude under
+    // spec.timeoutMs=30000. Generous bound (3s) so a slow CI
+    // doesn't flake.
+    expect(realElapsed).toBeLessThan(3_000);
+  });
+
   test('chain timeout (15s wall-clock) skips remaining hooks', async () => {
     // CONTRACTS.md §10 line 1040: blockable-event chain has a
     // wall-clock cap of 15s. Inject a clock that jumps past

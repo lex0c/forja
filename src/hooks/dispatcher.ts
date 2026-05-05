@@ -80,6 +80,15 @@ export interface DispatcherDeps {
   // Linux runner can verify the Windows-fallback path without
   // actually running on Windows.
   shell?: HookShellResolution;
+  // Per-call timeout override. dispatchChain clamps each
+  // blocking hook's `spec.timeoutMs` against the remaining
+  // chain budget (`MAX_HOOK_CHAIN_MS - elapsed`) so a hook
+  // configured with `timeout_ms = 30000` can't push a chain
+  // past the 15s wall-clock cap. When set, dispatchOne uses
+  // this instead of `spec.timeoutMs` both for the timer AND
+  // for the audit row's recorded timeout. Caller must respect
+  // the operator's spec.timeoutMs as the upper bound.
+  effectiveTimeoutMs?: number;
 }
 
 // Spawn signature the dispatcher uses. Returns an interface
@@ -488,6 +497,11 @@ export const dispatchOne = async (
     kind: 'exited',
     code,
   }));
+  // Effective timeout: chain may clamp this below spec.timeoutMs
+  // when the chain budget is nearly exhausted (see DispatcherDeps
+  // doc). Audit row + result both record the EFFECTIVE value so
+  // forensic readers see the deadline that actually fired.
+  const effectiveTimeoutMs = deps.effectiveTimeoutMs ?? spec.timeoutMs;
   const timeoutPromise: Promise<RaceWinner> = new Promise((resolve) => {
     timeoutHandle = setTimeout(() => {
       proc.kill('SIGTERM');
@@ -495,7 +509,7 @@ export const dispatchOne = async (
         proc.kill('SIGKILL');
       }, 1000);
       resolve({ kind: 'timeout' });
-    }, spec.timeoutMs);
+    }, effectiveTimeoutMs);
   });
 
   const winner = await Promise.race([exitedPromise, timeoutPromise]);
@@ -538,7 +552,7 @@ export const dispatchOne = async (
 
   const result: HookRunResult =
     winner.kind === 'timeout'
-      ? { kind: 'timeout', timeoutMs: spec.timeoutMs, shouldBlock: spec.failClosed }
+      ? { kind: 'timeout', timeoutMs: effectiveTimeoutMs, shouldBlock: spec.failClosed }
       : classifyExitCode(exitCode, stdout, durationMs, spec.failClosed);
 
   // Emit audit row. Best-effort try/catch — DB failure must
@@ -624,7 +638,8 @@ export const dispatchChain = async (
   for (let i = 0; i < matching.length; i++) {
     const spec = matching[i];
     if (spec === undefined) continue;
-    if (isBlocking && now() - chainStarted > MAX_HOOK_CHAIN_MS) {
+    const elapsed = now() - chainStarted;
+    if (isBlocking && elapsed > MAX_HOOK_CHAIN_MS) {
       // Whole-chain timeout per CONTRACTS.md §10 line 1040.
       // Surface as a stderr warning + skip remaining hooks.
       // For audit clarity, we don't emit `hook_runs` rows for
@@ -636,6 +651,19 @@ export const dispatchChain = async (
       break;
     }
 
+    // Per-hook timeout clamped against the remaining chain
+    // budget for blocking events. Without this, a chain that
+    // reached t=14.9s could still launch a hook with
+    // spec.timeoutMs=30000 and run out to t=44.9s — violating
+    // the 15s wall-clock cap that CONTRACTS.md §10 line 1040
+    // advertises to callers. Non-blocking events don't gate
+    // anything, so their clamp is moot (chain return doesn't
+    // wait on them in spec terms; harness drains separately).
+    const remaining = MAX_HOOK_CHAIN_MS - elapsed;
+    const effectiveTimeoutMs = isBlocking
+      ? Math.max(1, Math.min(spec.timeoutMs, remaining))
+      : spec.timeoutMs;
+
     // Pass the SPEC'S OWN entryIndex, not `i` (the index in the
     // filtered `matching` array). With matcher filtering, `i`
     // would mismatch the operator's source-file position
@@ -645,7 +673,11 @@ export const dispatchChain = async (
     // Thread the already-resolved shell through to dispatchOne
     // so the chain doesn't re-resolve per hook. Passes the same
     // value already cached or test-injected at the chain layer.
-    const result = await dispatchOne(spec, spec.entryIndex, payload, cwd, { ...deps, shell });
+    const result = await dispatchOne(spec, spec.entryIndex, payload, cwd, {
+      ...deps,
+      shell,
+      effectiveTimeoutMs,
+    });
     runs.push({ spec, result });
 
     if (!isBlocking) continue;
