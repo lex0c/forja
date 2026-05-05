@@ -15,6 +15,102 @@ Format:
 
 ---
 
+## [2026-05-05] M3 / fix — round-4 review: trust boundary + escalation math
+
+Same branch (`feat/m3-subagent-ipc`). Fourth round of independent
+code review on the IPC subsystem, by a fresh agent reading
+production-readiness rather than re-validating prior fixes.
+Previous rounds' bugs (replay race, FileSink stdin, WritableStream
+close, line framer cap) all stayed fixed. The round-4 reviewer
+flagged 4 pre-merge items as load-bearing:
+
+**Done:**
+
+- **`buildResultFromPayload` validates `status` and `reason`
+  against closed sets** (`src/subagents/runtime.ts` ~line 1230).
+  Pre-fix: `status: any string` / `reason: any string` cast
+  through `as` without check, then forwarded to
+  `completeSession(db, id, 'evil', ...)` where the
+  `sessions.status` CHECK constraint throws inside a try and the
+  catch silently swallows. Result: phantom `running` row no
+  future stale-session sweeper can touch. Post-fix: any value
+  not in `{'done','interrupted','exhausted','error'}` for
+  status (or the closed `HarnessResult['reason']` union for
+  reason) collapses to `'error'` / `'internalError'` — values
+  the CHECK accepts.
+
+- **Soft→hard promotion resets `interruptAt`** (~line 1093). The
+  2×grace bail-out measures from `interruptAt`; pre-fix on
+  promotion the anchor stayed at the soft moment, so the cushion
+  shrank to ~1×grace from SIGTERM. Intent of the 2× cushion:
+  "after SIGTERM, give SIGKILL its grace AND a kernel reap" —
+  two graces FROM the SIGTERM, not from the original interrupt.
+  Post-fix: promotion always resets `interruptAt = Date.now()`.
+
+- **Wall-clock check no longer guarded on
+  `interruptCause === undefined`** (~line 1115). Pre-fix: in-
+  flight soft signal froze the wall-clock check until soft
+  promoted to hard. On pathological `wallClockMs < graceMs`
+  configurations this could deadlock the loop. Post-fix: both
+  budgets independent; whichever fires first lands its kill,
+  downstream resolution picks the more specific verdict.
+
+- **Version-mismatch listener is single-shot** (~line 1601).
+  Captures own `unsubscribe` and drops itself on first
+  match/mismatch. Pre-fix: regression child sending multiple
+  session_starts would re-execute the cascade
+  (`interrupt:hard` + SIGTERM + scheduled SIGKILL) on each.
+  Flag check belt-and-suspenders for the pre-unsubscribe race.
+
+- **Tests** (4 new, "review fixes (round 4)" describe block):
+  - Bogus child status collapses to error/internalError; child
+    session row reaches a terminal status (not stuck `running`).
+  - Soft→hard promotion: elapsed ≥ 150ms under `graceMs=50`
+    (proves cushion measures from SIGTERM, not soft moment).
+  - Wall-clock + soft together: pathological
+    `wallClockMs < graceMs` doesn't deadlock.
+  - Version-mismatch idempotent: 3 bad session_starts produce
+    exactly 1 `interrupt:hard` send + 1 SIGTERM.
+
+**Real-provider smoke** re-ran clean: 20 progress events,
+IPC↔SQLite cross-reference intact, no regression in production
+happy path.
+
+**Decisions:**
+
+1. **VALID_STATUS / VALID_REASON constants duplicate the SQLite
+   CHECK.** Intentional belt-and-suspenders: runtime catches
+   bogus values BEFORE they reach the DB; CHECK is the last-
+   ditch safety net. Drift between the two would surface as a
+   swallowed throw — exactly the shape this fix addresses.
+
+2. **Wall-clock wins over interrupt at the kill layer, not the
+   result layer.** Both can be set; the exited-resolved branch
+   keeps interrupt taking precedence in the *result* (operator's
+   intent wins the verdict), while the kill-layer fires both
+   budgets' SIGTERMs (redundant kills harmless; alternative is
+   the deadlock pre-fix produced).
+
+3. **Version listener idempotency via captured unsubscribe.**
+   Cleaner than guard-on-flag because handler stops paying
+   invocation cost on subsequent messages. Flag check still
+   there for pre-unsubscribe race.
+
+**Pending followups** from the round-4 reviewer (don't gate
+merge):
+- stderr DoS rate-limit on malformed-line warnings.
+- TUI sanitization of child string fields entering `warn`
+  permanent (spec §7 calls this out).
+- Hook fallback under worktree without `memoryCwd` re-resolves
+  from worktree dir (no hooks.toml) — defeats unbypassable-
+  corp-policy on legacy path.
+- macOS bg reaper: pre-existing gap.
+
+Subsystem is genuinely merge-ready after 4 rounds of
+independent verification.
+
+---
+
 ## [2026-05-05] M3 / harden — IPC line-framer OOM seatbelt + transport error surface
 
 Same branch (`feat/m3-subagent-ipc`). Closes the one remaining

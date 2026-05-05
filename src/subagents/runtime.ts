@@ -1089,9 +1089,17 @@ const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
     // scheduling SIGKILL after `graceMs`.
     const softExpired = interruptCause === 'soft' && Date.now() - interruptAt >= graceMs;
     if ((signal?.aborted === true || softExpired) && interruptCause !== 'hard') {
-      const promotedFromSoft = interruptCause === 'soft';
       interruptCause = 'hard';
-      if (!promotedFromSoft) interruptAt = Date.now();
+      // Reset interruptAt regardless of whether we're promoting
+      // from soft or starting fresh on hard. The 2×grace bail-out
+      // below measures from `interruptAt`; if we kept the soft
+      // moment as the anchor on promotion, the cushion would
+      // shrink to ~1×grace from the SIGTERM (graceMs already
+      // elapsed during the soft window). The intent of the
+      // 2× cushion is "after SIGTERM fires, give SIGKILL its
+      // grace AND a kernel reap window" — that's two graces
+      // FROM the SIGTERM, not from the original interrupt.
+      interruptAt = Date.now();
       if (handle.ipc !== undefined) {
         try {
           handle.ipc.send(makeInterruptHard());
@@ -1103,9 +1111,18 @@ const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
       scheduleKill();
     }
 
-    // Wall-clock budget exceeded — same escalation shape.
+    // Wall-clock budget exceeded — same escalation shape. We
+    // honor wall-clock even when an interrupt is in flight: the
+    // operator's two budgets are independent and both can fire
+    // (e.g. soft was sent and the child stalled past its
+    // wall-clock budget without acknowledging). Stamping
+    // `killed = 'wall_clock'` over an in-flight `interruptCause`
+    // gives the operator the more specific verdict — "we hit the
+    // budget cap" beats "we sent an abort signal" when both are
+    // true. The bail-out paths below already handle the case
+    // where both states are set.
     const elapsed = Date.now() - startTs;
-    if (elapsed >= wallClockMs && killed === undefined && interruptCause === undefined) {
+    if (elapsed >= wallClockMs && killed === undefined) {
       killed = 'wall_clock';
       killedAt = Date.now();
       handle.kill('SIGTERM');
@@ -1176,12 +1193,60 @@ const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
 // poller. Each missing or wrong-typed field falls back to a
 // safe default that surfaces as 'error' / reason='internalError'
 // downstream when it matters.
+// Closed sets of values the parent will accept from the child's
+// envelope. The previous implementation cast through `as` without
+// validation — a buggy or malicious child publishing
+// `status: "evil"` would land downstream as
+// `completeSession(db, id, 'evil', ...)`, where the `sessions.status`
+// CHECK constraint throws and the caller's catch block silently
+// swallows it. Result: phantom `running` row that no future
+// stale-session sweeper can clean up. Validating here at the trust
+// boundary keeps every downstream consumer honest.
+const VALID_STATUS: ReadonlySet<RunSubagentResult['status']> = new Set([
+  'done',
+  'interrupted',
+  'exhausted',
+  'error',
+]);
+
+const VALID_REASON: ReadonlySet<RunSubagentResult['reason']> = new Set([
+  // HarnessResult['reason'] union members
+  'done',
+  'aborted',
+  'maxSteps',
+  'maxCostUsd',
+  'maxWallClockMs',
+  'maxOutputTokens',
+  'degenerateLoop',
+  'internalError',
+  'userPromptBlocked',
+  // Subagent-runtime extensions
+  'worktree_create_failed',
+  'subprocess_crashed',
+  'subprocess_spawn_failed',
+  'heartbeat_stale',
+  'ipc_version_mismatch',
+]);
+
 const buildResultFromPayload = (
   payload: Record<string, unknown>,
   sessionId: string,
 ): RunSubagentResult => {
-  const status = (payload.status as RunSubagentResult['status']) ?? 'error';
-  const reason = (payload.reason as RunSubagentResult['reason']) ?? 'internalError';
+  // Status / reason validated against closed sets. Anything
+  // unrecognized collapses to status='error' / reason='internalError'
+  // — safe interpretation that the row CAN be finalized via
+  // `completeSession`'s CHECK constraint without a swallowed
+  // throw leaving the row as `running`.
+  const rawStatus = payload.status;
+  const status: RunSubagentResult['status'] =
+    typeof rawStatus === 'string' && VALID_STATUS.has(rawStatus as RunSubagentResult['status'])
+      ? (rawStatus as RunSubagentResult['status'])
+      : 'error';
+  const rawReason = payload.reason;
+  const reason: RunSubagentResult['reason'] =
+    typeof rawReason === 'string' && VALID_REASON.has(rawReason as RunSubagentResult['reason'])
+      ? (rawReason as RunSubagentResult['reason'])
+      : 'internalError';
   // Abort discriminator (S3): trust the child only when the
   // payload's `abort_cause` is a known value AND the reason is
   // 'aborted'. A producer bug that stamped `abort_cause` on a
@@ -1531,15 +1596,34 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // outcome handler downstream branches on this flag.
   let ipcVersionMismatch: number | undefined;
   if (handle.ipc !== undefined) {
-    handle.ipc.onMessage((msg) => {
+    // Idempotent on the FIRST mismatch only: the listener
+    // unsubscribes itself the moment it fires, so a child that
+    // (regression-bug) sends multiple session_starts won't
+    // re-execute the kill cascade + spawn extra orphan SIGKILL
+    // timers. The flag check is belt-and-suspenders for the
+    // race where a second message slipped past `unsub()`'s
+    // synchronous return.
+    let unsubscribe: (() => void) | undefined;
+    unsubscribe = handle.ipc.onMessage((msg) => {
+      if (ipcVersionMismatch !== undefined) return;
       if (msg.type !== 'session_start') return;
-      if (msg.protocolVersion === IPC_PROTOCOL_VERSION) return;
+      if (msg.protocolVersion === IPC_PROTOCOL_VERSION) {
+        // Match: we don't need to keep listening for further
+        // session_starts (a well-behaved child sends exactly
+        // one). Drop the subscription so this handler stays a
+        // single-shot.
+        unsubscribe?.();
+        unsubscribe = undefined;
+        return;
+      }
       // Mismatch: child speaks a version we don't recognize.
       // Record for the result-building branch and tear the
       // child down. Send interrupt:hard so a child that DOES
       // honor the wire (just not the version) still drains
       // cleanly; SIGTERM is the fallback.
       ipcVersionMismatch = msg.protocolVersion;
+      unsubscribe?.();
+      unsubscribe = undefined;
       try {
         handle.ipc?.send(makeInterruptHard());
       } catch {

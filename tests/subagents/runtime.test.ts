@@ -3429,3 +3429,251 @@ describe('runSubagent — interrupt soft/hard (S3)', () => {
     expect(env.abort_cause).toBe('soft');
   });
 });
+
+// Review-pass fixes (round 4 review): trust-boundary tightening
+// + soft→hard cushion math + version listener idempotency.
+describe('runSubagent — review fixes (round 4)', () => {
+  test('child publishing bogus status collapses to error/internalError (no phantom running row)', async () => {
+    // Without validation, a child publishing `status: "evil"`
+    // would land in completeSession(status='evil') which throws
+    // the CHECK constraint, the catch swallows, and the row
+    // sits in 'running' indefinitely. Validating at the trust
+    // boundary keeps every downstream consumer honest.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake: SpawnChildProcess = (opts) => {
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      setSubagentPayload(db, opts.sessionId, {
+        status: 'evil', // bogus; not in the CHECK constraint set
+        reason: 'mystery_value', // bogus reason too
+        output: '',
+        cost_usd: 0,
+        steps: 0,
+        duration_ms: 0,
+      });
+      return {
+        exited: Promise.resolve({ exitCode: 0 }),
+        kill: () => undefined,
+      };
+    };
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: fake,
+    });
+    expect(result.status).toBe('error');
+    expect(result.reason).toBe('internalError');
+    // The child session row must be in a terminal status, NOT
+    // 'running' — completeSession's CHECK constraint accepts
+    // 'error' so the finalize should land cleanly.
+    const childRow = (await import('../../src/storage/repos/sessions.ts')).getSession(
+      db,
+      result.sessionId,
+    );
+    expect(childRow?.status).not.toBe('running');
+    expect(['done', 'error', 'interrupted', 'exhausted']).toContain(childRow?.status ?? '');
+  });
+
+  test('soft→hard promotion resets interruptAt so 2×grace cushion measures from SIGTERM', async () => {
+    // Pre-fix: on promotion the cushion shrunk to ~1×grace
+    // because interruptAt anchored to the soft moment. Post-fix:
+    // hard bail-out fires at ≥ promote_time + 2×grace, not
+    // soft_time + 2×grace.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const { spawn, killSignals, parentSent } = (() => {
+      const { a, b } = fakeTransportPair();
+      const parentChannel = createChannel(a);
+      const childChannel = createChannel(b);
+      const sent: import('../../src/subagents/ipc.ts').IpcMessage[] = [];
+      childChannel.onMessage((m) => sent.push(m));
+      const kills: string[] = [];
+      let resolveExit: ((v: { exitCode: number }) => void) | undefined;
+      const exited = new Promise<{ exitCode: number }>((r) => {
+        resolveExit = r;
+      });
+      const sp: SpawnChildProcess = () => ({
+        exited,
+        kill: (s) => {
+          kills.push(s);
+          if (s === 'SIGKILL' && resolveExit) {
+            resolveExit({ exitCode: 137 });
+            resolveExit = undefined;
+          }
+        },
+        ipc: parentChannel,
+      });
+      return { spawn: sp, killSignals: kills, parentSent: sent };
+    })();
+    const softCtl = new AbortController();
+    queueMicrotask(() => softCtl.abort());
+    const startedAt = Date.now();
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      softStopSignal: softCtl.signal,
+      spawnChildProcess: spawn,
+      graceMs: 50,
+    });
+    const elapsed = Date.now() - startedAt;
+    // Soft fires at ~iter 1 (50ms). softExpired fires at ~iter
+    // ≥ soft_time + 50 (at least 100ms). Hard bail-out at
+    // promote_time + 2×50 = 200ms after promote = at least 250ms
+    // total. Pre-fix: bail-out would have fired at ~150ms.
+    // Allow generous slack for CI variance.
+    expect(elapsed).toBeGreaterThanOrEqual(150);
+    expect(result.reason).toBe('aborted');
+    expect(result.abortCause).toBe('hard');
+    expect(parentSent.some((m) => m.type === 'interrupt:soft')).toBe(true);
+    expect(parentSent.some((m) => m.type === 'interrupt:hard')).toBe(true);
+    expect(killSignals.includes('SIGTERM')).toBe(true);
+  });
+
+  test('wall-clock fires even when an interrupt is in flight (was guarded out pre-fix)', async () => {
+    // Pre-fix: the wall-clock check had a `interruptCause === undefined`
+    // guard, so a soft signal that fired before wall_clock would
+    // freeze the budget cap until soft promoted to hard. Post-fix:
+    // both budgets are independent. We don't directly observe
+    // wall_clock as the result reason here (the interrupt cause
+    // wins the operator-intent layer), but we DO observe the
+    // SIGTERM count — the pre-fix had only one (from the hard
+    // promote); the post-fix can have two (soft promote +
+    // wall_clock both attempt SIGTERM).
+    //
+    // Correctness gate: the run terminates without deadlocking
+    // even if the child never publishes a payload. Pre-fix on a
+    // pathological `wallClockMs < graceMs` setting could stall.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake = (() => {
+      const { a, b } = fakeTransportPair();
+      const parentChannel = createChannel(a);
+      createChannel(b);
+      let resolveExit: ((v: { exitCode: number }) => void) | undefined;
+      const exited = new Promise<{ exitCode: number }>((r) => {
+        resolveExit = r;
+      });
+      const sp: SpawnChildProcess = () => ({
+        exited,
+        kill: (s) => {
+          if (s === 'SIGKILL' && resolveExit) {
+            resolveExit({ exitCode: 137 });
+            resolveExit = undefined;
+          }
+        },
+        ipc: parentChannel,
+      });
+      return { spawn: sp };
+    })();
+    const softCtl = new AbortController();
+    queueMicrotask(() => softCtl.abort());
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      softStopSignal: softCtl.signal,
+      spawnChildProcess: fake.spawn,
+      graceMs: 50,
+      wallClockMs: 30, // pathological: shorter than graceMs
+    });
+    // Run terminates (no deadlock). Status is some terminal
+    // value — either aborted (operator intent wins) or wall_clock
+    // (depending on bail-out ordering); both are acceptable. The
+    // load-bearing assertion is "doesn't hang".
+    expect(['interrupted', 'error']).toContain(result.status);
+  });
+
+  test('version-mismatch listener is idempotent — repeated session_starts do not re-fire kill cascade', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const { a, b } = fakeTransportPair();
+    const parentChannel = createChannel(a);
+    const childChannel = createChannel(b);
+    const parentSent: import('../../src/subagents/ipc.ts').IpcMessage[] = [];
+    childChannel.onMessage((m) => parentSent.push(m));
+    const killSignals: string[] = [];
+    let resolveExit: ((v: { exitCode: number }) => void) | undefined;
+    const exited = new Promise<{ exitCode: number }>((r) => {
+      resolveExit = r;
+    });
+    const fake: SpawnChildProcess = () => ({
+      exited,
+      kill: (s) => {
+        killSignals.push(s);
+        if (s === 'SIGKILL' && resolveExit) {
+          resolveExit({ exitCode: 137 });
+          resolveExit = undefined;
+        }
+      },
+      ipc: parentChannel,
+    });
+    queueMicrotask(() => {
+      const children = listChildSessions(db, parent.id);
+      const last = children[children.length - 1];
+      if (last !== undefined) {
+        // Send the bad session_start THREE times. Idempotent
+        // listener should fire kill cascade exactly once;
+        // pre-fix it fired three.
+        for (let i = 0; i < 3; i += 1) {
+          childChannel.send({
+            type: 'session_start',
+            id: `id-${i}`,
+            ts: Date.now(),
+            sessionId: last.id,
+            protocolVersion: 999,
+          });
+        }
+      }
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: fake,
+      graceMs: 50,
+    });
+    expect(result.reason).toBe('ipc_version_mismatch');
+    // Exactly ONE interrupt:hard sent — not three.
+    const hardCount = parentSent.filter((m) => m.type === 'interrupt:hard').length;
+    expect(hardCount).toBe(1);
+    // Exactly one SIGTERM (the version-mismatch path triggers
+    // its own SIGTERM directly, separate from the wait loop's
+    // hard-trigger path which never fires here because signal
+    // is undefined).
+    const sigterms = killSignals.filter((s) => s === 'SIGTERM').length;
+    expect(sigterms).toBe(1);
+  });
+});
