@@ -3624,6 +3624,7 @@ describe('runSubagent — review fixes (round 4)', () => {
   // but this test catches behavioral drift if someone adds
   // a value to the map without exercising it.
   test.each([
+    // ExitReason members
     ['done', 'done'],
     ['providerError', 'error'],
     ['maxToolErrors', 'error'],
@@ -3632,6 +3633,16 @@ describe('runSubagent — review fixes (round 4)', () => {
     ['maxCostUsd', 'exhausted'],
     ['maxWallClockMs', 'interrupted'],
     ['userPromptBlocked', 'interrupted'],
+    // Child-emitted startup-refusal reasons (subagent-child.ts).
+    // These bypass the harness loop entirely; the parent's
+    // validator must preserve them verbatim instead of coercing
+    // to internalError, otherwise audit/automation that branches
+    // on the specific failure code loses the actionable signal
+    // (operator can't tell "wrong model in registry" from "tool
+    // typo in definition" from "definition file malformed").
+    ['unknown_model', 'error'],
+    ['unknown_tool', 'error'],
+    ['subagent_load_failed', 'error'],
   ] as const)(
     'child publishing reason=%s is preserved verbatim, not coerced',
     async (reason, statusForReason) => {

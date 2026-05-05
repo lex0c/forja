@@ -592,11 +592,24 @@ export interface RunSubagentResult {
   // subprocess_crashed, etc.).
   reason:
     | HarnessResult['reason']
+    // Parent-runtime synthesized — set when the child never
+    // reaches the harness loop OR dies before publishing a
+    // payload. Never emitted by the child itself.
     | 'worktree_create_failed'
     | 'subprocess_crashed'
     | 'subprocess_spawn_failed'
     | 'heartbeat_stale'
-    | 'ipc_version_mismatch';
+    | 'ipc_version_mismatch'
+    // Child-emitted (subagent-child.ts startup-refusal paths).
+    // The child publishes these in `setSubagentPayload` BEFORE
+    // entering the harness loop when its bootstrap detects an
+    // unrecoverable misconfiguration. The parent's payload
+    // validator preserves them verbatim so callers branching on
+    // specific failure codes (audit telemetry, retry logic,
+    // operator diagnostics) keep their fidelity.
+    | 'unknown_model'
+    | 'unknown_tool'
+    | 'subagent_load_failed';
   costUsd: number;
   steps: number;
   durationMs: number;
@@ -1320,16 +1333,23 @@ const VALID_REASON_MAP: Record<RunSubagentResult['reason'], true> = {
   internalError: true,
   scriptExhausted: true,
   userPromptBlocked: true,
-  // Subagent-runtime extensions (only synthesized parent-side
-  // when the child never reaches the harness loop or dies before
-  // publishing a payload — never appears in a child's envelope,
-  // but listing keeps the validator's surface symmetric with
-  // RunSubagentResult['reason']).
+  // Parent-side synthesized — never appears in a child's
+  // envelope, but listed for symmetry with the type union.
   worktree_create_failed: true,
   subprocess_crashed: true,
   subprocess_spawn_failed: true,
   heartbeat_stale: true,
   ipc_version_mismatch: true,
+  // Child-emitted startup-refusal reasons (subagent-child.ts).
+  // The child publishes these in `setSubagentPayload` BEFORE
+  // the harness loop runs, when its bootstrap detects an
+  // unrecoverable misconfiguration. Validator preserves them
+  // verbatim so audit telemetry / retry logic / operator
+  // diagnostics keep their fidelity instead of seeing every
+  // startup failure as `internalError`.
+  unknown_model: true,
+  unknown_tool: true,
+  subagent_load_failed: true,
 };
 const VALID_REASON: ReadonlySet<RunSubagentResult['reason']> = new Set(
   Object.keys(VALID_REASON_MAP) as RunSubagentResult['reason'][],
@@ -2190,7 +2210,10 @@ export interface SubagentEnvelope {
     | 'subprocess_crashed'
     | 'subprocess_spawn_failed'
     | 'heartbeat_stale'
-    | 'ipc_version_mismatch';
+    | 'ipc_version_mismatch'
+    | 'unknown_model'
+    | 'unknown_tool'
+    | 'subagent_load_failed';
   cost_usd: number;
   steps: number;
   duration_ms: number;
