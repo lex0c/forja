@@ -996,6 +996,45 @@ describe('readStream — OOM cap', () => {
     const result = await _readStreamForTests(stream);
     expect(result).toBe('');
   });
+
+  test('drains past cap to EOF (does not stop reading after buffer is full)', async () => {
+    // Sanity-revert: pre-fix, the loop broke on cap-reached,
+    // leaving any remaining chunks unconsumed in the stream.
+    // For a real subprocess pipe, that means the OS buffer
+    // fills, the child blocks on write(), the dispatcher's
+    // per-hook timer fires, and a chatty hook gets reported
+    // as `timeout` even though its logic completed. Drain-and-
+    // discard keeps the pipe flowing.
+    //
+    // We model the subprocess-pipe contract with a pull-based
+    // ReadableStream: each `pull` provides one chunk, and
+    // `pull` is invoked ONLY when the reader requests more.
+    // Pre-fix: reader bailed after the 2nd chunk filled the
+    // 16KB cap, so `pulled` froze at 2. Post-fix: reader
+    // drains every chunk to EOF, so `pulled` reaches the full
+    // count. Cleanest direct test of "did the reader keep
+    // consuming past cap?".
+    const chunkSize = 8 * 1024; // 8 KB
+    const totalChunks = 5; // 40 KB total — well past 16 KB cap
+    let pulled = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pulled >= totalChunks) {
+          controller.close();
+          return;
+        }
+        pulled += 1;
+        controller.enqueue(new Uint8Array(chunkSize).fill(65));
+      },
+    });
+    const result = await _readStreamForTests(stream);
+    // Buffered cap is honored — reader stored only 16KB
+    // regardless of how much it drained.
+    expect(new TextEncoder().encode(result).byteLength).toBe(STREAM_READ_CAP_BYTES);
+    // ALL chunks were pulled, including the ones past the
+    // cap. Pre-fix would have stopped at 2.
+    expect(pulled).toBe(totalChunks);
+  });
 });
 
 describe('dispatchChain — shell unavailable short-circuits', () => {

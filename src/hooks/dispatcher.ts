@@ -168,25 +168,43 @@ const readStream = async (stream: ReadableStream<Uint8Array>): Promise<string> =
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
-  // Read until EOF OR cap. The cap is enforced PER CHUNK before
-  // buffering — an earlier cut pushed each chunk first and
-  // checked total afterward, so a single multi-MB chunk would
-  // be fully buffered (defeating the OOM guard) before the
-  // post-push check broke the loop. Now: slice each chunk down
-  // to the remaining budget, push the slice, break when the
-  // budget is exhausted. Worst-case memory = exactly
-  // STREAM_READ_CAP_BYTES + one chunk-header overhead, no
-  // matter how large each chunk arrives.
+  // Read to EOF, but cap how much we BUFFER. Two layered caps:
+  //
+  //   - Buffer cap (STREAM_READ_CAP_BYTES): per-chunk slice
+  //     before push, so a single multi-MB chunk can't blow
+  //     past the cap by being pushed-then-checked.
+  //   - Drain semantics: AFTER the buffer cap is reached, we
+  //     keep reading and DISCARDING. Breaking out early would
+  //     leave bytes in the OS pipe buffer; once that fills,
+  //     the subprocess blocks on its next `write()` and never
+  //     exits — the dispatcher's per-hook timer fires and we
+  //     report `timeout` even though the hook's logic
+  //     completed. With failClosed=true on a blockable event,
+  //     a chatty-but-correct hook would wrongly deny the
+  //     gated tool. Drain-and-discard keeps the pipe flowing,
+  //     subprocess writes succeed, child exits naturally,
+  //     true exit code reaches classifyExitCode.
+  //
+  // Drain-and-discard (vs reader.cancel()) is deliberate:
+  // canceling the stream propagates to the source, closing
+  // the pipe's read end → child gets SIGPIPE / EPIPE on next
+  // write. Some operators' hooks ignore SIGPIPE and complete;
+  // others abort with a non-zero code that classifyExitCode
+  // would call an "error". Drain semantics give a stable
+  // contract: cap bounds memory, child sees a healthy pipe.
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     if (value === undefined) continue;
+    if (total >= STREAM_READ_CAP_BYTES) {
+      // Cap already reached — discard and keep draining so
+      // the subprocess's stdout pipe never fills.
+      continue;
+    }
     const remaining = STREAM_READ_CAP_BYTES - total;
-    if (remaining <= 0) break;
     const slice = value.byteLength <= remaining ? value : value.subarray(0, remaining);
     chunks.push(slice);
     total += slice.byteLength;
-    if (total >= STREAM_READ_CAP_BYTES) break;
   }
   if (chunks.length === 0) return '';
   const combined = new Uint8Array(total);
