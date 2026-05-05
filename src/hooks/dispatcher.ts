@@ -273,11 +273,62 @@ export interface ResolveHookShellOpts {
   env?: NodeJS.ProcessEnv;
 }
 
-const splitOverride = (raw: string): string[] =>
-  raw
-    .trim()
-    .split(/\s+/)
-    .filter((s) => s.length > 0);
+// Tokenize FORJA_HOOK_SHELL the way an operator would expect a
+// shell-style env var to parse: whitespace separates tokens UNLESS
+// inside matching `"` or `'` quotes. An earlier cut split on raw
+// whitespace, so a Windows operator setting
+// `"C:\Program Files\Git\bin\bash.exe" -lc` would see the binary
+// path shred into `"C:\Program`, `Files\Git\bin\bash.exe"`, and
+// `-lc` — the `which` lookup against the first token would fail
+// and the dispatcher would mark the shell unavailable, silently
+// skipping every hook.
+//
+// Lenient: unterminated quotes consume to end-of-string (POSIX sh
+// would error here, but operator typo-recovery is preferred to a
+// hard refusal). No backslash escape — operators with paths that
+// contain quote characters in the binary name are an unusual
+// edge case; quoting fully is the documented contract.
+const splitOverride = (raw: string): string[] => {
+  const out: string[] = [];
+  let buf = '';
+  let quote: '"' | "'" | null = null;
+  let inToken = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i] as string;
+    if (quote !== null) {
+      // Inside a quoted segment: anything except the matching
+      // close-quote is literal. Whitespace inside quotes does
+      // NOT split tokens.
+      if (c === quote) {
+        quote = null;
+      } else {
+        buf += c;
+      }
+      // Stay inToken so an empty-quoted "" still emits the
+      // current accumulator at token-end (rare but consistent
+      // with shell behavior).
+      inToken = true;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      quote = c;
+      inToken = true;
+      continue;
+    }
+    if (/\s/.test(c)) {
+      if (inToken) {
+        out.push(buf);
+        buf = '';
+        inToken = false;
+      }
+      continue;
+    }
+    buf += c;
+    inToken = true;
+  }
+  if (inToken) out.push(buf);
+  return out;
+};
 
 export const resolveHookShell = (opts: ResolveHookShellOpts = {}): HookShellResolution => {
   const platform = opts.platform ?? process.platform;

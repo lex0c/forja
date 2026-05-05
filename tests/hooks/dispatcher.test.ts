@@ -792,6 +792,72 @@ describe('resolveHookShell', () => {
       expect(r.argv).toEqual(['C:\\Windows\\System32\\powershell.exe', '-NoProfile', '-Command']);
     }
   });
+
+  test('FORJA_HOOK_SHELL with double-quoted path-with-spaces (Windows)', () => {
+    // Sanity-revert: pre-fix, raw whitespace split shredded the
+    // quoted Windows path `"C:\Program Files\Git\bin\bash.exe"`
+    // into 3 tokens (`"C:\Program`, `Files\Git\bin\bash.exe"`,
+    // `-lc`). `which` lookup against the first token failed and
+    // hooks degraded to "shell unavailable" silently. Fix
+    // honors POSIX shell quoting in the env override.
+    const fullPath = 'C:\\Program Files\\Git\\bin\\bash.exe';
+    const r = resolveHookShell({
+      platform: 'win32',
+      which: (b) => (b === fullPath ? fullPath : null),
+      env: { FORJA_HOOK_SHELL: `"${fullPath}" -lc` },
+    });
+    expect(r.kind).toBe('posix');
+    if (r.kind === 'posix') {
+      expect(r.argv).toEqual([fullPath, '-lc']);
+    }
+  });
+
+  test('FORJA_HOOK_SHELL with single-quoted path-with-spaces', () => {
+    const fullPath = '/Library/Application Support/agent/bin/sh';
+    const r = resolveHookShell({
+      platform: 'darwin',
+      which: (b) => (b === fullPath ? fullPath : null),
+      env: { FORJA_HOOK_SHELL: `'${fullPath}' -c` },
+    });
+    expect(r.kind).toBe('posix');
+    if (r.kind === 'posix') {
+      expect(r.argv).toEqual([fullPath, '-c']);
+    }
+  });
+
+  test('FORJA_HOOK_SHELL quoted args alongside unquoted bin', () => {
+    // Operator may quote a single arg (e.g. one with embedded
+    // spaces) while leaving others bare. Splitter must keep
+    // each quoted span as a single token regardless of
+    // position.
+    const r = resolveHookShell({
+      platform: 'linux',
+      which: (b) => (b === 'sh' ? '/bin/sh' : null),
+      env: { FORJA_HOOK_SHELL: 'sh -c "echo hello"' },
+    });
+    expect(r.kind).toBe('posix');
+    if (r.kind === 'posix') {
+      expect(r.argv).toEqual(['/bin/sh', '-c', 'echo hello']);
+    }
+  });
+
+  test('FORJA_HOOK_SHELL unterminated quote consumes to end (lenient)', () => {
+    // Operator typo: closing quote omitted. Strict POSIX would
+    // error; we'd rather recover gracefully — accumulate the
+    // remainder as the open token and let `which` decide if
+    // the binary exists.
+    const r = resolveHookShell({
+      platform: 'linux',
+      which: (b) => (b === '/bad path with no close' ? null : null),
+      env: { FORJA_HOOK_SHELL: '"/bad path with no close' },
+    });
+    expect(r.kind).toBe('unavailable');
+    if (r.kind === 'unavailable') {
+      // Reason mentions the bin name (the recovered token), not
+      // a parse-error message — this is operator-friendly.
+      expect(r.reason).toContain('/bad path with no close');
+    }
+  });
 });
 
 describe('readStream — OOM cap', () => {
