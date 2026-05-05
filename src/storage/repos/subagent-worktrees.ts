@@ -35,40 +35,31 @@ export interface InsertSubagentWorktreeInput {
   sessionId: string;
   path: string;
   branch: string;
-  // Terminal status at insert time. 4.2a is fully synchronous —
-  // worktree create + child run + cleanup happen in one call, so
-  // the audit row lands AFTER cleanup with the resolved state
-  // (`cleaned` or `preserved`). The `active` value is reserved
-  // for 4.2b+ when subprocess execution introduces a window
-  // where the row exists before the run completes; including it
-  // in the schema CHECK now keeps that future migration a one-row
-  // change instead of a constraint rewrite.
+  // Terminal status at insert time. 'active' is set on worktree
+  // creation and updated to 'cleaned' / 'preserved' at end-of-run.
+  // Callers that perform create + run + cleanup synchronously can
+  // insert directly with the terminal status.
   status: SubagentWorktreeStatus;
   // Stamps when the row's status reached its current value. For
   // `active` rows this is the worktree creation time; for
-  // `cleaned`/`preserved` it's the cleanup time. 4.2a only ever
-  // inserts terminal rows so this stamps cleanup; the audit
-  // consumer reads it as "row finalized at <ts>".
+  // `cleaned`/`preserved` it's the cleanup time.
   createdAt?: number;
   cleanedAt?: number;
 }
 
-// Insert a worktree audit row. 4.2a inserts ONCE post-cleanup with
-// the terminal status — the FK to `sessions(id)` requires the
-// child session to exist, and that happens inside `runAgent`, so
-// pre-creation insertion isn't possible without restructuring the
-// harness's session lifecycle. The intermediate `active` state
-// matters only when the subprocess work in 4.2b lets the audit
-// row outlive a parent crash; for in-process execution the post-
-// cleanup row is the honest record.
+// Insert a worktree audit row. The FK to `sessions(id)` requires
+// the child session to exist, and that happens inside `runAgent`.
+// The intermediate `active` state matters when the subprocess
+// flow lets the audit row outlive a parent crash; for synchronous
+// in-process execution the post-cleanup row is the honest record.
 export const insertSubagentWorktree = (
   db: DB,
   input: InsertSubagentWorktreeInput,
 ): SubagentWorktree => {
   const createdAt = input.createdAt ?? Date.now();
   // For terminal rows we default cleanedAt to createdAt; for
-  // 'active' rows it stays null (the cleanup pass will UPDATE
-  // when 4.2b wires that path).
+  // 'active' rows it stays null (the cleanup pass updates it
+  // at end-of-run).
   const cleanedAt = input.cleanedAt ?? (input.status === 'active' ? null : createdAt);
   db.query(
     `INSERT INTO subagent_worktrees
@@ -103,13 +94,12 @@ export const getSubagentWorktree = (db: DB, sessionId: string): SubagentWorktree
 };
 
 // Surface every worktree currently on disk according to the audit
-// table — both `active` (the 4.2b subprocess path will use this
-// status while a child runs) and `preserved` (4.2a's "child wrote
-// something, kept for inspection"). 'cleaned' rows are excluded
-// because the worktree dir + branch were already dropped. Used by
-// `agent worktree gc` (Step 4.2d); here in 4.2a, primarily for
-// tests and future read-side tooling. Order: oldest first, so a
-// sweep can act on the longest-orphaned ones up front.
+// table — both `active` (subprocess path while a child runs) and
+// `preserved` ("child wrote something, kept for inspection").
+// 'cleaned' rows are excluded because the worktree dir + branch
+// were already dropped. Used by `agent worktree gc`. Order:
+// oldest first, so a sweep can act on the longest-orphaned ones
+// up front.
 //
 // The earlier name was `listActiveSubagentWorktrees`, which
 // suggested the result was scoped to the 'active' status. It
@@ -128,7 +118,7 @@ export const listOnDiskSubagentWorktrees = (db: DB): SubagentWorktree[] => {
 };
 
 // Return every audit row, including 'cleaned'. The gc reconciler
-// (Step 4.2d) needs this because a 'cleaned' row whose worktree
+// needs this because a 'cleaned' row whose worktree
 // path still exists on disk indicates a previously-failed cleanup
 // — the gc retries removal in that case. `listOnDiskSubagentWorktrees`
 // excludes 'cleaned' rows by construction, which would hide that
@@ -146,7 +136,7 @@ export const listAllSubagentWorktrees = (db: DB): SubagentWorktree[] => {
 };
 
 // SubagentWorktree augmented with the parent session's cwd.
-// Scoped gc (Step 4.2d) needs the parent's cwd to filter rows
+// Scoped gc needs the parent's cwd to filter rows
 // to the repo gc was invoked from — but the comparison can't
 // happen at SQL level because `sessions.cwd` stores the
 // LITERAL path passed at session creation (e.g. an operator's
@@ -177,7 +167,7 @@ const fromRowWithParent = (
 });
 
 // Surface every audit row joined with its parent session's cwd.
-// Used by `agent --worktrees gc` (Step 4.2d) to scope rows to
+// Used by `agent --worktrees gc` to scope rows to
 // the repo gc was invoked from. The caller is expected to
 // canonicalize both `parentCwd` and the resolved repo root
 // before comparing.

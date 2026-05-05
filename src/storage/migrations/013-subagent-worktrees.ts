@@ -1,12 +1,12 @@
 export const migration013SubagentWorktrees = {
   id: 13,
   name: '013-subagent-worktrees',
-  // M3 / Step 4.2a — worktree audit trail. When a subagent declares
+  // Worktree audit trail. When a subagent declares
   // `isolation: worktree` (spec §11.2) the harness creates a git
   // worktree for the child run before invoking the loop. Without
   // persistence, a parent process crash (or even a clean exit) leaves
   // the operator with a worktree on disk and no record of which
-  // session owned it — `agent worktree gc` (Step 4.2d) needs the
+  // session owned it — `agent worktree gc` needs the
   // audit row to know what is safe to remove and what is still
   // attached to a live or paused session.
   //
@@ -28,7 +28,7 @@ export const migration013SubagentWorktrees = {
   //   stays NULL while status='active'; gets stamped on the
   //   transition to 'cleaned' or 'preserved'.
   //
-  // Index on `status` so the GC sweep (4.2d) can find every
+  // Index on `status` so the GC sweep can find every
   // 'active' row that has no live process attached, without
   // scanning the whole table.
   sql: `

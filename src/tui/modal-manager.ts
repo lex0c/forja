@@ -175,8 +175,8 @@ const PERMISSION_OPTIONS = (toolName: string): ConfirmOption[] => [
 export interface ModalManager {
   // Permission flavor. Returns the user's choice (or 'cancel' on Esc /
   // close / timeout). Callers translate semantics: yes → execute,
-  // session-allow → execute + write session-layer rule (deferred,
-  // see 1.d.7), no/cancel → deny.
+  // session-allow → execute + write session-layer rule (deferred),
+  // no/cancel → deny.
   askPermission: (args: PermissionAskArgs, opts?: ConfirmAskOptions) => Promise<PermissionAnswer>;
   // Trust flavor. Returns the operator's choice (or 'cancel' on Esc /
   // close / timeout). Caller (REPL boot) translates: yes → persist

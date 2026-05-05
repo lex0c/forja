@@ -52,7 +52,7 @@ export interface ToolMetadata {
   // boundary. It catches honest models that forget to declare
   // intent. It does NOT catch confused or adversarial models that
   // declare `read_only: true` while sending `echo x > file` —
-  // observed in practice (M2 / Step 6.5 baseline). Real protection
+  // observed in practice. Real protection
   // for adversarial inputs requires sandbox (spec §9.1, M3+).
   // The `writes: true` + omitted-predicate combo IS bullet-proof
   // because the harness never executes the tool. Use that for
@@ -76,10 +76,7 @@ export interface ToolMetadata {
   // tool-error at runtime. The validator pulls that runtime
   // error forward to bootstrap-time so a subagent author whose
   // whitelist includes a bg-bound tool finds out before first
-  // invocation. For the M3/4.2a subagent runtime, bgManager is
-  // never wired into the child harness (worktree subagents share
-  // the parent's bg log dir, which is unsafe); 4.2b will revisit
-  // by giving worktree subagents their own bg dir.
+  // invocation.
   requiresBgManager?: boolean;
   // Tool needs an interactive operator confirmation surface to run
   // (today only `memory_write`, which awaits the modal-bridge

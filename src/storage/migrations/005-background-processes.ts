@@ -1,7 +1,7 @@
 export const migration005BackgroundProcesses = {
   id: 5,
   name: '005-background-processes',
-  // M3 / Step 2.1. Spec §7.3 — `bash_background` spawns long-running
+  // Spec §7.3 — `bash_background` spawns long-running
   // processes (npm run dev, pytest --watch, builds) that outlive a single
   // turn. Their lifecycle (pid, command, status, output cursor) needs to
   // survive across model turns within a session and be visible in the

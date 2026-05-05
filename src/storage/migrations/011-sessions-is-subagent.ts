@@ -1,7 +1,7 @@
 export const migration011SessionsIsSubagent = {
   id: 11,
   name: '011-sessions-is-subagent',
-  // M3 / Step 4.1 review fix. Migration 010 added
+  // Migration 010 added
   // `parent_session_id` with ON DELETE SET NULL, which is the right
   // shape for the audit-survives-parent-purge property. But that
   // creates a second problem: `parent_session_id IS NULL` was being

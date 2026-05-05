@@ -3,7 +3,7 @@ import type { SubagentDefinition } from './types.ts';
 
 // Validate a subagent definition against the active tool registry.
 //
-// Step 4.1 safety depends on preventing any mutating tool from
+// Default-isolation safety depends on preventing any mutating tool from
 // running inside a default-isolation subagent because `runSubagent`
 // disables checkpoints (`enableCheckpoints: false`); a write tool
 // from a child session has no reverse path through `--undo`, and
@@ -15,7 +15,7 @@ import type { SubagentDefinition } from './types.ts';
 // not the name, so any future tool that declares writes inherits
 // the refusal automatically.
 //
-// Step 4.2 lifts this gate ONLY when the definition declares
+// This gate is lifted ONLY when the definition declares
 // `isolation: worktree` in its frontmatter — the child then runs
 // inside a dedicated git worktree (separate branch, separate
 // working tree from the parent), so write tools can mutate freely
@@ -43,8 +43,8 @@ import type { SubagentDefinition } from './types.ts';
 //      so the author gets a clean error instead of a deferred
 //      `headless_mode` rejection at first invocation.
 //
-// Step 4.2b.iv lifted the third check (`requiresBgManager`):
-// every subagent now gets its own bg log directory namespaced
+// `requiresBgManager` is not a third check: every subagent
+// gets its own bg log directory namespaced
 // under `<parentCwd>/.agent/bg/<childSessionId>/`, so
 // `bash_background` / `bash_output` / `bash_kill` /
 // process-aware `wait_for` and `monitor` are safe to expose. The

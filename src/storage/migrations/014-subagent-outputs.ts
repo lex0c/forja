@@ -1,21 +1,14 @@
 export const migration014SubagentOutputs = {
   id: 14,
   name: '014-subagent-outputs',
-  // M3 / Step 4.2b.i — IPC schema. Step 4.2b moves subagent
-  // execution from in-process to a separate Bun subprocess (spec
-  // AGENTIC_CLI §11:1030 — "mesmo binário, processo separado,
-  // comunicação via SQLite (write-only do filho, read-only do
-  // pai)"). The child writes its structured output and a periodic
-  // heartbeat into this table; the parent reads. No bidirectional
-  // channel — the only inputs the child needs are the definition
-  // (loaded from disk) and the user prompt (passed via the
-  // session row).
-  //
-  // 4.2b.i lands ONLY the schema + repo. The runtime code that
-  // actually writes/reads via subprocess lives in 4.2b.ii. The
-  // table arrives empty until 4.2b.ii ships; in-process subagents
-  // (4.2a) keep using `messages` and `sessions` for their final
-  // output without populating this table at all.
+  // IPC schema. Subagent execution runs in a separate Bun
+  // subprocess (spec AGENTIC_CLI §11:1030 — "mesmo binário,
+  // processo separado, comunicação via SQLite (write-only do
+  // filho, read-only do pai)"). The child writes its structured
+  // output and a periodic heartbeat into this table; the parent
+  // reads. No bidirectional channel — the only inputs the child
+  // needs are the definition (loaded from disk) and the user
+  // prompt (passed via the session row).
   //
   // Schema rationale:
   // - session_id (PK + FK CASCADE). 1:1 with sessions — each
@@ -57,11 +50,11 @@ export const migration014SubagentOutputs = {
   // never-heartbeated rows (which are either pre-spawn or
   // spawn-failed and don't need timeout treatment).
   //
-  // No index on `updated_at` today. If 4.2b.ii grows a query
-  // shape like "every row updated more than X ago" — e.g., a
+  // No index on `updated_at` today. If a future query shape
+  // like "every row updated more than X ago" appears — e.g., a
   // janitor that prunes stale outputs whose owning sessions
   // already finished — add a partial index in a follow-up
-  // migration (015 or later). The column is on the row by
+  // migration. The column is on the row by
   // design so future audit queries can use it; only the index
   // is deferred to "first real query".
   //

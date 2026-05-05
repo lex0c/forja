@@ -1,7 +1,7 @@
 export const migration017SessionsAbortCause = {
   id: 17,
   name: '017-sessions-abort-cause',
-  // M1 / Step 1.g.2 — persist the abort discriminator.
+  // Persist the abort discriminator.
   //
   // The harness already produces `HarnessResult.abortCause` ('soft' /
   // 'hard') when `reason === 'aborted'`, but that field died at the

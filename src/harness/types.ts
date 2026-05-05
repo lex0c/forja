@@ -296,7 +296,7 @@ export interface HarnessConfig {
   // work — operator UX: first Esc/Ctrl+C asks the loop to stop at
   // the next safe boundary, second Esc/Ctrl+C kills mid-tool.
   // Optional — when absent, the loop only honors the hard signal,
-  // preserving the pre-1.g.1 behavior.
+  // preserving the legacy behavior.
   softStopSignal?: AbortSignal;
   // Synchronous observer for lifecycle events. Throws are caught and
   // discarded so a buggy renderer doesn't kill the loop.
@@ -527,6 +527,6 @@ export interface HarnessResult {
   // is meaningless when the loop exited for budget caps, done, or a
   // non-abort error. Audit log + future telemetry need this to
   // distinguish "operator nudged" from "operator escalated";
-  // pre-1.g.2 both Esc and Esc-Esc produced identical HarnessResults.
+  // without this discriminator, both Esc and Esc-Esc would produce identical HarnessResults.
   abortCause?: 'soft' | 'hard';
 }

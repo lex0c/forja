@@ -1,7 +1,7 @@
 export const migration016MemoryEvents = {
   id: 16,
   name: '016-memory-events',
-  // M3 / Step 5.1 — memory subsystem audit table.
+  // Memory subsystem audit table.
   //
   // Spec MEMORY.md §5.3 mandates a single audit log for every
   // memory operation: proposed, created, edited, deleted, read,

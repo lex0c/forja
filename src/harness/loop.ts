@@ -1085,7 +1085,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               ? await finish('maxWallClockMs')
               : await finish('aborted', undefined, 'hard');
           }
-          // Cooperative-stop also honored mid-step (1.g.1, D158): if
+          // Cooperative-stop also honored mid-step: if
           // the model returned multiple tool_uses and soft fired
           // after the first one ran, don't keep executing the rest.
           // Already-executed tools' results were appended to the
@@ -1208,15 +1208,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     // the child run too. The child builds its own
                     // wall-clock on top of this.
                     signal,
-                    // Forward the cooperative-stop signal — wired
-                    // here so that when the in-process subagent path
-                    // lands (IPC slice unblocks 1.f.2), Esc-during-
-                    // task already routes correctly. Today the
-                    // subprocess path can't act on a soft signal (no
-                    // IPC); the parent blocks on `await runSubagent`
-                    // until the child finishes its full budget, then
-                    // the parent's top-of-loop soft check exits.
-                    // Documented gap (D159).
+                    // Forward the cooperative-stop signal —
+                    // runSubagent threads it across to the child via
+                    // IPC, so Esc-during-task routes to the child's
+                    // harness as `interrupt:soft` and the child exits
+                    // at its next step boundary.
                     ...(config.softStopSignal !== undefined
                       ? { softStopSignal: config.softStopSignal }
                       : {}),

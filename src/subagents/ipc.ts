@@ -15,14 +15,6 @@
 //      and DO NOT close the channel — spec §4.5: "log warning,
 //      descarta a linha".
 //
-// S1 lands the wire + transports + channel. The taxonomy already
-// reserves the message types S2 (HarnessEvent observability),
-// S3 (interrupt soft/hard), and S4 (tool warning) will populate.
-// Until those slices wire semantics, the only messages the child
-// emits are `session_start` (at boot, carries protocol version)
-// and `session_finished` (right before exit) — enough to prove
-// the wire is alive end-to-end without committing to event shapes.
-
 export const IPC_PROTOCOL_VERSION = 1;
 
 // Exit code the child uses when refusing on protocol version
@@ -39,7 +31,7 @@ export const IPC_VERSION_MISMATCH_EXIT_CODE = 64;
 
 interface CommonFields {
   // UUID v4 from the emitter. Uniqueness lets request/response
-  // pairs (S4 permission proxy) correlate across a single
+  // pairs correlate across a single
   // session. Debug correlation in audit too — pair an audit row
   // with the IPC line that produced it.
   id: string;
@@ -56,9 +48,9 @@ export type IpcCommand =
   | (CommonFields & { type: 'shutdown' });
 
 // Filho → pai. `event` carries an arbitrary HarnessEvent payload
-// — S2 narrows it to the full HarnessEvent union once that union
-// is in scope. `session_start` and `session_finished` bracket
-// every run; S1 emits both and S2-S4 add the in-between events.
+// (the consumer layer narrows it to the HarnessEvent union).
+// `session_start` and `session_finished` bracket every run; the
+// in-between events flow through `event`.
 export type IpcEvent =
   | (CommonFields & {
       type: 'session_start';
@@ -140,8 +132,8 @@ export const parseLine = (line: string): ParseResult => {
       break;
     }
     case 'event': {
-      // The `event` payload is opaque at this layer — S2 narrows
-      // it to HarnessEvent. We only verify the field exists so
+      // The `event` payload is opaque at this layer (the consumer
+      // narrows it to HarnessEvent). We only verify the field exists so
       // a sender bug ("forgot to include event") surfaces here
       // instead of as a confusing reducer crash downstream.
       if (!('event' in obj)) {

@@ -54,7 +54,7 @@ export type {
 export { resolveChildBinaryCmd, drainStderrToLogFile } from './spawn-factory.ts';
 
 // Filter the parent's registry down to a child registry. The
-// child runs in a SUBPROCESS (Step 4.2b.ii.a) and reads the
+// child runs in a SUBPROCESS and reads the
 // definition from `subagent_runs` itself; the parent never
 // passes the registry across the IPC boundary. This validation
 // is defense in depth: bootstrap pre-validates via
@@ -65,10 +65,9 @@ export { resolveChildBinaryCmd, drainStderrToLogFile } from './spawn-factory.ts'
 //      (typo — model would never recover)
 //   2. Tool declares writes:true but isolation is not worktree
 //
-// 4.2b.iv lifted the previous third condition (`requiresBgManager`)
-// — every subagent now gets its own bg log dir threaded across
-// via `--subagent-bg-log-dir`, so background-process tools are
-// safe to expose.
+// `requiresBgManager` is not a check — every subagent gets
+// its own bg log dir threaded across via `--subagent-bg-log-dir`,
+// so background-process tools are safe to expose.
 //
 // The validation runs only as a refusal gate — the returned
 // registry is unused on the subprocess path because the child
@@ -118,7 +117,7 @@ const assertWhitelistValidForSubagent = (
     }
     if (builtins !== null && builtins.get(toolName) === null) {
       // The parent's registry has this tool, but the builtin
-      // set doesn't. Subagent (4.2b.ii.a) requires builtin
+      // set doesn't. Subagent subprocesses require builtin
       // tools because the subprocess child rebuilds its
       // registry from `registerBuiltinTools()` — the only
       // tool source visible across the IPC boundary today.
@@ -128,7 +127,7 @@ const assertWhitelistValidForSubagent = (
       // at the parent's spawn time instead of letting the
       // child fail at startup with `unknown_tool`.
       throw new Error(
-        `subagent '${subagentName}': tool '${toolName}' is registered with the parent but NOT in the builtin set — subagent subprocesses (4.2b.ii.a) can only run with builtin tools because the child rebuilds its registry from registerBuiltinTools(). Custom tools require a transmission mechanism that lands with MCP / plugin support in a later slice.`,
+        `subagent '${subagentName}': tool '${toolName}' is registered with the parent but NOT in the builtin set — subagent subprocesses can only run with builtin tools because the child rebuilds its registry from registerBuiltinTools(). Custom tools require a transmission mechanism that lands with MCP / plugin support in a later slice.`,
       );
     }
   }
@@ -155,14 +154,10 @@ export interface RunSubagentInput {
   db: DB;
   cwd: string;
   signal?: AbortSignal;
-  // Cooperative-stop signal (1.g.1). Parent forwards its own
-  // softStopSignal here so the future in-process subagent path can
-  // honor it directly. Today's subprocess path CANNOT — there's no
-  // IPC channel between parent and child, only OS signals (which
-  // are inherently preemptive). When a parent's soft fires while a
-  // task() is in flight, the parent blocks until the child finishes
-  // its full budget, then the parent's top-of-loop soft check
-  // exits.
+  // Cooperative-stop signal. Parent forwards its own
+  // softStopSignal here; runSubagent threads it across to the
+  // child via IPC, which sends `interrupt:soft` so the child
+  // exits at its next step boundary.
   softStopSignal?: AbortSignal;
   // Lifecycle observer. The subprocess child can't stream events
   // directly to the parent (no IPC channel for that); the parent
@@ -224,7 +219,7 @@ export interface RunSubagentInput {
   // the wire (audit log replays, IPC contract tests). Production
   // consumers should prefer `onChildEvent` below.
   onIpcMessage?: (msg: IpcMessage) => void;
-  // Typed child-event observer (S2 of subagent observability).
+  // Typed child-event observer.
   // The runtime synthesizes three HarnessEvents around the
   // child's run:
   //   - `subagent_start` right after the child session row is
@@ -660,7 +655,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
         }
       });
     }
-    // Typed child-event forwarding (S2). For each `event` IPC
+    // Typed child-event forwarding. For each `event` IPC
     // variant arriving from the child, decode the inner
     // HarnessEvent and re-emit as `subagent_progress` on the
     // parent's observer. Drops nested subagent observability and
@@ -756,7 +751,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // bg DB rows should be in terminal status. But the child can
   // also exit via paths that bypass its own finally:
   //
-  //   - SIGKILL on heartbeat staleness (4.2b.ii.b): the harness's
+  //   - SIGKILL on heartbeat staleness: the harness's
   //     finally is uncatchable, the bg manager's cleanup never
   //     runs, and bg processes the child spawned are reparented
   //     to PID 1, kept alive by the kernel.
@@ -795,7 +790,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // changing, and the cleanup pass sees a deterministic snapshot.
   await reapChildBgProcesses(input.db, childSession.id);
 
-  // 7b. Cleanup worktree if isolated. Same contract as 4.2a:
+  // 7b. Cleanup worktree if isolated. Contract:
   // clean tree → remove; dirty tree → preserve.
   let cleanup: CleanupResult | undefined;
   let auditFailure: { code: string; message: string } | undefined;
@@ -833,7 +828,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // Re-query post-reap; if the DB shows no 'running' rows for
   // this child session, every process is accounted for and the
   // dir is safe to remove. Otherwise we leave it; `agent worktree
-  // gc` (4.2d) will reconcile alongside the audit table.
+  // gc` will reconcile alongside the audit table.
   let stillRunningCount: number;
   try {
     stillRunningCount = listBgProcessesBySession(input.db, childSession.id, {
@@ -852,7 +847,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     // (permission denied, disk full, etc.) get logged to stderr
     // so the operator knows the cache is leaking. Cleanup failure
     // never changes the run outcome — operator's `agent worktree
-    // gc` (4.2d) sweeps stragglers.
+    // gc` sweeps stragglers.
     try {
       rmSync(bgLogDir, { recursive: true, force: true });
     } catch (e) {
@@ -911,7 +906,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       break;
     }
     case 'aborted': {
-      // S3: surface the soft/hard discriminator from the wait
+      // Surface the soft/hard discriminator from the wait
       // outcome onto the synthesized result. The payload-arrived
       // path already pulls `abort_cause` off the child's envelope
       // via `buildResultFromPayload`; this branch is the
@@ -1021,7 +1016,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     // ignore — the row is already in a terminal state
   }
 
-  // Bracket close (S2): fire `subagent_finished` for the typed
+  // Bracket close: fire `subagent_finished` for the typed
   // observer. Summary picks the first non-blank line of the
   // child's output (capped at 80 chars) so the parent's
   // permanent line shows what the run actually produced.

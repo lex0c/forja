@@ -575,7 +575,7 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           subagentId: event.subagentId,
           progress,
         });
-        // S4: tool_warning from the child propagates as a top-level
+        // tool_warning from the child propagates as a top-level
         // `warn` so the operator sees the warning explicitly in the
         // permanent scrollback. Defensive field-presence guard:
         // the IPC `event` payload is `unknown` at the wire boundary
@@ -652,8 +652,8 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           // Wall-clock duration of the turn, plumbed to the
           // turn-end marker (UI.md §3.2 → "Cogitated for 1m23s").
           durationMs: r.durationMs,
-          // Pass-through abortCause when the harness produced one
-          // (1.g.3 closes D171). Meaningful only when reason ==='aborted'
+          // Pass-through abortCause when the harness produced one.
+          // Meaningful only when reason ==='aborted'
           // — the harness's finish() helper guarantees this invariant
           // by setting abortCause exclusively on the abort path.
           ...(r.abortCause !== undefined ? { abortCause: r.abortCause } : {}),

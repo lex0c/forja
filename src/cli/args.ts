@@ -44,12 +44,12 @@ export interface ParsedArgs {
   // dispatcher inside the handler.
   checkpoints?: { verb: string; positionals: string[] };
   // `--worktrees <verb> [positionals]` — operator surface for
-  // gc/list of subagent worktrees (Step 4.2d). Verbs: 'list',
+  // gc/list of subagent worktrees. Verbs: 'list',
   // 'gc'. `gc` accepts `--dry-run` and `--force` as
   // positionals (sub-flags); the handler interprets them.
   worktrees?: { verb: string; positionals: string[] };
   // `--memory <verb> [positionals]` — operator surface for
-  // inspecting cross-session memory (Step 5.2.b). Verbs:
+  // inspecting cross-session memory. Verbs:
   // 'list' (optional scope positional), 'show' (name + optional
   // scope). DB-only path; no provider call needed. The handler
   // builds a memory registry from the cwd and renders entries /
@@ -62,7 +62,7 @@ export interface ParsedArgs {
   // --list-sessions; standalone use is a parse error so the
   // truncation hint that points at this flag stays actionable.
   limit?: number;
-  // Subagent-child mode (M3 §11 / Step 4.2b.ii.a). The parent
+  // Subagent-child mode (spec §11). The parent
   // process spawns the same binary with this flag set; the value
   // is the pre-created child session id. Triggers a dedicated
   // entry path that loads the session + audit row, builds a

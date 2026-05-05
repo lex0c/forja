@@ -1,9 +1,9 @@
 export const migration015SubagentRunsPolicy = {
   id: 15,
   name: '015-subagent-runs-policy',
-  // M3 / Step 4.2b.ii.a follow-up — policy drift defense.
+  // Policy drift defense.
   //
-  // The 4.2b.ii.a subprocess flow had the child re-resolve
+  // The subprocess flow had the child re-resolve
   // `.agent/permissions.yaml` (+ enterprise + user layers) at
   // its own startup. If a human edited any of those files
   // between parent spawn and child startup (race window: ~ms

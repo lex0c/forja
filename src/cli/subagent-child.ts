@@ -36,7 +36,7 @@ import {
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 
-// M3 / Step 4.2b.ii.a — subagent-child entry path.
+// Subagent-child entry path.
 //
 // The parent invokes the same binary with `--subagent-session-id
 // <uuid>` to spawn an isolated child process. This module is that
@@ -307,7 +307,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     ipcChannel.send(makeSessionStart(opts.sessionId));
   }
 
-  // Soft/hard abort controllers (S3). Local to the child run and
+  // Soft/hard abort controllers. Local to the child run and
   // wired into the harness's `signal` / `softStopSignal` config
   // fields. The IPC channel routes parent commands here:
   //   - `interrupt:soft` aborts `softStopController` → harness
@@ -583,7 +583,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // empty, the child's harness loop builds the user message
     // from `config.userPrompt`. We pull it from the audit-adjacent
     // metadata: the parent stores the prompt in a sessions-extras
-    // location… but we don't have one yet. For 4.2b.ii.a, the
+    // location… but we don't have one yet. For now, the
     // parent passes the prompt by inserting it as the first
     // message BEFORE spawn; the child's harness then does NOT
     // append a fresh user message (preassignedSessionId path).
@@ -725,8 +725,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // can resolve grandchild names. Without this, the harness
       // loop's spawn closure stays undefined and every nested
       // task() invocation surfaces `subagent.unavailable` —
-      // breaking coordinator-style chains that 4.2a supported
-      // in-process.
+      // breaking coordinator-style chains.
       //
       // Conditional spread: when `task` isn't in the whitelist
       // we skipped the load above, so `subagents` is undefined.
@@ -770,9 +769,9 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // source path; future tools may add more) silently denies
       // even when the operator trusted the parent's cwd.
       isCwdTrusted: opts.cwdTrusted === true,
-      // Checkpoints stay off in 4.2b.ii.a — the worktree path
-      // already provides a separate branch for changes; per-step
-      // checkpoint chain inside the worktree lands in 4.2c.
+      // Checkpoints stay off — the worktree path already provides
+      // a separate branch for changes; a per-step checkpoint chain
+      // inside the worktree is a future addition.
       enableCheckpoints: false,
       // Per-subagent bg log directory. When omitted (older
       // parents, tests that route around the spawn) the harness
@@ -794,7 +793,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // (re-resolved here from the same repo root, so config
       // staleness across spawn isn't a concern).
       hooks: hookChain,
-      // S3: route IPC interrupt commands into the harness's
+      // Route IPC interrupt commands into the harness's
       // abort plumbing. The harness honors `signal` for hard
       // preemption (in-flight provider call abort) and
       // `softStopSignal` for cooperative exit at the next step
@@ -805,7 +804,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // semantics as omitting the fields.
       signal: signalController.signal,
       softStopSignal: softStopController.signal,
-      // IPC event forwarding (S2 of subagent observability,
+      // IPC event forwarding (subagent observability,
       // spec docs/spec/IPC.md §3.2). When the parent enabled the
       // channel, every HarnessEvent the child fires also lands
       // on the wire as an `event` IPC message. The parent's

@@ -70,8 +70,8 @@ export const bashOutputTool: Tool<BashOutputInput, BashOutputOutput> = {
     // reading output from a previously-approved process opens no
     // new attack surface. Operators who want to deny output reads
     // for already-spawned processes don't have a clean policy
-    // surface today; that's a known gap (see BACKLOG Step 2.1
-    // risks). The right defense is denying spawn at policy time.
+    // surface today; that's a known gap. The right defense is
+    // denying spawn at policy time.
     category: 'misc',
     writes: false,
     // Hard dependency on `ToolContext.bgManager`. Pulled forward

@@ -49,10 +49,8 @@ export interface RunSubagentResult {
   //     mid-step (signal abort in-flight). Reached when the
   //     parent sent `interrupt:hard` OR the soft escalation
   //     timed out.
-  // Pre-S3 every subprocess abort surfaced as 'hard' implicitly
-  // because the only kill path was OS SIGTERM. Now: undefined for
-  // every non-abort outcome, set explicitly when the wire carried
-  // the resolution.
+  // Undefined for every non-abort outcome; set explicitly when
+  // the wire carried the resolution.
   abortCause?: 'soft' | 'hard';
 }
 
@@ -147,7 +145,7 @@ export const buildResultFromPayload = (
     typeof rawReason === 'string' && VALID_REASON.has(rawReason as RunSubagentResult['reason'])
       ? (rawReason as RunSubagentResult['reason'])
       : 'internalError';
-  // Abort discriminator (S3): trust the child only when the
+  // Abort discriminator: trust the child only when the
   // payload's `abort_cause` is a known value AND the reason is
   // 'aborted'. A producer bug that stamped `abort_cause` on a
   // non-abort path would otherwise mislead the parent's audit;
@@ -169,8 +167,7 @@ export const buildResultFromPayload = (
 };
 
 // Surface the spec'd "structured" envelope for the calling tool.
-// Same shape the in-process path used in 4.2a; kept stable across
-// the subprocess refactor so consumers don't break.
+// Stable shape — consumers depend on the keys here.
 export interface SubagentEnvelope {
   output: string;
   session_id: string;
@@ -188,7 +185,7 @@ export interface SubagentEnvelope {
   cost_usd: number;
   steps: number;
   duration_ms: number;
-  // Soft/hard abort discriminator (S3). Snake_cased for the
+  // Soft/hard abort discriminator. Snake_cased for the
   // tool-facing envelope; mirrors the camelCased
   // `RunSubagentResult.abortCause`. Absent for non-abort outcomes.
   abort_cause?: 'soft' | 'hard';

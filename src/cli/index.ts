@@ -41,7 +41,7 @@ const main = async (): Promise<number> => {
     });
   }
 
-  // Subagent-child mode (Step 4.2b.ii.a). The parent process
+  // Subagent-child mode. The parent process
   // spawns the same binary with this flag set; the value is the
   // pre-created child session id. Short-circuits ALL other entry
   // paths — no prompt, no list-sessions, no resume, no plan.

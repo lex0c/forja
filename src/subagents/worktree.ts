@@ -17,7 +17,7 @@ import { type ValidationResult, validateWorktreeContents } from './worktree-vali
 //   - No reuse of the checkpoints/git.ts helpers because their
 //     `runGit` is file-private and tuned for index-isolated
 //     snapshots; pulling those into a shared surface would force
-//     a refactor that is not load-bearing for 4.2a.
+//     a refactor that is not load-bearing today.
 //   - No persistence here; the repo / migration owns that.
 //   - SECURITY §8.4 hardening (symlink boundary + deny-list copy
 //     filter) lives in `worktree-validation.ts` and runs as a
@@ -237,7 +237,7 @@ export const createWorktree = async (opts: CreateWorktreeOptions): Promise<Workt
   const path = join(root, opts.sessionId);
   if (existsSync(path)) {
     throw new Error(
-      `worktree path '${path}' already exists; an earlier run may have crashed before cleanup. Remove it manually or wait for 'agent worktree gc' (Step 4.2d).`,
+      `worktree path '${path}' already exists; an earlier run may have crashed before cleanup. Remove it manually or wait for 'agent worktree gc'.`,
     );
   }
   const branch = branchName(opts.sessionId, opts.prompt);
@@ -369,7 +369,7 @@ export const createWorktree = async (opts: CreateWorktreeOptions): Promise<Workt
 // the run already passed validation and the worktree is in a
 // secure state; the worst case from a skip-worktree failure is
 // a preserved-but-cleanable worktree at end of run, which the
-// operator's `agent worktree gc` (4.2d) reconciles.
+// operator's `agent worktree gc` reconciles.
 const markValidatorDeletionsSkipWorktree = async (
   worktreePath: string,
   deniedRemoved: ReadonlyArray<{ path: string; pattern: string }>,
@@ -439,7 +439,7 @@ export interface CleanupResult {
 // and the result is authoritative. Failures during remove leave
 // the worktree on disk (preserved: true) with the failure
 // captured on stderr; the operator deals with it through
-// `agent worktree gc` later (4.2d).
+// `agent worktree gc` later.
 export const cleanupWorktree = async (opts: CleanupWorktreeOptions): Promise<CleanupResult> => {
   const { handle, parentCwd } = opts;
   // First check: did the child re-create or modify any path

@@ -1,7 +1,7 @@
 export const migration010Subagents = {
   id: 10,
   name: '010-subagents',
-  // M3 / Step 4.1. Spec §11: subagents run in their own session,
+  // Spec §11: subagents run in their own session,
   // isolated context, restricted toolset and budget. The spec defers
   // the inter-process detail to a later step (§11.2 worktree); for
   // now we run subagents in-process but still spawn a fresh session

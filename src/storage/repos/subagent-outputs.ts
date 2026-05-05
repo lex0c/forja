@@ -1,8 +1,7 @@
 import type { DB } from '../db.ts';
 
 // Repo for `subagent_outputs` (migration 014). The IPC table
-// the 4.2b.ii subprocess work will write into. 4.2b.i lands the
-// helpers; the runtime caller arrives in .ii.
+// the subprocess flow writes into.
 //
 // Two write paths matter:
 //   1. `insertSubagentOutput` — child subprocess creates its
@@ -79,7 +78,7 @@ const fromRow = (row: SubagentOutputRow): SubagentOutput => ({
 
 export interface InsertSubagentOutputInput {
   sessionId: string;
-  // Optional initial payload. The 4.2b.ii subprocess flow inserts
+  // Optional initial payload. The subprocess flow inserts
   // with null payload (the row precedes any output the child
   // publishes); leaving it optional here lets tests stage a
   // pre-populated row without a follow-up update.
@@ -129,7 +128,7 @@ export const insertSubagentOutput = (db: DB, input: InsertSubagentOutputInput): 
 // suspiciously old (e.g., the child wrote a payload but didn't
 // touch the heartbeat for a few cycles before exit).
 //
-// Throws when no row exists for `sessionId`. The 4.2b.ii flow
+// Throws when no row exists for `sessionId`. The subprocess flow
 // always inserts before the first heartbeat, so a missing row
 // indicates a programmer / sequencing bug rather than a runtime
 // state.

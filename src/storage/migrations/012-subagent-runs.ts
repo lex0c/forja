@@ -1,7 +1,7 @@
 export const migration012SubagentRuns = {
   id: 12,
   name: '012-subagent-runs',
-  // M3 / Step 4.1 audit fix (option A in the discussion). Subagent
+  // Subagent
   // definitions live in `.md` files on disk; the harness loads them
   // at bootstrap and uses systemPrompt + tools to shape the child
   // run, but neither field is persisted into messages or sessions.

@@ -24,7 +24,7 @@ const FRONTMATTER_DELIM = '---';
 // Note on tool capability validation: the loader is REGISTRY-AGNOSTIC
 // — it doesn't know which tools the harness has wired or what their
 // metadata says. Validation that depends on tool capabilities (write
-// detection for the Step 4.1 worktree-blocking rule) lives in
+// detection for the worktree-blocking rule) lives in
 // `validate.ts` and runs at bootstrap (against the loaded registry)
 // AND at runtime (in `runSubagent`'s child-registry construction).
 // Earlier we hardcoded a name list here, which silently let any
@@ -220,8 +220,8 @@ const parseDefinition = (
 };
 
 // Parse the optional `isolation` frontmatter field. Defaults to
-// 'none' when absent so every Step 4.1 definition keeps its prior
-// behavior. Only 'none' and 'worktree' are accepted in 4.2 — any
+// 'none' when absent so every existing definition keeps its prior
+// behavior. Only 'none' and 'worktree' are accepted — any
 // other string fails loud at load time so a typo
 // (`isolation: worktee`) doesn't silently downgrade to no isolation.
 const parseIsolation = (raw: unknown, sourcePath: string): SubagentIsolation => {

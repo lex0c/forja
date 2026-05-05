@@ -1,7 +1,4 @@
 // Memory subsystem barrel.
-//
-// Step 5.1 lands the storage primitives. Higher slices (5.2+)
-// will re-export their tools/CLI surface alongside these.
 
 export type {
   IndexEntry,

@@ -1,11 +1,11 @@
 // Sensitive path deny-list (spec §8.4). Lives under `subagents/`
-// because the first consumer is the worktree pre-spawn filter
-// (4.2b.iii). Future consumers — `read_file` / `write_file`
-// runtime checks (§8.4 points 1 and 2) — will import the same
-// constant and matcher to keep one source of truth for what
-// counts as "sensitive". When that wiring lands, this file may
-// migrate to `src/security/` or similar; the patterns and the
-// matcher API stay stable.
+// because the first consumer is the worktree pre-spawn filter.
+// Future consumers — `read_file` / `write_file` runtime checks
+// (§8.4 points 1 and 2) — will import the same constant and
+// matcher to keep one source of truth for what counts as
+// "sensitive". When that wiring lands, this file may migrate to
+// `src/security/` or similar; the patterns and the matcher API
+// stay stable.
 
 import { Glob } from 'bun';
 

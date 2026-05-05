@@ -1,12 +1,4 @@
 // Shared types for the memory subsystem (spec MEMORY.md).
-//
-// Step 5.1 lands the storage primitives: types, frontmatter
-// parser/writer, scope/path resolver, MEMORY.md index handling,
-// memory_events audit table, and the auto-generated
-// .agent/.gitignore. Tools (memory_read/write/list/search), TUI
-// confirmation, trust integration, promote/demote, and lifecycle
-// arrive in later slices (5.2–5.6). This file holds the type
-// vocabulary the rest of the slice (and future slices) builds on.
 
 // The four memory categories defined in spec §1. Validation gates
 // reject anything else — categorising memory is the first defense

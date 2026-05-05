@@ -74,8 +74,8 @@ export interface SubagentDefinition {
   // surfaces in error messages and `--list-subagents` (later).
   scope: SubagentScope;
   // Isolation strategy. Defaults to `none` when the frontmatter
-  // omits the `isolation` field — preserves the Step 4.1 contract
-  // for every existing definition.
+  // omits the `isolation` field — preserves the contract for
+  // every existing definition.
   isolation: SubagentIsolation;
   sourcePath: string;
   // SHA-256 of the raw `.md` content (frontmatter + body) at load

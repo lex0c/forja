@@ -2,7 +2,7 @@ import { existsSync, statSync } from 'node:fs';
 import { connect } from 'node:net';
 import type { BgManager } from '../bg/index.ts';
 
-// Re-exports for the monitor primitive (Step 2.2.4) — sibling
+// Re-exports for the monitor primitive — sibling
 // streaming-observation module. Lives in a separate file so the
 // wait_for code stays focused.
 export type {
@@ -20,10 +20,6 @@ export { monitor } from './monitor.ts';
 // only wall-clock cost. The harness's combined signal (caller abort
 // + maxWallClockMs) cascades through `options.signal`, so a Ctrl+C
 // or wall-clock cap aborts the wait promptly.
-//
-// Conditions in this slice (Step 2.2.1) are non-bg utility waits.
-// Process-aware conditions (`process_exit`, `process_output`) and
-// composition (`all_of`, `any_of`) land in 2.2.2 / 2.2.3.
 
 export type WaitCondition =
   | { kind: 'sleep'; durationMs: number }
@@ -563,9 +559,8 @@ export const waitFor = async (
   // Each poll re-reads the last PATTERN_OVERLAP_BYTES of the
   // previous chunk alongside the new bytes, so a pattern that
   // straddles a poll boundary still matches. Patterns longer than
-  // the overlap risk getting missed — documented as a Step 2.2.2
-  // risk; configurable overlap can land if a real workflow needs
-  // longer patterns.
+  // the overlap risk getting missed — configurable overlap can
+  // land if a real workflow needs longer patterns.
   const PATTERN_OVERLAP_BYTES = 64;
 
   while (true) {

@@ -133,8 +133,8 @@ export type SpawnChildProcess = (opts: SpawnChildProcessOptions) => ChildProcess
 // compiled mode it's the literal string 'bun' (Bun spoofs it
 // for Node.js-compatibility) — using it as the cmd[0] would
 // spawn the bun CLI instead of re-invoking the compiled agent
-// binary, which is the original 4.2b.ii.a regression this
-// resolver was written for. Always use execPath, never argv[0].
+// binary, which is the original regression this resolver was
+// written for. Always use execPath, never argv[0].
 //
 // In dev we additionally need to pass the entry script as
 // argv[1] so the interpreter knows what to run. The detection

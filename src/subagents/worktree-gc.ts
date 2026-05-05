@@ -77,7 +77,7 @@ export type WorktreeGcEntry =
       path: string;
       branch: string;
       sessionId: string;
-      reason: 'row_status_active'; // 4.2b: subprocess running, do not touch
+      reason: 'row_status_active'; // subprocess running, do not touch
     };
 
 export interface WorktreeGcPlan {
@@ -443,8 +443,8 @@ export const buildGcPlan = async (opts: BuildGcPlanOptions): Promise<WorktreeGcP
       }
     })();
 
-    // Active rows are off-limits. The 4.2b subprocess path
-    // inserts 'active' before spawn; gc must never touch a
+    // Active rows are off-limits. The subprocess path inserts
+    // 'active' before spawn; gc must never touch a
     // worktree whose subagent is still running.
     if (dbRow?.status === 'active') {
       entries.push({

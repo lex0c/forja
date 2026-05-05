@@ -78,7 +78,7 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
   metadata: {
     // Subagents are gated as their own permission category — the
     // `subagent` policy section can lock which agents are spawnable
-    // and from which scopes. Step 4.1 wires the route as `misc` so
+    // and from which scopes. The route is wired as `misc` so
     // we don't introduce a new policy section before its rules are
     // designed; the engine still gates per the `misc` defaults.
     // Migration to a dedicated `subagent` category lands when the

@@ -54,7 +54,7 @@ interface WaitForChildArgs {
   sessionId: string;
   handle: ChildProcessHandle;
   signal: AbortSignal | undefined;
-  // S3: parent's cooperative-stop signal. Triggers `interrupt:soft`
+  // Parent's cooperative-stop signal. Triggers `interrupt:soft`
   // over IPC; the child's harness exits at the next step boundary.
   // Without IPC, no-op for the subprocess path (the OS has no
   // cooperative signal). Hard `signal` above remains the
@@ -138,7 +138,7 @@ export const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome>
   // the outcome.
   let killed: 'wall_clock' | 'heartbeat_stale' | undefined;
   let killedAt = 0;
-  // S3: tri-state tracking the parent's cooperative-vs-preemptive
+  // Tri-state tracking the parent's cooperative-vs-preemptive
   // escalation against the child.
   //   - undefined: no abort signaled.
   //   - 'soft':    parent pressed Esc once; we sent `interrupt:soft`

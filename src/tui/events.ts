@@ -80,7 +80,7 @@ export type SessionEndEvent = BaseEvent & {
   // legacy / replay paths that don't have timing — production
   // emitters always set it.
   durationMs?: number;
-  // Mirrors HarnessResult.abortCause (1.g.2). Only meaningful when
+  // Mirrors HarnessResult.abortCause. Only meaningful when
   // reason === 'aborted' — discriminates operator-initiated cooperative
   // ('soft') from preemptive ('hard'). NDJSON consumers and the
   // scrollback footer use this to distinguish "operator nudged" from

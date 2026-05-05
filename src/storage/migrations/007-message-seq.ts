@@ -1,7 +1,7 @@
 export const migration007MessageSeq = {
   id: 7,
   name: '007-message-seq',
-  // M3 / Step 2.4 code review fix. Resume reconstitutes
+  // Resume reconstitutes
   // ProviderMessage[] from listMessagesBySession, which previously
   // ordered by `created_at, id`. created_at is millisecond-granular
   // (Date.now), so two messages appended within the same ms tie on

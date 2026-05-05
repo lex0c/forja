@@ -1,7 +1,7 @@
 export const migration006BgStderrCursor = {
   id: 6,
   name: '006-bg-stderr-cursor',
-  // M3 / Step 2.1 code review fix. The original 005 schema kept a single
+  // The original 005 schema kept a single
   // cursor_position. Manager.readOutput advanced that cursor by stdout's
   // window end and reused the same offset for stderr — a pattern that
   // silently loses stderr writes once stdout outpaces stderr in bytes:
