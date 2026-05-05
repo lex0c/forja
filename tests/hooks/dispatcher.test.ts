@@ -841,6 +841,41 @@ describe('resolveHookShell', () => {
     }
   });
 
+  test('FORJA_HOOK_SHELL=cmd.exe with no flag defaults to /c (not -c)', () => {
+    // Sanity-revert: pre-fix, the override default flag was
+    // hardcoded to `-c` regardless of binary kind. An operator
+    // setting just `FORJA_HOOK_SHELL=cmd.exe` would spawn
+    // `cmd.exe -c <expanded>`, which cmd rejects ("no such
+    // command -c") — every hook would error out and a
+    // failClosed blocking hook would deny the gated tool for
+    // the wrong reason (shell-flag error, not hook logic).
+    // Fix: shell-aware default `/c` for cmd-like binaries.
+    const r = resolveHookShell({
+      platform: 'win32',
+      which: (b) => (b === 'cmd.exe' ? 'C:\\Windows\\System32\\cmd.exe' : null),
+      env: { FORJA_HOOK_SHELL: 'cmd.exe' },
+    });
+    expect(r.kind).toBe('cmd');
+    if (r.kind === 'cmd') {
+      expect(r.argv).toEqual(['C:\\Windows\\System32\\cmd.exe', '/c']);
+    }
+  });
+
+  test('FORJA_HOOK_SHELL=cmd.exe /k honors operator-specified flag', () => {
+    // When the operator passes a flag explicitly, we DO NOT
+    // override it — `/k` (keep cmd open after running) is a
+    // valid choice for some debugging workflows.
+    const r = resolveHookShell({
+      platform: 'win32',
+      which: (b) => (b === 'cmd.exe' ? 'C:\\Windows\\System32\\cmd.exe' : null),
+      env: { FORJA_HOOK_SHELL: 'cmd.exe /k' },
+    });
+    expect(r.kind).toBe('cmd');
+    if (r.kind === 'cmd') {
+      expect(r.argv).toEqual(['C:\\Windows\\System32\\cmd.exe', '/k']);
+    }
+  });
+
   test('FORJA_HOOK_SHELL unterminated quote consumes to end (lenient)', () => {
     // Operator typo: closing quote omitted. Strict POSIX would
     // error; we'd rather recover gracefully — accumulate the

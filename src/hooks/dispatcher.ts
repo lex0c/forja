@@ -344,7 +344,6 @@ export const resolveHookShell = (opts: ResolveHookShellOpts = {}): HookShellReso
   if (override !== undefined && override.length > 0) {
     const parts = splitOverride(override);
     const bin = parts[0];
-    const flagArgs = parts.length > 1 ? parts.slice(1) : ['-c'];
     if (bin === undefined) {
       return { kind: 'unavailable', reason: 'FORJA_HOOK_SHELL is set but empty after split' };
     }
@@ -362,6 +361,14 @@ export const resolveHookShell = (opts: ResolveHookShellOpts = {}): HookShellReso
     // POSIX semantics — operator override is expected to know
     // what they're doing.
     const looksLikeCmd = /(?:^|[/\\])cmd(?:\.exe)?$/i.test(found);
+    // Default flag is shell-aware: cmd.exe accepts only `/c` or
+    // `/k` (Microsoft `cmd [/c|/k]`). Defaulting to `-c` for
+    // cmd would spawn `cmd.exe -c <expanded>` and fail with
+    // "no such command -c", surfacing as a hook-error outcome —
+    // worst case a failClosed blocking hook denies the gated
+    // tool for the wrong reason. POSIX shells take `-c`. When
+    // the operator passed flags explicitly, honor them as-is.
+    const flagArgs = parts.length > 1 ? parts.slice(1) : looksLikeCmd ? ['/c'] : ['-c'];
     return {
       kind: looksLikeCmd ? 'cmd' : 'posix',
       argv: [found, ...flagArgs],
