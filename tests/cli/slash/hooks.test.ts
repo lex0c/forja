@@ -484,6 +484,31 @@ describe('/hooks audit', () => {
     expect(r.kind).toBe('error');
   });
 
+  test('--limit rejects partial-numeric coercion (sanity-revert)', async () => {
+    // Sanity-revert: pre-fix used Number.parseInt which
+    // silently coerced `20foo` → 20 and `1e3` → 1 (parseInt
+    // stops at the first non-digit). Operator typos produced
+    // surprising audit output instead of an error matching
+    // the documented "positive integer" message. Strict regex
+    // gates the parse now.
+    const { ctx } = makeCtx([]);
+    for (const bad of ['20foo', '1e3', '20.5', ' 20', '20 ', '+20', '0x10', '', '-5']) {
+      const r = await hooksCommand.exec(['audit', '--limit', bad], ctx);
+      expect(r.kind).toBe('error');
+      if (r.kind === 'error') {
+        expect(r.message).toContain('positive integer');
+      }
+    }
+  });
+
+  test('--limit accepts canonical integer strings', async () => {
+    const { ctx } = makeCtx([]);
+    const r = await hooksCommand.exec(['audit', '--limit', '20'], ctx);
+    // No rows in DB → "no runs" note; importantly NOT an
+    // error (the value parsed cleanly).
+    expect(r.kind).toBe('ok');
+  });
+
   test('unknown subcommand → error', async () => {
     const { ctx } = makeCtx([]);
     const r = await hooksCommand.exec(['nope'], ctx);

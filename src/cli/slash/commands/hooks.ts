@@ -212,8 +212,17 @@ const parseAuditFlags = (args: readonly string[]): AuditFilters | { error: strin
     } else if (arg === '--limit') {
       const val = args[i + 1];
       if (val === undefined) return { error: '/hooks audit: --limit requires a value' };
+      // Strict integer parse: digits only. Number.parseInt
+      // would silently coerce partial-numeric input
+      // (`20foo` → 20, `1e3` → 1) — surprising audit output
+      // that contradicts the error message's "positive
+      // integer" promise. Regex anchors both ends so any
+      // non-digit char rejects the value cleanly.
+      if (!/^\d+$/.test(val)) {
+        return { error: `/hooks audit: invalid --limit '${val}' (need positive integer)` };
+      }
       const n = Number.parseInt(val, 10);
-      if (!Number.isFinite(n) || n <= 0) {
+      if (n <= 0) {
         return { error: `/hooks audit: invalid --limit '${val}' (need positive integer)` };
       }
       filters.limit = Math.min(n, MAX_AUDIT_LIMIT);
