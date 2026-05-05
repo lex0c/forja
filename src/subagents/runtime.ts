@@ -192,6 +192,12 @@ export interface SpawnChildProcessOptions {
   // in its whitelist would execute. Boolean shape — undefined /
   // false omits the flag, true emits it.
   planMode?: boolean;
+  // Trust verdict carried across via `--subagent-cwd-trusted`.
+  // Spec §9 trust is per-project; the child runs under the
+  // parent's resolved verdict. Without forwarding, the child's
+  // harness defaults `isCwdTrusted=false` and tools gating on
+  // trust (memory_write inferred source) silently deny.
+  cwdTrusted?: boolean;
   // Per-subagent background-process log directory. Threaded
   // across via `--subagent-bg-log-dir`. Format:
   // `<parentCwd>/.agent/bg/<childSessionId>/`. Each subagent
@@ -407,6 +413,9 @@ const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
   if (opts.planMode === true) {
     appendArgs.push('--subagent-plan-mode');
   }
+  if (opts.cwdTrusted === true) {
+    appendArgs.push('--subagent-cwd-trusted');
+  }
   if (opts.bgLogDir !== undefined) {
     appendArgs.push('--subagent-bg-log-dir', opts.bgLogDir);
   }
@@ -510,6 +519,18 @@ export interface RunSubagentInput {
   temperature?: number;
   subagentRegistry?: SubagentSet;
   planMode?: boolean;
+  // Trust verdict from the parent's bootstrap (spec §9). Forwarded
+  // via `--subagent-cwd-trusted` to the child process so the
+  // child's harness honors the SAME trust decision the parent
+  // resolved at startup. Without this, every subagent runs with
+  // `isCwdTrusted: false` (fail-closed); tools that gate on trust
+  // (memory_write inferred-source path; future tools that read
+  // ~/.ssh, etc.) would silently deny even when the operator
+  // explicitly trusted the cwd. Defaults absent ⇒ false; the
+  // harness loop's spawnSubagent closure forwards
+  // `config.isCwdTrusted` so the in-flight run propagates the
+  // verdict it's already operating under.
+  cwdTrusted?: boolean;
   depth?: number;
   worktreeRootDir?: string;
   // Test seam: inject a fake subprocess factory. Production
@@ -1664,6 +1685,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       memoryCwd: input.cwd,
       ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
       ...(input.planMode === true ? { planMode: true } : {}),
+      ...(input.cwdTrusted === true ? { cwdTrusted: true } : {}),
       // Forward the IPC opt-in. The default spawn factory
       // converts this into pipe streams + the `--ipc=<n>` argv
       // flag; injected fakes can either build their own channel

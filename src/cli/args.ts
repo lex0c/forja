@@ -103,6 +103,22 @@ export interface ParsedArgs {
   // gate also refuses writes under planMode, so a write tool
   // in the whitelist is doubly blocked.
   subagentPlanMode?: boolean;
+  // Trust state carried across the subprocess boundary.
+  // Presence = true (no value); absence = false. Spec §9 trust
+  // is per-PROJECT, not per-instance: the parent already
+  // resolved trust against `~/.config/agent/trust.json` at
+  // bootstrap, and the child must run under that same verdict.
+  // Without this forwarding the child's harness defaults
+  // `isCwdTrusted` to false (fail-closed) — even when the
+  // operator explicitly trusted the cwd. Tools that gate on
+  // trust (e.g., `memory_write` refuses inferred writes on
+  // untrusted cwd) silently degrade for every subagent the
+  // operator spawns. Worktree-isolated subagents particularly
+  // hit this: the worktree path under `~/.cache/agent/worktrees/`
+  // is never on the trusted list, so re-resolving trust from
+  // `session.cwd` would also default false. Carrying the
+  // parent's verdict explicitly is the only correct option.
+  subagentCwdTrusted?: boolean;
   // Internal: per-subagent bg log directory. The parent's
   // runSubagent computes
   // `<parentCwd>/.agent/bg/<childSessionId>/` and forwards via
@@ -512,6 +528,15 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         // child defaults to non-plan-mode when the flag isn't
         // supplied.
         args.subagentPlanMode = true;
+        i += 1;
+        break;
+      case '--subagent-cwd-trusted':
+        // Presence-only flag, same pattern as `--subagent-plan-mode`.
+        // Absence = false (fail-closed). Parent only emits this
+        // when its OWN bootstrap resolved the cwd as trusted
+        // against `~/.config/agent/trust.json`, so the child
+        // inherits the same verdict without re-resolving.
+        args.subagentCwdTrusted = true;
         i += 1;
         break;
       case '--subagent-temperature': {

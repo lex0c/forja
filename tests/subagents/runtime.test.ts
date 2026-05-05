@@ -860,6 +860,60 @@ describe('runSubagent — orchestration', () => {
     expect(captured.depth).toBe(2);
   });
 
+  test('parent threads cwdTrusted into spawn opts (trust state forward)', async () => {
+    // Spec §9 trust is per-PROJECT. Parent resolves the verdict
+    // at bootstrap; child must inherit it instead of re-resolving
+    // from disk (worktree paths are never on the trust list).
+    // Pre-fix: spawn factory received `cwdTrusted: undefined`,
+    // child defaulted `isCwdTrusted=false`, tools gating on
+    // trust silently denied even when parent was trusted.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const captured: Array<boolean | undefined> = [];
+    const recordingSpawn: SpawnChildProcess = (opts) => {
+      captured.push(opts.cwdTrusted);
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      setSubagentPayload(db, opts.sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'ok',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      });
+      return { exited: Promise.resolve({ exitCode: 0 }), kill: () => undefined };
+    };
+    // Trusted run.
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      cwdTrusted: true,
+      spawnChildProcess: recordingSpawn,
+    });
+    expect(captured[0]).toBe(true);
+    // Untrusted (or unspecified) run.
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: recordingSpawn,
+    });
+    expect(captured[1]).toBeUndefined();
+  });
+
   test('4.2b.iv: parent threads per-session bgLogDir into spawn opts', async () => {
     // Every subagent gets its own bg log directory so concurrent
     // children don't collide and the operator's `bg list` view

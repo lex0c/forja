@@ -122,6 +122,18 @@ export interface SubagentChildOptions {
   // with planMode:true would see writing tools execute in the
   // child unchecked.
   planMode?: boolean;
+  // Trust verdict carried across via `--subagent-cwd-trusted`
+  // (presence-only). The parent resolved trust at bootstrap
+  // against `~/.config/agent/trust.json`; the child can't
+  // re-resolve correctly because (a) worktree-isolated
+  // subagents have a cache-dir cwd that's never on the trust
+  // list, and (b) re-reading mid-run could observe a different
+  // verdict if the operator updated trust between spawn and
+  // child startup. Same drift-window argument as the policy
+  // and hook snapshots. Absent ⇒ child defaults
+  // `isCwdTrusted=false` (fail-closed); tools gating on trust
+  // (memory_write inferred-source refusal) deny accordingly.
+  cwdTrusted?: boolean;
   // Per-subagent background-process log directory passed across
   // via `--subagent-bg-log-dir <path>`. The harness wires it
   // into the bg manager so `bash_background` / `bash_output` /
@@ -756,6 +768,13 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // the flag on the parent side leaves the child running
       // with normal (non-plan) execution.
       ...(opts.planMode === true ? { planMode: true } : {}),
+      // Trust verdict from the parent's bootstrap. Without this
+      // forward, `harness/loop.ts` would default `isCwdTrusted`
+      // to false (fail-closed) for every subagent — so a tool
+      // that gates on trust (today: `memory_write`'s inferred-
+      // source path; future tools may add more) silently denies
+      // even when the operator trusted the parent's cwd.
+      isCwdTrusted: opts.cwdTrusted === true,
       // Checkpoints stay off in 4.2b.ii.a — the worktree path
       // already provides a separate branch for changes; per-step
       // checkpoint chain inside the worktree lands in 4.2c.

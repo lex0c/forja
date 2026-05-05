@@ -499,6 +499,37 @@ describe('--subagent-bg-log-dir', () => {
   });
 });
 
+describe('--subagent-cwd-trusted', () => {
+  test('captures true when present', () => {
+    const r = parseArgs(['--subagent-session-id', 'sess-x', '--subagent-cwd-trusted']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentCwdTrusted).toBe(true);
+  });
+
+  test('absent by default — child treats cwd as untrusted', () => {
+    const r = parseArgs(['hi']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentCwdTrusted).toBeUndefined();
+  });
+
+  test('coexists with other internal subagent flags', () => {
+    const r = parseArgs([
+      '--subagent-session-id',
+      'sess-x',
+      '--subagent-cwd-trusted',
+      '--subagent-plan-mode',
+      '--ipc=1',
+    ]);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentCwdTrusted).toBe(true);
+    expect(r.args.subagentPlanMode).toBe(true);
+    expect(r.args.subagentIpcVersion).toBe(1);
+  });
+});
+
 describe('--ipc', () => {
   test('--ipc=<n> paired with --subagent-session-id captures protocol version', () => {
     const r = parseArgs(['--subagent-session-id', 'sess-x', '--ipc=1']);

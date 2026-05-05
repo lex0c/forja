@@ -1230,6 +1230,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     // gate already refused `task` itself in plan mode,
                     // but a future bypass would still be contained.
                     ...(config.planMode === true ? { planMode: true } : {}),
+                    // Trust verdict (spec §9): per-project, sealed
+                    // from the parent's bootstrap. Forwarding
+                    // unconditionally so the child runs under the
+                    // same verdict, instead of re-resolving (which
+                    // would fail-close on worktree paths and could
+                    // observe a stale verdict if the operator
+                    // updated trust mid-run). Default-false in
+                    // config maps cleanly to absent flag → child
+                    // defaults `isCwdTrusted=false`.
+                    ...(config.isCwdTrusted === true ? { cwdTrusted: true } : {}),
                     // Sampling temperature is also a run-wide property.
                     // The harness uses it for its own provider calls
                     // (line ~594); subagent runs MUST inherit so that
