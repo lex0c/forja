@@ -1150,20 +1150,43 @@ const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
       if (lastLook !== null && lastLook.payload !== null) {
         return { kind: 'payload', payload: lastLook.payload };
       }
-      // Abort precedence: explicit interruptCause wins over a
-      // bare `signal?.aborted` because we may have driven the
-      // soft path even when the caller's hard signal also
-      // aborted later. Default to 'hard' if the OS signal
-      // raced ahead before we could record interruptCause.
+      // Verdict precedence on no-payload exit:
+      //
+      //   1. `killed` (wall_clock / heartbeat_stale): system
+      //      constraint terminations win over operator intent.
+      //      Both fired SIGTERM at the child, and the budget
+      //      cap (or hung-tool detection) is what actually
+      //      caused the death — the soft signal in flight
+      //      didn't kill anything by itself, so reporting
+      //      `aborted/soft` would misclassify a timeout-
+      //      enforced termination as a user abort and skew
+      //      operator diagnostics + retry/telemetry that
+      //      branches on reason.
+      //
+      //   2. `interruptCause` ('hard' or 'soft'): the operator
+      //      pressed Esc and `killed` didn't fire alongside.
+      //      Hard SIGTERM'd; soft sent `interrupt:soft` and
+      //      waited cooperatively. Either way the child died
+      //      because the operator asked it to.
+      //
+      //   3. `signal.aborted` / `softStopSignal.aborted` with
+      //      no `interruptCause` recorded: the OS signal raced
+      //      ahead before our wait-loop's iteration could
+      //      stamp `interruptCause`. Default to 'hard'
+      //      conservatively — if the operator hit Esc-Esc and
+      //      the child exited before our soft promotion ran,
+      //      hard is the correct verdict.
+      //
+      //   4. Genuine crash (no payload, no kill, no signal).
+      if (killed !== undefined) {
+        return { kind: killed };
+      }
       if (
         interruptCause !== undefined ||
         signal?.aborted === true ||
         softStopSignal?.aborted === true
       ) {
         return { kind: 'aborted', cause: interruptCause ?? 'hard' };
-      }
-      if (killed !== undefined) {
-        return { kind: killed };
       }
       const { exitCode } = await handle.exited;
       return { kind: 'crashed', exitCode };

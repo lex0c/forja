@@ -3803,12 +3803,12 @@ describe('runSubagent — review fixes (round 4)', () => {
     // Pre-fix: the wall-clock check had a `interruptCause === undefined`
     // guard, so a soft signal that fired before wall_clock would
     // freeze the budget cap until soft promoted to hard. Post-fix:
-    // both budgets are independent. We don't directly observe
-    // wall_clock as the result reason here (the interrupt cause
-    // wins the operator-intent layer), but we DO observe the
-    // SIGTERM count — the pre-fix had only one (from the hard
-    // promote); the post-fix can have two (soft promote +
-    // wall_clock both attempt SIGTERM).
+    // both budgets are independent — wall_clock fires regardless,
+    // and (per the verdict-precedence fix below) `killed`
+    // ('wall_clock') wins over `interruptCause` ('soft') on the
+    // exit branch because the SIGTERM that actually killed the
+    // child came from the wall-clock budget, not from a
+    // cooperative soft signal that doesn't SIGTERM.
     //
     // Correctness gate: the run terminates without deadlocking
     // even if the child never publishes a payload. Pre-fix on a
@@ -3859,6 +3859,72 @@ describe('runSubagent — review fixes (round 4)', () => {
     // (depending on bail-out ordering); both are acceptable. The
     // load-bearing assertion is "doesn't hang".
     expect(['interrupted', 'error']).toContain(result.status);
+  });
+
+  test('killed (wall_clock) wins over interruptCause (soft) on no-payload exit', async () => {
+    // Verdict precedence: when soft is in-flight AND wall_clock
+    // fires AND the child exits without publishing, the SIGTERM
+    // that killed the child came from the wall-clock budget,
+    // not from the soft signal (which doesn't SIGTERM). Pre-fix
+    // the exit branch returned `aborted/soft`, misclassifying
+    // the timeout-enforced termination as a user abort and
+    // skewing operator diagnostics + retry/telemetry that
+    // branches on reason.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake = (() => {
+      const { a, b } = fakeTransportPair();
+      const parentChannel = createChannel(a);
+      createChannel(b);
+      let resolveExit: ((v: { exitCode: number }) => void) | undefined;
+      const exited = new Promise<{ exitCode: number }>((r) => {
+        resolveExit = r;
+      });
+      const sp: SpawnChildProcess = () => ({
+        exited,
+        kill: () => {
+          // Fake: ANY kill signal terminates the simulated
+          // child. Realistic OS would let SIGTERM through to
+          // graceful shutdown; for this test we collapse to
+          // immediate exit so the wait loop's exit branch
+          // fires deterministically with both
+          // `killed='wall_clock'` AND `interruptCause='soft'`
+          // set at the moment of exit.
+          if (resolveExit) {
+            resolveExit({ exitCode: 137 });
+            resolveExit = undefined;
+          }
+        },
+        ipc: parentChannel,
+      });
+      return { spawn: sp };
+    })();
+    const softCtl = new AbortController();
+    queueMicrotask(() => softCtl.abort());
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      softStopSignal: softCtl.signal,
+      spawnChildProcess: fake.spawn,
+      graceMs: 1000, // generous so soft doesn't promote during this test
+      wallClockMs: 25, // fires before soft grace expires
+    });
+    // Wall-clock cap fired and SIGTERMed; the child exited
+    // because of THAT, not because of soft. Reason must reflect.
+    expect(result.reason).toBe('maxWallClockMs');
+    expect(result.status).toBe('interrupted');
+    // abortCause is undefined for non-aborted reasons (soft
+    // signal is incidental — it didn't kill anything).
+    expect(result.abortCause).toBeUndefined();
   });
 
   test('version-mismatch listener is idempotent — repeated session_starts do not re-fire kill cascade', async () => {
