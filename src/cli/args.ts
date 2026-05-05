@@ -644,6 +644,23 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
       message: '--limit requires --list-sessions',
     };
   }
+  // `--ipc[=<n>]` is an INTERNAL flag the parent appends to the
+  // child's argv when spawning. The dispatcher in cli/index.ts
+  // only reads `args.subagentIpcVersion` inside the
+  // `subagentSessionId !== undefined` branch — every other entry
+  // path ignores it silently. Pre-fix: an operator typing `agent
+  // --ipc=1 "fix the bug"` would have the flag silently consumed
+  // (no error, no IPC channel actually wired anywhere), and a
+  // prompt fragment that legitimately starts with `--ipc=...`
+  // gets parsed as the flag and stripped from the user's prompt.
+  // Both surfaces are unsupported invocations; reject loudly so
+  // the misconfiguration surfaces at parse time.
+  if (args.subagentIpcVersion !== undefined && args.subagentSessionId === undefined) {
+    return {
+      ok: false,
+      message: '--ipc is an internal flag and requires --subagent-session-id',
+    };
+  }
   return { ok: true, args };
 };
 
