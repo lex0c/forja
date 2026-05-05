@@ -1,7 +1,7 @@
 export const migration009Checkpoints = {
   id: 9,
   name: '009-checkpoints',
-  // M3 / Step 3. Spec §12 + CHECKPOINTS.md design doc. Each step that
+  // Spec §12 + CHECKPOINTS.md design doc. Each step that
   // executes a tool with `writes: true` produces a snapshot in git
   // (commit object referenced under `refs/agent/checkpoints/<session>/<id>`).
   // This table is the audit + lookup layer: it lets `--checkpoints list`

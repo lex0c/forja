@@ -1,7 +1,7 @@
 export const migration019HookRuns = {
   id: 19,
   name: '019-hook-runs',
-  // M3 / hooks subsystem audit table.
+  // Hooks subsystem audit table.
   //
   // Spec AGENTIC_CLI.md §10.3 line 1006: "Logging: cada execução
   // grava em tabela `hook_runs` (auditoria)". Without this table,

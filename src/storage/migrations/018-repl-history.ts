@@ -1,7 +1,7 @@
 export const migration018ReplHistory = {
   id: 18,
   name: '018-repl-history',
-  // M2 / HISTORY — REPL input history table (HISTORY.md §1.1).
+  // REPL input history table (HISTORY.md §1.1).
   //
   // History is the ordered sequence of prompts the operator has
   // submitted to the REPL, scoped per project_root. Recallable via

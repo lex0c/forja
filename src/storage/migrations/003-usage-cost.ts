@@ -1,7 +1,7 @@
 export const migration003UsageCost = {
   id: 3,
   name: '003-usage-cost',
-  // M2 / Step 1 — telemetry. The original schema has tokens_in/tokens_out/
+  // Telemetry. The original schema has tokens_in/tokens_out/
   // cached_tokens but no column for cache *creation* (Anthropic charges a
   // distinct write-through tier) and no per-message cost. Splitting cache
   // reads from cache writes lets the cost computer use each rate

@@ -23,7 +23,7 @@ export interface ParsedArgs {
   // Special value 'last' selects the most recently started session.
   // The positional prompt is the follow-up message — without it,
   // there's nothing for the model to do (the picker form `--resume`
-  // without a value waits for M4 / Ink TUI).
+  // without a value waits for an interactive TUI).
   resume?: string;
   // Confirm-bypass for had_bash warning on `--undo` /
   // `--checkpoints restore`. Without `--yes`, the handler refuses

@@ -41,9 +41,8 @@ export interface ActiveTool {
   startedAt: number;
   // Last few lines of streaming output. Capped so a tool that emits
   // a megabyte of stdout doesn't bloat the live region — the full
-  // content has already gone through the scrollback as `tool:delta`
-  // permanent lines (or, in this slice, will once delta lines are
-  // wired to print permanently).
+  // content goes through the scrollback as `tool:delta` permanent
+  // lines.
   preview: string[];
 }
 

@@ -111,7 +111,7 @@ export const evaluateBootTriggers = (cwd: string): BootContext => {
 // order:
 //
 //   1. Memory has NO `triggers:` field (or empty array): UNCONDITIONAL
-//      eager-load. Same behavior as before this slice.
+//      eager-load.
 //   2. Memory has triggers but ALL of them are unknown to this
 //      module (operator-defined runtime tags): UNCONDITIONAL.
 //      The operator chose to tag the memory for runtime-only;

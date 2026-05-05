@@ -1,7 +1,7 @@
 export const migration004SessionUsageComplete = {
   id: 4,
   name: '004-session-usage-complete',
-  // M2 / Step 1 hardening. `sessions.total_cost_usd` was always written
+  // Telemetry hardening. `sessions.total_cost_usd` was always written
   // as the sum of measured turns; sessions where some turn skipped
   // telemetry (compat endpoints, mid-stream aborts, provider errors)
   // were silently persisted as if the number were authoritative. Add a

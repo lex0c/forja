@@ -1,13 +1,13 @@
 // /memory — manage cross-session memories (MEMORY.md §6.3).
 //
-// Subcommands shipped in this slice (Tier 1 — read-only inspection):
+// Subcommands (Tier 1 — read-only inspection):
 //   /memory                     — summary line: count + scope breakdown
 //   /memory list [scope]        — list entries (scope: user|project|local|shared)
 //   /memory show <name> [scope] — print body content
 //   /memory audit [--limit N | --name <name>]
 //                               — recent memory_events rows
 //
-// Tier 2 (commit 2 of this slice):
+// Tier 2:
 //   /memory delete <name> [scope]  — confirm modal + removeMemory
 //   /memory promote shared <name>  — local → shared with scanner
 //   /memory demote local <name>    — shared → local

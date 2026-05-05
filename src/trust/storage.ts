@@ -1,6 +1,6 @@
 // Trusted-directories storage. Spec: AGENTIC_CLI.md §9.1.
 //
-// The store is intentionally minimal in this slice: a flat list of
+// The store is intentionally minimal: a flat list of
 // absolute paths in `~/.config/agent/trusted_dirs.json`. Once a path
 // is added, subsequent boots from that cwd skip the trust prompt.
 //
