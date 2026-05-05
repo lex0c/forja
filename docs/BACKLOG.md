@@ -15,6 +15,91 @@ Format:
 
 ---
 
+## [2026-05-05] M3 / refactor — decompose `src/subagents/runtime.ts`
+
+New branch `refactor/m3-runtime-decompose` off `develop`. The
+file accumulated to 2280 LoC across the IPC subsystem work and
+became cognitively expensive to read — `waitForChild`'s state
+machine alone was ~280 LoC with tri-state `interruptCause`,
+three timers, and five bail-out paths. R1 from
+`docs/REFACTOR.md` applied as four extraction slices, one
+commit each; suite of 2967 tests green throughout.
+
+**Done:**
+
+- **`bg-reaper.ts` (275 LoC):** the Linux-only safety net
+  (`reapChildBgProcesses`, `checkPidIdentity`, `IdentityResult`,
+  `BG_REAP_GRACE_MS`) that signals leftover bg processes when
+  the child died via SIGKILL / wall-clock / heartbeat-stale.
+  Conceptually disconnected from IPC — shares no state with
+  the orchestration loop. Only `reapChildBgProcesses` exported;
+  helpers stay module-private.
+
+- **`result-builder.ts` (207 LoC):** the trust boundary that
+  validates the child's payload envelope (`VALID_STATUS_MAP`,
+  `VALID_REASON_MAP`, `buildResultFromPayload`,
+  `RunSubagentResult`, `SubagentEnvelope`, `toEnvelope`). Sits
+  between an untrusted child producer and the parent's audit /
+  event surface. `runtime.ts` re-exports the public types so
+  the import path stays unchanged for every consumer.
+
+- **`spawn-factory.ts` (371 LoC):** the Bun.spawn wiring
+  (`ChildProcessHandle`, `SpawnChildProcess` /
+  `SpawnChildProcessOptions`, `resolveChildBinaryCmd`,
+  `drainStderrToLogFile`, `defaultSpawnChildProcess`).
+  Decouples subprocess concerns (node:fs, node:path, IPC
+  transport details) from the orchestration loop. Public
+  symbols re-exported from `runtime.ts`.
+
+- **`wait-loop.ts` (400 LoC):** the poll-and-escalate state
+  machine (`waitForChild`, `raceExitAgainstTimeout`,
+  `drainChildAfterPayload`, timing constants, `WaitOutcome`).
+  Most cognitively demanding part of the old file. Privately
+  keeps `POLL_*`, `WaitForChildArgs`, and the helpers; exports
+  the constants `runSubagent` reads (`DEFAULT_WALL_CLOCK_MS`,
+  `WALL_CLOCK_GRACE_MS`, `HEARTBEAT_STALE_THRESHOLD_MS`) plus
+  `waitForChild` / `WaitOutcome`. No re-export needed in
+  `runtime.ts` — these symbols were never public.
+
+- **`runtime.ts`: 2280 → 1066 LoC** (cut to less than half).
+  Now reads as orchestration only (`runSubagent` + helpers),
+  with the four extracted clusters arriving via named imports.
+
+- **Public surface unchanged.** `src/harness/loop.ts`,
+  `tests/subagents/runtime.test.ts`, and
+  `tests/subagents/e2e.test.ts` kept their existing import
+  paths from `'./runtime.ts'` because runtime.ts re-exports
+  every public symbol the slices moved out.
+
+**Decisions:**
+
+1. **R1 standalone, no feature folding.** The doc's own
+   recommendation: same-day no-forcing-function refactors are
+   easier to review when they touch only the structure.
+
+2. **Preserve old import paths via re-exports.** The follow-up
+   "tightening" (have consumers import from the new module
+   directly) is mechanical and orthogonal to the structural
+   cut; deferred.
+
+3. **Test changes: zero.** The 2967-test suite is the contract;
+   rewriting tests to point at new module paths would prove
+   only that the rewrite is correct, not that the contract
+   held. Suite ran green at every commit.
+
+**Pending:** R1's optional re-export tightening — defer until a
+consumer touches each import line for an unrelated reason. Not
+worth a churn-only commit.
+
+**Next:** R2 (schema-first IPC contract) and R3 (single
+handshake mechanism) stay deferred until a forcing function
+appears (permission proxy, taxonomy expansion). R4 (spec PR
+alongside code PR) is process guidance to adopt at the next
+subsystem slice. Both per `docs/REFACTOR.md` cumulative
+recommendation.
+
+---
+
 ## [2026-05-05] M3 / harden — child stderr → per-subagent log file
 
 Same branch (`feat/m3-subagent-ipc`). Closes the only operator-
