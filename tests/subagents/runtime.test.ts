@@ -3266,6 +3266,104 @@ describe('runSubagent — interrupt soft/hard (S3)', () => {
     expect(result.abortCause).toBeUndefined();
   });
 
+  test('protocolVersion mismatch on session_start kills child + stamps ipc_version_mismatch', async () => {
+    // Spec §4.2: parent and child must refuse on protocol-version
+    // mismatch BEFORE doing useful work. The child's side is
+    // covered by tests/cli/subagent-child.test.ts; this is the
+    // mirror-image check on the parent (a future child running a
+    // newer/older protocol that survived its own check would
+    // otherwise stream events in a shape the parent's reducer
+    // doesn't understand).
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const ipcMod = await import('../../src/subagents/ipc.ts');
+    const fake = fakeSpawnInterruptable();
+    fake.childChannel.onMessage((msg) => {
+      // Echo a session_start carrying a protocolVersion the parent
+      // doesn't recognize. The parent's listener should detect the
+      // mismatch, send interrupt:hard, and tear down. We emulate
+      // the child's "respond by exiting" by publishing nothing —
+      // the SIGTERM shape on the fake will resolve its exit via
+      // the kill handler.
+      if (msg.type === 'interrupt:hard') {
+        // Don't publish — let the loop see no payload and the
+        // ipcVersionMismatch override stamp the result.
+      }
+    });
+    queueMicrotask(() => {
+      const children = listChildSessions(db, parent.id);
+      const last = children[children.length - 1];
+      if (last !== undefined) {
+        // Child sends session_start with a future-protocol version.
+        const v999: import('../../src/subagents/ipc.ts').IpcMessage = {
+          type: 'session_start',
+          id: 'fake-id',
+          ts: Date.now(),
+          sessionId: last.id,
+          protocolVersion: 999,
+        };
+        fake.childChannel.send(v999);
+      }
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: fake.spawn,
+      graceMs: 50,
+    });
+    expect(result.status).toBe('error');
+    expect(result.reason).toBe('ipc_version_mismatch');
+    // Parent should have sent interrupt:hard AND issued OS
+    // SIGTERM as the belt-and-suspenders fallback.
+    expect(fake.parentSent.some((m) => m.type === 'interrupt:hard')).toBe(true);
+    expect(fake.killSignals.includes('SIGTERM')).toBe(true);
+    // Avoid linter warning about unused import.
+    expect(ipcMod.IPC_PROTOCOL_VERSION).toBe(1);
+  });
+
+  test('protocolVersion match leaves the run alone', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake = fakeSpawnInterruptable();
+    queueMicrotask(() => {
+      const children = listChildSessions(db, parent.id);
+      const last = children[children.length - 1];
+      if (last !== undefined) {
+        // Send a well-formed session_start with the correct
+        // protocol version, then publish a happy payload.
+        fake.childChannel.send(makeSessionStart(last.id));
+        fake.publish(last.id, { status: 'done', reason: 'done' });
+      }
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: fake.spawn,
+    });
+    expect(result.status).toBe('done');
+    expect(result.reason).toBe('done');
+    // Parent never sent interrupt:hard since the version matched.
+    expect(fake.parentSent.some((m) => m.type === 'interrupt:hard')).toBe(false);
+  });
+
   test('toEnvelope round-trips abortCause as snake_cased abort_cause', () => {
     const result = {
       output: '',

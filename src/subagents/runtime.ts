@@ -495,7 +495,8 @@ export interface RunSubagentResult {
     | 'worktree_create_failed'
     | 'subprocess_crashed'
     | 'subprocess_spawn_failed'
-    | 'heartbeat_stale';
+    | 'heartbeat_stale'
+    | 'ipc_version_mismatch';
   costUsd: number;
   steps: number;
   durationMs: number;
@@ -1493,6 +1494,52 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // surface keeps them off the typed observer path. Drop on
   // stderr so an operator running with `--json` still sees the
   // signal (NDJSON contract: stdout pure, stderr admin).
+  //
+  // Protocol version handshake: spec §4.2 requires both sides
+  // to refuse on mismatch BEFORE doing real work. The child
+  // refuses pre-message when `--ipc=<n>` carries a version it
+  // doesn't recognize; the parent's mirror-image check fires
+  // on the child's first `session_start` (which carries the
+  // version the child negotiated). On mismatch we kill the
+  // child and stamp the result reason; the wait loop's
+  // outcome handler downstream branches on this flag.
+  let ipcVersionMismatch: number | undefined;
+  if (handle.ipc !== undefined) {
+    handle.ipc.onMessage((msg) => {
+      if (msg.type !== 'session_start') return;
+      if (msg.protocolVersion === IPC_PROTOCOL_VERSION) return;
+      // Mismatch: child speaks a version we don't recognize.
+      // Record for the result-building branch and tear the
+      // child down. Send interrupt:hard so a child that DOES
+      // honor the wire (just not the version) still drains
+      // cleanly; SIGTERM is the fallback.
+      ipcVersionMismatch = msg.protocolVersion;
+      try {
+        handle.ipc?.send(makeInterruptHard());
+      } catch {
+        // Channel may already be torn down; SIGTERM below
+        // covers the dead-pipe case.
+      }
+      handle.kill('SIGTERM');
+      // Belt-and-suspenders SIGKILL escalation. A child that
+      // ignores SIGTERM (custom signal handler, infinite loop in
+      // the harness's exit path) would otherwise block the
+      // parent's wait loop forever — the regular hard-trigger
+      // path that schedules SIGKILL only fires when
+      // signal.aborted, which a protocol-mismatch caller didn't
+      // necessarily set. Use the caller's graceMs (or the
+      // default) so the escalation is bounded by the same
+      // window as every other kill path.
+      const gms = input.graceMs ?? WALL_CLOCK_GRACE_MS;
+      setTimeout(() => {
+        try {
+          handle.kill('SIGKILL');
+        } catch {
+          // Already exited; ignore.
+        }
+      }, gms).unref();
+    });
+  }
   if (handle.ipc !== undefined) {
     if (input.onIpcMessage !== undefined) {
       const observer = input.onIpcMessage;
@@ -1786,6 +1833,25 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     }
   }
 
+  // Protocol version mismatch override: spec §4.2 mandates the
+  // run be refused before useful work runs. If the version
+  // listener fired, the child was killed mid-spawn; the wait
+  // loop's outcome (`aborted` / `crashed` depending on timing)
+  // is technically correct but operationally misleading — the
+  // operator cares that this was a protocol problem, not a
+  // runtime abort. Stamp the dedicated reason.
+  if (ipcVersionMismatch !== undefined) {
+    result = {
+      output: '',
+      sessionId: childSession.id,
+      status: 'error',
+      reason: 'ipc_version_mismatch',
+      costUsd: 0,
+      steps: 0,
+      durationMs: Date.now() - startTs,
+    };
+  }
+
   // Best-effort finalize the child session row. The 'payload'
   // outcome already saw the child's harness call
   // `completeSession` before publishing — the call here is a
@@ -1878,7 +1944,8 @@ export interface SubagentEnvelope {
     | 'worktree_create_failed'
     | 'subprocess_crashed'
     | 'subprocess_spawn_failed'
-    | 'heartbeat_stale';
+    | 'heartbeat_stale'
+    | 'ipc_version_mismatch';
   cost_usd: number;
   steps: number;
   duration_ms: number;

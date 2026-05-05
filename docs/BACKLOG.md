@@ -15,6 +15,133 @@ Format:
 
 ---
 
+## [2026-05-05] M3 / harden — subagents IPC production-readiness blockers
+
+Same branch (`feat/m3-subagent-ipc`). After the review fixes the
+operator pushed back: subsystem is "feature-complete per spec" but
+not production-ready until the wire is exercised against a real
+subprocess and the parent honors the spec §4.2 protocol-version
+handshake. Both lands here.
+
+**Done:**
+
+- **Parent `protocolVersion` handshake** (`src/subagents/runtime.ts`):
+  the runtime now subscribes to the channel BEFORE `waitForChild`
+  runs and listens for the child's first `session_start`. On
+  protocol-version mismatch the parent sends `interrupt:hard` over
+  IPC, calls `handle.kill('SIGTERM')`, schedules an unref'd
+  SIGKILL escalation after `graceMs`, and stamps the result with
+  the new `reason: 'ipc_version_mismatch'`. The previous wire was
+  silent — a child negotiating a future protocol that survived
+  its own check would have streamed events the parent's reducer
+  doesn't understand. Closes spec §4.2 mirror-image gap.
+
+- **`RunSubagentResult.reason` + `SubagentEnvelope.reason`** unions
+  extended with `'ipc_version_mismatch'` so the model + audit can
+  positively branch on the protocol fault.
+
+- **Real-subprocess smoke test**
+  (`tests/subagents/subprocess-smoke.test.ts`, 3 cases): spawns
+  the actual binary via `Bun.spawn(process.execPath, src/cli/index.ts,
+  ...)`, hijacks `XDG_DATA_HOME` so the child opens a per-test temp
+  DB instead of the operator's data dir, seeds the parent +
+  child sessions + audit row, and reads the child's stdout
+  through a real OS pipe. Validates:
+  - **`--ipc=1`**: real binary boots, first stdout line is
+    `session_start` with `protocolVersion === 1`, last is
+    `session_finished`, NDJSON contract holds (no malformed
+    lines, no stderr leakage into stdout). The child exits
+    non-zero because we deliberately seeded an unknown model id
+    (`mock/missing`) — the bracket invariant must hold even on
+    early refusal.
+  - **No `--ipc`**: legacy mode produces zero IPC frames on
+    stdout (backwards-compat invariant per IPC.md §5).
+  - **`--ipc=999`**: child refuses BEFORE emitting any message
+    (spec §4.2), exits 1, stderr carries `ipc_version_mismatch`,
+    stdout is empty.
+
+- **Env-whitelist for spawned children**: smoke's `childEnv()`
+  forwards only `PATH / HOME / TMPDIR / LANG / LC_ALL` plus the
+  test's `XDG_DATA_HOME` override. Defense in depth — a
+  full-env forward would leak the operator's `ANTHROPIC_API_KEY`
+  into a spawned binary that has no business making provider
+  calls during a test.
+
+**Decisions:**
+
+1. **Protocol handshake check fires inside `onMessage`, not as
+   a synchronous pre-wait gate.** A pre-wait gate would have
+   needed an `await` on the first message with a timeout — adding
+   one more failure mode (spec doesn't guarantee any message
+   arrives within X ms; a slow child startup would falsely fail
+   the handshake). The in-loop detection lets `waitForChild`
+   continue its existing ladder; the result-build branch
+   downstream then notices the flag and stamps the dedicated
+   reason. Less code, fewer races.
+
+2. **Mismatch path schedules its own SIGKILL escalation
+   independently of the wait loop's `scheduleKill`.** The wait
+   loop only schedules SIGKILL when `signal.aborted` /
+   `softStopSignal.aborted` / wall-clock / heartbeat-stale fire
+   — none of which a protocol-mismatch caller necessarily
+   triggered. Without an inline timer the parent would block
+   indefinitely on a child that ignored SIGTERM (custom signal
+   handler). The unref'd timer matches the pattern the
+   wait-loop kill timer already uses.
+
+3. **Smoke test uses `XDG_DATA_HOME` override, not a new
+   `--db-path` flag.** Production `defaultDbPath()` already
+   reads `XDG_DATA_HOME` (storage/paths.ts); reusing the env
+   path means the test exercises the same resolution code the
+   operator's binary runs against. Adding a `--db-path` flag
+   would have created a CLI surface that exists only for tests
+   — anti-pattern (CLAUDE.md "no half-finished implementations
+   either").
+
+4. **Smoke deliberately uses an unknown model id** (`mock/missing`)
+   so the child's bootstrap exits early with `unknown_model`.
+   We don't need the harness's success path here — that's
+   covered exhaustively in-process. We need the wire's bracket
+   invariant to hold under an early refusal, which is the
+   subtle case (the outer `finally` in subagent-child runs the
+   IPC close + session_finished even when the happy path never
+   reached the harness).
+
+5. **Tier-2 review items still deferred.** Reviewer flagged six
+   "important / nit" items beyond the two blockers. Three are
+   addressed (replay buffer, `tool_warning` field guard, hard-
+   interrupt e2e in S4 already). Three remain: `worktreeError`
+   field overload (pre-existing, not introduced here),
+   `KNOWN_TYPES` drift guard (cosmetic), comment density
+   (cosmetic). Worth a follow-up branch but not load-bearing
+   for production.
+
+**Subsystem readiness assessment:**
+
+| Surface | Status |
+|---|---|
+| Wire (transport, framing, parser) | ✅ S1 + smoke |
+| Live observability | ✅ S2 |
+| Cooperative + preemptive abort | ✅ S3 |
+| `tool_warning` propagation | ✅ S4 |
+| Real subprocess spawn | ✅ smoke |
+| Parent protocol-version handshake | ✅ this slice |
+| Permission proxy | deferred (M2+ per spec) |
+| Subagent `memory_write` | deferred (per spec) |
+| Subprocess hook forwarding | deferred (Step 4.3 per BACKLOG ~355) |
+| Worktree+IPC combined integration test | deferred (each is independently tested) |
+| Subagents Map cap on parent's TUI state | deferred (no producer can flood; bracket close clears) |
+| Real-provider eval | blocked on `evals/` framework landing |
+
+**Pending:** none for the production-readiness tier-1 list.
+Branch is mergeable.
+
+**Next:** PR against `develop`. The deferred items above each
+have a clear hook for a future branch when the surrounding
+context lands (M2+, Step 4.3, evals).
+
+---
+
 ## [2026-05-05] M3 / fix — subagents IPC review fixes
 
 Same branch (`feat/m3-subagent-ipc`). Three findings from an
