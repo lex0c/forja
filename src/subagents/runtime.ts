@@ -1202,31 +1202,56 @@ const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
 // swallows it. Result: phantom `running` row that no future
 // stale-session sweeper can clean up. Validating here at the trust
 // boundary keeps every downstream consumer honest.
-const VALID_STATUS: ReadonlySet<RunSubagentResult['status']> = new Set([
-  'done',
-  'interrupted',
-  'exhausted',
-  'error',
-]);
+//
+// Compile-time exhaustiveness: the maps are typed as
+// `Record<Union, true>` so TypeScript refuses to compile if a new
+// status / reason variant lands upstream (in HarnessResult) and
+// this validator forgets to list it. The previous "list of
+// strings" shape silently drifted when `providerError`,
+// `maxToolErrors`, and `scriptExhausted` were added to ExitReason
+// — children exiting on those landed as `internalError`,
+// misclassifying real failures (provider outages, tool error
+// budget exhaustion) and breaking telemetry that branched on the
+// original reason. The Record shape catches that drift the next
+// time someone extends the upstream union.
+const VALID_STATUS_MAP: Record<RunSubagentResult['status'], true> = {
+  done: true,
+  interrupted: true,
+  exhausted: true,
+  error: true,
+};
+const VALID_STATUS: ReadonlySet<RunSubagentResult['status']> = new Set(
+  Object.keys(VALID_STATUS_MAP) as RunSubagentResult['status'][],
+);
 
-const VALID_REASON: ReadonlySet<RunSubagentResult['reason']> = new Set([
-  // HarnessResult['reason'] union members
-  'done',
-  'aborted',
-  'maxSteps',
-  'maxCostUsd',
-  'maxWallClockMs',
-  'maxOutputTokens',
-  'degenerateLoop',
-  'internalError',
-  'userPromptBlocked',
-  // Subagent-runtime extensions
-  'worktree_create_failed',
-  'subprocess_crashed',
-  'subprocess_spawn_failed',
-  'heartbeat_stale',
-  'ipc_version_mismatch',
-]);
+const VALID_REASON_MAP: Record<RunSubagentResult['reason'], true> = {
+  // HarnessResult['reason'] (= ExitReason in harness/types.ts)
+  done: true,
+  maxSteps: true,
+  maxWallClockMs: true,
+  maxOutputTokens: true,
+  maxCostUsd: true,
+  maxToolErrors: true,
+  degenerateLoop: true,
+  aborted: true,
+  providerError: true,
+  internalError: true,
+  scriptExhausted: true,
+  userPromptBlocked: true,
+  // Subagent-runtime extensions (only synthesized parent-side
+  // when the child never reaches the harness loop or dies before
+  // publishing a payload — never appears in a child's envelope,
+  // but listing keeps the validator's surface symmetric with
+  // RunSubagentResult['reason']).
+  worktree_create_failed: true,
+  subprocess_crashed: true,
+  subprocess_spawn_failed: true,
+  heartbeat_stale: true,
+  ipc_version_mismatch: true,
+};
+const VALID_REASON: ReadonlySet<RunSubagentResult['reason']> = new Set(
+  Object.keys(VALID_REASON_MAP) as RunSubagentResult['reason'][],
+);
 
 const buildResultFromPayload = (
   payload: Record<string, unknown>,

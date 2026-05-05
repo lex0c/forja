@@ -3482,6 +3482,61 @@ describe('runSubagent — review fixes (round 4)', () => {
     expect(['done', 'error', 'interrupted', 'exhausted']).toContain(childRow?.status ?? '');
   });
 
+  // Drift defense: VALID_REASON_MAP must cover every member of
+  // ExitReason. The test asserts a representative set of reasons
+  // including the three (`providerError`, `maxToolErrors`,
+  // `scriptExhausted`) the original whitelist forgot. If the
+  // upstream ExitReason union grows and the validator forgets
+  // a member, the Record<Reason, true> type fails to compile —
+  // but this test catches behavioral drift if someone adds
+  // a value to the map without exercising it.
+  test.each([
+    ['done', 'done'],
+    ['providerError', 'error'],
+    ['maxToolErrors', 'error'],
+    ['scriptExhausted', 'error'],
+    ['maxSteps', 'exhausted'],
+    ['maxCostUsd', 'exhausted'],
+    ['maxWallClockMs', 'interrupted'],
+    ['userPromptBlocked', 'interrupted'],
+  ] as const)(
+    'child publishing reason=%s is preserved verbatim, not coerced',
+    async (reason, statusForReason) => {
+      const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+        model: 'mock/m',
+        cwd: '/p',
+      });
+      const fake: SpawnChildProcess = (opts) => {
+        insertSubagentOutput(db, { sessionId: opts.sessionId });
+        setSubagentPayload(db, opts.sessionId, {
+          status: statusForReason,
+          reason,
+          output: '',
+          cost_usd: 0,
+          steps: 0,
+          duration_ms: 0,
+        });
+        return {
+          exited: Promise.resolve({ exitCode: 0 }),
+          kill: () => undefined,
+        };
+      };
+      const result = await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: '/p',
+        spawnChildProcess: fake,
+      });
+      expect(result.reason).toBe(reason);
+      expect(result.status).toBe(statusForReason);
+    },
+  );
+
   test('soft→hard promotion resets interruptAt so 2×grace cushion measures from SIGTERM', async () => {
     // Pre-fix: on promotion the cushion shrunk to ~1×grace
     // because interruptAt anchored to the soft moment. Post-fix:
