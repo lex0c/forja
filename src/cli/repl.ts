@@ -762,9 +762,9 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     });
     // Map the spec-shape answer to the harness's boolean contract.
     // 'session-allow' currently behaves like 'yes' — the policy
-    // mutation that would persist a session-layer rule is deferred
-    // (TODO 1.d.7). When that lands, this branch writes the rule
-    // before returning true.
+    // mutation that would persist a session-layer rule is deferred.
+    // When that lands, this branch writes the rule before returning
+    // true.
     return answer === 'yes' || answer === 'session-allow';
   };
 

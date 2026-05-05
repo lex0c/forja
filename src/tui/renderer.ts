@@ -473,9 +473,8 @@ export const createRenderer = (options: RendererOptions): Renderer => {
   // the watcher). On every resize, force a redraw so truncation
   // applies the new width immediately.
   //
-  // TODO(perf): a terminal "wiggle" during a resize drag can fire
-  // SIGWINCH 5-10 times per second. We currently flush per event;
-  // if this ever shows up as flicker, debounce to ~50ms here.
+  // SIGWINCH can burst (5-10/s during a resize drag). We flush
+  // per event today; if flicker shows up, debounce to ~50ms.
   const watcher =
     options.resizeStream === false ? null : createResizeWatcher(options.resizeStream ?? undefined);
   const unsubscribeResize = watcher

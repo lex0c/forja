@@ -63,8 +63,8 @@ const labelFor = (item: TodoItemForUI): string =>
 // would split into multiple terminal lines, but `composeLive` returns
 // one string, and the renderer's `liveHeight = truncated.length`
 // math would under-count by N. The todo_write tool's validateString
-// doesn't reject these (D131-style "validate at boundary" is a TODO
-// for that subsystem), so the renderer scrubs defensively. Tabs are
+// doesn't reject these (boundary-validation in that subsystem is
+// pending), so the renderer scrubs defensively. Tabs are
 // kept (harmless single-cell render in most terminals).
 const scrubLineBreaks = (s: string): string => s.replace(/[\r\n]+/g, ' ');
 

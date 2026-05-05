@@ -426,7 +426,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       // terminated for another reason) or if the prior bg manager
       // somehow left dangling entries.
       //
-      // TODO (D150): when daemon mode / `--keep-bg` lands and bg
+      // When daemon mode / `--keep-bg` lands and bg
       // processes survive across turn/session boundaries, this reset
       // becomes a regression — the operator would lose the counter
       // for processes still running in the background. Replace the
