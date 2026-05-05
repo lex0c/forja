@@ -63,8 +63,8 @@ export interface HarnessAdapterCtx {
   // Forwarded into `session:start.planMode` so the footer can show
   // the `plan` indicator. Defaults to false (full-write profile).
   planMode?: boolean;
-  // Distinct-name memory count at session boot (BACKLOG D68
-  // follow-up). Forwarded into `session:start.memoryCount` so the
+  // Distinct-name memory count at session boot. Forwarded into
+  // `session:start.memoryCount` so the
   // footer can render the `mem N` segment. Caller (REPL) reads
   // it from `MemoryRegistry.count({ deduplicateByName: true })`.
   // Optional: when memory wasn't wired (one-shot SDK without

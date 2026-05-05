@@ -99,7 +99,7 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
     if (state.bgProcesses.size > 0) {
       rightParts.push(dim(caps, `bg ${state.bgProcesses.size}`));
     }
-    // Memory count (BACKLOG D68 follow-up). Sits AFTER bg per spec
+    // Memory count. Sits AFTER bg per spec
     // §4.10.6 "less sticky" priority — bg already drops first when
     // the line is narrow; memory drops second. The token uses `mem`
     // not `memory` to keep it under 6 chars (the right column gets

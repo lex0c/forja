@@ -206,7 +206,7 @@ const buildEnvelope = (result: HarnessResult, output: string): Record<string, un
   // parent doesn't strictly need the id, but it's useful when
   // inspecting the envelope post-hoc.
   ...(result.lastMessageId !== undefined ? { last_message_id: result.lastMessageId } : {}),
-  // Abort discriminator (S3, BACKLOG D168). Populated only when
+  // Abort discriminator. Populated only when
   // the harness's loop exited via `reason === 'aborted'`. Lets
   // the parent's `RunSubagentResult` carry the soft/hard
   // verdict the child itself observed — without this round-trip

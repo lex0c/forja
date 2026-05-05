@@ -162,8 +162,7 @@ export interface RunSubagentInput {
   // are inherently preemptive). When a parent's soft fires while a
   // task() is in flight, the parent blocks until the child finishes
   // its full budget, then the parent's top-of-loop soft check
-  // exits. Documented gap (BACKLOG D159); will close when IPC
-  // lands (same slice that unblocks 1.f.2 subagent observability).
+  // exits.
   softStopSignal?: AbortSignal;
   // Lifecycle observer. The subprocess child can't stream events
   // directly to the parent (no IPC channel for that); the parent

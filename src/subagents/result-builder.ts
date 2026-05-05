@@ -38,7 +38,7 @@ export interface RunSubagentResult {
   auditFailure?: { code: string; message: string };
   worktree?: WorktreeOutcome;
   worktreeError?: { code: string; message: string };
-  // Abort discriminator (closes BACKLOG D168). Populated only on
+  // Abort discriminator. Populated only on
   // `reason === 'aborted'`:
   //   - 'soft' — operator pressed Esc once; the child's harness
   //     exited at the next step boundary cleanly (no preempted

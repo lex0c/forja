@@ -62,8 +62,8 @@ export interface StatusState {
   // column as a `plan` token between model and budget. Default false
   // on createInitialState; flipped by `session:start.planMode`.
   planMode: boolean;
-  // Distinct-name memory count for the footer's `mem N` segment
-  // (BACKLOG D68 follow-up). Snapshot at session:start; mid-session
+  // Distinct-name memory count for the footer's `mem N` segment.
+  // Snapshot at session:start; mid-session
   // memory_write success could bump the count, but we keep the
   // value boot-fresh for now (operators don't expect the footer to
   // animate per-memory-write — too much noise for too little

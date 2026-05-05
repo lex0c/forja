@@ -265,7 +265,7 @@ export const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome>
       return { kind: 'crashed', exitCode };
     }
 
-    // Soft trigger (S3, BACKLOG D159). Parent's cooperative-stop
+    // Soft trigger. Parent's cooperative-stop
     // signal fired AND the hard signal hasn't (the latter takes
     // precedence: a same-tick double-Esc lands on hard directly).
     // We send `interrupt:soft` over IPC if available; subprocess
