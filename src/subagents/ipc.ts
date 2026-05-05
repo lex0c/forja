@@ -385,53 +385,51 @@ export const subprocessTransport = (streams: SubprocessStreams): IpcTransport =>
   const framer = createLineFramer((line) => lines.emit(line));
   const reader = streams.stdout.getReader();
   const encoder = new TextEncoder();
-  // Branch on stdin shape ONCE at construction so the write
-  // path stays cheap and unbranched per call.
-  const writeBytes: (bytes: Uint8Array) => void = isWhatwgStream(streams.stdin)
-    ? (() => {
-        const w = streams.stdin.getWriter();
-        return (bytes) => {
-          w.write(bytes).catch(() => {
-            // Write to a dead pipe → channel is gone.
-            closeOnce();
-          });
-        };
-      })()
-    : (() => {
-        const sink = streams.stdin;
-        return (bytes) => {
-          try {
-            sink.write(bytes);
-          } catch {
-            closeOnce();
-          }
-        };
-      })();
-  const closeWriter = isWhatwgStream(streams.stdin)
-    ? () => {
-        // Best-effort — already-closed pipe throws.
-        try {
-          // The getWriter call inside the writeBytes closure is
-          // distinct from this one — calling getWriter twice on a
-          // WritableStream throws because the lock is exclusive.
-          // We can't easily share without restructuring; skip
-          // explicit close() here and rely on the kernel to
-          // close the pipe when the parent process exits.
-          // Real WhatwgStream stdin from Bun.spawn isn't the
-          // production path anyway; this is here for future-
-          // proofing.
-        } catch {
-          // ignore
-        }
+  // Branch on stdin shape ONCE at construction so the write +
+  // close paths stay cheap and unbranched per call. For the
+  // WHATWG case, acquire the writer once and reuse it for both
+  // operations — `getWriter()` is exclusive (calling it twice
+  // throws), so we MUST hold a single reference if close() is
+  // going to flush+EOF the pipe instead of relying on the
+  // kernel to clean up at process exit.
+  let writeBytes: (bytes: Uint8Array) => void;
+  let closeWriter: () => void;
+  if (isWhatwgStream(streams.stdin)) {
+    const w = streams.stdin.getWriter();
+    writeBytes = (bytes) => {
+      w.write(bytes).catch(() => {
+        // Write to a dead pipe → channel is gone.
+        closeOnce();
+      });
+    };
+    closeWriter = () => {
+      // Flush pending writes and send EOF on the child's stdin
+      // (its read loop sees done=true). Without this, a child
+      // blocked in `read()` waiting for input would never
+      // notice the parent's `close()` — graceful shutdowns
+      // turn into hangs that only the wall-clock kill recovers
+      // from. Best-effort: a writer already in error state
+      // throws; the child will detect EOF either way once the
+      // parent process exits.
+      w.close().catch(() => undefined);
+    };
+  } else {
+    const sink = streams.stdin;
+    writeBytes = (bytes) => {
+      try {
+        sink.write(bytes);
+      } catch {
+        closeOnce();
       }
-    : () => {
-        const sink = streams.stdin as FileSinkLike;
-        try {
-          sink.end?.();
-        } catch {
-          // ignore
-        }
-      };
+    };
+    closeWriter = () => {
+      try {
+        sink.end?.();
+      } catch {
+        // ignore
+      }
+    };
+  }
 
   // Pump loop: chained reads, fire-and-forget. The caller's
   // signal is `onClose`, not a returned future. Errors during

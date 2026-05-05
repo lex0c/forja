@@ -459,6 +459,33 @@ describe('IPC subprocessTransport — framer', () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(closed).toBe(true);
   });
+
+  test('close() flushes and ends the WritableStream stdin (peer sees EOF)', async () => {
+    // A child blocked in `read()` waiting on stdin must observe
+    // EOF when the parent calls `transport.close()`. Without
+    // this, `transport.close()` is silent on the writer side and
+    // the child hangs until a wall-clock kill — turning a
+    // graceful shutdown into a 5-15s timeout cascade.
+    let stdinClosed = false;
+    let pendingWritesFlushed = 0;
+    const stdout = new ReadableStream<Uint8Array>({ start() {} });
+    const stdin = new WritableStream<Uint8Array>({
+      write(_chunk) {
+        pendingWritesFlushed += 1;
+      },
+      close() {
+        stdinClosed = true;
+      },
+    });
+    const t = subprocessTransport({ stdin, stdout });
+    t.write('hello\n');
+    t.close();
+    // The writer's close() resolves on the microtask after
+    // flushing — give it a tick.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(stdinClosed).toBe(true);
+    expect(pendingWritesFlushed).toBe(1);
+  });
 });
 
 // processTransport: same contract, listening on a Node-style
