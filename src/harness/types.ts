@@ -148,6 +148,59 @@ export type HarnessEvent =
       sessionId: string;
       items: TodoItem[];
     }
+  | {
+      // Lifecycle bracket for a subagent the parent harness just
+      // spawned via `task`. Producer is the harness loop's
+      // spawnSubagent closure (loop.ts), emitted right BEFORE the
+      // child runs. Without this event, the parent's TUI sees no
+      // signal that work shifted to a child — the operator stares
+      // at a blank live region for the duration of the child's
+      // run. Adapter translates to UIEvent `subagent:start`; the
+      // renderer renders a collapsed group keyed by `subagentId`.
+      // `subagentId` is the child session id (also exposed as
+      // `RunSubagentResult.sessionId` upstream); `name` is the
+      // subagent definition name (e.g. `explore`); `prompt` is
+      // the child's seed prompt — short renderers truncate it.
+      type: 'subagent_start';
+      subagentId: string;
+      name: string;
+      prompt: string;
+    }
+  | {
+      // Live progress signal from a running subagent. Producer is
+      // the harness loop's spawnSubagent closure as it forwards
+      // HarnessEvents the child emits over IPC (spec docs/spec/IPC.md
+      // §3.2). The wrapped `lastEvent` carries the most recent
+      // HarnessEvent the child fired so the parent's reducer can
+      // compute a one-line progress string (step counter, last
+      // tool name, etc.) without needing to model the full child
+      // state. Stream-shaped: zero or many between
+      // `subagent_start` and `subagent_finished`. The wrapped
+      // event MUST NOT itself be a `subagent_*` variant — nested
+      // subagent observability is dropped at the boundary because
+      // the parent renders only its direct children.
+      type: 'subagent_progress';
+      subagentId: string;
+      lastEvent: HarnessEvent;
+    }
+  | {
+      // Closing bracket for a subagent run. Emitted by the
+      // spawnSubagent closure after `runSubagent` resolves — once
+      // per `subagent_start`. Carries the terminal outcome the
+      // parent will render in the collapsed group: `status` (the
+      // child's HarnessResult.status: 'done'/'error'/'interrupted'),
+      // `summary` (a short human-readable line — the renderer
+      // typically uses the child's `output` first line, truncated),
+      // `durationMs` (wall-clock from start to finish, parent's
+      // perspective), `costUsd` (the child's reported authoritative
+      // cost; 0 when the child died before publishing).
+      type: 'subagent_finished';
+      subagentId: string;
+      status: HarnessResult['status'];
+      summary: string;
+      durationMs: number;
+      costUsd: number;
+    }
   | { type: 'session_finished'; result: HarnessResult };
 
 // Budget caps for an autonomous run. Per AGENTIC_CLI §5: every limit has

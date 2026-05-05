@@ -1,6 +1,6 @@
 import { readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import type { HarnessResult } from '../harness/index.ts';
+import type { HarnessEvent, HarnessResult } from '../harness/index.ts';
 import type { PermissionEngine } from '../permissions/index.ts';
 import type { Provider } from '../providers/index.ts';
 import {
@@ -15,6 +15,15 @@ import {
   markBgProcessAsKilled,
 } from '../storage/index.ts';
 import { type ToolRegistry, createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
+import {
+  IPC_PROTOCOL_VERSION,
+  type IpcChannel,
+  type IpcMessage,
+  createChannel,
+  makeInterruptHard,
+  makeInterruptSoft,
+  subprocessTransport,
+} from './ipc.ts';
 import type { SubagentSet } from './load.ts';
 import type { SubagentDefinition, WorktreeOutcome } from './types.ts';
 import {
@@ -133,6 +142,15 @@ export interface ChildProcessHandle {
   // are responsible for translating these to whatever the platform
   // exposes; Bun.spawn accepts them as strings directly.
   kill: (signal: 'SIGTERM' | 'SIGKILL') => void;
+  // Live IPC channel to the child (spec docs/spec/IPC.md). Set
+  // when the parent enabled `ipc: true` AND the spawn factory
+  // produced one. Tests that don't model IPC (existing fakes)
+  // omit this field — the runtime treats absence the same as
+  // ipc-disabled (no live wire, payload-only). When present,
+  // the runtime subscribes to messages and forwards them to the
+  // optional `onIpcMessage` observer; on subprocess exit the
+  // channel is closed alongside the rest of the cleanup.
+  ipc?: IpcChannel;
 }
 
 export interface SpawnChildProcessOptions {
@@ -201,6 +219,14 @@ export interface SpawnChildProcessOptions {
   // older callers); the child surfaces `memory.registry_unavailable`
   // on tool calls.
   memoryCwd?: string;
+  // Open the live IPC channel between parent and child. When
+  // true, the spawn factory MUST set `stdin: 'pipe'` and
+  // `stdout: 'pipe'` (subprocess can't write the channel if
+  // stdout is `'ignore'`) and append `--ipc=<n>` to argv so the
+  // child opens its side. Returned `ChildProcessHandle.ipc`
+  // carries the wire. Undefined / false ⇒ legacy mode: child
+  // runs in SQLite-only mode (existing one-shot contract).
+  ipc?: boolean;
 }
 
 export type SpawnChildProcess = (opts: SpawnChildProcessOptions) => ChildProcessHandle;
@@ -301,16 +327,33 @@ const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
   if (opts.memoryCwd !== undefined) {
     appendArgs.push('--subagent-memory-cwd', opts.memoryCwd);
   }
+  // IPC opt-in. The flag carries the protocol version so the
+  // child can refuse a parent it doesn't speak (spec §4.2). A
+  // child binary on an older release that doesn't recognize
+  // `--ipc` would surface "unknown flag" — caller catches it as
+  // `subprocess_spawn_failed` upstream, which is the correct
+  // outcome (operator runs `agent --version` and learns the
+  // mismatch).
+  if (opts.ipc === true) {
+    appendArgs.push(`--ipc=${IPC_PROTOCOL_VERSION}`);
+  }
   const cmd = resolveChildBinaryCmd({
     argv: Bun.argv,
     execPath: process.execPath,
     appendArgs,
   });
+  // Spawn shape depends on IPC opt-in:
+  //   - ipc off (legacy): stdin/stdout left detached; child uses
+  //     SQLite for the terminal payload.
+  //   - ipc on: stdin/stdout piped so subprocessTransport can
+  //     attach to the channel. Spec §2.3 requires the parent
+  //     to drain stdout continuously — the channel's pump loop
+  //     does this from the moment subprocessTransport binds.
   const proc = Bun.spawn({
     cmd,
     cwd: opts.cwd,
     env: process.env,
-    stdout: 'ignore',
+    ...(opts.ipc === true ? { stdin: 'pipe', stdout: 'pipe' } : { stdout: 'ignore' }),
     stderr: 'pipe',
   });
   // Drain stderr in the background. We swallow read errors —
@@ -322,6 +365,20 @@ const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
   if (proc.stderr !== null && proc.stderr !== undefined) {
     new Response(proc.stderr).text().catch(() => undefined);
   }
+  // Build the IPC channel only when both opt-in is set AND the
+  // OS streams resolved (defensive — `Bun.spawn` should always
+  // honor `'pipe'` but a future Bun bug or platform quirk could
+  // strand them as null/undefined). Without the channel we leave
+  // `handle.ipc` undefined and the runtime falls back to the
+  // legacy poller path — same behavior as the legacy mode.
+  let ipc: IpcChannel | undefined;
+  if (opts.ipc === true && proc.stdin !== undefined && proc.stdout !== undefined) {
+    const transport = subprocessTransport({
+      stdin: proc.stdin as unknown as WritableStream<Uint8Array>,
+      stdout: proc.stdout as unknown as ReadableStream<Uint8Array>,
+    });
+    ipc = createChannel(transport);
+  }
   return {
     exited: proc.exited.then(() => ({ exitCode: proc.exitCode ?? 0 })),
     kill: (signal) => {
@@ -331,6 +388,7 @@ const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
         // proc may already be exited; kill() throws — ignore.
       }
     },
+    ...(ipc !== undefined ? { ipc } : {}),
   };
 };
 
@@ -389,6 +447,36 @@ export interface RunSubagentInput {
   // wedged and escalates SIGTERM → grace → SIGKILL. Tests pass
   // small values to exercise the path without waiting 10s.
   heartbeatStaleMs?: number;
+  // Open the live IPC channel (spec docs/spec/IPC.md). Forwards
+  // to the spawn factory; default factory uses pipe shells +
+  // `--ipc=<n>` argv. When omitted the child runs in legacy
+  // SQLite-only mode and `onIpcMessage` / `onChildEvent` are
+  // never invoked. Implied true when `onChildEvent` is set —
+  // observability without a wire is meaningless.
+  ipc?: boolean;
+  // Raw IPC observer. Best-effort delivery — a malformed line is
+  // dropped (with a stderr warning) and never reaches this
+  // callback. Useful for tests and tooling that need access to
+  // the wire (audit log replays, IPC contract tests). Production
+  // consumers should prefer `onChildEvent` below.
+  onIpcMessage?: (msg: IpcMessage) => void;
+  // Typed child-event observer (S2 of subagent observability).
+  // The runtime synthesizes three HarnessEvents around the
+  // child's run:
+  //   - `subagent_start` right after the child session row is
+  //     created (BEFORE spawn) so the parent sees the bracket
+  //     even if spawn fails.
+  //   - `subagent_progress` for each child HarnessEvent received
+  //     over IPC's `event` envelope. Inner events that are
+  //     `session_finished` or `subagent_*` are dropped at the
+  //     boundary (parent renders only its DIRECT children).
+  //   - `subagent_finished` after `waitForChild` resolves; same
+  //     shape regardless of outcome (done / error / interrupted /
+  //     wall-clock / heartbeat-stale).
+  // The harness loop's spawnSubagent closure pipes this into
+  // `config.onEvent` so the parent's HarnessEvent → UIEvent
+  // adapter sees the lifecycle automatically.
+  onChildEvent?: (event: HarnessEvent) => void;
 }
 
 export interface RunSubagentResult {
@@ -414,6 +502,22 @@ export interface RunSubagentResult {
   auditFailure?: { code: string; message: string };
   worktree?: WorktreeOutcome;
   worktreeError?: { code: string; message: string };
+  // Abort discriminator (closes BACKLOG D168). Populated only on
+  // `reason === 'aborted'`:
+  //   - 'soft' — operator pressed Esc once; the child's harness
+  //     exited at the next step boundary cleanly (no preempted
+  //     tool). Reached when the parent sent `interrupt:soft` over
+  //     IPC and the child's session_finished arrived inside the
+  //     grace window.
+  //   - 'hard' — operator escalated; the child was preempted
+  //     mid-step (signal abort in-flight). Reached when the
+  //     parent sent `interrupt:hard` OR the soft escalation
+  //     timed out.
+  // Pre-S3 every subprocess abort surfaced as 'hard' implicitly
+  // because the only kill path was OS SIGTERM. Now: undefined for
+  // every non-abort outcome, set explicitly when the wire carried
+  // the resolution.
+  abortCause?: 'soft' | 'hard';
 }
 
 // Hard cap on how deep a chain of `task → task → task` can nest.
@@ -733,7 +837,7 @@ const HEARTBEAT_STALE_THRESHOLD_MS = 10_000;
 type WaitOutcome =
   | { kind: 'payload'; payload: Record<string, unknown> }
   | { kind: 'crashed'; exitCode: number }
-  | { kind: 'aborted' }
+  | { kind: 'aborted'; cause: 'soft' | 'hard' }
   | { kind: 'wall_clock' }
   | { kind: 'heartbeat_stale' };
 
@@ -742,6 +846,12 @@ interface WaitForChildArgs {
   sessionId: string;
   handle: ChildProcessHandle;
   signal: AbortSignal | undefined;
+  // S3: parent's cooperative-stop signal. Triggers `interrupt:soft`
+  // over IPC; the child's harness exits at the next step boundary.
+  // Without IPC, no-op for the subprocess path (the OS has no
+  // cooperative signal). Hard `signal` above remains the
+  // preemptive escalation target.
+  softStopSignal: AbortSignal | undefined;
   wallClockMs: number;
   graceMs: number;
   heartbeatStaleMs: number;
@@ -801,11 +911,37 @@ const drainChildAfterPayload = async (
 };
 
 const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
-  const { db, sessionId, handle, signal, wallClockMs, graceMs, heartbeatStaleMs, startTs } = args;
+  const {
+    db,
+    sessionId,
+    handle,
+    signal,
+    softStopSignal,
+    wallClockMs,
+    graceMs,
+    heartbeatStaleMs,
+    startTs,
+  } = args;
 
   let pollDelay = POLL_INITIAL_MS;
-  let killed: 'aborted' | 'wall_clock' | 'heartbeat_stale' | undefined;
+  // `killed` tracks non-abort kill verdicts (wall_clock,
+  // heartbeat_stale). The abort path uses `interruptCause`
+  // separately so its soft/hard discriminator survives into
+  // the outcome.
+  let killed: 'wall_clock' | 'heartbeat_stale' | undefined;
   let killedAt = 0;
+  // S3: tri-state tracking the parent's cooperative-vs-preemptive
+  // escalation against the child.
+  //   - undefined: no abort signaled.
+  //   - 'soft':    parent pressed Esc once; we sent `interrupt:soft`
+  //     over IPC and are waiting `graceMs` for the child to publish
+  //     its envelope cleanly. No SIGKILL scheduled.
+  //   - 'hard':    parent escalated (Esc-Esc, soft grace expired,
+  //     or `signal.aborted` directly). We sent `interrupt:hard`
+  //     (when IPC is on) AND OS SIGTERM as belt-and-suspenders,
+  //     plus scheduled the SIGKILL escalation.
+  let interruptCause: 'soft' | 'hard' | undefined;
+  let interruptAt = 0;
   let exitedResolved = false;
   // The pending SIGKILL escalation timer (set when killed
   // transitions to defined). Tracked in this scope so:
@@ -879,8 +1015,17 @@ const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
       if (lastLook !== null && lastLook.payload !== null) {
         return { kind: 'payload', payload: lastLook.payload };
       }
-      if (signal?.aborted === true) {
-        return { kind: 'aborted' };
+      // Abort precedence: explicit interruptCause wins over a
+      // bare `signal?.aborted` because we may have driven the
+      // soft path even when the caller's hard signal also
+      // aborted later. Default to 'hard' if the OS signal
+      // raced ahead before we could record interruptCause.
+      if (
+        interruptCause !== undefined ||
+        signal?.aborted === true ||
+        softStopSignal?.aborted === true
+      ) {
+        return { kind: 'aborted', cause: interruptCause ?? 'hard' };
       }
       if (killed !== undefined) {
         return { kind: killed };
@@ -889,22 +1034,59 @@ const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
       return { kind: 'crashed', exitCode };
     }
 
-    // Caller aborted — escalate via SIGTERM, wait grace, then
-    // SIGKILL if still alive. The first iteration sets
-    // `killed='aborted'`; subsequent iterations skip the kill
-    // calls but keep polling for the payload (the child's
-    // graceful-shutdown writes still count) until the grace
-    // window expires or the child exits.
-    if (signal?.aborted === true && killed === undefined) {
-      killed = 'aborted';
-      killedAt = Date.now();
+    // Soft trigger (S3, BACKLOG D159). Parent's cooperative-stop
+    // signal fired AND the hard signal hasn't (the latter takes
+    // precedence: a same-tick double-Esc lands on hard directly).
+    // We send `interrupt:soft` over IPC if available; subprocess
+    // children without IPC have no cooperative path, so soft-only
+    // calls degrade silently — the operator's hard escalation is
+    // the only working channel in that mode.
+    if (
+      softStopSignal?.aborted === true &&
+      interruptCause === undefined &&
+      signal?.aborted !== true
+    ) {
+      interruptCause = 'soft';
+      interruptAt = Date.now();
+      if (handle.ipc !== undefined) {
+        try {
+          handle.ipc.send(makeInterruptSoft());
+        } catch {
+          // Channel may be torn down; the OS-level kill path
+          // below picks up the slack on grace expiry.
+        }
+      }
+      // No SIGKILL scheduled here: soft is patient by design.
+      // The child's harness exits at its next step boundary,
+      // publishes the envelope (with abort_cause: 'soft'), and
+      // the payload-arrived branch above returns 'payload'.
+    }
+
+    // Hard trigger: caller's signal aborted directly, OR soft
+    // grace expired without the child finishing its bracket.
+    // We escalate via IPC `interrupt:hard` (cleaner — child can
+    // still drain its message buffers) AND OS SIGTERM (the
+    // ultimate fallback when the channel is half-closed),
+    // scheduling SIGKILL after `graceMs`.
+    const softExpired = interruptCause === 'soft' && Date.now() - interruptAt >= graceMs;
+    if ((signal?.aborted === true || softExpired) && interruptCause !== 'hard') {
+      const promotedFromSoft = interruptCause === 'soft';
+      interruptCause = 'hard';
+      if (!promotedFromSoft) interruptAt = Date.now();
+      if (handle.ipc !== undefined) {
+        try {
+          handle.ipc.send(makeInterruptHard());
+        } catch {
+          // ignore — SIGTERM below covers the channel-broken case
+        }
+      }
       handle.kill('SIGTERM');
       scheduleKill();
     }
 
     // Wall-clock budget exceeded — same escalation shape.
     const elapsed = Date.now() - startTs;
-    if (elapsed >= wallClockMs && killed === undefined) {
+    if (elapsed >= wallClockMs && killed === undefined && interruptCause === undefined) {
       killed = 'wall_clock';
       killedAt = Date.now();
       handle.kill('SIGTERM');
@@ -929,6 +1111,7 @@ const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
     //   4. Not already killed — avoids re-firing escalation.
     if (
       killed === undefined &&
+      interruptCause === undefined &&
       out !== null &&
       out.lastHeartbeat !== null &&
       Date.now() - out.lastHeartbeat > heartbeatStaleMs
@@ -951,6 +1134,17 @@ const waitForChild = async (args: WaitForChildArgs): Promise<WaitOutcome> => {
         return { kind: killed };
       }
     }
+    // Same bail-out for the abort path. `interruptCause === 'hard'`
+    // already SIGTERMed and scheduled SIGKILL above; once the
+    // 2×grace cushion expires without a payload or exit, surface
+    // the hard verdict so the parent doesn't block forever on a
+    // child that ignored every signal.
+    if (interruptCause === 'hard') {
+      const sinceHard = Date.now() - interruptAt;
+      if (sinceHard >= graceMs * 2) {
+        return { kind: 'aborted', cause: 'hard' };
+      }
+    }
 
     await sleep(pollDelay);
     pollDelay = Math.min(pollDelay * POLL_GROWTH, POLL_MAX_MS);
@@ -969,6 +1163,15 @@ const buildResultFromPayload = (
 ): RunSubagentResult => {
   const status = (payload.status as RunSubagentResult['status']) ?? 'error';
   const reason = (payload.reason as RunSubagentResult['reason']) ?? 'internalError';
+  // Abort discriminator (S3): trust the child only when the
+  // payload's `abort_cause` is a known value AND the reason is
+  // 'aborted'. A producer bug that stamped `abort_cause` on a
+  // non-abort path would otherwise mislead the parent's audit;
+  // gating on `reason === 'aborted'` keeps the field's invariant
+  // honest across the wire.
+  const rawAbort = payload.abort_cause;
+  const abortCause: 'soft' | 'hard' | undefined =
+    reason === 'aborted' && (rawAbort === 'soft' || rawAbort === 'hard') ? rawAbort : undefined;
   return {
     output: typeof payload.output === 'string' ? payload.output : '',
     sessionId,
@@ -977,6 +1180,7 @@ const buildResultFromPayload = (
     costUsd: typeof payload.cost_usd === 'number' ? payload.cost_usd : 0,
     steps: typeof payload.steps === 'number' ? payload.steps : 0,
     durationMs: typeof payload.duration_ms === 'number' ? payload.duration_ms : 0,
+    ...(abortCause !== undefined ? { abortCause } : {}),
   };
 };
 
@@ -1169,6 +1373,38 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     throw e;
   }
 
+  // 4b. Emit the lifecycle bracket open BEFORE spawn. A spawn
+  // failure that returns early should still surface a
+  // `subagent_start` followed by `subagent_finished` to the
+  // parent's observer — symmetric brackets keep the renderer's
+  // state machine clean (the alternative would be "start emitted
+  // sometimes, depending on timing"). Wrapped in try/catch
+  // because the observer is supplied by an outer caller and
+  // should never break the run.
+  const childEventObserver = input.onChildEvent;
+  const fireChildEvent = (event: HarnessEvent): void => {
+    if (childEventObserver === undefined) return;
+    try {
+      childEventObserver(event);
+    } catch {
+      // Observer bugs must not break the parent loop. Same
+      // policy as `onIpcMessage`'s try-catch.
+    }
+  };
+  fireChildEvent({
+    type: 'subagent_start',
+    subagentId: childSession.id,
+    name: definition.name,
+    prompt: input.prompt,
+  });
+
+  // Implicit IPC opt-in: an `onChildEvent` observer without the
+  // wire is a contract bug. Channel-less mode delivers only
+  // start/finished — no progress in between — which would silently
+  // mislead consumers ("did the child do nothing?"). Force the
+  // wire on so the events flow.
+  const effectiveIpc = input.ipc === true || input.onChildEvent !== undefined;
+
   // 5. Spawn the subprocess. Production uses `Bun.spawn` of the
   // same binary; tests inject a fake that runs the harness
   // in-process and writes the payload synchronously. Spawn
@@ -1209,9 +1445,26 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       memoryCwd: input.cwd,
       ...(input.temperature !== undefined ? { temperature: input.temperature } : {}),
       ...(input.planMode === true ? { planMode: true } : {}),
+      // Forward the IPC opt-in. The default spawn factory
+      // converts this into pipe streams + the `--ipc=<n>` argv
+      // flag; injected fakes can either build their own channel
+      // (set handle.ipc) or ignore the flag (handle.ipc stays
+      // undefined and the runtime degrades to payload-only).
+      ...(effectiveIpc ? { ipc: true } : {}),
     });
   } catch (e) {
     await cleanupOnFail();
+    // Bracket close on spawn failure too. The observer saw
+    // `subagent_start` above; without a matching close the
+    // parent's renderer would leak a live row indefinitely.
+    fireChildEvent({
+      type: 'subagent_finished',
+      subagentId: childSession.id,
+      status: 'error',
+      summary: 'subprocess_spawn_failed',
+      durationMs: 0,
+      costUsd: 0,
+    });
     return {
       output: '',
       sessionId: childSession.id,
@@ -1225,6 +1478,74 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
         message: e instanceof Error ? e.message : String(e),
       },
     };
+  }
+
+  // 5b. Subscribe to the IPC channel (when present). Parent MUST
+  // begin draining immediately on spawn — spec §2.3: if the
+  // parent stops reading, the child blocks on its next stdout
+  // write and the wedge masquerades as heartbeat staleness.
+  // Subscribing before `waitForChild` runs guarantees the pump
+  // loop is live for every message the child sends, including
+  // an early `session_start` that may arrive before the child's
+  // first SQLite write.
+  //
+  // Errors (malformed lines) are diagnostic-only; the channel
+  // surface keeps them off the typed observer path. Drop on
+  // stderr so an operator running with `--json` still sees the
+  // signal (NDJSON contract: stdout pure, stderr admin).
+  if (handle.ipc !== undefined) {
+    if (input.onIpcMessage !== undefined) {
+      const observer = input.onIpcMessage;
+      handle.ipc.onMessage((msg) => {
+        try {
+          observer(msg);
+        } catch {
+          // Observer bugs must not break the parent loop.
+        }
+      });
+    }
+    // Typed child-event forwarding (S2). For each `event` IPC
+    // variant arriving from the child, decode the inner
+    // HarnessEvent and re-emit as `subagent_progress` on the
+    // parent's observer. Drops nested subagent observability and
+    // session_finished — the parent doesn't render its
+    // grandchildren, and the bracket close fires from
+    // waitForChild's outcome below.
+    if (childEventObserver !== undefined) {
+      handle.ipc.onMessage((msg) => {
+        if (msg.type !== 'event') return;
+        const inner = msg.event;
+        if (
+          typeof inner !== 'object' ||
+          inner === null ||
+          typeof (inner as { type?: unknown }).type !== 'string'
+        ) {
+          // Defensive: the child should have sent a real
+          // HarnessEvent; a corrupted payload is logged once
+          // and dropped.
+          return;
+        }
+        const innerType = (inner as { type: string }).type;
+        if (
+          innerType === 'session_finished' ||
+          innerType === 'subagent_start' ||
+          innerType === 'subagent_progress' ||
+          innerType === 'subagent_finished'
+        ) {
+          return;
+        }
+        fireChildEvent({
+          type: 'subagent_progress',
+          subagentId: childSession.id,
+          lastEvent: inner as HarnessEvent,
+        });
+      });
+    }
+    handle.ipc.onError((err) => {
+      process.stderr.write(
+        `subagent ${childSession.id}: ipc malformed line dropped (${err.reason}): ${err.line.slice(0, 120)}\n`,
+      );
+    });
   }
 
   // 6. Wait for the child. Outcome maps to the result envelope:
@@ -1255,11 +1576,22 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     sessionId: childSession.id,
     handle,
     signal: input.signal,
+    softStopSignal: input.softStopSignal,
     wallClockMs,
     graceMs,
     heartbeatStaleMs,
     startTs,
   });
+
+  // Tear down the IPC channel before bg/worktree cleanup. The
+  // child's own finally already sent `session_finished` and
+  // closed its side; closing here releases the parent's pump
+  // loop subscription so the post-run cleanup runs without a
+  // dangling reader on a defunct stream. Idempotent —
+  // transport.close() short-circuits if already closed.
+  if (handle.ipc !== undefined) {
+    handle.ipc.close();
+  }
 
   // 7a. Reap orphan bg processes BEFORE worktree cleanup. The
   // happy path (child exits cleanly via published payload)
@@ -1402,6 +1734,13 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       break;
     }
     case 'aborted': {
+      // S3: surface the soft/hard discriminator from the wait
+      // outcome onto the synthesized result. The payload-arrived
+      // path already pulls `abort_cause` off the child's envelope
+      // via `buildResultFromPayload`; this branch is the
+      // no-payload synthesis (child crashed/killed before
+      // publishing) and the `outcome.cause` is the parent's own
+      // observation of which signal won.
       result = {
         output: '',
         sessionId: childSession.id,
@@ -1410,6 +1749,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
         costUsd: 0,
         steps: 0,
         durationMs: Date.now() - startTs,
+        abortCause: outcome.cause,
       };
       break;
     }
@@ -1485,6 +1825,29 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     // ignore — the row is already in a terminal state
   }
 
+  // Bracket close (S2): fire `subagent_finished` for the typed
+  // observer. Summary picks the first non-blank line of the
+  // child's output (capped at 80 chars) so the parent's
+  // permanent line shows what the run actually produced.
+  // `output` is empty for non-payload outcomes (crashed /
+  // aborted / wall-clock) — fall back to the reason in those
+  // cases so the operator sees something meaningful.
+  const summaryFromOutput = (raw: string): string => {
+    const firstLine = raw.split(/\r?\n/, 1)[0]?.trim() ?? '';
+    if (firstLine.length === 0) return '';
+    if (firstLine.length <= 80) return firstLine;
+    return `${firstLine.slice(0, 79)}…`;
+  };
+  const summary = result.output.length > 0 ? summaryFromOutput(result.output) : `${result.reason}`;
+  fireChildEvent({
+    type: 'subagent_finished',
+    subagentId: childSession.id,
+    status: result.status,
+    summary,
+    durationMs: result.durationMs,
+    costUsd: result.costUsd,
+  });
+
   // Attach worktree shape and any audit failure side-channel.
   return {
     ...result,
@@ -1519,6 +1882,10 @@ export interface SubagentEnvelope {
   cost_usd: number;
   steps: number;
   duration_ms: number;
+  // Soft/hard abort discriminator (S3). Snake_cased for the
+  // tool-facing envelope; mirrors the camelCased
+  // `RunSubagentResult.abortCause`. Absent for non-abort outcomes.
+  abort_cause?: 'soft' | 'hard';
 }
 
 export const toEnvelope = (result: RunSubagentResult): SubagentEnvelope => ({
@@ -1529,4 +1896,5 @@ export const toEnvelope = (result: RunSubagentResult): SubagentEnvelope => ({
   cost_usd: result.costUsd,
   steps: result.steps,
   duration_ms: result.durationMs,
+  ...(result.abortCause !== undefined ? { abort_cause: result.abortCause } : {}),
 });

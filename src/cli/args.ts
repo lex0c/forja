@@ -128,6 +128,16 @@ export interface ParsedArgs {
   // operator-driven `--subagent-session-id` invocations without
   // a parent runtime to set it).
   subagentMemoryCwd?: string;
+  // Internal: IPC protocol version. Set when the parent spawns
+  // the child with `--ipc=<n>` to enable the parent↔child stream
+  // (spec docs/spec/IPC.md). Absent ⇒ child runs in the legacy
+  // SQLite-only mode (no live event channel). The protocol is
+  // versioned so future bumps can be detected at handshake; an
+  // older child that doesn't recognize the version refuses
+  // before emitting any message (spec §4.2). `undefined` is the
+  // default — present-but-mismatched is a hard refusal at
+  // child boot.
+  subagentIpcVersion?: number;
   // `agent init` mode (AGENTIC_CLI §2.1). Scaffolds
   // `.agent/permissions.yaml` and exits. The first positional
   // arg `init` triggers it — diverging from the `--<flag>`
@@ -574,16 +584,41 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         i += 2;
         break;
       }
-      default:
-        // Anything still starting with `--` after the explicit cases above
-        // is an unknown flag. Single-dash tokens (`-foo`) fall through as
-        // prompt fragments, which matches users who quote prompts loosely.
+      default: {
+        // `--ipc=<n>` (spec IPC.md §4.2). Equals-shape because
+        // the value carries protocol semantics, not arbitrary
+        // user input — matching `--key=value` mirrors how
+        // POSIX-style flags carry version negotiation in tools
+        // like `git`. Standalone `--ipc` (no value) is also
+        // accepted as version=1 for ergonomic invocations during
+        // dev / manual debugging.
+        if (arg === '--ipc') {
+          args.subagentIpcVersion = 1;
+          i += 1;
+          break;
+        }
+        if (arg.startsWith('--ipc=')) {
+          const raw = arg.slice('--ipc='.length);
+          if (!/^[1-9][0-9]*$/.test(raw)) {
+            return {
+              ok: false,
+              message: `--ipc requires a positive integer version, got '${raw}'`,
+            };
+          }
+          args.subagentIpcVersion = Number.parseInt(raw, 10);
+          i += 1;
+          break;
+        }
+        // Anything still starting with `--` after the explicit
+        // cases above is an unknown flag. Single-dash tokens
+        // (`-foo`) fall through as prompt fragments.
         if (arg.startsWith('--')) {
           return { ok: false, message: `unknown flag: ${arg}` };
         }
         promptParts.push(arg);
         i += 1;
         break;
+      }
     }
   }
   args.prompt = promptParts.join(' ').trim();

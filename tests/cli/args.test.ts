@@ -499,6 +499,53 @@ describe('--subagent-bg-log-dir', () => {
   });
 });
 
+describe('--ipc', () => {
+  test('--ipc=<n> captures protocol version', () => {
+    const r = parseArgs(['--ipc=1']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentIpcVersion).toBe(1);
+  });
+
+  test('--ipc (no value) defaults to version 1', () => {
+    // Ergonomic shorthand for dev / manual debugging — the
+    // parent always sends the explicit version, but a human
+    // typing `--ipc` directly should not get a parser error.
+    const r = parseArgs(['--ipc']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentIpcVersion).toBe(1);
+  });
+
+  test('rejects non-positive integers', () => {
+    expect(parseArgs(['--ipc=0']).ok).toBe(false);
+    expect(parseArgs(['--ipc=-1']).ok).toBe(false);
+    expect(parseArgs(['--ipc=foo']).ok).toBe(false);
+    expect(parseArgs(['--ipc=1.5']).ok).toBe(false);
+    expect(parseArgs(['--ipc=']).ok).toBe(false);
+  });
+
+  test('absent by default — child runs in legacy SQLite-only mode', () => {
+    const r = parseArgs(['hi']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentIpcVersion).toBeUndefined();
+  });
+
+  test('coexists with other internal subagent flags', () => {
+    // Concurrent flag presence is the realistic invocation:
+    // `agent --subagent-session-id <id> --subagent-depth 1
+    //  --ipc=1`. Each flag captures into its own field; no
+    // ordering coupling.
+    const r = parseArgs(['--subagent-session-id', 'sess-x', '--subagent-depth', '2', '--ipc=1']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentSessionId).toBe('sess-x');
+    expect(r.args.subagentDepth).toBe(2);
+    expect(r.args.subagentIpcVersion).toBe(1);
+  });
+});
+
 describe('--worktrees', () => {
   test('captures verb + positionals', () => {
     const r = parseArgs(['--worktrees', 'gc', '--dry-run']);

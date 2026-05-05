@@ -1179,6 +1179,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     permissionEngine: config.permissionEngine,
                     db: config.db,
                     cwd: config.cwd,
+                    // Live observability (S2 of subagent IPC).
+                    // Forward the parent's onEvent so subagent_*
+                    // HarnessEvents (start/progress/finished) flow
+                    // into the same channel the parent's TUI
+                    // adapter already listens on. The runtime
+                    // implies `ipc: true` automatically when
+                    // onChildEvent is set — without the wire there
+                    // are no progress events to observe between the
+                    // brackets.
+                    ...(config.onEvent !== undefined ? { onChildEvent: config.onEvent } : {}),
                     // Propagate combined parent signal: a Ctrl+C or
                     // wall-clock timeout on the parent must abort
                     // the child run too. The child builds its own

@@ -873,3 +873,147 @@ describe('harness-adapter — compaction & checkpoints', () => {
     expect((out[0] as Extract<UIEvent, { type: 'todo:update' }>).items).toEqual([]);
   });
 });
+
+describe('harness-adapter — subagent observability', () => {
+  test('subagent_start translates to subagent:start with name + goal pass-through', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'subagent_start',
+      subagentId: 'child-1',
+      name: 'explore',
+      prompt: 'find the README',
+    });
+    expect(types(out)).toEqual(['subagent:start']);
+    const ev = out[0] as Extract<UIEvent, { type: 'subagent:start' }>;
+    expect(ev.subagentId).toBe('child-1');
+    expect(ev.name).toBe('explore');
+    expect(ev.goal).toBe('find the README');
+  });
+
+  test('subagent_progress maps inner step_start to "step N"', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'c',
+      lastEvent: { type: 'step_start', stepN: 3 },
+    });
+    expect(types(out)).toEqual(['subagent:update']);
+    const ev = out[0] as Extract<UIEvent, { type: 'subagent:update' }>;
+    expect(ev.progress).toBe('step 3');
+  });
+
+  test('subagent_progress maps tool_invoking to "running <name>"', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'c',
+      lastEvent: {
+        type: 'tool_invoking',
+        toolUseId: 't1',
+        toolName: 'echo',
+        args: { msg: 'hi' },
+      },
+    });
+    const ev = out[0] as Extract<UIEvent, { type: 'subagent:update' }>;
+    expect(ev.progress).toBe('running echo');
+  });
+
+  test('subagent_progress maps tool_finished failed/done correctly', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const okOut = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'c',
+      lastEvent: {
+        type: 'tool_finished',
+        toolUseId: 't1',
+        toolName: 'echo',
+        failed: false,
+        durationMs: 5,
+      },
+    });
+    expect((okOut[0] as Extract<UIEvent, { type: 'subagent:update' }>).progress).toBe('echo done');
+
+    const failOut = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'c',
+      lastEvent: {
+        type: 'tool_finished',
+        toolUseId: 't1',
+        toolName: 'grep',
+        failed: true,
+        durationMs: 5,
+      },
+    });
+    expect((failOut[0] as Extract<UIEvent, { type: 'subagent:update' }>).progress).toBe(
+      'grep failed',
+    );
+  });
+
+  test('subagent_progress falls back to inner.type for unmodeled events', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'c',
+      lastEvent: { type: 'bg_started', processId: 'p1', command: 'sleep', label: null },
+    });
+    expect((out[0] as Extract<UIEvent, { type: 'subagent:update' }>).progress).toBe('bg_started');
+  });
+
+  test('subagent_progress with tool_warning inner emits BOTH subagent:update AND a warn UIEvent', () => {
+    // S4: child's tool_warning must surface to the operator's
+    // permanent scrollback, not just the transient live row that
+    // disappears on subagent:end. The adapter dual-emits.
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'cafebabe-1234-5678-9abc-def012345678',
+      lastEvent: {
+        type: 'tool_warning',
+        toolUseId: 't1',
+        toolName: 'memory_read',
+        message: '[memory: untrusted]',
+      },
+    });
+    expect(types(out)).toEqual(['subagent:update', 'warn']);
+    const warn = out[1] as Extract<UIEvent, { type: 'warn' }>;
+    expect(warn.message).toContain('subagent cafebabe');
+    expect(warn.message).toContain('memory_read');
+    expect(warn.message).toContain('[memory: untrusted]');
+  });
+
+  test('subagent_progress with non-warning inner emits ONLY subagent:update', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'c',
+      lastEvent: { type: 'step_start', stepN: 1 },
+    });
+    expect(types(out)).toEqual(['subagent:update']);
+  });
+
+  test('subagent_finished maps done → status:done, anything else → status:error', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const okOut = a.translate({
+      type: 'subagent_finished',
+      subagentId: 'c',
+      status: 'done',
+      summary: 'README found',
+      durationMs: 1234,
+      costUsd: 0.001,
+    });
+    const okEv = okOut[0] as Extract<UIEvent, { type: 'subagent:end' }>;
+    expect(okEv.status).toBe('done');
+    expect(okEv.summary).toBe('README found');
+    expect(okEv.durationMs).toBe(1234);
+
+    const errOut = a.translate({
+      type: 'subagent_finished',
+      subagentId: 'c',
+      status: 'interrupted',
+      summary: 'aborted',
+      durationMs: 9,
+      costUsd: 0,
+    });
+    expect((errOut[0] as Extract<UIEvent, { type: 'subagent:end' }>).status).toBe('error');
+  });
+});

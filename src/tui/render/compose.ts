@@ -30,6 +30,7 @@ import { renderInput } from './input.ts';
 import { renderModal } from './modal.ts';
 import { renderReverseSearch } from './reverse-search.ts';
 import { renderSlashPopover } from './slash-popover.ts';
+import { renderSubagentRows } from './subagent-row.ts';
 import { renderTodoList } from './todo-list.ts';
 import { renderToolCardLive } from './tool-card.ts';
 import { wrapInputLine } from './wrap.ts';
@@ -206,6 +207,14 @@ export const composeLive: ComposeLive = (
   // "Todo list (§4.3) acima dos chips, se houver"). renderTodoList
   // returns [] when state.todos is empty — section drops entirely.
   appendBlock(renderTodoList(state.todos, caps));
+
+  // 1b. Active subagents (UI.md §4.2). One row per concurrent
+  // child run; section disappears when state.subagents is empty.
+  // Rendered between TodoList and the assistant chip so the
+  // operator's eye lands on "what's the AI doing on my behalf"
+  // — todos (planning), then subagents (delegation), then the
+  // active turn (the AI's own thinking).
+  appendBlock(renderSubagentRows(state.subagents, caps, now));
 
   // 2. Live "Generating…" chip. Spec §4.10.5: the assistant turn is
   // an operation chip just like a tool call. Renders above the tool

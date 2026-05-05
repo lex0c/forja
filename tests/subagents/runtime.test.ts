@@ -27,6 +27,15 @@ import {
 } from '../../src/storage/index.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import {
+  type IpcChannel,
+  type IpcMessage,
+  createChannel,
+  fakeTransportPair,
+  makeEvent,
+  makeSessionFinished,
+  makeSessionStart,
+} from '../../src/subagents/ipc.ts';
+import {
   MAX_SUBAGENT_DEPTH,
   type SpawnChildProcess,
   resolveChildBinaryCmd,
@@ -2542,5 +2551,733 @@ describe('runSubagent — worktree isolation', () => {
     } finally {
       rmSync(outside, { recursive: true, force: true });
     }
+  });
+});
+
+// IPC integration (spec docs/spec/IPC.md, Slice 1). Verifies the
+// runtime opt-in (`input.ipc: true`) reaches the spawn factory,
+// the fake channel surfaces messages back to the parent's
+// `onIpcMessage` observer, and the post-wait teardown closes the
+// channel — without coupling these tests to a real subprocess.
+describe('runSubagent — IPC channel', () => {
+  // Helper: build a fake spawn that opens a channel pair and
+  // returns the child's side so the test can drive messages from
+  // the "child" perspective. The `payload` arg drives the
+  // canonical happy-path SQLite write the runtime polls for; the
+  // test can also send arbitrary IpcMessages over the channel
+  // before the payload lands.
+  const fakeSpawnWithIpc = (
+    payload: Partial<Record<string, unknown>> = {},
+  ): {
+    spawn: SpawnChildProcess;
+    childChannel: IpcChannel;
+    sawIpc: boolean;
+    publish: (sessionId: string) => void;
+  } => {
+    const { a, b } = fakeTransportPair();
+    const parentChannel = createChannel(a);
+    const childChannel = createChannel(b);
+    let resolveExit: ((v: { exitCode: number }) => void) | undefined;
+    const exited = new Promise<{ exitCode: number }>((r) => {
+      resolveExit = r;
+    });
+    const ctx = {
+      sawIpc: false,
+      publish: (sessionId: string) => {
+        insertSubagentOutput(db, { sessionId });
+        setSubagentPayload(db, sessionId, {
+          status: 'done',
+          reason: 'done',
+          output: 'child output',
+          cost_usd: 0.001,
+          steps: 1,
+          duration_ms: 50,
+          ...payload,
+        });
+        if (resolveExit !== undefined) {
+          resolveExit({ exitCode: 0 });
+          resolveExit = undefined;
+        }
+      },
+    };
+    const spawn: SpawnChildProcess = (opts) => {
+      // The spawn factory only sees `ipc: true` when the runtime
+      // forwarded the opt-in. Track it so the test can assert.
+      ctx.sawIpc = opts.ipc === true;
+      return {
+        exited,
+        kill: () => undefined,
+        ipc: parentChannel,
+      };
+    };
+    return {
+      spawn,
+      childChannel,
+      get sawIpc() {
+        return ctx.sawIpc;
+      },
+      publish: ctx.publish,
+    };
+  };
+
+  test('input.ipc: true forwards to spawn factory', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake = fakeSpawnWithIpc();
+    // Drive the payload publish on next tick so the wait loop
+    // resolves cleanly. Without this, the spawn returns a
+    // never-resolving exited promise and the test hangs until
+    // wallClockMs.
+    queueMicrotask(() => {
+      // Need the session id; runtime computes it post-spawn,
+      // so query the DB. The runtime inserts the row before
+      // calling spawn; here we drive `publish` from inside
+      // the test by reading `listChildSessions` shortly after.
+      const children = listChildSessions(db, parent.id);
+      const last = children[children.length - 1];
+      if (last !== undefined) fake.publish(last.id);
+    });
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: fake.spawn,
+    });
+    expect(fake.sawIpc).toBe(true);
+  });
+
+  test('messages from child reach onIpcMessage observer', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake = fakeSpawnWithIpc();
+    const received: IpcMessage[] = [];
+    queueMicrotask(() => {
+      const children = listChildSessions(db, parent.id);
+      const last = children[children.length - 1];
+      if (last !== undefined) {
+        fake.childChannel.send(makeSessionStart(last.id));
+        fake.childChannel.send(makeEvent({ kind: 'tool_invoking', name: 'echo', stepN: 1 }));
+        fake.childChannel.send(makeSessionFinished());
+        fake.publish(last.id);
+      }
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      onIpcMessage: (m) => received.push(m),
+      spawnChildProcess: fake.spawn,
+    });
+    expect(result.status).toBe('done');
+    // Three messages we drove + the order they arrived.
+    expect(received.map((m) => m.type)).toEqual(['session_start', 'event', 'session_finished']);
+  });
+
+  test('observer exceptions do not break the run', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake = fakeSpawnWithIpc();
+    queueMicrotask(() => {
+      const children = listChildSessions(db, parent.id);
+      const last = children[children.length - 1];
+      if (last !== undefined) {
+        fake.childChannel.send(makeSessionStart(last.id));
+        fake.publish(last.id);
+      }
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      onIpcMessage: () => {
+        throw new Error('observer exploded');
+      },
+      spawnChildProcess: fake.spawn,
+    });
+    // Run completes despite the listener throw.
+    expect(result.status).toBe('done');
+  });
+
+  test('opt-out (no ipc) leaves handle.ipc undefined and observer never fires', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const received: unknown[] = [];
+    let sawIpcFlag = false;
+    const spawn: SpawnChildProcess = (opts) => {
+      sawIpcFlag = opts.ipc === true;
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      setSubagentPayload(db, opts.sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'no ipc',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      });
+      return {
+        exited: Promise.resolve({ exitCode: 0 }),
+        kill: () => undefined,
+      };
+    };
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      onIpcMessage: (m) => received.push(m),
+      spawnChildProcess: spawn,
+    });
+    expect(result.status).toBe('done');
+    expect(sawIpcFlag).toBe(false);
+    expect(received).toEqual([]);
+  });
+});
+
+// S2: typed `onChildEvent` observer surfacing subagent_* HarnessEvents
+// to the parent's harness chain. Tests focus on the bracket invariant
+// (start always pairs with finished) and the subagent_progress
+// translation from incoming IPC `event` messages.
+describe('runSubagent — onChildEvent (S2 observability)', () => {
+  // Build a fake spawn that exposes a connected child channel for
+  // the test to drive. Mirrors `fakeSpawnWithIpc` from S1's tests
+  // but kept here so each S2 test reads top-down.
+  const fakeSpawnForObservability = (
+    payload: Partial<Record<string, unknown>> = {},
+  ): {
+    spawn: SpawnChildProcess;
+    childChannel: IpcChannel;
+    publish: (sessionId: string) => void;
+  } => {
+    const { a, b } = fakeTransportPair();
+    const parentChannel = createChannel(a);
+    const childChannel = createChannel(b);
+    let resolveExit: ((v: { exitCode: number }) => void) | undefined;
+    const exited = new Promise<{ exitCode: number }>((r) => {
+      resolveExit = r;
+    });
+    const publish = (sessionId: string) => {
+      insertSubagentOutput(db, { sessionId });
+      setSubagentPayload(db, sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'first line\nsecond line',
+        cost_usd: 0.002,
+        steps: 3,
+        duration_ms: 100,
+        ...payload,
+      });
+      if (resolveExit !== undefined) {
+        resolveExit({ exitCode: 0 });
+        resolveExit = undefined;
+      }
+    };
+    const spawn: SpawnChildProcess = () => ({
+      exited,
+      kill: () => undefined,
+      ipc: parentChannel,
+    });
+    return { spawn, childChannel, publish };
+  };
+
+  test('emits subagent_start before spawn and subagent_finished after wait', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake = fakeSpawnForObservability();
+    const events: import('../../src/harness/index.ts').HarnessEvent[] = [];
+    queueMicrotask(() => {
+      const children = listChildSessions(db, parent.id);
+      const last = children[children.length - 1];
+      if (last !== undefined) fake.publish(last.id);
+    });
+    const result = await runSubagent({
+      definition: definition({ name: 'explore' }),
+      prompt: 'find the README',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      onChildEvent: (e) => events.push(e),
+      spawnChildProcess: fake.spawn,
+    });
+    expect(result.status).toBe('done');
+    // Bracket invariant: first event is start, last is finished.
+    expect(events[0]?.type).toBe('subagent_start');
+    expect(events[events.length - 1]?.type).toBe('subagent_finished');
+    const start = events[0];
+    if (start?.type === 'subagent_start') {
+      expect(start.subagentId).toBe(result.sessionId);
+      expect(start.name).toBe('explore');
+      expect(start.prompt).toBe('find the README');
+    }
+    const fin = events[events.length - 1];
+    if (fin?.type === 'subagent_finished') {
+      expect(fin.subagentId).toBe(result.sessionId);
+      expect(fin.status).toBe('done');
+      // Summary picks the first line of `output` (first 80 chars).
+      expect(fin.summary).toBe('first line');
+      expect(fin.costUsd).toBe(0.002);
+    }
+  });
+
+  test('forwards child IPC events as subagent_progress (with inner HarnessEvent)', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake = fakeSpawnForObservability();
+    const progressEvents: import('../../src/harness/index.ts').HarnessEvent[] = [];
+    queueMicrotask(() => {
+      const children = listChildSessions(db, parent.id);
+      const last = children[children.length - 1];
+      if (last !== undefined) {
+        // Drive a few HarnessEvents from the "child" via the IPC
+        // `event` envelope. The runtime should unwrap and re-fire
+        // them as subagent_progress on our observer.
+        fake.childChannel.send(makeEvent({ type: 'step_start', stepN: 1 }));
+        fake.childChannel.send(
+          makeEvent({
+            type: 'tool_invoking',
+            toolUseId: 't1',
+            toolName: 'echo',
+            args: { msg: 'hi' },
+          }),
+        );
+        fake.publish(last.id);
+      }
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      onChildEvent: (e) => {
+        if (e.type === 'subagent_progress') progressEvents.push(e);
+      },
+      spawnChildProcess: fake.spawn,
+    });
+    expect(result.status).toBe('done');
+    expect(progressEvents.length).toBe(2);
+    const inner0 = progressEvents[0];
+    if (inner0?.type === 'subagent_progress') {
+      expect(inner0.lastEvent.type).toBe('step_start');
+    }
+    const inner1 = progressEvents[1];
+    if (inner1?.type === 'subagent_progress') {
+      expect(inner1.lastEvent.type).toBe('tool_invoking');
+    }
+  });
+
+  test('drops nested subagent_* and session_finished from progress forwarding', async () => {
+    // The parent renders only its DIRECT children — a grandchild
+    // throwing subagent_start over IPC must not bubble up to the
+    // parent's renderer. session_finished is also dropped: the
+    // bracket close fires from waitForChild's outcome, not from
+    // the wire (which the runtime cannot distinguish from a
+    // grandchild's bracket).
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake = fakeSpawnForObservability();
+    const progressEvents: import('../../src/harness/index.ts').HarnessEvent[] = [];
+    queueMicrotask(() => {
+      const children = listChildSessions(db, parent.id);
+      const last = children[children.length - 1];
+      if (last !== undefined) {
+        fake.childChannel.send(
+          makeEvent({
+            type: 'subagent_start',
+            subagentId: 'grandchild',
+            name: 'inner',
+            prompt: 'nested',
+          }),
+        );
+        fake.childChannel.send(makeEvent({ type: 'session_finished', result: { status: 'done' } }));
+        fake.childChannel.send(makeEvent({ type: 'step_start', stepN: 2 }));
+        fake.publish(last.id);
+      }
+    });
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      onChildEvent: (e) => {
+        if (e.type === 'subagent_progress') progressEvents.push(e);
+      },
+      spawnChildProcess: fake.spawn,
+    });
+    expect(progressEvents.length).toBe(1);
+    const only = progressEvents[0];
+    if (only?.type === 'subagent_progress') {
+      expect(only.lastEvent.type).toBe('step_start');
+    }
+  });
+
+  test('bracket invariant holds even when spawn throws', async () => {
+    // Defense in depth — observers must always see a finished
+    // event after a start, regardless of which path led to
+    // termination. The renderer's reducer would otherwise leak a
+    // live row when the spawn factory throws (ENOENT / EACCES
+    // produce subprocess_spawn_failed).
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const events: import('../../src/harness/index.ts').HarnessEvent[] = [];
+    const throwingSpawn: SpawnChildProcess = () => {
+      throw new Error('ENOENT: missing binary');
+    };
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      onChildEvent: (e) => events.push(e),
+      spawnChildProcess: throwingSpawn,
+    });
+    expect(result.status).toBe('error');
+    expect(result.reason).toBe('subprocess_spawn_failed');
+    expect(events.map((e) => e.type)).toEqual(['subagent_start', 'subagent_finished']);
+  });
+
+  test('observer exceptions do not break the run', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake = fakeSpawnForObservability();
+    queueMicrotask(() => {
+      const children = listChildSessions(db, parent.id);
+      const last = children[children.length - 1];
+      if (last !== undefined) fake.publish(last.id);
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      onChildEvent: () => {
+        throw new Error('observer exploded');
+      },
+      spawnChildProcess: fake.spawn,
+    });
+    expect(result.status).toBe('done');
+  });
+});
+
+// S3: soft/hard interrupt propagation + abortCause discriminator.
+// Tests focus on the wait-loop's escalation semantics: soft sends
+// `interrupt:soft` over IPC and waits; soft expiry promotes to
+// hard; payload-carried `abort_cause` round-trips through
+// `buildResultFromPayload`.
+describe('runSubagent — interrupt soft/hard (S3)', () => {
+  // Helper: build a fake spawn whose ipc channel is observable
+  // from the test side AND that records OS kill signals. The
+  // `childAck` callback fires when the parent sends an IPC
+  // command — tests use it to choreograph "child responded by
+  // publishing a payload".
+  const fakeSpawnInterruptable = (): {
+    spawn: SpawnChildProcess;
+    childChannel: IpcChannel;
+    parentSent: import('../../src/subagents/ipc.ts').IpcMessage[];
+    killSignals: string[];
+    publish: (sessionId: string, payload?: Partial<Record<string, unknown>>) => void;
+    forceExit: (exitCode?: number) => void;
+  } => {
+    const { a, b } = fakeTransportPair();
+    const parentChannel = createChannel(a);
+    const childChannel = createChannel(b);
+    const parentSent: import('../../src/subagents/ipc.ts').IpcMessage[] = [];
+    childChannel.onMessage((m) => parentSent.push(m));
+
+    const killSignals: string[] = [];
+    let resolveExit: ((v: { exitCode: number }) => void) | undefined;
+    const exited = new Promise<{ exitCode: number }>((r) => {
+      resolveExit = r;
+    });
+    const publish = (sessionId: string, payload: Partial<Record<string, unknown>> = {}) => {
+      insertSubagentOutput(db, { sessionId });
+      setSubagentPayload(db, sessionId, {
+        status: 'interrupted',
+        reason: 'aborted',
+        output: '',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 10,
+        ...payload,
+      });
+      if (resolveExit !== undefined) {
+        resolveExit({ exitCode: 0 });
+        resolveExit = undefined;
+      }
+    };
+    const forceExit = (exitCode = 137) => {
+      if (resolveExit !== undefined) {
+        resolveExit({ exitCode });
+        resolveExit = undefined;
+      }
+    };
+    const spawn: SpawnChildProcess = () => ({
+      exited,
+      kill: (sig) => {
+        killSignals.push(sig);
+        // SIGKILL ends the subprocess for our purposes.
+        if (sig === 'SIGKILL') forceExit(137);
+      },
+      ipc: parentChannel,
+    });
+    return { spawn, childChannel, parentSent, killSignals, publish, forceExit };
+  };
+
+  test('soft signal sends interrupt:soft over IPC and surfaces abortCause from payload', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake = fakeSpawnInterruptable();
+    const softCtl = new AbortController();
+    // Choreography: trigger the soft signal once the wait loop is
+    // already polling, then have the "child" publish a clean
+    // abort_cause:'soft' payload only AFTER it observes the IPC
+    // command. This sequencing matches the real flow (parent ->
+    // wire -> child harness exits at next step boundary) and avoids
+    // the race where the test's payload-publish would beat the
+    // parent's first wake-up cycle.
+    fake.childChannel.onMessage((msg) => {
+      if (msg.type === 'interrupt:soft') {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) fake.publish(last.id, { abort_cause: 'soft' });
+      }
+    });
+    queueMicrotask(() => softCtl.abort());
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      softStopSignal: softCtl.signal,
+      spawnChildProcess: fake.spawn,
+      graceMs: 1000,
+    });
+    expect(result.status).toBe('interrupted');
+    expect(result.reason).toBe('aborted');
+    expect(result.abortCause).toBe('soft');
+    expect(fake.parentSent.some((m) => m.type === 'interrupt:soft')).toBe(true);
+    expect(fake.parentSent.some((m) => m.type === 'interrupt:hard')).toBe(false);
+    // No OS kill needed when the child cooperates.
+    expect(fake.killSignals).toEqual([]);
+  });
+
+  test('hard signal sends interrupt:hard + SIGTERM and surfaces abortCause=hard', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake = fakeSpawnInterruptable();
+    const hardCtl = new AbortController();
+    fake.childChannel.onMessage((msg) => {
+      if (msg.type === 'interrupt:hard') {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) fake.publish(last.id, { abort_cause: 'hard' });
+      }
+    });
+    queueMicrotask(() => hardCtl.abort());
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      signal: hardCtl.signal,
+      spawnChildProcess: fake.spawn,
+      graceMs: 1000,
+    });
+    expect(result.status).toBe('interrupted');
+    expect(result.abortCause).toBe('hard');
+    expect(fake.parentSent.some((m) => m.type === 'interrupt:hard')).toBe(true);
+    // SIGTERM is the belt-and-suspenders fallback the wait loop
+    // fires alongside the IPC command; SIGKILL would only land if
+    // the kill timer fired (graceMs hadn't expired in this test).
+    expect(fake.killSignals.includes('SIGTERM')).toBe(true);
+  });
+
+  test('soft escalates to hard when grace expires without payload', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake = fakeSpawnInterruptable();
+    const softCtl = new AbortController();
+    queueMicrotask(() => {
+      // Soft signals immediately. The "child" (us, in this fake)
+      // never publishes a payload — emulates a stubborn child
+      // that ignored interrupt:soft. The wait loop's grace timer
+      // (graceMs=50) should expire and promote to hard, sending
+      // interrupt:hard + SIGTERM, then SIGKILL after another grace.
+      softCtl.abort();
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      softStopSignal: softCtl.signal,
+      spawnChildProcess: fake.spawn,
+      graceMs: 50,
+    });
+    expect(result.status).toBe('interrupted');
+    expect(result.reason).toBe('aborted');
+    expect(result.abortCause).toBe('hard');
+    expect(fake.parentSent.some((m) => m.type === 'interrupt:soft')).toBe(true);
+    expect(fake.parentSent.some((m) => m.type === 'interrupt:hard')).toBe(true);
+    expect(fake.killSignals.includes('SIGTERM')).toBe(true);
+  });
+
+  test('non-abort outcomes leave abortCause undefined', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake = fakeSpawnInterruptable();
+    queueMicrotask(() => {
+      const children = listChildSessions(db, parent.id);
+      const last = children[children.length - 1];
+      if (last !== undefined) {
+        // Happy-path payload — no abort.
+        fake.publish(last.id, { status: 'done', reason: 'done' });
+      }
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: fake.spawn,
+    });
+    expect(result.status).toBe('done');
+    expect(result.abortCause).toBeUndefined();
+  });
+
+  test('payload abort_cause is ignored when reason is not aborted (defensive)', async () => {
+    // A buggy child that stamps abort_cause on a non-abort payload
+    // shouldn't mislead the parent's audit. The parser gates on
+    // reason === 'aborted'.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake = fakeSpawnInterruptable();
+    queueMicrotask(() => {
+      const children = listChildSessions(db, parent.id);
+      const last = children[children.length - 1];
+      if (last !== undefined) {
+        fake.publish(last.id, {
+          status: 'done',
+          reason: 'done',
+          // Bogus discriminator on a happy outcome.
+          abort_cause: 'soft',
+        });
+      }
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: fake.spawn,
+    });
+    expect(result.abortCause).toBeUndefined();
+  });
+
+  test('toEnvelope round-trips abortCause as snake_cased abort_cause', () => {
+    const result = {
+      output: '',
+      sessionId: 's1',
+      status: 'interrupted' as const,
+      reason: 'aborted' as const,
+      costUsd: 0,
+      steps: 0,
+      durationMs: 0,
+      abortCause: 'soft' as const,
+    };
+    const env = toEnvelope(result);
+    expect(env.abort_cause).toBe('soft');
   });
 });

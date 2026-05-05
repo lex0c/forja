@@ -2080,3 +2080,145 @@ You are the worker.`,
     }
   });
 });
+
+describe('runSubagentChild — IPC', () => {
+  test('opens channel when ipcVersion=1 and brackets the run with session_start/session_finished', async () => {
+    const { sessionId } = seedChildSession(dbDir);
+    const { IPC_PROTOCOL_VERSION, createChannel, fakeTransportPair } = await import(
+      '../../src/subagents/ipc.ts'
+    );
+    type IpcMessage = import('../../src/subagents/ipc.ts').IpcMessage;
+    const { a, b } = fakeTransportPair();
+    const parentChannel = createChannel(a);
+    const received: IpcMessage[] = [];
+    parentChannel.onMessage((m) => received.push(m));
+
+    const exitCode = await runSubagentChild({
+      sessionId,
+      dbPath,
+      providerOverride: stubProvider('hello'),
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      errSink: () => undefined,
+      ipcVersion: 1,
+      // Inject the child's transport directly so we don't have
+      // to spin up a real subprocess. The fake pair routes the
+      // child's writes into our parentChannel above.
+      ipcTransportFactory: () => b,
+    });
+    expect(exitCode).toBe(0);
+
+    const types = received.map((m) => m.type);
+    // Spec §4.2 + §4.3: session_start is the FIRST message;
+    // session_finished is the LAST. Other variants may land
+    // between them in future slices, but the bracket invariant
+    // is fixed.
+    expect(types[0]).toBe('session_start');
+    expect(types[types.length - 1]).toBe('session_finished');
+
+    const start = received[0];
+    if (start?.type === 'session_start') {
+      expect(start.sessionId).toBe(sessionId);
+      expect(start.protocolVersion).toBe(IPC_PROTOCOL_VERSION);
+    } else {
+      throw new Error('expected first message to be session_start');
+    }
+  });
+
+  test('refuses ipc_version_mismatch and exits non-zero before any work', async () => {
+    const { sessionId } = seedChildSession(dbDir);
+    const errMessages: string[] = [];
+    const exitCode = await runSubagentChild({
+      sessionId,
+      dbPath,
+      providerOverride: stubProvider('hi'),
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      errSink: (s) => errMessages.push(s),
+      // Pretend a future parent requested protocol v999 — child
+      // only knows v1.
+      ipcVersion: 999,
+    });
+    expect(exitCode).toBe(1);
+    expect(errMessages.some((s) => s.includes('ipc_version_mismatch'))).toBe(true);
+    // Payload row was never inserted because the refusal lands
+    // before the harness path. The session row stays in
+    // 'running' — finalizeAsError isn't called either, since
+    // the refusal happens before db.open. Operator-facing
+    // signal is the error envelope on stderr.
+    const db = openDb(dbPath);
+    try {
+      const out = getSubagentOutput(db, sessionId);
+      expect(out).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  test('interrupt:hard over IPC routes to harness signal (preemptive abort)', async () => {
+    const { sessionId } = seedChildSession(dbDir);
+    const { createChannel, fakeTransportPair, makeInterruptHard } = await import(
+      '../../src/subagents/ipc.ts'
+    );
+    const { a, b } = fakeTransportPair();
+    const parentChannel = createChannel(a);
+    const slowProvider: Provider = {
+      ...stubProvider('content'),
+      async *generate() {
+        await new Promise((r) => setTimeout(r, 30));
+        yield { kind: 'start', message_id: 'm1' };
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+    };
+    setTimeout(() => parentChannel.send(makeInterruptHard()), 5);
+    const exitCode = await runSubagentChild({
+      sessionId,
+      dbPath,
+      providerOverride: slowProvider,
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      errSink: () => undefined,
+      ipcVersion: 1,
+      ipcTransportFactory: () => b,
+    });
+    expect(exitCode).toBe(0);
+    const db = openDb(dbPath);
+    try {
+      const out = getSubagentOutput(db, sessionId);
+      const payload = out?.payload as Record<string, unknown> | undefined;
+      expect(payload?.status).toBe('interrupted');
+      expect(payload?.reason).toBe('aborted');
+      expect(payload?.abort_cause).toBe('hard');
+    } finally {
+      db.close();
+    }
+  });
+
+  test('omitting ipcVersion runs in legacy mode (no channel opened)', async () => {
+    const { sessionId } = seedChildSession(dbDir);
+    let factoryCalled = false;
+    const exitCode = await runSubagentChild({
+      sessionId,
+      dbPath,
+      providerOverride: stubProvider('hi'),
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      errSink: () => undefined,
+      // No ipcVersion. The factory should never run; if it did,
+      // the test would catch the regression here.
+      ipcTransportFactory: () => {
+        factoryCalled = true;
+        // Stub returning a no-op transport. Never reached when
+        // ipcVersion is absent — that's the property under test.
+        return {
+          write: () => undefined,
+          onLine: () => () => undefined,
+          onClose: () => () => undefined,
+          close: () => undefined,
+        };
+      },
+    });
+    expect(exitCode).toBe(0);
+    expect(factoryCalled).toBe(false);
+  });
+});

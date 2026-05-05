@@ -36,3 +36,27 @@ export type {
   RunSubagentResult,
   SubagentEnvelope,
 } from './runtime.ts';
+export {
+  IPC_PROTOCOL_VERSION,
+  createChannel,
+  encodeMessage,
+  fakeTransportPair,
+  makeEvent,
+  makeInterruptHard,
+  makeInterruptSoft,
+  makeSessionFinished,
+  makeSessionStart,
+  makeShutdown,
+  parseLine,
+  processTransport,
+  subprocessTransport,
+} from './ipc.ts';
+export type {
+  IpcChannel,
+  IpcCommand,
+  IpcEvent,
+  IpcMessage,
+  IpcTransport,
+  ProcessStreams,
+  SubprocessStreams,
+} from './ipc.ts';

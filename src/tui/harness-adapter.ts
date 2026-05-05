@@ -513,6 +513,106 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         });
         return out;
 
+      case 'subagent_start':
+        // Pass-through into the existing UIEvent shape (defined in
+        // events.ts). The harness producer carries `prompt` (the
+        // raw seed text the model passed); the UIEvent calls it
+        // `goal` to match the spec UI.md vocabulary — "what is
+        // this child doing for me?". Renderer truncates upstream;
+        // we forward verbatim.
+        out.push({
+          type: 'subagent:start',
+          ts,
+          subagentId: event.subagentId,
+          name: event.name,
+          goal: event.prompt,
+        });
+        return out;
+
+      case 'subagent_progress': {
+        // Compose a one-liner from the most recent child
+        // HarnessEvent. We don't carry the full child event
+        // through to the UI — the parent's renderer has no
+        // business modeling the child's full state. Coalescing
+        // happens here so the reducer / renderer stay simple.
+        // Format aims for "what's the child doing right now"
+        // not "what just happened" — present tense, present
+        // detail.
+        const inner = event.lastEvent;
+        let progress: string;
+        switch (inner.type) {
+          case 'step_start':
+            progress = `step ${inner.stepN}`;
+            break;
+          case 'tool_invoking':
+            progress = `running ${inner.toolName}`;
+            break;
+          case 'tool_finished':
+            progress = inner.failed ? `${inner.toolName} failed` : `${inner.toolName} done`;
+            break;
+          case 'compaction_started':
+            progress = 'compacting context';
+            break;
+          case 'compaction_finished':
+            progress = `compacted (${inner.foldedCount} folded)`;
+            break;
+          case 'todo_updated':
+            progress = `${inner.items.length} todo${inner.items.length === 1 ? '' : 's'}`;
+            break;
+          case 'tool_warning':
+            progress = `warn: ${inner.message}`;
+            break;
+          default:
+            // Unmodeled inner events still produce a heartbeat
+            // — silent passes would let a chatty child appear
+            // hung in the renderer.
+            progress = inner.type;
+            break;
+        }
+        out.push({
+          type: 'subagent:update',
+          ts,
+          subagentId: event.subagentId,
+          progress,
+        });
+        // S4: tool_warning from the child propagates as a top-level
+        // `warn` so the operator sees the warning explicitly in the
+        // permanent scrollback. Defensive field-presence guard:
+        // the IPC `event` payload is `unknown` at the wire boundary
+        // (parsed via `as HarnessEvent`), so a child on a different
+        // version that omits `toolName` / `message` would otherwise
+        // surface as `subagent <id> · undefined: undefined`.
+        if (
+          inner.type === 'tool_warning' &&
+          typeof inner.toolName === 'string' &&
+          typeof inner.message === 'string'
+        ) {
+          out.push({
+            type: 'warn',
+            ts,
+            message: `subagent ${event.subagentId.slice(0, 8)} · ${inner.toolName}: ${inner.message}`,
+          });
+        }
+        return out;
+      }
+
+      case 'subagent_finished':
+        // Status maps from HarnessResult.status onto the UIEvent's
+        // narrower 'done' | 'error' shape. 'interrupted' and
+        // 'exhausted' both surface as 'error' for the operator —
+        // the difference between "user pressed Esc" and "ran out
+        // of budget" is captured in the summary line, not in the
+        // status enum (which exists to drive a glyph color).
+        out.push({
+          type: 'subagent:end',
+          ts,
+          subagentId: event.subagentId,
+          status: event.status === 'done' ? 'done' : 'error',
+          summary: event.summary,
+          durationMs: event.durationMs,
+        });
+        return out;
+
       case 'session_finished': {
         // Make sure no streaming state leaks past the end. A run
         // killed mid-turn (interrupt, provider error) won't have

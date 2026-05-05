@@ -731,6 +731,113 @@ describe('bg lifecycle', () => {
   });
 });
 
+describe('subagent lifecycle', () => {
+  test('initial state has empty subagents map', () => {
+    expect(createInitialState().subagents.size).toBe(0);
+  });
+
+  test('subagent:start adds an entry keyed by subagentId', () => {
+    const { state, permanent } = drive([
+      { type: 'subagent:start', ts: 100, subagentId: 'c1', name: 'explore', goal: 'find README' },
+    ]);
+    expect(state.subagents.size).toBe(1);
+    const entry = state.subagents.get('c1');
+    expect(entry?.name).toBe('explore');
+    expect(entry?.goal).toBe('find README');
+    expect(entry?.startedAt).toBe(100);
+    expect(entry?.progress).toBe('');
+    expect(permanent).toEqual([]);
+  });
+
+  test('subagent:update mutates the existing entry in place', () => {
+    const { state, permanent } = drive([
+      { type: 'subagent:start', ts: 1, subagentId: 'c1', name: 'r', goal: 'g' },
+      { type: 'subagent:update', ts: 2, subagentId: 'c1', progress: 'running echo' },
+    ]);
+    expect(state.subagents.get('c1')?.progress).toBe('running echo');
+    expect(permanent).toEqual([]);
+  });
+
+  test('subagent:update for unknown id is a silent no-op', () => {
+    const { state, permanent } = drive([
+      { type: 'subagent:update', ts: 1, subagentId: 'never', progress: '...' },
+    ]);
+    expect(state.subagents.size).toBe(0);
+    expect(permanent).toEqual([]);
+  });
+
+  test('subagent:end removes the entry and emits subagent_summary permanent', () => {
+    const { state, permanent } = drive([
+      { type: 'subagent:start', ts: 1, subagentId: 'c1', name: 'explore', goal: 'g' },
+      {
+        type: 'subagent:end',
+        ts: 1234,
+        subagentId: 'c1',
+        status: 'done',
+        summary: 'README at /repo/README.md',
+        durationMs: 5_000,
+      },
+    ]);
+    expect(state.subagents.size).toBe(0);
+    expect(permanent.length).toBe(1);
+    const item = permanent[0];
+    if (item?.kind === 'subagent_summary') {
+      expect(item.subagentId).toBe('c1');
+      expect(item.name).toBe('explore');
+      expect(item.status).toBe('done');
+      expect(item.summary).toBe('README at /repo/README.md');
+      expect(item.durationMs).toBe(5_000);
+    } else {
+      throw new Error('expected subagent_summary permanent');
+    }
+  });
+
+  test('subagent:end without a prior start emits no permanent (defensive)', () => {
+    // Out-of-order producer would otherwise produce a half-formed
+    // summary line. Reducer's policy: drop silently.
+    const { state, permanent } = drive([
+      {
+        type: 'subagent:end',
+        ts: 1,
+        subagentId: 'orphan',
+        status: 'error',
+        summary: 'lost',
+        durationMs: 0,
+      },
+    ]);
+    expect(state.subagents.size).toBe(0);
+    expect(permanent).toEqual([]);
+  });
+
+  test('multiple concurrent subagents render as independent entries', () => {
+    const { state } = drive([
+      { type: 'subagent:start', ts: 1, subagentId: 'a', name: 'explore', goal: 'g1' },
+      { type: 'subagent:start', ts: 2, subagentId: 'b', name: 'audit', goal: 'g2' },
+      { type: 'subagent:update', ts: 3, subagentId: 'a', progress: 'step 1' },
+      { type: 'subagent:update', ts: 4, subagentId: 'b', progress: 'step 1' },
+    ]);
+    expect(state.subagents.size).toBe(2);
+    expect(state.subagents.get('a')?.progress).toBe('step 1');
+    expect(state.subagents.get('b')?.progress).toBe('step 1');
+  });
+
+  test('session:start clears the subagents map (fresh session boundary)', () => {
+    const { state } = drive([
+      { type: 'subagent:start', ts: 1, subagentId: 'c1', name: 'r', goal: 'g' },
+      start({ ts: 2, sessionId: 's2' }),
+    ]);
+    expect(state.subagents.size).toBe(0);
+  });
+
+  test('session:end clears the subagents map', () => {
+    const { state } = drive([
+      { type: 'subagent:start', ts: 1, subagentId: 'c1', name: 'r', goal: 'g' },
+      { type: 'session:end', ts: 2, sessionId: 's', reason: 'done', durationMs: 100 },
+    ]);
+    expect(state.subagents.size).toBe(0);
+  });
+});
+
 describe('not-yet-wired events accept silently', () => {
   test.each([
     [
@@ -772,12 +879,6 @@ describe('not-yet-wired events accept silently', () => {
       },
     ],
     ['critique:ask', { type: 'critique:ask', ts: 1, promptId: 'p1', issues: [] }],
-    ['subagent:start', { type: 'subagent:start', ts: 1, subagentId: 'a1', name: 'r', goal: 'g' }],
-    ['subagent:update', { type: 'subagent:update', ts: 1, subagentId: 'a1', progress: '...' }],
-    [
-      'subagent:end',
-      { type: 'subagent:end', ts: 1, subagentId: 'a1', status: 'done', summary: '', durationMs: 0 },
-    ],
     ['bg:start', { type: 'bg:start', ts: 1, processId: 'b1', command: 'sleep' }],
     ['bg:update', { type: 'bg:update', ts: 1, processId: 'b1', status: 'running' }],
     ['bg:end', { type: 'bg:end', ts: 1, processId: 'b1', cause: 'exited', exitCode: 0 }],

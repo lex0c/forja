@@ -15,6 +15,711 @@ Format:
 
 ---
 
+## [2026-05-05] M3 / fix — subagents IPC review fixes
+
+Same branch (`feat/m3-subagent-ipc`). Three findings from an
+independent code review on the S1-S4 work; addressed before merge
+so the subsystem closes clean.
+
+**Done:**
+
+- **Late-subscriber replay buffer in `createChannel`**
+  (`src/subagents/ipc.ts`): the channel now buffers up to 64
+  messages (and 64 errors) until the first `onMessage` /
+  `onError` listener attaches, draining synchronously on first
+  subscribe. Without this, the subprocess transport's pump loop
+  (which starts the moment `defaultSpawnChildProcess` constructs
+  it) would deliver to a channel whose runtime-side observer
+  hasn't been wired yet — `session_start` and any other
+  pre-subscribe lines would silently disappear into a no-op
+  emitter. Spec §10.2 endorses option (b) "buffer with a small
+  cap"; we picked 64 as the inflection between "wiring race"
+  (handful of messages) and "runaway producer" (worth a stderr
+  diagnostic). Overflow surfaces as a single stderr line with
+  the dropped count, no per-message logging.
+
+- **Field-presence guard for child `tool_warning` in the adapter**
+  (`src/tui/harness-adapter.ts`): the dual-emit path now also
+  checks that `inner.toolName` and `inner.message` are strings
+  before composing the parent-level warn. The IPC `event`
+  payload is `unknown` at the wire boundary (parsed via
+  `as HarnessEvent`), so a child running on a different protocol
+  version that ships a malformed `tool_warning` would otherwise
+  surface as `subagent <id> · undefined: undefined`.
+
+- **End-to-end hard-interrupt test**
+  (`tests/subagents/e2e.test.ts`): real `runSubagentChild`
+  in-process via `fakeTransportPair`, parent fires
+  `signal.aborted` → wait loop sends `interrupt:hard` IPC
+  command + SIGTERM → child's IPC listener routes to
+  `signalController` → harness aborts mid-stream → result has
+  `abortCause: 'hard'` AND `status: 'interrupted'`. Closes the
+  reviewer's gap on interrupt routing not being exercised
+  end-to-end. Soft routing through the full harness loop
+  remains tested at the unit level (S3) — exercising soft via
+  e2e requires a multi-step harness scenario that the existing
+  test fixtures don't support cheaply.
+
+- **Tests** (5 new):
+  - `tests/subagents/ipc.test.ts` (4 cases): pre-subscribe
+    message replay, pre-subscribe error replay, replay drains
+    exactly once (second subscriber gets only real-time), cap +
+    stderr diagnostic on overflow.
+  - `tests/subagents/e2e.test.ts` (1 case): hard interrupt
+    routing through real child harness.
+
+**Decisions:**
+
+1. **Buffer over the alternative "subscribe synchronously in the
+   spawn factory" approach.** The reviewer offered both.
+   Buffering keeps the API surface small (callers don't pass
+   observer hooks into spawn opts) and matches the existing
+   emitter contract — listeners attach when they attach. The
+   factory-side wiring would have moved policy into the spawn
+   factory and changed every fake spawn in the test suite; the
+   buffer change is local to one file.
+
+2. **64-message cap, not 200.** Spec §6 mentions a 200-event
+   ring buffer for the parent's TUI tray — that's per-subagent
+   long-term state. The channel's pre-subscribe buffer is a
+   wiring-race shock absorber: a real subscriber attaches in
+   the same synchronous frame as construction (or the next
+   microtask). 64 is generous for that and a clear "something
+   is wrong" signal when overflowed.
+
+3. **Soft interrupt e2e deferred.** The hard path exercises the
+   IPC → controller → harness signal-abort chain; the soft path
+   uses the same channel-listener code (lines apart in the
+   same closure) just routing to a different controller. The
+   harness's soft check sits at step boundaries, which require
+   a multi-step provider scenario to exercise. Setting that up
+   means seeding a tool whitelist, registering the right
+   builtin, and threading a multi-step provider — all of which
+   would test harness behavior already covered in
+   `tests/harness/`. Net new coverage from a soft e2e is
+   marginal; the cost is a fragile multi-step fixture. Skipped
+   with rationale here so a future maintainer doesn't re-tread
+   it.
+
+**Pending:** none. Subsystem is feature-complete and the review
+findings are resolved.
+
+**Next:** review the branch one more time and merge into
+`develop`.
+
+---
+
+## [2026-05-05] M3 / impl — subagents Slice 4: tool_warning propagation + e2e (subsystem complete)
+
+Same branch (`feat/m3-subagent-ipc`). Closes the BACKLOG ~line 746
+gap on subagent emitWarn propagation and lands the end-to-end
+integration test that exercises the entire IPC chain through the
+real `runSubagentChild` path. After this slice the subagents
+subsystem is feature-complete per spec docs/spec/AGENTIC_CLI.md
+§11 + IPC.md.
+
+**Done:**
+
+- **`tool_warning` dual-emission** (`src/tui/harness-adapter.ts`):
+  the `subagent_progress` translator already coalesced
+  `tool_warning` into a transient `subagent:update` line. Now it
+  ALSO emits a top-level `warn` UIEvent so the operator sees the
+  warning in permanent scrollback — without this, a child's
+  `[memory: untrusted]` warning would disappear when the
+  subagent's live row collapsed on `subagent:end`. Attribution
+  prefix names the subagent (8-char id + tool name) so the
+  operator doesn't confuse it with a parent-level warn.
+
+- **End-to-end test file** (`tests/subagents/e2e.test.ts`,
+  2 cases):
+  - "child HarnessEvents reach the parent observer through the
+    IPC wire": real on-disk SQLite, real `runSubagentChild`
+    in-process via injected `ipcTransportFactory` that points at
+    the parent's `fakeTransportPair` other side. Verifies the
+    bracket invariant (`subagent_start` first, `subagent_finished`
+    last), and that intermediate `subagent_progress` events
+    carry real child HarnessEvents (`step_start`, `provider_event`)
+    that crossed the wire — not synthetic ones the test
+    fabricated.
+  - "child session_finished is filtered": defense-in-depth
+    assertion that no `subagent_progress` ever surfaces with
+    `lastEvent.type === 'session_finished'`. The filter sits on
+    both sides (child's `onEvent` AND parent's `onMessage`); the
+    test passes regardless of which layer caught it, locking in
+    that the contract holds end-to-end.
+
+- **Adapter tests** (2 new in
+  `tests/tui/harness-adapter.test.ts`):
+  - `tool_warning` inner emits BOTH `subagent:update` AND a
+    `warn` UIEvent with attribution prefix.
+  - Non-warning inner emits ONLY `subagent:update` (negative
+    case to lock in the dual-emission gate).
+
+**Decisions:**
+
+1. **In-process e2e instead of real `Bun.spawn`.** Spawning the
+   real binary would require a release build (or per-test `bun
+   build`), the production provider registry (so the child
+   reads the model id off the session row), and CLI-arg
+   threading for the test's stub provider (which doesn't exist).
+   The in-process variant runs production code at every layer
+   except the transport leaf (`fakeTransportPair` swaps
+   `processTransport`), which is what S1 already unit-tested
+   exhaustively. Net coverage of the integration path is
+   identical for the gain we'd see from a real fork; the cost
+   would be ~1s per test in build + spawn latency and a much
+   noisier failure mode.
+
+2. **`tool_warning` warn message includes a short subagentId
+   prefix.** Parent-level warns and subagent-level warns share
+   the same UIEvent type (`warn`); without attribution the
+   operator can't tell whether `[memory: untrusted]` came from
+   their own session or a coordinator's child. 8-char prefix
+   matches the existing checkpoint id truncation in
+   `permanent.ts`.
+
+3. **No new HarnessEvent variant for subagent warnings.** Adding
+   `subagent_tool_warning` would be one more variant the
+   adapter switch must handle exhaustively; instead, the
+   `subagent_progress.lastEvent` already carries the inner
+   `tool_warning` and the adapter's existing case just dual-
+   emits. Smaller surface area, same behavior.
+
+**Subagents subsystem status: feature-complete.**
+
+| Spec section | Status |
+|---|---|
+| AGENTIC_CLI §11 (subagents) | ✅ |
+| IPC.md §1 / §2 (transport) | ✅ S1 |
+| IPC.md §3.2 (events) | ✅ S2 |
+| IPC.md §3.1 (commands) | ✅ S3 |
+| IPC.md §4 (lifecycle, brackets) | ✅ S2 |
+| BACKLOG D159 (soft propagation) | ✅ S3 |
+| BACKLOG D168 (abortCause) | ✅ S3 |
+| BACKLOG ~746 (emitWarn → parent renderer) | ✅ S4 |
+| BACKLOG ~352 (in-process subagent hook coverage) | deferred — separate slice (Step 4.3 per BACKLOG line 355) |
+| Permission proxy (IPC §1.1) | deferred to M2+ per spec |
+| Memory writes from child (MEMORY.md §5.3) | deferred per spec |
+
+**Pending:** none for the subagents IPC track. Branch is ready
+to merge into `develop`.
+
+**Next:** review the branch and merge. Subsequent work moves to
+the next M3 deliverable (TBD per the prior conversation:
+options were `/undo` + checkpoint visibility, Recap M4.1, or
+Playbooks `/explain`).
+
+---
+
+## [2026-05-05] M3 / impl — subagents Slice 3: interrupt:soft/hard + abortCause (closes D159, D168)
+
+Same branch (`feat/m3-subagent-ipc`). Wires the parent's
+cooperative-stop and hard-abort signals into the IPC channel
+and round-trips the soft/hard verdict back through the
+subagent's terminal payload. Closes BACKLOG D159 (soft-stop
+propagation gap) and D168 (`RunSubagentResult.abortCause`
+discriminator stuck at 'hard').
+
+**Done:**
+
+- **Child IPC command listener** (`src/cli/subagent-child.ts`):
+  two local `AbortController`s (`signalController`,
+  `softStopController`) wired into the harness's `signal` /
+  `softStopSignal` config fields. The IPC channel's
+  `onMessage` routes:
+  - `interrupt:soft` → `softStopController.abort()` (idempotent
+    per spec §3.1).
+  - `interrupt:hard` → `signalController.abort()`.
+  - `shutdown` → `signalController.abort()` (fast-path of
+    interrupt:hard + EOF; spec §3.1).
+  Controllers stay constructed even when IPC is off — cheap and
+  keeps the harness config branch uniform.
+
+- **Child envelope carries `abort_cause`**: when
+  `result.abortCause` is set, `buildEnvelope` adds
+  `abort_cause: 'soft' | 'hard'` to the payload. Snake_cased
+  for the wire to match the existing `cost_usd` / `duration_ms`
+  shape; mirrors `RunSubagentResult.abortCause` (camel) on the
+  parent side.
+
+- **Parent envelope parser** (`buildResultFromPayload`):
+  reads `abort_cause` and surfaces as `RunSubagentResult.abortCause`
+  ONLY when `reason === 'aborted'`. A buggy child that stamped
+  the field on a non-abort path can't mislead the parent's audit
+  — the gate keeps the field's invariant honest across the wire.
+
+- **Parent wait-loop escalation** (`waitForChild` in
+  `src/subagents/runtime.ts`): tri-state `interruptCause`
+  tracks 'soft' | 'hard' | undefined separately from the
+  existing wall_clock/heartbeat_stale `killed` state.
+  - Soft trigger: `softStopSignal.aborted` AND no hard signal
+    yet AND interruptCause undefined → send `makeInterruptSoft()`
+    over IPC. NO SIGKILL scheduled (soft is patient by design).
+  - Hard trigger: `signal.aborted` OR soft grace expired
+    (`Date.now() - interruptAt >= graceMs`) → send
+    `makeInterruptHard()` IPC + OS SIGTERM (belt-and-
+    suspenders) + scheduleKill (SIGKILL after graceMs).
+    Promotion from soft preserves `interruptAt` so the 2×grace
+    bail-out doesn't restart from zero.
+  - 2×grace bail-out for the hard path mirrors the existing
+    wall_clock/heartbeat shape: if no payload or exit lands by
+    then, return `{ kind: 'aborted', cause: 'hard' }`.
+  - Wall-clock and heartbeat checks now also gate on
+    `interruptCause === undefined` so they don't trample an
+    already-active abort path.
+
+- **`RunSubagentResult.abortCause`** added to the type. Populated
+  on every `aborted` outcome — both the payload-carried path
+  (child's envelope) and the no-payload synthesized path
+  (`outcome.cause`). Undefined for every non-abort reason.
+
+- **`SubagentEnvelope.abort_cause`** added to the tool-facing
+  shape; `toEnvelope` round-trips the field. The model can now
+  see "the soft stop you triggered finished cleanly" vs "I had
+  to kill the subagent" through the envelope it gets back.
+
+- **WaitOutcome shape extended**: `{ kind: 'aborted'; cause:
+  'soft' | 'hard' }` — the previous bare `{ kind: 'aborted' }`
+  collapsed both into one synthesized result.
+
+- **Tests** (8 new):
+  - `tests/subagents/runtime.test.ts` (7 cases, "interrupt
+    soft/hard" describe block):
+    - Soft signal → parent sends `interrupt:soft` over IPC; child
+      publishes payload with `abort_cause:'soft'`; result has
+      `abortCause:'soft'`; no OS kill needed (cooperative path).
+    - Hard signal → parent sends `interrupt:hard` over IPC AND
+      SIGTERM; result has `abortCause:'hard'`.
+    - Soft escalation: no payload arrives within graceMs (50ms
+      test override) → parent promotes to hard, sending both
+      soft + hard IPC commands AND SIGTERM; result is
+      `abortCause:'hard'`.
+    - Non-abort outcomes leave abortCause undefined (happy
+      path; no abort signal).
+    - Defensive: payload `abort_cause` is ignored when
+      `reason !== 'aborted'`.
+    - `toEnvelope` round-trips abortCause as `abort_cause`.
+  - `tests/cli/subagent-child.test.ts` (1 new case):
+    `interrupt:hard` over IPC routes to harness's `signal`
+    AbortController; child publishes payload with
+    `status:'interrupted'`, `reason:'aborted'`, `abort_cause:'hard'`.
+
+- **Test choreography note**: tests use the fake transport pair's
+  synchronous `onMessage` to choreograph "child responded to
+  IPC by publishing payload". The real subprocess would have
+  natural latency; the wait loop's `pollDelay` (50ms initial)
+  plus the test's own `setTimeout` sequencing makes the test
+  deterministic without race risk.
+
+**Decisions:**
+
+1. **Soft AND hard send IPC commands; hard ALSO sends SIGTERM.**
+   Spec §3.1 says interrupt:hard is "Equivalente semântico ao
+   SIGTERM mas sem race do OS signal vs canal." Practically:
+   the IPC command is the cleaner route (child can drain its
+   message buffer, write the payload, exit), but a half-closed
+   pipe (parent's IPC writer dies before delivering, child
+   never receives) would leave the child running indefinitely.
+   SIGTERM closes that hole. Soft never gets a SIGTERM —
+   cooperative by design.
+
+2. **Soft grace = `graceMs` (default 5s).** Reuses the existing
+   kill grace constant rather than introducing a separate
+   `softGraceMs`. The semantics are honest: 5s is "we waited
+   long enough for the child to publish if it was going to
+   cooperate." If real-world subagents need longer (e.g., a
+   tool finishing a slow file write at the soft moment),
+   extending `graceMs` extends both windows in lockstep. New
+   knob added later if telemetry justifies it.
+
+3. **`interruptCause === 'hard'` 2×grace bail-out, not 3×.** The
+   wall_clock/heartbeat shape already uses 2×grace. Symmetric
+   here. The cushion is "SIGKILL fires at 1×grace; one more
+   grace window for the kernel to reap." Tighter would risk
+   reporting a still-alive child as dead; looser would block
+   the parent's caller.
+
+4. **`abort_cause` gated on `reason === 'aborted'` in the
+   parser.** Defense in depth: the child's envelope shape isn't
+   schema-validated end-to-end, and a producer bug (or a future
+   third-party child binary) that stamps `abort_cause` on a
+   non-abort outcome would otherwise pollute audit. Gating
+   keeps the field's invariant honest at the trust boundary.
+
+5. **Soft routing on the child side stays untested at the
+   harness level.** A soft signal is observed at step
+   boundaries; the canonical scenarios (mid-tool soft, tool-
+   chain soft) already have integration coverage in
+   `tests/harness/`. The S3 child test focuses on hard, which
+   exercises the IPC → controller → harness signal abort path.
+   Soft routing through the same channel listener is
+   structurally identical (different controller, same
+   plumbing); the runtime test on the parent side already
+   verifies the wire delivery.
+
+**Pending:** S4 — tool_warning propagation + e2e tests across
+real subprocess + IPC + adapter + state. After S4 the subagents
+subsystem is feature-complete per spec.
+
+**Next:** start S4. Add `tool_warning` to IPC §3.2 taxonomy,
+filter on the child's `onEvent` so it goes over the wire, route
+on the parent side into a harness-level warn or a UIEvent.
+Then write the long-form e2e test that exercises a real
+subprocess + IPC + adapter + state to lock in the contract.
+
+---
+
+## [2026-05-05] M3 / impl — subagents Slice 2: HarnessEvent observability over IPC (closes 1.f.2)
+
+Same branch (`feat/m3-subagent-ipc`). Builds on S1's wire to deliver
+live observability of subagent runs in the parent's TUI. Closes the
+1.f.2 / D170 gap the audit called out: "Adapter has UIEvent types
+SubagentStart/Update/EndEvent defined but no producer".
+
+**Done:**
+
+- **3 new `HarnessEvent` variants** (`src/harness/types.ts`):
+  - `subagent_start { subagentId, name, prompt }` — emitted before
+    spawn; bracket open.
+  - `subagent_progress { subagentId, lastEvent }` — wraps the most
+    recent child HarnessEvent for the parent's reducer to compute
+    a one-liner (`step N`, `running echo`, `tool_finished failed`,
+    etc.) without modeling the child's full state.
+  - `subagent_finished { subagentId, status, summary, durationMs,
+    costUsd }` — bracket close; fires once per start, even on
+    spawn failure.
+
+- **Adapter wiring** (`src/tui/harness-adapter.ts`): three new switch
+  cases translate the harness variants into the existing UIEvents
+  (`subagent:start | subagent:update | subagent:end`).
+  `subagent_progress` coalesces the inner HarnessEvent into a
+  short present-tense phrase via a per-type table; unmodeled
+  inner events fall back to `inner.type` so a chatty child still
+  pulses (silent passes would let the row appear hung).
+  `subagent_finished.status` collapses `interrupted`/`exhausted`/
+  `error` onto the UI's binary `done|error` glyph axis — the
+  detail lives in the `summary`, not in the enum.
+
+- **State reducer wired** (`src/tui/state.ts`): new
+  `subagents: Map<id, { name, goal, progress, startedAt }>` field
+  on `LiveState`. `subagent:start` inserts; `subagent:update`
+  mutates in place (out-of-order updates dropped silently);
+  `subagent:end` removes the live entry AND emits a new
+  `PermanentItem.kind: 'subagent_summary'` so scrollback keeps
+  the terminal verdict. `session:start` and `session:end` clear
+  the map (per-session scope, mirrors `bgProcesses`).
+
+- **Live renderer** (`src/tui/render/subagent-row.ts` — new): one
+  block above the assistant chip when at least one subagent is
+  active. Header `Subagents`, then `▸ task <name> · <progress>
+  · <elapsed>`. Falls back to `booting · <goal>` when no
+  progress event has arrived yet. ASCII glyph (`>`) for non-
+  unicode terminals; long progress / goal text truncated at 80
+  chars with ellipsis. Composer (`compose.ts`) inserts the block
+  between TodoList and the assistant chip — operator's eye lands
+  on "what's the AI doing on my behalf" → planning, delegation,
+  thinking, in that order.
+
+- **Permanent renderer** (`src/tui/render/permanent.ts`):
+  formats `subagent_summary` as `· task <name> Done <summary>
+  in 1m23s` (or `Failed` on error). Reuses the chip-final glyph
+  for visual peering with `tool-end`. Summary truncated at 80
+  chars; empty summary produces `Done in 100ms` cleanly (no
+  double-space).
+
+- **Producer side — child** (`src/cli/subagent-child.ts`): the
+  harness `config.onEvent` now wraps every fired HarnessEvent as
+  an IPC `event` message and sends it to the parent. Drops
+  `session_finished` (the IPC layer's `session_finished` marker
+  brackets the run) and `subagent_*` (parent renders only its
+  direct children — nested observability would let an N-deep
+  child blow up the parent's renderer).
+
+- **Producer side — parent** (`src/subagents/runtime.ts`):
+  - New `RunSubagentInput.onChildEvent: (event: HarnessEvent) =>
+    void`. The runtime synthesizes the three lifecycle events:
+    `subagent_start` BEFORE the spawn (so a spawn failure still
+    surfaces a bracket open + close pair); `subagent_progress`
+    for each `event` IPC message arriving from the child (with
+    a defensive guard that drops malformed payloads + inner
+    `subagent_*` / `session_finished`); `subagent_finished`
+    after `waitForChild` resolves, with the summary computed
+    from the first non-blank line of `result.output` (or the
+    failure reason when output is empty).
+  - Implicit IPC opt-in: setting `onChildEvent` flips
+    `effectiveIpc = true` automatically. Observability without
+    a wire delivers only start/finished — silently misleading.
+  - Bracket invariant guaranteed across every exit path: spawn
+    throws, payload published, crashed, aborted, wall-clock,
+    heartbeat-stale.
+
+- **Harness loop wiring** (`src/harness/loop.ts`): the
+  `spawnSubagent` closure now passes `config.onEvent` through
+  as `onChildEvent` to `runSubagent`. Since the harness's own
+  observers are already wired to the adapter, every subagent
+  lifecycle event flows automatically into the parent's
+  UIEvent stream.
+
+- **Tests** (29 new):
+  - `tests/subagents/runtime.test.ts` (5 cases): bracket
+    invariant on happy path; child IPC `event` messages
+    forwarded as `subagent_progress`; nested
+    subagent_*/session_finished filtering; bracket holds on
+    spawn throw; observer exception isolation.
+  - `tests/tui/harness-adapter.test.ts` (6 cases): every
+    subagent_* HarnessEvent translates to the right UIEvent;
+    progress coalescing for step_start / tool_invoking /
+    tool_finished (done + failed) / unmodeled fallback;
+    finished status collapse `done|error`.
+  - `tests/tui/state.test.ts` (8 cases): map insertion /
+    mutation / removal; out-of-order update is no-op;
+    `subagent_summary` permanent emitted on end; orphan end
+    silently dropped; concurrent subagents independent;
+    session:start / session:end boundary clears.
+  - `tests/tui/render/subagent-row.test.ts` (6 cases): empty
+    map → []; header + rows; goal fallback; ASCII glyph;
+    truncation; duration formatting (ms/s/m+s).
+  - `tests/tui/render/permanent.test.ts` (5 cases): done +
+    error shapes; ASCII glyph; >80-char summary truncation;
+    empty summary clean line.
+
+**Decisions:**
+
+1. **Three lifecycle HarnessEvents, not raw forwarding.** The
+   parent's TUI doesn't render the child's full HarnessEvent
+   stream — that would be duplicate, unbounded, and depth-N
+   nested. Instead, the parent's harness emits coarse-grained
+   `subagent_*` HarnessEvents that the existing TUI adapter
+   already had UIEvent shapes for. Child's individual
+   HarnessEvents come through as `lastEvent` payloads inside
+   `subagent_progress`, where the adapter coalesces them into
+   one terse phrase. Net effect: a chatty child produces a
+   stream of harmless one-liner updates, not a flood of nested
+   chips.
+
+2. **Summary picks the first non-blank line of `output`.** A
+   subagent's terminal output is operator-facing free-form
+   text; surfacing the first line gives the post-run scrollback
+   row real signal ("README at /repo/README.md") instead of a
+   meaningless `done`. Falls back to `result.reason` when
+   output is empty (crashed / aborted / wall-clock paths).
+
+3. **`subagent_summary` permanent, not `info`-class.** Reusing
+   `info`/`warn` would have been the smaller diff but also
+   fuzzy: an operator filtering scrollback for "what did this
+   subagent do" can't grep a generic info line. Dedicated
+   `kind` lets future renderers (search, replay, NDJSON
+   exporter) treat subagent terminal events as first-class.
+
+4. **`onChildEvent` implies `ipc: true`.** Asking the caller
+   to set both was a footgun: a forgotten `ipc: true` would
+   silently produce only start/finished with no progress
+   events between, and the renderer would correctly show "row
+   appeared, then disappeared" without an explanation. Tying
+   them together makes the contract impossible to misuse.
+
+5. **Filter `subagent_*` and `session_finished` at the IPC
+   boundary, both sides.** Child's `onEvent` filters before
+   send; parent's `onMessage` filters before fire. Defense in
+   depth — a future test that injects a fake child can't
+   accidentally pollute the parent's observer with grandchild
+   bracket events; conversely, a bug in the child's filter
+   wouldn't reach the parent's renderer.
+
+**Pending:** S3 (interrupt:soft/hard + abortCause) and S4
+(tool_warning + e2e). Both depend only on the wire S1 landed and
+the typed observer S2 just added.
+
+**Next:** start S3 — wire the parent's softStopSignal /
+input.signal to send `interrupt:soft` / `interrupt:hard` IPC
+commands; child's IPC channel listens and routes to its harness
+softStopSignal / signal. Populate `RunSubagentResult.abortCause`
+from the child's session_finished payload (carried over the
+wire) so the parent can distinguish soft from hard terminations.
+
+---
+
+## [2026-05-05] M3 / impl — subagents Slice 1: IPC transport (parent↔child NDJSON channel)
+
+Branch `feat/m3-subagent-ipc`. First slice of the IPC migration plan
+in `docs/spec/IPC.md` §9. Goal: stand up the parent↔child wire so
+subsequent slices (observability, soft-stop, tool warnings) have a
+transport to ride. Behavior is opt-in — every existing test path
+runs unchanged because the `--ipc=<n>` flag stays absent until the
+parent's runtime requests it.
+
+**Done:**
+
+- **`src/subagents/ipc.ts`** (~570 LoC, three layers):
+  - **Wire**: `IpcMessage` discriminated union (commands
+    `interrupt:soft|hard|shutdown`; events `session_start |
+    session_finished | event`), `encodeMessage` (single-line LF
+    NDJSON; JSON.stringify escapes embedded LF inside string
+    values), `parseLine` (defensive — never throws; surfaces
+    stable reason codes `json_parse_failed`, `unknown_type:<t>`,
+    `session_start.missing_sessionId`, etc.). Convenience
+    constructors `makeSessionStart` / `makeEvent` /
+    `makeInterruptSoft` / etc. stamp UUID `id` + epoch `ts`
+    automatically.
+  - **Transport**: line-oriented duplex `IpcTransport` with
+    three concrete impls — `fakeTransportPair()` (in-memory
+    queues for tests), `subprocessTransport({ stdin, stdout })`
+    (parent side, wraps Bun.spawn web streams; pump loop reads
+    via `stdout.getReader()`, frames with `TextDecoder({
+    stream: true })` so multi-byte UTF-8 split across chunks
+    decodes cleanly), `processTransport()` (child side, wraps
+    `process.stdin/stdout` Node streams). Shared `LineFramer`
+    helper handles chunk boundaries and EOF flush.
+  - **Channel** (`createChannel(transport)`): typed `send` +
+    parsed `onMessage` + `onError` for malformed lines (does
+    NOT close the wire — spec §4.5: "log warning, descarta a
+    linha") + `onClose`.
+  - `IPC_PROTOCOL_VERSION = 1` exported as the source of truth
+    for handshake compatibility.
+
+- **Args parser** (`src/cli/args.ts`): new `--ipc=<n>` (and
+  shorthand `--ipc`) flag captures `subagentIpcVersion`. Refuses
+  zero/negative/non-integer values. Coexists with every other
+  internal subagent flag (depth, temperature, bgLogDir, etc.).
+
+- **Parent runtime** (`src/subagents/runtime.ts`):
+  - `RunSubagentInput` gains `ipc?: boolean` and
+    `onIpcMessage?: (msg) => void`. Opt-in only; absence keeps
+    legacy behavior.
+  - `SpawnChildProcessOptions` gains `ipc?: boolean` and
+    `ChildProcessHandle` gains `ipc?: IpcChannel`.
+  - Default `defaultSpawnChildProcess` switches to
+    `stdin: 'pipe', stdout: 'pipe'` only when ipc is on
+    (legacy mode keeps `stdout: 'ignore'`), appends
+    `--ipc=${IPC_PROTOCOL_VERSION}` to argv, and builds a
+    `subprocessTransport` + `createChannel` from `proc.stdin`/
+    `proc.stdout` for the returned handle.
+  - `runSubagent` subscribes to the channel BEFORE
+    `waitForChild` runs (spec §2.3: parent must drain stdout
+    continuously or the child blocks on its next write).
+    Forwards every message to `onIpcMessage`; observer
+    exceptions are swallowed so a buggy listener can't break
+    the parent loop. Malformed lines log to stderr with the
+    parser's reason code — operators grep audit. Closes the
+    channel after the wait outcome resolves (idempotent).
+
+- **Child bootstrap** (`src/cli/subagent-child.ts`):
+  - New options `ipcVersion?: number` and
+    `ipcTransportFactory?: () => IpcTransport` (test seam).
+  - When `ipcVersion` is set: refuses on protocol mismatch
+    (`ipc_version_mismatch` to stderr, exit 1) BEFORE any DB
+    or harness work — spec §4.2's "refuse before any message".
+    Otherwise opens the channel via `processTransport()` (or
+    the injected factory), sends `session_start(sessionId,
+    protocolVersion)` immediately. Outer `finally` always emits
+    `session_finished` and closes the channel — the bracket
+    invariant holds across happy path, pre-harness refusals,
+    and harness throws.
+  - Backwards compatible: ipcVersion absent ⇒ child runs in
+    legacy SQLite-only mode, identical to the previous build.
+
+- **CLI dispatch** (`src/cli/index.ts`): forwards
+  `args.subagentIpcVersion` → `runSubagentChild({ ipcVersion })`.
+
+- **Public re-exports** (`src/subagents/index.ts`): IPC types and
+  factories surfaced through the package root for downstream
+  consumers (S2's adapter, future eval harness).
+
+- **Tests** (48 new):
+  - `tests/subagents/ipc.test.ts` (36 cases): wire round-trip
+    for every IpcMessage variant, single-LF invariant under
+    embedded newlines, CRLF tolerance, every parser refusal
+    code, fake pair duplex / framing / close idempotency /
+    listener error isolation / unsubscribe, channel typed
+    sends, malformed-line routing through onError without
+    closing, close propagation. subprocessTransport: chunk-
+    boundary framing, EOF flush of partial line, UTF-8
+    multi-byte split across chunks. processTransport: Buffer
+    + string chunk normalization, end-event close.
+  - `tests/subagents/runtime.test.ts` (4 IPC cases): `ipc:
+    true` forwards to spawn factory; child-sent messages
+    reach `onIpcMessage`; observer throws don't break the
+    run; opt-out leaves `handle.ipc` undefined.
+  - `tests/cli/subagent-child.test.ts` (3 cases): ipcVersion=1
+    opens the channel and brackets the run with
+    session_start/session_finished; ipcVersion=999 refuses
+    with `ipc_version_mismatch` exit 1, no payload row;
+    ipcVersion absent leaves the channel closed (factory
+    never called).
+  - `tests/cli/args.test.ts` (5 cases): `--ipc=1` /
+    bare `--ipc` shorthand / refusal of bogus values /
+    absent-by-default / coexistence with other internal flags.
+
+**Decisions:**
+
+1. **Opt-in over default.** The spec (§5) explicitly mandates
+   backwards compat with the existing one-shot subprocess model.
+   Opting in means every test in `tests/subagents/runtime.test.ts`
+   that uses `fakeSpawnDone` keeps working without a flag — the
+   alternative ("ipc on by default") would have flipped 50+ tests
+   and made the slice's blast radius unreviewable. Cost: one
+   `ipc: true` opt-in at the parent's call site (S2 sets it
+   when the renderer is wired).
+
+2. **Transport abstraction with three concretes, not "subprocess
+   only".** The fake pair lets unit tests drive both ends in
+   the same process — without it, every IPC test would need a
+   real `Bun.spawn` of the agent binary, multiplying test
+   runtime by orders of magnitude. The `processTransport` for
+   the child is symmetric (same `IpcTransport` interface) and
+   lets the child's bootstrap take an injected transport in
+   tests instead of owning real `process.stdin/stdout`.
+
+3. **Bracket invariant in finally, not on success path.** A
+   pre-harness refusal (missing session row, unknown model)
+   used to be invisible — the parent saw the subprocess exit
+   with no payload and synthesized `subprocess_crashed`. With
+   IPC, the child's outer `finally` always fires
+   `session_finished` (and closes the wire) so the parent can
+   distinguish "child died unexpectedly" from "child shut down
+   cleanly even though it errored". S3 will use this to
+   populate `abortCause` — a `session_finished` at the wire
+   level means "soft" outcome was reachable; missing means
+   "hard kill or crash".
+
+4. **`onError` separate from `onMessage`.** Malformed lines are
+   diagnostic, not data — surfacing them through the same
+   pipe would force every reducer in S2 to type-guard against
+   "is this actually a message?" branches. Routing errors to
+   stderr (the runtime does this automatically) keeps the
+   message taxonomy clean and matches the NDJSON contract
+   (stdout pure, stderr admin).
+
+5. **No `permission:answer` / `permission:ask` yet.** Spec §1.2
+   defers them to M2+. The taxonomy doesn't reserve them
+   because adding new variants is non-breaking — S4 introduces
+   `tool_warning` the same way. Premature reservation would
+   lock in payload shapes before the design firms up.
+
+**Pending:** the next 3 subagent slices (per the punch list shared
+with the user before this slice opened):
+
+- **S2** — HarnessEvent observability: child serializes
+  `step_start`, `tool_invoking`, `tool_finished`, `usage`, etc.
+  via `event` IPC variant; parent's adapter translates back to
+  UIEvents; reducer + `tui/render/subagent-row.ts`. Closes
+  D170 / 1.f.2.
+- **S3** — `interrupt:soft`/`interrupt:hard` propagation +
+  `RunSubagentResult.abortCause` discriminator. Closes D159 /
+  D168.
+- **S4** — `tool_warning` propagation from child to parent
+  renderer + e2e test exercising real subprocess + IPC +
+  adapter + state. Closes the BACKLOG ~746 gap.
+
+After S4 the subagents subsystem is feature-complete per spec.
+
+**Next:** start S2. The wire is ready; S2 can begin by adding
+HarnessEvent variants `subagent_start | progress | finished` to
+`src/harness/types.ts`, then narrowing the IPC `event` payload
+to the harness union and threading it through the adapter.
+
+---
+
 ## [2026-05-04] M3 / impl — hooks Slice 5: /hooks slash command + locked enforcement E2E
 
 Same branch (`feat/m3-hooks`). Closes the hooks subsystem per spec

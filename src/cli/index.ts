@@ -76,6 +76,12 @@ const main = async (): Promise<number> => {
       // tree (project_local + project_shared anchored at the
       // parent's repo, not the worktree's cache dir).
       ...(args.subagentMemoryCwd !== undefined ? { memoryCwd: args.subagentMemoryCwd } : {}),
+      // IPC protocol version. When the parent set `--ipc=<n>`,
+      // the child opens the parent↔child channel (spec
+      // docs/spec/IPC.md). Older parents that don't pass the
+      // flag leave this undefined and the child runs in legacy
+      // SQLite-only mode — no live event channel.
+      ...(args.subagentIpcVersion !== undefined ? { ipcVersion: args.subagentIpcVersion } : {}),
     });
   }
 

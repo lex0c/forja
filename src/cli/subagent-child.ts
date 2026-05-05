@@ -1,4 +1,4 @@
-import { type HarnessResult, runAgent } from '../harness/index.ts';
+import { type HarnessEvent, type HarnessResult, runAgent } from '../harness/index.ts';
 import { resolveHookConfig, resolveHookPaths } from '../hooks/index.ts';
 import {
   createMemoryRegistry,
@@ -22,6 +22,16 @@ import {
   updateSubagentHeartbeat,
 } from '../storage/index.ts';
 import { loadSubagents, validateSubagentSet } from '../subagents/index.ts';
+import {
+  IPC_PROTOCOL_VERSION,
+  type IpcChannel,
+  type IpcTransport,
+  createChannel,
+  makeEvent,
+  makeSessionFinished,
+  makeSessionStart,
+  processTransport,
+} from '../subagents/ipc.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 
@@ -136,6 +146,20 @@ export interface SubagentChildOptions {
   // wiring (memory_* tools surface registry_unavailable, system
   // prompt has no memory section).
   memoryCwd?: string;
+  // IPC protocol version when the parent enabled the live
+  // channel (spec docs/spec/IPC.md). Set by the parser from the
+  // `--ipc=<n>` flag. Undefined ⇒ legacy mode: child does not
+  // open the channel; communication stays SQLite-only.
+  // Mismatched versions (child only knows version 1, parent
+  // requested 2) abort the run with `ipc_version_mismatch`
+  // before any harness work — spec §4.2 requires the refusal
+  // before the first message.
+  ipcVersion?: number;
+  // Test seam: inject a custom transport so the IPC layer can
+  // be exercised without owning real stdin/stdout. Production
+  // omits and falls back to `processTransport()` over the
+  // process's standard streams.
+  ipcTransportFactory?: () => IpcTransport;
 }
 
 // Cadence at which the child writes `last_heartbeat` to its
@@ -170,6 +194,14 @@ const buildEnvelope = (result: HarnessResult, output: string): Record<string, un
   // here on the child side), but keeping it in the envelope
   // makes payload-only diagnostics more useful.
   ...(result.lastMessageId !== undefined ? { last_message_id: result.lastMessageId } : {}),
+  // Abort discriminator (S3, BACKLOG D168). Populated only when
+  // the harness's loop exited via `reason === 'aborted'`. Lets
+  // the parent's `RunSubagentResult` carry the soft/hard
+  // verdict the child itself observed — without this round-trip
+  // the parent could only guess from "did the child exit before
+  // grace expired?" which collapses honest cases (slow flush,
+  // disk contention) into "hard".
+  ...(result.abortCause !== undefined ? { abort_cause: result.abortCause } : {}),
 });
 
 // Pull the child's terminal assistant text from messages by
@@ -209,6 +241,65 @@ const extractFinalOutput = (db: DB, lastMessageId: string | undefined): string =
 export const runSubagentChild = async (opts: SubagentChildOptions): Promise<number> => {
   const errSink = opts.errSink ?? ((s: string) => process.stderr.write(s));
   const dbPath = opts.dbPath ?? defaultDbPath();
+
+  // IPC channel — opened only when the parent enabled the live
+  // wire via `--ipc=<n>`. Spec §4.2: a child that doesn't
+  // recognize the requested protocol version refuses BEFORE
+  // emitting any message. We pin to IPC_PROTOCOL_VERSION; future
+  // bumps land here as a switch on accepted versions.
+  let ipcChannel: IpcChannel | undefined;
+  if (opts.ipcVersion !== undefined) {
+    if (opts.ipcVersion !== IPC_PROTOCOL_VERSION) {
+      errSink(
+        `forja: subagent-child: ipc_version_mismatch — parent requested ${opts.ipcVersion}, child only speaks ${IPC_PROTOCOL_VERSION}\n`,
+      );
+      return 1;
+    }
+    const transport = opts.ipcTransportFactory?.() ?? processTransport();
+    ipcChannel = createChannel(transport);
+    // Spec §4.2: the first message a child emits is session_start
+    // (no explicit handshake). Sending it here — before any DB or
+    // harness work — guarantees the parent sees the bracket open
+    // even if the child immediately fails on a missing row, an
+    // unknown model, etc. The corresponding session_finished
+    // lands in the outer finally, regardless of which path exited.
+    ipcChannel.send(makeSessionStart(opts.sessionId));
+  }
+
+  // Soft/hard abort controllers (S3). Local to the child run and
+  // wired into the harness's `signal` / `softStopSignal` config
+  // fields. The IPC channel routes parent commands here:
+  //   - `interrupt:soft` aborts `softStopController` → harness
+  //     exits at next step boundary, no preempted in-flight tool.
+  //   - `interrupt:hard` aborts `signalController` → harness
+  //     preempts in-flight work via AbortSignal propagation
+  //     through the provider call.
+  //   - `shutdown` is a fast-path of hard followed by EOF; it
+  //     also flips `signalController` so any in-flight provider
+  //     call sees the abort.
+  // Both controllers stay constructed even when IPC is off — the
+  // channel just never aborts them. Cheap (constructor only) and
+  // keeps the harness config branch simple.
+  const signalController = new AbortController();
+  const softStopController = new AbortController();
+  if (ipcChannel !== undefined) {
+    ipcChannel.onMessage((msg) => {
+      if (msg.type === 'interrupt:soft') {
+        // Idempotent — AbortController.abort() on an already-
+        // aborted signal is a no-op. Spec §3.1: "Idempotente —
+        // múltiplos `interrupt:soft` são no-op após o primeiro."
+        softStopController.abort();
+      } else if (msg.type === 'interrupt:hard') {
+        signalController.abort();
+      } else if (msg.type === 'shutdown') {
+        // Spec §3.1: shutdown is "fast-path do interrupt:hard +
+        // EOF no stdin". Aborting the hard signal is enough; the
+        // channel close that follows the parent's send will close
+        // our stdin reader and the outer finally will run.
+        signalController.abort();
+      }
+    });
+  }
 
   const db = openDb(dbPath);
   let envelopePublished = false;
@@ -640,6 +731,50 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // (re-resolved here from the same repo root, so config
       // staleness across spawn isn't a concern).
       hooks: resolvedHooks.hooks,
+      // S3: route IPC interrupt commands into the harness's
+      // abort plumbing. The harness honors `signal` for hard
+      // preemption (in-flight provider call abort) and
+      // `softStopSignal` for cooperative exit at the next step
+      // boundary. Without these wires, an `interrupt:soft` from
+      // the parent would dead-end at the channel listener and
+      // the child would run to completion ignoring the operator.
+      // When IPC is off the controllers stay quiescent — same
+      // semantics as omitting the fields.
+      signal: signalController.signal,
+      softStopSignal: softStopController.signal,
+      // IPC event forwarding (S2 of subagent observability,
+      // spec docs/spec/IPC.md §3.2). When the parent enabled the
+      // channel, every HarnessEvent the child fires also lands
+      // on the wire as an `event` IPC message. The parent's
+      // `runSubagent` decodes and re-fires them as
+      // `subagent_progress` HarnessEvents on the parent's own
+      // observer chain. Drops `session_finished` and
+      // `subagent_*` variants: the bracket events are fielded by
+      // the IPC layer's `session_start` / `session_finished`
+      // markers, and forwarding nested subagent observability
+      // would let an N-deep child blow up the parent's renderer
+      // budget. Send errors are swallowed — the channel may be
+      // half-closed mid-flush; SQLite remains the canonical
+      // record.
+      ...(ipcChannel !== undefined
+        ? {
+            onEvent: (he: HarnessEvent) => {
+              if (
+                he.type === 'session_finished' ||
+                he.type === 'subagent_start' ||
+                he.type === 'subagent_progress' ||
+                he.type === 'subagent_finished'
+              ) {
+                return;
+              }
+              try {
+                ipcChannel.send(makeEvent(he));
+              } catch {
+                // Channel may be torn down; ignore.
+              }
+            },
+          }
+        : {}),
     };
 
     const result = await runAgent(config);
@@ -690,6 +825,24 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // throw on the next tick — swallowed inside the timer body
     // anyway, but the explicit ordering is cleaner.
     if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
+    // Spec §4.3: emit session_finished as the LAST IPC message
+    // before exit, regardless of which path led here (happy path,
+    // pre-harness refusal, post-harness throw). The parent uses
+    // this to distinguish a clean shutdown from `subprocess_crashed`
+    // (pipe broken without the bracket close). After sending we
+    // close the channel — flushes the writer and releases the
+    // stdin/stdout listeners so the runtime can exit cleanly.
+    if (ipcChannel !== undefined) {
+      try {
+        ipcChannel.send(makeSessionFinished());
+      } catch {
+        // Channel may already be torn down (parent died, pipe
+        // broken). The session row + payload in SQLite remain
+        // the canonical record of what happened — IPC is best-
+        // effort visibility.
+      }
+      ipcChannel.close();
+    }
     db.close();
   }
 };
