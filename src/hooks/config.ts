@@ -141,12 +141,12 @@ const validateEntry = (
   const rawTimeout = obj.timeout_ms;
   if (rawTimeout !== undefined) {
     // Number.isInteger rejects non-numbers, NaN, Infinity,
-    // AND fractional values in one check. An earlier cut
-    // accepted any finite non-negative number, so
-    // `timeout_ms = 2500.5` silently propagated as a non-
-    // integer setTimeout delay (platform may truncate or
-    // round inconsistently). The validator's documented
-    // contract says "integer ms"; honor it. Common operator
+    // AND fractional values in one check. Without the
+    // integer guard, `timeout_ms = 2500.5` would silently
+    // propagate as a non-integer setTimeout delay (platform
+    // may truncate or round inconsistently). The validator's
+    // documented contract says "integer ms"; honor it.
+    // Common operator
     // mistakes this catches: accidental decimal (`5.0` from a
     // unit-conversion pass) or unit-mismatch (`0.5` intending
     // "half a second" while the field expects ms).

@@ -252,12 +252,12 @@ export const dispatchOne = async (
 
   // Concurrently: wait for exit, drain stdout/stderr, race
   // timeout. Race carries the WINNER's discriminator so each
-  // branch owns its teardown — earlier cut shared a `timedOut`
-  // bool that could land true even when the natural-exit branch
-  // ultimately won the race (timer microsecond-firing on a
-  // clean exit), causing the dispatcher to misreport a normal
-  // exit as `timeout`. Tagged-result race avoids the shared
-  // mutable state.
+  // branch owns its teardown. A shared `timedOut` bool would
+  // land true even when the natural-exit branch ultimately
+  // won the race (timer microsecond-firing on a clean exit),
+  // causing the dispatcher to misreport a normal exit as
+  // `timeout` — tagged-result race avoids the shared mutable
+  // state.
   const stdoutP = readStream(proc.stdout);
   const stderrP = readStream(proc.stderr);
 
@@ -387,15 +387,14 @@ export const dispatchChain = async (
     if (spec === undefined) continue;
     const elapsed = now() - chainStarted;
     // Wall-clock cap applies to ALL events (blocking AND
-    // non-blocking) per CONTRACTS.md §10 line 1040. An earlier
-    // cut gated this on `isBlocking`, but non-blocking chains
-    // are still AWAITED by the harness in lifecycle paths
+    // non-blocking) per CONTRACTS.md §10 line 1040. Non-blocking
+    // chains are still AWAITED by the harness in lifecycle paths
     // (SessionStart / Stop) and DRAINED at finish() before the
-    // session row closes. Without the cap, N hooks ×
-    // MAX_HOOK_TIMEOUT_MS each (up to 30s) could stall startup
-    // / shutdown by minutes — defeating the runtime guard
-    // operators rely on. Non-blocking just means "decisions
-    // don't gate", not "latency unbounded".
+    // session row closes — gating the cap on `isBlocking` would
+    // leave them uncapped. N hooks × MAX_HOOK_TIMEOUT_MS each
+    // (up to 30s) could stall startup / shutdown by minutes,
+    // defeating the runtime guard operators rely on. Non-blocking
+    // just means "decisions don't gate", not "latency unbounded".
     //
     // `>=` not `>`: at exactly `elapsed === MAX`, remaining
     // budget is zero and the per-hook clamp downstream would

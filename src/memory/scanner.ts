@@ -91,13 +91,13 @@ export const scanForInjection = (text: string): ScanResult => {
 // Hard cap on body line count for promotion (spec §5.4 line 384
 // "Content fica < 200 lines"). The cap value names the maximum
 // ALLOWED line count: 200 lines passes, 201 fails. Compare
-// strictly greater-than so the boundary value is treated as
-// "valid at the limit" — earlier cut used `>=` and rejected
-// exactly-200-line bodies while reporting "exceeds 200-line cap
-// (got 200)", which is internally contradictory (200 doesn't
-// exceed 200). See `countLines` below for the trailing-newline
-// normalization that keeps editor-written 200-line files from
-// counting as 201.
+// strictly greater-than so the boundary is treated as "valid at
+// the limit": 200 lines passes, 201 fails. Using `>=` would
+// reject exactly-200-line bodies while reporting "exceeds
+// 200-line cap (got 200)", internally contradictory since 200
+// doesn't exceed 200. See `countLines` below for the
+// trailing-newline normalization that keeps editor-written
+// 200-line files from counting as 201.
 export const SHARED_BODY_LINE_CAP = 200;
 
 // Count logical lines in a memory body. Most editors end files

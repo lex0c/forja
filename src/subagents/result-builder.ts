@@ -63,13 +63,12 @@ export interface RunSubagentResult {
 // safe default that surfaces as 'error' / reason='internalError'
 // downstream when it matters.
 // Closed sets of values the parent will accept from the child's
-// envelope. The previous implementation cast through `as` without
-// validation — a buggy or malicious child publishing
-// `status: "evil"` would land downstream as
+// envelope. Without validation here, a buggy or malicious child
+// publishing `status: "evil"` would land downstream as
 // `completeSession(db, id, 'evil', ...)`, where the `sessions.status`
 // CHECK constraint throws and the caller's catch block silently
 // swallows it. Result: phantom `running` row that no future
-// stale-session sweeper can clean up. Validating here at the trust
+// stale-session sweeper can clean up. Validating at the trust
 // boundary keeps every downstream consumer honest.
 //
 // Compile-time exhaustiveness: the maps are typed as

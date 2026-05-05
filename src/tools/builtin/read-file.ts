@@ -116,15 +116,14 @@ export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
       );
     }
 
-    // Read the whole file in one shot. The previous implementation
-    // streamed via `file.stream().getReader()` to keep memory
-    // proportional to the requested window — defensible in theory,
-    // but reproduced freezes against real .gitignore / package.json
-    // reads pointed at the stream loop never satisfying its `done`
-    // condition under specific Bun + raw-mode-stdio combinations.
-    // The async reader.read() call would suspend forever, the tool
-    // never returned, and the operator perceived "input frozen"
-    // because the harness was awaiting our promise.
+    // Read the whole file in one shot. Streaming via
+    // `file.stream().getReader()` to keep memory proportional to
+    // the requested window is defensible in theory, but it freezes
+    // on real .gitignore / package.json reads — the stream loop
+    // never satisfies its `done` condition under specific Bun +
+    // raw-mode-stdio combinations. reader.read() suspends forever,
+    // the tool never returns, and the operator sees "input frozen"
+    // while the harness awaits our promise.
     //
     // `file.text()` is a single native read(2) loop, no JS-level
     // async loop, no `done` handshake, no possibility of the stream

@@ -54,13 +54,14 @@ export interface ResolveHookShellOpts {
 
 // Tokenize FORJA_HOOK_SHELL the way an operator would expect a
 // shell-style env var to parse: whitespace separates tokens UNLESS
-// inside matching `"` or `'` quotes. An earlier cut split on raw
-// whitespace, so a Windows operator setting
-// `"C:\Program Files\Git\bin\bash.exe" -lc` would see the binary
-// path shred into `"C:\Program`, `Files\Git\bin\bash.exe"`, and
-// `-lc` — the `which` lookup against the first token would fail
-// and the dispatcher would mark the shell unavailable, silently
-// skipping every hook.
+// inside matching `"` or `'` quotes. Quote-aware split matters
+// because a Windows operator setting
+// `"C:\Program Files\Git\bin\bash.exe" -lc` needs the binary path
+// kept whole — a raw-whitespace split would shred it into
+// `"C:\Program`, `Files\Git\bin\bash.exe"`, and `-lc`, the
+// `which` lookup against the first token would fail, and the
+// dispatcher would mark the shell unavailable, silently skipping
+// every hook.
 //
 // Lenient: unterminated quotes consume to end-of-string (POSIX sh
 // would error here, but operator typo-recovery is preferred to a

@@ -60,10 +60,10 @@ const formatHook = (h: HookSpec): string => {
   // the originating hooks.toml — NOT a loop counter. Audit rows
   // (`hook_runs.hook_index`) carry the same value, so `<source>
   // #<displayed-n>` references survive filters and layer
-  // grouping. An earlier cut labeled with `inLayer.forEach`'s
-  // index, which reset per layer AND per filter, making the
+  // grouping. Labeling with the loop counter (`inLayer.forEach`'s
+  // index) would reset per layer AND per filter, making the
   // displayed `[n]` diverge from the audit-row index whenever
-  // the operator narrowed the view.
+  // the operator narrows the view.
   const matcherFrag = h.matcher.tool !== undefined ? ` matcher=tool:${h.matcher.tool}` : '';
   const flags: string[] = [];
   if (h.locked) flags.push('locked');

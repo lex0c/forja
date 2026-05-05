@@ -6,9 +6,9 @@ import type { HookEvent, HookEventPayload, HookRunResult, HookSpec } from './typ
 // the supplied tool name. Glob is a single trailing `*`
 // (`bash*` matches `bash` and `bash_background`).
 //
-// Both `matchesPayload` and the public `filterMatchingHooks`
-// share this; earlier cut had two near-identical
-// implementations that risked drifting.
+// Shared by `matchesPayload` and the public `filterMatchingHooks`
+// — keeping the rule in one place prevents drift between the
+// two call sites.
 const specMatches = (spec: HookSpec, event: HookEvent, toolName: string | null): boolean => {
   if (spec.event !== event) return false;
   const toolMatcher = spec.matcher.tool;

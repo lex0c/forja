@@ -43,11 +43,11 @@ export const migration020SubagentRunsHooks = {
   //     for hookless parents (a human edit to hooks.toml
   //     between spawn and read could otherwise let the child
   //     enforce hooks the parent never validated).
-  // The previous implementation conflated both into the
-  // `length > 0` check; that defeated migration 020's
-  // drift-prevention goal exactly when parent had no hooks —
-  // the case where it matters most because any disk re-resolve
-  // hit is a NET ADDITION of policy the parent never saw.
+  // Conflating both into a `length > 0` check defeats this
+  // drift-prevention exactly when parent had no hooks —
+  // the case where it matters most, because any disk
+  // re-resolve hit is a NET ADDITION of policy the parent
+  // never saw.
   sql: `
     ALTER TABLE subagent_runs
       ADD COLUMN hooks_snapshot TEXT;
