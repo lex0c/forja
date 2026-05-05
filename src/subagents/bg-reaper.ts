@@ -1,9 +1,5 @@
 import { readFileSync } from 'node:fs';
-import {
-  type DB,
-  listBgProcessesBySession,
-  markBgProcessAsKilled,
-} from '../storage/index.ts';
+import { type DB, listBgProcessesBySession, markBgProcessAsKilled } from '../storage/index.ts';
 
 // Grace window between SIGTERM and SIGKILL when reaping the
 // child's leftover bg processes (the SIGKILL'd-child path; see

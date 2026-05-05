@@ -2,11 +2,7 @@ import type { DB } from '../storage/db.ts';
 import { createHookRun } from '../storage/repos/hook-runs.ts';
 import { classifyExitCode, matchesPayload } from './dispatcher-matching.ts';
 import { type HookShellResolution, getCachedShell } from './dispatcher-shell.ts';
-import {
-  type DispatchedProcess,
-  type SpawnFn,
-  defaultSpawn,
-} from './dispatcher-spawn.ts';
+import { type DispatchedProcess, type SpawnFn, defaultSpawn } from './dispatcher-spawn.ts';
 import { readStream, truncate } from './dispatcher-stream.ts';
 import { expandTemplate } from './template.ts';
 import {
@@ -476,4 +472,3 @@ export const dispatchChain = async (
 
   return { blockedBy, runs };
 };
-
