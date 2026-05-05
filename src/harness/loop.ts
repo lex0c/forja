@@ -1179,6 +1179,30 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     permissionEngine: config.permissionEngine,
                     db: config.db,
                     cwd: config.cwd,
+                    // Live observability (S2 of subagent IPC).
+                    // Forward the parent's onEvent so subagent_*
+                    // HarnessEvents (start/progress/finished) flow
+                    // into the same channel the parent's TUI
+                    // adapter already listens on. The runtime
+                    // implies `ipc: true` automatically when
+                    // onChildEvent is set — without the wire there
+                    // are no progress events to observe between the
+                    // brackets.
+                    ...(config.onEvent !== undefined ? { onChildEvent: config.onEvent } : {}),
+                    // Hook-chain snapshot (migration 020). Always
+                    // forward the parent's resolved chain — even
+                    // when empty — so the child seals it into its
+                    // audit row instead of re-resolving from disk.
+                    // Empty `[]` is AUTHORITATIVE (parent had no
+                    // hooks); the previous `length > 0` gate
+                    // collapsed empty into the legacy disk-fallback
+                    // path, which let edits to `hooks.toml`
+                    // between spawn and child read add policy the
+                    // parent never validated — defeating the
+                    // migration's drift-prevention guarantee for
+                    // hookless parents (the case where any disk
+                    // hit is a NET ADDITION of policy).
+                    ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
                     // Propagate combined parent signal: a Ctrl+C or
                     // wall-clock timeout on the parent must abort
                     // the child run too. The child builds its own
@@ -1206,6 +1230,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     // gate already refused `task` itself in plan mode,
                     // but a future bypass would still be contained.
                     ...(config.planMode === true ? { planMode: true } : {}),
+                    // Trust verdict (spec §9): per-project, sealed
+                    // from the parent's bootstrap. Forwarding
+                    // unconditionally so the child runs under the
+                    // same verdict, instead of re-resolving (which
+                    // would fail-close on worktree paths and could
+                    // observe a stale verdict if the operator
+                    // updated trust mid-run). Default-false in
+                    // config maps cleanly to absent flag → child
+                    // defaults `isCwdTrusted=false`.
+                    ...(config.isCwdTrusted === true ? { cwdTrusted: true } : {}),
                     // Sampling temperature is also a run-wide property.
                     // The harness uses it for its own provider calls
                     // (line ~594); subagent runs MUST inherit so that

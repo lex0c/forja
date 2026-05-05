@@ -604,4 +604,98 @@ describe('formatPermanent', () => {
     expect(warned[0]).toBe(pad(''));
     expect(warned[1]).toBe(pad(`${CSI}33mwarn: high${CSI}0m`));
   });
+
+  describe('subagent_summary (S2 of subagent IPC)', () => {
+    test('done shape includes name + summary + duration', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'explore',
+          status: 'done',
+          summary: 'README at /repo/README.md',
+          durationMs: 5_000,
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0]).toContain('· task explore Done');
+      expect(out[0]).toContain('README at /repo/README.md');
+      expect(out[0]).toContain('5s');
+    });
+
+    test('error shape uses Failed verb and red SGR when colored', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'audit',
+          status: 'error',
+          summary: 'aborted',
+          durationMs: 12,
+        },
+        colored,
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0]).toContain('Failed');
+      // 31 = red SGR (paint(error, ...) goes through this code).
+      expect(out[0]).toContain(`${CSI}31m`);
+    });
+
+    test('uses ASCII glyph when caps.unicode is false', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'r',
+          status: 'done',
+          summary: 'ok',
+          durationMs: 100,
+        },
+        ascii,
+      );
+      // The padFrame helper prepends '  '; CHIP_FINAL_GLYPH ASCII
+      // is `*` so the line should begin with `  *`.
+      expect(out[0]?.startsWith('  *')).toBe(true);
+    });
+
+    test('truncates summary >80 chars with ellipsis', () => {
+      const long = 'x'.repeat(200);
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'r',
+          status: 'done',
+          summary: long,
+          durationMs: 100,
+        },
+        unicode,
+      );
+      expect(out[0]?.includes('…')).toBe(true);
+      // The truncated summary plus chrome should still be a single line.
+      expect(out).toHaveLength(1);
+    });
+
+    test('empty summary produces a clean line without double-space', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'r',
+          status: 'done',
+          summary: '',
+          durationMs: 100,
+        },
+        unicode,
+      );
+      expect(out[0]).toContain('Done in 100ms');
+      expect(out[0]).not.toContain('Done  in');
+    });
+  });
 });

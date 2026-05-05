@@ -239,5 +239,40 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // leading blank as error/warn so consecutive info lines from
       // different sources don't blob together.
       return ['', item.message].map(padFrame);
+    case 'subagent_summary': {
+      // One-line scrollback summary for a subagent run. Mirrors
+      // tool-end's compact shape: `· task <name> Done <summary> in 1m2s`
+      // for success, `· task <name> Failed <summary> in 1m2s` for
+      // failure. The leading glyph reuses CHIP_FINAL_GLYPH so the
+      // marker visually peers with tool-end (same ascending-dot
+      // motif).
+      const glyph = caps.unicode ? CHIP_FINAL_GLYPH.unicode : CHIP_FINAL_GLYPH.ascii;
+      const verb = item.status === 'done' ? 'Done' : 'Failed';
+      const formatDuration = (ms: number): string => {
+        if (ms < 1000) return `${ms}ms`;
+        const totalSec = Math.round(ms / 1000);
+        if (totalSec < 60) return `${totalSec}s`;
+        const m = Math.floor(totalSec / 60);
+        const s = totalSec % 60;
+        return s === 0 ? `${m}m` : `${m}m${s}s`;
+      };
+      // Truncate the summary so a verbose child doesn't blow out
+      // the line — the renderer's frame width is the operator's
+      // budget, not the producer's.
+      const maxSummary = 80;
+      const trimmedSummary = item.summary.replace(/\s+/g, ' ').trim();
+      const summary =
+        trimmedSummary.length > maxSummary
+          ? `${trimmedSummary.slice(0, maxSummary - 1)}…`
+          : trimmedSummary;
+      const head = `${glyph} task ${item.name} ${verb}`;
+      const tail = ` in ${formatDuration(item.durationMs)}`;
+      const body = summary.length > 0 ? ` ${summary}` : '';
+      const line =
+        item.status === 'done'
+          ? paint(caps, 'secondary', `${head}${body}${tail}`)
+          : paint(caps, 'error', `${head}${body}${tail}`);
+      return [padFrame(line)];
+    }
   }
 };

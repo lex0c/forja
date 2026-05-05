@@ -103,6 +103,22 @@ export interface ParsedArgs {
   // gate also refuses writes under planMode, so a write tool
   // in the whitelist is doubly blocked.
   subagentPlanMode?: boolean;
+  // Trust state carried across the subprocess boundary.
+  // Presence = true (no value); absence = false. Spec §9 trust
+  // is per-PROJECT, not per-instance: the parent already
+  // resolved trust against `~/.config/agent/trust.json` at
+  // bootstrap, and the child must run under that same verdict.
+  // Without this forwarding the child's harness defaults
+  // `isCwdTrusted` to false (fail-closed) — even when the
+  // operator explicitly trusted the cwd. Tools that gate on
+  // trust (e.g., `memory_write` refuses inferred writes on
+  // untrusted cwd) silently degrade for every subagent the
+  // operator spawns. Worktree-isolated subagents particularly
+  // hit this: the worktree path under `~/.cache/agent/worktrees/`
+  // is never on the trusted list, so re-resolving trust from
+  // `session.cwd` would also default false. Carrying the
+  // parent's verdict explicitly is the only correct option.
+  subagentCwdTrusted?: boolean;
   // Internal: per-subagent bg log directory. The parent's
   // runSubagent computes
   // `<parentCwd>/.agent/bg/<childSessionId>/` and forwards via
@@ -128,6 +144,16 @@ export interface ParsedArgs {
   // operator-driven `--subagent-session-id` invocations without
   // a parent runtime to set it).
   subagentMemoryCwd?: string;
+  // Internal: IPC protocol version. Set when the parent spawns
+  // the child with `--ipc=<n>` to enable the parent↔child stream
+  // (spec docs/spec/IPC.md). Absent ⇒ child runs in the legacy
+  // SQLite-only mode (no live event channel). The protocol is
+  // versioned so future bumps can be detected at handshake; an
+  // older child that doesn't recognize the version refuses
+  // before emitting any message (spec §4.2). `undefined` is the
+  // default — present-but-mismatched is a hard refusal at
+  // child boot.
+  subagentIpcVersion?: number;
   // `agent init` mode (AGENTIC_CLI §2.1). Scaffolds
   // `.agent/permissions.yaml` and exits. The first positional
   // arg `init` triggers it — diverging from the `--<flag>`
@@ -504,6 +530,15 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         args.subagentPlanMode = true;
         i += 1;
         break;
+      case '--subagent-cwd-trusted':
+        // Presence-only flag, same pattern as `--subagent-plan-mode`.
+        // Absence = false (fail-closed). Parent only emits this
+        // when its OWN bootstrap resolved the cwd as trusted
+        // against `~/.config/agent/trust.json`, so the child
+        // inherits the same verdict without re-resolving.
+        args.subagentCwdTrusted = true;
+        i += 1;
+        break;
       case '--subagent-temperature': {
         const value = argv[i + 1];
         if (value === undefined) {
@@ -574,16 +609,41 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         i += 2;
         break;
       }
-      default:
-        // Anything still starting with `--` after the explicit cases above
-        // is an unknown flag. Single-dash tokens (`-foo`) fall through as
-        // prompt fragments, which matches users who quote prompts loosely.
+      default: {
+        // `--ipc=<n>` (spec IPC.md §4.2). Equals-shape because
+        // the value carries protocol semantics, not arbitrary
+        // user input — matching `--key=value` mirrors how
+        // POSIX-style flags carry version negotiation in tools
+        // like `git`. Standalone `--ipc` (no value) is also
+        // accepted as version=1 for ergonomic invocations during
+        // dev / manual debugging.
+        if (arg === '--ipc') {
+          args.subagentIpcVersion = 1;
+          i += 1;
+          break;
+        }
+        if (arg.startsWith('--ipc=')) {
+          const raw = arg.slice('--ipc='.length);
+          if (!/^[1-9][0-9]*$/.test(raw)) {
+            return {
+              ok: false,
+              message: `--ipc requires a positive integer version, got '${raw}'`,
+            };
+          }
+          args.subagentIpcVersion = Number.parseInt(raw, 10);
+          i += 1;
+          break;
+        }
+        // Anything still starting with `--` after the explicit
+        // cases above is an unknown flag. Single-dash tokens
+        // (`-foo`) fall through as prompt fragments.
         if (arg.startsWith('--')) {
           return { ok: false, message: `unknown flag: ${arg}` };
         }
         promptParts.push(arg);
         i += 1;
         break;
+      }
     }
   }
   args.prompt = promptParts.join(' ').trim();
@@ -607,6 +667,23 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
     return {
       ok: false,
       message: '--limit requires --list-sessions',
+    };
+  }
+  // `--ipc[=<n>]` is an INTERNAL flag the parent appends to the
+  // child's argv when spawning. The dispatcher in cli/index.ts
+  // only reads `args.subagentIpcVersion` inside the
+  // `subagentSessionId !== undefined` branch — every other entry
+  // path ignores it silently. Pre-fix: an operator typing `agent
+  // --ipc=1 "fix the bug"` would have the flag silently consumed
+  // (no error, no IPC channel actually wired anywhere), and a
+  // prompt fragment that legitimately starts with `--ipc=...`
+  // gets parsed as the flag and stripped from the user's prompt.
+  // Both surfaces are unsupported invocations; reject loudly so
+  // the misconfiguration surfaces at parse time.
+  if (args.subagentIpcVersion !== undefined && args.subagentSessionId === undefined) {
+    return {
+      ok: false,
+      message: '--ipc is an internal flag and requires --subagent-session-id',
     };
   }
   return { ok: true, args };

@@ -1,3 +1,4 @@
+import type { HookSpec } from '../../hooks/types.ts';
 import type { Policy } from '../../permissions/index.ts';
 import type { DB } from '../db.ts';
 
@@ -30,6 +31,27 @@ export interface SubagentRun {
   // empty Policy → strict-mode defaults: maximally safe
   // interpretation of "unknown policy").
   policySnapshot: Policy;
+  // Snapshot of the parent's resolved hook chain at spawn time
+  // (migration 020). The subprocess child reads this and uses it
+  // INSTEAD of re-resolving `hooks.toml` from disk. Closes the
+  // drift window where a human edit between parent spawn and
+  // child startup could have run the child under a different
+  // hook chain than the parent had locked in.
+  //
+  // Discriminator:
+  //   - `null` — no snapshot was taken at spawn (legacy pre-
+  //     migration row, or a programmatic caller that didn't
+  //     supply a chain). Child falls through to disk re-resolve;
+  //     spec §10 unbypassable-corp-policy still binds via the
+  //     filesystem.
+  //   - `[]` — parent resolved its chain and got zero hooks;
+  //     authoritatively no hooks. Child runs WITHOUT hooks. This
+  //     is distinct from the legacy fallback: a disk re-resolve
+  //     here would let an edit to hooks.toml between spawn and
+  //     child read add policy the parent never validated, the
+  //     exact drift this migration exists to close.
+  //   - `[hook, ...]` — parent's resolved chain, used verbatim.
+  hooksSnapshot: readonly HookSpec[] | null;
   capturedAt: number;
 }
 
@@ -45,6 +67,7 @@ interface SubagentRunRow {
   budget_max_cost_usd: number;
   budget_max_wall_ms: number | null;
   policy_snapshot: string;
+  hooks_snapshot: string | null;
   captured_at: number;
 }
 
@@ -98,6 +121,31 @@ const fromRow = (row: SubagentRunRow): SubagentRun => {
   } catch {
     policySnapshot = { defaults: { mode: 'strict' }, tools: {} };
   }
+  // Defensive parse on hooks_snapshot. Three states:
+  //   - `null` (column NULL) → no snapshot was taken. Caller
+  //     falls through to disk re-resolve.
+  //   - valid JSON array → use as-is (even when empty:
+  //     authoritative "parent had no hooks").
+  //   - corrupt JSON / wrong shape → fall back to `null` so the
+  //     caller's legacy disk-re-resolve path engages. We do NOT
+  //     fall back to `[]` here: an authoritative empty would
+  //     skip disk re-resolve, and a corrupt row should NOT
+  //     silently disable hook enforcement.
+  let hooksSnapshot: HookSpec[] | null;
+  if (row.hooks_snapshot === null) {
+    hooksSnapshot = null;
+  } else {
+    try {
+      const parsed = JSON.parse(row.hooks_snapshot) as unknown;
+      if (Array.isArray(parsed) && parsed.every((e) => e !== null && typeof e === 'object')) {
+        hooksSnapshot = parsed as HookSpec[];
+      } else {
+        hooksSnapshot = null;
+      }
+    } catch {
+      hooksSnapshot = null;
+    }
+  }
   return {
     sessionId: row.session_id,
     name: row.name,
@@ -110,6 +158,7 @@ const fromRow = (row: SubagentRunRow): SubagentRun => {
     budgetMaxCostUsd: row.budget_max_cost_usd,
     budgetMaxWallMs: row.budget_max_wall_ms,
     policySnapshot,
+    hooksSnapshot,
     capturedAt: row.captured_at,
   };
 };
@@ -132,6 +181,20 @@ export interface InsertSubagentRunInput {
   // Omitting it persists `'{}'` which the read path falls back
   // to strict-mode defaults — safe but maximally restrictive.
   policySnapshot?: Policy;
+  // Parent's resolved hook chain at spawn time. Tri-state:
+  //   - undefined / omitted → row's `hooks_snapshot` column
+  //     stays NULL; child treats this as "no snapshot, re-
+  //     resolve from disk" (legacy fallback). Programmatic
+  //     callers that don't model hooks land here.
+  //   - empty array `[]` → authoritatively "parent had no
+  //     hooks". Child uses [] verbatim, no disk re-resolve.
+  //   - non-empty `HookSpec[]` → parent's resolved chain.
+  //     Child uses verbatim.
+  // The previous shape conflated undefined and `[]` into a
+  // single "fall back to disk" sentinel — defeating the
+  // migration's drift-prevention guarantee for hookless
+  // parents. The discriminator now lives on the wire.
+  hooksSnapshot?: readonly HookSpec[];
   capturedAt?: number;
 }
 
@@ -143,12 +206,26 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
   // schema dumb, parse on read.
   const toolsJson = JSON.stringify(input.toolsWhitelist);
   const policyJson = JSON.stringify(input.policySnapshot ?? {});
+  // hooks_snapshot is nullable (migration 020): undefined OR null
+  // both mean "no snapshot taken, child falls back to disk"; only
+  // an explicit array (even []) is authoritative. The TS type is
+  // `?: readonly HookSpec[]` so null isn't valid statically, but
+  // a JS caller could pass null and `JSON.stringify(null)` would
+  // produce the literal string "null" — a third on-disk state
+  // that would round-trip back as JS null and fall into the
+  // legacy disk-fallback path "by accident". Collapse to SQL
+  // NULL explicitly so the column has exactly two states:
+  // `NULL` (absent) and a JSON array (authoritative).
+  const hooksJson =
+    input.hooksSnapshot !== undefined && input.hooksSnapshot !== null
+      ? JSON.stringify(input.hooksSnapshot)
+      : null;
   db.query(
     `INSERT INTO subagent_runs
        (session_id, name, scope, source_path, source_sha256, system_prompt,
         tools_whitelist, budget_max_steps, budget_max_cost_usd,
-        budget_max_wall_ms, policy_snapshot, captured_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        budget_max_wall_ms, policy_snapshot, hooks_snapshot, captured_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     input.sessionId,
     input.name,
@@ -161,6 +238,7 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     input.budgetMaxCostUsd,
     wallMs,
     policyJson,
+    hooksJson,
     capturedAt,
   );
   // Resolve the snapshot for the return value with the same
@@ -182,6 +260,7 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     budgetMaxCostUsd: input.budgetMaxCostUsd,
     budgetMaxWallMs: wallMs,
     policySnapshot,
+    hooksSnapshot: input.hooksSnapshot ?? null,
     capturedAt,
   };
 };
@@ -200,7 +279,7 @@ export const getSubagentRun = (db: DB, sessionId: string): SubagentRun | null =>
     .query<SubagentRunRow, [string]>(
       `SELECT session_id, name, scope, source_path, source_sha256, system_prompt,
               tools_whitelist, budget_max_steps, budget_max_cost_usd,
-              budget_max_wall_ms, policy_snapshot, captured_at
+              budget_max_wall_ms, policy_snapshot, hooks_snapshot, captured_at
          FROM subagent_runs
         WHERE session_id = ?`,
     )

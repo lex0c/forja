@@ -224,6 +224,32 @@ export interface LiveState {
   // insertion order so a future expanded tray can list in
   // chronological order. session:start clears (per-session scope).
   bgProcesses: Map<string, { processId: string; command: string }>;
+  // Active subagents, keyed by subagentId (the child session id).
+  // Live region renders one row per entry until the corresponding
+  // `subagent:end` lands; on end the row is removed and a one-line
+  // permanent summary is pushed to scrollback. Insertion via
+  // `subagent:start`, mutated in place by `subagent:update`.
+  // Insertion order preserved by Map so concurrent subagents
+  // render in start order.
+  subagents: Map<
+    string,
+    {
+      subagentId: string;
+      name: string;
+      goal: string;
+      // Most recent progress one-liner from the adapter
+      // (`step N`, `running echo`, `tool foo done`, etc.). Empty
+      // string before the first `subagent:update` arrives —
+      // renderer shows the `goal` until then.
+      progress: string;
+      // Wall-clock when the start event landed. Renderers compute
+      // duration as `now - startedAt` for the live row; the
+      // permanent summary on end uses `subagent:end.durationMs`
+      // from the producer (parent's runSubagent), which is the
+      // authoritative span.
+      startedAt: number;
+    }
+  >;
   // Operator hit Esc once during a running turn (spec UI.md §4.10.6
   // "Soft-aborted (ainda processando)"). The footer swaps its
   // interrupt cue from "esc to interrupt" to "esc again to force"
@@ -268,6 +294,7 @@ export const createInitialState = (): LiveState => ({
   reverseSearch: null,
   todos: [],
   bgProcesses: new Map(),
+  subagents: new Map(),
   softInterrupted: false,
   exitArmed: null,
   ended: false,
@@ -340,7 +367,22 @@ export type PermanentItem =
     }
   | { kind: 'error'; message: string }
   | { kind: 'warn'; message: string }
-  | { kind: 'info'; message: string };
+  | { kind: 'info'; message: string }
+  | {
+      // Subagent run terminal summary, emitted from the
+      // `subagent:end` reducer branch. Renderer formats as a
+      // single line with the name, status glyph, summary
+      // (truncated), and duration. Mirrors `tool-end`'s shape
+      // intent: live row collapses, scrollback line carries the
+      // outcome.
+      kind: 'subagent_summary';
+      ts: number;
+      subagentId: string;
+      name: string;
+      status: 'done' | 'error';
+      summary: string;
+      durationMs: number;
+    };
 
 export interface ApplyResult {
   state: LiveState;
@@ -411,6 +453,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
           // bridge), so the boundary reset closes the gap.
           exitArmed: null,
           bgProcesses: new Map(),
+          subagents: new Map(),
           ended: false,
         },
         permanent: [],
@@ -437,6 +480,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
           // Same boundary reset rationale as session:start (above).
           exitArmed: null,
           bgProcesses: new Map(),
+          subagents: new Map(),
           ended: true,
         },
         permanent: [
@@ -1072,11 +1116,61 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       // status changes without flapping the counter.
       return { state, permanent: [] };
 
-    // ─── Not yet wired (subagent render arrives later) ──────────────
-    case 'subagent:start':
-    case 'subagent:update':
-    case 'subagent:end':
-      return { state, permanent: [] };
+    case 'subagent:start': {
+      // Insert a fresh row keyed by subagentId. Duplicate starts
+      // (defensive — producer is single-shot) overwrite the
+      // existing entry rather than no-oping; the new producer is
+      // the source of truth for any field the renderer reads.
+      const next = new Map(state.subagents);
+      next.set(event.subagentId, {
+        subagentId: event.subagentId,
+        name: event.name,
+        goal: event.goal,
+        progress: '',
+        startedAt: event.ts,
+      });
+      return { state: { ...state, subagents: next }, permanent: [] };
+    }
+
+    case 'subagent:update': {
+      // Out-of-order updates (event arrives before the matching
+      // start; or after the end already removed the entry) are
+      // silently dropped. The renderer relies on the entry
+      // existing; instead of synthesizing a half-formed row, we
+      // wait for the producer's next start. This matches the
+      // bg:* reducer's same-shape policy.
+      const existing = state.subagents.get(event.subagentId);
+      if (existing === undefined) return { state, permanent: [] };
+      const next = new Map(state.subagents);
+      next.set(event.subagentId, { ...existing, progress: event.progress });
+      return { state: { ...state, subagents: next }, permanent: [] };
+    }
+
+    case 'subagent:end': {
+      // Drop the live row + emit a one-line scrollback summary so
+      // the operator sees the run's terminal verdict even after
+      // the live region recycles. Same shape as bg:end / tool
+      // finalize: the live region collapses, the permanent line
+      // captures the outcome.
+      const existing = state.subagents.get(event.subagentId);
+      const next = new Map(state.subagents);
+      next.delete(event.subagentId);
+      const permanent: PermanentItem[] =
+        existing === undefined
+          ? []
+          : [
+              {
+                kind: 'subagent_summary',
+                ts: event.ts,
+                subagentId: event.subagentId,
+                name: existing.name,
+                status: event.status,
+                summary: event.summary,
+                durationMs: event.durationMs,
+              },
+            ];
+      return { state: { ...state, subagents: next }, permanent };
+    }
 
     default: {
       // Exhaustiveness guard: TypeScript marks `event` as `never` here

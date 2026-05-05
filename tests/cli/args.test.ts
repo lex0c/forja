@@ -499,6 +499,107 @@ describe('--subagent-bg-log-dir', () => {
   });
 });
 
+describe('--subagent-cwd-trusted', () => {
+  test('captures true when present', () => {
+    const r = parseArgs(['--subagent-session-id', 'sess-x', '--subagent-cwd-trusted']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentCwdTrusted).toBe(true);
+  });
+
+  test('absent by default — child treats cwd as untrusted', () => {
+    const r = parseArgs(['hi']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentCwdTrusted).toBeUndefined();
+  });
+
+  test('coexists with other internal subagent flags', () => {
+    const r = parseArgs([
+      '--subagent-session-id',
+      'sess-x',
+      '--subagent-cwd-trusted',
+      '--subagent-plan-mode',
+      '--ipc=1',
+    ]);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentCwdTrusted).toBe(true);
+    expect(r.args.subagentPlanMode).toBe(true);
+    expect(r.args.subagentIpcVersion).toBe(1);
+  });
+});
+
+describe('--ipc', () => {
+  test('--ipc=<n> paired with --subagent-session-id captures protocol version', () => {
+    const r = parseArgs(['--subagent-session-id', 'sess-x', '--ipc=1']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentIpcVersion).toBe(1);
+  });
+
+  test('--ipc (no value) defaults to version 1 when paired', () => {
+    // Ergonomic shorthand for dev / manual debugging — the
+    // parent always sends the explicit version, but a human
+    // typing `--ipc` directly inside subagent-child mode
+    // should not get a parser error on the value side. The
+    // outer pair-check still requires --subagent-session-id.
+    const r = parseArgs(['--subagent-session-id', 'sess-x', '--ipc']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentIpcVersion).toBe(1);
+  });
+
+  test('rejects non-positive integers (value validation fires before pair check)', () => {
+    // Even paired correctly, bogus values fail at the
+    // per-flag value check.
+    expect(parseArgs(['--subagent-session-id', 's', '--ipc=0']).ok).toBe(false);
+    expect(parseArgs(['--subagent-session-id', 's', '--ipc=-1']).ok).toBe(false);
+    expect(parseArgs(['--subagent-session-id', 's', '--ipc=foo']).ok).toBe(false);
+    expect(parseArgs(['--subagent-session-id', 's', '--ipc=1.5']).ok).toBe(false);
+    expect(parseArgs(['--subagent-session-id', 's', '--ipc=']).ok).toBe(false);
+  });
+
+  test('rejects --ipc without --subagent-session-id (would otherwise silently strip from prompt)', () => {
+    // `--ipc` is an INTERNAL flag the parent appends to child
+    // argv. Operators typing `agent --ipc=1 "fix the bug"`
+    // would have it silently consumed (no IPC channel actually
+    // wired in non-subagent mode); a prompt fragment starting
+    // with `--ipc=...` would be unexpectedly stripped from the
+    // user's input. Reject loudly so the misconfiguration
+    // surfaces at parse time.
+    const r1 = parseArgs(['--ipc=1']);
+    expect(r1.ok).toBe(false);
+    if (!r1.ok) expect(r1.message).toContain('--subagent-session-id');
+
+    const r2 = parseArgs(['--ipc']);
+    expect(r2.ok).toBe(false);
+
+    const r3 = parseArgs(['--ipc=2', 'fix', 'the', 'bug']);
+    expect(r3.ok).toBe(false);
+  });
+
+  test('absent by default — child runs in legacy SQLite-only mode', () => {
+    const r = parseArgs(['hi']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentIpcVersion).toBeUndefined();
+  });
+
+  test('coexists with other internal subagent flags', () => {
+    // Concurrent flag presence is the realistic invocation:
+    // `agent --subagent-session-id <id> --subagent-depth 1
+    //  --ipc=1`. Each flag captures into its own field; no
+    // ordering coupling.
+    const r = parseArgs(['--subagent-session-id', 'sess-x', '--subagent-depth', '2', '--ipc=1']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.subagentSessionId).toBe('sess-x');
+    expect(r.args.subagentDepth).toBe(2);
+    expect(r.args.subagentIpcVersion).toBe(1);
+  });
+});
+
 describe('--worktrees', () => {
   test('captures verb + positionals', () => {
     const r = parseArgs(['--worktrees', 'gc', '--dry-run']);

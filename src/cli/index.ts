@@ -67,6 +67,12 @@ const main = async (): Promise<number> => {
       // programmatic caller that invokes runSubagent with
       // planMode:true.
       ...(args.subagentPlanMode === true ? { planMode: true } : {}),
+      // Trust verdict from the parent's bootstrap. Spec §9 trust
+      // is per-project; the child runs under the parent's
+      // resolved verdict instead of re-resolving from disk
+      // (worktree paths are never on the trust list, so a
+      // re-resolve would default-deny every worktree subagent).
+      ...(args.subagentCwdTrusted === true ? { cwdTrusted: true } : {}),
       // Per-subagent bg log directory. Threaded across by the
       // parent so background-process tools work for the child
       // without colliding with the parent's bg state.
@@ -76,6 +82,12 @@ const main = async (): Promise<number> => {
       // tree (project_local + project_shared anchored at the
       // parent's repo, not the worktree's cache dir).
       ...(args.subagentMemoryCwd !== undefined ? { memoryCwd: args.subagentMemoryCwd } : {}),
+      // IPC protocol version. When the parent set `--ipc=<n>`,
+      // the child opens the parent↔child channel (spec
+      // docs/spec/IPC.md). Older parents that don't pass the
+      // flag leave this undefined and the child runs in legacy
+      // SQLite-only mode — no live event channel.
+      ...(args.subagentIpcVersion !== undefined ? { ipcVersion: args.subagentIpcVersion } : {}),
     });
   }
 

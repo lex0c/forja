@@ -1,4 +1,4 @@
-import { type HarnessResult, runAgent } from '../harness/index.ts';
+import { type HarnessEvent, type HarnessResult, runAgent } from '../harness/index.ts';
 import { resolveHookConfig, resolveHookPaths } from '../hooks/index.ts';
 import {
   createMemoryRegistry,
@@ -22,6 +22,17 @@ import {
   updateSubagentHeartbeat,
 } from '../storage/index.ts';
 import { loadSubagents, validateSubagentSet } from '../subagents/index.ts';
+import {
+  IPC_PROTOCOL_VERSION,
+  IPC_VERSION_MISMATCH_EXIT_CODE,
+  type IpcChannel,
+  type IpcTransport,
+  createChannel,
+  makeEvent,
+  makeSessionFinished,
+  makeSessionStart,
+  processTransport,
+} from '../subagents/ipc.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 
@@ -111,6 +122,18 @@ export interface SubagentChildOptions {
   // with planMode:true would see writing tools execute in the
   // child unchecked.
   planMode?: boolean;
+  // Trust verdict carried across via `--subagent-cwd-trusted`
+  // (presence-only). The parent resolved trust at bootstrap
+  // against `~/.config/agent/trust.json`; the child can't
+  // re-resolve correctly because (a) worktree-isolated
+  // subagents have a cache-dir cwd that's never on the trust
+  // list, and (b) re-reading mid-run could observe a different
+  // verdict if the operator updated trust between spawn and
+  // child startup. Same drift-window argument as the policy
+  // and hook snapshots. Absent ⇒ child defaults
+  // `isCwdTrusted=false` (fail-closed); tools gating on trust
+  // (memory_write inferred-source refusal) deny accordingly.
+  cwdTrusted?: boolean;
   // Per-subagent background-process log directory passed across
   // via `--subagent-bg-log-dir <path>`. The harness wires it
   // into the bg manager so `bash_background` / `bash_output` /
@@ -136,6 +159,20 @@ export interface SubagentChildOptions {
   // wiring (memory_* tools surface registry_unavailable, system
   // prompt has no memory section).
   memoryCwd?: string;
+  // IPC protocol version when the parent enabled the live
+  // channel (spec docs/spec/IPC.md). Set by the parser from the
+  // `--ipc=<n>` flag. Undefined ⇒ legacy mode: child does not
+  // open the channel; communication stays SQLite-only.
+  // Mismatched versions (child only knows version 1, parent
+  // requested 2) abort the run with `ipc_version_mismatch`
+  // before any harness work — spec §4.2 requires the refusal
+  // before the first message.
+  ipcVersion?: number;
+  // Test seam: inject a custom transport so the IPC layer can
+  // be exercised without owning real stdin/stdout. Production
+  // omits and falls back to `processTransport()` over the
+  // process's standard streams.
+  ipcTransportFactory?: () => IpcTransport;
 }
 
 // Cadence at which the child writes `last_heartbeat` to its
@@ -170,6 +207,14 @@ const buildEnvelope = (result: HarnessResult, output: string): Record<string, un
   // here on the child side), but keeping it in the envelope
   // makes payload-only diagnostics more useful.
   ...(result.lastMessageId !== undefined ? { last_message_id: result.lastMessageId } : {}),
+  // Abort discriminator (S3, BACKLOG D168). Populated only when
+  // the harness's loop exited via `reason === 'aborted'`. Lets
+  // the parent's `RunSubagentResult` carry the soft/hard
+  // verdict the child itself observed — without this round-trip
+  // the parent could only guess from "did the child exit before
+  // grace expired?" which collapses honest cases (slow flush,
+  // disk contention) into "hard".
+  ...(result.abortCause !== undefined ? { abort_cause: result.abortCause } : {}),
 });
 
 // Pull the child's terminal assistant text from messages by
@@ -209,6 +254,98 @@ const extractFinalOutput = (db: DB, lastMessageId: string | undefined): string =
 export const runSubagentChild = async (opts: SubagentChildOptions): Promise<number> => {
   const errSink = opts.errSink ?? ((s: string) => process.stderr.write(s));
   const dbPath = opts.dbPath ?? defaultDbPath();
+
+  // IPC channel — opened only when the parent enabled the live
+  // wire via `--ipc=<n>`. Spec §4.2: a child that doesn't
+  // recognize the requested protocol version refuses BEFORE
+  // emitting any message. We pin to IPC_PROTOCOL_VERSION; future
+  // bumps land here as a switch on accepted versions.
+  let ipcChannel: IpcChannel | undefined;
+  if (opts.ipcVersion !== undefined) {
+    if (opts.ipcVersion !== IPC_PROTOCOL_VERSION) {
+      errSink(
+        `forja: subagent-child: ipc_version_mismatch — parent requested ${opts.ipcVersion}, child only speaks ${IPC_PROTOCOL_VERSION}\n`,
+      );
+      // Belt-and-suspenders finalize: the parent's runSubagent
+      // wait loop ALSO finalizes via completeSession near the
+      // end of its outcome handler, so this is redundant on the
+      // happy parent path. But if the parent itself crashes
+      // between spawn and that handler (e.g., the operator's
+      // SIGINT killed the parent process group while the child
+      // was refusing version), the session row would otherwise
+      // sit in 'running' indefinitely. Every other early-refusal
+      // path in this function calls finalizeAsError for the
+      // same reason; the version-mismatch path was the outlier.
+      // Open + close DB just for this finalize since the regular
+      // try/finally hasn't started yet.
+      try {
+        const db = openDb(dbPath);
+        try {
+          migrate(db);
+          completeSession(db, opts.sessionId, 'error', 0, true);
+        } finally {
+          db.close();
+        }
+      } catch {
+        // Best-effort: if the DB is unhealthy or migration
+        // fails, the parent's wait loop is the next safety
+        // net.
+      }
+      // Exit with the dedicated `EX_USAGE` sentinel so the
+      // parent's wait loop can distinguish a version-mismatch
+      // refusal from a generic crash. Spec §4.2 mandates the
+      // child refuses BEFORE emitting any IPC message, so the
+      // exit code is the only signal channel; without this,
+      // mixed-version deployments surface as `subprocess_crashed`
+      // and the handshake's diagnostic value is lost exactly
+      // for the startup-refusal case.
+      return IPC_VERSION_MISMATCH_EXIT_CODE;
+    }
+    const transport = opts.ipcTransportFactory?.() ?? processTransport();
+    ipcChannel = createChannel(transport);
+    // Spec §4.2: the first message a child emits is session_start
+    // (no explicit handshake). Sending it here — before any DB or
+    // harness work — guarantees the parent sees the bracket open
+    // even if the child immediately fails on a missing row, an
+    // unknown model, etc. The corresponding session_finished
+    // lands in the outer finally, regardless of which path exited.
+    ipcChannel.send(makeSessionStart(opts.sessionId));
+  }
+
+  // Soft/hard abort controllers (S3). Local to the child run and
+  // wired into the harness's `signal` / `softStopSignal` config
+  // fields. The IPC channel routes parent commands here:
+  //   - `interrupt:soft` aborts `softStopController` → harness
+  //     exits at next step boundary, no preempted in-flight tool.
+  //   - `interrupt:hard` aborts `signalController` → harness
+  //     preempts in-flight work via AbortSignal propagation
+  //     through the provider call.
+  //   - `shutdown` is a fast-path of hard followed by EOF; it
+  //     also flips `signalController` so any in-flight provider
+  //     call sees the abort.
+  // Both controllers stay constructed even when IPC is off — the
+  // channel just never aborts them. Cheap (constructor only) and
+  // keeps the harness config branch simple.
+  const signalController = new AbortController();
+  const softStopController = new AbortController();
+  if (ipcChannel !== undefined) {
+    ipcChannel.onMessage((msg) => {
+      if (msg.type === 'interrupt:soft') {
+        // Idempotent — AbortController.abort() on an already-
+        // aborted signal is a no-op. Spec §3.1: "Idempotente —
+        // múltiplos `interrupt:soft` são no-op após o primeiro."
+        softStopController.abort();
+      } else if (msg.type === 'interrupt:hard') {
+        signalController.abort();
+      } else if (msg.type === 'shutdown') {
+        // Spec §3.1: shutdown is "fast-path do interrupt:hard +
+        // EOF no stdin". Aborting the hard signal is enough; the
+        // channel close that follows the parent's send will close
+        // our stdin reader and the outer finally will run.
+        signalController.abort();
+      }
+    });
+  }
 
   const db = openDb(dbPath);
   let envelopePublished = false;
@@ -530,25 +667,40 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text) ?? '';
     }
 
-    // Hooks subsystem (spec AGENTIC_CLI.md §10). The subprocess
-    // subagent re-resolves the same three-layer hook hierarchy
-    // the parent uses — without this, an enterprise `locked:
-    // true` PreToolUse hook protecting `bash` is enforced in
-    // the parent but bypassed by every `task`-spawned child
-    // (defeating the §10 unbypassable-corp-policy claim). Anchor
-    // the project layer at the PARENT's cwd via `memoryCwd`
-    // (when forwarded) or fall back to `session.cwd`. Same
-    // shape as the memory anchor: the project's hooks.toml
-    // belongs to the repo the operator configured, not to a
-    // worktree. Warnings surface on stderr alongside the
-    // permission/policy ones; AUDIT DRIFT-style failures stay
-    // local to the dispatcher.
-    const hookAnchor = opts.memoryCwd !== undefined ? opts.memoryCwd : session.cwd;
-    const hookRepoRoot = resolveRepoRoot(hookAnchor);
-    const resolvedHooks = resolveHookConfig(resolveHookPaths(hookRepoRoot));
-    for (const w of resolvedHooks.warnings) {
-      const layerFrag = w.layer !== null ? `${w.layer} ` : '';
-      errSink(`forja: subagent-child: ${layerFrag}hook ${w.sourcePath}: ${w.message}\n`);
+    // Hooks subsystem (spec AGENTIC_CLI.md §10). Three paths,
+    // discriminated by `audit.hooksSnapshot` (nullable per
+    // migration 020):
+    //
+    //   1. Snapshot present, non-empty (`[hook, ...]`): parent
+    //      forwarded its resolved chain. Use verbatim.
+    //   2. Snapshot present, empty (`[]`): parent resolved to
+    //      ZERO hooks authoritatively. Use [] — do NOT re-
+    //      resolve from disk. A re-resolve here would let an
+    //      edit to `hooks.toml` between spawn and this read add
+    //      policy the parent never validated, defeating the
+    //      drift-prevention this migration exists for in the
+    //      hookless-parent case (where any disk hit is a NET
+    //      ADDITION of policy).
+    //   3. Snapshot absent (`null`): legacy pre-migration row OR
+    //      a programmatic caller that didn't model hooks. Re-
+    //      resolve from disk anchored at the PARENT's cwd via
+    //      `memoryCwd` (when forwarded) or `session.cwd` as
+    //      fallback. Surface config warnings on stderr —
+    //      preserves spec §10 unbypassable-corp-policy claim
+    //      for legacy rows where the disk IS the source of
+    //      truth.
+    let hookChain: readonly import('../hooks/types.ts').HookSpec[];
+    if (audit.hooksSnapshot !== null) {
+      hookChain = audit.hooksSnapshot;
+    } else {
+      const hookAnchor = opts.memoryCwd !== undefined ? opts.memoryCwd : session.cwd;
+      const hookRepoRoot = resolveRepoRoot(hookAnchor);
+      const resolvedHooks = resolveHookConfig(resolveHookPaths(hookRepoRoot));
+      for (const w of resolvedHooks.warnings) {
+        const layerFrag = w.layer !== null ? `${w.layer} ` : '';
+        errSink(`forja: subagent-child: ${layerFrag}hook ${w.sourcePath}: ${w.message}\n`);
+      }
+      hookChain = resolvedHooks.hooks;
     }
 
     const config = {
@@ -616,6 +768,13 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // the flag on the parent side leaves the child running
       // with normal (non-plan) execution.
       ...(opts.planMode === true ? { planMode: true } : {}),
+      // Trust verdict from the parent's bootstrap. Without this
+      // forward, `harness/loop.ts` would default `isCwdTrusted`
+      // to false (fail-closed) for every subagent — so a tool
+      // that gates on trust (today: `memory_write`'s inferred-
+      // source path; future tools may add more) silently denies
+      // even when the operator trusted the parent's cwd.
+      isCwdTrusted: opts.cwdTrusted === true,
       // Checkpoints stay off in 4.2b.ii.a — the worktree path
       // already provides a separate branch for changes; per-step
       // checkpoint chain inside the worktree lands in 4.2c.
@@ -639,7 +798,51 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // subagent through the same hooks.toml the parent loaded
       // (re-resolved here from the same repo root, so config
       // staleness across spawn isn't a concern).
-      hooks: resolvedHooks.hooks,
+      hooks: hookChain,
+      // S3: route IPC interrupt commands into the harness's
+      // abort plumbing. The harness honors `signal` for hard
+      // preemption (in-flight provider call abort) and
+      // `softStopSignal` for cooperative exit at the next step
+      // boundary. Without these wires, an `interrupt:soft` from
+      // the parent would dead-end at the channel listener and
+      // the child would run to completion ignoring the operator.
+      // When IPC is off the controllers stay quiescent — same
+      // semantics as omitting the fields.
+      signal: signalController.signal,
+      softStopSignal: softStopController.signal,
+      // IPC event forwarding (S2 of subagent observability,
+      // spec docs/spec/IPC.md §3.2). When the parent enabled the
+      // channel, every HarnessEvent the child fires also lands
+      // on the wire as an `event` IPC message. The parent's
+      // `runSubagent` decodes and re-fires them as
+      // `subagent_progress` HarnessEvents on the parent's own
+      // observer chain. Drops `session_finished` and
+      // `subagent_*` variants: the bracket events are fielded by
+      // the IPC layer's `session_start` / `session_finished`
+      // markers, and forwarding nested subagent observability
+      // would let an N-deep child blow up the parent's renderer
+      // budget. Send errors are swallowed — the channel may be
+      // half-closed mid-flush; SQLite remains the canonical
+      // record.
+      ...(ipcChannel !== undefined
+        ? {
+            onEvent: (he: HarnessEvent) => {
+              if (
+                he.type === 'session_finished' ||
+                he.type === 'subagent_start' ||
+                he.type === 'subagent_progress' ||
+                he.type === 'subagent_finished'
+              ) {
+                return;
+              }
+              try {
+                ipcChannel.send(makeEvent(he));
+              } catch {
+                // Channel may be torn down; ignore.
+              }
+            },
+          }
+        : {}),
     };
 
     const result = await runAgent(config);
@@ -690,6 +893,24 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // throw on the next tick — swallowed inside the timer body
     // anyway, but the explicit ordering is cleaner.
     if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
+    // Spec §4.3: emit session_finished as the LAST IPC message
+    // before exit, regardless of which path led here (happy path,
+    // pre-harness refusal, post-harness throw). The parent uses
+    // this to distinguish a clean shutdown from `subprocess_crashed`
+    // (pipe broken without the bracket close). After sending we
+    // close the channel — flushes the writer and releases the
+    // stdin/stdout listeners so the runtime can exit cleanly.
+    if (ipcChannel !== undefined) {
+      try {
+        ipcChannel.send(makeSessionFinished());
+      } catch {
+        // Channel may already be torn down (parent died, pipe
+        // broken). The session row + payload in SQLite remain
+        // the canonical record of what happened — IPC is best-
+        // effort visibility.
+      }
+      ipcChannel.close();
+    }
     db.close();
   }
 };
