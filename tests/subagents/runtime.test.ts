@@ -38,6 +38,7 @@ import {
 import {
   MAX_SUBAGENT_DEPTH,
   type SpawnChildProcess,
+  drainStderrToLogFile,
   resolveChildBinaryCmd,
   runSubagent,
   toEnvelope,
@@ -2175,6 +2176,138 @@ describe('runSubagent — orchestration', () => {
     // parent's wait loop could even send a signal — but the
     // post-wait finalization MUST still fire.
     expect(getSession(db, result.sessionId)?.status).toBe('interrupted');
+  });
+});
+
+describe('drainStderrToLogFile', () => {
+  // Per-test temp dir so each scenario has clean disk state.
+  let tmp: string;
+  beforeEach(() => {
+    tmp = require('node:fs').mkdtempSync(
+      require('node:path').join(require('node:os').tmpdir(), 'forja-drain-'),
+    );
+  });
+  afterEach(() => {
+    try {
+      require('node:fs').rmSync(tmp, { recursive: true, force: true });
+    } catch {}
+  });
+
+  // Helper: build a controllable ReadableStream that pushes
+  // bytes when the test calls `enqueue` and ends on `close`.
+  const makeStream = () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+    });
+    return {
+      stream,
+      enqueue: (s: string) => controller.enqueue(new TextEncoder().encode(s)),
+      close: () => controller.close(),
+    };
+  };
+
+  const stderrPath = () => require('node:path').join(tmp, 'stderr.log');
+
+  test('writes received bytes into <logDir>/stderr.log', async () => {
+    const { stream, enqueue, close } = makeStream();
+    const drained = drainStderrToLogFile(stream, tmp);
+    enqueue('forja: subagent-child: hook /etc/agent/hooks.toml: malformed entry\n');
+    enqueue('forja: subagent-child: another error\n');
+    close();
+    await drained;
+    const contents = require('node:fs').readFileSync(stderrPath(), 'utf8');
+    expect(contents).toContain('hook /etc/agent/hooks.toml');
+    expect(contents).toContain('another error');
+  });
+
+  test('lazy creation: child that never writes stderr produces NO file (no empty noise)', async () => {
+    // The common happy path. Without lazy creation we'd
+    // accumulate empty stderr.log files across thousands of
+    // subagent invocations.
+    const { stream, close } = makeStream();
+    const drained = drainStderrToLogFile(stream, tmp);
+    close();
+    await drained;
+    expect(require('node:fs').existsSync(stderrPath())).toBe(false);
+  });
+
+  test('zero-length chunks are not enough to trigger lazy file creation', async () => {
+    // Defensive: a stream that emits zero-byte buffers (rare
+    // but technically allowed) shouldn't open the file. Only
+    // actual content matters.
+    const { stream, close } = makeStream();
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const realStream = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+    });
+    const drained = drainStderrToLogFile(realStream, tmp);
+    controller.enqueue(new Uint8Array(0));
+    controller.enqueue(new Uint8Array(0));
+    controller.close();
+    await drained;
+    void stream;
+    void close;
+    expect(require('node:fs').existsSync(stderrPath())).toBe(false);
+  });
+
+  test('logDir undefined: drains stream silently without crashing', async () => {
+    // Test fixtures that don't model a log dir need the drain
+    // to keep reading the pipe (otherwise the subprocess would
+    // block on its next write). Discard mode preserves that
+    // contract — the caller gets no on-disk artifact but the
+    // child stays unblocked.
+    const { stream, enqueue, close } = makeStream();
+    const drained = drainStderrToLogFile(stream, undefined);
+    enqueue('some error\n');
+    enqueue('and another\n');
+    close();
+    await drained;
+    // No file path to verify against; the assertion is
+    // "didn't throw, drained promise resolved".
+    expect(true).toBe(true);
+  });
+
+  test('creates the log dir if it does not exist (mkdirSync recursive)', async () => {
+    // bgLogDir is normally created lazily by the bg manager on
+    // first bg spawn — but stderr can fire before any bg work,
+    // so the drain must mkdir on its own.
+    const path = require('node:path');
+    const fs = require('node:fs');
+    const deepDir = path.join(tmp, 'a', 'b', 'c');
+    expect(fs.existsSync(deepDir)).toBe(false);
+    const { stream, enqueue, close } = makeStream();
+    const drained = drainStderrToLogFile(stream, deepDir);
+    enqueue('error\n');
+    close();
+    await drained;
+    expect(fs.existsSync(path.join(deepDir, 'stderr.log'))).toBe(true);
+  });
+
+  test('continues draining after a write error (sink dropped, pipe stays clear)', async () => {
+    // If the disk fills mid-run, the sink writes throw. The
+    // drain has to keep READING the pipe regardless or the
+    // subprocess would block on its next stderr write —
+    // exactly the failure mode the drain exists to prevent.
+    // We can't easily simulate disk-full at unit level, but
+    // the contract holds even if mkdirSync fails (e.g., the
+    // path is a regular file). Test that path.
+    const path = require('node:path');
+    const fs = require('node:fs');
+    // Plant a regular file where the drain expects a dir.
+    fs.writeFileSync(path.join(tmp, 'collision'), 'i am a file');
+    const { stream, enqueue, close } = makeStream();
+    const drained = drainStderrToLogFile(stream, path.join(tmp, 'collision'));
+    enqueue('something');
+    enqueue('more');
+    close();
+    // Drain must not reject: it swallows the mkdir error and
+    // keeps reading.
+    await expect(drained).resolves.toBeUndefined();
   });
 });
 

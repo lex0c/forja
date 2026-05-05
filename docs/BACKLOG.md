@@ -15,6 +15,73 @@ Format:
 
 ---
 
+## [2026-05-05] M3 / harden — child stderr → per-subagent log file
+
+Same branch (`feat/m3-subagent-ipc`). Closes the only operator-
+visible lacuna remaining from the maturity audit: the child's
+stderr was drained to keep the OS pipe from filling but the
+content was discarded. Hook config warnings, parser errors,
+panic prints — every diagnostic the child wrote to stderr never
+reached the operator. Now they land at
+`<bgLogDir>/stderr.log` for post-mortem inspection.
+
+**Done:**
+
+- **`drainStderrToLogFile(stderr, logDir)` helper** in
+  `src/subagents/runtime.ts`. Drains a
+  `ReadableStream<Uint8Array>` chunk-by-chunk into
+  `<logDir>/stderr.log` via `Bun.file().writer()`. Lazy: file
+  is created on the FIRST byte. A child that never writes to
+  stderr produces no on-disk artifact (the common happy path
+  for thousands of subagent invocations stays clean).
+
+- **Defensive paths** all collapse to "drain silently":
+  `logDir === undefined` → discard mode (test fixtures that
+  don't model a log dir); mkdir/open fails → drop the sink;
+  mid-run write fails → drop the sink. In every case the pipe
+  STAYS drained so the child never blocks on `write(2)` —
+  which would otherwise masquerade as heartbeat staleness.
+
+- **`defaultSpawnChildProcess`** wires the helper with
+  `opts.bgLogDir`. Production runtime always computes a
+  per-session bgLogDir
+  (`<parentCwd>/.agent/bg/subagents/<childSessionId>/`), so the
+  path is always available. Existing end-of-run `rmSync(bgLogDir)`
+  takes the stderr.log down with the rest when bg processes
+  are all terminal; when bg is stuck, the log sticks around
+  alongside for operator inspection.
+
+- **Tests** (6 new in `runtime.test.ts > drainStderrToLogFile`):
+  writes content; lazy creation (no file when empty); zero-
+  length chunks don't trigger; undefined logDir drains
+  silently; recursive mkdir; mid-failure (path collision) is
+  swallowed and drain promise resolves cleanly.
+
+**Decisions:**
+
+1. **Exported helper, not inlined.** The drain logic is complex
+   enough that inlining would force tests to spawn a real
+   subprocess to exercise it. Helper is testable with synthetic
+   `ReadableStream`s.
+
+2. **Lazy file creation.** Eager would scatter empty `stderr.log`
+   files across thousands of subagent invocations — noise that
+   confuses operators investigating after-the-fact. Lazy
+   ensures the file's presence IS the signal "child wrote
+   something to stderr."
+
+3. **Tied to `bgLogDir`, not a parallel `stderrLogDir` option.**
+   Every subagent already has a bgLogDir; reusing it means
+   stderr shares the same lifecycle (created lazily, rmSync'd
+   together, preserved when bg is stuck).
+
+**Pending:** none. The maturity-audit lacuna is closed; remaining
+deferred items (Map cap on parent's TUI state, soft-routing
+harness e2e, permission proxy, cross-process hook dispatch) all
+have clear triggers and don't gate the branch.
+
+---
+
 ## [2026-05-05] M3 / fix — round-4 review: trust boundary + escalation math
 
 Same branch (`feat/m3-subagent-ipc`). Fourth round of independent

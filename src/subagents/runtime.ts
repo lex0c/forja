@@ -1,4 +1,4 @@
-import { readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import type { HarnessEvent, HarnessResult } from '../harness/index.ts';
 import type { HookSpec } from '../hooks/types.ts';
@@ -305,6 +305,90 @@ export const resolveChildBinaryCmd = (input: ResolveChildBinaryArgs): string[] =
 // `reason: 'subprocess_spawn_failed'`. We let the exception
 // propagate from here — the runtime is the only caller of the
 // default factory.
+
+// Drain a child's stderr stream to `<logDir>/stderr.log`. Lazy:
+// the file is opened on the FIRST byte, so a child that never
+// writes stderr produces no on-disk artifact (no empty-file
+// noise across thousands of subagent invocations). Without
+// this, the OS pipe fills at ~64 KiB and the child blocks on
+// next stderr write — which the heartbeat staleness path
+// would then mistake for a wedge. Discards silently when:
+//   - `logDir` is undefined (test fixture without a log dir)
+//   - mkdir/open fails (disk full, EACCES) — child still
+//     runs, just without a post-mortem trail
+//   - mid-run write fails (disk full mid-run) — sink dropped,
+//     pipe keeps draining to prevent child blocking
+//
+// Exported for direct testing without a real subprocess: tests
+// build a `ReadableStream<Uint8Array>` controller, push bytes,
+// close, and assert the resulting `<logDir>/stderr.log`.
+export const drainStderrToLogFile = (
+  stderr: ReadableStream<Uint8Array>,
+  logDir: string | undefined,
+): Promise<void> => {
+  return (async () => {
+    const reader = stderr.getReader();
+    // Duck-typed sink — Bun's FileSink generic shape varies
+    // between releases; we only need write + end.
+    let sink: { write: (chunk: Uint8Array) => void; end: () => void } | undefined;
+    let opened = false;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value === undefined || value.length === 0) continue;
+        if (!opened) {
+          if (logDir === undefined) {
+            // Drain-to-discard mode: no log dir configured.
+            // The pipe still has to be read or the child
+            // blocks; just throw the bytes away.
+            opened = true;
+            continue;
+          }
+          try {
+            mkdirSync(logDir, { recursive: true });
+            const writer = Bun.file(join(logDir, 'stderr.log')).writer();
+            sink = {
+              write: (chunk) => {
+                writer.write(chunk);
+              },
+              end: () => {
+                writer.end();
+              },
+            };
+            opened = true;
+          } catch {
+            // mkdir/open failed. Child keeps running; the
+            // post-mortem trail is the operator's filesystem
+            // problem to investigate.
+            opened = true;
+            continue;
+          }
+        }
+        if (sink !== undefined) {
+          try {
+            sink.write(value);
+          } catch {
+            // Disk full mid-run, etc. Drop the sink but keep
+            // reading so the child's pipe doesn't block.
+            sink = undefined;
+          }
+        }
+      }
+    } catch {
+      // Pipe closed mid-read on kill — normal termination shape.
+    } finally {
+      if (sink !== undefined) {
+        try {
+          sink.end();
+        } catch {
+          // best-effort flush
+        }
+      }
+    }
+  })();
+};
+
 const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
   // Internal flags appended in fixed order. `--subagent-temperature`
   // is conditional: omitting it (instead of stamping a default)
@@ -358,14 +442,11 @@ const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
     ...(opts.ipc === true ? { stdin: 'pipe', stdout: 'pipe' } : { stdout: 'ignore' }),
     stderr: 'pipe',
   });
-  // Drain stderr in the background. We swallow read errors —
-  // the stream may close mid-read on a kill, which is normal.
-  // The drained content is dropped today; capturing it for
-  // post-mortem diagnosis is a follow-up (likely under the
-  // 4.2b.iv bgLogDir work, where child stderr would naturally
-  // route to per-worktree log files).
+  // Route child stderr to a per-subagent log file under
+  // bgLogDir. Extracted as a helper so tests can drive it with
+  // synthetic streams without spawning a real subprocess.
   if (proc.stderr !== null && proc.stderr !== undefined) {
-    new Response(proc.stderr).text().catch(() => undefined);
+    drainStderrToLogFile(proc.stderr as ReadableStream<Uint8Array>, opts.bgLogDir);
   }
   // Build the IPC channel only when both opt-in is set AND the
   // OS streams resolved (defensive — `Bun.spawn` should always
