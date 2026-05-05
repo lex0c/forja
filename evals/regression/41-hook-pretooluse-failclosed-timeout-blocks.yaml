@@ -10,7 +10,7 @@ setup:
     .agent/hooks.toml: |
       [[hooks]]
       event = "PreToolUse"
-      command = "sleep 5"
+      command = "sleep 1"
       timeout_ms = 200
       fail_closed = true
 expect:

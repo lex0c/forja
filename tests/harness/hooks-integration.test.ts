@@ -549,11 +549,18 @@ describe('hooks Slice 2 — error tolerance', () => {
 
   test('hook timeout (chain stays under 15s)', async () => {
     const hooks: HookSpec[] = [
-      // 100ms timeout with `sleep 5` → dispatcher kills it via
-      // SIGTERM and records outcome=timeout, exit_code=124.
+      // 100ms timeout with `sleep 1` → dispatcher's timer fires
+      // and records outcome=timeout, exit_code=124. Sleep
+      // duration kept low (1s) so a CI runner where the kill
+      // ladder fails to actually terminate the process (PID
+      // namespace, signal-blocking parent shell) falls back to
+      // the natural exit well within Bun-test's 5s per-case
+      // default — without that margin, the harness's
+      // `await proc.exited` blocks 5s and the test framework
+      // times out before the assertion runs.
       baseSpec({
         event: 'SessionStart',
-        command: 'sleep 5',
+        command: 'sleep 1',
         timeoutMs: 100,
       }),
     ];

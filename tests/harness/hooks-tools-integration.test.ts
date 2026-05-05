@@ -307,6 +307,15 @@ describe('hooks Slice 3 — PreToolUse', () => {
   });
 
   test('timeout + failClosed=true → blocks as silent (no internal text leak)', async () => {
+    // sleep BLOCK_TIMEOUT_TEST_DURATION must exceed timeoutMs by
+    // a wide margin so the dispatcher's timer fires first
+    // (proving the timeout PATH executes), but stays small
+    // enough that even a CI runner where SIGTERM/SIGKILL don't
+    // land (PID namespace quirks, signal-blocking parent shells)
+    // falls back to the natural exit well within the test
+    // framework's per-case 5s default. `sleep 1` gives a 10×
+    // margin over timeoutMs=100ms while bounding worst-case
+    // wall clock to ~1s.
     const calls: { args: Record<string, unknown> }[] = [];
     const tool = makeRecordingTool(calls);
     const registry = createToolRegistry();
@@ -315,7 +324,7 @@ describe('hooks Slice 3 — PreToolUse', () => {
     const hooks: HookSpec[] = [
       baseSpec({
         event: 'PreToolUse',
-        command: 'sleep 5',
+        command: 'sleep 1',
         timeoutMs: 100,
         failClosed: true,
       }),
