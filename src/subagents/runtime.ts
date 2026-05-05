@@ -373,8 +373,14 @@ const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
   // legacy poller path — same behavior as the legacy mode.
   let ipc: IpcChannel | undefined;
   if (opts.ipc === true && proc.stdin !== undefined && proc.stdout !== undefined) {
+    // Bun.spawn's `proc.stdin` is a FileSink (not a WHATWG
+    // WritableStream — that was the early bug caught by the
+    // real-subprocess smoke). subprocessTransport accepts either
+    // shape and branches internally; cast through unknown
+    // because the SubprocessStreams union covers both with
+    // structural types Bun's typings don't quite line up with.
     const transport = subprocessTransport({
-      stdin: proc.stdin as unknown as WritableStream<Uint8Array>,
+      stdin: proc.stdin as unknown as Parameters<typeof subprocessTransport>[0]['stdin'],
       stdout: proc.stdout as unknown as ReadableStream<Uint8Array>,
     });
     ipc = createChannel(transport);

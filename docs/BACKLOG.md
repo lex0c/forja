@@ -15,6 +15,131 @@ Format:
 
 ---
 
+## [2026-05-05] M3 / fix — subagents IPC: FileSink stdin + replay buffer fanout (smoke caught)
+
+Same branch (`feat/m3-subagent-ipc`). Real-provider smoke
+(`evals/smoke-subagent-explore.sh`, adapted to assert IPC wire
+behavior against Haiku 4.5) caught two production bugs that every
+in-process test missed because `fakeTransportPair` doesn't model
+either failure surface.
+
+**Bugs:**
+
+1. **`Bun.spawn({stdin:'pipe'})` returns `FileSink`, not
+   `WritableStream<Uint8Array>`.** The `subprocessTransport`
+   wrote via `streams.stdin.getWriter()` — works for WHATWG
+   streams (the type the unit tests pass through `buildStreams`),
+   throws `streams.stdin.getWriter is not a function` for
+   FileSink (the actual Bun primitive). Every real subagent
+   spawn under `--ipc=1` failed with `subprocess_spawn_failed`
+   before the bracket close even fired. In-process tests passed
+   because they bypass the spawn factory entirely.
+
+2. **Replay buffer drained into the FIRST subscriber only.** The
+   parent's runtime wires three `onMessage` handlers back-to-back
+   in `runSubagent`: the protocol-version check, the optional
+   `onIpcMessage` raw observer, and the typed
+   `onChildEvent`-forwarding handler. The original drain-once
+   semantic delivered the buffered replay to the version checker
+   only — every `event` IPC message that arrived before the
+   typed observer attached vanished. In production this meant
+   zero `subagent_progress` events surfaced even though the
+   bracket events did.
+
+**Done:**
+
+- **`subprocessTransport`** now accepts `FileSink | WritableStream`
+  for stdin (`SubprocessStreams.stdin: FileSinkLike |
+  WritableStreamLike`). Writes branch ONCE at construction
+  (cheap per-call afterwards): WHATWG streams use the writer's
+  promise-returning `.write()`, FileSinks use the synchronous
+  `.write()` directly. Close path mirrors: WHATWG no-op (Bun
+  closes the pipe at process exit; can't get a second writer
+  to call `.close()`), FileSink `.end?.()`. Comment narrows
+  the rationale because Bun's stdin shape is the kind of thing
+  easy to forget.
+
+- **`runtime.ts`** spawn site updated to pass `proc.stdin` cast
+  through `Parameters<typeof subprocessTransport>[0]['stdin']`
+  so the union covers both shapes regardless of which one Bun
+  surfaces.
+
+- **`createChannel` replay buffer** changed from "drain into
+  first subscriber, clear" to "buffer until first real-time
+  emit, replay to every subscriber that attaches in the
+  pre-commit window". New subscribers see the full history;
+  the buffer commits (transitions `pendingMessages` to `null`)
+  the first time a message lands when subscribers exist. After
+  the commit, late subscribers see only real-time — same as
+  the standard emitter contract. Diagnostic flush moved to
+  fire on either first-emit OR first-subscribe (whichever
+  surfaces the signal to a listener that can actually act on it).
+
+- **Smoke test (`evals/smoke-subagent-explore.sh`)** extended
+  with five IPC assertions on the parent's NDJSON output:
+  bracket pair count match (`subagent_start` ≡ `subagent_finished`),
+  progress event presence (≥1 — proves wire delivered events
+  during the run), bracket order via jq (1:1 by `subagentId`),
+  inner-event-type variety with `step_start` as the minimum
+  signal that the child's harness iterated visibly, and
+  cross-reference between IPC `subagentId`s and SQLite
+  `parent_session_id` linkage.
+
+- **Tests updated** (`tests/subagents/ipc.test.ts`):
+  - "replay drains exactly once" replaced by "multiple
+    subscribers in the same sync frame all receive the
+    buffered replay" — locks in the new fanout semantic that
+    the production case requires.
+  - New "subscriber attaching AFTER first real-time emit sees
+    only real-time (buffer committed)" — locks in the buffer
+    commit transition.
+
+**Smoke result against Haiku 4.5:**
+```
+IPC bracket pairs: 1 start, 1 finished (matched).
+IPC progress events: 20 (live wire delivered child HarnessEvents in real-time).
+IPC inner event variety: 6 distinct types (provider_event,session_start,step_start,tool_decided,tool_finished,tool_invoking).
+IPC subagentIds match SQLite child session ids — audit cross-reference intact.
+PASS: subagent runtime + task tool + audit snapshot + live IPC wired end-to-end.
+```
+
+20 progress events crossed the wire in a single Haiku run that
+invoked one tool — in line with the spec §6 "100-500 messages
+per session" estimate. Cross-reference between IPC ids and
+SQLite ids holds, so audit + live stream can be cross-grepped.
+
+**Decisions:**
+
+1. **No new in-process test for FileSink.** `subprocessTransport`
+   is now structurally typed for both shapes; a unit test could
+   exercise the FileSink branch with a mock, but the real
+   coverage is the smoke. Adding a unit test would just lock
+   in the mock's shape, not Bun's actual behavior. The smoke
+   IS the contract test.
+
+2. **Replay-buffer fanout instead of "wait for all subscribers".**
+   The runtime knows when it's done wiring observers (end of
+   the synchronous block), but exposing that to the channel
+   would require a `flushReplay()` or "ready" handshake.
+   Detecting via "buffer until first real-time emit" is
+   automatic and matches the natural transition point — the
+   first real message means the wiring completed at least
+   once. New subscribers that attach later are genuinely
+   late and shouldn't expect history.
+
+3. **Smoke now load-bearing for production-readiness claims.**
+   The S1-S4 unit suite was 100% green when this branch was
+   first marked "production-ready" — and missed both bugs
+   because the failure surfaces only manifest with real Bun
+   primitives + real concurrent subscribers. Smoke runs in
+   CI go forward (cost ~$0.02/run, gated on
+   `ANTHROPIC_API_KEY`); a regression on the wire shape would
+   fail the smoke before merge.
+
+**Pending:** none. Branch genuinely tier-1 production-ready now.
+
+---
+
 ## [2026-05-05] M3 / harden — subagents IPC production-readiness blockers
 
 Same branch (`feat/m3-subagent-ipc`). After the review fixes the

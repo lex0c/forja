@@ -278,26 +278,56 @@ describe('IPC channel', () => {
     expect(errors[1]?.reason).toContain('unknown_type');
   });
 
-  test('replay drains exactly once — second subscriber sees only real-time', () => {
+  test('multiple subscribers in the same sync frame all receive the buffered replay', () => {
+    // Production wires THREE onMessage handlers back-to-back in
+    // runSubagent (protocol-version check, optional onIpcMessage,
+    // typed onChildEvent forwarder). Each must see the same
+    // history — a drain-once-into-first-subscriber semantic would
+    // leak every child-emitted event into only the version
+    // checker, leaving the typed observer empty (regression
+    // caught by the real-subprocess smoke).
     const { a, b } = fakeTransportPair();
     const parent = createChannel(a);
     const child = createChannel(b);
     child.send(makeSessionStart('s-1'));
+    child.send(makeShutdown());
 
     const first: IpcMessage[] = [];
-    parent.onMessage((m) => first.push(m));
-    expect(first).toHaveLength(1);
-
     const second: IpcMessage[] = [];
+    parent.onMessage((m) => first.push(m));
     parent.onMessage((m) => second.push(m));
-    // No replay for the second subscriber.
-    expect(second).toEqual([]);
+    // Both same-frame subscribers see the full pre-subscribe
+    // replay.
+    expect(first.map((m) => m.type)).toEqual(['session_start', 'shutdown']);
+    expect(second.map((m) => m.type)).toEqual(['session_start', 'shutdown']);
+  });
 
-    // Real-time delivery resumes: both subscribers see the next
-    // message live.
+  test('subscriber attaching AFTER first real-time emit sees only real-time (buffer committed)', () => {
+    // Once the buffer commits (first real-time message lands on
+    // an attached subscriber), it can't be replayed — late
+    // subscribers are "late" by construction. Matches the
+    // standard emitter contract.
+    const { a, b } = fakeTransportPair();
+    const parent = createChannel(a);
+    const child = createChannel(b);
+    // Buffer one message, attach first subscriber (drains buffer
+    // into it), emit a second message live (commits the buffer),
+    // then attach a late subscriber.
+    child.send(makeSessionStart('s-1'));
+    const first: IpcMessage[] = [];
+    parent.onMessage((m) => first.push(m));
     child.send(makeShutdown());
+    const late: IpcMessage[] = [];
+    parent.onMessage((m) => late.push(m));
+    // First subscriber: replay (1) + real-time (1) = 2.
     expect(first).toHaveLength(2);
-    expect(second).toHaveLength(1);
+    // Late subscriber: nothing (the buffer committed when the
+    // shutdown landed live).
+    expect(late).toEqual([]);
+    // Real-time still flows to both going forward.
+    child.send(makeInterruptHard());
+    expect(first).toHaveLength(3);
+    expect(late).toHaveLength(1);
   });
 
   test('replay buffer caps at 64 messages with a stderr diagnostic', () => {
