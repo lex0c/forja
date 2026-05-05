@@ -3731,4 +3731,67 @@ describe('runSubagent — review fixes (round 4)', () => {
     const sigterms = killSignals.filter((s) => s === 'SIGTERM').length;
     expect(sigterms).toBe(1);
   });
+
+  test('child crash with EX_USAGE (64) exit code maps to ipc_version_mismatch reason', async () => {
+    // The startup-refusal path: child receives a `--ipc=<n>`
+    // version it can't satisfy and exits with the dedicated
+    // sentinel BEFORE sending any IPC message (spec §4.2). The
+    // parent's session_start mismatch listener never fires
+    // because the child never opens the channel; the exit
+    // code is the only signal. Pre-fix: this surfaced as
+    // `subprocess_crashed`, defeating the handshake's
+    // diagnostic value.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake: SpawnChildProcess = () => ({
+      // Mimic the real child's pre-message refusal: never
+      // publish a payload, exit immediately with EX_USAGE.
+      exited: Promise.resolve({ exitCode: 64 }),
+      kill: () => undefined,
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: fake,
+    });
+    expect(result.status).toBe('error');
+    expect(result.reason).toBe('ipc_version_mismatch');
+  });
+
+  test('child crash with non-EX_USAGE exit code stays subprocess_crashed', async () => {
+    // Negative case: the EX_USAGE mapping is sentinel-specific.
+    // A generic crash (exit 1, SIGSEGV / 139, etc.) must NOT
+    // be mislabeled as a version mismatch.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake: SpawnChildProcess = () => ({
+      exited: Promise.resolve({ exitCode: 1 }),
+      kill: () => undefined,
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: fake,
+    });
+    expect(result.status).toBe('error');
+    expect(result.reason).toBe('subprocess_crashed');
+  });
 });

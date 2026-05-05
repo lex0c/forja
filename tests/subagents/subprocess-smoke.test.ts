@@ -208,7 +208,11 @@ describe('subprocess smoke — real Bun.spawn + processTransport (production wir
     // channel is fully wired).
     const { sessionId } = seedChildSession();
     const result = await runRealSubprocess(sessionId, ['--ipc=999']);
-    expect(result.exitCode).toBe(1);
+    // Exit code 64 (EX_USAGE) is the dedicated sentinel: parent's
+    // wait loop maps `crashed { exitCode: 64 }` to the
+    // `ipc_version_mismatch` reason (no payload was published, so
+    // the exit code is the only signal channel).
+    expect(result.exitCode).toBe(64);
     expect(result.stderr).toContain('ipc_version_mismatch');
     expect(result.rawStdout).toBe('');
   }, 15_000);

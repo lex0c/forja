@@ -38,6 +38,7 @@ export type {
 } from './runtime.ts';
 export {
   IPC_PROTOCOL_VERSION,
+  IPC_VERSION_MISMATCH_EXIT_CODE,
   createChannel,
   encodeMessage,
   fakeTransportPair,

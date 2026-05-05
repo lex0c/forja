@@ -2139,7 +2139,11 @@ describe('runSubagentChild — IPC', () => {
       // only knows v1.
       ipcVersion: 999,
     });
-    expect(exitCode).toBe(1);
+    // Dedicated EX_USAGE exit code (64) — parent's wait loop
+    // maps this to `reason: 'ipc_version_mismatch'` so mixed-
+    // version deployments surface the handshake failure
+    // explicitly instead of as a generic crash.
+    expect(exitCode).toBe(64);
     expect(errMessages.some((s) => s.includes('ipc_version_mismatch'))).toBe(true);
     // Payload row was never inserted because the refusal lands
     // before the harness path. The session row stays in

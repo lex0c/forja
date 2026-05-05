@@ -25,6 +25,18 @@
 
 export const IPC_PROTOCOL_VERSION = 1;
 
+// Exit code the child uses when refusing on protocol version
+// mismatch (spec §4.2 mandates pre-message refusal). The parent's
+// wait loop maps this exit code from a `crashed` outcome (no
+// payload published) to the dedicated `ipc_version_mismatch`
+// reason — without it, mixed-version deployments surface as a
+// generic `subprocess_crashed`, defeating the handshake's
+// diagnostic value exactly when it matters most. 64 is
+// `EX_USAGE` per sysexits.h: the parent invoked the child with
+// a flag (`--ipc=<n>`) the child can't satisfy; that's a usage
+// problem, not a software fault.
+export const IPC_VERSION_MISMATCH_EXIT_CODE = 64;
+
 interface CommonFields {
   // UUID v4 from the emitter. Uniqueness lets request/response
   // pairs (S4 permission proxy) correlate across a single

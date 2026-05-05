@@ -18,6 +18,7 @@ import {
 import { type ToolRegistry, createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import {
   IPC_PROTOCOL_VERSION,
+  IPC_VERSION_MISMATCH_EXIT_CODE,
   type IpcChannel,
   type IpcMessage,
   createChannel,
@@ -1904,11 +1905,24 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       break;
     }
     case 'crashed': {
+      // Distinguish IPC version mismatch from generic crash. The
+      // child refuses with `IPC_VERSION_MISMATCH_EXIT_CODE` BEFORE
+      // sending any IPC message (spec §4.2), so the exit code is
+      // the only signal channel for the startup-refusal case —
+      // the parent's session_start mismatch listener (spec §4.2's
+      // "child sends bad version" path) never fires when the
+      // child gates pre-message. Mapping here closes the loop
+      // for mixed-version deployments where the parent runs a
+      // newer protocol than the child's binary.
+      const reason: RunSubagentResult['reason'] =
+        outcome.exitCode === IPC_VERSION_MISMATCH_EXIT_CODE
+          ? 'ipc_version_mismatch'
+          : 'subprocess_crashed';
       result = {
         output: '',
         sessionId: childSession.id,
         status: 'error',
-        reason: 'subprocess_crashed',
+        reason,
         costUsd: 0,
         steps: 0,
         durationMs: Date.now() - startTs,

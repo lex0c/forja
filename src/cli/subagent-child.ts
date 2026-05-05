@@ -24,6 +24,7 @@ import {
 import { loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import {
   IPC_PROTOCOL_VERSION,
+  IPC_VERSION_MISMATCH_EXIT_CODE,
   type IpcChannel,
   type IpcTransport,
   createChannel,
@@ -253,7 +254,15 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       errSink(
         `forja: subagent-child: ipc_version_mismatch — parent requested ${opts.ipcVersion}, child only speaks ${IPC_PROTOCOL_VERSION}\n`,
       );
-      return 1;
+      // Exit with the dedicated `EX_USAGE` sentinel so the
+      // parent's wait loop can distinguish a version-mismatch
+      // refusal from a generic crash. Spec §4.2 mandates the
+      // child refuses BEFORE emitting any IPC message, so the
+      // exit code is the only signal channel; without this,
+      // mixed-version deployments surface as `subprocess_crashed`
+      // and the handshake's diagnostic value is lost exactly
+      // for the startup-refusal case.
+      return IPC_VERSION_MISMATCH_EXIT_CODE;
     }
     const transport = opts.ipcTransportFactory?.() ?? processTransport();
     ipcChannel = createChannel(transport);
