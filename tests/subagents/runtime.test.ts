@@ -3767,6 +3767,39 @@ describe('runSubagent — review fixes (round 4)', () => {
     expect(result.reason).toBe('ipc_version_mismatch');
   });
 
+  test('exit 64 from non-IPC child stays subprocess_crashed (sentinel gated on effectiveIpc)', async () => {
+    // 64 is EX_USAGE per sysexits.h. The child only returns it
+    // from the version-check refusal, which only runs when
+    // --ipc=<n> was passed. A child invoked WITHOUT --ipc that
+    // happens to exit 64 (a tool called process.exit(64), a
+    // misbehaving binary, etc.) must NOT be mis-stamped as
+    // ipc_version_mismatch — the parent never asked for IPC, so
+    // a version negotiation didn't happen. Gate on effectiveIpc.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake: SpawnChildProcess = () => ({
+      exited: Promise.resolve({ exitCode: 64 }),
+      kill: () => undefined,
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      // ipc: false (omitted) — onChildEvent also absent. Gate
+      // produces effectiveIpc=false → exit 64 stays
+      // subprocess_crashed.
+      spawnChildProcess: fake,
+    });
+    expect(result.reason).toBe('subprocess_crashed');
+  });
+
   test('child crash with non-EX_USAGE exit code stays subprocess_crashed', async () => {
     // Negative case: the EX_USAGE mapping is sentinel-specific.
     // A generic crash (exit 1, SIGSEGV / 139, etc.) must NOT

@@ -206,10 +206,20 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
   // schema dumb, parse on read.
   const toolsJson = JSON.stringify(input.toolsWhitelist);
   const policyJson = JSON.stringify(input.policySnapshot ?? {});
-  // hooks_snapshot is nullable (migration 020): undefined means
-  // "no snapshot taken, child falls back to disk"; an explicit
-  // value (even []) is authoritative.
-  const hooksJson = input.hooksSnapshot !== undefined ? JSON.stringify(input.hooksSnapshot) : null;
+  // hooks_snapshot is nullable (migration 020): undefined OR null
+  // both mean "no snapshot taken, child falls back to disk"; only
+  // an explicit array (even []) is authoritative. The TS type is
+  // `?: readonly HookSpec[]` so null isn't valid statically, but
+  // a JS caller could pass null and `JSON.stringify(null)` would
+  // produce the literal string "null" — a third on-disk state
+  // that would round-trip back as JS null and fall into the
+  // legacy disk-fallback path "by accident". Collapse to SQL
+  // NULL explicitly so the column has exactly two states:
+  // `NULL` (absent) and a JSON array (authoritative).
+  const hooksJson =
+    input.hooksSnapshot !== undefined && input.hooksSnapshot !== null
+      ? JSON.stringify(input.hooksSnapshot)
+      : null;
   db.query(
     `INSERT INTO subagent_runs
        (session_id, name, scope, source_path, source_sha256, system_prompt,

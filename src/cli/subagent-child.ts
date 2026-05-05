@@ -254,6 +254,31 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       errSink(
         `forja: subagent-child: ipc_version_mismatch — parent requested ${opts.ipcVersion}, child only speaks ${IPC_PROTOCOL_VERSION}\n`,
       );
+      // Belt-and-suspenders finalize: the parent's runSubagent
+      // wait loop ALSO finalizes via completeSession near the
+      // end of its outcome handler, so this is redundant on the
+      // happy parent path. But if the parent itself crashes
+      // between spawn and that handler (e.g., the operator's
+      // SIGINT killed the parent process group while the child
+      // was refusing version), the session row would otherwise
+      // sit in 'running' indefinitely. Every other early-refusal
+      // path in this function calls finalizeAsError for the
+      // same reason; the version-mismatch path was the outlier.
+      // Open + close DB just for this finalize since the regular
+      // try/finally hasn't started yet.
+      try {
+        const db = openDb(dbPath);
+        try {
+          migrate(db);
+          completeSession(db, opts.sessionId, 'error', 0, true);
+        } finally {
+          db.close();
+        }
+      } catch {
+        // Best-effort: if the DB is unhealthy or migration
+        // fails, the parent's wait loop is the next safety
+        // net.
+      }
       // Exit with the dedicated `EX_USAGE` sentinel so the
       // parent's wait loop can distinguish a version-mismatch
       // refusal from a generic crash. Spec §4.2 mandates the

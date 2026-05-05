@@ -2146,14 +2146,22 @@ describe('runSubagentChild — IPC', () => {
     expect(exitCode).toBe(64);
     expect(errMessages.some((s) => s.includes('ipc_version_mismatch'))).toBe(true);
     // Payload row was never inserted because the refusal lands
-    // before the harness path. The session row stays in
-    // 'running' — finalizeAsError isn't called either, since
-    // the refusal happens before db.open. Operator-facing
-    // signal is the error envelope on stderr.
+    // before the harness path runs.
     const db = openDb(dbPath);
     try {
       const out = getSubagentOutput(db, sessionId);
       expect(out).toBeNull();
+      // BUT the session row IS finalized (post-fix). Belt-and-
+      // suspenders so a parent crash between spawn and the
+      // wait-loop's finalize wouldn't leak the row as 'running'
+      // — every other early-refusal path in subagent-child
+      // calls finalizeAsError; the version-mismatch path now
+      // matches that pattern.
+      const session = (await import('../../src/storage/repos/sessions.ts')).getSession(
+        db,
+        sessionId,
+      );
+      expect(session?.status).toBe('error');
     } finally {
       db.close();
     }

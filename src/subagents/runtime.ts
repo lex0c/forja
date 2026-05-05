@@ -1621,35 +1621,34 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
   // child and stamp the result reason; the wait loop's
   // outcome handler downstream branches on this flag.
   let ipcVersionMismatch: number | undefined;
+  // SIGKILL escalation timer for the mismatch path. Tracked at
+  // this scope so the `handle.exited.then` handler below can
+  // clear it the moment the child dies — without that, a child
+  // that exits cleanly under SIGTERM would still leave the
+  // unref'd timer pending until `gms` elapses, calling
+  // `handle.kill('SIGKILL')` on a long-dead handle. The throw
+  // is swallowed but the noise is preventable.
+  let mismatchKillTimer: ReturnType<typeof setTimeout> | undefined;
   if (handle.ipc !== undefined) {
-    // Idempotent on the FIRST mismatch only: the listener
-    // unsubscribes itself the moment it fires, so a child that
-    // (regression-bug) sends multiple session_starts won't
-    // re-execute the kill cascade + spawn extra orphan SIGKILL
-    // timers. The flag check is belt-and-suspenders for the
-    // race where a second message slipped past `unsub()`'s
-    // synchronous return.
-    let unsubscribe: (() => void) | undefined;
-    unsubscribe = handle.ipc.onMessage((msg) => {
+    // Idempotent on the FIRST mismatch only: the flag short-
+    // circuits the body so a child that (regression-bug) sends
+    // multiple session_starts won't re-execute the kill
+    // cascade. The previous attempt at self-unsubscribe was
+    // racy — `onMessage` synchronously replays the channel's
+    // pre-subscribe buffer BEFORE returning, so the local
+    // `unsubscribe` reference was still `undefined` when a
+    // buffered mismatched session_start fired. The flag check
+    // is the only correct gate.
+    handle.ipc.onMessage((msg) => {
       if (ipcVersionMismatch !== undefined) return;
       if (msg.type !== 'session_start') return;
-      if (msg.protocolVersion === IPC_PROTOCOL_VERSION) {
-        // Match: we don't need to keep listening for further
-        // session_starts (a well-behaved child sends exactly
-        // one). Drop the subscription so this handler stays a
-        // single-shot.
-        unsubscribe?.();
-        unsubscribe = undefined;
-        return;
-      }
+      if (msg.protocolVersion === IPC_PROTOCOL_VERSION) return;
       // Mismatch: child speaks a version we don't recognize.
       // Record for the result-building branch and tear the
       // child down. Send interrupt:hard so a child that DOES
       // honor the wire (just not the version) still drains
       // cleanly; SIGTERM is the fallback.
       ipcVersionMismatch = msg.protocolVersion;
-      unsubscribe?.();
-      unsubscribe = undefined;
       try {
         handle.ipc?.send(makeInterruptHard());
       } catch {
@@ -1658,8 +1657,8 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       }
       handle.kill('SIGTERM');
       // Belt-and-suspenders SIGKILL escalation. A child that
-      // ignores SIGTERM (custom signal handler, infinite loop in
-      // the harness's exit path) would otherwise block the
+      // ignores SIGTERM (custom signal handler, infinite loop
+      // in the harness's exit path) would otherwise block the
       // parent's wait loop forever — the regular hard-trigger
       // path that schedules SIGKILL only fires when
       // signal.aborted, which a protocol-mismatch caller didn't
@@ -1667,16 +1666,24 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       // default) so the escalation is bounded by the same
       // window as every other kill path.
       const gms = input.graceMs ?? WALL_CLOCK_GRACE_MS;
-      setTimeout(() => {
+      mismatchKillTimer = setTimeout(() => {
         try {
           handle.kill('SIGKILL');
         } catch {
           // Already exited; ignore.
         }
-      }, gms).unref();
+      }, gms);
+      mismatchKillTimer.unref?.();
     });
-  }
-  if (handle.ipc !== undefined) {
+    // Clear the mismatch SIGKILL timer once the child exits —
+    // mirrors the wait loop's own exit-handler cleanup of its
+    // SIGKILL escalation timer.
+    handle.exited.then(() => {
+      if (mismatchKillTimer !== undefined) {
+        clearTimeout(mismatchKillTimer);
+        mismatchKillTimer = undefined;
+      }
+    });
     if (input.onIpcMessage !== undefined) {
       const observer = input.onIpcMessage;
       handle.ipc.onMessage((msg) => {
@@ -1909,13 +1916,21 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       // child refuses with `IPC_VERSION_MISMATCH_EXIT_CODE` BEFORE
       // sending any IPC message (spec §4.2), so the exit code is
       // the only signal channel for the startup-refusal case —
-      // the parent's session_start mismatch listener (spec §4.2's
-      // "child sends bad version" path) never fires when the
-      // child gates pre-message. Mapping here closes the loop
-      // for mixed-version deployments where the parent runs a
-      // newer protocol than the child's binary.
+      // the parent's session_start mismatch listener never fires
+      // when the child gates pre-message. Mapping here closes
+      // the loop for mixed-version deployments where the parent
+      // runs a newer protocol than the child's binary.
+      //
+      // Gate on `effectiveIpc`: a child invoked WITHOUT `--ipc`
+      // never enters the version-check path, so an exit code of
+      // 64 from such a child means the value came from somewhere
+      // else (a tool that called `process.exit(64)`, a build
+      // accidentally returning the EX_USAGE constant). Without
+      // this gate, those would be mis-stamped as version
+      // mismatches even though IPC was off and no version was
+      // negotiated. Tighter sentinel = fewer false positives.
       const reason: RunSubagentResult['reason'] =
-        outcome.exitCode === IPC_VERSION_MISMATCH_EXIT_CODE
+        effectiveIpc && outcome.exitCode === IPC_VERSION_MISMATCH_EXIT_CODE
           ? 'ipc_version_mismatch'
           : 'subprocess_crashed';
       result = {
