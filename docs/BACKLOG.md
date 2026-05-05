@@ -15,6 +15,107 @@ Format:
 
 ---
 
+## [2026-05-05] M3 / refactor — decompose `src/hooks/dispatcher.ts`
+
+New branch `refactor/hooks-dispatcher-decompose` off `develop`.
+The file accumulated to 908 LoC mixing four conceptually-
+separable clusters: the Bun.spawn contract, stdout/stderr
+draining + truncation, hook-spec matching + exit-code
+classification, and platform-aware shell resolution. Apply the
+same R1-style decomposition (R1 closed runtime.ts the day
+before). Suite of 2967 tests green throughout.
+
+**Done:**
+
+- **`dispatcher-spawn.ts` (48 LoC):** `DispatchedProcess`,
+  `SpawnFn`, `SpawnOpts`, and `defaultSpawn`. The contract
+  between dispatcher and Bun.spawn — no shared state with the
+  orchestration loop. Types re-exported from `dispatcher.ts`
+  to preserve the public path the test file imports from.
+
+- **`dispatcher-stream.ts` (82 LoC):** `truncate`, `readStream`,
+  `STREAM_READ_CAP_BYTES`, and `_readStreamForTests`. Pure
+  stdout/stderr utilities with a load-bearing ~50 LoC of
+  buffering rationale (drain-don't-cancel, two-cap layering).
+  `STREAM_READ_CAP_BYTES` and `_readStreamForTests`
+  re-exported.
+
+- **`dispatcher-matching.ts` (69 LoC):** `specMatches`,
+  `matchesPayload`, `classifyExitCode`, and the public
+  `filterMatchingHooks`. Pure functions deciding "does this
+  spec apply?" and "what verdict does this exit code map to?".
+  No state shared with the dispatch loop. `filterMatchingHooks`
+  re-exported.
+
+- **`dispatcher-shell.ts` (246 LoC):** `resolveHookShell`
+  with `splitOverride` / `isCommandLeadingFlag` helpers, the
+  `HookShellResolution` / `ResolveHookShellOpts` contract, and
+  the module-level cache. Self-contained subsystem — every
+  helper here exists for one purpose: pick which shell binary
+  the dispatcher invokes. `getCachedShell` had to become
+  module-public so the dispatch loop can call it across the
+  boundary; `resolveHookShell`, the types, and
+  `_resetHookShellCacheForTests` re-exported.
+
+- **`dispatcher.ts`: 908 → 479 LoC** (cut just under half).
+  Now reads as the spawn → wait → audit pipeline plus the
+  per-event chain orchestration. The four extracted clusters
+  arrive via named imports.
+
+- **Public surface unchanged.** `tests/hooks/dispatcher.test.ts`
+  is the only external consumer; every named import it uses
+  (`STREAM_READ_CAP_BYTES`, `_readStreamForTests`,
+  `dispatchChain`, `dispatchOne`, `filterMatchingHooks`,
+  `resolveHookShell`, plus types `DispatchedProcess`,
+  `HookShellResolution`, `SpawnFn`, `SpawnOpts`) still resolves
+  from `'../../src/hooks/dispatcher.ts'` thanks to re-exports.
+
+- **Bundled biome carry-over.** The R1 closing biome auto-fix
+  (`bg-reaper.ts` import collapse, `runtime.ts` blank-line
+  cleanup) was made locally on the R1 branch but never reached
+  develop — the PR was merged before that commit. Tree lint
+  failed on those two files plus the same patterns in
+  `dispatcher.ts` post-extraction. Bundled the auto-fix here
+  in a single `style:` commit so the tree lints clean again.
+
+**Decisions:**
+
+1. **Same R1 playbook, different file.** The structural
+   pattern — function-monster file with several disconnected
+   clusters — repeats here. Applying the same cut keeps the
+   project's internal style coherent.
+
+2. **`getCachedShell` becomes module-public.** Previously a
+   module-private helper called from the dispatch loop. After
+   moving the shell cluster out, the loop has to reach in.
+   Exporting `getCachedShell` from `dispatcher-shell.ts` is
+   the minimum surface change; alternatives (passing the cache
+   getter through `DispatcherDeps`, threading the resolution
+   per-call) were rejected — they'd touch every caller.
+
+3. **`_readStreamForTests` preserved.** Five test cases import
+   it by name. After the move, `readStream` is necessarily
+   public (dispatcher.ts has to call it across the boundary),
+   making the seam alias redundant. Kept anyway to avoid
+   touching the test file.
+
+4. **Test changes: zero.** Same as R1 — the suite is the
+   contract; rewriting tests for new module paths would prove
+   only that the rewrite is correct, not that the contract
+   held. 2957 pass / 10 skip / 0 fail at every commit.
+
+**Pending:** the `_readStreamForTests` redundancy is a
+candidate for the optional re-export tightening pass (drop
+the alias, update the 5 test sites). Not worth a churn-only
+commit.
+
+**Next:** the next R1-style candidate from the audit ranking
+is `subagents/worktree-gc.ts` (869 LoC, natural split into
+build-phase / apply-phase). Or move on to a feature deliverable
+and let forcing functions surface the next refactor.
+
+---
+
 ## [2026-05-05] M3 / refactor — decompose `src/subagents/runtime.ts`
 
 New branch `refactor/m3-runtime-decompose` off `develop`. The

@@ -260,7 +260,6 @@ export interface RunSubagentInput {
 // a clear error well before the budget caps would.
 export const MAX_SUBAGENT_DEPTH = 4;
 
-
 // Spawn a subagent in a separate Bun subprocess (spec §11:1030).
 // The parent creates the child session row + audit rows, spawns
 // the binary, and waits for the child to publish its terminal
@@ -1063,4 +1062,3 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       : {}),
   };
 };
-
