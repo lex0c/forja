@@ -420,6 +420,68 @@ describe('dispatchOne — audit emission', () => {
     expect(rows[0]?.outcome).toBe('timeout');
     expect(rows[0]?.exitCode).toBe(124);
   });
+
+  test('synchronous spawn throw → error result + audit row (failClosed honored)', async () => {
+    // Sanity-revert: pre-fix, spawn() was called without a
+    // try/catch. A synchronous failure (cwd ENOTDIR, ENOENT,
+    // EACCES, fd exhaustion) propagated out of dispatchOne →
+    // out of dispatchChain → caught by the harness's
+    // dispatchHooks closure as "chain dispatch failed",
+    // returning null. The harness treats null as "no block"
+    // (fail-OPEN), so failClosed=true on a blockable event
+    // was silently bypassed AND no audit row landed for the
+    // failed hook. Forensic queries showed silence.
+    //
+    // Now: spawn throw becomes a normal HookRunResult with
+    // kind='error', shouldBlock=spec.failClosed, exitCode=-1
+    // (synthetic marker), and the audit row IS written so
+    // operators see the spawn failure in /hooks audit.
+    const db = openMemoryDb();
+    migrate(db);
+    const sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+    const throwingSpawn: SpawnFn = () => {
+      throw new Error('ENOTDIR: cwd no longer exists');
+    };
+    const result = await dispatchOne(makeSpec({ failClosed: true }), 0, makePayload(), '/p', {
+      db,
+      sessionId,
+      spawn: throwingSpawn,
+    });
+    expect(result.kind).toBe('error');
+    if (result.kind === 'error') {
+      expect(result.shouldBlock).toBe(true); // failClosed honored
+      expect(result.exitCode).toBe(-1);
+      expect(result.reason).toContain('ENOTDIR');
+    }
+    // Audit row landed.
+    const rows = listHookRunsBySession(db, sessionId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.outcome).toBe('error');
+    expect(rows[0]?.exitCode).toBe(-1);
+    expect(rows[0]?.stderr).toContain('ENOTDIR');
+  });
+
+  test('synchronous spawn throw + failClosed=false → error result, no block', async () => {
+    // Mirror of the above: failClosed=false means
+    // shouldBlock=false, so even on spawn failure the chain
+    // doesn't block. Audit still lands.
+    const db = openMemoryDb();
+    migrate(db);
+    const sessionId = createSession(db, { model: 'm', cwd: '/p' }).id;
+    const throwingSpawn: SpawnFn = () => {
+      throw new Error('EACCES');
+    };
+    const result = await dispatchOne(makeSpec(), 0, makePayload(), '/p', {
+      db,
+      sessionId,
+      spawn: throwingSpawn,
+    });
+    expect(result.kind).toBe('error');
+    if (result.kind === 'error') {
+      expect(result.shouldBlock).toBe(false);
+    }
+    expect(listHookRunsBySession(db, sessionId)).toHaveLength(1);
+  });
 });
 
 // ─── dispatchChain ────────────────────────────────────────────────────

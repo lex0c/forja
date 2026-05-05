@@ -576,13 +576,84 @@ export const dispatchOne = async (
       shouldBlock: false,
     };
   }
-  const proc = spawn([...shell.argv, expanded], {
-    env: buildHookEnv(cwd, deps.sessionId ?? null),
-    cwd,
-    stdin: 'pipe',
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
+  // Audit-emission closure shared by the spawn-failure catch
+  // below AND the normal path further down. Extracted so a
+  // synchronous spawn throw doesn't drop the row that operator
+  // queries (`/hooks audit`) need to forensically diagnose
+  // "why did my hook fail?".
+  const emitAudit = (
+    exitCode: number | null,
+    outcome: HookRunResult['kind'],
+    durationMs: number,
+    stdout: string | null,
+    stderr: string | null,
+  ): void => {
+    if (deps.db === undefined) return;
+    try {
+      const matcherTool =
+        payload.event === 'PreToolUse' || payload.event === 'PostToolUse'
+          ? payload.data.tool.name
+          : null;
+      createHookRun(deps.db, {
+        sessionId: deps.sessionId ?? null,
+        event: spec.event,
+        layer: spec.layer,
+        sourcePath: spec.sourcePath,
+        hookIndex,
+        command: spec.command,
+        expanded,
+        exitCode,
+        outcome,
+        durationMs,
+        stdout,
+        stderr,
+        matchedTool: matcherTool,
+        createdAt: now(),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `hooks: AUDIT DRIFT: failed to record ${spec.event} run (${spec.sourcePath}#${hookIndex}): ${msg}\n`,
+      );
+    }
+  };
+
+  let proc: DispatchedProcess;
+  try {
+    proc = spawn([...shell.argv, expanded], {
+      env: buildHookEnv(cwd, deps.sessionId ?? null),
+      cwd,
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+  } catch (err) {
+    // Synchronous spawn failure. Common causes: `cwd` no
+    // longer exists (ENOTDIR / ENOENT — operator deleted the
+    // directory between session boot and hook dispatch), the
+    // resolved shell binary lost permission since module load
+    // (EACCES), or fd / process-table exhaustion. Without
+    // this catch, the throw propagates up through
+    // dispatchChain into the harness's `dispatchHooks`
+    // try/catch, which converts to `null` (fail-OPEN) — for
+    // blocking events that bypasses `failClosed` AND drops
+    // the expected audit row. Convert to a normal error
+    // HookRunResult so failClosed still gates and forensic
+    // queries see the spawn failure. exit_code -1 is a
+    // synthetic marker (no real process to read from);
+    // operator query `WHERE exit_code = -1` finds these.
+    const durationMs = now() - startedAt;
+    const reason = err instanceof Error ? err.message : String(err);
+    const result: HookRunResult = {
+      kind: 'error',
+      exitCode: -1,
+      reason: `spawn failed: ${reason}`,
+      durationMs,
+      shouldBlock: spec.failClosed,
+    };
+    emitAudit(-1, 'error', durationMs, null, reason);
+    return result;
+  }
 
   // Write the JSON payload to stdin and close. Process can
   // ignore it; that's fine. Stdin write errors are swallowed —
@@ -674,42 +745,16 @@ export const dispatchOne = async (
       ? { kind: 'timeout', timeoutMs: effectiveTimeoutMs, shouldBlock: spec.failClosed }
       : classifyExitCode(exitCode, stdout, durationMs, spec.failClosed);
 
-  // Emit audit row. Best-effort try/catch — DB failure must
-  // not invalidate the hook's decision (the operator's
-  // shell command already ran and returned).
-  if (deps.db !== undefined) {
-    try {
-      const matcherTool =
-        payload.event === 'PreToolUse' || payload.event === 'PostToolUse'
-          ? payload.data.tool.name
-          : null;
-      createHookRun(deps.db, {
-        sessionId: deps.sessionId ?? null,
-        event: spec.event,
-        layer: spec.layer,
-        sourcePath: spec.sourcePath,
-        hookIndex,
-        command: spec.command,
-        expanded,
-        // CONTRACTS.md §3 line 725: timeouts record exit_code
-        // 124 (POSIX `timeout(1)` convention). exitCode is
-        // already 124 in the timeout branch above; pass through.
-        exitCode,
-        outcome: result.kind,
-        durationMs,
-        stdout: stdout.length > 0 ? stdout : null,
-        stderr: stderr.length > 0 ? stderr : null,
-        matchedTool: matcherTool,
-        createdAt: now(),
-      });
-    } catch (err) {
-      // AUDIT DRIFT — same pattern as memory registry.
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(
-        `hooks: AUDIT DRIFT: failed to record ${spec.event} run (${spec.sourcePath}#${hookIndex}): ${msg}\n`,
-      );
-    }
-  }
+  // CONTRACTS.md §3 line 725: timeouts record exit_code 124
+  // (POSIX `timeout(1)` convention). exitCode is already 124
+  // in the timeout branch above; pass through.
+  emitAudit(
+    exitCode,
+    result.kind,
+    durationMs,
+    stdout.length > 0 ? stdout : null,
+    stderr.length > 0 ? stderr : null,
+  );
 
   return result;
 };
