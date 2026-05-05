@@ -366,6 +366,17 @@ const isCommandLeadingFlag = (token: string): boolean => {
   // dispatch is exotic — happy-path operators don't trip on
   // this.
   if (token === '-c' || token === '-C') return true;
+  // POSIX combined short flags. `bash -lc "cmd"` parses as
+  // `-l` (login shell) + `-c` (command), and the `-c` portion
+  // still consumes the next arg as command text. Other common
+  // forms in the wild: `-ic` (interactive + command), `-clm`,
+  // `-cl`. Any group of dash-prefixed letters that contains a
+  // LOWERCASE `c` is command-leading. Case-sensitive on `c`
+  // because `-C` is bash's noclobber, not a command flag, so
+  // `-Cl` / `-CC` should NOT trip. Length > 2 skips the lone
+  // `-c` already handled above and the `-x`-style single
+  // flags (`-i`, `-l`, `-x`).
+  if (token.length > 2 && /^-[a-zA-Z]*c[a-zA-Z]*$/.test(token)) return true;
   // cmd.exe case-insensitive `/c` / `/k`.
   if (/^\/[ck]$/i.test(token)) return true;
   // Powershell long-form, case-insensitive.

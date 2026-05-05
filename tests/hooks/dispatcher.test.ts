@@ -1106,6 +1106,68 @@ describe('resolveHookShell', () => {
     }
   });
 
+  test('combined POSIX flag -lc with command text is rejected (sanity-revert)', async () => {
+    // Sanity-revert: pre-fix, isCommandLeadingFlag only matched
+    // exact `-c` / `-C`. `bash -lc "echo hi"` parsed as
+    // ['bash', '-lc', 'echo hi']; -lc bypassed the check; the
+    // appended hook command became $0 (positional, ignored)
+    // and every dispatch silently ran `echo hi`. POSIX
+    // combined-short-flag groups containing lowercase `c`
+    // (`-lc`, `-ic`, `-cl`, `-clm`, etc.) ARE command-leading
+    // — the `-c` part still consumes the next arg.
+    const r = resolveHookShell({
+      platform: 'linux',
+      which: (b) => (b === 'bash' ? '/bin/bash' : null),
+      env: { FORJA_HOOK_SHELL: 'bash -lc "echo hi"' },
+    });
+    expect(r.kind).toBe('unavailable');
+    if (r.kind === 'unavailable') {
+      expect(r.reason).toContain("'-lc'");
+    }
+  });
+
+  test('combined POSIX flag -ic with command text is rejected', async () => {
+    const r = resolveHookShell({
+      platform: 'linux',
+      which: (b) => (b === 'bash' ? '/bin/bash' : null),
+      env: { FORJA_HOOK_SHELL: 'bash -ic "stuff"' },
+    });
+    expect(r.kind).toBe('unavailable');
+    if (r.kind === 'unavailable') {
+      expect(r.reason).toContain("'-ic'");
+    }
+  });
+
+  test('combined flag -lc as LAST token (canonical) is accepted', async () => {
+    // Operator wants login + command shell; appending the
+    // hook command after `-lc` is the documented contract.
+    // `bash -lc <expanded>` runs the hook in a login shell.
+    const r = resolveHookShell({
+      platform: 'linux',
+      which: (b) => (b === 'bash' ? '/bin/bash' : null),
+      env: { FORJA_HOOK_SHELL: 'bash -lc' },
+    });
+    expect(r.kind).toBe('posix');
+    if (r.kind === 'posix') {
+      expect(r.argv).toEqual(['/bin/bash', '-lc']);
+    }
+  });
+
+  test('non-command flag combinations (no lowercase c) NOT rejected', async () => {
+    // `-il` (interactive + login), `-Cl` (-C noclobber + -l
+    // login), `-ix` (interactive + xtrace) — none consume the
+    // next arg as command. Should pass through.
+    const r = resolveHookShell({
+      platform: 'linux',
+      which: (b) => (b === 'bash' ? '/bin/bash' : null),
+      env: { FORJA_HOOK_SHELL: 'bash -il -Cl -c' },
+    });
+    expect(r.kind).toBe('posix');
+    if (r.kind === 'posix') {
+      expect(r.argv).toEqual(['/bin/bash', '-il', '-Cl', '-c']);
+    }
+  });
+
   test('FORJA_HOOK_SHELL=cmd.exe /k honors operator-specified flag', () => {
     // When the operator passes a flag explicitly, we DO NOT
     // override it — `/k` (keep cmd open after running) is a
