@@ -55,14 +55,22 @@ const previewCommand = (cmd: string): string => {
   return `${cmd.slice(0, COMMAND_PREVIEW_LIMIT - 1)}…`;
 };
 
-const formatHook = (h: HookSpec, idx: number): string => {
+const formatHook = (h: HookSpec): string => {
+  // Index label uses the spec's `entryIndex` — the position in
+  // the originating hooks.toml — NOT a loop counter. Audit rows
+  // (`hook_runs.hook_index`) carry the same value, so `<source>
+  // #<displayed-n>` references survive filters and layer
+  // grouping. An earlier cut labeled with `inLayer.forEach`'s
+  // index, which reset per layer AND per filter, making the
+  // displayed `[n]` diverge from the audit-row index whenever
+  // the operator narrowed the view.
   const matcherFrag = h.matcher.tool !== undefined ? ` matcher=tool:${h.matcher.tool}` : '';
   const flags: string[] = [];
   if (h.locked) flags.push('locked');
   if (h.failClosed) flags.push('fail_closed');
   const flagFrag = flags.length > 0 ? ` [${flags.join(',')}]` : '';
   const timeoutFrag = ` timeout=${h.timeoutMs}ms`;
-  return `  [${idx}] ${h.event}${matcherFrag}${timeoutFrag}${flagFrag}\n      cmd: ${previewCommand(h.command)}\n      from: ${h.sourcePath}`;
+  return `  [${h.entryIndex}] ${h.event}${matcherFrag}${timeoutFrag}${flagFrag}\n      cmd: ${previewCommand(h.command)}\n      from: ${h.sourcePath}`;
 };
 
 const handleSummary = (hooks: readonly HookSpec[]): SlashResult => {
@@ -172,9 +180,9 @@ const handleList = (hooks: readonly HookSpec[], args: readonly string[]): SlashR
     const inLayer = filtered.filter((h) => h.layer === layer);
     if (inLayer.length === 0) continue;
     lines.push(`  ${layer}:`);
-    inLayer.forEach((h, i) => {
-      lines.push(formatHook(h, i));
-    });
+    for (const h of inLayer) {
+      lines.push(formatHook(h));
+    }
   }
   return { kind: 'ok', notes: lines };
 };

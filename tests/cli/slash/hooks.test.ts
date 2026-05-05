@@ -170,6 +170,32 @@ describe('/hooks list', () => {
     }
   });
 
+  test('[index] label uses spec.entryIndex (matches audit hook_index)', async () => {
+    // Sanity-revert: an earlier cut labeled rows with the
+    // post-filter loop counter, so an operator filtering by
+    // --event would see [0] for a hook whose audit row carried
+    // hook_index=1 (the source-file position). Operators
+    // correlating a `hook_runs` row to its config entry would
+    // hit the wrong rule. Fix uses spec.entryIndex (the same
+    // value dispatchOne writes to hook_runs), so `<source>#<n>`
+    // references stay consistent across filters.
+    const { ctx } = makeCtx([
+      // Source layout: PreToolUse at index 0, Stop at index 1
+      // — same hooks.toml file, two events.
+      baseSpec({ event: 'PreToolUse', command: 'a', entryIndex: 0 }),
+      baseSpec({ event: 'Stop', command: 'b', entryIndex: 1 }),
+    ]);
+    const r = await hooksCommand.exec(['list', '--event', 'Stop'], ctx);
+    expect(r.kind).toBe('ok');
+    if (r.kind === 'ok') {
+      const text = r.notes?.join('\n') ?? '';
+      // Filtered output must still show [1] (source position),
+      // not [0] (post-filter loop index).
+      expect(text).toContain('[1] Stop');
+      expect(text).not.toContain('[0] Stop');
+    }
+  });
+
   test('locked + fail_closed flags surface', async () => {
     const { ctx } = makeCtx([
       baseSpec({
