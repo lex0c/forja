@@ -1,0 +1,20 @@
+name: UserPromptSubmit hook block aborts the turn
+prompt: |
+  Use the write_file tool to create `out.txt` with content `landed`.
+setup:
+  files:
+    .agent/permissions.yaml: |
+      defaults:
+        mode: bypass
+    .agent/hooks.toml: |
+      [[hooks]]
+      event = "UserPromptSubmit"
+      command = "exit 1"
+expect:
+  - tool_not_called: write_file
+  - file_not_exists: out.txt
+  - exit_reason: userPromptBlocked
+  - status: interrupted
+budget:
+  maxSteps: 5
+  maxCostUsd: 0.10

@@ -352,6 +352,75 @@ describe('run end-to-end with mock provider', () => {
     expect(errLines.join('')).toContain('[plan mode]');
   });
 
+  test('hook config warnings are surfaced to errSink before the run starts', async () => {
+    // Project-level hooks.toml with one valid entry + one invalid
+    // (bad event name). Loader drops the invalid one and emits a
+    // warning; run() must surface it on stderr so the operator
+    // sees their config dropped silently otherwise.
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    fs.mkdirSync(path.join(workdir, '.agent'), { recursive: true });
+    fs.writeFileSync(
+      path.join(workdir, '.agent/hooks.toml'),
+      [
+        '[[hooks]]',
+        'event = "Stop"',
+        'command = "true"',
+        '',
+        '[[hooks]]',
+        'event = "TotallyNotAnEvent"',
+        'command = "true"',
+        '',
+      ].join('\n'),
+    );
+
+    const { renderer } = recordingRenderer();
+    const errLines: string[] = [];
+    await run({
+      args: baseArgs(),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'ok' }]),
+        dbPath,
+        cwd: workdir,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: renderer,
+      errSink: (s) => errLines.push(s),
+    });
+    const all = errLines.join('');
+    expect(all).toContain('hook');
+    expect(all).toContain('TotallyNotAnEvent');
+    expect(all).toContain('project');
+  });
+
+  test('hook warnings suppressed in JSON mode (NDJSON contract)', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    fs.mkdirSync(path.join(workdir, '.agent'), { recursive: true });
+    fs.writeFileSync(
+      path.join(workdir, '.agent/hooks.toml'),
+      ['[[hooks]]', 'event = "BadEvent"', 'command = "true"', ''].join('\n'),
+    );
+
+    const { renderer } = recordingRenderer();
+    const errLines: string[] = [];
+    await run({
+      args: baseArgs({ json: true }),
+      bootstrapOverride: {
+        providerOverride: mockProvider([{ text: 'ok' }]),
+        dbPath,
+        cwd: workdir,
+      },
+      signal: new AbortController().signal,
+      rendererOverride: renderer,
+      errSink: (s) => errLines.push(s),
+    });
+    // No `forja: ... hook ...` line in JSON mode (admin warnings
+    // are suppressed so NDJSON consumers parsing stderr don't see
+    // free-form text mixed with JSON lines).
+    expect(errLines.join('')).not.toContain('hook');
+  });
+
   test('lock conflicts are surfaced to errSink before the run starts', async () => {
     // Stage a layered policy where enterprise locks tools.bash and
     // a project file tries to override it. run() should print one

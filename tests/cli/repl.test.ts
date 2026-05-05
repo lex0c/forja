@@ -115,6 +115,7 @@ const makeBootstrapStub = (
     policyLayers: [],
     lockConflicts: [],
     subagents: { byName: new Map(), shadows: [] } as unknown as BootstrapResult['subagents'],
+    hookWarnings: [],
   };
 };
 

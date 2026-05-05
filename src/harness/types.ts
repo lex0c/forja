@@ -1,3 +1,4 @@
+import type { HookSpec } from '../hooks/index.ts';
 import type { MemoryRegistry } from '../memory/index.ts';
 import type { Decision, PermissionEngine } from '../permissions/index.ts';
 import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
@@ -211,7 +212,8 @@ export type ExitReason =
   | 'aborted' // user cancelled via signal
   | 'providerError' // unrecoverable provider failure (network, 4xx)
   | 'internalError' // uncaught throw in the harness path (typically SQLite)
-  | 'scriptExhausted'; // mock provider drained — only seen in tests
+  | 'scriptExhausted' // mock provider drained — only seen in tests
+  | 'userPromptBlocked'; // a UserPromptSubmit hook refused this turn
 
 export interface HarnessConfig {
   provider: Provider;
@@ -408,6 +410,13 @@ export interface HarnessConfig {
   // operator a second look at the content before the
   // cross-session blast hits.
   confirmMemoryUserScope?: (req: ConfirmMemoryUserScopeRequest) => Promise<MemoryWriteAnswer>;
+  // Hook specs resolved at boot (spec AGENTIC_CLI.md §10). Already
+  // ordered enterprise → user → project; the dispatcher iterates
+  // in order and short-circuits on first block (for blocking
+  // events). Empty/undefined = no hooks; all dispatch sites turn
+  // into a no-op filter — no perf cost beyond an empty array
+  // walk.
+  hooks?: readonly HookSpec[];
 }
 
 // Producer-facing args for `confirmMemoryWrite`. Mirrors

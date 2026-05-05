@@ -1,6 +1,12 @@
 import { join } from 'node:path';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
 import {
+  type HookConfigWarning,
+  resolveHookConfig,
+  resolveHookPaths,
+  resolveHookShell,
+} from '../hooks/index.ts';
+import {
   createMemoryRegistry,
   evaluateBootTriggers,
   gcExpiredMemories,
@@ -87,6 +93,12 @@ export interface BootstrapResult {
   // `byName` for resolution. Empty when no .md files are found
   // anywhere.
   subagents: SubagentSet;
+  // Per-layer warnings emitted by the hooks loader (spec
+  // AGENTIC_CLI.md §10.4): missing matcher fields, unknown event
+  // names, locked-section conflicts, parse errors. Empty in the
+  // happy path. CLI driver renders them on stderr alongside the
+  // policy lockConflicts warnings.
+  hookWarnings: readonly HookConfigWarning[];
 }
 
 // Build a HarnessConfig from environment + cwd + args. This is the main
@@ -167,6 +179,7 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
 
   let resolvedSystemPrompt: string | undefined;
   let memoryRegistry: ReturnType<typeof createMemoryRegistry>;
+  let resolvedHooks: ReturnType<typeof resolveHookConfig>;
   try {
     migrate(db);
 
@@ -249,6 +262,42 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
       bootContext,
     });
     resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text);
+
+    // Hooks subsystem (spec AGENTIC_CLI.md §10). Resolved inside
+    // the same try-block as memory so any throw — TOML parse
+    // error, fs EACCES on the user-scope hook file, etc. — is
+    // funneled into db.close() before the rethrow. Otherwise
+    // the SQLite handle (and its WAL files) leak. Reuses the
+    // `repoRoot` already computed for memory; the project layer
+    // probes `<repoRoot>/.agent/hooks.toml`.
+    const hookPaths = resolveHookPaths(repoRoot);
+    resolvedHooks = resolveHookConfig(hookPaths);
+    // Probe the shell the dispatcher will use. If hooks are
+    // configured but no usable shell is on PATH (Windows host
+    // without Git Bash / WSL / cmd.exe — exotic but possible
+    // in some container builds), synthesize a HookConfigWarning
+    // so the CLI driver surfaces the cause on stderr alongside
+    // the loader warnings. Without this signal, an operator
+    // configures hooks, hits the dispatcher's shell-unavailable
+    // short-circuit, and sees mysteriously-skipped hooks with
+    // no audit row to debug from.
+    if (resolvedHooks.hooks.length > 0) {
+      const shell = resolveHookShell();
+      if (shell.kind === 'unavailable') {
+        resolvedHooks = {
+          ...resolvedHooks,
+          warnings: [
+            ...resolvedHooks.warnings,
+            {
+              kind: 'shell_unavailable',
+              layer: null,
+              sourcePath: '<host>',
+              message: `${resolvedHooks.hooks.length} hook(s) loaded but no shell available: ${shell.reason} — hooks will be skipped at dispatch`,
+            },
+          ],
+        };
+      }
+    }
   } catch (e) {
     db.close();
     throw e;
@@ -302,6 +351,12 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     subagentRegistry: subagents,
     memoryRegistry,
     isCwdTrusted,
+    // Hooks resolved at boot (spec AGENTIC_CLI.md §10). When the
+    // list is empty (no config files exist) we still pass the
+    // empty array — the harness's loop is unconditional, the
+    // chain-filter is the no-op when there are no hooks for the
+    // event.
+    hooks: resolvedHooks.hooks,
     ...(input.budget !== undefined ? { budget: input.budget } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.plan === true ? { planMode: true } : {}),
@@ -319,5 +374,6 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     policyLayers,
     lockConflicts: resolved.lockConflicts,
     subagents,
+    hookWarnings: resolvedHooks.warnings,
   };
 };

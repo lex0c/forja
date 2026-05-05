@@ -373,6 +373,17 @@ export const executeCase = async (
             decisions.push({ toolUseId: e.toolUseId, kind: e.decision.kind });
             return;
           }
+          // tool_finished.denied catches denial paths the engine
+          // alone doesn't model: confirm_no (engine returned
+          // confirm, user said no) and hook block (engine
+          // returned allow, PreToolUse hook refused). Without
+          // this branch, an eval `tool_denied` expectation
+          // would silently fail for those paths even though the
+          // tool truly did not run.
+          if (e.type === 'tool_finished' && e.denied === true) {
+            decisions.push({ toolUseId: e.toolUseId, kind: 'deny' });
+            return;
+          }
           if (e.type === 'compaction_finished') {
             compactions.push({ strategy: e.strategy });
             return;

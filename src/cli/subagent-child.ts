@@ -1,4 +1,5 @@
 import { type HarnessResult, runAgent } from '../harness/index.ts';
+import { resolveHookConfig, resolveHookPaths } from '../hooks/index.ts';
 import {
   createMemoryRegistry,
   evaluateBootTriggers,
@@ -529,6 +530,27 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text) ?? '';
     }
 
+    // Hooks subsystem (spec AGENTIC_CLI.md §10). The subprocess
+    // subagent re-resolves the same three-layer hook hierarchy
+    // the parent uses — without this, an enterprise `locked:
+    // true` PreToolUse hook protecting `bash` is enforced in
+    // the parent but bypassed by every `task`-spawned child
+    // (defeating the §10 unbypassable-corp-policy claim). Anchor
+    // the project layer at the PARENT's cwd via `memoryCwd`
+    // (when forwarded) or fall back to `session.cwd`. Same
+    // shape as the memory anchor: the project's hooks.toml
+    // belongs to the repo the operator configured, not to a
+    // worktree. Warnings surface on stderr alongside the
+    // permission/policy ones; AUDIT DRIFT-style failures stay
+    // local to the dispatcher.
+    const hookAnchor = opts.memoryCwd !== undefined ? opts.memoryCwd : session.cwd;
+    const hookRepoRoot = resolveRepoRoot(hookAnchor);
+    const resolvedHooks = resolveHookConfig(resolveHookPaths(hookRepoRoot));
+    for (const w of resolvedHooks.warnings) {
+      const layerFrag = w.layer !== null ? `${w.layer} ` : '';
+      errSink(`forja: subagent-child: ${layerFrag}hook ${w.sourcePath}: ${w.message}\n`);
+    }
+
     const config = {
       provider,
       toolRegistry: childRegistry,
@@ -611,6 +633,13 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // Conditional spread: omitted ⇒ registry stays undefined
       // ⇒ memory tools surface `registry_unavailable`.
       ...(memoryRegistry !== undefined ? { memoryRegistry } : {}),
+      // Hook chain resolved above. Always passed (even when
+      // empty) — the harness's dispatch sites short-circuit on
+      // empty arrays. Locked enterprise hooks reach the
+      // subagent through the same hooks.toml the parent loaded
+      // (re-resolved here from the same repo root, so config
+      // staleness across spawn isn't a concern).
+      hooks: resolvedHooks.hooks,
     };
 
     const result = await runAgent(config);

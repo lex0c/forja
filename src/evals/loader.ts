@@ -238,18 +238,21 @@ const parseExpectation = (raw: unknown, idx: number): EvalExpectation => {
     case 'exit_reason': {
       const reason = requireString(r.exit_reason, `expect[${idx}].exit_reason`);
       // Mirror of harness types.ExitReason; kept inline to avoid
-      // pulling the union into runtime.
+      // pulling the union into runtime. Stay in sync with
+      // src/harness/types.ts when ExitReason grows.
       const valid = new Set([
         'done',
         'maxSteps',
         'maxWallClockMs',
         'maxOutputTokens',
+        'maxCostUsd',
         'maxToolErrors',
         'degenerateLoop',
         'aborted',
         'providerError',
         'internalError',
         'scriptExhausted',
+        'userPromptBlocked',
       ]);
       if (!valid.has(reason)) {
         throw new Error(
@@ -263,12 +266,14 @@ const parseExpectation = (raw: unknown, idx: number): EvalExpectation => {
           | 'maxSteps'
           | 'maxWallClockMs'
           | 'maxOutputTokens'
+          | 'maxCostUsd'
           | 'maxToolErrors'
           | 'degenerateLoop'
           | 'aborted'
           | 'providerError'
           | 'internalError'
-          | 'scriptExhausted',
+          | 'scriptExhausted'
+          | 'userPromptBlocked',
       };
     }
     case 'output_contains':

@@ -151,7 +151,7 @@ describe('dispatch', () => {
 });
 
 describe('createBuiltinRegistry', () => {
-  test('contains all 11 builtins', () => {
+  test('contains all 12 builtins', () => {
     const r = createBuiltinRegistry();
     const names = r.list().map((c) => c.name);
     expect(names).toEqual([
@@ -166,6 +166,7 @@ describe('createBuiltinRegistry', () => {
       'perms',
       'history',
       'memory',
+      'hooks',
     ]);
   });
 
@@ -176,7 +177,7 @@ describe('createBuiltinRegistry', () => {
     if (help === undefined) return;
     const result = await help.exec([], makeCtx().ctx);
     if (result.kind !== 'ok') return;
-    // 11 commands → header + 11 rows + blank + emergency-exit footer = 14.
-    expect(result.notes?.length).toBe(14);
+    // 12 commands → header + 12 rows + blank + emergency-exit footer = 15.
+    expect(result.notes?.length).toBe(15);
   });
 });

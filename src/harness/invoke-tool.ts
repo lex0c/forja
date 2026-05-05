@@ -1,3 +1,4 @@
+import type { HookChainResult, HookEventPayload } from '../hooks/index.ts';
 import type { Decision, PermissionEngine, ToolArgs } from '../permissions/index.ts';
 import type { ProviderToolResultBlock } from '../providers/index.ts';
 import { sanitizeToolOutput, stripAnsi } from '../sanitize/index.ts';
@@ -61,6 +62,15 @@ export interface InvokeToolDeps {
   // Loop already has the signal; threads it here so the abort
   // propagates one level deeper.
   signal?: AbortSignal;
+  // Hook chain dispatch — generic per-event funnel built in
+  // loop.ts. invoke-tool.ts calls this for events that originate
+  // inside its scope (Notification on permission modal,
+  // PreToolUse / PostToolUse). Returns the chain's `blockedBy`
+  // for blocking events (PreToolUse) so the caller can short-
+  // circuit; non-blocking sites just void the promise. Returns
+  // null when no hooks are configured or the dispatcher itself
+  // failed (fail-open per spec line 1057).
+  fireHook?: (payload: HookEventPayload) => Promise<HookChainResult | null>;
 }
 
 export interface InvokeToolResult {
@@ -361,7 +371,15 @@ export const invokeTool = async (
       decidedBy: 'policy',
       reason: decision.reason ?? null,
     });
-    startToolCall(deps.db, toolCall.id);
+    // startToolCall is INTENTIONALLY deferred until after the
+    // PreToolUse hook chain runs (further below). Calling it here
+    // would put the row in `running` while the hooks are still
+    // dispatching; if a hook then blocks, the row would
+    // transition `running → denied` — an honest reading of the
+    // audit table, but `running` implies "tool body executed"
+    // (matches the comment in tool-calls.ts:90). Deferring keeps
+    // the lifecycle: pending → denied (hook-blocked) OR
+    // pending → running → done/error (normal completion).
     return { phase: 'started', toolCall };
   });
 
@@ -410,6 +428,26 @@ export const invokeTool = async (
     // denied — no two-step "Esc out of modal then signal-check"
     // dance. The catch collapses both rejection paths (callback
     // throw, abort) to a denied answer.
+    // Notification hook (spec AGENTIC_CLI.md §10.1, table:
+    // permission_prompt). Fired BEFORE the modal opens so the
+    // operator's hook (desktop notify, slack ping, etc.) can
+    // alert them that a confirmation is pending. Fire-and-forget
+    // per spec line 1041 — we don't want a slow notification
+    // command to delay the modal that's about to appear, since
+    // the operator is sitting in front of the terminal already.
+    // No await; the dispatcher's per-hook timeout still bounds
+    // each child process's wall clock.
+    if (deps.fireHook !== undefined) {
+      void deps.fireHook({
+        schema: 'v1',
+        event: 'Notification',
+        sessionId: deps.ctx.sessionId,
+        data: {
+          kind: 'permission_prompt',
+          message: `permission requested: ${input.toolName}`,
+        },
+      });
+    }
     let answer = false;
     try {
       answer = await raceAgainstAbort(
@@ -457,22 +495,90 @@ export const invokeTool = async (
         decision,
       };
     }
-    // User approved — record the approval and start the call so the
-    // execution path below treats it like the policy-allow case.
-    // Approval reason left null: the decision (`confirm_yes` by user)
-    // is self-explanatory; engine prompt belongs in the deny path.
-    withTransaction(deps.db, () => {
-      recordApproval(deps.db, {
-        toolCallId: callId,
-        decision: 'confirm_yes',
-        decidedBy: 'user',
-        reason: null,
-      });
-      startToolCall(deps.db, callId);
+    // User approved — record the approval so the execution path
+    // below treats it like the policy-allow case. Approval reason
+    // left null: the decision (`confirm_yes` by user) is self-
+    // explanatory; engine prompt belongs in the deny path.
+    // startToolCall is deferred to the post-PreToolUse step
+    // (same rationale as the policy-allow branch above).
+    recordApproval(deps.db, {
+      toolCallId: callId,
+      decision: 'confirm_yes',
+      decidedBy: 'user',
+      reason: null,
     });
   }
 
   const toolCall = setup.toolCall;
+
+  // PreToolUse hook chain (spec AGENTIC_CLI.md §10.1, blocking).
+  // Fires AFTER the permission engine allowed (or user confirmed)
+  // but BEFORE the tool runs. First-block-wins (CONTRACTS.md §10
+  // line 1046). When a hook blocks:
+  //   - record a second approval row (decidedBy='hook',
+  //     decision='deny') so the audit trail shows BOTH the policy
+  //     allow AND the hook deny — operator can grep approvals to
+  //     find hook-blocked tool calls.
+  //   - finishToolCall with status='denied' so the row's terminal
+  //     state matches the outcome.
+  //   - return failed=true, denied=true so the loop's tool-error
+  //     budget counts this against the model just like a policy
+  //     deny.
+  // The engine `decision` returned by invokeTool stays as the
+  // engine's decision (allow / confirm_yes); `denied=true` is the
+  // discriminator the loop / renderer reads.
+  if (deps.fireHook !== undefined) {
+    const chain = await deps.fireHook({
+      schema: 'v1',
+      event: 'PreToolUse',
+      sessionId: deps.ctx.sessionId,
+      data: {
+        tool: { name: input.toolName, input: input.args },
+      },
+    });
+    if (chain !== null && chain.blockedBy !== null) {
+      const block = chain.blockedBy;
+      // Audit reason: identifies which hook blocked + the layer
+      // it came from. Useful for `agent audit approvals` queries.
+      const auditReason = `blocked by ${block.spec.layer} hook ${block.spec.sourcePath}: ${block.message ?? '(silent)'}`;
+      // Model-facing message: the operator's stdout when present
+      // (block_message), otherwise a generic denial. Keeping
+      // "denied by hook" prefix lets the model recognize the
+      // refusal as policy-shaped (not a tool error to retry).
+      const modelMessage =
+        block.reason === 'message' && block.message !== null && block.message.length > 0
+          ? `denied by hook: ${block.message}`
+          : 'denied by hook';
+      withTransaction(deps.db, () => {
+        recordApproval(deps.db, {
+          toolCallId: toolCall.id,
+          decision: 'deny',
+          decidedBy: 'hook',
+          reason: auditReason,
+        });
+        finishToolCall(deps.db, {
+          id: toolCall.id,
+          status: 'denied',
+          durationMs: Date.now() - start,
+          error: auditReason,
+        });
+      });
+      return {
+        toolResult: buildErrorBlock(input.toolUseId, input.toolName, modelMessage),
+        toolCallId: toolCall.id,
+        durationMs: Date.now() - start,
+        failed: true,
+        denied: true,
+        decision,
+      };
+    }
+  }
+
+  // PreToolUse passed (or no hooks configured) — flip the row to
+  // `running`. From this point on, the tool body executes and the
+  // tool_call lifecycle reaches a terminal state via finishToolCall
+  // below.
+  startToolCall(deps.db, toolCall.id);
 
   let rawResult: unknown;
   let crashed = false;
@@ -493,6 +599,31 @@ export const invokeTool = async (
 
   const duration = Date.now() - start;
 
+  // PostToolUse hook chain (spec AGENTIC_CLI.md §10.1, log-only).
+  // Fires AFTER tool execution AND AFTER the tool_call row's
+  // terminal status is persisted. Fire-and-forget per spec line
+  // 1041 — non-blocking, can't undo the tool. Hook receives the
+  // sanitized output + a `failed` flag so the operator can
+  // distinguish "tool ran successfully" from "tool errored" in
+  // forensic / metrics scripts. Sanitized (post-stripAnsi) output
+  // matches what the model + audit row see.
+  const firePostToolUse = (failed: boolean): void => {
+    if (deps.fireHook === undefined) return;
+    void deps.fireHook({
+      schema: 'v1',
+      event: 'PostToolUse',
+      sessionId: deps.ctx.sessionId,
+      data: {
+        tool: {
+          name: input.toolName,
+          input: input.args,
+          output: result,
+          failed,
+        },
+      },
+    });
+  };
+
   if (isToolError(result) || crashed) {
     const err = result as ToolError;
     finishToolCall(deps.db, {
@@ -502,6 +633,7 @@ export const invokeTool = async (
       durationMs: duration,
       error: err.error_message,
     });
+    firePostToolUse(true);
     return {
       toolResult: buildErrorBlock(input.toolUseId, input.toolName, JSON.stringify(err)),
       toolCallId: toolCall.id,
@@ -517,6 +649,7 @@ export const invokeTool = async (
     output: result,
     durationMs: duration,
   });
+  firePostToolUse(false);
   return {
     toolResult: {
       type: 'tool_result',

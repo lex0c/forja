@@ -15,6 +15,473 @@ Format:
 
 ---
 
+## [2026-05-04] M3 / impl — hooks Slice 5: /hooks slash command + locked enforcement E2E
+
+Same branch (`feat/m3-hooks`). Closes the hooks subsystem per spec
+AGENTIC_CLI.md §10. Adds the operator-facing introspection surface
+(`/hooks` with `list` + `audit` subcommands) and an end-to-end test
+that exercises the three meanings of `locked`. After this slice
+the hooks subsystem is feature-complete; ready to merge.
+
+**Done:**
+
+- **`/hooks` slash command** (`src/cli/slash/commands/hooks.ts`):
+  - Bare `/hooks` → summary: total count, by-layer counts, by-
+    event counts, hint to the two subcommands.
+  - `/hooks list [--layer <l>] [--event <e>]` → grouped listing
+    in resolution order (enterprise → user → project) with
+    `event`, `matcher.tool`, `timeout`, locked / fail_closed
+    flags, command preview (truncated at 60 chars), source path.
+    Filters reject unknown layers / events with a usage error
+    instead of silently applying bogus values.
+  - `/hooks audit [--session] [--event <e>] [--limit N]` →
+    recent `hook_runs` rows, newest first. Default limit 20,
+    cap 200. `--session` scopes to the current REPL session via
+    `currentSessionId()`; surfaces "no session yet" when run
+    before the first turn instead of silently dumping cross-
+    session rows.
+  - Read-only by design — mutations go through the on-disk
+    `hooks.toml` hierarchy. Mirrors the `/perms` and `/memory`
+    pattern.
+
+- **Registered in `createBuiltinRegistry`** alongside the other
+  11 builtins (now 12). Help command picks it up via the closure
+  pattern automatically. Existing dispatch test bumped to expect
+  12 rows.
+
+- **Locked-enforcement E2E** (`tests/hooks/locked-enforcement.test.ts`,
+  9 cases). Real on-disk hooks.toml fixtures across three
+  isolated subdirs (passed explicitly to `resolveHookConfig` so
+  the runner's own /etc/agent / ~/.config/agent files don't
+  pollute). Coverage:
+  - Config layer: enterprise can declare `locked: true`; user/
+    project declarations are downgraded to `locked=false` with
+    a `lock_ignored` warning.
+  - Resolution order: enterprise → user → project preserved;
+    multiple entries within a layer keep declaration order.
+  - Dispatcher first-block-wins: enterprise blocking hook
+    short-circuits the chain BEFORE user/project would run; if
+    enterprise allows but user blocks, project never runs;
+    all-allow runs the full chain.
+  - Non-blocking events (PostToolUse) ignore "would-block" exit
+    codes — every layer runs regardless.
+
+- **Tests** (27 new across two files): 18 slash-command unit tests
+  + 9 locked-enforcement E2E tests. Existing
+  `tests/cli/slash/dispatch.test.ts` bumped to count 12 builtins.
+
+**Decisions:**
+
+1. **Locked is a layered-access control, not a runtime gate.**
+   Once you can declare `locked: true` only from the enterprise
+   layer (which lives in `/etc/agent` and requires root), the
+   spec's "lower layers cannot remove or override" property
+   follows from the filesystem permissions + the dispatcher's
+   first-block-wins. The lock flag itself is a marker for audit
+   (`/hooks list` shows `[locked]`); no extra runtime check
+   needed.
+
+2. **`/hooks list` groups by layer in resolution order.** Reading
+   top-to-bottom, the operator sees enterprise first, then user,
+   then project — same order the dispatcher iterates. Reading
+   the file matches reading the runtime behavior.
+
+3. **`/hooks audit` newest-first, ISO timestamps.** Matches
+   `listRecentHookRuns`'s ordering and the operator's "what just
+   happened" mental model. ISO is unambiguous (no locale
+   surprises) and trivially greppable.
+
+4. **Audit rows show `outcome`, `exit_code`, `matched_tool`, and
+   `duration_ms`** in the one-liner. That's the forensic minimum
+   (was the chain blocked? which tool was being gated? how long
+   did it take?) without flooding the scrollback. Operator
+   queries `hook_runs` directly for stdout/stderr/expanded
+   command.
+
+**Closing notes:**
+
+Post-slice integration follow-up (same commit batch): the CLI driver
+(`src/cli/run.ts` + `src/cli/repl.ts`) now surfaces `hookWarnings`
+on stderr at boot, mirroring the existing `lockConflicts` and
+subagent-shadow warnings. Without this fix, a malformed
+`hooks.toml` entry (bad event name, unreadable file) would
+silently drop the offending hook from the chain — operator left
+guessing why their lint hook never fires. JSON mode skips the
+warnings (NDJSON contract: stdout is pure, stderr-admin-text
+suppressed). Two new `tests/cli/run.test.ts` cases prove the
+surfacing + the JSON-mode suppression.
+
+The hooks subsystem now covers all 9 events from spec §10.1:
+
+| Event | Slice | Blocking |
+|---|---|---|
+| SessionStart | 2 | no |
+| UserPromptSubmit | 4 | yes |
+| PreToolUse | 3 | yes |
+| PostToolUse | 3 | no |
+| PreCompact | 4 | yes |
+| Notification | 2 | no |
+| PreCheckpoint | 2 | no |
+| MemoryWrite | 4 | yes |
+| Stop | 2 | no |
+
+**Pending:** none. The hooks subsystem is feature-complete per
+spec. Ready to merge into `develop`.
+
+**Next:** review the branch and merge. Subsequent work moves to
+the next M3 deliverable (TBD).
+
+---
+
+## [2026-05-04] M3 / impl — hooks Slice 4: UserPromptSubmit + PreCompact + MemoryWrite
+
+Same branch (`feat/m3-hooks`). Closes the remaining 3 blocking events
+(spec AGENTIC_CLI.md §10.1 table). With Slices 1–4 the subsystem
+covers 8 of 9 events (Notification stays log-only by design); only
+the operator-facing `/hooks` slash commands remain (Slice 5).
+
+**Done:**
+
+- **`UserPromptSubmit` wired in `runAgent`** between SessionStart
+  hook and the main `while (true)` loop. Fires on every fresh user
+  prompt (skipped when `userPrompt === ''`, the resume re-execute
+  shape). Block path short-circuits via a new exit reason
+  `userPromptBlocked` mapped to status=`interrupted`. Stop hook
+  still fires inside `finish` so the lifecycle bracket
+  `session_start … session_finished` is honored even on a refused
+  turn. The user message is persisted BEFORE the hook fires so
+  the audit trail captures what was attempted.
+
+- **`PreCompact` wired in `runAgent`** at the existing compaction
+  trigger site, BEFORE the `compaction_started` event. Block path
+  skips the entire compaction pass: no LLM call, no started/
+  finished events emitted. Loop re-tries compaction on the next
+  step's tail check (if tokens stay over threshold). The hook
+  audit row is the operator's signal.
+
+- **`MemoryWrite` wired in the `memory_write` tool** as the LAST
+  gate before persist (after modal confirm + user-scope second
+  confirm). Block path records `refused` audit row with
+  `details.stage='hook'` and returns the rejected outcome with
+  the operator's stdout as the reason (`block_message`) or a
+  generic `'denied by hook'` (`block_silent` / failClosed). Tool
+  returns the standard `outcome='rejected'` shape so the model
+  sees the same denial pattern as user-cancelled writes.
+
+- **`ToolContext.fireHook` field** — generic per-event funnel
+  exposed on every tool's context. Today only `memory_write`
+  consumes it; future tools that need to fire blocking events
+  (e.g., a hypothetical `web_fetch` with a `BeforeFetch` event)
+  inherit the contract. Wired from the harness via the same
+  `dispatchHooks` closure used by the loop and invoke-tool, so
+  one definition of "what's a chain block?" applies everywhere.
+
+- **`ExitReason.userPromptBlocked`** added to the union;
+  `exitToStatus` and `exitToHarnessStatus` map it to
+  `interrupted` (mirrors `aborted` — operator-initiated
+  termination, not error).
+
+- **Tests** (13 cases total across two files):
+  - `tests/harness/hooks-blocking-events.test.ts` (8 cases):
+    UserPromptSubmit allow/block_silent/block_message; resume
+    with empty prompt → no hook; Stop fires on block
+    (lifecycle); PreCompact allow/block; PreCompact payload has
+    promptTokens + threshold > triggerAt
+  - `tests/tools/memory-write-hook.test.ts` (5 cases):
+    block_silent → audit stage=hook + no file; block_message →
+    operator stdout becomes reason; allow → file lands;
+    fireHook returns null → write proceeds; modal yes + hook
+    block → still rejects (modal IS NOT enough)
+
+**Decisions:**
+
+1. **UserPromptSubmit fires AFTER message persist.** Persisting
+   the user prompt BEFORE the hook means a blocked prompt still
+   shows up in the messages table — the operator can audit "what
+   did the model try to ask the LLM?" even when the LLM never
+   saw it. Alternative (skip persist on block) would erase the
+   operator's audit trail. Spec doesn't mandate either order; we
+   pick visibility.
+
+2. **PreCompact block skips compaction events entirely** (not
+   started + skipped finished). The compaction lifecycle
+   conceptually didn't happen — emitting started + finished
+   would be a phantom event for renderers. The `hook_runs` row
+   is the audit trail; skip semantics are a clean no-op.
+
+3. **MemoryWrite fires AFTER the modal**, not before. Spec wording
+   "Antes de gravar nova memória" allows both, but firing after
+   the modal lets the operator's hook be a SECOND gate (corp
+   policy) on top of the operator's habit (modal). Firing before
+   the modal would let a hook silently swallow proposals the
+   operator wanted to see. Our order: validation → trust →
+   scanner → modal → user-scope-modal → **hook** → persist.
+
+4. **`exitToStatus.userPromptBlocked = 'interrupted'`**, not a
+   new session_status. The session row's status field has a CHECK
+   constraint that would need a migration to add a new value;
+   `interrupted` is semantically closest (operator-initiated
+   non-error termination).
+
+**Pending:**
+
+- **Slice 5**: `/hooks list` + `/hooks audit` slash commands;
+  end-to-end locked-enforcement test (enterprise > user >
+  project hierarchy honored).
+
+**Next:** Slice 5 — operator-facing slash commands and locked
+enforcement. After Slice 5, the hooks subsystem is feature-
+complete per spec.
+
+---
+
+## [2026-05-04] M3 / impl — hooks Slice 3: PreToolUse + PostToolUse (blocking flow + audit)
+
+Same branch (`feat/m3-hooks`). Adds the two events that turn the
+hooks subsystem into a real production gate: PreToolUse can BLOCK a
+tool call before invocation (first-block-wins, CONTRACTS.md §10
+line 1046), and PostToolUse logs after with the full result.
+Together they cover the "lint hook denies a `bash rm -rf`" /
+"prettier reformats after every write_file" use cases.
+
+**Done:**
+
+- **`dispatchHooks` returns `HookChainResult | null`** (replaces
+  the previous `fireHookChain` void shape). Non-blocking sites
+  `void` the promise; blocking sites await and inspect
+  `blockedBy`. Returns null when no hooks are configured OR the
+  dispatcher throws — fail-open per spec line 1057 ("continuação
+  assume 'ninguém bloqueou' para eventos bloqueáveis").
+
+- **PreToolUse wired in `invoke-tool.ts`** between the
+  permission-engine allow / user-confirm-yes branch and
+  `tool.execute`. When `chain.blockedBy !== null`:
+  - records a SECOND approval row with `decidedBy='hook'` +
+    `decision='deny'` so the audit trail shows BOTH the policy
+    allow AND the hook deny (operator can grep approvals to find
+    hook-blocked tool_calls)
+  - `finishToolCall(status='denied', error=hookReason)` so the
+    row's terminal state matches the outcome
+  - returns `failed: true, denied: true` so the harness's
+    `consecutive_errors` budget counts the block against the
+    model — same as a policy deny
+  - synthesizes a model-facing error block: operator's stdout
+    when `block_message`, generic `'denied by hook'` for
+    `block_silent` / `error+failClosed` / `timeout+failClosed`
+
+- **PostToolUse wired in `invoke-tool.ts`** as a fire-and-forget
+  `firePostToolUse(failed)` helper called AFTER the tool_call
+  row's terminal status persists. Two call sites: the
+  `isToolError || crashed` branch (failed=true) and the success
+  branch (failed=false). Operator hook receives `tool.name`,
+  `tool.input`, sanitized `tool.output`, plus the `failed` flag
+  for failure-case forensics.
+
+- **PostToolUse skipped on PreToolUse-block paths**. The block
+  branch returns before `tool.execute` runs, so no
+  `firePostToolUse` call is reachable. Test asserts: when
+  PreToolUse blocks, only PreToolUse rows land in `hook_runs` —
+  PostToolUse does not fire because there's no result to report.
+
+- **Tests** (`tests/harness/hooks-tools-integration.test.ts`,
+  12 cases). End-to-end through `runAgent` with real `sh -c`
+  commands. Coverage:
+  - PreToolUse exit 0 → tool runs; hook_runs row carries
+    `outcome=allow`, `matchedTool`
+  - PreToolUse exit 1 (block_silent) → tool body NEVER runs;
+    approvals shows `[policy:allow, hook:deny]`; tool_call
+    status=`denied`
+  - PreToolUse exit 2 (block_message) → operator stdout becomes
+    the audit reason; surfaces in approval.reason
+  - PreToolUse exit 7 + failClosed=true → blocks (treated as
+    silent)
+  - PreToolUse exit 7 + failClosed=false → does NOT block (log
+    only)
+  - First-block-wins: 3-hook chain `allow → block → allow` runs
+    only the first 2; third never executes
+  - Matcher `tool="echo"` → only fires for echo, leaves `other`
+    alone
+  - Matcher `tool="bash*"` → wildcard prefix matches `bash_run`
+  - PreToolUse stdin: payload includes
+    `data.tool.{name,input}` reaching the operator's command
+  - PostToolUse fires on success; payload has output + failed=false
+  - PostToolUse fires on tool error; payload.failed=true,
+    output carries the ToolError shape
+  - PostToolUse skipped when PreToolUse blocks
+
+**Decisions:**
+
+1. **Two approval rows on a hook-block, not one row updated.** The
+   approvals table has no UNIQUE on `tool_call_id`; multiple rows
+   per call are valid. Policy=allow + hook=deny tells a coherent
+   story for forensic queries: "the policy allowed this, but a
+   hook caught it". Updating the existing row to `deny` would
+   erase the policy decision.
+
+2. **Engine `decision` returned by invokeTool stays as engine's
+   answer.** Hook block sets `denied: true` instead. Renderers
+   can disambiguate via the (decision, denied) pair — same shape
+   they already use for confirm_no (`decision.kind=confirm,
+   denied=true` ≡ user said no).
+
+3. **PostToolUse doesn't fire when PreToolUse blocked.** Spec
+   doesn't mandate either way, but the operator's PostToolUse hook
+   exists to react to a tool's RESULT — there is no result when
+   the tool was blocked. Firing it with empty output would be a
+   contract violation; recording the block in `hook_runs` already
+   covers the audit need.
+
+4. **Sanitized output in PostToolUse payload.** The sanitization
+   (ANSI strip) that `sanitizeToolOutput` applies between the tool
+   body and the model context also lands in the hook payload —
+   operator's hook sees the same bytes the model sees (and the same
+   bytes that go in the tool_call row).
+
+**Pending:**
+
+- **Slice 4**: `UserPromptSubmit`, `PreCompact`, `MemoryWrite` —
+  remaining blocking events. UserPromptSubmit fires at the REPL
+  before the harness gets the prompt; PreCompact fires inside
+  `compactMessages`; MemoryWrite fires inside the `memory_write`
+  tool.
+
+- **Slice 5**: `/hooks list` + `/hooks audit` slash commands;
+  end-to-end locked-enforcement test (enterprise > user >
+  project).
+
+- **Subagent hook coverage**: in-process subagent path doesn't
+  see parent's hooks (test-only path). Subprocess subagents
+  re-bootstrap and get their own — production path. Documented
+  as a deliberate boundary; revisit if operators ask for parent
+  hooks to bracket subagent invocations.
+
+**Next:** Slice 4 — UserPromptSubmit + PreCompact + MemoryWrite.
+
+---
+
+## [2026-05-04] M3 / impl — hooks Slice 2: 4 non-blocking events wired into harness
+
+Branch `feat/m3-hooks`. Builds on Slice 1 (foundation: types, paths, template,
+config loader, dispatcher, audit table 019, 68 tests at `b4acae5`). This slice
+threads the dispatcher through the harness lifecycle for the four non-blocking
+events the spec marks as "log-only" (`AGENTIC_CLI.md §10.1` table line 980,
+`CONTRACTS.md §3` line 742): `SessionStart`, `Stop`, `Notification`,
+`PreCheckpoint`. Decisions don't gate (per spec line 1041) — these are
+operator hooks for desktop notifications, slack pings, working-tree tagging,
+forensic logging.
+
+**Done:**
+
+- **`HarnessConfig.hooks`**: optional `readonly HookSpec[]` threaded
+  through. Empty/undefined = no-op (every dispatch site falls through
+  the chain filter). Bootstrap resolves the three-layer hierarchy at
+  boot via `resolveHookConfig(resolveHookPaths(repoRoot))` and surfaces
+  warnings on `BootstrapResult.hookWarnings` for the CLI driver to
+  render alongside policy lock-conflict warnings.
+
+- **`SessionStart` + `Stop` (harness loop)**: `runAgent` now hosts a
+  shared `fireHookChain(payload)` helper that wraps `dispatchChain`
+  with the bound deps (db, sessionId, cwd) and a stderr fallback for
+  defense-in-depth. SessionStart fires AFTER the `session_start` event
+  so renderers see it bracketing the visible session; Stop fires
+  BEFORE `session_finished` so a "session ended at $cost" hook lands
+  while the UI is still visible. Both awaited so audit lands before
+  the DB closes; latency capped by the dispatcher's
+  `MAX_HOOK_CHAIN_MS` (15s).
+
+- **`Notification` (invoke-tool)**: fired when the permission engine
+  returns `confirm` and BEFORE `confirmPermission` is invoked, so
+  desktop alerts beat the modal opening. Fire-and-forget per spec
+  (the modal shouldn't wait on a slack ping). Wired via a generic
+  `deps.fireHook?: (payload) => Promise<void>` callback in
+  `InvokeToolDeps` so future events from this scope (PreToolUse,
+  PostToolUse — Slice 3) reuse the same pipe.
+
+- **`PreCheckpoint` (harness loop)**: fired just before
+  `checkpointManager.snapshot(...)` whenever the step had a
+  writes-true tool. Fire-and-forget — non-blocking events can't
+  gate the snapshot, and the snapshot's git ops are already
+  optimized; bounding operator latency to their own hook timeout
+  is the right tradeoff.
+
+- **`finish` is now async**. Every `return finish(...)` updated to
+  `return await finish(...)` (mechanical change across ~20 call sites
+  including `guardedFinish`). This is what lets Stop hooks complete
+  before `session_finished` is emitted.
+
+- **Tests** (`tests/harness/hooks-integration.test.ts`, 11 cases):
+  end-to-end through `runAgent` with real `sh -c` hook commands that
+  write payloads to temp files. Asserts both audit-row presence and
+  payload shape. Coverage:
+  - SessionStart: schema=v1, sessionId, cwd, model, profile=`default`
+  - SessionStart: profile=`plan` when `planMode=true`
+  - Stop: payload carries `durationMs`, `costUsd`, `steps`; lifecycle
+    order `session_start` → `session_finished` preserved
+  - Stop: still fires when the run exits via `providerError`
+  - Stop: zero hooks → zero rows, no error
+  - Notification: confirm decision (via `read_file` + `confirm_paths`)
+    triggers Notification with `kind=permission_prompt`; modal opens
+    after dispatch
+  - Notification: bypass mode (no confirm) → no Notification rows
+  - PreCheckpoint: writes-true tool in step → row landed with
+    `stepN` in the payload
+  - PreCheckpoint: read-only step → no row (gate is `hasWrites`)
+  - Error path: hook command `exit 7` → outcome=`error`, exit_code=7,
+    harness still completes
+  - Timeout path: `sleep 5` with `timeoutMs=100` → outcome=`timeout`,
+    exit_code=124 (POSIX `timeout(1)` convention)
+
+**Decisions:**
+
+1. **Await for SessionStart + Stop, fire-and-forget for Notification +
+   PreCheckpoint.** Spec says non-blocking events are fire-and-forget,
+   meaning decisions don't gate. We interpret "fire-and-forget" at two
+   levels:
+   - DECISION-LEVEL: never. None of the four block.
+   - EXECUTION-LEVEL: lifecycle events (SessionStart/Stop) await so
+     audit lands before DB closes; intra-step events
+     (Notification/PreCheckpoint) don't await so user-facing latency
+     stays low (modal opens promptly, snapshot proceeds without delay).
+
+2. **Stop fires BEFORE `session_finished` emission**. Symmetry with
+   SessionStart-after-session_start: the spec wants hooks bracketed
+   inside the visible session window. A "session ended" hook running
+   AFTER renderers tear down the screen is invisible; running before
+   gives the operator time to see the message.
+
+3. **Generic `fireHook` callback in `InvokeToolDeps`** instead of an
+   event-specific `fireNotification`. Slice 3 (PreToolUse +
+   PostToolUse) will land in invoke-tool too; the generic shape lets
+   that slice add events without renegotiating the deps interface.
+
+4. **Bootstrap-side warnings on `BootstrapResult.hookWarnings`**, not
+   inline stderr. Mirrors how policy `lockConflicts` and subagent
+   shadows surface — the CLI driver decides rendering. Tests stubbing
+   bootstrap need a 1-line `hookWarnings: []` addition; existing
+   tests in `tests/cli/repl*.test.ts` updated.
+
+**Pending:**
+
+- **Slice 3** (PreToolUse + PostToolUse). Blocking event semantics:
+  PreToolUse decisions can deny a tool call BEFORE invocation;
+  PostToolUse fires after. Fits the same `deps.fireHook` pipe added
+  here; the dispatcher already supports the blocking flow (Slice 1's
+  30 dispatcher tests cover it). Needs harness logic to interpret
+  `block_silent`/`block_message` outcomes and turn them into a
+  `confirm_no`-shape failure with the operator's message surfaced.
+
+- **Slice 4**: `UserPromptSubmit`, `PreCompact`, `MemoryWrite` —
+  remaining blocking events. Wires through the REPL (UserPromptSubmit
+  before harness gets the prompt), the harness compaction path
+  (PreCompact), and the memory_write tool (MemoryWrite).
+
+- **Slice 5**: `/hooks list` + `/hooks audit` slash commands; locked
+  enforcement (enterprise > user > project) verified end-to-end.
+
+**Next:** Slice 3 — PreToolUse + PostToolUse blocking flow.
+
+---
+
 ## [2026-05-04] M3 / impl — /memory slash commands (list/show/audit/delete/promote/demote)
 
 Continues the memory subsystem on the same branch. Two commits in
