@@ -246,11 +246,12 @@ describe('subagent_runs repo', () => {
       expect(run?.hooksSnapshot).toEqual(hooks);
     });
 
-    test('omitting hooksSnapshot lands as empty array (legacy fallback path)', () => {
-      // The child reads `hooksSnapshot.length === 0` as the
-      // signal to fall back to disk re-resolve. Programmatic
-      // callers that don't model the snapshot must produce
-      // exactly that shape.
+    test('omitting hooksSnapshot lands as null (legacy fallback discriminator)', () => {
+      // The child reads `hooksSnapshot === null` as the signal
+      // to fall back to disk re-resolve. Programmatic callers
+      // that don't model the snapshot must produce exactly
+      // that shape — distinct from the authoritative
+      // empty-array case below.
       const child = seedSession(seedSession().id);
       insertSubagentRun(db, {
         sessionId: child.id,
@@ -264,14 +265,40 @@ describe('subagent_runs repo', () => {
         budgetMaxCostUsd: 0,
       });
       const run = getSubagentRun(db, child.id);
-      expect(run?.hooksSnapshot).toEqual([]);
+      expect(run?.hooksSnapshot).toBeNull();
     });
 
-    test('malformed hooks_snapshot JSON parses as empty array (defensive)', () => {
-      // Mirror of the tools_whitelist defensive parse. A
-      // corrupt snapshot must not crash audit listings; the
-      // child receives an empty chain and falls through to disk
-      // re-resolve — same shape as a legacy row.
+    test('explicit empty hooksSnapshot ([]) round-trips as authoritative empty', () => {
+      // Distinct from null. The child treats this as "parent
+      // resolved its chain and got zero hooks" and runs WITHOUT
+      // hooks — does NOT re-resolve from disk. This is the
+      // load-bearing behavior the previous `length > 0` check
+      // collapsed; the discriminator is the wire's job.
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'r',
+        scope: 'user',
+        sourcePath: '/p',
+        sourceSha256: 'h',
+        systemPrompt: 'p',
+        toolsWhitelist: [],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0,
+        hooksSnapshot: [],
+      });
+      const run = getSubagentRun(db, child.id);
+      expect(run?.hooksSnapshot).toEqual([]);
+      // Critically NOT null — the discriminator must survive.
+      expect(run?.hooksSnapshot).not.toBeNull();
+    });
+
+    test('malformed hooks_snapshot JSON parses as null (defensive)', () => {
+      // A corrupt snapshot must not crash audit listings. We
+      // fall back to `null` (NOT `[]`) so the child takes the
+      // legacy disk-re-resolve path — a corrupt row should
+      // NOT silently disable hook enforcement, which `[]`
+      // (authoritative empty) would do.
       const child = seedSession(seedSession().id);
       db.query(
         `INSERT INTO subagent_runs
@@ -281,13 +308,13 @@ describe('subagent_runs repo', () => {
          VALUES (?, 'explore', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', 'not-json', 0)`,
       ).run(child.id);
       const run = getSubagentRun(db, child.id);
-      expect(run?.hooksSnapshot).toEqual([]);
+      expect(run?.hooksSnapshot).toBeNull();
     });
 
-    test('non-array hooks_snapshot parses as empty (shape guard)', () => {
-      // Parser refuses anything that isn't an array of objects —
-      // a stray `{}` or `null` payload would otherwise feed bad
-      // shapes into the dispatcher.
+    test('non-array hooks_snapshot parses as null (shape guard)', () => {
+      // Parser refuses anything that isn't an array of objects.
+      // `null` here so corrupt rows take the legacy disk path
+      // rather than silently skipping hooks via `[]`.
       const child = seedSession(seedSession().id);
       db.query(
         `INSERT INTO subagent_runs
@@ -297,7 +324,7 @@ describe('subagent_runs repo', () => {
          VALUES (?, 'explore', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', '{"oops":1}', 0)`,
       ).run(child.id);
       const run = getSubagentRun(db, child.id);
-      expect(run?.hooksSnapshot).toEqual([]);
+      expect(run?.hooksSnapshot).toBeNull();
     });
   });
 });

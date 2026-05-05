@@ -36,11 +36,22 @@ export interface SubagentRun {
   // INSTEAD of re-resolving `hooks.toml` from disk. Closes the
   // drift window where a human edit between parent spawn and
   // child startup could have run the child under a different
-  // hook chain than the parent had locked in. Empty array on
-  // pre-migration rows (the ALTER TABLE seeded `'[]'`) — child
-  // falls through to disk re-resolve on that path, preserving
-  // the legacy behavior.
-  hooksSnapshot: readonly HookSpec[];
+  // hook chain than the parent had locked in.
+  //
+  // Discriminator:
+  //   - `null` — no snapshot was taken at spawn (legacy pre-
+  //     migration row, or a programmatic caller that didn't
+  //     supply a chain). Child falls through to disk re-resolve;
+  //     spec §10 unbypassable-corp-policy still binds via the
+  //     filesystem.
+  //   - `[]` — parent resolved its chain and got zero hooks;
+  //     authoritatively no hooks. Child runs WITHOUT hooks. This
+  //     is distinct from the legacy fallback: a disk re-resolve
+  //     here would let an edit to hooks.toml between spawn and
+  //     child read add policy the parent never validated, the
+  //     exact drift this migration exists to close.
+  //   - `[hook, ...]` — parent's resolved chain, used verbatim.
+  hooksSnapshot: readonly HookSpec[] | null;
   capturedAt: number;
 }
 
@@ -56,7 +67,7 @@ interface SubagentRunRow {
   budget_max_cost_usd: number;
   budget_max_wall_ms: number | null;
   policy_snapshot: string;
-  hooks_snapshot: string;
+  hooks_snapshot: string | null;
   captured_at: number;
 }
 
@@ -110,23 +121,30 @@ const fromRow = (row: SubagentRunRow): SubagentRun => {
   } catch {
     policySnapshot = { defaults: { mode: 'strict' }, tools: {} };
   }
-  // Defensive parse on hooks_snapshot. Same shape as
-  // tools_whitelist: TEXT column, JSON-array, fall back to []
-  // on parse failure or wrong shape. Empty array means "no
-  // snapshot" — caller falls through to disk re-resolve. We do
-  // NOT validate inner HookSpec field shapes here; the
-  // dispatcher tolerates field-level absences (clamps timeouts,
-  // etc.) and a corrupt entry would surface there with the
-  // same diagnostic path as a corrupt hooks.toml.
-  let hooksSnapshot: HookSpec[];
-  try {
-    const parsed = JSON.parse(row.hooks_snapshot) as unknown;
-    hooksSnapshot =
-      Array.isArray(parsed) && parsed.every((e) => e !== null && typeof e === 'object')
-        ? (parsed as HookSpec[])
-        : [];
-  } catch {
-    hooksSnapshot = [];
+  // Defensive parse on hooks_snapshot. Three states:
+  //   - `null` (column NULL) → no snapshot was taken. Caller
+  //     falls through to disk re-resolve.
+  //   - valid JSON array → use as-is (even when empty:
+  //     authoritative "parent had no hooks").
+  //   - corrupt JSON / wrong shape → fall back to `null` so the
+  //     caller's legacy disk-re-resolve path engages. We do NOT
+  //     fall back to `[]` here: an authoritative empty would
+  //     skip disk re-resolve, and a corrupt row should NOT
+  //     silently disable hook enforcement.
+  let hooksSnapshot: HookSpec[] | null;
+  if (row.hooks_snapshot === null) {
+    hooksSnapshot = null;
+  } else {
+    try {
+      const parsed = JSON.parse(row.hooks_snapshot) as unknown;
+      if (Array.isArray(parsed) && parsed.every((e) => e !== null && typeof e === 'object')) {
+        hooksSnapshot = parsed as HookSpec[];
+      } else {
+        hooksSnapshot = null;
+      }
+    } catch {
+      hooksSnapshot = null;
+    }
   }
   return {
     sessionId: row.session_id,
@@ -163,11 +181,19 @@ export interface InsertSubagentRunInput {
   // Omitting it persists `'{}'` which the read path falls back
   // to strict-mode defaults — safe but maximally restrictive.
   policySnapshot?: Policy;
-  // Parent's resolved hook chain at spawn time. Production
-  // callers (subagent runtime) supply it; programmatic callers
-  // omitting it land an empty array, which the child treats as
-  // "no snapshot, re-resolve from disk" — preserving legacy
-  // behavior for fixtures that don't model the snapshot.
+  // Parent's resolved hook chain at spawn time. Tri-state:
+  //   - undefined / omitted → row's `hooks_snapshot` column
+  //     stays NULL; child treats this as "no snapshot, re-
+  //     resolve from disk" (legacy fallback). Programmatic
+  //     callers that don't model hooks land here.
+  //   - empty array `[]` → authoritatively "parent had no
+  //     hooks". Child uses [] verbatim, no disk re-resolve.
+  //   - non-empty `HookSpec[]` → parent's resolved chain.
+  //     Child uses verbatim.
+  // The previous shape conflated undefined and `[]` into a
+  // single "fall back to disk" sentinel — defeating the
+  // migration's drift-prevention guarantee for hookless
+  // parents. The discriminator now lives on the wire.
   hooksSnapshot?: readonly HookSpec[];
   capturedAt?: number;
 }
@@ -180,7 +206,10 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
   // schema dumb, parse on read.
   const toolsJson = JSON.stringify(input.toolsWhitelist);
   const policyJson = JSON.stringify(input.policySnapshot ?? {});
-  const hooksJson = JSON.stringify(input.hooksSnapshot ?? []);
+  // hooks_snapshot is nullable (migration 020): undefined means
+  // "no snapshot taken, child falls back to disk"; an explicit
+  // value (even []) is authoritative.
+  const hooksJson = input.hooksSnapshot !== undefined ? JSON.stringify(input.hooksSnapshot) : null;
   db.query(
     `INSERT INTO subagent_runs
        (session_id, name, scope, source_path, source_sha256, system_prompt,
@@ -221,7 +250,7 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     budgetMaxCostUsd: input.budgetMaxCostUsd,
     budgetMaxWallMs: wallMs,
     policySnapshot,
-    hooksSnapshot: input.hooksSnapshot ?? [],
+    hooksSnapshot: input.hooksSnapshot ?? null,
     capturedAt,
   };
 };

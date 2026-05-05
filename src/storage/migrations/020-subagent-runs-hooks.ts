@@ -28,13 +28,28 @@ export const migration020SubagentRunsHooks = {
   //
   // Storage as TEXT (JSON-serialized HookSpec[]). Same
   // convention `tools_whitelist` / `policy_snapshot` use.
-  // NOT NULL with empty-array default '[]' so pre-migration
-  // rows parse to "no hooks" rather than crashing the audit
-  // listing — child falls through to disk re-resolve in that
-  // case, preserving the behavior callers had before this
-  // migration.
+  //
+  // **NULLABLE** with default NULL — distinguishes "no snapshot
+  // taken" (NULL: legacy pre-migration row, programmatic caller
+  // that didn't model hooks) from "snapshot is authoritatively
+  // empty" ('[]': parent resolved its chain and got zero hooks).
+  // The two cases need different child-side behavior:
+  //   - NULL ⇒ child re-resolves from disk (legacy fallback,
+  //     preserves spec §10 unbypassable-corp-policy claim for
+  //     pre-migration rows).
+  //   - '[]' ⇒ child runs WITHOUT hooks, honoring the parent's
+  //     resolved chain. Child does NOT re-resolve — that would
+  //     reintroduce the drift the migration is trying to close
+  //     for hookless parents (a human edit to hooks.toml
+  //     between spawn and read could otherwise let the child
+  //     enforce hooks the parent never validated).
+  // The previous implementation conflated both into the
+  // `length > 0` check; that defeated migration 020's
+  // drift-prevention goal exactly when parent had no hooks —
+  // the case where it matters most because any disk re-resolve
+  // hit is a NET ADDITION of policy the parent never saw.
   sql: `
     ALTER TABLE subagent_runs
-      ADD COLUMN hooks_snapshot TEXT NOT NULL DEFAULT '[]';
+      ADD COLUMN hooks_snapshot TEXT;
   `,
 } as const;

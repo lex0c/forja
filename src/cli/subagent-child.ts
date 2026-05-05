@@ -630,26 +630,30 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text) ?? '';
     }
 
-    // Hooks subsystem (spec AGENTIC_CLI.md §10). Two paths:
+    // Hooks subsystem (spec AGENTIC_CLI.md §10). Three paths,
+    // discriminated by `audit.hooksSnapshot` (nullable per
+    // migration 020):
     //
-    //   1. Snapshot path (preferred, migration 020): the parent
-    //      forwarded its resolved chain via `subagent_runs.hooks_snapshot`.
-    //      We use it as-is. No disk re-resolve, no warnings (the
-    //      parent already surfaced any when it resolved).
-    //   2. Legacy fallback: `audit.hooksSnapshot` is empty (older
-    //      rows from before migration 020, or programmatic
-    //      callers that didn't supply a chain). Re-resolve the
-    //      same three-layer hierarchy the parent uses, anchored
-    //      at the PARENT's cwd via `memoryCwd` (when forwarded)
-    //      or `session.cwd` as fallback. Surface config warnings
-    //      on stderr.
-    //
-    // The fallback preserves the spec §10 unbypassable-corp-
-    // policy claim for legacy rows: an enterprise `locked: true`
-    // PreToolUse hook on disk still binds the child even when
-    // the parent forgot to supply the snapshot.
+    //   1. Snapshot present, non-empty (`[hook, ...]`): parent
+    //      forwarded its resolved chain. Use verbatim.
+    //   2. Snapshot present, empty (`[]`): parent resolved to
+    //      ZERO hooks authoritatively. Use [] — do NOT re-
+    //      resolve from disk. A re-resolve here would let an
+    //      edit to `hooks.toml` between spawn and this read add
+    //      policy the parent never validated, defeating the
+    //      drift-prevention this migration exists for in the
+    //      hookless-parent case (where any disk hit is a NET
+    //      ADDITION of policy).
+    //   3. Snapshot absent (`null`): legacy pre-migration row OR
+    //      a programmatic caller that didn't model hooks. Re-
+    //      resolve from disk anchored at the PARENT's cwd via
+    //      `memoryCwd` (when forwarded) or `session.cwd` as
+    //      fallback. Surface config warnings on stderr —
+    //      preserves spec §10 unbypassable-corp-policy claim
+    //      for legacy rows where the disk IS the source of
+    //      truth.
     let hookChain: readonly import('../hooks/types.ts').HookSpec[];
-    if (audit.hooksSnapshot.length > 0) {
+    if (audit.hooksSnapshot !== null) {
       hookChain = audit.hooksSnapshot;
     } else {
       const hookAnchor = opts.memoryCwd !== undefined ? opts.memoryCwd : session.cwd;
