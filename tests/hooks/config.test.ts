@@ -182,6 +182,48 @@ describe('resolveHookConfig — validation', () => {
     expect(result.warnings[0]?.message).toContain('clamped to 30000');
   });
 
+  test('rejects fractional timeout_ms (validator promised integer)', () => {
+    // Sanity-revert: pre-fix, the check was
+    // `Number.isFinite(rawTimeout)` + `>= 0` — accepting any
+    // finite non-negative number including fractions.
+    // `timeout_ms = 2500.5` silently propagated as a non-
+    // integer setTimeout delay. Common operator mistakes:
+    // accidental decimal from a unit-conversion pass, or
+    // unit-mismatch (`0.5` intending half a second).
+    const tmp = makeTmp();
+    const tomlPath = join(tmp, 'hooks.toml');
+    writeToml(
+      tomlPath,
+      `
+        [[hooks]]
+        event = "Stop"
+        command = "x"
+        timeout_ms = 2500.5
+      `,
+    );
+    const result = resolveHookConfig(paths({ project: tomlPath }));
+    expect(result.hooks).toEqual([]);
+    expect(result.warnings[0]?.message).toContain('timeout_ms must be a non-negative integer');
+  });
+
+  test('rejects unit-mismatch timeout (0.5 meaning seconds)', () => {
+    // Same gate, different operator-mistake shape.
+    const tmp = makeTmp();
+    const tomlPath = join(tmp, 'hooks.toml');
+    writeToml(
+      tomlPath,
+      `
+        [[hooks]]
+        event = "Stop"
+        command = "x"
+        timeout_ms = 0.5
+      `,
+    );
+    const result = resolveHookConfig(paths({ project: tomlPath }));
+    expect(result.hooks).toEqual([]);
+    expect(result.warnings[0]?.message).toContain('non-negative integer');
+  });
+
   test('drops entry with malformed matcher + warns', () => {
     const tmp = makeTmp();
     const tomlPath = join(tmp, 'hooks.toml');

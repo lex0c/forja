@@ -140,7 +140,17 @@ const validateEntry = (
   let timeoutWarning: HookConfigWarning | undefined;
   const rawTimeout = obj.timeout_ms;
   if (rawTimeout !== undefined) {
-    if (typeof rawTimeout !== 'number' || !Number.isFinite(rawTimeout) || rawTimeout < 0) {
+    // Number.isInteger rejects non-numbers, NaN, Infinity,
+    // AND fractional values in one check. An earlier cut
+    // accepted any finite non-negative number, so
+    // `timeout_ms = 2500.5` silently propagated as a non-
+    // integer setTimeout delay (platform may truncate or
+    // round inconsistently). The validator's documented
+    // contract says "integer ms"; honor it. Common operator
+    // mistakes this catches: accidental decimal (`5.0` from a
+    // unit-conversion pass) or unit-mismatch (`0.5` intending
+    // "half a second" while the field expects ms).
+    if (typeof rawTimeout !== 'number' || !Number.isInteger(rawTimeout) || rawTimeout < 0) {
       return {
         warning: {
           kind: 'invalid_entry',
