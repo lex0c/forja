@@ -1,5 +1,10 @@
 import type { DB } from '../storage/db.ts';
 import { createHookRun } from '../storage/repos/hook-runs.ts';
+import {
+  type DispatchedProcess,
+  type SpawnFn,
+  defaultSpawn,
+} from './dispatcher-spawn.ts';
 import { expandTemplate } from './template.ts';
 import {
   BLOCKING_EVENTS,
@@ -11,6 +16,8 @@ import {
   type HookSpec,
   MAX_HOOK_CHAIN_MS,
 } from './types.ts';
+
+export type { DispatchedProcess, SpawnFn, SpawnOpts } from './dispatcher-spawn.ts';
 
 // Hook dispatcher (spec AGENTIC_CLI.md §10.3 + CONTRACTS.md §3 +
 // §10).
@@ -90,55 +97,6 @@ export interface DispatcherDeps {
   // the operator's spec.timeoutMs as the upper bound.
   effectiveTimeoutMs?: number;
 }
-
-// Spawn signature the dispatcher uses. Returns an interface
-// the dispatcher drives: write stdin, kill, await exit.
-export interface DispatchedProcess {
-  stdin: { write: (chunk: string) => void; end: () => void };
-  stdout: ReadableStream<Uint8Array>;
-  stderr: ReadableStream<Uint8Array>;
-  // Promise resolves when the process exits. `kill(signal)` sends
-  // the signal; the resulting exit may take more time. Caller
-  // is responsible for the SIGTERM → 1s → SIGKILL ladder.
-  exited: Promise<number>;
-  kill: (signal?: 'SIGTERM' | 'SIGKILL') => void;
-}
-
-export type SpawnFn = (cmd: string[], opts: SpawnOpts) => DispatchedProcess;
-
-export interface SpawnOpts {
-  env: Record<string, string>;
-  cwd: string;
-  stdin: 'pipe';
-  stdout: 'pipe';
-  stderr: 'pipe';
-}
-
-const defaultSpawn: SpawnFn = (cmd, opts) => {
-  const proc = Bun.spawn(cmd, {
-    env: opts.env,
-    cwd: opts.cwd,
-    stdin: 'pipe',
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-  return {
-    stdin: {
-      write: (chunk) => {
-        proc.stdin.write(chunk);
-      },
-      end: () => {
-        proc.stdin.end();
-      },
-    },
-    stdout: proc.stdout as ReadableStream<Uint8Array>,
-    stderr: proc.stderr as ReadableStream<Uint8Array>,
-    exited: proc.exited,
-    kill: (signal) => {
-      proc.kill(signal);
-    },
-  };
-};
 
 // Truncate a string to HOOK_STDOUT_MAX_BYTES; appends a marker
 // when truncated so the audit row makes the cap visible.
