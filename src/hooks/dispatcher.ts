@@ -803,18 +803,28 @@ export const dispatchChain = async (
     const spec = matching[i];
     if (spec === undefined) continue;
     const elapsed = now() - chainStarted;
-    if (isBlocking && elapsed >= MAX_HOOK_CHAIN_MS) {
-      // Whole-chain timeout per CONTRACTS.md §10 line 1040.
-      // Surface as a stderr warning + skip remaining hooks.
-      // For audit clarity, we don't emit `hook_runs` rows for
-      // skipped hooks — the absence is itself the signal
-      // (compare against the resolved chain to spot it).
-      //
-      // `>=` not `>`: at exactly `elapsed === MAX`, remaining
-      // budget is zero and the per-hook clamp downstream would
-      // floor to 1ms (`Math.max(1, 0)`) — sneaking one extra
-      // hook past the documented hard cap. The boundary belongs
-      // to "expired", not "one more for free".
+    // Wall-clock cap applies to ALL events (blocking AND
+    // non-blocking) per CONTRACTS.md §10 line 1040. An earlier
+    // cut gated this on `isBlocking`, but non-blocking chains
+    // are still AWAITED by the harness in lifecycle paths
+    // (SessionStart / Stop) and DRAINED at finish() before the
+    // session row closes. Without the cap, N hooks ×
+    // MAX_HOOK_TIMEOUT_MS each (up to 30s) could stall startup
+    // / shutdown by minutes — defeating the runtime guard
+    // operators rely on. Non-blocking just means "decisions
+    // don't gate", not "latency unbounded".
+    //
+    // `>=` not `>`: at exactly `elapsed === MAX`, remaining
+    // budget is zero and the per-hook clamp downstream would
+    // floor to 1ms (`Math.max(1, 0)`) — sneaking one extra
+    // hook past the documented hard cap. The boundary belongs
+    // to "expired", not "one more for free".
+    if (elapsed >= MAX_HOOK_CHAIN_MS) {
+      // Whole-chain timeout. Surface as a stderr warning + skip
+      // remaining hooks. For audit clarity, we don't emit
+      // `hook_runs` rows for skipped hooks — the absence is
+      // itself the signal (compare against the resolved chain
+      // to spot it).
       process.stderr.write(
         `hooks: chain for ${payload.event} exceeded ${MAX_HOOK_CHAIN_MS}ms; skipping ${matching.length - i} remaining hook(s)\n`,
       );
@@ -822,17 +832,13 @@ export const dispatchChain = async (
     }
 
     // Per-hook timeout clamped against the remaining chain
-    // budget for blocking events. Without this, a chain that
-    // reached t=14.9s could still launch a hook with
+    // budget — applies to ALL events for the same reason as
+    // the cap check above. Without this, a chain that reached
+    // t=14.9s could still launch a hook with
     // spec.timeoutMs=30000 and run out to t=44.9s — violating
-    // the 15s wall-clock cap that CONTRACTS.md §10 line 1040
-    // advertises to callers. Non-blocking events don't gate
-    // anything, so their clamp is moot (chain return doesn't
-    // wait on them in spec terms; harness drains separately).
+    // the 15s wall-clock cap that CONTRACTS.md §10 advertises.
     const remaining = MAX_HOOK_CHAIN_MS - elapsed;
-    const effectiveTimeoutMs = isBlocking
-      ? Math.max(1, Math.min(spec.timeoutMs, remaining))
-      : spec.timeoutMs;
+    const effectiveTimeoutMs = Math.max(1, Math.min(spec.timeoutMs, remaining));
 
     // Pass the SPEC'S OWN entryIndex, not `i` (the index in the
     // filtered `matching` array). With matcher filtering, `i`

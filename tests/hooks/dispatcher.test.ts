@@ -503,6 +503,83 @@ describe('dispatchChain — non-blocking events', () => {
     expect(result.runs).toHaveLength(2);
     expect(result.blockedBy).toBeNull();
   });
+
+  test('chain budget enforced for non-blocking events too (sanity-revert)', async () => {
+    // Sanity-revert: pre-fix, the wall-clock cap was gated on
+    // `isBlocking` — non-blocking chains ran every hook with
+    // its full spec.timeoutMs (up to 30s) regardless of total
+    // elapsed. The harness AWAITS lifecycle non-blocking
+    // chains (SessionStart/Stop) for audit reasons and DRAINS
+    // remaining ones at finish(), so unbounded latency stalled
+    // startup/shutdown by minutes when operators stacked
+    // hooks.
+    //
+    // Inject a clock that lies past the cap on iter 2 → only
+    // h1 runs, h2 is skipped with the chain-exceeded warning.
+    const fake = makeFakeSpawn({ exitCode: 0 });
+    const hooks = [
+      makeSpec({ event: 'Stop', command: 'h1', timeoutMs: 30_000 }),
+      makeSpec({ event: 'Stop', command: 'h2', timeoutMs: 30_000 }),
+      makeSpec({ event: 'Stop', command: 'h3', timeoutMs: 30_000 }),
+    ];
+    const payload = {
+      schema: 'v1',
+      event: 'Stop',
+      sessionId: 'sess',
+      data: { durationMs: 100, costUsd: 0.01, steps: 5 },
+    } as HookEventPayload;
+    // Clock layout: chainStart=0, iter0=0 (h1), h1 dispatchOne
+    // ×2, iter1=15_500 (OVER cap → break before h2 launches).
+    let callIdx = 0;
+    const clockValues = [0, 0, 0, 0, 15_500, 15_500];
+    const now = (): number => clockValues[callIdx++] ?? 15_500;
+
+    const errs: string[] = [];
+    const writeOrig = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((s: string | Uint8Array): boolean => {
+      if (typeof s === 'string') errs.push(s);
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const result = await dispatchChain(hooks, payload, '/cwd', { spawn: fake, now });
+      expect(result.runs).toHaveLength(1);
+      expect(result.runs[0]?.spec.command).toBe('h1');
+      expect(errs.some((e) => e.includes('chain for Stop exceeded'))).toBe(true);
+    } finally {
+      process.stderr.write = writeOrig;
+    }
+  });
+
+  test('non-blocking event clamps per-hook timeout to remaining budget', async () => {
+    // The clamp fires for non-blocking events too. With
+    // chainStart=0 and iter0 elapsed=14_900, h1 (spec
+    // timeout 30_000) gets clamped to 100ms. Real timer at
+    // 100ms triggers kill → fake's killImmediate=true
+    // resolves → result.kind='timeout' with timeoutMs=100.
+    const fake = makeFakeSpawn({ exitCode: 0, delayMs: 60_000, killImmediate: true });
+    const hooks = [makeSpec({ event: 'Stop', command: 'h1', timeoutMs: 30_000 })];
+    const payload = {
+      schema: 'v1',
+      event: 'Stop',
+      sessionId: 'sess',
+      data: { durationMs: 100, costUsd: 0.01, steps: 5 },
+    } as HookEventPayload;
+    let callIdx = 0;
+    const clockValues = [0, 14_900, 14_900, 14_900];
+    const now = (): number => clockValues[callIdx++] ?? 14_900;
+    const start = Date.now();
+    const result = await dispatchChain(hooks, payload, '/cwd', { spawn: fake, now });
+    const realElapsed = Date.now() - start;
+    expect(result.runs).toHaveLength(1);
+    const h1 = result.runs[0]?.result;
+    expect(h1?.kind).toBe('timeout');
+    if (h1?.kind === 'timeout') {
+      expect(h1.timeoutMs).toBe(100);
+    }
+    // Real wall-clock is ~100ms; pre-fix would have waited
+    // 30s for the unclamped timer.
+    expect(realElapsed).toBeLessThan(3_000);
+  });
 });
 
 describe('dispatchChain — blocking events', () => {
