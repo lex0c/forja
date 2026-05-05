@@ -145,22 +145,39 @@ const truncate = (s: string): string => {
   return `${decoder.decode(cut)}\n... (truncated)`;
 };
 
-// Read a stream to a string, capping at the byte limit.
+// Read a stream to a string, capping at the byte limit. The cap
+// is 4× HOOK_STDOUT_MAX_BYTES so `truncate()` (post-read) has
+// slack for the trailing "(truncated)" marker without losing
+// useful prefix bytes — keeping the audit-visible cap as the
+// canonical truncate point. The READ-side cap is the OOM guard
+// against pathological hooks emitting megabytes; truncate is
+// the audit-presentation cap. Exported for direct unit-test of
+// the slicing behavior without driving a full dispatchOne.
+export const STREAM_READ_CAP_BYTES = 16 * 1024;
+
 const readStream = async (stream: ReadableStream<Uint8Array>): Promise<string> => {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
-  // Read until EOF. We don't bail early on cap because the
-  // hook may keep writing; we'd rather buffer + truncate at
-  // the end so the audit shows the prefix the operator gets.
-  // Stop at 16KB to avoid pathological-output OOM.
+  // Read until EOF OR cap. The cap is enforced PER CHUNK before
+  // buffering — an earlier cut pushed each chunk first and
+  // checked total afterward, so a single multi-MB chunk would
+  // be fully buffered (defeating the OOM guard) before the
+  // post-push check broke the loop. Now: slice each chunk down
+  // to the remaining budget, push the slice, break when the
+  // budget is exhausted. Worst-case memory = exactly
+  // STREAM_READ_CAP_BYTES + one chunk-header overhead, no
+  // matter how large each chunk arrives.
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     if (value === undefined) continue;
-    chunks.push(value);
-    total += value.byteLength;
-    if (total > 16 * 1024) break;
+    const remaining = STREAM_READ_CAP_BYTES - total;
+    if (remaining <= 0) break;
+    const slice = value.byteLength <= remaining ? value : value.subarray(0, remaining);
+    chunks.push(slice);
+    total += slice.byteLength;
+    if (total >= STREAM_READ_CAP_BYTES) break;
   }
   if (chunks.length === 0) return '';
   const combined = new Uint8Array(total);
@@ -171,6 +188,12 @@ const readStream = async (stream: ReadableStream<Uint8Array>): Promise<string> =
   }
   return new TextDecoder('utf-8', { fatal: false }).decode(combined);
 };
+
+// Test-only seam exposing the module-private readStream so the
+// per-chunk slicing behavior can be unit-tested without driving
+// a full dispatchOne (which post-truncates the audit-cap on top).
+export const _readStreamForTests = (stream: ReadableStream<Uint8Array>): Promise<string> =>
+  readStream(stream);
 
 // Build the env dict passed to the hook subprocess. Strict
 // allow-list per CONTRACTS.md §3 line 707: PATH, HOME,

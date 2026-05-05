@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  STREAM_READ_CAP_BYTES,
+  _readStreamForTests,
   dispatchChain,
   dispatchOne,
   filterMatchingHooks,
@@ -729,6 +731,68 @@ describe('resolveHookShell', () => {
     if (r.kind === 'posix') {
       expect(r.argv).toEqual(['C:\\Windows\\System32\\powershell.exe', '-NoProfile', '-Command']);
     }
+  });
+});
+
+describe('readStream — OOM cap', () => {
+  // Sanity-revert: pre-fix, the loop pushed the FULL chunk
+  // before checking total. A single 1MB chunk arriving from a
+  // chatty hook would be fully buffered in memory before the
+  // post-push check broke the loop — defeating the OOM guard.
+  // Fix slices each chunk to the remaining budget BEFORE
+  // pushing.
+
+  test('single chunk larger than cap is sliced; final string respects cap', async () => {
+    // 64 KB chunk vs 16 KB cap → final string must be 16 KB.
+    const big = new Uint8Array(64 * 1024).fill(65); // 'A' × 64KB
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(big);
+        controller.close();
+      },
+    });
+    const result = await _readStreamForTests(stream);
+    // UTF-8 'A' is 1 byte each, so byteLength === string length.
+    expect(result.length).toBe(STREAM_READ_CAP_BYTES);
+    expect(new TextEncoder().encode(result).byteLength).toBe(STREAM_READ_CAP_BYTES);
+  });
+
+  test('many small chunks summing past cap stop at the budget', async () => {
+    // 100 chunks × 1KB = 100KB, cap 16KB → result is exactly
+    // 16KB, no overrun.
+    const chunkSize = 1024;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let i = 0; i < 100; i += 1) {
+          controller.enqueue(new Uint8Array(chunkSize).fill(66));
+        }
+        controller.close();
+      },
+    });
+    const result = await _readStreamForTests(stream);
+    expect(result.length).toBe(STREAM_READ_CAP_BYTES);
+  });
+
+  test('chunks summing under cap are read fully (no early break)', async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('hello '));
+        controller.enqueue(new TextEncoder().encode('world'));
+        controller.close();
+      },
+    });
+    const result = await _readStreamForTests(stream);
+    expect(result).toBe('hello world');
+  });
+
+  test('empty stream returns empty string', async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.close();
+      },
+    });
+    const result = await _readStreamForTests(stream);
+    expect(result).toBe('');
   });
 });
 
