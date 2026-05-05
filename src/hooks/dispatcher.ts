@@ -697,12 +697,18 @@ export const dispatchChain = async (
     const spec = matching[i];
     if (spec === undefined) continue;
     const elapsed = now() - chainStarted;
-    if (isBlocking && elapsed > MAX_HOOK_CHAIN_MS) {
+    if (isBlocking && elapsed >= MAX_HOOK_CHAIN_MS) {
       // Whole-chain timeout per CONTRACTS.md §10 line 1040.
       // Surface as a stderr warning + skip remaining hooks.
       // For audit clarity, we don't emit `hook_runs` rows for
       // skipped hooks — the absence is itself the signal
       // (compare against the resolved chain to spot it).
+      //
+      // `>=` not `>`: at exactly `elapsed === MAX`, remaining
+      // budget is zero and the per-hook clamp downstream would
+      // floor to 1ms (`Math.max(1, 0)`) — sneaking one extra
+      // hook past the documented hard cap. The boundary belongs
+      // to "expired", not "one more for free".
       process.stderr.write(
         `hooks: chain for ${payload.event} exceeded ${MAX_HOOK_CHAIN_MS}ms; skipping ${matching.length - i} remaining hook(s)\n`,
       );

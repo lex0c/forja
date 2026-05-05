@@ -582,6 +582,47 @@ describe('dispatchChain — blocking events', () => {
     expect(realElapsed).toBeLessThan(3_000);
   });
 
+  test('elapsed === MAX_HOOK_CHAIN_MS breaks before launching another hook', async () => {
+    // Sanity-revert: pre-fix, the cap check was strict `>`. At
+    // exactly `elapsed === MAX_HOOK_CHAIN_MS`, the loop fell
+    // through to the per-hook clamp where `Math.max(1, 0)`
+    // floored the remaining budget to 1ms — sneaking one extra
+    // hook past the documented hard cap. Boundary should belong
+    // to "expired", not "one more for free".
+    const fake = makeFakeSpawn({ exitCode: 0 });
+    const hooks = [
+      makeSpec({ event: 'PreToolUse', command: 'h1' }),
+      makeSpec({ event: 'PreToolUse', command: 'h2' }),
+    ];
+    const payload = {
+      schema: 'v1',
+      event: 'PreToolUse',
+      sessionId: 'sess',
+      data: { tool: { name: 'bash', input: {} } },
+    } as HookEventPayload;
+    // Clock layout: chainStart=0, iter0=0 (h1 starts), h1
+    // dispatchOne ×2 = 0,0, iter1=15000 (EXACT cap → must
+    // break). 7 calls total; pad with cap value.
+    let callIdx = 0;
+    const clockValues = [0, 0, 0, 0, 15_000, 15_000, 15_000];
+    const now = (): number => clockValues[callIdx++] ?? 15_000;
+    const errs: string[] = [];
+    const writeOrig = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((s: string | Uint8Array): boolean => {
+      if (typeof s === 'string') errs.push(s);
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const result = await dispatchChain(hooks, payload, '/cwd', { spawn: fake, now });
+      // Only h1 ran; h2 was skipped at the boundary.
+      expect(result.runs).toHaveLength(1);
+      expect(result.runs[0]?.spec.command).toBe('h1');
+      expect(errs.some((e) => e.includes('chain for PreToolUse exceeded'))).toBe(true);
+    } finally {
+      process.stderr.write = writeOrig;
+    }
+  });
+
   test('chain timeout (15s wall-clock) skips remaining hooks', async () => {
     // CONTRACTS.md §10 line 1040: blockable-event chain has a
     // wall-clock cap of 15s. Inject a clock that jumps past
