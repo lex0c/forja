@@ -201,4 +201,103 @@ describe('subagent_runs repo', () => {
     const run = getSubagentRun(db, child.id);
     expect(run?.toolsWhitelist).toEqual([]);
   });
+
+  describe('hooks_snapshot (migration 020)', () => {
+    test('round-trips a non-empty hook chain', () => {
+      const parent = seedSession();
+      const child = seedSession(parent.id);
+      const hooks = [
+        {
+          layer: 'enterprise' as const,
+          sourcePath: '/etc/agent/hooks.toml',
+          event: 'PreToolUse' as const,
+          matcher: { tool: 'bash' as const },
+          command: 'audit-bash {{tool.input.command}}',
+          timeoutMs: 5000,
+          failClosed: true,
+          locked: true,
+          entryIndex: 0,
+        },
+        {
+          layer: 'project' as const,
+          sourcePath: '/p/.agent/hooks.toml',
+          event: 'PostToolUse' as const,
+          matcher: { tool: 'write_file' as const },
+          command: 'lint {{tool.input.path}}',
+          timeoutMs: 3000,
+          failClosed: false,
+          locked: false,
+          entryIndex: 0,
+        },
+      ];
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'project',
+        sourcePath: '/p/.agent/agents/explore.md',
+        sourceSha256: 'a'.repeat(64),
+        systemPrompt: 'You are explore.',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 5,
+        budgetMaxCostUsd: 0.1,
+        hooksSnapshot: hooks,
+      });
+      const run = getSubagentRun(db, child.id);
+      expect(run?.hooksSnapshot).toEqual(hooks);
+    });
+
+    test('omitting hooksSnapshot lands as empty array (legacy fallback path)', () => {
+      // The child reads `hooksSnapshot.length === 0` as the
+      // signal to fall back to disk re-resolve. Programmatic
+      // callers that don't model the snapshot must produce
+      // exactly that shape.
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'r',
+        scope: 'user',
+        sourcePath: '/p',
+        sourceSha256: 'h',
+        systemPrompt: 'p',
+        toolsWhitelist: [],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0,
+      });
+      const run = getSubagentRun(db, child.id);
+      expect(run?.hooksSnapshot).toEqual([]);
+    });
+
+    test('malformed hooks_snapshot JSON parses as empty array (defensive)', () => {
+      // Mirror of the tools_whitelist defensive parse. A
+      // corrupt snapshot must not crash audit listings; the
+      // child receives an empty chain and falls through to disk
+      // re-resolve — same shape as a legacy row.
+      const child = seedSession(seedSession().id);
+      db.query(
+        `INSERT INTO subagent_runs
+           (session_id, name, scope, source_path, source_sha256, system_prompt,
+            tools_whitelist, budget_max_steps, budget_max_cost_usd,
+            policy_snapshot, hooks_snapshot, captured_at)
+         VALUES (?, 'explore', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', 'not-json', 0)`,
+      ).run(child.id);
+      const run = getSubagentRun(db, child.id);
+      expect(run?.hooksSnapshot).toEqual([]);
+    });
+
+    test('non-array hooks_snapshot parses as empty (shape guard)', () => {
+      // Parser refuses anything that isn't an array of objects —
+      // a stray `{}` or `null` payload would otherwise feed bad
+      // shapes into the dispatcher.
+      const child = seedSession(seedSession().id);
+      db.query(
+        `INSERT INTO subagent_runs
+           (session_id, name, scope, source_path, source_sha256, system_prompt,
+            tools_whitelist, budget_max_steps, budget_max_cost_usd,
+            policy_snapshot, hooks_snapshot, captured_at)
+         VALUES (?, 'explore', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', '{"oops":1}', 0)`,
+      ).run(child.id);
+      const run = getSubagentRun(db, child.id);
+      expect(run?.hooksSnapshot).toEqual([]);
+    });
+  });
 });

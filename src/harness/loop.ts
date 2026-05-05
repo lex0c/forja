@@ -1189,6 +1189,20 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     // are no progress events to observe between the
                     // brackets.
                     ...(config.onEvent !== undefined ? { onChildEvent: config.onEvent } : {}),
+                    // Hook-chain snapshot (migration 020). Forward
+                    // the parent's already-resolved chain so the
+                    // child seals it into its audit row instead of
+                    // re-resolving hooks.toml from disk on its own
+                    // startup. Closes the drift window where an
+                    // edit between parent spawn and child read
+                    // could land the child under a different chain.
+                    // Empty array ⇒ parent had no hooks; let the
+                    // child re-resolve the legacy way (audit row
+                    // gets `[]` and the child detects "no
+                    // snapshot").
+                    ...(config.hooks !== undefined && config.hooks.length > 0
+                      ? { hooksSnapshot: config.hooks }
+                      : {}),
                     // Propagate combined parent signal: a Ctrl+C or
                     // wall-clock timeout on the parent must abort
                     // the child run too. The child builds its own

@@ -1,3 +1,4 @@
+import type { HookSpec } from '../../hooks/types.ts';
 import type { Policy } from '../../permissions/index.ts';
 import type { DB } from '../db.ts';
 
@@ -30,6 +31,16 @@ export interface SubagentRun {
   // empty Policy → strict-mode defaults: maximally safe
   // interpretation of "unknown policy").
   policySnapshot: Policy;
+  // Snapshot of the parent's resolved hook chain at spawn time
+  // (migration 020). The subprocess child reads this and uses it
+  // INSTEAD of re-resolving `hooks.toml` from disk. Closes the
+  // drift window where a human edit between parent spawn and
+  // child startup could have run the child under a different
+  // hook chain than the parent had locked in. Empty array on
+  // pre-migration rows (the ALTER TABLE seeded `'[]'`) — child
+  // falls through to disk re-resolve on that path, preserving
+  // the legacy behavior.
+  hooksSnapshot: readonly HookSpec[];
   capturedAt: number;
 }
 
@@ -45,6 +56,7 @@ interface SubagentRunRow {
   budget_max_cost_usd: number;
   budget_max_wall_ms: number | null;
   policy_snapshot: string;
+  hooks_snapshot: string;
   captured_at: number;
 }
 
@@ -98,6 +110,24 @@ const fromRow = (row: SubagentRunRow): SubagentRun => {
   } catch {
     policySnapshot = { defaults: { mode: 'strict' }, tools: {} };
   }
+  // Defensive parse on hooks_snapshot. Same shape as
+  // tools_whitelist: TEXT column, JSON-array, fall back to []
+  // on parse failure or wrong shape. Empty array means "no
+  // snapshot" — caller falls through to disk re-resolve. We do
+  // NOT validate inner HookSpec field shapes here; the
+  // dispatcher tolerates field-level absences (clamps timeouts,
+  // etc.) and a corrupt entry would surface there with the
+  // same diagnostic path as a corrupt hooks.toml.
+  let hooksSnapshot: HookSpec[];
+  try {
+    const parsed = JSON.parse(row.hooks_snapshot) as unknown;
+    hooksSnapshot =
+      Array.isArray(parsed) && parsed.every((e) => e !== null && typeof e === 'object')
+        ? (parsed as HookSpec[])
+        : [];
+  } catch {
+    hooksSnapshot = [];
+  }
   return {
     sessionId: row.session_id,
     name: row.name,
@@ -110,6 +140,7 @@ const fromRow = (row: SubagentRunRow): SubagentRun => {
     budgetMaxCostUsd: row.budget_max_cost_usd,
     budgetMaxWallMs: row.budget_max_wall_ms,
     policySnapshot,
+    hooksSnapshot,
     capturedAt: row.captured_at,
   };
 };
@@ -132,6 +163,12 @@ export interface InsertSubagentRunInput {
   // Omitting it persists `'{}'` which the read path falls back
   // to strict-mode defaults — safe but maximally restrictive.
   policySnapshot?: Policy;
+  // Parent's resolved hook chain at spawn time. Production
+  // callers (subagent runtime) supply it; programmatic callers
+  // omitting it land an empty array, which the child treats as
+  // "no snapshot, re-resolve from disk" — preserving legacy
+  // behavior for fixtures that don't model the snapshot.
+  hooksSnapshot?: readonly HookSpec[];
   capturedAt?: number;
 }
 
@@ -143,12 +180,13 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
   // schema dumb, parse on read.
   const toolsJson = JSON.stringify(input.toolsWhitelist);
   const policyJson = JSON.stringify(input.policySnapshot ?? {});
+  const hooksJson = JSON.stringify(input.hooksSnapshot ?? []);
   db.query(
     `INSERT INTO subagent_runs
        (session_id, name, scope, source_path, source_sha256, system_prompt,
         tools_whitelist, budget_max_steps, budget_max_cost_usd,
-        budget_max_wall_ms, policy_snapshot, captured_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        budget_max_wall_ms, policy_snapshot, hooks_snapshot, captured_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     input.sessionId,
     input.name,
@@ -161,6 +199,7 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     input.budgetMaxCostUsd,
     wallMs,
     policyJson,
+    hooksJson,
     capturedAt,
   );
   // Resolve the snapshot for the return value with the same
@@ -182,6 +221,7 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     budgetMaxCostUsd: input.budgetMaxCostUsd,
     budgetMaxWallMs: wallMs,
     policySnapshot,
+    hooksSnapshot: input.hooksSnapshot ?? [],
     capturedAt,
   };
 };
@@ -200,7 +240,7 @@ export const getSubagentRun = (db: DB, sessionId: string): SubagentRun | null =>
     .query<SubagentRunRow, [string]>(
       `SELECT session_id, name, scope, source_path, source_sha256, system_prompt,
               tools_whitelist, budget_max_steps, budget_max_cost_usd,
-              budget_max_wall_ms, policy_snapshot, captured_at
+              budget_max_wall_ms, policy_snapshot, hooks_snapshot, captured_at
          FROM subagent_runs
         WHERE session_id = ?`,
     )

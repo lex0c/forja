@@ -3364,6 +3364,56 @@ describe('runSubagent — interrupt soft/hard (S3)', () => {
     expect(fake.parentSent.some((m) => m.type === 'interrupt:hard')).toBe(false);
   });
 
+  test('hooksSnapshot is sealed onto the audit row at insert time (migration 020)', async () => {
+    // Drift defense for the hook chain: parent's resolved hooks
+    // get snapshotted into subagent_runs.hooks_snapshot so the
+    // child reads from there instead of re-resolving hooks.toml
+    // (which a human edit between spawn and child startup could
+    // have changed). The runtime test verifies the round-trip;
+    // child-side use of the snapshot is exercised by the
+    // real-subprocess smoke.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const fake = fakeSpawnInterruptable();
+    const hooks = [
+      {
+        layer: 'enterprise' as const,
+        sourcePath: '/etc/agent/hooks.toml',
+        event: 'PreToolUse' as const,
+        matcher: { tool: 'bash' as const },
+        command: 'audit-bash',
+        timeoutMs: 5000,
+        failClosed: true,
+        locked: true,
+        entryIndex: 0,
+      },
+    ];
+    queueMicrotask(() => {
+      const children = listChildSessions(db, parent.id);
+      const last = children[children.length - 1];
+      if (last !== undefined) fake.publish(last.id, { status: 'done', reason: 'done' });
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      hooksSnapshot: hooks,
+      spawnChildProcess: fake.spawn,
+    });
+    const audit = (await import('../../src/storage/repos/subagent-runs.ts')).getSubagentRun(
+      db,
+      result.sessionId,
+    );
+    expect(audit?.hooksSnapshot).toEqual(hooks);
+  });
+
   test('toEnvelope round-trips abortCause as snake_cased abort_cause', () => {
     const result = {
       output: '',

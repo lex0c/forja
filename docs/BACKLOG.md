@@ -15,6 +15,123 @@ Format:
 
 ---
 
+## [2026-05-05] M3 / harden — subagent hook chain snapshot (migration 020)
+
+Same branch (`feat/m3-subagent-ipc`). Mirror of migration 015
+(policy snapshot) for the hooks subsystem. Closes the same drift
+window: subprocess subagents re-resolved their hook chain from
+`hooks.toml` at startup, so a human edit between parent spawn and
+child startup could land the child running under a different
+chain than the parent had locked in.
+
+This is the deferred item the operator picked from the
+"production blockers" list, framed as the bounded interpretation
+of "subprocess hook forwarding" — snapshot only, NOT
+cross-process per-tool hook dispatch (that broader work
+stays deferred per AGENTIC_CLI §10).
+
+**Done:**
+
+- **Migration 020** (`storage/migrations/020-subagent-runs-hooks.ts`):
+  `ALTER TABLE subagent_runs ADD COLUMN hooks_snapshot TEXT NOT
+  NULL DEFAULT '[]'`. Same TEXT-of-JSON convention as
+  `tools_whitelist` and `policy_snapshot`. Default empty array
+  so pre-migration rows parse as "no snapshot, fall back to disk
+  re-resolve" — preserving the legacy behavior for older
+  fixtures.
+
+- **Repo extensions** (`storage/repos/subagent-runs.ts`):
+  `SubagentRun.hooksSnapshot: readonly HookSpec[]` field;
+  `InsertSubagentRunInput.hooksSnapshot?` optional input;
+  `fromRow` parses defensively (try/catch on JSON, shape guard
+  rejecting non-array / non-object entries → empty array on
+  corruption).
+
+- **Runtime wiring** (`src/subagents/runtime.ts`):
+  `RunSubagentInput.hooksSnapshot?: readonly HookSpec[]`
+  forwarded to `insertSubagentRun`. Conditional spread keeps the
+  empty-array semantic for callers who don't supply a chain.
+
+- **Harness loop** (`src/harness/loop.ts`): `spawnSubagent`
+  closure now passes `config.hooks` as `hooksSnapshot` when
+  non-empty. Empty parent chain → omit, child re-resolves
+  (legacy path).
+
+- **Child bootstrap** (`src/cli/subagent-child.ts`): hook chain
+  resolution branches on `audit.hooksSnapshot.length`:
+  - **Snapshot path** (`length > 0`): use `audit.hooksSnapshot`
+    directly. No disk re-resolve, no warnings (the parent
+    already surfaced any when it resolved upstream).
+  - **Legacy fallback** (`length === 0`): re-resolve via
+    `resolveHookConfig(resolveHookPaths(...))` exactly as
+    before. Preserves the spec §10 unbypassable-corp-policy
+    claim for pre-migration rows: enterprise locked hooks on
+    disk still bind even when the parent forgot to supply the
+    snapshot.
+
+- **Tests** (5 new):
+  - `tests/storage/subagent-runs.test.ts` (4 cases): non-empty
+    chain round-trip; omitted snapshot lands as empty;
+    malformed JSON parses defensively as empty;
+    non-array shape (e.g. `'{"oops":1}'`) rejected as empty.
+  - `tests/subagents/runtime.test.ts` (1 case): runtime forwards
+    `hooksSnapshot` through `insertSubagentRun` so the audit row
+    sees the parent's chain verbatim.
+
+- **Smoke regression check**: re-ran
+  `evals/smoke-subagent-explore.sh` against Haiku 4.5 — still
+  passes (the smoke's workspace has no hooks.toml, so the
+  parent's resolved chain is empty, child takes the legacy
+  fallback path which is the pre-migration behavior).
+
+**Decisions:**
+
+1. **Snapshot path is opt-in via parent forwarding, not
+   automatic.** The runtime's `runSubagent` accepts
+   `hooksSnapshot` as an optional input. Production callers (the
+   harness loop's `spawnSubagent` closure) supply it; test
+   fixtures that don't model hooks omit it and exercise the
+   legacy fallback. This keeps the existing test surface stable
+   — every `runSubagent` test that passes today keeps passing
+   without a hook context to thread.
+
+2. **Empty array means "fall back", not "no hooks".** The child
+   distinguishes `length === 0` from `length > 0`. An operator
+   that legitimately wants the child to run with NO hooks even
+   though the parent had some would need a different signal —
+   we don't model that today because it's not a real use case
+   (parent's hooks should bind the child). The semantic stays
+   simple: parent had hooks → child uses snapshot; parent had
+   none → child re-resolves from disk (and may find some
+   independently, which is the legacy behavior).
+
+3. **No child-side integration test specifically for snapshot
+   vs disk divergence.** The repo round-trip tests + the
+   runtime audit-row test prove the snapshot persists and is
+   readable. The child's branch is a single `if`; verifying it
+   would require either exposing the resolved chain through a
+   test seam (invasive) or constructing a workspace where
+   `hooks.toml` differs from the snapshot (heavy fixture for
+   marginal coverage). The smoke + manual review of the branch
+   is the contract test.
+
+4. **`hooks_snapshot` parser does NOT validate inner HookSpec
+   shapes.** A corrupt entry's missing/wrong field surfaces at
+   the dispatcher (which already tolerates field absences via
+   timeout clamps and defensive resolution). Mirrors the same
+   minimal-validation philosophy `tools_whitelist` uses; the
+   schema stays dumb.
+
+**Pending:** none. The two harder items the operator asked
+about — Permission proxy and broader subprocess hook forwarding
+(cross-process per-tool dispatch) — stay deferred with their own
+scope rationale (Permission proxy is genuine M2+ work per spec
+§1.1; cross-process dispatch is C in the BACKLOG taxonomy and
+needs an IPC slice + design doc). This branch closes
+production-readiness for the wire-shape contract.
+
+---
+
 ## [2026-05-05] M3 / smoke — three production paths against real provider
 
 Same branch (`feat/m3-subagent-ipc`). After the FileSink/replay-

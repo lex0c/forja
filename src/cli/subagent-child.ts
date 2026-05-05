@@ -621,25 +621,36 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text) ?? '';
     }
 
-    // Hooks subsystem (spec AGENTIC_CLI.md §10). The subprocess
-    // subagent re-resolves the same three-layer hook hierarchy
-    // the parent uses — without this, an enterprise `locked:
-    // true` PreToolUse hook protecting `bash` is enforced in
-    // the parent but bypassed by every `task`-spawned child
-    // (defeating the §10 unbypassable-corp-policy claim). Anchor
-    // the project layer at the PARENT's cwd via `memoryCwd`
-    // (when forwarded) or fall back to `session.cwd`. Same
-    // shape as the memory anchor: the project's hooks.toml
-    // belongs to the repo the operator configured, not to a
-    // worktree. Warnings surface on stderr alongside the
-    // permission/policy ones; AUDIT DRIFT-style failures stay
-    // local to the dispatcher.
-    const hookAnchor = opts.memoryCwd !== undefined ? opts.memoryCwd : session.cwd;
-    const hookRepoRoot = resolveRepoRoot(hookAnchor);
-    const resolvedHooks = resolveHookConfig(resolveHookPaths(hookRepoRoot));
-    for (const w of resolvedHooks.warnings) {
-      const layerFrag = w.layer !== null ? `${w.layer} ` : '';
-      errSink(`forja: subagent-child: ${layerFrag}hook ${w.sourcePath}: ${w.message}\n`);
+    // Hooks subsystem (spec AGENTIC_CLI.md §10). Two paths:
+    //
+    //   1. Snapshot path (preferred, migration 020): the parent
+    //      forwarded its resolved chain via `subagent_runs.hooks_snapshot`.
+    //      We use it as-is. No disk re-resolve, no warnings (the
+    //      parent already surfaced any when it resolved).
+    //   2. Legacy fallback: `audit.hooksSnapshot` is empty (older
+    //      rows from before migration 020, or programmatic
+    //      callers that didn't supply a chain). Re-resolve the
+    //      same three-layer hierarchy the parent uses, anchored
+    //      at the PARENT's cwd via `memoryCwd` (when forwarded)
+    //      or `session.cwd` as fallback. Surface config warnings
+    //      on stderr.
+    //
+    // The fallback preserves the spec §10 unbypassable-corp-
+    // policy claim for legacy rows: an enterprise `locked: true`
+    // PreToolUse hook on disk still binds the child even when
+    // the parent forgot to supply the snapshot.
+    let hookChain: readonly import('../hooks/types.ts').HookSpec[];
+    if (audit.hooksSnapshot.length > 0) {
+      hookChain = audit.hooksSnapshot;
+    } else {
+      const hookAnchor = opts.memoryCwd !== undefined ? opts.memoryCwd : session.cwd;
+      const hookRepoRoot = resolveRepoRoot(hookAnchor);
+      const resolvedHooks = resolveHookConfig(resolveHookPaths(hookRepoRoot));
+      for (const w of resolvedHooks.warnings) {
+        const layerFrag = w.layer !== null ? `${w.layer} ` : '';
+        errSink(`forja: subagent-child: ${layerFrag}hook ${w.sourcePath}: ${w.message}\n`);
+      }
+      hookChain = resolvedHooks.hooks;
     }
 
     const config = {
@@ -730,7 +741,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // subagent through the same hooks.toml the parent loaded
       // (re-resolved here from the same repo root, so config
       // staleness across spawn isn't a concern).
-      hooks: resolvedHooks.hooks,
+      hooks: hookChain,
       // S3: route IPC interrupt commands into the harness's
       // abort plumbing. The harness honors `signal` for hard
       // preemption (in-flight provider call abort) and

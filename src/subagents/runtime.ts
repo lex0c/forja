@@ -1,6 +1,7 @@
 import { readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import type { HarnessEvent, HarnessResult } from '../harness/index.ts';
+import type { HookSpec } from '../hooks/types.ts';
 import type { PermissionEngine } from '../permissions/index.ts';
 import type { Provider } from '../providers/index.ts';
 import {
@@ -483,6 +484,17 @@ export interface RunSubagentInput {
   // `config.onEvent` so the parent's HarnessEvent → UIEvent
   // adapter sees the lifecycle automatically.
   onChildEvent?: (event: HarnessEvent) => void;
+  // Parent's resolved hook chain to seal into the child's audit
+  // row (migration 020). The child reads from the snapshot
+  // instead of re-resolving `hooks.toml` from disk — collapses
+  // the drift window where a human edit between parent spawn
+  // and child startup could land the child running under a
+  // different chain than the parent validated. The harness
+  // loop's spawnSubagent closure forwards `config.hooks`;
+  // programmatic callers that omit it land the child in the
+  // legacy disk-re-resolve path (preserving pre-migration
+  // behavior for fixtures that don't model the snapshot).
+  hooksSnapshot?: readonly HookSpec[];
 }
 
 export interface RunSubagentResult {
@@ -1358,6 +1370,14 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       // policy via `policy()`; that's the canonical source for
       // this snapshot.
       policySnapshot: input.permissionEngine.policy(),
+      // Mirror snapshot for the hook chain (migration 020). Same
+      // drift defense: child reads from this on startup instead
+      // of re-resolving hooks.toml from disk, so an edit between
+      // parent spawn and child read can't diverge the chain
+      // mid-run. Falls through to disk re-resolve when the
+      // caller didn't supply a chain (older test fixtures,
+      // programmatic callers without a hook context).
+      ...(input.hooksSnapshot !== undefined ? { hooksSnapshot: input.hooksSnapshot } : {}),
     });
   } catch (e) {
     await cleanupOnFail();
