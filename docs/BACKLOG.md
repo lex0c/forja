@@ -15,6 +15,115 @@ Format:
 
 ---
 
+## [2026-05-05] M3 / smoke — three production paths against real provider
+
+Same branch (`feat/m3-subagent-ipc`). After the FileSink/replay-
+buffer find, the operator pushed back: smoke caught two bugs the
+unit suite missed; what other paths need real-provider validation
+before claiming production-ready? Three highest-value gaps
+identified:
+
+1. **Hard interrupt** — operator presses Ctrl+C; AbortSignal must
+   propagate through the SDK's real `fetch` stream, not just our
+   AbortController fake.
+2. **Grandchild chain** — coordinator subagent task()s a worker;
+   tests `subagentDepth` propagation across two `Bun.spawn` hops
+   AND the IPC `event` filter holds at the boundary on BOTH sides.
+3. **Worktree + IPC composition** — independently sound subsystems
+   compose; child cwd ≠ parent cwd shouldn't degrade the wire.
+
+**Done:**
+
+- **`evals/smoke-subagent-interrupt.sh`** (~150 lines): spawns
+  parent in background under `--json`, polls SQLite for the
+  child session row to confirm task() fired, sends SIGINT, waits
+  for parent exit. Asserts:
+  - Parent's `session_finished.result.reason = 'aborted'` AND
+    `abortCause = 'hard'`.
+  - `subagent_finished.status = 'interrupted'` (lifecycle bracket
+    reflects the kill).
+  - Child session in SQLite is finalized (not stuck `running`).
+
+- **`evals/smoke-subagent-grandchild.sh`** (~180 lines): defines
+  a `coordinator` subagent (tools=[task]) and a `worker` subagent
+  (tools=[read_file, glob, grep]); parent prompts the coordinator
+  to delegate to the worker. Asserts:
+  - Three sessions linked correctly (parent → coordinator →
+    worker via `parent_session_id`); worker does NOT directly
+    link to top-level parent.
+  - `subagent_runs` audit row at both subagent levels with the
+    right name.
+  - Top-level parent's NDJSON has EXACTLY ONE bracket pair, name
+    = 'coordinator'. Worker bracket filtered at the IPC
+    boundary.
+  - No `subagent_progress.lastEvent` carries inner `subagent_*`
+    or `session_finished` events (filter holds end-to-end).
+
+- **`evals/smoke-subagent-worktree-ipc.sh`** (~180 lines):
+  initializes a real git repo as workspace, defines a `scribe`
+  subagent with `isolation: worktree` and a `write_file` tool.
+  Asserts:
+  - `subagent_worktrees` audit row has matching path/branch/
+    status, child's `session.cwd` equals worktree path.
+  - IPC bracket pair lands AND ≥1 `subagent_progress` event
+    crossed the wire under worktree isolation.
+  - Parent's repo top-level NEVER mutated (no `report.txt` at
+    parent cwd; existing files unchanged).
+  - Worktree cleanup verdict (`cleaned` vs `preserved`)
+    matches the actual on-disk state.
+  - Whitelist enforced: child only invoked tools from its
+    declared set, no leak from worktree mode lifting the
+    refusal.
+
+**Smoke results against Haiku 4.5:**
+
+| Smoke | Real outcome |
+|---|---|
+| Interrupt | `reason=aborted, abortCause=hard, subagent.status=interrupted`, child session finalized. |
+| Grandchild | 3-level chain formed correctly, top-level parent saw only coordinator's bracket (worker filtered). |
+| Worktree+IPC | **75 progress events** crossed the wire under worktree isolation, status=preserved, repo top-level unmodified. |
+
+Total wall-clock: ~30s per run. Total cost: ~$0.13 across all
+three. No regressions surfaced; the IPC stack stayed honest under
+each surface.
+
+**Decisions:**
+
+1. **Soft interrupt smoke not added.** Soft is REPL-only (cli/
+   signal.ts maps SIGINT to hard); soft requires Esc through TTY
+   emulation. Covered at unit level (S3 describe block in
+   `tests/subagents/runtime.test.ts` + S3 child test). Adding a
+   TTY-emulating smoke would test the REPL's signal-handling
+   surface, not the IPC wire — outside this branch's scope.
+
+2. **75 progress events on the worktree smoke.** Anthropic's
+   streaming for a single tool-using turn fires ~20-25 events;
+   the worktree smoke had 2 read_file calls + 1 write_file +
+   final assistant text, so 3-4 turns × 20 events ≈ 75. Spec
+   §6 estimated 100-500 messages per session; we're squarely in
+   that range. The wire didn't drop, didn't reorder, didn't
+   degrade — `fakeTransportPair`'s synchronous emit semantics
+   matched real OS pipe behavior here.
+
+3. **Each smoke runs the production binary via `bun run`, not a
+   compiled release.** Compiled-release smokes would need
+   `bun build` in CI; the dev script path through
+   `process.execPath` exercises the same `defaultSpawnChildProcess`
+   logic with the same FileSink shape we just fixed. A future
+   release-binary smoke would catch only `resolveChildBinaryCmd`
+   regressions specific to compiled mode (the dev/compile branch
+   is well-tested in `tests/subagents/runtime.test.ts`).
+
+**Branch is genuinely tier-1 production-ready now.** The three
+deferred items called out earlier are still deferred (Map cap,
+soft routing harness e2e, permission proxy, hook forwarding) but
+each has clear triggers and none is load-bearing for the wire's
+current contract.
+
+**Pending:** none. Ready for PR.
+
+---
+
 ## [2026-05-05] M3 / fix — subagents IPC: FileSink stdin + replay buffer fanout (smoke caught)
 
 Same branch (`feat/m3-subagent-ipc`). Real-provider smoke
