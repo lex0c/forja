@@ -77,6 +77,9 @@ export const readStream = async (stream: ReadableStream<Uint8Array>): Promise<st
 };
 
 // Test-only alias for `readStream`, kept for backwards compat
-// with existing test imports.
+// with existing test imports. Lets the per-chunk slicing
+// behavior be unit-tested without driving a full dispatchOne
+// (which post-truncates the audit-cap on top of what readStream
+// caps at the buffer level).
 export const _readStreamForTests = (stream: ReadableStream<Uint8Array>): Promise<string> =>
   readStream(stream);

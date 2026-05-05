@@ -11,8 +11,6 @@ export interface DispatchedProcess {
   kill: (signal?: 'SIGTERM' | 'SIGKILL') => void;
 }
 
-export type SpawnFn = (cmd: string[], opts: SpawnOpts) => DispatchedProcess;
-
 export interface SpawnOpts {
   env: Record<string, string>;
   cwd: string;
@@ -20,6 +18,8 @@ export interface SpawnOpts {
   stdout: 'pipe';
   stderr: 'pipe';
 }
+
+export type SpawnFn = (cmd: string[], opts: SpawnOpts) => DispatchedProcess;
 
 export const defaultSpawn: SpawnFn = (cmd, opts) => {
   const proc = Bun.spawn(cmd, {

@@ -234,6 +234,11 @@ export const resolveHookShell = (opts: ResolveHookShellOpts = {}): HookShellReso
 // restart) — acceptable since the harness is one-process-per-
 // session today.
 let cachedShell: HookShellResolution | null = null;
+// Package-internal — exported only so dispatcher.ts can call
+// it across the module boundary. Do NOT re-export from
+// dispatcher.ts or index.ts; consumers outside src/hooks/
+// should reach for `resolveHookShell()` directly to get the
+// uncached resolution they can control via opts.
 export const getCachedShell = (): HookShellResolution => {
   if (cachedShell === null) cachedShell = resolveHookShell();
   return cachedShell;
