@@ -700,6 +700,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ...(config.isCwdTrusted === true ? { cwdTrusted: true } : {}),
             ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
             depth: childDepth,
+            // Forward the spawn factory test seam. Production
+            // callers leave it unset; runSubagent falls back to
+            // its default Bun.spawn-based factory.
+            ...(config.spawnChildProcess !== undefined
+              ? { spawnChildProcess: config.spawnChildProcess }
+              : {}),
             // Permission proxy (spec docs/spec/IPC.md §7).
             // Forward only when the parent has a `confirmPermission`
             // callback wired (REPL does; one-shot / headless do

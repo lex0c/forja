@@ -526,6 +526,17 @@ export interface HarnessConfig {
   // into a no-op filter — no perf cost beyond an empty array
   // walk.
   hooks?: readonly HookSpec[];
+  // Test seam: subprocess spawn factory threaded through
+  // `runSubagent` so the harness can exercise the full
+  // `task` / `task_async` chain without forking a real Bun
+  // process. Production callers omit; the harness's
+  // `spawnSubagentImpl` forwards this verbatim to `runSubagent`,
+  // which uses the default `Bun.spawn` factory when absent.
+  // Lives on the harness config (not the runtime call site)
+  // because the `task` family invokes runSubagent indirectly —
+  // tests need a way to reach the spawn point through the
+  // wider step loop.
+  spawnChildProcess?: import('../subagents/runtime.ts').SpawnChildProcess;
 }
 
 // Producer-facing args for `confirmMemoryWrite`. Mirrors

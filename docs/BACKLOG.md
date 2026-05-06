@@ -15,6 +15,45 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — e2e through real child harness (#11)
+
+Closes the test-débito identified in the post-review inventory: the
+`task_async` family was only exercised against a fake `spawnFn`,
+so the FULL chain (parent runAgent → tool dispatch → handle store
+→ runSubagent → real child via IPC) had no regression net.
+
+| File | Change |
+|---|---|
+| `src/harness/types.ts` | `HarnessConfig.spawnChildProcess?: SpawnChildProcess` (test seam). Production callers omit; the harness's `spawnSubagentImpl` forwards verbatim to `runSubagent`, which falls back to its default Bun.spawn factory when absent. Lives on the harness config (not the runtime call site) because the `task` family invokes runSubagent indirectly — tests need a way to reach the spawn point through the wider step loop. |
+| `src/harness/loop.ts` | `spawnSubagentImpl` threads the optional `spawnChildProcess` into its `runSubagent` call. |
+| `tests/harness/task-async-e2e.test.ts` | NEW. Two end-to-end tests: (a) "three task_async spawns + three task_await collect; children run in parallel" — drives a real parent runAgent emitting three task_async tools in one turn, captures the handle ids returned, then a second turn emits three task_await calls. The spawn factory runs `runSubagentChild` in-process via `fakeTransportPair` (same pattern as `tests/subagents/e2e.test.ts`), so the IPC channel, encode/parse, harness, providers, permission engine, and hook subsystem all run production code. Live-children counter confirms parallelism (`maxLiveChildren >= 2`). (b) "task_cancel preempts a running child via the IPC interrupt path" — single spawn with a 500ms-sleeping child; cancel fired in turn 2 must abort via the per-handle signal threading through to the IPC interrupt; full run bounded well under the natural completion time. |
+
+**Decisions:**
+
+- **D174 — Spawn factory test seam lives on `HarnessConfig`, not on the
+  `task` tools.** The runtime already exposes `spawnChildProcess`
+  on `RunSubagentInput` for tests of `runSubagent` directly, but
+  the e2e path that crosses the step loop needed the seam at the
+  harness level. The alternative was to expose it through
+  `ToolContext`, but tools shouldn't bypass the harness-controlled
+  spawn assembly — keeping the seam at the config layer matches
+  how `bgLogDir`, `subagentRegistry`, and other "harness-builds-
+  this" knobs surface.
+- **Parallelism assertion is `maxLiveChildren >= 2`, not `=== 3`.** The
+  child stub has a small natural delay, and the parent's
+  task_async dispatch is itself queued through the step loop;
+  there's a microscopic window where the first child can finish
+  before the third dispatches. `>= 2` is the load-bearing
+  parallelism proof — it distinguishes overlap from accidental
+  serialization. The handle store unit tests (`tests/subagents/
+  handle-store.test.ts`) pin `tracker.max === N` deterministically
+  for the cap-honoring case; the e2e accepts a wider window.
+
+Verification: typecheck clean, lint clean, 3061 pass / 0 fail /
+10 skip (2 new tests).
+
+---
+
 ## [2026-05-06] parallel — wire-shape completion (task_sync alias, timing, soft-stop D173)
 
 Closing three of the gaps that the post-review inventory still
