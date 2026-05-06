@@ -51,6 +51,12 @@ export interface PermissionAskArgs {
   cwd: string;
   rule?: string;
   reason?: string;
+  // Subagent attribution. Set by the parent harness when
+  // proxying a child's `permission:ask` over IPC (spec
+  // docs/spec/IPC.md §7). The reducer prefixes the modal title
+  // so the operator distinguishes a parent confirm from a child
+  // confirm. Undefined for the parent's own confirms.
+  subagent?: { sessionId: string; name: string };
 }
 
 // Trust flavor — first-run "is this directory safe to operate in?"
@@ -444,6 +450,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           cwd: args.cwd,
           ...(args.rule !== undefined ? { rule: args.rule } : {}),
           ...(args.reason !== undefined ? { reason: args.reason } : {}),
+          ...(args.subagent !== undefined ? { subagent: args.subagent } : {}),
         }),
         PERMISSION_OPTIONS(args.toolName),
         opts?.timeoutMs,

@@ -24,6 +24,7 @@ import {
   listMessageTailBySession,
   reopenSession,
 } from '../storage/index.ts';
+import type { PermissionDecision } from '../subagents/ipc.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
 import { type TodoStore, createTodoStore } from '../todo/index.ts';
 import type { ToolContext } from '../tools/index.ts';
@@ -1250,6 +1251,47 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     // Increment depth: the child being spawned is one
                     // level deeper than this run.
                     depth: childDepth,
+                    // Permission proxy (spec docs/spec/IPC.md §7).
+                    // Forward only when the parent has a
+                    // `confirmPermission` callback wired (REPL
+                    // does; one-shot / headless do not). Without
+                    // an operator surface there's no human to
+                    // ask; the runtime auto-denies on absence so
+                    // the child's bridge gets a prompt deny
+                    // instead of hanging until wall-clock. The
+                    // adapter maps the boolean answer onto the
+                    // wire decision; subagent attribution is
+                    // baked in by the runtime, so the closure
+                    // doesn't need to thread sessionId / name
+                    // through itself. Local rebind so the
+                    // narrowed type survives across the async
+                    // closure (the outer `config.confirmPermission
+                    // !== undefined` guard wouldn't follow a
+                    // member access through the promise hop).
+                    ...((): {
+                      onPermissionAsk?: (req: {
+                        toolName: string;
+                        args: Record<string, unknown>;
+                        cwd: string;
+                        prompt: string;
+                        subagent: { sessionId: string; name: string };
+                      }) => Promise<PermissionDecision>;
+                    } => {
+                      const ask = config.confirmPermission;
+                      if (ask === undefined) return {};
+                      return {
+                        onPermissionAsk: async (req) => {
+                          const allowed = await ask({
+                            toolName: req.toolName,
+                            args: req.args,
+                            cwd: req.cwd,
+                            prompt: req.prompt,
+                            subagent: req.subagent,
+                          });
+                          return allowed ? 'allow' : 'deny';
+                        },
+                      };
+                    })(),
                   });
                   return {
                     kind: 'ran',

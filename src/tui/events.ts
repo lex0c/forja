@@ -207,6 +207,12 @@ export type PermissionAskEvent = BaseEvent & {
   // Optional risk hint — when present, modal shows the "why?" detail.
   rule?: string;
   reason?: string;
+  // Subagent attribution. Set when the ask was proxied from a
+  // child subagent over IPC (spec docs/spec/IPC.md §7). The
+  // reducer renders a prefix in the modal preview so the
+  // operator distinguishes parent vs child requests. Undefined
+  // for the parent's own confirms.
+  subagent?: { sessionId: string; name: string };
 };
 // Modal resolution event. Renamed from `permission:answer` because
 // the same event flows for every modal flavor (trust answers `yes`/

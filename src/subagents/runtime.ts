@@ -19,7 +19,9 @@ import {
   IPC_PROTOCOL_VERSION,
   IPC_VERSION_MISMATCH_EXIT_CODE,
   type IpcMessage,
+  type PermissionDecision,
   makeInterruptHard,
+  makePermissionAnswer,
 } from './ipc.ts';
 import type { SubagentSet } from './load.ts';
 import { buildResultFromPayload } from './result-builder.ts';
@@ -247,6 +249,24 @@ export interface RunSubagentInput {
   // legacy disk-re-resolve path (preserving pre-migration
   // behavior for fixtures that don't model the snapshot).
   hooksSnapshot?: readonly HookSpec[];
+  // Permission proxy callback (spec docs/spec/IPC.md §7,
+  // permission:ask / permission:answer slice). When the child's
+  // engine returns a `confirm` verdict, the child bridge
+  // forwards a `permission:ask` over IPC; the runtime calls
+  // this hook with the child's request plus baked-in subagent
+  // attribution (sessionId + agent name). Callback resolves
+  // with the operator's verdict; runtime sends the matching
+  // `permission:answer` back over the channel. When omitted,
+  // every `permission:ask` from the child auto-denies (the
+  // safe fallback when no operator is wired — keeps the child
+  // from hanging on a missing answer).
+  onPermissionAsk?: (req: {
+    toolName: string;
+    args: Record<string, unknown>;
+    cwd: string;
+    prompt: string;
+    subagent: { sessionId: string; name: string };
+  }) => Promise<PermissionDecision>;
 }
 
 // Hard cap on how deep a chain of `task → task → task` can nest.
@@ -690,6 +710,70 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
           subagentId: childSession.id,
           lastEvent: inner as HarnessEvent,
         });
+      });
+    }
+    // Permission proxy (spec docs/spec/IPC.md §7,
+    // permission:ask / permission:answer slice). The child's
+    // bridge emits `permission:ask` when its engine returns a
+    // `confirm` verdict; the runtime forwards to the caller's
+    // hook with subagent attribution baked in, then ships the
+    // operator's verdict back as `permission:answer`. When
+    // `onPermissionAsk` is unset the runtime auto-denies so
+    // the child unblocks promptly — a child waiting on an
+    // answer that never arrives would hang past wall-clock.
+    {
+      const hook = input.onPermissionAsk;
+      handle.ipc.onMessage((msg) => {
+        if (msg.type !== 'permission:ask') return;
+        const promptId = msg.promptId;
+        // Args sanitization: the wire field is `unknown`. The
+        // hook contract requires Record<string, unknown>; if
+        // the child sent something else (model bug, malformed
+        // bridge) we deny rather than pass garbage to the
+        // modal renderer.
+        const args =
+          typeof msg.args === 'object' && msg.args !== null && !Array.isArray(msg.args)
+            ? (msg.args as Record<string, unknown>)
+            : null;
+        if (hook === undefined || args === null) {
+          try {
+            handle.ipc?.send(makePermissionAnswer({ promptId, decision: 'deny' }));
+          } catch {
+            // Channel may already be torn down (child died
+            // mid-ask). The child's bridge drains pending as
+            // denied on its onClose, so the verdict here is
+            // moot in that case.
+          }
+          return;
+        }
+        // Async hook. We don't await here (the IPC observer is
+        // sync); fire-and-forward and let the .then send the
+        // answer when the operator decides. Multiple parallel
+        // asks from the same child interleave naturally because
+        // each .then closure carries its own promptId.
+        hook({
+          toolName: msg.toolName,
+          args,
+          cwd: msg.cwd,
+          prompt: msg.prompt,
+          subagent: { sessionId: childSession.id, name: definition.name },
+        })
+          .then((decision: PermissionDecision) => {
+            try {
+              handle.ipc?.send(makePermissionAnswer({ promptId, decision }));
+            } catch {
+              // Channel teardown race — same as above.
+            }
+          })
+          .catch(() => {
+            // Hook threw. Treat as deny so the child doesn't
+            // hang waiting for an answer that will never come.
+            try {
+              handle.ipc?.send(makePermissionAnswer({ promptId, decision: 'deny' }));
+            } catch {
+              // ignored
+            }
+          });
       });
     }
     handle.ipc.onError((err) => {

@@ -32,6 +32,7 @@ import {
   createChannel,
   fakeTransportPair,
   makeEvent,
+  makePermissionAsk,
   makeSessionFinished,
   makeSessionStart,
 } from '../../src/subagents/ipc.ts';
@@ -4090,5 +4091,391 @@ describe('runSubagent — review fixes (round 4)', () => {
     });
     expect(result.status).toBe('error');
     expect(result.reason).toBe('subprocess_crashed');
+  });
+});
+
+// Slice 2 of the permission proxy (spec docs/spec/IPC.md §7).
+// Parent runtime listens for `permission:ask` from the child,
+// routes through the caller-supplied `onPermissionAsk` hook with
+// subagent attribution baked in, and ships `permission:answer`
+// back over the IPC channel. These tests use the same
+// fakeTransportPair pattern as the IPC observer tests above.
+describe('runSubagent — permission proxy (parent)', () => {
+  // Helper mirrors fakeSpawnWithIpc but exposes the channel and
+  // exit driver so each test can craft its own ask sequence.
+  const buildPermissionRig = () => {
+    const { a, b } = fakeTransportPair();
+    const parentChannel = createChannel(a);
+    const childChannel = createChannel(b);
+    let resolveExit: ((v: { exitCode: number }) => void) | undefined;
+    const exited = new Promise<{ exitCode: number }>((r) => {
+      resolveExit = r;
+    });
+    const publish = (sessionId: string): void => {
+      insertSubagentOutput(db, { sessionId });
+      setSubagentPayload(db, sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'ok',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      });
+      if (resolveExit !== undefined) {
+        resolveExit({ exitCode: 0 });
+        resolveExit = undefined;
+      }
+    };
+    const spawn: SpawnChildProcess = () => ({
+      exited,
+      kill: () => undefined,
+      ipc: parentChannel,
+    });
+    return { spawn, childChannel, publish };
+  };
+
+  test('permission:ask invokes onPermissionAsk with subagent attribution and ships allow back', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const calls: { req: unknown }[] = [];
+    const answers: IpcMessage[] = [];
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      // Child emits an ask, then publishes its payload so the
+      // wait loop resolves and the parent tears down the channel.
+      // Order: ask first so the observer fires before the
+      // session_finished envelope races the test microtask scheduler.
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-A',
+          toolName: 'bash',
+          args: { command: 'rm -rf /' },
+          cwd: '/p',
+          prompt: 'Run shell command?',
+        }),
+      );
+      // Drive publish on a follow-up microtask so the ask has
+      // time to round-trip through onPermissionAsk before exit
+      // closes the channel.
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    await runSubagent({
+      definition: definition({ name: 'explore' }),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: rig.spawn,
+      onPermissionAsk: async (req) => {
+        calls.push({ req });
+        return 'allow';
+      },
+    });
+
+    expect(calls).toHaveLength(1);
+    const req = calls[0]?.req as {
+      toolName: string;
+      args: Record<string, unknown>;
+      cwd: string;
+      prompt: string;
+      subagent: { sessionId: string; name: string };
+    };
+    expect(req.toolName).toBe('bash');
+    expect(req.args).toEqual({ command: 'rm -rf /' });
+    expect(req.cwd).toBe('/p');
+    expect(req.prompt).toBe('Run shell command?');
+    expect(req.subagent.name).toBe('explore');
+    expect(typeof req.subagent.sessionId).toBe('string');
+    expect(req.subagent.sessionId.length).toBeGreaterThan(0);
+
+    expect(answers).toHaveLength(1);
+    const ans = answers[0];
+    if (ans?.type === 'permission:answer') {
+      expect(ans.promptId).toBe('pid-A');
+      expect(ans.decision).toBe('allow');
+    }
+  });
+
+  test('hook returning deny ships deny back', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-B',
+          toolName: 'bash',
+          args: {},
+          cwd: '/p',
+          prompt: 'why?',
+        }),
+      );
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: rig.spawn,
+      onPermissionAsk: async () => 'deny',
+    });
+
+    expect(answers).toHaveLength(1);
+    if (answers[0]?.type === 'permission:answer') {
+      expect(answers[0].decision).toBe('deny');
+    }
+  });
+
+  test('missing onPermissionAsk auto-denies', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-C',
+          toolName: 'bash',
+          args: {},
+          cwd: '/p',
+          prompt: 'q',
+        }),
+      );
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: rig.spawn,
+      // No onPermissionAsk wired.
+    });
+
+    expect(answers).toHaveLength(1);
+    if (answers[0]?.type === 'permission:answer') {
+      expect(answers[0].promptId).toBe('pid-C');
+      expect(answers[0].decision).toBe('deny');
+    }
+  });
+
+  test('hook that throws auto-denies (child must not hang)', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-D',
+          toolName: 'bash',
+          args: {},
+          cwd: '/p',
+          prompt: 'q',
+        }),
+      );
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: rig.spawn,
+      onPermissionAsk: async () => {
+        throw new Error('hook exploded');
+      },
+    });
+
+    expect(answers).toHaveLength(1);
+    if (answers[0]?.type === 'permission:answer') {
+      expect(answers[0].decision).toBe('deny');
+    }
+  });
+
+  test('parallel asks each get their matching promptId answered', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-1',
+          toolName: 'bash',
+          args: { command: 'one' },
+          cwd: '/p',
+          prompt: 'q1',
+        }),
+      );
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-2',
+          toolName: 'write_file',
+          args: { path: 'a.txt' },
+          cwd: '/p',
+          prompt: 'q2',
+        }),
+      );
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: rig.spawn,
+      // Per-tool decision: bash deny, write_file allow. Verifies
+      // promptId correlation rather than positional ordering.
+      onPermissionAsk: async (req) => (req.toolName === 'write_file' ? 'allow' : 'deny'),
+    });
+
+    expect(answers).toHaveLength(2);
+    const byPid = new Map<string, string>();
+    for (const a of answers) {
+      if (a.type === 'permission:answer') byPid.set(a.promptId, a.decision);
+    }
+    expect(byPid.get('pid-1')).toBe('deny');
+    expect(byPid.get('pid-2')).toBe('allow');
+  });
+
+  test('malformed args (non-object) auto-denies', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    const calls: number[] = [];
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      // Hand-craft an ask whose `args` field is an array — the
+      // parser accepts (it only verifies the field is present)
+      // but the runtime's hook contract requires an object.
+      // Runtime must auto-deny, not crash, not invoke the hook.
+      rig.childChannel.send({
+        type: 'permission:ask',
+        id: 'env-1',
+        ts: Date.now(),
+        promptId: 'pid-bad',
+        toolName: 'bash',
+        args: [1, 2, 3],
+        cwd: '/p',
+        prompt: 'q',
+      });
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: rig.spawn,
+      onPermissionAsk: async () => {
+        calls.push(1);
+        return 'allow';
+      },
+    });
+
+    expect(calls).toEqual([]);
+    expect(answers).toHaveLength(1);
+    if (answers[0]?.type === 'permission:answer') {
+      expect(answers[0].promptId).toBe('pid-bad');
+      expect(answers[0].decision).toBe('deny');
+    }
   });
 });

@@ -838,6 +838,50 @@ describe('subagent lifecycle', () => {
   });
 });
 
+describe('permission:ask modal (UI.md §4.10.13)', () => {
+  test('parent confirm renders standard title without subagent prefix', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p1',
+      toolName: 'bash',
+      command: 'rm -rf /',
+      cwd: '/p',
+    } as UIEvent);
+    expect(r.state.modal).not.toBeNull();
+    if (r.state.modal !== null) {
+      expect(r.state.modal.title).toBe('Run command');
+      // Standard preview is `$ <command>` then `cwd: …`. No subagent line.
+      expect(r.state.modal.preview[0]).toBe('$ rm -rf /');
+    }
+  });
+
+  test('subagent attribution mutates title + injects prefix preview line', () => {
+    // Spec docs/spec/IPC.md §7: child-proxied asks must label the
+    // subagent so the operator can distinguish parent vs child
+    // requests. The reducer keys on the optional event field.
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p2',
+      toolName: 'bash',
+      command: 'ls',
+      cwd: '/p',
+      subagent: { sessionId: 'abcdef-12345678', name: 'explore' },
+    } as UIEvent);
+    expect(r.state.modal).not.toBeNull();
+    if (r.state.modal !== null) {
+      expect(r.state.modal.title).toBe('Subagent permission — explore');
+      // The first preview line is the attribution; the 8-char tail
+      // disambiguates concurrent instances of the same subagent.
+      expect(r.state.modal.preview[0]).toBe('subagent: explore (12345678)');
+      // Followed by the standard $cwd lines.
+      expect(r.state.modal.preview[1]).toBe('$ ls');
+      expect(r.state.modal.preview[2]).toBe('cwd: /p');
+    }
+  });
+});
+
 describe('not-yet-wired events accept silently', () => {
   test.each([
     [

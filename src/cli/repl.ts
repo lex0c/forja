@@ -24,6 +24,7 @@ import { basename, join } from 'node:path';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
 import { DEFAULT_BUDGET } from '../harness/types.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
+import { stripAnsi } from '../sanitize/index.ts';
 import {
   HISTORY_CAP,
   appendHistory,
@@ -736,6 +737,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     args: Record<string, unknown>;
     cwd: string;
     prompt: string;
+    subagent?: { sessionId: string; name: string };
   }): Promise<boolean> => {
     const vocab = lookupToolVocab(req.toolName);
     let command = '';
@@ -754,11 +756,31 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       }
       if (command.length > 80) command = `${command.slice(0, 80)}…`;
     }
+    // Anti-spoof for subagent-proxied requests (spec
+    // docs/spec/IPC.md §7). The child's tool args came from
+    // model output inside the subagent; a crafted system prompt
+    // (or a hostile agent .md file dropped in
+    // `.agent/agents/`) could pack ANSI escapes into args that
+    // the modal would otherwise render verbatim — mimicking
+    // friendly-looking labels around a destructive command. We
+    // apply stripAnsi to the strings the modal renders for
+    // subagent-proxied paths only; the parent's own confirms
+    // come from prompts the operator authored directly and stay
+    // unsanitized for fidelity.
+    if (req.subagent !== undefined) {
+      command = stripAnsi(command);
+    }
     const answer = await modalManager.askPermission({
       toolName: req.toolName,
       command,
-      cwd: req.cwd,
-      reason: req.prompt,
+      cwd: req.subagent !== undefined ? stripAnsi(req.cwd) : req.cwd,
+      reason: req.subagent !== undefined ? stripAnsi(req.prompt) : req.prompt,
+      // Forward subagent attribution so the modal can label the
+      // request as coming from a child run (spec
+      // docs/spec/IPC.md §7). Spread keeps the field absent for
+      // the parent's own confirms — the reducer only branches
+      // on its presence.
+      ...(req.subagent !== undefined ? { subagent: req.subagent } : {}),
     });
     // Map the spec-shape answer to the harness's boolean contract.
     // 'session-allow' currently behaves like 'yes' — the policy

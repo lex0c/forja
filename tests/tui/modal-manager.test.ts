@@ -232,6 +232,49 @@ describe('askPermission (3-option modal per UI.md §4.10.13)', () => {
     return promise;
   });
 
+  test('subagent attribution is forwarded to permission:ask event', () => {
+    // Spec docs/spec/IPC.md §7: when the parent proxies a child's
+    // permission:ask, the modal must show which subagent is
+    // requesting. The manager threads the optional `subagent`
+    // field straight onto the emitted event; the reducer renders.
+    const s = make();
+    const promise = s.manager.askPermission({
+      toolName: 'bash',
+      command: 'rm',
+      cwd: '/p',
+      subagent: { sessionId: 'sess-12345678', name: 'explore' },
+    });
+    const askEvent = s.events.find((e) => e.type === 'permission:ask');
+    expect(askEvent).toBeDefined();
+    if (askEvent !== undefined && askEvent.type === 'permission:ask') {
+      expect(askEvent.subagent).toEqual({
+        sessionId: 'sess-12345678',
+        name: 'explore',
+      });
+    }
+    s.fs.dispatch(key('escape'));
+    return promise;
+  });
+
+  test('omitting subagent leaves the event field absent', () => {
+    // Defensive — the manager spreads conditionally so consumers
+    // that branch on `subagent !== undefined` (the reducer does)
+    // never see a truthy field for a parent's own confirm.
+    const s = make();
+    const promise = s.manager.askPermission({
+      toolName: 'bash',
+      command: 'rm',
+      cwd: '/p',
+    });
+    const askEvent = s.events.find((e) => e.type === 'permission:ask');
+    expect(askEvent).toBeDefined();
+    if (askEvent !== undefined && askEvent.type === 'permission:ask') {
+      expect(askEvent.subagent).toBeUndefined();
+    }
+    s.fs.dispatch(key('escape'));
+    return promise;
+  });
+
   test('Multiple navigations emit a modal:select per move with the right index', async () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });

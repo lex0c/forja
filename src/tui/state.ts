@@ -783,6 +783,17 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
         { key: '3', label: 'No', value: 'no' },
       ];
       const previewLines: string[] = [];
+      // Subagent attribution prefix (spec docs/spec/IPC.md §7).
+      // First line so the operator's eye lands on it before the
+      // command. Anti-spoof: only the agent's `name` (the
+      // definition's declared name from the agents/*.md
+      // frontmatter) reaches the preview — never a string the
+      // child generated. The 8-char sessionId tail disambiguates
+      // when multiple instances of the same agent run in parallel.
+      if (event.subagent !== undefined) {
+        const idTail = event.subagent.sessionId.slice(-8);
+        previewLines.push(`subagent: ${event.subagent.name} (${idTail})`);
+      }
       previewLines.push(`$ ${event.command}`);
       previewLines.push(`cwd: ${event.cwd}`);
       if (event.rule !== undefined) previewLines.push(`matched rule: ${event.rule}`);
@@ -792,7 +803,10 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
           modal: {
             promptId: event.promptId,
             flavor: 'permission',
-            title: 'Run command',
+            title:
+              event.subagent !== undefined
+                ? `Subagent permission — ${event.subagent.name}`
+                : 'Run command',
             subject: event.command,
             preview: previewLines,
             question:

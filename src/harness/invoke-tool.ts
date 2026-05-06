@@ -33,6 +33,13 @@ export interface ConfirmPermissionRequest {
   // ("matches deny rule bash.rm.rf", "tool runs outside workspace",
   // etc.). Renderer surfaces it as the modal's `reason`/`rule`.
   prompt: string;
+  // Subagent attribution. Set when the request originates from a
+  // child run (parent's IPC observer routes the child's
+  // `permission:ask` through `confirmPermission` with this filled).
+  // The TUI renderer prefixes the modal so the operator can tell
+  // a parent confirm from a child confirm. Undefined for the
+  // parent's own confirms.
+  subagent?: { sessionId: string; name: string };
 }
 
 export interface InvokeToolDeps {

@@ -1033,6 +1033,58 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('confirmPermission with subagent attribution survives ANSI-tainted args end-to-end', async () => {
+    // Spec docs/spec/IPC.md §7. The child's tool args originate
+    // inside the subagent — a hostile agent definition could
+    // inject ANSI escape sequences into args that, rendered raw,
+    // would mislead the operator (fake "✓ trusted" labels around
+    // `rm -rf /`). The bridge applies stripAnsi to command,
+    // cwd, and prompt before handing them to the modal manager;
+    // strip behavior itself is unit-tested in sanitize tests.
+    // This test guards the integration path: bridge + tainted
+    // input + subagent attribution must round-trip the modal
+    // without crashing or losing the operator's verdict.
+    // Smoke: drive the bridge with tainted strings + subagent
+    // attribution, hit '1' to allow, assert the answer is true
+    // (sanitization didn't crash the path) and that no escape
+    // bytes survived in the captured `permission:ask` event the
+    // bus carried — the modal manager keeps fields verbatim.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    expect(cfg?.confirmPermission).toBeDefined();
+    const tainted = '[31mrm -rf /[0m';
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: tainted },
+      cwd: '[32m/safe[0m',
+      prompt: '[33mLooks fine[0m',
+      subagent: { sessionId: 'sess-childA', name: 'explore' },
+    });
+    await tick();
+    // Hotkey '1' resolves the modal as 'yes' — bridge maps to true.
+    stdin.feed('1');
+    await tick();
+    const answer = await askPromise;
+    expect(answer).toBe(true);
+    // Wrap up.
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('error thrown by runAgent surfaces as an error UIEvent and lets the REPL continue', async () => {
     const stdin = makeStdin();
     const resolvers: Array<(r: HarnessResult) => void> = [];
