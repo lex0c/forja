@@ -238,6 +238,24 @@ export type ModalSelectEvent = BaseEvent & {
   promptId: string;
   selectedIndex: number;
 };
+// Live update of how many other ask*s are queued behind the active
+// modal. Producer (modal-manager) emits one when the modal opens
+// (snapshot of `queue.length` at drain time) and again every time
+// a new ask enqueues while the modal is up. Reducer updates the
+// active modal's `queueDepth` when promptId matches; mismatches
+// drop silently (a stale event arriving after the matching modal
+// already resolved). Renderer surfaces the depth as a title
+// suffix so the operator sees the queue grow / shrink in real
+// time instead of being blindsided when answering one modal
+// auto-pops the next.
+export type ModalQueueDepthEvent = BaseEvent & {
+  type: 'modal:queue-depth';
+  promptId: string;
+  // Number of asks waiting BEHIND this active one — does NOT
+  // include the active modal itself. Zero when the active is
+  // the only ask in flight.
+  depth: number;
+};
 export type TrustAskEvent = BaseEvent & {
   type: 'trust:ask';
   promptId: string;
@@ -520,6 +538,7 @@ export type UIEvent =
   | PermissionAskEvent
   | ModalAnswerEvent
   | ModalSelectEvent
+  | ModalQueueDepthEvent
   | TrustAskEvent
   | MemoryWriteAskEvent
   | MemoryUserScopeAskEvent

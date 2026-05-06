@@ -365,6 +365,84 @@ describe('queue', () => {
     await expect(p2).resolves.toBe('yes');
     expect(s.manager.pendingCount()).toBe(0);
   });
+
+  test('queue depth events: live updates as asks enqueue + resolve', async () => {
+    // Three asks pile up: first opens active, second + third queue.
+    // The contract:
+    //   - First ask opens → no `modal:queue-depth` (queue empty
+    //     behind it, no suffix needed). We skip emitting depth=0
+    //     to keep the event stream quieter.
+    //   - Second ask enqueues while active → emit depth=1 keyed to
+    //     active.promptId so the suffix becomes `(+1 waiting)`.
+    //   - Third ask enqueues → emit depth=2.
+    //   - Operator answers active → resolveActive → drain pops
+    //     second (now active). drain emits depth=1 keyed to the
+    //     newly-active modal (one still queued behind).
+    //   - Answer that → drain pops third. queue.length === 0 →
+    //     no depth event (the modal renders bare).
+    const s = make();
+    const p1 = s.manager.askPermission({ toolName: 'b', command: 'c1', cwd: '/' });
+    expect(s.events.filter((e) => e.type === 'modal:queue-depth')).toHaveLength(0);
+
+    const p2 = s.manager.askPermission({ toolName: 'b', command: 'c2', cwd: '/' });
+    let depthEvents = s.events.filter((e) => e.type === 'modal:queue-depth');
+    expect(depthEvents).toHaveLength(1);
+    if (depthEvents[0]?.type === 'modal:queue-depth') {
+      expect(depthEvents[0].depth).toBe(1);
+    }
+
+    const p3 = s.manager.askPermission({ toolName: 'b', command: 'c3', cwd: '/' });
+    depthEvents = s.events.filter((e) => e.type === 'modal:queue-depth');
+    expect(depthEvents).toHaveLength(2);
+    if (depthEvents[1]?.type === 'modal:queue-depth') {
+      expect(depthEvents[1].depth).toBe(2);
+    }
+
+    // Resolve the active. drain pops next; emits depth=1 for it.
+    s.fs.dispatch(key('enter')); // p1 → 'no'
+    await p1;
+    depthEvents = s.events.filter((e) => e.type === 'modal:queue-depth');
+    expect(depthEvents).toHaveLength(3);
+    if (depthEvents[2]?.type === 'modal:queue-depth') {
+      expect(depthEvents[2].depth).toBe(1);
+    }
+
+    // Resolve the next active. drain pops third — empty queue
+    // behind it, no event.
+    s.fs.dispatch(key('enter')); // p2 → 'no'
+    await p2;
+    depthEvents = s.events.filter((e) => e.type === 'modal:queue-depth');
+    expect(depthEvents).toHaveLength(3);
+
+    // Wrap up.
+    s.fs.dispatch(key('enter'));
+    await p3;
+  });
+
+  test('queue depth events key on the ACTIVE modal promptId, not the enqueued one', async () => {
+    // Regression guard: a buggy emit could key the depth event to
+    // the just-enqueued ask's promptId instead of the active one.
+    // The reducer would then drop it (mismatched promptId), the
+    // suffix would never appear. Verify the active's promptId is
+    // what gets emitted.
+    const s = make();
+    s.manager.askPermission({ toolName: 'b', command: 'c1', cwd: '/' });
+    const firstAsk = s.events.find((e) => e.type === 'permission:ask');
+    expect(firstAsk).toBeDefined();
+    const activeId = firstAsk?.type === 'permission:ask' ? firstAsk.promptId : '';
+    expect(activeId).not.toBe('');
+
+    s.manager.askPermission({ toolName: 'b', command: 'c2', cwd: '/' });
+    const depthEvent = s.events.find((e) => e.type === 'modal:queue-depth');
+    expect(depthEvent).toBeDefined();
+    if (depthEvent?.type === 'modal:queue-depth') {
+      expect(depthEvent.promptId).toBe(activeId);
+      expect(depthEvent.depth).toBe(1);
+    }
+
+    // Tear down so the test process doesn't leak handles.
+    s.fs.dispatch(key('escape'));
+  });
 });
 
 describe('timeout', () => {

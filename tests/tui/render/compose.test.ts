@@ -246,6 +246,7 @@ describe('composeLive layout', () => {
       options: [{ key: '1', label: 'No', value: 'no' }],
       selectedIndex: 0,
       hints: ['Esc to cancel'],
+      queueDepth: 0,
     };
     const out = composeLive(s, caps, 0);
     // The modal substitutes the entire bottom anchor — input box,
@@ -275,6 +276,7 @@ describe('composeLive layout', () => {
       options: [{ key: '1', label: 'Yes', value: 'yes' }],
       selectedIndex: 0,
       hints: ['Esc to cancel'],
+      queueDepth: 0,
     };
     const out = composeLive(s, caps, 0);
     // A rule line starts with `─` (or `-`). After padFrame it would
@@ -378,6 +380,7 @@ describe('composeCursor', () => {
       options: [{ key: '1', label: 'OK', value: 'yes' }],
       selectedIndex: 0,
       hints: [],
+      queueDepth: 0,
     };
     expect(composeCursor(s, caps, 5)).toBeNull();
   });

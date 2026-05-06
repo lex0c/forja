@@ -882,6 +882,75 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
   });
 });
 
+describe('modal:queue-depth (live count of asks queued behind active)', () => {
+  test('matching promptId updates state.modal.queueDepth', () => {
+    const opened = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p1',
+      toolName: 'bash',
+      command: 'rm',
+      cwd: '/p',
+    } as UIEvent);
+    expect(opened.state.modal?.queueDepth).toBe(0);
+    const bumped = applyEvent(opened.state, {
+      type: 'modal:queue-depth',
+      ts: 2,
+      promptId: 'p1',
+      depth: 3,
+    } as UIEvent);
+    expect(bumped.state.modal?.queueDepth).toBe(3);
+  });
+
+  test('mismatched promptId is dropped silently (no state churn)', () => {
+    const opened = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p1',
+      toolName: 'bash',
+      command: 'rm',
+      cwd: '/p',
+    } as UIEvent);
+    const stale = applyEvent(opened.state, {
+      type: 'modal:queue-depth',
+      ts: 2,
+      promptId: 'p-other',
+      depth: 99,
+    } as UIEvent);
+    expect(stale.state).toBe(opened.state);
+    expect(stale.state.modal?.queueDepth).toBe(0);
+  });
+
+  test('event after the modal closed is dropped silently', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'modal:queue-depth',
+      ts: 1,
+      promptId: 'p1',
+      depth: 5,
+    } as UIEvent);
+    expect(r.state.modal).toBeNull();
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('negative depth clamps to 0 (defensive)', () => {
+    const opened = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p1',
+      toolName: 'bash',
+      command: 'rm',
+      cwd: '/p',
+    } as UIEvent);
+    const bad = applyEvent(opened.state, {
+      type: 'modal:queue-depth',
+      ts: 2,
+      promptId: 'p1',
+      depth: -7,
+    } as UIEvent);
+    expect(bad.state.modal?.queueDepth).toBe(0);
+  });
+});
+
 describe('not-yet-wired events accept silently', () => {
   test.each([
     [

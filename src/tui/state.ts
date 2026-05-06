@@ -153,6 +153,16 @@ export interface ConfirmState {
   // producers add 'Tab to amend' etc. when the corresponding
   // features land.
   hints: string[];
+  // Number of OTHER asks queued behind this active modal. Modal-
+  // manager owns the queue and emits `modal:queue-depth` events
+  // whenever the count changes (modal opens, new ask enqueues
+  // while active). Starts at 0 when the modal opens; the renderer
+  // surfaces a `(+N waiting)` title suffix when > 0 so the
+  // operator isn't blindsided by another modal popping
+  // immediately after answering. Updated live via the reducer's
+  // `modal:queue-depth` case; cleared with the modal on
+  // `modal:answer`.
+  queueDepth: number;
 }
 
 // Permission flavor's answer values. Other flavors define their
@@ -816,6 +826,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
             options,
             selectedIndex: options.length - 1,
             hints: ['Esc to cancel'],
+            queueDepth: 0,
           },
         },
         permanent: [],
@@ -846,6 +857,24 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       const clamped = Math.max(0, Math.min(max, event.selectedIndex));
       return {
         state: { ...state, modal: { ...state.modal, selectedIndex: clamped } },
+        permanent: [],
+      };
+    }
+
+    case 'modal:queue-depth': {
+      // Live update of how many other ask*s are queued behind the
+      // active modal. Modal-manager emits one when a modal opens
+      // (from drain) and again whenever a new ask enqueues while
+      // the modal is up. Dropped silently when promptId mismatches
+      // or the modal already closed — a stale event that lost its
+      // race with `modal:answer`. Negative depths clamp to 0 (a
+      // buggy producer can't render a phantom "(-1 waiting)").
+      if (state.modal === null || state.modal.promptId !== event.promptId) {
+        return { state, permanent: [] };
+      }
+      const depth = Math.max(0, event.depth);
+      return {
+        state: { ...state, modal: { ...state.modal, queueDepth: depth } },
         permanent: [],
       };
     }
@@ -891,6 +920,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
             options,
             selectedIndex: options.length - 1,
             hints: ['Enter to confirm', 'Esc to cancel'],
+            queueDepth: 0,
           },
         },
         permanent: [],
@@ -934,6 +964,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
             // Enter without reading shouldn't lose history.
             selectedIndex: options.length - 1,
             hints: ['Enter to confirm', 'Esc to cancel'],
+            queueDepth: 0,
           },
         },
         permanent: [],
@@ -958,6 +989,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
             options,
             selectedIndex: options.length - 1,
             hints: ['Esc to cancel'],
+            queueDepth: 0,
           },
         },
         permanent: [],
@@ -987,6 +1019,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
             options,
             selectedIndex: options.length - 1,
             hints: ['Esc to cancel'],
+            queueDepth: 0,
           },
         },
         permanent: [],
@@ -1030,6 +1063,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
             options,
             selectedIndex: options.length - 1,
             hints: ['Esc to cancel'],
+            queueDepth: 0,
           },
         },
         permanent: [],
@@ -1060,6 +1094,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
             options,
             selectedIndex: options.length - 1,
             hints: ['Esc to cancel'],
+            queueDepth: 0,
           },
         },
         permanent: [],
@@ -1087,6 +1122,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
             options,
             selectedIndex: options.length - 1,
             hints: ['Esc to cancel'],
+            queueDepth: 0,
           },
         },
         permanent: [],

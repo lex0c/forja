@@ -291,6 +291,21 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
     const promptId = next.open();
     // Default selectedIndex = last option (conservative choice).
     active = { promptId, selectedIndex: next.options.length - 1, pending: next };
+    // Initial queue-depth snapshot for the just-opened modal. The
+    // event MUST fire AFTER `next.open()` so the reducer has
+    // already created the modal slot before this update lands —
+    // otherwise the reducer's mismatched-promptId guard would
+    // drop it. `queue.length` reflects what's STILL waiting AFTER
+    // popping this one (see queue.shift above) — exactly the
+    // count the renderer's `(+N waiting)` suffix needs.
+    if (queue.length > 0) {
+      bus.emit({
+        type: 'modal:queue-depth',
+        ts: now(),
+        promptId,
+        depth: queue.length,
+      });
+    }
     activeHandler = (key) => {
       if (active === null) return false;
 
@@ -422,6 +437,21 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         timeout: null,
       };
       queue.push(pending as Pending);
+      // Live update for an existing modal: a new ask just landed
+      // behind the active one. Bump the displayed `(+N waiting)`
+      // suffix so the operator sees the queue grow in real time
+      // — without this, only the snapshot at modal-open time
+      // would show, and any asks arriving afterward would be
+      // invisible until the operator answered. `drain()` below
+      // will be a no-op when active !== null, so no double-emit.
+      if (active !== null) {
+        bus.emit({
+          type: 'modal:queue-depth',
+          ts: now(),
+          promptId: active.promptId,
+          depth: queue.length,
+        });
+      }
       if (timeoutMs !== undefined && timeoutMs > 0) {
         pending.timeout = setTimer(() => {
           // Timeout while ACTIVE: same as Esc (resolve cancel).

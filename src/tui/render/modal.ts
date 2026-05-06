@@ -42,7 +42,15 @@ export const renderModal = (modal: ConfirmState, caps: Capabilities): string[] =
   const lines: string[] = [];
   // Block 1 — title + subject.
   lines.push(rule(caps));
-  lines.push(`  ${paint(caps, 'bold', modal.title)}`);
+  // Queue suffix is the visible signal that more asks are waiting
+  // behind the active one. Without it the operator answering a
+  // modal would see another pop immediately afterward with no
+  // warning — particularly confusing when the same subagent name
+  // queues multiple asks (looks like a regression / loop). Modal-
+  // manager keeps `queueDepth` live via `modal:queue-depth`
+  // events; renderer only formats.
+  const queueSuffix = modal.queueDepth > 0 ? ` (+${modal.queueDepth} waiting)` : '';
+  lines.push(`  ${paint(caps, 'bold', `${modal.title}${queueSuffix}`)}`);
   if (modal.subject !== null) lines.push(`  ${paint(caps, 'dim', modal.subject)}`);
   // Block 2 — preview (skipped when empty so we don't render
   // back-to-back rules).
