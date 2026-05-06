@@ -15,6 +15,96 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — cancel-source attribution on settled handles (audit fix #1)
+
+Auditability gap. Three different call sites cancel handles
+— the assistant's `task_cancel` tool, the cost-progress
+watchdog (`cancelAll` on cap-cross), and the harness's outer
+finally drain (`drain` on shutdown). Every settled row showed
+the same generic envelope:
+
+```json
+{ "kind": "ran", "status": "interrupted", "reason": "cancelled" }
+```
+
+Postmortem queries asking "why did handle X die?" had no
+column to filter on. The runtime can't know — it only sees
+the abort signal. The store knows but threw the information
+away.
+
+Fix: the three cancel surfaces now require a `CancelReason`
+parameter (`'model' | 'cap_watchdog' | 'parent_drain'`)
+plumbed through to a per-record `cancelReason` field. When
+the IIFE settles an `interrupted` envelope from the spawnFn,
+it stamps the orthogonal `cancelSource` field on the
+envelope. The persisted `subagent_handles.settled_payload`
+keeps the documented `reason` string intact (per CONTRACTS.md
+§2.6.4.1) while gaining the new field for forensic
+correlation.
+
+| File | Change |
+|---|---|
+| `src/subagents/handle-store.ts` | New `CancelReason` exported type. `SubagentHandleStore.cancel(id, reason)` / `cancelAll(reason)` / `drain(reason)` — `reason` becomes a required parameter (TS-side enforced). Internal `SubagentRecord` carries `cancelReason: CancelReason \| undefined`, set when `cancelled` flips. Post-spawn override stamps `cancelSource` on every non-`done` envelope (interrupted / exhausted / error) so a maxSteps-after-cancel race or a spawnFn-throw-during-cancel still carries attribution; `done` is excluded since the child finished naturally even if cancel landed in the post-spawn microtask gap. `cancelledBeforeDispatch` accepts the reason and embeds it in the synthesized envelope. `envelopeFromJson` re-validates `cancelSource` defensively (older rows / schema rot). Both drain and `cancel` itself carry `!record.cancelled` guards — first-writer-wins on attribution so neither path can silently overwrite a sibling's `cancelReason`. |
+| `src/tools/types.ts` | `SpawnSubagentResult.kind === 'ran'` gains optional `cancelSource: 'model' \| 'cap_watchdog' \| 'parent_drain'`. Documented as orthogonal to `reason` / `status`: those describe outcome; this describes source. Absent on natural settles (`status === 'done'`, child wall-clock at the runtime layer) — we don't invent attribution. |
+| `src/tools/builtin/task-cancel.ts` | Passes `'model'` to `store.cancel`. |
+| `src/harness/loop.ts` | Watchdog `cancelAll('cap_watchdog')`; outer-finally `drain('parent_drain')`. |
+| `tests/subagents/handle-store.test.ts` | Existing 14 cancel call sites updated to pass an explicit reason. Five new tests: (a) "cancelSource attribution" exercises all three paths in isolation with signal-driven barriers; asserts `reason` stays `'cancelled'` while `cancelSource` carries the right enum. Sanity branch: a natural `done` settle has `cancelSource === undefined`. (b) "drain preserves prior model attribution" — drain runs AFTER `cancel('model')`; model attribution survives. (c) "cancel after drain is idempotent" — the inverse: drain runs FIRST, late `task_cancel` arrives before the IIFE wakes; `parent_drain` attribution survives via the new `!record.cancelled` guard in `cancel`. (d) "cancelSource stamps on exhausted / error envelopes too" — exhausted maxSteps and synthesizeSpawnError both retain attribution; done envelope correctly skipped. (e) "cancelSource survives DB round-trip" — each of the three reasons persists into `subagent_handles.settled_payload.cancelSource` and re-emerges via `getSubagentHandle`. |
+| `tests/tools/task-async.test.ts` | One cancel call site updated. |
+
+**Decision:**
+
+- **D217 — Source attribution lives in a separate field
+  (`cancelSource`), not the `reason` string.** Two reasons
+  to keep them orthogonal:
+  - The `reason` string is a documented contract surface
+    (CONTRACTS.md §2.6.4.1: `done`, `cancelled`,
+    `cancelled_before_dispatch`, `resumed_session`,
+    `spawn_failed`, `corrupt_envelope`, `unknown_subagent`,
+    `depth_exceeded`, plus harness ExitReason mirror).
+    Mutating it to `cancelled_${source}` would break parsers
+    on the model side and old persisted rows.
+  - The dimensions don't combine cleanly. A
+    `cancelled_before_dispatch` handle has a
+    `cancelReason` too (the cancel that arrived BEFORE the
+    dispatcher woke). Encoding both into one string forces
+    `cancelled_before_dispatch_model` /
+    `cancelled_before_dispatch_cap_watchdog` etc. — Cartesian
+    explosion. The orthogonal field admits both: `reason:
+    'cancelled_before_dispatch'`, `cancelSource: 'model'`.
+
+- **D218 — First-writer-wins on cancel attribution.** Both
+  `cancel` and `drain` now guard with `!record.cancelled`
+  before mutating `cancelReason`. Without the guard in
+  `cancel`, the sequence `drain('parent_drain')` →
+  IIFE-still-asleep → late model `task_cancel` would
+  silently overwrite `parent_drain` to `model` — the
+  postmortem would lose evidence that drain initiated the
+  teardown. Symmetric guards on both surfaces back the
+  invariant: once a record is cancelled, its `cancelReason`
+  is immutable until settle. Code-review catch.
+
+- **D219 — Stamp cancelSource on every non-`done` envelope,
+  not only `interrupted`.** The override originally fired
+  only when `result.status === 'interrupted'`, dropping
+  attribution when a cancelled spawn surfaced as `exhausted`
+  (maxSteps hit before the abort propagated) or `error`
+  (spawnFn threw between cancel and the runtime catching
+  the abort). Both are plausible races. Widening the guard
+  to `status !== 'done'` keeps the intent (don't lie about
+  runs that finished naturally) while covering the legitimate
+  cancel paths. Code-review catch.
+
+- **Spec update deferred.** CONTRACTS.md §2.6.4.1 documents
+  reason values but not envelope-shape extensions. Adding
+  `cancelSource` to the spec would require a separate spec PR
+  (per CLAUDE.md "diverging from the spec requires a PR
+  against the spec first"). Logged as a follow-up.
+
+Verification: typecheck clean, lint clean, 3109 pass / 0 fail
+(5 new tests).
+
+---
+
 ## [2026-05-06] parallel — keep rehydrated child cost out of persisted session totals
 
 User-spotted bug. `runAgent` mutated `priorCostUsd` with the

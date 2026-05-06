@@ -67,7 +67,7 @@ export type AwaitOutcome =
   | { kind: 'timeout' }
   | { kind: 'aborted' };
 
-// Tagged outcome from `cancel(id)`. `unknown` distinguishes
+// Tagged outcome from `cancel(id, reason)`. `unknown` distinguishes
 // "you typed an id we never saw" from `already_settled` ("the
 // child already returned"); the model can recover differently
 // (look up its prior tool calls vs. just call task_await for
@@ -75,6 +75,31 @@ export type AwaitOutcome =
 export type CancelOutcome =
   | { cancelled: true }
   | { cancelled: false; reason: 'unknown' | 'already_settled' };
+
+// Why the cancel happened. Required at every cancel call site
+// so the settled handle's audit row distinguishes operator-
+// driven cancellation from harness-driven one. Persisted into
+// `subagent_handles.settled_payload.reason` as
+// `cancelled_${reason}`, e.g. `cancelled_model` /
+// `cancelled_cap_watchdog` / `cancelled_parent_drain`.
+//
+//   - `model`: the assistant emitted a `task_cancel` tool_use
+//     for this specific handle.
+//   - `cap_watchdog`: the cost-progress watchdog observed a
+//     cumulative spend cross `maxCostUsd` mid-flight and
+//     called `cancelAll` to tear down every active handle
+//     (spec ORCHESTRATION.md §3.5). Distinguishing this from
+//     a model-driven cancel is the audit signal operators
+//     need to triage "why did my run die?" — the cap was
+//     exceeded, not the model giving up.
+//   - `parent_drain`: the harness's outer finally is shutting
+//     down (run end, signal abort, wall-clock timeout) and is
+//     terminating any still-active handle. Symmetric to the
+//     `resumed_session` envelope on the prior side of a
+//     parent crash: both mean "parent went away," but
+//     `parent_drain` happens within a single run while
+//     `resumed_session` happens after a crash.
+export type CancelReason = 'model' | 'cap_watchdog' | 'parent_drain';
 
 export interface SpawnOptions {
   // Pessimistic worst-case cost estimate for this spawn, in
@@ -96,7 +121,7 @@ export interface SubagentHandleStore {
     id: string,
     options?: { timeoutMs?: number; signal?: AbortSignal },
   ): Promise<AwaitOutcome>;
-  cancel(id: string): CancelOutcome;
+  cancel(id: string, reason: CancelReason): CancelOutcome;
   // Snapshot of EVERY handle this store knows about, including
   // ones rehydrated from a prior run (resume path). Use this
   // for audit listings; do NOT use it as a "subagents in
@@ -116,14 +141,20 @@ export interface SubagentHandleStore {
   inFlightCount(): number;
   // Cancel all running records and await every record's
   // promise. Idempotent. Used by the harness's outer finally.
-  drain(): Promise<void>;
+  // `reason` propagates to every cancelled record's audit row;
+  // pass `'parent_drain'` from the outer finally so postmortem
+  // queries can distinguish a graceful shutdown cancel from a
+  // cap-watchdog kill.
+  drain(reason: CancelReason): Promise<void>;
   // Cancel every running record without awaiting (synchronous).
   // Used by the cost-cap watchdog when the live total crosses
   // the run's cap mid-flight (spec ORCHESTRATION.md §3.5):
   // active children get the abort signal immediately so they
   // tear down gracefully via their next IPC interrupt boundary.
-  // Idempotent; rows already settled are skipped.
-  cancelAll(): void;
+  // Idempotent; rows already settled are skipped. `reason`
+  // tags every newly-cancelled record's audit row with the
+  // source (almost always `'cap_watchdog'`).
+  cancelAll(reason: CancelReason): void;
   // Record a live cost-update from the child via IPC. Called
   // by the harness's onChildEvent forwarder after a
   // `cost_update` HarnessEvent lands. `cumulative` is the
@@ -257,6 +288,17 @@ interface SubagentRecord {
   // cancel). Single-write: only cancel-paths flip; never
   // un-flips.
   cancelled: boolean;
+  // Why the cancel happened, set when `cancelled` flips. Read
+  // by the IIFE on settle: when the spawnFn returns an
+  // `interrupted` envelope (the runtime's response to the
+  // abort signal), we stamp the `cancelSource` field on the
+  // envelope so the persisted `settled_payload` tells
+  // postmortem queries WHO cancelled, not just THAT it was
+  // cancelled. The `reason` string stays as the documented
+  // contract value (`cancelled` / `cancelled_before_dispatch`,
+  // CONTRACTS.md §2.6.4.1); attribution is orthogonal.
+  // `undefined` when the record has never been cancelled.
+  cancelReason: CancelReason | undefined;
 }
 
 // Envelope payload mirroring `SpawnSubagentResult` shape, used
@@ -351,6 +393,17 @@ const envelopeFromJson = (raw: Record<string, unknown>): SpawnSubagentResult => 
             message: (auditFailureRaw as { message: string }).message,
           },
         }
+      : {}),
+    // Cancel-source attribution (audit fix). Re-validated on
+    // rehydrate so a corrupted enum value (older row predating
+    // this field, or schema rot) doesn't smuggle an unknown
+    // value through the type system. Absent → no attribution
+    // (the store wasn't running this code when the row was
+    // settled, or the cancel never happened).
+    ...(raw.cancelSource === 'model' ||
+    raw.cancelSource === 'cap_watchdog' ||
+    raw.cancelSource === 'parent_drain'
+      ? { cancelSource: raw.cancelSource }
       : {}),
   };
 };
@@ -477,6 +530,7 @@ export const createSubagentHandleStore = (
         estimateCostUsd: 0,
         liveCostUsd: 0,
         cancelled: false,
+        cancelReason: undefined,
       };
       records.set(row.handleId, record);
     }
@@ -506,7 +560,18 @@ export const createSubagentHandleStore = (
     if (next !== undefined) next();
   };
 
-  const cancelledBeforeDispatch = (spawnedAt: number): SpawnSubagentResult => ({
+  // Cancel landed before the IIFE woke from `acquireSlot`. The
+  // spawnFn never ran. The `reason` string stays as the
+  // documented contract value (`cancelled_before_dispatch`,
+  // CONTRACTS.md §2.6.4.1) so existing parsers don't break;
+  // attribution lives in the orthogonal `cancelSource` field
+  // (audit fix). When `cancelReason === undefined` (extremely
+  // unlikely — the controller is owned by the store) we omit
+  // the field rather than invent attribution we don't have.
+  const cancelledBeforeDispatch = (
+    spawnedAt: number,
+    cancelReason: CancelReason | undefined,
+  ): SpawnSubagentResult => ({
     kind: 'ran',
     output: '',
     sessionId: '',
@@ -515,6 +580,7 @@ export const createSubagentHandleStore = (
     costUsd: 0,
     steps: 0,
     durationMs: now() - spawnedAt,
+    ...(cancelReason !== undefined ? { cancelSource: cancelReason } : {}),
   });
 
   const synthesizeSpawnError = (e: unknown, spawnedAt: number): SpawnSubagentResult => ({
@@ -585,6 +651,7 @@ export const createSubagentHandleStore = (
       estimateCostUsd,
       liveCostUsd: 0,
       cancelled: false,
+      cancelReason: undefined,
     };
 
     const promise = (async (): Promise<SpawnSubagentResult> => {
@@ -592,7 +659,7 @@ export const createSubagentHandleStore = (
       let result: SpawnSubagentResult;
       try {
         if (controller.signal.aborted) {
-          result = cancelledBeforeDispatch(spawnedAt);
+          result = cancelledBeforeDispatch(spawnedAt, record.cancelReason);
         } else {
           try {
             result = await spawnFn(args, controller.signal, id);
@@ -602,6 +669,36 @@ export const createSubagentHandleStore = (
         }
       } finally {
         releaseSlot();
+      }
+      // Cancel-source attribution (audit fix). When the IIFE
+      // was aborted by `cancel`/`cancelAll`/`drain`, the
+      // spawnFn returned an envelope — but the runtime can't
+      // know WHO cancelled. We do. Stamp the orthogonal
+      // `cancelSource` field so the persisted `settled_payload`
+      // distinguishes `model` / `cap_watchdog` /
+      // `parent_drain` for postmortem queries, while keeping
+      // the legacy `reason` string intact per CONTRACTS.md
+      // §2.6.4.1.
+      //
+      // Status filter: stamp on every non-`done` envelope —
+      //   - `interrupted`: child observed the abort cleanly
+      //   - `exhausted`: child hit maxSteps before the abort
+      //     propagated (plausible in long runs)
+      //   - `error`: spawnFn threw (SQLITE_BUSY, IPC failure)
+      //     between cancel and the runtime catching the abort
+      //
+      // `done` is excluded: the child finished naturally even
+      // though `record.cancelled` may have flipped in the
+      // microtask gap between `result = await spawnFn(...)`
+      // and this block. Stamping there would be misleading
+      // ("cancelled" but with `status: 'done'`).
+      //
+      // Skipped when `cancelReason === undefined` (the record
+      // was never explicitly cancelled — runtime aborted for
+      // some other reason, e.g. wall-clock at the child layer)
+      // so we don't invent attribution we don't have.
+      if (record.cancelReason !== undefined && result.kind === 'ran' && result.status !== 'done') {
+        result = { ...result, cancelSource: record.cancelReason };
       }
       record.status = 'settled';
       record.settledResult = result;
@@ -688,12 +785,21 @@ export const createSubagentHandleStore = (
     });
   };
 
-  const cancel = (id: string): CancelOutcome => {
+  const cancel = (id: string, reason: CancelReason): CancelOutcome => {
     const record = records.get(id);
     if (record === undefined) return { cancelled: false, reason: 'unknown' };
     if (record.status === 'settled') {
       return { cancelled: false, reason: 'already_settled' };
     }
+    // First-writer-wins on attribution. If a sibling cancel
+    // path (`drain` or `cancelAll`) already flipped the record,
+    // their `cancelReason` stands — re-stamping here would
+    // break audit causality (drain set `parent_drain`; a late
+    // model `task_cancel` would silently overwrite it to
+    // `model`). Returning `{ cancelled: true }` keeps the call
+    // idempotent from the caller's perspective: the handle is
+    // cancelled either way; only the attribution differs.
+    if (record.cancelled) return { cancelled: true };
     // Free the cost reservation IMMEDIATELY. Without this, a
     // queued spawn (waiting on `acquireSlot`) would hold its
     // pessimistic reservation until the IIFE wakes after a
@@ -710,6 +816,7 @@ export const createSubagentHandleStore = (
     // re-incrementing `liveCostUsd` between cancel and IIFE
     // settle.
     record.cancelled = true;
+    record.cancelReason = reason;
     record.controller.abort();
     return { cancelled: true };
   };
@@ -724,15 +831,25 @@ export const createSubagentHandleStore = (
     return n;
   };
 
-  const drain = async (): Promise<void> => {
+  const drain = async (reason: CancelReason): Promise<void> => {
     // Cancel every still-running record. The records' own
     // promises will settle (either via the cancelled-before-
     // dispatch synthesis or via spawnFn returning an
     // interrupted result). We await every record's promise via
     // `Promise.allSettled` so a single throwing promise doesn't
     // strand the others.
+    //
+    // `reason` flows to the per-record `cancelReason` so the
+    // settled envelope carries `cancelSource: 'parent_drain'`
+    // (typical caller). A record already cancelled by the model
+    // (`'model'`) keeps its prior attribution — drain's
+    // `cancelled` short-circuit means we don't re-stamp.
     for (const r of records.values()) {
-      if (r.status === 'running') r.controller.abort();
+      if (r.status === 'running' && !r.cancelled) {
+        r.cancelled = true;
+        r.cancelReason = reason;
+        r.controller.abort();
+      }
     }
     await Promise.allSettled(Array.from(records.values()).map((r) => r.promise));
   };
@@ -779,10 +896,11 @@ export const createSubagentHandleStore = (
     if (cumulative > record.liveCostUsd) record.liveCostUsd = cumulative;
   };
 
-  const cancelAll = (): void => {
+  const cancelAll = (reason: CancelReason): void => {
     for (const r of records.values()) {
       if (r.status === 'running' && !r.cancelled) {
         r.cancelled = true;
+        r.cancelReason = reason;
         r.controller.abort();
       }
     }

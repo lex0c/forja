@@ -343,6 +343,21 @@ export type SpawnSubagentResult =
       // `reason='worktree_create_failed'` so non-`done` mapping
       // catches it; the field is advisory detail for diagnostics.
       worktreeError?: { code: string; message: string };
+      // Attribution for cancel-driven settles (spec
+      // ORCHESTRATION.md §3.5 audit fix). Set by the handle
+      // store when a record was explicitly cancelled via
+      // `cancel`/`cancelAll`/`drain`; carries WHO triggered
+      // it (model = explicit task_cancel, cap_watchdog =
+      // automatic kill on cap-cross, parent_drain = harness
+      // shutdown). Orthogonal to the `reason` / `status`
+      // strings — those describe the OUTCOME, this describes
+      // the SOURCE. Persisted into
+      // `subagent_handles.settled_payload.cancelSource`.
+      // Absent when the run wasn't explicitly cancelled
+      // (status === 'done', wall-clock timeout at the child
+      // layer, etc.) so postmortem queries don't get false
+      // attribution.
+      cancelSource?: 'model' | 'cap_watchdog' | 'parent_drain';
     };
 
 export interface Tool<I = unknown, O = unknown> {

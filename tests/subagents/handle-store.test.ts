@@ -123,7 +123,7 @@ describe('SubagentHandleStore', () => {
     });
     const h = store.spawn({ name: 'slow', prompt: 'p' }, { estimateCostUsd: 0 });
     await inFlight;
-    const cancelOutcome = store.cancel(h.id);
+    const cancelOutcome = store.cancel(h.id, 'model');
     expect(cancelOutcome.cancelled).toBe(true);
     const out = await store.awaitHandle(h.id);
     expect(out.kind).toBe('done');
@@ -147,7 +147,7 @@ describe('SubagentHandleStore', () => {
     const h2 = store.spawn({ name: 'queued', prompt: 'p' }, { estimateCostUsd: 0 });
     // h2 is queued behind h1 at cap=1. Cancelling h2 BEFORE the
     // slot frees should bypass spawnFn entirely.
-    const cancelOutcome = store.cancel(h2.id);
+    const cancelOutcome = store.cancel(h2.id, 'model');
     expect(cancelOutcome.cancelled).toBe(true);
     // Wait for both to settle.
     const [a, b] = await Promise.all([store.awaitHandle(h1.id), store.awaitHandle(h2.id)]);
@@ -165,7 +165,7 @@ describe('SubagentHandleStore', () => {
       cap: 3,
       spawnFn: async (args) => okResult(args),
     });
-    const out = store.cancel('nope');
+    const out = store.cancel('nope', 'model');
     expect(out).toEqual({ cancelled: false, reason: 'unknown' });
   });
 
@@ -176,7 +176,7 @@ describe('SubagentHandleStore', () => {
     });
     const h = store.spawn({ name: 'fast', prompt: 'p' }, { estimateCostUsd: 0 });
     await store.awaitHandle(h.id);
-    const out = store.cancel(h.id);
+    const out = store.cancel(h.id, 'model');
     expect(out).toEqual({ cancelled: false, reason: 'already_settled' });
   });
 
@@ -256,7 +256,7 @@ describe('SubagentHandleStore', () => {
       store.spawn({ name: `w${i}`, prompt: 'p' }, { estimateCostUsd: 0 }),
     );
     await allInFlight;
-    await store.drain();
+    await store.drain('parent_drain');
     expect(store.inFlightCount()).toBe(0);
     expect(store.list()).toHaveLength(handles.length);
     for (const h of handles) {
@@ -327,7 +327,7 @@ describe('SubagentHandleStore', () => {
     // Monotonic: a stale (smaller) cumulative does NOT regress.
     store.recordLiveCost(h.id, 1.0);
     expect(store.getReservedChildCostUsd()).toBe(2.5);
-    store.cancel(h.id);
+    store.cancel(h.id, 'model');
     await store.awaitHandle(h.id);
   });
 
@@ -380,8 +380,8 @@ describe('SubagentHandleStore', () => {
     expect(store.getReservedChildCostUsd(h2.id)).toBe(2);
     // Excluding unknown id: full $5 (no-op).
     expect(store.getReservedChildCostUsd('does-not-exist')).toBe(5);
-    store.cancel(h1.id);
-    store.cancel(h2.id);
+    store.cancel(h1.id, 'model');
+    store.cancel(h2.id, 'model');
     await store.awaitHandle(h1.id);
     await store.awaitHandle(h2.id);
   });
@@ -404,7 +404,7 @@ describe('SubagentHandleStore', () => {
     store.recordLiveCost(h.id, 0.5);
     expect(store.getReservedChildCostUsd()).toBe(1); // estimate floor
     // Cancel: reservation drops to 0 immediately.
-    store.cancel(h.id);
+    store.cancel(h.id, 'model');
     expect(store.getReservedChildCostUsd()).toBe(0);
     // A stray `cost_update` already in flight on the IPC pipe
     // when cancel landed MUST NOT bump the reservation back up.
@@ -436,7 +436,7 @@ describe('SubagentHandleStore', () => {
     store.recordLiveCost(h2.id, 2);
     expect(store.getReservedChildCostUsd()).toBe(5);
     // Watchdog fires.
-    store.cancelAll();
+    store.cancelAll('cap_watchdog');
     // Reservation MUST drop to 0, not stay at 5 because of
     // liveCostUsd. This is the regression the previous
     // implementation had: cancelAll only zeroed estimate, so
@@ -494,7 +494,7 @@ describe('SubagentHandleStore', () => {
     await inFlight;
     // Watchdog reads liveCostUsd before settling.
     expect(store.getLiveCostUsd(h.id)).toBe(2.0);
-    store.cancel(h.id);
+    store.cancel(h.id, 'model');
     const out = await store.awaitHandle(h.id);
     if (out.kind !== 'done' || out.result.kind !== 'ran') throw new Error('expected ran');
     // Terminal envelope's costUsd is 0 (runtime hardcoded).
@@ -538,7 +538,7 @@ describe('SubagentHandleStore', () => {
     );
     await ready;
     expect(store.getReservedChildCostUsd()).toBe(6);
-    store.cancelAll();
+    store.cancelAll('cap_watchdog');
     // Reservations dropped to 0 immediately even before the
     // IIFEs settle. Backs the spec §3.5 promise that the
     // watchdog frees the cap.
@@ -551,6 +551,309 @@ describe('SubagentHandleStore', () => {
         expect(out.result.status).toBe('interrupted');
       }
     }
+  });
+
+  test('cancelSource attribution: model / cap_watchdog / parent_drain', async () => {
+    // Audit fix. Each cancel call site (`cancel`, `cancelAll`,
+    // `drain`) requires a `CancelReason` so the persisted
+    // envelope's `cancelSource` distinguishes WHO cancelled.
+    // The runtime can't tell — only the call site knows. This
+    // test exercises all three paths in isolation and asserts
+    // the orthogonal `cancelSource` field carries the right
+    // value while `reason` stays at the contract value
+    // (`cancelled`).
+    //
+    // Each store carries its own `entered` signal so we cancel
+    // ONLY after spawnFn has woken — otherwise the cancel
+    // races the IIFE's pre-dispatch check and we get the
+    // (different) `cancelled_before_dispatch` reason. That's
+    // exercised separately in the existing
+    // "cancel before dispatch" test.
+    const buildStore = (): {
+      store: ReturnType<typeof createSubagentHandleStore>;
+      entered: Promise<void>;
+    } => {
+      let resolveEntered: () => void = () => {};
+      const entered = new Promise<void>((r) => {
+        resolveEntered = r;
+      });
+      const store = createSubagentHandleStore({
+        cap: 3,
+        spawnFn: async (_args, signal) => {
+          resolveEntered();
+          try {
+            await sleep(500, signal);
+          } catch {
+            // fall through
+          }
+          return {
+            kind: 'ran',
+            output: '',
+            sessionId: 'child-id',
+            status: 'interrupted',
+            reason: 'cancelled',
+            costUsd: 0,
+            steps: 0,
+            durationMs: 0,
+          };
+        },
+      });
+      return { store, entered };
+    };
+
+    // Path 1: explicit task_cancel (model).
+    const { store: s1, entered: e1 } = buildStore();
+    const h1 = s1.spawn({ name: 'a', prompt: 'p' }, { estimateCostUsd: 0 });
+    await e1;
+    s1.cancel(h1.id, 'model');
+    const out1 = await s1.awaitHandle(h1.id);
+    if (out1.kind !== 'done' || out1.result.kind !== 'ran') {
+      throw new Error('expected ran envelope');
+    }
+    expect(out1.result.reason).toBe('cancelled');
+    expect(out1.result.cancelSource).toBe('model');
+
+    // Path 2: cap watchdog.
+    const { store: s2, entered: e2 } = buildStore();
+    const h2 = s2.spawn({ name: 'b', prompt: 'p' }, { estimateCostUsd: 0 });
+    await e2;
+    s2.cancelAll('cap_watchdog');
+    const out2 = await s2.awaitHandle(h2.id);
+    if (out2.kind !== 'done' || out2.result.kind !== 'ran') {
+      throw new Error('expected ran envelope');
+    }
+    expect(out2.result.reason).toBe('cancelled');
+    expect(out2.result.cancelSource).toBe('cap_watchdog');
+
+    // Path 3: parent drain (harness shutdown).
+    const { store: s3, entered: e3 } = buildStore();
+    const h3 = s3.spawn({ name: 'c', prompt: 'p' }, { estimateCostUsd: 0 });
+    await e3;
+    await s3.drain('parent_drain');
+    const out3 = await s3.awaitHandle(h3.id);
+    if (out3.kind !== 'done' || out3.result.kind !== 'ran') {
+      throw new Error('expected ran envelope');
+    }
+    expect(out3.result.reason).toBe('cancelled');
+    expect(out3.result.cancelSource).toBe('parent_drain');
+
+    // Sanity: a handle that finishes naturally (status='done')
+    // does NOT carry cancelSource — we don't invent attribution.
+    const s4 = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+    });
+    const h4 = s4.spawn({ name: 'd', prompt: 'p' }, { estimateCostUsd: 0 });
+    const out4 = await s4.awaitHandle(h4.id);
+    if (out4.kind !== 'done' || out4.result.kind !== 'ran') {
+      throw new Error('expected ran envelope');
+    }
+    expect(out4.result.status).toBe('done');
+    expect(out4.result.cancelSource).toBeUndefined();
+  });
+
+  test('drain preserves prior model attribution (does not re-stamp)', async () => {
+    // Sequence: model cancels h1; drain runs after. h1 should
+    // keep `cancelSource: 'model'`, not get overwritten to
+    // `'parent_drain'`. The drain loop's `!r.cancelled` guard
+    // is what prevents re-stamping; this test backs that
+    // behavior so a refactor that drops the guard fails loud.
+    let entered1: () => void = () => {};
+    let entered2: () => void = () => {};
+    const e1 = new Promise<void>((r) => {
+      entered1 = r;
+    });
+    const e2 = new Promise<void>((r) => {
+      entered2 = r;
+    });
+    let count = 0;
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (_args, signal) => {
+        count += 1;
+        if (count === 1) entered1();
+        else entered2();
+        try {
+          await sleep(500, signal);
+        } catch {
+          // fall through
+        }
+        return {
+          kind: 'ran',
+          output: '',
+          sessionId: 'child-id',
+          status: 'interrupted',
+          reason: 'cancelled',
+          costUsd: 0,
+          steps: 0,
+          durationMs: 0,
+        };
+      },
+    });
+    const h1 = store.spawn({ name: 'a', prompt: 'p' }, { estimateCostUsd: 0 });
+    const h2 = store.spawn({ name: 'b', prompt: 'p' }, { estimateCostUsd: 0 });
+    await Promise.all([e1, e2]);
+    store.cancel(h1.id, 'model');
+    await store.drain('parent_drain');
+    const out1 = await store.awaitHandle(h1.id);
+    const out2 = await store.awaitHandle(h2.id);
+    if (out1.kind !== 'done' || out1.result.kind !== 'ran') {
+      throw new Error('expected ran envelope');
+    }
+    if (out2.kind !== 'done' || out2.result.kind !== 'ran') {
+      throw new Error('expected ran envelope');
+    }
+    expect(out1.result.cancelSource).toBe('model');
+    expect(out2.result.cancelSource).toBe('parent_drain');
+  });
+
+  test('cancel after drain is idempotent and preserves drain attribution', async () => {
+    // Inverse of "drain preserves prior model attribution":
+    // here drain happens FIRST, then a late `task_cancel`
+    // arrives before the IIFE wakes from the abort signal.
+    // Without the `!record.cancelled` guard in `cancel`, the
+    // second call would silently overwrite cancelReason from
+    // 'parent_drain' to 'model'.
+    let entered: () => void = () => {};
+    const e = new Promise<void>((r) => {
+      entered = r;
+    });
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (_args, signal) => {
+        entered();
+        try {
+          await sleep(500, signal);
+        } catch {
+          // fall through
+        }
+        return {
+          kind: 'ran',
+          output: '',
+          sessionId: 'child-id',
+          status: 'interrupted',
+          reason: 'cancelled',
+          costUsd: 0,
+          steps: 0,
+          durationMs: 0,
+        };
+      },
+    });
+    const h = store.spawn({ name: 'a', prompt: 'p' }, { estimateCostUsd: 0 });
+    await e;
+    // Drain marks the record cancelled with parent_drain.
+    // Don't await drain — we want to interleave a `cancel`
+    // BEFORE the IIFE wakes from the abort.
+    const drainPromise = store.drain('parent_drain');
+    const lateOutcome = store.cancel(h.id, 'model');
+    // The late cancel reports `cancelled: true` (idempotent;
+    // the handle IS cancelled, just by drain).
+    expect(lateOutcome.cancelled).toBe(true);
+    await drainPromise;
+    const out = await store.awaitHandle(h.id);
+    if (out.kind !== 'done' || out.result.kind !== 'ran') {
+      throw new Error('expected ran envelope');
+    }
+    // Attribution stays with the first writer (drain).
+    expect(out.result.cancelSource).toBe('parent_drain');
+  });
+
+  test('cancelSource stamps on exhausted / error envelopes too (audit fix #1 review)', async () => {
+    // Cancellation can land while the child is finishing with
+    // a non-interrupted status: `exhausted` (maxSteps hit
+    // before the abort propagated) or `error` (spawnFn threw,
+    // synthesizeSpawnError fired). Both must still carry
+    // attribution so postmortem queries don't lose the source
+    // on those paths.
+
+    // Path 1: status='exhausted'.
+    let enteredA: () => void = () => {};
+    const eA = new Promise<void>((r) => {
+      enteredA = r;
+    });
+    const sA = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async () => {
+        enteredA();
+        // Simulate a child that finishes with `exhausted`
+        // BEFORE observing the abort. The store's override
+        // must still stamp cancelSource since record.cancelled
+        // is true by then.
+        await new Promise((r) => setTimeout(r, 10));
+        return {
+          kind: 'ran',
+          output: '',
+          sessionId: 'child-A',
+          status: 'exhausted',
+          reason: 'maxSteps',
+          costUsd: 0.01,
+          steps: 5,
+          durationMs: 10,
+        };
+      },
+    });
+    const hA = sA.spawn({ name: 'a', prompt: 'p' }, { estimateCostUsd: 0 });
+    await eA;
+    sA.cancel(hA.id, 'model');
+    const outA = await sA.awaitHandle(hA.id);
+    if (outA.kind !== 'done' || outA.result.kind !== 'ran') {
+      throw new Error('expected ran envelope');
+    }
+    expect(outA.result.status).toBe('exhausted');
+    expect(outA.result.cancelSource).toBe('model');
+
+    // Path 2: status='error' via spawnFn throw.
+    let enteredB: () => void = () => {};
+    const eB = new Promise<void>((r) => {
+      enteredB = r;
+    });
+    const sB = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async () => {
+        enteredB();
+        await new Promise((r) => setTimeout(r, 10));
+        throw new Error('simulated spawnFn failure');
+      },
+    });
+    const hB = sB.spawn({ name: 'b', prompt: 'p' }, { estimateCostUsd: 0 });
+    await eB;
+    sB.cancel(hB.id, 'cap_watchdog');
+    const outB = await sB.awaitHandle(hB.id);
+    if (outB.kind !== 'done' || outB.result.kind !== 'ran') {
+      throw new Error('expected ran envelope');
+    }
+    expect(outB.result.status).toBe('error');
+    expect(outB.result.cancelSource).toBe('cap_watchdog');
+
+    // Negative: a natural `done` envelope with cancelReason
+    // landing in the post-spawn microtask gap must NOT get a
+    // cancelSource stamp. Status='done' means the child
+    // finished naturally; the cancel was too late to matter.
+    let enteredC: () => void = () => {};
+    const eC = new Promise<void>((r) => {
+      enteredC = r;
+    });
+    const sC = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => {
+        enteredC();
+        return okResult(args);
+      },
+    });
+    const hC = sC.spawn({ name: 'c', prompt: 'p' }, { estimateCostUsd: 0 });
+    await eC;
+    // Cancel races AFTER spawnFn returned but BEFORE the IIFE
+    // settled (microtask gap). bun's scheduler doesn't
+    // guarantee this exact interleaving, but the guard is
+    // structural: even if cancel lands in the gap,
+    // status='done' makes the override skip.
+    sC.cancel(hC.id, 'model');
+    const outC = await sC.awaitHandle(hC.id);
+    if (outC.kind !== 'done' || outC.result.kind !== 'ran') {
+      throw new Error('expected ran envelope');
+    }
+    expect(outC.result.status).toBe('done');
+    expect(outC.result.cancelSource).toBeUndefined();
   });
 });
 
@@ -610,7 +913,7 @@ describe('SubagentHandleStore — persistence (resume rehydration)', () => {
     });
     const h1 = store.spawn({ name: 'first', prompt: 'p' }, { estimateCostUsd: 0 });
     const h2 = store.spawn({ name: 'queued', prompt: 'p' }, { estimateCostUsd: 0 });
-    store.cancel(h2.id);
+    store.cancel(h2.id, 'model');
     await store.awaitHandle(h1.id);
     await store.awaitHandle(h2.id);
     const queued = getSubagentHandle(db, h2.id);
@@ -1133,5 +1436,72 @@ describe('SubagentHandleStore — persistence (resume rehydration)', () => {
       persistTo: { db, parentSessionId: parentId },
     });
     expect(store2.getRehydratedChildCostUsd()).toBeCloseTo(1.75);
+  });
+
+  test('cancelSource survives DB round-trip (audit fix #1 review)', async () => {
+    // Each of the three CancelReason values must persist into
+    // `subagent_handles.settled_payload.cancelSource` and
+    // rehydrate from there with the field intact. Without
+    // round-trip coverage, a typo in `envelopeFromJson` could
+    // silently drop the field on resume — postmortem queries
+    // would lose attribution despite it being correctly set
+    // at settle time.
+    let entered: () => void = () => {};
+    const buildEntered = () => {
+      let resolve: () => void = () => {};
+      const p = new Promise<void>((r) => {
+        resolve = r;
+      });
+      return { p, resolve };
+    };
+
+    for (const reason of ['model', 'cap_watchdog', 'parent_drain'] as const) {
+      const { p, resolve } = buildEntered();
+      entered = resolve;
+      const handleId = `h-${reason}`;
+      const store1 = createSubagentHandleStore({
+        cap: 3,
+        spawnFn: async (_args, signal) => {
+          entered();
+          try {
+            await sleep(500, signal);
+          } catch {
+            // fall through
+          }
+          return {
+            kind: 'ran',
+            output: '',
+            sessionId: `child-${reason}`,
+            status: 'interrupted',
+            reason: 'cancelled',
+            costUsd: 0,
+            steps: 0,
+            durationMs: 0,
+          };
+        },
+        persistTo: { db, parentSessionId: parentId },
+      });
+      // We can't pin handleId from outside (the store generates
+      // it). Spawn, capture id, route the right cancel.
+      const h = store1.spawn({ name: handleId, prompt: 'p' }, { estimateCostUsd: 0 });
+      await p;
+      if (reason === 'model') store1.cancel(h.id, 'model');
+      else if (reason === 'cap_watchdog') store1.cancelAll('cap_watchdog');
+      else await store1.drain('parent_drain');
+      const out = await store1.awaitHandle(h.id);
+      if (out.kind !== 'done' || out.result.kind !== 'ran') {
+        throw new Error('expected ran envelope');
+      }
+      expect(out.result.cancelSource).toBe(reason);
+
+      // Rehydrate via the DB — the row was just persisted by
+      // the IIFE settle. A second store reads it back through
+      // `envelopeFromJson` and the `cancelSource` field must
+      // re-emerge intact.
+      const persistedRow = getSubagentHandle(db, h.id);
+      expect(persistedRow?.status).toBe('settled');
+      const payload = persistedRow?.settledPayload;
+      expect(payload?.cancelSource).toBe(reason);
+    }
   });
 });

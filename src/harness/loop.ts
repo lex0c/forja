@@ -846,7 +846,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                         rehydratedChildCostUsd +
                         reserved;
                       if (total > budget.maxCostUsd) {
-                        trackerStore.cancelAll();
+                        trackerStore.cancelAll('cap_watchdog');
                       }
                     }
                   }
@@ -2066,7 +2066,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     // swallowed; the store's allSettled already absorbs them.
     if (subagentHandleStore !== undefined) {
       try {
-        await subagentHandleStore.drain();
+        await subagentHandleStore.drain('parent_drain');
       } catch {
         // Defensive — drain itself uses Promise.allSettled, so
         // this shouldn't fire in practice. Catching keeps the

@@ -69,7 +69,11 @@ export const taskCancelTool: Tool<TaskCancelInput, TaskCancelOutput> = {
     if (typeof args.handle_id !== 'string' || args.handle_id.length === 0) {
       return toolError(ERROR_CODES.invalidArg, "'handle_id' must be a non-empty string");
     }
-    const outcome = ctx.subagentHandleStore.cancel(args.handle_id);
+    // 'model' attributes the cancel to the assistant's tool_use
+    // in the persisted audit row (`settled_payload.cancelSource`).
+    // The other CancelReason values (`cap_watchdog`,
+    // `parent_drain`) belong to harness-internal call sites.
+    const outcome = ctx.subagentHandleStore.cancel(args.handle_id, 'model');
     if (outcome.cancelled) {
       return { cancelled: true };
     }

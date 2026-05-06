@@ -293,7 +293,7 @@ describe('task_async / task_await / task_cancel tools', () => {
     // since we can't rely on the tool's estimate getter here.
     const h2 = store.spawn({ name: 'queued', prompt: 'b' }, { estimateCostUsd: 2 });
     expect(store.getReservedChildCostUsd()).toBeGreaterThanOrEqual(2);
-    const cancelOutcome = store.cancel(h2.id);
+    const cancelOutcome = store.cancel(h2.id, 'model');
     expect(cancelOutcome.cancelled).toBe(true);
     // Reservation drops IMMEDIATELY for the cancelled handle.
     // The spawn body for h2 is still queued (h1 is still
