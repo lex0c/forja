@@ -123,6 +123,28 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
         },
       );
     }
+    // Resolve subagent name BEFORE issuing a handle. The estimate
+    // getter returns `null` when the name doesn't match any
+    // registered definition; coalescing that to 0 (the previous
+    // behavior) let the spawn proceed and only failed at
+    // `task_await`, regressing the sync `task` tool's
+    // fail-fast-on-typo contract and burning a turn for every
+    // invalid name. Distinct from `undefined` (the getter not
+    // wired in test contexts) — that path falls back to the
+    // legacy "no validation" behavior so headless/test
+    // fixtures aren't broken.
+    const estimateRaw = ctx.getSubagentBudgetEstimate?.(args.subagent);
+    if (estimateRaw === null) {
+      const available = ctx.getKnownSubagentNames?.() ?? [];
+      return toolError('subagent.unknown', `subagent '${args.subagent}' not found`, {
+        hint:
+          available.length > 0
+            ? `Known subagents: ${available.join(', ')}.`
+            : 'No subagents are defined. Add a .md file under ~/.config/agent/agents/ or <cwd>/.agent/agents/.',
+        details: { available },
+      });
+    }
+    const estimate = estimateRaw ?? 0;
     // Pre-spawn cost budget check (spec ORCHESTRATION.md §3.5).
     // Computes a projected total assuming this spawn lands at
     // its worst-case cost. Pessimistic reservation: every
@@ -137,7 +159,6 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
     // mid-run cost-progress IPC the parent has no way to
     // observe in-flight spend.
     const budget = ctx.getCostBudget?.();
-    const estimate = ctx.getSubagentBudgetEstimate?.(args.subagent) ?? 0;
     if (budget !== undefined && budget.cap !== undefined && Number.isFinite(budget.cap)) {
       const projected = budget.spent + estimate;
       if (projected > budget.cap) {

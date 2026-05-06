@@ -1525,6 +1525,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             const cost = def.budget.maxCostUsd;
             return Number.isFinite(cost) && cost > 0 ? cost : 0;
           },
+          // Sorted list of available subagent names. Empty when
+          // no registry wired. `task_async` reads this to
+          // populate the `subagent.unknown` error's
+          // `available` field — same shape as sync `task`.
+          getKnownSubagentNames: (): string[] =>
+            config.subagentRegistry !== undefined
+              ? Array.from(config.subagentRegistry.byName.keys()).sort()
+              : [],
           ...(config.memoryRegistry !== undefined ? { memoryRegistry: config.memoryRegistry } : {}),
           ...(config.confirmMemoryWrite !== undefined
             ? { confirmMemoryWrite: config.confirmMemoryWrite }

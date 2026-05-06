@@ -162,7 +162,21 @@ export interface ToolContext {
   // from a full `subagentRegistry` exposure to keep tools
   // that spawn children from reaching into definition shapes
   // they don't need to read.
+  //
+  // The `null` return is load-bearing: it distinguishes
+  // "subagent not registered" from "registered with zero
+  // cost". `task_async` reads `null` as fail-fast (refuse
+  // before issuing a handle the eventual `task_await` would
+  // bounce). Callers MUST NOT coalesce `null` to `0`.
   getSubagentBudgetEstimate?: (name: string) => number | null;
+  // Lists the names of subagents available in the current run.
+  // Empty array when no registry is wired or the registry is
+  // empty. `task_async` uses this to populate the
+  // `subagent.unknown` error's `available` field — same shape
+  // as the sync `task` tool's error path. Sorted for stable
+  // ordering across calls so audit consumers see a
+  // deterministic list.
+  getKnownSubagentNames?: () => string[];
   // Background process manager for the current session. Optional so
   // existing tools that don't need bg orchestration aren't forced to
   // declare a dependency. Tools that DO need it (`bash_background`,

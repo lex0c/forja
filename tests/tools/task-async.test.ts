@@ -308,6 +308,58 @@ describe('task_async / task_await / task_cancel tools', () => {
     await store.awaitHandle(h2.id);
   });
 
+  test('task_async refuses unknown subagent name BEFORE issuing handle (review fix)', async () => {
+    // Pre-fix: estimate getter returned null on unknown name;
+    // task_async coalesced to 0, called store.spawn, returned
+    // a handle. The eventual task_await would fail with
+    // unknown_subagent — but the model already burned a turn
+    // and the store accumulated a phantom row. Sync `task`
+    // fails fast; async should match.
+    let dispatched = 0;
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => {
+        dispatched += 1;
+        return okResult(args);
+      },
+    });
+    const ctx = makeCtx({
+      subagentHandleStore: store,
+      // Production wiring returns `null` from the estimate
+      // getter when the name isn't in the registry.
+      getSubagentBudgetEstimate: (name: string): number | null =>
+        name === 'explore' || name === 'review' ? 0.5 : null,
+      getKnownSubagentNames: (): string[] => ['explore', 'review'],
+    });
+    const r = await taskAsyncTool.execute({ subagent: 'explroe', prompt: 'p' }, ctx);
+    expect(isToolError(r)).toBe(true);
+    if (!isToolError(r)) return;
+    expect(r.error_code).toBe('subagent.unknown');
+    expect(r.error_message).toContain("'explroe'");
+    expect(r.details?.available).toEqual(['explore', 'review']);
+    // No handle issued, no dispatch attempted.
+    expect(store.list()).toHaveLength(0);
+    expect(dispatched).toBe(0);
+  });
+
+  test('task_async empty registry produces helpful hint', async () => {
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+    });
+    const ctx = makeCtx({
+      subagentHandleStore: store,
+      getSubagentBudgetEstimate: (): number | null => null,
+      getKnownSubagentNames: (): string[] => [],
+    });
+    const r = await taskAsyncTool.execute({ subagent: 'anything', prompt: 'p' }, ctx);
+    expect(isToolError(r)).toBe(true);
+    if (!isToolError(r)) return;
+    expect(r.error_code).toBe('subagent.unknown');
+    expect(r.hint).toContain('No subagents are defined');
+    expect(r.details?.available).toEqual([]);
+  });
+
   test('task_async pre-checks subagent depth and refuses without spawning', async () => {
     // Importing MAX_SUBAGENT_DEPTH from runtime keeps the test
     // pinned to the runtime cap; if a future slice loosens or

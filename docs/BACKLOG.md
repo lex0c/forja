@@ -15,6 +15,53 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — task_async fails fast on unknown subagent name
+
+User-spotted bug. Sync `task` tool's contract is "fail fast on
+unknown name": typo `subagent: 'explroe'` returns
+`subagent.unknown` immediately, no spawn dispatched. The async
+counterpart had regressed this:
+
+```
+const estimate = ctx.getSubagentBudgetEstimate?.(args.subagent) ?? 0;
+```
+
+The getter returns `null` when the name doesn't resolve. The
+`?? 0` coalesced both `null` (unknown name) AND `undefined`
+(getter not wired) to 0; the spawn proceeded and the failure
+only surfaced at the eventual `task_await`. Effects:
+
+- A typo burns a turn (model issues async, awaits, gets
+  unknown_subagent on the await side, has to retry).
+- Multiple invalid names enqueue multiple phantom handles in
+  the store (each registers a record + persists a row).
+- Audit log gains rows for spawns that never could have run.
+
+| File | Change |
+|---|---|
+| `src/tools/types.ts` | New `getKnownSubagentNames?: () => string[]` on `ToolContext`. The estimate getter's `null` doc updated to load-bearing distinction between "not registered" vs "registered with zero cost" — callers MUST NOT coalesce. |
+| `src/harness/loop.ts` | `buildCtx` provides `getKnownSubagentNames` reading `config.subagentRegistry?.byName.keys()` sorted. Empty when no registry. |
+| `src/tools/builtin/task-async.ts` | Detect `estimateRaw === null` BEFORE the budget gate. Return `subagent.unknown` with the same `available[]` shape sync `task` produces — paritetic error envelope across the two surfaces. `estimateRaw === undefined` (getter not wired in test ctx) preserves the legacy no-validation path so headless fixtures aren't broken. |
+| `tests/tools/_helpers.ts` | `makeCtx` accepts `getKnownSubagentNames` override. |
+| `tests/tools/task-async.test.ts` | Two new tests: (a) "task_async refuses unknown subagent name BEFORE issuing handle" — typo `explroe` against registry [`explore`, `review`]; expects `subagent.unknown`, no handle in `store.list()`, no spawnFn dispatch. (b) "task_async empty registry produces helpful hint" — same path with empty `available`; expects "No subagents are defined" hint. |
+
+**Decisions:**
+
+- **D212 — `null` is load-bearing on the estimate getter; tools
+  MUST NOT coalesce.** The doc on `getSubagentBudgetEstimate`
+  now states this explicitly. Future tools that read the
+  getter and coalesce `null` to `0` would silently regress
+  fail-fast back to fail-on-await; the doc is the rule.
+- **D213 — Async error mirrors sync error shape.** Same
+  `subagent.unknown` code, same `available[]` details, same
+  hint messages. Models that learned to recover from sync
+  task's typo errors don't need separate handling for async.
+
+Verification: typecheck clean, lint clean, 3098 pass / 0 fail
+(2 new tests).
+
+---
+
 ## [2026-05-06] parallel — fix double-count of own reservation in async pre-spawn gate
 
 User-spotted bug. The dispatcher's pre-spawn cost gate in
