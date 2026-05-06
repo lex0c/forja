@@ -306,9 +306,11 @@ describe('parallel tool execution (ORCHESTRATION §1.3)', () => {
 
   test('consecutive errors counter folds in original order; bails when threshold crossed mid-batch', async () => {
     const bad = parallelEcho('p_bad', { delayMs: 1, fail: true });
-    // 3 parallel-safe tools all failing in one batch with maxToolErrors=2 —
-    // the harness must bail at the second failed tu (counter 1→2). Tool
-    // results truncate to the first 2 entries to mirror serial-path audit.
+    // 3 parallel-safe tools all failing in one batch with
+    // maxToolErrors=2 — the harness must bail when the counter
+    // crosses 2 mid-batch. The parallel batch DID execute every
+    // sibling (their tool_call rows are committed in DB), so the
+    // persisted message includes ALL 3 tool_results — D167.
     const { config, handle } = buildConfig(
       [
         {
@@ -326,8 +328,103 @@ describe('parallel tool execution (ORCHESTRATION §1.3)', () => {
     const result = await runAgent(config);
     expect(result.status).toBe('error');
     expect(result.reason).toBe('maxToolErrors');
+    // detail snapshots the counter at the moment of crossing,
+    // not the post-loop value.
+    expect(result.detail).toBe('2 consecutive tool errors');
     // Only one provider request — we bailed before the next turn.
     expect(handle.requests).toHaveLength(1);
+  });
+
+  test('parallel bail persists every tool_result in the audit message (D167 audit fidelity)', async () => {
+    // Same setup as the consecutive-errors test, but assert on
+    // what the persisted user message contained. With D167's
+    // no-trim policy the message holds 3 tool_results — one per
+    // tool_call row in the DB — so a future replay/recap doesn't
+    // see orphan tool_calls.
+    const bad = parallelEcho('p_bad', { delayMs: 1, fail: true });
+    const { config, handle } = buildConfig(
+      [
+        {
+          tool_uses: [
+            { id: 'tu1', name: 'p_bad', input: { x: 1 } },
+            { id: 'tu2', name: 'p_bad', input: { x: 2 } },
+            { id: 'tu3', name: 'p_bad', input: { x: 3 } },
+          ],
+          stop_reason: 'tool_use',
+        },
+        { text: 'never reached', stop_reason: 'end_turn' },
+      ],
+      { tools: [bad], budget: { maxToolErrors: 2 } },
+    );
+    await runAgent(config);
+    // Even though we bailed before the second provider call, the
+    // db should hold the partial user message; the test peeks at
+    // the in-memory mock to confirm the SHAPE of the persisted
+    // tool_results (the mock provider only sees what was sent
+    // before the bail, but the DB row went down regardless —
+    // probe via listMessages instead).
+    expect(handle.requests).toHaveLength(1);
+    // Inspect via DB: listMessages of the session id from the
+    // first request's last user message.
+    const { listMessageTailBySession, listSessions } = await import('../../src/storage/index.ts');
+    const sessions = listSessions(config.db);
+    const sid = sessions[0]?.id;
+    if (sid === undefined) throw new Error('no session row');
+    const tail = listMessageTailBySession(config.db, sid, 1000);
+    // The user-role message holding tool_results sits second
+    // from the end (the assistant's tool_use turn precedes it).
+    const lastUser = tail.messages.filter((m) => m.role === 'user').at(-1);
+    if (lastUser === undefined) throw new Error('no user msg');
+    const content = lastUser.content;
+    if (!Array.isArray(content)) throw new Error('expected array content');
+    const toolResultBlocks = content.filter((b: { type?: string }) => b.type === 'tool_result');
+    expect(toolResultBlocks).toHaveLength(3);
+  });
+
+  test('writes:true + parallel_safe:true tool collapses batch to serial (defense-in-depth runtime guard)', async () => {
+    // Construct a misbehaving tool that violates the
+    // ToolMetadata contract (parallel_safe MUST NOT be true on
+    // a writes-true tool). The runtime guard in loop.ts must
+    // refuse the parallel branch and run the batch serially —
+    // the tracker.max=1 confirms no overlap occurred.
+    const tracker = makeTracker();
+    const misbehaving: typeof serialEcho = {
+      name: 'broken_writer',
+      description: 'misbehaving',
+      inputSchema: { type: 'object', properties: { msg: { type: 'string' } } },
+      metadata: {
+        category: 'misc',
+        writes: true,
+        idempotent: false,
+        // Violation: writes:true should never appear with
+        // parallel_safe:true. Tests the runtime guard.
+        parallel_safe: true,
+      },
+      async execute(args, ctx) {
+        tracker.current += 1;
+        if (tracker.current > tracker.max) tracker.max = tracker.current;
+        await sleep(20, ctx.signal);
+        tracker.current -= 1;
+        return { echoed: args.msg ?? 'b' };
+      },
+    };
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: [
+            { id: 'tu1', name: 'broken_writer', input: { msg: 'a' } },
+            { id: 'tu2', name: 'broken_writer', input: { msg: 'b' } },
+          ],
+          stop_reason: 'tool_use',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ],
+      { tools: [misbehaving] },
+    );
+    const result = await runAgent(config);
+    expect(result.status).toBe('done');
+    // Serial fallback — never two in flight.
+    expect(tracker.max).toBe(1);
   });
 
   test('hard abort during parallel batch resolves as aborted', async () => {

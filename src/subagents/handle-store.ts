@@ -163,77 +163,77 @@ export const createSubagentHandleStore = (
     durationMs: now() - spawnedAt,
   });
 
+  const synthesizeSpawnError = (e: unknown, spawnedAt: number): SpawnSubagentResult => ({
+    kind: 'ran',
+    output: '',
+    sessionId: '',
+    status: 'error',
+    reason: 'spawn_failed',
+    costUsd: 0,
+    steps: 0,
+    durationMs: now() - spawnedAt,
+    auditFailure: {
+      code: 'subagent.spawn_throw',
+      message: e instanceof Error ? e.message : String(e),
+    },
+  });
+
   const spawn = (args: SpawnSubagentArgs): SubagentHandle => {
     const id = newId();
     const spawnedAt = now();
     const handle: SubagentHandle = { id, name: args.name, spawnedAt };
     const controller = new AbortController();
 
-    // Wrap the spawn lifecycle in an IIFE so we can reference
-    // the record from the `finally` that flips its status. The
-    // promise body owns slot acquisition + early-cancel check
-    // + dispatch + slot release, and translates a pre-dispatch
-    // cancel into a synthesized envelope so callers don't need
-    // a separate "the cancel landed before we even queued"
-    // status. `runSubagent` failures propagate via the
-    // promise.
-    const promise = (async (): Promise<SpawnSubagentResult> => {
-      await acquireSlot();
-      try {
-        if (controller.signal.aborted) {
-          return cancelledBeforeDispatch(spawnedAt);
-        }
-        return await spawnFn(args, controller.signal);
-      } finally {
-        releaseSlot();
-      }
-    })();
-
+    // Construct the record FIRST with a placeholder promise; the
+    // real promise (next block) closes over it so the spawn body
+    // can flip its status synchronously with the result becoming
+    // visible. Doing the flip INSIDE the async body — instead of
+    // attaching a separate `.then` after the promise — eliminates
+    // the race window between promise resolution and an external
+    // `.then` observer that the previous design had: a `cancel()`
+    // that landed AFTER the spawn settled but BEFORE the
+    // post-promise `.then` ran could observe `status === 'running'`
+    // and emit a misleading `cancelled: true`.
+    //
+    // `spawnFn` rejections are caught locally and synthesized
+    // into an error envelope so `awaitHandle` consumers see one
+    // shape on settle (`kind: 'done'` with a structured result)
+    // — no try/catch on the consumer side.
     const record: SubagentRecord = {
       handle,
-      promise,
+      // Placeholder, replaced below before the IIFE has a chance
+      // to settle. TS-side cast keeps the field non-optional in
+      // the record shape; the assignment lands synchronously
+      // immediately after `promise` is constructed.
+      promise: undefined as unknown as Promise<SpawnSubagentResult>,
       controller,
       status: 'running',
       settledResult: null,
     };
-    records.set(id, record);
 
-    // Settled-status flip + cached result. Tied to the same
-    // promise via `.then` so the transition happens before any
-    // other `.then` listener (FIFO microtask ordering). A throw
-    // from `spawnFn` falls through to the `.catch` branch and
-    // is RE-THROWN — the underlying record's promise still
-    // rejects, which `awaitHandle` translates upstream.
-    promise.then(
-      (result) => {
-        record.status = 'settled';
-        record.settledResult = result;
-      },
-      (e) => {
-        // Reject path: still mark settled so cancel is a no-op
-        // and a re-await sees the failure exactly once. We
-        // synthesize an error envelope so `awaitHandle` always
-        // hands callers `kind: 'done'` with a structured
-        // result; throwing through `awaitHandle` would force
-        // every consumer to wrap in try/catch even though the
-        // failure mode is already in the envelope shape.
-        record.status = 'settled';
-        record.settledResult = {
-          kind: 'ran',
-          output: '',
-          sessionId: '',
-          status: 'error',
-          reason: 'spawn_failed',
-          costUsd: 0,
-          steps: 0,
-          durationMs: now() - spawnedAt,
-          auditFailure: {
-            code: 'subagent.spawn_throw',
-            message: e instanceof Error ? e.message : String(e),
-          },
-        };
-      },
-    );
+    const promise = (async (): Promise<SpawnSubagentResult> => {
+      await acquireSlot();
+      let result: SpawnSubagentResult;
+      try {
+        if (controller.signal.aborted) {
+          result = cancelledBeforeDispatch(spawnedAt);
+        } else {
+          try {
+            result = await spawnFn(args, controller.signal);
+          } catch (e) {
+            result = synthesizeSpawnError(e, spawnedAt);
+          }
+        }
+      } finally {
+        releaseSlot();
+      }
+      record.status = 'settled';
+      record.settledResult = result;
+      return result;
+    })();
+
+    record.promise = promise;
+    records.set(id, record);
 
     return handle;
   };
@@ -268,29 +268,14 @@ export const createSubagentHandleStore = (
       if (externalSignal !== undefined) {
         externalSignal.addEventListener('abort', onAbort, { once: true });
       }
-      // The store's promise already resolves with a cached
-      // result on success and (via the .then on spawn) settles
-      // status to 'settled'. We attach our own .then here so we
-      // don't double-cache or race the `record.settledResult`
-      // pointer — we just wait for the promise and read the
-      // cached result back out, which the spawn-side .then
-      // populates before any later .then runs in microtask
-      // FIFO. `result` from this .then is the same value.
-      record.promise.then(
-        (r) => settle({ kind: 'done', result: r }),
-        () => {
-          // Reject branch: read the synthesized error envelope
-          // from `settledResult` (the spawn-side reject .then
-          // populated it). Falling back to `aborted` is a
-          // belt-and-braces case that should never fire — keep
-          // it so the union stays exhaustive.
-          if (record.settledResult !== null) {
-            settle({ kind: 'done', result: record.settledResult });
-          } else {
-            settle({ kind: 'aborted' });
-          }
-        },
-      );
+      // The store's promise resolves with a structured envelope
+      // in every case — `spawnFn` failures are caught and
+      // synthesized inside the spawn body, so this promise
+      // never rejects. A reject handler would be dead code; we
+      // omit it so a future maintainer doesn't read the
+      // existence of one as evidence the underlying promise can
+      // throw.
+      record.promise.then((r) => settle({ kind: 'done', result: r }));
     });
   };
 

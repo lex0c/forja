@@ -83,9 +83,14 @@ describe('task_async / task_await / task_cancel tools', () => {
   });
 
   test('task_cancel aborts a still-running spawn; task_await returns interrupted envelope as error', async () => {
+    let entered: () => void = () => {};
+    const inFlight = new Promise<void>((r) => {
+      entered = r;
+    });
     const store = createSubagentHandleStore({
       cap: 3,
       spawnFn: async (args, signal) => {
+        entered();
         try {
           await sleep(500, signal);
         } catch {
@@ -106,8 +111,7 @@ describe('task_async / task_await / task_cancel tools', () => {
     const ctx = makeCtx({ subagentHandleStore: store });
     const spawn = await taskAsyncTool.execute({ subagent: 'slow', prompt: 'p' }, ctx);
     if (isToolError(spawn)) throw new Error('spawn failed');
-    // Yield once so the spawnFn enters its sleep before cancel.
-    await sleep(20);
+    await inFlight;
     const cancel = await taskCancelTool.execute({ handle_id: spawn.handle_id }, ctx);
     if (isToolError(cancel)) throw new Error('cancel failed');
     expect(cancel.cancelled).toBe(true);

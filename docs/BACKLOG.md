@@ -15,6 +15,50 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — review fixes (slices 1+2)
+
+Two independent code reviews on `feat/parallel` (slices 1 and 2)
+flagged a mix of bugs and risks. Applied the actionable subset
+before opening a PR; documented follow-ups for the rest.
+
+**Files:**
+
+| File | Change |
+|---|---|
+| `src/tools/builtin/task-cancel.ts` | `planSafe: true` → `planSafe: false`. Reviewer (slice 2 #3) caught that the cancel cascade triggers `cleanupWorktree` → `git worktree remove --force`, which mutates `.git/`. The previous claim "read-only relative to the working tree" missed `.git/`. Plan-mode-locked operators can still clean up via `agent worktree gc` (no plan gate there) or by exiting plan mode. **Supersedes D163.** |
+| `src/subagents/handle-store.ts` | (a) Spawn body now flips `record.status = 'settled'` and populates `record.settledResult` synchronously inside the async IIFE BEFORE returning, eliminating the race window where a `cancel()` between promise resolution and the post-promise `.then` could observe `status === 'running'` and emit a misleading `cancelled: true`. (b) The post-promise `.then` reject branch is removed — the spawn body now catches `spawnFn` throws locally and synthesizes the error envelope, so the underlying promise no longer rejects. (c) `awaitHandle`'s reject-branch fallback is correspondingly removed (it was unreachable). |
+| `src/harness/loop.ts` | (a) `safeInvokeOne` wrapper inside the parallel branch catches any throw escaping `invokeOne` and synthesizes a tool_result with `is_error: true`, so `runPool`'s `Promise.all` cannot orphan sibling workers in flight. (b) `allParallelSafe` predicate now also requires `tool.metadata.writes !== true` — runtime defense in depth against a future plugin / MCP-imported tool that violates the contract by declaring both `writes: true` and `parallel_safe: true`. (c) Parallel bail no longer trims `toolResults` (D167 supersedes D158): the persisted user message holds every tool_result the batch produced, matching the `tool_call` rows committed in DB. The bail snapshots `consecutiveErrors` at the moment of crossing so a sibling success after the bail can't reset the reported counter. |
+| `tests/harness/parallel.test.ts` | New `expect(result.detail).toBe('2 consecutive tool errors')` assertion locks the bail-counter snapshot. Two new tests: "parallel bail persists every tool_result in the audit message (D167)" reads the persisted `messages` row from SQLite and confirms 3 tool_result blocks; "writes:true + parallel_safe:true tool collapses batch to serial" registers a misbehaving tool that violates the metadata contract and confirms the runtime guard refuses parallel and falls back to serial via `tracker.max === 1`. |
+| `tests/subagents/handle-store.test.ts` | Two timing-dependent tests ("cancel aborts a running spawn", "drain cancels every running record") replaced their `await sleep(20)` cancellation barriers with promise-based "I'm in flight" signals the spawnFn flips on entry. Deterministic under loaded CI vs. wall-clock waits. |
+| `tests/tools/task-async.test.ts` | Same barrier pattern applied to "task_cancel aborts a still-running spawn". |
+
+**Decisions (review fixes):**
+
+- **D167 — Parallel bail persists every tool_result; supersedes D158.** D158 trimmed `toolResults` to `bailIndex+1` to "mirror serial-path audit". The reviewer (slice 1 #3) pointed out this leaves orphan `tool_call` rows in the DB: the parallel batch already executed every sibling and committed their rows inside `invokeTool`, while the message that pairs with the assistant's tool_use blocks now has fewer `tool_result` blocks than `tool_call` rows. Replay / recap consumers would diverge from audit. Persisting all results is the audit-correct shape; the bail still exits the run with `maxToolErrors`, and the reported counter is now snapshotted at the moment of crossing (so a sibling success after the bail can't reset it).
+- **D168 — `safeInvokeOne` wrapper guards `runPool` against throw escapes.** The reviewer (slice 1 #5) noted that `runPool` uses `Promise.all`, which rejects on the first worker throw and orphans in-flight siblings. `invokeTool`'s contract says "tool errors return as data, never as throws", but a regression in that path would leave `tool_call` rows in `running` forever. The wrapper converts unexpected throws into a synthesized `is_error: true` tool_result so the pool always settles every worker. Belt-and-braces; today's invokeTool doesn't need it, tomorrow's might.
+- **D169 — Runtime guard against `writes: true + parallel_safe: true`.** The `ToolMetadata` doc-comment forbids the combination, but it was only a documentation rule. Reviewer (slice 1 #1) flagged that a misbehaving plugin or MCP-imported tool could violate it silently. The `allParallelSafe` predicate in `loop.ts` now also requires `writes !== true`; a violator collapses the batch to serial — the safe outcome regardless of intent. The metadata comment stays as guidance for tool authors; the runtime check is the load-bearing invariant.
+- **D170 — Status flip lives inside the spawn body, not in a post-promise `.then`.** The reviewer (slice 2 #2) pointed out the race window: a `cancel()` invoked between promise resolution and the post-promise `.then` running observed `status === 'running'` and returned `{ cancelled: true }` for a run that already settled. Moving the flip inside the async body collapses the window — the assignment lands in the same microtask the promise resolves in. The TS-side cost is a placeholder field assignment (`record.promise = ...` after IIFE construction), since `record` must exist before the IIFE captures it; the cost is one cast that documents itself.
+- **D171 — `task_cancel` is `planSafe: false`; supersedes D163.** Cancel cascading triggers worktree cleanup which writes to `.git/`. Plan mode promises observable-only; the previous "cancel is read-only relative to the working tree" claim ignored `.git/`. Operator with a leftover handle in plan mode can use `agent worktree gc` (no plan gate) or exit plan mode.
+- **D172 — Test barriers are signal-driven, not wall-clock.** "cancel aborts a running spawn" / "drain cancels every running record" / "task_cancel during run" all replaced `await sleep(20)` with promises the spawnFn resolves on entry. Removes a CI-flake risk where `setTimeout`-based sleeps under load could let cancel hit before spawnFn entered its sleep, taking the `cancelled_before_dispatch` path instead.
+
+**Pending — deferred to follow-up issues (not blockers for PR):**
+
+- **Slice 1 #2 — concurrent confirm modals via parallel pool.** If a policy entry forces `mode: confirm` on a `parallel_safe` tool, N modals can race. ModalManager has its own queue, so it shouldn't deadlock, but the operator UX hasn't been exercised. Issue for after the PR.
+- **Slice 1 #6 — `maxConcurrentToolCalls` shared between step loop and DAG.** Spec §11 reserved the 5/16 matrix for "Tool calls em flight (DAG)". The implementation reuses it for step parallelism. Defensible (single underlying pipeline) but worth a spec note when the DAG executor lands.
+- **Slice 1 #8 — soft-stop not honored mid-batch.** The parallel branch only checks soft-stop at the next step boundary; a soft signal during a 3-tool batch runs all 3 to completion. The current behavior matches the spec's "complete the current step" reading; revisit if operator UX research suggests otherwise.
+- **Slice 1 #7 — timing assertion in "all parallel_safe" test.** `expect(elapsed).toBeLessThan(220)` for 3×80ms could flake on heavily-loaded CI. The load-bearing assertion is `tracker.max >= 2`; the timing one is informational. Consider rewriting as a wall-clock-vs-serial-baseline ratio.
+- **Slice 2 #5 — cross-subagent budget reconciliation (spec §3.5).** Today three concurrent `task_async` spawns can each spend the full remaining `maxCostUsd`. A `$5` cap can balloon to ~$15 before the first cost-cap check fires post-turn. Implementing a reservation / accounting system is a slice of its own; until then the cap is best-effort across parallel subagents. Documented here so a future iteration knows it's open.
+- **Slice 2 #4 — `task_await timeout_ms = 0` doc claim.** The TaskAwaitInput JSDoc said "the store treats `0` as 'no timeout'", but the validator rejects `< 1`. Doc comment should be removed; trivial fix in the next pass.
+- **Slice 2 #6 — D161 stable-const bridge could be simplified.** Reviewer noted TS narrowing IS preserved across closures for `const` (the original concern was `let`). The current bridge works; rewriting it is a stylistic tidy.
+- **Slice 2 #8 — `task_async` doesn't pre-check `subagentDepth`.** Spawn returns a handle even when the depth would exceed `MAX_SUBAGENT_DEPTH`; the depth check fires at await time. One round trip wasted. `task` (sync) flushes earlier. Worth aligning when convenient.
+
+**Verification:** `bun run typecheck` clean; `bun run lint` clean;
+`bun test` 3057 pass / 0 fail / 10 skip.
+
+**Next:** PR `feat/parallel` against `develop`.
+
+---
+
 ## [2026-05-06] parallel — `parallel_safe` opt-in + parallel branch in step loop (kickoff)
 
 New branch `feat/parallel` off `develop`. Closes the gap between

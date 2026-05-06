@@ -85,9 +85,18 @@ describe('SubagentHandleStore', () => {
   });
 
   test('cancel aborts a running spawn before it finishes', async () => {
+    // Signal-driven barrier: spawnFn flips it BEFORE awaiting
+    // sleep, the test waits on it BEFORE cancel. Replaces a
+    // wall-clock `sleep(20)` that flaked under loaded CI when
+    // the spawnFn's own setTimeout was delayed past the cancel.
+    let entered: () => void = () => {};
+    const inFlight = new Promise<void>((r) => {
+      entered = r;
+    });
     const store = createSubagentHandleStore({
       cap: 3,
       spawnFn: async (args, signal) => {
+        entered();
         try {
           await sleep(500, signal);
         } catch {
@@ -106,13 +115,7 @@ describe('SubagentHandleStore', () => {
       },
     });
     const h = store.spawn({ name: 'slow', prompt: 'p' });
-    // Yield long enough for spawnFn to enter its sleep — only then
-    // does cancel land DURING the spawnFn body. Without this wait
-    // the controller flips before slot acquisition completes its
-    // microtask, and the store correctly takes the
-    // cancelled_before_dispatch fast path (covered by a separate
-    // test). 20ms is well clear of the microtask boundary.
-    await sleep(20);
+    await inFlight;
     const cancelOutcome = store.cancel(h.id);
     expect(cancelOutcome.cancelled).toBe(true);
     const out = await store.awaitHandle(h.id);
@@ -212,9 +215,19 @@ describe('SubagentHandleStore', () => {
   });
 
   test('drain cancels every running record and awaits settle', async () => {
+    // Counter-based barrier: spawnFn increments on entry; the
+    // test awaits the third entry before draining. Deterministic
+    // under loaded CI vs. a wall-clock sleep.
+    let entered = 0;
+    let allInFlightResolve: () => void = () => {};
+    const allInFlight = new Promise<void>((r) => {
+      allInFlightResolve = r;
+    });
     const store = createSubagentHandleStore({
       cap: 3,
       spawnFn: async (args, signal) => {
+        entered += 1;
+        if (entered === 3) allInFlightResolve();
         try {
           await sleep(500, signal);
         } catch {
@@ -235,17 +248,10 @@ describe('SubagentHandleStore', () => {
     const handles = Array.from({ length: 3 }, (_, i) =>
       store.spawn({ name: `w${i}`, prompt: 'p' }),
     );
-    // Yield so each record's spawnFn enters its sleep; without
-    // this, drain aborts before the slot-acquire microtask
-    // finishes and every record takes the
-    // cancelled_before_dispatch fast path. Both shapes are valid
-    // outcomes; we want to assert that drain settles the IN-FLIGHT
-    // case here (the queued case is covered separately).
-    await sleep(20);
+    await allInFlight;
     await store.drain();
     expect(store.inFlightCount()).toBe(0);
     expect(store.list()).toHaveLength(handles.length);
-    // Each record's outcome reflects the in-flight cancellation.
     for (const h of handles) {
       const out = await store.awaitHandle(h.id);
       expect(out.kind).toBe('done');

@@ -1443,12 +1443,26 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           1,
           Math.min(budget.maxConcurrentToolCalls, MAX_CONCURRENT_TOOL_CALLS_CAP),
         );
+        // Defense in depth against malformed metadata: a tool
+        // that declares BOTH `parallel_safe: true` and
+        // `writes: true` is a contract violation (the
+        // ToolMetadata comment forbids it explicitly). The 6
+        // builtins flagged today are clean, but a future plugin
+        // / MCP-imported tool could declare both — refusing the
+        // parallel path in that case keeps the FS-race
+        // invariant load-bearing at runtime, not just at
+        // documentation. A failed-but-still-parallel-safe tool
+        // also gets caught here: any `writes` tool collapses
+        // the batch to serial, which is the conservative
+        // outcome.
         const allParallelSafe =
           collected.tool_uses.length >= 2 &&
           parallelCap >= 2 &&
           collected.tool_uses.every((tu) => {
             const tool = config.toolRegistry.get(tu.name);
-            return tool !== null && tool.metadata.parallel_safe === true;
+            if (tool === null) return false;
+            if (tool.metadata.writes === true) return false;
+            return tool.metadata.parallel_safe === true;
           });
 
         const toolResults: ProviderToolResultBlock[] = [];
@@ -1470,47 +1484,78 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           //   tool_use order AFTER the batch settles. This
           //   preserves the "5 consecutive failures" semantics:
           //   if A,B,C all fail in one parallel batch and the
-          //   prior step ended at 2 failures, the counter is now
-          //   5 (audit + replay match the serial path that would
-          //   have executed A,B,C in sequence). The early-bail
-          //   point is the index where the counter first crosses
-          //   `maxToolErrors`; tool_results are truncated there
-          //   so the persisted message reflects "we took action,
-          //   then bailed" — same audit shape as serial.
+          //   prior step ended at 2 failures, the counter is
+          //   now 5 (audit + replay match the serial path that
+          //   would have executed A,B,C in sequence).
+          // - On bail, EVERY result the batch produced is
+          //   persisted (D167 — superseding D158's trim). The
+          //   parallel batch already executed every sibling
+          //   tool — its `tool_call` rows are in the DB,
+          //   committed inside `invokeTool`. Trimming the
+          //   message would leave orphan tool_calls referenced
+          //   by an assistant tool_use block whose paired
+          //   tool_result is missing — replay/recap consumers
+          //   would diverge from the audit log. The bail still
+          //   exits the run with `maxToolErrors`; the message
+          //   accurately reflects what physically happened.
           // - Aborts mid-batch: workers honor `ctx.signal` so a
           //   hard abort routes individual invokeTool calls to
           //   ToolError `aborted`. The pool still settles all
           //   workers (they return quickly via their own abort
           //   branch); the next top-of-step abort check exits
           //   with `aborted` / `maxWallClockMs`. This matches
-          //   the "complete the current step" semantics the spec
-          //   calls for, both for soft and hard cancel given
-          //   that the parallel pool is tightly bounded.
-          const outcomes = await runPool(collected.tool_uses, parallelCap, invokeOne);
-          let bailIndex = -1;
-          for (const [i, o] of outcomes.entries()) {
+          //   the "complete the current step" semantics the
+          //   spec calls for, both for soft and hard cancel
+          //   given that the parallel pool is tightly bounded.
+          // - `safeInvokeOne` wraps `invokeOne` with a
+          //   try/catch (D168 — defense vs. `runPool`'s
+          //   `Promise.all`-shaped failure mode). The contract
+          //   for `invokeTool` is "tool errors return as data,
+          //   never as throws"; if a future regression breaks
+          //   that, a single throw would reject `Promise.all`
+          //   and orphan sibling workers in flight. The wrapper
+          //   converts unexpected throws into a synthesized
+          //   error envelope so the pool always settles every
+          //   worker.
+          const safeInvokeOne = async (
+            tu: CollectedToolUse,
+          ): Promise<{ toolResult: ProviderToolResultBlock; failed: boolean }> => {
+            try {
+              return await invokeOne(tu);
+            } catch (e) {
+              const message = e instanceof Error ? e.message : String(e);
+              return {
+                toolResult: {
+                  type: 'tool_result',
+                  tool_use_id: tu.id,
+                  name: tu.name,
+                  content: `internal harness error: ${message}`,
+                  is_error: true,
+                },
+                failed: true,
+              };
+            }
+          };
+          const outcomes = await runPool(collected.tool_uses, parallelCap, safeInvokeOne);
+          let bailCounter = -1;
+          for (const o of outcomes) {
             toolResults.push(o.toolResult);
             if (o.failed) {
               consecutiveErrors += 1;
             } else {
               consecutiveErrors = 0;
             }
-            if (consecutiveErrors >= budget.maxToolErrors) {
-              bailIndex = i;
-              break;
+            // Snapshot the counter the FIRST time it crosses
+            // the cap. Any later outcome (a sibling success
+            // would reset to 0; a sibling failure would keep
+            // climbing) shouldn't change the reason we report —
+            // the run was condemned at the moment of the first
+            // crossing.
+            if (consecutiveErrors >= budget.maxToolErrors && bailCounter === -1) {
+              bailCounter = consecutiveErrors;
             }
           }
-          if (bailIndex !== -1) {
-            // Mirror the serial-path partial persist: the message
-            // we land in audit reflects only the tool_results up
-            // to (and including) the call that pushed the counter
-            // over the cap. The parallel batch DID execute every
-            // sibling — we cannot un-run them — but persisting
-            // their results past the bail point would mislead a
-            // future replay into thinking the harness kept going
-            // past `maxToolErrors`. Trimming makes audit
-            // consistent with what serial would have shown.
-            toolResults.length = bailIndex + 1;
+          if (bailCounter !== -1) {
             const partialMsg = appendMessage(config.db, {
               sessionId,
               role: 'user',
@@ -1519,7 +1564,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             });
             lastMessageId = partialMsg.id;
             messages.push({ role: 'user', content: toolResults });
-            return await finish('maxToolErrors', `${consecutiveErrors} consecutive tool errors`);
+            return await finish('maxToolErrors', `${bailCounter} consecutive tool errors`);
           }
         } else {
           // Serial path — historical behavior. Sibling iterations

@@ -39,11 +39,16 @@ export const taskCancelTool: Tool<TaskCancelInput, TaskCancelOutput> = {
     category: 'misc',
     writes: false,
     idempotent: true,
-    // Plan mode: cancelling is read-only relative to the working
-    // tree (it stops a run, doesn't write). Allow it so the
-    // operator can clean up an inherited handle via the model
-    // even when plan mode is on.
-    planSafe: true,
+    // Plan mode: blocked. The cascade triggered by cancel is NOT
+    // strictly read-only: when the cancelled child declared
+    // `isolation: worktree`, the cleanup path (`cleanupWorktree`)
+    // shells out `git worktree remove --force`, which mutates
+    // `.git/`. Plan mode promises the working tree is observable-
+    // only; cancelling a worktree subagent breaks that promise.
+    // Operators with leftover handles can still cancel via the
+    // explicit `agent worktree gc` command surface (no plan-mode
+    // gate there) or by exiting and re-entering plan mode.
+    planSafe: false,
     display: 'raw',
   },
   async execute(args, ctx): Promise<ToolResult<TaskCancelOutput>> {
