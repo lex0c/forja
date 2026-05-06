@@ -275,6 +275,32 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   let priorCostUsd = 0;
   let priorUsageComplete = true;
 
+  // Cost incurred by settled child handles inherited from prior
+  // runs of the resumed session. Lives SEPARATELY from
+  // `priorCostUsd` because the two flow to different sinks:
+  //
+  //   - `priorCostUsd` is parent-self only and is round-tripped
+  //     through `sessions.totalCostUsd` (loaded at resume, written
+  //     back at finish via `priorCostUsd + totalCostUsd`).
+  //   - `rehydratedChildCostUsd` is the sum of `costUsd` across
+  //     SETTLED rows in `subagent_handles` — already persisted by
+  //     each child's `runSubagent` settle event. Folding it back
+  //     into `priorCostUsd` would double-persist on every resume:
+  //     finish() would write `(priorCostUsd + childA + childB) +
+  //     totalCostUsd` to sessions.totalCostUsd; the next resume
+  //     loads that into `priorCostUsd` and adds the same children
+  //     again. After N resumes, `sessions.totalCostUsd` shows
+  //     `parentSelf + N * childTotal` even though no new work
+  //     ran.
+  //
+  // The budget gate (cap check, getCostBudget, watchdog) sums all
+  // four — priorCostUsd + totalCostUsd + cumulativeChildCostUsd
+  // (this run's children) + rehydratedChildCostUsd (prior runs'
+  // children) + reserved (in-flight) — so a resumed run still
+  // sees the full picture and can't burn the cap a second time.
+  // Persistence stays parent-self only.
+  let rehydratedChildCostUsd = 0;
+
   // Per-turn cost-delta event emitter (spec ORCHESTRATION.md §3.5
   // shared-budget contract). Fires every time the run's
   // `totalCostUsd` advances — turn settle, compaction, partial
@@ -327,7 +353,8 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   const costCapDetailIfExceeded = (): string | null => {
     if (budget.maxCostUsd === undefined) return null;
     const reserved = subagentHandleStore?.getReservedChildCostUsd() ?? 0;
-    const cumulative = priorCostUsd + totalCostUsd + cumulativeChildCostUsd + reserved;
+    const cumulative =
+      priorCostUsd + totalCostUsd + cumulativeChildCostUsd + rehydratedChildCostUsd + reserved;
     if (cumulative <= budget.maxCostUsd) return null;
     return `cumulative cost $${cumulative.toFixed(6)} exceeded cap $${budget.maxCostUsd.toFixed(6)}`;
   };
@@ -735,7 +762,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             // with `handleId === undefined`; the exclude is a
             // no-op there.
             const reserved = subagentHandleStore?.getReservedChildCostUsd(handleId) ?? 0;
-            const spent = priorCostUsd + totalCostUsd + cumulativeChildCostUsd + reserved;
+            const spent =
+              priorCostUsd +
+              totalCostUsd +
+              cumulativeChildCostUsd +
+              rehydratedChildCostUsd +
+              reserved;
             const projected = spent + estimate;
             if (projected > budget.maxCostUsd) {
               return {
@@ -807,7 +839,12 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     trackerStore.recordLiveCost(trackerHandleId, e.lastEvent.cumulative);
                     if (budget.maxCostUsd !== undefined) {
                       const reserved = trackerStore.getReservedChildCostUsd();
-                      const total = priorCostUsd + totalCostUsd + cumulativeChildCostUsd + reserved;
+                      const total =
+                        priorCostUsd +
+                        totalCostUsd +
+                        cumulativeChildCostUsd +
+                        rehydratedChildCostUsd +
+                        reserved;
                       if (total > budget.maxCostUsd) {
                         trackerStore.cancelAll();
                       }
@@ -950,7 +987,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // second time. Read once at construction; the store's
         // accumulator is a one-shot value snapshotted from the
         // rehydrated rows.
-        priorCostUsd += subagentHandleStore.getRehydratedChildCostUsd();
+        //
+        // Stored in `rehydratedChildCostUsd` rather than mutating
+        // `priorCostUsd` because finish() persists `priorCostUsd
+        // + totalCostUsd` back to `sessions.totalCostUsd`. Folding
+        // child cost into priorCostUsd would re-persist it on
+        // every resume, inflating sessions.totalCostUsd by the
+        // settled-children sum each cycle and tripping
+        // `maxCostUsd` prematurely on long-lived sessions even
+        // when no new work runs. The budget gate sums both
+        // priorCostUsd and rehydratedChildCostUsd; persistence
+        // does not.
+        rehydratedChildCostUsd = subagentHandleStore.getRehydratedChildCostUsd();
       }
 
       // Checkpoint manager. Only built when the caller opted in —
@@ -1511,6 +1559,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               priorCostUsd +
               totalCostUsd +
               cumulativeChildCostUsd +
+              rehydratedChildCostUsd +
               (subagentHandleStore?.getReservedChildCostUsd() ?? 0),
             cap: budget.maxCostUsd,
           }),

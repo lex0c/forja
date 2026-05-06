@@ -15,6 +15,72 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — keep rehydrated child cost out of persisted session totals
+
+User-spotted bug. `runAgent` mutated `priorCostUsd` with the
+sum of settled child costs at resume:
+
+```ts
+priorCostUsd += subagentHandleStore.getRehydratedChildCostUsd();
+```
+
+But `priorCostUsd` is round-tripped through the persisted
+column. At resume start: `priorCostUsd = existing.totalCostUsd`.
+At finish: `completeSession(..., priorCostUsd + totalCostUsd, ...)`.
+So folding child cost into `priorCostUsd` re-persisted the
+same child spend on every resume cycle:
+
+| Resume # | sessions.totalCostUsd before | rehydrated added | persisted at finish |
+|---|---|---|---|
+| 1 | $0.5 (parent self) | +$2.0 (child) | $2.5 |
+| 2 | $2.5 (loaded as priorCostUsd) | +$2.0 (same child!) | $4.5 |
+| 3 | $4.5 | +$2.0 | $6.5 |
+
+After N resumes the row showed `parentSelf + N * childTotal`
+even when no new work ran. A `maxCostUsd` cap that started
+healthy could trip purely from resume churn, blocking the
+session before any new turn started.
+
+The bug only reproduces with at least one prior `task_async` /
+`task` settled with non-zero cost, which is exactly the
+common case once the async surface is in active use — easy to
+miss in tests that exercise resume on cost-free fixtures.
+
+| File | Change |
+|---|---|
+| `src/harness/loop.ts` | Introduces `let rehydratedChildCostUsd = 0;` next to `priorCostUsd` and reassigns (not `+=`) it at store-construction time. The four budget-gate sites (`costCapDetailIfExceeded`, dispatcher's pre-spawn `spent`, in-turn cost watchdog, `getCostBudget` getter) all add the new variable to the projected cumulative. The persistence site (`completeSession(..., priorCostUsd + totalCostUsd, ...)`) is left untouched — that's the load-bearing change. The store-construction comment is rewritten to spell out the why. |
+| `tests/harness/loop.test.ts` | Two regression tests. (a) "rehydrated child cost does NOT inflate sessions.totalCostUsd across resumes" — three runs (initial + two resumes) with a $0.04 settled handle seeded; asserts the column stays at parent-self only ($0.0006 → $0.0009 → $0.0012). With the bug, the row would inflate by $0.04 on each resume. (b) "rehydrated child cost still enters the budget gate on resume" — counterpart guard so the fix doesn't silently drop the gate's view of inherited spend; cap=$0.001 with $0.04 of seeded child cost trips the pre-call gate before any provider call. |
+
+**Decision:**
+
+- **D216 — Split `priorCostUsd` (parent-self, persisted) from
+  `rehydratedChildCostUsd` (gate-only).** Two flows that
+  superficially look like "previous run's spend" actually go
+  to different sinks:
+  - `priorCostUsd` round-trips through `sessions.totalCostUsd`
+    (parent-self only — the column was never meant to include
+    children, since each child carries its own session row /
+    handle row with its own cost).
+  - `rehydratedChildCostUsd` is a budget-gate-only view of
+    settled-handle costs; it informs the cap check but is
+    NEVER persisted, because the source of truth for child
+    spend is `subagent_handles.settled_payload` itself.
+  
+  Folding both into one variable conflated the two
+  responsibilities. The fix isolates them by storage, not by
+  computation timing — the gate cumulative now sums four
+  components (`priorCostUsd`, `totalCostUsd`,
+  `cumulativeChildCostUsd`, `rehydratedChildCostUsd`,
+  `reserved`); persistence stays a two-component sum.
+  Symmetric to the `cumulativeChildCostUsd` (this run's
+  children) / `rehydratedChildCostUsd` (prior runs' children)
+  pair: both gate-only, neither persisted.
+
+Verification: typecheck clean, lint clean, 3104 pass / 0 fail
+(2 new tests).
+
+---
+
 ## [2026-05-06] parallel — write-once guard on updateSubagentHandleChildSession
 
 User-spotted bug. `settleSubagentHandle` is write-once
