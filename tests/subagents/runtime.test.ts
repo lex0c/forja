@@ -4548,4 +4548,90 @@ describe('runSubagent — permission proxy (parent)', () => {
     expect(observedSignal).not.toBeNull();
     expect(signalAbortedAtHookExit).toBe(true);
   });
+
+  test('parent signal listener is removed after the subagent run ends (no per-run leak)', async () => {
+    // Memory hygiene for long REPL sessions. The runtime forwards
+    // input.signal aborts into its per-session askAbort as
+    // belt-and-suspenders, but if every runSubagent call left a
+    // listener attached to input.signal until the parent itself
+    // aborts (which doesn't happen in a healthy REPL), 1000s of
+    // subagent runs would accumulate 1000s of closure references.
+    // The fix pairs add/remove off askAbort.signal so cleanup
+    // runs exactly once at end-of-session.
+    //
+    // AbortSignal doesn't expose a public listener count; we
+    // instrument by wrapping a real AbortSignal in a Proxy-like
+    // object that tracks add/remove calls. The runtime treats
+    // the wrapper as a normal AbortSignal (it never type-narrows
+    // beyond the AbortSignal interface).
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const parentAc = new AbortController();
+    let addCount = 0;
+    let removeCount = 0;
+    const trackedSignal = new Proxy(parentAc.signal, {
+      get(target, prop) {
+        if (prop === 'addEventListener') {
+          return (
+            type: string,
+            listener: EventListener,
+            options?: AddEventListenerOptions | boolean,
+          ): void => {
+            if (type === 'abort') addCount += 1;
+            target.addEventListener(type, listener, options);
+          };
+        }
+        if (prop === 'removeEventListener') {
+          return (
+            type: string,
+            listener: EventListener,
+            options?: EventListenerOptions | boolean,
+          ): void => {
+            if (type === 'abort') removeCount += 1;
+            target.removeEventListener(type, listener, options);
+          };
+        }
+        // Forward every other access to the real signal with
+        // `this` bound to the underlying AbortSignal — native
+        // getters like `aborted` and `reason` refuse to run on
+        // anything but a real AbortSignal instance, so passing
+        // the proxy as `this` (the default Reflect.get receiver)
+        // throws "AbortSignal.aborted getter can only be used
+        // on instances of AbortSignal".
+        const v = Reflect.get(target, prop, target);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    });
+
+    const rig = buildPermissionRig();
+    queueMicrotask(() => {
+      const children = listChildSessions(db, parent.id);
+      const last = children[children.length - 1];
+      if (last !== undefined) rig.publish(last.id);
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      signal: trackedSignal,
+      spawnChildProcess: rig.spawn,
+      onPermissionAsk: async () => 'allow',
+    });
+
+    // Runtime added exactly one listener (the parent-abort
+    // forward) and removed exactly one (the cleanup off
+    // askAbort.signal abort). Pre-fix: addCount=1, removeCount=0
+    // → leak.
+    expect(addCount).toBe(1);
+    expect(removeCount).toBe(1);
+  });
 });

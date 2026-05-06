@@ -758,7 +758,26 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
         if (input.signal.aborted) {
           askAbort.abort();
         } else {
-          input.signal.addEventListener('abort', () => askAbort.abort(), { once: true });
+          // Pair add/remove so the listener doesn't accumulate on
+          // the parent's signal across N subagent runs in a long
+          // REPL session. Without this cleanup, every runSubagent
+          // call leaves a closure attached to input.signal that
+          // only auto-removes when the parent itself aborts (Ctrl+C
+          // / REPL exit) — a handful per session is fine, but a
+          // session running 1000s of subagents would accumulate
+          // 1000s of closures. `askAbort` always fires by end of
+          // session (channel.onClose is the typical path; the
+          // input.signal forward is the belt-and-suspenders), so
+          // wiring removal off askAbort guarantees cleanup runs
+          // exactly once at the right moment.
+          const parentSignal = input.signal;
+          const onParentAbort = (): void => askAbort.abort();
+          parentSignal.addEventListener('abort', onParentAbort);
+          askAbort.signal.addEventListener(
+            'abort',
+            () => parentSignal.removeEventListener('abort', onParentAbort),
+            { once: true },
+          );
         }
       }
       handle.ipc.onMessage((msg) => {
