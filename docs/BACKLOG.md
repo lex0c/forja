@@ -15,6 +15,44 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — busy_timeout=5000 to absorb WAL contention
+
+User-prompted DB review. The parallelism architecture has
+parent + up to 8 child subagent subprocesses, each with its
+own DB connection. WAL allows multiple readers + 1 writer;
+N+1 writers compete for the lock. With default
+`busy_timeout = 0`, any collision throws SQLITE_BUSY
+immediately at the caller — no internal retry.
+
+Several writes are fail-soft (audit streams:
+`cost_progress_events`, `subagent_gate_decisions`,
+`hook_runs`) so a throw degrades audit completeness
+silently. Others are load-bearing (`messages`,
+`sessions.complete`, `subagent_handles.settle`) and
+propagate up. Both categories benefit from internal retry:
+5s is well above any single-row write latency on commodity
+disk (typical <5ms) and well below any operator-perceptible
+hang threshold.
+
+| File | Change |
+|---|---|
+| `src/storage/db.ts` | One new PRAGMA inside the file-backed branch: `PRAGMA busy_timeout = 5000`. In-memory DBs are skipped — they're single-connection by construction, and some tests simulate `SQLITE_BUSY` via mock; applying a real timeout there would slow those tests without buying anything. |
+| `tests/storage/db.test.ts` | Two new tests: file-backed DB asserts `PRAGMA busy_timeout` returns 5000; in-memory DB asserts it stays at 0 (the default). |
+
+**Decision:**
+
+- **D224 — busy_timeout=5000 is universal for file-backed
+  DBs.** Skipping memory DBs preserves test determinism
+  (tests that simulate contention via mock get the throw
+  they expect) without weakening production guarantees —
+  in-memory DBs in production would be a bug, not a
+  contention surface.
+
+Verification: typecheck clean, lint clean, 3130 pass / 0
+fail (2 new tests).
+
+---
+
 ## [2026-05-06] parallel — stop dispatching queued tool calls after abort
 
 User-spotted bug. The parallel worker loop (`runPool`) had
@@ -219,14 +257,8 @@ run is unaffected.
   the IPC contract but not persistence. Spec PR logged as
   follow-up alongside D217's CONTRACTS.md update.
 
-- **Follow-up logged: `PRAGMA busy_timeout`.** Reviewer
-  noted `db.ts` sets WAL + `synchronous=NORMAL` but no
-  `busy_timeout`. Concurrent writers (parent + N child
-  processes) can throw SQLITE_BUSY; the try/catch swallows
-  it — losing rows. A 5s busy_timeout would absorb
-  transient contention without losing data. Not in this
-  slice's scope (DB-wide config change touches every
-  writer); logged as a separate cleanup.
+- **Follow-up resolved (D224, separate commit): `PRAGMA
+  busy_timeout = 5000`.** See entry below.
 
 Verification: typecheck clean, lint clean, 3117 pass / 0
 fail (8 new tests).

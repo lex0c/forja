@@ -42,6 +42,25 @@ describe('openDb', () => {
     expect(row.journal_mode).toBe('memory');
     db.close();
   });
+
+  test('file-backed DB sets busy_timeout to absorb WAL contention', () => {
+    // Critical for the parallelism architecture: parent + up
+    // to 8 child subagent subprocesses compete for the WAL
+    // writer lock. Default busy_timeout=0 throws SQLITE_BUSY
+    // on any collision; 5s absorbs transient contention
+    // without surfacing the error.
+    const db = openDb(join(tmpDir, 'busy.db'));
+    const row = db.query('PRAGMA busy_timeout').get() as { timeout: number };
+    expect(row.timeout).toBe(5000);
+    db.close();
+  });
+
+  test('memory DB does not set busy_timeout (single-connection by construction)', () => {
+    const db = openMemoryDb();
+    const row = db.query('PRAGMA busy_timeout').get() as { timeout: number };
+    expect(row.timeout).toBe(0);
+    db.close();
+  });
 });
 
 describe('withTransaction', () => {
