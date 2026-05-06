@@ -57,7 +57,7 @@ const DEFAULT_LIMIT = 50;
 export const memorySearchTool: Tool<MemorySearchInput, MemorySearchOutput> = {
   name: 'memory_search',
   description:
-    'Substring search across memory names, descriptions, and (with deep=true) bodies. Case-insensitive, no fuzziness — this is grep, not vector retrieval. Returns up to `limit` hits (default 50, max 200). Use after memory_list when you want to narrow by topic.',
+    'Substring search across memory names, descriptions, and (with deep=true) bodies. Case-insensitive, no fuzziness — this is grep, not vector retrieval. Returns up to `limit` hits (default 50, max 200). Use after memory_list when you want to narrow by topic. Parallel-safe: emit multiple memory_search calls in a single turn to query several patterns concurrently.',
   inputSchema: {
     type: 'object',
     properties: {

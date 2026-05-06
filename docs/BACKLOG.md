@@ -15,6 +15,119 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — surface parallelism affordances to the model
+
+User-prompted gap audit: "o modelo sabe que pode rodar coisas
+em paralelo?" Audit answer: only partially. `task_async`'s
+description spelled out the fan-out pattern explicitly, but
+the 6 parallel-safe builtins (`read_file`, `glob`, `grep`,
+`memory_read`, `memory_list`, `memory_search`) gave zero
+hint about batchable dispatch in their descriptions, and
+no system-prompt preamble taught the meta-rule. Models
+default to one-tool-per-turn under that signal vacuum,
+leaving the harness's parallel-tool path
+(spec ORCHESTRATION.md §1.3) capability-dormant. Smoke 09
+(`evals/smoke/09-parallel-reads.yaml`) only passed because
+its prompt EXPLICITLY said "emit all three calls in a single
+turn"; the model wasn't getting there on its own.
+
+Two-layer fix:
+
+  1. **Per-tool descriptions.** Each of the 6
+     parallel-safe builtins gains a "Parallel-safe: ..."
+     sentence in its `description`. Pattern is consistent
+     across tools: "emit multiple X calls in a single turn
+     to ... concurrently." Makes the affordance visible at
+     the tool-discovery layer without requiring system
+     prompt cooperation.
+
+  2. **System-prompt preamble.** New
+     `src/cli/parallel-prompt.ts` exports
+     `PARALLEL_HINT_PROMPT` — a short markdown block that
+     names the 6 parallel-safe tools, the `task_async` /
+     `task_await` / `task_cancel` family, AND the cases
+     where sequential dispatch is correct ("when each step
+     depends on the previous one"). Bootstrap composes this
+     hint as a universal preamble, prepended to whatever the
+     caller / plan-mode supplied. Three-layer ordering:
+     hint (universal background) → plan/user prompt
+     (operating mode) → memory section (project context).
+
+| File | Change |
+|---|---|
+| `src/tools/builtin/read-file.ts` | Description appended: "Parallel-safe: emit multiple read_file calls in a single turn to batch reads — the harness dispatches them concurrently." |
+| `src/tools/builtin/glob.ts` | Same shape: "Parallel-safe: emit multiple glob calls in a single turn to scan several patterns concurrently." |
+| `src/tools/builtin/grep.ts` | Same shape: "Parallel-safe: emit multiple grep calls in a single turn to search several patterns concurrently." |
+| `src/tools/builtin/memory-read.ts` | Same shape, with "to load several memories concurrently." |
+| `src/tools/builtin/memory-list.ts` | Same shape, with "(e.g. one per scope) to enumerate concurrently." |
+| `src/tools/builtin/memory-search.ts` | Same shape, with "to query several patterns concurrently." |
+| `src/cli/parallel-prompt.ts` | NEW. `PARALLEL_HINT_PROMPT` constant + `composeWithParallelHint(downstream)` helper. Mirrors the `plan-prompt.ts` shape so both system-prompt layers compose the same way. |
+| `src/cli/bootstrap.ts` | Imports `composeWithParallelHint`. The systemPrompt assembly now stacks three layers in precedence order: hint (universal) → plan-mode prompt OR caller's prompt (operating mode) → memory section (project context). |
+| `src/cli/subagent-child.ts` | (Review fix) Imports `composeWithParallelHint` and prepends the hint above `audit.systemPrompt` BEFORE the optional memory composition. Without this, subagent children — which build their config independently of `bootstrap.ts` — inherited only the per-tool "Parallel-safe: ..." descriptions but missed the meta-rule preamble. Exploration subagents (`tools: [read_file, grep, glob]` — typical) regressed to capability-dormant one-tool-per-turn behavior, exactly the pre-D227 state the slice exists to fix. |
+| `tests/cli/parallel-prompt.test.ts` | NEW. Five unit tests: hint anchors on concrete tool names; hint acknowledges sequential dispatch; compose returns hint alone for undefined/empty downstream; compose prepends hint with separator before downstream. |
+| `tests/cli/bootstrap.test.ts` | Four existing tests updated to reflect that the system prompt now always carries the hint as a base. New ordering assertion in the plan+user composition test: hint < plan < user. |
+| `tests/cli/subagent-child.test.ts` | (Review fix) New test "child system prompt carries the parallelism hint": captures the system block via a recording provider, asserts hint precedes the subagent's identity prompt. Two pre-existing tests ("whitelist without memory_*..." / "memoryCwd absent...") updated to assert hint+identity instead of identity-alone — the property they actually test (memory section suppression) is preserved with stronger assertions on what DOES land. |
+| `evals/smoke/10-parallel-reads-implicit.yaml` | NEW smoke. Same fixture as 09 but the prompt drops the "emit all three in a single turn" instruction — just "take a look... summarize." Cap of 4 steps (review fix: bumped from 3 for safety margin without losing the property) — full serialization (3 reads + 1 summary = 4 steps) trips on any extra interleaved turn, while parallelization lands at 2 steps. Counterpart eval that 09 (explicit prompt) doesn't reach. |
+
+**Decision:**
+
+- **D227 — The hint is universal, not opt-in.** A flag-
+  gated hint would defeat the point: the affordance is
+  invisible to the model under the default config, which
+  is precisely the configuration most operators (and most
+  CI eval runs) hit. Forcing every caller to opt in would
+  re-introduce the gap. The hint is short (~7 sentences)
+  so the prompt-cache amortization is fine, and it's
+  composable: callers' prompts layer AFTER as more-specific
+  instructions.
+
+- **Hint goes FIRST in the composition order.** Background
+  framing belongs above operating-mode framing belongs
+  above project-context. The model reads them as a stack:
+  general capabilities → mode-specific rules → concrete
+  context. Reversing the order would push "you can run
+  things in parallel" below specific instructions and let
+  the more-specific framing override the affordance signal.
+
+- **D228 — Hint reaches subagent children too.** Code
+  review caught that `subagent-child.ts` builds its harness
+  config independently of `bootstrap.ts`, so the hint
+  injection in bootstrap didn't propagate. Subagents that
+  inherit `read_file` / `grep` / `glob` (typical
+  exploration personas) MUST see the meta-rule preamble
+  too — the per-tool descriptions alone are not enough.
+  Fix mirrors the bootstrap composition: hint goes ABOVE
+  the audit-snapshot identity prompt, memory section
+  (when applicable) goes below — same three-layer order.
+
+- **Smoke 10 is the regression net.** Without the hint
+  AND without per-tool descriptions, smoke 10 would fail
+  on the maxSteps=4 cap because the model sequentializes
+  one read per turn. With both, it lands in 2 steps.
+  Smoke 09 (explicit prompt) keeps passing as the
+  protocol-level regression for the parallel-safe wire.
+  Smoke 10 is the meta-regression for the model-side
+  guidance — if a future change weakens the hint or strips
+  the per-tool annotations, smoke 10 trips first.
+
+- **Follow-up logged: prompt-cache marker on system block.**
+  Code review noted `src/providers/anthropic/index.ts` passes
+  `system: req.system` as a plain string with no
+  `cache_control: ephemeral` marker. The hint adds ~270
+  tokens that ride above the cached prefix on every turn.
+  Pre-existing condition (memory section also pays full
+  cost), not introduced here, but worth a separate slice
+  to wire the cache marker on the system block — would
+  amortize hint + memory across the prompt cache TTL.
+
+Verification: typecheck clean, lint clean, 3137 pass / 0
+fail (6 new tests, 4 existing updated). Smoke 09 pass (2
+steps, $0.0431). Smoke 10 pass (2 steps, $0.0429) — model
+parallelized purely from hint + per-tool descriptions, no
+explicit "single turn" instruction.
+
+---
+
 ## [2026-05-06] parallel — rehydrate worktree fields in settled handle envelopes
 
 User-spotted bug. The `kind: 'ran'` rehydration branch in

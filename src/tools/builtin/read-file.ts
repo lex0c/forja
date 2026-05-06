@@ -39,7 +39,7 @@ const MAX_FILE_BYTES = 10 * 1024 * 1024;
 export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = {
   name: 'read_file',
   description:
-    'Read a file from the filesystem. Use offset/limit to read specific line ranges of large files.',
+    'Read a file from the filesystem. Use offset/limit to read specific line ranges of large files. Parallel-safe: emit multiple read_file calls in a single turn to batch reads — the harness dispatches them concurrently.',
   inputSchema: {
     type: 'object',
     properties: {

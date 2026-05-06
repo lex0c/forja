@@ -1007,7 +1007,13 @@ You are the worker.`,
       expect(exitCode).toBe(0);
       expect(recordedSystem.length).toBeGreaterThan(0);
       const sys = recordedSystem[0];
-      expect(sys).toBe('You are explore.');
+      // Post-D227 review: subagent-child also prepends the
+      // parallelism hint above the audit snapshot's identity
+      // prompt. The whitelist-gated memory section is still
+      // suppressed (the property under test); only the hint is
+      // expected to land.
+      expect(sys).toContain('# Parallelism');
+      expect(sys).toContain('You are explore.');
       expect(sys).not.toContain('# Memory');
     } finally {
       if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
@@ -1096,7 +1102,11 @@ You are the worker.`,
     expect(exitCode).toBe(0);
     expect(recordedSystem.length).toBeGreaterThan(0);
     const sys = recordedSystem[0];
-    expect(sys).toBe('You are explore.');
+    // Post-D227 review: hint preamble lands above the
+    // audit-snapshot identity even when memory is unwired.
+    // Memory section suppression is the property under test.
+    expect(sys).toContain('# Parallelism');
+    expect(sys).toContain('You are explore.');
     expect(sys).not.toContain('# Memory');
   });
 
@@ -2233,5 +2243,47 @@ describe('runSubagentChild — IPC', () => {
     });
     expect(exitCode).toBe(0);
     expect(factoryCalled).toBe(false);
+  });
+
+  test('child system prompt carries the parallelism hint (D227 review)', async () => {
+    // Bug fix from review of D227: the parallelism hint
+    // (`PARALLEL_HINT_PROMPT`) was injected only in
+    // bootstrap.ts (parent path), so subagent children — which
+    // build their config in subagent-child.ts — went without
+    // it. An exploration subagent (typical `tools: [read_file,
+    // grep, glob]`) got the per-tool "Parallel-safe: ..."
+    // descriptions but missed the meta-rule preamble. This
+    // test pins down that subagent-child now prepends the hint
+    // ABOVE the audit's persisted systemPrompt, mirroring
+    // bootstrap's three-layer composition.
+    const { sessionId } = seedChildSession(dbDir);
+    let captured: string | undefined;
+    const captureProvider: Provider = {
+      ...stubProvider('done'),
+      async *generate(req): AsyncGenerator<StreamEvent> {
+        captured = req.system;
+        yield { kind: 'start', message_id: 'mock-msg' };
+        yield { kind: 'text_delta', text: 'done' };
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+    };
+    const exitCode = await runSubagentChild({
+      sessionId,
+      dbPath,
+      providerOverride: captureProvider,
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      errSink: () => undefined,
+    });
+    expect(exitCode).toBe(0);
+    expect(captured).toBeDefined();
+    // Hint preamble lands BEFORE the subagent's own identity
+    // prompt — the meta-rule is universal background and the
+    // identity prompt is the more-specific operating context.
+    expect(captured).toContain('# Parallelism');
+    expect(captured).toContain('You are explore.');
+    const hintIdx = (captured ?? '').indexOf('# Parallelism');
+    const identityIdx = (captured ?? '').indexOf('You are explore.');
+    expect(hintIdx).toBeLessThan(identityIdx);
   });
 });

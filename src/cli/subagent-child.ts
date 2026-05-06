@@ -39,6 +39,7 @@ import {
 } from '../subagents/permission-bridge.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
+import { composeWithParallelHint } from './parallel-prompt.ts';
 
 // Subagent-child entry path.
 //
@@ -645,7 +646,18 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // dynamic per-run and goes after.
     const wantsMemory = audit.toolsWhitelist.some((t) => t.startsWith('memory_'));
     let memoryRegistry: ReturnType<typeof createMemoryRegistry> | undefined;
-    let resolvedSystemPrompt = audit.systemPrompt;
+    // Three-layer composition mirrors bootstrap.ts (D227): the
+    // parallelism hint sits BELOW the subagent's identity prompt
+    // (the .md body captured in `audit.systemPrompt`) so the
+    // child reads its own role first and the affordance hint
+    // second. Without prepending here, exploration subagents
+    // (`tools: [read_file, grep, glob]` — the typical case) get
+    // the per-tool "Parallel-safe: ..." descriptions but never
+    // the meta-rule preamble — exactly the pre-D227 capability-
+    // dormant state, just one layer down. Memory section
+    // (when applicable) is appended at the bottom by the
+    // existing block below.
+    let resolvedSystemPrompt = composeWithParallelHint(audit.systemPrompt);
     if (opts.memoryCwd !== undefined && wantsMemory) {
       // Resolve repo root from the parent's cwd. Same fix as
       // bootstrap.ts: parent's invocation cwd may be a subdir
