@@ -410,6 +410,63 @@ describe('SubagentHandleStore', () => {
     await store.awaitHandle(h2.id);
   });
 
+  test('cumulative reconciles with liveCostUsd on kill-during-run (review fix #2)', async () => {
+    // Simulate a child that reported $2 of live cost before
+    // being aborted; the runtime returns costUsd=0 on
+    // interrupted exits. Without reconciliation, the
+    // cumulative tracker would charge $0; with it, it charges
+    // the live $2. We can't drive this end-to-end here (needs
+    // the harness loop), so we exercise the store-side getter
+    // directly: post-cost_update, getLiveCostUsd reflects the
+    // value; the harness reads it and combines.
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (_args, signal) => {
+        await sleep(200, signal).catch(() => undefined);
+        // Runtime hardcodes costUsd: 0 on cancelled paths.
+        return {
+          kind: 'ran',
+          output: '',
+          sessionId: 'child-abc',
+          status: 'interrupted',
+          reason: 'cancelled',
+          costUsd: 0,
+          steps: 0,
+          durationMs: 0,
+        };
+      },
+    });
+    let entered: () => void = () => {};
+    const inFlight = new Promise<void>((r) => {
+      entered = r;
+    });
+    const wrappedStore = {
+      ...store,
+      spawn: (args: SpawnSubagentArgs, opts: { estimateCostUsd: number }) => {
+        const handle = store.spawn(args, opts);
+        // Simulate cost_update arriving while the child runs.
+        queueMicrotask(() => {
+          entered();
+          store.recordLiveCost(handle.id, 2.0);
+        });
+        return handle;
+      },
+    };
+    const h = wrappedStore.spawn({ name: 'k', prompt: 'p' }, { estimateCostUsd: 0 });
+    await inFlight;
+    // Watchdog reads liveCostUsd before settling.
+    expect(store.getLiveCostUsd(h.id)).toBe(2.0);
+    store.cancel(h.id);
+    const out = await store.awaitHandle(h.id);
+    if (out.kind !== 'done' || out.result.kind !== 'ran') throw new Error('expected ran');
+    // Terminal envelope's costUsd is 0 (runtime hardcoded).
+    expect(out.result.costUsd).toBe(0);
+    // But getLiveCostUsd still reports the truth — the harness
+    // uses Math.max(child.costUsd, getLiveCostUsd) to reconcile
+    // before charging cumulative.
+    expect(store.getLiveCostUsd(h.id)).toBe(2.0);
+  });
+
   test('cancelAll aborts every running record and zeroes their reservations', async () => {
     let entered = 0;
     let allInFlight: () => void = () => {};
@@ -743,5 +800,110 @@ describe('SubagentHandleStore — persistence (resume rehydration)', () => {
     // Use the store to satisfy the no-unused-variable rule —
     // the construction is the side effect we're testing.
     expect(store.list()).toHaveLength(2);
+  });
+
+  test('persistence throw does NOT crash the harness (review fix #1)', async () => {
+    // Build a DB proxy that throws on the first UPDATE
+    // (child_session_id update OR settle, whichever fires).
+    // Production hits this on SQLITE_BUSY under WAL contention
+    // or FK violation from a cascading parent drop.
+    const realDb = db;
+    let updateCount = 0;
+    const throwingDb = new Proxy(realDb, {
+      get(target, prop, receiver) {
+        if (prop === 'query') {
+          return (sql: string) => {
+            const stmt = target.query(sql);
+            if (sql.includes('UPDATE subagent_handles')) {
+              return new Proxy(stmt, {
+                get(s, p) {
+                  if (p === 'run') {
+                    return () => {
+                      updateCount += 1;
+                      throw new Error('SQLITE_BUSY: simulated contention');
+                    };
+                  }
+                  // biome-ignore lint/suspicious/noExplicitAny: passthrough
+                  return (s as any)[p];
+                },
+              });
+            }
+            return stmt;
+          };
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+      // biome-ignore lint/suspicious/noExplicitAny: test seam
+      persistTo: { db: throwingDb as any, parentSessionId: parentId },
+    });
+    const h = store.spawn({ name: 'will-fail', prompt: 'p' }, { estimateCostUsd: 0 });
+    // Settle awaits without throwing — the catch in the IIFE
+    // swallowed the persistence error, the in-memory cache is
+    // still authoritative.
+    const out = await store.awaitHandle(h.id);
+    expect(out.kind).toBe('done');
+    if (out.kind === 'done' && out.result.kind === 'ran') {
+      expect(out.result.status).toBe('done');
+      expect(out.result.output).toContain('will-fail');
+    }
+    expect(updateCount).toBeGreaterThan(0);
+  });
+
+  test('getRehydratedChildCostUsd sums settled prior-run cost (review fix #3)', () => {
+    // Insert two prior-run settled handles with non-zero cost.
+    db.query(
+      `INSERT INTO subagent_handles
+         (handle_id, parent_session_id, child_session_id, name, spawned_at, status, settled_payload, created_at)
+       VALUES (?, ?, ?, ?, ?, 'settled', ?, ?)`,
+    ).run(
+      'h-prior-1',
+      parentId,
+      'child-1',
+      'explore',
+      Date.now() - 1000,
+      JSON.stringify({
+        kind: 'ran',
+        output: 'x',
+        sessionId: 'child-1',
+        status: 'done',
+        reason: 'done',
+        costUsd: 1.5,
+        steps: 1,
+        durationMs: 100,
+      }),
+      Date.now() - 1000,
+    );
+    db.query(
+      `INSERT INTO subagent_handles
+         (handle_id, parent_session_id, child_session_id, name, spawned_at, status, settled_payload, created_at)
+       VALUES (?, ?, ?, ?, ?, 'settled', ?, ?)`,
+    ).run(
+      'h-prior-2',
+      parentId,
+      'child-2',
+      'review',
+      Date.now() - 500,
+      JSON.stringify({
+        kind: 'ran',
+        output: 'y',
+        sessionId: 'child-2',
+        status: 'done',
+        reason: 'done',
+        costUsd: 0.75,
+        steps: 1,
+        durationMs: 50,
+      }),
+      Date.now() - 500,
+    );
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+      persistTo: { db, parentSessionId: parentId },
+    });
+    expect(store.getRehydratedChildCostUsd()).toBeCloseTo(2.25);
   });
 });

@@ -868,15 +868,30 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               };
             })(),
           });
-          // Charge the child's actual cost against the run-wide
+          // Reconcile the child's terminal `costUsd` against the
+          // live tracker captured via cost_update IPC events.
+          // The runtime hardcodes `costUsd: 0` for kill paths
+          // (interrupted / aborted / wall_clock / heartbeat_stale
+          // — see runtime.ts ~1152/1171/1184/1203). Without the
+          // max, a watchdog-killed child that had spent $2 would
+          // contribute $0 to `cumulativeChildCostUsd`, defeating
+          // the kill-during-run cap enforcement THIS branch
+          // explicitly added. The live tracker only exists for
+          // async path (handleId provided); sync `task` falls
+          // through to the unmodified terminal value.
+          const childCostUsd =
+            handleId !== undefined && subagentHandleStore !== undefined
+              ? Math.max(child.costUsd, subagentHandleStore.getLiveCostUsd(handleId))
+              : child.costUsd;
+          // Charge the reconciled cost against the run-wide
           // tracker. Both `task` (sync) and `task_async` reach
           // this dispatcher, so this single increment captures
           // every spawn. NaN-guarded: a misbehaving child that
           // emits a non-finite costUsd would otherwise poison
           // the cumulative counter and trip every subsequent
           // budget gate.
-          if (Number.isFinite(child.costUsd)) {
-            cumulativeChildCostUsd += child.costUsd;
+          if (Number.isFinite(childCostUsd)) {
+            cumulativeChildCostUsd += childCostUsd;
           }
           return {
             kind: 'ran',
@@ -884,7 +899,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             sessionId: child.sessionId,
             status: child.status,
             reason: child.reason,
-            costUsd: child.costUsd,
+            // Surface the reconciled cost in the envelope so
+            // task_await consumers and persisted audit rows
+            // reflect the truth even when the runtime emitted 0
+            // on a kill path.
+            costUsd: childCostUsd,
             steps: child.steps,
             durationMs: child.durationMs,
             ...(child.auditFailure !== undefined ? { auditFailure: child.auditFailure } : {}),
@@ -913,6 +932,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           spawnFn: async (args, perHandleSignal, handleId) => impl(args, perHandleSignal, handleId),
           persistTo: { db: config.db, parentSessionId: sessionId },
         });
+        // On resume, rehydrated settled handles carry cost that
+        // prior runs incurred but the `sessions.totalCostUsd`
+        // column does NOT include (that column is parent-self
+        // only). Without folding this in, the budget gate
+        // silently lets a resumed run burn the same cap a
+        // second time. Read once at construction; the store's
+        // accumulator is a one-shot value snapshotted from the
+        // rehydrated rows.
+        priorCostUsd += subagentHandleStore.getRehydratedChildCostUsd();
       }
 
       // Checkpoint manager. Only built when the caller opted in —

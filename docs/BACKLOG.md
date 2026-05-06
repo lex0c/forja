@@ -15,6 +15,82 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — final review fixes (persistence safety, kill-cost reconcile, resume cost)
+
+Final pre-PR review caught three bugs that broke invariants the
+branch claimed to deliver. Fixes in one commit; the remaining
+items are tracked as follow-ups (lockfile, e2e cost_update IPC,
+floating-point precision, batched rehydration) and don't
+block merge.
+
+| File | Change |
+|---|---|
+| `src/subagents/handle-store.ts` | (a) IIFE persistence calls (`updateSubagentHandleChildSession`, `settleSubagentHandle`) wrapped in try/catch with stderr warning. The previous code's "promise never rejects" comment was a lie — SQLITE_BUSY / FK violation / schema drift would have produced an unhandled rejection and crashed the process. The in-memory `settledResult` is correct above the persist call, so a swallowed error preserves consumer-visible state at the cost of a stale audit row (warning surfaces it). (b) New `getLiveCostUsd(handleId)` getter returns the latest cumulative the child reported via cost_update. The harness reads it at settle time. (c) New `getRehydratedChildCostUsd()` accumulator, populated one-shot at constructor time from rehydrated settled rows. The harness folds it into `priorCostUsd` so a resumed run's cap accounts for prior child spend. |
+| `src/harness/loop.ts` | (a) After the handle store is created, `priorCostUsd += store.getRehydratedChildCostUsd()`. Closes the resume cap hole: `sessions.totalCostUsd` is parent-self only, so without this, a session that spent $4 on children in run 1 sees $0 of child cost on resume; the operator's $5 cap silently allowed +$5 more. (b) Inside `spawnSubagentImpl`, after `runSubagent` returns, reconcile `child.costUsd` with the live tracker: `Math.max(child.costUsd, store.getLiveCostUsd(handleId))`. The runtime hardcodes `costUsd: 0` on every kill path (`runtime.ts ~1152/1171/1184/1203`), so without the max, a watchdog-killed child that spent $2 contributed $0 — directly defeating the kill-during-run cap enforcement this branch added. The reconciled value flows into `cumulativeChildCostUsd` AND into the returned envelope's `costUsd` so persisted audit + `task_await` consumers see the truth. |
+| `tests/subagents/handle-store.test.ts` | Three new tests: (a) "persistence throw does NOT crash the harness" — DB proxy throws on UPDATE, store's IIFE swallows + emits warn, in-memory cache returns clean result. (b) "cumulative reconciles with liveCostUsd on kill-during-run" — exercise the store-side getter; harness's Math.max combines correctly. (c) "getRehydratedChildCostUsd sums settled prior-run cost" — insert two prior-run handles with $1.50 + $0.75 cost; assert getter returns $2.25. |
+
+**Decisions:**
+
+- **D208 — Persistence errors are best-effort with warn.**
+  Wrapping the IIFE persist calls in try/catch keeps the
+  harness alive on transient DB issues. The trade-off: if
+  persistence fails, resume rehydration of THAT specific
+  handle won't recover (the row is stale or missing). The
+  warn on stderr surfaces the issue to operators / log
+  aggregators. The alternative — propagating the error to
+  the caller — would crash the entire run for one handle's
+  audit row, which is the wrong reliability balance.
+
+- **D209 — `Math.max(child.costUsd, getLiveCostUsd)` only when
+  handleId provided.** Sync `task` doesn't use the live
+  tracker (no handle), so falls through to the unmodified
+  terminal value. The runtime emits `costUsd: 0` on sync
+  kill paths too, which is a separate (smaller) hole — sync
+  task can't be watchdog-killed mid-run by the cost cap
+  (it blocks the parent step entirely), so kill-during-run
+  is async-only by construction. The hole only matters if a
+  sync task itself crosses the cap from inside its own
+  budget; the parent's turn-end check catches that on the
+  next boundary.
+
+- **D210 — Rehydrated cost folded into `priorCostUsd`, not a
+  separate field.** Keeps the existing budget formula
+  (`priorCostUsd + totalCostUsd + cumulative + reserved`)
+  intact. The fold happens once at startup; subsequent
+  cap projections see a unified cumulative number. The
+  schema-correct fix would be to redefine
+  `sessions.totalCostUsd` to include children, but that's
+  a migration with backwards-compat implications across
+  the audit subsystem. Folding at runAgent startup is the
+  right scope for this slice.
+
+**Tracked follow-ups (not in this commit):**
+
+- **#9 SQLITE_BUSY tolerance throughout the codebase.** Pre-fix
+  D208 makes the persist path resilient, but other DB calls
+  in the harness path (`appendMessage`, `insertCheckpoint`,
+  etc.) have similar exposure. Defense-in-depth slice.
+- **End-to-end test for cost_update IPC**. Existing tests
+  cover the store contract; an integration test driving
+  cost_update through real subprocess IPC is acknowledged.
+- **Lockfile enforcement** (D175 + #9 in this review).
+  Pre-existing débito; not regressed by this branch.
+- **Floating-point precision in cap formula** (#7 in this
+  review). Bounded ~1e-15 USD; documented as known noise.
+- **Batched rehydration** (#8 in this review). Currently
+  serial round-trips per running row at startup. Bounded
+  by FK CASCADE on session drop.
+- **Orphaned subprocess spend post-crash** (#10 in this
+  review). Doc gap; tracking.
+- **PLAYBOOKS production examples** (#11 in this review).
+  General guide added in §1.1.1; concrete playbook
+  examples deferred.
+
+Verification: typecheck clean, lint clean, 3095 pass / 0 fail /
+10 skip (3 new tests).
+
+---
+
 ## [2026-05-06] parallel — review fixes for cost-progress IPC (cancel-flag, sync IPC opt-in, spec reconcile)
 
 Code review of the cost-progress IPC work flagged 2 bugs + 3

@@ -145,6 +145,25 @@ export interface SubagentHandleStore {
   // monotonically across the run as children settle. Used by
   // the same pre-spawn check.
   getSettledChildCostUsd(): number;
+  // Latest live cost reported by the child via cost_update
+  // for a specific handle. Returns 0 on unknown handles or
+  // when no cost_update has landed yet. Used by the harness
+  // to reconcile the terminal envelope's `costUsd` against
+  // the live tracker — a watchdog-killed child reports
+  // `costUsd: 0` in its terminal payload (the runtime hardcodes
+  // it), but the live tracker has the actual mid-run spend
+  // captured via IPC. Without this reconciliation,
+  // `cumulativeChildCostUsd` would lose every kill-during-run
+  // cost. Spec ORCHESTRATION.md §3.5.
+  getLiveCostUsd(handleId: string): number;
+  // Sum of cost from rehydrated settled rows captured at
+  // store construction time. Zero on a fresh session;
+  // non-zero only when the store rehydrates a resumed
+  // session's prior handles. The harness adds this to
+  // `priorCostUsd` so the resumed run's cap accounts for
+  // child cost already spent in prior runs (the
+  // `sessions.totalCostUsd` column is parent-self only).
+  getRehydratedChildCostUsd(): number;
 }
 
 export interface CreateSubagentHandleStoreOptions {
@@ -379,6 +398,13 @@ export const createSubagentHandleStore = (
   // become no-ops (write-once), so each parent ends up with a
   // coherent self-view, just one parent's view is wrong about
   // who got there first.
+  // Sum of cost from settled children rehydrated at construction
+  // time. Captured one-shot here (rather than maintained in
+  // records) so the harness can add it to `priorCostUsd` once
+  // and the budget gate sees the resumed run's prior child
+  // spend without conflating it with this run's cumulative.
+  let rehydratedChildCostUsd = 0;
+
   if (persistTo !== undefined) {
     const rows = listSubagentHandlesByParent(persistTo.db, persistTo.parentSessionId);
     const tNow = now();
@@ -386,6 +412,9 @@ export const createSubagentHandleStore = (
       let cached: SpawnSubagentResult;
       if (row.status === 'settled' && row.settledPayload !== null) {
         cached = envelopeFromJson(row.settledPayload);
+        if (cached.kind === 'ran' && Number.isFinite(cached.costUsd)) {
+          rehydratedChildCostUsd += cached.costUsd;
+        }
       } else {
         // Running row → synthesize per-row resumed_session and
         // commit to DB. settleSubagentHandle is write-once: if
@@ -563,11 +592,30 @@ export const createSubagentHandleStore = (
       // either fully settled or recoverable as running"). Empty
       // sessionId (cancelled-before-dispatch and spawn-failed
       // paths) is left null in the column.
+      //
+      // Both calls go through bun:sqlite, which can throw on
+      // SQLITE_BUSY (concurrent checkpointing under WAL), FK
+      // violations (parent session row dropped via cascade
+      // mid-run), or schema mismatches after a future migration.
+      // Without this catch, a transient throw here becomes an
+      // unhandled rejection on the record's promise — node/Bun
+      // crashes the process. The in-memory `settledResult`
+      // is already correct above; the persistence failure is
+      // worth a stderr warning so audit consumers know the row
+      // may be stale or missing, but it MUST NOT take the
+      // harness down.
       if (persistTo !== undefined) {
-        if (result.kind === 'ran' && result.sessionId.length > 0) {
-          updateSubagentHandleChildSession(persistTo.db, id, result.sessionId);
+        try {
+          if (result.kind === 'ran' && result.sessionId.length > 0) {
+            updateSubagentHandleChildSession(persistTo.db, id, result.sessionId);
+          }
+          settleSubagentHandle(persistTo.db, id, envelopeToJson(result));
+        } catch (e) {
+          const message = e instanceof Error ? e.message : String(e);
+          console.error(
+            `subagent handle ${id}: persist failed (${message}); audit row may be stale`,
+          );
         }
-        settleSubagentHandle(persistTo.db, id, envelopeToJson(result));
       }
       return result;
     })();
@@ -729,6 +777,14 @@ export const createSubagentHandleStore = (
     return total;
   };
 
+  const getLiveCostUsd = (handleId: string): number => {
+    const record = records.get(handleId);
+    if (record === undefined) return 0;
+    return record.liveCostUsd;
+  };
+
+  const getRehydratedChildCostUsd = (): number => rehydratedChildCostUsd;
+
   return {
     spawn,
     awaitHandle,
@@ -740,5 +796,7 @@ export const createSubagentHandleStore = (
     recordLiveCost,
     getReservedChildCostUsd,
     getSettledChildCostUsd,
+    getLiveCostUsd,
+    getRehydratedChildCostUsd,
   };
 };
