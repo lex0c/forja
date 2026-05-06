@@ -80,7 +80,7 @@ Todas as mensagens têm shape:
 |---|---|---|
 | `interrupt:soft` | `{}` | Operador pediu soft stop. Filho aborta `softStopSignal` interno; harness sai no próximo step boundary. Idempotente — múltiplos `interrupt:soft` são no-op após o primeiro. |
 | `interrupt:hard` | `{}` | Operador escalou. Filho aborta `signal` (hard); preempta in-flight work. Equivalente semântico ao SIGTERM mas sem race do OS signal vs canal. |
-| `permission:answer` | `{ promptId, decision }` | Resposta a uma `permission:ask` que o filho mandou. (Slice futuro; não M1.) |
+| `permission:answer` | `{ promptId, decision: 'allow' \| 'deny' }` | Resposta a uma `permission:ask` que o filho mandou. Correlação por `promptId` — NÃO pelo envelope `id` (que é stamp por mensagem). `decision` é a verdict binária do operator no modal; o canal não transporta a `Decision` rica do engine (allow/deny/confirm) porque o modal só produz sim/não. `promptId` desconhecido no filho → log + drop (defensivo, nunca throws). |
 | `shutdown` | `{}` | Pai está exitando, filho deve encerrar limpo agora. Fast-path do `interrupt:hard` + EOF no stdin. |
 
 ### 3.2 Filho → pai (events)
@@ -95,7 +95,7 @@ Espelho dos `HarnessEvent` que o harness do filho já emite via `config.onEvent`
 | `tool_invoking` / `tool_decided` / `tool_finished` | (idem HarnessEvent) | Lifecycle de tool. |
 | `bg_started` / `bg_ended` | (idem HarnessEvent) | Bg processes spawned pelo filho. |
 | `todo_updated` | `{ items }` | Filho mexeu na própria TodoList. |
-| `permission:ask` | `{ promptId, toolName, command, cwd }` | (Slice futuro; não M1.) Filho pede aprovação. |
+| `permission:ask` | `{ promptId, toolName, args, cwd, prompt }` | Filho pede aprovação ao operador. `args` é opaco no wire (`unknown`) — o parent's modal renderer narrowa por `toolName`. `prompt` é a string que o engine montou da regra que matchou (ex: "Run bash: rm -rf /"). Único variant request/response no canal — bridge do filho bloqueia até o `permission:answer` correspondente chegar. |
 | `session_finished` | `{ result: HarnessResult }` | Filho terminou. Última mensagem antes do EOF. |
 
 ### 3.3 Eventos que NÃO atravessam IPC
@@ -180,9 +180,9 @@ Espelho dos `HarnessEvent` que o harness do filho já emite via `config.onEvent`
 1. **Slice 1**: transport + framing (stdin/stdout NDJSON, no semantics yet). Pai cria canal, filho ecoa eventos. Tests com fake transport.
 2. **Slice 2**: HarnessEvent → IPC message serialization no filho; deserialização + onEvent forward no pai. Subagent observability landing (1.f.2).
 3. **Slice 3**: `interrupt:soft`/`interrupt:hard` propagation. Soft-stop em subagents (D159). `abortCause` em subagent results (D168).
-4. **Slice 4** (futuro, M2+): `permission:ask` proxy.
+4. **Slice 4**: `permission:ask` proxy. Bridge child-side em `src/subagents/permission-bridge.ts` traduz verdict `confirm` do engine em ask sobre o canal; runtime parent-side roteia para o `ModalManager` com atribuição (sessionId + agent name). `Decision` rica do engine colapsa para `'allow' | 'deny'` no wire — modal só produz binário.
 
-Cada slice é landable independentemente. 1+2 já entrega 80% do valor (operator finalmente vê e cancela subagents).
+Cada slice é landable independentemente. 1+2 já entrega 80% do valor (operator finalmente vê e cancela subagents); 4 fecha o gap onde child em `confirm` verdict cairia para deny silencioso.
 
 ---
 
