@@ -17,6 +17,7 @@ import { permsCommand } from './commands/perms.ts';
 import { planCommand } from './commands/plan.ts';
 import { quitCommand } from './commands/quit.ts';
 import { sessionsCommand } from './commands/sessions.ts';
+import { subagentsCommand } from './commands/subagents.ts';
 import { parseSlashInput } from './parse.ts';
 import { type SlashRegistry, createRegistry } from './registry.ts';
 import type { SlashCommand, SlashContext, SlashResult } from './types.ts';
@@ -39,6 +40,7 @@ export const createBuiltinRegistry = (): SlashRegistry => {
     clearCommand,
     costCommand,
     sessionsCommand,
+    subagentsCommand,
     modelCommand,
     planCommand,
     budgetCommand,

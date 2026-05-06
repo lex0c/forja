@@ -99,6 +99,23 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
     if (state.bgProcesses.size > 0) {
       rightParts.push(dim(caps, `bg ${state.bgProcesses.size}`));
     }
+    // Active subagent counter. Sits next to `bg` because both
+    // are operator-facing in-flight indicators that drop early
+    // when the line is narrow (UI.md §4.10.6). Shown only when
+    // the count is > 0; same suppression rule as bg.
+    //
+    // `state.subagents` is populated by the harness adapter from
+    // `subagent_start` / `subagent_finished` events — those fire
+    // for BOTH sync `task` runs AND async `task_async` runs. The
+    // counter is therefore "live subagent runs" regardless of
+    // surface. The `/subagents` slash command, by contrast, only
+    // lists async handles (those persisted in `subagent_handles`).
+    // The two surfaces are complementary, not redundant: the
+    // footer answers "is anything in flight right now"; the
+    // slash answers "what async handles can I task_await".
+    if (state.subagents.size > 0) {
+      rightParts.push(dim(caps, `subagents ${state.subagents.size}`));
+    }
     // Memory count. Sits AFTER bg per spec
     // §4.10.6 "less sticky" priority — bg already drops first when
     // the line is narrow; memory drops second. The token uses `mem`

@@ -15,6 +15,127 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — operator surface review fixes (footer/slash semantics, test gaps)
+
+Code review of the operator surface (#1 sync vs async semantic
+mismatch, #3 test gaps, #4 stale-status doc). Fixes in one
+commit; the smaller nits (#2/#5/#6/#7/#8/#10) are deferred or
+rejected as documented débito.
+
+| File | Change |
+|---|---|
+| `src/tui/render/footer.ts` | Comment expanded to document the `subagents N` counter's dual semantic — `state.subagents` is populated by `subagent_start`/`finished` HarnessEvents that fire for BOTH sync `task` runs AND async `task_async` runs. The counter is "live subagent runs" regardless of surface. The slash command, by contrast, is async-only. The two surfaces complement each other rather than duplicate. |
+| `src/cli/slash/commands/subagents.ts` | (a) Empty-state message clarifies async-only scope: "no async subagent handles in this session — sync `task` calls do not appear here (they block the parent during execution)". (b) Populated path now emits a header line "Async subagent handles in this session:" so the operator immediately sees what kind of list this is. (c) Inline doc note about stale `running` status: a `task_cancel` flips the in-memory reservation immediately but the DB row only settles when the IIFE wakes; an operator polling fast may see stale `running`. Eventually consistent. |
+| `tests/cli/slash/commands.test.ts` | Updated assertions on the `/subagents` tests for the new header + clarification text. New tests: (a) malformed `settled_payload` JSON renders without crash and without `(undefined)` reason suffix; (b) `/budget parallel-tools` no-op path returns "already" without next-turn cue; (c) `/budget subagents` no-op path same. |
+| `tests/tui/render/footer.test.ts` | Three new tests for the `subagents N` token: count > 0 surfaces; count === 0 drops the token; bg + subagents coexist with bg-before-subagents ordering. Pattern mirrors the existing `bg N` / `mem N` tests so the regression net stays uniform. |
+
+**Decisions:**
+
+- **D197 — Footer counter is dual-semantic by design.** Renaming
+  to "async subagents" would lose information (sync runs really
+  ARE subagents in flight, blocking the parent). Renaming to
+  "live runs" would lose the operator-recognizable noun.
+  Keeping `subagents N` and clarifying in the slash command's
+  output is the cleanest UX: the counter answers "is anything
+  in flight?", the slash answers "what async handles can I
+  task_await?".
+
+- **D198 — `/subagents` shows handles in DB-snapshot view.** A
+  cancel that landed mid-spawn but hasn't settled yet still
+  appears `running`. The note inside the command body (and the
+  closeout) makes this explicit. Implementing a "drift-free"
+  view would require the slash dispatcher to read from the live
+  handle store (same wire D193 sketched for cancel), out of
+  scope for this slice.
+
+- **D199 — Tests for footer counter use the existing state-
+  injection pattern.** No new test infrastructure: same
+  `startedSession()` factory + `state.subagents.set(...)` to
+  populate. Mirrors the bg counter tests written when the bg
+  family landed.
+
+**Rejected/deferred from review:**
+
+- **#2/#7 leading zeros + safe-integer overflow in
+  `parseBoundedPositiveInt`.** Existing pattern across all
+  /budget subcommands; not regression. Out of scope.
+- **#5 footer overflow priority.** Pre-existing débito
+  documented in the footer's own comment. Real but unrelated
+  to parallelism.
+- **#6 hard-cap numbers as literals in usage / comment.** Doc
+  drift risk acknowledged; the error string itself uses the
+  imported constant, so the load-bearing copy stays accurate.
+- **#9 D193 cancel-via-slash gap.** Documented as out-of-scope
+  in the previous closeout. Not regressed by this commit.
+- **#10 `toEqual` brittle ordering on the registry test.**
+  Existing pattern; rewriting to set-based comparison is a
+  separate cleanup.
+
+Verification: typecheck clean, lint clean, 3087 pass / 0 fail /
+10 skip (6 new tests).
+
+---
+
+## [2026-05-06] parallel — operator surface (TUI counter, /subagents, /budget extensions, PLAYBOOKS)
+
+Closes the four operator-surface items from the original
+inventory (#7, #8, #10, #15) so the parallelism subsystem ships
+end-to-end rather than as a model-only feature. Nothing
+exercised the new caps from the operator's side; nothing
+showed how many subagents were running; the model could spawn
+async children but the operator couldn't observe what was
+in flight without grepping the DB.
+
+| File | Change |
+|---|---|
+| `src/tui/render/footer.ts` | New right-column token `subagents N` next to `bg N`. Suppressed when count is zero (same UX as bg). Reads `state.subagents.size` (already populated by the harness adapter via `subagent_start` / `subagent_finished`). |
+| `src/cli/slash/commands/budget.ts` | Two new subcommands: `/budget parallel-tools <N>` (1..16, sets `maxConcurrentToolCalls`) and `/budget subagents <N>` (1..8, sets `maxConcurrentSubagents`). Read-only `/budget` lists both. New `parseBoundedPositiveInt` helper for the cap-clamped subcommands. Imports `MAX_CONCURRENT_TOOL_CALLS_CAP` / `MAX_CONCURRENT_SUBAGENTS_CAP` so the bounds always match the harness's hard caps. |
+| `src/cli/slash/commands/subagents.ts` | NEW. `/subagents` slash command — observability-only listing of async subagent handles for the current session. Reads `subagent_handles` table (via `listSubagentHandlesByParent`), renders one line per handle (timestamp + 8-char id + name + status [+ reason if settled]). Mutation explicitly NOT exposed: cancel needs a wire to the live handle store's AbortController which the slash dispatcher doesn't have today; the model still drives cancel via `task_cancel`. Documented inline. |
+| `src/cli/slash/index.ts` | Registers `subagentsCommand`. |
+| `docs/spec/PLAYBOOKS.md §1.1.1` | NEW subsection "Spawn semantics: `task` (sync) vs `task_async`". Documents the two surfaces, the parallel pattern, the `max_concurrent_subagents` cap default, the budget-shared contract with `subagent.budget_exhausted` reference, and the cancel UX. Anti-pattern (`task_async` without `task_await`) called out explicitly. Closes the doc gap where playbook authors only saw the `task` example. |
+| `tests/cli/slash/commands.test.ts` | (a) Five new tests for the `/budget` subcommands: parallel-tools updates the field; rejects > cap with `[1, 16]` error; rejects 0/negatives/non-integers; subagents counterpart; subagents rejects > cap with `[1, 8]` error. (b) Four new tests for `/subagents`: pre-session "no session yet"; empty session "no async subagents"; lists handles with status + reason; cross-session isolation (sessionA doesn't see sessionB's handles). |
+| `tests/cli/slash/dispatch.test.ts` | Builtin count assertion bumped from 12 to 13; help-listing length bumped from 15 to 16. |
+
+**Decisions:**
+
+- **D193 — `/subagents` is observability-only.** The model owns
+  spawn/cancel via the tool surface (`task_async` /
+  `task_cancel`). Surfacing cancel to the slash command would
+  require the slash dispatcher to reach into the LIVE handle
+  store's AbortController inside `runAgent`, which doesn't have
+  a wire today (the dispatcher only sees `db`, `bus`,
+  `modalManager`, `baseConfig`). A future slash↔store bridge
+  similar to the modal-manager bridge for `confirmPermission`
+  would close this; tracking as out-of-scope.
+
+- **D194 — Footer counter uses `state.subagents.size` directly.**
+  The state already maintains the live map (driven by
+  `subagent_start` / `subagent_finished` events the harness
+  adapter forwards). No new event plumbing — just a renderer
+  read. Same approach as the bg counter: zero state, zero new
+  channel.
+
+- **D195 — `/budget` exposes parallel-tools / subagents but NOT
+  the lower-level RunBudget fields.** `maxToolErrors`,
+  `maxRepeatedToolHash`, etc. are harness safety budgets that
+  shouldn't be tuned per-run from operator UX (they protect
+  against runaway loops; lowering them silently changes the
+  loop's semantics). The two concurrency caps are user-visible
+  performance/cost tradeoffs, fair to expose. Pattern matches
+  what `/budget steps` and `/budget cost` already followed.
+
+- **D196 — Cap bounds enforced at the slash layer match the
+  hard caps in `harness/types.ts`.** Operators get the
+  rejection message `[1, 16]` for parallel-tools, `[1, 8]` for
+  subagents — same numbers the harness clamps to. Lets the
+  operator understand WHY their value didn't take effect
+  rather than seeing a silent clamp on the next turn.
+
+Verification: typecheck clean, lint clean, 3081 pass / 0 fail /
+10 skip (9 new tests).
+
+---
+
 ## [2026-05-06] parallel — review fixes for #1 (gate centralized, sync coverage, immediate cancel)
 
 Code review of the budget enforcement work flagged 1 bug + 6

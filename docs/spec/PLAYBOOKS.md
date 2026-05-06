@@ -68,6 +68,26 @@ phases:                       # opt-in; auto-emite push/pop em goal_stack (STATE
 
 Sampling defaults canônicos por workflow em [`TOKEN_TUNING.md`](./TOKEN_TUNING.md) §9. Context recipes canônicos por workflow em [`CONTEXT_TUNING.md`](./CONTEXT_TUNING.md) §13. Override per playbook conforme acima. Goal stack lifecycle em [`STATE_MACHINE.md`](./STATE_MACHINE.md) §2.3 — playbooks com `phases` declaradas auto-empilham objetivos; sem `phases`, push/pop é manual.
 
+### 1.1.1 Spawn semantics: `task` (sync) vs `task_async`
+
+Um playbook que precisa orquestrar múltiplos subagents tem duas superfícies (`ORCHESTRATION.md §3`):
+
+- **`task` / `task_sync`** — spawn bloqueante. Modelo aguarda o filho terminar antes de continuar. Use para coordenação simples ("primeiro analise; depois decida").
+- **`task_async`** — retorna handle imediato; modelo coleta depois com `task_await`. Use para paralelizar exploração ("encontre auth, queue, migrations" em paralelo).
+
+Pattern paralelo canônico:
+
+```markdown
+## Faça
+- Para problemas com 2+ áreas independentes, emita N `task_async` num único turno e colete com `task_await` no turno seguinte.
+- Cap default `max_concurrent_subagents = 3` (cap 8). Excedeu: spawn aguarda slot livre — não rejeita.
+- Budget compartilhado entre pai + filhos via `RunBudget.maxCostUsd`. `task_async` recusa com `subagent.budget_exhausted` quando o cap projetado seria cruzado (`CONTRACTS.md §2.6.4.2`).
+- Cancele com `task_cancel(handle_id)` se um filho for desnecessário; libera reserva imediato.
+- Handles **não** sobrevivem entre runs distintas além do envelope cacheado: rehidratam como `interrupted/resumed_session` (`CONTRACTS.md §2.6.4.1`).
+```
+
+Anti-padrão: `task_async` sem `task_await` correspondente (handle órfão, reserva perdida até drain).
+
 ### 1.2 Output schema sempre tem
 
 - **`summary`** — 1-3 linhas, executive summary

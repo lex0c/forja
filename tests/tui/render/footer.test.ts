@@ -189,6 +189,49 @@ describe('renderFooter', () => {
     expect(out).toContain('• sonnet-4.6 · plan · 3/50 · $0.0120 · bg 1');
   });
 
+  test('subagents counter > 0 surfaces as `subagents N` after bg', () => {
+    const s = startedSession();
+    s.subagents.set('child-1', {
+      subagentId: 'child-1',
+      name: 'explore',
+      goal: 'find auth',
+      progress: '',
+      startedAt: 0,
+    });
+    s.subagents.set('child-2', {
+      subagentId: 'child-2',
+      name: 'review',
+      goal: 'check diff',
+      progress: '',
+      startedAt: 0,
+    });
+    const out = renderFooter(s, caps) ?? '';
+    expect(out).toContain('subagents 2');
+  });
+
+  test('subagents counter === 0 drops the token', () => {
+    const s = startedSession();
+    expect(s.subagents.size).toBe(0);
+    const out = renderFooter(s, caps) ?? '';
+    expect(out).not.toContain('subagents ');
+  });
+
+  test('bg + subagents coexist with bg before subagents', () => {
+    const s = startedSession();
+    s.bgProcesses.set('p1', { processId: 'p1', command: 'pytest' });
+    s.subagents.set('child-1', {
+      subagentId: 'child-1',
+      name: 'explore',
+      goal: 'g',
+      progress: '',
+      startedAt: 0,
+    });
+    const out = renderFooter(s, caps) ?? '';
+    expect(out).toContain('bg 1');
+    expect(out).toContain('subagents 1');
+    expect(out.indexOf('bg 1')).toBeLessThan(out.indexOf('subagents 1'));
+  });
+
   test('null when modal is up', () => {
     const s = startedSession();
     s.modal = {

@@ -1,9 +1,11 @@
 // /budget — read or set run budget caps.
 //
-// Read-only form (`/budget`) shows all four caps. Mutation forms:
-//   /budget steps <N>      — set maxSteps (positive integer)
-//   /budget cost <USD>     — set maxCostUsd (positive number, or
-//                            `none`/`off` to clear the cap)
+// Read-only form (`/budget`) shows every cap. Mutation forms:
+//   /budget steps <N>           — set maxSteps (positive integer)
+//   /budget cost <USD>          — set maxCostUsd (positive number,
+//                                  or `none`/`off` to clear the cap)
+//   /budget parallel-tools <N>  — set maxConcurrentToolCalls (1..16)
+//   /budget subagents <N>       — set maxConcurrentSubagents (1..8)
 //
 // Other caps (maxWallClockMs, maxToolErrors) aren't user-tunable
 // from the slash surface today — they're tied to the harness's
@@ -14,11 +16,16 @@
 // turn (current turn already snapshot its budget at startTurn).
 // Note in the confirmation makes timing explicit, matching /plan.
 
-import { DEFAULT_BUDGET, type RunBudget } from '../../../harness/types.ts';
+import {
+  DEFAULT_BUDGET,
+  MAX_CONCURRENT_SUBAGENTS_CAP,
+  MAX_CONCURRENT_TOOL_CALLS_CAP,
+  type RunBudget,
+} from '../../../harness/types.ts';
 import { formatCost, formatMs } from '../format.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
-const usage = '/budget [steps <N> | cost <USD|none>]';
+const usage = '/budget [steps <N> | cost <USD|none> | parallel-tools <N> | subagents <N>]';
 
 const showAll = (ctx: SlashContext): SlashResult => {
   const b = ctx.baseConfig.budget ?? {};
@@ -29,8 +36,20 @@ const showAll = (ctx: SlashContext): SlashResult => {
       `max wall-clock: ${formatMs(b.maxWallClockMs ?? DEFAULT_BUDGET.maxWallClockMs)}`,
       `max tool errors: ${b.maxToolErrors ?? DEFAULT_BUDGET.maxToolErrors}`,
       `max cost: ${b.maxCostUsd !== undefined ? formatCost(b.maxCostUsd) : 'no cap'}`,
+      `max parallel tools: ${b.maxConcurrentToolCalls ?? DEFAULT_BUDGET.maxConcurrentToolCalls} (cap ${MAX_CONCURRENT_TOOL_CALLS_CAP})`,
+      `max concurrent subagents: ${b.maxConcurrentSubagents ?? DEFAULT_BUDGET.maxConcurrentSubagents} (cap ${MAX_CONCURRENT_SUBAGENTS_CAP})`,
     ],
   };
+};
+
+// Parse positive integer with an inclusive upper bound. Used by the
+// concurrency caps where the harness clamps anything above the
+// hard cap anyway — surfacing the rejection here lets the operator
+// understand WHY their value didn't take effect.
+const parseBoundedPositiveInt = (raw: string, max: number): number | null => {
+  if (!/^\d+$/.test(raw)) return null;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 1 && n <= max ? n : null;
 };
 
 // Parse a positive integer for `steps`. Rejects negatives, zero,
@@ -150,6 +169,62 @@ export const budgetCommand: SlashCommand = {
         kind: 'ok',
         notes: withRunningCue(ctx, [
           `max cost: ${formatCost(usd)} — takes effect on the next turn`,
+        ]),
+      };
+    }
+
+    if (sub === 'parallel-tools') {
+      if (args.length !== 2) {
+        return {
+          kind: 'error',
+          message: `/budget parallel-tools: expected one value. usage: ${usage}`,
+        };
+      }
+      const raw = args[1] ?? '';
+      const n = parseBoundedPositiveInt(raw, MAX_CONCURRENT_TOOL_CALLS_CAP);
+      if (n === null) {
+        return {
+          kind: 'error',
+          message: `/budget parallel-tools: '${raw}' is not an integer in [1, ${MAX_CONCURRENT_TOOL_CALLS_CAP}]`,
+        };
+      }
+      const current =
+        ctx.baseConfig.budget?.maxConcurrentToolCalls ?? DEFAULT_BUDGET.maxConcurrentToolCalls;
+      if (current === n) {
+        return { kind: 'ok', notes: [`max parallel tools already ${n} (no change)`] };
+      }
+      writeBudget(ctx, { maxConcurrentToolCalls: n });
+      return {
+        kind: 'ok',
+        notes: withRunningCue(ctx, [`max parallel tools: ${n} — takes effect on the next turn`]),
+      };
+    }
+
+    if (sub === 'subagents') {
+      if (args.length !== 2) {
+        return {
+          kind: 'error',
+          message: `/budget subagents: expected one value. usage: ${usage}`,
+        };
+      }
+      const raw = args[1] ?? '';
+      const n = parseBoundedPositiveInt(raw, MAX_CONCURRENT_SUBAGENTS_CAP);
+      if (n === null) {
+        return {
+          kind: 'error',
+          message: `/budget subagents: '${raw}' is not an integer in [1, ${MAX_CONCURRENT_SUBAGENTS_CAP}]`,
+        };
+      }
+      const current =
+        ctx.baseConfig.budget?.maxConcurrentSubagents ?? DEFAULT_BUDGET.maxConcurrentSubagents;
+      if (current === n) {
+        return { kind: 'ok', notes: [`max concurrent subagents already ${n} (no change)`] };
+      }
+      writeBudget(ctx, { maxConcurrentSubagents: n });
+      return {
+        kind: 'ok',
+        notes: withRunningCue(ctx, [
+          `max concurrent subagents: ${n} — takes effect on the next turn`,
         ]),
       };
     }
