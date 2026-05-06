@@ -33,6 +33,21 @@ export interface ConfirmPermissionRequest {
   // ("matches deny rule bash.rm.rf", "tool runs outside workspace",
   // etc.). Renderer surfaces it as the modal's `reason`/`rule`.
   prompt: string;
+  // Subagent attribution. Set when the request originates from a
+  // child run (parent's IPC observer routes the child's
+  // `permission:ask` through `confirmPermission` with this filled).
+  // The TUI renderer prefixes the modal so the operator can tell
+  // a parent confirm from a child confirm. Undefined for the
+  // parent's own confirms.
+  subagent?: { sessionId: string; name: string };
+  // Producer-driven cancellation. Subagent proxy fills this with
+  // a per-session AbortController; abort fires when the child
+  // dies/closes its IPC channel so the operator's modal closes
+  // instead of staying open on a stale prompt whose answer would
+  // go into a closed pipe. invoke-tool (parent's own confirm
+  // path) leaves it unset — it already races against `deps.signal`
+  // via raceAgainstAbort at the await site.
+  signal?: AbortSignal;
 }
 
 export interface InvokeToolDeps {

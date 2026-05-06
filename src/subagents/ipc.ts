@@ -40,17 +40,44 @@ interface CommonFields {
   ts: number;
 }
 
+// Verdict the operator's modal returns for a `permission:ask`.
+// Wire-friendly subset of the engine's full `Decision` type — the
+// modal only produces yes/no, so the answer is a binary verdict
+// instead of round-tripping the engine's richer shape. The bridge
+// at the child side maps `'allow' | 'deny'` back to the boolean
+// `confirmPermission` callback contract; future scope (`'session'`)
+// would extend this union, not break it.
+export type PermissionDecision = 'allow' | 'deny';
+
 // Pai → filho. Idempotent within a session: a second
 // `interrupt:soft` after the first is a no-op (spec §3.1).
+// `permission:answer` carries the operator's verdict for an
+// outstanding `permission:ask`; correlation is by `promptId`,
+// NOT the IPC envelope `id` (which the emitter stamps fresh
+// per message).
 export type IpcCommand =
   | (CommonFields & { type: 'interrupt:soft' })
   | (CommonFields & { type: 'interrupt:hard' })
-  | (CommonFields & { type: 'shutdown' });
+  | (CommonFields & { type: 'shutdown' })
+  | (CommonFields & {
+      type: 'permission:answer';
+      promptId: string;
+      decision: PermissionDecision;
+    });
 
 // Filho → pai. `event` carries an arbitrary HarnessEvent payload
 // (the consumer layer narrows it to the HarnessEvent union).
 // `session_start` and `session_finished` bracket every run; the
-// in-between events flow through `event`.
+// in-between events flow through `event`. `permission:ask` is the
+// only request/response variant on the wire — child blocks until
+// the matching `permission:answer` returns. The deviation from
+// IPC.md §3.2's illustrative `{ promptId, toolName, command, cwd }`
+// is intentional: the engine's confirm flow already passes
+// `{ toolName, args, cwd, prompt }` through `confirmPermission`,
+// and forcing a bash-shaped `command` field would require lossy
+// translation for non-bash tools (write_file, web_fetch, …).
+// `args` is opaque at the wire layer; the parent's modal renderer
+// is responsible for safe display.
 export type IpcEvent =
   | (CommonFields & {
       type: 'session_start';
@@ -58,7 +85,15 @@ export type IpcEvent =
       protocolVersion: number;
     })
   | (CommonFields & { type: 'session_finished' })
-  | (CommonFields & { type: 'event'; event: unknown });
+  | (CommonFields & { type: 'event'; event: unknown })
+  | (CommonFields & {
+      type: 'permission:ask';
+      promptId: string;
+      toolName: string;
+      args: unknown;
+      cwd: string;
+      prompt: string;
+    });
 
 export type IpcMessage = IpcCommand | IpcEvent;
 
@@ -73,7 +108,11 @@ const KNOWN_TYPES: ReadonlySet<IpcMessage['type']> = new Set([
   'session_start',
   'session_finished',
   'event',
+  'permission:ask',
+  'permission:answer',
 ]);
+
+const PERMISSION_DECISIONS: ReadonlySet<PermissionDecision> = new Set(['allow', 'deny']);
 
 // Encode a typed message into a single NDJSON line (terminated
 // LF). JSON.stringify escapes embedded LF inside string values
@@ -141,6 +180,46 @@ export const parseLine = (line: string): ParseResult => {
       }
       break;
     }
+    case 'permission:ask': {
+      if (typeof obj.promptId !== 'string' || obj.promptId.length === 0) {
+        return { ok: false, reason: 'permission_ask.missing_promptId' };
+      }
+      if (typeof obj.toolName !== 'string' || obj.toolName.length === 0) {
+        return { ok: false, reason: 'permission_ask.missing_toolName' };
+      }
+      // `args` is opaque (Record / array / scalar) — only verify
+      // the key is present so the parent's modal doesn't have to
+      // reach into an undefined slot. A sender bug ("forgot to
+      // include args") surfaces here, not as a render crash later.
+      if (!('args' in obj)) {
+        return { ok: false, reason: 'permission_ask.missing_args' };
+      }
+      if (typeof obj.cwd !== 'string' || obj.cwd.length === 0) {
+        return { ok: false, reason: 'permission_ask.missing_cwd' };
+      }
+      if (typeof obj.prompt !== 'string' || obj.prompt.length === 0) {
+        return { ok: false, reason: 'permission_ask.missing_prompt' };
+      }
+      break;
+    }
+    case 'permission:answer': {
+      if (typeof obj.promptId !== 'string' || obj.promptId.length === 0) {
+        return { ok: false, reason: 'permission_answer.missing_promptId' };
+      }
+      // Wire decision is a closed enum. Anything outside the set
+      // is a protocol violation (parent crafted a value the child
+      // doesn't know how to honor). Refuse here so the child
+      // bridge never has to pick a default for an unknown verdict
+      // — picking `deny` would silently change the operator's
+      // meaning, picking `allow` would defeat the entire proxy.
+      if (typeof obj.decision !== 'string') {
+        return { ok: false, reason: 'permission_answer.missing_decision' };
+      }
+      if (!PERMISSION_DECISIONS.has(obj.decision as PermissionDecision)) {
+        return { ok: false, reason: `permission_answer.unknown_decision:${obj.decision}` };
+      }
+      break;
+    }
     default:
       break;
   }
@@ -186,6 +265,41 @@ export const makeInterruptHard = (): IpcCommand => ({
 
 export const makeShutdown = (): IpcCommand => ({
   type: 'shutdown',
+  ...stamp(),
+});
+
+// Child → parent. Caller (the child permission bridge) supplies a
+// `promptId` so the matching answer can be correlated; we do NOT
+// reuse the IPC envelope `id` for correlation because that field
+// is stamped per message and would collide if the child ever
+// re-emitted a retry. `args` opaque on the wire — see
+// `permission:ask` type comment for the rationale.
+export const makePermissionAsk = (input: {
+  promptId: string;
+  toolName: string;
+  args: unknown;
+  cwd: string;
+  prompt: string;
+}): IpcEvent => ({
+  type: 'permission:ask',
+  promptId: input.promptId,
+  toolName: input.toolName,
+  args: input.args,
+  cwd: input.cwd,
+  prompt: input.prompt,
+  ...stamp(),
+});
+
+// Parent → child. `promptId` MUST match a prior `permission:ask`
+// the child emitted; an unknown promptId is dropped silently by
+// the child bridge (see `permission-bridge.ts`).
+export const makePermissionAnswer = (input: {
+  promptId: string;
+  decision: PermissionDecision;
+}): IpcCommand => ({
+  type: 'permission:answer',
+  promptId: input.promptId,
+  decision: input.decision,
   ...stamp(),
 });
 

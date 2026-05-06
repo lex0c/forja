@@ -427,6 +427,21 @@ export interface HarnessConfig {
     args: Record<string, unknown>;
     cwd: string;
     prompt: string;
+    // Subagent attribution. Set by the parent harness's
+    // spawnSubagent closure when proxying a child's
+    // `permission:ask` (spec docs/spec/IPC.md §7). The TUI
+    // renderer keys on this to prefix the modal so the
+    // operator distinguishes parent vs child requests.
+    subagent?: { sessionId: string; name: string };
+    // Producer-driven cancellation. When set, the implementation
+    // (REPL bridge) forwards to ModalManager so a producer-side
+    // event (typically: subagent died with the modal still open)
+    // closes the modal and resolves to deny without operator
+    // input. Used by the subagent permission proxy; invoke-tool
+    // (the parent's own confirm path) leaves it unset because
+    // it already handles abort via raceAgainstAbort at the
+    // call site.
+    signal?: AbortSignal;
   }) => Promise<boolean>;
   // Trust state of `cwd` (AGENTIC_CLI.md §9.1, MEMORY.md §7.2.1).
   // True when the cwd is in the persisted `trusted_dirs.json` at

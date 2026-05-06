@@ -32,6 +32,7 @@ import {
   createChannel,
   fakeTransportPair,
   makeEvent,
+  makePermissionAsk,
   makeSessionFinished,
   makeSessionStart,
 } from '../../src/subagents/ipc.ts';
@@ -4090,5 +4091,951 @@ describe('runSubagent — review fixes (round 4)', () => {
     });
     expect(result.status).toBe('error');
     expect(result.reason).toBe('subprocess_crashed');
+  });
+});
+
+// Slice 2 of the permission proxy (spec docs/spec/IPC.md §7).
+// Parent runtime listens for `permission:ask` from the child,
+// routes through the caller-supplied `onPermissionAsk` hook with
+// subagent attribution baked in, and ships `permission:answer`
+// back over the IPC channel. These tests use the same
+// fakeTransportPair pattern as the IPC observer tests above.
+describe('runSubagent — permission proxy (parent)', () => {
+  // Helper mirrors fakeSpawnWithIpc but exposes the channel and
+  // exit driver so each test can craft its own ask sequence.
+  const buildPermissionRig = () => {
+    const { a, b } = fakeTransportPair();
+    const parentChannel = createChannel(a);
+    const childChannel = createChannel(b);
+    let resolveExit: ((v: { exitCode: number }) => void) | undefined;
+    const exited = new Promise<{ exitCode: number }>((r) => {
+      resolveExit = r;
+    });
+    const publish = (sessionId: string): void => {
+      insertSubagentOutput(db, { sessionId });
+      setSubagentPayload(db, sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'ok',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      });
+      if (resolveExit !== undefined) {
+        resolveExit({ exitCode: 0 });
+        resolveExit = undefined;
+      }
+    };
+    const spawn: SpawnChildProcess = () => ({
+      exited,
+      kill: () => undefined,
+      ipc: parentChannel,
+    });
+    return { spawn, childChannel, publish };
+  };
+
+  test('permission:ask invokes onPermissionAsk with subagent attribution and ships allow back', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const calls: { req: unknown }[] = [];
+    const answers: IpcMessage[] = [];
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      // Child emits an ask, then publishes its payload so the
+      // wait loop resolves and the parent tears down the channel.
+      // Order: ask first so the observer fires before the
+      // session_finished envelope races the test microtask scheduler.
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-A',
+          toolName: 'bash',
+          args: { command: 'rm -rf /' },
+          cwd: '/p',
+          prompt: 'Run shell command?',
+        }),
+      );
+      // Drive publish on a follow-up microtask so the ask has
+      // time to round-trip through onPermissionAsk before exit
+      // closes the channel.
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    await runSubagent({
+      definition: definition({ name: 'explore' }),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: rig.spawn,
+      onPermissionAsk: async (req) => {
+        calls.push({ req });
+        return 'allow';
+      },
+    });
+
+    expect(calls).toHaveLength(1);
+    const req = calls[0]?.req as {
+      toolName: string;
+      args: Record<string, unknown>;
+      cwd: string;
+      prompt: string;
+      subagent: { sessionId: string; name: string };
+    };
+    expect(req.toolName).toBe('bash');
+    expect(req.args).toEqual({ command: 'rm -rf /' });
+    expect(req.cwd).toBe('/p');
+    expect(req.prompt).toBe('Run shell command?');
+    expect(req.subagent.name).toBe('explore');
+    expect(typeof req.subagent.sessionId).toBe('string');
+    expect(req.subagent.sessionId.length).toBeGreaterThan(0);
+
+    expect(answers).toHaveLength(1);
+    const ans = answers[0];
+    if (ans?.type === 'permission:answer') {
+      expect(ans.promptId).toBe('pid-A');
+      expect(ans.decision).toBe('allow');
+    }
+  });
+
+  test('hook returning deny ships deny back', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-B',
+          toolName: 'bash',
+          args: {},
+          cwd: '/p',
+          prompt: 'why?',
+        }),
+      );
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: rig.spawn,
+      onPermissionAsk: async () => 'deny',
+    });
+
+    expect(answers).toHaveLength(1);
+    if (answers[0]?.type === 'permission:answer') {
+      expect(answers[0].decision).toBe('deny');
+    }
+  });
+
+  test('missing onPermissionAsk auto-denies', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-C',
+          toolName: 'bash',
+          args: {},
+          cwd: '/p',
+          prompt: 'q',
+        }),
+      );
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: rig.spawn,
+      // No onPermissionAsk wired.
+    });
+
+    expect(answers).toHaveLength(1);
+    if (answers[0]?.type === 'permission:answer') {
+      expect(answers[0].promptId).toBe('pid-C');
+      expect(answers[0].decision).toBe('deny');
+    }
+  });
+
+  test('hook that throws auto-denies (child must not hang)', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-D',
+          toolName: 'bash',
+          args: {},
+          cwd: '/p',
+          prompt: 'q',
+        }),
+      );
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: rig.spawn,
+      onPermissionAsk: async () => {
+        throw new Error('hook exploded');
+      },
+    });
+
+    expect(answers).toHaveLength(1);
+    if (answers[0]?.type === 'permission:answer') {
+      expect(answers[0].decision).toBe('deny');
+    }
+  });
+
+  test('hook that throws SYNCHRONOUSLY also auto-denies (no hang)', async () => {
+    // Companion to the async-throw test above. The hook
+    // signature returns Promise<...>, but a JS caller or a
+    // non-async TS function that validates input and throws
+    // before returning a promise can still slip through. The
+    // earlier path (`hook(...).then(...).catch(...)`) caught
+    // ASYNC failures only — a sync throw propagated up to
+    // onMessage where the channel emitter swallowed listener
+    // exceptions silently, leaving the child blocked on an
+    // unresolved permission:ask. The Promise.resolve().then
+    // wrap collapses sync throws into the same .catch path.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-sync-throw',
+          toolName: 'bash',
+          args: {},
+          cwd: '/p',
+          prompt: 'q',
+        }),
+      );
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: rig.spawn,
+      // Cast through unknown so TS lets a non-async throwing
+      // function sit in the typed Promise<...> slot — mimics
+      // the JS-caller path the wrap protects against.
+      onPermissionAsk: ((): Promise<'allow' | 'deny'> => {
+        throw new Error('sync hook exploded');
+      }) as unknown as (req: {
+        subagent: { sessionId: string; name: string };
+      }) => Promise<'allow' | 'deny'>,
+    });
+
+    // Pre-fix: answers.length === 0 (hang path) — child's bridge
+    // never received a verdict, runSubagent hung until publish
+    // forced exit but the ask was already lost.
+    // Post-fix: answers === [{ decision: 'deny' }] (uniform
+    // failure path).
+    expect(answers).toHaveLength(1);
+    if (answers[0]?.type === 'permission:answer') {
+      expect(answers[0].promptId).toBe('pid-sync-throw');
+      expect(answers[0].decision).toBe('deny');
+    }
+  });
+
+  test('parallel asks each get their matching promptId answered', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-1',
+          toolName: 'bash',
+          args: { command: 'one' },
+          cwd: '/p',
+          prompt: 'q1',
+        }),
+      );
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-2',
+          toolName: 'write_file',
+          args: { path: 'a.txt' },
+          cwd: '/p',
+          prompt: 'q2',
+        }),
+      );
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: rig.spawn,
+      // Per-tool decision: bash deny, write_file allow. Verifies
+      // promptId correlation rather than positional ordering.
+      onPermissionAsk: async (req) => (req.toolName === 'write_file' ? 'allow' : 'deny'),
+    });
+
+    expect(answers).toHaveLength(2);
+    const byPid = new Map<string, string>();
+    for (const a of answers) {
+      if (a.type === 'permission:answer') byPid.set(a.promptId, a.decision);
+    }
+    expect(byPid.get('pid-1')).toBe('deny');
+    expect(byPid.get('pid-2')).toBe('allow');
+  });
+
+  test('malformed args (non-object) auto-denies', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    const calls: number[] = [];
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      // Hand-craft an ask whose `args` field is an array — the
+      // parser accepts (it only verifies the field is present)
+      // but the runtime's hook contract requires an object.
+      // Runtime must auto-deny, not crash, not invoke the hook.
+      rig.childChannel.send({
+        type: 'permission:ask',
+        id: 'env-1',
+        ts: Date.now(),
+        promptId: 'pid-bad',
+        toolName: 'bash',
+        args: [1, 2, 3],
+        cwd: '/p',
+        prompt: 'q',
+      });
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: rig.spawn,
+      onPermissionAsk: async () => {
+        calls.push(1);
+        return 'allow';
+      },
+    });
+
+    expect(calls).toEqual([]);
+    expect(answers).toHaveLength(1);
+    if (answers[0]?.type === 'permission:answer') {
+      expect(answers[0].promptId).toBe('pid-bad');
+      expect(answers[0].decision).toBe('deny');
+    }
+  });
+
+  test('hook receives a per-session AbortSignal that fires when channel closes', async () => {
+    // Regression guard: a child dying while its modal is open
+    // would otherwise leave the operator staring at a stale
+    // prompt whose answer has nowhere to go (channel closed,
+    // child gone). The runtime now hands the hook a per-session
+    // AbortSignal that fires on channel.onClose; the hook
+    // (REPL bridge) wires it into the modal manager so the modal
+    // closes promptly. Verify the signal is provided AND that
+    // it fires when the channel tears down.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    let observedSignal: AbortSignal | null = null;
+    let signalAbortedAtHookExit = false;
+
+    queueMicrotask(() => {
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-abort',
+          toolName: 'bash',
+          args: {},
+          cwd: '/p',
+          prompt: 'q',
+        }),
+      );
+      // Drive publish on next microtask so the hook is in flight
+      // when the runtime tears the channel down.
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: rig.spawn,
+      // Hook holds the promise unresolved until aborted. The
+      // runtime tears the channel down after publish + waitForChild
+      // resolves; channel.onClose then fires the per-session
+      // signal, which we observe via this `await new Promise`
+      // race that resolves when the signal aborts.
+      onPermissionAsk: async (req) => {
+        observedSignal = req.signal;
+        await new Promise<void>((resolve) => {
+          if (req.signal.aborted) {
+            resolve();
+            return;
+          }
+          req.signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+        signalAbortedAtHookExit = req.signal.aborted;
+        return 'deny';
+      },
+    });
+
+    expect(observedSignal).not.toBeNull();
+    expect(signalAbortedAtHookExit).toBe(true);
+  });
+
+  test('parent signal listener is removed after the subagent run ends (no per-run leak)', async () => {
+    // Memory hygiene for long REPL sessions. The runtime forwards
+    // input.signal aborts into its per-session askAbort as
+    // belt-and-suspenders, but if every runSubagent call left a
+    // listener attached to input.signal until the parent itself
+    // aborts (which doesn't happen in a healthy REPL), 1000s of
+    // subagent runs would accumulate 1000s of closure references.
+    // The fix pairs add/remove off askAbort.signal so cleanup
+    // runs exactly once at end-of-session.
+    //
+    // AbortSignal doesn't expose a public listener count; we
+    // instrument by wrapping a real AbortSignal in a Proxy-like
+    // object that tracks add/remove calls. The runtime treats
+    // the wrapper as a normal AbortSignal (it never type-narrows
+    // beyond the AbortSignal interface).
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const parentAc = new AbortController();
+    let addCount = 0;
+    let removeCount = 0;
+    const trackedSignal = new Proxy(parentAc.signal, {
+      get(target, prop) {
+        if (prop === 'addEventListener') {
+          return (
+            type: string,
+            listener: EventListener,
+            options?: AddEventListenerOptions | boolean,
+          ): void => {
+            if (type === 'abort') addCount += 1;
+            target.addEventListener(type, listener, options);
+          };
+        }
+        if (prop === 'removeEventListener') {
+          return (
+            type: string,
+            listener: EventListener,
+            options?: EventListenerOptions | boolean,
+          ): void => {
+            if (type === 'abort') removeCount += 1;
+            target.removeEventListener(type, listener, options);
+          };
+        }
+        // Forward every other access to the real signal with
+        // `this` bound to the underlying AbortSignal — native
+        // getters like `aborted` and `reason` refuse to run on
+        // anything but a real AbortSignal instance, so passing
+        // the proxy as `this` (the default Reflect.get receiver)
+        // throws "AbortSignal.aborted getter can only be used
+        // on instances of AbortSignal".
+        const v = Reflect.get(target, prop, target);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    });
+
+    const rig = buildPermissionRig();
+    queueMicrotask(() => {
+      const children = listChildSessions(db, parent.id);
+      const last = children[children.length - 1];
+      if (last !== undefined) rig.publish(last.id);
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      signal: trackedSignal,
+      spawnChildProcess: rig.spawn,
+      onPermissionAsk: async () => 'allow',
+    });
+
+    // Runtime added exactly one listener (the parent-abort
+    // forward) and removed exactly one (the cleanup off
+    // askAbort.signal abort). Pre-fix: addCount=1, removeCount=0
+    // → leak.
+    expect(addCount).toBe(1);
+    expect(removeCount).toBe(1);
+  });
+
+  test('rate limit: cap exceeded auto-denies without invoking the hook', async () => {
+    // Bound on concurrent permission asks per child session.
+    // Defends the operator's modal queue when a child is in a
+    // confirm-loop. With cap=2 and three asks emitted rapidly,
+    // the first two flow to the hook; the third is auto-denied
+    // and never reaches the hook.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    let hookCallCount = 0;
+    let releaseHookA: (() => void) | undefined;
+    let releaseHookB: (() => void) | undefined;
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      // Three asks in rapid succession.
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-A',
+          toolName: 'bash',
+          args: { command: '1' },
+          cwd: '/p',
+          prompt: 'q1',
+        }),
+      );
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-B',
+          toolName: 'bash',
+          args: { command: '2' },
+          cwd: '/p',
+          prompt: 'q2',
+        }),
+      );
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-C',
+          toolName: 'bash',
+          args: { command: '3' },
+          cwd: '/p',
+          prompt: 'q3',
+        }),
+      );
+      // Wait briefly for the runtime to observe all three, then
+      // release the held hooks so they resolve and the run can end.
+      queueMicrotask(() => {
+        queueMicrotask(() => {
+          if (releaseHookA !== undefined) releaseHookA();
+          if (releaseHookB !== undefined) releaseHookB();
+          const children = listChildSessions(db, parent.id);
+          const last = children[children.length - 1];
+          if (last !== undefined) rig.publish(last.id);
+        });
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      maxPendingPermissionAsks: 2,
+      spawnChildProcess: rig.spawn,
+      onPermissionAsk: async () => {
+        hookCallCount += 1;
+        // Hold the hook until released so the cap fills up.
+        await new Promise<void>((resolve) => {
+          if (hookCallCount === 1) releaseHookA = resolve;
+          else if (hookCallCount === 2) releaseHookB = resolve;
+          else resolve();
+        });
+        return 'allow';
+      },
+    });
+
+    // Only the first two asks reached the hook; the third was
+    // auto-denied at the rate-limit gate.
+    expect(hookCallCount).toBe(2);
+    // Three answers total (two from hook + one synthetic deny).
+    expect(answers).toHaveLength(3);
+    const byPid = new Map<string, string>();
+    for (const a of answers) {
+      if (a.type === 'permission:answer') byPid.set(a.promptId, a.decision);
+    }
+    expect(byPid.get('pid-A')).toBe('allow');
+    expect(byPid.get('pid-B')).toBe('allow');
+    expect(byPid.get('pid-C')).toBe('deny'); // rate-limited
+  });
+
+  test('rate limit: slot frees up after a hook resolves', async () => {
+    // After the first ask resolves, the cap drops back below
+    // the threshold and the next ask flows through normally.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    let hookCallCount = 0;
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      // First ask. Hook resolves immediately (allow). Slot frees.
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-1',
+          toolName: 'bash',
+          args: {},
+          cwd: '/p',
+          prompt: 'q1',
+        }),
+      );
+      // Send pid-2 only AFTER pid-1's answer lands — polling
+      // is more robust than counting microtasks since the
+      // runtime's hook invocation went through a
+      // Promise.resolve().then(...) wrap (added as sync-throw
+      // safety) and any future change in the resolution chain
+      // would shift counts again. Polling the visible side
+      // effect (answer arrived) ties the test to the contract
+      // we actually care about: "slot frees AFTER first resolves".
+      const sendSecondAfterFirstAnswered = (): void => {
+        if (answers.length >= 1) {
+          rig.childChannel.send(
+            makePermissionAsk({
+              promptId: 'pid-2',
+              toolName: 'bash',
+              args: {},
+              cwd: '/p',
+              prompt: 'q2',
+            }),
+          );
+          queueMicrotask(() => {
+            const children = listChildSessions(db, parent.id);
+            const last = children[children.length - 1];
+            if (last !== undefined) rig.publish(last.id);
+          });
+        } else {
+          queueMicrotask(sendSecondAfterFirstAnswered);
+        }
+      };
+      queueMicrotask(sendSecondAfterFirstAnswered);
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      maxPendingPermissionAsks: 1,
+      spawnChildProcess: rig.spawn,
+      onPermissionAsk: async () => {
+        hookCallCount += 1;
+        return 'allow';
+      },
+    });
+
+    expect(hookCallCount).toBe(2);
+    expect(answers).toHaveLength(2);
+    const byPid = new Map<string, string>();
+    for (const a of answers) {
+      if (a.type === 'permission:answer') byPid.set(a.promptId, a.decision);
+    }
+    expect(byPid.get('pid-1')).toBe('allow');
+    expect(byPid.get('pid-2')).toBe('allow');
+  });
+
+  test('rate limit: cap=0 disables the gate (stress-testing surface)', async () => {
+    // Opt-out path: setting cap to 0 should let unlimited asks
+    // through. Verifies the `askCap > 0` check ordering — with
+    // an integer-zero cap we never even read the in-flight set.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    let hookCallCount = 0;
+    const releases: Array<() => void> = [];
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      // 10 asks in rapid succession — would saturate the
+      // default cap (5) but cap=0 lets them all through.
+      for (let i = 0; i < 10; i++) {
+        rig.childChannel.send(
+          makePermissionAsk({
+            promptId: `pid-${i}`,
+            toolName: 'bash',
+            args: {},
+            cwd: '/p',
+            prompt: `q${i}`,
+          }),
+        );
+      }
+      queueMicrotask(() => {
+        queueMicrotask(() => {
+          for (const r of releases) r();
+          const children = listChildSessions(db, parent.id);
+          const last = children[children.length - 1];
+          if (last !== undefined) rig.publish(last.id);
+        });
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      maxPendingPermissionAsks: 0,
+      spawnChildProcess: rig.spawn,
+      onPermissionAsk: async () => {
+        hookCallCount += 1;
+        await new Promise<void>((resolve) => {
+          releases.push(resolve);
+        });
+        return 'allow';
+      },
+    });
+
+    // All 10 reached the hook (none rate-limited).
+    expect(hookCallCount).toBe(10);
+    expect(answers).toHaveLength(10);
+    for (const a of answers) {
+      if (a.type === 'permission:answer') {
+        expect(a.decision).toBe('allow');
+      }
+    }
+  });
+
+  test('hook returning invalid decision coerces to deny (defensive)', async () => {
+    // The hook signature types `decision` as PermissionDecision
+    // ('allow' | 'deny'), but JS callers and TS callers using
+    // `any` can return arbitrary strings. The IPC parser would
+    // reject the malformed answer and the child would block on
+    // its prompt until channel close. Verify the runtime
+    // coerces to 'deny' so the child always gets a usable
+    // answer + the diagnostic surfaces on stderr.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    const stderrLines: string[] = [];
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    // biome-ignore lint/suspicious/noExplicitAny: stderr.write overload signature isn't worth typing in a test
+    (process.stderr as any).write = (chunk: unknown): boolean => {
+      stderrLines.push(String(chunk));
+      return true;
+    };
+
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-bad-verdict',
+          toolName: 'bash',
+          args: {},
+          cwd: '/p',
+          prompt: 'q',
+        }),
+      );
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    try {
+      await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: '/p',
+        ipc: true,
+        spawnChildProcess: rig.spawn,
+        // Cast through unknown so TS lets a bogus value reach
+        // the runtime — mimics the JS-caller / TS-any path the
+        // defensive coercion targets.
+        onPermissionAsk: (async () => 'session-allow') as unknown as (req: {
+          subagent: { sessionId: string; name: string };
+        }) => Promise<'allow' | 'deny'>,
+      });
+    } finally {
+      // biome-ignore lint/suspicious/noExplicitAny: restore the patched method
+      (process.stderr as any).write = originalWrite;
+    }
+
+    expect(answers).toHaveLength(1);
+    if (answers[0]?.type === 'permission:answer') {
+      // Coerced to 'deny' (NOT shipped as the bogus
+      // 'session-allow' which would have been parser-refused).
+      expect(answers[0].decision).toBe('deny');
+    }
+    // Diagnostic surfaced.
+    const coercionLine = stderrLines.find((l) => l.includes('invalid decision'));
+    expect(coercionLine).toBeDefined();
+    expect(coercionLine).toContain('session-allow');
   });
 });

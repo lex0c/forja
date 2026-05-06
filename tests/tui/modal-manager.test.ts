@@ -232,6 +232,49 @@ describe('askPermission (3-option modal per UI.md §4.10.13)', () => {
     return promise;
   });
 
+  test('subagent attribution is forwarded to permission:ask event', () => {
+    // Spec docs/spec/IPC.md §7: when the parent proxies a child's
+    // permission:ask, the modal must show which subagent is
+    // requesting. The manager threads the optional `subagent`
+    // field straight onto the emitted event; the reducer renders.
+    const s = make();
+    const promise = s.manager.askPermission({
+      toolName: 'bash',
+      command: 'rm',
+      cwd: '/p',
+      subagent: { sessionId: 'sess-12345678', name: 'explore' },
+    });
+    const askEvent = s.events.find((e) => e.type === 'permission:ask');
+    expect(askEvent).toBeDefined();
+    if (askEvent !== undefined && askEvent.type === 'permission:ask') {
+      expect(askEvent.subagent).toEqual({
+        sessionId: 'sess-12345678',
+        name: 'explore',
+      });
+    }
+    s.fs.dispatch(key('escape'));
+    return promise;
+  });
+
+  test('omitting subagent leaves the event field absent', () => {
+    // Defensive — the manager spreads conditionally so consumers
+    // that branch on `subagent !== undefined` (the reducer does)
+    // never see a truthy field for a parent's own confirm.
+    const s = make();
+    const promise = s.manager.askPermission({
+      toolName: 'bash',
+      command: 'rm',
+      cwd: '/p',
+    });
+    const askEvent = s.events.find((e) => e.type === 'permission:ask');
+    expect(askEvent).toBeDefined();
+    if (askEvent !== undefined && askEvent.type === 'permission:ask') {
+      expect(askEvent.subagent).toBeUndefined();
+    }
+    s.fs.dispatch(key('escape'));
+    return promise;
+  });
+
   test('Multiple navigations emit a modal:select per move with the right index', async () => {
     const s = make();
     const promise = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
@@ -322,6 +365,84 @@ describe('queue', () => {
     await expect(p2).resolves.toBe('yes');
     expect(s.manager.pendingCount()).toBe(0);
   });
+
+  test('queue depth events: live updates as asks enqueue + resolve', async () => {
+    // Three asks pile up: first opens active, second + third queue.
+    // The contract:
+    //   - First ask opens → no `modal:queue-depth` (queue empty
+    //     behind it, no suffix needed). We skip emitting depth=0
+    //     to keep the event stream quieter.
+    //   - Second ask enqueues while active → emit depth=1 keyed to
+    //     active.promptId so the suffix becomes `(+1 waiting)`.
+    //   - Third ask enqueues → emit depth=2.
+    //   - Operator answers active → resolveActive → drain pops
+    //     second (now active). drain emits depth=1 keyed to the
+    //     newly-active modal (one still queued behind).
+    //   - Answer that → drain pops third. queue.length === 0 →
+    //     no depth event (the modal renders bare).
+    const s = make();
+    const p1 = s.manager.askPermission({ toolName: 'b', command: 'c1', cwd: '/' });
+    expect(s.events.filter((e) => e.type === 'modal:queue-depth')).toHaveLength(0);
+
+    const p2 = s.manager.askPermission({ toolName: 'b', command: 'c2', cwd: '/' });
+    let depthEvents = s.events.filter((e) => e.type === 'modal:queue-depth');
+    expect(depthEvents).toHaveLength(1);
+    if (depthEvents[0]?.type === 'modal:queue-depth') {
+      expect(depthEvents[0].depth).toBe(1);
+    }
+
+    const p3 = s.manager.askPermission({ toolName: 'b', command: 'c3', cwd: '/' });
+    depthEvents = s.events.filter((e) => e.type === 'modal:queue-depth');
+    expect(depthEvents).toHaveLength(2);
+    if (depthEvents[1]?.type === 'modal:queue-depth') {
+      expect(depthEvents[1].depth).toBe(2);
+    }
+
+    // Resolve the active. drain pops next; emits depth=1 for it.
+    s.fs.dispatch(key('enter')); // p1 → 'no'
+    await p1;
+    depthEvents = s.events.filter((e) => e.type === 'modal:queue-depth');
+    expect(depthEvents).toHaveLength(3);
+    if (depthEvents[2]?.type === 'modal:queue-depth') {
+      expect(depthEvents[2].depth).toBe(1);
+    }
+
+    // Resolve the next active. drain pops third — empty queue
+    // behind it, no event.
+    s.fs.dispatch(key('enter')); // p2 → 'no'
+    await p2;
+    depthEvents = s.events.filter((e) => e.type === 'modal:queue-depth');
+    expect(depthEvents).toHaveLength(3);
+
+    // Wrap up.
+    s.fs.dispatch(key('enter'));
+    await p3;
+  });
+
+  test('queue depth events key on the ACTIVE modal promptId, not the enqueued one', async () => {
+    // Regression guard: a buggy emit could key the depth event to
+    // the just-enqueued ask's promptId instead of the active one.
+    // The reducer would then drop it (mismatched promptId), the
+    // suffix would never appear. Verify the active's promptId is
+    // what gets emitted.
+    const s = make();
+    s.manager.askPermission({ toolName: 'b', command: 'c1', cwd: '/' });
+    const firstAsk = s.events.find((e) => e.type === 'permission:ask');
+    expect(firstAsk).toBeDefined();
+    const activeId = firstAsk?.type === 'permission:ask' ? firstAsk.promptId : '';
+    expect(activeId).not.toBe('');
+
+    s.manager.askPermission({ toolName: 'b', command: 'c2', cwd: '/' });
+    const depthEvent = s.events.find((e) => e.type === 'modal:queue-depth');
+    expect(depthEvent).toBeDefined();
+    if (depthEvent?.type === 'modal:queue-depth') {
+      expect(depthEvent.promptId).toBe(activeId);
+      expect(depthEvent.depth).toBe(1);
+    }
+
+    // Tear down so the test process doesn't leak handles.
+    s.fs.dispatch(key('escape'));
+  });
 });
 
 describe('timeout', () => {
@@ -365,6 +486,285 @@ describe('timeout', () => {
     s.fs.dispatch(key('enter'));
     await p1;
   });
+
+  test('producer signal aborts the active modal: resolves cancel + drains next', async () => {
+    const s = make();
+    const ac = new AbortController();
+    const p1 = s.manager.askPermission(
+      { toolName: 'b', command: 'a', cwd: '/' },
+      { signal: ac.signal },
+    );
+    const p2 = s.manager.askPermission({ toolName: 'b', command: 'b', cwd: '/' });
+
+    // p1 active, p2 queued. Aborting p1's signal must close it
+    // and drain p2.
+    ac.abort();
+    await expect(p1).resolves.toBe('cancel');
+
+    // p2 is now active. Resolve to drain.
+    s.fs.dispatch(charKey('1'));
+    await expect(p2).resolves.toBe('yes');
+  });
+
+  test('producer signal aborts a queued modal: emits queue-depth correction', async () => {
+    // Same shape as the queued-timeout regression guard above —
+    // verifies the abort path goes through the same
+    // cancelPending helper. Active stays untouched; the queued
+    // entry vanishes; the active modal's `(+N waiting)` suffix
+    // drops by one.
+    const s = make();
+    const p1 = s.manager.askPermission({ toolName: 'b', command: 'a', cwd: '/' });
+    const firstAsk = s.events.find((e) => e.type === 'permission:ask');
+    const activeId = firstAsk?.type === 'permission:ask' ? firstAsk.promptId : '';
+
+    const ac = new AbortController();
+    const p2 = s.manager.askPermission(
+      { toolName: 'b', command: 'b', cwd: '/' },
+      { signal: ac.signal },
+    );
+    const p3 = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
+
+    let depthEvents = s.events.filter((e) => e.type === 'modal:queue-depth');
+    expect(depthEvents).toHaveLength(2);
+    if (depthEvents[1]?.type === 'modal:queue-depth') {
+      expect(depthEvents[1].depth).toBe(2);
+    }
+
+    // Abort p2 (queued). Active (p1) must stay; queue depth corrects to 1.
+    ac.abort();
+    await expect(p2).resolves.toBe('cancel');
+
+    depthEvents = s.events.filter((e) => e.type === 'modal:queue-depth');
+    expect(depthEvents).toHaveLength(3);
+    if (depthEvents[2]?.type === 'modal:queue-depth') {
+      expect(depthEvents[2].depth).toBe(1);
+      expect(depthEvents[2].promptId).toBe(activeId);
+    }
+
+    // Tear down.
+    s.fs.dispatch(key('enter'));
+    await p1;
+    s.fs.dispatch(key('enter'));
+    await p3;
+  });
+
+  test('producer signal pre-aborted: cancels synchronously without ever opening', async () => {
+    const s = make();
+    const ac = new AbortController();
+    ac.abort();
+    const p = s.manager.askPermission(
+      { toolName: 'b', command: 'a', cwd: '/' },
+      { signal: ac.signal },
+    );
+    await expect(p).resolves.toBe('cancel');
+    expect(s.manager.pendingCount()).toBe(0);
+  });
+
+  test('signal listener detaches when modal resolves naturally (no per-ask leak)', async () => {
+    // Memory hygiene for shared signals — the subagent permission
+    // proxy uses one AbortSignal per child session, but a child
+    // can issue many asks. If every resolved ask left its abort
+    // listener attached, eventual signal abort would fire an O(n)
+    // burst of stale callbacks (each a no-op, but each holding a
+    // closure alive). Verify add/remove balance via a tracked
+    // signal that counts both calls.
+    //
+    // Five asks, all resolved by operator (hotkey '1'). After
+    // resolution, the signal should have ZERO net listeners
+    // attached — five adds matched by five removes.
+    const s = make();
+    const ac = new AbortController();
+    let addCount = 0;
+    let removeCount = 0;
+    const trackedSignal = new Proxy(ac.signal, {
+      get(target, prop) {
+        if (prop === 'addEventListener') {
+          return (
+            type: string,
+            listener: EventListener,
+            options?: AddEventListenerOptions | boolean,
+          ): void => {
+            if (type === 'abort') addCount += 1;
+            target.addEventListener(type, listener, options);
+          };
+        }
+        if (prop === 'removeEventListener') {
+          return (
+            type: string,
+            listener: EventListener,
+            options?: EventListenerOptions | boolean,
+          ): void => {
+            if (type === 'abort') removeCount += 1;
+            target.removeEventListener(type, listener, options);
+          };
+        }
+        const v = Reflect.get(target, prop, target);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    });
+
+    const promises: Promise<unknown>[] = [];
+    for (let i = 0; i < 5; i++) {
+      promises.push(
+        s.manager.askPermission(
+          { toolName: 'b', command: `c${i}`, cwd: '/' },
+          { signal: trackedSignal },
+        ),
+      );
+    }
+    expect(addCount).toBe(5);
+
+    // Resolve each in turn via hotkey '1' (yes). Drain queue.
+    for (let i = 0; i < 5; i++) {
+      s.fs.dispatch(charKey('1'));
+      await promises[i];
+    }
+
+    // Every ask's listener was detached on resolve. Pre-fix:
+    // addCount=5, removeCount=0 → 5 stale listeners would fire
+    // when ac.abort() runs. Post-fix: balanced.
+    expect(removeCount).toBe(5);
+  });
+
+  test('signal listener detaches when modal closes via Esc (cancel path)', async () => {
+    // Esc resolves 'cancel' → resolveActive runs → detach fires.
+    // Same balance check as the natural-resolve test above.
+    const s = make();
+    const ac = new AbortController();
+    let addCount = 0;
+    let removeCount = 0;
+    const trackedSignal = new Proxy(ac.signal, {
+      get(target, prop) {
+        if (prop === 'addEventListener') {
+          return (
+            type: string,
+            listener: EventListener,
+            options?: AddEventListenerOptions | boolean,
+          ): void => {
+            if (type === 'abort') addCount += 1;
+            target.addEventListener(type, listener, options);
+          };
+        }
+        if (prop === 'removeEventListener') {
+          return (
+            type: string,
+            listener: EventListener,
+            options?: EventListenerOptions | boolean,
+          ): void => {
+            if (type === 'abort') removeCount += 1;
+            target.removeEventListener(type, listener, options);
+          };
+        }
+        const v = Reflect.get(target, prop, target);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    });
+
+    const p = s.manager.askPermission(
+      { toolName: 'b', command: 'a', cwd: '/' },
+      { signal: trackedSignal },
+    );
+    expect(addCount).toBe(1);
+    s.fs.dispatch(key('escape'));
+    await expect(p).resolves.toBe('cancel');
+    expect(removeCount).toBe(1);
+  });
+
+  test('signal cancel of a queued modal also clears its scheduled timeout', async () => {
+    // Regression guard. The active branch of cancelPending
+    // routes through resolveActive which clears the timeout;
+    // the queued branch resolved directly without the
+    // clearTimer call, leaving live timers behind for every
+    // signal-cancelled queued modal. No functional break (the
+    // timer's later fire is a no-op on settled promises) but
+    // the timer keeps the event loop alive longer than needed
+    // and accrues callback churn under repeated cancels.
+    const s = make();
+    const ac = new AbortController();
+
+    // First ask is the active one — no timer needed.
+    const p1 = s.manager.askPermission({ toolName: 'b', command: 'a', cwd: '/' });
+    // Second ask is queued behind p1 with both a signal AND a
+    // timeout. Aborting the signal must clear the timer so
+    // s.timer.pending() reports empty.
+    const p2 = s.manager.askPermission(
+      { toolName: 'b', command: 'b', cwd: '/' },
+      { signal: ac.signal, timeoutMs: 9999 },
+    );
+    // The queued timer is registered.
+    expect(s.timer.pending()).toHaveLength(1);
+
+    // Abort the signal. Queued path of cancelPending fires.
+    ac.abort();
+    await expect(p2).resolves.toBe('cancel');
+
+    // Pre-fix: timer still queued (length 1, would fire later).
+    // Post-fix: clearTimer ran inside cancelPending; no timer.
+    expect(s.timer.pending()).toHaveLength(0);
+
+    // Tear down p1.
+    s.fs.dispatch(key('enter'));
+    await p1;
+  });
+
+  test('timeout while still queued: emits modal:queue-depth so the suffix corrects down', async () => {
+    // Regression guard. Earlier the queued-timeout branch removed
+    // the entry and resolved the promise but never emitted a
+    // `modal:queue-depth` event — the active modal's `(+N
+    // waiting)` suffix would keep showing the stale higher count
+    // until the operator answered the active and drain popped
+    // the next. With three asks (one active + two queued, both
+    // with timers), firing one queued timer must drop the
+    // displayed depth from 2 to 1 immediately.
+    const s = make();
+    const p1 = s.manager.askPermission({ toolName: 'b', command: 'a', cwd: '/' });
+    const firstAsk = s.events.find((e) => e.type === 'permission:ask');
+    const activeId = firstAsk?.type === 'permission:ask' ? firstAsk.promptId : '';
+    expect(activeId).not.toBe('');
+
+    const p2 = s.manager.askPermission(
+      { toolName: 'b', command: 'b', cwd: '/' },
+      { timeoutMs: 50 },
+    );
+    const p3 = s.manager.askPermission(
+      { toolName: 'b', command: 'c', cwd: '/' },
+      { timeoutMs: 50 },
+    );
+
+    // Two depth events so far: depth=1 (after p2 enqueue), depth=2
+    // (after p3 enqueue), both keyed to p1 (the active one).
+    let depthEvents = s.events.filter((e) => e.type === 'modal:queue-depth');
+    expect(depthEvents).toHaveLength(2);
+    if (depthEvents[1]?.type === 'modal:queue-depth') {
+      expect(depthEvents[1].depth).toBe(2);
+      expect(depthEvents[1].promptId).toBe(activeId);
+    }
+
+    // Fire p2's timer. It's in the queue (p1 is active).
+    const timers = s.timer.pending();
+    expect(timers).toHaveLength(2);
+    const handleP2 = timers[0];
+    s.timer.fire(handleP2);
+    await expect(p2).resolves.toBe('cancel');
+
+    // The third depth event should fire AFTER p2 dropped — depth=1
+    // (only p3 left in queue), still keyed to the active p1.
+    depthEvents = s.events.filter((e) => e.type === 'modal:queue-depth');
+    expect(depthEvents).toHaveLength(3);
+    if (depthEvents[2]?.type === 'modal:queue-depth') {
+      expect(depthEvents[2].depth).toBe(1);
+      expect(depthEvents[2].promptId).toBe(activeId);
+    }
+
+    // Tear down: fire p3's timer (now the only queued one), then
+    // resolve the active so the test exits cleanly.
+    const remaining = s.timer.pending();
+    expect(remaining).toHaveLength(1);
+    s.timer.fire(remaining[0]);
+    await expect(p3).resolves.toBe('cancel');
+    s.fs.dispatch(key('enter'));
+    await p1;
+  });
 });
 
 describe('close', () => {
@@ -386,6 +786,70 @@ describe('close', () => {
     await expect(promise).resolves.toBe('cancel');
     expect(s.fs.size()).toBe(0);
     expect(s.manager.pendingCount()).toBe(0);
+  });
+
+  test('close() detaches abort listeners on every drained pending', async () => {
+    // Regression guard. close() resolves promises directly
+    // instead of routing through resolveActive / cancelPending,
+    // so every pending entry's signal listener (if any) needs
+    // explicit detach in the drain loop. Without this, a
+    // long-lived caller closing the manager while sharing one
+    // AbortSignal across N pending asks (subagent permission
+    // proxy) would leave N stale closures attached until the
+    // signal eventually aborts.
+    //
+    // Setup: 3 asks (1 active + 2 queued), all sharing one
+    // signal. Track add/remove via Proxy. After close: every
+    // listener detached → addCount === removeCount.
+    const s = make();
+    const ac = new AbortController();
+    let addCount = 0;
+    let removeCount = 0;
+    const trackedSignal = new Proxy(ac.signal, {
+      get(target, prop) {
+        if (prop === 'addEventListener') {
+          return (
+            type: string,
+            listener: EventListener,
+            options?: AddEventListenerOptions | boolean,
+          ): void => {
+            if (type === 'abort') addCount += 1;
+            target.addEventListener(type, listener, options);
+          };
+        }
+        if (prop === 'removeEventListener') {
+          return (
+            type: string,
+            listener: EventListener,
+            options?: EventListenerOptions | boolean,
+          ): void => {
+            if (type === 'abort') removeCount += 1;
+            target.removeEventListener(type, listener, options);
+          };
+        }
+        const v = Reflect.get(target, prop, target);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    });
+
+    const promises: Promise<unknown>[] = [];
+    for (let i = 0; i < 3; i++) {
+      promises.push(
+        s.manager.askPermission(
+          { toolName: 'b', command: `c${i}`, cwd: '/' },
+          { signal: trackedSignal },
+        ),
+      );
+    }
+    expect(addCount).toBe(3);
+    expect(removeCount).toBe(0);
+
+    s.manager.close();
+    await Promise.all(promises);
+
+    // Pre-fix: removeCount=0 — listeners survived close. Post-fix:
+    // removeCount=3 — drain loop detached every one.
+    expect(removeCount).toBe(3);
   });
 });
 

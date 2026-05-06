@@ -207,6 +207,12 @@ export type PermissionAskEvent = BaseEvent & {
   // Optional risk hint — when present, modal shows the "why?" detail.
   rule?: string;
   reason?: string;
+  // Subagent attribution. Set when the ask was proxied from a
+  // child subagent over IPC (spec docs/spec/IPC.md §7). The
+  // reducer renders a prefix in the modal preview so the
+  // operator distinguishes parent vs child requests. Undefined
+  // for the parent's own confirms.
+  subagent?: { sessionId: string; name: string };
 };
 // Modal resolution event. Renamed from `permission:answer` because
 // the same event flows for every modal flavor (trust answers `yes`/
@@ -231,6 +237,24 @@ export type ModalSelectEvent = BaseEvent & {
   type: 'modal:select';
   promptId: string;
   selectedIndex: number;
+};
+// Live update of how many other ask*s are queued behind the active
+// modal. Producer (modal-manager) emits one when the modal opens
+// (snapshot of `queue.length` at drain time) and again every time
+// a new ask enqueues while the modal is up. Reducer updates the
+// active modal's `queueDepth` when promptId matches; mismatches
+// drop silently (a stale event arriving after the matching modal
+// already resolved). Renderer surfaces the depth as a title
+// suffix so the operator sees the queue grow / shrink in real
+// time instead of being blindsided when answering one modal
+// auto-pops the next.
+export type ModalQueueDepthEvent = BaseEvent & {
+  type: 'modal:queue-depth';
+  promptId: string;
+  // Number of asks waiting BEHIND this active one — does NOT
+  // include the active modal itself. Zero when the active is
+  // the only ask in flight.
+  depth: number;
 };
 export type TrustAskEvent = BaseEvent & {
   type: 'trust:ask';
@@ -514,6 +538,7 @@ export type UIEvent =
   | PermissionAskEvent
   | ModalAnswerEvent
   | ModalSelectEvent
+  | ModalQueueDepthEvent
   | TrustAskEvent
   | MemoryWriteAskEvent
   | MemoryUserScopeAskEvent

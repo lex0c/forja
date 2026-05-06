@@ -838,6 +838,119 @@ describe('subagent lifecycle', () => {
   });
 });
 
+describe('permission:ask modal (UI.md §4.10.13)', () => {
+  test('parent confirm renders standard title without subagent prefix', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p1',
+      toolName: 'bash',
+      command: 'rm -rf /',
+      cwd: '/p',
+    } as UIEvent);
+    expect(r.state.modal).not.toBeNull();
+    if (r.state.modal !== null) {
+      expect(r.state.modal.title).toBe('Run command');
+      // Standard preview is `$ <command>` then `cwd: …`. No subagent line.
+      expect(r.state.modal.preview[0]).toBe('$ rm -rf /');
+    }
+  });
+
+  test('subagent attribution mutates title + injects prefix preview line', () => {
+    // Spec docs/spec/IPC.md §7: child-proxied asks must label the
+    // subagent so the operator can distinguish parent vs child
+    // requests. The reducer keys on the optional event field.
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p2',
+      toolName: 'bash',
+      command: 'ls',
+      cwd: '/p',
+      subagent: { sessionId: 'abcdef-12345678', name: 'explore' },
+    } as UIEvent);
+    expect(r.state.modal).not.toBeNull();
+    if (r.state.modal !== null) {
+      expect(r.state.modal.title).toBe('Subagent permission — explore');
+      // The first preview line is the attribution; the 8-char tail
+      // disambiguates concurrent instances of the same subagent.
+      expect(r.state.modal.preview[0]).toBe('subagent: explore (12345678)');
+      // Followed by the standard $cwd lines.
+      expect(r.state.modal.preview[1]).toBe('$ ls');
+      expect(r.state.modal.preview[2]).toBe('cwd: /p');
+    }
+  });
+});
+
+describe('modal:queue-depth (live count of asks queued behind active)', () => {
+  test('matching promptId updates state.modal.queueDepth', () => {
+    const opened = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p1',
+      toolName: 'bash',
+      command: 'rm',
+      cwd: '/p',
+    } as UIEvent);
+    expect(opened.state.modal?.queueDepth).toBe(0);
+    const bumped = applyEvent(opened.state, {
+      type: 'modal:queue-depth',
+      ts: 2,
+      promptId: 'p1',
+      depth: 3,
+    } as UIEvent);
+    expect(bumped.state.modal?.queueDepth).toBe(3);
+  });
+
+  test('mismatched promptId is dropped silently (no state churn)', () => {
+    const opened = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p1',
+      toolName: 'bash',
+      command: 'rm',
+      cwd: '/p',
+    } as UIEvent);
+    const stale = applyEvent(opened.state, {
+      type: 'modal:queue-depth',
+      ts: 2,
+      promptId: 'p-other',
+      depth: 99,
+    } as UIEvent);
+    expect(stale.state).toBe(opened.state);
+    expect(stale.state.modal?.queueDepth).toBe(0);
+  });
+
+  test('event after the modal closed is dropped silently', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'modal:queue-depth',
+      ts: 1,
+      promptId: 'p1',
+      depth: 5,
+    } as UIEvent);
+    expect(r.state.modal).toBeNull();
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('negative depth clamps to 0 (defensive)', () => {
+    const opened = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p1',
+      toolName: 'bash',
+      command: 'rm',
+      cwd: '/p',
+    } as UIEvent);
+    const bad = applyEvent(opened.state, {
+      type: 'modal:queue-depth',
+      ts: 2,
+      promptId: 'p1',
+      depth: -7,
+    } as UIEvent);
+    expect(bad.state.modal?.queueDepth).toBe(0);
+  });
+});
+
 describe('not-yet-wired events accept silently', () => {
   test.each([
     [

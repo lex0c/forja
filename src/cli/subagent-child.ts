@@ -33,6 +33,10 @@ import {
   makeSessionStart,
   processTransport,
 } from '../subagents/ipc.ts';
+import {
+  type ChildPermissionBridge,
+  createChildPermissionBridge,
+} from '../subagents/permission-bridge.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 
@@ -323,6 +327,16 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
   // keeps the harness config branch simple.
   const signalController = new AbortController();
   const softStopController = new AbortController();
+  // Permission proxy bridge — only constructed when IPC is on.
+  // Without the channel there's no way to round-trip a confirm
+  // verdict to an operator, so the harness config's
+  // `confirmPermission` stays unset and `invoke-tool.ts:341`
+  // collapses confirm verdicts to denials (the legacy headless
+  // behavior). Spec docs/spec/IPC.md §7: every positive answer
+  // must originate from a human at the parent's modal — the
+  // bridge enforces that by being the ONLY producer of `true`
+  // for a confirm verdict in a child.
+  let permissionBridge: ChildPermissionBridge | undefined;
   if (ipcChannel !== undefined) {
     ipcChannel.onMessage((msg) => {
       if (msg.type === 'interrupt:soft') {
@@ -339,6 +353,14 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         // our stdin reader and the outer finally will run.
         signalController.abort();
       }
+      // permission:answer messages are routed by the bridge's
+      // own onMessage subscription (constructed below); no work
+      // for this listener.
+    });
+    permissionBridge = createChildPermissionBridge({
+      channel: ipcChannel,
+      signal: signalController.signal,
+      errSink,
     });
   }
 
@@ -837,6 +859,16 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
             },
           }
         : {}),
+      // Permission proxy. The bridge converts a confirm verdict
+      // from this child's engine into a `permission:ask` IPC
+      // message, blocks awaiting `permission:answer` from the
+      // parent's operator, and resolves the resulting
+      // `Promise<boolean>` back to invoke-tool's existing async
+      // confirm branch. Without this wire, every confirm verdict
+      // would fall back to denial (invoke-tool.ts:341).
+      ...(permissionBridge !== undefined
+        ? { confirmPermission: permissionBridge.confirmPermission }
+        : {}),
     };
 
     const result = await runAgent(config);
@@ -887,6 +919,16 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // throw on the next tick — swallowed inside the timer body
     // anyway, but the explicit ordering is cleaner.
     if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
+    // Drain the permission bridge BEFORE closing the channel.
+    // dispose() resolves any in-flight ask as denied so a
+    // confirmPermission caller blocked at child-shutdown time
+    // exits its await — without this, the harness's invokeTool
+    // could be holding the event loop alive past return. Order
+    // matters: the bridge's onClose subscription would also
+    // fire on channel.close() below, but disposing first keeps
+    // the cleanup deterministic (one source of denial, not a
+    // race between dispose's drain and the close handler's).
+    if (permissionBridge !== undefined) permissionBridge.dispose();
     // Spec §4.3: emit session_finished as the LAST IPC message
     // before exit, regardless of which path led here (happy path,
     // pre-harness refusal, post-harness throw). The parent uses

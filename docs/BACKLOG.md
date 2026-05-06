@@ -15,6 +15,219 @@ Format:
 
 ---
 
+## [2026-05-05] M3 / impl — subagent permission proxy (slices 1–3)
+
+New branch `feat/m3-subagent-permission-proxy` off `develop`. Closes
+the `permission:ask` proxy gap reserved as "Slice 4" of the IPC
+subsystem (`docs/spec/IPC.md §9`). Before this work landed, a
+child subagent that hit a `confirm` verdict from the permission
+engine fell back to denial: `src/harness/invoke-tool.ts:341`
+records `decision: 'confirm_no'`, `decidedBy: 'policy'`
+whenever `deps.confirmPermission` is undefined — the child's
+default. Tool returned `requires user confirmation: <prompt>`;
+the child model gave up or retried blindly. Safe (no
+auto-allow) but operator-invisible.
+
+Three slices, same branch.
+
+**Done — Slice 1 (IPC extension + child bridge):**
+
+- **`src/subagents/ipc.ts`** gains `permission:ask` (child→parent
+  event) and `permission:answer` (parent→child command). Both
+  added to the union, `KNOWN_TYPES`, parser switch, and
+  factories (`makePermissionAsk`, `makePermissionAnswer`). New
+  exported type `PermissionDecision = 'allow' | 'deny'`. The
+  payload field for `permission:ask` deviates from
+  `IPC.md §3.2`'s illustrative `{ promptId, toolName, command,
+  cwd }` because the engine's confirm flow already passes
+  `{ toolName, args, cwd, prompt }` through `confirmPermission`
+  — forcing a bash-shaped `command` field would require lossy
+  translation for non-bash tools. Documented inline.
+
+- **`src/subagents/permission-bridge.ts`** (new, ~190 LoC).
+  `createChildPermissionBridge({ channel, signal, errSink })`
+  returns a `confirmPermission` drop-in for `HarnessConfig`.
+  Holds `Map<promptId, { resolve }>`. On call: generate UUID,
+  register pending, send `permission:ask`. On
+  `permission:answer`: lookup, resolve. Cleanup paths:
+  hard-abort drains pending as denied; `channel.onClose`
+  drains pending as denied; `dispose()` drains + short-circuits
+  future calls. `signal.aborted` at construction makes future
+  calls short-circuit too.
+
+- **`src/cli/subagent-child.ts`** wires the bridge when
+  `ipcChannel !== undefined`. Bridge passes its
+  `confirmPermission` into the child's harness config and is
+  disposed in the outer finally before the channel closes
+  (deterministic teardown — one source of denial, not a race
+  between dispose's drain and the close handler's).
+
+- **Tests** (11 new, `tests/subagents/permission-bridge.test.ts`):
+  happy path (allow / deny / parallel out-of-order), failure
+  modes (hard abort drains, channel close drains, pre-aborted
+  signal short-circuits, ask-after-abort short-circuits, unknown
+  promptId logs and drops, non-permission traffic ignored,
+  dispose drains + idempotent). Plus 9 new parser cases in
+  `tests/subagents/ipc.test.ts` covering shape + decision
+  validation.
+
+**Done — Slice 2 (parent proxy):**
+
+- **`src/harness/invoke-tool.ts` + `src/harness/types.ts`**:
+  `confirmPermission`'s request shape gains optional
+  `subagent?: { sessionId, name }`. The child's own
+  invoke-tool path doesn't set it (no attribution at that
+  layer); the parent's spawnSubagent closure injects it when
+  proxying.
+
+- **`src/tui/modal-manager.ts`** + **`src/tui/events.ts`** add
+  optional `subagent` to `PermissionAskArgs` /
+  `PermissionAskEvent`. Manager spreads conditionally so the
+  parent's own confirms emit no `subagent` field at all.
+
+- **`src/tui/state.ts`** reducer renders attribution: title
+  becomes `Subagent permission — <name>` and the first
+  preview line is `subagent: <name> (<8-char id tail>)`. The
+  8-char tail disambiguates concurrent instances of the same
+  agent. Anti-spoof: only the agent's declared `name` (from
+  the `agents/*.md` frontmatter) reaches the preview — never
+  a string the child generated.
+
+- **`src/cli/repl.ts`** `confirmPermission` threads the
+  `subagent` field straight into `modalManager.askPermission`.
+
+- **`src/subagents/runtime.ts`** `RunSubagentInput` gains
+  `onPermissionAsk?: (req) => Promise<PermissionDecision>`. New
+  IPC observer recognizes `permission:ask`, narrows
+  `args` to `Record<string, unknown>` (auto-deny on shape
+  mismatch — opaque wire payload, can't trust child to send
+  the right shape), calls the hook with subagent attribution
+  baked in (`{ sessionId: childSession.id, name:
+  definition.name }`), then ships `permission:answer` with
+  the verdict. When `onPermissionAsk` is unset the runtime
+  auto-denies — without this the child would hang waiting for
+  an answer that never arrives, past wall-clock. Hook throw
+  also collapses to deny.
+
+- **`src/harness/loop.ts`** `spawnSubagent` closure provides
+  `onPermissionAsk` only when `config.confirmPermission` is
+  wired; the closure adapts the boolean response to the wire's
+  `'allow' | 'deny'`. Local-rebind pattern so the narrowed
+  type survives across the async closure (config member
+  access through the promise hop wouldn't otherwise stay
+  narrowed).
+
+- **Tests** (10 new): 6 in `tests/subagents/runtime.test.ts`
+  (`runSubagent — permission proxy (parent)` describe block):
+  ask invokes hook with attribution + ships allow back;
+  deny path; missing hook auto-denies; throwing hook
+  auto-denies; parallel asks each get matching promptId
+  answered; malformed args (non-object) auto-denies without
+  invoking the hook. 2 in `tests/tui/modal-manager.test.ts`
+  (subagent forwarded to event; absent when omitted). 2 in
+  `tests/tui/state.test.ts` (parent confirm renders standard
+  title; subagent attribution mutates title + injects
+  prefix preview line).
+
+**Done — Slice 3 (UX polish + smoke):**
+
+- **Anti-spoof at the REPL bridge.** `confirmPermission` now
+  `stripAnsi`s `command`, `cwd`, and `prompt` for
+  subagent-proxied requests. The parent's own confirms
+  remain unsanitized (those args originate from prompts the
+  operator authored directly, not from a model run inside an
+  isolated agent definition). Imports `stripAnsi` from the
+  existing `src/sanitize/` module — no new dependency. Test
+  in `tests/cli/repl.test.ts` exercises the bridge with
+  ANSI-tainted strings + subagent attribution and asserts
+  the modal round-trip resolves cleanly to true; `stripAnsi`
+  itself is covered by sanitize tests.
+
+- **No audit migration.** The chain "operator approved X for
+  child Y for tool Z" is already reconstructable through
+  joins: `approvals.tool_call_id → tool_calls.message_id →
+  messages.session_id → sessions.parent_session_id`. Adding
+  redundant `requester_session_id` /
+  `requester_subagent_name` columns would be denormalization
+  for query convenience, not a missing capability. The
+  initial slice plan called for the migration; on inspection
+  of the schema it turned out unnecessary. Documented here
+  so a future operator looking for the columns understands
+  why they don't exist.
+
+**Decisions (resolved without spec PR):**
+
+1. **No spec PR mid-flight.** The spec already declares both
+   message types in `docs/spec/IPC.md §3` with payloads
+   defined; this slice promotes the "futuro" marker to
+   current. `CLAUDE.md` reserves spec edits for explicit
+   user request, so this entry carries the open-question
+   resolutions; a follow-up spec PR codifies them later if
+   wanted.
+
+2. **Session-allow propagation: not propagated.** Operator
+   choosing "yes for session" on the parent's modal applies
+   only to the in-flight ask. Child's local policy snapshot
+   is not mutated. Trade-off: more prompts vs simpler
+   semantics + stronger audit trail (every approval is
+   per-call, per-child). Aligns with `IPC.md §7`: "filho
+   NUNCA recebe auto-approve via IPC; o canal só transporta
+   a decisão do humano."
+
+3. **Answer wire shape:
+   `{ promptId, decision: 'allow' | 'deny' }`.** No richer
+   `Decision` round-trip — the modal returns boolean
+   semantics, and the bridge converts back to
+   `confirmPermission`'s existing `Promise<boolean>` shape.
+   Future per-call scope (`'session'`) would extend the
+   union, not break it.
+
+4. **Modal attribution: dedicated optional field.** Extends
+   `PermissionAskArgs` / `PermissionAskEvent` with optional
+   `subagent`. Reducer keys on presence; the parent's own
+   confirms stay unchanged (no field, no prefix).
+
+5. **No timeout on `permission:ask` bridge.** Spec
+   `UI.md §6`: "permission:ask sem timeout (espera o user)".
+   Child's awaited promise resolves on operator answer or
+   short-circuits to denial on signal abort / channel close.
+   A wedged operator wedges the child — same as the
+   parent's own confirm flow.
+
+6. **Rate limiting deferred.** A child in a loop firing
+   `permission:ask` could DoS the operator's modal queue.
+   Modal manager's existing FIFO already bounds visible
+   noise to one-at-a-time. Per-child cap
+   (`subagents.maxPendingPermissionAsks`) is a follow-up
+   pull-in if real signal appears.
+
+**Verification:** suite of 2998 tests green throughout
+(2988 pass, 10 skip, 0 fail). Lint + typecheck clean at
+every step.
+
+**Pending:** child-death-with-modal-open is currently a UX
+papercut: the modal stays open until the operator answers
+(or modalManager.close at REPL shutdown), and the answer
+goes into a closed channel. A targeted per-ask abort on
+modalManager would let the runtime cancel the open modal
+when the child dies; the manager today only has a global
+`close()`. Defer until real signal arises.
+
+**Next:** R2 (schema-first IPC) and R3 (single handshake)
+remain deferred per `docs/REFACTOR.md`. The parser is now
+at three hand-rolled variants beyond the M1 set
+(`permission:ask` / `permission:answer` joined the existing
+ones), and the migration cost stays linear — R2 still
+warrants a forcing function before pulling. Permission
+proxy was R3's headline justification ("structured
+handshake will be needed anyway"); now that the proxy is
+implemented WITHOUT a unified handshake, R3's pull-in
+signal weakens. Re-evaluate when the next M3+ feature
+(parallel subagents, MCP, repo map) generates fresh
+forcing function.
+
+---
+
 ## [2026-05-05] M3 / refactor — decompose `src/hooks/dispatcher.ts`
 
 New branch `refactor/hooks-dispatcher-decompose` off `develop`.

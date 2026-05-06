@@ -19,7 +19,9 @@ import {
   IPC_PROTOCOL_VERSION,
   IPC_VERSION_MISMATCH_EXIT_CODE,
   type IpcMessage,
+  type PermissionDecision,
   makeInterruptHard,
+  makePermissionAnswer,
 } from './ipc.ts';
 import type { SubagentSet } from './load.ts';
 import { buildResultFromPayload } from './result-builder.ts';
@@ -247,12 +249,60 @@ export interface RunSubagentInput {
   // legacy disk-re-resolve path (preserving pre-migration
   // behavior for fixtures that don't model the snapshot).
   hooksSnapshot?: readonly HookSpec[];
+  // Permission proxy callback (spec docs/spec/IPC.md §7,
+  // permission:ask / permission:answer slice). When the child's
+  // engine returns a `confirm` verdict, the child bridge
+  // forwards a `permission:ask` over IPC; the runtime calls
+  // this hook with the child's request plus baked-in subagent
+  // attribution (sessionId + agent name). Callback resolves
+  // with the operator's verdict; runtime sends the matching
+  // `permission:answer` back over the channel. When omitted,
+  // every `permission:ask` from the child auto-denies (the
+  // safe fallback when no operator is wired — keeps the child
+  // from hanging on a missing answer).
+  onPermissionAsk?: (req: {
+    toolName: string;
+    args: Record<string, unknown>;
+    cwd: string;
+    prompt: string;
+    subagent: { sessionId: string; name: string };
+    // Per-session abort signal. Fires when the child's IPC
+    // channel closes (peer death, normal exit, hard abort) so
+    // the parent's modal layer can close any open prompt
+    // instead of stranding the operator on a stale request
+    // whose answer would go into a closed pipe. Hook
+    // implementations forward it to ModalManager via
+    // `confirmPermission`'s own `signal` field.
+    signal: AbortSignal;
+  }) => Promise<PermissionDecision>;
+  // Cap on concurrent permission asks per child session. When a
+  // child has this many asks pending and emits one more, the
+  // runtime auto-denies the new ask immediately (synthetic
+  // `permission:answer { decision: 'deny' }`) without invoking
+  // the hook. Defends the operator's modal queue against a
+  // child stuck in a confirm-loop or a hostile agent definition
+  // emitting hundreds of asks. Default `DEFAULT_MAX_PENDING_ASKS`
+  // (5) — small enough that the operator never sees a runaway
+  // queue, large enough that legitimate batch workflows (e.g.,
+  // confirm 4 file edits as a unit) pass through. Set to 0 to
+  // disable the cap entirely (eval / smoke harnesses that need
+  // to stress-test the wire).
+  maxPendingPermissionAsks?: number;
 }
 
 // Hard cap on how deep a chain of `task → task → task` can nest.
 // 4 levels covers every plausible playbook composition; surfaces
 // a clear error well before the budget caps would.
 export const MAX_SUBAGENT_DEPTH = 4;
+
+// Default cap on concurrent permission asks per child session.
+// Picked to keep the modal queue ergonomic — operator answering
+// one at a time can drain N=5 in roughly the same time a child
+// would take to issue a sixth, so legitimate batch workflows
+// don't trigger the cap. Hostile / buggy children that emit
+// 100s of asks hit the cap on the 6th one and every subsequent
+// ask auto-denies, keeping the operator's queue bounded.
+export const DEFAULT_MAX_PENDING_ASKS = 5;
 
 // Spawn a subagent in a separate Bun subprocess (spec §11:1030).
 // The parent creates the child session row + audit rows, spawns
@@ -690,6 +740,205 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
           subagentId: childSession.id,
           lastEvent: inner as HarnessEvent,
         });
+      });
+    }
+    // Permission proxy (spec docs/spec/IPC.md §7,
+    // permission:ask / permission:answer slice). The child's
+    // bridge emits `permission:ask` when its engine returns a
+    // `confirm` verdict; the runtime forwards to the caller's
+    // hook with subagent attribution baked in, then ships the
+    // operator's verdict back as `permission:answer`. When
+    // `onPermissionAsk` is unset the runtime auto-denies so
+    // the child unblocks promptly — a child waiting on an
+    // answer that never arrives would hang past wall-clock.
+    {
+      const hook = input.onPermissionAsk;
+      // Concurrent-ask cap (rate-limit per child). Tracks the
+      // promptIds currently in flight; entries are added on
+      // `permission:ask` arrival and removed when the hook
+      // settles (resolve OR reject). When the set is at the
+      // cap, additional asks short-circuit to deny — child's
+      // bridge sees `permission:answer { 'deny' }` and treats
+      // it like any other denial. The cap defaults to
+      // DEFAULT_MAX_PENDING_ASKS (5); set 0 to disable
+      // (stress-testing surface).
+      const askCap = input.maxPendingPermissionAsks ?? DEFAULT_MAX_PENDING_ASKS;
+      const inFlightAsks = new Set<string>();
+      // Per-session abort signal threaded into every hook call.
+      // Fires when the IPC channel closes (child died / EOF /
+      // post-wait teardown) — that's the moment the operator's
+      // modal must close, because any answer the operator
+      // produces afterward would land on a dead pipe and the
+      // child can't act on it. Without this, a child crash with
+      // the modal open would strand the operator on a stale
+      // prompt that blocks the rest of the modal queue. The
+      // abort fires AT MOST ONCE per session; AbortController
+      // is idempotent. Subscribe BEFORE wiring the ask handler
+      // so a `permission:ask` arriving simultaneously with a
+      // close (race) sees the signal already set.
+      const askAbort = new AbortController();
+      handle.ipc.onClose(() => askAbort.abort());
+      // Belt-and-suspenders: parent's hard-abort signal also
+      // fires the per-session abort. The channel.onClose path
+      // covers the typical case (waitForChild → handle.ipc.close
+      // → onClose listeners), but a pathological teardown that
+      // closes the underlying transport without firing onClose
+      // (or a future code change that reorders the cleanup)
+      // would leave the modal open. The parent's hard-signal is
+      // a redundant trigger — if it fired, the operator already
+      // gave up on the run.
+      if (input.signal !== undefined) {
+        if (input.signal.aborted) {
+          askAbort.abort();
+        } else {
+          // Pair add/remove so the listener doesn't accumulate on
+          // the parent's signal across N subagent runs in a long
+          // REPL session. Without this cleanup, every runSubagent
+          // call leaves a closure attached to input.signal that
+          // only auto-removes when the parent itself aborts (Ctrl+C
+          // / REPL exit) — a handful per session is fine, but a
+          // session running 1000s of subagents would accumulate
+          // 1000s of closures. `askAbort` always fires by end of
+          // session (channel.onClose is the typical path; the
+          // input.signal forward is the belt-and-suspenders), so
+          // wiring removal off askAbort guarantees cleanup runs
+          // exactly once at the right moment.
+          const parentSignal = input.signal;
+          const onParentAbort = (): void => askAbort.abort();
+          parentSignal.addEventListener('abort', onParentAbort);
+          askAbort.signal.addEventListener(
+            'abort',
+            () => parentSignal.removeEventListener('abort', onParentAbort),
+            { once: true },
+          );
+        }
+      }
+      handle.ipc.onMessage((msg) => {
+        if (msg.type !== 'permission:ask') return;
+        const promptId = msg.promptId;
+        // Args sanitization: the wire field is `unknown`. The
+        // hook contract requires Record<string, unknown>; if
+        // the child sent something else (model bug, malformed
+        // bridge) we deny rather than pass garbage to the
+        // modal renderer.
+        const args =
+          typeof msg.args === 'object' && msg.args !== null && !Array.isArray(msg.args)
+            ? (msg.args as Record<string, unknown>)
+            : null;
+        if (hook === undefined || args === null) {
+          try {
+            handle.ipc?.send(makePermissionAnswer({ promptId, decision: 'deny' }));
+          } catch {
+            // Channel may already be torn down (child died
+            // mid-ask). The child's bridge drains pending as
+            // denied on its onClose, so the verdict here is
+            // moot in that case.
+          }
+          return;
+        }
+        // Rate-limit gate: deny without invoking the hook when
+        // the child has hit the concurrent-ask cap. Operator's
+        // modal queue stays bounded under a hostile / buggy
+        // child that emits 100s of asks. Diagnostic to stderr
+        // (not the bus — operator's TUI shouldn't see a
+        // synthetic warn for every rate-limited ask; child's
+        // own model sees the deny and is expected to back off).
+        // `askCap === 0` opts out of the gate (stress-testing
+        // surface); ordering puts the opt-out check first so a
+        // legitimate uncapped run never even reads the set.
+        if (askCap > 0 && inFlightAsks.size >= askCap) {
+          process.stderr.write(
+            `subagent ${childSession.id}: permission ask rate-limited (cap=${askCap}); promptId=${promptId} auto-denied\n`,
+          );
+          try {
+            handle.ipc?.send(makePermissionAnswer({ promptId, decision: 'deny' }));
+          } catch {
+            // ignored — same teardown race
+          }
+          return;
+        }
+        // Track the in-flight ask so subsequent ones see the
+        // count. The .then/.catch handlers below remove the
+        // entry; ordering is naturally correct (Promise
+        // continuations always schedule on a later microtask,
+        // never synchronously) but doing the add before the
+        // hook call also keeps the failure surface tight — a
+        // hook that throws synchronously (turned into a rejected
+        // promise) still has its .catch run async, by which time
+        // the entry is in the set and the .catch's delete is the
+        // matching cleanup.
+        inFlightAsks.add(promptId);
+        // Async hook. We don't await here (the IPC observer is
+        // sync); fire-and-forward and let the .then send the
+        // answer when the operator decides. Multiple parallel
+        // asks from the same child interleave naturally because
+        // each .then closure carries its own promptId. The
+        // finally-style cleanup removes from the set whether
+        // the hook resolved or threw — slot frees up either way.
+        //
+        // Wrap in `Promise.resolve().then(() => hook(...))` so a
+        // hook that throws SYNCHRONOUSLY (non-async function
+        // that validates input and throws before returning a
+        // promise; or a JS caller violating the typed contract)
+        // collapses into a rejected promise the .catch below
+        // handles uniformly. Without this wrap, a sync throw
+        // propagates up to onMessage where the channel emitter
+        // swallows listener exceptions silently — no
+        // permission:answer is sent, the child's bridge stays
+        // pending, and the run blocks until channel
+        // teardown / wall-clock. The wrap also keeps
+        // `inFlightAsks` accounting honest: the .catch's delete
+        // matches the .add above instead of leaking a slot
+        // when the hook never completes.
+        Promise.resolve()
+          .then(() =>
+            hook({
+              toolName: msg.toolName,
+              args,
+              cwd: msg.cwd,
+              prompt: msg.prompt,
+              subagent: { sessionId: childSession.id, name: definition.name },
+              signal: askAbort.signal,
+            }),
+          )
+          .then((decision: PermissionDecision) => {
+            inFlightAsks.delete(promptId);
+            // Defensive coercion. The hook signature types
+            // `decision` as PermissionDecision ('allow' | 'deny'),
+            // but JS callers and TS callers reaching this path
+            // through `any` can return arbitrary values. The
+            // child's IPC parser refuses any decision outside
+            // {'allow', 'deny'} as `permission_answer.unknown_decision:<v>`,
+            // routing it to onError instead of onMessage — the
+            // bridge's `pending` entry stays unresolved and the
+            // child blocks on the prompt until channel close or
+            // wall-clock. Coercing invalid values to 'deny'
+            // here means the child always gets a usable answer
+            // and the diagnostic surfaces on stderr so a buggy
+            // hook is debuggable.
+            const safeDecision: PermissionDecision =
+              decision === 'allow' || decision === 'deny' ? decision : 'deny';
+            if (safeDecision !== decision) {
+              process.stderr.write(
+                `subagent ${childSession.id}: onPermissionAsk returned invalid decision (${String(decision)}); coercing to 'deny'\n`,
+              );
+            }
+            try {
+              handle.ipc?.send(makePermissionAnswer({ promptId, decision: safeDecision }));
+            } catch {
+              // Channel teardown race — same as above.
+            }
+          })
+          .catch(() => {
+            inFlightAsks.delete(promptId);
+            // Hook threw. Treat as deny so the child doesn't
+            // hang waiting for an answer that will never come.
+            try {
+              handle.ipc?.send(makePermissionAnswer({ promptId, decision: 'deny' }));
+            } catch {
+              // ignored
+            }
+          });
       });
     }
     handle.ipc.onError((err) => {

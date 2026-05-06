@@ -24,6 +24,7 @@ import { basename, join } from 'node:path';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
 import { DEFAULT_BUDGET } from '../harness/types.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
+import { stripAnsi } from '../sanitize/index.ts';
 import {
   HISTORY_CAP,
   appendHistory,
@@ -134,6 +135,38 @@ export interface RunReplOptions {
 // gap between session:end and the next user:submit, and one-shot
 // callers still get their final marker.
 const filterUiEvent = (_event: UIEvent): boolean => true;
+
+// Anti-spoof transform applied to every string field a child
+// subagent contributes to a permission modal an operator will
+// see (spec docs/spec/IPC.md §7). Three layers:
+//   1. stripAnsi removes ESC-prefixed control sequences so the
+//      child can't paint fake colors / cursor moves.
+//   2. Replace newline / tab / CR with a single space so a
+//      multi-line payload can't split across modal rows and
+//      mimic separator lines or fake warnings. stripAnsi does
+//      NOT cover \x0a (LF) — its character class excludes
+//      \x09-\x0a-\x0d to keep ordinary text intact — so the
+//      explicit collapse is necessary.
+//   3. Length cap prevents a child from emitting kilobyte-long
+//      strings that would push subsequent modal content off
+//      screen or overflow the rule width. 200 chars covers
+//      every legitimate display surface (longest is the
+//      command preview; the JSON-fallback path already caps
+//      at 80) with headroom.
+// Used ONLY for the subagent-proxy code path; parent's own
+// confirms come from operator-authored prompts and stay raw.
+// Exported for unit testing — kept in this module rather than
+// `src/sanitize/` because it encodes a UI-specific contract
+// (modal display surface widths + multi-row mimicry defense)
+// that has no other consumer.
+export const SUBAGENT_DISPLAY_MAX = 200;
+export const sanitizeForSubagentDisplay = (raw: string): string => {
+  let cleaned = stripAnsi(raw).replace(/[\r\n\t]+/g, ' ');
+  if (cleaned.length > SUBAGENT_DISPLAY_MAX) {
+    cleaned = `${cleaned.slice(0, SUBAGENT_DISPLAY_MAX - 1)}…`;
+  }
+  return cleaned;
+};
 
 export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const { args } = options;
@@ -736,6 +769,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     args: Record<string, unknown>;
     cwd: string;
     prompt: string;
+    subagent?: { sessionId: string; name: string };
+    signal?: AbortSignal;
   }): Promise<boolean> => {
     const vocab = lookupToolVocab(req.toolName);
     let command = '';
@@ -754,12 +789,50 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       }
       if (command.length > 80) command = `${command.slice(0, 80)}…`;
     }
-    const answer = await modalManager.askPermission({
-      toolName: req.toolName,
-      command,
-      cwd: req.cwd,
-      reason: req.prompt,
-    });
+    // Anti-spoof for subagent-proxied requests (spec
+    // docs/spec/IPC.md §7). EVERY string field that originates
+    // from the child's wire payload and reaches the modal must
+    // pass through `sanitizeForSubagentDisplay`:
+    //   - `toolName` is rendered into option labels and the
+    //     question line ("Yes, allow all <tool> during this
+    //     session", "Do you want to run this <tool> command?").
+    //     The IPC parser only validates non-empty string; a
+    //     hostile child can pack ANSI / newlines that bypass
+    //     stripAnsi-only sanitization (newlines are NOT in
+    //     stripAnsi's range, so a `bash\n[red] FAKE WARN` would
+    //     split the modal display).
+    //   - `command`, `cwd`, `prompt` show up in the preview block.
+    // The parent's own confirms (req.subagent === undefined) keep
+    // raw strings — those originate from prompts the operator
+    // authored, so fidelity matters and trust is implicit.
+    let displayToolName = req.toolName;
+    let displayCwd = req.cwd;
+    let displayPrompt = req.prompt;
+    if (req.subagent !== undefined) {
+      command = sanitizeForSubagentDisplay(command);
+      displayToolName = sanitizeForSubagentDisplay(req.toolName);
+      displayCwd = sanitizeForSubagentDisplay(req.cwd);
+      displayPrompt = sanitizeForSubagentDisplay(req.prompt);
+    }
+    const answer = await modalManager.askPermission(
+      {
+        toolName: displayToolName,
+        command,
+        cwd: displayCwd,
+        reason: displayPrompt,
+        // Forward subagent attribution so the modal can label the
+        // request as coming from a child run (spec
+        // docs/spec/IPC.md §7). Spread keeps the field absent for
+        // the parent's own confirms — the reducer only branches
+        // on its presence.
+        ...(req.subagent !== undefined ? { subagent: req.subagent } : {}),
+      },
+      // Forward producer cancellation signal. Subagent proxy
+      // wires it to the child's IPC lifetime so a child dying
+      // mid-modal closes the prompt instead of stranding the
+      // operator on a stale request.
+      req.signal !== undefined ? { signal: req.signal } : undefined,
+    );
     // Map the spec-shape answer to the harness's boolean contract.
     // 'session-allow' currently behaves like 'yes' — the policy
     // mutation that would persist a session-layer rule is deferred.

@@ -36,6 +36,17 @@ interface Pending<Answer extends string = string> {
   options: readonly ConfirmOption[];
   // Optional timeout handle so we can clear it on early resolve.
   timeout: unknown;
+  // Detach the producer-signal abort listener on early resolve.
+  // Without this, every ask whose modal resolved naturally
+  // (operator answer, Esc, timeout) would leave a stale closure
+  // attached to the ConfirmAskOptions.signal — for the subagent
+  // permission-proxy path where N asks share one per-session
+  // signal, that's N retained closures that fire as a useless
+  // O(n) burst when the signal eventually aborts. Set when
+  // the signal listener is wired; called by every resolve path
+  // that isn't the abort itself. Optional because most asks
+  // don't supply a signal.
+  detachAbortListener?: () => void;
 }
 
 export interface ConfirmAskOptions {
@@ -43,6 +54,20 @@ export interface ConfirmAskOptions {
   // timeout (the spec marks `permission:ask` as no-timeout per UI.md
   // §5.5 rule 6; trust:ask uses 5min via the caller).
   timeoutMs?: number;
+  // Producer-driven cancellation. When the signal aborts, the modal
+  // resolves to 'cancel' immediately — same shape as the
+  // timeout/Esc paths. Two cases collapse to the same outcome:
+  //   - Active modal: same as resolveActive('cancel'); fires the
+  //     answer event, drains the next from the queue.
+  //   - Still queued: remove from queue and resolve. Emits a
+  //     queue-depth update keyed to the active modal so the
+  //     `(+N waiting)` suffix corrects down (mirrors the
+  //     queued-timeout path).
+  // Used by the subagent permission proxy (spec docs/spec/IPC.md §7)
+  // so a child dying with its modal open closes the prompt instead
+  // of blocking the operator on a stale request whose answer would
+  // go into a closed channel.
+  signal?: AbortSignal;
 }
 
 export interface PermissionAskArgs {
@@ -51,6 +76,12 @@ export interface PermissionAskArgs {
   cwd: string;
   rule?: string;
   reason?: string;
+  // Subagent attribution. Set by the parent harness when
+  // proxying a child's `permission:ask` over IPC (spec
+  // docs/spec/IPC.md §7). The reducer prefixes the modal title
+  // so the operator distinguishes a parent confirm from a child
+  // confirm. Undefined for the parent's own confirms.
+  subagent?: { sessionId: string; name: string };
 }
 
 // Trust flavor — first-run "is this directory safe to operate in?"
@@ -285,6 +316,21 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
     const promptId = next.open();
     // Default selectedIndex = last option (conservative choice).
     active = { promptId, selectedIndex: next.options.length - 1, pending: next };
+    // Initial queue-depth snapshot for the just-opened modal. The
+    // event MUST fire AFTER `next.open()` so the reducer has
+    // already created the modal slot before this update lands —
+    // otherwise the reducer's mismatched-promptId guard would
+    // drop it. `queue.length` reflects what's STILL waiting AFTER
+    // popping this one (see queue.shift above) — exactly the
+    // count the renderer's `(+N waiting)` suffix needs.
+    if (queue.length > 0) {
+      bus.emit({
+        type: 'modal:queue-depth',
+        ts: now(),
+        promptId,
+        depth: queue.length,
+      });
+    }
     activeHandler = (key) => {
       if (active === null) return false;
 
@@ -371,6 +417,13 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
     if (pending.timeout !== null && pending.timeout !== undefined) {
       clearTimer(pending.timeout);
     }
+    // Detach the producer-signal abort listener (if any) so a
+    // late signal abort doesn't fire a stale callback for a
+    // modal that already resolved naturally. Idempotent — no-op
+    // for asks that didn't supply a signal, no-op if the
+    // listener already auto-removed via `once: true` (the
+    // signal-abort path that routes through here).
+    pending.detachAbortListener?.();
     if (activeHandler !== null) {
       focusStack.remove(activeHandler);
       activeHandler = null;
@@ -397,6 +450,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
     open: (promptId: string) => UIEvent,
     optionsList: readonly ConfirmOption[],
     timeoutMs: number | undefined,
+    signal: AbortSignal | undefined,
   ): Promise<Answer> =>
     new Promise<Answer>((resolve) => {
       // Already-closed manager: resolve immediately as 'cancel' so
@@ -416,18 +470,108 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         timeout: null,
       };
       queue.push(pending as Pending);
+      // Live update for an existing modal: a new ask just landed
+      // behind the active one. Bump the displayed `(+N waiting)`
+      // suffix so the operator sees the queue grow in real time
+      // — without this, only the snapshot at modal-open time
+      // would show, and any asks arriving afterward would be
+      // invisible until the operator answered. `drain()` below
+      // will be a no-op when active !== null, so no double-emit.
+      if (active !== null) {
+        bus.emit({
+          type: 'modal:queue-depth',
+          ts: now(),
+          promptId: active.promptId,
+          depth: queue.length,
+        });
+      }
+      // Cancel-on-resolve helper — wired by both the timeout and
+      // signal paths to keep the cleanup uniform. Two cases
+      // collapse to the same outcome:
+      //   - Active modal: same as Esc / resolveActive('cancel');
+      //     fires the answer event, drains the next from the
+      //     queue (drain emits its own queue-depth update for
+      //     the newly-active modal).
+      //   - Still queued: remove from queue, resolve the promise,
+      //     and emit queue-depth keyed to the active modal so
+      //     the visible `(+N waiting)` suffix corrects down
+      //     immediately. Without that emit the count would lie
+      //     until the active modal resolves and drain pops the
+      //     next.
+      // Idempotent: a second call on an already-resolved pending
+      // hits `pending.resolve` (no-op on settled promises) and
+      // `queue.indexOf` returns -1 (no double-emit). Safe under
+      // races between the timeout firing and the signal aborting.
+      const cancelPending = (): void => {
+        if (active !== null && active.pending === (pending as Pending)) {
+          // Active path: resolveActive detaches the abort
+          // listener AND clears the timeout for us. Single
+          // exit point, no per-branch cleanup duplication.
+          resolveActive('cancel');
+          return;
+        }
+        const idx = queue.indexOf(pending as Pending);
+        if (idx >= 0) queue.splice(idx, 1);
+        // Queued path: detach here too so a stale signal
+        // listener doesn't outlive the resolved pending, AND
+        // clear the scheduled timeout. Without the clearTimer
+        // a queued modal cancelled via signal would leave its
+        // timer running until it fires (no-op at fire time —
+        // pending.resolve is a no-op on settled promises — but
+        // the timer keeps the event loop alive longer than the
+        // run intended and adds avoidable callback churn for
+        // every aborted queued modal). Idempotent: clearTimer
+        // on an already-fired or already-cleared handle is a
+        // no-op.
+        pending.detachAbortListener?.();
+        if (pending.timeout !== null && pending.timeout !== undefined) {
+          clearTimer(pending.timeout);
+        }
+        pending.resolve('cancel' as Answer);
+        if (active !== null && idx >= 0) {
+          bus.emit({
+            type: 'modal:queue-depth',
+            ts: now(),
+            promptId: active.promptId,
+            depth: queue.length,
+          });
+        }
+      };
+
       if (timeoutMs !== undefined && timeoutMs > 0) {
-        pending.timeout = setTimer(() => {
-          // Timeout while ACTIVE: same as Esc (resolve cancel).
-          // Timeout while still queued: drop the entry and resolve.
-          if (active !== null && active.pending === (pending as Pending)) {
-            resolveActive('cancel');
-          } else {
-            const idx = queue.indexOf(pending as Pending);
-            if (idx >= 0) queue.splice(idx, 1);
-            pending.resolve('cancel' as Answer);
-          }
-        }, timeoutMs);
+        pending.timeout = setTimer(cancelPending, timeoutMs);
+      }
+      // Producer signal — wires the same cancel path as timeout.
+      // The signal handler runs at most once: AbortSignal listeners
+      // fire on the first abort and don't re-fire. `cancelPending`
+      // itself is idempotent over the pending entry's identity
+      // (resolve is a no-op after the promise already settled),
+      // so a late timer firing AFTER the signal already cancelled
+      // (or vice versa) is harmless.
+      if (signal !== undefined) {
+        if (signal.aborted) {
+          // Pre-aborted signal: cancel synchronously. We already
+          // pushed onto the queue, so cancelPending finds the
+          // entry and resolves immediately as cancel.
+          cancelPending();
+        } else {
+          signal.addEventListener('abort', cancelPending, { once: true });
+          // Track the listener so resolve paths that DON'T go
+          // through the abort itself (operator answer, Esc,
+          // timeout) can detach it. Without this, every modal
+          // that resolved naturally would leave a stale
+          // closure attached to `signal` until it eventually
+          // aborts — a problem for the subagent permission
+          // proxy where one per-session signal collects
+          // listeners across N asks and fires all of them as a
+          // useless O(n) burst when the channel finally closes.
+          // Local-bind `signal` so the closure narrows past
+          // the optional param.
+          const liveSignal = signal;
+          pending.detachAbortListener = () => {
+            liveSignal.removeEventListener('abort', cancelPending);
+          };
+        }
       }
       drain();
     });
@@ -444,9 +588,11 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           cwd: args.cwd,
           ...(args.rule !== undefined ? { rule: args.rule } : {}),
           ...(args.reason !== undefined ? { reason: args.reason } : {}),
+          ...(args.subagent !== undefined ? { subagent: args.subagent } : {}),
         }),
         PERMISSION_OPTIONS(args.toolName),
         opts?.timeoutMs,
+        opts?.signal,
       ),
     askTrust: (args, opts) =>
       enqueueConfirm<TrustAnswer>(
@@ -459,6 +605,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         }),
         TRUST_OPTIONS,
         opts?.timeoutMs,
+        opts?.signal,
       ),
     askHistoryClear: (args, opts) =>
       enqueueConfirm<HistoryClearAnswer>(
@@ -471,6 +618,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         }),
         HISTORY_CLEAR_OPTIONS,
         opts?.timeoutMs,
+        opts?.signal,
       ),
     askMemoryWrite: (args, opts) =>
       enqueueConfirm<MemoryWriteAnswer>(
@@ -484,6 +632,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         }),
         MEMORY_WRITE_OPTIONS,
         opts?.timeoutMs,
+        opts?.signal,
       ),
     askMemoryUserScope: (args, opts) =>
       enqueueConfirm<MemoryWriteAnswer>(
@@ -496,6 +645,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         }),
         MEMORY_USER_SCOPE_OPTIONS,
         opts?.timeoutMs,
+        opts?.signal,
       ),
     askMemoryAction: (args, opts) =>
       enqueueConfirm<MemoryWriteAnswer>(
@@ -511,6 +661,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         }),
         MEMORY_ACTION_OPTIONS,
         opts?.timeoutMs,
+        opts?.signal,
       ),
     pendingCount: () => (active !== null ? 1 : 0) + queue.length,
     close: () => {
@@ -530,6 +681,19 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
       drainList.push(...queue.splice(0));
       for (const p of drainList) {
         if (p.timeout !== null && p.timeout !== undefined) clearTimer(p.timeout);
+        // Detach the producer-signal abort listener (if any) for
+        // every drained pending. close() resolves the promises
+        // directly instead of routing through resolveActive /
+        // cancelPending, so neither of those cleanup callsites
+        // runs here. Without this loop, a long-lived caller that
+        // closes the manager while sharing one AbortSignal across
+        // many pending asks (subagent permission proxy) would
+        // leave N stale closures attached to the signal —
+        // retained until the signal eventually aborts, then
+        // firing as a useless O(n) burst. detachAbortListener is
+        // optional (only set when the ask supplied a signal), so
+        // the optional-chain call is safe for asks that didn't.
+        p.detachAbortListener?.();
         p.resolve('cancel');
       }
     },

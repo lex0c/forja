@@ -45,6 +45,8 @@ export {
   makeEvent,
   makeInterruptHard,
   makeInterruptSoft,
+  makePermissionAnswer,
+  makePermissionAsk,
   makeSessionFinished,
   makeSessionStart,
   makeShutdown,
@@ -58,6 +60,13 @@ export type {
   IpcEvent,
   IpcMessage,
   IpcTransport,
+  PermissionDecision,
   ProcessStreams,
   SubprocessStreams,
 } from './ipc.ts';
+export { createChildPermissionBridge } from './permission-bridge.ts';
+export type {
+  ChildPermissionBridge,
+  CreateChildPermissionBridgeOptions,
+  PermissionBridgeRequest,
+} from './permission-bridge.ts';

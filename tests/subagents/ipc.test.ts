@@ -10,6 +10,8 @@ import {
   makeEvent,
   makeInterruptHard,
   makeInterruptSoft,
+  makePermissionAnswer,
+  makePermissionAsk,
   makeSessionFinished,
   makeSessionStart,
   makeShutdown,
@@ -31,6 +33,15 @@ describe('IPC wire — encode/parse', () => {
       makeInterruptSoft(),
       makeInterruptHard(),
       makeShutdown(),
+      makePermissionAsk({
+        promptId: 'pid-1',
+        toolName: 'bash',
+        args: { command: 'ls' },
+        cwd: '/tmp/proj',
+        prompt: 'Run shell command?',
+      }),
+      makePermissionAnswer({ promptId: 'pid-1', decision: 'allow' }),
+      makePermissionAnswer({ promptId: 'pid-2', decision: 'deny' }),
     ];
     for (const msg of cases) {
       const line = encodeMessage(msg);
@@ -100,6 +111,37 @@ describe('IPC wire — encode/parse', () => {
       'session_start.missing_protocolVersion',
     ],
     ['{"type":"event","id":"x","ts":1}', 'event.missing_event'],
+    ['{"type":"permission:ask","id":"x","ts":1}', 'permission_ask.missing_promptId'],
+    ['{"type":"permission:ask","id":"x","ts":1,"promptId":"p"}', 'permission_ask.missing_toolName'],
+    [
+      '{"type":"permission:ask","id":"x","ts":1,"promptId":"p","toolName":"bash"}',
+      'permission_ask.missing_args',
+    ],
+    [
+      '{"type":"permission:ask","id":"x","ts":1,"promptId":"p","toolName":"bash","args":null}',
+      'permission_ask.missing_cwd',
+    ],
+    [
+      '{"type":"permission:ask","id":"x","ts":1,"promptId":"p","toolName":"bash","args":null,"cwd":"/c"}',
+      'permission_ask.missing_prompt',
+    ],
+    [
+      '{"type":"permission:ask","id":"x","ts":1,"promptId":"","toolName":"bash","args":null,"cwd":"/c","prompt":"q?"}',
+      'permission_ask.missing_promptId',
+    ],
+    ['{"type":"permission:answer","id":"x","ts":1}', 'permission_answer.missing_promptId'],
+    [
+      '{"type":"permission:answer","id":"x","ts":1,"promptId":"p"}',
+      'permission_answer.missing_decision',
+    ],
+    [
+      '{"type":"permission:answer","id":"x","ts":1,"promptId":"p","decision":"maybe"}',
+      'permission_answer.unknown_decision:maybe',
+    ],
+    [
+      '{"type":"permission:answer","id":"x","ts":1,"promptId":"p","decision":42}',
+      'permission_answer.missing_decision',
+    ],
   ])('parseLine refuses %j with reason %s', (input, expected) => {
     const r = parseLine(input);
     expect(r.ok).toBe(false);

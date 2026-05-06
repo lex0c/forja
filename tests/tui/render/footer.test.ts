@@ -201,6 +201,7 @@ describe('renderFooter', () => {
       options: [{ key: '1', label: 'OK', value: 'yes' }],
       selectedIndex: 0,
       hints: [],
+      queueDepth: 0,
     };
     expect(renderFooter(s, caps)).toBeNull();
   });

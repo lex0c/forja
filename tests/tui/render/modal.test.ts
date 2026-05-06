@@ -34,6 +34,7 @@ const baseModal = (overrides: Partial<ConfirmState> = {}): ConfirmState => ({
   options: PERM_OPTIONS,
   selectedIndex: PERM_OPTIONS.length - 1,
   hints: ['Esc to cancel'],
+  queueDepth: 0,
   ...overrides,
 });
 
@@ -135,6 +136,30 @@ describe('renderModal (UI.md §4.10.13 layout)', () => {
   test('color disabled emits no SGR escapes', () => {
     const out = renderModal(baseModal(), unicode);
     for (const line of out) expect(line).not.toContain(CSI);
+  });
+
+  test('queueDepth = 0 leaves the title bare (no suffix)', () => {
+    const out = renderModal(baseModal({ queueDepth: 0 }), unicode);
+    // Title block is rule + title + subject. The bold+ANSI wrap
+    // doesn't carry payload we care about here — just verify the
+    // raw `Run command` substring with no "(+N waiting)" tail.
+    expect(out[1]).toContain('Run command');
+    expect(out[1]).not.toContain('waiting');
+  });
+
+  test('queueDepth > 0 appends `(+N waiting)` to the title', () => {
+    const out = renderModal(baseModal({ queueDepth: 3 }), unicode);
+    expect(out[1]).toContain('Run command (+3 waiting)');
+  });
+
+  test('queueDepth = 1 still renders (singular vs plural not differentiated by design)', () => {
+    // Honest "(+1 waiting)" beats branching on plurals — depth is
+    // a count, the suffix wording is consistent. Lock the
+    // contract so a future "(+1 ask waiting)" vs "(+2 asks
+    // waiting)" branch doesn't sneak in without a deliberate
+    // decision.
+    const out = renderModal(baseModal({ queueDepth: 1 }), unicode);
+    expect(out[1]).toContain('Run command (+1 waiting)');
   });
 
   test('rule width tracks caps.cols', () => {
