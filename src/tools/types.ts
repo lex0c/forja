@@ -3,6 +3,7 @@ import type { HookChainResult, HookEventPayload } from '../hooks/index.ts';
 import type { MemoryRegistry } from '../memory/index.ts';
 import type { Decision, PermissionsView, PolicyCategory, ToolArgs } from '../permissions/index.ts';
 import type { ProviderToolInputSchema } from '../providers/index.ts';
+import type { SubagentHandleStore } from '../subagents/handle-store.ts';
 import type { WorktreeOutcome } from '../subagents/types.ts';
 import type { TodoStore } from '../todo/index.ts';
 
@@ -163,6 +164,18 @@ export interface ToolContext {
   // The harness binds parent_session_id from this context's
   // sessionId so the link is captured automatically.
   spawnSubagent?: (args: SpawnSubagentArgs) => Promise<SpawnSubagentResult>;
+  // Async subagent handle store (spec ORCHESTRATION.md §3). Set by
+  // the harness when a subagent registry is wired and the run is
+  // not in plan mode. `task_async` calls `store.spawn(args)` to
+  // get a handle; `task_await` and `task_cancel` use the same
+  // store instance. Run-scoped — the same store survives across
+  // every step in a single `runAgent` call so a handle returned
+  // in step 3 is awaitable in step 7. Drained in the run's outer
+  // finally so a parent abort tears every running spawn down
+  // before SQLite closes. Absent ⇒ the three async-subagent
+  // tools surface `subagent.unavailable` (matching the legacy
+  // `task` tool shape when no registry is configured).
+  subagentHandleStore?: SubagentHandleStore;
   // Memory subsystem registry (spec MEMORY.md). Set by the harness
   // when memory was wired via HarnessConfig.memoryRegistry. The
   // memory_read / memory_list / memory_search tools surface a

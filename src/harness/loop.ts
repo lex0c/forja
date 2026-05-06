@@ -24,6 +24,7 @@ import {
   listMessageTailBySession,
   reopenSession,
 } from '../storage/index.ts';
+import { type SubagentHandleStore, createSubagentHandleStore } from '../subagents/handle-store.ts';
 import type { PermissionDecision } from '../subagents/ipc.ts';
 import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
 import { type TodoStore, createTodoStore } from '../todo/index.ts';
@@ -46,6 +47,7 @@ import {
   type HarnessConfig,
   type HarnessEvent,
   type HarnessResult,
+  MAX_CONCURRENT_SUBAGENTS_CAP,
   MAX_CONCURRENT_TOOL_CALLS_CAP,
   type RunBudget,
 } from './types.ts';
@@ -184,6 +186,23 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // closure so the outer-finally cleanup hook can find it whether
   // we exited normally or through guardedFinish.
   let bgManager: BgManager | undefined;
+  // Run-scoped subagent handle store (spec ORCHESTRATION.md §3,
+  // task_async family). Created after sessionId resolves —
+  // identical lifecycle window as bgManager. Drained in the outer
+  // finally so a hard parent abort still tears every running
+  // spawn down before SQLite closes. Stays undefined when no
+  // subagent registry is wired (mirrors `task` tool's behavior).
+  let subagentHandleStore: SubagentHandleStore | undefined;
+  // Run-scoped subagent spawn implementation. Captures the run's
+  // sessionId, signal, depth, and config; accepts an optional
+  // per-call signal override that the handle store wires per
+  // handle so `task_cancel` can preempt one child without
+  // disturbing siblings. The legacy synchronous `task` tool uses
+  // it WITHOUT an override (defaults to the run signal), so both
+  // task surfaces share the same dispatcher.
+  let spawnSubagentImpl:
+    | ((args: SpawnSubagentArgs, signalOverride?: AbortSignal) => Promise<SpawnSubagentResult>)
+    | undefined;
   // Per-session CheckpointManager. Lifecycle parallels bgManager:
   // created after sessionId is resolved (the manager carries it),
   // used inline before tool execution, and otherwise just lives on
@@ -605,6 +624,142 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               });
             }
           },
+        });
+      }
+
+      // Subagent dispatcher + handle store. Wired only when a
+      // subagent registry is configured; both `task` (sync) and the
+      // `task_async` family (async) flow through `spawnSubagentImpl`,
+      // which centralizes the runSubagent option assembly and lets
+      // callers pass a per-call signal override. The store wraps
+      // the impl with bounded-concurrency slot semantics so multiple
+      // `task_async` calls overlap up to the cap.
+      if (config.subagentRegistry !== undefined) {
+        spawnSubagentImpl = async (args, signalOverride) => {
+          const registry = config.subagentRegistry;
+          if (registry === undefined) {
+            return { kind: 'unknown_subagent', requested: args.name, available: [] };
+          }
+          const def = registry.byName.get(args.name);
+          if (def === undefined) {
+            return {
+              kind: 'unknown_subagent',
+              requested: args.name,
+              available: Array.from(registry.byName.keys()).sort(),
+            };
+          }
+          // Depth check happens here (before runSubagent's own
+          // throw) so the model gets a recoverable tool error
+          // instead of a wrapped exception. The tool surface
+          // distinguishes "you passed a bad name"
+          // (unknown_subagent) from "you nested too deep"
+          // (depth_exceeded) — both are model-fixable.
+          const childDepth = (config.subagentDepth ?? 0) + 1;
+          if (childDepth > MAX_SUBAGENT_DEPTH) {
+            return {
+              kind: 'depth_exceeded',
+              requested: args.name,
+              depth: childDepth,
+              maxDepth: MAX_SUBAGENT_DEPTH,
+            };
+          }
+          // Validate child's whitelist against the ROOT registry
+          // (full toolset), NOT against this harness's `toolRegistry`
+          // (which is narrowed to OUR own whitelist when we're a
+          // subagent). A coordinator subagent with `tools: [task]`
+          // must still be able to spawn a worker with
+          // `tools: [read_file]` even though it doesn't have
+          // `read_file` itself.
+          const rootRegistry = config.rootToolRegistry ?? config.toolRegistry;
+          // Combine the run's signal with the optional per-call
+          // override. Both must be live at the same time: the run
+          // signal carries hard-abort + wall-clock from the parent;
+          // the override is the per-handle controller `task_cancel`
+          // flips. `AbortSignal.any` handles the case where the
+          // override is undefined (returns the run signal directly,
+          // no wrapping cost).
+          const combinedSignal =
+            signalOverride === undefined ? signal : AbortSignal.any([signal, signalOverride]);
+          const child = await runSubagent({
+            definition: def,
+            prompt: args.prompt,
+            parentSessionId: sessionId,
+            provider: config.provider,
+            parentToolRegistry: rootRegistry,
+            permissionEngine: config.permissionEngine,
+            db: config.db,
+            cwd: config.cwd,
+            ...(config.onEvent !== undefined ? { onChildEvent: config.onEvent } : {}),
+            ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
+            signal: combinedSignal,
+            ...(config.softStopSignal !== undefined
+              ? { softStopSignal: config.softStopSignal }
+              : {}),
+            subagentRegistry: registry,
+            ...(config.planMode === true ? { planMode: true } : {}),
+            ...(config.isCwdTrusted === true ? { cwdTrusted: true } : {}),
+            ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
+            depth: childDepth,
+            // Permission proxy (spec docs/spec/IPC.md §7).
+            // Forward only when the parent has a `confirmPermission`
+            // callback wired (REPL does; one-shot / headless do
+            // not). Local rebind so the narrowed type survives
+            // across the async closure (the outer
+            // `config.confirmPermission !== undefined` guard
+            // wouldn't follow a member access through the promise
+            // hop).
+            ...((): {
+              onPermissionAsk?: (req: {
+                toolName: string;
+                args: Record<string, unknown>;
+                cwd: string;
+                prompt: string;
+                subagent: { sessionId: string; name: string };
+                signal: AbortSignal;
+              }) => Promise<PermissionDecision>;
+            } => {
+              const ask = config.confirmPermission;
+              if (ask === undefined) return {};
+              return {
+                onPermissionAsk: async (req) => {
+                  const allowed = await ask({
+                    toolName: req.toolName,
+                    args: req.args,
+                    cwd: req.cwd,
+                    prompt: req.prompt,
+                    subagent: req.subagent,
+                    signal: req.signal,
+                  });
+                  return allowed ? 'allow' : 'deny';
+                },
+              };
+            })(),
+          });
+          return {
+            kind: 'ran',
+            output: child.output,
+            sessionId: child.sessionId,
+            status: child.status,
+            reason: child.reason,
+            costUsd: child.costUsd,
+            steps: child.steps,
+            durationMs: child.durationMs,
+            ...(child.auditFailure !== undefined ? { auditFailure: child.auditFailure } : {}),
+            ...(child.worktree !== undefined ? { worktree: child.worktree } : {}),
+            ...(child.worktreeError !== undefined ? { worktreeError: child.worktreeError } : {}),
+          };
+        };
+        const subagentCap = Math.max(
+          1,
+          Math.min(budget.maxConcurrentSubagents, MAX_CONCURRENT_SUBAGENTS_CAP),
+        );
+        // The store's spawnFn always passes the per-handle signal
+        // through. The captured spawnSubagentImpl above combines it
+        // with the run signal.
+        const impl = spawnSubagentImpl;
+        subagentHandleStore = createSubagentHandleStore({
+          cap: subagentCap,
+          spawnFn: async (args, perHandleSignal) => impl(args, perHandleSignal),
         });
       }
 
@@ -1117,204 +1272,23 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // N times, and so the parallel path can dispatch through
         // the same `invokeOne` worker the serial path uses.
 
-        // spawnSubagent closure: only wired when the caller supplied
-        // a subagent registry. The closure binds the *current*
-        // sessionId as the parent id at call time so a child knows
-        // exactly which session spawned it. Each `task` invocation
-        // produces a fresh child session row; recursion is allowed
-        // (a child can task() further children) because the child
-        // harness propagates the same registry down.
+        // Bridge from the run-scoped `spawnSubagentImpl` to the
+        // legacy synchronous tool surface. The legacy `task` tool
+        // expects `(args) => Promise<SpawnSubagentResult>`; the run
+        // impl exposes a richer `(args, signalOverride?)` shape so
+        // the handle store can carry a per-handle signal. Bridging
+        // here keeps the existing tool surface unchanged while
+        // letting both spawn paths share one dispatcher. Captured
+        // into a local const FIRST so TS keeps the narrowed type
+        // across the closure body — `let` declarations can re-widen
+        // inside a lambda, breaking the `=== undefined` narrowing.
+        const stableImpl = spawnSubagentImpl;
         const spawnSubagentClosure:
           | ((args: SpawnSubagentArgs) => Promise<SpawnSubagentResult>)
           | undefined =
-          config.subagentRegistry === undefined
+          stableImpl === undefined
             ? undefined
-            : async (args: SpawnSubagentArgs): Promise<SpawnSubagentResult> => {
-                const registry = config.subagentRegistry;
-                if (registry === undefined) {
-                  return {
-                    kind: 'unknown_subagent',
-                    requested: args.name,
-                    available: [],
-                  };
-                }
-                const def = registry.byName.get(args.name);
-                if (def === undefined) {
-                  return {
-                    kind: 'unknown_subagent',
-                    requested: args.name,
-                    available: Array.from(registry.byName.keys()).sort(),
-                  };
-                }
-                // Depth check happens here (before runSubagent's
-                // own throw) so the model gets a recoverable tool
-                // error instead of a wrapped exception. The tool
-                // surface distinguishes "you passed a bad name"
-                // (unknown_subagent) from "you nested too deep"
-                // (depth_exceeded) — both are model-fixable.
-                const childDepth = (config.subagentDepth ?? 0) + 1;
-                if (childDepth > MAX_SUBAGENT_DEPTH) {
-                  return {
-                    kind: 'depth_exceeded',
-                    requested: args.name,
-                    depth: childDepth,
-                    maxDepth: MAX_SUBAGENT_DEPTH,
-                  };
-                }
-                // Validate child's whitelist against the ROOT
-                // registry (full toolset), NOT against this
-                // harness's `toolRegistry` (which is narrowed to
-                // OUR own whitelist when we're a subagent). A
-                // coordinator subagent with `tools: [task]` must
-                // still be able to spawn a worker with
-                // `tools: [read_file]` even though it doesn't have
-                // `read_file` itself.
-                const rootRegistry = config.rootToolRegistry ?? config.toolRegistry;
-                const child = await runSubagent({
-                  definition: def,
-                  prompt: args.prompt,
-                  parentSessionId: sessionId,
-                  provider: config.provider,
-                  parentToolRegistry: rootRegistry,
-                  permissionEngine: config.permissionEngine,
-                  db: config.db,
-                  cwd: config.cwd,
-                  // Live observability (S2 of subagent IPC).
-                  // Forward the parent's onEvent so subagent_*
-                  // HarnessEvents (start/progress/finished) flow
-                  // into the same channel the parent's TUI
-                  // adapter already listens on. The runtime
-                  // implies `ipc: true` automatically when
-                  // onChildEvent is set — without the wire there
-                  // are no progress events to observe between the
-                  // brackets.
-                  ...(config.onEvent !== undefined ? { onChildEvent: config.onEvent } : {}),
-                  // Hook-chain snapshot (migration 020). Always
-                  // forward the parent's resolved chain — even
-                  // when empty — so the child seals it into its
-                  // audit row instead of re-resolving from disk.
-                  // Empty `[]` is AUTHORITATIVE (parent had no
-                  // hooks); the previous `length > 0` gate
-                  // collapsed empty into the legacy disk-fallback
-                  // path, which let edits to `hooks.toml`
-                  // between spawn and child read add policy the
-                  // parent never validated — defeating the
-                  // migration's drift-prevention guarantee for
-                  // hookless parents (the case where any disk
-                  // hit is a NET ADDITION of policy).
-                  ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
-                  // Propagate combined parent signal: a Ctrl+C or
-                  // wall-clock timeout on the parent must abort
-                  // the child run too. The child builds its own
-                  // wall-clock on top of this.
-                  signal,
-                  // Forward the cooperative-stop signal —
-                  // runSubagent threads it across to the child via
-                  // IPC, so Esc-during-task routes to the child's
-                  // harness as `interrupt:soft` and the child exits
-                  // at its next step boundary.
-                  ...(config.softStopSignal !== undefined
-                    ? { softStopSignal: config.softStopSignal }
-                    : {}),
-                  // Forward the registry so the child can task()
-                  // further children. Same set, same names.
-                  subagentRegistry: registry,
-                  // Plan mode is a global property of the run; the
-                  // child inherits it so a write tool in its
-                  // whitelist still trips the harness gate inside
-                  // the child loop. Defense in depth — the parent's
-                  // gate already refused `task` itself in plan mode,
-                  // but a future bypass would still be contained.
-                  ...(config.planMode === true ? { planMode: true } : {}),
-                  // Trust verdict (spec §9): per-project, sealed
-                  // from the parent's bootstrap. Forwarding
-                  // unconditionally so the child runs under the
-                  // same verdict, instead of re-resolving (which
-                  // would fail-close on worktree paths and could
-                  // observe a stale verdict if the operator
-                  // updated trust mid-run). Default-false in
-                  // config maps cleanly to absent flag → child
-                  // defaults `isCwdTrusted=false`.
-                  ...(config.isCwdTrusted === true ? { cwdTrusted: true } : {}),
-                  // Sampling temperature is also a run-wide property.
-                  // The harness uses it for its own provider calls
-                  // (line ~594); subagent runs MUST inherit so that
-                  // eval / automation pipelines pinning
-                  // temperature=0 see deterministic behavior across
-                  // the entire chain. Without this forward, the
-                  // subprocess child would silently fall back to
-                  // the provider default and break reproducibility.
-                  ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
-                  // Increment depth: the child being spawned is one
-                  // level deeper than this run.
-                  depth: childDepth,
-                  // Permission proxy (spec docs/spec/IPC.md §7).
-                  // Forward only when the parent has a
-                  // `confirmPermission` callback wired (REPL
-                  // does; one-shot / headless do not). Without
-                  // an operator surface there's no human to
-                  // ask; the runtime auto-denies on absence so
-                  // the child's bridge gets a prompt deny
-                  // instead of hanging until wall-clock. The
-                  // adapter maps the boolean answer onto the
-                  // wire decision; subagent attribution is
-                  // baked in by the runtime, so the closure
-                  // doesn't need to thread sessionId / name
-                  // through itself. Local rebind so the
-                  // narrowed type survives across the async
-                  // closure (the outer `config.confirmPermission
-                  // !== undefined` guard wouldn't follow a
-                  // member access through the promise hop).
-                  ...((): {
-                    onPermissionAsk?: (req: {
-                      toolName: string;
-                      args: Record<string, unknown>;
-                      cwd: string;
-                      prompt: string;
-                      subagent: { sessionId: string; name: string };
-                      signal: AbortSignal;
-                    }) => Promise<PermissionDecision>;
-                  } => {
-                    const ask = config.confirmPermission;
-                    if (ask === undefined) return {};
-                    return {
-                      onPermissionAsk: async (req) => {
-                        const allowed = await ask({
-                          toolName: req.toolName,
-                          args: req.args,
-                          cwd: req.cwd,
-                          prompt: req.prompt,
-                          subagent: req.subagent,
-                          // Forward the per-session abort so
-                          // the modal closes when the child
-                          // dies — without this, an operator
-                          // staring at a modal for a dead
-                          // subagent would have to manually
-                          // dismiss it (and the answer would
-                          // go into a closed channel anyway).
-                          signal: req.signal,
-                        });
-                        return allowed ? 'allow' : 'deny';
-                      },
-                    };
-                  })(),
-                });
-                return {
-                  kind: 'ran',
-                  output: child.output,
-                  sessionId: child.sessionId,
-                  status: child.status,
-                  reason: child.reason,
-                  costUsd: child.costUsd,
-                  steps: child.steps,
-                  durationMs: child.durationMs,
-                  ...(child.auditFailure !== undefined ? { auditFailure: child.auditFailure } : {}),
-                  ...(child.worktree !== undefined ? { worktree: child.worktree } : {}),
-                  ...(child.worktreeError !== undefined
-                    ? { worktreeError: child.worktreeError }
-                    : {}),
-                };
-              };
+            : (args: SpawnSubagentArgs): Promise<SpawnSubagentResult> => stableImpl(args);
 
         const buildCtx = (tu: CollectedToolUse): ToolContext => ({
           signal,
@@ -1327,6 +1301,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           todoStore,
           ...(bgManager !== undefined ? { bgManager } : {}),
           ...(spawnSubagentClosure !== undefined ? { spawnSubagent: spawnSubagentClosure } : {}),
+          ...(subagentHandleStore !== undefined ? { subagentHandleStore } : {}),
           ...(config.memoryRegistry !== undefined ? { memoryRegistry: config.memoryRegistry } : {}),
           ...(config.confirmMemoryWrite !== undefined
             ? { confirmMemoryWrite: config.confirmMemoryWrite }
@@ -1742,6 +1717,24 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         await checkpointsPurgeInFlight;
       } catch {
         // Already swallowed at construction; defensive.
+      }
+    }
+    // Drain the subagent handle store before bgManager cleanup —
+    // each subagent run holds its own bg processes, and we want
+    // those rows to land before the parent's bg manager tears
+    // its own pids down. Drain cancels every still-running record
+    // and awaits all promises (including the cancelled-before-
+    // dispatch synthesis), so a hard parent abort still leaves
+    // children with a clean termination point. Errors are
+    // swallowed; the store's allSettled already absorbs them.
+    if (subagentHandleStore !== undefined) {
+      try {
+        await subagentHandleStore.drain();
+      } catch {
+        // Defensive — drain itself uses Promise.allSettled, so
+        // this shouldn't fire in practice. Catching keeps the
+        // cleanup path resilient to any future code path that
+        // synchronously throws before the await.
       }
     }
     if (bgManager !== undefined) {

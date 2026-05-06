@@ -100,6 +100,163 @@ has zero ordering constraints.
 
 ---
 
+## [2026-05-06] parallel / slice 2 — `task_async` family (kickoff)
+
+Slice 2 on `feat/parallel`. Closes the gap between
+`ORCHESTRATION.md §3` ("`task_sync` em sequência ⇒ subagents
+**sequenciais**. Pra paralelismo: `task_async`") and the current
+code: `task` is the only spawn surface today; the model can't
+overlap multiple subagent runs in a single turn — three
+`task("explore", …)` calls add up to 3× wall-clock.
+
+**Plan:**
+
+1. **`SubagentHandleStore`** (`src/subagents/handle-store.ts`):
+   session-scoped registry keyed by handle id. Methods:
+   - `spawn(args)`: returns handle synchronously; the underlying
+     `runSubagent` call is queued behind a counted-slot semaphore
+     capped at `maxConcurrentSubagents` (default 3, cap 8 per
+     `ORCHESTRATION.md §11`). The promise inside the record
+     blocks on slot acquisition, then dispatches via the
+     harness-provided `spawnFn`. Slot release fires in `finally`
+     so a throw still frees the slot.
+   - `await(id, timeoutMs?, signal?)`: races the record's
+     promise against an optional timeout + abort. Caches the
+     settled result so multiple awaits on the same handle return
+     the same envelope (idempotent).
+   - `cancel(id)`: aborts the per-handle controller; idempotent
+     on unknown / already-settled handles.
+   - `drain()`: cancels every running record and awaits settle.
+     Called from the run's outer finally so a hard parent abort
+     still tears children down before `db.close()`.
+
+2. **Harness wiring** (`src/harness/loop.ts`,
+   `src/harness/types.ts`):
+   - `RunBudget.maxConcurrentSubagents: number` (default 3).
+   - `MAX_CONCURRENT_SUBAGENTS_CAP = 8` exported.
+   - Refactor `spawnSubagentClosure` to accept a per-call signal
+     override. The store-driven `spawnFn` combines the parent's
+     signal with each handle's controller via `AbortSignal.any`,
+     so `task_cancel(h)` aborts only that child while a parent
+     Ctrl+C still cascades to all of them.
+   - Run-scoped (not step-scoped) store. Created right after
+     `sessionId` resolves; threaded through `ToolContext`. The
+     outer finally awaits `store.drain()` before reaping bg.
+   - Spec §3.6 cancel-cascading already works because parent
+     signal forwards into child runs; the new piece is just the
+     per-handle layer on top.
+
+3. **Three tools** (`src/tools/builtin/task-async.ts`,
+   `task-await.ts`, `task-cancel.ts`):
+   - `task_async({ subagent, prompt })`
+     → `{ handle_id, name, spawned_at }`
+   - `task_await({ handle_id, timeout_ms? })`
+     → SubagentOutput (same shape as `task` tool's result on
+     `done`; surfaces non-`done` exits as tool errors with
+     details — same mapping as `task`).
+   - `task_cancel({ handle_id })`
+     → `{ cancelled, reason? }` where `reason` is `unknown` /
+     `already_settled` for idempotent paths.
+   - Plan-mode: blocked, same as `task`.
+   - Register in `src/tools/builtin/index.ts`.
+
+**Decisions (kickoff):**
+
+- **Single spawnFn shared between sync and async paths.** The
+  existing in-step `spawnSubagentClosure` is the right one to
+  reuse — but it captures the step's `signal` rather than
+  accepting one. Refactor: closure takes an optional signal arg,
+  fallback to step signal. The handle store calls it with the
+  combined per-handle signal; the legacy sync `task` keeps the
+  step-signal default. One source of truth, two callers.
+- **Handle is an object, not a bare string.** `task_async`
+  returns `{ handle_id, name, spawned_at }`. `task_await` /
+  `task_cancel` accept just `{ handle_id }`. The model gets the
+  name back so its planning text can refer to the spawn ("waiting
+  on the explore handle") without re-deriving from the prompt.
+- **`task_await` caches result for repeat calls.** Spec §3.4
+  shows `Promise.all(handles.map(task_await))` style — the
+  store's settled cache makes a re-await on the same handle a
+  no-op that returns the same envelope (timestamp invariance).
+  Useful when a parent's later step revisits a handle for a
+  recap.
+- **Drain on session end.** Spec §3.6 ("Cancel cascading") — the
+  parent's outer finally calls `store.drain()` after the inner
+  loop exits. Equivalent to `task_cancel` on every running
+  handle. Needed even on clean exit so an orphaned async spawn
+  doesn't outlive its session lock.
+- **Budget shared, not pre-allocated, deferred.** Spec §3.5 calls
+  out budget contention semantics ("subagent ativo recebe sinal
+  de finalizar; novos spawns rejeitam com `budget_exhausted`").
+  Implementing the full cross-subagent budget reconciler is its
+  own slice (the parent's `maxCostUsd` already terminates the
+  parent run when crossed; the children inherit that signal via
+  the parent abort path). Anything beyond "parent dies → children
+  die" lands in a follow-up slice.
+
+**Pending:**
+
+- `SubagentHandleStore` module + unit tests
+- Harness wiring + budget field + ToolContext extension
+- 3 new tools + index registration
+- E2E test driving task_async + task_await across steps
+- Closeout entry
+
+**Next:** start with the store module — it's the load-bearing
+piece every other change builds on.
+
+---
+
+## [2026-05-06] parallel / slice 2 — `task_async` family lands
+
+Slice 2 closed on `feat/parallel`. The model now has a non-blocking
+spawn surface: `task_async` returns a handle synchronously while the
+underlying `runSubagent` queues behind a counted-slot semaphore;
+`task_await` collects the envelope (with optional timeout); `task_cancel`
+preempts. Multiple `task_async` calls in one turn overlap up to
+`maxConcurrentSubagents` (default 3, cap 8). The legacy `task` tool
+keeps its synchronous shape — both spawn paths now share one
+dispatcher (`spawnSubagentImpl`) so a future change to runSubagent
+options doesn't drift between them.
+
+**Files:**
+
+| File | Change |
+|---|---|
+| `src/subagents/handle-store.ts` | NEW. ~280 LoC. `SubagentHandleStore` interface + `createSubagentHandleStore` factory. Methods: `spawn`, `awaitHandle`, `cancel`, `list`, `inFlightCount`, `drain`. Slot semaphore caps in-flight at `cap`; queued spawns wait for slot release; pre-dispatch cancel synthesizes a `cancelled_before_dispatch` envelope. spawnFn throw collapses into a synthesized error envelope (status `error`, reason `spawn_failed`) so `awaitHandle` always returns `kind: 'done'` on a settled record — consumers don't need try/catch around the await result. |
+| `src/harness/types.ts` | `RunBudget.maxConcurrentSubagents: number` (default 3). New exported `MAX_CONCURRENT_SUBAGENTS_CAP = 8`. |
+| `src/tools/types.ts` | `ToolContext.subagentHandleStore?: SubagentHandleStore`. |
+| `src/harness/loop.ts` | Lifted the in-step `spawnSubagentClosure` body into a run-scoped `spawnSubagentImpl: (args, signalOverride?) => Promise<SpawnSubagentResult>` declared at the start of the run and initialized right after `bgManager`. The new arg accepts a per-handle signal; the impl combines it with the run signal via `AbortSignal.any` so per-handle cancel still cascades on parent abort. The legacy `spawnSubagentClosure` is now a one-line bridge that captures the impl into a stable const and forwards `(args)` through. The handle store's `spawnFn` calls the impl with the per-handle signal. Drain runs in the outer finally BEFORE bgManager cleanup so child bg processes settle first. `subagentHandleStore` threaded through `buildCtx`. |
+| `src/tools/builtin/task-async.ts` | NEW. `task_async({ subagent, prompt }) → { handle_id, name, spawned_at }`. Same prompt cap as `task` (32 KiB). Plan-mode: blocked. |
+| `src/tools/builtin/task-await.ts` | NEW. `task_await({ handle_id, timeout_ms? }) → SubagentOutput`. Maps store outcomes: `unknown` → `subagent.unknown_handle`, `timeout` → `subagent.await_timeout` (retryable), `aborted` → `tool.aborted`, `done` with non-`done` status → `subagent.run_failed` (mirrors `task`). Plan-mode: blocked. |
+| `src/tools/builtin/task-cancel.ts` | NEW. `task_cancel({ handle_id }) → { cancelled, reason? }`. Idempotent — unknown / settled handles return `cancelled: false` with a reason rather than failing. Plan-mode: ALLOWED (cancellation is read-only relative to the working tree). |
+| `src/tools/builtin/index.ts` | Registers the three new tools next to `taskTool`. |
+| `tests/cli/bootstrap.test.ts` | Tool-list expectation extended with `task_async` / `task_await` / `task_cancel`. |
+| `tests/tools/_helpers.ts` | `makeCtx` accepts `subagentHandleStore` override. |
+| `tests/subagents/handle-store.test.ts` | NEW, 13 tests: spawn happy path, repeat-await cache, cap honored under burst, cancel during run, cancel before dispatch (queued), unknown / settled cancel idempotency, unknown await, timeout, external-signal abort, drain, spawnFn throw → synthesized error envelope, inFlightCount tracking. |
+| `tests/tools/task-async.test.ts` | NEW, 9 tests: round-trip, sequential awaits across multiple handles, cancel during run, idempotent cancel on unknown / settled, timeout retry path, unknown await, all-three-tools `subagent.unavailable` when store missing, input validation. |
+
+**Decisions (closeout):**
+
+- **D161 — Single `spawnSubagentImpl` shared between sync and async paths.** The pre-existing in-step `spawnSubagentClosure` had ~190 LoC of `runSubagent` option assembly captured by closure on `signal` / `sessionId` / `config.*`. Inlining the same logic into the handle store's `spawnFn` would have duplicated that surface. Hoisting it into a run-scoped impl that takes an optional signal override gives BOTH callers (legacy `task` AND the store) one source of truth for the runSubagent contract. The legacy bridge is now a 4-line const that captures the narrowed impl into a stable local before forwarding — necessary because TS re-widens `let`-declared optional types inside a closure body, breaking the `=== undefined` narrowing the outer guard established.
+- **D162 — Pre-dispatch cancel synthesizes its own envelope.** When a cancel lands while a record is still queued behind the slot semaphore (cap=1, three spawns in flight), the spawn's promise body sees `controller.signal.aborted === true` BEFORE calling `spawnFn`. The store could let `runSubagent` detect this for itself, but `runSubagent` would then create a child session row + audit entries for a run that never executed any work — pollution. Synthesizing `{ status: 'interrupted', reason: 'cancelled_before_dispatch' }` directly skips that machinery; the only observable difference is `sessionId === ''` (no row created). The model's `task_await` maps it onto `subagent.run_failed` like any other interrupted exit, so the wire shape is uniform.
+- **D163 — `task_cancel` is `planSafe: true`; the spawn tools are not.** Plan mode blocks `task` / `task_async` / `task_await` because the underlying child run might write. But `task_cancel` only stops a run that's already in flight — it doesn't write to the working tree, and refusing it would strand a leftover handle the operator inherits from a non-plan-mode session. Allowing it gives a clean cleanup path even when plan mode is on. (The child being cancelled may itself have written before the cancel landed, but that's not a NEW write caused by the cancel.)
+- **D164 — `task_await` is `idempotent: true` despite observing a non-idempotent child.** The TOOL's behavior is deterministic: on a settled handle the cached envelope is returned byte-for-byte regardless of how many times you call it. The CHILD's run is not idempotent — but `task_async` carries that property in its own metadata (`idempotent: false`), and `task_await` is just a collector. The distinction matters for the harness's degenerate-loop hash check: a turn that emits `task_async + task_await + task_await` for the same handle won't hash-collide on the await calls because the inputs include the handle id, but even if it did, the second await is the cached read.
+- **D165 — Drain runs BEFORE bgManager cleanup in the outer finally.** Each subagent run holds its own bg processes (the child harness opens its own bg manager). When the parent drains its handle store, every child run reaches its terminal state; the children's `bg_ended` events land BEFORE the parent's bgManager.cleanup() walks its own pid table. Reversing the order would race the child's bg manager against the parent's cleanup and could leave child bg rows in `running` status forever. Cheap ordering invariant; tests under `tests/subagents/` already cover the bg lifecycle on its own, so this slice doesn't add bg-specific tests.
+- **D166 — `cancelled_before_dispatch` test pre-dispatch path uses cap=1.** The test "cancel before dispatch (queued at cap) yields cancelled_before_dispatch" forces a queued spawn by setting cap=1, dispatching one slow spawn, then a second one that queues. The "cancel aborts a running spawn" test, in contrast, has to wait for the spawnFn to ENTER its sleep (yields ~20ms past the microtask boundary) so the cancel lands DURING the spawnFn body and the spawnFn's catch branch fires. Both paths are valid; tests assert each by construction.
+
+**Pending:**
+
+- None for this slice.
+
+**Next:** branch ready for review / merge into `develop`. Optional
+follow-ups: cross-subagent budget reconciliation (spec §3.5 — the
+slice deliberately deferred this), eval covering "3 task_async +
+3 task_await in one turn" (in line with the existing
+`parallel_safe` eval idea at line 9195).
+
+---
+
 ## [2026-05-06] parallel / slice 1 — `parallel_safe` opt-in lands
 
 Slice 1 closed on `feat/parallel`. The step loop now opts into a

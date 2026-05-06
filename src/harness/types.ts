@@ -255,6 +255,18 @@ export interface RunBudget {
   // serial path live for every step). The harness clamps to
   // [1, 16] internally.
   maxConcurrentToolCalls: number;
+  // Maximum number of in-flight `task_async` subagent spawns
+  // for this run. The handle store admits more `spawn` calls
+  // than the cap (handles return immediately) but only
+  // `maxConcurrentSubagents` of them are dispatched into a
+  // child run at any moment; the rest queue. Spec
+  // `ORCHESTRATION.md §11`: default 3, hard cap 8.
+  //
+  // Setting `1` collapses `task_async` to "spawn-immediately
+  // but only one runs at a time", which is observable as
+  // serial-but-with-handles. Useful for budget-constrained
+  // runs that still want to use the handle/await surface.
+  maxConcurrentSubagents: number;
 }
 
 export const DEFAULT_BUDGET: RunBudget = {
@@ -266,6 +278,7 @@ export const DEFAULT_BUDGET: RunBudget = {
   compactionThreshold: 0.7,
   compactionPreserveTail: 3,
   maxConcurrentToolCalls: 5,
+  maxConcurrentSubagents: 3,
 };
 
 // Hard cap for the parallel pool — even an explicit caller config of
@@ -273,6 +286,12 @@ export const DEFAULT_BUDGET: RunBudget = {
 // pressure (file descriptors, SQLite WAL writers, hook chain fanout).
 // Mirrors `ORCHESTRATION.md §11`.
 export const MAX_CONCURRENT_TOOL_CALLS_CAP = 16;
+
+// Hard cap for `task_async` slot semaphore. Mirrors
+// `ORCHESTRATION.md §11`. The harness clamps `maxConcurrentSubagents`
+// to `[1, 8]` at the consumer; configs that ask for more are
+// silently capped (operator gets the cap behavior, not a refusal).
+export const MAX_CONCURRENT_SUBAGENTS_CAP = 8;
 
 // Why the loop stopped. `done` is the only success path; everything else
 // is the harness intervening for safety or budget reasons.
