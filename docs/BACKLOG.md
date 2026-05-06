@@ -15,6 +15,54 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — wire-shape completion (task_sync alias, timing, soft-stop D173)
+
+Closing three of the gaps that the post-review inventory still
+listed as open before this branch can ship — wire-shape items
+(`task_sync` alias) and decision-affirming items (soft-stop
+mid-batch). None deferred as follow-ups; subsystem is closed on
+each.
+
+| File | Change |
+|---|---|
+| `src/tools/builtin/task.ts` | New `taskSyncTool` — same execute / metadata / inputSchema as `taskTool`, just `name: 'task_sync'`. Spec ORCHESTRATION.md §3.1 names `task_sync` as canonical and `task` as the legacy alias; both now exist on the wire. |
+| `src/tools/builtin/index.ts` | `taskSyncTool` registered + exported. |
+| `src/harness/loop.ts` | Soft-stop comment in the parallel branch rewritten: split hard-abort and soft-abort cases, document D173 explicitly. The behavior was already correct; the comment now states it. |
+| `tests/cli/bootstrap.test.ts` | Tool list expectation extended with `task_sync`. |
+| `tests/harness/parallel.test.ts` | (a) Replaced the timing-based assertion (`elapsed < 220ms`, CI-flake risk) with `tracker.max === 3` — stronger, deterministic, and fails loudly under any silent throttle. (b) New test "soft-stop fired mid-batch lets the batch complete; loop bails at next step (D173)" verifies that workers do NOT inspect `softStopSignal` mid-batch, the batch completes atomically, and the next top-of-step check exits with `aborted/'soft'` before the next provider call. |
+
+**Decisions:**
+
+- **D173 — Soft-stop is honored at step boundary, not mid-batch.** Spec
+  cooperative-stop semantics is "complete the current step". For
+  the parallel branch the BATCH is the step's tool-execution unit;
+  workers therefore do not inspect `softStopSignal` once dispatched.
+  The pool settles every worker, tool_results persist normally,
+  and the next top-of-step soft check exits before the next
+  provider call. Per-worker soft inspection would synthesize
+  `aborted` tool_results for siblings that hadn't yet started —
+  a hybrid the spec doesn't describe and the model would have
+  to translate. This decision is enforced by a regression test;
+  flipping it requires a spec PR first.
+
+- **`task_sync` alias is the canonical name.** The spec called it out
+  in §3.1 ("`task` (alias legado) = `task_sync`"); we'd been
+  shipping only `task` and diverging silently. Both names now
+  resolve through `spawnSubagentImpl`; audit rows carry whichever
+  the model invoked.
+
+- **Test moved from timing to deterministic counter.** The previous
+  threshold `expect(elapsed).toBeLessThan(220)` was informational;
+  the load-bearing assertion was always the tracker. Asking
+  `tracker.max === 3` (cap=5, batch=3) on a parallelism test
+  means the test fails iff the harness silently serializes or
+  throttles below the cap.
+
+Verification: typecheck clean, lint clean, 3059 pass / 0 fail /
+10 skip (1 new test).
+
+---
+
 ## [2026-05-06] parallel — pre-PR tidies (timeout doc, depth pre-check, bridge)
 
 Three trivial follow-ups from the review feedback applied before

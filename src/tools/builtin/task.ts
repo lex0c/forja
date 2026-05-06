@@ -204,3 +204,16 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
     };
   },
 };
+
+// `task_sync` is the canonical name in spec §3.1; `task` is kept
+// as the legacy alias because models discovering tools by name
+// already expect it. The two are byte-identical at the wire — same
+// inputSchema, same metadata, same execute. Spawn-side audit rows
+// carry whichever name the model invoked. Spec ORCHESTRATION.md
+// §3.1: "task (alias legado) = task_sync".
+export const taskSyncTool: Tool<TaskInput, TaskOutput> = {
+  ...taskTool,
+  name: 'task_sync',
+  description:
+    'Synchronous spawn of a subagent. Pairs with `task_async` / `task_await` / `task_cancel`. Identical to the legacy `task` tool — both names are wired to the same dispatcher. The `prompt` must be self-contained: the child has no view of this conversation.',
+};

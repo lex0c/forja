@@ -1498,15 +1498,26 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           //   would diverge from the audit log. The bail still
           //   exits the run with `maxToolErrors`; the message
           //   accurately reflects what physically happened.
-          // - Aborts mid-batch: workers honor `ctx.signal` so a
-          //   hard abort routes individual invokeTool calls to
-          //   ToolError `aborted`. The pool still settles all
-          //   workers (they return quickly via their own abort
-          //   branch); the next top-of-step abort check exits
-          //   with `aborted` / `maxWallClockMs`. This matches
-          //   the "complete the current step" semantics the
-          //   spec calls for, both for soft and hard cancel
-          //   given that the parallel pool is tightly bounded.
+          // - Hard abort mid-batch: workers honor `ctx.signal`,
+          //   so individual invokeTool calls return ToolError
+          //   `aborted`. The pool still settles all workers
+          //   (they return quickly via their own abort branch);
+          //   the next top-of-step abort check exits with
+          //   `aborted` / `maxWallClockMs`.
+          // - Soft abort mid-batch: workers do NOT inspect
+          //   `softStopSignal` — by spec design. The cooperative
+          //   stop semantics is "complete the current step"
+          //   (D173): the batch is the unit of work for one
+          //   step, so we let every worker settle, persist the
+          //   tool_results normally, and let the next
+          //   top-of-step soft check (line ~497) exit with
+          //   `aborted` / `'soft'` BEFORE the next provider
+          //   call. Per-worker soft inspection would surface
+          //   `aborted` tool_results for siblings that hadn't
+          //   yet started — a hybrid state the spec doesn't
+          //   describe and the model would have to translate.
+          //   Keeping the batch atomic preserves the simple
+          //   contract.
           // - `safeInvokeOne` wraps `invokeOne` with a
           //   try/catch (D168 — defense vs. `runPool`'s
           //   `Promise.all`-shaped failure mode). The contract

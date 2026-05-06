@@ -15,7 +15,7 @@ import { readFileTool } from './read-file.ts';
 import { taskAsyncTool } from './task-async.ts';
 import { taskAwaitTool } from './task-await.ts';
 import { taskCancelTool } from './task-cancel.ts';
-import { taskTool } from './task.ts';
+import { taskSyncTool, taskTool } from './task.ts';
 import { todoWriteTool } from './todo-write.ts';
 import { waitForTool } from './wait-for.ts';
 import { writeFileTool } from './write-file.ts';
@@ -50,7 +50,7 @@ export { monitorTool } from './monitor.ts';
 export type { MonitorInput, MonitorOutput } from './monitor.ts';
 export { readFileTool } from './read-file.ts';
 export type { ReadFileInput, ReadFileOutput } from './read-file.ts';
-export { taskTool } from './task.ts';
+export { taskTool, taskSyncTool } from './task.ts';
 export type { TaskInput, TaskOutput } from './task.ts';
 export { taskAsyncTool } from './task-async.ts';
 export type { TaskAsyncInput, TaskAsyncOutput } from './task-async.ts';
@@ -83,6 +83,7 @@ export const BUILTIN_TOOLS = [
   monitorTool,
   todoWriteTool,
   taskTool,
+  taskSyncTool,
   taskAsyncTool,
   taskAwaitTool,
   taskCancelTool,

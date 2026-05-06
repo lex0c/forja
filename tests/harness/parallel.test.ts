@@ -184,9 +184,9 @@ const buildConfig = (
 };
 
 describe('parallel tool execution (ORCHESTRATION §1.3)', () => {
-  test('all parallel_safe → batch dispatched concurrently (wall-clock < sum of latencies)', async () => {
+  test('all parallel_safe → every tu in flight at the same instant', async () => {
     const tracker = makeTracker();
-    const tool = parallelEcho('p_read', { delayMs: 80, tracker });
+    const tool = parallelEcho('p_read', { delayMs: 50, tracker });
     const { config } = buildConfig(
       [
         {
@@ -201,17 +201,14 @@ describe('parallel tool execution (ORCHESTRATION §1.3)', () => {
       ],
       { tools: [tool], budget: { maxConcurrentToolCalls: 5 } },
     );
-    const start = Date.now();
     const result = await runAgent(config);
-    const elapsed = Date.now() - start;
     expect(result.status).toBe('done');
-    // 3 parallel @ 80ms each: serial would be ≥240ms; parallel ~80–150ms
-    // (provider call overhead + scheduler jitter). The budget gives a wide
-    // margin to avoid CI flakes while still failing if the harness
-    // serialized.
-    expect(elapsed).toBeLessThan(220);
-    // Tracker confirms ≥2 in flight at the same instant.
-    expect(tracker.max).toBeGreaterThanOrEqual(2);
+    // Cap is 5, batch is 3 — every tu must be in flight at the
+    // same instant. Stronger than `>=2` and not flake-prone (the
+    // tracker is a deterministic counter, not wall-clock). A
+    // serialized run would max out at 1; an undocumented
+    // throttle would max out at 2 and fail loudly here.
+    expect(tracker.max).toBe(3);
   });
 
   test('mixed parallel_safe + non-parallel → fully serial fallback', async () => {
@@ -425,6 +422,54 @@ describe('parallel tool execution (ORCHESTRATION §1.3)', () => {
     expect(result.status).toBe('done');
     // Serial fallback — never two in flight.
     expect(tracker.max).toBe(1);
+  });
+
+  test('soft-stop fired mid-batch lets the batch complete; loop bails at next step (D173)', async () => {
+    const softCtrl = new AbortController();
+    const tracker = makeTracker();
+    const tool = parallelEcho('p_read', { delayMs: 30, tracker });
+    const handle = mockProvider([
+      {
+        tool_uses: [
+          { id: 'tu1', name: 'p_read', input: { msg: '1' } },
+          { id: 'tu2', name: 'p_read', input: { msg: '2' } },
+          { id: 'tu3', name: 'p_read', input: { msg: '3' } },
+        ],
+        stop_reason: 'tool_use',
+      },
+      { text: 'never reached', stop_reason: 'end_turn' },
+    ]);
+    const registry = createToolRegistry();
+    registry.register(tool);
+    const config = {
+      provider: handle.provider,
+      toolRegistry: registry,
+      permissionEngine: createPermissionEngine(
+        { defaults: { mode: 'strict' as const }, tools: {} },
+        { cwd: '/p' },
+      ),
+      db,
+      cwd: '/p',
+      userPrompt: 'hi',
+      softStopSignal: softCtrl.signal,
+    };
+    // Fire soft-stop right after the batch starts. Workers don't
+    // inspect softStopSignal, so the batch must complete; the
+    // next top-of-step check then bails with aborted/'soft'.
+    const runPromise = runAgent(config);
+    setTimeout(() => softCtrl.abort(), 5);
+    const result = await runPromise;
+    expect(result.status).toBe('interrupted');
+    expect(result.reason).toBe('aborted');
+    expect(result.abortCause).toBe('soft');
+    // Every tu completed (D173): the batch is atomic per step.
+    // Tracker max=3 confirms parallel execution went through;
+    // reaching tracker.max=3 requires all three to be in flight,
+    // which can't happen if we shortcut some via soft-stop.
+    expect(tracker.max).toBe(3);
+    // Only one provider request — soft-stop bailed before the
+    // second turn.
+    expect(handle.requests).toHaveLength(1);
   });
 
   test('hard abort during parallel batch resolves as aborted', async () => {
