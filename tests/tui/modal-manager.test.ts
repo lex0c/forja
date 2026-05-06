@@ -486,6 +486,65 @@ describe('timeout', () => {
     s.fs.dispatch(key('enter'));
     await p1;
   });
+
+  test('timeout while still queued: emits modal:queue-depth so the suffix corrects down', async () => {
+    // Regression guard. Earlier the queued-timeout branch removed
+    // the entry and resolved the promise but never emitted a
+    // `modal:queue-depth` event — the active modal's `(+N
+    // waiting)` suffix would keep showing the stale higher count
+    // until the operator answered the active and drain popped
+    // the next. With three asks (one active + two queued, both
+    // with timers), firing one queued timer must drop the
+    // displayed depth from 2 to 1 immediately.
+    const s = make();
+    const p1 = s.manager.askPermission({ toolName: 'b', command: 'a', cwd: '/' });
+    const firstAsk = s.events.find((e) => e.type === 'permission:ask');
+    const activeId = firstAsk?.type === 'permission:ask' ? firstAsk.promptId : '';
+    expect(activeId).not.toBe('');
+
+    const p2 = s.manager.askPermission(
+      { toolName: 'b', command: 'b', cwd: '/' },
+      { timeoutMs: 50 },
+    );
+    const p3 = s.manager.askPermission(
+      { toolName: 'b', command: 'c', cwd: '/' },
+      { timeoutMs: 50 },
+    );
+
+    // Two depth events so far: depth=1 (after p2 enqueue), depth=2
+    // (after p3 enqueue), both keyed to p1 (the active one).
+    let depthEvents = s.events.filter((e) => e.type === 'modal:queue-depth');
+    expect(depthEvents).toHaveLength(2);
+    if (depthEvents[1]?.type === 'modal:queue-depth') {
+      expect(depthEvents[1].depth).toBe(2);
+      expect(depthEvents[1].promptId).toBe(activeId);
+    }
+
+    // Fire p2's timer. It's in the queue (p1 is active).
+    const timers = s.timer.pending();
+    expect(timers).toHaveLength(2);
+    const handleP2 = timers[0];
+    s.timer.fire(handleP2);
+    await expect(p2).resolves.toBe('cancel');
+
+    // The third depth event should fire AFTER p2 dropped — depth=1
+    // (only p3 left in queue), still keyed to the active p1.
+    depthEvents = s.events.filter((e) => e.type === 'modal:queue-depth');
+    expect(depthEvents).toHaveLength(3);
+    if (depthEvents[2]?.type === 'modal:queue-depth') {
+      expect(depthEvents[2].depth).toBe(1);
+      expect(depthEvents[2].promptId).toBe(activeId);
+    }
+
+    // Tear down: fire p3's timer (now the only queued one), then
+    // resolve the active so the test exits cleanly.
+    const remaining = s.timer.pending();
+    expect(remaining).toHaveLength(1);
+    s.timer.fire(remaining[0]);
+    await expect(p3).resolves.toBe('cancel');
+    s.fs.dispatch(key('enter'));
+    await p1;
+  });
 });
 
 describe('close', () => {

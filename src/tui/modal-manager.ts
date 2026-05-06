@@ -462,6 +462,20 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
             const idx = queue.indexOf(pending as Pending);
             if (idx >= 0) queue.splice(idx, 1);
             pending.resolve('cancel' as Answer);
+            // Live update for the active modal's `(+N waiting)`
+            // suffix: a queued entry just disappeared. Without
+            // this emit, the visible count would lie until the
+            // active modal resolves and drain pops the next.
+            // Mirror image of the enqueue-side bump in
+            // enqueueConfirm above.
+            if (active !== null && idx >= 0) {
+              bus.emit({
+                type: 'modal:queue-depth',
+                ts: now(),
+                promptId: active.promptId,
+                depth: queue.length,
+              });
+            }
           }
         }, timeoutMs);
       }
