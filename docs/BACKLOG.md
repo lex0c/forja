@@ -15,6 +15,48 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — smoke entry for parallel_safe wire (closes BACKLOG eval #34)
+
+Final pre-PR action. The full smoke suite (8 cases) ran clean
+against `feat/parallel` (7/8 pass; the 1 fail was a pre-existing
+markdown-formatting flake in `05-plan-mode-blocks-write` —
+unrelated to this branch). But: the suite had no entry that
+exercised `parallel_safe` against a real provider, despite
+`BACKLOG.md:9195` reserving eval #34 for exactly that since M2.
+
+**Added:**
+
+| File | Change |
+|---|---|
+| `evals/fixtures/parallel-reads/{alpha,beta,gamma}.txt` | Three small files, one short sentence each. The contents are crafted so the assistant's summary in turn 2 carries unique substrings (`agile`, `bright`, `graceful`) that the eval can grep for. |
+| `evals/smoke/09-parallel-reads.yaml` | Smoke case "parallel reads in a single turn". Prompt explicitly asks for all three `read_file` calls in ONE assistant message. `maxSteps: 3` forces parallelism: turn 1 (3 reads parallel) + turn 2 (summary) = 2 steps; if the model serialized (one read per turn), it would hit 4 steps and trip the cap. Combined with three `output_contains` assertions on the files' unique substrings, this gives a non-trivial regression net for the wire shape. |
+
+**Result:** 1/1 pass, 4.6s, $0.04, 2 steps. Confirms (a) the
+Anthropic adapter emits multiple `tool_use` blocks in a single
+assistant turn correctly, (b) the harness's parallel branch
+dispatches them through `runPool`, (c) the tool_results land
+index-aligned for the next provider request — all the
+ORCHESTRATION.md §1.3 contracts a unit test couldn't observe.
+
+**Not added (deferred): smoke for `task_async` round-trip via
+real subprocess.** Initially planned as the second smoke entry,
+but the eval framework's default `spawnChildProcess` would try
+to fork `bun src/evals/cli.ts --subagent-session-id ...` —
+`evals/cli.ts` is not the subagent-child entry point, so the
+spawn would fail. Doing it correctly requires either (a) a
+build of `dist/agent` before the smoke runs and an option to
+point `spawnChildProcess` at it, or (b) extending the eval YAML
+schema with a `spawnChildProcess` test seam. Both are
+extensions to the eval framework, out of scope for this
+branch. Tracking as a follow-up: "smoke entry exercising
+real-subprocess `task_async` round-trip" — needs eval framework
+extension first.
+
+Verification: smoke 8/8 cases (excluding the pre-existing
+plan-mode flake) passed. New entry: 1/1 pass.
+
+---
+
 ## [2026-05-06] parallel — final review fixes (persistence safety, kill-cost reconcile, resume cost)
 
 Final pre-PR review caught three bugs that broke invariants the
