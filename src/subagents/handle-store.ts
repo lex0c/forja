@@ -39,6 +39,13 @@
 // `cancelled_before_dispatch` — no child session row is
 // created.
 
+import type { DB } from '../storage/db.ts';
+import {
+  insertSubagentHandle,
+  listSubagentHandlesByParent,
+  settleSubagentHandle,
+  updateSubagentHandleChildSession,
+} from '../storage/repos/subagent-handles.ts';
 import type { SpawnSubagentArgs, SpawnSubagentResult } from '../tools/types.ts';
 
 // Shape exposed to the model. The id is opaque; the name and
@@ -76,13 +83,22 @@ export interface SubagentHandleStore {
     options?: { timeoutMs?: number; signal?: AbortSignal },
   ): Promise<AwaitOutcome>;
   cancel(id: string): CancelOutcome;
-  // Snapshot of currently-known handles (running + settled).
-  // Useful for tests and for a future "subagents in flight"
-  // operator readout — the store never persists, this is the
-  // only window into its state from outside.
+  // Snapshot of EVERY handle this store knows about, including
+  // ones rehydrated from a prior run (resume path). Use this
+  // for audit listings; do NOT use it as a "subagents in
+  // flight" operator readout — rehydrated handles are
+  // status='settled' (resumed_session), and any UI that wants
+  // "currently active" should call `inFlightCount()` (a cheap
+  // counter that filters by status) or filter `list()` by
+  // ignoring handles whose `spawnedAt` predates the store's
+  // construction time. We don't filter at this layer because
+  // both flavors are useful — the audit consumer wants every
+  // row, the UI wants only live ones.
   list(): SubagentHandle[];
   // Number of records whose status is still 'running'. Bounded
-  // above by the configured cap.
+  // above by the configured cap. Always reflects only the
+  // current run's in-flight spawns: rehydrated handles enter
+  // the records map already as 'settled'.
   inFlightCount(): number;
   // Cancel all running records and await every record's
   // promise. Idempotent. Used by the harness's outer finally.
@@ -101,6 +117,22 @@ export interface CreateSubagentHandleStoreOptions {
   // — the store's record promise propagates them so the
   // task_await tool surface can map onto a tool error.
   spawnFn: (args: SpawnSubagentArgs, signal: AbortSignal) => Promise<SpawnSubagentResult>;
+  // Optional persistence binding. When set, the store mirrors
+  // every handle lifecycle event into the `subagent_handles`
+  // table:
+  //   - spawn → INSERT row (status='running')
+  //   - dispatch settles with a child session id → UPDATE row
+  //     with `child_session_id`
+  //   - settle → UPDATE row to status='settled' + payload JSON
+  // On construction the store ALSO loads any existing rows for
+  // the given parent_session_id and rehydrates them: settled
+  // rows return their cached envelope on `awaitHandle`; running
+  // rows (parent crashed mid-spawn) are mass-converted to
+  // `interrupted/reason=resumed_session` so a resumed run sees
+  // a coherent envelope instead of `unknown_handle`. Production
+  // callers pass this; tests use the in-memory variant by
+  // omitting it.
+  persistTo?: { db: DB; parentSessionId: string };
   // Optional id factory for tests; production uses crypto.randomUUID.
   newId?: () => string;
   // Optional clock; production uses Date.now. Tests override to
@@ -120,13 +152,185 @@ interface SubagentRecord {
   settledResult: SpawnSubagentResult | null;
 }
 
+// Envelope payload mirroring `SpawnSubagentResult` shape, used
+// when settling a row in the DB. The forward direction
+// (`envelopeToJson`) is safe by construction — a real envelope
+// is always shape-correct at the source. The reverse direction
+// is defensive: rehydrating from JSON could see (a) a
+// shape-corrupt payload from storage rot, (b) a payload written
+// by an OLDER version of the schema, or (c) a payload normally
+// written by `settleSubagentHandle` whose source kind is
+// `unknown_subagent` / `depth_exceeded` (legal envelope shapes
+// that survive round-trip and must be discriminated).
+const envelopeToJson = (env: SpawnSubagentResult): Record<string, unknown> =>
+  env as unknown as Record<string, unknown>;
+
+const isStringArray = (x: unknown): x is string[] =>
+  Array.isArray(x) && x.every((v) => typeof v === 'string');
+
+const validateRanStatus = (s: unknown): 'done' | 'interrupted' | 'exhausted' | 'error' => {
+  if (s === 'done' || s === 'interrupted' || s === 'exhausted' || s === 'error') return s;
+  return 'error';
+};
+
+const envelopeFromJson = (raw: Record<string, unknown>): SpawnSubagentResult => {
+  // Discriminate on `kind`. Each branch validates only the
+  // fields downstream callers will read; missing/wrong-typed
+  // ones default to safe values rather than letting the cast
+  // smuggle `undefined` past the type system. Spec
+  // ORCHESTRATION.md §3 leaves the wire shape opaque so the
+  // safe defaults below are not observable to the model — they
+  // only protect downstream tools (task_await) from crashing
+  // on storage corruption or version skew.
+  if (raw.kind === 'unknown_subagent' && typeof raw.requested === 'string') {
+    return {
+      kind: 'unknown_subagent',
+      requested: raw.requested,
+      available: isStringArray(raw.available) ? raw.available : [],
+    };
+  }
+  if (
+    raw.kind === 'depth_exceeded' &&
+    typeof raw.requested === 'string' &&
+    typeof raw.depth === 'number' &&
+    typeof raw.maxDepth === 'number'
+  ) {
+    return {
+      kind: 'depth_exceeded',
+      requested: raw.requested,
+      depth: raw.depth,
+      maxDepth: raw.maxDepth,
+    };
+  }
+  // Everything else falls into `kind: 'ran'`. Unknown kinds
+  // are treated as a corrupt "ran" row with status='error' —
+  // task_await maps that to `subagent.run_failed` which is the
+  // safest tool-error shape we can show the model.
+  const auditFailureRaw = raw.auditFailure;
+  return {
+    kind: 'ran',
+    output: typeof raw.output === 'string' ? raw.output : '',
+    sessionId: typeof raw.sessionId === 'string' ? raw.sessionId : '',
+    status: validateRanStatus(raw.status),
+    reason: typeof raw.reason === 'string' ? raw.reason : 'corrupt_envelope',
+    costUsd: typeof raw.costUsd === 'number' ? raw.costUsd : 0,
+    steps: typeof raw.steps === 'number' ? raw.steps : 0,
+    durationMs: typeof raw.durationMs === 'number' ? raw.durationMs : 0,
+    ...(typeof auditFailureRaw === 'object' &&
+    auditFailureRaw !== null &&
+    !Array.isArray(auditFailureRaw) &&
+    typeof (auditFailureRaw as { code?: unknown }).code === 'string' &&
+    typeof (auditFailureRaw as { message?: unknown }).message === 'string'
+      ? {
+          auditFailure: {
+            code: (auditFailureRaw as { code: string }).code,
+            message: (auditFailureRaw as { message: string }).message,
+          },
+        }
+      : {}),
+  };
+};
+
+const resumedSessionEnvelope = (now: number, spawnedAt: number): SpawnSubagentResult => ({
+  kind: 'ran',
+  output: '',
+  sessionId: '',
+  status: 'interrupted',
+  reason: 'resumed_session',
+  costUsd: 0,
+  steps: 0,
+  durationMs: now - spawnedAt,
+});
+
 export const createSubagentHandleStore = (
   options: CreateSubagentHandleStoreOptions,
 ): SubagentHandleStore => {
   const { spawnFn, cap } = options;
   const newId = options.newId ?? ((): string => crypto.randomUUID());
   const now = options.now ?? ((): number => Date.now());
+  const persistTo = options.persistTo;
   const records = new Map<string, SubagentRecord>();
+
+  // Rehydrate existing rows. A fresh session has zero rows; a
+  // resumed session inherits whatever the previous run left
+  // behind. Each row is processed individually:
+  //   - status='settled': replay the cached envelope (parsed
+  //     defensively in `envelopeFromJson`).
+  //   - status='running': synthesize `resumed_session` with a
+  //     PER-ROW `durationMs = now - row.spawnedAt`, then settle
+  //     that row with the synthesized envelope. Settle is
+  //     write-once at the repo layer, so a sibling subprocess
+  //     that finishes after this constructor cannot overwrite
+  //     the resumed envelope.
+  // Listing inside the same constructor (vs. mass-update
+  // followed by list) keeps `durationMs` correct per row — a
+  // mass UPDATE would have to embed a single envelope and any
+  // single envelope picks one duration.
+  //
+  // **Concurrency assumption**: only ONE process at a time may
+  // hold a session id open. Spec
+  // `STATE_MACHINE.md §105` and `ORCHESTRATION.md §11`
+  // mandate a per-cwd lockfile (`.agent/lock`) that enforces
+  // this. The mass-settle here is destructive: every running
+  // row owned by `parentSessionId` is converted to
+  // `resumed_session`. If two parent processes simultaneously
+  // construct stores against the same `parentSessionId` (which
+  // the lockfile is supposed to prevent), each would settle
+  // the other's in-flight handles. The lockfile is the
+  // load-bearing invariant; this constructor TRUSTS it.
+  // FAILURE_MODES.md §200 documents the lockfile-detection
+  // path. If a programmatic caller bypasses it, the corruption
+  // surface is bounded to whichever handles the second store
+  // sees as 'running' — the first store's settle calls then
+  // become no-ops (write-once), so each parent ends up with a
+  // coherent self-view, just one parent's view is wrong about
+  // who got there first.
+  if (persistTo !== undefined) {
+    const rows = listSubagentHandlesByParent(persistTo.db, persistTo.parentSessionId);
+    const tNow = now();
+    for (const row of rows) {
+      let cached: SpawnSubagentResult;
+      if (row.status === 'settled' && row.settledPayload !== null) {
+        cached = envelopeFromJson(row.settledPayload);
+      } else {
+        // Running row → synthesize per-row resumed_session and
+        // commit to DB. settleSubagentHandle is write-once: if
+        // some other writer races us here (a stray subprocess
+        // settling after the parent crashed), the loser keeps
+        // its rehydrated payload from the winner — same record
+        // the resumed run will surface either way, since both
+        // settle paths agree on the wire shape via the JSON
+        // round-trip.
+        cached = resumedSessionEnvelope(tNow, row.spawnedAt);
+        settleSubagentHandle(persistTo.db, row.handleId, envelopeToJson(cached));
+        // Re-read the persisted payload — if a competing
+        // settle won the race, we want the SURVIVING envelope
+        // in memory so awaitHandle returns what audit will
+        // show. Cheap (single-row read on the same DB
+        // connection that just attempted the write).
+        const refreshed = listSubagentHandlesByParent(persistTo.db, persistTo.parentSessionId).find(
+          (r) => r.handleId === row.handleId,
+        );
+        if (refreshed !== undefined && refreshed.settledPayload !== null) {
+          cached = envelopeFromJson(refreshed.settledPayload);
+        }
+      }
+      const handle: SubagentHandle = {
+        id: row.handleId,
+        name: row.name,
+        spawnedAt: row.spawnedAt,
+      };
+      const controller = new AbortController();
+      const record: SubagentRecord = {
+        handle,
+        promise: Promise.resolve(cached),
+        controller,
+        status: 'settled',
+        settledResult: cached,
+      };
+      records.set(row.handleId, record);
+    }
+  }
 
   // Slot semaphore. `inFlight` counts records currently inside
   // their `spawnFn` call; queued waiters resolve in FIFO order
@@ -184,6 +388,21 @@ export const createSubagentHandleStore = (
     const handle: SubagentHandle = { id, name: args.name, spawnedAt };
     const controller = new AbortController();
 
+    // Persist the handle row BEFORE the IIFE schedules — a
+    // crash between issuance and dispatch leaves a recoverable
+    // 'running' row that resume converts to interrupted. The
+    // INSERT runs synchronously (bun:sqlite is sync); failure
+    // here means the DB is unhealthy and we want to surface
+    // it now rather than after a spawn already burned tokens.
+    if (persistTo !== undefined) {
+      insertSubagentHandle(persistTo.db, {
+        handleId: id,
+        parentSessionId: persistTo.parentSessionId,
+        name: args.name,
+        spawnedAt,
+      });
+    }
+
     // Construct the record FIRST with a placeholder promise; the
     // real promise (next block) closes over it so the spawn body
     // can flip its status synchronously with the result becoming
@@ -229,6 +448,20 @@ export const createSubagentHandleStore = (
       }
       record.status = 'settled';
       record.settledResult = result;
+      // Persist the linkage + final envelope. We bind
+      // child_session_id BEFORE settling so a concurrent reader
+      // sees the map intact even if the settle write fails for
+      // some reason (it shouldn't — the row was just inserted —
+      // but ordering is cheap and the contract is "row is
+      // either fully settled or recoverable as running"). Empty
+      // sessionId (cancelled-before-dispatch and spawn-failed
+      // paths) is left null in the column.
+      if (persistTo !== undefined) {
+        if (result.kind === 'ran' && result.sessionId.length > 0) {
+          updateSubagentHandleChildSession(persistTo.db, id, result.sessionId);
+        }
+        settleSubagentHandle(persistTo.db, id, envelopeToJson(result));
+      }
       return result;
     })();
 

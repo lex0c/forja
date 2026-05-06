@@ -96,6 +96,20 @@ export type {
 } from './repos/subagent-runs.ts';
 
 export {
+  getSubagentHandle,
+  insertSubagentHandle,
+  listSubagentHandlesByParent,
+  settleRunningSubagentHandles,
+  settleSubagentHandle,
+  updateSubagentHandleChildSession,
+} from './repos/subagent-handles.ts';
+export type {
+  InsertSubagentHandleInput,
+  SubagentHandleRecord,
+  SubagentHandleStatus,
+} from './repos/subagent-handles.ts';
+
+export {
   getSubagentWorktree,
   insertSubagentWorktree,
   listAllSubagentWorktrees,

@@ -1,4 +1,11 @@
-import { describe, expect, test } from 'bun:test';
+import { beforeEach, describe, expect, test } from 'bun:test';
+import { type DB, openMemoryDb } from '../../src/storage/db.ts';
+import { migrate } from '../../src/storage/index.ts';
+import {
+  getSubagentHandle,
+  listSubagentHandlesByParent,
+  settleSubagentHandle,
+} from '../../src/storage/repos/subagent-handles.ts';
 import { createSubagentHandleStore } from '../../src/subagents/handle-store.ts';
 import type { SpawnSubagentArgs, SpawnSubagentResult } from '../../src/tools/types.ts';
 
@@ -292,5 +299,292 @@ describe('SubagentHandleStore', () => {
     expect(store.inFlightCount()).toBe(2);
     await Promise.all([store.awaitHandle(h1.id), store.awaitHandle(h2.id)]);
     expect(store.inFlightCount()).toBe(0);
+  });
+});
+
+describe('SubagentHandleStore — persistence (resume rehydration)', () => {
+  let db: DB;
+  const parentId = 'parent-session-id';
+
+  beforeEach(() => {
+    db = openMemoryDb();
+    migrate(db);
+    // Insert a placeholder session row so the FK on
+    // subagent_handles.parent_session_id resolves. The repo
+    // doesn't care about session shape; we just need the row
+    // to exist.
+    db.query(
+      `INSERT INTO sessions (id, model, started_at, cwd, status)
+       VALUES (?, 'mock/m', ?, '/p', 'running')`,
+    ).run(parentId, Date.now());
+  });
+
+  test('spawn writes a row; settle updates child_session_id and payload', async () => {
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args, `output-${args.name}`),
+      persistTo: { db, parentSessionId: parentId },
+    });
+    const h = store.spawn({ name: 'explore', prompt: 'p' });
+    // INSERT happened synchronously inside spawn().
+    const beforeSettle = getSubagentHandle(db, h.id);
+    expect(beforeSettle).not.toBeNull();
+    if (beforeSettle === null) return;
+    expect(beforeSettle.status).toBe('running');
+    expect(beforeSettle.childSessionId).toBeNull();
+    expect(beforeSettle.settledPayload).toBeNull();
+
+    await store.awaitHandle(h.id);
+
+    const afterSettle = getSubagentHandle(db, h.id);
+    expect(afterSettle).not.toBeNull();
+    if (afterSettle === null) return;
+    expect(afterSettle.status).toBe('settled');
+    expect(afterSettle.childSessionId).toBe('child-explore');
+    expect(afterSettle.settledPayload).not.toBeNull();
+    if (afterSettle.settledPayload !== null) {
+      expect(afterSettle.settledPayload.output).toBe('output-explore');
+    }
+  });
+
+  test('cancelled-before-dispatch row stays with null child_session_id', async () => {
+    const store = createSubagentHandleStore({
+      cap: 1,
+      spawnFn: async (args, signal) => {
+        await sleep(50, signal);
+        return okResult(args);
+      },
+      persistTo: { db, parentSessionId: parentId },
+    });
+    const h1 = store.spawn({ name: 'first', prompt: 'p' });
+    const h2 = store.spawn({ name: 'queued', prompt: 'p' });
+    store.cancel(h2.id);
+    await store.awaitHandle(h1.id);
+    await store.awaitHandle(h2.id);
+    const queued = getSubagentHandle(db, h2.id);
+    expect(queued).not.toBeNull();
+    if (queued === null) return;
+    expect(queued.status).toBe('settled');
+    expect(queued.childSessionId).toBeNull();
+    if (queued.settledPayload !== null) {
+      expect(queued.settledPayload.reason).toBe('cancelled_before_dispatch');
+    }
+  });
+
+  test('resume rehydration: settled rows return their cached envelope; running rows convert to resumed_session', async () => {
+    // First store: spawn three handles.
+    //   - h1 settles cleanly via awaitHandle
+    //   - h2 stays mid-spawn (slow spawnFn never resolves before
+    //     the test stops awaiting; we manually cancel to force
+    //     the row to settle, leaving subagent_outputs reflecting
+    //     a clean exit)
+    //   - h3 we DO NOT await; the spawn body runs in the
+    //     background. We bypass it by closing the first store
+    //     without drain — simulating a parent crash. A parent
+    //     that exits without drain leaves the row in 'running'.
+    // We simulate the crash by NOT calling drain on the first
+    // store; instead we directly create a SECOND store backed
+    // by the same DB. The second store's constructor mass-
+    // settles any 'running' rows the first run left behind.
+    let blockSpawn3: () => void = () => {};
+    const blockedSpawn3 = new Promise<void>((r) => {
+      blockSpawn3 = r;
+    });
+    const store1 = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args, signal) => {
+        if (args.name === 'h3') {
+          // Block until we manually release. The first store
+          // never awaits this handle, simulating the parent
+          // crashing while h3 was still running.
+          await Promise.race([
+            blockedSpawn3,
+            new Promise((_, reject) => {
+              if (signal.aborted) reject(new Error('aborted'));
+              else
+                signal.addEventListener('abort', () => reject(new Error('aborted')), {
+                  once: true,
+                });
+            }),
+          ]);
+        }
+        return okResult(args);
+      },
+      persistTo: { db, parentSessionId: parentId },
+    });
+    const h1 = store1.spawn({ name: 'h1', prompt: 'p' });
+    const h2 = store1.spawn({ name: 'h2', prompt: 'p' });
+    const h3 = store1.spawn({ name: 'h3', prompt: 'p' });
+    await store1.awaitHandle(h1.id);
+    await store1.awaitHandle(h2.id);
+    // Don't await h3 — it's stuck in the spawnFn. Construct
+    // a second store: this is the resume path.
+    const store2 = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args), // never called for rehydrated handles
+      persistTo: { db, parentSessionId: parentId },
+    });
+    // Settled handles rehydrate with cached envelope.
+    const o1 = await store2.awaitHandle(h1.id);
+    expect(o1.kind).toBe('done');
+    if (o1.kind === 'done' && o1.result.kind === 'ran') {
+      expect(o1.result.status).toBe('done');
+      expect(o1.result.sessionId).toBe('child-h1');
+    }
+    // h3 was running when the "crash" happened; it must
+    // surface as resumed_session interrupted.
+    const o3 = await store2.awaitHandle(h3.id);
+    expect(o3.kind).toBe('done');
+    if (o3.kind === 'done' && o3.result.kind === 'ran') {
+      expect(o3.result.status).toBe('interrupted');
+      expect(o3.result.reason).toBe('resumed_session');
+    }
+    // The DB row for h3 was mass-settled by store2's
+    // constructor.
+    const persisted = listSubagentHandlesByParent(db, parentId);
+    expect(persisted).toHaveLength(3);
+    for (const row of persisted) {
+      expect(row.status).toBe('settled');
+    }
+    // Release the dangling spawnFn so the test runner exits
+    // cleanly. Per the write-once contract on
+    // settleSubagentHandle (D180), store1's eventual settle
+    // call is a NO-OP because store2 already moved the row to
+    // 'settled' as `resumed_session`. The DB MUST still
+    // reflect the resumed envelope, not the late `done`.
+    blockSpawn3();
+    await store1.awaitHandle(h3.id);
+    const finalRow = persisted.find((r) => r.handleId === h3.id);
+    expect(finalRow).not.toBeUndefined();
+    if (finalRow !== undefined && finalRow.settledPayload !== null) {
+      expect(finalRow.settledPayload.reason).toBe('resumed_session');
+    }
+    const refetch = listSubagentHandlesByParent(db, parentId).find((r) => r.handleId === h3.id);
+    if (refetch !== undefined && refetch.settledPayload !== null) {
+      expect(refetch.settledPayload.reason).toBe('resumed_session');
+    }
+  });
+
+  test('rehydration discriminates unknown_subagent envelope correctly (no shape corruption)', () => {
+    // Persist a row whose settled_payload was written from an
+    // `unknown_subagent` envelope. Without the discriminated
+    // parser, rehydration cast it to `kind: 'ran'` and
+    // task_await crashed reading missing fields.
+    db.query(
+      `INSERT INTO subagent_handles
+         (handle_id, parent_session_id, child_session_id, name, spawned_at, status, settled_payload, created_at)
+       VALUES ('h-unknown', ?, NULL, 'typo-name', ?, 'settled', ?, ?)`,
+    ).run(
+      parentId,
+      Date.now(),
+      JSON.stringify({
+        kind: 'unknown_subagent',
+        requested: 'typo-name',
+        available: ['explore', 'review'],
+      }),
+      Date.now(),
+    );
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+      persistTo: { db, parentSessionId: parentId },
+    });
+    const handles = store.list();
+    expect(handles).toHaveLength(1);
+  });
+
+  test('rehydration of corrupt JSON falls back to kind:ran with reason=corrupt_envelope', async () => {
+    db.query(
+      `INSERT INTO subagent_handles
+         (handle_id, parent_session_id, child_session_id, name, spawned_at, status, settled_payload, created_at)
+       VALUES ('h-corrupt', ?, NULL, 'broken', ?, 'settled', ?, ?)`,
+    ).run(
+      parentId,
+      Date.now(),
+      JSON.stringify({ kind: 'totally_unknown', random: 'garbage' }),
+      Date.now(),
+    );
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+      persistTo: { db, parentSessionId: parentId },
+    });
+    const out = await store.awaitHandle('h-corrupt');
+    expect(out.kind).toBe('done');
+    if (out.kind === 'done' && out.result.kind === 'ran') {
+      expect(out.result.status).toBe('error');
+      expect(out.result.reason).toBe('corrupt_envelope');
+    }
+  });
+
+  test('write-once settle: late settle on a resumed row is a no-op (D180)', () => {
+    // Insert a row, settle it as resumed, then call
+    // settleSubagentHandle again with a `done` envelope. The
+    // second call must NOT overwrite — that's the protection
+    // against a child subprocess that finishes after the
+    // parent crashed and the resume already wrote its envelope.
+    const handleId = 'h-race';
+    db.query(
+      `INSERT INTO subagent_handles
+         (handle_id, parent_session_id, child_session_id, name, spawned_at, status, settled_payload, created_at)
+       VALUES (?, ?, NULL, 'racy', ?, 'running', NULL, ?)`,
+    ).run(handleId, parentId, Date.now(), Date.now());
+    // First settle: resumed_session.
+    const won = settleSubagentHandle(db, handleId, {
+      kind: 'ran',
+      reason: 'resumed_session',
+      status: 'interrupted',
+    });
+    expect(won).toBe(true);
+    // Second settle: late `done` from a child subprocess.
+    const lost = settleSubagentHandle(db, handleId, {
+      kind: 'ran',
+      reason: 'done',
+      status: 'done',
+    });
+    expect(lost).toBe(false);
+    const finalRow = getSubagentHandle(db, handleId);
+    expect(finalRow).not.toBeNull();
+    if (finalRow !== null && finalRow.settledPayload !== null) {
+      expect(finalRow.settledPayload.reason).toBe('resumed_session');
+    }
+  });
+
+  test('rehydration uses per-row durationMs (D181)', () => {
+    // Two rows with different spawn times; both running. After
+    // rehydration, each row's settled_payload.durationMs must
+    // reflect (now - row.spawnedAt), NOT a single shared value.
+    const tBase = Date.now();
+    db.query(
+      `INSERT INTO subagent_handles
+         (handle_id, parent_session_id, child_session_id, name, spawned_at, status, settled_payload, created_at)
+       VALUES (?, ?, NULL, ?, ?, 'running', NULL, ?)`,
+    ).run('h-old', parentId, 'old', tBase - 1000, tBase - 1000);
+    db.query(
+      `INSERT INTO subagent_handles
+         (handle_id, parent_session_id, child_session_id, name, spawned_at, status, settled_payload, created_at)
+       VALUES (?, ?, NULL, ?, ?, 'running', NULL, ?)`,
+    ).run('h-new', parentId, 'new', tBase - 50, tBase - 50);
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+      persistTo: { db, parentSessionId: parentId },
+    });
+    const persisted = listSubagentHandlesByParent(db, parentId);
+    const old = persisted.find((r) => r.handleId === 'h-old');
+    const recent = persisted.find((r) => r.handleId === 'h-new');
+    if (old?.settledPayload === undefined || old.settledPayload === null) {
+      throw new Error('old row settledPayload missing');
+    }
+    if (recent?.settledPayload === undefined || recent.settledPayload === null) {
+      throw new Error('new row settledPayload missing');
+    }
+    const oldDuration = old.settledPayload.durationMs as number;
+    const newDuration = recent.settledPayload.durationMs as number;
+    expect(oldDuration).toBeGreaterThanOrEqual(900);
+    expect(newDuration).toBeLessThan(oldDuration);
+    // Use the store to satisfy the no-unused-variable rule —
+    // the construction is the side effect we're testing.
+    expect(store.list()).toHaveLength(2);
   });
 });

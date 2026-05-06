@@ -763,9 +763,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // through. The captured spawnSubagentImpl above combines it
         // with the run signal.
         const impl = spawnSubagentImpl;
+        // Persist handles into `subagent_handles` so a parent
+        // crash → resume cycle rehydrates rather than losing the
+        // mapping. Always wired in production; the store itself
+        // takes care of (a) inserting on spawn, (b) updating
+        // child_session_id once the spawnFn returns, (c) settling
+        // on terminal envelope, and (d) mass-converting any
+        // running rows from a prior run into `resumed_session`
+        // envelopes when this store loads.
         subagentHandleStore = createSubagentHandleStore({
           cap: subagentCap,
           spawnFn: async (args, perHandleSignal) => impl(args, perHandleSignal),
+          persistTo: { db: config.db, parentSessionId: sessionId },
         });
       }
 

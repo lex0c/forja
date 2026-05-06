@@ -1,4 +1,4 @@
-import { MAX_SUBAGENT_DEPTH } from '../../subagents/runtime.ts';
+import { MAX_SUBAGENT_DEPTH } from '../../subagents/types.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
 // `task_async` spawns a subagent without blocking the parent on its
@@ -128,10 +128,28 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
     // but the handle is created synchronously — the model can
     // confidently emit several task_async calls in one turn and
     // get a handle back for each.
-    const handle = ctx.subagentHandleStore.spawn({
-      name: args.subagent,
-      prompt: args.prompt,
-    });
+    //
+    // The wrap catches a synchronous throw from `store.spawn`.
+    // Production stores persist the handle row at the top of
+    // spawn(), and a failure there (FK violation: the parent
+    // session row was dropped mid-run; CHECK constraint surface
+    // in a future schema change; corrupted DB file) would
+    // propagate as a JS exception. We surface it as a tool
+    // error so the model sees a recoverable signal instead of
+    // an uncaught throw escaping into the harness loop.
+    let handle: ReturnType<typeof ctx.subagentHandleStore.spawn>;
+    try {
+      handle = ctx.subagentHandleStore.spawn({
+        name: args.subagent,
+        prompt: args.prompt,
+      });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      return toolError('subagent.spawn_failed', `failed to issue handle: ${message}`, {
+        retryable: false,
+        hint: 'The handle store rejected the spawn — most likely the parent session row was deleted or the database is unhealthy.',
+      });
+    }
     return {
       handle_id: handle.id,
       name: handle.name,

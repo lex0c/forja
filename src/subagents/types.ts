@@ -1,3 +1,14 @@
+// Hard cap on how deep a chain of `task → task → task` can nest.
+// 4 levels covers every plausible playbook composition; surfaces
+// a clear error well before the budget caps would. Lives in
+// types.ts (not runtime.ts) so tools that pre-flight depth at
+// the call site (`task_async`) can import the const without
+// pulling in the runtime module — runtime.ts depends on the
+// tools registry for whitelist validation, and a tools/...→
+// runtime → tools/... cycle would put `task_async` in a
+// temporal dead zone at module load.
+export const MAX_SUBAGENT_DEPTH = 4;
+
 // Subagent definition (spec §11). Loaded from `.md` files with YAML
 // frontmatter; the body is the system prompt the child harness will
 // run with. Only the runtime-load-bearing fields are typed strongly

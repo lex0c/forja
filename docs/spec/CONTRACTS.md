@@ -169,6 +169,24 @@ Conjunto fechado para v1. Adições requerem PR contra este doc + eval de regres
 | `task_await` | `{ handle, timeout_ms? }` | `SubagentOutput` | nenhum (block) | sim | varia |
 | `task_cancel` | `{ handle }` | `{ cancelled: bool }` | mata subprocess | sim (idempotente em handle morto) | ~10ms |
 
+#### 2.6.4.1 SubagentOutput.reason — valores válidos
+
+Qualquer caller que mapeia `SubagentOutput` para tool error deve reconhecer este enum. Strings desconhecidas devem ser tratadas como `error`/`run_failed` genérico (forward-compatibility).
+
+| `reason` | `status` | Origem | Semântica |
+|---|---|---|---|
+| `done` | `done` | child harness | run terminou normalmente |
+| `cancelled` | `interrupted` | per-handle cancel mid-run | operador disparou `task_cancel` ou parent abortou |
+| `cancelled_before_dispatch` | `interrupted` | handle store | cancel chegou ANTES do slot do semáforo liberar; child nunca rodou (sessionId vazio) |
+| `resumed_session` | `interrupted` | handle store rehydration | parent crashou enquanto este handle estava `running`; resume converte |
+| `spawn_failed` | `error` | handle store | `spawnFn` lançou exceção fora do envelope normal (programmer bug ou DB unhealthy); detalhes em `auditFailure` |
+| `corrupt_envelope` | `error` | handle store rehydration | `settled_payload` JSON tinha shape desconhecida (storage rot ou version skew) |
+| `unknown_subagent` | `error` | spawn dispatch | nome do subagent não está registrado no run; rehidratado via discriminated parser |
+| `depth_exceeded` | `error` | spawn dispatch | recursão `task → task → task` excedeu `MAX_SUBAGENT_DEPTH`; rehidratado via discriminated parser |
+| `maxSteps`/`maxWallClockMs`/`maxToolErrors`/etc. | `exhausted`/`error`/etc. | child harness `ExitReason` | espelha o exit reason do harness do filho |
+
+Os reasons originados no handle store (`cancelled_before_dispatch`, `resumed_session`, `spawn_failed`, `corrupt_envelope`) são **session-scoped** — só aparecem em runs com `task_async` family ativa. Os demais valem para `task_sync` também.
+
 ### 2.6.5 Memory
 
 | Tool | Input | Output | Side effects | Idempotente | Custo típico |

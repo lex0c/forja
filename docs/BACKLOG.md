@@ -15,6 +15,115 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — review fixes for #17 (write-once, parser, per-row duration, spec emend)
+
+Independent code review of the handle persistence work flagged
+1 bug, 1 mascarado-por-cast, plus 7 risks/gaps. Applied the
+acionable subset before opening the PR; remaining items either
+collapse into doc/spec changes or are outside the slice.
+
+| File | Change |
+|---|---|
+| `src/storage/repos/subagent-handles.ts` | `settleSubagentHandle` is now write-once: UPDATE only fires when `status='running'`. Returns `boolean` (true = winner of the write race; false = a prior settle already wrote). Throws only when no row exists at all (programmer bug, distinct from "already settled" race). |
+| `src/subagents/handle-store.ts` | (a) `envelopeFromJson` is now a discriminated parser instead of a `as unknown as SpawnSubagentResult` cast — handles `unknown_subagent` / `depth_exceeded` envelopes correctly; corrupt JSON falls back to `kind: 'ran'` with `reason='corrupt_envelope'` and `status='error'`. (b) Constructor mass-settle was a single payload with `durationMs: 0`; replaced with a per-row loop that synthesizes `durationMs = now - row.spawnedAt` for each running handle. (c) `list()` doc clarifies it returns audit-complete (rehydrated handles included); UI consumers should use `inFlightCount()` or filter by `spawnedAt`. (d) Constructor comment now documents the lockfile concurrency assumption explicitly: spec `STATE_MACHINE.md §105` + `ORCHESTRATION.md §11` mandate the per-cwd lockfile that prevents two parents from racing the mass-settle on the same `parentSessionId`. |
+| `src/tools/builtin/task-async.ts` | `store.spawn` call now wrapped in try/catch — a synchronous throw from the persistence INSERT (FK violation, schema check, corrupt DB) surfaces as `subagent.spawn_failed` tool error instead of an uncaught exception escaping the tool dispatch path. |
+| `src/subagents/types.ts` + `src/subagents/runtime.ts` + `src/tools/builtin/task-async.ts` | Moved `MAX_SUBAGENT_DEPTH = 4` from `runtime.ts` to `types.ts` to break a load-order cycle. `task-async.ts` now imports the const directly from `types.ts`; `runtime.ts` re-exports for backward compat. The cycle (`tools/builtin → runtime → tools/index → tools/builtin`) was producing a `taskAsyncTool` TDZ error in tests that imported `task-async.ts` directly after the persistence work landed. |
+| `docs/spec/CONTRACTS.md` | New §2.6.4.1 "SubagentOutput.reason — valores válidos" — table listing every reason string the envelope can carry: `done`, `cancelled`, `cancelled_before_dispatch`, `resumed_session`, `spawn_failed`, `corrupt_envelope`, `unknown_subagent`, `depth_exceeded`, plus the harness ExitReason mirror. Closes the spec-first divergence the reviewer flagged for D178; the previous spec only documented `done` / `interrupted` / `error` at the status level. |
+| `tests/subagents/handle-store.test.ts` | 4 new tests in the persistence describe block: (a) write-once settle: late `done` settle on a row already settled as `resumed_session` is a no-op; final row keeps `resumed_session`. (b) Rehydration discriminates `unknown_subagent` envelope correctly (no shape corruption). (c) Corrupt JSON falls back to `kind:'ran'` + `reason='corrupt_envelope'`. (d) Per-row `durationMs` on rehydration: two handles with different `spawnedAt` get different durations. |
+| `tests/tools/task-async.test.ts` | New test: `store.spawn` throw surfaces as `subagent.spawn_failed` tool error (covers the FK-violation path). |
+
+**Decisions:**
+
+- **D180 — `settleSubagentHandle` is write-once via `WHERE status='running'`.** The reviewer's bug was real: when a parent crashes mid-run with a child still alive, resume mass-settles the row to `resumed_session`. The original child eventually finishes (its subprocess outlives the parent crash) and tries to settle the same row to `done`. Without the guard, the resumed parent's view (`resumed_session`) would be silently overwritten — audit replay would see a coherent `done` row and no trace of the crash. Write-once preserves the timeline. The repo returns `boolean` (winner / loser of the race) rather than throwing on the loser-side because both branches are legitimate runtime states.
+
+- **D181 — Discriminated rehydration parser.** The previous `as unknown as SpawnSubagentResult` cast hid that `unknown_subagent` and `depth_exceeded` envelopes don't have `sessionId/status/reason`. Persisted-then-rehydrated, `task_await` would read undefined and crash. The new parser discriminates on `kind`, validates the shape, falls back to `kind:'ran'` + `reason='corrupt_envelope'` on anything unexpected. Forward-compat: an older row with a fresh `reason` string flows through as a `ran` row with that reason preserved verbatim.
+
+- **D182 — Per-row `durationMs` in mass settle.** The mass-update was using a single envelope (`durationMs: 0`) for every running row. Refactor: list rows first, iterate, settle each individually with `now - row.spawnedAt`. A small extra round-trip per resume but the audit data is now meaningful. Matches the convention `bg-processes` already uses (per-row finalization, never bulk-update with a synthetic envelope).
+
+- **D183 — `MAX_SUBAGENT_DEPTH` lives in `types.ts`, not `runtime.ts`.** The depth pre-check in `task_async` (D161) imports the const. Sourcing it from `runtime.ts` introduced a load-order cycle: `tools/builtin → runtime → tools/index → tools/builtin`. Tests that imported `task-async.ts` directly hit a `taskAsyncTool` TDZ. Moved to `types.ts` (no inbound deps from `tools/`); `runtime.ts` re-exports so existing call sites don't churn.
+
+- **Spec emend (D178 follow-through) — `CONTRACTS.md §2.6.4.1`.** Adds the table of valid `reason` values. Forward-compat clause: unknown reasons map to `error/run_failed` so callers can survive a future addition.
+
+**Out of scope for this slice (documented for future):**
+
+- **Concurrent-confirm modals on parallel batches.** Reviewer's #2 from the slice 1 review — unchanged here. Track separately.
+- **`list()` filter at the API layer.** Doc-only fix here. A method `listInFlight()` could land later if a concrete consumer needs it; today the `inFlightCount()` already serves the only known callsite (operator readout, when wired).
+- **Lockfile enforcement implementation.** Spec mandates it (`STATE_MACHINE.md §105`); src/ doesn't have it yet. Pre-existing débito; the persistence layer documents the dependency rather than enforcing it. A separate slice should add the lockfile.
+- **Registry pre-check at `task_async`.** With D181 the rehydration is shape-correct; the model gets a clean `subagent.unknown` tool error via `task_await` even when the registry drifts. Pre-check at `task_async` would save one INSERT but doesn't change correctness.
+
+Verification: typecheck clean, lint clean, 3069 pass / 0 fail /
+10 skip (5 new tests).
+
+---
+
+## [2026-05-06] parallel — handle persistence + resume rehydration (#17)
+
+Closes the resume-recovery gap the post-review inventory flagged.
+Before this commit, `task_async` handles lived only in process
+memory: a parent that died between `task_async` (handle issued
+to model + recorded in chat history) and `task_await` (collect
+output) left the model holding a handle id the new run couldn't
+resolve. `task_await` returned `subagent.unknown_handle` —
+silently abandoning the child's output, which `subagent_outputs`
+already had on disk.
+
+| File | Change |
+|---|---|
+| `src/storage/migrations/021-subagent-handles.ts` | NEW. `subagent_handles` table: `handle_id` PK, `parent_session_id` FK CASCADE → sessions, `child_session_id` (nullable until spawn dispatches), `name`, `spawned_at`, `status` IN ('running','settled'), `settled_payload` (JSON envelope), `created_at`. Index on `parent_session_id`. |
+| `src/storage/migrations/index.ts` | Wired into MIGRATIONS list. |
+| `src/storage/repos/subagent-handles.ts` | NEW. CRUD: `insertSubagentHandle`, `updateSubagentHandleChildSession`, `settleSubagentHandle`, `settleRunningSubagentHandles` (mass-update for resume), `listSubagentHandlesByParent`, `getSubagentHandle`. Defensive JSON parse on `settled_payload` mirrors the `subagent-outputs` convention. |
+| `src/storage/index.ts` | New repo exports. |
+| `src/subagents/handle-store.ts` | New optional `persistTo: { db, parentSessionId }`. When set: (a) constructor mass-settles any pre-existing 'running' rows for `parentSessionId` to `interrupted/reason=resumed_session` and rehydrates EVERY row's record (settled rows replay their cached envelope; running rows now-resumed surface as interrupted). (b) `spawn` synchronously inserts a row before returning the handle. (c) Spawn body updates `child_session_id` once the spawnFn returns with a child sessionId, then settles the row with the envelope JSON. (d) Cancelled-before-dispatch and spawn-failed paths settle with their synthesized envelope (no child_session_id). |
+| `src/harness/loop.ts` | Threaded `persistTo: { db: config.db, parentSessionId: sessionId }` into the store. Every production run now persists handles; tests can opt out by omitting the binding. |
+| `tests/subagents/handle-store.test.ts` | New describe block "persistence (resume rehydration)" — 3 tests: (a) spawn writes a row with `running` + null child_session_id; settle updates child_session_id and payload. (b) cancelled-before-dispatch row stays with null child_session_id and `reason=cancelled_before_dispatch` payload. (c) Resume rehydration: build a first store, spawn h1/h2/h3 (h3 blocked mid-spawn), close without drain (simulating crash), build a second store with the same DB binding. Settled handles return cached envelopes; the still-running h3 surfaces as `interrupted/resumed_session`; every DB row is now settled. Test inserts a placeholder `sessions` row to satisfy the FK. |
+
+**Decisions:**
+
+- **D175 — Persist by default in production runs.** Storage is cheap
+  (one INSERT per spawn, one UPDATE per settle). Making
+  `persistTo` opt-in would let a future programmatic caller
+  silently drop the resume safety net without realizing —
+  exactly the failure mode the migration exists to close. The
+  in-memory path still works for tests via `omit persistTo`.
+
+- **D176 — Constructor performs mass settle synchronously.** The
+  resumed run's first action is to convert previous-run leftovers
+  to `resumed_session`. Doing this on construction (not
+  lazily on first lookup) means the DB is always in a coherent
+  state by the time any handle access lands; an interleaved
+  consumer can't see a half-rehydrated mix.
+
+- **D177 — `child_session_id` set BEFORE settle, not in the same
+  UPDATE.** Two writes per settle (linkage then envelope) cost
+  one extra round-trip per spawn but keep the contract "row is
+  either fully settled with linkage OR recoverable as running".
+  A combined write that fails partway would leave a row in an
+  unobservable in-between state; the split keeps every snapshot
+  interpretable.
+
+- **D178 — `resumed_session` is a new envelope reason.** Distinct
+  from `cancelled_before_dispatch` (parent never dispatched the
+  spawn) and from `cancelled` (operator-driven mid-run). A
+  resumed model that sees `resumed_session` knows its prior
+  spawn was cut by a parent crash; `cancelled` would
+  miscommunicate as operator action. The reason string ships in
+  the envelope and is part of the wire contract; documented in
+  `subagent-handles.ts:128–143`.
+
+- **D179 — No prompt persisted in `subagent_handles`.** Spec §3.4
+  isolates the prompt to the child run. Persisting it on the
+  parent's handle row would duplicate state and risk leaking
+  prompt content into a wider audit surface. The handle row
+  carries identity (`handle_id`, `name`, `spawned_at`) and
+  outcome (`status`, `child_session_id`, `settled_payload`);
+  reconstruction of "what prompt did we send" goes through the
+  child's own session row.
+
+Verification: typecheck clean, lint clean, 3064 pass / 0 fail /
+10 skip (3 new tests).
+
+---
+
 ## [2026-05-06] parallel — e2e through real child harness (#11)
 
 Closes the test-débito identified in the post-review inventory: the

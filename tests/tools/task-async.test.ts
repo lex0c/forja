@@ -191,6 +191,30 @@ describe('task_async / task_await / task_cancel tools', () => {
     }
   });
 
+  test('task_async surfaces store.spawn() throw as subagent.spawn_failed (no uncaught exception)', async () => {
+    // Construct a store whose spawn() throws synchronously.
+    // Production storage failure modes (FK violation, schema
+    // CHECK constraint, corrupted DB) all surface as throws
+    // from the persistTo INSERT. Without the wrap in
+    // task_async.execute, that throw propagates through the
+    // tool dispatch path as an uncaught exception.
+    const throwingStore = {
+      ...createSubagentHandleStore({
+        cap: 3,
+        spawnFn: async (args) => okResult(args),
+      }),
+      spawn: () => {
+        throw new Error('FOREIGN KEY constraint failed');
+      },
+    };
+    const ctx = makeCtx({ subagentHandleStore: throwingStore });
+    const r = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'p' }, ctx);
+    expect(isToolError(r)).toBe(true);
+    if (!isToolError(r)) return;
+    expect(r.error_code).toBe('subagent.spawn_failed');
+    expect(r.error_message).toContain('FOREIGN KEY constraint failed');
+  });
+
   test('task_async pre-checks subagent depth and refuses without spawning', async () => {
     // Importing MAX_SUBAGENT_DEPTH from runtime keeps the test
     // pinned to the runtime cap; if a future slice loosens or
