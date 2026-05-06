@@ -83,24 +83,43 @@ export const insertSubagentHandle = (db: DB, input: InsertSubagentHandleInput): 
 // Bind the child session id once the spawn dispatched. Separate
 // from settle so that a parent crash mid-run still has the
 // linkage when resume looks up subagent_outputs by child id.
-// Throws on missing row — programmer / sequencing bug.
+//
+// Write-once on the row's settled state: the UPDATE only fires
+// while `status='running'`. A row already settled (by a competing
+// writer in the crash-resume race, or by `settleSubagentHandle`
+// itself if the late spawn wakes after the IIFE settled an
+// `interrupted` envelope) is left immutable. Without this guard,
+// a late `updateSubagentHandleChildSession` would mutate
+// `child_session_id` while `settled_payload.reason ===
+// 'resumed_session'` — internal inconsistency for any audit /
+// debug tooling that correlates the two columns.
+//
+// Returns true when this call was the writer; false when the row
+// was already settled (race-loser; safe to ignore). Throws ONLY
+// on missing row — that's a programmer / sequencing bug
+// (insert MUST precede update).
 export const updateSubagentHandleChildSession = (
   db: DB,
   handleId: string,
   childSessionId: string,
-): void => {
+): boolean => {
   const result = db
     .query(
       `UPDATE subagent_handles
           SET child_session_id = ?
-        WHERE handle_id = ?`,
+        WHERE handle_id = ? AND status = 'running'`,
     )
     .run(childSessionId, handleId);
-  if (result.changes === 0) {
-    throw new Error(
-      `updateSubagentHandleChildSession: no subagent_handles row for handle ${handleId}`,
-    );
-  }
+  if (result.changes > 0) return true;
+  const exists = db
+    .query<{ n: number }, [string]>(
+      'SELECT COUNT(*) AS n FROM subagent_handles WHERE handle_id = ?',
+    )
+    .get(handleId);
+  if (exists !== null && exists.n > 0) return false;
+  throw new Error(
+    `updateSubagentHandleChildSession: no subagent_handles row for handle ${handleId}`,
+  );
 };
 
 // Settle a handle exactly once. The UPDATE only fires when the

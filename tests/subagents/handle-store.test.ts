@@ -1008,6 +1008,63 @@ describe('SubagentHandleStore — persistence (resume rehydration)', () => {
     expect(store.getRehydratedChildCostUsd()).toBeCloseTo(3.0);
   });
 
+  test('updateSubagentHandleChildSession is write-once on settled rows (review fix)', async () => {
+    // Pre-fix: late writer could mutate child_session_id even
+    // after another process settled the row, leaving
+    // settled_payload.reason='resumed_session' but
+    // child_session_id pointing to a different child. Audit
+    // consumers correlating the two columns saw inconsistent
+    // state.
+    //
+    // Post-fix: update is guarded by status='running'; settled
+    // rows are immutable. Return value distinguishes
+    // winner-write (true) from race-loser (false).
+    const { updateSubagentHandleChildSession, getSubagentHandle, insertSubagentHandle } =
+      await import('../../src/storage/repos/subagent-handles.ts');
+    insertSubagentHandle(db, {
+      handleId: 'h-immutable',
+      parentSessionId: parentId,
+      name: 'racer',
+      spawnedAt: Date.now(),
+    });
+    // Winner-write while running: returns true, row updated.
+    const won = updateSubagentHandleChildSession(db, 'h-immutable', 'child-first');
+    expect(won).toBe(true);
+    expect(getSubagentHandle(db, 'h-immutable')?.childSessionId).toBe('child-first');
+    // Settle the row (simulating the resumed parent's
+    // mass-settle).
+    settleSubagentHandle(db, 'h-immutable', {
+      kind: 'ran',
+      reason: 'resumed_session',
+      status: 'interrupted',
+    });
+    // Late writer attempts to update child_session_id again
+    // (the original child subprocess woke up after parent's
+    // resume and tried to bind its session id). MUST NOT
+    // overwrite — returns false; row's child_session_id
+    // stays as whatever the winner wrote.
+    const lost = updateSubagentHandleChildSession(db, 'h-immutable', 'child-late');
+    expect(lost).toBe(false);
+    const finalRow = getSubagentHandle(db, 'h-immutable');
+    expect(finalRow).not.toBeNull();
+    if (finalRow !== null) {
+      expect(finalRow.childSessionId).toBe('child-first');
+      expect(finalRow.status).toBe('settled');
+      if (finalRow.settledPayload !== null) {
+        expect(finalRow.settledPayload.reason).toBe('resumed_session');
+      }
+    }
+  });
+
+  test('updateSubagentHandleChildSession throws on missing row (programmer bug)', async () => {
+    const { updateSubagentHandleChildSession } = await import(
+      '../../src/storage/repos/subagent-handles.ts'
+    );
+    expect(() => updateSubagentHandleChildSession(db, 'never-inserted', 'child-x')).toThrow(
+      /no subagent_handles row/,
+    );
+  });
+
   test('rehydration of race-loser path: constructor settle no-ops; re-read cost is folded in', () => {
     // Direct simulation of the race-loser path. We can't have
     // two real writers in a unit test, but we can pre-stage

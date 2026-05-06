@@ -15,6 +15,54 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — write-once guard on updateSubagentHandleChildSession
+
+User-spotted bug. `settleSubagentHandle` is write-once
+(`WHERE handle_id = ? AND status = 'running'`, D180) — settled
+rows can't be overwritten. But the sibling
+`updateSubagentHandleChildSession` had no such guard:
+
+```sql
+UPDATE subagent_handles
+   SET child_session_id = ?
+ WHERE handle_id = ?
+```
+
+Crash-resume race: resumed parent settles a row to
+`resumed_session` (status flips to 'settled'). The original
+child subprocess (still alive on the OS) wakes up and the
+spawn IIFE eventually calls `updateSubagentHandleChildSession`
+to bind its own child session id. Without the guard, the row
+ends up with:
+
+- `settled_payload.reason = 'resumed_session'` (write-once preserved)
+- `child_session_id = 'child-late'` (the late child's session)
+- internal contradiction: any audit / debug tool correlating
+  the two columns sees a row that was "interrupted by resume"
+  yet bound to a child that ran AFTER the parent crashed.
+
+| File | Change |
+|---|---|
+| `src/storage/repos/subagent-handles.ts` | `updateSubagentHandleChildSession` adds `AND status = 'running'` to the UPDATE WHERE. Return type changed from `void` to `boolean` (true = winner-write; false = row already settled, race-loser, safe to ignore). Throws ONLY on missing row, same shape as `settleSubagentHandle`. Doc rewritten to spell out the race-loser semantics. |
+| `tests/subagents/handle-store.test.ts` | Two new tests. (a) "updateSubagentHandleChildSession is write-once on settled rows" — winner-write while running succeeds (returns true); settle the row; late writer returns false; final row keeps the winner's `child_session_id` and `resumed_session` payload (no contradiction). (b) "updateSubagentHandleChildSession throws on missing row" — preserves the programmer-bug-detection contract. |
+
+**Decision:**
+
+- **D215 — Both lifecycle writes (`settle` + linkage) are
+  write-once.** Pairs the two repo-side methods so a settled
+  row is structurally immutable across both columns
+  (`status`/`settled_payload` AND `child_session_id`).
+  Eliminates the cross-column inconsistency the bug exposed
+  without needing an additional schema constraint. Future
+  fields added to `subagent_handles` (e.g. `final_audit_failure`
+  in a later slice) inherit the same contract by following
+  the pattern.
+
+Verification: typecheck clean, lint clean, 3102 pass / 0 fail
+(2 new tests).
+
+---
+
 ## [2026-05-06] parallel — fold race-winner cost into rehydration tracker
 
 User-spotted bug. The handle store's rehydration constructor
