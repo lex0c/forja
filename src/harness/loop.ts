@@ -1274,21 +1274,20 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
 
         // Bridge from the run-scoped `spawnSubagentImpl` to the
         // legacy synchronous tool surface. The legacy `task` tool
-        // expects `(args) => Promise<SpawnSubagentResult>`; the run
-        // impl exposes a richer `(args, signalOverride?)` shape so
-        // the handle store can carry a per-handle signal. Bridging
-        // here keeps the existing tool surface unchanged while
-        // letting both spawn paths share one dispatcher. Captured
-        // into a local const FIRST so TS keeps the narrowed type
-        // across the closure body — `let` declarations can re-widen
-        // inside a lambda, breaking the `=== undefined` narrowing.
-        const stableImpl = spawnSubagentImpl;
-        const spawnSubagentClosure:
+        // expects `(args) => Promise<SpawnSubagentResult>`; the
+        // run impl exposes a richer `(args, signalOverride?)`
+        // shape so the handle store can carry a per-handle
+        // signal. The `if`-block aliases the impl into a const
+        // so TS narrowing survives the closure — `let`-declared
+        // optionals can re-widen inside a lambda even when the
+        // source is never reassigned after initialization.
+        let spawnSubagentClosure:
           | ((args: SpawnSubagentArgs) => Promise<SpawnSubagentResult>)
-          | undefined =
-          stableImpl === undefined
-            ? undefined
-            : (args: SpawnSubagentArgs): Promise<SpawnSubagentResult> => stableImpl(args);
+          | undefined;
+        if (spawnSubagentImpl !== undefined) {
+          const impl = spawnSubagentImpl;
+          spawnSubagentClosure = (args) => impl(args);
+        }
 
         const buildCtx = (tu: CollectedToolUse): ToolContext => ({
           signal,
@@ -1302,6 +1301,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(bgManager !== undefined ? { bgManager } : {}),
           ...(spawnSubagentClosure !== undefined ? { spawnSubagent: spawnSubagentClosure } : {}),
           ...(subagentHandleStore !== undefined ? { subagentHandleStore } : {}),
+          subagentDepth: config.subagentDepth ?? 0,
           ...(config.memoryRegistry !== undefined ? { memoryRegistry: config.memoryRegistry } : {}),
           ...(config.confirmMemoryWrite !== undefined
             ? { confirmMemoryWrite: config.confirmMemoryWrite }

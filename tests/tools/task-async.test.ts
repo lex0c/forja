@@ -191,6 +191,37 @@ describe('task_async / task_await / task_cancel tools', () => {
     }
   });
 
+  test('task_async pre-checks subagent depth and refuses without spawning', async () => {
+    // Importing MAX_SUBAGENT_DEPTH from runtime keeps the test
+    // pinned to the runtime cap; if a future slice loosens or
+    // tightens the gate the test fails loudly rather than
+    // silently passing on a stale literal.
+    const { MAX_SUBAGENT_DEPTH } = await import('../../src/subagents/runtime.ts');
+    let dispatched = 0;
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => {
+        dispatched += 1;
+        return okResult(args);
+      },
+    });
+    // ctx.subagentDepth = MAX_SUBAGENT_DEPTH means the next
+    // `task_async` would land at MAX + 1 — must refuse.
+    const ctx = makeCtx({
+      subagentHandleStore: store,
+      subagentDepth: MAX_SUBAGENT_DEPTH,
+    });
+    const r = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'p' }, ctx);
+    expect(isToolError(r)).toBe(true);
+    if (!isToolError(r)) return;
+    expect(r.error_code).toBe('subagent.depth_exceeded');
+    expect(r.details?.depth).toBe(MAX_SUBAGENT_DEPTH + 1);
+    // No spawn dispatched — the round trip the legacy `task`
+    // tool saved is preserved.
+    expect(dispatched).toBe(0);
+    expect(store.list()).toHaveLength(0);
+  });
+
   test('task_async rejects empty subagent name and oversized prompt', async () => {
     const store = createSubagentHandleStore({
       cap: 3,

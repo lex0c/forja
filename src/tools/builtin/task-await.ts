@@ -15,9 +15,8 @@ export interface TaskAwaitInput {
   handle_id: string;
   // Optional cap on how long to wait, in milliseconds. Omit for
   // "wait forever" (still subject to the run's wall-clock cap).
-  // The store treats `0` as "no timeout" by virtue of the
-  // setTimeout/Date.now math; setting `1` is the smallest
-  // meaningful nonzero value.
+  // Must be an integer >= 1; the runtime rejects 0 / negative /
+  // float / NaN with `tool.invalid_arg`. Capped at 30 minutes.
   timeout_ms?: number;
 }
 

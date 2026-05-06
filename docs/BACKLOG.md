@@ -15,6 +15,25 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — pre-PR tidies (timeout doc, depth pre-check, bridge)
+
+Three trivial follow-ups from the review feedback applied before
+opening the PR:
+
+| File | Change |
+|---|---|
+| `src/tools/builtin/task-await.ts` | TaskAwaitInput JSDoc no longer claims `timeout_ms = 0` is "no timeout" — the validator rejects `< 1`, so the doc lied. Replaced with the actual contract: integer ≥ 1, capped at 30 minutes. |
+| `src/tools/types.ts` + `src/harness/loop.ts` | `ToolContext` gains optional `subagentDepth?: number`. The harness threads `config.subagentDepth ?? 0` through `buildCtx`. |
+| `src/tools/builtin/task-async.ts` | Depth pre-check at the tool surface: a `task_async` call at the cap returns `subagent.depth_exceeded` BEFORE the handle store dispatches a spawn. Matches the legacy `task` tool's contract (it flushes early via `spawnSubagentImpl`); without this the model would get a handle whose later `task_await` was pre-destined to fail — wasted round trip. |
+| `src/harness/loop.ts` | Replaced the `const stableImpl = …` ternary bridge with a guarded `if`-block. Same TS-narrowing reason (a `let` source re-widens inside a closure body even when never reassigned), but the `if` aliases the const inline rather than at the outer scope. Comment updated to drop the slightly-overstated reasoning the slice 2 reviewer flagged. |
+| `tests/tools/_helpers.ts` | `makeCtx` accepts `subagentDepth` override. |
+| `tests/tools/task-async.test.ts` | New test: "task_async pre-checks subagent depth and refuses without spawning" — sets `subagentDepth = MAX_SUBAGENT_DEPTH`, expects `subagent.depth_exceeded`, and verifies no spawnFn dispatch happened. Imports the cap from runtime so a future tightening fails the test loudly. |
+
+Verification: typecheck clean, lint clean, 3058 pass / 0 fail /
+10 skip (one new test).
+
+---
+
 ## [2026-05-06] parallel — review fixes (slices 1+2)
 
 Two independent code reviews on `feat/parallel` (slices 1 and 2)

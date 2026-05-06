@@ -1,3 +1,4 @@
+import { MAX_SUBAGENT_DEPTH } from '../../subagents/runtime.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
 // `task_async` spawns a subagent without blocking the parent on its
@@ -91,6 +92,25 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
     }
     if (typeof args.prompt !== 'string' || args.prompt.length === 0) {
       return toolError(ERROR_CODES.invalidArg, "'prompt' must be a non-empty string");
+    }
+    // Depth pre-check at the tool surface. The dispatcher
+    // (`spawnSubagentImpl` in the harness) also checks at await
+    // time, but flushing here saves the round trip for a model
+    // that called `task_async` at the cap: the legacy `task`
+    // tool returns `subagent.depth_exceeded` before the spawn
+    // happens; `task_async` should match that contract instead
+    // of returning a handle whose later `task_await` is
+    // pre-destined to fail.
+    const childDepth = (ctx.subagentDepth ?? 0) + 1;
+    if (childDepth > MAX_SUBAGENT_DEPTH) {
+      return toolError(
+        'subagent.depth_exceeded',
+        `subagent '${args.subagent}' would nest at depth ${childDepth} (max ${MAX_SUBAGENT_DEPTH})`,
+        {
+          hint: 'Stop nesting task() calls. Either finish the work directly in this turn or restructure into a flatter chain.',
+          details: { depth: childDepth, max_depth: MAX_SUBAGENT_DEPTH },
+        },
+      );
     }
     const promptBytes = Buffer.byteLength(args.prompt, 'utf8');
     if (promptBytes > PROMPT_MAX_BYTES) {

@@ -133,6 +133,14 @@ export interface ToolContext {
   sessionId: string;
   stepId: string;
   permissions: PermissionsView;
+  // Recursion depth of the CURRENT run inside a subagent chain.
+  // 0 (or unset) = top-level user session. The harness threads
+  // this from `HarnessConfig.subagentDepth` so tools that spawn
+  // children (`task` / `task_async`) can pre-flight the depth
+  // gate at the call site instead of the deeper-down dispatcher.
+  // Optional + default-zero so test contexts that don't model
+  // chain state still construct cleanly.
+  subagentDepth?: number;
   // Background process manager for the current session. Optional so
   // existing tools that don't need bg orchestration aren't forced to
   // declare a dependency. Tools that DO need it (`bash_background`,
