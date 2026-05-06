@@ -96,6 +96,20 @@ export type {
 } from './repos/subagent-runs.ts';
 
 export {
+  getSubagentHandle,
+  insertSubagentHandle,
+  listSubagentHandlesByParent,
+  settleRunningSubagentHandles,
+  settleSubagentHandle,
+  updateSubagentHandleChildSession,
+} from './repos/subagent-handles.ts';
+export type {
+  InsertSubagentHandleInput,
+  SubagentHandleRecord,
+  SubagentHandleStatus,
+} from './repos/subagent-handles.ts';
+
+export {
   getSubagentWorktree,
   insertSubagentWorktree,
   listAllSubagentWorktrees,
@@ -148,3 +162,25 @@ export type {
   HookRunsLayer,
   HookRunsOutcome,
 } from './repos/hook-runs.ts';
+
+export {
+  insertCostProgressEvent,
+  listCostProgressByHandle,
+  listCostProgressByParent,
+} from './repos/cost-progress-events.ts';
+export type {
+  CostProgressEvent,
+  InsertCostProgressEventInput,
+} from './repos/cost-progress-events.ts';
+
+export {
+  insertSubagentGateDecision,
+  listSubagentGateDecisionsByParent,
+  listSubagentGateDecisionsByType,
+} from './repos/subagent-gate-decisions.ts';
+export type {
+  GateDecisionTool,
+  GateDecisionType,
+  InsertSubagentGateDecisionInput,
+  SubagentGateDecision,
+} from './repos/subagent-gate-decisions.ts';

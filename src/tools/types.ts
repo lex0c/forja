@@ -3,6 +3,7 @@ import type { HookChainResult, HookEventPayload } from '../hooks/index.ts';
 import type { MemoryRegistry } from '../memory/index.ts';
 import type { Decision, PermissionsView, PolicyCategory, ToolArgs } from '../permissions/index.ts';
 import type { ProviderToolInputSchema } from '../providers/index.ts';
+import type { SubagentHandleStore } from '../subagents/handle-store.ts';
 import type { WorktreeOutcome } from '../subagents/types.ts';
 import type { TodoStore } from '../todo/index.ts';
 
@@ -91,6 +92,33 @@ export interface ToolMetadata {
   // opts in today.
   requiresOperatorConfirm?: boolean;
   idempotent: boolean;
+  // Opt-in to parallel execution within a step (spec
+  // ORCHESTRATION.md §1.3). When EVERY tool_use the model emits in
+  // a single step has `parallel_safe === true`, the harness
+  // dispatches them through a bounded pool instead of the default
+  // serial loop. A single non-`parallel_safe` tool_use in the
+  // batch falls back to fully-serial execution (no partial
+  // parallelism — keeps invariants simple and order deterministic).
+  //
+  // Only declare `true` for tools whose execution is naturally
+  // independent of OTHER concurrent tool calls in the same
+  // process: read-only filesystem reads, in-memory lookups against
+  // immutable state, lexical/grep searches. Tools with
+  // `writes: true` MUST NOT declare it (FS race). Tools that
+  // touch session-bound mutable state (todo store, bg manager
+  // state machine, IPC channels) MUST NOT declare it. Tools that
+  // require operator confirmation MUST NOT declare it (modal
+  // serialization is per-modal-manager, not per-tool).
+  //
+  // `bash` is intentionally NOT flagged even though `args.read_only`
+  // exists: the flag is a model declaration, not a static property,
+  // and spec §9.1 documents it's not a security boundary. Letting a
+  // runtime hint gate parallelism would let an adversarial model
+  // amplify a race.
+  //
+  // Default false is the safe choice — opt-in keeps every existing
+  // tool serial until it's been audited for parallel safety.
+  parallel_safe?: boolean;
   display?: DisplayHint;
   // Optional cost hints; informational only in M1.
   cost?: {
@@ -105,6 +133,74 @@ export interface ToolContext {
   sessionId: string;
   stepId: string;
   permissions: PermissionsView;
+  // Recursion depth of the CURRENT run inside a subagent chain.
+  // 0 (or unset) = top-level user session. The harness threads
+  // this from `HarnessConfig.subagentDepth` so tools that spawn
+  // children (`task` / `task_async`) can pre-flight the depth
+  // gate at the call site instead of the deeper-down dispatcher.
+  // Optional + default-zero so test contexts that don't model
+  // chain state still construct cleanly.
+  subagentDepth?: number;
+  // Run-level cost accounting (spec ORCHESTRATION.md §3.5).
+  // Returns the cap and the cumulative cost incurred so far.
+  // `spent` includes parent self-cost (priorCostUsd +
+  // totalCostUsd) AND settled child costs AND the
+  // pessimistic reservation for in-flight children. `cap` is
+  // undefined when the run has no maxCostUsd configured —
+  // every projected total fits under "no cap".
+  // Used by `task_async` to refuse new spawns when the cap
+  // would be crossed; the in-flight reservation is what
+  // protects against the footgun where 3 concurrent
+  // task_async calls each pass an "I see room" check
+  // because no settled child cost has landed yet.
+  getCostBudget?: () => { spent: number; cap: number | undefined };
+  // Lookup helper for subagent budget estimates. Returns the
+  // definition's `budget.maxCostUsd` (worst-case spend) for the
+  // named subagent, or null when the name doesn't resolve.
+  // `task_async` uses this to compute the pessimistic
+  // reservation for the spawn it's about to issue. Separated
+  // from a full `subagentRegistry` exposure to keep tools
+  // that spawn children from reaching into definition shapes
+  // they don't need to read.
+  //
+  // The `null` return is load-bearing: it distinguishes
+  // "subagent not registered" from "registered with zero
+  // cost". `task_async` reads `null` as fail-fast (refuse
+  // before issuing a handle the eventual `task_await` would
+  // bounce). Callers MUST NOT coalesce `null` to `0`.
+  getSubagentBudgetEstimate?: (name: string) => number | null;
+  // Lists the names of subagents available in the current run.
+  // Empty array when no registry is wired or the registry is
+  // empty. `task_async` uses this to populate the
+  // `subagent.unknown` error's `available` field — same shape
+  // as the sync `task` tool's error path. Sorted for stable
+  // ordering across calls so audit consumers see a
+  // deterministic list.
+  getKnownSubagentNames?: () => string[];
+  // Audit recorder for pre-spawn refusals (spec
+  // ORCHESTRATION.md §3.5, audit fix #3). Called by `task` /
+  // `task_sync` / `task_async` immediately before returning a
+  // `subagent.budget_exhausted`, `subagent.unknown`, or
+  // `subagent.depth_exceeded` tool error. Persists into
+  // `subagent_gate_decisions`.
+  //
+  // The harness wraps the underlying repo write in a fail-soft
+  // try/catch — DB throws degrade audit completeness without
+  // affecting the model's view (the tool error is already
+  // about to return). Tools that don't have a recorder wired
+  // (test contexts without the harness) get `undefined` and
+  // skip the call; audit data is not load-bearing for
+  // correctness.
+  //
+  // The recorder is a single-call surface so each refusal site
+  // can write its decision in one line — keeps tool code lean
+  // and hides the db/sessionId binding inside the harness.
+  recordGateDecision?: (input: {
+    decisionType: 'budget_exhausted' | 'unknown_subagent' | 'depth_exceeded';
+    toolName: 'task' | 'task_sync' | 'task_async';
+    requestedName: string;
+    details: Record<string, unknown>;
+  }) => void;
   // Background process manager for the current session. Optional so
   // existing tools that don't need bg orchestration aren't forced to
   // declare a dependency. Tools that DO need it (`bash_background`,
@@ -136,6 +232,18 @@ export interface ToolContext {
   // The harness binds parent_session_id from this context's
   // sessionId so the link is captured automatically.
   spawnSubagent?: (args: SpawnSubagentArgs) => Promise<SpawnSubagentResult>;
+  // Async subagent handle store (spec ORCHESTRATION.md §3). Set by
+  // the harness when a subagent registry is wired and the run is
+  // not in plan mode. `task_async` calls `store.spawn(args)` to
+  // get a handle; `task_await` and `task_cancel` use the same
+  // store instance. Run-scoped — the same store survives across
+  // every step in a single `runAgent` call so a handle returned
+  // in step 3 is awaitable in step 7. Drained in the run's outer
+  // finally so a parent abort tears every running spawn down
+  // before SQLite closes. Absent ⇒ the three async-subagent
+  // tools surface `subagent.unavailable` (matching the legacy
+  // `task` tool shape when no registry is configured).
+  subagentHandleStore?: SubagentHandleStore;
   // Memory subsystem registry (spec MEMORY.md). Set by the harness
   // when memory was wired via HarnessConfig.memoryRegistry. The
   // memory_read / memory_list / memory_search tools surface a
@@ -203,9 +311,10 @@ export interface SpawnSubagentArgs {
 // Result discriminated by `kind` so the calling tool can map an
 // unknown subagent name into a tool error (model error) without
 // confusing it with an executed-but-failed run (child error). The
-// `depth_exceeded` variant is also a model-recoverable signal —
-// the model should stop nesting `task()` calls and finish the work
-// itself.
+// `depth_exceeded` and `budget_exhausted` variants are also
+// model-recoverable signals — the model should stop nesting /
+// stop spawning and finish the work itself, or wait for in-flight
+// reservations to release.
 export type SpawnSubagentResult =
   | {
       kind: 'unknown_subagent';
@@ -217,6 +326,23 @@ export type SpawnSubagentResult =
       requested: string;
       depth: number;
       maxDepth: number;
+    }
+  | {
+      // Refused by the cost-cap gate in `spawnSubagentImpl`
+      // (spec ORCHESTRATION.md §3.5). `spent` includes parent
+      // self-cost + cumulative child cost (settled, sync + async)
+      // + pessimistic reservation (in-flight async). `estimate`
+      // is the worst-case for this would-be spawn from
+      // `definition.budget.maxCostUsd`. `projected = spent +
+      // estimate`, the value that crossed `cap`. Both `task`
+      // and `task_async` map this onto a `subagent.budget_exhausted`
+      // tool error with the same `details` shape.
+      kind: 'budget_exhausted';
+      requested: string;
+      spent: number;
+      estimate: number;
+      projected: number;
+      cap: number;
     }
   | {
       kind: 'ran';
@@ -241,6 +367,21 @@ export type SpawnSubagentResult =
       // `reason='worktree_create_failed'` so non-`done` mapping
       // catches it; the field is advisory detail for diagnostics.
       worktreeError?: { code: string; message: string };
+      // Attribution for cancel-driven settles (spec
+      // ORCHESTRATION.md §3.5 audit fix). Set by the handle
+      // store when a record was explicitly cancelled via
+      // `cancel`/`cancelAll`/`drain`; carries WHO triggered
+      // it (model = explicit task_cancel, cap_watchdog =
+      // automatic kill on cap-cross, parent_drain = harness
+      // shutdown). Orthogonal to the `reason` / `status`
+      // strings — those describe the OUTCOME, this describes
+      // the SOURCE. Persisted into
+      // `subagent_handles.settled_payload.cancelSource`.
+      // Absent when the run wasn't explicitly cancelled
+      // (status === 'done', wall-clock timeout at the child
+      // layer, etc.) so postmortem queries don't get false
+      // attribution.
+      cancelSource?: 'model' | 'cap_watchdog' | 'parent_drain';
     };
 
 export interface Tool<I = unknown, O = unknown> {

@@ -53,7 +53,7 @@ description: Stub.
 tools: []
 budget:
   max_steps: 1
-  max_cost_usd: 0
+  max_cost_usd: 0.01
 output_schema:
   summary: string
 sampling:
@@ -92,7 +92,7 @@ prompt`,
 name: x
 description: y
 tools: []
-budget: { max_steps: 1, max_cost_usd: 0 }
+budget: { max_steps: 1, max_cost_usd: 0.01 }
 ---
 `,
         'user',
@@ -314,7 +314,7 @@ budget: { max_steps: 1, max_cost_usd: 0 }
     ).toThrow(/'budget.max_steps' must be a positive integer/);
     expect(() =>
       loadSubagentFromString(VALID.replace('max_cost_usd: 0.5', 'max_cost_usd: -1'), 'user', '/p'),
-    ).toThrow(/'budget.max_cost_usd' must be a finite non-negative number/);
+    ).toThrow(/'budget.max_cost_usd' must be a finite positive number/);
   });
 
   test('rejects non-finite max_cost_usd (Infinity / NaN)', () => {
@@ -329,7 +329,7 @@ budget: { max_steps: 1, max_cost_usd: 0 }
     for (const literal of cases) {
       const src = VALID.replace('max_cost_usd: 0.5', `max_cost_usd: ${literal}`);
       expect(() => loadSubagentFromString(src, 'user', '/p')).toThrow(
-        /'budget\.max_cost_usd' must be a finite non-negative number/,
+        /'budget\.max_cost_usd' must be a finite positive number/,
       );
     }
   });

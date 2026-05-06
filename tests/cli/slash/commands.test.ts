@@ -8,6 +8,7 @@ import { permsCommand, renderPolicy } from '../../../src/cli/slash/commands/perm
 import { planCommand } from '../../../src/cli/slash/commands/plan.ts';
 import { quitCommand } from '../../../src/cli/slash/commands/quit.ts';
 import { sessionsCommand } from '../../../src/cli/slash/commands/sessions.ts';
+import { subagentsCommand } from '../../../src/cli/slash/commands/subagents.ts';
 import type { SlashCommand, SlashContext } from '../../../src/cli/slash/types.ts';
 import type { HarnessConfig } from '../../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../../src/harness/types.ts';
@@ -546,6 +547,186 @@ describe('/budget', () => {
     await budgetCommand.exec(['cost', 'none'], ctx);
     expect(ctx.baseConfig.budget?.maxSteps).toBe(50);
     expect(ctx.baseConfig.budget?.maxCostUsd).toBeUndefined();
+  });
+
+  test('/budget parallel-tools N updates maxConcurrentToolCalls within cap', async () => {
+    const ctx = makeCtx();
+    const result = await budgetCommand.exec(['parallel-tools', '7'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(ctx.baseConfig.budget?.maxConcurrentToolCalls).toBe(7);
+    expect(result.notes?.[0]).toContain('7');
+    expect(result.notes?.[0]).toContain('next turn');
+  });
+
+  test('/budget parallel-tools rejects values above hard cap', async () => {
+    const ctx = makeCtx();
+    const before = ctx.baseConfig.budget?.maxConcurrentToolCalls;
+    const result = await budgetCommand.exec(['parallel-tools', '50'], ctx);
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('[1, 16]');
+    // Untouched: same as before (default seeded by makeCtx).
+    expect(ctx.baseConfig.budget?.maxConcurrentToolCalls).toBe(before);
+  });
+
+  test('/budget parallel-tools rejects 0 / negatives / non-integers', async () => {
+    for (const bad of ['0', '-1', 'abc', '3.5', '']) {
+      const ctx = makeCtx();
+      const before = ctx.baseConfig.budget?.maxConcurrentToolCalls;
+      const result = await budgetCommand.exec(['parallel-tools', bad], ctx);
+      expect(result.kind).toBe('error');
+      expect(ctx.baseConfig.budget?.maxConcurrentToolCalls).toBe(before);
+    }
+  });
+
+  test('/budget subagents N updates maxConcurrentSubagents within cap', async () => {
+    const ctx = makeCtx();
+    const result = await budgetCommand.exec(['subagents', '5'], ctx);
+    if (result.kind !== 'ok') return;
+    expect(ctx.baseConfig.budget?.maxConcurrentSubagents).toBe(5);
+    expect(result.notes?.[0]).toContain('5');
+    expect(result.notes?.[0]).toContain('next turn');
+  });
+
+  test('/budget subagents rejects values above hard cap', async () => {
+    const ctx = makeCtx();
+    const before = ctx.baseConfig.budget?.maxConcurrentSubagents;
+    const result = await budgetCommand.exec(['subagents', '20'], ctx);
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('[1, 8]');
+    expect(ctx.baseConfig.budget?.maxConcurrentSubagents).toBe(before);
+  });
+
+  test('/budget parallel-tools setting the same value returns no-change note', async () => {
+    const ctx = makeCtx();
+    const current = ctx.baseConfig.budget?.maxConcurrentToolCalls;
+    if (current === undefined) throw new Error('default missing');
+    const result = await budgetCommand.exec(['parallel-tools', String(current)], ctx);
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    expect(result.notes?.[0]).toContain('already');
+    expect(result.notes?.[0]).not.toContain('next turn');
+  });
+
+  test('/budget subagents setting the same value returns no-change note', async () => {
+    const ctx = makeCtx();
+    const current = ctx.baseConfig.budget?.maxConcurrentSubagents;
+    if (current === undefined) throw new Error('default missing');
+    const result = await budgetCommand.exec(['subagents', String(current)], ctx);
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    expect(result.notes?.[0]).toContain('already');
+    expect(result.notes?.[0]).not.toContain('next turn');
+  });
+});
+
+describe('/subagents', () => {
+  test('reports "no session yet" before any turn ran', async () => {
+    const ctx = makeCtx();
+    const result = await subagentsCommand.exec([], ctx);
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    expect(result.notes?.[0]).toContain('no session yet');
+  });
+
+  test('reports "no async subagents" when session has no handles', async () => {
+    const ctx = makeCtx();
+    const session = createSession(ctx.db, { model: 'm', cwd: '/test/cwd' });
+    const ctx2 = { ...ctx, currentSessionId: () => session.id };
+    const result = await subagentsCommand.exec([], ctx2);
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = (result.notes ?? []).join('\n');
+    expect(text).toContain('no async subagent handles');
+    // Disambiguation note: footer counter may show non-zero for
+    // sync task runs even when /subagents is empty.
+    expect(text).toContain('sync `task` calls do not appear here');
+  });
+
+  test('lists handles with status and reason for the current session', async () => {
+    const ctx = makeCtx();
+    const session = createSession(ctx.db, { model: 'm', cwd: '/test/cwd' });
+    const { insertSubagentHandle, settleSubagentHandle } = await import(
+      '../../../src/storage/repos/subagent-handles.ts'
+    );
+    insertSubagentHandle(ctx.db, {
+      handleId: 'h-running',
+      parentSessionId: session.id,
+      name: 'explore',
+      spawnedAt: Date.now(),
+    });
+    insertSubagentHandle(ctx.db, {
+      handleId: 'h-settled',
+      parentSessionId: session.id,
+      name: 'review',
+      spawnedAt: Date.now(),
+    });
+    settleSubagentHandle(ctx.db, 'h-settled', {
+      kind: 'ran',
+      reason: 'done',
+      status: 'done',
+    });
+    const ctx2 = { ...ctx, currentSessionId: () => session.id };
+    const result = await subagentsCommand.exec([], ctx2);
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    expect(result.notes).toBeDefined();
+    // 1 header + 2 rows.
+    expect(result.notes?.length).toBe(3);
+    expect(result.notes?.[0]).toContain('Async subagent handles');
+    const text = (result.notes ?? []).join('\n');
+    expect(text).toContain('explore');
+    expect(text).toContain('review');
+    expect(text).toContain('running');
+    expect(text).toContain('settled');
+    expect(text).toContain('(done)');
+  });
+
+  test('does not leak handles from other sessions', async () => {
+    const ctx = makeCtx();
+    const sessionA = createSession(ctx.db, { model: 'm', cwd: '/test/cwd' });
+    const sessionB = createSession(ctx.db, { model: 'm', cwd: '/test/cwd' });
+    const { insertSubagentHandle } = await import('../../../src/storage/repos/subagent-handles.ts');
+    insertSubagentHandle(ctx.db, {
+      handleId: 'h-other',
+      parentSessionId: sessionB.id,
+      name: 'foreign',
+      spawnedAt: Date.now(),
+    });
+    const ctx2 = { ...ctx, currentSessionId: () => sessionA.id };
+    const result = await subagentsCommand.exec([], ctx2);
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = (result.notes ?? []).join('\n');
+    expect(text).toContain('no async subagent handles');
+  });
+
+  test('handles with malformed settled_payload JSON render without "reason" suffix', async () => {
+    // `parsePayload` in the repo returns null on JSON parse errors
+    // and on non-object roots. The slash command must NOT crash
+    // and must NOT show a misleading reason — it just omits the
+    // suffix and renders the row at status='settled' bare.
+    const ctx = makeCtx();
+    const session = createSession(ctx.db, { model: 'm', cwd: '/test/cwd' });
+    // Insert directly via SQL — the repo never produces this
+    // shape, but storage corruption / migration drift could.
+    ctx.db
+      .query(
+        `INSERT INTO subagent_handles
+           (handle_id, parent_session_id, child_session_id, name, spawned_at, status, settled_payload, created_at)
+         VALUES ('h-bad', ?, NULL, 'broken', ?, 'settled', 'not-json{', ?)`,
+      )
+      .run(session.id, Date.now(), Date.now());
+    const ctx2 = { ...ctx, currentSessionId: () => session.id };
+    const result = await subagentsCommand.exec([], ctx2);
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = (result.notes ?? []).join('\n');
+    expect(text).toContain('broken');
+    expect(text).toContain('settled');
+    // No `(reason)` suffix rendered for the corrupt row.
+    expect(text).not.toContain('(undefined)');
   });
 });
 

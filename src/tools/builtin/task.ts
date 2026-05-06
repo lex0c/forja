@@ -142,7 +142,21 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
       name: args.subagent,
       prompt: args.prompt,
     });
+    // Audit: the synchronous task family hits the dispatcher
+    // first (no pre-flight check), so the three refusal kinds
+    // arrive HERE rather than inline like in `task_async`.
+    // Both `task` and `task_sync` share this execute body, so
+    // we attribute every audit row to `'task_sync'` (canonical
+    // per spec §3.1). Distinguishing the legacy `task` alias
+    // from `task_sync` is recoverable from `messages.tool_uses`
+    // if a future audit needs that fidelity.
     if (result.kind === 'unknown_subagent') {
+      ctx.recordGateDecision?.({
+        decisionType: 'unknown_subagent',
+        toolName: 'task_sync',
+        requestedName: result.requested,
+        details: { available: result.available },
+      });
       return toolError('subagent.unknown', `subagent '${result.requested}' not found`, {
         hint:
           result.available.length > 0
@@ -152,12 +166,46 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
       });
     }
     if (result.kind === 'depth_exceeded') {
+      ctx.recordGateDecision?.({
+        decisionType: 'depth_exceeded',
+        toolName: 'task_sync',
+        requestedName: result.requested,
+        details: { depth: result.depth, max_depth: result.maxDepth },
+      });
       return toolError(
         'subagent.depth_exceeded',
         `subagent '${result.requested}' would nest at depth ${result.depth} (max ${result.maxDepth})`,
         {
           hint: 'Stop nesting task() calls. Either finish the work directly in this turn or restructure into a flatter chain.',
           details: { depth: result.depth, max_depth: result.maxDepth },
+        },
+      );
+    }
+    if (result.kind === 'budget_exhausted') {
+      ctx.recordGateDecision?.({
+        decisionType: 'budget_exhausted',
+        toolName: 'task_sync',
+        requestedName: result.requested,
+        details: {
+          spent: result.spent,
+          estimate: result.estimate,
+          projected: result.projected,
+          cap: result.cap,
+        },
+      });
+      return toolError(
+        'subagent.budget_exhausted',
+        `spawning '${result.requested}' would push projected cost to $${result.projected.toFixed(6)} (cap $${result.cap.toFixed(6)})`,
+        {
+          retryable: false,
+          hint: 'Cumulative parent + child cost would cross the run cap. Finish the work without a new subagent, or wait for in-flight task_async spawns to settle and free their reservations.',
+          details: {
+            subagent: result.requested,
+            spent: result.spent,
+            estimate: result.estimate,
+            projected: result.projected,
+            cap: result.cap,
+          },
         },
       );
     }
@@ -203,4 +251,17 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
       ...(result.worktree !== undefined ? { worktree: result.worktree } : {}),
     };
   },
+};
+
+// `task_sync` is the canonical name in spec §3.1; `task` is kept
+// as the legacy alias because models discovering tools by name
+// already expect it. The two are byte-identical at the wire — same
+// inputSchema, same metadata, same execute. Spawn-side audit rows
+// carry whichever name the model invoked. Spec ORCHESTRATION.md
+// §3.1: "task (alias legado) = task_sync".
+export const taskSyncTool: Tool<TaskInput, TaskOutput> = {
+  ...taskTool,
+  name: 'task_sync',
+  description:
+    'Synchronous spawn of a subagent. Pairs with `task_async` / `task_await` / `task_cancel`. Identical to the legacy `task` tool — both names are wired to the same dispatcher. The `prompt` must be self-contained: the child has no view of this conversation.',
 };

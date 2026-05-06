@@ -31,7 +31,7 @@ import {
   type SpawnChildProcess,
   defaultSpawnChildProcess,
 } from './spawn-factory.ts';
-import type { SubagentDefinition } from './types.ts';
+import { MAX_SUBAGENT_DEPTH, type SubagentDefinition } from './types.ts';
 import {
   DEFAULT_WALL_CLOCK_MS,
   HEARTBEAT_STALE_THRESHOLD_MS,
@@ -290,10 +290,11 @@ export interface RunSubagentInput {
   maxPendingPermissionAsks?: number;
 }
 
-// Hard cap on how deep a chain of `task → task → task` can nest.
-// 4 levels covers every plausible playbook composition; surfaces
-// a clear error well before the budget caps would.
-export const MAX_SUBAGENT_DEPTH = 4;
+// MAX_SUBAGENT_DEPTH lives in `./types.ts` — see the comment
+// there for why. Re-exported here so existing callers
+// (`harness/loop.ts` and the e2e tests) keep working without
+// import churn.
+export { MAX_SUBAGENT_DEPTH };
 
 // Default cap on concurrent permission asks per child session.
 // Picked to keep the modal queue ergonomic — operator answering

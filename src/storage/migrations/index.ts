@@ -18,6 +18,9 @@ import { migration017SessionsAbortCause } from './017-sessions-abort-cause.ts';
 import { migration018ReplHistory } from './018-repl-history.ts';
 import { migration019HookRuns } from './019-hook-runs.ts';
 import { migration020SubagentRunsHooks } from './020-subagent-runs-hooks.ts';
+import { migration021SubagentHandles } from './021-subagent-handles.ts';
+import { migration022CostProgressEvents } from './022-cost-progress-events.ts';
+import { migration023SubagentGateDecisions } from './023-subagent-gate-decisions.ts';
 
 export interface Migration {
   id: number;
@@ -46,4 +49,7 @@ export const MIGRATIONS: readonly Migration[] = [
   migration018ReplHistory,
   migration019HookRuns,
   migration020SubagentRunsHooks,
+  migration021SubagentHandles,
+  migration022CostProgressEvents,
+  migration023SubagentGateDecisions,
 ];

@@ -62,7 +62,7 @@ const parseRipgrepLine = (line: string): GrepMatch | null => {
 export const grepTool: Tool<GrepInput, GrepOutput> = {
   name: 'grep',
   description:
-    'Search files for a pattern using ripgrep. Returns matching lines with file paths and line numbers.',
+    'Search files for a pattern using ripgrep. Returns matching lines with file paths and line numbers. Parallel-safe: emit multiple grep calls in a single turn to search several patterns concurrently.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -83,6 +83,7 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
     category: 'fs.read',
     writes: false,
     idempotent: true,
+    parallel_safe: true,
     display: 'list',
     cost: { latency_ms_typical: 100 },
   },

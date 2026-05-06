@@ -1003,6 +1003,77 @@ describe('not-yet-wired events accept silently', () => {
   });
 });
 
+describe('parallel:status reducer (D234)', () => {
+  test('initial state has parallelStatus null', () => {
+    expect(createInitialState().parallelStatus).toBeNull();
+  });
+
+  test('parallel:status writes the snapshot into state.parallelStatus', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'parallel:status',
+      ts: 1,
+      subagentsRunning: 2,
+      subagentsQueued: 3,
+      subagentsCap: 4,
+      toolsRunning: 1,
+      toolsCap: 3,
+    });
+    expect(r.permanent).toEqual([]);
+    expect(r.state.parallelStatus).toEqual({
+      subagentsRunning: 2,
+      subagentsQueued: 3,
+      subagentsCap: 4,
+      toolsRunning: 1,
+      toolsCap: 3,
+    });
+  });
+
+  test('subsequent parallel:status events overwrite the snapshot', () => {
+    const after1 = applyEvent(createInitialState(), {
+      type: 'parallel:status',
+      ts: 1,
+      subagentsRunning: 1,
+      subagentsQueued: 5,
+      subagentsCap: 3,
+      toolsRunning: 0,
+      toolsCap: 0,
+    });
+    const after2 = applyEvent(after1.state, {
+      type: 'parallel:status',
+      ts: 2,
+      subagentsRunning: 2,
+      subagentsQueued: 4,
+      subagentsCap: 3,
+      toolsRunning: 0,
+      toolsCap: 0,
+    });
+    expect(after2.state.parallelStatus?.subagentsRunning).toBe(2);
+    expect(after2.state.parallelStatus?.subagentsQueued).toBe(4);
+  });
+
+  test('session:start clears parallelStatus to null (boundary reset)', () => {
+    const seeded = applyEvent(createInitialState(), {
+      type: 'parallel:status',
+      ts: 1,
+      subagentsRunning: 2,
+      subagentsQueued: 0,
+      subagentsCap: 3,
+      toolsRunning: 0,
+      toolsCap: 0,
+    });
+    expect(seeded.state.parallelStatus).not.toBeNull();
+    const after = applyEvent(seeded.state, {
+      type: 'session:start',
+      ts: 2,
+      sessionId: 's1',
+      profile: 'autonomous',
+      project: 'p',
+      model: 'm',
+    });
+    expect(after.state.parallelStatus).toBeNull();
+  });
+});
+
 describe('history-clear modal (HISTORY.md §2.3)', () => {
   test('history-clear:ask opens a modal with three options + last selected', () => {
     const r = applyEvent(createInitialState(), {

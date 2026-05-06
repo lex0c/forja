@@ -15,6 +15,2142 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — TUI footer queue split + parallel-tools chip
+
+User-prompted gap audit: "como a TUI exibe o paralelismo?"
+This slice closes the remaining two visibility gaps the
+audit identified — combining queue depth with running count
+in the subagents footer chip, and surfacing the parallel-
+tool dispatcher's running count alongside the cap.
+
+Pre-D234, the footer counter `subagents N` agreed all
+runs (sync + async, dispatched + queued) into one
+number. With cap=3 and 5 task_async calls, the operator
+saw `subagents 5` with no signal that 2 were waiting on
+slot acquisition. Similarly, the parallel-tool path
+showed N concurrent cards but no aggregate — operators
+couldn't tell whether they were running near or below the
+cap.
+
+| File | Change |
+|---|---|
+| `src/harness/types.ts` | New `HarnessEvent` variant `parallel_status` carrying `subagentsRunning`, `subagentsQueued`, `subagentsCap`, `toolsRunning`, `toolsCap`. Documented as the snapshot the harness fires whenever the in-flight or queued counts change. |
+| `src/subagents/handle-store.ts` | Store gains a `queuedCount()` getter and an `onStateChange` option. Internal counter `queued` increments on `spawn` (fires callback), decrements when the IIFE wakes from `acquireSlot` (fires callback again). Settle (`status='running'` → `'settled'`) also fires. Three transitions per record: spawn / dispatch / settle — all emit. |
+| `src/harness/loop.ts` | New helper `emitParallelStatus()` snapshots the store + run-local `parallelToolsRunning` / `parallelToolsCap` counters and `safeEmit`s `parallel_status`. Wired into the store's `onStateChange`; also called before/after each `safeInvokeOne` (parallel tool branch only). The cap is set to `min(parallelCap, tool_uses.length)` for the duration of the batch and reset to 0 after. |
+| `src/tui/events.ts` | New `ParallelStatusEvent` UIEvent + union member. |
+| `src/tui/harness-adapter.ts` | New top-level case translates `parallel_status` 1:1 to `parallel:status`. |
+| `src/tui/state.ts` | New `state.parallelStatus` field (nullable; null until the first event lands and on session boundaries). New reducer case writes the snapshot. |
+| `src/tui/render/footer.ts` | Two new chip variants. (a) `subagents R+Q/cap` when `parallelStatus !== null && R+Q > 0`, with the `+Q` segment suppressed at queue=0 (pure-running state reads as `subagents 2/3` rather than `subagents 2+0/3`). (b) `tools R/cap` when `R > 1`. Single-tool runs leave the chip off — the per-tool card already shows them. Fallback to legacy `subagents N` when `parallelStatus === null` covers pre-event surfaces. |
+| `tests/subagents/handle-store.test.ts` | Two new tests: `queuedCount` reflects unmet `acquireSlot`s; `onStateChange` fires on spawn / dispatch / settle (>=3 transitions per record). |
+| `tests/tui/state.test.ts` | New describe `parallel:status reducer`: initial state nullable; reducer writes the snapshot; subsequent events overwrite; session boundary clears. |
+| `tests/tui/render/footer.test.ts` | Five new chip-rendering tests: `R+Q/cap` shape; queue-suffix suppressed at 0; both chips suppressed at zero; `tools R/cap` shows only when R > 1; null `parallelStatus` falls back to legacy chip. |
+| `tests/tui/harness-adapter.test.ts` | One new translation test: `parallel_status` lands as `parallel:status` with all five counters preserved. |
+
+**Decision:**
+
+- **D234 — `R+Q/cap` shape, not `total/cap`.** The two
+  numbers carry distinct operator signal. `total/cap` would
+  compress "5 tasks emitted, 3 running" and "5 tasks
+  emitted, 5 running" into the same `5/3` — the operator
+  loses the queue depth, which is the figure they actually
+  use to decide "should I wait or kill some?". The
+  `R+Q/cap` shape costs one extra char (`+0` / `+2`) and
+  surfaces the queue at a glance; the queue-zero
+  suppression keeps the common case visually clean.
+
+- **Tools chip suppressed at R=1.** A single tool in flight
+  is visible via its per-tool card; adding `tools 1/3` to
+  the footer would be a duplicate signal at best, noise at
+  worst. The chip exists specifically for "running multiple
+  in parallel" — visible only when that condition holds.
+
+- **Legacy fallback preserved.** The footer chip falls back
+  to `state.subagents.size` when `parallelStatus === null`.
+  Two reasons: (a) a brief window between `subagent:start`
+  and the first `parallel_status` event fires, which
+  shouldn't go visually empty; (b) any future surface that
+  bypasses the harness's emission still gets a basic chip.
+  The branch evaporates once `parallel_status` arrives.
+
+- **D235 — Cap-watchdog fires once per run.** Code review
+  caught that `cap_watchdog_fired` could emit multiple
+  times for one effective watchdog event: after the first
+  `cancelAll('cap_watchdog')`, every cancelled record
+  contributes 0 to the reservation, but
+  `cumulativeChildCostUsd` already accumulated the
+  pre-cancel cost and stays > cap. Any `cost_update` still
+  queued in the IPC pipe (the child hadn't yet observed
+  the abort signal) re-enters the same `total > cap`
+  branch and re-emits the banner. Fix: a run-scoped
+  `capWatchdogFired` latch. Set BEFORE `cancelAll` so
+  a re-entrant forwarder on the same microtask sees
+  `true` and skips. `cancelAll` is idempotent so the
+  structural side effect was already safe — only the
+  operator-visible signal needed deduplication.
+
+- **D236 — `cancelledCount` reflects dispatched, not
+  queued.** Review caught that `inFlightCount()` returns
+  every record with `status === 'running'` — including
+  records still parked on `acquireSlot`. Saying "3
+  subagents cancelled" when only 2 had actually
+  dispatched would mislead the operator. Fix:
+  `inFlightCount() - queuedCount()` matches the intended
+  "actually running through spawnFn" semantic. Wrapped
+  in `Math.max(0, …)` for defense against any race that
+  produces a transient negative.
+
+- **Adapter contract pinning.** Review (point 7) flagged
+  that the reducer's "undefined = no change" semantic
+  for `cumulativeCostUsd` depends on every non-cost inner
+  kind omitting the field. Test sweep added covering all
+  current inner kinds (step_start, tool_invoking,
+  tool_finished, compaction_started, compaction_finished,
+  todo_updated, tool_warning) — a future inner kind that
+  forgets to think about cost surfaces as a test failure
+  rather than a silent zeroing of the per-row chip.
+
+Verification: typecheck clean, lint clean, 3170 pass / 0
+fail (14 new tests across handle-store + state + footer +
+adapter, +1 cross-inner pinning sweep). Smoke 09 + 10 still
+pass — the new emission path doesn't perturb the existing
+parallel-dispatch wire.
+
+---
+
+## [2026-05-06] parallel — TUI cost chip + cap-watchdog banner
+
+User-prompted gap audit: "como a TUI exibe o paralelismo?"
+Audit found two visibility gaps that operators hit during
+real fan-out runs:
+
+1. **Cost is invisible mid-run.** Subagent rows in the live
+   region showed name, progress one-liner, and elapsed
+   time — but no spend. The cost only landed in the
+   permanent summary on `subagent:end`, so an operator
+   watching a long-running fan-out couldn't tell whether
+   one child was burning the budget.
+
+2. **Cap-watchdog cancellations are silent.** When the
+   cost-cap watchdog (`cancelAll('cap_watchdog')`) killed
+   every active handle, the rows just disappeared from the
+   live region and the footer counter dropped — no banner,
+   no scrollback line, no signal beyond the absence. The
+   operator had to root-cause via `/sessions` / audit
+   tables to discover the cap was the cause.
+
+This slice closes both. Two slices remain (footer queue
+split, parallel-tool counter) — separate commit since they
+share a new HarnessEvent.
+
+| File | Change |
+|---|---|
+| `src/tui/state.ts` | `state.subagents` row gains `liveCostUsd: number`. Initialized to 0 on `subagent:start`; updated on `subagent:update` whose `cumulativeCostUsd` is populated (the `cost_update` inner case). Other progress events leave it unchanged — semantics: undefined on the event = "no change". |
+| `src/tui/events.ts` | `SubagentUpdateEvent` gains optional `cumulativeCostUsd: number`. |
+| `src/tui/harness-adapter.ts` | `subagent_progress` with `lastEvent.type === 'cost_update'` now (a) keeps the existing one-liner heartbeat as `+$X.XXXX` (the delta) and (b) attaches `cumulativeCostUsd` for the reducer. New top-level case `cap_watchdog_fired` translates to a `warn` permanent line: `cap watchdog: 3 subagents cancelled — cumulative $5.12 exceeded cap $5.00`. |
+| `src/tui/render/subagent-row.ts` | Row renders an optional `· $X.XXXX` cost chip in the secondary chrome. Suppressed when `liveCostUsd === 0` so test fixtures (zero-cost mock providers) and free-tier runs stay visually clean. |
+| `src/harness/types.ts` | New `HarnessEvent` variant `cap_watchdog_fired` with `cancelledCount`, `cumulativeUsd`, `capUsd`. |
+| `src/harness/loop.ts` | The watchdog branch (where `total > maxCostUsd` triggers `cancelAll`) now also `safeEmit`s `cap_watchdog_fired`. Snapshot the count BEFORE `cancelAll` so the operator-visible figure reflects what the watchdog asked to kill, before the IIFE settles flip status. |
+| `tests/tui/render/subagent-row.test.ts` | Two new tests: cost chip renders `$X.XXXX` when `liveCostUsd > 0`; suppressed at zero. |
+| `tests/tui/harness-adapter.test.ts` | Three new tests: `cost_update` inner pipes `cumulativeCostUsd` through; non-cost inner omits the field; `cap_watchdog_fired` surfaces as a warn line with the right shape; pluralization branch covered. |
+| `tests/tui/render/footer.test.ts` | Three existing fixtures updated to set `liveCostUsd: 0` (now required on the row state). |
+| `tests/tui/render/subagent-row.test.ts` | Helper updated to default `liveCostUsd: 0`. |
+
+**Decision:**
+
+- **D232 — Cost chip suppressed at zero, not "always
+  shown".** Tests run on mock providers with
+  `cost_per_1k_*: 0`; rendering an always-zero `· $0.0000`
+  chip would clutter every fixture without conveying
+  signal. Suppression at zero matches the existing
+  `bgProcesses.size > 0` / `subagents.size > 0` /
+  `memoryCount > 0` patterns elsewhere in the footer —
+  show the token only when the underlying state has
+  something to say.
+
+- **D233 — Watchdog event is a banner, not a row mutation.**
+  The handles that got cancelled DO surface their
+  cancellation via `subagent:end` with `status: 'error'`
+  + `cancelSource: 'cap_watchdog'` in the cached envelope.
+  But the per-handle end is too quiet for a multi-cancel
+  event — three rows ending in the same tick gives the
+  operator three small lines, not one root-cause
+  signal. The banner message names the cap explicitly
+  (`exceeded cap $X.XX`) so the operator can decide
+  whether to raise the cap or rein in the model without
+  consulting `/budget`.
+
+- **Cumulative-cost chip uses 4-decimal precision.** Same
+  precision as the footer's `formatCost` so an operator
+  glancing across the screen sees consistent figures.
+  6-decimal would push the chip past the 80-col budget on
+  long subagent names; 2-decimal loses signal for cheap
+  reads ($0.0023 → $0.00 hides the difference between a
+  cheap exploration and a free run).
+
+Verification: typecheck clean, lint clean, 3156 pass / 0
+fail (5 new tests).
+
+---
+
+## [2026-05-06] parallel — task_list tool for handle visibility
+
+User-prompted gap audit: "modelo consegue gerenciar o
+paralelismo?" The audit identified that the model could
+spawn / await / cancel handles but had no way to recover
+handle ids it lost (long context drops earlier turns,
+post-resume rehydration, programmatic uncertainty). Without
+this surface, the model has to guess based on prior text or
+re-invoke task_async — wasting a spawn slot. The operator
+slash `/subagents` covered the operator's view; this slice
+adds the model-facing equivalent.
+
+Read-only and parallel-safe by construction: the tool just
+snapshots the in-memory store and serializes to a tool-result
+envelope. Plan-mode safe (no shell-out, no FS mutation).
+
+| File | Change |
+|---|---|
+| `src/subagents/handle-store.ts` | New `SubagentHandleSummary` type carrying status + a `kind` discriminator (review fix Q3 — present iff settled, lets the model tell `'ran'` from refusal kinds without a follow-up `task_await`) + (when settled with a `kind: 'ran'` envelope) a one-line summary block: child status, reason, cost, steps, duration, child_session_id, optional cancelSource. New `listDetailed()` method on `SubagentHandleStore` returning the summary array. The full envelope stays unexposed — it can be 100+ KiB of child output, and a list operation should be cheap; the model follows up with `task_await(id)` when it wants the body. |
+| `src/tools/builtin/task-list.ts` | NEW. `taskListTool` reads the store via `listDetailed`, sorts by spawn order, optionally filters by status, and shapes the output as `{ handles: TaskListEntry[], in_flight, settled, total_in_flight, total_settled }`. The first two counters reflect the FILTERED set; the latter two (review fix Q2) reflect the WHOLE store regardless of filter — lets the model decide e.g. "I asked for running, but there are 3 settled handles I should `task_await` for cached output before fanning out more". |
+| `src/tools/builtin/index.ts` | Imports + exports the new tool; registers in BUILTIN_TOOLS adjacent to `taskCancelTool`. |
+| `src/cli/parallel-prompt.ts` | Hint preamble extended with one bullet: "Use `task_list` to recover handle ids you may have lost track of (long context, post-compaction, after a resume) or to confirm what is still in flight before fanning out more work." |
+| `tests/subagents/handle-store.test.ts` | Three new tests: (a) listDetailed surfaces running + settled with the right shape; (b) refusal kinds (unknown_subagent, depth_exceeded, budget_exhausted) get status='settled' WITHOUT a settled block; (c) cancelled-then-settled rows surface cancelSource on the summary. |
+| `tests/tools/task-list.test.ts` | NEW. Ten tests covering: empty list; running+settled mix in spawn order with counters; status filter; refusal-kind handles; cancel attribution surfaced; `subagent.unavailable` when no store; abort signal handling; (review fix Q7) rehydrated handles from a prior run surface in the snapshot — the headline use case for the tool; `child_session_id: null` for cancelled-before-dispatch envelopes; multiple refusal kinds in one snapshot all discriminated by `kind`. |
+| `tests/cli/parallel-prompt.test.ts` | New assertion: hint contains `task_list`. |
+| `tests/cli/bootstrap.test.ts` | One existing test's tool-list expectation includes `task_list`. |
+
+**Decision:**
+
+- **D229 — `task_list` exposes summaries, not full envelopes.**
+  Two reasons. (1) Cost: full envelopes can carry 100+ KiB of
+  child output; a list operation should be cheap and
+  predictable. (2) Workflow: the model uses `task_list` to
+  ORIENT (figure out what handles exist), not to consume
+  output — consumption is `task_await`'s job. Mirroring the
+  full envelope here would conflate the two operations and
+  encourage the model to skip `task_await` even when it
+  needs the output, defeating the cached-envelope path.
+  Refusal kinds (unknown_subagent / depth_exceeded /
+  budget_exhausted) intentionally surface as
+  `status: 'settled'` without a summary block — they're
+  recoverable via `task_await(handle_id)` which surfaces
+  the full refusal as a structured tool error.
+
+- **No persistence layer change.** The tool reads from the
+  in-memory store, which already rehydrates from
+  `subagent_handles` at construction time. Settled
+  handles from prior runs of the same session show up as
+  `status: 'settled'` with their cached envelope summary —
+  same view the operator's `/subagents` slash sees.
+
+- **D230 — Refusal kinds are discriminated, not hidden.**
+  Code review (Q3) flagged that surfacing refusal handles
+  as `status: 'settled'` without any other signal forced
+  the model into a wasted `task_await` round-trip just to
+  classify the row. The `kind` field on the entry is
+  always populated for settled handles, so the model
+  triages locally: `'ran'` means an outcome (read the
+  `settled` block); the three refusal kinds say "this
+  handle was refused at the gate, follow up with
+  `task_await` only if you want the structured detail".
+
+- **D231 — Two counter dimensions: filtered + total.**
+  Review (Q2) noted the original "counters reflect the
+  filtered set" lost information when the model passed
+  `status: 'running'`. The output now carries both the
+  filtered counters AND `total_in_flight` /
+  `total_settled` over the whole store. The four-counter
+  shape is pure additive — pre-existing consumers that
+  only read `in_flight` / `settled` see the same numbers
+  they did before.
+
+- **Follow-up logged: pagination / soft cap.** Review (Q6)
+  noted that for long sessions with hundreds of subagents,
+  `task_list` returns the whole store. No cap today —
+  worth revisiting if real usage shows large snapshots.
+  Punted as a future slice with a `limit` arg + newest-
+  first ordering. Not in scope here since the typical
+  session has <10 handles and adding ordering semantics
+  needs a deliberate UX decision.
+
+Verification: typecheck clean, lint clean, 3150 pass / 0
+fail (13 new tests across handle-store + task-list).
+
+---
+
+## [2026-05-06] parallel — surface parallelism affordances to the model
+
+User-prompted gap audit: "o modelo sabe que pode rodar coisas
+em paralelo?" Audit answer: only partially. `task_async`'s
+description spelled out the fan-out pattern explicitly, but
+the 6 parallel-safe builtins (`read_file`, `glob`, `grep`,
+`memory_read`, `memory_list`, `memory_search`) gave zero
+hint about batchable dispatch in their descriptions, and
+no system-prompt preamble taught the meta-rule. Models
+default to one-tool-per-turn under that signal vacuum,
+leaving the harness's parallel-tool path
+(spec ORCHESTRATION.md §1.3) capability-dormant. Smoke 09
+(`evals/smoke/09-parallel-reads.yaml`) only passed because
+its prompt EXPLICITLY said "emit all three calls in a single
+turn"; the model wasn't getting there on its own.
+
+Two-layer fix:
+
+  1. **Per-tool descriptions.** Each of the 6
+     parallel-safe builtins gains a "Parallel-safe: ..."
+     sentence in its `description`. Pattern is consistent
+     across tools: "emit multiple X calls in a single turn
+     to ... concurrently." Makes the affordance visible at
+     the tool-discovery layer without requiring system
+     prompt cooperation.
+
+  2. **System-prompt preamble.** New
+     `src/cli/parallel-prompt.ts` exports
+     `PARALLEL_HINT_PROMPT` — a short markdown block that
+     names the 6 parallel-safe tools, the `task_async` /
+     `task_await` / `task_cancel` family, AND the cases
+     where sequential dispatch is correct ("when each step
+     depends on the previous one"). Bootstrap composes this
+     hint as a universal preamble, prepended to whatever the
+     caller / plan-mode supplied. Three-layer ordering:
+     hint (universal background) → plan/user prompt
+     (operating mode) → memory section (project context).
+
+| File | Change |
+|---|---|
+| `src/tools/builtin/read-file.ts` | Description appended: "Parallel-safe: emit multiple read_file calls in a single turn to batch reads — the harness dispatches them concurrently." |
+| `src/tools/builtin/glob.ts` | Same shape: "Parallel-safe: emit multiple glob calls in a single turn to scan several patterns concurrently." |
+| `src/tools/builtin/grep.ts` | Same shape: "Parallel-safe: emit multiple grep calls in a single turn to search several patterns concurrently." |
+| `src/tools/builtin/memory-read.ts` | Same shape, with "to load several memories concurrently." |
+| `src/tools/builtin/memory-list.ts` | Same shape, with "(e.g. one per scope) to enumerate concurrently." |
+| `src/tools/builtin/memory-search.ts` | Same shape, with "to query several patterns concurrently." |
+| `src/cli/parallel-prompt.ts` | NEW. `PARALLEL_HINT_PROMPT` constant + `composeWithParallelHint(downstream)` helper. Mirrors the `plan-prompt.ts` shape so both system-prompt layers compose the same way. |
+| `src/cli/bootstrap.ts` | Imports `composeWithParallelHint`. The systemPrompt assembly now stacks three layers in precedence order: hint (universal) → plan-mode prompt OR caller's prompt (operating mode) → memory section (project context). |
+| `src/cli/subagent-child.ts` | (Review fix) Imports `composeWithParallelHint` and prepends the hint above `audit.systemPrompt` BEFORE the optional memory composition. Without this, subagent children — which build their config independently of `bootstrap.ts` — inherited only the per-tool "Parallel-safe: ..." descriptions but missed the meta-rule preamble. Exploration subagents (`tools: [read_file, grep, glob]` — typical) regressed to capability-dormant one-tool-per-turn behavior, exactly the pre-D227 state the slice exists to fix. |
+| `tests/cli/parallel-prompt.test.ts` | NEW. Five unit tests: hint anchors on concrete tool names; hint acknowledges sequential dispatch; compose returns hint alone for undefined/empty downstream; compose prepends hint with separator before downstream. |
+| `tests/cli/bootstrap.test.ts` | Four existing tests updated to reflect that the system prompt now always carries the hint as a base. New ordering assertion in the plan+user composition test: hint < plan < user. |
+| `tests/cli/subagent-child.test.ts` | (Review fix) New test "child system prompt carries the parallelism hint": captures the system block via a recording provider, asserts hint precedes the subagent's identity prompt. Two pre-existing tests ("whitelist without memory_*..." / "memoryCwd absent...") updated to assert hint+identity instead of identity-alone — the property they actually test (memory section suppression) is preserved with stronger assertions on what DOES land. |
+| `evals/smoke/10-parallel-reads-implicit.yaml` | NEW smoke. Same fixture as 09 but the prompt drops the "emit all three in a single turn" instruction — just "take a look... summarize." Cap of 4 steps (review fix: bumped from 3 for safety margin without losing the property) — full serialization (3 reads + 1 summary = 4 steps) trips on any extra interleaved turn, while parallelization lands at 2 steps. Counterpart eval that 09 (explicit prompt) doesn't reach. |
+
+**Decision:**
+
+- **D227 — The hint is universal, not opt-in.** A flag-
+  gated hint would defeat the point: the affordance is
+  invisible to the model under the default config, which
+  is precisely the configuration most operators (and most
+  CI eval runs) hit. Forcing every caller to opt in would
+  re-introduce the gap. The hint is short (~7 sentences)
+  so the prompt-cache amortization is fine, and it's
+  composable: callers' prompts layer AFTER as more-specific
+  instructions.
+
+- **Hint goes FIRST in the composition order.** Background
+  framing belongs above operating-mode framing belongs
+  above project-context. The model reads them as a stack:
+  general capabilities → mode-specific rules → concrete
+  context. Reversing the order would push "you can run
+  things in parallel" below specific instructions and let
+  the more-specific framing override the affordance signal.
+
+- **D228 — Hint reaches subagent children too.** Code
+  review caught that `subagent-child.ts` builds its harness
+  config independently of `bootstrap.ts`, so the hint
+  injection in bootstrap didn't propagate. Subagents that
+  inherit `read_file` / `grep` / `glob` (typical
+  exploration personas) MUST see the meta-rule preamble
+  too — the per-tool descriptions alone are not enough.
+  Fix mirrors the bootstrap composition: hint goes ABOVE
+  the audit-snapshot identity prompt, memory section
+  (when applicable) goes below — same three-layer order.
+
+- **Smoke 10 is the regression net.** Without the hint
+  AND without per-tool descriptions, smoke 10 would fail
+  on the maxSteps=4 cap because the model sequentializes
+  one read per turn. With both, it lands in 2 steps.
+  Smoke 09 (explicit prompt) keeps passing as the
+  protocol-level regression for the parallel-safe wire.
+  Smoke 10 is the meta-regression for the model-side
+  guidance — if a future change weakens the hint or strips
+  the per-tool annotations, smoke 10 trips first.
+
+- **Follow-up logged: prompt-cache marker on system block.**
+  Code review noted `src/providers/anthropic/index.ts` passes
+  `system: req.system` as a plain string with no
+  `cache_control: ephemeral` marker. The hint adds ~270
+  tokens that ride above the cached prefix on every turn.
+  Pre-existing condition (memory section also pays full
+  cost), not introduced here, but worth a separate slice
+  to wire the cache marker on the system block — would
+  amortize hint + memory across the prompt cache TTL.
+
+Verification: typecheck clean, lint clean, 3137 pass / 0
+fail (6 new tests, 4 existing updated). Smoke 09 pass (2
+steps, $0.0431). Smoke 10 pass (2 steps, $0.0429) — model
+parallelized purely from hint + per-tool descriptions, no
+explicit "single turn" instruction.
+
+---
+
+## [2026-05-06] parallel — rehydrate worktree fields in settled handle envelopes
+
+User-spotted bug. The `kind: 'ran'` rehydration branch in
+`envelopeFromJson` rebuilt a partial envelope from
+`settled_payload`: it restored `output`, `sessionId`,
+`status`, `reason`, cost, steps, duration, and (post-D215)
+`auditFailure` + `cancelSource` — but DROPPED the optional
+`worktree` and `worktreeError` fields.
+
+Concrete impact: a subagent with `isolation: worktree`
+settles with a `worktree: { path, branch, dirty, preserved,
+removed }` payload (or `worktreeError: { code, message }`
+if creation failed). `envelopeToJson` is identity-cast, so
+the field persists into the row's `settled_payload` JSON
+intact. But on resume, `envelopeFromJson` rebuilds the
+envelope without those keys — `task_await` after a resume
+returns less information than the original (pre-resume)
+`task_await` for the same handle, even though the row in
+the DB has the data.
+
+The asymmetry only surfaces post-resume (in-memory
+settledResult is used directly, no rehydrate). Easy to
+miss in tests that don't model a resume cycle for
+worktree-isolated subagents.
+
+| File | Change |
+|---|---|
+| `src/subagents/handle-store.ts` | Two new defensive validation branches added to `envelopeFromJson` after the `auditFailure` block. (a) `worktree`: requires all five fields (`path`, `branch`, `dirty`, `preserved`, `removed`) to validate their declared types together; a partial shape is treated as missing rather than half-restored. (b) `worktreeError`: same shape as `auditFailure` (code + message), validated identically. Both use the same conditional-spread pattern as the existing fields so the resulting envelope shape stays minimal when the row had no worktree (the common `isolation: none` case). |
+| `tests/subagents/handle-store.test.ts` | NEW test "rehydrates worktree + worktreeError fields on resume". Three scenarios: (a) successful worktree outcome with all five fields set — resume must surface every one; (b) worktreeError row (creation failed) — resume must surface code+message; (c) malformed partial worktree (missing `removed`) — rehydrate drops it silently rather than smuggling `undefined` past the boolean type. |
+
+**Decision:**
+
+- **D226 — All-or-nothing validation on the `worktree`
+  block.** A partial shape (missing one field) is treated
+  as missing entirely rather than half-restored with
+  fallback values. The fields are semantically coupled
+  (`preserved` and `removed` are mutually exclusive
+  booleans; defaulting either silently changes the
+  observable outcome the model sees). All-or-nothing is
+  symmetric with how `auditFailure` already validates code
+  AND message together. Future schema additions to
+  `WorktreeOutcome` get the same rule by following the
+  pattern.
+
+Verification: typecheck clean, lint clean, 3131 pass / 0
+fail (1 new test).
+
+---
+
+## [2026-05-06] parallel — degenerate-loop tracker counts only dispatched calls
+
+User-spotted bug. The pre-batch degenerate-loop check in
+`runAgent`'s step body iterated every `tool_use` and pushed
+its hash into `recentToolHashes` BEFORE any invocation
+happened. If the step exited mid-batch — soft/hard abort
+between iterations, `maxToolErrors` after the first failure
+— the unexecuted tu's stayed in the global buffer.
+
+The drift surfaces as a semantic invariant break: the
+buffer's contract is "hashes of tool calls the harness
+actually dispatched in the recent window", but the
+implementation was "hashes the model emitted in the recent
+window, even ones the harness refused to dispatch". The two
+diverge whenever a step exits early.
+
+In today's codebase every early-exit path is terminal
+(`finish()` always ends `runAgent`), so the buffer's
+post-bail contents never matter — the run is over. The
+bug is therefore latent rather than observable in current
+behavior. But the bookkeeping mismatch is a landmine for
+any future refactor that introduces a non-terminal mid-step
+exit (e.g. a soft-stop variant that lets the loop continue
+into the next step, or a partial retry path). Fixing the
+invariant now keeps the future change small.
+
+| File | Change |
+|---|---|
+| `src/harness/loop.ts` | Pre-batch detection now runs against a LOCAL COPY of `recentToolHashes` (`const preBatchHashes = [...recentToolHashes]`). The local copy is mutated as the pre-batch loop walks the tu's; if any tu trips `maxRepeatedToolHash`, the harness still bails with the same message naming the offending tu. The GLOBAL buffer is untouched at the pre-batch stage. Per-dispatch push moved to two new sites, mirroring the per-iteration tracking that already existed for serial-only behavior pre-parallel: (a) inside the serial loop body, after the abort/soft-stop checks, before `invokeOne`; (b) inside `safeInvokeOne` (parallel path), after the abort guard, before `invokeOne`. Workers that take the abort-skipped branch in `safeInvokeOne` (D223) NEVER push, so unexecuted calls don't pollute the buffer. |
+
+**Decision:**
+
+- **D225 — Pre-batch detection is read-only on the global
+  buffer; per-dispatch tracking is the only writer.** The
+  pre-batch loop's job is "refuse cheaply if this batch
+  WOULD trip the threshold" — it doesn't need to mutate
+  shared state to do that. The local-copy pattern (snapshot
+  at entry, mutate the snapshot) gives the same detection
+  correctness (in-batch repeats AND batch-vs-history
+  repeats both detected) without the side effect. The
+  per-dispatch sites are the natural single-writer for the
+  buffer: each push corresponds to a tool call the harness
+  committed to running. JS single-threaded execution means
+  concurrent parallel workers' pushes serialize without
+  races; the ordering is non-deterministic but the
+  invariant ("each entry corresponds to a real dispatch")
+  is preserved regardless.
+
+- **No new test.** The fix is invariant-correctness; today's
+  early-exit paths are all terminal, so the diff between
+  pre- and post-fix behavior isn't observable in `runAgent`'s
+  external surface. Existing degenerate-loop tests
+  (`tests/harness/loop.test.ts:481` "identical tool calls
+  are caught", `tests/harness/parallel.test.ts:594`
+  "degenerate-loop check fires pre-batch even when all
+  parallel_safe") continue to pass — they exercise the
+  detection path without depending on the buffer's
+  post-bail state. Adding a defensive test would require
+  inspecting the private `recentToolHashes` or constructing
+  a synthetic non-terminal exit path, both of which would
+  encode implementation details the fix is trying to keep
+  loose.
+
+Verification: typecheck clean, lint clean, 3130 pass / 0
+fail (no new tests).
+
+---
+
+## [2026-05-06] parallel — busy_timeout=5000 to absorb WAL contention
+
+User-prompted DB review. The parallelism architecture has
+parent + up to 8 child subagent subprocesses, each with its
+own DB connection. WAL allows multiple readers + 1 writer;
+N+1 writers compete for the lock. With default
+`busy_timeout = 0`, any collision throws SQLITE_BUSY
+immediately at the caller — no internal retry.
+
+Several writes are fail-soft (audit streams:
+`cost_progress_events`, `subagent_gate_decisions`,
+`hook_runs`) so a throw degrades audit completeness
+silently. Others are load-bearing (`messages`,
+`sessions.complete`, `subagent_handles.settle`) and
+propagate up. Both categories benefit from internal retry:
+5s is well above any single-row write latency on commodity
+disk (typical <5ms) and well below any operator-perceptible
+hang threshold.
+
+| File | Change |
+|---|---|
+| `src/storage/db.ts` | One new PRAGMA inside the file-backed branch: `PRAGMA busy_timeout = 5000`. In-memory DBs are skipped — they're single-connection by construction, and some tests simulate `SQLITE_BUSY` via mock; applying a real timeout there would slow those tests without buying anything. |
+| `tests/storage/db.test.ts` | Two new tests: file-backed DB asserts `PRAGMA busy_timeout` returns 5000; in-memory DB asserts it stays at 0 (the default). |
+
+**Decision:**
+
+- **D224 — busy_timeout=5000 is universal for file-backed
+  DBs.** Skipping memory DBs preserves test determinism
+  (tests that simulate contention via mock get the throw
+  they expect) without weakening production guarantees —
+  in-memory DBs in production would be a bug, not a
+  contention surface.
+
+Verification: typecheck clean, lint clean, 3130 pass / 0
+fail (2 new tests).
+
+---
+
+## [2026-05-06] parallel — stop dispatching queued tool calls after abort
+
+User-spotted bug. The parallel worker loop (`runPool`) had
+no abort check before dequeuing the next item, so workers
+kept invoking queued `tool_uses` even after the run signal
+had aborted. The serial path checks `signal.aborted` at the
+top of each iteration and `return await finish('aborted')`
+immediately; the parallel path was silently divergent.
+
+Concrete impact: 5 `parallel_safe` tool_uses with cap=2 and
+a hard interrupt (Ctrl+C / wall-clock timeout) landing
+30ms in. Workers A and B grabbed tu1/tu2 — their tools
+self-cancel via `ctx.signal` and return cleanly. Workers
+A and B then dequeued tu3, tu4, tu5 and invoked them. Each
+of those tools ALSO got `ctx.signal.aborted` and exited
+fast — but their `execute(args, ctx)` body still ran up
+to the first signal check. A tool that performed any side
+effect BEFORE its first cooperative `signal` check (e.g.
+opening a file handle, sending a message) would have
+committed that side effect after the run was supposed to
+be cancelled.
+
+| File | Change |
+|---|---|
+| `src/harness/loop.ts` | Two-step guard. (1) `safeInvokeOne` pre-checks `signal.aborted` AND `softStopSignal.aborted` before calling `invokeOne` — returns a synthesized `is_error: true` placeholder with `failed: false` (an aborted dispatch is not a tool failure, so consecutiveErrors stays clean). (2) Post-`runPool`, before any message append or bailCounter handling, the harness mirrors the serial path's `if (signal.aborted) return await finish(...)` — abort takes precedence over the partial tool_result message, matching the existing "no half-baked tool_result on abort" contract. |
+| `tests/harness/parallel.test.ts` | NEW regression test "hard abort mid-batch stops dispatch of queued tool_uses". 5 tool_uses, cap=2, each delays 1s; abort fires at 30ms. The tool increments a counter at the TOP of execute (before any signal check). With the fix, only the 2 workers that entered before the abort count; the test asserts `totalInvoked ≤ 2`. Without the fix, all 5 dispatch and the count climbs to 5. |
+
+**Decision:**
+
+- **D223 — Parallel dispatch must mirror serial's
+  pre-iteration abort check.** Two distinct guards because
+  the parallel path has two distinct dispatch surfaces: the
+  per-worker `safeInvokeOne` (one tool_use about to fire)
+  and the post-pool message append (the entire batch
+  about to land in the transcript). Both need the check;
+  either alone is incomplete. The serial path's
+  per-iteration check covers both because it interleaves
+  dispatch and message append, while the parallel path
+  separates them — discovering this asymmetry was the
+  user-spotted catch.
+
+- **`failed: false` on the abort-skipped placeholder.** An
+  aborted dispatch is not a tool failure: the tool never
+  ran, so `consecutiveErrors` must not climb. Conflating
+  abort with failure would make `maxToolErrors` trip on
+  abort sequences, masking the true exit reason. Distinct
+  from the `is_error: true` field on the tool_result
+  payload, which signals the model that there's no
+  meaningful output (consistent with how the serial path
+  treats interrupted runs).
+
+Verification: typecheck clean, lint clean, 3128 pass / 0
+fail (1 new regression test).
+
+---
+
+## [2026-05-06] parallel — persisted gate-decision audit table (audit fix #3)
+
+Auditability gap. Three pre-spawn refusal kinds —
+`subagent.budget_exhausted`, `subagent.unknown`,
+`subagent.depth_exceeded` — surface as tool errors and the
+only forensic trace lives in `messages.tool_results` JSON
+payloads. Queries like "did this run hit the budget cap?" or
+"which subagent typos did the model retry into?" require
+JSON scans across long message histories, with no closed-set
+column to filter on.
+
+Fix: new table `subagent_gate_decisions` (migration 023)
+captures every refusal as a first-class row. Schema:
+discriminated `decision_type` (closed enum via CHECK),
+`tool_name` (also CHECK-enumerated: `task` / `task_sync` /
+`task_async`), `requested_name` denormalized, `details` JSON
+with per-kind shape, `decided_at` timestamp. FK CASCADE on
+parent session — same lifecycle as `subagent_handles` and
+`cost_progress_events`.
+
+| File | Change |
+|---|---|
+| `src/storage/migrations/023-subagent-gate-decisions.ts` | NEW. Table with two CHECK constraints (decision_type, tool_name) and one composite index (parent_session_id, decided_at). Both enums force a migration if a future refusal kind needs adding — small but intentional friction so the audit surface stays predictable. |
+| `src/storage/migrations/index.ts` | Migration 023 wired. |
+| `src/storage/repos/subagent-gate-decisions.ts` | NEW. `insertSubagentGateDecision`, `listSubagentGateDecisionsByParent`, `listSubagentGateDecisionsByType`. Defensive JSON parse on `details` (corrupt → null). |
+| `src/storage/index.ts` | Barrel re-exports. |
+| `src/tools/types.ts` | `ToolContext` gains optional `recordGateDecision` callback. Documented as fail-soft: recorder swallows DB throws so the tool error is never shadowed by an audit failure. Optional so test contexts that don't model the harness can construct cleanly. |
+| `src/harness/loop.ts` | Wires the recorder when constructing `ToolContext`. Inner try/catch + stderr warn (D208 fail-soft pattern), with a SECOND inner try around `console.error` itself (review fix): in stdio edge cases (EPIPE, exhausted stderr) the diagnostic sink can throw; without the second guard that throw escapes the outer catch and propagates up through the tool's execute path, defeating the entire fail-soft promise. Audit data is the LEAST important signal at the refusal site — the tool-error return MUST land even when both the DB write AND its diagnostic fail. Imports `insertSubagentGateDecision` from the storage barrel. |
+| `src/tools/builtin/task-async.ts` | Three new `recordGateDecision` calls — one before each pre-flight refusal (depth_exceeded, unknown_subagent, budget_exhausted). Each records before returning the tool error so the audit row lands first. |
+| `src/tools/builtin/task.ts` | Three new `recordGateDecision` calls in the dispatcher-result mapping. The synchronous task family doesn't pre-flight; refusal kinds arrive from the dispatcher and are mapped to tool errors. Both `task` and `task_sync` (alias) share this execute body — every audit row attributes to `'task_sync'` (canonical per spec §3.1); the legacy alias distinction is recoverable via `messages.tool_uses` if needed. |
+| `src/tools/builtin/task-await.ts` | Three new `recordGateDecision` calls (review fix). When `task_async`'s pre-flight passes but the dispatcher revalidates at slot-acquire time and refuses (typical race: a sibling settled between pre-flight and dispatch, projection now exceeds cap), the refusal lands as a settled-payload `kind` and reaches the model only via `task_await`. Without recording here, the JSON-scan gap migration 023 closes for pre-flight refusals would still be open for dispatcher-revalid refusals. Attributes to `'task_async'` because the originating model call was task_async; the dispatcher revalid is an implementation detail. |
+| `tests/storage/subagent-gate-decisions.test.ts` | NEW. Seven unit tests: round-trip + chronological listing; `listByType` filtering; CHECK constraint rejects unknown decision_type; CHECK rejects unknown tool_name; FK CASCADE on session drop; defensive JSON parse on corrupt `details`; default `decidedAt` uses `Date.now()`. |
+| `tests/tools/_helpers.ts` | `makeCtx` plumbs `recordGateDecision` overrides. |
+| `tests/tools/task-async.test.ts` | NEW test exercising all three pre-flight refusal sites (depth, unknown, budget). Captures recorder calls via an array; asserts decision type, tool name, requested name, and per-kind details shape. |
+| `tests/tools/task.test.ts` | NEW test mirroring task-async but for the dispatcher-result path. Three refusal envelopes feed in via mocked `spawnSubagent`; asserts all three trigger the recorder with `toolName: 'task_sync'`. |
+| `tests/tools/task-async.test.ts` (additional) | NEW test (review fix) covering the `task_await` settle-refusal path. Each of the three refusal kinds is fed via a `spawnFn` returning the corresponding envelope; pre-flight passes (so `task_async` returns success), then `task_await` resolves the handle and invokes the recorder before mapping to a tool error. Closes the dispatcher-revalid coverage gap. |
+
+**Decision:**
+
+- **D221 — `recordGateDecision` is a single ToolContext
+  callback, not a per-tool dependency.** Adding `db` +
+  `sessionId` directly to ToolContext would have broken the
+  pattern that other audit-style writes (memory_events,
+  hook_runs, subagent_outputs) follow: each gets its own
+  bound helper on ctx so the tool code stays free of storage
+  concerns. The single-call surface also lets each refusal
+  site write its decision in one line, keeping the tool
+  diff lean. Fail-soft is wired at the harness layer (the
+  helper wraps the repo write in try/catch); tools just
+  invoke and forget.
+
+- **`task` legacy alias attributes to `task_sync` in
+  audit.** Both share the same execute body and the runtime
+  doesn't carry `this.name` into a closure. Refactoring to
+  parameterize the execute by tool name was rejected as
+  noise — the spec §3.1 declares `task_sync` canonical, and
+  the alias distinction (which is rare and shrinking) is
+  recoverable from `messages.tool_uses`. The CHECK
+  constraint still admits `'task'` as a value so a future
+  refactor that DOES want full fidelity isn't schema-blocked.
+
+- **D222 — `task_await` is also a refusal site.** Code
+  review caught that the dispatcher revalidates the same
+  three gates (`spawnSubagentImpl` re-checks budget /
+  unknown / depth) when the slot frees, AFTER `task_async`'s
+  pre-flight passed. A refusal at that layer settles as a
+  non-`ran` envelope and only reaches the model through
+  `task_await`'s tool-error mapping. The pre-flight recorder
+  alone left the dispatcher-revalid path uncovered — the
+  exact scenario "child A and B settled between my
+  pre-flight and my dispatch, cap projection now exceeded"
+  produces a `subagent.budget_exhausted` audit-blind from
+  the model's perspective. Adding the recorder calls in
+  `task_await` closes the gap. Attribution stays
+  `'task_async'` since the originating call was
+  `task_async`; the dispatcher revalid is implementation
+  detail invisible to the model.
+
+- **Spec update deferred.** ORCHESTRATION.md §3.5 documents
+  the gate behavior but not its persistence. Spec PR logged
+  as follow-up alongside D217 (cancelSource) and D220
+  (cost_progress_events).
+
+Verification: typecheck clean, lint clean, 3127 pass / 0
+fail (11 new tests).
+
+---
+
+## [2026-05-06] parallel — persisted cost-progress event stream (audit fix #2)
+
+Auditability gap. Each child subagent emits `cost_update`
+HarnessEvents over IPC every time its `totalCostUsd`
+advances (turn settle, compaction, partial provider-error
+charge). The parent's `onChildEventForwarder` consumed them
+in-memory for two purposes — drive the reservation tracker
+(`recordLiveCost`) and run the cost-cap watchdog — then
+discarded the event. Only the FINAL settled cost landed in
+`subagent_handles.settled_payload.costUsd`. Postmortem
+queries asking "what was handle X's cumulative spend at
+minute 3?" or "did the spend curve spike or burn slowly?"
+had nothing to work with.
+
+Fix: new table `cost_progress_events` (migration 022)
+captures the stream. The harness's IPC handler now ALSO
+inserts each `cost_update` into the table, alongside the
+existing `recordLiveCost` and watchdog calls. Best-effort:
+SQLITE_BUSY / FK throws are caught and stderr-warned per the
+D208 fail-soft pattern — losing one event degrades curve
+resolution but the live tracker already observed it, so the
+run is unaffected.
+
+| File | Change |
+|---|---|
+| `src/storage/migrations/022-cost-progress-events.ts` | NEW. Table `cost_progress_events` with `(handle_id FK CASCADE, parent_session_id FK CASCADE, delta, cumulative, recorded_at)` and two indexes (per-handle + per-parent reconstruction). Both FKs cascade so dropping a session reaps the whole stream; dropping a single handle row reaps just its slice. `parent_session_id` denormalized off `subagent_handles` to skip the join on whole-session queries. |
+| `src/storage/migrations/index.ts` | Migration 022 wired into the registry. |
+| `src/storage/repos/cost-progress-events.ts` | NEW. `insertCostProgressEvent`, `listCostProgressByHandle` (per-handle reconstruction), `listCostProgressByParent` (whole-session). Deterministic ordering: `recorded_at ASC, id ASC` so same-tick inserts preserve insertion order. |
+| `src/storage/index.ts` | Barrel re-exports. |
+| `src/harness/loop.ts` | `onChildEventForwarder` now also calls `insertCostProgressEvent` after `recordLiveCost`. Wrapped in try/catch with stderr warn — DB failures don't escalate. The watchdog cap-cross check remains downstream of the insert so a persist throw doesn't skip cancellation. **Persist runs UNCONDITIONALLY** of `recordLiveCost`'s monotonic / cancelled guards: a late `cost_update` arriving after `cancelAll` is no-op'd by the in-memory tracker but STILL inserted, since the child was actually burning tokens until its observed-abort point — audit truth requires those rows. The model-side view (settled cancelled envelope) and the table view (post-cancel cumulative growth) describe different layers; both are correct. |
+| `tests/storage/cost-progress-events.test.ts` | NEW. Six tests: round-trip insert+list, same-tick id-tiebreak, listByParent aggregating across handles, FK cascade on session drop, FK cascade on individual handle drop, default `recordedAt` uses `Date.now()`. |
+| `tests/harness/task-async-e2e.test.ts` | TWO new e2e tests. (a) Single-event coverage: spawns one child via the existing in-process pattern with a provider that emits a `usage` event and non-zero pricing; asserts the IPC stream landed (≥1 row, `cumulative > 0`, `parent_session_id` matches, monotonic). (b) Multi-event coverage (review fix): a two-turn child producing two `cost_update` events; asserts ≥2 rows persist with strict monotonic cumulative, every delta > 0, and `sum(deltas) === final_cumulative` within FP tolerance. The second test was added in response to the reviewer flag that single-event coverage doesn't prove stream behavior across emissions. |
+
+**Decision:**
+
+- **D220 — Persist cost stream alongside the in-memory
+  tracker, not in place of it.** The in-memory
+  `getReservedChildCostUsd` / `getLiveCostUsd` getters drive
+  hot-path behavior (cap watchdog, pre-spawn projection); the
+  DB stream drives cold-path forensics. Two distinct
+  consumers, two distinct write paths — keeping the live
+  tracker independent of the DB ensures a transient
+  SQLITE_BUSY can't stall the watchdog. The fail-soft
+  try/catch on the insert is the load-bearing decision: a
+  missed audit row is observably worse than a watchdog
+  pause, but the watchdog only runs against in-memory state
+  so persist failure doesn't cascade.
+
+- **`recorded_at` is parent receive time, not child emit
+  time.** The cap watchdog operates on the parent's
+  timeline; correlating cost spikes to other parent-side
+  events (turn IDs, hook fires, cancel signals) needs the
+  same clock. Child emit times — if a downstream tool ever
+  needs them — are recoverable from the child session's own
+  audit rows.
+
+- **Spec update deferred.** ORCHESTRATION.md §3.5 mentions
+  the IPC contract but not persistence. Spec PR logged as
+  follow-up alongside D217's CONTRACTS.md update.
+
+- **Follow-up resolved (D224, separate commit): `PRAGMA
+  busy_timeout = 5000`.** See entry below.
+
+Verification: typecheck clean, lint clean, 3117 pass / 0
+fail (8 new tests).
+
+---
+
+## [2026-05-06] parallel — cancel-source attribution on settled handles (audit fix #1)
+
+Auditability gap. Three different call sites cancel handles
+— the assistant's `task_cancel` tool, the cost-progress
+watchdog (`cancelAll` on cap-cross), and the harness's outer
+finally drain (`drain` on shutdown). Every settled row showed
+the same generic envelope:
+
+```json
+{ "kind": "ran", "status": "interrupted", "reason": "cancelled" }
+```
+
+Postmortem queries asking "why did handle X die?" had no
+column to filter on. The runtime can't know — it only sees
+the abort signal. The store knows but threw the information
+away.
+
+Fix: the three cancel surfaces now require a `CancelReason`
+parameter (`'model' | 'cap_watchdog' | 'parent_drain'`)
+plumbed through to a per-record `cancelReason` field. When
+the IIFE settles an `interrupted` envelope from the spawnFn,
+it stamps the orthogonal `cancelSource` field on the
+envelope. The persisted `subagent_handles.settled_payload`
+keeps the documented `reason` string intact (per CONTRACTS.md
+§2.6.4.1) while gaining the new field for forensic
+correlation.
+
+| File | Change |
+|---|---|
+| `src/subagents/handle-store.ts` | New `CancelReason` exported type. `SubagentHandleStore.cancel(id, reason)` / `cancelAll(reason)` / `drain(reason)` — `reason` becomes a required parameter (TS-side enforced). Internal `SubagentRecord` carries `cancelReason: CancelReason \| undefined`, set when `cancelled` flips. Post-spawn override stamps `cancelSource` on every non-`done` envelope (interrupted / exhausted / error) so a maxSteps-after-cancel race or a spawnFn-throw-during-cancel still carries attribution; `done` is excluded since the child finished naturally even if cancel landed in the post-spawn microtask gap. `cancelledBeforeDispatch` accepts the reason and embeds it in the synthesized envelope. `envelopeFromJson` re-validates `cancelSource` defensively (older rows / schema rot). Both drain and `cancel` itself carry `!record.cancelled` guards — first-writer-wins on attribution so neither path can silently overwrite a sibling's `cancelReason`. |
+| `src/tools/types.ts` | `SpawnSubagentResult.kind === 'ran'` gains optional `cancelSource: 'model' \| 'cap_watchdog' \| 'parent_drain'`. Documented as orthogonal to `reason` / `status`: those describe outcome; this describes source. Absent on natural settles (`status === 'done'`, child wall-clock at the runtime layer) — we don't invent attribution. |
+| `src/tools/builtin/task-cancel.ts` | Passes `'model'` to `store.cancel`. |
+| `src/harness/loop.ts` | Watchdog `cancelAll('cap_watchdog')`; outer-finally `drain('parent_drain')`. |
+| `tests/subagents/handle-store.test.ts` | Existing 14 cancel call sites updated to pass an explicit reason. Five new tests: (a) "cancelSource attribution" exercises all three paths in isolation with signal-driven barriers; asserts `reason` stays `'cancelled'` while `cancelSource` carries the right enum. Sanity branch: a natural `done` settle has `cancelSource === undefined`. (b) "drain preserves prior model attribution" — drain runs AFTER `cancel('model')`; model attribution survives. (c) "cancel after drain is idempotent" — the inverse: drain runs FIRST, late `task_cancel` arrives before the IIFE wakes; `parent_drain` attribution survives via the new `!record.cancelled` guard in `cancel`. (d) "cancelSource stamps on exhausted / error envelopes too" — exhausted maxSteps and synthesizeSpawnError both retain attribution; done envelope correctly skipped. (e) "cancelSource survives DB round-trip" — each of the three reasons persists into `subagent_handles.settled_payload.cancelSource` and re-emerges via `getSubagentHandle`. |
+| `tests/tools/task-async.test.ts` | One cancel call site updated. |
+
+**Decision:**
+
+- **D217 — Source attribution lives in a separate field
+  (`cancelSource`), not the `reason` string.** Two reasons
+  to keep them orthogonal:
+  - The `reason` string is a documented contract surface
+    (CONTRACTS.md §2.6.4.1: `done`, `cancelled`,
+    `cancelled_before_dispatch`, `resumed_session`,
+    `spawn_failed`, `corrupt_envelope`, `unknown_subagent`,
+    `depth_exceeded`, plus harness ExitReason mirror).
+    Mutating it to `cancelled_${source}` would break parsers
+    on the model side and old persisted rows.
+  - The dimensions don't combine cleanly. A
+    `cancelled_before_dispatch` handle has a
+    `cancelReason` too (the cancel that arrived BEFORE the
+    dispatcher woke). Encoding both into one string forces
+    `cancelled_before_dispatch_model` /
+    `cancelled_before_dispatch_cap_watchdog` etc. — Cartesian
+    explosion. The orthogonal field admits both: `reason:
+    'cancelled_before_dispatch'`, `cancelSource: 'model'`.
+
+- **D218 — First-writer-wins on cancel attribution.** Both
+  `cancel` and `drain` now guard with `!record.cancelled`
+  before mutating `cancelReason`. Without the guard in
+  `cancel`, the sequence `drain('parent_drain')` →
+  IIFE-still-asleep → late model `task_cancel` would
+  silently overwrite `parent_drain` to `model` — the
+  postmortem would lose evidence that drain initiated the
+  teardown. Symmetric guards on both surfaces back the
+  invariant: once a record is cancelled, its `cancelReason`
+  is immutable until settle. Code-review catch.
+
+- **D219 — Stamp cancelSource on every non-`done` envelope,
+  not only `interrupted`.** The override originally fired
+  only when `result.status === 'interrupted'`, dropping
+  attribution when a cancelled spawn surfaced as `exhausted`
+  (maxSteps hit before the abort propagated) or `error`
+  (spawnFn threw between cancel and the runtime catching
+  the abort). Both are plausible races. Widening the guard
+  to `status !== 'done'` keeps the intent (don't lie about
+  runs that finished naturally) while covering the legitimate
+  cancel paths. Code-review catch.
+
+- **Spec update deferred.** CONTRACTS.md §2.6.4.1 documents
+  reason values but not envelope-shape extensions. Adding
+  `cancelSource` to the spec would require a separate spec PR
+  (per CLAUDE.md "diverging from the spec requires a PR
+  against the spec first"). Logged as a follow-up.
+
+Verification: typecheck clean, lint clean, 3109 pass / 0 fail
+(5 new tests).
+
+---
+
+## [2026-05-06] parallel — keep rehydrated child cost out of persisted session totals
+
+User-spotted bug. `runAgent` mutated `priorCostUsd` with the
+sum of settled child costs at resume:
+
+```ts
+priorCostUsd += subagentHandleStore.getRehydratedChildCostUsd();
+```
+
+But `priorCostUsd` is round-tripped through the persisted
+column. At resume start: `priorCostUsd = existing.totalCostUsd`.
+At finish: `completeSession(..., priorCostUsd + totalCostUsd, ...)`.
+So folding child cost into `priorCostUsd` re-persisted the
+same child spend on every resume cycle:
+
+| Resume # | sessions.totalCostUsd before | rehydrated added | persisted at finish |
+|---|---|---|---|
+| 1 | $0.5 (parent self) | +$2.0 (child) | $2.5 |
+| 2 | $2.5 (loaded as priorCostUsd) | +$2.0 (same child!) | $4.5 |
+| 3 | $4.5 | +$2.0 | $6.5 |
+
+After N resumes the row showed `parentSelf + N * childTotal`
+even when no new work ran. A `maxCostUsd` cap that started
+healthy could trip purely from resume churn, blocking the
+session before any new turn started.
+
+The bug only reproduces with at least one prior `task_async` /
+`task` settled with non-zero cost, which is exactly the
+common case once the async surface is in active use — easy to
+miss in tests that exercise resume on cost-free fixtures.
+
+| File | Change |
+|---|---|
+| `src/harness/loop.ts` | Introduces `let rehydratedChildCostUsd = 0;` next to `priorCostUsd` and reassigns (not `+=`) it at store-construction time. The four budget-gate sites (`costCapDetailIfExceeded`, dispatcher's pre-spawn `spent`, in-turn cost watchdog, `getCostBudget` getter) all add the new variable to the projected cumulative. The persistence site (`completeSession(..., priorCostUsd + totalCostUsd, ...)`) is left untouched — that's the load-bearing change. The store-construction comment is rewritten to spell out the why. |
+| `tests/harness/loop.test.ts` | Two regression tests. (a) "rehydrated child cost does NOT inflate sessions.totalCostUsd across resumes" — three runs (initial + two resumes) with a $0.04 settled handle seeded; asserts the column stays at parent-self only ($0.0006 → $0.0009 → $0.0012). With the bug, the row would inflate by $0.04 on each resume. (b) "rehydrated child cost still enters the budget gate on resume" — counterpart guard so the fix doesn't silently drop the gate's view of inherited spend; cap=$0.001 with $0.04 of seeded child cost trips the pre-call gate before any provider call. |
+
+**Decision:**
+
+- **D216 — Split `priorCostUsd` (parent-self, persisted) from
+  `rehydratedChildCostUsd` (gate-only).** Two flows that
+  superficially look like "previous run's spend" actually go
+  to different sinks:
+  - `priorCostUsd` round-trips through `sessions.totalCostUsd`
+    (parent-self only — the column was never meant to include
+    children, since each child carries its own session row /
+    handle row with its own cost).
+  - `rehydratedChildCostUsd` is a budget-gate-only view of
+    settled-handle costs; it informs the cap check but is
+    NEVER persisted, because the source of truth for child
+    spend is `subagent_handles.settled_payload` itself.
+  
+  Folding both into one variable conflated the two
+  responsibilities. The fix isolates them by storage, not by
+  computation timing — the gate cumulative now sums four
+  components (`priorCostUsd`, `totalCostUsd`,
+  `cumulativeChildCostUsd`, `rehydratedChildCostUsd`,
+  `reserved`); persistence stays a two-component sum.
+  Symmetric to the `cumulativeChildCostUsd` (this run's
+  children) / `rehydratedChildCostUsd` (prior runs' children)
+  pair: both gate-only, neither persisted.
+
+Verification: typecheck clean, lint clean, 3104 pass / 0 fail
+(2 new tests).
+
+---
+
+## [2026-05-06] parallel — write-once guard on updateSubagentHandleChildSession
+
+User-spotted bug. `settleSubagentHandle` is write-once
+(`WHERE handle_id = ? AND status = 'running'`, D180) — settled
+rows can't be overwritten. But the sibling
+`updateSubagentHandleChildSession` had no such guard:
+
+```sql
+UPDATE subagent_handles
+   SET child_session_id = ?
+ WHERE handle_id = ?
+```
+
+Crash-resume race: resumed parent settles a row to
+`resumed_session` (status flips to 'settled'). The original
+child subprocess (still alive on the OS) wakes up and the
+spawn IIFE eventually calls `updateSubagentHandleChildSession`
+to bind its own child session id. Without the guard, the row
+ends up with:
+
+- `settled_payload.reason = 'resumed_session'` (write-once preserved)
+- `child_session_id = 'child-late'` (the late child's session)
+- internal contradiction: any audit / debug tool correlating
+  the two columns sees a row that was "interrupted by resume"
+  yet bound to a child that ran AFTER the parent crashed.
+
+| File | Change |
+|---|---|
+| `src/storage/repos/subagent-handles.ts` | `updateSubagentHandleChildSession` adds `AND status = 'running'` to the UPDATE WHERE. Return type changed from `void` to `boolean` (true = winner-write; false = row already settled, race-loser, safe to ignore). Throws ONLY on missing row, same shape as `settleSubagentHandle`. Doc rewritten to spell out the race-loser semantics. |
+| `tests/subagents/handle-store.test.ts` | Two new tests. (a) "updateSubagentHandleChildSession is write-once on settled rows" — winner-write while running succeeds (returns true); settle the row; late writer returns false; final row keeps the winner's `child_session_id` and `resumed_session` payload (no contradiction). (b) "updateSubagentHandleChildSession throws on missing row" — preserves the programmer-bug-detection contract. |
+
+**Decision:**
+
+- **D215 — Both lifecycle writes (`settle` + linkage) are
+  write-once.** Pairs the two repo-side methods so a settled
+  row is structurally immutable across both columns
+  (`status`/`settled_payload` AND `child_session_id`).
+  Eliminates the cross-column inconsistency the bug exposed
+  without needing an additional schema constraint. Future
+  fields added to `subagent_handles` (e.g. `final_audit_failure`
+  in a later slice) inherit the same contract by following
+  the pattern.
+
+Verification: typecheck clean, lint clean, 3102 pass / 0 fail
+(2 new tests).
+
+---
+
+## [2026-05-06] parallel — fold race-winner cost into rehydration tracker
+
+User-spotted bug. The handle store's rehydration constructor
+had two paths to populate `cached`:
+
+- `row.status === 'settled'`: read payload directly →
+  `rehydratedChildCostUsd += cached.costUsd` ✓
+- `row.status === 'running'`: synthesize `resumed_session`
+  envelope ($0) → settle write-once → re-read in case a
+  competing writer beat us. The re-read overwrote `cached`
+  with the winner's envelope BUT the cost increment lived
+  inside the first branch only.
+
+In the crash-resume race where the child subprocess settled
+before the resumed parent ran the constructor, the parent's
+re-read picked up the winner's envelope (correct for
+`awaitHandle` semantics) but `rehydratedChildCostUsd` saw $0
+for that row. `priorCostUsd += store.getRehydratedChildCostUsd()`
+in `runAgent` then undercounted by the winner's cost — the
+resumed parent's `maxCostUsd` cap silently admitted extra
+work.
+
+| File | Change |
+|---|---|
+| `src/subagents/handle-store.ts` | Moved the `rehydratedChildCostUsd += cached.costUsd` line OUT of the settled-first branch, to a single site AFTER the if/else where `cached` is final. Both paths (settled-first and race-loser-with-reread) flow through the same fold; whichever envelope `cached` ends up holding is the one that gets charged. |
+| `tests/subagents/handle-store.test.ts` | Two new tests: (a) "rehydration of running row LOST to a race-winner counts the winner cost" — direct insert of a settled row with cost=$3, constructor reads it correctly. (b) "rehydration of race-loser path: constructor settle no-ops; re-read cost is folded in" — first store settles a running row to resumed_session ($0); manual UPDATE bypasses write-once to simulate a late-arriving child envelope ($1.75); second store's rehydration folds the $1.75 — proves the unified fold site catches the race-loser case. Pre-fix the second store would have shown $0. |
+
+**Decision:**
+
+- **D214 — Single fold site after both rehydration paths.**
+  The previous structure (cost increment only in
+  settled-first) was the kind of "happy path code" that
+  silently misses the unhappy path. The unified site after
+  the if/else makes the fold's invariant unconditional:
+  whatever envelope ends up in `cached` is what gets
+  charged. Future paths added to the rehydration logic
+  (e.g., a third recovery branch) inherit the fold for free.
+
+Verification: typecheck clean, lint clean, 3100 pass / 0 fail
+(2 new tests).
+
+---
+
+## [2026-05-06] parallel — task_async fails fast on unknown subagent name
+
+User-spotted bug. Sync `task` tool's contract is "fail fast on
+unknown name": typo `subagent: 'explroe'` returns
+`subagent.unknown` immediately, no spawn dispatched. The async
+counterpart had regressed this:
+
+```
+const estimate = ctx.getSubagentBudgetEstimate?.(args.subagent) ?? 0;
+```
+
+The getter returns `null` when the name doesn't resolve. The
+`?? 0` coalesced both `null` (unknown name) AND `undefined`
+(getter not wired) to 0; the spawn proceeded and the failure
+only surfaced at the eventual `task_await`. Effects:
+
+- A typo burns a turn (model issues async, awaits, gets
+  unknown_subagent on the await side, has to retry).
+- Multiple invalid names enqueue multiple phantom handles in
+  the store (each registers a record + persists a row).
+- Audit log gains rows for spawns that never could have run.
+
+| File | Change |
+|---|---|
+| `src/tools/types.ts` | New `getKnownSubagentNames?: () => string[]` on `ToolContext`. The estimate getter's `null` doc updated to load-bearing distinction between "not registered" vs "registered with zero cost" — callers MUST NOT coalesce. |
+| `src/harness/loop.ts` | `buildCtx` provides `getKnownSubagentNames` reading `config.subagentRegistry?.byName.keys()` sorted. Empty when no registry. |
+| `src/tools/builtin/task-async.ts` | Detect `estimateRaw === null` BEFORE the budget gate. Return `subagent.unknown` with the same `available[]` shape sync `task` produces — paritetic error envelope across the two surfaces. `estimateRaw === undefined` (getter not wired in test ctx) preserves the legacy no-validation path so headless fixtures aren't broken. |
+| `tests/tools/_helpers.ts` | `makeCtx` accepts `getKnownSubagentNames` override. |
+| `tests/tools/task-async.test.ts` | Two new tests: (a) "task_async refuses unknown subagent name BEFORE issuing handle" — typo `explroe` against registry [`explore`, `review`]; expects `subagent.unknown`, no handle in `store.list()`, no spawnFn dispatch. (b) "task_async empty registry produces helpful hint" — same path with empty `available`; expects "No subagents are defined" hint. |
+
+**Decisions:**
+
+- **D212 — `null` is load-bearing on the estimate getter; tools
+  MUST NOT coalesce.** The doc on `getSubagentBudgetEstimate`
+  now states this explicitly. Future tools that read the
+  getter and coalesce `null` to `0` would silently regress
+  fail-fast back to fail-on-await; the doc is the rule.
+- **D213 — Async error mirrors sync error shape.** Same
+  `subagent.unknown` code, same `available[]` details, same
+  hint messages. Models that learned to recover from sync
+  task's typo errors don't need separate handling for async.
+
+Verification: typecheck clean, lint clean, 3098 pass / 0 fail
+(2 new tests).
+
+---
+
+## [2026-05-06] parallel — fix double-count of own reservation in async pre-spawn gate
+
+User-spotted bug. The dispatcher's pre-spawn cost gate in
+`spawnSubagentImpl` was double-counting the SAME handle's
+estimate when called via the async path:
+
+1. `task_async` calls `store.spawn(args, { estimateCostUsd })`.
+2. `store.spawn` synchronously registers the record (its
+   estimate already in `getReservedChildCostUsd()` total).
+3. Spawn IIFE eventually invokes `spawnSubagentImpl(args,
+   signal, handleId)`.
+4. Gate computes:
+   `reserved = getReservedChildCostUsd()`  ← includes own estimate
+   `spent = parent + cumulative + reserved`
+   `projected = spent + estimate`           ← adds estimate AGAIN
+
+At cap boundary (remaining budget exactly equal to estimate),
+the gate refuses valid spawns: a single async spawn whose
+estimate fits the remaining budget gets a false
+`subagent.budget_exhausted`. Effective async budget shrinks by
+the largest in-flight estimate every time.
+
+The pre-spawn gate in the `task_async` tool layer (UX-friendly
+early refuse, before `store.spawn` registers the record) does
+NOT have this bug — at that point the record doesn't exist
+yet. Sync `task` also doesn't have it — `handleId === undefined`,
+no record in store. Bug is localized to the dispatcher gate
+on the async path.
+
+| File | Change |
+|---|---|
+| `src/subagents/handle-store.ts` | `getReservedChildCostUsd` accepts optional `excludeHandleId`. When set, the matching record is skipped in the sum. The unmodified callers (watchdog in cost_update wrapper, audit listings) keep `undefined` and see the unchanged total. |
+| `src/harness/loop.ts` | Pre-spawn gate now calls `subagentHandleStore?.getReservedChildCostUsd(handleId)`. For sync `task` (handleId undefined) it's a no-op (no record matches); for `task_async` it removes the own reservation so `spent + estimate` is the correct projection without double-counting. |
+| `tests/subagents/handle-store.test.ts` | New test "getReservedChildCostUsd(excludeHandleId) drops own reservation (no double-count at cap boundary)" — two records ($2 + $3); without exclude returns $5; excluding h1 returns $3; excluding h2 returns $2; excluding unknown id returns $5 (no-op). |
+
+**Decision:**
+
+- **D211 — `excludeHandleId` is the dispatcher gate's
+  responsibility.** The store's reservation total is honest —
+  it really does include every running record. The gate is
+  the consumer that needs to exclude its own contribution
+  before adding the new estimate. Keeping the exclude at the
+  gate (rather than embedding it in the dispatcher's call to
+  spawn) makes the formula `spent + estimate` consistent
+  between sync and async paths; both call the same gate
+  template, just with different `handleId` values.
+
+Verification: typecheck clean, lint clean, 3096 pass / 0 fail
+(1 new test).
+
+---
+
+## [2026-05-06] parallel — smoke entry for parallel_safe wire (closes BACKLOG eval #34)
+
+Final pre-PR action. The full smoke suite (8 cases) ran clean
+against `feat/parallel` (7/8 pass; the 1 fail was a pre-existing
+markdown-formatting flake in `05-plan-mode-blocks-write` —
+unrelated to this branch). But: the suite had no entry that
+exercised `parallel_safe` against a real provider, despite
+`BACKLOG.md:9195` reserving eval #34 for exactly that since M2.
+
+**Added:**
+
+| File | Change |
+|---|---|
+| `evals/fixtures/parallel-reads/{alpha,beta,gamma}.txt` | Three small files, one short sentence each. The contents are crafted so the assistant's summary in turn 2 carries unique substrings (`agile`, `bright`, `graceful`) that the eval can grep for. |
+| `evals/smoke/09-parallel-reads.yaml` | Smoke case "parallel reads in a single turn". Prompt explicitly asks for all three `read_file` calls in ONE assistant message. `maxSteps: 3` forces parallelism: turn 1 (3 reads parallel) + turn 2 (summary) = 2 steps; if the model serialized (one read per turn), it would hit 4 steps and trip the cap. Combined with three `output_contains` assertions on the files' unique substrings, this gives a non-trivial regression net for the wire shape. |
+
+**Result:** 1/1 pass, 4.6s, $0.04, 2 steps. Confirms (a) the
+Anthropic adapter emits multiple `tool_use` blocks in a single
+assistant turn correctly, (b) the harness's parallel branch
+dispatches them through `runPool`, (c) the tool_results land
+index-aligned for the next provider request — all the
+ORCHESTRATION.md §1.3 contracts a unit test couldn't observe.
+
+**Not added (deferred): smoke for `task_async` round-trip via
+real subprocess.** Initially planned as the second smoke entry,
+but the eval framework's default `spawnChildProcess` would try
+to fork `bun src/evals/cli.ts --subagent-session-id ...` —
+`evals/cli.ts` is not the subagent-child entry point, so the
+spawn would fail. Doing it correctly requires either (a) a
+build of `dist/agent` before the smoke runs and an option to
+point `spawnChildProcess` at it, or (b) extending the eval YAML
+schema with a `spawnChildProcess` test seam. Both are
+extensions to the eval framework, out of scope for this
+branch. Tracking as a follow-up: "smoke entry exercising
+real-subprocess `task_async` round-trip" — needs eval framework
+extension first.
+
+Verification: smoke 8/8 cases (excluding the pre-existing
+plan-mode flake) passed. New entry: 1/1 pass.
+
+---
+
+## [2026-05-06] parallel — final review fixes (persistence safety, kill-cost reconcile, resume cost)
+
+Final pre-PR review caught three bugs that broke invariants the
+branch claimed to deliver. Fixes in one commit; the remaining
+items are tracked as follow-ups (lockfile, e2e cost_update IPC,
+floating-point precision, batched rehydration) and don't
+block merge.
+
+| File | Change |
+|---|---|
+| `src/subagents/handle-store.ts` | (a) IIFE persistence calls (`updateSubagentHandleChildSession`, `settleSubagentHandle`) wrapped in try/catch with stderr warning. The previous code's "promise never rejects" comment was a lie — SQLITE_BUSY / FK violation / schema drift would have produced an unhandled rejection and crashed the process. The in-memory `settledResult` is correct above the persist call, so a swallowed error preserves consumer-visible state at the cost of a stale audit row (warning surfaces it). (b) New `getLiveCostUsd(handleId)` getter returns the latest cumulative the child reported via cost_update. The harness reads it at settle time. (c) New `getRehydratedChildCostUsd()` accumulator, populated one-shot at constructor time from rehydrated settled rows. The harness folds it into `priorCostUsd` so a resumed run's cap accounts for prior child spend. |
+| `src/harness/loop.ts` | (a) After the handle store is created, `priorCostUsd += store.getRehydratedChildCostUsd()`. Closes the resume cap hole: `sessions.totalCostUsd` is parent-self only, so without this, a session that spent $4 on children in run 1 sees $0 of child cost on resume; the operator's $5 cap silently allowed +$5 more. (b) Inside `spawnSubagentImpl`, after `runSubagent` returns, reconcile `child.costUsd` with the live tracker: `Math.max(child.costUsd, store.getLiveCostUsd(handleId))`. The runtime hardcodes `costUsd: 0` on every kill path (`runtime.ts ~1152/1171/1184/1203`), so without the max, a watchdog-killed child that spent $2 contributed $0 — directly defeating the kill-during-run cap enforcement this branch added. The reconciled value flows into `cumulativeChildCostUsd` AND into the returned envelope's `costUsd` so persisted audit + `task_await` consumers see the truth. |
+| `tests/subagents/handle-store.test.ts` | Three new tests: (a) "persistence throw does NOT crash the harness" — DB proxy throws on UPDATE, store's IIFE swallows + emits warn, in-memory cache returns clean result. (b) "cumulative reconciles with liveCostUsd on kill-during-run" — exercise the store-side getter; harness's Math.max combines correctly. (c) "getRehydratedChildCostUsd sums settled prior-run cost" — insert two prior-run handles with $1.50 + $0.75 cost; assert getter returns $2.25. |
+
+**Decisions:**
+
+- **D208 — Persistence errors are best-effort with warn.**
+  Wrapping the IIFE persist calls in try/catch keeps the
+  harness alive on transient DB issues. The trade-off: if
+  persistence fails, resume rehydration of THAT specific
+  handle won't recover (the row is stale or missing). The
+  warn on stderr surfaces the issue to operators / log
+  aggregators. The alternative — propagating the error to
+  the caller — would crash the entire run for one handle's
+  audit row, which is the wrong reliability balance.
+
+- **D209 — `Math.max(child.costUsd, getLiveCostUsd)` only when
+  handleId provided.** Sync `task` doesn't use the live
+  tracker (no handle), so falls through to the unmodified
+  terminal value. The runtime emits `costUsd: 0` on sync
+  kill paths too, which is a separate (smaller) hole — sync
+  task can't be watchdog-killed mid-run by the cost cap
+  (it blocks the parent step entirely), so kill-during-run
+  is async-only by construction. The hole only matters if a
+  sync task itself crosses the cap from inside its own
+  budget; the parent's turn-end check catches that on the
+  next boundary.
+
+- **D210 — Rehydrated cost folded into `priorCostUsd`, not a
+  separate field.** Keeps the existing budget formula
+  (`priorCostUsd + totalCostUsd + cumulative + reserved`)
+  intact. The fold happens once at startup; subsequent
+  cap projections see a unified cumulative number. The
+  schema-correct fix would be to redefine
+  `sessions.totalCostUsd` to include children, but that's
+  a migration with backwards-compat implications across
+  the audit subsystem. Folding at runAgent startup is the
+  right scope for this slice.
+
+**Tracked follow-ups (not in this commit):**
+
+- **#9 SQLITE_BUSY tolerance throughout the codebase.** Pre-fix
+  D208 makes the persist path resilient, but other DB calls
+  in the harness path (`appendMessage`, `insertCheckpoint`,
+  etc.) have similar exposure. Defense-in-depth slice.
+- **End-to-end test for cost_update IPC**. Existing tests
+  cover the store contract; an integration test driving
+  cost_update through real subprocess IPC is acknowledged.
+- **Lockfile enforcement** (D175 + #9 in this review).
+  Pre-existing débito; not regressed by this branch.
+- **Floating-point precision in cap formula** (#7 in this
+  review). Bounded ~1e-15 USD; documented as known noise.
+- **Batched rehydration** (#8 in this review). Currently
+  serial round-trips per running row at startup. Bounded
+  by FK CASCADE on session drop.
+- **Orphaned subprocess spend post-crash** (#10 in this
+  review). Doc gap; tracking.
+- **PLAYBOOKS production examples** (#11 in this review).
+  General guide added in §1.1.1; concrete playbook
+  examples deferred.
+
+Verification: typecheck clean, lint clean, 3095 pass / 0 fail /
+10 skip (3 new tests).
+
+---
+
+## [2026-05-06] parallel — review fixes for cost-progress IPC (cancel-flag, sync IPC opt-in, spec reconcile)
+
+Code review of the cost-progress IPC work flagged 2 bugs + 3
+risks. Applied the load-bearing subset.
+
+| File | Change |
+|---|---|
+| `src/subagents/handle-store.ts` | (a) `SubagentRecord.cancelled: boolean` (default false). (b) `cancel()` and `cancelAll()` set the flag; do NOT touch `estimateCostUsd` / `liveCostUsd` anymore. (c) `getReservedChildCostUsd` filters out cancelled rows, so the reservation drops to 0 the moment cancel lands — even when `liveCostUsd > 0`. (d) `recordLiveCost` no-ops on cancelled records: a stale `cost_update` already on the IPC pipe at cancel time can't bump the reservation back up. |
+| `src/harness/loop.ts` | Wrap `onChildEvent` only when needed: tracker (`handleId !== undefined && store !== undefined`) OR `config.onEvent !== undefined`. Sync `task` calls with no operator observer no longer open an IPC channel just to fire a dead-code branch. Local rebind into `trackerStore` / `trackerHandleId` keeps TS narrowing across the closure. |
+| `docs/spec/ORCHESTRATION.md §3.5.1` | Spec reconcile with `§0` principle 7 ("Budget é compartilhado, não pre-alocado") + `§12` anti-pattern. The `estimateCostUsd` floor is documented as a **bootstrap window placeholder** (until first cost_update lands, milliseconds), NOT pre-allocation in the anti-pattern's sense. The window is unavoidable with current IPC: spawn-to-first-turn delay exists regardless. After the first report, the tracker is pure live-shared. New "Cancelled" bullet documents the immediate reservation release contract. |
+| `tests/subagents/handle-store.test.ts` | Two new tests. (a) "recordLiveCost no-ops on cancelled records (review fix: stale cost_update post-cancel)" — recordLiveCost(5) after cancel does NOT raise reservation. (b) "cancelAll releases reservation even when liveCostUsd is non-zero" — pre-fix path: simulate cost_updates that pushed live above estimate, call cancelAll, assert reservation == 0. The pre-fix code zeroed only estimate, leaving the reservation locked at live. |
+
+**Decisions:**
+
+- **D205 — `cancelled` flag, not field-zeroing.** The previous
+  approach (zeroing `estimateCostUsd` on cancel) failed when
+  `liveCostUsd > 0` — `max(0, live) = live`, reservation
+  stayed locked. Filtering on a flag in
+  `getReservedChildCostUsd` is the cleanest fix:
+  cancellation contract becomes one-bit, audit fields stay
+  intact, and `recordLiveCost` can also honor the flag to
+  silence stale events.
+- **D206 — IPC opt-in stays narrow for sync `task`.** The
+  pre-fix "always wire `onChildEvent`" (D201) made every
+  sync `task` open an IPC channel solely so a
+  `handleId !== undefined` check could fire — dead code for
+  sync. The wrapper is now conditional: tracker-needed OR
+  operator-wired. Sync `task` from a headless test stays on
+  the pre-IPC fast path.
+- **D207 — `estimateCostUsd` floor is not pre-allocation.**
+  The reviewer flagged `§0`/§12 anti-pattern conflict.
+  Reconciled in `§3.5.1`: the floor is a **placeholder
+  during the bootstrap window** (spawn → first cost_update,
+  typically ms). Without it, three concurrent spawns each
+  see `live = 0`, all pass the gate, and the cap blows
+  before any cost_update arrives. The anti-pattern targets
+  long-lived per-subagent budget reservation; a sub-second
+  bootstrap floor is operationally distinct.
+
+**Deferred (review nits):**
+- Coverage gap: end-to-end test that drives `cost_update`
+  through real IPC (priority #2). Existing handle-store
+  unit tests cover the store contract; the runtime
+  forwarding path is exercised by `tests/subagents/e2e.test.ts`
+  for arbitrary HarnessEvent forwarding. A combined test
+  would be valuable; skipped for this slice.
+- Filter `delta <= 0` in `emitCostUpdate` (priority #6)
+  — acceptable per audit nit; cumulative is monotonic so
+  the next nonzero turn carries the running total.
+
+Verification: typecheck clean, lint clean, 3092 pass / 0 fail /
+10 skip (2 new tests).
+
+---
+
+## [2026-05-06] parallel — cost-progress IPC + kill-during-run (closes §3.5)
+
+Closes the last open spec deviation. Before this commit the
+budget gate refused new spawns at the cap but had no way to
+abort a child whose live cost crossed mid-run — spec §3.5
+"subagent ativo recebe sinal de finalizar" was deferred via
+D184 as "until cost-progress IPC lands". This commit lands it.
+
+The flow:
+
+1. Child harness emits `cost_update { delta, cumulative }`
+   HarnessEvent after every provider call (turn settle,
+   compaction, partial provider-error charge).
+2. Runtime forwards via the existing `event` IPC envelope; the
+   parent observer receives it as `subagent_progress.lastEvent`.
+3. `spawnSubagentImpl` wraps `onChildEvent` to detect the
+   cost_update and call `handleStore.recordLiveCost(handleId,
+   cumulative)`.
+4. Reservation per record becomes `max(estimateCostUsd,
+   liveCostUsd)` — pessimistic until the first report, then
+   tracks real spend.
+5. Watchdog at every cost_update: if projected total > cap,
+   `handleStore.cancelAll()` aborts every active record's
+   AbortController. Children gracefully exit via the existing
+   `interrupt:hard` IPC path.
+
+| File | Change |
+|---|---|
+| `src/harness/types.ts` | New `HarnessEvent` variant `cost_update { delta, cumulative }`. |
+| `src/harness/loop.ts` | (a) `emitCostUpdate(delta)` helper fires after each `totalCostUsd` advance — turn settle, compaction, partial error. (b) `spawnSubagentImpl` signature gains optional `handleId`; sync `task` calls with undefined, async path passes the store-issued handle. (c) `onChildEvent` is now ALWAYS wired (not gated on `config.onEvent !== undefined`) so the budget tracker fires for headless runs. The wrapper detects `subagent_progress.lastEvent.type === 'cost_update'` and routes through the store; cap watchdog runs after each update. |
+| `src/subagents/handle-store.ts` | (a) `SubagentRecord.liveCostUsd: number` field, default 0. (b) New `recordLiveCost(handleId, cumulative)` — monotonic update; ignores unknown / settled rows / regressions. (c) `getReservedChildCostUsd` returns `sum(max(estimate, live))` — pessimistic floor with live override. (d) New `cancelAll()` — synchronous mass-cancel that zeroes reservations and aborts every active controller. (e) `spawnFn` signature gains `handleId` so the dispatcher can route cost_update back to the right record. |
+| `src/tui/harness-adapter.ts` | New `case 'cost_update'` in the translate switch — returns the (likely empty) `out` array. The TUI doesn't render cost_update directly; the existing `step:budget` event already drives the cost token on the status line. The case exists to keep the exhaustive switch contract. |
+| `docs/spec/ORCHESTRATION.md §3.5` | Spec emend. Old §3.5.1 (pessimistic deviation rationale) replaced with §3.5.1 (cost-progress IPC: how the wire feeds the live tracker and the reservation `max(estimate, live)` formula). §3.5.2 failure-mode table no longer has "future" column — kill-during-run is now the implemented behavior. |
+| `tests/subagents/handle-store.test.ts` | 3 new tests: (a) `recordLiveCost` updates reservation; floor is `max(estimate, live)`; monotonic. (b) `recordLiveCost` no-ops on unknown / settled records. (c) `cancelAll` aborts every running record + zeroes reservations + records settle as `interrupted`. |
+
+**Decisions:**
+
+- **D200 — `cost_update` is a HarnessEvent, not a new IPC type.**
+  Reuses the existing `event` envelope. No new IPC parser
+  branch, no `KNOWN_TYPES` addition, no schema bump. The runtime
+  already forwards arbitrary HarnessEvents from child to parent
+  via `subagent_progress`; the budget tracker plugs into that
+  same channel.
+
+- **D201 — Wrapper always wires `onChildEvent`.** The pre-fix
+  code only wired `onChildEvent` when `config.onEvent` was
+  defined. With the budget tracker hooking the same path, the
+  wire must exist regardless — even a headless test run needs
+  the watchdog. The wrapper forwards to `config.onEvent?.` when
+  set; otherwise the operator-facing channel is just no-op.
+
+- **D202 — Reservation floor is `max(estimate, live)`, not just
+  `live`.** A child that hasn't reported yet has `live = 0`.
+  Without the estimate floor, three concurrent spawns would all
+  pass the gate (each sees 0 in-flight) and the cap would be
+  crossed before the first cost_update lands. Keeping the
+  estimate as a floor preserves the pre-fix safety margin until
+  the live data takes over.
+
+- **D203 — Watchdog runs at every cost_update, not on a timer.**
+  Event-driven: the moment the child reports its latest spend
+  is the moment the parent has new information. A timer would
+  add latency without buying anything (the cost only changes
+  when cost_update fires). Subsequent cost_updates after a
+  cap-cross are no-ops (records already aborted, reservations
+  already zeroed).
+
+- **D204 — `cancelAll` is synchronous and aggressive.** Spec
+  §3.5 says "subagent ativo recebe sinal de finalizar" — fires
+  abort signals to ALL active children. The spec doesn't say
+  "kill the most expensive one" or "ration"; it says the
+  global limit triggers a global stop. Any child that hadn't
+  yet caused the crossing still gets cancelled because the
+  parent can't predict which child's next provider call would
+  push further over.
+
+**D184 superseded.** The pessimistic-reservation deviation
+documented in D184 (and §3.5.1 of the prior emend) is
+superseded by this commit. The deviation's rationale ("until
+cost-progress IPC lands") is now satisfied; the reservation
+is no longer a static estimate but a live-tracking value with
+the estimate as a fallback floor.
+
+Verification: typecheck clean, lint clean, 3090 pass / 0 fail /
+10 skip (3 new tests).
+
+---
+
+## [2026-05-06] parallel — operator surface review fixes (footer/slash semantics, test gaps)
+
+Code review of the operator surface (#1 sync vs async semantic
+mismatch, #3 test gaps, #4 stale-status doc). Fixes in one
+commit; the smaller nits (#2/#5/#6/#7/#8/#10) are deferred or
+rejected as documented débito.
+
+| File | Change |
+|---|---|
+| `src/tui/render/footer.ts` | Comment expanded to document the `subagents N` counter's dual semantic — `state.subagents` is populated by `subagent_start`/`finished` HarnessEvents that fire for BOTH sync `task` runs AND async `task_async` runs. The counter is "live subagent runs" regardless of surface. The slash command, by contrast, is async-only. The two surfaces complement each other rather than duplicate. |
+| `src/cli/slash/commands/subagents.ts` | (a) Empty-state message clarifies async-only scope: "no async subagent handles in this session — sync `task` calls do not appear here (they block the parent during execution)". (b) Populated path now emits a header line "Async subagent handles in this session:" so the operator immediately sees what kind of list this is. (c) Inline doc note about stale `running` status: a `task_cancel` flips the in-memory reservation immediately but the DB row only settles when the IIFE wakes; an operator polling fast may see stale `running`. Eventually consistent. |
+| `tests/cli/slash/commands.test.ts` | Updated assertions on the `/subagents` tests for the new header + clarification text. New tests: (a) malformed `settled_payload` JSON renders without crash and without `(undefined)` reason suffix; (b) `/budget parallel-tools` no-op path returns "already" without next-turn cue; (c) `/budget subagents` no-op path same. |
+| `tests/tui/render/footer.test.ts` | Three new tests for the `subagents N` token: count > 0 surfaces; count === 0 drops the token; bg + subagents coexist with bg-before-subagents ordering. Pattern mirrors the existing `bg N` / `mem N` tests so the regression net stays uniform. |
+
+**Decisions:**
+
+- **D197 — Footer counter is dual-semantic by design.** Renaming
+  to "async subagents" would lose information (sync runs really
+  ARE subagents in flight, blocking the parent). Renaming to
+  "live runs" would lose the operator-recognizable noun.
+  Keeping `subagents N` and clarifying in the slash command's
+  output is the cleanest UX: the counter answers "is anything
+  in flight?", the slash answers "what async handles can I
+  task_await?".
+
+- **D198 — `/subagents` shows handles in DB-snapshot view.** A
+  cancel that landed mid-spawn but hasn't settled yet still
+  appears `running`. The note inside the command body (and the
+  closeout) makes this explicit. Implementing a "drift-free"
+  view would require the slash dispatcher to read from the live
+  handle store (same wire D193 sketched for cancel), out of
+  scope for this slice.
+
+- **D199 — Tests for footer counter use the existing state-
+  injection pattern.** No new test infrastructure: same
+  `startedSession()` factory + `state.subagents.set(...)` to
+  populate. Mirrors the bg counter tests written when the bg
+  family landed.
+
+**Rejected/deferred from review:**
+
+- **#2/#7 leading zeros + safe-integer overflow in
+  `parseBoundedPositiveInt`.** Existing pattern across all
+  /budget subcommands; not regression. Out of scope.
+- **#5 footer overflow priority.** Pre-existing débito
+  documented in the footer's own comment. Real but unrelated
+  to parallelism.
+- **#6 hard-cap numbers as literals in usage / comment.** Doc
+  drift risk acknowledged; the error string itself uses the
+  imported constant, so the load-bearing copy stays accurate.
+- **#9 D193 cancel-via-slash gap.** Documented as out-of-scope
+  in the previous closeout. Not regressed by this commit.
+- **#10 `toEqual` brittle ordering on the registry test.**
+  Existing pattern; rewriting to set-based comparison is a
+  separate cleanup.
+
+Verification: typecheck clean, lint clean, 3087 pass / 0 fail /
+10 skip (6 new tests).
+
+---
+
+## [2026-05-06] parallel — operator surface (TUI counter, /subagents, /budget extensions, PLAYBOOKS)
+
+Closes the four operator-surface items from the original
+inventory (#7, #8, #10, #15) so the parallelism subsystem ships
+end-to-end rather than as a model-only feature. Nothing
+exercised the new caps from the operator's side; nothing
+showed how many subagents were running; the model could spawn
+async children but the operator couldn't observe what was
+in flight without grepping the DB.
+
+| File | Change |
+|---|---|
+| `src/tui/render/footer.ts` | New right-column token `subagents N` next to `bg N`. Suppressed when count is zero (same UX as bg). Reads `state.subagents.size` (already populated by the harness adapter via `subagent_start` / `subagent_finished`). |
+| `src/cli/slash/commands/budget.ts` | Two new subcommands: `/budget parallel-tools <N>` (1..16, sets `maxConcurrentToolCalls`) and `/budget subagents <N>` (1..8, sets `maxConcurrentSubagents`). Read-only `/budget` lists both. New `parseBoundedPositiveInt` helper for the cap-clamped subcommands. Imports `MAX_CONCURRENT_TOOL_CALLS_CAP` / `MAX_CONCURRENT_SUBAGENTS_CAP` so the bounds always match the harness's hard caps. |
+| `src/cli/slash/commands/subagents.ts` | NEW. `/subagents` slash command — observability-only listing of async subagent handles for the current session. Reads `subagent_handles` table (via `listSubagentHandlesByParent`), renders one line per handle (timestamp + 8-char id + name + status [+ reason if settled]). Mutation explicitly NOT exposed: cancel needs a wire to the live handle store's AbortController which the slash dispatcher doesn't have today; the model still drives cancel via `task_cancel`. Documented inline. |
+| `src/cli/slash/index.ts` | Registers `subagentsCommand`. |
+| `docs/spec/PLAYBOOKS.md §1.1.1` | NEW subsection "Spawn semantics: `task` (sync) vs `task_async`". Documents the two surfaces, the parallel pattern, the `max_concurrent_subagents` cap default, the budget-shared contract with `subagent.budget_exhausted` reference, and the cancel UX. Anti-pattern (`task_async` without `task_await`) called out explicitly. Closes the doc gap where playbook authors only saw the `task` example. |
+| `tests/cli/slash/commands.test.ts` | (a) Five new tests for the `/budget` subcommands: parallel-tools updates the field; rejects > cap with `[1, 16]` error; rejects 0/negatives/non-integers; subagents counterpart; subagents rejects > cap with `[1, 8]` error. (b) Four new tests for `/subagents`: pre-session "no session yet"; empty session "no async subagents"; lists handles with status + reason; cross-session isolation (sessionA doesn't see sessionB's handles). |
+| `tests/cli/slash/dispatch.test.ts` | Builtin count assertion bumped from 12 to 13; help-listing length bumped from 15 to 16. |
+
+**Decisions:**
+
+- **D193 — `/subagents` is observability-only.** The model owns
+  spawn/cancel via the tool surface (`task_async` /
+  `task_cancel`). Surfacing cancel to the slash command would
+  require the slash dispatcher to reach into the LIVE handle
+  store's AbortController inside `runAgent`, which doesn't have
+  a wire today (the dispatcher only sees `db`, `bus`,
+  `modalManager`, `baseConfig`). A future slash↔store bridge
+  similar to the modal-manager bridge for `confirmPermission`
+  would close this; tracking as out-of-scope.
+
+- **D194 — Footer counter uses `state.subagents.size` directly.**
+  The state already maintains the live map (driven by
+  `subagent_start` / `subagent_finished` events the harness
+  adapter forwards). No new event plumbing — just a renderer
+  read. Same approach as the bg counter: zero state, zero new
+  channel.
+
+- **D195 — `/budget` exposes parallel-tools / subagents but NOT
+  the lower-level RunBudget fields.** `maxToolErrors`,
+  `maxRepeatedToolHash`, etc. are harness safety budgets that
+  shouldn't be tuned per-run from operator UX (they protect
+  against runaway loops; lowering them silently changes the
+  loop's semantics). The two concurrency caps are user-visible
+  performance/cost tradeoffs, fair to expose. Pattern matches
+  what `/budget steps` and `/budget cost` already followed.
+
+- **D196 — Cap bounds enforced at the slash layer match the
+  hard caps in `harness/types.ts`.** Operators get the
+  rejection message `[1, 16]` for parallel-tools, `[1, 8]` for
+  subagents — same numbers the harness clamps to. Lets the
+  operator understand WHY their value didn't take effect
+  rather than seeing a silent clamp on the next turn.
+
+Verification: typecheck clean, lint clean, 3081 pass / 0 fail /
+10 skip (9 new tests).
+
+---
+
+## [2026-05-06] parallel — review fixes for #1 (gate centralized, sync coverage, immediate cancel)
+
+Code review of the budget enforcement work flagged 1 bug + 6
+risks. Applied them all in this commit. The most important fix
+moves the gate from the `task_async` tool surface to the
+dispatcher (`spawnSubagentImpl`), which closes the bug where
+synchronous `task` skipped the budget contract entirely.
+
+| File | Change |
+|---|---|
+| `src/tools/types.ts` | New `SpawnSubagentResult` variant `{ kind: 'budget_exhausted', requested, spent, estimate, projected, cap }`. Both `task` and `task_async`/`task_await` paths map this onto a `subagent.budget_exhausted` tool error with the same `details` shape — uniform regardless of sync/async surface. |
+| `src/harness/loop.ts` | (a) New run-scoped counter `cumulativeChildCostUsd` increments inside `spawnSubagentImpl` after every `runSubagent` returns. Captures BOTH sync `task` and async `task_async` settle costs in one place — the SOURCE of truth for "what children spent in this run". (b) `spawnSubagentImpl` gains a pre-spawn cost-cap gate that returns the `budget_exhausted` envelope when projected (`parent self + cumulative + reserved + estimate`) > cap. Single point of enforcement. (c) `costCapDetailIfExceeded()` now includes `cumulativeChildCostUsd + reserved` so the parent's turn-end cap check stays consistent with the pre-spawn gate (closes review risk #2 incoherence). (d) `getCostBudget` reads from `cumulativeChildCostUsd` instead of the store's `getSettledChildCostUsd()` — avoids double-counting rehydrated child cost (closes risk #6). |
+| `src/tools/builtin/task.ts` | Maps `kind: 'budget_exhausted'` envelope to tool error. Sync surface now respects the cap (closes the BUG from review). |
+| `src/tools/builtin/task-await.ts` | Maps `budget_exhausted` envelope to tool error. Reached when an async spawn hits the cap and the model awaits the handle. |
+| `src/subagents/handle-store.ts` | (a) `envelopeFromJson` discriminator extended with `budget_exhausted` kind (rehydration safety). (b) `SpawnOptions.estimateCostUsd` is now REQUIRED — TS forces every caller to declare an estimate; programmatic callers can no longer silently bypass the cap by omission (closes risk #10). Tests pass `0` explicitly when not modeling cost. (c) `cancel()` zeros `record.estimateCostUsd` synchronously BEFORE the controller abort — releases the reservation IMMEDIATELY rather than waiting for the queued IIFE to wake (closes risk #4: the hint string promised this and it's now true). |
+| `src/subagents/load.ts` | `budget.max_cost_usd` validator changed from `>= 0` to `> 0`. Zero-cost definitions are an escape hatch (a `0` estimate always passes the projection gate) — every accepted definition now declares a real positive ceiling. Closes risk #5. |
+| `src/tools/builtin/task-async.ts` | Inline budget gate kept (early-UX feedback) but now passes `{ estimateCostUsd: estimate > 0 ? estimate : 0 }` explicitly to `store.spawn`. The dispatcher gate is the load-bearing one. |
+| `docs/spec/CONTRACTS.md §2.6.4.2` | NEW. Documents the `subagent.budget_exhausted` error's `details` shape (subagent, spent, estimate, projected, cap, all USD). Closes the spec-first divergence the reviewer flagged for risk #3 — model-readable contract is now declared. |
+| `tests/subagents/handle-store.test.ts` | Every existing `store.spawn(args)` call updated to pass the now-required `{ estimateCostUsd: 0 }` second arg. Dozens of call sites; the change is mechanical and opt-out (test fixtures that don't model budget pass 0). |
+| `tests/cli/run.test.ts`, `tests/cli/subagent-child.test.ts`, `tests/evals/executor.test.ts`, `tests/subagents/validate.test.ts`, `tests/subagents/load.test.ts` | Definition fixtures updated from `max_cost_usd: 0` to `max_cost_usd: 0.01`; loader test message expectation updated to `must be a finite positive number`. |
+| `tests/tools/task-async.test.ts` | New test "task_cancel immediately frees the cost reservation (review fix #4)" — spawns 2 handles (cap=1), cancels the queued one, asserts reserved drops without waiting for IIFE wakeup. |
+
+**Decisions:**
+
+- **D188 — Single budget gate at `spawnSubagentImpl`.** Both spawn paths (`task` sync, `task_async` async) flow through `spawnSubagentImpl` after refactor D161. Putting the gate there means the contract holds for either tool — closing the BUG where `task` sync silently bypassed all budget logic. The `task_async` tool keeps its own inline check for early UX (refuse before the handle row gets persisted), but it's no longer load-bearing — the dispatcher is.
+
+- **D189 — `cumulativeChildCostUsd` is the single source of truth for child spend.** Replaces the store's `getSettledChildCostUsd()` in budget calculations. Why: store's settled sum includes rehydrated handles from prior runs (whose cost is already accounted for in `priorCostUsd` via the session row aggregate); double-counting would refuse legitimate spawns on resumed sessions. The new counter starts at 0 per run and only counts what THIS run dispatched. Reservations stay separate (in-flight async only), since their costs haven't landed in `cumulative` yet.
+
+- **D190 — Synchronous reservation release on cancel.** The reservation was previously released only when the spawn body's IIFE woke up after slot acquisition. For a queued handle (cap=1, multiple spawns), that wait could be ms to seconds. The error hint on `subagent.budget_exhausted` ("cancel one to free its reservation") promised immediate effect; now the implementation matches. The status flip to `'settled'` still happens lazily in the IIFE (preserves the `cancelled` envelope contract), but `getReservedChildCostUsd` reads `estimateCostUsd` directly, so zeroing it on cancel decouples the consumer-visible budget contract from the IIFE timing.
+
+- **D191 — `SpawnOptions.estimateCostUsd` is required.** Optional fields tempt programmatic callers to omit and silently bypass the cap. A required `number` field (TS forces it) means every caller must declare intent — tests pass `0` explicitly when not modeling budget; production passes the real estimate. The `0` value still lets the spawn through (it's a legal "no reservation" signal for the tracker), but the explicitness moves the bypass from "implicit and easy" to "explicit and reviewable".
+
+- **D192 — Loader rejects `max_cost_usd <= 0`.** A zero-cost definition is an escape hatch — its 0 estimate always passes the projection gate (`spent + 0 > cap` only refuses when spent already crosses cap). Every accepted definition must declare a real positive ceiling so the gate has signal to work with. Existing fixtures using `0` were trivially rewritable to `0.01`.
+
+**What still ships pessimistic-not-spec-literal:** Spec §3.5 reads
+"competindo" (each child sees the full cap) which our pessimistic
+reservation deviates from. Section §3.5.1 of the spec emend
+documents the deviation; the literal reading needs cost-progress
+IPC events that don't exist yet. Forward-compatible: `cumulative`
+will replace `reserved` once children stream their actual spend
+between calls.
+
+Verification: typecheck clean, lint clean, 3072 pass / 0 fail /
+10 skip (1 new test).
+
+---
+
+## [2026-05-06] parallel — cross-subagent budget enforcement (#1)
+
+Closes the last open inventory item before the branch ships.
+Spec `ORCHESTRATION.md §3.5` mandates budget shared across the
+parent + children; before this commit, three concurrent
+`task_async` calls could each pass an "I see room" check
+(no settled child cost yet), the parent's own self-cost cap
+would only fire at the next turn boundary, and a `$5` cap
+could see `~$15` spent before the harness intervened.
+
+| File | Change |
+|---|---|
+| `src/tools/types.ts` | `ToolContext` gains `getCostBudget?: () => { spent, cap }` (cumulative spend including parent self-cost + settled child costs + pessimistic reservation for in-flight children; cap from RunBudget) and `getSubagentBudgetEstimate?: (name) => number \| null` (worst-case estimate from the named subagent's `definition.budget.maxCostUsd`). |
+| `src/subagents/handle-store.ts` | New `SpawnOptions { estimateCostUsd? }` arg on `spawn()`. `SubagentRecord` gains `estimateCostUsd: number` field, populated at spawn-time. New methods `getReservedChildCostUsd()` (sum of estimates for status='running') and `getSettledChildCostUsd()` (sum of `result.costUsd` for status='settled' kind='ran' rows). Rehydrated records carry `estimateCostUsd: 0` — they're already settled so the actual cost flows through `getSettledChildCostUsd` instead. |
+| `src/harness/loop.ts` | `buildCtx` provides `getCostBudget` and `getSubagentBudgetEstimate` closures. The cost budget sums parent's `priorCostUsd + totalCostUsd` (own self-cost) + the store's `getSettledChildCostUsd()` (actual children spend) + `getReservedChildCostUsd()` (pessimistic worst-case for in-flight). The estimate lookup goes through `config.subagentRegistry`. |
+| `src/tools/builtin/task-async.ts` | New pre-spawn budget gate before the depth + prompt-size validators settle: computes `projected = budget.spent + estimate`; refuses with `subagent.budget_exhausted` (retryable=false) when `projected > budget.cap`. `details` carry `spent`, `estimate`, `projected`, `cap` so the model can see the math. The estimate is forwarded to `store.spawn(args, { estimateCostUsd })` so the in-flight reservation tracks until the spawn settles. |
+| `docs/spec/ORCHESTRATION.md §3.5` | Spec emend. Old §3.5 (one bullet list) replaced with three sub-sections: (3.5.1) why pessimistic reservation deviates from the literal "não pre-aloca", justified by absence of cost-progress IPC; (3.5.2) failure-mode table mapping each cap-cross scenario to current vs future behavior; (3.5.3) audit shape (`error_code = 'subagent.budget_exhausted'` in `tool_calls`, no separate `failure_events` entry). |
+| `tests/tools/_helpers.ts` | `makeCtx` accepts `getCostBudget` and `getSubagentBudgetEstimate` overrides. |
+| `tests/tools/task-async.test.ts` | Two new tests: (a) "task_async refuses spawn when projected cost would exceed cap (D184)" — three task_async with $2 estimate each against $5 cap; first two land, third refused; after settling the in-flight ones, reservation drops back to 0. (b) "task_async passes when no cap is configured" — `cap: undefined` lets even seven-figure projected costs through. |
+
+**Decisions:**
+
+- **D184 — Cross-subagent budget enforcement is pessimistic by default.**
+  Spec §3.5 reads "não pre-aloca" + "competindo" — children share
+  the cap and only the actual cumulative spend matters. Implementing
+  that literal reading needs cost-progress IPC events (parent sees
+  children's mid-run spend) that don't exist yet. Without them, the
+  literal reading produces the footgun: 3 concurrent spawns each see
+  the cap as "fully available" and the parent overspends 3× before
+  the next turn-end check. Pessimistic reservation
+  (`definition.budget.maxCostUsd` reserved while in-flight) closes
+  the footgun at the cost of false-refusing some spawns whose
+  actual cost would have fit. The spec emend documents this as a
+  deliberate deviation with a future-tense plan to relax it once
+  the cost-progress IPC lands.
+
+- **D185 — `getCostBudget` returns cumulative spent, not separate
+  components.** Tools see one `spent` number that already includes
+  parent self-cost + settled child cost + reserved in-flight cost.
+  Exposing the components individually would tempt callers to
+  compute their own projection logic (with potentially different
+  invariants); funneling through a single getter makes the
+  invariant load-bearing in one place.
+
+- **D186 — Estimate is opt-in via `getSubagentBudgetEstimate`, not
+  required.** A test `ToolContext` without the getter (or a
+  programmatic caller that hasn't wired the registry) sees
+  `estimate = 0`, the budget check passes, and the spawn lands —
+  same behavior as before. Production runs always wire it through
+  the harness's `subagentRegistry`. This keeps the test surface
+  minimal: a fixture that just wants to spawn without modeling
+  budget can omit the getter and not hit unexpected refusals.
+
+- **D187 — Reservation is decoupled from in-flight count.** A run
+  with `maxConcurrentSubagents: 8` and `cap: $5` could in
+  principle queue 8 spawns each estimating $1; the 6th onwards
+  refuse. But the slot semaphore (concurrency cap) and the cost
+  reservation tracker (budget cap) are independent: a slot
+  becoming free doesn't free a reservation. The reservation
+  releases on settle, the slot releases on dispatch finish. Both
+  must hold for a new spawn to land.
+
+**Out of scope (spec-tracked):**
+
+- **Mid-run cost-progress IPC.** Spec §3.5.2 documents the
+  enhancement: parent gets per-child cost deltas, can hard-signal
+  active children when cumulative crosses cap. Requires IPC
+  schema change. Separate slice; the cap-enforcement contract
+  here is forward-compatible (the projected total naturally
+  collapses to the actual spend once cost-progress IPC starts
+  feeding into `getSettledChildCostUsd`).
+
+Verification: typecheck clean, lint clean, 3071 pass / 0 fail /
+10 skip (2 new tests).
+
+---
+
+## [2026-05-06] parallel — review fixes for #17 (write-once, parser, per-row duration, spec emend)
+
+Independent code review of the handle persistence work flagged
+1 bug, 1 mascarado-por-cast, plus 7 risks/gaps. Applied the
+acionable subset before opening the PR; remaining items either
+collapse into doc/spec changes or are outside the slice.
+
+| File | Change |
+|---|---|
+| `src/storage/repos/subagent-handles.ts` | `settleSubagentHandle` is now write-once: UPDATE only fires when `status='running'`. Returns `boolean` (true = winner of the write race; false = a prior settle already wrote). Throws only when no row exists at all (programmer bug, distinct from "already settled" race). |
+| `src/subagents/handle-store.ts` | (a) `envelopeFromJson` is now a discriminated parser instead of a `as unknown as SpawnSubagentResult` cast — handles `unknown_subagent` / `depth_exceeded` envelopes correctly; corrupt JSON falls back to `kind: 'ran'` with `reason='corrupt_envelope'` and `status='error'`. (b) Constructor mass-settle was a single payload with `durationMs: 0`; replaced with a per-row loop that synthesizes `durationMs = now - row.spawnedAt` for each running handle. (c) `list()` doc clarifies it returns audit-complete (rehydrated handles included); UI consumers should use `inFlightCount()` or filter by `spawnedAt`. (d) Constructor comment now documents the lockfile concurrency assumption explicitly: spec `STATE_MACHINE.md §105` + `ORCHESTRATION.md §11` mandate the per-cwd lockfile that prevents two parents from racing the mass-settle on the same `parentSessionId`. |
+| `src/tools/builtin/task-async.ts` | `store.spawn` call now wrapped in try/catch — a synchronous throw from the persistence INSERT (FK violation, schema check, corrupt DB) surfaces as `subagent.spawn_failed` tool error instead of an uncaught exception escaping the tool dispatch path. |
+| `src/subagents/types.ts` + `src/subagents/runtime.ts` + `src/tools/builtin/task-async.ts` | Moved `MAX_SUBAGENT_DEPTH = 4` from `runtime.ts` to `types.ts` to break a load-order cycle. `task-async.ts` now imports the const directly from `types.ts`; `runtime.ts` re-exports for backward compat. The cycle (`tools/builtin → runtime → tools/index → tools/builtin`) was producing a `taskAsyncTool` TDZ error in tests that imported `task-async.ts` directly after the persistence work landed. |
+| `docs/spec/CONTRACTS.md` | New §2.6.4.1 "SubagentOutput.reason — valores válidos" — table listing every reason string the envelope can carry: `done`, `cancelled`, `cancelled_before_dispatch`, `resumed_session`, `spawn_failed`, `corrupt_envelope`, `unknown_subagent`, `depth_exceeded`, plus the harness ExitReason mirror. Closes the spec-first divergence the reviewer flagged for D178; the previous spec only documented `done` / `interrupted` / `error` at the status level. |
+| `tests/subagents/handle-store.test.ts` | 4 new tests in the persistence describe block: (a) write-once settle: late `done` settle on a row already settled as `resumed_session` is a no-op; final row keeps `resumed_session`. (b) Rehydration discriminates `unknown_subagent` envelope correctly (no shape corruption). (c) Corrupt JSON falls back to `kind:'ran'` + `reason='corrupt_envelope'`. (d) Per-row `durationMs` on rehydration: two handles with different `spawnedAt` get different durations. |
+| `tests/tools/task-async.test.ts` | New test: `store.spawn` throw surfaces as `subagent.spawn_failed` tool error (covers the FK-violation path). |
+
+**Decisions:**
+
+- **D180 — `settleSubagentHandle` is write-once via `WHERE status='running'`.** The reviewer's bug was real: when a parent crashes mid-run with a child still alive, resume mass-settles the row to `resumed_session`. The original child eventually finishes (its subprocess outlives the parent crash) and tries to settle the same row to `done`. Without the guard, the resumed parent's view (`resumed_session`) would be silently overwritten — audit replay would see a coherent `done` row and no trace of the crash. Write-once preserves the timeline. The repo returns `boolean` (winner / loser of the race) rather than throwing on the loser-side because both branches are legitimate runtime states.
+
+- **D181 — Discriminated rehydration parser.** The previous `as unknown as SpawnSubagentResult` cast hid that `unknown_subagent` and `depth_exceeded` envelopes don't have `sessionId/status/reason`. Persisted-then-rehydrated, `task_await` would read undefined and crash. The new parser discriminates on `kind`, validates the shape, falls back to `kind:'ran'` + `reason='corrupt_envelope'` on anything unexpected. Forward-compat: an older row with a fresh `reason` string flows through as a `ran` row with that reason preserved verbatim.
+
+- **D182 — Per-row `durationMs` in mass settle.** The mass-update was using a single envelope (`durationMs: 0`) for every running row. Refactor: list rows first, iterate, settle each individually with `now - row.spawnedAt`. A small extra round-trip per resume but the audit data is now meaningful. Matches the convention `bg-processes` already uses (per-row finalization, never bulk-update with a synthetic envelope).
+
+- **D183 — `MAX_SUBAGENT_DEPTH` lives in `types.ts`, not `runtime.ts`.** The depth pre-check in `task_async` (D161) imports the const. Sourcing it from `runtime.ts` introduced a load-order cycle: `tools/builtin → runtime → tools/index → tools/builtin`. Tests that imported `task-async.ts` directly hit a `taskAsyncTool` TDZ. Moved to `types.ts` (no inbound deps from `tools/`); `runtime.ts` re-exports so existing call sites don't churn.
+
+- **Spec emend (D178 follow-through) — `CONTRACTS.md §2.6.4.1`.** Adds the table of valid `reason` values. Forward-compat clause: unknown reasons map to `error/run_failed` so callers can survive a future addition.
+
+**Out of scope for this slice (documented for future):**
+
+- **Concurrent-confirm modals on parallel batches.** Reviewer's #2 from the slice 1 review — unchanged here. Track separately.
+- **`list()` filter at the API layer.** Doc-only fix here. A method `listInFlight()` could land later if a concrete consumer needs it; today the `inFlightCount()` already serves the only known callsite (operator readout, when wired).
+- **Lockfile enforcement implementation.** Spec mandates it (`STATE_MACHINE.md §105`); src/ doesn't have it yet. Pre-existing débito; the persistence layer documents the dependency rather than enforcing it. A separate slice should add the lockfile.
+- **Registry pre-check at `task_async`.** With D181 the rehydration is shape-correct; the model gets a clean `subagent.unknown` tool error via `task_await` even when the registry drifts. Pre-check at `task_async` would save one INSERT but doesn't change correctness.
+
+Verification: typecheck clean, lint clean, 3069 pass / 0 fail /
+10 skip (5 new tests).
+
+---
+
+## [2026-05-06] parallel — handle persistence + resume rehydration (#17)
+
+Closes the resume-recovery gap the post-review inventory flagged.
+Before this commit, `task_async` handles lived only in process
+memory: a parent that died between `task_async` (handle issued
+to model + recorded in chat history) and `task_await` (collect
+output) left the model holding a handle id the new run couldn't
+resolve. `task_await` returned `subagent.unknown_handle` —
+silently abandoning the child's output, which `subagent_outputs`
+already had on disk.
+
+| File | Change |
+|---|---|
+| `src/storage/migrations/021-subagent-handles.ts` | NEW. `subagent_handles` table: `handle_id` PK, `parent_session_id` FK CASCADE → sessions, `child_session_id` (nullable until spawn dispatches), `name`, `spawned_at`, `status` IN ('running','settled'), `settled_payload` (JSON envelope), `created_at`. Index on `parent_session_id`. |
+| `src/storage/migrations/index.ts` | Wired into MIGRATIONS list. |
+| `src/storage/repos/subagent-handles.ts` | NEW. CRUD: `insertSubagentHandle`, `updateSubagentHandleChildSession`, `settleSubagentHandle`, `settleRunningSubagentHandles` (mass-update for resume), `listSubagentHandlesByParent`, `getSubagentHandle`. Defensive JSON parse on `settled_payload` mirrors the `subagent-outputs` convention. |
+| `src/storage/index.ts` | New repo exports. |
+| `src/subagents/handle-store.ts` | New optional `persistTo: { db, parentSessionId }`. When set: (a) constructor mass-settles any pre-existing 'running' rows for `parentSessionId` to `interrupted/reason=resumed_session` and rehydrates EVERY row's record (settled rows replay their cached envelope; running rows now-resumed surface as interrupted). (b) `spawn` synchronously inserts a row before returning the handle. (c) Spawn body updates `child_session_id` once the spawnFn returns with a child sessionId, then settles the row with the envelope JSON. (d) Cancelled-before-dispatch and spawn-failed paths settle with their synthesized envelope (no child_session_id). |
+| `src/harness/loop.ts` | Threaded `persistTo: { db: config.db, parentSessionId: sessionId }` into the store. Every production run now persists handles; tests can opt out by omitting the binding. |
+| `tests/subagents/handle-store.test.ts` | New describe block "persistence (resume rehydration)" — 3 tests: (a) spawn writes a row with `running` + null child_session_id; settle updates child_session_id and payload. (b) cancelled-before-dispatch row stays with null child_session_id and `reason=cancelled_before_dispatch` payload. (c) Resume rehydration: build a first store, spawn h1/h2/h3 (h3 blocked mid-spawn), close without drain (simulating crash), build a second store with the same DB binding. Settled handles return cached envelopes; the still-running h3 surfaces as `interrupted/resumed_session`; every DB row is now settled. Test inserts a placeholder `sessions` row to satisfy the FK. |
+
+**Decisions:**
+
+- **D175 — Persist by default in production runs.** Storage is cheap
+  (one INSERT per spawn, one UPDATE per settle). Making
+  `persistTo` opt-in would let a future programmatic caller
+  silently drop the resume safety net without realizing —
+  exactly the failure mode the migration exists to close. The
+  in-memory path still works for tests via `omit persistTo`.
+
+- **D176 — Constructor performs mass settle synchronously.** The
+  resumed run's first action is to convert previous-run leftovers
+  to `resumed_session`. Doing this on construction (not
+  lazily on first lookup) means the DB is always in a coherent
+  state by the time any handle access lands; an interleaved
+  consumer can't see a half-rehydrated mix.
+
+- **D177 — `child_session_id` set BEFORE settle, not in the same
+  UPDATE.** Two writes per settle (linkage then envelope) cost
+  one extra round-trip per spawn but keep the contract "row is
+  either fully settled with linkage OR recoverable as running".
+  A combined write that fails partway would leave a row in an
+  unobservable in-between state; the split keeps every snapshot
+  interpretable.
+
+- **D178 — `resumed_session` is a new envelope reason.** Distinct
+  from `cancelled_before_dispatch` (parent never dispatched the
+  spawn) and from `cancelled` (operator-driven mid-run). A
+  resumed model that sees `resumed_session` knows its prior
+  spawn was cut by a parent crash; `cancelled` would
+  miscommunicate as operator action. The reason string ships in
+  the envelope and is part of the wire contract; documented in
+  `subagent-handles.ts:128–143`.
+
+- **D179 — No prompt persisted in `subagent_handles`.** Spec §3.4
+  isolates the prompt to the child run. Persisting it on the
+  parent's handle row would duplicate state and risk leaking
+  prompt content into a wider audit surface. The handle row
+  carries identity (`handle_id`, `name`, `spawned_at`) and
+  outcome (`status`, `child_session_id`, `settled_payload`);
+  reconstruction of "what prompt did we send" goes through the
+  child's own session row.
+
+Verification: typecheck clean, lint clean, 3064 pass / 0 fail /
+10 skip (3 new tests).
+
+---
+
+## [2026-05-06] parallel — e2e through real child harness (#11)
+
+Closes the test-débito identified in the post-review inventory: the
+`task_async` family was only exercised against a fake `spawnFn`,
+so the FULL chain (parent runAgent → tool dispatch → handle store
+→ runSubagent → real child via IPC) had no regression net.
+
+| File | Change |
+|---|---|
+| `src/harness/types.ts` | `HarnessConfig.spawnChildProcess?: SpawnChildProcess` (test seam). Production callers omit; the harness's `spawnSubagentImpl` forwards verbatim to `runSubagent`, which falls back to its default Bun.spawn factory when absent. Lives on the harness config (not the runtime call site) because the `task` family invokes runSubagent indirectly — tests need a way to reach the spawn point through the wider step loop. |
+| `src/harness/loop.ts` | `spawnSubagentImpl` threads the optional `spawnChildProcess` into its `runSubagent` call. |
+| `tests/harness/task-async-e2e.test.ts` | NEW. Two end-to-end tests: (a) "three task_async spawns + three task_await collect; children run in parallel" — drives a real parent runAgent emitting three task_async tools in one turn, captures the handle ids returned, then a second turn emits three task_await calls. The spawn factory runs `runSubagentChild` in-process via `fakeTransportPair` (same pattern as `tests/subagents/e2e.test.ts`), so the IPC channel, encode/parse, harness, providers, permission engine, and hook subsystem all run production code. Live-children counter confirms parallelism (`maxLiveChildren >= 2`). (b) "task_cancel preempts a running child via the IPC interrupt path" — single spawn with a 500ms-sleeping child; cancel fired in turn 2 must abort via the per-handle signal threading through to the IPC interrupt; full run bounded well under the natural completion time. |
+
+**Decisions:**
+
+- **D174 — Spawn factory test seam lives on `HarnessConfig`, not on the
+  `task` tools.** The runtime already exposes `spawnChildProcess`
+  on `RunSubagentInput` for tests of `runSubagent` directly, but
+  the e2e path that crosses the step loop needed the seam at the
+  harness level. The alternative was to expose it through
+  `ToolContext`, but tools shouldn't bypass the harness-controlled
+  spawn assembly — keeping the seam at the config layer matches
+  how `bgLogDir`, `subagentRegistry`, and other "harness-builds-
+  this" knobs surface.
+- **Parallelism assertion is `maxLiveChildren >= 2`, not `=== 3`.** The
+  child stub has a small natural delay, and the parent's
+  task_async dispatch is itself queued through the step loop;
+  there's a microscopic window where the first child can finish
+  before the third dispatches. `>= 2` is the load-bearing
+  parallelism proof — it distinguishes overlap from accidental
+  serialization. The handle store unit tests (`tests/subagents/
+  handle-store.test.ts`) pin `tracker.max === N` deterministically
+  for the cap-honoring case; the e2e accepts a wider window.
+
+Verification: typecheck clean, lint clean, 3061 pass / 0 fail /
+10 skip (2 new tests).
+
+---
+
+## [2026-05-06] parallel — wire-shape completion (task_sync alias, timing, soft-stop D173)
+
+Closing three of the gaps that the post-review inventory still
+listed as open before this branch can ship — wire-shape items
+(`task_sync` alias) and decision-affirming items (soft-stop
+mid-batch). None deferred as follow-ups; subsystem is closed on
+each.
+
+| File | Change |
+|---|---|
+| `src/tools/builtin/task.ts` | New `taskSyncTool` — same execute / metadata / inputSchema as `taskTool`, just `name: 'task_sync'`. Spec ORCHESTRATION.md §3.1 names `task_sync` as canonical and `task` as the legacy alias; both now exist on the wire. |
+| `src/tools/builtin/index.ts` | `taskSyncTool` registered + exported. |
+| `src/harness/loop.ts` | Soft-stop comment in the parallel branch rewritten: split hard-abort and soft-abort cases, document D173 explicitly. The behavior was already correct; the comment now states it. |
+| `tests/cli/bootstrap.test.ts` | Tool list expectation extended with `task_sync`. |
+| `tests/harness/parallel.test.ts` | (a) Replaced the timing-based assertion (`elapsed < 220ms`, CI-flake risk) with `tracker.max === 3` — stronger, deterministic, and fails loudly under any silent throttle. (b) New test "soft-stop fired mid-batch lets the batch complete; loop bails at next step (D173)" verifies that workers do NOT inspect `softStopSignal` mid-batch, the batch completes atomically, and the next top-of-step check exits with `aborted/'soft'` before the next provider call. |
+
+**Decisions:**
+
+- **D173 — Soft-stop is honored at step boundary, not mid-batch.** Spec
+  cooperative-stop semantics is "complete the current step". For
+  the parallel branch the BATCH is the step's tool-execution unit;
+  workers therefore do not inspect `softStopSignal` once dispatched.
+  The pool settles every worker, tool_results persist normally,
+  and the next top-of-step soft check exits before the next
+  provider call. Per-worker soft inspection would synthesize
+  `aborted` tool_results for siblings that hadn't yet started —
+  a hybrid the spec doesn't describe and the model would have
+  to translate. This decision is enforced by a regression test;
+  flipping it requires a spec PR first.
+
+- **`task_sync` alias is the canonical name.** The spec called it out
+  in §3.1 ("`task` (alias legado) = `task_sync`"); we'd been
+  shipping only `task` and diverging silently. Both names now
+  resolve through `spawnSubagentImpl`; audit rows carry whichever
+  the model invoked.
+
+- **Test moved from timing to deterministic counter.** The previous
+  threshold `expect(elapsed).toBeLessThan(220)` was informational;
+  the load-bearing assertion was always the tracker. Asking
+  `tracker.max === 3` (cap=5, batch=3) on a parallelism test
+  means the test fails iff the harness silently serializes or
+  throttles below the cap.
+
+Verification: typecheck clean, lint clean, 3059 pass / 0 fail /
+10 skip (1 new test).
+
+---
+
+## [2026-05-06] parallel — pre-PR tidies (timeout doc, depth pre-check, bridge)
+
+Three trivial follow-ups from the review feedback applied before
+opening the PR:
+
+| File | Change |
+|---|---|
+| `src/tools/builtin/task-await.ts` | TaskAwaitInput JSDoc no longer claims `timeout_ms = 0` is "no timeout" — the validator rejects `< 1`, so the doc lied. Replaced with the actual contract: integer ≥ 1, capped at 30 minutes. |
+| `src/tools/types.ts` + `src/harness/loop.ts` | `ToolContext` gains optional `subagentDepth?: number`. The harness threads `config.subagentDepth ?? 0` through `buildCtx`. |
+| `src/tools/builtin/task-async.ts` | Depth pre-check at the tool surface: a `task_async` call at the cap returns `subagent.depth_exceeded` BEFORE the handle store dispatches a spawn. Matches the legacy `task` tool's contract (it flushes early via `spawnSubagentImpl`); without this the model would get a handle whose later `task_await` was pre-destined to fail — wasted round trip. |
+| `src/harness/loop.ts` | Replaced the `const stableImpl = …` ternary bridge with a guarded `if`-block. Same TS-narrowing reason (a `let` source re-widens inside a closure body even when never reassigned), but the `if` aliases the const inline rather than at the outer scope. Comment updated to drop the slightly-overstated reasoning the slice 2 reviewer flagged. |
+| `tests/tools/_helpers.ts` | `makeCtx` accepts `subagentDepth` override. |
+| `tests/tools/task-async.test.ts` | New test: "task_async pre-checks subagent depth and refuses without spawning" — sets `subagentDepth = MAX_SUBAGENT_DEPTH`, expects `subagent.depth_exceeded`, and verifies no spawnFn dispatch happened. Imports the cap from runtime so a future tightening fails the test loudly. |
+
+Verification: typecheck clean, lint clean, 3058 pass / 0 fail /
+10 skip (one new test).
+
+---
+
+## [2026-05-06] parallel — review fixes (slices 1+2)
+
+Two independent code reviews on `feat/parallel` (slices 1 and 2)
+flagged a mix of bugs and risks. Applied the actionable subset
+before opening a PR; documented follow-ups for the rest.
+
+**Files:**
+
+| File | Change |
+|---|---|
+| `src/tools/builtin/task-cancel.ts` | `planSafe: true` → `planSafe: false`. Reviewer (slice 2 #3) caught that the cancel cascade triggers `cleanupWorktree` → `git worktree remove --force`, which mutates `.git/`. The previous claim "read-only relative to the working tree" missed `.git/`. Plan-mode-locked operators can still clean up via `agent worktree gc` (no plan gate there) or by exiting plan mode. **Supersedes D163.** |
+| `src/subagents/handle-store.ts` | (a) Spawn body now flips `record.status = 'settled'` and populates `record.settledResult` synchronously inside the async IIFE BEFORE returning, eliminating the race window where a `cancel()` between promise resolution and the post-promise `.then` could observe `status === 'running'` and emit a misleading `cancelled: true`. (b) The post-promise `.then` reject branch is removed — the spawn body now catches `spawnFn` throws locally and synthesizes the error envelope, so the underlying promise no longer rejects. (c) `awaitHandle`'s reject-branch fallback is correspondingly removed (it was unreachable). |
+| `src/harness/loop.ts` | (a) `safeInvokeOne` wrapper inside the parallel branch catches any throw escaping `invokeOne` and synthesizes a tool_result with `is_error: true`, so `runPool`'s `Promise.all` cannot orphan sibling workers in flight. (b) `allParallelSafe` predicate now also requires `tool.metadata.writes !== true` — runtime defense in depth against a future plugin / MCP-imported tool that violates the contract by declaring both `writes: true` and `parallel_safe: true`. (c) Parallel bail no longer trims `toolResults` (D167 supersedes D158): the persisted user message holds every tool_result the batch produced, matching the `tool_call` rows committed in DB. The bail snapshots `consecutiveErrors` at the moment of crossing so a sibling success after the bail can't reset the reported counter. |
+| `tests/harness/parallel.test.ts` | New `expect(result.detail).toBe('2 consecutive tool errors')` assertion locks the bail-counter snapshot. Two new tests: "parallel bail persists every tool_result in the audit message (D167)" reads the persisted `messages` row from SQLite and confirms 3 tool_result blocks; "writes:true + parallel_safe:true tool collapses batch to serial" registers a misbehaving tool that violates the metadata contract and confirms the runtime guard refuses parallel and falls back to serial via `tracker.max === 1`. |
+| `tests/subagents/handle-store.test.ts` | Two timing-dependent tests ("cancel aborts a running spawn", "drain cancels every running record") replaced their `await sleep(20)` cancellation barriers with promise-based "I'm in flight" signals the spawnFn flips on entry. Deterministic under loaded CI vs. wall-clock waits. |
+| `tests/tools/task-async.test.ts` | Same barrier pattern applied to "task_cancel aborts a still-running spawn". |
+
+**Decisions (review fixes):**
+
+- **D167 — Parallel bail persists every tool_result; supersedes D158.** D158 trimmed `toolResults` to `bailIndex+1` to "mirror serial-path audit". The reviewer (slice 1 #3) pointed out this leaves orphan `tool_call` rows in the DB: the parallel batch already executed every sibling and committed their rows inside `invokeTool`, while the message that pairs with the assistant's tool_use blocks now has fewer `tool_result` blocks than `tool_call` rows. Replay / recap consumers would diverge from audit. Persisting all results is the audit-correct shape; the bail still exits the run with `maxToolErrors`, and the reported counter is now snapshotted at the moment of crossing (so a sibling success after the bail can't reset it).
+- **D168 — `safeInvokeOne` wrapper guards `runPool` against throw escapes.** The reviewer (slice 1 #5) noted that `runPool` uses `Promise.all`, which rejects on the first worker throw and orphans in-flight siblings. `invokeTool`'s contract says "tool errors return as data, never as throws", but a regression in that path would leave `tool_call` rows in `running` forever. The wrapper converts unexpected throws into a synthesized `is_error: true` tool_result so the pool always settles every worker. Belt-and-braces; today's invokeTool doesn't need it, tomorrow's might.
+- **D169 — Runtime guard against `writes: true + parallel_safe: true`.** The `ToolMetadata` doc-comment forbids the combination, but it was only a documentation rule. Reviewer (slice 1 #1) flagged that a misbehaving plugin or MCP-imported tool could violate it silently. The `allParallelSafe` predicate in `loop.ts` now also requires `writes !== true`; a violator collapses the batch to serial — the safe outcome regardless of intent. The metadata comment stays as guidance for tool authors; the runtime check is the load-bearing invariant.
+- **D170 — Status flip lives inside the spawn body, not in a post-promise `.then`.** The reviewer (slice 2 #2) pointed out the race window: a `cancel()` invoked between promise resolution and the post-promise `.then` running observed `status === 'running'` and returned `{ cancelled: true }` for a run that already settled. Moving the flip inside the async body collapses the window — the assignment lands in the same microtask the promise resolves in. The TS-side cost is a placeholder field assignment (`record.promise = ...` after IIFE construction), since `record` must exist before the IIFE captures it; the cost is one cast that documents itself.
+- **D171 — `task_cancel` is `planSafe: false`; supersedes D163.** Cancel cascading triggers worktree cleanup which writes to `.git/`. Plan mode promises observable-only; the previous "cancel is read-only relative to the working tree" claim ignored `.git/`. Operator with a leftover handle in plan mode can use `agent worktree gc` (no plan gate) or exit plan mode.
+- **D172 — Test barriers are signal-driven, not wall-clock.** "cancel aborts a running spawn" / "drain cancels every running record" / "task_cancel during run" all replaced `await sleep(20)` with promises the spawnFn resolves on entry. Removes a CI-flake risk where `setTimeout`-based sleeps under load could let cancel hit before spawnFn entered its sleep, taking the `cancelled_before_dispatch` path instead.
+
+**Pending — deferred to follow-up issues (not blockers for PR):**
+
+- **Slice 1 #2 — concurrent confirm modals via parallel pool.** If a policy entry forces `mode: confirm` on a `parallel_safe` tool, N modals can race. ModalManager has its own queue, so it shouldn't deadlock, but the operator UX hasn't been exercised. Issue for after the PR.
+- **Slice 1 #6 — `maxConcurrentToolCalls` shared between step loop and DAG.** Spec §11 reserved the 5/16 matrix for "Tool calls em flight (DAG)". The implementation reuses it for step parallelism. Defensible (single underlying pipeline) but worth a spec note when the DAG executor lands.
+- **Slice 1 #8 — soft-stop not honored mid-batch.** The parallel branch only checks soft-stop at the next step boundary; a soft signal during a 3-tool batch runs all 3 to completion. The current behavior matches the spec's "complete the current step" reading; revisit if operator UX research suggests otherwise.
+- **Slice 1 #7 — timing assertion in "all parallel_safe" test.** `expect(elapsed).toBeLessThan(220)` for 3×80ms could flake on heavily-loaded CI. The load-bearing assertion is `tracker.max >= 2`; the timing one is informational. Consider rewriting as a wall-clock-vs-serial-baseline ratio.
+- **Slice 2 #5 — cross-subagent budget reconciliation (spec §3.5).** Today three concurrent `task_async` spawns can each spend the full remaining `maxCostUsd`. A `$5` cap can balloon to ~$15 before the first cost-cap check fires post-turn. Implementing a reservation / accounting system is a slice of its own; until then the cap is best-effort across parallel subagents. Documented here so a future iteration knows it's open.
+- **Slice 2 #4 — `task_await timeout_ms = 0` doc claim.** The TaskAwaitInput JSDoc said "the store treats `0` as 'no timeout'", but the validator rejects `< 1`. Doc comment should be removed; trivial fix in the next pass.
+- **Slice 2 #6 — D161 stable-const bridge could be simplified.** Reviewer noted TS narrowing IS preserved across closures for `const` (the original concern was `let`). The current bridge works; rewriting it is a stylistic tidy.
+- **Slice 2 #8 — `task_async` doesn't pre-check `subagentDepth`.** Spawn returns a handle even when the depth would exceed `MAX_SUBAGENT_DEPTH`; the depth check fires at await time. One round trip wasted. `task` (sync) flushes earlier. Worth aligning when convenient.
+
+**Verification:** `bun run typecheck` clean; `bun run lint` clean;
+`bun test` 3057 pass / 0 fail / 10 skip.
+
+**Next:** PR `feat/parallel` against `develop`.
+
+---
+
+## [2026-05-06] parallel — `parallel_safe` opt-in + parallel branch in step loop (kickoff)
+
+New branch `feat/parallel` off `develop`. Closes the gap between
+spec `ORCHESTRATION.md §1.3` ("opt-in paralelismo: tool definition
+pode declarar `parallel_safe: true`; se todos tool_use no mesmo
+step são `parallel_safe`, harness roda em paralelo") and the
+current code: today `src/harness/loop.ts:1080` iterates
+`for (const tu of collected.tool_uses) { await invokeTool(...) }`
+— every tool_use serializes regardless of side-effect class. A
+turn that emits 3 `read_file` calls pays 3× latency for I/O that
+has zero ordering constraints.
+
+**Plan (this branch covers slice 1; `task_async` follows on the same branch as slice 2):**
+
+1. **Slice 1 — `parallel_safe`:**
+   - Add `parallel_safe?: boolean` to `ToolMetadata` (default false). Mark
+     read-only tools: `read_file`, `grep`, `glob`, `memory_read`,
+     `memory_search`, `memory_list`, `bash_output`. `bash` stays
+     unflagged: its `read_only` is a runtime arg, not a static
+     property; `parallel_safe` is static metadata. Conservative.
+   - Add `maxConcurrentToolCalls` to `RunBudget` (default 5, cap 16
+     per `ORCHESTRATION.md §11`).
+   - Loop branch: when `tool_uses.length >= 2` AND every tool's
+     `parallel_safe === true`, dispatch through a bounded pool;
+     otherwise fall through to today's serial path. Tool_results
+     preserved in the original `tool_uses` order (Anthropic ordering
+     contract). PreToolUse hooks + permission engine still fire
+     per-tool (concurrent — invoke-tool internals already gate each
+     call).
+   - Hash-window degenerate-loop check runs UP-FRONT before the
+     parallel dispatch so the cheap refusal still happens; we want
+     "3 identical reads in 5 steps" to be caught even when those
+     reads now overlap in wall-clock.
+   - `consecutiveErrors` re-evaluated AFTER the batch. The "5
+     consecutive" intent stays operator-meaningful: a parallel batch
+     of N failures collapses to N consecutive errors (no
+     intervening successes), same audit shape as serial.
+
+2. **Slice 2 — `task_async` / `task_await` / `task_cancel`:**
+   spec `ORCHESTRATION.md §3` and `CONTRACTS.md §2.6.4`. Pool global
+   `max_concurrent_subagents = 3` (cap 8). Budget shared, not
+   pre-allocated. Cancel cascading. Will land on this branch after
+   slice 1 closes.
+
+**Decisions (kickoff):**
+
+- **`bash` excluded from `parallel_safe`** even though `read_only=true` arg
+  exists. Static metadata vs runtime declaration: the spec phrasing
+  ("read-only tools devem declarar true") refers to tools that are
+  always read-only by construction. `bash --read_only` is a hint, and
+  the spec explicitly notes (§9.1) it's not a security boundary —
+  letting it gate parallelism would let an adversarial / confused
+  model amplify a race by lying. Cheap to revisit later if a
+  `bash_readonly` family emerges.
+- **`todo_write` excluded** even though it's a small in-memory
+  mutation. Two parallel `todo_write` calls in one step would race
+  on the session-bound `TodoStore`; the spec keeps the door open
+  for this but no model surfaces benefit yet — keep it serial.
+- **`task` (sync) excluded.** Already a synchronous spawn that bridges
+  IPC + permission proxy + worktree GC; parallel `task` is
+  `task_async` — slice 2.
+- **Pool, not naive `Promise.all`.** With cap 5 and a step that
+  emits 7 reads, naive `Promise.all` would issue all 7 concurrently
+  and exceed `maxConcurrentToolCalls`. The spec calls out the cap
+  as load-bearing (§11) — implementation honors it via a counted
+  semaphore.
+
+**Pending — slice 1:**
+
+- Schema change in `src/tools/types.ts` + `src/harness/types.ts`.
+- Tool metadata flips on the 7 read-only tools.
+- Loop branch in `src/harness/loop.ts:1080` — refactor the
+  `for (const tu of collected.tool_uses)` block to two paths.
+- Tests under `tests/harness/`: parallel happy path, mixed-flag
+  fallback, order preservation, sibling-failure independence,
+  consecutiveErrors after batch, abort mid-flight, cap enforcement,
+  hash-window detection still fires.
+- Eval smoke covering "3 reads in one turn" (planned in
+  `BACKLOG.md` line 9195 — eval 34).
+
+**Next:** slice 1 implementation, then closeout entry, then slice 2
+(`task_async`).
+
+---
+
+## [2026-05-06] parallel / slice 2 — `task_async` family (kickoff)
+
+Slice 2 on `feat/parallel`. Closes the gap between
+`ORCHESTRATION.md §3` ("`task_sync` em sequência ⇒ subagents
+**sequenciais**. Pra paralelismo: `task_async`") and the current
+code: `task` is the only spawn surface today; the model can't
+overlap multiple subagent runs in a single turn — three
+`task("explore", …)` calls add up to 3× wall-clock.
+
+**Plan:**
+
+1. **`SubagentHandleStore`** (`src/subagents/handle-store.ts`):
+   session-scoped registry keyed by handle id. Methods:
+   - `spawn(args)`: returns handle synchronously; the underlying
+     `runSubagent` call is queued behind a counted-slot semaphore
+     capped at `maxConcurrentSubagents` (default 3, cap 8 per
+     `ORCHESTRATION.md §11`). The promise inside the record
+     blocks on slot acquisition, then dispatches via the
+     harness-provided `spawnFn`. Slot release fires in `finally`
+     so a throw still frees the slot.
+   - `await(id, timeoutMs?, signal?)`: races the record's
+     promise against an optional timeout + abort. Caches the
+     settled result so multiple awaits on the same handle return
+     the same envelope (idempotent).
+   - `cancel(id)`: aborts the per-handle controller; idempotent
+     on unknown / already-settled handles.
+   - `drain()`: cancels every running record and awaits settle.
+     Called from the run's outer finally so a hard parent abort
+     still tears children down before `db.close()`.
+
+2. **Harness wiring** (`src/harness/loop.ts`,
+   `src/harness/types.ts`):
+   - `RunBudget.maxConcurrentSubagents: number` (default 3).
+   - `MAX_CONCURRENT_SUBAGENTS_CAP = 8` exported.
+   - Refactor `spawnSubagentClosure` to accept a per-call signal
+     override. The store-driven `spawnFn` combines the parent's
+     signal with each handle's controller via `AbortSignal.any`,
+     so `task_cancel(h)` aborts only that child while a parent
+     Ctrl+C still cascades to all of them.
+   - Run-scoped (not step-scoped) store. Created right after
+     `sessionId` resolves; threaded through `ToolContext`. The
+     outer finally awaits `store.drain()` before reaping bg.
+   - Spec §3.6 cancel-cascading already works because parent
+     signal forwards into child runs; the new piece is just the
+     per-handle layer on top.
+
+3. **Three tools** (`src/tools/builtin/task-async.ts`,
+   `task-await.ts`, `task-cancel.ts`):
+   - `task_async({ subagent, prompt })`
+     → `{ handle_id, name, spawned_at }`
+   - `task_await({ handle_id, timeout_ms? })`
+     → SubagentOutput (same shape as `task` tool's result on
+     `done`; surfaces non-`done` exits as tool errors with
+     details — same mapping as `task`).
+   - `task_cancel({ handle_id })`
+     → `{ cancelled, reason? }` where `reason` is `unknown` /
+     `already_settled` for idempotent paths.
+   - Plan-mode: blocked, same as `task`.
+   - Register in `src/tools/builtin/index.ts`.
+
+**Decisions (kickoff):**
+
+- **Single spawnFn shared between sync and async paths.** The
+  existing in-step `spawnSubagentClosure` is the right one to
+  reuse — but it captures the step's `signal` rather than
+  accepting one. Refactor: closure takes an optional signal arg,
+  fallback to step signal. The handle store calls it with the
+  combined per-handle signal; the legacy sync `task` keeps the
+  step-signal default. One source of truth, two callers.
+- **Handle is an object, not a bare string.** `task_async`
+  returns `{ handle_id, name, spawned_at }`. `task_await` /
+  `task_cancel` accept just `{ handle_id }`. The model gets the
+  name back so its planning text can refer to the spawn ("waiting
+  on the explore handle") without re-deriving from the prompt.
+- **`task_await` caches result for repeat calls.** Spec §3.4
+  shows `Promise.all(handles.map(task_await))` style — the
+  store's settled cache makes a re-await on the same handle a
+  no-op that returns the same envelope (timestamp invariance).
+  Useful when a parent's later step revisits a handle for a
+  recap.
+- **Drain on session end.** Spec §3.6 ("Cancel cascading") — the
+  parent's outer finally calls `store.drain()` after the inner
+  loop exits. Equivalent to `task_cancel` on every running
+  handle. Needed even on clean exit so an orphaned async spawn
+  doesn't outlive its session lock.
+- **Budget shared, not pre-allocated, deferred.** Spec §3.5 calls
+  out budget contention semantics ("subagent ativo recebe sinal
+  de finalizar; novos spawns rejeitam com `budget_exhausted`").
+  Implementing the full cross-subagent budget reconciler is its
+  own slice (the parent's `maxCostUsd` already terminates the
+  parent run when crossed; the children inherit that signal via
+  the parent abort path). Anything beyond "parent dies → children
+  die" lands in a follow-up slice.
+
+**Pending:**
+
+- `SubagentHandleStore` module + unit tests
+- Harness wiring + budget field + ToolContext extension
+- 3 new tools + index registration
+- E2E test driving task_async + task_await across steps
+- Closeout entry
+
+**Next:** start with the store module — it's the load-bearing
+piece every other change builds on.
+
+---
+
+## [2026-05-06] parallel / slice 2 — `task_async` family lands
+
+Slice 2 closed on `feat/parallel`. The model now has a non-blocking
+spawn surface: `task_async` returns a handle synchronously while the
+underlying `runSubagent` queues behind a counted-slot semaphore;
+`task_await` collects the envelope (with optional timeout); `task_cancel`
+preempts. Multiple `task_async` calls in one turn overlap up to
+`maxConcurrentSubagents` (default 3, cap 8). The legacy `task` tool
+keeps its synchronous shape — both spawn paths now share one
+dispatcher (`spawnSubagentImpl`) so a future change to runSubagent
+options doesn't drift between them.
+
+**Files:**
+
+| File | Change |
+|---|---|
+| `src/subagents/handle-store.ts` | NEW. ~280 LoC. `SubagentHandleStore` interface + `createSubagentHandleStore` factory. Methods: `spawn`, `awaitHandle`, `cancel`, `list`, `inFlightCount`, `drain`. Slot semaphore caps in-flight at `cap`; queued spawns wait for slot release; pre-dispatch cancel synthesizes a `cancelled_before_dispatch` envelope. spawnFn throw collapses into a synthesized error envelope (status `error`, reason `spawn_failed`) so `awaitHandle` always returns `kind: 'done'` on a settled record — consumers don't need try/catch around the await result. |
+| `src/harness/types.ts` | `RunBudget.maxConcurrentSubagents: number` (default 3). New exported `MAX_CONCURRENT_SUBAGENTS_CAP = 8`. |
+| `src/tools/types.ts` | `ToolContext.subagentHandleStore?: SubagentHandleStore`. |
+| `src/harness/loop.ts` | Lifted the in-step `spawnSubagentClosure` body into a run-scoped `spawnSubagentImpl: (args, signalOverride?) => Promise<SpawnSubagentResult>` declared at the start of the run and initialized right after `bgManager`. The new arg accepts a per-handle signal; the impl combines it with the run signal via `AbortSignal.any` so per-handle cancel still cascades on parent abort. The legacy `spawnSubagentClosure` is now a one-line bridge that captures the impl into a stable const and forwards `(args)` through. The handle store's `spawnFn` calls the impl with the per-handle signal. Drain runs in the outer finally BEFORE bgManager cleanup so child bg processes settle first. `subagentHandleStore` threaded through `buildCtx`. |
+| `src/tools/builtin/task-async.ts` | NEW. `task_async({ subagent, prompt }) → { handle_id, name, spawned_at }`. Same prompt cap as `task` (32 KiB). Plan-mode: blocked. |
+| `src/tools/builtin/task-await.ts` | NEW. `task_await({ handle_id, timeout_ms? }) → SubagentOutput`. Maps store outcomes: `unknown` → `subagent.unknown_handle`, `timeout` → `subagent.await_timeout` (retryable), `aborted` → `tool.aborted`, `done` with non-`done` status → `subagent.run_failed` (mirrors `task`). Plan-mode: blocked. |
+| `src/tools/builtin/task-cancel.ts` | NEW. `task_cancel({ handle_id }) → { cancelled, reason? }`. Idempotent — unknown / settled handles return `cancelled: false` with a reason rather than failing. Plan-mode: ALLOWED (cancellation is read-only relative to the working tree). |
+| `src/tools/builtin/index.ts` | Registers the three new tools next to `taskTool`. |
+| `tests/cli/bootstrap.test.ts` | Tool-list expectation extended with `task_async` / `task_await` / `task_cancel`. |
+| `tests/tools/_helpers.ts` | `makeCtx` accepts `subagentHandleStore` override. |
+| `tests/subagents/handle-store.test.ts` | NEW, 13 tests: spawn happy path, repeat-await cache, cap honored under burst, cancel during run, cancel before dispatch (queued), unknown / settled cancel idempotency, unknown await, timeout, external-signal abort, drain, spawnFn throw → synthesized error envelope, inFlightCount tracking. |
+| `tests/tools/task-async.test.ts` | NEW, 9 tests: round-trip, sequential awaits across multiple handles, cancel during run, idempotent cancel on unknown / settled, timeout retry path, unknown await, all-three-tools `subagent.unavailable` when store missing, input validation. |
+
+**Decisions (closeout):**
+
+- **D161 — Single `spawnSubagentImpl` shared between sync and async paths.** The pre-existing in-step `spawnSubagentClosure` had ~190 LoC of `runSubagent` option assembly captured by closure on `signal` / `sessionId` / `config.*`. Inlining the same logic into the handle store's `spawnFn` would have duplicated that surface. Hoisting it into a run-scoped impl that takes an optional signal override gives BOTH callers (legacy `task` AND the store) one source of truth for the runSubagent contract. The legacy bridge is now a 4-line const that captures the narrowed impl into a stable local before forwarding — necessary because TS re-widens `let`-declared optional types inside a closure body, breaking the `=== undefined` narrowing the outer guard established.
+- **D162 — Pre-dispatch cancel synthesizes its own envelope.** When a cancel lands while a record is still queued behind the slot semaphore (cap=1, three spawns in flight), the spawn's promise body sees `controller.signal.aborted === true` BEFORE calling `spawnFn`. The store could let `runSubagent` detect this for itself, but `runSubagent` would then create a child session row + audit entries for a run that never executed any work — pollution. Synthesizing `{ status: 'interrupted', reason: 'cancelled_before_dispatch' }` directly skips that machinery; the only observable difference is `sessionId === ''` (no row created). The model's `task_await` maps it onto `subagent.run_failed` like any other interrupted exit, so the wire shape is uniform.
+- **D163 — `task_cancel` is `planSafe: true`; the spawn tools are not.** Plan mode blocks `task` / `task_async` / `task_await` because the underlying child run might write. But `task_cancel` only stops a run that's already in flight — it doesn't write to the working tree, and refusing it would strand a leftover handle the operator inherits from a non-plan-mode session. Allowing it gives a clean cleanup path even when plan mode is on. (The child being cancelled may itself have written before the cancel landed, but that's not a NEW write caused by the cancel.)
+- **D164 — `task_await` is `idempotent: true` despite observing a non-idempotent child.** The TOOL's behavior is deterministic: on a settled handle the cached envelope is returned byte-for-byte regardless of how many times you call it. The CHILD's run is not idempotent — but `task_async` carries that property in its own metadata (`idempotent: false`), and `task_await` is just a collector. The distinction matters for the harness's degenerate-loop hash check: a turn that emits `task_async + task_await + task_await` for the same handle won't hash-collide on the await calls because the inputs include the handle id, but even if it did, the second await is the cached read.
+- **D165 — Drain runs BEFORE bgManager cleanup in the outer finally.** Each subagent run holds its own bg processes (the child harness opens its own bg manager). When the parent drains its handle store, every child run reaches its terminal state; the children's `bg_ended` events land BEFORE the parent's bgManager.cleanup() walks its own pid table. Reversing the order would race the child's bg manager against the parent's cleanup and could leave child bg rows in `running` status forever. Cheap ordering invariant; tests under `tests/subagents/` already cover the bg lifecycle on its own, so this slice doesn't add bg-specific tests.
+- **D166 — `cancelled_before_dispatch` test pre-dispatch path uses cap=1.** The test "cancel before dispatch (queued at cap) yields cancelled_before_dispatch" forces a queued spawn by setting cap=1, dispatching one slow spawn, then a second one that queues. The "cancel aborts a running spawn" test, in contrast, has to wait for the spawnFn to ENTER its sleep (yields ~20ms past the microtask boundary) so the cancel lands DURING the spawnFn body and the spawnFn's catch branch fires. Both paths are valid; tests assert each by construction.
+
+**Pending:**
+
+- None for this slice.
+
+**Next:** branch ready for review / merge into `develop`. Optional
+follow-ups: cross-subagent budget reconciliation (spec §3.5 — the
+slice deliberately deferred this), eval covering "3 task_async +
+3 task_await in one turn" (in line with the existing
+`parallel_safe` eval idea at line 9195).
+
+---
+
+## [2026-05-06] parallel / slice 1 — `parallel_safe` opt-in lands
+
+Slice 1 closed on `feat/parallel`. The step loop now opts into a
+bounded-concurrency pool when every `tool_use` in the assistant
+turn declares `parallel_safe: true`; mixed batches and single
+calls keep the historical serial path. No behavior change for
+existing tools — `parallel_safe` defaults false, opt-in at the
+metadata layer keeps the surface tight.
+
+**Files:**
+
+| File | Change |
+|---|---|
+| `src/tools/types.ts` | `ToolMetadata` gains optional `parallel_safe?: boolean`. Long-form comment documents (a) the all-or-nothing batch invariant, (b) why `bash` is intentionally excluded despite `args.read_only`, and (c) the "writes / mutable session state / requires confirm" exclusion list. Default false. |
+| `src/harness/types.ts` | `RunBudget` gains required `maxConcurrentToolCalls: number` (default 5). New exported constant `MAX_CONCURRENT_TOOL_CALLS_CAP = 16` mirrors `ORCHESTRATION.md §11`. The clamp lives at the consumer in `loop.ts` so the operator-level error surface stays "your config was clamped" rather than rejecting at boot. |
+| `src/harness/loop.ts` | New module-private `runPool<I, T>(items, cap, worker)` runner: spawns N workers that pull off a shared cursor, populates results in original index order. Refactored the in-step tool dispatch: lifted `spawnSubagentClosure`, `buildCtx(tu)`, and `invokeOne(tu)` out of the per-tu `for` so both paths share one worker. Added pre-batch abort gate (signal + softStopSignal) and pre-batch degenerate-loop hash precheck. Branch decision: `tool_uses.length >= 2 && parallelCap >= 2 && every(tool.metadata.parallel_safe === true)`. Parallel path runs `runPool`, then folds outcomes in original order to apply `consecutiveErrors` and pick the bail index; truncates `toolResults` so audit shape matches the serial path. Serial path otherwise unchanged. |
+| `src/tools/builtin/read-file.ts` | `parallel_safe: true`. |
+| `src/tools/builtin/grep.ts` | `parallel_safe: true`. |
+| `src/tools/builtin/glob.ts` | `parallel_safe: true`. |
+| `src/tools/builtin/memory-list.ts` | `parallel_safe: true`. |
+| `src/tools/builtin/memory-read.ts` | `parallel_safe: true`. |
+| `src/tools/builtin/memory-search.ts` | `parallel_safe: true`. |
+| `tests/harness/parallel.test.ts` | New file, 11 tests: parallel happy path with wall-clock proof, mixed-flag fallback, order preservation across asymmetric latencies, sibling-failure independence, consecutive-error bail mid-batch, hard-abort propagation, cap=2 enforcement on a 5-tu batch, degenerate-loop precheck (zero work landed), cap=1 forces serial, single-tu never enters parallel branch, one tool_invoking + tool_finished event per call. |
+
+**Decisions (closeout):**
+
+- **D156 — `bash_output` excluded from `parallel_safe` despite being read-only.** The tool's own metadata flags `idempotent: false` because reading without `since` advances the per-process cursor inside `BgManager`. Two parallel `bash_output` calls on the same `process_id` would race on cursor state and produce interleaved or dropped output. The static `parallel_safe` flag is a per-tool guarantee; runtime arg-shape ("you only paralleled distinct process_ids") cannot back that guarantee. If the model ever benefits from parallel reads on different bg processes, the right shape is a future `bash_output_batch` tool that takes a list of `process_id`s and serializes per-pid internally. Cheap to revisit.
+- **D157 — Pre-batch degenerate-loop check now applies to both paths.** The serial path used to hash + check per-tu inside the `for`; the new pre-batch loop iterates every `tu` and bails on the first one whose hash trips `maxRepeatedToolHash`. Observable change: if the **first** tu of a step would have run before the **second** tripped the cap (a window edge case), the pre-batch loop now refuses without running the first tu. This is strictly more conservative — fail-fast on a step we've already classified as degenerate. Existing test (`degenerate loop: identical tool calls are caught`) still passes; the new pre-batch behavior is exercised by `degenerate-loop check fires pre-batch even when all parallel_safe`.
+- **D158 — `consecutiveErrors` replayed in tool_use order after the parallel batch.** The pool waits for every worker to settle so we can't bail mid-flight. The replay mirrors what the serial path would have produced: increment-on-failure, reset-on-success, bail at the first index where the counter crosses `maxToolErrors`. Tool_results are truncated to that index so audit + replay see the same shape regardless of which path produced the message.
+- **D159 — `runPool` takes the items array, not a `count + index → item`.** The earlier draft was `runPool(count, cap, worker_by_index)` and pushed bounds checking onto the caller. Switching to `runPool(items, cap, worker)` lets `noUncheckedIndexedAccess` be satisfied with one `as I` inside the runner (right after `i < items.length`) instead of leaking the bounds concern into every call site. Same shape we've used elsewhere (e.g., the validators array in `subagents/`).
+- **D160 — The serial path's per-iteration soft check uses `: boolean` annotation.** Without the annotation, TS narrows `config.softStopSignal?.aborted` after the top-of-step soft check and rejects the comparison at the per-iteration check (`'false | undefined' has no overlap with 'true'`). Annotating `const softAborted: boolean = config.softStopSignal?.aborted ?? false` forces TS to re-widen — the runtime read IS a fresh `.aborted` lookup on a live AbortSignal, so the narrowing was incorrect at the type level.
+
+**Pending — moves to slice 2:** `task_async` / `task_await` /
+`task_cancel` family. Same branch.
+
+**Next:** spec-side review of the `task_async` slice (re-read
+`ORCHESTRATION.md §3` + `CONTRACTS.md §2.6.4`), then implementation.
+
+---
+
 ## [2026-05-05] M3 / impl — subagent permission proxy (slices 1–3)
 
 New branch `feat/m3-subagent-permission-proxy` off `develop`. Closes

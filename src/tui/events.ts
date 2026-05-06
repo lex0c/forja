@@ -385,6 +385,14 @@ export type SubagentUpdateEvent = BaseEvent & {
   type: 'subagent:update';
   subagentId: string;
   progress: string;
+  // Cumulative cost reported by the child via the `cost_update`
+  // HarnessEvent stream (spec ORCHESTRATION.md §3.5). Optional
+  // because most progress events (step_start, tool_invoking,
+  // etc.) don't carry cost; only the adapter's `cost_update`
+  // case populates it. Reducer treats `undefined` as "no
+  // change" — preserves the prior `liveCostUsd` rather than
+  // zeroing.
+  cumulativeCostUsd?: number;
 };
 export type SubagentEndEvent = BaseEvent & {
   type: 'subagent:end';
@@ -392,6 +400,22 @@ export type SubagentEndEvent = BaseEvent & {
   status: 'done' | 'error';
   summary: string;
   durationMs: number;
+};
+
+// Parallelism observability snapshot (spec ORCHESTRATION.md
+// §1.3 / §3.3). Emitted every time the running / queued
+// counts change (handle spawn / dispatch / settle for
+// subagents; safeInvokeOne enter/exit for parallel tools).
+// The footer's `subagents R+Q/cap` and `tools R/cap` chips
+// read from `state.parallelStatus`, populated by the
+// reducer on this event.
+export type ParallelStatusEvent = BaseEvent & {
+  type: 'parallel:status';
+  subagentsRunning: number;
+  subagentsQueued: number;
+  subagentsCap: number;
+  toolsRunning: number;
+  toolsCap: number;
 };
 
 // Background processes.
@@ -550,6 +574,7 @@ export type UIEvent =
   | SubagentStartEvent
   | SubagentUpdateEvent
   | SubagentEndEvent
+  | ParallelStatusEvent
   | BgStartEvent
   | BgUpdateEvent
   | BgEndEvent

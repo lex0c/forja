@@ -191,4 +191,83 @@ describe('task tool', () => {
     if (!isToolError(result)) return;
     expect(result.error_code).toBe('tool.aborted');
   });
+
+  test('records gate decisions for all three refusal kinds (audit fix #3)', async () => {
+    // The synchronous task path doesn't pre-flight; the
+    // dispatcher returns a refusal kind, the tool maps it to
+    // a tool error, and the recorder fires before returning.
+    // All three rows attribute to `task_sync` (canonical per
+    // spec §3.1) — the legacy `task` alias shares this
+    // execute body.
+    type Decision = {
+      decisionType: 'budget_exhausted' | 'unknown_subagent' | 'depth_exceeded';
+      toolName: 'task' | 'task_sync' | 'task_async';
+      requestedName: string;
+      details: Record<string, unknown>;
+    };
+    const recorded: Decision[] = [];
+    const recordGateDecision = (d: Decision) => recorded.push(d);
+
+    const ctxUnknown = makeCtx({
+      spawnSubagent: async () => ({
+        kind: 'unknown_subagent',
+        requested: 'typo',
+        available: ['explore'],
+      }),
+      recordGateDecision,
+    });
+    const r1 = await taskTool.execute({ subagent: 'typo', prompt: 'p' }, ctxUnknown);
+    expect(isToolError(r1)).toBe(true);
+
+    const ctxDepth = makeCtx({
+      spawnSubagent: async () => ({
+        kind: 'depth_exceeded',
+        requested: 'explore',
+        depth: 5,
+        maxDepth: 4,
+      }),
+      recordGateDecision,
+    });
+    const r2 = await taskTool.execute({ subagent: 'explore', prompt: 'p' }, ctxDepth);
+    expect(isToolError(r2)).toBe(true);
+
+    const ctxBudget = makeCtx({
+      spawnSubagent: async () => ({
+        kind: 'budget_exhausted',
+        requested: 'explore',
+        spent: 4.5,
+        estimate: 1.0,
+        projected: 5.5,
+        cap: 5.0,
+      }),
+      recordGateDecision,
+    });
+    const r3 = await taskTool.execute({ subagent: 'explore', prompt: 'p' }, ctxBudget);
+    expect(isToolError(r3)).toBe(true);
+
+    expect(recorded).toHaveLength(3);
+    expect(recorded[0]).toMatchObject({
+      decisionType: 'unknown_subagent',
+      toolName: 'task_sync',
+      requestedName: 'typo',
+    });
+    expect(recorded[0]?.details.available).toEqual(['explore']);
+    expect(recorded[1]).toMatchObject({
+      decisionType: 'depth_exceeded',
+      toolName: 'task_sync',
+      requestedName: 'explore',
+    });
+    expect(recorded[1]?.details).toEqual({ depth: 5, max_depth: 4 });
+    expect(recorded[2]).toMatchObject({
+      decisionType: 'budget_exhausted',
+      toolName: 'task_sync',
+      requestedName: 'explore',
+    });
+    expect(recorded[2]?.details).toMatchObject({
+      spent: 4.5,
+      estimate: 1.0,
+      projected: 5.5,
+      cap: 5.0,
+    });
+  });
 });

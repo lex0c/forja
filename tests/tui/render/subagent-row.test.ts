@@ -17,6 +17,7 @@ const sub = (overrides: Partial<SubagentRowState> = {}): SubagentRowState => ({
   goal: 'find the README',
   progress: '',
   startedAt: 0,
+  liveCostUsd: 0,
   ...overrides,
 });
 
@@ -71,5 +72,22 @@ describe('renderSubagentRows', () => {
     expect(renderSubagentRows(map, caps, 500)[1]).toContain('500ms');
     expect(renderSubagentRows(map, caps, 12_000)[1]).toContain('12s');
     expect(renderSubagentRows(map, caps, 75_000)[1]).toContain('1m15s');
+  });
+
+  test('cost chip surfaces $X.XXXX when liveCostUsd > 0 (D232)', () => {
+    const map = new Map<string, SubagentRowState>([
+      ['a', sub({ progress: 'step 3', liveCostUsd: 0.0184 })],
+    ]);
+    const out = renderSubagentRows(map, caps, 1000);
+    expect(out[1]).toContain('$0.0184');
+  });
+
+  test('cost chip is suppressed at zero (test fixtures / free-tier)', () => {
+    const map = new Map<string, SubagentRowState>([
+      ['a', sub({ progress: 'step 3', liveCostUsd: 0 })],
+    ]);
+    const out = renderSubagentRows(map, caps, 1000);
+    expect(out[1]).not.toContain('$0');
+    expect(out[1]).not.toContain('$');
   });
 });

@@ -201,6 +201,79 @@ export type HarnessEvent =
       durationMs: number;
       costUsd: number;
     }
+  | {
+      // Per-turn cost delta, emitted right after the harness
+      // appends a provider call's usage to its `totalCostUsd`
+      // counter. Producer is the harness loop (loop.ts). The
+      // event flows over IPC for subagent runs so the parent
+      // can track in-flight child spend in real time and enforce
+      // the shared `maxCostUsd` cap (spec ORCHESTRATION.md
+      // §3.5). `delta` is the cost of the latest turn alone
+      // (compaction calls also fire this event with their own
+      // delta); `cumulative` is the running self-cost of THIS
+      // session (does NOT include prior-run cost; the parent
+      // already tracks `priorCostUsd` separately).
+      type: 'cost_update';
+      delta: number;
+      cumulative: number;
+    }
+  | {
+      // Parallelism observability snapshot (spec
+      // ORCHESTRATION.md §1.3 / §3.3). Emitted by the harness
+      // whenever the in-flight or queued counts change — the
+      // TUI footer turns it into the `subagents R+Q/cap` and
+      // `tools R/cap` chips. Without this, the operator only
+      // saw "subagents 5" without knowing how many of those
+      // were running vs queued behind the cap, and the
+      // parallel tool batch was visible only as N concurrent
+      // cards with no aggregate.
+      //
+      // Fields:
+      //   - `subagentsRunning`: handles whose spawn has been
+      //     dispatched (passed the slot semaphore) and whose
+      //     IIFE has not yet settled.
+      //   - `subagentsQueued`: handles created but still
+      //     waiting on `acquireSlot`. Sum (running + queued)
+      //     equals the model's "tasks I emitted that haven't
+      //     finished yet" count.
+      //   - `subagentsCap`: configured cap for concurrent
+      //     dispatch (`maxConcurrentSubagents`).
+      //   - `toolsRunning`: tools currently in flight in the
+      //     parallel-tool dispatcher pool. 0 outside a parallel
+      //     batch (or during the serial path, since serial
+      //     never has more than 1 in flight at once).
+      //   - `toolsCap`: pool concurrency for the current
+      //     batch (`Math.min(maxConcurrentToolCalls,
+      //     MAX_CONCURRENT_TOOL_CALLS_CAP)`). 0 when no batch
+      //     is active.
+      type: 'parallel_status';
+      subagentsRunning: number;
+      subagentsQueued: number;
+      subagentsCap: number;
+      toolsRunning: number;
+      toolsCap: number;
+    }
+  | {
+      // Cost-cap watchdog fired (spec ORCHESTRATION.md §3.5).
+      // Cumulative parent + child spend (settled + reserved +
+      // live) crossed `maxCostUsd` mid-run; the harness
+      // signaled `cancelAll('cap_watchdog')` on every active
+      // handle. The TUI converts this to a permanent banner
+      // line so the operator sees the cause — without it, the
+      // active subagent rows just disappear and the operator
+      // has to root-cause via `/sessions` or audit logs.
+      // Carries `cancelledCount` (how many active handles got
+      // the abort) and the cumulative figure that crossed the
+      // cap so the banner reads concretely ("3 subagents
+      // cancelled — cumulative spend $5.12 exceeded cap
+      // $5.00"). The cap value is included for the same
+      // reason: a banner that just says "cap exceeded" forces
+      // the operator to look up which cap.
+      type: 'cap_watchdog_fired';
+      cancelledCount: number;
+      cumulativeUsd: number;
+      capUsd: number;
+    }
   | { type: 'session_finished'; result: HarnessResult };
 
 // Budget caps for an autonomous run. Per AGENTIC_CLI §5: every limit has
@@ -240,6 +313,33 @@ export interface RunBudget {
   // + totalCostUsd is what the cap compares against, NOT just the
   // per-run total).
   maxCostUsd?: number;
+  // Maximum number of tool calls the harness will dispatch in
+  // parallel within a single step. Only active when EVERY
+  // `tool_use` in the step has `metadata.parallel_safe === true`
+  // (mixed batches fall back to fully-serial). Default 5 mirrors
+  // `ORCHESTRATION.md §11` ("Tool calls em flight (DAG): 5
+  // default / 16 hard cap"). The same matrix governs the DAG
+  // executor, but the step loop and the DAG executor share the
+  // cap because they share the underlying invoke-tool pipeline
+  // — no reason to have two budgets for the same physical
+  // resource.
+  //
+  // Setting `1` effectively disables parallelism (keeps the
+  // serial path live for every step). The harness clamps to
+  // [1, 16] internally.
+  maxConcurrentToolCalls: number;
+  // Maximum number of in-flight `task_async` subagent spawns
+  // for this run. The handle store admits more `spawn` calls
+  // than the cap (handles return immediately) but only
+  // `maxConcurrentSubagents` of them are dispatched into a
+  // child run at any moment; the rest queue. Spec
+  // `ORCHESTRATION.md §11`: default 3, hard cap 8.
+  //
+  // Setting `1` collapses `task_async` to "spawn-immediately
+  // but only one runs at a time", which is observable as
+  // serial-but-with-handles. Useful for budget-constrained
+  // runs that still want to use the handle/await surface.
+  maxConcurrentSubagents: number;
 }
 
 export const DEFAULT_BUDGET: RunBudget = {
@@ -250,7 +350,21 @@ export const DEFAULT_BUDGET: RunBudget = {
   maxOutputTokensPerCall: 4096,
   compactionThreshold: 0.7,
   compactionPreserveTail: 3,
+  maxConcurrentToolCalls: 5,
+  maxConcurrentSubagents: 3,
 };
+
+// Hard cap for the parallel pool — even an explicit caller config of
+// `maxConcurrentToolCalls: 100` is clamped to this to bound resource
+// pressure (file descriptors, SQLite WAL writers, hook chain fanout).
+// Mirrors `ORCHESTRATION.md §11`.
+export const MAX_CONCURRENT_TOOL_CALLS_CAP = 16;
+
+// Hard cap for `task_async` slot semaphore. Mirrors
+// `ORCHESTRATION.md §11`. The harness clamps `maxConcurrentSubagents`
+// to `[1, 8]` at the consumer; configs that ask for more are
+// silently capped (operator gets the cap behavior, not a refusal).
+export const MAX_CONCURRENT_SUBAGENTS_CAP = 8;
 
 // Why the loop stopped. `done` is the only success path; everything else
 // is the harness intervening for safety or budget reasons.
@@ -485,6 +599,17 @@ export interface HarnessConfig {
   // into a no-op filter — no perf cost beyond an empty array
   // walk.
   hooks?: readonly HookSpec[];
+  // Test seam: subprocess spawn factory threaded through
+  // `runSubagent` so the harness can exercise the full
+  // `task` / `task_async` chain without forking a real Bun
+  // process. Production callers omit; the harness's
+  // `spawnSubagentImpl` forwards this verbatim to `runSubagent`,
+  // which uses the default `Bun.spawn` factory when absent.
+  // Lives on the harness config (not the runtime call site)
+  // because the `task` family invokes runSubagent indirectly —
+  // tests need a way to reach the spawn point through the
+  // wider step loop.
+  spawnChildProcess?: import('../subagents/runtime.ts').SpawnChildProcess;
 }
 
 // Producer-facing args for `confirmMemoryWrite`. Mirrors

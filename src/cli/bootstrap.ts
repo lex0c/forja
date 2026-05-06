@@ -21,6 +21,7 @@ import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagen
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { isTrusted, trustListPath } from '../trust/index.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
+import { composeWithParallelHint } from './parallel-prompt.ts';
 import { composeWithUserPrompt } from './plan-prompt.ts';
 
 export const DEFAULT_MODEL = 'anthropic/claude-sonnet-4-6';
@@ -183,13 +184,27 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   try {
     migrate(db);
 
-    // Resolve the effective system prompt. Plan mode prepends its
-    // own prompt to whatever the caller supplied; without plan mode,
-    // the caller's prompt passes through unchanged.
+    // Resolve the effective system prompt. Three layers stack
+    // here in precedence order (most-specific to most-generic):
+    //   1. Caller's user prompt (input.systemPrompt) — most
+    //      specific, the operator's own framing.
+    //   2. Plan mode prompt — operating-mode framing for
+    //      `--plan` invocations only.
+    //   3. Parallelism hint — universal background that
+    //      surfaces the harness's concurrency affordances
+    //      (multi-tool turns, task_async family) so the
+    //      capability isn't dormant.
+    //
+    // Composition order: hint FIRST (background), plan/user
+    // prompts AFTER (more-specific instructions). Without the
+    // hint at the top, models default to one-tool-per-turn and
+    // the parallel dispatch path goes unused on read-heavy
+    // exploration.
     if (input.plan === true) {
-      resolvedSystemPrompt = composeWithUserPrompt(input.systemPrompt);
-    } else if (input.systemPrompt !== undefined) {
-      resolvedSystemPrompt = input.systemPrompt;
+      const planAndUser = composeWithUserPrompt(input.systemPrompt);
+      resolvedSystemPrompt = composeWithParallelHint(planAndUser);
+    } else {
+      resolvedSystemPrompt = composeWithParallelHint(input.systemPrompt);
     }
 
     // Memory subsystem (spec MEMORY.md / §4.1). Build the registry

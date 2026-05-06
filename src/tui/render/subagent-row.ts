@@ -52,6 +52,12 @@ export interface SubagentRowState {
   goal: string;
   progress: string;
   startedAt: number;
+  // Cumulative live cost from `cost_update` IPC events. 0 when
+  // no cost has been reported yet (or the child runs on a
+  // zero-cost provider, typical in tests). The renderer
+  // suppresses the `$` chip when 0 so test fixtures and
+  // free-tier runs stay visually clean.
+  liveCostUsd: number;
 }
 
 export const renderSubagentRows = (
@@ -77,16 +83,21 @@ export const renderSubagentRows = (
         ? truncate(sub.progress, MAX_DETAIL)
         : truncate(`booting · ${sub.goal}`, MAX_DETAIL);
     const elapsed = formatDuration(Math.max(0, now - sub.startedAt));
-    // `▸ task <name>` is the title; `· <detail> · <elapsed>` is
-    // the secondary chrome. Color split keeps the operator's eye
-    // on the live verb (`running echo`) rather than the header
-    // word.
+    // Cost chip: a 6-cent precision dollar amount when the
+    // child has reported any spend. Suppressed at 0 so test
+    // fixtures (zero-cost mock providers) and free-tier runs
+    // don't render an always-zero ornament.
+    const costChip = sub.liveCostUsd > 0 ? ` · $${sub.liveCostUsd.toFixed(4)}` : '';
+    // `▸ task <name>` is the title; `· <detail> · <elapsed>
+    // [· $X.XXXX]` is the secondary chrome. Color split keeps
+    // the operator's eye on the live verb (`running echo`)
+    // rather than the header word.
     // No paint() on the head: the `paint` palette is alert-class
     // (error/warn/success/secondary/etc.) — primary content is
     // plain text. Secondary tail keeps the chrome dimmer than the
     // verb so the operator scans the row's "name + activity".
     const head = `  ${glyph} task ${sub.name}`;
-    const tail = paint(caps, 'secondary', ` · ${detail} · ${elapsed}`);
+    const tail = paint(caps, 'secondary', ` · ${detail} · ${elapsed}${costChip}`);
     out.push(`${head}${tail}`);
   }
   return out;

@@ -306,13 +306,41 @@ const [out1, out2, out3] = await Promise.all([h1, h2, h3].map(task_await));
 
 Pai vê **só os outputs finais**. History intermediária dos subagents nunca chega ao pai (§11.1 do AGENTIC_CLI.md — contexto isolado).
 
-### 3.5 Budget shared, não pre-aloca
+### 3.5 Budget shared
 
-- Pai tem $5 budget restante
-- Spawna 3 subagents com `task_async`
-- Cada um pode usar até $5 (todo disponível) **competindo**
-- Hit do limite global: subagent ativo recebe sinal de finalizar; novos spawns rejeitam com `budget_exhausted`
-- Audit em `failure_events`
+Cap de cost (`maxCostUsd` do `RunBudget`) é **compartilhado** entre o pai e seus filhos `task_async`. O contrato:
+
+- Pai tem `$cap` total
+- `priorCostUsd + totalCostUsd` rastreia spend do pai (próprias provider calls + compaction calls)
+- Cada filho settled contribui com seu `costUsd` real ao tracker compartilhado
+- Cada filho **in-flight** contribui com sua **reserva pessimista**: `definition.budget.maxCostUsd` (worst-case do playbook)
+- `task_async` pré-checa: se `parentSpend + settledChildCost + reservedChildCost + novaReserva > cap`, refusa com `subagent.budget_exhausted` (`SubagentOutput.reason` em `CONTRACTS.md §2.6.4.1`)
+- Reserva libera quando o filho settla; spend real do filho então conta direto
+
+#### 3.5.1 Cost-progress via IPC
+
+O filho emite um `HarnessEvent` `cost_update { delta, cumulative }` após cada provider call (turn settle, compaction, partial provider-error). O canal IPC `event` envelopa o evento; o runtime do pai forward via `subagent_progress.lastEvent`. O `spawnSubagentImpl` no pai intercepta e chama `subagentHandleStore.recordLiveCost(handleId, cumulative)` — que atualiza um campo `liveCostUsd` per-record monotonically (eventos out-of-order não regridem).
+
+A reserva por handle é `max(estimateCostUsd, liveCostUsd)`:
+
+- **Antes do primeiro `cost_update`** (bootstrap window): reserva = `definition.budget.maxCostUsd` (worst-case declarado pelo playbook). Sem isto, três `task_async` concorrentes cada um veria `liveCostUsd = 0` (filhos ainda não reportaram) e o cap seria cruzado antes do primeiro `cost_update` chegar. A janela bootstrap é unavoidable mesmo com IPC: existe um delay físico entre spawn e primeiro provider turn.
+- **Após `cost_update`**: reserva tracks o gasto real. Se filho excede sua própria budget (`liveCostUsd > estimateCostUsd`), a reserva cresce com o real — não é silenciada.
+- **Cancelled** (`cancel`/`cancelAll`): reserva → 0 imediatamente. O record permanece `'running'` até a IIFE settlar, mas `getReservedChildCostUsd` filtra rows com flag `cancelled` para não contar. Eventos `cost_update` em vôo após o cancel são no-op para evitar reativar a reserva.
+- **Settled**: reserva → 0; o cost real (`result.costUsd`) flui para `cumulativeChildCostUsd`.
+
+Reconciliação com `§0` princípio 7 ("Budget é compartilhado, não pre-alocado") e `§12` anti-pattern: o `estimateCostUsd` floor NÃO é pre-alocação no sentido do anti-pattern (que ali se refere a "reservar 1/N do cap por subagent paralelo"). É um **placeholder pessimista de duração curta** (até primeiro `cost_update` arrival, tipicamente milissegundos). Após o primeiro report, o tracker é puro live-shared. A janela bootstrap mantém a invariante "novos spawns não over-committam no momento de issue"; sem ela, a leitura literal "competindo" tem o footgun de over-commit transient documentado acima.
+
+#### 3.5.2 Falhas no cap
+
+| Hit | Comportamento |
+|---|---|
+| Pré-spawn projetado > cap | `task_async` (e `task_sync`/dispatcher) retornam `subagent.budget_exhausted`. Reserva soma de in-flight + estimate do novo spawn impede over-commit no momento do spawn. |
+| Filho ativo cruza cap mid-run | A cada `cost_update` recebido, watchdog em `spawnSubagentImpl` projeta `priorCostUsd + totalCostUsd + cumulativeChildCostUsd + getReservedChildCostUsd()`. Se > cap, dispara `subagentHandleStore.cancelAll()` — todos os filhos ativos recebem hard-signal via per-handle controller, gracefully terminam via interrupt:hard IPC. |
+| Pai self-cost cruza cap | `runAgent.costCapDetailIfExceeded()` finaliza com `maxCostUsd` no próximo turn boundary. Inclui cumulative + reserved ao computar (consistente com pré-spawn gate). |
+
+#### 3.5.3 Audit
+
+Recusa de spawn com `budget_exhausted` é registrada como tool error normal em `tool_calls`. Não há entry separada em `failure_events` para esse caso (caller pode rastrear via `error_code = 'subagent.budget_exhausted'` em queries de audit).
 
 ### 3.6 Cancel cascading
 

@@ -7,6 +7,8 @@ import type { GenerateRequest, Provider, StreamEvent } from '../../src/providers
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { getSession, listSessions } from '../../src/storage/repos/sessions.ts';
+import type { SubagentSet } from '../../src/subagents/load.ts';
+import type { SubagentDefinition } from '../../src/subagents/types.ts';
 import { createToolRegistry } from '../../src/tools/registry.ts';
 import { type Tool, toolError } from '../../src/tools/types.ts';
 
@@ -706,6 +708,190 @@ describe('runAgent', () => {
     expect(r2.detail).toContain('$0.000600'); // cumulative figure
     const session = getSession(db, r1.sessionId);
     expect(session?.totalCostUsd).toBeCloseTo(0.0006, 9);
+  });
+
+  test('rehydrated child cost does NOT inflate sessions.totalCostUsd across resumes (D216)', async () => {
+    // Regression for D216 — the rehydrated cost from settled
+    // `subagent_handles` rows must enter the budget gate but
+    // MUST NOT be folded into the persisted parent-self cost.
+    // Folding it via `priorCostUsd += rehydrated` made finish()
+    // re-write the same child spend back to
+    // `sessions.totalCostUsd` on every resume; after N resumes
+    // the row showed `parentSelf + N * childTotal` even when no
+    // new work ran, eventually tripping `maxCostUsd`
+    // prematurely.
+    //
+    // The fix splits the two: `priorCostUsd` is parent-self
+    // only (round-tripped through the column); a separate
+    // `rehydratedChildCostUsd` is added to gate cumulatives but
+    // not to the persisted total.
+    const definition: SubagentDefinition = {
+      name: 'explore',
+      description: 'fixture',
+      tools: [],
+      budget: { maxSteps: 5, maxCostUsd: 0.05 },
+      systemPrompt: 'fixture',
+      scope: 'project',
+      isolation: 'none',
+      sourcePath: '/fake/explore.md',
+      sourceSha256: 'a'.repeat(64),
+      meta: {},
+    };
+    const subagentRegistry: SubagentSet = {
+      byName: new Map([['explore', definition]]),
+      shadows: [],
+    };
+    // Run #1 — parent-self spend $0.0006. No subagent calls;
+    // we'll seed the settled handle directly to keep the test
+    // small.
+    const first = buildConfig(
+      [{ text: 'one', stop_reason: 'end_turn', usage: { input: 100, output: 20 } }],
+      { capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 } },
+    );
+    const r1 = await runAgent({ ...first.config, subagentRegistry });
+    expect(r1.status).toBe('done');
+    expect(r1.costUsd).toBeCloseTo(0.0006, 9);
+    const sessionAfterRun1 = getSession(db, r1.sessionId);
+    expect(sessionAfterRun1?.totalCostUsd).toBeCloseTo(0.0006, 9);
+
+    // Seed a settled subagent_handles row tied to the run #1
+    // session, with a non-zero child cost ($0.04). Mirrors the
+    // shape `runSubagent` settles via task_async →
+    // settleSubagentHandle.
+    db.query(
+      `INSERT INTO subagent_handles
+         (handle_id, parent_session_id, child_session_id, name, spawned_at, status, settled_payload, created_at)
+       VALUES (?, ?, ?, ?, ?, 'settled', ?, ?)`,
+    ).run(
+      'h-prior',
+      r1.sessionId,
+      'child-prior',
+      'explore',
+      Date.now() - 10_000,
+      JSON.stringify({
+        kind: 'ran',
+        output: 'prior',
+        sessionId: 'child-prior',
+        status: 'done',
+        reason: 'done',
+        costUsd: 0.04,
+        steps: 1,
+        durationMs: 50,
+      }),
+      Date.now() - 10_000,
+    );
+
+    // Run #2 (resume) — single text turn, $0.0003 cost. With
+    // the bug, finish() would persist (priorCostUsd + child) +
+    // turn = (0.0006 + 0.04) + 0.0003 = $0.0409 to
+    // sessions.totalCostUsd. With the fix, persistence is
+    // priorCostUsd-only: 0.0006 + 0.0003 = $0.0009. The
+    // rehydrated $0.04 stays out of the column.
+    const second = buildConfig(
+      [{ text: 'two', stop_reason: 'end_turn', usage: { input: 50, output: 10 } }],
+      { capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 } },
+    );
+    const r2 = await runAgent({
+      ...second.config,
+      resumeFromSessionId: r1.sessionId,
+      subagentRegistry,
+    });
+    expect(r2.status).toBe('done');
+    expect(r2.costUsd).toBeCloseTo(0.0003, 9);
+    const sessionAfterRun2 = getSession(db, r1.sessionId);
+    expect(sessionAfterRun2?.totalCostUsd).toBeCloseTo(0.0009, 9);
+
+    // Run #3 (resume again) — same shape, $0.0003 cost. With
+    // the bug, the row would now hold (0.0006 + 0.04 + 0.0003)
+    // + 0.04 + 0.0003 = $0.0812 — child cost compounding once
+    // per resume. With the fix, it's still parent-self only:
+    // 0.0009 + 0.0003 = $0.0012.
+    const third = buildConfig(
+      [{ text: 'three', stop_reason: 'end_turn', usage: { input: 50, output: 10 } }],
+      { capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 } },
+    );
+    const r3 = await runAgent({
+      ...third.config,
+      resumeFromSessionId: r1.sessionId,
+      subagentRegistry,
+    });
+    expect(r3.status).toBe('done');
+    const sessionAfterRun3 = getSession(db, r1.sessionId);
+    expect(sessionAfterRun3?.totalCostUsd).toBeCloseTo(0.0012, 9);
+  });
+
+  test('rehydrated child cost still enters the budget gate on resume (D216)', async () => {
+    // Counterpart to D216 — the fix must not regress the gate.
+    // Even though the rehydrated child cost is no longer
+    // persisted into `sessions.totalCostUsd`, the cap check
+    // must still see it. Otherwise a resumed run could burn
+    // through the cap a second time on a fresh subagent_handles
+    // row that the previous run left settled.
+    const definition: SubagentDefinition = {
+      name: 'explore',
+      description: 'fixture',
+      tools: [],
+      budget: { maxSteps: 5, maxCostUsd: 0.05 },
+      systemPrompt: 'fixture',
+      scope: 'project',
+      isolation: 'none',
+      sourcePath: '/fake/explore.md',
+      sourceSha256: 'a'.repeat(64),
+      meta: {},
+    };
+    const subagentRegistry: SubagentSet = {
+      byName: new Map([['explore', definition]]),
+      shadows: [],
+    };
+    // Run #1 — parent-self $0.0006.
+    const first = buildConfig(
+      [{ text: 'one', stop_reason: 'end_turn', usage: { input: 100, output: 20 } }],
+      { capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 } },
+    );
+    const r1 = await runAgent({ ...first.config, subagentRegistry });
+    expect(r1.status).toBe('done');
+    // Seed prior child cost = $0.04. Combined with the
+    // parent-self $0.0006, total cumulative = $0.0406. A cap of
+    // $0.001 must trip at the pre-call gate.
+    db.query(
+      `INSERT INTO subagent_handles
+         (handle_id, parent_session_id, child_session_id, name, spawned_at, status, settled_payload, created_at)
+       VALUES (?, ?, ?, ?, ?, 'settled', ?, ?)`,
+    ).run(
+      'h-prior',
+      r1.sessionId,
+      'child-prior',
+      'explore',
+      Date.now() - 10_000,
+      JSON.stringify({
+        kind: 'ran',
+        output: 'prior',
+        sessionId: 'child-prior',
+        status: 'done',
+        reason: 'done',
+        costUsd: 0.04,
+        steps: 1,
+        durationMs: 50,
+      }),
+      Date.now() - 10_000,
+    );
+
+    // Run #2 (resume) — empty mock script, cap $0.001. The
+    // rehydrated $0.04 alone exceeds the cap, so the pre-call
+    // gate must short-circuit BEFORE any provider call.
+    const second = buildConfig([], {
+      capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 },
+      budget: { maxCostUsd: 0.001 },
+    });
+    const r2 = await runAgent({
+      ...second.config,
+      resumeFromSessionId: r1.sessionId,
+      subagentRegistry,
+    });
+    expect(r2.status).toBe('exhausted');
+    expect(r2.reason).toBe('maxCostUsd');
+    expect(r2.steps).toBe(0);
+    expect(second.handle.requests).toHaveLength(0);
   });
 
   test('budget.maxCostUsd=0 trips on the first paid turn', async () => {

@@ -91,6 +91,11 @@ describe('bootstrap', () => {
         'monitor',
         'read_file',
         'task',
+        'task_async',
+        'task_await',
+        'task_cancel',
+        'task_list',
+        'task_sync',
         'todo_write',
         'wait_for',
         'write_file',
@@ -176,7 +181,12 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('plan omitted leaves planMode unset and no system prompt', () => {
+  test('plan omitted leaves planMode unset; system prompt carries the parallelism hint', () => {
+    // Post-D227: every bootstrap surfaces the parallelism hint
+    // as a base preamble so the model knows multi-tool turns
+    // dispatch concurrently. Pre-D227 this test asserted
+    // `systemPrompt === undefined`; that's now the only surface
+    // change visible to the model.
     const { config, db } = bootstrap({
       prompt: 'hi',
       cwd: workdir,
@@ -186,11 +196,18 @@ describe('bootstrap', () => {
       userPolicyPath: null,
     });
     expect(config.planMode).toBeUndefined();
-    expect(config.systemPrompt).toBeUndefined();
+    expect(config.systemPrompt).toBeDefined();
+    expect(config.systemPrompt).toContain('# Parallelism');
+    expect(config.systemPrompt).toContain('emit MULTIPLE tool calls in a SINGLE turn');
     db.close();
   });
 
-  test('plan + caller systemPrompt composes (plan first, user after separator)', () => {
+  test('plan + caller systemPrompt composes (parallelism hint, then plan, then user)', () => {
+    // Post-D227: three-layer composition. Parallelism hint is
+    // the universal background; plan-mode prompt is the
+    // operating mode; caller's prompt is the most specific
+    // context. Ordering must be hint → plan → user so the
+    // model reads them most-generic → most-specific.
     const { config, db } = bootstrap({
       prompt: 'refactor',
       cwd: workdir,
@@ -202,11 +219,13 @@ describe('bootstrap', () => {
       systemPrompt: 'Project convention: prefer functional style.',
     });
     expect(config.planMode).toBe(true);
+    expect(config.systemPrompt).toContain('# Parallelism');
     expect(config.systemPrompt).toContain('PLAN MODE');
     expect(config.systemPrompt).toContain('Project convention');
-    // Plan instructions come first; user prompt after separator.
+    const hintIdx = (config.systemPrompt ?? '').indexOf('# Parallelism');
     const planIdx = (config.systemPrompt ?? '').indexOf('PLAN MODE');
     const userIdx = (config.systemPrompt ?? '').indexOf('Project convention');
+    expect(hintIdx).toBeLessThan(planIdx);
     expect(planIdx).toBeLessThan(userIdx);
     db.close();
   });
@@ -291,7 +310,12 @@ describe('bootstrap', () => {
     db.close();
   });
 
-  test('memory section becomes systemPrompt when no caller prompt and memories exist', () => {
+  test('memory section composes after the parallelism hint when no caller prompt and memories exist', () => {
+    // Post-D227 ordering: parallelism hint (background framing)
+    // FIRST, then user/plan prompt (none here), then memory
+    // section (project context). A fresh resume reading the
+    // prompt sees parallelism guidance up front; memories sit
+    // after as project-specific context.
     const localDir = join(workdir, '.agent', 'memory', 'local');
     mkdirSync(localDir, { recursive: true });
     writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — TS dev\n');
@@ -304,8 +328,8 @@ describe('bootstrap', () => {
       userPolicyPath: null,
     });
     expect(config.systemPrompt).toBeDefined();
+    expect(config.systemPrompt?.startsWith('# Parallelism')).toBe(true);
     expect(config.systemPrompt).toContain('# Memory');
-    expect(config.systemPrompt?.startsWith('# Memory')).toBe(true);
     db.close();
   });
 
@@ -401,17 +425,25 @@ describe('bootstrap', () => {
       enterprisePolicyPath: null,
       userPolicyPath: null,
     });
-    // With empty memory tree, systemPrompt stays undefined (no
-    // injection forces the field) — preserves existing test
-    // expectations.
-    expect(config.systemPrompt).toBeUndefined();
-    // But the registry is still threaded through for tools.
+    // Post-D227: systemPrompt is the parallelism hint alone
+    // when no memory entries and no caller prompt. The hint is
+    // unconditional; only the memory section is gated on
+    // having entries.
+    expect(config.systemPrompt).toBeDefined();
+    expect(config.systemPrompt).toContain('# Parallelism');
+    expect(config.systemPrompt).not.toContain('# Memory');
+    // And the registry is still threaded through for tools.
     expect(config.memoryRegistry).toBeDefined();
     expect(config.memoryRegistry?.list()).toEqual([]);
     db.close();
   });
 
-  test('caller systemPrompt without plan passes through unchanged', () => {
+  test('caller systemPrompt is layered after the parallelism hint without plan', () => {
+    // Post-D227: caller prompt no longer passes through verbatim
+    // — the parallelism hint is prepended as background framing.
+    // Composition order: hint (universal) → caller prompt (more
+    // specific). The separator (\\n\\n---\\n\\n) makes the
+    // boundary visible to the model.
     const { config, db } = bootstrap({
       prompt: 'hi',
       cwd: workdir,
@@ -422,7 +454,11 @@ describe('bootstrap', () => {
       systemPrompt: 'You are a senior engineer.',
     });
     expect(config.planMode).toBeUndefined();
-    expect(config.systemPrompt).toBe('You are a senior engineer.');
+    expect(config.systemPrompt?.startsWith('# Parallelism')).toBe(true);
+    expect(config.systemPrompt).toContain('You are a senior engineer.');
+    // The caller prompt comes AFTER the hint — the separator is
+    // load-bearing for the model to distinguish the two layers.
+    expect(config.systemPrompt).toContain('---');
     db.close();
   });
 

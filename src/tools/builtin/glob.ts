@@ -37,7 +37,8 @@ const patternEscapesRoot = (pattern: string): boolean => {
 
 export const globTool: Tool<GlobInput, GlobOutput> = {
   name: 'glob',
-  description: 'List files matching a glob pattern. Returns paths relative to the search root.',
+  description:
+    'List files matching a glob pattern. Returns paths relative to the search root. Parallel-safe: emit multiple glob calls in a single turn to scan several patterns concurrently.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -53,6 +54,7 @@ export const globTool: Tool<GlobInput, GlobOutput> = {
     category: 'fs.read',
     writes: false,
     idempotent: true,
+    parallel_safe: true,
     display: 'list',
     cost: { latency_ms_typical: 25 },
   },

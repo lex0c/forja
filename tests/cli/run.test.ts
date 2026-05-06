@@ -237,7 +237,7 @@ describe('run end-to-end with mock provider', () => {
     mkdirSync(userAgents, { recursive: true });
     mkdirSync(projectAgents, { recursive: true });
     const def = (name: string, desc: string) =>
-      `---\nname: ${name}\ndescription: ${desc}\ntools: []\nbudget:\n  max_steps: 1\n  max_cost_usd: 0\n---\nbody`;
+      `---\nname: ${name}\ndescription: ${desc}\ntools: []\nbudget:\n  max_steps: 1\n  max_cost_usd: 0.01\n---\nbody`;
     writeFileSync(join(userAgents, 'explore.md'), def('explore', 'user version'));
     writeFileSync(join(projectAgents, 'explore.md'), def('explore', 'project version'));
 
@@ -271,7 +271,7 @@ describe('run end-to-end with mock provider', () => {
     mkdirSync(userAgents, { recursive: true });
     mkdirSync(projectAgents, { recursive: true });
     const def = (name: string) =>
-      `---\nname: ${name}\ndescription: x\ntools: []\nbudget:\n  max_steps: 1\n  max_cost_usd: 0\n---\nbody`;
+      `---\nname: ${name}\ndescription: x\ntools: []\nbudget:\n  max_steps: 1\n  max_cost_usd: 0.01\n---\nbody`;
     writeFileSync(join(userAgents, 'explore.md'), def('explore'));
     writeFileSync(join(projectAgents, 'explore.md'), def('explore'));
 

@@ -28,6 +28,20 @@ export const makeCtx = (overrides: Partial<ToolContext> = {}): ToolContext => ({
   ...(overrides.bgManager !== undefined ? { bgManager: overrides.bgManager } : {}),
   ...(overrides.todoStore !== undefined ? { todoStore: overrides.todoStore } : {}),
   ...(overrides.spawnSubagent !== undefined ? { spawnSubagent: overrides.spawnSubagent } : {}),
+  ...(overrides.subagentHandleStore !== undefined
+    ? { subagentHandleStore: overrides.subagentHandleStore }
+    : {}),
+  ...(overrides.subagentDepth !== undefined ? { subagentDepth: overrides.subagentDepth } : {}),
+  ...(overrides.getCostBudget !== undefined ? { getCostBudget: overrides.getCostBudget } : {}),
+  ...(overrides.getSubagentBudgetEstimate !== undefined
+    ? { getSubagentBudgetEstimate: overrides.getSubagentBudgetEstimate }
+    : {}),
+  ...(overrides.getKnownSubagentNames !== undefined
+    ? { getKnownSubagentNames: overrides.getKnownSubagentNames }
+    : {}),
+  ...(overrides.recordGateDecision !== undefined
+    ? { recordGateDecision: overrides.recordGateDecision }
+    : {}),
   ...(overrides.memoryRegistry !== undefined ? { memoryRegistry: overrides.memoryRegistry } : {}),
   ...(overrides.confirmMemoryWrite !== undefined
     ? { confirmMemoryWrite: overrides.confirmMemoryWrite }
