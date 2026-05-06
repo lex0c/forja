@@ -123,6 +123,41 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
         },
       );
     }
+    // Pre-spawn cost budget check (spec ORCHESTRATION.md §3.5).
+    // Computes a projected total assuming this spawn lands at
+    // its worst-case cost. Pessimistic reservation: every
+    // in-flight handle's `definition.budget.maxCostUsd` already
+    // counts via `getCostBudget().spent`, plus the new
+    // estimate added here. If the total would exceed the cap,
+    // refuse with `subagent.budget_exhausted` and let the model
+    // fall back to settled-handle inspection or a smaller
+    // spawn. The pessimistic reservation deviates from the
+    // spec's strict "não pre-aloca" reading — the deviation is
+    // documented as a deliberate safety choice, since without
+    // mid-run cost-progress IPC the parent has no way to
+    // observe in-flight spend.
+    const budget = ctx.getCostBudget?.();
+    const estimate = ctx.getSubagentBudgetEstimate?.(args.subagent) ?? 0;
+    if (budget !== undefined && budget.cap !== undefined && Number.isFinite(budget.cap)) {
+      const projected = budget.spent + estimate;
+      if (projected > budget.cap) {
+        return toolError(
+          'subagent.budget_exhausted',
+          `spawning '${args.subagent}' would push projected cost to $${projected.toFixed(6)} (cap $${budget.cap.toFixed(6)})`,
+          {
+            retryable: false,
+            hint: 'Wait for in-flight subagents to settle (their actual cost is usually less than the worst-case reservation) and retry, or cancel one via task_cancel to free its reservation, or finish the work without a new subagent.',
+            details: {
+              spent: budget.spent,
+              estimate,
+              projected,
+              cap: budget.cap,
+            },
+          },
+        );
+      }
+    }
+
     // Spawn returns immediately. The store's slot semaphore may
     // queue the underlying `runSubagent` call until a slot frees,
     // but the handle is created synchronously — the model can
@@ -139,10 +174,21 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
     // an uncaught throw escaping into the harness loop.
     let handle: ReturnType<typeof ctx.subagentHandleStore.spawn>;
     try {
-      handle = ctx.subagentHandleStore.spawn({
-        name: args.subagent,
-        prompt: args.prompt,
-      });
+      handle = ctx.subagentHandleStore.spawn(
+        {
+          name: args.subagent,
+          prompt: args.prompt,
+        },
+        // Forward the estimate so the store can include it in
+        // `getReservedChildCostUsd()` for the duration of the
+        // spawn. Pass 0 when no estimate is available — the
+        // store's reservation tracker treats 0 as "no
+        // reservation" and the load-bearing gate is in
+        // `spawnSubagentImpl` (which can read the definition
+        // directly), so this branch only loses the early-UX
+        // refusal, not the safety net.
+        { estimateCostUsd: estimate > 0 ? estimate : 0 },
+      );
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       return toolError('subagent.spawn_failed', `failed to issue handle: ${message}`, {

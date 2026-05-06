@@ -141,6 +141,28 @@ export interface ToolContext {
   // Optional + default-zero so test contexts that don't model
   // chain state still construct cleanly.
   subagentDepth?: number;
+  // Run-level cost accounting (spec ORCHESTRATION.md §3.5).
+  // Returns the cap and the cumulative cost incurred so far.
+  // `spent` includes parent self-cost (priorCostUsd +
+  // totalCostUsd) AND settled child costs AND the
+  // pessimistic reservation for in-flight children. `cap` is
+  // undefined when the run has no maxCostUsd configured —
+  // every projected total fits under "no cap".
+  // Used by `task_async` to refuse new spawns when the cap
+  // would be crossed; the in-flight reservation is what
+  // protects against the footgun where 3 concurrent
+  // task_async calls each pass an "I see room" check
+  // because no settled child cost has landed yet.
+  getCostBudget?: () => { spent: number; cap: number | undefined };
+  // Lookup helper for subagent budget estimates. Returns the
+  // definition's `budget.maxCostUsd` (worst-case spend) for the
+  // named subagent, or null when the name doesn't resolve.
+  // `task_async` uses this to compute the pessimistic
+  // reservation for the spawn it's about to issue. Separated
+  // from a full `subagentRegistry` exposure to keep tools
+  // that spawn children from reaching into definition shapes
+  // they don't need to read.
+  getSubagentBudgetEstimate?: (name: string) => number | null;
   // Background process manager for the current session. Optional so
   // existing tools that don't need bg orchestration aren't forced to
   // declare a dependency. Tools that DO need it (`bash_background`,
@@ -251,9 +273,10 @@ export interface SpawnSubagentArgs {
 // Result discriminated by `kind` so the calling tool can map an
 // unknown subagent name into a tool error (model error) without
 // confusing it with an executed-but-failed run (child error). The
-// `depth_exceeded` variant is also a model-recoverable signal —
-// the model should stop nesting `task()` calls and finish the work
-// itself.
+// `depth_exceeded` and `budget_exhausted` variants are also
+// model-recoverable signals — the model should stop nesting /
+// stop spawning and finish the work itself, or wait for in-flight
+// reservations to release.
 export type SpawnSubagentResult =
   | {
       kind: 'unknown_subagent';
@@ -265,6 +288,23 @@ export type SpawnSubagentResult =
       requested: string;
       depth: number;
       maxDepth: number;
+    }
+  | {
+      // Refused by the cost-cap gate in `spawnSubagentImpl`
+      // (spec ORCHESTRATION.md §3.5). `spent` includes parent
+      // self-cost + cumulative child cost (settled, sync + async)
+      // + pessimistic reservation (in-flight async). `estimate`
+      // is the worst-case for this would-be spawn from
+      // `definition.budget.maxCostUsd`. `projected = spent +
+      // estimate`, the value that crossed `cap`. Both `task`
+      // and `task_async` map this onto a `subagent.budget_exhausted`
+      // tool error with the same `details` shape.
+      kind: 'budget_exhausted';
+      requested: string;
+      spent: number;
+      estimate: number;
+      projected: number;
+      cap: number;
     }
   | {
       kind: 'ran';

@@ -271,6 +271,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   let priorCostUsd = 0;
   let priorUsageComplete = true;
 
+  // Cumulative cost of every child this run spawned (sync `task`
+  // and async `task_async` alike). Increments inside
+  // `spawnSubagentImpl` after each `runSubagent` returns. Used
+  // by both the per-step cap check and the pre-spawn budget
+  // gate to ensure the parent + children share `maxCostUsd`
+  // (spec ORCHESTRATION.md §3.5). Reserved-but-not-yet-settled
+  // async children are tracked separately by the handle store
+  // (`getReservedChildCostUsd`); the projected total combines
+  // both so a burst of concurrent `task_async` calls can't slip
+  // past the gate while their reservations are pending.
+  let cumulativeChildCostUsd = 0;
+
   // Distinguish wall-clock from user abort — both use `signal.aborted` but
   // the user wants different exit reasons.
   const isWallClockTimeout = (): boolean =>
@@ -278,15 +290,21 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
 
   // Cumulative-cost cap check. Returns a detail string when the cap
   // is exceeded so callers can build the finish() call inline; null
-  // otherwise. The comparison uses CUMULATIVE cost (priorCostUsd +
-  // totalCostUsd) so that a resumed run honors the same cap that
-  // applied to its predecessor — matching the persistence contract
-  // where the session row stores cumulative spend. Strict `>` so a
-  // `maxCostUsd: 0` config trips the gate on the first paid turn,
-  // not before any work runs.
+  // otherwise. The comparison uses TOTAL cumulative cost
+  // (parent self + children settled + reserved in-flight) so the
+  // parent's turn-end gate stays consistent with the pre-spawn
+  // budget gate in `spawnSubagentImpl`. Without including
+  // children, a resumed run with $4 of prior child cost and $0
+  // of parent self-cost could pass every turn-end check forever
+  // while `task_async` refuses new spawns at $1.01 — incoherent
+  // surface the reviewer flagged as risk #2. Matches the
+  // persistence contract where the session row stores cumulative
+  // spend. Strict `>` so a `maxCostUsd: 0` config trips the gate
+  // on the first paid turn, not before any work runs.
   const costCapDetailIfExceeded = (): string | null => {
     if (budget.maxCostUsd === undefined) return null;
-    const cumulative = priorCostUsd + totalCostUsd;
+    const reserved = subagentHandleStore?.getReservedChildCostUsd() ?? 0;
+    const cumulative = priorCostUsd + totalCostUsd + cumulativeChildCostUsd + reserved;
     if (cumulative <= budget.maxCostUsd) return null;
     return `cumulative cost $${cumulative.toFixed(6)} exceeded cap $${budget.maxCostUsd.toFixed(6)}`;
   };
@@ -663,6 +681,40 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               maxDepth: MAX_SUBAGENT_DEPTH,
             };
           }
+
+          // Cost-cap gate (spec ORCHESTRATION.md §3.5).
+          // Single source of truth for budget enforcement —
+          // covers BOTH the sync `task` and async `task_async`
+          // surfaces because both flow through this dispatcher.
+          // Pessimistic projection: parent self-cost + child
+          // cumulative settled + reserved in-flight (async only)
+          // + this spawn's worst-case estimate from its
+          // definition. Refuse with a structured envelope when
+          // the cap would be crossed; the calling tool maps it
+          // to `subagent.budget_exhausted`.
+          //
+          // The strict `>` matches `costCapDetailIfExceeded` —
+          // a `maxCostUsd: 0` config refuses on the first non-
+          // zero-cost spawn rather than before any work runs.
+          if (budget.maxCostUsd !== undefined) {
+            const estimate =
+              Number.isFinite(def.budget.maxCostUsd) && def.budget.maxCostUsd > 0
+                ? def.budget.maxCostUsd
+                : 0;
+            const reserved = subagentHandleStore?.getReservedChildCostUsd() ?? 0;
+            const spent = priorCostUsd + totalCostUsd + cumulativeChildCostUsd + reserved;
+            const projected = spent + estimate;
+            if (projected > budget.maxCostUsd) {
+              return {
+                kind: 'budget_exhausted',
+                requested: args.name,
+                spent,
+                estimate,
+                projected,
+                cap: budget.maxCostUsd,
+              };
+            }
+          }
           // Validate child's whitelist against the ROOT registry
           // (full toolset), NOT against this harness's `toolRegistry`
           // (which is narrowed to OUR own whitelist when we're a
@@ -741,6 +793,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               };
             })(),
           });
+          // Charge the child's actual cost against the run-wide
+          // tracker. Both `task` (sync) and `task_async` reach
+          // this dispatcher, so this single increment captures
+          // every spawn. NaN-guarded: a misbehaving child that
+          // emits a non-finite costUsd would otherwise poison
+          // the cumulative counter and trip every subsequent
+          // budget gate.
+          if (Number.isFinite(child.costUsd)) {
+            cumulativeChildCostUsd += child.costUsd;
+          }
           return {
             kind: 'ran',
             output: child.output,
@@ -1317,6 +1379,37 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(spawnSubagentClosure !== undefined ? { spawnSubagent: spawnSubagentClosure } : {}),
           ...(subagentHandleStore !== undefined ? { subagentHandleStore } : {}),
           subagentDepth: config.subagentDepth ?? 0,
+          // Cost budget tracker (spec ORCHESTRATION.md §3.5).
+          // Returns the cumulative spend (parent self-cost +
+          // run-scoped child cost cumulative + pessimistic
+          // reservation for in-flight async children) and the
+          // cap. Reads from the run-level `cumulativeChildCostUsd`
+          // counter rather than the store's settled-child
+          // sum, so a resumed run does NOT double-count
+          // rehydrated handles whose cost flowed via prior
+          // sessions. `task_async` reads this pre-spawn for
+          // immediate UX feedback; the dispatcher
+          // (`spawnSubagentImpl`) re-checks as the load-bearing
+          // gate.
+          getCostBudget: () => ({
+            spent:
+              priorCostUsd +
+              totalCostUsd +
+              cumulativeChildCostUsd +
+              (subagentHandleStore?.getReservedChildCostUsd() ?? 0),
+            cap: budget.maxCostUsd,
+          }),
+          // Subagent budget lookup. Returns the definition's
+          // `budget.maxCostUsd` worst-case spend for the named
+          // subagent, or null when the name doesn't resolve.
+          // `task_async` uses this to compute the pessimistic
+          // reservation for the spawn it's about to issue.
+          getSubagentBudgetEstimate: (name: string): number | null => {
+            const def = config.subagentRegistry?.byName.get(name);
+            if (def === undefined) return null;
+            const cost = def.budget.maxCostUsd;
+            return Number.isFinite(cost) && cost > 0 ? cost : 0;
+          },
           ...(config.memoryRegistry !== undefined ? { memoryRegistry: config.memoryRegistry } : {}),
           ...(config.confirmMemoryWrite !== undefined
             ? { confirmMemoryWrite: config.confirmMemoryWrite }

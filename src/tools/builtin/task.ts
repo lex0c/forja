@@ -161,6 +161,23 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
         },
       );
     }
+    if (result.kind === 'budget_exhausted') {
+      return toolError(
+        'subagent.budget_exhausted',
+        `spawning '${result.requested}' would push projected cost to $${result.projected.toFixed(6)} (cap $${result.cap.toFixed(6)})`,
+        {
+          retryable: false,
+          hint: 'Cumulative parent + child cost would cross the run cap. Finish the work without a new subagent, or wait for in-flight task_async spawns to settle and free their reservations.',
+          details: {
+            subagent: result.requested,
+            spent: result.spent,
+            estimate: result.estimate,
+            projected: result.projected,
+            cap: result.cap,
+          },
+        },
+      );
+    }
 
     // Map non-`done` exits to tool errors. The model should know
     // when a child run exhausted its budget vs cleanly finished —

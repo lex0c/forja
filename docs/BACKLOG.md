@@ -15,6 +15,130 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — review fixes for #1 (gate centralized, sync coverage, immediate cancel)
+
+Code review of the budget enforcement work flagged 1 bug + 6
+risks. Applied them all in this commit. The most important fix
+moves the gate from the `task_async` tool surface to the
+dispatcher (`spawnSubagentImpl`), which closes the bug where
+synchronous `task` skipped the budget contract entirely.
+
+| File | Change |
+|---|---|
+| `src/tools/types.ts` | New `SpawnSubagentResult` variant `{ kind: 'budget_exhausted', requested, spent, estimate, projected, cap }`. Both `task` and `task_async`/`task_await` paths map this onto a `subagent.budget_exhausted` tool error with the same `details` shape — uniform regardless of sync/async surface. |
+| `src/harness/loop.ts` | (a) New run-scoped counter `cumulativeChildCostUsd` increments inside `spawnSubagentImpl` after every `runSubagent` returns. Captures BOTH sync `task` and async `task_async` settle costs in one place — the SOURCE of truth for "what children spent in this run". (b) `spawnSubagentImpl` gains a pre-spawn cost-cap gate that returns the `budget_exhausted` envelope when projected (`parent self + cumulative + reserved + estimate`) > cap. Single point of enforcement. (c) `costCapDetailIfExceeded()` now includes `cumulativeChildCostUsd + reserved` so the parent's turn-end cap check stays consistent with the pre-spawn gate (closes review risk #2 incoherence). (d) `getCostBudget` reads from `cumulativeChildCostUsd` instead of the store's `getSettledChildCostUsd()` — avoids double-counting rehydrated child cost (closes risk #6). |
+| `src/tools/builtin/task.ts` | Maps `kind: 'budget_exhausted'` envelope to tool error. Sync surface now respects the cap (closes the BUG from review). |
+| `src/tools/builtin/task-await.ts` | Maps `budget_exhausted` envelope to tool error. Reached when an async spawn hits the cap and the model awaits the handle. |
+| `src/subagents/handle-store.ts` | (a) `envelopeFromJson` discriminator extended with `budget_exhausted` kind (rehydration safety). (b) `SpawnOptions.estimateCostUsd` is now REQUIRED — TS forces every caller to declare an estimate; programmatic callers can no longer silently bypass the cap by omission (closes risk #10). Tests pass `0` explicitly when not modeling cost. (c) `cancel()` zeros `record.estimateCostUsd` synchronously BEFORE the controller abort — releases the reservation IMMEDIATELY rather than waiting for the queued IIFE to wake (closes risk #4: the hint string promised this and it's now true). |
+| `src/subagents/load.ts` | `budget.max_cost_usd` validator changed from `>= 0` to `> 0`. Zero-cost definitions are an escape hatch (a `0` estimate always passes the projection gate) — every accepted definition now declares a real positive ceiling. Closes risk #5. |
+| `src/tools/builtin/task-async.ts` | Inline budget gate kept (early-UX feedback) but now passes `{ estimateCostUsd: estimate > 0 ? estimate : 0 }` explicitly to `store.spawn`. The dispatcher gate is the load-bearing one. |
+| `docs/spec/CONTRACTS.md §2.6.4.2` | NEW. Documents the `subagent.budget_exhausted` error's `details` shape (subagent, spent, estimate, projected, cap, all USD). Closes the spec-first divergence the reviewer flagged for risk #3 — model-readable contract is now declared. |
+| `tests/subagents/handle-store.test.ts` | Every existing `store.spawn(args)` call updated to pass the now-required `{ estimateCostUsd: 0 }` second arg. Dozens of call sites; the change is mechanical and opt-out (test fixtures that don't model budget pass 0). |
+| `tests/cli/run.test.ts`, `tests/cli/subagent-child.test.ts`, `tests/evals/executor.test.ts`, `tests/subagents/validate.test.ts`, `tests/subagents/load.test.ts` | Definition fixtures updated from `max_cost_usd: 0` to `max_cost_usd: 0.01`; loader test message expectation updated to `must be a finite positive number`. |
+| `tests/tools/task-async.test.ts` | New test "task_cancel immediately frees the cost reservation (review fix #4)" — spawns 2 handles (cap=1), cancels the queued one, asserts reserved drops without waiting for IIFE wakeup. |
+
+**Decisions:**
+
+- **D188 — Single budget gate at `spawnSubagentImpl`.** Both spawn paths (`task` sync, `task_async` async) flow through `spawnSubagentImpl` after refactor D161. Putting the gate there means the contract holds for either tool — closing the BUG where `task` sync silently bypassed all budget logic. The `task_async` tool keeps its own inline check for early UX (refuse before the handle row gets persisted), but it's no longer load-bearing — the dispatcher is.
+
+- **D189 — `cumulativeChildCostUsd` is the single source of truth for child spend.** Replaces the store's `getSettledChildCostUsd()` in budget calculations. Why: store's settled sum includes rehydrated handles from prior runs (whose cost is already accounted for in `priorCostUsd` via the session row aggregate); double-counting would refuse legitimate spawns on resumed sessions. The new counter starts at 0 per run and only counts what THIS run dispatched. Reservations stay separate (in-flight async only), since their costs haven't landed in `cumulative` yet.
+
+- **D190 — Synchronous reservation release on cancel.** The reservation was previously released only when the spawn body's IIFE woke up after slot acquisition. For a queued handle (cap=1, multiple spawns), that wait could be ms to seconds. The error hint on `subagent.budget_exhausted` ("cancel one to free its reservation") promised immediate effect; now the implementation matches. The status flip to `'settled'` still happens lazily in the IIFE (preserves the `cancelled` envelope contract), but `getReservedChildCostUsd` reads `estimateCostUsd` directly, so zeroing it on cancel decouples the consumer-visible budget contract from the IIFE timing.
+
+- **D191 — `SpawnOptions.estimateCostUsd` is required.** Optional fields tempt programmatic callers to omit and silently bypass the cap. A required `number` field (TS forces it) means every caller must declare intent — tests pass `0` explicitly when not modeling budget; production passes the real estimate. The `0` value still lets the spawn through (it's a legal "no reservation" signal for the tracker), but the explicitness moves the bypass from "implicit and easy" to "explicit and reviewable".
+
+- **D192 — Loader rejects `max_cost_usd <= 0`.** A zero-cost definition is an escape hatch — its 0 estimate always passes the projection gate (`spent + 0 > cap` only refuses when spent already crosses cap). Every accepted definition must declare a real positive ceiling so the gate has signal to work with. Existing fixtures using `0` were trivially rewritable to `0.01`.
+
+**What still ships pessimistic-not-spec-literal:** Spec §3.5 reads
+"competindo" (each child sees the full cap) which our pessimistic
+reservation deviates from. Section §3.5.1 of the spec emend
+documents the deviation; the literal reading needs cost-progress
+IPC events that don't exist yet. Forward-compatible: `cumulative`
+will replace `reserved` once children stream their actual spend
+between calls.
+
+Verification: typecheck clean, lint clean, 3072 pass / 0 fail /
+10 skip (1 new test).
+
+---
+
+## [2026-05-06] parallel — cross-subagent budget enforcement (#1)
+
+Closes the last open inventory item before the branch ships.
+Spec `ORCHESTRATION.md §3.5` mandates budget shared across the
+parent + children; before this commit, three concurrent
+`task_async` calls could each pass an "I see room" check
+(no settled child cost yet), the parent's own self-cost cap
+would only fire at the next turn boundary, and a `$5` cap
+could see `~$15` spent before the harness intervened.
+
+| File | Change |
+|---|---|
+| `src/tools/types.ts` | `ToolContext` gains `getCostBudget?: () => { spent, cap }` (cumulative spend including parent self-cost + settled child costs + pessimistic reservation for in-flight children; cap from RunBudget) and `getSubagentBudgetEstimate?: (name) => number \| null` (worst-case estimate from the named subagent's `definition.budget.maxCostUsd`). |
+| `src/subagents/handle-store.ts` | New `SpawnOptions { estimateCostUsd? }` arg on `spawn()`. `SubagentRecord` gains `estimateCostUsd: number` field, populated at spawn-time. New methods `getReservedChildCostUsd()` (sum of estimates for status='running') and `getSettledChildCostUsd()` (sum of `result.costUsd` for status='settled' kind='ran' rows). Rehydrated records carry `estimateCostUsd: 0` — they're already settled so the actual cost flows through `getSettledChildCostUsd` instead. |
+| `src/harness/loop.ts` | `buildCtx` provides `getCostBudget` and `getSubagentBudgetEstimate` closures. The cost budget sums parent's `priorCostUsd + totalCostUsd` (own self-cost) + the store's `getSettledChildCostUsd()` (actual children spend) + `getReservedChildCostUsd()` (pessimistic worst-case for in-flight). The estimate lookup goes through `config.subagentRegistry`. |
+| `src/tools/builtin/task-async.ts` | New pre-spawn budget gate before the depth + prompt-size validators settle: computes `projected = budget.spent + estimate`; refuses with `subagent.budget_exhausted` (retryable=false) when `projected > budget.cap`. `details` carry `spent`, `estimate`, `projected`, `cap` so the model can see the math. The estimate is forwarded to `store.spawn(args, { estimateCostUsd })` so the in-flight reservation tracks until the spawn settles. |
+| `docs/spec/ORCHESTRATION.md §3.5` | Spec emend. Old §3.5 (one bullet list) replaced with three sub-sections: (3.5.1) why pessimistic reservation deviates from the literal "não pre-aloca", justified by absence of cost-progress IPC; (3.5.2) failure-mode table mapping each cap-cross scenario to current vs future behavior; (3.5.3) audit shape (`error_code = 'subagent.budget_exhausted'` in `tool_calls`, no separate `failure_events` entry). |
+| `tests/tools/_helpers.ts` | `makeCtx` accepts `getCostBudget` and `getSubagentBudgetEstimate` overrides. |
+| `tests/tools/task-async.test.ts` | Two new tests: (a) "task_async refuses spawn when projected cost would exceed cap (D184)" — three task_async with $2 estimate each against $5 cap; first two land, third refused; after settling the in-flight ones, reservation drops back to 0. (b) "task_async passes when no cap is configured" — `cap: undefined` lets even seven-figure projected costs through. |
+
+**Decisions:**
+
+- **D184 — Cross-subagent budget enforcement is pessimistic by default.**
+  Spec §3.5 reads "não pre-aloca" + "competindo" — children share
+  the cap and only the actual cumulative spend matters. Implementing
+  that literal reading needs cost-progress IPC events (parent sees
+  children's mid-run spend) that don't exist yet. Without them, the
+  literal reading produces the footgun: 3 concurrent spawns each see
+  the cap as "fully available" and the parent overspends 3× before
+  the next turn-end check. Pessimistic reservation
+  (`definition.budget.maxCostUsd` reserved while in-flight) closes
+  the footgun at the cost of false-refusing some spawns whose
+  actual cost would have fit. The spec emend documents this as a
+  deliberate deviation with a future-tense plan to relax it once
+  the cost-progress IPC lands.
+
+- **D185 — `getCostBudget` returns cumulative spent, not separate
+  components.** Tools see one `spent` number that already includes
+  parent self-cost + settled child cost + reserved in-flight cost.
+  Exposing the components individually would tempt callers to
+  compute their own projection logic (with potentially different
+  invariants); funneling through a single getter makes the
+  invariant load-bearing in one place.
+
+- **D186 — Estimate is opt-in via `getSubagentBudgetEstimate`, not
+  required.** A test `ToolContext` without the getter (or a
+  programmatic caller that hasn't wired the registry) sees
+  `estimate = 0`, the budget check passes, and the spawn lands —
+  same behavior as before. Production runs always wire it through
+  the harness's `subagentRegistry`. This keeps the test surface
+  minimal: a fixture that just wants to spawn without modeling
+  budget can omit the getter and not hit unexpected refusals.
+
+- **D187 — Reservation is decoupled from in-flight count.** A run
+  with `maxConcurrentSubagents: 8` and `cap: $5` could in
+  principle queue 8 spawns each estimating $1; the 6th onwards
+  refuse. But the slot semaphore (concurrency cap) and the cost
+  reservation tracker (budget cap) are independent: a slot
+  becoming free doesn't free a reservation. The reservation
+  releases on settle, the slot releases on dispatch finish. Both
+  must hold for a new spawn to land.
+
+**Out of scope (spec-tracked):**
+
+- **Mid-run cost-progress IPC.** Spec §3.5.2 documents the
+  enhancement: parent gets per-child cost deltas, can hard-signal
+  active children when cumulative crosses cap. Requires IPC
+  schema change. Separate slice; the cap-enforcement contract
+  here is forward-compatible (the projected total naturally
+  collapses to the actual spend once cost-progress IPC starts
+  feeding into `getSettledChildCostUsd`).
+
+Verification: typecheck clean, lint clean, 3071 pass / 0 fail /
+10 skip (2 new tests).
+
+---
+
 ## [2026-05-06] parallel — review fixes for #17 (write-once, parser, per-row duration, spec emend)
 
 Independent code review of the handle persistence work flagged

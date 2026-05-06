@@ -444,7 +444,7 @@ description: Worker.
 tools: []
 budget:
   max_steps: 2
-  max_cost_usd: 0.0
+  max_cost_usd: 0.01
 ---
 You are the worker.`,
       );
@@ -1511,7 +1511,7 @@ description: Worker.
 tools: []
 budget:
   max_steps: 2
-  max_cost_usd: 0.0
+  max_cost_usd: 0.01
 ---
 You are the worker.`,
       );

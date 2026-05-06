@@ -32,6 +32,10 @@ export const makeCtx = (overrides: Partial<ToolContext> = {}): ToolContext => ({
     ? { subagentHandleStore: overrides.subagentHandleStore }
     : {}),
   ...(overrides.subagentDepth !== undefined ? { subagentDepth: overrides.subagentDepth } : {}),
+  ...(overrides.getCostBudget !== undefined ? { getCostBudget: overrides.getCostBudget } : {}),
+  ...(overrides.getSubagentBudgetEstimate !== undefined
+    ? { getSubagentBudgetEstimate: overrides.getSubagentBudgetEstimate }
+    : {}),
   ...(overrides.memoryRegistry !== undefined ? { memoryRegistry: overrides.memoryRegistry } : {}),
   ...(overrides.confirmMemoryWrite !== undefined
     ? { confirmMemoryWrite: overrides.confirmMemoryWrite }

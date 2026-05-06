@@ -43,7 +43,7 @@ describe('SubagentHandleStore', () => {
       cap: 3,
       spawnFn: async (args) => okResult(args),
     });
-    const h = store.spawn({ name: 'explore', prompt: 'find auth' });
+    const h = store.spawn({ name: 'explore', prompt: 'find auth' }, { estimateCostUsd: 0 });
     expect(typeof h.id).toBe('string');
     expect(h.name).toBe('explore');
     expect(typeof h.spawnedAt).toBe('number');
@@ -64,7 +64,7 @@ describe('SubagentHandleStore', () => {
         return okResult(args);
       },
     });
-    const h = store.spawn({ name: 'review', prompt: 'p' });
+    const h = store.spawn({ name: 'review', prompt: 'p' }, { estimateCostUsd: 0 });
     const a = await store.awaitHandle(h.id);
     const b = await store.awaitHandle(h.id);
     expect(calls).toBe(1);
@@ -85,7 +85,7 @@ describe('SubagentHandleStore', () => {
       },
     });
     const handles = Array.from({ length: 5 }, (_, i) =>
-      store.spawn({ name: `worker_${i}`, prompt: 'p' }),
+      store.spawn({ name: `worker_${i}`, prompt: 'p' }, { estimateCostUsd: 0 }),
     );
     await Promise.all(handles.map((h) => store.awaitHandle(h.id)));
     expect(maxLive).toBe(2);
@@ -121,7 +121,7 @@ describe('SubagentHandleStore', () => {
         return okResult(args);
       },
     });
-    const h = store.spawn({ name: 'slow', prompt: 'p' });
+    const h = store.spawn({ name: 'slow', prompt: 'p' }, { estimateCostUsd: 0 });
     await inFlight;
     const cancelOutcome = store.cancel(h.id);
     expect(cancelOutcome.cancelled).toBe(true);
@@ -143,8 +143,8 @@ describe('SubagentHandleStore', () => {
         return okResult(args);
       },
     });
-    const h1 = store.spawn({ name: 'first', prompt: 'p' });
-    const h2 = store.spawn({ name: 'queued', prompt: 'p' });
+    const h1 = store.spawn({ name: 'first', prompt: 'p' }, { estimateCostUsd: 0 });
+    const h2 = store.spawn({ name: 'queued', prompt: 'p' }, { estimateCostUsd: 0 });
     // h2 is queued behind h1 at cap=1. Cancelling h2 BEFORE the
     // slot frees should bypass spawnFn entirely.
     const cancelOutcome = store.cancel(h2.id);
@@ -174,7 +174,7 @@ describe('SubagentHandleStore', () => {
       cap: 3,
       spawnFn: async (args) => okResult(args),
     });
-    const h = store.spawn({ name: 'fast', prompt: 'p' });
+    const h = store.spawn({ name: 'fast', prompt: 'p' }, { estimateCostUsd: 0 });
     await store.awaitHandle(h.id);
     const out = store.cancel(h.id);
     expect(out).toEqual({ cancelled: false, reason: 'already_settled' });
@@ -197,7 +197,7 @@ describe('SubagentHandleStore', () => {
         return okResult(args);
       },
     });
-    const h = store.spawn({ name: 'slow', prompt: 'p' });
+    const h = store.spawn({ name: 'slow', prompt: 'p' }, { estimateCostUsd: 0 });
     const out = await store.awaitHandle(h.id, { timeoutMs: 30 });
     expect(out.kind).toBe('timeout');
     // The run is still in flight — a later await without timeout
@@ -215,7 +215,7 @@ describe('SubagentHandleStore', () => {
         return okResult(args);
       },
     });
-    const h = store.spawn({ name: 'slow', prompt: 'p' });
+    const h = store.spawn({ name: 'slow', prompt: 'p' }, { estimateCostUsd: 0 });
     setTimeout(() => ctrl.abort(), 20);
     const out = await store.awaitHandle(h.id, { signal: ctrl.signal });
     expect(out.kind).toBe('aborted');
@@ -253,7 +253,7 @@ describe('SubagentHandleStore', () => {
       },
     });
     const handles = Array.from({ length: 3 }, (_, i) =>
-      store.spawn({ name: `w${i}`, prompt: 'p' }),
+      store.spawn({ name: `w${i}`, prompt: 'p' }, { estimateCostUsd: 0 }),
     );
     await allInFlight;
     await store.drain();
@@ -276,7 +276,7 @@ describe('SubagentHandleStore', () => {
         throw new Error('boom');
       },
     });
-    const h = store.spawn({ name: 'broken', prompt: 'p' });
+    const h = store.spawn({ name: 'broken', prompt: 'p' }, { estimateCostUsd: 0 });
     const out = await store.awaitHandle(h.id);
     expect(out.kind).toBe('done');
     if (out.kind === 'done' && out.result.kind === 'ran') {
@@ -294,8 +294,8 @@ describe('SubagentHandleStore', () => {
         return okResult(args);
       },
     });
-    const h1 = store.spawn({ name: 'a', prompt: 'p' });
-    const h2 = store.spawn({ name: 'b', prompt: 'p' });
+    const h1 = store.spawn({ name: 'a', prompt: 'p' }, { estimateCostUsd: 0 });
+    const h2 = store.spawn({ name: 'b', prompt: 'p' }, { estimateCostUsd: 0 });
     expect(store.inFlightCount()).toBe(2);
     await Promise.all([store.awaitHandle(h1.id), store.awaitHandle(h2.id)]);
     expect(store.inFlightCount()).toBe(0);
@@ -325,7 +325,7 @@ describe('SubagentHandleStore — persistence (resume rehydration)', () => {
       spawnFn: async (args) => okResult(args, `output-${args.name}`),
       persistTo: { db, parentSessionId: parentId },
     });
-    const h = store.spawn({ name: 'explore', prompt: 'p' });
+    const h = store.spawn({ name: 'explore', prompt: 'p' }, { estimateCostUsd: 0 });
     // INSERT happened synchronously inside spawn().
     const beforeSettle = getSubagentHandle(db, h.id);
     expect(beforeSettle).not.toBeNull();
@@ -356,8 +356,8 @@ describe('SubagentHandleStore — persistence (resume rehydration)', () => {
       },
       persistTo: { db, parentSessionId: parentId },
     });
-    const h1 = store.spawn({ name: 'first', prompt: 'p' });
-    const h2 = store.spawn({ name: 'queued', prompt: 'p' });
+    const h1 = store.spawn({ name: 'first', prompt: 'p' }, { estimateCostUsd: 0 });
+    const h2 = store.spawn({ name: 'queued', prompt: 'p' }, { estimateCostUsd: 0 });
     store.cancel(h2.id);
     await store.awaitHandle(h1.id);
     await store.awaitHandle(h2.id);
@@ -412,9 +412,9 @@ describe('SubagentHandleStore — persistence (resume rehydration)', () => {
       },
       persistTo: { db, parentSessionId: parentId },
     });
-    const h1 = store1.spawn({ name: 'h1', prompt: 'p' });
-    const h2 = store1.spawn({ name: 'h2', prompt: 'p' });
-    const h3 = store1.spawn({ name: 'h3', prompt: 'p' });
+    const h1 = store1.spawn({ name: 'h1', prompt: 'p' }, { estimateCostUsd: 0 });
+    const h2 = store1.spawn({ name: 'h2', prompt: 'p' }, { estimateCostUsd: 0 });
+    const h3 = store1.spawn({ name: 'h3', prompt: 'p' }, { estimateCostUsd: 0 });
     await store1.awaitHandle(h1.id);
     await store1.awaitHandle(h2.id);
     // Don't await h3 — it's stuck in the spawnFn. Construct

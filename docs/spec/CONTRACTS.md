@@ -187,6 +187,20 @@ Qualquer caller que mapeia `SubagentOutput` para tool error deve reconhecer este
 
 Os reasons originados no handle store (`cancelled_before_dispatch`, `resumed_session`, `spawn_failed`, `corrupt_envelope`) são **session-scoped** — só aparecem em runs com `task_async` family ativa. Os demais valem para `task_sync` também.
 
+#### 2.6.4.2 `subagent.budget_exhausted` — error details
+
+Tool error emitido por `task_sync`/`task_async`/`task_await` quando o cap compartilhado seria cruzado (spec `ORCHESTRATION.md §3.5`). `details` carrega:
+
+| Campo | Tipo | Semântica |
+|---|---|---|
+| `subagent` | string | Nome do subagent que seria spawnado |
+| `spent` | number | Cost cumulativo já incorrido: parent self + children settled + reservas in-flight (USD) |
+| `estimate` | number | Worst-case do spawn em pauta, lido de `definition.budget.maxCostUsd` (USD) |
+| `projected` | number | `spent + estimate` (USD); valor que cruzou `cap` |
+| `cap` | number | `RunBudget.maxCostUsd` (USD) |
+
+Modelos podem ler esses campos para decidir entre (a) aguardar in-flight settlar (libera reservas) ou (b) finalizar sem novo subagent. `retryable: false` — chamar de novo com mesmos args é garantido falhar (a menos que outro evento libere espaço).
+
 ### 2.6.5 Memory
 
 | Tool | Input | Output | Side effects | Idempotente | Custo típico |

@@ -141,15 +141,18 @@ const parseBudget = (raw: unknown, sourcePath: string): SubagentBudget => {
   if (typeof maxSteps !== 'number' || !Number.isInteger(maxSteps) || maxSteps <= 0) {
     throw new Error(`subagent ${sourcePath}: 'budget.max_steps' must be a positive integer`);
   }
-  // `>= 0` alone admits Infinity (YAML `.inf`), which silently
-  // disables the spend cap that the field is required to enforce.
-  // NaN is already rejected by the `>= 0` clause (NaN comparisons
-  // are always false), but `Number.isFinite` catches both with one
-  // honest predicate. Reject any non-finite value so every accepted
-  // definition has a real numeric ceiling.
-  if (typeof maxCost !== 'number' || !Number.isFinite(maxCost) || maxCost < 0) {
+  // Strict `> 0`. `>= 0` alone admits Infinity (YAML `.inf`),
+  // which silently disables the spend cap. `0` is also
+  // rejected: a zero-cost subagent is an escape hatch that
+  // bypasses the cross-subagent budget gate (spec
+  // ORCHESTRATION.md §3.5), since a 0-estimate spawn always
+  // passes the `projected = spent + 0 > cap` check unless
+  // `spent` already crossed cap. Every accepted definition
+  // must declare a real positive ceiling. NaN is rejected by
+  // `Number.isFinite`.
+  if (typeof maxCost !== 'number' || !Number.isFinite(maxCost) || maxCost <= 0) {
     throw new Error(
-      `subagent ${sourcePath}: 'budget.max_cost_usd' must be a finite non-negative number`,
+      `subagent ${sourcePath}: 'budget.max_cost_usd' must be a finite positive number`,
     );
   }
   if (

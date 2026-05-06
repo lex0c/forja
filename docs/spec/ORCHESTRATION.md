@@ -306,13 +306,34 @@ const [out1, out2, out3] = await Promise.all([h1, h2, h3].map(task_await));
 
 Pai vê **só os outputs finais**. History intermediária dos subagents nunca chega ao pai (§11.1 do AGENTIC_CLI.md — contexto isolado).
 
-### 3.5 Budget shared, não pre-aloca
+### 3.5 Budget shared
 
-- Pai tem $5 budget restante
-- Spawna 3 subagents com `task_async`
-- Cada um pode usar até $5 (todo disponível) **competindo**
-- Hit do limite global: subagent ativo recebe sinal de finalizar; novos spawns rejeitam com `budget_exhausted`
-- Audit em `failure_events`
+Cap de cost (`maxCostUsd` do `RunBudget`) é **compartilhado** entre o pai e seus filhos `task_async`. O contrato:
+
+- Pai tem `$cap` total
+- `priorCostUsd + totalCostUsd` rastreia spend do pai (próprias provider calls + compaction calls)
+- Cada filho settled contribui com seu `costUsd` real ao tracker compartilhado
+- Cada filho **in-flight** contribui com sua **reserva pessimista**: `definition.budget.maxCostUsd` (worst-case do playbook)
+- `task_async` pré-checa: se `parentSpend + settledChildCost + reservedChildCost + novaReserva > cap`, refusa com `subagent.budget_exhausted` (`SubagentOutput.reason` em `CONTRACTS.md §2.6.4.1`)
+- Reserva libera quando o filho settla; spend real do filho então conta direto
+
+#### 3.5.1 Pessimismo justificado
+
+A reserva pessimista é desvio deliberado da leitura "não pre-aloca" — sem ela, três `task_async` concorrentes cada um vê `settled = 0` no momento do spawn (filhos ainda não terminaram), passa o gate, e o run gasta `3 × cap` antes do próximo turn-end check do pai disparar.
+
+A spec original assume **cost-progress IPC events** entre filho e pai (delta de cost a cada provider call do child) que permitiriam o pai ver gasto real in-flight e abortar quando ultrapassar. Esses events ainda não estão implementados — quando estiverem, a reserva pessimista pode ser substituída pela leitura literal "competindo" (cada um vê todo cap, parent kills active children when limit hit).
+
+#### 3.5.2 Falhas no cap
+
+| Hit | Comportamento atual | Comportamento futuro (com cost-progress IPC) |
+|---|---|---|
+| Pré-spawn projetado > cap | `task_async` retorna `subagent.budget_exhausted` | mesma |
+| Filho ativo cruza cap mid-run | não detecta hoje (spec emend pendente) | parent envia hard signal ao filho ativo via per-handle controller |
+| Pai self-cost cruza cap | `runAgent` finaliza com `maxCostUsd` no próximo turn boundary (já implementado em `loop.ts`) | mesma |
+
+#### 3.5.3 Audit
+
+Recusa de spawn com `budget_exhausted` é registrada como tool error normal em `tool_calls`. Não há entry separada em `failure_events` para esse caso (caller pode rastrear via `error_code = 'subagent.budget_exhausted'` em queries de audit).
 
 ### 3.6 Cancel cascading
 

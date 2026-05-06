@@ -154,6 +154,23 @@ export const taskAwaitTool: Tool<TaskAwaitInput, TaskAwaitOutput> = {
         },
       );
     }
+    if (result.kind === 'budget_exhausted') {
+      return toolError(
+        'subagent.budget_exhausted',
+        `spawning '${result.requested}' would push projected cost to $${result.projected.toFixed(6)} (cap $${result.cap.toFixed(6)})`,
+        {
+          retryable: false,
+          hint: 'Cumulative parent + child cost would cross the run cap. Finish the work without a new subagent, or wait for in-flight task_async spawns to settle and free their reservations.',
+          details: {
+            subagent: result.requested,
+            spent: result.spent,
+            estimate: result.estimate,
+            projected: result.projected,
+            cap: result.cap,
+          },
+        },
+      );
+    }
     // result.kind === 'ran' — non-`done` exits map to tool
     // errors so the model sees the failure clearly. Same shape
     // as `task` does.

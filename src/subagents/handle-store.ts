@@ -76,8 +76,22 @@ export type CancelOutcome =
   | { cancelled: true }
   | { cancelled: false; reason: 'unknown' | 'already_settled' };
 
+export interface SpawnOptions {
+  // Pessimistic worst-case cost estimate for this spawn, in
+  // USD. Used by the cost reservation tracker (spec
+  // ORCHESTRATION.md §3.5). Source: definition.budget.maxCostUsd
+  // looked up at the call site. REQUIRED so a programmatic
+  // caller can't bypass the cap by omitting the estimate; pass
+  // 0 only when the definition itself declares zero cost
+  // (which the loader rejects in production — see
+  // `subagents/load.ts`). Tests that don't model budget can
+  // pass 0 to opt out without compromising the production
+  // invariant.
+  estimateCostUsd: number;
+}
+
 export interface SubagentHandleStore {
-  spawn(args: SpawnSubagentArgs): SubagentHandle;
+  spawn(args: SpawnSubagentArgs, options: SpawnOptions): SubagentHandle;
   awaitHandle(
     id: string,
     options?: { timeoutMs?: number; signal?: AbortSignal },
@@ -103,6 +117,16 @@ export interface SubagentHandleStore {
   // Cancel all running records and await every record's
   // promise. Idempotent. Used by the harness's outer finally.
   drain(): Promise<void>;
+  // Sum of `estimateCostUsd` for handles currently in
+  // status='running'. The pessimistic reservation against the
+  // run's cost cap. Drops to 0 once every handle is settled.
+  // Used by `task_async`'s pre-spawn budget check.
+  getReservedChildCostUsd(): number;
+  // Sum of `costUsd` from settled children's envelopes
+  // (`SpawnSubagentResult.kind === 'ran'` branch only). Climbs
+  // monotonically across the run as children settle. Used by
+  // the same pre-spawn check.
+  getSettledChildCostUsd(): number;
 }
 
 export interface CreateSubagentHandleStoreOptions {
@@ -150,6 +174,12 @@ interface SubagentRecord {
   // pair without a race.
   status: 'running' | 'settled';
   settledResult: SpawnSubagentResult | null;
+  // Pessimistic worst-case cost estimate captured at spawn
+  // time. Used by `getReservedChildCostUsd` while status is
+  // 'running'; once settled, the actual cost from
+  // `settledResult` flows into `getSettledChildCostUsd`
+  // instead.
+  estimateCostUsd: number;
 }
 
 // Envelope payload mirroring `SpawnSubagentResult` shape, used
@@ -200,6 +230,23 @@ const envelopeFromJson = (raw: Record<string, unknown>): SpawnSubagentResult => 
       requested: raw.requested,
       depth: raw.depth,
       maxDepth: raw.maxDepth,
+    };
+  }
+  if (
+    raw.kind === 'budget_exhausted' &&
+    typeof raw.requested === 'string' &&
+    typeof raw.spent === 'number' &&
+    typeof raw.estimate === 'number' &&
+    typeof raw.projected === 'number' &&
+    typeof raw.cap === 'number'
+  ) {
+    return {
+      kind: 'budget_exhausted',
+      requested: raw.requested,
+      spent: raw.spent,
+      estimate: raw.estimate,
+      projected: raw.projected,
+      cap: raw.cap,
     };
   }
   // Everything else falls into `kind: 'ran'`. Unknown kinds
@@ -327,6 +374,10 @@ export const createSubagentHandleStore = (
         controller,
         status: 'settled',
         settledResult: cached,
+        // Rehydrated records carry no live reservation (they're
+        // already settled). The actual cost flows into
+        // `getSettledChildCostUsd` via `cached.costUsd`.
+        estimateCostUsd: 0,
       };
       records.set(row.handleId, record);
     }
@@ -382,11 +433,15 @@ export const createSubagentHandleStore = (
     },
   });
 
-  const spawn = (args: SpawnSubagentArgs): SubagentHandle => {
+  const spawn = (args: SpawnSubagentArgs, options: SpawnOptions): SubagentHandle => {
     const id = newId();
     const spawnedAt = now();
     const handle: SubagentHandle = { id, name: args.name, spawnedAt };
     const controller = new AbortController();
+    const estimateCostUsd =
+      Number.isFinite(options.estimateCostUsd) && options.estimateCostUsd > 0
+        ? options.estimateCostUsd
+        : 0;
 
     // Persist the handle row BEFORE the IIFE schedules — a
     // crash between issuance and dispatch leaves a recoverable
@@ -428,6 +483,7 @@ export const createSubagentHandleStore = (
       controller,
       status: 'running',
       settledResult: null,
+      estimateCostUsd,
     };
 
     const promise = (async (): Promise<SpawnSubagentResult> => {
@@ -518,6 +574,20 @@ export const createSubagentHandleStore = (
     if (record.status === 'settled') {
       return { cancelled: false, reason: 'already_settled' };
     }
+    // Free the cost reservation IMMEDIATELY. Without this, a
+    // queued spawn (waiting on `acquireSlot`) would hold its
+    // pessimistic reservation until the IIFE wakes after a
+    // sibling settled the slot — ms to seconds of false
+    // contention against the cap. The hint string in
+    // `task_async`'s error envelope ("cancel one to free its
+    // reservation") promises this is immediate; making it
+    // immediate at the source is what backs that promise.
+    // The record's status stays `'running'` until the IIFE
+    // reaches the synchronous status flip — `inFlightCount`
+    // observes the in-progress state, but the budget tracker
+    // sees zero reservation, which is the consumer-visible
+    // contract that matters.
+    record.estimateCostUsd = 0;
     record.controller.abort();
     return { cancelled: true };
   };
@@ -545,5 +615,37 @@ export const createSubagentHandleStore = (
     await Promise.allSettled(Array.from(records.values()).map((r) => r.promise));
   };
 
-  return { spawn, awaitHandle, cancel, list, inFlightCount, drain };
+  const getReservedChildCostUsd = (): number => {
+    let total = 0;
+    for (const r of records.values()) {
+      if (r.status === 'running') total += r.estimateCostUsd;
+    }
+    return total;
+  };
+
+  const getSettledChildCostUsd = (): number => {
+    let total = 0;
+    for (const r of records.values()) {
+      if (
+        r.status === 'settled' &&
+        r.settledResult !== null &&
+        r.settledResult.kind === 'ran' &&
+        Number.isFinite(r.settledResult.costUsd)
+      ) {
+        total += r.settledResult.costUsd;
+      }
+    }
+    return total;
+  };
+
+  return {
+    spawn,
+    awaitHandle,
+    cancel,
+    list,
+    inFlightCount,
+    drain,
+    getReservedChildCostUsd,
+    getSettledChildCostUsd,
+  };
 };

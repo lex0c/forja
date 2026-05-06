@@ -215,6 +215,99 @@ describe('task_async / task_await / task_cancel tools', () => {
     expect(r.error_message).toContain('FOREIGN KEY constraint failed');
   });
 
+  test('task_async refuses spawn when projected cost would exceed cap (D184 budget shared)', async () => {
+    // Three concurrent task_async calls each estimating $2; cap
+    // = $5. The third spawn must refuse: spent ($0 parent +
+    // $0 settled + $4 reserved for two in-flight) + $2 estimate
+    // = $6 > $5.
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args, signal) => {
+        await sleep(50, signal);
+        return okResult(args);
+      },
+    });
+    const ctx = makeCtx({
+      subagentHandleStore: store,
+      getCostBudget: () => ({
+        spent:
+          0 + // priorCostUsd
+          0 + // totalCostUsd
+          store.getSettledChildCostUsd() +
+          store.getReservedChildCostUsd(),
+        cap: 5,
+      }),
+      getSubagentBudgetEstimate: () => 2,
+    });
+    const r1 = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'p' }, ctx);
+    const r2 = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'q' }, ctx);
+    const r3 = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'r' }, ctx);
+    expect(isToolError(r1)).toBe(false);
+    expect(isToolError(r2)).toBe(false);
+    expect(isToolError(r3)).toBe(true);
+    if (!isToolError(r3)) return;
+    expect(r3.error_code).toBe('subagent.budget_exhausted');
+    expect(r3.details?.cap).toBe(5);
+    // After the in-flight settle, the reservation drops and
+    // the budget is freed up. Without that drop, repeated
+    // resolution attempts would never recover.
+    if (!isToolError(r1) && !isToolError(r2)) {
+      await taskAwaitTool.execute({ handle_id: r1.handle_id }, ctx);
+      await taskAwaitTool.execute({ handle_id: r2.handle_id }, ctx);
+    }
+    expect(store.getReservedChildCostUsd()).toBe(0);
+  });
+
+  test('task_async passes when no cap is configured', async () => {
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+    });
+    const ctx = makeCtx({
+      subagentHandleStore: store,
+      getCostBudget: () => ({ spent: 1_000_000, cap: undefined }),
+      getSubagentBudgetEstimate: () => 1_000_000,
+    });
+    const r = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'p' }, ctx);
+    expect(isToolError(r)).toBe(false);
+  });
+
+  test('task_cancel immediately frees the cost reservation (review fix #4)', async () => {
+    // Spawn with a $2 estimate, then cancel. The reservation
+    // must drop to 0 BEFORE the spawn body's IIFE wakes (which
+    // may be queued). Backs the hint string on
+    // subagent.budget_exhausted that promises cancel frees the
+    // reservation.
+    const store = createSubagentHandleStore({
+      cap: 1,
+      spawnFn: async (args, signal) => {
+        await sleep(200, signal);
+        return okResult(args);
+      },
+    });
+    const ctx = makeCtx({ subagentHandleStore: store });
+    const r1 = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'a' }, ctx);
+    if (isToolError(r1)) throw new Error('first spawn should succeed');
+    // Spawn a second handle that's queued behind the first
+    // (cap=1). Use the explicit estimate path on the store
+    // since we can't rely on the tool's estimate getter here.
+    const h2 = store.spawn({ name: 'queued', prompt: 'b' }, { estimateCostUsd: 2 });
+    expect(store.getReservedChildCostUsd()).toBeGreaterThanOrEqual(2);
+    const cancelOutcome = store.cancel(h2.id);
+    expect(cancelOutcome.cancelled).toBe(true);
+    // Reservation drops IMMEDIATELY for the cancelled handle.
+    // The spawn body for h2 is still queued (h1 is still
+    // running), but the reservation is released regardless of
+    // whether the IIFE has woken up.
+    const reservedAfterCancel = store.getReservedChildCostUsd();
+    // h1 may or may not have completed by now (depends on
+    // whether its spawnFn settled). Lower bound: cancelling h2
+    // dropped at least h2's full $2 reservation.
+    expect(reservedAfterCancel).toBeLessThan(2);
+    await store.awaitHandle(r1.handle_id);
+    await store.awaitHandle(h2.id);
+  });
+
   test('task_async pre-checks subagent depth and refuses without spawning', async () => {
     // Importing MAX_SUBAGENT_DEPTH from runtime keeps the test
     // pinned to the runtime cap; if a future slice loosens or
