@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ParsedArgs } from '../../src/cli/args.ts';
 import type { BootstrapResult } from '../../src/cli/bootstrap.ts';
-import { runRepl } from '../../src/cli/repl.ts';
+import { SUBAGENT_DISPLAY_MAX, runRepl, sanitizeForSubagentDisplay } from '../../src/cli/repl.ts';
 import type { HarnessConfig, HarnessEvent, HarnessResult } from '../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
@@ -206,6 +206,65 @@ const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 // (default 33ms at 30fps). Use this when assertions depend on a
 // live-region redraw being observable in `rendererWrite` captures.
 const flushFrame = (): Promise<void> => new Promise((r) => setTimeout(r, 50));
+
+describe('sanitizeForSubagentDisplay (anti-spoof for proxied modal text)', () => {
+  // Spec docs/spec/IPC.md §7. The child's permission:ask wire
+  // payload reaches the operator's modal as title / option label /
+  // preview rows. The IPC parser only validates non-empty string
+  // for toolName/cwd/prompt — bytes inside are arbitrary. Without
+  // this transform, a hostile child could pack ANSI escapes,
+  // newlines, or kilobytes into any displayed field and either
+  // mimic friendly UI elements or push real content offscreen.
+
+  test('strips ANSI escape sequences', () => {
+    const dirty = '\x1b[31mrm -rf /\x1b[0m';
+    expect(sanitizeForSubagentDisplay(dirty)).toBe('rm -rf /');
+  });
+
+  test('replaces newline / CR / tab with single space (collapse runs)', () => {
+    // stripAnsi does not cover \x0a (LF) — operator must not see
+    // multi-row payloads pretending to be modal separators.
+    expect(sanitizeForSubagentDisplay('a\nb')).toBe('a b');
+    expect(sanitizeForSubagentDisplay('a\r\nb')).toBe('a b');
+    expect(sanitizeForSubagentDisplay('a\tb')).toBe('a b');
+    expect(sanitizeForSubagentDisplay('a\n\n\nb')).toBe('a b');
+    // Literal spaces interleaved with controls aren't merged: the
+    // regex only matches RUNS of \r\n\t, so the space breaks the
+    // run. Resulting double-space is cosmetic, not a spoof vector.
+    expect(sanitizeForSubagentDisplay('a\t \nb')).toBe('a   b');
+  });
+
+  test('caps length and appends ellipsis past SUBAGENT_DISPLAY_MAX', () => {
+    const long = 'x'.repeat(SUBAGENT_DISPLAY_MAX + 50);
+    const out = sanitizeForSubagentDisplay(long);
+    expect(out.length).toBe(SUBAGENT_DISPLAY_MAX);
+    expect(out.endsWith('…')).toBe(true);
+    expect(out.startsWith('x'.repeat(SUBAGENT_DISPLAY_MAX - 1))).toBe(true);
+  });
+
+  test('passes legitimate strings through unchanged', () => {
+    expect(sanitizeForSubagentDisplay('bash')).toBe('bash');
+    expect(sanitizeForSubagentDisplay('mcp:server:tool')).toBe('mcp:server:tool');
+    expect(sanitizeForSubagentDisplay('/tmp/safe.txt')).toBe('/tmp/safe.txt');
+    expect(sanitizeForSubagentDisplay('Run bash: rm -rf /tmp/foo')).toBe(
+      'Run bash: rm -rf /tmp/foo',
+    );
+  });
+
+  test('combines ANSI strip + newline collapse + length cap', () => {
+    // Worst-case payload: ANSI prefix, embedded newline, very long.
+    const dirty = `\x1b[31m${'a'.repeat(50)}\n${'b'.repeat(SUBAGENT_DISPLAY_MAX)}\x1b[0m`;
+    const out = sanitizeForSubagentDisplay(dirty);
+    expect(out.length).toBe(SUBAGENT_DISPLAY_MAX);
+    expect(out.includes('\x1b')).toBe(false);
+    expect(out.includes('\n')).toBe(false);
+    expect(out.endsWith('…')).toBe(true);
+  });
+
+  test('empty string is safe (no transform, no overflow)', () => {
+    expect(sanitizeForSubagentDisplay('')).toBe('');
+  });
+});
 
 describe('repl — boot + smoke', () => {
   // process.on('SIGINT', ...) leaks across tests if we don't clean
