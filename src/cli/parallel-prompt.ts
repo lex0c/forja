@@ -28,6 +28,7 @@ When the work is independent, emit MULTIPLE tool calls in a SINGLE turn — the 
 
 - Read-only tools (\`read_file\`, \`grep\`, \`glob\`, \`memory_read\`, \`memory_list\`, \`memory_search\`) are parallel-safe. Batch them in one turn instead of looping turn-by-turn.
 - For independent subtasks that need a full subagent run, use \`task_async\` to spawn several subagents in parallel, then \`task_await\` each to collect their outputs. Use \`task_cancel\` to abort one mid-run if its results are no longer needed.
+- Use \`task_list\` to recover handle ids you may have lost track of (long context, post-compaction, after a resume) or to confirm what is still in flight before fanning out more work.
 
 Sequential dispatch is the right call when each step depends on the previous one's result; parallel dispatch is the right call when steps are independent. Default to parallel for read-heavy exploration ("explore these N files", "search for X across the tree") and for fan-out subagent work ("review these three modules in parallel").`;
 

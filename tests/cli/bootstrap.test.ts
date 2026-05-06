@@ -94,6 +94,7 @@ describe('bootstrap', () => {
         'task_async',
         'task_await',
         'task_cancel',
+        'task_list',
         'task_sync',
         'todo_write',
         'wait_for',

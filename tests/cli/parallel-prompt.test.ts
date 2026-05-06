@@ -13,6 +13,7 @@ describe('parallel-prompt', () => {
     expect(PARALLEL_HINT_PROMPT).toContain('task_async');
     expect(PARALLEL_HINT_PROMPT).toContain('task_await');
     expect(PARALLEL_HINT_PROMPT).toContain('task_cancel');
+    expect(PARALLEL_HINT_PROMPT).toContain('task_list');
   });
 
   test('PARALLEL_HINT_PROMPT acknowledges sequential dispatch is right when steps depend', () => {

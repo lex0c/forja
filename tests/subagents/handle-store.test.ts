@@ -286,6 +286,141 @@ describe('SubagentHandleStore', () => {
     }
   });
 
+  test('listDetailed surfaces status and settled summary for each handle (D229)', async () => {
+    // task_list tool consumer. Running handles surface as
+    // status='running' with no `settled` block; settled handles
+    // (kind: 'ran') get the summary fields. The view is a
+    // snapshot — repeated calls return fresh state as records
+    // transition.
+    let releaseLong: () => void = () => {};
+    const longHold = new Promise<void>((r) => {
+      releaseLong = r;
+    });
+    let count = 0;
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args, signal) => {
+        count += 1;
+        if (count === 1) {
+          // First spawn settles fast.
+          return {
+            kind: 'ran',
+            output: 'fast',
+            sessionId: 'child-fast',
+            status: 'done',
+            reason: 'done',
+            costUsd: 0.5,
+            steps: 2,
+            durationMs: 50,
+          };
+        }
+        // Second spawn waits on longHold so we can observe a
+        // settled+running mix.
+        try {
+          await Promise.race([longHold, sleep(2000, signal)]);
+        } catch {
+          // Aborted.
+        }
+        return okResult(args);
+      },
+    });
+    const h1 = store.spawn({ name: 'fast-explore', prompt: 'p' }, { estimateCostUsd: 0 });
+    const h2 = store.spawn({ name: 'slow-review', prompt: 'p' }, { estimateCostUsd: 0 });
+    await store.awaitHandle(h1.id);
+    const snapshotMixed = store.listDetailed();
+    expect(snapshotMixed).toHaveLength(2);
+    const fast = snapshotMixed.find((s) => s.id === h1.id);
+    const slow = snapshotMixed.find((s) => s.id === h2.id);
+    if (fast === undefined || slow === undefined) {
+      throw new Error('snapshot missing handles');
+    }
+    expect(fast.status).toBe('settled');
+    expect(fast.name).toBe('fast-explore');
+    expect(fast.settled).toEqual({
+      childStatus: 'done',
+      reason: 'done',
+      costUsd: 0.5,
+      steps: 2,
+      durationMs: 50,
+      childSessionId: 'child-fast',
+    });
+    expect(slow.status).toBe('running');
+    expect(slow.settled).toBeUndefined();
+    // Release and verify the post-settle state for the second
+    // handle.
+    releaseLong();
+    await store.awaitHandle(h2.id);
+    const snapshotFinal = store.listDetailed();
+    const slowFinal = snapshotFinal.find((s) => s.id === h2.id);
+    expect(slowFinal?.status).toBe('settled');
+    expect(slowFinal?.settled?.childSessionId).toBe('child-slow-review');
+  });
+
+  test('listDetailed omits settled summary for non-ran envelopes (refusal kinds)', async () => {
+    // unknown_subagent / depth_exceeded / budget_exhausted
+    // settled rows DO show status='settled' but carry no
+    // summary block — the consumer (task_list tool) lets the
+    // model fetch the full envelope via task_await for those
+    // refusal cases, where the kind discriminator drives the
+    // tool-error mapping.
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async () => ({
+        kind: 'budget_exhausted',
+        requested: 'explore',
+        spent: 4.5,
+        estimate: 1.0,
+        projected: 5.5,
+        cap: 5.0,
+      }),
+    });
+    const h = store.spawn({ name: 'explore', prompt: 'p' }, { estimateCostUsd: 0 });
+    await store.awaitHandle(h.id);
+    const snapshot = store.listDetailed();
+    expect(snapshot).toHaveLength(1);
+    expect(snapshot[0]?.status).toBe('settled');
+    expect(snapshot[0]?.settled).toBeUndefined();
+  });
+
+  test('listDetailed surfaces cancelSource on cancelled-then-settled rows', async () => {
+    // Cross-fix interaction (D217 + D229): a handle cancelled
+    // by the model lands in listDetailed with cancelSource set
+    // — the operator/model can spot "this one was cancelled by
+    // me, not by the cap watchdog" without reading the full
+    // envelope.
+    let entered: () => void = () => {};
+    const e = new Promise<void>((r) => {
+      entered = r;
+    });
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (_args, signal) => {
+        entered();
+        try {
+          await sleep(500, signal);
+        } catch {
+          // fall through
+        }
+        return {
+          kind: 'ran',
+          output: '',
+          sessionId: 'child-id',
+          status: 'interrupted',
+          reason: 'cancelled',
+          costUsd: 0,
+          steps: 0,
+          durationMs: 0,
+        };
+      },
+    });
+    const h = store.spawn({ name: 'a', prompt: 'p' }, { estimateCostUsd: 0 });
+    await e;
+    store.cancel(h.id, 'model');
+    await store.awaitHandle(h.id);
+    const snapshot = store.listDetailed();
+    expect(snapshot[0]?.settled?.cancelSource).toBe('model');
+  });
+
   test('inFlightCount reflects only running records', async () => {
     const store = createSubagentHandleStore({
       cap: 3,

@@ -58,6 +58,54 @@ export interface SubagentHandle {
   spawnedAt: number;
 }
 
+// Detailed shape for `task_list` consumers (the model via the
+// `task_list` tool, plus the `/subagents` operator slash).
+// Carries the running/settled status, the spawn metadata, and
+// a summary of the settled envelope when applicable. The full
+// envelope is intentionally NOT exposed — it can be 100+ KiB of
+// child output, and a list operation should be cheap. The model
+// follows up with `task_await(id)` when it wants the body.
+export interface SubagentHandleSummary {
+  id: string;
+  name: string;
+  spawnedAt: number;
+  status: 'running' | 'settled';
+  // Settled-envelope kind discriminator (review fix Q3).
+  // Present iff status === 'settled'. Lets the model triage
+  // settled handles WITHOUT a follow-up `task_await` —
+  // `'ran'` means the child produced an outcome (a `settled`
+  // summary block follows); the other three kinds are
+  // refusals (no summary block, since refusals carry
+  // structured metadata that's not the child outcome shape).
+  // Without this discriminator, settled-without-summary was
+  // ambiguous — model couldn't tell "ran with no summary"
+  // from "refused"; with it, the surface is unambiguous.
+  kind?: 'ran' | 'unknown_subagent' | 'depth_exceeded' | 'budget_exhausted';
+  // Present iff status is 'settled' and the envelope's `kind`
+  // is `'ran'` (the only kind that carries a child outcome).
+  // Other kinds — `unknown_subagent`, `depth_exceeded`,
+  // `budget_exhausted` — surface as a tool error from
+  // `task_await`; readers of this list see them as `settled`
+  // with `kind` discriminating, but no `settled` summary
+  // block since the refusal payload doesn't fit the
+  // child-outcome shape.
+  settled?: {
+    childStatus: 'done' | 'interrupted' | 'exhausted' | 'error';
+    reason: string;
+    costUsd: number;
+    steps: number;
+    durationMs: number;
+    // Child session id. Null for the cancelled-before-dispatch
+    // path (no child session was ever created) and for the
+    // resumed_session synthesized envelope. Lets audit consumers
+    // join back to the child's full session.
+    childSessionId: string | null;
+    // Cancel attribution (D217). Only present when this row was
+    // explicitly cancelled by one of the harness paths.
+    cancelSource?: 'model' | 'cap_watchdog' | 'parent_drain';
+  };
+}
+
 // Tagged outcome from `await(id, ...)`. The harness translates
 // these into tool results (or tool errors) at the task_await
 // layer; the store stays agnostic of the wire format.
@@ -134,6 +182,13 @@ export interface SubagentHandleStore {
   // both flavors are useful — the audit consumer wants every
   // row, the UI wants only live ones.
   list(): SubagentHandle[];
+  // Detailed snapshot for `task_list` (model-facing) and
+  // `/subagents` (operator-facing). Includes status and a
+  // summary of settled `kind: 'ran'` envelopes. Same set of
+  // records as `list()` — both rehydrated and current-run
+  // handles — so the model that lost handle ids across a
+  // compaction or a resume cycle can recover them.
+  listDetailed(): SubagentHandleSummary[];
   // Number of records whose status is still 'running'. Bounded
   // above by the configured cap. Always reflects only the
   // current run's in-flight spawns: rehydrated handles enter
@@ -871,6 +926,45 @@ export const createSubagentHandleStore = (
 
   const list = (): SubagentHandle[] => Array.from(records.values()).map((r) => ({ ...r.handle }));
 
+  const listDetailed = (): SubagentHandleSummary[] => {
+    const out: SubagentHandleSummary[] = [];
+    for (const r of records.values()) {
+      const base: SubagentHandleSummary = {
+        id: r.handle.id,
+        name: r.handle.name,
+        spawnedAt: r.handle.spawnedAt,
+        status: r.status,
+      };
+      // Settled rows: surface the `kind` discriminator AND
+      // (for `kind: 'ran'`) the summary block. The other three
+      // kinds (unknown_subagent, depth_exceeded,
+      // budget_exhausted) don't carry a child outcome — just
+      // refusal metadata that doesn't fit the summary shape —
+      // so they get the discriminator without a summary block.
+      // Defensive on `settledResult === null`: shouldn't happen
+      // (status flips with settledResult atomically), but if a
+      // future bug introduces the gap we surface 'ran' as the
+      // safe fallback rather than guessing.
+      if (r.status === 'settled' && r.settledResult !== null) {
+        base.kind = r.settledResult.kind;
+        if (r.settledResult.kind === 'ran') {
+          const env = r.settledResult;
+          base.settled = {
+            childStatus: env.status,
+            reason: env.reason,
+            costUsd: env.costUsd,
+            steps: env.steps,
+            durationMs: env.durationMs,
+            childSessionId: env.sessionId.length > 0 ? env.sessionId : null,
+            ...(env.cancelSource !== undefined ? { cancelSource: env.cancelSource } : {}),
+          };
+        }
+      }
+      out.push(base);
+    }
+    return out;
+  };
+
   const inFlightCount = (): number => {
     let n = 0;
     for (const r of records.values()) {
@@ -982,6 +1076,7 @@ export const createSubagentHandleStore = (
     awaitHandle,
     cancel,
     list,
+    listDetailed,
     inFlightCount,
     drain,
     cancelAll,

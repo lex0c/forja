@@ -15,6 +15,92 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — task_list tool for handle visibility
+
+User-prompted gap audit: "modelo consegue gerenciar o
+paralelismo?" The audit identified that the model could
+spawn / await / cancel handles but had no way to recover
+handle ids it lost (long context drops earlier turns,
+post-resume rehydration, programmatic uncertainty). Without
+this surface, the model has to guess based on prior text or
+re-invoke task_async — wasting a spawn slot. The operator
+slash `/subagents` covered the operator's view; this slice
+adds the model-facing equivalent.
+
+Read-only and parallel-safe by construction: the tool just
+snapshots the in-memory store and serializes to a tool-result
+envelope. Plan-mode safe (no shell-out, no FS mutation).
+
+| File | Change |
+|---|---|
+| `src/subagents/handle-store.ts` | New `SubagentHandleSummary` type carrying status + a `kind` discriminator (review fix Q3 — present iff settled, lets the model tell `'ran'` from refusal kinds without a follow-up `task_await`) + (when settled with a `kind: 'ran'` envelope) a one-line summary block: child status, reason, cost, steps, duration, child_session_id, optional cancelSource. New `listDetailed()` method on `SubagentHandleStore` returning the summary array. The full envelope stays unexposed — it can be 100+ KiB of child output, and a list operation should be cheap; the model follows up with `task_await(id)` when it wants the body. |
+| `src/tools/builtin/task-list.ts` | NEW. `taskListTool` reads the store via `listDetailed`, sorts by spawn order, optionally filters by status, and shapes the output as `{ handles: TaskListEntry[], in_flight, settled, total_in_flight, total_settled }`. The first two counters reflect the FILTERED set; the latter two (review fix Q2) reflect the WHOLE store regardless of filter — lets the model decide e.g. "I asked for running, but there are 3 settled handles I should `task_await` for cached output before fanning out more". |
+| `src/tools/builtin/index.ts` | Imports + exports the new tool; registers in BUILTIN_TOOLS adjacent to `taskCancelTool`. |
+| `src/cli/parallel-prompt.ts` | Hint preamble extended with one bullet: "Use `task_list` to recover handle ids you may have lost track of (long context, post-compaction, after a resume) or to confirm what is still in flight before fanning out more work." |
+| `tests/subagents/handle-store.test.ts` | Three new tests: (a) listDetailed surfaces running + settled with the right shape; (b) refusal kinds (unknown_subagent, depth_exceeded, budget_exhausted) get status='settled' WITHOUT a settled block; (c) cancelled-then-settled rows surface cancelSource on the summary. |
+| `tests/tools/task-list.test.ts` | NEW. Ten tests covering: empty list; running+settled mix in spawn order with counters; status filter; refusal-kind handles; cancel attribution surfaced; `subagent.unavailable` when no store; abort signal handling; (review fix Q7) rehydrated handles from a prior run surface in the snapshot — the headline use case for the tool; `child_session_id: null` for cancelled-before-dispatch envelopes; multiple refusal kinds in one snapshot all discriminated by `kind`. |
+| `tests/cli/parallel-prompt.test.ts` | New assertion: hint contains `task_list`. |
+| `tests/cli/bootstrap.test.ts` | One existing test's tool-list expectation includes `task_list`. |
+
+**Decision:**
+
+- **D229 — `task_list` exposes summaries, not full envelopes.**
+  Two reasons. (1) Cost: full envelopes can carry 100+ KiB of
+  child output; a list operation should be cheap and
+  predictable. (2) Workflow: the model uses `task_list` to
+  ORIENT (figure out what handles exist), not to consume
+  output — consumption is `task_await`'s job. Mirroring the
+  full envelope here would conflate the two operations and
+  encourage the model to skip `task_await` even when it
+  needs the output, defeating the cached-envelope path.
+  Refusal kinds (unknown_subagent / depth_exceeded /
+  budget_exhausted) intentionally surface as
+  `status: 'settled'` without a summary block — they're
+  recoverable via `task_await(handle_id)` which surfaces
+  the full refusal as a structured tool error.
+
+- **No persistence layer change.** The tool reads from the
+  in-memory store, which already rehydrates from
+  `subagent_handles` at construction time. Settled
+  handles from prior runs of the same session show up as
+  `status: 'settled'` with their cached envelope summary —
+  same view the operator's `/subagents` slash sees.
+
+- **D230 — Refusal kinds are discriminated, not hidden.**
+  Code review (Q3) flagged that surfacing refusal handles
+  as `status: 'settled'` without any other signal forced
+  the model into a wasted `task_await` round-trip just to
+  classify the row. The `kind` field on the entry is
+  always populated for settled handles, so the model
+  triages locally: `'ran'` means an outcome (read the
+  `settled` block); the three refusal kinds say "this
+  handle was refused at the gate, follow up with
+  `task_await` only if you want the structured detail".
+
+- **D231 — Two counter dimensions: filtered + total.**
+  Review (Q2) noted the original "counters reflect the
+  filtered set" lost information when the model passed
+  `status: 'running'`. The output now carries both the
+  filtered counters AND `total_in_flight` /
+  `total_settled` over the whole store. The four-counter
+  shape is pure additive — pre-existing consumers that
+  only read `in_flight` / `settled` see the same numbers
+  they did before.
+
+- **Follow-up logged: pagination / soft cap.** Review (Q6)
+  noted that for long sessions with hundreds of subagents,
+  `task_list` returns the whole store. No cap today —
+  worth revisiting if real usage shows large snapshots.
+  Punted as a future slice with a `limit` arg + newest-
+  first ordering. Not in scope here since the typical
+  session has <10 handles and adding ordering semantics
+  needs a deliberate UX decision.
+
+Verification: typecheck clean, lint clean, 3150 pass / 0
+fail (13 new tests across handle-store + task-list).
+
+---
+
 ## [2026-05-06] parallel — surface parallelism affordances to the model
 
 User-prompted gap audit: "o modelo sabe que pode rodar coisas
