@@ -4358,6 +4358,77 @@ describe('runSubagent — permission proxy (parent)', () => {
     }
   });
 
+  test('hook that throws SYNCHRONOUSLY also auto-denies (no hang)', async () => {
+    // Companion to the async-throw test above. The hook
+    // signature returns Promise<...>, but a JS caller or a
+    // non-async TS function that validates input and throws
+    // before returning a promise can still slip through. The
+    // earlier path (`hook(...).then(...).catch(...)`) caught
+    // ASYNC failures only — a sync throw propagated up to
+    // onMessage where the channel emitter swallowed listener
+    // exceptions silently, leaving the child blocked on an
+    // unresolved permission:ask. The Promise.resolve().then
+    // wrap collapses sync throws into the same .catch path.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-sync-throw',
+          toolName: 'bash',
+          args: {},
+          cwd: '/p',
+          prompt: 'q',
+        }),
+      );
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: rig.spawn,
+      // Cast through unknown so TS lets a non-async throwing
+      // function sit in the typed Promise<...> slot — mimics
+      // the JS-caller path the wrap protects against.
+      onPermissionAsk: ((): Promise<'allow' | 'deny'> => {
+        throw new Error('sync hook exploded');
+      }) as unknown as (req: {
+        subagent: { sessionId: string; name: string };
+      }) => Promise<'allow' | 'deny'>,
+    });
+
+    // Pre-fix: answers.length === 0 (hang path) — child's bridge
+    // never received a verdict, runSubagent hung until publish
+    // forced exit but the ask was already lost.
+    // Post-fix: answers === [{ decision: 'deny' }] (uniform
+    // failure path).
+    expect(answers).toHaveLength(1);
+    if (answers[0]?.type === 'permission:answer') {
+      expect(answers[0].promptId).toBe('pid-sync-throw');
+      expect(answers[0].decision).toBe('deny');
+    }
+  });
+
   test('parallel asks each get their matching promptId answered', async () => {
     const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
       model: 'mock/m',
@@ -4759,11 +4830,16 @@ describe('runSubagent — permission proxy (parent)', () => {
           prompt: 'q1',
         }),
       );
-      // Second ask after first resolves. With cap=1, this
-      // would auto-deny if the slot didn't free. Use multiple
-      // microtasks to give the first hook time to resolve.
-      queueMicrotask(() => {
-        queueMicrotask(() => {
+      // Send pid-2 only AFTER pid-1's answer lands — polling
+      // is more robust than counting microtasks since the
+      // runtime's hook invocation went through a
+      // Promise.resolve().then(...) wrap (added as sync-throw
+      // safety) and any future change in the resolution chain
+      // would shift counts again. Polling the visible side
+      // effect (answer arrived) ties the test to the contract
+      // we actually care about: "slot frees AFTER first resolves".
+      const sendSecondAfterFirstAnswered = (): void => {
+        if (answers.length >= 1) {
           rig.childChannel.send(
             makePermissionAsk({
               promptId: 'pid-2',
@@ -4778,8 +4854,11 @@ describe('runSubagent — permission proxy (parent)', () => {
             const last = children[children.length - 1];
             if (last !== undefined) rig.publish(last.id);
           });
-        });
-      });
+        } else {
+          queueMicrotask(sendSecondAfterFirstAnswered);
+        }
+      };
+      queueMicrotask(sendSecondAfterFirstAnswered);
     });
 
     await runSubagent({

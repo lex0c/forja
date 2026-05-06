@@ -875,14 +875,32 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
         // each .then closure carries its own promptId. The
         // finally-style cleanup removes from the set whether
         // the hook resolved or threw — slot frees up either way.
-        hook({
-          toolName: msg.toolName,
-          args,
-          cwd: msg.cwd,
-          prompt: msg.prompt,
-          subagent: { sessionId: childSession.id, name: definition.name },
-          signal: askAbort.signal,
-        })
+        //
+        // Wrap in `Promise.resolve().then(() => hook(...))` so a
+        // hook that throws SYNCHRONOUSLY (non-async function
+        // that validates input and throws before returning a
+        // promise; or a JS caller violating the typed contract)
+        // collapses into a rejected promise the .catch below
+        // handles uniformly. Without this wrap, a sync throw
+        // propagates up to onMessage where the channel emitter
+        // swallows listener exceptions silently — no
+        // permission:answer is sent, the child's bridge stays
+        // pending, and the run blocks until channel
+        // teardown / wall-clock. The wrap also keeps
+        // `inFlightAsks` accounting honest: the .catch's delete
+        // matches the .add above instead of leaking a slot
+        // when the hook never completes.
+        Promise.resolve()
+          .then(() =>
+            hook({
+              toolName: msg.toolName,
+              args,
+              cwd: msg.cwd,
+              prompt: msg.prompt,
+              subagent: { sessionId: childSession.id, name: definition.name },
+              signal: askAbort.signal,
+            }),
+          )
           .then((decision: PermissionDecision) => {
             inFlightAsks.delete(promptId);
             // Defensive coercion. The hook signature types
