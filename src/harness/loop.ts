@@ -724,7 +724,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               Number.isFinite(def.budget.maxCostUsd) && def.budget.maxCostUsd > 0
                 ? def.budget.maxCostUsd
                 : 0;
-            const reserved = subagentHandleStore?.getReservedChildCostUsd() ?? 0;
+            // Exclude THIS handle's own reservation from the
+            // sum: when the store dispatches us, the record is
+            // already in `records` with `estimateCostUsd =
+            // estimate`. Without the exclude, the same estimate
+            // counts in both `reserved` and the `+ estimate`
+            // below — false rejections at cap boundaries (e.g.
+            // a single async spawn whose estimate exactly
+            // matches the remaining budget). Sync `task` runs
+            // with `handleId === undefined`; the exclude is a
+            // no-op there.
+            const reserved = subagentHandleStore?.getReservedChildCostUsd(handleId) ?? 0;
             const spent = priorCostUsd + totalCostUsd + cumulativeChildCostUsd + reserved;
             const projected = spent + estimate;
             if (projected > budget.maxCostUsd) {

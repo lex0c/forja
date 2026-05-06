@@ -15,6 +15,58 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — fix double-count of own reservation in async pre-spawn gate
+
+User-spotted bug. The dispatcher's pre-spawn cost gate in
+`spawnSubagentImpl` was double-counting the SAME handle's
+estimate when called via the async path:
+
+1. `task_async` calls `store.spawn(args, { estimateCostUsd })`.
+2. `store.spawn` synchronously registers the record (its
+   estimate already in `getReservedChildCostUsd()` total).
+3. Spawn IIFE eventually invokes `spawnSubagentImpl(args,
+   signal, handleId)`.
+4. Gate computes:
+   `reserved = getReservedChildCostUsd()`  ← includes own estimate
+   `spent = parent + cumulative + reserved`
+   `projected = spent + estimate`           ← adds estimate AGAIN
+
+At cap boundary (remaining budget exactly equal to estimate),
+the gate refuses valid spawns: a single async spawn whose
+estimate fits the remaining budget gets a false
+`subagent.budget_exhausted`. Effective async budget shrinks by
+the largest in-flight estimate every time.
+
+The pre-spawn gate in the `task_async` tool layer (UX-friendly
+early refuse, before `store.spawn` registers the record) does
+NOT have this bug — at that point the record doesn't exist
+yet. Sync `task` also doesn't have it — `handleId === undefined`,
+no record in store. Bug is localized to the dispatcher gate
+on the async path.
+
+| File | Change |
+|---|---|
+| `src/subagents/handle-store.ts` | `getReservedChildCostUsd` accepts optional `excludeHandleId`. When set, the matching record is skipped in the sum. The unmodified callers (watchdog in cost_update wrapper, audit listings) keep `undefined` and see the unchanged total. |
+| `src/harness/loop.ts` | Pre-spawn gate now calls `subagentHandleStore?.getReservedChildCostUsd(handleId)`. For sync `task` (handleId undefined) it's a no-op (no record matches); for `task_async` it removes the own reservation so `spent + estimate` is the correct projection without double-counting. |
+| `tests/subagents/handle-store.test.ts` | New test "getReservedChildCostUsd(excludeHandleId) drops own reservation (no double-count at cap boundary)" — two records ($2 + $3); without exclude returns $5; excluding h1 returns $3; excluding h2 returns $2; excluding unknown id returns $5 (no-op). |
+
+**Decision:**
+
+- **D211 — `excludeHandleId` is the dispatcher gate's
+  responsibility.** The store's reservation total is honest —
+  it really does include every running record. The gate is
+  the consumer that needs to exclude its own contribution
+  before adding the new estimate. Keeping the exclude at the
+  gate (rather than embedding it in the dispatcher's call to
+  spawn) makes the formula `spent + estimate` consistent
+  between sync and async paths; both call the same gate
+  template, just with different `handleId` values.
+
+Verification: typecheck clean, lint clean, 3096 pass / 0 fail
+(1 new test).
+
+---
+
 ## [2026-05-06] parallel — smoke entry for parallel_safe wire (closes BACKLOG eval #34)
 
 Final pre-PR action. The full smoke suite (8 cases) ran clean

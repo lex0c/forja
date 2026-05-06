@@ -139,7 +139,18 @@ export interface SubagentHandleStore {
   // reservation grows with the actual spend (covers the rare
   // case of a child overshooting its declared budget).
   // Drops to 0 once every handle is settled.
-  getReservedChildCostUsd(): number;
+  //
+  // Optional `excludeHandleId` filters out one specific record
+  // — used by the dispatcher's pre-spawn cost gate. When the
+  // store dispatches `spawnFn`, the record is ALREADY in the
+  // map (its estimate already in this sum). The gate then
+  // computes `spent + estimate` for the new spawn — without
+  // exclusion, the same estimate is counted twice and async
+  // spawns get false `subagent.budget_exhausted` at cap
+  // boundaries (exactly when remaining budget == estimate).
+  // Sync `task` doesn't pass through the store, so an
+  // `undefined` argument is the safe no-op.
+  getReservedChildCostUsd(excludeHandleId?: string): number;
   // Sum of `costUsd` from settled children's envelopes
   // (`SpawnSubagentResult.kind === 'ran'` branch only). Climbs
   // monotonically across the run as children settle. Used by
@@ -716,9 +727,14 @@ export const createSubagentHandleStore = (
     await Promise.allSettled(Array.from(records.values()).map((r) => r.promise));
   };
 
-  const getReservedChildCostUsd = (): number => {
+  const getReservedChildCostUsd = (excludeHandleId?: string): number => {
     let total = 0;
-    for (const r of records.values()) {
+    for (const [id, r] of records.entries()) {
+      // Caller-side exclude: the dispatcher's pre-spawn gate
+      // skips its own handle here so its estimate isn't
+      // counted both in `reserved` and in the gate's
+      // `spent + estimate`.
+      if (excludeHandleId !== undefined && id === excludeHandleId) continue;
       // Cancelled records contribute 0 — the cancel path
       // releases the reservation IMMEDIATELY (D204). Filtering
       // here (rather than zeroing estimate/live on cancel)

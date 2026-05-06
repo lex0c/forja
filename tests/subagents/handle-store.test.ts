@@ -348,6 +348,44 @@ describe('SubagentHandleStore', () => {
     expect(store.getReservedChildCostUsd()).toBe(0);
   });
 
+  test('getReservedChildCostUsd(excludeHandleId) drops own reservation (no double-count at cap boundary)', async () => {
+    // Pre-fix: dispatcher's pre-spawn gate computed
+    //   spent = priorCost + cumulative + reserved
+    //   projected = spent + estimate
+    // But `reserved` ALREADY included this handle's estimate
+    // (store.spawn registered the record before spawnFn ran),
+    // so the same estimate counted twice. At cap boundary
+    // (remaining budget exactly == estimate) this falsely
+    // refused valid spawns. The exclude param fixes it.
+    let entered: () => void = () => {};
+    const inFlight = new Promise<void>((r) => {
+      entered = r;
+    });
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args, signal) => {
+        entered();
+        await sleep(200, signal).catch(() => undefined);
+        return okResult(args);
+      },
+    });
+    const h1 = store.spawn({ name: 'a', prompt: 'p' }, { estimateCostUsd: 2 });
+    const h2 = store.spawn({ name: 'b', prompt: 'p' }, { estimateCostUsd: 3 });
+    await inFlight;
+    // Without exclude: $2 + $3 = $5.
+    expect(store.getReservedChildCostUsd()).toBe(5);
+    // Excluding h1: $3 only.
+    expect(store.getReservedChildCostUsd(h1.id)).toBe(3);
+    // Excluding h2: $2 only.
+    expect(store.getReservedChildCostUsd(h2.id)).toBe(2);
+    // Excluding unknown id: full $5 (no-op).
+    expect(store.getReservedChildCostUsd('does-not-exist')).toBe(5);
+    store.cancel(h1.id);
+    store.cancel(h2.id);
+    await store.awaitHandle(h1.id);
+    await store.awaitHandle(h2.id);
+  });
+
   test('recordLiveCost no-ops on cancelled records (review fix: stale cost_update post-cancel)', async () => {
     let entered: () => void = () => {};
     const inFlight = new Promise<void>((r) => {
