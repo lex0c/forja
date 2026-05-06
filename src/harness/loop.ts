@@ -1894,6 +1894,39 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           const safeInvokeOne = async (
             tu: CollectedToolUse,
           ): Promise<{ toolResult: ProviderToolResultBlock; failed: boolean }> => {
+            // Pre-dispatch abort guard. Mirror the serial path's
+            // top-of-iteration `if (signal.aborted) finish(...)`
+            // — the run signal MUST stop dispatch of queued
+            // tool_uses, not just signal already-running tools
+            // to self-cancel. Without this guard, `runPool`
+            // workers continue dequeuing after Ctrl+C / wall-
+            // clock landed, invoking tools whose own
+            // `ctx.signal` self-check is the only thing that
+            // would prevent side effects. Soft-stop also routes
+            // here so a cooperative cancel mid-batch behaves
+            // identically.
+            //
+            // The synthesized result is a placeholder: the
+            // post-pool abort gate (right below) discards
+            // `toolResults` entirely on `signal.aborted` /
+            // `softStopSignal.aborted`, mirroring the serial
+            // path's "no partial tool_result message on abort"
+            // contract. We still need to RETURN something so
+            // `runPool` settles every worker. `failed: false`
+            // keeps the outcome out of `consecutiveErrors` —
+            // an aborted dispatch is not a tool failure.
+            if (signal.aborted || config.softStopSignal?.aborted === true) {
+              return {
+                toolResult: {
+                  type: 'tool_result',
+                  tool_use_id: tu.id,
+                  name: tu.name,
+                  content: 'tool dispatch skipped: run aborted before invocation',
+                  is_error: true,
+                },
+                failed: false,
+              };
+            }
             try {
               return await invokeOne(tu);
             } catch (e) {
@@ -1911,6 +1944,32 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             }
           };
           const outcomes = await runPool(collected.tool_uses, parallelCap, safeInvokeOne);
+
+          // Post-pool abort gate. Mirrors the serial path's
+          // per-iteration check — once the run signal flipped
+          // mid-batch, finish() takes precedence over message
+          // append + bailCounter handling. Discarding the
+          // partial toolResults preserves the existing
+          // contract: an interrupted run does NOT leave a
+          // half-baked tool_result message in the transcript.
+          // Some workers may have produced real results before
+          // the abort landed; those are still authoritative
+          // in-memory but the conservative choice (matching
+          // serial) is to skip the append.
+          if (signal.aborted) {
+            return isWallClockTimeout()
+              ? await finish('maxWallClockMs')
+              : await finish('aborted', undefined, 'hard');
+          }
+          // Local rebind forces TS to re-narrow on a fresh
+          // read; the `: boolean` annotation breaks the
+          // optional-chain undefined narrowing. Same trick as
+          // the serial path's per-iteration soft-abort
+          // re-check.
+          const softAbortedPostPool: boolean = config.softStopSignal?.aborted ?? false;
+          if (softAbortedPostPool) {
+            return await finish('aborted', undefined, 'soft');
+          }
           let bailCounter = -1;
           for (const o of outcomes) {
             toolResults.push(o.toolResult);

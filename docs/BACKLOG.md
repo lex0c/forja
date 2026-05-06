@@ -15,6 +15,62 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — stop dispatching queued tool calls after abort
+
+User-spotted bug. The parallel worker loop (`runPool`) had
+no abort check before dequeuing the next item, so workers
+kept invoking queued `tool_uses` even after the run signal
+had aborted. The serial path checks `signal.aborted` at the
+top of each iteration and `return await finish('aborted')`
+immediately; the parallel path was silently divergent.
+
+Concrete impact: 5 `parallel_safe` tool_uses with cap=2 and
+a hard interrupt (Ctrl+C / wall-clock timeout) landing
+30ms in. Workers A and B grabbed tu1/tu2 — their tools
+self-cancel via `ctx.signal` and return cleanly. Workers
+A and B then dequeued tu3, tu4, tu5 and invoked them. Each
+of those tools ALSO got `ctx.signal.aborted` and exited
+fast — but their `execute(args, ctx)` body still ran up
+to the first signal check. A tool that performed any side
+effect BEFORE its first cooperative `signal` check (e.g.
+opening a file handle, sending a message) would have
+committed that side effect after the run was supposed to
+be cancelled.
+
+| File | Change |
+|---|---|
+| `src/harness/loop.ts` | Two-step guard. (1) `safeInvokeOne` pre-checks `signal.aborted` AND `softStopSignal.aborted` before calling `invokeOne` — returns a synthesized `is_error: true` placeholder with `failed: false` (an aborted dispatch is not a tool failure, so consecutiveErrors stays clean). (2) Post-`runPool`, before any message append or bailCounter handling, the harness mirrors the serial path's `if (signal.aborted) return await finish(...)` — abort takes precedence over the partial tool_result message, matching the existing "no half-baked tool_result on abort" contract. |
+| `tests/harness/parallel.test.ts` | NEW regression test "hard abort mid-batch stops dispatch of queued tool_uses". 5 tool_uses, cap=2, each delays 1s; abort fires at 30ms. The tool increments a counter at the TOP of execute (before any signal check). With the fix, only the 2 workers that entered before the abort count; the test asserts `totalInvoked ≤ 2`. Without the fix, all 5 dispatch and the count climbs to 5. |
+
+**Decision:**
+
+- **D223 — Parallel dispatch must mirror serial's
+  pre-iteration abort check.** Two distinct guards because
+  the parallel path has two distinct dispatch surfaces: the
+  per-worker `safeInvokeOne` (one tool_use about to fire)
+  and the post-pool message append (the entire batch
+  about to land in the transcript). Both need the check;
+  either alone is incomplete. The serial path's
+  per-iteration check covers both because it interleaves
+  dispatch and message append, while the parallel path
+  separates them — discovering this asymmetry was the
+  user-spotted catch.
+
+- **`failed: false` on the abort-skipped placeholder.** An
+  aborted dispatch is not a tool failure: the tool never
+  ran, so `consecutiveErrors` must not climb. Conflating
+  abort with failure would make `maxToolErrors` trip on
+  abort sequences, masking the true exit reason. Distinct
+  from the `is_error: true` field on the tool_result
+  payload, which signals the model that there's no
+  meaningful output (consistent with how the serial path
+  treats interrupted runs).
+
+Verification: typecheck clean, lint clean, 3128 pass / 0
+fail (1 new regression test).
+
+---
+
 ## [2026-05-06] parallel — persisted gate-decision audit table (audit fix #3)
 
 Auditability gap. Three pre-spawn refusal kinds —

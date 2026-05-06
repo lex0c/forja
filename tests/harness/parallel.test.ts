@@ -472,6 +472,76 @@ describe('parallel tool execution (ORCHESTRATION §1.3)', () => {
     expect(handle.requests).toHaveLength(1);
   });
 
+  test('hard abort mid-batch stops dispatch of queued tool_uses (D223)', async () => {
+    // Regression: `runPool` had no abort check before
+    // dequeuing the next index, so workers continued to
+    // invoke queued tool_uses after `signal.aborted` flipped.
+    // The serial path checks `signal.aborted` at the top of
+    // each iteration; the parallel path now mirrors that
+    // check inside `safeInvokeOne`. A tool that doesn't
+    // self-cancel via `ctx.signal` would otherwise still run
+    // its side effects after Ctrl+C.
+    //
+    // Test setup: 5 tool_uses, cap=2, each tool delays 1s.
+    // Fire abort at 30ms — workers A and B grabbed tu1/tu2
+    // and entered execute; their sleep rejects on the abort.
+    // Tu3-5 are queued. Without the fix, runPool would
+    // dispatch them too (even though they'd fail-fast at
+    // sleep, they'd still increment the invocation counter
+    // and run any pre-sleep side effects). With the fix,
+    // safeInvokeOne returns the abort-skipped placeholder
+    // BEFORE invokeOne fires.
+    let totalInvoked = 0;
+    const counted: Tool<{ msg?: string }, { echoed: string }> = {
+      name: 'p_count',
+      description: 'parallel-safe counter that delays',
+      inputSchema: { type: 'object', properties: { msg: { type: 'string' } } },
+      metadata: {
+        category: 'misc',
+        writes: false,
+        idempotent: true,
+        parallel_safe: true,
+      },
+      async execute(args, ctx) {
+        totalInvoked += 1; // increment FIRST so even an
+        // immediately-aborted run leaves a trace.
+        await sleep(1000, ctx.signal);
+        return { echoed: args.msg ?? 'p_count' };
+      },
+    };
+    const ctrl = new AbortController();
+    const { config } = buildConfig(
+      [
+        {
+          tool_uses: Array.from({ length: 5 }, (_, i) => ({
+            id: `tu${i + 1}`,
+            name: 'p_count',
+            input: { msg: String(i) },
+          })),
+          stop_reason: 'tool_use',
+        },
+        { text: 'done', stop_reason: 'end_turn' },
+      ],
+      {
+        tools: [counted],
+        signal: ctrl.signal,
+        budget: { maxConcurrentToolCalls: 2 },
+      },
+    );
+    const runPromise = runAgent(config);
+    setTimeout(() => ctrl.abort(), 30);
+    const result = await runPromise;
+    expect(result.status).toBe('interrupted');
+    expect(result.reason).toBe('aborted');
+    // The load-bearing assertion: only the workers that had
+    // already entered execute count. With cap=2 and the abort
+    // firing after both workers entered, totalInvoked is 2.
+    // Without the fix, queued tu3-5 also dispatch (even if
+    // they fail-fast inside sleep), so totalInvoked would
+    // climb to 5.
+    expect(totalInvoked).toBeLessThanOrEqual(2);
+  });
+
   test('hard abort during parallel batch resolves as aborted', async () => {
     const ctrl = new AbortController();
     const slow = parallelEcho('p_slow', { delayMs: 200 });
