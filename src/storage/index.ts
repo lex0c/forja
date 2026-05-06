@@ -172,3 +172,15 @@ export type {
   CostProgressEvent,
   InsertCostProgressEventInput,
 } from './repos/cost-progress-events.ts';
+
+export {
+  insertSubagentGateDecision,
+  listSubagentGateDecisionsByParent,
+  listSubagentGateDecisionsByType,
+} from './repos/subagent-gate-decisions.ts';
+export type {
+  GateDecisionTool,
+  GateDecisionType,
+  InsertSubagentGateDecisionInput,
+  SubagentGateDecision,
+} from './repos/subagent-gate-decisions.ts';

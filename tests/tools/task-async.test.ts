@@ -405,4 +405,158 @@ describe('task_async / task_await / task_cancel tools', () => {
     if (!isToolError(r2)) return;
     expect(r2.error_code).toBe('tool.invalid_arg');
   });
+
+  test('task_async records gate decisions for all three refusal kinds (audit fix #3)', async () => {
+    // Each pre-flight refusal site (depth_exceeded,
+    // unknown_subagent, budget_exhausted) must invoke the
+    // recorder before returning the tool error. The recorder
+    // is fail-soft in production; here we capture calls into
+    // an array to verify shape + invocation count.
+    type Decision = {
+      decisionType: 'budget_exhausted' | 'unknown_subagent' | 'depth_exceeded';
+      toolName: 'task' | 'task_sync' | 'task_async';
+      requestedName: string;
+      details: Record<string, unknown>;
+    };
+    const recorded: Decision[] = [];
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+    });
+
+    // Path 1: depth_exceeded (depth pre-check before name resolve).
+    const ctxDepth = makeCtx({
+      subagentHandleStore: store,
+      subagentDepth: 4, // MAX_SUBAGENT_DEPTH = 4 so child = 5 trips
+      recordGateDecision: (d) => recorded.push(d),
+    });
+    const rDepth = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'p' }, ctxDepth);
+    expect(isToolError(rDepth)).toBe(true);
+    if (isToolError(rDepth)) expect(rDepth.error_code).toBe('subagent.depth_exceeded');
+
+    // Path 2: unknown_subagent.
+    const ctxUnknown = makeCtx({
+      subagentHandleStore: store,
+      getSubagentBudgetEstimate: () => null,
+      getKnownSubagentNames: () => ['explore', 'review'],
+      recordGateDecision: (d) => recorded.push(d),
+    });
+    const rUnknown = await taskAsyncTool.execute({ subagent: 'typo', prompt: 'p' }, ctxUnknown);
+    expect(isToolError(rUnknown)).toBe(true);
+    if (isToolError(rUnknown)) expect(rUnknown.error_code).toBe('subagent.unknown');
+
+    // Path 3: budget_exhausted.
+    const ctxBudget = makeCtx({
+      subagentHandleStore: store,
+      getCostBudget: () => ({ spent: 4.5, cap: 5.0 }),
+      getSubagentBudgetEstimate: () => 1.0,
+      recordGateDecision: (d) => recorded.push(d),
+    });
+    const rBudget = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'p' }, ctxBudget);
+    expect(isToolError(rBudget)).toBe(true);
+    if (isToolError(rBudget)) expect(rBudget.error_code).toBe('subagent.budget_exhausted');
+
+    // All three decisions captured with the right shape.
+    expect(recorded).toHaveLength(3);
+    expect(recorded[0]?.decisionType).toBe('depth_exceeded');
+    expect(recorded[0]?.toolName).toBe('task_async');
+    expect(recorded[0]?.requestedName).toBe('explore');
+    expect(recorded[1]?.decisionType).toBe('unknown_subagent');
+    expect(recorded[1]?.requestedName).toBe('typo');
+    expect(recorded[1]?.details.available).toEqual(['explore', 'review']);
+    expect(recorded[2]?.decisionType).toBe('budget_exhausted');
+    expect(recorded[2]?.details.spent).toBe(4.5);
+    expect(recorded[2]?.details.cap).toBe(5.0);
+  });
+
+  test('task_await records gate decisions when dispatcher revalidates and refuses (audit fix #3 review)', async () => {
+    // Race scenario: pre-flight in task_async passed (the
+    // model didn't see a refusal at spawn time), but the
+    // dispatcher revalidated when the slot freed and refused
+    // — the refusal kind reaches the model only when
+    // `task_await` resolves the handle.
+    //
+    // Without this branch logging, the JSON-scan-based
+    // forensic gap that migration 023 closes for the pre-
+    // flight paths would still be open for dispatcher-revalid
+    // refusals. Three sub-cases mirror the three refusal
+    // kinds; each builds a store whose `spawnFn` returns the
+    // refusal envelope (simulating the dispatcher's response).
+    type Decision = {
+      decisionType: 'budget_exhausted' | 'unknown_subagent' | 'depth_exceeded';
+      toolName: 'task' | 'task_sync' | 'task_async';
+      requestedName: string;
+      details: Record<string, unknown>;
+    };
+    const buildStore = (refusal: SpawnSubagentResult) =>
+      createSubagentHandleStore({
+        cap: 3,
+        spawnFn: async () => refusal,
+      });
+
+    // Path 1: budget_exhausted from dispatcher.
+    const recorded1: Decision[] = [];
+    const s1 = buildStore({
+      kind: 'budget_exhausted',
+      requested: 'explore',
+      spent: 4.0,
+      estimate: 1.5,
+      projected: 5.5,
+      cap: 5.0,
+    });
+    const ctx1 = makeCtx({
+      subagentHandleStore: s1,
+      recordGateDecision: (d) => recorded1.push(d),
+    });
+    const spawn1 = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'p' }, ctx1);
+    if (isToolError(spawn1)) throw new Error('spawn should succeed');
+    const await1 = await taskAwaitTool.execute({ handle_id: spawn1.handle_id }, ctx1);
+    expect(isToolError(await1)).toBe(true);
+    if (isToolError(await1)) expect(await1.error_code).toBe('subagent.budget_exhausted');
+    expect(recorded1).toHaveLength(1);
+    expect(recorded1[0]).toMatchObject({
+      decisionType: 'budget_exhausted',
+      toolName: 'task_async',
+      requestedName: 'explore',
+    });
+
+    // Path 2: unknown_subagent from dispatcher.
+    const recorded2: Decision[] = [];
+    const s2 = buildStore({
+      kind: 'unknown_subagent',
+      requested: 'mistyped',
+      available: ['explore', 'review'],
+    });
+    const ctx2 = makeCtx({
+      subagentHandleStore: s2,
+      recordGateDecision: (d) => recorded2.push(d),
+    });
+    const spawn2 = await taskAsyncTool.execute({ subagent: 'mistyped', prompt: 'p' }, ctx2);
+    if (isToolError(spawn2)) throw new Error('spawn should succeed');
+    const await2 = await taskAwaitTool.execute({ handle_id: spawn2.handle_id }, ctx2);
+    expect(isToolError(await2)).toBe(true);
+    expect(recorded2).toHaveLength(1);
+    expect(recorded2[0]?.decisionType).toBe('unknown_subagent');
+    expect(recorded2[0]?.toolName).toBe('task_async');
+
+    // Path 3: depth_exceeded from dispatcher.
+    const recorded3: Decision[] = [];
+    const s3 = buildStore({
+      kind: 'depth_exceeded',
+      requested: 'explore',
+      depth: 5,
+      maxDepth: 4,
+    });
+    const ctx3 = makeCtx({
+      subagentHandleStore: s3,
+      recordGateDecision: (d) => recorded3.push(d),
+    });
+    const spawn3 = await taskAsyncTool.execute({ subagent: 'explore', prompt: 'p' }, ctx3);
+    if (isToolError(spawn3)) throw new Error('spawn should succeed');
+    const await3 = await taskAwaitTool.execute({ handle_id: spawn3.handle_id }, ctx3);
+    expect(isToolError(await3)).toBe(true);
+    expect(recorded3).toHaveLength(1);
+    expect(recorded3[0]?.decisionType).toBe('depth_exceeded');
+    expect(recorded3[0]?.details).toEqual({ depth: 5, max_depth: 4 });
+  });
 });

@@ -177,6 +177,30 @@ export interface ToolContext {
   // ordering across calls so audit consumers see a
   // deterministic list.
   getKnownSubagentNames?: () => string[];
+  // Audit recorder for pre-spawn refusals (spec
+  // ORCHESTRATION.md §3.5, audit fix #3). Called by `task` /
+  // `task_sync` / `task_async` immediately before returning a
+  // `subagent.budget_exhausted`, `subagent.unknown`, or
+  // `subagent.depth_exceeded` tool error. Persists into
+  // `subagent_gate_decisions`.
+  //
+  // The harness wraps the underlying repo write in a fail-soft
+  // try/catch — DB throws degrade audit completeness without
+  // affecting the model's view (the tool error is already
+  // about to return). Tools that don't have a recorder wired
+  // (test contexts without the harness) get `undefined` and
+  // skip the call; audit data is not load-bearing for
+  // correctness.
+  //
+  // The recorder is a single-call surface so each refusal site
+  // can write its decision in one line — keeps tool code lean
+  // and hides the db/sessionId binding inside the harness.
+  recordGateDecision?: (input: {
+    decisionType: 'budget_exhausted' | 'unknown_subagent' | 'depth_exceeded';
+    toolName: 'task' | 'task_sync' | 'task_async';
+    requestedName: string;
+    details: Record<string, unknown>;
+  }) => void;
   // Background process manager for the current session. Optional so
   // existing tools that don't need bg orchestration aren't forced to
   // declare a dependency. Tools that DO need it (`bash_background`,

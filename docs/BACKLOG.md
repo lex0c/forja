@@ -15,6 +15,94 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — persisted gate-decision audit table (audit fix #3)
+
+Auditability gap. Three pre-spawn refusal kinds —
+`subagent.budget_exhausted`, `subagent.unknown`,
+`subagent.depth_exceeded` — surface as tool errors and the
+only forensic trace lives in `messages.tool_results` JSON
+payloads. Queries like "did this run hit the budget cap?" or
+"which subagent typos did the model retry into?" require
+JSON scans across long message histories, with no closed-set
+column to filter on.
+
+Fix: new table `subagent_gate_decisions` (migration 023)
+captures every refusal as a first-class row. Schema:
+discriminated `decision_type` (closed enum via CHECK),
+`tool_name` (also CHECK-enumerated: `task` / `task_sync` /
+`task_async`), `requested_name` denormalized, `details` JSON
+with per-kind shape, `decided_at` timestamp. FK CASCADE on
+parent session — same lifecycle as `subagent_handles` and
+`cost_progress_events`.
+
+| File | Change |
+|---|---|
+| `src/storage/migrations/023-subagent-gate-decisions.ts` | NEW. Table with two CHECK constraints (decision_type, tool_name) and one composite index (parent_session_id, decided_at). Both enums force a migration if a future refusal kind needs adding — small but intentional friction so the audit surface stays predictable. |
+| `src/storage/migrations/index.ts` | Migration 023 wired. |
+| `src/storage/repos/subagent-gate-decisions.ts` | NEW. `insertSubagentGateDecision`, `listSubagentGateDecisionsByParent`, `listSubagentGateDecisionsByType`. Defensive JSON parse on `details` (corrupt → null). |
+| `src/storage/index.ts` | Barrel re-exports. |
+| `src/tools/types.ts` | `ToolContext` gains optional `recordGateDecision` callback. Documented as fail-soft: recorder swallows DB throws so the tool error is never shadowed by an audit failure. Optional so test contexts that don't model the harness can construct cleanly. |
+| `src/harness/loop.ts` | Wires the recorder when constructing `ToolContext`. Inner try/catch + stderr warn (D208 fail-soft pattern), with a SECOND inner try around `console.error` itself (review fix): in stdio edge cases (EPIPE, exhausted stderr) the diagnostic sink can throw; without the second guard that throw escapes the outer catch and propagates up through the tool's execute path, defeating the entire fail-soft promise. Audit data is the LEAST important signal at the refusal site — the tool-error return MUST land even when both the DB write AND its diagnostic fail. Imports `insertSubagentGateDecision` from the storage barrel. |
+| `src/tools/builtin/task-async.ts` | Three new `recordGateDecision` calls — one before each pre-flight refusal (depth_exceeded, unknown_subagent, budget_exhausted). Each records before returning the tool error so the audit row lands first. |
+| `src/tools/builtin/task.ts` | Three new `recordGateDecision` calls in the dispatcher-result mapping. The synchronous task family doesn't pre-flight; refusal kinds arrive from the dispatcher and are mapped to tool errors. Both `task` and `task_sync` (alias) share this execute body — every audit row attributes to `'task_sync'` (canonical per spec §3.1); the legacy alias distinction is recoverable via `messages.tool_uses` if needed. |
+| `src/tools/builtin/task-await.ts` | Three new `recordGateDecision` calls (review fix). When `task_async`'s pre-flight passes but the dispatcher revalidates at slot-acquire time and refuses (typical race: a sibling settled between pre-flight and dispatch, projection now exceeds cap), the refusal lands as a settled-payload `kind` and reaches the model only via `task_await`. Without recording here, the JSON-scan gap migration 023 closes for pre-flight refusals would still be open for dispatcher-revalid refusals. Attributes to `'task_async'` because the originating model call was task_async; the dispatcher revalid is an implementation detail. |
+| `tests/storage/subagent-gate-decisions.test.ts` | NEW. Seven unit tests: round-trip + chronological listing; `listByType` filtering; CHECK constraint rejects unknown decision_type; CHECK rejects unknown tool_name; FK CASCADE on session drop; defensive JSON parse on corrupt `details`; default `decidedAt` uses `Date.now()`. |
+| `tests/tools/_helpers.ts` | `makeCtx` plumbs `recordGateDecision` overrides. |
+| `tests/tools/task-async.test.ts` | NEW test exercising all three pre-flight refusal sites (depth, unknown, budget). Captures recorder calls via an array; asserts decision type, tool name, requested name, and per-kind details shape. |
+| `tests/tools/task.test.ts` | NEW test mirroring task-async but for the dispatcher-result path. Three refusal envelopes feed in via mocked `spawnSubagent`; asserts all three trigger the recorder with `toolName: 'task_sync'`. |
+| `tests/tools/task-async.test.ts` (additional) | NEW test (review fix) covering the `task_await` settle-refusal path. Each of the three refusal kinds is fed via a `spawnFn` returning the corresponding envelope; pre-flight passes (so `task_async` returns success), then `task_await` resolves the handle and invokes the recorder before mapping to a tool error. Closes the dispatcher-revalid coverage gap. |
+
+**Decision:**
+
+- **D221 — `recordGateDecision` is a single ToolContext
+  callback, not a per-tool dependency.** Adding `db` +
+  `sessionId` directly to ToolContext would have broken the
+  pattern that other audit-style writes (memory_events,
+  hook_runs, subagent_outputs) follow: each gets its own
+  bound helper on ctx so the tool code stays free of storage
+  concerns. The single-call surface also lets each refusal
+  site write its decision in one line, keeping the tool
+  diff lean. Fail-soft is wired at the harness layer (the
+  helper wraps the repo write in try/catch); tools just
+  invoke and forget.
+
+- **`task` legacy alias attributes to `task_sync` in
+  audit.** Both share the same execute body and the runtime
+  doesn't carry `this.name` into a closure. Refactoring to
+  parameterize the execute by tool name was rejected as
+  noise — the spec §3.1 declares `task_sync` canonical, and
+  the alias distinction (which is rare and shrinking) is
+  recoverable from `messages.tool_uses`. The CHECK
+  constraint still admits `'task'` as a value so a future
+  refactor that DOES want full fidelity isn't schema-blocked.
+
+- **D222 — `task_await` is also a refusal site.** Code
+  review caught that the dispatcher revalidates the same
+  three gates (`spawnSubagentImpl` re-checks budget /
+  unknown / depth) when the slot frees, AFTER `task_async`'s
+  pre-flight passed. A refusal at that layer settles as a
+  non-`ran` envelope and only reaches the model through
+  `task_await`'s tool-error mapping. The pre-flight recorder
+  alone left the dispatcher-revalid path uncovered — the
+  exact scenario "child A and B settled between my
+  pre-flight and my dispatch, cap projection now exceeded"
+  produces a `subagent.budget_exhausted` audit-blind from
+  the model's perspective. Adding the recorder calls in
+  `task_await` closes the gap. Attribution stays
+  `'task_async'` since the originating call was
+  `task_async`; the dispatcher revalid is implementation
+  detail invisible to the model.
+
+- **Spec update deferred.** ORCHESTRATION.md §3.5 documents
+  the gate behavior but not its persistence. Spec PR logged
+  as follow-up alongside D217 (cancelSource) and D220
+  (cost_progress_events).
+
+Verification: typecheck clean, lint clean, 3127 pass / 0
+fail (11 new tests).
+
+---
+
 ## [2026-05-06] parallel — persisted cost-progress event stream (audit fix #2)
 
 Auditability gap. Each child subagent emits `cost_update`

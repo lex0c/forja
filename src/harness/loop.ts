@@ -22,6 +22,7 @@ import {
   createSession,
   getSession,
   insertCostProgressEvent,
+  insertSubagentGateDecision,
   listMessageTailBySession,
   reopenSession,
 } from '../storage/index.ts';
@@ -1623,6 +1624,47 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             config.subagentRegistry !== undefined
               ? Array.from(config.subagentRegistry.byName.keys()).sort()
               : [],
+          // Pre-spawn refusal recorder (audit fix #3,
+          // migration 023). Each subagent tool calls this
+          // immediately before returning its
+          // `subagent.budget_exhausted` / `subagent.unknown`
+          // / `subagent.depth_exceeded` tool error. Fail-soft
+          // try/catch — a DB throw at audit time MUST NOT
+          // shadow the model-visible refusal: the error is
+          // already on its way back; losing the audit row is
+          // strictly worse than crashing the harness, but
+          // crashing because we couldn't audit is worse than
+          // either.
+          recordGateDecision: (input) => {
+            try {
+              insertSubagentGateDecision(config.db, {
+                parentSessionId: sessionId,
+                decisionType: input.decisionType,
+                toolName: input.toolName,
+                requestedName: input.requestedName,
+                details: input.details,
+              });
+            } catch (e) {
+              // Inner try wraps `console.error` itself: in stdio
+              // edge cases (EPIPE, exhausted stderr) the error
+              // sink can throw, which would escape the outer
+              // catch and propagate up through the tool's
+              // execute path — defeating the entire fail-soft
+              // promise. Audit data is the LEAST important
+              // signal here; the tool-error return MUST land
+              // even when both the DB write AND its diagnostic
+              // fail.
+              try {
+                const message = e instanceof Error ? e.message : String(e);
+                console.error(
+                  `gate decision persist failed (${input.decisionType} for '${input.requestedName}'): ${message}`,
+                );
+              } catch {
+                // Truly nothing left to do — let the tool error
+                // through.
+              }
+            }
+          },
           ...(config.memoryRegistry !== undefined ? { memoryRegistry: config.memoryRegistry } : {}),
           ...(config.confirmMemoryWrite !== undefined
             ? { confirmMemoryWrite: config.confirmMemoryWrite }

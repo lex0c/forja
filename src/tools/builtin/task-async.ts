@@ -103,6 +103,12 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
     // pre-destined to fail.
     const childDepth = (ctx.subagentDepth ?? 0) + 1;
     if (childDepth > MAX_SUBAGENT_DEPTH) {
+      ctx.recordGateDecision?.({
+        decisionType: 'depth_exceeded',
+        toolName: 'task_async',
+        requestedName: args.subagent,
+        details: { depth: childDepth, max_depth: MAX_SUBAGENT_DEPTH },
+      });
       return toolError(
         'subagent.depth_exceeded',
         `subagent '${args.subagent}' would nest at depth ${childDepth} (max ${MAX_SUBAGENT_DEPTH})`,
@@ -136,6 +142,12 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
     const estimateRaw = ctx.getSubagentBudgetEstimate?.(args.subagent);
     if (estimateRaw === null) {
       const available = ctx.getKnownSubagentNames?.() ?? [];
+      ctx.recordGateDecision?.({
+        decisionType: 'unknown_subagent',
+        toolName: 'task_async',
+        requestedName: args.subagent,
+        details: { available },
+      });
       return toolError('subagent.unknown', `subagent '${args.subagent}' not found`, {
         hint:
           available.length > 0
@@ -162,6 +174,17 @@ export const taskAsyncTool: Tool<TaskAsyncInput, TaskAsyncOutput> = {
     if (budget !== undefined && budget.cap !== undefined && Number.isFinite(budget.cap)) {
       const projected = budget.spent + estimate;
       if (projected > budget.cap) {
+        ctx.recordGateDecision?.({
+          decisionType: 'budget_exhausted',
+          toolName: 'task_async',
+          requestedName: args.subagent,
+          details: {
+            spent: budget.spent,
+            estimate,
+            projected,
+            cap: budget.cap,
+          },
+        });
         return toolError(
           'subagent.budget_exhausted',
           `spawning '${args.subagent}' would push projected cost to $${projected.toFixed(6)} (cap $${budget.cap.toFixed(6)})`,

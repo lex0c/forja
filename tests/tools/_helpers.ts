@@ -39,6 +39,9 @@ export const makeCtx = (overrides: Partial<ToolContext> = {}): ToolContext => ({
   ...(overrides.getKnownSubagentNames !== undefined
     ? { getKnownSubagentNames: overrides.getKnownSubagentNames }
     : {}),
+  ...(overrides.recordGateDecision !== undefined
+    ? { recordGateDecision: overrides.recordGateDecision }
+    : {}),
   ...(overrides.memoryRegistry !== undefined ? { memoryRegistry: overrides.memoryRegistry } : {}),
   ...(overrides.confirmMemoryWrite !== undefined
     ? { confirmMemoryWrite: overrides.confirmMemoryWrite }

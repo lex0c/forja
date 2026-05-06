@@ -131,11 +131,36 @@ export const taskAwaitTool: Tool<TaskAwaitInput, TaskAwaitOutput> = {
       return toolError(ERROR_CODES.aborted, 'await aborted', { retryable: true });
     }
     // outcome.kind === 'done' — fold the SpawnSubagentResult.
+    //
+    // Three of the four `kind` branches below mirror the
+    // refusals that `task_async` pre-flights at the call
+    // site. They CAN still arrive here when the dispatcher
+    // (`spawnSubagentImpl` in loop.ts) revalidates and
+    // refuses AFTER the pre-flight passed — typical case:
+    // the cap projection looked OK at task_async time, but
+    // by the time the store's slot frees and dispatch runs,
+    // a sibling settled and the projection now exceeds the
+    // cap. The refusal lands as a settled-payload kind, not
+    // as a synchronous tool error, so the audit recorder
+    // wasn't called by `task_async`.
+    //
+    // Each branch records the decision before returning, so
+    // forensic queries see the refusal regardless of which
+    // gate (pre-flight vs. dispatcher) caught it. Attributes
+    // to `'task_async'` because the originating model call
+    // was task_async; the dispatcher revalidation is an
+    // implementation detail invisible to the model.
     const result = outcome.result;
     if (result.kind === 'unknown_subagent') {
       // Reachable when the spawn itself reported unknown name —
       // the original task_async would have surfaced this before
       // the handle was returned, so this is purely defensive.
+      ctx.recordGateDecision?.({
+        decisionType: 'unknown_subagent',
+        toolName: 'task_async',
+        requestedName: result.requested,
+        details: { available: result.available },
+      });
       return toolError('subagent.unknown', `subagent '${result.requested}' not found`, {
         hint:
           result.available.length > 0
@@ -145,6 +170,12 @@ export const taskAwaitTool: Tool<TaskAwaitInput, TaskAwaitOutput> = {
       });
     }
     if (result.kind === 'depth_exceeded') {
+      ctx.recordGateDecision?.({
+        decisionType: 'depth_exceeded',
+        toolName: 'task_async',
+        requestedName: result.requested,
+        details: { depth: result.depth, max_depth: result.maxDepth },
+      });
       return toolError(
         'subagent.depth_exceeded',
         `subagent '${result.requested}' would nest at depth ${result.depth} (max ${result.maxDepth})`,
@@ -155,6 +186,17 @@ export const taskAwaitTool: Tool<TaskAwaitInput, TaskAwaitOutput> = {
       );
     }
     if (result.kind === 'budget_exhausted') {
+      ctx.recordGateDecision?.({
+        decisionType: 'budget_exhausted',
+        toolName: 'task_async',
+        requestedName: result.requested,
+        details: {
+          spent: result.spent,
+          estimate: result.estimate,
+          projected: result.projected,
+          cap: result.cap,
+        },
+      });
       return toolError(
         'subagent.budget_exhausted',
         `spawning '${result.requested}' would push projected cost to $${result.projected.toFixed(6)} (cap $${result.cap.toFixed(6)})`,
