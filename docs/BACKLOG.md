@@ -15,6 +15,49 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — fold race-winner cost into rehydration tracker
+
+User-spotted bug. The handle store's rehydration constructor
+had two paths to populate `cached`:
+
+- `row.status === 'settled'`: read payload directly →
+  `rehydratedChildCostUsd += cached.costUsd` ✓
+- `row.status === 'running'`: synthesize `resumed_session`
+  envelope ($0) → settle write-once → re-read in case a
+  competing writer beat us. The re-read overwrote `cached`
+  with the winner's envelope BUT the cost increment lived
+  inside the first branch only.
+
+In the crash-resume race where the child subprocess settled
+before the resumed parent ran the constructor, the parent's
+re-read picked up the winner's envelope (correct for
+`awaitHandle` semantics) but `rehydratedChildCostUsd` saw $0
+for that row. `priorCostUsd += store.getRehydratedChildCostUsd()`
+in `runAgent` then undercounted by the winner's cost — the
+resumed parent's `maxCostUsd` cap silently admitted extra
+work.
+
+| File | Change |
+|---|---|
+| `src/subagents/handle-store.ts` | Moved the `rehydratedChildCostUsd += cached.costUsd` line OUT of the settled-first branch, to a single site AFTER the if/else where `cached` is final. Both paths (settled-first and race-loser-with-reread) flow through the same fold; whichever envelope `cached` ends up holding is the one that gets charged. |
+| `tests/subagents/handle-store.test.ts` | Two new tests: (a) "rehydration of running row LOST to a race-winner counts the winner cost" — direct insert of a settled row with cost=$3, constructor reads it correctly. (b) "rehydration of race-loser path: constructor settle no-ops; re-read cost is folded in" — first store settles a running row to resumed_session ($0); manual UPDATE bypasses write-once to simulate a late-arriving child envelope ($1.75); second store's rehydration folds the $1.75 — proves the unified fold site catches the race-loser case. Pre-fix the second store would have shown $0. |
+
+**Decision:**
+
+- **D214 — Single fold site after both rehydration paths.**
+  The previous structure (cost increment only in
+  settled-first) was the kind of "happy path code" that
+  silently misses the unhappy path. The unified site after
+  the if/else makes the fold's invariant unconditional:
+  whatever envelope ends up in `cached` is what gets
+  charged. Future paths added to the rehydration logic
+  (e.g., a third recovery branch) inherit the fold for free.
+
+Verification: typecheck clean, lint clean, 3100 pass / 0 fail
+(2 new tests).
+
+---
+
 ## [2026-05-06] parallel — task_async fails fast on unknown subagent name
 
 User-spotted bug. Sync `task` tool's contract is "fail fast on

@@ -423,9 +423,6 @@ export const createSubagentHandleStore = (
       let cached: SpawnSubagentResult;
       if (row.status === 'settled' && row.settledPayload !== null) {
         cached = envelopeFromJson(row.settledPayload);
-        if (cached.kind === 'ran' && Number.isFinite(cached.costUsd)) {
-          rehydratedChildCostUsd += cached.costUsd;
-        }
       } else {
         // Running row → synthesize per-row resumed_session and
         // commit to DB. settleSubagentHandle is write-once: if
@@ -448,6 +445,19 @@ export const createSubagentHandleStore = (
         if (refreshed !== undefined && refreshed.settledPayload !== null) {
           cached = envelopeFromJson(refreshed.settledPayload);
         }
+      }
+      // Charge the FINAL `cached` envelope (post-race reread when
+      // applicable) against the rehydrated tracker. The
+      // settled-first branch and the race-loser path both end
+      // here with `cached` reflecting whichever envelope won the
+      // settle write-once contract. Folding once at this single
+      // site closes the bug where a child that settled with
+      // costUsd > 0 just before the parent crashed was undercounted
+      // — the resumed parent's priorCostUsd would have missed
+      // that spend and `maxCostUsd` would silently admit extra
+      // work.
+      if (cached.kind === 'ran' && Number.isFinite(cached.costUsd)) {
+        rehydratedChildCostUsd += cached.costUsd;
       }
       const handle: SubagentHandle = {
         id: row.handleId,
