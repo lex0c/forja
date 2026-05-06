@@ -1775,11 +1775,25 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // path used to give. Fail-fast: as soon as one tu repeats
         // `maxRepeatedToolHash` times in the sliding window, the
         // entire step is refused — no tool runs.
+        //
+        // Detection runs against a LOCAL COPY of
+        // `recentToolHashes` — the global buffer is only mutated
+        // when a tool actually dispatches (serial loop body /
+        // parallel `safeInvokeOne`). Without the local-copy
+        // pattern, an early step exit (signal.aborted,
+        // softStopSignal, maxToolErrors mid-batch) would leave
+        // hashes in the global buffer for tools that never ran,
+        // and a later step could trip `degenerateLoop` against
+        // unexecuted call counts. The local pre-check still
+        // detects in-batch duplicates AND batch-vs-history
+        // duplicates, just without the side effect on the
+        // global buffer.
+        const preBatchHashes = [...recentToolHashes];
         for (const tu of collected.tool_uses) {
           const h = hashToolCall(tu.name, tu.input);
-          recentToolHashes.push(h);
-          if (recentToolHashes.length > HASH_WINDOW) recentToolHashes.shift();
-          const repeats = recentToolHashes.filter((x) => x === h).length;
+          preBatchHashes.push(h);
+          if (preBatchHashes.length > HASH_WINDOW) preBatchHashes.shift();
+          const repeats = preBatchHashes.filter((x) => x === h).length;
           if (repeats >= budget.maxRepeatedToolHash) {
             return await finish(
               'degenerateLoop',
@@ -1927,6 +1941,18 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                 failed: false,
               };
             }
+            // Track the dispatch hash NOW (after abort guard,
+            // before invokeOne). Workers that take the
+            // abort-skipped branch above NEVER reach this line,
+            // so unexecuted calls don't pollute the global
+            // `recentToolHashes`. JS is single-threaded so
+            // concurrent workers' pushes serialize without
+            // races; the buffer's only invariant is "every
+            // entry corresponds to a real dispatch", which
+            // this site preserves.
+            const callHash = hashToolCall(tu.name, tu.input);
+            recentToolHashes.push(callHash);
+            if (recentToolHashes.length > HASH_WINDOW) recentToolHashes.shift();
             try {
               return await invokeOne(tu);
             } catch (e) {
@@ -2022,6 +2048,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             if (softAborted) {
               return await finish('aborted', undefined, 'soft');
             }
+            // Track the dispatch hash NOW (after abort/soft
+            // checks, before invokeOne). The pre-batch detection
+            // ran against a local copy; this is the only site
+            // that mutates the global `recentToolHashes`. Skipped
+            // tools (signal.aborted between iterations) never
+            // reach this line, so unexecuted calls don't
+            // pollute the buffer.
+            const callHash = hashToolCall(tu.name, tu.input);
+            recentToolHashes.push(callHash);
+            if (recentToolHashes.length > HASH_WINDOW) recentToolHashes.shift();
             const inv = await invokeOne(tu);
             toolResults.push(inv.toolResult);
             if (inv.failed) {

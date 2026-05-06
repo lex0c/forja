@@ -15,6 +15,74 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — degenerate-loop tracker counts only dispatched calls
+
+User-spotted bug. The pre-batch degenerate-loop check in
+`runAgent`'s step body iterated every `tool_use` and pushed
+its hash into `recentToolHashes` BEFORE any invocation
+happened. If the step exited mid-batch — soft/hard abort
+between iterations, `maxToolErrors` after the first failure
+— the unexecuted tu's stayed in the global buffer.
+
+The drift surfaces as a semantic invariant break: the
+buffer's contract is "hashes of tool calls the harness
+actually dispatched in the recent window", but the
+implementation was "hashes the model emitted in the recent
+window, even ones the harness refused to dispatch". The two
+diverge whenever a step exits early.
+
+In today's codebase every early-exit path is terminal
+(`finish()` always ends `runAgent`), so the buffer's
+post-bail contents never matter — the run is over. The
+bug is therefore latent rather than observable in current
+behavior. But the bookkeeping mismatch is a landmine for
+any future refactor that introduces a non-terminal mid-step
+exit (e.g. a soft-stop variant that lets the loop continue
+into the next step, or a partial retry path). Fixing the
+invariant now keeps the future change small.
+
+| File | Change |
+|---|---|
+| `src/harness/loop.ts` | Pre-batch detection now runs against a LOCAL COPY of `recentToolHashes` (`const preBatchHashes = [...recentToolHashes]`). The local copy is mutated as the pre-batch loop walks the tu's; if any tu trips `maxRepeatedToolHash`, the harness still bails with the same message naming the offending tu. The GLOBAL buffer is untouched at the pre-batch stage. Per-dispatch push moved to two new sites, mirroring the per-iteration tracking that already existed for serial-only behavior pre-parallel: (a) inside the serial loop body, after the abort/soft-stop checks, before `invokeOne`; (b) inside `safeInvokeOne` (parallel path), after the abort guard, before `invokeOne`. Workers that take the abort-skipped branch in `safeInvokeOne` (D223) NEVER push, so unexecuted calls don't pollute the buffer. |
+
+**Decision:**
+
+- **D225 — Pre-batch detection is read-only on the global
+  buffer; per-dispatch tracking is the only writer.** The
+  pre-batch loop's job is "refuse cheaply if this batch
+  WOULD trip the threshold" — it doesn't need to mutate
+  shared state to do that. The local-copy pattern (snapshot
+  at entry, mutate the snapshot) gives the same detection
+  correctness (in-batch repeats AND batch-vs-history
+  repeats both detected) without the side effect. The
+  per-dispatch sites are the natural single-writer for the
+  buffer: each push corresponds to a tool call the harness
+  committed to running. JS single-threaded execution means
+  concurrent parallel workers' pushes serialize without
+  races; the ordering is non-deterministic but the
+  invariant ("each entry corresponds to a real dispatch")
+  is preserved regardless.
+
+- **No new test.** The fix is invariant-correctness; today's
+  early-exit paths are all terminal, so the diff between
+  pre- and post-fix behavior isn't observable in `runAgent`'s
+  external surface. Existing degenerate-loop tests
+  (`tests/harness/loop.test.ts:481` "identical tool calls
+  are caught", `tests/harness/parallel.test.ts:594`
+  "degenerate-loop check fires pre-batch even when all
+  parallel_safe") continue to pass — they exercise the
+  detection path without depending on the buffer's
+  post-bail state. Adding a defensive test would require
+  inspecting the private `recentToolHashes` or constructing
+  a synthetic non-terminal exit path, both of which would
+  encode implementation details the fix is trying to keep
+  loose.
+
+Verification: typecheck clean, lint clean, 3130 pass / 0
+fail (no new tests).
+
+---
+
 ## [2026-05-06] parallel — busy_timeout=5000 to absorb WAL contention
 
 User-prompted DB review. The parallelism architecture has
