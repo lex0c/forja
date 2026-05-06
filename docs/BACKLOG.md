@@ -15,6 +15,55 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — rehydrate worktree fields in settled handle envelopes
+
+User-spotted bug. The `kind: 'ran'` rehydration branch in
+`envelopeFromJson` rebuilt a partial envelope from
+`settled_payload`: it restored `output`, `sessionId`,
+`status`, `reason`, cost, steps, duration, and (post-D215)
+`auditFailure` + `cancelSource` — but DROPPED the optional
+`worktree` and `worktreeError` fields.
+
+Concrete impact: a subagent with `isolation: worktree`
+settles with a `worktree: { path, branch, dirty, preserved,
+removed }` payload (or `worktreeError: { code, message }`
+if creation failed). `envelopeToJson` is identity-cast, so
+the field persists into the row's `settled_payload` JSON
+intact. But on resume, `envelopeFromJson` rebuilds the
+envelope without those keys — `task_await` after a resume
+returns less information than the original (pre-resume)
+`task_await` for the same handle, even though the row in
+the DB has the data.
+
+The asymmetry only surfaces post-resume (in-memory
+settledResult is used directly, no rehydrate). Easy to
+miss in tests that don't model a resume cycle for
+worktree-isolated subagents.
+
+| File | Change |
+|---|---|
+| `src/subagents/handle-store.ts` | Two new defensive validation branches added to `envelopeFromJson` after the `auditFailure` block. (a) `worktree`: requires all five fields (`path`, `branch`, `dirty`, `preserved`, `removed`) to validate their declared types together; a partial shape is treated as missing rather than half-restored. (b) `worktreeError`: same shape as `auditFailure` (code + message), validated identically. Both use the same conditional-spread pattern as the existing fields so the resulting envelope shape stays minimal when the row had no worktree (the common `isolation: none` case). |
+| `tests/subagents/handle-store.test.ts` | NEW test "rehydrates worktree + worktreeError fields on resume". Three scenarios: (a) successful worktree outcome with all five fields set — resume must surface every one; (b) worktreeError row (creation failed) — resume must surface code+message; (c) malformed partial worktree (missing `removed`) — rehydrate drops it silently rather than smuggling `undefined` past the boolean type. |
+
+**Decision:**
+
+- **D226 — All-or-nothing validation on the `worktree`
+  block.** A partial shape (missing one field) is treated
+  as missing entirely rather than half-restored with
+  fallback values. The fields are semantically coupled
+  (`preserved` and `removed` are mutually exclusive
+  booleans; defaulting either silently changes the
+  observable outcome the model sees). All-or-nothing is
+  symmetric with how `auditFailure` already validates code
+  AND message together. Future schema additions to
+  `WorktreeOutcome` get the same rule by following the
+  pattern.
+
+Verification: typecheck clean, lint clean, 3131 pass / 0
+fail (1 new test).
+
+---
+
 ## [2026-05-06] parallel — degenerate-loop tracker counts only dispatched calls
 
 User-spotted bug. The pre-batch degenerate-loop check in

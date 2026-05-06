@@ -373,6 +373,8 @@ const envelopeFromJson = (raw: Record<string, unknown>): SpawnSubagentResult => 
   // task_await maps that to `subagent.run_failed` which is the
   // safest tool-error shape we can show the model.
   const auditFailureRaw = raw.auditFailure;
+  const worktreeRaw = raw.worktree;
+  const worktreeErrorRaw = raw.worktreeError;
   return {
     kind: 'ran',
     output: typeof raw.output === 'string' ? raw.output : '',
@@ -391,6 +393,52 @@ const envelopeFromJson = (raw: Record<string, unknown>): SpawnSubagentResult => 
           auditFailure: {
             code: (auditFailureRaw as { code: string }).code,
             message: (auditFailureRaw as { message: string }).message,
+          },
+        }
+      : {}),
+    // Worktree outcome (spec §11.2). Re-validated on rehydrate
+    // so corrupted/legacy rows don't smuggle a partial shape
+    // past the type system. Without this branch a resumed
+    // `task_await` would lose the worktree diagnostics that
+    // were persisted at settle time — `path`, `branch`,
+    // `dirty`/`preserved`/`removed` flags — which is a regression
+    // vs. the original (pre-resume) `task_await` for the same
+    // handle. All five fields must validate together; a
+    // partial shape is treated as missing rather than half-
+    // restored.
+    ...(typeof worktreeRaw === 'object' &&
+    worktreeRaw !== null &&
+    !Array.isArray(worktreeRaw) &&
+    typeof (worktreeRaw as { path?: unknown }).path === 'string' &&
+    typeof (worktreeRaw as { branch?: unknown }).branch === 'string' &&
+    typeof (worktreeRaw as { dirty?: unknown }).dirty === 'boolean' &&
+    typeof (worktreeRaw as { preserved?: unknown }).preserved === 'boolean' &&
+    typeof (worktreeRaw as { removed?: unknown }).removed === 'boolean'
+      ? {
+          worktree: {
+            path: (worktreeRaw as { path: string }).path,
+            branch: (worktreeRaw as { branch: string }).branch,
+            dirty: (worktreeRaw as { dirty: boolean }).dirty,
+            preserved: (worktreeRaw as { preserved: boolean }).preserved,
+            removed: (worktreeRaw as { removed: boolean }).removed,
+          },
+        }
+      : {}),
+    // Worktree creation error (status='error',
+    // reason='worktree_create_failed' in the source envelope).
+    // Re-validated like `auditFailure` since the shape is the
+    // same. Persisted to keep the diagnostic on resume; without
+    // this, the model's view of "the worktree branch never
+    // started" turns into a generic error after resume.
+    ...(typeof worktreeErrorRaw === 'object' &&
+    worktreeErrorRaw !== null &&
+    !Array.isArray(worktreeErrorRaw) &&
+    typeof (worktreeErrorRaw as { code?: unknown }).code === 'string' &&
+    typeof (worktreeErrorRaw as { message?: unknown }).message === 'string'
+      ? {
+          worktreeError: {
+            code: (worktreeErrorRaw as { code: string }).code,
+            message: (worktreeErrorRaw as { message: string }).message,
           },
         }
       : {}),

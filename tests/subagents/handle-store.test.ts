@@ -1504,4 +1504,145 @@ describe('SubagentHandleStore — persistence (resume rehydration)', () => {
       expect(payload?.cancelSource).toBe(reason);
     }
   });
+
+  test('rehydrates worktree + worktreeError fields on resume (D226)', async () => {
+    // Regression: the `kind: 'ran'` rehydration branch
+    // previously rebuilt the envelope without `worktree` /
+    // `worktreeError`, dropping diagnostics that were
+    // persisted at settle time. A resumed `task_await` then
+    // returned less information than the original (pre-resume)
+    // call for the same handle.
+    //
+    // Three scenarios:
+    //   (a) handle settled with a successful worktree outcome
+    //       (path/branch/dirty/preserved/removed all set);
+    //       resume must surface every field.
+    //   (b) handle settled with worktreeError (creation
+    //       failed); resume must surface code+message.
+    //   (c) handle settled with a malformed worktree shape
+    //       (corrupt row, partial fields); rehydrate treats
+    //       it as missing rather than half-restoring.
+
+    // Scenario (a)
+    db.query(
+      `INSERT INTO subagent_handles
+         (handle_id, parent_session_id, child_session_id, name, spawned_at, status, settled_payload, created_at)
+       VALUES ('h-wt-ok', ?, 'child-wt-ok', 'worker', ?, 'settled', ?, ?)`,
+    ).run(
+      parentId,
+      Date.now(),
+      JSON.stringify({
+        kind: 'ran',
+        output: 'wt-output',
+        sessionId: 'child-wt-ok',
+        status: 'done',
+        reason: 'done',
+        costUsd: 0.5,
+        steps: 3,
+        durationMs: 100,
+        worktree: {
+          path: '/tmp/forja-wt/child-wt-ok',
+          branch: 'agent/child-wt-ok',
+          dirty: true,
+          preserved: true,
+          removed: false,
+        },
+      }),
+      Date.now(),
+    );
+
+    // Scenario (b)
+    db.query(
+      `INSERT INTO subagent_handles
+         (handle_id, parent_session_id, child_session_id, name, spawned_at, status, settled_payload, created_at)
+       VALUES ('h-wt-err', ?, NULL, 'worker', ?, 'settled', ?, ?)`,
+    ).run(
+      parentId,
+      Date.now(),
+      JSON.stringify({
+        kind: 'ran',
+        output: '',
+        sessionId: '',
+        status: 'error',
+        reason: 'worktree_create_failed',
+        costUsd: 0,
+        steps: 0,
+        durationMs: 5,
+        worktreeError: {
+          code: 'worktree.create_failed',
+          message: 'fatal: invalid reference: agent/child-wt-err',
+        },
+      }),
+      Date.now(),
+    );
+
+    // Scenario (c) — partial shape (missing `removed` boolean)
+    db.query(
+      `INSERT INTO subagent_handles
+         (handle_id, parent_session_id, child_session_id, name, spawned_at, status, settled_payload, created_at)
+       VALUES ('h-wt-partial', ?, 'child-wt-partial', 'worker', ?, 'settled', ?, ?)`,
+    ).run(
+      parentId,
+      Date.now(),
+      JSON.stringify({
+        kind: 'ran',
+        output: 'partial',
+        sessionId: 'child-wt-partial',
+        status: 'done',
+        reason: 'done',
+        costUsd: 0.1,
+        steps: 1,
+        durationMs: 20,
+        worktree: {
+          path: '/tmp/forja-wt/partial',
+          branch: 'agent/partial',
+          dirty: false,
+          preserved: false,
+          // removed: missing — treated as malformed
+        },
+      }),
+      Date.now(),
+    );
+
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+      persistTo: { db, parentSessionId: parentId },
+    });
+
+    // (a) Worktree fully restored.
+    const outOk = await store.awaitHandle('h-wt-ok');
+    if (outOk.kind !== 'done' || outOk.result.kind !== 'ran') {
+      throw new Error('expected ran envelope for h-wt-ok');
+    }
+    expect(outOk.result.worktree).toEqual({
+      path: '/tmp/forja-wt/child-wt-ok',
+      branch: 'agent/child-wt-ok',
+      dirty: true,
+      preserved: true,
+      removed: false,
+    });
+    expect(outOk.result.worktreeError).toBeUndefined();
+
+    // (b) WorktreeError fully restored.
+    const outErr = await store.awaitHandle('h-wt-err');
+    if (outErr.kind !== 'done' || outErr.result.kind !== 'ran') {
+      throw new Error('expected ran envelope for h-wt-err');
+    }
+    expect(outErr.result.worktree).toBeUndefined();
+    expect(outErr.result.worktreeError).toEqual({
+      code: 'worktree.create_failed',
+      message: 'fatal: invalid reference: agent/child-wt-err',
+    });
+
+    // (c) Partial worktree silently dropped — half-restoring
+    // would smuggle `undefined` into a non-optional `removed`
+    // boolean past the type system.
+    const outPartial = await store.awaitHandle('h-wt-partial');
+    if (outPartial.kind !== 'done' || outPartial.result.kind !== 'ran') {
+      throw new Error('expected ran envelope for h-wt-partial');
+    }
+    expect(outPartial.result.worktree).toBeUndefined();
+    expect(outPartial.result.output).toBe('partial');
+  });
 });
