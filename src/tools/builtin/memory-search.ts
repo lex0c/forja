@@ -88,6 +88,7 @@ export const memorySearchTool: Tool<MemorySearchInput, MemorySearchOutput> = {
     writes: false,
     idempotent: true,
     planSafe: true,
+    parallel_safe: true,
     display: 'list',
     // Body searches do disk reads; latency tracks roughly with the
     // memory count. The hint is a typical case (~10 memories).

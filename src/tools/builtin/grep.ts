@@ -83,6 +83,7 @@ export const grepTool: Tool<GrepInput, GrepOutput> = {
     category: 'fs.read',
     writes: false,
     idempotent: true,
+    parallel_safe: true,
     display: 'list',
     cost: { latency_ms_typical: 100 },
   },

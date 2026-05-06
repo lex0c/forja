@@ -30,7 +30,7 @@ import { type TodoStore, createTodoStore } from '../todo/index.ts';
 import type { ToolContext } from '../tools/index.ts';
 import type { SpawnSubagentArgs, SpawnSubagentResult } from '../tools/types.ts';
 import { abortableIterable } from './abortable.ts';
-import { CollectStepError, collectStep } from './collect.ts';
+import { CollectStepError, type CollectedToolUse, collectStep } from './collect.ts';
 import { compactMessages } from './compaction.ts';
 import { invokeTool } from './invoke-tool.ts';
 import {
@@ -46,6 +46,7 @@ import {
   type HarnessConfig,
   type HarnessEvent,
   type HarnessResult,
+  MAX_CONCURRENT_TOOL_CALLS_CAP,
   type RunBudget,
 } from './types.ts';
 
@@ -74,6 +75,41 @@ const hashToolCall = (name: string, args: Record<string, unknown>): string =>
   createHash('sha256')
     .update(`${name}:${stableStringify(args)}`)
     .digest('hex');
+
+// Bounded-concurrency runner used by the parallel-tool path. Spawns
+// `cap` workers that pull the next free index off a shared cursor;
+// each worker awaits its assigned `worker(item)` before grabbing the
+// next index. Result array is populated in original index order, so
+// callers can preserve the model's tool_use ordering even though
+// completion order is whichever finishes first.
+//
+// Errors thrown by `worker` propagate via the wrapping `Promise.all`
+// — invoke-tool already converts tool failures into ToolResult error
+// shapes, so the only realistic throw path here is a programming bug
+// in the harness itself; we want it to surface, not be swallowed.
+const runPool = async <I, T>(
+  items: readonly I[],
+  cap: number,
+  worker: (item: I) => Promise<T>,
+): Promise<T[]> => {
+  const results = new Array<T>(items.length);
+  const concurrency = Math.max(1, Math.min(cap, items.length));
+  let nextIndex = 0;
+  const runWorker = async (): Promise<void> => {
+    while (true) {
+      const i = nextIndex;
+      nextIndex += 1;
+      if (i >= items.length) return;
+      // Bounds-checked: `i < items.length` was just verified above.
+      // The `as I` keeps TS happy under noUncheckedIndexedAccess
+      // without paying a runtime guard for the impossible case.
+      const item = items[i] as I;
+      results[i] = await worker(item);
+    }
+  };
+  await Promise.all(Array.from({ length: concurrency }, () => runWorker()));
+  return results;
+};
 
 const exitToStatus: Record<ExitReason, TerminalSessionStatus> = {
   done: 'done',
@@ -1075,305 +1111,270 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           }
         }
 
-        // Execute every tool_use in this step, collecting results.
-        const toolResults: ProviderToolResultBlock[] = [];
-        for (const tu of collected.tool_uses) {
-          // Same wall-clock-vs-user-abort distinction as the top-of-loop
-          // check; otherwise a wall-clock timeout that lands between tool
-          // invocations gets misreported as a user abort.
-          if (signal.aborted) {
-            return isWallClockTimeout()
-              ? await finish('maxWallClockMs')
-              : await finish('aborted', undefined, 'hard');
-          }
-          // Cooperative-stop also honored mid-step: if
-          // the model returned multiple tool_uses and soft fired
-          // after the first one ran, don't keep executing the rest.
-          // Already-executed tools' results were appended to the
-          // message log via the prior iterations; the loop exits
-          // before the next provider call (which would have asked
-          // the model to react to a partial set, but the operator
-          // already cancelled the conversation). Symmetry with the
-          // top-of-loop soft check.
-          // Re-check via local assignment forces TS to re-narrow on
-          // every iteration — without this, the outer top-of-loop
-          // check would have narrowed `aborted` to false at this
-          // scope. The Set/get is on a live AbortSignal so the value
-          // genuinely changes between iterations.
-          const softAborted = config.softStopSignal?.aborted;
-          if (softAborted) {
-            return await finish('aborted', undefined, 'soft');
-          }
+        // Step-scoped helpers shared by serial and parallel paths.
+        // Lifted out of the per-tu loop so a step that emits N
+        // tool_uses doesn't reconstruct the spawnSubagent closure
+        // N times, and so the parallel path can dispatch through
+        // the same `invokeOne` worker the serial path uses.
 
-          // Degenerate-loop detection: hash this call and check the sliding
-          // window. We do this BEFORE invocation so we can refuse cheaply.
-          const h = hashToolCall(tu.name, tu.input);
-          recentToolHashes.push(h);
-          if (recentToolHashes.length > HASH_WINDOW) recentToolHashes.shift();
-          const repeats = recentToolHashes.filter((x) => x === h).length;
-          if (repeats >= budget.maxRepeatedToolHash) {
-            return await finish(
-              'degenerateLoop',
-              `tool ${tu.name} called ${repeats} times with identical args in last ${HASH_WINDOW} calls`,
-            );
-          }
-
-          // spawnSubagent closure: only wired when the caller supplied
-          // a subagent registry. The closure binds the *current*
-          // sessionId as the parent id at call time so a child knows
-          // exactly which session spawned it. Each `task` invocation
-          // produces a fresh child session row; recursion is allowed
-          // (a child can task() further children) because the child
-          // harness propagates the same registry down.
-          const spawnSubagentClosure:
-            | ((args: SpawnSubagentArgs) => Promise<SpawnSubagentResult>)
-            | undefined =
-            config.subagentRegistry === undefined
-              ? undefined
-              : async (args: SpawnSubagentArgs): Promise<SpawnSubagentResult> => {
-                  const registry = config.subagentRegistry;
-                  if (registry === undefined) {
-                    return {
-                      kind: 'unknown_subagent',
-                      requested: args.name,
-                      available: [],
-                    };
-                  }
-                  const def = registry.byName.get(args.name);
-                  if (def === undefined) {
-                    return {
-                      kind: 'unknown_subagent',
-                      requested: args.name,
-                      available: Array.from(registry.byName.keys()).sort(),
-                    };
-                  }
-                  // Depth check happens here (before runSubagent's
-                  // own throw) so the model gets a recoverable tool
-                  // error instead of a wrapped exception. The tool
-                  // surface distinguishes "you passed a bad name"
-                  // (unknown_subagent) from "you nested too deep"
-                  // (depth_exceeded) — both are model-fixable.
-                  const childDepth = (config.subagentDepth ?? 0) + 1;
-                  if (childDepth > MAX_SUBAGENT_DEPTH) {
-                    return {
-                      kind: 'depth_exceeded',
-                      requested: args.name,
-                      depth: childDepth,
-                      maxDepth: MAX_SUBAGENT_DEPTH,
-                    };
-                  }
-                  // Validate child's whitelist against the ROOT
-                  // registry (full toolset), NOT against this
-                  // harness's `toolRegistry` (which is narrowed to
-                  // OUR own whitelist when we're a subagent). A
-                  // coordinator subagent with `tools: [task]` must
-                  // still be able to spawn a worker with
-                  // `tools: [read_file]` even though it doesn't have
-                  // `read_file` itself.
-                  const rootRegistry = config.rootToolRegistry ?? config.toolRegistry;
-                  const child = await runSubagent({
-                    definition: def,
-                    prompt: args.prompt,
-                    parentSessionId: sessionId,
-                    provider: config.provider,
-                    parentToolRegistry: rootRegistry,
-                    permissionEngine: config.permissionEngine,
-                    db: config.db,
-                    cwd: config.cwd,
-                    // Live observability (S2 of subagent IPC).
-                    // Forward the parent's onEvent so subagent_*
-                    // HarnessEvents (start/progress/finished) flow
-                    // into the same channel the parent's TUI
-                    // adapter already listens on. The runtime
-                    // implies `ipc: true` automatically when
-                    // onChildEvent is set — without the wire there
-                    // are no progress events to observe between the
-                    // brackets.
-                    ...(config.onEvent !== undefined ? { onChildEvent: config.onEvent } : {}),
-                    // Hook-chain snapshot (migration 020). Always
-                    // forward the parent's resolved chain — even
-                    // when empty — so the child seals it into its
-                    // audit row instead of re-resolving from disk.
-                    // Empty `[]` is AUTHORITATIVE (parent had no
-                    // hooks); the previous `length > 0` gate
-                    // collapsed empty into the legacy disk-fallback
-                    // path, which let edits to `hooks.toml`
-                    // between spawn and child read add policy the
-                    // parent never validated — defeating the
-                    // migration's drift-prevention guarantee for
-                    // hookless parents (the case where any disk
-                    // hit is a NET ADDITION of policy).
-                    ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
-                    // Propagate combined parent signal: a Ctrl+C or
-                    // wall-clock timeout on the parent must abort
-                    // the child run too. The child builds its own
-                    // wall-clock on top of this.
-                    signal,
-                    // Forward the cooperative-stop signal —
-                    // runSubagent threads it across to the child via
-                    // IPC, so Esc-during-task routes to the child's
-                    // harness as `interrupt:soft` and the child exits
-                    // at its next step boundary.
-                    ...(config.softStopSignal !== undefined
-                      ? { softStopSignal: config.softStopSignal }
-                      : {}),
-                    // Forward the registry so the child can task()
-                    // further children. Same set, same names.
-                    subagentRegistry: registry,
-                    // Plan mode is a global property of the run; the
-                    // child inherits it so a write tool in its
-                    // whitelist still trips the harness gate inside
-                    // the child loop. Defense in depth — the parent's
-                    // gate already refused `task` itself in plan mode,
-                    // but a future bypass would still be contained.
-                    ...(config.planMode === true ? { planMode: true } : {}),
-                    // Trust verdict (spec §9): per-project, sealed
-                    // from the parent's bootstrap. Forwarding
-                    // unconditionally so the child runs under the
-                    // same verdict, instead of re-resolving (which
-                    // would fail-close on worktree paths and could
-                    // observe a stale verdict if the operator
-                    // updated trust mid-run). Default-false in
-                    // config maps cleanly to absent flag → child
-                    // defaults `isCwdTrusted=false`.
-                    ...(config.isCwdTrusted === true ? { cwdTrusted: true } : {}),
-                    // Sampling temperature is also a run-wide property.
-                    // The harness uses it for its own provider calls
-                    // (line ~594); subagent runs MUST inherit so that
-                    // eval / automation pipelines pinning
-                    // temperature=0 see deterministic behavior across
-                    // the entire chain. Without this forward, the
-                    // subprocess child would silently fall back to
-                    // the provider default and break reproducibility.
-                    ...(config.temperature !== undefined
-                      ? { temperature: config.temperature }
-                      : {}),
-                    // Increment depth: the child being spawned is one
-                    // level deeper than this run.
-                    depth: childDepth,
-                    // Permission proxy (spec docs/spec/IPC.md §7).
-                    // Forward only when the parent has a
-                    // `confirmPermission` callback wired (REPL
-                    // does; one-shot / headless do not). Without
-                    // an operator surface there's no human to
-                    // ask; the runtime auto-denies on absence so
-                    // the child's bridge gets a prompt deny
-                    // instead of hanging until wall-clock. The
-                    // adapter maps the boolean answer onto the
-                    // wire decision; subagent attribution is
-                    // baked in by the runtime, so the closure
-                    // doesn't need to thread sessionId / name
-                    // through itself. Local rebind so the
-                    // narrowed type survives across the async
-                    // closure (the outer `config.confirmPermission
-                    // !== undefined` guard wouldn't follow a
-                    // member access through the promise hop).
-                    ...((): {
-                      onPermissionAsk?: (req: {
-                        toolName: string;
-                        args: Record<string, unknown>;
-                        cwd: string;
-                        prompt: string;
-                        subagent: { sessionId: string; name: string };
-                        signal: AbortSignal;
-                      }) => Promise<PermissionDecision>;
-                    } => {
-                      const ask = config.confirmPermission;
-                      if (ask === undefined) return {};
-                      return {
-                        onPermissionAsk: async (req) => {
-                          const allowed = await ask({
-                            toolName: req.toolName,
-                            args: req.args,
-                            cwd: req.cwd,
-                            prompt: req.prompt,
-                            subagent: req.subagent,
-                            // Forward the per-session abort so
-                            // the modal closes when the child
-                            // dies — without this, an operator
-                            // staring at a modal for a dead
-                            // subagent would have to manually
-                            // dismiss it (and the answer would
-                            // go into a closed channel anyway).
-                            signal: req.signal,
-                          });
-                          return allowed ? 'allow' : 'deny';
-                        },
-                      };
-                    })(),
-                  });
+        // spawnSubagent closure: only wired when the caller supplied
+        // a subagent registry. The closure binds the *current*
+        // sessionId as the parent id at call time so a child knows
+        // exactly which session spawned it. Each `task` invocation
+        // produces a fresh child session row; recursion is allowed
+        // (a child can task() further children) because the child
+        // harness propagates the same registry down.
+        const spawnSubagentClosure:
+          | ((args: SpawnSubagentArgs) => Promise<SpawnSubagentResult>)
+          | undefined =
+          config.subagentRegistry === undefined
+            ? undefined
+            : async (args: SpawnSubagentArgs): Promise<SpawnSubagentResult> => {
+                const registry = config.subagentRegistry;
+                if (registry === undefined) {
                   return {
-                    kind: 'ran',
-                    output: child.output,
-                    sessionId: child.sessionId,
-                    status: child.status,
-                    reason: child.reason,
-                    costUsd: child.costUsd,
-                    steps: child.steps,
-                    durationMs: child.durationMs,
-                    ...(child.auditFailure !== undefined
-                      ? { auditFailure: child.auditFailure }
-                      : {}),
-                    ...(child.worktree !== undefined ? { worktree: child.worktree } : {}),
-                    ...(child.worktreeError !== undefined
-                      ? { worktreeError: child.worktreeError }
-                      : {}),
+                    kind: 'unknown_subagent',
+                    requested: args.name,
+                    available: [],
                   };
+                }
+                const def = registry.byName.get(args.name);
+                if (def === undefined) {
+                  return {
+                    kind: 'unknown_subagent',
+                    requested: args.name,
+                    available: Array.from(registry.byName.keys()).sort(),
+                  };
+                }
+                // Depth check happens here (before runSubagent's
+                // own throw) so the model gets a recoverable tool
+                // error instead of a wrapped exception. The tool
+                // surface distinguishes "you passed a bad name"
+                // (unknown_subagent) from "you nested too deep"
+                // (depth_exceeded) — both are model-fixable.
+                const childDepth = (config.subagentDepth ?? 0) + 1;
+                if (childDepth > MAX_SUBAGENT_DEPTH) {
+                  return {
+                    kind: 'depth_exceeded',
+                    requested: args.name,
+                    depth: childDepth,
+                    maxDepth: MAX_SUBAGENT_DEPTH,
+                  };
+                }
+                // Validate child's whitelist against the ROOT
+                // registry (full toolset), NOT against this
+                // harness's `toolRegistry` (which is narrowed to
+                // OUR own whitelist when we're a subagent). A
+                // coordinator subagent with `tools: [task]` must
+                // still be able to spawn a worker with
+                // `tools: [read_file]` even though it doesn't have
+                // `read_file` itself.
+                const rootRegistry = config.rootToolRegistry ?? config.toolRegistry;
+                const child = await runSubagent({
+                  definition: def,
+                  prompt: args.prompt,
+                  parentSessionId: sessionId,
+                  provider: config.provider,
+                  parentToolRegistry: rootRegistry,
+                  permissionEngine: config.permissionEngine,
+                  db: config.db,
+                  cwd: config.cwd,
+                  // Live observability (S2 of subagent IPC).
+                  // Forward the parent's onEvent so subagent_*
+                  // HarnessEvents (start/progress/finished) flow
+                  // into the same channel the parent's TUI
+                  // adapter already listens on. The runtime
+                  // implies `ipc: true` automatically when
+                  // onChildEvent is set — without the wire there
+                  // are no progress events to observe between the
+                  // brackets.
+                  ...(config.onEvent !== undefined ? { onChildEvent: config.onEvent } : {}),
+                  // Hook-chain snapshot (migration 020). Always
+                  // forward the parent's resolved chain — even
+                  // when empty — so the child seals it into its
+                  // audit row instead of re-resolving from disk.
+                  // Empty `[]` is AUTHORITATIVE (parent had no
+                  // hooks); the previous `length > 0` gate
+                  // collapsed empty into the legacy disk-fallback
+                  // path, which let edits to `hooks.toml`
+                  // between spawn and child read add policy the
+                  // parent never validated — defeating the
+                  // migration's drift-prevention guarantee for
+                  // hookless parents (the case where any disk
+                  // hit is a NET ADDITION of policy).
+                  ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
+                  // Propagate combined parent signal: a Ctrl+C or
+                  // wall-clock timeout on the parent must abort
+                  // the child run too. The child builds its own
+                  // wall-clock on top of this.
+                  signal,
+                  // Forward the cooperative-stop signal —
+                  // runSubagent threads it across to the child via
+                  // IPC, so Esc-during-task routes to the child's
+                  // harness as `interrupt:soft` and the child exits
+                  // at its next step boundary.
+                  ...(config.softStopSignal !== undefined
+                    ? { softStopSignal: config.softStopSignal }
+                    : {}),
+                  // Forward the registry so the child can task()
+                  // further children. Same set, same names.
+                  subagentRegistry: registry,
+                  // Plan mode is a global property of the run; the
+                  // child inherits it so a write tool in its
+                  // whitelist still trips the harness gate inside
+                  // the child loop. Defense in depth — the parent's
+                  // gate already refused `task` itself in plan mode,
+                  // but a future bypass would still be contained.
+                  ...(config.planMode === true ? { planMode: true } : {}),
+                  // Trust verdict (spec §9): per-project, sealed
+                  // from the parent's bootstrap. Forwarding
+                  // unconditionally so the child runs under the
+                  // same verdict, instead of re-resolving (which
+                  // would fail-close on worktree paths and could
+                  // observe a stale verdict if the operator
+                  // updated trust mid-run). Default-false in
+                  // config maps cleanly to absent flag → child
+                  // defaults `isCwdTrusted=false`.
+                  ...(config.isCwdTrusted === true ? { cwdTrusted: true } : {}),
+                  // Sampling temperature is also a run-wide property.
+                  // The harness uses it for its own provider calls
+                  // (line ~594); subagent runs MUST inherit so that
+                  // eval / automation pipelines pinning
+                  // temperature=0 see deterministic behavior across
+                  // the entire chain. Without this forward, the
+                  // subprocess child would silently fall back to
+                  // the provider default and break reproducibility.
+                  ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
+                  // Increment depth: the child being spawned is one
+                  // level deeper than this run.
+                  depth: childDepth,
+                  // Permission proxy (spec docs/spec/IPC.md §7).
+                  // Forward only when the parent has a
+                  // `confirmPermission` callback wired (REPL
+                  // does; one-shot / headless do not). Without
+                  // an operator surface there's no human to
+                  // ask; the runtime auto-denies on absence so
+                  // the child's bridge gets a prompt deny
+                  // instead of hanging until wall-clock. The
+                  // adapter maps the boolean answer onto the
+                  // wire decision; subagent attribution is
+                  // baked in by the runtime, so the closure
+                  // doesn't need to thread sessionId / name
+                  // through itself. Local rebind so the
+                  // narrowed type survives across the async
+                  // closure (the outer `config.confirmPermission
+                  // !== undefined` guard wouldn't follow a
+                  // member access through the promise hop).
+                  ...((): {
+                    onPermissionAsk?: (req: {
+                      toolName: string;
+                      args: Record<string, unknown>;
+                      cwd: string;
+                      prompt: string;
+                      subagent: { sessionId: string; name: string };
+                      signal: AbortSignal;
+                    }) => Promise<PermissionDecision>;
+                  } => {
+                    const ask = config.confirmPermission;
+                    if (ask === undefined) return {};
+                    return {
+                      onPermissionAsk: async (req) => {
+                        const allowed = await ask({
+                          toolName: req.toolName,
+                          args: req.args,
+                          cwd: req.cwd,
+                          prompt: req.prompt,
+                          subagent: req.subagent,
+                          // Forward the per-session abort so
+                          // the modal closes when the child
+                          // dies — without this, an operator
+                          // staring at a modal for a dead
+                          // subagent would have to manually
+                          // dismiss it (and the answer would
+                          // go into a closed channel anyway).
+                          signal: req.signal,
+                        });
+                        return allowed ? 'allow' : 'deny';
+                      },
+                    };
+                  })(),
+                });
+                return {
+                  kind: 'ran',
+                  output: child.output,
+                  sessionId: child.sessionId,
+                  status: child.status,
+                  reason: child.reason,
+                  costUsd: child.costUsd,
+                  steps: child.steps,
+                  durationMs: child.durationMs,
+                  ...(child.auditFailure !== undefined ? { auditFailure: child.auditFailure } : {}),
+                  ...(child.worktree !== undefined ? { worktree: child.worktree } : {}),
+                  ...(child.worktreeError !== undefined
+                    ? { worktreeError: child.worktreeError }
+                    : {}),
                 };
+              };
 
-          const ctx: ToolContext = {
-            signal,
-            cwd: config.cwd,
-            sessionId,
-            stepId: assistantMsg.id,
-            permissions: config.permissionEngine.view(),
-            permissionCheck: (toolName, category, args) =>
-              config.permissionEngine.check(toolName, category, args),
-            todoStore,
-            ...(bgManager !== undefined ? { bgManager } : {}),
-            ...(spawnSubagentClosure !== undefined ? { spawnSubagent: spawnSubagentClosure } : {}),
-            ...(config.memoryRegistry !== undefined
-              ? { memoryRegistry: config.memoryRegistry }
-              : {}),
-            ...(config.confirmMemoryWrite !== undefined
-              ? { confirmMemoryWrite: config.confirmMemoryWrite }
-              : {}),
-            ...(config.confirmMemoryUserScope !== undefined
-              ? { confirmMemoryUserScope: config.confirmMemoryUserScope }
-              : {}),
-            // Trust state — required on ToolContext, optional on
-            // HarnessConfig. Default-false at the harness layer is
-            // the fail-closed answer when bootstrap (or a test
-            // harness) didn't supply one.
-            isCwdTrusted: config.isCwdTrusted ?? false,
-            // Operator-facing warn channel. Closure captures the
-            // current tool call's id + name so the adapter can
-            // attribute the warning to the right invocation.
-            // Always wired — tools that don't use it just don't
-            // call it. Optional in ToolContext for headless / SDK
-            // contexts that don't construct via the harness; here
-            // we always set it because we know the onEvent sink.
-            emitWarn: (message: string) =>
-              safeEmit(config.onEvent, {
-                type: 'tool_warning',
-                toolUseId: tu.id,
-                toolName: tu.name,
-                message,
-              }),
-            // Hook chain — bound to the same dispatcher invoke-tool
-            // already uses. Tools fire blocking events (today only
-            // memory_write fires MemoryWrite); chain failure is
-            // null-returned so tools fail-open per spec line 1057.
-            fireHook: dispatchHooks,
-          };
+        const buildCtx = (tu: CollectedToolUse): ToolContext => ({
+          signal,
+          cwd: config.cwd,
+          sessionId,
+          stepId: assistantMsg.id,
+          permissions: config.permissionEngine.view(),
+          permissionCheck: (toolName, category, args) =>
+            config.permissionEngine.check(toolName, category, args),
+          todoStore,
+          ...(bgManager !== undefined ? { bgManager } : {}),
+          ...(spawnSubagentClosure !== undefined ? { spawnSubagent: spawnSubagentClosure } : {}),
+          ...(config.memoryRegistry !== undefined ? { memoryRegistry: config.memoryRegistry } : {}),
+          ...(config.confirmMemoryWrite !== undefined
+            ? { confirmMemoryWrite: config.confirmMemoryWrite }
+            : {}),
+          ...(config.confirmMemoryUserScope !== undefined
+            ? { confirmMemoryUserScope: config.confirmMemoryUserScope }
+            : {}),
+          // Trust state — required on ToolContext, optional on
+          // HarnessConfig. Default-false at the harness layer is
+          // the fail-closed answer when bootstrap (or a test
+          // harness) didn't supply one.
+          isCwdTrusted: config.isCwdTrusted ?? false,
+          // Operator-facing warn channel. Closure captures the
+          // current tool call's id + name so the adapter can
+          // attribute the warning to the right invocation.
+          // Always wired — tools that don't use it just don't
+          // call it. Optional in ToolContext for headless / SDK
+          // contexts that don't construct via the harness; here
+          // we always set it because we know the onEvent sink.
+          emitWarn: (message: string) =>
+            safeEmit(config.onEvent, {
+              type: 'tool_warning',
+              toolUseId: tu.id,
+              toolName: tu.name,
+              message,
+            }),
+          // Hook chain — bound to the same dispatcher invoke-tool
+          // already uses. Tools fire blocking events (today only
+          // memory_write fires MemoryWrite); chain failure is
+          // null-returned so tools fail-open per spec line 1057.
+          fireHook: dispatchHooks,
+        });
 
+        // Per-tu worker. Emits tool_invoking, dispatches through
+        // invokeTool (permission check + checkpoint hook + tool
+        // exec + audit), then emits tool_decided / tool_finished.
+        // Returns a shape rich enough for the post-batch
+        // consecutive-error replay plus the tool_result the
+        // harness must persist.
+        const invokeOne = async (
+          tu: CollectedToolUse,
+        ): Promise<{ toolResult: ProviderToolResultBlock; failed: boolean }> => {
           safeEmit(config.onEvent, {
             type: 'tool_invoking',
             toolUseId: tu.id,
             toolName: tu.name,
             args: tu.input,
           });
-
           const inv = await invokeTool(
             {
               toolUseId: tu.id,
@@ -1385,7 +1386,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               db: config.db,
               registry: config.toolRegistry,
               engine: config.permissionEngine,
-              ctx,
+              ctx: buildCtx(tu),
               ...(config.planMode === true ? { planMode: true } : {}),
               ...(config.confirmPermission !== undefined
                 ? { confirmPermission: config.confirmPermission }
@@ -1394,7 +1395,6 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               signal,
             },
           );
-
           if (inv.decision !== null) {
             safeEmit(config.onEvent, {
               type: 'tool_decided',
@@ -1410,20 +1410,132 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             durationMs: inv.durationMs,
             ...(inv.denied === true ? { denied: true } : {}),
           });
+          return { toolResult: inv.toolResult, failed: inv.failed };
+        };
 
-          toolResults.push(inv.toolResult);
-          if (inv.failed) {
-            consecutiveErrors += 1;
-          } else {
-            consecutiveErrors = 0;
+        // Pre-batch abort gate. Both paths defer to the same check
+        // up here — without this, a hard abort or a soft cooperative
+        // stop landing between the provider call and the dispatch
+        // could still kick off tool work the harness was asked not
+        // to do. Wall-clock-vs-user-abort distinction matches the
+        // top-of-loop check (without it a wall-clock timeout
+        // landing here would get misreported as a user abort).
+        if (signal.aborted) {
+          return isWallClockTimeout()
+            ? await finish('maxWallClockMs')
+            : await finish('aborted', undefined, 'hard');
+        }
+        if (config.softStopSignal?.aborted === true) {
+          return await finish('aborted', undefined, 'soft');
+        }
+
+        // Pre-batch degenerate-loop check (spec ORCHESTRATION.md
+        // §1.6: "we do this BEFORE invocation so we can refuse
+        // cheaply"). Iterates in tool_use order so the bail
+        // message names the FIRST tu whose hash trips the cap,
+        // mirroring the audit-friendly behavior the per-tu serial
+        // path used to give. Fail-fast: as soon as one tu repeats
+        // `maxRepeatedToolHash` times in the sliding window, the
+        // entire step is refused — no tool runs.
+        for (const tu of collected.tool_uses) {
+          const h = hashToolCall(tu.name, tu.input);
+          recentToolHashes.push(h);
+          if (recentToolHashes.length > HASH_WINDOW) recentToolHashes.shift();
+          const repeats = recentToolHashes.filter((x) => x === h).length;
+          if (repeats >= budget.maxRepeatedToolHash) {
+            return await finish(
+              'degenerateLoop',
+              `tool ${tu.name} called ${repeats} times with identical args in last ${HASH_WINDOW} calls`,
+            );
           }
+        }
 
-          if (consecutiveErrors >= budget.maxToolErrors) {
-            // Persist the partial tool_result message before bailing so the
-            // session history reflects what actually happened. Mirror it in
-            // the in-memory `messages` array for symmetry with the normal
-            // path; nothing reads it post-bail today, but a future refactor
-            // that does (resume, replay) gets a consistent view.
+        // Decide between the parallel and serial paths. Spec
+        // ORCHESTRATION.md §1.3: every tool_use in the step must
+        // carry `metadata.parallel_safe === true` for the harness
+        // to dispatch in parallel. A single non-flagged tool
+        // collapses the entire batch back to serial — mixing
+        // modes inside one step would force the harness to pick
+        // which order writes happen in vs. which reads can race,
+        // and the simpler "all-or-nothing" invariant keeps
+        // tool_result ordering deterministic for the model and
+        // the audit log.
+        //
+        // The cap clamp matches `MAX_CONCURRENT_TOOL_CALLS_CAP`.
+        // Operators can lower the budget to 1 to force serial
+        // for a run without changing tool metadata.
+        const parallelCap = Math.max(
+          1,
+          Math.min(budget.maxConcurrentToolCalls, MAX_CONCURRENT_TOOL_CALLS_CAP),
+        );
+        const allParallelSafe =
+          collected.tool_uses.length >= 2 &&
+          parallelCap >= 2 &&
+          collected.tool_uses.every((tu) => {
+            const tool = config.toolRegistry.get(tu.name);
+            return tool !== null && tool.metadata.parallel_safe === true;
+          });
+
+        const toolResults: ProviderToolResultBlock[] = [];
+
+        if (allParallelSafe) {
+          // Parallel path. Spec ORCHESTRATION.md §1.3.
+          //
+          // - All N tool_uses dispatch through `runPool` with a
+          //   worker count clamped at `parallelCap`. Result
+          //   indices preserve the original order so the
+          //   tool_result blocks land in the shape Anthropic /
+          //   OpenAI / Gemini all expect (tool_result blocks
+          //   paired index-aligned with the assistant's tool_use
+          //   blocks for that turn).
+          // - Tool failures DO NOT cancel siblings (§1.3
+          //   "falha de A não cancela B"). The pool waits for
+          //   every worker to settle, then we fold the results.
+          // - `consecutiveErrors` is replayed in original
+          //   tool_use order AFTER the batch settles. This
+          //   preserves the "5 consecutive failures" semantics:
+          //   if A,B,C all fail in one parallel batch and the
+          //   prior step ended at 2 failures, the counter is now
+          //   5 (audit + replay match the serial path that would
+          //   have executed A,B,C in sequence). The early-bail
+          //   point is the index where the counter first crosses
+          //   `maxToolErrors`; tool_results are truncated there
+          //   so the persisted message reflects "we took action,
+          //   then bailed" — same audit shape as serial.
+          // - Aborts mid-batch: workers honor `ctx.signal` so a
+          //   hard abort routes individual invokeTool calls to
+          //   ToolError `aborted`. The pool still settles all
+          //   workers (they return quickly via their own abort
+          //   branch); the next top-of-step abort check exits
+          //   with `aborted` / `maxWallClockMs`. This matches
+          //   the "complete the current step" semantics the spec
+          //   calls for, both for soft and hard cancel given
+          //   that the parallel pool is tightly bounded.
+          const outcomes = await runPool(collected.tool_uses, parallelCap, invokeOne);
+          let bailIndex = -1;
+          for (const [i, o] of outcomes.entries()) {
+            toolResults.push(o.toolResult);
+            if (o.failed) {
+              consecutiveErrors += 1;
+            } else {
+              consecutiveErrors = 0;
+            }
+            if (consecutiveErrors >= budget.maxToolErrors) {
+              bailIndex = i;
+              break;
+            }
+          }
+          if (bailIndex !== -1) {
+            // Mirror the serial-path partial persist: the message
+            // we land in audit reflects only the tool_results up
+            // to (and including) the call that pushed the counter
+            // over the cap. The parallel batch DID execute every
+            // sibling — we cannot un-run them — but persisting
+            // their results past the bail point would mislead a
+            // future replay into thinking the harness kept going
+            // past `maxToolErrors`. Trimming makes audit
+            // consistent with what serial would have shown.
+            toolResults.length = bailIndex + 1;
             const partialMsg = appendMessage(config.db, {
               sessionId,
               role: 'user',
@@ -1433,6 +1545,55 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             lastMessageId = partialMsg.id;
             messages.push({ role: 'user', content: toolResults });
             return await finish('maxToolErrors', `${consecutiveErrors} consecutive tool errors`);
+          }
+        } else {
+          // Serial path — historical behavior. Sibling iterations
+          // honor signal / softStop between calls so a Ctrl+C
+          // lands as soon as the in-flight tool returns instead
+          // of after the last tu of the step.
+          for (const tu of collected.tool_uses) {
+            if (signal.aborted) {
+              return isWallClockTimeout()
+                ? await finish('maxWallClockMs')
+                : await finish('aborted', undefined, 'hard');
+            }
+            // Re-check via local assignment forces TS to re-narrow
+            // on every iteration — without this, the outer
+            // top-of-step soft check would have narrowed the
+            // value at this scope. The `: boolean` annotation
+            // breaks TS's narrowing of the optional chain even
+            // though the runtime read is fresh; the chained
+            // `?? false` collapses the optional-chain undefined
+            // to false at the type level.
+            const softAborted: boolean = config.softStopSignal?.aborted ?? false;
+            if (softAborted) {
+              return await finish('aborted', undefined, 'soft');
+            }
+            const inv = await invokeOne(tu);
+            toolResults.push(inv.toolResult);
+            if (inv.failed) {
+              consecutiveErrors += 1;
+            } else {
+              consecutiveErrors = 0;
+            }
+            if (consecutiveErrors >= budget.maxToolErrors) {
+              // Persist the partial tool_result message before
+              // bailing so the session history reflects what
+              // actually happened. Mirror it in the in-memory
+              // `messages` array for symmetry with the normal
+              // path; nothing reads it post-bail today, but a
+              // future refactor that does (resume, replay) gets
+              // a consistent view.
+              const partialMsg = appendMessage(config.db, {
+                sessionId,
+                role: 'user',
+                parentId: lastMessageId,
+                content: toolResults,
+              });
+              lastMessageId = partialMsg.id;
+              messages.push({ role: 'user', content: toolResults });
+              return await finish('maxToolErrors', `${consecutiveErrors} consecutive tool errors`);
+            }
           }
         }
 

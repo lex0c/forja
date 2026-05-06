@@ -15,6 +15,131 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — `parallel_safe` opt-in + parallel branch in step loop (kickoff)
+
+New branch `feat/parallel` off `develop`. Closes the gap between
+spec `ORCHESTRATION.md §1.3` ("opt-in paralelismo: tool definition
+pode declarar `parallel_safe: true`; se todos tool_use no mesmo
+step são `parallel_safe`, harness roda em paralelo") and the
+current code: today `src/harness/loop.ts:1080` iterates
+`for (const tu of collected.tool_uses) { await invokeTool(...) }`
+— every tool_use serializes regardless of side-effect class. A
+turn that emits 3 `read_file` calls pays 3× latency for I/O that
+has zero ordering constraints.
+
+**Plan (this branch covers slice 1; `task_async` follows on the same branch as slice 2):**
+
+1. **Slice 1 — `parallel_safe`:**
+   - Add `parallel_safe?: boolean` to `ToolMetadata` (default false). Mark
+     read-only tools: `read_file`, `grep`, `glob`, `memory_read`,
+     `memory_search`, `memory_list`, `bash_output`. `bash` stays
+     unflagged: its `read_only` is a runtime arg, not a static
+     property; `parallel_safe` is static metadata. Conservative.
+   - Add `maxConcurrentToolCalls` to `RunBudget` (default 5, cap 16
+     per `ORCHESTRATION.md §11`).
+   - Loop branch: when `tool_uses.length >= 2` AND every tool's
+     `parallel_safe === true`, dispatch through a bounded pool;
+     otherwise fall through to today's serial path. Tool_results
+     preserved in the original `tool_uses` order (Anthropic ordering
+     contract). PreToolUse hooks + permission engine still fire
+     per-tool (concurrent — invoke-tool internals already gate each
+     call).
+   - Hash-window degenerate-loop check runs UP-FRONT before the
+     parallel dispatch so the cheap refusal still happens; we want
+     "3 identical reads in 5 steps" to be caught even when those
+     reads now overlap in wall-clock.
+   - `consecutiveErrors` re-evaluated AFTER the batch. The "5
+     consecutive" intent stays operator-meaningful: a parallel batch
+     of N failures collapses to N consecutive errors (no
+     intervening successes), same audit shape as serial.
+
+2. **Slice 2 — `task_async` / `task_await` / `task_cancel`:**
+   spec `ORCHESTRATION.md §3` and `CONTRACTS.md §2.6.4`. Pool global
+   `max_concurrent_subagents = 3` (cap 8). Budget shared, not
+   pre-allocated. Cancel cascading. Will land on this branch after
+   slice 1 closes.
+
+**Decisions (kickoff):**
+
+- **`bash` excluded from `parallel_safe`** even though `read_only=true` arg
+  exists. Static metadata vs runtime declaration: the spec phrasing
+  ("read-only tools devem declarar true") refers to tools that are
+  always read-only by construction. `bash --read_only` is a hint, and
+  the spec explicitly notes (§9.1) it's not a security boundary —
+  letting it gate parallelism would let an adversarial / confused
+  model amplify a race by lying. Cheap to revisit later if a
+  `bash_readonly` family emerges.
+- **`todo_write` excluded** even though it's a small in-memory
+  mutation. Two parallel `todo_write` calls in one step would race
+  on the session-bound `TodoStore`; the spec keeps the door open
+  for this but no model surfaces benefit yet — keep it serial.
+- **`task` (sync) excluded.** Already a synchronous spawn that bridges
+  IPC + permission proxy + worktree GC; parallel `task` is
+  `task_async` — slice 2.
+- **Pool, not naive `Promise.all`.** With cap 5 and a step that
+  emits 7 reads, naive `Promise.all` would issue all 7 concurrently
+  and exceed `maxConcurrentToolCalls`. The spec calls out the cap
+  as load-bearing (§11) — implementation honors it via a counted
+  semaphore.
+
+**Pending — slice 1:**
+
+- Schema change in `src/tools/types.ts` + `src/harness/types.ts`.
+- Tool metadata flips on the 7 read-only tools.
+- Loop branch in `src/harness/loop.ts:1080` — refactor the
+  `for (const tu of collected.tool_uses)` block to two paths.
+- Tests under `tests/harness/`: parallel happy path, mixed-flag
+  fallback, order preservation, sibling-failure independence,
+  consecutiveErrors after batch, abort mid-flight, cap enforcement,
+  hash-window detection still fires.
+- Eval smoke covering "3 reads in one turn" (planned in
+  `BACKLOG.md` line 9195 — eval 34).
+
+**Next:** slice 1 implementation, then closeout entry, then slice 2
+(`task_async`).
+
+---
+
+## [2026-05-06] parallel / slice 1 — `parallel_safe` opt-in lands
+
+Slice 1 closed on `feat/parallel`. The step loop now opts into a
+bounded-concurrency pool when every `tool_use` in the assistant
+turn declares `parallel_safe: true`; mixed batches and single
+calls keep the historical serial path. No behavior change for
+existing tools — `parallel_safe` defaults false, opt-in at the
+metadata layer keeps the surface tight.
+
+**Files:**
+
+| File | Change |
+|---|---|
+| `src/tools/types.ts` | `ToolMetadata` gains optional `parallel_safe?: boolean`. Long-form comment documents (a) the all-or-nothing batch invariant, (b) why `bash` is intentionally excluded despite `args.read_only`, and (c) the "writes / mutable session state / requires confirm" exclusion list. Default false. |
+| `src/harness/types.ts` | `RunBudget` gains required `maxConcurrentToolCalls: number` (default 5). New exported constant `MAX_CONCURRENT_TOOL_CALLS_CAP = 16` mirrors `ORCHESTRATION.md §11`. The clamp lives at the consumer in `loop.ts` so the operator-level error surface stays "your config was clamped" rather than rejecting at boot. |
+| `src/harness/loop.ts` | New module-private `runPool<I, T>(items, cap, worker)` runner: spawns N workers that pull off a shared cursor, populates results in original index order. Refactored the in-step tool dispatch: lifted `spawnSubagentClosure`, `buildCtx(tu)`, and `invokeOne(tu)` out of the per-tu `for` so both paths share one worker. Added pre-batch abort gate (signal + softStopSignal) and pre-batch degenerate-loop hash precheck. Branch decision: `tool_uses.length >= 2 && parallelCap >= 2 && every(tool.metadata.parallel_safe === true)`. Parallel path runs `runPool`, then folds outcomes in original order to apply `consecutiveErrors` and pick the bail index; truncates `toolResults` so audit shape matches the serial path. Serial path otherwise unchanged. |
+| `src/tools/builtin/read-file.ts` | `parallel_safe: true`. |
+| `src/tools/builtin/grep.ts` | `parallel_safe: true`. |
+| `src/tools/builtin/glob.ts` | `parallel_safe: true`. |
+| `src/tools/builtin/memory-list.ts` | `parallel_safe: true`. |
+| `src/tools/builtin/memory-read.ts` | `parallel_safe: true`. |
+| `src/tools/builtin/memory-search.ts` | `parallel_safe: true`. |
+| `tests/harness/parallel.test.ts` | New file, 11 tests: parallel happy path with wall-clock proof, mixed-flag fallback, order preservation across asymmetric latencies, sibling-failure independence, consecutive-error bail mid-batch, hard-abort propagation, cap=2 enforcement on a 5-tu batch, degenerate-loop precheck (zero work landed), cap=1 forces serial, single-tu never enters parallel branch, one tool_invoking + tool_finished event per call. |
+
+**Decisions (closeout):**
+
+- **D156 — `bash_output` excluded from `parallel_safe` despite being read-only.** The tool's own metadata flags `idempotent: false` because reading without `since` advances the per-process cursor inside `BgManager`. Two parallel `bash_output` calls on the same `process_id` would race on cursor state and produce interleaved or dropped output. The static `parallel_safe` flag is a per-tool guarantee; runtime arg-shape ("you only paralleled distinct process_ids") cannot back that guarantee. If the model ever benefits from parallel reads on different bg processes, the right shape is a future `bash_output_batch` tool that takes a list of `process_id`s and serializes per-pid internally. Cheap to revisit.
+- **D157 — Pre-batch degenerate-loop check now applies to both paths.** The serial path used to hash + check per-tu inside the `for`; the new pre-batch loop iterates every `tu` and bails on the first one whose hash trips `maxRepeatedToolHash`. Observable change: if the **first** tu of a step would have run before the **second** tripped the cap (a window edge case), the pre-batch loop now refuses without running the first tu. This is strictly more conservative — fail-fast on a step we've already classified as degenerate. Existing test (`degenerate loop: identical tool calls are caught`) still passes; the new pre-batch behavior is exercised by `degenerate-loop check fires pre-batch even when all parallel_safe`.
+- **D158 — `consecutiveErrors` replayed in tool_use order after the parallel batch.** The pool waits for every worker to settle so we can't bail mid-flight. The replay mirrors what the serial path would have produced: increment-on-failure, reset-on-success, bail at the first index where the counter crosses `maxToolErrors`. Tool_results are truncated to that index so audit + replay see the same shape regardless of which path produced the message.
+- **D159 — `runPool` takes the items array, not a `count + index → item`.** The earlier draft was `runPool(count, cap, worker_by_index)` and pushed bounds checking onto the caller. Switching to `runPool(items, cap, worker)` lets `noUncheckedIndexedAccess` be satisfied with one `as I` inside the runner (right after `i < items.length`) instead of leaking the bounds concern into every call site. Same shape we've used elsewhere (e.g., the validators array in `subagents/`).
+- **D160 — The serial path's per-iteration soft check uses `: boolean` annotation.** Without the annotation, TS narrows `config.softStopSignal?.aborted` after the top-of-step soft check and rejects the comparison at the per-iteration check (`'false | undefined' has no overlap with 'true'`). Annotating `const softAborted: boolean = config.softStopSignal?.aborted ?? false` forces TS to re-widen — the runtime read IS a fresh `.aborted` lookup on a live AbortSignal, so the narrowing was incorrect at the type level.
+
+**Pending — moves to slice 2:** `task_async` / `task_await` /
+`task_cancel` family. Same branch.
+
+**Next:** spec-side review of the `task_async` slice (re-read
+`ORCHESTRATION.md §3` + `CONTRACTS.md §2.6.4`), then implementation.
+
+---
+
 ## [2026-05-05] M3 / impl — subagent permission proxy (slices 1–3)
 
 New branch `feat/m3-subagent-permission-proxy` off `develop`. Closes

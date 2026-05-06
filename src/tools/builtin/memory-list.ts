@@ -77,6 +77,7 @@ export const memoryListTool: Tool<MemoryListInput, MemoryListOutput> = {
     writes: false,
     idempotent: true,
     planSafe: true,
+    parallel_safe: true,
     display: 'list',
     cost: { latency_ms_typical: 0 },
   },

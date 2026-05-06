@@ -91,6 +91,33 @@ export interface ToolMetadata {
   // opts in today.
   requiresOperatorConfirm?: boolean;
   idempotent: boolean;
+  // Opt-in to parallel execution within a step (spec
+  // ORCHESTRATION.md §1.3). When EVERY tool_use the model emits in
+  // a single step has `parallel_safe === true`, the harness
+  // dispatches them through a bounded pool instead of the default
+  // serial loop. A single non-`parallel_safe` tool_use in the
+  // batch falls back to fully-serial execution (no partial
+  // parallelism — keeps invariants simple and order deterministic).
+  //
+  // Only declare `true` for tools whose execution is naturally
+  // independent of OTHER concurrent tool calls in the same
+  // process: read-only filesystem reads, in-memory lookups against
+  // immutable state, lexical/grep searches. Tools with
+  // `writes: true` MUST NOT declare it (FS race). Tools that
+  // touch session-bound mutable state (todo store, bg manager
+  // state machine, IPC channels) MUST NOT declare it. Tools that
+  // require operator confirmation MUST NOT declare it (modal
+  // serialization is per-modal-manager, not per-tool).
+  //
+  // `bash` is intentionally NOT flagged even though `args.read_only`
+  // exists: the flag is a model declaration, not a static property,
+  // and spec §9.1 documents it's not a security boundary. Letting a
+  // runtime hint gate parallelism would let an adversarial model
+  // amplify a race.
+  //
+  // Default false is the safe choice — opt-in keeps every existing
+  // tool serial until it's been audited for parallel safety.
+  parallel_safe?: boolean;
   display?: DisplayHint;
   // Optional cost hints; informational only in M1.
   cost?: {

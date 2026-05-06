@@ -240,6 +240,21 @@ export interface RunBudget {
   // + totalCostUsd is what the cap compares against, NOT just the
   // per-run total).
   maxCostUsd?: number;
+  // Maximum number of tool calls the harness will dispatch in
+  // parallel within a single step. Only active when EVERY
+  // `tool_use` in the step has `metadata.parallel_safe === true`
+  // (mixed batches fall back to fully-serial). Default 5 mirrors
+  // `ORCHESTRATION.md §11` ("Tool calls em flight (DAG): 5
+  // default / 16 hard cap"). The same matrix governs the DAG
+  // executor, but the step loop and the DAG executor share the
+  // cap because they share the underlying invoke-tool pipeline
+  // — no reason to have two budgets for the same physical
+  // resource.
+  //
+  // Setting `1` effectively disables parallelism (keeps the
+  // serial path live for every step). The harness clamps to
+  // [1, 16] internally.
+  maxConcurrentToolCalls: number;
 }
 
 export const DEFAULT_BUDGET: RunBudget = {
@@ -250,7 +265,14 @@ export const DEFAULT_BUDGET: RunBudget = {
   maxOutputTokensPerCall: 4096,
   compactionThreshold: 0.7,
   compactionPreserveTail: 3,
+  maxConcurrentToolCalls: 5,
 };
+
+// Hard cap for the parallel pool — even an explicit caller config of
+// `maxConcurrentToolCalls: 100` is clamped to this to bound resource
+// pressure (file descriptors, SQLite WAL writers, hook chain fanout).
+// Mirrors `ORCHESTRATION.md §11`.
+export const MAX_CONCURRENT_TOOL_CALLS_CAP = 16;
 
 // Why the loop stopped. `done` is the only success path; everything else
 // is the harness intervening for safety or budget reasons.
