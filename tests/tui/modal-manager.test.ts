@@ -787,6 +787,70 @@ describe('close', () => {
     expect(s.fs.size()).toBe(0);
     expect(s.manager.pendingCount()).toBe(0);
   });
+
+  test('close() detaches abort listeners on every drained pending', async () => {
+    // Regression guard. close() resolves promises directly
+    // instead of routing through resolveActive / cancelPending,
+    // so every pending entry's signal listener (if any) needs
+    // explicit detach in the drain loop. Without this, a
+    // long-lived caller closing the manager while sharing one
+    // AbortSignal across N pending asks (subagent permission
+    // proxy) would leave N stale closures attached until the
+    // signal eventually aborts.
+    //
+    // Setup: 3 asks (1 active + 2 queued), all sharing one
+    // signal. Track add/remove via Proxy. After close: every
+    // listener detached → addCount === removeCount.
+    const s = make();
+    const ac = new AbortController();
+    let addCount = 0;
+    let removeCount = 0;
+    const trackedSignal = new Proxy(ac.signal, {
+      get(target, prop) {
+        if (prop === 'addEventListener') {
+          return (
+            type: string,
+            listener: EventListener,
+            options?: AddEventListenerOptions | boolean,
+          ): void => {
+            if (type === 'abort') addCount += 1;
+            target.addEventListener(type, listener, options);
+          };
+        }
+        if (prop === 'removeEventListener') {
+          return (
+            type: string,
+            listener: EventListener,
+            options?: EventListenerOptions | boolean,
+          ): void => {
+            if (type === 'abort') removeCount += 1;
+            target.removeEventListener(type, listener, options);
+          };
+        }
+        const v = Reflect.get(target, prop, target);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    });
+
+    const promises: Promise<unknown>[] = [];
+    for (let i = 0; i < 3; i++) {
+      promises.push(
+        s.manager.askPermission(
+          { toolName: 'b', command: `c${i}`, cwd: '/' },
+          { signal: trackedSignal },
+        ),
+      );
+    }
+    expect(addCount).toBe(3);
+    expect(removeCount).toBe(0);
+
+    s.manager.close();
+    await Promise.all(promises);
+
+    // Pre-fix: removeCount=0 — listeners survived close. Post-fix:
+    // removeCount=3 — drain loop detached every one.
+    expect(removeCount).toBe(3);
+  });
 });
 
 describe('askMemoryWrite (memory:write:ask producer)', () => {

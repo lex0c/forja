@@ -681,6 +681,19 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
       drainList.push(...queue.splice(0));
       for (const p of drainList) {
         if (p.timeout !== null && p.timeout !== undefined) clearTimer(p.timeout);
+        // Detach the producer-signal abort listener (if any) for
+        // every drained pending. close() resolves the promises
+        // directly instead of routing through resolveActive /
+        // cancelPending, so neither of those cleanup callsites
+        // runs here. Without this loop, a long-lived caller that
+        // closes the manager while sharing one AbortSignal across
+        // many pending asks (subagent permission proxy) would
+        // leave N stale closures attached to the signal —
+        // retained until the signal eventually aborts, then
+        // firing as a useless O(n) burst. detachAbortListener is
+        // optional (only set when the ask supplied a signal), so
+        // the optional-chain call is safe for asks that didn't.
+        p.detachAbortListener?.();
         p.resolve('cancel');
       }
     },
