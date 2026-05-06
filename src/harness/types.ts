@@ -201,6 +201,22 @@ export type HarnessEvent =
       durationMs: number;
       costUsd: number;
     }
+  | {
+      // Per-turn cost delta, emitted right after the harness
+      // appends a provider call's usage to its `totalCostUsd`
+      // counter. Producer is the harness loop (loop.ts). The
+      // event flows over IPC for subagent runs so the parent
+      // can track in-flight child spend in real time and enforce
+      // the shared `maxCostUsd` cap (spec ORCHESTRATION.md
+      // §3.5). `delta` is the cost of the latest turn alone
+      // (compaction calls also fire this event with their own
+      // delta); `cumulative` is the running self-cost of THIS
+      // session (does NOT include prior-run cost; the parent
+      // already tracks `priorCostUsd` separately).
+      type: 'cost_update';
+      delta: number;
+      cumulative: number;
+    }
   | { type: 'session_finished'; result: HarnessResult };
 
 // Budget caps for an autonomous run. Per AGENTIC_CLI §5: every limit has

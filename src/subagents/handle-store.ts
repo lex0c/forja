@@ -117,10 +117,28 @@ export interface SubagentHandleStore {
   // Cancel all running records and await every record's
   // promise. Idempotent. Used by the harness's outer finally.
   drain(): Promise<void>;
-  // Sum of `estimateCostUsd` for handles currently in
-  // status='running'. The pessimistic reservation against the
-  // run's cost cap. Drops to 0 once every handle is settled.
-  // Used by `task_async`'s pre-spawn budget check.
+  // Cancel every running record without awaiting (synchronous).
+  // Used by the cost-cap watchdog when the live total crosses
+  // the run's cap mid-flight (spec ORCHESTRATION.md §3.5):
+  // active children get the abort signal immediately so they
+  // tear down gracefully via their next IPC interrupt boundary.
+  // Idempotent; rows already settled are skipped.
+  cancelAll(): void;
+  // Record a live cost-update from the child via IPC. Called
+  // by the harness's onChildEvent forwarder after a
+  // `cost_update` HarnessEvent lands. `cumulative` is the
+  // child's running self-cost (NOT a delta). The store stores
+  // it on the matching record and the next
+  // `getReservedChildCostUsd` reflects it. No-op on unknown
+  // handles or already-settled records.
+  recordLiveCost(handleId: string, cumulative: number): void;
+  // Reservation against the run's cost cap, in USD. Returns
+  // `sum(max(estimate, live))` over every running record. The
+  // `max` keeps the floor pessimistic until the child reports
+  // its first `cost_update`; once `live > estimate` the
+  // reservation grows with the actual spend (covers the rare
+  // case of a child overshooting its declared budget).
+  // Drops to 0 once every handle is settled.
   getReservedChildCostUsd(): number;
   // Sum of `costUsd` from settled children's envelopes
   // (`SpawnSubagentResult.kind === 'ran'` branch only). Climbs
@@ -137,10 +155,17 @@ export interface CreateSubagentHandleStoreOptions {
   cap: number;
   // Spawner that knows how to call `runSubagent` with the run's
   // wired-up provider/db/registry/etc. Receives a per-handle
-  // `signal` that the store flips on `cancel`. Failures throw
+  // `signal` that the store flips on `cancel`, and the
+  // `handleId` so the spawnFn can route the child's
+  // `cost_update` HarnessEvents back to `recordLiveCost`
+  // (spec ORCHESTRATION.md §3.5 budget shared). Failures throw
   // — the store's record promise propagates them so the
   // task_await tool surface can map onto a tool error.
-  spawnFn: (args: SpawnSubagentArgs, signal: AbortSignal) => Promise<SpawnSubagentResult>;
+  spawnFn: (
+    args: SpawnSubagentArgs,
+    signal: AbortSignal,
+    handleId: string,
+  ) => Promise<SpawnSubagentResult>;
   // Optional persistence binding. When set, the store mirrors
   // every handle lifecycle event into the `subagent_handles`
   // table:
@@ -175,11 +200,33 @@ interface SubagentRecord {
   status: 'running' | 'settled';
   settledResult: SpawnSubagentResult | null;
   // Pessimistic worst-case cost estimate captured at spawn
-  // time. Used by `getReservedChildCostUsd` while status is
-  // 'running'; once settled, the actual cost from
-  // `settledResult` flows into `getSettledChildCostUsd`
-  // instead.
+  // time. Used as the FLOOR of `getReservedChildCostUsd` while
+  // status is 'running' — covers the window before the child's
+  // first `cost_update` event lands. Once `liveCostUsd` exceeds
+  // it (rare but possible if a child overspends its declared
+  // budget), the reservation grows with `liveCostUsd` instead.
+  // Once settled, the actual cost from `settledResult` flows
+  // into `getSettledChildCostUsd` and this field stops
+  // mattering.
   estimateCostUsd: number;
+  // Latest cumulative self-cost the child reported via
+  // `cost_update` HarnessEvent (spec ORCHESTRATION.md §3.5).
+  // Default 0 (no reports yet); monotonically advances as the
+  // child runs. The reservation tracker reads this as the
+  // CURRENT real spend, replacing the pessimistic estimate
+  // floor as data arrives. `recordLiveCost` is the only writer.
+  liveCostUsd: number;
+  // True iff `cancel` or `cancelAll` aborted this record. The
+  // status field stays 'running' until the IIFE wakes and
+  // settles the result, but the reservation contract requires
+  // an immediate release. Read by `getReservedChildCostUsd`
+  // (filters out cancelled rows so their reservation drops to
+  // 0 the moment cancel lands) and by `recordLiveCost` (no-op
+  // on cancelled rows so a `cost_update` already in flight on
+  // the IPC pipe can't bump the reservation back up after
+  // cancel). Single-write: only cancel-paths flip; never
+  // un-flips.
+  cancelled: boolean;
 }
 
 // Envelope payload mirroring `SpawnSubagentResult` shape, used
@@ -378,6 +425,8 @@ export const createSubagentHandleStore = (
         // already settled). The actual cost flows into
         // `getSettledChildCostUsd` via `cached.costUsd`.
         estimateCostUsd: 0,
+        liveCostUsd: 0,
+        cancelled: false,
       };
       records.set(row.handleId, record);
     }
@@ -484,6 +533,8 @@ export const createSubagentHandleStore = (
       status: 'running',
       settledResult: null,
       estimateCostUsd,
+      liveCostUsd: 0,
+      cancelled: false,
     };
 
     const promise = (async (): Promise<SpawnSubagentResult> => {
@@ -494,7 +545,7 @@ export const createSubagentHandleStore = (
           result = cancelledBeforeDispatch(spawnedAt);
         } else {
           try {
-            result = await spawnFn(args, controller.signal);
+            result = await spawnFn(args, controller.signal, id);
           } catch (e) {
             result = synthesizeSpawnError(e, spawnedAt);
           }
@@ -582,12 +633,14 @@ export const createSubagentHandleStore = (
     // `task_async`'s error envelope ("cancel one to free its
     // reservation") promises this is immediate; making it
     // immediate at the source is what backs that promise.
-    // The record's status stays `'running'` until the IIFE
-    // reaches the synchronous status flip — `inFlightCount`
-    // observes the in-progress state, but the budget tracker
-    // sees zero reservation, which is the consumer-visible
-    // contract that matters.
-    record.estimateCostUsd = 0;
+    //
+    // Setting `cancelled: true` (instead of zeroing
+    // estimate/live) keeps the audit fields intact while the
+    // reservation tracker filters cancelled rows. Also blocks
+    // any in-flight `cost_update` on the IPC pipe from
+    // re-incrementing `liveCostUsd` between cancel and IIFE
+    // settle.
+    record.cancelled = true;
     record.controller.abort();
     return { cancelled: true };
   };
@@ -618,9 +671,47 @@ export const createSubagentHandleStore = (
   const getReservedChildCostUsd = (): number => {
     let total = 0;
     for (const r of records.values()) {
-      if (r.status === 'running') total += r.estimateCostUsd;
+      // Cancelled records contribute 0 — the cancel path
+      // releases the reservation IMMEDIATELY (D204). Filtering
+      // here (rather than zeroing estimate/live on cancel)
+      // keeps the audit fields intact for diagnostics while
+      // still freeing the cap.
+      if (r.status === 'running' && !r.cancelled) {
+        // Pessimistic floor (estimate) until the child reports;
+        // once live > estimate, follow the actual spend.
+        total += Math.max(r.estimateCostUsd, r.liveCostUsd);
+      }
     }
     return total;
+  };
+
+  const recordLiveCost = (handleId: string, cumulative: number): void => {
+    const record = records.get(handleId);
+    if (record === undefined) return;
+    if (record.status !== 'running') return;
+    // No-op on cancelled records: a `cost_update` event already
+    // in flight on the IPC pipe (sent by the child before the
+    // abort signal landed) MUST NOT bump the reservation back
+    // up after `cancel`/`cancelAll` flipped the flag. Without
+    // this guard the watchdog's release would be silently
+    // undone by a stale message.
+    if (record.cancelled) return;
+    if (!Number.isFinite(cumulative) || cumulative < 0) return;
+    // Monotonic: a stale or out-of-order event from the child
+    // (clock skew, retried stream) MUST NOT regress the
+    // reservation. The downstream cap watchdog relies on
+    // monotonic accumulation to avoid false-positive cap-cross
+    // alarms when an old `cost_update` lands after a newer one.
+    if (cumulative > record.liveCostUsd) record.liveCostUsd = cumulative;
+  };
+
+  const cancelAll = (): void => {
+    for (const r of records.values()) {
+      if (r.status === 'running' && !r.cancelled) {
+        r.cancelled = true;
+        r.controller.abort();
+      }
+    }
   };
 
   const getSettledChildCostUsd = (): number => {
@@ -645,6 +736,8 @@ export const createSubagentHandleStore = (
     list,
     inFlightCount,
     drain,
+    cancelAll,
+    recordLiveCost,
     getReservedChildCostUsd,
     getSettledChildCostUsd,
   };

@@ -613,6 +613,17 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         });
         return out;
 
+      case 'cost_update':
+        // Internal-bookkeeping event: the harness emits one per
+        // turn so subagent runs can stream live spend up to the
+        // parent over IPC (spec ORCHESTRATION.md §3.5). The TUI
+        // doesn't render it directly — the existing `step:budget`
+        // event already updates the cost token on the status
+        // line. Returning `out` (likely empty since no other
+        // case fired) makes the adapter ignore the event without
+        // breaking the exhaustive switch contract.
+        return out;
+
       case 'session_finished': {
         // Make sure no streaming state leaks past the end. A run
         // killed mid-turn (interrupt, provider error) won't have

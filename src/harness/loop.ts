@@ -201,7 +201,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // it WITHOUT an override (defaults to the run signal), so both
   // task surfaces share the same dispatcher.
   let spawnSubagentImpl:
-    | ((args: SpawnSubagentArgs, signalOverride?: AbortSignal) => Promise<SpawnSubagentResult>)
+    | ((
+        args: SpawnSubagentArgs,
+        signalOverride?: AbortSignal,
+        handleId?: string,
+      ) => Promise<SpawnSubagentResult>)
     | undefined;
   // Per-session CheckpointManager. Lifecycle parallels bgManager:
   // created after sessionId is resolved (the manager carries it),
@@ -270,6 +274,25 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // the result reports just totalCostUsd.
   let priorCostUsd = 0;
   let priorUsageComplete = true;
+
+  // Per-turn cost-delta event emitter (spec ORCHESTRATION.md §3.5
+  // shared-budget contract). Fires every time the run's
+  // `totalCostUsd` advances — turn settle, compaction, partial
+  // provider-error charge. Carries `delta` (the latest charge
+  // alone) and `cumulative` (this session's running self-cost).
+  // For a subagent run, the parent's IPC observer reads these
+  // events and tracks live in-flight spend; for a top-level run
+  // the event is harmless (TUI ignores it). Skipped on zero
+  // deltas so a misbehaving provider that emitted a usage event
+  // with all zeros doesn't generate noise.
+  const emitCostUpdate = (delta: number): void => {
+    if (!Number.isFinite(delta) || delta <= 0) return;
+    safeEmit(config.onEvent, {
+      type: 'cost_update',
+      delta,
+      cumulative: totalCostUsd,
+    });
+  };
 
   // Cumulative cost of every child this run spawned (sync `task`
   // and async `task_async` alike). Increments inside
@@ -653,7 +676,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // the impl with bounded-concurrency slot semantics so multiple
       // `task_async` calls overlap up to the cap.
       if (config.subagentRegistry !== undefined) {
-        spawnSubagentImpl = async (args, signalOverride) => {
+        spawnSubagentImpl = async (args, signalOverride, handleId) => {
           const registry = config.subagentRegistry;
           if (registry === undefined) {
             return { kind: 'unknown_subagent', requested: args.name, available: [] };
@@ -732,6 +755,58 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // no wrapping cost).
           const combinedSignal =
             signalOverride === undefined ? signal : AbortSignal.any([signal, signalOverride]);
+
+          // Wrap the parent's event observer when (a) we need
+          // the cost-update budget tracker (async path: we got a
+          // handleId AND a store) OR (b) the operator wired
+          // `config.onEvent` for observability. When NEITHER
+          // applies (sync `task` from a headless test, no
+          // operator TUI), we omit `onChildEvent` entirely —
+          // the runtime's `effectiveIpc = input.ipc === true ||
+          // input.onChildEvent !== undefined` (runtime.ts ~535)
+          // would otherwise spin up an IPC channel for every
+          // sync subagent solely so a dead `handleId !==
+          // undefined` check could fire.
+          //
+          // The wrapper has two responsibilities (spec
+          // ORCHESTRATION.md §3.5):
+          //   (1) update the handle store's per-record live cost
+          //       via `recordLiveCost` so `getReservedChildCostUsd`
+          //       reflects actual spend instead of the
+          //       pessimistic floor.
+          //   (2) cap watchdog: when cumulative live spend
+          //       crosses `maxCostUsd`, hard-signal every active
+          //       handle ("subagent ativo recebe sinal de
+          //       finalizar"). The pre-spawn gate above handles
+          //       NEW spawn refusal; this branch handles
+          //       in-flight termination.
+          // Local-rebind so TS narrowing survives the closure
+          // body (the outer `let` widens back to optional inside
+          // a lambda).
+          const trackerStore = handleId !== undefined ? subagentHandleStore : undefined;
+          const trackerHandleId = handleId;
+          const onChildEventForwarder: ((e: HarnessEvent) => void) | undefined =
+            trackerStore !== undefined || config.onEvent !== undefined
+              ? (e: HarnessEvent) => {
+                  if (
+                    trackerStore !== undefined &&
+                    trackerHandleId !== undefined &&
+                    e.type === 'subagent_progress' &&
+                    e.lastEvent.type === 'cost_update'
+                  ) {
+                    trackerStore.recordLiveCost(trackerHandleId, e.lastEvent.cumulative);
+                    if (budget.maxCostUsd !== undefined) {
+                      const reserved = trackerStore.getReservedChildCostUsd();
+                      const total = priorCostUsd + totalCostUsd + cumulativeChildCostUsd + reserved;
+                      if (total > budget.maxCostUsd) {
+                        trackerStore.cancelAll();
+                      }
+                    }
+                  }
+                  config.onEvent?.(e);
+                }
+              : undefined;
+
           const child = await runSubagent({
             definition: def,
             prompt: args.prompt,
@@ -741,7 +816,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             permissionEngine: config.permissionEngine,
             db: config.db,
             cwd: config.cwd,
-            ...(config.onEvent !== undefined ? { onChildEvent: config.onEvent } : {}),
+            ...(onChildEventForwarder !== undefined ? { onChildEvent: onChildEventForwarder } : {}),
             ...(config.hooks !== undefined ? { hooksSnapshot: config.hooks } : {}),
             signal: combinedSignal,
             ...(config.softStopSignal !== undefined
@@ -835,7 +910,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // envelopes when this store loads.
         subagentHandleStore = createSubagentHandleStore({
           cap: subagentCap,
-          spawnFn: async (args, perHandleSignal) => impl(args, perHandleSignal),
+          spawnFn: async (args, perHandleSignal, handleId) => impl(args, perHandleSignal, handleId),
           persistTo: { db: config.db, parentSessionId: sessionId },
         });
       }
@@ -1138,6 +1213,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               const partialCost = computeCost(config.provider.capabilities, partial.usage);
               totalUsage = addUsage(totalUsage, partial.usage);
               totalCostUsd += partialCost;
+              emitCostUpdate(partialCost);
               // Note: we deliberately do NOT check budget.maxCostUsd here.
               // The provider error path is about to call finish('providerError')
               // unconditionally — surfacing maxCostUsd instead when the partial
@@ -1185,6 +1261,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         const turnCostUsd = computeCost(config.provider.capabilities, collected.usage);
         totalUsage = addUsage(totalUsage, collected.usage);
         totalCostUsd += turnCostUsd;
+        emitCostUpdate(turnCostUsd);
         // ANY assistant turn that completes without a usage event is
         // unmeasured — every successful provider call bills input tokens
         // for the prompt, even when the model emits no text, no
@@ -1837,6 +1914,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             const compactionCost = computeCost(config.provider.capabilities, compaction.usage);
             totalUsage = addUsage(totalUsage, compaction.usage);
             totalCostUsd += compactionCost;
+            emitCostUpdate(compactionCost);
             // If the compaction call MADE a provider request (llm or
             // fallback strategy) but didn't see usage telemetry, the
             // session total is now a lower bound — same conservative

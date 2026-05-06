@@ -15,6 +15,149 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — review fixes for cost-progress IPC (cancel-flag, sync IPC opt-in, spec reconcile)
+
+Code review of the cost-progress IPC work flagged 2 bugs + 3
+risks. Applied the load-bearing subset.
+
+| File | Change |
+|---|---|
+| `src/subagents/handle-store.ts` | (a) `SubagentRecord.cancelled: boolean` (default false). (b) `cancel()` and `cancelAll()` set the flag; do NOT touch `estimateCostUsd` / `liveCostUsd` anymore. (c) `getReservedChildCostUsd` filters out cancelled rows, so the reservation drops to 0 the moment cancel lands — even when `liveCostUsd > 0`. (d) `recordLiveCost` no-ops on cancelled records: a stale `cost_update` already on the IPC pipe at cancel time can't bump the reservation back up. |
+| `src/harness/loop.ts` | Wrap `onChildEvent` only when needed: tracker (`handleId !== undefined && store !== undefined`) OR `config.onEvent !== undefined`. Sync `task` calls with no operator observer no longer open an IPC channel just to fire a dead-code branch. Local rebind into `trackerStore` / `trackerHandleId` keeps TS narrowing across the closure. |
+| `docs/spec/ORCHESTRATION.md §3.5.1` | Spec reconcile with `§0` principle 7 ("Budget é compartilhado, não pre-alocado") + `§12` anti-pattern. The `estimateCostUsd` floor is documented as a **bootstrap window placeholder** (until first cost_update lands, milliseconds), NOT pre-allocation in the anti-pattern's sense. The window is unavoidable with current IPC: spawn-to-first-turn delay exists regardless. After the first report, the tracker is pure live-shared. New "Cancelled" bullet documents the immediate reservation release contract. |
+| `tests/subagents/handle-store.test.ts` | Two new tests. (a) "recordLiveCost no-ops on cancelled records (review fix: stale cost_update post-cancel)" — recordLiveCost(5) after cancel does NOT raise reservation. (b) "cancelAll releases reservation even when liveCostUsd is non-zero" — pre-fix path: simulate cost_updates that pushed live above estimate, call cancelAll, assert reservation == 0. The pre-fix code zeroed only estimate, leaving the reservation locked at live. |
+
+**Decisions:**
+
+- **D205 — `cancelled` flag, not field-zeroing.** The previous
+  approach (zeroing `estimateCostUsd` on cancel) failed when
+  `liveCostUsd > 0` — `max(0, live) = live`, reservation
+  stayed locked. Filtering on a flag in
+  `getReservedChildCostUsd` is the cleanest fix:
+  cancellation contract becomes one-bit, audit fields stay
+  intact, and `recordLiveCost` can also honor the flag to
+  silence stale events.
+- **D206 — IPC opt-in stays narrow for sync `task`.** The
+  pre-fix "always wire `onChildEvent`" (D201) made every
+  sync `task` open an IPC channel solely so a
+  `handleId !== undefined` check could fire — dead code for
+  sync. The wrapper is now conditional: tracker-needed OR
+  operator-wired. Sync `task` from a headless test stays on
+  the pre-IPC fast path.
+- **D207 — `estimateCostUsd` floor is not pre-allocation.**
+  The reviewer flagged `§0`/§12 anti-pattern conflict.
+  Reconciled in `§3.5.1`: the floor is a **placeholder
+  during the bootstrap window** (spawn → first cost_update,
+  typically ms). Without it, three concurrent spawns each
+  see `live = 0`, all pass the gate, and the cap blows
+  before any cost_update arrives. The anti-pattern targets
+  long-lived per-subagent budget reservation; a sub-second
+  bootstrap floor is operationally distinct.
+
+**Deferred (review nits):**
+- Coverage gap: end-to-end test that drives `cost_update`
+  through real IPC (priority #2). Existing handle-store
+  unit tests cover the store contract; the runtime
+  forwarding path is exercised by `tests/subagents/e2e.test.ts`
+  for arbitrary HarnessEvent forwarding. A combined test
+  would be valuable; skipped for this slice.
+- Filter `delta <= 0` in `emitCostUpdate` (priority #6)
+  — acceptable per audit nit; cumulative is monotonic so
+  the next nonzero turn carries the running total.
+
+Verification: typecheck clean, lint clean, 3092 pass / 0 fail /
+10 skip (2 new tests).
+
+---
+
+## [2026-05-06] parallel — cost-progress IPC + kill-during-run (closes §3.5)
+
+Closes the last open spec deviation. Before this commit the
+budget gate refused new spawns at the cap but had no way to
+abort a child whose live cost crossed mid-run — spec §3.5
+"subagent ativo recebe sinal de finalizar" was deferred via
+D184 as "until cost-progress IPC lands". This commit lands it.
+
+The flow:
+
+1. Child harness emits `cost_update { delta, cumulative }`
+   HarnessEvent after every provider call (turn settle,
+   compaction, partial provider-error charge).
+2. Runtime forwards via the existing `event` IPC envelope; the
+   parent observer receives it as `subagent_progress.lastEvent`.
+3. `spawnSubagentImpl` wraps `onChildEvent` to detect the
+   cost_update and call `handleStore.recordLiveCost(handleId,
+   cumulative)`.
+4. Reservation per record becomes `max(estimateCostUsd,
+   liveCostUsd)` — pessimistic until the first report, then
+   tracks real spend.
+5. Watchdog at every cost_update: if projected total > cap,
+   `handleStore.cancelAll()` aborts every active record's
+   AbortController. Children gracefully exit via the existing
+   `interrupt:hard` IPC path.
+
+| File | Change |
+|---|---|
+| `src/harness/types.ts` | New `HarnessEvent` variant `cost_update { delta, cumulative }`. |
+| `src/harness/loop.ts` | (a) `emitCostUpdate(delta)` helper fires after each `totalCostUsd` advance — turn settle, compaction, partial error. (b) `spawnSubagentImpl` signature gains optional `handleId`; sync `task` calls with undefined, async path passes the store-issued handle. (c) `onChildEvent` is now ALWAYS wired (not gated on `config.onEvent !== undefined`) so the budget tracker fires for headless runs. The wrapper detects `subagent_progress.lastEvent.type === 'cost_update'` and routes through the store; cap watchdog runs after each update. |
+| `src/subagents/handle-store.ts` | (a) `SubagentRecord.liveCostUsd: number` field, default 0. (b) New `recordLiveCost(handleId, cumulative)` — monotonic update; ignores unknown / settled rows / regressions. (c) `getReservedChildCostUsd` returns `sum(max(estimate, live))` — pessimistic floor with live override. (d) New `cancelAll()` — synchronous mass-cancel that zeroes reservations and aborts every active controller. (e) `spawnFn` signature gains `handleId` so the dispatcher can route cost_update back to the right record. |
+| `src/tui/harness-adapter.ts` | New `case 'cost_update'` in the translate switch — returns the (likely empty) `out` array. The TUI doesn't render cost_update directly; the existing `step:budget` event already drives the cost token on the status line. The case exists to keep the exhaustive switch contract. |
+| `docs/spec/ORCHESTRATION.md §3.5` | Spec emend. Old §3.5.1 (pessimistic deviation rationale) replaced with §3.5.1 (cost-progress IPC: how the wire feeds the live tracker and the reservation `max(estimate, live)` formula). §3.5.2 failure-mode table no longer has "future" column — kill-during-run is now the implemented behavior. |
+| `tests/subagents/handle-store.test.ts` | 3 new tests: (a) `recordLiveCost` updates reservation; floor is `max(estimate, live)`; monotonic. (b) `recordLiveCost` no-ops on unknown / settled records. (c) `cancelAll` aborts every running record + zeroes reservations + records settle as `interrupted`. |
+
+**Decisions:**
+
+- **D200 — `cost_update` is a HarnessEvent, not a new IPC type.**
+  Reuses the existing `event` envelope. No new IPC parser
+  branch, no `KNOWN_TYPES` addition, no schema bump. The runtime
+  already forwards arbitrary HarnessEvents from child to parent
+  via `subagent_progress`; the budget tracker plugs into that
+  same channel.
+
+- **D201 — Wrapper always wires `onChildEvent`.** The pre-fix
+  code only wired `onChildEvent` when `config.onEvent` was
+  defined. With the budget tracker hooking the same path, the
+  wire must exist regardless — even a headless test run needs
+  the watchdog. The wrapper forwards to `config.onEvent?.` when
+  set; otherwise the operator-facing channel is just no-op.
+
+- **D202 — Reservation floor is `max(estimate, live)`, not just
+  `live`.** A child that hasn't reported yet has `live = 0`.
+  Without the estimate floor, three concurrent spawns would all
+  pass the gate (each sees 0 in-flight) and the cap would be
+  crossed before the first cost_update lands. Keeping the
+  estimate as a floor preserves the pre-fix safety margin until
+  the live data takes over.
+
+- **D203 — Watchdog runs at every cost_update, not on a timer.**
+  Event-driven: the moment the child reports its latest spend
+  is the moment the parent has new information. A timer would
+  add latency without buying anything (the cost only changes
+  when cost_update fires). Subsequent cost_updates after a
+  cap-cross are no-ops (records already aborted, reservations
+  already zeroed).
+
+- **D204 — `cancelAll` is synchronous and aggressive.** Spec
+  §3.5 says "subagent ativo recebe sinal de finalizar" — fires
+  abort signals to ALL active children. The spec doesn't say
+  "kill the most expensive one" or "ration"; it says the
+  global limit triggers a global stop. Any child that hadn't
+  yet caused the crossing still gets cancelled because the
+  parent can't predict which child's next provider call would
+  push further over.
+
+**D184 superseded.** The pessimistic-reservation deviation
+documented in D184 (and §3.5.1 of the prior emend) is
+superseded by this commit. The deviation's rationale ("until
+cost-progress IPC lands") is now satisfied; the reservation
+is no longer a static estimate but a live-tracking value with
+the estimate as a fallback floor.
+
+Verification: typecheck clean, lint clean, 3090 pass / 0 fail /
+10 skip (3 new tests).
+
+---
+
 ## [2026-05-06] parallel — operator surface review fixes (footer/slash semantics, test gaps)
 
 Code review of the operator surface (#1 sync vs async semantic

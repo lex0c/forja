@@ -300,6 +300,163 @@ describe('SubagentHandleStore', () => {
     await Promise.all([store.awaitHandle(h1.id), store.awaitHandle(h2.id)]);
     expect(store.inFlightCount()).toBe(0);
   });
+
+  test('recordLiveCost updates reservation; max(estimate, live) is the floor', async () => {
+    let entered: () => void = () => {};
+    const inFlight = new Promise<void>((r) => {
+      entered = r;
+    });
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args, signal) => {
+        entered();
+        await sleep(200, signal).catch(() => undefined);
+        return okResult(args);
+      },
+    });
+    const h = store.spawn({ name: 'live', prompt: 'p' }, { estimateCostUsd: 1 });
+    await inFlight;
+    // Initial reservation is the estimate (live=0 < estimate=1).
+    expect(store.getReservedChildCostUsd()).toBe(1);
+    // Live below estimate: reservation stays at estimate.
+    store.recordLiveCost(h.id, 0.3);
+    expect(store.getReservedChildCostUsd()).toBe(1);
+    // Live above estimate: reservation grows with actual spend.
+    store.recordLiveCost(h.id, 2.5);
+    expect(store.getReservedChildCostUsd()).toBe(2.5);
+    // Monotonic: a stale (smaller) cumulative does NOT regress.
+    store.recordLiveCost(h.id, 1.0);
+    expect(store.getReservedChildCostUsd()).toBe(2.5);
+    store.cancel(h.id);
+    await store.awaitHandle(h.id);
+  });
+
+  test('recordLiveCost no-ops on unknown handle and on settled records', async () => {
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+    });
+    // Unknown handle.
+    store.recordLiveCost('does-not-exist', 5);
+    expect(store.getReservedChildCostUsd()).toBe(0);
+    // Settled record.
+    const h = store.spawn({ name: 'fast', prompt: 'p' }, { estimateCostUsd: 0 });
+    await store.awaitHandle(h.id);
+    store.recordLiveCost(h.id, 10);
+    // Settled records contribute via getSettledChildCostUsd, not
+    // via reservation. Reservation drops to 0 once settled.
+    expect(store.getReservedChildCostUsd()).toBe(0);
+  });
+
+  test('recordLiveCost no-ops on cancelled records (review fix: stale cost_update post-cancel)', async () => {
+    let entered: () => void = () => {};
+    const inFlight = new Promise<void>((r) => {
+      entered = r;
+    });
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args, signal) => {
+        entered();
+        await sleep(200, signal).catch(() => undefined);
+        return okResult(args);
+      },
+    });
+    const h = store.spawn({ name: 'live', prompt: 'p' }, { estimateCostUsd: 1 });
+    await inFlight;
+    store.recordLiveCost(h.id, 0.5);
+    expect(store.getReservedChildCostUsd()).toBe(1); // estimate floor
+    // Cancel: reservation drops to 0 immediately.
+    store.cancel(h.id);
+    expect(store.getReservedChildCostUsd()).toBe(0);
+    // A stray `cost_update` already in flight on the IPC pipe
+    // when cancel landed MUST NOT bump the reservation back up.
+    store.recordLiveCost(h.id, 5);
+    expect(store.getReservedChildCostUsd()).toBe(0);
+    await store.awaitHandle(h.id);
+  });
+
+  test('cancelAll releases reservation even when liveCostUsd is non-zero', async () => {
+    let entered = 0;
+    let allInFlight: () => void = () => {};
+    const ready = new Promise<void>((r) => {
+      allInFlight = r;
+    });
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args, signal) => {
+        entered += 1;
+        if (entered === 2) allInFlight();
+        await sleep(500, signal).catch(() => undefined);
+        return okResult(args);
+      },
+    });
+    const h1 = store.spawn({ name: 'a', prompt: 'p' }, { estimateCostUsd: 1 });
+    const h2 = store.spawn({ name: 'b', prompt: 'p' }, { estimateCostUsd: 1 });
+    await ready;
+    // Simulate cost_updates that pushed live above estimate.
+    store.recordLiveCost(h1.id, 3);
+    store.recordLiveCost(h2.id, 2);
+    expect(store.getReservedChildCostUsd()).toBe(5);
+    // Watchdog fires.
+    store.cancelAll();
+    // Reservation MUST drop to 0, not stay at 5 because of
+    // liveCostUsd. This is the regression the previous
+    // implementation had: cancelAll only zeroed estimate, so
+    // a record with live > 0 kept its reservation locked at
+    // live and blocked new spawns even after the cancel
+    // cascaded.
+    expect(store.getReservedChildCostUsd()).toBe(0);
+    await store.awaitHandle(h1.id);
+    await store.awaitHandle(h2.id);
+  });
+
+  test('cancelAll aborts every running record and zeroes their reservations', async () => {
+    let entered = 0;
+    let allInFlight: () => void = () => {};
+    const ready = new Promise<void>((r) => {
+      allInFlight = r;
+    });
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args, signal) => {
+        entered += 1;
+        if (entered === 3) allInFlight();
+        try {
+          await sleep(500, signal);
+        } catch {
+          return {
+            kind: 'ran',
+            output: '',
+            sessionId: '',
+            status: 'interrupted',
+            reason: 'cancelled',
+            costUsd: 0,
+            steps: 0,
+            durationMs: 0,
+          };
+        }
+        return okResult(args);
+      },
+    });
+    const handles = Array.from({ length: 3 }, (_, i) =>
+      store.spawn({ name: `w${i}`, prompt: 'p' }, { estimateCostUsd: 2 }),
+    );
+    await ready;
+    expect(store.getReservedChildCostUsd()).toBe(6);
+    store.cancelAll();
+    // Reservations dropped to 0 immediately even before the
+    // IIFEs settle. Backs the spec §3.5 promise that the
+    // watchdog frees the cap.
+    expect(store.getReservedChildCostUsd()).toBe(0);
+    // Each record settled as interrupted.
+    for (const h of handles) {
+      const out = await store.awaitHandle(h.id);
+      expect(out.kind).toBe('done');
+      if (out.kind === 'done' && out.result.kind === 'ran') {
+        expect(out.result.status).toBe('interrupted');
+      }
+    }
+  });
 });
 
 describe('SubagentHandleStore — persistence (resume rehydration)', () => {
