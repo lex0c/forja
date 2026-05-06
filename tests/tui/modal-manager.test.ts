@@ -670,6 +670,43 @@ describe('timeout', () => {
     expect(removeCount).toBe(1);
   });
 
+  test('signal cancel of a queued modal also clears its scheduled timeout', async () => {
+    // Regression guard. The active branch of cancelPending
+    // routes through resolveActive which clears the timeout;
+    // the queued branch resolved directly without the
+    // clearTimer call, leaving live timers behind for every
+    // signal-cancelled queued modal. No functional break (the
+    // timer's later fire is a no-op on settled promises) but
+    // the timer keeps the event loop alive longer than needed
+    // and accrues callback churn under repeated cancels.
+    const s = make();
+    const ac = new AbortController();
+
+    // First ask is the active one — no timer needed.
+    const p1 = s.manager.askPermission({ toolName: 'b', command: 'a', cwd: '/' });
+    // Second ask is queued behind p1 with both a signal AND a
+    // timeout. Aborting the signal must clear the timer so
+    // s.timer.pending() reports empty.
+    const p2 = s.manager.askPermission(
+      { toolName: 'b', command: 'b', cwd: '/' },
+      { signal: ac.signal, timeoutMs: 9999 },
+    );
+    // The queued timer is registered.
+    expect(s.timer.pending()).toHaveLength(1);
+
+    // Abort the signal. Queued path of cancelPending fires.
+    ac.abort();
+    await expect(p2).resolves.toBe('cancel');
+
+    // Pre-fix: timer still queued (length 1, would fire later).
+    // Post-fix: clearTimer ran inside cancelPending; no timer.
+    expect(s.timer.pending()).toHaveLength(0);
+
+    // Tear down p1.
+    s.fs.dispatch(key('enter'));
+    await p1;
+  });
+
   test('timeout while still queued: emits modal:queue-depth so the suffix corrects down', async () => {
     // Regression guard. Earlier the queued-timeout branch removed
     // the entry and resolved the promise but never emitted a

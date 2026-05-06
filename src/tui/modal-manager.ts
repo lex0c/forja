@@ -505,18 +505,28 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
       const cancelPending = (): void => {
         if (active !== null && active.pending === (pending as Pending)) {
           // Active path: resolveActive detaches the abort
-          // listener for us via pending.detachAbortListener.
+          // listener AND clears the timeout for us. Single
+          // exit point, no per-branch cleanup duplication.
           resolveActive('cancel');
           return;
         }
         const idx = queue.indexOf(pending as Pending);
         if (idx >= 0) queue.splice(idx, 1);
         // Queued path: detach here too so a stale signal
-        // listener doesn't outlive the resolved pending. Same
-        // idempotency story as resolveActive's call: harmless
-        // when the listener already auto-removed (signal-abort
-        // path that routes through here).
+        // listener doesn't outlive the resolved pending, AND
+        // clear the scheduled timeout. Without the clearTimer
+        // a queued modal cancelled via signal would leave its
+        // timer running until it fires (no-op at fire time —
+        // pending.resolve is a no-op on settled promises — but
+        // the timer keeps the event loop alive longer than the
+        // run intended and adds avoidable callback churn for
+        // every aborted queued modal). Idempotent: clearTimer
+        // on an already-fired or already-cleared handle is a
+        // no-op.
         pending.detachAbortListener?.();
+        if (pending.timeout !== null && pending.timeout !== undefined) {
+          clearTimer(pending.timeout);
+        }
         pending.resolve('cancel' as Answer);
         if (active !== null && idx >= 0) {
           bus.emit({
