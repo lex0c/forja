@@ -12,6 +12,7 @@ import { createSession, migrate } from '../../src/storage/index.ts';
 import { createChannel, fakeTransportPair } from '../../src/subagents/ipc.ts';
 import { type SpawnChildProcess, runSubagent } from '../../src/subagents/runtime.ts';
 import type { SubagentDefinition } from '../../src/subagents/types.ts';
+import { readFileTool } from '../../src/tools/builtin/read-file.ts';
 import { createToolRegistry } from '../../src/tools/registry.ts';
 import type { Tool } from '../../src/tools/types.ts';
 
@@ -317,6 +318,290 @@ describe('subagent e2e — real child harness over IPC (S4)', () => {
       (e) => e.type === 'subagent_progress' && e.lastEvent.type === 'session_finished',
     );
     expect(leakedSessionFinished).toBe(false);
+    parentDb.close();
+  });
+
+  test('permission proxy: child confirm verdict round-trips through parent operator hook', async () => {
+    // Costura as três slices do permission proxy em um único caminho:
+    //   child engine returns confirm
+    //     → bridge sends permission:ask via IPC
+    //     → parent runtime observer routes to onPermissionAsk hook
+    //     → hook (test stub) returns 'allow'
+    //     → runtime sends permission:answer
+    //     → bridge resolves invoke-tool's confirmPermission to true
+    //     → invoke-tool records `confirm_yes` / decided_by='user'
+    //     → tool actually executes
+    //
+    // No subprocess: `runSubagentChild` runs in-process via the same
+    // pattern the other e2e tests above use. Every layer is
+    // production code except the transport leaf (fakeTransportPair
+    // substitutes for processTransport).
+    //
+    // Tool choice: read_file. Has writes:false (so the subagent
+    // definition doesn't need worktree isolation), exercises the
+    // fs.read engine path (distinct from bash but same confirm
+    // surface), and Bun.file's "missing path" error path is
+    // graceful — when the operator allows, the tool body runs
+    // and either returns content or a clean error; either way the
+    // approval row is what we're asserting on.
+    const parentDb = openDb(dbPath);
+    migrate(parentDb);
+    const parent = createSession(parentDb, { model: 'mock/m', cwd: '/p' });
+
+    // Engine in strict mode with an fs.read confirm rule. The
+    // child inherits this policy via policy_snapshot when the
+    // parent stamps the audit row, so the engine inside the
+    // child returns the same confirm verdict the parent's engine
+    // would. `**` matches every relative path; `/**` would match
+    // every absolute path. Combined we cover both shapes the
+    // model might emit.
+    const enginePolicy = policy({
+      defaults: { mode: 'strict' },
+      tools: { read_file: { confirm_paths: ['**', '/**'] } },
+    });
+    const engine = createPermissionEngine(enginePolicy, { cwd: '/p' });
+
+    // Parent's tool registry must include `read_file` — runtime
+    // validates the subagent's whitelist against the parent's
+    // registry before spawning (assertWhitelistValidForSubagent).
+    // The parent never executes the tool itself; the registration
+    // is purely a contract gate.
+    const parentRegistry = createToolRegistry();
+    parentRegistry.register(readFileTool as unknown as Tool);
+
+    // Child provider: emit a single read_file tool_use, then
+    // end_turn after the tool_result lands. Stateful via a
+    // closure counter. The path is fictional — read_file's
+    // execute will surface a clean ENOENT error which the model
+    // sees as a tool result; the audit row was already written
+    // before the body ran.
+    let providerCall = 0;
+    const childProvider: Provider = {
+      id: 'mock/m',
+      family: 'anthropic',
+      capabilities: stubProvider('').capabilities,
+      async *generate(): AsyncGenerator<StreamEvent> {
+        providerCall += 1;
+        yield { kind: 'start', message_id: `mock-msg-${providerCall}` };
+        if (providerCall === 1) {
+          yield { kind: 'tool_use_start', id: 'tu-1', name: 'read_file' };
+          yield {
+            kind: 'tool_use_stop',
+            id: 'tu-1',
+            final_args: { path: '/p/permission-proxy-smoke.txt' },
+          };
+          yield { kind: 'stop', reason: 'tool_use' };
+        } else {
+          yield { kind: 'text_delta', text: 'tool ran, all done' };
+          yield { kind: 'stop', reason: 'end_turn' };
+        }
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+
+    // Operator stand-in: record what the runtime delivered, answer
+    // 'allow'. Spec §7's mandate ("child NEVER receives auto-approve
+    // via IPC") is honored — the hook is a TEST simulating an
+    // operator at the modal, not an automated allow path inside
+    // the runtime.
+    interface RecordedAsk {
+      toolName: string;
+      args: Record<string, unknown>;
+      cwd: string;
+      prompt: string;
+      subagent: { sessionId: string; name: string };
+    }
+    const askedRequests: RecordedAsk[] = [];
+    const onPermissionAsk = async (req: RecordedAsk): Promise<'allow' | 'deny'> => {
+      askedRequests.push(req);
+      return 'allow';
+    };
+
+    const spawn: SpawnChildProcess = (opts) => {
+      const { a, b } = fakeTransportPair();
+      const parentChannel = createChannel(a);
+      const exited = runSubagentChild({
+        sessionId: opts.sessionId,
+        dbPath,
+        providerOverride: childProvider,
+        userAgentsDir: null,
+        projectAgentsDir: null,
+        errSink: () => undefined,
+        ipcVersion: 1,
+        ipcTransportFactory: () => b,
+      }).then((exitCode) => ({ exitCode }));
+      return {
+        exited,
+        kill: () => undefined,
+        ipc: parentChannel,
+      };
+    };
+
+    const result = await runSubagent({
+      definition: definition({ name: 'explore', tools: ['read_file'] }),
+      prompt: 'read the file',
+      parentSessionId: parent.id,
+      provider: stubProvider(''),
+      parentToolRegistry: parentRegistry,
+      permissionEngine: engine,
+      db: parentDb,
+      cwd: '/p',
+      onPermissionAsk,
+      spawnChildProcess: spawn,
+    });
+
+    // Hook fired exactly once with the right shape and the runtime
+    // baked-in attribution.
+    expect(askedRequests).toHaveLength(1);
+    const ask = askedRequests[0];
+    expect(ask).toBeDefined();
+    if (ask !== undefined) {
+      expect(ask.toolName).toBe('read_file');
+      expect(ask.args).toEqual({ path: '/p/permission-proxy-smoke.txt' });
+      expect(ask.cwd).toBe('/p');
+      expect(ask.subagent.name).toBe('explore');
+      expect(ask.subagent.sessionId).toMatch(/^[0-9a-f-]{36}$/);
+      // The engine builds the prompt from the matched rule —
+      // fs.read's confirm path uses `Read from <path>?`.
+      expect(ask.prompt).toContain('Read from /p/permission-proxy-smoke.txt');
+    }
+
+    // Child completed cleanly. The operator allowed; whether the
+    // tool body succeeded (file exists) or surfaced an error
+    // (ENOENT) is irrelevant — the integration we're testing
+    // ends at the approval row.
+    expect(result.status).toBe('done');
+    expect(result.reason).toBe('done');
+
+    // Audit chain: query the approvals table joined back to
+    // tool_calls + messages so the assertion mirrors what an
+    // operator running `agent --list-sessions <child> --audit`
+    // would see — proves the chain "operator approved X for child Y
+    // for tool Z" is reconstructable through the existing schema
+    // (no migration needed, per BACKLOG decision).
+    if (ask !== undefined) {
+      const approvals = parentDb
+        .query(
+          `SELECT a.decision, a.decided_by
+             FROM approvals a
+             JOIN tool_calls tc ON a.tool_call_id = tc.id
+             JOIN messages m ON tc.message_id = m.id
+             WHERE m.session_id = ?
+             ORDER BY a.decided_at ASC`,
+        )
+        .all(ask.subagent.sessionId) as { decision: string; decided_by: string }[];
+      expect(approvals).toHaveLength(1);
+      expect(approvals[0]?.decision).toBe('confirm_yes');
+      expect(approvals[0]?.decided_by).toBe('user');
+    }
+
+    parentDb.close();
+  });
+
+  test('permission proxy: operator deny blocks the tool and records confirm_no', async () => {
+    // Mirror image of the test above. Same setup; hook returns
+    // 'deny' instead of 'allow'. Child's invoke-tool records
+    // `confirm_no` / `decided_by='user'`, the read_file tool
+    // body never runs, and the child's harness sees `denied by
+    // user` as the tool result. The child still completes
+    // cleanly (denial is a tool-result-level error, not a
+    // session-level one) — the model just gets the negative
+    // outcome and decides what to do.
+    const parentDb = openDb(dbPath);
+    migrate(parentDb);
+    const parent = createSession(parentDb, { model: 'mock/m', cwd: '/p' });
+
+    const enginePolicy = policy({
+      defaults: { mode: 'strict' },
+      tools: { read_file: { confirm_paths: ['**', '/**'] } },
+    });
+    const engine = createPermissionEngine(enginePolicy, { cwd: '/p' });
+    const parentRegistry = createToolRegistry();
+    parentRegistry.register(readFileTool as unknown as Tool);
+
+    let providerCall = 0;
+    const childProvider: Provider = {
+      id: 'mock/m',
+      family: 'anthropic',
+      capabilities: stubProvider('').capabilities,
+      async *generate(): AsyncGenerator<StreamEvent> {
+        providerCall += 1;
+        yield { kind: 'start', message_id: `mock-msg-${providerCall}` };
+        if (providerCall === 1) {
+          yield { kind: 'tool_use_start', id: 'tu-deny', name: 'read_file' };
+          yield {
+            kind: 'tool_use_stop',
+            id: 'tu-deny',
+            final_args: { path: '/p/blocked.txt' },
+          };
+          yield { kind: 'stop', reason: 'tool_use' };
+        } else {
+          yield { kind: 'text_delta', text: 'gave up after denial' };
+          yield { kind: 'stop', reason: 'end_turn' };
+        }
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+
+    let askCount = 0;
+    let recordedSubagentSessionId = '';
+    const onPermissionAsk = async (req: {
+      subagent: { sessionId: string; name: string };
+    }): Promise<'allow' | 'deny'> => {
+      askCount += 1;
+      recordedSubagentSessionId = req.subagent.sessionId;
+      return 'deny';
+    };
+
+    const spawn: SpawnChildProcess = (opts) => {
+      const { a, b } = fakeTransportPair();
+      const parentChannel = createChannel(a);
+      const exited = runSubagentChild({
+        sessionId: opts.sessionId,
+        dbPath,
+        providerOverride: childProvider,
+        userAgentsDir: null,
+        projectAgentsDir: null,
+        errSink: () => undefined,
+        ipcVersion: 1,
+        ipcTransportFactory: () => b,
+      }).then((exitCode) => ({ exitCode }));
+      return { exited, kill: () => undefined, ipc: parentChannel };
+    };
+
+    const result = await runSubagent({
+      definition: definition({ name: 'explore', tools: ['read_file'] }),
+      prompt: 'try to read',
+      parentSessionId: parent.id,
+      provider: stubProvider(''),
+      parentToolRegistry: parentRegistry,
+      permissionEngine: engine,
+      db: parentDb,
+      cwd: '/p',
+      onPermissionAsk,
+      spawnChildProcess: spawn,
+    });
+
+    expect(askCount).toBe(1);
+    expect(result.status).toBe('done');
+
+    // Audit row reflects user denial, not policy denial.
+    const approvals = parentDb
+      .query(
+        `SELECT a.decision, a.decided_by
+           FROM approvals a
+           JOIN tool_calls tc ON a.tool_call_id = tc.id
+           JOIN messages m ON tc.message_id = m.id
+           WHERE m.session_id = ?
+           ORDER BY a.decided_at ASC`,
+      )
+      .all(recordedSubagentSessionId) as { decision: string; decided_by: string }[];
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]?.decision).toBe('confirm_no');
+    expect(approvals[0]?.decided_by).toBe('user');
+
     parentDb.close();
   });
 });
