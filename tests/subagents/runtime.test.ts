@@ -4880,4 +4880,83 @@ describe('runSubagent — permission proxy (parent)', () => {
       }
     }
   });
+
+  test('hook returning invalid decision coerces to deny (defensive)', async () => {
+    // The hook signature types `decision` as PermissionDecision
+    // ('allow' | 'deny'), but JS callers and TS callers using
+    // `any` can return arbitrary strings. The IPC parser would
+    // reject the malformed answer and the child would block on
+    // its prompt until channel close. Verify the runtime
+    // coerces to 'deny' so the child always gets a usable
+    // answer + the diagnostic surfaces on stderr.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    const stderrLines: string[] = [];
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    // biome-ignore lint/suspicious/noExplicitAny: stderr.write overload signature isn't worth typing in a test
+    (process.stderr as any).write = (chunk: unknown): boolean => {
+      stderrLines.push(String(chunk));
+      return true;
+    };
+
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-bad-verdict',
+          toolName: 'bash',
+          args: {},
+          cwd: '/p',
+          prompt: 'q',
+        }),
+      );
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    try {
+      await runSubagent({
+        definition: definition(),
+        prompt: 'go',
+        parentSessionId: parent.id,
+        provider: stubProvider(),
+        parentToolRegistry: buildParentRegistry(echoTool),
+        permissionEngine: buildEngine(),
+        db,
+        cwd: '/p',
+        ipc: true,
+        spawnChildProcess: rig.spawn,
+        // Cast through unknown so TS lets a bogus value reach
+        // the runtime — mimics the JS-caller / TS-any path the
+        // defensive coercion targets.
+        onPermissionAsk: (async () => 'session-allow') as unknown as (req: {
+          subagent: { sessionId: string; name: string };
+        }) => Promise<'allow' | 'deny'>,
+      });
+    } finally {
+      // biome-ignore lint/suspicious/noExplicitAny: restore the patched method
+      (process.stderr as any).write = originalWrite;
+    }
+
+    expect(answers).toHaveLength(1);
+    if (answers[0]?.type === 'permission:answer') {
+      // Coerced to 'deny' (NOT shipped as the bogus
+      // 'session-allow' which would have been parser-refused).
+      expect(answers[0].decision).toBe('deny');
+    }
+    // Diagnostic surfaced.
+    const coercionLine = stderrLines.find((l) => l.includes('invalid decision'));
+    expect(coercionLine).toBeDefined();
+    expect(coercionLine).toContain('session-allow');
+  });
 });

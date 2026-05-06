@@ -885,8 +885,28 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
         })
           .then((decision: PermissionDecision) => {
             inFlightAsks.delete(promptId);
+            // Defensive coercion. The hook signature types
+            // `decision` as PermissionDecision ('allow' | 'deny'),
+            // but JS callers and TS callers reaching this path
+            // through `any` can return arbitrary values. The
+            // child's IPC parser refuses any decision outside
+            // {'allow', 'deny'} as `permission_answer.unknown_decision:<v>`,
+            // routing it to onError instead of onMessage — the
+            // bridge's `pending` entry stays unresolved and the
+            // child blocks on the prompt until channel close or
+            // wall-clock. Coercing invalid values to 'deny'
+            // here means the child always gets a usable answer
+            // and the diagnostic surfaces on stderr so a buggy
+            // hook is debuggable.
+            const safeDecision: PermissionDecision =
+              decision === 'allow' || decision === 'deny' ? decision : 'deny';
+            if (safeDecision !== decision) {
+              process.stderr.write(
+                `subagent ${childSession.id}: onPermissionAsk returned invalid decision (${String(decision)}); coercing to 'deny'\n`,
+              );
+            }
             try {
-              handle.ipc?.send(makePermissionAnswer({ promptId, decision }));
+              handle.ipc?.send(makePermissionAnswer({ promptId, decision: safeDecision }));
             } catch {
               // Channel teardown race — same as above.
             }
