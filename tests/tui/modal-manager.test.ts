@@ -560,6 +560,116 @@ describe('timeout', () => {
     expect(s.manager.pendingCount()).toBe(0);
   });
 
+  test('signal listener detaches when modal resolves naturally (no per-ask leak)', async () => {
+    // Memory hygiene for shared signals — the subagent permission
+    // proxy uses one AbortSignal per child session, but a child
+    // can issue many asks. If every resolved ask left its abort
+    // listener attached, eventual signal abort would fire an O(n)
+    // burst of stale callbacks (each a no-op, but each holding a
+    // closure alive). Verify add/remove balance via a tracked
+    // signal that counts both calls.
+    //
+    // Five asks, all resolved by operator (hotkey '1'). After
+    // resolution, the signal should have ZERO net listeners
+    // attached — five adds matched by five removes.
+    const s = make();
+    const ac = new AbortController();
+    let addCount = 0;
+    let removeCount = 0;
+    const trackedSignal = new Proxy(ac.signal, {
+      get(target, prop) {
+        if (prop === 'addEventListener') {
+          return (
+            type: string,
+            listener: EventListener,
+            options?: AddEventListenerOptions | boolean,
+          ): void => {
+            if (type === 'abort') addCount += 1;
+            target.addEventListener(type, listener, options);
+          };
+        }
+        if (prop === 'removeEventListener') {
+          return (
+            type: string,
+            listener: EventListener,
+            options?: EventListenerOptions | boolean,
+          ): void => {
+            if (type === 'abort') removeCount += 1;
+            target.removeEventListener(type, listener, options);
+          };
+        }
+        const v = Reflect.get(target, prop, target);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    });
+
+    const promises: Promise<unknown>[] = [];
+    for (let i = 0; i < 5; i++) {
+      promises.push(
+        s.manager.askPermission(
+          { toolName: 'b', command: `c${i}`, cwd: '/' },
+          { signal: trackedSignal },
+        ),
+      );
+    }
+    expect(addCount).toBe(5);
+
+    // Resolve each in turn via hotkey '1' (yes). Drain queue.
+    for (let i = 0; i < 5; i++) {
+      s.fs.dispatch(charKey('1'));
+      await promises[i];
+    }
+
+    // Every ask's listener was detached on resolve. Pre-fix:
+    // addCount=5, removeCount=0 → 5 stale listeners would fire
+    // when ac.abort() runs. Post-fix: balanced.
+    expect(removeCount).toBe(5);
+  });
+
+  test('signal listener detaches when modal closes via Esc (cancel path)', async () => {
+    // Esc resolves 'cancel' → resolveActive runs → detach fires.
+    // Same balance check as the natural-resolve test above.
+    const s = make();
+    const ac = new AbortController();
+    let addCount = 0;
+    let removeCount = 0;
+    const trackedSignal = new Proxy(ac.signal, {
+      get(target, prop) {
+        if (prop === 'addEventListener') {
+          return (
+            type: string,
+            listener: EventListener,
+            options?: AddEventListenerOptions | boolean,
+          ): void => {
+            if (type === 'abort') addCount += 1;
+            target.addEventListener(type, listener, options);
+          };
+        }
+        if (prop === 'removeEventListener') {
+          return (
+            type: string,
+            listener: EventListener,
+            options?: EventListenerOptions | boolean,
+          ): void => {
+            if (type === 'abort') removeCount += 1;
+            target.removeEventListener(type, listener, options);
+          };
+        }
+        const v = Reflect.get(target, prop, target);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    });
+
+    const p = s.manager.askPermission(
+      { toolName: 'b', command: 'a', cwd: '/' },
+      { signal: trackedSignal },
+    );
+    expect(addCount).toBe(1);
+    s.fs.dispatch(key('escape'));
+    await expect(p).resolves.toBe('cancel');
+    expect(removeCount).toBe(1);
+  });
+
   test('timeout while still queued: emits modal:queue-depth so the suffix corrects down', async () => {
     // Regression guard. Earlier the queued-timeout branch removed
     // the entry and resolved the promise but never emitted a

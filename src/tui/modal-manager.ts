@@ -36,6 +36,17 @@ interface Pending<Answer extends string = string> {
   options: readonly ConfirmOption[];
   // Optional timeout handle so we can clear it on early resolve.
   timeout: unknown;
+  // Detach the producer-signal abort listener on early resolve.
+  // Without this, every ask whose modal resolved naturally
+  // (operator answer, Esc, timeout) would leave a stale closure
+  // attached to the ConfirmAskOptions.signal — for the subagent
+  // permission-proxy path where N asks share one per-session
+  // signal, that's N retained closures that fire as a useless
+  // O(n) burst when the signal eventually aborts. Set when
+  // the signal listener is wired; called by every resolve path
+  // that isn't the abort itself. Optional because most asks
+  // don't supply a signal.
+  detachAbortListener?: () => void;
 }
 
 export interface ConfirmAskOptions {
@@ -406,6 +417,13 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
     if (pending.timeout !== null && pending.timeout !== undefined) {
       clearTimer(pending.timeout);
     }
+    // Detach the producer-signal abort listener (if any) so a
+    // late signal abort doesn't fire a stale callback for a
+    // modal that already resolved naturally. Idempotent — no-op
+    // for asks that didn't supply a signal, no-op if the
+    // listener already auto-removed via `once: true` (the
+    // signal-abort path that routes through here).
+    pending.detachAbortListener?.();
     if (activeHandler !== null) {
       focusStack.remove(activeHandler);
       activeHandler = null;
@@ -486,11 +504,19 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
       // races between the timeout firing and the signal aborting.
       const cancelPending = (): void => {
         if (active !== null && active.pending === (pending as Pending)) {
+          // Active path: resolveActive detaches the abort
+          // listener for us via pending.detachAbortListener.
           resolveActive('cancel');
           return;
         }
         const idx = queue.indexOf(pending as Pending);
         if (idx >= 0) queue.splice(idx, 1);
+        // Queued path: detach here too so a stale signal
+        // listener doesn't outlive the resolved pending. Same
+        // idempotency story as resolveActive's call: harmless
+        // when the listener already auto-removed (signal-abort
+        // path that routes through here).
+        pending.detachAbortListener?.();
         pending.resolve('cancel' as Answer);
         if (active !== null && idx >= 0) {
           bus.emit({
@@ -520,6 +546,21 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           cancelPending();
         } else {
           signal.addEventListener('abort', cancelPending, { once: true });
+          // Track the listener so resolve paths that DON'T go
+          // through the abort itself (operator answer, Esc,
+          // timeout) can detach it. Without this, every modal
+          // that resolved naturally would leave a stale
+          // closure attached to `signal` until it eventually
+          // aborts — a problem for the subagent permission
+          // proxy where one per-session signal collects
+          // listeners across N asks and fires all of them as a
+          // useless O(n) burst when the channel finally closes.
+          // Local-bind `signal` so the closure narrows past
+          // the optional param.
+          const liveSignal = signal;
+          pending.detachAbortListener = () => {
+            liveSignal.removeEventListener('abort', cancelPending);
+          };
         }
       }
       drain();
