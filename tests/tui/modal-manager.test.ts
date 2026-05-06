@@ -487,6 +487,79 @@ describe('timeout', () => {
     await p1;
   });
 
+  test('producer signal aborts the active modal: resolves cancel + drains next', async () => {
+    const s = make();
+    const ac = new AbortController();
+    const p1 = s.manager.askPermission(
+      { toolName: 'b', command: 'a', cwd: '/' },
+      { signal: ac.signal },
+    );
+    const p2 = s.manager.askPermission({ toolName: 'b', command: 'b', cwd: '/' });
+
+    // p1 active, p2 queued. Aborting p1's signal must close it
+    // and drain p2.
+    ac.abort();
+    await expect(p1).resolves.toBe('cancel');
+
+    // p2 is now active. Resolve to drain.
+    s.fs.dispatch(charKey('1'));
+    await expect(p2).resolves.toBe('yes');
+  });
+
+  test('producer signal aborts a queued modal: emits queue-depth correction', async () => {
+    // Same shape as the queued-timeout regression guard above —
+    // verifies the abort path goes through the same
+    // cancelPending helper. Active stays untouched; the queued
+    // entry vanishes; the active modal's `(+N waiting)` suffix
+    // drops by one.
+    const s = make();
+    const p1 = s.manager.askPermission({ toolName: 'b', command: 'a', cwd: '/' });
+    const firstAsk = s.events.find((e) => e.type === 'permission:ask');
+    const activeId = firstAsk?.type === 'permission:ask' ? firstAsk.promptId : '';
+
+    const ac = new AbortController();
+    const p2 = s.manager.askPermission(
+      { toolName: 'b', command: 'b', cwd: '/' },
+      { signal: ac.signal },
+    );
+    const p3 = s.manager.askPermission({ toolName: 'b', command: 'c', cwd: '/' });
+
+    let depthEvents = s.events.filter((e) => e.type === 'modal:queue-depth');
+    expect(depthEvents).toHaveLength(2);
+    if (depthEvents[1]?.type === 'modal:queue-depth') {
+      expect(depthEvents[1].depth).toBe(2);
+    }
+
+    // Abort p2 (queued). Active (p1) must stay; queue depth corrects to 1.
+    ac.abort();
+    await expect(p2).resolves.toBe('cancel');
+
+    depthEvents = s.events.filter((e) => e.type === 'modal:queue-depth');
+    expect(depthEvents).toHaveLength(3);
+    if (depthEvents[2]?.type === 'modal:queue-depth') {
+      expect(depthEvents[2].depth).toBe(1);
+      expect(depthEvents[2].promptId).toBe(activeId);
+    }
+
+    // Tear down.
+    s.fs.dispatch(key('enter'));
+    await p1;
+    s.fs.dispatch(key('enter'));
+    await p3;
+  });
+
+  test('producer signal pre-aborted: cancels synchronously without ever opening', async () => {
+    const s = make();
+    const ac = new AbortController();
+    ac.abort();
+    const p = s.manager.askPermission(
+      { toolName: 'b', command: 'a', cwd: '/' },
+      { signal: ac.signal },
+    );
+    await expect(p).resolves.toBe('cancel');
+    expect(s.manager.pendingCount()).toBe(0);
+  });
+
   test('timeout while still queued: emits modal:queue-depth so the suffix corrects down', async () => {
     // Regression guard. Earlier the queued-timeout branch removed
     // the entry and resolved the promise but never emitted a

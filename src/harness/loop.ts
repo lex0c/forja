@@ -1275,6 +1275,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                         cwd: string;
                         prompt: string;
                         subagent: { sessionId: string; name: string };
+                        signal: AbortSignal;
                       }) => Promise<PermissionDecision>;
                     } => {
                       const ask = config.confirmPermission;
@@ -1287,6 +1288,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                             cwd: req.cwd,
                             prompt: req.prompt,
                             subagent: req.subagent,
+                            // Forward the per-session abort so
+                            // the modal closes when the child
+                            // dies — without this, an operator
+                            // staring at a modal for a dead
+                            // subagent would have to manually
+                            // dismiss it (and the answer would
+                            // go into a closed channel anyway).
+                            signal: req.signal,
                           });
                           return allowed ? 'allow' : 'deny';
                         },

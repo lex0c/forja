@@ -4478,4 +4478,74 @@ describe('runSubagent — permission proxy (parent)', () => {
       expect(answers[0].decision).toBe('deny');
     }
   });
+
+  test('hook receives a per-session AbortSignal that fires when channel closes', async () => {
+    // Regression guard: a child dying while its modal is open
+    // would otherwise leave the operator staring at a stale
+    // prompt whose answer has nowhere to go (channel closed,
+    // child gone). The runtime now hands the hook a per-session
+    // AbortSignal that fires on channel.onClose; the hook
+    // (REPL bridge) wires it into the modal manager so the modal
+    // closes promptly. Verify the signal is provided AND that
+    // it fires when the channel tears down.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    let observedSignal: AbortSignal | null = null;
+    let signalAbortedAtHookExit = false;
+
+    queueMicrotask(() => {
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-abort',
+          toolName: 'bash',
+          args: {},
+          cwd: '/p',
+          prompt: 'q',
+        }),
+      );
+      // Drive publish on next microtask so the hook is in flight
+      // when the runtime tears the channel down.
+      queueMicrotask(() => {
+        const children = listChildSessions(db, parent.id);
+        const last = children[children.length - 1];
+        if (last !== undefined) rig.publish(last.id);
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      spawnChildProcess: rig.spawn,
+      // Hook holds the promise unresolved until aborted. The
+      // runtime tears the channel down after publish + waitForChild
+      // resolves; channel.onClose then fires the per-session
+      // signal, which we observe via this `await new Promise`
+      // race that resolves when the signal aborts.
+      onPermissionAsk: async (req) => {
+        observedSignal = req.signal;
+        await new Promise<void>((resolve) => {
+          if (req.signal.aborted) {
+            resolve();
+            return;
+          }
+          req.signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+        signalAbortedAtHookExit = req.signal.aborted;
+        return 'deny';
+      },
+    });
+
+    expect(observedSignal).not.toBeNull();
+    expect(signalAbortedAtHookExit).toBe(true);
+  });
 });

@@ -738,6 +738,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     cwd: string;
     prompt: string;
     subagent?: { sessionId: string; name: string };
+    signal?: AbortSignal;
   }): Promise<boolean> => {
     const vocab = lookupToolVocab(req.toolName);
     let command = '';
@@ -770,18 +771,25 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     if (req.subagent !== undefined) {
       command = stripAnsi(command);
     }
-    const answer = await modalManager.askPermission({
-      toolName: req.toolName,
-      command,
-      cwd: req.subagent !== undefined ? stripAnsi(req.cwd) : req.cwd,
-      reason: req.subagent !== undefined ? stripAnsi(req.prompt) : req.prompt,
-      // Forward subagent attribution so the modal can label the
-      // request as coming from a child run (spec
-      // docs/spec/IPC.md §7). Spread keeps the field absent for
-      // the parent's own confirms — the reducer only branches
-      // on its presence.
-      ...(req.subagent !== undefined ? { subagent: req.subagent } : {}),
-    });
+    const answer = await modalManager.askPermission(
+      {
+        toolName: req.toolName,
+        command,
+        cwd: req.subagent !== undefined ? stripAnsi(req.cwd) : req.cwd,
+        reason: req.subagent !== undefined ? stripAnsi(req.prompt) : req.prompt,
+        // Forward subagent attribution so the modal can label the
+        // request as coming from a child run (spec
+        // docs/spec/IPC.md §7). Spread keeps the field absent for
+        // the parent's own confirms — the reducer only branches
+        // on its presence.
+        ...(req.subagent !== undefined ? { subagent: req.subagent } : {}),
+      },
+      // Forward producer cancellation signal. Subagent proxy
+      // wires it to the child's IPC lifetime so a child dying
+      // mid-modal closes the prompt instead of stranding the
+      // operator on a stale request.
+      req.signal !== undefined ? { signal: req.signal } : undefined,
+    );
     // Map the spec-shape answer to the harness's boolean contract.
     // 'session-allow' currently behaves like 'yes' — the policy
     // mutation that would persist a session-layer rule is deferred.

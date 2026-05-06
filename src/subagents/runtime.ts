@@ -266,6 +266,14 @@ export interface RunSubagentInput {
     cwd: string;
     prompt: string;
     subagent: { sessionId: string; name: string };
+    // Per-session abort signal. Fires when the child's IPC
+    // channel closes (peer death, normal exit, hard abort) so
+    // the parent's modal layer can close any open prompt
+    // instead of stranding the operator on a stale request
+    // whose answer would go into a closed pipe. Hook
+    // implementations forward it to ModalManager via
+    // `confirmPermission`'s own `signal` field.
+    signal: AbortSignal;
   }) => Promise<PermissionDecision>;
 }
 
@@ -723,6 +731,36 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     // answer that never arrives would hang past wall-clock.
     {
       const hook = input.onPermissionAsk;
+      // Per-session abort signal threaded into every hook call.
+      // Fires when the IPC channel closes (child died / EOF /
+      // post-wait teardown) — that's the moment the operator's
+      // modal must close, because any answer the operator
+      // produces afterward would land on a dead pipe and the
+      // child can't act on it. Without this, a child crash with
+      // the modal open would strand the operator on a stale
+      // prompt that blocks the rest of the modal queue. The
+      // abort fires AT MOST ONCE per session; AbortController
+      // is idempotent. Subscribe BEFORE wiring the ask handler
+      // so a `permission:ask` arriving simultaneously with a
+      // close (race) sees the signal already set.
+      const askAbort = new AbortController();
+      handle.ipc.onClose(() => askAbort.abort());
+      // Belt-and-suspenders: parent's hard-abort signal also
+      // fires the per-session abort. The channel.onClose path
+      // covers the typical case (waitForChild → handle.ipc.close
+      // → onClose listeners), but a pathological teardown that
+      // closes the underlying transport without firing onClose
+      // (or a future code change that reorders the cleanup)
+      // would leave the modal open. The parent's hard-signal is
+      // a redundant trigger — if it fired, the operator already
+      // gave up on the run.
+      if (input.signal !== undefined) {
+        if (input.signal.aborted) {
+          askAbort.abort();
+        } else {
+          input.signal.addEventListener('abort', () => askAbort.abort(), { once: true });
+        }
+      }
       handle.ipc.onMessage((msg) => {
         if (msg.type !== 'permission:ask') return;
         const promptId = msg.promptId;
@@ -757,6 +795,7 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
           cwd: msg.cwd,
           prompt: msg.prompt,
           subagent: { sessionId: childSession.id, name: definition.name },
+          signal: askAbort.signal,
         })
           .then((decision: PermissionDecision) => {
             try {

@@ -43,6 +43,20 @@ export interface ConfirmAskOptions {
   // timeout (the spec marks `permission:ask` as no-timeout per UI.md
   // §5.5 rule 6; trust:ask uses 5min via the caller).
   timeoutMs?: number;
+  // Producer-driven cancellation. When the signal aborts, the modal
+  // resolves to 'cancel' immediately — same shape as the
+  // timeout/Esc paths. Two cases collapse to the same outcome:
+  //   - Active modal: same as resolveActive('cancel'); fires the
+  //     answer event, drains the next from the queue.
+  //   - Still queued: remove from queue and resolve. Emits a
+  //     queue-depth update keyed to the active modal so the
+  //     `(+N waiting)` suffix corrects down (mirrors the
+  //     queued-timeout path).
+  // Used by the subagent permission proxy (spec docs/spec/IPC.md §7)
+  // so a child dying with its modal open closes the prompt instead
+  // of blocking the operator on a stale request whose answer would
+  // go into a closed channel.
+  signal?: AbortSignal;
 }
 
 export interface PermissionAskArgs {
@@ -418,6 +432,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
     open: (promptId: string) => UIEvent,
     optionsList: readonly ConfirmOption[],
     timeoutMs: number | undefined,
+    signal: AbortSignal | undefined,
   ): Promise<Answer> =>
     new Promise<Answer>((resolve) => {
       // Already-closed manager: resolve immediately as 'cancel' so
@@ -452,32 +467,60 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           depth: queue.length,
         });
       }
+      // Cancel-on-resolve helper — wired by both the timeout and
+      // signal paths to keep the cleanup uniform. Two cases
+      // collapse to the same outcome:
+      //   - Active modal: same as Esc / resolveActive('cancel');
+      //     fires the answer event, drains the next from the
+      //     queue (drain emits its own queue-depth update for
+      //     the newly-active modal).
+      //   - Still queued: remove from queue, resolve the promise,
+      //     and emit queue-depth keyed to the active modal so
+      //     the visible `(+N waiting)` suffix corrects down
+      //     immediately. Without that emit the count would lie
+      //     until the active modal resolves and drain pops the
+      //     next.
+      // Idempotent: a second call on an already-resolved pending
+      // hits `pending.resolve` (no-op on settled promises) and
+      // `queue.indexOf` returns -1 (no double-emit). Safe under
+      // races between the timeout firing and the signal aborting.
+      const cancelPending = (): void => {
+        if (active !== null && active.pending === (pending as Pending)) {
+          resolveActive('cancel');
+          return;
+        }
+        const idx = queue.indexOf(pending as Pending);
+        if (idx >= 0) queue.splice(idx, 1);
+        pending.resolve('cancel' as Answer);
+        if (active !== null && idx >= 0) {
+          bus.emit({
+            type: 'modal:queue-depth',
+            ts: now(),
+            promptId: active.promptId,
+            depth: queue.length,
+          });
+        }
+      };
+
       if (timeoutMs !== undefined && timeoutMs > 0) {
-        pending.timeout = setTimer(() => {
-          // Timeout while ACTIVE: same as Esc (resolve cancel).
-          // Timeout while still queued: drop the entry and resolve.
-          if (active !== null && active.pending === (pending as Pending)) {
-            resolveActive('cancel');
-          } else {
-            const idx = queue.indexOf(pending as Pending);
-            if (idx >= 0) queue.splice(idx, 1);
-            pending.resolve('cancel' as Answer);
-            // Live update for the active modal's `(+N waiting)`
-            // suffix: a queued entry just disappeared. Without
-            // this emit, the visible count would lie until the
-            // active modal resolves and drain pops the next.
-            // Mirror image of the enqueue-side bump in
-            // enqueueConfirm above.
-            if (active !== null && idx >= 0) {
-              bus.emit({
-                type: 'modal:queue-depth',
-                ts: now(),
-                promptId: active.promptId,
-                depth: queue.length,
-              });
-            }
-          }
-        }, timeoutMs);
+        pending.timeout = setTimer(cancelPending, timeoutMs);
+      }
+      // Producer signal — wires the same cancel path as timeout.
+      // The signal handler runs at most once: AbortSignal listeners
+      // fire on the first abort and don't re-fire. `cancelPending`
+      // itself is idempotent over the pending entry's identity
+      // (resolve is a no-op after the promise already settled),
+      // so a late timer firing AFTER the signal already cancelled
+      // (or vice versa) is harmless.
+      if (signal !== undefined) {
+        if (signal.aborted) {
+          // Pre-aborted signal: cancel synchronously. We already
+          // pushed onto the queue, so cancelPending finds the
+          // entry and resolves immediately as cancel.
+          cancelPending();
+        } else {
+          signal.addEventListener('abort', cancelPending, { once: true });
+        }
       }
       drain();
     });
@@ -498,6 +541,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         }),
         PERMISSION_OPTIONS(args.toolName),
         opts?.timeoutMs,
+        opts?.signal,
       ),
     askTrust: (args, opts) =>
       enqueueConfirm<TrustAnswer>(
@@ -510,6 +554,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         }),
         TRUST_OPTIONS,
         opts?.timeoutMs,
+        opts?.signal,
       ),
     askHistoryClear: (args, opts) =>
       enqueueConfirm<HistoryClearAnswer>(
@@ -522,6 +567,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         }),
         HISTORY_CLEAR_OPTIONS,
         opts?.timeoutMs,
+        opts?.signal,
       ),
     askMemoryWrite: (args, opts) =>
       enqueueConfirm<MemoryWriteAnswer>(
@@ -535,6 +581,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         }),
         MEMORY_WRITE_OPTIONS,
         opts?.timeoutMs,
+        opts?.signal,
       ),
     askMemoryUserScope: (args, opts) =>
       enqueueConfirm<MemoryWriteAnswer>(
@@ -547,6 +594,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         }),
         MEMORY_USER_SCOPE_OPTIONS,
         opts?.timeoutMs,
+        opts?.signal,
       ),
     askMemoryAction: (args, opts) =>
       enqueueConfirm<MemoryWriteAnswer>(
@@ -562,6 +610,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
         }),
         MEMORY_ACTION_OPTIONS,
         opts?.timeoutMs,
+        opts?.signal,
       ),
     pendingCount: () => (active !== null ? 1 : 0) + queue.length,
     close: () => {
