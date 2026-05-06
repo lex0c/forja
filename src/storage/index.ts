@@ -162,3 +162,13 @@ export type {
   HookRunsLayer,
   HookRunsOutcome,
 } from './repos/hook-runs.ts';
+
+export {
+  insertCostProgressEvent,
+  listCostProgressByHandle,
+  listCostProgressByParent,
+} from './repos/cost-progress-events.ts';
+export type {
+  CostProgressEvent,
+  InsertCostProgressEventInput,
+} from './repos/cost-progress-events.ts';

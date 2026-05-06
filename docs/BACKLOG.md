@@ -15,6 +15,80 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — persisted cost-progress event stream (audit fix #2)
+
+Auditability gap. Each child subagent emits `cost_update`
+HarnessEvents over IPC every time its `totalCostUsd`
+advances (turn settle, compaction, partial provider-error
+charge). The parent's `onChildEventForwarder` consumed them
+in-memory for two purposes — drive the reservation tracker
+(`recordLiveCost`) and run the cost-cap watchdog — then
+discarded the event. Only the FINAL settled cost landed in
+`subagent_handles.settled_payload.costUsd`. Postmortem
+queries asking "what was handle X's cumulative spend at
+minute 3?" or "did the spend curve spike or burn slowly?"
+had nothing to work with.
+
+Fix: new table `cost_progress_events` (migration 022)
+captures the stream. The harness's IPC handler now ALSO
+inserts each `cost_update` into the table, alongside the
+existing `recordLiveCost` and watchdog calls. Best-effort:
+SQLITE_BUSY / FK throws are caught and stderr-warned per the
+D208 fail-soft pattern — losing one event degrades curve
+resolution but the live tracker already observed it, so the
+run is unaffected.
+
+| File | Change |
+|---|---|
+| `src/storage/migrations/022-cost-progress-events.ts` | NEW. Table `cost_progress_events` with `(handle_id FK CASCADE, parent_session_id FK CASCADE, delta, cumulative, recorded_at)` and two indexes (per-handle + per-parent reconstruction). Both FKs cascade so dropping a session reaps the whole stream; dropping a single handle row reaps just its slice. `parent_session_id` denormalized off `subagent_handles` to skip the join on whole-session queries. |
+| `src/storage/migrations/index.ts` | Migration 022 wired into the registry. |
+| `src/storage/repos/cost-progress-events.ts` | NEW. `insertCostProgressEvent`, `listCostProgressByHandle` (per-handle reconstruction), `listCostProgressByParent` (whole-session). Deterministic ordering: `recorded_at ASC, id ASC` so same-tick inserts preserve insertion order. |
+| `src/storage/index.ts` | Barrel re-exports. |
+| `src/harness/loop.ts` | `onChildEventForwarder` now also calls `insertCostProgressEvent` after `recordLiveCost`. Wrapped in try/catch with stderr warn — DB failures don't escalate. The watchdog cap-cross check remains downstream of the insert so a persist throw doesn't skip cancellation. **Persist runs UNCONDITIONALLY** of `recordLiveCost`'s monotonic / cancelled guards: a late `cost_update` arriving after `cancelAll` is no-op'd by the in-memory tracker but STILL inserted, since the child was actually burning tokens until its observed-abort point — audit truth requires those rows. The model-side view (settled cancelled envelope) and the table view (post-cancel cumulative growth) describe different layers; both are correct. |
+| `tests/storage/cost-progress-events.test.ts` | NEW. Six tests: round-trip insert+list, same-tick id-tiebreak, listByParent aggregating across handles, FK cascade on session drop, FK cascade on individual handle drop, default `recordedAt` uses `Date.now()`. |
+| `tests/harness/task-async-e2e.test.ts` | TWO new e2e tests. (a) Single-event coverage: spawns one child via the existing in-process pattern with a provider that emits a `usage` event and non-zero pricing; asserts the IPC stream landed (≥1 row, `cumulative > 0`, `parent_session_id` matches, monotonic). (b) Multi-event coverage (review fix): a two-turn child producing two `cost_update` events; asserts ≥2 rows persist with strict monotonic cumulative, every delta > 0, and `sum(deltas) === final_cumulative` within FP tolerance. The second test was added in response to the reviewer flag that single-event coverage doesn't prove stream behavior across emissions. |
+
+**Decision:**
+
+- **D220 — Persist cost stream alongside the in-memory
+  tracker, not in place of it.** The in-memory
+  `getReservedChildCostUsd` / `getLiveCostUsd` getters drive
+  hot-path behavior (cap watchdog, pre-spawn projection); the
+  DB stream drives cold-path forensics. Two distinct
+  consumers, two distinct write paths — keeping the live
+  tracker independent of the DB ensures a transient
+  SQLITE_BUSY can't stall the watchdog. The fail-soft
+  try/catch on the insert is the load-bearing decision: a
+  missed audit row is observably worse than a watchdog
+  pause, but the watchdog only runs against in-memory state
+  so persist failure doesn't cascade.
+
+- **`recorded_at` is parent receive time, not child emit
+  time.** The cap watchdog operates on the parent's
+  timeline; correlating cost spikes to other parent-side
+  events (turn IDs, hook fires, cancel signals) needs the
+  same clock. Child emit times — if a downstream tool ever
+  needs them — are recoverable from the child session's own
+  audit rows.
+
+- **Spec update deferred.** ORCHESTRATION.md §3.5 mentions
+  the IPC contract but not persistence. Spec PR logged as
+  follow-up alongside D217's CONTRACTS.md update.
+
+- **Follow-up logged: `PRAGMA busy_timeout`.** Reviewer
+  noted `db.ts` sets WAL + `synchronous=NORMAL` but no
+  `busy_timeout`. Concurrent writers (parent + N child
+  processes) can throw SQLITE_BUSY; the try/catch swallows
+  it — losing rows. A 5s busy_timeout would absorb
+  transient contention without losing data. Not in this
+  slice's scope (DB-wide config change touches every
+  writer); logged as a separate cleanup.
+
+Verification: typecheck clean, lint clean, 3117 pass / 0
+fail (8 new tests).
+
+---
+
 ## [2026-05-06] parallel — cancel-source attribution on settled handles (audit fix #1)
 
 Auditability gap. Three different call sites cancel handles

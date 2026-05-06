@@ -391,4 +391,353 @@ describe('task_async / task_await — full e2e through harness loop and real chi
     // had the cancel not propagated.
     expect(elapsed).toBeLessThan(1500);
   });
+
+  test('cost_update IPC events persist into cost_progress_events (audit fix #2)', async () => {
+    // E2E for migration 022. The parent's onChildEventForwarder
+    // observes `cost_update` HarnessEvents arriving via IPC and
+    // INSERTs each into `cost_progress_events`. This test
+    // exercises the full path: child runAgent emits cost_update
+    // when its turnCostUsd advances → IPC → parent forwarder
+    // → INSERT.
+    //
+    // The pre-existing `task_async` e2e tests use
+    // cost_per_1k_*: 0, which means turnCostUsd stays 0 and
+    // emitCostUpdate's `delta <= 0` skip fires. To trigger an
+    // event we need a provider with non-zero pricing AND a
+    // `usage` event in the child's stream — both supplied here
+    // inline.
+    const childWithCost = (): Provider => ({
+      id: 'mock/child-cost',
+      family: 'anthropic',
+      capabilities: {
+        tools: 'native',
+        cache: false,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 1000,
+        output_max_tokens: 100,
+        cost_per_1k_input: 3.0,
+        cost_per_1k_output: 15.0,
+        notes: [],
+      },
+      async *generate() {
+        yield { kind: 'start', message_id: `child-${crypto.randomUUID()}` };
+        yield { kind: 'text_delta', text: 'priced output' };
+        yield {
+          kind: 'usage',
+          usage: { input: 100, output: 20, cache_read: 0, cache_creation: 0 },
+        };
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    });
+
+    let capturedHandle = '';
+    const script: ScriptedStep[] = [
+      {
+        tool_uses: [
+          { id: 'tu1', name: 'task_async', input: { subagent: 'explore', prompt: 'go' } },
+        ],
+        stop_reason: 'tool_use',
+      },
+      // Placeholder; replaced once we have the handle id.
+      { text: 'unused', stop_reason: 'end_turn' },
+      { text: 'done', stop_reason: 'end_turn' },
+    ];
+    let req = 0;
+    const parent: Provider = {
+      ...buildParentProvider(script),
+      async *generate(reqArgs) {
+        req += 1;
+        if (req === 1) {
+          for (const ev of replayStep(script[0] as ScriptedStep)) yield ev;
+          return;
+        }
+        if (req === 2) {
+          const lastUser = reqArgs.messages[reqArgs.messages.length - 1];
+          if (lastUser !== undefined && Array.isArray(lastUser.content)) {
+            for (const block of lastUser.content) {
+              if (block.type === 'tool_result' && typeof block.content === 'string') {
+                const parsed = JSON.parse(block.content) as { handle_id?: string };
+                if (typeof parsed.handle_id === 'string') capturedHandle = parsed.handle_id;
+              }
+            }
+          }
+          const step2: ScriptedStep = {
+            tool_uses: [{ id: 'tw1', name: 'task_await', input: { handle_id: capturedHandle } }],
+            stop_reason: 'tool_use',
+          };
+          for (const ev of replayStep(step2)) yield ev;
+          return;
+        }
+        for (const ev of replayStep({ text: 'done', stop_reason: 'end_turn' })) yield ev;
+      },
+    };
+
+    const parentRegistry = createToolRegistry();
+    registerBuiltinTools(parentRegistry);
+    const engine = createPermissionEngine(policy(), { cwd: '/p' });
+    const subagentRegistry: SubagentSet = {
+      // Generous cost cap so the child's $0.60 spend fits.
+      byName: new Map([['explore', definition({ budget: { maxSteps: 5, maxCostUsd: 1.0 } })]]),
+      shadows: [],
+    };
+
+    const spawn: SpawnChildProcess = (opts) => {
+      const { a, b } = fakeTransportPair();
+      const parentChannel = createChannel(a);
+      const exited = runSubagentChild({
+        sessionId: opts.sessionId,
+        dbPath,
+        providerOverride: childWithCost(),
+        userAgentsDir: null,
+        projectAgentsDir: null,
+        errSink: () => undefined,
+        ipcVersion: 1,
+        ipcTransportFactory: () => b,
+      }).then((exitCode) => ({ exitCode }));
+      return { exited, kill: () => undefined, ipc: parentChannel };
+    };
+
+    const result = await runAgent({
+      provider: parent,
+      toolRegistry: parentRegistry,
+      permissionEngine: engine,
+      db,
+      cwd: '/p',
+      userPrompt: 'go',
+      subagentRegistry,
+      spawnChildProcess: spawn,
+      budget: { maxConcurrentSubagents: 1, maxCostUsd: 5.0 },
+    });
+
+    expect(result.status).toBe('done');
+    expect(capturedHandle).not.toBe('');
+
+    // The child's single turn at $0.60 should produce at least
+    // one cost_progress_events row. We can't assert an exact
+    // count because the child's runAgent may emit additional
+    // events (compaction, partial provider-error charges) on
+    // some paths; the load-bearing invariant is "the stream
+    // landed at all" + "cumulative is non-zero" + "the row
+    // links to this run's handle and parent session."
+    const rows = db
+      .query<
+        {
+          id: number;
+          handle_id: string;
+          parent_session_id: string;
+          delta: number;
+          cumulative: number;
+        },
+        [string]
+      >(
+        `SELECT id, handle_id, parent_session_id, delta, cumulative
+           FROM cost_progress_events
+          WHERE handle_id = ?
+          ORDER BY id ASC`,
+      )
+      .all(capturedHandle);
+    expect(rows.length).toBeGreaterThanOrEqual(1);
+    const last = rows[rows.length - 1];
+    expect(last?.cumulative).toBeGreaterThan(0);
+    expect(last?.parent_session_id).toBe(result.sessionId);
+    // Monotonic cumulative across the stream — handle store
+    // already enforces in-memory; the persisted stream must
+    // reflect the same property.
+    let prev = 0;
+    for (const r of rows) {
+      expect(r.cumulative).toBeGreaterThanOrEqual(prev);
+      prev = r.cumulative;
+    }
+  });
+
+  test('multi-turn child produces multiple cost_progress rows in monotonic order (audit fix #2 review)', async () => {
+    // Counterpart to the single-event test. The reviewer
+    // flagged that one-event coverage doesn't prove the
+    // stream behavior across multiple emissions. This child
+    // runs two turns: it emits a tool_use in turn 1, the
+    // harness's invokeTool runs (no-op echo), turn 2 settles
+    // with end_turn. Both turns produce usage events, so two
+    // distinct cost_updates flow over IPC and two
+    // cost_progress_events rows must persist with monotonic
+    // cumulative.
+    const childMultiTurn = (): Provider => {
+      let turn = 0;
+      return {
+        id: 'mock/child-multi',
+        family: 'anthropic',
+        capabilities: {
+          tools: 'native',
+          cache: false,
+          vision: false,
+          streaming: true,
+          constrained: 'tools',
+          context_window: 1000,
+          output_max_tokens: 100,
+          cost_per_1k_input: 3.0,
+          cost_per_1k_output: 15.0,
+          notes: [],
+        },
+        async *generate() {
+          turn += 1;
+          yield { kind: 'start', message_id: `child-${crypto.randomUUID()}` };
+          if (turn === 1) {
+            // Echo tool to force a second turn — registerBuiltinTools
+            // gives the child `read_file` and friends, but echo's
+            // simpler. Use one that exists for child via inheritance:
+            // `read_file` requires args; we'll hit the second-turn
+            // path with a permission-denied path that still costs.
+            // Easier: emit text_delta then end_turn turn1, then keep
+            // the script alive for a follow-up. Actually cleanest:
+            // emit usage in turn 1, end_turn; the child's runAgent
+            // ends. So we need TWO turns from the child = a tool_use
+            // turn + a final-text turn.
+            //
+            // Approach: yield tool_use for `read_file` against an
+            // unreadable path; the result tool_error feeds turn 2.
+            yield {
+              kind: 'tool_use_start',
+              id: 'tu_child_1',
+              name: 'read_file',
+            };
+            yield {
+              kind: 'tool_use_stop',
+              id: 'tu_child_1',
+              final_args: { path: '/nonexistent-file-for-test' },
+            };
+            yield {
+              kind: 'usage',
+              usage: { input: 100, output: 20, cache_read: 0, cache_creation: 0 },
+            };
+            yield { kind: 'stop', reason: 'tool_use' };
+            return;
+          }
+          // Turn 2: terminal text after the tool error.
+          yield { kind: 'text_delta', text: 'done' };
+          yield {
+            kind: 'usage',
+            usage: { input: 50, output: 10, cache_read: 0, cache_creation: 0 },
+          };
+          yield { kind: 'stop', reason: 'end_turn' };
+        },
+        generateConstrained: () => Promise.reject(new Error('n/a')),
+        countTokens: () => Promise.resolve(0),
+      };
+    };
+
+    let capturedHandle = '';
+    const script: ScriptedStep[] = [
+      {
+        tool_uses: [
+          { id: 'tu1', name: 'task_async', input: { subagent: 'explore', prompt: 'go' } },
+        ],
+        stop_reason: 'tool_use',
+      },
+      { text: 'unused', stop_reason: 'end_turn' },
+      { text: 'done', stop_reason: 'end_turn' },
+    ];
+    let req = 0;
+    const parent: Provider = {
+      ...buildParentProvider(script),
+      async *generate(reqArgs) {
+        req += 1;
+        if (req === 1) {
+          for (const ev of replayStep(script[0] as ScriptedStep)) yield ev;
+          return;
+        }
+        if (req === 2) {
+          const lastUser = reqArgs.messages[reqArgs.messages.length - 1];
+          if (lastUser !== undefined && Array.isArray(lastUser.content)) {
+            for (const block of lastUser.content) {
+              if (block.type === 'tool_result' && typeof block.content === 'string') {
+                const parsed = JSON.parse(block.content) as { handle_id?: string };
+                if (typeof parsed.handle_id === 'string') capturedHandle = parsed.handle_id;
+              }
+            }
+          }
+          const step2: ScriptedStep = {
+            tool_uses: [{ id: 'tw1', name: 'task_await', input: { handle_id: capturedHandle } }],
+            stop_reason: 'tool_use',
+          };
+          for (const ev of replayStep(step2)) yield ev;
+          return;
+        }
+        for (const ev of replayStep({ text: 'done', stop_reason: 'end_turn' })) yield ev;
+      },
+    };
+
+    const parentRegistry = createToolRegistry();
+    registerBuiltinTools(parentRegistry);
+    const engine = createPermissionEngine(policy(), { cwd: '/p' });
+    const subagentRegistry: SubagentSet = {
+      // Cap = 1.0 so two turns at $0.6 each (= $1.2 total)
+      // would normally exceed; we only need one to settle —
+      // the child's own budget gate handles it.
+      // We use $5.0 here for the child to be sure it
+      // completes both turns without budget interference.
+      byName: new Map([
+        ['explore', definition({ budget: { maxSteps: 5, maxCostUsd: 5.0 }, tools: ['read_file'] })],
+      ]),
+      shadows: [],
+    };
+
+    const spawn: SpawnChildProcess = (opts) => {
+      const { a, b } = fakeTransportPair();
+      const parentChannel = createChannel(a);
+      const exited = runSubagentChild({
+        sessionId: opts.sessionId,
+        dbPath,
+        providerOverride: childMultiTurn(),
+        userAgentsDir: null,
+        projectAgentsDir: null,
+        errSink: () => undefined,
+        ipcVersion: 1,
+        ipcTransportFactory: () => b,
+      }).then((exitCode) => ({ exitCode }));
+      return { exited, kill: () => undefined, ipc: parentChannel };
+    };
+
+    const result = await runAgent({
+      provider: parent,
+      toolRegistry: parentRegistry,
+      permissionEngine: engine,
+      db,
+      cwd: '/p',
+      userPrompt: 'go',
+      subagentRegistry,
+      spawnChildProcess: spawn,
+      budget: { maxConcurrentSubagents: 1, maxCostUsd: 20.0 },
+    });
+
+    expect(result.status).toBe('done');
+    const rows = db
+      .query<{ id: number; delta: number; cumulative: number }, [string]>(
+        `SELECT id, delta, cumulative
+           FROM cost_progress_events
+          WHERE handle_id = ?
+          ORDER BY id ASC`,
+      )
+      .all(capturedHandle);
+    // Two turns, both with usage events, must produce at
+    // least two rows.
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+    // Strict monotonicity: every cumulative >= the prior;
+    // every delta > 0 (the emitter at loop.ts skips zero
+    // deltas).
+    let prev = 0;
+    for (const r of rows) {
+      expect(r.cumulative).toBeGreaterThanOrEqual(prev);
+      expect(r.delta).toBeGreaterThan(0);
+      prev = r.cumulative;
+    }
+    // Sum of deltas should match the final cumulative (within
+    // floating-point tolerance) — the contract that
+    // `cumulative_n = sum(delta_1..n)` at the source.
+    const deltaSum = rows.reduce((acc, r) => acc + r.delta, 0);
+    const finalCum = rows[rows.length - 1]?.cumulative ?? 0;
+    expect(Math.abs(deltaSum - finalCum)).toBeLessThan(1e-9);
+  });
 });

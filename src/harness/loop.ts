@@ -21,6 +21,7 @@ import {
   completeSession,
   createSession,
   getSession,
+  insertCostProgressEvent,
   listMessageTailBySession,
   reopenSession,
 } from '../storage/index.ts';
@@ -837,6 +838,46 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                     e.lastEvent.type === 'cost_update'
                   ) {
                     trackerStore.recordLiveCost(trackerHandleId, e.lastEvent.cumulative);
+                    // Persist the cost-update into the audit
+                    // stream (migration 022, audit fix #2). The
+                    // in-memory tracker drives live behavior
+                    // (reservation tracking, watchdog); this
+                    // INSERT is purely for postmortem
+                    // reconstruction. Best-effort: a DB throw
+                    // (SQLITE_BUSY under WAL contention; FK
+                    // violation if the parent session row was
+                    // dropped mid-run) MUST NOT take the harness
+                    // down — losing one event degrades curve
+                    // resolution but the live tracker already
+                    // observed it.
+                    //
+                    // Persist runs UNCONDITIONALLY of the
+                    // tracker's monotonic / cancelled guards.
+                    // A late `cost_update` arriving after
+                    // `cancelAll` lands at the parent will be
+                    // no-op'd by `recordLiveCost` (cancelled
+                    // record guard) but STILL inserted here —
+                    // audit truth: the child kept burning
+                    // tokens until its observed-abort point,
+                    // and forensic queries deserve to see
+                    // those rows. The model-side view (settled
+                    // `cancelled` envelope) and the table view
+                    // (post-cancel cumulative growth) are both
+                    // correct; they describe different layers.
+                    try {
+                      insertCostProgressEvent(config.db, {
+                        handleId: trackerHandleId,
+                        parentSessionId: sessionId,
+                        delta: e.lastEvent.delta,
+                        cumulative: e.lastEvent.cumulative,
+                      });
+                    } catch (persistErr) {
+                      const message =
+                        persistErr instanceof Error ? persistErr.message : String(persistErr);
+                      console.error(
+                        `cost_progress persist failed for handle ${trackerHandleId}: ${message}`,
+                      );
+                    }
                     if (budget.maxCostUsd !== undefined) {
                       const reserved = trackerStore.getReservedChildCostUsd();
                       const total =
