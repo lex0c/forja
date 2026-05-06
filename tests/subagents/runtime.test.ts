@@ -4634,4 +4634,250 @@ describe('runSubagent — permission proxy (parent)', () => {
     expect(addCount).toBe(1);
     expect(removeCount).toBe(1);
   });
+
+  test('rate limit: cap exceeded auto-denies without invoking the hook', async () => {
+    // Bound on concurrent permission asks per child session.
+    // Defends the operator's modal queue when a child is in a
+    // confirm-loop. With cap=2 and three asks emitted rapidly,
+    // the first two flow to the hook; the third is auto-denied
+    // and never reaches the hook.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    let hookCallCount = 0;
+    let releaseHookA: (() => void) | undefined;
+    let releaseHookB: (() => void) | undefined;
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      // Three asks in rapid succession.
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-A',
+          toolName: 'bash',
+          args: { command: '1' },
+          cwd: '/p',
+          prompt: 'q1',
+        }),
+      );
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-B',
+          toolName: 'bash',
+          args: { command: '2' },
+          cwd: '/p',
+          prompt: 'q2',
+        }),
+      );
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-C',
+          toolName: 'bash',
+          args: { command: '3' },
+          cwd: '/p',
+          prompt: 'q3',
+        }),
+      );
+      // Wait briefly for the runtime to observe all three, then
+      // release the held hooks so they resolve and the run can end.
+      queueMicrotask(() => {
+        queueMicrotask(() => {
+          if (releaseHookA !== undefined) releaseHookA();
+          if (releaseHookB !== undefined) releaseHookB();
+          const children = listChildSessions(db, parent.id);
+          const last = children[children.length - 1];
+          if (last !== undefined) rig.publish(last.id);
+        });
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      maxPendingPermissionAsks: 2,
+      spawnChildProcess: rig.spawn,
+      onPermissionAsk: async () => {
+        hookCallCount += 1;
+        // Hold the hook until released so the cap fills up.
+        await new Promise<void>((resolve) => {
+          if (hookCallCount === 1) releaseHookA = resolve;
+          else if (hookCallCount === 2) releaseHookB = resolve;
+          else resolve();
+        });
+        return 'allow';
+      },
+    });
+
+    // Only the first two asks reached the hook; the third was
+    // auto-denied at the rate-limit gate.
+    expect(hookCallCount).toBe(2);
+    // Three answers total (two from hook + one synthetic deny).
+    expect(answers).toHaveLength(3);
+    const byPid = new Map<string, string>();
+    for (const a of answers) {
+      if (a.type === 'permission:answer') byPid.set(a.promptId, a.decision);
+    }
+    expect(byPid.get('pid-A')).toBe('allow');
+    expect(byPid.get('pid-B')).toBe('allow');
+    expect(byPid.get('pid-C')).toBe('deny'); // rate-limited
+  });
+
+  test('rate limit: slot frees up after a hook resolves', async () => {
+    // After the first ask resolves, the cap drops back below
+    // the threshold and the next ask flows through normally.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    let hookCallCount = 0;
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      // First ask. Hook resolves immediately (allow). Slot frees.
+      rig.childChannel.send(
+        makePermissionAsk({
+          promptId: 'pid-1',
+          toolName: 'bash',
+          args: {},
+          cwd: '/p',
+          prompt: 'q1',
+        }),
+      );
+      // Second ask after first resolves. With cap=1, this
+      // would auto-deny if the slot didn't free. Use multiple
+      // microtasks to give the first hook time to resolve.
+      queueMicrotask(() => {
+        queueMicrotask(() => {
+          rig.childChannel.send(
+            makePermissionAsk({
+              promptId: 'pid-2',
+              toolName: 'bash',
+              args: {},
+              cwd: '/p',
+              prompt: 'q2',
+            }),
+          );
+          queueMicrotask(() => {
+            const children = listChildSessions(db, parent.id);
+            const last = children[children.length - 1];
+            if (last !== undefined) rig.publish(last.id);
+          });
+        });
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      maxPendingPermissionAsks: 1,
+      spawnChildProcess: rig.spawn,
+      onPermissionAsk: async () => {
+        hookCallCount += 1;
+        return 'allow';
+      },
+    });
+
+    expect(hookCallCount).toBe(2);
+    expect(answers).toHaveLength(2);
+    const byPid = new Map<string, string>();
+    for (const a of answers) {
+      if (a.type === 'permission:answer') byPid.set(a.promptId, a.decision);
+    }
+    expect(byPid.get('pid-1')).toBe('allow');
+    expect(byPid.get('pid-2')).toBe('allow');
+  });
+
+  test('rate limit: cap=0 disables the gate (stress-testing surface)', async () => {
+    // Opt-out path: setting cap to 0 should let unlimited asks
+    // through. Verifies the `askCap > 0` check ordering — with
+    // an integer-zero cap we never even read the in-flight set.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const rig = buildPermissionRig();
+    const answers: IpcMessage[] = [];
+    let hookCallCount = 0;
+    const releases: Array<() => void> = [];
+    rig.childChannel.onMessage((m) => {
+      if (m.type === 'permission:answer') answers.push(m);
+    });
+
+    queueMicrotask(() => {
+      // 10 asks in rapid succession — would saturate the
+      // default cap (5) but cap=0 lets them all through.
+      for (let i = 0; i < 10; i++) {
+        rig.childChannel.send(
+          makePermissionAsk({
+            promptId: `pid-${i}`,
+            toolName: 'bash',
+            args: {},
+            cwd: '/p',
+            prompt: `q${i}`,
+          }),
+        );
+      }
+      queueMicrotask(() => {
+        queueMicrotask(() => {
+          for (const r of releases) r();
+          const children = listChildSessions(db, parent.id);
+          const last = children[children.length - 1];
+          if (last !== undefined) rig.publish(last.id);
+        });
+      });
+    });
+
+    await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      ipc: true,
+      maxPendingPermissionAsks: 0,
+      spawnChildProcess: rig.spawn,
+      onPermissionAsk: async () => {
+        hookCallCount += 1;
+        await new Promise<void>((resolve) => {
+          releases.push(resolve);
+        });
+        return 'allow';
+      },
+    });
+
+    // All 10 reached the hook (none rate-limited).
+    expect(hookCallCount).toBe(10);
+    expect(answers).toHaveLength(10);
+    for (const a of answers) {
+      if (a.type === 'permission:answer') {
+        expect(a.decision).toBe('allow');
+      }
+    }
+  });
 });
