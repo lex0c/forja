@@ -15,6 +15,183 @@ Format:
 
 ---
 
+## [2026-05-06] parallel — TUI footer queue split + parallel-tools chip
+
+User-prompted gap audit: "como a TUI exibe o paralelismo?"
+This slice closes the remaining two visibility gaps the
+audit identified — combining queue depth with running count
+in the subagents footer chip, and surfacing the parallel-
+tool dispatcher's running count alongside the cap.
+
+Pre-D234, the footer counter `subagents N` agreed all
+runs (sync + async, dispatched + queued) into one
+number. With cap=3 and 5 task_async calls, the operator
+saw `subagents 5` with no signal that 2 were waiting on
+slot acquisition. Similarly, the parallel-tool path
+showed N concurrent cards but no aggregate — operators
+couldn't tell whether they were running near or below the
+cap.
+
+| File | Change |
+|---|---|
+| `src/harness/types.ts` | New `HarnessEvent` variant `parallel_status` carrying `subagentsRunning`, `subagentsQueued`, `subagentsCap`, `toolsRunning`, `toolsCap`. Documented as the snapshot the harness fires whenever the in-flight or queued counts change. |
+| `src/subagents/handle-store.ts` | Store gains a `queuedCount()` getter and an `onStateChange` option. Internal counter `queued` increments on `spawn` (fires callback), decrements when the IIFE wakes from `acquireSlot` (fires callback again). Settle (`status='running'` → `'settled'`) also fires. Three transitions per record: spawn / dispatch / settle — all emit. |
+| `src/harness/loop.ts` | New helper `emitParallelStatus()` snapshots the store + run-local `parallelToolsRunning` / `parallelToolsCap` counters and `safeEmit`s `parallel_status`. Wired into the store's `onStateChange`; also called before/after each `safeInvokeOne` (parallel tool branch only). The cap is set to `min(parallelCap, tool_uses.length)` for the duration of the batch and reset to 0 after. |
+| `src/tui/events.ts` | New `ParallelStatusEvent` UIEvent + union member. |
+| `src/tui/harness-adapter.ts` | New top-level case translates `parallel_status` 1:1 to `parallel:status`. |
+| `src/tui/state.ts` | New `state.parallelStatus` field (nullable; null until the first event lands and on session boundaries). New reducer case writes the snapshot. |
+| `src/tui/render/footer.ts` | Two new chip variants. (a) `subagents R+Q/cap` when `parallelStatus !== null && R+Q > 0`, with the `+Q` segment suppressed at queue=0 (pure-running state reads as `subagents 2/3` rather than `subagents 2+0/3`). (b) `tools R/cap` when `R > 1`. Single-tool runs leave the chip off — the per-tool card already shows them. Fallback to legacy `subagents N` when `parallelStatus === null` covers pre-event surfaces. |
+| `tests/subagents/handle-store.test.ts` | Two new tests: `queuedCount` reflects unmet `acquireSlot`s; `onStateChange` fires on spawn / dispatch / settle (>=3 transitions per record). |
+| `tests/tui/state.test.ts` | New describe `parallel:status reducer`: initial state nullable; reducer writes the snapshot; subsequent events overwrite; session boundary clears. |
+| `tests/tui/render/footer.test.ts` | Five new chip-rendering tests: `R+Q/cap` shape; queue-suffix suppressed at 0; both chips suppressed at zero; `tools R/cap` shows only when R > 1; null `parallelStatus` falls back to legacy chip. |
+| `tests/tui/harness-adapter.test.ts` | One new translation test: `parallel_status` lands as `parallel:status` with all five counters preserved. |
+
+**Decision:**
+
+- **D234 — `R+Q/cap` shape, not `total/cap`.** The two
+  numbers carry distinct operator signal. `total/cap` would
+  compress "5 tasks emitted, 3 running" and "5 tasks
+  emitted, 5 running" into the same `5/3` — the operator
+  loses the queue depth, which is the figure they actually
+  use to decide "should I wait or kill some?". The
+  `R+Q/cap` shape costs one extra char (`+0` / `+2`) and
+  surfaces the queue at a glance; the queue-zero
+  suppression keeps the common case visually clean.
+
+- **Tools chip suppressed at R=1.** A single tool in flight
+  is visible via its per-tool card; adding `tools 1/3` to
+  the footer would be a duplicate signal at best, noise at
+  worst. The chip exists specifically for "running multiple
+  in parallel" — visible only when that condition holds.
+
+- **Legacy fallback preserved.** The footer chip falls back
+  to `state.subagents.size` when `parallelStatus === null`.
+  Two reasons: (a) a brief window between `subagent:start`
+  and the first `parallel_status` event fires, which
+  shouldn't go visually empty; (b) any future surface that
+  bypasses the harness's emission still gets a basic chip.
+  The branch evaporates once `parallel_status` arrives.
+
+- **D235 — Cap-watchdog fires once per run.** Code review
+  caught that `cap_watchdog_fired` could emit multiple
+  times for one effective watchdog event: after the first
+  `cancelAll('cap_watchdog')`, every cancelled record
+  contributes 0 to the reservation, but
+  `cumulativeChildCostUsd` already accumulated the
+  pre-cancel cost and stays > cap. Any `cost_update` still
+  queued in the IPC pipe (the child hadn't yet observed
+  the abort signal) re-enters the same `total > cap`
+  branch and re-emits the banner. Fix: a run-scoped
+  `capWatchdogFired` latch. Set BEFORE `cancelAll` so
+  a re-entrant forwarder on the same microtask sees
+  `true` and skips. `cancelAll` is idempotent so the
+  structural side effect was already safe — only the
+  operator-visible signal needed deduplication.
+
+- **D236 — `cancelledCount` reflects dispatched, not
+  queued.** Review caught that `inFlightCount()` returns
+  every record with `status === 'running'` — including
+  records still parked on `acquireSlot`. Saying "3
+  subagents cancelled" when only 2 had actually
+  dispatched would mislead the operator. Fix:
+  `inFlightCount() - queuedCount()` matches the intended
+  "actually running through spawnFn" semantic. Wrapped
+  in `Math.max(0, …)` for defense against any race that
+  produces a transient negative.
+
+- **Adapter contract pinning.** Review (point 7) flagged
+  that the reducer's "undefined = no change" semantic
+  for `cumulativeCostUsd` depends on every non-cost inner
+  kind omitting the field. Test sweep added covering all
+  current inner kinds (step_start, tool_invoking,
+  tool_finished, compaction_started, compaction_finished,
+  todo_updated, tool_warning) — a future inner kind that
+  forgets to think about cost surfaces as a test failure
+  rather than a silent zeroing of the per-row chip.
+
+Verification: typecheck clean, lint clean, 3170 pass / 0
+fail (14 new tests across handle-store + state + footer +
+adapter, +1 cross-inner pinning sweep). Smoke 09 + 10 still
+pass — the new emission path doesn't perturb the existing
+parallel-dispatch wire.
+
+---
+
+## [2026-05-06] parallel — TUI cost chip + cap-watchdog banner
+
+User-prompted gap audit: "como a TUI exibe o paralelismo?"
+Audit found two visibility gaps that operators hit during
+real fan-out runs:
+
+1. **Cost is invisible mid-run.** Subagent rows in the live
+   region showed name, progress one-liner, and elapsed
+   time — but no spend. The cost only landed in the
+   permanent summary on `subagent:end`, so an operator
+   watching a long-running fan-out couldn't tell whether
+   one child was burning the budget.
+
+2. **Cap-watchdog cancellations are silent.** When the
+   cost-cap watchdog (`cancelAll('cap_watchdog')`) killed
+   every active handle, the rows just disappeared from the
+   live region and the footer counter dropped — no banner,
+   no scrollback line, no signal beyond the absence. The
+   operator had to root-cause via `/sessions` / audit
+   tables to discover the cap was the cause.
+
+This slice closes both. Two slices remain (footer queue
+split, parallel-tool counter) — separate commit since they
+share a new HarnessEvent.
+
+| File | Change |
+|---|---|
+| `src/tui/state.ts` | `state.subagents` row gains `liveCostUsd: number`. Initialized to 0 on `subagent:start`; updated on `subagent:update` whose `cumulativeCostUsd` is populated (the `cost_update` inner case). Other progress events leave it unchanged — semantics: undefined on the event = "no change". |
+| `src/tui/events.ts` | `SubagentUpdateEvent` gains optional `cumulativeCostUsd: number`. |
+| `src/tui/harness-adapter.ts` | `subagent_progress` with `lastEvent.type === 'cost_update'` now (a) keeps the existing one-liner heartbeat as `+$X.XXXX` (the delta) and (b) attaches `cumulativeCostUsd` for the reducer. New top-level case `cap_watchdog_fired` translates to a `warn` permanent line: `cap watchdog: 3 subagents cancelled — cumulative $5.12 exceeded cap $5.00`. |
+| `src/tui/render/subagent-row.ts` | Row renders an optional `· $X.XXXX` cost chip in the secondary chrome. Suppressed when `liveCostUsd === 0` so test fixtures (zero-cost mock providers) and free-tier runs stay visually clean. |
+| `src/harness/types.ts` | New `HarnessEvent` variant `cap_watchdog_fired` with `cancelledCount`, `cumulativeUsd`, `capUsd`. |
+| `src/harness/loop.ts` | The watchdog branch (where `total > maxCostUsd` triggers `cancelAll`) now also `safeEmit`s `cap_watchdog_fired`. Snapshot the count BEFORE `cancelAll` so the operator-visible figure reflects what the watchdog asked to kill, before the IIFE settles flip status. |
+| `tests/tui/render/subagent-row.test.ts` | Two new tests: cost chip renders `$X.XXXX` when `liveCostUsd > 0`; suppressed at zero. |
+| `tests/tui/harness-adapter.test.ts` | Three new tests: `cost_update` inner pipes `cumulativeCostUsd` through; non-cost inner omits the field; `cap_watchdog_fired` surfaces as a warn line with the right shape; pluralization branch covered. |
+| `tests/tui/render/footer.test.ts` | Three existing fixtures updated to set `liveCostUsd: 0` (now required on the row state). |
+| `tests/tui/render/subagent-row.test.ts` | Helper updated to default `liveCostUsd: 0`. |
+
+**Decision:**
+
+- **D232 — Cost chip suppressed at zero, not "always
+  shown".** Tests run on mock providers with
+  `cost_per_1k_*: 0`; rendering an always-zero `· $0.0000`
+  chip would clutter every fixture without conveying
+  signal. Suppression at zero matches the existing
+  `bgProcesses.size > 0` / `subagents.size > 0` /
+  `memoryCount > 0` patterns elsewhere in the footer —
+  show the token only when the underlying state has
+  something to say.
+
+- **D233 — Watchdog event is a banner, not a row mutation.**
+  The handles that got cancelled DO surface their
+  cancellation via `subagent:end` with `status: 'error'`
+  + `cancelSource: 'cap_watchdog'` in the cached envelope.
+  But the per-handle end is too quiet for a multi-cancel
+  event — three rows ending in the same tick gives the
+  operator three small lines, not one root-cause
+  signal. The banner message names the cap explicitly
+  (`exceeded cap $X.XX`) so the operator can decide
+  whether to raise the cap or rein in the model without
+  consulting `/budget`.
+
+- **Cumulative-cost chip uses 4-decimal precision.** Same
+  precision as the footer's `formatCost` so an operator
+  glancing across the screen sees consistent figures.
+  6-decimal would push the chip past the 80-col budget on
+  long subagent names; 2-decimal loses signal for cheap
+  reads ($0.0023 → $0.00 hides the difference between a
+  cheap exploration and a free run).
+
+Verification: typecheck clean, lint clean, 3156 pass / 0
+fail (5 new tests).
+
+---
+
 ## [2026-05-06] parallel — task_list tool for handle visibility
 
 User-prompted gap audit: "modelo consegue gerenciar o

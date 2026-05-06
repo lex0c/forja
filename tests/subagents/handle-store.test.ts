@@ -421,6 +421,69 @@ describe('SubagentHandleStore', () => {
     expect(snapshot[0]?.settled?.cancelSource).toBe('model');
   });
 
+  test('queuedCount reflects spawn calls still waiting on a slot (D234)', async () => {
+    // Cap=1 with 3 spawns: the first dispatches immediately
+    // (queued goes to 0 once acquireSlot resolves), the next
+    // two queue. Until the first settles, queuedCount stays
+    // at 2. As each completes, the next dequeues, queue
+    // drops by 1.
+    let release: () => void = () => {};
+    const hold = new Promise<void>((r) => {
+      release = r;
+    });
+    const store = createSubagentHandleStore({
+      cap: 1,
+      spawnFn: async (args, signal) => {
+        try {
+          await Promise.race([hold, sleep(2000, signal)]);
+        } catch {
+          // fall through
+        }
+        return okResult(args);
+      },
+    });
+    const h1 = store.spawn({ name: 'a', prompt: 'p' }, { estimateCostUsd: 0 });
+    const h2 = store.spawn({ name: 'b', prompt: 'p' }, { estimateCostUsd: 0 });
+    const h3 = store.spawn({ name: 'c', prompt: 'p' }, { estimateCostUsd: 0 });
+    // Microtask boundary so the first IIFE has run
+    // `acquireSlot` and decremented the queue.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(store.queuedCount()).toBe(2);
+    expect(store.inFlightCount()).toBe(3);
+    release();
+    await Promise.all([
+      store.awaitHandle(h1.id),
+      store.awaitHandle(h2.id),
+      store.awaitHandle(h3.id),
+    ]);
+    expect(store.queuedCount()).toBe(0);
+    expect(store.inFlightCount()).toBe(0);
+  });
+
+  test('onStateChange fires on spawn / dispatch / settle (D234)', async () => {
+    // Three transitions per record × N records. Test counts
+    // them via a callback so the harness's parallel_status
+    // emission can be wired with confidence.
+    let count = 0;
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async (args) => okResult(args),
+      onStateChange: () => {
+        count += 1;
+      },
+    });
+    const h = store.spawn({ name: 'a', prompt: 'p' }, { estimateCostUsd: 0 });
+    // After spawn(): one transition fired (queue+1).
+    expect(count).toBeGreaterThanOrEqual(1);
+    await store.awaitHandle(h.id);
+    // After settle: two more transitions fired (queue-1 on
+    // acquireSlot resolve, then running-1 on settle). Total
+    // 3 per record. Allow >= since concurrent emissions can
+    // happen in some interleavings.
+    expect(count).toBeGreaterThanOrEqual(3);
+  });
+
   test('inFlightCount reflects only running records', async () => {
     const store = createSubagentHandleStore({
       cap: 3,

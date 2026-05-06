@@ -197,6 +197,7 @@ describe('renderFooter', () => {
       goal: 'find auth',
       progress: '',
       startedAt: 0,
+      liveCostUsd: 0,
     });
     s.subagents.set('child-2', {
       subagentId: 'child-2',
@@ -204,6 +205,7 @@ describe('renderFooter', () => {
       goal: 'check diff',
       progress: '',
       startedAt: 0,
+      liveCostUsd: 0,
     });
     const out = renderFooter(s, caps) ?? '';
     expect(out).toContain('subagents 2');
@@ -225,11 +227,93 @@ describe('renderFooter', () => {
       goal: 'g',
       progress: '',
       startedAt: 0,
+      liveCostUsd: 0,
     });
     const out = renderFooter(s, caps) ?? '';
     expect(out).toContain('bg 1');
     expect(out).toContain('subagents 1');
     expect(out.indexOf('bg 1')).toBeLessThan(out.indexOf('subagents 1'));
+  });
+
+  test('parallelStatus surfaces as `subagents R+Q/cap` (D234)', () => {
+    const s = startedSession();
+    s.parallelStatus = {
+      subagentsRunning: 2,
+      subagentsQueued: 3,
+      subagentsCap: 3,
+      toolsRunning: 0,
+      toolsCap: 0,
+    };
+    const out = renderFooter(s, caps) ?? '';
+    expect(out).toContain('subagents 2+3/3');
+  });
+
+  test('parallelStatus omits queue suffix when queue is 0', () => {
+    const s = startedSession();
+    s.parallelStatus = {
+      subagentsRunning: 2,
+      subagentsQueued: 0,
+      subagentsCap: 3,
+      toolsRunning: 0,
+      toolsCap: 0,
+    };
+    const out = renderFooter(s, caps) ?? '';
+    expect(out).toContain('subagents 2/3');
+    expect(out).not.toContain('+0');
+  });
+
+  test('parallelStatus suppresses subagents chip when running+queued is 0', () => {
+    const s = startedSession();
+    s.parallelStatus = {
+      subagentsRunning: 0,
+      subagentsQueued: 0,
+      subagentsCap: 3,
+      toolsRunning: 0,
+      toolsCap: 0,
+    };
+    const out = renderFooter(s, caps) ?? '';
+    expect(out).not.toContain('subagents ');
+  });
+
+  test('parallelStatus surfaces tools chip when running > 1 (D234)', () => {
+    const s = startedSession();
+    s.parallelStatus = {
+      subagentsRunning: 0,
+      subagentsQueued: 0,
+      subagentsCap: 3,
+      toolsRunning: 3,
+      toolsCap: 3,
+    };
+    const out = renderFooter(s, caps) ?? '';
+    expect(out).toContain('tools 3/3');
+  });
+
+  test('parallelStatus suppresses tools chip at 1 in flight (single-tool noise)', () => {
+    const s = startedSession();
+    s.parallelStatus = {
+      subagentsRunning: 0,
+      subagentsQueued: 0,
+      subagentsCap: 3,
+      toolsRunning: 1,
+      toolsCap: 3,
+    };
+    const out = renderFooter(s, caps) ?? '';
+    expect(out).not.toContain('tools ');
+  });
+
+  test('parallelStatus null falls back to legacy subagents N from live map', () => {
+    const s = startedSession();
+    s.parallelStatus = null;
+    s.subagents.set('child-1', {
+      subagentId: 'child-1',
+      name: 'explore',
+      goal: 'g',
+      progress: '',
+      startedAt: 0,
+      liveCostUsd: 0,
+    });
+    const out = renderFooter(s, caps) ?? '';
+    expect(out).toContain('subagents 1');
   });
 
   test('null when modal is up', () => {

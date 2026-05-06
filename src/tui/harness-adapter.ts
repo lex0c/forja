@@ -540,6 +540,12 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         // detail.
         const inner = event.lastEvent;
         let progress: string;
+        // Optional live-cost piggyback (D232). When the inner
+        // event is `cost_update`, the cumulative figure flows
+        // through to the reducer for the per-row `$X.XX` chip.
+        // Skipped for other inner events to leave `liveCostUsd`
+        // alone (semantics: undefined = "no change").
+        let cumulativeCostUsd: number | undefined;
         switch (inner.type) {
           case 'step_start':
             progress = `step ${inner.stepN}`;
@@ -562,6 +568,15 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           case 'tool_warning':
             progress = `warn: ${inner.message}`;
             break;
+          case 'cost_update':
+            // Cost-only events: keep the existing progress
+            // text by emitting the inner type as a verb. The
+            // load-bearing payload is `cumulative` — even
+            // when the operator can't read the heartbeat
+            // text fast enough, the row's cost chip updates.
+            progress = `+$${inner.delta.toFixed(4)}`;
+            cumulativeCostUsd = inner.cumulative;
+            break;
           default:
             // Unmodeled inner events still produce a heartbeat
             // — silent passes would let a chatty child appear
@@ -574,6 +589,7 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           ts,
           subagentId: event.subagentId,
           progress,
+          ...(cumulativeCostUsd !== undefined ? { cumulativeCostUsd } : {}),
         });
         // tool_warning from the child propagates as a top-level
         // `warn` so the operator sees the warning explicitly in the
@@ -622,6 +638,42 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         // line. Returning `out` (likely empty since no other
         // case fired) makes the adapter ignore the event without
         // breaking the exhaustive switch contract.
+        return out;
+
+      case 'cap_watchdog_fired':
+        // Cost-cap watchdog killed every active handle (spec
+        // ORCHESTRATION.md §3.5). Surface as a permanent
+        // banner-style warn so the operator sees the cause —
+        // without it, the active subagent rows just disappear
+        // and the operator has to root-cause via /sessions or
+        // logs. The cumulative + cap figures spell out which
+        // limit got hit, so the operator can decide whether to
+        // raise the cap or rein in the model.
+        out.push({
+          type: 'warn',
+          ts,
+          message: `cap watchdog: ${event.cancelledCount} subagent${event.cancelledCount === 1 ? '' : 's'} cancelled — cumulative $${event.cumulativeUsd.toFixed(4)} exceeded cap $${event.capUsd.toFixed(4)}`,
+        });
+        return out;
+
+      case 'parallel_status':
+        // Parallelism observability snapshot (spec
+        // ORCHESTRATION.md §1.3 / §3.3). Translates 1:1 into a
+        // UIEvent that updates state.parallelStatus; the
+        // footer's `subagents R+Q/cap` and `tools R/cap`
+        // chips read from there. Emitted by the harness on
+        // every transition (handle spawn / dispatch / settle,
+        // tool dispatch enter/exit), so the chips stay in sync
+        // without polling.
+        out.push({
+          type: 'parallel:status',
+          ts,
+          subagentsRunning: event.subagentsRunning,
+          subagentsQueued: event.subagentsQueued,
+          subagentsCap: event.subagentsCap,
+          toolsRunning: event.toolsRunning,
+          toolsCap: event.toolsCap,
+        });
         return out;
 
       case 'session_finished': {

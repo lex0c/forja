@@ -1016,4 +1016,134 @@ describe('harness-adapter — subagent observability', () => {
     });
     expect((errOut[0] as Extract<UIEvent, { type: 'subagent:end' }>).status).toBe('error');
   });
+
+  test('subagent_progress with cost_update inner pipes cumulativeCostUsd through (D232)', () => {
+    // Per-row cost chip in the live region. The adapter
+    // forwards `cumulativeCostUsd` only on the cost_update
+    // inner case so other progress events leave the
+    // reducer's prior `liveCostUsd` untouched.
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'c',
+      lastEvent: { type: 'cost_update', delta: 0.005, cumulative: 0.018 },
+    });
+    expect(types(out)).toEqual(['subagent:update']);
+    const ev = out[0] as Extract<UIEvent, { type: 'subagent:update' }>;
+    expect(ev.cumulativeCostUsd).toBe(0.018);
+    expect(ev.progress).toBe('+$0.0050');
+  });
+
+  test('subagent_progress with non-cost inner omits cumulativeCostUsd', () => {
+    // Counterpart guard: a step_start should NOT carry a
+    // cumulativeCostUsd, so the reducer keeps the prior
+    // value rather than zeroing.
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'c',
+      lastEvent: { type: 'step_start', stepN: 5 },
+    });
+    const ev = out[0] as Extract<UIEvent, { type: 'subagent:update' }>;
+    expect(ev.cumulativeCostUsd).toBeUndefined();
+  });
+
+  test('subagent_progress contract: only cost_update inner sets cumulativeCostUsd (review fix)', () => {
+    // Pin the contract: the reducer's "undefined = no
+    // change" semantic depends on every non-cost inner kind
+    // omitting the field. A future addition that forgets to
+    // think about cost would silently zero the per-row cost
+    // chip every time that inner kind fired. Sweep across
+    // every inner kind covered by the adapter switch.
+    const a = createHarnessAdapter(baseCtx());
+    const innerEvents = [
+      { type: 'step_start' as const, stepN: 1 },
+      {
+        type: 'tool_invoking' as const,
+        toolUseId: 't',
+        toolName: 'echo',
+        args: {},
+      },
+      {
+        type: 'tool_finished' as const,
+        toolUseId: 't',
+        toolName: 'echo',
+        failed: false,
+        durationMs: 1,
+      },
+      { type: 'compaction_started' as const, beforeMessages: 10 },
+      {
+        type: 'compaction_finished' as const,
+        foldedCount: 3,
+        afterMessages: 4,
+        savingTokens: 100,
+      },
+      { type: 'todo_updated' as const, items: [] },
+      {
+        type: 'tool_warning' as const,
+        toolUseId: 't',
+        toolName: 'echo',
+        message: 'w',
+      },
+    ];
+    for (const inner of innerEvents) {
+      const out = a.translate({
+        type: 'subagent_progress',
+        subagentId: 'c',
+        lastEvent: inner,
+      });
+      const update = out.find((e) => e.type === 'subagent:update');
+      expect(update).toBeDefined();
+      const ev = update as Extract<UIEvent, { type: 'subagent:update' }>;
+      expect(ev.cumulativeCostUsd).toBeUndefined();
+    }
+  });
+
+  test('cap_watchdog_fired surfaces as a permanent warn line (D233)', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'cap_watchdog_fired',
+      cancelledCount: 3,
+      cumulativeUsd: 5.123456,
+      capUsd: 5.0,
+    });
+    expect(types(out)).toEqual(['warn']);
+    const ev = out[0] as Extract<UIEvent, { type: 'warn' }>;
+    expect(ev.message).toContain('cap watchdog');
+    expect(ev.message).toContain('3 subagents');
+    expect(ev.message).toContain('$5.1235');
+    expect(ev.message).toContain('$5.0000');
+  });
+
+  test('parallel_status translates to parallel:status with all counters preserved (D234)', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'parallel_status',
+      subagentsRunning: 2,
+      subagentsQueued: 3,
+      subagentsCap: 3,
+      toolsRunning: 1,
+      toolsCap: 3,
+    });
+    expect(types(out)).toEqual(['parallel:status']);
+    const ev = out[0] as Extract<UIEvent, { type: 'parallel:status' }>;
+    expect(ev.subagentsRunning).toBe(2);
+    expect(ev.subagentsQueued).toBe(3);
+    expect(ev.subagentsCap).toBe(3);
+    expect(ev.toolsRunning).toBe(1);
+    expect(ev.toolsCap).toBe(3);
+  });
+
+  test('cap_watchdog_fired pluralizes correctly for cancelledCount=1', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'cap_watchdog_fired',
+      cancelledCount: 1,
+      cumulativeUsd: 5.0,
+      capUsd: 4.99,
+    });
+    const ev = out[0] as Extract<UIEvent, { type: 'warn' }>;
+    expect(ev.message).toContain('1 subagent ');
+    expect(ev.message).not.toContain('1 subagents');
+  });
 });

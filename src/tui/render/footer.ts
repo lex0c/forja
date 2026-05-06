@@ -113,7 +113,36 @@ export const renderFooter = (state: LiveState, caps: Capabilities): string | nul
     // The two surfaces are complementary, not redundant: the
     // footer answers "is anything in flight right now"; the
     // slash answers "what async handles can I task_await".
-    if (state.subagents.size > 0) {
+    // Subagents chip. Two variants:
+    //   - `parallelStatus` populated (D234): show
+    //     `subagents R+Q/cap` so the operator sees the queue
+    //     depth alongside the running count. Suppressed when
+    //     R+Q === 0.
+    //   - `parallelStatus === null` (no event yet — pre-task
+    //     surface activity): fall back to `subagents N` from
+    //     the live-row map. Same suppression at zero.
+    // The fallback covers the brief window between
+    // `subagent:start` and the first `parallel:status` event,
+    // and any future surface that bypasses the harness's
+    // emission. Both branches feed the same operator-visible
+    // chip — the layout slot is identical.
+    if (state.parallelStatus !== null) {
+      const ps = state.parallelStatus;
+      const total = ps.subagentsRunning + ps.subagentsQueued;
+      if (total > 0) {
+        const queueChip = ps.subagentsQueued > 0 ? `+${ps.subagentsQueued}` : '';
+        rightParts.push(
+          dim(caps, `subagents ${ps.subagentsRunning}${queueChip}/${ps.subagentsCap}`),
+        );
+      }
+      // Tools chip — only when more than one tool is in flight
+      // through the parallel-tool dispatcher. A single tool is
+      // visible via the per-tool card; the chip exists to
+      // surface "running multiple in parallel" specifically.
+      if (ps.toolsRunning > 1 && ps.toolsCap > 0) {
+        rightParts.push(dim(caps, `tools ${ps.toolsRunning}/${ps.toolsCap}`));
+      }
+    } else if (state.subagents.size > 0) {
       rightParts.push(dim(caps, `subagents ${state.subagents.size}`));
     }
     // Memory count. Sits AFTER bg per spec

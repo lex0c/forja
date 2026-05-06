@@ -194,6 +194,17 @@ export interface SubagentHandleStore {
   // current run's in-flight spawns: rehydrated handles enter
   // the records map already as 'settled'.
   inFlightCount(): number;
+  // Number of records that have been spawned but have not yet
+  // passed the slot semaphore (`acquireSlot`). Sum of
+  // `inFlightCount` (dispatched but not settled) +
+  // `queuedCount` (waiting for a slot) equals the total
+  // unsettled work the model has issued. Used by the harness
+  // to populate the `parallel_status.subagentsQueued` figure
+  // — the operator's footer shows `subagents R+Q/cap` so a
+  // burst of `task_async` calls beyond the cap is visible
+  // rather than collapsing into a single `subagents N`
+  // counter.
+  queuedCount(): number;
   // Cancel all running records and await every record's
   // promise. Idempotent. Used by the harness's outer finally.
   // `reason` propagates to every cancelled record's audit row;
@@ -303,6 +314,18 @@ export interface CreateSubagentHandleStoreOptions {
   // Optional clock; production uses Date.now. Tests override to
   // fix `spawnedAt` so they can assert on a stable value.
   now?: () => number;
+  // Optional state-change callback fired whenever the running
+  // or queued counts shift: spawn (queue+1), slot acquisition
+  // (queue-1, running+1), IIFE settle (running-1), cancel
+  // (running-1 OR queue-1 depending on which side the cancel
+  // landed). Production wires this to a `safeEmit` of
+  // `parallel_status` so the TUI footer's `R+Q/cap` chip
+  // updates without polling. Synchronous from the call site's
+  // perspective; the callback MUST NOT throw (the store
+  // doesn't try/catch around it — same contract as `spawnFn`,
+  // where a throw is the harness's bug to surface, not the
+  // store's to swallow).
+  onStateChange?: () => void;
 }
 
 interface SubagentRecord {
@@ -529,7 +552,22 @@ export const createSubagentHandleStore = (
   const newId = options.newId ?? ((): string => crypto.randomUUID());
   const now = options.now ?? ((): number => Date.now());
   const persistTo = options.persistTo;
+  const onStateChange = options.onStateChange;
   const records = new Map<string, SubagentRecord>();
+  // Number of records that have been spawned but have not yet
+  // passed `acquireSlot`. Increment in spawn(); decrement
+  // immediately after `acquireSlot` resolves AND on the
+  // cancelled-before-dispatch path (which races to settle
+  // before the slot ever acquires). The single source of truth
+  // for the queue depth — exposed via `queuedCount()` and
+  // emitted as part of `parallel_status` by the harness.
+  let queued = 0;
+  // Helper: invoke the optional state-change callback, swallowing
+  // the case where it isn't wired. Production passes a
+  // `safeEmit(parallel_status)`; tests omit it.
+  const fireStateChange = (): void => {
+    if (onStateChange !== undefined) onStateChange();
+  };
 
   // Rehydrate existing rows. A fresh session has zero rows; a
   // resumed session inherits whatever the previous run left
@@ -757,8 +795,23 @@ export const createSubagentHandleStore = (
       cancelReason: undefined,
     };
 
+    // Track the new handle as queued. Decremented as soon as
+    // `acquireSlot` resolves (or as soon as the
+    // cancelled-before-dispatch path fires). Spawn always
+    // increments — even when the cap has free slots, the IIFE
+    // hasn't actually entered yet at the moment `spawn()`
+    // returns to the caller.
+    queued += 1;
+    fireStateChange();
     const promise = (async (): Promise<SpawnSubagentResult> => {
       await acquireSlot();
+      // Slot acquired (or cancelled-before-dispatch about to
+      // fire). Either way, this record is no longer "queued"
+      // — it's about to settle one way or another. Decrement
+      // first so the operator's view of `R+Q` reflects the
+      // transition before the IIFE runs.
+      queued -= 1;
+      fireStateChange();
       let result: SpawnSubagentResult;
       try {
         if (controller.signal.aborted) {
@@ -805,6 +858,10 @@ export const createSubagentHandleStore = (
       }
       record.status = 'settled';
       record.settledResult = result;
+      // Running count just dropped by one. Fire the state-
+      // change callback so the harness re-emits
+      // parallel_status with the fresh figures.
+      fireStateChange();
       // Persist the linkage + final envelope. We bind
       // child_session_id BEFORE settling so a concurrent reader
       // sees the map intact even if the settle write fails for
@@ -965,6 +1022,8 @@ export const createSubagentHandleStore = (
     return out;
   };
 
+  const queuedCount = (): number => queued;
+
   const inFlightCount = (): number => {
     let n = 0;
     for (const r of records.values()) {
@@ -1078,6 +1137,7 @@ export const createSubagentHandleStore = (
     list,
     listDetailed,
     inFlightCount,
+    queuedCount,
     drain,
     cancelAll,
     recordLiveCost,

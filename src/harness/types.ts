@@ -217,6 +217,63 @@ export type HarnessEvent =
       delta: number;
       cumulative: number;
     }
+  | {
+      // Parallelism observability snapshot (spec
+      // ORCHESTRATION.md §1.3 / §3.3). Emitted by the harness
+      // whenever the in-flight or queued counts change — the
+      // TUI footer turns it into the `subagents R+Q/cap` and
+      // `tools R/cap` chips. Without this, the operator only
+      // saw "subagents 5" without knowing how many of those
+      // were running vs queued behind the cap, and the
+      // parallel tool batch was visible only as N concurrent
+      // cards with no aggregate.
+      //
+      // Fields:
+      //   - `subagentsRunning`: handles whose spawn has been
+      //     dispatched (passed the slot semaphore) and whose
+      //     IIFE has not yet settled.
+      //   - `subagentsQueued`: handles created but still
+      //     waiting on `acquireSlot`. Sum (running + queued)
+      //     equals the model's "tasks I emitted that haven't
+      //     finished yet" count.
+      //   - `subagentsCap`: configured cap for concurrent
+      //     dispatch (`maxConcurrentSubagents`).
+      //   - `toolsRunning`: tools currently in flight in the
+      //     parallel-tool dispatcher pool. 0 outside a parallel
+      //     batch (or during the serial path, since serial
+      //     never has more than 1 in flight at once).
+      //   - `toolsCap`: pool concurrency for the current
+      //     batch (`Math.min(maxConcurrentToolCalls,
+      //     MAX_CONCURRENT_TOOL_CALLS_CAP)`). 0 when no batch
+      //     is active.
+      type: 'parallel_status';
+      subagentsRunning: number;
+      subagentsQueued: number;
+      subagentsCap: number;
+      toolsRunning: number;
+      toolsCap: number;
+    }
+  | {
+      // Cost-cap watchdog fired (spec ORCHESTRATION.md §3.5).
+      // Cumulative parent + child spend (settled + reserved +
+      // live) crossed `maxCostUsd` mid-run; the harness
+      // signaled `cancelAll('cap_watchdog')` on every active
+      // handle. The TUI converts this to a permanent banner
+      // line so the operator sees the cause — without it, the
+      // active subagent rows just disappear and the operator
+      // has to root-cause via `/sessions` or audit logs.
+      // Carries `cancelledCount` (how many active handles got
+      // the abort) and the cumulative figure that crossed the
+      // cap so the banner reads concretely ("3 subagents
+      // cancelled — cumulative spend $5.12 exceeded cap
+      // $5.00"). The cap value is included for the same
+      // reason: a banner that just says "cap exceeded" forces
+      // the operator to look up which cap.
+      type: 'cap_watchdog_fired';
+      cancelledCount: number;
+      cumulativeUsd: number;
+      capUsd: number;
+    }
   | { type: 'session_finished'; result: HarnessResult };
 
 // Budget caps for an autonomous run. Per AGENTIC_CLI §5: every limit has

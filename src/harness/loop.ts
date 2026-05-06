@@ -334,6 +334,58 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // past the gate while their reservations are pending.
   let cumulativeChildCostUsd = 0;
 
+  // Parallel-tool dispatch counters (spec ORCHESTRATION.md
+  // §1.3). Updated inside the parallel branch's `runPool`
+  // before/after each worker invokes its tool; outside that
+  // branch (idle, serial path) both stay at 0. The TUI's
+  // footer reads these via the `parallel_status` HarnessEvent
+  // — the cap chip is suppressed at 0 so a serial-only run
+  // shows nothing.
+  let parallelToolsRunning = 0;
+  let parallelToolsCap = 0;
+
+  // Cap-watchdog fire-once latch (D235 review fix). Without
+  // this, the watchdog can emit `cap_watchdog_fired` multiple
+  // times per run: after the first `cancelAll('cap_watchdog')`,
+  // every cancelled record contributes 0 to the reservation
+  // (filtered in `getReservedChildCostUsd`), but
+  // `cumulativeChildCostUsd` already accumulated the
+  // pre-cancel cost and stays > cap. Any cost_update still
+  // queued in the IPC pipe fires the same `total > cap`
+  // branch again, re-emitting the banner. The latch silences
+  // re-emissions for the rest of the run — `cancelAll` is
+  // idempotent so the structural side effect is fine; only
+  // the operator-visible signal needs deduplication.
+  let capWatchdogFired = false;
+
+  // Helper: snapshot the current parallelism state and fire a
+  // `parallel_status` HarnessEvent. Called from two sources:
+  // (a) the handle store's `onStateChange` callback when a
+  // spawn / dispatch / settle transitions; (b) the parallel
+  // tool path before/after each worker invokes its tool. The
+  // event lands at the TUI footer's reducer, which renders
+  // `subagents R+Q/cap` and `tools R/cap` chips.
+  const emitParallelStatus = (): void => {
+    const subagentsActive = subagentHandleStore?.inFlightCount() ?? 0;
+    const subagentsQueued = subagentHandleStore?.queuedCount() ?? 0;
+    // `inFlightCount` returns every record with status='running' —
+    // both the dispatched and the queue-waiting. Subtract the
+    // queue depth to get "actually running through spawnFn".
+    const subagentsRunning = Math.max(0, subagentsActive - subagentsQueued);
+    const subagentsCap = Math.max(
+      1,
+      Math.min(budget.maxConcurrentSubagents, MAX_CONCURRENT_SUBAGENTS_CAP),
+    );
+    safeEmit(config.onEvent, {
+      type: 'parallel_status',
+      subagentsRunning,
+      subagentsQueued,
+      subagentsCap,
+      toolsRunning: parallelToolsRunning,
+      toolsCap: parallelToolsCap,
+    });
+  };
+
   // Distinguish wall-clock from user abort — both use `signal.aborted` but
   // the user wants different exit reasons.
   const isWallClockTimeout = (): boolean =>
@@ -887,8 +939,49 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                         cumulativeChildCostUsd +
                         rehydratedChildCostUsd +
                         reserved;
-                      if (total > budget.maxCostUsd) {
+                      if (total > budget.maxCostUsd && !capWatchdogFired) {
+                        // Latch the fire-once flag BEFORE the
+                        // cancellations run so a re-entrant
+                        // `cost_update` that lands while
+                        // cancelAll is still propagating sees
+                        // `capWatchdogFired === true` and
+                        // skips. The latch never resets — once
+                        // the watchdog fires for a run, the
+                        // operator banner has the data they
+                        // need; subsequent cap-crosses (which
+                        // only happen because cumulative cost
+                        // doesn't decrease) carry no new signal.
+                        capWatchdogFired = true;
+                        // Snapshot the dispatched count BEFORE
+                        // cancelAll. `inFlightCount` returns
+                        // every record with `status: 'running'`,
+                        // which includes records still queued
+                        // on `acquireSlot` — those have no
+                        // child session yet, so saying "3
+                        // subagents cancelled" when only 2
+                        // dispatched would mislead the operator.
+                        // Subtract `queuedCount()` to land on
+                        // "actually dispatched" (D236 review
+                        // fix). cancelAll is idempotent on
+                        // already-settled rows, so the firing
+                        // count and the actual-cancel count
+                        // match in practice for the dispatched
+                        // set.
+                        const cancelledCount =
+                          trackerStore.inFlightCount() - trackerStore.queuedCount();
                         trackerStore.cancelAll('cap_watchdog');
+                        // Surface to the operator. Pre-D233 this
+                        // event was missing — handles just
+                        // disappeared from the live region and
+                        // the operator had to root-cause via
+                        // audit logs. The TUI adapter converts
+                        // this into a permanent banner line.
+                        safeEmit(config.onEvent, {
+                          type: 'cap_watchdog_fired',
+                          cancelledCount: Math.max(0, cancelledCount),
+                          cumulativeUsd: total,
+                          capUsd: budget.maxCostUsd,
+                        });
                       }
                     }
                   }
@@ -1020,6 +1113,10 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           cap: subagentCap,
           spawnFn: async (args, perHandleSignal, handleId) => impl(args, perHandleSignal, handleId),
           persistTo: { db: config.db, parentSessionId: sessionId },
+          // Re-emit parallel_status whenever the queued or
+          // running count shifts — keeps the TUI footer's
+          // `subagents R+Q/cap` chip in sync without polling.
+          onStateChange: emitParallelStatus,
         });
         // On resume, rehydrated settled handles carry cost that
         // prior runs incurred but the `sessions.totalCostUsd`
@@ -1953,6 +2050,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             const callHash = hashToolCall(tu.name, tu.input);
             recentToolHashes.push(callHash);
             if (recentToolHashes.length > HASH_WINDOW) recentToolHashes.shift();
+            // Track the dispatched-tool count for the
+            // `parallel_status` event. The runPool worker
+            // calls this wrapper for one tu; bracket the
+            // invokeOne with increment/decrement so the live
+            // figure reflects "tools actually inside their
+            // execute() right now". JS single-threaded
+            // serializes these mutations across workers, so
+            // the value is monotonic per transition.
+            parallelToolsRunning += 1;
+            emitParallelStatus();
             try {
               return await invokeOne(tu);
             } catch (e) {
@@ -1967,9 +2074,27 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                 },
                 failed: true,
               };
+            } finally {
+              parallelToolsRunning -= 1;
+              emitParallelStatus();
             }
           };
+          // Snapshot the cap BEFORE the pool runs so the
+          // first emit (from the first worker entering
+          // safeInvokeOne) carries the right denominator. The
+          // pool's actual concurrency is `min(cap,
+          // tool_uses.length)` so we use that — matches what
+          // an operator counts visually as "tools running /
+          // tools possible right now".
+          parallelToolsCap = Math.max(1, Math.min(parallelCap, collected.tool_uses.length));
+          emitParallelStatus();
           const outcomes = await runPool(collected.tool_uses, parallelCap, safeInvokeOne);
+          // Reset cap after the batch settles. With cap=0 the
+          // TUI footer's `tools R/cap` chip suppresses,
+          // returning the operator's view to "no parallel
+          // tools right now".
+          parallelToolsCap = 0;
+          emitParallelStatus();
 
           // Post-pool abort gate. Mirrors the serial path's
           // per-iteration check — once the run signal flipped

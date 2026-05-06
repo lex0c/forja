@@ -257,6 +257,15 @@ export interface LiveState {
       // from the producer (parent's runSubagent), which is the
       // authoritative span.
       startedAt: number;
+      // Cumulative live cost reported by the child via the
+      // `cost_update` HarnessEvent stream (spec ORCHESTRATION.md
+      // §3.5). Updated on every `subagent:update` whose adapter-
+      // observed inner type was `cost_update`. 0 until the first
+      // cost update lands — children with `costUsd: 0` providers
+      // (test mocks) stay at 0 and the renderer suppresses the
+      // `$X.XX` segment, preserving the existing test-fixture
+      // visual shape.
+      liveCostUsd: number;
     }
   >;
   // Operator hit Esc once during a running turn (spec UI.md §4.10.6
@@ -268,6 +277,23 @@ export interface LiveState {
   // immediate-vs-cooperative cancellation distinction lives in a
   // future hard-abort slice.
   softInterrupted: boolean;
+  // Parallelism observability snapshot (spec ORCHESTRATION.md
+  // §1.3 / §3.3). Updated by `parallel:status` events fired by
+  // the harness whenever the running / queued counts shift.
+  // The footer reads this into `subagents R+Q/cap` and
+  // `tools R/cap` chips. `null` before the first event lands
+  // (idle session pre-task_async); the renderer treats null as
+  // "no parallel activity" — both chips suppressed. Once any
+  // parallel work happens, the field stays populated for the
+  // remainder of the session even if every counter returns to
+  // 0; the renderer suppresses individual chips at zero.
+  parallelStatus: {
+    subagentsRunning: number;
+    subagentsQueued: number;
+    subagentsCap: number;
+    toolsRunning: number;
+    toolsCap: number;
+  } | null;
   // Idle Ctrl+C double-tap gate (UI.md §5.4 + §4.10.6). Non-null means
   // the operator pressed Ctrl+C once at idle with an empty buffer;
   // footer flips to `Press Ctrl-C again to exit` (warn). The REPL owns the
@@ -304,6 +330,7 @@ export const createInitialState = (): LiveState => ({
   todos: [],
   bgProcesses: new Map(),
   subagents: new Map(),
+  parallelStatus: null,
   softInterrupted: false,
   exitArmed: null,
   ended: false,
@@ -463,6 +490,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
           exitArmed: null,
           bgProcesses: new Map(),
           subagents: new Map(),
+          parallelStatus: null,
           ended: false,
         },
         permanent: [],
@@ -490,6 +518,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
           exitArmed: null,
           bgProcesses: new Map(),
           subagents: new Map(),
+          parallelStatus: null,
           ended: true,
         },
         permanent: [
@@ -1177,6 +1206,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
         goal: event.goal,
         progress: '',
         startedAt: event.ts,
+        liveCostUsd: 0,
       });
       return { state: { ...state, subagents: next }, permanent: [] };
     }
@@ -1191,7 +1221,14 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       const existing = state.subagents.get(event.subagentId);
       if (existing === undefined) return { state, permanent: [] };
       const next = new Map(state.subagents);
-      next.set(event.subagentId, { ...existing, progress: event.progress });
+      // `cumulativeCostUsd` is optional on subagent:update — only
+      // populated when the adapter routed a `cost_update` inner
+      // event. Other progress events leave it undefined, which
+      // means "no change" — preserves the existing value rather
+      // than zeroing it. Monotonic at the source (handle-store
+      // enforces) so we don't need a max() guard.
+      const liveCostUsd = event.cumulativeCostUsd ?? existing.liveCostUsd;
+      next.set(event.subagentId, { ...existing, progress: event.progress, liveCostUsd });
       return { state: { ...state, subagents: next }, permanent: [] };
     }
 
@@ -1219,6 +1256,28 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
               },
             ];
       return { state: { ...state, subagents: next }, permanent };
+    }
+
+    case 'parallel:status': {
+      // Snapshot the latest figures for the footer's
+      // `subagents R+Q/cap` and `tools R/cap` chips. The
+      // event arrives every time the harness's running /
+      // queued counts shift — we just overwrite the
+      // previous snapshot. No permanent emission: the
+      // footer is the only consumer.
+      return {
+        state: {
+          ...state,
+          parallelStatus: {
+            subagentsRunning: event.subagentsRunning,
+            subagentsQueued: event.subagentsQueued,
+            subagentsCap: event.subagentsCap,
+            toolsRunning: event.toolsRunning,
+            toolsCap: event.toolsCap,
+          },
+        },
+        permanent: [],
+      };
     }
 
     default: {
