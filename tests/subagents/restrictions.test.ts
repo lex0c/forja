@@ -152,6 +152,59 @@ describe('enforceBashRestriction', () => {
   test('absent allow but present deny — passes when deny does not match', () => {
     expect(enforceBashRestriction('git status', { deny: ['rm *'] })).toEqual({ ok: true });
   });
+
+  test('leading whitespace does not bypass deny pattern', () => {
+    // Regression: the matcher does literal char-by-char comparison
+    // anchored at position 0, so a leading space made
+    // ` rm -rf /tmp` slip past `deny: ["rm -rf *"]` even though
+    // the shell would tokenize that whitespace away before
+    // executing. Normalization (trim + collapse) closes the gap.
+    const v = enforceBashRestriction(' rm -rf /tmp', { deny: ['rm -rf *'] });
+    expect(v.ok).toBe(false);
+    if (v.ok) return;
+    expect(v.matchedPattern).toBe('rm -rf *');
+  });
+
+  test('trailing whitespace and embedded tabs/newlines normalize before match', () => {
+    // Tab/newline within and around the command — normalized to
+    // single-space form, which then matches the canonical pattern.
+    const variants = [
+      'rm -rf /tmp ',
+      'rm -rf /tmp\n',
+      '\trm -rf /tmp',
+      'rm\t-rf /tmp',
+      'rm  -rf  /tmp',
+      'rm\n-rf\n/tmp',
+    ];
+    for (const cmd of variants) {
+      const v = enforceBashRestriction(cmd, { deny: ['rm -rf *'] });
+      expect(v.ok).toBe(false);
+      if (v.ok) return;
+      expect(v.matchedPattern).toBe('rm -rf *');
+    }
+  });
+
+  test('whitespace normalization is symmetric — pattern with double-space still matches single-space command', () => {
+    // The author wrote `rm  -rf *` (two spaces, likely a typo).
+    // Normalizing only the input would still miss commands written
+    // with one space — patterns get the same treatment so a typo
+    // does not silently shrink coverage.
+    const v = enforceBashRestriction('rm -rf /tmp', { deny: ['rm  -rf *'] });
+    expect(v.ok).toBe(false);
+    if (v.ok) return;
+    // matchedPattern surfaces the ORIGINAL author text (not the
+    // normalized projection), so the operator can locate it in the
+    // .md frontmatter.
+    expect(v.matchedPattern).toBe('rm  -rf *');
+  });
+
+  test('leading whitespace cannot fake a match against an allow list', () => {
+    // Inverse of the deny-bypass: an allow list's match window
+    // is also anchored at position 0, so leading whitespace
+    // pre-fix made a clean command miss its own allow rule.
+    const v = enforceBashRestriction('  git diff main', { allow: ['git diff *'] });
+    expect(v).toEqual({ ok: true });
+  });
 });
 
 describe('enforcePathRestriction', () => {

@@ -97,6 +97,32 @@ export const matchAny = (input: string, patterns: ReadonlyArray<string>): Patter
   return { matched: false };
 };
 
+// Normalize a command string for restriction matching: trim
+// leading/trailing whitespace and collapse internal runs of
+// whitespace (spaces, tabs, newlines, etc.) to a single space.
+// Mirrors how the shell tokenizes whitespace before execution —
+// without it, ` rm -rf /tmp` (leading space) or `rm\t-rf /tmp`
+// (tab) silently bypasses `deny: ["rm -rf *"]` because the
+// matcher does literal char-by-char comparison anchored at
+// position 0. Applied SYMMETRICALLY to the input and each
+// pattern so a double-space typo in a pattern doesn't leak
+// coverage either way.
+const normalizeCommandForMatch = (s: string): string => s.trim().replace(/\s+/g, ' ');
+
+// Command-shape variant of `matchAny`: normalizes both sides
+// before delegating to `matchGlob`, but reports the ORIGINAL
+// pattern in the verdict so authors see what they actually wrote
+// in the .md frontmatter (not the normalized projection).
+const matchCommandAny = (command: string, patterns: ReadonlyArray<string>): PatternMatch => {
+  const normalizedCommand = normalizeCommandForMatch(command);
+  for (const pattern of patterns) {
+    if (matchGlob(normalizedCommand, normalizeCommandForMatch(pattern))) {
+      return { matched: true, pattern };
+    }
+  }
+  return { matched: false };
+};
+
 // Verdict on an individual restriction check. Internally typed so
 // the tool-wrapping factory and the enforce* functions share one
 // shape; consumers only care about the `ok` discriminator.
@@ -125,7 +151,7 @@ export const enforceBashRestriction = (
   rules: ToolRestrictionRules,
 ): RestrictionVerdict => {
   if (rules.deny !== undefined) {
-    const hit = matchAny(command, rules.deny);
+    const hit = matchCommandAny(command, rules.deny);
     if (hit.matched) {
       return {
         ok: false,
@@ -135,7 +161,7 @@ export const enforceBashRestriction = (
     }
   }
   if (rules.allow !== undefined) {
-    const hit = matchAny(command, rules.allow);
+    const hit = matchCommandAny(command, rules.allow);
     if (!hit.matched) {
       const list = rules.allow.length > 0 ? rules.allow.join(', ') : '(empty allow list)';
       return {
