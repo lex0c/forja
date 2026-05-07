@@ -114,9 +114,45 @@ describe('validateOutput — shorthand schema', () => {
     expect(result.typeMismatches.find((m) => m.key === 'blockers')?.actual).toBe('string');
   });
 
-  test('accepts the int alias for number', () => {
+  test('accepts integral values for the int alias', () => {
     const result = validateOutput('count: 5', { count: 'int' });
     expect(result.valid).toBe(true);
+    // Negative + zero are integers too; no off-by-one in the gate.
+    expect(validateOutput('count: 0', { count: 'int' }).valid).toBe(true);
+    expect(validateOutput('count: -7', { count: 'int' }).valid).toBe(true);
+  });
+
+  test('rejects fractional values for the int / integer alias', () => {
+    // Regression: int/integer used to share the `number` branch,
+    // so 3.14 silently passed schemas that asked for line numbers,
+    // counts, or ids. JSON Schema's integer type is "number with
+    // no fractional component"; the validator now mirrors it via
+    // Number.isInteger so the contract is real.
+    for (const alias of ['int', 'integer'] as const) {
+      const result = validateOutput('count: 3.14', { count: alias });
+      expect(result.valid).toBe(false);
+      if (result.valid) continue;
+      const m = result.typeMismatches.find((x) => x.key === 'count');
+      expect(m?.expected).toBe(alias);
+      expect(m?.actual).toBe('number');
+    }
+  });
+
+  test('rejects NaN and Infinity for int (not an integer per Number.isInteger)', () => {
+    // YAML parses `.nan` / `.inf` per the YAML 1.1 float spec;
+    // both are valid `number` values but neither is an integer.
+    // Number.isInteger naturally rules them out — pinning the
+    // behavior here so a future "tolerant" rewrite doesn't
+    // re-introduce the gap.
+    expect(validateOutput('count: .nan', { count: 'int' }).valid).toBe(false);
+    expect(validateOutput('count: .inf', { count: 'int' }).valid).toBe(false);
+  });
+
+  test('number alias still accepts fractional values (no over-tightening)', () => {
+    // Don't let the integer fix bleed into the `number` branch —
+    // an author who wrote `confidence: number` still expects 0.9
+    // to pass.
+    expect(validateOutput('confidence: 0.9', { confidence: 'number' }).valid).toBe(true);
   });
 
   test('accepts the list alias for array', () => {

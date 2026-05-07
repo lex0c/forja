@@ -118,9 +118,16 @@ const typeMatches = (declared: string, value: unknown): boolean => {
     case 'string':
       return typeof value === 'string';
     case 'number':
+      return typeof value === 'number';
     case 'integer':
     case 'int':
-      return typeof value === 'number';
+      // Author asked for an integer specifically — fractional
+      // values (3.14) must NOT pass. JSON Schema's integer type
+      // is "number with no fractional component"; we mirror that
+      // with `Number.isInteger`, which also rejects NaN /
+      // ±Infinity. Downstream consumers that assume integral
+      // fields (line numbers, counts, IDs) get a real gate.
+      return Number.isInteger(value);
     case 'boolean':
     case 'bool':
       return typeof value === 'boolean';
