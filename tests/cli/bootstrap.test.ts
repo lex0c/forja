@@ -433,13 +433,18 @@ Body.`,
     db.close();
   });
 
-  test('response-format hint sits OUTERMOST, then parallelism, then memory', () => {
-    // Layered prompt ordering (bootstrap.ts comment): response
-    // format FIRST (render target — applies to every section),
-    // then parallelism (concurrency mechanics), then user/plan,
-    // then memory. A fresh resume reading the prompt sees the
-    // surface contract up front so every downstream layer's
-    // output respects it.
+  test('layered system prompt: env → discipline → response → parallel → memory', () => {
+    // Layered prompt ordering (bootstrap.ts comment). The
+    // outermost layer (which lands FIRST in the rendered string)
+    // gives the model situational anchor; each inner layer
+    // narrows toward task-specific framing. A fresh resume
+    // reading the prompt sees:
+    //   1. # Environment — where am I, what date, git context.
+    //   2. # Task discipline — behavioral norms.
+    //   3. # Response surface — render-target rules.
+    //   4. # Parallelism — concurrency mechanics.
+    //   5. (caller / playbook hint / plan-mode wrap when applicable)
+    //   6. # Memory — index of cross-session memories.
     const localDir = join(workdir, '.agent', 'memory', 'local');
     mkdirSync(localDir, { recursive: true });
     writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — TS dev\n');
@@ -452,11 +457,15 @@ Body.`,
       userPolicyPath: null,
     });
     expect(config.systemPrompt).toBeDefined();
-    expect(config.systemPrompt?.startsWith('# Response surface')).toBe(true);
+    expect(config.systemPrompt?.startsWith('# Environment')).toBe(true);
+    const envIdx = config.systemPrompt?.indexOf('# Environment') ?? -1;
+    const disciplineIdx = config.systemPrompt?.indexOf('# Task discipline') ?? -1;
     const responseIdx = config.systemPrompt?.indexOf('# Response surface') ?? -1;
     const parallelIdx = config.systemPrompt?.indexOf('# Parallelism') ?? -1;
     const memoryIdx = config.systemPrompt?.indexOf('# Memory') ?? -1;
-    expect(responseIdx).toBe(0);
+    expect(envIdx).toBe(0);
+    expect(disciplineIdx).toBeGreaterThan(envIdx);
+    expect(responseIdx).toBeGreaterThan(disciplineIdx);
     expect(parallelIdx).toBeGreaterThan(responseIdx);
     expect(memoryIdx).toBeGreaterThan(parallelIdx);
     db.close();
@@ -567,13 +576,12 @@ Body.`,
     db.close();
   });
 
-  test('caller systemPrompt is layered after response-format and parallelism hints without plan', () => {
-    // Caller prompt no longer passes through verbatim — the
-    // response-format hint is the OUTERMOST layer, parallelism
-    // sits inside it, and the caller prompt is innermost.
-    // Composition order: response-format → parallel → caller.
-    // Each `\\n\\n---\\n\\n` separator makes a boundary visible
-    // to the model.
+  test('caller systemPrompt is layered after environment / discipline / response-format / parallelism hints without plan', () => {
+    // Caller prompt sits INNERMOST in the layered system prompt.
+    // The outer wrappers (environment, task discipline,
+    // response-format, parallelism) all land before it; the
+    // caller's framing comes last so the operator's specific
+    // instructions read against the established context.
     const { config, db } = bootstrap({
       prompt: 'hi',
       cwd: workdir,
@@ -584,15 +592,19 @@ Body.`,
       systemPrompt: 'You are a senior engineer.',
     });
     expect(config.planMode).toBeUndefined();
-    expect(config.systemPrompt?.startsWith('# Response surface')).toBe(true);
+    expect(config.systemPrompt?.startsWith('# Environment')).toBe(true);
+    expect(config.systemPrompt).toContain('# Task discipline');
+    expect(config.systemPrompt).toContain('# Response surface');
     expect(config.systemPrompt).toContain('# Parallelism');
     expect(config.systemPrompt).toContain('You are a senior engineer.');
-    // The caller prompt comes AFTER both hints — the separator is
-    // load-bearing for the model to distinguish the layers.
+    const envIdx = config.systemPrompt?.indexOf('# Environment') ?? -1;
+    const disciplineIdx = config.systemPrompt?.indexOf('# Task discipline') ?? -1;
     const responseIdx = config.systemPrompt?.indexOf('# Response surface') ?? -1;
     const parallelIdx = config.systemPrompt?.indexOf('# Parallelism') ?? -1;
     const callerIdx = config.systemPrompt?.indexOf('You are a senior engineer.') ?? -1;
-    expect(responseIdx).toBe(0);
+    expect(envIdx).toBe(0);
+    expect(disciplineIdx).toBeGreaterThan(envIdx);
+    expect(responseIdx).toBeGreaterThan(disciplineIdx);
     expect(parallelIdx).toBeGreaterThan(responseIdx);
     expect(callerIdx).toBeGreaterThan(parallelIdx);
     db.close();

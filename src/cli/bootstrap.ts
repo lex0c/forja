@@ -20,12 +20,15 @@ import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { isTrusted, trustListPath } from '../trust/index.ts';
+import { composeWithEnvironment } from './environment-prompt.ts';
+import { probeGitContext } from './git-context.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithParallelHint } from './parallel-prompt.ts';
 import { composeWithUserPrompt } from './plan-prompt.ts';
 import { composeWithPlaybookHint } from './playbook-prompt.ts';
 import { assembleProjectPointer, composeWithProjectPointer } from './project-pointer.ts';
 import { composeWithResponseFormat } from './response-format.ts';
+import { composeWithTaskDiscipline } from './task-discipline.ts';
 
 export const DEFAULT_MODEL = 'anthropic/claude-sonnet-4-6';
 
@@ -199,8 +202,12 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   try {
     migrate(db);
 
-    // Resolve the effective system prompt. Five layers stack
-    // here in precedence order (most-specific to most-generic):
+    // Resolve the effective system prompt. Layers stack here in
+    // precedence order (most-specific to most-generic). Each
+    // `composeWith*` prepends to the downstream chunk it
+    // receives, so we wrap from the inside out — the LAST
+    // wrapper applied lands FIRST in the final string.
+    //
     //   1. Caller's user prompt (input.systemPrompt) — most
     //      specific, the operator's own framing.
     //   2. Plan mode prompt — operating-mode framing for
@@ -217,20 +224,43 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     //   5. Response-format hint — render-target rules
     //      (CommonMark in monospace ANSI, file:line refs,
     //      no-emoji default, structural padding bans) per
-    //      ANTI_PATTERNS.md §1.3 ("output format expectations
-    //      literais"). Sits OUTERMOST because it applies to
-    //      every other section's output equally.
-    //
-    // Composition order: response-format FIRST (most general
-    // surface contract), then parallel hint, then playbook
-    // hint, then plan/user (more-specific instructions). Each
-    // `composeWith*Hint` prepends its hint to the downstream
-    // chunk it receives, so we wrap from the inside out.
+    //      ANTI_PATTERNS.md §1.3.
+    //   6. Task discipline — behavioral norms (prefer editing,
+    //      no premature abstractions, WHY-only comments, no
+    //      half-finished work). Most-general operational
+    //      framing; sits above response-format because it
+    //      governs WHAT the model writes, while response-format
+    //      governs HOW it formats output.
+    //   7. Environment block — situational anchor: cwd, OS,
+    //      model, today's date, git context. Sits OUTERMOST so
+    //      it lands first in the prompt — the model reads
+    //      "where am I" before reading any task instructions.
+    //      Date in this section invalidates cache once per
+    //      UTC day (acceptable per CONTEXT_TUNING §3.2; the
+    //      alternative — placeholder + post-cache substitution
+    //      — is not supported by Anthropic's API).
     const baseDownstream =
       input.plan === true ? composeWithUserPrompt(input.systemPrompt) : input.systemPrompt;
     const withPlaybook = composeWithPlaybookHint(baseDownstream, subagents);
     const withParallel = composeWithParallelHint(withPlaybook);
-    resolvedSystemPrompt = composeWithResponseFormat(withParallel);
+    const withResponseFormat = composeWithResponseFormat(withParallel);
+    const withDiscipline = composeWithTaskDiscipline(withResponseFormat);
+    resolvedSystemPrompt = composeWithEnvironment(withDiscipline, {
+      cwd,
+      platform: process.platform,
+      modelId: provider.id,
+      // Today's date in `YYYY-MM-DD`. Single Date.now() call at
+      // boot — stable for the whole session, so the env block
+      // sits inside cache breakpoint #1 across turns within a
+      // session. Across session boundaries spanning UTC
+      // midnight the cache invalidates, which is the intended
+      // trade-off.
+      today: new Date().toISOString().split('T')[0] ?? '',
+      // Git probes are best-effort: when cwd is not a git repo
+      // the helper returns null and the env section omits the
+      // git sub-block entirely.
+      git: probeGitContext(cwd),
+    });
 
     // Memory subsystem (spec MEMORY.md / §4.1). Build the registry
     // from the REPO root, not the invocation cwd: project memory

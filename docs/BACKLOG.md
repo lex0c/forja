@@ -15,6 +15,142 @@ Format:
 
 ---
 
+## [2026-05-07] system prompt enrichment — env, task discipline, memory framing
+
+Three new layers added to the system prompt composition,
+matching surfaces that Claude Code's own prompt has and Forja
+was missing. The slice is bigger than a single fix but the
+three sections are tightly coupled in the prompt-composition
+pipeline, so they ship together.
+
+**Done — `# Environment` section:**
+
+Situational anchor at session boot: cwd, OS (Linux/macOS/
+Windows friendly labels), model id, today's date, and a `## Git`
+sub-block when in a repo (branch, dirty/clean status, ahead/
+behind, last 3 commits). Sits OUTERMOST in the prompt — model
+reads "where am I" before any task instruction. Date in the
+section invalidates cache once per UTC day; acceptable trade-
+off per CONTEXT_TUNING §3.2 (Anthropic's API doesn't support
+post-cache substitution, so the placeholder pattern doesn't
+apply — accept the daily miss, sessions are typically <5min).
+
+New modules:
+- `src/cli/git-context.ts` — synchronous best-effort probes
+  via `Bun.spawnSync`. `probeGitContext` returns null when
+  cwd is not a git repo (env section then omits the git
+  block). Each individual probe (branch, status, ahead/
+  behind, log) returns undefined on failure rather than
+  throwing — env is informational, not load-bearing.
+- `src/cli/environment-prompt.ts` — `renderEnvironmentSection`
+  + `composeWithEnvironment`. Renders the section deterministically
+  from a pure input record so tests stay seamless without
+  injecting Date.now or process.platform.
+
+**Done — `# Task discipline` section:**
+
+Distills the behavioral norms that make code agents ship clean
+work vs plausible-looking work: prefer editing, no premature
+abstractions, WHY-only comments, no half-finished implementations,
+no error handling for impossible scenarios, no backwards-
+compat shims for code that has no consumers yet. These nudges
+shape OUTPUT QUALITY in a way structural rules
+(response-format, parallelism hint) don't reach. Forja had
+none of this in the system prompt; the model defaulted to
+introducing abstractions for hypothetical futures, padding fixes
+with surrounding cleanup, writing comments that restate WHAT
+the code already says.
+
+Sits between the environment block (most-general anchor) and
+the response-format hint (output-format rules). New module
+`src/cli/task-discipline.ts`; one composer function, single
+section.
+
+**Done — memory framing in the existing `# Memory` section:**
+
+Beyond the index of memories, the section now describes HOW
+memory works: four types (user / feedback / project /
+reference) with one-line semantics each, when to save (per
+type), and what NOT to save (code patterns, git history, fix
+recipes — all reconstructible). The memory_write tool's own
+description was thin on guidance; without the framing, models
+default to saving anything that "looks intelligent" and the
+index degrades into noise over time.
+
+Modified `src/cli/memory-prompt.ts` to extend the section
+header with the framing block. The verification rule (FACT vs
+PREFERENCE memories) stays at the end as the safety nuance.
+
+**Bootstrap composition pipeline updated:**
+
+```
+# Environment        ← outermost (situational anchor)
+# Task discipline    ← behavioral norms
+# Response surface   ← output-format rules
+# Parallelism        ← concurrency mechanics
+# Playbooks          ← discovery hint when subagents present
+[plan-mode wrap]     ← when --plan
+[caller's prompt]
+# Project context    ← AGENTS.md pointer (when trusted + present)
+# Memory             ← framing + index
+```
+
+**Verification:** `bun test` 3611 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean. Suite gained 20+ new
+tests (task-discipline × 5, environment-prompt × 9, git-context
+× 6 with real `git` invocations in tmpdir).
+
+**Token cost (estimate):** ~600 stable tokens added to the
+cached system prompt (task discipline ~150, memory framing
+~200, environment ~50, git context ~50-200 per session).
+Cache breakpoint #1 amortizes the write cost; net positive
+on any session > 1 turn.
+
+**Spec posture:** none required. CONTEXT_TUNING.md §1.8
+mentions "system prompt canônico" and identity/date/metadata/
+constraints as the components — these additions fit the
+declared layout without changing the contract.
+
+**Pending — explicit follow-ups:**
+
+- **Subagent prompt composition.** `subagent-child.ts:762`
+  composes only the parallelism hint — it does NOT include
+  response-format, task-discipline, or environment. The same
+  model running inside a subagent therefore lacks the
+  behavioral nudges this slice ships and the situational
+  anchor (cwd / date / git) that the parent has. The pattern
+  is consistent (response-format was already not propagated;
+  the playbook author owns the framing), but with task
+  discipline and environment now in the parent prompt, the
+  parent/subagent gap widens. Worth an audit slice that
+  decides per-section whether subagents inherit. Specifically:
+  task-discipline almost certainly should propagate (code
+  quality applies regardless of context); environment block
+  is debatable (subagent inherits cwd but might want a
+  trimmed env to keep its prompt minimal).
+
+- **Operational tips section** (#7 from the prompt-comparison
+  list): brief cheat-sheet "use edit_file batch / task_async
+  / todo_write". Skipped this slice because tools' own
+  descriptions cover the mechanics; revisit if eval shows the
+  model defaults to the wrong tool family.
+
+- **Action care nudges** (#4 from the prompt-comparison list):
+  brief reminder to confirm destructive ops. The permission
+  engine enforces gates; the system-prompt nudge would prevent
+  the model from TRYING in the first place. Belt-and-suspenders;
+  defer until eval shows whether the gate is enough.
+
+- **Eval coverage:** all three additions ship blind. The
+  task-discipline section is the highest-leverage and the
+  hardest to measure (does it actually shape output?). An
+  eval comparing pre/post on a corpus of "did the model
+  introduce premature abstractions" would close the loop.
+
+**Next:** branch is mergeable.
+
+---
+
 ## [2026-05-07] REPL adapter — display cost cap matches enforced cap
 
 Slice C introduced `DEFAULT_BUDGET.maxCostUsd = 5` so an
