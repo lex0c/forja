@@ -15,6 +15,87 @@ Format:
 
 ---
 
+## [2026-05-07] tool descriptions — conservative trim
+
+Token-budget audit measured tool schemas at 5,537 tokens (38%
+above the spec's 2-4k estimate in CONTEXT_TUNING.md §2.1).
+Diagnosis: 60% of the wire size is schema property
+descriptions, not the top-level `description` field. The slice
+de hoje (system prompt enrichment) added a `# Memory` section
+that frames memory types + when-to-save, making the
+corresponding schema descriptions on the memory tools partially
+redundant.
+
+This pass trims the redundant prose where the system prompt
+now carries the framing, plus tightens a few duplicated phrases
+in `wait_for`. Conservative — every cut preserves the semantic
+information the model uses to invoke correctly; only repetition
+and prose padding go.
+
+**Done:**
+
+- `memory_write` (529 → 444 tokens, −85): trimmed `type` /
+  `source` / `body` / `expires` schema descriptions. The
+  per-type semantics now live in the system prompt's `# Memory`
+  section; the schema cross-refs there instead of repeating.
+- `memory_read` (199 → 155 tokens, −44): description dropped
+  the frontmatter-listing prose and the audit-log mention
+  (operator concern, not a model decision input). Lookup
+  precedence kept (load-bearing).
+- `memory_list` (218 → 168 tokens, −50): description dropped
+  the field enumeration and the redundant "(e.g. one per
+  scope)" example. "Parallel-safe" stays as the load-bearing
+  hint.
+- `memory_search` (238 → 208 tokens, −30): removed the "vector
+  retrieval" anti-claim (drift-prone if Forja ever adopts
+  retrieval) and tightened parallel-safe phrasing.
+- `wait_for` (775 → 746 tokens, −29): tightened `redirect`,
+  `process_id`, `pattern`, `is_regex` descriptions. The
+  9-kind tagged union is genuinely complex; cuts limited to
+  redundant prose, not structure.
+
+**Verification:** `bun run typecheck` clean · `bun run lint`
+clean · `bun test` 3612 pass / 0 fail. No test changes
+required — tests assert tool behavior, not description
+strings.
+
+**Token impact:**
+- Before: 5,537 tokens (tools) / 7,500 tokens (full stable cache)
+- After: 5,293 tokens (tools) / 7,256 tokens (full stable cache)
+- Savings: 244 tokens (4.4% of tools budget, 3.3% of stable
+  cache)
+
+Per-session cache write 1.25× input rate. Across many sessions
+the absolute dollar savings is small; the real value is
+**attention budget** — fewer redundant tokens before the model
+gets to task-specific input, and a tighter alignment between
+tool schemas and the system-prompt framing.
+
+**Spec posture:** none required. The cuts don't change tool
+contracts; they only remove prose that duplicated framing the
+slice de hoje added to the system prompt. CONTEXT_TUNING.md
+§2.1's 2-4k estimate is still optimistic (we're at 5.3k after
+the cut), but updating that range to 4-6k is a separate
+follow-up — the audit honestly reports current state.
+
+**Pending — explicit follow-ups:**
+
+- **Aggressive trim** (~200 more tokens): would require
+  restructuring `wait_for`'s 9-kind tagged union (factor out
+  shared properties) and rewriting `todo_write` description.
+  Higher regression risk because the model relies on the
+  current verbosity to pick the right tool variant; defer
+  unless eval shows the cuts are safe.
+
+- **Spec amendment**: update CONTEXT_TUNING.md §2.1's
+  tool_schemas estimate from 2-4k to 4-6k tokens to reflect
+  current state (parallel + monitor + wait_for + task family
+  weren't in the spec's original estimate).
+
+**Next:** branch is mergeable.
+
+---
+
 ## [2026-05-07] system prompt enrichment — env, task discipline, memory framing
 
 Three new layers added to the system prompt composition,

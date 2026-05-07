@@ -113,29 +113,27 @@ export const memoryWriteTool: Tool<MemoryWriteInput, MemoryWriteOutput> = {
       type: {
         type: 'string',
         enum: ['user', 'feedback', 'project', 'reference'],
-        description:
-          'Spec category. user = profile / role; feedback = corrections + validated approaches; project = ongoing work context; reference = pointers to external systems.',
+        description: 'Spec category — see system prompt # Memory for per-type semantics.',
       },
       source: {
         type: 'string',
         enum: ['user_explicit', 'inferred'],
         description:
-          'user_explicit = operator asked you to save this; inferred = you decided based on a correction / validation. Inferred memories require operator confirmation and may carry trust=untrusted markers.',
+          'user_explicit = operator asked; inferred = you decided. Inferred entries require operator confirm.',
       },
       description: {
         type: 'string',
-        description:
-          'One-line hook shown in the per-scope MEMORY.md index. Single line, <=200 chars.',
+        description: 'One-line hook for the per-scope MEMORY.md index. Single line, <=200 chars.',
       },
       body: {
         type: 'string',
         description:
-          'Full markdown body of the memory file. For feedback/project entries, include "Why:" and "How to apply:" lines per the system prompt template. Will be scanned for injection patterns before reaching the operator confirm modal.',
+          'Full markdown body. For feedback/project entries, see # Memory for the Why / How-to-apply structure.',
       },
       expires: {
         type: 'string',
         description:
-          'Optional ISO date YYYY-MM-DD. When omitted for inferred memories in project scope, defaults to +90 days. user_explicit memories never auto-expire.',
+          'Optional ISO date (YYYY-MM-DD). Inferred + project scope defaults to +90 days when omitted; user_explicit never auto-expires.',
       },
     },
     required: ['name', 'scope', 'type', 'source', 'description', 'body'],

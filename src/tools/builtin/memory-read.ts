@@ -52,7 +52,7 @@ const validateScope = (raw: unknown): MemoryScope | null | { error: string } => 
 export const memoryReadTool: Tool<MemoryReadInput, MemoryReadOutput> = {
   name: 'memory_read',
   description:
-    'Load the body of one memory by name. Returns frontmatter (name, description, type, source, expires, trust, triggers) plus the markdown body. Optional scope hint forces a strict lookup in that scope (no fallback). Without scope, looks up project_local → project_shared → user and returns the first match. Emits a read event to the audit log. Parallel-safe: emit multiple memory_read calls in a single turn to load several memories concurrently.',
+    'Load the body of one memory by name. Without scope, looks up project_local → project_shared → user and returns the first match; pass scope to pin a strict lookup. Parallel-safe: emit multiple memory_read calls in a single turn to load several memories concurrently.',
   inputSchema: {
     type: 'object',
     properties: {

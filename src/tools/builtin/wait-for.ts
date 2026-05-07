@@ -422,22 +422,21 @@ export const waitForTool: Tool<WaitForInput, WaitForOutput> = {
             type: 'string',
             enum: ['follow', 'manual'],
             description:
-              "For kind=http_response: 'follow' (default) traverses 3xx redirects and matches the FINAL status; 'manual' surfaces the literal status of the requested URL.",
+              "For kind=http_response: 'follow' (default) follows 3xx and matches the final status; 'manual' surfaces the literal status of the requested URL.",
           },
           process_id: {
             type: 'string',
-            description:
-              'For kind=process_exit | process_output: the process_id returned by bash_background.',
+            description: 'For kind=process_exit | process_output: process_id from bash_background.',
           },
           pattern: {
             type: 'string',
             description:
-              'For kind=process_output: text to match in the process output. Literal string by default; set is_regex=true to interpret as a regex.',
+              'For kind=process_output: literal text to match (or a regex when is_regex=true).',
           },
           is_regex: {
             type: 'boolean',
             description:
-              'For kind=process_output: when true, `pattern` compiles as a regex. Default false (literal). The global (g) flag is rejected.',
+              'For kind=process_output: compile `pattern` as a regex (no /g flag). Default false.',
           },
           conditions: {
             type: 'array',
