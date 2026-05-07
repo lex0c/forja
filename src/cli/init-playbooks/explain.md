@@ -20,7 +20,7 @@ output_schema:
   files_touched:
     - { path: string, why: string }
   dependencies:
-    - { name: string, role: string, file?: string }
+    - { name: string, role: string, file: string }
   flow:
     - { step: int, what: string, where: string }
   gotchas:
