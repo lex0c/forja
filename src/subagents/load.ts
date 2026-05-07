@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { DEFAULT_BUDGET } from '../harness/types.ts';
 import { projectAgentsDir, userAgentsDir } from './paths.ts';
+import { TOOL_RESTRICTION_SHAPE } from './restrictions.ts';
 import type {
   ClarifyMode,
   ContextRecipe,
@@ -364,7 +365,9 @@ const parseToolRestrictionRule = (
   // the `allow` set; nothing else can be declared on that rule.
   if (Array.isArray(raw)) {
     const allow = requireRestrictionPatternArray(raw, sourcePath, `tool_restrictions.${toolName}`);
-    return { allow };
+    const out: ToolRestrictionRules = { allow };
+    enforceRestrictionShape(out, toolName, sourcePath);
+    return out;
   }
   if (raw === null || typeof raw !== 'object') {
     throw new Error(
@@ -420,7 +423,51 @@ const parseToolRestrictionRule = (
       `tool_restrictions.${toolName}.deny_paths`,
     );
   }
+  enforceRestrictionShape(out, toolName, sourcePath);
   return out;
+};
+
+// Shape compatibility gate. The runtime maps each tool to either
+// `bash` (matched by command-string) or `path` (matched by target
+// path) via `TOOL_RESTRICTION_SHAPE` in `restrictions.ts`. The
+// loader accepts arbitrary key combinations, but at runtime
+// `enforceBashRestriction` only consults `allow`/`deny` and
+// `enforcePathRestriction` only consults `allowPaths`/`denyPaths`
+// — so a playbook that wrote `tool_restrictions.write_file.allow:
+// ["src/**"]` would parse fine and then enforce nothing at runtime,
+// leaving writes effectively unrestricted. Refuse at load with a
+// directional hint so the author moves the rule to the right
+// field rather than discovering the silent bypass in production.
+//
+// Tools NOT in `TOOL_RESTRICTION_SHAPE` (forward-compat for future
+// tools that the loader accepts but the runtime does not gate)
+// pass through untouched — the restriction is inert anyway, so
+// refusing here would punish the author for the loader's
+// permissiveness elsewhere.
+const enforceRestrictionShape = (
+  rules: ToolRestrictionRules,
+  toolName: string,
+  sourcePath: string,
+): void => {
+  const shape = TOOL_RESTRICTION_SHAPE[toolName];
+  if (shape === undefined) return;
+  if (shape === 'bash') {
+    if (rules.allowPaths !== undefined || rules.denyPaths !== undefined) {
+      const offending = rules.allowPaths !== undefined ? 'allow_paths' : 'deny_paths';
+      const replacement = rules.allowPaths !== undefined ? 'allow' : 'deny';
+      throw new Error(
+        `subagent ${sourcePath}: 'tool_restrictions.${toolName}.${offending}' is path-shape but ${toolName} is gated by command-string match — use '${replacement}' (or move the rule to a path-shape tool like write_file / edit_file)`,
+      );
+    }
+  } else {
+    if (rules.allow !== undefined || rules.deny !== undefined) {
+      const offending = rules.allow !== undefined ? 'allow' : 'deny';
+      const replacement = rules.allow !== undefined ? 'allow_paths' : 'deny_paths';
+      throw new Error(
+        `subagent ${sourcePath}: 'tool_restrictions.${toolName}.${offending}' is command-shape but ${toolName} is gated by target path — use '${replacement}' (or move the rule to a bash-shape tool like bash / bash_background)`,
+      );
+    }
+  }
 };
 
 const parseToolRestrictions = (raw: unknown, sourcePath: string): ToolRestrictions | undefined => {

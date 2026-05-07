@@ -650,6 +650,92 @@ describe('playbook surface — tool_restrictions', () => {
     }
   });
 
+  test('rejects path-shape keys on a bash-shape tool', () => {
+    // Regression: the parser accepted `bash.allow_paths` /
+    // `bash.deny_paths` even though the runtime gates bash by
+    // command-string match (allow/deny). The rule loaded fine,
+    // never matched anything at runtime, and the operator
+    // believed the gate was active.
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('tool_restrictions:\n  bash:\n    allow_paths: ["src/**"]'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(
+      /'tool_restrictions\.bash\.allow_paths' is path-shape but bash is gated by command-string match/,
+    );
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('tool_restrictions:\n  bash:\n    deny_paths: ["secrets/**"]'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(
+      /'tool_restrictions\.bash\.deny_paths' is path-shape but bash is gated by command-string match/,
+    );
+  });
+
+  test('rejects bash-shape keys on a path-shape tool', () => {
+    // Mirror of the above: write_file / edit_file are gated by
+    // target path; allow / deny keys on them would be silently
+    // ignored. Refuse at load with a directional hint pointing
+    // to allow_paths / deny_paths.
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('tool_restrictions:\n  write_file:\n    allow: ["src/**"]'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(
+      /'tool_restrictions\.write_file\.allow' is command-shape but write_file is gated by target path/,
+    );
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('tool_restrictions:\n  edit_file:\n    deny: ["dist/**"]'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(
+      /'tool_restrictions\.edit_file\.deny' is command-shape but edit_file is gated by target path/,
+    );
+  });
+
+  test('rejects list-shorthand on a path-shape tool', () => {
+    // List-shorthand (`bash: [glob]`) becomes `{ allow: [...] }`.
+    // On a path tool it loads as command-shape allow → silent
+    // ignore at runtime. Same gate catches it.
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('tool_restrictions:\n  write_file:\n    - "src/**"'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(
+      /'tool_restrictions\.write_file\.allow' is command-shape but write_file is gated by target path/,
+    );
+  });
+
+  test('forward-compat: unknown tool with arbitrary keys still loads', () => {
+    // Tools the runtime does not gate (`future_tool_xyz`) pass
+    // through untouched. The shape map is the authority on what
+    // gets enforced; refusing here would punish authors for the
+    // loader's intentional permissiveness on arbitrary tool
+    // names (`tool_restrictions` accepts forward-compat names
+    // even when the runtime ignores them).
+    const def = loadSubagentFromString(
+      withExtraFrontmatter(
+        'tool_restrictions:\n  future_tool_xyz:\n    allow: ["foo *"]\n    allow_paths: ["src/**"]',
+      ),
+      'user',
+      '/p',
+    );
+    expect(def.toolRestrictions?.future_tool_xyz).toEqual({
+      allow: ['foo *'],
+      allowPaths: ['src/**'],
+    });
+  });
+
   test('keeps internal whitespace inside patterns valid (bash needs it)', () => {
     // Bash command patterns legitimately have spaces between
     // tokens (`git diff *`); the surrounding-whitespace guard
