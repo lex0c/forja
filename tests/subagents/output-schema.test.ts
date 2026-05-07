@@ -44,18 +44,46 @@ describe('parseOutputAsObject', () => {
     expect(out).toEqual({ summary: 'ok', blockers: [] });
   });
 
-  test('extracts an earlier block when the LAST one fails to parse as a mapping', () => {
-    // The walker tries blocks in reverse order; if the very
-    // last block doesn't yield a mapping (e.g., it's a closing
-    // illustrative snippet), an earlier block whose content IS
-    // a mapping wins. Defends against the model swapping the
-    // order — schema-bound YAML earlier, demonstration last.
+  test('refuses an earlier valid mapping followed by a terminal non-mapping fence', () => {
+    // The motivating shape from the bug report: model emits a
+    // clean YAML mapping in fence A, then a second fence B
+    // whose content does not parse as a mapping. The terminal
+    // contract refuses — only fence B (the final answer)
+    // satisfies the gate.
+    const text =
+      'Setup:\n\n```yaml\ntopic: ok\n```\n\nFinal answer:\n\n```text\njust some prose, no mapping\n```';
+    expect(parseOutputAsObject(text)).toBeNull();
+  });
+
+  test('terminal mapping fence wins even when an earlier fence is also a mapping', () => {
+    // Counterpart pin: when BOTH the earlier fence AND the
+    // terminal fence are mappings, the terminal one is the
+    // authoritative answer (per `output_schema` contract). The
+    // returned object must be the LAST mapping, not the first.
+    const text =
+      '```yaml\ntopic: scratch\n```\n\nFinal answer:\n\n```yaml\ntopic: real_answer\nsummary: ok\n```';
+    const out = parseOutputAsObject(text);
+    expect(out).toEqual({ topic: 'real_answer', summary: 'ok' });
+  });
+
+  test('refuses to fall back to an EARLIER fenced block when the LAST one is non-mapping', () => {
+    // Strict terminal-output contract: the schema instruction
+    // ("Your final assistant turn MUST be a YAML mapping")
+    // means an earlier fenced object MUST NOT satisfy the gate
+    // when the terminal block is non-conformant. Without this
+    // strictness, a model could emit a clean object in fence
+    // A, then continue with prose / another invalid fence B,
+    // and silently pass the schema check — defeating the
+    // post-hoc contract meant for the FINAL answer. Whole-text
+    // parse is the only fallback path; it fails here too
+    // because the surrounding text is not a YAML mapping at
+    // root, so the verdict is null (→ playbook.output_invalid
+    // upstream).
     const text =
       '```yaml\nsummary: ok\nblockers: []\n```\n\n' +
       'For reference, a related illustration:\n\n' +
       '```text\njust prose\n```';
-    const out = parseOutputAsObject(text);
-    expect(out).toEqual({ summary: 'ok', blockers: [] });
+    expect(parseOutputAsObject(text)).toBeNull();
   });
 
   test('extracts a fenced block preceded by prose (Reflection: line)', () => {

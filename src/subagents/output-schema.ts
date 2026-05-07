@@ -44,16 +44,23 @@ import { parse as parseYaml } from 'yaml';
 export const parseOutputAsObject = (text: string): Record<string, unknown> | null => {
   const trimmed = text.trim();
   if (trimmed.length === 0) return null;
-  // Prefer fenced blocks when present, walked LAST-FIRST. The
-  // output_schema prompt tells the model to wrap its TERMINAL
-  // mapping in a ```yaml fence; outputs with multiple fences
-  // (e.g., a brief snippet block earlier in the response,
-  // followed by the final YAML) need the LAST block, not a
-  // slice that conflates both. Falling through to whole-text
-  // parse covers the bare-YAML case (no fence).
-  for (const candidate of extractFencedCandidates(trimmed)) {
-    const obj = tryParseObject(candidate);
-    if (obj !== null) return obj;
+  // Validate ONLY against the TERMINAL fenced block when fences
+  // are present. The output_schema prompt is explicit: "Your
+  // final assistant turn MUST be a YAML mapping". An earlier
+  // fenced object that happens to parse must NOT satisfy the
+  // schema if the terminal block is non-conformant — otherwise
+  // a model can emit a clean object in fence A then continue
+  // with prose or another invalid fence B and silently pass
+  // the gate. Try the last fence; if it does not yield a
+  // mapping, fall through to whole-text parse (covers the
+  // bare-YAML case, no fences anywhere).
+  const candidates = extractFencedCandidates(trimmed);
+  if (candidates.length > 0) {
+    const last = candidates[0];
+    if (last !== undefined) {
+      const fromLast = tryParseObject(last);
+      if (fromLast !== null) return fromLast;
+    }
   }
   return tryParseObject(trimmed);
 };
