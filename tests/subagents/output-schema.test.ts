@@ -321,34 +321,63 @@ describe('validateOutput — schema-side edge cases', () => {
     expect(validateOutput('- not\n- a\n- mapping', {}).valid).toBe(true);
   });
 
-  test('JSON-schema-shaped schema with null properties does not crash', () => {
-    // Regression: `typeof null === 'object'` let a malformed
-    // `{type: "object", properties: null}` enter JSON-Schema mode,
-    // and validateJsonSchema would index into the null
-    // `properties` for required keys — TypeError on a clean
-    // `done` run instead of a structured diagnostic. The
-    // discriminator now requires `properties` to be a real,
-    // non-null, non-array object. Malformed shapes fall through
-    // to shorthand, where the validator emits a diagnostic
-    // about missing keys rather than throwing.
+  test('JSON-schema-shaped schema with null/array properties does not crash', () => {
+    // Regression contract: `typeof null === 'object'` previously
+    // let a malformed `{type: "object", properties: null}` index
+    // into a null properties record and throw a TypeError on a
+    // clean `done` run. The discriminator now classifies any
+    // `type: "object"` schema as JSON Schema mode — including
+    // these malformed shapes — and validateJsonSchema's
+    // extraction guard normalizes null / array properties into
+    // an empty object so the runtime stays well-formed.
     const malformed = [
       { type: 'object', properties: null, required: ['foo'] },
       { type: 'object', properties: ['foo', 'bar'], required: ['foo'] },
     ];
     for (const schema of malformed) {
-      // Must not throw — that is the regression contract.
       expect(() => validateOutput('summary: ok', schema)).not.toThrow();
-      // Result is well-formed (a ValidationResult with `valid`).
       const result = validateOutput('summary: ok', schema);
       expect(typeof result.valid).toBe('boolean');
     }
   });
 
-  test('JSON-schema mode requires a real properties object (non-null, non-array)', () => {
-    // Counterpart pin: a schema that DOES qualify as JSON-Schema
-    // (real properties object) must still validate. Defensively
-    // confirms the tightened discriminator did not over-shrink
-    // the JSON-Schema branch's coverage.
+  test('JSON-schema with required but no properties block validates correctly', () => {
+    // Regression: requiring properties on the discriminator
+    // misclassified valid schemas like `{type: "object",
+    // required: [...]}` (no properties declared) as shorthand.
+    // The validator then iterated `Object.keys(schema)` and
+    // treated `type` and `required` as required OUTPUT keys —
+    // a false `playbook.output_invalid` even when the model
+    // emitted exactly what the schema asked for.
+    const schema = { type: 'object', required: ['summary'] };
+    // summary present → valid (no properties means no type checks).
+    expect(validateOutput('summary: ok', schema).valid).toBe(true);
+    // summary absent → missing required key (NOT "missing type / required").
+    const result = validateOutput('other: 42', schema);
+    expect(result.valid).toBe(false);
+    if (result.valid) return;
+    expect(result.missingKeys).toEqual(['summary']);
+    // Defensive: the schema's own keywords MUST NOT leak into
+    // the missing-keys list (the symptom of the misclassification).
+    expect(result.missingKeys).not.toContain('type');
+    expect(result.missingKeys).not.toContain('required');
+  });
+
+  test('JSON-schema with bare type=object (no required, no properties) accepts any output', () => {
+    // The most permissive JSON Schema: declares "must be an
+    // object" with no further constraints. Output is unconditionally
+    // valid because there are no required keys and no typed
+    // properties to gate.
+    const schema = { type: 'object' };
+    expect(validateOutput('summary: anything\nother: 42', schema).valid).toBe(true);
+    expect(validateOutput('foo: bar', schema).valid).toBe(true);
+  });
+
+  test('JSON-schema mode validates against the declared properties block when present', () => {
+    // Counterpart pin to the discriminator change. A schema
+    // that DOES declare properties must still type-check them
+    // (defends against an over-permissive rewrite that skips
+    // the type gate when the discriminator loosens).
     const valid = {
       type: 'object',
       required: ['summary'],

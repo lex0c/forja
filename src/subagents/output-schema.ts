@@ -119,18 +119,19 @@ const extractFencedCandidates = (text: string): string[] => {
 // only canonical entry point for an object schema is `type:
 // 'object'`). Anything else is shorthand.
 //
-// `properties` must be a non-null, non-array object — `typeof
-// null === 'object'` is the JS quirk that previously let
-// `properties: null` enter JSON-Schema mode and then crash with
-// a TypeError when `validateJsonSchema` indexed into it. The
-// stricter check here ensures malformed schemas fall through to
-// shorthand (producing a structured diagnostic) instead of
-// throwing mid-validation on a `done` run.
-const isJsonSchema = (schema: Record<string, unknown>): boolean =>
-  schema.type === 'object' &&
-  schema.properties !== null &&
-  typeof schema.properties === 'object' &&
-  !Array.isArray(schema.properties);
+// `properties` shape is intentionally NOT part of the
+// discriminator: a valid JSON Schema can declare
+// `{type: 'object', required: [...]}` with no properties block
+// at all, or rely only on keywords like `additionalProperties`
+// / `patternProperties`. Requiring properties here would have
+// misclassified those as shorthand and started treating schema
+// keywords (`type`, `required`) as required output keys —
+// false `playbook.output_invalid` against otherwise-correct
+// output. validateJsonSchema below is robust against null /
+// array `properties` (extraction guard normalizes to `{}`),
+// so loosening the discriminator does not reintroduce the
+// null-properties crash that motivated the earlier tightening.
+const isJsonSchema = (schema: Record<string, unknown>): boolean => schema.type === 'object';
 
 // Map a JSON Schema primitive type to a runtime test against the
 // observed value. We accept the conventional aliases the spec
