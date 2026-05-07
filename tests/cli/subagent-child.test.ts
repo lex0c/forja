@@ -804,6 +804,74 @@ You are the worker.`,
     }
   });
 
+  test('schema-valid output leaves sessions.status as done (no spurious reclassify)', async () => {
+    // Counterpart pin to the schema-fail test above. Defends
+    // against a regression where the reclassify call leaks out
+    // of the !verdict.valid branch — without this assertion,
+    // a buggy variant that always reclassifies (or reclassifies
+    // on the success branch by mistake) would pass the
+    // schema-fail test and silently mark every successful
+    // schema-bound run as failed.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    let childId: string;
+    const db = openDb(dbPath);
+    try {
+      migrate(db);
+      const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+      const child = sessionsRepo.createSession(db, {
+        model: 'mock/m',
+        cwd: dbDir,
+        parentSessionId: parent.id,
+      });
+      childId = child.id;
+      subagentRunsRepo.insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'project',
+        sourcePath: '/fake/explore.md',
+        sourceSha256: 'a'.repeat(64),
+        systemPrompt: 'You are explore.',
+        toolsWhitelist: [],
+        budgetMaxSteps: 5,
+        budgetMaxCostUsd: 0.1,
+        // Same schema as the fail test, but the provider stub
+        // below emits a YAML mapping that matches it cleanly.
+        outputSchema: { summary: 'string' },
+      });
+      messagesRepo.appendMessage(db, {
+        sessionId: child.id,
+        role: 'user',
+        content: 'go',
+      });
+    } finally {
+      db.close();
+    }
+
+    // Bare YAML mapping — parseOutputAsObject handles fence-less
+    // input and the validator accepts the `summary: string`
+    // shape. Run completes cleanly with status='done' AND
+    // schema passes, so no reclassify should fire.
+    const exitCode = await runSubagentChild({
+      sessionId: childId,
+      dbPath,
+      providerOverride: stubProvider('summary: ok'),
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      errSink: () => undefined,
+    });
+    expect(exitCode).toBe(0);
+    const db2 = openDb(dbPath);
+    try {
+      const session = sessionsRepo.getSession(db2, childId);
+      expect(session?.status).toBe('done');
+    } finally {
+      db2.close();
+    }
+  });
+
   test('memoryCwd anchors the registry at the parent repo even for worktree-cwd children', async () => {
     // Subagent runs in a worktree (different cwd from parent's
     // repo). Without memoryCwd forwarding, the child would build
