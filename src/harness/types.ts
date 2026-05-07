@@ -450,6 +450,15 @@ export interface HarnessConfig {
   // surface expresses intent, per-provider effort follows). Tied
   // to `PLAYBOOKS.md` §1.1 `sampling.thinking_budget`.
   thinkingBudget?: number;
+  // Determinism intent flag (`PLAYBOOKS.md` §1.1
+  // `sampling.seed_in_eval`). When true, the playbook author
+  // declared the run wants seeded generation for reproducibility.
+  // The harness forwards verbatim onto GenerateRequest; provider
+  // adapters that support seeding (OpenAI / Google) translate to
+  // their seed surface, those without (Anthropic) drop the
+  // field — same best-effort convention `topP` and
+  // `thinkingBudget` follow.
+  seedInEval?: boolean;
   // Resume mode (AGENTIC_CLI §2.1): when set, the harness skips
   // createSession and uses this id instead. Persisted messages for
   // the session are loaded into the in-memory `messages` array

@@ -649,6 +649,92 @@ You are the worker.`,
     expect(recordedRequests[0]?.temperature).toBe(0);
   });
 
+  test('sampling.seedInEval flows through to the harness provider request', async () => {
+    // Regression: the loader parsed and persisted seed_in_eval
+    // into the audit row, but subagent-child forwarded only
+    // temperature / topP / thinkingBudget — the determinism
+    // intent flag landed in snapshots and had zero runtime
+    // effect. Authors who declared seed_in_eval: true got
+    // unseeded generation regardless. The forward now puts it
+    // on HarnessConfig.seedInEval and harness/loop.ts threads
+    // it onto GenerateRequest.seed_in_eval where provider
+    // adapters can translate (or drop, per the same convention
+    // top_p / thinking_budget follow).
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    let childId: string;
+    const db = openDb(dbPath);
+    try {
+      migrate(db);
+      const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+      const child = sessionsRepo.createSession(db, {
+        model: 'mock/m',
+        cwd: dbDir,
+        parentSessionId: parent.id,
+      });
+      childId = child.id;
+      subagentRunsRepo.insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'project',
+        sourcePath: '/fake/explore.md',
+        sourceSha256: 'a'.repeat(64),
+        systemPrompt: 'You are explore.',
+        toolsWhitelist: [],
+        budgetMaxSteps: 5,
+        budgetMaxCostUsd: 0.1,
+        sampling: { seedInEval: true },
+      });
+      messagesRepo.appendMessage(db, {
+        sessionId: child.id,
+        role: 'user',
+        content: 'go',
+      });
+    } finally {
+      db.close();
+    }
+
+    const recordedSeed: Array<boolean | undefined> = [];
+    const recordingProvider: Provider = {
+      id: 'mock/m',
+      family: 'anthropic',
+      capabilities: {
+        tools: 'native',
+        cache: false,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 1000,
+        output_max_tokens: 100,
+        cost_per_1k_input: 0,
+        cost_per_1k_output: 0,
+        notes: [],
+      },
+      async *generate(req): AsyncGenerator<StreamEvent> {
+        recordedSeed.push(req.seed_in_eval);
+        yield { kind: 'start', message_id: 'mock-msg' };
+        yield { kind: 'text_delta', text: 'done' };
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+
+    const exitCode = await runSubagentChild({
+      sessionId: childId,
+      dbPath,
+      providerOverride: recordingProvider,
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      errSink: () => undefined,
+    });
+    expect(exitCode).toBe(0);
+    expect(recordedSeed.length).toBeGreaterThan(0);
+    expect(recordedSeed[0]).toBe(true);
+  });
+
   test('memoryCwd anchors the registry at the parent repo even for worktree-cwd children', async () => {
     // Subagent runs in a worktree (different cwd from parent's
     // repo). Without memoryCwd forwarding, the child would build

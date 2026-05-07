@@ -142,6 +142,15 @@ export interface GenerateRequest {
   // here would force every playbook to declare per-provider
   // sampling overrides, which the spec deliberately does not.
   thinking_budget?: number;
+  // Determinism intent flag (`PLAYBOOKS.md` §1.1
+  // `sampling.seed_in_eval`). When true, the playbook author
+  // declared this run wants seeded generation for reproducibility
+  // across replays. Providers that support seeding (OpenAI's
+  // `seed`, Google's `seed`) read the flag and inject a
+  // deterministic seed; adapters without seed surface today
+  // (Anthropic) drop the field — same best-effort convention
+  // `top_p` and `thinking_budget` follow.
+  seed_in_eval?: boolean;
   stop_sequences?: string[];
   metadata?: Record<string, string>;
 }

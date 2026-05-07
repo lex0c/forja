@@ -923,6 +923,16 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       ...(audit.sampling?.thinkingBudget !== undefined
         ? { thinkingBudget: audit.sampling.thinkingBudget }
         : {}),
+      // Determinism intent flag (`PLAYBOOKS.md` §1.1
+      // `sampling.seed_in_eval`). The loader parses + persists it
+      // and the audit row carries it through every replay; without
+      // forwarding here, the field landed in snapshots but had no
+      // runtime effect. Adapter-side translation is per-provider
+      // (Anthropic drops, OpenAI / Google use seed) — the harness
+      // just expresses the intent.
+      ...(audit.sampling?.seedInEval !== undefined
+        ? { seedInEval: audit.sampling.seedInEval }
+        : {}),
       // Plan mode propagation. When the parent invoked
       // runSubagent with planMode:true, the child's harness
       // loop must reject every writing tool BEFORE execution —

@@ -1409,6 +1409,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(config.thinkingBudget !== undefined
             ? { thinking_budget: config.thinkingBudget }
             : {}),
+          ...(config.seedInEval !== undefined ? { seed_in_eval: config.seedInEval } : {}),
         };
 
         let collected: Awaited<ReturnType<typeof collectStep>>;
