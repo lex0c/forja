@@ -30,28 +30,41 @@ import { parse as parseYaml } from 'yaml';
 
 // Parse the model's terminal text as a structured object. The
 // model is told to emit YAML; YAML is a superset of JSON so this
-// path also handles JSON output without a branch. A leading code
-// fence (```yaml ... ``` or ```json ... ```) is stripped before
-// parsing — models commonly wrap output in fences when the
-// surrounding prompt contains other markdown.
+// path also handles JSON output without a branch. A code fence
+// (```yaml ... ``` or ```json ... ```) is recognized anywhere in
+// the text — not just at the start — because playbooks that also
+// enable `step_reflection` instruct the model to begin every step
+// with a `Reflection:` prose line, which lands BEFORE the final
+// YAML fence.
 //
 // Returns null on parse failure or non-object root. The caller
 // treats null as "did not emit a structured object" — a distinct
 // failure mode from "emitted a structured object but missing
 // fields", and surfaces a different diagnostic.
 export const parseOutputAsObject = (text: string): Record<string, unknown> | null => {
-  // Strip a leading / trailing code fence if present. The
-  // commonest shape is:
-  //
-  //   ```yaml
-  //   summary: ...
-  //   ```
-  //
-  // We also handle ```json, ``` (no language), and bare text.
-  const stripped = stripCodeFence(text.trim());
-  if (stripped.length === 0) return null;
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return null;
+  // Prefer a fenced block when present. The output_schema prompt
+  // tells the model to wrap its terminal mapping in a ```yaml
+  // fence; with step_reflection enabled the fence is preceded by
+  // prose, so parsing the whole text as YAML fails. Falling back
+  // to whole-text parsing covers the bare-YAML case (no fence).
+  const fenced = extractFencedBlock(trimmed);
+  if (fenced !== null) {
+    const fromFence = tryParseObject(fenced);
+    if (fromFence !== null) return fromFence;
+    // The fence existed but its contents didn't yield a mapping —
+    // could be a misfire (e.g., a triple-backtick inside a YAML
+    // scalar). Fall through to whole-text parsing rather than
+    // refusing outright.
+  }
+  return tryParseObject(trimmed);
+};
+
+const tryParseObject = (text: string): Record<string, unknown> | null => {
+  if (text.trim().length === 0) return null;
   try {
-    const parsed = parseYaml(stripped) as unknown;
+    const parsed = parseYaml(text) as unknown;
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
     return parsed as Record<string, unknown>;
   } catch {
@@ -59,26 +72,32 @@ export const parseOutputAsObject = (text: string): Record<string, unknown> | nul
   }
 };
 
-const stripCodeFence = (text: string): string => {
-  // Match ```<lang>?\n ... \n```. Allow trailing whitespace after
-  // the closing fence (common when the model adds a sign-off
-  // line). Conservative: only strip the OUTER fence; nested
-  // fences inside content stay verbatim.
+// Locate the OUTER fenced code block in the text, if any, and
+// return its inner contents. The opener is the first line that
+// starts with ``` (with or without a language tag); the closer is
+// the LAST line that is exactly ```. Picking "last close" rather
+// than "first close after open" preserves the historical behavior
+// of treating nested fences inside YAML scalars as content, not
+// as a premature close — only the outermost fence is stripped.
+const extractFencedBlock = (text: string): string | null => {
   const lines = text.split('\n');
-  if (lines.length >= 2 && lines[0]?.startsWith('```')) {
-    // Find the matching close.
-    let closeIdx = -1;
-    for (let i = lines.length - 1; i > 0; i--) {
-      if (lines[i]?.trim() === '```') {
-        closeIdx = i;
-        break;
-      }
-    }
-    if (closeIdx > 0) {
-      return lines.slice(1, closeIdx).join('\n');
+  let openIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i]?.startsWith('```')) {
+      openIdx = i;
+      break;
     }
   }
-  return text;
+  if (openIdx === -1) return null;
+  let closeIdx = -1;
+  for (let i = lines.length - 1; i > openIdx; i--) {
+    if (lines[i]?.trim() === '```') {
+      closeIdx = i;
+      break;
+    }
+  }
+  if (closeIdx === -1) return null;
+  return lines.slice(openIdx + 1, closeIdx).join('\n');
 };
 
 // Discriminator: did the author write JSON Schema or shorthand?

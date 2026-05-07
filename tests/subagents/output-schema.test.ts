@@ -27,6 +27,37 @@ describe('parseOutputAsObject', () => {
     expect(out).toEqual({ summary: 'ok' });
   });
 
+  test('extracts a fenced block preceded by prose (Reflection: line)', () => {
+    // step_reflection: terse forces a `Reflection:` prefix line
+    // BEFORE the YAML fence. The whole text is not parseable
+    // YAML, but the fence contents are.
+    const text =
+      'Reflection: Previous YAML was rejected — re-emitting clean YAML.\n\n```yaml\nsummary: ok\nblockers: []\n```';
+    const out = parseOutputAsObject(text);
+    expect(out).toEqual({ summary: 'ok', blockers: [] });
+  });
+
+  test('extracts a fenced block preceded by multi-paragraph prose', () => {
+    const text =
+      'Reflection: First line.\nSecond paragraph of reasoning.\n\n```json\n{"summary": "ok"}\n```';
+    const out = parseOutputAsObject(text);
+    expect(out).toEqual({ summary: 'ok' });
+  });
+
+  test('falls back to whole-text parse when the fence content is not a mapping', () => {
+    // The fence exists but its inner content is not a YAML
+    // object (here it's just a scalar). The parser should fall
+    // through and try the whole text — which here is also not a
+    // mapping, so returns null. Guards against the fence path
+    // shadowing a successful whole-text parse.
+    const text = 'foo: bar\n\n```\njust a string\n```';
+    const out = parseOutputAsObject(text);
+    // Whole text isn't a clean mapping either (the fence inside
+    // breaks YAML), so result is null. The point of this test is
+    // that we don't throw and we don't lock onto the fence.
+    expect(out).toBeNull();
+  });
+
   test('returns null for non-object root (array)', () => {
     // The schema validator expects a top-level mapping. An array
     // root can't be validated against `{ summary: string, ... }`
