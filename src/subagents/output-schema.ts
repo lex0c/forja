@@ -44,19 +44,16 @@ import { parse as parseYaml } from 'yaml';
 export const parseOutputAsObject = (text: string): Record<string, unknown> | null => {
   const trimmed = text.trim();
   if (trimmed.length === 0) return null;
-  // Prefer a fenced block when present. The output_schema prompt
-  // tells the model to wrap its terminal mapping in a ```yaml
-  // fence; with step_reflection enabled the fence is preceded by
-  // prose, so parsing the whole text as YAML fails. Falling back
-  // to whole-text parsing covers the bare-YAML case (no fence).
-  const fenced = extractFencedBlock(trimmed);
-  if (fenced !== null) {
-    const fromFence = tryParseObject(fenced);
-    if (fromFence !== null) return fromFence;
-    // The fence existed but its contents didn't yield a mapping —
-    // could be a misfire (e.g., a triple-backtick inside a YAML
-    // scalar). Fall through to whole-text parsing rather than
-    // refusing outright.
+  // Prefer fenced blocks when present, walked LAST-FIRST. The
+  // output_schema prompt tells the model to wrap its TERMINAL
+  // mapping in a ```yaml fence; outputs with multiple fences
+  // (e.g., a brief snippet block earlier in the response,
+  // followed by the final YAML) need the LAST block, not a
+  // slice that conflates both. Falling through to whole-text
+  // parse covers the bare-YAML case (no fence).
+  for (const candidate of extractFencedCandidates(trimmed)) {
+    const obj = tryParseObject(candidate);
+    if (obj !== null) return obj;
   }
   return tryParseObject(trimmed);
 };
@@ -72,32 +69,49 @@ const tryParseObject = (text: string): Record<string, unknown> | null => {
   }
 };
 
-// Locate the OUTER fenced code block in the text, if any, and
-// return its inner contents. The opener is the first line that
-// starts with ``` (with or without a language tag); the closer is
-// the LAST line that is exactly ```. Picking "last close" rather
-// than "first close after open" preserves the historical behavior
-// of treating nested fences inside YAML scalars as content, not
-// as a premature close — only the outermost fence is stripped.
-const extractFencedBlock = (text: string): string | null => {
+// Walk the text top-to-bottom, pairing each opener (line
+// starting with ```) with the NEXT bare-``` close line. Returns
+// the inner contents of every paired block in REVERSE order
+// (last block first) — the schema instruction places the
+// authoritative YAML at the end of the assistant turn, so
+// preferring the last block reaches the right answer when the
+// model emits a brief snippet fence earlier in the response.
+//
+// Trade-off vs. the prior "first-open + last-close" strategy: a
+// YAML scalar that contains a nested ``` line (e.g., a string
+// field whose body is markdown with its own fences) will close
+// the outer fence prematurely under nearest-pair walking, and
+// the inner block parses as a partial mapping. The previous
+// strategy handled that edge but conflated multi-block outputs
+// into one unparseable chunk — the bug report that prompted
+// this change. Nested-fence-in-YAML is rare in practice (a
+// playbook must declare a string-typed field AND the model must
+// emit markdown with code fences in it); multi-block responses
+// are the common case under step_reflection: full or any
+// playbook where the model "shows its work" before the final
+// YAML.
+const extractFencedCandidates = (text: string): string[] => {
   const lines = text.split('\n');
+  const pairs: Array<{ open: number; close: number }> = [];
   let openIdx = -1;
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i]?.startsWith('```')) {
-      openIdx = i;
-      break;
+    const line = lines[i] ?? '';
+    if (openIdx === -1) {
+      if (line.startsWith('```')) {
+        openIdx = i;
+      }
+    } else if (line.trim() === '```') {
+      pairs.push({ open: openIdx, close: i });
+      openIdx = -1;
     }
   }
-  if (openIdx === -1) return null;
-  let closeIdx = -1;
-  for (let i = lines.length - 1; i > openIdx; i--) {
-    if (lines[i]?.trim() === '```') {
-      closeIdx = i;
-      break;
-    }
+  const out: string[] = [];
+  for (let i = pairs.length - 1; i >= 0; i--) {
+    const p = pairs[i];
+    if (p === undefined) continue;
+    out.push(lines.slice(p.open + 1, p.close).join('\n'));
   }
-  if (closeIdx === -1) return null;
-  return lines.slice(openIdx + 1, closeIdx).join('\n');
+  return out;
 };
 
 // Discriminator: did the author write JSON Schema or shorthand?

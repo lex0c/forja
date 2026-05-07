@@ -27,6 +27,37 @@ describe('parseOutputAsObject', () => {
     expect(out).toEqual({ summary: 'ok' });
   });
 
+  test('prefers the LAST fenced block when multiple top-level blocks are present', () => {
+    // Regression: previously the extractor paired the FIRST
+    // opener with the LAST closer, so an earlier snippet fence
+    // and the final YAML fence were sliced into one unparseable
+    // chunk. Real outputs look like this whenever the model
+    // shows an example before the final mapping (common under
+    // step_reflection: full or any playbook where the model
+    // "demonstrates" something before the schema-bound YAML).
+    const text =
+      'Reflection: I will show a snippet first, then emit the final YAML.\n\n' +
+      '```text\nbrief illustrative snippet\n```\n\n' +
+      'Now the schema-bound output:\n\n' +
+      '```yaml\nsummary: ok\nblockers: []\n```';
+    const out = parseOutputAsObject(text);
+    expect(out).toEqual({ summary: 'ok', blockers: [] });
+  });
+
+  test('extracts an earlier block when the LAST one fails to parse as a mapping', () => {
+    // The walker tries blocks in reverse order; if the very
+    // last block doesn't yield a mapping (e.g., it's a closing
+    // illustrative snippet), an earlier block whose content IS
+    // a mapping wins. Defends against the model swapping the
+    // order — schema-bound YAML earlier, demonstration last.
+    const text =
+      '```yaml\nsummary: ok\nblockers: []\n```\n\n' +
+      'For reference, a related illustration:\n\n' +
+      '```text\njust prose\n```';
+    const out = parseOutputAsObject(text);
+    expect(out).toEqual({ summary: 'ok', blockers: [] });
+  });
+
   test('extracts a fenced block preceded by prose (Reflection: line)', () => {
     // step_reflection: terse forces a `Reflection:` prefix line
     // BEFORE the YAML fence. The whole text is not parseable
