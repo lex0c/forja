@@ -32,6 +32,7 @@ import {
   loadHistory,
   searchHistory,
 } from '../storage/history.ts';
+import { completeSession, createSession } from '../storage/repos/sessions.ts';
 import { runSubagent } from '../subagents/index.ts';
 import { addTrustedDir, isTrusted, trustListPath } from '../trust/index.ts';
 import {
@@ -526,6 +527,36 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // above the trust prompt — see "Pre-bootstrap stack" earlier in
   // this function.
   let lastSessionId: string | null = null;
+
+  // Synthetic parent session id for slash playbook dispatches that
+  // happen BEFORE any normal turn has run. `runSubagent` requires a
+  // `parentSessionId` for audit attribution + budget cascading; the
+  // bridge used to refuse with "no session yet" until the operator
+  // typed a regular prompt first. The synthetic is created lazily on
+  // the first slash dispatch (see `ensureParentSessionId` below),
+  // immediately closed to status='done' so it doesn't sit running
+  // forever, and reused across subsequent dispatches until a real
+  // turn assigns `lastSessionId` — at which point the real id wins
+  // and the synthetic is left as a no-cost / no-message orphan in
+  // the sessions table. Operators inspecting `--list-sessions` will
+  // see it; harmless but worth knowing.
+  let syntheticParentSessionId: string | null = null;
+  const ensureParentSessionId = (): string => {
+    if (lastSessionId !== null) return lastSessionId;
+    if (syntheticParentSessionId !== null) return syntheticParentSessionId;
+    const synthetic = createSession(db, {
+      model: baseConfig.provider.id,
+      cwd: baseConfig.cwd,
+    });
+    // Immediately close. The session row exists only as an audit
+    // anchor for the slash dispatch's child; it has no turns, no
+    // messages, no cost. Leaving it 'running' would pile up over
+    // a long REPL session that does many slash dispatches before
+    // any normal turn (rare but possible in eval / scripted runs).
+    completeSession(db, synthetic.id, 'done', 0, true);
+    syntheticParentSessionId = synthetic.id;
+    return synthetic.id;
+  };
 
   // ─── Input history (HISTORY.md §2.1) ───────────────────────────────
   // In-memory mirror of repl_history for the current project, oldest-
@@ -1146,23 +1177,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     //   1. Definition unknown — slash registration filtered defs
     //      without `slash:`, but a typo or dynamic shadow change
     //      could still produce a name the registry doesn't have.
-    //   2. No session yet — `runSubagent` wants `parentSessionId`
-    //      to attribute the child against a real parent. Before
-    //      the first turn, no session row exists; refusing here
-    //      matches `/subagents`'s "no session yet" UX.
     //
-    // The slash command itself further gates on `isRunning()` so
-    // a slash dispatch never races a foreground turn.
+    // No "session yet" precondition: `ensureParentSessionId` lazily
+    // creates a synthetic parent on the first dispatch when a real
+    // turn hasn't run — the operator can `/review` immediately on
+    // boot. The slash command itself further gates on `isRunning()`
+    // so a slash dispatch never races a foreground turn.
     runPlaybook: async ({ name, prompt }) => {
       const definition = subagents.byName.get(name);
       if (definition === undefined) {
         throw new Error(`playbook '${name}' is not registered`);
       }
-      if (lastSessionId === null) {
-        throw new Error(
-          `playbook '${name}' cannot dispatch — run a turn first so a parent session exists`,
-        );
-      }
+      const parentSessionId = ensureParentSessionId();
       // Fresh signal per dispatch. Cancellation by Esc / Ctrl+C
       // would route through the REPL's main interrupt path; for
       // an inline slash run we don't expose cancel today (the
@@ -1173,7 +1199,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       return runSubagent({
         definition,
         prompt,
-        parentSessionId: lastSessionId,
+        parentSessionId,
         provider: baseConfig.provider,
         parentToolRegistry: baseConfig.toolRegistry,
         permissionEngine: baseConfig.permissionEngine,
