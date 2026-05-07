@@ -351,8 +351,31 @@ export const checkRestriction = (
     return { ok: true };
   }
   const input = extractor.extract(args);
-  if (input === null) return { ok: true };
-  if (extractor.shape === 'bash') return enforceBashRestriction(input, rules);
+  if (extractor.shape === 'bash') {
+    if (input === null) return { ok: true };
+    return enforceBashRestriction(input, rules);
+  }
+  // Path shape with a MISSING path arg is the bypass case the
+  // user-of-the-restriction-surface most easily forgets. Tools
+  // like grep treat absent path as "search cwd recursively"
+  // (rg's default), and write_file / edit_file / read_file
+  // treat it as a tool-validation error. When `allow_paths` is
+  // declared, the absence of an explicit target expands the
+  // scope to the tool's default — wider than the author's
+  // declared list. Refuse with a clear reason instead of
+  // passing through. When `allow_paths` is undefined (deny-only
+  // or rule-less path tool), the default scope is intentionally
+  // permissive and we let the tool handle arg validation.
+  if (input === null) {
+    if (rules.allowPaths !== undefined) {
+      return {
+        ok: false,
+        reason:
+          'tool invoked without an explicit path arg, but allow_paths is declared — the default scope (cwd) exceeds the allow list. Pass an explicit path to gate the call.',
+      };
+    }
+    return { ok: true };
+  }
   // Path shape: canonicalize against cwd before matching. The
   // patterns are interpreted as relative-to-cwd globs (the spec
   // example is `src/**`), so we project the input into the same

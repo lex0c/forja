@@ -428,17 +428,38 @@ describe('checkRestriction (tool dispatch hook)', () => {
     expect(v.reason).toContain('does not match');
   });
 
-  test('grep without a path passes through (search cwd default)', () => {
-    // grep's `path` is optional; absent means "search cwd",
-    // which IS the playbook scope. The PATH_EXTRACTOR returns
-    // null for missing fields and the runtime treats null as
-    // "no field to gate on" — the call passes through to the
-    // underlying tool, which already runs against ctx.cwd
-    // (bounded by the worktree / subagent isolation).
+  test('grep without a path is REFUSED when allow_paths is declared', () => {
+    // Regression: grep treats missing `path` as "search cwd
+    // recursively" (rg's default). When allow_paths is declared,
+    // the default cwd scope exceeds the allow list — a model
+    // could omit `path` and read matches from files outside
+    // src/** even with `allow_paths: ['src/**']`. Refuse the
+    // missing-path call so the model is forced to pass an
+    // explicit target the gate can canonicalize and match.
     const v = checkRestriction(
       'grep',
       { pattern: 'TODO' },
       { grep: { allowPaths: ['src/**'] } },
+      CWD,
+    );
+    expect(v.ok).toBe(false);
+    if (v.ok) return;
+    expect(v.reason).toContain('without an explicit path');
+    expect(v.reason).toContain('allow_paths');
+  });
+
+  test('grep without a path PASSES when only deny_paths is declared (deny-only is permissive by design)', () => {
+    // Mirror of the above for the deny-only contract: the
+    // author chose "everything allowed except matches" — the
+    // default cwd scope is intentionally permissive, and a
+    // missing path arg is normal grep usage. The deny list
+    // can't fire on a missing path string, but the contract
+    // doesn't require it to: the author knew the default scope
+    // when they chose deny-only.
+    const v = checkRestriction(
+      'grep',
+      { pattern: 'TODO' },
+      { grep: { denyPaths: ['secrets/**'] } },
       CWD,
     );
     expect(v).toEqual({ ok: true });
