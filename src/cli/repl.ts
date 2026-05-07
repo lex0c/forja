@@ -257,6 +257,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     resolveExit = r;
   });
   let running = false;
+  // Mirrors `running` for slash playbook dispatches. Foreground
+  // turns and slash playbooks share the provider, the DB, and the
+  // permission engine — running them concurrently would interleave
+  // tool calls and audit rows under the same parent session, which
+  // the playbook layer's "one-at-a-time" contract was meant to
+  // prevent. The slash `exec` body checks `ctx.isRunning()`
+  // synchronously before awaiting `runPlaybook`; flipping this flag
+  // SYNCHRONOUSLY at the top of `runPlaybook` (before its first
+  // await) ensures a second slash dispatch fired in the same Enter
+  // burst sees `isRunning() === true` and refuses cleanly.
+  let playbookRunning = false;
 
   const ESC_DRAIN_MS = 30;
   let drainTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1114,8 +1125,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     requestShutdown,
     // Closure over the REPL's `running` flag — fresh read per call so
     // a slash command queued before a turn starts but executed after
-    // observes the post-startTurn state.
-    isRunning: () => running,
+    // observes the post-startTurn state. Also reports `true` while a
+    // slash playbook dispatch is in flight; foreground turns and
+    // playbook runs share the provider / DB / permission engine, and
+    // the slash gate (`buildOnePlaybookCommand`) is the single point
+    // where parallel surfaces are refused.
+    isRunning: () => running || playbookRunning,
     // Most recent session id (closure so it's read fresh per slash
     // call). Set after the first turn's session_finished event;
     // null between boot and first turn. /memory show forwards this
@@ -1189,50 +1204,71 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // boot. The slash command itself further gates on `isRunning()`
     // so a slash dispatch never races a foreground turn.
     runPlaybook: async ({ name, prompt }) => {
+      // Defensive serialization. The slash command's `exec` body
+      // checks `ctx.isRunning()` before calling us, but a programmatic
+      // caller (or a future slash path that forgets the gate) could
+      // re-enter while a prior dispatch is still mid-flight. Refusing
+      // here preserves the one-at-a-time contract regardless of how
+      // we're invoked. Set the flag SYNCHRONOUSLY before any await so
+      // a second dispatch queued in the same Enter burst sees
+      // `isRunning() === true` and refuses cleanly via the slash
+      // surface (which renders an operator-friendly error) rather
+      // than landing on this throw.
+      if (playbookRunning) {
+        throw new Error(`playbook '${name}' rejected — another playbook dispatch is in flight`);
+      }
       const definition = subagents.byName.get(name);
       if (definition === undefined) {
         throw new Error(`playbook '${name}' is not registered`);
       }
-      const parentSessionId = ensureParentSessionId();
-      // Fresh signal per dispatch. Cancellation by Esc / Ctrl+C
-      // would route through the REPL's main interrupt path; for
-      // an inline slash run we don't expose cancel today (the
-      // run is bounded by the playbook's `budget.maxWallClockMs`
-      // / `maxCostUsd` instead). Future slice can plumb the
-      // global `currentTurnAbort` here for parity.
-      const ac = new AbortController();
-      const runSubagentImpl = options.runSubagentOverride ?? runSubagent;
-      return runSubagentImpl({
-        definition,
-        prompt,
-        parentSessionId,
-        provider: baseConfig.provider,
-        parentToolRegistry: baseConfig.toolRegistry,
-        permissionEngine: baseConfig.permissionEngine,
-        db,
-        cwd: baseConfig.cwd,
-        signal: ac.signal,
-        subagentRegistry: subagents,
-        ...(baseConfig.isCwdTrusted !== undefined ? { cwdTrusted: baseConfig.isCwdTrusted } : {}),
-        // Permission proxy (spec docs/spec/IPC.md §7). Without this
-        // the runtime auto-denies every child `permission:ask`, so a
-        // playbook that touches a confirm-gated tool (bash / write
-        // under `confirm` policy) would silently fail with denials
-        // instead of prompting the operator. Mirrors the harness's
-        // spawnSubagentImpl wiring (loop.ts) — the `boolean ↔
-        // PermissionDecision` shape adapter is the same one.
-        onPermissionAsk: async (req) => {
-          const allowed = await confirmPermission({
-            toolName: req.toolName,
-            args: req.args,
-            cwd: req.cwd,
-            prompt: req.prompt,
-            subagent: req.subagent,
-            signal: req.signal,
-          });
-          return allowed ? 'allow' : 'deny';
-        },
-      });
+      playbookRunning = true;
+      try {
+        const parentSessionId = ensureParentSessionId();
+        // Fresh signal per dispatch. Cancellation by Esc / Ctrl+C
+        // would route through the REPL's main interrupt path; for
+        // an inline slash run we don't expose cancel today (the
+        // run is bounded by the playbook's `budget.maxWallClockMs`
+        // / `maxCostUsd` instead). Future slice can plumb the
+        // global `currentTurnAbort` here for parity.
+        const ac = new AbortController();
+        const runSubagentImpl = options.runSubagentOverride ?? runSubagent;
+        return await runSubagentImpl({
+          definition,
+          prompt,
+          parentSessionId,
+          provider: baseConfig.provider,
+          parentToolRegistry: baseConfig.toolRegistry,
+          permissionEngine: baseConfig.permissionEngine,
+          db,
+          cwd: baseConfig.cwd,
+          signal: ac.signal,
+          subagentRegistry: subagents,
+          ...(baseConfig.isCwdTrusted !== undefined ? { cwdTrusted: baseConfig.isCwdTrusted } : {}),
+          // Permission proxy (spec docs/spec/IPC.md §7). Without this
+          // the runtime auto-denies every child `permission:ask`, so a
+          // playbook that touches a confirm-gated tool (bash / write
+          // under `confirm` policy) would silently fail with denials
+          // instead of prompting the operator. Mirrors the harness's
+          // spawnSubagentImpl wiring (loop.ts) — the `boolean ↔
+          // PermissionDecision` shape adapter is the same one.
+          onPermissionAsk: async (req) => {
+            const allowed = await confirmPermission({
+              toolName: req.toolName,
+              args: req.args,
+              cwd: req.cwd,
+              prompt: req.prompt,
+              subagent: req.subagent,
+              signal: req.signal,
+            });
+            return allowed ? 'allow' : 'deny';
+          },
+        });
+      } finally {
+        // Drop the gate even on throw — a stuck `playbookRunning`
+        // would lock the operator out of every subsequent dispatch
+        // until process restart.
+        playbookRunning = false;
+      }
     },
   };
 

@@ -2023,4 +2023,107 @@ describe('repl — slash commands integration', () => {
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
+
+  test('a second slash playbook dispatch is refused while the first is in flight', async () => {
+    // Regression: `dispatchSlash` is fire-and-forget (`void
+    // dispatchSlash(...)`), and `runPlaybook` doesn't touch the
+    // REPL's foreground `running` flag. Without a separate gate,
+    // hitting `/fake go\r` twice in a row would race two child
+    // runs against shared DB / provider / permission state under
+    // the same parent session. The fix: `runPlaybook` flips a
+    // dedicated `playbookRunning` flag synchronously (before any
+    // await), and `isRunning()` reports either flag, so the
+    // second slash exec sees `isRunning() === true` and refuses.
+    const stub = makeBootstrapStub();
+    const fakeDef = {
+      name: 'fake',
+      description: 'fake subagent for tests',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'noop',
+      scope: 'project',
+      isolation: 'none',
+      sourcePath: '/dev/null',
+      sourceSha256: '0'.repeat(64),
+      slash: 'fake',
+    };
+    (stub.subagents.byName as Map<string, unknown>).set('fake', fakeDef);
+
+    let inflight = 0;
+    let maxConcurrent = 0;
+    let firstSeen = false;
+    let releaseFirst: () => void = () => {};
+    const firstParked = new Promise<void>((r) => {
+      releaseFirst = r;
+    });
+    const fakeRunSubagent = async (): ReturnType<
+      typeof import('../../src/subagents/index.ts').runSubagent
+    > => {
+      inflight += 1;
+      maxConcurrent = Math.max(maxConcurrent, inflight);
+      // First dispatch parks until the test releases it. A second
+      // dispatch leaking past the gate would also reach here and
+      // bump `maxConcurrent` past 1 — the assertion catches it
+      // without hanging the test (the second call returns
+      // immediately rather than parking).
+      if (!firstSeen) {
+        firstSeen = true;
+        await firstParked;
+      }
+      inflight -= 1;
+      return {
+        output: '(no-op)',
+        sessionId: 'sess-fake-child',
+        status: 'done',
+        reason: 'done',
+        costUsd: 0,
+        steps: 0,
+        durationMs: 0,
+      };
+    };
+
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      runSubagentOverride: fakeRunSubagent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    // Two dispatches in the same Enter burst — the first sets
+    // playbookRunning synchronously inside runPlaybook before the
+    // first await; the second sees isRunning() === true and is
+    // refused by the slash gate.
+    stdin.feed('/fake first\r');
+    await tick();
+    await tick();
+    stdin.feed('/fake second\r');
+    await tick();
+    await tick();
+    await flushFrame();
+
+    // The first dispatch must be parked in the fake; the second
+    // must have been refused before reaching the runtime.
+    expect(maxConcurrent).toBe(1);
+    expect(inflight).toBe(1);
+    // The slash gate's error message reaches scrollback.
+    expect(writes.join('')).toContain('turn or playbook is in progress');
+
+    // Release the first dispatch and let the REPL settle.
+    releaseFirst();
+    await tick();
+    await flushFrame();
+    expect(inflight).toBe(0);
+
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
 });

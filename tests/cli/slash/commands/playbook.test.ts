@@ -165,7 +165,7 @@ describe('playbook slash command exec — preconditions', () => {
     );
     expect(result.kind).toBe('error');
     if (result.kind !== 'error') return;
-    expect(result.message).toContain('turn is in progress');
+    expect(result.message).toContain('turn or playbook is in progress');
     expect(dispatched).toBe(false);
   });
 });

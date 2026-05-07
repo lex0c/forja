@@ -84,15 +84,19 @@ const buildOnePlaybookCommand = (def: SubagentDefinition): SlashCommand => {
           message: `/${slash} cannot dispatch — playbook runtime is not wired in this context`,
         };
       }
-      // Defensive on running state. The REPL gates parallel
-      // surfaces (one turn at a time); a slash dispatch while a
-      // user turn is in flight would compete for the provider /
-      // permission engine. Better to refuse with a clear message
-      // than to interleave runs.
+      // Serialize parallel surfaces. The REPL's `isRunning()`
+      // closure reports `true` for either a foreground turn OR an
+      // in-flight slash playbook dispatch — both share the
+      // provider, the DB, and the permission engine, so running
+      // them concurrently would interleave tool calls and audit
+      // rows under the same parent session. Without this check a
+      // user could submit /<slash> twice in succession and both
+      // dispatches would race; the gate refuses the second one
+      // with a clear message instead.
       if (ctx.isRunning()) {
         return {
           kind: 'error',
-          message: `/${slash} cannot dispatch while a turn is in progress — wait for it to finish or interrupt with Esc`,
+          message: `/${slash} cannot dispatch while a turn or playbook is in progress — wait for it to finish or interrupt with Esc`,
         };
       }
       const prompt = args.join(' ');
