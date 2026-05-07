@@ -281,4 +281,44 @@ describe('validateOutput — schema-side edge cases', () => {
     expect(validateOutput('', {}).valid).toBe(true);
     expect(validateOutput('- not\n- a\n- mapping', {}).valid).toBe(true);
   });
+
+  test('JSON-schema-shaped schema with null properties does not crash', () => {
+    // Regression: `typeof null === 'object'` let a malformed
+    // `{type: "object", properties: null}` enter JSON-Schema mode,
+    // and validateJsonSchema would index into the null
+    // `properties` for required keys — TypeError on a clean
+    // `done` run instead of a structured diagnostic. The
+    // discriminator now requires `properties` to be a real,
+    // non-null, non-array object. Malformed shapes fall through
+    // to shorthand, where the validator emits a diagnostic
+    // about missing keys rather than throwing.
+    const malformed = [
+      { type: 'object', properties: null, required: ['foo'] },
+      { type: 'object', properties: ['foo', 'bar'], required: ['foo'] },
+    ];
+    for (const schema of malformed) {
+      // Must not throw — that is the regression contract.
+      expect(() => validateOutput('summary: ok', schema)).not.toThrow();
+      // Result is well-formed (a ValidationResult with `valid`).
+      const result = validateOutput('summary: ok', schema);
+      expect(typeof result.valid).toBe('boolean');
+    }
+  });
+
+  test('JSON-schema mode requires a real properties object (non-null, non-array)', () => {
+    // Counterpart pin: a schema that DOES qualify as JSON-Schema
+    // (real properties object) must still validate. Defensively
+    // confirms the tightened discriminator did not over-shrink
+    // the JSON-Schema branch's coverage.
+    const valid = {
+      type: 'object',
+      required: ['summary'],
+      properties: { summary: { type: 'string' } },
+    };
+    expect(validateOutput('summary: ok', valid).valid).toBe(true);
+    const fail = validateOutput('other: 42', valid);
+    expect(fail.valid).toBe(false);
+    if (fail.valid) return;
+    expect(fail.missingKeys).toContain('summary');
+  });
 });

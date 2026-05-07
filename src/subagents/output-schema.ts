@@ -118,8 +118,19 @@ const extractFencedCandidates = (text: string): string[] => {
 // JSON Schema unambiguously declares a top-level `type` (the
 // only canonical entry point for an object schema is `type:
 // 'object'`). Anything else is shorthand.
+//
+// `properties` must be a non-null, non-array object — `typeof
+// null === 'object'` is the JS quirk that previously let
+// `properties: null` enter JSON-Schema mode and then crash with
+// a TypeError when `validateJsonSchema` indexed into it. The
+// stricter check here ensures malformed schemas fall through to
+// shorthand (producing a structured diagnostic) instead of
+// throwing mid-validation on a `done` run.
 const isJsonSchema = (schema: Record<string, unknown>): boolean =>
-  schema.type === 'object' && typeof schema.properties === 'object';
+  schema.type === 'object' &&
+  schema.properties !== null &&
+  typeof schema.properties === 'object' &&
+  !Array.isArray(schema.properties);
 
 // Map a JSON Schema primitive type to a runtime test against the
 // observed value. We accept the conventional aliases the spec
@@ -225,8 +236,15 @@ const validateJsonSchema = (
   output: Record<string, unknown>,
   schema: Record<string, unknown>,
 ): ValidationResult => {
+  // Defense in depth: even though `isJsonSchema` already gates
+  // null/array out of this branch, extract with the same null/
+  // array guard so a future call site that bypasses the
+  // discriminator does not regress to indexing into null.
   const properties =
-    schema.properties !== undefined && typeof schema.properties === 'object'
+    schema.properties !== null &&
+    schema.properties !== undefined &&
+    typeof schema.properties === 'object' &&
+    !Array.isArray(schema.properties)
       ? (schema.properties as Record<string, unknown>)
       : {};
   const required = Array.isArray(schema.required)
