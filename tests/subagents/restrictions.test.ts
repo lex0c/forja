@@ -1,4 +1,7 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   RESTRICTION_ERROR_CODE,
   checkRestriction,
@@ -581,5 +584,116 @@ describe('toRestrictionError', () => {
     const err = toRestrictionError('bash', 'command does not match any allow');
     if (err.is_error !== true) return;
     expect(err.details).toBeUndefined();
+  });
+});
+
+describe('checkRestriction — symlink-aware path canonicalization', () => {
+  // Symlinks bypass purely-lexical fences: a path like
+  // `src/link/secret.txt` where `src/link → /etc` matches
+  // `allow_paths: ['src/**']` lexically but writes outside cwd
+  // because the syscall follows the link. The runtime now
+  // realpath's the deepest existing prefix before matching,
+  // catching the escape regardless of where in the path the
+  // symlink lives. These tests use a real on-disk workspace
+  // because realpathSync needs actual filesystem state.
+  let workspace: string;
+  let outsideDir: string;
+
+  beforeEach(() => {
+    workspace = mkdtempSync(join(tmpdir(), 'forja-symlink-test-'));
+    outsideDir = mkdtempSync(join(tmpdir(), 'forja-symlink-outside-'));
+    mkdirSync(join(workspace, 'src'));
+    writeFileSync(join(workspace, 'src', 'auth.ts'), 'real content\n');
+    writeFileSync(join(outsideDir, 'sensitive.txt'), 'secret\n');
+  });
+
+  afterEach(() => {
+    rmSync(workspace, { recursive: true, force: true });
+    rmSync(outsideDir, { recursive: true, force: true });
+  });
+
+  test('refuses write through a symlink that targets a directory outside cwd', () => {
+    // Layout: workspace/src/link → outsideDir. A purely
+    // lexical fence accepts `src/link/new.txt` because the
+    // string starts with `src/`; the realpath fence sees
+    // outsideDir/new.txt and refuses as escape.
+    symlinkSync(outsideDir, join(workspace, 'src', 'link'), 'dir');
+    const v = checkRestriction(
+      'write_file',
+      { path: 'src/link/new.txt' },
+      { write_file: { allowPaths: ['src/**'] } },
+      workspace,
+    );
+    expect(v.ok).toBe(false);
+    if (v.ok) return;
+    expect(v.reason).toContain('outside the session cwd');
+  });
+
+  test('refuses read through a symlinked file that targets a path outside cwd', () => {
+    // Layout: workspace/src/leak → outsideDir/sensitive.txt.
+    // `read_file('src/leak')` matches `src/**` lexically; the
+    // realpath fence resolves through the link and refuses.
+    symlinkSync(join(outsideDir, 'sensitive.txt'), join(workspace, 'src', 'leak'), 'file');
+    const v = checkRestriction(
+      'read_file',
+      { path: 'src/leak' },
+      { read_file: { allowPaths: ['src/**'] } },
+      workspace,
+    );
+    expect(v.ok).toBe(false);
+    if (v.ok) return;
+    expect(v.reason).toContain('outside the session cwd');
+  });
+
+  test('allows a symlink whose target is INSIDE cwd', () => {
+    // Symlinks staying inside the sandbox are not escapes —
+    // a project that legitimately uses `src/lib → ../shared`
+    // (where shared is also inside cwd) should not be refused.
+    mkdirSync(join(workspace, 'shared'));
+    writeFileSync(join(workspace, 'shared', 'util.ts'), 'shared\n');
+    symlinkSync(join(workspace, 'shared'), join(workspace, 'src', 'lib'), 'dir');
+    const v = checkRestriction(
+      'read_file',
+      { path: 'src/lib/util.ts' },
+      // allow_paths covers both src/** and shared/** — the
+      // canonical path lands in shared/, which the rule allows.
+      { read_file: { allowPaths: ['src/**', 'shared/**'] } },
+      workspace,
+    );
+    expect(v).toEqual({ ok: true });
+  });
+
+  test('refuses write through a symlinked PARENT directory (target file does not exist yet)', () => {
+    // The deepest-existing-prefix walker is the load-bearing
+    // primitive here: write_file's TARGET file does not exist,
+    // but its parent (the symlink) does. The walker realpaths
+    // the parent and re-attaches the non-existent tail — the
+    // canonical write target lands outside cwd and the fence
+    // refuses BEFORE the syscall touches disk.
+    symlinkSync(outsideDir, join(workspace, 'src', 'link'), 'dir');
+    const v = checkRestriction(
+      'write_file',
+      { path: 'src/link/never_existed.txt' },
+      { write_file: { allowPaths: ['src/**'] } },
+      workspace,
+    );
+    expect(v.ok).toBe(false);
+    if (v.ok) return;
+    expect(v.reason).toContain('outside the session cwd');
+  });
+
+  test('honest writes into non-existent paths inside cwd still pass', () => {
+    // Counterpart pin: when none of the path's segments are
+    // symlinks, the deepest-existing-prefix walker collapses
+    // to the lexical form and the rule matches normally. A
+    // future change that broke non-existing-path writes would
+    // fail this test even if the symlink case still worked.
+    const v = checkRestriction(
+      'write_file',
+      { path: 'src/new/dir/file.ts' },
+      { write_file: { allowPaths: ['src/**'] } },
+      workspace,
+    );
+    expect(v).toEqual({ ok: true });
   });
 });

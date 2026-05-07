@@ -22,7 +22,8 @@
 // permission engine refuses: a deny match always wins, an allow
 // list (when present) requires a match.
 
-import { isAbsolute, relative, resolve } from 'node:path';
+import { realpathSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { Tool } from '../tools/types.ts';
 import { type ToolResult, toolError } from '../tools/types.ts';
 import type { ToolRestrictionRules, ToolRestrictions } from './types.ts';
@@ -409,32 +410,88 @@ const canonicalizeUnderCwd = (
   input: string,
   cwd: string,
 ): { escaped: false; relPath: string } | { escaped: true } => {
-  // `resolve(cwd, input)` collapses `.` / `..` segments and
-  // honors absolute `input` (when input is absolute, cwd is
-  // ignored). Both cases land at the same canonical absolute
-  // path the write tools would write to.
-  const abs = resolve(cwd, input);
-  // `relative(cwd, abs)` returns native-separator output:
-  // `foo/bar` on POSIX, `foo\bar` on Windows. Patterns in
-  // `allow_paths` / `deny_paths` are authored with POSIX
-  // separators per the spec example (`src/**`), so we project
-  // the relative path onto `/` before matching. Without this,
-  // every Windows run silently denies legitimate writes because
-  // `src\file.ts` cannot match `src/**` literally — turning a
-  // platform-neutral policy surface into a POSIX-only one.
-  //
-  // POSIX trade-off: a filename that legitimately contains `\`
-  // (a valid POSIX path char) gets its backslash rewritten to
-  // `/`, mismatching what the file tools would actually write.
-  // Accepted because (a) backslashes in POSIX filenames are
-  // exotic-to-the-point-of-pathological and (b) glob patterns
-  // are universally authored with `/`, so normalization aligns
-  // with the dominant author intent on every platform.
-  const rel = relative(cwd, abs).split('\\').join('/');
+  // Step 1: lexical resolve. `resolve(cwd, input)` collapses
+  // `.` / `..` segments and honors absolute `input` (when input
+  // is absolute, cwd is ignored).
+  const lexAbs = resolve(cwd, input);
+  // Step 2: realpath the deepest existing prefix. resolve()
+  // alone follows neither symlinks nor `realpath` semantics,
+  // so a path like `src/link/secret.txt` where `src/link` is a
+  // symlink to `/etc` would lexically appear inside cwd. The
+  // file tool then writes through the symlink, escaping the
+  // sandbox — the exact bypass the path fence was meant to
+  // prevent. Resolving the deepest existing prefix via
+  // realpathSync and reattaching the non-existing tail gives
+  // the canonical path the syscall will actually touch.
+  const realResult = realpathDeepestPrefix(lexAbs);
+  if (!realResult.ok) return { escaped: true };
+  const realAbs = realResult.real;
+  // Step 3: realpath the cwd too — the comparison must be in
+  // the same coordinate system. If cwd is itself a symlinked
+  // path (e.g., `/tmp/proj` linked to `/real/proj`), comparing
+  // the lexical cwd against a realpath'd target would always
+  // look like an escape. When cwd cannot be realpath'd (rare —
+  // unit-test fixtures with fake cwd, or a cwd deleted mid-run)
+  // fall back to the lexical form so the matcher continues to
+  // operate; the symlink fence above still rejects targets that
+  // resolve outside the lexical cwd, just without the cwd-side
+  // canonicalization. Production paths always have a real cwd.
+  let realCwd: string;
+  try {
+    realCwd = realpathSync(cwd);
+  } catch {
+    realCwd = cwd;
+  }
+  // Step 4: separator normalization. `relative()` returns
+  // native separators (`foo/bar` on POSIX, `foo\bar` on
+  // Windows); allow_paths / deny_paths are authored POSIX-style
+  // (`src/**`). Project onto `/` before matching so the policy
+  // surface stays platform-neutral. POSIX trade-off: a filename
+  // with a literal backslash gets its backslash rewritten —
+  // accepted because backslashes in POSIX filenames are
+  // exotic-to-pathological and globs are universally authored
+  // with `/`.
+  const rel = relative(realCwd, realAbs).split('\\').join('/');
   if (rel === '..' || rel.startsWith('../') || isAbsolute(rel)) {
     return { escaped: true };
   }
   return { escaped: false, relPath: rel };
+};
+
+// Walk `abs` up its directory chain until a path that exists is
+// found, realpath that prefix, then re-attach the non-existent
+// tail in original order. Used to canonicalize paths the model
+// passes to write_file / edit_file before the file is created
+// — the write target itself does not exist yet, but its parent
+// dir might be a symlink to an external location.
+//
+// `{ ok: false }` on non-ENOENT errors (EACCES / ELOOP / EIO):
+// we cannot verify the path safely, refuse rather than fall
+// back to lexical (which would miss the very symlink we are
+// trying to detect). `{ ok: true, real: abs }` on all-ENOENT
+// up to filesystem root — no symlinks were involved, the
+// lexical form IS the canonical form.
+const realpathDeepestPrefix = (abs: string): { ok: true; real: string } | { ok: false } => {
+  const segments: string[] = [];
+  let current = abs;
+  for (;;) {
+    try {
+      const real = realpathSync(current);
+      if (segments.length === 0) return { ok: true, real };
+      return { ok: true, real: join(real, ...segments.slice().reverse()) };
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT') {
+        return { ok: false };
+      }
+      const parent = dirname(current);
+      if (parent === current) {
+        return { ok: true, real: abs };
+      }
+      segments.push(basename(current));
+      current = parent;
+    }
+  }
 };
 
 // Convenience: the tool-error code for restriction refusals. Kept
