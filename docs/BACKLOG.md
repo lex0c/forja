@@ -15,6 +15,199 @@ Format:
 
 ---
 
+## [2026-05-07] playbooks — hardening pass after the slices 1-10 cut
+
+41-commit cleanup pass against `feat/playbooks` after the
+initial subsystem landed (`9cfec9b`). Each commit closes a
+specific failure mode found by review or audit; the suite stays
+single-purpose-per-commit so a regression bisect can isolate
+the cause cleanly.
+
+**Done — security fences (path / restriction surface):**
+
+- **Symlink escape closed** (`3654844`): `canonicalizeUnderCwd`
+  walks the deepest existing prefix via `realpathSync` and
+  re-attaches the non-existent tail before matching. A workspace
+  with `src/link → /etc` could previously satisfy
+  `allow_paths: ['src/**']` and write to `/etc/secret.txt` because
+  the lexical fence missed the symlink target.
+- **Path traversal canonicalization** (`7359274`): resolve →
+  relative-to-cwd → escape detection on the EFFECTIVE path the
+  write tools resolve against, so `src/../secrets.txt` cannot
+  bypass `src/**`.
+- **Bash whitespace evasion** (`9defacf`): trim + collapse
+  whitespace symmetrically on input AND patterns; ` rm -rf /tmp`
+  no longer slips past `deny: ['rm -rf *']`.
+- **read_file + grep gated** (`bae0dde`): added to the
+  TOOL_RESTRICTION_SHAPE map. A playbook rule like
+  `tool_restrictions.read_file.allow_paths` was silently ignored
+  at runtime — content-disclosure surface unfenced despite the
+  frontmatter declaration.
+- **Missing-path bypass** (`74fc8ae`): `grep` without the
+  optional `path` arg defaults to recursive cwd search; refusing
+  the call when `allow_paths` is declared closes the bypass via
+  arg omission.
+- **Mismatched-shape keys** (`baf8bf1`): loader rejects
+  `tool_restrictions.write_file.allow` (bash-shape on path-shape
+  tool) with a directional hint — silent runtime no-op
+  eliminated.
+- **Padded patterns** (`a85d0be`): loader rejects ` src/**` /
+  `src/** ` — patterns that would never match literally are
+  flagged at load.
+- **Cross-platform separator normalization** (`b2d4d67`):
+  Windows backslash separators rewritten to `/` before matching
+  so `allow_paths: ['src/**']` is platform-neutral.
+- **Plan mode propagation** (`a525462`): slash dispatcher
+  forwards `baseConfig.planMode` so /<playbook> respects
+  `/plan on` (was a sandbox-escape vs. foreground harness).
+
+**Done — output_schema validator correctness:**
+
+- **Reflection-prose fence parse** (`7741c71`): walker locates
+  fences anywhere in the text (not just first-line); fixes the
+  `step_reflection: terse` × `output_schema` collision where the
+  Reflection: line preceded the YAML fence.
+- **Empty schema short-circuit** (`889c22e`): `validateOutput`
+  treats `{}` as no-constraints, matching the prompt composer.
+- **Integer enforcement** (`f7e1230`): `int` / `integer` aliases
+  use `Number.isInteger`; fractional values no longer pass.
+- **Optional-property type gate** (`9566bbf`): JSON Schema type
+  checks now run on every PRESENT declared property, not just
+  `required` ones.
+- **Type=object discriminator loosened** (`33d63f0`):
+  `{type: 'object', required: [...]}` (no properties) is
+  classified as JSON Schema mode; previously fell through to
+  shorthand and treated `type` / `required` as required output
+  keys.
+- **Null/array properties guard** (`6e17262`):
+  `validateJsonSchema` extracts non-object properties as `{}`
+  instead of crashing on indexing.
+- **Terminal fence enforcement** (`be750c7`): the schema
+  validates against the LAST fenced block only — earlier fenced
+  objects no longer satisfy when the terminal block is
+  non-mapping.
+- **YAML-illegal `?` removed from explain.md** (`5584d82`):
+  `file?: string` was rejected by strict YAML parsers; the
+  shorthand validator never enforced optionality anyway.
+
+**Done — runtime / lifecycle:**
+
+- **Synthetic parent session marked subagent** (`45b4e58`): the
+  REPL's lazy parent for slash dispatches no longer pollutes
+  `--list-sessions` or shadows `--resume last`.
+- **Permission proxy forwarded** (`56657bd`): runPlaybook passes
+  `onPermissionAsk` so confirm-gated tools prompt the operator
+  instead of auto-denying.
+- **Slash serialization** (`2505669`): in-flight playbook blocks
+  a second slash dispatch; foreground submit gates use the same
+  busy predicate (`e0c29d3`).
+- **Cumulative cost accounting** (`2fd45ac`): `/cost` now
+  reflects slash dispatch spend.
+- **Abort signals plumbed** (`7f99189`): Esc/Ctrl+C/SIGINT
+  preempt a long-running /<playbook>.
+- **Shutdown joins playbook promise** (`36e7653`): /quit awaits
+  the dispatch's `setSubagentPayload` before `db.close()` — no
+  more "database is closed" race.
+- **Temperature + hooks snapshot forwarded** (`12b808c`,
+  `1958a33`): slash dispatch parity with `task_*` spawn path
+  for determinism + hook-chain consistency.
+- **Retry budget rebased** (`4c037a5`): output_schema retry
+  subtracts spent steps/wall-clock from the original envelope; a
+  single playbook can no longer exceed declared budget.
+- **Output-invalid reason preserved** (`63c306a`):
+  `playbook.output_invalid` rides through the parent's
+  closed-set validator instead of being downgraded to
+  `internalError`.
+- **Session status reclassified on output-invalid** (`66f7f40` +
+  `7a89e75`): `sessions.status` flips from `done` to `error` so
+  audit/telemetry queries align with the published envelope.
+- **thinking_budget vs effective max_tokens** (`e13c868`):
+  loader validates against
+  `DEFAULT_BUDGET.maxOutputTokensPerCall` when `max_tokens` is
+  omitted — pre-fix, `thinking_budget: 8000` without explicit
+  `max_tokens` failed mid-run with HTTP 400.
+
+**Done — integration / cross-provider:**
+
+- **`seed_in_eval` end-to-end** (`42db09b` + `da025fc`): field
+  plumbed from sampling → audit → child config → HarnessConfig
+  → GenerateRequest. OpenAI and Google adapters derive a
+  deterministic int32 seed from system+messages (shared
+  `deriveSeedFromRequest` helper); Anthropic drops with
+  documented reason.
+
+**Done — playbook content:**
+
+- References field removed from the 10 shipped playbooks
+  (pointed at doctrine .md files that did not exist) — `89f58cd`.
+- `refactor` gained write/edit `deny_paths` (`fb3631d`).
+- `debug` gained `wait_for` + `monitor` (`9f51455`).
+- `prompt_version` + `context_recipe_version` pinned on every
+  playbook (`e3c4a63`).
+- 4 weak `when_to_use` lines rewritten with negative triggers
+  (`bcb6abc`).
+
+**Done — prompt surface:**
+
+- **Response-format hint added** as outermost system layer
+  (`9c868b3`): literal CommonMark / monospace render contract
+  with measurable rules (file:line refs, no-emoji default, no
+  preface/recap padding) per ANTI_PATTERNS.md §1.3.
+
+**Done — eval / test infrastructure:**
+
+- Cross-cutting kitchen-sink smoke (`10a6d4e`) exercises
+  `output_schema` + `references` + `tool_restrictions` +
+  `sampling` + `context_recipe` + `prompt_version` + `slash` in
+  one playbook against haiku-4-5; 5 invariants asserted
+  end-to-end. Token-bound by playbook budget; ~$0.01-0.04 per
+  run.
+- 33 fixes + 2 pin tests added; suite went from ~3420 to 3505
+  passing tests.
+
+**Decisions:**
+
+- **Symlink trade-off**: `realpathSync` non-ENOENT errors
+  (EACCES/ELOOP/EIO) refuse outright — falling back to lexical
+  would miss the very symlink the gate is trying to detect.
+  Non-existent cwd falls back to lexical so unit-test fixtures
+  with fake cwd keep working; production paths always have a
+  real cwd.
+- **Schema terminal-block contract**: only the LAST fenced block
+  satisfies the gate. Lenient "try-all" was too easy to bypass
+  via emit-yaml-then-prose pattern.
+- **Reason fidelity over generic codes**:
+  `playbook.output_invalid` added as canonical reason in
+  `RunSubagentResult` / `SubagentEnvelope` / `VALID_REASON_MAP`
+  rather than collapsing to `internalError`. Operators /
+  telemetry need the specific failure code.
+- **Skip schema enum support in shorthand**: `enum [...]`
+  shorthand stays passthrough (descriptive only); JSON Schema
+  mode enforces. Authors who need enforcement should adopt JSON
+  Schema. Keeps the shorthand mode simple.
+
+**Pending (known limitations, NOT fixed):**
+
+- **Grandchild spawn escalation**: a tightly-fenced playbook
+  with `task` in its whitelist can dispatch a more-permissive
+  child playbook from the registry. Architectural —
+  intersection-with-parent restrictions would close this but is
+  a slice on its own.
+- **Bash deny enumeration gaps**: `deny: ['rm -rf *']` does not
+  catch `find / -delete`, `dd if=/dev/zero of=...`, etc.
+  Authoring problem; mitigation is to prefer allow lists over
+  deny-only.
+- **Anthropic seed**: `seed_in_eval` drops at the Anthropic
+  adapter (no SDK seed surface as of 2026). When the API ships
+  seed, anthropic/index.ts has a single-site comment pointing to
+  the wiring.
+
+**Next:** merge `feat/playbooks` into `main` after BACKLOG
+update + smoke re-run on the latest commits (both done in this
+entry).
+
+---
+
 ## [2026-05-06] playbooks — full subsystem (slices 1-10) + retry-cost accumulator fix
 
 End-to-end implementation of the playbooks layer over the
