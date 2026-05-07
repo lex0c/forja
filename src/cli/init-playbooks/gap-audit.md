@@ -11,6 +11,8 @@ sampling:
   temperature: 0.2
   max_tokens: 4096
   thinking_budget: 4000
+prompt_version: 1
+context_recipe_version: 1
 output_schema:
   summary: string
   gaps:

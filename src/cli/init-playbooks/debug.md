@@ -19,6 +19,8 @@ sampling:
   max_tokens: 4096
 context_recipe:
   step_reflection: terse
+prompt_version: 1
+context_recipe_version: 1
 output_schema:
   symptom: string
   hypotheses:

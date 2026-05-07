@@ -10,6 +10,8 @@ when_to_use: "scan code for threat categories (auth, injection, supply-chain, se
 sampling:
   temperature: 0.1
   max_tokens: 4096
+prompt_version: 1
+context_recipe_version: 1
 output_schema:
   summary: string
   threat_model:

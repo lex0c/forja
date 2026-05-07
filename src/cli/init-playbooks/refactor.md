@@ -57,6 +57,8 @@ sampling:
   max_tokens: 4096
 context_recipe:
   clarify_mode: pre_execution
+prompt_version: 1
+context_recipe_version: 1
 output_schema:
   summary: string
   scope:
