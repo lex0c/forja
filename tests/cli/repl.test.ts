@@ -2127,6 +2127,85 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(130);
   });
 
+  test('slash playbook forwards baseConfig.hooks as hooksSnapshot', async () => {
+    // Regression: runPlaybook called runSubagent without
+    // hooksSnapshot, so slash-dispatched playbooks fell back to
+    // re-resolving hooks.toml from disk at child startup —
+    // reintroducing the parent/child drift the snapshot
+    // mechanism (forwarded by harness/loop.ts on the task_*
+    // path) was added to prevent. A human edit between parent
+    // boot and child startup would land the slash child on a
+    // different chain than the operator validated.
+    const stub = makeBootstrapStub();
+    // Pin a sentinel hook chain on the captured config. The
+    // shape comes from `HookSpec` but we only need an
+    // identifiable marker for the round-trip assertion.
+    const sentinelHooks = [
+      {
+        event: 'PreToolUse',
+        sourcePath: '/test/hooks.toml',
+        match: { tool: 'bash' },
+        run: 'echo sentinel',
+      },
+    ];
+    (stub.config as { hooks?: unknown }).hooks = sentinelHooks;
+
+    const fakeDef = {
+      name: 'fake',
+      description: 'fake subagent for tests',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'noop',
+      scope: 'project',
+      isolation: 'none',
+      sourcePath: '/dev/null',
+      sourceSha256: '0'.repeat(64),
+      slash: 'fake',
+    };
+    (stub.subagents.byName as Map<string, unknown>).set('fake', fakeDef);
+
+    let capturedSnapshot: unknown;
+    const fakeRunSubagent = async (
+      input: Parameters<typeof import('../../src/subagents/index.ts').runSubagent>[0],
+    ): ReturnType<typeof import('../../src/subagents/index.ts').runSubagent> => {
+      capturedSnapshot = input.hooksSnapshot;
+      return {
+        output: '(no-op)',
+        sessionId: 'sess-fake-child',
+        status: 'done',
+        reason: 'done',
+        costUsd: 0,
+        steps: 0,
+        durationMs: 0,
+      };
+    };
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      runSubagentOverride: fakeRunSubagent,
+    });
+    await tick();
+
+    stdin.feed('/fake go\r');
+    await tick();
+    await tick();
+    await flushFrame();
+
+    // The sentinel chain round-tripped — same array reference
+    // (no clone) since the spawn closure forwards verbatim.
+    expect(capturedSnapshot).toBe(sentinelHooks);
+
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('slash playbook forwards baseConfig.temperature to runSubagent', async () => {
     // Regression: runPlaybook called runSubagent without
     // forwarding baseConfig.temperature, so an eval rig that

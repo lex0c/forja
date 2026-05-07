@@ -1293,6 +1293,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           // object) is observed; reading temperature too keeps
           // the precedence ladder honest.
           ...(baseConfig.temperature !== undefined ? { temperature: baseConfig.temperature } : {}),
+          // Hook chain snapshot. The foreground task_* spawn path
+          // in harness/loop.ts forwards config.hooks as
+          // hooksSnapshot so the child uses the parent's validated
+          // chain instead of re-resolving hooks.toml from disk —
+          // closes the drift window where a human edit between
+          // parent boot and child startup would land the child on
+          // a different chain than the operator validated. Without
+          // this forward the slash dispatch path opens that exact
+          // drift hole; mirror the loop's wiring.
+          ...(baseConfig.hooks !== undefined ? { hooksSnapshot: baseConfig.hooks } : {}),
           // Plan mode propagation. When `/plan on` is active the
           // foreground harness refuses every writing tool — the
           // slash dispatcher must inherit the same gate, otherwise
