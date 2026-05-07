@@ -10,6 +10,7 @@ import {
   getSession,
   listChildSessions,
   listSessions,
+  reclassifySessionStatus,
   reopenSession,
   updateSessionCost,
 } from '../../src/storage/repos/sessions.ts';
@@ -242,6 +243,42 @@ describe('sessions repo', () => {
     // by audit / debug paths that legitimately want to see
     // every row.
     expect(listSessions(db, { cwd: '/p', includeSubagents: true })).toHaveLength(1);
+  });
+
+  test('reclassifySessionStatus flips a finalized row from done to error', () => {
+    // Used by post-finalize failure detection — the playbook
+    // schema validator runs AFTER runAgent finalized the row
+    // to `done`, and a schema mismatch needs to mark the row
+    // as failed so audit queries keyed on `sessions.status`
+    // count the run correctly.
+    const s = createSession(db, { model: 'm', cwd: '/p' });
+    completeSession(db, s.id, 'done', 0, true);
+    reclassifySessionStatus(db, s.id, 'done', 'error');
+    const row = getSession(db, s.id);
+    expect(row?.status).toBe('error');
+  });
+
+  test('reclassifySessionStatus throws when the row is not in the expected state', () => {
+    // Strict precondition guard: refusing to override unknown
+    // states keeps `completeSession` as the canonical finalize
+    // path. A typo'd from-state surfaces at write time rather
+    // than silently no-op'ing.
+    const s = createSession(db, { model: 'm', cwd: '/p' });
+    // Row is 'running' — calling with expectedFrom='done' must throw.
+    expect(() => reclassifySessionStatus(db, s.id, 'done', 'error')).toThrow(
+      /not in expected 'done' state/,
+    );
+    // Finalize as 'done', then try to flip from 'interrupted' — must throw.
+    completeSession(db, s.id, 'done', 0, true);
+    expect(() => reclassifySessionStatus(db, s.id, 'interrupted', 'error')).toThrow(
+      /not in expected 'interrupted' state/,
+    );
+  });
+
+  test('reclassifySessionStatus throws when the session does not exist', () => {
+    expect(() => reclassifySessionStatus(db, 'missing-id', 'done', 'error')).toThrow(
+      /session missing-id not found/,
+    );
   });
 
   test('synthetic parent does not shadow a real session in --resume last', () => {

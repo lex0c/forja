@@ -297,6 +297,40 @@ export const completeSession = (
   }
 };
 
+// Reclassify an ALREADY-finalized session's status. Used by
+// post-finalize failure detection — currently the playbook
+// output_schema validator, which runs AFTER `runAgent` returns
+// (and therefore AFTER `completeSession` flipped status to
+// `done`). Without this override, a schema-failed run leaves
+// `sessions.status = 'done'` while the published envelope says
+// `status = 'error'` / `reason = 'playbook.output_invalid'`,
+// and any audit / telemetry query keyed on `sessions.status`
+// counts the run as successful.
+//
+// Strict precondition: the row must be in `expectedFrom` status
+// (typically `'done'`). Refusing to override `running` rows
+// keeps `completeSession` as the canonical finalize path —
+// using this for the initial finalize would race the harness's
+// own writeback. The CHECK constraint on `sessions.status`
+// rejects any unknown destination value at SQLite write time.
+export const reclassifySessionStatus = (
+  db: DB,
+  id: string,
+  expectedFrom: Exclude<SessionStatus, 'running'>,
+  newStatus: Exclude<SessionStatus, 'running'>,
+): void => {
+  const result = db
+    .query('UPDATE sessions SET status = ? WHERE id = ? AND status = ?')
+    .run(newStatus, id, expectedFrom);
+  if (result.changes === 0) {
+    const exists = getSession(db, id);
+    if (exists === null) throw new Error(`session ${id} not found`);
+    throw new Error(
+      `session ${id} not in expected '${expectedFrom}' state (was '${exists.status}')`,
+    );
+  }
+};
+
 export const updateSessionCost = (db: DB, id: string, totalCostUsd: number): void => {
   const result = db
     .query('UPDATE sessions SET total_cost_usd = ? WHERE id = ?')

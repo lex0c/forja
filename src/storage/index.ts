@@ -17,6 +17,7 @@ export {
   getSession,
   listChildSessions,
   listSessions,
+  reclassifySessionStatus,
   reopenSession,
   updateSessionCost,
 } from './repos/sessions.ts';

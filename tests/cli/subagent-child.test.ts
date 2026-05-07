@@ -735,6 +735,75 @@ You are the worker.`,
     expect(recordedSeed[0]).toBe(true);
   });
 
+  test('schema-invalid output reclassifies sessions.status from done to error', async () => {
+    // Regression: when schema validation fails after the retry
+    // path, the published envelope reads status='error' /
+    // reason='playbook.output_invalid' but the session row was
+    // already finalized to 'done' by runAgent. Audit / telemetry
+    // queries keyed on sessions.status would count the run as
+    // successful. The reclassification on the schema-fail
+    // branch keeps the row aligned with the envelope.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    let childId: string;
+    const db = openDb(dbPath);
+    try {
+      migrate(db);
+      const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+      const child = sessionsRepo.createSession(db, {
+        model: 'mock/m',
+        cwd: dbDir,
+        parentSessionId: parent.id,
+      });
+      childId = child.id;
+      subagentRunsRepo.insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'project',
+        sourcePath: '/fake/explore.md',
+        sourceSha256: 'a'.repeat(64),
+        systemPrompt: 'You are explore.',
+        toolsWhitelist: [],
+        budgetMaxSteps: 5,
+        budgetMaxCostUsd: 0.1,
+        // Schema requires `summary: string`; the stub provider
+        // emits free-form text that does NOT parse as a YAML
+        // mapping with that key, so validation fails on both
+        // the first run and the retry.
+        outputSchema: { summary: 'string' },
+      });
+      messagesRepo.appendMessage(db, {
+        sessionId: child.id,
+        role: 'user',
+        content: 'go',
+      });
+    } finally {
+      db.close();
+    }
+
+    const exitCode = await runSubagentChild({
+      sessionId: childId,
+      dbPath,
+      providerOverride: stubProvider('not a yaml mapping'),
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      errSink: () => undefined,
+    });
+    expect(exitCode).toBe(0);
+    // Envelope reports the schema-failure verdict.
+    const db2 = openDb(dbPath);
+    try {
+      const out = subagentRunsRepo.getSubagentRun(db2, childId);
+      expect(out).toBeDefined();
+      const session = sessionsRepo.getSession(db2, childId);
+      expect(session?.status).toBe('error');
+    } finally {
+      db2.close();
+    }
+  });
+
   test('memoryCwd anchors the registry at the parent repo even for worktree-cwd children', async () => {
     // Subagent runs in a worktree (different cwd from parent's
     // repo). Without memoryCwd forwarding, the child would build

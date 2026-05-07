@@ -19,6 +19,7 @@ import {
   insertSubagentOutput,
   migrate,
   openDb,
+  reclassifySessionStatus,
   setSubagentPayload,
   updateSubagentHeartbeat,
 } from '../storage/index.ts';
@@ -1128,6 +1129,19 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
           type_mismatches: verdict.typeMismatches,
           ...(result.lastMessageId !== undefined ? { last_message_id: result.lastMessageId } : {}),
         };
+        // Reclassify the session row so audit / telemetry queries
+        // keyed on `sessions.status` see this run as failed.
+        // runAgent already finalized the row to `done` (the
+        // harness loop completed cleanly), but the post-finalize
+        // schema validator has just rejected the output —
+        // leaving status='done' alongside an envelope of
+        // status='error' / reason='playbook.output_invalid' would
+        // count schema-failed runs as successful in any
+        // downstream aggregation. Reclassify is a strict
+        // done→error transition; the helper throws if the row
+        // is in any other state, catching a future regression
+        // that races the finalize.
+        reclassifySessionStatus(db, opts.sessionId, 'done', 'error');
       } else {
         envelope = buildEnvelope(aggregatedResult, output);
       }
