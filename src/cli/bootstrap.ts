@@ -24,6 +24,7 @@ import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithParallelHint } from './parallel-prompt.ts';
 import { composeWithUserPrompt } from './plan-prompt.ts';
 import { composeWithPlaybookHint } from './playbook-prompt.ts';
+import { assembleProjectPointer, composeWithProjectPointer } from './project-pointer.ts';
 import { composeWithResponseFormat } from './response-format.ts';
 
 export const DEFAULT_MODEL = 'anthropic/claude-sonnet-4-6';
@@ -180,6 +181,18 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   const dbPath = input.dbPath ?? defaultDbPath();
   const db = openDb(dbPath);
 
+  // Resolve cwd trust state EARLY so the system-prompt composition
+  // (project pointer, below) can gate on it. Originally this lived
+  // after the prompt assembly because no upstream surface needed
+  // it; the project_pointer section needs the flag at compose
+  // time, so we lift it. Failing-closed semantics unchanged: any
+  // path that resolves to "no trust storage" or "cwd absent from
+  // list" yields `false`, which suppresses the pointer (and any
+  // other downstream gate that consults `isCwdTrusted`).
+  const trustPath =
+    input.trustListPathOverride !== undefined ? input.trustListPathOverride : trustListPath();
+  const isCwdTrusted = trustPath !== null && isTrusted(trustPath, cwd);
+
   let resolvedSystemPrompt: string | undefined;
   let memoryRegistry: ReturnType<typeof createMemoryRegistry>;
   let resolvedHooks: ReturnType<typeof resolveHookConfig>;
@@ -284,6 +297,17 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     // project memory loaded from `/repo` mentions them; probing
     // cwd would silently miss every project-root file.
     const bootContext = evaluateBootTriggers(repoRoot);
+    // [project_context] section (spec CONTEXT_TUNING.md §2.0).
+    // Pointer to AGENTS.md; body lazy via read_file. Sits in the
+    // composed string BEFORE [memory_index] to match the layout in
+    // §2 — most-stable-first ordering keeps the cache breakpoint
+    // economy intact: the pointer changes only when AGENTS.md is
+    // renamed/removed, while memory index changes on every
+    // /memory write. Empty-text section passes the base prompt
+    // through unchanged when AGENTS.md is absent or cwd is
+    // untrusted.
+    const projectPointer = assembleProjectPointer({ cwd, repoRoot, isCwdTrusted });
+    resolvedSystemPrompt = composeWithProjectPointer(resolvedSystemPrompt, projectPointer.text);
     const memorySection = assembleMemorySection({
       registry: memoryRegistry,
       bootContext,
@@ -337,25 +361,11 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   // collide with the parent repo's.
   const bgLogDir = join(cwd, '.agent', 'bg');
 
-  // Resolve cwd trust state for downstream gates (today: memory_write
-  // refuses inferred writes in untrusted cwd, MEMORY.md §7.2.1). The
-  // REPL boot path runs the trust modal BEFORE calling bootstrap, so
-  // by the time we get here cwd is already in the persisted list (or
-  // the boot exited). One-shot mode (`agent "prompt"`) calls bootstrap
-  // directly with no trust modal — cwd may genuinely be untrusted.
-  // Either way, recompute here so the answer matches the live state
-  // of `trusted_dirs.json` at this moment.
-  //
-  // Fail-closed semantics:
-  //   - trustListPathOverride === null         → no trust storage
-  //                                              → isCwdTrusted=false
-  //   - trustListPath() returned null (XDG     → idem
-  //     paths unavailable on weird platform)
-  //   - file missing / corrupt / not in list   → false
-  //   - cwd in list                            → true
-  const trustPath =
-    input.trustListPathOverride !== undefined ? input.trustListPathOverride : trustListPath();
-  const isCwdTrusted = trustPath !== null && isTrusted(trustPath, cwd);
+  // (`trustPath` and `isCwdTrusted` resolved above the try-block
+  // so the project-pointer section can gate on them at prompt-
+  // assembly time; both are still consumed below — memory_write
+  // honors the same flag (MEMORY.md §7.2.1) and the harness
+  // surfaces it for downstream gates.)
 
   const config: HarnessConfig = {
     provider,

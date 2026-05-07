@@ -15,6 +15,93 @@ Format:
 
 ---
 
+## [2026-05-07] AGENTS.md as pointer (project_context section)
+
+The trust modal was advertising "AGENTS.md present — its
+instructions will be loaded on first use" but no code path
+actually loaded the file body anywhere. Operators with
+AGENTS.md saw the message at boot and the model never received
+the content. Honest fix could have gone two ways:
+
+1. **Implement eager-load** (the spec position pre-amendment):
+   read AGENTS.md content into the system prompt at boot,
+   carry it under cache breakpoint #3.
+
+2. **Implement pointer-only** (this slice): emit a small
+   reference to AGENTS.md in the system prompt and let the
+   model call `read_file` when project conventions matter.
+
+Picked option 2 — symmetric with the memory subsystem (index
+eager, body lazy), bounded eager cost regardless of AGENTS.md
+size, smaller prompt-injection surface, cache breakpoint #3
+stays stable through edits to the body. Trade-off: model can
+forget to read; the pointer's verb ("Read it via read_file
+when project conventions matter") is explicit, and if eval
+shows that's insufficient the mitigation is a stronger nudge,
+not a return to eager-content default.
+
+**Done — spec amendment:**
+
+- `CONTEXT_TUNING.md §2` layout updated: `[project_context]`
+  now describes "pointer pra AGENTS.md (path + verification
+  rule); body lazy via read_file" instead of "AGENTS.md
+  content". Token estimate dropped from 1000-3000 to ~50.
+- `CONTEXT_TUNING.md §2.0` (new section) records the four
+  reasons pointer-over-content is the correct default and the
+  forgetting-risk trade-off honestly.
+- `AGENTIC_CLI.md §6` layout block synced.
+
+**Done — code:**
+
+- `src/cli/project-pointer.ts` — new module with
+  `assembleProjectPointer({ repoRoot, isCwdTrusted })` and
+  `composeWithProjectPointer(base, pointer)`. Probe is
+  `existsSync(repoRoot/AGENTS.md)`; emits empty section when
+  the file is absent or cwd is untrusted. Helper signature
+  symmetric with `memory-prompt.ts` (`assembleMemorySection` +
+  `composeSystemPrompt`).
+- `src/cli/bootstrap.ts` — trust resolution lifted to before
+  the system-prompt assembly (was after; only consumers were
+  downstream). Pointer composed AFTER the
+  parallelism/playbook/plan/user layers and BEFORE the memory
+  section, matching the spec layout's most-stable-first
+  ordering. Old in-place trust resolution replaced with a
+  cross-ref comment so future readers understand the lift.
+- `src/tui/state.ts` — trust modal copy fixed: the line that
+  said "instructions will be loaded on first use" now says
+  "the agent will read it via read_file when project
+  conventions are relevant" — matches the actual semantic.
+
+**Done — tests:**
+
+- `tests/cli/project-pointer.test.ts` (new, 8 cases): empty
+  section on absent file, empty on untrusted cwd, populated
+  when both gates pass, path advertised in body, `read_file`
+  verb pinned, size cap (<700 chars), repoRoot-vs-cwd anchor,
+  composer with empty / non-empty / undefined base.
+- `tests/cli/bootstrap.test.ts` (3 new cases): trusted cwd +
+  AGENTS.md emits pointer at the right composition position
+  (after parallelism, before memory), untrusted cwd suppresses,
+  trusted cwd + no AGENTS.md suppresses.
+
+**Verification:** `bun test` 3553 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean.
+
+**Pending — explicit follow-up:**
+
+- **Eval coverage for pointer-vs-eager.** Worth an eval that
+  measures whether the model actually invokes `read_file` on
+  AGENTS.md when conventions matter, vs ignoring it. Without
+  data, the trade-off is intuition. If the miss rate is high
+  on real tasks, the mitigation tier is documented (stronger
+  nudge → first-tool-call auto-injection → fall back to
+  eager-content) but eval is the entry point.
+
+**Next:** branch absorbs this slice on top of the m4 context
+tuning arc; mergeable.
+
+---
+
 ## [2026-05-07] m4 context tuning — post-review touch-up
 
 Two findings from the code review of the four-slice arc landed

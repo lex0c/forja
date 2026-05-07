@@ -931,7 +931,9 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       ];
       if (event.agentsMd) {
         previewLines.push('');
-        previewLines.push('AGENTS.md present — its instructions will be loaded on first use.');
+        previewLines.push(
+          'AGENTS.md present — the agent will read it via read_file when project conventions are relevant.',
+        );
       }
       return {
         state: {

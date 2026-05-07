@@ -727,4 +727,120 @@ Body.`,
       db.close();
     });
   });
+
+  describe('project pointer (AGENTS.md)', () => {
+    // Pin the wire-up to the system prompt that
+    // src/cli/project-pointer.ts produces. Module-level tests
+    // verify the helper's contract; these verify bootstrap
+    // actually calls it with the right inputs and threads the
+    // result into config.systemPrompt at the right position
+    // (between the system layers and the memory section).
+
+    test('emits the AGENTS.md pointer when cwd is trusted and AGENTS.md exists', () => {
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+      writeFileSync(join(workdir, 'AGENTS.md'), '# Project rules\nUse pnpm.\n');
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(config.systemPrompt).toBeDefined();
+      expect(config.systemPrompt).toContain('# Project context');
+      expect(config.systemPrompt).toContain(join(workdir, 'AGENTS.md'));
+      // Pointer sits AFTER the universal hints (e.g. the
+      // parallelism layer) but BEFORE the memory section per
+      // CONTEXT_TUNING.md §2 layout. The cache-stability
+      // ranking is most-stable-first; project pointer is
+      // stable until AGENTS.md is renamed/removed, memory index
+      // is stable until any /memory write. Pin both adjacencies
+      // so a future composer reorder shows up at PR review
+      // rather than as quiet cache invalidation.
+      const promptText = config.systemPrompt ?? '';
+      const hintIdx = promptText.indexOf('# Parallelism');
+      const pointerIdx = promptText.indexOf('# Project context');
+      const memoryIdx = promptText.indexOf('# Memory');
+      expect(hintIdx).toBeLessThan(pointerIdx);
+      // Memory section is only present when at least one
+      // memory exists in the registry — the bootstrap test
+      // setup isolates user scope under the workdir, which
+      // starts empty, so the section is absent here. When
+      // present, pointer must precede it.
+      if (memoryIdx >= 0) {
+        expect(pointerIdx).toBeLessThan(memoryIdx);
+      }
+      db.close();
+    });
+
+    test('emits the pointer for the cwd-specific AGENTS.md when present (subdir scope)', () => {
+      // Operator running `agent` from a subdir that has its own
+      // AGENTS.md should see THAT file pointed to, not the
+      // repoRoot one. Bootstrap forwards both `cwd` and
+      // `repoRoot` to the helper; cwd-first probe wins when
+      // both files exist.
+      const subdir = join(workdir, 'src');
+      mkdirSync(subdir, { recursive: true });
+      writeFileSync(join(workdir, 'AGENTS.md'), '# repo-wide');
+      writeFileSync(join(subdir, 'AGENTS.md'), '# subdir-specific');
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [subdir] }));
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: subdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(config.systemPrompt ?? '').toContain(join(subdir, 'AGENTS.md'));
+      // The repoRoot file's path should NOT be advertised when
+      // the cwd-scoped file exists — operator scoped to subdir
+      // gets the subdir's conventions.
+      expect(config.systemPrompt ?? '').not.toContain(join(workdir, 'AGENTS.md'));
+      db.close();
+    });
+
+    test('suppresses the pointer when cwd is untrusted (even with AGENTS.md present)', () => {
+      // Trust modal not yet granted (one-shot CLI / programmatic
+      // boot) — the pointer must NOT advertise a file the
+      // operator hasn't authorized the agent to read. The
+      // permission engine would block read_file anyway; this
+      // gate avoids the misleading nudge upstream.
+      writeFileSync(join(workdir, 'AGENTS.md'), '# Project rules\nUse pnpm.\n');
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        // No trust list path → not trusted.
+        trustListPathOverride: null,
+      });
+      expect(config.systemPrompt ?? '').not.toContain('# Project context');
+      db.close();
+    });
+
+    test('suppresses the pointer when AGENTS.md is absent (even on a trusted cwd)', () => {
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+      // No AGENTS.md written.
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(config.systemPrompt ?? '').not.toContain('# Project context');
+      db.close();
+    });
+  });
 });
