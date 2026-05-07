@@ -2127,6 +2127,110 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(130);
   });
 
+  test('Ctrl+C during a slash playbook aborts the dispatch signal', async () => {
+    // Regression: runPlaybook used to mint a fresh AbortController
+    // and never wire it to the REPL's interrupt machinery
+    // (triggerInterrupt aborted only the foreground per-turn
+    // controllers). A long-running /<playbook> run could not be
+    // preempted until budget / wall-clock fired. The per-dispatch
+    // controllers are now stored in module-scope mirror refs
+    // (playbookAbortController / playbookSoftStopController) so
+    // triggerInterrupt aborts the playbook signal too — and the
+    // 4 entry points (modal cancel, reverse-search Ctrl+C/Ctrl+D,
+    // editor cancelInput) gate on isBusy() instead of running so
+    // the path actually fires during a playbook.
+    const stub = makeBootstrapStub();
+    const fakeDef = {
+      name: 'fake',
+      description: 'fake subagent for tests',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'noop',
+      scope: 'project',
+      isolation: 'none',
+      sourcePath: '/dev/null',
+      sourceSha256: '0'.repeat(64),
+      slash: 'fake',
+    };
+    (stub.subagents.byName as Map<string, unknown>).set('fake', fakeDef);
+
+    let capturedSignal: AbortSignal | undefined;
+    let capturedSoftSignal: AbortSignal | undefined;
+    let signalAborted = false;
+    const fakeRunSubagent = async (
+      input: Parameters<typeof import('../../src/subagents/index.ts').runSubagent>[0],
+    ): ReturnType<typeof import('../../src/subagents/index.ts').runSubagent> => {
+      capturedSignal = input.signal;
+      capturedSoftSignal = input.softStopSignal;
+      // Park until the interrupt fires. The controller's abort
+      // resolves this race so we can return a result without
+      // hanging the test.
+      await new Promise<void>((resolve) => {
+        capturedSignal?.addEventListener(
+          'abort',
+          () => {
+            signalAborted = true;
+            resolve();
+          },
+          { once: true },
+        );
+      });
+      return {
+        output: '',
+        sessionId: 'sess-fake-child',
+        status: 'interrupted',
+        reason: 'aborted',
+        costUsd: 0,
+        steps: 0,
+        durationMs: 0,
+        abortCause: 'hard',
+      };
+    };
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      runSubagentOverride: fakeRunSubagent,
+    });
+    await tick();
+
+    stdin.feed('/fake go\r');
+    // Two ticks for the slash dispatch microtask chain to land
+    // inside fakeRunSubagent and capture the signals.
+    await tick();
+    await tick();
+    expect(capturedSignal).toBeDefined();
+    expect(capturedSoftSignal).toBeDefined();
+    expect(capturedSignal?.aborted).toBe(false);
+
+    // Ctrl+C twice — first soft, second escalates to hard.
+    // The reducer flips softInterrupted on the first emit;
+    // triggerInterrupt reads that to decide which controller to
+    // abort.
+    stdin.feed('\x03');
+    await tick();
+    await flushFrame();
+    // Soft is plumbed through the soft controller; hard signal
+    // stays pending until the second tap.
+    expect(capturedSoftSignal?.aborted).toBe(true);
+    expect(capturedSignal?.aborted).toBe(false);
+
+    stdin.feed('\x03');
+    await tick();
+    await flushFrame();
+    expect(capturedSignal?.aborted).toBe(true);
+    expect(signalAborted).toBe(true);
+
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('foreground Enter is blocked while a slash playbook is in flight', async () => {
     // Regression: playbookRunning gated the slash dispatcher's
     // own `isRunning()` closure, but the foreground submit paths

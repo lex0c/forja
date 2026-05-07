@@ -766,6 +766,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // can't leak forward.
   let abortController: AbortController | null = null;
   let softStopController: AbortController | null = null;
+  // Mirror controllers for the slash playbook dispatcher's
+  // runSubagent call. Set inside runPlaybook before the await
+  // and cleared in its finally block; triggerInterrupt below
+  // aborts whichever pair (foreground OR playbook) is live so
+  // Esc / Ctrl+C / SIGINT preempt a long-running /<playbook>
+  // dispatch the same way they preempt a foreground turn.
+  let playbookAbortController: AbortController | null = null;
+  let playbookSoftStopController: AbortController | null = null;
   // The promise returned by the in-flight runAgent (already wrapped
   // in `.catch().finally()`, so awaiting never throws). `shutdown`
   // awaits this before closing the DB so the harness's async cleanup
@@ -1042,10 +1050,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const triggerInterrupt = (): void => {
     const level: 'soft' | 'hard' = renderer.state().softInterrupted ? 'hard' : 'soft';
     bus.emit({ type: 'interrupt', ts: now(), level });
-    if (level === 'hard' && abortController !== null) {
-      abortController.abort();
-    } else if (level === 'soft' && softStopController !== null) {
-      softStopController.abort();
+    if (level === 'hard') {
+      if (abortController !== null) abortController.abort();
+      // Abort the playbook controller TOO if a slash dispatch
+      // is in flight. Foreground and playbook controllers are
+      // never both populated simultaneously (the busy gate
+      // serializes them), so this is "abort whichever is live"
+      // rather than two separate state machines.
+      if (playbookAbortController !== null) playbookAbortController.abort();
+    } else {
+      if (softStopController !== null) softStopController.abort();
+      if (playbookSoftStopController !== null) playbookSoftStopController.abort();
     }
   };
 
@@ -1109,7 +1124,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // behind it. Modal still resolves 'cancel' via the manager's own
   // path; we just skip the spurious interrupt emit.
   onModalInterrupt = () => {
-    if (running) triggerInterrupt();
+    if (isBusy()) triggerInterrupt();
   };
 
   // Slash command registry + cumulative tracker for /cost. Built once
@@ -1239,15 +1254,18 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         throw new Error(`playbook '${name}' is not registered`);
       }
       playbookRunning = true;
+      // Fresh per-dispatch controllers. `triggerInterrupt`
+      // (Esc / Ctrl+C / SIGINT / modal-cancel) reads these as a
+      // mirror of the foreground per-turn controllers and
+      // aborts whichever pair is live. The finally block clears
+      // them so a subsequent triggerInterrupt fired in idle
+      // does not abort a stale signal.
+      const ac = new AbortController();
+      const softAc = new AbortController();
+      playbookAbortController = ac;
+      playbookSoftStopController = softAc;
       try {
         const parentSessionId = ensureParentSessionId();
-        // Fresh signal per dispatch. Cancellation by Esc / Ctrl+C
-        // would route through the REPL's main interrupt path; for
-        // an inline slash run we don't expose cancel today (the
-        // run is bounded by the playbook's `budget.maxWallClockMs`
-        // / `maxCostUsd` instead). Future slice can plumb the
-        // global `currentTurnAbort` here for parity.
-        const ac = new AbortController();
         const runSubagentImpl = options.runSubagentOverride ?? runSubagent;
         const result = await runSubagentImpl({
           definition,
@@ -1259,6 +1277,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           db,
           cwd: baseConfig.cwd,
           signal: ac.signal,
+          softStopSignal: softAc.signal,
           subagentRegistry: subagents,
           ...(baseConfig.isCwdTrusted !== undefined ? { cwdTrusted: baseConfig.isCwdTrusted } : {}),
           // Plan mode propagation. When `/plan on` is active the
@@ -1307,8 +1326,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       } finally {
         // Drop the gate even on throw — a stuck `playbookRunning`
         // would lock the operator out of every subsequent dispatch
-        // until process restart.
+        // until process restart. Same logic for the controllers:
+        // clear them so a subsequent triggerInterrupt fired in
+        // idle does not call abort() on a settled signal.
         playbookRunning = false;
+        playbookAbortController = null;
+        playbookSoftStopController = null;
       }
     },
   };
@@ -1462,12 +1485,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       if (key.kind === 'char') {
         if (key.ctrl && key.char === 'c') {
           // Close the overlay, then route through the same ladder
-          // the editor handler uses for raw-mode Ctrl+C: running →
+          // the editor handler uses for raw-mode Ctrl+C: busy →
           // soft/hard interrupt; idle → arm/exit double-tap gate
           // (UI.md §5.4). cancelExitArm is implicit in
-          // handleIdleInterrupt's arm path.
+          // handleIdleInterrupt's arm path. `isBusy()` covers
+          // both a foreground turn and an in-flight playbook so
+          // either can be preempted from reverse-search mode.
           closeReverseSearch();
-          if (running) {
+          if (isBusy()) {
             triggerInterrupt();
           } else {
             handleIdleInterrupt();
@@ -1475,12 +1500,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           return true;
         }
         if (key.ctrl && key.char === 'd') {
-          // EOF convention. running → interrupt (consistent with the
+          // EOF convention. busy → interrupt (consistent with the
           // editor handler's `result.cancelInput === 'eof'` branch);
           // idle → direct exit 130, no double-tap (shell EOF is one
           // explicit decision per spec UI.md §5.4).
           closeReverseSearch();
-          if (running) {
+          if (isBusy()) {
             triggerInterrupt();
           } else {
             exitCode = 130;
@@ -1757,13 +1782,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     }
 
     // Ctrl+C with empty buffer:
-    //   - running → soft/hard interrupt ladder (same as Esc and SIGINT).
+    //   - busy → soft/hard interrupt ladder (same as Esc and SIGINT).
+    //     `isBusy()` covers both a foreground turn and an in-flight
+    //     playbook so either can be preempted from the editor.
     //   - idle → double-tap gate (UI.md §5.4): first press arms,
     //     second within 2s exits 130. Synchronous shutdown gate
     //     (`exiting` set in requestShutdown) keeps a stray follow-up
     //     keystroke from racing past the check.
     if (result.cancelInput === 'interrupt') {
-      if (running) {
+      if (isBusy()) {
         triggerInterrupt();
       } else {
         handleIdleInterrupt();
