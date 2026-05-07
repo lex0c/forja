@@ -8,6 +8,13 @@ import type {
   ProviderToolDef,
   StreamEvent,
 } from '../types.ts';
+import {
+  MAX_CACHE_BREAKPOINTS_PER_REQUEST,
+  countCacheBreakpoints,
+  messagesWithTailCacheBreakpoint,
+  systemWithCacheBreakpoint,
+  toolsWithCacheBreakpoint,
+} from './cache.ts';
 import { ANTHROPIC_CAPS } from './capabilities.ts';
 import { type RawAnthropicEvent, normalizeAnthropicStream } from './stream.ts';
 
@@ -70,12 +77,38 @@ export const createAnthropicProvider = (
     // The SDK's typed `messages.stream({...})` accepts our shape directly;
     // we cast the returned async iterable to the local minimal event type
     // (structural compatibility — the SDK's events are a superset).
+    //
+    // Cache breakpoints (CONTEXT_TUNING.md §3.1, PROVIDERS.md §3.1):
+    // anchors are placed on (a) the system block, (b) the last tool,
+    // and (c) the last message's last content block. See
+    // `./cache.ts` for the full strategy and the gap to four
+    // breakpoints (the [project_context] / [memory_index] split).
+    const cachedSystem = systemWithCacheBreakpoint(req.system);
+    const cachedTools =
+      req.tools !== undefined
+        ? toolsWithCacheBreakpoint(req.tools.map(toAnthropicTool))
+        : undefined;
+    const cachedMessages = messagesWithTailCacheBreakpoint(req.messages.map(toAnthropicMessage));
+    // Anthropic 400s on > 4 cache_control markers per request.
+    // Asserting here means a future composition change that adds a
+    // fourth or fifth marker fails fast in unit/integration tests
+    // rather than at the API boundary.
+    const breakpointCount = countCacheBreakpoints({
+      system: cachedSystem,
+      tools: cachedTools,
+      messages: cachedMessages,
+    });
+    if (breakpointCount > MAX_CACHE_BREAKPOINTS_PER_REQUEST) {
+      throw new Error(
+        `anthropic request exceeds the ${MAX_CACHE_BREAKPOINTS_PER_REQUEST}-breakpoint cache_control limit (${breakpointCount} markers); review src/providers/anthropic/cache.ts`,
+      );
+    }
     const stream = client.messages.stream({
       model: modelName,
       max_tokens: req.max_tokens,
-      messages: req.messages.map(toAnthropicMessage),
-      ...(req.system !== undefined ? { system: req.system } : {}),
-      ...(req.tools !== undefined ? { tools: req.tools.map(toAnthropicTool) } : {}),
+      messages: cachedMessages,
+      ...(cachedSystem !== undefined ? { system: cachedSystem } : {}),
+      ...(cachedTools !== undefined ? { tools: cachedTools } : {}),
       ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
       ...(req.top_p !== undefined ? { top_p: req.top_p } : {}),
       // Extended thinking (`PLAYBOOKS.md` §1.1
