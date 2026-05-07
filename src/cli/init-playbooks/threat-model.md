@@ -14,7 +14,7 @@ references:
   - AGENTS.md
 sampling:
   temperature: 0.2
-  max_tokens: 4096
+  max_tokens: 8192
   thinking_budget: 4096
   seed_in_eval: true
 context_recipe:

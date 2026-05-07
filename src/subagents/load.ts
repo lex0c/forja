@@ -501,6 +501,33 @@ const parseSampling = (raw: unknown, sourcePath: string): SamplingOverride | und
     }
     out.seedInEval = r.seed_in_eval;
   }
+  // Cross-field check (`PLAYBOOKS.md` §1.1, Anthropic API
+  // contract). When extended thinking is enabled, the budget MUST
+  // be strictly less than max_tokens — Anthropic rejects equal
+  // or greater with HTTP 400, and the equivalent Gemini path
+  // silently caps the budget. Catching at load means the author
+  // sees a source-aware error before the binary even spawns the
+  // child, instead of a 400 mid-run that reaches the operator
+  // as an opaque provider failure.
+  //
+  // Only checked when BOTH fields are explicit AND thinking is
+  // active (`> 0`; budget=0 disables thinking and the adapter
+  // omits the block entirely). When max_tokens is absent the
+  // child will use the harness's `RunBudget.maxOutputTokensPerCall`
+  // default (4096); we do NOT cross-check against that here
+  // because a future runtime override could land before the
+  // provider call and the author's intent at load time is the
+  // authoritative reference for the playbook contract.
+  if (
+    out.thinkingBudget !== undefined &&
+    out.thinkingBudget > 0 &&
+    out.maxTokens !== undefined &&
+    out.thinkingBudget >= out.maxTokens
+  ) {
+    throw new Error(
+      `subagent ${sourcePath}: 'sampling.thinking_budget' (${out.thinkingBudget}) must be strictly less than 'sampling.max_tokens' (${out.maxTokens}) — Anthropic API rejects equal or greater with HTTP 400`,
+    );
+  }
   return out;
 };
 

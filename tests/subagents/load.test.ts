@@ -727,6 +727,61 @@ describe('playbook surface — sampling', () => {
       loadSubagentFromString(withExtraFrontmatter('sampling: 0.2'), 'user', '/p'),
     ).toThrow(/'sampling' must be a mapping/);
   });
+
+  test('rejects thinking_budget >= max_tokens (Anthropic 400 guard)', () => {
+    // Anthropic API rejects requests where thinking.budget_tokens
+    // >= max_tokens with HTTP 400. Catching at load means the
+    // author sees the cause source-aware before any provider
+    // call. The pre-fix canonical playbooks `threat-model.md`
+    // and `perf-investigate.md` both shipped with `4096 == 4096`
+    // and would have failed mid-run.
+    const bad = [
+      'thinking_budget: 4096\n  max_tokens: 4096',
+      'thinking_budget: 5000\n  max_tokens: 4096',
+    ];
+    for (const pair of bad) {
+      expect(() =>
+        loadSubagentFromString(withExtraFrontmatter(`sampling:\n  ${pair}`), 'user', '/p'),
+      ).toThrow(
+        /'sampling\.thinking_budget' \([0-9]+\) must be strictly less than 'sampling\.max_tokens'/,
+      );
+    }
+  });
+
+  test('thinking_budget=0 escapes the cross-field check (disables thinking)', () => {
+    // budget=0 means "no thinking block on the request" — the
+    // adapter omits it entirely, so the cross-field constraint
+    // doesn't apply. Authors who set 0 to disable get a clean
+    // load even when max_tokens is 0-ish (or any value).
+    const def = loadSubagentFromString(
+      withExtraFrontmatter('sampling:\n  thinking_budget: 0\n  max_tokens: 4096'),
+      'user',
+      '/p',
+    );
+    expect(def.sampling).toEqual({ thinkingBudget: 0, maxTokens: 4096 });
+  });
+
+  test('thinking_budget alone (no max_tokens) skips the cross-field check', () => {
+    // The check only fires when BOTH fields are explicit. When
+    // max_tokens is absent the harness fills it from RunBudget;
+    // the load-time check defers to runtime config rather than
+    // guess at a default.
+    const def = loadSubagentFromString(
+      withExtraFrontmatter('sampling:\n  thinking_budget: 4096'),
+      'user',
+      '/p',
+    );
+    expect(def.sampling?.thinkingBudget).toBe(4096);
+  });
+
+  test('thinking_budget < max_tokens passes', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter('sampling:\n  thinking_budget: 4000\n  max_tokens: 4096'),
+      'user',
+      '/p',
+    );
+    expect(def.sampling).toEqual({ thinkingBudget: 4000, maxTokens: 4096 });
+  });
 });
 
 describe('playbook surface — context_recipe', () => {
