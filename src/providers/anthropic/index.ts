@@ -103,6 +103,36 @@ export const createAnthropicProvider = (
         `anthropic request exceeds the ${MAX_CACHE_BREAKPOINTS_PER_REQUEST}-breakpoint cache_control limit (${breakpointCount} markers); review src/providers/anthropic/cache.ts`,
       );
     }
+    // `thinking_budget` cross-check (PLAYBOOKS.md §1.1, Anthropic
+    // API contract). The Messages API rejects requests where the
+    // extended-thinking budget is greater than or equal to
+    // `max_tokens`. The loader-side gate (`subagents/load.ts`
+    // §thinking_budget) catches this for playbook frontmatter at
+    // load time, but its floor is conservative
+    // (`LOAD_TIME_OUTPUT_TOKENS_FLOOR = 4096`) because the runtime
+    // model is not in scope there. A playbook that declares
+    // `thinking_budget: 8000` with `max_tokens: 12000` passes
+    // load-time validation, then runs against a model whose
+    // capability ceiling is 4096 (or whose budget override clamps
+    // resolved max_tokens below `thinking_budget`); the resolver
+    // returns 4096, the request goes out with `thinking_budget=8000
+    // >= max_tokens=4096`, and Anthropic 400s mid-run. This check
+    // surfaces the failure as a source-aware error before the call
+    // leaves the binary, with the resolved values both visible so
+    // the operator knows which side to adjust. Zero is the
+    // disable-via-zero idiom and is gated below by `> 0` — also
+    // skipped here so a playbook with `thinking_budget: 0` and
+    // `max_tokens: 0` doesn't trip the check (the request would be
+    // rejected anyway, but for max_tokens=0, not for the budget).
+    if (
+      req.thinking_budget !== undefined &&
+      req.thinking_budget > 0 &&
+      req.thinking_budget >= req.max_tokens
+    ) {
+      throw new Error(
+        `anthropic request: 'thinking_budget' (${req.thinking_budget}) must be strictly less than 'max_tokens' (${req.max_tokens}) — Anthropic API rejects equal or greater with HTTP 400. The runtime resolved max_tokens against the provider capability ceiling (capabilities.output_max_tokens=${caps.output_max_tokens}); raise the playbook's 'sampling.max_tokens' or lower 'sampling.thinking_budget'.`,
+      );
+    }
     const stream = client.messages.stream({
       model: modelName,
       max_tokens: req.max_tokens,

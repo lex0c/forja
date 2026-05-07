@@ -15,6 +15,71 @@ Format:
 
 ---
 
+## [2026-05-07] m4 context tuning — post-review touch-up
+
+Two findings from the code review of the four-slice arc landed
+on the same branch instead of being deferred to follow-ups.
+Both were observations from the review, not blockers — but
+small enough to bundle and large enough that punting them would
+have left known gaps in the cost-primary surface.
+
+**Done — `thinking_budget` runtime cross-check (Anthropic adapter):**
+
+The loader-side gate at `subagents/load.ts §thinking_budget`
+catches the most common "thinking_budget >= max_tokens" shape
+at playbook load time, but its conservative floor
+(`LOAD_TIME_OUTPUT_TOKENS_FLOOR = 4096`) can't see the runtime
+model. A playbook that declares `thinking_budget: 8000` with
+`max_tokens: 12000` passes load-time validation, then runs
+against a model whose capability ceiling is 4096 (or whose
+budget override clamps the resolved max_tokens below the
+budget); the resolver returns 4096, the request goes out with
+`thinking_budget=8000 >= max_tokens=4096`, and Anthropic 400s
+mid-run. The new check in `src/providers/anthropic/index.ts`
+turns that into a source-aware throw before the call leaves
+the binary, with both the resolved values and the capability
+ceiling in the message so the operator knows which side to
+adjust. The check sits next to the cache-breakpoint assertion
+so all "request shape sanity" gates live in one block.
+
+Coverage: rejection path, equality strict-`<`, zero-disable
+idiom bypass, and a positive case (valid budget reaches the
+SDK) so a regression that unconditionally throws can't pass
+the suite via the throw-expecting tests alone.
+
+**Done — single source of truth for partial-budget merge:**
+
+The loop did `{ ...DEFAULT_BUDGET, ...config.budget }` (per-
+field merge) while the banner did `baseConfig.budget ??
+DEFAULT_BUDGET` (whole-object fallback). The two diverged when
+the operator supplied a partial budget object: the banner saw
+only the partial fields, the loop saw the partial overlaid on
+DEFAULT_BUDGET. Today only `maxOutputTokensPerCall` had a
+non-default-driven consumer, so the gap was harmless — but it
+was a smell that would silently bite the next field added with
+both consumers. New `effectiveBudget(partial?)` helper in
+`harness/types.ts` is the single source; loop and banner both
+route through it. Pre-helper behavior preserved on every field
+that exists today (verified per-field in the diff and pinned
+via tests).
+
+**Verification:** `bun test` 3542 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean. Suite gained 8 new
+tests (4 for `effectiveBudget`, 4 for the thinking-budget
+adapter cross-check).
+
+**Closeout follow-ups still pending** (no scope change since
+the previous entry — listed here for one-stop reference):
+
+- Fourth cache breakpoint via system-block split.
+- Eval coverage for compaction quality.
+- Optional spec amendment in CONTEXT_TUNING.md for the
+  structured-block schema (ANCHORS / REJECTED).
+
+**Next:** branch is mergeable.
+
+---
+
 ## [2026-05-07] m4 context tuning — closeout (slices A–D landed)
 
 Branch `feat/m4-context-tuning` carried four slices end-to-end.

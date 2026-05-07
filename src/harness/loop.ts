@@ -44,7 +44,6 @@ import {
 } from './resume.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
 import {
-  DEFAULT_BUDGET,
   type ExitReason,
   type HarnessConfig,
   type HarnessEvent,
@@ -52,6 +51,7 @@ import {
   MAX_CONCURRENT_SUBAGENTS_CAP,
   MAX_CONCURRENT_TOOL_CALLS_CAP,
   type RunBudget,
+  effectiveBudget,
   resolveMaxOutputTokens,
 } from './types.ts';
 
@@ -161,7 +161,7 @@ const buildToolDefs = (config: HarnessConfig): ProviderToolDef[] =>
 // expect their own format already constructed by the adapter.
 
 export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> => {
-  const budget: RunBudget = { ...DEFAULT_BUDGET, ...(config.budget ?? {}) };
+  const budget: RunBudget = effectiveBudget(config.budget);
   const startMs = Date.now();
 
   // Combine the caller's abort signal with a wall-clock timer so the cap

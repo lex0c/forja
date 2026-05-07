@@ -247,6 +247,105 @@ describe('createAnthropicProvider', () => {
     expect('stop_sequences' in params).toBe(false);
   });
 
+  test('rejects thinking_budget >= max_tokens before leaving the binary', async () => {
+    // Anthropic 400s on thinking_budget >= max_tokens. The loader
+    // floor (LOAD_TIME_OUTPUT_TOKENS_FLOOR=4096) catches the most
+    // common shape at playbook load time, but it can't see the
+    // runtime model — a playbook that declares max_tokens 12k +
+    // thinking_budget 10k passes the loader, then runs against a
+    // model whose capability ceiling is 4k. The runtime resolver
+    // clamps max_tokens to 4k, the request goes out with
+    // thinking_budget=10k >= max_tokens=4k, and the API 400s mid-
+    // run. The adapter check turns that mid-run failure into a
+    // source-aware throw with both values visible. The mock
+    // client should NOT be reached when the check fires.
+    const handle = mockClient([{ type: 'message_stop' }]);
+    const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+    const drain = async () => {
+      for await (const _ of provider.generate({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 4096,
+        thinking_budget: 10_000,
+      })) {
+        // drain
+      }
+    };
+    await expect(drain()).rejects.toThrow(
+      /'thinking_budget' \(10000\) must be strictly less than 'max_tokens' \(4096\)/,
+    );
+    // The SDK was never called — the throw fires at request build
+    // time, before the cache helpers and stream open.
+    expect(handle.streamCalls).toHaveLength(0);
+  });
+
+  test('thinking_budget equal to max_tokens is rejected (strict <)', async () => {
+    // The 400 contract is strict less-than; equality also fails.
+    // A regression that switched the operator to `>` would let
+    // equal pass the check and surface as the same 400 we wanted
+    // to prevent — pin the comparison.
+    const handle = mockClient([{ type: 'message_stop' }]);
+    const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+    const drain = async () => {
+      for await (const _ of provider.generate({
+        model: 'claude-sonnet-4-6',
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 8000,
+        thinking_budget: 8000,
+      })) {
+        // drain
+      }
+    };
+    await expect(drain()).rejects.toThrow(/must be strictly less than/);
+  });
+
+  test('thinking_budget < max_tokens passes the check and reaches the SDK', async () => {
+    // Positive case for the runtime cross-check. Without an
+    // explicit "valid budget gets through" test, the negative
+    // tests above only confirm the throw path; a regression that
+    // unconditionally threw would still pass them. Existing tests
+    // ("generate forwards model, max_tokens, ..." etc) provide
+    // implicit coverage by not setting thinking_budget at all,
+    // but transitive confidence is weaker than direct.
+    const handle = mockClient([{ type: 'message_stop' }]);
+    const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 8000,
+      thinking_budget: 4000,
+    })) {
+      // drain
+    }
+    expect(handle.streamCalls).toHaveLength(1);
+    const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+    const thinking = params.thinking as { type: string; budget_tokens: number };
+    expect(thinking).toEqual({ type: 'enabled', budget_tokens: 4000 });
+    expect(params.max_tokens).toBe(8000);
+  });
+
+  test('thinking_budget=0 (disable idiom) skips the check', async () => {
+    // PLAYBOOKS.md §1.1 declares budget=0 as the disable idiom —
+    // the adapter omits the thinking block entirely. The check
+    // must not trip on it (any max_tokens > 0 satisfies a "0 <
+    // max_tokens" test, but the > 0 gate exists to make the
+    // intent explicit and survives a future refactor that
+    // changes how the disable signal flows).
+    const handle = mockClient([{ type: 'message_stop' }]);
+    const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'claude-sonnet-4-6',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 8,
+      thinking_budget: 0,
+    })) {
+      // drain
+    }
+    expect(handle.streamCalls).toHaveLength(1);
+    const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+    expect('thinking' in params).toBe(false);
+  });
+
   test('countTokens returns the SDK input_tokens value', async () => {
     const handle = mockClient([], { input_tokens: 137 });
     const provider = createAnthropicProvider('claude-haiku-4-5', { client: handle.client });

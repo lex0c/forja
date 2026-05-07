@@ -412,6 +412,30 @@ export const resolveMaxOutputTokens = (
   return Math.min(override, cap);
 };
 
+// Single source of truth for "what does a partial budget actually
+// resolve to". The loop and any read-only consumer (banner, slash
+// `/budget` show, future surfaces) MUST go through this helper so
+// they observe the same effective values. Pre-helper, the loop
+// did `{ ...DEFAULT_BUDGET, ...config.budget }` (per-field merge)
+// while the banner did `config.budget ?? DEFAULT_BUDGET` (whole-
+// object fallback) — the two diverged when an operator supplied a
+// partial budget object: the banner saw only the partial fields,
+// the loop saw the partial overlaid on DEFAULT_BUDGET. Today only
+// `maxOutputTokensPerCall` had a non-default-driven consumer, so
+// the gap was harmless; routing both call sites through one
+// helper closes the latent divergence before a future field
+// reintroduces it.
+//
+// `Partial<RunBudget>` mirrors what `HarnessConfig.budget`
+// accepts. The spread copies `undefined` overrides verbatim
+// (operator opt-out for `maxCostUsd`), so the resulting
+// `RunBudget` may legitimately carry `maxCostUsd: undefined`
+// despite the type being `RunBudget`.
+export const effectiveBudget = (partial?: Partial<RunBudget>): RunBudget => ({
+  ...DEFAULT_BUDGET,
+  ...(partial ?? {}),
+});
+
 // Hard cap for the parallel pool — even an explicit caller config of
 // `maxConcurrentToolCalls: 100` is clamped to this to bound resource
 // pressure (file descriptors, SQLite WAL writers, hook chain fanout).
