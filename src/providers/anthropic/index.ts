@@ -90,6 +90,13 @@ export const createAnthropicProvider = (
         ? { thinking: { type: 'enabled' as const, budget_tokens: req.thinking_budget } }
         : {}),
       ...(req.stop_sequences !== undefined ? { stop_sequences: req.stop_sequences } : {}),
+      // `seed_in_eval` is intentionally NOT forwarded here. The
+      // Anthropic Messages API does not expose a seed surface
+      // (as of the SDK pinned in package.json); the field stays
+      // present on GenerateRequest for cross-provider intent,
+      // and OpenAI / Google translate to their respective seed
+      // params. When Anthropic ships a seed, this is the single
+      // site to wire it.
       // metadata is intentionally not forwarded in M1: the SDK's MetadataParam
       // shape (`{ user_id?: string | null }`) is narrower than our generic
       // Record<string,string>; the harness will pass user identity through a
