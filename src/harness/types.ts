@@ -438,6 +438,18 @@ export interface HarnessConfig {
   // and any workflow that needs repeatable output. Tunable per
   // workflow per `TOKEN_TUNING.md`.
   temperature?: number;
+  // Nucleus sampling cutoff in (0, 1]. Same passthrough story as
+  // `temperature` — provider applies its own default when unset.
+  // Playbook frontmatter `sampling.top_p` (`PLAYBOOKS.md` §1.1)
+  // flows here when the parent spawns a subagent.
+  topP?: number;
+  // Extended-thinking budget in tokens. 0 explicitly disables;
+  // positive integers cap the model's hidden reasoning. Only the
+  // Anthropic adapter applies a dedicated budget surface today;
+  // adapters that cannot map the value drop it (the request
+  // surface expresses intent, per-provider effort follows). Tied
+  // to `PLAYBOOKS.md` §1.1 `sampling.thinking_budget`.
+  thinkingBudget?: number;
   // Resume mode (AGENTIC_CLI §2.1): when set, the harness skips
   // createSession and uses this id instead. Persisted messages for
   // the session are loaded into the in-memory `messages` array

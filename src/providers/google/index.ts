@@ -104,6 +104,15 @@ export const createGoogleProvider = (
     };
     if (req.system !== undefined) config.systemInstruction = req.system;
     if (req.temperature !== undefined) config.temperature = req.temperature;
+    if (req.top_p !== undefined) config.topP = req.top_p;
+    // Gemini 2.5+ exposes a thinking budget via
+    // `thinkingConfig.thinkingBudget` (token count). Mirror the
+    // Anthropic gating: 0 disables, which we encode by omitting
+    // the block. Models that don't support thinking (1.x) ignore
+    // the field; the SDK no-ops the unrecognized config key.
+    if (req.thinking_budget !== undefined && req.thinking_budget > 0) {
+      config.thinkingConfig = { thinkingBudget: req.thinking_budget };
+    }
     if (req.stop_sequences !== undefined) config.stopSequences = req.stop_sequences;
     if (req.tools !== undefined) config.tools = toGoogleTools(req.tools);
 

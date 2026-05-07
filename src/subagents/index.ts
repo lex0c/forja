@@ -1,10 +1,37 @@
 export type {
+  ClarifyMode,
+  ContextRecipe,
+  IncludeRepoMap,
+  PhaseDef,
+  SamplingOverride,
+  StepReflection,
   SubagentBudget,
   SubagentDefinition,
   SubagentIsolation,
   SubagentScope,
+  ToolRestrictionRules,
+  ToolRestrictions,
   WorktreeOutcome,
 } from './types.ts';
+export {
+  RESTRICTION_ERROR_CODE,
+  checkRestriction,
+  enforceBashRestriction,
+  enforcePathRestriction,
+  matchAny,
+  toRestrictionError,
+  wrapToolWithRestrictions,
+} from './restrictions.ts';
+export type { PatternMatch, RestrictionVerdict } from './restrictions.ts';
+export {
+  parseOutputAsObject,
+  validateOutput,
+} from './output-schema.ts';
+export type {
+  ValidationFail,
+  ValidationOk,
+  ValidationResult,
+} from './output-schema.ts';
 export {
   branchName,
   cleanupWorktree,

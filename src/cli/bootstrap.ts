@@ -23,6 +23,7 @@ import { isTrusted, trustListPath } from '../trust/index.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithParallelHint } from './parallel-prompt.ts';
 import { composeWithUserPrompt } from './plan-prompt.ts';
+import { composeWithPlaybookHint } from './playbook-prompt.ts';
 
 export const DEFAULT_MODEL = 'anthropic/claude-sonnet-4-6';
 
@@ -184,28 +185,33 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   try {
     migrate(db);
 
-    // Resolve the effective system prompt. Three layers stack
+    // Resolve the effective system prompt. Four layers stack
     // here in precedence order (most-specific to most-generic):
     //   1. Caller's user prompt (input.systemPrompt) — most
     //      specific, the operator's own framing.
     //   2. Plan mode prompt — operating-mode framing for
     //      `--plan` invocations only.
-    //   3. Parallelism hint — universal background that
+    //   3. Playbook discovery hint — table of available
+    //      subagents + auto-delegation criteria (PLAYBOOKS.md
+    //      §1.4). Sits between parallel and plan/user because
+    //      the table assumes the model already knows the
+    //      task_async family from the parallel layer.
+    //   4. Parallelism hint — universal background that
     //      surfaces the harness's concurrency affordances
     //      (multi-tool turns, task_async family) so the
     //      capability isn't dormant.
     //
-    // Composition order: hint FIRST (background), plan/user
-    // prompts AFTER (more-specific instructions). Without the
-    // hint at the top, models default to one-tool-per-turn and
-    // the parallel dispatch path goes unused on read-heavy
-    // exploration.
-    if (input.plan === true) {
-      const planAndUser = composeWithUserPrompt(input.systemPrompt);
-      resolvedSystemPrompt = composeWithParallelHint(planAndUser);
-    } else {
-      resolvedSystemPrompt = composeWithParallelHint(input.systemPrompt);
-    }
+    // Composition order: parallel hint FIRST (most general
+    // background), then playbook hint (catalogue of subagents),
+    // then plan/user (more-specific instructions). Each
+    // `composeWith*Hint` prepends its hint to the downstream
+    // chunk it receives, so we wrap from the inside out: build
+    // the user/plan downstream first, layer playbook around it,
+    // then layer parallel around that.
+    const baseDownstream =
+      input.plan === true ? composeWithUserPrompt(input.systemPrompt) : input.systemPrompt;
+    const withPlaybook = composeWithPlaybookHint(baseDownstream, subagents);
+    resolvedSystemPrompt = composeWithParallelHint(withPlaybook);
 
     // Memory subsystem (spec MEMORY.md / §4.1). Build the registry
     // from the REPO root, not the invocation cwd: project memory

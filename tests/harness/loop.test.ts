@@ -2068,4 +2068,56 @@ describe('runAgent', () => {
       expect(result.reason).toBe('internalError');
     });
   });
+
+  describe('sampling forwarded to provider request', () => {
+    test('temperature is forwarded when set', async () => {
+      const { config, handle } = buildConfig([{ text: 'ok', stop_reason: 'end_turn' }]);
+      await runAgent({ ...config, temperature: 0.2 });
+      expect(handle.requests[0]?.temperature).toBe(0.2);
+    });
+
+    test('temperature absent leaves the field off the request', async () => {
+      const { config, handle } = buildConfig([{ text: 'ok', stop_reason: 'end_turn' }]);
+      await runAgent(config);
+      expect(handle.requests[0]?.temperature).toBeUndefined();
+    });
+
+    test('topP is forwarded as top_p', async () => {
+      // The harness's HarnessConfig field is camelCase (`topP`)
+      // matching TS convention; the GenerateRequest field is
+      // snake_case (`top_p`) matching the provider wire format.
+      // The mapping happens in `loop.ts`; this test pins it.
+      const { config, handle } = buildConfig([{ text: 'ok', stop_reason: 'end_turn' }]);
+      await runAgent({ ...config, topP: 0.9 });
+      expect(handle.requests[0]?.top_p).toBe(0.9);
+    });
+
+    test('thinkingBudget is forwarded as thinking_budget', async () => {
+      // Mirror of topP: the per-call extended-thinking budget
+      // travels from `HarnessConfig.thinkingBudget` to
+      // `GenerateRequest.thinking_budget`. Adapter-level
+      // mapping (e.g. Anthropic's `thinking: { type:'enabled',
+      // budget_tokens }`) is the provider's concern; this test
+      // covers only the harness-side wire.
+      const { config, handle } = buildConfig([{ text: 'ok', stop_reason: 'end_turn' }]);
+      await runAgent({ ...config, thinkingBudget: 4000 });
+      expect(handle.requests[0]?.thinking_budget).toBe(4000);
+    });
+
+    test('all three sampling fields compose on a single request', async () => {
+      const { config, handle } = buildConfig([{ text: 'ok', stop_reason: 'end_turn' }]);
+      await runAgent({
+        ...config,
+        temperature: 0.1,
+        topP: 0.95,
+        thinkingBudget: 2048,
+      });
+      const req = handle.requests[0];
+      expect(req).toBeDefined();
+      if (req === undefined) return;
+      expect(req.temperature).toBe(0.1);
+      expect(req.top_p).toBe(0.95);
+      expect(req.thinking_budget).toBe(2048);
+    });
+  });
 });

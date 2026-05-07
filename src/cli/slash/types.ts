@@ -14,8 +14,32 @@
 import type { HarnessConfig } from '../../harness/index.ts';
 import type { ModelRegistry } from '../../providers/registry.ts';
 import type { DB } from '../../storage/index.ts';
+import type { RunSubagentResult } from '../../subagents/index.ts';
 import type { Bus } from '../../tui/bus.ts';
 import type { ModalManager } from '../../tui/modal-manager.ts';
+
+// Bridge a slash command uses to dispatch a playbook subagent
+// (`PLAYBOOKS.md` §1.4). The REPL constructs this with the same
+// `runSubagent` machinery the harness uses for `task_*` tool calls,
+// so the subagent inherits provider, registry, permission engine,
+// trust verdict, and signal from the operator's session — there is
+// only one runtime path, two surface invocations.
+//
+// Optional on the context: tests / headless contexts that only
+// exercise observability commands omit it. A playbook slash
+// command receiving an undefined bridge fails with a clear
+// "dispatch unavailable" error — never crashes.
+export interface PlaybookDispatchInput {
+  // Resolved subagent name (NOT the slash). The REPL bridge looks
+  // it up in its registry to fetch the definition; passing the
+  // canonical id keeps the bridge ignorant of slash routing.
+  name: string;
+  // Self-contained instruction for the child. The slash command
+  // forwards `args.join(' ')` here after a non-empty check.
+  prompt: string;
+}
+
+export type PlaybookDispatcher = (input: PlaybookDispatchInput) => Promise<RunSubagentResult>;
 
 export interface SlashContext {
   // Read-only snapshot of the harness config the REPL bootstrapped
@@ -84,6 +108,13 @@ export interface SlashContext {
     clearLocal: () => void;
     optOutReason: () => 'env' | 'file-marker' | null;
   };
+  // Playbook dispatcher (`PLAYBOOKS.md` §1.4). When wired, slash
+  // commands auto-registered from playbook definitions invoke this
+  // to run the subagent inline against the operator's session.
+  // Absent in tests / headless contexts: the playbook commands
+  // surface a clear "dispatch unavailable" error rather than
+  // crashing or silently no-opping.
+  runPlaybook?: PlaybookDispatcher;
 }
 
 // Outcome of executing a command. The dispatcher emits any messages

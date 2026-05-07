@@ -77,6 +77,18 @@ export const createAnthropicProvider = (
       ...(req.system !== undefined ? { system: req.system } : {}),
       ...(req.tools !== undefined ? { tools: req.tools.map(toAnthropicTool) } : {}),
       ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
+      ...(req.top_p !== undefined ? { top_p: req.top_p } : {}),
+      // Extended thinking (`PLAYBOOKS.md` §1.1
+      // `sampling.thinking_budget`). Anthropic's surface is
+      // `thinking: { type:'enabled', budget_tokens }`; budget=0
+      // disables, which the SDK shape encodes as omitting the
+      // block entirely. We mirror that by gating the spread on
+      // `> 0` — passing `budget_tokens: 0` would be rejected by
+      // the API, so the disable-via-zero idiom (PLAYBOOKS.md §1.1)
+      // collapses to "no `thinking` field on the request".
+      ...(req.thinking_budget !== undefined && req.thinking_budget > 0
+        ? { thinking: { type: 'enabled' as const, budget_tokens: req.thinking_budget } }
+        : {}),
       ...(req.stop_sequences !== undefined ? { stop_sequences: req.stop_sequences } : {}),
       // metadata is intentionally not forwarded in M1: the SDK's MetadataParam
       // shape (`{ user_id?: string | null }`) is narrower than our generic

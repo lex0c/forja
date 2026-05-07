@@ -42,10 +42,15 @@ describe('loadSubagentFromString', () => {
     expect(def.meta).toEqual({});
   });
 
-  test('captures unknown frontmatter into meta', () => {
-    // Future playbook fields (output_schema, sampling, references)
-    // must survive the loader unchanged so consumers can read them
-    // without bumping this surface.
+  test('captures genuinely unknown frontmatter into meta', () => {
+    // Forward-compat invariant: a frontmatter key with no typed
+    // parser still lands in `meta` so a future slice that adds the
+    // parser doesn't need a loader bump to start reading the
+    // field. The well-known playbook surfaces (output_schema,
+    // sampling, references, tool_restrictions, etc.) all have
+    // typed parsers now and live on dedicated fields — this test
+    // covers ONLY the overflow path, with a synthetic key that no
+    // parser claims.
     const def = loadSubagentFromString(
       `---
 name: review
@@ -54,17 +59,14 @@ tools: []
 budget:
   max_steps: 1
   max_cost_usd: 0.01
-output_schema:
-  summary: string
-sampling:
-  temperature: 0.2
+custom_unrecognized_field:
+  arbitrary: payload
 ---
 prompt`,
       'user',
       '/p',
     );
-    expect(def.meta.output_schema).toEqual({ summary: 'string' });
-    expect(def.meta.sampling).toEqual({ temperature: 0.2 });
+    expect(def.meta.custom_unrecognized_field).toEqual({ arbitrary: 'payload' });
   });
 
   test('rejects missing leading delimiter', () => {
@@ -339,6 +341,663 @@ budget: { max_steps: 1, max_cost_usd: 0.01 }
     const def = loadSubagentFromString(crlf, 'user', '/p');
     expect(def.name).toBe('explore');
     expect(def.systemPrompt.length).toBeGreaterThan(0);
+  });
+});
+
+// Helper: substitute the closing `---` line with extra frontmatter
+// keys preceded by a newline, then the closing delimiter and body.
+// Avoids fragile string-replace recipes when a test needs to add
+// arbitrary YAML to the canonical fixture.
+const withExtraFrontmatter = (extra: string): string =>
+  `---
+name: explore
+description: Read-only codebase exploration.
+tools: [read_file, grep, glob]
+budget:
+  max_steps: 20
+  max_cost_usd: 0.5
+${extra}
+---
+You are an exploration subagent. Be concise.`;
+
+describe('playbook surface — slash', () => {
+  test('absent slash yields undefined', () => {
+    const def = loadSubagentFromString(VALID, 'user', '/p');
+    expect(def.slash).toBeUndefined();
+  });
+
+  test('valid kebab-case slash parses through', () => {
+    const def = loadSubagentFromString(withExtraFrontmatter('slash: review'), 'user', '/p');
+    expect(def.slash).toBe('review');
+    expect(def.meta.slash).toBeUndefined();
+  });
+
+  test('rejects non-string slash', () => {
+    expect(() => loadSubagentFromString(withExtraFrontmatter('slash: 42'), 'user', '/p')).toThrow(
+      /'slash' must be a non-empty string/,
+    );
+  });
+
+  test('rejects non-kebab slash', () => {
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('slash: ReviewIt'), 'user', '/p'),
+    ).toThrow(/'slash' must be kebab-case/);
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('slash: 9-review'), 'user', '/p'),
+    ).toThrow(/'slash' must be kebab-case/);
+  });
+});
+
+describe('playbook surface — when_to_use', () => {
+  test('absent when_to_use yields undefined', () => {
+    expect(loadSubagentFromString(VALID, 'user', '/p').whenToUse).toBeUndefined();
+  });
+
+  test('valid when_to_use parses through verbatim', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter('when_to_use: "diff ready for review"'),
+      'user',
+      '/p',
+    );
+    expect(def.whenToUse).toBe('diff ready for review');
+    expect(def.meta.when_to_use).toBeUndefined();
+  });
+
+  test('rejects empty / whitespace-only when_to_use', () => {
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('when_to_use: ""'), 'user', '/p'),
+    ).toThrow(/'when_to_use' must be a non-empty string/);
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('when_to_use: "   "'), 'user', '/p'),
+    ).toThrow(/'when_to_use' must be a non-empty string/);
+  });
+});
+
+describe('playbook surface — output_schema', () => {
+  test('absent output_schema yields undefined', () => {
+    expect(loadSubagentFromString(VALID, 'user', '/p').outputSchema).toBeUndefined();
+  });
+
+  test('YAML inline shorthand passes through unchanged', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter('output_schema:\n  summary: string\n  blockers: array'),
+      'user',
+      '/p',
+    );
+    expect(def.outputSchema).toEqual({ summary: 'string', blockers: 'array' });
+    expect(def.meta.output_schema).toBeUndefined();
+  });
+
+  test('JSON Schema-style mapping passes through unchanged', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter(
+        'output_schema:\n  type: object\n  required: [summary]\n  properties:\n    summary:\n      type: string',
+      ),
+      'user',
+      '/p',
+    );
+    expect(def.outputSchema).toEqual({
+      type: 'object',
+      required: ['summary'],
+      properties: { summary: { type: 'string' } },
+    });
+  });
+
+  test('rejects array / scalar output_schema', () => {
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('output_schema: [a, b]'), 'user', '/p'),
+    ).toThrow(/'output_schema' must be a YAML mapping/);
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('output_schema: scalar'), 'user', '/p'),
+    ).toThrow(/'output_schema' must be a YAML mapping/);
+  });
+});
+
+describe('playbook surface — references', () => {
+  test('absent references yields undefined', () => {
+    expect(loadSubagentFromString(VALID, 'user', '/p').references).toBeUndefined();
+  });
+
+  test('valid references list parses through', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter('references:\n  - OPSEC.md\n  - CRYPTOGRAPHY.md'),
+      'user',
+      '/p',
+    );
+    expect(def.references).toEqual(['OPSEC.md', 'CRYPTOGRAPHY.md']);
+    expect(def.meta.references).toBeUndefined();
+  });
+
+  test('rejects non-array references', () => {
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('references: OPSEC.md'), 'user', '/p'),
+    ).toThrow(/'references' must be an array of strings/);
+  });
+
+  test('rejects non-string entries', () => {
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('references: ["OPSEC.md", 42]'), 'user', '/p'),
+    ).toThrow(/'references\[1\]' must be a string \(got number\)/);
+  });
+
+  test('rejects empty / whitespace-padded entries', () => {
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('references: [""]'), 'user', '/p'),
+    ).toThrow(/'references\[0\]' must be a non-empty path/);
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('references: [" OPSEC.md"]'), 'user', '/p'),
+    ).toThrow(/'references\[0\]' has leading or trailing whitespace/);
+  });
+
+  test('rejects duplicates', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('references: ["OPSEC.md", "CRYPTO.md", "OPSEC.md"]'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'references' lists 'OPSEC.md' twice \(index 0 and index 2\)/);
+  });
+});
+
+describe('playbook surface — tool_restrictions', () => {
+  test('absent tool_restrictions yields undefined', () => {
+    expect(loadSubagentFromString(VALID, 'user', '/p').toolRestrictions).toBeUndefined();
+  });
+
+  test('list shorthand becomes { allow: [...] }', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter('tool_restrictions:\n  bash:\n    - "git diff *"\n    - "git log *"'),
+      'user',
+      '/p',
+    );
+    expect(def.toolRestrictions).toEqual({
+      bash: { allow: ['git diff *', 'git log *'] },
+    });
+    expect(def.meta.tool_restrictions).toBeUndefined();
+  });
+
+  test('mapping form with allow / deny passes through unchanged', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter(
+        'tool_restrictions:\n  bash:\n    allow: ["rg *", "cat *"]\n    deny: ["rm -rf *"]',
+      ),
+      'user',
+      '/p',
+    );
+    expect(def.toolRestrictions).toEqual({
+      bash: { allow: ['rg *', 'cat *'], deny: ['rm -rf *'] },
+    });
+  });
+
+  test('allow_patterns is a synonym for allow', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter(
+        'tool_restrictions:\n  bash:\n    allow_patterns: ["hyperfine *", "perf record *"]',
+      ),
+      'user',
+      '/p',
+    );
+    expect(def.toolRestrictions).toEqual({
+      bash: { allow: ['hyperfine *', 'perf record *'] },
+    });
+  });
+
+  test('rejects mixing allow and allow_patterns on the same rule', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter(
+          'tool_restrictions:\n  bash:\n    allow: ["a *"]\n    allow_patterns: ["b *"]',
+        ),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/cannot declare both 'allow' and 'allow_patterns'/);
+  });
+
+  test('allow_paths / deny_paths normalize to camelCase', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter(
+        'tool_restrictions:\n  write_file:\n    allow_paths: ["src/**"]\n    deny_paths: ["src/secret/**"]',
+      ),
+      'user',
+      '/p',
+    );
+    expect(def.toolRestrictions).toEqual({
+      write_file: { allowPaths: ['src/**'], denyPaths: ['src/secret/**'] },
+    });
+  });
+
+  test('multiple tools with independent rules', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter(
+        'tool_restrictions:\n  bash:\n    - "git diff *"\n  write_file:\n    allow_paths: ["src/**"]',
+      ),
+      'user',
+      '/p',
+    );
+    expect(def.toolRestrictions).toEqual({
+      bash: { allow: ['git diff *'] },
+      write_file: { allowPaths: ['src/**'] },
+    });
+  });
+
+  test('rejects unknown rule key', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('tool_restrictions:\n  bash:\n    allows: ["typo *"]'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'tool_restrictions\.bash' has unknown key 'allows'/);
+  });
+
+  test('rejects non-mapping / non-array rule', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('tool_restrictions:\n  bash: "git *"'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'tool_restrictions\.bash' must be an array of patterns or a mapping/);
+  });
+
+  test('rejects non-mapping tool_restrictions', () => {
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('tool_restrictions: ["bash"]'), 'user', '/p'),
+    ).toThrow(/'tool_restrictions' must be a mapping/);
+  });
+
+  test('rejects empty pattern strings inside an allow list', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('tool_restrictions:\n  bash:\n    allow: ["valid *", ""]'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'tool_restrictions\.bash\.allow\[1\]' must be a non-empty pattern/);
+  });
+
+  test('rejects duplicate patterns inside an allow list', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('tool_restrictions:\n  bash:\n    allow: ["rg *", "rg *"]'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'tool_restrictions\.bash\.allow' lists "rg \*" twice \(index 0 and index 1\)/);
+  });
+});
+
+describe('playbook surface — sampling', () => {
+  test('absent sampling yields undefined', () => {
+    expect(loadSubagentFromString(VALID, 'user', '/p').sampling).toBeUndefined();
+  });
+
+  test('full valid sampling block parses through with camelCase rename', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter(
+        'sampling:\n  temperature: 0.2\n  top_p: 0.9\n  max_tokens: 4096\n  thinking_budget: 4000\n  seed_in_eval: true',
+      ),
+      'user',
+      '/p',
+    );
+    expect(def.sampling).toEqual({
+      temperature: 0.2,
+      topP: 0.9,
+      maxTokens: 4096,
+      thinkingBudget: 4000,
+      seedInEval: true,
+    });
+    expect(def.meta.sampling).toBeUndefined();
+  });
+
+  test('partial sampling block leaves other fields undefined', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter('sampling:\n  temperature: 0.7'),
+      'user',
+      '/p',
+    );
+    expect(def.sampling).toEqual({ temperature: 0.7 });
+  });
+
+  test('rejects out-of-range temperature', () => {
+    for (const bad of ['-0.1', '2.5']) {
+      expect(() =>
+        loadSubagentFromString(
+          withExtraFrontmatter(`sampling:\n  temperature: ${bad}`),
+          'user',
+          '/p',
+        ),
+      ).toThrow(/'sampling\.temperature' must be in \[0, 2\]/);
+    }
+  });
+
+  test('rejects out-of-range top_p', () => {
+    for (const bad of ['0', '1.5']) {
+      expect(() =>
+        loadSubagentFromString(withExtraFrontmatter(`sampling:\n  top_p: ${bad}`), 'user', '/p'),
+      ).toThrow(/'sampling\.top_p' must be in \(0, 1\]/);
+    }
+  });
+
+  test('rejects non-integer / non-positive max_tokens', () => {
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('sampling:\n  max_tokens: 3.5'), 'user', '/p'),
+    ).toThrow(/'sampling\.max_tokens' must be a positive integer/);
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('sampling:\n  max_tokens: 0'), 'user', '/p'),
+    ).toThrow(/'sampling\.max_tokens' must be a positive integer/);
+  });
+
+  test('thinking_budget accepts 0 (disabled) and rejects negatives', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter('sampling:\n  thinking_budget: 0'),
+      'user',
+      '/p',
+    );
+    expect(def.sampling?.thinkingBudget).toBe(0);
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('sampling:\n  thinking_budget: -1'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'sampling\.thinking_budget' must be a non-negative integer/);
+  });
+
+  test('rejects non-boolean seed_in_eval', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('sampling:\n  seed_in_eval: yes-please'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'sampling\.seed_in_eval' must be a boolean/);
+  });
+
+  test('rejects unknown sampling key', () => {
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('sampling:\n  temprature: 0.2'), 'user', '/p'),
+    ).toThrow(/'sampling\.temprature' is not a recognized option/);
+  });
+
+  test('rejects non-mapping sampling', () => {
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('sampling: 0.2'), 'user', '/p'),
+    ).toThrow(/'sampling' must be a mapping/);
+  });
+});
+
+describe('playbook surface — context_recipe', () => {
+  test('absent context_recipe yields undefined', () => {
+    expect(loadSubagentFromString(VALID, 'user', '/p').contextRecipe).toBeUndefined();
+  });
+
+  test('full valid recipe parses through with camelCase rename', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter(
+        'context_recipe:\n  include_repo_map: eager\n  include_diff: true\n  include_callers: false\n  goal_reinjection_every_n_steps: 4\n  fewshot_count: 1\n  memory_filter: ["security", "architecture"]\n  step_reflection: terse\n  clarify_mode: pre_execution',
+      ),
+      'user',
+      '/p',
+    );
+    expect(def.contextRecipe).toEqual({
+      includeRepoMap: 'eager',
+      includeDiff: true,
+      includeCallers: false,
+      goalReinjectionEveryNSteps: 4,
+      fewshotCount: 1,
+      memoryFilter: ['security', 'architecture'],
+      stepReflection: 'terse',
+      clarifyMode: 'pre_execution',
+    });
+    expect(def.meta.context_recipe).toBeUndefined();
+  });
+
+  test('include_repo_map enum is enforced', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('context_recipe:\n  include_repo_map: maybe'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'context_recipe\.include_repo_map' must be one of eager, lazy, off/);
+  });
+
+  test('step_reflection enum is enforced', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('context_recipe:\n  step_reflection: paragraph'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'context_recipe\.step_reflection' must be one of off, terse, full/);
+  });
+
+  test('clarify_mode enum is enforced', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('context_recipe:\n  clarify_mode: always'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'context_recipe\.clarify_mode' must be one of off, on_high_blast, pre_execution/);
+  });
+
+  test('include_diff / include_callers must be boolean', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('context_recipe:\n  include_diff: "yes"'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'context_recipe\.include_diff' must be a boolean/);
+  });
+
+  test('goal_reinjection_every_n_steps must be positive integer', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('context_recipe:\n  goal_reinjection_every_n_steps: 0'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'context_recipe\.goal_reinjection_every_n_steps' must be a positive integer/);
+  });
+
+  test('fewshot_count accepts 0', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter('context_recipe:\n  fewshot_count: 0'),
+      'user',
+      '/p',
+    );
+    expect(def.contextRecipe?.fewshotCount).toBe(0);
+  });
+
+  test('memory_filter passes through with whitespace / dup checks', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('context_recipe:\n  memory_filter: ["security", "security"]'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'context_recipe\.memory_filter' lists "security" twice/);
+  });
+
+  test('rejects unknown context_recipe key', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('context_recipe:\n  cache_size: 100'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'context_recipe\.cache_size' is not a recognized option/);
+  });
+});
+
+describe('playbook surface — prompt_version / context_recipe_version', () => {
+  test('absent versions yield undefined', () => {
+    const def = loadSubagentFromString(VALID, 'user', '/p');
+    expect(def.promptVersion).toBeUndefined();
+    expect(def.contextRecipeVersion).toBeUndefined();
+  });
+
+  test('positive integers parse through', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter('prompt_version: 3\ncontext_recipe_version: 1'),
+      'user',
+      '/p',
+    );
+    expect(def.promptVersion).toBe(3);
+    expect(def.contextRecipeVersion).toBe(1);
+  });
+
+  test('rejects 0 / negative / non-integer prompt_version', () => {
+    for (const bad of ['0', '-1', '1.5']) {
+      expect(() =>
+        loadSubagentFromString(withExtraFrontmatter(`prompt_version: ${bad}`), 'user', '/p'),
+      ).toThrow(/'prompt_version' must be a positive integer/);
+    }
+  });
+
+  test('rejects 0 / negative / non-integer context_recipe_version', () => {
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('context_recipe_version: 0'), 'user', '/p'),
+    ).toThrow(/'context_recipe_version' must be a positive integer/);
+  });
+});
+
+describe('playbook surface — phases', () => {
+  test('absent phases yields undefined', () => {
+    expect(loadSubagentFromString(VALID, 'user', '/p').phases).toBeUndefined();
+  });
+
+  test('valid phases list parses through with camelCase rename', () => {
+    const def = loadSubagentFromString(
+      withExtraFrontmatter(
+        'phases:\n  - name: explore\n    on_enter: \'goal_push("explore")\'\n  - name: synthesize\n    on_enter: \'goal_push("synthesize")\'\n    on_complete: \'goal_pop("completion")\'',
+      ),
+      'user',
+      '/p',
+    );
+    expect(def.phases).toEqual([
+      { name: 'explore', onEnter: 'goal_push("explore")' },
+      {
+        name: 'synthesize',
+        onEnter: 'goal_push("synthesize")',
+        onComplete: 'goal_pop("completion")',
+      },
+    ]);
+    expect(def.meta.phases).toBeUndefined();
+  });
+
+  test('rejects non-array phases', () => {
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('phases: explore'), 'user', '/p'),
+    ).toThrow(/'phases' must be an array of phase mappings/);
+  });
+
+  test('rejects phase missing name', () => {
+    expect(() =>
+      loadSubagentFromString(withExtraFrontmatter('phases:\n  - on_enter: foo'), 'user', '/p'),
+    ).toThrow(/'phases\[0\]\.name' must be a non-empty string/);
+  });
+
+  test('rejects phase with non-kebab name', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('phases:\n  - name: SynthesizeAll'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'phases\[0\]\.name' must be kebab-case/);
+  });
+
+  test('rejects unknown phase key', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('phases:\n  - name: explore\n    when: pre'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'phases\[0\]\.when' is not a recognized field/);
+  });
+
+  test('rejects duplicate phase names', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('phases:\n  - name: explore\n  - name: explore'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'phases' lists name 'explore' twice \(index 0 and index 1\)/);
+  });
+
+  test('rejects empty on_enter / on_complete strings', () => {
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('phases:\n  - name: explore\n    on_enter: ""'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/'phases\[0\]\.on_enter' must be a non-empty string/);
+  });
+});
+
+describe('playbook surface — fully populated playbook leaves meta empty', () => {
+  test('every PLAYBOOKS.md §1.1 field has a typed parser', () => {
+    // Sanity: the typed surface is large enough that a "kitchen
+    // sink" playbook produces an empty `meta`. If a future spec
+    // change adds a new field, this test fails until either the
+    // parser ships or the field is intentionally left to overflow.
+    const def = loadSubagentFromString(
+      `---
+name: kitchen-sink
+description: Hits every typed playbook field.
+tools: [read_file, grep]
+budget:
+  max_steps: 25
+  max_cost_usd: 0.75
+isolation: none
+slash: kitchen
+when_to_use: "exhaustive validator coverage"
+output_schema:
+  summary: string
+references:
+  - SOFTWARE_ARCHITECTURE.md
+tool_restrictions:
+  bash:
+    - "git diff *"
+sampling:
+  temperature: 0.2
+  max_tokens: 2048
+context_recipe:
+  step_reflection: terse
+  memory_filter: [security]
+prompt_version: 1
+context_recipe_version: 1
+phases:
+  - name: explore
+    on_enter: 'goal_push("explore")'
+---
+Body.`,
+      'user',
+      '/p',
+    );
+    expect(def.meta).toEqual({});
+    expect(def.slash).toBe('kitchen');
+    expect(def.whenToUse).toBe('exhaustive validator coverage');
+    expect(def.outputSchema).toEqual({ summary: 'string' });
+    expect(def.references).toEqual(['SOFTWARE_ARCHITECTURE.md']);
+    expect(def.toolRestrictions).toEqual({ bash: { allow: ['git diff *'] } });
+    expect(def.sampling).toEqual({ temperature: 0.2, maxTokens: 2048 });
+    expect(def.contextRecipe).toEqual({
+      stepReflection: 'terse',
+      memoryFilter: ['security'],
+    });
+    expect(def.promptVersion).toBe(1);
+    expect(def.contextRecipeVersion).toBe(1);
+    expect(def.phases).toEqual([{ name: 'explore', onEnter: 'goal_push("explore")' }]);
   });
 });
 

@@ -439,3 +439,116 @@ describe('assembleMemorySection — boot trigger filter (spec §4.3)', () => {
     expect(result.entryCount).toBe(0);
   });
 });
+
+describe('assembleMemorySection — memory_filter (slice 9)', () => {
+  // Helper: write a memory body with a typed frontmatter and
+  // optional triggers list. The `type` field is required by the
+  // frontmatter parser; tests pin it so the filter can exercise
+  // the type-vs-trigger branch independently.
+  const writeBodyWithTriggers = (
+    dir: string,
+    name: string,
+    type: 'user' | 'feedback' | 'project' | 'reference',
+    triggers: string[] = [],
+  ): void => {
+    mkdirSync(dir, { recursive: true });
+    const lines = [
+      `name: ${name}`,
+      `description: hook for ${name}`,
+      `type: ${type}`,
+      'source: user_explicit',
+    ];
+    if (triggers.length > 0) {
+      lines.push('triggers:');
+      for (const t of triggers) lines.push(`  - ${t}`);
+    }
+    writeFileSync(join(dir, `${name}.md`), `---\n${lines.join('\n')}\n---\n\nbody of ${name}\n`);
+  };
+
+  test('absent filter is a no-op (existing behavior preserved)', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [A](a.md) — h\n- [B](b.md) — h\n');
+    writeBodyWithTriggers(roots.projectLocal, 'a', 'feedback');
+    writeBodyWithTriggers(roots.projectLocal, 'b', 'project');
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry });
+    expect(result.entryCount).toBe(2);
+  });
+
+  test('empty filter is treated as absent', () => {
+    // Spec PLAYBOOKS.md §1.1: an empty list is "no filter
+    // declared" — same effect as omitting the field. Authors
+    // who intentionally blank the list want the unfiltered
+    // shape, not the strict refuse-everything shape.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [A](a.md) — h\n');
+    writeBodyWithTriggers(roots.projectLocal, 'a', 'feedback');
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry, memoryFilter: [] });
+    expect(result.entryCount).toBe(1);
+  });
+
+  test('keeps entries whose type matches a filter value', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [A](a.md) — h\n- [B](b.md) — h\n- [C](c.md) — h\n');
+    writeBodyWithTriggers(roots.projectLocal, 'a', 'feedback');
+    writeBodyWithTriggers(roots.projectLocal, 'b', 'project');
+    writeBodyWithTriggers(roots.projectLocal, 'c', 'reference');
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry, memoryFilter: ['reference'] });
+    // Only `c` (type=reference) survives.
+    expect(result.entryCount).toBe(1);
+    expect(result.text).toContain('c');
+    expect(result.text).not.toContain('— h\n- [A]');
+  });
+
+  test('keeps entries whose triggers intersect a filter value', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [A](a.md) — h\n- [B](b.md) — h\n');
+    // `a` is feedback with `security` trigger; `b` is feedback
+    // with no triggers. Filter ['security'] keeps `a` only.
+    writeBodyWithTriggers(roots.projectLocal, 'a', 'feedback', ['security']);
+    writeBodyWithTriggers(roots.projectLocal, 'b', 'feedback');
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry, memoryFilter: ['security'] });
+    expect(result.entryCount).toBe(1);
+    expect(result.text).toContain('a');
+  });
+
+  test('a filter value matches BOTH type and trigger axes', () => {
+    // The canonical playbook example mixes `reference` (a type
+    // value) with `security` / `architecture` (trigger tags).
+    // The filter has to walk both axes for each entry rather
+    // than picking one — testing the cross-axis fallthrough.
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [A](a.md) — h\n- [B](b.md) — h\n- [C](c.md) — h\n');
+    writeBodyWithTriggers(roots.projectLocal, 'a', 'reference'); // type match
+    writeBodyWithTriggers(roots.projectLocal, 'b', 'feedback', ['security']); // trigger match
+    writeBodyWithTriggers(roots.projectLocal, 'c', 'feedback', ['unrelated']); // no match
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({
+      registry,
+      memoryFilter: ['security', 'reference'],
+    });
+    expect(result.entryCount).toBe(2);
+    expect(result.text).toContain('a');
+    expect(result.text).toContain('b');
+    expect(result.text).not.toContain('— h\n- [project_local] c');
+  });
+
+  test('no entry matches → empty section', () => {
+    const repo = makeTmp();
+    const roots = makeRoots(repo);
+    writeIndex(roots.projectLocal, '- [A](a.md) — h\n');
+    writeBodyWithTriggers(roots.projectLocal, 'a', 'feedback');
+    const registry = createMemoryRegistry({ roots });
+    const result = assembleMemorySection({ registry, memoryFilter: ['nonexistent'] });
+    expect(result.entryCount).toBe(0);
+    expect(result.text).toBe('');
+  });
+});

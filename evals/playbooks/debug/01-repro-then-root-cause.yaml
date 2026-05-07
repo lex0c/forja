@@ -1,0 +1,12 @@
+name: 01-repro-then-root-cause
+playbook: debug
+prompt: |-
+  The flaky test `tests/queue/dequeue.test.ts` fails roughly
+  1 in 20 runs with: "expected 1 job, got 0". Investigate. Form
+  hypotheses, validate them, and propose a minimal fix.
+expect:
+  output_schema_valid: true
+  output_contains:
+    - hypotheses
+    - root_cause
+    - repro

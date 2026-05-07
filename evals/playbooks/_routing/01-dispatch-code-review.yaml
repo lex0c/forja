@@ -1,0 +1,10 @@
+name: 01-dispatch-code-review
+prompt: |-
+  Here's the diff from PR #142 — please review it before I
+  merge. Look for race conditions and check whether the test
+  coverage is enough.
+
+  ```diff
+  +function dequeue() { ... }
+  ```
+expect_dispatch: code-review

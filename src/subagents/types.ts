@@ -65,6 +65,94 @@ export interface WorktreeOutcome {
   removed: boolean;
 }
 
+// Per-tool restriction rules declared by a playbook (`PLAYBOOKS.md`
+// §1.1). The loader normalizes the YAML's permissive surface into
+// this canonical shape so consumers (slice 5 enforcement) can match
+// without a switch over input forms. Glob/prefix only — never regex
+// (CLAUDE.md hard rule).
+//
+// Two key spaces coexist on the same record:
+//
+//   - `allow` / `deny` — pattern lists matched against the tool's
+//     argv-shaped command string. Used by `bash` and friends.
+//   - `allowPaths` / `denyPaths` — pattern lists matched against
+//     filesystem paths. Used by `write_file` / `edit_file`.
+//
+// Both spaces can coexist on a single rule (`bash` could in
+// principle restrict by both command and path), but the typical
+// playbook uses just one. The slice-5 enforcer is the only consumer
+// that decides which fields apply to which tool.
+export interface ToolRestrictionRules {
+  allow?: string[];
+  deny?: string[];
+  allowPaths?: string[];
+  denyPaths?: string[];
+}
+
+// Map from tool name → restriction rules. Empty rule object means
+// "no constraints declared for this tool" — distinct from absence
+// of the entry which means "no entry at all". Slice 5 enforces;
+// slice 1 only validates shape.
+export type ToolRestrictions = Record<string, ToolRestrictionRules>;
+
+// Sampling overrides per playbook (`PLAYBOOKS.md` §1.1, defaults in
+// `TOKEN_TUNING.md` §9). Slice 6 wires these through the harness
+// config; slice 1 only validates ranges. Field names are camelCase
+// here (TS convention) but the YAML frontmatter keys are snake_case
+// (`top_p`, `max_tokens`, `thinking_budget`, `seed_in_eval`).
+export interface SamplingOverride {
+  temperature?: number;
+  topP?: number;
+  maxTokens?: number;
+  thinkingBudget?: number;
+  seedInEval?: boolean;
+}
+
+// `context_recipe.include_repo_map` enum from `PLAYBOOKS.md` §1.1.
+// `eager` = inject at session start, `lazy` = only when the model
+// asks, `off` = never. Slice 9 consumes; slice 1 validates.
+export type IncludeRepoMap = 'eager' | 'lazy' | 'off';
+
+// `context_recipe.step_reflection` enum from `CONTEXT_TUNING.md`
+// §13.10. `terse` = one-line trace per step, `full` = paragraph,
+// `off` = none.
+export type StepReflection = 'off' | 'terse' | 'full';
+
+// `context_recipe.clarify_mode` enum from `STATE_MACHINE.md` §12.
+// `on_high_blast` = clarify only before destructive/irreversible
+// steps; `pre_execution` = clarify before any execution begins;
+// `off` = never.
+export type ClarifyMode = 'off' | 'on_high_blast' | 'pre_execution';
+
+// Context shaping per playbook (`PLAYBOOKS.md` §1.1, canonical
+// recipes in `CONTEXT_TUNING.md` §13). Slice 9 consumes the fields
+// that have downstream subsystems wired (memory_filter,
+// step_reflection, clarify_mode, goal_reinjection); the repo-map /
+// diff / callers fields stay frozen until CODE_INDEX lands. Slice 1
+// validates shape so authors can declare the intent today and the
+// definition is forward-compatible.
+export interface ContextRecipe {
+  includeRepoMap?: IncludeRepoMap;
+  includeDiff?: boolean;
+  includeCallers?: boolean;
+  goalReinjectionEveryNSteps?: number;
+  fewshotCount?: number;
+  memoryFilter?: string[];
+  stepReflection?: StepReflection;
+  clarifyMode?: ClarifyMode;
+}
+
+// Single phase declaration (`PLAYBOOKS.md` §1.1, lifecycle in
+// `STATE_MACHINE.md` §2.3). `onEnter` / `onComplete` are opaque
+// strings here — the runtime that consumes them (deferred until
+// goal_stack lands) parses the call shape. Slice 1 only enforces
+// presence of `name` and string typing on the hooks.
+export interface PhaseDef {
+  name: string;
+  onEnter?: string;
+  onComplete?: string;
+}
+
 export interface SubagentDefinition {
   // Kebab-case unique identifier. Project scope shadows user
   // scope; cross-scope name collision is reported as a precedence
@@ -94,10 +182,57 @@ export interface SubagentDefinition {
   // subagent ran under, independent of what the file looks like
   // now. Hex-encoded lowercase for readability in JSON output.
   sourceSha256: string;
+  // Playbook surfaces (`PLAYBOOKS.md` §1.1). All optional — a
+  // legacy subagent without any of these stays valid, behaves
+  // exactly as before, and the consumer slices treat absence as
+  // "no override". Each field is validated for shape at load time
+  // so authors get a source-aware error instead of a deferred
+  // runtime exception. Consumers land in later slices:
+  //
+  //   - `outputSchema` (slice 8)        — schema rendered into the
+  //                                       child's system prompt and
+  //                                       used post-hoc to validate
+  //                                       the terminal assistant turn.
+  //   - `references` (slice 7)          — list injected into the
+  //                                       child's system prompt
+  //                                       under a "References" block.
+  //   - `toolRestrictions` (slice 5)    — argv-shape / path-shape
+  //                                       glob/prefix gates run as a
+  //                                       middleware before invoke.
+  //   - `slash` (slice 3)               — auto-registered as a
+  //                                       slash command dispatching
+  //                                       `task_sync(playbook=name)`.
+  //   - `whenToUse` (slice 2)           — emitted in the discovery
+  //                                       table the principal agent
+  //                                       reads at session start.
+  //   - `sampling` (slice 6)            — passed to the child harness
+  //                                       config; provider applies.
+  //   - `contextRecipe` (slice 9, partial) — applied to the child's
+  //                                       memory filter / step
+  //                                       reflection / goal
+  //                                       reinjection cadence.
+  //   - `promptVersion` /
+  //     `contextRecipeVersion` (slice 10) — surfaced in eval audit
+  //                                       so a regression can be
+  //                                       traced to a prompt edit.
+  //   - `phases` (deferred, runtime needs goal_stack) — validated
+  //                                       at load so authors can
+  //                                       declare the intent today.
+  outputSchema?: Record<string, unknown>;
+  references?: string[];
+  toolRestrictions?: ToolRestrictions;
+  slash?: string;
+  whenToUse?: string;
+  sampling?: SamplingOverride;
+  contextRecipe?: ContextRecipe;
+  promptVersion?: number;
+  contextRecipeVersion?: number;
+  phases?: PhaseDef[];
   // Untyped frontmatter overflow. Anything the loader didn't
   // map into a strongly-typed field lives here so future slices
-  // (playbooks, sampling, context_recipe) can read frontmatter
-  // without a loader bump. Validation of these fields lives in
-  // the consumer, not in the loader.
+  // can read frontmatter without a loader bump. Validation of
+  // these fields lives in the consumer, not in the loader. Today
+  // this is rarely populated — the typed surface above covers
+  // every field `PLAYBOOKS.md` §1.1 declares.
   meta: Record<string, unknown>;
 }

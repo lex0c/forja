@@ -32,6 +32,7 @@ import {
   loadHistory,
   searchHistory,
 } from '../storage/history.ts';
+import { runSubagent } from '../subagents/index.ts';
 import { addTrustedDir, isTrusted, trustListPath } from '../trust/index.ts';
 import {
   type FocusHandler,
@@ -1051,7 +1052,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // Slash command registry + cumulative tracker for /cost. Built once
   // per REPL session — the registry is stable; cumulative is mutated
   // by startTurn's success branch and read by /cost.
-  const slashRegistry = createBuiltinRegistry();
+  //
+  // Pass the discovered subagents in so every definition with a
+  // `slash:` field auto-registers as a slash command (`PLAYBOOKS.md`
+  // §1.4). The registry's duplicate-name guard surfaces conflicts
+  // between a builtin and a playbook author's chosen slash at boot
+  // — no chance of a typed `/<conflict>` ambiguously routing
+  // mid-session.
+  const slashRegistry = createBuiltinRegistry(subagents);
   const cumulative = { costUsd: 0, steps: 0, turns: 0 };
   // Single registry instance for the REPL's lifetime. /model uses it
   // for the lookup + factory; bootstrap built its own at boot for
@@ -1123,6 +1131,58 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // be visible to `/history on` even though the env never
       // changes. Cheap (single existsSync against `.agent/no-history`).
       optOutReason: () => historyOptOutReason(baseConfig.cwd),
+    },
+    // Playbook dispatcher (`PLAYBOOKS.md` §1.4). Slash commands
+    // built from subagent definitions invoke this to run a child
+    // inline against the operator's session. Same `runSubagent`
+    // path the harness uses for `task_*` tool calls — provider,
+    // tool registry, permission engine, trust verdict all
+    // inherited from `baseConfig`.
+    //
+    // Two preconditions surface early as user-visible errors so
+    // the operator gets a clear cause rather than a deferred
+    // failure mid-run:
+    //
+    //   1. Definition unknown — slash registration filtered defs
+    //      without `slash:`, but a typo or dynamic shadow change
+    //      could still produce a name the registry doesn't have.
+    //   2. No session yet — `runSubagent` wants `parentSessionId`
+    //      to attribute the child against a real parent. Before
+    //      the first turn, no session row exists; refusing here
+    //      matches `/subagents`'s "no session yet" UX.
+    //
+    // The slash command itself further gates on `isRunning()` so
+    // a slash dispatch never races a foreground turn.
+    runPlaybook: async ({ name, prompt }) => {
+      const definition = subagents.byName.get(name);
+      if (definition === undefined) {
+        throw new Error(`playbook '${name}' is not registered`);
+      }
+      if (lastSessionId === null) {
+        throw new Error(
+          `playbook '${name}' cannot dispatch — run a turn first so a parent session exists`,
+        );
+      }
+      // Fresh signal per dispatch. Cancellation by Esc / Ctrl+C
+      // would route through the REPL's main interrupt path; for
+      // an inline slash run we don't expose cancel today (the
+      // run is bounded by the playbook's `budget.maxWallClockMs`
+      // / `maxCostUsd` instead). Future slice can plumb the
+      // global `currentTurnAbort` here for parity.
+      const ac = new AbortController();
+      return runSubagent({
+        definition,
+        prompt,
+        parentSessionId: lastSessionId,
+        provider: baseConfig.provider,
+        parentToolRegistry: baseConfig.toolRegistry,
+        permissionEngine: baseConfig.permissionEngine,
+        db,
+        cwd: baseConfig.cwd,
+        signal: ac.signal,
+        subagentRegistry: subagents,
+        ...(baseConfig.isCwdTrusted !== undefined ? { cwdTrusted: baseConfig.isCwdTrusted } : {}),
+      });
     },
   };
 

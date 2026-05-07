@@ -230,6 +230,129 @@ describe('bootstrap', () => {
     db.close();
   });
 
+  // Helper: write a playbook-shaped subagent definition under
+  // <workdir>/.agent/agents/<name>.md so bootstrap discovers it
+  // through the project scope. Includes `when_to_use` so the def
+  // qualifies for the discovery table.
+  const writePlaybookDef = (name: string, whenToUse: string): void => {
+    const dir = join(workdir, '.agent', 'agents');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, `${name}.md`),
+      `---
+name: ${name}
+description: ${name} stub
+tools: [read_file]
+budget:
+  max_steps: 10
+  max_cost_usd: 0.5
+when_to_use: "${whenToUse}"
+---
+Body for ${name}.`,
+    );
+  };
+
+  test('playbook hint absent when no subagent declares when_to_use', () => {
+    // Default workdir has no agents/ dir → registry is empty and
+    // the hint must not render. Without this guard the model
+    // reads a "Playbook subagents" preamble that lists nothing —
+    // pure noise.
+    const { config, db } = bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+    });
+    expect(config.systemPrompt).toBeDefined();
+    expect(config.systemPrompt).not.toContain('# Playbook subagents');
+    db.close();
+  });
+
+  test('playbook hint absent when subagent has no when_to_use field', () => {
+    // Project def WITHOUT when_to_use must not surface in the
+    // table. Anchors the §1.4 filter at the bootstrap layer.
+    const dir = join(workdir, '.agent', 'agents');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'legacy.md'),
+      `---
+name: legacy
+description: Legacy generic subagent
+tools: [read_file]
+budget:
+  max_steps: 5
+  max_cost_usd: 0.1
+---
+Body.`,
+    );
+    const { config, db } = bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+    });
+    expect(config.systemPrompt).toBeDefined();
+    expect(config.systemPrompt).not.toContain('# Playbook subagents');
+    db.close();
+  });
+
+  test('playbook hint sits between parallel and user when a def declares when_to_use', () => {
+    writePlaybookDef('code-review', 'gate diff before merge');
+    const { config, db } = bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      systemPrompt: 'Project convention: prefer pure functions.',
+    });
+    expect(config.systemPrompt).toBeDefined();
+    expect(config.systemPrompt).toContain('# Parallelism');
+    expect(config.systemPrompt).toContain('# Playbook subagents');
+    expect(config.systemPrompt).toContain('| code-review | gate diff before merge |');
+    expect(config.systemPrompt).toContain('Project convention');
+    const parallelIdx = (config.systemPrompt ?? '').indexOf('# Parallelism');
+    const playbookIdx = (config.systemPrompt ?? '').indexOf('# Playbook subagents');
+    const userIdx = (config.systemPrompt ?? '').indexOf('Project convention');
+    expect(parallelIdx).toBeLessThan(playbookIdx);
+    expect(playbookIdx).toBeLessThan(userIdx);
+    db.close();
+  });
+
+  test('playbook hint composes with plan-mode (parallel → playbook → plan → user)', () => {
+    // Four-layer ordering: most-generic background first, then
+    // catalogue, then operating mode, then operator-specific
+    // framing. Anchors the bootstrap.ts comment and prevents a
+    // future refactor from reordering the layers without
+    // updating the model's mental hierarchy.
+    writePlaybookDef('refactor', 'apply scope-bounded mutations');
+    const { config, db } = bootstrap({
+      prompt: 'hi',
+      cwd: workdir,
+      providerOverride: mockProvider,
+      dbPath,
+      enterprisePolicyPath: null,
+      userPolicyPath: null,
+      plan: true,
+      systemPrompt: 'Project convention: prefer pure functions.',
+    });
+    expect(config.systemPrompt).toBeDefined();
+    const parallelIdx = (config.systemPrompt ?? '').indexOf('# Parallelism');
+    const playbookIdx = (config.systemPrompt ?? '').indexOf('# Playbook subagents');
+    const planIdx = (config.systemPrompt ?? '').indexOf('PLAN MODE');
+    const userIdx = (config.systemPrompt ?? '').indexOf('Project convention');
+    expect(parallelIdx).toBeGreaterThanOrEqual(0);
+    expect(playbookIdx).toBeGreaterThan(parallelIdx);
+    expect(planIdx).toBeGreaterThan(playbookIdx);
+    expect(userIdx).toBeGreaterThan(planIdx);
+    db.close();
+  });
+
   test('memory section appended to caller systemPrompt when memories exist', () => {
     // Project local memory under workdir.
     const localDir = join(workdir, '.agent', 'memory', 'local');

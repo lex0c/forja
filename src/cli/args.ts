@@ -161,10 +161,19 @@ export interface ParsedArgs {
   // muscle memory (`git init`, `npm init`, `cargo init`). When
   // set, the parser stops collecting prompt fragments and
   // accepts only the init-specific sub-flags (`--force`,
-  // `--mode`). Mutually exclusive with --json (init is
-  // operator-facing, not scriptable yet) and every other run
-  // mode; the dispatcher checks.
-  init?: { force: boolean; mode: 'strict' | 'acceptEdits' };
+  // `--mode`, `--playbooks`). Mutually exclusive with --json
+  // (init is operator-facing, not scriptable yet) and every
+  // other run mode; the dispatcher checks.
+  //
+  // `playbooks` switches the handler to the alternate path
+  // (`PLAYBOOKS.md` §14): instead of writing
+  // `.agent/permissions.yaml`, the handler writes the canonical
+  // .md playbooks under `.agent/agents/`. Mode is irrelevant on
+  // that path (mode is a permissions concept) and gets ignored
+  // by the handler. Force still gates overwrites — shared with
+  // the permissions path so the operator does not have to
+  // remember per-flag semantics.
+  init?: { force: boolean; mode: 'strict' | 'acceptEdits'; playbooks: boolean };
 }
 
 export interface ParseError {
@@ -188,6 +197,7 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
   if (argv.length === 0 || argv[0] !== 'init') return null;
   let force = false;
   let mode: 'strict' | 'acceptEdits' = 'strict';
+  let playbooks = false;
   let i = 1;
   while (i < argv.length) {
     const token = argv[i];
@@ -197,6 +207,18 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
     }
     if (token === '--force') {
       force = true;
+      i += 1;
+      continue;
+    }
+    if (token === '--playbooks') {
+      // Switches init to the canonical-playbooks path
+      // (`PLAYBOOKS.md` §14). Mutually compatible with --force;
+      // --mode is ignored on this path and silently dropped (the
+      // handler does not consult it). Erroring on the
+      // combination would be operator-hostile — the muscle
+      // memory `agent init --mode strict --playbooks` should
+      // just work.
+      playbooks = true;
       i += 1;
       continue;
     }
@@ -246,7 +268,7 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
       listSessions: false,
       includeSubagents: false,
       yes: false,
-      init: { force, mode },
+      init: { force, mode, playbooks },
     },
   };
 };
@@ -693,9 +715,11 @@ export const usage = (): string =>
   [
     'Usage: agent [options] <prompt>',
     '       agent init [--force] [--mode strict|acceptEdits]',
+    '       agent init --playbooks [--force]',
     '',
     'Subcommands:',
     '  init                   Scaffold .agent/permissions.yaml (refuse-on-exists; --force overwrites)',
+    '  init --playbooks       Copy the 10 canonical playbooks to .agent/agents/ (skip-if-exists; --force overwrites)',
     '',
     'Options:',
     '  --version, -v          Print version and exit',

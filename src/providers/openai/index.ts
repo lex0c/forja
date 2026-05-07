@@ -180,6 +180,17 @@ export const createOpenAIProvider = (
     }
     if (req.tools !== undefined) params.tools = toOpenAITools(req.tools);
     if (req.temperature !== undefined) params.temperature = req.temperature;
+    if (req.top_p !== undefined) params.top_p = req.top_p;
+    // `thinking_budget` is intentionally NOT forwarded here.
+    // OpenAI's reasoning surface (`reasoning.effort`:
+    // low|medium|high) takes a coarse string, not a token count
+    // — mapping a budget integer onto it would be a guess. The
+    // request stays silent on reasoning when the playbook
+    // declared a budget; the model uses its default. A future
+    // slice that adds a `reasoning.effort` override to
+    // `PLAYBOOKS.md` §1.1 sampling is the right place to wire
+    // this — until then, dropping the field preserves intent
+    // (no guess) over crude mapping.
     if (req.stop_sequences !== undefined) params.stop = req.stop_sequences;
 
     const stream = (await client.chat.completions.create(
