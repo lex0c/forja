@@ -47,16 +47,19 @@ describe('renderEnvironmentSection', () => {
         untracked: 0,
         ahead: 0,
         behind: 0,
-        recentCommits: ['abc123 first commit', 'def456 second commit'],
       },
     });
     expect(out).toContain('## Git');
     expect(out).toContain('branch: `feat/m4-context-tuning`');
     expect(out).toContain('status: clean');
     expect(out).toContain('upstream: in sync');
-    expect(out).toContain('recent commits:');
-    expect(out).toContain('abc123 first commit');
-    expect(out).toContain('def456 second commit');
+    // Recent commit subjects are intentionally NOT rendered —
+    // see git-context.ts threat model. Pin the absence so a
+    // future contributor reintroducing the field doesn't
+    // silently elevate repo-controlled text into the system
+    // prompt.
+    expect(out).not.toContain('recent commits');
+    expect(out).not.toContain('recent commit');
   });
 
   test('renders dirty status when working tree has changes', () => {
@@ -66,14 +69,11 @@ describe('renderEnvironmentSection', () => {
         branch: 'develop',
         modified: 5,
         untracked: 2,
-        recentCommits: [],
       },
     });
     expect(out).toContain('status: 5 modified, 2 untracked');
     // No upstream sub-line when ahead/behind absent (no tracking branch).
     expect(out).not.toContain('upstream:');
-    // No recent-commits sub-line when array is empty.
-    expect(out).not.toContain('recent commits:');
   });
 
   test('renders ahead/behind when not in sync', () => {
@@ -85,7 +85,6 @@ describe('renderEnvironmentSection', () => {
         untracked: 0,
         ahead: 3,
         behind: 1,
-        recentCommits: [],
       },
     });
     expect(out).toContain('upstream: ahead 3, behind 1');
@@ -97,7 +96,6 @@ describe('renderEnvironmentSection', () => {
       git: {
         modified: 0,
         untracked: 0,
-        recentCommits: [],
       },
     });
     expect(out).toContain('## Git');
@@ -108,15 +106,13 @@ describe('renderEnvironmentSection', () => {
   test('omits the entire ## Git block when no sub-field renders', () => {
     // Reachable degenerate case: detached HEAD (branch=undef) +
     // failed status probe (modified/untracked=undef) + no
-    // upstream (ahead/behind=undef) + empty repo or log probe
-    // failure (recentCommits=[]). Without this guard the section
-    // would emit `## Git` with nothing under it — visually
-    // broken in the rendered prompt and confusing to the model.
+    // upstream (ahead/behind=undef). Without this guard the
+    // section would emit `## Git` with nothing under it —
+    // visually broken in the rendered prompt and confusing to
+    // the model.
     const out = renderEnvironmentSection({
       ...baseInput,
-      git: {
-        recentCommits: [],
-      },
+      git: {},
     });
     expect(out).not.toContain('## Git');
     // Env-only fields still render correctly.

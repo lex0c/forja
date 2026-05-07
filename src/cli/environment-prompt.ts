@@ -11,7 +11,10 @@ import type { GitContext } from './git-context.ts';
 //     "yesterday's commit" / "log since today" requests without
 //     a tool call)
 //   - git context (when in a repo): branch, dirty/clean, ahead/
-//     behind, last 3 commits
+//     behind. Recent commit subjects are intentionally NOT
+//     included — see `git-context.ts` for the threat model
+//     (commit messages are repo-controlled text and would
+//     elevate untrusted content to system-level context).
 //
 // All fields are stable WITHIN a session (snapshot at boot, not
 // re-probed per turn) so the section sits inside cache breakpoint
@@ -72,12 +75,6 @@ const renderGitBlock = (git: GitContext): string => {
       sub.push('- upstream: in sync');
     } else {
       sub.push(`- upstream: ahead ${git.ahead}, behind ${git.behind}`);
-    }
-  }
-  if (git.recentCommits.length > 0) {
-    sub.push('- recent commits:');
-    for (const c of git.recentCommits) {
-      sub.push(`  - ${c}`);
     }
   }
   if (sub.length === 0) return '';

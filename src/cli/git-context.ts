@@ -9,6 +9,24 @@
 // Runs synchronously at session boot via Bun.spawnSync. Each
 // probe is one git invocation; total cost ~5-15ms on a warm
 // disk. Acceptable for a once-per-session call.
+//
+// Surface scope: branch name, dirty/clean counts, and ahead/
+// behind distance. We DO NOT include recent commit subjects
+// (`git log --oneline`) because commit messages are repo-
+// controlled text — a malicious commit on a third-party fork
+// or merged PR can carry instruction-like payloads, and
+// embedding them at the TOP of the system prompt elevates
+// repo content to system-level context before the operator's
+// request lands. Same threat the AGENTS.md pointer pattern
+// avoids: project text stays lazy, accessed via tools the
+// model invokes deliberately, not eager-loaded by the
+// bootstrap. The model can run `bash git log --oneline -10`
+// on demand when commit history matters.
+//
+// Branch name is repo metadata too, but the surface is much
+// smaller (refs/heads/ char restrictions) and operator-
+// controlled at checkout time. Numeric fields (modified,
+// untracked, ahead, behind) carry zero injection surface.
 
 export interface GitContext {
   // Current branch, e.g. "feat/m4-context-tuning". Falls back
@@ -24,10 +42,6 @@ export interface GitContext {
   // Both undefined when the branch has no upstream.
   ahead?: number;
   behind?: number;
-  // Last few commits as `<short_sha> <subject>` lines. Capped
-  // at 3 entries to keep the env block compact. Empty array
-  // on probe failure or empty repo.
-  recentCommits: string[];
 }
 
 const runGit = (cwd: string, args: string[]): string | null => {
@@ -88,19 +102,14 @@ const probeAheadBehind = (cwd: string): { ahead: number; behind: number } | unde
   return { behind: parts[0] ?? 0, ahead: parts[1] ?? 0 };
 };
 
-const probeRecentCommits = (cwd: string): string[] => {
-  // `--oneline` gives `<short_sha> <subject>` per line.
-  // Cap at 3 — enough for context ("what was the last thing
-  // we shipped") without ballooning the env block.
-  const out = runGit(cwd, ['log', '--oneline', '-3']);
-  if (out === null || out.length === 0) return [];
-  return out.split('\n').filter((l) => l.length > 0);
-};
-
-// Probe all four fields. Returns null when the cwd is not a git
-// repo (probed via the branch lookup — `rev-parse` fails outside
-// a repo). The env-prompt composer treats null as "skip the git
-// block entirely".
+// Probe the env-relevant fields. Returns null when the cwd is
+// not a git repo (probed via `rev-parse --is-inside-work-tree`
+// — fails outside a repo). The env-prompt composer treats null
+// as "skip the git block entirely".
+//
+// `git log` is intentionally NOT probed here — see the module
+// docstring above for the threat model that motivates that
+// omission.
 export const probeGitContext = (cwd: string): GitContext | null => {
   // Use rev-parse --is-inside-work-tree as the cheap "is this a
   // git repo" probe. Returns "true" when inside, fails otherwise.
@@ -109,11 +118,9 @@ export const probeGitContext = (cwd: string): GitContext | null => {
   const branch = probeBranch(cwd);
   const status = probeStatus(cwd);
   const aheadBehind = probeAheadBehind(cwd);
-  const recentCommits = probeRecentCommits(cwd);
   return {
     ...(branch !== undefined ? { branch } : {}),
     ...(status !== undefined ? { modified: status.modified, untracked: status.untracked } : {}),
     ...(aheadBehind !== undefined ? aheadBehind : {}),
-    recentCommits,
   };
 };
