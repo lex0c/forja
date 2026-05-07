@@ -433,12 +433,13 @@ Body.`,
     db.close();
   });
 
-  test('memory section composes after the parallelism hint when no caller prompt and memories exist', () => {
-    // Post-D227 ordering: parallelism hint (background framing)
-    // FIRST, then user/plan prompt (none here), then memory
-    // section (project context). A fresh resume reading the
-    // prompt sees parallelism guidance up front; memories sit
-    // after as project-specific context.
+  test('response-format hint sits OUTERMOST, then parallelism, then memory', () => {
+    // Layered prompt ordering (bootstrap.ts comment): response
+    // format FIRST (render target — applies to every section),
+    // then parallelism (concurrency mechanics), then user/plan,
+    // then memory. A fresh resume reading the prompt sees the
+    // surface contract up front so every downstream layer's
+    // output respects it.
     const localDir = join(workdir, '.agent', 'memory', 'local');
     mkdirSync(localDir, { recursive: true });
     writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — TS dev\n');
@@ -451,8 +452,13 @@ Body.`,
       userPolicyPath: null,
     });
     expect(config.systemPrompt).toBeDefined();
-    expect(config.systemPrompt?.startsWith('# Parallelism')).toBe(true);
-    expect(config.systemPrompt).toContain('# Memory');
+    expect(config.systemPrompt?.startsWith('# Response surface')).toBe(true);
+    const responseIdx = config.systemPrompt?.indexOf('# Response surface') ?? -1;
+    const parallelIdx = config.systemPrompt?.indexOf('# Parallelism') ?? -1;
+    const memoryIdx = config.systemPrompt?.indexOf('# Memory') ?? -1;
+    expect(responseIdx).toBe(0);
+    expect(parallelIdx).toBeGreaterThan(responseIdx);
+    expect(memoryIdx).toBeGreaterThan(parallelIdx);
     db.close();
   });
 
@@ -561,12 +567,13 @@ Body.`,
     db.close();
   });
 
-  test('caller systemPrompt is layered after the parallelism hint without plan', () => {
-    // Post-D227: caller prompt no longer passes through verbatim
-    // — the parallelism hint is prepended as background framing.
-    // Composition order: hint (universal) → caller prompt (more
-    // specific). The separator (\\n\\n---\\n\\n) makes the
-    // boundary visible to the model.
+  test('caller systemPrompt is layered after response-format and parallelism hints without plan', () => {
+    // Caller prompt no longer passes through verbatim — the
+    // response-format hint is the OUTERMOST layer, parallelism
+    // sits inside it, and the caller prompt is innermost.
+    // Composition order: response-format → parallel → caller.
+    // Each `\\n\\n---\\n\\n` separator makes a boundary visible
+    // to the model.
     const { config, db } = bootstrap({
       prompt: 'hi',
       cwd: workdir,
@@ -577,11 +584,17 @@ Body.`,
       systemPrompt: 'You are a senior engineer.',
     });
     expect(config.planMode).toBeUndefined();
-    expect(config.systemPrompt?.startsWith('# Parallelism')).toBe(true);
+    expect(config.systemPrompt?.startsWith('# Response surface')).toBe(true);
+    expect(config.systemPrompt).toContain('# Parallelism');
     expect(config.systemPrompt).toContain('You are a senior engineer.');
-    // The caller prompt comes AFTER the hint — the separator is
-    // load-bearing for the model to distinguish the two layers.
-    expect(config.systemPrompt).toContain('---');
+    // The caller prompt comes AFTER both hints — the separator is
+    // load-bearing for the model to distinguish the layers.
+    const responseIdx = config.systemPrompt?.indexOf('# Response surface') ?? -1;
+    const parallelIdx = config.systemPrompt?.indexOf('# Parallelism') ?? -1;
+    const callerIdx = config.systemPrompt?.indexOf('You are a senior engineer.') ?? -1;
+    expect(responseIdx).toBe(0);
+    expect(parallelIdx).toBeGreaterThan(responseIdx);
+    expect(callerIdx).toBeGreaterThan(parallelIdx);
     db.close();
   });
 

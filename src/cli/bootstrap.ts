@@ -24,6 +24,7 @@ import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithParallelHint } from './parallel-prompt.ts';
 import { composeWithUserPrompt } from './plan-prompt.ts';
 import { composeWithPlaybookHint } from './playbook-prompt.ts';
+import { composeWithResponseFormat } from './response-format.ts';
 
 export const DEFAULT_MODEL = 'anthropic/claude-sonnet-4-6';
 
@@ -185,7 +186,7 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   try {
     migrate(db);
 
-    // Resolve the effective system prompt. Four layers stack
+    // Resolve the effective system prompt. Five layers stack
     // here in precedence order (most-specific to most-generic):
     //   1. Caller's user prompt (input.systemPrompt) — most
     //      specific, the operator's own framing.
@@ -200,18 +201,23 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     //      surfaces the harness's concurrency affordances
     //      (multi-tool turns, task_async family) so the
     //      capability isn't dormant.
+    //   5. Response-format hint — render-target rules
+    //      (CommonMark in monospace ANSI, file:line refs,
+    //      no-emoji default, structural padding bans) per
+    //      ANTI_PATTERNS.md §1.3 ("output format expectations
+    //      literais"). Sits OUTERMOST because it applies to
+    //      every other section's output equally.
     //
-    // Composition order: parallel hint FIRST (most general
-    // background), then playbook hint (catalogue of subagents),
-    // then plan/user (more-specific instructions). Each
+    // Composition order: response-format FIRST (most general
+    // surface contract), then parallel hint, then playbook
+    // hint, then plan/user (more-specific instructions). Each
     // `composeWith*Hint` prepends its hint to the downstream
-    // chunk it receives, so we wrap from the inside out: build
-    // the user/plan downstream first, layer playbook around it,
-    // then layer parallel around that.
+    // chunk it receives, so we wrap from the inside out.
     const baseDownstream =
       input.plan === true ? composeWithUserPrompt(input.systemPrompt) : input.systemPrompt;
     const withPlaybook = composeWithPlaybookHint(baseDownstream, subagents);
-    resolvedSystemPrompt = composeWithParallelHint(withPlaybook);
+    const withParallel = composeWithParallelHint(withPlaybook);
+    resolvedSystemPrompt = composeWithResponseFormat(withParallel);
 
     // Memory subsystem (spec MEMORY.md / §4.1). Build the registry
     // from the REPO root, not the invocation cwd: project memory
