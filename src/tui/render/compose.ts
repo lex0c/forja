@@ -31,6 +31,7 @@ import { renderModal } from './modal.ts';
 import { renderReverseSearch } from './reverse-search.ts';
 import { renderSlashPopover } from './slash-popover.ts';
 import { renderSubagentRows } from './subagent-row.ts';
+import { renderThinkingChip } from './thinking-chip.ts';
 import { renderTodoList } from './todo-list.ts';
 import { renderToolCardLive } from './tool-card.ts';
 import { wrapInputLine } from './wrap.ts';
@@ -216,11 +217,24 @@ export const composeLive: ComposeLive = (
   // active turn (the AI's own thinking).
   appendBlock(renderSubagentRows(state.subagents, caps, now));
 
-  // 2. Live "Generating…" chip. Spec §4.10.5: the assistant turn is
-  // an operation chip just like a tool call. Renders above the tool
-  // cards because the assistant is the parent operation — tool calls
-  // it spawns sit beneath it visually.
-  if (state.pendingAssistant !== null) {
+  // 2. Live "Thinking…" or "Generating…" chip. Spec §4.10.5: the
+  // assistant turn is an operation chip just like a tool call.
+  // Renders above the tool cards because the assistant is the
+  // parent operation — tool calls it spawns sit beneath it
+  // visually.
+  //
+  // Mutual exclusion: harness-adapter.ts closes `thinking:end` the
+  // moment text starts streaming (within a turn the two states
+  // alternate but never overlap). When `state.thinking` is set we
+  // show the Thinking chip — more specific signal than the generic
+  // "Generating…", and explains the otherwise-confusing 5-30s
+  // gap with no token counter visible during extended thinking.
+  // When thinking has ended and only `pendingAssistant` is set, we
+  // show the Generating chip (existing behavior preserved). When
+  // both are null, the slot is empty.
+  if (state.thinking !== null) {
+    appendBlock(renderThinkingChip(state.thinking, caps, now));
+  } else if (state.pendingAssistant !== null) {
     appendBlock(renderAssistantChip(state.pendingAssistant, caps, now));
   }
 

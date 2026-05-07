@@ -174,6 +174,43 @@ describe('composeLive layout', () => {
     expect(out[3]).toBe(expectedRule(caps.cols, true));
   });
 
+  test('thinking chip replaces the generating chip while state.thinking is set', () => {
+    // Mutual exclusion contract: when both `state.thinking` and
+    // `state.pendingAssistant` are set (Anthropic emits
+    // message_start before thinking_delta arrives), the more-
+    // specific Thinking… chip wins. The Generating… chip would
+    // surface a generic "model is producing output" signal, but
+    // during the thinking pass no text streams — operator would
+    // see a frozen chip. Thinking… explains the 5-30s no-progress
+    // gap honestly.
+    const s = startedSession();
+    s.pendingAssistant = {
+      messageId: 'm1',
+      text: '',
+      startedAt: 0,
+      inputTokens: null,
+      outputTokens: null,
+      cacheRead: null,
+      cacheCreation: null,
+    };
+    s.thinking = { startedAt: 0 };
+    const out = composeLive(s, caps, 1000);
+    const joined = out.join('\n');
+    expect(joined).toContain('Thinking…');
+    expect(joined).not.toContain('Generating…');
+  });
+
+  test('thinking chip alone (no pendingAssistant) still renders', () => {
+    // Defensive case: thinking_delta arrived with no prior
+    // assistant:start (out-of-order producer, mid-stream resume).
+    // The chip should still render so the operator sees activity.
+    const s = startedSession();
+    s.thinking = { startedAt: 0 };
+    const out = composeLive(s, caps, 1000);
+    const joined = out.join('\n');
+    expect(joined).toContain('Thinking…');
+  });
+
   test('multi-line input keeps input above the trailing rule + footer', () => {
     const s = startedSession();
     s.input.value = 'a\nb';

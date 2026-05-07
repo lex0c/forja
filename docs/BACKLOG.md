@@ -15,6 +15,64 @@ Format:
 
 ---
 
+## [2026-05-07] TUI thinking chip (closes the second silent UX promise)
+
+Same shape as the AGENTS.md gap closed earlier today: spec
+documents a UI surface, code carries the state and the events,
+but the renderer never paints it. `TOKEN_TUNING.md §4.3` says:
+
+> UI mostra `thinking... (Xs, $Y)` na status line durante reasoning ativo
+
+The harness adapter emits `thinking:start` / `thinking:delta` /
+`thinking:end` from Anthropic's `thinking_delta` stream events
+(`harness-adapter.ts:258-265`). The reducer holds
+`state.thinking = { startedAt }` between start and end
+(`state.ts:657-665`). But the only render-side consumers were
+`footer.ts:27` (contributes to `isRunning` for the "esc to
+interrupt" cue) and `renderer.ts:390` (contributes to the
+heartbeat keep-alive). No chip, no label.
+
+Operators using extended thinking (Anthropic Opus, OpenAI o-
+series) saw a frozen "Generating…" chip with no token counter
+during the 5-30s thinking pass and had no way to tell whether
+the model was reasoning or the run was hung. `Generating…` is
+honest about not knowing the count, but it's the wrong label
+during the thinking phase — text isn't streaming.
+
+**Done:**
+
+- `src/tui/render/thinking-chip.ts` — new module mirroring the
+  shape of `assistant-chip.ts` (same spinner, same elapsed
+  formatting). Renders `▸ Thinking… (Xs)`. Intentionally no
+  token counter — Anthropic emits cumulative usage at
+  message_stop only; the per-delta count would be invented.
+  Cost stays in the footer's right column, not duplicated.
+- `src/tui/render/compose.ts` — slot 2 (the assistant chip
+  position) now picks between `Thinking…` and `Generating…`
+  by checking `state.thinking !== null` first. Mutual
+  exclusion is honored: `harness-adapter.ts:229` already
+  closes thinking when text starts streaming, so within a
+  turn the two states alternate but never overlap.
+- `tests/tui/render/thinking-chip.test.ts` (new, 5 cases):
+  label + elapsed format, no-token-counter pin, sub-second
+  ms branch, clock-skew clamp, ASCII fallback.
+- `tests/tui/render/compose.test.ts` (2 new cases): thinking
+  chip wins over Generating chip when both states are set;
+  thinking chip alone (defensive: thinking_delta with no prior
+  assistant:start) still renders.
+
+**Verification:** `bun test` 3563 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean.
+
+**Spec posture:** none required — the spec already promised
+this surface in `TOKEN_TUNING.md §4.3`. Implementation aligns
+code to the existing spec rather than diverging from it.
+
+**Next:** branch ready to merge (m4 context tuning arc + post-
+review fixes + AGENTS.md pointer + thinking chip).
+
+---
+
 ## [2026-05-07] AGENTS.md as pointer (project_context section)
 
 The trust modal was advertising "AGENTS.md present — its
