@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
+import { DEFAULT_BUDGET } from '../harness/types.ts';
 import { projectAgentsDir, userAgentsDir } from './paths.ts';
 import type {
   ClarifyMode,
@@ -503,30 +504,37 @@ const parseSampling = (raw: unknown, sourcePath: string): SamplingOverride | und
   }
   // Cross-field check (`PLAYBOOKS.md` §1.1, Anthropic API
   // contract). When extended thinking is enabled, the budget MUST
-  // be strictly less than max_tokens — Anthropic rejects equal
-  // or greater with HTTP 400, and the equivalent Gemini path
-  // silently caps the budget. Catching at load means the author
-  // sees a source-aware error before the binary even spawns the
-  // child, instead of a 400 mid-run that reaches the operator
-  // as an opaque provider failure.
+  // be strictly less than the EFFECTIVE max_tokens — Anthropic
+  // rejects equal or greater with HTTP 400, and the equivalent
+  // Gemini path silently caps the budget. Catching at load means
+  // the author sees a source-aware error before the binary even
+  // spawns the child, instead of a 400 mid-run that reaches the
+  // operator as an opaque provider failure.
   //
-  // Only checked when BOTH fields are explicit AND thinking is
-  // active (`> 0`; budget=0 disables thinking and the adapter
-  // omits the block entirely). When max_tokens is absent the
-  // child will use the harness's `RunBudget.maxOutputTokensPerCall`
-  // default (4096); we do NOT cross-check against that here
-  // because a future runtime override could land before the
-  // provider call and the author's intent at load time is the
-  // authoritative reference for the playbook contract.
-  if (
-    out.thinkingBudget !== undefined &&
-    out.thinkingBudget > 0 &&
-    out.maxTokens !== undefined &&
-    out.thinkingBudget >= out.maxTokens
-  ) {
-    throw new Error(
-      `subagent ${sourcePath}: 'sampling.thinking_budget' (${out.thinkingBudget}) must be strictly less than 'sampling.max_tokens' (${out.maxTokens}) — Anthropic API rejects equal or greater with HTTP 400`,
-    );
+  // The effective cap is whichever wins at runtime: the playbook's
+  // explicit `sampling.max_tokens` if declared, otherwise the
+  // harness's `DEFAULT_BUDGET.maxOutputTokensPerCall`. Only
+  // gating on the explicit case (the previous behavior) misses
+  // the common shape `sampling: { thinking_budget: 8000 }` with
+  // no max_tokens — that passes loader validation but fails the
+  // provider mid-run because the actual request goes out with
+  // max_tokens=DEFAULT_BUDGET.maxOutputTokensPerCall and a larger
+  // budget. We import `DEFAULT_BUDGET` directly so a future bump
+  // to the harness default automatically rebases this gate.
+  if (out.thinkingBudget !== undefined && out.thinkingBudget > 0) {
+    const effectiveMaxTokens = out.maxTokens ?? DEFAULT_BUDGET.maxOutputTokensPerCall;
+    if (out.thinkingBudget >= effectiveMaxTokens) {
+      // Distinct messages for explicit-vs-defaulted so the author
+      // can tell whether to raise their declared max_tokens or
+      // reduce thinking_budget under the runtime default.
+      const cause =
+        out.maxTokens !== undefined
+          ? `'sampling.max_tokens' (${out.maxTokens})`
+          : `the runtime default max_tokens (${DEFAULT_BUDGET.maxOutputTokensPerCall}; declare 'sampling.max_tokens' explicitly to raise this cap)`;
+      throw new Error(
+        `subagent ${sourcePath}: 'sampling.thinking_budget' (${out.thinkingBudget}) must be strictly less than ${cause} — Anthropic API rejects equal or greater with HTTP 400`,
+      );
+    }
   }
   return out;
 };

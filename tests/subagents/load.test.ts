@@ -728,7 +728,7 @@ describe('playbook surface — sampling', () => {
     ).toThrow(/'sampling' must be a mapping/);
   });
 
-  test('rejects thinking_budget >= max_tokens (Anthropic 400 guard)', () => {
+  test('rejects thinking_budget >= explicit max_tokens (Anthropic 400 guard)', () => {
     // Anthropic API rejects requests where thinking.budget_tokens
     // >= max_tokens with HTTP 400. Catching at load means the
     // author sees the cause source-aware before any provider
@@ -748,6 +748,30 @@ describe('playbook surface — sampling', () => {
     }
   });
 
+  test('rejects thinking_budget >= runtime default when max_tokens omitted', () => {
+    // Regression: when sampling.max_tokens is absent, the harness
+    // uses DEFAULT_BUDGET.maxOutputTokensPerCall (4096) as the
+    // request's max_tokens. Authors who declared
+    // `thinking_budget: 8000` without an explicit max_tokens
+    // previously passed loader validation, then hit a provider
+    // 400 mid-run. The loader now rebases the cross-check against
+    // the effective cap so the failure surfaces source-aware at
+    // load time. The error message names the runtime default so
+    // the author knows whether to raise max_tokens or lower the
+    // budget.
+    const bad = [
+      'thinking_budget: 4096', // == default cap
+      'thinking_budget: 8000', // > default cap
+    ];
+    for (const line of bad) {
+      expect(() =>
+        loadSubagentFromString(withExtraFrontmatter(`sampling:\n  ${line}`), 'user', '/p'),
+      ).toThrow(
+        /'sampling\.thinking_budget' \([0-9]+\) must be strictly less than the runtime default max_tokens \(4096/,
+      );
+    }
+  });
+
   test('thinking_budget=0 escapes the cross-field check (disables thinking)', () => {
     // budget=0 means "no thinking block on the request" — the
     // adapter omits it entirely, so the cross-field constraint
@@ -761,17 +785,21 @@ describe('playbook surface — sampling', () => {
     expect(def.sampling).toEqual({ thinkingBudget: 0, maxTokens: 4096 });
   });
 
-  test('thinking_budget alone (no max_tokens) skips the cross-field check', () => {
-    // The check only fires when BOTH fields are explicit. When
-    // max_tokens is absent the harness fills it from RunBudget;
-    // the load-time check defers to runtime config rather than
-    // guess at a default.
+  test('thinking_budget below runtime default passes when max_tokens omitted', () => {
+    // Counterpart to the explicit-cap "passes" test: a budget
+    // strictly less than DEFAULT_BUDGET.maxOutputTokensPerCall
+    // is a valid runtime configuration even without declaring
+    // sampling.max_tokens. Pinning a value safely below the
+    // default ensures the loader-side check stays a positive
+    // gate, not a blanket refusal of "any thinking_budget without
+    // max_tokens".
     const def = loadSubagentFromString(
-      withExtraFrontmatter('sampling:\n  thinking_budget: 4096'),
+      withExtraFrontmatter('sampling:\n  thinking_budget: 2000'),
       'user',
       '/p',
     );
-    expect(def.sampling?.thinkingBudget).toBe(4096);
+    expect(def.sampling?.thinkingBudget).toBe(2000);
+    expect(def.sampling?.maxTokens).toBeUndefined();
   });
 
   test('thinking_budget < max_tokens passes', () => {
