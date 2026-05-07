@@ -868,20 +868,21 @@ describe('playbook surface — sampling', () => {
     }
   });
 
-  test('rejects thinking_budget >= runtime default when max_tokens omitted', () => {
-    // Regression: when sampling.max_tokens is absent, the harness
-    // uses DEFAULT_BUDGET.maxOutputTokensPerCall (4096) as the
-    // request's max_tokens. Authors who declared
-    // `thinking_budget: 8000` without an explicit max_tokens
-    // previously passed loader validation, then hit a provider
-    // 400 mid-run. The loader now rebases the cross-check against
-    // the effective cap so the failure surfaces source-aware at
-    // load time. The error message names the runtime default so
-    // the author knows whether to raise max_tokens or lower the
-    // budget.
+  test('rejects thinking_budget >= load-time floor when max_tokens omitted', () => {
+    // Regression: when sampling.max_tokens is absent, the loader
+    // gates against `LOAD_TIME_OUTPUT_TOKENS_FLOOR` (4096) — a
+    // conservative best-effort floor used because the runtime
+    // model is not in scope at load time. The harness's runtime
+    // resolver clamps against the real provider capability cap,
+    // which can be much larger (Claude 4.x advertises 64k); the
+    // load-time floor stays small so authors get a source-aware
+    // error before mid-run provider 400s on small-cap models.
+    // Authors who declared `thinking_budget: 8000` without an
+    // explicit max_tokens trip this gate and must declare
+    // `sampling.max_tokens` to raise the bound.
     const bad = [
-      'thinking_budget: 4096', // == default cap
-      'thinking_budget: 8000', // > default cap
+      'thinking_budget: 4096', // == load-time floor
+      'thinking_budget: 8000', // > load-time floor
     ];
     for (const line of bad) {
       expect(() =>
@@ -905,12 +906,12 @@ describe('playbook surface — sampling', () => {
     expect(def.sampling).toEqual({ thinkingBudget: 0, maxTokens: 4096 });
   });
 
-  test('thinking_budget below runtime default passes when max_tokens omitted', () => {
+  test('thinking_budget below load-time floor passes when max_tokens omitted', () => {
     // Counterpart to the explicit-cap "passes" test: a budget
-    // strictly less than DEFAULT_BUDGET.maxOutputTokensPerCall
-    // is a valid runtime configuration even without declaring
+    // strictly less than `LOAD_TIME_OUTPUT_TOKENS_FLOOR` is a
+    // valid configuration even without declaring
     // sampling.max_tokens. Pinning a value safely below the
-    // default ensures the loader-side check stays a positive
+    // floor ensures the loader-side check stays a positive
     // gate, not a blanket refusal of "any thinking_budget without
     // max_tokens".
     const def = loadSubagentFromString(

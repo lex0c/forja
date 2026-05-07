@@ -286,9 +286,18 @@ export interface RunBudget {
   // Sliding window: if `maxRepeatedToolHash` of the last 5 tool calls hash
   // identically, abort with `degenerate_loop`.
   maxRepeatedToolHash: number;
-  // Cap on output tokens per provider call (passed straight through as
-  // `max_tokens`). Not part of session-wide budget.
-  maxOutputTokensPerCall: number;
+  // Optional ceiling on output tokens per provider call. When set,
+  // the harness clamps the per-request `max_tokens` to
+  // `min(maxOutputTokensPerCall, provider.capabilities.output_max_tokens)`.
+  // When unset (the default), the harness uses the provider's
+  // declared capability ceiling — no silent 4096 truncation on
+  // models that advertise a larger output window. Playbooks declare
+  // `sampling.max_tokens` to take an explicit override; that flows
+  // in via this field and is still clamped to the capability cap so
+  // an over-declared playbook can't bypass the provider's hard
+  // limit. Never part of session-wide budget — this is a per-call
+  // shaping knob, not a cumulative tally.
+  maxOutputTokensPerCall?: number;
   // Fraction of `provider.capabilities.context_window` at which the
   // harness triggers compaction. AGENTIC_CLI §6 / ORCHESTRATION §4.1
   // recommend 0.7 — leaves 30% headroom for the compaction call
@@ -347,11 +356,41 @@ export const DEFAULT_BUDGET: RunBudget = {
   maxWallClockMs: 10 * 60 * 1000,
   maxToolErrors: 5,
   maxRepeatedToolHash: 3,
-  maxOutputTokensPerCall: 4096,
+  // `maxOutputTokensPerCall` intentionally unset — runtime resolves
+  // against the provider capability via `resolveMaxOutputTokens`.
   compactionThreshold: 0.7,
   compactionPreserveTail: 3,
   maxConcurrentToolCalls: 5,
   maxConcurrentSubagents: 3,
+};
+
+// Conservative best-effort floor used by load-time validation that
+// has no provider in scope (e.g. playbook frontmatter cross-checks
+// where `sampling.thinking_budget` must be strictly less than the
+// effective `max_tokens`). The runtime resolver clamps against the
+// real `provider.capabilities.output_max_tokens`; this constant
+// exists so authors get a source-aware error at load time even
+// before the model is selected. Kept at 4096 because that was the
+// historical runtime default — raising it would silently widen the
+// gate and let invalid `thinking_budget` values pass loader, then
+// fail mid-run on smaller-cap providers.
+export const LOAD_TIME_OUTPUT_TOKENS_FLOOR = 4096;
+
+// Resolve the effective `max_tokens` for a provider request:
+//   - explicit budget override clamps to the capability ceiling
+//   - absent override defaults to the capability ceiling
+// Centralized here so the loop, the banner, and any future call
+// site (recap, critique) share one resolution rule. Returns a
+// finite positive integer; callers can pass it directly as
+// `max_tokens`.
+export const resolveMaxOutputTokens = (
+  budget: Pick<RunBudget, 'maxOutputTokensPerCall'>,
+  capabilities: { output_max_tokens: number },
+): number => {
+  const cap = capabilities.output_max_tokens;
+  const override = budget.maxOutputTokensPerCall;
+  if (override === undefined) return cap;
+  return Math.min(override, cap);
 };
 
 // Hard cap for the parallel pool — even an explicit caller config of

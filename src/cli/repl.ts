@@ -22,7 +22,7 @@
 import { existsSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
-import { DEFAULT_BUDGET } from '../harness/types.ts';
+import { DEFAULT_BUDGET, resolveMaxOutputTokens } from '../harness/types.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
 import { stripAnsi } from '../sanitize/index.ts';
 import {
@@ -1964,7 +1964,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     version: VERSION,
     model: modelId,
     contextWindow: providerCaps.context_window,
-    maxOutputTokens: baseConfig.budget?.maxOutputTokensPerCall ?? providerCaps.output_max_tokens,
+    maxOutputTokens: resolveMaxOutputTokens(baseConfig.budget ?? DEFAULT_BUDGET, providerCaps),
     cwd: baseConfig.cwd,
     env,
   });

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { DEFAULT_BUDGET } from '../harness/types.ts';
+import { LOAD_TIME_OUTPUT_TOKENS_FLOOR } from '../harness/types.ts';
 import { projectAgentsDir, userAgentsDir } from './paths.ts';
 import { TOOL_RESTRICTION_SHAPE } from './restrictions.ts';
 import type {
@@ -573,17 +573,19 @@ const parseSampling = (raw: unknown, sourcePath: string): SamplingOverride | und
   // operator as an opaque provider failure.
   //
   // The effective cap is whichever wins at runtime: the playbook's
-  // explicit `sampling.max_tokens` if declared, otherwise the
-  // harness's `DEFAULT_BUDGET.maxOutputTokensPerCall`. Only
-  // gating on the explicit case (the previous behavior) misses
-  // the common shape `sampling: { thinking_budget: 8000 }` with
-  // no max_tokens — that passes loader validation but fails the
-  // provider mid-run because the actual request goes out with
-  // max_tokens=DEFAULT_BUDGET.maxOutputTokensPerCall and a larger
-  // budget. We import `DEFAULT_BUDGET` directly so a future bump
-  // to the harness default automatically rebases this gate.
+  // explicit `sampling.max_tokens` if declared, otherwise a
+  // conservative best-effort floor from the harness types layer.
+  // The runtime resolver clamps against the real provider
+  // capability ceiling (which can be much larger than 4096 — Claude
+  // 4.x ships 64k); the load-time gate uses the floor because the
+  // playbook's runtime model is not in scope here. Authors who
+  // declare `thinking_budget: 8000` without an explicit max_tokens
+  // hit this gate even on a model whose runtime cap would have
+  // accommodated them — the trade-off favors source-aware errors
+  // over mid-run provider 400s, and the fix is to declare
+  // `sampling.max_tokens` explicitly.
   if (out.thinkingBudget !== undefined && out.thinkingBudget > 0) {
-    const effectiveMaxTokens = out.maxTokens ?? DEFAULT_BUDGET.maxOutputTokensPerCall;
+    const effectiveMaxTokens = out.maxTokens ?? LOAD_TIME_OUTPUT_TOKENS_FLOOR;
     if (out.thinkingBudget >= effectiveMaxTokens) {
       // Distinct messages for explicit-vs-defaulted so the author
       // can tell whether to raise their declared max_tokens or
@@ -591,7 +593,7 @@ const parseSampling = (raw: unknown, sourcePath: string): SamplingOverride | und
       const cause =
         out.maxTokens !== undefined
           ? `'sampling.max_tokens' (${out.maxTokens})`
-          : `the runtime default max_tokens (${DEFAULT_BUDGET.maxOutputTokensPerCall}; declare 'sampling.max_tokens' explicitly to raise this cap)`;
+          : `the runtime default max_tokens (${LOAD_TIME_OUTPUT_TOKENS_FLOOR}; declare 'sampling.max_tokens' explicitly to raise this cap)`;
       throw new Error(
         `subagent ${sourcePath}: 'sampling.thinking_budget' (${out.thinkingBudget}) must be strictly less than ${cause} — Anthropic API rejects equal or greater with HTTP 400`,
       );

@@ -52,6 +52,7 @@ import {
   MAX_CONCURRENT_SUBAGENTS_CAP,
   MAX_CONCURRENT_TOOL_CALLS_CAP,
   type RunBudget,
+  resolveMaxOutputTokens,
 } from './types.ts';
 
 type TerminalSessionStatus = 'done' | 'interrupted' | 'exhausted' | 'error';
@@ -1395,13 +1396,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         steps += 1;
         safeEmit(config.onEvent, { type: 'step_start', stepN: steps });
 
+        const resolvedMaxTokens = resolveMaxOutputTokens(budget, config.provider.capabilities);
         const req: GenerateRequest = {
           model: config.provider.id,
           // Snapshot the running message list so post-call mutations (the next
           // iteration appends assistant + tool_results) don't retroactively
           // change what the provider observed.
           messages: [...messages],
-          max_tokens: budget.maxOutputTokensPerCall,
+          max_tokens: resolvedMaxTokens,
           ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
           ...(tools.length > 0 ? { tools } : {}),
           ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
@@ -1559,7 +1561,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           if (collected.stop_reason === 'max_tokens') {
             return await finish(
               'maxOutputTokens',
-              `provider truncated at max_tokens (cap=${budget.maxOutputTokensPerCall})`,
+              `provider truncated at max_tokens (cap=${resolvedMaxTokens})`,
             );
           }
           return await finish('done');

@@ -15,6 +15,107 @@ Format:
 
 ---
 
+## [2026-05-07] m4 context tuning — kickoff (cache + output cap + cost cap + compaction prompt)
+
+Branch `feat/m4-context-tuning` off `develop`. Four-slice
+subsystem cut against the gap between the long-turn capability
+the harness already has (loop, parallel, subagents, plan mode,
+playbooks) and the context-engine debt that makes long sessions
+overpay and re-investigate. Every slice aligns code to spec
+that was already written; no spec divergence, no pre-blocking
+spec PR.
+
+**Scope per slice:**
+
+- **Slice A — output token resolver.** `DEFAULT_BUDGET.maxOutputTokensPerCall`
+  is hardcoded `4096`. `TOKEN_TUNING.md §2.1` already declares
+  the per-workflow overrides (compaction 8192, critique 512,
+  tool-only 1024, playbook-specific) AND `capabilities.output_max_tokens`
+  is declared per model (Anthropic Claude 4.x: 64k). The slice
+  resolves `req.max_tokens` as `min(budget.maxOutputTokensPerCall,
+  capabilities.output_max_tokens)` with explicit override hooks
+  for compaction/critique paths, and surfaces the resolution at
+  the loop boundary so audit captures the chosen value. Closes
+  the silent-truncation failure mode in long responses (plans,
+  multi-file diffs, audit reports).
+
+- **Slice B — Anthropic prompt cache breakpoints wired.**
+  `capabilities.ts:6` declares `cache: 'server_5min'` and the
+  cost model already separates `cost_per_1k_cached_input`
+  (0.10× input) from `cost_per_1k_cache_write` (1.25× input).
+  Stream parser at `stream.ts:8-11` already tracks
+  `cache_creation_input_tokens` / `cache_read_input_tokens` in
+  usage. The provider call in `anthropic/index.ts:73-105` does
+  not attach `cache_control` anywhere. Slice anchors the four
+  breakpoints `CONTEXT_TUNING.md §3.1` declares — after
+  `[system]`, after `[tool_schemas]`, after `[project_context]`
+  (when present), after `[memory_index]` (when present) — with
+  the conversation-tail breakpoint placed BEFORE the current
+  turn (not on it) so cache survives the next turn instead of
+  invalidating every step. Cost telemetry validates the
+  expected ~70% input reduction after the first hit.
+
+- **Slice C — `maxCostUsd` as primary budget gate.** `AGENTIC_CLI.md
+  §5` line 333 declares `maxCostUsd: number  // default 5`. Code
+  has `maxCostUsd?: number` optional with no default — a direct
+  spec/code divergence that has been carried since M2 budget.
+  Slice promotes the cap to required-with-default, raises
+  `maxSteps` from 50 to 200 (backstop semantic per §5), and
+  documents the intent: cost cap is the engagement gate; step
+  cap is the runaway-loop guard. Loop already enforces both
+  paths (`loop.ts:803-833`); this is a default-tightening +
+  spec-alignment slice, not new mechanism.
+
+- **Slice D — structured compaction prompt.** `compaction.ts:80`
+  uses a freeform "be precise" instruction. Long sessions lose
+  decisions and file-touch history through the LLM summary
+  smear. Slice restructures the prompt to require named
+  sections — `## Decisões`, `## Arquivos tocados`, `## Erros e
+  como contornados`, `## Em aberto` — so the resumed context
+  carries the load-bearing facts as discrete claims, not narrative
+  prose. Mitigation, not full Recap M4.1 (which is a separate
+  branch). `compactionPreserveTail` stays at 3 — the slice does
+  not bump the tail because per-section preservation reduces
+  the pressure on literal trailing turns.
+
+**Sequencing:** A → B → C → D in the same branch. C benefits
+from B's cost reduction (cap of $5 only stings if a session
+overpays input on every turn); D is independent of A-C but
+keeps the branch as one cohesive context-engine cut.
+
+**Why one branch:** all four slices live in the seam between
+`src/harness/` (budget, compaction) and `src/providers/anthropic/`
+(stream, cache_control). Splitting would create stacked PRs
+with shared test infrastructure (cache hit accounting,
+cost-budget integration tests). Aligns with the branch-strategy
+rule for same-subsystem slices.
+
+**Spec posture:** zero divergence. Each slice closes a
+documented mechanism that was specified but not implemented.
+Slice D may add a 1-paragraph clarification to
+`CONTEXT_TUNING.md` describing the structured-section contract;
+not a divergence, a refinement.
+
+**Eval / verification per slice:**
+
+- A: unit test on the resolver + smoke with a forced long
+  output (over 4k tokens) verifying no silent truncation.
+- B: stream-shape unit tests (cache_control attached at the
+  declared breakpoints) + a session-replay test asserting the
+  second turn carries `cache_read_input_tokens > 0`.
+- C: budget unit tests for the new default + a smoke that
+  configures `maxCostUsd: 0.001` and verifies clean
+  `exhausted` exit.
+- D: compaction unit test asserting the four sections render
+  in the summary block + smoke that runs >30 turns and
+  inspects the post-compaction state for section presence.
+
+**Pending:** all four slices. Implementation starts with A.
+
+**Next:** Slice A — output token resolver. Same branch.
+
+---
+
 ## [2026-05-07] playbooks — hardening pass after the slices 1-10 cut
 
 41-commit cleanup pass against `feat/playbooks` after the
