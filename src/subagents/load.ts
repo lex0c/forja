@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { LOAD_TIME_OUTPUT_TOKENS_FLOOR } from '../harness/types.ts';
 import { projectAgentsDir, userAgentsDir } from './paths.ts';
 import { TOOL_RESTRICTION_SHAPE } from './restrictions.ts';
 import type {
@@ -563,41 +562,42 @@ const parseSampling = (raw: unknown, sourcePath: string): SamplingOverride | und
     }
     out.seedInEval = r.seed_in_eval;
   }
-  // Cross-field check (`PLAYBOOKS.md` §1.1, Anthropic API
-  // contract). When extended thinking is enabled, the budget MUST
-  // be strictly less than the EFFECTIVE max_tokens — Anthropic
-  // rejects equal or greater with HTTP 400, and the equivalent
-  // Gemini path silently caps the budget. Catching at load means
-  // the author sees a source-aware error before the binary even
-  // spawns the child, instead of a 400 mid-run that reaches the
-  // operator as an opaque provider failure.
+  // Cross-field check (`PLAYBOOKS.md` §1.1). When extended
+  // thinking is enabled, the budget MUST be strictly less than
+  // the effective max_tokens — providers reject equal-or-greater
+  // pairs (Anthropic 400s with an explicit error; Gemini
+  // silently caps the budget; OpenAI's reasoning models have
+  // their own internal accounting that misbehaves). We gate ONLY
+  // on the pair of explicitly-declared values
+  // (`sampling.thinking_budget` + `sampling.max_tokens`); when
+  // the playbook omits `sampling.max_tokens`, the runtime
+  // resolver picks `provider.capabilities.output_max_tokens`
+  // (e.g. 64k on Claude 4.x) and the provider adapter
+  // (`providers/anthropic/index.ts` for the model the playbook
+  // actually runs against) re-runs the cross-check against the
+  // resolved value before sending the request. A loader-side
+  // floor against a conservative constant (4096 in earlier
+  // slices) was rejecting playbooks like `thinking_budget: 8000`
+  // with no explicit `max_tokens` even though the actual request
+  // would be valid on any model whose capability cap exceeds
+  // 8000 — undermining the runtime-capability resolution. The
+  // runtime adapter check is the source of truth; the loader
+  // limits itself to what it can honestly verify with the values
+  // in front of it.
   //
-  // The effective cap is whichever wins at runtime: the playbook's
-  // explicit `sampling.max_tokens` if declared, otherwise a
-  // conservative best-effort floor from the harness types layer.
-  // The runtime resolver clamps against the real provider
-  // capability ceiling (which can be much larger than 4096 — Claude
-  // 4.x ships 64k); the load-time gate uses the floor because the
-  // playbook's runtime model is not in scope here. Authors who
-  // declare `thinking_budget: 8000` without an explicit max_tokens
-  // hit this gate even on a model whose runtime cap would have
-  // accommodated them — the trade-off favors source-aware errors
-  // over mid-run provider 400s, and the fix is to declare
-  // `sampling.max_tokens` explicitly.
-  if (out.thinkingBudget !== undefined && out.thinkingBudget > 0) {
-    const effectiveMaxTokens = out.maxTokens ?? LOAD_TIME_OUTPUT_TOKENS_FLOOR;
-    if (out.thinkingBudget >= effectiveMaxTokens) {
-      // Distinct messages for explicit-vs-defaulted so the author
-      // can tell whether to raise their declared max_tokens or
-      // reduce thinking_budget under the runtime default.
-      const cause =
-        out.maxTokens !== undefined
-          ? `'sampling.max_tokens' (${out.maxTokens})`
-          : `the runtime default max_tokens (${LOAD_TIME_OUTPUT_TOKENS_FLOOR}; declare 'sampling.max_tokens' explicitly to raise this cap)`;
-      throw new Error(
-        `subagent ${sourcePath}: 'sampling.thinking_budget' (${out.thinkingBudget}) must be strictly less than ${cause} — Anthropic API rejects equal or greater with HTTP 400`,
-      );
-    }
+  // Error message stays provider-neutral on purpose: a playbook
+  // is portable across providers, so naming a single vendor's
+  // failure mode would mislead operators running against other
+  // backends.
+  if (
+    out.thinkingBudget !== undefined &&
+    out.thinkingBudget > 0 &&
+    out.maxTokens !== undefined &&
+    out.thinkingBudget >= out.maxTokens
+  ) {
+    throw new Error(
+      `subagent ${sourcePath}: 'sampling.thinking_budget' (${out.thinkingBudget}) must be strictly less than 'sampling.max_tokens' (${out.maxTokens}) — providers reject equal-or-greater pairs (Anthropic 400s; Gemini silently caps the budget)`,
+    );
   }
   return out;
 };

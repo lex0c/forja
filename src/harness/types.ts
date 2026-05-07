@@ -383,18 +383,6 @@ export const DEFAULT_BUDGET: RunBudget = {
   maxConcurrentSubagents: 3,
 };
 
-// Conservative best-effort floor used by load-time validation that
-// has no provider in scope (e.g. playbook frontmatter cross-checks
-// where `sampling.thinking_budget` must be strictly less than the
-// effective `max_tokens`). The runtime resolver clamps against the
-// real `provider.capabilities.output_max_tokens`; this constant
-// exists so authors get a source-aware error at load time even
-// before the model is selected. Kept at 4096 because that was the
-// historical runtime default — raising it would silently widen the
-// gate and let invalid `thinking_budget` values pass loader, then
-// fail mid-run on smaller-cap providers.
-export const LOAD_TIME_OUTPUT_TOKENS_FLOOR = 4096;
-
 // Resolve the effective `max_tokens` for a provider request:
 //   - explicit budget override clamps to the capability ceiling
 //   - absent override defaults to the capability ceiling

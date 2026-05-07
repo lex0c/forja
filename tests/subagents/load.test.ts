@@ -848,12 +848,13 @@ describe('playbook surface — sampling', () => {
     ).toThrow(/'sampling' must be a mapping/);
   });
 
-  test('rejects thinking_budget >= explicit max_tokens (Anthropic 400 guard)', () => {
-    // Anthropic API rejects requests where thinking.budget_tokens
-    // >= max_tokens with HTTP 400. Catching at load means the
-    // author sees the cause source-aware before any provider
-    // call. The pre-fix canonical playbooks `threat-model.md`
-    // and `perf-investigate.md` both shipped with `4096 == 4096`
+  test('rejects thinking_budget >= explicit max_tokens (provider compatibility guard)', () => {
+    // Providers reject thinking_budget >= max_tokens —
+    // Anthropic 400s explicitly, Gemini silently caps the
+    // budget. Catching at load means the author sees the cause
+    // source-aware before any provider call. The pre-fix
+    // canonical playbooks `threat-model.md` and
+    // `perf-investigate.md` both shipped with `4096 == 4096`
     // and would have failed mid-run.
     const bad = [
       'thinking_budget: 4096\n  max_tokens: 4096',
@@ -868,28 +869,42 @@ describe('playbook surface — sampling', () => {
     }
   });
 
-  test('rejects thinking_budget >= load-time floor when max_tokens omitted', () => {
-    // Regression: when sampling.max_tokens is absent, the loader
-    // gates against `LOAD_TIME_OUTPUT_TOKENS_FLOOR` (4096) — a
-    // conservative best-effort floor used because the runtime
-    // model is not in scope at load time. The harness's runtime
-    // resolver clamps against the real provider capability cap,
-    // which can be much larger (Claude 4.x advertises 64k); the
-    // load-time floor stays small so authors get a source-aware
-    // error before mid-run provider 400s on small-cap models.
-    // Authors who declared `thinking_budget: 8000` without an
-    // explicit max_tokens trip this gate and must declare
-    // `sampling.max_tokens` to raise the bound.
-    const bad = [
-      'thinking_budget: 4096', // == load-time floor
-      'thinking_budget: 8000', // > load-time floor
-    ];
-    for (const line of bad) {
-      expect(() =>
-        loadSubagentFromString(withExtraFrontmatter(`sampling:\n  ${line}`), 'user', '/p'),
-      ).toThrow(
-        /'sampling\.thinking_budget' \([0-9]+\) must be strictly less than the runtime default max_tokens \(4096/,
+  test('rejection message is provider-neutral (playbooks are portable across backends)', () => {
+    // The error must NOT mention a single vendor's failure mode
+    // — a playbook can run against Anthropic, Gemini, OpenAI,
+    // or a local model. An error that says only "Anthropic 400s"
+    // misleads operators running against other backends.
+    expect(() =>
+      loadSubagentFromString(
+        withExtraFrontmatter('sampling:\n  thinking_budget: 5000\n  max_tokens: 4096'),
+        'user',
+        '/p',
+      ),
+    ).toThrow(/Gemini/);
+  });
+
+  test('thinking_budget without explicit max_tokens loads cleanly (runtime validates)', () => {
+    // The loader does NOT gate against a fixed floor when
+    // `sampling.max_tokens` is omitted. Earlier slices used a
+    // 4096 floor that rejected `thinking_budget: 8000` even on
+    // models whose runtime capability cap (e.g. Claude 4.x's
+    // 64k) would have accommodated it — undermining the runtime
+    // resolver's job of picking the real cap. The Anthropic
+    // adapter (`providers/anthropic/index.ts`) re-runs the
+    // cross-check against the runtime-resolved max_tokens
+    // before sending the request, so an actually-invalid pair
+    // still fails source-aware before the API call leaves the
+    // binary; the loader only enforces what it can verify with
+    // the values in front of it.
+    const cases = ['thinking_budget: 4096', 'thinking_budget: 8000', 'thinking_budget: 50000'];
+    for (const line of cases) {
+      const def = loadSubagentFromString(
+        withExtraFrontmatter(`sampling:\n  ${line}`),
+        'user',
+        '/p',
       );
+      expect(def.sampling?.thinkingBudget).toBeGreaterThan(0);
+      expect(def.sampling?.maxTokens).toBeUndefined();
     }
   });
 
@@ -906,14 +921,29 @@ describe('playbook surface — sampling', () => {
     expect(def.sampling).toEqual({ thinkingBudget: 0, maxTokens: 4096 });
   });
 
-  test('thinking_budget below load-time floor passes when max_tokens omitted', () => {
-    // Counterpart to the explicit-cap "passes" test: a budget
-    // strictly less than `LOAD_TIME_OUTPUT_TOKENS_FLOOR` is a
-    // valid configuration even without declaring
-    // sampling.max_tokens. Pinning a value safely below the
-    // floor ensures the loader-side check stays a positive
-    // gate, not a blanket refusal of "any thinking_budget without
-    // max_tokens".
+  test('thinking_budget=0 without max_tokens loads cleanly (disable idiom in minimal shape)', () => {
+    // Pin the disable-idiom case where max_tokens is also
+    // omitted. The gate's `> 0` short-circuit must fire BEFORE
+    // the `maxTokens !== undefined` check; if a regression
+    // swapped the conditions or relaxed `> 0` to `>= 0`,
+    // budget=0 alone would surface a confusing error about
+    // missing max_tokens. Pinning so the disable idiom keeps
+    // working in the minimal shape.
+    const def = loadSubagentFromString(
+      withExtraFrontmatter('sampling:\n  thinking_budget: 0'),
+      'user',
+      '/p',
+    );
+    expect(def.sampling?.thinkingBudget).toBe(0);
+    expect(def.sampling?.maxTokens).toBeUndefined();
+  });
+
+  test('thinking_budget without max_tokens loads even at small values (positive gate, not blanket refusal)', () => {
+    // Counterpart to the explicit-cap "passes" test. After
+    // dropping the loader floor, a small thinking_budget without
+    // max_tokens still loads cleanly — pinned to confirm the
+    // loader doesn't accidentally refuse the no-max_tokens shape
+    // entirely.
     const def = loadSubagentFromString(
       withExtraFrontmatter('sampling:\n  thinking_budget: 2000'),
       'user',

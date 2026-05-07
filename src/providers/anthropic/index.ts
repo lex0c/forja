@@ -107,23 +107,21 @@ export const createAnthropicProvider = (
     // API contract). The Messages API rejects requests where the
     // extended-thinking budget is greater than or equal to
     // `max_tokens`. The loader-side gate (`subagents/load.ts`
-    // §thinking_budget) catches this for playbook frontmatter at
-    // load time, but its floor is conservative
-    // (`LOAD_TIME_OUTPUT_TOKENS_FLOOR = 4096`) because the runtime
-    // model is not in scope there. A playbook that declares
-    // `thinking_budget: 8000` with `max_tokens: 12000` passes
-    // load-time validation, then runs against a model whose
-    // capability ceiling is 4096 (or whose budget override clamps
-    // resolved max_tokens below `thinking_budget`); the resolver
-    // returns 4096, the request goes out with `thinking_budget=8000
-    // >= max_tokens=4096`, and Anthropic 400s mid-run. This check
-    // surfaces the failure as a source-aware error before the call
-    // leaves the binary, with the resolved values both visible so
-    // the operator knows which side to adjust. Zero is the
-    // disable-via-zero idiom and is gated below by `> 0` — also
+    // §thinking_budget) only catches the case where BOTH values
+    // are explicitly declared in playbook frontmatter; when only
+    // `thinking_budget` is set, the runtime resolver picks
+    // `capabilities.output_max_tokens` for `max_tokens` and the
+    // pair becomes whatever capability the selected provider
+    // ships. This check is where that runtime-resolved pair gets
+    // validated — surfacing the failure as a source-aware error
+    // before the call leaves the binary, with both the resolved
+    // values and the capability ceiling visible so the operator
+    // knows which side to adjust. Zero is the disable-via-zero
+    // idiom (PLAYBOOKS.md §1.1) and gated below by `> 0` —
     // skipped here so a playbook with `thinking_budget: 0` and
-    // `max_tokens: 0` doesn't trip the check (the request would be
-    // rejected anyway, but for max_tokens=0, not for the budget).
+    // `max_tokens: 0` doesn't trip the check (the request would
+    // be rejected anyway, but for max_tokens=0, not for the
+    // budget).
     if (
       req.thinking_budget !== undefined &&
       req.thinking_budget > 0 &&

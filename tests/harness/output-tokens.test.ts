@@ -1,7 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
   DEFAULT_BUDGET,
-  LOAD_TIME_OUTPUT_TOKENS_FLOOR,
   effectiveBudget,
   resolveMaxOutputTokens,
 } from '../../src/harness/types.ts';
@@ -46,15 +45,6 @@ describe('resolveMaxOutputTokens', () => {
   test('DEFAULT_BUDGET leaves override unset so resolver picks capability', () => {
     expect(DEFAULT_BUDGET.maxOutputTokensPerCall).toBeUndefined();
     expect(resolveMaxOutputTokens(DEFAULT_BUDGET, { output_max_tokens: 64_000 })).toBe(64_000);
-  });
-
-  test('LOAD_TIME_OUTPUT_TOKENS_FLOOR is the conservative loader-side bound', () => {
-    // The floor is intentionally smaller than typical runtime caps
-    // — load.ts uses it for thinking_budget cross-checks where the
-    // runtime model is not in scope. Pin the value so a future
-    // bump goes through PR review (the floor controls a public
-    // error message and a cross-field validation gate).
-    expect(LOAD_TIME_OUTPUT_TOKENS_FLOOR).toBe(4096);
   });
 });
 

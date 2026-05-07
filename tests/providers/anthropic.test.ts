@@ -248,17 +248,15 @@ describe('createAnthropicProvider', () => {
   });
 
   test('rejects thinking_budget >= max_tokens before leaving the binary', async () => {
-    // Anthropic 400s on thinking_budget >= max_tokens. The loader
-    // floor (LOAD_TIME_OUTPUT_TOKENS_FLOOR=4096) catches the most
-    // common shape at playbook load time, but it can't see the
-    // runtime model — a playbook that declares max_tokens 12k +
-    // thinking_budget 10k passes the loader, then runs against a
-    // model whose capability ceiling is 4k. The runtime resolver
-    // clamps max_tokens to 4k, the request goes out with
-    // thinking_budget=10k >= max_tokens=4k, and the API 400s mid-
-    // run. The adapter check turns that mid-run failure into a
-    // source-aware throw with both values visible. The mock
-    // client should NOT be reached when the check fires.
+    // Anthropic 400s on thinking_budget >= max_tokens. The
+    // loader-side gate (`subagents/load.ts`) only catches the
+    // case where BOTH values are explicitly declared in playbook
+    // frontmatter — when a playbook sets only `thinking_budget`,
+    // the runtime resolver picks `capabilities.output_max_tokens`
+    // for `max_tokens`, and a small-cap model can produce a pair
+    // where budget >= cap. This adapter check is where that
+    // runtime-resolved pair gets validated; the mock client must
+    // NOT be reached when the cross-check fires.
     const handle = mockClient([{ type: 'message_stop' }]);
     const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });
     const drain = async () => {

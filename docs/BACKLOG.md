@@ -15,6 +15,65 @@ Format:
 
 ---
 
+## [2026-05-07] loader thinking_budget — drop the 4096 floor
+
+Slice A introduced a `LOAD_TIME_OUTPUT_TOKENS_FLOOR` (4096) so
+the subagent loader could cross-check `sampling.thinking_budget`
+against an effective max_tokens at load time even when the
+playbook omitted `sampling.max_tokens`. The reasoning was: the
+runtime model is not in scope at load time, so use a
+conservative floor to surface obviously-invalid budgets early.
+
+That reasoning held for slice A. Then `e859abf` added the
+runtime cross-check in `providers/anthropic/index.ts`: before
+sending to the API, the adapter validates
+`thinking_budget < req.max_tokens` against the runtime-resolved
+value. With that check in place, the loader floor became
+redundant for the implicit-max_tokens case AND actively wrong:
+a playbook with `thinking_budget: 8000` and no explicit
+`max_tokens` runs fine on Claude 4.x (cap 64k → resolved
+max_tokens 64k → 8000 < 64000 ✓), but the loader was rejecting
+it at load time citing the 4096 floor.
+
+**Fix:** the loader now gates ONLY when both `thinking_budget`
+and `sampling.max_tokens` are explicitly declared. The implicit
+case delegates to the runtime adapter check, which has the
+real capability ceiling in scope. Same source-aware error
+guarantee — just at the right layer.
+
+**Done:**
+
+- `src/subagents/load.ts` — gate condition tightened to
+  `out.thinkingBudget !== undefined && out.thinkingBudget > 0
+  && out.maxTokens !== undefined && out.thinkingBudget >= out.maxTokens`.
+  Error message simplified (no more "runtime default" branch).
+  Comment rewritten to point at the adapter check as the
+  source of truth for the implicit case.
+- `src/harness/types.ts` — `LOAD_TIME_OUTPUT_TOKENS_FLOOR`
+  constant removed (dead code; sole consumer was the loader).
+- `src/providers/anthropic/index.ts` — comment updated to
+  reflect that the loader only catches the both-declared case
+  and the adapter is the source of truth for the rest.
+- `tests/subagents/load.test.ts` — the rejection test for
+  `thinking_budget` without `max_tokens` inverted: same shapes
+  now load cleanly. Positive case for `thinking_budget: 8000`
+  pinned (the exact scenario the review flagged).
+- `tests/harness/output-tokens.test.ts` —
+  `LOAD_TIME_OUTPUT_TOKENS_FLOOR` import + assertion removed.
+- `tests/providers/anthropic.test.ts` — comment in the
+  thinking-budget cross-check test updated to drop the stale
+  reference to the loader floor.
+
+**Verification:** `bun test` 3589 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean.
+
+**Spec posture:** none required. The loader's behavior is a
+private contract; the public-facing rule (`thinking_budget <
+max_tokens` per Anthropic) is enforced at the adapter, which
+matches the API contract.
+
+---
+
 ## [2026-05-07] project pointer — trust gate on repoRoot fallback
 
 Security fix on the AGENTS.md pointer slice. The fallback to
