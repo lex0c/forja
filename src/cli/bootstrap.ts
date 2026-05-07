@@ -304,9 +304,26 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     // economy intact: the pointer changes only when AGENTS.md is
     // renamed/removed, while memory index changes on every
     // /memory write. Empty-text section passes the base prompt
-    // through unchanged when AGENTS.md is absent or cwd is
-    // untrusted.
-    const projectPointer = assembleProjectPointer({ cwd, repoRoot, isCwdTrusted });
+    // through unchanged when neither path is both trusted and
+    // present.
+    //
+    // `isRepoRootTrusted` is computed independently of
+    // `isCwdTrusted`: trust storage is exact-path membership
+    // (`isTrusted(trustList, path)`), so an operator who trusted
+    // only a subdir has NOT implicitly trusted its parent. The
+    // pointer must not advertise paths outside the explicit
+    // trust grant — see `project-pointer.ts` §"Trust gate" for
+    // the threat model. When `cwd === repoRoot` (the common
+    // project-root invocation) the two flags are equal by
+    // construction and the second `isTrusted` call is a no-op.
+    const isRepoRootTrusted =
+      cwd === repoRoot ? isCwdTrusted : trustPath !== null && isTrusted(trustPath, repoRoot);
+    const projectPointer = assembleProjectPointer({
+      cwd,
+      repoRoot,
+      isCwdTrusted,
+      isRepoRootTrusted,
+    });
     resolvedSystemPrompt = composeWithProjectPointer(resolvedSystemPrompt, projectPointer.text);
     const memorySection = assembleMemorySection({
       registry: memoryRegistry,

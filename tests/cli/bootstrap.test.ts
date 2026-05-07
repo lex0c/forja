@@ -805,6 +805,70 @@ Body.`,
       db.close();
     });
 
+    test('does not advertise repoRoot AGENTS.md when only the subdir is trusted (security boundary)', () => {
+      // Threat model: operator trusted only the subdir
+      // (`directories: [subdir]`), not the repoRoot. Trust
+      // storage is exact-path membership — a trusted subdir does
+      // NOT extend trust to its parent. AGENTS.md exists at the
+      // (untrusted) repoRoot only; trust modal probed
+      // `subdir/AGENTS.md` (absent) so the operator never saw a
+      // disclosure for the repoRoot file. The pointer must
+      // suppress the fallback to keep the system prompt's path
+      // surface aligned with what the operator authorized.
+      //
+      // `git init workdir` is necessary so `resolveRepoRoot(subdir)`
+      // returns `workdir` and not `subdir` itself — without a
+      // `.git` directory the resolver falls back to cwd, which
+      // would degenerate the test (cwd === repoRoot, no
+      // boundary case to exercise).
+      Bun.spawnSync({ cmd: ['git', 'init', workdir], stdout: 'ignore', stderr: 'ignore' });
+      const subdir = join(workdir, 'src');
+      mkdirSync(subdir, { recursive: true });
+      writeFileSync(join(workdir, 'AGENTS.md'), '# repo-wide rules');
+      // No AGENTS.md at the trusted subdir.
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [subdir] }));
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: subdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(config.systemPrompt ?? '').not.toContain('# Project context');
+      expect(config.systemPrompt ?? '').not.toContain(join(workdir, 'AGENTS.md'));
+      db.close();
+    });
+
+    test('falls back to repoRoot when BOTH cwd and repoRoot are trusted (typical workflow)', () => {
+      // The common operator workflow: trust the whole repo, run
+      // `agent` from a subdir. Both directories are in the trust
+      // list. Pointer should fall back to repoRoot/AGENTS.md
+      // when the subdir has no AGENTS.md.
+      //
+      // Same `git init workdir` setup as above so resolveRepoRoot
+      // returns workdir, not the cwd subdir.
+      Bun.spawnSync({ cmd: ['git', 'init', workdir], stdout: 'ignore', stderr: 'ignore' });
+      const subdir = join(workdir, 'src');
+      mkdirSync(subdir, { recursive: true });
+      writeFileSync(join(workdir, 'AGENTS.md'), '# repo-wide rules');
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir, subdir] }));
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: subdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(config.systemPrompt ?? '').toContain(join(workdir, 'AGENTS.md'));
+      db.close();
+    });
+
     test('suppresses the pointer when cwd is untrusted (even with AGENTS.md present)', () => {
       // Trust modal not yet granted (one-shot CLI / programmatic
       // boot) — the pointer must NOT advertise a file the

@@ -15,6 +15,55 @@ Format:
 
 ---
 
+## [2026-05-07] project pointer — trust gate on repoRoot fallback
+
+Security fix on the AGENTS.md pointer slice. The fallback to
+`repoRoot/AGENTS.md` was gated only on `isCwdTrusted`, which
+admits a real boundary violation: operator trusts only a subdir
+(say `/repo/src/`), the trust modal probes `/repo/src/AGENTS.md`
+(absent and never disclosed), but the bootstrap then advertises
+`/repo/AGENTS.md` to the model. Forja's trust storage is exact-
+path membership (`isTrusted(path, cwd)`) — a trusted subdir
+does NOT extend trust to its parent. The fallback was leaking
+paths outside the operator's explicit grant.
+
+**Fix:** independent trust gate per probe.
+
+- `assembleProjectPointer` gains an `isRepoRootTrusted: boolean`
+  input. The cwd probe stays gated on `isCwdTrusted`; the
+  repoRoot fallback now requires `isRepoRootTrusted` true.
+- `bootstrap.ts` computes `isRepoRootTrusted` next to the existing
+  `isCwdTrusted`. When `cwd === repoRoot` the second `isTrusted`
+  call short-circuits to the same value — no redundant probe.
+- Common workflow (operator trusts the whole repo, runs `agent`
+  from a subdir): both flags true, fallback works as before.
+  Narrow workflow (operator trusts only the subdir): repoRoot
+  fallback skipped, no pointer emitted, system prompt's path
+  surface stays aligned with what was authorized.
+
+**Tests added:**
+
+- `project-pointer.test.ts`: trusted subdir + AGENTS.md only
+  at repoRoot + repoRoot untrusted → no pointer; mirror case
+  (cwd untrusted, repoRoot trusted) defense-in-depth; both-
+  trusted positive case to confirm the typical workflow keeps
+  working.
+- `bootstrap.test.ts`: end-to-end security boundary case (only
+  subdir trusted, AGENTS.md at repoRoot, no pointer); both-
+  trusted fallback case (typical workflow). Both initialize
+  `git init workdir` so `resolveRepoRoot` returns workdir
+  instead of degenerating to the cwd subdir.
+
+**Verification:** `bun test` 3590 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean.
+
+**Spec posture:** none required. The fix tightens an existing
+trust boundary; CONTEXT_TUNING.md §2.0 already declares the
+section is gated on trust, the implementation now matches the
+declared semantic.
+
+---
+
 ## [2026-05-07] edit_file batch — multi-replacement per call
 
 Closes the "N edits = N tool calls" overhead documented when

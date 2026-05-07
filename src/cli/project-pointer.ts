@@ -32,52 +32,59 @@ import { join } from 'node:path';
 //     nudge or first-tool-call auto-injection, not a return to
 //     eager-content default.
 //
-// Trust gate: pointer only emits when the cwd is trusted. An
-// untrusted cwd already blocks the boot at the trust modal in
-// the REPL path; one-shot mode bypasses the modal but the same
-// flag (`isCwdTrusted`) gates downstream surfaces (memory write,
-// permission policy). Following the existing convention here
-// keeps the pointer consistent with the rest of the bootstrap.
+// Trust gate: pointer only emits when the path it advertises is
+// trusted. Forja's trust storage (`isTrusted(path, cwd)`) is
+// exact-string membership on absolute paths — a trusted
+// subdirectory does NOT extend trust to its parent tree. So
+// gating only on `isCwdTrusted` while still falling back to
+// `repoRoot/AGENTS.md` would advertise a path the operator
+// never explicitly trusted: trust was granted for `/repo/src/`,
+// the modal probed `/repo/src/AGENTS.md` (absent), and the
+// pointer would then nudge the model to read `/repo/AGENTS.md`,
+// which the trust modal never disclosed.
 //
-// Probe location: cwd FIRST, repoRoot as fallback. Two reasons:
+// Two probes, two independent gates:
 //
-//   1. The trust modal in `cli/repl.ts` probes `cwd/AGENTS.md`,
-//      not `repoRoot/AGENTS.md`. Probing only repoRoot here would
-//      open an asymmetry: an operator running `agent` from a
-//      subdir would never see the trust-time "AGENTS.md present"
-//      warning, but the bootstrap would still surface a pointer
-//      to a file outside the cwd they trusted. cwd-first matches
-//      the modal's surface and only falls back to repoRoot when
-//      that cwd-specific probe returns nothing — which catches
-//      the common case (operator in a subdir, AGENTS.md at the
-//      project root) without the asymmetry.
+//   1. cwd: probed only when `isCwdTrusted`. Matches the trust
+//      modal's own probe (`repl.ts:397` checks `cwd/AGENTS.md`).
+//   2. repoRoot: probed only when `isRepoRootTrusted`. The
+//      common operator workflow (trust the whole repo, run
+//      `agent` from a subdir) sets both flags true, so the
+//      fallback works as before. The narrow case (operator
+//      explicitly trusted only the subdir) skips the fallback
+//      and emits no pointer, keeping the system prompt's path
+//      surface aligned with what the operator authorized.
 //
-//   2. Some teams keep multiple per-area AGENTS.md files (one at
-//      `src/AGENTS.md` for the engine, one at `web/AGENTS.md` for
-//      the frontend, etc.). In that layout the cwd-specific file
-//      is more relevant to the current task than the repo-level
-//      one. cwd-first picks the right anchor without operator
-//      configuration.
+// Probe order is cwd-first: when both files exist (some teams
+// keep per-area AGENTS.md at `src/AGENTS.md`, `web/AGENTS.md`,
+// etc.), the cwd-specific file is more relevant to the current
+// task than the repo-level one.
 //
-// Both gates pass → emit pointer with the resolved path. Neither
-// path has a file → empty section, base prompt unchanged.
+// Equivalent paths (cwd === repoRoot, the common project-root
+// invocation) collapse to a single check — both flags are equal
+// by construction since `isTrusted` is path-keyed.
 
 export interface ProjectPointerInput {
   // Operator's invocation directory. Probed FIRST for AGENTS.md
   // (mirrors the trust modal's probe surface).
   cwd: string;
   // Resolved repo root from `resolveRepoRoot(cwd)`. Probed as
-  // fallback when `<cwd>/AGENTS.md` is absent — catches the
-  // common case of running `agent` from a subdirectory while
-  // AGENTS.md lives at the project root. Bootstrap passes the
-  // same `repoRoot` value it computed for memory and boot
+  // fallback when `<cwd>/AGENTS.md` is absent. Bootstrap passes
+  // the same `repoRoot` value it computed for memory and boot
   // triggers, so all three subsystems share one anchor.
   repoRoot: string;
-  // Cwd-trust flag from `isTrusted(trustListPath, cwd)`. Pointer
-  // suppressed when false: a session running in an untrusted dir
-  // shouldn't be told to read project rules from a file under
-  // that same untrusted tree.
+  // Trust flag for the cwd path. When false the cwd probe is
+  // skipped entirely.
   isCwdTrusted: boolean;
+  // Trust flag for the repoRoot path. Independent of cwd trust
+  // because Forja's trust storage is exact-path membership, not
+  // tree-spanning. When false the repoRoot fallback is skipped
+  // even if AGENTS.md exists there — the operator never
+  // disclosed that path to the agent. In the typical "trust the
+  // whole repo" workflow this flag matches `isCwdTrusted`; the
+  // narrow "trust only this subdir" case is where the gates
+  // diverge and the security distinction matters.
+  isRepoRootTrusted: boolean;
 }
 
 export interface ProjectPointerSection {
@@ -103,10 +110,19 @@ const SECTION_HEADER = `# Project context
 Project-specific conventions, idioms, and rules live at the path below. Read it via read_file when those matter for the current task; re-read if you suspect drift since you last read it this session. The file may be stale — verify factual claims against the live tree before acting.`;
 
 // Probe + assemble the pointer section. Returns an empty-text
-// section when AGENTS.md is absent at BOTH the cwd and the
-// repoRoot, or when the cwd is untrusted; the caller's compose
-// helper passes empty sections through unchanged so the upstream
-// prompt stays identical.
+// section when no trusted-and-existing AGENTS.md is found at
+// the cwd or repoRoot; the caller's compose helper passes empty
+// sections through unchanged so the upstream prompt stays
+// identical.
+//
+// Each probe is gated on its own trust flag — the cwd probe on
+// `isCwdTrusted`, the repoRoot probe on `isRepoRootTrusted`.
+// Trust storage is exact-path membership, so a trusted subdir
+// does not implicitly trust its parent; advertising the parent's
+// AGENTS.md without an explicit trust grant for that path would
+// surface conventions the operator never disclosed at the trust
+// modal. Each gate's `false` value is fail-closed (skip the
+// probe).
 //
 // `existsSync` is fine here: cheap stat on at most two fixed
 // paths, runs once per session bootstrap, and missing-permissions
@@ -115,18 +131,19 @@ Project-specific conventions, idioms, and rules live at the path below. Read it 
 // — the operator should see disk-level failures, not silently
 // lose the pointer.
 export const assembleProjectPointer = (input: ProjectPointerInput): ProjectPointerSection => {
-  if (!input.isCwdTrusted) return { text: '' };
   const cwdPath = join(input.cwd, 'AGENTS.md');
   const repoRootPath = join(input.repoRoot, 'AGENTS.md');
-  // cwd-first: when both exist, the cwd-specific file wins. This
-  // matches the operator running with a subdir-scoped AGENTS.md
-  // (per-area conventions), and incidentally collapses to "use
-  // the repoRoot file" when cwd === repoRoot (the same path on
-  // both checks).
+  const samePath = cwdPath === repoRootPath;
+  // cwd-first: when both exist AND both gates pass, the cwd-
+  // specific file wins (matches operators using per-area
+  // AGENTS.md at `src/`, `web/`, etc.). When cwd === repoRoot
+  // the repoRoot branch is unreachable by construction (the cwd
+  // probe already covers it); the explicit `!samePath` guard
+  // documents that and avoids redundant existsSync calls.
   let agentsMdPath: string | undefined;
-  if (existsSync(cwdPath)) {
+  if (input.isCwdTrusted && existsSync(cwdPath)) {
     agentsMdPath = cwdPath;
-  } else if (cwdPath !== repoRootPath && existsSync(repoRootPath)) {
+  } else if (!samePath && input.isRepoRootTrusted && existsSync(repoRootPath)) {
     agentsMdPath = repoRootPath;
   }
   if (agentsMdPath === undefined) return { text: '' };
