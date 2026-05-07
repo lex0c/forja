@@ -2127,6 +2127,100 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(130);
   });
 
+  test('foreground Enter is blocked while a slash playbook is in flight', async () => {
+    // Regression: playbookRunning gated the slash dispatcher's
+    // own `isRunning()` closure, but the foreground submit paths
+    // (Enter in the editor, Enter in reverse-search) checked
+    // only `running`. Pressing Enter mid-playbook started a
+    // second concurrent run against the same provider / DB /
+    // permission engine. The single `isBusy()` predicate now
+    // gates every submit surface.
+    const stub = makeBootstrapStub();
+    const fakeDef = {
+      name: 'fake',
+      description: 'fake subagent for tests',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'noop',
+      scope: 'project',
+      isolation: 'none',
+      sourcePath: '/dev/null',
+      sourceSha256: '0'.repeat(64),
+      slash: 'fake',
+    };
+    (stub.subagents.byName as Map<string, unknown>).set('fake', fakeDef);
+
+    let releaseDispatch: () => void = () => {};
+    const dispatchParked = new Promise<void>((r) => {
+      releaseDispatch = r;
+    });
+    const fakeRunSubagent = async (): ReturnType<
+      typeof import('../../src/subagents/index.ts').runSubagent
+    > => {
+      await dispatchParked;
+      return {
+        output: '(no-op)',
+        sessionId: 'sess-fake-child',
+        status: 'done',
+        reason: 'done',
+        costUsd: 0,
+        steps: 0,
+        durationMs: 0,
+      };
+    };
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      runSubagentOverride: fakeRunSubagent,
+    });
+    await tick();
+
+    // Park a slash playbook in flight (fakeRunSubagent waits
+    // on dispatchParked).
+    stdin.feed('/fake go\r');
+    await tick();
+    await tick();
+
+    // Now hit Enter on a normal prompt. The submit gate must
+    // refuse — startTurn should NOT call runAgent while the
+    // playbook is in flight.
+    stdin.feed('a normal prompt\r');
+    await tick();
+    await tick();
+    await flushFrame();
+
+    // No foreground harness call landed.
+    expect(ra.captured).toHaveLength(0);
+
+    // The blocked submit kept the typed text in the buffer (per
+    // the editor handler's contract — applyKey doesn't clear on
+    // a refused submit, the operator can hit Enter again). Now
+    // release the playbook and re-press Enter; the same buffer
+    // submits and a foreground turn starts. This proves the
+    // gate RELEASES correctly when the playbook ends.
+    releaseDispatch();
+    await tick();
+    await flushFrame();
+
+    stdin.feed('\r');
+    await tick();
+    await tick();
+    expect(ra.captured).toHaveLength(1);
+    expect(ra.captured[0]?.configs[0]?.userPrompt).toBe('a normal prompt');
+
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('slash playbook inherits plan mode when /plan on is active', async () => {
     // Regression: runPlaybook ignored baseConfig.planMode, so a
     // playbook dispatched via /<slash> while the operator had

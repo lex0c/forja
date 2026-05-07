@@ -268,6 +268,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // await) ensures a second slash dispatch fired in the same Enter
   // burst sees `isRunning() === true` and refuses cleanly.
   let playbookRunning = false;
+  // Single busy predicate threaded through every submit gate
+  // (foreground startTurn, Enter in the editor, Enter in
+  // reverse-search) AND the slash dispatcher's `isRunning()`
+  // closure. Without it, the foreground submit paths would gate
+  // on `running` alone and let a normal turn start mid-playbook
+  // — the exact serialization the playbookRunning flag was
+  // supposed to enforce, defeated at every other entry point.
+  const isBusy = (): boolean => running || playbookRunning;
 
   const ESC_DRAIN_MS = 30;
   let drainTimer: ReturnType<typeof setTimeout> | null = null;
@@ -921,7 +929,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   }): Promise<'yes' | 'no' | 'cancel'> => modalManager.askMemoryUserScope(req);
 
   const startTurn = (text: string): void => {
-    if (running || exiting) return;
+    if (isBusy() || exiting) return;
     running = true;
     // Mint a fresh token for this turn and claim ownership of the
     // shared state slots (running / abortController / runningPromise).
@@ -1131,14 +1139,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     cumulative,
     now,
     requestShutdown,
-    // Closure over the REPL's `running` flag — fresh read per call so
-    // a slash command queued before a turn starts but executed after
-    // observes the post-startTurn state. Also reports `true` while a
-    // slash playbook dispatch is in flight; foreground turns and
-    // playbook runs share the provider / DB / permission engine, and
-    // the slash gate (`buildOnePlaybookCommand`) is the single point
-    // where parallel surfaces are refused.
-    isRunning: () => running || playbookRunning,
+    // Closure over the REPL's busy state — fresh read per call so
+    // a slash command queued before a turn starts but executed
+    // after observes the post-startTurn state. The same predicate
+    // (`isBusy`) gates foreground submit paths; pinning all
+    // surfaces to one source of truth means there is no Enter /
+    // reverse-search path that can sneak a normal turn past a
+    // playbook in flight, and no slash dispatch that can race a
+    // foreground turn.
+    isRunning: () => isBusy(),
     // Most recent session id (closure so it's read fresh per slash
     // call). Set after the first turn's session_finished event;
     // null between boot and first turn. /memory show forwards this
@@ -1388,10 +1397,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         if (key.name === 'enter') {
           const match = currentReverseSearchMatch();
           if (match === null) return true;
-          if (running) {
+          if (isBusy()) {
             // Mid-turn protection: same gate the normal Enter path
-            // honors (`!running`). Operator gets the recalled buffer
-            // staged but no submit until the turn ends.
+            // honors (`!isBusy()`). Operator gets the recalled buffer
+            // staged but no submit until the turn OR playbook ends.
             bus.emit({ type: 'input:update', ts: now(), value: match, cursor: match.length });
             closeReverseSearch();
             return true;
@@ -1736,11 +1745,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       updateSlashSuggestions(result.next.value);
     }
 
-    // Enter while a turn is running is ignored — no double-submit. The
-    // typed text stays in the buffer (applyKey doesn't clear; only the
-    // user:submit reducer would, which we're not emitting). The user
-    // can hit Enter again once the turn ends.
-    if (result.submit !== undefined && !running) {
+    // Enter while a turn or playbook is in flight is ignored — no
+    // double-submit. The typed text stays in the buffer (applyKey
+    // doesn't clear; only the user:submit reducer would, which
+    // we're not emitting). The user can hit Enter again once the
+    // run ends.
+    if (result.submit !== undefined && !isBusy()) {
       bus.emit({ type: 'user:submit', ts: now(), text: result.submit.text });
       recordHistorySubmit(result.submit.text);
       startTurn(result.submit.text);
