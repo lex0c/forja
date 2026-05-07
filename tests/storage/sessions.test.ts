@@ -219,6 +219,53 @@ describe('sessions repo', () => {
     expect(listSessions(db, { includeSubagents: true })).toHaveLength(3);
   });
 
+  test('isSubagent override flags a parentless row as hidden', () => {
+    // Synthetic anchor rows (REPL slash playbook dispatches before
+    // any real turn) are parentless but audit-only; they should NOT
+    // surface as user-facing sessions even though
+    // `parentSessionId` is null. The override flips is_subagent
+    // explicitly so the default listing AND `--resume last` skip
+    // them.
+    const synthetic = createSession(db, { model: 'm', cwd: '/p', isSubagent: true });
+    expect(synthetic.parentSessionId).toBeNull();
+    expect(synthetic.isSubagent).toBe(true);
+    const fetched = getSession(db, synthetic.id);
+    expect(fetched?.isSubagent).toBe(true);
+    // Default listing — synthetic must be hidden.
+    expect(listSessions(db, { cwd: '/p' })).toHaveLength(0);
+    // `--resume last` shape: limit:1 over the cwd, default
+    // is_subagent filter. Should return nothing — there is no
+    // real conversation in /p, so resume falls back to "no
+    // session".
+    expect(listSessions(db, { cwd: '/p', limit: 1 })).toHaveLength(0);
+    // Only includeSubagents:true surfaces the synthetic — used
+    // by audit / debug paths that legitimately want to see
+    // every row.
+    expect(listSessions(db, { cwd: '/p', includeSubagents: true })).toHaveLength(1);
+  });
+
+  test('synthetic parent does not shadow a real session in --resume last', () => {
+    // The exact scenario the bug report describes: operator runs
+    // a slash playbook (synthetic created), then types a normal
+    // prompt (real session created). `--resume last` must pick
+    // the real session, not the synthetic that happened to be
+    // newer when its row landed.
+    const real = createSession(db, { model: 'm', cwd: '/p', startedAt: 1000 });
+    // Synthetic created LATER (newer started_at) — without the
+    // is_subagent flag this would shadow the real session in
+    // limit:1 ordering. Pinning startedAt makes the test
+    // deterministic regardless of system clock granularity.
+    createSession(db, {
+      model: 'm',
+      cwd: '/p',
+      isSubagent: true,
+      startedAt: 2000,
+    });
+    const last = listSessions(db, { cwd: '/p', limit: 1 });
+    expect(last).toHaveLength(1);
+    expect(last[0]?.id).toBe(real.id);
+  });
+
   test('listChildSessions returns children oldest-first', () => {
     const parent = createSession(db, { model: 'm', cwd: '/p' });
     const c1 = createSession(db, {

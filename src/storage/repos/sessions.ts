@@ -69,19 +69,35 @@ export interface CreateSessionInput {
   cwd: string;
   startedAt?: number;
   parentSessionId?: string;
+  // Override the default `is_subagent` derivation. Omit
+  // (default) to let `parentSessionId !== null` decide.
+  // Set `true` to mark a parentless audit-anchor row as
+  // hidden from top-level listings — used by REPL synthetic
+  // parents that exist only to attribute slash-dispatched
+  // playbook children when no real turn has run yet.
+  isSubagent?: boolean;
 }
 
 export const createSession = (db: DB, input: CreateSessionInput): Session => {
   const id = input.id ?? crypto.randomUUID();
   const startedAt = input.startedAt ?? Date.now();
   const parentSessionId = input.parentSessionId ?? null;
-  // is_subagent is the IDENTITY flag — set once based on whether
-  // this session was created as a subagent child, never updated
+  // is_subagent is the IDENTITY flag — flips once based on the
+  // role this session plays in the audit graph, never updated
   // afterwards. parent_session_id can later go to NULL via the
   // ON DELETE SET NULL cascade when the parent is purged, but
   // is_subagent stays at 1 so the orphaned row continues to be
   // excluded from the default top-level listing.
-  const isSubagent = parentSessionId !== null;
+  //
+  // Default derivation: a session with a parent IS a subagent
+  // child. The explicit `isSubagent` override exists for
+  // synthetic anchor rows (e.g., the REPL's lazy-created parent
+  // for slash playbook dispatches before any real turn) — those
+  // rows have no parent but also no user-facing conversation,
+  // and treating them as top-level pollutes `--list-sessions`
+  // and lets `--resume last` resurrect an empty shell instead
+  // of the operator's real session.
+  const isSubagent = input.isSubagent ?? parentSessionId !== null;
   // usage_complete defaults to 1 in the schema and starts true here for
   // the same reason: a freshly-created session has no measured turns
   // yet; the harness flips it to 0 via completeSession when finalizing

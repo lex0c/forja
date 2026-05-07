@@ -554,8 +554,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // forever, and reused across subsequent dispatches until a real
   // turn assigns `lastSessionId` — at which point the real id wins
   // and the synthetic is left as a no-cost / no-message orphan in
-  // the sessions table. Operators inspecting `--list-sessions` will
-  // see it; harmless but worth knowing.
+  // the sessions table.
+  //
+  // Marked `is_subagent: true` so it stays hidden from top-level
+  // surfaces. Without that flag the synthetic lands as the most
+  // recent top-level row for this cwd, and `--resume last`
+  // (listSessions(..., { cwd, limit: 1 }) filtered to
+  // is_subagent = 0) resurrects an empty shell instead of the
+  // operator's real conversation. The flag also keeps
+  // `--list-sessions` clean of these audit-only rows.
   let syntheticParentSessionId: string | null = null;
   const ensureParentSessionId = (): string => {
     if (lastSessionId !== null) return lastSessionId;
@@ -563,6 +570,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     const synthetic = createSession(db, {
       model: baseConfig.provider.id,
       cwd: baseConfig.cwd,
+      isSubagent: true,
     });
     // Immediately close. The session row exists only as an audit
     // anchor for the slash dispatch's child; it has no turns, no
