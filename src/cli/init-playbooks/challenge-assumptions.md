@@ -7,9 +7,6 @@ budget:
   max_cost_usd: 0.40
 slash: challenge
 when_to_use: "decision/plan with high confidence + weak evidence; reasoning that uses 'obviously', 'we can always do it later', or ignores obvious options (do nothing, buy, deprecate)"
-references:
-  - CRITICAL_THINKING.md
-  - GROUPTHINK_BIAS.md
 sampling:
   temperature: 0.3
   max_tokens: 4096

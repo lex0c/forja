@@ -7,9 +7,6 @@ budget:
   max_cost_usd: 0.50
 slash: gapaudit
 when_to_use: "spec/plan/PR description with claims to verify; want to audit claim vs evidence without proposing a fix; textual artifact, not code"
-references:
-  - CRITICAL_THINKING.md
-  - TOOL_ERGONOMICS.md
 sampling:
   temperature: 0.2
   max_tokens: 4096

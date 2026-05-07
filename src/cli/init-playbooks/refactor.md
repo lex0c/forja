@@ -30,15 +30,6 @@ budget:
   max_cost_usd: 2.00
 slash: refactor
 when_to_use: "semantics-preserving change requested with declared scope; cleanup/rename/extract with existing tests that must keep passing"
-references:
-  - REFACTORING.md
-  - COHESION_COUPLING.md
-  - DESIGN_SMELLS.md
-  - ANTI_PATTERNS_AND_CODE_ENTROPY.md
-  - CODE_COMMODITY.md
-  - CONCEPTUAL_INTEGRITY.md
-  - IDEMPOTENCY.md
-  - IMMUTABLE.md
 sampling:
   temperature: 0.1
   max_tokens: 4096

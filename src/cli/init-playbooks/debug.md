@@ -14,16 +14,6 @@ budget:
   max_cost_usd: 1.50
 slash: debug
 when_to_use: "bug with a reproducible symptom; user describes the failure and needs the root cause isolated, not just a patch"
-references:
-  - BRUTE_FORCE_VS_ROOT_CAUSE.md
-  - SCIENTIFIC_METHOD.md
-  - PROBLEM_SOLUTION.md
-  - PARADOX_ANALYSIS.md
-  - PROD_PROBLEM.md
-  - CONCURRENCY.md
-  - DISTRIBUTED_SYSTEMS.md
-  - OBSERVABILITY.md
-  - TOOL_ERGONOMICS.md
 sampling:
   temperature: 0.1
   max_tokens: 4096

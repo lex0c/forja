@@ -7,11 +7,6 @@ budget:
   max_cost_usd: 1.50
 slash: threat-model
 when_to_use: "new component or attack surface being introduced; pre-design or pre-deploy of a feature touching auth, sensitive data, or trust boundary"
-references:
-  - THREAT_MODELING.md
-  - ZERO_TRUST.md
-  - SECURITY_GUIDELINE.md
-  - AGENTS.md
 sampling:
   temperature: 0.2
   max_tokens: 8192

@@ -24,9 +24,6 @@ budget:
   max_cost_usd: 0.30
 slash: git-hygiene
 when_to_use: "dirty branch before PR; commits to reorganize; history needs cleanup (squash, rebase, message rewrite)"
-references:
-  - COMMIT.md
-  - AGENTS.md
 sampling:
   temperature: 0.1
   max_tokens: 2048

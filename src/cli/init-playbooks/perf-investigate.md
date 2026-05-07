@@ -40,12 +40,6 @@ budget:
   max_wall_clock_ms: 600000
 slash: perf
 when_to_use: "observed latency/throughput regression; symptom of slowness without identified cause and no formed hypothesis yet"
-references:
-  - PROFILING.md
-  - PREMATURE_OPTIMIZATION.md
-  - PERFORMANCE.md
-  - AGENTS.md
-  - TOOL_ERGONOMICS.md
 sampling:
   temperature: 0.1
   max_tokens: 8192

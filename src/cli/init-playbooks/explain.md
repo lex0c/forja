@@ -7,11 +7,6 @@ budget:
   max_cost_usd: 0.30
 slash: explain
 when_to_use: "question about how/why something works; user wants a structured mental model, not a fix or change"
-references:
-  - SOFTWARE_ARCHITECTURE.md
-  - CONCEPTUAL_INTEGRITY.md
-  - HOLISTIC_VIEW.md
-  - TOOL_ERGONOMICS.md
 sampling:
   temperature: 0.2
   max_tokens: 4096

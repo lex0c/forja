@@ -7,26 +7,6 @@ budget:
   max_cost_usd: 1.50
 slash: audit
 when_to_use: "scan code for threat categories (auth, injection, supply-chain, secrets) without a specific target; pre-deploy or post-sensitive-feature"
-references:
-  - THREAT_MODELING.md
-  - ZERO_TRUST.md
-  - OPSEC.md
-  - SOFTWARE_SECURITY_GUIDELINE.md
-  - WEB_SECURITY.md
-  - CLOUD_SECURITY.md
-  - CONTAINER_SECURITY.md
-  - MOBILE_SECURITY.md
-  - AUTHENTICATION.md
-  - AD_SECURITY.md
-  - CRYPTOGRAPHY.md
-  - CRYPTO_ADVANCED.md
-  - SUPPLY_CHAIN.md
-  - AI_SECURITY.md
-  - BINARY_EXPLOITATION.md
-  - NETWORK_ATTACKS.md
-  - AV_EDR.md
-  - FIREWALL.md
-  - ANONYMITY_NETWORKS.md
 sampling:
   temperature: 0.1
   max_tokens: 4096

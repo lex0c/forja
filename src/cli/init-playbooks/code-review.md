@@ -7,18 +7,6 @@ budget:
   max_cost_usd: 0.75
 slash: review
 when_to_use: "diff or PR ready for review; a code change that needs a quality gate before merge"
-references:
-  - CODE_COMMODITY.md
-  - CONCEPTUAL_INTEGRITY.md
-  - HOLISTIC_VIEW.md
-  - ANTI_PATTERNS_AND_CODE_ENTROPY.md
-  - DESIGN_SMELLS.md
-  - COHESION_COUPLING.md
-  - DESIGN_FAILURE.md
-  - IDEMPOTENCY.md
-  - IMMUTABLE.md
-  - PREMATURE_OPTIMIZATION.md
-  - TOOL_ERGONOMICS.md
 sampling:
   temperature: 0.2
   max_tokens: 4096
