@@ -1,0 +1,14 @@
+name: 01-spec-claims-vs-evidence
+playbook: gap-audit
+prompt: |-
+  Audit `docs/spec/STATE_MACHINE.md` §11 (drift detector). Check
+  every claim about emitted events, persisted columns, and
+  cross-references against the implementation in `src/`. Report
+  gaps, contradictions, unverifiable claims, and confirmed-OK
+  items with evidence references.
+expect:
+  output_schema_valid: true
+  output_contains:
+    - gaps
+    - confirmed_ok
+    - not_checked

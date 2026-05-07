@@ -1,0 +1,6 @@
+name: 02-dispatch-debug
+prompt: |-
+  CI is failing with "TypeError: Cannot read properties of
+  undefined (reading 'length')" at queue.ts:88 about 1 in 20
+  runs. I need root-cause investigation, not a band-aid try/catch.
+expect_dispatch: debug

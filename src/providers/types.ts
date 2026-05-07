@@ -124,6 +124,33 @@ export interface GenerateRequest {
   tools?: ProviderToolDef[];
   max_tokens: number;
   temperature?: number;
+  // Nucleus sampling (`PLAYBOOKS.md` §1.1, `TOKEN_TUNING.md`).
+  // Range (0, 1]. When unset each provider applies its own default.
+  // Anthropic, OpenAI, Google all consume `top_p`; an adapter that
+  // does not support it drops the field silently — the request
+  // contract here is "express intent", per-provider best-effort
+  // is the convention this surface follows.
+  top_p?: number;
+  // Extended-thinking budget in tokens (`PLAYBOOKS.md` §1.1). 0
+  // explicitly disables; positive integers cap the model's
+  // hidden reasoning. Only Anthropic exposes a dedicated
+  // budget surface today (`thinking: { type:'enabled',
+  // budget_tokens }`); OpenAI's `reasoning.effort` is a
+  // different shape (low/medium/high) and Google's
+  // `thinking_config.thinking_budget` accepts a token count.
+  // Adapters that cannot map the field drop it; refusing
+  // here would force every playbook to declare per-provider
+  // sampling overrides, which the spec deliberately does not.
+  thinking_budget?: number;
+  // Determinism intent flag (`PLAYBOOKS.md` §1.1
+  // `sampling.seed_in_eval`). When true, the playbook author
+  // declared this run wants seeded generation for reproducibility
+  // across replays. Providers that support seeding (OpenAI's
+  // `seed`, Google's `seed`) read the flag and inject a
+  // deterministic seed; adapters without seed surface today
+  // (Anthropic) drop the field — same best-effort convention
+  // `top_p` and `thinking_budget` follow.
+  seed_in_eval?: boolean;
   stop_sequences?: string[];
   metadata?: Record<string, string>;
 }

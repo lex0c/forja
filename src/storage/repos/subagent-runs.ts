@@ -1,5 +1,6 @@
 import type { HookSpec } from '../../hooks/types.ts';
 import type { Policy } from '../../permissions/index.ts';
+import type { ContextRecipe, SamplingOverride, ToolRestrictions } from '../../subagents/types.ts';
 import type { DB } from '../db.ts';
 
 export type SubagentScope = 'user' | 'project';
@@ -52,6 +53,61 @@ export interface SubagentRun {
   //     exact drift this migration exists to close.
   //   - `[hook, ...]` — parent's resolved chain, used verbatim.
   hooksSnapshot: readonly HookSpec[] | null;
+  // Per-playbook tool_restrictions snapshot (migration 024,
+  // `PLAYBOOKS.md` §1.1). Mirrors the same drift-prevention
+  // pattern as policy_snapshot / hooks_snapshot: the parent
+  // committed the rule shape from the .md, the child runs against
+  // exactly that contract.
+  //
+  // Discriminator:
+  //   - `null` — no snapshot taken (legacy pre-migration row, or
+  //     a definition without a `tool_restrictions` block at load
+  //     time). Child applies no restriction gate; the playbook's
+  //     `tools[]` whitelist remains the floor.
+  //   - `{}` — snapshot exists but is empty. Same runtime effect
+  //     as `null` (passthrough), but distinguishable in audit:
+  //     the operator sees the author meant "no restrictions" vs
+  //     "no snapshot was taken".
+  //   - `{ <tool>: { allow|deny|allowPaths|denyPaths }, ... }` —
+  //     authoritative rule map. Child consults each entry on
+  //     dispatch.
+  toolRestrictions: ToolRestrictions | null;
+  // Per-playbook sampling override (migration 025,
+  // `PLAYBOOKS.md` §1.1). Same drift-prevention contract as the
+  // other snapshots. Tri-state mirrors hooks_snapshot:
+  //   - `null` — no snapshot. Child uses provider defaults.
+  //   - `{}` — snapshot exists but no overrides. Same runtime
+  //     effect as null but distinguishable in audit.
+  //   - non-empty `SamplingOverride` — field-by-field override
+  //     map applied to the child's harness config.
+  sampling: SamplingOverride | null;
+  // Per-playbook reference paths (migration 026,
+  // `PLAYBOOKS.md` §1.1). Same drift-prevention contract as the
+  // other snapshots. Tri-state:
+  //   - `null` — no snapshot. Child appends no reference block;
+  //     the system prompt is the playbook body alone.
+  //   - `[]` — empty list, snapshot exists. Same runtime effect
+  //     as null at composition (no block rendered) but
+  //     distinguishable in audit.
+  //   - non-empty `string[]` — paths the child surfaces in a
+  //     "References (read on demand)" block appended to the
+  //     system prompt.
+  references: string[] | null;
+  // Per-playbook output_schema snapshot (migration 027,
+  // `PLAYBOOKS.md` §1.2). Two-state — schemas are either
+  // present (an arbitrary mapping the child renders + validates
+  // against) or absent (no enforcement). Empty `{}` collapses
+  // to absent at runtime because validateOutput against an
+  // empty object is a no-op; we don't bother distinguishing it
+  // here since the audit value rounds back through the same
+  // null-check.
+  outputSchema: Record<string, unknown> | null;
+  // Per-playbook context_recipe snapshot (migration 028,
+  // `PLAYBOOKS.md` §1.1). Two-state — recipe present or absent.
+  // Empty `{}` collapses to absent at runtime since every recipe
+  // field is optional and an empty recipe is functionally
+  // identical to no recipe.
+  contextRecipe: ContextRecipe | null;
   capturedAt: number;
 }
 
@@ -68,6 +124,11 @@ interface SubagentRunRow {
   budget_max_wall_ms: number | null;
   policy_snapshot: string;
   hooks_snapshot: string | null;
+  tool_restrictions: string | null;
+  sampling: string | null;
+  reference_paths: string | null;
+  output_schema: string | null;
+  context_recipe: string | null;
   captured_at: number;
 }
 
@@ -146,6 +207,110 @@ const fromRow = (row: SubagentRunRow): SubagentRun => {
       hooksSnapshot = null;
     }
   }
+  // Defensive parse on tool_restrictions. Same tri-state shape as
+  // hooks_snapshot:
+  //   - `null` (column NULL) → no snapshot. Child runs with no
+  //     restriction gate.
+  //   - valid JSON object → use as-is (even when empty `{}`:
+  //     authoritative "author declared no restrictions").
+  //   - corrupt JSON / wrong shape → fall back to `null` so the
+  //     child path treats the row as "no snapshot". We do NOT
+  //     fall back to `{}`: a corrupt row should not silently
+  //     disable restrictions when the author authored them, and
+  //     an empty map at runtime is functionally identical to
+  //     null anyway.
+  let toolRestrictions: ToolRestrictions | null;
+  if (row.tool_restrictions === null) {
+    toolRestrictions = null;
+  } else {
+    try {
+      const parsed = JSON.parse(row.tool_restrictions) as unknown;
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        toolRestrictions = parsed as ToolRestrictions;
+      } else {
+        toolRestrictions = null;
+      }
+    } catch {
+      toolRestrictions = null;
+    }
+  }
+  // Defensive parse on sampling. Same shape rules as
+  // tool_restrictions (a map of override fields, not an array,
+  // not a primitive). Corrupt or wrong-shape rows fall back to
+  // null — child runs with provider defaults rather than picking
+  // up a half-applied override.
+  let sampling: SamplingOverride | null;
+  if (row.sampling === null) {
+    sampling = null;
+  } else {
+    try {
+      const parsed = JSON.parse(row.sampling) as unknown;
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        sampling = parsed as SamplingOverride;
+      } else {
+        sampling = null;
+      }
+    } catch {
+      sampling = null;
+    }
+  }
+  // Defensive parse on reference_paths. Shape: string[]. Same
+  // tri-state convention. Wrong shape (object, mixed types,
+  // etc.) collapses to null; the child renders no reference
+  // block in that case rather than a malformed list.
+  let references: string[] | null;
+  if (row.reference_paths === null) {
+    references = null;
+  } else {
+    try {
+      const parsed = JSON.parse(row.reference_paths) as unknown;
+      if (Array.isArray(parsed) && parsed.every((e) => typeof e === 'string')) {
+        references = parsed;
+      } else {
+        references = null;
+      }
+    } catch {
+      references = null;
+    }
+  }
+  // Defensive parse on output_schema. Shape: object mapping.
+  // Wrong shape (array, primitive) collapses to null → child
+  // runs with no schema enforcement, preserving the legacy
+  // free-form output behavior. Refusing the row would punish
+  // a corrupt audit instead of degrading gracefully.
+  let outputSchema: Record<string, unknown> | null;
+  if (row.output_schema === null) {
+    outputSchema = null;
+  } else {
+    try {
+      const parsed = JSON.parse(row.output_schema) as unknown;
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        outputSchema = parsed as Record<string, unknown>;
+      } else {
+        outputSchema = null;
+      }
+    } catch {
+      outputSchema = null;
+    }
+  }
+  // Defensive parse on context_recipe. Same shape rules as
+  // sampling — a corrupt or wrong-shape row collapses to null
+  // (recipe disabled rather than partially applied).
+  let contextRecipe: ContextRecipe | null;
+  if (row.context_recipe === null) {
+    contextRecipe = null;
+  } else {
+    try {
+      const parsed = JSON.parse(row.context_recipe) as unknown;
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        contextRecipe = parsed as ContextRecipe;
+      } else {
+        contextRecipe = null;
+      }
+    } catch {
+      contextRecipe = null;
+    }
+  }
   return {
     sessionId: row.session_id,
     name: row.name,
@@ -159,6 +324,11 @@ const fromRow = (row: SubagentRunRow): SubagentRun => {
     budgetMaxWallMs: row.budget_max_wall_ms,
     policySnapshot,
     hooksSnapshot,
+    toolRestrictions,
+    sampling,
+    references,
+    outputSchema,
+    contextRecipe,
     capturedAt: row.captured_at,
   };
 };
@@ -195,6 +365,45 @@ export interface InsertSubagentRunInput {
   // migration's drift-prevention guarantee for hookless
   // parents. The discriminator now lives on the wire.
   hooksSnapshot?: readonly HookSpec[];
+  // Per-playbook tool_restrictions snapshot (migration 024).
+  // Tri-state mirrors `hooksSnapshot`:
+  //   - undefined / omitted → row's `tool_restrictions` column
+  //     stays NULL; child treats this as "no snapshot, no gate".
+  //   - empty object `{}` → authoritative "author declared no
+  //     restrictions". Functionally identical to undefined at
+  //     runtime, but distinguishable in audit.
+  //   - non-empty `ToolRestrictions` → rule map per tool.
+  toolRestrictions?: ToolRestrictions;
+  // Per-playbook sampling override (migration 025). Tri-state
+  // mirrors `toolRestrictions`:
+  //   - undefined / omitted → column NULL ⇒ child uses provider
+  //     defaults. Programmatic callers without a sampling block
+  //     land here.
+  //   - empty object `{}` → authoritative "author declared no
+  //     overrides". Functionally identical to undefined at
+  //     runtime, but distinguishable in audit.
+  //   - non-empty `SamplingOverride` → override map per field.
+  sampling?: SamplingOverride;
+  // Per-playbook reference paths (migration 026). Tri-state:
+  //   - undefined / omitted → column NULL ⇒ child appends no
+  //     reference block.
+  //   - `[]` → empty list snapshot. Same runtime as undefined
+  //     but distinguishable in audit ("author declared no refs"
+  //     vs "no snapshot taken").
+  //   - non-empty `string[]` → paths rendered in the prompt's
+  //     trailing reference block.
+  references?: readonly string[];
+  // Per-playbook output_schema snapshot (migration 027). Two-
+  // state: undefined ⇒ column NULL ⇒ child runs without schema
+  // enforcement; non-empty object ⇒ JSON-serialized into the
+  // column. The runtime collapses an empty object to "no
+  // enforcement" because the validator can't fail on it anyway.
+  outputSchema?: Record<string, unknown>;
+  // Per-playbook context_recipe snapshot (migration 028).
+  // Two-state: undefined ⇒ column NULL ⇒ child uses default
+  // behavior on memory + prompt composition; non-empty
+  // `ContextRecipe` ⇒ JSON-serialized into the column.
+  contextRecipe?: ContextRecipe;
   capturedAt?: number;
 }
 
@@ -220,12 +429,41 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     input.hooksSnapshot !== undefined && input.hooksSnapshot !== null
       ? JSON.stringify(input.hooksSnapshot)
       : null;
+  // Same NULL-vs-array convention for tool_restrictions: undefined
+  // ⇒ column NULL (no snapshot taken); explicit object ⇒ JSON
+  // serialization. The runtime collapses both NULL and `'{}'` to
+  // passthrough, but the column distinction survives in audit.
+  const restrictionsJson =
+    input.toolRestrictions !== undefined && input.toolRestrictions !== null
+      ? JSON.stringify(input.toolRestrictions)
+      : null;
+  // Same NULL-vs-object convention for sampling: undefined ⇒
+  // column NULL (no snapshot taken); explicit object ⇒ JSON.
+  const samplingJson =
+    input.sampling !== undefined && input.sampling !== null ? JSON.stringify(input.sampling) : null;
+  // Same NULL-vs-array convention for reference_paths.
+  const referencesJson =
+    input.references !== undefined && input.references !== null
+      ? JSON.stringify(input.references)
+      : null;
+  // Same NULL-vs-object convention for output_schema.
+  const outputSchemaJson =
+    input.outputSchema !== undefined && input.outputSchema !== null
+      ? JSON.stringify(input.outputSchema)
+      : null;
+  // Same NULL-vs-object convention for context_recipe.
+  const contextRecipeJson =
+    input.contextRecipe !== undefined && input.contextRecipe !== null
+      ? JSON.stringify(input.contextRecipe)
+      : null;
   db.query(
     `INSERT INTO subagent_runs
        (session_id, name, scope, source_path, source_sha256, system_prompt,
         tools_whitelist, budget_max_steps, budget_max_cost_usd,
-        budget_max_wall_ms, policy_snapshot, hooks_snapshot, captured_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        budget_max_wall_ms, policy_snapshot, hooks_snapshot,
+        tool_restrictions, sampling, reference_paths, output_schema,
+        context_recipe, captured_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     input.sessionId,
     input.name,
@@ -239,6 +477,11 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     wallMs,
     policyJson,
     hooksJson,
+    restrictionsJson,
+    samplingJson,
+    referencesJson,
+    outputSchemaJson,
+    contextRecipeJson,
     capturedAt,
   );
   // Resolve the snapshot for the return value with the same
@@ -261,6 +504,11 @@ export const insertSubagentRun = (db: DB, input: InsertSubagentRunInput): Subage
     budgetMaxWallMs: wallMs,
     policySnapshot,
     hooksSnapshot: input.hooksSnapshot ?? null,
+    toolRestrictions: input.toolRestrictions ?? null,
+    sampling: input.sampling ?? null,
+    references: input.references === undefined ? null : [...input.references],
+    outputSchema: input.outputSchema ?? null,
+    contextRecipe: input.contextRecipe ?? null,
     capturedAt,
   };
 };
@@ -279,7 +527,9 @@ export const getSubagentRun = (db: DB, sessionId: string): SubagentRun | null =>
     .query<SubagentRunRow, [string]>(
       `SELECT session_id, name, scope, source_path, source_sha256, system_prompt,
               tools_whitelist, budget_max_steps, budget_max_cost_usd,
-              budget_max_wall_ms, policy_snapshot, hooks_snapshot, captured_at
+              budget_max_wall_ms, policy_snapshot, hooks_snapshot,
+              tool_restrictions, sampling, reference_paths, output_schema,
+              context_recipe, captured_at
          FROM subagent_runs
         WHERE session_id = ?`,
     )

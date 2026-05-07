@@ -36,6 +36,7 @@ const main = async (): Promise<number> => {
       cwd: process.cwd(),
       force: args.init.force,
       mode: args.init.mode,
+      playbooks: args.init.playbooks,
       out: (s) => process.stdout.write(s),
       err: (s) => process.stderr.write(s),
     });

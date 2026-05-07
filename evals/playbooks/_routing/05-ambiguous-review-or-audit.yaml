@@ -1,0 +1,8 @@
+name: 05-ambiguous-review-or-audit
+prompt: |-
+  Take a look at the auth middleware I just changed. I want
+  feedback on quality AND whether there are security concerns.
+expect_dispatch: ambiguous
+ambiguous_acceptable:
+  - code-review
+  - security-audit

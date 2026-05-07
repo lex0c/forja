@@ -150,6 +150,134 @@ describe('createOpenAIProvider', () => {
     expect(tools[0]?.function.name).toBe('read_file');
   });
 
+  test('seed_in_eval=true derives a deterministic seed for the OpenAI request', async () => {
+    // OpenAI's `seed` is the canonical reproducibility surface
+    // for Chat Completions. When the playbook frontmatter sets
+    // sampling.seed_in_eval: true, the harness threads
+    // seed_in_eval onto the GenerateRequest; the adapter must
+    // translate boolean intent into a numeric seed. Two calls
+    // with the same conversation must produce the same seed
+    // (replay reproducibility), and a different conversation
+    // must produce a different seed (so step N and step N+1
+    // within a run don't collapse to the same output).
+    const baseReq = {
+      model: 'gpt-4o',
+      system: 'be brief',
+      messages: [{ role: 'user' as const, content: 'q' }],
+      max_tokens: 4,
+      seed_in_eval: true,
+    };
+    const handleA = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const providerA = createOpenAIProvider('gpt-4o', { client: handleA.client });
+    for await (const _ of providerA.generate(baseReq)) {
+      // drain
+    }
+    const seedA = (handleA.createCalls[0]?.params as Record<string, unknown>).seed;
+    expect(typeof seedA).toBe('number');
+
+    // Same request → same seed.
+    const handleB = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const providerB = createOpenAIProvider('gpt-4o', { client: handleB.client });
+    for await (const _ of providerB.generate(baseReq)) {
+      // drain
+    }
+    const seedB = (handleB.createCalls[0]?.params as Record<string, unknown>).seed;
+    expect(seedB).toBe(seedA);
+
+    // Different conversation → different seed.
+    const handleC = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const providerC = createOpenAIProvider('gpt-4o', { client: handleC.client });
+    for await (const _ of providerC.generate({
+      ...baseReq,
+      messages: [{ role: 'user' as const, content: 'different prompt' }],
+    })) {
+      // drain
+    }
+    const seedC = (handleC.createCalls[0]?.params as Record<string, unknown>).seed;
+    expect(seedC).not.toBe(seedA);
+  });
+
+  test('seed_in_eval=true varies the seed across steps within a run', async () => {
+    // Within a multi-step run the message history grows each
+    // step (model emits assistant turn → tools → next user
+    // input). The seed MUST differ across steps; otherwise
+    // every seeded step samples from the same trajectory and
+    // collapses to repetitive outputs. Pin the property here
+    // so a future change that, say, hashes only `system` does
+    // not silently regress to step-collapse.
+    const reqStep1 = {
+      model: 'gpt-4o',
+      system: 'be brief',
+      messages: [{ role: 'user' as const, content: 'q' }],
+      max_tokens: 4,
+      seed_in_eval: true,
+    };
+    const reqStep2 = {
+      ...reqStep1,
+      messages: [
+        { role: 'user' as const, content: 'q' },
+        { role: 'assistant' as const, content: 'first answer' },
+        { role: 'user' as const, content: 'follow up' },
+      ],
+    };
+    const handle1 = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const provider1 = createOpenAIProvider('gpt-4o', { client: handle1.client });
+    for await (const _ of provider1.generate(reqStep1)) {
+      // drain
+    }
+    const seed1 = (handle1.createCalls[0]?.params as Record<string, unknown>).seed;
+
+    const handle2 = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const provider2 = createOpenAIProvider('gpt-4o', { client: handle2.client });
+    for await (const _ of provider2.generate(reqStep2)) {
+      // drain
+    }
+    const seed2 = (handle2.createCalls[0]?.params as Record<string, unknown>).seed;
+
+    expect(seed2).not.toBe(seed1);
+  });
+
+  test('derived seed lands inside the int32 range (no overflow)', async () => {
+    // Gemini's seed is documented int32 (max 2^31 - 1). The
+    // derivation lives in shared seed.ts but the consequence
+    // surfaces here — pin that the value the OpenAI adapter
+    // emits is also a valid int32 so nobody downcasts the
+    // helper to uint32 by mistake.
+    const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const provider = createOpenAIProvider('gpt-4o', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'gpt-4o',
+      messages: [{ role: 'user' as const, content: 'q' }],
+      max_tokens: 4,
+      seed_in_eval: true,
+    })) {
+      // drain
+    }
+    const seed = (handle.createCalls[0]?.params as Record<string, unknown>).seed as number;
+    expect(Number.isInteger(seed)).toBe(true);
+    expect(seed).toBeGreaterThanOrEqual(-2_147_483_648);
+    expect(seed).toBeLessThanOrEqual(2_147_483_647);
+  });
+
+  test('seed_in_eval omitted leaves the seed param absent', async () => {
+    // Counterpart pin: without the flag, the adapter must NOT
+    // synthesize a seed — the model is free to use its own
+    // sampling. Refusing to default a seed is the right shape
+    // because non-eval requests should not be silently pinned
+    // to a deterministic trajectory.
+    const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
+    const provider = createOpenAIProvider('gpt-4o', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: 'q' }],
+      max_tokens: 4,
+    })) {
+      // drain
+    }
+    const params = handle.createCalls[0]?.params as Record<string, unknown>;
+    expect(params.seed).toBeUndefined();
+  });
+
   test('generate sends stream_options.include_usage by default', async () => {
     const handle = mockClient([{ choices: [{ delta: {}, finish_reason: 'stop' }] }]);
     const provider = createOpenAIProvider('gpt-4o', { client: handle.client });

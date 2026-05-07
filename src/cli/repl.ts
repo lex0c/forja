@@ -32,6 +32,8 @@ import {
   loadHistory,
   searchHistory,
 } from '../storage/history.ts';
+import { completeSession, createSession } from '../storage/repos/sessions.ts';
+import { runSubagent } from '../subagents/index.ts';
 import { addTrustedDir, isTrusted, trustListPath } from '../trust/index.ts';
 import {
   type FocusHandler,
@@ -78,6 +80,11 @@ export interface RunReplOptions {
   // Tests inject a fake that drives a scripted set of HarnessEvents
   // through `cfg.onEvent` and resolves a HarnessResult.
   runAgentOverride?: (cfg: HarnessConfig) => Promise<HarnessResult>;
+  // Test seam: replace the subagent runtime entry used by the
+  // playbook dispatcher. Defaults to `runSubagent`. Tests inject a
+  // fake to capture the input (especially `onPermissionAsk`) without
+  // spinning up a child Bun subprocess.
+  runSubagentOverride?: typeof runSubagent;
   // Stdin source. Production wires to `process.stdin`; tests inject
   // an EventEmitter-backed fake that doesn't need a TTY.
   stdin?: NodeJS.ReadStream;
@@ -250,6 +257,25 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     resolveExit = r;
   });
   let running = false;
+  // Mirrors `running` for slash playbook dispatches. Foreground
+  // turns and slash playbooks share the provider, the DB, and the
+  // permission engine — running them concurrently would interleave
+  // tool calls and audit rows under the same parent session, which
+  // the playbook layer's "one-at-a-time" contract was meant to
+  // prevent. The slash `exec` body checks `ctx.isRunning()`
+  // synchronously before awaiting `runPlaybook`; flipping this flag
+  // SYNCHRONOUSLY at the top of `runPlaybook` (before its first
+  // await) ensures a second slash dispatch fired in the same Enter
+  // burst sees `isRunning() === true` and refuses cleanly.
+  let playbookRunning = false;
+  // Single busy predicate threaded through every submit gate
+  // (foreground startTurn, Enter in the editor, Enter in
+  // reverse-search) AND the slash dispatcher's `isRunning()`
+  // closure. Without it, the foreground submit paths would gate
+  // on `running` alone and let a normal turn start mid-playbook
+  // — the exact serialization the playbookRunning flag was
+  // supposed to enforce, defeated at every other entry point.
+  const isBusy = (): boolean => running || playbookRunning;
 
   const ESC_DRAIN_MS = 30;
   let drainTimer: ReturnType<typeof setTimeout> | null = null;
@@ -526,6 +552,44 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // this function.
   let lastSessionId: string | null = null;
 
+  // Synthetic parent session id for slash playbook dispatches that
+  // happen BEFORE any normal turn has run. `runSubagent` requires a
+  // `parentSessionId` for audit attribution + budget cascading; the
+  // bridge used to refuse with "no session yet" until the operator
+  // typed a regular prompt first. The synthetic is created lazily on
+  // the first slash dispatch (see `ensureParentSessionId` below),
+  // immediately closed to status='done' so it doesn't sit running
+  // forever, and reused across subsequent dispatches until a real
+  // turn assigns `lastSessionId` — at which point the real id wins
+  // and the synthetic is left as a no-cost / no-message orphan in
+  // the sessions table.
+  //
+  // Marked `is_subagent: true` so it stays hidden from top-level
+  // surfaces. Without that flag the synthetic lands as the most
+  // recent top-level row for this cwd, and `--resume last`
+  // (listSessions(..., { cwd, limit: 1 }) filtered to
+  // is_subagent = 0) resurrects an empty shell instead of the
+  // operator's real conversation. The flag also keeps
+  // `--list-sessions` clean of these audit-only rows.
+  let syntheticParentSessionId: string | null = null;
+  const ensureParentSessionId = (): string => {
+    if (lastSessionId !== null) return lastSessionId;
+    if (syntheticParentSessionId !== null) return syntheticParentSessionId;
+    const synthetic = createSession(db, {
+      model: baseConfig.provider.id,
+      cwd: baseConfig.cwd,
+      isSubagent: true,
+    });
+    // Immediately close. The session row exists only as an audit
+    // anchor for the slash dispatch's child; it has no turns, no
+    // messages, no cost. Leaving it 'running' would pile up over
+    // a long REPL session that does many slash dispatches before
+    // any normal turn (rare but possible in eval / scripted runs).
+    completeSession(db, synthetic.id, 'done', 0, true);
+    syntheticParentSessionId = synthetic.id;
+    return synthetic.id;
+  };
+
   // ─── Input history (HISTORY.md §2.1) ───────────────────────────────
   // In-memory mirror of repl_history for the current project, oldest-
   // first. Loaded once at boot — concurrent REPLs in the same project
@@ -702,6 +766,23 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // can't leak forward.
   let abortController: AbortController | null = null;
   let softStopController: AbortController | null = null;
+  // Mirror controllers for the slash playbook dispatcher's
+  // runSubagent call. Set inside runPlaybook before the await
+  // and cleared in its finally block; triggerInterrupt below
+  // aborts whichever pair (foreground OR playbook) is live so
+  // Esc / Ctrl+C / SIGINT preempt a long-running /<playbook>
+  // dispatch the same way they preempt a foreground turn.
+  let playbookAbortController: AbortController | null = null;
+  let playbookSoftStopController: AbortController | null = null;
+  // Promise handle for the in-flight slash playbook dispatch.
+  // shutdown() aborts the playbook controller AND awaits this so
+  // the child's setSubagentPayload completes before db.close() —
+  // without it, /quit during a long /<playbook> tears down the
+  // SQLite handle while the runtime is still flushing the
+  // envelope, surfacing as a "database is closed" throw and
+  // leaking the child subprocess past REPL exit. Mirrors the
+  // foreground `runningPromise` contract.
+  let playbookPromise: Promise<unknown> | null = null;
   // The promise returned by the in-flight runAgent (already wrapped
   // in `.catch().finally()`, so awaiting never throws). `shutdown`
   // awaits this before closing the DB so the harness's async cleanup
@@ -865,7 +946,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   }): Promise<'yes' | 'no' | 'cancel'> => modalManager.askMemoryUserScope(req);
 
   const startTurn = (text: string): void => {
-    if (running || exiting) return;
+    if (isBusy() || exiting) return;
     running = true;
     // Mint a fresh token for this turn and claim ownership of the
     // shared state slots (running / abortController / runningPromise).
@@ -928,6 +1009,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // function does the work without needing its own guard.
   const shutdown = async (): Promise<void> => {
     if (abortController !== null) abortController.abort();
+    // Same hard-abort signal for an in-flight slash playbook so
+    // its runSubagent settles instead of running to natural
+    // completion past the operator's /quit. The promise await
+    // below blocks db.close() until the child's payload write
+    // lands.
+    if (playbookAbortController !== null) playbookAbortController.abort();
     // Cancel any pending idle-exit-gate timer so a 2s setTimeout
     // doesn't outlive the REPL and leak a node handle (visible in
     // tests as Bun's "open handles" warning, and in production as
@@ -942,6 +1029,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // and SQLite throws on the closed handle. The promise is already
     // .catch()ed so awaiting never throws.
     if (runningPromise !== null) await runningPromise;
+    // Same wait for the playbook dispatch — the runtime's final
+    // `setSubagentPayload` AND `reclassifySessionStatus` calls land
+    // BEFORE db.close(), keeping the audit trail consistent with
+    // the published envelope even on a /quit-mid-playbook race.
+    if (playbookPromise !== null) {
+      try {
+        await playbookPromise;
+      } catch {
+        // Swallow — runPlaybook's caller (slash exec) already
+        // surfaces failures via the slash bus error channel; the
+        // shutdown path only needs the wait, not the verdict.
+      }
+    }
     modalManager.close();
     renderer.close();
     stdin.removeListener('data', onData);
@@ -978,10 +1078,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   const triggerInterrupt = (): void => {
     const level: 'soft' | 'hard' = renderer.state().softInterrupted ? 'hard' : 'soft';
     bus.emit({ type: 'interrupt', ts: now(), level });
-    if (level === 'hard' && abortController !== null) {
-      abortController.abort();
-    } else if (level === 'soft' && softStopController !== null) {
-      softStopController.abort();
+    if (level === 'hard') {
+      if (abortController !== null) abortController.abort();
+      // Abort the playbook controller TOO if a slash dispatch
+      // is in flight. Foreground and playbook controllers are
+      // never both populated simultaneously (the busy gate
+      // serializes them), so this is "abort whichever is live"
+      // rather than two separate state machines.
+      if (playbookAbortController !== null) playbookAbortController.abort();
+    } else {
+      if (softStopController !== null) softStopController.abort();
+      if (playbookSoftStopController !== null) playbookSoftStopController.abort();
     }
   };
 
@@ -1045,13 +1152,20 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // behind it. Modal still resolves 'cancel' via the manager's own
   // path; we just skip the spurious interrupt emit.
   onModalInterrupt = () => {
-    if (running) triggerInterrupt();
+    if (isBusy()) triggerInterrupt();
   };
 
   // Slash command registry + cumulative tracker for /cost. Built once
   // per REPL session — the registry is stable; cumulative is mutated
   // by startTurn's success branch and read by /cost.
-  const slashRegistry = createBuiltinRegistry();
+  //
+  // Pass the discovered subagents in so every definition with a
+  // `slash:` field auto-registers as a slash command (`PLAYBOOKS.md`
+  // §1.4). The registry's duplicate-name guard surfaces conflicts
+  // between a builtin and a playbook author's chosen slash at boot
+  // — no chance of a typed `/<conflict>` ambiguously routing
+  // mid-session.
+  const slashRegistry = createBuiltinRegistry(subagents);
   const cumulative = { costUsd: 0, steps: 0, turns: 0 };
   // Single registry instance for the REPL's lifetime. /model uses it
   // for the lookup + factory; bootstrap built its own at boot for
@@ -1068,10 +1182,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     cumulative,
     now,
     requestShutdown,
-    // Closure over the REPL's `running` flag — fresh read per call so
-    // a slash command queued before a turn starts but executed after
-    // observes the post-startTurn state.
-    isRunning: () => running,
+    // Closure over the REPL's busy state — fresh read per call so
+    // a slash command queued before a turn starts but executed
+    // after observes the post-startTurn state. The same predicate
+    // (`isBusy`) gates foreground submit paths; pinning all
+    // surfaces to one source of truth means there is no Enter /
+    // reverse-search path that can sneak a normal turn past a
+    // playbook in flight, and no slash dispatch that can race a
+    // foreground turn.
+    isRunning: () => isBusy(),
     // Most recent session id (closure so it's read fresh per slash
     // call). Set after the first turn's session_finished event;
     // null between boot and first turn. /memory show forwards this
@@ -1123,6 +1242,160 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // be visible to `/history on` even though the env never
       // changes. Cheap (single existsSync against `.agent/no-history`).
       optOutReason: () => historyOptOutReason(baseConfig.cwd),
+    },
+    // Playbook dispatcher (`PLAYBOOKS.md` §1.4). Slash commands
+    // built from subagent definitions invoke this to run a child
+    // inline against the operator's session. Same `runSubagent`
+    // path the harness uses for `task_*` tool calls — provider,
+    // tool registry, permission engine, trust verdict all
+    // inherited from `baseConfig`.
+    //
+    // Two preconditions surface early as user-visible errors so
+    // the operator gets a clear cause rather than a deferred
+    // failure mid-run:
+    //
+    //   1. Definition unknown — slash registration filtered defs
+    //      without `slash:`, but a typo or dynamic shadow change
+    //      could still produce a name the registry doesn't have.
+    //
+    // No "session yet" precondition: `ensureParentSessionId` lazily
+    // creates a synthetic parent on the first dispatch when a real
+    // turn hasn't run — the operator can `/review` immediately on
+    // boot. The slash command itself further gates on `isRunning()`
+    // so a slash dispatch never races a foreground turn.
+    runPlaybook: async ({ name, prompt }) => {
+      // Defensive serialization. The slash command's `exec` body
+      // checks `ctx.isRunning()` before calling us, but a programmatic
+      // caller (or a future slash path that forgets the gate) could
+      // re-enter while a prior dispatch is still mid-flight. Refusing
+      // here preserves the one-at-a-time contract regardless of how
+      // we're invoked. Set the flag SYNCHRONOUSLY before any await so
+      // a second dispatch queued in the same Enter burst sees
+      // `isRunning() === true` and refuses cleanly via the slash
+      // surface (which renders an operator-friendly error) rather
+      // than landing on this throw.
+      if (playbookRunning) {
+        throw new Error(`playbook '${name}' rejected — another playbook dispatch is in flight`);
+      }
+      const definition = subagents.byName.get(name);
+      if (definition === undefined) {
+        throw new Error(`playbook '${name}' is not registered`);
+      }
+      playbookRunning = true;
+      // Fresh per-dispatch controllers. `triggerInterrupt`
+      // (Esc / Ctrl+C / SIGINT / modal-cancel) reads these as a
+      // mirror of the foreground per-turn controllers and
+      // aborts whichever pair is live. The finally block clears
+      // them so a subsequent triggerInterrupt fired in idle
+      // does not abort a stale signal.
+      const ac = new AbortController();
+      const softAc = new AbortController();
+      playbookAbortController = ac;
+      playbookSoftStopController = softAc;
+      try {
+        const parentSessionId = ensureParentSessionId();
+        const runSubagentImpl = options.runSubagentOverride ?? runSubagent;
+        // Capture the dispatch promise BEFORE awaiting so the
+        // module-scope `playbookPromise` ref points at the same
+        // settle the shutdown path can wait on. Without the
+        // pre-await capture, shutdown would either close the DB
+        // before the runtime's `setSubagentPayload` /
+        // `reclassifySessionStatus` writes land or have nothing
+        // to wait on at all.
+        const dispatchPromise = runSubagentImpl({
+          definition,
+          prompt,
+          parentSessionId,
+          provider: baseConfig.provider,
+          parentToolRegistry: baseConfig.toolRegistry,
+          permissionEngine: baseConfig.permissionEngine,
+          db,
+          cwd: baseConfig.cwd,
+          signal: ac.signal,
+          softStopSignal: softAc.signal,
+          subagentRegistry: subagents,
+          ...(baseConfig.isCwdTrusted !== undefined ? { cwdTrusted: baseConfig.isCwdTrusted } : {}),
+          // Forward the session-level temperature pin to the
+          // child. Without this, /<playbook> dispatch diverges
+          // from the foreground task_* spawn path
+          // (harness/loop.ts ~1010), which DOES forward
+          // config.temperature: an eval rig that started the
+          // REPL with temperature: 0 would see deterministic
+          // task_sync runs but nondeterministic /<playbook>
+          // runs depending on the route the model picks.
+          // Reading per-dispatch from baseConfig.provider so a
+          // mid-session /model swap (which mints a new provider
+          // object) is observed; reading temperature too keeps
+          // the precedence ladder honest.
+          ...(baseConfig.temperature !== undefined ? { temperature: baseConfig.temperature } : {}),
+          // Hook chain snapshot. The foreground task_* spawn path
+          // in harness/loop.ts forwards config.hooks as
+          // hooksSnapshot so the child uses the parent's validated
+          // chain instead of re-resolving hooks.toml from disk —
+          // closes the drift window where a human edit between
+          // parent boot and child startup would land the child on
+          // a different chain than the operator validated. Without
+          // this forward the slash dispatch path opens that exact
+          // drift hole; mirror the loop's wiring.
+          ...(baseConfig.hooks !== undefined ? { hooksSnapshot: baseConfig.hooks } : {}),
+          // Plan mode propagation. When `/plan on` is active the
+          // foreground harness refuses every writing tool — the
+          // slash dispatcher must inherit the same gate, otherwise
+          // `/<playbook> ...` becomes a sandbox escape that runs
+          // mutating tools while the operator believes the session
+          // is read-only. Mirrors the harness's spawnSubagentImpl
+          // wiring (loop.ts) — read fresh from baseConfig per
+          // dispatch so a /plan toggle BETWEEN dispatches takes
+          // effect immediately.
+          ...(baseConfig.planMode === true ? { planMode: true } : {}),
+          // Permission proxy (spec docs/spec/IPC.md §7). Without this
+          // the runtime auto-denies every child `permission:ask`, so a
+          // playbook that touches a confirm-gated tool (bash / write
+          // under `confirm` policy) would silently fail with denials
+          // instead of prompting the operator. Mirrors the harness's
+          // spawnSubagentImpl wiring (loop.ts) — the `boolean ↔
+          // PermissionDecision` shape adapter is the same one.
+          onPermissionAsk: async (req) => {
+            const allowed = await confirmPermission({
+              toolName: req.toolName,
+              args: req.args,
+              cwd: req.cwd,
+              prompt: req.prompt,
+              subagent: req.subagent,
+              signal: req.signal,
+            });
+            return allowed ? 'allow' : 'deny';
+          },
+        });
+        playbookPromise = dispatchPromise;
+        const result = await dispatchPromise;
+        // Roll the playbook spend into the REPL cumulative tracker.
+        // Without this, /cost reports zero for slash-dispatched
+        // playbooks because the foreground `session_finished` path
+        // (the only place cumulative is mutated) never fires for
+        // them — the harness never ran for the parent. NaN-guarded
+        // because a misbehaving runtime could synthesize a
+        // non-finite cost on a kill path; including it would poison
+        // the running total for every subsequent dispatch.
+        if (Number.isFinite(result.costUsd)) {
+          cumulative.costUsd += result.costUsd;
+        }
+        cumulative.steps += result.steps;
+        cumulative.turns += 1;
+        return result;
+      } finally {
+        // Drop the gate even on throw — a stuck `playbookRunning`
+        // would lock the operator out of every subsequent dispatch
+        // until process restart. Same logic for the controllers
+        // and the promise ref: clear them so a subsequent
+        // triggerInterrupt / shutdown fired in idle does not
+        // call abort() on a settled signal or await a stale
+        // promise.
+        playbookRunning = false;
+        playbookAbortController = null;
+        playbookSoftStopController = null;
+        playbookPromise = null;
+      }
     },
   };
 
@@ -1210,10 +1483,10 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         if (key.name === 'enter') {
           const match = currentReverseSearchMatch();
           if (match === null) return true;
-          if (running) {
+          if (isBusy()) {
             // Mid-turn protection: same gate the normal Enter path
-            // honors (`!running`). Operator gets the recalled buffer
-            // staged but no submit until the turn ends.
+            // honors (`!isBusy()`). Operator gets the recalled buffer
+            // staged but no submit until the turn OR playbook ends.
             bus.emit({ type: 'input:update', ts: now(), value: match, cursor: match.length });
             closeReverseSearch();
             return true;
@@ -1275,12 +1548,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       if (key.kind === 'char') {
         if (key.ctrl && key.char === 'c') {
           // Close the overlay, then route through the same ladder
-          // the editor handler uses for raw-mode Ctrl+C: running →
+          // the editor handler uses for raw-mode Ctrl+C: busy →
           // soft/hard interrupt; idle → arm/exit double-tap gate
           // (UI.md §5.4). cancelExitArm is implicit in
-          // handleIdleInterrupt's arm path.
+          // handleIdleInterrupt's arm path. `isBusy()` covers
+          // both a foreground turn and an in-flight playbook so
+          // either can be preempted from reverse-search mode.
           closeReverseSearch();
-          if (running) {
+          if (isBusy()) {
             triggerInterrupt();
           } else {
             handleIdleInterrupt();
@@ -1288,12 +1563,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           return true;
         }
         if (key.ctrl && key.char === 'd') {
-          // EOF convention. running → interrupt (consistent with the
+          // EOF convention. busy → interrupt (consistent with the
           // editor handler's `result.cancelInput === 'eof'` branch);
           // idle → direct exit 130, no double-tap (shell EOF is one
           // explicit decision per spec UI.md §5.4).
           closeReverseSearch();
-          if (running) {
+          if (isBusy()) {
             triggerInterrupt();
           } else {
             exitCode = 130;
@@ -1558,24 +1833,27 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       updateSlashSuggestions(result.next.value);
     }
 
-    // Enter while a turn is running is ignored — no double-submit. The
-    // typed text stays in the buffer (applyKey doesn't clear; only the
-    // user:submit reducer would, which we're not emitting). The user
-    // can hit Enter again once the turn ends.
-    if (result.submit !== undefined && !running) {
+    // Enter while a turn or playbook is in flight is ignored — no
+    // double-submit. The typed text stays in the buffer (applyKey
+    // doesn't clear; only the user:submit reducer would, which
+    // we're not emitting). The user can hit Enter again once the
+    // run ends.
+    if (result.submit !== undefined && !isBusy()) {
       bus.emit({ type: 'user:submit', ts: now(), text: result.submit.text });
       recordHistorySubmit(result.submit.text);
       startTurn(result.submit.text);
     }
 
     // Ctrl+C with empty buffer:
-    //   - running → soft/hard interrupt ladder (same as Esc and SIGINT).
+    //   - busy → soft/hard interrupt ladder (same as Esc and SIGINT).
+    //     `isBusy()` covers both a foreground turn and an in-flight
+    //     playbook so either can be preempted from the editor.
     //   - idle → double-tap gate (UI.md §5.4): first press arms,
     //     second within 2s exits 130. Synchronous shutdown gate
     //     (`exiting` set in requestShutdown) keeps a stray follow-up
     //     keystroke from racing past the check.
     if (result.cancelInput === 'interrupt') {
-      if (running) {
+      if (isBusy()) {
         triggerInterrupt();
       } else {
         handleIdleInterrupt();

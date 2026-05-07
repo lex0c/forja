@@ -115,6 +115,28 @@ export interface AssembleMemorySectionInput {
   // production: subagent-child) pass the result of
   // `evaluateBootTriggers(cwd)`.
   bootContext?: BootContext;
+  // Per-playbook memory filter (`PLAYBOOKS.md` §1.1
+  // `context_recipe.memory_filter`). When provided, the
+  // assembled section keeps ONLY entries that match at least one
+  // value in the filter list, where a value matches if it is:
+  //
+  //   - the entry's `frontmatter.type` (`user` / `feedback` /
+  //     `project` / `reference`), OR
+  //   - present in the entry's `frontmatter.triggers` array
+  //     (free-form tags the author declared at memory creation).
+  //
+  // The filter applies AFTER the trust + boot-trigger pass, so
+  // it composes with the existing safety filters rather than
+  // replacing them. An empty list is treated as absent (no
+  // filter); a non-empty list with no matching entries yields
+  // an empty section (same shape as a registry with no
+  // memories).
+  //
+  // Subagent-only surface: bootstrap (the operator-facing root)
+  // intentionally does not consume this — the playbook is
+  // narrowing the model's view inside a subagent context, not
+  // the operator's.
+  memoryFilter?: ReadonlyArray<string>;
 }
 
 export interface AssembleMemorySectionResult {
@@ -159,7 +181,18 @@ export const assembleMemorySection = (
     const peek = input.registry.peek(l.name, { scope: l.scope });
     if (peek.kind !== 'present') return true; // uncertainty → include
     if (peek.file.frontmatter.trust === 'untrusted') return false;
-    return shouldEagerLoadByTriggers(peek.file.frontmatter.triggers, bootContext);
+    if (!shouldEagerLoadByTriggers(peek.file.frontmatter.triggers, bootContext)) return false;
+    // Per-playbook memory filter (slice 9). When the playbook's
+    // context_recipe.memory_filter is set, keep only entries
+    // whose `type` matches any filter value OR whose triggers
+    // intersect with one. Absent / empty filter is a no-op.
+    if (input.memoryFilter !== undefined && input.memoryFilter.length > 0) {
+      const ftype = peek.file.frontmatter.type;
+      const fTriggers = peek.file.frontmatter.triggers ?? [];
+      const matches = input.memoryFilter.some((f) => f === ftype || fTriggers.includes(f));
+      if (!matches) return false;
+    }
+    return true;
   });
   if (eligible.length === 0) {
     // Every memory was filtered out. Same empty-shape as a

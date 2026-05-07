@@ -1,0 +1,4 @@
+name: 03-no-dispatch-trivial-lookup
+prompt: |-
+  Where is the `composeWithParallelHint` function defined?
+expect_dispatch: none

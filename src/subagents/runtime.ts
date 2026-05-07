@@ -480,6 +480,46 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       // caller didn't supply a chain (older test fixtures,
       // programmatic callers without a hook context).
       ...(input.hooksSnapshot !== undefined ? { hooksSnapshot: input.hooksSnapshot } : {}),
+      // Mirror snapshot for tool_restrictions (migration 024,
+      // `PLAYBOOKS.md` §1.1). Same drift defense applied to the
+      // playbook's per-tool allow/deny lists: child reads from
+      // this row instead of re-parsing the .md, so an edit
+      // between spawn and child read can't relax / tighten gates
+      // mid-run. Absent (undefined) ⇒ column NULL ⇒ child runs
+      // with no restriction gate (the `tools[]` whitelist is the
+      // floor regardless).
+      ...(definition.toolRestrictions !== undefined
+        ? { toolRestrictions: definition.toolRestrictions }
+        : {}),
+      // Mirror snapshot for sampling overrides (migration 025,
+      // `PLAYBOOKS.md` §1.1). Same drift defense applied to
+      // generation parameters: the parent committed the values
+      // from the .md, the child runs the harness with exactly
+      // those overrides on every provider call.
+      ...(definition.sampling !== undefined ? { sampling: definition.sampling } : {}),
+      // Mirror snapshot for reference paths (migration 026,
+      // `PLAYBOOKS.md` §1.1). The child renders these as a
+      // trailing "References (read on demand)" block in its
+      // system prompt — the model reads them lazily via the
+      // `read_file` tool. Drift defense: a live edit to the
+      // .md between spawn and child read can't change which
+      // documents the child believes are "available for
+      // consultation".
+      ...(definition.references !== undefined ? { references: definition.references } : {}),
+      // Mirror snapshot for output_schema (migration 027,
+      // `PLAYBOOKS.md` §1.2). Child renders this into the
+      // system prompt as a "## Output schema" block AND
+      // validates the terminal text against it post-hoc.
+      // Drift defense: an edit to the schema after spawn cannot
+      // change what the child must produce.
+      ...(definition.outputSchema !== undefined ? { outputSchema: definition.outputSchema } : {}),
+      // Mirror snapshot for context_recipe (migration 028,
+      // `PLAYBOOKS.md` §1.1, `CONTEXT_TUNING.md` §13). Slice 9
+      // wires `memory_filter` and `step_reflection`; the other
+      // fields persist for forward-compat consumer slices.
+      ...(definition.contextRecipe !== undefined
+        ? { contextRecipe: definition.contextRecipe }
+        : {}),
     });
   } catch (e) {
     await cleanupOnFail();

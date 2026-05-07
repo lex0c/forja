@@ -10,6 +10,7 @@ import {
   getSession,
   listChildSessions,
   listSessions,
+  reclassifySessionStatus,
   reopenSession,
   updateSessionCost,
 } from '../../src/storage/repos/sessions.ts';
@@ -217,6 +218,89 @@ describe('sessions repo', () => {
     createSession(db, { model: 'm', cwd: '/p', parentSessionId: parent.id });
     expect(listSessions(db)).toHaveLength(1);
     expect(listSessions(db, { includeSubagents: true })).toHaveLength(3);
+  });
+
+  test('isSubagent override flags a parentless row as hidden', () => {
+    // Synthetic anchor rows (REPL slash playbook dispatches before
+    // any real turn) are parentless but audit-only; they should NOT
+    // surface as user-facing sessions even though
+    // `parentSessionId` is null. The override flips is_subagent
+    // explicitly so the default listing AND `--resume last` skip
+    // them.
+    const synthetic = createSession(db, { model: 'm', cwd: '/p', isSubagent: true });
+    expect(synthetic.parentSessionId).toBeNull();
+    expect(synthetic.isSubagent).toBe(true);
+    const fetched = getSession(db, synthetic.id);
+    expect(fetched?.isSubagent).toBe(true);
+    // Default listing — synthetic must be hidden.
+    expect(listSessions(db, { cwd: '/p' })).toHaveLength(0);
+    // `--resume last` shape: limit:1 over the cwd, default
+    // is_subagent filter. Should return nothing — there is no
+    // real conversation in /p, so resume falls back to "no
+    // session".
+    expect(listSessions(db, { cwd: '/p', limit: 1 })).toHaveLength(0);
+    // Only includeSubagents:true surfaces the synthetic — used
+    // by audit / debug paths that legitimately want to see
+    // every row.
+    expect(listSessions(db, { cwd: '/p', includeSubagents: true })).toHaveLength(1);
+  });
+
+  test('reclassifySessionStatus flips a finalized row from done to error', () => {
+    // Used by post-finalize failure detection — the playbook
+    // schema validator runs AFTER runAgent finalized the row
+    // to `done`, and a schema mismatch needs to mark the row
+    // as failed so audit queries keyed on `sessions.status`
+    // count the run correctly.
+    const s = createSession(db, { model: 'm', cwd: '/p' });
+    completeSession(db, s.id, 'done', 0, true);
+    reclassifySessionStatus(db, s.id, 'done', 'error');
+    const row = getSession(db, s.id);
+    expect(row?.status).toBe('error');
+  });
+
+  test('reclassifySessionStatus throws when the row is not in the expected state', () => {
+    // Strict precondition guard: refusing to override unknown
+    // states keeps `completeSession` as the canonical finalize
+    // path. A typo'd from-state surfaces at write time rather
+    // than silently no-op'ing.
+    const s = createSession(db, { model: 'm', cwd: '/p' });
+    // Row is 'running' — calling with expectedFrom='done' must throw.
+    expect(() => reclassifySessionStatus(db, s.id, 'done', 'error')).toThrow(
+      /not in expected 'done' state/,
+    );
+    // Finalize as 'done', then try to flip from 'interrupted' — must throw.
+    completeSession(db, s.id, 'done', 0, true);
+    expect(() => reclassifySessionStatus(db, s.id, 'interrupted', 'error')).toThrow(
+      /not in expected 'interrupted' state/,
+    );
+  });
+
+  test('reclassifySessionStatus throws when the session does not exist', () => {
+    expect(() => reclassifySessionStatus(db, 'missing-id', 'done', 'error')).toThrow(
+      /session missing-id not found/,
+    );
+  });
+
+  test('synthetic parent does not shadow a real session in --resume last', () => {
+    // The exact scenario the bug report describes: operator runs
+    // a slash playbook (synthetic created), then types a normal
+    // prompt (real session created). `--resume last` must pick
+    // the real session, not the synthetic that happened to be
+    // newer when its row landed.
+    const real = createSession(db, { model: 'm', cwd: '/p', startedAt: 1000 });
+    // Synthetic created LATER (newer started_at) — without the
+    // is_subagent flag this would shadow the real session in
+    // limit:1 ordering. Pinning startedAt makes the test
+    // deterministic regardless of system clock granularity.
+    createSession(db, {
+      model: 'm',
+      cwd: '/p',
+      isSubagent: true,
+      startedAt: 2000,
+    });
+    const last = listSessions(db, { cwd: '/p', limit: 1 });
+    expect(last).toHaveLength(1);
+    expect(last[0]?.id).toBe(real.id);
   });
 
   test('listChildSessions returns children oldest-first', () => {

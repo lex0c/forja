@@ -1,0 +1,19 @@
+name: 01-blocker-and-nit
+playbook: code-review
+prompt: |-
+  Review this diff:
+
+  diff --git a/src/queue.ts b/src/queue.ts
+  @@
+  +export function dequeue(): Job | null {
+  +  if (queue.len() === 0) return null;
+  +  const job = queue.pop();
+  +  return job ?? null;
+  +}
+
+  Look for race conditions, edge-case bugs, and style issues.
+expect:
+  output_schema_valid: true
+  output_contains:
+    - summary
+    - blockers

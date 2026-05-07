@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runSubagentChild } from '../../src/cli/subagent-child.ts';
+import { computeSchemaRetryBudget, runSubagentChild } from '../../src/cli/subagent-child.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
 import { openDb } from '../../src/storage/db.ts';
 import {
@@ -647,6 +647,229 @@ You are the worker.`,
     expect(exitCode).toBe(0);
     expect(recordedRequests.length).toBeGreaterThan(0);
     expect(recordedRequests[0]?.temperature).toBe(0);
+  });
+
+  test('sampling.seedInEval flows through to the harness provider request', async () => {
+    // Regression: the loader parsed and persisted seed_in_eval
+    // into the audit row, but subagent-child forwarded only
+    // temperature / topP / thinkingBudget — the determinism
+    // intent flag landed in snapshots and had zero runtime
+    // effect. Authors who declared seed_in_eval: true got
+    // unseeded generation regardless. The forward now puts it
+    // on HarnessConfig.seedInEval and harness/loop.ts threads
+    // it onto GenerateRequest.seed_in_eval where provider
+    // adapters can translate (or drop, per the same convention
+    // top_p / thinking_budget follow).
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    let childId: string;
+    const db = openDb(dbPath);
+    try {
+      migrate(db);
+      const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+      const child = sessionsRepo.createSession(db, {
+        model: 'mock/m',
+        cwd: dbDir,
+        parentSessionId: parent.id,
+      });
+      childId = child.id;
+      subagentRunsRepo.insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'project',
+        sourcePath: '/fake/explore.md',
+        sourceSha256: 'a'.repeat(64),
+        systemPrompt: 'You are explore.',
+        toolsWhitelist: [],
+        budgetMaxSteps: 5,
+        budgetMaxCostUsd: 0.1,
+        sampling: { seedInEval: true },
+      });
+      messagesRepo.appendMessage(db, {
+        sessionId: child.id,
+        role: 'user',
+        content: 'go',
+      });
+    } finally {
+      db.close();
+    }
+
+    const recordedSeed: Array<boolean | undefined> = [];
+    const recordingProvider: Provider = {
+      id: 'mock/m',
+      family: 'anthropic',
+      capabilities: {
+        tools: 'native',
+        cache: false,
+        vision: false,
+        streaming: true,
+        constrained: 'tools',
+        context_window: 1000,
+        output_max_tokens: 100,
+        cost_per_1k_input: 0,
+        cost_per_1k_output: 0,
+        notes: [],
+      },
+      async *generate(req): AsyncGenerator<StreamEvent> {
+        recordedSeed.push(req.seed_in_eval);
+        yield { kind: 'start', message_id: 'mock-msg' };
+        yield { kind: 'text_delta', text: 'done' };
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+
+    const exitCode = await runSubagentChild({
+      sessionId: childId,
+      dbPath,
+      providerOverride: recordingProvider,
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      errSink: () => undefined,
+    });
+    expect(exitCode).toBe(0);
+    expect(recordedSeed.length).toBeGreaterThan(0);
+    expect(recordedSeed[0]).toBe(true);
+  });
+
+  test('schema-invalid output reclassifies sessions.status from done to error', async () => {
+    // Regression: when schema validation fails after the retry
+    // path, the published envelope reads status='error' /
+    // reason='playbook.output_invalid' but the session row was
+    // already finalized to 'done' by runAgent. Audit / telemetry
+    // queries keyed on sessions.status would count the run as
+    // successful. The reclassification on the schema-fail
+    // branch keeps the row aligned with the envelope.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    let childId: string;
+    const db = openDb(dbPath);
+    try {
+      migrate(db);
+      const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+      const child = sessionsRepo.createSession(db, {
+        model: 'mock/m',
+        cwd: dbDir,
+        parentSessionId: parent.id,
+      });
+      childId = child.id;
+      subagentRunsRepo.insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'project',
+        sourcePath: '/fake/explore.md',
+        sourceSha256: 'a'.repeat(64),
+        systemPrompt: 'You are explore.',
+        toolsWhitelist: [],
+        budgetMaxSteps: 5,
+        budgetMaxCostUsd: 0.1,
+        // Schema requires `summary: string`; the stub provider
+        // emits free-form text that does NOT parse as a YAML
+        // mapping with that key, so validation fails on both
+        // the first run and the retry.
+        outputSchema: { summary: 'string' },
+      });
+      messagesRepo.appendMessage(db, {
+        sessionId: child.id,
+        role: 'user',
+        content: 'go',
+      });
+    } finally {
+      db.close();
+    }
+
+    const exitCode = await runSubagentChild({
+      sessionId: childId,
+      dbPath,
+      providerOverride: stubProvider('not a yaml mapping'),
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      errSink: () => undefined,
+    });
+    expect(exitCode).toBe(0);
+    // Envelope reports the schema-failure verdict.
+    const db2 = openDb(dbPath);
+    try {
+      const out = subagentRunsRepo.getSubagentRun(db2, childId);
+      expect(out).toBeDefined();
+      const session = sessionsRepo.getSession(db2, childId);
+      expect(session?.status).toBe('error');
+    } finally {
+      db2.close();
+    }
+  });
+
+  test('schema-valid output leaves sessions.status as done (no spurious reclassify)', async () => {
+    // Counterpart pin to the schema-fail test above. Defends
+    // against a regression where the reclassify call leaks out
+    // of the !verdict.valid branch — without this assertion,
+    // a buggy variant that always reclassifies (or reclassifies
+    // on the success branch by mistake) would pass the
+    // schema-fail test and silently mark every successful
+    // schema-bound run as failed.
+    const sessionsRepo = await import('../../src/storage/repos/sessions.ts');
+    const subagentRunsRepo = await import('../../src/storage/repos/subagent-runs.ts');
+    const messagesRepo = await import('../../src/storage/repos/messages.ts');
+
+    let childId: string;
+    const db = openDb(dbPath);
+    try {
+      migrate(db);
+      const parent = sessionsRepo.createSession(db, { model: 'mock/m', cwd: dbDir });
+      const child = sessionsRepo.createSession(db, {
+        model: 'mock/m',
+        cwd: dbDir,
+        parentSessionId: parent.id,
+      });
+      childId = child.id;
+      subagentRunsRepo.insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'project',
+        sourcePath: '/fake/explore.md',
+        sourceSha256: 'a'.repeat(64),
+        systemPrompt: 'You are explore.',
+        toolsWhitelist: [],
+        budgetMaxSteps: 5,
+        budgetMaxCostUsd: 0.1,
+        // Same schema as the fail test, but the provider stub
+        // below emits a YAML mapping that matches it cleanly.
+        outputSchema: { summary: 'string' },
+      });
+      messagesRepo.appendMessage(db, {
+        sessionId: child.id,
+        role: 'user',
+        content: 'go',
+      });
+    } finally {
+      db.close();
+    }
+
+    // Bare YAML mapping — parseOutputAsObject handles fence-less
+    // input and the validator accepts the `summary: string`
+    // shape. Run completes cleanly with status='done' AND
+    // schema passes, so no reclassify should fire.
+    const exitCode = await runSubagentChild({
+      sessionId: childId,
+      dbPath,
+      providerOverride: stubProvider('summary: ok'),
+      userAgentsDir: null,
+      projectAgentsDir: null,
+      errSink: () => undefined,
+    });
+    expect(exitCode).toBe(0);
+    const db2 = openDb(dbPath);
+    try {
+      const session = sessionsRepo.getSession(db2, childId);
+      expect(session?.status).toBe('done');
+    } finally {
+      db2.close();
+    }
   });
 
   test('memoryCwd anchors the registry at the parent repo even for worktree-cwd children', async () => {
@@ -2285,5 +2508,81 @@ describe('runSubagentChild — IPC', () => {
     const hintIdx = (captured ?? '').indexOf('# Parallelism');
     const identityIdx = (captured ?? '').indexOf('You are explore.');
     expect(hintIdx).toBeLessThan(identityIdx);
+  });
+});
+
+describe('computeSchemaRetryBudget', () => {
+  // Regression: the schema-retry path used to spread the original
+  // budget verbatim, giving the retry a fresh maxSteps /
+  // maxWallClockMs window — a playbook with `max_steps: 10`
+  // could burn 20 across the validation cycle. The harness
+  // gates maxCostUsd cumulatively across resumed sessions, so
+  // cost stays untouched here; steps and wall-clock reset
+  // per-call and need explicit subtraction.
+
+  test('subtracts steps consumed by the first run', () => {
+    const out = computeSchemaRetryBudget(
+      { maxSteps: 10, maxCostUsd: 1.0 },
+      { steps: 3, durationMs: 0 },
+    );
+    expect(out.skip).toBe(false);
+    if (out.skip) return;
+    expect(out.budget.maxSteps).toBe(7);
+    // maxCostUsd round-trips untouched — the harness is the
+    // authority on cumulative cost via priorCostUsd.
+    expect(out.budget.maxCostUsd).toBe(1.0);
+  });
+
+  test('subtracts durationMs consumed by the first run', () => {
+    const out = computeSchemaRetryBudget(
+      { maxSteps: 10, maxCostUsd: 1.0, maxWallClockMs: 60_000 },
+      { steps: 1, durationMs: 25_000 },
+    );
+    expect(out.skip).toBe(false);
+    if (out.skip) return;
+    expect(out.budget.maxWallClockMs).toBe(35_000);
+  });
+
+  test('returns skip when steps are exhausted', () => {
+    // First run consumed the full step envelope. Retry would
+    // start with a 0-step budget that trips its own cap on
+    // entry; better to skip and surface the schema-invalid
+    // diagnostic against the first output.
+    expect(
+      computeSchemaRetryBudget({ maxSteps: 5, maxCostUsd: 1.0 }, { steps: 5, durationMs: 100 }),
+    ).toEqual({ skip: true });
+    // Over-consumption (defensive — should not happen but a
+    // misbehaving harness could report steps > cap) also skips.
+    expect(
+      computeSchemaRetryBudget({ maxSteps: 5, maxCostUsd: 1.0 }, { steps: 6, durationMs: 100 }),
+    ).toEqual({ skip: true });
+  });
+
+  test('returns skip when wall-clock is exhausted', () => {
+    expect(
+      computeSchemaRetryBudget(
+        { maxSteps: 10, maxCostUsd: 1.0, maxWallClockMs: 30_000 },
+        { steps: 1, durationMs: 30_000 },
+      ),
+    ).toEqual({ skip: true });
+    expect(
+      computeSchemaRetryBudget(
+        { maxSteps: 10, maxCostUsd: 1.0, maxWallClockMs: 30_000 },
+        { steps: 1, durationMs: 31_000 },
+      ),
+    ).toEqual({ skip: true });
+  });
+
+  test('omits maxWallClockMs from the retry budget when the original had none', () => {
+    // No wall-clock cap declared → the retry should not
+    // synthesize one. Spreading the original budget preserves
+    // every other field the harness will fill from defaults.
+    const out = computeSchemaRetryBudget(
+      { maxSteps: 10, maxCostUsd: 1.0 },
+      { steps: 2, durationMs: 50_000 },
+    );
+    expect(out.skip).toBe(false);
+    if (out.skip) return;
+    expect(out.budget.maxWallClockMs).toBeUndefined();
   });
 });

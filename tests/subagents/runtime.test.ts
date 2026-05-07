@@ -3698,6 +3698,11 @@ describe('runSubagent — review fixes (round 4)', () => {
     ['unknown_model', 'error'],
     ['unknown_tool', 'error'],
     ['subagent_load_failed', 'error'],
+    // Child-emitted post-harness output_schema violation
+    // (PLAYBOOKS.md §1.2). Same fidelity contract: callers
+    // distinguishing "model violated the contract" from generic
+    // `internalError` need the verbatim reason on the wire.
+    ['playbook.output_invalid', 'error'],
   ] as const)(
     'child publishing reason=%s is preserved verbatim, not coerced',
     async (reason, statusForReason) => {

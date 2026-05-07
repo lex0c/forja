@@ -171,6 +171,67 @@ describe('createGoogleProvider', () => {
     expect(tools[0]?.functionDeclarations[0]?.name).toBe('read_file');
   });
 
+  test('seed_in_eval=true derives a deterministic seed for the Gemini config', async () => {
+    // Gemini's `generationConfig.seed` is the reproducibility
+    // surface (uint32-ish range). Translate seed_in_eval boolean
+    // intent into a stable numeric seed derived from the
+    // request shape. Same conversation → same seed (replay
+    // determinism); different conversation → different seed
+    // (steps don't collapse to repetitive output).
+    const baseReq = {
+      model: 'gemini-2.5-flash',
+      system: 'be brief',
+      messages: [{ role: 'user' as const, content: 'q' }],
+      max_tokens: 4,
+      seed_in_eval: true,
+    };
+    const handleA = mockClient([{ candidates: [{ finishReason: 'STOP' }] }]);
+    const providerA = createGoogleProvider('gemini-2.5-flash', { client: handleA.client });
+    for await (const _ of providerA.generate(baseReq)) {
+      // drain
+    }
+    const seedA = (handleA.streamCalls[0]?.params as { config: Record<string, unknown> }).config
+      .seed;
+    expect(typeof seedA).toBe('number');
+
+    const handleB = mockClient([{ candidates: [{ finishReason: 'STOP' }] }]);
+    const providerB = createGoogleProvider('gemini-2.5-flash', { client: handleB.client });
+    for await (const _ of providerB.generate(baseReq)) {
+      // drain
+    }
+    const seedB = (handleB.streamCalls[0]?.params as { config: Record<string, unknown> }).config
+      .seed;
+    expect(seedB).toBe(seedA);
+
+    const handleC = mockClient([{ candidates: [{ finishReason: 'STOP' }] }]);
+    const providerC = createGoogleProvider('gemini-2.5-flash', { client: handleC.client });
+    for await (const _ of providerC.generate({
+      ...baseReq,
+      messages: [{ role: 'user' as const, content: 'different prompt' }],
+    })) {
+      // drain
+    }
+    const seedC = (handleC.streamCalls[0]?.params as { config: Record<string, unknown> }).config
+      .seed;
+    expect(seedC).not.toBe(seedA);
+  });
+
+  test('seed_in_eval omitted leaves the Gemini seed absent', async () => {
+    // Same defensive pin as the OpenAI counterpart — without
+    // the flag, the adapter must not synthesize a seed.
+    const handle = mockClient([{ candidates: [{ finishReason: 'STOP' }] }]);
+    const provider = createGoogleProvider('gemini-2.5-flash', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'gemini-2.5-flash',
+      messages: [{ role: 'user', content: 'q' }],
+      max_tokens: 4,
+    })) {
+      // drain
+    }
+    const config = (handle.streamCalls[0]?.params as { config: Record<string, unknown> }).config;
+    expect(config.seed).toBeUndefined();
+  });
+
   test('tool_result block with name is converted to functionResponse', async () => {
     const handle = mockClient([{ candidates: [{ finishReason: 'STOP' }] }]);
     const provider = createGoogleProvider('gemini-2.5-flash', { client: handle.client });

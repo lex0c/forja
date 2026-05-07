@@ -327,4 +327,469 @@ describe('subagent_runs repo', () => {
       expect(run?.hooksSnapshot).toBeNull();
     });
   });
+
+  describe('tool_restrictions (migration 024)', () => {
+    test('round-trips a non-empty restrictions map', () => {
+      // Author declares both bash gates and write_file path gates.
+      // Snapshot must preserve both shapes verbatim — the child's
+      // wrapper consults each entry, and a normalization pass here
+      // would silently relax / drop a rule.
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'refactor',
+        scope: 'project',
+        sourcePath: '/p/.agent/agents/refactor.md',
+        sourceSha256: 'b'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['bash', 'write_file'],
+        budgetMaxSteps: 10,
+        budgetMaxCostUsd: 0.5,
+        toolRestrictions: {
+          bash: { allow: ['git diff *', 'rg *'], deny: ['rm -rf *'] },
+          write_file: { allowPaths: ['src/**'], denyPaths: ['src/secret/**'] },
+        },
+      });
+      const run = getSubagentRun(db, child.id);
+      expect(run?.toolRestrictions).toEqual({
+        bash: { allow: ['git diff *', 'rg *'], deny: ['rm -rf *'] },
+        write_file: { allowPaths: ['src/**'], denyPaths: ['src/secret/**'] },
+      });
+    });
+
+    test('omitting toolRestrictions lands as null', () => {
+      // Legacy / programmatic callers without a restrictions block
+      // must end up with `null` so the child runtime treats the row
+      // as "no snapshot, no gate". `{}` would also be a passthrough
+      // at runtime but is reserved for the explicit empty case.
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'user',
+        sourcePath: '/p',
+        sourceSha256: 'c'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0.01,
+      });
+      expect(getSubagentRun(db, child.id)?.toolRestrictions).toBeNull();
+    });
+
+    test('explicit empty {} round-trips as authoritative empty', () => {
+      // Distinguishable from `null` in audit even though both
+      // become passthrough at runtime. Author who deliberately
+      // declared an empty restrictions block in their .md gets
+      // `{}` back, not `null`.
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'minimal',
+        scope: 'user',
+        sourcePath: '/p',
+        sourceSha256: 'd'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0.01,
+        toolRestrictions: {},
+      });
+      expect(getSubagentRun(db, child.id)?.toolRestrictions).toEqual({});
+    });
+
+    test('corrupt JSON in tool_restrictions falls back to null', () => {
+      // Storage corruption (extremely unlikely on TEXT) must not
+      // silently disable gates — `null` engages the legacy "no
+      // snapshot" branch in the child, which simply applies no
+      // gate. That is identical to the corrupt-row case for
+      // purposes of safety: the row is unusable, treat as "no
+      // snapshot" rather than "everything allowed".
+      const child = seedSession(seedSession().id);
+      db.query(
+        `INSERT INTO subagent_runs
+           (session_id, name, scope, source_path, source_sha256, system_prompt,
+            tools_whitelist, budget_max_steps, budget_max_cost_usd,
+            policy_snapshot, tool_restrictions, captured_at)
+         VALUES (?, 'corrupt', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', '{not json', 0)`,
+      ).run(child.id);
+      const run = getSubagentRun(db, child.id);
+      expect(run?.toolRestrictions).toBeNull();
+    });
+
+    test('non-mapping shape (array) falls back to null', () => {
+      // Defensive: an array would parse but fail the
+      // `typeof === 'object' && !Array.isArray` guard. Important
+      // because `JSON.parse('[]')` is structurally valid but the
+      // restrictions surface is a map of tool names; treating the
+      // array as a map would silently drop every rule.
+      const child = seedSession(seedSession().id);
+      db.query(
+        `INSERT INTO subagent_runs
+           (session_id, name, scope, source_path, source_sha256, system_prompt,
+            tools_whitelist, budget_max_steps, budget_max_cost_usd,
+            policy_snapshot, tool_restrictions, captured_at)
+         VALUES (?, 'array', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', '[]', 0)`,
+      ).run(child.id);
+      expect(getSubagentRun(db, child.id)?.toolRestrictions).toBeNull();
+    });
+  });
+
+  describe('sampling (migration 025)', () => {
+    test('round-trips a full sampling override map', () => {
+      // Mirrors the canonical playbook frontmatter shape: every
+      // field the loader normalizes (camelCase rename of the
+      // YAML snake_case) must survive the JSON round-trip
+      // unchanged. The child wraps these values into harness
+      // config + GenerateRequest verbatim, so a normalization
+      // pass here would silently drift the model's actual
+      // generation parameters from what the .md declared.
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'threat-model',
+        scope: 'project',
+        sourcePath: '/p/.agent/agents/threat-model.md',
+        sourceSha256: 'e'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 25,
+        budgetMaxCostUsd: 1.5,
+        sampling: {
+          temperature: 0.2,
+          topP: 0.9,
+          maxTokens: 4096,
+          thinkingBudget: 4000,
+          seedInEval: true,
+        },
+      });
+      expect(getSubagentRun(db, child.id)?.sampling).toEqual({
+        temperature: 0.2,
+        topP: 0.9,
+        maxTokens: 4096,
+        thinkingBudget: 4000,
+        seedInEval: true,
+      });
+    });
+
+    test('omitting sampling lands as null', () => {
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'user',
+        sourcePath: '/p',
+        sourceSha256: 'f'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0.01,
+      });
+      expect(getSubagentRun(db, child.id)?.sampling).toBeNull();
+    });
+
+    test('explicit empty {} round-trips as authoritative empty', () => {
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'minimal',
+        scope: 'user',
+        sourcePath: '/p',
+        sourceSha256: '0'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0.01,
+        sampling: {},
+      });
+      expect(getSubagentRun(db, child.id)?.sampling).toEqual({});
+    });
+
+    test('partial override (just temperature) round-trips with absent fields stripped', () => {
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'partial',
+        scope: 'user',
+        sourcePath: '/p',
+        sourceSha256: '1'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0.01,
+        sampling: { temperature: 0.7 },
+      });
+      const run = getSubagentRun(db, child.id);
+      expect(run?.sampling).toEqual({ temperature: 0.7 });
+      expect(run?.sampling?.topP).toBeUndefined();
+      expect(run?.sampling?.maxTokens).toBeUndefined();
+    });
+
+    test('corrupt JSON in sampling falls back to null', () => {
+      const child = seedSession(seedSession().id);
+      db.query(
+        `INSERT INTO subagent_runs
+           (session_id, name, scope, source_path, source_sha256, system_prompt,
+            tools_whitelist, budget_max_steps, budget_max_cost_usd,
+            policy_snapshot, sampling, captured_at)
+         VALUES (?, 'corrupt', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', 'not json', 0)`,
+      ).run(child.id);
+      expect(getSubagentRun(db, child.id)?.sampling).toBeNull();
+    });
+
+    test('non-mapping shape (array) falls back to null', () => {
+      const child = seedSession(seedSession().id);
+      db.query(
+        `INSERT INTO subagent_runs
+           (session_id, name, scope, source_path, source_sha256, system_prompt,
+            tools_whitelist, budget_max_steps, budget_max_cost_usd,
+            policy_snapshot, sampling, captured_at)
+         VALUES (?, 'array', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', '[]', 0)`,
+      ).run(child.id);
+      expect(getSubagentRun(db, child.id)?.sampling).toBeNull();
+    });
+  });
+
+  describe('reference_paths (migration 026)', () => {
+    test('round-trips a non-empty reference list in declared order', () => {
+      // Order matters for the rendered block; the audit row
+      // preserves the author's order verbatim. Test pins this.
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'security-audit',
+        scope: 'project',
+        sourcePath: '/p/.agent/agents/security-audit.md',
+        sourceSha256: '2'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0.01,
+        references: ['THREAT_MODELING.md', 'OPSEC.md', 'CRYPTOGRAPHY.md'],
+      });
+      expect(getSubagentRun(db, child.id)?.references).toEqual([
+        'THREAT_MODELING.md',
+        'OPSEC.md',
+        'CRYPTOGRAPHY.md',
+      ]);
+    });
+
+    test('omitting references lands as null', () => {
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'user',
+        sourcePath: '/p',
+        sourceSha256: '3'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0.01,
+      });
+      expect(getSubagentRun(db, child.id)?.references).toBeNull();
+    });
+
+    test('explicit empty [] round-trips as authoritative empty', () => {
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'minimal',
+        scope: 'user',
+        sourcePath: '/p',
+        sourceSha256: '4'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0.01,
+        references: [],
+      });
+      expect(getSubagentRun(db, child.id)?.references).toEqual([]);
+    });
+
+    test('corrupt JSON falls back to null', () => {
+      const child = seedSession(seedSession().id);
+      db.query(
+        `INSERT INTO subagent_runs
+           (session_id, name, scope, source_path, source_sha256, system_prompt,
+            tools_whitelist, budget_max_steps, budget_max_cost_usd,
+            policy_snapshot, reference_paths, captured_at)
+         VALUES (?, 'corrupt', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', 'not json', 0)`,
+      ).run(child.id);
+      expect(getSubagentRun(db, child.id)?.references).toBeNull();
+    });
+
+    test('non-string entries fall back to null', () => {
+      // The runtime renders each entry into a markdown bullet —
+      // a non-string would either crash the renderer or produce
+      // a `[object Object]` line. Defensive parse rejects the
+      // whole row as malformed rather than silently dropping
+      // bad entries.
+      const child = seedSession(seedSession().id);
+      db.query(
+        `INSERT INTO subagent_runs
+           (session_id, name, scope, source_path, source_sha256, system_prompt,
+            tools_whitelist, budget_max_steps, budget_max_cost_usd,
+            policy_snapshot, reference_paths, captured_at)
+         VALUES (?, 'mixed', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', '["a", 42]', 0)`,
+      ).run(child.id);
+      expect(getSubagentRun(db, child.id)?.references).toBeNull();
+    });
+
+    test('non-array shape falls back to null', () => {
+      const child = seedSession(seedSession().id);
+      db.query(
+        `INSERT INTO subagent_runs
+           (session_id, name, scope, source_path, source_sha256, system_prompt,
+            tools_whitelist, budget_max_steps, budget_max_cost_usd,
+            policy_snapshot, reference_paths, captured_at)
+         VALUES (?, 'object', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', '{"x":1}', 0)`,
+      ).run(child.id);
+      expect(getSubagentRun(db, child.id)?.references).toBeNull();
+    });
+  });
+
+  describe('output_schema (migration 027)', () => {
+    test('round-trips a shorthand schema', () => {
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'review',
+        scope: 'project',
+        sourcePath: '/p',
+        sourceSha256: '5'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0.01,
+        outputSchema: { summary: 'string', blockers: 'array' },
+      });
+      expect(getSubagentRun(db, child.id)?.outputSchema).toEqual({
+        summary: 'string',
+        blockers: 'array',
+      });
+    });
+
+    test('round-trips a JSON Schema-style mapping', () => {
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'threat-model',
+        scope: 'project',
+        sourcePath: '/p',
+        sourceSha256: '6'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0.01,
+        outputSchema: {
+          type: 'object',
+          required: ['summary'],
+          properties: { summary: { type: 'string' } },
+        },
+      });
+      expect(getSubagentRun(db, child.id)?.outputSchema).toEqual({
+        type: 'object',
+        required: ['summary'],
+        properties: { summary: { type: 'string' } },
+      });
+    });
+
+    test('omitting outputSchema lands as null', () => {
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'user',
+        sourcePath: '/p',
+        sourceSha256: '7'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0.01,
+      });
+      expect(getSubagentRun(db, child.id)?.outputSchema).toBeNull();
+    });
+
+    test('corrupt JSON falls back to null', () => {
+      const child = seedSession(seedSession().id);
+      db.query(
+        `INSERT INTO subagent_runs
+           (session_id, name, scope, source_path, source_sha256, system_prompt,
+            tools_whitelist, budget_max_steps, budget_max_cost_usd,
+            policy_snapshot, output_schema, captured_at)
+         VALUES (?, 'corrupt', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', 'not json', 0)`,
+      ).run(child.id);
+      expect(getSubagentRun(db, child.id)?.outputSchema).toBeNull();
+    });
+
+    test('non-mapping shape falls back to null', () => {
+      const child = seedSession(seedSession().id);
+      db.query(
+        `INSERT INTO subagent_runs
+           (session_id, name, scope, source_path, source_sha256, system_prompt,
+            tools_whitelist, budget_max_steps, budget_max_cost_usd,
+            policy_snapshot, output_schema, captured_at)
+         VALUES (?, 'array', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', '[1,2,3]', 0)`,
+      ).run(child.id);
+      expect(getSubagentRun(db, child.id)?.outputSchema).toBeNull();
+    });
+  });
+
+  describe('context_recipe (migration 028)', () => {
+    test('round-trips a non-empty recipe', () => {
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'security-audit',
+        scope: 'project',
+        sourcePath: '/p',
+        sourceSha256: '8'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0.01,
+        contextRecipe: {
+          memoryFilter: ['security', 'reference'],
+          stepReflection: 'terse',
+          clarifyMode: 'on_high_blast',
+          goalReinjectionEveryNSteps: 4,
+        },
+      });
+      expect(getSubagentRun(db, child.id)?.contextRecipe).toEqual({
+        memoryFilter: ['security', 'reference'],
+        stepReflection: 'terse',
+        clarifyMode: 'on_high_blast',
+        goalReinjectionEveryNSteps: 4,
+      });
+    });
+
+    test('omitting contextRecipe lands as null', () => {
+      const child = seedSession(seedSession().id);
+      insertSubagentRun(db, {
+        sessionId: child.id,
+        name: 'explore',
+        scope: 'user',
+        sourcePath: '/p',
+        sourceSha256: '9'.repeat(64),
+        systemPrompt: 'body',
+        toolsWhitelist: ['read_file'],
+        budgetMaxSteps: 1,
+        budgetMaxCostUsd: 0.01,
+      });
+      expect(getSubagentRun(db, child.id)?.contextRecipe).toBeNull();
+    });
+
+    test('corrupt JSON falls back to null', () => {
+      const child = seedSession(seedSession().id);
+      db.query(
+        `INSERT INTO subagent_runs
+           (session_id, name, scope, source_path, source_sha256, system_prompt,
+            tools_whitelist, budget_max_steps, budget_max_cost_usd,
+            policy_snapshot, context_recipe, captured_at)
+         VALUES (?, 'corrupt', 'user', '/p', 'h', 'p', '[]', 1, 0, '{}', 'not json', 0)`,
+      ).run(child.id);
+      expect(getSubagentRun(db, child.id)?.contextRecipe).toBeNull();
+    });
+  });
 });

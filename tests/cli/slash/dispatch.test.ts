@@ -7,6 +7,7 @@ import { DEFAULT_BUDGET } from '../../../src/harness/types.ts';
 import { createRegistry as createModelRegistry } from '../../../src/providers/registry.ts';
 import { type DB, openMemoryDb } from '../../../src/storage/db.ts';
 import { migrate } from '../../../src/storage/migrate.ts';
+import type { SubagentDefinition } from '../../../src/subagents/types.ts';
 import { createBus } from '../../../src/tui/bus.ts';
 import type { UIEvent } from '../../../src/tui/events.ts';
 import { createFocusStack } from '../../../src/tui/focus-stack.ts';
@@ -151,7 +152,7 @@ describe('dispatch', () => {
 });
 
 describe('createBuiltinRegistry', () => {
-  test('contains all 13 builtins', () => {
+  test('contains all 13 builtins when no subagents provided', () => {
     const r = createBuiltinRegistry();
     const names = r.list().map((c) => c.name);
     expect(names).toEqual([
@@ -180,5 +181,71 @@ describe('createBuiltinRegistry', () => {
     if (result.kind !== 'ok') return;
     // 13 commands → header + 13 rows + blank + emergency-exit footer = 16.
     expect(result.notes?.length).toBe(16);
+  });
+
+  test('appends playbook slash commands when a SubagentSet is provided', () => {
+    // PLAYBOOKS.md §1.4: every def with `slash:` lands as an
+    // operator-facing entry. Defs without slash stay
+    // tool-routing-only and don't crowd /help.
+    const reviewDef: SubagentDefinition = {
+      name: 'code-review',
+      description: 'Review code',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'body',
+      scope: 'user',
+      isolation: 'none',
+      sourcePath: '/x/code-review.md',
+      sourceSha256: 'a'.repeat(64),
+      slash: 'review',
+      meta: {},
+    };
+    const exploreDef: SubagentDefinition = {
+      name: 'explore',
+      description: 'Explore code',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'body',
+      scope: 'user',
+      isolation: 'none',
+      sourcePath: '/x/explore.md',
+      sourceSha256: 'b'.repeat(64),
+      meta: {},
+    };
+    const r = createBuiltinRegistry({
+      byName: new Map([
+        ['code-review', reviewDef],
+        ['explore', exploreDef],
+      ]),
+      shadows: [],
+    });
+    const names = r.list().map((c) => c.name);
+    expect(names).toContain('review');
+    expect(names).not.toContain('explore');
+  });
+
+  test('throws at construction when a playbook slash collides with a builtin', () => {
+    // A playbook author who writes `slash: help` should learn at
+    // boot, not at first `/help` press, that they shadowed the
+    // builtin. Registry's duplicate-name check is the gate.
+    const collidingDef: SubagentDefinition = {
+      name: 'colliding',
+      description: 'collides with builtin',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'body',
+      scope: 'user',
+      isolation: 'none',
+      sourcePath: '/x/colliding.md',
+      sourceSha256: 'a'.repeat(64),
+      slash: 'help', // collides
+      meta: {},
+    };
+    expect(() =>
+      createBuiltinRegistry({
+        byName: new Map([['colliding', collidingDef]]),
+        shadows: [],
+      }),
+    ).toThrow(/duplicate command name 'help'/);
   });
 });

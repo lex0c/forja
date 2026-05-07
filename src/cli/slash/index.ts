@@ -5,6 +5,7 @@
 // `dispatch()` after parsing the user's slash input; this module
 // owns the lookup-and-execute path.
 
+import type { SubagentSet } from '../../subagents/index.ts';
 import { budgetCommand } from './commands/budget.ts';
 import { clearCommand } from './commands/clear.ts';
 import { costCommand } from './commands/cost.ts';
@@ -15,6 +16,7 @@ import { memoryCommand } from './commands/memory.ts';
 import { modelCommand } from './commands/model.ts';
 import { permsCommand } from './commands/perms.ts';
 import { planCommand } from './commands/plan.ts';
+import { buildPlaybookSlashCommands } from './commands/playbook.ts';
 import { quitCommand } from './commands/quit.ts';
 import { sessionsCommand } from './commands/sessions.ts';
 import { subagentsCommand } from './commands/subagents.ts';
@@ -31,11 +33,20 @@ export type { SlashCommand, SlashContext, SlashResult } from './types.ts';
 // Build the canonical builtin registry. Help is built last so it
 // can list every other command via `listCommands`. Order matters
 // for /help output (operator reads top-to-bottom).
-export const createBuiltinRegistry = (): SlashRegistry => {
+//
+// `subagents` is optional: when provided, every definition with a
+// `slash` field contributes one entry to the registry, registered
+// AFTER builtins. A builtin name and a playbook slash colliding is
+// the playbook author's mistake — the registry's duplicate-name
+// check throws at construction so the operator sees the conflict
+// at boot, not at first `/<conflict>` press. Builtins keep their
+// names because the playbook is the new arrival; the author
+// renames `slash:` in their .md to fix.
+export const createBuiltinRegistry = (subagents?: SubagentSet): SlashRegistry => {
   // Two-pass: build the registry without help first, then add help
   // with a closure over its `list()`. Avoids the chicken-and-egg
   // (help needs to know about itself + everything).
-  const withoutHelp: readonly SlashCommand[] = [
+  const builtinsWithoutHelp: readonly SlashCommand[] = [
     quitCommand,
     clearCommand,
     costCommand,
@@ -49,8 +60,11 @@ export const createBuiltinRegistry = (): SlashRegistry => {
     memoryCommand,
     hooksCommand,
   ];
-  const helpCommand = buildHelpCommand(() => [helpCommand, ...withoutHelp]);
-  return createRegistry([helpCommand, ...withoutHelp]);
+  const playbookCommands =
+    subagents !== undefined ? buildPlaybookSlashCommands(subagents.byName.values()) : [];
+  const allWithoutHelp: readonly SlashCommand[] = [...builtinsWithoutHelp, ...playbookCommands];
+  const helpCommand = buildHelpCommand(() => [helpCommand, ...allWithoutHelp]);
+  return createRegistry([helpCommand, ...allWithoutHelp]);
 };
 
 export interface DispatchOptions {

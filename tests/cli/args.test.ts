@@ -759,7 +759,7 @@ describe('parseArgs — init subcommand', () => {
     const r = parseArgs(['init']);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.args.init).toEqual({ force: false, mode: 'strict' });
+    expect(r.args.init).toEqual({ force: false, mode: 'strict', playbooks: false });
     expect(r.args.prompt).toBe('');
   });
 
@@ -796,6 +796,31 @@ describe('parseArgs — init subcommand', () => {
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.message).toContain('init: unknown argument');
+  });
+
+  test('--playbooks switches the init mode flag', () => {
+    const r = parseArgs(['init', '--playbooks']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.init).toEqual({ force: false, mode: 'strict', playbooks: true });
+  });
+
+  test('--playbooks composes with --force', () => {
+    const r = parseArgs(['init', '--playbooks', '--force']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.init).toEqual({ force: true, mode: 'strict', playbooks: true });
+  });
+
+  test('--playbooks ignores the irrelevant --mode flag without erroring', () => {
+    // Mode is a permissions concept; on the playbooks path the
+    // handler does not consult it. Erroring on the combination
+    // would be operator-hostile (`agent init --mode strict
+    // --playbooks` is plausible muscle memory).
+    const r = parseArgs(['init', '--mode', 'acceptEdits', '--playbooks']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.init).toEqual({ force: false, mode: 'acceptEdits', playbooks: true });
   });
 
   test('init only triggers as the FIRST positional', () => {

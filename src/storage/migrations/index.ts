@@ -21,6 +21,11 @@ import { migration020SubagentRunsHooks } from './020-subagent-runs-hooks.ts';
 import { migration021SubagentHandles } from './021-subagent-handles.ts';
 import { migration022CostProgressEvents } from './022-cost-progress-events.ts';
 import { migration023SubagentGateDecisions } from './023-subagent-gate-decisions.ts';
+import { migration024SubagentRunsToolRestrictions } from './024-subagent-runs-tool-restrictions.ts';
+import { migration025SubagentRunsSampling } from './025-subagent-runs-sampling.ts';
+import { migration026SubagentRunsReferences } from './026-subagent-runs-references.ts';
+import { migration027SubagentRunsOutputSchema } from './027-subagent-runs-output-schema.ts';
+import { migration028SubagentRunsContextRecipe } from './028-subagent-runs-context-recipe.ts';
 
 export interface Migration {
   id: number;
@@ -52,4 +57,9 @@ export const MIGRATIONS: readonly Migration[] = [
   migration021SubagentHandles,
   migration022CostProgressEvents,
   migration023SubagentGateDecisions,
+  migration024SubagentRunsToolRestrictions,
+  migration025SubagentRunsSampling,
+  migration026SubagentRunsReferences,
+  migration027SubagentRunsOutputSchema,
+  migration028SubagentRunsContextRecipe,
 ];

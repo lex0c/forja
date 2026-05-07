@@ -1,4 +1,5 @@
 import { type HarnessEvent, type HarnessResult, runAgent } from '../harness/index.ts';
+import type { RunBudget } from '../harness/types.ts';
 import { resolveHookConfig, resolveHookPaths } from '../hooks/index.ts';
 import {
   createMemoryRegistry,
@@ -18,10 +19,16 @@ import {
   insertSubagentOutput,
   migrate,
   openDb,
+  reclassifySessionStatus,
   setSubagentPayload,
   updateSubagentHeartbeat,
 } from '../storage/index.ts';
-import { loadSubagents, validateSubagentSet } from '../subagents/index.ts';
+import {
+  loadSubagents,
+  validateOutput,
+  validateSubagentSet,
+  wrapToolWithRestrictions,
+} from '../subagents/index.ts';
 import {
   IPC_PROTOCOL_VERSION,
   IPC_VERSION_MISMATCH_EXIT_CODE,
@@ -39,7 +46,10 @@ import {
 } from '../subagents/permission-bridge.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
+import { composeWithOutputSchemaBlock } from './output-schema-block.ts';
 import { composeWithParallelHint } from './parallel-prompt.ts';
+import { composeWithReferenceBlock } from './reference-block.ts';
+import { composeWithReflectionBlock } from './reflection-block.ts';
 
 // Subagent-child entry path.
 //
@@ -251,6 +261,55 @@ const extractFinalOutput = (db: DB, lastMessageId: string | undefined): string =
 // to process.exit. Never throws — pre-loop failures route through
 // the error envelope (when the outputs row exists) or stderr
 // (when even that isn't possible).
+// Compute the budget that REMAINS for an output_schema retry
+// after the first runAgent pass exits cleanly with `done`.
+// `maxCostUsd` stays untouched because the harness gates cost
+// cumulatively across a resumed session (priorCostUsd loaded
+// from the row at line ~640 of harness/loop.ts), but `maxSteps`
+// and `maxWallClockMs` reset per runAgent call — the steps
+// counter starts at 0 and the wall-clock timer is fresh — so
+// passing the original budget verbatim would give the retry a
+// SECOND full window and let a single playbook invocation
+// exceed its declared step / time envelope.
+//
+// `skip: true` when any dimension is depleted (≤ 0 after
+// subtraction): the first run already used the declared
+// envelope, and a 0-step / 0-time retry would just trip its own
+// cap immediately — better to surface playbook.output_invalid
+// against the first output than to spend another provider call
+// producing a maxSteps / maxWallClockMs result.
+//
+// Exported for unit-testing the arithmetic without standing up
+// a real harness loop. Production callers use it from inline in
+// `runSubagentChild` below.
+// `Partial<RunBudget> & { maxSteps: number }` mirrors the shape
+// subagent-child constructs at the runAgent call site (where
+// the harness fills in any missing optional caps from
+// DEFAULT_BUDGET). We require maxSteps so the arithmetic is
+// well-defined.
+type RetryBudgetInput = Partial<RunBudget> & { maxSteps: number };
+
+export const computeSchemaRetryBudget = (
+  budget: RetryBudgetInput,
+  spent: { steps: number; durationMs: number },
+): { skip: true } | { skip: false; budget: RetryBudgetInput } => {
+  const remainingSteps = budget.maxSteps - spent.steps;
+  const remainingWallMs =
+    budget.maxWallClockMs !== undefined ? budget.maxWallClockMs - spent.durationMs : undefined;
+  const wallExhausted = remainingWallMs !== undefined && remainingWallMs <= 0;
+  if (remainingSteps <= 0 || wallExhausted) {
+    return { skip: true };
+  }
+  return {
+    skip: false,
+    budget: {
+      ...budget,
+      maxSteps: remainingSteps,
+      ...(remainingWallMs !== undefined ? { maxWallClockMs: remainingWallMs } : {}),
+    },
+  };
+};
+
 export const runSubagentChild = async (opts: SubagentChildOptions): Promise<number> => {
   const errSink = opts.errSink ?? ((s: string) => process.stderr.write(s));
   const dbPath = opts.dbPath ?? defaultDbPath();
@@ -532,6 +591,16 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     const fullRegistry = createToolRegistry();
     registerBuiltinTools(fullRegistry);
     const childRegistry = createToolRegistry();
+    // Per-playbook tool_restrictions snapshot (`PLAYBOOKS.md` §1.1,
+    // migration 024). Wrap every tool in a pre-flight gate that
+    // matches argv (or target path) against the playbook's
+    // declared allow/deny patterns. Tools without a rule, or with
+    // an unknown shape (no extractor) become passthroughs — the
+    // wrapper costs one map lookup. Audit row carries the snapshot
+    // taken at parent spawn time, so an edit to the .md between
+    // spawn and child read can't relax the gates mid-run. Absent
+    // (NULL in the column) ⇒ no restrictions; passthrough.
+    const restrictions = audit.toolRestrictions ?? undefined;
     for (const toolName of audit.toolsWhitelist) {
       const tool = fullRegistry.get(toolName);
       if (tool === null) {
@@ -550,7 +619,7 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         finalizeAsError();
         return 1;
       }
-      childRegistry.register(tool);
+      childRegistry.register(wrapToolWithRestrictions(tool, restrictions));
     }
 
     // Subagent discovery for nested task() calls. ONLY run when
@@ -657,7 +726,40 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     // dormant state, just one layer down. Memory section
     // (when applicable) is appended at the bottom by the
     // existing block below.
-    let resolvedSystemPrompt = composeWithParallelHint(audit.systemPrompt);
+    // Reference block (`PLAYBOOKS.md` §1.1, migration 026). The
+    // playbook author declared a list of paths the model may
+    // consult; we render them as a trailing block AFTER the
+    // playbook body but BEFORE the parallel hint wraps the whole
+    // thing. Composition order ends up:
+    //
+    //   PARALLEL_HINT
+    //   ---
+    //   <playbook body>
+    //   ---
+    //   ## References (read on demand)
+    //   <bullet list>
+    //
+    // ...and memory section (when applicable) gets folded in AFTER
+    // by `composeSystemPrompt` below. Reference block sits next
+    // to the body because it is metadata about the body's
+    // resources; memory is a per-run dynamic and rightly lands
+    // last.
+    const promptWithReferences = composeWithReferenceBlock(audit.systemPrompt, audit.references);
+    // Output-schema block (`PLAYBOOKS.md` §1.2). Sits AFTER the
+    // reference block so the model reads role → resources →
+    // termination contract in that order. The runtime validates
+    // the terminal text against the same schema post-hoc; this
+    // is the prompt-side surface only.
+    const promptWithSchema = composeWithOutputSchemaBlock(promptWithReferences, audit.outputSchema);
+    // Step-reflection block (slice 9, `CONTEXT_TUNING.md`
+    // §13.10). Tail position because the cadence applies to
+    // every step the model takes; placing it last keeps the
+    // instruction proximate when the model decides what to
+    // emit at step boundary. `off` / undefined collapses to a
+    // passthrough.
+    const reflectionMode = audit.contextRecipe?.stepReflection;
+    const promptWithReflection = composeWithReflectionBlock(promptWithSchema, reflectionMode);
+    let resolvedSystemPrompt = composeWithParallelHint(promptWithReflection);
     if (opts.memoryCwd !== undefined && wantsMemory) {
       // Resolve repo root from the parent's cwd. Same fix as
       // bootstrap.ts: parent's invocation cwd may be a subdir
@@ -689,9 +791,16 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       //               itself (its own top-level), which carries
       //               the checked-out files like the original.
       const bootContext = evaluateBootTriggers(resolveRepoRoot(session.cwd));
+      // Per-playbook memory filter (slice 9). Forwarded into
+      // `assembleMemorySection` so the assembled block keeps
+      // only entries whose type or trigger tag matches a
+      // declared filter value. Absent filter ⇒ existing
+      // (unfiltered, post-trust, post-trigger) behavior.
+      const memoryFilter = audit.contextRecipe?.memoryFilter;
       const memorySection = assembleMemorySection({
         registry: memoryRegistry,
         bootContext,
+        ...(memoryFilter !== undefined ? { memoryFilter } : {}),
       });
       resolvedSystemPrompt = composeSystemPrompt(resolvedSystemPrompt, memorySection.text) ?? '';
     }
@@ -749,11 +858,20 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       systemPrompt: resolvedSystemPrompt,
       userPrompt,
       preassignedSessionId: opts.sessionId,
-      // Carry through budget caps from the audit row.
+      // Carry through budget caps from the audit row. Sampling's
+      // `max_tokens` (`PLAYBOOKS.md` §1.1) overrides the
+      // harness's `maxOutputTokensPerCall` when the playbook
+      // declared one — that field IS the per-call output cap the
+      // provider receives as `max_tokens`. The harness fills
+      // every other RunBudget field from `DEFAULT_BUDGET` when
+      // we omit it here, so the spread stays minimal.
       budget: {
         maxSteps: audit.budgetMaxSteps,
         maxCostUsd: audit.budgetMaxCostUsd,
         ...(audit.budgetMaxWallMs !== null ? { maxWallClockMs: audit.budgetMaxWallMs } : {}),
+        ...(audit.sampling?.maxTokens !== undefined
+          ? { maxOutputTokensPerCall: audit.sampling.maxTokens }
+          : {}),
       },
       // Subagent registry forwarded so the child's `task` tool
       // can resolve grandchild names. Without this, the harness
@@ -779,14 +897,43 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // spawn closure increments this on the next hop, so a
       // grandchild correctly sees `parentDepth + 1`.
       subagentDepth: opts.depth ?? 0,
-      // Sampling temperature carried across the subprocess
-      // boundary. Conditional spread: when undefined, the
-      // harness lets the provider use its own default (same as
-      // a top-level run with no temperature pinned). Without
-      // forwarding, eval / automation pipelines that pin
-      // temperature=0 would see subprocess subagents silently
-      // run at the provider default and break determinism.
-      ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+      // Sampling temperature precedence:
+      //   1. `opts.temperature` (parent-forwarded via
+      //      `--subagent-temperature`) — the eval / automation
+      //      pipeline pinned the value session-wide; respecting
+      //      it preserves determinism across the parent/child
+      //      boundary.
+      //   2. `audit.sampling.temperature` (`PLAYBOOKS.md` §1.1)
+      //      — the playbook's declared override. Only applies
+      //      when the parent did not explicitly pin.
+      //   3. Provider default — fallback when neither was
+      //      declared.
+      // Without precedence (1) over (2), an eval rig that
+      // hardcoded temperature=0 would see playbook overrides
+      // silently break determinism.
+      ...(opts.temperature !== undefined
+        ? { temperature: opts.temperature }
+        : audit.sampling?.temperature !== undefined
+          ? { temperature: audit.sampling.temperature }
+          : {}),
+      // Nucleus sampling and extended-thinking budget. No
+      // parent-forwarded equivalent today — argv carries only
+      // temperature. When the spec adds further parent-forwarded
+      // overrides, this branch grows the same precedence ladder.
+      ...(audit.sampling?.topP !== undefined ? { topP: audit.sampling.topP } : {}),
+      ...(audit.sampling?.thinkingBudget !== undefined
+        ? { thinkingBudget: audit.sampling.thinkingBudget }
+        : {}),
+      // Determinism intent flag (`PLAYBOOKS.md` §1.1
+      // `sampling.seed_in_eval`). The loader parses + persists it
+      // and the audit row carries it through every replay; without
+      // forwarding here, the field landed in snapshots but had no
+      // runtime effect. Adapter-side translation is per-provider
+      // (Anthropic drops, OpenAI / Google use seed) — the harness
+      // just expresses the intent.
+      ...(audit.sampling?.seedInEval !== undefined
+        ? { seedInEval: audit.sampling.seedInEval }
+        : {}),
       // Plan mode propagation. When the parent invoked
       // runSubagent with planMode:true, the child's harness
       // loop must reject every writing tool BEFORE execution —
@@ -883,9 +1030,124 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
         : {}),
     };
 
-    const result = await runAgent(config);
-    const output = extractFinalOutput(db, result.lastMessageId);
-    const envelope = buildEnvelope(result, output);
+    let result = await runAgent(config);
+    let output = extractFinalOutput(db, result.lastMessageId);
+    // Cumulative bookkeeping across the (possibly-retried) run.
+    // `HarnessResult` reports cost/steps/duration PER-RUN — the
+    // resume call inside `runAgent` loads `priorCostUsd` from the
+    // session row but the returned `result.costUsd` reports just
+    // that resume's spend (`harness/loop.ts:271-276`). Without
+    // accumulating manually, a retry pass would see the envelope
+    // (and the parent's `subagent_handles.costUsd`,
+    // `cumulativeChildCostUsd` accounting, `/cost` aggregation,
+    // `subagent_finished` event) under-report the real spend by
+    // exactly the first run's cost. Same shape applies to
+    // `steps` and `durationMs`.
+    let totalCostUsd = result.costUsd;
+    let totalSteps = result.steps;
+    let totalDurationMs = result.durationMs;
+
+    // Output-schema enforcement (`PLAYBOOKS.md` §1.2). Only
+    // engages when the playbook author declared a schema AND
+    // the run terminated cleanly (`done`). Errored / aborted /
+    // exhausted runs propagate verbatim — schema is a contract
+    // about WHAT the model emits when it has the chance to
+    // emit, not a clean-up gate on top of every failure.
+    //
+    // Soft enforcement: a first mismatch buys ONE retry pass.
+    // We append a diagnostic user message and resume the same
+    // session (preassigned id was consumed by the first call;
+    // the second call uses `resumeFromSessionId`). If the
+    // retry also fails validation, the run finalizes with
+    // `playbook.output_invalid`.
+    if (audit.outputSchema !== null && result.status === 'done') {
+      const firstVerdict = validateOutput(output, audit.outputSchema);
+      if (!firstVerdict.valid) {
+        const retryBudgetVerdict = computeSchemaRetryBudget(config.budget, {
+          steps: result.steps,
+          durationMs: result.durationMs,
+        });
+        if (retryBudgetVerdict.skip) {
+          // First run already consumed the declared envelope —
+          // skip the retry. The final validation pass below
+          // surfaces the playbook.output_invalid envelope using
+          // the original result.
+        } else {
+          const diagnostic = `Your previous output did not match the declared output_schema: ${firstVerdict.reason}. Re-emit the YAML with all required keys and correct types. This is your last attempt before the run is failed with playbook.output_invalid.`;
+          // Build the retry config: same surface, except we
+          // switch the session-id discriminator from
+          // `preassignedSessionId` (already consumed) to
+          // `resumeFromSessionId` (reopens the row), hand the
+          // diagnostic in as the new userPrompt, and rebase
+          // the per-run budget so the retry shares the
+          // original envelope rather than getting a fresh one.
+          const { preassignedSessionId: _omit, userPrompt: _prevPrompt, ...rest } = config;
+          const retryConfig = {
+            ...rest,
+            resumeFromSessionId: opts.sessionId,
+            userPrompt: diagnostic,
+            budget: retryBudgetVerdict.budget,
+          };
+          result = await runAgent(retryConfig);
+          output = extractFinalOutput(db, result.lastMessageId);
+          totalCostUsd += result.costUsd;
+          totalSteps += result.steps;
+          totalDurationMs += result.durationMs;
+        }
+      }
+    }
+
+    // Aggregated shape for envelope construction. Spread the
+    // per-run `result` (so status / reason / lastMessageId /
+    // abortCause come from the FINAL run, which is the right
+    // semantic for those discriminators) and override the three
+    // additive metrics with the cumulative totals from above.
+    const aggregatedResult: HarnessResult = {
+      ...result,
+      costUsd: totalCostUsd,
+      steps: totalSteps,
+      durationMs: totalDurationMs,
+    };
+
+    // Final validation pass after the (possibly-retried) run.
+    // The schema cuts BOTH ways: even a first-pass invalid
+    // output that the retry fixed runs through this pass and
+    // succeeds; a never-failing pass is a no-op.
+    let envelope: Record<string, unknown>;
+    if (audit.outputSchema !== null && result.status === 'done') {
+      const verdict = validateOutput(output, audit.outputSchema);
+      if (!verdict.valid) {
+        envelope = {
+          status: 'error',
+          reason: 'playbook.output_invalid',
+          output,
+          cost_usd: totalCostUsd,
+          steps: totalSteps,
+          duration_ms: totalDurationMs,
+          message: verdict.reason,
+          missing_keys: verdict.missingKeys,
+          type_mismatches: verdict.typeMismatches,
+          ...(result.lastMessageId !== undefined ? { last_message_id: result.lastMessageId } : {}),
+        };
+        // Reclassify the session row so audit / telemetry queries
+        // keyed on `sessions.status` see this run as failed.
+        // runAgent already finalized the row to `done` (the
+        // harness loop completed cleanly), but the post-finalize
+        // schema validator has just rejected the output —
+        // leaving status='done' alongside an envelope of
+        // status='error' / reason='playbook.output_invalid' would
+        // count schema-failed runs as successful in any
+        // downstream aggregation. Reclassify is a strict
+        // done→error transition; the helper throws if the row
+        // is in any other state, catching a future regression
+        // that races the finalize.
+        reclassifySessionStatus(db, opts.sessionId, 'done', 'error');
+      } else {
+        envelope = buildEnvelope(aggregatedResult, output);
+      }
+    } else {
+      envelope = buildEnvelope(aggregatedResult, output);
+    }
     setSubagentPayload(db, opts.sessionId, envelope);
     envelopePublished = true;
     return 0;

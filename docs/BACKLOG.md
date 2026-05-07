@@ -15,6 +15,372 @@ Format:
 
 ---
 
+## [2026-05-07] playbooks — hardening pass after the slices 1-10 cut
+
+41-commit cleanup pass against `feat/playbooks` after the
+initial subsystem landed (`9cfec9b`). Each commit closes a
+specific failure mode found by review or audit; the suite stays
+single-purpose-per-commit so a regression bisect can isolate
+the cause cleanly.
+
+**Done — security fences (path / restriction surface):**
+
+- **Symlink escape closed** (`3654844`): `canonicalizeUnderCwd`
+  walks the deepest existing prefix via `realpathSync` and
+  re-attaches the non-existent tail before matching. A workspace
+  with `src/link → /etc` could previously satisfy
+  `allow_paths: ['src/**']` and write to `/etc/secret.txt` because
+  the lexical fence missed the symlink target.
+- **Path traversal canonicalization** (`7359274`): resolve →
+  relative-to-cwd → escape detection on the EFFECTIVE path the
+  write tools resolve against, so `src/../secrets.txt` cannot
+  bypass `src/**`.
+- **Bash whitespace evasion** (`9defacf`): trim + collapse
+  whitespace symmetrically on input AND patterns; ` rm -rf /tmp`
+  no longer slips past `deny: ['rm -rf *']`.
+- **read_file + grep gated** (`bae0dde`): added to the
+  TOOL_RESTRICTION_SHAPE map. A playbook rule like
+  `tool_restrictions.read_file.allow_paths` was silently ignored
+  at runtime — content-disclosure surface unfenced despite the
+  frontmatter declaration.
+- **Missing-path bypass** (`74fc8ae`): `grep` without the
+  optional `path` arg defaults to recursive cwd search; refusing
+  the call when `allow_paths` is declared closes the bypass via
+  arg omission.
+- **Mismatched-shape keys** (`baf8bf1`): loader rejects
+  `tool_restrictions.write_file.allow` (bash-shape on path-shape
+  tool) with a directional hint — silent runtime no-op
+  eliminated.
+- **Padded patterns** (`a85d0be`): loader rejects ` src/**` /
+  `src/** ` — patterns that would never match literally are
+  flagged at load.
+- **Cross-platform separator normalization** (`b2d4d67`):
+  Windows backslash separators rewritten to `/` before matching
+  so `allow_paths: ['src/**']` is platform-neutral.
+- **Plan mode propagation** (`a525462`): slash dispatcher
+  forwards `baseConfig.planMode` so /<playbook> respects
+  `/plan on` (was a sandbox-escape vs. foreground harness).
+
+**Done — output_schema validator correctness:**
+
+- **Reflection-prose fence parse** (`7741c71`): walker locates
+  fences anywhere in the text (not just first-line); fixes the
+  `step_reflection: terse` × `output_schema` collision where the
+  Reflection: line preceded the YAML fence.
+- **Empty schema short-circuit** (`889c22e`): `validateOutput`
+  treats `{}` as no-constraints, matching the prompt composer.
+- **Integer enforcement** (`f7e1230`): `int` / `integer` aliases
+  use `Number.isInteger`; fractional values no longer pass.
+- **Optional-property type gate** (`9566bbf`): JSON Schema type
+  checks now run on every PRESENT declared property, not just
+  `required` ones.
+- **Type=object discriminator loosened** (`33d63f0`):
+  `{type: 'object', required: [...]}` (no properties) is
+  classified as JSON Schema mode; previously fell through to
+  shorthand and treated `type` / `required` as required output
+  keys.
+- **Null/array properties guard** (`6e17262`):
+  `validateJsonSchema` extracts non-object properties as `{}`
+  instead of crashing on indexing.
+- **Terminal fence enforcement** (`be750c7`): the schema
+  validates against the LAST fenced block only — earlier fenced
+  objects no longer satisfy when the terminal block is
+  non-mapping.
+- **YAML-illegal `?` removed from explain.md** (`5584d82`):
+  `file?: string` was rejected by strict YAML parsers; the
+  shorthand validator never enforced optionality anyway.
+
+**Done — runtime / lifecycle:**
+
+- **Synthetic parent session marked subagent** (`45b4e58`): the
+  REPL's lazy parent for slash dispatches no longer pollutes
+  `--list-sessions` or shadows `--resume last`.
+- **Permission proxy forwarded** (`56657bd`): runPlaybook passes
+  `onPermissionAsk` so confirm-gated tools prompt the operator
+  instead of auto-denying.
+- **Slash serialization** (`2505669`): in-flight playbook blocks
+  a second slash dispatch; foreground submit gates use the same
+  busy predicate (`e0c29d3`).
+- **Cumulative cost accounting** (`2fd45ac`): `/cost` now
+  reflects slash dispatch spend.
+- **Abort signals plumbed** (`7f99189`): Esc/Ctrl+C/SIGINT
+  preempt a long-running /<playbook>.
+- **Shutdown joins playbook promise** (`36e7653`): /quit awaits
+  the dispatch's `setSubagentPayload` before `db.close()` — no
+  more "database is closed" race.
+- **Temperature + hooks snapshot forwarded** (`12b808c`,
+  `1958a33`): slash dispatch parity with `task_*` spawn path
+  for determinism + hook-chain consistency.
+- **Retry budget rebased** (`4c037a5`): output_schema retry
+  subtracts spent steps/wall-clock from the original envelope; a
+  single playbook can no longer exceed declared budget.
+- **Output-invalid reason preserved** (`63c306a`):
+  `playbook.output_invalid` rides through the parent's
+  closed-set validator instead of being downgraded to
+  `internalError`.
+- **Session status reclassified on output-invalid** (`66f7f40` +
+  `7a89e75`): `sessions.status` flips from `done` to `error` so
+  audit/telemetry queries align with the published envelope.
+- **thinking_budget vs effective max_tokens** (`e13c868`):
+  loader validates against
+  `DEFAULT_BUDGET.maxOutputTokensPerCall` when `max_tokens` is
+  omitted — pre-fix, `thinking_budget: 8000` without explicit
+  `max_tokens` failed mid-run with HTTP 400.
+
+**Done — integration / cross-provider:**
+
+- **`seed_in_eval` end-to-end** (`42db09b` + `da025fc`): field
+  plumbed from sampling → audit → child config → HarnessConfig
+  → GenerateRequest. OpenAI and Google adapters derive a
+  deterministic int32 seed from system+messages (shared
+  `deriveSeedFromRequest` helper); Anthropic drops with
+  documented reason.
+
+**Done — playbook content:**
+
+- References field removed from the 10 shipped playbooks
+  (pointed at doctrine .md files that did not exist) — `89f58cd`.
+- `refactor` gained write/edit `deny_paths` (`fb3631d`).
+- `debug` gained `wait_for` + `monitor` (`9f51455`).
+- `prompt_version` + `context_recipe_version` pinned on every
+  playbook (`e3c4a63`).
+- 4 weak `when_to_use` lines rewritten with negative triggers
+  (`bcb6abc`).
+
+**Done — prompt surface:**
+
+- **Response-format hint added** as outermost system layer
+  (`9c868b3`): literal CommonMark / monospace render contract
+  with measurable rules (file:line refs, no-emoji default, no
+  preface/recap padding) per ANTI_PATTERNS.md §1.3.
+
+**Done — eval / test infrastructure:**
+
+- Cross-cutting kitchen-sink smoke (`10a6d4e`) exercises
+  `output_schema` + `references` + `tool_restrictions` +
+  `sampling` + `context_recipe` + `prompt_version` + `slash` in
+  one playbook against haiku-4-5; 5 invariants asserted
+  end-to-end. Token-bound by playbook budget; ~$0.01-0.04 per
+  run.
+- 33 fixes + 2 pin tests added; suite went from ~3420 to 3505
+  passing tests.
+
+**Decisions:**
+
+- **Symlink trade-off**: `realpathSync` non-ENOENT errors
+  (EACCES/ELOOP/EIO) refuse outright — falling back to lexical
+  would miss the very symlink the gate is trying to detect.
+  Non-existent cwd falls back to lexical so unit-test fixtures
+  with fake cwd keep working; production paths always have a
+  real cwd.
+- **Schema terminal-block contract**: only the LAST fenced block
+  satisfies the gate. Lenient "try-all" was too easy to bypass
+  via emit-yaml-then-prose pattern.
+- **Reason fidelity over generic codes**:
+  `playbook.output_invalid` added as canonical reason in
+  `RunSubagentResult` / `SubagentEnvelope` / `VALID_REASON_MAP`
+  rather than collapsing to `internalError`. Operators /
+  telemetry need the specific failure code.
+- **Skip schema enum support in shorthand**: `enum [...]`
+  shorthand stays passthrough (descriptive only); JSON Schema
+  mode enforces. Authors who need enforcement should adopt JSON
+  Schema. Keeps the shorthand mode simple.
+
+**Pending (known limitations, NOT fixed):**
+
+- **Grandchild spawn escalation**: a tightly-fenced playbook
+  with `task` in its whitelist can dispatch a more-permissive
+  child playbook from the registry. Architectural —
+  intersection-with-parent restrictions would close this but is
+  a slice on its own.
+- **Bash deny enumeration gaps**: `deny: ['rm -rf *']` does not
+  catch `find / -delete`, `dd if=/dev/zero of=...`, etc.
+  Authoring problem; mitigation is to prefer allow lists over
+  deny-only.
+- **Anthropic seed**: `seed_in_eval` drops at the Anthropic
+  adapter (no SDK seed surface as of 2026). When the API ships
+  seed, anthropic/index.ts has a single-site comment pointing to
+  the wiring.
+
+**Next:** merge `feat/playbooks` into `main` after BACKLOG
+update + smoke re-run on the latest commits (both done in this
+entry).
+
+---
+
+## [2026-05-06] playbooks — full subsystem (slices 1-10) + retry-cost accumulator fix
+
+End-to-end implementation of the playbooks layer over the
+existing subagent runtime. Closes every load-bearing field
+`PLAYBOOKS.md` §1.1 declares (typed at load time, snapshot-
+persisted at spawn, applied at child-side composition) and
+ships the operator surface — slash auto-registration,
+`agent init --playbooks` distribution of the 10 canonical
+.md files, eval fixture infrastructure. Branch
+`feat/playbooks` off `develop`; same-branch slices 1-10
+land as one cohesive subsystem cut.
+
+The work spans 5 storage migrations (024-028, all `ADD COLUMN
+... NULL`, retro-compatible), 4 prompt-block compositors
+following the same prefix/suffix convention, a glob/prefix
+matcher (no regex per CLAUDE.md hard rule), a soft output-
+schema validator with retry-once orchestration, and 10 .md
+playbook assets bundled via Bun's `with { type: 'text' }`
+import attribute.
+
+| Slice | File(s) | Change |
+|---|---|---|
+| 1 | `src/subagents/types.ts`, `src/subagents/load.ts` | Typed frontmatter for `outputSchema`, `references`, `toolRestrictions`, `slash`, `whenToUse`, `sampling`, `contextRecipe`, `promptVersion`, `contextRecipeVersion`, `phases`. Validators per field with source-aware errors; YAML→camelCase normalization; tool_restrictions list-shorthand collapses to `{allow}`. Loader's `meta` overflow now stays empty for canonical playbooks. |
+| 2 | `src/cli/playbook-prompt.ts`, `src/cli/bootstrap.ts` | Discovery preamble + alphabetical-by-name table of `\| name \| when_to_use \|`; cap 12 rows; `composeWithPlaybookHint` slots between parallel hint and plan/user. Defs without `whenToUse` skipped. |
+| 3 | `src/cli/slash/commands/playbook.ts`, `src/cli/slash/index.ts`, `src/cli/repl.ts` | `buildPlaybookSlashCommands` factory; `createBuiltinRegistry(subagents?)` appends them; collisions throw at construction. REPL provides `runPlaybook` bridge that calls `runSubagent` inline; output renders to scrollback. |
+| 4 | `src/cli/init-playbooks/*.md` (10), `src/cli/init.ts`, `src/cli/args.ts` | The 10 canonical playbooks in English, embedded via `with { type: 'text' }`. `agent init --playbooks` copies to `<cwd>/.agent/agents/`; skip-if-exists, `--force` overrides; per-file copied/overwritten/skipped report. |
+| 5 | `src/subagents/restrictions.ts`, migration 024, `src/cli/subagent-child.ts` | Glob+prefix matcher (2-pointer backtrack), `enforceBashRestriction` / `enforcePathRestriction`, `wrapToolWithRestrictions(tool, restrictions)` middleware. Audit row carries `tool_restrictions`; child's tool registry wraps every tool. Refusal code `policy.tool_restricted`. |
+| 6 | `src/providers/{anthropic,openai,google}/index.ts`, `src/harness/{types,loop}.ts`, migration 025 | `GenerateRequest.top_p` / `thinking_budget` end-to-end. Anthropic maps thinking_budget to `thinking: {type:'enabled',budget_tokens}` (gates >0); Google to `thinkingConfig.thinkingBudget`; OpenAI passes top_p, drops thinking_budget (different surface — `reasoning.effort`). `HarnessConfig.topP` / `thinkingBudget` join the existing `temperature`. Audit row carries `sampling` snapshot; child applies temperature precedence (parent argv > playbook .md > provider default). |
+| 7 | `src/cli/reference-block.ts`, migration 026 | Trailing "References (read on demand)" block with `read_file` citation + explicit "do not embed eagerly" warning (PLAYBOOKS §13). `reference_paths` column avoids SQL keyword. Order preserved; null/empty/corrupt rows degrade to no-block. |
+| 8 | `src/subagents/output-schema.ts`, `src/cli/output-schema-block.ts`, migration 027, `src/cli/subagent-child.ts` | `parseOutputAsObject` (YAML/JSON, code-fence strip), `validateOutput` supports JSON Schema (`type:'object'+required`) and shorthand (`field: type-string`) dialects; type aliases (`int`/`list`/`bool`); shallow checks. Schema block tells the model "ONE retry then `playbook.output_invalid`". Child orchestrates retry: post-`done`, validate; if invalid, append diagnostic via new `userPrompt` + `runAgent` with `resumeFromSessionId`; second-fail publishes `playbook.output_invalid` envelope with `missing_keys` + `type_mismatches`. |
+| 9 | `src/cli/{memory-prompt,reflection-block}.ts`, migration 028, `src/cli/subagent-child.ts` | Memory filter (`memoryFilter: ReadonlyArray<string>` on `AssembleMemorySectionInput`) — keeps entries whose `type` matches OR `triggers` intersects the filter list; composes after trust+trigger gates. Step-reflection block (terse=one-line, full=paragraph; both name `Reflection:` literal). `clarifyMode`, `goalReinjectionEveryNSteps`, `fewshotCount`, `includeRepoMap`/`Diff`/`Callers` persisted but no consumer yet. |
+| 10 | `src/evals/playbook-fixtures.ts`, `evals/playbooks/**`, `evals/smoke-playbook-fixtures.sh` | Fixture loader for per-playbook (`<name>/<id>.yaml`) and routing (`_routing/<id>.yaml`) cases. Cross-check: `playbook` field must match directory; misfiled fixture refused at load. `computeRoutingMetrics` computes `wrong_dispatch_rate`, `false_dispatch_rate`, `missed_dispatch_rate`, `ambiguous_wrong_count`. 10 stub fixtures (1 per playbook) + 5 routing fixtures (2 dispatch, 2 none, 1 ambiguous). Smoke script fails the suite on malformed YAML. |
+| B1 | `src/cli/subagent-child.ts` | Retry-cost accumulator. `runAgent` returns per-run cost/steps/duration (`harness/loop.ts:271-276`); the slice 8 retry assigned `result = await runAgent(retryConfig)` and the envelope reported only the second run's spend, silently subreporting child cost to `subagent_handles` / `cumulativeChildCostUsd` / `/cost` / `subagent_finished`. Now: `totalCostUsd`/`totalSteps`/`totalDurationMs` accumulate across both runs; `aggregatedResult: HarnessResult = { ...result, costUsd: total, ... }` flows into `buildEnvelope`; `playbook.output_invalid` path uses the totals directly. |
+
+**Decisions:**
+
+- **D237 — Slash dispatches inline, not through the model.** The
+  REPL's `runPlaybook` bridge invokes `runSubagent` directly:
+  the operator pressed `/review`, no provider call to the
+  principal is needed. Output goes to scrollback as info notes.
+  Cleanly mirrors `/sessions` and `/cost` UX (observability-
+  shaped). Trade-off: the principal model does not see the
+  playbook's report unless the operator pastes it back. Slice
+  could later grow an "inject report into next turn" flag
+  if the want shows up.
+
+- **D238 — Schema retry uses `resumeFromSessionId`.** The first
+  pass consumes `preassignedSessionId`; the retry switches to
+  `resumeFromSessionId` (same id) so the harness reopens
+  the row and appends the diagnostic as a new user message.
+  Picking `appendMessage` + bare-config call would have
+  worked too but split the contract (some prompt-side work
+  done by harness, some by us); the resume path keeps
+  everything in one harness-level invariant.
+
+- **D239 — Cost accumulator pattern over `priorCostUsd`
+  re-export.** Considered: bubbling `priorCostUsd` to the
+  result. Rejected: the harness's contract is per-run for
+  good reason (replay + audit math), and the child is the
+  only caller that aggregates across multiple `runAgent`
+  invocations on one subprocess. The accumulator stays
+  child-local.
+
+- **D240 — `bash_kill` / `bash_output` get no extractor.**
+  bash_kill takes a pid (numeric, not a command string);
+  bash_output reads stored state. Neither shape is "the kind
+  of arg an allow/deny pattern matches." Listed in the
+  `TOOL_RESTRICTION_EXTRACTORS` map's docstring as
+  intentionally absent.
+
+- **D241 — OpenAI drops `thinking_budget` silently.** OpenAI's
+  reasoning surface (`reasoning.effort`: low/medium/high) is
+  a coarse string, not a token count. Mapping a budget integer
+  onto it would be a guess. The request stays silent on
+  reasoning when the playbook declared a budget; the model
+  uses its default. Future spec change can add a
+  `reasoning.effort` override to PLAYBOOKS §1.1; until then,
+  drop > guess.
+
+- **D242 — `agent init --playbooks` skips by default.** Authors
+  who hand-edited a playbook keep their changes on re-run.
+  `--force` is the explicit override path. Composes with
+  `--mode` flag: the playbook path ignores mode silently
+  rather than rejecting the combination (operator-hostile).
+
+- **D243 — `reference_paths` column name (not `references`).**
+  `REFERENCES` is a SQL reserved word (foreign-key syntax).
+  SQLite tolerates the literal in column position when quoted,
+  but unquoted DDL would silently parse as a foreign-key
+  clause and fail in confusing ways. The runtime field stays
+  `references` (string[]); only the column is renamed.
+
+- **D244 — Shorthand schema "unknown type-string" passes
+  through.** Authors using `enum [confirmed, speculation]` or
+  composite descriptors get a passthrough instead of a refuse.
+  The shallow validator's job is catching obvious mismatches
+  (missing fields, swapped string vs. array), not enforcing
+  the dialect. Authors who need stricter typing adopt JSON
+  Schema mode.
+
+- **D245 — Memory filter walks both type and trigger axes per
+  entry.** The canonical playbook example mixes `reference`
+  (a MemoryType) with `security` / `architecture` (free-form
+  trigger tags). A single-axis filter would force authors to
+  duplicate values; cross-axis fallthrough lets one filter
+  list cover both shapes naturally.
+
+- **D246 — Eval fixture cross-check of playbook field vs
+  directory.** Authors who drop a fixture in the wrong
+  directory would otherwise silently dispatch the wrong
+  playbook. Loader refuses at load time with both coordinates
+  in the error message.
+
+**Pending:**
+
+- B1's regression test is deferred. Testing the retry-cost
+  accumulator inline requires a fake-spawn child harness that
+  sees a schema-fail-then-pass sequence — substantial fixture
+  work. The B1 comment cites `harness/loop.ts:271-276` so a
+  future hand-edit removing the accumulator hits the same
+  invariant rationale. Eval slice (10) runner-side execution
+  (when it lands) naturally exercises the path end-to-end.
+
+- M1 — `Esc` does not cancel a slash playbook in flight.
+  Documented in the REPL bridge comment.
+
+- M2 — First slash playbook before any normal turn refuses
+  with "no session yet" (mirrors `/subagents`). Acceptable but
+  worth a UX revisit once a synthetic-parent-session helper
+  exists.
+
+- M3 — `thinking_budget` ≥ `max_tokens` is not validated at
+  load. Anthropic API rejects with 400 at runtime. Slice 1's
+  `parseSampling` is the right place for the cross-field
+  check; defer until a playbook actually trips it.
+
+- 25 of 30 routing fixtures are still TBD (PLAYBOOKS §1.4).
+  The shipped 5 cover dispatch/none/ambiguous shapes; the
+  bulk grows when an author authors them against real
+  patterns observed in eval runs.
+
+- Hard variant of output-schema enforcement (forced tool_use
+  via a `submit_report` synthetic tool) — defer until soft
+  validation regresses against eval thresholds.
+
+- `clarifyMode`, `goalReinjectionEveryNSteps`, `fewshotCount`,
+  `includeRepoMap`/`Diff`/`Callers` from `context_recipe` are
+  persisted but inert until their consumer subsystems land
+  (state-machine goal stack; CODE_INDEX repo-map).
+
+- `phases` from frontmatter validates at load but no runtime
+  consumer (depends on goal_stack).
+
+- `seed_in_eval` from sampling persists but the eval harness
+  doesn't consume it yet.
+
+- `AGENTIC_CLI.md §11.3` says "Oito playbooks na v1";
+  `PLAYBOOKS.md §14` declares 10 (the authoritative count
+  this work follows). Spec PR to align should land before
+  the next spec edit.
+
+**Verification:**
+
+- 3411 pass / 0 fail / 10 skip across 171 test files.
+- typecheck clean (`tsc --noEmit`).
+- lint clean (`biome check`).
+- All 10 canonical .md playbooks pass `loadSubagentFromString` +
+  `validateSubagentTools` against the active registry.
+- Smoke `evals/smoke-playbook-fixtures.sh` reports 10/10
+  per-playbook + 5 routing fixtures loading cleanly.
+
+---
+
 ## [2026-05-06] parallel — TUI footer queue split + parallel-tools chip
 
 User-prompted gap audit: "como a TUI exibe o paralelismo?"

@@ -2,6 +2,7 @@ import OpenAI from 'openai';
 // Shared chars/4 heuristic — see `src/providers/tokens.ts` for accuracy
 // bounds. OpenAI has no server-side countTokens endpoint until tiktoken
 // lands in M5.
+import { deriveSeedFromRequest } from '../seed.ts';
 import { estimateMessagesTokens } from '../tokens.ts';
 import type {
   ConstrainedRequest,
@@ -180,6 +181,26 @@ export const createOpenAIProvider = (
     }
     if (req.tools !== undefined) params.tools = toOpenAITools(req.tools);
     if (req.temperature !== undefined) params.temperature = req.temperature;
+    if (req.top_p !== undefined) params.top_p = req.top_p;
+    // Determinism intent (`PLAYBOOKS.md` §1.1
+    // `sampling.seed_in_eval`). OpenAI's `seed` param is
+    // best-effort but documented as the canonical reproducibility
+    // surface for the Chat Completions API. Derive a stable
+    // 32-bit seed from the request's system + messages so
+    // replays of the same conversation get the same seed AND
+    // step N differs from step N+1 within a run (each step's
+    // message history is longer / different).
+    if (req.seed_in_eval === true) params.seed = deriveSeedFromRequest(req);
+    // `thinking_budget` is intentionally NOT forwarded here.
+    // OpenAI's reasoning surface (`reasoning.effort`:
+    // low|medium|high) takes a coarse string, not a token count
+    // — mapping a budget integer onto it would be a guess. The
+    // request stays silent on reasoning when the playbook
+    // declared a budget; the model uses its default. A future
+    // slice that adds a `reasoning.effort` override to
+    // `PLAYBOOKS.md` §1.1 sampling is the right place to wire
+    // this — until then, dropping the field preserves intent
+    // (no guess) over crude mapping.
     if (req.stop_sequences !== undefined) params.stop = req.stop_sequences;
 
     const stream = (await client.chat.completions.create(
