@@ -15,6 +15,88 @@ Format:
 
 ---
 
+## [2026-05-07] step-stall watchdog — silent-hang detection
+
+The reported failure (operator's "explore o projeto" run) had
+a second subagent that ran 3m13s with no second provider call
+ever firing. Pre-fix the only path out was the operator
+noticing and hard-aborting. Spec `AGENTIC_CLI.md §5` line 372
+already declared the watchdog as `maxStepStallMs` ("não
+default"); this slice implements it.
+
+**Done:**
+
+- `src/harness/abortable.ts` — new `StepStallError` (distinct
+  from `AbortError` so the loop's catch can route to
+  `stepStalled` instead of `aborted`) + `stallWatchdog(source,
+  stallMs)` async iterable wrapper. Timer arms before each
+  iter.next(), clears on yield, fires StepStallError when the
+  source is silent for the full budget. `stallMs <= 0`
+  disables the wrapper (yields source verbatim).
+- `src/harness/types.ts` — `ExitReason` gains `'stepStalled'`;
+  `RunBudget.maxStepStallMs` (default 90_000ms = 90s). The
+  default is long enough that legitimate slow turns (extended
+  thinking with high budget, large structured outputs) don't
+  trip; short enough that the reported failure (3m13s silent)
+  would have aborted at 90s with a source-aware reason.
+- `src/harness/loop.ts` — wires the wrapper between
+  `generateWithRetry` and `abortableIterable`. Composition
+  order matters: stall watchdog INSIDE abortable so external
+  signals (Ctrl-C, wall-clock) take precedence; otherwise a
+  slow consumer between deltas could trip the stall budget on
+  rendering, not provider hangs. Catch handler routes
+  `StepStallError` to `finish('stepStalled', message)`.
+- `src/subagents/result-builder.ts` — `VALID_REASON_MAP`
+  accepts the new `stepStalled` value so the IPC envelope
+  validator doesn't reject it on its way back to the parent.
+- `src/tui/render/permanent.ts` — verb mapping:
+  `error + stepStalled` → `"Error (no progress)"`. The
+  reported failure would have rendered as
+  `· task explain Error (no progress) in 1m30s` instead of
+  the operator's experience of "Aborted (hard) after 3m24s"
+  with no signal of WHY.
+
+**Tests:**
+
+- `tests/harness/abortable.test.ts` — 8 new cases: passthrough,
+  disabled (stallMs=0), slow-but-progressing stream OK, stall
+  fires when source silent for budget, timer resets between
+  yields, finally cleanup on normal completion, finally
+  cleanup on early break, composition order pinned (external
+  abort wins; stall wins when no abort).
+- `tests/tui/render/permanent.test.ts` — verb mapping case
+  for `stepStalled`.
+
+**Verification:** `bun test` 3625 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean.
+
+**Behavioral payoff:** the silent-hang failure mode that
+prompted this entire diagnostic arc now fails with a clear
+cause label at 90s instead of leaving the operator staring
+at a frozen UI for minutes.
+
+**Spec posture:** none required. `AGENTIC_CLI.md §5` already
+declared the field; this implements it. The spec said "não
+default" — we ship a 90s default because the field's purpose
+is defense against an undocumented failure mode (provider
+hang) where opt-in defeats the value. Operator can disable
+via `budget.maxStepStallMs: 0` if a workflow legitimately
+needs longer silent gaps.
+
+**Pending — explicit follow-up (next slice on this branch):**
+
+- **Soft-cap behavior** for per-playbook `max_cost_usd`
+  (warn instead of hard-kill, with the global cap as the only
+  hard gate). Pre-conversation pivot from "remove per-playbook
+  caps" to "soften them"; preserves the pessimistic
+  reservation the pre-spawn gate needs while removing the
+  "child died at cap that's too tight for legitimate work"
+  failure mode.
+
+**Next:** branch is mergeable.
+
+---
+
 ## [2026-05-07] subagent settle UX — surface cause + cap raise on explain.md
 
 A real-world failure exposed two independent gaps in the

@@ -300,6 +300,17 @@ export interface RunBudget {
   // Sliding window: if `maxRepeatedToolHash` of the last 5 tool calls hash
   // identically, abort with `degenerate_loop`.
   maxRepeatedToolHash: number;
+  // Per-step stall watchdog (spec AGENTIC_CLI.md §5 line 372).
+  // When the provider stream is silent — no text_delta, no
+  // thinking_delta, no tool_use_*, no message_stop — for this
+  // many milliseconds, the harness aborts the step with
+  // `stepStalled`. Distinct from `maxWallClockMs` (whole-session
+  // cap) and `maxOutputTokens` (truncation by token count) —
+  // catches the "provider call opened but never streams anything
+  // back" failure mode that previously surfaced as a silent
+  // multi-minute hang. Reset on every stream event so a slow but
+  // progressing turn doesn't trip the gate. Set to 0 to disable.
+  maxStepStallMs: number;
   // Optional ceiling on output tokens per provider call. When set,
   // the harness clamps the per-request `max_tokens` to
   // `min(maxOutputTokensPerCall, provider.capabilities.output_max_tokens)`.
@@ -384,6 +395,14 @@ export const DEFAULT_BUDGET: RunBudget = {
   maxWallClockMs: 10 * 60 * 1000,
   maxToolErrors: 5,
   maxRepeatedToolHash: 3,
+  // 90s default step-stall watchdog. Long enough that legitimate
+  // slow turns (extended thinking with high budget, large
+  // structured outputs) don't trip; short enough that a hung
+  // provider call fails source-aware before the operator
+  // wonders whether the agent is still alive. The reported bug
+  // (subagent silent for 3m+ after 12 parallel reads) would
+  // have aborted at 90s with `stepStalled`.
+  maxStepStallMs: 90_000,
   // `maxOutputTokensPerCall` intentionally unset — runtime resolves
   // against the provider capability via `resolveMaxOutputTokens`.
   compactionThreshold: 0.7,
@@ -460,6 +479,7 @@ export type ExitReason =
   | 'maxCostUsd' // running cumulative cost crossed budget.maxCostUsd
   | 'maxToolErrors'
   | 'degenerateLoop'
+  | 'stepStalled' // provider stream silent for `maxStepStallMs` mid-step
   | 'aborted' // user cancelled via signal
   | 'providerError' // unrecoverable provider failure (network, 4xx)
   | 'internalError' // uncaught throw in the harness path (typically SQLite)

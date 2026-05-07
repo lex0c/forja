@@ -9,6 +9,83 @@ export class AbortError extends Error {
   }
 }
 
+// StepStallError fires when the stall watchdog observed no events
+// for `ms` milliseconds. Distinct from AbortError so the loop's
+// catch can route to `stepStalled` instead of `aborted` — the
+// operator distinction matters: aborted is "I cancelled this",
+// stepStalled is "the provider stream went silent".
+export class StepStallError extends Error {
+  constructor(public readonly stallMs: number) {
+    super(`step stalled (no provider events for ${stallMs}ms)`);
+    this.name = 'StepStallError';
+  }
+}
+
+// Per-step stall watchdog. Wraps an AsyncIterable so that the
+// for-await throws `StepStallError` when the source is silent
+// for `stallMs` consecutive milliseconds. Reset on each yield —
+// a slow but progressing stream (extended thinking with high
+// budget, large structured outputs) doesn't trip the gate.
+//
+// Distinct from the existing wall-clock cap (maxWallClockMs)
+// because that's session-wide; stallMs is per-step. A long
+// session with many short turns can stay under wall-clock while
+// still wanting per-step stall protection. Distinct from
+// abortableIterable because that one fires the signal on
+// EXTERNAL events (user Ctrl+C, wall-clock); this one fires on
+// INTERNAL silence (provider hang, network drop mid-stream).
+//
+// `stallMs` of 0 disables the watchdog entirely — yields the
+// source verbatim with no timer. Negative values are treated
+// the same as 0 (defensive).
+export async function* stallWatchdog<T>(
+  source: AsyncIterable<T>,
+  stallMs: number,
+): AsyncIterable<T> {
+  if (stallMs <= 0) {
+    yield* source;
+    return;
+  }
+  const iter = source[Symbol.asyncIterator]();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let stallReject: ((e: Error) => void) | null = null;
+  const arm = (): void => {
+    if (timer !== null) clearTimeout(timer);
+    timer = setTimeout(() => {
+      stallReject?.(new StepStallError(stallMs));
+    }, stallMs);
+  };
+  const disarm = (): void => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  try {
+    arm();
+    while (true) {
+      const result = await new Promise<IteratorResult<T>>((resolve, reject) => {
+        stallReject = reject;
+        iter.next().then(resolve, reject);
+      });
+      if (result.done) return;
+      // Reset the timer BEFORE yielding so the consumer's own
+      // processing time doesn't count against the stall budget.
+      // Setting AFTER the yield would mean a slow consumer (e.g.
+      // a renderer doing heavy work between events) burns the
+      // stall budget every iteration.
+      arm();
+      yield result.value;
+    }
+  } finally {
+    disarm();
+    stallReject = null;
+    if (typeof iter.return === 'function') {
+      Promise.resolve(iter.return(undefined)).catch(() => undefined);
+    }
+  }
+}
+
 // Wraps an `AsyncIterable<T>` so that an aborted signal interrupts the
 // for-await loop, even if the underlying source (e.g., an SDK stream)
 // never yields again. The Provider interface doesn't expose a way to

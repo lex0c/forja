@@ -32,7 +32,7 @@ import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
 import { type TodoStore, createTodoStore } from '../todo/index.ts';
 import type { ToolContext } from '../tools/index.ts';
 import type { SpawnSubagentArgs, SpawnSubagentResult } from '../tools/types.ts';
-import { abortableIterable } from './abortable.ts';
+import { StepStallError, abortableIterable, stallWatchdog } from './abortable.ts';
 import { CollectStepError, type CollectedToolUse, collectStep } from './collect.ts';
 import { compactMessages } from './compaction.ts';
 import { invokeTool } from './invoke-tool.ts';
@@ -124,6 +124,11 @@ const exitToStatus: Record<ExitReason, TerminalSessionStatus> = {
   maxCostUsd: 'exhausted',
   maxToolErrors: 'error',
   degenerateLoop: 'error',
+  // Step-stalled is closer to an error than an interrupt — the
+  // provider opened a stream and went silent, which is a runtime
+  // failure (provider hang, network drop mid-stream, parser
+  // stuck). Resume can retry; same handling as providerError.
+  stepStalled: 'error',
   aborted: 'interrupted',
   providerError: 'error',
   internalError: 'error',
@@ -143,6 +148,7 @@ const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
   maxCostUsd: 'exhausted',
   maxToolErrors: 'error',
   degenerateLoop: 'error',
+  stepStalled: 'error',
   aborted: 'interrupted',
   providerError: 'error',
   internalError: 'error',
@@ -1421,8 +1427,26 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // The Provider interface doesn't propagate signals to the SDK,
           // so without this a hung HTTP request blocks indefinitely and
           // neither Ctrl+C nor maxWallClockMs can interrupt it.
+          // Stream wrapping order is load-bearing:
+          //   1. generateWithRetry produces the raw stream.
+          //   2. stallWatchdog wraps inside-out so silent stalls
+          //      throw StepStallError; reset on every yield.
+          //   3. abortableIterable wraps OUTSIDE so external
+          //      aborts (Ctrl+C, wall-clock) take precedence over
+          //      stall detection.
+          // Inverting (1) and (2) would let the stall timer
+          // count time the consumer spends processing each event
+          // (e.g. heavy renderer work between deltas) against
+          // the stall budget, which would falsely trip on slow
+          // consumers rather than real provider hangs.
           collected = await collectStep(
-            abortableIterable(generateWithRetry(config.provider, req, DEFAULT_RETRY), signal),
+            abortableIterable(
+              stallWatchdog(
+                generateWithRetry(config.provider, req, DEFAULT_RETRY),
+                budget.maxStepStallMs,
+              ),
+              signal,
+            ),
             (ev) => safeEmit(config.onEvent, { type: 'provider_event', event: ev }),
           );
         } catch (e) {
@@ -1467,6 +1491,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             return isWallClockTimeout()
               ? await finish('maxWallClockMs')
               : await finish('aborted', undefined, 'hard');
+          }
+          // Step-stall watchdog fired (no provider events for
+          // budget.maxStepStallMs). Distinct from providerError
+          // — the connection didn't crash, it just went silent.
+          // Operator sees `stepStalled` in audit and the TUI's
+          // permanent chip renders the cause cleanly instead of
+          // a generic "Error".
+          const stallCause = e instanceof CollectStepError ? e.cause : e;
+          if (stallCause instanceof StepStallError) {
+            return await finish('stepStalled', stallCause.message);
           }
           const cause = e instanceof CollectStepError ? e.cause : e;
           const detail =

@@ -1,5 +1,10 @@
 import { describe, expect, test } from 'bun:test';
-import { AbortError, abortableIterable } from '../../src/harness/abortable.ts';
+import {
+  AbortError,
+  StepStallError,
+  abortableIterable,
+  stallWatchdog,
+} from '../../src/harness/abortable.ts';
 
 describe('abortableIterable', () => {
   test('passes events through when signal is never aborted', async () => {
@@ -104,5 +109,147 @@ describe('abortableIterable', () => {
     // from accumulated listeners.
     expect(ctrl.signal.aborted).toBe(false);
     void before;
+  });
+});
+
+describe('stallWatchdog', () => {
+  // A source that yields N values, each after `delayMs`. Lets
+  // tests pin the relationship between yield interval and stall
+  // budget without timing flakiness from the system clock.
+  const delayedSource = async function* (
+    values: readonly number[],
+    delayMs: number,
+  ): AsyncIterable<number> {
+    for (const v of values) {
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+      yield v;
+    }
+  };
+
+  test('passes events through when stallMs is 0 (disabled)', async () => {
+    const out: number[] = [];
+    for await (const n of stallWatchdog(delayedSource([1, 2, 3], 5), 0)) out.push(n);
+    expect(out).toEqual([1, 2, 3]);
+  });
+
+  test('passes events through when stream yields faster than stallMs', async () => {
+    // 5ms between yields, 200ms stall budget — every yield
+    // resets the timer well before it can fire.
+    const out: number[] = [];
+    for await (const n of stallWatchdog(delayedSource([1, 2, 3, 4], 5), 200)) out.push(n);
+    expect(out).toEqual([1, 2, 3, 4]);
+  });
+
+  test('throws StepStallError when stream is silent for stallMs', async () => {
+    // Source delays 200ms before its first yield, stall budget
+    // is 50ms — the watchdog fires before the source ever
+    // produces an event.
+    const source = delayedSource([1, 2], 200);
+    let caught: unknown = null;
+    try {
+      for await (const _ of stallWatchdog(source, 50)) {
+        // unreachable
+      }
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(StepStallError);
+    if (caught instanceof StepStallError) {
+      expect(caught.stallMs).toBe(50);
+      expect(caught.message).toContain('50ms');
+    }
+  });
+
+  test('resets the timer between yields (slow but progressing stream is fine)', async () => {
+    // 40ms between yields, 60ms stall budget — each yield resets
+    // before the next interval expires; total stream takes
+    // 4×40=160ms but never stalls 60ms in a row. Test confirms
+    // the timer is reset on each yield, not just armed once.
+    const out: number[] = [];
+    for await (const n of stallWatchdog(delayedSource([1, 2, 3, 4], 40), 60)) out.push(n);
+    expect(out).toEqual([1, 2, 3, 4]);
+  });
+
+  test('clears the timer on normal stream completion', async () => {
+    // After the stream finishes, no stale setTimeout should fire
+    // post-completion. Bun would surface this as an unhandled
+    // rejection in the test process. Drain a fast stream and
+    // wait past what would have been a stall budget — no
+    // unhandled errors means the timer was disarmed in finally.
+    for await (const _ of stallWatchdog(delayedSource([1, 2], 5), 50)) {
+      // drain
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 80));
+    // Reaching here without a thrown StepStallError == pass.
+    expect(true).toBe(true);
+  });
+
+  test('clears the timer on early break (consumer abandons the stream)', async () => {
+    // for-await with `break` triggers iter.return(); the
+    // watchdog's finally must disarm the timer. Otherwise a
+    // stale setTimeout fires post-break and rejects nothing
+    // (consumer already moved on), which Bun surfaces as
+    // unhandled. The "no error wins" assertion is the test.
+    const slow = delayedSource([1, 2, 3, 4, 5], 80);
+    for await (const n of stallWatchdog(slow, 200)) {
+      if (n === 1) break;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 250));
+    expect(true).toBe(true);
+  });
+});
+
+describe('stallWatchdog composed with abortableIterable', () => {
+  // The loop wires them as `abortableIterable(stallWatchdog(...))`
+  // — external aborts (Ctrl+C, wall-clock) take precedence over
+  // stall detection. Pin the composition order semantics here
+  // so a future refactor that swaps the layering shows up as a
+  // test failure.
+
+  test('external abort wins over a hung stream', async () => {
+    const ctrl = new AbortController();
+    // Source that NEVER yields (would otherwise stall forever).
+    const hung: AsyncIterable<number> = {
+      // biome-ignore lint/suspicious/useAwait: deliberate hang
+      [Symbol.asyncIterator]: async function* () {
+        await new Promise<never>(() => {
+          // never resolves
+        });
+      },
+    };
+    setTimeout(() => ctrl.abort(), 30);
+    let caught: unknown = null;
+    try {
+      for await (const _ of abortableIterable(stallWatchdog(hung, 5_000), ctrl.signal)) {
+        // unreachable
+      }
+    } catch (e) {
+      caught = e;
+    }
+    // abortableIterable wins — signal abort fires before the
+    // stall budget elapses (5s budget vs 30ms abort).
+    expect(caught).toBeInstanceOf(AbortError);
+  });
+
+  test('stall fires when stallMs is shorter than any external abort', async () => {
+    const ctrl = new AbortController();
+    // No abort — only stall can end the loop.
+    const hung: AsyncIterable<number> = {
+      // biome-ignore lint/suspicious/useAwait: deliberate hang
+      [Symbol.asyncIterator]: async function* () {
+        await new Promise<never>(() => {
+          // never resolves
+        });
+      },
+    };
+    let caught: unknown = null;
+    try {
+      for await (const _ of abortableIterable(stallWatchdog(hung, 30), ctrl.signal)) {
+        // unreachable
+      }
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(StepStallError);
   });
 });

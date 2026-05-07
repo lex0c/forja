@@ -734,6 +734,29 @@ describe('formatPermanent', () => {
       expect(out[0]).toContain('Exhausted (step cap)');
     });
 
+    test('error + stepStalled renders "Error (no progress)"', () => {
+      // Step-stall watchdog fired — provider stream went silent
+      // for the full stallMs budget. Operator sees a specific
+      // cause label instead of a generic "Error" or worse,
+      // "Failed". Pin the verb so a regression that drops the
+      // stepStalled branch from the verb mapping shows up here.
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'explain',
+          status: 'error',
+          reason: 'stepStalled',
+          summary: 'step stalled (no provider events for 90000ms)',
+          durationMs: 90_000,
+          costUsd: 0.02,
+        },
+        unicode,
+      );
+      expect(out[0]).toContain('Error (no progress)');
+    });
+
     test('interrupted + maxWallClockMs renders Timed out', () => {
       const out = formatPermanent(
         {

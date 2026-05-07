@@ -290,6 +290,7 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
         if (status === 'error') {
           if (reason === 'degenerate_loop') return 'Error (loop)';
           if (reason === 'providerError') return 'Error (provider)';
+          if (reason === 'stepStalled') return 'Error (no progress)';
           return 'Error';
         }
         return 'Failed';
