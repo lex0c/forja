@@ -210,7 +210,15 @@ export interface LiveState {
   // by `Map`, so the renderer can iterate and produce stable layout.
   activeTools: Map<string, ActiveTool>;
   pendingAssistant: PendingAssistant | null;
-  thinking: { startedAt: number } | null;
+  // `messageId` carried alongside `startedAt` so the thinking
+  // chip can hash a stable per-turn seed when picking its
+  // spinner verb (`render/spinner-verbs.ts`). The reducer copies
+  // it from the `thinking:start` event; without it the chip
+  // would have no per-turn identity to hash and would either
+  // collapse to a single static verb or drift to a non-stable
+  // seed (timestamp-based picks can change mid-turn under clock
+  // skew or replay).
+  thinking: { startedAt: number; messageId: string } | null;
   // Active modal, or null when no modal is up. Composer (compose.ts)
   // replaces the input box with `renderModal(modal, caps)` whenever
   // this is non-null. Status line + tool cards stay visible.
@@ -655,7 +663,10 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
     }
 
     case 'thinking:start':
-      return { state: { ...state, thinking: { startedAt: event.ts } }, permanent: [] };
+      return {
+        state: { ...state, thinking: { startedAt: event.ts, messageId: event.messageId } },
+        permanent: [],
+      };
 
     case 'thinking:end':
     case 'thinking:delta':

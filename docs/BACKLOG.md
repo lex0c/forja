@@ -15,6 +15,112 @@ Format:
 
 ---
 
+## [2026-05-07] Spinner verbs — rotating cognitive / forge pools
+
+Replaces the flat "Thinking…" / "Generating…" labels on the two
+chips with per-turn-deterministic rotation across themed verb
+pools. Brand framing: Forja reads as an industrial / operational
+system executing a cognitive pipeline, not a chatbot doing
+stand-up. Flat labels gave no flavor and didn't carry the
+metaphor; rotating verbs do.
+
+**Done:**
+
+- `src/tui/render/spinner-verbs.ts` — new module. Two pools of
+  five verbs each, each pool drawn from a single coherent
+  cluster of the brand vocabulary:
+
+    - **COGNITIVE** (research-lab cluster): Modeling,
+      Synthesizing, Deriving, Correlating, Evaluating.
+    - **OUTPUT** (Forge OS cluster): Forging, Tempering,
+      Hardening, Smelting, Shaping.
+
+  Two clusters NOT used here are reserved for future surfaces:
+  "minimalist technical" (Analyzing / Indexing / Verifying /
+  Refining / Executing) maps cleanly to tool active verbs;
+  "agent infrastructure" (Orchestrating / Dispatching /
+  Sequencing / Coordinating / Consolidating) fits subagent
+  rows and compaction telemetry. Both follow-ups are tracked
+  but out of scope for this slice.
+
+  Selection is DETERMINISTIC — `pickCognitiveVerb(seed)` and
+  `pickOutputVerb(seed)` hash the assistant message id into a
+  pool index. Stable within a turn (no flicker between
+  consecutive frames every ~150ms), varies across turns. The
+  hash is a Java-style 31-multiplier rolling sum coerced to
+  int32, then `Math.abs(h) % pool.length` — not cryptographic,
+  just stable distribution across short ids.
+
+- `src/tui/state.ts` — `state.thinking` shape extended from
+  `{ startedAt }` to `{ startedAt, messageId }`. The reducer
+  copies the messageId from the `thinking:start` event. Without
+  it the chip would have no per-turn seed and would either
+  collapse to a single static verb or pick on a non-stable
+  signal (timestamp-based seeds drift under clock skew or
+  replay).
+
+- `src/tui/render/thinking-chip.ts` — verb is picked from the
+  cognitive pool by `pickCognitiveVerb(thinking.messageId)`.
+  Format updated from `Thinking… (Xs)` to
+  `<verb>… (Xs)`. No token counter (Anthropic emits cumulative
+  usage at message_stop only — pinning the absence so a future
+  refactor that adds a counter has to come with an explicit
+  signal source).
+
+- `src/tui/render/assistant-chip.ts` — verb is picked from the
+  output pool by `pickOutputVerb(pending.messageId)`. Format
+  updated from `Generating… (...)` to `<verb>… (...)`. Token
+  counter behavior preserved: shows once `assistant:usage`
+  lands, hidden before that.
+
+- `tests/tui/render/spinner-verbs.test.ts` (new, 9 cases):
+  pools verbatim, no overlap between pools, picker
+  determinism, picker distribution across many seeds.
+
+- `tests/tui/render/thinking-chip.test.ts` and
+  `assistant-chip.test.ts` updated: pool-membership assertions
+  replace literal-label assertions; new "verb stable across
+  re-renders" cases pin the no-flicker contract.
+
+- `tests/tui/render/compose.test.ts` — three pre-existing
+  cases that pinned literal "Generating…" / "Thinking…" labels
+  switched to pool-membership assertions. New helpers
+  (`verbInLine`, `containsAnyVerb`) keep the assertions
+  readable.
+
+- `tests/tui/render/footer.test.ts`,
+  `tests/tui/state.test.ts` — the few sites constructing
+  `state.thinking` directly extended to carry `messageId`.
+
+**Verification:** `bun test` 3565 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean. Suite gained 18 new
+tests across the new module + updated chip tests.
+
+**Pending — explicit follow-ups:**
+
+- **Tool active verbs** (`tools/builtin/*.ts` — each tool
+  declares an `activeVerb`). The "minimalist technical"
+  cluster (Analyzing, Indexing, Verifying, Refining,
+  Executing) maps cleanly: `read_file` → Indexing, `grep` →
+  Analyzing, `bash` (test runner) → Verifying, etc. Out of
+  scope here; ranking medium-effort, medium-impact.
+
+- **Subagent / compaction surfaces** (`tui/render/subagent-row.ts`,
+  compaction telemetry). The "agent infrastructure" cluster
+  (Orchestrating, Dispatching, Sequencing, Coordinating,
+  Consolidating) describes those activities precisely. Out of
+  scope; ranking low-priority but on-brand.
+
+- **Eval coverage for chip-verb perception.** Whether the
+  rotating verbs help or hurt operator perception is an eval
+  question. Stable-per-turn / vary-across-turn is the right
+  contract by construction; the open question is whether the
+  pool size and cluster choice land. No data → instinct.
+
+**Next:** branch ready to merge.
+
+---
+
 ## [2026-05-07] TUI thinking chip (closes the second silent UX promise)
 
 Same shape as the AGENTS.md gap closed earlier today: spec
