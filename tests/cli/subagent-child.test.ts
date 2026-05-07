@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runSubagentChild } from '../../src/cli/subagent-child.ts';
+import { computeSchemaRetryBudget, runSubagentChild } from '../../src/cli/subagent-child.ts';
 import type { Provider, StreamEvent } from '../../src/providers/index.ts';
 import { openDb } from '../../src/storage/db.ts';
 import {
@@ -2285,5 +2285,81 @@ describe('runSubagentChild — IPC', () => {
     const hintIdx = (captured ?? '').indexOf('# Parallelism');
     const identityIdx = (captured ?? '').indexOf('You are explore.');
     expect(hintIdx).toBeLessThan(identityIdx);
+  });
+});
+
+describe('computeSchemaRetryBudget', () => {
+  // Regression: the schema-retry path used to spread the original
+  // budget verbatim, giving the retry a fresh maxSteps /
+  // maxWallClockMs window — a playbook with `max_steps: 10`
+  // could burn 20 across the validation cycle. The harness
+  // gates maxCostUsd cumulatively across resumed sessions, so
+  // cost stays untouched here; steps and wall-clock reset
+  // per-call and need explicit subtraction.
+
+  test('subtracts steps consumed by the first run', () => {
+    const out = computeSchemaRetryBudget(
+      { maxSteps: 10, maxCostUsd: 1.0 },
+      { steps: 3, durationMs: 0 },
+    );
+    expect(out.skip).toBe(false);
+    if (out.skip) return;
+    expect(out.budget.maxSteps).toBe(7);
+    // maxCostUsd round-trips untouched — the harness is the
+    // authority on cumulative cost via priorCostUsd.
+    expect(out.budget.maxCostUsd).toBe(1.0);
+  });
+
+  test('subtracts durationMs consumed by the first run', () => {
+    const out = computeSchemaRetryBudget(
+      { maxSteps: 10, maxCostUsd: 1.0, maxWallClockMs: 60_000 },
+      { steps: 1, durationMs: 25_000 },
+    );
+    expect(out.skip).toBe(false);
+    if (out.skip) return;
+    expect(out.budget.maxWallClockMs).toBe(35_000);
+  });
+
+  test('returns skip when steps are exhausted', () => {
+    // First run consumed the full step envelope. Retry would
+    // start with a 0-step budget that trips its own cap on
+    // entry; better to skip and surface the schema-invalid
+    // diagnostic against the first output.
+    expect(
+      computeSchemaRetryBudget({ maxSteps: 5, maxCostUsd: 1.0 }, { steps: 5, durationMs: 100 }),
+    ).toEqual({ skip: true });
+    // Over-consumption (defensive — should not happen but a
+    // misbehaving harness could report steps > cap) also skips.
+    expect(
+      computeSchemaRetryBudget({ maxSteps: 5, maxCostUsd: 1.0 }, { steps: 6, durationMs: 100 }),
+    ).toEqual({ skip: true });
+  });
+
+  test('returns skip when wall-clock is exhausted', () => {
+    expect(
+      computeSchemaRetryBudget(
+        { maxSteps: 10, maxCostUsd: 1.0, maxWallClockMs: 30_000 },
+        { steps: 1, durationMs: 30_000 },
+      ),
+    ).toEqual({ skip: true });
+    expect(
+      computeSchemaRetryBudget(
+        { maxSteps: 10, maxCostUsd: 1.0, maxWallClockMs: 30_000 },
+        { steps: 1, durationMs: 31_000 },
+      ),
+    ).toEqual({ skip: true });
+  });
+
+  test('omits maxWallClockMs from the retry budget when the original had none', () => {
+    // No wall-clock cap declared → the retry should not
+    // synthesize one. Spreading the original budget preserves
+    // every other field the harness will fill from defaults.
+    const out = computeSchemaRetryBudget(
+      { maxSteps: 10, maxCostUsd: 1.0 },
+      { steps: 2, durationMs: 50_000 },
+    );
+    expect(out.skip).toBe(false);
+    if (out.skip) return;
+    expect(out.budget.maxWallClockMs).toBeUndefined();
   });
 });

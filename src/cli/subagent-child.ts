@@ -1,4 +1,5 @@
 import { type HarnessEvent, type HarnessResult, runAgent } from '../harness/index.ts';
+import type { RunBudget } from '../harness/types.ts';
 import { resolveHookConfig, resolveHookPaths } from '../hooks/index.ts';
 import {
   createMemoryRegistry,
@@ -259,6 +260,55 @@ const extractFinalOutput = (db: DB, lastMessageId: string | undefined): string =
 // to process.exit. Never throws — pre-loop failures route through
 // the error envelope (when the outputs row exists) or stderr
 // (when even that isn't possible).
+// Compute the budget that REMAINS for an output_schema retry
+// after the first runAgent pass exits cleanly with `done`.
+// `maxCostUsd` stays untouched because the harness gates cost
+// cumulatively across a resumed session (priorCostUsd loaded
+// from the row at line ~640 of harness/loop.ts), but `maxSteps`
+// and `maxWallClockMs` reset per runAgent call — the steps
+// counter starts at 0 and the wall-clock timer is fresh — so
+// passing the original budget verbatim would give the retry a
+// SECOND full window and let a single playbook invocation
+// exceed its declared step / time envelope.
+//
+// `skip: true` when any dimension is depleted (≤ 0 after
+// subtraction): the first run already used the declared
+// envelope, and a 0-step / 0-time retry would just trip its own
+// cap immediately — better to surface playbook.output_invalid
+// against the first output than to spend another provider call
+// producing a maxSteps / maxWallClockMs result.
+//
+// Exported for unit-testing the arithmetic without standing up
+// a real harness loop. Production callers use it from inline in
+// `runSubagentChild` below.
+// `Partial<RunBudget> & { maxSteps: number }` mirrors the shape
+// subagent-child constructs at the runAgent call site (where
+// the harness fills in any missing optional caps from
+// DEFAULT_BUDGET). We require maxSteps so the arithmetic is
+// well-defined.
+type RetryBudgetInput = Partial<RunBudget> & { maxSteps: number };
+
+export const computeSchemaRetryBudget = (
+  budget: RetryBudgetInput,
+  spent: { steps: number; durationMs: number },
+): { skip: true } | { skip: false; budget: RetryBudgetInput } => {
+  const remainingSteps = budget.maxSteps - spent.steps;
+  const remainingWallMs =
+    budget.maxWallClockMs !== undefined ? budget.maxWallClockMs - spent.durationMs : undefined;
+  const wallExhausted = remainingWallMs !== undefined && remainingWallMs <= 0;
+  if (remainingSteps <= 0 || wallExhausted) {
+    return { skip: true };
+  }
+  return {
+    skip: false,
+    budget: {
+      ...budget,
+      maxSteps: remainingSteps,
+      ...(remainingWallMs !== undefined ? { maxWallClockMs: remainingWallMs } : {}),
+    },
+  };
+};
+
 export const runSubagentChild = async (opts: SubagentChildOptions): Promise<number> => {
   const errSink = opts.errSink ?? ((s: string) => process.stderr.write(s));
   const dbPath = opts.dbPath ?? defaultDbPath();
@@ -1002,23 +1052,37 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
     if (audit.outputSchema !== null && result.status === 'done') {
       const firstVerdict = validateOutput(output, audit.outputSchema);
       if (!firstVerdict.valid) {
-        const diagnostic = `Your previous output did not match the declared output_schema: ${firstVerdict.reason}. Re-emit the YAML with all required keys and correct types. This is your last attempt before the run is failed with playbook.output_invalid.`;
-        // Build the retry config: same surface, except we
-        // switch the session-id discriminator from
-        // `preassignedSessionId` (already consumed) to
-        // `resumeFromSessionId` (reopens the row), and we hand
-        // the diagnostic in as the new userPrompt.
-        const { preassignedSessionId: _omit, userPrompt: _prevPrompt, ...rest } = config;
-        const retryConfig = {
-          ...rest,
-          resumeFromSessionId: opts.sessionId,
-          userPrompt: diagnostic,
-        };
-        result = await runAgent(retryConfig);
-        output = extractFinalOutput(db, result.lastMessageId);
-        totalCostUsd += result.costUsd;
-        totalSteps += result.steps;
-        totalDurationMs += result.durationMs;
+        const retryBudgetVerdict = computeSchemaRetryBudget(config.budget, {
+          steps: result.steps,
+          durationMs: result.durationMs,
+        });
+        if (retryBudgetVerdict.skip) {
+          // First run already consumed the declared envelope —
+          // skip the retry. The final validation pass below
+          // surfaces the playbook.output_invalid envelope using
+          // the original result.
+        } else {
+          const diagnostic = `Your previous output did not match the declared output_schema: ${firstVerdict.reason}. Re-emit the YAML with all required keys and correct types. This is your last attempt before the run is failed with playbook.output_invalid.`;
+          // Build the retry config: same surface, except we
+          // switch the session-id discriminator from
+          // `preassignedSessionId` (already consumed) to
+          // `resumeFromSessionId` (reopens the row), hand the
+          // diagnostic in as the new userPrompt, and rebase
+          // the per-run budget so the retry shares the
+          // original envelope rather than getting a fresh one.
+          const { preassignedSessionId: _omit, userPrompt: _prevPrompt, ...rest } = config;
+          const retryConfig = {
+            ...rest,
+            resumeFromSessionId: opts.sessionId,
+            userPrompt: diagnostic,
+            budget: retryBudgetVerdict.budget,
+          };
+          result = await runAgent(retryConfig);
+          output = extractFinalOutput(db, result.lastMessageId);
+          totalCostUsd += result.costUsd;
+          totalSteps += result.steps;
+          totalDurationMs += result.durationMs;
+        }
       }
     }
 
