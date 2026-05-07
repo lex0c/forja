@@ -22,7 +22,7 @@
 import { existsSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
-import { DEFAULT_BUDGET, effectiveBudget, resolveMaxOutputTokens } from '../harness/types.ts';
+import { effectiveBudget, resolveMaxOutputTokens } from '../harness/types.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
 import { stripAnsi } from '../sanitize/index.ts';
 import {
@@ -518,32 +518,48 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // boot-time `modelId` local because /model swaps the provider
   // object; the local goes stale immediately after the first
   // /model invocation.
-  const buildAdapterCtx = () => ({
-    profile: 'autonomous' as const,
-    project,
-    model: baseConfig.provider.id,
-    maxSteps: baseConfig.budget?.maxSteps ?? DEFAULT_BUDGET.maxSteps,
-    ...(baseConfig.budget?.maxCostUsd !== undefined
-      ? { maxCostUsd: baseConfig.budget.maxCostUsd }
-      : {}),
-    ...(baseConfig.planMode === true ? { planMode: true } : {}),
-    // Distinct-name memory count for the footer's `mem N` segment.
-    // Snapshot at adapter-construction time (per-turn) — if a
-    // memory_write succeeds mid-turn, the next turn's adapter
-    // picks up the new count. Within a turn the footer doesn't
-    // animate per-write; the `mem N` token reflects "what was
-    // available when this turn began". Trade-off: per-write live
-    // updates would couple the reducer to the memory_events bus
-    // (every write would have to fire a status:update event the
-    // reducer maps onto status.memoryCount). Per-turn fidelity is
-    // acceptable today because writes are interactive (operator
-    // confirms each one) and the next turn picks up the bump
-    // within seconds. Revisit if operator data shows confusion
-    // ("I just confirmed a write but the counter didn't move").
-    ...(baseConfig.memoryRegistry !== undefined
-      ? { memoryCount: baseConfig.memoryRegistry.count({ deduplicateByName: true }) }
-      : {}),
-  });
+  //
+  // Budget fields go through `effectiveBudget` so the TUI shows
+  // the same caps the harness will actually enforce. Reading
+  // `baseConfig.budget?.maxCostUsd` directly diverges from the
+  // loop, which uses `effectiveBudget(config.budget)` and
+  // therefore picks up `DEFAULT_BUDGET.maxCostUsd = 5` when the
+  // operator hasn't set one. The pre-fix shape silently omitted
+  // `maxCostUsd` from the ctx in that case — TUI rendered "no
+  // cap" while the harness still aborted at 5 USD with reason
+  // `maxCostUsd`. Routing through `effectiveBudget` keeps the
+  // displayed and enforced limits aligned and preserves the
+  // explicit-undefined opt-out (operator `/budget cost off`
+  // writes `maxCostUsd: undefined`, the merge propagates that
+  // undefined, and the ctx omits the field — TUI then correctly
+  // shows uncapped, matching the harness's skipped gate).
+  const buildAdapterCtx = () => {
+    const budget = effectiveBudget(baseConfig.budget);
+    return {
+      profile: 'autonomous' as const,
+      project,
+      model: baseConfig.provider.id,
+      maxSteps: budget.maxSteps,
+      ...(budget.maxCostUsd !== undefined ? { maxCostUsd: budget.maxCostUsd } : {}),
+      ...(baseConfig.planMode === true ? { planMode: true } : {}),
+      // Distinct-name memory count for the footer's `mem N` segment.
+      // Snapshot at adapter-construction time (per-turn) — if a
+      // memory_write succeeds mid-turn, the next turn's adapter
+      // picks up the new count. Within a turn the footer doesn't
+      // animate per-write; the `mem N` token reflects "what was
+      // available when this turn began". Trade-off: per-write live
+      // updates would couple the reducer to the memory_events bus
+      // (every write would have to fire a status:update event the
+      // reducer maps onto status.memoryCount). Per-turn fidelity is
+      // acceptable today because writes are interactive (operator
+      // confirms each one) and the next turn picks up the bump
+      // within seconds. Revisit if operator data shows confusion
+      // ("I just confirmed a write but the counter didn't move").
+      ...(baseConfig.memoryRegistry !== undefined
+        ? { memoryCount: baseConfig.memoryRegistry.count({ deduplicateByName: true }) }
+        : {}),
+    };
+  };
 
   // bus / focusStack / renderer / modalManager / parser / `running`
   // / `exiting` / `exitCode` / `resolveExit` / `exitPromise` /

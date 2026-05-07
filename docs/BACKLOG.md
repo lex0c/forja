@@ -15,6 +15,63 @@ Format:
 
 ---
 
+## [2026-05-07] REPL adapter — display cost cap matches enforced cap
+
+Slice C introduced `DEFAULT_BUDGET.maxCostUsd = 5` so an
+unconfigured session enforces the spec-declared 5 USD cap.
+`runAgent` resolves through `effectiveBudget(config.budget)` so
+the merge picks up the default. But `buildAdapterCtx` in
+`repl.ts` was reading `baseConfig.budget?.maxCostUsd`
+directly — when the operator hadn't set a cost override, the
+ctx omitted `maxCostUsd` entirely, the adapter's `step:budget`
+event carried `undefined`, and the TUI rendered "no cap"
+while the harness still aborted at 5 USD with reason
+`maxCostUsd`. Operator hit the cap with no warning glyph
+leading up to it.
+
+**Fix:** `buildAdapterCtx` now resolves through `effectiveBudget`
+just like the loop does. Same merge, same explicit-undefined
+opt-out propagation:
+
+- absent `baseConfig.budget.maxCostUsd` → merged value 5 →
+  ctx forwards 5 → TUI shows the warning thresholds correctly.
+- explicit number (e.g. operator set `/budget cost 10`) → ctx
+  forwards that number.
+- explicit undefined (operator did `/budget cost off`) → merged
+  is undefined → ctx omits the field → TUI correctly shows
+  uncapped, matching the harness's skipped gate.
+
+`maxSteps` was already reading `?? DEFAULT_BUDGET.maxSteps` and
+worked correctly, but the same `effectiveBudget` route now
+keeps both fields aligned for any future budget field that
+gets a non-trivial default.
+
+**Done:**
+
+- `src/cli/repl.ts` — `buildAdapterCtx` rebuilt around
+  `effectiveBudget(baseConfig.budget)`. Comment block records
+  the alignment contract and the divergence the pre-fix shape
+  caused.
+- Removed unused `DEFAULT_BUDGET` import from repl.ts (the
+  rewrite consolidates the merge through `effectiveBudget`).
+
+**Verification:** `bun test` 3591 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean. The harness-adapter
+tests (`tests/tui/harness-adapter.test.ts`) already pin that
+`ctx.maxCostUsd → step:budget.maxCostUsd`; this fix closes the
+upstream gap where `buildAdapterCtx` wasn't seeing the merged
+default. No new test added because the fix is verified
+end-to-end by the existing suite plus `effectiveBudget`'s own
+unit coverage; the visible UX delta (warning glyph at 80% of
+cap) only manifests under cost progression, which the existing
+mocks don't drive.
+
+**Spec posture:** none required. Aligns the displayed cap
+with the cap declared in `AGENTIC_CLI.md §5` and already
+enforced by the harness; no new behavior, just consistency.
+
+---
+
 ## [2026-05-07] loader thinking_budget — drop the 4096 floor
 
 Slice A introduced a `LOAD_TIME_OUTPUT_TOKENS_FLOOR` (4096) so
