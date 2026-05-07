@@ -232,6 +232,18 @@ export const TOOL_RESTRICTION_SHAPE: Readonly<Record<string, ToolRestrictionShap
   // "command string" or "path" shape.
   write_file: 'path',
   edit_file: 'path',
+  // Read-class path tools. read_file leaks file CONTENTS verbatim
+  // and grep leaks matching LINES from any file the path arg
+  // resolves to — both are content-disclosure surfaces a playbook
+  // author may want to fence (`tool_restrictions.read_file.allow_paths:
+  // ['src/**']`). grep's `path` is optional; the extractor returns
+  // null when absent, which the runtime treats as "no field to
+  // gate on" so the no-path call (search cwd) passes through.
+  // glob is intentionally excluded — it returns file NAMES only,
+  // and the actual content disclosure happens downstream through
+  // read_file/grep where this map already gates.
+  read_file: 'path',
+  grep: 'path',
 };
 
 // Render a refusal as a `ToolResult` error so the child's invoke
@@ -297,6 +309,8 @@ export const TOOL_RESTRICTION_EXTRACTORS: Readonly<Record<string, RestrictionExt
   bash_background: BASH_EXTRACTOR,
   write_file: PATH_EXTRACTOR,
   edit_file: PATH_EXTRACTOR,
+  read_file: PATH_EXTRACTOR,
+  grep: PATH_EXTRACTOR,
 };
 
 // Run the relevant restriction check for a tool given its raw

@@ -369,6 +369,81 @@ describe('checkRestriction (tool dispatch hook)', () => {
     expect(v.reason).toContain('outside the session cwd');
   });
 
+  test('read_file is gated by path-shape restrictions (content-disclosure surface)', () => {
+    // Regression: read_file was missing from TOOL_RESTRICTION_SHAPE
+    // and TOOL_RESTRICTION_EXTRACTORS, so a playbook rule like
+    // tool_restrictions.read_file.allow_paths: ['src/**'] was
+    // silently ignored — a subagent could read /etc/passwd or
+    // .env even though the frontmatter declared a fence. Now
+    // gated by the same PATH_EXTRACTOR + canonicalization that
+    // protects write_file/edit_file.
+    const v = checkRestriction(
+      'read_file',
+      { path: '.env' },
+      { read_file: { allowPaths: ['src/**'] } },
+      CWD,
+    );
+    expect(v.ok).toBe(false);
+    if (v.ok) return;
+    expect(v.reason).toContain('does not match');
+
+    // In-scope read passes.
+    const ok = checkRestriction(
+      'read_file',
+      { path: 'src/auth.ts' },
+      { read_file: { allowPaths: ['src/**'] } },
+      CWD,
+    );
+    expect(ok).toEqual({ ok: true });
+  });
+
+  test('read_file traversal cannot escape allow_paths', () => {
+    // Inherits the canonicalization fix — the extractor wiring
+    // alone is not enough; we also need the path-shape gate to
+    // canonicalize before matching. Pin both behaviors via the
+    // unified path extractor on read_file.
+    const v = checkRestriction(
+      'read_file',
+      { path: 'src/../.env' },
+      { read_file: { allowPaths: ['src/**'] } },
+      CWD,
+    );
+    expect(v.ok).toBe(false);
+    if (v.ok) return;
+    expect(v.reason).toContain('does not match');
+  });
+
+  test('grep with explicit path is gated', () => {
+    // grep can leak matching lines from any file its path arg
+    // resolves to — same content-disclosure surface as
+    // read_file when a path is supplied.
+    const v = checkRestriction(
+      'grep',
+      { pattern: 'TOKEN', path: 'secrets/' },
+      { grep: { allowPaths: ['src/**'] } },
+      CWD,
+    );
+    expect(v.ok).toBe(false);
+    if (v.ok) return;
+    expect(v.reason).toContain('does not match');
+  });
+
+  test('grep without a path passes through (search cwd default)', () => {
+    // grep's `path` is optional; absent means "search cwd",
+    // which IS the playbook scope. The PATH_EXTRACTOR returns
+    // null for missing fields and the runtime treats null as
+    // "no field to gate on" — the call passes through to the
+    // underlying tool, which already runs against ctx.cwd
+    // (bounded by the worktree / subagent isolation).
+    const v = checkRestriction(
+      'grep',
+      { pattern: 'TODO' },
+      { grep: { allowPaths: ['src/**'] } },
+      CWD,
+    );
+    expect(v).toEqual({ ok: true });
+  });
+
   test('path canonicalization: backslash separators normalize to forward slashes', () => {
     // Regression: `path.relative` returns native separators —
     // forward slashes on POSIX, backslashes on Windows. Patterns
