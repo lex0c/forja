@@ -22,6 +22,7 @@
 // permission engine refuses: a deny match always wins, an allow
 // list (when present) requires a match.
 
+import { isAbsolute, relative, resolve } from 'node:path';
 import type { Tool } from '../tools/types.ts';
 import { type ToolResult, toolError } from '../tools/types.ts';
 import type { ToolRestrictionRules, ToolRestrictions } from './types.ts';
@@ -281,10 +282,21 @@ export const TOOL_RESTRICTION_EXTRACTORS: Readonly<Record<string, RestrictionExt
 // tool the wrapper is invoking. Both null returns and missing
 // extractors collapse to "ok" — the strictest gate that triggers
 // is the floor.
+//
+// `cwd` is the session cwd the underlying tool resolves paths
+// against (write_file / edit_file: `resolve(ctx.cwd, args.path)`).
+// Path-shape restrictions canonicalize against the same cwd
+// before matching so traversal forms like `src/../secrets.txt`
+// cannot bypass `allow_paths: ["src/**"]` — the raw arg starts
+// with `src/`, but the resolved write target lands outside.
+// Bash-shape rules ignore cwd; the parameter is required so a
+// forgotten thread-through is a compile error rather than a
+// silent canonicalization skip.
 export const checkRestriction = (
   toolName: string,
   args: unknown,
   restrictions: ToolRestrictions | undefined,
+  cwd: string,
 ): RestrictionVerdict => {
   if (restrictions === undefined) return { ok: true };
   const rules = restrictions[toolName];
@@ -301,7 +313,54 @@ export const checkRestriction = (
   const input = extractor.extract(args);
   if (input === null) return { ok: true };
   if (extractor.shape === 'bash') return enforceBashRestriction(input, rules);
-  return enforcePathRestriction(input, rules);
+  // Path shape: canonicalize against cwd before matching. The
+  // patterns are interpreted as relative-to-cwd globs (the spec
+  // example is `src/**`), so we project the input into the same
+  // form. A canonical path that escapes cwd is refused outright —
+  // a write outside the session sandbox should not be reachable
+  // by any pattern, and folding it into the matcher would invite
+  // pattern authors to over-grant by accident.
+  const canonical = canonicalizeUnderCwd(input, cwd);
+  if (canonical.escaped) {
+    return {
+      ok: false,
+      reason:
+        'path resolves outside the session cwd — restrictions evaluate canonical paths under cwd to prevent traversal escapes',
+    };
+  }
+  return enforcePathRestriction(canonical.relPath, rules);
+};
+
+// Canonicalize a tool-supplied path against `cwd` and decide
+// whether it stays inside the sandbox. Mirrors what `write_file` /
+// `edit_file` do at write time (`resolve(ctx.cwd, args.path)`)
+// but ALSO rejects results that fall outside `cwd`, where the
+// write tools would happily proceed against the resolved absolute
+// path. This is the security boundary that turns the path
+// restriction into a true sandbox: glob authors write
+// `allow_paths: ["src/**"]` and the runtime guarantees that no
+// canonical path matched against that glob can escape `src/`,
+// regardless of how the model formats the arg (`src/../etc/x`,
+// `./src/../etc/x`, an absolute path outside cwd, etc.).
+const canonicalizeUnderCwd = (
+  input: string,
+  cwd: string,
+): { escaped: false; relPath: string } | { escaped: true } => {
+  // `resolve(cwd, input)` collapses `.` / `..` segments and
+  // honors absolute `input` (when input is absolute, cwd is
+  // ignored). Both cases land at the same canonical absolute
+  // path the write tools would write to.
+  const abs = resolve(cwd, input);
+  // `relative(cwd, abs)` returns:
+  //   - ''           when `abs === cwd`
+  //   - 'foo/bar'    when abs is inside cwd (POSIX-style on POSIX)
+  //   - '../foo'     when abs is one level outside cwd
+  //   - 'C:\\other'  on Windows when drives differ
+  const rel = relative(cwd, abs);
+  if (rel === '..' || rel.startsWith(`..${'/'}`) || rel.startsWith('..\\') || isAbsolute(rel)) {
+    return { escaped: true };
+  }
+  return { escaped: false, relPath: rel };
 };
 
 // Convenience: the tool-error code for restriction refusals. Kept
@@ -340,7 +399,7 @@ export const wrapToolWithRestrictions = <I, O>(
   return {
     ...tool,
     execute: (args, ctx) => {
-      const verdict = checkRestriction(tool.name, args, restrictions);
+      const verdict = checkRestriction(tool.name, args, restrictions, ctx.cwd);
       if (verdict.ok) return tool.execute(args, ctx);
       const result: ToolResult<O> = toRestrictionError(
         tool.name,
