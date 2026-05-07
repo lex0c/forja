@@ -25,6 +25,28 @@ tool_restrictions:
       - "git push *"
       - "git reset --hard *"
       - "rm -rf *"
+  write_file:
+    deny_paths:
+      - ".env*"
+      - "**/.env*"
+      - "**/secrets/**"
+      - "**/.git/**"
+      - "**/node_modules/**"
+      - "**/dist/**"
+      - "**/build/**"
+      - "**/.agent/**"
+      - "**/coverage/**"
+  edit_file:
+    deny_paths:
+      - ".env*"
+      - "**/.env*"
+      - "**/secrets/**"
+      - "**/.git/**"
+      - "**/node_modules/**"
+      - "**/dist/**"
+      - "**/build/**"
+      - "**/.agent/**"
+      - "**/coverage/**"
 budget:
   max_steps: 50
   max_cost_usd: 2.00
