@@ -15,6 +15,126 @@ Format:
 
 ---
 
+## [2026-05-07] m4 context tuning — closeout (slices A–D landed)
+
+Branch `feat/m4-context-tuning` carried four slices end-to-end.
+Each slice closed a documented mechanism that the spec had
+already specified but the code had not implemented; no spec
+divergence, no pre-blocking spec PR. Three commits on the branch
+plus this closeout entry.
+
+**Done:**
+
+- **Slice A — output token resolver** (`3b2e856`). The harness
+  was capping every Anthropic call at 4096 even though
+  `capabilities.output_max_tokens` already declared 64k for
+  Claude 4.x. `maxOutputTokensPerCall` becomes optional; new
+  `resolveMaxOutputTokens(budget, capabilities)` helper picks
+  `min(override ?? capability, capability)` so an unconfigured
+  session gets the full provider window. Subagent load-time
+  validation moved to a separate `LOAD_TIME_OUTPUT_TOKENS_FLOOR`
+  constant (4096) — best-effort gate where the runtime model
+  isn't yet in scope. Fixes silent truncation on long responses.
+
+- **Slice B — Anthropic prompt cache breakpoints** (`aba0230`).
+  Capabilities advertised `cache: 'server_5min'` and the cost
+  model already separated cached_input / cache_write rates, but
+  the adapter wasn't attaching `cache_control` anywhere — every
+  turn paid full input price. New `src/providers/anthropic/cache.ts`
+  module anchors three of the four breakpoints
+  CONTEXT_TUNING.md §3.1 declares: system block, last tool, last
+  message's last content block. Fourth breakpoint
+  ([project_context] / [memory_index] split) needs a
+  `composeSystemPrompt` restructure and is tracked as follow-up.
+  Hard cap of 4 markers per request asserted at request build
+  time. Captures the ~70% input-cost reduction documented in
+  PROVIDERS.md §5.1.
+
+- **Slice C — cost-primary budget defaults** (`795e62b`). Aligns
+  DEFAULT_BUDGET to AGENTIC_CLI.md §5: cost is the engagement
+  gate, step count is the runaway-loop backstop. `maxCostUsd`
+  becomes 5 USD (was undefined / no cap by default), type widens
+  to `number | undefined` so explicit operator opt-out
+  (`/budget cost off`) propagates through the spread merge.
+  `maxSteps` lifts 50 → 200 (degenerate-loop hash tracker
+  catches genuine pathology earlier; 50 was cutting legitimate
+  multi-file refactors mid-flight). /budget show falls back to
+  DEFAULT_BUDGET cost cap; the "no cap" label is now reserved
+  for explicit opt-outs.
+
+- **Slice D — structured compaction prompt.** The kickoff
+  hypothesis ("freeform 'be precise' instruction") was wrong —
+  the existing prompt at `compaction.ts:80` already had
+  GOAL/DECISIONS/FILES_TOUCHED/ERRORS/PENDING sections.
+  Refinement landed instead: added two sections that target the
+  dominant re-investigation cost in long sessions —
+  `ANCHORS` (file:line / symbol pointers found via tools that
+  the next turn should NOT re-grep) and `REJECTED` (approaches
+  tried and dismissed with one-line reason, so the next turn
+  doesn't replay the same dead end). Preamble strengthened to
+  explain WHY the structure exists ("anything not preserved
+  here will be re-investigated next turn"). Section names
+  stayed English per the Forja language policy; the
+  PT-BR sketch in the kickoff entry was a misread.
+
+**Decisions:**
+
+- **No spec edits in this branch.** Kickoff hedged that slice D
+  "may add a 1-paragraph clarification to CONTEXT_TUNING.md".
+  Per the project rule (CLAUDE.md: "Never edit `docs/spec/`
+  without an explicit user request"), the spec stays untouched.
+  The compaction-prompt refinement is consistent with
+  CONTEXT_TUNING.md §6 (importance-weighted truncation) and
+  doesn't introduce new contracts that require a spec PR.
+
+- **Three breakpoints, not four.** Slice B's cache layout
+  intentionally stops at three. The fourth would require
+  splitting the fused system string into discrete TextBlockParam
+  blocks — a composition refactor that touches `composeSystemPrompt`
+  and the playbook / parallel-hint composers. Out of scope for
+  the context-tuning arc; tracked as a follow-up PR against
+  CONTEXT_TUNING.md §3.1's declared layout.
+
+- **`maxCostUsd: number | undefined` instead of removing
+  opt-out.** Could have removed "no cap" entirely (always-have-a-
+  cap posture aligns with the spec). Kept the opt-out because
+  power users and CI / eval runners with their own budget
+  enforcement need an escape hatch; the explicit-undefined shape
+  documents the opt-out instead of hiding it as "absent ==
+  uncapped".
+
+**Pending — explicit follow-ups for future branches:**
+
+- **Fourth cache breakpoint via system-block split.** Slice B
+  notes the gap. Ranking: high value (memory_index-only changes
+  would not invalidate system + project_context cache); medium
+  effort (touches `composeSystemPrompt` and several composers).
+
+- **CONTEXT_TUNING.md amendment for ANCHORS / REJECTED.** Spec
+  describes compaction at a high level (CONTEXT_TUNING.md §6 +
+  ORCHESTRATION.md §4.6) without prescribing section names.
+  Worth a small spec PR codifying the structured-block schema
+  if other compaction consumers (Recap M4.1) want to share the
+  shape.
+
+- **Eval coverage for compaction quality.** No regression eval
+  exists yet for "compacted output preserves decisions / files /
+  errors faithfully". Slice D ships the prompt change blind —
+  empirical validation needs an eval harness with synthetic
+  long sessions and assertions on preserved facts. Tracked for
+  the eval-regression arc.
+
+**Verification:** `bun test` 3534 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean. Suite gained 26 new
+tests across the four slices (output-tokens × 6, anthropic-cache
+× 15, budget-defaults × 5; compaction prompt-shape pin in the
+existing file).
+
+**Next:** branch is mergeable. Cache-breakpoint and Recap M4
+follow-ups go on separate branches.
+
+---
+
 ## [2026-05-07] m4 context tuning — kickoff (cache + output cap + cost cap + compaction prompt)
 
 Branch `feat/m4-context-tuning` off `develop`. Four-slice

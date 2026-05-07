@@ -77,13 +77,38 @@ export interface CompactionResult {
 const SUMMARY_MARKER_OPEN = '[compacted_history]';
 const SUMMARY_MARKER_CLOSE = '[/compacted_history]';
 
-const COMPACTION_SYSTEM_PROMPT = `You are summarizing a long conversation between a user and an autonomous coding agent. Your output replaces the middle turns of the transcript so the model can continue without losing critical context. Be precise — every word costs tokens the agent could use to keep working.
+// Structured compaction prompt. The shape matters: the next agent
+// turn reads this block in place of the folded messages, so any
+// fact NOT preserved here gets re-investigated (extra grep / read /
+// test calls). The prompt nudges the model toward concrete
+// pointers (file:line, exact error strings) over narrative prose,
+// and adds two sections — ANCHORS and REJECTED — that target the
+// dominant re-investigation costs in long sessions:
+//
+//   - ANCHORS: code facts the agent had to use tools to find
+//     (symbol locations, struct shapes, framework idioms in this
+//     codebase). Without these, the next turn re-runs the same
+//     grep / read sequence to relearn what the prior turn already
+//     paid for.
+//   - REJECTED: approaches that were tried and dismissed, with a
+//     one-line reason. Without these, the next turn can rediscover
+//     the same dead end and burn cost on a path the prior turn
+//     already proved unviable.
+//
+// FILES_TOUCHED stays as-is rather than splitting into read/wrote;
+// the split is nice-to-have but FILES_TOUCHED is already
+// structurally adequate and the section count hits a usability
+// floor where adding more granularity costs more attention than
+// it saves.
+const COMPACTION_SYSTEM_PROMPT = `You are summarizing a long conversation between a user and an autonomous coding agent. Your output replaces the middle turns of the transcript so the model can continue without losing critical context. The next agent turn reads this block in place of those messages — anything not preserved here will be re-investigated next turn (extra grep / read / test calls), so prefer concrete pointers (file:line, symbol names, exact error strings) over prose. Every word costs tokens the agent could use to keep working.
 
 Output ONLY the following structured block, nothing else:
 
 ${SUMMARY_MARKER_OPEN}
 GOAL: <single line restating the user's original request>
-DECISIONS: <bullet list of concrete decisions taken; empty list if none>
+DECISIONS: <bullet list of concrete decisions taken with a brief rationale each; empty list if none>
+ANCHORS: <bullet list of code facts found via tools that the next turn should NOT re-discover; format \`path/file.ts:line — what\`; empty if none>
+REJECTED: <bullet list of approaches tried and dismissed; format \`<approach> — <why>\`; empty if none>
 FILES_TOUCHED: <comma-separated list of paths read/written; empty if none>
 ERRORS: <bullet list of errors hit and whether resolved>
 PENDING: <bullet list of remaining sub-tasks>
