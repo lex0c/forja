@@ -2127,6 +2127,79 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(130);
   });
 
+  test('slash playbook forwards baseConfig.temperature to runSubagent', async () => {
+    // Regression: runPlaybook called runSubagent without
+    // forwarding baseConfig.temperature, so an eval rig that
+    // started the REPL with temperature: 0 would see
+    // deterministic task_sync runs (harness/loop.ts forwards
+    // config.temperature on the foreground spawn path) but
+    // nondeterministic /<playbook> runs. Identical subagent
+    // work behaved differently depending on the route the
+    // model picked; the bridge now mirrors the loop's wiring.
+    const stub = makeBootstrapStub();
+    // Pin a session-level temperature on the captured config.
+    // makeBootstrapStub returns a partial HarnessConfig; cast
+    // through unknown to assign the field test-side without
+    // dragging the full type into the stub.
+    (stub.config as { temperature?: number }).temperature = 0;
+
+    const fakeDef = {
+      name: 'fake',
+      description: 'fake subagent for tests',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'noop',
+      scope: 'project',
+      isolation: 'none',
+      sourcePath: '/dev/null',
+      sourceSha256: '0'.repeat(64),
+      slash: 'fake',
+    };
+    (stub.subagents.byName as Map<string, unknown>).set('fake', fakeDef);
+
+    let capturedTemperature: number | undefined;
+    const fakeRunSubagent = async (
+      input: Parameters<typeof import('../../src/subagents/index.ts').runSubagent>[0],
+    ): ReturnType<typeof import('../../src/subagents/index.ts').runSubagent> => {
+      capturedTemperature = input.temperature;
+      return {
+        output: '(no-op)',
+        sessionId: 'sess-fake-child',
+        status: 'done',
+        reason: 'done',
+        costUsd: 0,
+        steps: 0,
+        durationMs: 0,
+      };
+    };
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      runSubagentOverride: fakeRunSubagent,
+    });
+    await tick();
+
+    stdin.feed('/fake go\r');
+    await tick();
+    await tick();
+    await flushFrame();
+
+    // The pinned temperature flowed through to the child's
+    // runSubagent input, matching what the foreground task_*
+    // spawn path does in harness/loop.ts.
+    expect(capturedTemperature).toBe(0);
+
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('Ctrl+C during a slash playbook aborts the dispatch signal', async () => {
     // Regression: runPlaybook used to mint a fresh AbortController
     // and never wire it to the REPL's interrupt machinery

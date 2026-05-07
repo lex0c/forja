@@ -1280,6 +1280,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           softStopSignal: softAc.signal,
           subagentRegistry: subagents,
           ...(baseConfig.isCwdTrusted !== undefined ? { cwdTrusted: baseConfig.isCwdTrusted } : {}),
+          // Forward the session-level temperature pin to the
+          // child. Without this, /<playbook> dispatch diverges
+          // from the foreground task_* spawn path
+          // (harness/loop.ts ~1010), which DOES forward
+          // config.temperature: an eval rig that started the
+          // REPL with temperature: 0 would see deterministic
+          // task_sync runs but nondeterministic /<playbook>
+          // runs depending on the route the model picks.
+          // Reading per-dispatch from baseConfig.provider so a
+          // mid-session /model swap (which mints a new provider
+          // object) is observed; reading temperature too keeps
+          // the precedence ladder honest.
+          ...(baseConfig.temperature !== undefined ? { temperature: baseConfig.temperature } : {}),
           // Plan mode propagation. When `/plan on` is active the
           // foreground harness refuses every writing tool — the
           // slash dispatcher must inherit the same gate, otherwise
