@@ -587,7 +587,7 @@ Estrutura do prompt **fixa, ordem importa, cache breakpoints conscientes**:
 ```
 [system]            estável        ← cache breakpoint #1
 [tool schemas]      estável        ← cache breakpoint #2
-[project context]   AGENTS.md      ← cache breakpoint #3
+[project context]   pointer pra AGENTS.md (~50 tokens; body lazy via read_file)  ← cache breakpoint #3
 [compacted history] resumo turns antigos
 [recent turns]      últimos N na íntegra
 [current turn]      mensagem + tool results pendentes

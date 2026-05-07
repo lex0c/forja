@@ -226,8 +226,8 @@ Repete `AGENTIC_CLI.md §6` com detalhamento:
 │  identity + date + metadata + format + constraints + (playbook?)
 ├─ [tool_schemas] ───────────────── cache #2 (stable enquanto tools fixas)
 │  JSON Schema de cada tool exposta
-├─ [project_context] ────────────── cache #3 (stable até AGENTS.md mudar)
-│  AGENTS.md content
+├─ [project_context] ────────────── cache #3 (stable até AGENTS.md ser renomeado/removido)
+│  pointer pra AGENTS.md (path + verification rule); body lazy via read_file
 ├─ [memory_index] ───────────────── cache #4 (stable até memory_event)
 │  index from MEMORY.md (~150 linhas)
 ├─ [repo_map] ───────────────────── stable até FS write
@@ -240,20 +240,36 @@ Repete `AGENTIC_CLI.md §6` com detalhamento:
    user prompt OR tool_result + qualquer goal re-injection
 ```
 
+### 2.0 `[project_context]` — pointer eager, body lazy
+
+Section emite **apenas um pointer** pra `AGENTS.md` quando o arquivo existe no cwd e o diretório está trusted; o conteúdo do arquivo NÃO entra no cache eager. Modelo lê via `read_file` quando regras/idioms/convenções do projeto importam pra a tarefa corrente.
+
+**Por quê pointer em vez de content:**
+
+1. **Simetria com memory subsystem.** `[memory_index]` carrega o índice (`MEMORY.md`, ~150 linhas) eager; bodies das memórias entram via `memory_read` lazy. AGENTS.md segue o mesmo padrão: ponteiro eager, body lazy. Decisão arquitetural consistente em vez de duas estratégias para o mesmo classe de "registro de regras do projeto".
+
+2. **Custo eager bounded.** Pointer é ~50 tokens estáveis. AGENTS.md em projetos reais chega a 1-3k tokens (e cresce). Eager-loading do body custa tokens em todo turno, em toda compaction call, em todo subagent spawn, mesmo em turnos onde o conteúdo não é relevante. O cache amortiza, mas só mascara o custo — não elimina.
+
+3. **Surface de prompt injection menor.** Mesmo após trust grant, o operator pode ter colado ou herdado conteúdo malicioso em AGENTS.md. Lazy read limita a ingestão a momentos onde o modelo decidiu ativamente que precisa do arquivo; verificação na entrada (`SECURITY_GUIDELINE §4`) opera sobre uma janela menor de eventos.
+
+4. **Preserva o cache breakpoint #3.** Pointer estável até AGENTS.md ser renomeado ou removido. Edits no body do AGENTS.md NÃO invalidam o cache — apenas a próxima `read_file` retorna conteúdo novo. Sessões longas onde o operator edita AGENTS.md mid-run não pagam re-cache do system prefix inteiro.
+
+**Trade-off honesto:** o modelo pode esquecer de ler AGENTS.md. A frase do pointer é explícita ("Read it via read_file when conventions matter") pra reduzir esquecimento. Se eval futura mostrar que o modelo ignora demais, a mitigação é endurecer o nudge ou auto-injetar o conteúdo na primeira tool call relevante — não voltar pra eager-content padrão. O custo de "esquecer e fazer errado" (uma mensagem do operador corrigindo) é menor que o custo recorrente de eager-content em toda sessão.
+
 ### 2.1 Tokens estimados por section (sessão típica)
 
 | Section | Tokens |
 |---|---|
 | system | 500-1000 |
 | tool_schemas | 2000-4000 |
-| project_context (AGENTS.md) | 1000-3000 |
+| project_context (pointer pra AGENTS.md) | ~50 |
 | memory_index | 1500-2500 |
 | repo_map | 1500-3000 |
 | compacted_history | 0-3000 |
 | recent_turns | varia (até cap) |
 | current_turn | varia |
 
-Total estável (cache hit): ~6-13k tokens. Variável: ~5-30k tokens.
+Total estável (cache hit): ~5-10k tokens. Variável: ~5-30k tokens.
 
 ---
 
