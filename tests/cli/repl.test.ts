@@ -1786,13 +1786,15 @@ describe('repl — slash commands integration', () => {
       },
     });
     await tick();
-    // Turn 1: drive session_start, observe boot-time maxSteps (50 from
-    // DEFAULT_BUDGET) in the rendered status line.
+    // Turn 1: drive session_start, observe boot-time maxSteps
+    // (200 from DEFAULT_BUDGET — bumped from 50 when cost became
+    // the primary engagement gate; step count is now the
+    // runaway-loop backstop) in the rendered status line.
     stdin.feed('go\r');
     await tick();
     ra.emitInto(0, { type: 'session_start', sessionId: 'sess-1' });
     await flushFrame();
-    expect(writes.join('')).toContain('0/50');
+    expect(writes.join('')).toContain('0/200');
     ra.finish(0);
     await tick();
     // Mutate via slash command, then turn 2. The cutoff sits AFTER

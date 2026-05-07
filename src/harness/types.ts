@@ -311,17 +311,25 @@ export interface RunBudget {
   // module walks back one position. preserveTail=0 still preserves
   // the trailing assistant + its tool_result for the same reason.
   compactionPreserveTail: number;
-  // Hard cap on total spend for this run, in USD. Optional —
-  // absent = no cap, preserves the existing "let other budgets
-  // contain the run" behavior. When set, the harness aborts with
-  // `maxCostUsd` after the FIRST cost-increasing event whose
-  // running total crosses the cap (provider turn or compaction
-  // call). Compared per-event with `>` so a `maxCostUsd: 0` config
-  // means "no spend allowed" — the first paid turn trips the gate.
-  // Honored across resumes via the cumulative tracker (priorCostUsd
-  // + totalCostUsd is what the cap compares against, NOT just the
-  // per-run total).
-  maxCostUsd?: number;
+  // Hard cap on total spend for this run, in USD. AGENTIC_CLI.md §5
+  // declares a default of 5 — cost is the engagement gate; step
+  // count (`maxSteps`) is the runaway-loop backstop. Three states:
+  //   - field absent: merge with DEFAULT_BUDGET picks up 5 USD.
+  //   - field === undefined: operator explicitly opted out (e.g.
+  //     via `/budget cost off`); the loop skips the cost gate.
+  //   - field is a number: that exact cap.
+  // The undefined-as-opt-out shape requires `number | undefined`
+  // (not just `?:`) under `exactOptionalPropertyTypes` so a partial
+  // override can carry the explicit disable signal through the
+  // spread merge.
+  // The harness aborts with `maxCostUsd` after the FIRST
+  // cost-increasing event whose running total crosses the cap
+  // (provider turn or compaction call). Compared per-event with
+  // `>` so a `maxCostUsd: 0` config means "no spend allowed" —
+  // the first paid turn trips the gate. Honored across resumes
+  // via the cumulative tracker (priorCostUsd + totalCostUsd is
+  // what the cap compares against, NOT just the per-run total).
+  maxCostUsd?: number | undefined;
   // Maximum number of tool calls the harness will dispatch in
   // parallel within a single step. Only active when EVERY
   // `tool_use` in the step has `metadata.parallel_safe === true`
@@ -352,7 +360,13 @@ export interface RunBudget {
 }
 
 export const DEFAULT_BUDGET: RunBudget = {
-  maxSteps: 50,
+  // `maxSteps` is the runaway-loop BACKSTOP, not the engagement
+  // gate. AGENTIC_CLI.md §5 frames cost as the primary gate;
+  // sessions that need many small steps (large refactor, multi-
+  // file audit) shouldn't be cut by step count if the cost cap is
+  // honored. 200 leaves headroom while still bounding genuine loop
+  // pathology (degenerate-loop tracker hits much earlier).
+  maxSteps: 200,
   maxWallClockMs: 10 * 60 * 1000,
   maxToolErrors: 5,
   maxRepeatedToolHash: 3,
@@ -360,6 +374,11 @@ export const DEFAULT_BUDGET: RunBudget = {
   // against the provider capability via `resolveMaxOutputTokens`.
   compactionThreshold: 0.7,
   compactionPreserveTail: 3,
+  // Spec-declared default cost cap (AGENTIC_CLI.md §5 line 333).
+  // Operator opts out via `/budget cost off`, which writes an
+  // explicit `undefined` so the spread-merge propagates the
+  // disable signal instead of falling back to 5.
+  maxCostUsd: 5,
   maxConcurrentToolCalls: 5,
   maxConcurrentSubagents: 3,
 };

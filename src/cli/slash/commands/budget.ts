@@ -29,13 +29,25 @@ const usage = '/budget [steps <N> | cost <USD|none> | parallel-tools <N> | subag
 
 const showAll = (ctx: SlashContext): SlashResult => {
   const b = ctx.baseConfig.budget ?? {};
+  // Cost has three states (see RunBudget docstring for the full
+  // contract): absent → fall back to DEFAULT_BUDGET; explicit
+  // undefined → operator opted out, render "no cap"; number →
+  // that value. `'maxCostUsd' in b` distinguishes "absent" from
+  // "present-as-undefined" since both read as undefined via `?.`.
+  const costLine = (() => {
+    if (!('maxCostUsd' in b)) {
+      const d = DEFAULT_BUDGET.maxCostUsd;
+      return `max cost: ${d !== undefined ? formatCost(d) : 'no cap'}`;
+    }
+    return `max cost: ${b.maxCostUsd !== undefined ? formatCost(b.maxCostUsd) : 'no cap'}`;
+  })();
   return {
     kind: 'ok',
     notes: [
       `max steps: ${b.maxSteps ?? DEFAULT_BUDGET.maxSteps}`,
       `max wall-clock: ${formatMs(b.maxWallClockMs ?? DEFAULT_BUDGET.maxWallClockMs)}`,
       `max tool errors: ${b.maxToolErrors ?? DEFAULT_BUDGET.maxToolErrors}`,
-      `max cost: ${b.maxCostUsd !== undefined ? formatCost(b.maxCostUsd) : 'no cap'}`,
+      costLine,
       `max parallel tools: ${b.maxConcurrentToolCalls ?? DEFAULT_BUDGET.maxConcurrentToolCalls} (cap ${MAX_CONCURRENT_TOOL_CALLS_CAP})`,
       `max concurrent subagents: ${b.maxConcurrentSubagents ?? DEFAULT_BUDGET.maxConcurrentSubagents} (cap ${MAX_CONCURRENT_SUBAGENTS_CAP})`,
     ],
@@ -133,18 +145,22 @@ export const budgetCommand: SlashCommand = {
       const raw = args[1] ?? '';
       const lowered = raw.toLowerCase();
       if (lowered === 'none' || lowered === 'off') {
-        // Clear the cap entirely. The harness treats undefined as
-        // "no spend cap" (per RunBudget docstring); absent vs
-        // undefined are equivalent at runtime today (loop checks
-        // `=== undefined`). Deleting the key keeps the config
-        // shape identical to the boot-time absence — cosmetic
-        // today, future-proof for diff tools / serializers.
+        // Operator opt-out from the cost cap. Now that
+        // DEFAULT_BUDGET ships a 5 USD default (AGENTIC_CLI.md §5),
+        // simply deleting the key would let the merge fall back to
+        // the default — silently re-applying a cap the operator
+        // just asked to clear. Writing an explicit `undefined`
+        // propagates through the spread merge (`{ ...DEFAULT_BUDGET,
+        // ...{ maxCostUsd: undefined } }` resolves to `undefined`)
+        // and the loop's `=== undefined` gate skips the cost
+        // check. The `'maxCostUsd' in current` check keeps the
+        // idempotency note honest: re-running `cost off` after the
+        // first one is a no-op.
         const current = ctx.baseConfig.budget ?? {};
-        if (current.maxCostUsd === undefined) {
+        if ('maxCostUsd' in current && current.maxCostUsd === undefined) {
           return { kind: 'ok', notes: ['max cost already uncapped (no change)'] };
         }
-        const { maxCostUsd: _drop, ...rest } = current;
-        ctx.baseConfig.budget = rest;
+        ctx.baseConfig.budget = { ...current, maxCostUsd: undefined };
         return {
           kind: 'ok',
           notes: withRunningCue(ctx, ['max cost: no cap — takes effect on the next turn']),
