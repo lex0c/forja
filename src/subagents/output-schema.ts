@@ -176,6 +176,14 @@ export const validateOutput = (text: string, schema: unknown): ValidationResult 
     return { valid: true };
   }
   const schemaObj = schema as Record<string, unknown>;
+  // Empty schema → no constraints. Mirrors `buildOutputSchemaBlock`
+  // (output-schema-block.ts), which suppresses the prompt-side
+  // "emit a YAML mapping" instruction for empty schemas. Without
+  // this short-circuit, free-form output would fail the parse
+  // gate below even though the author intentionally declared no
+  // structured contract — a prompt/runtime mismatch that forces
+  // unnecessary retries or `playbook.output_invalid` errors.
+  if (Object.keys(schemaObj).length === 0) return { valid: true };
   const parsed = parseOutputAsObject(text);
   if (parsed === null) {
     return {

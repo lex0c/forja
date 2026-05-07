@@ -195,8 +195,23 @@ describe('validateOutput — schema-side edge cases', () => {
     expect(validateOutput('whatever', [1, 2]).valid).toBe(true);
   });
 
-  test('empty schema is permissive', () => {
+  test('empty schema is permissive (parseable mapping)', () => {
     // An empty mapping has no required keys — any output passes.
     expect(validateOutput('foo: bar', {}).valid).toBe(true);
+  });
+
+  test('empty schema accepts free-form text (no parse gate when no constraints)', () => {
+    // Regression: previously, `audit.outputSchema !== null` gated
+    // enforcement, so an empty mapping `{}` still ran through
+    // validateOutput, which required the output to be parseable
+    // YAML/JSON. Free-form text would fail the parse and surface
+    // a spurious playbook.output_invalid even though the author
+    // intentionally declared no structured contract (the prompt
+    // composer in output-schema-block.ts already suppresses the
+    // "emit YAML" instruction for empty schemas). The validator
+    // now short-circuits empty schemas to mirror that intent.
+    expect(validateOutput('Just a free-form answer.\n\nNo YAML at all.', {}).valid).toBe(true);
+    expect(validateOutput('', {}).valid).toBe(true);
+    expect(validateOutput('- not\n- a\n- mapping', {}).valid).toBe(true);
   });
 });
