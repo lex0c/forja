@@ -31,7 +31,17 @@ export interface RunSubagentResult {
     // operator diagnostics) keep their fidelity.
     | 'unknown_model'
     | 'unknown_tool'
-    | 'subagent_load_failed';
+    | 'subagent_load_failed'
+    // Child-emitted post-harness contract violation (PLAYBOOKS.md
+    // §1.2). The harness ran cleanly to `done`, but the terminal
+    // assistant text didn't match the playbook's declared
+    // `output_schema` — even after the one-shot retry pass. The
+    // child synthesizes this envelope in `subagent-child.ts` and
+    // we preserve it verbatim so /<playbook> scrollback,
+    // task_sync / task_await tool errors, and audit telemetry can
+    // distinguish "model violated the contract" from generic
+    // `internalError` (which would otherwise mask the cause).
+    | 'playbook.output_invalid';
   costUsd: number;
   steps: number;
   durationMs: number;
@@ -121,6 +131,12 @@ const VALID_REASON_MAP: Record<RunSubagentResult['reason'], true> = {
   unknown_model: true,
   unknown_tool: true,
   subagent_load_failed: true,
+  // Child-emitted post-harness output_schema violation
+  // (PLAYBOOKS.md §1.2). Without this entry the parent's
+  // validator downgrades the child's specific verdict to
+  // `internalError`, blinding consumers / telemetry to the
+  // contract-violation cause.
+  'playbook.output_invalid': true,
 };
 const VALID_REASON: ReadonlySet<RunSubagentResult['reason']> = new Set(
   Object.keys(VALID_REASON_MAP) as RunSubagentResult['reason'][],
@@ -181,7 +197,8 @@ export interface SubagentEnvelope {
     | 'ipc_version_mismatch'
     | 'unknown_model'
     | 'unknown_tool'
-    | 'subagent_load_failed';
+    | 'subagent_load_failed'
+    | 'playbook.output_invalid';
   cost_usd: number;
   steps: number;
   duration_ms: number;
