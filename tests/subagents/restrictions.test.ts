@@ -369,6 +369,33 @@ describe('checkRestriction (tool dispatch hook)', () => {
     expect(v.reason).toContain('outside the session cwd');
   });
 
+  test('path canonicalization: backslash separators normalize to forward slashes', () => {
+    // Regression: `path.relative` returns native separators —
+    // forward slashes on POSIX, backslashes on Windows. Patterns
+    // in allow_paths / deny_paths are authored POSIX-style
+    // (`src/**`), so a Windows canonical `src\auth.ts` would
+    // fail to match every intended rule, turning the policy
+    // surface into a POSIX-only one and silently denying
+    // legitimate writes. The runtime now rewrites backslashes to
+    // forward slashes before matching.
+    //
+    // Cross-platform proof on POSIX: an input arg with a literal
+    // backslash (a valid POSIX filename character) goes through
+    // resolve() as filename text, comes back from relative() with
+    // the backslash preserved, and the normalization pass
+    // converts it. The same conversion runs unconditionally on
+    // Windows where the relative() output has backslash
+    // separators, so this test exercises the same code path that
+    // the Windows fix targets.
+    const v = checkRestriction(
+      'write_file',
+      { path: 'src\\auth.ts' },
+      { write_file: { allowPaths: ['src/**'] } },
+      CWD,
+    );
+    expect(v).toEqual({ ok: true });
+  });
+
   test('path canonicalization: deny_paths still applies after canonicalization', () => {
     // Mirror of the deny gate: a canonical path inside
     // `src/secret/**` is refused even if it was supplied as

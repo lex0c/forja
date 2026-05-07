@@ -377,13 +377,24 @@ const canonicalizeUnderCwd = (
   // ignored). Both cases land at the same canonical absolute
   // path the write tools would write to.
   const abs = resolve(cwd, input);
-  // `relative(cwd, abs)` returns:
-  //   - ''           when `abs === cwd`
-  //   - 'foo/bar'    when abs is inside cwd (POSIX-style on POSIX)
-  //   - '../foo'     when abs is one level outside cwd
-  //   - 'C:\\other'  on Windows when drives differ
-  const rel = relative(cwd, abs);
-  if (rel === '..' || rel.startsWith(`..${'/'}`) || rel.startsWith('..\\') || isAbsolute(rel)) {
+  // `relative(cwd, abs)` returns native-separator output:
+  // `foo/bar` on POSIX, `foo\bar` on Windows. Patterns in
+  // `allow_paths` / `deny_paths` are authored with POSIX
+  // separators per the spec example (`src/**`), so we project
+  // the relative path onto `/` before matching. Without this,
+  // every Windows run silently denies legitimate writes because
+  // `src\file.ts` cannot match `src/**` literally — turning a
+  // platform-neutral policy surface into a POSIX-only one.
+  //
+  // POSIX trade-off: a filename that legitimately contains `\`
+  // (a valid POSIX path char) gets its backslash rewritten to
+  // `/`, mismatching what the file tools would actually write.
+  // Accepted because (a) backslashes in POSIX filenames are
+  // exotic-to-the-point-of-pathological and (b) glob patterns
+  // are universally authored with `/`, so normalization aligns
+  // with the dominant author intent on every platform.
+  const rel = relative(cwd, abs).split('\\').join('/');
+  if (rel === '..' || rel.startsWith('../') || isAbsolute(rel)) {
     return { escaped: true };
   }
   return { escaped: false, relPath: rel };
