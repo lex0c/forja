@@ -6,7 +6,7 @@ budget:
   max_steps: 40
   max_cost_usd: 1.50
 slash: audit
-when_to_use: "scan code for threat categories (auth, injection, supply-chain, secrets) without a specific target; pre-deploy or post-sensitive-feature"
+when_to_use: "broad sweep across changed code for threat categories (auth, injection, supply-chain, secrets, crypto, etc.) before deploy or after a sensitive-feature merge. NOT for a specific known vulnerability — that is /debug with a security framing; NOT for design-time threat modeling — use /threat-model BEFORE the code exists; NOT for a one-line snippet — the playbook expects a meaningful surface to scan."
 sampling:
   temperature: 0.1
   max_tokens: 4096

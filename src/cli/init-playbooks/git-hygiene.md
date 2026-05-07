@@ -23,7 +23,7 @@ budget:
   max_steps: 12
   max_cost_usd: 0.30
 slash: git-hygiene
-when_to_use: "dirty branch before PR; commits to reorganize; history needs cleanup (squash, rebase, message rewrite)"
+when_to_use: "branch with messy history (WIP commits, oversized blobs, missing context) being prepared for review or merge. NOT for resolving merge conflicts (use normal mode); NOT for picking a commit message for a single staged change (a one-shot suggestion fits a normal turn); NOT for force-push or rewrite-public-history operations (out of scope, requires explicit operator approval)."
 sampling:
   temperature: 0.1
   max_tokens: 2048
