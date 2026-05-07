@@ -1,7 +1,7 @@
 ---
 name: debug
 description: Investigates a bug with hypotheses, repro, root cause, and a proposed fix.
-tools: [read_file, grep, glob, bash, bash_background, bash_output, bash_kill, todo_write]
+tools: [read_file, grep, glob, bash, bash_background, bash_output, bash_kill, wait_for, monitor, todo_write]
 isolation: worktree
 tool_restrictions:
   bash:
