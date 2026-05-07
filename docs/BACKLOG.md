@@ -15,6 +15,108 @@ Format:
 
 ---
 
+## [2026-05-07] edit_file batch — multi-replacement per call
+
+Closes the "N edits = N tool calls" overhead documented when
+the operator asked about edit_file efficiency. Single-edit
+calls were the only path; a refactor touching 5 sites in one
+file paid 5× (read + scan + write + permission gate + audit
+row + stream round-trip). For multi-arg playbook runs the
+overhead added up enough to be worth fixing.
+
+**API change (no backward compat):**
+
+  `{ path, old_string, new_string, replace_all? }`
+  →
+  `{ path, edits: [{ old_string, new_string, replace_all? }, ...] }`
+
+Single-edit callers wrap in an array of 1. No external
+consumers exist (Forja's at M4, no SDK shipped), so paying
+the test churn now ships a clean API instead of a hybrid
+shape with both top-level and array forms permanent.
+
+**Semantics:**
+
+- **Sequential.** Edit N operates on the result of edits
+  1..N-1, not on the original file. An earlier edit can
+  introduce text that a later edit targets, or remove text
+  that a later edit was expecting. The uniqueness gate also
+  runs against the post-previous-edit content — pinned by a
+  test that exercises the case where edit 1 introduces a
+  second occurrence of edit 2's target.
+- **All-or-nothing.** The batch is applied in memory; the
+  file is written only after every edit succeeds. Any
+  failure leaves the file untouched, with an error message
+  naming the failing edit's index (`edits[N].old_string not
+  found`, etc.). Partial application would leave the working
+  tree in a state the model didn't intend; whole-call
+  rollback matches the existing single-edit semantic and
+  composes cleanly with the harness's checkpoint layer.
+- **Cap of 50 edits per call.** Batches above that usually
+  signal either (a) the model should rewrite the file with
+  write_file, or (b) the change is genuinely AST-level and
+  needs a future symbol-aware tool. Blocking pathological
+  batches keeps the success rate honest — model gets a clean
+  invalid_arg and rethinks instead of submitting a 500-edit
+  batch likely to have a uniqueness collision somewhere.
+- **One write per batch.** `bytes_written` reflects the
+  final size; `mtime` bumps once. Per-edit writes would
+  multiply checkpoint cost and break the diff display.
+
+**Output shape:**
+
+  `{ path, edits: [{ replacements: N }, ...], total_replacements, bytes_written }`
+
+Per-edit `replacements` lets the model verify "did edit 3
+actually hit anything?" without re-reading the file. The
+aggregate is convenience for audit and eval assertions.
+
+**Done:**
+
+- `src/tools/builtin/edit-file.ts` — rewritten around the
+  array shape. Pulled the per-edit logic into a pure
+  `applyEdit` helper so each step (validate non-empty,
+  validate old !== new, count occurrences, apply
+  replacement) is one call site. The batch loop walks
+  in memory and errors out on first failure without
+  touching the disk. Tool description updated to teach
+  the sequential + all-or-nothing semantics explicitly.
+- `tests/tools/edit-file.test.ts` — rewritten. Existing 8
+  cases migrated to the array form (single-edit batches);
+  3 new cases for batch-shape validation (empty array,
+  non-array, cap); 6 new cases for multi-edit semantics
+  (sequential application, all-or-nothing rollback, per-edit
+  replace_all, post-previous-edit uniqueness gate, single
+  write at end).
+
+**Verification:** `bun test` 3584 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean. 19 new tests in
+this slice.
+
+**Spec posture:** none required. Spec mentions edit_file
+in passing (UI verb mapping, FEATURE_FLAGS audit query) but
+doesn't fix the API shape. Adding batch support is
+implementation refinement, not spec divergence.
+
+**Pending — explicit follow-ups:**
+
+- **`parallel_safe` for cross-file edits.** Today edit_file
+  is serial by default (`writes: true`, no `parallel_safe`).
+  Batching multi-edit IN-FILE removes the dominant
+  N×call overhead, but a refactor touching 10 different
+  files still fires 10 sequential calls. The gate is the
+  harness's parallel pool: `parallel_safe: true` + a
+  per-step path-disjointness check would let the pool
+  dispatch concurrently. Slice of medium complexity; not
+  in the same arc as this batch change.
+- **AST-aware rename.** The third recommendation from the
+  efficiency review. Requires CODE_INDEX (tree-sitter, M3
+  debt). Larger subsystem.
+
+**Next:** branch ready to merge.
+
+---
+
 ## [2026-05-07] Spinner verbs — rotating cognitive / forge pools
 
 Replaces the flat "Thinking…" / "Generating…" labels on the two
