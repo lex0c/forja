@@ -616,6 +616,7 @@ describe('formatPermanent', () => {
           status: 'done',
           summary: 'README at /repo/README.md',
           durationMs: 5_000,
+          costUsd: 0,
         },
         unicode,
       );
@@ -625,7 +626,12 @@ describe('formatPermanent', () => {
       expect(out[0]).toContain('5s');
     });
 
-    test('error shape uses Failed verb and red SGR when colored', () => {
+    test('error shape uses Error verb and red SGR when colored', () => {
+      // Renamed from "Failed" to "Error" — the verb mapping
+      // distinguishes status types (Done / Aborted / Exhausted /
+      // Error) so the operator can read the cause at a glance.
+      // "Failed" remains the last-resort fallback for unknown
+      // status combos.
       const out = formatPermanent(
         {
           kind: 'subagent_summary',
@@ -633,15 +639,117 @@ describe('formatPermanent', () => {
           subagentId: 'c1',
           name: 'audit',
           status: 'error',
-          summary: 'aborted',
+          summary: 'crashed',
           durationMs: 12,
+          costUsd: 0,
         },
         colored,
       );
       expect(out).toHaveLength(1);
-      expect(out[0]).toContain('Failed');
+      expect(out[0]).toContain('Error');
       // 31 = red SGR (paint(error, ...) goes through this code).
       expect(out[0]).toContain(`${CSI}31m`);
+    });
+
+    test('exhausted + maxCostUsd renders cost cap label with $X', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'explain',
+          status: 'exhausted',
+          reason: 'maxCostUsd',
+          summary: 'budget exceeded',
+          durationMs: 96_000,
+          costUsd: 0.6,
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0]).toContain('Exhausted (cost cap, $0.60)');
+    });
+
+    test('cost rendering rounds half-up at IEEE-754 edges (0.585 → $0.59)', () => {
+      // (0.585).toFixed(2) returns "0.58" in V8 / JavaScriptCore
+      // because 0.585 has an inexact IEEE-754 representation
+      // that rounds DOWN under toFixed's banker-style behavior.
+      // Anthropic pricing produces values right at this kind of
+      // edge — operator would see "$0.58 cost cap" when the run
+      // actually hit $0.59. Pin the half-up Math.round-based
+      // formatter so the displayed amount matches the cap that
+      // fired.
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'explain',
+          status: 'exhausted',
+          reason: 'maxCostUsd',
+          summary: '',
+          durationMs: 96_000,
+          costUsd: 0.585,
+        },
+        unicode,
+      );
+      expect(out[0]).toContain('Exhausted (cost cap, $0.59)');
+      expect(out[0]).not.toContain('$0.58');
+    });
+
+    test('interrupted + aborted renders Aborted verb', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'explain',
+          status: 'interrupted',
+          reason: 'aborted',
+          summary: '',
+          durationMs: 1500,
+          costUsd: 0.02,
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0]).toContain('Aborted');
+    });
+
+    test('exhausted + maxSteps renders step cap label', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'refactor',
+          status: 'exhausted',
+          reason: 'maxSteps',
+          summary: 'step cap reached',
+          durationMs: 5000,
+          costUsd: 0.42,
+        },
+        unicode,
+      );
+      expect(out[0]).toContain('Exhausted (step cap)');
+    });
+
+    test('interrupted + maxWallClockMs renders Timed out', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'audit',
+          status: 'interrupted',
+          reason: 'maxWallClockMs',
+          summary: '',
+          durationMs: 600_000,
+          costUsd: 0,
+        },
+        unicode,
+      );
+      expect(out[0]).toContain('Timed out');
     });
 
     test('uses ASCII glyph when caps.unicode is false', () => {
@@ -654,6 +762,7 @@ describe('formatPermanent', () => {
           status: 'done',
           summary: 'ok',
           durationMs: 100,
+          costUsd: 0,
         },
         ascii,
       );
@@ -673,6 +782,7 @@ describe('formatPermanent', () => {
           status: 'done',
           summary: long,
           durationMs: 100,
+          costUsd: 0,
         },
         unicode,
       );
@@ -691,6 +801,7 @@ describe('formatPermanent', () => {
           status: 'done',
           summary: '',
           durationMs: 100,
+          costUsd: 0,
         },
         unicode,
       );

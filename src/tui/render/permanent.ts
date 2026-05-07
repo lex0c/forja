@@ -242,12 +242,59 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
     case 'subagent_summary': {
       // One-line scrollback summary for a subagent run. Mirrors
       // tool-end's compact shape: `· task <name> Done <summary> in 1m2s`
-      // for success, `· task <name> Failed <summary> in 1m2s` for
-      // failure. The leading glyph reuses CHIP_FINAL_GLYPH so the
-      // marker visually peers with tool-end (same ascending-dot
-      // motif).
+      // for success, `· task <name> <Verb> <summary> in 1m2s` for
+      // non-success — Verb is chosen from status + reason so the
+      // operator can read the cause at a glance instead of a flat
+      // "Failed" that hides whether the cap blew, the user
+      // pressed Esc, or the provider crashed.
+      //
+      // Verb mapping:
+      //   done                                       → Done
+      //   exhausted + reason=maxCostUsd              → Exhausted (cost cap, $X)
+      //   exhausted + reason=maxSteps                → Exhausted (step cap)
+      //   exhausted + reason=maxToolErrors           → Exhausted (tool errors)
+      //   interrupted + reason=aborted               → Aborted
+      //   interrupted + reason=maxWallClockMs        → Timed out
+      //   interrupted (other)                        → Interrupted
+      //   error + reason=degenerate_loop             → Error (loop)
+      //   error + reason=providerError               → Error (provider)
+      //   error (other)                              → Error
+      //   anything unrecognized                      → Failed (last-resort)
       const glyph = caps.unicode ? CHIP_FINAL_GLYPH.unicode : CHIP_FINAL_GLYPH.ascii;
-      const verb = item.status === 'done' ? 'Done' : 'Failed';
+      // Half-up rounding to two decimals. `(0.585).toFixed(2)`
+      // returns "0.58" in V8 / JavaScriptCore because 0.585 has
+      // an inexact IEEE-754 representation that rounds DOWN under
+      // toFixed's banker-style behavior. Operator sees an
+      // off-by-cent that doesn't match the reason ("hit $0.59
+      // cap, displayed $0.58"). Math.round + scale + toFixed is
+      // deterministic and rounds half-up like the operator
+      // expects.
+      const formatDollars = (usd: number): string => (Math.round(usd * 100) / 100).toFixed(2);
+      const verbFor = (
+        status: typeof item.status,
+        reason: string | undefined,
+        costUsd: number,
+      ): string => {
+        if (status === 'done') return 'Done';
+        if (status === 'exhausted') {
+          if (reason === 'maxCostUsd') return `Exhausted (cost cap, $${formatDollars(costUsd)})`;
+          if (reason === 'maxSteps') return 'Exhausted (step cap)';
+          if (reason === 'maxToolErrors') return 'Exhausted (tool errors)';
+          return 'Exhausted';
+        }
+        if (status === 'interrupted') {
+          if (reason === 'aborted') return 'Aborted';
+          if (reason === 'maxWallClockMs') return 'Timed out';
+          return 'Interrupted';
+        }
+        if (status === 'error') {
+          if (reason === 'degenerate_loop') return 'Error (loop)';
+          if (reason === 'providerError') return 'Error (provider)';
+          return 'Error';
+        }
+        return 'Failed';
+      };
+      const verb = verbFor(item.status, item.reason, item.costUsd);
       const formatDuration = (ms: number): string => {
         if (ms < 1000) return `${ms}ms`;
         const totalSec = Math.round(ms / 1000);

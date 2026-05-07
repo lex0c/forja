@@ -197,6 +197,20 @@ export type HarnessEvent =
       type: 'subagent_finished';
       subagentId: string;
       status: HarnessResult['status'];
+      // Stable reason code, a string superset that includes
+      // every `ExitReason` plus subagent-specific failures
+      // (`worktree_create_failed`, `subprocess_spawn_failed`,
+      // `subprocess_crashed`, `heartbeat_stale`,
+      // `ipc_version_mismatch`, etc). Forwarded so the parent's
+      // TUI can render an honest cause label instead of the
+      // bare `status` enum, which loses the distinction between
+      // budget exhaustion and crash. Typed as `string` rather
+      // than the harness's `ExitReason` because the subagent
+      // runtime's reason set is intentionally wider — locking
+      // the event type to `ExitReason` would force every
+      // subagent-specific failure to be remapped at the
+      // boundary and lose information.
+      reason?: string;
       summary: string;
       durationMs: number;
       costUsd: number;

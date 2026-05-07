@@ -991,30 +991,72 @@ describe('harness-adapter — subagent observability', () => {
     expect(types(out)).toEqual(['subagent:update']);
   });
 
-  test('subagent_finished maps done → status:done, anything else → status:error', () => {
+  test('subagent_finished forwards full status + reason + costUsd to subagent:end', () => {
+    // The adapter previously collapsed status to `done | error`,
+    // erasing the cause distinction (cost cap, user abort,
+    // crash). Pin the new contract: full status preserved,
+    // reason forwarded when present, costUsd carried so the
+    // permanent chip can render "Exhausted (cost cap, $0.59)"
+    // instead of the bare "Failed".
     const a = createHarnessAdapter(baseCtx());
     const okOut = a.translate({
       type: 'subagent_finished',
       subagentId: 'c',
       status: 'done',
+      reason: 'done',
       summary: 'README found',
       durationMs: 1234,
       costUsd: 0.001,
     });
     const okEv = okOut[0] as Extract<UIEvent, { type: 'subagent:end' }>;
     expect(okEv.status).toBe('done');
+    expect(okEv.reason).toBe('done');
+    expect(okEv.costUsd).toBeCloseTo(0.001);
     expect(okEv.summary).toBe('README found');
     expect(okEv.durationMs).toBe(1234);
 
-    const errOut = a.translate({
+    // interrupted status is preserved (not collapsed to error).
+    const interruptedOut = a.translate({
       type: 'subagent_finished',
       subagentId: 'c',
       status: 'interrupted',
+      reason: 'aborted',
       summary: 'aborted',
       durationMs: 9,
       costUsd: 0,
     });
-    expect((errOut[0] as Extract<UIEvent, { type: 'subagent:end' }>).status).toBe('error');
+    const interruptedEv = interruptedOut[0] as Extract<UIEvent, { type: 'subagent:end' }>;
+    expect(interruptedEv.status).toBe('interrupted');
+    expect(interruptedEv.reason).toBe('aborted');
+
+    // exhausted status is preserved with budget reason intact.
+    const exhaustedOut = a.translate({
+      type: 'subagent_finished',
+      subagentId: 'c',
+      status: 'exhausted',
+      reason: 'maxCostUsd',
+      summary: 'budget exceeded',
+      durationMs: 9,
+      costUsd: 0.59,
+    });
+    const exhaustedEv = exhaustedOut[0] as Extract<UIEvent, { type: 'subagent:end' }>;
+    expect(exhaustedEv.status).toBe('exhausted');
+    expect(exhaustedEv.reason).toBe('maxCostUsd');
+    expect(exhaustedEv.costUsd).toBeCloseTo(0.59);
+
+    // reason omitted when the producer didn't set one (e.g.
+    // legacy spawn-failure path that synthesized the envelope).
+    const noReasonOut = a.translate({
+      type: 'subagent_finished',
+      subagentId: 'c',
+      status: 'error',
+      summary: 'crashed',
+      durationMs: 9,
+      costUsd: 0,
+    });
+    const noReasonEv = noReasonOut[0] as Extract<UIEvent, { type: 'subagent:end' }>;
+    expect(noReasonEv.status).toBe('error');
+    expect(noReasonEv.reason).toBeUndefined();
   });
 
   test('subagent_progress with cost_update inner pipes cumulativeCostUsd through (D232)', () => {

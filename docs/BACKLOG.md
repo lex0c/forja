@@ -15,6 +15,114 @@ Format:
 
 ---
 
+## [2026-05-07] subagent settle UX — surface cause + cap raise on explain.md
+
+A real-world failure exposed two independent gaps in the
+subagent settle UX:
+
+1. **TUI rendered "Failed in Xs" regardless of cause.** The
+   harness-adapter was collapsing HarnessResult.status from
+   four values (`done` / `interrupted` / `exhausted` / `error`)
+   onto a binary `done | error`, and the renderer used
+   "Done"/"Failed" against that. Operator who hit `maxCostUsd`
+   saw the same chip as the operator who pressed Ctrl-C or hit
+   a provider crash — no signal of actual cause.
+
+2. **The `explain` playbook's $0.30 cap was under-calibrated**
+   for project-wide exploration (12+ parallel reads + a long
+   structured YAML output blow past it cleanly).
+
+Reported via session DB inspection: parent ran 4m20s but only
+spent $0.10. One subagent legitimately exhausted its $0.30
+playbook cap at $0.585 with a complete YAML output (working
+as designed — cap calibration issue). A second subagent ran
+3m13s with $0.02 spent and emitted nothing after its first
+turn (genuine hang — no second provider call ever fired,
+diagnosed via the cost_progress_events table showing one event
+at boot then silence). User saw frozen UI and hard-aborted.
+The frozen-second-subagent is a separate bug — tracked as a
+follow-up because the fix is the step-stall detector
+(maxStepStallMs).
+
+**Done — UX surface failure cause:**
+
+- `subagent_finished` HarnessEvent gains `reason?: string`
+  (a string superset of ExitReason; subagent-specific values
+  like `subprocess_spawn_failed` and `worktree_create_failed`
+  flow through). Both emit sites in `src/subagents/runtime.ts`
+  populate it.
+- `subagent:end` UIEvent forwards full status (4 values), the
+  optional reason, and `costUsd: number`. The harness-adapter
+  no longer collapses status to `done | error`.
+- `subagent_summary` PermanentItem mirrors the new shape.
+- `formatPermanent` (`src/tui/render/permanent.ts`) maps
+  status × reason onto an honest verb:
+  - `done` → `Done`
+  - `exhausted` + `maxCostUsd` → `Exhausted (cost cap, $X.XX)`
+  - `exhausted` + `maxSteps` → `Exhausted (step cap)`
+  - `exhausted` + `maxToolErrors` → `Exhausted (tool errors)`
+  - `interrupted` + `aborted` → `Aborted`
+  - `interrupted` + `maxWallClockMs` → `Timed out`
+  - `error` + `degenerate_loop` → `Error (loop)`
+  - `error` + `providerError` → `Error (provider)`
+  - other unrecognized combos → `Failed` (last-resort fallback)
+- Cost formatter uses `Math.round(usd*100)/100` before
+  `toFixed(2)` to fix an IEEE-754 edge case: `(0.585).toFixed(2)`
+  returns `"0.58"` in V8/JavaScriptCore, displaying $0.58 for
+  a cap that fired at $0.59. Test pins the half-up rounding
+  with the exact 0.585 fixture.
+
+**Done — calibration:**
+
+- `src/cli/init-playbooks/explain.md`: `max_cost_usd: 0.30`
+  → `1.00` and `max_steps: 20` → `25`. The original cap was
+  calibrated for explanation of a single function or file, not
+  for project-wide exploration with parallel reads. Bumping
+  to $1.00 aligns with `code-review` ($0.75) and `gap-audit`
+  ($0.50) tier — generous enough for legitimate broad scope,
+  still well below `refactor` ($2.00) and `audit` ($1.50).
+
+  NOTE: this updates the install-time TEMPLATE only.
+  `.agent/agents/explain.md` (the operator's installed copy)
+  is gitignored — operators with an existing install must
+  re-run `agent init --playbooks` or edit the file manually
+  to pick up the new cap.
+
+**Verification:** `bun test` 3616 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean. Suite gained 5 new
+tests (4 verb-mapping cases in `permanent.test.ts`, 1
+half-up rounding pin) plus 3 expanded cases in the
+harness-adapter test that pin the new forwarding contract.
+
+**Spec posture:** none required. The fix tightens UX
+rendering of an existing event surface; no contract change.
+
+**Pending — explicit follow-ups (sequencing for the next slice):**
+
+- **Step-stall detector** (spec AGENTIC_CLI.md §5
+  `maxStepStallMs` — declared but not implemented). The
+  second subagent in the reported failure ran 3m13s with no
+  second provider call ever firing; without a stall watchdog,
+  the operator only learned about it by hard-aborting. Next
+  slice.
+
+- **Soft-cap behavior for per-playbook `max_cost_usd`** —
+  user proposal to make per-playbook caps a warn signal
+  rather than a hard kill, with the global `maxCostUsd` as
+  the only hard gate. Preserves the pessimistic reservation
+  the pre-spawn gate needs while removing the "child died at
+  cap that's too tight for legitimate work" failure mode.
+  Same next slice.
+
+- **Surface cost on non-budget settles** (`Aborted in 3m ·
+  $0.05`). Operator sometimes wants to know how much was
+  spent before a cancel. Polish.
+
+**Next:** branch is mergeable; step-stall + soft-cap go in a
+follow-up slice on the same branch.
+
+---
+
 ## [2026-05-07] env block — drop recent commit subjects (prompt-injection guard)
 
 The system prompt enrichment slice landed `git log --oneline -3`

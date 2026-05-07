@@ -613,17 +613,22 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
       }
 
       case 'subagent_finished':
-        // Status maps from HarnessResult.status onto the UIEvent's
-        // narrower 'done' | 'error' shape. 'interrupted' and
-        // 'exhausted' both surface as 'error' for the operator —
-        // the difference between "user pressed Esc" and "ran out
-        // of budget" is captured in the summary line, not in the
-        // status enum (which exists to drive a glyph color).
+        // Forward the FULL HarnessResult.status (done /
+        // interrupted / exhausted / error). The previous shape
+        // collapsed everything non-done to 'error' and the
+        // operator lost the distinction — "Failed in 96s" gave
+        // no signal whether the run hit a budget cap, was
+        // user-cancelled, or crashed. The renderer uses the
+        // detailed status + reason to render an honest cause
+        // label ("Exhausted (cost cap, $0.59)" vs "Aborted" vs
+        // "Error").
         out.push({
           type: 'subagent:end',
           ts,
           subagentId: event.subagentId,
-          status: event.status === 'done' ? 'done' : 'error',
+          status: event.status,
+          ...(event.reason !== undefined ? { reason: event.reason } : {}),
+          costUsd: event.costUsd,
           summary: event.summary,
           durationMs: event.durationMs,
         });

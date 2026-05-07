@@ -397,7 +397,25 @@ export type SubagentUpdateEvent = BaseEvent & {
 export type SubagentEndEvent = BaseEvent & {
   type: 'subagent:end';
   subagentId: string;
-  status: 'done' | 'error';
+  // Full harness status — `done` | `interrupted` | `exhausted` |
+  // `error`. The renderer was previously collapsing this to
+  // `done | error` and the operator lost the cause distinction
+  // ("Did it run out of budget? Did I cancel it? Did the
+  // provider blow up?"). Surface full status so the scrollback
+  // chip can render an honest cause label.
+  status: 'done' | 'interrupted' | 'exhausted' | 'error';
+  // Stable reason code from the harness — `maxCostUsd`,
+  // `maxSteps`, `maxWallClockMs`, `aborted`, `degenerate_loop`,
+  // `providerError`, `done`, etc. Optional: older producers /
+  // fallback paths may not set it. The renderer uses it to
+  // refine the verb ("Exhausted (cost cap)" vs the bare
+  // "Exhausted").
+  reason?: string;
+  // Child's authoritative spend at settle. Renderer surfaces
+  // this in the chip when the run was budget-related so the
+  // operator sees "spent $0.59 of a $0.30 cap" rather than just
+  // "Failed".
+  costUsd: number;
   summary: string;
   durationMs: number;
 };

@@ -423,7 +423,20 @@ export type PermanentItem =
       ts: number;
       subagentId: string;
       name: string;
-      status: 'done' | 'error';
+      // Full HarnessResult.status. Renderer maps this onto a
+      // verb (`Done` / `Aborted` / `Exhausted` / `Error`) and a
+      // glyph color so the operator sees the cause type at a
+      // glance.
+      status: 'done' | 'interrupted' | 'exhausted' | 'error';
+      // Stable reason code (`maxCostUsd`, `maxSteps`, `aborted`,
+      // `degenerate_loop`, etc). Optional. Renderer uses it to
+      // refine the verb ("Exhausted (cost cap)") and decide
+      // whether to surface costUsd.
+      reason?: string;
+      // Authoritative spend at settle. Surfaced by the renderer
+      // when reason is budget-related so the operator sees how
+      // much was burned vs the cap.
+      costUsd: number;
       summary: string;
       durationMs: number;
     };
@@ -1264,6 +1277,8 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
                 subagentId: event.subagentId,
                 name: existing.name,
                 status: event.status,
+                ...(event.reason !== undefined ? { reason: event.reason } : {}),
+                costUsd: event.costUsd,
                 summary: event.summary,
                 durationMs: event.durationMs,
               },
