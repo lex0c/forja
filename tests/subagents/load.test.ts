@@ -627,6 +627,40 @@ describe('playbook surface — tool_restrictions', () => {
       ),
     ).toThrow(/'tool_restrictions\.bash\.allow' lists "rg \*" twice \(index 0 and index 1\)/);
   });
+
+  test('rejects patterns padded with leading or trailing whitespace', () => {
+    // Regression: the matcher does literal-position glob
+    // comparison (no input/pattern normalization on the path
+    // side), so ` src/**` or `src/** ` would never trigger any
+    // path the write tools would resolve. The loader caught
+    // empty strings but not whitespace-padded ones, leaving
+    // typo-shaped entries to silently disable an allow rule
+    // (or fail to deny a sensitive path). Reject at load so
+    // the author sees the cause source-aware.
+    const padded = [
+      'tool_restrictions:\n  write_file:\n    allow_paths: ["src/** "]',
+      'tool_restrictions:\n  write_file:\n    allow_paths: [" src/**"]',
+      'tool_restrictions:\n  write_file:\n    deny_paths: ["\\tsecrets/**"]',
+      'tool_restrictions:\n  bash:\n    deny: ["rm -rf *\\n"]',
+    ];
+    for (const fm of padded) {
+      expect(() => loadSubagentFromString(withExtraFrontmatter(fm), 'user', '/p')).toThrow(
+        /has surrounding whitespace/,
+      );
+    }
+  });
+
+  test('keeps internal whitespace inside patterns valid (bash needs it)', () => {
+    // Bash command patterns legitimately have spaces between
+    // tokens (`git diff *`); the surrounding-whitespace guard
+    // must NOT swallow them.
+    const def = loadSubagentFromString(
+      withExtraFrontmatter('tool_restrictions:\n  bash:\n    allow: ["git diff *"]'),
+      'user',
+      '/p',
+    );
+    expect(def.toolRestrictions?.bash?.allow).toEqual(['git diff *']);
+  });
 });
 
 describe('playbook surface — sampling', () => {

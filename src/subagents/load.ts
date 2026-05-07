@@ -303,6 +303,20 @@ const requireRestrictionPatternArray = (
     if (entry.length === 0) {
       throw new Error(`subagent ${sourcePath}: '${fieldPath}[${i}]' must be a non-empty pattern`);
     }
+    // Surrounding whitespace is always a typo: the matcher does
+    // literal-position glob comparison (no input/pattern
+    // normalization on the path side), so an entry like
+    // ' src/**' or 'src/** ' could not possibly match any path
+    // that write_file / edit_file would resolve. Refuse at load
+    // so authors see the cause source-aware instead of debugging
+    // why an allow / deny rule never triggers. Internal
+    // whitespace stays valid — bash command patterns
+    // legitimately contain spaces (`git diff *`).
+    if (entry !== entry.trim()) {
+      throw new Error(
+        `subagent ${sourcePath}: '${fieldPath}[${i}]' has surrounding whitespace (${JSON.stringify(entry)}); patterns are matched literally and a padded entry would never trigger`,
+      );
+    }
     const prior = seen.get(entry);
     if (prior !== undefined) {
       throw new Error(
