@@ -2279,6 +2279,89 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(130);
   });
 
+  test('/quit during a slash playbook aborts and waits for the dispatch before db.close', async () => {
+    // Regression: runPlaybook started a long-lived runSubagent
+    // await that the shutdown path neither aborted nor awaited
+    // (only `runningPromise` was tracked). /quit-mid-playbook
+    // would close the SQLite handle while the runtime was
+    // still flushing the envelope, surfacing as a "database is
+    // closed" throw and leaking the child past REPL exit. The
+    // shutdown path now (a) aborts playbookAbortController and
+    // (b) awaits playbookPromise before calling db.close.
+    const stub = makeBootstrapStub();
+    const fakeDef = {
+      name: 'fake',
+      description: 'fake subagent for tests',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'noop',
+      scope: 'project',
+      isolation: 'none',
+      sourcePath: '/dev/null',
+      sourceSha256: '0'.repeat(64),
+      slash: 'fake',
+    };
+    (stub.subagents.byName as Map<string, unknown>).set('fake', fakeDef);
+
+    let dispatchSignal: AbortSignal | undefined;
+    let dispatchSettled = false;
+    const fakeRunSubagent = async (
+      input: Parameters<typeof import('../../src/subagents/index.ts').runSubagent>[0],
+    ): ReturnType<typeof import('../../src/subagents/index.ts').runSubagent> => {
+      dispatchSignal = input.signal;
+      // Park until the signal aborts. Once it does, simulate the
+      // runtime's "still flushing" window — a brief async tick
+      // before settling so any teardown that didn't await would
+      // race past us.
+      await new Promise<void>((resolve) => {
+        input.signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+      await new Promise((r) => setTimeout(r, 5));
+      dispatchSettled = true;
+      return {
+        output: '',
+        sessionId: 'sess-fake-child',
+        status: 'interrupted',
+        reason: 'aborted',
+        costUsd: 0,
+        steps: 0,
+        durationMs: 0,
+        abortCause: 'hard',
+      };
+    };
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      runSubagentOverride: fakeRunSubagent,
+    });
+    await tick();
+
+    stdin.feed('/fake go\r');
+    await tick();
+    await tick();
+    expect(dispatchSignal).toBeDefined();
+    expect(dispatchSignal?.aborted).toBe(false);
+
+    // Operator hits /quit — shutdown must abort the playbook
+    // signal AND wait for dispatch to settle before exiting.
+    stdin.feed('/quit\r');
+    const code = await promise;
+    // Shutdown aborted the dispatch.
+    expect(dispatchSignal?.aborted).toBe(true);
+    // AND awaited the runtime's flush window — without the
+    // await in shutdown, dispatchSettled could still be false
+    // by the time the REPL exited.
+    expect(dispatchSettled).toBe(true);
+    expect(code).toBe(0);
+  });
+
   test('Ctrl+C during a slash playbook aborts the dispatch signal', async () => {
     // Regression: runPlaybook used to mint a fresh AbortController
     // and never wire it to the REPL's interrupt machinery

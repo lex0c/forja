@@ -774,6 +774,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // dispatch the same way they preempt a foreground turn.
   let playbookAbortController: AbortController | null = null;
   let playbookSoftStopController: AbortController | null = null;
+  // Promise handle for the in-flight slash playbook dispatch.
+  // shutdown() aborts the playbook controller AND awaits this so
+  // the child's setSubagentPayload completes before db.close() —
+  // without it, /quit during a long /<playbook> tears down the
+  // SQLite handle while the runtime is still flushing the
+  // envelope, surfacing as a "database is closed" throw and
+  // leaking the child subprocess past REPL exit. Mirrors the
+  // foreground `runningPromise` contract.
+  let playbookPromise: Promise<unknown> | null = null;
   // The promise returned by the in-flight runAgent (already wrapped
   // in `.catch().finally()`, so awaiting never throws). `shutdown`
   // awaits this before closing the DB so the harness's async cleanup
@@ -1000,6 +1009,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // function does the work without needing its own guard.
   const shutdown = async (): Promise<void> => {
     if (abortController !== null) abortController.abort();
+    // Same hard-abort signal for an in-flight slash playbook so
+    // its runSubagent settles instead of running to natural
+    // completion past the operator's /quit. The promise await
+    // below blocks db.close() until the child's payload write
+    // lands.
+    if (playbookAbortController !== null) playbookAbortController.abort();
     // Cancel any pending idle-exit-gate timer so a 2s setTimeout
     // doesn't outlive the REPL and leak a node handle (visible in
     // tests as Bun's "open handles" warning, and in production as
@@ -1014,6 +1029,19 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // and SQLite throws on the closed handle. The promise is already
     // .catch()ed so awaiting never throws.
     if (runningPromise !== null) await runningPromise;
+    // Same wait for the playbook dispatch — the runtime's final
+    // `setSubagentPayload` AND `reclassifySessionStatus` calls land
+    // BEFORE db.close(), keeping the audit trail consistent with
+    // the published envelope even on a /quit-mid-playbook race.
+    if (playbookPromise !== null) {
+      try {
+        await playbookPromise;
+      } catch {
+        // Swallow — runPlaybook's caller (slash exec) already
+        // surfaces failures via the slash bus error channel; the
+        // shutdown path only needs the wait, not the verdict.
+      }
+    }
     modalManager.close();
     renderer.close();
     stdin.removeListener('data', onData);
@@ -1267,7 +1295,14 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       try {
         const parentSessionId = ensureParentSessionId();
         const runSubagentImpl = options.runSubagentOverride ?? runSubagent;
-        const result = await runSubagentImpl({
+        // Capture the dispatch promise BEFORE awaiting so the
+        // module-scope `playbookPromise` ref points at the same
+        // settle the shutdown path can wait on. Without the
+        // pre-await capture, shutdown would either close the DB
+        // before the runtime's `setSubagentPayload` /
+        // `reclassifySessionStatus` writes land or have nothing
+        // to wait on at all.
+        const dispatchPromise = runSubagentImpl({
           definition,
           prompt,
           parentSessionId,
@@ -1332,6 +1367,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
             return allowed ? 'allow' : 'deny';
           },
         });
+        playbookPromise = dispatchPromise;
+        const result = await dispatchPromise;
         // Roll the playbook spend into the REPL cumulative tracker.
         // Without this, /cost reports zero for slash-dispatched
         // playbooks because the foreground `session_finished` path
@@ -1349,12 +1386,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       } finally {
         // Drop the gate even on throw — a stuck `playbookRunning`
         // would lock the operator out of every subsequent dispatch
-        // until process restart. Same logic for the controllers:
-        // clear them so a subsequent triggerInterrupt fired in
-        // idle does not call abort() on a settled signal.
+        // until process restart. Same logic for the controllers
+        // and the promise ref: clear them so a subsequent
+        // triggerInterrupt / shutdown fired in idle does not
+        // call abort() on a settled signal or await a stale
+        // promise.
         playbookRunning = false;
         playbookAbortController = null;
         playbookSoftStopController = null;
+        playbookPromise = null;
       }
     },
   };
