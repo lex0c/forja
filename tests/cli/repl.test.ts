@@ -1917,4 +1917,110 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(0);
     expect(ra.captured).toHaveLength(0);
   });
+
+  test('runPlaybook forwards onPermissionAsk through confirmPermission (subagent confirm gating)', async () => {
+    // Regression: `runPlaybook` previously called `runSubagent`
+    // without `onPermissionAsk`, so the subagent runtime would
+    // auto-deny every child `permission:ask`. A playbook hitting a
+    // confirm-gated tool would silently fail under the operator
+    // instead of prompting them. Now the dispatcher mirrors the
+    // harness's `spawnSubagentImpl` wiring (loop.ts) — adapting
+    // the parent's `confirmPermission` (boolean) into the runtime's
+    // PermissionDecision shape.
+    const stub = makeBootstrapStub();
+    // Inject one fake playbook with `slash: 'fake'`. The bootstrap
+    // stub default has `subagents: { byName: new Map() }`; we cast
+    // through unknown because the real SubagentDefinition has many
+    // optional fields the dispatcher does not read on this path.
+    const fakeDef = {
+      name: 'fake',
+      description: 'fake subagent for tests',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'noop',
+      scope: 'project',
+      isolation: 'none',
+      sourcePath: '/dev/null',
+      sourceSha256: '0'.repeat(64),
+      slash: 'fake',
+    };
+    (stub.subagents.byName as Map<string, unknown>).set('fake', fakeDef);
+
+    let captured:
+      | {
+          onPermissionAsk?: (req: {
+            toolName: string;
+            args: Record<string, unknown>;
+            cwd: string;
+            prompt: string;
+            subagent: { sessionId: string; name: string };
+            signal: AbortSignal;
+          }) => Promise<'allow' | 'deny'>;
+        }
+      | undefined;
+    const fakeRunSubagent = async (
+      input: Parameters<typeof import('../../src/subagents/index.ts').runSubagent>[0],
+    ): ReturnType<typeof import('../../src/subagents/index.ts').runSubagent> => {
+      captured = {
+        ...(input.onPermissionAsk !== undefined ? { onPermissionAsk: input.onPermissionAsk } : {}),
+      };
+      return {
+        output: '(no-op)',
+        sessionId: 'sess-fake-child',
+        status: 'done',
+        reason: 'done',
+        costUsd: 0,
+        steps: 0,
+        durationMs: 0,
+      };
+    };
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      runSubagentOverride: fakeRunSubagent,
+    });
+    await tick();
+    // Drive the slash dispatch.
+    stdin.feed('/fake go\r');
+    // Dispatcher awaits runPlaybook → runSubagent. Two ticks let the
+    // microtask chain settle through the slash exec path.
+    await tick();
+    await tick();
+
+    expect(captured).toBeDefined();
+    expect(captured?.onPermissionAsk).toBeDefined();
+
+    // Drive the callback. It should call confirmPermission, which
+    // routes through modalManager. We resolve the modal with Esc
+    // (no), the bridge maps to false, runtime adapter maps to
+    // 'deny'.
+    const decisionPromise = captured?.onPermissionAsk?.({
+      toolName: 'bash',
+      args: { command: 'echo hi' },
+      cwd: '/tmp',
+      prompt: 'subagent wants to run a command',
+      subagent: { sessionId: 'sess-fake-child', name: 'fake' },
+      signal: new AbortController().signal,
+    });
+    await tick();
+    // Esc-Esc rejects the modal (mirrors the existing modal smoke
+    // test above; '\x1b\x1b' is the modal-manager's reject hotkey).
+    stdin.feed('\x1b\x1b');
+    await tick();
+    const decision = await decisionPromise;
+    expect(decision).toBe('deny');
+
+    // No normal turn was started — slash dispatch goes through the
+    // playbook bridge, not runAgent. Skip ra.finish; just close
+    // stdin to wind down the REPL.
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
 });

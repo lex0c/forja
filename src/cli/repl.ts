@@ -80,6 +80,11 @@ export interface RunReplOptions {
   // Tests inject a fake that drives a scripted set of HarnessEvents
   // through `cfg.onEvent` and resolves a HarnessResult.
   runAgentOverride?: (cfg: HarnessConfig) => Promise<HarnessResult>;
+  // Test seam: replace the subagent runtime entry used by the
+  // playbook dispatcher. Defaults to `runSubagent`. Tests inject a
+  // fake to capture the input (especially `onPermissionAsk`) without
+  // spinning up a child Bun subprocess.
+  runSubagentOverride?: typeof runSubagent;
   // Stdin source. Production wires to `process.stdin`; tests inject
   // an EventEmitter-backed fake that doesn't need a TTY.
   stdin?: NodeJS.ReadStream;
@@ -1196,7 +1201,8 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       // / `maxCostUsd` instead). Future slice can plumb the
       // global `currentTurnAbort` here for parity.
       const ac = new AbortController();
-      return runSubagent({
+      const runSubagentImpl = options.runSubagentOverride ?? runSubagent;
+      return runSubagentImpl({
         definition,
         prompt,
         parentSessionId,
@@ -1208,6 +1214,24 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         signal: ac.signal,
         subagentRegistry: subagents,
         ...(baseConfig.isCwdTrusted !== undefined ? { cwdTrusted: baseConfig.isCwdTrusted } : {}),
+        // Permission proxy (spec docs/spec/IPC.md §7). Without this
+        // the runtime auto-denies every child `permission:ask`, so a
+        // playbook that touches a confirm-gated tool (bash / write
+        // under `confirm` policy) would silently fail with denials
+        // instead of prompting the operator. Mirrors the harness's
+        // spawnSubagentImpl wiring (loop.ts) — the `boolean ↔
+        // PermissionDecision` shape adapter is the same one.
+        onPermissionAsk: async (req) => {
+          const allowed = await confirmPermission({
+            toolName: req.toolName,
+            args: req.args,
+            cwd: req.cwd,
+            prompt: req.prompt,
+            subagent: req.subagent,
+            signal: req.signal,
+          });
+          return allowed ? 'allow' : 'deny';
+        },
       });
     },
   };
