@@ -2126,4 +2126,90 @@ describe('repl — slash commands integration', () => {
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });
+
+  test('slash playbook spend rolls into /cost cumulative tracker', async () => {
+    // Regression: cumulative.costUsd / steps / turns are mutated
+    // ONLY on session_finished events from the foreground harness.
+    // Slash dispatches go through `runSubagent` directly — no
+    // session_finished fires for the parent — so /cost reported
+    // 0 even after several /<playbook> runs. The bridge now folds
+    // result.costUsd / steps into cumulative and bumps turns.
+    const stub = makeBootstrapStub();
+    const fakeDef = {
+      name: 'fake',
+      description: 'fake subagent for tests',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'noop',
+      scope: 'project',
+      isolation: 'none',
+      sourcePath: '/dev/null',
+      sourceSha256: '0'.repeat(64),
+      slash: 'fake',
+    };
+    (stub.subagents.byName as Map<string, unknown>).set('fake', fakeDef);
+
+    // Resolve immediately with known accounting numbers — the
+    // assertion below pins them through the cumulative tracker
+    // and into the /cost render.
+    const fakeRunSubagent = async (): ReturnType<
+      typeof import('../../src/subagents/index.ts').runSubagent
+    > => ({
+      output: '(no-op)',
+      sessionId: 'sess-fake-child',
+      status: 'done',
+      reason: 'done',
+      costUsd: 0.0123,
+      steps: 4,
+      durationMs: 0,
+    });
+
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      runSubagentOverride: fakeRunSubagent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+
+    // First dispatch.
+    stdin.feed('/fake one\r');
+    await tick();
+    await tick();
+    await flushFrame();
+
+    // Second dispatch — accumulation should compose.
+    stdin.feed('/fake two\r');
+    await tick();
+    await tick();
+    await flushFrame();
+
+    // Drive /cost and observe the rendered cumulative line.
+    const before = writes.length;
+    stdin.feed('/cost\r');
+    await tick();
+    await flushFrame();
+    const newWrites = writes.slice(before).join('');
+
+    // Two playbook dispatches at 0.0123 USD each → 0.0246 total.
+    // /cost formats via formatCost; the standard render shows
+    // four decimals for sub-cent totals. 4 steps × 2 = 8.
+    // Two dispatches → turns = 2.
+    expect(newWrites).toContain('cumulative:');
+    expect(newWrites).toMatch(/\$0\.0246/);
+    expect(newWrites).toContain('8 steps');
+    expect(newWrites).toContain('2 turns');
+
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
 });

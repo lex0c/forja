@@ -1240,7 +1240,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // global `currentTurnAbort` here for parity.
         const ac = new AbortController();
         const runSubagentImpl = options.runSubagentOverride ?? runSubagent;
-        return await runSubagentImpl({
+        const result = await runSubagentImpl({
           definition,
           prompt,
           parentSessionId,
@@ -1271,6 +1271,20 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
             return allowed ? 'allow' : 'deny';
           },
         });
+        // Roll the playbook spend into the REPL cumulative tracker.
+        // Without this, /cost reports zero for slash-dispatched
+        // playbooks because the foreground `session_finished` path
+        // (the only place cumulative is mutated) never fires for
+        // them — the harness never ran for the parent. NaN-guarded
+        // because a misbehaving runtime could synthesize a
+        // non-finite cost on a kill path; including it would poison
+        // the running total for every subsequent dispatch.
+        if (Number.isFinite(result.costUsd)) {
+          cumulative.costUsd += result.costUsd;
+        }
+        cumulative.steps += result.steps;
+        cumulative.turns += 1;
+        return result;
       } finally {
         // Drop the gate even on throw — a stuck `playbookRunning`
         // would lock the operator out of every subsequent dispatch
