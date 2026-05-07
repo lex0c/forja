@@ -1252,6 +1252,16 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
           signal: ac.signal,
           subagentRegistry: subagents,
           ...(baseConfig.isCwdTrusted !== undefined ? { cwdTrusted: baseConfig.isCwdTrusted } : {}),
+          // Plan mode propagation. When `/plan on` is active the
+          // foreground harness refuses every writing tool — the
+          // slash dispatcher must inherit the same gate, otherwise
+          // `/<playbook> ...` becomes a sandbox escape that runs
+          // mutating tools while the operator believes the session
+          // is read-only. Mirrors the harness's spawnSubagentImpl
+          // wiring (loop.ts) — read fresh from baseConfig per
+          // dispatch so a /plan toggle BETWEEN dispatches takes
+          // effect immediately.
+          ...(baseConfig.planMode === true ? { planMode: true } : {}),
           // Permission proxy (spec docs/spec/IPC.md §7). Without this
           // the runtime auto-denies every child `permission:ask`, so a
           // playbook that touches a confirm-gated tool (bash / write

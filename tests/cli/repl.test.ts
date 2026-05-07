@@ -2127,6 +2127,95 @@ describe('repl — slash commands integration', () => {
     expect(await promise).toBe(130);
   });
 
+  test('slash playbook inherits plan mode when /plan on is active', async () => {
+    // Regression: runPlaybook ignored baseConfig.planMode, so a
+    // playbook dispatched via /<slash> while the operator had
+    // /plan on enabled would run with write-capable behavior —
+    // a sandbox escape vs. the foreground harness's read-only
+    // guard. The bridge now mirrors the harness's
+    // spawnSubagentImpl wiring (loop.ts) and forwards planMode
+    // verbatim from baseConfig.
+    const stub = makeBootstrapStub();
+    const fakeDef = {
+      name: 'fake',
+      description: 'fake subagent for tests',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'noop',
+      scope: 'project',
+      isolation: 'none',
+      sourcePath: '/dev/null',
+      sourceSha256: '0'.repeat(64),
+      slash: 'fake',
+    };
+    (stub.subagents.byName as Map<string, unknown>).set('fake', fakeDef);
+
+    let capturedPlanMode: boolean | undefined;
+    const fakeRunSubagent = async (
+      input: Parameters<typeof import('../../src/subagents/index.ts').runSubagent>[0],
+    ): ReturnType<typeof import('../../src/subagents/index.ts').runSubagent> => {
+      capturedPlanMode = input.planMode;
+      return {
+        output: '(no-op)',
+        sessionId: 'sess-fake-child',
+        status: 'done',
+        reason: 'done',
+        costUsd: 0,
+        steps: 0,
+        durationMs: 0,
+      };
+    };
+
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      runSubagentOverride: fakeRunSubagent,
+    });
+    await tick();
+
+    // Toggle plan mode ON via the slash command — same surface
+    // the operator uses. baseConfig.planMode flips to true.
+    stdin.feed('/plan on\r');
+    await tick();
+    await flushFrame();
+
+    // Now dispatch the playbook. The bridge must read the
+    // freshly-toggled planMode and forward it.
+    stdin.feed('/fake go\r');
+    await tick();
+    await tick();
+    await flushFrame();
+
+    expect(capturedPlanMode).toBe(true);
+
+    // Toggle OFF and dispatch again to confirm the read is
+    // FRESH per dispatch (a stale capture at REPL boot would
+    // pin true forever even after /plan off).
+    stdin.feed('/plan off\r');
+    await tick();
+    await flushFrame();
+
+    capturedPlanMode = undefined;
+    stdin.feed('/fake go\r');
+    await tick();
+    await tick();
+    await flushFrame();
+
+    // After /plan off, planMode should NOT be forwarded
+    // (undefined / absent on the input — the conditional spread
+    // omits the field rather than passing `false`).
+    expect(capturedPlanMode).toBeUndefined();
+
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('slash playbook spend rolls into /cost cumulative tracker', async () => {
     // Regression: cumulative.costUsd / steps / turns are mutated
     // ONLY on session_finished events from the foreground harness.
