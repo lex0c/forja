@@ -252,22 +252,38 @@ const validateJsonSchema = (
     : [];
   const missingKeys: string[] = [];
   const typeMismatches: { key: string; expected: string; actual: string }[] = [];
+  // Pass 1 — required-presence gate. An absent required key
+  // surfaces as missingKey; the type check on its (absent) value
+  // would be incoherent, so skip via continue.
   for (const key of required) {
     if (!(key in output)) {
       missingKeys.push(key);
+    }
+  }
+  // Pass 2 — type gate over EVERY declared property that is
+  // PRESENT in the output. Required-and-present + optional-and-
+  // present both run through the same loop. Absent optional
+  // properties are not gated (JSON Schema semantics — optional
+  // means "may omit"). The earlier shape, which only ran type
+  // checks inside the required loop, silently accepted a
+  // wrong-typed optional value: `{severity: [1]}` against
+  // `{properties.severity.type: 'string'}` passed because
+  // severity was not in `required`. Iterating over `properties`
+  // closes that gap; output keys not declared in properties stay
+  // ignored (additionalProperties: true is the default).
+  for (const [key, propSchema] of Object.entries(properties)) {
+    if (!(key in output)) continue;
+    if (
+      propSchema === null ||
+      typeof propSchema !== 'object' ||
+      Array.isArray(propSchema) ||
+      typeof (propSchema as Record<string, unknown>).type !== 'string'
+    ) {
       continue;
     }
-    const propSchema = properties[key];
-    if (
-      propSchema !== null &&
-      typeof propSchema === 'object' &&
-      !Array.isArray(propSchema) &&
-      typeof (propSchema as Record<string, unknown>).type === 'string'
-    ) {
-      const expected = (propSchema as Record<string, unknown>).type as string;
-      if (!typeMatches(expected, output[key])) {
-        typeMismatches.push({ key, expected, actual: actualType(output[key]) });
-      }
+    const expected = (propSchema as Record<string, unknown>).type as string;
+    if (!typeMatches(expected, output[key])) {
+      typeMismatches.push({ key, expected, actual: actualType(output[key]) });
     }
   }
   if (missingKeys.length === 0 && typeMismatches.length === 0) return { valid: true };

@@ -244,11 +244,50 @@ describe('validateOutput — JSON Schema mode', () => {
     });
   });
 
-  test('non-required keys are not gated', () => {
+  test('non-required keys are not gated for PRESENCE', () => {
     // `severity` is in properties but not required → output may
     // omit it without invalidating. Mirrors JSON Schema semantics.
     const result = validateOutput('summary: ok\nfindings: []', schema);
     expect(result.valid).toBe(true);
+  });
+
+  test('optional keys ARE type-gated when present', () => {
+    // Regression: type checks used to live inside the
+    // required-key loop, so an optional property with the wrong
+    // type slipped through. `severity` is optional but typed
+    // `string`; emitting `[1]` violates the declared schema and
+    // must be flagged.
+    const result = validateOutput('summary: ok\nfindings: []\nseverity: [1]', schema);
+    expect(result.valid).toBe(false);
+    if (result.valid) return;
+    expect(result.typeMismatches.length).toBe(1);
+    expect(result.typeMismatches[0]).toEqual({
+      key: 'severity',
+      expected: 'string',
+      actual: 'array',
+    });
+  });
+
+  test('optional key absent stays valid (no spurious type-mismatch)', () => {
+    // Counterpart pin to the above. Without this assertion, a
+    // future refactor that always type-checks declared properties
+    // (regardless of presence) would also pass the optional-
+    // wrong-type test but flag every absent optional field.
+    const result = validateOutput('summary: ok\nfindings: []', schema);
+    expect(result.valid).toBe(true);
+  });
+
+  test('required-missing AND optional-wrong-type compose into one verdict', () => {
+    // Aggregation pin: the validator collects ALL violations in
+    // one pass — a single failure mode does not short-circuit
+    // the others. The model gets a complete diagnostic on the
+    // retry pass, not a piecemeal one.
+    const result = validateOutput('severity: [1]', schema);
+    expect(result.valid).toBe(false);
+    if (result.valid) return;
+    expect(result.missingKeys).toContain('summary');
+    expect(result.missingKeys).toContain('findings');
+    expect(result.typeMismatches.find((m) => m.key === 'severity')?.expected).toBe('string');
   });
 });
 
