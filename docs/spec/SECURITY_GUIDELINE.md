@@ -72,7 +72,7 @@ Análise sistemática por categoria, com mitigação primária.
 | Ameaça | Mitigação |
 |---|---|
 | Loop infinito do modelo (tool call repetido) | `maxSteps` budget + `maxToolErrors` consecutive |
-| Cost runaway por loop degenerado | `maxCostUsd` budget hard cap; sem opt-out |
+| Cost runaway por loop degenerado | `maxCostUsd` budget hard cap; sem opt-out programático (modelo/loop não pode burlar) — opt-out só via ação explícita do operador (`/budget cost off`), registrada em audit |
 | Hook trava harness | Timeout 5s; SIGKILL após grace |
 | Tool com side effect pesado (rm -rf) | Permission deny por padrão; sandbox `bwrap` opcional/obrigatório |
 | Memory bloat (índice cresce sem fim) | Hard cap 200 linhas; expires default 90d em project |
@@ -235,7 +235,7 @@ Propriedades que devem **sempre** valer. Violação = bug crítico, não gracefu
 5. **Diretório não-confiável bloqueia inferred memory writes** automaticamente.
 6. **Locked rules em enterprise nunca são overridable** por user/project/session.
 7. **Hook timeout não bloqueia harness por mais que `max_hook_chain_ms`** (15s default).
-8. **`maxCostUsd` é respeitado**; sem opt-out runtime.
+8. **`maxCostUsd` é respeitado**; sem opt-out programático — nem modelo nem tool nem hook pode escrever em `baseConfig.budget` pra burlar o cap. A única forma de opt-out é ação explícita do operador via `/budget cost off`, que escreve `maxCostUsd: undefined` em `baseConfig.budget` e fica registrada em audit. Threat model: loop adversarial e adversário (repo malicioso induzindo loops) não têm acesso a essa superfície; operador deliberado tem.
 9. **MCP tools de servidor não-confiável são invisíveis** ao modelo.
 10. **Schema violation em tool args bloqueia invocação**, não tenta "best effort".
 11. **Path traversal em qualquer tool é fatal** (não warning).

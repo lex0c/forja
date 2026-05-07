@@ -316,6 +316,7 @@ Cap de cost (`maxCostUsd` do `RunBudget`) é **compartilhado** entre o pai e seu
 - Cada filho **in-flight** contribui com sua **reserva pessimista**: `definition.budget.maxCostUsd` (worst-case do playbook)
 - `task_async` pré-checa: se `parentSpend + settledChildCost + reservedChildCost + novaReserva > cap`, refusa com `subagent.budget_exhausted` (`SubagentOutput.reason` em `CONTRACTS.md §2.6.4.1`)
 - Reserva libera quando o filho settla; spend real do filho então conta direto
+- **Operator opt-out:** se o pai tem `maxCostUsd === undefined` (operador desabilitou via `/budget cost off`, ver `AGENTIC_CLI.md §5`), todos os gates desta seção viram no-op — não há cap pra projetar contra. Filhos herdam o mesmo opt-out via snapshot do `audit.budgetMaxCostUsd`. Esta é uma ação deliberada do operador, registrada em audit; o threat model `SECURITY_GUIDELINE.md §1.5` cobre por que não é vulnerabilidade (loop/modelo/repo malicioso não consegue escrever em `baseConfig.budget`).
 
 #### 3.5.1 Cost-progress via IPC
 

@@ -329,13 +329,19 @@ interface Step {
 }
 
 interface RunBudget {
-  maxSteps: number              // default 50
-  maxCostUsd: number            // default 5
+  maxSteps: number              // default 200 — backstop, não engagement gate
+  maxCostUsd?: number           // default 5; explicit `undefined` = operator opt-out
   maxWallClockMs: number        // default 600_000 (10min)
   maxToolErrors: number         // default 5 consecutivos
   maxRepeatedToolHash: number   // default 3 (mesma tool+input em 5 steps)
 }
 ```
+
+#### Postura cost-primary
+
+`maxCostUsd` é o **engagement gate**: define até onde a sessão pode ir em valor real. `maxSteps` é **backstop** contra runaway loop, não o limite de ambição da sessão. Refactor multi-arquivo, audit profundo, ou debug iterativo legítimo precisam de muitos passos pequenos — cortar por contagem quando o custo está dentro do orçamento descarta trabalho válido. O `degenerate-loop tracker` (`maxRepeatedToolHash`) e o contador de erros (`maxToolErrors`) detectam patologia genuína bem antes do `maxSteps`; este último só dispara quando os outros sinais falham, e 200 dá margem pra sessões ambiciosas sem desabilitar a proteção.
+
+`maxCostUsd` é opcional **apenas pra suportar opt-out explícito** (CI runners, eval com enforcement próprio, sessões locais sem providers pagos). O shape `?: number | undefined` distingue três estados: campo ausente → merge com default 5; campo presente como `undefined` → operador opta out e o gate não dispara; campo numérico → esse cap. Operadores típicos não tocam — o default 5 cobre o uso comum, e `/budget cost <USD>` ajusta. `/budget cost off` escreve o `undefined` explícito.
 
 Loop com **três tipos de saída**:
 
@@ -349,7 +355,7 @@ Cada limite tem warning threshold (soft) e cap (hard). Hit qualquer hard cap = `
 
 | Limite | Soft warning | Hard cap action | Observação |
 |---|---|---|---|
-| `maxSteps` | 80% (40/50) — UI mostra `⚠ 40/50` | hit → step atual termina, sessão `exhausted` | step em andamento sempre conclui |
+| `maxSteps` | 80% (160/200) — UI mostra `⚠ 160/200` | hit → step atual termina, sessão `exhausted` | step em andamento sempre conclui; backstop, não engagement gate |
 | `maxCostUsd` | 80% — UI mostra `$4.00/$5.00` em amarelo; 90% em vermelho | hit → step atual recebe sinal pra finalizar; novos spawns rejeitados; eventual `exhausted` | provider call em curso conclui (cost extra contado) |
 | `maxWallClockMs` | 80% — UI mostra clock no rodapé | hit → `interrupt_signal` paralelo (ORCHESTRATION §7); cleanup; sessão `interrupted` (não `exhausted`) | distinto: time-based é interrupt, não exhausted |
 | `maxToolErrors` | 4 erros consecutivos — warning no rodapé | 5 erros consecutivos → `exhausted_errors`; sessão `error` (recoverable via resume) | reset em step bem-sucedido |
