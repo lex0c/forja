@@ -6,6 +6,14 @@
 // elided to counts past a threshold so the scrollback doesn't
 // flood when the policy carries dozens of allow patterns.
 //
+// Sub-mode `/perms why <tool> [args...]` runs an engine dry-check
+// against synthetic args and renders the resulting Decision plus
+// source attribution (which layer + rule fired). Lets operators
+// answer "why was this allowed/denied/confirmed?" without having
+// to actually invoke the tool — useful for sanity-checking a new
+// rule, debugging an unexpected denial, or confirming a policy
+// edit took effect.
+//
 // Read-only by design. Editing policy goes through the YAML files
 // (`.agent/permissions.yaml` etc.) — keeps a single source of
 // truth and avoids inventing a runtime mutation path that would
@@ -13,10 +21,13 @@
 
 import type {
   BashPolicy,
+  Decision,
   FetchPolicy,
   PathPolicy,
   Policy,
+  PolicyCategory,
   PolicyToolsSection,
+  ToolArgs,
 } from '../../../permissions/index.ts';
 import type { SlashCommand } from '../types.ts';
 
@@ -113,12 +124,161 @@ export const renderPolicy = (policy: Policy): string[] => {
   return lines;
 };
 
+// Build the per-tool ToolArgs shape from the operator's positional
+// inputs. Returns either valid args or a usage-error message — the
+// caller surfaces the error verbatim so the operator gets the
+// example syntax for the specific tool they asked about.
+//
+// `category` drives the shape (engine.check is keyed on category,
+// not toolName). For bash, `rest` joins with spaces — operators
+// type `/perms why bash rm -rf /tmp/cache` and want the full
+// command checked, not just the first word. For fs.* and
+// web.fetch the shape is single-positional. grep / glob accept
+// an optional path/cwd (the engine's default-to-session-cwd
+// behavior is itself worth dry-checking).
+const buildDryCheckArgs = (
+  toolName: string,
+  category: PolicyCategory,
+  rest: readonly string[],
+): { ok: true; args: ToolArgs } | { ok: false; error: string } => {
+  if (category === 'bash') {
+    if (rest.length === 0) {
+      return {
+        ok: false,
+        error: `/perms why ${toolName}: missing command (e.g. /perms why ${toolName} npm test)`,
+      };
+    }
+    return { ok: true, args: { command: rest.join(' ') } };
+  }
+  if (category === 'fs.read' || category === 'fs.write') {
+    // grep and glob accept an optional search root; everything
+    // else (read_file/write_file/edit_file) requires a path.
+    const optional = toolName === 'grep' || toolName === 'glob';
+    if (rest.length === 0 && !optional) {
+      return {
+        ok: false,
+        error: `/perms why ${toolName}: missing path (e.g. /perms why ${toolName} src/foo.ts)`,
+      };
+    }
+    if (rest.length > 1) {
+      return {
+        ok: false,
+        error: `/perms why ${toolName}: takes a single path (got ${rest.length} args)`,
+      };
+    }
+    if (rest.length === 0) {
+      return { ok: true, args: {} };
+    }
+    // rest.length is 1 here (guarded above); the cast pacifies
+    // TS's noUncheckedIndexedAccess without changing the runtime
+    // shape (a regression that broke the length guard would surface
+    // as a literal undefined in args, which the engine's missing-
+    // arg branch already deny-handles).
+    const value = rest[0] as string;
+    if (toolName === 'glob') {
+      return { ok: true, args: { cwd: value } };
+    }
+    return { ok: true, args: { path: value } };
+  }
+  if (category === 'web.fetch') {
+    if (rest.length !== 1) {
+      return {
+        ok: false,
+        error: `/perms why ${toolName}: takes a single URL (got ${rest.length} args)`,
+      };
+    }
+    return { ok: true, args: { url: rest[0] as string } };
+  }
+  // misc — no policy section consulted; engine returns allow
+  // unconditionally. Args are ignored.
+  return { ok: true, args: {} };
+};
+
+const formatLayer = (layer: string): string =>
+  layer === 'default' ? 'built-in default' : `${layer} policy`;
+
+// Render a Decision with full source attribution. Padded labels
+// match the columnar feel of the rest of /perms output. Order
+// (decision → rule → layer → section → reason) puts the
+// operator's first question (allow/deny/confirm?) at the top.
+const renderDryCheck = (decision: Decision): string[] => {
+  const lines: string[] = [];
+  lines.push(`  decision: ${decision.kind}`);
+  if (decision.kind === 'confirm') {
+    lines.push(`  prompt:   ${decision.prompt}`);
+  }
+  if (decision.source !== undefined) {
+    if (decision.source.rule !== undefined) {
+      lines.push(`  rule:     ${decision.source.rule}`);
+    }
+    lines.push(`  layer:    ${formatLayer(decision.source.layer)}`);
+    if (decision.source.section !== undefined) {
+      lines.push(`  section:  ${decision.source.section}`);
+    }
+  }
+  if (decision.reason !== undefined && decision.reason.length > 0) {
+    lines.push(`  reason:   ${decision.reason}`);
+  }
+  return lines;
+};
+
+const runWhy = (
+  args: readonly string[],
+  ctx: Parameters<SlashCommand['exec']>[1],
+): ReturnType<SlashCommand['exec']> => {
+  // args[0] === 'why' (already matched). Operator-typed: tool
+  // name + positional arg(s).
+  if (args.length < 2) {
+    return Promise.resolve({
+      kind: 'error',
+      message: '/perms why: missing tool name (e.g. /perms why bash npm test)',
+    });
+  }
+  const toolName = args[1];
+  if (toolName === undefined || toolName.length === 0) {
+    return Promise.resolve({
+      kind: 'error',
+      message: '/perms why: missing tool name (e.g. /perms why bash npm test)',
+    });
+  }
+  const tool = ctx.baseConfig.toolRegistry.get(toolName);
+  if (tool === null) {
+    return Promise.resolve({
+      kind: 'error',
+      message: `/perms why: unknown tool '${toolName}'`,
+    });
+  }
+  const built = buildDryCheckArgs(toolName, tool.metadata.category, args.slice(2));
+  if (!built.ok) {
+    return Promise.resolve({ kind: 'error', message: built.error });
+  }
+  const decision = ctx.baseConfig.permissionEngine.check(
+    toolName,
+    tool.metadata.category,
+    built.args,
+  );
+  // Header line echoes the dry-check input so the operator's
+  // scrollback shows what was probed (especially useful when
+  // they pipe the modal answer back into a second `why` call).
+  const header = `/perms why ${toolName}${args.length > 2 ? ` ${args.slice(2).join(' ')}` : ''}`;
+  return Promise.resolve({
+    kind: 'ok',
+    notes: [header, ...renderDryCheck(decision)],
+  });
+};
+
 export const permsCommand: SlashCommand = {
   name: 'perms',
-  description: 'show the active permission policy',
+  description: 'show the active permission policy (or "/perms why <tool> [args]" for dry-check)',
   exec: async (args, ctx) => {
+    if (args.length > 0 && args[0] === 'why') {
+      return runWhy(args, ctx);
+    }
     if (args.length > 0) {
-      return { kind: 'error', message: '/perms: takes no arguments' };
+      return {
+        kind: 'error',
+        message: '/perms: unknown sub-command (try "/perms" or "/perms why <tool>")',
+      };
     }
     const policy = ctx.baseConfig.permissionEngine.policy();
     return { kind: 'ok', notes: renderPolicy(policy) };
