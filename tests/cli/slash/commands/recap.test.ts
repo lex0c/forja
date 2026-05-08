@@ -41,6 +41,7 @@ const makeCtx = (overrides: Partial<SlashContext> = {}): SlashContext => {
     requestShutdown: () => undefined,
     isRunning: () => false,
     currentSessionId: () => currentSessionId,
+    replSessionIds: () => (currentSessionId !== null ? [currentSessionId] : []),
     modelRegistry: createModelRegistry(),
     ...overrides,
   };

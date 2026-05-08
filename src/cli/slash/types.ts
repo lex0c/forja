@@ -99,6 +99,15 @@ export interface SlashContext {
   // boot and first turn — callers MUST treat null as "skip the
   // attribution override" rather than passing it through.
   currentSessionId: () => string | null;
+  // All session ids the REPL has tracked since boot, oldest
+  // first. Each finished turn pushes its session id; playbook
+  // subagent dispatches push the child's session id too. Slash
+  // commands that aggregate across the whole REPL (today
+  // `/critique`) read this instead of `currentSessionId` so an
+  // operator running 5 turns + 1 playbook sees data from all 6
+  // sessions, not just the last one. Empty until the first turn
+  // finishes — caller treats `[]` as "no sessions yet".
+  replSessionIds: () => readonly string[];
   // History controls (HISTORY.md §2.3). `/history off` / `/history on`
   // toggle the session-volatile flag; `/history clear` invokes
   // `clearLocal` AFTER the storage layer wipe so the in-memory

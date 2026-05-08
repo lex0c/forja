@@ -50,6 +50,7 @@ const makeCtx = (): {
       },
       isRunning: () => false,
       currentSessionId: () => null,
+      replSessionIds: () => [],
       modelRegistry: createModelRegistry(),
     },
     events,

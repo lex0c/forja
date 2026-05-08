@@ -574,6 +574,21 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // above the trust prompt — see "Pre-bootstrap stack" earlier in
   // this function.
   let lastSessionId: string | null = null;
+  // Append-only list of session ids tracked across this REPL
+  // boot. Pushed on `session_finished` and on playbook subagent
+  // completion. /critique aggregates across this list so an
+  // operator running multiple turns sees critique data from all
+  // of them, not just the most recent. Synthetic-parent ids
+  // (audit anchors created by ensureParentSessionId before any
+  // real turn) are NOT pushed — those are subagent-flagged
+  // anchors with no critique runs of their own.
+  const replSessionIdSet = new Set<string>();
+  const replSessionIdOrder: string[] = [];
+  const trackReplSessionId = (id: string): void => {
+    if (replSessionIdSet.has(id)) return;
+    replSessionIdSet.add(id);
+    replSessionIdOrder.push(id);
+  };
 
   // Synthetic parent session id for slash playbook dispatches that
   // happen BEFORE any normal turn has run. `runSubagent` requires a
@@ -856,6 +871,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     if (event.type === 'session_finished') {
       running = false;
       lastSessionId = event.result.sessionId;
+      trackReplSessionId(event.result.sessionId);
       cumulative.costUsd += event.result.costUsd;
       cumulative.steps += event.result.steps;
       cumulative.turns += 1;
@@ -1267,6 +1283,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // as auditSessionId so its read rows group with the operator's
     // current session.
     currentSessionId: () => lastSessionId,
+    replSessionIds: () => replSessionIdOrder,
     modelRegistry,
     // History controls (HISTORY.md §2.3). `/history clear` calls
     // `clearLocal` AFTER `clearHistory` against the db so the in-
@@ -1452,6 +1469,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         }
         cumulative.steps += result.steps;
         cumulative.turns += 1;
+        // Track the playbook child session so `/critique` can
+        // aggregate critique runs from the playbook alongside the
+        // parent's. The child wrote its `critique_runs` rows into
+        // the same DB at execution time; we just need its session
+        // id to find them again.
+        trackReplSessionId(result.sessionId);
         return result;
       } finally {
         // Drop the gate even on throw — a stuck `playbookRunning`

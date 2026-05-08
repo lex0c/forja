@@ -50,6 +50,7 @@ const makeCtx = (overrides: Partial<SlashContext> = {}): SlashContext => {
     requestShutdown: () => undefined,
     isRunning: () => false,
     currentSessionId: () => null,
+    replSessionIds: () => [],
     modelRegistry: createModelRegistry(),
     ...overrides,
   };
@@ -175,13 +176,18 @@ describe('/critique', () => {
     expect(out).toContain('(executor: anthropic/sonnet-4-6)');
   });
 
-  test('config falls back to defaults when [critique] is not set', async () => {
+  test('config falls back to DEFAULT_CRITIQUE_CONFIG when [critique] is not set', async () => {
+    // Read the source-of-truth defaults so a future change to
+    // DEFAULT_CRITIQUE_CONFIG forces an explicit acknowledgment
+    // here. Hardcoding the same values both in /critique and the
+    // test would let them drift in lockstep silently.
+    const { DEFAULT_CRITIQUE_CONFIG } = await import('../../../src/critique/index.ts');
     const result = await critiqueCommand.exec(['config'], makeCtx());
     if (result.kind !== 'ok') return;
     const out = (result.notes ?? []).join('\n');
-    expect(out).toContain('mode:             off');
-    expect(out).toContain('threshold:        0.70');
-    expect(out).toContain('max_overhead_ms:  3000');
+    expect(out).toContain(`mode:             ${DEFAULT_CRITIQUE_CONFIG.mode}`);
+    expect(out).toContain(`threshold:        ${DEFAULT_CRITIQUE_CONFIG.threshold.toFixed(2)}`);
+    expect(out).toContain(`max_overhead_ms:  ${DEFAULT_CRITIQUE_CONFIG.maxOverheadMs}`);
   });
 
   test('shows distinct critic provider when configured', async () => {
@@ -267,6 +273,7 @@ describe('/critique', () => {
     const ctxWithSession = makeCtx({
       db: ctx.db,
       currentSessionId: () => session.id,
+      replSessionIds: () => [session.id],
     });
     const result = await critiqueCommand.exec([], ctxWithSession);
     if (result.kind !== 'ok') return;
@@ -317,12 +324,68 @@ describe('/critique', () => {
     const ctxWithSession = makeCtx({
       db: ctx.db,
       currentSessionId: () => session.id,
+      replSessionIds: () => [session.id],
     });
     const result = await critiqueCommand.exec(['2'], ctxWithSession);
     if (result.kind !== 'ok') return;
     const out = (result.notes ?? []).join('\n');
     // "(2 of 5)" — 5 total, 2 shown.
     expect(out).toContain('recent runs (2 of 5):');
+  });
+
+  test('aggregates across multiple REPL session ids (cross-turn / playbook)', async () => {
+    // Two different sessions in the same DB, both with critique
+    // runs. /critique should walk both via replSessionIds and
+    // surface the union — not just the most recent.
+    const ctx = makeCtx();
+    const sessionA = createSession(ctx.db, { cwd: '/p', model: 'mock/m' });
+    const sessionB = createSession(ctx.db, { cwd: '/p', model: 'mock/m' });
+    const { recordCritiqueRun } = await import('../../../src/storage/index.ts');
+    recordCritiqueRun(ctx.db, {
+      sessionId: sessionA.id,
+      stepN: 1,
+      mode: 'always',
+      strategy: 'llm',
+      decision: 'no_modal',
+      code: 'critique.clean',
+      rawCount: 0,
+      filteredCount: 0,
+      overallConfidence: 0.95,
+      durationMs: 1000,
+      costUsd: 0.001,
+      toolPlanWrites: false,
+      promptVersion: 'v1',
+      threshold: 0.7,
+    });
+    recordCritiqueRun(ctx.db, {
+      sessionId: sessionB.id,
+      stepN: 1,
+      mode: 'always',
+      strategy: 'llm',
+      decision: 'redo',
+      code: 'critique.warning_redo',
+      rawCount: 1,
+      filteredCount: 1,
+      overallConfidence: 0.4,
+      durationMs: 1500,
+      costUsd: 0.002,
+      toolPlanWrites: false,
+      promptVersion: 'v1',
+      threshold: 0.7,
+    });
+    const ctx2 = makeCtx({
+      db: ctx.db,
+      currentSessionId: () => sessionB.id,
+      replSessionIds: () => [sessionA.id, sessionB.id],
+    });
+    const result = await critiqueCommand.exec([], ctx2);
+    if (result.kind !== 'ok') return;
+    const out = (result.notes ?? []).join('\n');
+    // Two rows total — both sessions surfaced.
+    expect(out).toContain('recent runs (2 of 2):');
+    // Aggregate spans both codes.
+    expect(out).toContain('critique.clean:1');
+    expect(out).toContain('critique.warning_redo:1');
   });
 
   test('non-numeric limit produces a clean error', async () => {

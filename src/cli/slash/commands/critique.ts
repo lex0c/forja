@@ -21,6 +21,7 @@
 // no turn has run yet (fresh REPL boot, no `currentSessionId`),
 // surfaces a clear "no session yet" hint instead of an empty list.
 
+import { DEFAULT_CRITIQUE_CONFIG } from '../../../critique/index.ts';
 import { type CritiqueRun, listCritiqueRunsBySession } from '../../../storage/index.ts';
 import { formatCost } from '../format.ts';
 import type { SlashCommand } from '../types.ts';
@@ -35,16 +36,17 @@ const renderConfigBlock = (
   >,
 ): string[] => {
   const c = baseConfig.critique;
-  // Defaults the harness applies when fields are absent. Mirrors
-  // DEFAULT_CRITIQUE_CONFIG so the operator sees the resolved
-  // values, not the partial config they typed. Keeping the
-  // numbers inline (vs importing the const) avoids dragging the
-  // critique module into the slash layer for one read; if the
-  // defaults ever drift, the test suite catches the divergence.
-  const mode = c?.mode ?? 'off';
-  const threshold = c?.threshold ?? 0.7;
-  const maxOverheadMs = c?.maxOverheadMs ?? 3000;
-  const promptVersion = c?.promptVersion ?? 'v1';
+  // Read fallbacks from `DEFAULT_CRITIQUE_CONFIG` so a future
+  // change to the default mode / threshold / overhead doesn't
+  // silently drift this display from what the harness actually
+  // applies. The harness merges `Partial<CritiqueConfig>` with
+  // the same defaults at loop time, so what the operator sees
+  // here equals what the gate enforces — no second source of
+  // truth.
+  const mode = c?.mode ?? DEFAULT_CRITIQUE_CONFIG.mode;
+  const threshold = c?.threshold ?? DEFAULT_CRITIQUE_CONFIG.threshold;
+  const maxOverheadMs = c?.maxOverheadMs ?? DEFAULT_CRITIQUE_CONFIG.maxOverheadMs;
+  const promptVersion = c?.promptVersion ?? DEFAULT_CRITIQUE_CONFIG.promptVersion ?? 'v1';
   const lines: string[] = [
     'critique config:',
     `  mode:             ${mode}`,
@@ -156,17 +158,28 @@ export const critiqueCommand: SlashCommand = {
 
     const lines: string[] = [...renderConfigBlock(ctx.baseConfig)];
 
-    const sessionId = ctx.currentSessionId();
-    if (sessionId === null) {
+    // Aggregate across every session this REPL has tracked since
+    // boot — including playbook subagent sessions whose child
+    // harness wrote critique rows into the same DB. Without this,
+    // `/critique` would show only the most recent turn's runs and
+    // miss everything before, which is surprising in a REPL where
+    // each turn is a separate session.
+    const sessionIds = ctx.replSessionIds();
+    if (sessionIds.length === 0) {
       lines.push('', 'recent runs: (no session yet — submit a turn first)');
       return { kind: 'ok', notes: lines };
     }
 
-    // listCritiqueRunsBySession returns oldest-first (step ASC,
-    // created_at ASC). Slicing the tail gives the most recent N;
-    // we then reverse so the operator reads newest-first, matching
-    // the convention in /sessions.
-    const all = listCritiqueRunsBySession(ctx.db, sessionId);
+    // Per-session lookup → flat oldest-first list. listCritique-
+    // RunsBySession returns oldest-first within a session, and we
+    // walk session ids in REPL-add order (also oldest-first), so
+    // concat preserves chronological order across sessions. Same
+    // tail-slice + reverse pattern /sessions uses to surface
+    // newest-first to the operator.
+    const all: CritiqueRun[] = [];
+    for (const id of sessionIds) {
+      all.push(...listCritiqueRunsBySession(ctx.db, id));
+    }
     const recent = all.slice(-limit).reverse();
     lines.push('', `recent runs (${recent.length} of ${all.length}):`);
     if (recent.length === 0) {

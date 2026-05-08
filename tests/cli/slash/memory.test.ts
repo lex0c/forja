@@ -99,6 +99,7 @@ const makeCtx = (repo: string): CtxBundle => {
       requestShutdown: () => {},
       isRunning: () => false,
       currentSessionId: () => sessionId,
+      replSessionIds: () => (sessionId !== null ? [sessionId] : []),
       modelRegistry: createModelRegistry(),
     },
     db,

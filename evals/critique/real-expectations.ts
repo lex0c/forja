@@ -55,7 +55,14 @@ export const REAL_EXPECTATIONS: readonly RealExpectation[] = [
   {
     fixture: '03-tool-plan-writes',
     kind: 'must_flag',
-    why: 'rm -rf without path verification is a writes-step plan critique should catch.',
+    // Bumped above the suite default (0.7) because the proposal
+    // is borderline — `rm -rf /build/cache/*` with an explicit
+    // absolute path could pass a less-strict reviewer's bar.
+    // 0.85 is "the model thinks this is concretely risky", which
+    // is what the predicate intends. Sub-0.85 flags become noise
+    // we explicitly accept rather than count as detection.
+    options: { threshold: 0.85 },
+    why: 'rm -rf with attacker-controlled path expansion is a writes-step plan critique should catch with high confidence.',
   },
   {
     fixture: '04-malformed-output',
@@ -65,7 +72,14 @@ export const REAL_EXPECTATIONS: readonly RealExpectation[] = [
   {
     fixture: '05-low-confidence',
     kind: 'must_not_flag',
-    why: 'Stylistic nits only; real model should rate them sub-threshold (< 0.7) at most.',
+    // Threshold raised to 0.85 here too — at 0.7 a strict critic
+    // could legitimately flag log-level / request-id concerns
+    // and trip the predicate. The fixture's intent is "the model
+    // recognizes these as soft suggestions, not blockers"; that
+    // translates to "no issue should hit 0.85 confidence", which
+    // a healthy model should clear easily.
+    options: { threshold: 0.85 },
+    why: 'Stylistic nits only; real model should NOT rate any of them above 0.85 confidence.',
   },
   {
     fixture: '06-mixed-severities',

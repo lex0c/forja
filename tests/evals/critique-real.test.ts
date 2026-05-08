@@ -85,6 +85,41 @@ describe('critique-real runner — arg parsing', () => {
     expect(io.errLines.join('\n')).toContain('--max-overhead');
   });
 
+  test('--max-overhead 0 is accepted (engine semantic = watchdog disabled)', async () => {
+    // Crosses parseArgs (where 0 is now legal) into the model-
+    // resolution path; we trip "unknown model" with a fake
+    // anthropic id to confirm parseArgs accepted the 0 without
+    // throwing. Without this gate, the runner would have
+    // refused a legitimate operator choice that the engine
+    // honors.
+    const io = collectIo();
+    const { exitCode } = await runCritiqueRealEval(
+      ['--max-overhead', '0', '--model', 'anthropic/imaginary'],
+      {
+        out: io.out,
+        err: io.err,
+        apiKey: 'sk-fake',
+      },
+    );
+    // Bumped past parseArgs; fails on the (now-deferred) unknown-
+    // model check, NOT on --max-overhead.
+    expect(exitCode).toBe(2);
+    expect(io.errLines.join('\n')).toContain('unknown model');
+  });
+
+  test('known flag without value surfaces "missing value", not "unknown arg"', async () => {
+    const io = collectIo();
+    const { exitCode } = await runCritiqueRealEval(['--threshold'], {
+      out: io.out,
+      err: io.err,
+      apiKey: 'sk-fake',
+    });
+    expect(exitCode).toBe(2);
+    const errOut = io.errLines.join('\n');
+    expect(errOut).toContain('missing value for --threshold');
+    expect(errOut).not.toContain('unknown arg');
+  });
+
   test('unknown model fails with exit 2 and lists known ids', async () => {
     const io = collectIo();
     const { exitCode } = await runCritiqueRealEval(

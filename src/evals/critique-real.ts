@@ -52,34 +52,47 @@ interface RunArgs {
   maxOverheadMs: number;
 }
 
+const KNOWN_VALUE_FLAGS = new Set(['--model', '--threshold', '--max-overhead']);
+
 const parseArgs = (argv: readonly string[]): RunArgs => {
   let modelId = DEFAULT_MODEL_ID;
   let threshold = 0.7;
-  let maxOverheadMs = 30_000; // generous for real network calls
+  // `0` is a legitimate operator choice (engine treats it as
+  // "watchdog disabled"). Spec line 525 default is 3000ms; the
+  // runner's default bumps to 30s because real network calls
+  // routinely take 5-10s and a 3s cap would skip everything.
+  let maxOverheadMs = 30_000;
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    const next = argv[i + 1];
-    if (a === '--model' && next !== undefined) {
-      modelId = next;
-      i++;
-      continue;
-    }
-    if (a === '--threshold' && next !== undefined) {
-      const v = Number.parseFloat(next);
-      if (!Number.isFinite(v) || v < 0 || v > 1) {
-        throw new Error(`--threshold must be in [0,1]; got '${next}'`);
+    if (a === undefined) continue;
+    // Two-step gating: detect known value-flags FIRST so we can
+    // distinguish "unknown arg" from "known arg, missing value".
+    // Falling through to the unknown-arg throw at the bottom for a
+    // bare `--threshold` would be misleading — operator typed a
+    // valid flag, just forgot the value.
+    if (KNOWN_VALUE_FLAGS.has(a)) {
+      const next = argv[i + 1];
+      if (next === undefined) {
+        throw new Error(`missing value for ${a}`);
       }
-      threshold = v;
-      i++;
-      continue;
-    }
-    if (a === '--max-overhead' && next !== undefined) {
-      const v = Number.parseInt(next, 10);
-      if (!Number.isFinite(v) || v <= 0) {
-        throw new Error(`--max-overhead must be a positive integer; got '${next}'`);
+      if (a === '--model') {
+        modelId = next;
+      } else if (a === '--threshold') {
+        const v = Number.parseFloat(next);
+        if (!Number.isFinite(v) || v < 0 || v > 1) {
+          throw new Error(`--threshold must be in [0,1]; got '${next}'`);
+        }
+        threshold = v;
+      } else {
+        // --max-overhead. `0` is allowed here (engine semantic =
+        // disable watchdog); negatives still rejected.
+        const v = Number.parseInt(next, 10);
+        if (!Number.isFinite(v) || v < 0) {
+          throw new Error(`--max-overhead must be a non-negative integer; got '${next}'`);
+        }
+        maxOverheadMs = v;
       }
-      maxOverheadMs = v;
       i++;
       continue;
     }
@@ -258,27 +271,31 @@ export const runCritiqueRealEval = async (
   const passes = outcomes.filter((o) => o.kind === 'pass').length;
   const fails = outcomes.filter((o) => o.kind === 'fail').length;
   const skips = outcomes.filter((o) => o.kind === 'skip').length;
-  // FP and FN rates are scoped to the fixtures that ASSERTED a
-  // direction (not skipped). FP = "expected clean, model flagged";
-  // FN = "expected flag, model didn't". Both are normalized by
-  // the count of fixtures of that kind so a 0/1 fail isn't
-  // misleadingly small.
-  const flagFixtures = outcomes.filter(
-    (o) => expectationByName.get(o.fixture)?.kind === 'must_flag',
-  );
-  const cleanFixtures = outcomes.filter(
-    (o) => expectationByName.get(o.fixture)?.kind === 'must_not_flag',
-  );
-  const fnCount = flagFixtures.filter((o) => o.kind === 'fail').length;
-  const fpCount = cleanFixtures.filter((o) => o.kind === 'fail').length;
-  const fnRate = flagFixtures.length > 0 ? fnCount / flagFixtures.length : 0;
-  const fpRate = cleanFixtures.length > 0 ? fpCount / cleanFixtures.length : 0;
+  // FP and FN rates are scoped to fixtures that ASSERTED a
+  // direction AND actually evaluated (not the engine-soft-fail
+  // skips). FP = "expected clean, model flagged"; FN = "expected
+  // flag, model didn't". Including skips in the denominator would
+  // hide regressions — a flaky engine that skipped 2 of 3 must_flag
+  // fixtures with 1 real FN would report 33%, not the actual 100%
+  // the operator should see.
+  const flagAssertions = outcomes.filter((o) => {
+    if (o.kind === 'skip') return false;
+    return expectationByName.get(o.fixture)?.kind === 'must_flag';
+  });
+  const cleanAssertions = outcomes.filter((o) => {
+    if (o.kind === 'skip') return false;
+    return expectationByName.get(o.fixture)?.kind === 'must_not_flag';
+  });
+  const fnCount = flagAssertions.filter((o) => o.kind === 'fail').length;
+  const fpCount = cleanAssertions.filter((o) => o.kind === 'fail').length;
+  const fnRate = flagAssertions.length > 0 ? fnCount / flagAssertions.length : 0;
+  const fpRate = cleanAssertions.length > 0 ? fpCount / cleanAssertions.length : 0;
 
   io.out('');
   io.out(`summary: ${passes} pass · ${fails} fail · ${skips} skip`);
   io.out(`         total cost ~${(totalCost * 1000).toFixed(2)}m$ · ${totalDuration}ms wall`);
   io.out(
-    `         FP rate ${(fpRate * 100).toFixed(0)}% (${fpCount}/${cleanFixtures.length}) · FN rate ${(fnRate * 100).toFixed(0)}% (${fnCount}/${flagFixtures.length})`,
+    `         FP rate ${(fpRate * 100).toFixed(0)}% (${fpCount}/${cleanAssertions.length}) · FN rate ${(fnRate * 100).toFixed(0)}% (${fnCount}/${flagAssertions.length})`,
   );
 
   return { exitCode: fails === 0 ? 0 : 1, outcomes };

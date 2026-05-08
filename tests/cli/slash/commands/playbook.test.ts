@@ -60,6 +60,7 @@ const makeCtx = (opts: CtxOpts = {}): SlashContext => {
     requestShutdown: () => {},
     isRunning: () => opts.isRunning ?? false,
     currentSessionId: () => opts.sessionId ?? null,
+    replSessionIds: () => (typeof opts.sessionId === 'string' ? [opts.sessionId] : []),
     modelRegistry: createModelRegistry(),
     ...(opts.runPlaybook !== undefined ? { runPlaybook: opts.runPlaybook } : {}),
   };
