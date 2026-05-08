@@ -25,6 +25,13 @@ export {
 } from './integration.ts';
 
 export {
+  loadCritiqueConfig,
+  projectConfigPath,
+  userConfigPath,
+} from './config-loader.ts';
+export type { LoadCritiqueConfigInput, LoadedCritiqueConfig } from './config-loader.ts';
+
+export {
   CRITIQUE_MARKER_CLOSE,
   CRITIQUE_MARKER_OPEN,
   CRITIQUE_PROMPT_VERSION_V1,

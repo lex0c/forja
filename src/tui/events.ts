@@ -336,6 +336,13 @@ export type CritiqueAskEvent = BaseEvent & {
   type: 'critique:ask';
   promptId: string;
   issues: { severity: 'low' | 'medium' | 'high'; confidence: number; message: string }[];
+  // True iff the proposed step would invoke at least one
+  // `writes:true` tool. Drives the modal's framing — a writes-step
+  // critique deserves a stronger headline ("about to mutate files
+  // — review before continuing") than an end-of-step text-only
+  // critique. Optional for backward compat with producers that
+  // predate Slice C; absent ⇒ false (treated as text-only).
+  toolPlanWrites?: boolean;
 };
 
 // History wipe confirmation (HISTORY.md §2.3 `/history clear`). Three

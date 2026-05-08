@@ -937,3 +937,67 @@ describe('askMemoryUserScope (memory:user-scope:ask producer, spec §7.2.5)', ()
     await expect(promise).resolves.toBe('cancel');
   });
 });
+
+describe('askCritique (critique:ask producer, spec AGENTIC_CLI.md §5.4)', () => {
+  const sampleIssues = [
+    { severity: 'high' as const, confidence: 0.9, message: 'unsafe rm -rf' },
+    { severity: 'low' as const, confidence: 0.5, message: 'naming nit' },
+  ];
+
+  test('emits critique:ask carrying the issues and (optional) toolPlanWrites flag', () => {
+    const s = make();
+    s.manager.askCritique({ issues: sampleIssues, toolPlanWrites: true });
+    expect(s.fs.size()).toBe(1);
+    const ask = s.events.find((e) => e.type === 'critique:ask');
+    expect(ask).toBeDefined();
+    if (ask?.type !== 'critique:ask') throw new Error('wrong type');
+    expect(ask.issues).toEqual(sampleIssues);
+    expect(ask.toolPlanWrites).toBe(true);
+  });
+
+  test('toolPlanWrites=false omitted from the event (backward-compat)', () => {
+    const s = make();
+    s.manager.askCritique({ issues: sampleIssues });
+    const ask = s.events.find((e) => e.type === 'critique:ask');
+    if (ask?.type !== 'critique:ask') throw new Error('wrong type');
+    expect(ask.toolPlanWrites).toBeUndefined();
+  });
+
+  test('default selectedIndex = last (Abort); plain Enter resolves "abort"', async () => {
+    const s = make();
+    const promise = s.manager.askCritique({ issues: sampleIssues });
+    s.fs.dispatch(key('enter'));
+    await expect(promise).resolves.toBe('abort');
+  });
+
+  test('hotkey "1" resolves "ignore"', async () => {
+    const s = make();
+    const promise = s.manager.askCritique({ issues: sampleIssues });
+    s.fs.dispatch(charKey('1'));
+    await expect(promise).resolves.toBe('ignore');
+  });
+
+  test('hotkey "2" resolves "redo"', async () => {
+    const s = make();
+    const promise = s.manager.askCritique({ issues: sampleIssues });
+    s.fs.dispatch(charKey('2'));
+    await expect(promise).resolves.toBe('redo');
+  });
+
+  test('hotkey "3" resolves "abort"', async () => {
+    const s = make();
+    const promise = s.manager.askCritique({ issues: sampleIssues });
+    s.fs.dispatch(charKey('3'));
+    await expect(promise).resolves.toBe('abort');
+  });
+
+  test('Esc resolves "cancel" (distinct from "abort")', async () => {
+    // Cancel is the passive close — Esc / timeout / abort signal.
+    // The harness loop maps cancel to the same shape as abort, but
+    // audit can tell the two apart via the answer string.
+    const s = make();
+    const promise = s.manager.askCritique({ issues: sampleIssues });
+    s.fs.dispatch(key('escape'));
+    await expect(promise).resolves.toBe('cancel');
+  });
+});

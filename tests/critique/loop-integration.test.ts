@@ -10,6 +10,7 @@ import { createPermissionEngine } from '../../src/permissions/index.ts';
 import type { GenerateRequest, Provider, StreamEvent } from '../../src/providers/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
+import { listCritiqueRunsBySession } from '../../src/storage/repos/critique-runs.ts';
 import { listMessagesBySession } from '../../src/storage/repos/messages.ts';
 import { createToolRegistry } from '../../src/tools/registry.ts';
 import type { Tool } from '../../src/tools/types.ts';
@@ -452,6 +453,141 @@ describe('runAgent — critique decisions', () => {
     );
     const result = await runAgent(config);
     expect(result.status).toBe('done');
+  });
+});
+
+describe('runAgent — critique audit rows (migration 031)', () => {
+  test('clean critique persists row with code=critique.clean', async () => {
+    const { config } = buildHarnessConfig(
+      [{ text: 'all good', usage: { input: 100, output: 50 } }],
+      { criticPayloads: [cleanPayload()], mode: 'always' },
+    );
+    const result = await runAgent(config);
+    const rows = listCritiqueRunsBySession(db, result.sessionId);
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    expect(row?.code).toBe('critique.clean');
+    expect(row?.strategy).toBe('llm');
+    expect(row?.decision).toBe('no_modal');
+    expect(row?.filteredCount).toBe(0);
+    expect(row?.toolPlanWrites).toBe(false);
+    expect(row?.threshold).toBe(0.7);
+  });
+
+  test('flagged + ignore persists row with code=critique.warning_ignored', async () => {
+    const { config } = buildHarnessConfig(
+      [{ text: 'flagged', usage: { input: 100, output: 50 } }],
+      {
+        criticPayloads: [flaggedPayload()],
+        mode: 'always',
+        confirmCritique: async () => 'ignore',
+      },
+    );
+    const result = await runAgent(config);
+    const rows = listCritiqueRunsBySession(db, result.sessionId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.code).toBe('critique.warning_ignored');
+    expect(rows[0]?.decision).toBe('ignore');
+    expect(rows[0]?.filteredCount).toBeGreaterThan(0);
+  });
+
+  test('flagged + abort persists row with code=critique.warning_abort', async () => {
+    const { config } = buildHarnessConfig(
+      [{ text: 'flagged', usage: { input: 100, output: 50 } }],
+      {
+        criticPayloads: [flaggedPayload()],
+        mode: 'always',
+        confirmCritique: async () => 'abort',
+      },
+    );
+    const result = await runAgent(config);
+    const rows = listCritiqueRunsBySession(db, result.sessionId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.code).toBe('critique.warning_abort');
+    expect(rows[0]?.decision).toBe('abort');
+  });
+
+  test('flagged + cancel persists row with code=critique.warning_abort', async () => {
+    const { config } = buildHarnessConfig(
+      [{ text: 'flagged', usage: { input: 100, output: 50 } }],
+      {
+        criticPayloads: [flaggedPayload()],
+        mode: 'always',
+        confirmCritique: async () => 'cancel',
+      },
+    );
+    const result = await runAgent(config);
+    const rows = listCritiqueRunsBySession(db, result.sessionId);
+    // cancel collapses to warning_abort at the audit layer (decision
+    // stays 'cancel' so audit can still tell explicit-rejection from
+    // passive-cancel via that field — code is the higher-level
+    // grouping spec line 552 wants).
+    expect(rows[0]?.code).toBe('critique.warning_abort');
+    expect(rows[0]?.decision).toBe('cancel');
+  });
+
+  test('flagged + redo persists TWO rows: warning_redo on the rejected turn, then warning_ignored or clean on the retry', async () => {
+    let confirmCalls = 0;
+    const { config } = buildHarnessConfig(
+      [
+        { text: 'wrong', usage: { input: 100, output: 50 } },
+        { text: 'better', usage: { input: 110, output: 60 } },
+      ],
+      {
+        criticPayloads: [flaggedPayload(), cleanPayload()],
+        mode: 'always',
+        confirmCritique: async () => {
+          confirmCalls++;
+          return confirmCalls === 1 ? 'redo' : 'ignore';
+        },
+      },
+    );
+    const result = await runAgent(config);
+    const rows = listCritiqueRunsBySession(db, result.sessionId);
+    expect(rows).toHaveLength(2);
+    // Order is by step_n then created_at — the redo row lands
+    // first (step_n smaller), the retry's clean row second.
+    expect(rows[0]?.code).toBe('critique.warning_redo');
+    expect(rows[0]?.decision).toBe('redo');
+    expect(rows[1]?.code).toBe('critique.clean');
+    expect(rows[1]?.decision).toBe('no_modal');
+  });
+
+  test('strategy=failed persists row with code=critique.failed AND reason', async () => {
+    const { config } = buildHarnessConfig([{ text: 'output', usage: { input: 100, output: 50 } }], {
+      criticPayloads: ['{not valid: json}'],
+      mode: 'always',
+    });
+    const result = await runAgent(config);
+    const rows = listCritiqueRunsBySession(db, result.sessionId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.code).toBe('critique.failed');
+    expect(rows[0]?.strategy).toBe('failed');
+    expect(rows[0]?.reason).toBe('parse_failed');
+  });
+
+  test('on_writes + writes:true tool plan: row carries tool_plan_writes=true', async () => {
+    const { config } = buildHarnessConfig(
+      [
+        {
+          tool_uses: [{ id: 'tu1', name: 'write_file', input: { path: '/p/x' } }],
+          usage: { input: 100, output: 50 },
+        },
+        { text: 'done', usage: { input: 110, output: 30 } },
+      ],
+      {
+        criticPayloads: [cleanPayload(), cleanPayload()],
+        mode: 'on_writes',
+      },
+    );
+    const result = await runAgent(config);
+    const rows = listCritiqueRunsBySession(db, result.sessionId);
+    expect(rows).toHaveLength(2);
+    // First row: tool plan critique (toolPlanWrites=true).
+    expect(rows[0]?.toolPlanWrites).toBe(true);
+    // Second row: end-of-step text critique (no plan).
+    expect(rows[1]?.toolPlanWrites).toBe(false);
+    expect(rows.every((r) => r.mode === 'on_writes')).toBe(true);
   });
 });
 

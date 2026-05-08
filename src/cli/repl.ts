@@ -961,6 +961,41 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     body: string;
   }): Promise<'yes' | 'no' | 'cancel'> => modalManager.askMemoryUserScope(req);
 
+  // Self-critique bridge (AGENTIC_CLI.md §5.4, ORCHESTRATION.md §6).
+  // Translates the engine's severity vocabulary (`info | warn |
+  // error`, set by the spec at line 542) into the modal layer's
+  // (`low | medium | high`, set by the pre-existing `critique:ask`
+  // event shape). The two sets are kept distinct so each side can
+  // evolve without churning the other — the bridge is the single
+  // place that has to hold both vocabularies in mind. Mapping is
+  // 1:1 by intent: info=stylistic nit, warn=probable issue,
+  // error=would break intent → low, medium, high.
+  //
+  // `description` from the engine becomes `message` for the modal —
+  // the modal renders one line per issue and only needs the
+  // headline; the suggestion is delivered to the model in the
+  // redo hint, not shown in the modal preview.
+  const confirmCritique = async (req: {
+    issues: { severity: 'info' | 'warn' | 'error'; description: string; confidence: number }[];
+    overallConfidence: number;
+    toolPlanWrites: boolean;
+  }): Promise<'ignore' | 'redo' | 'abort' | 'cancel'> => {
+    const translated = req.issues.map((i) => ({
+      severity:
+        i.severity === 'error'
+          ? ('high' as const)
+          : i.severity === 'warn'
+            ? ('medium' as const)
+            : ('low' as const),
+      confidence: i.confidence,
+      message: i.description,
+    }));
+    return modalManager.askCritique({
+      issues: translated,
+      ...(req.toolPlanWrites === true ? { toolPlanWrites: true } : {}),
+    });
+  };
+
   const startTurn = (text: string): void => {
     if (isBusy() || exiting) return;
     running = true;
@@ -982,6 +1017,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       confirmPermission,
       confirmMemoryWrite,
       confirmMemoryUserScope,
+      confirmCritique,
       ...(lastSessionId !== null ? { resumeFromSessionId: lastSessionId } : {}),
     };
     const runAgentImpl = options.runAgentOverride ?? runAgent;

@@ -1512,23 +1512,41 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
     }
 
     case 'critique:ask': {
+      // Three-way decision per AGENTIC_CLI.md §5.4 line 551 and
+      // ORCHESTRATION.md §6.2: ignore (proceed), redo (re-run with
+      // hint), abort (stop the run). Default selection is `abort`
+      // (last) — the most conservative answer for a step that just
+      // got flagged. The D5/D65 convention places the safe default
+      // last, but for critique "safe" means "don't proceed without
+      // the operator looking", which `abort` captures more
+      // strongly than `ignore` (proceeding blind) or `redo`
+      // (re-running and possibly looping).
       const options: ConfirmOption[] = [
-        { key: '1', label: 'Acknowledge', value: 'yes' },
-        { key: '2', label: 'Reject', value: 'no' },
+        { key: '1', label: 'Ignore', value: 'ignore' },
+        { key: '2', label: 'Redo with hint', value: 'redo' },
+        { key: '3', label: 'Abort step', value: 'abort' },
       ];
       const previewLines = event.issues.map(
         (i) => `[${i.severity}] (${i.confidence.toFixed(2)}) ${i.message}`,
       );
+      // Stronger headline when the proposal includes writes:true
+      // tool calls. The `toolPlanWrites` flag is forwarded by the
+      // producer (harness's confirmCritique bridge); absent ⇒
+      // text-only end-of-step critique.
+      const writes = event.toolPlanWrites === true;
+      const title = writes ? 'Critique — about to mutate' : 'Critique';
       return {
         state: {
           ...state,
           modal: {
             promptId: event.promptId,
             flavor: 'critique',
-            title: 'Critique',
+            title,
             subject: `${event.issues.length} issue(s)`,
             preview: previewLines,
-            question: null,
+            question: writes
+              ? 'Proceed, redo with hint, or abort?'
+              : 'Acknowledge, redo with hint, or abort?',
             options,
             selectedIndex: options.length - 1,
             hints: ['Esc to cancel'],

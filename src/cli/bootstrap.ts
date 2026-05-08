@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { loadCritiqueConfig } from '../critique/index.ts';
 import type { HarnessConfig, RunBudget } from '../harness/index.ts';
 import {
   type HookConfigWarning,
@@ -108,6 +109,12 @@ export interface BootstrapResult {
   // happy path. CLI driver renders them on stderr alongside the
   // policy lockConflicts warnings.
   hookWarnings: readonly HookConfigWarning[];
+  // Warnings from the self-critique config loader (Slice C —
+  // AGENTIC_CLI.md §5.4): malformed `[critique]` block, invalid
+  // mode/threshold/max_overhead_ms, unknown model id. Non-fatal:
+  // a bad value degrades to defaults rather than aborting boot.
+  // Empty in the happy path.
+  critiqueWarnings: readonly string[];
 }
 
 // Build a HarnessConfig from environment + cwd + args. This is the main
@@ -124,10 +131,14 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   // policy YAML error or unknown model doesn't leak a SQLite handle
   // (and the WAL files that come with it).
   let provider: Provider;
+  // Build the registry once and share it across both the executor
+  // and the critique-config loader (Slice C). Creating two
+  // independent default registries would double the model-table
+  // import cost for no benefit.
+  const registry = createDefaultRegistry();
   if (input.providerOverride !== undefined) {
     provider = input.providerOverride;
   } else {
-    const registry = createDefaultRegistry();
     const entry = registry.get(modelId);
     if (entry === null) {
       throw new Error(
@@ -139,6 +150,20 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     }
     provider = entry.factory();
   }
+
+  // Self-critique config (AGENTIC_CLI.md §5.4). Loaded from
+  // `~/.config/agent/config.toml` + `<cwd>/.agent/config.toml`.
+  // When no [critique] section is declared (the common case), this
+  // returns the defaults (mode='off') and no provider — the harness
+  // skips the gate entirely with zero overhead. When the operator
+  // opts in, the resolved config + (optional) critique provider
+  // flow into HarnessConfig below.
+  //
+  // Warnings surface to stderr at boot via the caller; the loader
+  // is non-fatal by design (a malformed [critique] block degrades
+  // to defaults, not a hard exit). The warnings array is exposed
+  // on BootstrapResult for the CLI driver to print.
+  const critiqueLoaded = loadCritiqueConfig({ cwd, registry });
 
   // Hierarchy: enterprise → user → project → session. Each layer is
   // optional; absent layers contribute nothing. The resolver merges
@@ -460,6 +485,16 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     // chain-filter is the no-op when there are no hooks for the
     // event.
     hooks: resolvedHooks.hooks,
+    // Self-critique config (AGENTIC_CLI.md §5.4). When mode='off'
+    // (default), the harness's gate short-circuits — no
+    // measurable cost beyond the partial-merge in
+    // effectiveBudget-style logic. When the operator opted in
+    // via [critique].mode, the harness runs the gate per
+    // ORCHESTRATION.md §6.
+    critique: critiqueLoaded.config,
+    ...(critiqueLoaded.critiqueProvider !== null
+      ? { critiqueProvider: critiqueLoaded.critiqueProvider }
+      : {}),
     ...(input.budget !== undefined ? { budget: input.budget } : {}),
     ...(input.signal !== undefined ? { signal: input.signal } : {}),
     ...(input.plan === true ? { planMode: true } : {}),
@@ -478,5 +513,6 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     lockConflicts: resolved.lockConflicts,
     subagents,
     hookWarnings: resolvedHooks.warnings,
+    critiqueWarnings: critiqueLoaded.warnings,
   };
 };

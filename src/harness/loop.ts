@@ -28,6 +28,7 @@ import type {
 } from '../providers/index.ts';
 import { estimatePromptTokens } from '../providers/tokens.ts';
 import {
+  type CritiqueRunCode,
   appendMessage,
   completeSession,
   createSession,
@@ -35,6 +36,7 @@ import {
   insertCostProgressEvent,
   insertSubagentGateDecision,
   listMessageTailBySession,
+  recordCritiqueRun,
   reopenSession,
 } from '../storage/index.ts';
 import { type SubagentHandleStore, createSubagentHandleStore } from '../subagents/handle-store.ts';
@@ -1693,6 +1695,62 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               decision,
               ...(critiqueResult.reason !== undefined ? { reason: critiqueResult.reason } : {}),
             });
+
+            // Audit row (migration 031). Spec §5.4 line 552 codes
+            // plus a few harness-specific ones to cover the full
+            // decision matrix the loop produces. The mapping is
+            // strategy + decision → code:
+            //   skipped        → critique.skipped
+            //   failed         → critique.failed
+            //   llm + no_modal → critique.clean (no issues over threshold)
+            //   llm + ignore   → critique.warning_ignored
+            //   llm + redo     → critique.warning_redo
+            //   llm + abort|cancel → critique.warning_abort
+            // critique.warning_shown is NOT used here — it's
+            // implied by any code that starts with `critique.warning_*`.
+            // Audit consumers that want "did we show a modal at
+            // all" filter on the prefix.
+            //
+            // Try/catch fail-soft: a DB write throw at audit time
+            // MUST NOT mask the run's actual outcome. The lifecycle
+            // event already fired; losing the persisted row is the
+            // lesser evil compared to crashing the loop on a
+            // transient SQLite error. Mirrors the recordGateDecision
+            // pattern at the subagent gate (loop.ts:1815).
+            try {
+              const code: CritiqueRunCode =
+                critiqueResult.strategy === 'skipped'
+                  ? 'critique.skipped'
+                  : critiqueResult.strategy === 'failed'
+                    ? 'critique.failed'
+                    : decision === 'no_modal'
+                      ? 'critique.clean'
+                      : decision === 'ignore'
+                        ? 'critique.warning_ignored'
+                        : decision === 'redo'
+                          ? 'critique.warning_redo'
+                          : 'critique.warning_abort';
+              recordCritiqueRun(config.db, {
+                sessionId,
+                stepN: steps,
+                mode: critiqueCfg.mode === 'always' ? 'always' : 'on_writes',
+                strategy: critiqueResult.strategy,
+                decision,
+                code,
+                rawCount: critiqueResult.rawIssues.length,
+                filteredCount: critiqueResult.filteredIssues.length,
+                overallConfidence: critiqueResult.overallConfidence,
+                durationMs: critiqueResult.durationMs,
+                costUsd: critiqueResult.costUsd,
+                toolPlanWrites: planHasWrites,
+                ...(critiqueResult.reason !== undefined ? { reason: critiqueResult.reason } : {}),
+                promptVersion: critiqueCfg.promptVersion ?? 'v1',
+                threshold: critiqueCfg.threshold,
+              });
+            } catch {
+              // Audit row write failed; the lifecycle event still
+              // captured the same data for live observers.
+            }
 
             if (decision === 'abort' || decision === 'cancel') {
               return await finish(

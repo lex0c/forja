@@ -15,6 +15,178 @@ Format:
 
 ---
 
+## [2026-05-08] m4/critique — Slice C: TUI modal + audit + eval + TOML loader
+
+**Done:** Closes the Slice B punch list — the harness loop now
+flows the operator through a real modal, persists every critique
+decision to `critique_runs`, ships a deterministic eval suite, and
+honors `[critique]` in `~/.config/agent/config.toml` /
+`<cwd>/.agent/config.toml`. The harness is fully usable in
+production: an operator who sets `mode = "on_writes"` in their
+config gets the gate, the modal, and the audit trail end-to-end.
+
+### TUI modal — 3 options instead of 2
+
+| File | What |
+|---|---|
+| `src/tui/state.ts` | `critique:ask` reducer rewritten to build 3 options (`ignore`/`redo`/`abort`) instead of the old 2 (`yes`/`no`). Default selection lands on `abort` (last) — the conservative default for a flagged proposal is "don't proceed without the operator looking", which `abort` captures more strongly than `ignore` (proceed blind) or `redo` (re-run, possibly loop). When `toolPlanWrites=true` the title becomes `Critique — about to mutate` and the question copy reflects the writes framing. |
+| `src/tui/events.ts` | `CritiqueAskEvent` extended with `toolPlanWrites?: boolean`. Optional for backward compat — absent ⇒ false (text-only end-of-step critique). |
+| `src/tui/modal-manager.ts` | NEW `askCritique(args, opts) => Promise<CritiqueModalAnswer>` method following the same pattern as `askMemoryWrite` / `askPlanReview`. NEW `CritiqueAskArgs` (issues + optional toolPlanWrites) and `CritiqueModalAnswer = 'ignore' \| 'redo' \| 'abort' \| 'cancel'` types. Severity is `low \| medium \| high` at the modal layer; the bridge translates from the engine's `info \| warn \| error` so each side evolves independently. |
+| `tests/tui/modal-integration.test.ts` | Updated `critique:ask` reducer test for 3 options with `selectedIndex=2` default. NEW test for `toolPlanWrites=true` headline path. |
+| `tests/tui/modal-manager.test.ts` | NEW `describe('askCritique')` — 7 tests covering event emission with optional `toolPlanWrites`, the 3 hotkeys (`1`→ignore, `2`→redo, `3`→abort), default selection on Enter, and Esc → cancel. |
+
+### REPL bridge
+
+| File | What |
+|---|---|
+| `src/cli/repl.ts` | NEW `confirmCritique` closure that translates engine-side severity (`info`→`low`, `warn`→`medium`, `error`→`high`) and `description` (engine field) → `message` (modal field) before forwarding to `modalManager.askCritique`. Wired into the per-turn `HarnessConfig` alongside `confirmPermission` / `confirmMemoryWrite`. Suggestion is delivered via the redo hint, not the modal preview — modal stays single-line-per-issue for scannability. |
+
+### Audit (`critique_runs` table)
+
+| File | What |
+|---|---|
+| `src/storage/migrations/031-critique-runs.ts` | NEW migration creating `critique_runs (id PK, session_id FK ON DELETE CASCADE, step_n, mode, strategy, decision, code, raw_count, filtered_count, overall_confidence, duration_ms, cost_usd, tool_plan_writes, reason, prompt_version, threshold, created_at)`. Two indexes: `(session_id, step_n)` for session-scoped audit, `(created_at DESC)` for cross-session listings. CHECKs pin the `mode` / `strategy` / `decision` enums; `code` is free-form so adding a new code (when the critique vocabulary grows) doesn't require a migration. |
+| `src/storage/repos/critique-runs.ts` | NEW repo: `recordCritiqueRun` (write), `listCritiqueRunsBySession` (read), with `CritiqueRunCode` union pinning the spec line 552 codes (`critique.warning_shown` / `_ignored` / `_redo` / `_abort`, plus engine codes `critique.skipped` / `_failed` / `_clean`). |
+| `src/storage/migrations/index.ts` + `src/storage/index.ts` | Registered the migration; re-exported the repo's surface. |
+| `src/harness/loop.ts` | Persists the audit row at the same point `critique_finished` fires. Decision-to-code mapping: `skipped`→`critique.skipped`, `failed`→`critique.failed`, `llm + no_modal`→`critique.clean`, `llm + ignore/redo/abort`→`critique.warning_*`. `cancel` collapses to `warning_abort` at the audit layer (decision field still preserves `cancel` for explicit-rejection vs passive-cancel telemetry). Try/catch fail-soft: a DB write throw at audit time MUST NOT mask the run's outcome — the lifecycle event already fired and losing one row is the lesser evil. |
+| `tests/critique/loop-integration.test.ts` | NEW `describe('runAgent — critique audit rows')` — 7 tests covering each code (clean, warning_ignored, warning_abort × 2 for abort/cancel, warning_redo across two rows, failed with reason, on_writes with `tool_plan_writes=true`). |
+
+### Eval (`evals/critique/`)
+
+| File | What |
+|---|---|
+| `evals/critique/README.md` | Documents the deterministic-fixture eval: what it catches (schema drift, threshold-filter regressions, marker / parse failures, cost accounting), what it doesn't (real-model FP / FN rates — out of scope without API-key CI). |
+| `evals/critique/fixtures/types.ts` | `CritiqueFixture` interface: `name`, `description`, `input` (CritiqueInput), `criticResponse` (raw text including markers), `options` (overrides), `expected` (assertion subset). |
+| `evals/critique/fixtures/01-clean-output.ts` | Clean executor proposal — empty issues, engine returns strategy=llm with zero filtered. |
+| `evals/critique/fixtures/02-flagged-bug.ts` | Real bug (handle leak after null-set) — critic flags with confidence 0.92, engine surfaces. |
+| `evals/critique/fixtures/03-tool-plan-writes.ts` | `writes:true` `rm -rf` plan — toolPlan path of the prompt exercised, critic flags. |
+| `evals/critique/fixtures/04-malformed-output.ts` | Critic forgets close marker — engine returns strategy=failed with `markers_missing`. |
+| `evals/critique/fixtures/05-low-confidence.ts` | Two issues both below 0.7 threshold — `rawIssues` carries them, `filteredIssues` empty. |
+| `evals/critique/fixtures/06-mixed-severities.ts` | One issue per severity (info/warn/error) all above threshold — engine preserves vocabulary in rawIssues. |
+| `tests/critique/eval.test.ts` | Runner: per-fixture mock provider yields the pinned response, asserts the result matches the expected subset (`strategy`, optional `rawCount`, `filteredCount`, `min/maxOverallConfidence`, `reasonContains`). |
+
+### TOML config loader
+
+| File | What |
+|---|---|
+| `src/critique/config-loader.ts` | NEW `loadCritiqueConfig({ cwd, registry, env, factoryOptions })` reads `[critique]` from two layers: user (`~/.config/agent/config.toml`, XDG-honoring) and project (`<cwd>/.agent/config.toml`). Project overrides user, both override `DEFAULT_CRITIQUE_CONFIG`. Per-field merge so a project file that only tweaks `threshold` keeps the user-level mode in effect. Resolves `model = "..."` against the registry to a `Provider`; unknown id surfaces a warning + null provider (fallback to executor at the loop layer). Accepts both snake_case (spec convention) and camelCase (API convention) keys. Non-fatal: malformed TOML, invalid mode, out-of-range threshold all degrade to defaults with a warning. |
+| `src/critique/index.ts` | Re-exports the loader + types. |
+| `src/cli/bootstrap.ts` | Wires `loadCritiqueConfig` after the executor provider is built, sharing the registry. Plumbs the resolved `config` into `HarnessConfig.critique` and the optional `critiqueProvider`. New `BootstrapResult.critiqueWarnings: readonly string[]` so the CLI driver can render to stderr. |
+| `tests/cli/repl-history.test.ts` + `tests/cli/repl.test.ts` | Updated BootstrapResult fixtures with `critiqueWarnings: []`. |
+| `tests/critique/config-loader.test.ts` | NEW 13 tests across 5 describes: path resolution (XDG, HOME fallback, projectConfigPath), empty layers (no files = defaults, no warnings), project layer (snake_case + camelCase aliases), layer merge (project overrides user per-field), validation (invalid mode / out-of-range threshold / malformed TOML all degrade with a warning), model resolution (known id → provider; unknown id → warning + null). |
+
+**Decisions:**
+
+- **`critique_runs` instead of generic `failure_events`.** Spec
+  line 552 names `failure_events`, but that table doesn't exist
+  yet — the M4.1 inventory (BACKLOG line 39) flagged it as
+  cross-cutting infrastructure that's bigger than any one
+  subsystem. Adding it as a side effect of critique would prejudge
+  the schema for recap/hooks/sessions audit. Critique-specific
+  table now, generic `failure_events` later — the column set
+  here is rich enough that a future merge into `failure_events`
+  is mechanical (rename `code` to `event_code`, add a `subsystem`
+  discriminator). When `failure_events` lands, this table
+  migrates.
+- **Modal severity stays `low | medium | high`; engine stays
+  `info | warn | error`.** Two vocabularies, translated at the
+  REPL bridge. Each side has its own audience: the engine's set
+  matches the spec's prose ("error: would break intent") while
+  the modal's set matches general urgency ("high: stop and
+  read"). Collapsing to one would force one audience to read
+  the other's framing. Translation lives in the bridge so each
+  side evolves freely.
+- **Default selection on the critique modal is `abort`.** D5/D65
+  convention is "last option = conservative default", which
+  usually means "no". For critique, "no proceed" means abort,
+  not ignore. `redo` would be a reasonable second choice but
+  carries a subtle risk: a critic that consistently flags
+  reasonable proposals could send the operator into a redo
+  loop without them ever consciously approving. Abort is a
+  hard stop the operator must explicitly downgrade with a key
+  press, which makes the cost of bad critique most visible.
+- **Description vs suggestion split in the modal.** The modal
+  preview shows `description` only — one line per issue. The
+  `suggestion` flows into the `redo` hint message that the
+  model sees. Two reasons: (a) the modal is for human-time
+  decision-making (yes/no/redo on this proposal), and the
+  suggestion is detail the model should act on (not the
+  operator); (b) jamming both into the modal preview line bloats
+  the visual. Operator who wants the suggestion before deciding
+  inspects the audit row.
+- **Decision-to-code mapping at the audit layer.** Spec line 552
+  lists three codes (shown / ignored / skipped). I added
+  `_redo`, `_abort`, `_failed`, `_clean` for the cases the spec
+  doesn't enumerate. `cancel` collapses to `warning_abort`
+  (semantic equivalence — both mean "don't proceed") but the
+  `decision` field preserves `cancel` so explicit rejection is
+  distinguishable from passive close. Audit consumers that want
+  "did the modal open at all" filter on `code LIKE 'critique.warning_%'`.
+- **TOML loader is two-layer (user + project), not three.**
+  Hooks have an enterprise layer because hook-locked rules are
+  security-relevant (a regulator can pin a SessionStart hook
+  that scrubs prompts). Critique is a soft check — even with
+  `mode = "always"` it never blocks the run, just adds latency
+  and audit. An enterprise lock would be overkill. If a
+  regulated environment ever needs it, the loader's path layer
+  is small enough to add (mirror `enterpriseHooksPath`).
+- **TOML loader is non-fatal.** A malformed `[critique]` section
+  doesn't abort boot — it degrades to defaults and surfaces a
+  warning on `BootstrapResult.critiqueWarnings`. Rationale: the
+  operator's existing run shouldn't break because they typo'd
+  a config key. The warning is the actionable signal; the
+  default-mode ('off') is the safe fallback.
+- **Engine vocabulary preserved in audit, modal vocabulary at
+  the bridge.** The audit table stores severity values from the
+  engine (`info | warn | error` shape would be natural, but the
+  schema doesn't store severity — issues persist in the
+  lifecycle events, not the audit row). The audit row carries
+  counts (`raw_count`, `filtered_count`) and metadata (`mode`,
+  `strategy`, `decision`, `code`) but NOT the issues themselves.
+  Trade-off: forensics on "what specific issue did the critic
+  flag at step N of session X?" requires correlating the
+  audit row's `(session_id, step_n)` against an external trace.
+  Acceptable: the typical query is "how often is mode=on_writes
+  catching real problems vs noise?" which the count columns
+  answer directly.
+
+**Pending (Slice D and beyond):**
+
+- **Cross-session severity vocabulary alignment.** The
+  engine/modal split works but every consumer that reasons
+  about severity has to know the mapping. A future cleanup
+  could promote one set as canonical and migrate the other.
+  Low priority — the bridge is one closure.
+- **Real-model eval gate.** The deterministic fixture suite
+  catches engine-side regressions but doesn't measure how the
+  actual critic model performs against the prompt. A separate
+  CI job (with API-key gating) running the same fixtures
+  through Anthropic Haiku and comparing against thresholds
+  would close that gap. Out of scope for Slice C.
+- **D184 supersession entry.** The original D184 (TUI
+  `critique:ask` modal had no producer) is now fully resolved:
+  Slice A built the engine, Slice B wired the harness loop,
+  Slice C wired the modal + REPL bridge + audit. The next
+  inventory pass should retire D184.
+- **`/critique` slash command.** Operator-side introspection
+  ("show me the critique runs for this session", "what's the
+  current threshold?", "toggle mode for this session"). Useful
+  but not load-bearing — the audit table + config TOML cover
+  the data path; this is just UX sugar.
+- **Static fallback when critique provider is undeclared but
+  mode is on.** Today `critiqueProvider` falls back to the
+  executor's provider when no model is declared in TOML. That
+  works but pays the executor's pricing for each critique call.
+  A future enhancement could refuse to enable mode=on_writes
+  unless a cheap-tier provider is explicitly declared, with a
+  warning on boot.
+
+**Next:** Branch is ready. Slice D could open a follow-up branch
+once the cross-cutting items in the Pending section have a
+champion.
+
+---
+
 ## [2026-05-08] m4/critique — Slice B: master loop integration (end-of-step + tool plan)
 
 **Done:** Self-critique engine wired into the master loop per
