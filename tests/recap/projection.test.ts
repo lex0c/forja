@@ -552,6 +552,88 @@ describe('projectRecap', () => {
     expect(out.goal.text).toBe('second');
   });
 
+  test('session_current with limit windows subagent children by spawn time', () => {
+    // Regression: every child of the parent landed in
+    // subagentsSpawned regardless of when it was spawned. So
+    // `/recap last 1` against a session that spawned a subagent
+    // early then ran a final unrelated step would still report
+    // the old spawn under the last step. Children carry no
+    // stepId anchor (parent_session_id only); we window by
+    // child.startedAt vs the earliest kept message's createdAt.
+    const parent = seedSession();
+    // First step + a child spawned during it.
+    const u1 = addUserTurn(parent.id, 'go explore', 1_100);
+    const a1 = addAssistantTurn(parent.id, u1, 'spawning explore', { ts: 1_110 });
+    void a1;
+    const oldChild = createSession(db, {
+      model: 'haiku',
+      cwd: '/proj',
+      startedAt: 1_120,
+      parentSessionId: parent.id,
+    });
+    completeSession(db, oldChild.id, 'done', 0.001, true, 1_130);
+    insertSubagentOutput(db, { sessionId: oldChild.id, createdAt: 1_120 });
+    setSubagentPayload(db, oldChild.id, { status: 'done', summary: 'old child' }, 1_130);
+    // Second step + a child spawned during it.
+    const u2 = addUserTurn(parent.id, 'now do other thing', 1_200);
+    const a2 = addAssistantTurn(parent.id, u2, 'spawning again', { ts: 1_210 });
+    void a2;
+    const newChild = createSession(db, {
+      model: 'haiku',
+      cwd: '/proj',
+      startedAt: 1_220,
+      parentSessionId: parent.id,
+    });
+    completeSession(db, newChild.id, 'done', 0.001, true, 1_230);
+    insertSubagentOutput(db, { sessionId: newChild.id, createdAt: 1_220 });
+    setSubagentPayload(db, newChild.id, { status: 'done', summary: 'new child' }, 1_230);
+
+    const out = projectRecap(db, {
+      scope: { kind: 'session_current', sessionId: parent.id, limit: 1 },
+    });
+    // Only the in-window child surfaces under actions.
+    expect(out.actions.subagentsSpawned).toHaveLength(1);
+    expect(out.actions.subagentsSpawned[0]?.name).toBe(newChild.id);
+    // Timeline is consistent: the old spawn must not leak as a
+    // subagent_spawned event for the kept window.
+    const spawnEvents = out.timeline.filter((e) => e.event === 'subagent_spawned');
+    expect(spawnEvents.map((e) => e.detail)).toEqual([newChild.id]);
+  });
+
+  test('non-windowed scopes preserve all subagent children (regression guard)', () => {
+    // Mirror of the checkpoint regression-guard test below: an
+    // over-eager filter would silently empty the subagent
+    // section across the most common recap form.
+    const parent = seedSession();
+    const u1 = addUserTurn(parent.id, 'spawn', 1_100);
+    const a1 = addAssistantTurn(parent.id, u1, 'spawning', { ts: 1_110 });
+    void a1;
+    const child1 = createSession(db, {
+      model: 'haiku',
+      cwd: '/proj',
+      startedAt: 1_120,
+      parentSessionId: parent.id,
+    });
+    completeSession(db, child1.id, 'done', 0.001, true, 1_130);
+    const u2 = addUserTurn(parent.id, 'spawn again', 1_200);
+    const a2 = addAssistantTurn(parent.id, u2, 'spawning', { ts: 1_210 });
+    void a2;
+    const child2 = createSession(db, {
+      model: 'haiku',
+      cwd: '/proj',
+      startedAt: 1_220,
+      parentSessionId: parent.id,
+    });
+    completeSession(db, child2.id, 'done', 0.001, true, 1_230);
+
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: parent.id },
+    });
+    expect(out.actions.subagentsSpawned.map((s) => s.name).sort()).toEqual(
+      [child1.id, child2.id].sort(),
+    );
+  });
+
   test('session_current with limit windows checkpoints + their timeline events', () => {
     // Regression: messages and toolCalls were sliced to the last
     // N user-anchored steps, but listCheckpointsBySession ran

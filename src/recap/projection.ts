@@ -545,14 +545,52 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
       }
     }
 
+    // Window gates for `/recap last <N>`. Two filter shapes:
+    //
+    //   - `keptStepIds`: set of message ids surviving the
+    //     truncation. Checkpoints carry a `stepId` (assistant
+    //     message id), so a Set lookup is the natural filter.
+    //   - `windowStart`: epoch-ms of the earliest kept message.
+    //     Subagent children carry no `stepId` anchor — they key
+    //     on `parent_session_id`, not `parent_step_id` — so we
+    //     fall back to the time-based "child started ≥ window
+    //     start" rule. A child spawned within the kept window
+    //     necessarily has `started_at >= b.messages[0].createdAt`
+    //     because spawn is synchronous with the parent's host
+    //     message.
+    //
+    // Both gates are null when scope is not windowed
+    // (session_specific / day / range / pre_compact); existing
+    // all-children / all-checkpoint behavior is preserved
+    // structurally.
+    //
+    // memory_events still has no usable anchor and stays
+    // unfiltered — surfacing all proposals for the session is
+    // the safer default than windowing by createdAt and risking
+    // a proposal whose audit row landed mid-step but whose
+    // semantic step is unclear. Tracked as a follow-up.
+    const isWindowedScope =
+      options.scope.kind === 'session_current' && options.scope.limit !== undefined;
+    const keptStepIds = isWindowedScope ? new Set(b.messages.map((m) => m.id)) : null;
+    const windowStart = isWindowedScope ? (b.messages[0]?.createdAt ?? null) : null;
+
     // Subagent children of this session. `listChildSessions` SQL-
     // filters on `parent_session_id` and returns oldest-first, so
     // the natural call order is preserved (operator reading the
     // recap sees subagent[0] before subagent[1] as they were
     // dispatched). Orphans (parent purged → parent_session_id NULL)
     // are excluded structurally by the WHERE clause.
+    //
+    // Time-based windowing: a child spawned BEFORE the earliest
+    // kept message belongs to a step outside the requested slice.
+    // Without this filter, `/recap last 1` would surface every
+    // child the session ever spawned even if none of them
+    // belonged to the last step's prose — operators would read
+    // stale subagent activity as if it were part of the visible
+    // turn.
     const children = listChildSessions(db, b.session.id);
     for (const child of children) {
+      if (windowStart !== null && child.startedAt < windowStart) continue;
       const payload = getSubagentOutput(db, child.id);
       let outputSummary = '';
       if (payload?.payload !== undefined && payload?.payload !== null) {
@@ -572,27 +610,6 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
       });
     }
 
-    // Window checkpoints by the kept-step set when the caller
-    // asked for `/recap last <N>`. Without this, slicing
-    // messages / toolCalls earlier in the loop left the
-    // checkpoint surface untouched: `/recap last 1` reported
-    // 1 step's worth of prose but every checkpoint the session
-    // ever produced, breaking the "last N steps" contract and
-    // misleading operators about what landed in the visible
-    // slice. `keptStepIds` is null for non-windowed scopes
-    // (session_specific / day / range / pre_compact) so the
-    // existing all-checkpoint behavior is preserved there.
-    //
-    // The same window inconsistency applies to memory_events
-    // and subagentsSpawned — those don't carry a `stepId`
-    // anchor (memory_events has no message FK, child sessions
-    // anchor on parent_session_id rather than parent_step_id),
-    // so windowing them requires a different filter mechanism
-    // (createdAt vs earliest kept message ts). Out of scope for
-    // this fix; tracked as a follow-up.
-    const isWindowedScope =
-      options.scope.kind === 'session_current' && options.scope.limit !== undefined;
-    const keptStepIds = isWindowedScope ? new Set(b.messages.map((m) => m.id)) : null;
     for (const cp of listCheckpointsBySession(db, b.session.id)) {
       if (keptStepIds !== null && !keptStepIds.has(cp.stepId)) continue;
       checkpointsRefs.push({
