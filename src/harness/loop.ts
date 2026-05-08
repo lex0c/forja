@@ -1132,6 +1132,11 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             ...(child.auditFailure !== undefined ? { auditFailure: child.auditFailure } : {}),
             ...(child.worktree !== undefined ? { worktree: child.worktree } : {}),
             ...(child.worktreeError !== undefined ? { worktreeError: child.worktreeError } : {}),
+            // Forward the child's diagnostic detail (provider
+            // error text, tool-budget breakdown, etc.) so
+            // task / task_await error strings can show the
+            // cause instead of just the categorical reason.
+            ...(child.detail !== undefined ? { detail: child.detail } : {}),
           };
         };
         const subagentCap = Math.max(

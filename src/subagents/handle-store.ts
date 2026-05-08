@@ -531,6 +531,11 @@ const envelopeFromJson = (raw: Record<string, unknown>): SpawnSubagentResult => 
     raw.cancelSource === 'parent_drain'
       ? { cancelSource: raw.cancelSource }
       : {}),
+    // Diagnostic detail forwarded from the child's harness.
+    // Same defensive parse as elsewhere in this function:
+    // accept only a non-empty string, drop everything else.
+    // Older rows that predate the field rehydrate without it.
+    ...(typeof raw.detail === 'string' && raw.detail.length > 0 ? { detail: raw.detail } : {}),
   };
 };
 

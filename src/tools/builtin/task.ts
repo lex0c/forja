@@ -220,7 +220,14 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
     // forensic record either, so the missing snapshot is exactly
     // what the user needs to see flagged.
     if (result.status !== 'done') {
-      const detail = `subagent '${args.subagent}' exited with status='${result.status}', reason='${result.reason}'`;
+      // Append the child's diagnostic `detail` when the runtime
+      // forwarded one (e.g. provider error message, tool budget
+      // breakdown). Without it the model — and the operator's
+      // TUI chip via invoke-tool's `errorMessage` plumbing —
+      // only see the categorical `reason` code.
+      const causeSuffix =
+        result.detail !== undefined && result.detail.length > 0 ? `: ${result.detail}` : '';
+      const detail = `subagent '${args.subagent}' exited with status='${result.status}', reason='${result.reason}'${causeSuffix}`;
       return toolError('subagent.run_failed', detail, {
         retryable: result.status === 'exhausted',
         details: {
