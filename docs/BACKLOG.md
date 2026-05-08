@@ -15,6 +15,110 @@ Format:
 
 ---
 
+## [2026-05-08] m4/recap slice (c) — `/recap` slash command surface
+
+Same branch (`feat/m4-recap`). Slice (a) projection + slice (b)
+renderers wired into the REPL. The slash command is the operator-
+facing front door for the recap subsystem: it resolves scope from
+arguments, runs the projection, picks a renderer, audits the run.
+
+**Done:**
+
+- **`src/cli/slash/commands/recap.ts`** — `recapCommand` registered
+  in the builtin registry between `/sessions` and `/subagents`.
+  Parses args via a pure `parseRecapArgs` helper (no DB, no ctx) so
+  the parser is unit-testable in isolation from the executor.
+  Subcommand vocabulary shipped in slice (c):
+  - `/recap` — current session, human render, last 10 steps
+  - `/recap last <N>` — current session, human render, last N steps
+  - `/recap session <id>` — specific session, human render, full
+  - `/recap json` — current session, intermediate raw
+  - `/recap json session <id>` — specific session, intermediate raw
+- **Future subcommands surface "not yet available" with the
+  blocking milestone.** RECAP.md §1 lists `pr`, `changelog`,
+  `slack`, `terse` (M4.2 — needs LLM render), `day`, `range` (M4.3
+  — cross-session), `pre-compact` (M4.3 — needs Context Engine),
+  `list` (M4.2 — needs `recap_mini` cache). Operator typing any of
+  these gets a one-line error naming the milestone, not a silent
+  no-op or a generic "unknown command" hint.
+- **Audit row per invocation.** Every successful `/recap` writes
+  one `recap_runs` row with the resolved scope kind, the literal
+  session ids the projection touched, the renderer name, and
+  `usedLlm:false` (always, in M4.1). Parse errors and projection
+  failures (unknown session id) DO NOT write a row — those never
+  consumed audit-worthy resources, and recording them would inflate
+  the anomaly-detection signal.
+- **Bus output via `notes`.** Each line of the rendered markdown /
+  JSON becomes one `info` event in scrollback. The renderer's
+  trailing newline is dropped before splitting so consumers don't
+  see a phantom blank line.
+- **17 tests in `tests/cli/slash/commands/recap.test.ts`.** Bare
+  invocation requires active session; human render shape; json
+  render parses back; specific-session targeting (and verifies
+  current session is NOT mixed in); json+session combo; `last <N>`
+  truncation; audit row recording (success path, parse-error path,
+  projection-error path); `last` argument validation (missing,
+  non-numeric, zero); `session` missing id; future-subcommand
+  hints (M4.2 vs M4.3 messages); unknown subcommand hint; trailing
+  garbage rejection.
+- **Registry tests updated.** Builtin count is 14 (was 13); `/help`
+  notes count is 17 (was 16). The new entry sits in the registration
+  order between `sessions` and `subagents` so its slot in `/help`
+  is predictable.
+
+**Decisions:**
+
+- **Subcommand grammar: `[json] [session <id> | last <N>]`.** The
+  `json` token is a renderer override that may appear before any
+  scope token. This keeps the most common form (`/recap`) terse
+  while letting `/recap json session <id>` chain naturally. The
+  alternative — separate `recapJson` command — would have been
+  flatter but inflates `/help` and forces operators to learn two
+  command names for the same subsystem.
+- **Audit on success only, never on parse / projection error.**
+  RECAP.md §6.3 calls `recap_runs` an anomaly surface ("script
+  generating recaps in a tight loop, unexpected cross-project
+  run"). A typo at the prompt should not look the same as a real
+  recap in that table — keeping it success-only preserves the
+  signal-to-noise ratio of the anomaly query.
+- **`/recap session ghost` returns an error WITH the projection's
+  reason.** The projection throws "session ghost not found" and
+  the slash command prefixes `/recap: ` and surfaces it. We could
+  have swallowed the technical detail behind a generic message;
+  the projection's wording IS the actionable detail (operator
+  knows the id was bad, not that the system is broken).
+- **`/recap last <N>` validates as positive integer.** `0` and
+  negative values are explicit errors; matches the same `/sessions
+  <limit>` discipline. Anything else (`abc`, `1.5`) fails fast.
+- **Future-renderer messages cite the milestone.** "M4.2" /
+  "M4.3" lands literally in the error string so an operator
+  spelunking through commits / spec can trace exactly when their
+  request lands. The literal token is also the audit anchor when
+  someone reports "I tried /recap pr and got an error".
+
+**Pending:**
+
+- Slice (d) — eval smoke fixtures (5 sessions, golden outputs;
+  PR-blocking fidelity per RECAP.md §11.3).
+- M4.2 — LLM render path with Haiku + schema enforcement, plus
+  `pr` / `changelog` / `slack` / `terse` renderers and
+  `recap_cache` table.
+- M4.3 — `/recap day`, `/recap range` cross-session scopes;
+  `/recap pre-compact` integration with Context Engine; cross-
+  project guards (`--all-projects` flag).
+- **Flags `--out <path>`, `--limit <N>`, `--anonymize`.** RECAP.md
+  §1 lists universal flags; not parsed in slice (c). The slash
+  surface today emits inline; an `--out` writer would also need
+  to coexist with the `notes` channel cleanly. Follow-up.
+
+**Verification:** `bun test` 3785 pass / 0 fail / 10 skip ·
+`bun run typecheck` clean · `bun run lint` clean
+(pre-existing `tests/harness/abortable.test.ts` warning unchanged).
+
+**Next:** slice (d) eval smoke. Same branch.
+
+---
+
 ## [2026-05-08] m4/recap slice (b) — deterministic human + json renderers
 
 Same branch (`feat/m4-recap`), continuation of M4.1. Slice (a) landed
