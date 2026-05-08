@@ -572,7 +572,29 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
       });
     }
 
+    // Window checkpoints by the kept-step set when the caller
+    // asked for `/recap last <N>`. Without this, slicing
+    // messages / toolCalls earlier in the loop left the
+    // checkpoint surface untouched: `/recap last 1` reported
+    // 1 step's worth of prose but every checkpoint the session
+    // ever produced, breaking the "last N steps" contract and
+    // misleading operators about what landed in the visible
+    // slice. `keptStepIds` is null for non-windowed scopes
+    // (session_specific / day / range / pre_compact) so the
+    // existing all-checkpoint behavior is preserved there.
+    //
+    // The same window inconsistency applies to memory_events
+    // and subagentsSpawned — those don't carry a `stepId`
+    // anchor (memory_events has no message FK, child sessions
+    // anchor on parent_session_id rather than parent_step_id),
+    // so windowing them requires a different filter mechanism
+    // (createdAt vs earliest kept message ts). Out of scope for
+    // this fix; tracked as a follow-up.
+    const isWindowedScope =
+      options.scope.kind === 'session_current' && options.scope.limit !== undefined;
+    const keptStepIds = isWindowedScope ? new Set(b.messages.map((m) => m.id)) : null;
     for (const cp of listCheckpointsBySession(db, b.session.id)) {
+      if (keptStepIds !== null && !keptStepIds.has(cp.stepId)) continue;
       checkpointsRefs.push({
         id: cp.id,
         stepId: cp.stepId,

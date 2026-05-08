@@ -552,6 +552,107 @@ describe('projectRecap', () => {
     expect(out.goal.text).toBe('second');
   });
 
+  test('session_current with limit windows checkpoints + their timeline events', () => {
+    // Regression: messages and toolCalls were sliced to the last
+    // N user-anchored steps, but listCheckpointsBySession ran
+    // unfiltered, so `/recap last 1` reported 1 step's worth of
+    // prose alongside every checkpoint the session produced.
+    // The window contract is "last N steps" — checkpoints
+    // anchored to dropped steps must drop with them.
+    const s = seedSession();
+    const u1 = addUserTurn(s.id, 'first', 1_100);
+    const a1 = addAssistantTurn(s.id, u1, 'r1', { ts: 1_110 });
+    insertCheckpoint(db, {
+      id: 'ckpt-old',
+      sessionId: s.id,
+      stepId: a1,
+      gitRef: 'sha-old',
+      hadBash: false,
+      createdAt: 1_115,
+    });
+    const u2 = addUserTurn(s.id, 'second', 1_200);
+    const a2 = addAssistantTurn(s.id, u2, 'r2', { ts: 1_210 });
+    insertCheckpoint(db, {
+      id: 'ckpt-new',
+      sessionId: s.id,
+      stepId: a2,
+      gitRef: 'sha-new',
+      hadBash: false,
+      createdAt: 1_215,
+    });
+
+    const out = projectRecap(db, {
+      scope: { kind: 'session_current', sessionId: s.id, limit: 1 },
+    });
+    // Only the in-window checkpoint surfaces.
+    expect(out.outcomes.checkpoints).toHaveLength(1);
+    expect(out.outcomes.checkpoints[0]?.id).toBe('ckpt-new');
+    // Timeline is consistent: the dropped checkpoint's event
+    // must not leak through either, otherwise the operator
+    // sees a "checkpoint" entry referring to a step that has
+    // no matching prose elsewhere in the recap.
+    const checkpointEvents = out.timeline.filter((e) => e.event === 'checkpoint');
+    expect(checkpointEvents.map((e) => e.detail)).toEqual(['ckpt-new']);
+  });
+
+  test('non-windowed scopes preserve all checkpoints (regression guard)', () => {
+    // Negative space for the windowing gate. session_specific /
+    // day / range / pre_compact MUST surface every checkpoint
+    // in their bundle; an over-eager filter would silently empty
+    // the checkpoint section across the most common recap form.
+    const s = seedSession();
+    const u1 = addUserTurn(s.id, 'first', 1_100);
+    const a1 = addAssistantTurn(s.id, u1, 'r1', { ts: 1_110 });
+    insertCheckpoint(db, {
+      id: 'ckpt-1',
+      sessionId: s.id,
+      stepId: a1,
+      gitRef: 'sha1',
+      hadBash: false,
+      createdAt: 1_115,
+    });
+    const u2 = addUserTurn(s.id, 'second', 1_200);
+    const a2 = addAssistantTurn(s.id, u2, 'r2', { ts: 1_210 });
+    insertCheckpoint(db, {
+      id: 'ckpt-2',
+      sessionId: s.id,
+      stepId: a2,
+      gitRef: 'sha2',
+      hadBash: false,
+      createdAt: 1_215,
+    });
+
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.outcomes.checkpoints.map((c) => c.id).sort()).toEqual(['ckpt-1', 'ckpt-2']);
+  });
+
+  test('session_current without limit (or limit larger than steps) keeps every checkpoint', () => {
+    // Limit set but session has fewer steps than the cap → no
+    // truncation happens, so windowing must be a no-op for
+    // checkpoints too. Without this guard, a hypothetical
+    // off-by-one in `keptStepIds` would silently drop all
+    // checkpoints whenever the session was short.
+    const s = seedSession();
+    const u1 = addUserTurn(s.id, 'only', 1_100);
+    const a1 = addAssistantTurn(s.id, u1, 'r1', { ts: 1_110 });
+    insertCheckpoint(db, {
+      id: 'ckpt-only',
+      sessionId: s.id,
+      stepId: a1,
+      gitRef: 'sha',
+      hadBash: false,
+      createdAt: 1_115,
+    });
+
+    const out = projectRecap(db, {
+      scope: { kind: 'session_current', sessionId: s.id, limit: 50 },
+    });
+    expect(out.outcomes.checkpoints).toHaveLength(1);
+    expect(out.outcomes.checkpoints[0]?.id).toBe('ckpt-only');
+  });
+
   test('timeline is totally ordered: ties on (ts, event) tiebreak on detail deterministically', () => {
     // Regression: prior comparator returned 1 (instead of 0) for
     // equal (ts, event) pairs, violating antisymmetry. Two
