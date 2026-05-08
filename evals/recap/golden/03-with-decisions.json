@@ -46,11 +46,6 @@
         "durationMs": 18
       },
       {
-        "command": "curl -X POST https://example.com/webhook",
-        "exitCode": -1,
-        "durationMs": 0
-      },
-      {
         "command": "echo done",
         "exitCode": 0,
         "durationMs": 4

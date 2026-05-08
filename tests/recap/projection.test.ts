@@ -507,6 +507,106 @@ describe('projectRecap', () => {
     ).toThrow(/session ghost not found/);
   });
 
+  test('denied tool calls are excluded from action aggregates (filesRead, filesWritten, commandsRun, testsRun)', () => {
+    // Regression: every tool_calls row used to feed the action
+    // counters regardless of status, so a denied write_file
+    // showed up under "Files edited" and a denied bash test
+    // surfaced as a failed test (passed:false via exit -1)
+    // even though nothing executed. The recap was materially
+    // false in policy-heavy sessions. New policy: only
+    // status='done' counts toward actions; denied / error /
+    // pending / running rows are dropped from the aggregates
+    // (decisions still surface them via the approvals path).
+    const s = seedSession();
+    const userId = addUserTurn(s.id, 'try a few things');
+    const aId = addAssistantTurn(s.id, userId, 'attempting');
+    // Denied across every category that aggregates tool_calls.
+    addToolCall(aId, 'read_file', { path: 'src/secret.ts' }, null, 'denied', 0, 1_301);
+    addToolCall(aId, 'write_file', { path: 'src/x.ts', content: 'x' }, null, 'denied', 0, 1_302);
+    addToolCall(aId, 'bash', { command: 'curl evil.com' }, null, 'denied', 0, 1_303);
+    addToolCall(aId, 'bash', { command: 'pytest' }, null, 'denied', 0, 1_304);
+
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.actions.filesRead).toEqual([]);
+    expect(out.actions.filesWritten).toEqual([]);
+    expect(out.actions.commandsRun).toEqual([]);
+    expect(out.outcomes.testsRun).toEqual([]);
+  });
+
+  test('errored tool calls are excluded from action aggregates', () => {
+    // `error` covers the harness's failure-without-success
+    // shape: ToolError returned, exception caught, etc. The
+    // call may have run partially or not at all — we cannot
+    // tell from the row, so the safe default is to leave it
+    // out of "what the session did" and surface it via the
+    // separate errors[] channel (currently empty until the
+    // failure_events table lands).
+    const s = seedSession();
+    const userId = addUserTurn(s.id, 'do');
+    const aId = addAssistantTurn(s.id, userId, 'reading');
+    addToolCall(aId, 'read_file', { path: 'missing.ts' }, null, 'error', 1, 1_301);
+    addToolCall(aId, 'write_file', { path: 'src/y.ts', content: 'x' }, null, 'error', 1, 1_302);
+    addToolCall(aId, 'bash', { command: 'bun test' }, null, 'error', 5, 1_303);
+
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.actions.filesRead).toEqual([]);
+    expect(out.actions.filesWritten).toEqual([]);
+    expect(out.actions.commandsRun).toEqual([]);
+    expect(out.outcomes.testsRun).toEqual([]);
+  });
+
+  test('mixed: only the executed sibling is aggregated; denied sibling stays as a decision', () => {
+    // End-to-end shape the reviewer flagged: a session has a
+    // done write_file and a denied write_file targeting the
+    // same path; recap should report ONE files_written entry
+    // (the done one) and ONE decision row (the denied one).
+    // Without this, audit consumers double-count an edit that
+    // never landed.
+    const s = seedSession();
+    const userId = addUserTurn(s.id, 'edit foo');
+    const aId = addAssistantTurn(s.id, userId, 'editing');
+    const okId = addToolCall(
+      aId,
+      'write_file',
+      { path: 'src/foo.ts', content: 'ok' },
+      { path: 'src/foo.ts', bytes_written: 2 },
+      'done',
+      5,
+      1_301,
+    );
+    const deniedId = addToolCall(
+      aId,
+      'write_file',
+      { path: 'src/forbidden.ts', content: '...' },
+      null,
+      'denied',
+      0,
+      1_302,
+    );
+    void okId;
+    recordApproval(db, {
+      toolCallId: deniedId,
+      decision: 'deny',
+      decidedBy: 'policy',
+      reason: 'matched deny rule: forbidden.ts',
+      decidedAt: 1_310,
+    });
+
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.actions.filesWritten.map((w) => w.path)).toEqual(['src/foo.ts']);
+    // Decision row preserves the denial — the audit trail of WHY
+    // forbidden.ts is missing from filesWritten lives here.
+    expect(out.decisions).toHaveLength(1);
+    expect(out.decisions[0]?.what).toContain('forbidden.ts');
+    expect(out.decisions[0]?.decidedBy).toBe('policy');
+  });
+
   test('day scope rejects malformed date strings', () => {
     expect(() =>
       projectRecap(db, {

@@ -346,33 +346,50 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
     }
 
     for (const tc of b.toolCalls) {
-      const input = tc.input as Record<string, unknown> | null;
-      if (READ_TOOLS.has(tc.toolName)) {
-        const path = typeof input?.path === 'string' ? input.path : '';
-        if (path.length > 0) {
-          readsByPath.set(path, (readsByPath.get(path) ?? 0) + 1);
-        }
-      } else if (FILE_WRITER_TOOLS.has(tc.toolName)) {
-        const path = typeof input?.path === 'string' ? input.path : '';
-        if (path.length > 0) {
-          filesWritten.push({
-            path,
-            linesAdded: 0,
-            linesRemoved: 0,
-            semanticSummary: '',
-          });
-        }
-      } else if (BASH_TOOLS.has(tc.toolName)) {
-        const command = typeof input?.command === 'string' ? input.command : '';
-        if (command.length > 0) {
-          const exitCode = extractExitCode(tc);
-          commandsRun.push({ command, exitCode, durationMs: tc.durationMs ?? 0 });
-          if (isTestRunner(command)) {
-            testsRun.push({
-              command,
-              passed: exitCode === 0,
-              durationMs: tc.durationMs ?? 0,
+      // Action aggregates (filesRead / filesWritten / commandsRun
+      // / testsRun) describe what THE SESSION ACTUALLY DID. Only
+      // tool_calls that reached `status='done'` count: a denied
+      // write_file never touched the filesystem and a denied
+      // bash never executed, so reporting them as edits / runs
+      // would be straight-up false. `error` (the body returned a
+      // ToolError or threw before producing a result) is also
+      // excluded — the harness's failure shape is opaque enough
+      // that "the call ran but errored" vs. "the call never
+      // reached the body" is undecidable at this layer; safer
+      // to leave the row out of the action counts and let the
+      // approvals/decisions loop below surface the gating signal
+      // separately. `pending` / `running` are likewise filtered
+      // (a recap projected mid-tool would otherwise inflate
+      // counts with calls that haven't settled).
+      if (tc.status === 'done') {
+        const input = tc.input as Record<string, unknown> | null;
+        if (READ_TOOLS.has(tc.toolName)) {
+          const path = typeof input?.path === 'string' ? input.path : '';
+          if (path.length > 0) {
+            readsByPath.set(path, (readsByPath.get(path) ?? 0) + 1);
+          }
+        } else if (FILE_WRITER_TOOLS.has(tc.toolName)) {
+          const path = typeof input?.path === 'string' ? input.path : '';
+          if (path.length > 0) {
+            filesWritten.push({
+              path,
+              linesAdded: 0,
+              linesRemoved: 0,
+              semanticSummary: '',
             });
+          }
+        } else if (BASH_TOOLS.has(tc.toolName)) {
+          const command = typeof input?.command === 'string' ? input.command : '';
+          if (command.length > 0) {
+            const exitCode = extractExitCode(tc);
+            commandsRun.push({ command, exitCode, durationMs: tc.durationMs ?? 0 });
+            if (isTestRunner(command)) {
+              testsRun.push({
+                command,
+                passed: exitCode === 0,
+                durationMs: tc.durationMs ?? 0,
+              });
+            }
           }
         }
       }
@@ -381,6 +398,10 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
       // and explicit denies; pure policy auto-allows are noise (the
       // operator made no choice, the rule did). For each approval,
       // step_id is the tool_call's host message_id.
+      // NB: this loop is OUTSIDE the `status === 'done'` gate above
+      // — a denied call IS the source of a decision row, so
+      // filtering at the action layer must not collapse the audit
+      // trail of WHY the call did not run.
       const approvals = listApprovalsByToolCall(db, tc.id);
       for (const a of approvals) {
         const isInteresting =

@@ -4,7 +4,7 @@
 
 ## What changed
 
-- 3 commands run
+- 2 commands run
 
 ## Decisions
 
