@@ -491,7 +491,12 @@ describe('runAgent — critique audit rows (migration 031)', () => {
     expect(row?.decision).toBe('no_modal');
     expect(row?.filteredCount).toBe(0);
     expect(row?.toolPlanWrites).toBe(false);
-    expect(row?.threshold).toBe(0.7);
+    // Threshold matches DEFAULT_CRITIQUE_CONFIG (currently 0.85
+    // post-real-eval calibration). Pinned via the constant so a
+    // future change to the production default doesn't ask this
+    // test to update silently.
+    const { DEFAULT_CRITIQUE_CONFIG } = await import('../../src/critique/index.ts');
+    expect(row?.threshold).toBe(DEFAULT_CRITIQUE_CONFIG.threshold);
   });
 
   test('flagged + ignore persists row with code=critique.warning_ignored', async () => {

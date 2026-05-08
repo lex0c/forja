@@ -35,8 +35,11 @@ export {
   CRITIQUE_MARKER_CLOSE,
   CRITIQUE_MARKER_OPEN,
   CRITIQUE_PROMPT_VERSION_V1,
+  CRITIQUE_PROMPT_VERSION_V2,
   CRITIQUE_SYSTEM_PROMPT_V1,
+  CRITIQUE_SYSTEM_PROMPT_V2,
   DEFAULT_CRITIQUE_PROMPT_VERSION,
+  getCritiqueSystemPrompt,
   renderCritiqueUserMessage,
   stripPriorCritique,
 } from './prompt.ts';

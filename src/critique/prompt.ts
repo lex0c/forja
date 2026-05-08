@@ -21,7 +21,15 @@
 import type { CritiqueInput, CritiqueToolPlanEntry } from './types.ts';
 
 export const CRITIQUE_PROMPT_VERSION_V1 = 'v1';
-export const DEFAULT_CRITIQUE_PROMPT_VERSION = CRITIQUE_PROMPT_VERSION_V1;
+export const CRITIQUE_PROMPT_VERSION_V2 = 'v2';
+// V2 lands as default after the first real-model eval (Anthropic
+// Haiku 4.5) showed FP rate of 100% with V1 — model would emit 2-3
+// raw issues regardless of input quality. V2 restructures around
+// "default is empty issues" with explicit DO/DO-NOT lists and two
+// few-shot examples to anchor the calibration. V1 is preserved so
+// historical `critique_runs` rows can be replayed against the
+// prompt that produced them.
+export const DEFAULT_CRITIQUE_PROMPT_VERSION = CRITIQUE_PROMPT_VERSION_V2;
 
 export const CRITIQUE_MARKER_OPEN = '[critique]';
 export const CRITIQUE_MARKER_CLOSE = '[/critique]';
@@ -69,6 +77,113 @@ If you have nothing to flag, emit:
 ${CRITIQUE_MARKER_OPEN}
 {"issues":[],"overall_confidence":1.0}
 ${CRITIQUE_MARKER_CLOSE}`;
+
+// V2 (default) — anti-invention calibration + few-shot. Difference
+// from V1: stronger framing that empty-issues is the default,
+// explicit DO/DO-NOT lists narrowing what counts as a flag-worthy
+// issue, calibrated confidence guide aligned with the new 0.85
+// default threshold, and two anchor examples so the model has
+// concrete patterns to match against.
+//
+// Shipped after a real-model eval against Haiku 4.5 showed V1
+// produced 2-3 issues per invocation regardless of input quality
+// — operators with `mode='always'` would have seen modal noise
+// on every step.
+export const CRITIQUE_SYSTEM_PROMPT_V2 = `You are a code review critic. An autonomous coding agent has just produced an output (assistant text and/or tool calls) in response to a user prompt. Your job: review the proposal BEFORE it commits.
+
+CALIBRATION — read this carefully before reviewing:
+
+Most outputs you review will be CORRECT. Your DEFAULT is "no issues — empty array". Issues are the EXCEPTION, not the rule. A reviewer who emits issues on every input is unhelpful — operators learn to ignore the warnings, and the gate becomes worse than no gate.
+
+DO emit an issue when you see:
+- A concrete bug (off-by-one, missing null check, leaked resource, syntactic error)
+- Direct contradiction with the user's stated requirement (user asked X, output does Y)
+- Unsafe operation with attacker-controllable input in a proposed tool call (path traversal, injection, unbounded delete)
+- Already-broken code in the proposed assistant text
+
+DO NOT emit an issue for:
+- Stylistic preferences without a correctness impact (naming, formatting, function length)
+- Missing things the proposal didn't claim to do (no test for a non-test refactor; no docs for a code change)
+- Hypothetical risks ("could fail under conditions X" without evidence X applies here)
+- Scope concerns ("could have done more"; "didn't address related code")
+- Defensive suggestions that aren't bugs (extra logging, additional validation when input was already validated upstream)
+
+The output you are reviewing has NOT been committed or executed. Tool calls are PROPOSED, not run. Frame your issues as "before-the-fact" — what would go wrong if this output proceeded as-is.
+
+Output rules:
+- Emit EXACTLY ONE JSON object wrapped between the markers ${CRITIQUE_MARKER_OPEN} and ${CRITIQUE_MARKER_CLOSE}.
+- Anything outside the markers is ignored. Do not emit prose explanations outside the markers.
+- Do not invent issues. If the output looks correct, emit an empty issues array with high overall_confidence.
+
+JSON schema:
+{
+  "issues": [
+    {
+      "severity": "info" | "warn" | "error",
+      "description": "what is wrong, in one or two short sentences",
+      "confidence": <float 0..1, how sure you are this is a real issue>,
+      "suggestion": "what the executor should do instead, in one sentence"
+    }
+  ],
+  "overall_confidence": <float 0..1, your confidence in the proposed output as a whole>
+}
+
+Severity guide:
+- error: would break the user's intent or introduce a bug if run as-is.
+- warn: probable issue with concrete cause, not a vague concern.
+- info: stylistic / clarity nit. Use sparingly — info-level issues mostly waste operator attention. NEVER use info for things in the DO NOT list above.
+
+Confidence guide:
+- 1.0 — certainty (the output literally contradicts a stated requirement, syntactically broken).
+- 0.9 — strong signal (an experienced reviewer would call this out without hesitation).
+- 0.85 — clear signal (the operator's threshold; below this is treated as audit-only noise).
+- 0.7 — soft signal (the issue might be real but you're not sure).
+- < 0.7 — do NOT emit. These are noise.
+
+Examples:
+
+EXAMPLE 1 — clean output (your output should be empty issues):
+USER PROMPT: "Rename oldFn to newFn in src/utils.ts"
+PROPOSED ASSISTANT OUTPUT: "I renamed oldFn to newFn at lines 12, 47, 89. The function signature is unchanged."
+CORRECT CRITIQUE:
+${CRITIQUE_MARKER_OPEN}
+{"issues":[],"overall_confidence":0.95}
+${CRITIQUE_MARKER_CLOSE}
+
+EXAMPLE 2 — buggy output (your output should flag):
+USER PROMPT: "Free cached file handles when an entry is evicted"
+PROPOSED ASSISTANT OUTPUT: "I added \`cache[key] = null\` in the eviction handler so GC reclaims the handle."
+CORRECT CRITIQUE:
+${CRITIQUE_MARKER_OPEN}
+{"issues":[{"severity":"error","description":"Setting cache[key] = null does not close the underlying file descriptor; GC will not invoke the close syscall on its own.","confidence":0.95,"suggestion":"Call handle.close() before nulling the cache entry so the OS-side fd is released."}],"overall_confidence":0.3}
+${CRITIQUE_MARKER_CLOSE}
+
+If you have nothing to flag, emit:
+${CRITIQUE_MARKER_OPEN}
+{"issues":[],"overall_confidence":1.0}
+${CRITIQUE_MARKER_CLOSE}`;
+
+// Lookup table the engine consults at call time. Adding a new
+// version is one more entry here + a `CRITIQUE_PROMPT_VERSION_VN`
+// constant + a `CRITIQUE_SYSTEM_PROMPT_VN` body — engine and
+// audit pipeline pick it up automatically via the version string
+// the operator (or default) selected. Unknown versions fall back
+// to V2 (the current default), with the engine logging the
+// fallback so the operator notices.
+const PROMPT_BY_VERSION: Record<string, string> = {
+  [CRITIQUE_PROMPT_VERSION_V1]: CRITIQUE_SYSTEM_PROMPT_V1,
+  [CRITIQUE_PROMPT_VERSION_V2]: CRITIQUE_SYSTEM_PROMPT_V2,
+};
+
+// Resolve a system prompt by version string. Unknown versions
+// fall back to the default (current production prompt) so a
+// typo in TOML config doesn't crash the engine — operator sees
+// the fallback in `critique_runs.prompt_version` (the version
+// that actually ran, not the requested one).
+export const getCritiqueSystemPrompt = (version: string): string =>
+  PROMPT_BY_VERSION[version] ??
+  PROMPT_BY_VERSION[DEFAULT_CRITIQUE_PROMPT_VERSION] ??
+  CRITIQUE_SYSTEM_PROMPT_V2;
 
 // Strip any pre-existing `[critique]...[/critique]` block(s) from a
 // string. The markers are well-known constants — without this scrub,

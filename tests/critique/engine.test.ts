@@ -2,7 +2,12 @@ import { describe, expect, test } from 'bun:test';
 import {
   CRITIQUE_MARKER_CLOSE,
   CRITIQUE_MARKER_OPEN,
+  CRITIQUE_PROMPT_VERSION_V1,
+  CRITIQUE_PROMPT_VERSION_V2,
   CRITIQUE_SYSTEM_PROMPT_V1,
+  CRITIQUE_SYSTEM_PROMPT_V2,
+  DEFAULT_CRITIQUE_PROMPT_VERSION,
+  getCritiqueSystemPrompt,
   runCritique,
 } from '../../src/critique/index.ts';
 import type { GenerateRequest, Provider, StreamEvent } from '../../src/providers/index.ts';
@@ -124,7 +129,11 @@ describe('runCritique — happy path', () => {
 
     expect(handle.generateCalls).toHaveLength(1);
     const req = handle.generateCalls[0];
-    expect(req?.system).toBe(CRITIQUE_SYSTEM_PROMPT_V1);
+    // Default prompt version is V2 (post-real-eval calibration);
+    // baseOptions doesn't override `promptVersion`, so the engine
+    // resolves via `getCritiqueSystemPrompt`.
+    expect(req?.system).toBe(CRITIQUE_SYSTEM_PROMPT_V2);
+    expect(req?.metadata?.critique_prompt_version).toBe(DEFAULT_CRITIQUE_PROMPT_VERSION);
     expect(req?.temperature).toBe(0);
     expect(req?.messages).toHaveLength(1);
     const userContent = req?.messages[0]?.content;
@@ -357,6 +366,66 @@ describe('runCritique — overhead watchdog', () => {
     });
     setTimeout(() => ctrl.abort(), 10);
     await expect(p).rejects.toBeDefined();
+  });
+});
+
+describe('runCritique — prompt versioning', () => {
+  // V2 is the default after real-model calibration; V1 is preserved
+  // for replay of historical audit rows. The engine consults
+  // `getCritiqueSystemPrompt` at call time, so a fixture asking
+  // for V1 explicitly must see the V1 prompt on the wire (NOT V2)
+  // — without this, replay is meaningless.
+
+  test('promptVersion=v1 sends the V1 system prompt verbatim', async () => {
+    const json = '{"issues":[],"overall_confidence":1.0}';
+    const handle = mockProvider(() => replyText(wrapPayload(json)));
+    await runCritique(handle.provider, baseInput, {
+      ...baseOptions,
+      promptVersion: CRITIQUE_PROMPT_VERSION_V1,
+    });
+    const req = handle.generateCalls[0];
+    expect(req?.system).toBe(CRITIQUE_SYSTEM_PROMPT_V1);
+    expect(req?.metadata?.critique_prompt_version).toBe('v1');
+  });
+
+  test('promptVersion=v2 sends the V2 system prompt (DO/DO-NOT structure)', async () => {
+    const json = '{"issues":[],"overall_confidence":1.0}';
+    const handle = mockProvider(() => replyText(wrapPayload(json)));
+    await runCritique(handle.provider, baseInput, {
+      ...baseOptions,
+      promptVersion: CRITIQUE_PROMPT_VERSION_V2,
+    });
+    const req = handle.generateCalls[0];
+    expect(req?.system).toBe(CRITIQUE_SYSTEM_PROMPT_V2);
+    // V2 carries calibration text V1 does not — used as a sanity
+    // check so a future regression that swaps the prompts here
+    // would surface.
+    expect(req?.system).toContain('DEFAULT is "no issues');
+    expect(req?.system).toContain('DO emit an issue when');
+    expect(req?.system).toContain('DO NOT emit an issue for');
+  });
+
+  test('unknown promptVersion falls back to default V2', async () => {
+    const json = '{"issues":[],"overall_confidence":1.0}';
+    const handle = mockProvider(() => replyText(wrapPayload(json)));
+    await runCritique(handle.provider, baseInput, {
+      ...baseOptions,
+      promptVersion: 'v9999-imaginary',
+    });
+    const req = handle.generateCalls[0];
+    // Body is V2 (default fallback); metadata still carries the
+    // requested version verbatim — operator sees in audit which
+    // version was REQUESTED vs which actually ran (engine logs
+    // the fallback elsewhere).
+    expect(req?.system).toBe(CRITIQUE_SYSTEM_PROMPT_V2);
+    expect(req?.metadata?.critique_prompt_version).toBe('v9999-imaginary');
+  });
+
+  test('getCritiqueSystemPrompt is the resolution surface', () => {
+    // Pinned so engine + audit consumers see the same lookup.
+    expect(getCritiqueSystemPrompt('v1')).toBe(CRITIQUE_SYSTEM_PROMPT_V1);
+    expect(getCritiqueSystemPrompt('v2')).toBe(CRITIQUE_SYSTEM_PROMPT_V2);
+    expect(getCritiqueSystemPrompt('unknown')).toBe(CRITIQUE_SYSTEM_PROMPT_V2);
   });
 });
 

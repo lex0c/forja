@@ -151,7 +151,17 @@ export const DEFAULT_CRITIQUE_CONFIG: CritiqueConfig = {
   // requires per-project threshold tuning before it stops being
   // noise.
   mode: 'off',
-  threshold: 0.7,
+  // Bumped from spec's 0.7 to 0.85 after the first real-model
+  // eval (Anthropic Haiku 4.5) showed FP rate of 100% on clean
+  // fixtures at 0.7 — the model emits 2-3 raw issues regardless,
+  // and most live in the 0.7-0.85 band as borderline concerns
+  // (style, scope, hypothetical risks). 0.85 keeps unambiguous
+  // bugs (handle leaks, off-by-one, contradiction with stated
+  // requirement) while filtering the noise. Operators tuning down
+  // to 0.7 explicitly opt back into the higher-recall regime.
+  // Sub-0.85 issues still surface in `rawIssues` (audit-only),
+  // just not in `filteredIssues` (which is what opens the modal).
+  threshold: 0.85,
   // §5.4: 3000ms. Beyond this the critic is silently skipped.
   maxOverheadMs: 3000,
 };

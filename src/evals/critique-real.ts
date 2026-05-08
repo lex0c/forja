@@ -37,7 +37,7 @@ import { fixture as f05 } from '../../evals/critique/fixtures/05-low-confidence.
 import { fixture as f06 } from '../../evals/critique/fixtures/06-mixed-severities.ts';
 import type { CritiqueFixture } from '../../evals/critique/fixtures/types.ts';
 import { REAL_EXPECTATIONS, type RealExpectation } from '../../evals/critique/real-expectations.ts';
-import { runCritique } from '../critique/index.ts';
+import { DEFAULT_CRITIQUE_CONFIG, runCritique } from '../critique/index.ts';
 import type { CritiqueResult } from '../critique/index.ts';
 import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
@@ -56,7 +56,11 @@ const KNOWN_VALUE_FLAGS = new Set(['--model', '--threshold', '--max-overhead']);
 
 const parseArgs = (argv: readonly string[]): RunArgs => {
   let modelId = DEFAULT_MODEL_ID;
-  let threshold = 0.7;
+  // Default threshold mirrors `DEFAULT_CRITIQUE_CONFIG.threshold`
+  // (currently 0.85). Read from the constant so a future change
+  // to the production default doesn't drift this runner. Operator
+  // can override via `--threshold` for ROC sweeps / tuning.
+  let threshold = DEFAULT_CRITIQUE_CONFIG.threshold;
   // `0` is a legitimate operator choice (engine treats it as
   // "watchdog disabled"). Spec line 525 default is 3000ms; the
   // runner's default bumps to 30s because real network calls

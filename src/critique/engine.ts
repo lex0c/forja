@@ -26,8 +26,8 @@ import { stripAnsi } from '../sanitize/index.ts';
 import {
   CRITIQUE_MARKER_CLOSE,
   CRITIQUE_MARKER_OPEN,
-  CRITIQUE_SYSTEM_PROMPT_V1,
   DEFAULT_CRITIQUE_PROMPT_VERSION,
+  getCritiqueSystemPrompt,
   renderCritiqueUserMessage,
 } from './prompt.ts';
 import type {
@@ -227,10 +227,11 @@ export const runCritique = async (
   const promptVersion = options.promptVersion ?? DEFAULT_CRITIQUE_PROMPT_VERSION;
 
   const userMessage = renderCritiqueUserMessage(input);
+  const systemPrompt = getCritiqueSystemPrompt(promptVersion);
 
   const req: GenerateRequest = {
     model: provider.id,
-    system: CRITIQUE_SYSTEM_PROMPT_V1,
+    system: systemPrompt,
     messages: [{ role: 'user', content: userMessage }],
     max_tokens: maxTokens,
     // Determinism: the critic should produce the same opinion for

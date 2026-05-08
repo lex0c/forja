@@ -7,6 +7,7 @@ import {
   projectConfigPath,
   userConfigPath,
 } from '../../src/critique/config-loader.ts';
+import { DEFAULT_CRITIQUE_CONFIG } from '../../src/critique/index.ts';
 import type { Provider } from '../../src/providers/index.ts';
 import type { ModelEntry, ModelRegistry } from '../../src/providers/registry.ts';
 
@@ -103,9 +104,13 @@ describe('loadCritiqueConfig — empty layers', () => {
           registry: reg,
           env: { HOME: home },
         });
-        expect(result.config.mode).toBe('off');
-        expect(result.config.threshold).toBe(0.7);
-        expect(result.config.maxOverheadMs).toBe(3000);
+        // Read defaults from the constant rather than hardcoding —
+        // a future calibration that bumps threshold (e.g.
+        // post-real-eval to 0.85) shouldn't require this test
+        // to update separately.
+        expect(result.config.mode).toBe(DEFAULT_CRITIQUE_CONFIG.mode);
+        expect(result.config.threshold).toBe(DEFAULT_CRITIQUE_CONFIG.threshold);
+        expect(result.config.maxOverheadMs).toBe(DEFAULT_CRITIQUE_CONFIG.maxOverheadMs);
         expect(result.critiqueProvider).toBeNull();
         expect(result.warnings).toEqual([]);
       } finally {
@@ -256,7 +261,7 @@ threshold = 1.7
         registry: reg,
         env: { HOME: '/none' },
       });
-      expect(result.config.threshold).toBe(0.7); // default
+      expect(result.config.threshold).toBe(DEFAULT_CRITIQUE_CONFIG.threshold);
       expect(result.warnings[0]).toContain('threshold=1.7');
     } finally {
       rmSync(cwd, { recursive: true, force: true });
