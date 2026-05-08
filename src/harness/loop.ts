@@ -1919,6 +1919,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             failed: inv.failed,
             durationMs: inv.durationMs,
             ...(inv.denied === true ? { denied: true } : {}),
+            ...(inv.errorMessage !== undefined ? { errorMessage: inv.errorMessage } : {}),
           });
           return { toolResult: inv.toolResult, failed: inv.failed };
         };

@@ -239,15 +239,27 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // subject (some tools have no obvious one — todo_write etc.).
       // For denied, the subject is replaced by the policy reason if
       // surfaced via summary; absent that, drop the connector.
+      // For error, the subject (path / command) is preserved AND
+      // the summary (failure reason) is appended as `subject:
+      // summary` on the same line — operators get both the target
+      // and the cause without scrolling. When only one of subject /
+      // summary is present, the line falls back to that single
+      // value so a tool with no vocab subject (todo_write) still
+      // surfaces its error reason.
       // Treat empty-string subject as absent so a misbehaving producer
       // doesn't render a bare `└─ ` line.
       const sub = subContentConnector(caps);
+      const hasSubject = item.subject !== null && item.subject !== '';
       const subText =
         item.status === 'denied' && item.summary !== undefined
           ? item.summary
-          : item.subject !== null && item.subject !== ''
-            ? item.subject
-            : (item.summary ?? null);
+          : item.status === 'error' && item.summary !== undefined
+            ? hasSubject
+              ? `${item.subject}: ${item.summary}`
+              : item.summary
+            : hasSubject
+              ? item.subject
+              : (item.summary ?? null);
       // Sub-content uses `secondary` (SGR 90 bright-black, visibly
       // grey) rather than `dim` (SGR 2 faint, frequently invisible
       // in default xterm/i3 setups) so the operator can actually

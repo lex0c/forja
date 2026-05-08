@@ -440,11 +440,16 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
             : event.failed
               ? 'error'
               : 'done';
-        // Surface the engine's deny reason in the scrollback chip's
-        // sub-line. Without this, the operator sees "Denied" with no
-        // explanation — a strict default-deny policy looks like a
-        // bug, not a configured posture. The renderer routes
-        // `summary` to the `└─` connector for denied chips
+        // Surface the failure reason in the scrollback chip's
+        // sub-line. For denied: the engine's deny reason (or
+        // "rejected at confirmation prompt" when the user said no
+        // at the modal). For error: the harness's `errorMessage`
+        // (set by invokeTool for unknown tools, ToolError returns,
+        // or wrapped exceptions). Without this, the operator sees
+        // "Failed" / "Denied" with no explanation — a strict
+        // default-deny policy looks like a bug, and a tool error
+        // is just a path with no diagnosis. The renderer routes
+        // `summary` to the `└─` connector for non-done chips
         // (render/permanent.ts §4.1).
         let summary: string | undefined;
         if (status === 'denied' && tool?.decision !== undefined && tool.decision !== null) {
@@ -457,6 +462,8 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
             // choice — surface the choice instead.
             summary = 'rejected at confirmation prompt';
           }
+        } else if (status === 'error' && event.errorMessage !== undefined) {
+          summary = event.errorMessage;
         }
         state.tools.delete(event.toolUseId);
         out.push({
@@ -743,6 +750,12 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
             } else if (decision.kind === 'confirm') {
               summary = 'rejected at confirmation prompt';
             }
+          } else if (
+            status === 'error' &&
+            typeof inner.errorMessage === 'string' &&
+            inner.errorMessage.length > 0
+          ) {
+            summary = inner.errorMessage;
           }
           state.tools.delete(namespacedId);
           out.push({
