@@ -282,11 +282,22 @@ export interface LiveState {
   thinking: { startedAt: number; messageId: string } | null;
   // Self-critique pass live indicator (AGENTIC_CLI.md §5.4). Set by
   // `critique:start` (harness adapter translates `critique_started`)
-  // and cleared by `critique:end` (idem `critique_finished`). The
-  // composer reads this to render a chip during the up-to-3s
+  // and cleared by EITHER `critique:ask` (modal about to open —
+  // critic call is over, the wait is now on the operator) OR
+  // `critique:end` (idem `critique_finished`, when no modal opens).
+  // The composer reads this to render a chip during the up-to-3s
   // critic call — without it, the live region goes silent between
   // executor `assistant:end` and the modal opening, which is
   // indistinguishable from a hang.
+  //
+  // The clear at `critique:ask` is load-bearing for honesty:
+  // `critique_finished` only fires AFTER `confirmCritique` resolves,
+  // so leaving the chip up after the modal opens would have its
+  // elapsed counter tick across operator decision time. Operators
+  // would read "Reviewing… (45s)" while the critic call had
+  // actually completed in 2s and the remaining 43s was them
+  // reading the modal — and "still reviewing" is exactly the
+  // wrong UX cue when the surface is awaiting a human answer.
   //
   // `toolPlanWrites` mirrors the modal flag so the chip can
   // visually escalate when the proposal includes writes:true tool
@@ -1566,6 +1577,18 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // the operator looking", which `abort` captures more
       // strongly than `ignore` (proceeding blind) or `redo`
       // (re-running and possibly looping).
+      //
+      // We ALSO clear `state.critique` here. The chip's `startedAt`
+      // is the critic LLM call's start — at the point the modal
+      // opens, that call is already over and the remaining wait is
+      // on the operator. Letting the chip live past this point
+      // would have it tick across human decision time, reading
+      // "Reviewing… (45s)" when the actual critic call took 2s
+      // and the rest was the operator reading. The eventual
+      // `critique:end` (mapped from `critique_finished`, fired
+      // AFTER `confirmCritique` resolves) becomes a no-op for the
+      // chip since we already nulled it; that's intentional —
+      // both clear sites converge on the same end state.
       const options: ConfirmOption[] = [
         { key: '1', label: 'Ignore', value: 'ignore' },
         { key: '2', label: 'Redo with hint', value: 'redo' },
@@ -1583,6 +1606,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       return {
         state: {
           ...state,
+          critique: null,
           modal: {
             promptId: event.promptId,
             flavor: 'critique',

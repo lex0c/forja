@@ -386,6 +386,49 @@ describe('critique lifecycle (Slice D)', () => {
     expect(result.state.critique?.toolPlanWrites).toBe(true);
   });
 
+  test('critique:ask clears the chip — modal-open marks the critic call as done, wait shifts to operator', () => {
+    // Regression: the chip's `startedAt` is the critic LLM call's
+    // start. `critique_finished` (which maps to `critique:end`)
+    // fires AFTER the operator decides on the modal — so leaving
+    // the chip up past `critique:ask` would have its elapsed
+    // counter tick across human decision time. Clearing here
+    // keeps the live indicator honest about what's actually
+    // running.
+    const result = drive([{ type: 'critique:start', ts: 1_000, stepN: 2, toolPlanWrites: false }]);
+    expect(result.state.critique).not.toBeNull();
+    const after = applyEvent(result.state, {
+      type: 'critique:ask',
+      ts: 3_000,
+      promptId: 'p-crit-1',
+      issues: [{ message: 'something off', severity: 'medium', confidence: 0.9 }],
+    });
+    expect(after.state.critique).toBeNull();
+    // The modal still opens — the chip clear and the modal open
+    // are paired side effects of the same event, not alternatives.
+    expect(after.state.modal?.flavor).toBe('critique');
+  });
+
+  test('critique:end after critique:ask is a chip no-op (already cleared)', () => {
+    // The two clear sites (`ask` and `end`) converge on the same
+    // end state; the second clear must not throw / regress.
+    const afterAsk = drive([
+      { type: 'critique:start', ts: 1_000, stepN: 2, toolPlanWrites: false },
+      {
+        type: 'critique:ask',
+        ts: 3_000,
+        promptId: 'p-crit-2',
+        issues: [{ message: 'x', severity: 'low', confidence: 0.5 }],
+      },
+    ]);
+    expect(afterAsk.state.critique).toBeNull();
+    const afterEnd = applyEvent(afterAsk.state, {
+      type: 'critique:end',
+      ts: 9_000,
+      stepN: 2,
+    });
+    expect(afterEnd.state.critique).toBeNull();
+  });
+
   test('session:end clears a dangling critique chip (mid-critique abort)', () => {
     // Operator hits Ctrl+C while the critic call is still in
     // flight: the harness signal aborts before `critique_finished`
