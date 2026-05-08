@@ -21,7 +21,10 @@
 // no turn has run yet (fresh REPL boot, no `currentSessionId`),
 // surfaces a clear "no session yet" hint instead of an empty list.
 
-import { DEFAULT_CRITIQUE_CONFIG } from '../../../critique/index.ts';
+import {
+  DEFAULT_CRITIQUE_CONFIG,
+  DEFAULT_CRITIQUE_PROMPT_VERSION,
+} from '../../../critique/index.ts';
 import { type CritiqueRun, listCritiqueRunsBySession } from '../../../storage/index.ts';
 import { formatCost } from '../format.ts';
 import type { SlashCommand } from '../types.ts';
@@ -46,7 +49,16 @@ const renderConfigBlock = (
   const mode = c?.mode ?? DEFAULT_CRITIQUE_CONFIG.mode;
   const threshold = c?.threshold ?? DEFAULT_CRITIQUE_CONFIG.threshold;
   const maxOverheadMs = c?.maxOverheadMs ?? DEFAULT_CRITIQUE_CONFIG.maxOverheadMs;
-  const promptVersion = c?.promptVersion ?? DEFAULT_CRITIQUE_CONFIG.promptVersion ?? 'v1';
+  // promptVersion fallback chain: operator config →
+  // DEFAULT_CRITIQUE_CONFIG.promptVersion (currently undefined,
+  // see types.ts) → DEFAULT_CRITIQUE_PROMPT_VERSION. The last
+  // step is what the engine actually resolves to at runtime
+  // (engine.ts: `options.promptVersion ?? DEFAULT_CRITIQUE_PROMPT_VERSION`),
+  // so this command MUST mirror that or it lies to operators
+  // about which prompt is active. The previous hardcoded 'v1'
+  // fallback drifted the moment V2 became default.
+  const promptVersion =
+    c?.promptVersion ?? DEFAULT_CRITIQUE_CONFIG.promptVersion ?? DEFAULT_CRITIQUE_PROMPT_VERSION;
   const lines: string[] = [
     'critique config:',
     `  mode:             ${mode}`,

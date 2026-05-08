@@ -158,6 +158,7 @@ describe('/cost', () => {
 
 describe('/critique', () => {
   test('config-only sub-command shows mode/threshold/maxOverheadMs/promptVersion + provider', async () => {
+    const { DEFAULT_CRITIQUE_PROMPT_VERSION } = await import('../../../src/critique/index.ts');
     const ctx = makeCtx({
       baseConfig: {
         cwd: '/p',
@@ -172,7 +173,11 @@ describe('/critique', () => {
     expect(out).toContain('mode:             on_writes');
     expect(out).toContain('threshold:        0.85');
     expect(out).toContain('max_overhead_ms:  5000');
-    expect(out).toContain('prompt_version:   v1'); // default fallback
+    // Pinned via the constant so the displayed default tracks
+    // whatever the engine actually resolves to (V1 → V2 → ...).
+    // Hardcoding the literal would let /critique drift from the
+    // engine's runtime default again.
+    expect(out).toContain(`prompt_version:   ${DEFAULT_CRITIQUE_PROMPT_VERSION}`);
     expect(out).toContain('(executor: anthropic/sonnet-4-6)');
   });
 
@@ -181,13 +186,22 @@ describe('/critique', () => {
     // DEFAULT_CRITIQUE_CONFIG forces an explicit acknowledgment
     // here. Hardcoding the same values both in /critique and the
     // test would let them drift in lockstep silently.
-    const { DEFAULT_CRITIQUE_CONFIG } = await import('../../../src/critique/index.ts');
+    const { DEFAULT_CRITIQUE_CONFIG, DEFAULT_CRITIQUE_PROMPT_VERSION } = await import(
+      '../../../src/critique/index.ts'
+    );
     const result = await critiqueCommand.exec(['config'], makeCtx());
     if (result.kind !== 'ok') return;
     const out = (result.notes ?? []).join('\n');
     expect(out).toContain(`mode:             ${DEFAULT_CRITIQUE_CONFIG.mode}`);
     expect(out).toContain(`threshold:        ${DEFAULT_CRITIQUE_CONFIG.threshold.toFixed(2)}`);
     expect(out).toContain(`max_overhead_ms:  ${DEFAULT_CRITIQUE_CONFIG.maxOverheadMs}`);
+    // The displayed prompt_version MUST match what the engine
+    // would resolve to at runtime (engine.ts:
+    // `options.promptVersion ?? DEFAULT_CRITIQUE_PROMPT_VERSION`).
+    // Without this assertion, /critique drifted: it reported 'v1'
+    // for runs that actually used V2 after the calibration. Now
+    // pinned via the constant so a future bump propagates.
+    expect(out).toContain(`prompt_version:   ${DEFAULT_CRITIQUE_PROMPT_VERSION}`);
   });
 
   test('shows distinct critic provider when configured', async () => {
