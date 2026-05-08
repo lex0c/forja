@@ -338,3 +338,249 @@ Pull this when EITHER:
 **Spec reference:** `AGENTIC_CLI.md §16` ("Roda em CI.
 Comparação contra **golden traces** versionados. Mudou
 prompt do system? Roda eval. Regrediu? PR bloqueado.").
+
+---
+
+## Native structured output for compaction / critique / recap
+
+**Status:** noted while reviewing the M4 critique branch
+(2026-05-08). The contract slot exists
+(`Provider.generateConstrained`) but is unused by the harness
+paths that emit JSON-shaped output.
+
+**What it is:** three subsystems currently emit JSON between
+sentinel markers and parse the result with a custom parser.
+Failure rate observed in the M4 real-eval was ~5% (markers
+missing, malformed JSON, Unicode quotes in place of ASCII,
+etc.). Today's call sites:
+
+| Surface | Current mechanism | Reliability |
+|---|---|---|
+| Tool calls (`task`, `bash`, ...) | Native tool calling | Strong |
+| Compaction summary | Markers + JSON parse | Weak |
+| Critique output | Markers + JSON parse | Weak |
+| Recap render | Markers + parse | Weak |
+| Memory write proposals | Tool args | Strong |
+
+The marker convention was chosen for cross-provider uniformity
+at a time when JSON modes were patchy. Today every cloud
+provider in the registry has a native structured-output path:
+
+| Mechanism | Provider support | Guarantee |
+|---|---|---|
+| Tool calling with `input_schema` | Anthropic, OpenAI, Google | Strong (provider-validated) |
+| `response_format: json_object` | OpenAI, partial Anthropic | Medium (no types in schema) |
+| `response_schema` (JSON Schema) | Google, OpenAI Structured Outputs | Strong |
+| GBNF / EBNF grammar | llama.cpp, vLLM | Strong (token-level) |
+| Markers + parse | Any | Weak (best-effort) |
+
+When a parse fails today, the critique engine writes
+`strategy='failed'` to `critique_runs` and the run survives
+(engine is fail-soft). Compaction falls back to the
+deterministic summarizer when the marker close-tag is missing,
+so the operator silently loses the semantic summary.
+
+**Why deferred:**
+
+1. **Real-world failure rate is low under default config.**
+   5% sounds large until you remember that critique mode `off`
+   is the default. The failure envelope only matters for
+   opt-in `mode='always'` + long sessions. Compaction shares
+   the parser shape but is invoked rarely (per-trigger, not
+   per-step). Recap is on-demand. The blast radius today is
+   "audit-row noise + fallback to deterministic path", not
+   user-visible breakage.
+2. **Cross-provider abstraction is non-trivial.** Each
+   provider exposes structured output differently; a naive
+   wire-up would scatter provider conditionals into the
+   engine. The right shape is a schema-aware layer one step
+   above the `Provider` interface, accepting a JSON Schema
+   and routing to tool_use / response_format / response_schema
+   / GBNF, with a marker fallback for providers that lack any
+   constrained mode (older local models). Worth designing
+   once, not per call site.
+3. **Streaming + structured is still emerging.**
+   `generateConstrained` returns the full string at the end,
+   sacrificing streaming UX. Some providers already support
+   streaming structured output (Anthropic tool_use streaming,
+   OpenAI delta-mode structured outputs); bundling streaming
+   into the same design pass avoids two rewrites.
+
+**Pull-in signal:**
+
+Pull when EITHER:
+
+- A subsystem starts running `mode='always'` critique (or any
+  equivalent always-on JSON path) and `parse_failed` /
+  `markers_missing` audit rows accumulate enough to be visibly
+  noisy. The typed contract pays for itself within weeks at
+  that point.
+- A new subsystem is added that needs JSON-shaped LLM output
+  (planner emits structured plan, reviewer subagent emits
+  structured findings). Cheaper to ship the abstraction once
+  than to add a third marker-parser call site.
+
+**Concrete shape (when pulled):**
+
+```ts
+const tool: ProviderToolDef = {
+  name: 'emit_critique',
+  description: 'Emit your structured critique',
+  input_schema: {
+    type: 'object',
+    properties: {
+      issues: { type: 'array', items: { /* ... */ } },
+      overall_confidence: { type: 'number' },
+    },
+    required: ['issues', 'overall_confidence'],
+  },
+};
+const req: ConstrainedRequest = {
+  ...gen,
+  tools: [tool],
+  tool_choice: { type: 'tool', name: 'emit_critique' },
+};
+```
+
+**Estimated work:**
+
+- ~1 week — wire `generateConstrained` into the critique
+  engine, fallback to markers when the provider lacks a
+  structured mode.
+- +1 week — same for compaction.
+- +2 weeks — schema-aware abstraction above the provider
+  contract; route a single JSON Schema to tool_use /
+  response_format / response_schema / GBNF.
+- Test suite: per-provider conformance (output respects the
+  schema, not merely parses) + fallback semantics.
+
+**Comparison vs. status quo:**
+
+| | Markers + parse | Native structured |
+|---|---|---|
+| Provider effort | none (string interpreted) | provider enforces at token level |
+| Observed failure rate | ~5% | <1% |
+| Cost | same | same |
+| Vendor lock-in | none | per-provider feature mapping |
+| DX (engine code) | custom parser | typed contract |
+
+**Spec reference:** `PROVIDERS.md §3` (Provider contract),
+`CONTEXT_TUNING.md` (compaction), `AGENTIC_CLI.md §5.4` and
+`ORCHESTRATION.md §6` (critique), `RECAP.md`.
+
+---
+
+## Permission policy ergonomics
+
+**Status:** noted during the M4 critique branch review
+(2026-05-08). The permission engine is functionally complete;
+usability gaps surfaced repeatedly while running multi-step
+flows during the branch.
+
+**What it is:** the permission hierarchy (enterprise → user →
+project → session) and the YAML rule shape work, but the
+operator surface around them has friction. Six concrete pain
+points observed:
+
+a) **Discovery.** Operators don't know what permissions they
+need until they hit the modal. Typical session yields 10–30
+modals. Recurring workflows pay the cost on every restart.
+
+b) **No pattern recognition.** Approving `bash("npm test")`
+five times in one session does not surface a "promote to
+allowlist?" suggestion. Only the modal's
+"yes-allow-all-during-this-session" toggle exists, and it is
+volatile (lost on restart).
+
+c) **Visualization gaps.** `/perms` shows the merged policy
+but does not show: what was approved this session, the
+history of denials, or the practical diff between modes
+(`strict` vs `acceptEdits`).
+
+d) **Mode names are opaque.** `strict | acceptEdits | bypass`
+require reading `AGENTIC_CLI.md §8` to interpret. New
+operators have no inline hint.
+
+e) **Glob is fragile for shell.** `command_glob: 'rm *'`
+matches both `rm -rf /` (intended) and `git rm file.txt`
+(probably not intended). Bash's command space is semantically
+rich; text glob over the raw command string is a leaky
+abstraction.
+
+f) **Denial errors are unhelpful.** Tool denied → `ToolError`
+with a generic message to both the model and the operator.
+Neither sees which rule fired or which layer holds it.
+
+**Why deferred:**
+
+1. **Not a correctness gap.** Every pain point above is
+   friction, not a bug. The engine refuses what it should
+   refuse and allows what it should allow. Operators
+   tolerate the friction today because session count is
+   low and the team is small.
+2. **Adjacent subsystems should land first.** Pattern
+   learning (Tier 2 below) needs durable session-scoped
+   audit history that today only exists transiently. Tier 4
+   (AST-based bash matching) needs a shell-parser dependency
+   decision the codebase hasn't made yet.
+3. **Risk of incentivizing `bypass`.** Premature ergonomics
+   work that surfaces "easy approve" affordances without
+   first exposing the underlying policy can push operators
+   toward `bypass` mode, the opposite of the safety goal.
+   Order matters: discoverability before promotion.
+4. **Composes with sandbox.** Sandbox of tool execution is
+   the structural defense layer; ergonomics is the operator
+   layer above it. Doing ergonomics first means redoing some
+   of the surface once sandbox lands.
+
+**Pull-in signal:**
+
+Pull when EITHER:
+
+- A second operator joins the project and modal volume
+  becomes a complaint (the discovery pain compounds with
+  team size).
+- The session-history audit work referenced in `AUDIT.md`
+  lands, unblocking pattern learning without a new schema.
+- An incident is traced to a glob false-positive — Tier 4
+  becomes load-bearing the moment a permissive `*` rule
+  allows something the operator did not intend.
+
+**Tier breakdown (when pulled):**
+
+| Tier | Scope | Estimated work |
+|---|---|---|
+| 1 | Discoverability: `--explain-permissions`, modal cites matching rule + layer, `/perms why <tool>` | ~2 weeks |
+| 2 | Pattern learning (opt-in): N-approval prompt to promote, `--learn-mode`, `/perms suggestions` | ~3 weeks |
+| 3 | Policy templates: `safe-readonly`, `trusted-fullstack`, `ci-locked`; `agent init --template=<name>` | ~1 week |
+| 4 | AST-based bash matching; explicit relative-vs-absolute path glob semantics; rule composability (any-of / all-of) | ~2 weeks |
+| 5 | `/perms diff session`, `/perms commit` (promote session-allowlist to project layer with confirm), `/perms revert` | ~1 week |
+
+**Trade-offs:**
+
+- **Pro:** UX value per engineer-day is high; zero
+  architectural risk (pure surface work).
+- **Pro:** Reduces modal fatigue, so operators leave strict
+  mode on rather than defaulting to bypass.
+- **Pro:** Pattern learning is a positive safety layer
+  (visibility into accumulated session approvals).
+- **Pro:** Composes with sandbox-of-tool-execution as
+  defense in depth.
+- **Con:** Policy UX is a known-difficult design space;
+  rolling Tier 2 without a thoughtful flow can backfire
+  (auto-promote surprises).
+- **Con:** Risk of pushing operators toward `bypass` if the
+  "fast path" is too prominent.
+
+**Mitigations to bake into the design when pulled:**
+
+- `--no-auto-promote` flag for operators who want the modal
+  flow as-is.
+- Every promote action requires explicit confirm; never
+  silent.
+- Tier 2 reads from durable audit, not in-memory state, so
+  suggestions survive restarts and can be reviewed offline.
+
+**Spec reference:** `AGENTIC_CLI.md §8` (permissions),
+`SECURITY_GUIDELINE.md` (threat model), `AUDIT.md` (session
+history that pattern learning would consume).
