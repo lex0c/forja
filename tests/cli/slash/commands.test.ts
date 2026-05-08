@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { budgetCommand } from '../../../src/cli/slash/commands/budget.ts';
 import { clearCommand } from '../../../src/cli/slash/commands/clear.ts';
 import { costCommand } from '../../../src/cli/slash/commands/cost.ts';
+import { critiqueCommand } from '../../../src/cli/slash/commands/critique.ts';
 import { buildHelpCommand } from '../../../src/cli/slash/commands/help.ts';
 import { modelCommand } from '../../../src/cli/slash/commands/model.ts';
 import { permsCommand, renderPolicy } from '../../../src/cli/slash/commands/perms.ts';
@@ -151,6 +152,191 @@ describe('/cost', () => {
     // Second line is the breakdown — tree-glyph prefix matches the
     // existing scrollback aesthetic for nested info.
     expect(result.notes?.[1]).toMatch(/^└─ critique: \$0\.1200/);
+  });
+});
+
+describe('/critique', () => {
+  test('config-only sub-command shows mode/threshold/maxOverheadMs/promptVersion + provider', async () => {
+    const ctx = makeCtx({
+      baseConfig: {
+        cwd: '/p',
+        provider: { id: 'anthropic/sonnet-4-6' },
+        critique: { mode: 'on_writes', threshold: 0.85, maxOverheadMs: 5000 },
+      } as unknown as HarnessConfig,
+    });
+    const result = await critiqueCommand.exec(['config'], ctx);
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const out = (result.notes ?? []).join('\n');
+    expect(out).toContain('mode:             on_writes');
+    expect(out).toContain('threshold:        0.85');
+    expect(out).toContain('max_overhead_ms:  5000');
+    expect(out).toContain('prompt_version:   v1'); // default fallback
+    expect(out).toContain('(executor: anthropic/sonnet-4-6)');
+  });
+
+  test('config falls back to defaults when [critique] is not set', async () => {
+    const result = await critiqueCommand.exec(['config'], makeCtx());
+    if (result.kind !== 'ok') return;
+    const out = (result.notes ?? []).join('\n');
+    expect(out).toContain('mode:             off');
+    expect(out).toContain('threshold:        0.70');
+    expect(out).toContain('max_overhead_ms:  3000');
+  });
+
+  test('shows distinct critic provider when configured', async () => {
+    const ctx = makeCtx({
+      baseConfig: {
+        cwd: '/p',
+        provider: { id: 'anthropic/sonnet-4-6' },
+        critiqueProvider: { id: 'anthropic/haiku-4-5' },
+      } as unknown as HarnessConfig,
+    });
+    const result = await critiqueCommand.exec(['config'], ctx);
+    if (result.kind !== 'ok') return;
+    const out = (result.notes ?? []).join('\n');
+    expect(out).toContain('critic provider:  anthropic/haiku-4-5');
+    expect(out).not.toContain('(executor:');
+  });
+
+  test('"no session yet" when currentSessionId is null', async () => {
+    const result = await critiqueCommand.exec([], makeCtx());
+    if (result.kind !== 'ok') return;
+    const out = (result.notes ?? []).join('\n');
+    expect(out).toContain('no session yet');
+  });
+
+  test('lists recent runs newest-first with aggregate when session has critique rows', async () => {
+    const ctx = makeCtx();
+    const session = createSession(ctx.db, {
+      cwd: '/p',
+      model: 'mock/m',
+    });
+    const { recordCritiqueRun } = await import('../../../src/storage/index.ts');
+    // Three runs: clean, warning_ignored, warning_redo. Aggregate
+    // should count each code, total cost should sum, and the
+    // listing order is newest-first (step 3 → 2 → 1).
+    recordCritiqueRun(ctx.db, {
+      sessionId: session.id,
+      stepN: 1,
+      mode: 'always',
+      strategy: 'llm',
+      decision: 'no_modal',
+      code: 'critique.clean',
+      rawCount: 0,
+      filteredCount: 0,
+      overallConfidence: 0.95,
+      durationMs: 1100,
+      costUsd: 0.001,
+      toolPlanWrites: false,
+      promptVersion: 'v1',
+      threshold: 0.7,
+    });
+    recordCritiqueRun(ctx.db, {
+      sessionId: session.id,
+      stepN: 2,
+      mode: 'always',
+      strategy: 'llm',
+      decision: 'ignore',
+      code: 'critique.warning_ignored',
+      rawCount: 2,
+      filteredCount: 1,
+      overallConfidence: 0.5,
+      durationMs: 2200,
+      costUsd: 0.002,
+      toolPlanWrites: false,
+      promptVersion: 'v1',
+      threshold: 0.7,
+    });
+    recordCritiqueRun(ctx.db, {
+      sessionId: session.id,
+      stepN: 3,
+      mode: 'always',
+      strategy: 'llm',
+      decision: 'redo',
+      code: 'critique.warning_redo',
+      rawCount: 1,
+      filteredCount: 1,
+      overallConfidence: 0.3,
+      durationMs: 1500,
+      costUsd: 0.003,
+      toolPlanWrites: true,
+      promptVersion: 'v1',
+      threshold: 0.7,
+    });
+    const ctxWithSession = makeCtx({
+      db: ctx.db,
+      currentSessionId: () => session.id,
+    });
+    const result = await critiqueCommand.exec([], ctxWithSession);
+    if (result.kind !== 'ok') return;
+    const out = (result.notes ?? []).join('\n');
+    expect(out).toContain('recent runs (3 of 3):');
+    // Newest first.
+    const step3 = out.indexOf('step 3');
+    const step2 = out.indexOf('step 2');
+    const step1 = out.indexOf('step 1');
+    expect(step3).toBeGreaterThan(-1);
+    expect(step3).toBeLessThan(step2);
+    expect(step2).toBeLessThan(step1);
+    // Writes flag rendered for step 3 (the only writes:true row).
+    expect(out).toMatch(/step 3.*\[writes\]/);
+    expect(out).toMatch(/step 1.*\[text\]/);
+    // Aggregate by code.
+    expect(out).toContain('aggregate (3 runs');
+    expect(out).toContain('critique.warning_ignored:1');
+    expect(out).toContain('critique.warning_redo:1');
+    expect(out).toContain('critique.clean:1');
+  });
+
+  test('limit argument caps the list size', async () => {
+    const ctx = makeCtx();
+    const session = createSession(ctx.db, {
+      cwd: '/p',
+      model: 'mock/m',
+    });
+    const { recordCritiqueRun } = await import('../../../src/storage/index.ts');
+    for (let i = 1; i <= 5; i++) {
+      recordCritiqueRun(ctx.db, {
+        sessionId: session.id,
+        stepN: i,
+        mode: 'always',
+        strategy: 'llm',
+        decision: 'no_modal',
+        code: 'critique.clean',
+        rawCount: 0,
+        filteredCount: 0,
+        overallConfidence: 0.9,
+        durationMs: 1000,
+        costUsd: 0.001,
+        toolPlanWrites: false,
+        promptVersion: 'v1',
+        threshold: 0.7,
+      });
+    }
+    const ctxWithSession = makeCtx({
+      db: ctx.db,
+      currentSessionId: () => session.id,
+    });
+    const result = await critiqueCommand.exec(['2'], ctxWithSession);
+    if (result.kind !== 'ok') return;
+    const out = (result.notes ?? []).join('\n');
+    // "(2 of 5)" — 5 total, 2 shown.
+    expect(out).toContain('recent runs (2 of 5):');
+  });
+
+  test('non-numeric limit produces a clean error', async () => {
+    const result = await critiqueCommand.exec(['10foo'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('invalid limit');
+  });
+
+  test('rejects more than one argument', async () => {
+    const result = await critiqueCommand.exec(['1', '2'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('at most one argument');
   });
 });
 
