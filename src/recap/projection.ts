@@ -278,15 +278,40 @@ const resolveSessions = (db: DB, scope: RecapScopeOption): Session[] => {
   }
 };
 
+// Pull the operator-authored prose out of a `messages.content`
+// value. String content (the common shape — operator typed a
+// prompt at the REPL) returns verbatim. Block-array content
+// (multimodal turns, tool_result echoes, providers that
+// always emit blocks) collects every `type:'text'` block whose
+// trimmed body is non-empty and joins them with a newline.
+//
+// The "non-empty after trim" filter is load-bearing: a leading
+// empty / whitespace-only text block (which the Anthropic SDK
+// occasionally emits when a turn opens with attachments) used
+// to silence the real prompt because the projection took
+// `extractTextBlocks(...)[0]` and stopped. Same surface bit
+// the model with image-first multimodal turns. Joining all
+// non-empty blocks instead of picking just the first
+// guarantees no operator prose gets dropped.
+const extractUserPromptText = (content: unknown): string => {
+  if (typeof content === 'string') return content;
+  return extractTextBlocks(content)
+    .filter((t) => t.trim().length > 0)
+    .join('\n');
+};
+
 const projectGoal = (bundles: readonly SessionBundle[]): { text: string; sourceStepId: string } => {
   // M4.1 goal_stack table does not exist yet; fallback per RECAP.md
   // §5 row "goal.text" is the first user message of the earliest
-  // session in scope.
+  // session in scope. "First" here means "first user message whose
+  // text content is non-empty" — a turn that carries only an
+  // image / only tool_result blocks falls through to the next
+  // user message instead of producing an empty goal that hides
+  // the real prompt below.
   for (const b of bundles) {
     for (const m of b.messages) {
       if (m.role !== 'user') continue;
-      const text =
-        typeof m.content === 'string' ? m.content : (extractTextBlocks(m.content)[0] ?? '');
+      const text = extractUserPromptText(m.content);
       if (text.length > 0) {
         return { text, sourceStepId: m.id };
       }

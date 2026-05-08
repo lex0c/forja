@@ -117,6 +117,107 @@ describe('projectRecap', () => {
     expect(out.goal.sourceStepId).toBe(userId);
   });
 
+  test('goal extraction skips leading empty / whitespace-only text blocks', () => {
+    // Regression: extractTextBlocks(...)[0] silenced the real
+    // prompt when a turn opened with an empty text block (which
+    // the Anthropic SDK can emit on multimodal turns or when an
+    // attachment slot precedes prose). The projection now
+    // filters out empty/whitespace blocks before picking the
+    // goal text.
+    const s = seedSession();
+    const userMsg = appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: [
+        { type: 'text', text: '' },
+        { type: 'text', text: '  ' },
+        { type: 'text', text: 'review the queue handler for races' },
+      ],
+      createdAt: 1_100,
+    });
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.goal.text).toBe('review the queue handler for races');
+    expect(out.goal.sourceStepId).toBe(userMsg.id);
+  });
+
+  test('goal extraction picks up text after a leading image block (multimodal turn)', () => {
+    // Multimodal turn: image attachment first, prose second.
+    // extractTextBlocks already filtered non-text blocks, but
+    // the first text block could still be empty depending on
+    // how the provider chunked. The combined fix is: walk all
+    // text blocks, drop empties, take what remains.
+    const s = seedSession();
+    const userMsg = appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: [
+        // Image-shaped block — extractTextBlocks ignores it.
+        {
+          type: 'image',
+          source: { type: 'base64', media_type: 'image/png', data: '...' },
+        },
+        { type: 'text', text: 'what does this trace tell us?' },
+      ],
+      createdAt: 1_100,
+    });
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.goal.text).toBe('what does this trace tell us?');
+    expect(out.goal.sourceStepId).toBe(userMsg.id);
+  });
+
+  test('goal joins multiple non-empty text blocks with a newline', () => {
+    // Some provider shapes split prose across two text blocks
+    // (e.g. turn re-injection on resume). Without joining, the
+    // recap loses everything past the first block. Joining
+    // preserves the operator's full prompt; the renderer's
+    // oneLine() collapses newlines back to "; " for the human
+    // surface.
+    const s = seedSession();
+    const userMsg = appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: [
+        { type: 'text', text: 'first part of the prompt' },
+        { type: 'text', text: 'continuation with extra context' },
+      ],
+      createdAt: 1_100,
+    });
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.goal.text).toBe('first part of the prompt\ncontinuation with extra context');
+    expect(out.goal.sourceStepId).toBe(userMsg.id);
+  });
+
+  test('goal falls through to the next user message when a turn carries only non-text blocks', () => {
+    // A turn whose content has no text blocks at all (e.g. a
+    // tool_result-only message from auto-rehydrate, or a future
+    // image-only turn) should not anchor the goal to itself.
+    // Walk to the next user message that does carry prose.
+    const s = seedSession();
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu-x', content: '{"ok":true}' }],
+      createdAt: 1_100,
+    });
+    const userMsg = appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'now refactor the queue',
+      createdAt: 1_200,
+    });
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.goal.text).toBe('now refactor the queue');
+    expect(out.goal.sourceStepId).toBe(userMsg.id);
+  });
+
   test('aggregates files_read, files_written, commands_run', () => {
     const s = seedSession();
     const userId = addUserTurn(s.id, 'do stuff');
