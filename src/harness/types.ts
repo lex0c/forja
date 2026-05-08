@@ -550,21 +550,33 @@ export const MAX_CONCURRENT_SUBAGENTS_CAP = 8;
 
 // Why the loop stopped. `done` is the only success path; everything else
 // is the harness intervening for safety or budget reasons.
-export type ExitReason =
-  | 'done' // model emitted text without tool_use
-  | 'maxSteps'
-  | 'maxWallClockMs'
-  | 'maxOutputTokens' // provider truncated the response at max_tokens
-  | 'maxCostUsd' // running cumulative cost crossed budget.maxCostUsd
-  | 'maxToolErrors'
-  | 'degenerateLoop'
-  | 'stepStalled' // provider stream silent for `maxStepStallMs` mid-step
-  | 'aborted' // user cancelled via signal
-  | 'providerError' // unrecoverable provider failure (network, 4xx)
-  | 'internalError' // uncaught throw in the harness path (typically SQLite)
-  | 'scriptExhausted' // mock provider drained — only seen in tests
-  | 'userPromptBlocked' // a UserPromptSubmit hook refused this turn
-  | 'critiqueAborted'; // operator chose `abort` from a self-critique modal
+//
+// Single source of truth — the runtime tuple is the canonical list and
+// `ExitReason` derives from it. Consumers that need a runtime allowlist
+// (eval YAML loader, future audit replay, telemetry filters) MUST
+// import `EXIT_REASONS` instead of hand-rolling their own mirror; that
+// pattern silently drifts when a new reason is added (the loader's
+// inline list missed `stepStalled` and then `critiqueAborted` until
+// this refactor — both bypassed compile-time coverage because the
+// loader cast `as <inline-union>` instead of `as ExitReason`).
+export const EXIT_REASONS = [
+  'done', // model emitted text without tool_use
+  'maxSteps',
+  'maxWallClockMs',
+  'maxOutputTokens', // provider truncated the response at max_tokens
+  'maxCostUsd', // running cumulative cost crossed budget.maxCostUsd
+  'maxToolErrors',
+  'degenerateLoop',
+  'stepStalled', // provider stream silent for `maxStepStallMs` mid-step
+  'aborted', // user cancelled via signal
+  'providerError', // unrecoverable provider failure (network, 4xx)
+  'internalError', // uncaught throw in the harness path (typically SQLite)
+  'scriptExhausted', // mock provider drained — only seen in tests
+  'userPromptBlocked', // a UserPromptSubmit hook refused this turn
+  'critiqueAborted', // operator chose `abort` from a self-critique modal
+] as const;
+
+export type ExitReason = (typeof EXIT_REASONS)[number];
 
 export interface HarnessConfig {
   provider: Provider;

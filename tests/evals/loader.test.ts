@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { EXIT_REASONS } from '../../src/harness/types.ts';
 import { loadEvalCase, parseEvalCase } from '../../src/evals/loader.ts';
 
 const minimal = `
@@ -369,6 +370,60 @@ expect:
     const c = parseEvalCase(yaml, '/tmp/c.yaml');
     expect(c.setup?.files?.['src/nested/file.txt']).toBe('ok');
     expect(c.setup?.files?.['config.json']).toBe('{}');
+  });
+
+  test('parses exit_reason: critiqueAborted (regression — was rejected before the loader allowlist read EXIT_REASONS)', () => {
+    // Regression: src/harness/types.ts grew critiqueAborted as part of
+    // the M4 critique work but the loader's inline allowlist drifted
+    // out of sync, blocking eval YAML from asserting the new exit
+    // shape. Now both consumers read EXIT_REASONS, so this stays
+    // covered automatically.
+    const yaml = `
+name: x
+prompt: y
+expect:
+  - exit_reason: critiqueAborted
+`;
+    const c = parseEvalCase(yaml, '/tmp/c.yaml');
+    expect(c.expect[0]).toEqual({ kind: 'exit_reason', reason: 'critiqueAborted' });
+  });
+
+  test('parses exit_reason: stepStalled (same drift class — was also missing from the loader allowlist)', () => {
+    const yaml = `
+name: x
+prompt: y
+expect:
+  - exit_reason: stepStalled
+`;
+    const c = parseEvalCase(yaml, '/tmp/c.yaml');
+    expect(c.expect[0]).toEqual({ kind: 'exit_reason', reason: 'stepStalled' });
+  });
+
+  test('every ExitReason is accepted by the loader (exhaustive over EXIT_REASONS)', () => {
+    // Meta-test: pins the invariant that the parser's allowlist
+    // matches the harness's source of truth. Adding a new ExitReason
+    // automatically extends this assertion — no manual mirror to
+    // update, no silent drift.
+    for (const reason of EXIT_REASONS) {
+      const yaml = `
+name: x
+prompt: y
+expect:
+  - exit_reason: ${reason}
+`;
+      const c = parseEvalCase(yaml, '/tmp/c.yaml');
+      expect(c.expect[0]).toEqual({ kind: 'exit_reason', reason });
+    }
+  });
+
+  test('rejects unknown exit_reason value', () => {
+    const yaml = `
+name: x
+prompt: y
+expect:
+  - exit_reason: bogusReason
+`;
+    expect(() => parseEvalCase(yaml, '/tmp/c.yaml')).toThrow(/exit_reason must be one of/);
   });
 
   test('rejects compaction_triggered with unknown strategy', () => {

@@ -20,6 +20,7 @@ export {
 } from './retry.ts';
 export {
   DEFAULT_BUDGET,
+  EXIT_REASONS,
   type ExitReason,
   type HarnessConfig,
   type HarnessEvent,
