@@ -15,6 +15,123 @@ Format:
 
 ---
 
+## [2026-05-08] m4/recap slice (a) — projection + schema + recap_runs repo
+
+Branch `feat/m4-recap` off `develop`. First slice of M4.1 (RECAP.md
+§12). Recap is a *projected view* over SQLite — deterministic by
+design, schema-bound, no LLM in the critical path. Slice (a) lands
+the projection layer + audit table; renderers (slice b), slash
+commands (slice c), and eval smoke (slice d) follow on the same
+branch.
+
+**Done:**
+
+- **Migration 030 — `recap_runs`.** Audit table for `/recap`
+  invocations themselves (RECAP.md §6.3). Captures `scope_kind`
+  (CHECK-bound to the §3 vocabulary), `session_ids` (JSON array;
+  cardinality 1 for session_*/pre_compact, N for day/range),
+  `renderer`, `used_llm`, `output_path`, `created_at`. No FK on
+  `session_ids` — a recap that referenced a since-purged session
+  is still a real historical event we want to keep. Indexed on
+  `created_at DESC` for the dominant "most recent runs" query.
+- **Repo `src/storage/repos/recap-runs.ts`.** `recordRecapRun`,
+  `getRecapRun`, `listRecentRecapRuns(limit=50)`. Defensive parse
+  on `session_ids` JSON: malformed payload surfaces as `[]` (mirrors
+  `subagent-outputs.ts:58-69` pattern) so audit listings cannot
+  crash on corruption.
+- **Type schema `src/recap/types.ts`.** Full `RecapIntermediate`
+  per RECAP.md §3 — every field always present (empty arrays /
+  empty strings on absence; the spec line "ausência viola schema"
+  is a hard rule). `RECAP_SCHEMA_VERSION = 'v1'` exported as a
+  pinning anchor for future producer/consumer skew detection.
+- **Projection function `src/recap/projection.ts`.** Pure
+  `(db, scope) → RecapIntermediate`. Resolves `session_current`,
+  `session_specific`, `pre_compact`, `day`, `range`. Aggregates from
+  the tables that exist today (sessions, messages, tool_calls,
+  approvals, checkpoints, subagent_outputs, memory_events) and
+  emits `[]` for fields whose source tables are not yet built
+  (`goal_stack`, `pinned_context`, `errors` from `failure_events`,
+  `not_done` from playbook reports). The shape is fixed today so
+  consumers can pin against it.
+- **Test coverage.** `tests/storage/recap-runs.test.ts` (6 tests):
+  insert/read, JSON round-trip, listing order/cap, CHECK rejection,
+  used_llm round-trip, defensive corruption parse.
+  `tests/recap/projection.test.ts` (19 tests): empty session shape,
+  goal extraction, files_read/written aggregation, commands_run,
+  incomplete-session flag, finalized session, decision filtering
+  (user/hook surface; policy auto-allow filtered; explicit denies
+  surface), test-runner heuristic, token/cost aggregation,
+  checkpoints, subagent children with payload summary,
+  `memory_events.action='proposed'` projection, trailing-question
+  extraction, determinism (same input → same output), day-window
+  filter, range-window filter, multi-model blank, step-limit
+  truncation in `session_current`, error paths (unknown session,
+  malformed date).
+
+**Decisions:**
+
+- **`recap_cache` deferred to slice / milestone M4.2.** Spec §8.3
+  designs cache keyed on `scope_hash`. Cache only earns its keep
+  when there's a slow path to amortize — that is the LLM renderer
+  (M4.2). M4.1's deterministic renderer is ~10ms; caching it adds
+  invalidation surface without latency win. Migration is a one-line
+  add when M4.2 lands.
+- **`/recap pre-compact` accepted as scope discriminator now,
+  wired later.** §3 schema includes `pre_compact` in the
+  `scope.kind` enum. Plumbing the value through projection today
+  is a no-cost shape preservation — the actual pre-compact view
+  needs Context Engine integration which lives elsewhere.
+- **`unresolvedQuestions` extracted via trailing-`?` heuristic.**
+  Spec §3 says "extraídas de assistant messages com explicit `?`".
+  Implemented as: walk text blocks of assistant messages, split on
+  sentence terminators, surface trailing-`?` segments. Bounded
+  3-per-message / 5-per-scope so a brainstorm turn cannot bloat the
+  schema-bound array. Conservative on purpose — false positives
+  pollute the recap; renderers cannot un-show them.
+- **`linesAdded` / `linesRemoved` / `filesAffected` emit 0 for now.**
+  Computing real line deltas requires `git diff` against
+  `checkpoints.git_ref`, which means external system access in the
+  projection path. Out of scope for slice (a) — the schema field
+  stays present (per §3 "always-present" rule) so consumers can
+  pin shape today. A follow-up wires the diff.
+- **Decisions filter: `user` + `hook` + explicit `deny`.** Pure
+  policy auto-allows are not decisions in the human sense — the
+  rule fired, no choice was made. Policy-driven *denies* DO
+  surface (a refused tool call is a meaningful negative decision
+  worth audit). User and hook approvals always surface regardless
+  of decision value (allow / deny / confirm_*).
+- **Test runner heuristic: explicit allowlist of patterns.** Match
+  the head of the command line (after trimStart + first-line slice)
+  against `bun test`, `npm/pnpm/yarn test`, `jest`, `vitest`,
+  `pytest`, `cargo test`, `go test`, `mvn test`, `gradle test`. A
+  missed runner shows up under `commands_run` anyway; a false
+  positive lies to the reader about what validated the change.
+
+**Pending:**
+
+- Slice (b) — renderers `human` + `json` (deterministic
+  template-based; LLM render is M4.2).
+- Slice (c) — slash commands `/recap`, `/recap session <id>`,
+  `/recap json`.
+- Slice (d) — eval smoke fixtures (5 sessions, golden outputs;
+  PR-blocking fidelity per RECAP.md §11.3).
+- **Diff-aware `linesAdded` / `linesRemoved`.** Wire `git diff`
+  against `checkpoints.git_ref` so the renderer can show real
+  deltas. Follow-up on this branch or a successor.
+- **Spec amendment for `recap_cache` deferral.** Optional spec PR
+  noting that M4.2 owns the cache table, not M4.1. Low-priority —
+  the §12 roadmap already implies this ordering.
+
+**Next:** slice (b) renderers, same branch. Determinism test
+fixtures from slice (a) feed the golden-output tests.
+
+**Verification:** `bun test` 3751 pass / 0 fail / 10 skip ·
+`bun run typecheck` clean · `bun run lint` clean (the one
+pre-existing `tests/harness/abortable.test.ts` suppression
+warning predates this branch).
+
+---
+
 ## [2026-05-07] "Awaiting model" indicator + heartbeat tick during quiet provider waits
 
 Operator-reported follow-up to the non-done bypass: even with the
