@@ -177,6 +177,15 @@ export type ToolStartEvent = BaseEvent & {
   // One-line subject under `└─ `; null when args don't carry the
   // expected field (renderer drops the connector line).
   subject: string | null;
+  // Optional grouping id (`subagentId` for tool calls fired
+  // inside a subagent run). When set, the renderer indents the
+  // chip and swaps its glyph to a nesting marker (`|_`) so the
+  // operator visually attributes nested tool calls to their
+  // owner. Top-level tool calls (parent harness) leave this
+  // absent. Carried verbatim from `tool:start` through the
+  // active-tool record into the `PermanentItem` so the chip
+  // renderer can read it back at end time without re-deriving.
+  parentId?: string;
 };
 export type ToolDeltaEvent = BaseEvent & {
   type: 'tool:delta';

@@ -15,6 +15,105 @@ Format:
 
 ---
 
+## [2026-05-07] indent subagent-owned tool chips under their owner
+
+Slice 2 of the subagent-tool-visibility arc. Slice 1 made
+subagent inner `tool_invoking`/`tool_finished` produce
+permanent chips; this slice gives the chips their visual
+hierarchy. A `parentId` field threads from the adapter through
+the state reducer onto the renderer, which swaps the leading
+glyph from `·` to `|_`, indents the chip + its sub-content by
+2sp, and drops the leading-blank separator so a burst of
+nested chips reads as one block under their owner.
+
+**Done:**
+
+- `src/tui/events.ts` — `ToolStartEvent` gains optional
+  `parentId`. Comment documents intent (today: subagentId;
+  future: nested tool groups).
+- `src/tui/state.ts` — `ActiveTool` carries optional
+  `parentId`; `PermanentItem` of `kind: 'tool-end'` mirrors
+  it. Reducer's `tool:start` branch threads
+  `event.parentId` onto the active record using the same
+  `...(x !== undefined ? { x } : {})` spread idiom the rest
+  of the file already uses for optional fields, so existing
+  test fixtures that build `ActiveTool` records directly
+  stay valid without per-record annotations. Reducer's
+  `tool:end` branch reads it back and stamps it on the
+  PermanentItem.
+- `src/tui/harness-adapter.ts` — subagent `tool_invoking`
+  case now sets `parentId: event.subagentId` and drops the
+  `[sub <id8>]` subject prefix that slice 1 added. The
+  indent IS the attribution signal — carrying both was
+  noisy.
+- `src/tui/render/permanent.ts` — new `CHIP_NESTED_GLYPH`
+  constant (`|_`, intentionally identical in unicode and
+  ascii so the nesting affordance survives ASCII fallback).
+  `tool-end` case branches on `item.parentId !== undefined`:
+  picks the nest glyph, prepends a 2sp indent before BOTH
+  the chip head and its `└─ subject` connector, and skips
+  the leading blank that separates top-level chips. Status
+  palette (dim/error/warn) applies identically regardless of
+  nesting.
+
+**Tests:**
+
+- `tests/tui/render/permanent.test.ts` — 4 new cases:
+  nested chip emits no leading blank + `|_` glyph + indented
+  sub-content; ASCII path also uses `|_` (consistency
+  pinned); nested chip with no subject emits ONLY the head
+  line (no orphan connector); nested error chip keeps the
+  error palette + nest glyph (status independence pinned).
+- `tests/tui/state.test.ts` — 2 new cases: parentId flows
+  through ActiveTool onto the tool-end PermanentItem;
+  top-level chips emit `parentId: undefined` (not null) so
+  the renderer's gate reads correctly — guards a future
+  regression that might always-write `null`.
+- `tests/tui/harness-adapter.test.ts` — slice 1's
+  expectation rewritten: subject is now the raw vocab
+  output (no `[sub …]` prefix) and `parentId` carries the
+  full subagentId.
+
+**Verification:** `bun test` 3663 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean (2 pre-existing
+unrelated warnings).
+
+**Behavioral payoff:**
+
+Before slice 2 (slice 1 only):
+```
+· Read in 0.2s
+└─ [sub deadbeef] src/foo.ts
+```
+Operator scans a sea of `·` chips and reads the `[sub …]`
+tag to know which child owned each one.
+
+After slice 2:
+```
+  |_ Read in 0.2s
+  └─ src/foo.ts
+  |_ Read in 0.3s
+  └─ src/bar.ts
+```
+The 2sp indent + `|_` glyph signals "child of the line
+above" without requiring the operator to parse subject
+prefixes. The block reads as a contiguous unit because the
+leading-blank separator drops between siblings of the same
+parent.
+
+**Pending — explicit follow-up (next slice on this branch):**
+
+- **Slice 3 (read coalescing):** renderer-side fold of
+  consecutive same-tool finishes within a single step into a
+  single `Read [N files] (Ts, Xtok)` summary chip. Needs the
+  fold to be aware of `parentId` so a subagent's batch reads
+  as one nested summary rather than coalescing across the
+  parent/child boundary.
+
+**Next:** branch is mergeable; slice 3 rides on top.
+
+---
+
 ## [2026-05-07] surface subagent tool calls as permanent scrollback chips
 
 A subagent doing real work used to surface as a single live

@@ -38,6 +38,14 @@ export interface ActiveTool {
   // tool's vocab entry has no extractor or args don't match the
   // expected shape — renderer drops the connector entirely.
   subject: string | null;
+  // Grouping id propagated from `tool:start.parentId` (today: the
+  // subagent id, when the tool fired inside a subagent run).
+  // Absent for top-level tool calls. Read back by the tool-end
+  // reducer branch so the resulting PermanentItem carries the
+  // same attribution into the renderer. Optional so existing
+  // test fixtures that build ActiveTool records directly stay
+  // valid without per-record null annotations.
+  parentId?: string;
   startedAt: number;
   // Last few lines of streaming output. Capped so a tool that emits
   // a megabyte of stdout doesn't bloat the live region — the full
@@ -408,6 +416,11 @@ export type PermanentItem =
       status: 'done' | 'error' | 'denied';
       durationMs: number;
       summary?: string;
+      // Set when this tool fired inside a parent (subagent today;
+      // future: nested tool groups). Renderer indents the chip and
+      // swaps the leading glyph to `|_` so the chip visually
+      // belongs to its owner. Absent for top-level tool calls.
+      parentId?: string;
     }
   | { kind: 'error'; message: string }
   | { kind: 'warn'; message: string }
@@ -697,6 +710,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
         activeVerb: event.activeVerb,
         finalVerb: event.finalVerb,
         subject: event.subject,
+        ...(event.parentId !== undefined ? { parentId: event.parentId } : {}),
         startedAt: event.ts,
         preview: [],
       };
@@ -729,6 +743,7 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
         status: event.status,
         durationMs: event.durationMs,
         ...(event.summary !== undefined ? { summary: event.summary } : {}),
+        ...(tool.parentId !== undefined ? { parentId: tool.parentId } : {}),
       };
       return { state: { ...state, activeTools: next }, permanent: [item] };
     }

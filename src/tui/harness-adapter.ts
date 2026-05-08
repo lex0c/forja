@@ -642,13 +642,12 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         //     prefix the parent's `state.tools` map would
         //     overwrite). The reducer + renderer treat the
         //     prefixed id as opaque.
-        //   - subject is prefixed `[sub <id8>] ` so the operator
-        //     can attribute the chip to a child even when two
-        //     subagents and the parent are issuing tools
-        //     interleaved. Slice-2 grouping (`|_` indent under a
-        //     subagent header) is a follow-up; this slice keeps
-        //     the chip flat with explicit attribution.
-        const subTag = `[sub ${event.subagentId.slice(0, 8)}]`;
+        //   - parentId is set to the subagentId so the renderer
+        //     indents the chip with `|_` and the operator can
+        //     visually attribute nested tools to their owner.
+        //     Slice-1 used a `[sub <id8>]` subject prefix instead;
+        //     slice 2 (this) drops that prefix in favor of the
+        //     indent, since carrying both is noisy.
         if (
           inner.type === 'tool_invoking' &&
           typeof inner.toolUseId === 'string' &&
@@ -656,13 +655,12 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         ) {
           const namespacedId = `sub:${event.subagentId}:${inner.toolUseId}`;
           const vocab = lookupToolVocab(inner.toolName);
-          let baseSubject: string | null = null;
+          let subject: string | null = null;
           try {
-            baseSubject = vocab.subject?.(inner.args) ?? null;
+            subject = vocab.subject?.(inner.args) ?? null;
           } catch {
-            baseSubject = null;
+            subject = null;
           }
-          const subject = baseSubject !== null ? `${subTag} ${baseSubject}` : subTag;
           state.tools.set(namespacedId, { name: inner.toolName, decision: null });
           out.push({
             type: 'tool:start',
@@ -672,6 +670,7 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
             activeVerb: vocab.activeVerb,
             finalVerb: vocab.finalVerb,
             subject,
+            parentId: event.subagentId,
           });
         }
         if (inner.type === 'tool_decided' && typeof inner.toolUseId === 'string') {

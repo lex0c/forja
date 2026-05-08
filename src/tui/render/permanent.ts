@@ -20,6 +20,22 @@ import { visualWidth } from './width.ts';
 // statuses; status is communicated by the verb ('Failed' vs the
 // per-tool finalVerb) plus color (error / dim).
 const CHIP_FINAL_GLYPH = { unicode: '·', ascii: '*' } as const;
+// Glyph used in place of CHIP_FINAL_GLYPH when a tool-end has a
+// `parentId` — visually marks the chip as nested inside its
+// parent (today: a subagent run). `|_` reads as "branch from
+// the line above" in both Unicode and ASCII; using a separate
+// distinct sequence rather than a fancy box-drawing arrow keeps
+// the visual clear under both `caps.unicode === true` (most
+// terminals) and the ASCII fallback (CI logs, dumb terminals,
+// `--no-unicode`).
+const CHIP_NESTED_GLYPH = '|_';
+// Indent prefix for nested chips and their sub-content, applied
+// AFTER frame padding — keeps the chip glyph aligned with the
+// frame's left rail and just shifts the content. Two spaces is
+// the minimum visual nesting that survives narrow terminals;
+// deeper nesting (subagent inside subagent) is uncommon enough
+// that we don't add a per-level multiplier yet.
+const CHIP_NESTED_INDENT = '  ';
 
 // Override the per-tool finalVerb when the tool didn't succeed.
 // Spec UI.md §4.10.5: error → `Exited 1 in 2.1s`, denied → `Denied`.
@@ -182,16 +198,27 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
     }
     case 'tool-end': {
       // UI.md §4.10.5 — chip glyph + verb (status-aware) + duration.
-      // `· <verb> in <duration>` for Unicode; '* <verb> in <duration>'
-      // for ASCII. Color: dim for done, error palette for failed,
-      // warn palette for denied.
-      const glyph = caps.unicode ? CHIP_FINAL_GLYPH.unicode : CHIP_FINAL_GLYPH.ascii;
+      // `· <verb> in <duration>` for top-level chips,
+      // `  |_ <verb> in <duration>` for nested chips
+      // (`item.parentId` set, today: tool fired inside a subagent).
+      // Color: dim for done, error palette for failed, warn palette
+      // for denied — applied identically regardless of nesting.
+      const nested = item.parentId !== undefined;
+      const glyph = nested
+        ? CHIP_NESTED_GLYPH
+        : caps.unicode
+          ? CHIP_FINAL_GLYPH.unicode
+          : CHIP_FINAL_GLYPH.ascii;
+      // Indent prefix only on nested chips. Applied BEFORE the
+      // glyph so the visual hierarchy reads "[indent][nest-glyph]
+      // verb" — the indent IS the attribution signal.
+      const indent = nested ? CHIP_NESTED_INDENT : '';
       const verb = finalVerbFor(item.status, item.verb);
       const ms =
         item.durationMs >= 1000
           ? `${(item.durationMs / 1000).toFixed(1)}s`
           : `${item.durationMs}ms`;
-      const headRaw = `${glyph} ${verb} in ${ms}`;
+      const headRaw = `${indent}${glyph} ${verb} in ${ms}`;
       const head =
         item.status === 'error'
           ? paint(caps, 'error', headRaw)
@@ -202,8 +229,12 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // own "session" block; the operator scrolls and sees each tool
       // (chip + sub-content) as a self-contained unit instead of a
       // wall of contiguous chips. Sub-content stays tight under the
-      // chip (it's the chip's "subsession").
-      const lines = ['', head];
+      // chip (it's the chip's "subsession"). Nested chips skip the
+      // leading blank so a burst of subagent-owned chips reads as a
+      // visually contiguous block under their owner instead of a
+      // gap-separated list — matches the "child of the line above"
+      // affordance that `|_` already signals.
+      const lines = nested ? [head] : ['', head];
       // Sub-content (subject) under the connector. Skipped when no
       // subject (some tools have no obvious one — todo_write etc.).
       // For denied, the subject is replaced by the policy reason if
@@ -221,8 +252,12 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // grey) rather than `dim` (SGR 2 faint, frequently invisible
       // in default xterm/i3 setups) so the operator can actually
       // read the subject — same rationale as the session-footer
-      // `Cogitated for X` marker (UI.md §6.1).
-      if (subText !== null) lines.push(paint(caps, 'secondary', `${sub}${subText}`));
+      // `Cogitated for X` marker (UI.md §6.1). Nested chips indent
+      // the sub-content too so the connector lines under the nest
+      // glyph stay visually tied to the nested chip head.
+      if (subText !== null) {
+        lines.push(paint(caps, 'secondary', `${indent}${sub}${subText}`));
+      }
       return lines.map(padFrame);
     }
     case 'error':

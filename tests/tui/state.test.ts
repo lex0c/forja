@@ -419,6 +419,55 @@ describe('tool lifecycle', () => {
     expect(item.subject).toBe('/foo');
   });
 
+  test('parentId from tool:start flows through ActiveTool onto the tool-end item', () => {
+    // Slice 2 plumbing: when the adapter sets parentId on a
+    // subagent-owned tool:start, the reducer carries it on the
+    // ActiveTool record and emits it on the tool-end PermanentItem
+    // so the renderer can pick the nested glyph + indent. A
+    // regression that lost the field anywhere in the pipeline
+    // would render the chip as if it were top-level.
+    const result = drive([
+      {
+        type: 'tool:start',
+        ts: 1,
+        toolId: 'sub:abc:t1',
+        name: 'read_file',
+        activeVerb: 'Reading file',
+        finalVerb: 'Read file',
+        subject: '/foo.ts',
+        parentId: 'abc',
+      },
+      { type: 'tool:end', ts: 100, toolId: 'sub:abc:t1', status: 'done', durationMs: 5 },
+    ]);
+    const item = result.permanent[0];
+    if (item?.kind !== 'tool-end') throw new Error('expected tool-end');
+    expect(item.parentId).toBe('abc');
+  });
+
+  test('top-level tool:start (no parentId) emits a tool-end without the parentId field', () => {
+    // The optional-field shape is load-bearing for existing
+    // top-level chips: the renderer's `item.parentId !== undefined`
+    // gate must read undefined, not null, when no parent is
+    // declared. A regression that always wrote `parentId: null`
+    // on the PermanentItem would silently render every top-level
+    // chip with the nest glyph.
+    const result = drive([
+      {
+        type: 'tool:start',
+        ts: 1,
+        toolId: 't1',
+        name: 'bash',
+        activeVerb: 'Executing',
+        finalVerb: 'Executed',
+        subject: 'ls',
+      },
+      { type: 'tool:end', ts: 50, toolId: 't1', status: 'done', durationMs: 5 },
+    ]);
+    const item = result.permanent[0];
+    if (item?.kind !== 'tool-end') throw new Error('expected tool-end');
+    expect(item.parentId).toBeUndefined();
+  });
+
   test('null subject from adapter survives the round-trip onto tool-end', () => {
     const result = drive([
       {

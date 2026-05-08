@@ -392,6 +392,92 @@ describe('formatPermanent', () => {
       expect(out[2]).toBe(pad('└─ /foo.ts'));
     });
 
+    test('nested (parentId set): no leading blank + |_ glyph + indented sub-content', () => {
+      // Slice 2: chips with parentId render under their owner
+      // (today: a subagent run). The leading blank that separates
+      // top-level chips drops — a burst of nested chips reads as
+      // one visual block under the parent rather than gap-
+      // separated siblings. The chip glyph swaps from `·` to `|_`
+      // and the sub-content connector indents to stay aligned
+      // with the nested chip head.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'read_file',
+          verb: 'Read file',
+          subject: '/foo.ts',
+          status: 'done',
+          durationMs: 200,
+          parentId: 'sub-abc',
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(2);
+      // Indent (2sp) between frame padding and the |_ glyph; subject
+      // line keeps the same indent so the connector lines up under
+      // the nested head.
+      expect(out[0]).toBe(pad('  |_ Read file in 200ms'));
+      expect(out[1]).toBe(pad('  └─ /foo.ts'));
+    });
+
+    test('nested chip in ASCII mode also uses |_ (consistent in both unicode and ascii)', () => {
+      // The nest glyph is the same string in unicode and ascii —
+      // `|_` reads as "branch from above" regardless of capability.
+      // Pinned so a future "fancy unicode arrow" refactor doesn't
+      // diverge the two paths and break the ASCII fallback.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'echo',
+          verb: 'Executed',
+          subject: 'hi',
+          status: 'done',
+          durationMs: 5,
+          parentId: 'sub-x',
+        },
+        ascii,
+      );
+      expect(out[0]).toBe(pad('  |_ Executed in 5ms'));
+    });
+
+    test('nested chip with no subject emits ONLY the head line (no orphan connector)', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'todo_write',
+          verb: 'Updated todos',
+          subject: null,
+          status: 'done',
+          durationMs: 5,
+          parentId: 'sub-y',
+        },
+        unicode,
+      );
+      expect(out).toEqual([pad('  |_ Updated todos in 5ms')]);
+    });
+
+    test('nested error chip keeps the error palette + |_ glyph', () => {
+      // Status palette is independent of nesting — a nested tool
+      // that failed still reads as red.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: null,
+          status: 'error',
+          durationMs: 5,
+          parentId: 'sub-z',
+        },
+        colored,
+      );
+      // Painted output starts with SGR red (palette 'error'). Just
+      // assert the visible substring — exact escape codes are
+      // verified elsewhere; the load-bearing thing here is that the
+      // glyph is `|_` with the indent under the painted segment.
+      expect(out[0]).toContain('|_ Failed in 5ms');
+    });
+
     test('done status with no subject emits blank + chip head only', () => {
       const out = formatPermanent(
         {

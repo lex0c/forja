@@ -1014,10 +1014,12 @@ describe('harness-adapter — subagent observability', () => {
     // toolId is namespaced so concurrent subagents can't clash.
     expect(start.toolId).toBe('sub:deadbeef-1234-5678-9abc-def012345678:tu-child-1');
     expect(start.name).toBe('read_file');
-    // Subject carries the [sub <id8>] prefix so the chip is
-    // attributable in mixed parent/child scrollback.
-    expect(start.subject).toContain('[sub deadbeef]');
-    expect(start.subject).toContain('src/foo.ts');
+    // Slice 2: parentId carries the subagentId so the renderer
+    // can indent the chip with `|_`. Subject stays the raw vocab
+    // extractor output (no `[sub …]` prefix — the indent is the
+    // attribution signal now).
+    expect(start.parentId).toBe('deadbeef-1234-5678-9abc-def012345678');
+    expect(start.subject).toBe('src/foo.ts');
   });
 
   test('subagent_progress tool_finished after tool_invoking → matched tool:end with same namespaced toolId', () => {
