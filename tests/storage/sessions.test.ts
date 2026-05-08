@@ -10,6 +10,7 @@ import {
   getSession,
   listChildSessions,
   listSessions,
+  listSessionsInRange,
   reclassifySessionStatus,
   reopenSession,
   updateSessionCost,
@@ -501,5 +502,73 @@ describe('sessions repo', () => {
       .query<{ is_subagent: number }, [string]>('SELECT is_subagent FROM sessions WHERE id = ?')
       .get(child.id);
     expect(raw?.is_subagent).toBe(1);
+  });
+
+  describe('listSessionsInRange', () => {
+    test('returns sessions whose started_at is in [start, end), oldest-first', () => {
+      const a = createSession(db, { model: 'm', cwd: '/p', startedAt: 100 });
+      const b = createSession(db, { model: 'm', cwd: '/p', startedAt: 200 });
+      const c = createSession(db, { model: 'm', cwd: '/p', startedAt: 300 });
+      void c;
+      const out = listSessionsInRange(db, { start: 100, end: 250 });
+      expect(out.map((s) => s.id)).toEqual([a.id, b.id]);
+    });
+
+    test('upper bound is exclusive (end=200 excludes a session at 200)', () => {
+      createSession(db, { model: 'm', cwd: '/p', startedAt: 100 });
+      const at200 = createSession(db, { model: 'm', cwd: '/p', startedAt: 200 });
+      void at200;
+      const out = listSessionsInRange(db, { start: 100, end: 200 });
+      expect(out.map((s) => s.startedAt)).toEqual([100]);
+    });
+
+    test('filters by cwd', () => {
+      const inProj = createSession(db, { model: 'm', cwd: '/p', startedAt: 100 });
+      const elsewhere = createSession(db, { model: 'm', cwd: '/elsewhere', startedAt: 150 });
+      void elsewhere;
+      const out = listSessionsInRange(db, { start: 50, end: 500, cwd: '/p' });
+      expect(out.map((s) => s.id)).toEqual([inProj.id]);
+    });
+
+    test('hides children unless includeSubagents is true', () => {
+      const parent = createSession(db, { model: 'm', cwd: '/p', startedAt: 100 });
+      createSession(db, {
+        model: 'm',
+        cwd: '/p',
+        startedAt: 110,
+        parentSessionId: parent.id,
+      });
+      const topOnly = listSessionsInRange(db, { start: 0, end: 1_000, cwd: '/p' });
+      expect(topOnly.map((s) => s.id)).toEqual([parent.id]);
+      const all = listSessionsInRange(db, {
+        start: 0,
+        end: 1_000,
+        cwd: '/p',
+        includeSubagents: true,
+      });
+      expect(all).toHaveLength(2);
+    });
+
+    test('does NOT silently cap when more than 500 sessions exist (the listSessions trap)', () => {
+      // The bug this function fixes: the previous projection.ts
+      // path did `listSessions(limit:500).filter(time)`, which
+      // dropped older windows once the project crossed 500
+      // sessions. Insert 600 sessions and verify the SQL
+      // predicate finds the oldest one in its day.
+      for (let i = 0; i < 600; i += 1) {
+        createSession(db, {
+          model: 'm',
+          cwd: '/p',
+          startedAt: 1_000 + i,
+        });
+      }
+      const earliest = listSessionsInRange(db, {
+        start: 1_000,
+        end: 1_001,
+        cwd: '/p',
+      });
+      expect(earliest).toHaveLength(1);
+      expect(earliest[0]?.startedAt).toBe(1_000);
+    });
   });
 });

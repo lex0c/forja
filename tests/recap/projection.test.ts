@@ -383,6 +383,36 @@ describe('projectRecap', () => {
     });
   });
 
+  test('day scope finds older sessions even when 500+ exist (no silent cap)', () => {
+    // Regression: an earlier draft used
+    // `listSessions(limit:500).filter(date)` which silently
+    // dropped older day windows once the project crossed 500
+    // sessions. The fix uses `listSessionsInRange` which filters
+    // in SQL, so the predicate is exact regardless of project
+    // size.
+    const targetDay = Date.UTC(2024, 0, 15, 12, 0, 0);
+    const target = createSession(db, {
+      model: 'sonnet',
+      cwd: '/proj',
+      startedAt: targetDay,
+    });
+    completeSession(db, target.id, 'done', 0, true, targetDay + 1_000);
+    // 600 newer sessions on a different day to exhaust the old cap.
+    const newerDayBase = Date.UTC(2024, 1, 1, 12, 0, 0);
+    for (let i = 0; i < 600; i += 1) {
+      const s = createSession(db, {
+        model: 'sonnet',
+        cwd: '/proj',
+        startedAt: newerDayBase + i,
+      });
+      completeSession(db, s.id, 'done', 0, true, newerDayBase + i + 100);
+    }
+    const out = projectRecap(db, {
+      scope: { kind: 'day', cwd: '/proj', date: '2024-01-15' },
+    });
+    expect(out.scope.sessionIds).toEqual([target.id]);
+  });
+
   test('range scope filters by start/end window', () => {
     const a = createSession(db, { model: 'sonnet', cwd: '/proj', startedAt: 100 });
     const b = createSession(db, { model: 'sonnet', cwd: '/proj', startedAt: 200 });

@@ -59,14 +59,13 @@ From the M4.1 self-review; commits `99a4f35`..`483dc45` plus the
 `c569c01` follow-up landed #1 (audit-comment fix) and #6
 (`listChildSessions` perf). Remaining items, by review id:
 
-- **#2 — day/range silent cap at 500.** `resolveSessions` for
-  `day` / `range` calls
-  `listSessions(db, {cwd, limit:500})` then filters in JS by
-  `startedAt`. A project with ≥500 sessions silently misses
-  older windows. Not user-visible today (M4.3 surfaces these
-  scopes); MUST land before M4.3 wires the slash command.
-  Solution: `listSessionsInRange(db, cwd, start, end)` doing
-  the filter in SQL.
+- ~~**#2 — day/range silent cap at 500.**~~ **Resolved.**
+  Added `listSessionsInRange(db, {start,end,cwd?,
+  includeSubagents?})` to the sessions repo (SQL-side
+  half-open `[start, end)` predicate, oldest-first); swapped
+  `resolveSessions` over to it. Regression test seeds 600
+  sessions and verifies the projection still finds an older
+  day window. 6 new tests (5 repo, 1 projection regression).
 - **#3 — `costs.durationMs` is summed across multi-session.**
   Three parallel 1h sessions on the same day render as `(3h)`
   in the day-scope title. For day / range the right answer is

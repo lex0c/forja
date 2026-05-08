@@ -267,6 +267,58 @@ export const listChildSessions = (db: DB, parentSessionId: string): Session[] =>
   return rows.map(fromRow);
 };
 
+export interface ListSessionsInRangeOptions {
+  // Half-open `[start, end)` interval on `started_at`, epoch ms.
+  // Inclusive lower bound, exclusive upper bound — matches how
+  // recap's `dayBoundsUtc` builds day windows
+  // (`Date.UTC(...) ` to `+24h`), so a session started at exactly
+  // midnight UTC belongs to that day, not the next.
+  start: number;
+  end: number;
+  cwd?: string;
+  includeSubagents?: boolean;
+}
+
+// Sessions whose `started_at` falls in `[start, end)`, optionally
+// filtered by `cwd`. Used by `/recap day` / `/recap range` so the
+// time predicate is applied in SQL — filtering AFTER a `LIMIT`
+// (the listSessions trap) silently misses older windows once a
+// project crosses the cap.
+//
+// Ordered oldest-first to match the recap projection's canonical
+// chronological reading; consumers that want newest-first can
+// reverse client-side. The (`started_at`, `seq`) tiebreak mirrors
+// `listSessions` so two sessions started in the same millisecond
+// resolve deterministically.
+//
+// `is_subagent = 0` is the default filter (same discipline as
+// `listSessions`): cross-session recap should not surface
+// orphaned children unless an explicit `includeSubagents:true`
+// asks for them. The (status, started_at) and (cwd, started_at)
+// indexes cover the common variants; the predicate-only-on-
+// started_at variant uses the cwd-prefixed index when `cwd` is
+// supplied and falls back to a scan in the full-table case.
+export const listSessionsInRange = (db: DB, options: ListSessionsInRangeOptions): Session[] => {
+  const filters: string[] = ['started_at >= ?', 'started_at < ?'];
+  const params: (string | number)[] = [options.start, options.end];
+  if (options.cwd !== undefined) {
+    filters.push('cwd = ?');
+    params.push(options.cwd);
+  }
+  if (options.includeSubagents !== true) {
+    filters.push('is_subagent = 0');
+  }
+  const rows = db
+    .query(
+      `SELECT id, started_at, ended_at, model, cwd, status, total_cost_usd, usage_complete, parent_session_id, is_subagent, abort_cause
+       FROM sessions
+       WHERE ${filters.join(' AND ')}
+       ORDER BY started_at ASC, seq ASC`,
+    )
+    .all(...params) as SessionRow[];
+  return rows.map(fromRow);
+};
+
 export const completeSession = (
   db: DB,
   id: string,

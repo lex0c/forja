@@ -7,7 +7,7 @@ import {
   type Session,
   getSession,
   listChildSessions,
-  listSessions,
+  listSessionsInRange,
 } from '../storage/repos/sessions.ts';
 import { getSubagentOutput } from '../storage/repos/subagent-outputs.ts';
 import { type ToolCall, listToolCallsByMessage } from '../storage/repos/tool-calls.ts';
@@ -179,18 +179,21 @@ const resolveSessions = (db: DB, scope: RecapScopeOption): Session[] => {
     }
     case 'day': {
       const { start, end } = dayBoundsUtc(scope.date);
-      // listSessions filters by cwd at the SQL layer; we apply the
-      // ts window in JS since listSessions doesn't accept a time
-      // range yet (and adding one is a separate refactor we do not
-      // want to fold into the recap slice). Cap at a generous 500 —
-      // an order of magnitude beyond a heavy workday — so a runaway
-      // does not OOM the projection.
-      const all = listSessions(db, { cwd: scope.cwd, limit: 500 });
-      return all.filter((s) => s.startedAt >= start && s.startedAt < end);
+      // Time predicate applied in SQL via `listSessionsInRange` —
+      // the prior `listSessions(limit:500).filter(...)` shape
+      // would silently miss older day windows once a project
+      // crossed the cap. The `[start, end)` interval matches the
+      // half-open day boundary `dayBoundsUtc` produces.
+      return listSessionsInRange(db, { start, end, cwd: scope.cwd });
     }
     case 'range': {
-      const all = listSessions(db, { cwd: scope.cwd, limit: 500 });
-      return all.filter((s) => s.startedAt >= scope.start && s.startedAt < scope.end);
+      // Operator-supplied range; trust the bounds as-is. Same
+      // SQL-side filter rationale as `day` above.
+      return listSessionsInRange(db, {
+        start: scope.start,
+        end: scope.end,
+        cwd: scope.cwd,
+      });
     }
   }
 };
