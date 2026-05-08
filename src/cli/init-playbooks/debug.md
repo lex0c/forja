@@ -15,7 +15,6 @@ budget:
 slash: debug
 when_to_use: "bug with a reproducible symptom; user describes the failure and needs the root cause isolated, not just a patch"
 sampling:
-  temperature: 0.1
   max_tokens: 4096
 context_recipe:
   step_reflection: terse

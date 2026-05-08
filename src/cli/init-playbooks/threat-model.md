@@ -8,7 +8,6 @@ budget:
 slash: threat-model
 when_to_use: "new component or attack surface being introduced; pre-design or pre-deploy of a feature touching auth, sensitive data, or trust boundary"
 sampling:
-  temperature: 0.2
   max_tokens: 8192
   thinking_budget: 4096
   seed_in_eval: true

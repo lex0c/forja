@@ -8,7 +8,6 @@ budget:
 slash: explain
 when_to_use: "question about how/why something works; user wants a structured mental model, not a fix or change"
 sampling:
-  temperature: 0.2
   max_tokens: 4096
 context_recipe:
   step_reflection: terse
