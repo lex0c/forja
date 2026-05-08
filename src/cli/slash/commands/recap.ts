@@ -9,10 +9,12 @@
 //   /recap json            → current session, raw intermediate
 //   /recap json session <id> → specific session, raw intermediate
 //
-// Every invocation writes a `recap_runs` audit row (RECAP.md §6.3)
-// so anomalous use (a runaway script, an unexpected scope) is
-// detectable. The row is recorded regardless of whether the
-// projection succeeded — a failed lookup is itself audit-worthy.
+// Every successful invocation writes a `recap_runs` audit row
+// (RECAP.md §6.3) so anomalous use (a runaway script, an unexpected
+// scope) is detectable. Parse errors and projection failures
+// (unknown session id) deliberately do NOT write a row — those
+// never consumed audit-worthy resources, and recording them would
+// inflate the anomaly-detection signal with operator typos.
 //
 // Other forms from RECAP.md §1 (`/recap day`, `/recap range`,
 // `/recap pre-compact`, `/recap pr|changelog|slack|terse`) wait on

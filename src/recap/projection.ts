@@ -3,7 +3,12 @@ import { listApprovalsByToolCall } from '../storage/repos/approvals.ts';
 import { listCheckpointsBySession } from '../storage/repos/checkpoints.ts';
 import { listMemoryEventsBySession } from '../storage/repos/memory-events.ts';
 import { type Message, listMessagesBySession } from '../storage/repos/messages.ts';
-import { type Session, getSession, listSessions } from '../storage/repos/sessions.ts';
+import {
+  type Session,
+  getSession,
+  listChildSessions,
+  listSessions,
+} from '../storage/repos/sessions.ts';
 import { getSubagentOutput } from '../storage/repos/subagent-outputs.ts';
 import { type ToolCall, listToolCallsByMessage } from '../storage/repos/tool-calls.ts';
 import {
@@ -373,13 +378,13 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
       }
     }
 
-    // Subagent children of this session. `parent_session_id` is
-    // the FK; orphans (parent purged) are excluded via the IDENTITY
-    // flag check inside listSessions's includeSubagents path.
-    const children = listSessions(db, {
-      includeSubagents: true,
-      limit: 500,
-    }).filter((s) => s.parentSessionId === b.session.id);
+    // Subagent children of this session. `listChildSessions` SQL-
+    // filters on `parent_session_id` and returns oldest-first, so
+    // the natural call order is preserved (operator reading the
+    // recap sees subagent[0] before subagent[1] as they were
+    // dispatched). Orphans (parent purged → parent_session_id NULL)
+    // are excluded structurally by the WHERE clause.
+    const children = listChildSessions(db, b.session.id);
     for (const child of children) {
       const payload = getSubagentOutput(db, child.id);
       let outputSummary = '';
