@@ -24,12 +24,25 @@ export type CritiqueRunDecision = 'ignore' | 'redo' | 'abort' | 'cancel' | 'no_m
 // union avoids dead-code drift; the prefix-filter convention is
 // documented in the spec line 552 comment and the migration's
 // schema commentary.
+//
+// `critique.aborted` is distinct from `critique.failed`:
+//   - `failed` = engine couldn't produce a parsed result (parser
+//     error, stream error, overhead exceeded — non-operator
+//     causes).
+//   - `aborted` = the run was interrupted by the caller signal
+//     (Ctrl+C, wall-clock cap) DURING the critic call. The
+//     critique didn't fail; the run did. Operators querying
+//     audit can filter by code to separate signal: "show me
+//     critic-side failures that need prompt tuning" vs. "show me
+//     runs the operator stopped mid-critique" are different
+//     analyses.
 export type CritiqueRunCode =
   | 'critique.warning_ignored'
   | 'critique.warning_redo'
   | 'critique.warning_abort'
   | 'critique.skipped'
   | 'critique.failed'
+  | 'critique.aborted'
   | 'critique.clean';
 
 export interface CritiqueRun {

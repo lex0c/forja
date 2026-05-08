@@ -37,8 +37,12 @@ export const migration031CritiqueRuns = {
   //   `critique.warning_ignored` — operator chose ignore.
   //   `critique.warning_redo` — operator chose redo.
   //   `critique.warning_abort` — operator chose abort or cancel.
-  //   `critique.skipped` — engine returned skipped.
-  //   `critique.failed` — engine returned failed.
+  //   `critique.skipped` — engine returned skipped (overhead).
+  //   `critique.failed` — engine returned failed (parse/stream).
+  //   `critique.aborted` — caller signal interrupted the critic
+  //     call mid-flight (Ctrl+C, wall-clock cap); distinct from
+  //     `failed` so audit can separate operator-driven aborts
+  //     from critic-side breakage.
   //   `critique.clean` — engine ran, no issues over threshold.
   //   Free-form TEXT (no CHECK) so future codes don't require a
   //   migration; eval covers the closed set.

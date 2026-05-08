@@ -802,5 +802,22 @@ describe('runAgent — critique soft-failure paths', () => {
     // Same partial cost the session total recovered.
     expect(finished.costUsd).toBeCloseTo(0.00011, 6);
     expect(finished.decision).toBe('no_modal');
+
+    // Audit row MUST also persist — the lifecycle event covers
+    // NDJSON external, but the DB row is what survives across
+    // process boundaries (replay, `/critique` audit). Without a
+    // row, `critique_runs` would silently drop entries precisely
+    // on operator-driven termination — the most forensically
+    // interesting cases.
+    const rows = listCritiqueRunsBySession(db, result.sessionId);
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    expect(row?.code).toBe('critique.aborted');
+    expect(row?.strategy).toBe('failed');
+    expect(row?.decision).toBe('no_modal');
+    expect(row?.reason).toBe('caller_aborted');
+    expect(row?.costUsd).toBeCloseTo(0.00011, 6);
+    expect(row?.filteredCount).toBe(0);
+    expect(row?.rawCount).toBe(0);
   });
 });

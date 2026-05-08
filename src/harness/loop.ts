@@ -9,9 +9,11 @@ import {
   type CritiqueAnswer,
   type CritiqueConfig,
   DEFAULT_CRITIQUE_CONFIG,
+  DEFAULT_CRITIQUE_PROMPT_VERSION,
   buildCritiqueInput,
   buildCritiqueToolPlan,
   renderCritiqueHint,
+  resolveCritiquePromptVersion,
   runCritique,
   shouldCritique,
   toolPlanHasWrites,
@@ -1689,6 +1691,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               // produce a parsed result); reason discriminates
               // abort from parse / stream / overhead failures so
               // audit consumers can tell them apart.
+              const abortDurationMs = Date.now() - critiqueStartMs;
               safeEmit(config.onEvent, {
                 type: 'critique_finished',
                 stepN: steps,
@@ -1696,11 +1699,49 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                 filteredCount: 0,
                 rawCount: 0,
                 overallConfidence: 0,
-                durationMs: Date.now() - critiqueStartMs,
+                durationMs: abortDurationMs,
                 costUsd: partialCost,
                 decision: 'no_modal',
                 reason: 'caller_aborted',
               });
+              // Persist the abort to `critique_runs` BEFORE the
+              // rethrow. Without this, the success path's
+              // recordCritiqueRun call below the rethrow never
+              // fires for aborted critiques, so the audit table
+              // loses rows precisely on the operator-driven
+              // termination cases — the lifecycle event flows
+              // through NDJSON external but the DB doesn't
+              // persist. Code is `critique.aborted` (distinct
+              // from `failed` so audit consumers can separate
+              // operator-driven aborts from critic-side
+              // breakage). Same try/catch fail-soft as the
+              // success path's recordCritiqueRun (line ~1750):
+              // a SQLite throw at audit time MUST NOT mask the
+              // run's actual outcome.
+              try {
+                recordCritiqueRun(config.db, {
+                  sessionId,
+                  stepN: steps,
+                  mode: critiqueCfg.mode === 'always' ? 'always' : 'on_writes',
+                  strategy: 'failed',
+                  decision: 'no_modal',
+                  code: 'critique.aborted',
+                  rawCount: 0,
+                  filteredCount: 0,
+                  overallConfidence: 0,
+                  durationMs: abortDurationMs,
+                  costUsd: partialCost,
+                  toolPlanWrites: planHasWrites,
+                  reason: 'caller_aborted',
+                  promptVersion: resolveCritiquePromptVersion(
+                    critiqueCfg.promptVersion ?? DEFAULT_CRITIQUE_PROMPT_VERSION,
+                  ),
+                  threshold: critiqueCfg.threshold,
+                });
+              } catch {
+                // Audit write failed; lifecycle event above still
+                // captured the data for live observers.
+              }
               throw e;
             }
 
