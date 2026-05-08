@@ -68,7 +68,11 @@ const make = () => {
 };
 
 describe('modal navigation preserves contents', () => {
-  test('initial ask renders title, subject, preview, options', () => {
+  test('initial ask renders context label, action, source attribution, options', () => {
+    // Modal redesign (design/permission-modal-redesign.md): title
+    // is now the per-tool context label ("Bash command"), the
+    // action lifts into its own block with breathing room, and
+    // option 2 promotes the matched rule.
     const s = make();
     void s.manager.askPermission({
       toolName: 'bash',
@@ -78,17 +82,19 @@ describe('modal navigation preserves contents', () => {
     });
     const out = s.rendered();
     expect(out).not.toBeNull();
-    // Title block.
-    expect(out).toContain('Run command');
-    expect(out).toContain('rm -rf ./build');
-    // Preview block.
+    // Title is the context label.
+    expect(out).toContain('Bash command');
+    // Action block.
     expect(out).toContain('$ rm -rf ./build');
     expect(out).toContain('cwd: /home/lex/forja');
     expect(out).toContain('matched rule: bash.rm.rf');
     // Options.
     expect(out).toContain('1. Yes');
-    expect(out).toContain('2. Yes, allow all bash during this session');
+    expect(out).toContain("2. Yes, don't ask again for: bash.rm.rf");
     expect(out).toContain('3. No');
+    // Footer reserves the slice 4-5 affordances.
+    expect(out).toContain('Tab to amend');
+    expect(out).toContain('Ctrl+E to explain');
     s.fs.dispatch(key('escape'));
   });
 
@@ -103,11 +109,13 @@ describe('modal navigation preserves contents', () => {
     s.fs.dispatch(key('up'));
     const after = s.rendered() ?? '';
     // All four blocks survive the navigation.
-    expect(after).toContain('Run command');
+    expect(after).toContain('Bash command');
     expect(after).toContain('$ rm -rf ./build');
     expect(after).toContain('1. Yes');
     expect(after).toContain('3. No');
     // Cursor moved from option 3 (No) to option 2 (session-allow).
+    // Without rule on this ask, option 2 falls back to the per-tool
+    // wording.
     expect(before).toMatch(/> 3\. No/);
     expect(after).toMatch(/> 2\. Yes, allow all bash during this session/);
     s.fs.dispatch(key('escape'));
@@ -124,8 +132,9 @@ describe('modal navigation preserves contents', () => {
     s.fs.dispatch(key('up')); // 1 → 0
     s.fs.dispatch(key('down')); // 0 → 1
     const out = s.rendered() ?? '';
-    expect(out).toContain('Run command');
+    expect(out).toContain('Editing file');
     expect(out).toContain('src/foo.ts');
+    // No-rule ask: option 2 falls back to per-tool wording.
     expect(out).toMatch(/> 2\. Yes, allow all edit_file during this session/);
     s.fs.dispatch(key('escape'));
   });
@@ -293,7 +302,9 @@ describe('per-flavor reducer option lists', () => {
     // D65 (UI.md §6.5): last option is the conservative default.
     expect(state.modal.selectedIndex).toBe(1);
     // AGENTS.md note appears in preview when present.
-    expect(state.modal.preview.some((l) => l.includes('AGENTS.md'))).toBe(true);
+    expect(
+      state.modal.preview.some((l) => (typeof l === 'string' ? l : l.text).includes('AGENTS.md')),
+    ).toBe(true);
   });
 
   test('memory:write:ask builds 2 options (yes / no), default = last; body is the preview', () => {
@@ -352,8 +363,14 @@ describe('per-flavor reducer option lists', () => {
     expect(state.modal.selectedIndex).toBe(2);
     // Preview: numbered steps + estimate footer.
     expect(state.modal.preview[0]).toBe('1. read foo');
-    expect(state.modal.preview.some((l) => l.includes('5 tool calls'))).toBe(true);
-    expect(state.modal.preview.some((l) => l.includes('$0.03'))).toBe(true);
+    expect(
+      state.modal.preview.some((l) =>
+        (typeof l === 'string' ? l : l.text).includes('5 tool calls'),
+      ),
+    ).toBe(true);
+    expect(
+      state.modal.preview.some((l) => (typeof l === 'string' ? l : l.text).includes('$0.03')),
+    ).toBe(true);
   });
 
   test('critique:ask builds 3 options (ignore/redo/abort), default = last; issues are the preview', () => {

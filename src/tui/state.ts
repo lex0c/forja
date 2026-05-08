@@ -16,6 +16,41 @@
 // functions.
 
 import type { SessionBannerEnvEntry, TodoItemForUI, UIEvent } from './events.ts';
+import { buildPermissionOptions } from './modal-manager.ts';
+
+// Bash family — every tool that's gated under `tools.bash` in the
+// policy file. The reducer's permission:ask case routes all four
+// to the same context label ("Bash command") and prefixes the
+// action with "$ ". Single source so a future rename / addition
+// can't drift between the label-decision and the prefix-decision.
+const BASH_FAMILY: ReadonlySet<string> = new Set([
+  'bash',
+  'bash_background',
+  'bash_output',
+  'bash_kill',
+]);
+
+// Map a tool name to the modal's context label. Replaces the older
+// "Run command" / "Subagent permission — <name>" titles with
+// per-category framing that matches reference designs (see
+// design/permission-modal-redesign.md). Subagent attribution is a
+// suffix the reducer adds; this helper only handles the per-tool
+// portion.
+const PERMISSION_CONTEXT_LABEL_BY_TOOL: Readonly<Record<string, string>> = {
+  bash: 'Bash command',
+  bash_background: 'Bash command',
+  bash_output: 'Bash command',
+  bash_kill: 'Bash command',
+  read_file: 'Accessing workspace:',
+  write_file: 'Editing file',
+  edit_file: 'Editing file',
+  glob: 'Searching workspace',
+  grep: 'Searching workspace',
+  fetch_url: 'Network access',
+};
+
+const contextLabelForTool = (toolName: string): string =>
+  PERMISSION_CONTEXT_LABEL_BY_TOOL[toolName] ?? 'Tool call';
 
 export interface InputState {
   // Current value of the input box (multi-line allowed via `\n`).
@@ -161,6 +196,18 @@ export interface ConfirmOption {
 // D5/D65 — last is conventionally the most conservative choice
 // (No/Reject/Skip), so Enter without navigating triggers the safe
 // outcome.
+// One line of modal preview. Plain strings paint dim (the default
+// for meta content); the object form lets a producer pick a
+// stronger paint token for a specific line. Used today by the
+// permission flavor:
+//   - `secondary` for source attribution ("matched rule: X
+//     (project policy)") so it breaks out of the dim baseline
+//   - `bold` for the action row ("$ rm -rf ./build") so the
+//     operator's eye lands on the command first
+// New tones land here when a future flavor needs them; the
+// renderer narrows on the discriminant.
+export type PreviewLine = string | { text: string; tone: 'secondary' | 'bold' };
+
 export interface ConfirmState {
   // ID assigned by the producer; threaded through `permission:ask` and
   // matched by `modal:answer` to resolve the right promise.
@@ -184,9 +231,15 @@ export interface ConfirmState {
   title: string;
   subject: string | null;
   // Tool-aware preview lines (diff for edit_file, command for bash,
-  // etc.). Producer formats them; renderer just emits between rules.
-  // Empty array → preview block omitted entirely.
-  preview: string[];
+  // etc.). Producer formats them; renderer paints each line dim by
+  // default. To paint a single line with a stronger token (e.g.,
+  // `secondary` for source attribution that must stand out from
+  // the surrounding context), wrap it as `{ text, tone }`. Empty
+  // array → preview block omitted entirely. Plain strings keep
+  // working — every existing producer (memory-write body,
+  // history-clear blast radius, etc.) continues to emit `string[]`
+  // and gets the dim default.
+  preview: readonly PreviewLine[];
   // Question in natural language ("Do you want to make this edit
   // to .gitignore?"). Optional — when absent, the title carries the
   // full question.
@@ -1241,85 +1294,115 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
     // Producer (modal-manager) is responsible for re-emitting if
     // multiple modals queue up; the reducer never queues itself.
     case 'permission:ask': {
-      // 3 options per UI.md §4.10.13: yes, session-allow, no.
-      // Default selectedIndex points to the last option (No) per
-      // D5/D65 — Enter without navigating triggers the safe choice.
-      // Esc returns 'cancel' (handled by manager, not in options
-      // list).
-      const options: ConfirmOption[] = [
-        { key: '1', label: 'Yes', value: 'yes' },
-        {
-          key: '2',
-          label: `Yes, allow all ${event.toolName} during this session`,
-          value: 'session-allow',
-          shortcut: 'shift+tab',
-        },
-        { key: '3', label: 'No', value: 'no' },
-      ];
-      const previewLines: string[] = [];
-      // Subagent attribution prefix (spec docs/spec/IPC.md §7).
-      // First line so the operator's eye lands on it before the
-      // command. Anti-spoof: only the agent's `name` (the
-      // definition's declared name from the agents/*.md
-      // frontmatter) reaches the preview — never a string the
-      // child generated. The 8-char sessionId tail disambiguates
-      // when multiple instances of the same agent run in parallel.
-      if (event.subagent !== undefined) {
-        const idTail = event.subagent.sessionId.slice(-8);
-        previewLines.push(`subagent: ${event.subagent.name} (${idTail})`);
-      }
-      previewLines.push(`$ ${event.command}`);
+      // Layout follows design/permission-modal-redesign.md. Three
+      // structural pieces:
+      //
+      //   1. Context label (was "title"+"subject"): per-tool framing
+      //      ("Bash command", "Editing file", "Network access"...).
+      //      Subagent attribution becomes a parenthesized suffix on
+      //      the same label — no separate "subagent:" preview line.
+      //   2. Action block (preview): blank line, action, blank line,
+      //      then conditional cwd + source attribution. The blank
+      //      lines around the action are load-bearing — they make
+      //      the action read as a deliberate decision instead of a
+      //      config row, matching reference terminal designs.
+      //   3. Options + footer: option 2's label promotes the matched
+      //      rule pattern ("Yes, don't ask again for: rm -rf *")
+      //      via buildPermissionOptions — same source the manager
+      //      uses for selection clamping, so labels and count can't
+      //      drift. Footer gains "Tab to amend" and
+      //      "Ctrl+E to explain" hints — handlers land in later
+      //      slices; the hint reservation pre-flows the footer.
+
+      const options = buildPermissionOptions(event.toolName, event.rule);
+
+      // Anti-spoof: only the agent's `name` (the definition's
+      // declared name from the agents/*.md frontmatter) reaches the
+      // label — never a string the child generated.
+      const baseLabel = contextLabelForTool(event.toolName);
+      const titleStr =
+        event.subagent !== undefined
+          ? `${baseLabel} (subagent: ${event.subagent.name})`
+          : baseLabel;
+
+      const previewLines: PreviewLine[] = [];
+      // Action block. Bash family carries the "$ " shell prefix; fs/
+      // web tools display the path/url verbatim. The 4-space lead
+      // (this stored line) + the renderer's 2-space indent = 6
+      // visible spaces, matching the design mockup's deeper indent.
+      // Bold paint highlights the command — operator's eye lands
+      // here first when triaging a confirm.
+      const actionPrefix = BASH_FAMILY.has(event.toolName) ? '$ ' : '';
+      previewLines.push('');
+      previewLines.push({
+        text: `    ${actionPrefix}${event.command}`,
+        tone: 'bold',
+      });
+      previewLines.push('');
+
+      // cwd: always shown for now — subagent-proxied asks land in a
+      // worktree path that's worth surfacing, and parent's own asks
+      // historically showed cwd too. Conditional rendering (hide on
+      // session-cwd match) is a future slice once we have access to
+      // the session cwd in the reducer.
       previewLines.push(`cwd: ${event.cwd}`);
+
+      // Source attribution lifts to the `secondary` paint so it
+      // visually breaks out of the dim baseline. Operator scanning
+      // a sea of confirms during a multi-step turn can find the
+      // YAML-edit hint without re-reading every line.
       if (event.rule !== undefined) {
-        // Append layer info alongside the rule so the operator
-        // sees which YAML to edit. 'default' renders as
-        // "(built-in default)" — distinguishes engine fallback
-        // from any layer-written rule. Unknown / absent layer
-        // omits the qualifier (modal degrades gracefully when
-        // source isn't available, e.g. subagent-proxied confirms
-        // before IPC marshals source).
         const layerLabel =
           event.layer === undefined
             ? ''
             : event.layer === 'default'
               ? ' (built-in default)'
               : ` (${event.layer} policy)`;
-        previewLines.push(`matched rule: ${event.rule}${layerLabel}`);
+        previewLines.push({
+          text: `matched rule: ${event.rule}${layerLabel}`,
+          tone: 'secondary',
+        });
       } else if (event.layer !== undefined && event.layer !== 'default') {
-        // Default-deny path: no rule matched, but a layer wrote
-        // the section that was consulted. Surface the layer alone
-        // so the operator knows where to add an allow rule. Skip
-        // 'default' since "no layer wrote the section" isn't
-        // useful operator info — the engine's default-deny is
-        // what matters and the question text already conveys it.
-        //
-        // Wording: "no rule matched in <layer> policy" reads as a
-        // status sentence; "policy: <layer>" alone leaves the
-        // operator wondering what "<layer>" refers to (a section
-        // name? a file?). The full sentence anchors the mental
-        // model: <layer> is a YAML, no rule in it matched, add
-        // one to allow.
-        previewLines.push(`no rule matched in ${event.layer} policy`);
+        previewLines.push({
+          text: `no rule matched in ${event.layer} policy`,
+          tone: 'secondary',
+        });
       }
+
+      // Trailing blank line before the option list. Without this,
+      // the source-attribution row visually fuses with option 1
+      // ("matched rule: X" + "1. Yes" read as a continuous block).
+      // The blank separates source attribution from the decision
+      // surface so the operator's eye registers them as different
+      // sections of the same modal.
+      previewLines.push('');
+
       return {
         state: {
           ...state,
           modal: {
             promptId: event.promptId,
             flavor: 'permission',
-            title:
-              event.subagent !== undefined
-                ? `Subagent permission — ${event.subagent.name}`
-                : 'Run command',
-            subject: event.command,
+            title: titleStr,
+            // Subject dropped: the context label IS the subject row
+            // now. Keeping a separate subject would re-render the
+            // category and create the same triple-statement of the
+            // action that the redesign aims to remove.
+            subject: null,
             preview: previewLines,
-            question:
-              event.reason !== undefined
-                ? event.reason
-                : `Do you want to run this ${event.toolName} command?`,
+            // Question dropped: "Do you want to run this <tool>
+            // command?" is implicit from the context label + the
+            // numbered options. The engine's `event.reason` (if
+            // any) lives in the source-attribution preview line via
+            // the matched-rule path; no separate question row.
+            question: null,
             options,
             selectedIndex: options.length - 1,
-            hints: ['Esc to cancel'],
+            // Tab and Ctrl+E are hints only — handlers are deferred
+            // to Slices 4-5 of the modal redesign. Pre-flowing the
+            // footer here means the visual layout stays stable when
+            // the handlers land.
+            hints: ['Esc to cancel', 'Tab to amend', 'Ctrl+E to explain'],
             queueDepth: 0,
           },
         },

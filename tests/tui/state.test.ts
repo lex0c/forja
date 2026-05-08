@@ -1550,7 +1550,12 @@ describe('subagent lifecycle', () => {
 });
 
 describe('permission:ask modal (UI.md §4.10.13)', () => {
-  test('parent confirm renders standard title without subagent prefix', () => {
+  test('parent confirm renders the per-tool context label', () => {
+    // Modal redesign (design/permission-modal-redesign.md): the
+    // title slot carries a per-tool context label instead of the
+    // generic "Run command". bash family → "Bash command".
+    // Subject is null (the context label IS the subject row);
+    // question is null (numbered options are self-evident).
     const r = applyEvent(createInitialState(), {
       type: 'permission:ask',
       ts: 1,
@@ -1561,16 +1566,87 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
     } as UIEvent);
     expect(r.state.modal).not.toBeNull();
     if (r.state.modal !== null) {
-      expect(r.state.modal.title).toBe('Run command');
-      // Standard preview is `$ <command>` then `cwd: …`. No subagent line.
-      expect(r.state.modal.preview[0]).toBe('$ rm -rf /');
+      expect(r.state.modal.title).toBe('Bash command');
+      expect(r.state.modal.subject).toBeNull();
+      expect(r.state.modal.question).toBeNull();
+      // Action block has blank-line-action-blank-line shape — the
+      // breathing room is what sets the action apart visually.
+      // Action line carries `tone: 'bold'` so the renderer paints
+      // it bold (operator's eye lands on the command first).
+      expect(r.state.modal.preview[0]).toBe('');
+      expect(r.state.modal.preview[1]).toEqual({
+        text: '    $ rm -rf /',
+        tone: 'bold',
+      });
+      expect(r.state.modal.preview[2]).toBe('');
+      // cwd follows the action block.
+      expect(r.state.modal.preview[3]).toBe('cwd: /p');
     }
   });
 
-  test('subagent attribution mutates title + injects prefix preview line', () => {
+  test('per-tool context labels (bash / fs.* / web.fetch / search)', () => {
+    // Pins the per-tool mapping. A drift here would surface as a
+    // generic "Tool call" label for a known tool, which loses the
+    // operator's category cue.
+    const cases: Array<{ tool: string; label: string }> = [
+      { tool: 'bash', label: 'Bash command' },
+      { tool: 'bash_background', label: 'Bash command' },
+      { tool: 'bash_kill', label: 'Bash command' },
+      { tool: 'read_file', label: 'Accessing workspace:' },
+      { tool: 'write_file', label: 'Editing file' },
+      { tool: 'edit_file', label: 'Editing file' },
+      { tool: 'glob', label: 'Searching workspace' },
+      { tool: 'grep', label: 'Searching workspace' },
+      { tool: 'fetch_url', label: 'Network access' },
+    ];
+    for (const c of cases) {
+      const r = applyEvent(createInitialState(), {
+        type: 'permission:ask',
+        ts: 1,
+        promptId: 'p',
+        toolName: c.tool,
+        command: 'x',
+        cwd: '/p',
+      } as UIEvent);
+      expect(r.state.modal?.title).toBe(c.label);
+    }
+  });
+
+  test('unknown tool falls back to generic "Tool call" label', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p',
+      toolName: 'totally_unknown_tool',
+      command: 'x',
+      cwd: '/p',
+    } as UIEvent);
+    expect(r.state.modal?.title).toBe('Tool call');
+  });
+
+  test('non-bash tools omit the "$ " action prefix', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p',
+      toolName: 'write_file',
+      command: 'src/foo.ts',
+      cwd: '/p',
+    } as UIEvent);
+    // Preview action line is the path verbatim, no shell prefix.
+    // Wrapped as a `{text, tone}` object so the renderer paints bold.
+    expect(r.state.modal?.preview[1]).toEqual({
+      text: '    src/foo.ts',
+      tone: 'bold',
+    });
+  });
+
+  test('subagent attribution becomes a parenthesized title suffix (not a preview row)', () => {
     // Spec docs/spec/IPC.md §7: child-proxied asks must label the
     // subagent so the operator can distinguish parent vs child
-    // requests. The reducer keys on the optional event field.
+    // requests. New layout: attribution is a suffix on the context
+    // label, not a separate preview line — keeps the action block
+    // visually atomic.
     const r = applyEvent(createInitialState(), {
       type: 'permission:ask',
       ts: 1,
@@ -1582,14 +1658,66 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
     } as UIEvent);
     expect(r.state.modal).not.toBeNull();
     if (r.state.modal !== null) {
-      expect(r.state.modal.title).toBe('Subagent permission — explore');
-      // The first preview line is the attribution; the 8-char tail
-      // disambiguates concurrent instances of the same subagent.
-      expect(r.state.modal.preview[0]).toBe('subagent: explore (12345678)');
-      // Followed by the standard $cwd lines.
-      expect(r.state.modal.preview[1]).toBe('$ ls');
-      expect(r.state.modal.preview[2]).toBe('cwd: /p');
+      expect(r.state.modal.title).toBe('Bash command (subagent: explore)');
+      // Preview goes straight to the action block — no
+      // "subagent: explore (12345678)" prefix line.
+      expect(r.state.modal.preview[0]).toBe('');
+      expect(r.state.modal.preview[1]).toEqual({ text: '    $ ls', tone: 'bold' });
+      expect(r.state.modal.preview[2]).toBe('');
+      expect(r.state.modal.preview[3]).toBe('cwd: /p');
+      // No row contains the old "subagent: <name> (<idTail>)"
+      // prefix shape.
+      expect(
+        r.state.modal.preview.some((p) =>
+          (typeof p === 'string' ? p : p.text).startsWith('subagent: '),
+        ),
+      ).toBe(false);
     }
+  });
+
+  test('option 2 promotes the matched rule pattern when present', () => {
+    // The session-allow option's label carries the literal rule
+    // ("Yes, don't ask again for: rm -rf *") so the operator
+    // reads a policy promotion, not a vague runtime toggle. Falls
+    // back to the per-tool wording when rule is absent.
+    const withRule = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p',
+      toolName: 'bash',
+      command: 'rm -rf /tmp',
+      cwd: '/p',
+      rule: 'rm -rf *',
+    } as UIEvent);
+    const opt2WithRule = withRule.state.modal?.options[1];
+    expect(opt2WithRule?.label).toBe("Yes, don't ask again for: rm -rf *");
+
+    const noRule = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 2,
+      promptId: 'p2',
+      toolName: 'bash',
+      command: 'whoami',
+      cwd: '/p',
+    } as UIEvent);
+    const opt2NoRule = noRule.state.modal?.options[1];
+    expect(opt2NoRule?.label).toBe('Yes, allow all bash during this session');
+  });
+
+  test('footer hints carry Tab to amend + Ctrl+E to explain', () => {
+    // Pre-flowing the footer for handlers that land in later
+    // slices. Without this reservation, the layout would re-flow
+    // when Tab/Ctrl+E ship and operators would see a layout
+    // change between minor versions.
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p',
+      toolName: 'bash',
+      command: 'ls',
+      cwd: '/p',
+    } as UIEvent);
+    expect(r.state.modal?.hints).toEqual(['Esc to cancel', 'Tab to amend', 'Ctrl+E to explain']);
   });
 });
 

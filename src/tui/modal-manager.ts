@@ -229,19 +229,38 @@ const CRITIQUE_OPTIONS: readonly ConfirmOption[] = [
   { key: '3', label: 'Abort step', value: 'abort' },
 ];
 
-// Permission flavor's option list, kept in sync with the reducer's
-// ConfirmState construction. Exported so producers can introspect /
-// override (future trust/memory variants do their own lists).
-const PERMISSION_OPTIONS = (toolName: string): ConfirmOption[] => [
-  { key: '1', label: 'Yes', value: 'yes' },
-  {
-    key: '2',
-    label: `Yes, allow all ${toolName} during this session`,
-    value: 'session-allow',
-    shortcut: 'shift+tab',
-  },
-  { key: '3', label: 'No', value: 'no' },
-];
+// Permission flavor's option list. Source of truth for both the
+// modal-manager (uses `.length` for selection clamping in
+// moveSelection) and the reducer (renders the labels via state).
+// Exported so the reducer's `permission:ask` case calls the same
+// builder — without a single source, the manager's count and the
+// reducer's labels could drift on a future field addition (e.g.
+// adding a fourth option) and break the cursor's clamp.
+//
+// Option 2 promotes the matched policy rule into the label so the
+// operator reads a literal scope ("don't ask again for: rm -rf *")
+// instead of an ambiguous "all bash during this session" — that
+// older wording sounded like a runtime toggle, but the semantics
+// are an actual policy promotion. When `rule` is absent (synthesized
+// asks, subagent-proxied confirms before IPC marshals source) the
+// label falls back to the per-tool wording — same shape, less
+// information, never a crash.
+export const buildPermissionOptions = (toolName: string, rule?: string): ConfirmOption[] => {
+  const sessionLabel =
+    rule !== undefined && rule.length > 0
+      ? `Yes, don't ask again for: ${rule}`
+      : `Yes, allow all ${toolName} during this session`;
+  return [
+    { key: '1', label: 'Yes', value: 'yes' },
+    {
+      key: '2',
+      label: sessionLabel,
+      value: 'session-allow',
+      shortcut: 'shift+tab',
+    },
+    { key: '3', label: 'No', value: 'no' },
+  ];
+};
 
 export interface ModalManager {
   // Permission flavor. Returns the user's choice (or 'cancel' on Esc /
@@ -639,7 +658,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           ...(args.reason !== undefined ? { reason: args.reason } : {}),
           ...(args.subagent !== undefined ? { subagent: args.subagent } : {}),
         }),
-        PERMISSION_OPTIONS(args.toolName),
+        buildPermissionOptions(args.toolName, args.rule),
         opts?.timeoutMs,
         opts?.signal,
       ),

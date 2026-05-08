@@ -943,14 +943,15 @@ function dispatch(k: Key) { for (let i=stack.length-1; i>=0; i--) if (stack[i](k
 | `default` | texto normal | (sem escape) |
 | `dim` | meta, hints, separadores (réguas, footer, sub-content `└─`) | `\x1b[2m` (faint) |
 | `secondary` | marker visivelmente grey que precisa se separar do conteúdo primário (turn-end `Cogitated for X`, §3.2) | `\x1b[90m` (bright-black ≈ grey) |
+| `accent` | structural anchors que precisam destacar do greyscale baseline — top rule + título de modal hoje | `\x1b[94m` (bright blue) |
 | `bold` | ênfase, header de modal | `\x1b[1m` |
 | `error` | mensagens de erro, status falho | `\x1b[31m` |
 | `warn` | avisos, budget 80% | `\x1b[33m` |
 | `success` | pipeline badges (`✓`) e indicadores binários de capability habilitada no banner env (§4.10.9) | `\x1b[32m` |
 
-**Sem mais cores.** Sem azul, sem ciano, sem magenta, sem gradientes, sem 256-color, sem truecolor. Profile/model/etc. ficam em `default`. Se você precisa de cor pra distinguir, o layout falhou.
+**Sem cores não-listadas.** Sem ciano, sem magenta, sem gradientes, sem 256-color, sem truecolor. A tabela acima é a paleta inteira. Profile/model/etc. ficam em `default`. Se você precisa de cor pra distinguir, o layout falhou.
 
-**Nota sobre `dim` vs `secondary`:** `dim` (SGR 2 faint) é o token tradicional para meta — réguas, hints, sub-content. Em xterm com config padrão, SGR 2 renderiza idêntico ao default; aceito porque no contexto desses elementos a posição já carrega a hierarquia. **`secondary`** (SGR 90 bright-black) é o variante explicitamente visível, reservado pra marker que PRECISA destacar do conteúdo primário (turn-end `Cogitated for X` da §3.2). SGR 90 é uma cor 16-color (cinza), não "mais uma cor" no sentido das proibidas (azul/ciano/magenta).
+**Nota sobre `dim` vs `secondary` vs `accent`:** `dim` (SGR 2 faint) é o token tradicional para meta — réguas, hints, sub-content. Em xterm com config padrão, SGR 2 renderiza idêntico ao default; aceito porque no contexto desses elementos a posição já carrega a hierarquia. **`secondary`** (SGR 90 bright-black) é o variante explicitamente visível, reservado pra marker que PRECISA destacar do conteúdo primário (turn-end `Cogitated for X` da §3.2; matched-rule e hint footer no permission modal). **`accent`** (SGR 94 bright blue) é o token mais saturado da paleta, reservado pra structural chrome — top rule do modal e título do modal hoje. Os três SGRs são cores 16-color (cinza, cinza-bright, blue-bright), parte do baseline universal de qualquer terminal; o `accent` foi pesado contra a regra "sem azul" porque a estrutura do modal precisa de um anchor visual além do dim baseline pra ler como uma decisão deliberada e não como conteúdo de fluxo.
 
 `NO_COLOR` env var ou `--no-color`: desativa todos os escapes. `CLICOLOR_FORCE=1` ignora `!isTTY` e força cores (útil em log capture).
 

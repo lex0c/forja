@@ -58,6 +58,8 @@ import {
   createResizeWatcher,
   cursorDown,
   cursorForward,
+  cursorHide,
+  cursorShow,
   cursorUp,
   disableBracketedPasteOn,
   disableRawMode,
@@ -180,6 +182,26 @@ export const createRenderer = (options: RendererOptions): Renderer => {
   // the terminal actually shows.
   let prevLines: string[] = [];
   let closed = false;
+  // Cursor visibility tracker. The terminal cursor is normally
+  // visible (where the operator types into the input box); during
+  // a modal there is no input, so the cursor lands on the modal's
+  // bottom row (the hint footer row by the redraw's "no cursor
+  // target → land at bottom" branch). The blinking cursor block
+  // sits ON TOP of the hint text, looking like flicker. Hide on
+  // modal-up, show on modal-down. Idempotent transition emit so
+  // the redraw fast path doesn't spam the escape every frame.
+  let cursorVisible = true;
+  const cursorVisibilityEscape = (modalUp: boolean): string => {
+    if (modalUp && cursorVisible) {
+      cursorVisible = false;
+      return cursorHide;
+    }
+    if (!modalUp && !cursorVisible) {
+      cursorVisible = true;
+      return cursorShow;
+    }
+    return '';
+  };
 
   // ─── Build helpers ────────────────────────────────────────────────
   //
@@ -322,6 +344,7 @@ export const createRenderer = (options: RendererOptions): Renderer => {
     // teardown for one-shot mode (close() erases the live region).
     const raw = composeLive(state, liveCaps, now());
     const truncated = raw.map((l) => truncateToWidth(l, liveCaps.cols));
+    buf += cursorVisibilityEscape(state.modal !== null);
     buf += buildFullDraw(truncated);
     prevLines = truncated;
     if (buf.length > 0) write(wrapSync(buf));
@@ -342,10 +365,16 @@ export const createRenderer = (options: RendererOptions): Renderer => {
     if (closed) return;
     const raw = composeLive(state, liveCaps, now());
     const truncated = raw.map((l) => truncateToWidth(l, liveCaps.cols));
+    // Cursor visibility transition: emit hide-on-modal /
+    // show-on-no-modal at the SAME frame as the modal state
+    // change. Idempotent — the helper returns '' when no change is
+    // needed, so the differential fast path doesn't spam the
+    // escape on every frame.
+    const cursorVis = cursorVisibilityEscape(state.modal !== null);
 
     // Empty live region — just erase.
     if (truncated.length === 0) {
-      const buf = buildErase();
+      const buf = cursorVis + buildErase();
       if (buf.length > 0) write(wrapSync(buf));
       prevLines = [];
       return;
@@ -353,14 +382,14 @@ export const createRenderer = (options: RendererOptions): Renderer => {
 
     // First frame OR height change → full erase + draw.
     if (liveHeight === 0 || prevLines.length !== truncated.length) {
-      const buf = buildErase() + buildFullDraw(truncated);
+      const buf = cursorVis + buildErase() + buildFullDraw(truncated);
       if (buf.length > 0) write(wrapSync(buf));
       prevLines = truncated;
       return;
     }
 
     // Differential — same height, only changed rows emit.
-    const buf = buildDifferentialDraw(truncated);
+    const buf = cursorVis + buildDifferentialDraw(truncated);
     if (buf.length > 0) write(wrapSync(buf));
     prevLines = truncated;
   };
@@ -532,7 +561,15 @@ export const createRenderer = (options: RendererOptions): Renderer => {
       scheduler.close();
       // Final clean live region so the prompt returns to a sane place.
       // Single write is fine here — no follow-up draw to coalesce with.
-      const eraseBuf = buildErase();
+      // Restore cursor visibility before exit so the operator's shell
+      // prompt doesn't inherit a hidden cursor (would happen when
+      // close() runs while a modal was the last visible thing).
+      let eraseBuf = '';
+      if (!cursorVisible) {
+        eraseBuf += cursorShow;
+        cursorVisible = true;
+      }
+      eraseBuf += buildErase();
       if (eraseBuf.length > 0) write(eraseBuf);
       prevLines = [];
       // Disable regardless of whether enableInput was called — close
