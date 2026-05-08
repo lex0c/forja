@@ -536,6 +536,91 @@ describe('projectRecap', () => {
     expect(out.costs.model).toBe('');
   });
 
+  test('step window does not anchor on tool_result-only user messages', () => {
+    // Regression: the harness persists tool_result responses as
+    // role='user' messages (loop.ts appends `{role:'user',
+    // content: toolResults}` after each tool batch). Counting
+    // every user row as a step boundary inflated the step count,
+    // so `/recap last 1` against a tool-using turn cut the
+    // session at the synthetic tool_result row — dropping the
+    // originating prompt and the assistant turn that issued the
+    // tool call. The result was an empty goal and an incomplete
+    // recap. Step boundaries now require prompt prose.
+    const s = seedSession();
+    const userId = addUserTurn(s.id, 'inspect the queue retry path', 1_100);
+    const aId = addAssistantTurn(s.id, userId, 'reading the file', { ts: 1_110 });
+    addToolCall(aId, 'read_file', { path: 'src/queue.ts' }, null, 'done', 5, 1_115);
+    // Synthetic tool_result user message — what the harness
+    // appends to feed the tool output back to the model.
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'tu-1',
+          content: 'file contents here',
+        },
+      ],
+      createdAt: 1_120,
+    });
+    addAssistantTurn(s.id, userId, 'analysis: looks like a race', { ts: 1_130 });
+
+    const out = projectRecap(db, {
+      scope: { kind: 'session_current', sessionId: s.id, limit: 1 },
+    });
+    // Only ONE real prompt step exists, so `last 1` keeps the
+    // entire session — goal must be the original prompt, NOT
+    // the empty tool_result message, and the read_file call
+    // must still surface in actions because its host message
+    // survives the truncation.
+    expect(out.goal.text).toBe('inspect the queue retry path');
+    expect(out.goal.sourceStepId).toBe(userId);
+    expect(out.actions.filesRead).toEqual([{ path: 'src/queue.ts', count: 1 }]);
+  });
+
+  test('two real prompts with tool_results between: last 1 keeps the second prompt + its tool work', () => {
+    // Two logical steps separated by a tool_result. `last 1`
+    // anchors to the SECOND real prompt and keeps the assistant
+    // / tool_result rows that belong to it; the first prompt
+    // and its tool work are dropped. The synthetic tool_result
+    // user message in step 2 must NOT itself be treated as the
+    // step boundary — that would put the cutoff one row too late
+    // and orphan the prompt above it.
+    const s = seedSession();
+    // Step 1: prompt → assistant tool_use → tool_result → assistant
+    const u1 = addUserTurn(s.id, 'first prompt', 1_100);
+    const a1 = addAssistantTurn(s.id, u1, 'reading old', { ts: 1_110 });
+    addToolCall(a1, 'read_file', { path: 'old.ts' }, null, 'done', 5, 1_115);
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu-old', content: 'old' }],
+      createdAt: 1_120,
+    });
+    addAssistantTurn(s.id, u1, 'done with first', { ts: 1_130 });
+    // Step 2: prompt → assistant tool_use → tool_result → assistant
+    const u2 = addUserTurn(s.id, 'second prompt', 1_200);
+    const a2 = addAssistantTurn(s.id, u2, 'reading new', { ts: 1_210 });
+    addToolCall(a2, 'read_file', { path: 'new.ts' }, null, 'done', 5, 1_215);
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tu-new', content: 'new' }],
+      createdAt: 1_220,
+    });
+    addAssistantTurn(s.id, u2, 'done with second', { ts: 1_230 });
+
+    const out = projectRecap(db, {
+      scope: { kind: 'session_current', sessionId: s.id, limit: 1 },
+    });
+    // Goal anchors to the second real prompt.
+    expect(out.goal.text).toBe('second prompt');
+    expect(out.goal.sourceStepId).toBe(u2);
+    // Tool work from step 1 must be filtered; step 2 work survives.
+    expect(out.actions.filesRead).toEqual([{ path: 'new.ts', count: 1 }]);
+  });
+
   test('session_current with limit truncates to last N user-anchored steps', () => {
     const s = seedSession();
     const u1 = addUserTurn(s.id, 'first', 1_100);

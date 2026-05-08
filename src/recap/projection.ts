@@ -353,16 +353,29 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
   const sessionIds = bundles.map((b) => b.session.id);
 
   // Apply step limit for session_current. The limit truncates the
-  // last N user/assistant message pairs from the working set; tool
-  // calls are filtered to the same window. Other scope kinds ignore
-  // the limit.
+  // last N user-prompt-anchored steps; tool calls are filtered to
+  // the same window. Other scope kinds ignore the limit.
+  //
+  // Step boundary: a `role='user'` message anchors a NEW step only
+  // when its content carries actual prompt prose. The harness
+  // persists tool_result responses as `role='user'` messages too
+  // (loop.ts appends `{role:'user', content: toolResults}` after
+  // each tool batch), so counting every user row would inflate
+  // the step count and let `/recap last 1` cut the session at a
+  // tool_result row — dropping the originating prompt and the
+  // assistant turn that issued the tool call. `extractUserPromptText`
+  // already filters non-text blocks and empty/whitespace text
+  // blocks, so a tool_result-only user message returns '' and is
+  // correctly skipped as a step boundary.
   if (options.scope.kind === 'session_current' && options.scope.limit !== undefined) {
     const limit = options.scope.limit;
     for (const b of bundles) {
       const stepStarts: number[] = [];
       for (let i = 0; i < b.messages.length; i += 1) {
         const m = b.messages[i];
-        if (m !== undefined && m.role === 'user') stepStarts.push(i);
+        if (m !== undefined && m.role === 'user' && extractUserPromptText(m.content).length > 0) {
+          stepStarts.push(i);
+        }
       }
       if (stepStarts.length > limit) {
         const cutoff = stepStarts[stepStarts.length - limit] ?? 0;
