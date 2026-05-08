@@ -15,6 +15,113 @@ Format:
 
 ---
 
+## [2026-05-08] m4/critique — Slice A: engine + types (foundation, no loop wiring)
+
+**Done:** Foundational module `src/critique/` for the self-critique
+pass (AGENTIC_CLI.md §5.4, ORCHESTRATION.md §6). Builds on top of the
+existing TUI `critique:ask` modal (state.ts:1514) which has been
+sitting idle since the modal pattern landed — D184 in the prior
+inventory tracked the missing producer.
+
+| File | What |
+|---|---|
+| `src/critique/types.ts` | `CritiqueMode` (`off` \| `on_writes` \| `always`), `CritiqueSeverity` (`info` \| `warn` \| `error`), `CritiqueIssue`, `CritiqueOutput`, `CritiqueResult` (strategy=`llm`\|`skipped`\|`failed` + filteredIssues + rawIssues + overallConfidence + durationMs + costUsd + usage + usageSeen + reason), `CritiqueRunOptions` (threshold, maxOverheadMs, maxTokens, promptVersion, signal), `CritiqueInput` (userPrompt, executorSystemPrompt?, assistantText, toolPlan?), `CritiqueToolPlanEntry`, `CritiqueConfig` + `DEFAULT_CRITIQUE_CONFIG` (mode='off', threshold=0.7, maxOverheadMs=3000 per spec defaults). |
+| `src/critique/prompt.ts` | Versioned system prompt (v1) demanding ONE JSON object wrapped between `[critique]`/`[/critique]` markers; `renderCritiqueUserMessage(input)` builds the per-call user content with USER PROMPT, EXECUTOR SYSTEM PROMPT (background, optional), PROPOSED ASSISTANT OUTPUT, PROPOSED TOOL CALLS sections. Markers + JSON pattern survives chatter / refusal prefaces / markdown fences without breaking the parser. |
+| `src/critique/engine.ts` | `runCritique(provider, input, options)` — pure function returning `CritiqueResult`. Three guarantees: bounded latency (`maxOverheadMs` is a hard ceiling, past it returns `skipped` with `overhead_exceeded`), bounded blast radius (stream errors / parse failures collapse to `failed`, run never aborts), cost honesty (any usage the provider reported flows through even on failed/aborted calls). Caller-driven aborts (Ctrl+C, wall-clock) rethrow so the harness loop's existing aborted path takes over; internal watchdog returns soft-skipped. |
+| `src/critique/index.ts` | Public surface — re-exports everything callers need without forcing them to know the module layout. |
+| `tests/critique/engine.test.ts` | 15 tests across 4 describe groups: happy path (parse + threshold filter, system prompt + temperature=0, tool plan rendering, empty issues, noise drop), input coercion (confidence clamp, severity coerce, threshold clamp), soft failure paths (markers_missing, parse_failed, malformed-issues, empty_response, stream_error, no usage = zero cost), overhead watchdog (overhead_exceeded skips with bounded elapsed; caller signal abort rethrows). |
+
+**Decisions:**
+
+- **Markers + JSON, not `generateConstrained`.** The provider
+  interface has `generateConstrained` for native structured output,
+  but two reasons against it here: (a) not every provider in the
+  M1-M4 set advertises a robust constrained mode for arbitrary
+  schemas (Anthropic uses tools, OpenAI uses JSON mode, Google has
+  its own surface); the marker pattern works uniformly across all
+  three. (b) The compaction module already uses markers (`[compacted_history]`)
+  for the same reason; staying with one pattern means less surface
+  to maintain. Trade-off: a model that completely ignores the
+  markers gets the parse_failed path — but the stream's billed
+  tokens still flow through, and the run is not derailed.
+- **Marker payload extracts `{...}` slice, not the full marker
+  body.** The parser pulls the substring between the first `{` and
+  the last `}` between markers. Lets the model emit ` ```json ... ``` `
+  fences inside the markers without breaking the parse — the
+  fences land outside the brace slice and JSON.parse sees clean
+  JSON. Tested via the `markers_missing` (no braces) and
+  `parse_failed` (braces present, body invalid) paths.
+- **Issues with empty description AND empty suggestion are
+  dropped pre-filter.** A model padding the array with empty
+  objects shouldn't inflate `rawIssues`. Issues with one of the
+  two filled in are preserved (the description alone is still
+  signal even without a suggestion, and vice versa).
+- **Confidence clamped, severity coerced, NOT rejected.** A
+  model that emits `confidence=1.7` or `severity=critical`
+  preserves the issue with clamped/coerced values rather than
+  dropping it. Reasoning: the model identified something it
+  thinks is a problem; we'd rather show it (with severity=warn
+  as the conservative coercion) than throw it away because of a
+  schema nit. The threshold filter still gates real issues from
+  reaching the user.
+- **Caller signal vs internal watchdog disambiguation.** Both
+  fire AbortError-shaped exceptions through the same code path
+  (collectStep → CollectStepError). Engine differentiates via
+  `watchdog.watchdogFired()` flag set BEFORE `ctrl.abort()` in
+  the timeout callback, so by the time the catch block sees the
+  error the flag accurately reflects which source fired. Caller
+  signal aborted → rethrow (loop handles via existing
+  aborted/maxWallClockMs paths); internal watchdog → soft-skip
+  with `overhead_exceeded`. Without this disambiguation, a real
+  Ctrl+C would silently degrade to a skipped critique result
+  while the loop kept running.
+- **`maxOverheadMs: 0` disables the watchdog.** Useful in tests
+  with synchronous mock providers (the watchdog timer would race
+  with the resolved promise and add jitter for no benefit). The
+  default `CritiqueConfig` keeps the spec-recommended 3000ms.
+- **`generateConstrained` not consumed in Slice A.** The engine
+  goes through `provider.generate` (streaming) like compaction
+  does. If a future provider exposes a much cheaper structured
+  path AND the engine wants to consume it, the engine signature
+  is stable enough that the swap would be a one-file change.
+
+**Pending (Slice B and later):**
+
+- **Loop integration** (Slice B). The harness loop currently
+  persists the assistant message at `loop.ts:1585` BEFORE checking
+  tool_uses or the stop_reason. ORCHESTRATION §6.2 wants the
+  critique to run BEFORE persist so a `redo` decision can discard
+  the buffer and re-run the step with the critic's hint injected.
+  Slice B reorders this: parse output → buffer → run critique (when
+  mode applies) → modal `critique:ask` if filtered issues → persist
+  on `ignore`/no-issues, re-run on `redo`, finish on `abort`.
+  Pre-tool-invoke critique (`on_writes` mode, tool plan critique)
+  also lives here — runs BEFORE `[PreToolUse hook]` per spec
+  §6.5.
+- **Audit + telemetry** (Slice C). `failure_events` rows with
+  `code: critique.warning_shown` / `critique.skipped` /
+  `critique.warning_ignored` / `critique.failed`; spans for
+  `critique.cost_usd` and `critique.duration_ms` separate from
+  step (ORCHESTRATION §6.3 — NOT folded into step cost, but added
+  to session totalCostUsd). HarnessEvent variants for the TUI
+  status line.
+- **Eval `evals/critique/`** (Slice D). Fixtures with bugs the
+  critic should detect; clean fixtures the critic must NOT
+  hallucinate issues for; threshold tuning baseline. Without
+  eval, critic is noise (spec line 577).
+- **Severity mapping at the TUI boundary.** TUI events.ts:338
+  uses `low | medium | high`; engine produces `info | warn |
+  error`. The harness adapter (Slice B) translates:
+  `info → low`, `warn → medium`, `error → high`. Kept distinct
+  because the TUI contract predates this engine and changing the
+  TUI side now would force a TUI-test churn unrelated to the
+  critique work.
+
+**Next:** Wait for review of Slice A. Slice B (loop integration)
+follows on the same `feat/m4-critique` branch.
+
+---
+
 ## [2026-05-08] m4/recap — closing inventory: what is left after M4.1
 
 Post-M4.1 punch list. M4.1 (slices a–d + the audit-comment / perf
