@@ -363,6 +363,86 @@ describe('renderHuman', () => {
     const b = renderHuman(data, { home: '/home/lex' });
     expect(a).toBe(b);
   });
+
+  test('anonymizes Windows-style $HOME paths in dedicated path columns', () => {
+    // Forja claims Windows support (environment-prompt.ts branches
+    // on 'win32'). The redactor used to only match POSIX `/`
+    // separators, so a Windows operator with
+    // `home: 'C:\\Users\\alice'` saw their full home path
+    // emitted verbatim under "Files edited".
+    const data = empty();
+    data.actions.filesWritten.push({
+      path: 'C:\\Users\\alice\\repo\\src\\auth.ts',
+      linesAdded: 0,
+      linesRemoved: 0,
+      semanticSummary: '',
+    });
+    const out = renderHuman(data, { home: 'C:\\Users\\alice' });
+    expect(out).toContain('`~\\repo\\src\\auth.ts`');
+    expect(out).not.toContain('C:\\Users\\alice');
+  });
+
+  test('anonymizes Windows-style $HOME paths embedded in free-text', () => {
+    const data = empty();
+    data.goal = {
+      text: 'review C:\\Users\\alice\\repo\\src\\foo.ts and the .env',
+      sourceStepId: 'x',
+    };
+    data.outcomes.testsRun.push({
+      command: 'cd C:\\Users\\alice\\repo && bun test',
+      passed: true,
+      durationMs: 100,
+    });
+    const out = renderHuman(data, { home: 'C:\\Users\\alice' });
+    expect(out).toContain('review ~\\repo\\src\\foo.ts');
+    expect(out).toContain('cd ~\\repo && bun test');
+    expect(out).not.toContain('C:\\Users\\alice\\repo');
+  });
+
+  test('handles bare Windows home with no trailing separator', () => {
+    // `cd C:\Users\alice` with nothing after — must collapse to
+    // `cd ~`. Mirror of the POSIX `cd /home/lex` test above.
+    const data = empty();
+    data.outcomes.testsRun.push({
+      command: 'cd C:\\Users\\alice && dir',
+      passed: true,
+      durationMs: 1,
+    });
+    const out = renderHuman(data, { home: 'C:\\Users\\alice' });
+    expect(out).toContain('cd ~ && dir');
+    expect(out).not.toContain('C:\\Users\\alice ');
+  });
+
+  test('handles mixed-separator paths after a Windows home prefix', () => {
+    // Cross-shell environments on Windows often surface paths
+    // with forward slashes even when home is backslash-style:
+    // `C:\Users\alice/proj/foo.ts` is what `git bash`, WSL
+    // mounts, and many Node tools produce. The redactor must
+    // accept either separator after the home prefix regardless
+    // of which separator style home itself uses.
+    const data = empty();
+    data.goal = {
+      text: 'inspect C:\\Users\\alice/proj/foo.ts via wsl',
+      sourceStepId: 'x',
+    };
+    const out = renderHuman(data, { home: 'C:\\Users\\alice' });
+    expect(out).toContain('inspect ~/proj/foo.ts via wsl');
+    expect(out).not.toContain('C:\\Users\\alice/proj');
+  });
+
+  test('Windows redaction preserves prefix-sharing defense', () => {
+    // The word-boundary check that protects /home/lexicon on
+    // POSIX must also protect C:\Users\alicia (a different
+    // user whose name shares the alice prefix).
+    const data = empty();
+    data.goal = {
+      text: 'compare C:\\Users\\alicia\\notes against ours',
+      sourceStepId: 'x',
+    };
+    const out = renderHuman(data, { home: 'C:\\Users\\alice' });
+    expect(out).toContain('C:\\Users\\alicia\\notes');
+    expect(out).not.toContain('~ia');
+  });
 });
 
 describe('renderRecap dispatcher', () => {

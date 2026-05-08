@@ -34,10 +34,20 @@ const resolveHome = (override: string | undefined): string => {
   return env.length > 0 ? env : HOME_FALLBACK;
 };
 
+// Separator that follows the home prefix in a real path: POSIX
+// `/` or Windows `\`. Forja claims Windows support
+// (`environment-prompt.ts` branches on `'win32'`), so the home
+// redactor must accept both. Without this, an operator running
+// on Windows with `home = 'C:\\Users\\alice'` saw their full
+// home path emitted verbatim in every recap.
+const isPathSeparator = (ch: string | undefined): boolean => ch === '/' || ch === '\\';
+
 const anonymize = (path: string, home: string): string => {
   if (path.length === 0) return path;
   if (path === home) return '~';
-  if (path.startsWith(`${home}/`)) return `~${path.slice(home.length)}`;
+  if (path.startsWith(home) && isPathSeparator(path[home.length])) {
+    return `~${path.slice(home.length)}`;
+  }
   return path;
 };
 
@@ -48,6 +58,13 @@ const anonymize = (path: string, home: string): string => {
 // arbitrarily and either over- or under-trigger the redaction.
 const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+// Regex character class that matches either path separator
+// (POSIX `/` or Windows `\`). Built from a string template
+// because both characters need careful escaping at two levels:
+// JS string literal AND regex grammar. The `\\\\` is a single
+// literal backslash inside the regex source `[/\\]`.
+const SEP_REGEX_CLASS = '[/\\\\]';
+
 // Redact `$HOME` paths embedded inside a free-text field (goal
 // text, command lines, decision reasons, subagent summaries,
 // open questions). The single-path `anonymize` helper above
@@ -57,15 +74,20 @@ const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$
 // dedicated path columns.
 //
 // Two passes:
-//   1. `<home>/` → `~/`  — the common path-prefix case. Eats
-//      the trailing `/` so "cat /home/lex/x" becomes "cat ~/x".
-//   2. `<home>\b` → `~`  — bare home with no trailing slash
+//   1. `<home><sep>` → `~<sep>`  — the common path-prefix case.
+//      `<sep>` matches `/` (POSIX) OR `\` (Windows) and is
+//      preserved in the replacement so the operator's native
+//      separator survives. "cat /home/lex/x" → "cat ~/x";
+//      "type C:\Users\alice\x" → "type ~\x".
+//   2. `<home>\b` → `~`  — bare home with no trailing separator,
 //      followed by a word boundary (end-of-string, whitespace,
 //      non-word punctuation). "cd /home/lex" → "cd ~". The `\b`
 //      check distinguishes the home prefix from a longer
 //      identifier sharing the same prefix (`/home/lexicon`,
 //      `/home/lexa.bak`) — those are NOT redacted because the
-//      home segment is part of a different path.
+//      home segment is part of a different path. Word boundary
+//      semantics are POSIX-vs-Windows-agnostic: both `/` and
+//      `\` are non-word characters.
 //
 // JSON renderer is intentionally NOT wired through this helper:
 // audit consumers need the literal path. The human renderer is
@@ -74,7 +96,7 @@ const anonymizeText = (text: string, home: string): string => {
   if (text.length === 0 || home.length === 0) return text;
   const escaped = escapeRegex(home);
   return text
-    .replace(new RegExp(`${escaped}/`, 'g'), '~/')
+    .replace(new RegExp(`${escaped}(${SEP_REGEX_CLASS})`, 'g'), '~$1')
     .replace(new RegExp(`${escaped}\\b`, 'g'), '~');
 };
 
