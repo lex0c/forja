@@ -25,6 +25,7 @@ import type { LiveState } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
 import { renderAssistantChip } from './assistant-chip.ts';
 import { renderAwaitingChip } from './awaiting-chip.ts';
+import { renderCritiqueChip } from './critique-chip.ts';
 import { renderFooter } from './footer.ts';
 import { padFrame } from './frame.ts';
 import { renderInput } from './input.ts';
@@ -237,6 +238,14 @@ export const composeLive: ComposeLive = (
     appendBlock(renderThinkingChip(state.thinking, caps, now));
   } else if (state.pendingAssistant !== null) {
     appendBlock(renderAssistantChip(state.pendingAssistant, caps, now));
+  } else if (state.critique !== null) {
+    // Self-critique pass in flight (AGENTIC_CLI.md §5.4). Renders
+    // between the executor's `assistant:end` and the modal opening
+    // (or the engine's soft-skipped fallthrough). Higher in the
+    // chain than `awaitingProvider` because critique is a defined
+    // post-stop state — the awaiting fallback is only meant for
+    // the gap BEFORE any provider event of the next step.
+    appendBlock(renderCritiqueChip(state.critique, caps, now));
   } else if (state.awaitingProvider !== null) {
     // Fallback chip when the harness has handed off to the
     // provider but no streaming has started yet. The reducer

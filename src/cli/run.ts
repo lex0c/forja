@@ -273,7 +273,8 @@ export const run = async (options: RunOptions): Promise<number> => {
       signal,
       ...(options.bootstrapOverride ?? {}),
     };
-    const { config, db, lockConflicts, subagents, hookWarnings } = bootstrap(bootstrapInput);
+    const { config, db, lockConflicts, subagents, hookWarnings, critiqueWarnings } =
+      bootstrap(bootstrapInput);
 
     // Surface cross-scope subagent shadows. A user's
     // ~/.config/agent/agents/<name>.md silently being eclipsed by
@@ -323,6 +324,15 @@ export const run = async (options: RunOptions): Promise<number> => {
       for (const w of hookWarnings) {
         const layerFrag = w.layer !== null ? `${w.layer} ` : '';
         errSink(`forja: ${layerFrag}hook ${w.sourcePath}: ${w.message}\n`);
+      }
+      // Self-critique config warnings (spec AGENTIC_CLI.md §5.4).
+      // The loader degrades to defaults on bad values rather than
+      // aborting boot — operators need stderr visibility on
+      // malformed [critique] blocks so they don't silently run
+      // with mode='off' after typoing the config. Same JSON-mode
+      // gating as the hook / subagent warnings above.
+      for (const w of critiqueWarnings) {
+        errSink(`forja: critique config: ${w}\n`);
       }
     }
 

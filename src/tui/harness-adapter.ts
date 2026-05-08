@@ -125,12 +125,24 @@ interface AdapterState {
 // The UI catalogue (events.ts) accepts a fixed set plus arbitrary
 // string fallback; we collapse adverse exits into 'error' and let the
 // detail appear in a separate `warn` line emitted alongside.
+//
+// Operator-driven terminations pass the harness reason through
+// verbatim — `aborted` (Ctrl+C / wall-clock) was the original case;
+// `critiqueAborted` (operator chose abort in the critique modal,
+// AGENTIC_CLI.md §5.4) and `userPromptBlocked` (a UserPromptSubmit
+// hook refused the turn) belong in the same family. All three map
+// to TerminalSessionStatus='interrupted' at the harness layer (see
+// loop.ts exitToStatus); collapsing them to 'error' here misled
+// the renderer's "exit X — Y" warn line into reading like a
+// failure when the operator deliberately stopped the turn.
 const mapExitReason = (reason: ExitReason): SessionEndEvent['reason'] => {
   switch (reason) {
     case 'done':
     case 'aborted':
     case 'maxSteps':
     case 'maxCostUsd':
+    case 'critiqueAborted':
+    case 'userPromptBlocked':
       return reason;
     default:
       return 'error';
@@ -852,6 +864,31 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           toolsRunning: event.toolsRunning,
           toolsCap: event.toolsCap,
         });
+        return out;
+
+      case 'critique_started':
+        // Self-critique pass started (ORCHESTRATION.md §6). The
+        // primary operator UX is the modal that opens after the
+        // engine returns issues; the chip covers the OTHERWISE-
+        // silent window between the executor's `assistant:end` and
+        // the modal (up to `maxOverheadMs`, default 3s). Without
+        // this translation the live region would show no progress
+        // indicator during the critic call — looks identical to a
+        // hang.
+        out.push({
+          type: 'critique:start',
+          ts,
+          stepN: event.stepN,
+          toolPlanWrites: event.toolPlanWrites,
+        });
+        return out;
+
+      case 'critique_finished':
+        // Close the chip. The next operator-visible surface is
+        // either the modal (when issues crossed threshold) or the
+        // next assistant turn (when no issues OR the operator
+        // chose ignore).
+        out.push({ type: 'critique:end', ts, stepN: event.stepN });
         return out;
 
       case 'session_finished': {

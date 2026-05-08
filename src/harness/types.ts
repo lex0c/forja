@@ -1,3 +1,9 @@
+import type {
+  ConfirmCritiqueRequest,
+  CritiqueAnswer,
+  CritiqueConfig,
+  CritiqueStrategy,
+} from '../critique/index.ts';
 import type { HookSpec } from '../hooks/index.ts';
 import type { MemoryRegistry } from '../memory/index.ts';
 import type { Decision, PermissionEngine } from '../permissions/index.ts';
@@ -307,6 +313,49 @@ export type HarnessEvent =
       threshold: number;
       cumulative: number;
     }
+  | {
+      // Self-critique pass entered for this step (ORCHESTRATION.md
+      // §6). Producer is the harness loop right BEFORE it issues
+      // the critic LLM call. Renderer can show a one-line "running
+      // critique..." indicator without needing to know the
+      // mode/threshold. Lifecycle bracket: every `critique_started`
+      // is followed by exactly one `critique_finished` for the
+      // same `stepN`.
+      type: 'critique_started';
+      stepN: number;
+      // True iff the proposed step would invoke at least one
+      // `writes:true` tool. Drives the renderer's framing — a
+      // writes-step critique deserves stronger UI than an end-of-
+      // step text critique (operator is about to mutate files).
+      toolPlanWrites: boolean;
+    }
+  | {
+      // Self-critique pass concluded. Producer is the harness loop
+      // after `runCritique` returns AND any `confirmCritique` modal
+      // has resolved. `strategy` mirrors the engine's output
+      // (`llm` | `skipped` | `failed`); when `strategy='llm'`,
+      // `filteredCount` is how many issues crossed the threshold.
+      // `decision` is the operator's choice (only set when the
+      // modal opened, i.e. `filteredCount > 0`). `costUsd` is the
+      // critic call's billed spend — folded into `total_cost_usd`
+      // separately from `step.cost_usd` per ORCHESTRATION §6.3.
+      type: 'critique_finished';
+      stepN: number;
+      strategy: CritiqueStrategy;
+      filteredCount: number;
+      rawCount: number;
+      overallConfidence: number;
+      durationMs: number;
+      costUsd: number;
+      // `'no_modal'` when no issues crossed the threshold (the
+      // modal never opened); the engine's strategy decided
+      // outright. Otherwise carries the operator's answer.
+      decision: CritiqueAnswer | 'no_modal';
+      // Optional human-readable detail (e.g., the reason
+      // `skipped`/`failed` carried, or which decision was made
+      // explicitly when `decision === 'no_modal'`).
+      reason?: string;
+    }
   | { type: 'session_finished'; result: HarnessResult };
 
 // Budget caps for an autonomous run. Per AGENTIC_CLI §5: every limit has
@@ -501,20 +550,33 @@ export const MAX_CONCURRENT_SUBAGENTS_CAP = 8;
 
 // Why the loop stopped. `done` is the only success path; everything else
 // is the harness intervening for safety or budget reasons.
-export type ExitReason =
-  | 'done' // model emitted text without tool_use
-  | 'maxSteps'
-  | 'maxWallClockMs'
-  | 'maxOutputTokens' // provider truncated the response at max_tokens
-  | 'maxCostUsd' // running cumulative cost crossed budget.maxCostUsd
-  | 'maxToolErrors'
-  | 'degenerateLoop'
-  | 'stepStalled' // provider stream silent for `maxStepStallMs` mid-step
-  | 'aborted' // user cancelled via signal
-  | 'providerError' // unrecoverable provider failure (network, 4xx)
-  | 'internalError' // uncaught throw in the harness path (typically SQLite)
-  | 'scriptExhausted' // mock provider drained — only seen in tests
-  | 'userPromptBlocked'; // a UserPromptSubmit hook refused this turn
+//
+// Single source of truth — the runtime tuple is the canonical list and
+// `ExitReason` derives from it. Consumers that need a runtime allowlist
+// (eval YAML loader, future audit replay, telemetry filters) MUST
+// import `EXIT_REASONS` instead of hand-rolling their own mirror; that
+// pattern silently drifts when a new reason is added (the loader's
+// inline list missed `stepStalled` and then `critiqueAborted` until
+// this refactor — both bypassed compile-time coverage because the
+// loader cast `as <inline-union>` instead of `as ExitReason`).
+export const EXIT_REASONS = [
+  'done', // model emitted text without tool_use
+  'maxSteps',
+  'maxWallClockMs',
+  'maxOutputTokens', // provider truncated the response at max_tokens
+  'maxCostUsd', // running cumulative cost crossed budget.maxCostUsd
+  'maxToolErrors',
+  'degenerateLoop',
+  'stepStalled', // provider stream silent for `maxStepStallMs` mid-step
+  'aborted', // user cancelled via signal
+  'providerError', // unrecoverable provider failure (network, 4xx)
+  'internalError', // uncaught throw in the harness path (typically SQLite)
+  'scriptExhausted', // mock provider drained — only seen in tests
+  'userPromptBlocked', // a UserPromptSubmit hook refused this turn
+  'critiqueAborted', // operator chose `abort` from a self-critique modal
+] as const;
+
+export type ExitReason = (typeof EXIT_REASONS)[number];
 
 export interface HarnessConfig {
   provider: Provider;
@@ -765,6 +827,31 @@ export interface HarnessConfig {
   // tests need a way to reach the spawn point through the
   // wider step loop.
   spawnChildProcess?: import('../subagents/runtime.ts').SpawnChildProcess;
+  // Self-critique pass config (AGENTIC_CLI.md §5.4,
+  // ORCHESTRATION.md §6). When absent, defaults merge with
+  // `DEFAULT_CRITIQUE_CONFIG` (mode='off') and the loop never
+  // pays the critique cost. Setting `mode = 'on_writes' |
+  // 'always'` enables the gate.
+  critique?: Partial<CritiqueConfig>;
+  // Provider used for the critic LLM call. When unset, the
+  // executor's provider is reused (cheapest wiring; the spec
+  // recommends a separate cheap model like Haiku, but for
+  // single-vendor runs the same provider is acceptable).
+  // Operator-facing config (`critique.model = 'anthropic/...'`)
+  // resolves to a Provider here at boot time.
+  critiqueProvider?: Provider;
+  // Hook the harness calls when the critic flags issues that
+  // crossed the threshold. Caller resolves with the operator's
+  // decision (`ignore` proceeds with the proposal as-is,
+  // `redo` re-runs the step with a hint message,
+  // `abort` finishes the run with `critiqueAborted`,
+  // `cancel` is treated as `abort` for safety). When unset,
+  // the harness defaults to `ignore` — the critique cost is
+  // still paid and the result is audited, but the run never
+  // blocks on a missing modal. Interactive callers (REPL) wire
+  // this to `modalManager.askCritique`; one-shot mode leaves
+  // it unset.
+  confirmCritique?: (req: ConfirmCritiqueRequest) => Promise<CritiqueAnswer>;
 }
 
 // Producer-facing args for `confirmMemoryWrite`. Mirrors

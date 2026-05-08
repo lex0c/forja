@@ -1,7 +1,15 @@
 import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
+import { EXIT_REASONS, type ExitReason } from '../harness/index.ts';
 import type { EvalBudget, EvalCase, EvalExpectation, EvalSetup } from './types.ts';
+
+// Built once from the harness's source-of-truth tuple. Adding a new
+// `ExitReason` automatically widens this allowlist — no hand-rolled
+// mirror to keep in sync (the prior inline literal silently rejected
+// `stepStalled` and `critiqueAborted` for an entire milestone before
+// anyone tried to assert them in YAML).
+const VALID_EXIT_REASONS: ReadonlySet<string> = new Set(EXIT_REASONS);
 
 // Fields tolerated at the top level. Unknown keys throw — the
 // motivation is the same as policy parsing: a typo like `expects`
@@ -237,44 +245,14 @@ const parseExpectation = (raw: unknown, idx: number): EvalExpectation => {
     }
     case 'exit_reason': {
       const reason = requireString(r.exit_reason, `expect[${idx}].exit_reason`);
-      // Mirror of harness types.ExitReason; kept inline to avoid
-      // pulling the union into runtime. Stay in sync with
-      // src/harness/types.ts when ExitReason grows.
-      const valid = new Set([
-        'done',
-        'maxSteps',
-        'maxWallClockMs',
-        'maxOutputTokens',
-        'maxCostUsd',
-        'maxToolErrors',
-        'degenerateLoop',
-        'aborted',
-        'providerError',
-        'internalError',
-        'scriptExhausted',
-        'userPromptBlocked',
-      ]);
-      if (!valid.has(reason)) {
+      if (!VALID_EXIT_REASONS.has(reason)) {
         throw new Error(
-          `eval: expect[${idx}].exit_reason must be one of: ${[...valid].sort().join(', ')}`,
+          `eval: expect[${idx}].exit_reason must be one of: ${[...VALID_EXIT_REASONS]
+            .sort()
+            .join(', ')}`,
         );
       }
-      return {
-        kind,
-        reason: reason as
-          | 'done'
-          | 'maxSteps'
-          | 'maxWallClockMs'
-          | 'maxOutputTokens'
-          | 'maxCostUsd'
-          | 'maxToolErrors'
-          | 'degenerateLoop'
-          | 'aborted'
-          | 'providerError'
-          | 'internalError'
-          | 'scriptExhausted'
-          | 'userPromptBlocked',
-      };
+      return { kind, reason: reason as ExitReason };
     }
     case 'output_contains':
       return { kind, pattern: requireString(r.output_contains, `expect[${idx}].output_contains`) };

@@ -280,6 +280,30 @@ export interface LiveState {
   // seed (timestamp-based picks can change mid-turn under clock
   // skew or replay).
   thinking: { startedAt: number; messageId: string } | null;
+  // Self-critique pass live indicator (AGENTIC_CLI.md §5.4). Set by
+  // `critique:start` (harness adapter translates `critique_started`)
+  // and cleared by EITHER `critique:ask` (modal about to open —
+  // critic call is over, the wait is now on the operator) OR
+  // `critique:end` (idem `critique_finished`, when no modal opens).
+  // The composer reads this to render a chip during the up-to-3s
+  // critic call — without it, the live region goes silent between
+  // executor `assistant:end` and the modal opening, which is
+  // indistinguishable from a hang.
+  //
+  // The clear at `critique:ask` is load-bearing for honesty:
+  // `critique_finished` only fires AFTER `confirmCritique` resolves,
+  // so leaving the chip up after the modal opens would have its
+  // elapsed counter tick across operator decision time. Operators
+  // would read "Reviewing… (45s)" while the critic call had
+  // actually completed in 2s and the remaining 43s was them
+  // reading the modal — and "still reviewing" is exactly the
+  // wrong UX cue when the surface is awaiting a human answer.
+  //
+  // `toolPlanWrites` mirrors the modal flag so the chip can
+  // visually escalate when the proposal includes writes:true tool
+  // calls (about-to-mutate critiques deserve a stronger color
+  // than text-only end-of-step reviews).
+  critique: { startedAt: number; stepN: number; toolPlanWrites: boolean } | null;
   // "Awaiting model" indicator. Set by `provider:waiting:start`
   // (which the harness adapter emits on `step_start` — i.e.,
   // right after the harness loop hands the request to the
@@ -410,6 +434,7 @@ export const createInitialState = (): LiveState => ({
   pendingToolEndBatch: null,
   pendingAssistant: null,
   thinking: null,
+  critique: null,
   awaitingProvider: null,
   modal: null,
   slash: null,
@@ -796,6 +821,11 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           // — the footer would then show "Awaiting model" against a
           // run that's already terminated.
           awaitingProvider: null,
+          // Same boundary cleanup for the critique chip: a session
+          // ending mid-critique (abort signal interrupted the
+          // critic call, watchdog never closed) shouldn't leave a
+          // dangling "Reviewing…" chip in the live region.
+          critique: null,
           ended: true,
         },
         permanent: [
@@ -958,6 +988,32 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         state: event.type === 'thinking:end' ? { ...state, thinking: null } : state,
         permanent: [],
       };
+
+    case 'critique:start':
+      // Self-critique pass started. Open the chip — composer
+      // (compose.ts) reads `state.critique` and renders a
+      // "Reviewing… (Xs)" line during the otherwise-silent window
+      // while the critic LLM call is in flight. Mutually exclusive
+      // with thinking / pendingAssistant / awaitingProvider — the
+      // executor's `assistant:end` fires before critique starts,
+      // so those states are already null by the time this hits.
+      return {
+        state: {
+          ...state,
+          critique: {
+            startedAt: event.ts,
+            stepN: event.stepN,
+            toolPlanWrites: event.toolPlanWrites,
+          },
+        },
+        permanent: [],
+      };
+
+    case 'critique:end':
+      // Close the chip. The next operator-visible surface is
+      // either the modal (when issues crossed threshold) or the
+      // next assistant turn (when no issues OR ignore was chosen).
+      return { state: { ...state, critique: null }, permanent: [] };
 
     case 'tool:start': {
       const tool: ActiveTool = {
@@ -1512,23 +1568,54 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
     }
 
     case 'critique:ask': {
+      // Three-way decision per AGENTIC_CLI.md §5.4 line 551 and
+      // ORCHESTRATION.md §6.2: ignore (proceed), redo (re-run with
+      // hint), abort (stop the run). Default selection is `abort`
+      // (last) — the most conservative answer for a step that just
+      // got flagged. The D5/D65 convention places the safe default
+      // last, but for critique "safe" means "don't proceed without
+      // the operator looking", which `abort` captures more
+      // strongly than `ignore` (proceeding blind) or `redo`
+      // (re-running and possibly looping).
+      //
+      // We ALSO clear `state.critique` here. The chip's `startedAt`
+      // is the critic LLM call's start — at the point the modal
+      // opens, that call is already over and the remaining wait is
+      // on the operator. Letting the chip live past this point
+      // would have it tick across human decision time, reading
+      // "Reviewing… (45s)" when the actual critic call took 2s
+      // and the rest was the operator reading. The eventual
+      // `critique:end` (mapped from `critique_finished`, fired
+      // AFTER `confirmCritique` resolves) becomes a no-op for the
+      // chip since we already nulled it; that's intentional —
+      // both clear sites converge on the same end state.
       const options: ConfirmOption[] = [
-        { key: '1', label: 'Acknowledge', value: 'yes' },
-        { key: '2', label: 'Reject', value: 'no' },
+        { key: '1', label: 'Ignore', value: 'ignore' },
+        { key: '2', label: 'Redo with hint', value: 'redo' },
+        { key: '3', label: 'Abort step', value: 'abort' },
       ];
       const previewLines = event.issues.map(
         (i) => `[${i.severity}] (${i.confidence.toFixed(2)}) ${i.message}`,
       );
+      // Stronger headline when the proposal includes writes:true
+      // tool calls. The `toolPlanWrites` flag is forwarded by the
+      // producer (harness's confirmCritique bridge); absent ⇒
+      // text-only end-of-step critique.
+      const writes = event.toolPlanWrites === true;
+      const title = writes ? 'Critique — about to mutate' : 'Critique';
       return {
         state: {
           ...state,
+          critique: null,
           modal: {
             promptId: event.promptId,
             flavor: 'critique',
-            title: 'Critique',
+            title,
             subject: `${event.issues.length} issue(s)`,
             preview: previewLines,
-            question: null,
+            question: writes
+              ? 'Proceed with the writes, redo with hint, or abort?'
+              : 'Ignore, redo with hint, or abort?',
             options,
             selectedIndex: options.length - 1,
             hints: ['Esc to cancel'],

@@ -60,10 +60,33 @@ export interface SlashContext {
   modalManager: ModalManager;
   // Cumulative-cost tracker the REPL maintains across turns. /cost
   // reads it. Numbers are USD; the bridge formats for display.
+  //
+  // `critiqueCostUsd` is a SUBSET of `costUsd` — the harness adds
+  // critique spend into the session total per ORCHESTRATION §6.3,
+  // so showing "cumulative: $X · critique: $Y" lets the operator
+  // see how much of total spend went to the second-pass review
+  // (matters for tuning mode/threshold). Updates per
+  // `critique_finished` event, not session_finished, so it stays
+  // accurate even if a run aborts before completion.
+  //
+  // `critiqueRuns` is the count of critique invocations (every
+  // `critique_finished` increments by one regardless of strategy
+  // — `llm`, `skipped`, and `failed` all count as "the engine
+  // was reached"). Tracked separately from cost so `/cost` can
+  // distinguish "critique never ran" (count 0 — gate is `off`,
+  // or `shouldCritique` shortcircuited every step) from "critique
+  // ran but cost is zero" (count > 0 with cost 0 — typically
+  // missing provider usage telemetry, or every run was
+  // `strategy=skipped`). Without this split, a zero cost from
+  // missing telemetry was indistinguishable from a never-ran
+  // gate and `/cost` silently dropped the critique line in real
+  // critique runs.
   cumulative: {
     costUsd: number;
     steps: number;
     turns: number;
+    critiqueCostUsd: number;
+    critiqueRuns: number;
   };
   // Wall-clock source for emitted UIEvents. Defaults to Date.now in
   // production; tests inject a counter.
@@ -90,6 +113,15 @@ export interface SlashContext {
   // boot and first turn — callers MUST treat null as "skip the
   // attribution override" rather than passing it through.
   currentSessionId: () => string | null;
+  // All session ids the REPL has tracked since boot, oldest
+  // first. Each finished turn pushes its session id; playbook
+  // subagent dispatches push the child's session id too. Slash
+  // commands that aggregate across the whole REPL (today
+  // `/critique`) read this instead of `currentSessionId` so an
+  // operator running 5 turns + 1 playbook sees data from all 6
+  // sessions, not just the last one. Empty until the first turn
+  // finishes — caller treats `[]` as "no sessions yet".
+  replSessionIds: () => readonly string[];
   // History controls (HISTORY.md §2.3). `/history off` / `/history on`
   // toggle the session-volatile flag; `/history clear` invokes
   // `clearLocal` AFTER the storage layer wipe so the in-memory
