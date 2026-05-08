@@ -31,14 +31,30 @@ import {
 const FILE_WRITER_TOOLS: ReadonlySet<string> = new Set(['write_file', 'edit_file']);
 
 // Bash family. Every shell call shows up under commands_run; the
-// foreground/background variant doesn't matter for the projection
-// (audit consumers can still pivot on tool_calls.tool_name).
+// foreground/background variant doesn't matter for category
+// assignment (audit consumers can still pivot on
+// `tool_calls.tool_name`). It DOES matter for exit-code semantics
+// though — see `FOREGROUND_BASH_TOOLS` below.
 const BASH_TOOLS: ReadonlySet<string> = new Set([
   'bash',
   'bash_background',
   'bash_kill',
   'bash_output',
 ]);
+
+// Subset of bash tools whose `tool_calls.status='done'` means
+// "the command finished and we have an exit code". Today only
+// foreground `bash` qualifies. `bash_background` reports done at
+// spawn time (the process keeps running afterward); reading its
+// `exit_code` from the recap would lie about completion. The
+// gate also excludes background calls from the test-runner
+// heuristic — a backgrounded `bun test` cannot be honestly
+// reported as `passed` because the process state at recap time
+// is undecidable. Foreground/background distinction is captured
+// here instead of by category-tag on the tool because the
+// recap projection is the only consumer that cares about the
+// difference today; pushing it into tool metadata is premature.
+const FOREGROUND_BASH_TOOLS: ReadonlySet<string> = new Set(['bash']);
 
 const READ_TOOLS: ReadonlySet<string> = new Set(['read_file']);
 
@@ -381,9 +397,26 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
         } else if (BASH_TOOLS.has(tc.toolName)) {
           const command = typeof input?.command === 'string' ? input.command : '';
           if (command.length > 0) {
-            const exitCode = extractExitCode(tc);
+            const isForeground = FOREGROUND_BASH_TOOLS.has(tc.toolName);
+            // Background bash variants exit to `done` at spawn,
+            // not at process exit — `extractExitCode` would
+            // return 0 (the "done with no exit_code" fallback)
+            // and the recap would falsely report success. Use
+            // the -1 sentinel ("no exit observed") which the
+            // renderer can flag visually. Audit consumers
+            // branching on exit_code already treat negative
+            // values as "no signal", so this preserves their
+            // existing assumptions.
+            const exitCode = isForeground ? extractExitCode(tc) : -1;
             commandsRun.push({ command, exitCode, durationMs: tc.durationMs ?? 0 });
-            if (isTestRunner(command)) {
+            // Test-runner heuristic gated to foreground only. A
+            // backgrounded `bun test` produces no recap-time
+            // signal of pass/fail; reporting it as `passed:true`
+            // because the spawn succeeded would mislead the
+            // operator about validation outcome. The command
+            // still appears under commandsRun above (with
+            // exitCode=-1) so it is not silently dropped.
+            if (isForeground && isTestRunner(command)) {
               testsRun.push({
                 command,
                 passed: exitCode === 0,

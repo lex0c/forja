@@ -607,6 +607,87 @@ describe('projectRecap', () => {
     expect(out.decisions[0]?.decidedBy).toBe('policy');
   });
 
+  test('bash_background commands report exitCode=-1 instead of 0', () => {
+    // Regression: `bash_background` reaches tool_calls.status=
+    // 'done' as soon as the process spawns, NOT when it exits.
+    // The previous extractExitCode fallback returned 0 for any
+    // done call without explicit exit_code, so the recap falsely
+    // claimed a clean exit for a process that may still be
+    // running, may have crashed, or may not have started at all.
+    // The fix: foreground bash uses the existing exit-code path;
+    // background variants get -1 ("no exit observed").
+    const s = seedSession();
+    const userId = addUserTurn(s.id, 'launch a watcher');
+    const aId = addAssistantTurn(s.id, userId, 'launching');
+    addToolCall(
+      aId,
+      'bash_background',
+      { command: 'bun run dev --watch' },
+      { process_id: 'pid-1', label: 'watcher' },
+      'done',
+      40,
+      1_301,
+    );
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.actions.commandsRun).toHaveLength(1);
+    expect(out.actions.commandsRun[0]).toEqual({
+      command: 'bun run dev --watch',
+      exitCode: -1,
+      durationMs: 40,
+    });
+  });
+
+  test('backgrounded test runner is NOT reported as passed', () => {
+    // Regression: a backgrounded `bun test` would land in
+    // outcomes.testsRun with passed=true via the spawn-only
+    // exit-code-0 fallback. There is no recap-time signal of
+    // actual pass/fail — the process may still be running or
+    // may have failed unobserved. Test-runner heuristic must
+    // fire ONLY on foreground bash so the operator never
+    // reads validation success from a spawn that hasn't
+    // settled. The command still appears under commandsRun
+    // (with exitCode=-1) so it is not silently dropped.
+    const s = seedSession();
+    const userId = addUserTurn(s.id, 'kick off the suite in bg');
+    const aId = addAssistantTurn(s.id, userId, 'running');
+    addToolCall(
+      aId,
+      'bash_background',
+      { command: 'bun test' },
+      { process_id: 'pid-bg-1' },
+      'done',
+      30,
+      1_301,
+    );
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.outcomes.testsRun).toEqual([]);
+    // commandsRun preserves the call so audit consumers can
+    // still see the spawn happened — they just see exitCode=-1
+    // signaling unknown completion.
+    expect(out.actions.commandsRun).toHaveLength(1);
+    expect(out.actions.commandsRun[0]?.exitCode).toBe(-1);
+  });
+
+  test('foreground bash test runner still enters testsRun (positive control)', () => {
+    // Negative space for the FOREGROUND_BASH_TOOLS gate: the
+    // fix must not over-narrow and stop reporting honest
+    // foreground test runs. Without this control, a regression
+    // that excluded `bash` from the heuristic would silently
+    // empty the testsRun section across every session.
+    const s = seedSession();
+    const userId = addUserTurn(s.id, 'run tests');
+    const aId = addAssistantTurn(s.id, userId, 'running');
+    addToolCall(aId, 'bash', { command: 'bun test' }, { exit_code: 0 }, 'done', 120, 1_301);
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.outcomes.testsRun).toEqual([{ command: 'bun test', passed: true, durationMs: 120 }]);
+  });
+
   test('day scope rejects malformed date strings', () => {
     expect(() =>
       projectRecap(db, {
