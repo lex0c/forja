@@ -233,14 +233,6 @@ export const runCritique = async (
   // at a version that exists in PROMPT_BY_VERSION. The original
   // requested string surfaces via the config-loader's warning,
   // not via audit data.
-  // Resolve to the canonical version (the one we'll actually
-  // render), not the requested string. An unknown version (e.g.
-  // operator typo'd `prompt_version = "v9999"`) collapses to the
-  // default here so every downstream reference — request
-  // metadata, CritiqueResult.promptVersion, audit row — points
-  // at a version that exists in PROMPT_BY_VERSION. The original
-  // requested string surfaces via the config-loader's warning,
-  // not via audit data.
   const promptVersion = resolveCritiquePromptVersion(
     options.promptVersion ?? DEFAULT_CRITIQUE_PROMPT_VERSION,
   );
