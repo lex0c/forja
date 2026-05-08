@@ -65,6 +65,21 @@ const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$
 // literal backslash inside the regex source `[/\\]`.
 const SEP_REGEX_CLASS = '[/\\\\]';
 
+// Negative lookahead listing chars that COULD continue an
+// identifier-shaped token after the home prefix. The
+// fallback bare-home pass uses this to distinguish a real
+// home reference from a longer identifier that shares it
+// (`/home/alice-backup`, `/home/alice.bak`, `/home/alicia`).
+// Word chars (`\w` = `[A-Za-z0-9_]`) plus `-` and `.` —
+// the two non-word chars that show up most commonly inside
+// usernames and filenames. Without `-` and `.` here, the
+// previous `\b` shape rewrote `/home/alice-backup/log.txt`
+// to `~-backup/log.txt` because `\b` matches at any
+// word-vs-non-word transition. Other shell-meaningful chars
+// (whitespace, quotes, closers, separators) ARE allowed to
+// trigger redaction — they mark the end of the path token.
+const IDENTIFIER_CONTINUATION = '[A-Za-z0-9_\\-.]';
+
 // Redact `$HOME` paths embedded inside a free-text field (goal
 // text, command lines, decision reasons, subagent summaries,
 // open questions). The single-path `anonymize` helper above
@@ -79,15 +94,18 @@ const SEP_REGEX_CLASS = '[/\\\\]';
 //      preserved in the replacement so the operator's native
 //      separator survives. "cat /home/lex/x" → "cat ~/x";
 //      "type C:\Users\alice\x" → "type ~\x".
-//   2. `<home>\b` → `~`  — bare home with no trailing separator,
-//      followed by a word boundary (end-of-string, whitespace,
-//      non-word punctuation). "cd /home/lex" → "cd ~". The `\b`
-//      check distinguishes the home prefix from a longer
-//      identifier sharing the same prefix (`/home/lexicon`,
-//      `/home/lexa.bak`) — those are NOT redacted because the
-//      home segment is part of a different path. Word boundary
-//      semantics are POSIX-vs-Windows-agnostic: both `/` and
-//      `\` are non-word characters.
+//   2. `<home>(?!<identifier-continuation>)` → `~`  — bare home
+//      with no trailing separator, only matched when the next
+//      char does NOT continue an identifier (so word chars,
+//      `-`, and `.` are excluded). End-of-string, whitespace,
+//      and shell delimiters DO trigger redaction. The earlier
+//      `\b` shape over-matched because `\b` triggers at any
+//      word-vs-non-word transition, so `/home/alice-backup`
+//      and `/home/alice.bak` got rewritten to `~-backup` and
+//      `~.bak` even though those are sibling paths NOT under
+//      $HOME. Excluding `-` and `.` from the boundary keeps
+//      identifier-shaped suffixes intact while still firing
+//      redaction on real path-token endings.
 //
 // JSON renderer is intentionally NOT wired through this helper:
 // audit consumers need the literal path. The human renderer is
@@ -97,7 +115,7 @@ const anonymizeText = (text: string, home: string): string => {
   const escaped = escapeRegex(home);
   return text
     .replace(new RegExp(`${escaped}(${SEP_REGEX_CLASS})`, 'g'), '~$1')
-    .replace(new RegExp(`${escaped}\\b`, 'g'), '~');
+    .replace(new RegExp(`${escaped}(?!${IDENTIFIER_CONTINUATION})`, 'g'), '~');
 };
 
 const formatDuration = (ms: number): string => {

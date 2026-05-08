@@ -443,6 +443,79 @@ describe('renderHuman', () => {
     expect(out).toContain('C:\\Users\\alicia\\notes');
     expect(out).not.toContain('~ia');
   });
+
+  test('redaction does NOT trigger on `-` after home (e.g. /home/alice-backup)', () => {
+    // Regression: the previous `\b` boundary fired on the
+    // word-vs-non-word transition between `e` and `-`, so
+    // `/home/alice-backup/log.txt` was rewritten to
+    // `~-backup/log.txt` even though it is NOT under $HOME.
+    // Sibling paths sharing a username prefix must stay literal.
+    const data = empty();
+    data.goal = {
+      text: 'compare /home/alice-backup/log.txt with the live one',
+      sourceStepId: 'x',
+    };
+    const out = renderHuman(data, { home: '/home/alice' });
+    expect(out).toContain('/home/alice-backup/log.txt');
+    expect(out).not.toContain('~-backup');
+  });
+
+  test('redaction does NOT trigger on `.` after home (e.g. /home/alice.bak)', () => {
+    // Same family as the `-` case — `\b` fires at the word/
+    // non-word boundary between `e` and `.`, corrupting
+    // `/home/alice.bak/x` into `~.bak/x`. Sibling backup dirs
+    // and `.local` style suffixes are common and must stay
+    // literal.
+    const data = empty();
+    data.goal = {
+      text: 'check /home/alice.bak/restore.sql before merging',
+      sourceStepId: 'x',
+    };
+    const out = renderHuman(data, { home: '/home/alice' });
+    expect(out).toContain('/home/alice.bak/restore.sql');
+    expect(out).not.toContain('~.bak');
+  });
+
+  test('redaction still fires on legitimate path-token boundaries', () => {
+    // Negative space for the IDENTIFIER_CONTINUATION exclusion:
+    // narrowing the boundary check must NOT break the
+    // legitimate cases the previous `\b` shape covered. Each
+    // entry below is a real bare-home reference where the
+    // following char marks the END of the path token.
+    const cases: { text: string; expectAfter: string }[] = [
+      { text: 'cd /home/alice', expectAfter: 'cd ~' }, // end-of-string
+      { text: 'cd /home/alice && ls', expectAfter: 'cd ~ && ls' }, // whitespace
+      { text: "echo '/home/alice'", expectAfter: "echo '~'" }, // quote-bounded
+      { text: 'echo "/home/alice"', expectAfter: 'echo "~"' }, // double-quote
+      { text: 'list (/home/alice) here', expectAfter: 'list (~) here' }, // paren-bounded
+      { text: 'a;/home/alice;b', expectAfter: 'a;~;b' }, // semicolon-bounded
+      { text: 'a&&/home/alice&&b', expectAfter: 'a&&~&&b' }, // shell-and
+    ];
+    for (const { text, expectAfter } of cases) {
+      const data = empty();
+      data.goal = { text, sourceStepId: 'x' };
+      const out = renderHuman(data, { home: '/home/alice' });
+      expect(out).toContain(expectAfter);
+      expect(out).not.toContain('/home/alice;');
+      expect(out).not.toContain('(/home/alice)');
+    }
+  });
+
+  test('Windows: redaction does NOT trigger on `-` / `.` after home', () => {
+    // Mirror of the POSIX cases above for Windows separators.
+    // `C:\Users\alice-backup` and `C:\Users\alice.bak` are
+    // sibling directories that must NOT be redacted.
+    const data = empty();
+    data.goal = {
+      text: 'compare C:\\Users\\alice-backup\\log and C:\\Users\\alice.bak\\db',
+      sourceStepId: 'x',
+    };
+    const out = renderHuman(data, { home: 'C:\\Users\\alice' });
+    expect(out).toContain('C:\\Users\\alice-backup\\log');
+    expect(out).toContain('C:\\Users\\alice.bak\\db');
+    expect(out).not.toContain('~-backup');
+    expect(out).not.toContain('~.bak');
+  });
 });
 
 describe('renderRecap dispatcher', () => {
