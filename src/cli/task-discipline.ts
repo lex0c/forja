@@ -28,7 +28,8 @@ When working on the task, default to the simplest change that does what was aske
 - Don't add error handling, fallbacks, or validation for scenarios that can't happen. Trust internal code and framework guarantees. Validate at system boundaries (user input, external APIs), not between trusted internal modules.
 - Default to writing no comments. Add a comment only when the WHY is non-obvious — a hidden constraint, a subtle invariant, a workaround for a specific bug, behavior that would surprise a reader. Don't explain WHAT well-named identifiers already convey, and don't reference the current task ("added for X", "used by Y") — those belong in the PR description and rot as the codebase evolves.
 - Don't add backwards-compatibility shims, renamed-but-unused vars, or removed-code stubs when the change has no external consumer. If something is unused, delete it.
-- For UI / frontend changes, exercise the feature in a browser before declaring it done — type checking and tests verify code correctness, not feature correctness.`;
+- For UI / frontend changes, exercise the feature in a browser before declaring it done — type checking and tests verify code correctness, not feature correctness.
+- Before producing the final answer for a turn, close any active todos you opened via \`todo_write\`. Mark each one \`done\` if the work landed; if it didn't (workflow shifted, blocker hit, scope abandoned), update the list honestly — either drop the row or leave it \`pending\` with the reason captioned. A turn that ends with a row in \`in_progress\` signals abandoned work to the operator, even when the answer above is complete.`;
 
 // Compose this guidance onto an optional downstream system prompt.
 // The discipline section is PREPENDED so it lands first in the
