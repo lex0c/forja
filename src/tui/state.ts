@@ -26,6 +26,44 @@ export interface InputState {
   cursor: number;
 }
 
+// Threshold below which a pending tool-end batch flushes as
+// individual chips (no visual savings from coalescing 1-2 items).
+// At/above the threshold, the batch flushes as a single
+// `tool-end-batch` PermanentItem. Tuned to 3 because that's the
+// smallest count where the operator visibly benefits from the
+// summary chip (Read 3 files reads cleaner than three back-to-back
+// "Read in 0.2s" chips with similar subjects).
+export const TOOL_BATCH_COALESCE_THRESHOLD = 3;
+
+// Item buffered inside `PendingToolEndBatch.items` — captures
+// what each child child contributed so the flush helper can decide
+// to emit individual `tool-end` items (when count < threshold) or
+// summarize them as `tool-end-batch` (count >= threshold). Mirrors
+// the relevant subset of the `tool-end` PermanentItem shape so
+// flushing as individual items is a 1:1 map.
+export interface PendingToolEndBatchItem {
+  verb: string;
+  subject: string | null;
+  status: 'done' | 'error' | 'denied';
+  durationMs: number;
+  summary?: string;
+}
+
+// Reducer-side buffer for slice 3 (read coalescing). See
+// `LiveState.pendingToolEndBatch` for the full lifecycle commentary.
+export interface PendingToolEndBatch {
+  // Tool name (e.g. 'read_file'). Batch only forms across
+  // matching names — a different-name tool-end is a flush trigger.
+  name: string;
+  // Parent grouping (subagent id when set). Two batches with the
+  // same name but different parentIds DO NOT merge — operator
+  // attribution stays correct (parent's reads vs child's reads
+  // surface as separate batches).
+  parentId?: string;
+  // Captured children, in completion order.
+  items: PendingToolEndBatchItem[];
+}
+
 export interface ActiveTool {
   toolId: string;
   name: string;
@@ -217,6 +255,21 @@ export interface LiveState {
   // Keyed by toolId so updates are O(1). Insertion order is preserved
   // by `Map`, so the renderer can iterate and produce stable layout.
   activeTools: Map<string, ActiveTool>;
+  // Transient buffer for the renderer-side coalescing of consecutive
+  // same-tool tool-end items (slice 3). Holds tool-end records that
+  // share a `name` + `parentId` until a flush trigger arrives:
+  // - tool:end with a different (name, parentId) → flush old, buffer new
+  // - tool:start (matching or not) → flush
+  // - any event that emits a top-level scrollback item → flush first
+  // - session:start / session:end → flush
+  //
+  // On flush, if `items.length >= TOOL_BATCH_COALESCE_THRESHOLD`, the
+  // batch emits a single `tool-end-batch` PermanentItem with N as the
+  // count + N `|_` continuation subjects; otherwise each item emits
+  // as its own `tool-end` (no visual savings, no fold). Null when
+  // no batch is pending. The buffer is INTERNAL to the reducer —
+  // renderer never reads it directly.
+  pendingToolEndBatch: PendingToolEndBatch | null;
   pendingAssistant: PendingAssistant | null;
   // `messageId` carried alongside `startedAt` so the thinking
   // chip can hash a stable per-turn seed when picking its
@@ -338,6 +391,7 @@ export const createInitialState = (): LiveState => ({
     memoryCount: 0,
   },
   activeTools: new Map(),
+  pendingToolEndBatch: null,
   pendingAssistant: null,
   thinking: null,
   modal: null,
@@ -422,6 +476,44 @@ export type PermanentItem =
       // belongs to its owner. Absent for top-level tool calls.
       parentId?: string;
     }
+  | {
+      // Coalesced batch of N consecutive same-name + same-parentId
+      // tool-end items, emitted by the reducer when the pending
+      // batch flushes with `count >= TOOL_BATCH_COALESCE_THRESHOLD`.
+      // Reads as a single chip "Read 3 files in 0.6s" with the N
+      // subjects as `|_` continuation lines underneath.
+      kind: 'tool-end-batch';
+      // Tool name — single value because the batch only forms across
+      // matching names.
+      name: string;
+      // Headline verb. Pluralized for known file-shaped tools
+      // (read_file → "Read N files", write_file → "Wrote N files",
+      // etc.); generic `${verb} ×N` fallback for everything else.
+      // Renderer overrides with "Failed" / "Denied" when status is
+      // non-done, mirroring tool-end behavior.
+      verb: string;
+      count: number;
+      // Sum of children's durations. For parallel batches this
+      // overcounts vs wall-clock — the renderer labels it as
+      // `in <total>` rather than `in <wall-clock>` so the operator
+      // reads it as cumulative work, not elapsed time.
+      totalDurationMs: number;
+      // One subject per child, in completion order. Null subjects
+      // (tools without a vocab subject extractor) are filtered out
+      // before the batch flushes — a `|_ ` line with no payload
+      // would be visual noise.
+      subjects: string[];
+      // Worst-of-children status. If any child failed → 'error';
+      // else any denied → 'denied'; else 'done'. Honest about a
+      // mixed batch — operator sees one chip but knows at least
+      // one tool inside hit the bad path.
+      status: 'done' | 'error' | 'denied';
+      // Forwarded from the children (all share the same parentId
+      // by the batch invariant). Optional only for symmetry with
+      // tool-end; the field is absent only when all children were
+      // top-level.
+      parentId?: string;
+    }
   | { kind: 'error'; message: string }
   | { kind: 'warn'; message: string }
   | { kind: 'info'; message: string }
@@ -478,7 +570,109 @@ const appendPreview = (tool: ActiveTool, text: string): ActiveTool => {
 
 const cloneTools = (tools: Map<string, ActiveTool>): Map<string, ActiveTool> => new Map(tools);
 
-export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
+// Pluralized headline verb for a coalesced batch. Hand-mapped for
+// the file-shaped tools where "Read 3 files" reads more naturally
+// than "Read file ×3"; everything else falls through to the
+// generic `${verb} ×${count}` form. Kept inline (not a vocab
+// extension) because the surface is small and the renderer-side
+// fold is the only consumer; centralizing in vocab would add
+// indirection without payoff.
+const batchHeadlineVerb = (name: string, childVerb: string, count: number): string => {
+  switch (name) {
+    case 'read_file':
+      return `Read ${count} files`;
+    case 'write_file':
+      return `Wrote ${count} files`;
+    case 'edit_file':
+      return `Edited ${count} files`;
+    case 'bash':
+      return `Executed ${count} commands`;
+    case 'grep':
+      return `Searched ${count} times`;
+    case 'glob':
+      return `Globbed ${count} times`;
+    default:
+      return `${childVerb} ×${count}`;
+  }
+};
+
+// Worst-of children for the batch chip's status. Single failure
+// poisons the chip — operator sees "error" and knows to look,
+// rather than seeing "done" and missing one bad file in the
+// middle of an otherwise-green run. Order matters: error >
+// denied > done.
+const batchWorstStatus = (
+  items: readonly PendingToolEndBatchItem[],
+): 'done' | 'error' | 'denied' => {
+  let denied = false;
+  for (const it of items) {
+    if (it.status === 'error') return 'error';
+    if (it.status === 'denied') denied = true;
+  }
+  return denied ? 'denied' : 'done';
+};
+
+// Flush the pending tool-end batch into PermanentItems. Returns
+// the next state (with batch cleared) and the items to push.
+// Behavior:
+//   - batch null/empty → no-op, returns empty array
+//   - count < TOOL_BATCH_COALESCE_THRESHOLD → emit each as an
+//     individual `tool-end` (no visual fold; the buffer just
+//     deferred them by one or two events)
+//   - count >= threshold → emit a single `tool-end-batch` with
+//     the children's subjects as continuation lines
+// Exported for the test driver, which terminates without a
+// natural flush trigger after the last `tool:end`. Production
+// callers don't invoke this directly — the wrapped `applyEvent`
+// flushes on the next scrollback-emitting event.
+export const flushPendingToolEndBatch = (
+  state: LiveState,
+): { state: LiveState; permanent: PermanentItem[] } => {
+  const batch = state.pendingToolEndBatch;
+  if (batch === null || batch.items.length === 0) return { state, permanent: [] };
+  const next: LiveState = { ...state, pendingToolEndBatch: null };
+  if (batch.items.length < TOOL_BATCH_COALESCE_THRESHOLD) {
+    const permanent: PermanentItem[] = batch.items.map((it) => ({
+      kind: 'tool-end',
+      name: batch.name,
+      verb: it.verb,
+      subject: it.subject,
+      status: it.status,
+      durationMs: it.durationMs,
+      ...(it.summary !== undefined ? { summary: it.summary } : {}),
+      ...(batch.parentId !== undefined ? { parentId: batch.parentId } : {}),
+    }));
+    return { state: next, permanent };
+  }
+  const totalDurationMs = batch.items.reduce((s, it) => s + it.durationMs, 0);
+  const subjects = batch.items
+    .map((it) => it.subject)
+    .filter((s): s is string => s !== null && s !== '');
+  const headlineVerb = batchHeadlineVerb(
+    batch.name,
+    batch.items[0]?.verb ?? batch.name,
+    batch.items.length,
+  );
+  const status = batchWorstStatus(batch.items);
+  const summary: PermanentItem = {
+    kind: 'tool-end-batch',
+    name: batch.name,
+    verb: headlineVerb,
+    count: batch.items.length,
+    totalDurationMs,
+    subjects,
+    status,
+    ...(batch.parentId !== undefined ? { parentId: batch.parentId } : {}),
+  };
+  return { state: next, permanent: [summary] };
+};
+
+// Inner switch — pure reducer that doesn't manage the
+// pendingToolEndBatch flush lifecycle. Wrapper `applyEvent`
+// composes the flush around it so the buffer logic stays
+// localized to one place rather than threaded through every
+// case that emits permanent items.
+const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
   switch (event.type) {
     case 'session:start': {
       const status: StatusState = {
@@ -732,20 +926,43 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
 
     case 'tool:end': {
       const tool = state.activeTools.get(event.toolId);
-      const next = cloneTools(state.activeTools);
-      next.delete(event.toolId);
-      if (tool === undefined) return { state: { ...state, activeTools: next }, permanent: [] };
-      const item: PermanentItem = {
-        kind: 'tool-end',
-        name: tool.name,
+      const nextTools = cloneTools(state.activeTools);
+      nextTools.delete(event.toolId);
+      if (tool === undefined) return { state: { ...state, activeTools: nextTools }, permanent: [] };
+      const incoming: PendingToolEndBatchItem = {
         verb: tool.finalVerb,
         subject: tool.subject,
         status: event.status,
         durationMs: event.durationMs,
         ...(event.summary !== undefined ? { summary: event.summary } : {}),
-        ...(tool.parentId !== undefined ? { parentId: tool.parentId } : {}),
       };
-      return { state: { ...state, activeTools: next }, permanent: [item] };
+      const pending = state.pendingToolEndBatch;
+      const matches =
+        pending !== null && pending.name === tool.name && pending.parentId === tool.parentId;
+      if (matches) {
+        // Extend the existing batch; emit nothing yet. The flush
+        // happens when a non-matching event arrives.
+        const extended: PendingToolEndBatch = {
+          ...pending,
+          items: [...pending.items, incoming],
+        };
+        return {
+          state: { ...state, activeTools: nextTools, pendingToolEndBatch: extended },
+          permanent: [],
+        };
+      }
+      // Different name/parentId (or no batch): flush whatever's
+      // pending and start a new batch with the incoming item.
+      const flushed = flushPendingToolEndBatch(state);
+      const fresh: PendingToolEndBatch = {
+        name: tool.name,
+        ...(tool.parentId !== undefined ? { parentId: tool.parentId } : {}),
+        items: [incoming],
+      };
+      return {
+        state: { ...flushed.state, activeTools: nextTools, pendingToolEndBatch: fresh },
+        permanent: flushed.permanent,
+      };
     }
 
     case 'step:budget': {
@@ -1333,4 +1550,45 @@ export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
       throw new Error(`applyEvent: unhandled event type ${(event as { type: string }).type}`);
     }
   }
+};
+
+// Public reducer. Wraps the inner switch with the
+// `pendingToolEndBatch` flush lifecycle (slice 3):
+//
+//   - `tool:end` events: handled directly by the inner switch,
+//     which extends the buffer or starts a new one. NEVER auto-
+//     flushes here — that would defeat the coalescing.
+//   - Any other event whose inner result emits permanent items:
+//     flush the pending batch FIRST, then prepend the flushed
+//     items to the inner's permanent. This preserves scrollback
+//     order — the batch (e.g., 3 reads) chronologically completed
+//     before whatever scrollback-emitting event fired next.
+//   - Events that emit no permanent items (status updates,
+//     deltas, heartbeats, parallel:status, cost_update wrapped
+//     in subagent_progress that doesn't rise to permanent):
+//     buffer holds across them. This is the load-bearing
+//     invariant: a parallel batch of reads can interleave with
+//     subagent:update heartbeats and still coalesce correctly.
+//
+// INVARIANT — DO NOT VIOLATE:
+//   No reducer case other than `tool:end` may read or mutate
+//   `state.pendingToolEndBatch`. The wrapper's "flush only when
+//   inner produced permanent items" rule depends on the buffer
+//   being unchanged across non-tool:end inner calls. A new case
+//   that touches the buffer would either double-flush (if it
+//   also flushed internally) or silently skip a flush (if it
+//   extended the buffer but emitted no permanent items, the
+//   wrapper would assume "nothing happened" and the next non-
+//   tool:end emitter would flush stale entries with the wrong
+//   chronology). Add buffer manipulation to `tool:end` only;
+//   for everything else, treat the field as opaque.
+export const applyEvent = (state: LiveState, event: UIEvent): ApplyResult => {
+  const inner = applyEventInner(state, event);
+  if (event.type === 'tool:end') return inner;
+  if (inner.permanent.length === 0) return inner;
+  const flushed = flushPendingToolEndBatch(inner.state);
+  return {
+    state: flushed.state,
+    permanent: [...flushed.permanent, ...inner.permanent],
+  };
 };

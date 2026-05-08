@@ -15,6 +15,132 @@ Format:
 
 ---
 
+## [2026-05-07] coalesce consecutive same-tool chips into a batch summary
+
+Slice 3 of the subagent-tool-visibility arc, but it benefits the
+parent path equally. When the model issues N parallel reads in
+one turn (the common case for "explore the project" prompts),
+the scrollback used to render N near-identical "Read in 0.2s"
+chips. With this slice, 3+ consecutive tool-end items sharing
+the same `name` and `parentId` collapse into a single
+`Read 3 files in 0.6s` chip with the per-file paths as `|_`
+continuation lines underneath. 1-2 items still emit individually
+(no visual savings below the threshold; surprise coalescing
+felt worse than redundancy).
+
+The fold is reducer-side, not renderer-side: `applyEvent` holds
+a `pendingToolEndBatch` buffer that captures consecutive tool-end
+events with matching `(name, parentId)`. The buffer flushes when
+a non-matching event with permanent items arrives — which means
+status updates, deltas, heartbeats, and `parallel_status` events
+DO NOT flush. That invariant is load-bearing: a parallel batch
+of reads inside a subagent interleaves with `subagent:update`
+heartbeats, and the batch must survive those to actually
+coalesce.
+
+**Done:**
+
+- `src/tui/state.ts`:
+  - New `TOOL_BATCH_COALESCE_THRESHOLD = 3` constant.
+  - New `PendingToolEndBatch` type holding `name`, optional
+    `parentId`, and a list of `PendingToolEndBatchItem` records
+    (the relevant subset of tool-end fields).
+  - New `tool-end-batch` PermanentItem variant carrying `name`,
+    pluralized `verb`, `count`, `totalDurationMs` (sum, not
+    wall-clock — labeled as cumulative work in the chip),
+    `subjects[]`, worst-of `status`, optional `parentId`.
+  - `LiveState.pendingToolEndBatch` field (transient, never read
+    by the renderer).
+  - `flushPendingToolEndBatch` exported helper: emits a single
+    `tool-end-batch` PermanentItem when count ≥ threshold, else
+    fans the buffered items out as individual `tool-end` items.
+    Empty / null subjects are filtered from the continuation
+    list (a bare `|_` line with no payload is visual noise).
+  - `batchHeadlineVerb` hand-mapper: `read_file → "Read N files"`,
+    `write_file → "Wrote N files"`, `edit_file → "Edited N files"`,
+    `bash → "Executed N commands"`, etc.; generic
+    `${verb} ×N` fallback.
+  - `batchWorstStatus`: `error > denied > done` precedence —
+    one bad child poisons the chip so the operator can't miss
+    a failure hidden in the middle of an otherwise-green batch.
+  - The reducer's `tool:end` case now extends the batch (when
+    `(name, parentId)` matches) or flushes-and-starts a new
+    one. Never emits permanent items directly — flushing is
+    the only path to scrollback.
+  - New `applyEvent` wrapper: delegates to the rebadged
+    `applyEventInner`, then flushes the pending batch IFF the
+    event was non-`tool:end` AND the inner produced permanent
+    items. This single hook centralizes the flush lifecycle
+    instead of threading flush calls through every emitting
+    case.
+- `src/tui/render/permanent.ts` — new case `'tool-end-batch'`:
+  same chip-shape contract as `tool-end` (status palette,
+  nested glyph + indent when `parentId`); continuation rows use
+  `|_` (intentionally identical to slice 2's nest glyph) so the
+  visual signal "child of the line above" stays consistent.
+  Nested batches indent the children one step deeper than the
+  head — operator reads "subagent > batch summary > child detail".
+- `tests/tui/state.test.ts` — `drive` helper now drains the
+  pending buffer at the end of the loop via the exported
+  `flushPendingToolEndBatch`. Production code never needs this;
+  it's the test driver compensating for terminating without a
+  natural flush trigger.
+
+**Tests:**
+
+- `tests/tui/state.test.ts` — 8 new cases in a dedicated
+  describe block: 3 reads coalesce; 1-2 reads emit individually;
+  different tool names don't merge; parent vs subagent reads
+  produce separate batches (parentId attribution); worst-of
+  status (one error in a green batch surfaces as error);
+  null subjects filter out of continuation lines; non-tool:end
+  permanent-emitting events flush the batch FIRST (chronology
+  preserved); `step:budget` (no permanent) does NOT flush
+  the batch (the load-bearing invariant for parallel batches
+  interleaved with heartbeats).
+- `tests/tui/render/permanent.test.ts` — 5 new cases under a
+  `tool-end-batch` describe: top-level layout (blank + head +
+  3 `|_` lines); nested layout (no leading blank, deeper indent
+  on continuations); error palette + verb override to "Failed";
+  empty subjects array still emits the head (no orphan
+  continuations); ASCII fallback still uses `|_`.
+
+**Verification:** `bun test` 3676 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean (2 pre-existing
+unrelated warnings).
+
+**Behavioral payoff:**
+
+Before slice 3 (slices 1+2 only):
+```
+  |_ Read in 0.2s
+  └─ src/foo.ts
+  |_ Read in 0.3s
+  └─ src/bar.ts
+  |_ Read in 0.2s
+  └─ src/baz.ts
+```
+
+After slice 3:
+```
+  |_ Read 3 files in 0.7s
+    |_ src/foo.ts
+    |_ src/bar.ts
+    |_ src/baz.ts
+```
+
+The model's "explore the project and give me highlights" prompt
+that started this whole arc — which previously produced a wall
+of individual chips when the LLM batched 12 reads in parallel —
+now collapses to one chip with the file list underneath.
+
+**Next:** branch is mergeable. Three-slice arc complete:
+permanent emission (slice 1) → indent attribution (slice 2) →
+coalescing (slice 3). Future polish (bold tool-name styling,
+the user's `**Read**` mock) can land separately.
+
+---
+
 ## [2026-05-07] indent subagent-owned tool chips under their owner
 
 Slice 2 of the subagent-tool-visibility arc. Slice 1 made

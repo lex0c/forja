@@ -682,6 +682,118 @@ describe('formatPermanent', () => {
     ]);
   });
 
+  describe('tool-end-batch (slice 3 — coalesced summary chip)', () => {
+    test('top-level batch: blank + chip head with count + |_ continuations per subject', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 3 files',
+          count: 3,
+          totalDurationMs: 4500,
+          subjects: ['src/a.ts', 'src/b.ts', 'src/c.ts'],
+          status: 'done',
+        },
+        unicode,
+      );
+      // Layout: blank, head, then 3 |_ continuation lines.
+      // Duration crosses 1s threshold → formatted as `4.5s`.
+      expect(out).toEqual([
+        pad(''),
+        pad('· Read 3 files in 4.5s'),
+        pad('  |_ src/a.ts'),
+        pad('  |_ src/b.ts'),
+        pad('  |_ src/c.ts'),
+      ]);
+    });
+
+    test('nested batch: no leading blank + |_ glyph head + double-indent continuations', () => {
+      // When the batch itself is nested under a subagent (parentId
+      // set), the head uses `|_` and the continuations indent ONE
+      // step deeper so the visual hierarchy reads "subagent >
+      // batch summary > child detail".
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 3 files',
+          count: 3,
+          totalDurationMs: 6000,
+          subjects: ['/sub/a.ts', '/sub/b.ts', '/sub/c.ts'],
+          status: 'done',
+          parentId: 'sub-abc',
+        },
+        unicode,
+      );
+      expect(out).toEqual([
+        pad('  |_ Read 3 files in 6.0s'),
+        pad('    |_ /sub/a.ts'),
+        pad('    |_ /sub/b.ts'),
+        pad('    |_ /sub/c.ts'),
+      ]);
+    });
+
+    test('error status: head uses error palette + verb overridden to Failed', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 3 files',
+          count: 3,
+          totalDurationMs: 100,
+          subjects: ['a', 'b', 'c'],
+          status: 'error',
+        },
+        colored,
+      );
+      // Verb override mirrors the single-chip behavior: error
+      // statuses always read "Failed" regardless of the producer's
+      // headline. Operator gets a uniform error verb across single
+      // and batch chips.
+      expect(out[1]).toContain('Failed in 100ms');
+    });
+
+    test('empty subjects array still emits the head (no orphan |_ lines)', () => {
+      // Defensive: a tool that has no vocab subject extractor (all
+      // children produced null subjects, all filtered upstream) can
+      // still surface as a batch chip — count carries the signal.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'echo',
+          verb: 'Echoed ×3',
+          count: 3,
+          totalDurationMs: 30,
+          subjects: [],
+          status: 'done',
+        },
+        unicode,
+      );
+      expect(out).toEqual([pad(''), pad('· Echoed ×3 in 30ms')]);
+    });
+
+    test('ASCII mode: |_ continuations work without unicode', () => {
+      // The nest glyph is intentionally identical in unicode and
+      // ASCII so the affordance survives the no-unicode fallback.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 2 files',
+          count: 2,
+          totalDurationMs: 200,
+          subjects: ['a.ts', 'b.ts'],
+          status: 'done',
+        },
+        ascii,
+      );
+      // ASCII chip glyph is `*`; continuations still `|_`.
+      expect(out[1]).toBe(pad('* Read 2 files in 200ms'));
+      expect(out[2]).toBe(pad('  |_ a.ts'));
+      expect(out[3]).toBe(pad('  |_ b.ts'));
+    });
+  });
+
   test('error and warn are wrapped in SGR escapes when color enabled', () => {
     const errored = formatPermanent({ kind: 'error', message: 'down' }, colored);
     expect(errored[0]).toBe(pad(''));

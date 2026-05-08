@@ -260,6 +260,52 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       }
       return lines.map(padFrame);
     }
+    case 'tool-end-batch': {
+      // Coalesced summary of N consecutive same-tool tool-end items
+      // (slice 3). Same chip-shape contract as `tool-end`: status
+      // palette (dim / error / warn), nested glyph + indent when
+      // `parentId` is set. The continuation here lists EACH
+      // child's subject under `|_` instead of the single `└─ subject`
+      // that a non-batched chip emits.
+      const nested = item.parentId !== undefined;
+      const glyph = nested
+        ? CHIP_NESTED_GLYPH
+        : caps.unicode
+          ? CHIP_FINAL_GLYPH.unicode
+          : CHIP_FINAL_GLYPH.ascii;
+      const indent = nested ? CHIP_NESTED_INDENT : '';
+      const verb = finalVerbFor(item.status, item.verb);
+      const ms =
+        item.totalDurationMs >= 1000
+          ? `${(item.totalDurationMs / 1000).toFixed(1)}s`
+          : `${item.totalDurationMs}ms`;
+      const headRaw = `${indent}${glyph} ${verb} in ${ms}`;
+      const head =
+        item.status === 'error'
+          ? paint(caps, 'error', headRaw)
+          : item.status === 'denied'
+            ? paint(caps, 'warn', headRaw)
+            : paint(caps, 'dim', headRaw);
+      // Same leading-blank rule as tool-end: top-level chips get a
+      // separator, nested ones stay tight under their owner.
+      const lines = nested ? [head] : ['', head];
+      // Each child's subject as a `|_` continuation. Reuse the
+      // nest glyph for the per-child connector — visually consistent
+      // with slice 2's nested chip glyph and explicitly different
+      // from the `└─ ` subject connector (which marks "this is the
+      // chip's subject", not "this is a sibling child of the chip
+      // above"). Empty subjects are filtered upstream in
+      // flushPendingToolEndBatch — we don't need to skip here.
+      for (const subj of item.subjects) {
+        // Continuation lines indent ONE deeper than the head when
+        // the chip itself is already nested under a subagent —
+        // visual hierarchy reads "subagent > batch summary >
+        // child detail".
+        const childIndent = nested ? `${CHIP_NESTED_INDENT}${CHIP_NESTED_INDENT}` : '  ';
+        lines.push(paint(caps, 'secondary', `${childIndent}${CHIP_NESTED_GLYPH} ${subj}`));
+      }
+      return lines.map(padFrame);
+    }
     case 'error':
       // Leading blank — alerts are top-level "session" blocks and
       // deserve emphasis; whatever printed above shouldn't bleed
