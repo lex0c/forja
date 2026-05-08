@@ -147,6 +147,134 @@ describe('renderHuman', () => {
     expect(out).toContain('`/home/lex/secret/x.ts`');
   });
 
+  test('anonymizes $HOME paths embedded in goal text', () => {
+    const data = empty();
+    data.goal = {
+      text: 'audit /home/lex/proj/auth and report findings',
+      sourceStepId: 'x',
+    };
+    const out = renderHuman(data, { home: '/home/lex' });
+    expect(out).toContain('audit ~/proj/auth and report findings');
+    expect(out).not.toContain('/home/lex/proj');
+  });
+
+  test('anonymizes $HOME paths embedded in command lines', () => {
+    const data = empty();
+    data.outcomes.testsRun.push({
+      command: 'pytest /home/lex/proj/tests',
+      passed: true,
+      durationMs: 50,
+    });
+    const out = renderHuman(data, { home: '/home/lex' });
+    expect(out).toContain('pytest ~/proj/tests');
+    expect(out).not.toContain('/home/lex/proj');
+  });
+
+  test('anonymizes $HOME paths in decision `what` and `why`', () => {
+    const data = empty();
+    data.decisions.push({
+      stepId: 'feedcafe-1111-2222-3333-444444444444',
+      what: 'bash: rm -rf /home/lex/tmp/old',
+      why: 'matched user policy on /home/lex/tmp/*',
+      decidedBy: 'user',
+    });
+    const out = renderHuman(data, { home: '/home/lex' });
+    expect(out).toContain('rm -rf ~/tmp/old');
+    expect(out).toContain('matched user policy on ~/tmp/*');
+    expect(out).not.toContain('/home/lex');
+  });
+
+  test('anonymizes $HOME paths in subagent output summary', () => {
+    const data = empty();
+    data.actions.subagentsSpawned.push({
+      name: 'feedcafe-1111-2222-3333-444444444444',
+      status: 'done',
+      outputSummary: 'analyzed /home/lex/proj/queue/backoff.ts',
+    });
+    const out = renderHuman(data, { home: '/home/lex' });
+    expect(out).toContain('analyzed ~/proj/queue/backoff.ts');
+    expect(out).not.toContain('/home/lex/proj');
+  });
+
+  test('anonymizes $HOME paths in not-done items', () => {
+    const data = empty();
+    data.notDone.push({
+      what: 'refactor /home/lex/proj/legacy.ts',
+      reason: 'out of scope per /home/lex/.agent/policy',
+    });
+    const out = renderHuman(data, { home: '/home/lex' });
+    expect(out).toContain('refactor ~/proj/legacy.ts');
+    expect(out).toContain('per ~/.agent/policy');
+    expect(out).not.toContain('/home/lex');
+  });
+
+  test('anonymizes $HOME paths in open questions', () => {
+    const data = empty();
+    data.unresolvedQuestions.push('Should we touch /home/lex/.env before merge?');
+    const out = renderHuman(data, { home: '/home/lex' });
+    expect(out).toContain('Should we touch ~/.env before merge?');
+    expect(out).not.toContain('/home/lex/.env');
+  });
+
+  test('redacts bare home with no trailing slash (cd /home/lex)', () => {
+    // Ensures "$HOME" mentioned without a path tail still
+    // collapses to "~". A trailing-slash-only redactor would
+    // leak `cd /home/lex` verbatim.
+    const data = empty();
+    data.outcomes.testsRun.push({
+      command: 'cd /home/lex && bun test',
+      passed: true,
+      durationMs: 1,
+    });
+    const out = renderHuman(data, { home: '/home/lex' });
+    expect(out).toContain('cd ~ && bun test');
+    expect(out).not.toContain('/home/lex');
+  });
+
+  test('does NOT redact prefix-sharing paths (/home/lexicon, /home/lexa.bak)', () => {
+    // Word-boundary defense: `home: '/home/lex'` must not match
+    // a longer identifier that happens to share the prefix.
+    // Without `\b` the regex would mangle siblings of the home dir.
+    const data = empty();
+    data.goal = {
+      text: 'compare /home/lexicon and /home/lexa.bak/recovery',
+      sourceStepId: 'x',
+    };
+    const out = renderHuman(data, { home: '/home/lex' });
+    expect(out).toContain('/home/lexicon');
+    expect(out).toContain('/home/lexa.bak/recovery');
+    // ~icon would be the broken-redactor failure mode; assert
+    // we did not produce that.
+    expect(out).not.toContain('~icon');
+  });
+
+  test('anonymizePaths:false leaves embedded paths literal across all surfaces', () => {
+    // Regression guard for the opt-out flag covering the new
+    // free-text surfaces, not just the dedicated path columns.
+    const data = empty();
+    data.goal = { text: 'review /home/lex/proj', sourceStepId: 'x' };
+    data.outcomes.testsRun.push({
+      command: 'cat /home/lex/.env',
+      passed: true,
+      durationMs: 1,
+    });
+    const out = renderHuman(data, { home: '/home/lex', anonymizePaths: false });
+    expect(out).toContain('/home/lex/proj');
+    expect(out).toContain('/home/lex/.env');
+    expect(out).not.toContain('~/proj');
+  });
+
+  test('json renderer is path-literal even in free-text fields', () => {
+    // Reaffirms the json/audit-vs-human boundary: JSON consumers
+    // need the real path. The fix to the human renderer must
+    // not bleed into JSON.
+    const data = empty();
+    data.goal = { text: 'audit /home/lex/proj', sourceStepId: 'x' };
+    const json = renderRecap(data, 'json', { anonymizePaths: true, home: '/home/lex' });
+    expect(json).toContain('/home/lex/proj');
+    expect(json).not.toContain('~/proj');
+  });
+
   test('failed test renders ✗ marker', () => {
     const data = empty();
     data.outcomes.testsRun.push({ command: 'pytest', passed: false, durationMs: 50 });

@@ -41,6 +41,43 @@ const anonymize = (path: string, home: string): string => {
   return path;
 };
 
+// Regex-escape a literal string so it can be embedded in a
+// RegExp without metachars firing. The home path commonly
+// contains `.` (`/home/user.local`) and other escapable chars on
+// non-Unix layouts; without escaping those would match
+// arbitrarily and either over- or under-trigger the redaction.
+const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// Redact `$HOME` paths embedded inside a free-text field (goal
+// text, command lines, decision reasons, subagent summaries,
+// open questions). The single-path `anonymize` helper above
+// handles a string that IS a path; this helper handles strings
+// that may CONTAIN a path. RECAP.md §6.2's privacy guarantee
+// applies to every human-rendered surface, not just the
+// dedicated path columns.
+//
+// Two passes:
+//   1. `<home>/` → `~/`  — the common path-prefix case. Eats
+//      the trailing `/` so "cat /home/lex/x" becomes "cat ~/x".
+//   2. `<home>\b` → `~`  — bare home with no trailing slash
+//      followed by a word boundary (end-of-string, whitespace,
+//      non-word punctuation). "cd /home/lex" → "cd ~". The `\b`
+//      check distinguishes the home prefix from a longer
+//      identifier sharing the same prefix (`/home/lexicon`,
+//      `/home/lexa.bak`) — those are NOT redacted because the
+//      home segment is part of a different path.
+//
+// JSON renderer is intentionally NOT wired through this helper:
+// audit consumers need the literal path. The human renderer is
+// the only surface that runs anonymization.
+const anonymizeText = (text: string, home: string): string => {
+  if (text.length === 0 || home.length === 0) return text;
+  const escaped = escapeRegex(home);
+  return text
+    .replace(new RegExp(`${escaped}/`, 'g'), '~/')
+    .replace(new RegExp(`${escaped}\\b`, 'g'), '~');
+};
+
 const formatDuration = (ms: number): string => {
   if (ms < 0 || !Number.isFinite(ms)) return '0s';
   if (ms < 1000) return `${ms}ms`;
@@ -110,6 +147,14 @@ export const renderHuman = (
   const home = resolveHome(options.home);
   const anon = options.anonymizePaths !== false;
   const path = (p: string): string => (anon ? anonymize(p, home) : p);
+  // Free-text variant: redacts `$HOME` paths embedded anywhere
+  // inside an arbitrary string. Used for every human-rendered
+  // surface that carries operator-authored or model-emitted
+  // prose (goal text, commands, decision reasons, summaries,
+  // questions). Without this, the privacy guarantee only
+  // covered the dedicated "Files edited" column and any other
+  // surface that happened to mention an absolute path leaked.
+  const text = (s: string): string => (anon ? anonymizeText(s, home) : s);
 
   const lines: string[] = [];
 
@@ -125,7 +170,7 @@ export const renderHuman = (
   lines.push('');
 
   if (intermediate.goal.text.length > 0) {
-    lines.push(`**Goal:** ${oneLine(intermediate.goal.text)}`);
+    lines.push(`**Goal:** ${text(oneLine(intermediate.goal.text))}`);
     lines.push('');
   }
 
@@ -175,7 +220,7 @@ export const renderHuman = (
     for (const t of intermediate.outcomes.testsRun) {
       const status = t.passed ? '✓' : '✗';
       lines.push(
-        `- ${status} \`${truncate(oneLine(t.command), 80)}\` (${formatDuration(t.durationMs)})`,
+        `- ${status} \`${truncate(text(oneLine(t.command)), 80)}\` (${formatDuration(t.durationMs)})`,
       );
     }
     lines.push('');
@@ -185,8 +230,8 @@ export const renderHuman = (
     lines.push('## Decisions');
     lines.push('');
     for (const d of intermediate.decisions) {
-      const why = d.why.length > 0 ? ` — ${d.why}` : '';
-      lines.push(`- step ${shortStep(d.stepId)}: ${d.what} (${d.decidedBy})${why}`);
+      const why = d.why.length > 0 ? ` — ${text(d.why)}` : '';
+      lines.push(`- step ${shortStep(d.stepId)}: ${text(d.what)} (${d.decidedBy})${why}`);
     }
     lines.push('');
   }
@@ -196,7 +241,7 @@ export const renderHuman = (
     lines.push('');
     for (const s of intermediate.actions.subagentsSpawned) {
       const summary =
-        s.outputSummary.length > 0 ? ` — ${truncate(oneLine(s.outputSummary), 100)}` : '';
+        s.outputSummary.length > 0 ? ` — ${truncate(text(oneLine(s.outputSummary)), 100)}` : '';
       lines.push(`- ${shortStep(s.name)} (${s.status})${summary}`);
     }
     lines.push('');
@@ -206,7 +251,7 @@ export const renderHuman = (
     lines.push('## Not done');
     lines.push('');
     for (const nd of intermediate.notDone) {
-      lines.push(`- ${nd.what} — ${nd.reason}`);
+      lines.push(`- ${text(nd.what)} — ${text(nd.reason)}`);
     }
     lines.push('');
   }
@@ -215,7 +260,7 @@ export const renderHuman = (
     lines.push('## Open questions');
     lines.push('');
     for (const q of intermediate.unresolvedQuestions) {
-      lines.push(`- ${oneLine(q)}`);
+      lines.push(`- ${text(oneLine(q))}`);
     }
     lines.push('');
   }
