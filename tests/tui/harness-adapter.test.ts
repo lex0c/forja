@@ -1076,6 +1076,56 @@ describe('harness-adapter — subagent observability', () => {
     expect(ev.progress).toBe('+$0.0050');
   });
 
+  test('cost_soft_cap_warn translates to a permanent warn message', () => {
+    // Spec ORCHESTRATION.md §3.5.0. The harness emits this event
+    // ONCE per run when cumulative crosses the soft threshold
+    // (the playbook's declared `max_cost_usd`). Renderer
+    // surfaces it as a permanent warn line so the operator sees
+    // the regression signal even after the live region recycles.
+    // Half-up rounding matches the `subagent_summary` formatter
+    // — pinned so a future refactor doesn't drift between
+    // surfaces.
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'cost_soft_cap_warn',
+      threshold: 0.3,
+      cumulative: 0.585,
+    });
+    const ev = out.find((e) => e.type === 'warn') as Extract<UIEvent, { type: 'warn' }> | undefined;
+    expect(ev).toBeDefined();
+    expect(ev?.message).toContain('over budget estimate');
+    expect(ev?.message).toContain('$0.30');
+    // 0.585 rounds half-up to 0.59 (Math.round*100/100 path).
+    expect(ev?.message).toContain('$0.59');
+  });
+
+  test('subagent_progress with cost_soft_cap_warn inner surfaces a top-level warn', () => {
+    // When a subagent crosses its soft cap, the child emits
+    // cost_soft_cap_warn over IPC; the parent's adapter
+    // unwraps via subagent_progress.lastEvent. The wrapped path
+    // mirrors the standalone case but prefixes the warn with
+    // the subagent id so the operator can attribute the
+    // regression signal to a specific child run.
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'sub_01ABC123',
+      lastEvent: {
+        type: 'cost_soft_cap_warn',
+        threshold: 0.3,
+        cumulative: 0.585,
+      },
+    });
+    const warn = out.find((e) => e.type === 'warn') as
+      | Extract<UIEvent, { type: 'warn' }>
+      | undefined;
+    expect(warn).toBeDefined();
+    expect(warn?.message).toContain('subagent sub_01AB');
+    expect(warn?.message).toContain('over budget estimate');
+    expect(warn?.message).toContain('$0.59');
+    expect(warn?.message).toContain('$0.30');
+  });
+
   test('subagent_progress with non-cost inner omits cumulativeCostUsd', () => {
     // Counterpart guard: a step_start should NOT carry a
     // cumulativeCostUsd, so the reducer keeps the prior

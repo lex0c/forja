@@ -1021,6 +1021,80 @@ describe('runAgent', () => {
     expect(finished.result.costUsd).toBe(result.costUsd);
   });
 
+  test('softCostUsd emits cost_soft_cap_warn ONCE when cumulative crosses the threshold', async () => {
+    // Spec ORCHESTRATION.md §3.5.0. Two turns; first turn pushes
+    // cumulative below threshold, second turn pushes it above.
+    // The warn event must fire exactly once, even though the
+    // emitCostUpdate callback runs every turn.
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    // Cost formula divides token*rate by 1M, so usage * 1000 here keeps
+    // the per-turn cost in human-readable cents (~$0.06 per turn).
+    const { config } = buildConfig(
+      [
+        // Turn 1: ~$0.06 cumulative (below 0.10 threshold)
+        {
+          tool_uses: [{ id: 't1', name: 'echo', input: { msg: 'a' } }],
+          stop_reason: 'tool_use',
+          usage: { input: 10_000, output: 2_000 },
+        },
+        // Turn 2: ~$0.12 cumulative (CROSSES 0.10 threshold)
+        {
+          tool_uses: [{ id: 't2', name: 'echo', input: { msg: 'b' } }],
+          stop_reason: 'tool_use',
+          usage: { input: 10_000, output: 2_000 },
+        },
+        // Turn 3: ~$0.18 cumulative (already warned — must NOT re-emit)
+        { text: 'done', stop_reason: 'end_turn', usage: { input: 10_000, output: 2_000 } },
+      ],
+      {
+        capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 },
+      },
+    );
+    const softThreshold = 0.1;
+    const result = await runAgent({
+      ...config,
+      budget: { softCostUsd: softThreshold },
+      onEvent: (e) => events.push(e),
+    });
+    const warns = events.filter((e) => e.type === 'cost_soft_cap_warn');
+    expect(warns.length).toBe(1);
+    if (warns[0]?.type === 'cost_soft_cap_warn') {
+      expect(warns[0].threshold).toBe(softThreshold);
+      expect(warns[0].cumulative).toBeGreaterThan(softThreshold);
+    }
+    // Run completed normally — soft cap does NOT terminate.
+    expect(result.status).toBe('done');
+  });
+
+  test('softCostUsd does NOT emit when cumulative stays below the threshold', async () => {
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const { config } = buildConfig(
+      [{ text: 'hi', stop_reason: 'end_turn', usage: { input: 10, output: 2 } }],
+      { capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 } },
+    );
+    await runAgent({
+      ...config,
+      // Threshold above the entire run's cost.
+      budget: { softCostUsd: 100.0 },
+      onEvent: (e) => events.push(e),
+    });
+    expect(events.find((e) => e.type === 'cost_soft_cap_warn')).toBeUndefined();
+  });
+
+  test('softCostUsd absent (or 0) suppresses the warn entirely', async () => {
+    const events: import('../../src/harness/types.ts').HarnessEvent[] = [];
+    const { config } = buildConfig(
+      [{ text: 'hi', stop_reason: 'end_turn', usage: { input: 10, output: 2 } }],
+      { capsOverride: { cost_per_1k_input: 3.0, cost_per_1k_output: 15.0 } },
+    );
+    await runAgent({
+      ...config,
+      // No softCostUsd → no warn, ever.
+      onEvent: (e) => events.push(e),
+    });
+    expect(events.find((e) => e.type === 'cost_soft_cap_warn')).toBeUndefined();
+  });
+
   test('max_tokens stop_reason exits as exhausted/maxOutputTokens (not done)', async () => {
     // Provider returns text and stops with max_tokens — output was
     // truncated by the per-call cap. Reporting `done` (exit 0) would

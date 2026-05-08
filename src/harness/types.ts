@@ -288,6 +288,17 @@ export type HarnessEvent =
       cumulativeUsd: number;
       capUsd: number;
     }
+  | {
+      // Soft cost-cap crossed (spec ORCHESTRATION.md §3.5.0).
+      // Emitted once when the run's cumulative cost first
+      // crosses `budget.softCostUsd`; never re-emitted. The
+      // run continues — this is a regression signal, not a
+      // termination. Renderer surfaces it as a permanent warn
+      // line ("· task <name> over budget estimate ($X.XX > $Y.YY)").
+      type: 'cost_soft_cap_warn';
+      threshold: number;
+      cumulative: number;
+    }
   | { type: 'session_finished'; result: HarnessResult };
 
 // Budget caps for an autonomous run. Per AGENTIC_CLI §5: every limit has
@@ -355,6 +366,17 @@ export interface RunBudget {
   // via the cumulative tracker (priorCostUsd + totalCostUsd is
   // what the cap compares against, NOT just the per-run total).
   maxCostUsd?: number | undefined;
+  // Soft warning threshold for cost (spec ORCHESTRATION.md
+  // §3.5.0). When set and the run's cumulative cost crosses
+  // it, the harness emits a `cost_soft_cap_warn` event ONCE
+  // (idempotent — not re-emitted on every subsequent
+  // cost_update). The run does NOT terminate at this
+  // threshold; only `maxCostUsd` (the hard cap) does. Used
+  // primarily by subagents — the parent forwards the
+  // playbook's declared `max_cost_usd` here as a regression
+  // signal, while leaving the child's hard cap to the global
+  // budget. Absent (or set to 0) → no soft warning fires.
+  softCostUsd?: number | undefined;
   // Maximum number of tool calls the harness will dispatch in
   // parallel within a single step. Only active when EVERY
   // `tool_use` in the step has `metadata.parallel_safe === true`

@@ -310,13 +310,29 @@ Pai vê **só os outputs finais**. History intermediária dos subagents nunca ch
 
 Cap de cost (`maxCostUsd` do `RunBudget`) é **compartilhado** entre o pai e seus filhos `task_async`. O contrato:
 
-- Pai tem `$cap` total
+- Pai tem `$cap` total — **único hard cap** que mata um run mid-flight.
 - `priorCostUsd + totalCostUsd` rastreia spend do pai (próprias provider calls + compaction calls)
 - Cada filho settled contribui com seu `costUsd` real ao tracker compartilhado
-- Cada filho **in-flight** contribui com sua **reserva pessimista**: `definition.budget.maxCostUsd` (worst-case do playbook)
+- Cada filho **in-flight** contribui com sua **reserva pessimista**: `definition.budget.maxCostUsd` (worst-case declarado pelo playbook)
 - `task_async` pré-checa: se `parentSpend + settledChildCost + reservedChildCost + novaReserva > cap`, refusa com `subagent.budget_exhausted` (`SubagentOutput.reason` em `CONTRACTS.md §2.6.4.1`)
 - Reserva libera quando o filho settla; spend real do filho então conta direto
 - **Operator opt-out:** se o pai tem `maxCostUsd === undefined` (operador desabilitou via `/budget cost off`, ver `AGENTIC_CLI.md §5`), todos os gates desta seção viram no-op — não há cap pra projetar contra. Filhos herdam o mesmo opt-out via snapshot do `audit.budgetMaxCostUsd`. Esta é uma ação deliberada do operador, registrada em audit; o threat model `SECURITY_GUIDELINE.md §1.5` cobre por que não é vulnerabilidade (loop/modelo/repo malicioso não consegue escrever em `baseConfig.budget`).
+
+#### 3.5.0 Per-playbook cap é soft, não hard
+
+O `definition.budget.maxCostUsd` declarado no frontmatter de um playbook (ex: `explain.md` com `max_cost_usd: 1.00`) tem **duas funções distintas** que merecem nomes distintos:
+
+1. **Reserva pessimística pré-spawn** — quanto o pai precisa "guardar" no orçamento global ao admitir esse spawn. Continua hard-load-bearing pra impedir over-commit no momento do spawn (§3.5.1, §3.5.2).
+2. **Sinal de regressão durante execução** — "esse playbook normalmente custa até X; se ele cruzou X, está fora do esperado". Soft, NÃO mata o run.
+
+Quando o filho ativo cruza o **per-playbook cap** mid-run:
+- O harness do filho emite um `HarnessEvent` `cost_soft_cap_warn { threshold, cumulative }` uma vez (idempotent — não re-emite a cada novo cost_update). O evento atravessa o canal IPC `event` (`IPC.md`) e o pai o desembrulha via `subagent_progress.lastEvent`; o `subagentId`/`handleId` é decoração do pai (vem do envelope `subagent_progress`), não viaja dentro do payload do evento.
+- Renderiza no scrollback como aviso ao operador: `subagent <id-prefix> over budget estimate ($X.XX > $Y.YY)` (ou sem prefixo, em runs top-level).
+- O run **continua** até o pai-side hard cap (§3.5.2) ou até o término natural.
+
+Isto é uma mudança consciente vs versões anteriores que matavam o filho com `exhausted/maxCostUsd` quando ele cruzava o per-playbook cap. A motivação: o cap de playbook é estimativa de custo, não SLO. Mata-lo no cruzamento gerava "filho morreu por estourar 30¢ de cap quando o pai tinha $4 disponíveis" — falso positivo que descartava trabalho útil. O global cap continua sendo o gate real, e o pai-side watchdog (§3.5.2) garante que cumulative cruzar global derruba todos os filhos.
+
+**Trade-off honesto:** um playbook com cap declarado bem abaixo do uso real não para mais sozinho — pode consumir até o global cap. Mitigação: soft-cap warn é visível ao operador (não é silenciado) e o pai-side watchdog mantém o teto absoluto. Calibração de caps por playbook continua útil como sinal de regressão, mas não é mais ponto único de falha.
 
 #### 3.5.1 Cost-progress via IPC
 
@@ -333,11 +349,14 @@ Reconciliação com `§0` princípio 7 ("Budget é compartilhado, não pre-aloca
 
 #### 3.5.2 Falhas no cap
 
+A tabela abaixo refere-se ao **global cap** (parent's `maxCostUsd`). O per-playbook cap é soft (§3.5.0) — não aparece aqui.
+
 | Hit | Comportamento |
 |---|---|
 | Pré-spawn projetado > cap | `task_async` (e `task_sync`/dispatcher) retornam `subagent.budget_exhausted`. Reserva soma de in-flight + estimate do novo spawn impede over-commit no momento do spawn. |
-| Filho ativo cruza cap mid-run | A cada `cost_update` recebido, watchdog em `spawnSubagentImpl` projeta `priorCostUsd + totalCostUsd + cumulativeChildCostUsd + getReservedChildCostUsd()`. Se > cap, dispara `subagentHandleStore.cancelAll()` — todos os filhos ativos recebem hard-signal via per-handle controller, gracefully terminam via interrupt:hard IPC. |
+| Filho ativo cruza global cap mid-run (cumulative) | A cada `cost_update` recebido, watchdog em `spawnSubagentImpl` projeta `priorCostUsd + totalCostUsd + cumulativeChildCostUsd + getReservedChildCostUsd()`. Se > cap, dispara `subagentHandleStore.cancelAll()` — todos os filhos ativos recebem hard-signal via per-handle controller, gracefully terminam via interrupt:hard IPC. |
 | Pai self-cost cruza cap | `runAgent.costCapDetailIfExceeded()` finaliza com `maxCostUsd` no próximo turn boundary. Inclui cumulative + reserved ao computar (consistente com pré-spawn gate). |
+| Filho cruza per-playbook cap (soft) | `cost_soft_cap_warn` event emitido uma vez; run continua. Ver §3.5.0. |
 
 #### 3.5.3 Audit
 

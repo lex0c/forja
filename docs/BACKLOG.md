@@ -15,6 +15,77 @@ Format:
 
 ---
 
+## [2026-05-07] per-playbook cost cap is now soft, not hard
+
+Pivot from the original idea ("remove per-playbook
+`max_cost_usd` entirely — the global cap suffices"). Removing
+it would have broken the pessimistic pre-spawn reservation in
+`ORCHESTRATION.md §3.5.2` (parent has no other way to know
+how much to "guard" for an admitted spawn). The cap stays for
+that purpose; mid-run it becomes a soft regression signal
+instead of a hard kill.
+
+**Why this matters:** the reported failure had Task A exhaust
+at $0.585 against a $0.30 cap that was simply too tight for
+legitimate exploration. Hard-killing the child at the
+playbook cap meant the operator paid the cost AND lost the
+output. Soft-cap inverts the trade-off: cap acts as a
+calibration alarm ("this playbook normally costs ≤ X"); the
+global `maxCostUsd` (default $5) remains the only enforcement
+gate.
+
+**Done:**
+
+- `docs/spec/ORCHESTRATION.md §3.5.0` (NEW) — documents the
+  two distinct functions of `definition.budget.maxCostUsd`:
+  hard pre-spawn reservation vs soft mid-run regression
+  signal. §3.5.2 table updated with the soft-cross row.
+- `src/harness/types.ts` — new `RunBudget.softCostUsd`
+  (`number | undefined`); new `cost_soft_cap_warn` HarnessEvent
+  variant (`threshold`, `cumulative`).
+- `src/harness/loop.ts` — `emitCostUpdate` checks the soft cap
+  on every cost-increasing event (turn settle, compaction,
+  partial provider-error charge). Sticky `softCapWarned` flag
+  guarantees idempotent emission: one warn per session, not
+  re-emitted on every subsequent `cost_update`. Run does NOT
+  terminate at this threshold.
+- `src/cli/subagent-child.ts` — child harness now receives
+  `maxCostUsd: undefined` (opt-out of hard cap inside the
+  child) and `softCostUsd: audit.budgetMaxCostUsd` (the
+  playbook cap routed to the soft channel). Parent's pre-spawn
+  reservation + global cap remain the sole hard gates.
+- `src/tui/harness-adapter.ts` — translates
+  `cost_soft_cap_warn` to a permanent `warn` line for both
+  top-level runs and subagent-wrapped runs (via
+  `subagent_progress`). Half-up rounding via
+  `Math.round(usd*100)/100` before `toFixed(2)` to dodge the
+  IEEE-754 `0.585 → "0.58"` edge case.
+
+**Tests:**
+
+- `tests/harness/loop.test.ts` — 3 new cases: warn fires once
+  when cumulative crosses threshold + run completes normally;
+  no warn when cumulative stays below; no warn when
+  `softCostUsd` is absent.
+- `tests/tui/harness-adapter.test.ts` — 2 new cases: top-level
+  `cost_soft_cap_warn` translation + subagent_progress wrapped
+  variant including the half-up rounding fixture
+  (`0.585 → "$0.59"`).
+
+**Verification:** `bun test` 3630 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean (2 pre-existing
+unrelated warnings).
+
+**Behavioral payoff:** the cap-too-tight failure mode that
+killed Task A in the reported session now surfaces as a
+visible warn while the run continues to a natural conclusion.
+Calibration drift is observable via the warn frequency
+without paying the cost-then-lose-output toll.
+
+**Next:** branch ready to merge.
+
+---
+
 ## [2026-05-07] step-stall watchdog — silent-hang detection
 
 The reported failure (operator's "explore o projeto" run) had

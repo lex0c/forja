@@ -320,6 +320,20 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // the event is harmless (TUI ignores it). Skipped on zero
   // deltas so a misbehaving provider that emitted a usage event
   // with all zeros doesn't generate noise.
+  // Sticky flag — set true the first time the soft cap is
+  // crossed and never reset. Idempotent emission per run.
+  // Declared ahead of `emitCostUpdate` so the closure reads a
+  // name already in scope.
+  //
+  // Per-session, NOT cumulative-across-resumes: the check uses
+  // `totalCostUsd` (this session only), unlike `maxCostUsd`
+  // which compares `priorCostUsd + totalCostUsd`. Subagents are
+  // one-shot so the divergence doesn't affect them; for a
+  // resumed top-level run, the soft warn re-arms each session
+  // (matches the "you crossed your estimate THIS session"
+  // framing and avoids spamming on every resume of an already-
+  // expensive session).
+  let softCapWarned = false;
   const emitCostUpdate = (delta: number): void => {
     if (!Number.isFinite(delta) || delta <= 0) return;
     safeEmit(config.onEvent, {
@@ -327,6 +341,26 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       delta,
       cumulative: totalCostUsd,
     });
+    // Soft cap (spec ORCHESTRATION.md §3.5.0). Fires ONCE when
+    // cumulative first crosses the threshold. The flag stays
+    // sticky for the rest of the run — re-emitting on every
+    // subsequent cost_update would spam the operator's
+    // scrollback and obscure the original warning. Run does
+    // NOT terminate at this threshold; only `maxCostUsd` (the
+    // hard cap) does.
+    if (
+      !softCapWarned &&
+      budget.softCostUsd !== undefined &&
+      budget.softCostUsd > 0 &&
+      totalCostUsd > budget.softCostUsd
+    ) {
+      softCapWarned = true;
+      safeEmit(config.onEvent, {
+        type: 'cost_soft_cap_warn',
+        threshold: budget.softCostUsd,
+        cumulative: totalCostUsd,
+      });
+    }
   };
 
   // Cumulative cost of every child this run spawned (sync `task`

@@ -609,6 +609,25 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
             message: `subagent ${event.subagentId.slice(0, 8)} · ${inner.toolName}: ${inner.message}`,
           });
         }
+        // Soft cap crossed inside the child — surface to the
+        // operator's scrollback so the regression signal isn't
+        // hidden inside subagent_progress heartbeat text.
+        // Defensive field-presence guard mirrors the
+        // tool_warning path: IPC payload is `unknown` at the
+        // wire boundary; ill-typed events fall through silently
+        // rather than rendering "$undefined > $NaN".
+        if (
+          inner.type === 'cost_soft_cap_warn' &&
+          typeof inner.threshold === 'number' &&
+          typeof inner.cumulative === 'number'
+        ) {
+          const fmt = (usd: number): string => (Math.round(usd * 100) / 100).toFixed(2);
+          out.push({
+            type: 'warn',
+            ts,
+            message: `subagent ${event.subagentId.slice(0, 8)} over budget estimate ($${fmt(inner.cumulative)} > $${fmt(inner.threshold)})`,
+          });
+        }
         return out;
       }
 
@@ -660,6 +679,21 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           message: `cap watchdog: ${event.cancelledCount} subagent${event.cancelledCount === 1 ? '' : 's'} cancelled — cumulative $${event.cumulativeUsd.toFixed(4)} exceeded cap $${event.capUsd.toFixed(4)}`,
         });
         return out;
+
+      case 'cost_soft_cap_warn': {
+        // Per-playbook soft cap crossed (spec ORCHESTRATION.md
+        // §3.5.0). Run continues — this is a regression signal,
+        // not a termination. Half-up rounding to two decimals
+        // matches the formatter used in subagent_summary so the
+        // displayed cents are consistent across surfaces.
+        const fmt = (usd: number): string => (Math.round(usd * 100) / 100).toFixed(2);
+        out.push({
+          type: 'warn',
+          ts,
+          message: `over budget estimate ($${fmt(event.cumulative)} > $${fmt(event.threshold)})`,
+        });
+        return out;
+      }
 
       case 'parallel_status':
         // Parallelism observability snapshot (spec
