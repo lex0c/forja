@@ -34,10 +34,37 @@ export interface LockConflict {
   attemptedBy: Layer;
 }
 
+// Provenance of each merged section (PolicyLayer in types.ts).
+// Tracks which layer was the LAST WRITER for each section in the
+// final merged policy. The modal layer + `/perms why` consume
+// this to answer "which YAML file holds this rule" without
+// replaying the merge.
+//
+// `defaults` covers `defaults.mode`. Set to:
+//   - the layer that explicitly wrote `defaults.mode`
+//   - 'default' when no layer set mode (resolver fell back to
+//     'strict' at emit time)
+//
+// Per-section keys are absent when no layer wrote that section.
+// The engine reads provenance for whatever section it consults;
+// an absent entry means "no policy section exists" → engine
+// fell into default-deny, source.layer='default'.
+export interface SectionProvenance {
+  defaults: Layer | 'default';
+  bash?: Layer;
+  read_file?: Layer;
+  write_file?: Layer;
+  edit_file?: Layer;
+  glob?: Layer;
+  grep?: Layer;
+  fetch_url?: Layer;
+}
+
 export interface ResolveResult {
   policy: Policy;
   layers: LayerPolicy[];
   lockConflicts: LockConflict[];
+  provenance: SectionProvenance;
 }
 
 export interface ResolveOptions {
@@ -105,7 +132,7 @@ const loadLayers = (options: ResolveOptions): LayerPolicy[] => {
 // is sticky — subsequent layers can no longer modify that section.
 const merge = (
   layers: readonly LayerPolicy[],
-): { policy: Policy; lockConflicts: LockConflict[] } => {
+): { policy: Policy; lockConflicts: LockConflict[]; provenance: SectionProvenance } => {
   // Track mode as `undefined` until a layer explicitly sets it. The
   // final fallback to 'strict' happens at emit time so layers that
   // omit `defaults.mode` don't trip the lock-conflict log against a
@@ -113,8 +140,13 @@ const merge = (
   let mergedMode: PolicyMode | undefined;
   let defaultsLocked: boolean | undefined;
   let defaultsLockedBy: Layer | null = null;
+  // Last-writer for `defaults.mode`. Stays null until a layer
+  // sets mode explicitly; the resolver flips it to 'default' at
+  // emit time when no layer wrote.
+  let defaultsModeWriter: Layer | null = null;
   const mergedTools: PolicyToolsSection = {};
   const sectionLockedBy: Partial<Record<keyof PolicyToolsSection, Layer>> = {};
+  const sectionWriter: Partial<Record<keyof PolicyToolsSection, Layer>> = {};
   const lockConflicts: LockConflict[] = [];
 
   for (const { layer, policy } of layers) {
@@ -145,6 +177,7 @@ const merge = (
       // Not yet locked. Apply mode change and/or lock activation.
       if (incomingMode !== undefined) {
         mergedMode = incomingMode;
+        defaultsModeWriter = layer;
       }
       if (incomingLocked) {
         // Lock applies to whatever mergedMode is — possibly
@@ -174,6 +207,7 @@ const merge = (
       if (incoming !== undefined) {
         // biome-ignore lint/suspicious/noExplicitAny: section types differ per key — narrowing per branch would not improve safety.
         (mergedTools as any)[key] = incoming;
+        sectionWriter[key] = layer;
         if (incoming.locked === true) {
           sectionLockedBy[key] = layer;
         }
@@ -189,21 +223,48 @@ const merge = (
     ...(defaultsLocked !== undefined ? { locked: defaultsLocked } : {}),
   };
 
+  // Build provenance from the writer trackers. `defaults` falls
+  // back to 'default' when no layer wrote mode (so the engine
+  // can render "default-deny — strict mode (built-in default)"
+  // honestly, distinct from "user policy chose strict mode").
+  const provenance: SectionProvenance = {
+    defaults: defaultsModeWriter ?? 'default',
+    ...(sectionWriter.bash !== undefined ? { bash: sectionWriter.bash } : {}),
+    ...(sectionWriter.read_file !== undefined ? { read_file: sectionWriter.read_file } : {}),
+    ...(sectionWriter.write_file !== undefined ? { write_file: sectionWriter.write_file } : {}),
+    ...(sectionWriter.edit_file !== undefined ? { edit_file: sectionWriter.edit_file } : {}),
+    ...(sectionWriter.glob !== undefined ? { glob: sectionWriter.glob } : {}),
+    ...(sectionWriter.grep !== undefined ? { grep: sectionWriter.grep } : {}),
+    ...(sectionWriter.fetch_url !== undefined ? { fetch_url: sectionWriter.fetch_url } : {}),
+  };
+
   return {
     policy: { defaults: mergedDefaults, tools: mergedTools },
     lockConflicts,
+    provenance,
   };
 };
 
 // Public entry — discover layers, merge, return the effective policy
 // plus the layer trail and any lock conflicts. Bootstrap consumes
 // `policy`; CLI rendering / debug surfaces consume `layers` and
-// `lockConflicts` for `agent perms` style introspection.
+// `lockConflicts` for `agent perms` style introspection. Engine
+// consumes `provenance` so each Decision can carry the source
+// layer/section it came from (modal layer + `/perms why` render
+// this for the operator).
 export const resolvePolicy = (options: ResolveOptions): ResolveResult => {
   const layers = loadLayers(options);
   if (layers.length === 0) {
-    return { policy: defaultPolicy(), layers: [], lockConflicts: [] };
+    return {
+      policy: defaultPolicy(),
+      layers: [],
+      lockConflicts: [],
+      // No layer means everything is built-in default. Engine
+      // will read this and stamp source.layer='default' on every
+      // Decision.
+      provenance: { defaults: 'default' },
+    };
   }
-  const { policy, lockConflicts } = merge(layers);
-  return { policy, layers, lockConflicts };
+  const { policy, lockConflicts, provenance } = merge(layers);
+  return { policy, layers, lockConflicts, provenance };
 };

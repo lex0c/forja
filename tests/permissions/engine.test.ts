@@ -319,3 +319,158 @@ describe('engine.policy() returns a deep copy', () => {
     expect(snap2.tools.bash).toEqual({ allow: ['echo *'] });
   });
 });
+
+describe('Decision.source provenance', () => {
+  test('bash deny rule carries source.layer + rule + section', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { deny: ['rm -rf *'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'rm -rf /' });
+    expect(d.kind).toBe('deny');
+    expect(d.source).toEqual({ layer: 'project', rule: 'rm -rf *', section: 'bash' });
+  });
+
+  test('bash allow rule carries source from the layer that wrote bash', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['npm test*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'user' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'npm test --watch' });
+    expect(d.kind).toBe('allow');
+    expect(d.source).toEqual({ layer: 'user', rule: 'npm test*', section: 'bash' });
+  });
+
+  test('bash confirm rule carries source', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { confirm: ['git push *'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'enterprise' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'git push origin main' });
+    expect(d.kind).toBe('confirm');
+    expect(d.source).toEqual({ layer: 'enterprise', rule: 'git push *', section: 'bash' });
+  });
+
+  test('default-deny carries source.layer of the section that exists (no rule)', () => {
+    // Section was set by 'project' but no rule matched. Operator
+    // editing the project YAML adds the missing allow rule —
+    // surfacing the layer points them at the right file.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'whoami' });
+    expect(d.kind).toBe('deny');
+    expect(d.source).toEqual({ layer: 'project', section: 'bash' });
+    // The rule field is absent — no rule matched, just the
+    // section's default-deny.
+    if (d.kind === 'deny') {
+      expect(d.source?.rule).toBeUndefined();
+    }
+  });
+
+  test('default-deny falls back to layer="default" when no layer wrote the section', () => {
+    // No layer touched bash. The denial is the engine's built-in
+    // strict-mode default, not a rule from any YAML.
+    const eng = createPermissionEngine(policy({}), {
+      cwd: CWD,
+      provenance: { defaults: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'whoami' });
+    expect(d.kind).toBe('deny');
+    expect(d.source).toEqual({ layer: 'default', section: 'bash' });
+  });
+
+  test('missing-arg deny carries source.layer="default" (engine-internal reject)', () => {
+    // Pre-policy reject: no command arg. The denial isn't from a
+    // rule — pointing the operator at any YAML would mislead.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'user', bash: 'user' },
+    });
+    const d = eng.check('bash', 'bash', {});
+    expect(d.kind).toBe('deny');
+    expect(d.source).toEqual({ layer: 'default' });
+  });
+
+  test('fs.read deny rule carries source per-section (read_file)', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { read_file: { deny_paths: ['**/.env*'] } } }),
+      { cwd: CWD, provenance: { defaults: 'project', read_file: 'enterprise' } },
+    );
+    const d = eng.check('read_file', 'fs.read', { path: '.env.production' });
+    expect(d.kind).toBe('deny');
+    expect(d.source).toEqual({
+      layer: 'enterprise',
+      rule: '**/.env*',
+      section: 'read_file',
+    });
+  });
+
+  test('fs.write allow + acceptEdits auto-allow keeps source from the matched rule', () => {
+    const eng = createPermissionEngine(
+      policy({
+        defaults: { mode: 'acceptEdits' },
+        tools: { write_file: { confirm_paths: ['package.json'] } },
+      }),
+      { cwd: CWD, provenance: { defaults: 'project', write_file: 'session' } },
+    );
+    const d = eng.check('write_file', 'fs.write', { path: 'package.json' });
+    expect(d.kind).toBe('allow');
+    expect(d.source).toEqual({
+      layer: 'session',
+      rule: 'package.json',
+      section: 'write_file',
+    });
+  });
+
+  test('web.fetch deny carries source.section="fetch_url"', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { fetch_url: { deny_hosts: ['evil.com'] } } }),
+      { cwd: CWD, provenance: { defaults: 'project', fetch_url: 'enterprise' } },
+    );
+    const d = eng.check('fetch_url', 'web.fetch', { url: 'https://evil.com/x' });
+    expect(d.kind).toBe('deny');
+    expect(d.source).toEqual({
+      layer: 'enterprise',
+      rule: 'evil.com',
+      section: 'fetch_url',
+    });
+  });
+
+  test('bypass mode carries source.layer of the layer that chose bypass', () => {
+    // Operator editing config to undo the bypass needs to know
+    // which YAML set mode — pointing the modal/audit there is
+    // exactly the affordance the source field provides.
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), {
+      cwd: CWD,
+      provenance: { defaults: 'session' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'whatever' });
+    expect(d.kind).toBe('allow');
+    expect(d.source).toEqual({ layer: 'session' });
+  });
+
+  test('misc category carries source.layer="default" (no policy section)', () => {
+    const eng = createPermissionEngine(policy({}), {
+      cwd: CWD,
+      provenance: { defaults: 'user' },
+    });
+    const d = eng.check('todo_write', 'misc', {});
+    expect(d.kind).toBe('allow');
+    expect(d.source).toEqual({ layer: 'default' });
+  });
+
+  test('engine without provenance falls back to source.layer="default" everywhere', () => {
+    // Test ergonomics: an engine built from a hand-crafted Policy
+    // (no resolver, no merge, no provenance) shouldn't crash —
+    // sources collapse to 'default' and consumers handle it
+    // gracefully.
+    const eng = createPermissionEngine(policy({ tools: { bash: { deny: ['rm -rf *'] } } }), {
+      cwd: CWD,
+    });
+    const d = eng.check('bash', 'bash', { command: 'rm -rf /' });
+    expect(d.kind).toBe('deny');
+    expect(d.source).toEqual({ layer: 'default', rule: 'rm -rf *', section: 'bash' });
+  });
+});

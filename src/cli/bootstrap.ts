@@ -176,7 +176,16 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
       : {}),
     ...(input.userPolicyPath !== undefined ? { userPath: input.userPolicyPath } : {}),
   });
-  const permissionEngine = createPermissionEngine(resolved.policy, { cwd });
+  // Pass `provenance` so every Decision the engine returns
+  // carries `source.layer` populated from the section that fired
+  // the rule. The modal layer renders "denied by user policy
+  // (rule: rm *, section: bash)" instead of a generic "denied",
+  // and `/perms why` can point operators at the YAML they need
+  // to edit.
+  const permissionEngine = createPermissionEngine(resolved.policy, {
+    cwd,
+    provenance: resolved.provenance,
+  });
   const policyLayers = resolved.layers.map((l) => l.layer);
 
   const toolRegistry = createToolRegistry();

@@ -1,3 +1,4 @@
+import type { SectionProvenance } from './hierarchy.ts';
 import { firstMatchingCommand, firstMatchingHost, firstMatchingPath } from './matcher.ts';
 import type {
   BashPolicy,
@@ -7,12 +8,22 @@ import type {
   PermissionsView,
   Policy,
   PolicyCategory,
+  PolicyLayer,
   PolicyMode,
+  PolicySource,
   PolicyToolsSection,
 } from './types.ts';
 
 export interface EngineOptions {
   cwd: string;
+  // Per-section last-writer tracking from the hierarchy resolver
+  // (PolicyLayer in types.ts). When provided, every Decision the
+  // engine returns carries `source.layer` populated from the
+  // section that fired the rule. Optional to keep test ergonomics
+  // (a one-off engine built from a hand-crafted Policy doesn't
+  // need to also synthesize provenance) — when absent, every
+  // Decision falls back to source.layer='default'.
+  provenance?: SectionProvenance;
 }
 
 export interface PermissionEngine {
@@ -81,9 +92,24 @@ const resolveFsTarget = (toolName: string, args: ToolArgs, cwd: string): string 
   return isNonEmptyString(args.path) ? args.path : null;
 };
 
-const denyDefault = (toolName: string, mode: PolicyMode): Decision => ({
+// Resolve the layer that holds a given tools section, falling back
+// to 'default' when no layer wrote it (or provenance was absent —
+// test-built engines may skip provenance entirely). Return type
+// pulled from `PolicyLayer` (not a hand-spelled literal union) so
+// adding a future layer (e.g. CLI runtime override) automatically
+// flows through here without a silent drift.
+const sectionLayer = (
+  provenance: SectionProvenance | undefined,
+  key: keyof PolicyToolsSection,
+): PolicyLayer => {
+  if (provenance === undefined) return 'default';
+  return provenance[key] ?? 'default';
+};
+
+const denyDefault = (toolName: string, mode: PolicyMode, source: PolicySource): Decision => ({
   kind: 'deny',
   reason: `no policy rule matched for ${toolName} (mode=${mode})`,
+  source,
 });
 
 const checkBash = (
@@ -91,21 +117,39 @@ const checkBash = (
   args: ToolArgs,
   rules: BashPolicy | undefined,
   mode: PolicyMode,
+  provenance: SectionProvenance | undefined,
 ): Decision => {
   const command = args.command;
   if (typeof command !== 'string' || command.length === 0) {
-    return { kind: 'deny', reason: `${toolName}: missing 'command' argument` };
+    // Engine-internal reject (missing arg). No policy was
+    // consulted — source.layer='default' so the modal doesn't
+    // mislead the operator into editing the wrong YAML.
+    return {
+      kind: 'deny',
+      reason: `${toolName}: missing 'command' argument`,
+      source: { layer: 'default' },
+    };
   }
+
+  const layer = sectionLayer(provenance, 'bash');
 
   // Deny rules win over allow/confirm regardless of mode (including bypass-
   // outside-callers, though `bypass` itself short-circuits earlier).
   const denied = firstMatchingCommand(rules?.deny, command);
   if (denied !== null) {
-    return { kind: 'deny', reason: `bash command matched deny rule: ${denied}` };
+    return {
+      kind: 'deny',
+      reason: `bash command matched deny rule: ${denied}`,
+      source: { layer, rule: denied, section: 'bash' },
+    };
   }
   const allowed = firstMatchingCommand(rules?.allow, command);
   if (allowed !== null) {
-    return { kind: 'allow', reason: `bash command matched allow rule: ${allowed}` };
+    return {
+      kind: 'allow',
+      reason: `bash command matched allow rule: ${allowed}`,
+      source: { layer, rule: allowed, section: 'bash' },
+    };
   }
   const confirm = firstMatchingCommand(rules?.confirm, command);
   if (confirm !== null) {
@@ -113,9 +157,15 @@ const checkBash = (
       kind: 'confirm',
       prompt: `Run bash: ${command}`,
       reason: `matched confirm rule: ${confirm}`,
+      source: { layer, rule: confirm, section: 'bash' },
     };
   }
-  return denyDefault(toolName, mode);
+  // Default-deny: no rule matched. `layer` still reflects which
+  // YAML holds the bash section (so operator knows where to add
+  // an allow rule), or 'default' when no layer declared bash at
+  // all. Section name set so `/perms why` can point operator at
+  // tools.bash.
+  return denyDefault(toolName, mode, { layer, section: 'bash' });
 };
 
 // Search-tool roots (grep/glob) are policy-allowed when the pattern
@@ -139,11 +189,20 @@ const checkPath = (
   mode: PolicyMode,
   cwd: string,
   isWrite: boolean,
+  provenance: SectionProvenance | undefined,
+  sectionKey: keyof PolicyToolsSection,
 ): Decision => {
   const path = resolveFsTarget(toolName, args, cwd);
   if (path === null) {
-    return { kind: 'deny', reason: `${toolName}: missing or non-string path argument` };
+    return {
+      kind: 'deny',
+      reason: `${toolName}: missing or non-string path argument`,
+      source: { layer: 'default' },
+    };
   }
+
+  const layer = sectionLayer(provenance, sectionKey);
+  const sectionName = sectionKey;
 
   // For search-tool roots we also need to check the literal path against
   // deny rules — a `deny_paths: ['secrets/**']` should block grep rooted
@@ -155,11 +214,19 @@ const checkPath = (
     : null;
   const denied = firstMatchingPath(rules?.deny_paths, matchTarget, cwd) ?? deniedLiteral;
   if (denied !== null) {
-    return { kind: 'deny', reason: `path matched deny rule: ${denied}` };
+    return {
+      kind: 'deny',
+      reason: `path matched deny rule: ${denied}`,
+      source: { layer, rule: denied, section: sectionName },
+    };
   }
   const allowed = firstMatchingPath(rules?.allow_paths, matchTarget, cwd);
   if (allowed !== null) {
-    return { kind: 'allow', reason: `path matched allow rule: ${allowed}` };
+    return {
+      kind: 'allow',
+      reason: `path matched allow rule: ${allowed}`,
+      source: { layer, rule: allowed, section: sectionName },
+    };
   }
   const confirm = firstMatchingPath(rules?.confirm_paths, matchTarget, cwd);
   if (confirm !== null) {
@@ -170,19 +237,21 @@ const checkPath = (
       return {
         kind: 'allow',
         reason: `acceptEdits: matched confirm rule (auto-accepted): ${confirm}`,
+        source: { layer, rule: confirm, section: sectionName },
       };
     }
     return {
       kind: 'confirm',
       prompt: `${isWrite ? 'Write to' : 'Read from'} ${path}?`,
       reason: `matched confirm rule: ${confirm}`,
+      source: { layer, rule: confirm, section: sectionName },
     };
   }
 
   // Unmatched paths default-deny in every mode (strict and acceptEdits).
   // acceptEdits skips the confirm step for confirmable writes; it does not
   // open writes to anywhere — that's what `bypass` is for.
-  return denyDefault(toolName, mode);
+  return denyDefault(toolName, mode, { layer, section: sectionName });
 };
 
 const checkFetch = (
@@ -190,27 +259,45 @@ const checkFetch = (
   args: ToolArgs,
   rules: FetchPolicy | undefined,
   mode: PolicyMode,
+  provenance: SectionProvenance | undefined,
 ): Decision => {
   const url = args.url;
   if (typeof url !== 'string' || url.length === 0) {
-    return { kind: 'deny', reason: `${toolName}: missing 'url' argument` };
+    return {
+      kind: 'deny',
+      reason: `${toolName}: missing 'url' argument`,
+      source: { layer: 'default' },
+    };
   }
   let host: string;
   try {
     host = new URL(url).hostname;
   } catch {
-    return { kind: 'deny', reason: `${toolName}: invalid URL '${url}'` };
+    return {
+      kind: 'deny',
+      reason: `${toolName}: invalid URL '${url}'`,
+      source: { layer: 'default' },
+    };
   }
 
+  const layer = sectionLayer(provenance, 'fetch_url');
   const denied = firstMatchingHost(rules?.deny_hosts, host);
   if (denied !== null) {
-    return { kind: 'deny', reason: `host matched deny rule: ${denied}` };
+    return {
+      kind: 'deny',
+      reason: `host matched deny rule: ${denied}`,
+      source: { layer, rule: denied, section: 'fetch_url' },
+    };
   }
   const allowed = firstMatchingHost(rules?.allow_hosts, host);
   if (allowed !== null) {
-    return { kind: 'allow', reason: `host matched allow rule: ${allowed}` };
+    return {
+      kind: 'allow',
+      reason: `host matched allow rule: ${allowed}`,
+      source: { layer, rule: allowed, section: 'fetch_url' },
+    };
   }
-  return denyDefault(toolName, mode);
+  return denyDefault(toolName, mode, { layer, section: 'fetch_url' });
 };
 
 // Resolve the policy section name for a tool. The mapping is mostly
@@ -223,16 +310,29 @@ const checkFetch = (
 // bash-category tool reads `tools.bash`. fs.* and web.fetch keep
 // their per-tool lookup because their semantics already differ
 // (read_file's allow_paths != write_file's allow_paths).
-const policySectionFor = (toolName: string, category: PolicyCategory): string => {
-  if (category === 'bash') return 'bash';
-  return toolName;
-};
-
-const lookupRules = (
+//
+// Returns `undefined` for `misc` (no policy section consulted). Both
+// `lookupRules` and source attribution route through this single
+// helper — without the unified path, a future fs.* tool whose name
+// diverged from its policy section would still match `lookupRules`
+// (which casts to string) but produce a bogus `provenance[key]`
+// lookup at the source-attribution site, silently mis-attributing
+// the rule's layer.
+const policySectionFor = (
   toolName: string,
   category: PolicyCategory,
-  tools: PolicyToolsSection,
-): unknown => (tools as unknown as Record<string, unknown>)[policySectionFor(toolName, category)];
+): keyof PolicyToolsSection | undefined => {
+  if (category === 'bash') return 'bash';
+  if (category === 'misc') return undefined;
+  // fs.read / fs.write / web.fetch — section key is the literal
+  // tool name. The cast asserts the tool's name is a known section
+  // key; tools that aren't surface a clean default-deny via
+  // lookupRules' undefined rules path. The narrower-than-`string`
+  // return type also kills the silent drift risk a string return
+  // hid (caller could pass anything to `provenance[key]` and get
+  // 'default' back instead of the right layer).
+  return toolName as keyof PolicyToolsSection;
+};
 
 export const createPermissionEngine = (
   policy: Policy,
@@ -244,49 +344,81 @@ export const createPermissionEngine = (
   // policy as the empty-file fallback.
   const mode = policy.defaults.mode ?? 'strict';
   const cwd = options.cwd;
+  const provenance = options.provenance;
 
   const check = (toolName: string, category: PolicyCategory, args: ToolArgs): Decision => {
     if (mode === 'bypass') {
-      return { kind: 'allow', reason: 'mode=bypass' };
+      // `bypass` is a defaults-level setting — source.layer points
+      // at whichever YAML chose `mode='bypass'` so the operator
+      // can find and undo it. No section/rule (mode-driven, not
+      // rule-driven).
+      return {
+        kind: 'allow',
+        reason: 'mode=bypass',
+        source: { layer: provenance?.defaults ?? 'default' },
+      };
     }
+
+    // Single source of truth for section key + rule lookup. Both
+    // `lookupRules` (rule matching) and the path/fetch source-
+    // attribution branches read `key` here, so a future change to
+    // tool→section mapping (e.g. a new fs.* tool routing to a
+    // shared section) updates one site instead of two.
+    const sectionKey = policySectionFor(toolName, category);
+    const sectionRules =
+      sectionKey === undefined
+        ? undefined
+        : (policy.tools as unknown as Record<string, unknown>)[sectionKey];
 
     switch (category) {
       case 'bash':
-        return checkBash(
-          toolName,
-          args,
-          lookupRules(toolName, category, policy.tools) as BashPolicy | undefined,
-          mode,
-        );
+        // `sectionKey` is always 'bash' here (policySectionFor
+        // collapses the bash family); checkBash hardcodes the
+        // section name internally.
+        return checkBash(toolName, args, sectionRules as BashPolicy | undefined, mode, provenance);
       case 'fs.read':
+        // `sectionKey` is non-undefined for non-misc categories.
+        // The non-null assertion is safe (typed branch) and
+        // documented at policySectionFor.
         return checkPath(
           toolName,
           args,
-          lookupRules(toolName, category, policy.tools) as PathPolicy | undefined,
+          sectionRules as PathPolicy | undefined,
           mode,
           cwd,
           false,
+          provenance,
+          sectionKey as keyof PolicyToolsSection,
         );
       case 'fs.write':
         return checkPath(
           toolName,
           args,
-          lookupRules(toolName, category, policy.tools) as PathPolicy | undefined,
+          sectionRules as PathPolicy | undefined,
           mode,
           cwd,
           true,
+          provenance,
+          sectionKey as keyof PolicyToolsSection,
         );
       case 'web.fetch':
         return checkFetch(
           toolName,
           args,
-          lookupRules(toolName, category, policy.tools) as FetchPolicy | undefined,
+          sectionRules as FetchPolicy | undefined,
           mode,
+          provenance,
         );
       case 'misc':
         // No category-level policy yet; misc tools must be explicitly
         // safe (no side effects worth gating). Default allow.
-        return { kind: 'allow', reason: 'misc category: no gate applied' };
+        // source.layer='default' — engine-internal decision, no
+        // policy section consulted.
+        return {
+          kind: 'allow',
+          reason: 'misc category: no gate applied',
+          source: { layer: 'default' },
+        };
     }
   };
 

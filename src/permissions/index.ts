@@ -7,7 +7,9 @@ export type {
   Policy,
   PolicyCategory,
   PolicyDefaults,
+  PolicyLayer,
   PolicyMode,
+  PolicySource,
   PolicyToolsSection,
 } from './types.ts';
 
@@ -42,5 +44,6 @@ export type {
   LockConflict,
   ResolveOptions,
   ResolveResult,
+  SectionProvenance,
 } from './hierarchy.ts';
 export { resolvePolicy } from './hierarchy.ts';
