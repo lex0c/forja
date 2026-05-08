@@ -182,16 +182,42 @@ export const critiqueCommand: SlashCommand = {
       return { kind: 'ok', notes: lines };
     }
 
-    // Per-session lookup → flat oldest-first list. listCritique-
-    // RunsBySession returns oldest-first within a session, and we
-    // walk session ids in REPL-add order (also oldest-first), so
-    // concat preserves chronological order across sessions. Same
-    // tail-slice + reverse pattern /sessions uses to surface
-    // newest-first to the operator.
+    // Per-session lookup → flat list, then globally sorted by
+    // `createdAt`. Walking sessionIds in REPL-add order is NOT a
+    // valid global timeline when sessions interleave: a foreground
+    // turn in session A can spawn a playbook child B and then
+    // continue producing more critique rows in A AFTER B's rows
+    // landed. With a per-session-then-concat order, A's later rows
+    // would sit before B's earlier rows in the flat list, and the
+    // tail-slice (`all.slice(-limit)`) would silently omit the
+    // genuinely most recent rows while keeping older ones from a
+    // session that happened to be added later. The global sort
+    // makes the tail-slice match the actual chronology regardless
+    // of how sessionIds got registered.
+    //
+    // Tiebreak chain (createdAt → sessionId → stepN → id) handles
+    // ms-collision cases — a single REPL turn can fire several
+    // critiques inside the same wall-clock millisecond, especially
+    // under mocked clocks in tests. Within a session-group at the
+    // same ms, `stepN` preserves the step order
+    // listCritiqueRunsBySession produced (`ORDER BY step_n ASC,
+    // created_at ASC`); without that explicit tier, sorting by
+    // `createdAt` alone could reverse a step run because UUIDs
+    // are random. The final `id` fallback keeps the order
+    // deterministic for the (essentially impossible) case where
+    // two rows share session, step, and ms.
     const all: CritiqueRun[] = [];
     for (const id of sessionIds) {
       all.push(...listCritiqueRunsBySession(ctx.db, id));
     }
+    all.sort((a, b) => {
+      if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
+      if (a.sessionId !== b.sessionId) return a.sessionId < b.sessionId ? -1 : 1;
+      if (a.stepN !== b.stepN) return a.stepN - b.stepN;
+      if (a.id < b.id) return -1;
+      if (a.id > b.id) return 1;
+      return 0;
+    });
     const recent = all.slice(-limit).reverse();
     lines.push('', `recent runs (${recent.length} of ${all.length}):`);
     if (recent.length === 0) {

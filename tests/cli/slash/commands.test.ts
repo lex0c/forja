@@ -444,6 +444,99 @@ describe('/critique', () => {
     expect(out).toContain('critique.warning_redo:1');
   });
 
+  test('sorts globally by createdAt before slicing — interleaved sessions do not corrupt the tail', async () => {
+    // Regression: per-session-order + sessionId-walk-order is NOT
+    // a valid global timeline when sessions interleave. Concrete
+    // scenario:
+    //   - sessionA produces critique rows at t=1, t=2, then t=10
+    //   - sessionB runs as a playbook child between A's t=2 and
+    //     A's t=10, producing rows at t=3 and t=4
+    //   - replSessionIds = [A, B] (REPL-add order; A landed first
+    //     when its earliest session_finished tracked it)
+    //
+    // Naive concat (per-session ASC × sessionIds order):
+    //   [A@1, A@2, A@10, B@3, B@4]                ← WRONG
+    // limit=2 → slice(-2) → [B@3, B@4] → reversed → [B@4, B@3].
+    // The genuinely most recent row (A@10) is dropped while
+    // older rows from B are kept.
+    //
+    // Globally sorted by createdAt:
+    //   [A@1, A@2, B@3, B@4, A@10]                ← CORRECT
+    // limit=2 → slice(-2) → [B@4, A@10] → reversed → [A@10, B@4].
+    const ctx = makeCtx();
+    const sessionA = createSession(ctx.db, { cwd: '/p', model: 'mock/m' });
+    const sessionB = createSession(ctx.db, { cwd: '/p', model: 'mock/m' });
+    const { recordCritiqueRun } = await import('../../../src/storage/index.ts');
+    const baseInput = {
+      mode: 'always' as const,
+      strategy: 'llm' as const,
+      decision: 'no_modal' as const,
+      code: 'critique.clean' as const,
+      rawCount: 0,
+      filteredCount: 0,
+      overallConfidence: 0.9,
+      durationMs: 100,
+      costUsd: 0.001,
+      toolPlanWrites: false,
+      promptVersion: 'v2',
+      threshold: 0.85,
+    };
+    // Insert in interleaved temporal order; explicit createdAt so
+    // the scenario is deterministic regardless of wall-clock skew
+    // during the test.
+    recordCritiqueRun(ctx.db, {
+      ...baseInput,
+      sessionId: sessionA.id,
+      stepN: 1,
+      createdAt: 1_000,
+    });
+    recordCritiqueRun(ctx.db, {
+      ...baseInput,
+      sessionId: sessionA.id,
+      stepN: 2,
+      createdAt: 2_000,
+    });
+    recordCritiqueRun(ctx.db, {
+      ...baseInput,
+      sessionId: sessionB.id,
+      stepN: 1,
+      createdAt: 3_000,
+    });
+    recordCritiqueRun(ctx.db, {
+      ...baseInput,
+      sessionId: sessionB.id,
+      stepN: 2,
+      createdAt: 4_000,
+    });
+    recordCritiqueRun(ctx.db, {
+      ...baseInput,
+      sessionId: sessionA.id,
+      stepN: 3,
+      createdAt: 10_000,
+    });
+    const ctx2 = makeCtx({
+      db: ctx.db,
+      currentSessionId: () => sessionB.id,
+      replSessionIds: () => [sessionA.id, sessionB.id],
+    });
+    const result = await critiqueCommand.exec(['2'], ctx2);
+    if (result.kind !== 'ok') return;
+    const out = (result.notes ?? []).join('\n');
+    // Total count unchanged (5 rows in DB across both sessions).
+    expect(out).toContain('recent runs (2 of 5):');
+    // The two most recent rows by createdAt are A@10000 (step 3
+    // in A) and B@4000 (step 2 in B) — both must surface.
+    const stepA3 = out.indexOf('step 3');
+    const stepB2 = out.indexOf('step 2');
+    expect(stepA3).toBeGreaterThan(-1);
+    expect(stepB2).toBeGreaterThan(-1);
+    // Newest-first: A@10000 before B@4000 in the rendered output.
+    expect(stepA3).toBeLessThan(stepB2);
+    // Older rows MUST NOT appear in the limited tail (these were
+    // the ones the buggy slice was keeping).
+    expect(out).not.toMatch(/step 1\b/);
+  });
+
   test('non-numeric limit produces a clean error', async () => {
     const result = await critiqueCommand.exec(['10foo'], makeCtx());
     expect(result.kind).toBe('error');
