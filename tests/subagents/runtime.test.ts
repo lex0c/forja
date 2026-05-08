@@ -16,6 +16,7 @@ import type { Policy } from '../../src/permissions/index.ts';
 import type { Provider } from '../../src/providers/index.ts';
 import { type DB, openMemoryDb } from '../../src/storage/db.ts';
 import {
+  getProcessRecord,
   getSession,
   getSubagentOutput,
   getSubagentRun,
@@ -39,6 +40,7 @@ import {
 import {
   MAX_SUBAGENT_DEPTH,
   type SpawnChildProcess,
+  computeArgvHash,
   drainStderrToLogFile,
   resolveChildBinaryCmd,
   runSubagent,
@@ -2231,6 +2233,259 @@ describe('runSubagent — orchestration', () => {
     // parent's wait loop could even send a signal — but the
     // post-wait finalization MUST still fire.
     expect(getSession(db, result.sessionId)?.status).toBe('interrupted');
+  });
+});
+
+// End-to-end subprocess audit (migration 029). The fakes used by
+// the orchestration tests above intentionally omit `pid` / `cmd`
+// (they bypass the subprocess surface entirely), so the audit row
+// is skipped — that's the documented behavior in
+// `runtime.ts:5a-bis`. These tests use fakes that DO expose pid +
+// cmd to exercise the audit path end-to-end.
+describe('runSubagent — subprocess audit (subagent_processes)', () => {
+  // Fake that exposes a fake pid + argv so the runtime's audit
+  // hook can record the spawn. Publishes a clean payload + exits 0.
+  const fakeSpawnAudited = (overrides: { exitCode?: number; signal?: string } = {}) => {
+    return ((opts) => {
+      insertSubagentOutput(db, { sessionId: opts.sessionId });
+      setSubagentPayload(db, opts.sessionId, {
+        status: 'done',
+        reason: 'done',
+        output: 'ok',
+        cost_usd: 0,
+        steps: 1,
+        duration_ms: 1,
+      });
+      const handle: ReturnType<SpawnChildProcess> = {
+        exited: Promise.resolve({
+          exitCode: overrides.exitCode ?? 0,
+          ...(overrides.signal !== undefined ? { signal: overrides.signal } : {}),
+        }),
+        pid: 99_999,
+        cmd: ['/bin/agent', '--subagent-session-id', opts.sessionId],
+        kill: () => undefined,
+      };
+      return handle;
+    }) satisfies SpawnChildProcess;
+  };
+
+  test('successful spawn → recordProcessSpawn + recordProcessExit with reason=normal', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: fakeSpawnAudited(),
+    });
+    const row = getProcessRecord(db, result.sessionId);
+    expect(row).not.toBeNull();
+    expect(row?.parentSessionId).toBe(parent.id);
+    expect(row?.pid).toBe(99_999);
+    // argv hash is SHA256 over cmd joined with NUL.
+    expect(row?.argvHash).toMatch(/^[0-9a-f]{64}$/);
+    // stderr log path matches the bgLogDir convention.
+    expect(row?.stderrLogPath).toContain('/.agent/bg/subagents/');
+    expect(row?.stderrLogPath?.endsWith('/stderr.log')).toBe(true);
+    // Exit fields populated by the proc.exited handler.
+    expect(row?.exitedAt).not.toBeNull();
+    expect(row?.exitCode).toBe(0);
+    expect(row?.exitSignal).toBeNull();
+    expect(row?.exitReason).toBe('normal');
+  });
+
+  test('non-zero exit → exit_reason=crash, exit_code preserved', async () => {
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: fakeSpawnAudited({ exitCode: 137 }),
+    });
+    const row = getProcessRecord(db, result.sessionId);
+    expect(row?.exitCode).toBe(137);
+    expect(row?.exitSignal).toBeNull();
+    expect(row?.exitReason).toBe('crash');
+  });
+
+  test('OS-killed (signal, no parent kill) → exit_reason=signal, exit_code=null', async () => {
+    // Child segfaulted / OOM-killed — exit.signal is set but the
+    // parent never called handle.kill (parentInitiatedKill stays
+    // false). Classifier picks 'signal'. exit_code persists as
+    // NULL per POSIX (signal exits have no meaningful code).
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: fakeSpawnAudited({ exitCode: 139, signal: 'SIGSEGV' }),
+    });
+    const row = getProcessRecord(db, result.sessionId);
+    expect(row?.exitCode).toBeNull();
+    expect(row?.exitSignal).toBe('SIGSEGV');
+    expect(row?.exitReason).toBe('signal');
+  });
+
+  test('fakes without pid/cmd skip the audit row (no FK / NOT NULL crash)', async () => {
+    // The orchestration-test fakes (fakeSpawnDone etc) don't
+    // expose pid/cmd. The runtime's `if (handle.pid !== undefined
+    // && handle.cmd !== undefined)` guard MUST skip the audit
+    // write so existing tests keep passing — a regression that
+    // tries to record without pid would fail on the NOT NULL
+    // pid column.
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      spawnChildProcess: fakeSpawnDone(),
+    });
+    expect(getProcessRecord(db, result.sessionId)).toBeNull();
+  });
+
+  test('parent abort → exit_reason=parent_aborted (precedence over signal/crash classification)', async () => {
+    // Parent's caller-supplied AbortSignal fires; the wait loop
+    // tears down. The classifier checks input.signal.aborted
+    // FIRST so even if the OS reports a SIGKILL exit, the audit
+    // reason reads 'parent_aborted' — captures intent, not
+    // mechanism. Lets forensic queries separate "operator
+    // pressed Ctrl-C" from "child died on its own".
+    const ctrl = new AbortController();
+    const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
+      model: 'mock/m',
+      cwd: '/p',
+    });
+    // Schedule the abort just after spawn so the wait loop
+    // observes signal.aborted before recording exit.
+    queueMicrotask(() => ctrl.abort());
+    const result = await runSubagent({
+      definition: definition(),
+      prompt: 'go',
+      parentSessionId: parent.id,
+      provider: stubProvider(),
+      parentToolRegistry: buildParentRegistry(echoTool),
+      permissionEngine: buildEngine(),
+      db,
+      cwd: '/p',
+      signal: ctrl.signal,
+      spawnChildProcess: fakeSpawnAudited({ exitCode: 137, signal: 'SIGKILL' }),
+    });
+    const row = getProcessRecord(db, result.sessionId);
+    expect(row?.exitReason).toBe('parent_aborted');
+  });
+});
+
+describe('computeArgvHash', () => {
+  // The hash is the audit's cross-run fingerprint. Pinning these
+  // shapes prevents two regression classes:
+  //   1. A future hand-edit that drops a real config flag from
+  //      the hash (would silently degrade the fingerprint).
+  //   2. A future hand-edit that adds a per-spawn flag without
+  //      updating ARGV_HASH_DROP_PAIRS (would re-introduce the
+  //      "unique per spawn" defect that motivated this filter).
+
+  test('argv differing ONLY in --subagent-session-id produces the same hash', () => {
+    const cmdA = [
+      '/bin/agent',
+      '--subagent-session-id',
+      '11111111-1111-4111-8111-111111111111',
+      '--subagent-depth',
+      '0',
+    ];
+    const cmdB = [
+      '/bin/agent',
+      '--subagent-session-id',
+      '22222222-2222-4222-8222-222222222222',
+      '--subagent-depth',
+      '0',
+    ];
+    expect(computeArgvHash(cmdA)).toBe(computeArgvHash(cmdB));
+  });
+
+  test('argv differing ONLY in --subagent-bg-log-dir produces the same hash', () => {
+    // The bg-log-dir embeds the session id in its path
+    // (`.agent/bg/subagents/<id>/`), so it MUST be filtered along
+    // with `--subagent-session-id` for the hash to be stable
+    // across runs.
+    const cmdA = [
+      '/bin/agent',
+      '--subagent-bg-log-dir',
+      '/p/.agent/bg/subagents/aaa/',
+      '--subagent-depth',
+      '0',
+    ];
+    const cmdB = [
+      '/bin/agent',
+      '--subagent-bg-log-dir',
+      '/p/.agent/bg/subagents/bbb/',
+      '--subagent-depth',
+      '0',
+    ];
+    expect(computeArgvHash(cmdA)).toBe(computeArgvHash(cmdB));
+  });
+
+  test('argv differing in --subagent-depth (a real config flag) produces a DIFFERENT hash', () => {
+    // depth IS config — a depth-0 spawn vs a depth-2 spawn are
+    // legitimately different runs. A regression that filtered
+    // depth out of the hash would flatten this distinction and
+    // be caught here.
+    const cmd0 = ['/bin/agent', '--subagent-depth', '0'];
+    const cmd2 = ['/bin/agent', '--subagent-depth', '2'];
+    expect(computeArgvHash(cmd0)).not.toBe(computeArgvHash(cmd2));
+  });
+
+  test('argv differing in --subagent-temperature produces a DIFFERENT hash', () => {
+    // Eval pipelines pin temperature=0; ad-hoc runs use the
+    // provider default. Cross-run regression hunts MUST see
+    // these as distinct configs.
+    const cmd0 = ['/bin/agent', '--subagent-temperature', '0'];
+    const cmd1 = ['/bin/agent', '--subagent-temperature', '1'];
+    expect(computeArgvHash(cmd0)).not.toBe(computeArgvHash(cmd1));
+  });
+
+  test('returns a 64-char lowercase hex string (SHA256 shape)', () => {
+    expect(computeArgvHash(['/bin/agent'])).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test('handles a malformed cmd with a drop-flag at the end (no value to skip)', () => {
+    // Defensive: a future bug in the spawn factory could emit
+    // `--subagent-session-id` as the LAST token without a value.
+    // The hash function must not throw or read out of bounds —
+    // the trailing drop-flag is consumed and the would-be value
+    // index is past the end, which the loop tolerates.
+    const cmd = ['/bin/agent', '--subagent-depth', '0', '--subagent-session-id'];
+    expect(() => computeArgvHash(cmd)).not.toThrow();
   });
 });
 

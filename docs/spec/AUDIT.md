@@ -25,7 +25,7 @@ Sem audit consolidado, "compliance" e "debug forense" viram intenção sem entre
 
 ## 1. Tables canônicas
 
-Lista canônica das **18 tabelas de audit**, com escopo, retention, sensitivity, e regra de redaction.
+Lista canônica das **19 tabelas de audit**, com escopo, retention, sensitivity, e regra de redaction.
 
 | Tabela | Escopo | Retention default | Sensitivity | Redaction |
 |---|---|---|---|---|
@@ -39,6 +39,7 @@ Lista canônica das **18 tabelas de audit**, com escopo, retention, sensitivity,
 | `recap_runs` | recap executions | 90d | low | nenhuma |
 | `checkpoints` | FS snapshots metadata | 30d | low | path → `~/...` |
 | `subagent_outputs` | subagent results | 90d | medium | full redaction em `payload` |
+| `subagent_processes` | subagent subprocess lifecycle (ver §1.7) | 90d (cascade com sessions) | low | nenhuma (só metadata OS) |
 | `pending_decisions` | modal state | 7d (transient) | low | nenhuma |
 | `recap_cache` | rendered recaps | 1h TTL | medium | nenhuma (output já passou por redaction) |
 | `background_processes` | bg processes metadata | 30d | low | redact `cmd` |
@@ -603,6 +604,73 @@ ORDER BY days_old DESC;
 - **State flags imutáveis durante sessão** (`profile`, `mcp_servers.state`) — gravados em outras tabelas; `feature_flags_active` reflete só user-controlled toggles.
 - **Sem versionamento de registry.** Se `experimental` → `staged` muda mid-session, `feature_flags_active` não captura — `set_by` registra origem, não stage histórico.
 - **Cleanup cascateia com sessão.** Sessão deletada por retention (`§1.2`) leva flags junto. Para análise long-term, agregação periódica em tabela separada (`flag_metrics`) é v2.
+
+### 1.7 Subagent subprocess lifecycle (`subagent_processes`)
+
+End-to-end audit do **OS-level** subprocess de cada subagent. Complementa `subagent_outputs` (resultado estruturado que o filho publica) e `subagent_runs` (metadata da decisão de spawn): cobre o que aconteceu **com o processo** em si.
+
+#### 1.7.1 Motivação
+
+Sem essa tabela, "subagent X falhou" como query forense quica entre `stderr.log` no disco + especulação. Especificamente:
+
+- Filho que crasha **antes** do primeiro IPC (segfault no boot, ENOENT do binário, OOM antes do harness inicializar): `subagent_outputs` fica com `payload IS NULL`, sem cause label.
+- Filho killed por signal externo (OOM-killer, operador `kill -9`): exit code 137 (ou similar) sem distinção entre "OS matou" e "pai matou".
+- Operador que quer correlacionar com ferramentas externas (`ps`, `top`, profiler): pid não está em lugar nenhum no audit.
+
+#### 1.7.2 Schema
+
+Migração `029-subagent-processes`:
+
+```sql
+CREATE TABLE subagent_processes (
+  session_id        TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  parent_session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+  pid               INTEGER NOT NULL,
+  argv_hash         TEXT NOT NULL,         -- SHA256(cmd.join('\0'))
+  spawned_at        INTEGER NOT NULL,
+  exited_at         INTEGER,               -- nullable enquanto vivo
+  exit_code         INTEGER,               -- nullable em signal-exit (POSIX)
+  exit_signal       TEXT,                  -- 'SIGTERM' | 'SIGSEGV' | ...
+  stderr_log_path   TEXT,                  -- nullable se bgLogDir undefined
+  ipc_handshake_ok  INTEGER NOT NULL DEFAULT 0,  -- 0|1
+  exit_reason       TEXT                   -- categórico (§1.7.4)
+);
+```
+
+`argv_hash` é fingerprint da **config efetiva**, não do invocation. Calculado em `runtime.ts:computeArgvHash` como SHA256 sobre o argv com pares `(--subagent-session-id, <id>)` e `(--subagent-bg-log-dir, <path>)` removidos — esses dois variam por spawn (UUID fresco a cada chamada; bg-log-dir embute o mesmo UUID no path) e sem o filtro o hash seria único por invocation, inutilizável como sinal de regressão cross-run. Os outros flags forwardados (`--subagent-depth`, `--subagent-temperature`, `--subagent-plan-mode`, `--subagent-cwd-trusted`, `--subagent-memory-cwd`, `--ipc=N`) ARE config e ficam no hash. Reproducibilidade ("este filho rodou com os mesmos flags do anterior?") via comparação de hashes; reconstrução literal não é objetivo (paths/tokens em argv não viram audit).
+
+#### 1.7.3 Lifecycle (two-phase write)
+
+| Fase | Caller | Tipo | Trigger |
+|---|---|---|---|
+| 1. INSERT | `runtime.ts:5a-bis` | `recordProcessSpawn` | logo após `Bun.spawn` retornar pid |
+| 1.5. UPDATE (idempotent) | `runtime.ts` IPC handshake | `markIpcHandshakeOk` | primeiro `session_start` válido sobre IPC |
+| 2. UPDATE | `runtime.ts` exit handler | `recordProcessExit` | `proc.exited` resolve |
+
+Spawn falha (ENOENT, EACCES, out-of-fds) **não** produz linha aqui — sem pid não há row. Esses casos seguem o caminho normal via `subagent_outputs` com `reason='subprocess_spawn_failed'`. A tabela é "processos que efetivamente rodaram".
+
+Tests que injetam fake `spawnChildProcess` (sem pid/cmd reais) skip o audit write — guard `if (handle.pid !== undefined && handle.cmd !== undefined)`. Documentado para que regressões que tentem stamp sem pid surfaçam como falha de teste.
+
+#### 1.7.4 Categorias de `exit_reason`
+
+Computed no exit handler, em ordem de precedência:
+
+| Reason | Condição | Significado |
+|---|---|---|
+| `parent_aborted` | `input.signal.aborted` (caller cancelou) | Operador deu Ctrl-C ou SDK chamou abort. Precedência sobre signal/code porque captura intenção, não mecanismo. |
+| `killed` | exit signal presente AND `parentInitiatedKill === true` | Pai chamou `handle.kill()` (wall-clock graceful, protocol mismatch, hard abort). |
+| `signal` | exit signal presente AND `parentInitiatedKill === false` | OS-killed sem ação do pai (SIGSEGV, OOM-killer, `kill -9` externo). |
+| `normal` | exit code 0, sem signal | Saída limpa. |
+| `crash` | exit code ≠ 0, sem signal | Filho saiu por conta própria com erro. |
+| `unknown` | reservado | Não emitido pelo classifier atual; reservado para shapes futuros. |
+
+`parentInitiatedKill` é tracked via shim em `handle.kill` no runtime — toda chamada (this-file + wait-loop) flipa o flag pelo reference compartilhado.
+
+#### 1.7.5 Best-effort writes
+
+Audit writes neste path são embrulhados em try/catch silencioso. Premissa: SQLite lock contention / schema mismatch / qualquer throw NÃO pode quebrar o spawn flow. O subagent run continua; o gap surge como linha ausente em query time. `agent worktree gc` futuro reapa órfãos via `listOrphanedProcesses`.
+
+Princípio §0.1 ("append-only por convenção") observado com a flexibilidade documentada em `subagent_outputs` (§1) — o row tem dois UPDATE points fixos (handshake + exit), refletindo lifecycle de duas-fases, não mutação livre.
 
 ---
 

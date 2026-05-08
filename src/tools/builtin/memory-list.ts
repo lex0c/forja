@@ -51,7 +51,7 @@ const validateScope = (raw: unknown): MemoryScope | null | { error: string } => 
 export const memoryListTool: Tool<MemoryListInput, MemoryListOutput> = {
   name: 'memory_list',
   description:
-    'List memory entries the agent has cross-session access to. Returns name, description, scope (project_local | project_shared | user), and href. Does NOT load the body content — call memory_read to fetch a specific entry. Pass scope to filter to one scope, or dedupe_by_name=true to collapse same-name shadowing across scopes (most-specific scope wins). Parallel-safe: emit multiple memory_list calls in a single turn (e.g. one per scope) to enumerate concurrently.',
+    'List memory entries the agent has cross-session access to. Returns name + description + scope per entry; does NOT load bodies (use memory_read). Pass scope to filter, or dedupe_by_name=true to collapse same-name shadowing (most-specific scope wins). Parallel-safe.',
   inputSchema: {
     type: 'object',
     properties: {

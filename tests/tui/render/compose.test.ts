@@ -1,9 +1,17 @@
 import { describe, expect, test } from 'bun:test';
 import { FOOTER_BLOCK_LINES, composeCursor, composeLive } from '../../../src/tui/render/compose.ts';
+import { COGNITIVE_VERB_POOL, OUTPUT_VERB_POOL } from '../../../src/tui/render/spinner-verbs.ts';
 import { visualWidth } from '../../../src/tui/render/width.ts';
 import type { ActiveTool, LiveState } from '../../../src/tui/state.ts';
 import { createInitialState } from '../../../src/tui/state.ts';
 import type { Capabilities } from '../../../src/tui/term.ts';
+
+// Match a verb-shaped chip line: "<verb>… (..." — the chip's
+// rotating verb sits before the elapsed counter.
+const verbInLine = (line: string | undefined): string | null => {
+  const m = line?.match(/(\w+)…\s*\(/);
+  return m ? (m[1] ?? null) : null;
+};
 
 const caps: Capabilities = {
   isTTY: true,
@@ -142,7 +150,8 @@ describe('composeLive layout', () => {
     expect(out[1]).toContain('Tasks');
     expect(out[2]).toContain('plan it');
     expect(out[3]).toBe('  '); // before assistant chip
-    expect(out[4]).toContain('Generating…');
+    // Assistant chip carries a verb from the OUTPUT pool (spinner-verbs.ts).
+    expect(OUTPUT_VERB_POOL).toContain(verbInLine(out[4]) ?? '');
     expect(out[5]).toBe('  '); // before tool card
     expect(out[6]).toContain('Executing');
     expect(out[7]).toContain('ls');
@@ -169,9 +178,58 @@ describe('composeLive layout', () => {
     // [BLANK, chip, BLANK, rule, input, rule, footer] = 7.
     expect(out).toHaveLength(7);
     expect(out[0]).toBe('  '); // leading blank before chip
-    expect(out[1]).toContain('Generating…');
+    expect(OUTPUT_VERB_POOL).toContain(verbInLine(out[1]) ?? '');
     expect(out[2]).toBe('  '); // blank between chip and input rule
     expect(out[3]).toBe(expectedRule(caps.cols, true));
+  });
+
+  test('thinking chip replaces the generating chip while state.thinking is set', () => {
+    // Mutual exclusion contract: when both `state.thinking` and
+    // `state.pendingAssistant` are set (Anthropic emits
+    // message_start before thinking_delta arrives), the more-
+    // specific cognitive-pool chip wins. The output-pool chip
+    // would surface a generic "model is producing output" signal,
+    // but during the thinking pass no text streams — operator
+    // would see a frozen chip. Cognitive verb explains the
+    // 5-30s no-progress gap honestly.
+    //
+    // Assertion targets the SPECIFIC chip line (out[1] in the
+    // BLANK + chip + BLANK + rule + input + rule + footer
+    // layout) rather than scanning the whole frame. Scanning
+    // would tangle this assertion with future tool active verbs:
+    // if a tool ever picks an active-verb in OUTPUT_VERB_POOL
+    // (e.g. "Refining" if a follow-up routes the minimalist
+    // technical cluster into tool cards), the scan-based check
+    // would falsely report exclusivity violation. Pinning the
+    // exact slot keeps this test about chip semantics, not
+    // about everything-on-screen.
+    const s = startedSession();
+    s.pendingAssistant = {
+      messageId: 'm1',
+      text: '',
+      startedAt: 0,
+      inputTokens: null,
+      outputTokens: null,
+      cacheRead: null,
+      cacheCreation: null,
+    };
+    s.thinking = { startedAt: 0, messageId: 'm1' };
+    const out = composeLive(s, caps, 1000);
+    const chipVerb = verbInLine(out[1]);
+    expect(chipVerb).not.toBeNull();
+    expect(COGNITIVE_VERB_POOL).toContain(chipVerb ?? '');
+    expect(OUTPUT_VERB_POOL).not.toContain(chipVerb ?? '');
+  });
+
+  test('thinking chip alone (no pendingAssistant) still renders', () => {
+    // Defensive case: thinking_delta arrived with no prior
+    // assistant:start (out-of-order producer, mid-stream resume).
+    // The chip should still render so the operator sees activity.
+    const s = startedSession();
+    s.thinking = { startedAt: 0, messageId: 'm1' };
+    const out = composeLive(s, caps, 1000);
+    const chipVerb = verbInLine(out[1]);
+    expect(COGNITIVE_VERB_POOL).toContain(chipVerb ?? '');
   });
 
   test('multi-line input keeps input above the trailing rule + footer', () => {

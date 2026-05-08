@@ -20,13 +20,19 @@ import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import { type SubagentSet, loadSubagents, validateSubagentSet } from '../subagents/index.ts';
 import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { isTrusted, trustListPath } from '../trust/index.ts';
+import { composeWithEnvironment } from './environment-prompt.ts';
+import { probeGitContext } from './git-context.ts';
+import { localIsoDate } from './local-date.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithParallelHint } from './parallel-prompt.ts';
 import { composeWithUserPrompt } from './plan-prompt.ts';
 import { composeWithPlaybookHint } from './playbook-prompt.ts';
+import { assembleProjectPointer, composeWithProjectPointer } from './project-pointer.ts';
 import { composeWithResponseFormat } from './response-format.ts';
+import { composeWithTaskDiscipline } from './task-discipline.ts';
+import { composeWithToolErgonomics } from './tool-ergonomics-prompt.ts';
 
-export const DEFAULT_MODEL = 'anthropic/claude-sonnet-4-6';
+export const DEFAULT_MODEL = 'anthropic/claude-opus-4-7';
 
 export interface BootstrapInput {
   prompt: string;
@@ -180,14 +186,30 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   const dbPath = input.dbPath ?? defaultDbPath();
   const db = openDb(dbPath);
 
+  // Resolve cwd trust state EARLY so the system-prompt composition
+  // (project pointer, below) can gate on it. Originally this lived
+  // after the prompt assembly because no upstream surface needed
+  // it; the project_pointer section needs the flag at compose
+  // time, so we lift it. Failing-closed semantics unchanged: any
+  // path that resolves to "no trust storage" or "cwd absent from
+  // list" yields `false`, which suppresses the pointer (and any
+  // other downstream gate that consults `isCwdTrusted`).
+  const trustPath =
+    input.trustListPathOverride !== undefined ? input.trustListPathOverride : trustListPath();
+  const isCwdTrusted = trustPath !== null && isTrusted(trustPath, cwd);
+
   let resolvedSystemPrompt: string | undefined;
   let memoryRegistry: ReturnType<typeof createMemoryRegistry>;
   let resolvedHooks: ReturnType<typeof resolveHookConfig>;
   try {
     migrate(db);
 
-    // Resolve the effective system prompt. Five layers stack
-    // here in precedence order (most-specific to most-generic):
+    // Resolve the effective system prompt. Layers stack here in
+    // precedence order (most-specific to most-generic). Each
+    // `composeWith*` prepends to the downstream chunk it
+    // receives, so we wrap from the inside out — the LAST
+    // wrapper applied lands FIRST in the final string.
+    //
     //   1. Caller's user prompt (input.systemPrompt) — most
     //      specific, the operator's own framing.
     //   2. Plan mode prompt — operating-mode framing for
@@ -197,27 +219,67 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     //      §1.4). Sits between parallel and plan/user because
     //      the table assumes the model already knows the
     //      task_async family from the parallel layer.
-    //   4. Parallelism hint — universal background that
+    //   4. Tool ergonomics — high-payoff usage rules distilled
+    //      from `TOOL_ERGONOMICS.md` (slice before reading,
+    //      filter before stdout, scope conservatively, prefer
+    //      dedicated tools, do not re-read in session, diagnose
+    //      before retry). Sits BETWEEN parallelism and the
+    //      playbook hint because it teaches "when you make
+    //      tool calls, MAKE THEM WELL" — paired with the
+    //      "you can make several at once" framing right above.
+    //   5. Parallelism hint — universal background that
     //      surfaces the harness's concurrency affordances
     //      (multi-tool turns, task_async family) so the
     //      capability isn't dormant.
-    //   5. Response-format hint — render-target rules
+    //   6. Response-format hint — render-target rules
     //      (CommonMark in monospace ANSI, file:line refs,
     //      no-emoji default, structural padding bans) per
-    //      ANTI_PATTERNS.md §1.3 ("output format expectations
-    //      literais"). Sits OUTERMOST because it applies to
-    //      every other section's output equally.
-    //
-    // Composition order: response-format FIRST (most general
-    // surface contract), then parallel hint, then playbook
-    // hint, then plan/user (more-specific instructions). Each
-    // `composeWith*Hint` prepends its hint to the downstream
-    // chunk it receives, so we wrap from the inside out.
+    //      ANTI_PATTERNS.md §1.3.
+    //   7. Task discipline — behavioral norms (prefer editing,
+    //      no premature abstractions, WHY-only comments, no
+    //      half-finished work). Most-general operational
+    //      framing; sits above response-format because it
+    //      governs WHAT the model writes, while response-format
+    //      governs HOW it formats output.
+    //   8. Environment block — situational anchor: cwd, OS,
+    //      model, today's date, git context. Sits OUTERMOST so
+    //      it lands first in the prompt — the model reads
+    //      "where am I" before reading any task instructions.
+    //      Date in this section invalidates cache once per
+    //      UTC day (acceptable per CONTEXT_TUNING §3.2; the
+    //      alternative — placeholder + post-cache substitution
+    //      — is not supported by Anthropic's API).
     const baseDownstream =
       input.plan === true ? composeWithUserPrompt(input.systemPrompt) : input.systemPrompt;
     const withPlaybook = composeWithPlaybookHint(baseDownstream, subagents);
-    const withParallel = composeWithParallelHint(withPlaybook);
-    resolvedSystemPrompt = composeWithResponseFormat(withParallel);
+    const withErgonomics = composeWithToolErgonomics(withPlaybook);
+    const withParallel = composeWithParallelHint(withErgonomics);
+    const withResponseFormat = composeWithResponseFormat(withParallel);
+    const withDiscipline = composeWithTaskDiscipline(withResponseFormat);
+    resolvedSystemPrompt = composeWithEnvironment(withDiscipline, {
+      cwd,
+      platform: process.platform,
+      modelId: provider.id,
+      // Today's date in `YYYY-MM-DD`, OPERATOR-LOCAL timezone.
+      // Single Date.now() call at boot — stable for the whole
+      // session, so the env block sits inside cache breakpoint
+      // #1 across turns within a session. Across session
+      // boundaries spanning local midnight the cache
+      // invalidates, which is the intended trade-off.
+      //
+      // Local time, not UTC: the model uses this value to
+      // interpret relative requests like "today's commits" /
+      // "yesterday's logs". `Date.toISOString()` would emit
+      // UTC, which is one day ahead in US evening sessions and
+      // similar; the wrong day in the prompt then pushes the
+      // model toward the wrong git --since window. See
+      // `local-date.ts` for the timezone-math rationale.
+      today: localIsoDate(),
+      // Git probes are best-effort: when cwd is not a git repo
+      // the helper returns null and the env section omits the
+      // git sub-block entirely.
+      git: probeGitContext(cwd),
+    });
 
     // Memory subsystem (spec MEMORY.md / §4.1). Build the registry
     // from the REPO root, not the invocation cwd: project memory
@@ -284,6 +346,34 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     // project memory loaded from `/repo` mentions them; probing
     // cwd would silently miss every project-root file.
     const bootContext = evaluateBootTriggers(repoRoot);
+    // [project_context] section (spec CONTEXT_TUNING.md §2.0).
+    // Pointer to AGENTS.md; body lazy via read_file. Sits in the
+    // composed string BEFORE [memory_index] to match the layout in
+    // §2 — most-stable-first ordering keeps the cache breakpoint
+    // economy intact: the pointer changes only when AGENTS.md is
+    // renamed/removed, while memory index changes on every
+    // /memory write. Empty-text section passes the base prompt
+    // through unchanged when neither path is both trusted and
+    // present.
+    //
+    // `isRepoRootTrusted` is computed independently of
+    // `isCwdTrusted`: trust storage is exact-path membership
+    // (`isTrusted(trustList, path)`), so an operator who trusted
+    // only a subdir has NOT implicitly trusted its parent. The
+    // pointer must not advertise paths outside the explicit
+    // trust grant — see `project-pointer.ts` §"Trust gate" for
+    // the threat model. When `cwd === repoRoot` (the common
+    // project-root invocation) the two flags are equal by
+    // construction and the second `isTrusted` call is a no-op.
+    const isRepoRootTrusted =
+      cwd === repoRoot ? isCwdTrusted : trustPath !== null && isTrusted(trustPath, repoRoot);
+    const projectPointer = assembleProjectPointer({
+      cwd,
+      repoRoot,
+      isCwdTrusted,
+      isRepoRootTrusted,
+    });
+    resolvedSystemPrompt = composeWithProjectPointer(resolvedSystemPrompt, projectPointer.text);
     const memorySection = assembleMemorySection({
       registry: memoryRegistry,
       bootContext,
@@ -337,25 +427,11 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   // collide with the parent repo's.
   const bgLogDir = join(cwd, '.agent', 'bg');
 
-  // Resolve cwd trust state for downstream gates (today: memory_write
-  // refuses inferred writes in untrusted cwd, MEMORY.md §7.2.1). The
-  // REPL boot path runs the trust modal BEFORE calling bootstrap, so
-  // by the time we get here cwd is already in the persisted list (or
-  // the boot exited). One-shot mode (`agent "prompt"`) calls bootstrap
-  // directly with no trust modal — cwd may genuinely be untrusted.
-  // Either way, recompute here so the answer matches the live state
-  // of `trusted_dirs.json` at this moment.
-  //
-  // Fail-closed semantics:
-  //   - trustListPathOverride === null         → no trust storage
-  //                                              → isCwdTrusted=false
-  //   - trustListPath() returned null (XDG     → idem
-  //     paths unavailable on weird platform)
-  //   - file missing / corrupt / not in list   → false
-  //   - cwd in list                            → true
-  const trustPath =
-    input.trustListPathOverride !== undefined ? input.trustListPathOverride : trustListPath();
-  const isCwdTrusted = trustPath !== null && isTrusted(trustPath, cwd);
+  // (`trustPath` and `isCwdTrusted` resolved above the try-block
+  // so the project-pointer section can gate on them at prompt-
+  // assembly time; both are still consumed below — memory_write
+  // honors the same flag (MEMORY.md §7.2.1) and the harness
+  // surfaces it for downstream gates.)
 
   const config: HarnessConfig = {
     provider,

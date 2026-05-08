@@ -12,13 +12,32 @@ import {
 // fake in tests runs the child harness in-process and writes
 // payload directly to `subagent_outputs`.
 export interface ChildProcessHandle {
-  // Resolves with the exit code when the subprocess terminates.
-  // Implementations must NOT reject this promise — even SIGKILL
-  // produces a numeric exit code (typically 137). Tests that want
-  // to model "still running" return a never-resolving promise
-  // and rely on the runtime's wall-clock timeout to trigger a
-  // kill that finally settles it.
-  exited: Promise<{ exitCode: number }>;
+  // Resolves with the exit code AND optional signal when the
+  // subprocess terminates. Implementations must NOT reject this
+  // promise — even SIGKILL produces a numeric exit code (typically
+  // 137). The optional `signal` field carries the POSIX signal
+  // name (e.g. 'SIGKILL', 'SIGSEGV') when the OS killed the
+  // process; absent on normal exit. The audit layer
+  // (`subagent_processes`) records both fields verbatim so
+  // post-mortem queries can distinguish "child returned 1" from
+  // "OS killed child with SIGSEGV".
+  // Tests that want to model "still running" return a
+  // never-resolving promise and rely on the runtime's wall-clock
+  // timeout to trigger a kill that finally settles it.
+  exited: Promise<{ exitCode: number; signal?: string | undefined }>;
+  // OS pid of the spawned process. Production wiring fills this
+  // from `proc.pid`; tests that inject a fake child run in-process
+  // and have no real pid set this to undefined (the audit row
+  // skip is acceptable — those tests don't audit the subprocess
+  // surface). When present, the value lands in
+  // `subagent_processes.pid` for `ps`/`top`/profiler correlation.
+  pid?: number;
+  // The cmd argv that produced this process, for audit
+  // fingerprinting. The runtime hashes this (SHA256 over the
+  // strings joined with NUL) and stores the hash in
+  // `subagent_processes.argv_hash`. Optional for the same reason
+  // as `pid`: in-process fakes have no argv.
+  cmd?: readonly string[];
   // Send a signal. The runtime sends SIGTERM first (graceful),
   // waits for `WALL_CLOCK_GRACE_MS`, then SIGKILL. Implementations
   // are responsible for translating these to whatever the platform
@@ -358,7 +377,21 @@ export const defaultSpawnChildProcess: SpawnChildProcess = (opts) => {
     ipc = createChannel(transport);
   }
   return {
-    exited: proc.exited.then(() => ({ exitCode: proc.exitCode ?? 0 })),
+    exited: proc.exited.then(() => ({
+      exitCode: proc.exitCode ?? 0,
+      // Bun exposes the POSIX signal name on `proc.signalCode`
+      // for processes killed by signal; null/undefined for normal
+      // exit. We propagate `undefined` so the audit layer can
+      // emit NULL columns rather than a string "null". The
+      // explicit ?? null → undefined coercion is so a future Bun
+      // release that returns null instead of undefined doesn't
+      // leak the literal into our typed surface.
+      ...(proc.signalCode !== null && proc.signalCode !== undefined
+        ? { signal: proc.signalCode }
+        : {}),
+    })),
+    pid: proc.pid,
+    cmd,
     kill: (signal) => {
       try {
         proc.kill(signal);

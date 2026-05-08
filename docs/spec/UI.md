@@ -244,14 +244,14 @@ Mais de 8 todos: trunca pra "▶ running + próximas 2 pending + ✗ failed", co
 > **Removida.** A "status line acima do input" foi absorvida pelo footer §4.10.6, que já mostra `model · [plan] · steps/max · cost · [bg N]` no canto direito. Renderer não emite mais uma linha separada — duplicar info em duas posições só consome espaço vertical (e em REPL com input outdented §6.3, a linha de status no fim da live region competia visualmente com o próprio input, sem ganho informativo). Seção mantida aqui como histórico de design; conteúdo canônico está em §4.10.6.
 
 ```
-[autonomous] · forja · sonnet-4.6 · 12/50 · $0.04 · mem 4u · bg 1
+[autonomous] · forja · sonnet-4.6 · 12/200 · $0.04 · mem 4u · bg 1
 ```
 
 Componentes (esquerda → direita):
 - `[profile]` (vazio se default)
 - nome do projeto (basename do repo root)
 - modelo
-- steps (`12/50`, `⚠ 40/50` se ≥ 80%, `‼ 48/50` se ≥ 90%)
+- steps (`12/200`, `⚠ 160/200` se ≥ 80%, `‼ 180/200` se ≥ 90%)
 - cost (`$0.04`, amarelo a 80% do max, vermelho a 90%)
 - memory badge (`mem 4u 2p` — 4 user, 2 project carregadas)
 - background tray (`bg 1` se houver, somem se zero)

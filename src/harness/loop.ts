@@ -32,7 +32,7 @@ import { MAX_SUBAGENT_DEPTH, runSubagent } from '../subagents/runtime.ts';
 import { type TodoStore, createTodoStore } from '../todo/index.ts';
 import type { ToolContext } from '../tools/index.ts';
 import type { SpawnSubagentArgs, SpawnSubagentResult } from '../tools/types.ts';
-import { abortableIterable } from './abortable.ts';
+import { StepStallError, abortableIterable, stallWatchdog } from './abortable.ts';
 import { CollectStepError, type CollectedToolUse, collectStep } from './collect.ts';
 import { compactMessages } from './compaction.ts';
 import { invokeTool } from './invoke-tool.ts';
@@ -44,7 +44,6 @@ import {
 } from './resume.ts';
 import { DEFAULT_RETRY, generateWithRetry } from './retry.ts';
 import {
-  DEFAULT_BUDGET,
   type ExitReason,
   type HarnessConfig,
   type HarnessEvent,
@@ -52,6 +51,8 @@ import {
   MAX_CONCURRENT_SUBAGENTS_CAP,
   MAX_CONCURRENT_TOOL_CALLS_CAP,
   type RunBudget,
+  effectiveBudget,
+  resolveMaxOutputTokens,
 } from './types.ts';
 
 type TerminalSessionStatus = 'done' | 'interrupted' | 'exhausted' | 'error';
@@ -123,6 +124,11 @@ const exitToStatus: Record<ExitReason, TerminalSessionStatus> = {
   maxCostUsd: 'exhausted',
   maxToolErrors: 'error',
   degenerateLoop: 'error',
+  // Step-stalled is closer to an error than an interrupt — the
+  // provider opened a stream and went silent, which is a runtime
+  // failure (provider hang, network drop mid-stream, parser
+  // stuck). Resume can retry; same handling as providerError.
+  stepStalled: 'error',
   aborted: 'interrupted',
   providerError: 'error',
   internalError: 'error',
@@ -142,6 +148,7 @@ const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
   maxCostUsd: 'exhausted',
   maxToolErrors: 'error',
   degenerateLoop: 'error',
+  stepStalled: 'error',
   aborted: 'interrupted',
   providerError: 'error',
   internalError: 'error',
@@ -160,7 +167,7 @@ const buildToolDefs = (config: HarnessConfig): ProviderToolDef[] =>
 // expect their own format already constructed by the adapter.
 
 export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> => {
-  const budget: RunBudget = { ...DEFAULT_BUDGET, ...(config.budget ?? {}) };
+  const budget: RunBudget = effectiveBudget(config.budget);
   const startMs = Date.now();
 
   // Combine the caller's abort signal with a wall-clock timer so the cap
@@ -313,6 +320,20 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // the event is harmless (TUI ignores it). Skipped on zero
   // deltas so a misbehaving provider that emitted a usage event
   // with all zeros doesn't generate noise.
+  // Sticky flag — set true the first time the soft cap is
+  // crossed and never reset. Idempotent emission per run.
+  // Declared ahead of `emitCostUpdate` so the closure reads a
+  // name already in scope.
+  //
+  // Per-session, NOT cumulative-across-resumes: the check uses
+  // `totalCostUsd` (this session only), unlike `maxCostUsd`
+  // which compares `priorCostUsd + totalCostUsd`. Subagents are
+  // one-shot so the divergence doesn't affect them; for a
+  // resumed top-level run, the soft warn re-arms each session
+  // (matches the "you crossed your estimate THIS session"
+  // framing and avoids spamming on every resume of an already-
+  // expensive session).
+  let softCapWarned = false;
   const emitCostUpdate = (delta: number): void => {
     if (!Number.isFinite(delta) || delta <= 0) return;
     safeEmit(config.onEvent, {
@@ -320,6 +341,26 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       delta,
       cumulative: totalCostUsd,
     });
+    // Soft cap (spec ORCHESTRATION.md §3.5.0). Fires ONCE when
+    // cumulative first crosses the threshold. The flag stays
+    // sticky for the rest of the run — re-emitting on every
+    // subsequent cost_update would spam the operator's
+    // scrollback and obscure the original warning. Run does
+    // NOT terminate at this threshold; only `maxCostUsd` (the
+    // hard cap) does.
+    if (
+      !softCapWarned &&
+      budget.softCostUsd !== undefined &&
+      budget.softCostUsd > 0 &&
+      totalCostUsd > budget.softCostUsd
+    ) {
+      softCapWarned = true;
+      safeEmit(config.onEvent, {
+        type: 'cost_soft_cap_warn',
+        threshold: budget.softCostUsd,
+        cumulative: totalCostUsd,
+      });
+    }
   };
 
   // Cumulative cost of every child this run spawned (sync `task`
@@ -1395,13 +1436,14 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         steps += 1;
         safeEmit(config.onEvent, { type: 'step_start', stepN: steps });
 
+        const resolvedMaxTokens = resolveMaxOutputTokens(budget, config.provider.capabilities);
         const req: GenerateRequest = {
           model: config.provider.id,
           // Snapshot the running message list so post-call mutations (the next
           // iteration appends assistant + tool_results) don't retroactively
           // change what the provider observed.
           messages: [...messages],
-          max_tokens: budget.maxOutputTokensPerCall,
+          max_tokens: resolvedMaxTokens,
           ...(config.systemPrompt !== undefined ? { system: config.systemPrompt } : {}),
           ...(tools.length > 0 ? { tools } : {}),
           ...(config.temperature !== undefined ? { temperature: config.temperature } : {}),
@@ -1419,8 +1461,26 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           // The Provider interface doesn't propagate signals to the SDK,
           // so without this a hung HTTP request blocks indefinitely and
           // neither Ctrl+C nor maxWallClockMs can interrupt it.
+          // Stream wrapping order is load-bearing:
+          //   1. generateWithRetry produces the raw stream.
+          //   2. stallWatchdog wraps inside-out so silent stalls
+          //      throw StepStallError; reset on every yield.
+          //   3. abortableIterable wraps OUTSIDE so external
+          //      aborts (Ctrl+C, wall-clock) take precedence over
+          //      stall detection.
+          // Inverting (1) and (2) would let the stall timer
+          // count time the consumer spends processing each event
+          // (e.g. heavy renderer work between deltas) against
+          // the stall budget, which would falsely trip on slow
+          // consumers rather than real provider hangs.
           collected = await collectStep(
-            abortableIterable(generateWithRetry(config.provider, req, DEFAULT_RETRY), signal),
+            abortableIterable(
+              stallWatchdog(
+                generateWithRetry(config.provider, req, DEFAULT_RETRY),
+                budget.maxStepStallMs,
+              ),
+              signal,
+            ),
             (ev) => safeEmit(config.onEvent, { type: 'provider_event', event: ev }),
           );
         } catch (e) {
@@ -1465,6 +1525,16 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             return isWallClockTimeout()
               ? await finish('maxWallClockMs')
               : await finish('aborted', undefined, 'hard');
+          }
+          // Step-stall watchdog fired (no provider events for
+          // budget.maxStepStallMs). Distinct from providerError
+          // — the connection didn't crash, it just went silent.
+          // Operator sees `stepStalled` in audit and the TUI's
+          // permanent chip renders the cause cleanly instead of
+          // a generic "Error".
+          const stallCause = e instanceof CollectStepError ? e.cause : e;
+          if (stallCause instanceof StepStallError) {
+            return await finish('stepStalled', stallCause.message);
           }
           const cause = e instanceof CollectStepError ? e.cause : e;
           const detail =
@@ -1559,7 +1629,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           if (collected.stop_reason === 'max_tokens') {
             return await finish(
               'maxOutputTokens',
-              `provider truncated at max_tokens (cap=${budget.maxOutputTokensPerCall})`,
+              `provider truncated at max_tokens (cap=${resolvedMaxTokens})`,
             );
           }
           return await finish('done');

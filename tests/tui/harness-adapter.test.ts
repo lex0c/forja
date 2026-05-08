@@ -84,13 +84,67 @@ describe('harness-adapter — session lifecycle', () => {
     expect(start.memoryCount).toBeUndefined();
   });
 
-  test('step_start bumps steps and emits step:budget', () => {
+  test('step_start bumps steps and emits step:budget + provider:waiting:start', () => {
+    // step_start now dual-emits: status update + the new
+    // "Awaiting model" indicator that bridges the gap between
+    // the harness handing off the request and the first
+    // provider event arriving on the renderer.
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({ type: 'step_start', stepN: 3 });
-    expect(out).toHaveLength(1);
+    expect(out.map((e) => e.type)).toEqual(['step:budget', 'provider:waiting:start']);
     const b = out[0] as Extract<UIEvent, { type: 'step:budget' }>;
-    expect(b.type).toBe('step:budget');
     expect(b.steps).toBe(3);
+    const w = out[1] as Extract<UIEvent, { type: 'provider:waiting:start' }>;
+    expect(w.stepN).toBe(3);
+  });
+
+  test('first provider_event after step_start emits provider:waiting:end', () => {
+    // The end-of-wait fires on the FIRST provider event, not on
+    // assistant:start specifically — covers tool-only turns where
+    // the model goes straight to tool_use_start without any
+    // assistant content.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'step_start', stepN: 1 });
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'start', message_id: 'm1' },
+    });
+    // Order: provider:waiting:end FIRST (closes the indicator),
+    // then the rest of the provider_event translation
+    // (assistant:start in this case).
+    expect(out[0]?.type).toBe('provider:waiting:end');
+    expect(out.map((e) => e.type)).toContain('assistant:start');
+  });
+
+  test('subsequent provider events do NOT re-emit provider:waiting:end (idempotent)', () => {
+    // The internal flag prevents per-event noise once the
+    // indicator already closed. Pinned so a regression that
+    // dropped the flag would surface as an extra
+    // provider:waiting:end on every text_delta.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'step_start', stepN: 1 });
+    a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'm1' } });
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'text_delta', text: 'hi' },
+    });
+    expect(out.map((e) => e.type)).not.toContain('provider:waiting:end');
+  });
+
+  test('two step_starts back to back close the prior gate before opening a new one', () => {
+    // Defensive close-before-open in the step_start case.
+    // Pinned so a regression that opened a second gate without
+    // closing the first would leave the reducer with a stale
+    // startedAt and an indicator that never closes.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'step_start', stepN: 1 });
+    const out = a.translate({ type: 'step_start', stepN: 2 });
+    // step_start (step 2) must close before opening: end then start.
+    const types = out.map((e) => e.type);
+    const endIdx = types.indexOf('provider:waiting:end');
+    const startIdx = types.indexOf('provider:waiting:start');
+    expect(endIdx).toBeGreaterThan(-1);
+    expect(startIdx).toBeGreaterThan(endIdx);
   });
 
   test('session_finished emits final step:budget + session:end', () => {
@@ -991,30 +1045,276 @@ describe('harness-adapter — subagent observability', () => {
     expect(types(out)).toEqual(['subagent:update']);
   });
 
-  test('subagent_finished maps done → status:done, anything else → status:error', () => {
+  test('subagent_progress with tool_invoking inner emits BOTH subagent:update AND tool:start', () => {
+    // Slice 1: a subagent doing real work shouldn't surface as
+    // nothing but a heartbeat row. The adapter dual-emits a
+    // permanent tool:start chip alongside the live subagent:update
+    // so the operator sees the actual file path / args in
+    // scrollback, not just the verb scrolling past on the live
+    // region.
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'deadbeef-1234-5678-9abc-def012345678',
+      lastEvent: {
+        type: 'tool_invoking',
+        toolUseId: 'tu-child-1',
+        toolName: 'read_file',
+        args: { path: 'src/foo.ts' },
+      },
+    });
+    expect(types(out)).toEqual(['subagent:update', 'tool:start']);
+    const start = out[1] as Extract<UIEvent, { type: 'tool:start' }>;
+    // toolId is namespaced so concurrent subagents can't clash.
+    expect(start.toolId).toBe('sub:deadbeef-1234-5678-9abc-def012345678:tu-child-1');
+    expect(start.name).toBe('read_file');
+    // Slice 2: parentId carries the subagentId so the renderer
+    // can indent the chip with `|_`. Subject stays the raw vocab
+    // extractor output (no `[sub …]` prefix — the indent is the
+    // attribution signal now).
+    expect(start.parentId).toBe('deadbeef-1234-5678-9abc-def012345678');
+    expect(start.subject).toBe('src/foo.ts');
+  });
+
+  test('subagent_progress tool_finished after tool_invoking → matched tool:end with same namespaced toolId', () => {
+    // Pin the round-trip: tool:start and tool:end carry the SAME
+    // namespaced toolId so the reducer's per-toolId state machine
+    // (state.tools map) matches them. A regression that
+    // forgot to namespace one side would leak entries in the
+    // map AND render an orphan tool-end with no preceding start.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'subagent_progress',
+      subagentId: 'aaaaaaaa-1111-2222-3333-444444444444',
+      lastEvent: {
+        type: 'tool_invoking',
+        toolUseId: 'tu-x',
+        toolName: 'echo',
+        args: { msg: 'hi' },
+      },
+    });
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'aaaaaaaa-1111-2222-3333-444444444444',
+      lastEvent: {
+        type: 'tool_finished',
+        toolUseId: 'tu-x',
+        toolName: 'echo',
+        failed: false,
+        durationMs: 42,
+      },
+    });
+    expect(types(out)).toEqual(['subagent:update', 'tool:end']);
+    const end = out[1] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(end.toolId).toBe('sub:aaaaaaaa-1111-2222-3333-444444444444:tu-x');
+    expect(end.status).toBe('done');
+    expect(end.durationMs).toBe(42);
+  });
+
+  test('subagent_progress tool_finished with failed=true → tool:end status=error', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'subagent_progress',
+      subagentId: 'c',
+      lastEvent: {
+        type: 'tool_invoking',
+        toolUseId: 'tu-fail',
+        toolName: 'grep',
+        args: { pattern: 'x' },
+      },
+    });
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'c',
+      lastEvent: {
+        type: 'tool_finished',
+        toolUseId: 'tu-fail',
+        toolName: 'grep',
+        failed: true,
+        durationMs: 5,
+      },
+    });
+    const end = out.find((e) => e.type === 'tool:end') as
+      | Extract<UIEvent, { type: 'tool:end' }>
+      | undefined;
+    expect(end?.status).toBe('error');
+  });
+
+  test('subagent_progress tool_decided=deny followed by tool_finished → tool:end status=denied with reason', () => {
+    // Mirrors the top-level deny path: the decision is captured
+    // on tool_decided and surfaces as the chip's `summary` on
+    // tool_finished. Without this, an operator who hits a strict
+    // policy in a subagent sees "echo failed" with no clue why.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'subagent_progress',
+      subagentId: 'c',
+      lastEvent: {
+        type: 'tool_invoking',
+        toolUseId: 'tu-deny',
+        toolName: 'echo',
+        args: { msg: 'x' },
+      },
+    });
+    a.translate({
+      type: 'subagent_progress',
+      subagentId: 'c',
+      lastEvent: {
+        type: 'tool_decided',
+        toolUseId: 'tu-deny',
+        decision: { kind: 'deny', reason: 'policy says no' },
+      },
+    });
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'c',
+      lastEvent: {
+        type: 'tool_finished',
+        toolUseId: 'tu-deny',
+        toolName: 'echo',
+        failed: false,
+        denied: true,
+        durationMs: 1,
+      },
+    });
+    const end = out.find((e) => e.type === 'tool:end') as
+      | Extract<UIEvent, { type: 'tool:end' }>
+      | undefined;
+    expect(end?.status).toBe('denied');
+    expect(end?.summary).toBe('policy says no');
+  });
+
+  test('two concurrent subagents with the SAME local toolUseId do not collide on state.tools', () => {
+    // The child generates toolUseIds locally, so two siblings
+    // running in parallel both pick "tu1" with high probability
+    // (or hand-rolled in tests). Without namespacing, the second
+    // tool_invoking would overwrite the first's state entry; on
+    // tool_finished, both would resolve to the same map key and
+    // the surviving chip status would describe the wrong tool.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'subagent_progress',
+      subagentId: 'sub-A',
+      lastEvent: {
+        type: 'tool_invoking',
+        toolUseId: 'tu1',
+        toolName: 'read_file',
+        args: { path: 'a.ts' },
+      },
+    });
+    a.translate({
+      type: 'subagent_progress',
+      subagentId: 'sub-B',
+      lastEvent: {
+        type: 'tool_invoking',
+        toolUseId: 'tu1',
+        toolName: 'read_file',
+        args: { path: 'b.ts' },
+      },
+    });
+    // A finishes failed, B finishes ok. If state collided,
+    // both would resolve to whichever subagent's invocation
+    // lived longer in the map.
+    const aOut = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'sub-A',
+      lastEvent: {
+        type: 'tool_finished',
+        toolUseId: 'tu1',
+        toolName: 'read_file',
+        failed: true,
+        durationMs: 1,
+      },
+    });
+    const bOut = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'sub-B',
+      lastEvent: {
+        type: 'tool_finished',
+        toolUseId: 'tu1',
+        toolName: 'read_file',
+        failed: false,
+        durationMs: 1,
+      },
+    });
+    const aEnd = aOut.find((e) => e.type === 'tool:end') as
+      | Extract<UIEvent, { type: 'tool:end' }>
+      | undefined;
+    const bEnd = bOut.find((e) => e.type === 'tool:end') as
+      | Extract<UIEvent, { type: 'tool:end' }>
+      | undefined;
+    expect(aEnd?.toolId).toBe('sub:sub-A:tu1');
+    expect(aEnd?.status).toBe('error');
+    expect(bEnd?.toolId).toBe('sub:sub-B:tu1');
+    expect(bEnd?.status).toBe('done');
+  });
+
+  test('subagent_finished forwards full status + reason + costUsd to subagent:end', () => {
+    // The adapter previously collapsed status to `done | error`,
+    // erasing the cause distinction (cost cap, user abort,
+    // crash). Pin the new contract: full status preserved,
+    // reason forwarded when present, costUsd carried so the
+    // permanent chip can render "Exhausted (cost cap, $0.59)"
+    // instead of the bare "Failed".
     const a = createHarnessAdapter(baseCtx());
     const okOut = a.translate({
       type: 'subagent_finished',
       subagentId: 'c',
       status: 'done',
+      reason: 'done',
       summary: 'README found',
       durationMs: 1234,
       costUsd: 0.001,
     });
     const okEv = okOut[0] as Extract<UIEvent, { type: 'subagent:end' }>;
     expect(okEv.status).toBe('done');
+    expect(okEv.reason).toBe('done');
+    expect(okEv.costUsd).toBeCloseTo(0.001);
     expect(okEv.summary).toBe('README found');
     expect(okEv.durationMs).toBe(1234);
 
-    const errOut = a.translate({
+    // interrupted status is preserved (not collapsed to error).
+    const interruptedOut = a.translate({
       type: 'subagent_finished',
       subagentId: 'c',
       status: 'interrupted',
+      reason: 'aborted',
       summary: 'aborted',
       durationMs: 9,
       costUsd: 0,
     });
-    expect((errOut[0] as Extract<UIEvent, { type: 'subagent:end' }>).status).toBe('error');
+    const interruptedEv = interruptedOut[0] as Extract<UIEvent, { type: 'subagent:end' }>;
+    expect(interruptedEv.status).toBe('interrupted');
+    expect(interruptedEv.reason).toBe('aborted');
+
+    // exhausted status is preserved with budget reason intact.
+    const exhaustedOut = a.translate({
+      type: 'subagent_finished',
+      subagentId: 'c',
+      status: 'exhausted',
+      reason: 'maxCostUsd',
+      summary: 'budget exceeded',
+      durationMs: 9,
+      costUsd: 0.59,
+    });
+    const exhaustedEv = exhaustedOut[0] as Extract<UIEvent, { type: 'subagent:end' }>;
+    expect(exhaustedEv.status).toBe('exhausted');
+    expect(exhaustedEv.reason).toBe('maxCostUsd');
+    expect(exhaustedEv.costUsd).toBeCloseTo(0.59);
+
+    // reason omitted when the producer didn't set one (e.g.
+    // legacy spawn-failure path that synthesized the envelope).
+    const noReasonOut = a.translate({
+      type: 'subagent_finished',
+      subagentId: 'c',
+      status: 'error',
+      summary: 'crashed',
+      durationMs: 9,
+      costUsd: 0,
+    });
+    const noReasonEv = noReasonOut[0] as Extract<UIEvent, { type: 'subagent:end' }>;
+    expect(noReasonEv.status).toBe('error');
+    expect(noReasonEv.reason).toBeUndefined();
   });
 
   test('subagent_progress with cost_update inner pipes cumulativeCostUsd through (D232)', () => {
@@ -1032,6 +1332,56 @@ describe('harness-adapter — subagent observability', () => {
     const ev = out[0] as Extract<UIEvent, { type: 'subagent:update' }>;
     expect(ev.cumulativeCostUsd).toBe(0.018);
     expect(ev.progress).toBe('+$0.0050');
+  });
+
+  test('cost_soft_cap_warn translates to a permanent warn message', () => {
+    // Spec ORCHESTRATION.md §3.5.0. The harness emits this event
+    // ONCE per run when cumulative crosses the soft threshold
+    // (the playbook's declared `max_cost_usd`). Renderer
+    // surfaces it as a permanent warn line so the operator sees
+    // the regression signal even after the live region recycles.
+    // Half-up rounding matches the `subagent_summary` formatter
+    // — pinned so a future refactor doesn't drift between
+    // surfaces.
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'cost_soft_cap_warn',
+      threshold: 0.3,
+      cumulative: 0.585,
+    });
+    const ev = out.find((e) => e.type === 'warn') as Extract<UIEvent, { type: 'warn' }> | undefined;
+    expect(ev).toBeDefined();
+    expect(ev?.message).toContain('over budget estimate');
+    expect(ev?.message).toContain('$0.30');
+    // 0.585 rounds half-up to 0.59 (Math.round*100/100 path).
+    expect(ev?.message).toContain('$0.59');
+  });
+
+  test('subagent_progress with cost_soft_cap_warn inner surfaces a top-level warn', () => {
+    // When a subagent crosses its soft cap, the child emits
+    // cost_soft_cap_warn over IPC; the parent's adapter
+    // unwraps via subagent_progress.lastEvent. The wrapped path
+    // mirrors the standalone case but prefixes the warn with
+    // the subagent id so the operator can attribute the
+    // regression signal to a specific child run.
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'subagent_progress',
+      subagentId: 'sub_01ABC123',
+      lastEvent: {
+        type: 'cost_soft_cap_warn',
+        threshold: 0.3,
+        cumulative: 0.585,
+      },
+    });
+    const warn = out.find((e) => e.type === 'warn') as
+      | Extract<UIEvent, { type: 'warn' }>
+      | undefined;
+    expect(warn).toBeDefined();
+    expect(warn?.message).toContain('subagent sub_01AB');
+    expect(warn?.message).toContain('over budget estimate');
+    expect(warn?.message).toContain('$0.59');
+    expect(warn?.message).toContain('$0.30');
   });
 
   test('subagent_progress with non-cost inner omits cumulativeCostUsd', () => {

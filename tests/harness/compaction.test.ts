@@ -149,6 +149,40 @@ describe('compactMessages — LLM path', () => {
     expect(req?.system).toContain('summarizing a long conversation');
   });
 
+  test('compaction prompt advertises every required section', () => {
+    // Pin the structured-section contract: GOAL stays single-line,
+    // ANCHORS and REJECTED were added in slice D to cut the long-
+    // session re-investigation cost (next turn re-greps for facts
+    // and re-tries dead ends without these). If a future tweak
+    // drops a section the LLM stops emitting it; this test
+    // surfaces the change at PR time instead of as a quiet
+    // degradation in compacted sessions.
+    const handle = mockProvider(() => replyText('noop'));
+    const subject = compactMessages;
+    expect(typeof subject).toBe('function');
+    return subject(handle.provider, buildHistory(5), {
+      preserveTail: 3,
+      maxTokens: 256,
+    }).then(() => {
+      const req = handle.generateCalls[0];
+      const system = req?.system ?? '';
+      for (const tag of [
+        'GOAL:',
+        'DECISIONS:',
+        'ANCHORS:',
+        'REJECTED:',
+        'FILES_TOUCHED:',
+        'ERRORS:',
+        'PENDING:',
+      ]) {
+        expect(system).toContain(tag);
+      }
+      // The preamble nudges toward concrete pointers — pin the
+      // phrase so a softening rewrite doesn't lose the hint.
+      expect(system).toContain('file:line');
+    });
+  });
+
   test('skips when history is shorter than goal + tail', async () => {
     const handle = mockProvider(() => replyText('should not be called'));
     const short = buildHistory(1); // 3 messages: goal + assistant + tool_result

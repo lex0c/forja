@@ -197,6 +197,20 @@ export type HarnessEvent =
       type: 'subagent_finished';
       subagentId: string;
       status: HarnessResult['status'];
+      // Stable reason code, a string superset that includes
+      // every `ExitReason` plus subagent-specific failures
+      // (`worktree_create_failed`, `subprocess_spawn_failed`,
+      // `subprocess_crashed`, `heartbeat_stale`,
+      // `ipc_version_mismatch`, etc). Forwarded so the parent's
+      // TUI can render an honest cause label instead of the
+      // bare `status` enum, which loses the distinction between
+      // budget exhaustion and crash. Typed as `string` rather
+      // than the harness's `ExitReason` because the subagent
+      // runtime's reason set is intentionally wider — locking
+      // the event type to `ExitReason` would force every
+      // subagent-specific failure to be remapped at the
+      // boundary and lose information.
+      reason?: string;
       summary: string;
       durationMs: number;
       costUsd: number;
@@ -274,6 +288,17 @@ export type HarnessEvent =
       cumulativeUsd: number;
       capUsd: number;
     }
+  | {
+      // Soft cost-cap crossed (spec ORCHESTRATION.md §3.5.0).
+      // Emitted once when the run's cumulative cost first
+      // crosses `budget.softCostUsd`; never re-emitted. The
+      // run continues — this is a regression signal, not a
+      // termination. Renderer surfaces it as a permanent warn
+      // line ("· task <name> over budget estimate ($X.XX > $Y.YY)").
+      type: 'cost_soft_cap_warn';
+      threshold: number;
+      cumulative: number;
+    }
   | { type: 'session_finished'; result: HarnessResult };
 
 // Budget caps for an autonomous run. Per AGENTIC_CLI §5: every limit has
@@ -286,9 +311,29 @@ export interface RunBudget {
   // Sliding window: if `maxRepeatedToolHash` of the last 5 tool calls hash
   // identically, abort with `degenerate_loop`.
   maxRepeatedToolHash: number;
-  // Cap on output tokens per provider call (passed straight through as
-  // `max_tokens`). Not part of session-wide budget.
-  maxOutputTokensPerCall: number;
+  // Per-step stall watchdog (spec AGENTIC_CLI.md §5 line 372).
+  // When the provider stream is silent — no text_delta, no
+  // thinking_delta, no tool_use_*, no message_stop — for this
+  // many milliseconds, the harness aborts the step with
+  // `stepStalled`. Distinct from `maxWallClockMs` (whole-session
+  // cap) and `maxOutputTokens` (truncation by token count) —
+  // catches the "provider call opened but never streams anything
+  // back" failure mode that previously surfaced as a silent
+  // multi-minute hang. Reset on every stream event so a slow but
+  // progressing turn doesn't trip the gate. Set to 0 to disable.
+  maxStepStallMs: number;
+  // Optional ceiling on output tokens per provider call. When set,
+  // the harness clamps the per-request `max_tokens` to
+  // `min(maxOutputTokensPerCall, provider.capabilities.output_max_tokens)`.
+  // When unset (the default), the harness uses the provider's
+  // declared capability ceiling — no silent 4096 truncation on
+  // models that advertise a larger output window. Playbooks declare
+  // `sampling.max_tokens` to take an explicit override; that flows
+  // in via this field and is still clamped to the capability cap so
+  // an over-declared playbook can't bypass the provider's hard
+  // limit. Never part of session-wide budget — this is a per-call
+  // shaping knob, not a cumulative tally.
+  maxOutputTokensPerCall?: number;
   // Fraction of `provider.capabilities.context_window` at which the
   // harness triggers compaction. AGENTIC_CLI §6 / ORCHESTRATION §4.1
   // recommend 0.7 — leaves 30% headroom for the compaction call
@@ -302,17 +347,36 @@ export interface RunBudget {
   // module walks back one position. preserveTail=0 still preserves
   // the trailing assistant + its tool_result for the same reason.
   compactionPreserveTail: number;
-  // Hard cap on total spend for this run, in USD. Optional —
-  // absent = no cap, preserves the existing "let other budgets
-  // contain the run" behavior. When set, the harness aborts with
-  // `maxCostUsd` after the FIRST cost-increasing event whose
-  // running total crosses the cap (provider turn or compaction
-  // call). Compared per-event with `>` so a `maxCostUsd: 0` config
-  // means "no spend allowed" — the first paid turn trips the gate.
-  // Honored across resumes via the cumulative tracker (priorCostUsd
-  // + totalCostUsd is what the cap compares against, NOT just the
-  // per-run total).
-  maxCostUsd?: number;
+  // Hard cap on total spend for this run, in USD. AGENTIC_CLI.md §5
+  // declares a default of 5 — cost is the engagement gate; step
+  // count (`maxSteps`) is the runaway-loop backstop. Three states:
+  //   - field absent: merge with DEFAULT_BUDGET picks up 5 USD.
+  //   - field === undefined: operator explicitly opted out (e.g.
+  //     via `/budget cost off`); the loop skips the cost gate.
+  //   - field is a number: that exact cap.
+  // The undefined-as-opt-out shape requires `number | undefined`
+  // (not just `?:`) under `exactOptionalPropertyTypes` so a partial
+  // override can carry the explicit disable signal through the
+  // spread merge.
+  // The harness aborts with `maxCostUsd` after the FIRST
+  // cost-increasing event whose running total crosses the cap
+  // (provider turn or compaction call). Compared per-event with
+  // `>` so a `maxCostUsd: 0` config means "no spend allowed" —
+  // the first paid turn trips the gate. Honored across resumes
+  // via the cumulative tracker (priorCostUsd + totalCostUsd is
+  // what the cap compares against, NOT just the per-run total).
+  maxCostUsd?: number | undefined;
+  // Soft warning threshold for cost (spec ORCHESTRATION.md
+  // §3.5.0). When set and the run's cumulative cost crosses
+  // it, the harness emits a `cost_soft_cap_warn` event ONCE
+  // (idempotent — not re-emitted on every subsequent
+  // cost_update). The run does NOT terminate at this
+  // threshold; only `maxCostUsd` (the hard cap) does. Used
+  // primarily by subagents — the parent forwards the
+  // playbook's declared `max_cost_usd` here as a regression
+  // signal, while leaving the child's hard cap to the global
+  // budget. Absent (or set to 0) → no soft warning fires.
+  softCostUsd?: number | undefined;
   // Maximum number of tool calls the harness will dispatch in
   // parallel within a single step. Only active when EVERY
   // `tool_use` in the step has `metadata.parallel_safe === true`
@@ -343,16 +407,77 @@ export interface RunBudget {
 }
 
 export const DEFAULT_BUDGET: RunBudget = {
-  maxSteps: 50,
+  // `maxSteps` is the runaway-loop BACKSTOP, not the engagement
+  // gate. AGENTIC_CLI.md §5 frames cost as the primary gate;
+  // sessions that need many small steps (large refactor, multi-
+  // file audit) shouldn't be cut by step count if the cost cap is
+  // honored. 200 leaves headroom while still bounding genuine loop
+  // pathology (degenerate-loop tracker hits much earlier).
+  maxSteps: 200,
   maxWallClockMs: 10 * 60 * 1000,
   maxToolErrors: 5,
   maxRepeatedToolHash: 3,
-  maxOutputTokensPerCall: 4096,
+  // 90s default step-stall watchdog. Long enough that legitimate
+  // slow turns (extended thinking with high budget, large
+  // structured outputs) don't trip; short enough that a hung
+  // provider call fails source-aware before the operator
+  // wonders whether the agent is still alive. The reported bug
+  // (subagent silent for 3m+ after 12 parallel reads) would
+  // have aborted at 90s with `stepStalled`.
+  maxStepStallMs: 90_000,
+  // `maxOutputTokensPerCall` intentionally unset — runtime resolves
+  // against the provider capability via `resolveMaxOutputTokens`.
   compactionThreshold: 0.7,
   compactionPreserveTail: 3,
+  // Spec-declared default cost cap (AGENTIC_CLI.md §5 line 333).
+  // Operator opts out via `/budget cost off`, which writes an
+  // explicit `undefined` so the spread-merge propagates the
+  // disable signal instead of falling back to 5.
+  maxCostUsd: 5,
   maxConcurrentToolCalls: 5,
   maxConcurrentSubagents: 3,
 };
+
+// Resolve the effective `max_tokens` for a provider request:
+//   - explicit budget override clamps to the capability ceiling
+//   - absent override defaults to the capability ceiling
+// Centralized here so the loop, the banner, and any future call
+// site (recap, critique) share one resolution rule. Returns a
+// finite positive integer; callers can pass it directly as
+// `max_tokens`.
+export const resolveMaxOutputTokens = (
+  budget: Pick<RunBudget, 'maxOutputTokensPerCall'>,
+  capabilities: { output_max_tokens: number },
+): number => {
+  const cap = capabilities.output_max_tokens;
+  const override = budget.maxOutputTokensPerCall;
+  if (override === undefined) return cap;
+  return Math.min(override, cap);
+};
+
+// Single source of truth for "what does a partial budget actually
+// resolve to". The loop and any read-only consumer (banner, slash
+// `/budget` show, future surfaces) MUST go through this helper so
+// they observe the same effective values. Pre-helper, the loop
+// did `{ ...DEFAULT_BUDGET, ...config.budget }` (per-field merge)
+// while the banner did `config.budget ?? DEFAULT_BUDGET` (whole-
+// object fallback) — the two diverged when an operator supplied a
+// partial budget object: the banner saw only the partial fields,
+// the loop saw the partial overlaid on DEFAULT_BUDGET. Today only
+// `maxOutputTokensPerCall` had a non-default-driven consumer, so
+// the gap was harmless; routing both call sites through one
+// helper closes the latent divergence before a future field
+// reintroduces it.
+//
+// `Partial<RunBudget>` mirrors what `HarnessConfig.budget`
+// accepts. The spread copies `undefined` overrides verbatim
+// (operator opt-out for `maxCostUsd`), so the resulting
+// `RunBudget` may legitimately carry `maxCostUsd: undefined`
+// despite the type being `RunBudget`.
+export const effectiveBudget = (partial?: Partial<RunBudget>): RunBudget => ({
+  ...DEFAULT_BUDGET,
+  ...(partial ?? {}),
+});
 
 // Hard cap for the parallel pool — even an explicit caller config of
 // `maxConcurrentToolCalls: 100` is clamped to this to bound resource
@@ -376,6 +501,7 @@ export type ExitReason =
   | 'maxCostUsd' // running cumulative cost crossed budget.maxCostUsd
   | 'maxToolErrors'
   | 'degenerateLoop'
+  | 'stepStalled' // provider stream silent for `maxStepStallMs` mid-step
   | 'aborted' // user cancelled via signal
   | 'providerError' // unrecoverable provider failure (network, 4xx)
   | 'internalError' // uncaught throw in the harness path (typically SQLite)

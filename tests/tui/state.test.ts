@@ -5,6 +5,7 @@ import {
   type PermanentItem,
   applyEvent,
   createInitialState,
+  flushPendingToolEndBatch,
 } from '../../src/tui/state.ts';
 
 const start = (overrides: Partial<UIEvent> = {}): UIEvent =>
@@ -26,6 +27,16 @@ const drive = (events: UIEvent[]): { state: LiveState; permanent: PermanentItem[
     state = r.state;
     permanent.push(...r.permanent);
   }
+  // Slice 3: tests terminate without a natural scrollback-emitting
+  // event, so any tool-end items still buffered in
+  // `pendingToolEndBatch` would never surface. Force a final flush
+  // so per-event tests see the same items they would in production
+  // once the next event lands. Tests that specifically want to
+  // observe the buffered-but-not-flushed state inspect `state`
+  // directly before the helper returns.
+  const flushed = flushPendingToolEndBatch(state);
+  state = flushed.state;
+  permanent.push(...flushed.permanent);
   return { state, permanent };
 };
 
@@ -419,6 +430,55 @@ describe('tool lifecycle', () => {
     expect(item.subject).toBe('/foo');
   });
 
+  test('parentId from tool:start flows through ActiveTool onto the tool-end item', () => {
+    // Slice 2 plumbing: when the adapter sets parentId on a
+    // subagent-owned tool:start, the reducer carries it on the
+    // ActiveTool record and emits it on the tool-end PermanentItem
+    // so the renderer can pick the nested glyph + indent. A
+    // regression that lost the field anywhere in the pipeline
+    // would render the chip as if it were top-level.
+    const result = drive([
+      {
+        type: 'tool:start',
+        ts: 1,
+        toolId: 'sub:abc:t1',
+        name: 'read_file',
+        activeVerb: 'Reading file',
+        finalVerb: 'Read file',
+        subject: '/foo.ts',
+        parentId: 'abc',
+      },
+      { type: 'tool:end', ts: 100, toolId: 'sub:abc:t1', status: 'done', durationMs: 5 },
+    ]);
+    const item = result.permanent[0];
+    if (item?.kind !== 'tool-end') throw new Error('expected tool-end');
+    expect(item.parentId).toBe('abc');
+  });
+
+  test('top-level tool:start (no parentId) emits a tool-end without the parentId field', () => {
+    // The optional-field shape is load-bearing for existing
+    // top-level chips: the renderer's `item.parentId !== undefined`
+    // gate must read undefined, not null, when no parent is
+    // declared. A regression that always wrote `parentId: null`
+    // on the PermanentItem would silently render every top-level
+    // chip with the nest glyph.
+    const result = drive([
+      {
+        type: 'tool:start',
+        ts: 1,
+        toolId: 't1',
+        name: 'bash',
+        activeVerb: 'Executing',
+        finalVerb: 'Executed',
+        subject: 'ls',
+      },
+      { type: 'tool:end', ts: 50, toolId: 't1', status: 'done', durationMs: 5 },
+    ]);
+    const item = result.permanent[0];
+    if (item?.kind !== 'tool-end') throw new Error('expected tool-end');
+    expect(item.parentId).toBeUndefined();
+  });
+
   test('null subject from adapter survives the round-trip onto tool-end', () => {
     const result = drive([
       {
@@ -492,6 +552,568 @@ describe('tool lifecycle', () => {
     }
     expect(e.status).toBe('error');
     expect(d.status).toBe('denied');
+  });
+});
+
+describe('tool-end batch coalescing (slice 3)', () => {
+  // Helper: build a tool:start + tool:end pair for read_file with
+  // a given subject and toolId. Simulates the simplest "model
+  // issued read_file" sequence.
+  const readPair = (toolId: string, subject: string, durationMs = 100) =>
+    [
+      {
+        type: 'tool:start' as const,
+        ts: 1,
+        toolId,
+        name: 'read_file',
+        activeVerb: 'Reading file',
+        finalVerb: 'Read file',
+        subject,
+      },
+      {
+        type: 'tool:end' as const,
+        ts: 1 + durationMs,
+        toolId,
+        status: 'done' as const,
+        durationMs,
+      },
+    ] satisfies UIEvent[];
+
+  test('3+ consecutive same-name tool:end items coalesce into a single tool-end-batch', () => {
+    const result = drive([
+      ...readPair('t1', 'src/a.ts', 100),
+      ...readPair('t2', 'src/b.ts', 200),
+      ...readPair('t3', 'src/c.ts', 150),
+    ]);
+    expect(result.permanent).toHaveLength(1);
+    const item = result.permanent[0];
+    if (item?.kind !== 'tool-end-batch') throw new Error('expected tool-end-batch');
+    expect(item.name).toBe('read_file');
+    expect(item.count).toBe(3);
+    expect(item.totalDurationMs).toBe(450);
+    expect(item.subjects).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts']);
+    expect(item.verb).toBe('Read 3 files');
+    expect(item.status).toBe('done');
+  });
+
+  test('1-2 same-name tool:end items emit individually (no fold below threshold)', () => {
+    // The buffer ALWAYS captures, but flush respects the threshold:
+    // 1-2 items unfold back into individual `tool-end` chips so the
+    // operator gets normal per-tool visibility for small batches
+    // without surprise coalescing.
+    const result = drive([...readPair('t1', 'src/a.ts'), ...readPair('t2', 'src/b.ts')]);
+    expect(result.permanent.map((i) => i.kind)).toEqual(['tool-end', 'tool-end']);
+  });
+
+  test('different tool names do NOT merge across the batch', () => {
+    // A read followed by a bash followed by a read produces three
+    // individual chips, not one cross-tool batch.
+    const result = drive([
+      ...readPair('t1', 'src/a.ts'),
+      {
+        type: 'tool:start',
+        ts: 100,
+        toolId: 't2',
+        name: 'bash',
+        activeVerb: 'Executing',
+        finalVerb: 'Executed',
+        subject: 'ls',
+      },
+      { type: 'tool:end', ts: 110, toolId: 't2', status: 'done', durationMs: 10 },
+      ...readPair('t3', 'src/b.ts'),
+    ]);
+    expect(result.permanent.map((i) => i.kind)).toEqual(['tool-end', 'tool-end', 'tool-end']);
+    // Names preserved per chip — no name homogenization across the
+    // sequence.
+    expect((result.permanent[0] as { name: string }).name).toBe('read_file');
+    expect((result.permanent[1] as { name: string }).name).toBe('bash');
+    expect((result.permanent[2] as { name: string }).name).toBe('read_file');
+  });
+
+  test('different parentIds do NOT merge across the batch (parent vs subagent reads)', () => {
+    // Parent's reads and a subagent's reads share the tool name
+    // but have different parentIds. They MUST stay in separate
+    // batches so attribution doesn't cross the boundary.
+    const result = drive([
+      ...readPair('t1', '/parent/a.ts'),
+      ...readPair('t2', '/parent/b.ts'),
+      ...readPair('t3', '/parent/c.ts'),
+      // Now three subagent reads with parentId set.
+      {
+        type: 'tool:start',
+        ts: 1000,
+        toolId: 'sub:s1:r1',
+        name: 'read_file',
+        activeVerb: 'Reading file',
+        finalVerb: 'Read file',
+        subject: '/sub/a.ts',
+        parentId: 's1',
+      },
+      { type: 'tool:end', ts: 1100, toolId: 'sub:s1:r1', status: 'done', durationMs: 100 },
+      {
+        type: 'tool:start',
+        ts: 1100,
+        toolId: 'sub:s1:r2',
+        name: 'read_file',
+        activeVerb: 'Reading file',
+        finalVerb: 'Read file',
+        subject: '/sub/b.ts',
+        parentId: 's1',
+      },
+      { type: 'tool:end', ts: 1200, toolId: 'sub:s1:r2', status: 'done', durationMs: 100 },
+      {
+        type: 'tool:start',
+        ts: 1200,
+        toolId: 'sub:s1:r3',
+        name: 'read_file',
+        activeVerb: 'Reading file',
+        finalVerb: 'Read file',
+        subject: '/sub/c.ts',
+        parentId: 's1',
+      },
+      { type: 'tool:end', ts: 1300, toolId: 'sub:s1:r3', status: 'done', durationMs: 100 },
+    ]);
+    // Two distinct batches each above the threshold → two
+    // tool-end-batch items, NOT one merged six-count batch.
+    const batches = result.permanent.filter(
+      (i): i is Extract<PermanentItem, { kind: 'tool-end-batch' }> => i.kind === 'tool-end-batch',
+    );
+    expect(batches).toHaveLength(2);
+    expect(batches[0]?.parentId).toBeUndefined();
+    expect(batches[0]?.count).toBe(3);
+    expect(batches[1]?.parentId).toBe('s1');
+    expect(batches[1]?.count).toBe(3);
+  });
+
+  test('non-done tool:end (error/denied) bypasses the buffer and emits immediately', () => {
+    // Real-world UX bug: a denied bash chip sat in the buffer
+    // for 51s while the agent paused on the policy refusal,
+    // leaving the operator staring at the previous batch with
+    // no signal that the NEXT tool was blocked. Errors and
+    // denials now skip the buffer entirely and emit as their
+    // own tool-end chip in scrollback the moment the event
+    // lands.
+    const denyState = createInitialState();
+    const s = applyEvent(denyState, {
+      type: 'tool:start',
+      ts: 1,
+      toolId: 't-bash',
+      name: 'bash',
+      activeVerb: 'Executing',
+      finalVerb: 'Executed',
+      subject: 'ls',
+    }).state;
+    const r = applyEvent(s, {
+      type: 'tool:end',
+      ts: 2,
+      toolId: 't-bash',
+      status: 'denied',
+      durationMs: 1,
+      summary: 'no policy rule matched',
+    });
+    // Emitted IMMEDIATELY — no buffer wait.
+    expect(r.permanent).toHaveLength(1);
+    const item = r.permanent[0];
+    if (item?.kind !== 'tool-end') throw new Error('expected tool-end');
+    expect(item.status).toBe('denied');
+    expect(item.summary).toBe('no policy rule matched');
+    // Buffer must not be left holding anything either.
+    expect(r.state.pendingToolEndBatch).toBeNull();
+  });
+
+  test('error mid-stream flushes the partial green batch FIRST, then emits the error', () => {
+    // Trade-off documented in the tool:end case: a failure
+    // splits the batch. Operator sees the green prefix, the
+    // failure boundary, and any subsequent green continuation
+    // as separate chips. More honest than a single batch chip
+    // with worst-of status hiding the boundary.
+    const result = drive([
+      ...readPair('t1', 'src/a.ts', 10),
+      {
+        type: 'tool:start',
+        ts: 11,
+        toolId: 't2',
+        name: 'read_file',
+        activeVerb: 'Reading file',
+        finalVerb: 'Read file',
+        subject: 'src/b.ts',
+      },
+      { type: 'tool:end', ts: 20, toolId: 't2', status: 'error', durationMs: 9 },
+      ...readPair('t3', 'src/c.ts', 10),
+    ]);
+    // 3 individual tool-end chips: green prefix (1 item, below
+    // threshold), the error, the green suffix (1 item, below
+    // threshold). NO tool-end-batch — the failure broke the
+    // batch.
+    expect(result.permanent.map((p) => p.kind)).toEqual(['tool-end', 'tool-end', 'tool-end']);
+    const statuses = result.permanent.map((p) => (p.kind === 'tool-end' ? p.status : null));
+    expect(statuses).toEqual(['done', 'error', 'done']);
+  });
+
+  test('null subjects are filtered out of the batch continuation list', () => {
+    // todo_write-style tools (no vocab subject) produce null
+    // subjects. They count toward `count` but don't surface as
+    // `|_` continuation lines (a bare `|_ ` with no payload is
+    // visual noise). Tested with a non-todo tool name so the
+    // batch still triggers via threshold.
+    const result = drive([
+      {
+        type: 'tool:start',
+        ts: 1,
+        toolId: 't1',
+        name: 'echo',
+        activeVerb: 'Echoing',
+        finalVerb: 'Echoed',
+        subject: 'hi',
+      },
+      { type: 'tool:end', ts: 10, toolId: 't1', status: 'done', durationMs: 9 },
+      {
+        type: 'tool:start',
+        ts: 11,
+        toolId: 't2',
+        name: 'echo',
+        activeVerb: 'Echoing',
+        finalVerb: 'Echoed',
+        subject: null,
+      },
+      { type: 'tool:end', ts: 20, toolId: 't2', status: 'done', durationMs: 9 },
+      {
+        type: 'tool:start',
+        ts: 21,
+        toolId: 't3',
+        name: 'echo',
+        activeVerb: 'Echoing',
+        finalVerb: 'Echoed',
+        subject: 'world',
+      },
+      { type: 'tool:end', ts: 30, toolId: 't3', status: 'done', durationMs: 9 },
+    ]);
+    const item = result.permanent[0];
+    if (item?.kind !== 'tool-end-batch') throw new Error('expected tool-end-batch');
+    expect(item.count).toBe(3);
+    expect(item.subjects).toEqual(['hi', 'world']);
+  });
+
+  test('non-tool:end events with permanent items flush the batch FIRST (chronological order)', () => {
+    // A user:submit (or any scrollback-emitting event) that lands
+    // mid-stream after a partial batch must trigger the buffer to
+    // flush BEFORE the new event's permanent items hit the log,
+    // so chronology stays intact.
+    const result = drive([
+      ...readPair('t1', 'src/a.ts'),
+      ...readPair('t2', 'src/b.ts'),
+      // Flush trigger: warn (emits a permanent item).
+      { type: 'warn', ts: 200, message: 'something' },
+    ]);
+    // Order: 2 tool-ends (under threshold so emit individual) +
+    // the warn item. Crucially the tool-ends come FIRST.
+    expect(result.permanent.map((i) => i.kind)).toEqual(['tool-end', 'tool-end', 'warn']);
+  });
+
+  test('batch holds across no-permanent events (status updates do NOT flush)', () => {
+    // step:budget emits no permanent — buffer should hold across
+    // it. Without this invariant, a parallel batch interleaved
+    // with status updates would never coalesce.
+    const result = drive([
+      ...readPair('t1', 'src/a.ts'),
+      ...readPair('t2', 'src/b.ts'),
+      // No-op for permanent. Must NOT flush the batch.
+      { type: 'step:budget', ts: 50, steps: 1, maxSteps: 200, costUsd: 0.01 },
+      ...readPair('t3', 'src/c.ts'),
+    ]);
+    expect(result.permanent).toHaveLength(1);
+    expect(result.permanent[0]?.kind).toBe('tool-end-batch');
+  });
+});
+
+describe('applyEvent wrapper (flush lifecycle, slice 3)', () => {
+  // Direct unit tests for the public `applyEvent` wrapper that
+  // sits in front of `applyEventInner`. The integration tests in
+  // the batch coalescing block exercise this through `drive`,
+  // but a focused test catches a future refactor that splits the
+  // wrapper or changes the flush rule without realizing the
+  // contract — the `drive` tests would still pass if the bug
+  // happens to land on a path they don't probe.
+  //
+  // We seed `pendingToolEndBatch` directly to isolate the
+  // wrapper's behavior from the inner reducer's tool:end logic.
+  // Production code never builds this state by hand; the helper
+  // here is a one-shot fixture, not an exported pattern.
+
+  const seedBatch = (state: LiveState): LiveState => ({
+    ...state,
+    pendingToolEndBatch: {
+      name: 'read_file',
+      items: [
+        { verb: 'Read file', subject: 'a.ts', status: 'done', durationMs: 50 },
+        { verb: 'Read file', subject: 'b.ts', status: 'done', durationMs: 60 },
+        { verb: 'Read file', subject: 'c.ts', status: 'done', durationMs: 70 },
+      ],
+    },
+  });
+
+  test('non-tool:end event with empty inner permanent does NOT flush the buffer', () => {
+    // step:budget emits no permanent. The wrapper must leave the
+    // buffer untouched — the load-bearing invariant for parallel
+    // batches that interleave with status updates / heartbeats.
+    const state = seedBatch(createInitialState());
+    const r = applyEvent(state, {
+      type: 'step:budget',
+      ts: 1,
+      steps: 1,
+      maxSteps: 200,
+      costUsd: 0,
+    });
+    expect(r.permanent).toEqual([]);
+    expect(r.state.pendingToolEndBatch).not.toBeNull();
+    expect(r.state.pendingToolEndBatch?.items).toHaveLength(3);
+  });
+
+  test('non-tool:end event with non-empty inner permanent FLUSHES the buffer first', () => {
+    // The flushed items prepend BEFORE the inner's permanent so
+    // chronology is preserved (batch chronologically completed
+    // before whatever scrollback-emitting event fired next).
+    const state = seedBatch(createInitialState());
+    const r = applyEvent(state, { type: 'warn', ts: 1, message: 'something' });
+    expect(r.permanent.map((p) => p.kind)).toEqual(['tool-end-batch', 'warn']);
+    expect(r.state.pendingToolEndBatch).toBeNull();
+  });
+
+  test('tool:end event NEVER auto-flushes via the wrapper (inner manages buffer)', () => {
+    // The wrapper's `event.type === 'tool:end' → return inner`
+    // short-circuit is the only thing standing between
+    // coalescing-works and every-tool-end-flushes. A regression
+    // that flipped the gate (e.g., flushing on tool:end too)
+    // would surface here as immediate emission instead of
+    // buffer extension.
+    const state = createInitialState();
+    // First tool:end starts a fresh batch — emits nothing.
+    const r1 = applyEvent(state, {
+      type: 'tool:start',
+      ts: 1,
+      toolId: 't1',
+      name: 'read_file',
+      activeVerb: 'Reading file',
+      finalVerb: 'Read file',
+      subject: 'a.ts',
+    });
+    const r2 = applyEvent(r1.state, {
+      type: 'tool:end',
+      ts: 50,
+      toolId: 't1',
+      status: 'done',
+      durationMs: 50,
+    });
+    // Buffer holds; nothing emitted yet.
+    expect(r2.permanent).toEqual([]);
+    expect(r2.state.pendingToolEndBatch).not.toBeNull();
+    expect(r2.state.pendingToolEndBatch?.items).toHaveLength(1);
+  });
+
+  test('inner permanent items survive the wrapper unchanged when buffer is empty', () => {
+    // Sanity: no buffer, non-tool:end event with permanent → the
+    // wrapper passes the inner's permanent through verbatim, no
+    // synthetic batch entries inserted. Pinned so a regression
+    // that always-prepends an empty batch (or worse, a default
+    // tool-end-batch with count 0) would surface immediately.
+    const state = createInitialState();
+    const r = applyEvent(state, { type: 'info', ts: 1, message: 'hi' });
+    expect(r.permanent.map((p) => p.kind)).toEqual(['info']);
+    expect(r.state.pendingToolEndBatch).toBeNull();
+  });
+
+  test('inner state mutations through the flush survive into the wrapper output', () => {
+    // The wrapper must not stomp the inner's state changes when
+    // it threads through the flush. Pinned by checking that an
+    // event which changes status fields (step:budget under a
+    // pending batch — but only when the inner produces
+    // permanent... step:budget produces none, so use a flush-
+    // triggering event that also mutates state).
+    //
+    // user:submit clears input and emits a permanent. Both must
+    // survive: input cleared AND batch flushed AND user-submit
+    // permanent appended.
+    const state = seedBatch({
+      ...createInitialState(),
+      input: { value: 'hello', cursor: 5 },
+    });
+    const r = applyEvent(state, { type: 'user:submit', ts: 1, text: 'hello' });
+    // Inner state mutation preserved.
+    expect(r.state.input.value).toBe('');
+    // Buffer flushed.
+    expect(r.state.pendingToolEndBatch).toBeNull();
+    // Both kinds in the right order: batch first, then user-submit.
+    expect(r.permanent.map((p) => p.kind)).toEqual(['tool-end-batch', 'user-submit']);
+  });
+});
+
+describe('session boundary handling of pendingToolEndBatch', () => {
+  // Reviewer-flagged defect: the wrapper skips flushing when
+  // inner.permanent is empty, so a session:start that follows a
+  // session that terminated mid-batch (process killed, harness
+  // crash, headless invocation that bypassed session:end) would
+  // carry the stale buffer forward and emit those items as
+  // scrollback under the WRONG session boundary. Boundary
+  // events must handle the buffer explicitly, not depend on
+  // the wrapper's permanent-emit trigger.
+
+  test('session:start drops a stale pendingToolEndBatch (chronology cleanup)', () => {
+    // Build a state with a half-pending batch, then fire a fresh
+    // session:start. Items in the buffer at that moment belong
+    // to a session that didn't reach session:end — emitting
+    // them under the new session would misattribute the
+    // chronology. Drop > flush.
+    const dirty: LiveState = {
+      ...createInitialState(),
+      pendingToolEndBatch: {
+        name: 'read_file',
+        items: [{ verb: 'Read file', subject: 'a.ts', status: 'done', durationMs: 10 }],
+      },
+    };
+    const r = applyEvent(dirty, start());
+    expect(r.state.pendingToolEndBatch).toBeNull();
+    // Crucially the items are NOT emitted as permanent. Wrong
+    // session attribution would be worse than dropping silently.
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('session:end flushes the buffer BEFORE the footer (correct chronology)', () => {
+    // The session that emitted the tool calls is the one ending,
+    // so the buffer's items DO belong in this session's
+    // scrollback — drained before the footer marker.
+    const dirty: LiveState = {
+      ...createInitialState(),
+      pendingToolEndBatch: {
+        name: 'read_file',
+        items: [
+          { verb: 'Read file', subject: 'a.ts', status: 'done', durationMs: 10 },
+          { verb: 'Read file', subject: 'b.ts', status: 'done', durationMs: 20 },
+        ],
+      },
+    };
+    const r = applyEvent(dirty, {
+      type: 'session:end',
+      ts: 1,
+      sessionId: 's1',
+      reason: 'done',
+    });
+    // Two tool-end items (under the threshold of 3, so each
+    // emits individually) come BEFORE the session-footer.
+    expect(r.permanent.map((p) => p.kind)).toEqual(['tool-end', 'tool-end', 'session-footer']);
+    expect(r.state.pendingToolEndBatch).toBeNull();
+  });
+
+  test('session:end with a coalesce-eligible buffer flushes as a single tool-end-batch', () => {
+    // 3+ items in the buffer flush as `tool-end-batch`, not
+    // as N individual chips. Pinned so the boundary flush
+    // respects the same threshold logic the regular path uses.
+    const dirty: LiveState = {
+      ...createInitialState(),
+      pendingToolEndBatch: {
+        name: 'read_file',
+        items: [
+          { verb: 'Read file', subject: 'a.ts', status: 'done', durationMs: 10 },
+          { verb: 'Read file', subject: 'b.ts', status: 'done', durationMs: 20 },
+          { verb: 'Read file', subject: 'c.ts', status: 'done', durationMs: 30 },
+        ],
+      },
+    };
+    const r = applyEvent(dirty, {
+      type: 'session:end',
+      ts: 1,
+      sessionId: 's1',
+      reason: 'done',
+    });
+    expect(r.permanent.map((p) => p.kind)).toEqual(['tool-end-batch', 'session-footer']);
+    const batch = r.permanent[0];
+    if (batch?.kind !== 'tool-end-batch') throw new Error('expected tool-end-batch');
+    expect(batch.count).toBe(3);
+    expect(batch.subjects).toEqual(['a.ts', 'b.ts', 'c.ts']);
+  });
+
+  test('session:end with no buffer emits ONLY the footer (no synthetic items)', () => {
+    // Sanity: the explicit flush in session:end must not
+    // synthesize items when the buffer was empty. Pinned to
+    // catch a regression that always emits at least one
+    // tool-end-batch (e.g., a count-zero artifact).
+    const r = applyEvent(createInitialState(), {
+      type: 'session:end',
+      ts: 1,
+      sessionId: 's1',
+      reason: 'done',
+    });
+    expect(r.permanent.map((p) => p.kind)).toEqual(['session-footer']);
+  });
+});
+
+describe('awaitingProvider indicator (provider:waiting bracket)', () => {
+  test('provider:waiting:start sets awaitingProvider with stepN + ts', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'provider:waiting:start',
+      ts: 100,
+      stepN: 3,
+    });
+    expect(r.state.awaitingProvider).toEqual({ stepN: 3, startedAt: 100 });
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('provider:waiting:end clears the indicator', () => {
+    let s = applyEvent(createInitialState(), {
+      type: 'provider:waiting:start',
+      ts: 100,
+      stepN: 1,
+    }).state;
+    s = applyEvent(s, { type: 'provider:waiting:end', ts: 150 }).state;
+    expect(s.awaitingProvider).toBeNull();
+  });
+
+  test('provider:waiting:end is a no-op when nothing is pending (defensive double-close)', () => {
+    const r = applyEvent(createInitialState(), { type: 'provider:waiting:end', ts: 1 });
+    expect(r.state.awaitingProvider).toBeNull();
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('assistant:start clears awaitingProvider (more specific chip takes the slot)', () => {
+    let s = applyEvent(createInitialState(), {
+      type: 'provider:waiting:start',
+      ts: 100,
+      stepN: 1,
+    }).state;
+    expect(s.awaitingProvider).not.toBeNull();
+    s = applyEvent(s, { type: 'assistant:start', ts: 200, messageId: 'm1' }).state;
+    expect(s.awaitingProvider).toBeNull();
+    expect(s.pendingAssistant).not.toBeNull();
+  });
+
+  test('thinking:start clears awaitingProvider', () => {
+    let s = applyEvent(createInitialState(), {
+      type: 'provider:waiting:start',
+      ts: 100,
+      stepN: 1,
+    }).state;
+    s = applyEvent(s, { type: 'thinking:start', ts: 200, messageId: 'm1' }).state;
+    expect(s.awaitingProvider).toBeNull();
+    expect(s.thinking).not.toBeNull();
+  });
+
+  test('session:start / session:end clear awaitingProvider (boundary cleanup)', () => {
+    let s = applyEvent(createInitialState(), {
+      type: 'provider:waiting:start',
+      ts: 100,
+      stepN: 1,
+    }).state;
+    // Session boundary should drop the indicator regardless of
+    // direction (start of a new turn or end of the current run).
+    s = applyEvent(s, start()).state;
+    expect(s.awaitingProvider).toBeNull();
+    s = applyEvent(s, {
+      type: 'provider:waiting:start',
+      ts: 200,
+      stepN: 2,
+    }).state;
+    expect(s.awaitingProvider).not.toBeNull();
+    s = applyEvent(s, { type: 'session:end', ts: 300, sessionId: 's1', reason: 'done' }).state;
+    expect(s.awaitingProvider).toBeNull();
   });
 });
 
@@ -774,6 +1396,7 @@ describe('subagent lifecycle', () => {
         ts: 1234,
         subagentId: 'c1',
         status: 'done',
+        costUsd: 0,
         summary: 'README at /repo/README.md',
         durationMs: 5_000,
       },
@@ -801,6 +1424,7 @@ describe('subagent lifecycle', () => {
         ts: 1,
         subagentId: 'orphan',
         status: 'error',
+        costUsd: 0,
         summary: 'lost',
         durationMs: 0,
       },

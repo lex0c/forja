@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { renderAssistantChip } from '../../../src/tui/render/assistant-chip.ts';
+import { OUTPUT_VERB_POOL } from '../../../src/tui/render/spinner-verbs.ts';
 import type { PendingAssistant } from '../../../src/tui/state.ts';
 import type { Capabilities } from '../../../src/tui/term.ts';
 
@@ -23,12 +24,19 @@ const pending = (overrides: Partial<PendingAssistant> = {}): PendingAssistant =>
   ...overrides,
 });
 
+// Match "<word>… (..." — the chip's verb sits before the elapsed
+// counter. Used by tests that don't pin a specific verb but do
+// need to assert the chip rendered SOME verb from the pool.
+const verbPattern = /(\w+)…\s*\(/;
+
 describe('renderAssistantChip', () => {
-  test('no usage event yet → counter is duration only', () => {
+  test('no usage event yet → counter is duration only, verb is from the output pool', () => {
     const out = renderAssistantChip(pending({ startedAt: 0 }), caps, 8200);
     expect(out).toHaveLength(1);
-    expect(out[0]).toContain('Generating…');
     expect(out[0]).toContain('(8.2s)');
+    const match = out[0]?.match(verbPattern);
+    expect(match).not.toBeNull();
+    expect(OUTPUT_VERB_POOL).toContain(match?.[1] ?? '');
     // No tokens clause until assistant:usage lands.
     expect(out[0]).not.toContain('tokens');
     expect(out[0]).not.toContain('↑');
@@ -36,8 +44,19 @@ describe('renderAssistantChip', () => {
 
   test('usage merged → counter shows tokens with ↑ glyph', () => {
     const out = renderAssistantChip(pending({ startedAt: 0, outputTokens: 234 }), caps, 8200);
-    expect(out[0]).toContain('Generating…');
+    const match = out[0]?.match(verbPattern);
+    expect(OUTPUT_VERB_POOL).toContain(match?.[1] ?? '');
     expect(out[0]).toContain('(8.2s · ↑ 234 tokens)');
+  });
+
+  test('verb is stable for the same messageId across consecutive renders', () => {
+    // Spinner re-renders every ~150ms; the chip must not flicker
+    // between "Forging" and "Tempering" inside a single turn.
+    const a = renderAssistantChip(pending({ messageId: 'msg_01ABC', startedAt: 0 }), caps, 1000);
+    const b = renderAssistantChip(pending({ messageId: 'msg_01ABC', startedAt: 0 }), caps, 5000);
+    const verbA = a[0]?.match(verbPattern)?.[1];
+    const verbB = b[0]?.match(verbPattern)?.[1];
+    expect(verbA).toBe(verbB ?? '');
   });
 
   test('sub-second elapsed renders in ms', () => {

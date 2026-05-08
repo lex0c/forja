@@ -3,8 +3,8 @@ name: explain
 description: Explains code/system/decision in a fixed structure. Read-only.
 tools: [read_file, grep, glob, memory_read, memory_search]
 budget:
-  max_steps: 20
-  max_cost_usd: 0.30
+  max_steps: 25
+  max_cost_usd: 1.00
 slash: explain
 when_to_use: "question about how/why something works; user wants a structured mental model, not a fix or change"
 sampling:

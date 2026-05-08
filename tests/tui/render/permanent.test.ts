@@ -392,6 +392,92 @@ describe('formatPermanent', () => {
       expect(out[2]).toBe(pad('└─ /foo.ts'));
     });
 
+    test('nested (parentId set): no leading blank + |_ glyph + indented sub-content', () => {
+      // Slice 2: chips with parentId render under their owner
+      // (today: a subagent run). The leading blank that separates
+      // top-level chips drops — a burst of nested chips reads as
+      // one visual block under the parent rather than gap-
+      // separated siblings. The chip glyph swaps from `·` to `|_`
+      // and the sub-content connector indents to stay aligned
+      // with the nested chip head.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'read_file',
+          verb: 'Read file',
+          subject: '/foo.ts',
+          status: 'done',
+          durationMs: 200,
+          parentId: 'sub-abc',
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(2);
+      // Indent (2sp) between frame padding and the |_ glyph; subject
+      // line keeps the same indent so the connector lines up under
+      // the nested head.
+      expect(out[0]).toBe(pad('  |_ Read file in 200ms'));
+      expect(out[1]).toBe(pad('  └─ /foo.ts'));
+    });
+
+    test('nested chip in ASCII mode also uses |_ (consistent in both unicode and ascii)', () => {
+      // The nest glyph is the same string in unicode and ascii —
+      // `|_` reads as "branch from above" regardless of capability.
+      // Pinned so a future "fancy unicode arrow" refactor doesn't
+      // diverge the two paths and break the ASCII fallback.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'echo',
+          verb: 'Executed',
+          subject: 'hi',
+          status: 'done',
+          durationMs: 5,
+          parentId: 'sub-x',
+        },
+        ascii,
+      );
+      expect(out[0]).toBe(pad('  |_ Executed in 5ms'));
+    });
+
+    test('nested chip with no subject emits ONLY the head line (no orphan connector)', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'todo_write',
+          verb: 'Updated todos',
+          subject: null,
+          status: 'done',
+          durationMs: 5,
+          parentId: 'sub-y',
+        },
+        unicode,
+      );
+      expect(out).toEqual([pad('  |_ Updated todos in 5ms')]);
+    });
+
+    test('nested error chip keeps the error palette + |_ glyph', () => {
+      // Status palette is independent of nesting — a nested tool
+      // that failed still reads as red.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'bash',
+          verb: 'Executed',
+          subject: null,
+          status: 'error',
+          durationMs: 5,
+          parentId: 'sub-z',
+        },
+        colored,
+      );
+      // Painted output starts with SGR red (palette 'error'). Just
+      // assert the visible substring — exact escape codes are
+      // verified elsewhere; the load-bearing thing here is that the
+      // glyph is `|_` with the indent under the painted segment.
+      expect(out[0]).toContain('|_ Failed in 5ms');
+    });
+
     test('done status with no subject emits blank + chip head only', () => {
       const out = formatPermanent(
         {
@@ -596,6 +682,118 @@ describe('formatPermanent', () => {
     ]);
   });
 
+  describe('tool-end-batch (slice 3 — coalesced summary chip)', () => {
+    test('top-level batch: blank + chip head with count + |_ continuations per subject', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 3 files',
+          count: 3,
+          totalDurationMs: 4500,
+          subjects: ['src/a.ts', 'src/b.ts', 'src/c.ts'],
+          status: 'done',
+        },
+        unicode,
+      );
+      // Layout: blank, head, then 3 |_ continuation lines.
+      // Duration crosses 1s threshold → formatted as `4.5s`.
+      expect(out).toEqual([
+        pad(''),
+        pad('· Read 3 files in 4.5s'),
+        pad('  |_ src/a.ts'),
+        pad('  |_ src/b.ts'),
+        pad('  |_ src/c.ts'),
+      ]);
+    });
+
+    test('nested batch: no leading blank + |_ glyph head + double-indent continuations', () => {
+      // When the batch itself is nested under a subagent (parentId
+      // set), the head uses `|_` and the continuations indent ONE
+      // step deeper so the visual hierarchy reads "subagent >
+      // batch summary > child detail".
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 3 files',
+          count: 3,
+          totalDurationMs: 6000,
+          subjects: ['/sub/a.ts', '/sub/b.ts', '/sub/c.ts'],
+          status: 'done',
+          parentId: 'sub-abc',
+        },
+        unicode,
+      );
+      expect(out).toEqual([
+        pad('  |_ Read 3 files in 6.0s'),
+        pad('    |_ /sub/a.ts'),
+        pad('    |_ /sub/b.ts'),
+        pad('    |_ /sub/c.ts'),
+      ]);
+    });
+
+    test('error status: head uses error palette + verb overridden to Failed', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 3 files',
+          count: 3,
+          totalDurationMs: 100,
+          subjects: ['a', 'b', 'c'],
+          status: 'error',
+        },
+        colored,
+      );
+      // Verb override mirrors the single-chip behavior: error
+      // statuses always read "Failed" regardless of the producer's
+      // headline. Operator gets a uniform error verb across single
+      // and batch chips.
+      expect(out[1]).toContain('Failed in 100ms');
+    });
+
+    test('empty subjects array still emits the head (no orphan |_ lines)', () => {
+      // Defensive: a tool that has no vocab subject extractor (all
+      // children produced null subjects, all filtered upstream) can
+      // still surface as a batch chip — count carries the signal.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'echo',
+          verb: 'Echoed ×3',
+          count: 3,
+          totalDurationMs: 30,
+          subjects: [],
+          status: 'done',
+        },
+        unicode,
+      );
+      expect(out).toEqual([pad(''), pad('· Echoed ×3 in 30ms')]);
+    });
+
+    test('ASCII mode: |_ continuations work without unicode', () => {
+      // The nest glyph is intentionally identical in unicode and
+      // ASCII so the affordance survives the no-unicode fallback.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end-batch',
+          name: 'read_file',
+          verb: 'Read 2 files',
+          count: 2,
+          totalDurationMs: 200,
+          subjects: ['a.ts', 'b.ts'],
+          status: 'done',
+        },
+        ascii,
+      );
+      // ASCII chip glyph is `*`; continuations still `|_`.
+      expect(out[1]).toBe(pad('* Read 2 files in 200ms'));
+      expect(out[2]).toBe(pad('  |_ a.ts'));
+      expect(out[3]).toBe(pad('  |_ b.ts'));
+    });
+  });
+
   test('error and warn are wrapped in SGR escapes when color enabled', () => {
     const errored = formatPermanent({ kind: 'error', message: 'down' }, colored);
     expect(errored[0]).toBe(pad(''));
@@ -616,6 +814,7 @@ describe('formatPermanent', () => {
           status: 'done',
           summary: 'README at /repo/README.md',
           durationMs: 5_000,
+          costUsd: 0,
         },
         unicode,
       );
@@ -625,7 +824,12 @@ describe('formatPermanent', () => {
       expect(out[0]).toContain('5s');
     });
 
-    test('error shape uses Failed verb and red SGR when colored', () => {
+    test('error shape uses Error verb and red SGR when colored', () => {
+      // Renamed from "Failed" to "Error" — the verb mapping
+      // distinguishes status types (Done / Aborted / Exhausted /
+      // Error) so the operator can read the cause at a glance.
+      // "Failed" remains the last-resort fallback for unknown
+      // status combos.
       const out = formatPermanent(
         {
           kind: 'subagent_summary',
@@ -633,15 +837,140 @@ describe('formatPermanent', () => {
           subagentId: 'c1',
           name: 'audit',
           status: 'error',
-          summary: 'aborted',
+          summary: 'crashed',
           durationMs: 12,
+          costUsd: 0,
         },
         colored,
       );
       expect(out).toHaveLength(1);
-      expect(out[0]).toContain('Failed');
+      expect(out[0]).toContain('Error');
       // 31 = red SGR (paint(error, ...) goes through this code).
       expect(out[0]).toContain(`${CSI}31m`);
+    });
+
+    test('exhausted + maxCostUsd renders cost cap label with $X', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'explain',
+          status: 'exhausted',
+          reason: 'maxCostUsd',
+          summary: 'budget exceeded',
+          durationMs: 96_000,
+          costUsd: 0.6,
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0]).toContain('Exhausted (cost cap, $0.60)');
+    });
+
+    test('cost rendering rounds half-up at IEEE-754 edges (0.585 → $0.59)', () => {
+      // (0.585).toFixed(2) returns "0.58" in V8 / JavaScriptCore
+      // because 0.585 has an inexact IEEE-754 representation
+      // that rounds DOWN under toFixed's banker-style behavior.
+      // Anthropic pricing produces values right at this kind of
+      // edge — operator would see "$0.58 cost cap" when the run
+      // actually hit $0.59. Pin the half-up Math.round-based
+      // formatter so the displayed amount matches the cap that
+      // fired.
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'explain',
+          status: 'exhausted',
+          reason: 'maxCostUsd',
+          summary: '',
+          durationMs: 96_000,
+          costUsd: 0.585,
+        },
+        unicode,
+      );
+      expect(out[0]).toContain('Exhausted (cost cap, $0.59)');
+      expect(out[0]).not.toContain('$0.58');
+    });
+
+    test('interrupted + aborted renders Aborted verb', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'explain',
+          status: 'interrupted',
+          reason: 'aborted',
+          summary: '',
+          durationMs: 1500,
+          costUsd: 0.02,
+        },
+        unicode,
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0]).toContain('Aborted');
+    });
+
+    test('exhausted + maxSteps renders step cap label', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'refactor',
+          status: 'exhausted',
+          reason: 'maxSteps',
+          summary: 'step cap reached',
+          durationMs: 5000,
+          costUsd: 0.42,
+        },
+        unicode,
+      );
+      expect(out[0]).toContain('Exhausted (step cap)');
+    });
+
+    test('error + stepStalled renders "Error (no progress)"', () => {
+      // Step-stall watchdog fired — provider stream went silent
+      // for the full stallMs budget. Operator sees a specific
+      // cause label instead of a generic "Error" or worse,
+      // "Failed". Pin the verb so a regression that drops the
+      // stepStalled branch from the verb mapping shows up here.
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'explain',
+          status: 'error',
+          reason: 'stepStalled',
+          summary: 'step stalled (no provider events for 90000ms)',
+          durationMs: 90_000,
+          costUsd: 0.02,
+        },
+        unicode,
+      );
+      expect(out[0]).toContain('Error (no progress)');
+    });
+
+    test('interrupted + maxWallClockMs renders Timed out', () => {
+      const out = formatPermanent(
+        {
+          kind: 'subagent_summary',
+          ts: 1,
+          subagentId: 'c1',
+          name: 'audit',
+          status: 'interrupted',
+          reason: 'maxWallClockMs',
+          summary: '',
+          durationMs: 600_000,
+          costUsd: 0,
+        },
+        unicode,
+      );
+      expect(out[0]).toContain('Timed out');
     });
 
     test('uses ASCII glyph when caps.unicode is false', () => {
@@ -654,6 +983,7 @@ describe('formatPermanent', () => {
           status: 'done',
           summary: 'ok',
           durationMs: 100,
+          costUsd: 0,
         },
         ascii,
       );
@@ -673,6 +1003,7 @@ describe('formatPermanent', () => {
           status: 'done',
           summary: long,
           durationMs: 100,
+          costUsd: 0,
         },
         unicode,
       );
@@ -691,6 +1022,7 @@ describe('formatPermanent', () => {
           status: 'done',
           summary: '',
           durationMs: 100,
+          costUsd: 0,
         },
         unicode,
       );

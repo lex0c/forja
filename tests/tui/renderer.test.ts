@@ -1108,6 +1108,55 @@ describe('renderer side effects', () => {
     r.close();
   });
 
+  test('heartbeat ticks while awaitingProvider is set (regression for frozen counter)', () => {
+    // Pre-fix the heartbeat predicate didn't include
+    // awaitingProvider. The "Awaiting model… (Xs)" chip was
+    // drawn ONCE at step_start with the elapsed counter frozen
+    // at 0ms — the operator perceived a hang anyway because
+    // visible state didn't change during the actual wait. The
+    // predicate now includes the field so the chip ticks at the
+    // heartbeat cadence.
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    type HbPending = { fn: () => void };
+    let hbPending: HbPending[] = [];
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+      heartbeat: {
+        setTimer: (fn) => {
+          const p: HbPending = { fn };
+          hbPending.push(p);
+          return p;
+        },
+        clearTimer: (h) => {
+          hbPending = hbPending.filter((p) => p !== h);
+        },
+      },
+    });
+    // Open the awaiting indicator with NO tool / thinking /
+    // assistant activity. The reducer's case for this event
+    // populates `state.awaitingProvider`, which the heartbeat's
+    // predicate must recognize as "active".
+    bus.emit({ type: 'provider:waiting:start', ts: 1, stepN: 1 });
+    sched.flushAll();
+    expect(hbPending.length).toBeGreaterThan(0);
+    // Close the indicator → predicate goes false on next firing,
+    // heartbeat stops re-arming.
+    bus.emit({ type: 'provider:waiting:end', ts: 2 });
+    sched.flushAll();
+    const snapshot = hbPending.slice();
+    hbPending = [];
+    snapshot.forEach((p) => p.fn());
+    sched.flushAll();
+    expect(hbPending.length).toBe(0);
+    r.close();
+  });
+
   test('stdin enableRawMode is invoked when stdin is provided', () => {
     const bus = createBus();
     const sink = makeSink();

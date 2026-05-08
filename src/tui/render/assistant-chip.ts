@@ -1,10 +1,19 @@
-// Live "Generating…" chip. Spec: UI.md §4.10.5 (operation chip,
+// Live output-pass chip. Spec: UI.md §4.10.5 (operation chip,
 // active state) — the assistant turn shows up as an operation chip
 // alongside tool cards while text streams in.
 //
 // Format:
-//   ▸ Generating… (8s · ↑ 234 tokens)        ← usage event arrived
-//   ▸ Generating… (8s)                       ← no usage yet
+//   ▸ Forging… (8s · ↑ 234 tokens)        ← usage event arrived
+//   ▸ Tempering… (8s)                     ← no usage yet
+//
+// Verb is picked from the OUTPUT pool by `pickOutputVerb`, hashed
+// off the assistant message id. Stable for the duration of the
+// turn (no flicker between consecutive frames), varies across
+// turns — see `spinner-verbs.ts` for the rationale and the cluster
+// composition (Forging / Tempering / Hardening / Smelting /
+// Shaping). The flat "Generating…" label was the prior baseline;
+// rotating verbs match Forja's industrial framing without
+// sacrificing per-turn coherence.
 //
 // The token counter only appears once an `assistant:usage` UIEvent
 // has merged onto pendingAssistant. Estimating from char count
@@ -16,6 +25,7 @@
 
 import type { PendingAssistant } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
+import { pickOutputVerb } from './spinner-verbs.ts';
 import { spinnerGlyph } from './tool-card.ts';
 
 const formatElapsed = (ms: number): string => {
@@ -44,5 +54,6 @@ export const renderAssistantChip = (
     pending.outputTokens === null
       ? `(${elapsed})`
       : `(${elapsed} · ${upArrow} ${pending.outputTokens} tokens)`;
-  return [paint(caps, 'warn', `${spinner} Generating… ${counter}`)];
+  const verb = pickOutputVerb(pending.messageId);
+  return [paint(caps, 'warn', `${spinner} ${verb}… ${counter}`)];
 };

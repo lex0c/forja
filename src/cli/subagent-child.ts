@@ -865,9 +865,26 @@ export const runSubagentChild = async (opts: SubagentChildOptions): Promise<numb
       // provider receives as `max_tokens`. The harness fills
       // every other RunBudget field from `DEFAULT_BUDGET` when
       // we omit it here, so the spread stays minimal.
+      //
+      // Cost cap semantics (spec ORCHESTRATION.md §3.5.0): the
+      // playbook's declared `max_cost_usd` is forwarded as
+      // `softCostUsd` (regression signal — emits a warn event
+      // when crossed, does NOT terminate the run), NOT as
+      // `maxCostUsd` (hard kill). The child's own `maxCostUsd`
+      // is explicitly undefined so the merge propagates
+      // "no per-child hard cap"; the parent-side watchdog
+      // (§3.5.2) is the single enforcement point for the
+      // global cap and will cancelAll if cumulative crosses.
+      // This was a deliberate change from earlier behavior
+      // where the playbook cap was hard — false-positive kills
+      // ("child died at $0.59 of $0.30 cap when parent had
+      // $4 free") were discarding useful work.
       budget: {
         maxSteps: audit.budgetMaxSteps,
-        maxCostUsd: audit.budgetMaxCostUsd,
+        maxCostUsd: undefined,
+        ...(audit.budgetMaxCostUsd !== null && audit.budgetMaxCostUsd !== undefined
+          ? { softCostUsd: audit.budgetMaxCostUsd }
+          : {}),
         ...(audit.budgetMaxWallMs !== null ? { maxWallClockMs: audit.budgetMaxWallMs } : {}),
         ...(audit.sampling?.maxTokens !== undefined
           ? { maxOutputTokensPerCall: audit.sampling.maxTokens }

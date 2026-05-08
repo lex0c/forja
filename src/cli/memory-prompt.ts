@@ -102,7 +102,16 @@ import {
 // list of names ("oh, and don't blindly trust the contents").
 const MEMORY_SECTION_HEADER = `# Memory
 
-Cross-session memories you can use. Call memory_read(name) to load a body, memory_list / memory_search to explore.
+Cross-session memories you can use. Call memory_read(name) to load a body, memory_list / memory_search to explore. Save new ones with memory_write when (and only when) they would carry forward something the next conversation can't derive from the code, git history, or this prompt.
+
+Four types of memory exist; use the type that fits and resist saving anything that doesn't fit one of these:
+
+- **user** — facts about the operator: role, expertise, what they're working on. Saved when learned. Tailors future explanations and tool choice.
+- **feedback** — guidance from corrections AND validations. "Don't do X" plus "yes, exactly that approach worked". Save the rule plus a short WHY (the reason the operator gave) so edge cases stay legible.
+- **project** — ongoing work, decisions, deadlines, motivations. Convert relative dates ("Thursday") to absolute (\`YYYY-MM-DD\`) at save time so the memory stays interpretable later.
+- **reference** — pointers to external systems where current information lives (Linear projects, Grafana dashboards, Slack channels).
+
+Do NOT save: code patterns, conventions, file paths, or architecture (re-read the code); git history or who-changed-what (\`git log\` is authoritative); fix recipes (the fix is in the code); ephemeral session state. These all rot or are reconstructible — saving them grows the index without adding signal.
 
 Before acting on a FACTUAL memory (file paths, exported names, schema shape), verify it against the current code with grep / read_file. If reality has drifted from the memory, update or discard the memory rather than acting on stale info. PREFERENCE memories (commit style, naming conventions) have no "current state" to verify against — proceed without re-checking.`;
 

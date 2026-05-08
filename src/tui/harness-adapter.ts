@@ -105,6 +105,14 @@ interface AdapterState {
   tools: Map<string, ToolTrack>;
   // Cumulative step counter for `step:budget`. Bumped on `step_start`.
   steps: number;
+  // True between `step_start` (we emitted `provider:waiting:start`)
+  // and the first `provider_event` of that step (we emit
+  // `provider:waiting:end` once and clear). Without this gate, every
+  // provider event would re-emit the end UIEvent — minor noise but
+  // unnecessary since the reducer is already idempotent on
+  // null. The flag also short-circuits the per-event check
+  // cheaper than always pushing.
+  providerWaiting: boolean;
   // Cumulative cost. The harness reports cost only at session_finished
   // (and per-compaction). We expose the running total when we have it
   // — for now it stays 0 mid-run and the final session:end carries no
@@ -138,6 +146,18 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
     tools: new Map(),
     steps: 0,
     costUsd: 0,
+    providerWaiting: false,
+  };
+
+  // Close the "Awaiting model" indicator. Called from the
+  // `provider_event` case the first time per step, and from the
+  // `step_start` case BEFORE opening a new one (defense in depth:
+  // a step that fires `step_start` twice without a provider event
+  // in between — bug or replay edge — wouldn't leak a stale gate).
+  const endProviderWaiting = (ts: number, out: UIEvent[]): void => {
+    if (!state.providerWaiting) return;
+    state.providerWaiting = false;
+    out.push({ type: 'provider:waiting:end', ts });
   };
 
   // Closing a thinking window is a frequent micro-step (any text or
@@ -205,10 +225,32 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           costUsd: state.costUsd,
           ...(ctx.maxCostUsd !== undefined ? { maxCostUsd: ctx.maxCostUsd } : {}),
         });
+        // Defensive close before re-opening: a malformed event
+        // stream (two step_starts back to back without a
+        // provider event between) would otherwise stack two
+        // open gates and miss one of the closes.
+        endProviderWaiting(ts, out);
+        // Open the "Awaiting model" indicator. The harness has
+        // just handed the request to the provider; the next visible
+        // signal is the first provider event (text_delta /
+        // thinking_delta / tool_use_start), which can take
+        // 30-60s on extended-thinking turns. Without this chip the
+        // operator sees nothing during the wait and reaches for
+        // Ctrl-C before the step-stall watchdog (90s default)
+        // would have caught a real hang.
+        state.providerWaiting = true;
+        out.push({ type: 'provider:waiting:start', ts, stepN: event.stepN });
         return out;
       }
 
       case 'provider_event': {
+        // First provider event of the step closes the "Awaiting
+        // model" indicator. The reducer also clears on
+        // assistant:start / thinking:start (defense in depth), but
+        // closing here covers cases where the very first event is
+        // a tool_use_start (no assistant content at all — the
+        // model went straight to tools).
+        endProviderWaiting(ts, out);
         const ev = event.event;
         switch (ev.kind) {
           case 'start':
@@ -609,21 +651,129 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
             message: `subagent ${event.subagentId.slice(0, 8)} · ${inner.toolName}: ${inner.message}`,
           });
         }
+        // Soft cap crossed inside the child — surface to the
+        // operator's scrollback so the regression signal isn't
+        // hidden inside subagent_progress heartbeat text.
+        // Defensive field-presence guard mirrors the
+        // tool_warning path: IPC payload is `unknown` at the
+        // wire boundary; ill-typed events fall through silently
+        // rather than rendering "$undefined > $NaN".
+        if (
+          inner.type === 'cost_soft_cap_warn' &&
+          typeof inner.threshold === 'number' &&
+          typeof inner.cumulative === 'number'
+        ) {
+          const fmt = (usd: number): string => (Math.round(usd * 100) / 100).toFixed(2);
+          out.push({
+            type: 'warn',
+            ts,
+            message: `subagent ${event.subagentId.slice(0, 8)} over budget estimate ($${fmt(inner.cumulative)} > $${fmt(inner.threshold)})`,
+          });
+        }
+        // Permanent tool chips for tool_invoking / tool_decided /
+        // tool_finished from inside the child. Without these, a
+        // subagent doing real work shows up as nothing but the
+        // heartbeat row above — operator sees "running read_file"
+        // scroll past, never the file path, never the duration.
+        // Mirrors the top-level path (case 'tool_invoking' /
+        // 'tool_finished' earlier in this switch) with two
+        // adaptations:
+        //   - toolId is namespaced as `sub:<subagentId>:<toolUseId>`
+        //     so two concurrent subagents can't collide on a shared
+        //     id (the child generates ids locally; without the
+        //     prefix the parent's `state.tools` map would
+        //     overwrite). The reducer + renderer treat the
+        //     prefixed id as opaque.
+        //   - parentId is set to the subagentId so the renderer
+        //     indents the chip with `|_` and the operator can
+        //     visually attribute nested tools to their owner.
+        //     Slice-1 used a `[sub <id8>]` subject prefix instead;
+        //     slice 2 (this) drops that prefix in favor of the
+        //     indent, since carrying both is noisy.
+        if (
+          inner.type === 'tool_invoking' &&
+          typeof inner.toolUseId === 'string' &&
+          typeof inner.toolName === 'string'
+        ) {
+          const namespacedId = `sub:${event.subagentId}:${inner.toolUseId}`;
+          const vocab = lookupToolVocab(inner.toolName);
+          let subject: string | null = null;
+          try {
+            subject = vocab.subject?.(inner.args) ?? null;
+          } catch {
+            subject = null;
+          }
+          state.tools.set(namespacedId, { name: inner.toolName, decision: null });
+          out.push({
+            type: 'tool:start',
+            ts,
+            toolId: namespacedId,
+            name: inner.toolName,
+            activeVerb: vocab.activeVerb,
+            finalVerb: vocab.finalVerb,
+            subject,
+            parentId: event.subagentId,
+          });
+        }
+        if (inner.type === 'tool_decided' && typeof inner.toolUseId === 'string') {
+          // Mirror the top-level path: store the decision so
+          // tool_finished can branch on `denied` vs error vs done.
+          // No UI emission here — the decision surfaces via the
+          // chip's status on tool_finished.
+          const namespacedId = `sub:${event.subagentId}:${inner.toolUseId}`;
+          const tool = state.tools.get(namespacedId);
+          if (tool !== undefined) tool.decision = inner.decision;
+        }
+        if (inner.type === 'tool_finished' && typeof inner.toolUseId === 'string') {
+          const namespacedId = `sub:${event.subagentId}:${inner.toolUseId}`;
+          const tool = state.tools.get(namespacedId);
+          const decisionKind = tool?.decision?.kind;
+          const status: 'done' | 'error' | 'denied' = inner.denied
+            ? 'denied'
+            : decisionKind === 'deny'
+              ? 'denied'
+              : inner.failed
+                ? 'error'
+                : 'done';
+          let summary: string | undefined;
+          if (status === 'denied' && tool?.decision !== undefined && tool.decision !== null) {
+            const decision = tool.decision;
+            if (decision.kind === 'deny') {
+              summary = decision.reason;
+            } else if (decision.kind === 'confirm') {
+              summary = 'rejected at confirmation prompt';
+            }
+          }
+          state.tools.delete(namespacedId);
+          out.push({
+            type: 'tool:end',
+            ts,
+            toolId: namespacedId,
+            status,
+            durationMs: inner.durationMs,
+            ...(summary !== undefined ? { summary } : {}),
+          });
+        }
         return out;
       }
 
       case 'subagent_finished':
-        // Status maps from HarnessResult.status onto the UIEvent's
-        // narrower 'done' | 'error' shape. 'interrupted' and
-        // 'exhausted' both surface as 'error' for the operator —
-        // the difference between "user pressed Esc" and "ran out
-        // of budget" is captured in the summary line, not in the
-        // status enum (which exists to drive a glyph color).
+        // Forward the FULL HarnessResult.status (done /
+        // interrupted / exhausted / error). The previous shape
+        // collapsed everything non-done to 'error' and the
+        // operator lost the distinction — "Failed in 96s" gave
+        // no signal whether the run hit a budget cap, was
+        // user-cancelled, or crashed. The renderer uses the
+        // detailed status + reason to render an honest cause
+        // label ("Exhausted (cost cap, $0.59)" vs "Aborted" vs
+        // "Error").
         out.push({
           type: 'subagent:end',
           ts,
           subagentId: event.subagentId,
-          status: event.status === 'done' ? 'done' : 'error',
+          status: event.status,
+          ...(event.reason !== undefined ? { reason: event.reason } : {}),
+          costUsd: event.costUsd,
           summary: event.summary,
           durationMs: event.durationMs,
         });
@@ -655,6 +805,21 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           message: `cap watchdog: ${event.cancelledCount} subagent${event.cancelledCount === 1 ? '' : 's'} cancelled — cumulative $${event.cumulativeUsd.toFixed(4)} exceeded cap $${event.capUsd.toFixed(4)}`,
         });
         return out;
+
+      case 'cost_soft_cap_warn': {
+        // Per-playbook soft cap crossed (spec ORCHESTRATION.md
+        // §3.5.0). Run continues — this is a regression signal,
+        // not a termination. Half-up rounding to two decimals
+        // matches the formatter used in subagent_summary so the
+        // displayed cents are consistent across surfaces.
+        const fmt = (usd: number): string => (Math.round(usd * 100) / 100).toFixed(2);
+        out.push({
+          type: 'warn',
+          ts,
+          message: `over budget estimate ($${fmt(event.cumulative)} > $${fmt(event.threshold)})`,
+        });
+        return out;
+      }
 
       case 'parallel_status':
         // Parallelism observability snapshot (spec

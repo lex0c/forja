@@ -177,6 +177,15 @@ export type ToolStartEvent = BaseEvent & {
   // One-line subject under `└─ `; null when args don't carry the
   // expected field (renderer drops the connector line).
   subject: string | null;
+  // Optional grouping id (`subagentId` for tool calls fired
+  // inside a subagent run). When set, the renderer indents the
+  // chip and swaps its glyph to a nesting marker (`|_`) so the
+  // operator visually attributes nested tool calls to their
+  // owner. Top-level tool calls (parent harness) leave this
+  // absent. Carried verbatim from `tool:start` through the
+  // active-tool record into the `PermanentItem` so the chip
+  // renderer can read it back at end time without re-deriving.
+  parentId?: string;
 };
 export type ToolDeltaEvent = BaseEvent & {
   type: 'tool:delta';
@@ -397,7 +406,25 @@ export type SubagentUpdateEvent = BaseEvent & {
 export type SubagentEndEvent = BaseEvent & {
   type: 'subagent:end';
   subagentId: string;
-  status: 'done' | 'error';
+  // Full harness status — `done` | `interrupted` | `exhausted` |
+  // `error`. The renderer was previously collapsing this to
+  // `done | error` and the operator lost the cause distinction
+  // ("Did it run out of budget? Did I cancel it? Did the
+  // provider blow up?"). Surface full status so the scrollback
+  // chip can render an honest cause label.
+  status: 'done' | 'interrupted' | 'exhausted' | 'error';
+  // Stable reason code from the harness — `maxCostUsd`,
+  // `maxSteps`, `maxWallClockMs`, `aborted`, `degenerate_loop`,
+  // `providerError`, `done`, etc. Optional: older producers /
+  // fallback paths may not set it. The renderer uses it to
+  // refine the verb ("Exhausted (cost cap)" vs the bare
+  // "Exhausted").
+  reason?: string;
+  // Child's authoritative spend at settle. Renderer surfaces
+  // this in the chip when the run was budget-related so the
+  // operator sees "spent $0.59 of a $0.30 cap" rather than just
+  // "Failed".
+  costUsd: number;
   summary: string;
   durationMs: number;
 };
@@ -444,6 +471,34 @@ export type StepBudgetEvent = BaseEvent & {
   maxSteps: number;
   costUsd: number;
   maxCostUsd?: number;
+};
+
+// Provider call lifecycle bracket — covers the gap between
+// `step_start` (harness asked the provider for the next turn) and
+// the first provider event landing on the renderer (text_delta /
+// thinking_delta / tool_use_start). The harness adapter emits
+// `provider:waiting:start` on step_start and
+// `provider:waiting:end` on the first provider_event of that
+// step.
+//
+// Without this bracket, a step where the model thinks for 30-60s
+// (extended thinking with high max_tokens, slow cold start, model
+// genuinely deliberating on a tool denial) shows nothing in the
+// live region — operator perceives a hang. The waiting chip
+// closes the visibility gap with an "Awaiting model… (Xs)"
+// indicator that ticks while the provider call is in flight.
+//
+// Mutually exclusive with the thinking and assistant chips: once
+// thinking_delta or text_delta arrives, the adapter emits the
+// :end event AND the relevant start event in the same translate
+// call, and the renderer's chip-slot picks the more specific
+// indicator.
+export type ProviderWaitingStartEvent = BaseEvent & {
+  type: 'provider:waiting:start';
+  stepN: number;
+};
+export type ProviderWaitingEndEvent = BaseEvent & {
+  type: 'provider:waiting:end';
 };
 export type CheckpointCreateEvent = BaseEvent & {
   type: 'checkpoint:create';
@@ -579,6 +634,8 @@ export type UIEvent =
   | BgUpdateEvent
   | BgEndEvent
   | StepBudgetEvent
+  | ProviderWaitingStartEvent
+  | ProviderWaitingEndEvent
   | CheckpointCreateEvent
   | ScreenClearEvent
   | SlashUpdateEvent

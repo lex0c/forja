@@ -20,6 +20,22 @@ import { visualWidth } from './width.ts';
 // statuses; status is communicated by the verb ('Failed' vs the
 // per-tool finalVerb) plus color (error / dim).
 const CHIP_FINAL_GLYPH = { unicode: '·', ascii: '*' } as const;
+// Glyph used in place of CHIP_FINAL_GLYPH when a tool-end has a
+// `parentId` — visually marks the chip as nested inside its
+// parent (today: a subagent run). `|_` reads as "branch from
+// the line above" in both Unicode and ASCII; using a separate
+// distinct sequence rather than a fancy box-drawing arrow keeps
+// the visual clear under both `caps.unicode === true` (most
+// terminals) and the ASCII fallback (CI logs, dumb terminals,
+// `--no-unicode`).
+const CHIP_NESTED_GLYPH = '|_';
+// Indent prefix for nested chips and their sub-content, applied
+// AFTER frame padding — keeps the chip glyph aligned with the
+// frame's left rail and just shifts the content. Two spaces is
+// the minimum visual nesting that survives narrow terminals;
+// deeper nesting (subagent inside subagent) is uncommon enough
+// that we don't add a per-level multiplier yet.
+const CHIP_NESTED_INDENT = '  ';
 
 // Override the per-tool finalVerb when the tool didn't succeed.
 // Spec UI.md §4.10.5: error → `Exited 1 in 2.1s`, denied → `Denied`.
@@ -182,16 +198,27 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
     }
     case 'tool-end': {
       // UI.md §4.10.5 — chip glyph + verb (status-aware) + duration.
-      // `· <verb> in <duration>` for Unicode; '* <verb> in <duration>'
-      // for ASCII. Color: dim for done, error palette for failed,
-      // warn palette for denied.
-      const glyph = caps.unicode ? CHIP_FINAL_GLYPH.unicode : CHIP_FINAL_GLYPH.ascii;
+      // `· <verb> in <duration>` for top-level chips,
+      // `  |_ <verb> in <duration>` for nested chips
+      // (`item.parentId` set, today: tool fired inside a subagent).
+      // Color: dim for done, error palette for failed, warn palette
+      // for denied — applied identically regardless of nesting.
+      const nested = item.parentId !== undefined;
+      const glyph = nested
+        ? CHIP_NESTED_GLYPH
+        : caps.unicode
+          ? CHIP_FINAL_GLYPH.unicode
+          : CHIP_FINAL_GLYPH.ascii;
+      // Indent prefix only on nested chips. Applied BEFORE the
+      // glyph so the visual hierarchy reads "[indent][nest-glyph]
+      // verb" — the indent IS the attribution signal.
+      const indent = nested ? CHIP_NESTED_INDENT : '';
       const verb = finalVerbFor(item.status, item.verb);
       const ms =
         item.durationMs >= 1000
           ? `${(item.durationMs / 1000).toFixed(1)}s`
           : `${item.durationMs}ms`;
-      const headRaw = `${glyph} ${verb} in ${ms}`;
+      const headRaw = `${indent}${glyph} ${verb} in ${ms}`;
       const head =
         item.status === 'error'
           ? paint(caps, 'error', headRaw)
@@ -202,8 +229,12 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // own "session" block; the operator scrolls and sees each tool
       // (chip + sub-content) as a self-contained unit instead of a
       // wall of contiguous chips. Sub-content stays tight under the
-      // chip (it's the chip's "subsession").
-      const lines = ['', head];
+      // chip (it's the chip's "subsession"). Nested chips skip the
+      // leading blank so a burst of subagent-owned chips reads as a
+      // visually contiguous block under their owner instead of a
+      // gap-separated list — matches the "child of the line above"
+      // affordance that `|_` already signals.
+      const lines = nested ? [head] : ['', head];
       // Sub-content (subject) under the connector. Skipped when no
       // subject (some tools have no obvious one — todo_write etc.).
       // For denied, the subject is replaced by the policy reason if
@@ -221,8 +252,58 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // grey) rather than `dim` (SGR 2 faint, frequently invisible
       // in default xterm/i3 setups) so the operator can actually
       // read the subject — same rationale as the session-footer
-      // `Cogitated for X` marker (UI.md §6.1).
-      if (subText !== null) lines.push(paint(caps, 'secondary', `${sub}${subText}`));
+      // `Cogitated for X` marker (UI.md §6.1). Nested chips indent
+      // the sub-content too so the connector lines under the nest
+      // glyph stay visually tied to the nested chip head.
+      if (subText !== null) {
+        lines.push(paint(caps, 'secondary', `${indent}${sub}${subText}`));
+      }
+      return lines.map(padFrame);
+    }
+    case 'tool-end-batch': {
+      // Coalesced summary of N consecutive same-tool tool-end items
+      // (slice 3). Same chip-shape contract as `tool-end`: status
+      // palette (dim / error / warn), nested glyph + indent when
+      // `parentId` is set. The continuation here lists EACH
+      // child's subject under `|_` instead of the single `└─ subject`
+      // that a non-batched chip emits.
+      const nested = item.parentId !== undefined;
+      const glyph = nested
+        ? CHIP_NESTED_GLYPH
+        : caps.unicode
+          ? CHIP_FINAL_GLYPH.unicode
+          : CHIP_FINAL_GLYPH.ascii;
+      const indent = nested ? CHIP_NESTED_INDENT : '';
+      const verb = finalVerbFor(item.status, item.verb);
+      const ms =
+        item.totalDurationMs >= 1000
+          ? `${(item.totalDurationMs / 1000).toFixed(1)}s`
+          : `${item.totalDurationMs}ms`;
+      const headRaw = `${indent}${glyph} ${verb} in ${ms}`;
+      const head =
+        item.status === 'error'
+          ? paint(caps, 'error', headRaw)
+          : item.status === 'denied'
+            ? paint(caps, 'warn', headRaw)
+            : paint(caps, 'dim', headRaw);
+      // Same leading-blank rule as tool-end: top-level chips get a
+      // separator, nested ones stay tight under their owner.
+      const lines = nested ? [head] : ['', head];
+      // Each child's subject as a `|_` continuation. Reuse the
+      // nest glyph for the per-child connector — visually consistent
+      // with slice 2's nested chip glyph and explicitly different
+      // from the `└─ ` subject connector (which marks "this is the
+      // chip's subject", not "this is a sibling child of the chip
+      // above"). Empty subjects are filtered upstream in
+      // flushPendingToolEndBatch — we don't need to skip here.
+      for (const subj of item.subjects) {
+        // Continuation lines indent ONE deeper than the head when
+        // the chip itself is already nested under a subagent —
+        // visual hierarchy reads "subagent > batch summary >
+        // child detail".
+        const childIndent = nested ? `${CHIP_NESTED_INDENT}${CHIP_NESTED_INDENT}` : '  ';
+        lines.push(paint(caps, 'secondary', `${childIndent}${CHIP_NESTED_GLYPH} ${subj}`));
+      }
       return lines.map(padFrame);
     }
     case 'error':
@@ -242,12 +323,60 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
     case 'subagent_summary': {
       // One-line scrollback summary for a subagent run. Mirrors
       // tool-end's compact shape: `· task <name> Done <summary> in 1m2s`
-      // for success, `· task <name> Failed <summary> in 1m2s` for
-      // failure. The leading glyph reuses CHIP_FINAL_GLYPH so the
-      // marker visually peers with tool-end (same ascending-dot
-      // motif).
+      // for success, `· task <name> <Verb> <summary> in 1m2s` for
+      // non-success — Verb is chosen from status + reason so the
+      // operator can read the cause at a glance instead of a flat
+      // "Failed" that hides whether the cap blew, the user
+      // pressed Esc, or the provider crashed.
+      //
+      // Verb mapping:
+      //   done                                       → Done
+      //   exhausted + reason=maxCostUsd              → Exhausted (cost cap, $X)
+      //   exhausted + reason=maxSteps                → Exhausted (step cap)
+      //   exhausted + reason=maxToolErrors           → Exhausted (tool errors)
+      //   interrupted + reason=aborted               → Aborted
+      //   interrupted + reason=maxWallClockMs        → Timed out
+      //   interrupted (other)                        → Interrupted
+      //   error + reason=degenerate_loop             → Error (loop)
+      //   error + reason=providerError               → Error (provider)
+      //   error (other)                              → Error
+      //   anything unrecognized                      → Failed (last-resort)
       const glyph = caps.unicode ? CHIP_FINAL_GLYPH.unicode : CHIP_FINAL_GLYPH.ascii;
-      const verb = item.status === 'done' ? 'Done' : 'Failed';
+      // Half-up rounding to two decimals. `(0.585).toFixed(2)`
+      // returns "0.58" in V8 / JavaScriptCore because 0.585 has
+      // an inexact IEEE-754 representation that rounds DOWN under
+      // toFixed's banker-style behavior. Operator sees an
+      // off-by-cent that doesn't match the reason ("hit $0.59
+      // cap, displayed $0.58"). Math.round + scale + toFixed is
+      // deterministic and rounds half-up like the operator
+      // expects.
+      const formatDollars = (usd: number): string => (Math.round(usd * 100) / 100).toFixed(2);
+      const verbFor = (
+        status: typeof item.status,
+        reason: string | undefined,
+        costUsd: number,
+      ): string => {
+        if (status === 'done') return 'Done';
+        if (status === 'exhausted') {
+          if (reason === 'maxCostUsd') return `Exhausted (cost cap, $${formatDollars(costUsd)})`;
+          if (reason === 'maxSteps') return 'Exhausted (step cap)';
+          if (reason === 'maxToolErrors') return 'Exhausted (tool errors)';
+          return 'Exhausted';
+        }
+        if (status === 'interrupted') {
+          if (reason === 'aborted') return 'Aborted';
+          if (reason === 'maxWallClockMs') return 'Timed out';
+          return 'Interrupted';
+        }
+        if (status === 'error') {
+          if (reason === 'degenerate_loop') return 'Error (loop)';
+          if (reason === 'providerError') return 'Error (provider)';
+          if (reason === 'stepStalled') return 'Error (no progress)';
+          return 'Error';
+        }
+        return 'Failed';
+      };
+      const verb = verbFor(item.status, item.reason, item.costUsd);
       const formatDuration = (ms: number): string => {
         if (ms < 1000) return `${ms}ms`;
         const totalSec = Math.round(ms / 1000);

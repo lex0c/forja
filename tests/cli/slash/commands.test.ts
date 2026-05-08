@@ -424,8 +424,25 @@ describe('/budget', () => {
     expect(result.notes?.some((l) => l.includes('max cost'))).toBe(true);
   });
 
-  test('shows "no cap" when maxCostUsd is unset', async () => {
+  test('shows the DEFAULT_BUDGET cost cap when operator has not overridden', async () => {
+    // DEFAULT_BUDGET ships a 5 USD cost cap (AGENTIC_CLI.md §5).
+    // The slash UI falls back to the default when the operator
+    // has not explicitly set or cleared the cap, so a fresh
+    // session shows "$5.00", not "no cap".
     const ctx = makeCtx();
+    const result = await budgetCommand.exec([], ctx);
+    if (result.kind !== 'ok') return;
+    const costLine = result.notes?.find((l) => l.startsWith('max cost:'));
+    expect(costLine).toBeDefined();
+    expect(costLine).not.toContain('no cap');
+    // Pinning the formatted default keeps the contract change
+    // visible if the spec bumps the value.
+    expect(costLine).toContain('$5.00');
+  });
+
+  test('shows "no cap" only after the operator explicitly opts out', async () => {
+    const ctx = makeCtx();
+    await budgetCommand.exec(['cost', 'off'], ctx);
     const result = await budgetCommand.exec([], ctx);
     if (result.kind !== 'ok') return;
     expect(result.notes?.some((l) => l.includes('no cap'))).toBe(true);
@@ -521,12 +538,20 @@ describe('/budget', () => {
     expect(result.notes?.[0]).toContain('already');
   });
 
-  test('/budget cost none idempotent when already uncapped', async () => {
+  test('/budget cost none idempotent only after an explicit opt-out', async () => {
+    // Now that DEFAULT_BUDGET ships a cost cap, "absent maxCostUsd
+    // in baseConfig" is NOT the uncapped state — it inherits the
+    // 5 USD default. The first `cost off` transitions the run from
+    // default→explicit_undefined and reports the change. A second
+    // `cost off` is the no-op.
     const ctx = makeCtx();
-    // baseConfig starts without maxCostUsd in DEFAULT_BUDGET.
-    const result = await budgetCommand.exec(['cost', 'none'], ctx);
-    if (result.kind !== 'ok') return;
-    expect(result.notes?.[0]).toContain('already uncapped');
+    const first = await budgetCommand.exec(['cost', 'off'], ctx);
+    if (first.kind !== 'ok') return;
+    expect(first.notes?.[0]).toContain('no cap');
+    expect(first.notes?.[0]).not.toContain('already');
+    const second = await budgetCommand.exec(['cost', 'off'], ctx);
+    if (second.kind !== 'ok') return;
+    expect(second.notes?.[0]).toContain('already uncapped');
   });
 
   test('/budget mutations append current-turn cue when a turn is running', async () => {

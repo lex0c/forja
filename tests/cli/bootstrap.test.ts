@@ -433,13 +433,18 @@ Body.`,
     db.close();
   });
 
-  test('response-format hint sits OUTERMOST, then parallelism, then memory', () => {
-    // Layered prompt ordering (bootstrap.ts comment): response
-    // format FIRST (render target — applies to every section),
-    // then parallelism (concurrency mechanics), then user/plan,
-    // then memory. A fresh resume reading the prompt sees the
-    // surface contract up front so every downstream layer's
-    // output respects it.
+  test('layered system prompt: env → discipline → response → parallel → memory', () => {
+    // Layered prompt ordering (bootstrap.ts comment). The
+    // outermost layer (which lands FIRST in the rendered string)
+    // gives the model situational anchor; each inner layer
+    // narrows toward task-specific framing. A fresh resume
+    // reading the prompt sees:
+    //   1. # Environment — where am I, what date, git context.
+    //   2. # Task discipline — behavioral norms.
+    //   3. # Response surface — render-target rules.
+    //   4. # Parallelism — concurrency mechanics.
+    //   5. (caller / playbook hint / plan-mode wrap when applicable)
+    //   6. # Memory — index of cross-session memories.
     const localDir = join(workdir, '.agent', 'memory', 'local');
     mkdirSync(localDir, { recursive: true });
     writeFileSync(join(localDir, 'MEMORY.md'), '- [Role](role.md) — TS dev\n');
@@ -452,11 +457,15 @@ Body.`,
       userPolicyPath: null,
     });
     expect(config.systemPrompt).toBeDefined();
-    expect(config.systemPrompt?.startsWith('# Response surface')).toBe(true);
+    expect(config.systemPrompt?.startsWith('# Environment')).toBe(true);
+    const envIdx = config.systemPrompt?.indexOf('# Environment') ?? -1;
+    const disciplineIdx = config.systemPrompt?.indexOf('# Task discipline') ?? -1;
     const responseIdx = config.systemPrompt?.indexOf('# Response surface') ?? -1;
     const parallelIdx = config.systemPrompt?.indexOf('# Parallelism') ?? -1;
     const memoryIdx = config.systemPrompt?.indexOf('# Memory') ?? -1;
-    expect(responseIdx).toBe(0);
+    expect(envIdx).toBe(0);
+    expect(disciplineIdx).toBeGreaterThan(envIdx);
+    expect(responseIdx).toBeGreaterThan(disciplineIdx);
     expect(parallelIdx).toBeGreaterThan(responseIdx);
     expect(memoryIdx).toBeGreaterThan(parallelIdx);
     db.close();
@@ -567,13 +576,12 @@ Body.`,
     db.close();
   });
 
-  test('caller systemPrompt is layered after response-format and parallelism hints without plan', () => {
-    // Caller prompt no longer passes through verbatim — the
-    // response-format hint is the OUTERMOST layer, parallelism
-    // sits inside it, and the caller prompt is innermost.
-    // Composition order: response-format → parallel → caller.
-    // Each `\\n\\n---\\n\\n` separator makes a boundary visible
-    // to the model.
+  test('caller systemPrompt is layered after environment / discipline / response-format / parallelism hints without plan', () => {
+    // Caller prompt sits INNERMOST in the layered system prompt.
+    // The outer wrappers (environment, task discipline,
+    // response-format, parallelism) all land before it; the
+    // caller's framing comes last so the operator's specific
+    // instructions read against the established context.
     const { config, db } = bootstrap({
       prompt: 'hi',
       cwd: workdir,
@@ -584,15 +592,19 @@ Body.`,
       systemPrompt: 'You are a senior engineer.',
     });
     expect(config.planMode).toBeUndefined();
-    expect(config.systemPrompt?.startsWith('# Response surface')).toBe(true);
+    expect(config.systemPrompt?.startsWith('# Environment')).toBe(true);
+    expect(config.systemPrompt).toContain('# Task discipline');
+    expect(config.systemPrompt).toContain('# Response surface');
     expect(config.systemPrompt).toContain('# Parallelism');
     expect(config.systemPrompt).toContain('You are a senior engineer.');
-    // The caller prompt comes AFTER both hints — the separator is
-    // load-bearing for the model to distinguish the layers.
+    const envIdx = config.systemPrompt?.indexOf('# Environment') ?? -1;
+    const disciplineIdx = config.systemPrompt?.indexOf('# Task discipline') ?? -1;
     const responseIdx = config.systemPrompt?.indexOf('# Response surface') ?? -1;
     const parallelIdx = config.systemPrompt?.indexOf('# Parallelism') ?? -1;
     const callerIdx = config.systemPrompt?.indexOf('You are a senior engineer.') ?? -1;
-    expect(responseIdx).toBe(0);
+    expect(envIdx).toBe(0);
+    expect(disciplineIdx).toBeGreaterThan(envIdx);
+    expect(responseIdx).toBeGreaterThan(disciplineIdx);
     expect(parallelIdx).toBeGreaterThan(responseIdx);
     expect(callerIdx).toBeGreaterThan(parallelIdx);
     db.close();
@@ -724,6 +736,186 @@ Body.`,
         trustListPathOverride: null,
       });
       expect(config.isCwdTrusted).toBe(false);
+      db.close();
+    });
+  });
+
+  describe('project pointer (AGENTS.md)', () => {
+    // Pin the wire-up to the system prompt that
+    // src/cli/project-pointer.ts produces. Module-level tests
+    // verify the helper's contract; these verify bootstrap
+    // actually calls it with the right inputs and threads the
+    // result into config.systemPrompt at the right position
+    // (between the system layers and the memory section).
+
+    test('emits the AGENTS.md pointer when cwd is trusted and AGENTS.md exists', () => {
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+      writeFileSync(join(workdir, 'AGENTS.md'), '# Project rules\nUse pnpm.\n');
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(config.systemPrompt).toBeDefined();
+      expect(config.systemPrompt).toContain('# Project context');
+      expect(config.systemPrompt).toContain(join(workdir, 'AGENTS.md'));
+      // Pointer sits AFTER the universal hints (e.g. the
+      // parallelism layer) but BEFORE the memory section per
+      // CONTEXT_TUNING.md §2 layout. The cache-stability
+      // ranking is most-stable-first; project pointer is
+      // stable until AGENTS.md is renamed/removed, memory index
+      // is stable until any /memory write. Pin both adjacencies
+      // so a future composer reorder shows up at PR review
+      // rather than as quiet cache invalidation.
+      const promptText = config.systemPrompt ?? '';
+      const hintIdx = promptText.indexOf('# Parallelism');
+      const pointerIdx = promptText.indexOf('# Project context');
+      const memoryIdx = promptText.indexOf('# Memory');
+      expect(hintIdx).toBeLessThan(pointerIdx);
+      // Memory section is only present when at least one
+      // memory exists in the registry — the bootstrap test
+      // setup isolates user scope under the workdir, which
+      // starts empty, so the section is absent here. When
+      // present, pointer must precede it.
+      if (memoryIdx >= 0) {
+        expect(pointerIdx).toBeLessThan(memoryIdx);
+      }
+      db.close();
+    });
+
+    test('emits the pointer for the cwd-specific AGENTS.md when present (subdir scope)', () => {
+      // Operator running `agent` from a subdir that has its own
+      // AGENTS.md should see THAT file pointed to, not the
+      // repoRoot one. Bootstrap forwards both `cwd` and
+      // `repoRoot` to the helper; cwd-first probe wins when
+      // both files exist.
+      const subdir = join(workdir, 'src');
+      mkdirSync(subdir, { recursive: true });
+      writeFileSync(join(workdir, 'AGENTS.md'), '# repo-wide');
+      writeFileSync(join(subdir, 'AGENTS.md'), '# subdir-specific');
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [subdir] }));
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: subdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(config.systemPrompt ?? '').toContain(join(subdir, 'AGENTS.md'));
+      // The repoRoot file's path should NOT be advertised when
+      // the cwd-scoped file exists — operator scoped to subdir
+      // gets the subdir's conventions.
+      expect(config.systemPrompt ?? '').not.toContain(join(workdir, 'AGENTS.md'));
+      db.close();
+    });
+
+    test('does not advertise repoRoot AGENTS.md when only the subdir is trusted (security boundary)', () => {
+      // Threat model: operator trusted only the subdir
+      // (`directories: [subdir]`), not the repoRoot. Trust
+      // storage is exact-path membership — a trusted subdir does
+      // NOT extend trust to its parent. AGENTS.md exists at the
+      // (untrusted) repoRoot only; trust modal probed
+      // `subdir/AGENTS.md` (absent) so the operator never saw a
+      // disclosure for the repoRoot file. The pointer must
+      // suppress the fallback to keep the system prompt's path
+      // surface aligned with what the operator authorized.
+      //
+      // `git init workdir` is necessary so `resolveRepoRoot(subdir)`
+      // returns `workdir` and not `subdir` itself — without a
+      // `.git` directory the resolver falls back to cwd, which
+      // would degenerate the test (cwd === repoRoot, no
+      // boundary case to exercise).
+      Bun.spawnSync({ cmd: ['git', 'init', workdir], stdout: 'ignore', stderr: 'ignore' });
+      const subdir = join(workdir, 'src');
+      mkdirSync(subdir, { recursive: true });
+      writeFileSync(join(workdir, 'AGENTS.md'), '# repo-wide rules');
+      // No AGENTS.md at the trusted subdir.
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [subdir] }));
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: subdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(config.systemPrompt ?? '').not.toContain('# Project context');
+      expect(config.systemPrompt ?? '').not.toContain(join(workdir, 'AGENTS.md'));
+      db.close();
+    });
+
+    test('falls back to repoRoot when BOTH cwd and repoRoot are trusted (typical workflow)', () => {
+      // The common operator workflow: trust the whole repo, run
+      // `agent` from a subdir. Both directories are in the trust
+      // list. Pointer should fall back to repoRoot/AGENTS.md
+      // when the subdir has no AGENTS.md.
+      //
+      // Same `git init workdir` setup as above so resolveRepoRoot
+      // returns workdir, not the cwd subdir.
+      Bun.spawnSync({ cmd: ['git', 'init', workdir], stdout: 'ignore', stderr: 'ignore' });
+      const subdir = join(workdir, 'src');
+      mkdirSync(subdir, { recursive: true });
+      writeFileSync(join(workdir, 'AGENTS.md'), '# repo-wide rules');
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir, subdir] }));
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: subdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(config.systemPrompt ?? '').toContain(join(workdir, 'AGENTS.md'));
+      db.close();
+    });
+
+    test('suppresses the pointer when cwd is untrusted (even with AGENTS.md present)', () => {
+      // Trust modal not yet granted (one-shot CLI / programmatic
+      // boot) — the pointer must NOT advertise a file the
+      // operator hasn't authorized the agent to read. The
+      // permission engine would block read_file anyway; this
+      // gate avoids the misleading nudge upstream.
+      writeFileSync(join(workdir, 'AGENTS.md'), '# Project rules\nUse pnpm.\n');
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        // No trust list path → not trusted.
+        trustListPathOverride: null,
+      });
+      expect(config.systemPrompt ?? '').not.toContain('# Project context');
+      db.close();
+    });
+
+    test('suppresses the pointer when AGENTS.md is absent (even on a trusted cwd)', () => {
+      const trustPath = join(workdir, 'trusted_dirs.json');
+      writeFileSync(trustPath, JSON.stringify({ directories: [workdir] }));
+      // No AGENTS.md written.
+      const { config, db } = bootstrap({
+        prompt: 'hi',
+        cwd: workdir,
+        providerOverride: mockProvider,
+        dbPath,
+        enterprisePolicyPath: null,
+        userPolicyPath: null,
+        trustListPathOverride: trustPath,
+      });
+      expect(config.systemPrompt ?? '').not.toContain('# Project context');
       db.close();
     });
   });

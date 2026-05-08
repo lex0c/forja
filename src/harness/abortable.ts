@@ -9,6 +9,112 @@ export class AbortError extends Error {
   }
 }
 
+// StepStallError fires when the stall watchdog observed no events
+// for `ms` milliseconds. Distinct from AbortError so the loop's
+// catch can route to `stepStalled` instead of `aborted` — the
+// operator distinction matters: aborted is "I cancelled this",
+// stepStalled is "the provider stream went silent".
+export class StepStallError extends Error {
+  constructor(public readonly stallMs: number) {
+    super(`step stalled (no provider events for ${stallMs}ms)`);
+    this.name = 'StepStallError';
+  }
+}
+
+// Per-step stall watchdog. Wraps an AsyncIterable so that the
+// for-await throws `StepStallError` when the source is silent
+// for `stallMs` consecutive milliseconds. Reset on each pull —
+// a slow but progressing stream (extended thinking with high
+// budget, large structured outputs) doesn't trip the gate.
+//
+// Distinct from the existing wall-clock cap (maxWallClockMs)
+// because that's session-wide; stallMs is per-step. A long
+// session with many short turns can stay under wall-clock while
+// still wanting per-step stall protection. Distinct from
+// abortableIterable because that one fires the signal on
+// EXTERNAL events (user Ctrl+C, wall-clock); this one fires on
+// INTERNAL silence (provider hang, network drop mid-stream).
+//
+// `stallMs` of 0 disables the watchdog entirely — yields the
+// source verbatim with no timer. Negative values are treated
+// the same as 0 (defensive).
+//
+// Lifecycle: timer is armed ONLY while `iter.next()` is in
+// flight. Disarmed the moment a value (or `done`) lands, so the
+// consumer's own processing time during `yield` does NOT count
+// against the budget. Re-armed at the top of the next iteration
+// before the next pull. This dual property is load-bearing:
+//
+//   - Arming before yield (the prior implementation) lets the
+//     timer fire DURING the yield while `stallReject` still
+//     points to the previous (already-settled) iteration's
+//     promise. Calling reject on a settled promise is a no-op,
+//     so the timeout is effectively dropped — the next pull
+//     then runs with NO timer armed at all and a true provider
+//     hang has no watchdog. The slow-consumer case (renderer
+//     doing heavy work between events with a low maxStepStallMs)
+//     would silently defeat the gate.
+//   - Arming after yield (the simpler alternative) would count
+//     consumer time against the budget — a slow renderer could
+//     trip the gate even though the provider is responsive.
+//
+// The arm-before-pull / disarm-on-result shape gets both: timer
+// covers exactly the iter.next() window, never the yield, and
+// stallReject is always live when the timer fires.
+export async function* stallWatchdog<T>(
+  source: AsyncIterable<T>,
+  stallMs: number,
+): AsyncIterable<T> {
+  if (stallMs <= 0) {
+    yield* source;
+    return;
+  }
+  const iter = source[Symbol.asyncIterator]();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let stallReject: ((e: Error) => void) | null = null;
+  const arm = (): void => {
+    if (timer !== null) clearTimeout(timer);
+    timer = setTimeout(() => {
+      stallReject?.(new StepStallError(stallMs));
+    }, stallMs);
+  };
+  const disarm = (): void => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+  try {
+    while (true) {
+      // Arm BEFORE setting stallReject + scheduling the pull so
+      // the timer covers the entire await; disarm on result so
+      // the consumer's `yield` window stays untimed.
+      arm();
+      const result = await new Promise<IteratorResult<T>>((resolve, reject) => {
+        stallReject = reject;
+        iter.next().then(resolve, reject);
+      });
+      // Got a result (or stall threw and we'd be in catch).
+      // Drop the timer + the closure ref so:
+      //   1. A late timer fire (between iter.next() resolving
+      //      and disarm running, in the same microtask) doesn't
+      //      reject a fresh promise from the next iteration.
+      //   2. The consumer's processing time during yield does
+      //      not count against the next pull's budget.
+      disarm();
+      stallReject = null;
+      if (result.done) return;
+      yield result.value;
+    }
+  } finally {
+    disarm();
+    stallReject = null;
+    if (typeof iter.return === 'function') {
+      Promise.resolve(iter.return(undefined)).catch(() => undefined);
+    }
+  }
+}
+
 // Wraps an `AsyncIterable<T>` so that an aborted signal interrupts the
 // for-await loop, even if the underlying source (e.g., an SDK stream)
 // never yields again. The Provider interface doesn't expose a way to
