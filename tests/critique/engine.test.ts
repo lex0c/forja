@@ -427,6 +427,45 @@ describe('runCritique — prompt versioning', () => {
     expect(getCritiqueSystemPrompt('v2')).toBe(CRITIQUE_SYSTEM_PROMPT_V2);
     expect(getCritiqueSystemPrompt('unknown')).toBe(CRITIQUE_SYSTEM_PROMPT_V2);
   });
+
+  test('CritiqueResult.promptVersion reports the version actually used (default path)', async () => {
+    // Operator left promptVersion unset → engine resolves to
+    // DEFAULT_CRITIQUE_PROMPT_VERSION. The result must report
+    // that version verbatim so the audit row records what RAN,
+    // not what the operator typed (or didn't). This is the
+    // exact bug that let the loop persist 'v1' for runs that
+    // used V2 after the default changed.
+    const json = '{"issues":[],"overall_confidence":1.0}';
+    const handle = mockProvider(() => replyText(wrapPayload(json)));
+    const result = await runCritique(handle.provider, baseInput, baseOptions);
+    expect(result.promptVersion).toBe(DEFAULT_CRITIQUE_PROMPT_VERSION);
+  });
+
+  test('CritiqueResult.promptVersion reports an explicit V1 override', async () => {
+    const json = '{"issues":[],"overall_confidence":1.0}';
+    const handle = mockProvider(() => replyText(wrapPayload(json)));
+    const result = await runCritique(handle.provider, baseInput, {
+      ...baseOptions,
+      promptVersion: CRITIQUE_PROMPT_VERSION_V1,
+    });
+    expect(result.promptVersion).toBe('v1');
+  });
+
+  test('CritiqueResult.promptVersion preserves the requested string even when unknown (fallback path)', async () => {
+    // The engine's body falls back to V2 for an unknown version,
+    // BUT the result reports the REQUESTED version verbatim — so
+    // the audit row distinguishes "operator typed an invalid
+    // version" from "operator typed v2 and got v2". The metadata
+    // on the GenerateRequest already preserves this; the result
+    // field stays in sync.
+    const json = '{"issues":[],"overall_confidence":1.0}';
+    const handle = mockProvider(() => replyText(wrapPayload(json)));
+    const result = await runCritique(handle.provider, baseInput, {
+      ...baseOptions,
+      promptVersion: 'v9999-imaginary',
+    });
+    expect(result.promptVersion).toBe('v9999-imaginary');
+  });
 });
 
 describe('runCritique — prompt-injection defense (stripPriorCritique)', () => {

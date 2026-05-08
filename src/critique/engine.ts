@@ -287,6 +287,7 @@ export const runCritique = async (
         costUsd: attemptUsageSeen ? computeCost(provider.capabilities, usage) : 0,
         usage,
         usageSeen: attemptUsageSeen,
+        promptVersion,
         reason: `overhead_exceeded (>${options.maxOverheadMs}ms)`,
       };
     }
@@ -311,6 +312,7 @@ export const runCritique = async (
       costUsd,
       usage: attemptUsage,
       usageSeen: attemptUsageSeen,
+      promptVersion,
       reason: `stream_error: ${streamErrorReason}`,
     };
   }
@@ -325,6 +327,7 @@ export const runCritique = async (
       costUsd,
       usage: attemptUsage,
       usageSeen: attemptUsageSeen,
+      promptVersion,
       reason: 'empty_response',
     };
   }
@@ -343,6 +346,7 @@ export const runCritique = async (
       costUsd,
       usage: attemptUsage,
       usageSeen: attemptUsageSeen,
+      promptVersion,
       // Distinguish "markers absent entirely" (refusal-style
       // output) from "markers present but no JSON between them"
       // (instruction-following half-failure). Threshold-tuning
@@ -361,6 +365,7 @@ export const runCritique = async (
       costUsd,
       usage: attemptUsage,
       usageSeen: attemptUsageSeen,
+      promptVersion,
       reason: 'parse_failed',
     };
   }
@@ -377,5 +382,6 @@ export const runCritique = async (
     costUsd,
     usage: attemptUsage,
     usageSeen: attemptUsageSeen,
+    promptVersion,
   };
 };

@@ -1755,7 +1755,15 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                 costUsd: critiqueResult.costUsd,
                 toolPlanWrites: planHasWrites,
                 ...(critiqueResult.reason !== undefined ? { reason: critiqueResult.reason } : {}),
-                promptVersion: critiqueCfg.promptVersion ?? 'v1',
+                // Use the version the engine ACTUALLY ran with —
+                // not the one in the operator's config (which may
+                // be undefined and fall through to the engine's
+                // default). Without this read-from-result, the
+                // audit row's prompt_version drifts the moment
+                // DEFAULT_CRITIQUE_PROMPT_VERSION changes (which
+                // already happened once, V1 → V2: the loop kept
+                // recording 'v1' on every run that used V2).
+                promptVersion: critiqueResult.promptVersion,
                 threshold: critiqueCfg.threshold,
               });
             } catch {

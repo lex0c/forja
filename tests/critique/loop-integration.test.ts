@@ -495,8 +495,15 @@ describe('runAgent — critique audit rows (migration 031)', () => {
     // post-real-eval calibration). Pinned via the constant so a
     // future change to the production default doesn't ask this
     // test to update silently.
-    const { DEFAULT_CRITIQUE_CONFIG } = await import('../../src/critique/index.ts');
+    const { DEFAULT_CRITIQUE_CONFIG, DEFAULT_CRITIQUE_PROMPT_VERSION } = await import(
+      '../../src/critique/index.ts'
+    );
     expect(row?.threshold).toBe(DEFAULT_CRITIQUE_CONFIG.threshold);
+    // Operator left promptVersion unset; audit row must record
+    // the version that ACTUALLY ran (resolved by the engine),
+    // not a hardcoded fallback. Pinned via the constant so the
+    // V1 → V2 → V3 progression keeps this assertion honest.
+    expect(row?.promptVersion).toBe(DEFAULT_CRITIQUE_PROMPT_VERSION);
   });
 
   test('flagged + ignore persists row with code=critique.warning_ignored', async () => {

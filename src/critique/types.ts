@@ -68,6 +68,17 @@ export interface CritiqueResult {
   costUsd: number;
   usage: UsageInfo;
   usageSeen: boolean;
+  // The prompt version the engine ACTUALLY used for this call,
+  // after resolving any caller-supplied `options.promptVersion`
+  // against the defaults. The harness loop persists this verbatim
+  // into `critique_runs.prompt_version` so audit / replay /
+  // threshold-tuning analyses key off the version that ran, not
+  // the version the operator typed (or didn't). Without this on
+  // the result, the loop would have to re-derive the default —
+  // and would drift silently if `DEFAULT_CRITIQUE_PROMPT_VERSION`
+  // ever changes (which is exactly what happened when V2 became
+  // the default and the loop kept recording 'v1').
+  promptVersion: string;
   // Optional human-readable detail. Populated on `skipped`
   // (`overhead_exceeded`, `mode_off`, `not_applicable`) and on
   // `failed` (parse error message, stream error code, etc).
