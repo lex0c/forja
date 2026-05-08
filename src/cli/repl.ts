@@ -860,6 +860,17 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       cumulative.steps += event.result.steps;
       cumulative.turns += 1;
     }
+    // Track critique cost as it accrues (NOT at session_finished).
+    // Updating per-event keeps the tracker accurate even when a
+    // run aborts mid-step — the rejected turn's critic call still
+    // billed tokens, and `/cost` should reflect that. The session
+    // total in `costUsd` already includes critique cost per
+    // ORCHESTRATION §6.3, so this field is a SUBSET — operators
+    // read "cumulative: $X · critique: $Y" as "of $X total spend,
+    // $Y was the second-pass review".
+    if (event.type === 'critique_finished') {
+      cumulative.critiqueCostUsd += event.costUsd;
+    }
   };
 
   // Bridge for the harness's confirm decisions: extracts a one-line
@@ -1225,7 +1236,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // — no chance of a typed `/<conflict>` ambiguously routing
   // mid-session.
   const slashRegistry = createBuiltinRegistry(subagents);
-  const cumulative = { costUsd: 0, steps: 0, turns: 0 };
+  const cumulative = { costUsd: 0, steps: 0, turns: 0, critiqueCostUsd: 0 };
   // Single registry instance for the REPL's lifetime. /model uses it
   // for the lookup + factory; bootstrap built its own at boot for
   // initial provider resolution. Both call sites are independent —

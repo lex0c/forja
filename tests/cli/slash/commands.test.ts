@@ -44,7 +44,7 @@ const makeCtx = (overrides: Partial<SlashContext> = {}): SlashContext => {
     db,
     bus,
     modalManager,
-    cumulative: { costUsd: 0, steps: 0, turns: 0 },
+    cumulative: { costUsd: 0, steps: 0, turns: 0, critiqueCostUsd: 0 },
     now: () => 1,
     requestShutdown: () => undefined,
     isRunning: () => false,
@@ -123,6 +123,34 @@ describe('/cost', () => {
     const r2 = await costCommand.exec([], ctx);
     if (r2.kind !== 'ok') return;
     expect(r2.notes?.[0]).toContain('$100.50');
+  });
+
+  test('omits the critique line when critiqueCostUsd is 0 (mode=off / never ran)', async () => {
+    const ctx = makeCtx();
+    ctx.cumulative.costUsd = 0.5;
+    ctx.cumulative.steps = 5;
+    ctx.cumulative.turns = 1;
+    ctx.cumulative.critiqueCostUsd = 0;
+    const result = await costCommand.exec([], ctx);
+    if (result.kind !== 'ok') return;
+    expect(result.notes).toHaveLength(1);
+    expect(result.notes?.[0]).not.toContain('critique');
+  });
+
+  test('shows critique breakdown line when critiqueCostUsd > 0', async () => {
+    const ctx = makeCtx();
+    ctx.cumulative.costUsd = 0.5;
+    ctx.cumulative.steps = 5;
+    ctx.cumulative.turns = 1;
+    ctx.cumulative.critiqueCostUsd = 0.12;
+    const result = await costCommand.exec([], ctx);
+    if (result.kind !== 'ok') return;
+    expect(result.notes).toHaveLength(2);
+    // First line keeps the existing format.
+    expect(result.notes?.[0]).toContain('$0.5000');
+    // Second line is the breakdown — tree-glyph prefix matches the
+    // existing scrollback aesthetic for nested info.
+    expect(result.notes?.[1]).toMatch(/^└─ critique: \$0\.1200/);
   });
 });
 

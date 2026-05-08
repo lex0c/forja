@@ -60,10 +60,19 @@ export interface SlashContext {
   modalManager: ModalManager;
   // Cumulative-cost tracker the REPL maintains across turns. /cost
   // reads it. Numbers are USD; the bridge formats for display.
+  //
+  // `critiqueCostUsd` is a SUBSET of `costUsd` — the harness adds
+  // critique spend into the session total per ORCHESTRATION §6.3,
+  // so showing "cumulative: $X · critique: $Y" lets the operator
+  // see how much of total spend went to the second-pass review
+  // (matters for tuning mode/threshold). Updates per
+  // `critique_finished` event, not session_finished, so it stays
+  // accurate even if a run aborts before completion.
   cumulative: {
     costUsd: number;
     steps: number;
     turns: number;
+    critiqueCostUsd: number;
   };
   // Wall-clock source for emitted UIEvents. Defaults to Date.now in
   // production; tests inject a counter.

@@ -55,7 +55,7 @@ const makeCtx = (opts: CtxOpts = {}): SlashContext => {
     db,
     bus,
     modalManager,
-    cumulative: { costUsd: 0, steps: 0, turns: 0 },
+    cumulative: { costUsd: 0, steps: 0, turns: 0, critiqueCostUsd: 0 },
     now: () => 1,
     requestShutdown: () => {},
     isRunning: () => opts.isRunning ?? false,
