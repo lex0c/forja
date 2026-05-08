@@ -29,6 +29,7 @@ import {
   DEFAULT_CRITIQUE_PROMPT_VERSION,
   getCritiqueSystemPrompt,
   renderCritiqueUserMessage,
+  resolveCritiquePromptVersion,
 } from './prompt.ts';
 import type {
   CritiqueInput,
@@ -224,7 +225,25 @@ export const runCritique = async (
   const start = Date.now();
   const threshold = clamp(options.threshold, 0, 1);
   const maxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
-  const promptVersion = options.promptVersion ?? DEFAULT_CRITIQUE_PROMPT_VERSION;
+  // Resolve to the canonical version (the one we'll actually
+  // render), not the requested string. An unknown version (e.g.
+  // operator typo'd `prompt_version = "v9999"`) collapses to the
+  // default here so every downstream reference — request
+  // metadata, CritiqueResult.promptVersion, audit row — points
+  // at a version that exists in PROMPT_BY_VERSION. The original
+  // requested string surfaces via the config-loader's warning,
+  // not via audit data.
+  // Resolve to the canonical version (the one we'll actually
+  // render), not the requested string. An unknown version (e.g.
+  // operator typo'd `prompt_version = "v9999"`) collapses to the
+  // default here so every downstream reference — request
+  // metadata, CritiqueResult.promptVersion, audit row — points
+  // at a version that exists in PROMPT_BY_VERSION. The original
+  // requested string surfaces via the config-loader's warning,
+  // not via audit data.
+  const promptVersion = resolveCritiquePromptVersion(
+    options.promptVersion ?? DEFAULT_CRITIQUE_PROMPT_VERSION,
+  );
 
   const userMessage = renderCritiqueUserMessage(input);
   const systemPrompt = getCritiqueSystemPrompt(promptVersion);

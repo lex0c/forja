@@ -39,7 +39,9 @@ export {
   CRITIQUE_SYSTEM_PROMPT_V1,
   CRITIQUE_SYSTEM_PROMPT_V2,
   DEFAULT_CRITIQUE_PROMPT_VERSION,
+  KNOWN_CRITIQUE_PROMPT_VERSIONS,
   getCritiqueSystemPrompt,
   renderCritiqueUserMessage,
+  resolveCritiquePromptVersion,
   stripPriorCritique,
 } from './prompt.ts';

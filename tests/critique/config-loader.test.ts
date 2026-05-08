@@ -157,13 +157,17 @@ prompt_version = "v2"
     const cwd = makeTempCwd();
     try {
       mkdirSync(join(cwd, '.agent'), { recursive: true });
+      // Use a known version so this test stays focused on the
+      // camelCase-alias parsing path; version validity is covered
+      // by the unknown-prompt_version test in the validation
+      // describe block below.
       writeFileSync(
         join(cwd, '.agent', 'config.toml'),
         `
 [critique]
 mode = "always"
 maxOverheadMs = 1500
-promptVersion = "v1.1"
+promptVersion = "v1"
 `,
       );
       const reg = stubRegistry([]);
@@ -173,7 +177,7 @@ promptVersion = "v1.1"
         env: { HOME: '/none' },
       });
       expect(result.config.maxOverheadMs).toBe(1500);
-      expect(result.config.promptVersion).toBe('v1.1');
+      expect(result.config.promptVersion).toBe('v1');
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
@@ -387,6 +391,63 @@ prompt_version = 5
       expect(result.warnings).toHaveLength(1);
       expect(result.warnings[0]).toContain('prompt_version=5');
       expect(result.warnings[0]).toContain('must be a string');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('unknown prompt_version (typo) emits a warning listing known versions', async () => {
+    // Operator typed `prompt_version = "v9999"` thinking it's a
+    // valid version. Without this warning, the loader accepts the
+    // string, the engine silently falls back to default at runtime,
+    // and the audit row records the resolved default — leaving NO
+    // signal anywhere about the typo. The warning at boot is the
+    // operator's only chance to catch it.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[critique]
+prompt_version = "v9999"
+`,
+      );
+      const result = loadCritiqueConfig({
+        cwd,
+        registry: stubRegistry([]),
+        env: { HOME: '/none' },
+      });
+      expect(result.config.promptVersion).toBeUndefined();
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toContain("'v9999'");
+      expect(result.warnings[0]).toContain('not a known prompt version');
+      // Lists the known versions so the operator can pick one.
+      expect(result.warnings[0]).toContain('v1');
+      expect(result.warnings[0]).toContain('v2');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('known prompt_version is accepted without warning', async () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[critique]
+prompt_version = "v1"
+`,
+      );
+      const result = loadCritiqueConfig({
+        cwd,
+        registry: stubRegistry([]),
+        env: { HOME: '/none' },
+      });
+      expect(result.config.promptVersion).toBe('v1');
+      expect(result.warnings).toEqual([]);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }

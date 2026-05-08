@@ -405,7 +405,15 @@ describe('runCritique — prompt versioning', () => {
     expect(req?.system).toContain('DO NOT emit an issue for');
   });
 
-  test('unknown promptVersion falls back to default V2', async () => {
+  test('unknown promptVersion: body falls back to V2 AND metadata records resolved (not requested) version', async () => {
+    // Earlier behavior preserved the operator's typo verbatim in
+    // metadata + result. That polluted critique_runs with version
+    // strings no release ever shipped, breaking replay/audit
+    // ("which prompt produced this row?" → "v9999-imaginary,
+    // which doesn't exist anywhere"). The engine now resolves
+    // BEFORE writing — operator's typo dies at the boundary, the
+    // canonical version flows through audit. The typo surfaces
+    // separately via the config-loader's warning at boot.
     const json = '{"issues":[],"overall_confidence":1.0}';
     const handle = mockProvider(() => replyText(wrapPayload(json)));
     await runCritique(handle.provider, baseInput, {
@@ -413,12 +421,8 @@ describe('runCritique — prompt versioning', () => {
       promptVersion: 'v9999-imaginary',
     });
     const req = handle.generateCalls[0];
-    // Body is V2 (default fallback); metadata still carries the
-    // requested version verbatim — operator sees in audit which
-    // version was REQUESTED vs which actually ran (engine logs
-    // the fallback elsewhere).
     expect(req?.system).toBe(CRITIQUE_SYSTEM_PROMPT_V2);
-    expect(req?.metadata?.critique_prompt_version).toBe('v9999-imaginary');
+    expect(req?.metadata?.critique_prompt_version).toBe(DEFAULT_CRITIQUE_PROMPT_VERSION);
   });
 
   test('getCritiqueSystemPrompt is the resolution surface', () => {
@@ -451,20 +455,22 @@ describe('runCritique — prompt versioning', () => {
     expect(result.promptVersion).toBe('v1');
   });
 
-  test('CritiqueResult.promptVersion preserves the requested string even when unknown (fallback path)', async () => {
-    // The engine's body falls back to V2 for an unknown version,
-    // BUT the result reports the REQUESTED version verbatim — so
-    // the audit row distinguishes "operator typed an invalid
-    // version" from "operator typed v2 and got v2". The metadata
-    // on the GenerateRequest already preserves this; the result
-    // field stays in sync.
+  test('CritiqueResult.promptVersion reports the resolved version (not the requested typo)', async () => {
+    // Audit data must point only at versions that exist. When the
+    // operator typos `prompt_version = "v9999"`, the engine
+    // resolves to default and reports the canonical name — replay
+    // tools can find the prompt body by looking up
+    // `critique_runs.prompt_version`. The typo dies at the
+    // resolve boundary; it surfaces separately via the
+    // config-loader warning at boot. Earlier behavior leaked the
+    // typo into per-row audit data.
     const json = '{"issues":[],"overall_confidence":1.0}';
     const handle = mockProvider(() => replyText(wrapPayload(json)));
     const result = await runCritique(handle.provider, baseInput, {
       ...baseOptions,
       promptVersion: 'v9999-imaginary',
     });
-    expect(result.promptVersion).toBe('v9999-imaginary');
+    expect(result.promptVersion).toBe(DEFAULT_CRITIQUE_PROMPT_VERSION);
   });
 });
 

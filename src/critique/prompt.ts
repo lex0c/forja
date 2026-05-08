@@ -168,18 +168,44 @@ ${CRITIQUE_MARKER_CLOSE}`;
 // constant + a `CRITIQUE_SYSTEM_PROMPT_VN` body — engine and
 // audit pipeline pick it up automatically via the version string
 // the operator (or default) selected. Unknown versions fall back
-// to V2 (the current default), with the engine logging the
-// fallback so the operator notices.
+// to the default; the engine records the RESOLVED version in
+// audit so `critique_runs.prompt_version` only ever contains
+// versions the release shipped.
 const PROMPT_BY_VERSION: Record<string, string> = {
   [CRITIQUE_PROMPT_VERSION_V1]: CRITIQUE_SYSTEM_PROMPT_V1,
   [CRITIQUE_PROMPT_VERSION_V2]: CRITIQUE_SYSTEM_PROMPT_V2,
 };
 
+// Closed set of versions the engine knows how to render. Exposed
+// so the config-loader can warn at boot when an operator types a
+// typo (`prompt_version = "v9999"`) — without this gate the typo
+// passes the loader's type-check, the engine silently falls back,
+// and the audit row records a version that no release ever
+// shipped. Mirrors the VALID_MODES pattern in config-loader.
+export const KNOWN_CRITIQUE_PROMPT_VERSIONS: ReadonlySet<string> = new Set(
+  Object.keys(PROMPT_BY_VERSION),
+);
+
+// Resolve a requested version string into the version that will
+// ACTUALLY render. Returns the requested version if it's known,
+// otherwise the default. The engine calls this BEFORE writing the
+// audit row + request metadata, so `critique_runs.prompt_version`
+// always points to a version that exists in PROMPT_BY_VERSION
+// (replay tools can find it; analytics aren't joined against
+// ghost versions).
+//
+// Original requested string is intentionally lost at this layer —
+// the operator's typo surfaces via the config-loader's warning at
+// boot, NOT inside per-row audit data. Mixing typo-data with
+// real version data would corrupt threshold-tuning analyses.
+export const resolveCritiquePromptVersion = (requested: string): string =>
+  KNOWN_CRITIQUE_PROMPT_VERSIONS.has(requested) ? requested : DEFAULT_CRITIQUE_PROMPT_VERSION;
+
 // Resolve a system prompt by version string. Unknown versions
 // fall back to the default (current production prompt) so a
-// typo in TOML config doesn't crash the engine — operator sees
-// the fallback in `critique_runs.prompt_version` (the version
-// that actually ran, not the requested one).
+// typo in TOML config doesn't crash the engine — but the engine
+// records the RESOLVED version (via `resolveCritiquePromptVersion`),
+// not the requested one, so audit data stays honest.
 export const getCritiqueSystemPrompt = (version: string): string =>
   PROMPT_BY_VERSION[version] ??
   PROMPT_BY_VERSION[DEFAULT_CRITIQUE_PROMPT_VERSION] ??

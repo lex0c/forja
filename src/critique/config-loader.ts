@@ -17,6 +17,7 @@ import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import type { Provider } from '../providers/index.ts';
 import type { ModelRegistry } from '../providers/registry.ts';
+import { KNOWN_CRITIQUE_PROMPT_VERSIONS } from './prompt.ts';
 import { type CritiqueConfig, type CritiqueMode, DEFAULT_CRITIQUE_CONFIG } from './types.ts';
 
 // Resolved config + (optional) critique provider. Bootstrap fans
@@ -199,6 +200,17 @@ const parseLayer = (path: string | null, source: string): ParseResult => {
       );
     } else if (promptVersion.length === 0) {
       warnings.push(`${source} config (${path}): [critique].${pvKey} is empty; ignoring`);
+    } else if (!KNOWN_CRITIQUE_PROMPT_VERSIONS.has(promptVersion)) {
+      // Unknown version (typo or unshipped). Engine falls back to
+      // the default at runtime, but without surfacing the typo
+      // here the operator only finds out by digging through audit
+      // rows — which themselves now point at the resolved
+      // (default) version, hiding the misconfig further. Warn at
+      // boot so the typo is visible in stderr.
+      const known = [...KNOWN_CRITIQUE_PROMPT_VERSIONS].sort().join(', ');
+      warnings.push(
+        `${source} config (${path}): [critique].${pvKey}='${promptVersion}' is not a known prompt version (known: ${known}); ignoring`,
+      );
     } else {
       layer.promptVersion = promptVersion;
     }
