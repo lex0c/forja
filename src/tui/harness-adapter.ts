@@ -856,22 +856,27 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
 
       case 'critique_started':
         // Self-critique pass started (ORCHESTRATION.md §6). The
-        // operator-visible UX is the critique modal itself, opened
-        // via the harness's `confirmCritique` hook (which the REPL
-        // bridge wires to `modalManager.askCritique`). The
-        // started/finished telemetry events are routed through
-        // headless NDJSON consumers; a TUI-side indicator is a
-        // future follow-up — today the live region goes silent
-        // between executor `stop` and the modal opening (up to
-        // `maxOverheadMs`, default 3s). Acceptable for opt-in
-        // critique; tracked in BACKLOG (Slice C Pending).
+        // primary operator UX is the modal that opens after the
+        // engine returns issues; the chip covers the OTHERWISE-
+        // silent window between the executor's `assistant:end` and
+        // the modal (up to `maxOverheadMs`, default 3s). Without
+        // this translation the live region would show no progress
+        // indicator during the critic call — looks identical to a
+        // hang.
+        out.push({
+          type: 'critique:start',
+          ts,
+          stepN: event.stepN,
+          toolPlanWrites: event.toolPlanWrites,
+        });
         return out;
 
       case 'critique_finished':
-        // Same rationale as `critique_started`: NDJSON-only
-        // telemetry today. The decision is reflected via the modal
-        // close + (on `redo`/`abort`) the next assistant turn or
-        // session_finished event.
+        // Close the chip. The next operator-visible surface is
+        // either the modal (when issues crossed threshold) or the
+        // next assistant turn (when no issues OR the operator
+        // chose ignore).
+        out.push({ type: 'critique:end', ts, stepN: event.stepN });
         return out;
 
       case 'session_finished': {

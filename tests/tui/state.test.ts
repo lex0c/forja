@@ -369,6 +369,50 @@ describe('thinking lifecycle', () => {
   });
 });
 
+describe('critique lifecycle (Slice D)', () => {
+  test('start sets startedAt + stepN + toolPlanWrites; end clears it', () => {
+    const result = drive([{ type: 'critique:start', ts: 1000, stepN: 3, toolPlanWrites: false }]);
+    expect(result.state.critique).toEqual({
+      startedAt: 1000,
+      stepN: 3,
+      toolPlanWrites: false,
+    });
+    const after = applyEvent(result.state, { type: 'critique:end', ts: 1500, stepN: 3 });
+    expect(after.state.critique).toBeNull();
+  });
+
+  test('toolPlanWrites=true is preserved (drives the chip color)', () => {
+    const result = drive([{ type: 'critique:start', ts: 1, stepN: 1, toolPlanWrites: true }]);
+    expect(result.state.critique?.toolPlanWrites).toBe(true);
+  });
+
+  test('session:end clears a dangling critique chip (mid-critique abort)', () => {
+    // Operator hits Ctrl+C while the critic call is still in
+    // flight: the harness signal aborts before `critique_finished`
+    // ever fires. Without the boundary cleanup the chip would
+    // outlive the session in the live region.
+    const result = drive([
+      {
+        type: 'session:start',
+        ts: 0,
+        sessionId: 's1',
+        profile: 'autonomous',
+        project: 'p',
+        model: 'mock/m',
+      },
+      { type: 'critique:start', ts: 100, stepN: 1, toolPlanWrites: false },
+    ]);
+    expect(result.state.critique).not.toBeNull();
+    const after = applyEvent(result.state, {
+      type: 'session:end',
+      ts: 200,
+      sessionId: 's1',
+      reason: 'aborted',
+    });
+    expect(after.state.critique).toBeNull();
+  });
+});
+
 describe('tool lifecycle', () => {
   // Vocabulary fields are pre-resolved by the adapter; tests pass the
   // resolved verb/subject directly to the events.

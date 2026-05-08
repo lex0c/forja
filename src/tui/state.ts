@@ -280,6 +280,19 @@ export interface LiveState {
   // seed (timestamp-based picks can change mid-turn under clock
   // skew or replay).
   thinking: { startedAt: number; messageId: string } | null;
+  // Self-critique pass live indicator (AGENTIC_CLI.md §5.4). Set by
+  // `critique:start` (harness adapter translates `critique_started`)
+  // and cleared by `critique:end` (idem `critique_finished`). The
+  // composer reads this to render a chip during the up-to-3s
+  // critic call — without it, the live region goes silent between
+  // executor `assistant:end` and the modal opening, which is
+  // indistinguishable from a hang.
+  //
+  // `toolPlanWrites` mirrors the modal flag so the chip can
+  // visually escalate when the proposal includes writes:true tool
+  // calls (about-to-mutate critiques deserve a stronger color
+  // than text-only end-of-step reviews).
+  critique: { startedAt: number; stepN: number; toolPlanWrites: boolean } | null;
   // "Awaiting model" indicator. Set by `provider:waiting:start`
   // (which the harness adapter emits on `step_start` — i.e.,
   // right after the harness loop hands the request to the
@@ -410,6 +423,7 @@ export const createInitialState = (): LiveState => ({
   pendingToolEndBatch: null,
   pendingAssistant: null,
   thinking: null,
+  critique: null,
   awaitingProvider: null,
   modal: null,
   slash: null,
@@ -796,6 +810,11 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           // — the footer would then show "Awaiting model" against a
           // run that's already terminated.
           awaitingProvider: null,
+          // Same boundary cleanup for the critique chip: a session
+          // ending mid-critique (abort signal interrupted the
+          // critic call, watchdog never closed) shouldn't leave a
+          // dangling "Reviewing…" chip in the live region.
+          critique: null,
           ended: true,
         },
         permanent: [
@@ -958,6 +977,32 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         state: event.type === 'thinking:end' ? { ...state, thinking: null } : state,
         permanent: [],
       };
+
+    case 'critique:start':
+      // Self-critique pass started. Open the chip — composer
+      // (compose.ts) reads `state.critique` and renders a
+      // "Reviewing… (Xs)" line during the otherwise-silent window
+      // while the critic LLM call is in flight. Mutually exclusive
+      // with thinking / pendingAssistant / awaitingProvider — the
+      // executor's `assistant:end` fires before critique starts,
+      // so those states are already null by the time this hits.
+      return {
+        state: {
+          ...state,
+          critique: {
+            startedAt: event.ts,
+            stepN: event.stepN,
+            toolPlanWrites: event.toolPlanWrites,
+          },
+        },
+        permanent: [],
+      };
+
+    case 'critique:end':
+      // Close the chip. The next operator-visible surface is
+      // either the modal (when issues crossed threshold) or the
+      // next assistant turn (when no issues OR ignore was chosen).
+      return { state: { ...state, critique: null }, permanent: [] };
 
     case 'tool:start': {
       const tool: ActiveTool = {

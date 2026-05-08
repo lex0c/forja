@@ -487,6 +487,39 @@ describe('harness-adapter — thinking', () => {
   });
 });
 
+describe('harness-adapter — critique lifecycle (Slice D)', () => {
+  test('critique_started → critique:start with stepN + toolPlanWrites', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'critique_started',
+      stepN: 4,
+      toolPlanWrites: true,
+    });
+    expect(types(out)).toEqual(['critique:start']);
+    const start = out[0] as Extract<UIEvent, { type: 'critique:start' }>;
+    expect(start.stepN).toBe(4);
+    expect(start.toolPlanWrites).toBe(true);
+  });
+
+  test('critique_finished → critique:end (regardless of strategy/decision)', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'critique_finished',
+      stepN: 4,
+      strategy: 'llm',
+      filteredCount: 0,
+      rawCount: 0,
+      overallConfidence: 0.95,
+      durationMs: 1200,
+      costUsd: 0.0001,
+      decision: 'no_modal',
+    });
+    expect(types(out)).toEqual(['critique:end']);
+    const end = out[0] as Extract<UIEvent, { type: 'critique:end' }>;
+    expect(end.stepN).toBe(4);
+  });
+});
+
 describe('harness-adapter — tool lifecycle', () => {
   test('tool_invoking → tool:start with stringified args', () => {
     const a = createHarnessAdapter(baseCtx());
