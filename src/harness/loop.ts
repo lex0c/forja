@@ -1651,6 +1651,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
             // never silently dropped.
             if (critiqueResult.usageSeen) {
               totalUsage = addUsage(totalUsage, critiqueResult.usage);
+            } else {
+              // The critique engine ALWAYS issues a provider.generate
+              // request — `skipped` (watchdog) and `failed` (parse /
+              // stream error) both happen AFTER the call has begun,
+              // unlike compaction's `skipped` which means "no call
+              // made". So a missing usage event here means the
+              // provider was billed (at least for input tokens) but
+              // didn't report telemetry; session totals become a
+              // lower bound. Mirrors the per-turn flip at line 1597
+              // and the compaction flip at line 2632.
+              usageComplete = false;
             }
             totalCostUsd += critiqueResult.costUsd;
             if (critiqueResult.costUsd > 0) emitCostUpdate(critiqueResult.costUsd);

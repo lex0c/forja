@@ -655,4 +655,59 @@ describe('runAgent — critique soft-failure paths', () => {
     expect(result.costUsd).toBeGreaterThan(0);
     expect(result.costUsd).toBeCloseTo(0.00011, 6);
   });
+
+  test('critique without usage event flips usageComplete to false', async () => {
+    // The critic engine ALWAYS issues a provider.generate request.
+    // When the adapter doesn't emit a `usage` event (compat
+    // endpoints that drop stream_options, mid-stream errors, older
+    // SDKs), the call still bills tokens but our session totals
+    // cannot account for them — same lower-bound rule the executor
+    // and compaction enforce. This test pins the contract: a
+    // missing usage event MUST flip usageComplete on the
+    // HarnessResult.
+    //
+    // Built inline (vs criticProvider helper) because the helper
+    // always emits usage; the whole point of this fixture is the
+    // missing event.
+    const noUsageCritic: Provider = {
+      id: 'mock/critic-no-usage',
+      family: 'anthropic',
+      capabilities: { ...baseCaps, cost_per_1k_input: 1, cost_per_1k_output: 2 },
+      async *generate() {
+        yield { kind: 'start', message_id: 'cnu' };
+        yield {
+          kind: 'text_delta',
+          text: `${CRITIQUE_MARKER_OPEN}\n{"issues":[],"overall_confidence":1.0}\n${CRITIQUE_MARKER_CLOSE}`,
+        };
+        // Intentionally NO `usage` event before stop.
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+
+    const exec = scriptedProvider([
+      { text: 'output', usage: { input: 100, output: 50 } },
+    ]);
+    const registry = createToolRegistry();
+    registry.register(readOnlyTool);
+    const config = {
+      provider: exec.provider,
+      toolRegistry: registry,
+      permissionEngine: createPermissionEngine(
+        { defaults: { mode: 'bypass' as const }, tools: {} },
+        { cwd: '/p' },
+      ),
+      db,
+      cwd: '/p',
+      userPrompt: 'do the work',
+      critiqueProvider: noUsageCritic,
+      critique: { mode: 'always' as const, maxOverheadMs: 0 },
+    };
+    const result = await runAgent(config);
+    expect(result.status).toBe('done');
+    // Executor reported usage cleanly. Critic did NOT — session
+    // totals are now a lower bound.
+    expect(result.usageComplete).toBe(false);
+  });
 });
