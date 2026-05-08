@@ -715,4 +715,74 @@ describe('runAgent — critique soft-failure paths', () => {
     // totals are now a lower bound.
     expect(result.usageComplete).toBe(false);
   });
+
+  test('caller abort during critique folds partial usage into session totals', async () => {
+    // The engine reports usage in CritiqueResult on the soft-fail
+    // paths (skipped/failed) but RETHROWS on caller-driven abort,
+    // so the loop has to recover any partial usage attached to the
+    // CollectStepError before the rethrow propagates to
+    // guardedFinish. Without that recovery, billed critic tokens
+    // emitted BEFORE the abort drop out of session totals — the
+    // operator pays, the audit doesn't see.
+    //
+    // Critic provider here:
+    //   1. Yields start + a usage event (provider already billed),
+    //   2. Triggers the harness's abort signal,
+    //   3. Stalls forever — the abort propagates through
+    //      abortableIterable, collectStep wraps the AbortError in
+    //      CollectStepError with partial.usage attached, the
+    //      engine rethrows, the loop catches and folds, and
+    //      guardedFinish maps the in-flight signal.aborted to
+    //      `aborted` for the HarnessResult.
+    const abortCtrl = new AbortController();
+    const partialUsageCritic: Provider = {
+      id: 'mock/critic-partial-then-abort',
+      family: 'anthropic',
+      capabilities: { ...baseCaps, cost_per_1k_input: 1, cost_per_1k_output: 2 },
+      async *generate() {
+        yield { kind: 'start', message_id: 'cab' };
+        yield {
+          kind: 'usage',
+          usage: { input: 50, output: 30, cache_read: 0, cache_creation: 0 },
+        };
+        // Provider has now reported usage. Trip the harness signal
+        // — abortableIterable's onAbort listener fires the
+        // internal AbortController, the next .next() pull rejects
+        // with AbortError.
+        abortCtrl.abort();
+        // Stall to give the abort time to propagate through the
+        // wrapped iterator chain; never resolves on its own.
+        await new Promise<never>(() => {});
+        yield { kind: 'stop', reason: 'end_turn' };
+      },
+      generateConstrained: () => Promise.reject(new Error('n/a')),
+      countTokens: () => Promise.resolve(0),
+    };
+
+    const exec = scriptedProvider([{ text: 'output', usage: { input: 100, output: 50 } }]);
+    const registry = createToolRegistry();
+    registry.register(readOnlyTool);
+    const config = {
+      provider: exec.provider,
+      toolRegistry: registry,
+      permissionEngine: createPermissionEngine(
+        { defaults: { mode: 'bypass' as const }, tools: {} },
+        { cwd: '/p' },
+      ),
+      db,
+      cwd: '/p',
+      userPrompt: 'do the work',
+      critiqueProvider: partialUsageCritic,
+      critique: { mode: 'always' as const, maxOverheadMs: 0 },
+      signal: abortCtrl.signal,
+    };
+    const result = await runAgent(config);
+    expect(result.status).toBe('interrupted');
+    expect(result.reason).toBe('aborted');
+    expect(result.usageComplete).toBe(false);
+    // Partial cost MUST be folded in — 50 input * 1 + 30 output * 2
+    // = 110 / 1e6 = $0.00011. Executor pricing is 0. Without the
+    // recovery, this would be 0.
+    expect(result.costUsd).toBeCloseTo(0.00011, 6);
+  });
 });

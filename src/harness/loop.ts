@@ -1631,14 +1631,47 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               toolPlanWrites: planHasWrites,
             });
 
-            const critiqueResult = await runCritique(critiqueProvider, critiqueInput, {
-              threshold: critiqueCfg.threshold,
-              maxOverheadMs: critiqueCfg.maxOverheadMs,
-              ...(critiqueCfg.promptVersion !== undefined
-                ? { promptVersion: critiqueCfg.promptVersion }
-                : {}),
-              signal,
-            });
+            // The engine swallows watchdog / parse / stream
+            // errors into a CritiqueResult, but rethrows when the
+            // CALLER signal aborts (so the loop's existing
+            // aborted/maxWallClockMs handling fires). On rethrow,
+            // any partial usage the provider already reported is
+            // attached to the CollectStepError — same shape the
+            // executor recovers from at line 1510. Without
+            // mirroring that recovery here, billed critique tokens
+            // emitted before the abort would silently drop out of
+            // session totals (operator pays, audit doesn't see).
+            let critiqueResult: Awaited<ReturnType<typeof runCritique>>;
+            try {
+              critiqueResult = await runCritique(critiqueProvider, critiqueInput, {
+                threshold: critiqueCfg.threshold,
+                maxOverheadMs: critiqueCfg.maxOverheadMs,
+                ...(critiqueCfg.promptVersion !== undefined
+                  ? { promptVersion: critiqueCfg.promptVersion }
+                  : {}),
+                signal,
+              });
+            } catch (e) {
+              // Caller-aborted critique. Mirror the executor's
+              // catch at line 1510: flip usageComplete (totals are
+              // a lower bound from here on) and fold any partial
+              // usage into the running counters before letting the
+              // throw propagate. The outer guardedFinish(e) maps
+              // to `aborted` / `maxWallClockMs` based on which
+              // signal fired — the partial cost lands in the
+              // session row that finish() persists.
+              usageComplete = false;
+              if (e instanceof CollectStepError) {
+                const partial = e.partial;
+                if (partial.usageSeen) {
+                  const partialCost = computeCost(critiqueProvider.capabilities, partial.usage);
+                  totalUsage = addUsage(totalUsage, partial.usage);
+                  totalCostUsd += partialCost;
+                  if (partialCost > 0) emitCostUpdate(partialCost);
+                }
+              }
+              throw e;
+            }
 
             // Fold critique cost into session totals as a separate
             // line per ORCHESTRATION §6.3 — `usage` aggregates
