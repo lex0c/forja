@@ -15,6 +15,647 @@ Format:
 
 ---
 
+## [2026-05-08] m4/recap — closing inventory: what is left after M4.1
+
+Post-M4.1 punch list. M4.1 (slices a–d + the audit-comment / perf
+follow-up `c569c01`) is shipped on `feat/m4-recap`; this entry is
+the consolidated "what is missing" view so the next person picking
+up M4.2 / M4.3 does not have to re-derive it from per-slice
+entries. Organized by category, not by milestone, because some
+items cross milestones (e.g., diff-aware lines is a follow-up that
+benefits both human and `pr` renderers).
+
+### Schema fields emitting empty by design
+
+These fields are present in the JSON output (always) but always
+empty / zero, because their source tables or upstream subsystems
+have not landed yet. The shape stays pinned today so consumers
+(auto-rehydrate, future renderers) can wire against it.
+
+- **`goalStack[]`** — needs the `goal_stack` table
+  (STATE_MACHINE.md §2.3.1). Not migrated.
+- **`pinnedContext[]`** — needs the `context_pins` table
+  (CONTEXT_TUNING.md §12.4.2). Not migrated.
+- **`errors[]`** — needs `failure_events`. Not migrated. Today
+  even a session that crashed mid-tool surfaces as
+  `incomplete: true` with no detail.
+- **`notDone[]`** — needs a formal `not_done` field in the
+  subagent payload envelope and / or playbook reports. Schema
+  not decided.
+- **`actions.webFetches[]`** — needs a `web_fetch` tool. Not
+  built.
+- **`actions.filesWritten[].linesAdded` / `linesRemoved`** and
+  **`outcomes.checkpoints[].filesAffected`** — require
+  `git diff` against `checkpoints.git_ref` from inside the
+  projection path. Not wired. Today they emit `0`.
+- **`actions.filesWritten[].semanticSummary`** and
+  **`decisions[].why`** (literal-from-approval fallback only) —
+  require LLM render (M4.2). Today emit `""` / the
+  approval `reason` literal.
+
+### Code review carry-overs (not yet applied)
+
+From the M4.1 self-review; commits `99a4f35`..`483dc45` plus the
+`c569c01` follow-up landed #1 (audit-comment fix) and #6
+(`listChildSessions` perf). Remaining items, by review id:
+
+- **#14 — timeline comparator violated antisymmetry.** Caught
+  post-review by the operator. The sort at projection.ts
+  returned `1` (not `0`) for entries with equal `(ts, event)`
+  pairs, so two approvals decided in the same millisecond with
+  the same `approval_*` label could sort unpredictably across
+  V8 / engine versions. **Resolved** with a three-key total
+  order (`ts → event → detail`, returning `0` only when all
+  three match) plus a regression test that forces the
+  collision and asserts deterministic ordering across two
+  back-to-back projections.
+
+- ~~**#2 — day/range silent cap at 500.**~~ **Resolved.**
+  Added `listSessionsInRange(db, {start,end,cwd?,
+  includeSubagents?})` to the sessions repo (SQL-side
+  half-open `[start, end)` predicate, oldest-first); swapped
+  `resolveSessions` over to it. Regression test seeds 600
+  sessions and verifies the projection still finds an older
+  day window. 6 new tests (5 repo, 1 projection regression).
+- **#3 — `costs.durationMs` is summed across multi-session.**
+  Three parallel 1h sessions on the same day render as `(3h)`
+  in the day-scope title. For day / range the right answer is
+  wall-clock `max(endedAt) − min(startedAt)`. Single-session
+  unaffected. Block on M4.3.
+- **#5 — step-limit truncation reshapes `goal.text`.** With
+  `/recap last 1`, `projectGoal` runs over the truncated
+  bundle, so the recap shows the *windowed* user prompt as the
+  goal, not the original session goal. Test 17 in
+  `projection.test.ts` asserts the windowed behavior; the call
+  is deliberate but unsupported by a comment. Decide:
+  (a) keep behavior + add comment, or (b) move
+  `projectGoal` ahead of the truncate.
+- **#7 — `dayBoundsUtc` invoked twice** for `day` scope (once
+  in `resolveSessions`, once in the result construction).
+  Idempotent but a divergence risk if one path changes.
+- **#8 — `renderToNotes` comment claims JSON has trailing
+  newline; it does not.** Functional behavior is correct
+  (`endsWith('\n')` only fires on the human path); only the
+  comment is misleading.
+- **#9 — `let intermediate: ReturnType<typeof projectRecap>;`**
+  works but is awkward; pull `RecapIntermediate` import or
+  fold the rest into the `try`.
+- **#10 — redundant null check** at
+  `projection.ts:386` (`payload?.payload !== undefined &&
+  payload?.payload !== null`). Simplifies to
+  `payload?.payload != null`.
+- ~~**#11 — `recordRecapRun` not resilient to DB failure.**~~
+  **Resolved.** Wrapped the audit INSERT in try/catch; on
+  failure the slash command emits a `warn` UIEvent
+  ("audit row not written (...); output is intact") and
+  still returns the recap notes. Regression test drops
+  `recap_runs` mid-execution to simulate disk-full /
+  schema-corruption and asserts: result is `ok`, recap
+  text is intact, exactly one warn fired, zero errors.
+- **#12 — `extractTextBlocks` ignores `tool_use` blocks**
+  intentionally (we only mine `text` for question
+  extraction). Needs a one-line comment so the next reader
+  does not file it as a bug.
+- **#13 — `incomplete` predicate uses `'running'` only.**
+  Today every other status is terminal so it is correct, but
+  a session that crashed with `endedAt=null AND
+  status='error'` would not flag as incomplete. Edge case
+  worth a defensive `OR endedAt IS NULL` once
+  `failure_events` lands.
+
+### M4.2 — LLM render + caching (next major slice)
+
+- **LLM render path with Haiku + schema enforcement.**
+  Anthropic structured outputs / GBNF for local models.
+  Validate output against schema before display; fall back
+  to deterministic mode on failure.
+- **Renderers `pr`, `changelog`, `slack`, `terse`** per
+  RECAP.md §4.2-4.6. Each with versioned prompt under
+  `prompts/recap/<name>-v1.j2` and golden output under
+  `evals/recap/golden/<fixture>.<renderer>.md`. Each existing
+  fixture × 4 new renderers = 20 new goldens.
+- **`recap_cache` table** with 1h TTL keyed on
+  `scope_hash`. Migration is a one-line add; the consumer
+  is the LLM render path (no point caching the ~10ms
+  deterministic surface).
+- **`recap_mini` schema** (RECAP.md §3.1) — pre-rendered by
+  a `Stop` hook into `recap_cache` so the session picker
+  loads in <50ms.
+- **`/recap list [filtros]`** slash command — depends on
+  `recap_mini`.
+- **Headless mode `agent --json /recap`** (RECAP.md §9) —
+  emits NDJSON: `recap_start`, `recap_intermediate`,
+  `recap_render`, `recap_end`. Useful in CI hooks.
+- **Eval coverage for the LLM renderer** (RECAP.md §7.4) —
+  fidelity / coverage / concision / consistency metrics.
+  Threshold: fidelity 100%, coverage ≥90%, concision 100%.
+- **Auto-rehydrate consumer** for resume (RECAP.md §3.2 +
+  STATE_MACHINE.md §7.6). On `agent --resume`, re-inject
+  `goal.text` literal + last 5 `decisions[]` + `notDone[]`.
+  Read from `recap_cache` if present, fall back to
+  deterministic projection of `RecapIntermediate` directly
+  from SQLite.
+
+### M4.3 — cross-session + pre-compact
+
+- **`/recap day [YYYY-MM-DD]`** and **`/recap range <from>
+  <to>`** slash commands. Same-cwd by default; cross-project
+  requires explicit `--all-projects` flag.
+- **`--all-projects` flag with cross-project guards.**
+  RECAP.md §6.1 / §6.2: never cross workspaces silently.
+- **`/recap pre-compact`** integrated with the Context
+  Engine. Critical-path latency budget < 200ms (no LLM
+  call there per RECAP.md §10 anti-pattern).
+- **Error-recovery + cross-day fixtures** to reach the
+  RECAP.md §11.3 target of 15 fixtures (5 read-only, 5
+  write, 3 error-recovered, 2 cross-day). Currently 5
+  shipped in slice (d).
+- **#2 / #3 from the carry-overs above** (silent 500 cap,
+  durationMs sum) MUST be resolved before this milestone.
+
+### Operator-facing follow-ups (any milestone)
+
+- **Slash flags** — `--out <path>`, `--limit <N>`,
+  `--anonymize`, `--lang pt|en`, `--include-tool-output`,
+  `--no-llm-render` (last one only meaningful with M4.2).
+- **`/recap audit`** view backed by
+  `listRecentRecapRuns` — repo function exists and is
+  tested, only the slash command wiring is missing.
+  ~30min of work.
+- **Path anonymization in JSON renderer** — today only the
+  human render rewrites `$HOME → ~/...`. Spec §6.2 implies
+  paths should be safe across renderers; the JSON path
+  staying literal is a deliberate audit choice but worth
+  re-evaluating once consumers exist.
+- **Secrets redaction** via heuristic in tool output
+  (RECAP.md §6.2). Tool output is omitted by default
+  (`--include-tool-output` opt-in), so today the surface
+  is small; opt-in flow needs the redactor.
+
+### Privacy / compliance items
+
+- **Cross-project leak guards** for the eventual
+  `--all-projects` flag.
+- **`recap_runs.session_ids` JOIN ergonomics** — querying
+  via `json_each(session_ids)` is documented in the
+  migration comment; no helper repo function exists.
+
+### Operational gaps
+
+- **No CI integration sample.** `agent --json /recap pr
+  --out PR_DESCRIPTION.md` is mentioned in spec §9 as the
+  canonical postcommit hook — needs an example doc once
+  M4.2 ships the `pr` renderer.
+- **No "first-run" bootstrap warning.** A fresh project
+  with zero finished sessions running `/recap` today gets
+  an "no active session yet" error which is correct but
+  could include a hint about
+  `/sessions` to find a recoverable session id.
+
+### Verification
+
+This entry is documentation-only — no code change. Branch
+`feat/m4-recap` remains at `c569c01`, ready for PR. Use this
+entry as the punch-list when M4.2 / M4.3 work resumes; cross
+items off and reference the closing commit.
+
+---
+
+## [2026-05-08] m4/recap slice (d) — eval smoke (5 fixtures, golden human + json)
+
+Same branch (`feat/m4-recap`). Closes M4.1. Five deterministic
+fixtures under `evals/recap/fixtures/` seed a fresh in-memory DB
+with pinned UUIDs and timestamps; the runner at
+`tests/recap/eval.test.ts` projects + renders each, comparing
+byte-for-byte against `evals/recap/golden/<name>.{human.md,json}`.
+Fidelity is PR-blocking (RECAP.md §11.3): a renderer or projection
+change that diverges from the goldens fails CI.
+
+**Done:**
+
+- **Five fixtures.** Each is a TS file exporting a `RecapFixture`
+  (`name`, `description`, `seed(db) → scope`, `now`):
+  - `01-read-only.ts` — 4 read_file calls (with one repeat),
+    exercises `actions.filesRead` aggregation.
+  - `02-write-refactor.ts` — read + edit + 2 writes + bun test
+    passing + checkpoint, exercises `filesWritten`,
+    `commands_run`, `outcomes.testsRun` (passed=true), and the
+    checkpoint section.
+  - `03-with-decisions.ts` — 3 bash calls with three approval
+    shapes (user-allow with reason, hook-deny with reason, policy
+    auto-allow filtered out), exercises the decision-filter rule
+    from slice (a).
+  - `04-with-subagent.ts` — parent + 1 child via `task` tool +
+    `subagent_outputs.payload` with summary, exercises the
+    `subagentsSpawned` walk and the payload summary extraction.
+  - `05-incomplete-session.ts` — session left in `running` state
+    plus a trailing assistant question, exercises the incomplete
+    callout AND the unresolved-question heuristic.
+- **Runner — `tests/recap/eval.test.ts`.** 11 tests: 2 per fixture
+  (human + json) plus a CI guard ensuring `UPDATE_GOLDENS` is
+  never `'1'` in CI runs. Reads goldens via `Bun.file().exists()`
+  / `.text()`; missing goldens surface a clear "run with
+  `UPDATE_GOLDENS=1` to create" hint instead of an opaque
+  "expected X received Y" diff.
+- **Update mode — `UPDATE_GOLDENS=1 bun test tests/recap/eval.test.ts`.**
+  Regenerates the goldens in place. The `evals/recap/README.md`
+  documents the workflow plus the discipline rule: "NEVER use
+  `UPDATE_GOLDENS=1` to mask an unintended drift — the goldens
+  exist to catch exactly that".
+- **`evals/recap/golden/` excluded from biome.** Goldens MUST be
+  byte-identical to `JSON.stringify(...)` and the renderer's
+  template output; biome's auto-format would silently rewrite
+  them and break the eval. Added to the `files.ignore` list in
+  `biome.json` alongside the existing `evals/fixtures` exclusion.
+- **`padId` helper places the unique segment in the FIRST 8 chars
+  of the UUID.** The renderer's `shortStep` (first 7 chars) drives
+  decision / subagent labels; with the unique part at the head
+  the goldens read as `step a300020` instead of `step 0000000`,
+  which is meaningful when reviewing diffs.
+
+**Decisions:**
+
+- **5 fixtures, not 15.** RECAP.md §11.3 lists 15 (5 read-only,
+  5 write, 3 error-recovered, 2 cross-day) as the eventual
+  coverage target; §12 roadmap pins M4.1 at "5 fixtures". The
+  remaining 10 land with their respective milestones — `errors`
+  surfacing requires the `failure_events` table (M4.x), cross-
+  day requires `/recap day` / `/recap range` (M4.3). Shipping 5
+  now beats stalling on tables that don't exist.
+- **Fixture seeds, not transcript YAML.** The pre-existing
+  `evals/smoke/*.yaml` format runs against a real provider; recap
+  has no provider call to make (projection is pure SQL + render
+  is a template). TypeScript fixtures with explicit `id` /
+  `createdAt` keep the seeds programmable, type-safe, and
+  byte-deterministic — critical for golden comparison.
+- **Goldens checked in.** A test-time generation pattern (compute
+  golden in `beforeAll` and never commit) would skip the
+  semantic-review benefit: a reviewer can read
+  `evals/recap/golden/03-with-decisions.human.md` and immediately
+  see "yes, this is what a human reading the recap should see".
+  The cost is that genuine renderer changes regenerate the
+  goldens; that diff is exactly the artifact a PR reviewer wants
+  to see anyway.
+- **CI guard against `UPDATE_GOLDENS=1` leaking into trunk.** A
+  developer leaving the env var exported in their shell is the
+  realistic failure mode; the test fires only when `CI=true` so
+  local update flows aren't blocked.
+- **No `pr` / `changelog` goldens yet.** RECAP.md §11.3 requests
+  goldens for `pr` and `changelog`; both renderers are M4.2 work
+  (LLM-driven). Slice (d) ships only the M4.1-shipped renderers
+  (`human`, `json`); the new renderers add their own golden
+  columns when they land.
+
+**Pending → M4.2:**
+
+- LLM render path with Haiku + schema enforcement.
+- `pr`, `changelog`, `slack`, `terse` renderers + their goldens.
+- `recap_cache` table (1h TTL) with `scope_hash` keying.
+- `recap_mini` schema for `/recap list` + the session picker.
+
+**Pending → M4.3:**
+
+- `/recap day`, `/recap range` cross-session scopes.
+- `--all-projects` flag + cross-project guards.
+- `/recap pre-compact` integration with Context Engine.
+- Error-recovery + cross-day fixtures (require `failure_events`
+  table + cross-day scope).
+
+**Pending → follow-ups (any milestone):**
+
+- `linesAdded` / `linesRemoved` / `filesAffected` populated via
+  `git diff` against `checkpoints.git_ref`.
+- `--out <path>`, `--limit <N>`, `--anonymize` slash flags.
+- `/recap audit` view backed by `listRecentRecapRuns`.
+
+**Verification:** `bun test` 3796 pass / 0 fail / 10 skip ·
+`bun run typecheck` clean · `bun run lint` clean
+(pre-existing `tests/harness/abortable.test.ts` warning unchanged).
+
+**Next:** M4.1 is complete on this branch (slices a + b + c + d).
+Branch ready for PR against develop. M4.2 work continues on a
+fresh branch.
+
+---
+
+## [2026-05-08] m4/recap slice (c) — `/recap` slash command surface
+
+Same branch (`feat/m4-recap`). Slice (a) projection + slice (b)
+renderers wired into the REPL. The slash command is the operator-
+facing front door for the recap subsystem: it resolves scope from
+arguments, runs the projection, picks a renderer, audits the run.
+
+**Done:**
+
+- **`src/cli/slash/commands/recap.ts`** — `recapCommand` registered
+  in the builtin registry between `/sessions` and `/subagents`.
+  Parses args via a pure `parseRecapArgs` helper (no DB, no ctx) so
+  the parser is unit-testable in isolation from the executor.
+  Subcommand vocabulary shipped in slice (c):
+  - `/recap` — current session, human render, last 10 steps
+  - `/recap last <N>` — current session, human render, last N steps
+  - `/recap session <id>` — specific session, human render, full
+  - `/recap json` — current session, intermediate raw
+  - `/recap json session <id>` — specific session, intermediate raw
+- **Future subcommands surface "not yet available" with the
+  blocking milestone.** RECAP.md §1 lists `pr`, `changelog`,
+  `slack`, `terse` (M4.2 — needs LLM render), `day`, `range` (M4.3
+  — cross-session), `pre-compact` (M4.3 — needs Context Engine),
+  `list` (M4.2 — needs `recap_mini` cache). Operator typing any of
+  these gets a one-line error naming the milestone, not a silent
+  no-op or a generic "unknown command" hint.
+- **Audit row per invocation.** Every successful `/recap` writes
+  one `recap_runs` row with the resolved scope kind, the literal
+  session ids the projection touched, the renderer name, and
+  `usedLlm:false` (always, in M4.1). Parse errors and projection
+  failures (unknown session id) DO NOT write a row — those never
+  consumed audit-worthy resources, and recording them would inflate
+  the anomaly-detection signal.
+- **Bus output via `notes`.** Each line of the rendered markdown /
+  JSON becomes one `info` event in scrollback. The renderer's
+  trailing newline is dropped before splitting so consumers don't
+  see a phantom blank line.
+- **17 tests in `tests/cli/slash/commands/recap.test.ts`.** Bare
+  invocation requires active session; human render shape; json
+  render parses back; specific-session targeting (and verifies
+  current session is NOT mixed in); json+session combo; `last <N>`
+  truncation; audit row recording (success path, parse-error path,
+  projection-error path); `last` argument validation (missing,
+  non-numeric, zero); `session` missing id; future-subcommand
+  hints (M4.2 vs M4.3 messages); unknown subcommand hint; trailing
+  garbage rejection.
+- **Registry tests updated.** Builtin count is 14 (was 13); `/help`
+  notes count is 17 (was 16). The new entry sits in the registration
+  order between `sessions` and `subagents` so its slot in `/help`
+  is predictable.
+
+**Decisions:**
+
+- **Subcommand grammar: `[json] [session <id> | last <N>]`.** The
+  `json` token is a renderer override that may appear before any
+  scope token. This keeps the most common form (`/recap`) terse
+  while letting `/recap json session <id>` chain naturally. The
+  alternative — separate `recapJson` command — would have been
+  flatter but inflates `/help` and forces operators to learn two
+  command names for the same subsystem.
+- **Audit on success only, never on parse / projection error.**
+  RECAP.md §6.3 calls `recap_runs` an anomaly surface ("script
+  generating recaps in a tight loop, unexpected cross-project
+  run"). A typo at the prompt should not look the same as a real
+  recap in that table — keeping it success-only preserves the
+  signal-to-noise ratio of the anomaly query.
+- **`/recap session ghost` returns an error WITH the projection's
+  reason.** The projection throws "session ghost not found" and
+  the slash command prefixes `/recap: ` and surfaces it. We could
+  have swallowed the technical detail behind a generic message;
+  the projection's wording IS the actionable detail (operator
+  knows the id was bad, not that the system is broken).
+- **`/recap last <N>` validates as positive integer.** `0` and
+  negative values are explicit errors; matches the same `/sessions
+  <limit>` discipline. Anything else (`abc`, `1.5`) fails fast.
+- **Future-renderer messages cite the milestone.** "M4.2" /
+  "M4.3" lands literally in the error string so an operator
+  spelunking through commits / spec can trace exactly when their
+  request lands. The literal token is also the audit anchor when
+  someone reports "I tried /recap pr and got an error".
+
+**Pending:**
+
+- Slice (d) — eval smoke fixtures (5 sessions, golden outputs;
+  PR-blocking fidelity per RECAP.md §11.3).
+- M4.2 — LLM render path with Haiku + schema enforcement, plus
+  `pr` / `changelog` / `slack` / `terse` renderers and
+  `recap_cache` table.
+- M4.3 — `/recap day`, `/recap range` cross-session scopes;
+  `/recap pre-compact` integration with Context Engine; cross-
+  project guards (`--all-projects` flag).
+- **Flags `--out <path>`, `--limit <N>`, `--anonymize`.** RECAP.md
+  §1 lists universal flags; not parsed in slice (c). The slash
+  surface today emits inline; an `--out` writer would also need
+  to coexist with the `notes` channel cleanly. Follow-up.
+
+**Verification:** `bun test` 3785 pass / 0 fail / 10 skip ·
+`bun run typecheck` clean · `bun run lint` clean
+(pre-existing `tests/harness/abortable.test.ts` warning unchanged).
+
+**Next:** slice (d) eval smoke. Same branch.
+
+---
+
+## [2026-05-08] m4/recap slice (b) — deterministic human + json renderers
+
+Same branch (`feat/m4-recap`), continuation of M4.1. Slice (a) landed
+the projection (SQLite → `RecapIntermediate`); slice (b) wraps the
+intermediate in markdown for humans and indented JSON for tooling.
+Both are deterministic and template-based — no LLM (LLM render is
+M4.2's job). The privacy guarantee from RECAP.md §6.2 (rewrite
+`$HOME` paths to `~/...`) lives at the renderer boundary so the json
+view stays literal for audit consumers while the human view stays
+shareable.
+
+**Done:**
+
+- **`src/recap/render.ts`** — `renderJson`, `renderHuman`,
+  `renderRecap` dispatcher. `renderJson` is a 2-space-indented
+  `JSON.stringify` of the intermediate (RECAP.md §4.5: "intermediate
+  cru, consumível por scripts; sem LLM, sem rendering"). `renderHuman`
+  emits structural sections (Goal, What changed, Files edited, Tests,
+  Decisions, Subagents, Not done, Open questions, Memory proposed,
+  Cost) — empty sections are omitted entirely (no "0 files edited"
+  noise). Cost section is always present so consumers can pin its
+  presence.
+- **Privacy: `$HOME` rewrite at the human renderer boundary.** Default
+  on; `anonymizePaths: false` opt-out for debug. JSON renderer is
+  always literal (audit consumers need the real path). Override for
+  tests via `home: '/home/lex'`.
+- **ANSI strip on untrusted strings.** Goals, commands, subagent
+  summaries, and questions pass through `stripAnsi` before rendering
+  — same defense the TUI applies on render. A mis-quoted tool result
+  containing escapes can never poison the markdown.
+- **Helpers: `formatDuration`, `formatUsd`, `formatTokens`,
+  `formatPct`, `shortStep`, `truncate`, `oneLine`.** All pure / fully
+  deterministic. `shortStep` mirrors git's abbreviated-sha convention
+  (first 7 chars of UUID) so an operator reading the recap can pivot
+  back to the audit DB by prefix-match.
+- **17 tests in `tests/recap/render.test.ts`.** Empty intermediate;
+  full populated intermediate (asserts every section); path
+  anonymization on/off; failed-test marker; incomplete-session
+  callout; conditional sections (open questions, not done, memory
+  proposed) only render when populated; day-scope and range-scope
+  labels; ANSI stripping on goals + commands; byte-identical
+  determinism; dispatcher delegation.
+
+**Decisions:**
+
+- **Drop the prose `Resumo` section in M4.1 entirely.** RECAP.md §4.1
+  shows a "Resumo (2-3 linhas, gerado por LLM)" block. With no LLM
+  in M4.1, the deterministic alternative was either (a) a stubbed
+  count-based one-liner ("3 files edited, 5 commands run, 1 test
+  passed") or (b) skip the section. Picked (b) — the count-summary
+  duplicates "What changed" and the cost line, adds noise without
+  adding signal. M4.2's LLM renderer will fill the slot with real
+  prose.
+- **Empty sections are omitted, not stubbed.** A "## Decisions"
+  followed by nothing teaches the reader to ignore section headers,
+  which dilutes the ones that DO matter. The empty-intermediate test
+  asserts the negative — `## What changed`, `## Decisions`, `## Tests`
+  must NOT appear when their underlying arrays are empty.
+- **Cost section is always present.** Counts may be zero, but pinning
+  its presence avoids consumers having to detect "did the renderer
+  omit cost on accident". Failure mode of an absent cost block is
+  subtle (operator overlooks zero-cost runs); failure mode of always-
+  present is loud (you see `$0.00`).
+- **Token formatting buckets at 1k / 100k.** `< 1000` = literal;
+  `< 100k` = `12.4k`; otherwise `Math.round(/1000)k`. Avoids the
+  `12345 in / 678 out` line being unreadable while keeping resolution
+  where it matters for typical sessions.
+- **`$HOME` anonymization is renderer-side, not projection-side.** The
+  spec calls anonymization a renderer concern (§6.2: "Path absoluto
+  com username é anonimizado em renderers"). Doing it in projection
+  would corrupt the audit JSON which legitimately needs the literal
+  path; doing it in the human renderer keeps the two surfaces
+  separate.
+
+**Pending:**
+
+- Slice (c) — slash commands `/recap`, `/recap session <id>`,
+  `/recap json` wired into the existing slash registry.
+- Slice (d) — eval smoke fixtures (5 sessions, golden outputs;
+  PR-blocking fidelity per RECAP.md §11.3).
+- **Diff-aware lines added/removed.** Still pending from slice (a) —
+  rendering shows the path of edited files but not the line delta.
+  Same follow-up as before; renderer is ready to consume the deltas
+  the moment projection populates them.
+- **Renderers `pr`, `changelog`, `slack`, `terse` (RECAP.md §4.2-4.6).**
+  M4.2 work; deferred until LLM render path lands. The deterministic
+  shape from slice (b) is the template the LLM will fill.
+
+**Verification:** `bun test` 3768 pass / 0 fail / 10 skip ·
+`bun run typecheck` clean · `bun run lint` clean (the pre-existing
+`tests/harness/abortable.test.ts` warning predates this branch).
+
+**Next:** slice (c) wires the renderers + projection into the REPL
+slash command surface. Same branch.
+
+---
+
+## [2026-05-08] m4/recap slice (a) — projection + schema + recap_runs repo
+
+Branch `feat/m4-recap` off `develop`. First slice of M4.1 (RECAP.md
+§12). Recap is a *projected view* over SQLite — deterministic by
+design, schema-bound, no LLM in the critical path. Slice (a) lands
+the projection layer + audit table; renderers (slice b), slash
+commands (slice c), and eval smoke (slice d) follow on the same
+branch.
+
+**Done:**
+
+- **Migration 030 — `recap_runs`.** Audit table for `/recap`
+  invocations themselves (RECAP.md §6.3). Captures `scope_kind`
+  (CHECK-bound to the §3 vocabulary), `session_ids` (JSON array;
+  cardinality 1 for session_*/pre_compact, N for day/range),
+  `renderer`, `used_llm`, `output_path`, `created_at`. No FK on
+  `session_ids` — a recap that referenced a since-purged session
+  is still a real historical event we want to keep. Indexed on
+  `created_at DESC` for the dominant "most recent runs" query.
+- **Repo `src/storage/repos/recap-runs.ts`.** `recordRecapRun`,
+  `getRecapRun`, `listRecentRecapRuns(limit=50)`. Defensive parse
+  on `session_ids` JSON: malformed payload surfaces as `[]` (mirrors
+  `subagent-outputs.ts:58-69` pattern) so audit listings cannot
+  crash on corruption.
+- **Type schema `src/recap/types.ts`.** Full `RecapIntermediate`
+  per RECAP.md §3 — every field always present (empty arrays /
+  empty strings on absence; the spec line "ausência viola schema"
+  is a hard rule). `RECAP_SCHEMA_VERSION = 'v1'` exported as a
+  pinning anchor for future producer/consumer skew detection.
+- **Projection function `src/recap/projection.ts`.** Pure
+  `(db, scope) → RecapIntermediate`. Resolves `session_current`,
+  `session_specific`, `pre_compact`, `day`, `range`. Aggregates from
+  the tables that exist today (sessions, messages, tool_calls,
+  approvals, checkpoints, subagent_outputs, memory_events) and
+  emits `[]` for fields whose source tables are not yet built
+  (`goal_stack`, `pinned_context`, `errors` from `failure_events`,
+  `not_done` from playbook reports). The shape is fixed today so
+  consumers can pin against it.
+- **Test coverage.** `tests/storage/recap-runs.test.ts` (6 tests):
+  insert/read, JSON round-trip, listing order/cap, CHECK rejection,
+  used_llm round-trip, defensive corruption parse.
+  `tests/recap/projection.test.ts` (19 tests): empty session shape,
+  goal extraction, files_read/written aggregation, commands_run,
+  incomplete-session flag, finalized session, decision filtering
+  (user/hook surface; policy auto-allow filtered; explicit denies
+  surface), test-runner heuristic, token/cost aggregation,
+  checkpoints, subagent children with payload summary,
+  `memory_events.action='proposed'` projection, trailing-question
+  extraction, determinism (same input → same output), day-window
+  filter, range-window filter, multi-model blank, step-limit
+  truncation in `session_current`, error paths (unknown session,
+  malformed date).
+
+**Decisions:**
+
+- **`recap_cache` deferred to slice / milestone M4.2.** Spec §8.3
+  designs cache keyed on `scope_hash`. Cache only earns its keep
+  when there's a slow path to amortize — that is the LLM renderer
+  (M4.2). M4.1's deterministic renderer is ~10ms; caching it adds
+  invalidation surface without latency win. Migration is a one-line
+  add when M4.2 lands.
+- **`/recap pre-compact` accepted as scope discriminator now,
+  wired later.** §3 schema includes `pre_compact` in the
+  `scope.kind` enum. Plumbing the value through projection today
+  is a no-cost shape preservation — the actual pre-compact view
+  needs Context Engine integration which lives elsewhere.
+- **`unresolvedQuestions` extracted via trailing-`?` heuristic.**
+  Spec §3 says "extraídas de assistant messages com explicit `?`".
+  Implemented as: walk text blocks of assistant messages, split on
+  sentence terminators, surface trailing-`?` segments. Bounded
+  3-per-message / 5-per-scope so a brainstorm turn cannot bloat the
+  schema-bound array. Conservative on purpose — false positives
+  pollute the recap; renderers cannot un-show them.
+- **`linesAdded` / `linesRemoved` / `filesAffected` emit 0 for now.**
+  Computing real line deltas requires `git diff` against
+  `checkpoints.git_ref`, which means external system access in the
+  projection path. Out of scope for slice (a) — the schema field
+  stays present (per §3 "always-present" rule) so consumers can
+  pin shape today. A follow-up wires the diff.
+- **Decisions filter: `user` + `hook` + explicit `deny`.** Pure
+  policy auto-allows are not decisions in the human sense — the
+  rule fired, no choice was made. Policy-driven *denies* DO
+  surface (a refused tool call is a meaningful negative decision
+  worth audit). User and hook approvals always surface regardless
+  of decision value (allow / deny / confirm_*).
+- **Test runner heuristic: explicit allowlist of patterns.** Match
+  the head of the command line (after trimStart + first-line slice)
+  against `bun test`, `npm/pnpm/yarn test`, `jest`, `vitest`,
+  `pytest`, `cargo test`, `go test`, `mvn test`, `gradle test`. A
+  missed runner shows up under `commands_run` anyway; a false
+  positive lies to the reader about what validated the change.
+
+**Pending:**
+
+- Slice (b) — renderers `human` + `json` (deterministic
+  template-based; LLM render is M4.2).
+- Slice (c) — slash commands `/recap`, `/recap session <id>`,
+  `/recap json`.
+- Slice (d) — eval smoke fixtures (5 sessions, golden outputs;
+  PR-blocking fidelity per RECAP.md §11.3).
+- **Diff-aware `linesAdded` / `linesRemoved`.** Wire `git diff`
+  against `checkpoints.git_ref` so the renderer can show real
+  deltas. Follow-up on this branch or a successor.
+- **Spec amendment for `recap_cache` deferral.** Optional spec PR
+  noting that M4.2 owns the cache table, not M4.1. Low-priority —
+  the §12 roadmap already implies this ordering.
+
+**Next:** slice (b) renderers, same branch. Determinism test
+fixtures from slice (a) feed the golden-output tests.
+
+**Verification:** `bun test` 3751 pass / 0 fail / 10 skip ·
+`bun run typecheck` clean · `bun run lint` clean (the one
+pre-existing `tests/harness/abortable.test.ts` suppression
+warning predates this branch).
+
+---
+
 ## [2026-05-07] "Awaiting model" indicator + heartbeat tick during quiet provider waits
 
 Operator-reported follow-up to the non-done bypass: even with the

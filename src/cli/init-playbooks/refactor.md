@@ -53,7 +53,6 @@ budget:
 slash: refactor
 when_to_use: "semantics-preserving change requested with declared scope; cleanup/rename/extract with existing tests that must keep passing"
 sampling:
-  temperature: 0.1
   max_tokens: 4096
 context_recipe:
   clarify_mode: pre_execution

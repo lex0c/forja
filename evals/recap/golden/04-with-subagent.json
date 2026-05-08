@@ -1,0 +1,76 @@
+{
+  "schemaVersion": "v1",
+  "generatedAt": 350000,
+  "scope": {
+    "kind": "session_specific",
+    "sessionIds": [
+      "a4000001-0000-0000-0000-000000000000"
+    ],
+    "range": {
+      "start": 0,
+      "end": 0
+    }
+  },
+  "completeness": {
+    "incomplete": false,
+    "incompleteSessions": [],
+    "incompleteReason": ""
+  },
+  "goal": {
+    "text": "analyze the queue retry tests for flakiness using a subagent",
+    "sourceStepId": "a4000100-0000-0000-0000-000000000000"
+  },
+  "goalStack": [],
+  "decisions": [],
+  "pinnedContext": [],
+  "actions": {
+    "filesRead": [],
+    "filesWritten": [],
+    "commandsRun": [],
+    "webFetches": [],
+    "subagentsSpawned": [
+      {
+        "name": "a4000002-0000-0000-0000-000000000000",
+        "status": "done",
+        "outputSummary": "no flake patterns in tests/queue/backoff.test.ts; 5/5 pass"
+      }
+    ]
+  },
+  "outcomes": {
+    "testsRun": [],
+    "checkpoints": [],
+    "artifacts": []
+  },
+  "timeline": [
+    {
+      "ts": 300000,
+      "event": "session_start",
+      "detail": "a4000001-0000-0000-0000-000000000000"
+    },
+    {
+      "ts": 300400,
+      "event": "subagent_spawned",
+      "detail": "a4000002-0000-0000-0000-000000000000"
+    },
+    {
+      "ts": 305000,
+      "event": "session_end",
+      "detail": "a4000001-0000-0000-0000-000000000000 (done)"
+    }
+  ],
+  "costs": {
+    "tokens": {
+      "in": 2000,
+      "out": 90,
+      "cached": 1600
+    },
+    "usd": 0.008,
+    "durationMs": 5000,
+    "model": "sonnet-4-6",
+    "cacheHitRatio": 0.8
+  },
+  "errors": [],
+  "notDone": [],
+  "unresolvedQuestions": [],
+  "memoryProposed": []
+}

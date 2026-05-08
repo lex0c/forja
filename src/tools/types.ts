@@ -382,6 +382,14 @@ export type SpawnSubagentResult =
       // layer, etc.) so postmortem queries don't get false
       // attribution.
       cancelSource?: 'model' | 'cap_watchdog' | 'parent_drain';
+      // Free-form diagnostic detail forwarded from the child's
+      // `HarnessResult.detail` across IPC. Carries the actual
+      // cause of a non-`done` exit (e.g. provider error message
+      // for `reason='providerError'`) so `task` / `task_await`
+      // can append it to their tool-error string instead of
+      // surfacing the bare categorical reason. Absent for
+      // success and for failure paths with no extra text.
+      detail?: string;
     };
 
 export interface Tool<I = unknown, O = unknown> {

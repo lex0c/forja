@@ -217,7 +217,14 @@ export const taskAwaitTool: Tool<TaskAwaitInput, TaskAwaitOutput> = {
     // errors so the model sees the failure clearly. Same shape
     // as `task` does.
     if (result.status !== 'done') {
-      const detail = `subagent exited with status='${result.status}', reason='${result.reason}'`;
+      // Append the child's diagnostic `detail` when the runtime
+      // forwarded one. Mirrors the same widening in `task.ts`;
+      // both surfaces (sync `task` and async `task_await`) need
+      // the cause text or the operator's TUI chip falls back to
+      // a bare categorical `reason`.
+      const causeSuffix =
+        result.detail !== undefined && result.detail.length > 0 ? `: ${result.detail}` : '';
+      const detail = `subagent exited with status='${result.status}', reason='${result.reason}'${causeSuffix}`;
       return toolError('subagent.run_failed', detail, {
         retryable: result.status === 'exhausted',
         details: {

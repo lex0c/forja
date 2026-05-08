@@ -116,6 +116,11 @@ describe('invokeTool', () => {
     expect(inv.toolResult.is_error).toBe(true);
     expect(inv.toolResult.content).toContain('unknown tool: nope');
     expect(inv.toolCallId).toBe('');
+    // errorMessage carries the same human-readable cause the TUI
+    // surfaces on the `└─` connector. Denied paths leave it absent
+    // (their reason flows via decision.reason → summary instead).
+    expect(inv.errorMessage).toBe('unknown tool: nope');
+    expect(inv.denied).toBeUndefined();
   });
 
   test('deny: records approval, finishes as denied, error tool_result', async () => {
@@ -336,9 +341,39 @@ describe('invokeTool', () => {
     expect(inv.toolResult.is_error).toBe(true);
     const parsed = JSON.parse(inv.toolResult.content) as Record<string, unknown>;
     expect(parsed.error_code).toBe('test.intentional');
+    // errorMessage is the clean human-readable form the TUI uses;
+    // distinct from toolResult.content (JSON-stringified ToolError
+    // for the model to see structured data).
+    expect(inv.errorMessage).toBe('this tool always fails');
+    expect(inv.denied).toBeUndefined();
 
     const tc = getToolCall(db, inv.toolCallId);
     expect(tc?.status).toBe('error');
+  });
+
+  test('tool that throws: errorMessage carries the wrapped exception', async () => {
+    const deps = buildDeps(crashingTool);
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'crashes', args: {}, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(true);
+    expect(inv.errorMessage).toContain('tool crashed');
+    expect(inv.errorMessage).toContain('boom');
+    expect(inv.denied).toBeUndefined();
+  });
+
+  test('denied paths leave errorMessage absent (reason flows via decision)', async () => {
+    const deps = buildDeps(restrictedTool, {
+      tools: { write_file: { deny_paths: ['**'] } },
+    });
+    const inv = await invokeTool(
+      { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'x.ts' }, messageId },
+      deps,
+    );
+    expect(inv.failed).toBe(true);
+    expect(inv.denied).toBe(true);
+    expect(inv.errorMessage).toBeUndefined();
   });
 
   test('plan mode: blocks writes:true tools BEFORE policy + execute', async () => {

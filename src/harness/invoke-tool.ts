@@ -107,6 +107,14 @@ export interface InvokeToolResult {
   // the renderer/audit boundary — without this, a confirm-no looks
   // identical to a tool that errored AFTER the user said yes.
   denied?: boolean;
+  // Human-readable failure reason for non-denied error paths. Set on
+  // `failed:true && !denied` outcomes (unknown tool, ToolError
+  // returned by the body, exception caught by wrapException). Absent
+  // for success and for denied (denied surfaces its reason via
+  // `decision.reason` on the gating site, which the renderer routes
+  // through `summary` separately). The TUI uses this to show the
+  // failure cause on the `└─` connector instead of just the path.
+  errorMessage?: string;
 }
 
 const buildErrorBlock = (
@@ -185,16 +193,14 @@ export const invokeTool = async (
   const start = Date.now();
   const tool: Tool | null = deps.registry.get(input.toolName);
   if (tool === null) {
+    const errorMessage = `unknown tool: ${input.toolName}`;
     return {
-      toolResult: buildErrorBlock(
-        input.toolUseId,
-        input.toolName,
-        `unknown tool: ${input.toolName}`,
-      ),
+      toolResult: buildErrorBlock(input.toolUseId, input.toolName, errorMessage),
       toolCallId: '',
       durationMs: Date.now() - start,
       failed: true,
       decision: null,
+      errorMessage,
     };
   }
 
@@ -655,6 +661,7 @@ export const invokeTool = async (
       durationMs: duration,
       failed: true,
       decision,
+      errorMessage: err.error_message,
     };
   }
 

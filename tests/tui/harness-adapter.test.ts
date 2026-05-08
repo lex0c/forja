@@ -682,6 +682,78 @@ describe('harness-adapter — tool lifecycle', () => {
     expect(e.status).toBe('error');
   });
 
+  test('errorMessage on tool_finished surfaces as summary on tool:end', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'read_file',
+      args: { path: '/missing.txt' },
+    });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'read_file',
+      failed: true,
+      durationMs: 2,
+      errorMessage: 'ENOENT: no such file or directory',
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('error');
+    expect(e.summary).toBe('ENOENT: no such file or directory');
+  });
+
+  test('errorMessage absent on done outcomes leaves summary unset', () => {
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'read_file',
+      args: { path: '/ok.txt' },
+    });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'read_file',
+      failed: false,
+      durationMs: 1,
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('done');
+    expect(e.summary).toBeUndefined();
+  });
+
+  test('denied paths prefer decision.reason over errorMessage on summary', () => {
+    // Defense in depth: even if a misbehaving producer attached
+    // both `denied:true` and `errorMessage` to the same event, the
+    // adapter routes through the denied branch (decision.reason).
+    // errorMessage is meant for non-denied error paths only.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({
+      type: 'tool_invoking',
+      toolUseId: 't1',
+      toolName: 'bash',
+      args: { command: 'rm -rf /' },
+    });
+    a.translate({
+      type: 'tool_decided',
+      toolUseId: 't1',
+      decision: { kind: 'deny', reason: 'matched deny rule: rm -rf /*' },
+    });
+    const out = a.translate({
+      type: 'tool_finished',
+      toolUseId: 't1',
+      toolName: 'bash',
+      failed: true,
+      durationMs: 0,
+      denied: true,
+      errorMessage: 'should not appear',
+    });
+    const e = out[0] as Extract<UIEvent, { type: 'tool:end' }>;
+    expect(e.status).toBe('denied');
+    expect(e.summary).toBe('matched deny rule: rm -rf /*');
+  });
+
   test('tool_finished without prior decision → status from failed flag', () => {
     const a = createHarnessAdapter(baseCtx());
     a.translate({

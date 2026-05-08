@@ -62,6 +62,18 @@ export interface RunSubagentResult {
   // Undefined for every non-abort outcome; set explicitly when
   // the wire carried the resolution.
   abortCause?: 'soft' | 'hard';
+  // Free-form diagnostic detail forwarded from the child's
+  // `HarnessResult.detail`. Set by the child's harness on error
+  // / non-done paths to carry the actual cause (e.g.
+  // "AnthropicError 401 invalid x-api-key" for `providerError`,
+  // or the tool's own `error_message` for tool-budget
+  // exhaustion). Without this, parent-side consumers (task /
+  // task_await error strings, audit telemetry) only see the
+  // categorical `reason` code and the operator has to grep audit
+  // logs to learn what actually went wrong. Absent for
+  // successful runs and for failure paths that have no extra
+  // text to add (e.g. `aborted` carries `abortCause` instead).
+  detail?: string;
 }
 
 // Convert the child's payload envelope into a strongly-typed
@@ -171,6 +183,13 @@ export const buildResultFromPayload = (
   const rawAbort = payload.abort_cause;
   const abortCause: 'soft' | 'hard' | undefined =
     reason === 'aborted' && (rawAbort === 'soft' || rawAbort === 'hard') ? rawAbort : undefined;
+  // Defensive parse: only accept a non-empty string as detail.
+  // A child publishing `detail: null` / `detail: 0` / `detail: ""`
+  // is treated as "no detail" — the parent's downstream consumers
+  // (error string concatenation, audit) would otherwise render
+  // confusing artifacts like "reason='providerError': null".
+  const rawDetail = payload.detail;
+  const detail = typeof rawDetail === 'string' && rawDetail.length > 0 ? rawDetail : undefined;
   return {
     output: typeof payload.output === 'string' ? payload.output : '',
     sessionId,
@@ -180,6 +199,7 @@ export const buildResultFromPayload = (
     steps: typeof payload.steps === 'number' ? payload.steps : 0,
     durationMs: typeof payload.duration_ms === 'number' ? payload.duration_ms : 0,
     ...(abortCause !== undefined ? { abortCause } : {}),
+    ...(detail !== undefined ? { detail } : {}),
   };
 };
 
@@ -207,6 +227,10 @@ export interface SubagentEnvelope {
   // tool-facing envelope; mirrors the camelCased
   // `RunSubagentResult.abortCause`. Absent for non-abort outcomes.
   abort_cause?: 'soft' | 'hard';
+  // Free-form diagnostic detail. Snake_cased for the tool-
+  // facing envelope; mirrors `RunSubagentResult.detail`. Absent
+  // for successful / detail-less outcomes.
+  detail?: string;
 }
 
 export const toEnvelope = (result: RunSubagentResult): SubagentEnvelope => ({
@@ -218,4 +242,5 @@ export const toEnvelope = (result: RunSubagentResult): SubagentEnvelope => ({
   steps: result.steps,
   duration_ms: result.durationMs,
   ...(result.abortCause !== undefined ? { abort_cause: result.abortCause } : {}),
+  ...(result.detail !== undefined ? { detail: result.detail } : {}),
 });

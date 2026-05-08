@@ -2053,6 +2053,69 @@ describe('runSubagent — orchestration', () => {
     expect(result.status).toBe('done');
   });
 
+  test('buildResultFromPayload picks up `detail` from the child envelope', async () => {
+    const { buildResultFromPayload } = await import('../../src/subagents/result-builder.ts');
+    const result = buildResultFromPayload(
+      {
+        status: 'error',
+        reason: 'providerError',
+        output: '',
+        cost_usd: 0,
+        steps: 0,
+        duration_ms: 5,
+        detail: 'AnthropicError 401 invalid x-api-key',
+      },
+      'sess-1',
+    );
+    expect(result.status).toBe('error');
+    expect(result.reason).toBe('providerError');
+    expect(result.detail).toBe('AnthropicError 401 invalid x-api-key');
+  });
+
+  test('buildResultFromPayload defensively drops empty / non-string `detail`', async () => {
+    const { buildResultFromPayload } = await import('../../src/subagents/result-builder.ts');
+    // Empty string falls through (consumers concatenating `: ${detail}`
+    // would otherwise render a trailing colon-space artifact).
+    expect(
+      buildResultFromPayload({ status: 'error', reason: 'providerError', detail: '' }, 'sess-1')
+        .detail,
+    ).toBeUndefined();
+    // Wrong type collapses to absent — protects downstream
+    // string concatenation from "[object Object]" / "null".
+    expect(
+      buildResultFromPayload({ status: 'error', reason: 'providerError', detail: 42 }, 'sess-1')
+        .detail,
+    ).toBeUndefined();
+    expect(
+      buildResultFromPayload({ status: 'error', reason: 'providerError', detail: null }, 'sess-1')
+        .detail,
+    ).toBeUndefined();
+  });
+
+  test('toEnvelope round-trips `detail` when present, omits when absent', async () => {
+    const { buildResultFromPayload, toEnvelope } = await import(
+      '../../src/subagents/result-builder.ts'
+    );
+    const withDetail = buildResultFromPayload(
+      {
+        status: 'error',
+        reason: 'providerError',
+        detail: 'connection reset by peer',
+      },
+      'sess-1',
+    );
+    expect(toEnvelope(withDetail).detail).toBe('connection reset by peer');
+
+    const withoutDetail = buildResultFromPayload(
+      { status: 'done', reason: 'done', output: 'ok' },
+      'sess-2',
+    );
+    expect(toEnvelope(withoutDetail).detail).toBeUndefined();
+    // Property MUST be absent (not `undefined`) so JSON.stringify
+    // produces a clean envelope without phantom `"detail":null`.
+    expect(Object.hasOwn(toEnvelope(withoutDetail), 'detail')).toBe(false);
+  });
+
   test('toEnvelope mirrors result fields', async () => {
     const parent = (await import('../../src/storage/repos/sessions.ts')).createSession(db, {
       model: 'mock/m',

@@ -511,6 +511,42 @@ describe('formatPermanent', () => {
       expect(out[2]).toBe(pad('└─ rm -rf /tmp/x'));
     });
 
+    test('error with summary appends reason as `subject: summary`', () => {
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'read_file',
+          verb: 'Read file',
+          subject: '/proj/missing.txt',
+          status: 'error',
+          durationMs: 2,
+          summary: 'ENOENT: no such file or directory',
+        },
+        unicode,
+      );
+      expect(out[1]).toContain('Failed in 2ms');
+      expect(out[2]).toBe(pad('└─ /proj/missing.txt: ENOENT: no such file or directory'));
+    });
+
+    test('error with summary but no subject falls back to summary alone', () => {
+      // todo_write has no vocab subject. An error there should still
+      // surface the cause on the connector instead of dropping it.
+      const out = formatPermanent(
+        {
+          kind: 'tool-end',
+          name: 'todo_write',
+          verb: 'Updated todos',
+          subject: null,
+          status: 'error',
+          durationMs: 1,
+          summary: 'todo list serialization failed',
+        },
+        unicode,
+      );
+      expect(out[1]).toContain('Failed in 1ms');
+      expect(out[2]).toBe(pad('└─ todo list serialization failed'));
+    });
+
     test('denied status overrides verb to "Denied"', () => {
       const out = formatPermanent(
         {

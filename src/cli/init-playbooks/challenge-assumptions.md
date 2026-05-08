@@ -8,7 +8,6 @@ budget:
 slash: challenge
 when_to_use: "decision/plan with high confidence + weak evidence; reasoning that uses 'obviously', 'we can always do it later', or ignores obvious options (do nothing, buy, deprecate)"
 sampling:
-  temperature: 0.3
   max_tokens: 4096
   thinking_budget: 4000
 prompt_version: 1

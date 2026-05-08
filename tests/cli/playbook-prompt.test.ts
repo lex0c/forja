@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   MAX_PLAYBOOK_TABLE_ROWS,
   PLAYBOOK_DELEGATION_PREAMBLE,
+  PLAYBOOK_WORKFLOW_HEADER,
   composeWithPlaybookHint,
 } from '../../src/cli/playbook-prompt.ts';
 import type { SubagentSet } from '../../src/subagents/load.ts';
@@ -219,5 +220,129 @@ describe('composeWithPlaybookHint — scope precedence does not perturb the tabl
     // No scope leak into the rendered table:
     expect(out).not.toContain('project');
     expect(out).not.toContain('user-scope');
+  });
+});
+
+describe('PLAYBOOK_WORKFLOW_HEADER', () => {
+  test('teaches decomposition before action', () => {
+    expect(PLAYBOOK_WORKFLOW_HEADER.toLowerCase()).toContain('decomposition');
+    expect(PLAYBOOK_WORKFLOW_HEADER).toMatch(/name the discrete sub-problems/i);
+  });
+
+  test('gates decomposition on multi-file / multi-surface scope', () => {
+    // Without an explicit scope threshold, the model over-applies
+    // decomposition to trivial changes (every typo fix becomes a
+    // planning exercise). The threshold language ("multiple
+    // files", "verification surfaces") gives the model something
+    // to apply mechanically.
+    expect(PLAYBOOK_WORKFLOW_HEADER).toMatch(/multiple files/i);
+    expect(PLAYBOOK_WORKFLOW_HEADER).toMatch(/verification surfaces/i);
+  });
+
+  test('explicitly excludes trivial changes from the decomposition rule', () => {
+    // The negative side of the threshold matters more than the
+    // positive: without an exemption clause, the model treats
+    // any prompt with two verbs as "multi-step" and decomposes
+    // a one-line CSS fix.
+    expect(PLAYBOOK_WORKFLOW_HEADER).toMatch(/Trivial changes/i);
+    expect(PLAYBOOK_WORKFLOW_HEADER).toMatch(/skip this/i);
+  });
+
+  test('frames each delegation as self-contained', () => {
+    // Without this discipline, the model assumes the subagent
+    // shares its memory of the conversation; in practice the
+    // child runs in an isolated context. The hint must remind
+    // the model to inline goal + constraints.
+    expect(PLAYBOOK_WORKFLOW_HEADER).toMatch(/self-contained/i);
+    expect(PLAYBOOK_WORKFLOW_HEADER).toMatch(/zero context/i);
+  });
+
+  test('cites both task_async and task_sync as fan-out vs sequential', () => {
+    expect(PLAYBOOK_WORKFLOW_HEADER).toContain('task_async');
+    expect(PLAYBOOK_WORKFLOW_HEADER).toContain('task_sync');
+  });
+});
+
+describe('composeWithPlaybookHint — workflow + closing-review block', () => {
+  test('workflow header is appended after the table', () => {
+    const set = makeSet([makeDef('refactor', 'apply scope-bounded mutations')]);
+    const out = composeWithPlaybookHint(undefined, set) ?? '';
+    const tableIdx = out.indexOf('| name | when_to_use |');
+    const workflowIdx = out.indexOf('**Workflow:**');
+    expect(tableIdx).toBeGreaterThan(0);
+    expect(workflowIdx).toBeGreaterThan(tableIdx);
+  });
+
+  test('closing-review bullet cites both code-review and security-audit when both loaded', () => {
+    const set = makeSet([
+      makeDef('code-review', 'gate diff before merge'),
+      makeDef('security-audit', 'scan changes for vuln surface'),
+      makeDef('refactor', 'apply scope-bounded mutations'),
+    ]);
+    const out = composeWithPlaybookHint(undefined, set) ?? '';
+    expect(out).toMatch(/consider closing with `code-review` and `security-audit`/);
+  });
+
+  test('closing-review is phrased as a suggestion, not a prescription', () => {
+    // "Consider" + "skip for trivial" is the load-bearing softening
+    // that prevents reflexive review on doc-only / single-line
+    // changes. Mandatory phrasing ("run before declaring done")
+    // produces over-ritual; the suggestion gate keeps the cost
+    // (~$0.002 + 3-5s per child) proportional to actual risk.
+    const set = makeSet([
+      makeDef('code-review', 'gate diff before merge'),
+      makeDef('security-audit', 'scan changes for vuln surface'),
+    ]);
+    const out = composeWithPlaybookHint(undefined, set) ?? '';
+    expect(out).toMatch(/consider closing with/i);
+    expect(out).toMatch(/Skip for docs, comments, config tweaks/i);
+    // Negative: must not read as a hard prescription.
+    expect(out).not.toMatch(/^- Before declaring the work done, run/im);
+  });
+
+  test('closing-review bullet falls back to single name when only one is loaded', () => {
+    const set = makeSet([
+      makeDef('code-review', 'gate diff before merge'),
+      makeDef('refactor', 'apply scope-bounded mutations'),
+    ]);
+    const out = composeWithPlaybookHint(undefined, set) ?? '';
+    expect(out).toMatch(/consider closing with `code-review` before/);
+    // Singular grammar: when only one peer is cited, the
+    // following sentence must not say "Both are read-only".
+    expect(out).toMatch(/It is read-only/);
+    expect(out).not.toMatch(/Both are read-only/);
+    // Negative: the missing peer must not appear inside the
+    // closing bullet itself. (The preamble cites
+    // `security-audit` as an example of bias-driven delegation,
+    // which is fine; we scope the negative assertion to the
+    // bullet's slice of the rendered string.)
+    const closingIdx = out.indexOf('consider closing with');
+    expect(closingIdx).toBeGreaterThan(0);
+    const closingSlice = out.slice(closingIdx);
+    expect(closingSlice).not.toContain('security-audit');
+  });
+
+  test('closing-review bullet absent when neither review playbook is loaded', () => {
+    const set = makeSet([
+      makeDef('refactor', 'apply scope-bounded mutations'),
+      makeDef('debug', 'reproduce + isolate root cause'),
+    ]);
+    const out = composeWithPlaybookHint(undefined, set) ?? '';
+    // Workflow header still renders (decomposition is universal);
+    // only the closing-review bullet drops out.
+    expect(out).toContain(PLAYBOOK_WORKFLOW_HEADER);
+    expect(out).not.toMatch(/consider closing with/i);
+  });
+
+  test('closing-review bullet position: after the workflow header', () => {
+    const set = makeSet([
+      makeDef('code-review', 'gate diff before merge'),
+      makeDef('security-audit', 'scan changes for vuln surface'),
+    ]);
+    const out = composeWithPlaybookHint(undefined, set) ?? '';
+    const headerIdx = out.indexOf('**Workflow:**');
+    const closingIdx = out.indexOf('consider closing with');
+    expect(headerIdx).toBeGreaterThan(0);
+    expect(closingIdx).toBeGreaterThan(headerIdx);
   });
 });

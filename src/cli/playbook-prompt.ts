@@ -51,6 +51,49 @@ Specialized subagents are available for structured workflows. Each one runs in a
 
 Spawning a subagent costs context handoff, budget, and latency. Default to answering directly; delegation is the exception that pays a specific benefit (isolation, schema, bias, tool restriction).`;
 
+// Workflow discipline that complements the delegation criteria.
+// PLAYBOOKS.md §1.4 frames delegation as a per-call decision; this
+// section frames the SHAPE of multi-step turns: decompose first,
+// then dispatch — but only when scope warrants. Without an
+// explicit threshold the model either over-applies decomposition
+// to trivial changes (every typo fix becomes a planning exercise)
+// or skips it for genuine multi-file work and drifts mid-turn.
+//
+// The closing-review bullet is conditional in two ways: (1) it
+// names `code-review` and `security-audit` only when those
+// playbooks are loaded in the registry — naming a subagent that
+// does not exist routes to an error or silently falls through;
+// (2) the bullet is phrased as a SUGGESTION ("consider"), not a
+// prescription ("run before declaring done"), so the model does
+// not invoke review subagents on doc-only / single-line changes
+// where the cost (~$0.002 + 3-5s per child) outweighs the
+// finding rate.
+export const PLAYBOOK_WORKFLOW_HEADER = `**Workflow:**
+
+- For tasks that span multiple files or multiple verification surfaces (compile + test + runtime UI + permissions, etc.), name the discrete sub-problems before acting on any of them. Each one is then a candidate for direct work, parallel \`task_async\` fan-out, or sequential \`task_sync\` delegation. Naming the steps prevents drift mid-turn. Trivial changes — single-file edits, doc/comment tweaks, one-line fixes — skip this; decomposition has overhead too.
+- Every delegated task carries a self-contained \`prompt\` — assume the subagent has zero context from this conversation. Inline the goal, the constraints, and the expected output shape.`;
+
+// Names of the canonical review playbooks the closing-discipline
+// bullet references. Both ship in `agent init --playbooks`; an
+// operator who hand-rolled their registry without these will
+// not see the closing bullet rendered.
+const CLOSING_REVIEW_NAMES = ['code-review', 'security-audit'] as const;
+
+const renderClosingReviewBullet = (set: SubagentSet): string | null => {
+  const present = CLOSING_REVIEW_NAMES.filter((name) => set.byName.has(name));
+  if (present.length === 0) return null;
+  // Single-name fallback when only one of the two is loaded —
+  // grammar matters more than naming both. Phrased as
+  // "consider" (suggestion) and gated on "non-trivial scope"
+  // so the model does not reflexively spawn review subagents on
+  // doc-only / single-line changes where the per-call cost
+  // (~$0.002 + 3-5s) outweighs the finding rate.
+  const cited =
+    present.length === 1 ? `\`${present[0]}\`` : `\`${present[0]}\` and \`${present[1]}\``;
+  const subjectVerb = present.length === 1 ? 'It is' : 'Both are';
+  return `- For changes with non-trivial scope (new feature, multi-file refactor, security-sensitive path), consider closing with ${cited} before declaring done. ${subjectVerb} read-only and surface findings worth addressing while the implementation is fresh. Skip for docs, comments, config tweaks, or work the operator is reviewing live.`;
+};
+
 // Filter the registry down to the defs that participate in
 // discovery. A def without `whenToUse` is intentionally excluded:
 // the table teaches the model when each playbook applies, and a
@@ -95,10 +138,17 @@ const renderTable = (defs: SubagentDefinition[], truncated: boolean): string => 
   return lines.join('\n');
 };
 
-// Build the playbook hint block (preamble + table). Returns null
-// when there's nothing to render — every caller treats null as
-// "no hint to compose," same convention `composeWithParallelHint`
-// uses for `undefined` downstream.
+// Build the playbook hint block (preamble + table + workflow
+// discipline). Returns null when there's nothing to render —
+// every caller treats null as "no hint to compose," same
+// convention `composeWithParallelHint` uses for `undefined`
+// downstream.
+//
+// Workflow ordering: criteria (preamble) → catalogue (table) →
+// shape (workflow header) → optional closing-review bullet. The
+// model reads "when to delegate" before "what is available"
+// before "how to structure a multi-step turn", which mirrors how
+// an operator would mentally frame the choice.
 const buildPlaybookHint = (set: SubagentSet | undefined): string | null => {
   if (set === undefined || set.byName.size === 0) return null;
   const eligible = eligibleDefinitions(set);
@@ -106,7 +156,12 @@ const buildPlaybookHint = (set: SubagentSet | undefined): string | null => {
   const truncated = eligible.length > MAX_PLAYBOOK_TABLE_ROWS;
   const visible = truncated ? eligible.slice(0, MAX_PLAYBOOK_TABLE_ROWS) : eligible;
   const table = renderTable(visible, truncated);
-  return `${PLAYBOOK_DELEGATION_PREAMBLE}\n\n${table}`;
+  const closingBullet = renderClosingReviewBullet(set);
+  const workflow =
+    closingBullet === null
+      ? PLAYBOOK_WORKFLOW_HEADER
+      : `${PLAYBOOK_WORKFLOW_HEADER}\n${closingBullet}`;
+  return `${PLAYBOOK_DELEGATION_PREAMBLE}\n\n${table}\n\n${workflow}`;
 };
 
 // Compose the playbook hint with a downstream prompt. Same shape

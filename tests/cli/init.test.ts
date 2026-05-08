@@ -42,7 +42,12 @@ describe('runInit', () => {
     // make `agent init` produce unparseable output).
     const policy = loadPolicyFromString(body);
     expect(policy.defaults.mode).toBe('strict');
-    expect(policy.tools.bash?.allow?.length ?? 0).toBeGreaterThan(0);
+    // Bash uses the catch-all confirm posture — every command
+    // pops a modal. The literal `*` rule stands in for the prior
+    // curated allowlist; replacing it back to specific allows is
+    // an operator choice, not a default.
+    expect(policy.tools.bash?.allow ?? []).toEqual([]);
+    expect(policy.tools.bash?.confirm).toEqual(['*']);
     expect(policy.tools.bash?.deny?.length ?? 0).toBeGreaterThan(0);
     expect(policy.tools.read_file?.deny_paths?.length ?? 0).toBeGreaterThan(0);
   });

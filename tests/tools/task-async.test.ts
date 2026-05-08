@@ -122,6 +122,38 @@ describe('task_async / task_await / task_cancel tools', () => {
     expect(awaitRes.details?.status).toBe('interrupted');
   });
 
+  test('task_await appends `detail` to the run_failed error when the child forwarded one', async () => {
+    // Symmetric with the same fix in `task.ts`: detail flows
+    // through SpawnSubagentResult → settled handle → task_await
+    // → tool error string. Without it, an async-spawned child
+    // that hits a provider error surfaces as just
+    // "providerError" with no actionable cause on the `└─`.
+    const store = createSubagentHandleStore({
+      cap: 3,
+      spawnFn: async () => ({
+        kind: 'ran',
+        output: '',
+        sessionId: 'child-1',
+        status: 'error',
+        reason: 'providerError',
+        costUsd: 0,
+        steps: 0,
+        durationMs: 5,
+        detail: 'AnthropicError 401 invalid x-api-key',
+      }),
+    });
+    const ctx = makeCtx({ subagentHandleStore: store });
+    const spawn = await taskAsyncTool.execute({ subagent: 'review', prompt: 'p' }, ctx);
+    if (isToolError(spawn)) throw new Error('spawn failed');
+    const awaitRes = await taskAwaitTool.execute({ handle_id: spawn.handle_id }, ctx);
+    expect(isToolError(awaitRes)).toBe(true);
+    if (!isToolError(awaitRes)) return;
+    expect(awaitRes.error_code).toBe('subagent.run_failed');
+    expect(awaitRes.error_message).toContain("reason='providerError'");
+    expect(awaitRes.error_message).toContain('AnthropicError 401 invalid x-api-key');
+    expect(awaitRes.error_message).toMatch(/reason='providerError': AnthropicError/);
+  });
+
   test('task_cancel on unknown handle is idempotent (cancelled: false, reason)', async () => {
     const store = createSubagentHandleStore({
       cap: 3,

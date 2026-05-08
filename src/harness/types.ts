@@ -62,6 +62,14 @@ export type HarnessEvent =
       // approval are both `failed: true` and audit/UI can't tell
       // them apart. Absent for non-failure outcomes.
       denied?: boolean;
+      // Human-readable failure reason for non-denied errors (unknown
+      // tool, tool returned a ToolError, tool threw and was wrapped).
+      // Absent for success and for denied (denials surface their
+      // reason via the `tool_decided` event's `decision.reason`,
+      // which the renderer routes through `summary` separately).
+      // The TUI uses this on the `└─` connector to surface the
+      // cause without forcing the operator to grep audit logs.
+      errorMessage?: string;
     }
   | {
       type: 'compaction_started';

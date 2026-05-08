@@ -229,6 +229,16 @@ const buildEnvelope = (result: HarnessResult, output: string): Record<string, un
   // grace expired?" which collapses honest cases (slow flush,
   // disk contention) into "hard".
   ...(result.abortCause !== undefined ? { abort_cause: result.abortCause } : {}),
+  // Diagnostic detail forwarded from `HarnessResult.detail`. The
+  // child's `finish('providerError', detail)` (loop.ts) sets
+  // this to the actual error message; without forwarding it
+  // across IPC the parent's `task` / `task_await` error string
+  // could only show the categorical reason ("providerError"),
+  // and the operator had to grep audit logs to learn the
+  // specific cause. Absent for successful / detail-less paths.
+  ...(typeof result.detail === 'string' && result.detail.length > 0
+    ? { detail: result.detail }
+    : {}),
 });
 
 // `content` is JSON-parsed at the row layer, so we receive the

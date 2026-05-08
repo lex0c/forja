@@ -130,6 +130,53 @@ describe('task tool', () => {
     expect(result.details?.max_depth).toBe(4);
   });
 
+  test('appends `detail` to the run_failed error when the child forwarded one', async () => {
+    // The child's HarnessResult.detail (e.g. provider error
+    // message for reason='providerError') crosses IPC into
+    // SpawnSubagentResult.detail. The tool error string must
+    // surface it after the categorical reason or operators see
+    // a bare "providerError" with no actionable cause. Test
+    // covers what landed via the f4f8a79 → c (this fix) chain:
+    // detail flows from harness → child envelope → result
+    // builder → spawn result → tool error string → invoke-tool
+    // errorMessage → TUI `└─` connector.
+    const ctx = makeCtx({
+      spawnSubagent: async () =>
+        ranEnvelope({
+          status: 'error',
+          reason: 'providerError',
+          output: '',
+          detail: 'AnthropicError 401 invalid x-api-key',
+        }),
+    });
+    const result = await taskTool.execute({ subagent: 'review', prompt: 'go' }, ctx);
+    expect(isToolError(result)).toBe(true);
+    if (!isToolError(result)) return;
+    expect(result.error_code).toBe('subagent.run_failed');
+    expect(result.error_message).toContain("reason='providerError'");
+    expect(result.error_message).toContain('AnthropicError 401 invalid x-api-key');
+    // Format invariant: `: <detail>` suffixed AFTER the closing
+    // single-quote, not embedded inside it. Prevents a future
+    // regression where the suffix lands before the categorical
+    // reason and the operator misreads cause.
+    expect(result.error_message).toMatch(/reason='providerError': AnthropicError/);
+  });
+
+  test('omits the detail suffix when the child forwarded none (back-compat)', async () => {
+    // Older runs / synthesized envelopes (subprocess crash with
+    // no payload, etc.) lack detail. Tool error string must
+    // stay backward-compatible: same shape as before this fix.
+    const ctx = makeCtx({
+      spawnSubagent: async () =>
+        ranEnvelope({ status: 'error', reason: 'subprocess_crashed', output: '' }),
+    });
+    const result = await taskTool.execute({ subagent: 'review', prompt: 'go' }, ctx);
+    expect(isToolError(result)).toBe(true);
+    if (!isToolError(result)) return;
+    // Plain trailing single-quote, no `:` suffix.
+    expect(result.error_message).toMatch(/reason='subprocess_crashed'$/);
+  });
+
   test('maps non-done child status to subagent.run_failed', async () => {
     const ctx = makeCtx({
       spawnSubagent: async () =>

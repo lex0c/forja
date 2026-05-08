@@ -8,7 +8,6 @@ budget:
 slash: gapaudit
 when_to_use: "textual artifact (spec, plan, PR description, threat model) where claims need to be verified against evidence in the codebase or repository, and the user wants the audit BEFORE acting on the artifact. NOT for code review (use /review); NOT for asking 'is this spec correct?' as a yes/no — the playbook reports claim-by-claim, not a verdict; NOT when the artifact is still being drafted (the audit assumes the form is final)."
 sampling:
-  temperature: 0.2
   max_tokens: 4096
   thinking_budget: 4000
 prompt_version: 1

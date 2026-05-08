@@ -40,13 +40,33 @@ describe('composeWithTaskDiscipline', () => {
     expect(out).toContain("Don't add backwards-compatibility");
   });
 
-  test('section size is reasonable (~150 tokens / ~1k chars)', () => {
+  test('reminds the model to close active todos before the final answer', () => {
+    // Without this nudge, long turns where the workflow shifts
+    // mid-flight (e.g. a delegated subagent crashes and the model
+    // recovers manually) routinely end with the last todo stuck
+    // in `in_progress`, signaling abandoned work to the operator
+    // even when the visible answer is complete.
+    const out = composeWithTaskDiscipline(undefined);
+    expect(out).toMatch(/close any active todos/i);
+    expect(out).toContain('todo_write');
+    // Vocabulary check: rule must use the actual TodoStatus
+    // values (`done`, `pending`, `in_progress`), not invented
+    // synonyms like `completed` / `abandoned` that todo_write
+    // would reject. A drift here would teach the model to call
+    // todo_write with invalid args.
+    expect(out).toContain('`done`');
+    expect(out).toContain('`pending`');
+    expect(out).toContain('`in_progress`');
+  });
+
+  test('section size is reasonable (~200 tokens / ~1.5k chars)', () => {
     // Section sits inside cache breakpoint #1 — bigger means
     // more cached input but also more attention budget consumed
-    // before the model gets to task-specific instructions. 1500
-    // chars is a generous ceiling that still keeps the section
-    // ~150 tokens.
+    // before the model gets to task-specific instructions. The
+    // close-todos bullet pushed us past the prior 1500-char
+    // ceiling; 2000 chars stays under ~250 tokens which is still
+    // a small fraction of the 200k context window.
     const out = composeWithTaskDiscipline(undefined);
-    expect(out.length).toBeLessThan(1500);
+    expect(out.length).toBeLessThan(2000);
   });
 });
