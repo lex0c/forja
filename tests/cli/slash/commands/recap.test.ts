@@ -228,6 +228,39 @@ describe('/recap', () => {
     expect(result.message).toContain('/recap session');
   });
 
+  test('audit INSERT failure does NOT destroy the recap output (warn instead)', async () => {
+    // Simulate disk-full / schema-corruption on the audit row by
+    // dropping the table after the projection succeeds. The slash
+    // must still return the recap notes; the operator gets a warn
+    // bracketing the audit gap, not a crash.
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'do work',
+      createdAt: 1_100,
+    });
+    currentSessionId = s.id;
+    db.query('DROP TABLE recap_runs').run();
+
+    const events: { type: string; message?: string }[] = [];
+    const ctx = makeCtx();
+    ctx.bus.on('warn', (e) => events.push({ type: 'warn', message: e.message }));
+    ctx.bus.on('error', (e) => events.push({ type: 'error', message: e.message }));
+
+    const result = await recapCommand.exec([], ctx);
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    expect(text).toContain('do work');
+    // Exactly one warn, no error.
+    const warns = events.filter((e) => e.type === 'warn');
+    expect(warns).toHaveLength(1);
+    expect(warns[0]?.message).toContain('audit row not written');
+    expect(warns[0]?.message).toContain('output is intact');
+    expect(events.filter((e) => e.type === 'error')).toHaveLength(0);
+  });
+
   test('rejects extra trailing arguments', async () => {
     const result = await recapCommand.exec(['session', 'sid', 'extra'], makeCtx());
     expect(result.kind).toBe('error');

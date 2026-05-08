@@ -104,12 +104,14 @@ From the M4.1 self-review; commits `99a4f35`..`483dc45` plus the
   `projection.ts:386` (`payload?.payload !== undefined &&
   payload?.payload !== null`). Simplifies to
   `payload?.payload != null`.
-- **#11 — `recordRecapRun` not resilient to DB failure.** A
-  disk-full INSERT crash bubbles up through `dispatch` and
-  the operator loses the recap output entirely. Spec §6.3
-  calls the row "informational"; wrap in try/catch + warn
-  via `ctx.bus.emit({type:'warn', ...})` to keep the user
-  output intact when the audit write fails.
+- ~~**#11 — `recordRecapRun` not resilient to DB failure.**~~
+  **Resolved.** Wrapped the audit INSERT in try/catch; on
+  failure the slash command emits a `warn` UIEvent
+  ("audit row not written (...); output is intact") and
+  still returns the recap notes. Regression test drops
+  `recap_runs` mid-execution to simulate disk-full /
+  schema-corruption and asserts: result is `ok`, recap
+  text is intact, exactly one warn fired, zero errors.
 - **#12 — `extractTextBlocks` ignores `tool_use` blocks**
   intentionally (we only mine `text` for question
   extraction). Needs a one-line comment so the next reader

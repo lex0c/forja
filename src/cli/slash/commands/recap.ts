@@ -167,20 +167,30 @@ export const recapCommand: SlashCommand = {
 
     const output = parsed.format === 'json' ? renderJson(intermediate) : renderHuman(intermediate);
 
-    // Audit the run BEFORE returning. Records the actual sessions
-    // touched (post-resolution), the renderer used, and whether the
-    // LLM was involved (always false in M4.1). Failures here would
-    // surface as a slash-command crash; per RECAP.md §6.3 the row
-    // is informational — losing one is preferable to losing the
-    // user's recap output, but we treat insertion as a normal write
-    // and let any DB error surface.
-    recordRecapRun(ctx.db, {
-      scopeKind: scope.kind,
-      sessionIds: intermediate.scope.sessionIds,
-      renderer: parsed.format,
-      usedLlm: false,
-      createdAt: ctx.now(),
-    });
+    // Audit the run alongside returning the recap text. Records
+    // the actual sessions touched (post-resolution), the renderer
+    // used, and whether the LLM was involved (always false in
+    // M4.1). Per RECAP.md §6.3 the row is INFORMATIONAL — a disk-
+    // full / schema-corruption failure on the audit INSERT must
+    // not destroy the operator's recap output, which is the
+    // primary product of the call. We try to record, and on
+    // failure surface a warn event but keep the recap intact.
+    try {
+      recordRecapRun(ctx.db, {
+        scopeKind: scope.kind,
+        sessionIds: intermediate.scope.sessionIds,
+        renderer: parsed.format,
+        usedLlm: false,
+        createdAt: ctx.now(),
+      });
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      ctx.bus.emit({
+        type: 'warn',
+        ts: ctx.now(),
+        message: `/recap: audit row not written (${reason}); output is intact`,
+      });
+    }
 
     return { kind: 'ok', notes: renderToNotes(output) };
   },
