@@ -105,6 +105,14 @@ interface AdapterState {
   tools: Map<string, ToolTrack>;
   // Cumulative step counter for `step:budget`. Bumped on `step_start`.
   steps: number;
+  // True between `step_start` (we emitted `provider:waiting:start`)
+  // and the first `provider_event` of that step (we emit
+  // `provider:waiting:end` once and clear). Without this gate, every
+  // provider event would re-emit the end UIEvent — minor noise but
+  // unnecessary since the reducer is already idempotent on
+  // null. The flag also short-circuits the per-event check
+  // cheaper than always pushing.
+  providerWaiting: boolean;
   // Cumulative cost. The harness reports cost only at session_finished
   // (and per-compaction). We expose the running total when we have it
   // — for now it stays 0 mid-run and the final session:end carries no
@@ -138,6 +146,18 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
     tools: new Map(),
     steps: 0,
     costUsd: 0,
+    providerWaiting: false,
+  };
+
+  // Close the "Awaiting model" indicator. Called from the
+  // `provider_event` case the first time per step, and from the
+  // `step_start` case BEFORE opening a new one (defense in depth:
+  // a step that fires `step_start` twice without a provider event
+  // in between — bug or replay edge — wouldn't leak a stale gate).
+  const endProviderWaiting = (ts: number, out: UIEvent[]): void => {
+    if (!state.providerWaiting) return;
+    state.providerWaiting = false;
+    out.push({ type: 'provider:waiting:end', ts });
   };
 
   // Closing a thinking window is a frequent micro-step (any text or
@@ -205,10 +225,32 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
           costUsd: state.costUsd,
           ...(ctx.maxCostUsd !== undefined ? { maxCostUsd: ctx.maxCostUsd } : {}),
         });
+        // Defensive close before re-opening: a malformed event
+        // stream (two step_starts back to back without a
+        // provider event between) would otherwise stack two
+        // open gates and miss one of the closes.
+        endProviderWaiting(ts, out);
+        // Open the "Awaiting model" indicator. The harness has
+        // just handed the request to the provider; the next visible
+        // signal is the first provider event (text_delta /
+        // thinking_delta / tool_use_start), which can take
+        // 30-60s on extended-thinking turns. Without this chip the
+        // operator sees nothing during the wait and reaches for
+        // Ctrl-C before the step-stall watchdog (90s default)
+        // would have caught a real hang.
+        state.providerWaiting = true;
+        out.push({ type: 'provider:waiting:start', ts, stepN: event.stepN });
         return out;
       }
 
       case 'provider_event': {
+        // First provider event of the step closes the "Awaiting
+        // model" indicator. The reducer also clears on
+        // assistant:start / thinking:start (defense in depth), but
+        // closing here covers cases where the very first event is
+        // a tool_use_start (no assistant content at all — the
+        // model went straight to tools).
+        endProviderWaiting(ts, out);
         const ev = event.event;
         switch (ev.kind) {
           case 'start':

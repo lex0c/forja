@@ -84,13 +84,67 @@ describe('harness-adapter — session lifecycle', () => {
     expect(start.memoryCount).toBeUndefined();
   });
 
-  test('step_start bumps steps and emits step:budget', () => {
+  test('step_start bumps steps and emits step:budget + provider:waiting:start', () => {
+    // step_start now dual-emits: status update + the new
+    // "Awaiting model" indicator that bridges the gap between
+    // the harness handing off the request and the first
+    // provider event arriving on the renderer.
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({ type: 'step_start', stepN: 3 });
-    expect(out).toHaveLength(1);
+    expect(out.map((e) => e.type)).toEqual(['step:budget', 'provider:waiting:start']);
     const b = out[0] as Extract<UIEvent, { type: 'step:budget' }>;
-    expect(b.type).toBe('step:budget');
     expect(b.steps).toBe(3);
+    const w = out[1] as Extract<UIEvent, { type: 'provider:waiting:start' }>;
+    expect(w.stepN).toBe(3);
+  });
+
+  test('first provider_event after step_start emits provider:waiting:end', () => {
+    // The end-of-wait fires on the FIRST provider event, not on
+    // assistant:start specifically — covers tool-only turns where
+    // the model goes straight to tool_use_start without any
+    // assistant content.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'step_start', stepN: 1 });
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'start', message_id: 'm1' },
+    });
+    // Order: provider:waiting:end FIRST (closes the indicator),
+    // then the rest of the provider_event translation
+    // (assistant:start in this case).
+    expect(out[0]?.type).toBe('provider:waiting:end');
+    expect(out.map((e) => e.type)).toContain('assistant:start');
+  });
+
+  test('subsequent provider events do NOT re-emit provider:waiting:end (idempotent)', () => {
+    // The internal flag prevents per-event noise once the
+    // indicator already closed. Pinned so a regression that
+    // dropped the flag would surface as an extra
+    // provider:waiting:end on every text_delta.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'step_start', stepN: 1 });
+    a.translate({ type: 'provider_event', event: { kind: 'start', message_id: 'm1' } });
+    const out = a.translate({
+      type: 'provider_event',
+      event: { kind: 'text_delta', text: 'hi' },
+    });
+    expect(out.map((e) => e.type)).not.toContain('provider:waiting:end');
+  });
+
+  test('two step_starts back to back close the prior gate before opening a new one', () => {
+    // Defensive close-before-open in the step_start case.
+    // Pinned so a regression that opened a second gate without
+    // closing the first would leave the reducer with a stale
+    // startedAt and an indicator that never closes.
+    const a = createHarnessAdapter(baseCtx());
+    a.translate({ type: 'step_start', stepN: 1 });
+    const out = a.translate({ type: 'step_start', stepN: 2 });
+    // step_start (step 2) must close before opening: end then start.
+    const types = out.map((e) => e.type);
+    const endIdx = types.indexOf('provider:waiting:end');
+    const startIdx = types.indexOf('provider:waiting:start');
+    expect(endIdx).toBeGreaterThan(-1);
+    expect(startIdx).toBeGreaterThan(endIdx);
   });
 
   test('session_finished emits final step:budget + session:end', () => {

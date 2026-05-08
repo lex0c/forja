@@ -24,6 +24,7 @@ import type { ComposeLive } from '../renderer-types.ts';
 import type { LiveState } from '../state.ts';
 import { type Capabilities, paint } from '../term.ts';
 import { renderAssistantChip } from './assistant-chip.ts';
+import { renderAwaitingChip } from './awaiting-chip.ts';
 import { renderFooter } from './footer.ts';
 import { padFrame } from './frame.ts';
 import { renderInput } from './input.ts';
@@ -236,6 +237,13 @@ export const composeLive: ComposeLive = (
     appendBlock(renderThinkingChip(state.thinking, caps, now));
   } else if (state.pendingAssistant !== null) {
     appendBlock(renderAssistantChip(state.pendingAssistant, caps, now));
+  } else if (state.awaitingProvider !== null) {
+    // Fallback chip when the harness has handed off to the
+    // provider but no streaming has started yet. The reducer
+    // clears `awaitingProvider` on assistant:start /
+    // thinking:start, so by the time either of those branches
+    // would fire, this fallback is already null.
+    appendBlock(renderAwaitingChip(state.awaitingProvider, caps, now));
   }
 
   // 3. Active tool cards (running). Map insertion order is preserved,

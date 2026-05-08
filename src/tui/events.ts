@@ -472,6 +472,34 @@ export type StepBudgetEvent = BaseEvent & {
   costUsd: number;
   maxCostUsd?: number;
 };
+
+// Provider call lifecycle bracket — covers the gap between
+// `step_start` (harness asked the provider for the next turn) and
+// the first provider event landing on the renderer (text_delta /
+// thinking_delta / tool_use_start). The harness adapter emits
+// `provider:waiting:start` on step_start and
+// `provider:waiting:end` on the first provider_event of that
+// step.
+//
+// Without this bracket, a step where the model thinks for 30-60s
+// (extended thinking with high max_tokens, slow cold start, model
+// genuinely deliberating on a tool denial) shows nothing in the
+// live region — operator perceives a hang. The waiting chip
+// closes the visibility gap with an "Awaiting model… (Xs)"
+// indicator that ticks while the provider call is in flight.
+//
+// Mutually exclusive with the thinking and assistant chips: once
+// thinking_delta or text_delta arrives, the adapter emits the
+// :end event AND the relevant start event in the same translate
+// call, and the renderer's chip-slot picks the more specific
+// indicator.
+export type ProviderWaitingStartEvent = BaseEvent & {
+  type: 'provider:waiting:start';
+  stepN: number;
+};
+export type ProviderWaitingEndEvent = BaseEvent & {
+  type: 'provider:waiting:end';
+};
 export type CheckpointCreateEvent = BaseEvent & {
   type: 'checkpoint:create';
   checkpointId: string;
@@ -606,6 +634,8 @@ export type UIEvent =
   | BgUpdateEvent
   | BgEndEvent
   | StepBudgetEvent
+  | ProviderWaitingStartEvent
+  | ProviderWaitingEndEvent
   | CheckpointCreateEvent
   | ScreenClearEvent
   | SlashUpdateEvent

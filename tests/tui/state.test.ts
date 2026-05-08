@@ -685,10 +685,48 @@ describe('tool-end batch coalescing (slice 3)', () => {
     expect(batches[1]?.count).toBe(3);
   });
 
-  test('worst-of status: any error in the batch poisons the chip', () => {
-    // Pinned: an error in the middle of an otherwise-green batch
-    // surfaces honestly. A regression that flattened to "all done"
-    // would silently hide a failure.
+  test('non-done tool:end (error/denied) bypasses the buffer and emits immediately', () => {
+    // Real-world UX bug: a denied bash chip sat in the buffer
+    // for 51s while the agent paused on the policy refusal,
+    // leaving the operator staring at the previous batch with
+    // no signal that the NEXT tool was blocked. Errors and
+    // denials now skip the buffer entirely and emit as their
+    // own tool-end chip in scrollback the moment the event
+    // lands.
+    const denyState = createInitialState();
+    const s = applyEvent(denyState, {
+      type: 'tool:start',
+      ts: 1,
+      toolId: 't-bash',
+      name: 'bash',
+      activeVerb: 'Executing',
+      finalVerb: 'Executed',
+      subject: 'ls',
+    }).state;
+    const r = applyEvent(s, {
+      type: 'tool:end',
+      ts: 2,
+      toolId: 't-bash',
+      status: 'denied',
+      durationMs: 1,
+      summary: 'no policy rule matched',
+    });
+    // Emitted IMMEDIATELY — no buffer wait.
+    expect(r.permanent).toHaveLength(1);
+    const item = r.permanent[0];
+    if (item?.kind !== 'tool-end') throw new Error('expected tool-end');
+    expect(item.status).toBe('denied');
+    expect(item.summary).toBe('no policy rule matched');
+    // Buffer must not be left holding anything either.
+    expect(r.state.pendingToolEndBatch).toBeNull();
+  });
+
+  test('error mid-stream flushes the partial green batch FIRST, then emits the error', () => {
+    // Trade-off documented in the tool:end case: a failure
+    // splits the batch. Operator sees the green prefix, the
+    // failure boundary, and any subsequent green continuation
+    // as separate chips. More honest than a single batch chip
+    // with worst-of status hiding the boundary.
     const result = drive([
       ...readPair('t1', 'src/a.ts', 10),
       {
@@ -703,9 +741,13 @@ describe('tool-end batch coalescing (slice 3)', () => {
       { type: 'tool:end', ts: 20, toolId: 't2', status: 'error', durationMs: 9 },
       ...readPair('t3', 'src/c.ts', 10),
     ]);
-    const item = result.permanent[0];
-    if (item?.kind !== 'tool-end-batch') throw new Error('expected tool-end-batch');
-    expect(item.status).toBe('error');
+    // 3 individual tool-end chips: green prefix (1 item, below
+    // threshold), the error, the green suffix (1 item, below
+    // threshold). NO tool-end-batch — the failure broke the
+    // batch.
+    expect(result.permanent.map((p) => p.kind)).toEqual(['tool-end', 'tool-end', 'tool-end']);
+    const statuses = result.permanent.map((p) => (p.kind === 'tool-end' ? p.status : null));
+    expect(statuses).toEqual(['done', 'error', 'done']);
   });
 
   test('null subjects are filtered out of the batch continuation list', () => {
@@ -902,6 +944,77 @@ describe('applyEvent wrapper (flush lifecycle, slice 3)', () => {
     expect(r.state.pendingToolEndBatch).toBeNull();
     // Both kinds in the right order: batch first, then user-submit.
     expect(r.permanent.map((p) => p.kind)).toEqual(['tool-end-batch', 'user-submit']);
+  });
+});
+
+describe('awaitingProvider indicator (provider:waiting bracket)', () => {
+  test('provider:waiting:start sets awaitingProvider with stepN + ts', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'provider:waiting:start',
+      ts: 100,
+      stepN: 3,
+    });
+    expect(r.state.awaitingProvider).toEqual({ stepN: 3, startedAt: 100 });
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('provider:waiting:end clears the indicator', () => {
+    let s = applyEvent(createInitialState(), {
+      type: 'provider:waiting:start',
+      ts: 100,
+      stepN: 1,
+    }).state;
+    s = applyEvent(s, { type: 'provider:waiting:end', ts: 150 }).state;
+    expect(s.awaitingProvider).toBeNull();
+  });
+
+  test('provider:waiting:end is a no-op when nothing is pending (defensive double-close)', () => {
+    const r = applyEvent(createInitialState(), { type: 'provider:waiting:end', ts: 1 });
+    expect(r.state.awaitingProvider).toBeNull();
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('assistant:start clears awaitingProvider (more specific chip takes the slot)', () => {
+    let s = applyEvent(createInitialState(), {
+      type: 'provider:waiting:start',
+      ts: 100,
+      stepN: 1,
+    }).state;
+    expect(s.awaitingProvider).not.toBeNull();
+    s = applyEvent(s, { type: 'assistant:start', ts: 200, messageId: 'm1' }).state;
+    expect(s.awaitingProvider).toBeNull();
+    expect(s.pendingAssistant).not.toBeNull();
+  });
+
+  test('thinking:start clears awaitingProvider', () => {
+    let s = applyEvent(createInitialState(), {
+      type: 'provider:waiting:start',
+      ts: 100,
+      stepN: 1,
+    }).state;
+    s = applyEvent(s, { type: 'thinking:start', ts: 200, messageId: 'm1' }).state;
+    expect(s.awaitingProvider).toBeNull();
+    expect(s.thinking).not.toBeNull();
+  });
+
+  test('session:start / session:end clear awaitingProvider (boundary cleanup)', () => {
+    let s = applyEvent(createInitialState(), {
+      type: 'provider:waiting:start',
+      ts: 100,
+      stepN: 1,
+    }).state;
+    // Session boundary should drop the indicator regardless of
+    // direction (start of a new turn or end of the current run).
+    s = applyEvent(s, start()).state;
+    expect(s.awaitingProvider).toBeNull();
+    s = applyEvent(s, {
+      type: 'provider:waiting:start',
+      ts: 200,
+      stepN: 2,
+    }).state;
+    expect(s.awaitingProvider).not.toBeNull();
+    s = applyEvent(s, { type: 'session:end', ts: 300, sessionId: 's1', reason: 'done' }).state;
+    expect(s.awaitingProvider).toBeNull();
   });
 });
 

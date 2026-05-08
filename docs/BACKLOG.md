@@ -15,6 +15,183 @@ Format:
 
 ---
 
+## [2026-05-07] "Awaiting model" indicator + heartbeat tick during quiet provider waits
+
+Operator-reported follow-up to the non-done bypass: even with the
+denied chip surfacing immediately, the agent still appeared to
+"hang" because nothing visible happened during the next provider
+call. Sonnet 4.6 with high `max_tokens` can take 20-30s per
+provider round-trip; multi-step turns ("explore the project") can
+total 2+ minutes of wall-clock with each individual step appearing
+as an opaque wait. The operator stares at a frozen screen and
+reaches for Ctrl-C before the step-stall watchdog (90s default)
+would have caught a real hang.
+
+Two fixes:
+
+**1. Visible indicator between step_start and the first provider event**
+
+A new `provider:waiting:start` / `provider:waiting:end` UIEvent
+bracket. The harness adapter emits `start` on `step_start` (after
+`step:budget`) and `end` on the first `provider_event` of that
+step. The reducer threads it onto `LiveState.awaitingProvider` and
+`compose.ts` renders an `▸ Awaiting model… (Xs)` chip in the live
+region as a fallback when neither `thinking` nor `pendingAssistant`
+is set. Palette is `secondary` (grey) — a long wait is normal,
+not an alarm.
+
+Mutual exclusion: `assistant:start` and `thinking:start` clear
+`awaitingProvider` so the more specific chip wins the slot.
+`session:start` / `session:end` clear it as boundary cleanup.
+The adapter's `endProviderWaiting` helper closes-before-opens
+defensively in `step_start` so back-to-back step starts don't
+leak a stale gate; an internal `providerWaiting` flag prevents
+per-event re-emission noise on subsequent provider events of the
+same step.
+
+**2. Heartbeat predicate must include awaitingProvider**
+
+Without this, the chip rendered ONCE at step_start with the
+elapsed counter frozen at `0ms`. The renderer only redraws on
+events, and during a provider wait NO events fire — that's the
+whole point of the chip. The heartbeat already redraws
+periodically when "anything in the live region animates", but its
+predicate only checked `activeTools` / `thinking` /
+`pendingAssistant`. Adding `awaitingProvider !== null` makes the
+heartbeat tick during the wait, the chip's elapsed counter
+advances honestly, and the operator can see real-time progress.
+
+**Done:**
+
+- `src/tui/events.ts` — `ProviderWaitingStartEvent` (carries
+  `stepN`) + `ProviderWaitingEndEvent`. Comments document
+  motivation + mutual exclusion with thinking/assistant chips.
+- `src/tui/state.ts` — `awaitingProvider` field, two reducer
+  cases, clears on `assistant:start` / `thinking:start` /
+  `session:start` / `session:end`.
+- `src/tui/harness-adapter.ts` — `providerWaiting` internal
+  flag, `endProviderWaiting` helper, dual-emit on `step_start`
+  (with defensive close-before-open), single-fire close on
+  the first `provider_event` of each step.
+- `src/tui/render/awaiting-chip.ts` (NEW) — renders the chip
+  with the same shape as thinking-chip / assistant-chip so the
+  three chips read as one visual family. Uses `secondary`
+  palette so a long wait doesn't read as an alarm.
+- `src/tui/render/compose.ts` — slot fallback when neither
+  thinking nor pendingAssistant is set.
+- `src/tui/renderer.ts` — heartbeat `isActive` predicate now
+  includes `state.awaitingProvider !== null` so the elapsed
+  counter ticks during the wait.
+
+**Tests:**
+
+- `tests/tui/state.test.ts` — 6 cases: start/end set/clear,
+  idempotent end, mutual exclusion with `assistant:start` /
+  `thinking:start`, boundary cleanup on `session:start` /
+  `session:end`.
+- `tests/tui/harness-adapter.test.ts` — 4 cases: step_start
+  dual-emits step:budget + provider:waiting:start; first
+  provider_event emits provider:waiting:end; subsequent
+  provider events do NOT re-emit (idempotency); two
+  back-to-back step_starts close before opening.
+- `tests/tui/renderer.test.ts` — 1 case: heartbeat ticks
+  while awaitingProvider is set, stops when it clears.
+  Mirrors the existing pendingAssistant heartbeat regression
+  test directly.
+
+**Verification:** `bun test` 3692 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean (2 pre-existing
+unrelated warnings).
+
+**Behavioral payoff:**
+
+Before: operator types "explore the project", sees the first few
+tool chips, then the screen freezes between steps. Each
+provider call appears as a 20-30s opaque wait. Operator gives
+up before the turn completes.
+
+After: operator sees `▸ Awaiting model… (12.3s)` in the live
+region during each wait, the counter ticks every heartbeat. If
+it climbs past 90s, the step-stall watchdog catches a real hang
+with `Error (no progress)`. Visibility > opacity.
+
+**Honest trade-off:** the chip doesn't FIX slowness — it surfaces
+it. If a turn genuinely takes 2 minutes the operator now sees
+2 minutes of "Awaiting model…" tick. Some operators may find
+that more annoying than the silent wait. Counter-argument: the
+visible counter is a reliable signal of "is the agent actually
+working", which the silent wait was not.
+
+---
+
+## [2026-05-07] non-`done` tool-end chips bypass the coalescing buffer
+
+Real-world bug from a fresh `dist/agent` run after slice 3 landed:
+operator typed "explore o projeto e me de hilights", saw the agent
+list memory, glob, then read 6 files (correctly coalesced as
+`Read 6 files in 81ms`). Then nothing for 51 seconds. After
+hitting Ctrl-C the operator finally saw `Denied in 1ms — no policy
+rule matched for bash (mode=strict)`.
+
+The denied bash chip had been sitting in `pendingToolEndBatch` the
+whole time. Slice 3's flush-on-permanent rule meant the chip stayed
+buffered until SOMETHING else emitted permanent items — and the
+agent had paused (probably the model thinking about the refusal).
+Operator was staring at the previous `Read 6 files` chip with zero
+signal that the next tool was blocked.
+
+**Done:**
+
+- `src/tui/state.ts` — `tool:end` case now bypasses the buffer
+  entirely when `event.status !== 'done'`. The path:
+  1. Flush whatever's pending (chronology preserved).
+  2. Emit the failed/denied chip immediately as its own
+     `tool-end` PermanentItem in the same return.
+  3. Leave `pendingToolEndBatch` null.
+
+  Comment in the case documents the trade-off: an error in the
+  middle of an otherwise-green batch no longer coalesces under
+  worst-of status — the failure flushes the partial batch, emits
+  its own chip, and any subsequent green items start a fresh
+  batch. Strictly more honest: operator sees the failure boundary
+  instead of one batch chip with status that hides the boundary.
+
+**Tests:**
+
+- `tests/tui/state.test.ts`:
+  - REPLACED the old "worst-of status: any error in the batch
+    poisons the chip" test (was pinning the now-superseded
+    behavior). New equivalent: "error mid-stream flushes the
+    partial green batch FIRST, then emits the error" — pins the
+    3-chip emission shape (green prefix, error, green suffix).
+  - NEW: "non-done tool:end (error/denied) bypasses the buffer
+    and emits immediately" — the load-bearing UX guarantee.
+    Single denied tool-end produces a permanent chip in one
+    `applyEvent` call with `pendingToolEndBatch === null`.
+
+**Verification:** `bun test` 3682 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean (2 pre-existing unrelated
+warnings).
+
+**Behavioral payoff:**
+
+The reported scenario now surfaces the denied chip the moment the
+event lands, not 51s later when the operator gives up and aborts.
+The agent might still be paused on whatever was happening after
+the denial — that's a separate investigation (the step-stall
+watchdog would have caught it at 90s) — but at least the operator
+has a signal of WHERE the agent stopped.
+
+**Pending — not addressed in this slice:**
+
+- The underlying hang after the denial (51s of no events) is
+  separate. Could be the model genuinely thinking, the harness
+  waiting for state, or a provider hang the step-stall watchdog
+  would catch at 90s. Needs its own investigation if it
+  reproduces.
+
+---
+
 ## [2026-05-07] coalesce consecutive same-tool chips into a batch summary
 
 Slice 3 of the subagent-tool-visibility arc, but it benefits the

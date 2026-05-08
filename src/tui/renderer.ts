@@ -380,6 +380,15 @@ export const createRenderer = (options: RendererOptions): Renderer => {
   // timer until the next delta lands. From the operator's POV the
   // run looks hung. Including pendingAssistant here keeps the chip
   // animating during pure text-generation turns.
+  //
+  // awaitingProvider: same rationale — between `step_start` and the
+  // first provider event of the step, NO HarnessEvent fires (the
+  // model is thinking on its end). Without including it here, the
+  // "Awaiting model… (Xs)" chip would be drawn ONCE at step_start
+  // with the elapsed counter frozen at 0ms, and the operator
+  // would still perceive a hang. With it, the chip ticks at the
+  // heartbeat cadence and the counter advances honestly while
+  // the wait happens.
   const heartbeat: Heartbeat | null =
     options.heartbeat === false
       ? null
@@ -388,7 +397,8 @@ export const createRenderer = (options: RendererOptions): Renderer => {
           isActive: () =>
             state.activeTools.size > 0 ||
             state.thinking !== null ||
-            state.pendingAssistant !== null,
+            state.pendingAssistant !== null ||
+            state.awaitingProvider !== null,
           onTick: () => scheduler.request(),
         });
 

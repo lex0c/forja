@@ -280,6 +280,22 @@ export interface LiveState {
   // seed (timestamp-based picks can change mid-turn under clock
   // skew or replay).
   thinking: { startedAt: number; messageId: string } | null;
+  // "Awaiting model" indicator. Set by `provider:waiting:start`
+  // (which the harness adapter emits on `step_start` — i.e.,
+  // right after the harness loop hands the request to the
+  // provider). Cleared by `provider:waiting:end` (first provider
+  // event of the step), `assistant:start`, `thinking:start`, or
+  // any session-boundary event. Read by `compose.ts` to render
+  // an "Awaiting model… (Xs)" chip in the live region between
+  // step_start and the first provider event.
+  //
+  // Without this state, a step where the model takes 30-60s to
+  // respond (extended thinking, slow cold start, deliberation
+  // after a tool denial) shows NOTHING in the live region —
+  // operator perceives a hang and reaches for Ctrl-C before the
+  // step-stall watchdog (90s default) would have caught a real
+  // problem.
+  awaitingProvider: { stepN: number; startedAt: number } | null;
   // Active modal, or null when no modal is up. Composer (compose.ts)
   // replaces the input box with `renderModal(modal, caps)` whenever
   // this is non-null. Status line + tool cards stay visible.
@@ -394,6 +410,7 @@ export const createInitialState = (): LiveState => ({
   pendingToolEndBatch: null,
   pendingAssistant: null,
   thinking: null,
+  awaitingProvider: null,
   modal: null,
   slash: null,
   reverseSearch: null,
@@ -719,6 +736,10 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           bgProcesses: new Map(),
           subagents: new Map(),
           parallelStatus: null,
+          // Per-session: a stale "Awaiting model" indicator from a
+          // crashed prior run (e.g., resume after parent crash mid-
+          // step) shouldn't carry into a fresh turn.
+          awaitingProvider: null,
           ended: false,
         },
         permanent: [],
@@ -747,6 +768,11 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           bgProcesses: new Map(),
           subagents: new Map(),
           parallelStatus: null,
+          // Same rationale as session:start: a session ending mid-
+          // step (abort, error) shouldn't leave the indicator armed
+          // — the footer would then show "Awaiting model" against a
+          // run that's already terminated.
+          awaitingProvider: null,
           ended: true,
         },
         permanent: [
@@ -794,9 +820,14 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       };
 
     case 'assistant:start':
+      // Clear `awaitingProvider` — the model has started
+      // streaming so the "Awaiting model" indicator isn't
+      // accurate anymore. The compose layer's chip-slot then
+      // picks the assistant chip from `pendingAssistant`.
       return {
         state: {
           ...state,
+          awaitingProvider: null,
           pendingAssistant: {
             messageId: event.messageId,
             text: '',
@@ -883,8 +914,14 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
     }
 
     case 'thinking:start':
+      // Clear `awaitingProvider` — extended thinking started
+      // streaming, the more specific indicator takes the slot.
       return {
-        state: { ...state, thinking: { startedAt: event.ts, messageId: event.messageId } },
+        state: {
+          ...state,
+          awaitingProvider: null,
+          thinking: { startedAt: event.ts, messageId: event.messageId },
+        },
         permanent: [],
       };
 
@@ -929,6 +966,43 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       const nextTools = cloneTools(state.activeTools);
       nextTools.delete(event.toolId);
       if (tool === undefined) return { state: { ...state, activeTools: nextTools }, permanent: [] };
+      // Non-`done` chips bypass the buffer entirely — emit the
+      // tool-end PermanentItem immediately AND flush whatever's
+      // pending so the chronological order stays correct.
+      //
+      // Why: a denied or errored tool is a signal the operator
+      // needs to see fast. The buffer's purpose is to coalesce
+      // SAME-tool successful runs; a failure mid-stream isn't
+      // coalesce-friendly anyway (the user's reported scenario:
+      // a denied bash chip sat in the buffer for 51s because the
+      // agent paused, leaving the operator staring at "Read 6
+      // files" with no signal that the next tool was blocked by
+      // policy). Emitting on the spot fixes that UX.
+      //
+      // Trade-off: a batch where one read fails in the middle
+      // of an otherwise-green run no longer coalesces — the
+      // failure flushes the partial buffer and emits its own
+      // chip, then the surviving items continue in a fresh
+      // buffer. That's strictly more honest: operator sees the
+      // failure boundary instead of one batch chip with
+      // worst-of status.
+      if (event.status !== 'done') {
+        const flushed = flushPendingToolEndBatch(state);
+        const item: PermanentItem = {
+          kind: 'tool-end',
+          name: tool.name,
+          verb: tool.finalVerb,
+          subject: tool.subject,
+          status: event.status,
+          durationMs: event.durationMs,
+          ...(event.summary !== undefined ? { summary: event.summary } : {}),
+          ...(tool.parentId !== undefined ? { parentId: tool.parentId } : {}),
+        };
+        return {
+          state: { ...flushed.state, activeTools: nextTools },
+          permanent: [...flushed.permanent, item],
+        };
+      }
       const incoming: PendingToolEndBatchItem = {
         verb: tool.finalVerb,
         subject: tool.subject,
@@ -974,6 +1048,30 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
         maxCostUsd: event.maxCostUsd ?? null,
       };
       return { state: { ...state, status }, permanent: [] };
+    }
+
+    case 'provider:waiting:start': {
+      // Open the "Awaiting model" indicator. Idempotent on
+      // resume / re-emit: the second start within the same step
+      // refreshes `startedAt` to the latest, which keeps the
+      // displayed elapsed time monotonic against the freshest
+      // signal of when the harness handed off the request.
+      return {
+        state: {
+          ...state,
+          awaitingProvider: { stepN: event.stepN, startedAt: event.ts },
+        },
+        permanent: [],
+      };
+    }
+
+    case 'provider:waiting:end': {
+      // Close the indicator. Safe to fire when nothing is open —
+      // `assistant:start` / `thinking:start` already handle that
+      // case via their own clears, and a duplicate end shouldn't
+      // throw.
+      if (state.awaitingProvider === null) return { state, permanent: [] };
+      return { state: { ...state, awaitingProvider: null }, permanent: [] };
     }
 
     case 'checkpoint:create':
