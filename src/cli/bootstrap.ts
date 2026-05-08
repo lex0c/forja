@@ -22,6 +22,7 @@ import { createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { isTrusted, trustListPath } from '../trust/index.ts';
 import { composeWithEnvironment } from './environment-prompt.ts';
 import { probeGitContext } from './git-context.ts';
+import { localIsoDate } from './local-date.ts';
 import { assembleMemorySection, composeSystemPrompt } from './memory-prompt.ts';
 import { composeWithParallelHint } from './parallel-prompt.ts';
 import { composeWithUserPrompt } from './plan-prompt.ts';
@@ -259,13 +260,21 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
       cwd,
       platform: process.platform,
       modelId: provider.id,
-      // Today's date in `YYYY-MM-DD`. Single Date.now() call at
-      // boot — stable for the whole session, so the env block
-      // sits inside cache breakpoint #1 across turns within a
-      // session. Across session boundaries spanning UTC
-      // midnight the cache invalidates, which is the intended
-      // trade-off.
-      today: new Date().toISOString().split('T')[0] ?? '',
+      // Today's date in `YYYY-MM-DD`, OPERATOR-LOCAL timezone.
+      // Single Date.now() call at boot — stable for the whole
+      // session, so the env block sits inside cache breakpoint
+      // #1 across turns within a session. Across session
+      // boundaries spanning local midnight the cache
+      // invalidates, which is the intended trade-off.
+      //
+      // Local time, not UTC: the model uses this value to
+      // interpret relative requests like "today's commits" /
+      // "yesterday's logs". `Date.toISOString()` would emit
+      // UTC, which is one day ahead in US evening sessions and
+      // similar; the wrong day in the prompt then pushes the
+      // model toward the wrong git --since window. See
+      // `local-date.ts` for the timezone-math rationale.
+      today: localIsoDate(),
       // Git probes are best-effort: when cwd is not a git repo
       // the helper returns null and the env section omits the
       // git sub-block entirely.
