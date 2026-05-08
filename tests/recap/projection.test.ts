@@ -607,6 +607,97 @@ describe('projectRecap', () => {
     expect(out.decisions[0]?.decidedBy).toBe('policy');
   });
 
+  test('files_written aggregates by path so iterative edits do not duplicate rows', () => {
+    // Regression: each successful write_file / edit_file used to
+    // append a new row, so an iterative-edit flow (read → edit
+    // → edit again → edit once more, all on the same file)
+    // produced N rows for the same path. The "## What changed"
+    // headline showed inflated counts ("4 files edited" for 4
+    // edits to a single file) and the "## Files edited" section
+    // listed the path repeatedly. Recap is now per-file, not
+    // per-call.
+    const s = seedSession();
+    const userId = addUserTurn(s.id, 'iterate on src/foo.ts');
+    const aId = addAssistantTurn(s.id, userId, 'editing');
+    addToolCall(
+      aId,
+      'edit_file',
+      { path: 'src/foo.ts', edits: [] },
+      { path: 'src/foo.ts', edits: [], total_replacements: 1, bytes_written: 100 },
+      'done',
+      5,
+      1_301,
+    );
+    addToolCall(
+      aId,
+      'edit_file',
+      { path: 'src/foo.ts', edits: [] },
+      { path: 'src/foo.ts', edits: [], total_replacements: 1, bytes_written: 110 },
+      'done',
+      5,
+      1_302,
+    );
+    addToolCall(
+      aId,
+      'write_file',
+      { path: 'src/foo.ts', content: 'final' },
+      { path: 'src/foo.ts', bytes_written: 5 },
+      'done',
+      5,
+      1_303,
+    );
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.actions.filesWritten).toHaveLength(1);
+    expect(out.actions.filesWritten[0]?.path).toBe('src/foo.ts');
+  });
+
+  test('files_written preserves first-seen order across distinct paths', () => {
+    // Insertion-order pin so audit consumers reading the json
+    // envelope see paths in chronological-touch order. Map's
+    // iteration semantics are load-bearing here; a refactor to
+    // a Set or to a sort-by-path would silently change the
+    // visible order across recaps and break diff-based regression
+    // tests.
+    const s = seedSession();
+    const userId = addUserTurn(s.id, 'edit several');
+    const aId = addAssistantTurn(s.id, userId, 'editing');
+    addToolCall(
+      aId,
+      'edit_file',
+      { path: 'src/zebra.ts', edits: [] },
+      { path: 'src/zebra.ts', edits: [], total_replacements: 1, bytes_written: 1 },
+      'done',
+      5,
+      1_301,
+    );
+    addToolCall(
+      aId,
+      'edit_file',
+      { path: 'src/alpha.ts', edits: [] },
+      { path: 'src/alpha.ts', edits: [], total_replacements: 1, bytes_written: 1 },
+      'done',
+      5,
+      1_302,
+    );
+    // Touch zebra again — should NOT duplicate AND should not
+    // bump it to the end of the list.
+    addToolCall(
+      aId,
+      'edit_file',
+      { path: 'src/zebra.ts', edits: [] },
+      { path: 'src/zebra.ts', edits: [], total_replacements: 1, bytes_written: 1 },
+      'done',
+      5,
+      1_303,
+    );
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.actions.filesWritten.map((f) => f.path)).toEqual(['src/zebra.ts', 'src/alpha.ts']);
+  });
+
   test('bash_background commands report exitCode=-1 instead of 0', () => {
     // Regression: `bash_background` reaches tool_calls.status=
     // 'done' as soon as the process spawns, NOT when it exits.

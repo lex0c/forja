@@ -312,7 +312,22 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
   // Actions — second pass with proper db access, replacing the
   // stand-in walks above.
   const readsByPath = new Map<string, number>();
-  const filesWritten: RecapFileWrite[] = [];
+  // filesWritten is aggregated by path so an iterative-edit flow
+  // (read → edit → edit again → edit once more, all touching
+  // `src/foo.ts`) produces ONE entry per file, not N. Without this,
+  // "## Files edited" listed the same path repeatedly and the
+  // "## What changed" headline showed inflated counts ("4 files
+  // edited" for 4 edits to a single file).
+  //
+  // Map preserves first-seen insertion order, which matches the
+  // chronological order of the bash-tool dispatch loop (oldest
+  // tool_call first via the `seq`-ordered messages query). Audit
+  // consumers reading the json envelope see paths in the order
+  // they were first touched. When `linesAdded` / `linesRemoved`
+  // become real (currently 0/0 placeholders), accumulating them
+  // here is the natural extension — sum across siblings within
+  // the same path key.
+  const writesByPath = new Map<string, RecapFileWrite>();
   const commandsRun: RecapCommandRun[] = [];
   const subagentsSpawned: RecapSubagentSpawn[] = [];
   const checkpointsRefs: { id: string; stepId: string; filesAffected: number }[] = [];
@@ -386,8 +401,14 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
           }
         } else if (FILE_WRITER_TOOLS.has(tc.toolName)) {
           const path = typeof input?.path === 'string' ? input.path : '';
-          if (path.length > 0) {
-            filesWritten.push({
+          if (path.length > 0 && !writesByPath.has(path)) {
+            // First write to this path lands the entry; subsequent
+            // writes to the same path collapse silently (they DID
+            // happen, but the "files edited" view is per-file, not
+            // per-call). When real line deltas arrive, the
+            // collapse becomes accumulation: read existing entry,
+            // sum linesAdded/linesRemoved, write back.
+            writesByPath.set(path, {
               path,
               linesAdded: 0,
               linesRemoved: 0,
@@ -562,7 +583,10 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
     pinnedContext: [],
     actions: {
       filesRead,
-      filesWritten,
+      // Drain the path-keyed Map. Map iteration preserves
+      // insertion order, so callers see paths in the order they
+      // were first touched in the session.
+      filesWritten: [...writesByPath.values()],
       commandsRun,
       webFetches: [],
       subagentsSpawned,
