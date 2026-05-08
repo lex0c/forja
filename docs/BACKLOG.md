@@ -15,6 +15,118 @@ Format:
 
 ---
 
+## [2026-05-08] m4/critique — Slices D–G: status chip, /cost, /critique, real-model eval
+
+**Done:** Closes the four operator-facing follow-ups left open at
+the end of Slice C. All four are independent (no shared schema /
+type drift between them) so they ship as one BACKLOG entry but
+distinct commits on the same `feat/m4-critique` branch.
+
+### Slice D — TUI status-line indicator (commit 4c1f0ab)
+
+| File | What |
+|---|---|
+| `src/tui/events.ts` | NEW `CritiqueStartEvent` / `CritiqueEndEvent` UIEvent types. Carry `stepN` and `toolPlanWrites` so the renderer can pair the chip with the step it's reviewing and pick a color. |
+| `src/tui/state.ts` | NEW `LiveState.critique: { startedAt, stepN, toolPlanWrites } \| null`. Reducer cases for `critique:start` / `critique:end`. `session:end` clears any dangling chip so a Ctrl+C abort during the critic call doesn't leave a zombie indicator. |
+| `src/tui/harness-adapter.ts` | Translates `critique_started` / `critique_finished` HarnessEvents into the new UIEvents (was previously no-op, with a comment punting the indicator to "future"). |
+| `src/tui/render/critique-chip.ts` | NEW chip component mirroring `thinking-chip.ts` structure. Color escalates with `toolPlanWrites`: `warn` (yellow) for text-only end-of-step reviews, `error` (red) for writes-step plan critiques. Same elapsed-time format the thinking chip uses. |
+| `src/tui/render/compose.ts` | Wires the chip into the live region between `pendingAssistant` and `awaitingProvider` — critique is a defined post-stop state, not a fallback for the gap before any provider event of the next step. |
+| `tests/tui/state.test.ts` + `tests/tui/render/critique-chip.test.ts` + `tests/tui/harness-adapter.test.ts` | 9 new tests covering the lifecycle, the writes-step color escalation, the elapsed format / clock-skew clamp, the boundary cleanup on session:end, and the adapter translation in both directions. |
+
+### Slice E — `/cost` shows critique line (commit 304a687)
+
+| File | What |
+|---|---|
+| `src/cli/slash/types.ts` | `SlashContext.cumulative` extended with `critiqueCostUsd: number`. |
+| `src/cli/repl.ts` | Tracker initialized with the new field; `onHarnessEvent` increments on `critique_finished` (per-event, NOT per session_finished — keeps the count accurate when a run aborts mid-step). |
+| `src/cli/slash/commands/cost.ts` | Emits a second note line `└─ critique: $X.XX` only when `critiqueCostUsd > 0`, so default-mode runs (gate=off) keep the existing single-line output. |
+| 7 test fixtures + a focused commands.test pair | Updated to the new shape; 2 new tests pin the omit-when-zero and the breakdown-when-non-zero behavior. |
+
+### Slice F — `/critique` slash command (commit 053aeb8)
+
+| File | What |
+|---|---|
+| `src/cli/slash/commands/critique.ts` | NEW operator-side introspection: `/critique` (config + last 10 runs), `/critique <N>` (limit 1..200), `/critique config` (config-only). Renders mode/threshold/max_overhead_ms/prompt_version, distinct critic provider (or "executor: …" when shared), per-run rows with [writes]/[text] flag + audit code + decision + filtered/raw issues + cost + reason, plus an aggregate by code sorted by frequency. |
+| `src/cli/slash/index.ts` | Registers the command in `createBuiltinRegistry`. |
+| `tests/cli/slash/commands.test.ts` + `tests/cli/slash/dispatch.test.ts` | 8 new tests for the command (config-only output, default-fallback formatting, distinct provider rendering, no-session hint, recent-runs listing with newest-first ordering and aggregate, limit cap, validation errors). Registry test bumped from 14 to 15 builtins. |
+
+### Slice G — Real-model eval (commit pending)
+
+| File | What |
+|---|---|
+| `src/evals/critique-real.ts` | NEW runner. Reads the same fixtures the deterministic suite uses and calls live Anthropic (default `anthropic/claude-haiku-4-5`, override via `--model`) with the engine's prompt. Parses `--threshold` (0..1) and `--max-overhead` (positive integer). ENV-gated: no `ANTHROPIC_API_KEY` ⇒ exit 0 with a "SKIP" note, so CI runs without secrets stay green. Per-fixture PASS/FAIL/SKIP plus aggregate FP rate (clean fixtures the model wrongly flagged) and FN rate (bugged fixtures the model missed). |
+| `evals/critique/real-expectations.ts` | NEW. Behavioral predicates per fixture: `must_flag` (bug must surface above threshold), `must_not_flag` (clean fixture must not produce filtered issues), `skip` (parser-robustness fixtures whose target is engine code, not model behavior). Each entry carries a `why:` string so a CI failure prints the rationale alongside the assertion. |
+| `tests/evals/critique-real.test.ts` | 6 unit tests for the runner shell — ENV gating, arg validation (unknown flag / bad threshold / bad max-overhead / unknown model), no live API calls (those are exercised via `bun run eval:critique` in environments with the key). |
+| `package.json` | NEW script `eval:critique` → `bun run src/evals/critique-real.ts`. |
+
+**Decisions:**
+
+- **Critique chip color escalates with writes-intent.** Yellow
+  (warn) for text-only end-of-step reviews; red (error) for
+  writes-step plan critiques. Same color rationale as the
+  modal's `Critique — about to mutate` headline: an operator's
+  fast scan should distinguish "model is doing a soft
+  check" from "model is about to mutate, currently being
+  reviewed". The two states deserve visually different chips.
+- **`/cost` omits the critique line at zero.** Most operators run
+  with `mode='off'` (the default). A "critique: $0" line every
+  time `/cost` is invoked would be noise. The line surfaces only
+  after the first `critique_finished` event with non-zero cost,
+  matching the precedent in `/sessions` (which omits "no
+  sessions" only when the list is empty).
+- **`/critique` defaults to last 10 runs, capped at 200.** Mirrors
+  the `/sessions` cap shape — operators wanting a wider view
+  query `critique_runs` directly. The 200 cap protects scrollback
+  from a `/critique 9999999` typo blowing out the buffer.
+- **Real-model eval is ENV-gated, not test-suite-gated.**
+  Putting the live call inside `bun test` would cost real money
+  on every contributor's local run AND flake on provider
+  outages. ENV gating + a dedicated `eval:critique` script
+  keeps the feedback loop fast for unit work while letting
+  operators (or a CI workflow with the secret) exercise
+  real-model behavior on demand.
+- **Real-expectations are loose by design.** Predicates assert
+  direction (`must_flag` / `must_not_flag`), not exact
+  filtered-count or confidence values. Real models drift across
+  versions; tightening the predicates would create a flaky
+  signal that punishes legitimate model upgrades. Operators
+  tuning threshold should re-derive these from production
+  `critique_runs` telemetry once it accumulates.
+- **Per-fixture `why:` strings on real-expectations.** A CI
+  failure ("FAIL 02-flagged-bug — expected at least one filtered
+  issue, got 0") is more useful with the rationale appended:
+  "Real handle-leak bug after null-set; a critic missing this is
+  a false negative." Keeps the assertion self-documenting at the
+  point of failure.
+
+**Pending (deferred to future work):**
+
+- **Migration to `failure_events`.** Still blocked on the
+  cross-cutting table being designed (BACKLOG line 39). When
+  that lands, the columns mapped to `critique_runs` migrate
+  mechanically: `code` → `event_code`, plus a `subsystem =
+  'critique'` discriminator. Tracked in the Slice C BACKLOG
+  entry's Pending section.
+- **CI workflow that runs `eval:critique`.** The script is
+  ready; wiring a GitHub Actions / equivalent workflow with
+  `secrets.ANTHROPIC_API_KEY` is the operator's choice. A weekly
+  cron + on-PR-touching-`src/critique/**` shape is the obvious
+  cadence.
+- **Threshold-tuning telemetry pipeline.** Now that
+  `critique_runs.threshold` is persisted alongside
+  `raw_count` and `filtered_count`, an operator could replay
+  different thresholds against historical raw issues without
+  re-billing. Out of scope for this slice — the data is there;
+  the analysis surface is future work.
+
+**Next:** Branch is ready for review / PR. The five-slice arc
+(A: engine, B: loop, C: TUI/audit/eval/TOML, D-G: indicator + UX
+polish + real eval) closes the operator-facing surface for
+self-critique. Spec-pending items above stay tracked but no
+longer block shipping.
+
+---
+
 ## [2026-05-08] m4/critique — Slice C: TUI modal + audit + eval + TOML loader
 
 **Done:** Closes the Slice B punch list — the harness loop now
