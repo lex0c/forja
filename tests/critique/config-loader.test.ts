@@ -285,6 +285,161 @@ threshold = 1.7
       rmSync(cwd, { recursive: true, force: true });
     }
   });
+
+  test('non-string mode (e.g. mode = true) emits a warning, not silent fallback', async () => {
+    // The previous behavior: `typeof !== 'string'` skipped the
+    // entire block, no warning, mode stayed at default 'off'.
+    // Operator who typo'd `mode = true` (forgot quotes) saw NO
+    // signal that critique was disabled. Bootstrap path advertises
+    // critiqueWarnings on stderr; this test pins that the parser
+    // contributes one for present-but-wrong-type values.
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[critique]
+mode = true
+`,
+      );
+      const result = loadCritiqueConfig({
+        cwd,
+        registry: stubRegistry([]),
+        env: { HOME: '/none' },
+      });
+      expect(result.config.mode).toBe(DEFAULT_CRITIQUE_CONFIG.mode);
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toContain('mode=true');
+      expect(result.warnings[0]).toContain('must be a string');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('non-number threshold emits a warning', async () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[critique]
+threshold = "high"
+`,
+      );
+      const result = loadCritiqueConfig({
+        cwd,
+        registry: stubRegistry([]),
+        env: { HOME: '/none' },
+      });
+      expect(result.config.threshold).toBe(DEFAULT_CRITIQUE_CONFIG.threshold);
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toContain('threshold=');
+      expect(result.warnings[0]).toContain('finite number');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('non-number max_overhead_ms emits a warning naming the snake key', async () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[critique]
+max_overhead_ms = "fast"
+`,
+      );
+      const result = loadCritiqueConfig({
+        cwd,
+        registry: stubRegistry([]),
+        env: { HOME: '/none' },
+      });
+      expect(result.config.maxOverheadMs).toBe(DEFAULT_CRITIQUE_CONFIG.maxOverheadMs);
+      expect(result.warnings).toHaveLength(1);
+      // The warning names the actual key the operator typed, not
+      // the camelCase alias — matches the operator's mental model.
+      expect(result.warnings[0]).toContain('max_overhead_ms=');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('non-string prompt_version emits a warning', async () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[critique]
+prompt_version = 5
+`,
+      );
+      const result = loadCritiqueConfig({
+        cwd,
+        registry: stubRegistry([]),
+        env: { HOME: '/none' },
+      });
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toContain('prompt_version=5');
+      expect(result.warnings[0]).toContain('must be a string');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('non-string model emits a warning', async () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[critique]
+model = false
+`,
+      );
+      const result = loadCritiqueConfig({
+        cwd,
+        registry: stubRegistry([]),
+        env: { HOME: '/none' },
+      });
+      expect(result.critiqueProvider).toBeNull();
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toContain('model=false');
+      expect(result.warnings[0]).toContain('must be a string');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('empty-string model emits a warning (not silent skip)', async () => {
+    const cwd = makeTempCwd();
+    try {
+      mkdirSync(join(cwd, '.agent'), { recursive: true });
+      writeFileSync(
+        join(cwd, '.agent', 'config.toml'),
+        `
+[critique]
+model = ""
+`,
+      );
+      const result = loadCritiqueConfig({
+        cwd,
+        registry: stubRegistry([]),
+        env: { HOME: '/none' },
+      });
+      expect(result.critiqueProvider).toBeNull();
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toContain('model is empty');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('loadCritiqueConfig — model resolution', () => {

@@ -113,46 +113,109 @@ const parseLayer = (path: string | null, source: string): ParseResult => {
   }
   const c = section as Record<string, unknown>;
 
-  if (typeof c.mode === 'string') {
-    if (VALID_MODES.has(c.mode)) {
-      layer.mode = c.mode as CritiqueMode;
-    } else {
+  // Format a value defensively for inclusion in a warning string.
+  // JSON.stringify handles objects/arrays/null without throwing on
+  // common shapes; the fallback is `String(v)` for the unlikely
+  // case of a value that JSON refuses (BigInt, function, circular
+  // reference). Operators reading the warning need to recognize
+  // what they typed — `mode=true` reads better as "true" than as
+  // "[object Object]".
+  const fmtBad = (v: unknown): string => {
+    try {
+      return JSON.stringify(v) ?? String(v);
+    } catch {
+      return String(v);
+    }
+  };
+
+  // Validate `mode` only when it's PRESENT in the TOML. A missing
+  // field falls through to the default — that's not a misconfig.
+  // But a present field with a wrong type (`mode = true`, `mode =
+  // 1`, `mode = ["always"]`) used to silently reset to default,
+  // which the bootstrap path advertises warnings for and operators
+  // expected. Now: any present-but-wrong value emits a warning
+  // pointing at the exact field.
+  if (c.mode !== undefined) {
+    if (typeof c.mode !== 'string') {
+      warnings.push(
+        `${source} config (${path}): [critique].mode=${fmtBad(c.mode)} must be a string (off|on_writes|always); ignoring`,
+      );
+    } else if (!VALID_MODES.has(c.mode)) {
       warnings.push(
         `${source} config (${path}): [critique].mode='${c.mode}' is invalid (must be off|on_writes|always); ignoring`,
       );
+    } else {
+      layer.mode = c.mode as CritiqueMode;
     }
   }
-  if (typeof c.threshold === 'number' && Number.isFinite(c.threshold)) {
-    if (c.threshold >= 0 && c.threshold <= 1) {
-      layer.threshold = c.threshold;
-    } else {
+
+  if (c.threshold !== undefined) {
+    if (typeof c.threshold !== 'number' || !Number.isFinite(c.threshold)) {
+      warnings.push(
+        `${source} config (${path}): [critique].threshold=${fmtBad(c.threshold)} must be a finite number in [0,1]; ignoring`,
+      );
+    } else if (c.threshold < 0 || c.threshold > 1) {
       warnings.push(
         `${source} config (${path}): [critique].threshold=${c.threshold} out of range [0,1]; ignoring`,
       );
+    } else {
+      layer.threshold = c.threshold;
     }
   }
+
   // Accept either snake_case (`max_overhead_ms`, spec §5.4) or
   // camelCase (`maxOverheadMs`, harness API). The TOML convention
   // is snake_case but accepting both lets operators copy-paste from
-  // either the spec or the API docs without churn.
-  const overhead = c.max_overhead_ms ?? c.maxOverheadMs;
-  if (typeof overhead === 'number' && Number.isFinite(overhead)) {
-    if (overhead >= 0) {
-      layer.maxOverheadMs = overhead;
-    } else {
+  // either the spec or the API docs without churn. snake wins on
+  // tie (canonical per spec); operator who declared both with
+  // different values typed a bug we surface separately.
+  const snakeOverhead = c.max_overhead_ms;
+  const camelOverhead = c.maxOverheadMs;
+  const overhead = snakeOverhead ?? camelOverhead;
+  const overheadKey = snakeOverhead !== undefined ? 'max_overhead_ms' : 'maxOverheadMs';
+  if (overhead !== undefined) {
+    if (typeof overhead !== 'number' || !Number.isFinite(overhead)) {
       warnings.push(
-        `${source} config (${path}): [critique].max_overhead_ms=${overhead} must be non-negative; ignoring`,
+        `${source} config (${path}): [critique].${overheadKey}=${fmtBad(overhead)} must be a non-negative finite number; ignoring`,
       );
+    } else if (overhead < 0) {
+      warnings.push(
+        `${source} config (${path}): [critique].${overheadKey}=${overhead} must be non-negative; ignoring`,
+      );
+    } else {
+      layer.maxOverheadMs = overhead;
     }
   }
+
   // Same dual-key tolerance for prompt_version / promptVersion.
-  const promptVersion = c.prompt_version ?? c.promptVersion;
-  if (typeof promptVersion === 'string' && promptVersion.length > 0) {
-    layer.promptVersion = promptVersion;
+  const snakePV = c.prompt_version;
+  const camelPV = c.promptVersion;
+  const promptVersion = snakePV ?? camelPV;
+  const pvKey = snakePV !== undefined ? 'prompt_version' : 'promptVersion';
+  if (promptVersion !== undefined) {
+    if (typeof promptVersion !== 'string') {
+      warnings.push(
+        `${source} config (${path}): [critique].${pvKey}=${fmtBad(promptVersion)} must be a string; ignoring`,
+      );
+    } else if (promptVersion.length === 0) {
+      warnings.push(`${source} config (${path}): [critique].${pvKey} is empty; ignoring`);
+    } else {
+      layer.promptVersion = promptVersion;
+    }
   }
-  if (typeof c.model === 'string' && c.model.length > 0) {
-    layer.model = c.model;
+
+  if (c.model !== undefined) {
+    if (typeof c.model !== 'string') {
+      warnings.push(
+        `${source} config (${path}): [critique].model=${fmtBad(c.model)} must be a string (e.g. 'anthropic/claude-haiku-4-5'); ignoring`,
+      );
+    } else if (c.model.length === 0) {
+      warnings.push(`${source} config (${path}): [critique].model is empty; ignoring`);
+    } else {
+      layer.model = c.model;
+    }
   }
+
   return { layer, warnings };
 };
 

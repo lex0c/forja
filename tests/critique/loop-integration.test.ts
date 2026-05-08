@@ -686,9 +686,7 @@ describe('runAgent — critique soft-failure paths', () => {
       countTokens: () => Promise.resolve(0),
     };
 
-    const exec = scriptedProvider([
-      { text: 'output', usage: { input: 100, output: 50 } },
-    ]);
+    const exec = scriptedProvider([{ text: 'output', usage: { input: 100, output: 50 } }]);
     const registry = createToolRegistry();
     registry.register(readOnlyTool);
     const config = {
