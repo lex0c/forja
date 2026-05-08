@@ -10,6 +10,8 @@ import type { HarnessConfig, HarnessEvent, HarnessResult } from '../../src/harne
 import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
+import { recordCritiqueRun } from '../../src/storage/repos/critique-runs.ts';
+import { createSession } from '../../src/storage/repos/sessions.ts';
 import { addTrustedDir, loadTrustedDirs } from '../../src/trust/index.ts';
 
 // Build a ParsedArgs shape with all the flags the REPL inspects set
@@ -2733,6 +2735,135 @@ describe('repl — slash commands integration', () => {
     expect(newWrites).toMatch(/\$0\.0246/);
     expect(newWrites).toContain('8 steps');
     expect(newWrites).toContain('2 turns');
+
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('slash playbook critique spend rolls into /cost critique subtotal', async () => {
+    // Regression: cumulative.critiqueCostUsd was only mutated on
+    // top-level critique_finished events, but child critique
+    // events from a slash-dispatched playbook flow through IPC as
+    // subagent_progress and don't trigger that branch. Result:
+    // /cost showed the playbook's full cost in the cumulative
+    // line (including child critique) but ZERO of it in the
+    // breakdown — operator running `mode='always'` playbooks saw
+    // a critique-line that only counted parent-direct spend.
+    //
+    // The bridge now queries critique_runs by the child's
+    // sessionId at dispatch-completion time and folds the cost
+    // into the subtotal. This test pre-seeds the child session +
+    // critique rows so the fake runSubagent's resolved
+    // sessionId points at real data.
+    const stub = makeBootstrapStub();
+    const fakeDef = {
+      name: 'fake',
+      description: 'fake subagent for tests',
+      tools: [],
+      budget: { maxSteps: 1, maxCostUsd: 0.01 },
+      systemPrompt: 'noop',
+      scope: 'project',
+      isolation: 'none',
+      sourcePath: '/dev/null',
+      sourceSha256: '0'.repeat(64),
+      slash: 'fake',
+    };
+    (stub.subagents.byName as Map<string, unknown>).set('fake', fakeDef);
+
+    // Pre-seed a child session with two critique rows. The fake
+    // runSubagent below resolves with this sessionId; the
+    // bridge's listCritiqueRunsBySession call walks both rows
+    // and folds 0.005 + 0.003 = 0.008 into critiqueCostUsd.
+    const childSessionId = 'sess-fake-child';
+    createSession(stub.db, {
+      id: childSessionId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+    });
+    recordCritiqueRun(stub.db, {
+      sessionId: childSessionId,
+      stepN: 1,
+      mode: 'always',
+      strategy: 'llm',
+      decision: 'no_modal',
+      code: 'critique.clean',
+      rawCount: 0,
+      filteredCount: 0,
+      overallConfidence: 0.95,
+      durationMs: 100,
+      costUsd: 0.005,
+      toolPlanWrites: false,
+      promptVersion: 'v2',
+      threshold: 0.85,
+    });
+    recordCritiqueRun(stub.db, {
+      sessionId: childSessionId,
+      stepN: 2,
+      mode: 'always',
+      strategy: 'llm',
+      decision: 'ignore',
+      code: 'critique.warning_ignored',
+      rawCount: 1,
+      filteredCount: 1,
+      overallConfidence: 0.5,
+      durationMs: 200,
+      costUsd: 0.003,
+      toolPlanWrites: false,
+      promptVersion: 'v2',
+      threshold: 0.85,
+    });
+
+    const fakeRunSubagent = async (): ReturnType<
+      typeof import('../../src/subagents/index.ts').runSubagent
+    > => ({
+      output: '(no-op)',
+      sessionId: childSessionId,
+      status: 'done',
+      reason: 'done',
+      // Total cost INCLUDES critique cost per the harness
+      // contract — 0.05 total of which 0.008 is critique.
+      costUsd: 0.05,
+      steps: 1,
+      durationMs: 0,
+    });
+
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      runSubagentOverride: fakeRunSubagent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+
+    stdin.feed('/fake go\r');
+    await tick();
+    await tick();
+    await flushFrame();
+
+    const before = writes.length;
+    stdin.feed('/cost\r');
+    await tick();
+    await flushFrame();
+    const newWrites = writes.slice(before).join('');
+
+    // Cumulative pulls the full result.costUsd ($0.05).
+    expect(newWrites).toContain('cumulative:');
+    expect(newWrites).toMatch(/\$0\.0500/);
+    // Breakdown line MUST surface — without the bridge's
+    // critique-row roll-up this would not render at all (the
+    // line is gated on critiqueCostUsd > 0 in commands/cost.ts).
+    expect(newWrites).toContain('└─ critique:');
+    // Sum of the two pre-seeded rows: 0.005 + 0.003 = 0.008.
+    expect(newWrites).toMatch(/critique:\s*\$0\.0080/);
 
     stdin.feed('\x04');
     expect(await promise).toBe(130);

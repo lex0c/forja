@@ -32,6 +32,7 @@ import {
   loadHistory,
   searchHistory,
 } from '../storage/history.ts';
+import { listCritiqueRunsBySession } from '../storage/repos/critique-runs.ts';
 import { completeSession, createSession } from '../storage/repos/sessions.ts';
 import { runSubagent } from '../subagents/index.ts';
 import { addTrustedDir, isTrusted, trustListPath } from '../trust/index.ts';
@@ -1475,6 +1476,30 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         // the same DB at execution time; we just need its session
         // id to find them again.
         trackReplSessionId(result.sessionId);
+        // Roll the playbook child's critique spend into the REPL
+        // critique subtotal. The foreground accumulator at
+        // onHarnessEvent only sees `critique_finished` events from
+        // the parent harness; the child's events flow through IPC
+        // as `subagent_progress` and don't trigger that branch. So
+        // without this query, /cost shows the playbook's full cost
+        // in `cumulative.costUsd` (including the child's critique
+        // contribution) but ZERO of it in
+        // `cumulative.critiqueCostUsd` — the breakdown would
+        // underreport critique spend whenever a playbook ran.
+        // Same fail-soft try/catch as the rest of this finally:
+        // a SQLite read throw at audit-rollup time MUST NOT mask
+        // the dispatch result the operator is waiting for.
+        try {
+          for (const row of listCritiqueRunsBySession(db, result.sessionId)) {
+            if (Number.isFinite(row.costUsd)) {
+              cumulative.critiqueCostUsd += row.costUsd;
+            }
+          }
+        } catch {
+          // Audit roll-up failed; the per-row data is still in DB
+          // for `/critique`, just not folded into the live
+          // subtotal. Subsequent dispatches still work.
+        }
         return result;
       } finally {
         // Drop the gate even on throw — a stuck `playbookRunning`
