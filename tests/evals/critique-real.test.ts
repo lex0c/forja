@@ -26,28 +26,68 @@ const collectIo = () => {
   };
 };
 
-describe('critique-real runner — ENV gating', () => {
-  test('no ANTHROPIC_API_KEY → exit 0 with skip note', async () => {
+// Pre-baked envs for the model-aware credential gate. Cloud
+// families want their own var; passing these directly lets each
+// test target a specific gate path.
+const ANTHROPIC_ENV: NodeJS.ProcessEnv = { ANTHROPIC_API_KEY: 'sk-fake' };
+const OPENAI_ENV: NodeJS.ProcessEnv = { OPENAI_API_KEY: 'sk-fake' };
+const EMPTY_ENV: NodeJS.ProcessEnv = {};
+
+describe('critique-real runner — credential gate (model-aware)', () => {
+  test('default model (anthropic) without ANTHROPIC_API_KEY → SKIP', async () => {
     const io = collectIo();
     const { exitCode } = await runCritiqueRealEval([], {
       out: io.out,
       err: io.err,
-      apiKey: undefined,
+      env: EMPTY_ENV,
     });
     expect(exitCode).toBe(0);
     expect(io.outLines.join('\n')).toContain('SKIP');
+    // SKIP message names the missing var so the operator knows
+    // what to set.
     expect(io.outLines.join('\n')).toContain('ANTHROPIC_API_KEY');
   });
 
-  test('empty-string ANTHROPIC_API_KEY also gates as skip', async () => {
+  test('empty-string ANTHROPIC_API_KEY counts as missing', async () => {
     const io = collectIo();
     const { exitCode } = await runCritiqueRealEval([], {
       out: io.out,
       err: io.err,
-      apiKey: '',
+      env: { ANTHROPIC_API_KEY: '' },
     });
     expect(exitCode).toBe(0);
     expect(io.outLines.join('\n')).toContain('SKIP');
+  });
+
+  test('--model openai/... with OPENAI_API_KEY (no Anthropic) executes past the gate', async () => {
+    // Regression: the previous shape skipped on missing
+    // ANTHROPIC_API_KEY before resolving --model, so an operator
+    // with only OpenAI credentials saw a false SKIP for
+    // openai-family models. Now the gate keys on the resolved
+    // model's family — `openai/...` checks for OPENAI_API_KEY,
+    // not for Anthropic's. The test uses an unknown openai model
+    // id so we trip "unknown model" AFTER the gate (proving the
+    // gate let us through) without making a real network call.
+    const io = collectIo();
+    const { exitCode } = await runCritiqueRealEval(['--model', 'openai/imaginary'], {
+      out: io.out,
+      err: io.err,
+      env: OPENAI_ENV,
+    });
+    // Past the gate (no SKIP); falls to unknown-model exit 2.
+    expect(exitCode).toBe(2);
+    expect(io.outLines.join('\n')).not.toContain('SKIP');
+    expect(io.errLines.join('\n')).toContain('unknown model');
+  });
+
+  test('SKIP message names the model id so multi-provider operators see which one needs creds', async () => {
+    const io = collectIo();
+    await runCritiqueRealEval(['--model', 'anthropic/claude-haiku-4-5'], {
+      out: io.out,
+      err: io.err,
+      env: EMPTY_ENV,
+    });
+    expect(io.outLines.join('\n')).toContain('anthropic/claude-haiku-4-5');
   });
 });
 
@@ -57,7 +97,7 @@ describe('critique-real runner — arg parsing', () => {
     const { exitCode } = await runCritiqueRealEval(['--bogus'], {
       out: io.out,
       err: io.err,
-      apiKey: 'sk-fake-but-not-empty',
+      env: ANTHROPIC_ENV,
     });
     expect(exitCode).toBe(2);
     expect(io.errLines.join('\n')).toContain("unknown arg '--bogus'");
@@ -68,7 +108,7 @@ describe('critique-real runner — arg parsing', () => {
     const { exitCode } = await runCritiqueRealEval(['--threshold', '2.5'], {
       out: io.out,
       err: io.err,
-      apiKey: 'sk-fake',
+      env: ANTHROPIC_ENV,
     });
     expect(exitCode).toBe(2);
     expect(io.errLines.join('\n')).toContain('--threshold');
@@ -79,7 +119,7 @@ describe('critique-real runner — arg parsing', () => {
     const { exitCode } = await runCritiqueRealEval(['--max-overhead', '-100'], {
       out: io.out,
       err: io.err,
-      apiKey: 'sk-fake',
+      env: ANTHROPIC_ENV,
     });
     expect(exitCode).toBe(2);
     expect(io.errLines.join('\n')).toContain('--max-overhead');
@@ -98,7 +138,7 @@ describe('critique-real runner — arg parsing', () => {
       {
         out: io.out,
         err: io.err,
-        apiKey: 'sk-fake',
+        env: ANTHROPIC_ENV,
       },
     );
     // Bumped past parseArgs; fails on the (now-deferred) unknown-
@@ -112,7 +152,7 @@ describe('critique-real runner — arg parsing', () => {
     const { exitCode } = await runCritiqueRealEval(['--threshold'], {
       out: io.out,
       err: io.err,
-      apiKey: 'sk-fake',
+      env: ANTHROPIC_ENV,
     });
     expect(exitCode).toBe(2);
     const errOut = io.errLines.join('\n');
@@ -127,7 +167,7 @@ describe('critique-real runner — arg parsing', () => {
       {
         out: io.out,
         err: io.err,
-        apiKey: 'sk-fake',
+        env: ANTHROPIC_ENV,
       },
     );
     expect(exitCode).toBe(2);

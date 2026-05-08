@@ -40,7 +40,7 @@ import { REAL_EXPECTATIONS, type RealExpectation } from '../../evals/critique/re
 import { DEFAULT_CRITIQUE_CONFIG, runCritique } from '../critique/index.ts';
 import type { CritiqueResult } from '../critique/index.ts';
 import { createDefaultRegistry } from '../providers/index.ts';
-import type { Provider } from '../providers/index.ts';
+import type { Provider, ProviderFamily } from '../providers/index.ts';
 
 const FIXTURES: readonly CritiqueFixture[] = [f01, f02, f03, f04, f05, f06];
 
@@ -173,21 +173,55 @@ const formatOutcome = (o: FixtureOutcome): string => {
   return `[${tag}] ${o.fixture.padEnd(28)}${dur}${cost} — ${o.reason}`;
 };
 
+// Env var(s) each provider family expects for credentials. Mirrors
+// what the provider factories actually read (see
+// src/providers/{anthropic,openai,google}/index.ts) — when more
+// than one var is accepted (Google honors both GOOGLE_API_KEY and
+// GEMINI_API_KEY), all are listed and the SKIP message names them
+// together so the operator sees their options. Local providers
+// (`ollama`, `llama_cpp`) need no key; an empty list signals
+// "always considered configured".
+//
+// Adding a future provider family means: provider's factory reads
+// some env, eval needs the same gate. Keep this map in sync as
+// new factories land — the runner test suite covers the
+// "unknown model" path but a brand-new family with the wrong
+// gate would silently SKIP every run until someone notices.
+const ENV_VARS_BY_FAMILY: Record<ProviderFamily, readonly string[]> = {
+  anthropic: ['ANTHROPIC_API_KEY'],
+  openai: ['OPENAI_API_KEY'],
+  google: ['GOOGLE_API_KEY', 'GEMINI_API_KEY'],
+  mistral: ['MISTRAL_API_KEY'],
+  ollama: [],
+  llama_cpp: [],
+};
+
+const hasAnyEnvVar = (env: NodeJS.ProcessEnv, vars: readonly string[]): boolean => {
+  if (vars.length === 0) return true;
+  for (const name of vars) {
+    const value = env[name];
+    if (value !== undefined && value.length > 0) return true;
+  }
+  return false;
+};
+
 export const runCritiqueRealEval = async (
   argv: readonly string[],
   io: {
     out: (line: string) => void;
     err: (line: string) => void;
-    apiKey: string | undefined;
+    // Full env, not a single API key — the credential gate has to
+    // be model-aware. An operator running `--model openai/...`
+    // with valid OPENAI_API_KEY but no ANTHROPIC_API_KEY should
+    // execute, not be told to set the wrong variable.
+    env: NodeJS.ProcessEnv;
   },
 ): Promise<{ exitCode: number; outcomes: FixtureOutcome[] }> => {
-  if (io.apiKey === undefined || io.apiKey.length === 0) {
-    io.out(
-      'critique-real: SKIP (no ANTHROPIC_API_KEY in environment; this eval requires a live API call).',
-    );
-    return { exitCode: 0, outcomes: [] };
-  }
-
+  // Parse args BEFORE the credential gate so the gate can key on
+  // the resolved model's family. The previous shape skipped on a
+  // missing ANTHROPIC_API_KEY before even looking at --model,
+  // which made --model openai/... return a false SKIP for users
+  // who only had OpenAI credentials configured.
   let args: RunArgs;
   try {
     args = parseArgs(argv);
@@ -206,6 +240,20 @@ export const runCritiqueRealEval = async (
         .join(', ')}`,
     );
     return { exitCode: 2, outcomes: [] };
+  }
+
+  // Credential gate, keyed on the resolved model's family. Local
+  // families (ollama / llama_cpp) skip the check entirely because
+  // their factories don't read an API key. Cloud families list
+  // their accepted env var(s); operator with any of them set is
+  // considered configured.
+  const requiredVars = ENV_VARS_BY_FAMILY[entry.family];
+  if (!hasAnyEnvVar(io.env, requiredVars)) {
+    const varList = requiredVars.join(' / ');
+    io.out(
+      `critique-real: SKIP (no ${varList} in environment for ${args.modelId}; this eval requires a live API call).`,
+    );
+    return { exitCode: 0, outcomes: [] };
   }
   let provider: Provider;
   try {
@@ -316,7 +364,7 @@ if (import.meta.main) {
   const { exitCode } = await runCritiqueRealEval(Bun.argv.slice(2), {
     out: (line) => console.log(line),
     err: (line) => console.error(line),
-    apiKey: process.env.ANTHROPIC_API_KEY,
+    env: process.env,
   });
   process.exit(exitCode);
 }
