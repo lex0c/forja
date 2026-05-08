@@ -161,7 +161,29 @@ const dayBoundsUtc = (yyyyMmDd: string): { start: number; end: number } => {
   if (m === null) {
     throw new Error(`day scope expects YYYY-MM-DD, got: ${yyyyMmDd}`);
   }
-  const start = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 0, 0, 0, 0);
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  const start = Date.UTC(year, month - 1, day, 0, 0, 0, 0);
+  // Round-trip validation: `Date.UTC` silently normalizes
+  // calendar overflows (Feb 31 → Mar 3, month 13 → next-year
+  // January, day 0 → previous month's last day). Without this
+  // check, an operator typing `/recap day 2026-02-31` would get
+  // back a recap of March 3 with no error — silently wrong, the
+  // worst failure mode for an audit-shaped surface.
+  // Comparing the components the constructor produced against
+  // the values the operator typed catches every overflow shape:
+  // month 13 / day 32 / Feb 31 / day 0 / month 0 all make AT
+  // LEAST one of the three components diverge after the
+  // normalization.
+  const back = new Date(start);
+  if (
+    back.getUTCFullYear() !== year ||
+    back.getUTCMonth() !== month - 1 ||
+    back.getUTCDate() !== day
+  ) {
+    throw new Error(`day scope received an invalid calendar date: ${yyyyMmDd}`);
+  }
   const end = start + 24 * 60 * 60 * 1000;
   return { start, end };
 };

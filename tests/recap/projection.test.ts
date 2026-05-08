@@ -514,4 +514,46 @@ describe('projectRecap', () => {
       }),
     ).toThrow(/YYYY-MM-DD/);
   });
+
+  test('day scope rejects calendar-overflow dates that the regex would accept', () => {
+    // Regression: `Date.UTC` silently normalizes invalid
+    // calendar dates (Feb 31 → Mar 3, day 0 → previous month's
+    // last day, month 13 → next-year January). Without
+    // round-trip validation, the regex passes, the bounds get
+    // computed against the wrong day, and the operator sees a
+    // recap of a different date with no error. Each shape below
+    // exercises one normalization path.
+    const invalid: { date: string; what: string }[] = [
+      { date: '2026-02-31', what: 'Feb 31 → Mar 3 (day-of-month overflow in short month)' },
+      { date: '2026-04-31', what: 'Apr 31 → May 1 (day-of-month overflow in 30-day month)' },
+      { date: '2025-02-29', what: 'Feb 29 in a non-leap year → Mar 1' },
+      { date: '2026-13-01', what: 'month 13 → January of next year' },
+      { date: '2026-00-15', what: 'month 0 → December of previous year' },
+      { date: '2026-02-00', what: 'day 0 → last day of previous month' },
+      { date: '2026-02-32', what: 'day 32 → next month' },
+    ];
+    for (const { date, what } of invalid) {
+      expect(() =>
+        projectRecap(db, {
+          scope: { kind: 'day', cwd: '/proj', date },
+        }),
+      ).toThrow(new RegExp(`invalid calendar date.*${date.replace(/-/g, '\\-')}`));
+      // Sanity: error message names the bad input so an operator
+      // looking at logs ($what) can pivot directly to it.
+      void what;
+    }
+  });
+
+  test('day scope accepts valid leap-year and month-end dates', () => {
+    // Positive control: 2024 is a leap year so Feb 29 is real;
+    // 31-day month boundaries (Mar 31, Dec 31) must not trigger
+    // the round-trip rejection.
+    for (const date of ['2024-02-29', '2026-03-31', '2026-12-31', '2026-01-01']) {
+      expect(() =>
+        projectRecap(db, {
+          scope: { kind: 'day', cwd: '/proj', date },
+        }),
+      ).not.toThrow();
+    }
+  });
 });
