@@ -1,0 +1,78 @@
+{
+  "schemaVersion": "v1",
+  "generatedAt": 50000,
+  "scope": {
+    "kind": "session_specific",
+    "sessionIds": [
+      "a1000001-0000-0000-0000-000000000000"
+    ],
+    "range": {
+      "start": 0,
+      "end": 0
+    }
+  },
+  "completeness": {
+    "incomplete": false,
+    "incompleteSessions": [],
+    "incompleteReason": ""
+  },
+  "goal": {
+    "text": "explore src/queue and tell me what files are involved",
+    "sourceStepId": "a1000100-0000-0000-0000-000000000000"
+  },
+  "goalStack": [],
+  "decisions": [],
+  "pinnedContext": [],
+  "actions": {
+    "filesRead": [
+      {
+        "path": "/home/lex/proj/src/queue.ts",
+        "count": 2
+      },
+      {
+        "path": "/home/lex/proj/src/queue/backoff.ts",
+        "count": 1
+      },
+      {
+        "path": "/home/lex/proj/src/queue/types.ts",
+        "count": 1
+      }
+    ],
+    "filesWritten": [],
+    "commandsRun": [],
+    "webFetches": [],
+    "subagentsSpawned": []
+  },
+  "outcomes": {
+    "testsRun": [],
+    "checkpoints": [],
+    "artifacts": []
+  },
+  "timeline": [
+    {
+      "ts": 10000,
+      "event": "session_start",
+      "detail": "a1000001-0000-0000-0000-000000000000"
+    },
+    {
+      "ts": 11000,
+      "event": "session_end",
+      "detail": "a1000001-0000-0000-0000-000000000000 (done)"
+    }
+  ],
+  "costs": {
+    "tokens": {
+      "in": 1500,
+      "out": 80,
+      "cached": 1200
+    },
+    "usd": 0.0035,
+    "durationMs": 1000,
+    "model": "sonnet-4-6",
+    "cacheHitRatio": 0.8
+  },
+  "errors": [],
+  "notDone": [],
+  "unresolvedQuestions": [],
+  "memoryProposed": []
+}

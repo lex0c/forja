@@ -15,6 +15,123 @@ Format:
 
 ---
 
+## [2026-05-08] m4/recap slice (d) — eval smoke (5 fixtures, golden human + json)
+
+Same branch (`feat/m4-recap`). Closes M4.1. Five deterministic
+fixtures under `evals/recap/fixtures/` seed a fresh in-memory DB
+with pinned UUIDs and timestamps; the runner at
+`tests/recap/eval.test.ts` projects + renders each, comparing
+byte-for-byte against `evals/recap/golden/<name>.{human.md,json}`.
+Fidelity is PR-blocking (RECAP.md §11.3): a renderer or projection
+change that diverges from the goldens fails CI.
+
+**Done:**
+
+- **Five fixtures.** Each is a TS file exporting a `RecapFixture`
+  (`name`, `description`, `seed(db) → scope`, `now`):
+  - `01-read-only.ts` — 4 read_file calls (with one repeat),
+    exercises `actions.filesRead` aggregation.
+  - `02-write-refactor.ts` — read + edit + 2 writes + bun test
+    passing + checkpoint, exercises `filesWritten`,
+    `commands_run`, `outcomes.testsRun` (passed=true), and the
+    checkpoint section.
+  - `03-with-decisions.ts` — 3 bash calls with three approval
+    shapes (user-allow with reason, hook-deny with reason, policy
+    auto-allow filtered out), exercises the decision-filter rule
+    from slice (a).
+  - `04-with-subagent.ts` — parent + 1 child via `task` tool +
+    `subagent_outputs.payload` with summary, exercises the
+    `subagentsSpawned` walk and the payload summary extraction.
+  - `05-incomplete-session.ts` — session left in `running` state
+    plus a trailing assistant question, exercises the incomplete
+    callout AND the unresolved-question heuristic.
+- **Runner — `tests/recap/eval.test.ts`.** 11 tests: 2 per fixture
+  (human + json) plus a CI guard ensuring `UPDATE_GOLDENS` is
+  never `'1'` in CI runs. Reads goldens via `Bun.file().exists()`
+  / `.text()`; missing goldens surface a clear "run with
+  `UPDATE_GOLDENS=1` to create" hint instead of an opaque
+  "expected X received Y" diff.
+- **Update mode — `UPDATE_GOLDENS=1 bun test tests/recap/eval.test.ts`.**
+  Regenerates the goldens in place. The `evals/recap/README.md`
+  documents the workflow plus the discipline rule: "NEVER use
+  `UPDATE_GOLDENS=1` to mask an unintended drift — the goldens
+  exist to catch exactly that".
+- **`evals/recap/golden/` excluded from biome.** Goldens MUST be
+  byte-identical to `JSON.stringify(...)` and the renderer's
+  template output; biome's auto-format would silently rewrite
+  them and break the eval. Added to the `files.ignore` list in
+  `biome.json` alongside the existing `evals/fixtures` exclusion.
+- **`padId` helper places the unique segment in the FIRST 8 chars
+  of the UUID.** The renderer's `shortStep` (first 7 chars) drives
+  decision / subagent labels; with the unique part at the head
+  the goldens read as `step a300020` instead of `step 0000000`,
+  which is meaningful when reviewing diffs.
+
+**Decisions:**
+
+- **5 fixtures, not 15.** RECAP.md §11.3 lists 15 (5 read-only,
+  5 write, 3 error-recovered, 2 cross-day) as the eventual
+  coverage target; §12 roadmap pins M4.1 at "5 fixtures". The
+  remaining 10 land with their respective milestones — `errors`
+  surfacing requires the `failure_events` table (M4.x), cross-
+  day requires `/recap day` / `/recap range` (M4.3). Shipping 5
+  now beats stalling on tables that don't exist.
+- **Fixture seeds, not transcript YAML.** The pre-existing
+  `evals/smoke/*.yaml` format runs against a real provider; recap
+  has no provider call to make (projection is pure SQL + render
+  is a template). TypeScript fixtures with explicit `id` /
+  `createdAt` keep the seeds programmable, type-safe, and
+  byte-deterministic — critical for golden comparison.
+- **Goldens checked in.** A test-time generation pattern (compute
+  golden in `beforeAll` and never commit) would skip the
+  semantic-review benefit: a reviewer can read
+  `evals/recap/golden/03-with-decisions.human.md` and immediately
+  see "yes, this is what a human reading the recap should see".
+  The cost is that genuine renderer changes regenerate the
+  goldens; that diff is exactly the artifact a PR reviewer wants
+  to see anyway.
+- **CI guard against `UPDATE_GOLDENS=1` leaking into trunk.** A
+  developer leaving the env var exported in their shell is the
+  realistic failure mode; the test fires only when `CI=true` so
+  local update flows aren't blocked.
+- **No `pr` / `changelog` goldens yet.** RECAP.md §11.3 requests
+  goldens for `pr` and `changelog`; both renderers are M4.2 work
+  (LLM-driven). Slice (d) ships only the M4.1-shipped renderers
+  (`human`, `json`); the new renderers add their own golden
+  columns when they land.
+
+**Pending → M4.2:**
+
+- LLM render path with Haiku + schema enforcement.
+- `pr`, `changelog`, `slack`, `terse` renderers + their goldens.
+- `recap_cache` table (1h TTL) with `scope_hash` keying.
+- `recap_mini` schema for `/recap list` + the session picker.
+
+**Pending → M4.3:**
+
+- `/recap day`, `/recap range` cross-session scopes.
+- `--all-projects` flag + cross-project guards.
+- `/recap pre-compact` integration with Context Engine.
+- Error-recovery + cross-day fixtures (require `failure_events`
+  table + cross-day scope).
+
+**Pending → follow-ups (any milestone):**
+
+- `linesAdded` / `linesRemoved` / `filesAffected` populated via
+  `git diff` against `checkpoints.git_ref`.
+- `--out <path>`, `--limit <N>`, `--anonymize` slash flags.
+- `/recap audit` view backed by `listRecentRecapRuns`.
+
+**Verification:** `bun test` 3796 pass / 0 fail / 10 skip ·
+`bun run typecheck` clean · `bun run lint` clean
+(pre-existing `tests/harness/abortable.test.ts` warning unchanged).
+
+**Next:** M4.1 is complete on this branch (slices a + b + c + d).
+Branch ready for PR against develop. M4.2 work continues on a
+fresh branch.
+
+---
+
 ## [2026-05-08] m4/recap slice (c) — `/recap` slash command surface
 
 Same branch (`feat/m4-recap`). Slice (a) projection + slice (b)
