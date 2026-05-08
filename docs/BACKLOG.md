@@ -15,6 +15,103 @@ Format:
 
 ---
 
+## [2026-05-08] m4/recap slice (b) — deterministic human + json renderers
+
+Same branch (`feat/m4-recap`), continuation of M4.1. Slice (a) landed
+the projection (SQLite → `RecapIntermediate`); slice (b) wraps the
+intermediate in markdown for humans and indented JSON for tooling.
+Both are deterministic and template-based — no LLM (LLM render is
+M4.2's job). The privacy guarantee from RECAP.md §6.2 (rewrite
+`$HOME` paths to `~/...`) lives at the renderer boundary so the json
+view stays literal for audit consumers while the human view stays
+shareable.
+
+**Done:**
+
+- **`src/recap/render.ts`** — `renderJson`, `renderHuman`,
+  `renderRecap` dispatcher. `renderJson` is a 2-space-indented
+  `JSON.stringify` of the intermediate (RECAP.md §4.5: "intermediate
+  cru, consumível por scripts; sem LLM, sem rendering"). `renderHuman`
+  emits structural sections (Goal, What changed, Files edited, Tests,
+  Decisions, Subagents, Not done, Open questions, Memory proposed,
+  Cost) — empty sections are omitted entirely (no "0 files edited"
+  noise). Cost section is always present so consumers can pin its
+  presence.
+- **Privacy: `$HOME` rewrite at the human renderer boundary.** Default
+  on; `anonymizePaths: false` opt-out for debug. JSON renderer is
+  always literal (audit consumers need the real path). Override for
+  tests via `home: '/home/lex'`.
+- **ANSI strip on untrusted strings.** Goals, commands, subagent
+  summaries, and questions pass through `stripAnsi` before rendering
+  — same defense the TUI applies on render. A mis-quoted tool result
+  containing escapes can never poison the markdown.
+- **Helpers: `formatDuration`, `formatUsd`, `formatTokens`,
+  `formatPct`, `shortStep`, `truncate`, `oneLine`.** All pure / fully
+  deterministic. `shortStep` mirrors git's abbreviated-sha convention
+  (first 7 chars of UUID) so an operator reading the recap can pivot
+  back to the audit DB by prefix-match.
+- **17 tests in `tests/recap/render.test.ts`.** Empty intermediate;
+  full populated intermediate (asserts every section); path
+  anonymization on/off; failed-test marker; incomplete-session
+  callout; conditional sections (open questions, not done, memory
+  proposed) only render when populated; day-scope and range-scope
+  labels; ANSI stripping on goals + commands; byte-identical
+  determinism; dispatcher delegation.
+
+**Decisions:**
+
+- **Drop the prose `Resumo` section in M4.1 entirely.** RECAP.md §4.1
+  shows a "Resumo (2-3 linhas, gerado por LLM)" block. With no LLM
+  in M4.1, the deterministic alternative was either (a) a stubbed
+  count-based one-liner ("3 files edited, 5 commands run, 1 test
+  passed") or (b) skip the section. Picked (b) — the count-summary
+  duplicates "What changed" and the cost line, adds noise without
+  adding signal. M4.2's LLM renderer will fill the slot with real
+  prose.
+- **Empty sections are omitted, not stubbed.** A "## Decisions"
+  followed by nothing teaches the reader to ignore section headers,
+  which dilutes the ones that DO matter. The empty-intermediate test
+  asserts the negative — `## What changed`, `## Decisions`, `## Tests`
+  must NOT appear when their underlying arrays are empty.
+- **Cost section is always present.** Counts may be zero, but pinning
+  its presence avoids consumers having to detect "did the renderer
+  omit cost on accident". Failure mode of an absent cost block is
+  subtle (operator overlooks zero-cost runs); failure mode of always-
+  present is loud (you see `$0.00`).
+- **Token formatting buckets at 1k / 100k.** `< 1000` = literal;
+  `< 100k` = `12.4k`; otherwise `Math.round(/1000)k`. Avoids the
+  `12345 in / 678 out` line being unreadable while keeping resolution
+  where it matters for typical sessions.
+- **`$HOME` anonymization is renderer-side, not projection-side.** The
+  spec calls anonymization a renderer concern (§6.2: "Path absoluto
+  com username é anonimizado em renderers"). Doing it in projection
+  would corrupt the audit JSON which legitimately needs the literal
+  path; doing it in the human renderer keeps the two surfaces
+  separate.
+
+**Pending:**
+
+- Slice (c) — slash commands `/recap`, `/recap session <id>`,
+  `/recap json` wired into the existing slash registry.
+- Slice (d) — eval smoke fixtures (5 sessions, golden outputs;
+  PR-blocking fidelity per RECAP.md §11.3).
+- **Diff-aware lines added/removed.** Still pending from slice (a) —
+  rendering shows the path of edited files but not the line delta.
+  Same follow-up as before; renderer is ready to consume the deltas
+  the moment projection populates them.
+- **Renderers `pr`, `changelog`, `slack`, `terse` (RECAP.md §4.2-4.6).**
+  M4.2 work; deferred until LLM render path lands. The deterministic
+  shape from slice (b) is the template the LLM will fill.
+
+**Verification:** `bun test` 3768 pass / 0 fail / 10 skip ·
+`bun run typecheck` clean · `bun run lint` clean (the pre-existing
+`tests/harness/abortable.test.ts` warning predates this branch).
+
+**Next:** slice (c) wires the renderers + projection into the REPL
+slash command surface. Same branch.
+
+---
+
 ## [2026-05-08] m4/recap slice (a) — projection + schema + recap_runs repo
 
 Branch `feat/m4-recap` off `develop`. First slice of M4.1 (RECAP.md

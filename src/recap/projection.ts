@@ -96,7 +96,7 @@ const extractQuestions = (text: string): string[] => {
     .filter((s) => s.length > 0);
   for (let i = parts.length - 1; i >= 0 && out.length < QUESTION_LIMIT_PER_MESSAGE; i -= 1) {
     const part = parts[i];
-    if (part !== undefined && part.endsWith('?') && part.length <= 200) {
+    if (part?.endsWith('?') && part.length <= 200) {
       out.unshift(part);
     }
   }
