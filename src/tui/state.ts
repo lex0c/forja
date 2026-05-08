@@ -1545,8 +1545,8 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             subject: `${event.issues.length} issue(s)`,
             preview: previewLines,
             question: writes
-              ? 'Proceed, redo with hint, or abort?'
-              : 'Acknowledge, redo with hint, or abort?',
+              ? 'Proceed with the writes, redo with hint, or abort?'
+              : 'Ignore, redo with hint, or abort?',
             options,
             selectedIndex: options.length - 1,
             hints: ['Esc to cancel'],

@@ -481,6 +481,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     subagents,
     policyLayers,
     hookWarnings,
+    critiqueWarnings,
   } = bootstrapped;
 
   // Surface the same warnings the one-shot path does. Operators get
@@ -501,6 +502,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   for (const w of hookWarnings) {
     const layerFrag = w.layer !== null ? `${w.layer} ` : '';
     errSink(`forja: ${layerFrag}hook ${w.sourcePath}: ${w.message}\n`);
+  }
+  // Self-critique config warnings (spec AGENTIC_CLI.md §5.4).
+  // Same surfacing as src/cli/run.ts. Operator gets one line per
+  // bad value at REPL boot.
+  for (const w of critiqueWarnings) {
+    errSink(`forja: critique config: ${w}\n`);
   }
 
   const project = basename(baseConfig.cwd) || baseConfig.cwd;

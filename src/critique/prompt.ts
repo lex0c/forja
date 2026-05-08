@@ -70,20 +70,56 @@ ${CRITIQUE_MARKER_OPEN}
 {"issues":[],"overall_confidence":1.0}
 ${CRITIQUE_MARKER_CLOSE}`;
 
+// Strip any pre-existing `[critique]...[/critique]` block(s) from a
+// string. The markers are well-known constants — without this scrub,
+// a malicious `assistantText` (jailbroken model, poisoned tool
+// output, copy-pasted regression fixture) carrying its own marker
+// pair would short-circuit the parser: `extractMarkerPayload` finds
+// the FIRST pair, so injected content trumps the critic's real
+// response.
+//
+// Mirrors the `stripPriorSummary` defense in `compaction.ts`. Same
+// trade-off: a legitimate input that happens to contain the literal
+// markers gets partially corrupted (the inner block is removed). We
+// accept that to close the injection vector — operators producing
+// content with these literal strings should be exceedingly rare,
+// while the injection vector is real for any model or upstream tool
+// that handles attacker-controlled text.
+//
+// Non-greedy match across newlines so multiple consecutive blocks
+// are each stripped independently. The `\n*` anchors at both ends
+// also collapse extra blank lines around the removed block so the
+// surrounding text reads cleanly.
+const CRITIQUE_BLOCK_RE = /\n*\[critique\][\s\S]*?\[\/critique\]\n*/g;
+
+export const stripPriorCritique = (text: string): string =>
+  text.replace(CRITIQUE_BLOCK_RE, '\n').trim();
+
 // Render the user-side message that carries the executor's proposal.
 // Kept separate from the system prompt so the critic's instructions
 // stay pinned and only the per-call payload varies — caching-friendly
 // for providers that cache the system block.
+//
+// All free-form input fields are scrubbed via `stripPriorCritique`
+// to defeat the marker-injection vector. `userPrompt` is most
+// risky (operator-supplied or tool-result-derived), but
+// `assistantText` and `executorSystemPrompt` go through the same
+// scrub for symmetry — a defensive layer should not depend on
+// "this field is trusted" assumptions that drift over time.
 export const renderCritiqueUserMessage = (input: CritiqueInput): string => {
   const sections: string[] = [];
 
-  sections.push(`USER PROMPT:\n${input.userPrompt.trim() || '(empty)'}`);
+  const userPrompt = stripPriorCritique(input.userPrompt);
+  sections.push(`USER PROMPT:\n${userPrompt.length > 0 ? userPrompt : '(empty)'}`);
 
-  if (input.executorSystemPrompt !== undefined && input.executorSystemPrompt.trim().length > 0) {
-    sections.push(`EXECUTOR SYSTEM PROMPT (background):\n${input.executorSystemPrompt.trim()}`);
+  if (input.executorSystemPrompt !== undefined) {
+    const sys = stripPriorCritique(input.executorSystemPrompt);
+    if (sys.length > 0) {
+      sections.push(`EXECUTOR SYSTEM PROMPT (background):\n${sys}`);
+    }
   }
 
-  const text = input.assistantText.trim();
+  const text = stripPriorCritique(input.assistantText);
   sections.push(
     `PROPOSED ASSISTANT OUTPUT:\n${text.length > 0 ? text : '(no text — only tool calls)'}`,
   );
@@ -99,11 +135,21 @@ export const renderCritiqueUserMessage = (input: CritiqueInput): string => {
   return sections.join('\n\n');
 };
 
+// Render one tool-plan entry. The `args` object goes through
+// JSON.stringify; if it contained a literal `[critique]` substring
+// (a string field with attacker-controlled content), the resulting
+// JSON string would carry it through to the critic's user message.
+// We scrub the SERIALIZED form rather than walking the object —
+// catches the common case (string values) and is robust to nested
+// shapes without hand-rolling a deep walk. JSON.stringify on a
+// scrubbed form roundtrips as itself, so no JSON-shape damage; the
+// only effect is that any internal `[critique]` substring in a
+// string field is replaced with a newline.
 const renderToolPlan = (plan: readonly CritiqueToolPlanEntry[]): string =>
   plan
     .map((entry, idx) => {
       const tag = entry.writes ? '[writes:true]' : '[read-only]';
-      const args = JSON.stringify(entry.input, null, 2);
+      const args = stripPriorCritique(JSON.stringify(entry.input, null, 2));
       return `${idx + 1}. ${entry.name} ${tag}\nargs: ${args}`;
     })
     .join('\n\n');

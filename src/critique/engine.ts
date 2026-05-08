@@ -58,27 +58,39 @@ const coerceSeverity = (raw: unknown): CritiqueSeverity => {
   return 'warn';
 };
 
-// Walk the model output and return the substring between the first
-// open marker and the matching close marker. Returns null when
-// either marker is missing — caller treats as parse failure.
-//
+// Walk the model output and return the JSON slice between the
+// first open marker and the matching close marker. Three failure
+// modes the caller distinguishes:
+//   - 'markers_missing' — open or close marker absent entirely.
+//     Most common when a refusal-style response replaces the
+//     critique with prose ("I cannot...").
+//   - 'no_json' — markers present but no `{...}` slice between
+//     them. Typically a model that wrapped prose in markers
+//     (instruction-following half-failure).
+//   - { payload } — well-formed slice; caller hands to
+//     `parseCritique`.
 // Markers + JSON (rather than raw JSON) survives chatter prefaces,
 // markdown fences, and refusal text outside the markers. Inside,
 // only the first `{` after the open marker through the last `}`
 // before the close marker is parsed; this is enough to handle the
 // common case where the model emits ` ```json {...} ``` ` between
 // markers — the fences land outside the `{...}` slice.
-const extractMarkerPayload = (text: string): string | null => {
+type ExtractResult =
+  | { kind: 'ok'; payload: string }
+  | { kind: 'markers_missing' }
+  | { kind: 'no_json' };
+
+const extractMarkerPayload = (text: string): ExtractResult => {
   const openIdx = text.indexOf(CRITIQUE_MARKER_OPEN);
-  if (openIdx < 0) return null;
+  if (openIdx < 0) return { kind: 'markers_missing' };
   const afterOpen = openIdx + CRITIQUE_MARKER_OPEN.length;
   const closeIdx = text.indexOf(CRITIQUE_MARKER_CLOSE, afterOpen);
-  if (closeIdx < 0) return null;
+  if (closeIdx < 0) return { kind: 'markers_missing' };
   const between = text.slice(afterOpen, closeIdx);
   const firstBrace = between.indexOf('{');
   const lastBrace = between.lastIndexOf('}');
-  if (firstBrace < 0 || lastBrace < firstBrace) return null;
-  return between.slice(firstBrace, lastBrace + 1);
+  if (firstBrace < 0 || lastBrace < firstBrace) return { kind: 'no_json' };
+  return { kind: 'ok', payload: between.slice(firstBrace, lastBrace + 1) };
 };
 
 interface ParsedCritique {
@@ -162,7 +174,22 @@ const buildAbortableStream = (
     if (callerSignal.aborted) {
       ctrl.abort();
     } else {
-      onCallerAbort = () => ctrl.abort();
+      // When the caller aborts, clear the watchdog timer FIRST so
+      // it can't race to fire after the caller's abort already
+      // settled the cancellation. Without this, a watchdog timer
+      // armed at e.g. 100ms could fire 1ms after the caller
+      // aborted at 99ms, leaving `watchdogFiredFlag = true` even
+      // though the caller was the actual cause. The catch block's
+      // disambiguation (`watchdogFired() && !callerAborted` →
+      // skip; otherwise rethrow) would then misclassify the
+      // caller-driven abort as an overhead-exceeded skip.
+      onCallerAbort = () => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        ctrl.abort();
+      };
       callerSignal.addEventListener('abort', onCallerAbort);
     }
   }
@@ -304,8 +331,8 @@ export const runCritique = async (
   // Strip ANSI before parsing — same defense the compaction module
   // applies (a buggy/hijacked proxy could inject control bytes).
   const sanitized = stripAnsi(collectedText);
-  const payload = extractMarkerPayload(sanitized);
-  if (payload === null) {
+  const extracted = extractMarkerPayload(sanitized);
+  if (extracted.kind !== 'ok') {
     return {
       strategy: 'failed',
       filteredIssues: [],
@@ -315,10 +342,14 @@ export const runCritique = async (
       costUsd,
       usage: attemptUsage,
       usageSeen: attemptUsageSeen,
-      reason: 'markers_missing',
+      // Distinguish "markers absent entirely" (refusal-style
+      // output) from "markers present but no JSON between them"
+      // (instruction-following half-failure). Threshold-tuning
+      // analytics treat the two differently.
+      reason: extracted.kind === 'markers_missing' ? 'markers_missing' : 'no_json_in_payload',
     };
   }
-  const parsed = parseCritique(payload);
+  const parsed = parseCritique(extracted.payload);
   if (parsed === null) {
     return {
       strategy: 'failed',

@@ -59,13 +59,31 @@ const baseCase = (overrides: Partial<EvalCase> = {}): EvalCase => ({
 });
 
 let workdir: string;
+// Snapshot env vars that the bootstrap chain reads from disk
+// (memory loader, critique config loader). Tests under this suite
+// run real `bootstrap()` via `executeCase` → providerOverride; if a
+// dev's `~/.config/agent/config.toml` declares `[critique].mode =
+// "always"`, that config would activate the critique gate against
+// the mock provider and burn script entries unexpectedly. Pinning
+// XDG_CONFIG_HOME and HOME at the temp workdir guarantees the
+// loader sees empty layers regardless of the host env.
+let originalXdg: string | undefined;
+let originalHome: string | undefined;
 
 beforeEach(() => {
   workdir = mkdtempSync(join(tmpdir(), 'forja-evexec-'));
+  originalXdg = process.env.XDG_CONFIG_HOME;
+  originalHome = process.env.HOME;
+  process.env.XDG_CONFIG_HOME = workdir;
+  process.env.HOME = workdir;
 });
 
 afterEach(() => {
   rmSync(workdir, { recursive: true, force: true });
+  if (originalXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = originalXdg;
+  if (originalHome === undefined) delete process.env.HOME;
+  else process.env.HOME = originalHome;
 });
 
 describe('executeCase', () => {

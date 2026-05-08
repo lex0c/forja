@@ -860,20 +860,18 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         // via the harness's `confirmCritique` hook (which the REPL
         // bridge wires to `modalManager.askCritique`). The
         // started/finished telemetry events are routed through
-        // headless NDJSON consumers but don't drive a TUI line —
-        // the live region already shows "thinking..." while the
-        // critic is in flight, and a duplicate "critiquing..."
-        // line would just compete for visual attention with the
-        // modal that's about to open. Slice C may add a status-
-        // line indicator if operator feedback shows the silence
-        // is confusing.
+        // headless NDJSON consumers; a TUI-side indicator is a
+        // future follow-up — today the live region goes silent
+        // between executor `stop` and the modal opening (up to
+        // `maxOverheadMs`, default 3s). Acceptable for opt-in
+        // critique; tracked in BACKLOG (Slice C Pending).
         return out;
 
       case 'critique_finished':
-        // Same rationale as `critique_started`: telemetry only at
-        // the TUI layer in Slice B. The decision is reflected via
-        // the modal close + (on `redo`/`abort`) the next assistant
-        // turn or session_finished event.
+        // Same rationale as `critique_started`: NDJSON-only
+        // telemetry today. The decision is reflected via the modal
+        // close + (on `redo`/`abort`) the next assistant turn or
+        // session_finished event.
         return out;
 
       case 'session_finished': {

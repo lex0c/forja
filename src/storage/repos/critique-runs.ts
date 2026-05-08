@@ -10,12 +10,21 @@ export type CritiqueRunMode = 'on_writes' | 'always';
 export type CritiqueRunStrategy = 'llm' | 'skipped' | 'failed';
 export type CritiqueRunDecision = 'ignore' | 'redo' | 'abort' | 'cancel' | 'no_modal';
 
-// Spec line 552 audit codes. Free-form TEXT in the schema so a
-// future code addition doesn't require a migration; the closed set
-// here is documentation and a type-narrower for callers, not a
-// CHECK constraint at the DB layer.
+// Spec line 552 audit codes plus harness-specific extensions. Free-
+// form TEXT in the schema so a future code addition doesn't require
+// a migration; the closed set here is documentation and a type-
+// narrower for callers, not a CHECK constraint at the DB layer.
+//
+// Spec calls out `critique.warning_shown` as the umbrella code for
+// "issues crossed threshold AND modal opened". The harness instead
+// emits the more specific operator-decision codes (_ignored /
+// _redo / _abort) — `_shown` is the implicit prefix-match for
+// audit consumers that want "did the modal open at all"
+// (`code LIKE 'critique.warning_%'`). Keeping `_shown` out of the
+// union avoids dead-code drift; the prefix-filter convention is
+// documented in the spec line 552 comment and the migration's
+// schema commentary.
 export type CritiqueRunCode =
-  | 'critique.warning_shown'
   | 'critique.warning_ignored'
   | 'critique.warning_redo'
   | 'critique.warning_abort'

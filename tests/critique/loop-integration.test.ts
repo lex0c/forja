@@ -59,15 +59,21 @@ interface ExecHandle {
   // Live counter — getter so tests reading after a run see the
   // final value, not a snapshot from construction time.
   readonly calls: number;
+  // Captured request payloads, in call order. Lets tests verify
+  // what messages reached the executor (e.g. that a critique-redo
+  // hint was actually merged into the user side of the next call).
+  readonly requests: readonly GenerateRequest[];
 }
 
 const scriptedProvider = (script: ScriptedStep[]): ExecHandle => {
   const state = { calls: 0 };
+  const requests: GenerateRequest[] = [];
   const provider: Provider = {
     id: 'mock/exec',
     family: 'anthropic',
     capabilities: baseCaps,
-    async *generate() {
+    async *generate(req) {
+      requests.push(req);
       const i = state.calls++;
       const step = script[i];
       if (step === undefined) throw new Error(`script exhausted at call ${i}`);
@@ -80,6 +86,9 @@ const scriptedProvider = (script: ScriptedStep[]): ExecHandle => {
     provider,
     get calls() {
       return state.calls;
+    },
+    get requests() {
+      return requests;
     },
   };
 };
@@ -395,7 +404,7 @@ describe('runAgent — critique decisions', () => {
         { text: 'better answer', usage: { input: 110, output: 60 } },
       ],
       {
-        criticPayloads: [flaggedPayload('first attempt off'), cleanPayload()],
+        criticPayloads: [flaggedPayload('first attempt off-target'), cleanPayload()],
         mode: 'always',
         confirmCritique: async () => {
           confirmCalls++;
@@ -414,15 +423,26 @@ describe('runAgent — critique decisions', () => {
     const tail = listMessagesBySession(db, result.sessionId);
     const assistantRows = tail.filter((m) => m.role === 'assistant');
     expect(assistantRows).toHaveLength(1);
-    // Second executor request must contain the critic's hint
-    // merged into the user prompt — that's how the model knows
-    // to address the issue on the redo attempt.
-    const secondReq = critic.requests[1];
-    expect(secondReq).toBeDefined();
-    // Redo is implemented by mutating messages array; the
-    // executor's second request reflects that.
-    // Additional sanity: critique_finished events show the redo
-    // decision then a no_modal (clean second attempt).
+    // The hint MUST reach the executor on the second attempt —
+    // that's how the model knows what to address. Walk the second
+    // executor request's messages and confirm the hint phrase
+    // landed in the user-side content. Matches the loop's merge
+    // rule: when the tail user message is a string, the hint is
+    // appended to it; the second exec call's last user message
+    // therefore contains both the original prompt and the hint.
+    const secondExecReq = exec.requests[1];
+    expect(secondExecReq).toBeDefined();
+    const tailUserMsg = secondExecReq?.messages[secondExecReq.messages.length - 1];
+    expect(tailUserMsg?.role).toBe('user');
+    const flatContent =
+      typeof tailUserMsg?.content === 'string'
+        ? tailUserMsg.content
+        : (tailUserMsg?.content ?? []).map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+    expect(flatContent).toContain('reviewed by a critic');
+    expect(flatContent).toContain('first attempt off-target');
+    // Sanity: critique_finished events fire twice (one per
+    // critic call) — first with redo decision, second with
+    // no_modal because the retry was clean.
     const finishedEvents = events.filter((e) => e.type === 'critique_finished');
     expect(finishedEvents).toHaveLength(2);
   });

@@ -38,4 +38,5 @@ export {
   CRITIQUE_SYSTEM_PROMPT_V1,
   DEFAULT_CRITIQUE_PROMPT_VERSION,
   renderCritiqueUserMessage,
+  stripPriorCritique,
 } from './prompt.ts';
