@@ -157,6 +157,95 @@ describe('modal navigation preserves contents', () => {
     expect(s.getState().modal).toBeNull();
   });
 
+  test('rule + layer renders "matched rule: X (project policy)"', () => {
+    // Operator's win: instead of a generic "matched rule: rm *",
+    // they see WHICH YAML to edit. layer label disambiguates
+    // enterprise vs user vs project vs session.
+    const s = make();
+    void s.manager.askPermission({
+      toolName: 'bash',
+      command: 'rm -rf /tmp',
+      cwd: '/r',
+      rule: 'rm -rf *',
+      layer: 'project',
+    });
+    const out = s.rendered() ?? '';
+    expect(out).toContain('matched rule: rm -rf * (project policy)');
+    s.fs.dispatch(key('escape'));
+  });
+
+  test('rule with layer="default" renders "(built-in default)"', () => {
+    // No layer wrote the section; rule fired from a synthesized
+    // path. Distinct label so operator doesn't go looking for a
+    // YAML that doesn't exist.
+    const s = make();
+    void s.manager.askPermission({
+      toolName: 'bash',
+      command: 'echo',
+      cwd: '/r',
+      rule: 'echo *',
+      layer: 'default',
+    });
+    const out = s.rendered() ?? '';
+    expect(out).toContain('matched rule: echo * (built-in default)');
+    s.fs.dispatch(key('escape'));
+  });
+
+  test('rule without layer renders the bare matched-rule line (back-compat)', () => {
+    // Synthesized events / pre-source consumers keep working —
+    // the layer suffix simply doesn't render.
+    const s = make();
+    void s.manager.askPermission({
+      toolName: 'bash',
+      command: 'echo',
+      cwd: '/r',
+      rule: 'echo *',
+    });
+    const out = s.rendered() ?? '';
+    expect(out).toContain('matched rule: echo *');
+    expect(out).not.toContain('policy)');
+    expect(out).not.toContain('built-in');
+    s.fs.dispatch(key('escape'));
+  });
+
+  test('layer alone (no rule) renders "no rule matched in <layer> policy"', () => {
+    // Default-deny path: section consulted but no rule matched.
+    // The layer alone tells the operator where to add an allow
+    // rule so the default-deny goes away. Sentence form
+    // ("no rule matched in user policy") reads cleanly; the
+    // earlier "policy section: user" wording confused 'user'
+    // (a layer) with section names like 'bash'.
+    const s = make();
+    void s.manager.askPermission({
+      toolName: 'bash',
+      command: 'whoami',
+      cwd: '/r',
+      layer: 'user',
+    });
+    const out = s.rendered() ?? '';
+    expect(out).toContain('no rule matched in user policy');
+    expect(out).not.toContain('matched rule:');
+    s.fs.dispatch(key('escape'));
+  });
+
+  test('layer="default" alone (no rule) renders no extra line — no actionable info', () => {
+    // No layer wrote the section AND no rule matched. The modal's
+    // question text already conveys "denied" — adding a "no rule
+    // matched in default policy" line would mislead operators
+    // into looking for a YAML named "default".
+    const s = make();
+    void s.manager.askPermission({
+      toolName: 'bash',
+      command: 'whoami',
+      cwd: '/r',
+      layer: 'default',
+    });
+    const out = s.rendered() ?? '';
+    expect(out).not.toContain('no rule matched');
+    expect(out).not.toContain('matched rule');
+    s.fs.dispatch(key('escape'));
+  });
+
   test('queued modal: first resolves, second renders fresh contents', async () => {
     const s = make();
     const p1 = s.manager.askPermission({

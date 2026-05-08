@@ -1147,6 +1147,65 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('confirmPermission bridge forwards source.rule + source.layer into the modal', async () => {
+    // Pins the engine → REPL bridge → modal seam. Without this,
+    // a regression where the bridge forgot to spread `rule` or
+    // `layer` into the modal manager call would silently
+    // degrade the operator UX (modal renders without the rule
+    // attribution) and only typecheck-pass because both fields
+    // are optional. Capturing rendered writes via rendererWrite
+    // is the only way to assert the rendered string contains
+    // the expected layer hint, since modalManager is internal
+    // to the REPL.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    expect(cfg?.confirmPermission).toBeDefined();
+    // Drive the bridge with a Decision-shaped source. The exact
+    // wording the modal prints comes from the reducer
+    // (modal-integration test pins the format string); we just
+    // check the bridge forwarded both fields end-to-end.
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: 'rm -rf /tmp/cache/*' },
+      cwd: '/r',
+      prompt: 'matched confirm rule: rm -rf *',
+      source: {
+        layer: 'project',
+        rule: 'rm -rf *',
+        section: 'bash',
+      },
+    });
+    await flushFrame();
+    const rendered = writes.join('');
+    // Rule + layer round-tripped: bridge → modalManager →
+    // event → reducer → renderer.
+    expect(rendered).toContain('matched rule: rm -rf * (project policy)');
+    // Resolve the modal so the test cleans up.
+    stdin.feed('\x1b\x1b');
+    await tick();
+    expect(await askPromise).toBe(false);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('error thrown by runAgent surfaces as an error UIEvent and lets the REPL continue', async () => {
     const stdin = makeStdin();
     const resolvers: Array<(r: HarnessResult) => void> = [];

@@ -23,6 +23,7 @@ import { existsSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
 import { effectiveBudget, resolveMaxOutputTokens } from '../harness/types.ts';
+import type { PolicySource } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
 import { stripAnsi } from '../sanitize/index.ts';
 import {
@@ -908,6 +909,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     args: Record<string, unknown>;
     cwd: string;
     prompt: string;
+    source?: PolicySource;
     subagent?: { sessionId: string; name: string };
     signal?: AbortSignal;
   }): Promise<boolean> => {
@@ -947,11 +949,21 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     let displayToolName = req.toolName;
     let displayCwd = req.cwd;
     let displayPrompt = req.prompt;
+    // The engine's matching rule. When subagent-proxied we
+    // sanitize it like every other display string (the IPC
+    // protocol won't grow source until the bridge gains
+    // marshaling — for now subagent confirms simply have
+    // req.source undefined). For parent-side confirms the rule
+    // came from operator-authored YAML, so trust is implicit.
+    let displayRule = req.source?.rule;
     if (req.subagent !== undefined) {
       command = sanitizeForSubagentDisplay(command);
       displayToolName = sanitizeForSubagentDisplay(req.toolName);
       displayCwd = sanitizeForSubagentDisplay(req.cwd);
       displayPrompt = sanitizeForSubagentDisplay(req.prompt);
+      if (displayRule !== undefined) {
+        displayRule = sanitizeForSubagentDisplay(displayRule);
+      }
     }
     const answer = await modalManager.askPermission(
       {
@@ -959,6 +971,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
         command,
         cwd: displayCwd,
         reason: displayPrompt,
+        // Forward source.layer + the rule into the modal so the
+        // operator sees "matched rule: rm * (project policy)"
+        // instead of a generic deny. Spread keeps fields absent
+        // when source is undefined (synthesized Decisions, or
+        // subagent-proxied confirms where IPC doesn't marshal
+        // source yet). The reducer renders one line per
+        // available field; missing fields just don't render.
+        ...(displayRule !== undefined ? { rule: displayRule } : {}),
+        ...(req.source?.layer !== undefined ? { layer: req.source.layer } : {}),
         // Forward subagent attribution so the modal can label the
         // request as coming from a child run (spec
         // docs/spec/IPC.md §7). Spread keeps the field absent for

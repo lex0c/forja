@@ -1270,7 +1270,37 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       }
       previewLines.push(`$ ${event.command}`);
       previewLines.push(`cwd: ${event.cwd}`);
-      if (event.rule !== undefined) previewLines.push(`matched rule: ${event.rule}`);
+      if (event.rule !== undefined) {
+        // Append layer info alongside the rule so the operator
+        // sees which YAML to edit. 'default' renders as
+        // "(built-in default)" — distinguishes engine fallback
+        // from any layer-written rule. Unknown / absent layer
+        // omits the qualifier (modal degrades gracefully when
+        // source isn't available, e.g. subagent-proxied confirms
+        // before IPC marshals source).
+        const layerLabel =
+          event.layer === undefined
+            ? ''
+            : event.layer === 'default'
+              ? ' (built-in default)'
+              : ` (${event.layer} policy)`;
+        previewLines.push(`matched rule: ${event.rule}${layerLabel}`);
+      } else if (event.layer !== undefined && event.layer !== 'default') {
+        // Default-deny path: no rule matched, but a layer wrote
+        // the section that was consulted. Surface the layer alone
+        // so the operator knows where to add an allow rule. Skip
+        // 'default' since "no layer wrote the section" isn't
+        // useful operator info — the engine's default-deny is
+        // what matters and the question text already conveys it.
+        //
+        // Wording: "no rule matched in <layer> policy" reads as a
+        // status sentence; "policy: <layer>" alone leaves the
+        // operator wondering what "<layer>" refers to (a section
+        // name? a file?). The full sentence anchors the mental
+        // model: <layer> is a YAML, no rule in it matched, add
+        // one to allow.
+        previewLines.push(`no rule matched in ${event.layer} policy`);
+      }
       return {
         state: {
           ...state,

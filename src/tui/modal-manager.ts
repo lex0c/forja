@@ -23,6 +23,7 @@
 // One modal at a time. Concurrent `ask*` calls queue; the queue
 // drains FIFO when a prior modal resolves.
 
+import type { PolicyLayer } from '../permissions/index.ts';
 import type { Bus } from './bus.ts';
 import type { UIEvent } from './events.ts';
 import type { FocusHandler, FocusStack } from './focus-stack.ts';
@@ -76,6 +77,14 @@ export interface PermissionAskArgs {
   cwd: string;
   rule?: string;
   reason?: string;
+  // Layer that holds the matching rule (PolicyLayer). When set
+  // alongside `rule`, the reducer renders "matched rule: <rule>
+  // (<layer> policy)" so the operator knows which YAML to edit.
+  // 'default' renders as "(built-in default)" — distinct from
+  // any layer-written rule. Optional for backwards compat with
+  // synthesized Decisions / subagent-proxied confirms (where
+  // IPC doesn't marshal source yet).
+  layer?: PolicyLayer;
   // Subagent attribution. Set by the parent harness when
   // proxying a child's `permission:ask` over IPC (spec
   // docs/spec/IPC.md §7). The reducer prefixes the modal title
@@ -626,6 +635,7 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           command: args.command,
           cwd: args.cwd,
           ...(args.rule !== undefined ? { rule: args.rule } : {}),
+          ...(args.layer !== undefined ? { layer: args.layer } : {}),
           ...(args.reason !== undefined ? { reason: args.reason } : {}),
           ...(args.subagent !== undefined ? { subagent: args.subagent } : {}),
         }),

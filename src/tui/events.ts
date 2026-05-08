@@ -15,6 +15,8 @@
 // and HarnessEvent diverge in shape, an adapter sits between them
 // (introduced in a later step).
 
+import type { PolicyLayer } from '../permissions/index.ts';
+
 // Common metadata. `ts` is wall-clock ms since epoch — useful for
 // rendering "elapsed" without the renderer holding its own clock.
 interface BaseEvent {
@@ -243,6 +245,12 @@ export type PermissionAskEvent = BaseEvent & {
   cwd: string;
   // Optional risk hint — when present, modal shows the "why?" detail.
   rule?: string;
+  // Policy layer that holds the matching rule (PolicyLayer in
+  // permissions/types.ts). When set alongside `rule`, the reducer
+  // renders "matched rule: <rule> (<layer> policy)" so the operator
+  // knows which YAML to edit. Optional for backwards compat with
+  // synthesized events / subagent-proxied confirms.
+  layer?: PolicyLayer;
   reason?: string;
   // Subagent attribution. Set when the ask was proxied from a
   // child subagent over IPC (spec docs/spec/IPC.md §7). The

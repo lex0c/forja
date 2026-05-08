@@ -247,11 +247,24 @@ describe('invokeTool', () => {
       { toolUseId: 'tu1', toolName: 'write_file', args: { path: 'x.ts' }, messageId },
       deps,
     );
+    // Source is forwarded from the engine's Decision when the
+    // engine populated it (which it does for every confirm). The
+    // exact source values depend on whether `buildDeps` builds
+    // the engine with provenance; today it doesn't, so source
+    // collapses to layer='default' but still carries the matched
+    // rule + section so the modal can render them. Asserting on
+    // the structure (not exact layer) keeps the test resilient
+    // to a future buildDeps change that wires provenance.
     expect(captured).toEqual({
       toolName: 'write_file',
       args: { path: 'x.ts' },
       cwd: '/p',
       prompt: expect.any(String) as unknown as string,
+      source: {
+        layer: 'default',
+        rule: 'x.ts',
+        section: 'write_file',
+      },
     });
   });
 
