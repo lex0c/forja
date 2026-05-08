@@ -740,13 +740,36 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           // crashed prior run (e.g., resume after parent crash mid-
           // step) shouldn't carry into a fresh turn.
           awaitingProvider: null,
+          // Drop any unflushed tool-end batch from a prior session
+          // that didn't reach `session:end` cleanly (process killed
+          // mid-stream, harness crash, headless invocation that
+          // skipped the footer). The wrapper's "flush only when
+          // inner emits permanent" rule otherwise lets a stale
+          // batch survive into the new session and emit later as
+          // scrollback under the wrong session boundary — wrong
+          // chronology, misleading audit. We DROP rather than
+          // FLUSH because emitting prior-session items inside the
+          // new session's scrollback misattributes them; if the
+          // prior session genuinely needed them, that path was the
+          // one to flush (via session:end's permanent emit
+          // triggering the wrapper, which it does).
+          pendingToolEndBatch: null,
           ended: false,
         },
         permanent: [],
       };
     }
 
-    case 'session:end':
+    case 'session:end': {
+      // Drain any buffered tool-end batch into the scrollback
+      // BEFORE the footer so the operator sees those tool calls
+      // attributed to the session that just ended. The wrapper
+      // already flushes around the footer's permanent emit, but
+      // doing it explicitly here keeps the boundary semantics
+      // local to the case (defensive against a future refactor
+      // where session:end might emit no permanent or where the
+      // wrapper's contract changes).
+      const flushed = flushPendingToolEndBatch(state);
       // Boundary cleanup: clear the soft-interrupt flag so the
       // footer's "esc again to force" cue stops surfacing once the
       // run actually terminates (regardless of WHY it ended — could
@@ -761,7 +784,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       // dropped as no-ops by the unknown-processId branch).
       return {
         state: {
-          ...state,
+          ...flushed.state,
           softInterrupted: false,
           // Same boundary reset rationale as session:start (above).
           exitArmed: null,
@@ -776,6 +799,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           ended: true,
         },
         permanent: [
+          ...flushed.permanent,
           {
             kind: 'session-footer',
             reason: event.reason,
@@ -784,6 +808,7 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
           },
         ],
       };
+    }
 
     case 'session:banner':
       return {

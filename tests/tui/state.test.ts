@@ -947,6 +947,105 @@ describe('applyEvent wrapper (flush lifecycle, slice 3)', () => {
   });
 });
 
+describe('session boundary handling of pendingToolEndBatch', () => {
+  // Reviewer-flagged defect: the wrapper skips flushing when
+  // inner.permanent is empty, so a session:start that follows a
+  // session that terminated mid-batch (process killed, harness
+  // crash, headless invocation that bypassed session:end) would
+  // carry the stale buffer forward and emit those items as
+  // scrollback under the WRONG session boundary. Boundary
+  // events must handle the buffer explicitly, not depend on
+  // the wrapper's permanent-emit trigger.
+
+  test('session:start drops a stale pendingToolEndBatch (chronology cleanup)', () => {
+    // Build a state with a half-pending batch, then fire a fresh
+    // session:start. Items in the buffer at that moment belong
+    // to a session that didn't reach session:end — emitting
+    // them under the new session would misattribute the
+    // chronology. Drop > flush.
+    const dirty: LiveState = {
+      ...createInitialState(),
+      pendingToolEndBatch: {
+        name: 'read_file',
+        items: [{ verb: 'Read file', subject: 'a.ts', status: 'done', durationMs: 10 }],
+      },
+    };
+    const r = applyEvent(dirty, start());
+    expect(r.state.pendingToolEndBatch).toBeNull();
+    // Crucially the items are NOT emitted as permanent. Wrong
+    // session attribution would be worse than dropping silently.
+    expect(r.permanent).toEqual([]);
+  });
+
+  test('session:end flushes the buffer BEFORE the footer (correct chronology)', () => {
+    // The session that emitted the tool calls is the one ending,
+    // so the buffer's items DO belong in this session's
+    // scrollback — drained before the footer marker.
+    const dirty: LiveState = {
+      ...createInitialState(),
+      pendingToolEndBatch: {
+        name: 'read_file',
+        items: [
+          { verb: 'Read file', subject: 'a.ts', status: 'done', durationMs: 10 },
+          { verb: 'Read file', subject: 'b.ts', status: 'done', durationMs: 20 },
+        ],
+      },
+    };
+    const r = applyEvent(dirty, {
+      type: 'session:end',
+      ts: 1,
+      sessionId: 's1',
+      reason: 'done',
+    });
+    // Two tool-end items (under the threshold of 3, so each
+    // emits individually) come BEFORE the session-footer.
+    expect(r.permanent.map((p) => p.kind)).toEqual(['tool-end', 'tool-end', 'session-footer']);
+    expect(r.state.pendingToolEndBatch).toBeNull();
+  });
+
+  test('session:end with a coalesce-eligible buffer flushes as a single tool-end-batch', () => {
+    // 3+ items in the buffer flush as `tool-end-batch`, not
+    // as N individual chips. Pinned so the boundary flush
+    // respects the same threshold logic the regular path uses.
+    const dirty: LiveState = {
+      ...createInitialState(),
+      pendingToolEndBatch: {
+        name: 'read_file',
+        items: [
+          { verb: 'Read file', subject: 'a.ts', status: 'done', durationMs: 10 },
+          { verb: 'Read file', subject: 'b.ts', status: 'done', durationMs: 20 },
+          { verb: 'Read file', subject: 'c.ts', status: 'done', durationMs: 30 },
+        ],
+      },
+    };
+    const r = applyEvent(dirty, {
+      type: 'session:end',
+      ts: 1,
+      sessionId: 's1',
+      reason: 'done',
+    });
+    expect(r.permanent.map((p) => p.kind)).toEqual(['tool-end-batch', 'session-footer']);
+    const batch = r.permanent[0];
+    if (batch?.kind !== 'tool-end-batch') throw new Error('expected tool-end-batch');
+    expect(batch.count).toBe(3);
+    expect(batch.subjects).toEqual(['a.ts', 'b.ts', 'c.ts']);
+  });
+
+  test('session:end with no buffer emits ONLY the footer (no synthetic items)', () => {
+    // Sanity: the explicit flush in session:end must not
+    // synthesize items when the buffer was empty. Pinned to
+    // catch a regression that always emits at least one
+    // tool-end-batch (e.g., a count-zero artifact).
+    const r = applyEvent(createInitialState(), {
+      type: 'session:end',
+      ts: 1,
+      sessionId: 's1',
+      reason: 'done',
+    });
+    expect(r.permanent.map((p) => p.kind)).toEqual(['session-footer']);
+  });
+});
+
 describe('awaitingProvider indicator (provider:waiting bracket)', () => {
   test('provider:waiting:start sets awaitingProvider with stepN + ts', () => {
     const r = applyEvent(createInitialState(), {
