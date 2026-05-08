@@ -23,7 +23,7 @@ export class StepStallError extends Error {
 
 // Per-step stall watchdog. Wraps an AsyncIterable so that the
 // for-await throws `StepStallError` when the source is silent
-// for `stallMs` consecutive milliseconds. Reset on each yield —
+// for `stallMs` consecutive milliseconds. Reset on each pull —
 // a slow but progressing stream (extended thinking with high
 // budget, large structured outputs) doesn't trip the gate.
 //
@@ -38,6 +38,29 @@ export class StepStallError extends Error {
 // `stallMs` of 0 disables the watchdog entirely — yields the
 // source verbatim with no timer. Negative values are treated
 // the same as 0 (defensive).
+//
+// Lifecycle: timer is armed ONLY while `iter.next()` is in
+// flight. Disarmed the moment a value (or `done`) lands, so the
+// consumer's own processing time during `yield` does NOT count
+// against the budget. Re-armed at the top of the next iteration
+// before the next pull. This dual property is load-bearing:
+//
+//   - Arming before yield (the prior implementation) lets the
+//     timer fire DURING the yield while `stallReject` still
+//     points to the previous (already-settled) iteration's
+//     promise. Calling reject on a settled promise is a no-op,
+//     so the timeout is effectively dropped — the next pull
+//     then runs with NO timer armed at all and a true provider
+//     hang has no watchdog. The slow-consumer case (renderer
+//     doing heavy work between events with a low maxStepStallMs)
+//     would silently defeat the gate.
+//   - Arming after yield (the simpler alternative) would count
+//     consumer time against the budget — a slow renderer could
+//     trip the gate even though the provider is responsive.
+//
+// The arm-before-pull / disarm-on-result shape gets both: timer
+// covers exactly the iter.next() window, never the yield, and
+// stallReject is always live when the timer fires.
 export async function* stallWatchdog<T>(
   source: AsyncIterable<T>,
   stallMs: number,
@@ -62,19 +85,25 @@ export async function* stallWatchdog<T>(
     }
   };
   try {
-    arm();
     while (true) {
+      // Arm BEFORE setting stallReject + scheduling the pull so
+      // the timer covers the entire await; disarm on result so
+      // the consumer's `yield` window stays untimed.
+      arm();
       const result = await new Promise<IteratorResult<T>>((resolve, reject) => {
         stallReject = reject;
         iter.next().then(resolve, reject);
       });
+      // Got a result (or stall threw and we'd be in catch).
+      // Drop the timer + the closure ref so:
+      //   1. A late timer fire (between iter.next() resolving
+      //      and disarm running, in the same microtask) doesn't
+      //      reject a fresh promise from the next iteration.
+      //   2. The consumer's processing time during yield does
+      //      not count against the next pull's budget.
+      disarm();
+      stallReject = null;
       if (result.done) return;
-      // Reset the timer BEFORE yielding so the consumer's own
-      // processing time doesn't count against the stall budget.
-      // Setting AFTER the yield would mean a slow consumer (e.g.
-      // a renderer doing heavy work between events) burns the
-      // stall budget every iteration.
-      arm();
       yield result.value;
     }
   } finally {

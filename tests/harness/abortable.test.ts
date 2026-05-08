@@ -197,6 +197,63 @@ describe('stallWatchdog', () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 250));
     expect(true).toBe(true);
   });
+
+  test('slow consumer (longer than stallMs) does NOT defeat the watchdog on the next pull (regression)', async () => {
+    // Pre-fix bug: the watchdog armed the timer BEFORE yield. If
+    // the consumer's processing time exceeded stallMs, the timer
+    // fired DURING the yield while `stallReject` still pointed
+    // to the just-resolved iter.next() promise. Calling reject on
+    // a settled promise is a no-op, so the timeout was silently
+    // dropped — the next pull then ran with NO timer at all and a
+    // real provider hang had no watchdog. A slow renderer + low
+    // maxStepStallMs was enough to trigger.
+    //
+    // Test shape: source yields 1 fast, then hangs. Consumer
+    // sleeps longer than stallMs after receiving the first
+    // value. The next pull (which never resolves) MUST trip the
+    // stall — proving the timer was re-armed for the second
+    // pull instead of being lost.
+    const source: AsyncIterable<number> = {
+      [Symbol.asyncIterator]: async function* () {
+        yield 1;
+        await new Promise<never>(() => {
+          // hang forever
+        });
+      },
+    };
+    const stallMs = 50;
+    let caught: unknown = null;
+    try {
+      for await (const _ of stallWatchdog(source, stallMs)) {
+        // Consumer takes longer than stallMs to process the
+        // first event. Pre-fix this would have burned the
+        // watchdog's only timer; post-fix the timer is
+        // disarmed during this sleep and re-armed for the next
+        // pull.
+        await new Promise<void>((resolve) => setTimeout(resolve, stallMs * 3));
+      }
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(StepStallError);
+  });
+
+  test('consumer time during yield does NOT count against the stall budget', async () => {
+    // The companion invariant: a slow consumer between fast
+    // provider yields shouldn't trip the gate either. The arm-
+    // before-pull / disarm-on-result shape gives us both
+    // guarantees: timer covers ONLY the iter.next() window.
+    //
+    // Source yields fast (5ms apart). Consumer sleeps 80ms
+    // between values — total elapsed comfortably exceeds the
+    // 50ms stall budget, but no individual pull does.
+    const out: number[] = [];
+    for await (const n of stallWatchdog(delayedSource([1, 2, 3], 5), 50)) {
+      out.push(n);
+      await new Promise<void>((resolve) => setTimeout(resolve, 80));
+    }
+    expect(out).toEqual([1, 2, 3]);
+  });
 });
 
 describe('stallWatchdog composed with abortableIterable', () => {
