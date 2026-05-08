@@ -191,6 +191,58 @@ describe('harness-adapter — session lifecycle', () => {
     expect(end.reason).toBe('error');
   });
 
+  test('critiqueAborted is NOT collapsed to error (operator-driven termination)', () => {
+    // The operator chose `abort` in the critique modal — that's
+    // an interrupted/aborted exit, NOT a failure. Without
+    // mapExitReason passing the reason through verbatim, the
+    // adverse-exit branch above would fire: a `warn` line saying
+    // 'exit critiqueAborted — N issue(s) flagged' would render
+    // like a crash, and session:end.reason would be 'error'.
+    // Both mislead operators and any NDJSON consumer keying off
+    // the UI reason.
+    const a = createHarnessAdapter(baseCtx());
+    const result: HarnessResult = {
+      status: 'interrupted',
+      reason: 'critiqueAborted',
+      sessionId: 'sess-crit',
+      steps: 1,
+      durationMs: 800,
+      usage: { input: 100, output: 50, cache_read: 0, cache_creation: 0 },
+      costUsd: 0.001,
+      usageComplete: true,
+      detail: '2 issue(s) flagged',
+    };
+    const out = a.translate({ type: 'session_finished', result });
+    // No warn line — the run wasn't an error.
+    expect(types(out)).toEqual(['step:budget', 'session:end']);
+    const end = out[1] as Extract<UIEvent, { type: 'session:end' }>;
+    expect(end.reason).toBe('critiqueAborted');
+  });
+
+  test('userPromptBlocked is NOT collapsed to error (hook refused turn)', () => {
+    // Same misclassification family as critiqueAborted: a
+    // UserPromptSubmit hook refusing the turn is operator-driven
+    // (the hook is operator policy), not a runtime failure.
+    // Maps to status='interrupted' at the harness layer; the UI
+    // mapping must follow.
+    const a = createHarnessAdapter(baseCtx());
+    const result: HarnessResult = {
+      status: 'interrupted',
+      reason: 'userPromptBlocked',
+      sessionId: 'sess-hook',
+      steps: 0,
+      durationMs: 5,
+      usage: { input: 0, output: 0, cache_read: 0, cache_creation: 0 },
+      costUsd: 0,
+      usageComplete: true,
+      detail: 'denied by user hook /etc/agent/hooks.toml',
+    };
+    const out = a.translate({ type: 'session_finished', result });
+    expect(types(out)).toEqual(['step:budget', 'session:end']);
+    const end = out[1] as Extract<UIEvent, { type: 'session:end' }>;
+    expect(end.reason).toBe('userPromptBlocked');
+  });
+
   test('session_finished with abortCause threads it onto session:end (1.g.3)', () => {
     const a = createHarnessAdapter(baseCtx());
     const result: HarnessResult = {

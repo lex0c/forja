@@ -125,12 +125,24 @@ interface AdapterState {
 // The UI catalogue (events.ts) accepts a fixed set plus arbitrary
 // string fallback; we collapse adverse exits into 'error' and let the
 // detail appear in a separate `warn` line emitted alongside.
+//
+// Operator-driven terminations pass the harness reason through
+// verbatim — `aborted` (Ctrl+C / wall-clock) was the original case;
+// `critiqueAborted` (operator chose abort in the critique modal,
+// AGENTIC_CLI.md §5.4) and `userPromptBlocked` (a UserPromptSubmit
+// hook refused the turn) belong in the same family. All three map
+// to TerminalSessionStatus='interrupted' at the harness layer (see
+// loop.ts exitToStatus); collapsing them to 'error' here misled
+// the renderer's "exit X — Y" warn line into reading like a
+// failure when the operator deliberately stopped the turn.
 const mapExitReason = (reason: ExitReason): SessionEndEvent['reason'] => {
   switch (reason) {
     case 'done':
     case 'aborted':
     case 'maxSteps':
     case 'maxCostUsd':
+    case 'critiqueAborted':
+    case 'userPromptBlocked':
       return reason;
     default:
       return 'error';
