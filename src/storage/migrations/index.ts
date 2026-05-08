@@ -26,6 +26,7 @@ import { migration025SubagentRunsSampling } from './025-subagent-runs-sampling.t
 import { migration026SubagentRunsReferences } from './026-subagent-runs-references.ts';
 import { migration027SubagentRunsOutputSchema } from './027-subagent-runs-output-schema.ts';
 import { migration028SubagentRunsContextRecipe } from './028-subagent-runs-context-recipe.ts';
+import { migration029SubagentProcesses } from './029-subagent-processes.ts';
 
 export interface Migration {
   id: number;
@@ -62,4 +63,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration026SubagentRunsReferences,
   migration027SubagentRunsOutputSchema,
   migration028SubagentRunsContextRecipe,
+  migration029SubagentProcesses,
 ];

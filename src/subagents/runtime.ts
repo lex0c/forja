@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { rmSync } from 'node:fs';
 import { join } from 'node:path';
 import type { HarnessEvent } from '../harness/index.ts';
@@ -6,12 +7,16 @@ import type { PermissionEngine } from '../permissions/index.ts';
 import type { Provider } from '../providers/index.ts';
 import {
   type DB,
+  type SubagentProcessExitReason,
   appendMessage,
   completeSession,
   createSession,
   insertSubagentRun,
   insertSubagentWorktree,
   listBgProcessesBySession,
+  markIpcHandshakeOk,
+  recordProcessExit,
+  recordProcessSpawn,
 } from '../storage/index.ts';
 import { type ToolRegistry, createToolRegistry, registerBuiltinTools } from '../tools/index.ts';
 import { reapChildBgProcesses } from './bg-reaper.ts';
@@ -144,6 +149,50 @@ const buildBuiltinRegistry = (): ToolRegistry => {
   const r = createToolRegistry();
   registerBuiltinTools(r);
   return r;
+};
+
+// Argv flags that vary per spawn but don't represent config (the
+// child's session id is a fresh UUID; `--subagent-bg-log-dir`
+// embeds that same UUID in its path). Hashing them in would make
+// `argv_hash` unique per spawn — useless as a "did this playbook
+// run with the same flags last time" fingerprint, which is the
+// stated audit purpose (AUDIT.md §1.7.2). Drop both as (flag,
+// value) pairs before hashing. Other forwarded flags
+// (`--subagent-depth`, `--subagent-temperature`,
+// `--subagent-plan-mode`, `--subagent-cwd-trusted`,
+// `--subagent-memory-cwd`, `--ipc=N`) ARE config and stay in.
+const ARGV_HASH_DROP_PAIRS: readonly string[] = ['--subagent-session-id', '--subagent-bg-log-dir'];
+
+// SHA256 over a stable subset of the spawn argv. The hash is a
+// fingerprint of the playbook's effective config (binary +
+// forwarded settings), NOT the unique invocation. Two runs of
+// the same playbook in the same project against the same
+// settings produce the same hash, so a regression hunt
+// ("when did this start failing?") can compare hashes across
+// rows without a JOIN against `sessions`.
+//
+// Algorithm: walk argv left-to-right; whenever we see one of
+// the drop flags, skip it AND its next positional value;
+// hash everything else. NUL-joined to avoid ambiguity between
+// `["--foo", "bar"]` and `["--foobar"]`.
+//
+// Exported for direct test coverage — the regression risk is
+// "future hand-edit drops a real-config flag by accident",
+// which a unit test pinning the hash for a known argv
+// surfaces immediately.
+export const computeArgvHash = (cmd: readonly string[]): string => {
+  const kept: string[] = [];
+  for (let i = 0; i < cmd.length; i++) {
+    const tok = cmd[i] ?? '';
+    if (ARGV_HASH_DROP_PAIRS.includes(tok)) {
+      // Skip the flag AND its value. Defensive bound check in
+      // case a malformed cmd ends mid-pair.
+      i += 1;
+      continue;
+    }
+    kept.push(tok);
+  }
+  return createHash('sha256').update(kept.join('\0')).digest('hex');
 };
 
 export interface RunSubagentInput {
@@ -623,6 +672,11 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       ...(effectiveIpc ? { ipc: true } : {}),
     });
   } catch (e) {
+    // Subprocess never produced a pid; no `subagent_processes` row
+    // is written here — the absence of a row is the audit signal
+    // for "spawn failed". `subagent_outputs` (set below to a
+    // spawn-failed result via the unified failure path) carries
+    // the human-readable cause.
     await cleanupOnFail();
     // Bracket close on spawn failure too. The observer saw
     // `subagent_start` above; without a matching close the
@@ -650,6 +704,89 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
       },
     };
   }
+
+  // 5a-bis. End-to-end subprocess audit (migration 029). The row
+  // is born here — after Bun.spawn returned a pid, before the
+  // wait loop. argv_hash is SHA256 over the cmd joined with NUL
+  // (a fingerprint of "what flags this child got"); we store the
+  // hash, not the cmd, so paths/tokens in argv stay out of audit.
+  // Tests that inject a fake `spawnChildProcess` typically omit
+  // pid/cmd — the row is skipped in that case (no audit, but the
+  // fake's whole point is to bypass the subprocess surface).
+  //
+  // The audit write is best-effort: a SQLite lock contention or
+  // schema-mismatch throw must NOT break the spawn flow. The
+  // subagent run continues; the audit gap surfaces as an absent
+  // row at query time. See AUDIT.md §1.
+  const spawnedAt = Date.now();
+  const stderrLogPath = join(bgLogDir, 'stderr.log');
+  if (handle.pid !== undefined && handle.cmd !== undefined) {
+    const argvHash = computeArgvHash(handle.cmd);
+    try {
+      recordProcessSpawn(input.db, {
+        sessionId: childSession.id,
+        parentSessionId: input.parentSessionId,
+        pid: handle.pid,
+        argvHash,
+        spawnedAt,
+        stderrLogPath,
+      });
+    } catch {
+      // Audit gap; spawn continues.
+    }
+  }
+
+  // Track parent-initiated kills for the exit_reason classifier
+  // below. Wraps `handle.kill` so every kill site (this file's
+  // protocol-mismatch path AND wait-loop's wall-clock path) flips
+  // the flag through the shared handle reference. Without this,
+  // we couldn't distinguish "we killed the child" (exit_reason =
+  // 'killed') from "the OS killed the child" (exit_reason =
+  // 'signal' — SIGSEGV, OOM, external SIGKILL).
+  let parentInitiatedKill = false;
+  const originalKill = handle.kill;
+  handle.kill = (sig) => {
+    parentInitiatedKill = true;
+    originalKill(sig);
+  };
+
+  // Single-fire exit-record handler. Fires when the OS reaps the
+  // child (proc.exited resolves). We classify the exit reason
+  // from (input.signal.aborted, exit.signal, parentInitiatedKill,
+  // exit.exitCode) — see SubagentProcessExitReason for the
+  // category meanings. The classify-then-write pattern is local
+  // to this file so a future audit consumer that wants the same
+  // taxonomy doesn't have to re-derive it.
+  handle.exited.then((exit) => {
+    if (handle.pid === undefined) return;
+    const exitedAt = Date.now();
+    const reason: SubagentProcessExitReason =
+      input.signal?.aborted === true
+        ? 'parent_aborted'
+        : exit.signal !== undefined && parentInitiatedKill
+          ? 'killed'
+          : exit.signal !== undefined
+            ? 'signal'
+            : exit.exitCode === 0
+              ? 'normal'
+              : 'crash';
+    try {
+      recordProcessExit(input.db, {
+        sessionId: childSession.id,
+        exitedAt,
+        // POSIX semantics: a process killed by signal has no
+        // meaningful exit code. We persist NULL so audit queries
+        // can filter "signal exits" cleanly via WHERE exit_signal
+        // IS NOT NULL rather than guessing 0/137/etc.
+        exitCode: exit.signal !== undefined ? null : exit.exitCode,
+        exitSignal: exit.signal ?? null,
+        exitReason: reason,
+      });
+    } catch {
+      // Audit gap; the row stays in the "still running" partial
+      // index. `agent worktree gc` reaps it later as orphan.
+    }
+  });
 
   // 5b. Subscribe to the IPC channel (when present). Parent MUST
   // begin draining immediately on spawn — spec §2.3: if the
@@ -695,7 +832,21 @@ export const runSubagent = async (input: RunSubagentInput): Promise<RunSubagentR
     handle.ipc.onMessage((msg) => {
       if (ipcVersionMismatch !== undefined) return;
       if (msg.type !== 'session_start') return;
-      if (msg.protocolVersion === IPC_PROTOCOL_VERSION) return;
+      if (msg.protocolVersion === IPC_PROTOCOL_VERSION) {
+        // Matching protocol version. The handshake is complete —
+        // stamp `subagent_processes.ipc_handshake_ok = 1` so a
+        // post-mortem can tell "child crashed before booting"
+        // (handshake_ok=0) from "child booted, then misbehaved"
+        // (handshake_ok=1, anything else). Idempotent: a future
+        // duplicate session_start (regression-bug or buffered
+        // replay) is a no-op via the WHERE clause in the repo.
+        try {
+          markIpcHandshakeOk(input.db, childSession.id);
+        } catch {
+          // Audit gap; handshake_ok stays 0 in the row.
+        }
+        return;
+      }
       // Mismatch: child speaks a version we don't recognize.
       // Record for the result-building branch and tear the
       // child down. Send interrupt:hard so a child that DOES

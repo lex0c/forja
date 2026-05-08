@@ -137,6 +137,21 @@ export type {
 } from './repos/subagent-outputs.ts';
 
 export {
+  getProcessRecord,
+  listOrphanedProcesses,
+  listProcessesByParent,
+  markIpcHandshakeOk,
+  recordProcessExit,
+  recordProcessSpawn,
+} from './repos/subagent-processes.ts';
+export type {
+  RecordProcessExitInput,
+  RecordProcessSpawnInput,
+  SubagentProcessExitReason,
+  SubagentProcessRecord,
+} from './repos/subagent-processes.ts';
+
+export {
   createMemoryEvent,
   listMemoryEventsByName,
   listMemoryEventsBySession,

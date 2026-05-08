@@ -15,6 +15,95 @@ Format:
 
 ---
 
+## [2026-05-07] subprocess audit (`subagent_processes`) for end-to-end forensics
+
+Closes the auditability gap between `subagent_outputs` (the
+result the child publishes) and the OS-level subprocess
+lifecycle. Without this, "subagent X failed" forensic queries
+routed through stderr.log files on disk plus speculation:
+children that crashed before the first IPC handshake had
+`payload IS NULL` with no cause label; pid/exit_signal lived
+nowhere; "OS killed" vs "parent killed" was not
+distinguishable. One row per subprocess now answers all of it.
+
+**Done:**
+
+- `migration 029-subagent-processes` — new audit table:
+  `(session_id PK, parent_session_id, pid, argv_hash,
+  spawned_at, exited_at, exit_code, exit_signal,
+  stderr_log_path, ipc_handshake_ok, exit_reason)`. CASCADE on
+  child session, SET NULL on parent (child evidence survives
+  parent purge). Two indexes: by-parent for forensics, partial
+  on `exited_at IS NULL` for the orphan/janitor surface.
+- `src/storage/repos/subagent-processes.ts` — repo with
+  `recordProcessSpawn` (INSERT OR REPLACE for idempotence),
+  `markIpcHandshakeOk` (idempotent UPDATE; WHERE clause
+  short-circuits after first match), `recordProcessExit`,
+  `getProcessRecord`, `listProcessesByParent`,
+  `listOrphanedProcesses`. Tolerant `exit_reason` reader: a
+  corrupt enum value reads as null rather than throwing.
+- `src/subagents/spawn-factory.ts` — `ChildProcessHandle` now
+  exposes `pid` + `cmd` (optional, omitted by in-process test
+  fakes); `exited` carries `signal` from `proc.signalCode` so
+  the audit layer can record signal-killed exits without a
+  fake exit code.
+- `src/subagents/runtime.ts` — three audit hooks:
+  1. After successful spawn: SHA256(cmd.join('\\0')) →
+     `argv_hash`; `recordProcessSpawn` with pid + spawn ts +
+     stderr_log_path. Wrapped in try/catch — audit write must
+     not break the spawn flow.
+  2. On the IPC `session_start` with matching protocol
+     version: `markIpcHandshakeOk`. Distinguishes
+     "child crashed before booting" (`handshake_ok=0`) from
+     "child booted, then misbehaved".
+  3. `proc.exited.then`: classifier picks `exit_reason` from
+     `(input.signal?.aborted, exit.signal,
+     parentInitiatedKill, exit.exitCode)` in fixed precedence
+     (`parent_aborted` > `killed` > `signal` > `normal` >
+     `crash`). `parentInitiatedKill` tracked via a
+     `handle.kill` wrapping shim so kills from runtime.ts
+     AND wait-loop.ts both flip the flag.
+- `docs/spec/AUDIT.md §1.7` (NEW) — documents motivation,
+  schema, two-phase lifecycle, exit_reason precedence table,
+  best-effort write semantics. Table count in §1 bumped from
+  18 → 19.
+
+**Tests:**
+
+- `tests/storage/subagent-processes.test.ts` — 11 new cases:
+  spawn round-trip, nullable parent + stderr path, idempotent
+  handshake, no-op on unknown session, exit fields, signal
+  exit shape (null exit_code), parent ordering, orphan
+  listing, CASCADE on session delete, parent SET NULL, and
+  the corrupt-enum tolerant-read path.
+- `tests/subagents/runtime.test.ts` — 5 integration cases
+  in a new describe block: `recordProcessSpawn` +
+  `recordProcessExit` reason=normal happy path, non-zero exit
+  → reason=crash, OS-killed (signal, no parent kill) →
+  reason=signal with null exit_code, fakes without pid/cmd
+  skip the audit row (NOT NULL pid column protected),
+  parent abort takes precedence over signal classification.
+
+**Verification:** `bun test` 3646 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean (2 pre-existing
+unrelated warnings).
+
+**Behavioral payoff:** `agent audit subprocess <id>` (future
+slice; data is in place now) answers in one row what used to
+require joining `subagent_outputs` + `subagent_runs` +
+`stderr.log` on disk + guessing. Critically, the early-crash
+case (segfault before first IPC handshake) goes from
+"no record except a possibly-empty stderr.log" to
+"`pid=X, ipc_handshake_ok=0, exit_signal='SIGSEGV',
+exit_reason='signal'`".
+
+**Next:** the data plumbing is done; `agent audit subprocess`
+CLI surface and a `session_timeline` view extension that
+joins `subagent_processes` are follow-up slices when the
+audit CLI lands.
+
+---
+
 ## [2026-05-07] per-playbook cost cap is now soft, not hard
 
 Pivot from the original idea ("remove per-playbook
