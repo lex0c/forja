@@ -83,8 +83,50 @@ const TEST_RUNNER_PATTERNS: readonly RegExp[] = [
   /^gradle\s+test\b/,
 ];
 
+// Strip shell prefixes that commonly precede a test-runner
+// command: a `cd`/`pushd` setup, leading env-var assignments,
+// and the time/nohup/exec wrappers. Each pass eats one
+// boundary-delimited prefix; the loop runs until nothing
+// matches, so chained forms (`A=1 cd pkg && bun test`,
+// `cd a && cd b && pytest`) collapse correctly. Quoted
+// directories with spaces are recognised. The intentional
+// limits — no subshell `( ... )`, no command substitution,
+// no `find -exec`-style trailing-runner forms — keep the
+// regex predictable; those shapes are rare enough in
+// agent-emitted commands that the false-negative cost is
+// lower than the false-positive risk of trying to parse
+// arbitrary shell.
+const SHELL_PREFIX_PATTERNS: readonly RegExp[] = [
+  // `cd <dir> && ` or `cd <dir>; ` — handles bare, single-
+  // quoted, and double-quoted directory tokens.
+  /^cd\s+(?:"[^"]*"|'[^']*'|\S+)\s*(?:&&|;)\s*/,
+  // `pushd <dir> && ` / `pushd <dir>; `
+  /^pushd\s+(?:"[^"]*"|'[^']*'|\S+)\s*(?:&&|;)\s*/,
+  // `NAME=value ` env-var assignment. Values may be bare,
+  // single-quoted, or double-quoted. The trailing whitespace
+  // is required so we do not eat into the runner token
+  // itself (`NODE_ENV=test` must consume the space before
+  // `npm`).
+  /^[A-Z_][A-Z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+/,
+  // `time `, `nohup `, `exec ` wrappers.
+  /^(?:time|nohup|exec)\s+/,
+];
+
+const stripShellPrefixes = (command: string): string => {
+  let s = command.trimStart();
+  let prev = '';
+  while (s !== prev) {
+    prev = s;
+    for (const rx of SHELL_PREFIX_PATTERNS) {
+      s = s.replace(rx, '');
+    }
+  }
+  return s;
+};
+
 const isTestRunner = (command: string): boolean => {
-  const head = command.trimStart().split('\n')[0]?.trim() ?? '';
+  const stripped = stripShellPrefixes(command);
+  const head = stripped.split('\n')[0]?.trim() ?? '';
   return TEST_RUNNER_PATTERNS.some((rx) => rx.test(head));
 };
 
