@@ -30,7 +30,7 @@ import { assembleProjectPointer, composeWithProjectPointer } from './project-poi
 import { composeWithResponseFormat } from './response-format.ts';
 import { composeWithTaskDiscipline } from './task-discipline.ts';
 
-export const DEFAULT_MODEL = 'anthropic/claude-sonnet-4-6';
+export const DEFAULT_MODEL = 'anthropic/claude-opus-4-7';
 
 export interface BootstrapInput {
   prompt: string;

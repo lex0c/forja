@@ -736,7 +736,7 @@ export const usage = (): string =>
     '  --checkpoints <cmd>    Checkpoint subcommands: list <session> | diff <session> <ckpt>',
     '                          | restore <session> <ckpt> | purge <session>',
     '  --yes, -y              Skip the bash-side-effect confirm on undo/restore',
-    '  --model <id>           Model id (default: anthropic/claude-sonnet-4-6)',
+    '  --model <id>           Model id (default: anthropic/claude-opus-4-7)',
     '  --max-steps <n>        Override harness step budget',
     '',
     'Examples:',
