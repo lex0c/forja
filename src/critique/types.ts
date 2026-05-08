@@ -155,3 +155,29 @@ export const DEFAULT_CRITIQUE_CONFIG: CritiqueConfig = {
   // §5.4: 3000ms. Beyond this the critic is silently skipped.
   maxOverheadMs: 3000,
 };
+
+// Three-way operator decision when the critic flags issues
+// (AGENTIC_CLI.md §5.4 line 551). Plus `cancel` (Esc / timeout)
+// which the harness treats the same as `abort` — neither one
+// proceeds with the proposed output. Kept distinct in the union
+// so audit can tell explicit-rejection from passive-cancel.
+export type CritiqueAnswer = 'ignore' | 'redo' | 'abort' | 'cancel';
+
+// Producer-facing args for `confirmCritique` (the harness hook the
+// REPL bridge wires to its modal manager). Mirrors the modal layer
+// without forcing the harness to import TUI types — the REPL
+// translates engine-side severity to the modal's `low | medium |
+// high` shape.
+export interface ConfirmCritiqueRequest {
+  // Issues that crossed the threshold. The modal renders these in
+  // its preview block; the operator sees them before deciding.
+  issues: CritiqueIssue[];
+  overallConfidence: number;
+  // True iff the proposed step was about to invoke at least one
+  // `writes:true` tool. Drives the modal's framing — a `writes`
+  // step is the high-stakes case `on_writes` mode targets, and
+  // the modal can render a stronger warning ("about to mutate
+  // files; review before continuing") vs a plain end-of-step
+  // critique.
+  toolPlanWrites: boolean;
+}

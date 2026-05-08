@@ -1,4 +1,6 @@
 export type {
+  ConfirmCritiqueRequest,
+  CritiqueAnswer,
   CritiqueConfig,
   CritiqueInput,
   CritiqueIssue,
@@ -13,6 +15,14 @@ export type {
 export { DEFAULT_CRITIQUE_CONFIG } from './types.ts';
 
 export { runCritique } from './engine.ts';
+
+export {
+  buildCritiqueInput,
+  buildCritiqueToolPlan,
+  renderCritiqueHint,
+  shouldCritique,
+  toolPlanHasWrites,
+} from './integration.ts';
 
 export {
   CRITIQUE_MARKER_CLOSE,

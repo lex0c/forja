@@ -5,6 +5,17 @@ import {
   createCheckpointManager,
   detectCheckpointSupport,
 } from '../checkpoints/index.ts';
+import {
+  type CritiqueAnswer,
+  type CritiqueConfig,
+  DEFAULT_CRITIQUE_CONFIG,
+  buildCritiqueInput,
+  buildCritiqueToolPlan,
+  renderCritiqueHint,
+  runCritique,
+  shouldCritique,
+  toolPlanHasWrites,
+} from '../critique/index.ts';
 import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
 import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
@@ -138,6 +149,11 @@ const exitToStatus: Record<ExitReason, TerminalSessionStatus> = {
   // an error — interrupted matches the existing 'aborted' shape
   // (operator-initiated termination).
   userPromptBlocked: 'interrupted',
+  // Self-critique abort: operator chose `abort` from the
+  // critique modal. Same shape as a UserPromptSubmit refusal —
+  // the operator stopped this turn voluntarily, not a runtime
+  // failure.
+  critiqueAborted: 'interrupted',
 };
 
 const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
@@ -154,6 +170,7 @@ const exitToHarnessStatus: Record<ExitReason, HarnessResult['status']> = {
   internalError: 'error',
   scriptExhausted: 'error',
   userPromptBlocked: 'interrupted',
+  critiqueAborted: 'interrupted',
 };
 
 const buildToolDefs = (config: HarnessConfig): ProviderToolDef[] =>
@@ -1576,6 +1593,162 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         // accepted and processed. Flipping the flag tells the renderer
         // to mark aggregate cost as a lower bound.
         if (!collected.usageSeen) usageComplete = false;
+
+        // === Self-critique gate (ORCHESTRATION.md §6) ===
+        // Runs BEFORE the assistant turn is persisted so a `redo`
+        // decision can discard the buffer without polluting the
+        // audit log. Inactive when:
+        //   - critique mode === 'off' (default; zero cost)
+        //   - the stream errored (we don't critique broken output;
+        //     stream errors take precedence and exit via the
+        //     `providerError` path below)
+        //   - the step's tool plan is all read-only in `on_writes`
+        //     mode (no writes-intent to gate)
+        //   - the step has no text AND no tool_uses (nothing to
+        //     review)
+        if (collected.errors.length === 0) {
+          const critiqueCfg: CritiqueConfig = {
+            ...DEFAULT_CRITIQUE_CONFIG,
+            ...(config.critique ?? {}),
+          };
+          if (
+            shouldCritique(critiqueCfg, collected.tool_uses, collected.text, config.toolRegistry)
+          ) {
+            const critiqueProvider = config.critiqueProvider ?? config.provider;
+            const toolPlan = buildCritiqueToolPlan(collected.tool_uses, config.toolRegistry);
+            const critiqueInput = buildCritiqueInput(
+              config.userPrompt,
+              config.systemPrompt,
+              collected.text,
+              toolPlan,
+            );
+            const planHasWrites = toolPlanHasWrites(toolPlan);
+            safeEmit(config.onEvent, {
+              type: 'critique_started',
+              stepN: steps,
+              toolPlanWrites: planHasWrites,
+            });
+
+            const critiqueResult = await runCritique(critiqueProvider, critiqueInput, {
+              threshold: critiqueCfg.threshold,
+              maxOverheadMs: critiqueCfg.maxOverheadMs,
+              ...(critiqueCfg.promptVersion !== undefined
+                ? { promptVersion: critiqueCfg.promptVersion }
+                : {}),
+              signal,
+            });
+
+            // Fold critique cost into session totals as a separate
+            // line per ORCHESTRATION §6.3 — `usage` aggregates
+            // billed tokens across executor + critic + compaction;
+            // `step.cost_usd` is the executor turn alone, and
+            // `totalCostUsd` is the session-wide sum. The
+            // critique's billed tokens flow through even on
+            // strategy='failed' / 'skipped' so partial bills
+            // (provider charged us before the call broke) are
+            // never silently dropped.
+            if (critiqueResult.usageSeen) {
+              totalUsage = addUsage(totalUsage, critiqueResult.usage);
+            }
+            totalCostUsd += critiqueResult.costUsd;
+            if (critiqueResult.costUsd > 0) emitCostUpdate(critiqueResult.costUsd);
+
+            // Decide whether to surface to the operator. The modal
+            // opens only when the engine ran end-to-end AND at
+            // least one issue crossed the threshold. Skipped /
+            // failed runs fall through silently — the audit event
+            // (Slice C) captures the reason for later analysis,
+            // but the run is not blocked.
+            let decision: CritiqueAnswer | 'no_modal' = 'no_modal';
+            if (critiqueResult.strategy === 'llm' && critiqueResult.filteredIssues.length > 0) {
+              // Default-ignore when no hook is wired (headless
+              // mode, tests). The Slice A engine guarantees the
+              // critic is a soft check, never a hard gate; a
+              // headless run shouldn't block on a missing modal.
+              decision = 'ignore';
+              if (config.confirmCritique !== undefined) {
+                try {
+                  decision = await config.confirmCritique({
+                    issues: critiqueResult.filteredIssues,
+                    overallConfidence: critiqueResult.overallConfidence,
+                    toolPlanWrites: planHasWrites,
+                  });
+                } catch {
+                  // Hook threw — degrade to `ignore`. A buggy
+                  // bridge MUST NOT take down the run.
+                  decision = 'ignore';
+                }
+              }
+            }
+
+            safeEmit(config.onEvent, {
+              type: 'critique_finished',
+              stepN: steps,
+              strategy: critiqueResult.strategy,
+              filteredCount: critiqueResult.filteredIssues.length,
+              rawCount: critiqueResult.rawIssues.length,
+              overallConfidence: critiqueResult.overallConfidence,
+              durationMs: critiqueResult.durationMs,
+              costUsd: critiqueResult.costUsd,
+              decision,
+              ...(critiqueResult.reason !== undefined ? { reason: critiqueResult.reason } : {}),
+            });
+
+            if (decision === 'abort' || decision === 'cancel') {
+              return await finish(
+                'critiqueAborted',
+                `${critiqueResult.filteredIssues.length} issue(s) flagged`,
+              );
+            }
+            if (decision === 'redo') {
+              // Discard the rejected assistant buffer entirely
+              // (ORCHESTRATION §6.2 — "discard buffer; re-run
+              // step com hint do critic injetado"). Push the
+              // critic's hint so the model sees it on the next
+              // provider call.
+              //
+              // Merge into the trailing user message when the
+              // tail is user-role — pushing a separate user
+              // message would create user→user alternation that
+              // some providers reject. For tail = string content,
+              // append the hint with a blank-line separator. For
+              // tail = block array (typically tool_results from
+              // the prior step), append a text block. When the
+              // tail is assistant (only happens if a prior step
+              // already left an assistant turn unmatched —
+              // shouldn't occur in normal flow) push a fresh
+              // user message.
+              const hint = renderCritiqueHint(critiqueResult.filteredIssues);
+              const last = messages[messages.length - 1];
+              if (last === undefined) {
+                messages.push({ role: 'user', content: hint });
+              } else if (last.role === 'user') {
+                if (typeof last.content === 'string') {
+                  messages[messages.length - 1] = {
+                    role: 'user',
+                    content: `${last.content}\n\n${hint}`,
+                  };
+                } else {
+                  messages[messages.length - 1] = {
+                    role: 'user',
+                    content: [...last.content, { type: 'text', text: hint }],
+                  };
+                }
+              } else {
+                messages.push({ role: 'user', content: hint });
+              }
+              // Cost-cap check before continuing — the rejected
+              // turn AND the critique call both billed tokens; a
+              // redo loop should not be able to blow past the
+              // hard cap by accumulating uncommitted spend.
+              const overage = costCapDetailIfExceeded();
+              if (overage !== null) return await finish('maxCostUsd', overage);
+              continue;
+            }
+            // decision === 'ignore' | 'no_modal' → fall through
+            // to persist.
+          }
+        }
 
         // When the adapter never emitted a `usage` event, persist NULL on
         // the token/cost columns instead of zeroes. Future analytics can

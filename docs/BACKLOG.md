@@ -15,6 +15,144 @@ Format:
 
 ---
 
+## [2026-05-08] m4/critique — Slice B: master loop integration (end-of-step + tool plan)
+
+**Done:** Self-critique engine wired into the master loop per
+ORCHESTRATION.md §6.2 / §6.5. The gate runs BEFORE the assistant
+turn is persisted so a `redo` decision can discard the rejected
+buffer entirely (spec-compliant: no audit row for the rejected
+output, only the critic's hint reaches the next turn).
+
+| File | What |
+|---|---|
+| `src/critique/types.ts` | NEW `CritiqueAnswer` union (`'ignore' \| 'redo' \| 'abort' \| 'cancel'`) and `ConfirmCritiqueRequest` interface (`issues`, `overallConfidence`, `toolPlanWrites`). The `cancel` value (Esc / timeout) is treated the same as `abort` at the loop layer — kept distinct in the union so audit can tell explicit-rejection from passive-cancel. |
+| `src/critique/integration.ts` | NEW pure helpers consumed by the loop: `shouldCritique` (mode-gating matrix per §6.1; on_writes fires for `writes:true` tool plans OR text-only end-of-step; always fires unless every tool_use is a known read-only), `buildCritiqueToolPlan` (maps `CollectedToolUse[]` to the engine's `CritiqueToolPlanEntry[]`), `buildCritiqueInput` (assembles the engine's input from prompt + system + text + plan), `renderCritiqueHint` (produces the synthetic user-message body the model sees on `redo`), `toolPlanHasWrites` (drives the modal's framing). |
+| `src/critique/index.ts` | Re-exports the new types + helpers. |
+| `src/harness/types.ts` | Three new `HarnessConfig` fields: `critique?: Partial<CritiqueConfig>` (operator config; merged with `DEFAULT_CRITIQUE_CONFIG`), `critiqueProvider?: Provider` (separate critic model — falls back to executor's provider when unset), `confirmCritique?: (req) => Promise<CritiqueAnswer>` (the bridge the REPL wires to its modal manager; absent ⇒ default-ignore). New `HarnessEvent` variants `critique_started` (carries `stepN` and `toolPlanWrites`) and `critique_finished` (carries `strategy`, `filteredCount`, `rawCount`, `overallConfidence`, `durationMs`, `costUsd`, `decision`, `reason?`). New `ExitReason: 'critiqueAborted'` mapped through both `TerminalSessionStatus` and `HarnessResult['status']` tables (interrupted, matching the `userPromptBlocked` shape — operator stopped voluntarily). |
+| `src/subagents/result-builder.ts` | Added `critiqueAborted: true` to `VALID_REASON_MAP` so the type-guarded validator accepts the new ExitReason in subagent envelopes. |
+| `src/harness/loop.ts` | Critique gate inserted between cost-tracking and `appendMessage`. Skipped when stream errored (don't critique broken output), mode is `off` (default), or `shouldCritique` returns false. On filtered issues the harness calls `confirmCritique` (or default-ignore when unset / hook throws). On `abort`/`cancel`: `finish('critiqueAborted', '<N> issue(s) flagged')`. On `redo`: hint merged into the trailing user message (avoids user→user alternation when redo fires right after the initial prompt — for tail = string content, append with a blank line; for tail = block array carrying tool_results, append a text block; for tail = assistant or empty, push a fresh user message), cost-cap re-checked (a redo loop must not blow past the hard cap on uncommitted spend), `continue` to top of `while(true)`. Critique cost folded into `totalUsage` + `totalCostUsd` separately from `step.cost_usd` per ORCHESTRATION §6.3. |
+| `src/tui/harness-adapter.ts` | Added no-op cases for `critique_started` / `critique_finished` so the exhaustiveness guard accepts the new union members. The operator-visible UX in Slice B is the modal itself (opened via `confirmCritique`); the lifecycle events are routed through headless NDJSON consumers but don't drive a TUI line yet — the live region's existing "thinking..." indicator covers the in-flight critic call, and a duplicate "critiquing..." line would just compete for visual attention with the modal that's about to open. Slice C may add a status-line indicator if operator feedback shows the silence is confusing. |
+| `tests/critique/loop-integration.test.ts` | NEW 13 tests across 3 describe groups: mode gating (`mode=off` skips entirely; default config skips entirely; on_writes skips read-only-only tool steps but fires on the trailing end-of-step text turn; on_writes + writes:true tool plan fires twice — once for the plan, once for the final text), critique decisions (clean run = no modal, run completes; flagged + ignore persists assistant; flagged + abort finishes critiqueAborted with NO assistant persisted; flagged + cancel maps to abort; flagged + redo discards the rejected turn AND re-runs successfully on the second attempt; missing confirmCritique defaults to ignore; throwing confirmCritique degrades to ignore), soft-failure paths (parse_failed strategy doesn't open the modal; critique cost flows into session totals at per-million pricing). |
+
+**Decisions:**
+
+- **Defer persist universally, not just on `redo`.** The first
+  draft kept the existing persist site at line 1585 and only
+  branched on redo. Problem: persisting before critique means a
+  `redo` row lands in `messages` AND an audit gap (we'd need to
+  insert a "superseded" marker), AND a stream-errors fallthrough
+  would persist a doubly-rejected message (errored output then
+  hint). Moving persist to AFTER the critique gate keeps the
+  spec semantics clean: rejected buffers never reach the audit
+  log, and the existing stream-errors path (which exits via
+  `providerError` BEFORE persist) gets the same "discard the
+  buffer on real failure" shape as critique-redo.
+- **Cost cap re-checked on every redo.** Without this, a redo
+  loop that keeps producing flagged output would accumulate
+  uncommitted spend (rejected turn cost + critique cost + next
+  turn cost + next critique cost...) without any per-iteration
+  gate. With the re-check, the run terminates as `maxCostUsd`
+  the moment the cumulative crosses the cap — same shape as
+  the steady-state cost cap, just at a different point in the
+  loop. The existing post-persist cost-cap check still runs on
+  the `ignore` / no-issues path.
+- **Hint merged into the trailing user message, not pushed
+  separately.** Pushing a fresh user message right after the
+  initial prompt creates user→user alternation that some
+  providers (Anthropic) reject with 400. Merging — for string
+  content, append with `\n\n` separator; for block array (tool
+  results from a prior step), append a text block — keeps the
+  alternation clean. Tail = assistant or empty (rare; only
+  happens if a prior step left an assistant unmatched, which
+  shouldn't occur in normal flow) falls through to a fresh
+  push. Trade-off: on multi-step runs where the redo lands on
+  step N>1, the hint sits inside a tool_result-carrying user
+  message, which mixes critique guidance with tool output for
+  the model. The model has no problem reading both, and the
+  alternative (a separate user message that breaks alternation)
+  was strictly worse.
+- **`confirmCritique` absent OR throwing both default to
+  `ignore`.** A headless run that opted into critique (mode is
+  set) shouldn't block on a missing modal; a buggy REPL bridge
+  that throws shouldn't take down the run. The Slice A engine
+  guarantees the critic is a soft check — this just propagates
+  that promise through the loop layer. Audit captures the
+  `decision` regardless (Slice C will surface the difference
+  between "no hook wired" and "hook threw" via the
+  `failure_events` row).
+- **Critique cost added to `totalCostUsd` but NOT included in
+  `step.cost_usd`.** ORCHESTRATION §6.3 line 608: critic gets
+  its own line in `/cost`. This matches the compaction call
+  semantic that already lives in the loop. Future `/cost`
+  breakdown (Slice C) will distinguish the two via per-event
+  cost (`compaction_finished.costUsd` vs
+  `critique_finished.costUsd`).
+- **TUI modal still emits 2 options (yes/no), not 3
+  (ignore/redo/abort).** The TUI's `critique:ask` reducer at
+  state.ts:1514 predates this engine and was wired with two
+  options matching the modal pattern's binary shape. Updating
+  it to 3 options + adding `askCritique` to modal-manager +
+  rewiring the REPL bridge is Slice C work; the harness's
+  `confirmCritique` interface is provider-agnostic (returns the
+  full union), so the bridge can do the translation when it
+  lands. Tests use mock `confirmCritique` implementations and
+  exercise all 4 answer values cleanly.
+- **No-op TUI adapter cases for critique events.** The harness
+  emits `critique_started` / `critique_finished` for headless
+  NDJSON consumers and Slice C's audit. The TUI doesn't render
+  them in Slice B because (a) the live region already shows
+  "thinking..." while the critic call is in flight, (b) the
+  modal opens via `confirmCritique` directly, (c) a competing
+  status line would just clutter the screen. The exhaustiveness
+  guard requires the cases to exist, so they're explicit
+  no-ops with rationale comments rather than a default branch.
+- **Mode gating: unknown tools count as non-read-only in
+  `always`, but NOT writes-equivalent in `on_writes`.** A tool
+  the registry doesn't recognize might be writes-equivalent OR
+  might be read-only — we don't know. In `always` mode the
+  safe default is to critique it (cost is paid; false positive
+  is acceptable; missing a write is worse). In `on_writes`
+  mode the semantic is "fire on declared writes-intent"; an
+  unknown tool doesn't prove that intent, so we don't fire.
+  Operator who wants critique on unknown tools sets mode to
+  `always`.
+
+**Pending (Slice C):**
+
+- **TUI modal 3 options + askCritique.** Rewrite the
+  `critique:ask` reducer at state.ts:1514 to build 3 options
+  (`ignore`/`redo`/`abort`), add `askCritique` to
+  modal-manager, wire the REPL's
+  `confirmCritique = modalManager.askCritique` so an
+  interactive run actually shows the operator the modal. Until
+  Slice C lands, mode=on_writes / mode=always in production
+  will run the critic and default-ignore (still useful — the
+  cost lands, audit captures the result, but the operator
+  doesn't get the gate yet).
+- **Audit: `failure_events` rows.** §5.4 line 552 spec'd
+  `critique.warning_shown` / `critique.skipped` /
+  `critique.warning_ignored` / new `critique.failed`. Today
+  audit lives only in the lifecycle events (`critique_started`,
+  `critique_finished`); persistence to `failure_events` is the
+  Slice C addition.
+- **Eval `evals/critique/`.** Spec line 572-577. Without eval
+  the critic is noise. Fixtures with bugs (must detect),
+  fixtures with clean output (must not invent issues),
+  threshold tuning baseline.
+- **Operator config loader.** TOML at
+  `~/.config/agent/config.toml` (`[critique] mode = "on_writes"`
+  etc). Today the only path to enable critique is programmatic
+  via `HarnessConfig.critique`; the CLI bootstrap doesn't read
+  the TOML.
+- **D184 supersession entry.** Once Slice C lands the modal +
+  REPL wire, mark D184 in the M4.1 inventory as superseded with
+  a pointer here.
+
+**Next:** Slice C (TUI modal + audit + eval + REPL wire) on the
+same `feat/m4-critique` branch.
+
+---
+
 ## [2026-05-08] m4/critique — Slice A: engine + types (foundation, no loop wiring)
 
 **Done:** Foundational module `src/critique/` for the self-critique
