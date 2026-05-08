@@ -143,6 +143,21 @@ describe('parseArgs', () => {
     expect(r.args.listSessions).toBe(true);
   });
 
+  test('--explain-permissions flag defaults off and toggles on', () => {
+    const off = parseArgs(['hello']);
+    expect(off.ok).toBe(true);
+    if (!off.ok) return;
+    expect(off.args.explainPermissions).toBe(false);
+
+    const on = parseArgs(['--explain-permissions']);
+    expect(on.ok).toBe(true);
+    if (!on.ok) return;
+    expect(on.args.explainPermissions).toBe(true);
+    // Standalone — no positional prompt required (it's an
+    // inspection-only flag).
+    expect(on.args.prompt).toBe('');
+  });
+
   test('--list-sessions composes with --json', () => {
     const r = parseArgs(['--list-sessions', '--json']);
     expect(r.ok).toBe(true);
