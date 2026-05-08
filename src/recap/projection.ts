@@ -280,10 +280,30 @@ const resolveSessions = (db: DB, scope: RecapScopeOption): Session[] => {
 
 // Pull the operator-authored prose out of a `messages.content`
 // value. String content (the common shape — operator typed a
-// prompt at the REPL) returns verbatim. Block-array content
-// (multimodal turns, tool_result echoes, providers that
-// always emit blocks) collects every `type:'text'` block whose
-// trimmed body is non-empty and joins them with a newline.
+// prompt at the REPL) returns verbatim WHEN it carries actual
+// prose; whitespace-only strings collapse to ''. Block-array
+// content (multimodal turns, tool_result echoes, providers
+// that always emit blocks) collects every `type:'text'` block
+// whose trimmed body is non-empty and joins them with a
+// newline.
+//
+// Two consistency invariants:
+//
+//   1. Both branches treat whitespace-only as empty. The
+//      string branch used to return raw content, so a user
+//      message of `'   '` or `'\n\n'` was counted as a real
+//      prompt — became the recap goal AND anchored a step
+//      boundary in `/recap last <N>`. Block-array branch
+//      already filtered whitespace-only blocks via
+//      `trim().length > 0` (commit e6b09e5); the string
+//      branch now mirrors the same gate.
+//
+//   2. Real content returns verbatim — meaningful leading /
+//      trailing whitespace inside a non-empty prompt is
+//      preserved so audit consumers and the json envelope
+//      see the operator's actual input. The renderer's
+//      oneLine() collapses whitespace at the human surface,
+//      so the visible shape is unchanged.
 //
 // The "non-empty after trim" filter is load-bearing: a leading
 // empty / whitespace-only text block (which the Anthropic SDK
@@ -294,7 +314,9 @@ const resolveSessions = (db: DB, scope: RecapScopeOption): Session[] => {
 // non-empty blocks instead of picking just the first
 // guarantees no operator prose gets dropped.
 const extractUserPromptText = (content: unknown): string => {
-  if (typeof content === 'string') return content;
+  if (typeof content === 'string') {
+    return content.trim().length > 0 ? content : '';
+  }
   return extractTextBlocks(content)
     .filter((t) => t.trim().length > 0)
     .join('\n');

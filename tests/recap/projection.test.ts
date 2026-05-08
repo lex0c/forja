@@ -117,6 +117,99 @@ describe('projectRecap', () => {
     expect(out.goal.sourceStepId).toBe(userId);
   });
 
+  test('goal extraction skips whitespace-only string user messages', () => {
+    // Regression: the string branch of extractUserPromptText
+    // returned content verbatim, so a user message of `'   '`
+    // or `'\n\n'` had length > 0 and was treated as a real
+    // prompt. That made the recap goal a literal whitespace
+    // string AND inflated step counts for `/recap last <N>`.
+    // Symmetric with the block-array branch, which already
+    // filtered whitespace-only blocks via `trim().length > 0`.
+    const s = seedSession();
+    // Two whitespace-only "prompts" before the real one.
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: '   ',
+      createdAt: 1_100,
+    });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: '\n\n\t  \n',
+      createdAt: 1_110,
+    });
+    const realId = appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'extract the queue retry logic',
+      createdAt: 1_120,
+    }).id;
+
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.goal.text).toBe('extract the queue retry logic');
+    expect(out.goal.sourceStepId).toBe(realId);
+  });
+
+  test('whitespace-only string user messages do NOT anchor /recap last <N> steps', () => {
+    // Same root cause manifesting at the step-boundary scan
+    // instead of goal extraction. With three "user" rows
+    // (whitespace, whitespace, real prompt), `last 1` must
+    // window to the real prompt — not to the second whitespace
+    // row. The earlier shape of this gate (only checking
+    // role==='user' or accepting any non-empty string) would
+    // have cut the session at the whitespace row, dropping
+    // the real prompt and producing an empty-goal recap.
+    const s = seedSession();
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: '   ',
+      createdAt: 1_100,
+    });
+    const realId = appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'do the actual work',
+      createdAt: 1_110,
+    }).id;
+    const aId = addAssistantTurn(s.id, realId, 'on it', { ts: 1_115 });
+    addToolCall(aId, 'read_file', { path: 'src/foo.ts' }, null, 'done', 5, 1_120);
+
+    const out = projectRecap(db, {
+      scope: { kind: 'session_current', sessionId: s.id, limit: 1 },
+    });
+    expect(out.goal.text).toBe('do the actual work');
+    expect(out.goal.sourceStepId).toBe(realId);
+    expect(out.actions.filesRead).toEqual([{ path: 'src/foo.ts', count: 1 }]);
+  });
+
+  test('non-empty string prompts retain their original whitespace verbatim', () => {
+    // Negative space for the trim gate: the fix must not
+    // mutate real prompts. Operator-typed content with
+    // intentional leading / trailing whitespace (code-shaped
+    // prompts, ASCII-art, deliberate indentation) should
+    // round-trip through the projection unchanged so the json
+    // envelope is faithful to what the operator typed. The
+    // renderer's oneLine() collapses for the human surface;
+    // the projection itself stays verbatim.
+    const s = seedSession();
+    const userId = appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: '   refactor the queue\n  preserve the indent\n',
+      createdAt: 1_100,
+    }).id;
+
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    expect(out.goal.text).toBe('   refactor the queue\n  preserve the indent\n');
+    expect(out.goal.sourceStepId).toBe(userId);
+  });
+
   test('goal extraction skips leading empty / whitespace-only text blocks', () => {
     // Regression: extractTextBlocks(...)[0] silenced the real
     // prompt when a turn opened with an empty text block (which
