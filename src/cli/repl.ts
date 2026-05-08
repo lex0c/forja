@@ -885,8 +885,15 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     // ORCHESTRATION §6.3, so this field is a SUBSET — operators
     // read "cumulative: $X · critique: $Y" as "of $X total spend,
     // $Y was the second-pass review".
+    //
+    // `critiqueRuns` advances unconditionally — even when the
+    // emitted `costUsd` is 0 (missing usage telemetry, or
+    // `strategy=skipped`). The count is what tells `/cost` that
+    // critique was actually invoked, separating "ran with no
+    // measurable cost" from "never ran".
     if (event.type === 'critique_finished') {
       cumulative.critiqueCostUsd += event.costUsd;
+      cumulative.critiqueRuns += 1;
     }
   };
 
@@ -1253,7 +1260,7 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
   // — no chance of a typed `/<conflict>` ambiguously routing
   // mid-session.
   const slashRegistry = createBuiltinRegistry(subagents);
-  const cumulative = { costUsd: 0, steps: 0, turns: 0, critiqueCostUsd: 0 };
+  const cumulative = { costUsd: 0, steps: 0, turns: 0, critiqueCostUsd: 0, critiqueRuns: 0 };
   // Single registry instance for the REPL's lifetime. /model uses it
   // for the lookup + factory; bootstrap built its own at boot for
   // initial provider resolution. Both call sites are independent —
@@ -1494,6 +1501,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
             if (Number.isFinite(row.costUsd)) {
               cumulative.critiqueCostUsd += row.costUsd;
             }
+            // Count every persisted run (the row's existence
+            // proves critique was invoked). Bad cost data
+            // shouldn't hide the fact that critique fired —
+            // `/cost` keys the breakdown line on the count, not
+            // the cost.
+            cumulative.critiqueRuns += 1;
           }
         } catch {
           // Audit roll-up failed; the per-row data is still in DB

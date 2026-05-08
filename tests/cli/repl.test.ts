@@ -2860,10 +2860,14 @@ describe('repl — slash commands integration', () => {
     expect(newWrites).toMatch(/\$0\.0500/);
     // Breakdown line MUST surface — without the bridge's
     // critique-row roll-up this would not render at all (the
-    // line is gated on critiqueCostUsd > 0 in commands/cost.ts).
+    // line is gated on critiqueRuns > 0 in commands/cost.ts).
     expect(newWrites).toContain('└─ critique:');
     // Sum of the two pre-seeded rows: 0.005 + 0.003 = 0.008.
     expect(newWrites).toMatch(/critique:\s*\$0\.0080/);
+    // Bridge also folds the run count from the same query, so
+    // /cost reports both spend AND firing frequency. Two seeded
+    // rows ⇒ "2 runs".
+    expect(newWrites).toMatch(/· 2 runs/);
 
     stdin.feed('\x04');
     expect(await promise).toBe(130);

@@ -45,7 +45,7 @@ const makeCtx = (overrides: Partial<SlashContext> = {}): SlashContext => {
     db,
     bus,
     modalManager,
-    cumulative: { costUsd: 0, steps: 0, turns: 0, critiqueCostUsd: 0 },
+    cumulative: { costUsd: 0, steps: 0, turns: 0, critiqueCostUsd: 0, critiqueRuns: 0 },
     now: () => 1,
     requestShutdown: () => undefined,
     isRunning: () => false,
@@ -127,32 +127,74 @@ describe('/cost', () => {
     expect(r2.notes?.[0]).toContain('$100.50');
   });
 
-  test('omits the critique line when critiqueCostUsd is 0 (mode=off / never ran)', async () => {
+  test('omits the critique line when critiqueRuns is 0 (mode=off / never invoked)', async () => {
+    // The gate is the run count, not the cost — when critique
+    // never fired the line is correctly suppressed (default-mode
+    // output stays a single line).
     const ctx = makeCtx();
     ctx.cumulative.costUsd = 0.5;
     ctx.cumulative.steps = 5;
     ctx.cumulative.turns = 1;
     ctx.cumulative.critiqueCostUsd = 0;
+    ctx.cumulative.critiqueRuns = 0;
     const result = await costCommand.exec([], ctx);
     if (result.kind !== 'ok') return;
     expect(result.notes).toHaveLength(1);
     expect(result.notes?.[0]).not.toContain('critique');
   });
 
-  test('shows critique breakdown line when critiqueCostUsd > 0', async () => {
+  test('shows critique breakdown line with cost and run count when critiqueRuns > 0', async () => {
     const ctx = makeCtx();
     ctx.cumulative.costUsd = 0.5;
     ctx.cumulative.steps = 5;
     ctx.cumulative.turns = 1;
     ctx.cumulative.critiqueCostUsd = 0.12;
+    ctx.cumulative.critiqueRuns = 4;
     const result = await costCommand.exec([], ctx);
     if (result.kind !== 'ok') return;
     expect(result.notes).toHaveLength(2);
     // First line keeps the existing format.
     expect(result.notes?.[0]).toContain('$0.5000');
     // Second line is the breakdown — tree-glyph prefix matches the
-    // existing scrollback aesthetic for nested info.
-    expect(result.notes?.[1]).toMatch(/^└─ critique: \$0\.1200/);
+    // existing scrollback aesthetic for nested info, with the run
+    // count alongside cost so operators see both spend AND firing
+    // frequency.
+    expect(result.notes?.[1]).toMatch(/^└─ critique: \$0\.1200 · 4 runs$/);
+  });
+
+  test('shows critique line even when critiqueCostUsd is 0 if critiqueRuns > 0 (no usage telemetry)', async () => {
+    // Regression: gating on cost alone hid real critique runs in
+    // environments where the provider didn't emit usage telemetry
+    // (or every invocation resolved as strategy=skipped). The
+    // count is the source of truth for "did critique fire" — cost
+    // is allowed to be zero without dropping the line, otherwise
+    // /cost lies about whether the gate is active.
+    const ctx = makeCtx();
+    ctx.cumulative.costUsd = 0.5;
+    ctx.cumulative.steps = 5;
+    ctx.cumulative.turns = 1;
+    ctx.cumulative.critiqueCostUsd = 0;
+    ctx.cumulative.critiqueRuns = 3;
+    const result = await costCommand.exec([], ctx);
+    if (result.kind !== 'ok') return;
+    expect(result.notes).toHaveLength(2);
+    // Line still renders; cost shows $0 next to a non-zero run
+    // count so the zero is unambiguous (critique fired 3 times
+    // with no measurable spend, NOT "critique never ran").
+    expect(result.notes?.[1]).toMatch(/^└─ critique: \$0\.0000 · 3 runs$/);
+  });
+
+  test('uses singular "run" when critiqueRuns is exactly 1', async () => {
+    const ctx = makeCtx();
+    ctx.cumulative.costUsd = 0.5;
+    ctx.cumulative.steps = 5;
+    ctx.cumulative.turns = 1;
+    ctx.cumulative.critiqueCostUsd = 0.0023;
+    ctx.cumulative.critiqueRuns = 1;
+    const result = await costCommand.exec([], ctx);
+    if (result.kind !== 'ok') return;
+    expect(result.notes?.[1]).toMatch(/· 1 run$/);
+    expect(result.notes?.[1]).not.toMatch(/runs$/);
   });
 });
 

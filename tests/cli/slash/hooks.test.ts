@@ -54,7 +54,7 @@ const makeCtx = (hooks: readonly HookSpec[]): CtxBundle => {
       db,
       bus,
       modalManager,
-      cumulative: { costUsd: 0, steps: 0, turns: 0, critiqueCostUsd: 0 },
+      cumulative: { costUsd: 0, steps: 0, turns: 0, critiqueCostUsd: 0, critiqueRuns: 0 },
       now: () => 1,
       requestShutdown: () => {},
       isRunning: () => false,
