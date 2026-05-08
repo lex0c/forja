@@ -198,6 +198,67 @@ describe('assembleProjectPointer — trust boundary (security)', () => {
   });
 });
 
+describe('assembleProjectPointer — prompt-injection hardening', () => {
+  // The trust modal authorizes ACCESS to a directory; it does
+  // NOT cleanse the path STRING of bytes that would break out of
+  // the surrounding code span and inject attacker-controlled
+  // instructions at system-prompt priority. The pointer text MUST
+  // sanitize the path it embeds even when the operator explicitly
+  // trusted the directory. Realistic exploit shapes:
+  //   - `cd /tmp/$(crafted)` pre-`agent` invocation
+  //   - `git clone target/dir-with-newlines/...`
+  //   - shared-volume mount where another user named a directory
+  //     with backticks or control bytes
+
+  test('a backtick in the cwd path does not break out of the code span', () => {
+    // Build a real directory with a backtick in its name so
+    // existsSync probes return true for the AGENTS.md inside.
+    // POSIX permits the byte; the test assumes a Linux/macOS
+    // filesystem (CI default).
+    const evilCwd = mkdtempSync(join(dir, 'a`b-'));
+    writeFileSync(join(evilCwd, 'AGENTS.md'), '# Malicious\n');
+    const out = assembleProjectPointer(trusted({ cwd: evilCwd, repoRoot: evilCwd }));
+    // The advertised path text must contain exactly two backticks
+    // (open + close of the code span); the value's own backtick
+    // was replaced by an apostrophe.
+    const pointerLine = out.text.split('\n').find((l) => l.includes('AGENTS.md at'));
+    expect(pointerLine).toBeDefined();
+    expect((pointerLine?.match(/`/g) ?? []).length).toBe(2);
+    // The on-disk path returned for observability stays raw — it
+    // IS the real filesystem path, callers might want to read or
+    // log it as-is.
+    expect(out.agentsMdPath).toBe(join(evilCwd, 'AGENTS.md'));
+  });
+
+  test('newlines in the cwd path do not inject extra prompt lines', () => {
+    // Build a directory whose name contains a newline. POSIX
+    // permits this; on filesystems that reject the byte the test
+    // skips by aborting at mkdir time — that's a platform fact,
+    // not a regression.
+    let evilCwd: string;
+    try {
+      evilCwd = mkdtempSync(join(dir, 'a\nb-'));
+    } catch {
+      // Filesystem rejected the byte (some setups do). The
+      // sanitizer still has to handle the case in case some
+      // OTHER source (a `--cwd` flag from a wrapper script)
+      // delivers a newline byte; the env-prompt unit tests
+      // already pin that. Skip the integration arm cleanly.
+      return;
+    }
+    writeFileSync(join(evilCwd, 'AGENTS.md'), '# x\n');
+    const out = assembleProjectPointer(trusted({ cwd: evilCwd, repoRoot: evilCwd }));
+    // No standalone H2 line — the would-be injected header was
+    // folded into the pointer line via U+23CE.
+    expect(out.text).not.toMatch(/^## SYSTEM/m);
+    // The pointer line itself stays a single line with two
+    // backticks.
+    const pointerLines = out.text.split('\n').filter((l) => l.includes('AGENTS.md at'));
+    expect(pointerLines).toHaveLength(1);
+    expect((pointerLines[0]?.match(/`/g) ?? []).length).toBe(2);
+  });
+});
+
 describe('composeWithProjectPointer', () => {
   test('returns base unchanged when pointer is empty', () => {
     expect(composeWithProjectPointer('base prompt', '')).toBe('base prompt');

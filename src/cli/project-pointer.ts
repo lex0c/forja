@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { sanitizeForCodeSpan } from './prompt-codespan.ts';
 
 // `[project_context]` section assembly (spec CONTEXT_TUNING.md §2.0).
 //
@@ -147,8 +148,25 @@ export const assembleProjectPointer = (input: ProjectPointerInput): ProjectPoint
     agentsMdPath = repoRootPath;
   }
   if (agentsMdPath === undefined) return { text: '' };
+  // Sanitize before embedding in the markdown code span. Even
+  // though the operator explicitly trusted the cwd / repoRoot
+  // path, the trust modal authorizes ACCESS to the directory —
+  // it does NOT cleanse the path STRING of injection bytes that
+  // would break out of the surrounding code span and inject
+  // attacker-controlled instructions at system-prompt priority.
+  // A `cd /tmp/x\`y` pre-`agent` invocation, or a `git clone`
+  // into a path containing `\n## SYSTEM:`, defeats the trust
+  // gate's prompt-protection guarantee without `sanitizeFor
+  // CodeSpan` at the interpolation site. The sanitizer's role
+  // here is identical to the env-prompt cwd / branch fix —
+  // see `prompt-codespan.ts` for the threat model.
+  // The on-disk `agentsMdPath` is preserved verbatim on the
+  // return value so observability / tests can compare against
+  // the actual filesystem path; only the prompt-embedded text
+  // is sanitized.
+  const safePath = sanitizeForCodeSpan(agentsMdPath);
   return {
-    text: `${SECTION_HEADER}\n\n- AGENTS.md at \`${agentsMdPath}\``,
+    text: `${SECTION_HEADER}\n\n- AGENTS.md at \`${safePath}\``,
     agentsMdPath,
   };
 };
