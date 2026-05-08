@@ -15,6 +15,81 @@ Format:
 
 ---
 
+## [2026-05-07] surface subagent tool calls as permanent scrollback chips
+
+A subagent doing real work used to surface as a single live
+heartbeat row ("running read_file" scrolling past) with no
+permanent record of WHAT files / args / durations the child
+actually touched. The child's tool events already crossed the
+IPC boundary — the parent's harness-adapter just dropped them
+into the `subagent:update` heartbeat and never emitted a
+permanent chip. This slice mirrors the parent path: subagent
+inner `tool_invoking` / `tool_decided` / `tool_finished` now
+produce permanent `tool:start` / `tool:end` UIEvents alongside
+the existing heartbeat.
+
+**Done:**
+
+- `src/tui/harness-adapter.ts` — in the `subagent_progress`
+  case, three new emissions:
+  1. `tool_invoking` → permanent `tool:start` chip with
+     namespaced `toolId = 'sub:<subagentId>:<toolUseId>'` and
+     subject prefixed `[sub <id8>] <vocab.subject(args)>` so
+     the chip is attributable in mixed parent/child scrollback.
+     Vocab subject extractor wrapped in try/catch (a malformed
+     args shape mustn't break the dual-emit path).
+  2. `tool_decided` → updates the namespaced state entry's
+     decision so the eventual `tool_finished` can branch
+     `denied` vs `error` vs `done`. No UI emission (mirrors
+     top-level path).
+  3. `tool_finished` → permanent `tool:end` with the same
+     namespaced toolId, status classifier (denied / error /
+     done) identical to the top-level path, summary carries
+     the deny reason when applicable.
+- Namespacing rationale: child generates `toolUseId` locally,
+  so two concurrent siblings can collide on `'tu1'`. Without
+  the prefix, the parent's `state.tools` map would overwrite
+  one with the other and the surviving chip would describe
+  the wrong tool. Tests pin the no-collision invariant
+  directly.
+
+**Tests:**
+
+- `tests/tui/harness-adapter.test.ts` — 5 new cases:
+  tool_invoking dual-emits subagent:update + tool:start with
+  prefixed toolId + `[sub …]` subject; round-trip from
+  tool_invoking through tool_finished matches by toolId;
+  failed=true → tool:end status=error; deny path captures
+  decision reason as summary; two concurrent subagents with
+  the same local `toolUseId` resolve to distinct namespaced
+  toolIds without colliding on state.tools.
+
+**Verification:** `bun test` 3657 pass / 0 fail · `bun run
+typecheck` clean · `bun run lint` clean (2 pre-existing
+unrelated warnings).
+
+**Behavioral payoff:** the operator now sees the actual file
+paths / commands / durations the child touched in scrollback
+rather than only the verb scrolling past on the live row.
+Before: "subagent abc · running read_file" → row recycles → gone.
+After: persistent chip "Read in 0.2s · [sub abc12345] src/foo.ts".
+
+**Pending — explicit follow-ups (next slices on this branch):**
+
+- **Slice 2 (`|_` continuation hierarchy):** UIEvent gains an
+  optional `parentId` so the renderer can indent
+  subagent-owned chips under a single subagent header, instead
+  of relying on the `[sub …]` subject prefix for attribution.
+- **Slice 3 (read coalescing):** renderer-side fold of
+  consecutive same-tool finishes within a single step into a
+  single `Read [N files] (Ts, Xtok)` summary chip. Real-time
+  feedback preserved (events still emitted individually); only
+  the rendered scrollback is condensed.
+
+**Next:** branch is mergeable; slices 2/3 ride on top.
+
+---
+
 ## [2026-05-07] subprocess audit (`subagent_processes`) for end-to-end forensics
 
 Closes the auditability gap between `subagent_outputs` (the

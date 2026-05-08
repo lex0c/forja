@@ -628,6 +628,91 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
             message: `subagent ${event.subagentId.slice(0, 8)} over budget estimate ($${fmt(inner.cumulative)} > $${fmt(inner.threshold)})`,
           });
         }
+        // Permanent tool chips for tool_invoking / tool_decided /
+        // tool_finished from inside the child. Without these, a
+        // subagent doing real work shows up as nothing but the
+        // heartbeat row above — operator sees "running read_file"
+        // scroll past, never the file path, never the duration.
+        // Mirrors the top-level path (case 'tool_invoking' /
+        // 'tool_finished' earlier in this switch) with two
+        // adaptations:
+        //   - toolId is namespaced as `sub:<subagentId>:<toolUseId>`
+        //     so two concurrent subagents can't collide on a shared
+        //     id (the child generates ids locally; without the
+        //     prefix the parent's `state.tools` map would
+        //     overwrite). The reducer + renderer treat the
+        //     prefixed id as opaque.
+        //   - subject is prefixed `[sub <id8>] ` so the operator
+        //     can attribute the chip to a child even when two
+        //     subagents and the parent are issuing tools
+        //     interleaved. Slice-2 grouping (`|_` indent under a
+        //     subagent header) is a follow-up; this slice keeps
+        //     the chip flat with explicit attribution.
+        const subTag = `[sub ${event.subagentId.slice(0, 8)}]`;
+        if (
+          inner.type === 'tool_invoking' &&
+          typeof inner.toolUseId === 'string' &&
+          typeof inner.toolName === 'string'
+        ) {
+          const namespacedId = `sub:${event.subagentId}:${inner.toolUseId}`;
+          const vocab = lookupToolVocab(inner.toolName);
+          let baseSubject: string | null = null;
+          try {
+            baseSubject = vocab.subject?.(inner.args) ?? null;
+          } catch {
+            baseSubject = null;
+          }
+          const subject = baseSubject !== null ? `${subTag} ${baseSubject}` : subTag;
+          state.tools.set(namespacedId, { name: inner.toolName, decision: null });
+          out.push({
+            type: 'tool:start',
+            ts,
+            toolId: namespacedId,
+            name: inner.toolName,
+            activeVerb: vocab.activeVerb,
+            finalVerb: vocab.finalVerb,
+            subject,
+          });
+        }
+        if (inner.type === 'tool_decided' && typeof inner.toolUseId === 'string') {
+          // Mirror the top-level path: store the decision so
+          // tool_finished can branch on `denied` vs error vs done.
+          // No UI emission here — the decision surfaces via the
+          // chip's status on tool_finished.
+          const namespacedId = `sub:${event.subagentId}:${inner.toolUseId}`;
+          const tool = state.tools.get(namespacedId);
+          if (tool !== undefined) tool.decision = inner.decision;
+        }
+        if (inner.type === 'tool_finished' && typeof inner.toolUseId === 'string') {
+          const namespacedId = `sub:${event.subagentId}:${inner.toolUseId}`;
+          const tool = state.tools.get(namespacedId);
+          const decisionKind = tool?.decision?.kind;
+          const status: 'done' | 'error' | 'denied' = inner.denied
+            ? 'denied'
+            : decisionKind === 'deny'
+              ? 'denied'
+              : inner.failed
+                ? 'error'
+                : 'done';
+          let summary: string | undefined;
+          if (status === 'denied' && tool?.decision !== undefined && tool.decision !== null) {
+            const decision = tool.decision;
+            if (decision.kind === 'deny') {
+              summary = decision.reason;
+            } else if (decision.kind === 'confirm') {
+              summary = 'rejected at confirmation prompt';
+            }
+          }
+          state.tools.delete(namespacedId);
+          out.push({
+            type: 'tool:end',
+            ts,
+            toolId: namespacedId,
+            status,
+            durationMs: inner.durationMs,
+            ...(summary !== undefined ? { summary } : {}),
+          });
+        }
         return out;
       }
 
