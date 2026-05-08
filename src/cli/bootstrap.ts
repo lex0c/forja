@@ -29,6 +29,7 @@ import { composeWithPlaybookHint } from './playbook-prompt.ts';
 import { assembleProjectPointer, composeWithProjectPointer } from './project-pointer.ts';
 import { composeWithResponseFormat } from './response-format.ts';
 import { composeWithTaskDiscipline } from './task-discipline.ts';
+import { composeWithToolErgonomics } from './tool-ergonomics-prompt.ts';
 
 export const DEFAULT_MODEL = 'anthropic/claude-opus-4-7';
 
@@ -217,21 +218,29 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     //      §1.4). Sits between parallel and plan/user because
     //      the table assumes the model already knows the
     //      task_async family from the parallel layer.
-    //   4. Parallelism hint — universal background that
+    //   4. Tool ergonomics — high-payoff usage rules distilled
+    //      from `TOOL_ERGONOMICS.md` (slice before reading,
+    //      filter before stdout, scope conservatively, prefer
+    //      dedicated tools, do not re-read in session, diagnose
+    //      before retry). Sits BETWEEN parallelism and the
+    //      playbook hint because it teaches "when you make
+    //      tool calls, MAKE THEM WELL" — paired with the
+    //      "you can make several at once" framing right above.
+    //   5. Parallelism hint — universal background that
     //      surfaces the harness's concurrency affordances
     //      (multi-tool turns, task_async family) so the
     //      capability isn't dormant.
-    //   5. Response-format hint — render-target rules
+    //   6. Response-format hint — render-target rules
     //      (CommonMark in monospace ANSI, file:line refs,
     //      no-emoji default, structural padding bans) per
     //      ANTI_PATTERNS.md §1.3.
-    //   6. Task discipline — behavioral norms (prefer editing,
+    //   7. Task discipline — behavioral norms (prefer editing,
     //      no premature abstractions, WHY-only comments, no
     //      half-finished work). Most-general operational
     //      framing; sits above response-format because it
     //      governs WHAT the model writes, while response-format
     //      governs HOW it formats output.
-    //   7. Environment block — situational anchor: cwd, OS,
+    //   8. Environment block — situational anchor: cwd, OS,
     //      model, today's date, git context. Sits OUTERMOST so
     //      it lands first in the prompt — the model reads
     //      "where am I" before reading any task instructions.
@@ -242,7 +251,8 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     const baseDownstream =
       input.plan === true ? composeWithUserPrompt(input.systemPrompt) : input.systemPrompt;
     const withPlaybook = composeWithPlaybookHint(baseDownstream, subagents);
-    const withParallel = composeWithParallelHint(withPlaybook);
+    const withErgonomics = composeWithToolErgonomics(withPlaybook);
+    const withParallel = composeWithParallelHint(withErgonomics);
     const withResponseFormat = composeWithResponseFormat(withParallel);
     const withDiscipline = composeWithTaskDiscipline(withResponseFormat);
     resolvedSystemPrompt = composeWithEnvironment(withDiscipline, {
