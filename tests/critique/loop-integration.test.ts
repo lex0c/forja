@@ -759,6 +759,7 @@ describe('runAgent — critique soft-failure paths', () => {
       countTokens: () => Promise.resolve(0),
     };
 
+    const events: HarnessEvent[] = [];
     const exec = scriptedProvider([{ text: 'output', usage: { input: 100, output: 50 } }]);
     const registry = createToolRegistry();
     registry.register(readOnlyTool);
@@ -775,6 +776,7 @@ describe('runAgent — critique soft-failure paths', () => {
       critiqueProvider: partialUsageCritic,
       critique: { mode: 'always' as const, maxOverheadMs: 0 },
       signal: abortCtrl.signal,
+      onEvent: (e: HarnessEvent) => events.push(e),
     };
     const result = await runAgent(config);
     expect(result.status).toBe('interrupted');
@@ -784,5 +786,21 @@ describe('runAgent — critique soft-failure paths', () => {
     // = 110 / 1e6 = $0.00011. Executor pricing is 0. Without the
     // recovery, this would be 0.
     expect(result.costUsd).toBeCloseTo(0.00011, 6);
+
+    // Critique_finished MUST fire on the abort path so the REPL's
+    // cumulative.critiqueCostUsd tracker (cli/repl.ts) sees the
+    // partial spend. Without this emit, /cost would show the
+    // partial in the session total but NOT in the critique
+    // subtotal — operator hits Ctrl+C and the breakdown lies.
+    const finished = events.find((e) => e.type === 'critique_finished') as
+      | Extract<HarnessEvent, { type: 'critique_finished' }>
+      | undefined;
+    expect(finished).toBeDefined();
+    if (finished === undefined) return;
+    expect(finished.strategy).toBe('failed');
+    expect(finished.reason).toBe('caller_aborted');
+    // Same partial cost the session total recovered.
+    expect(finished.costUsd).toBeCloseTo(0.00011, 6);
+    expect(finished.decision).toBe('no_modal');
   });
 });

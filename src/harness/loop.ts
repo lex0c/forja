@@ -1630,6 +1630,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               stepN: steps,
               toolPlanWrites: planHasWrites,
             });
+            // Pinned for the abort-path's `critique_finished`
+            // emission below — without our own start clock, we
+            // couldn't report a real durationMs when the engine's
+            // own timer never reaches its return-with-result
+            // path. Cheap to capture even on the happy path
+            // (engine reports its OWN durationMs in the result).
+            const critiqueStartMs = Date.now();
 
             // The engine swallows watchdog / parse / stream
             // errors into a CritiqueResult, but rethrows when the
@@ -1661,15 +1668,39 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               // signal fired — the partial cost lands in the
               // session row that finish() persists.
               usageComplete = false;
+              let partialCost = 0;
               if (e instanceof CollectStepError) {
                 const partial = e.partial;
                 if (partial.usageSeen) {
-                  const partialCost = computeCost(critiqueProvider.capabilities, partial.usage);
+                  partialCost = computeCost(critiqueProvider.capabilities, partial.usage);
                   totalUsage = addUsage(totalUsage, partial.usage);
                   totalCostUsd += partialCost;
                   if (partialCost > 0) emitCostUpdate(partialCost);
                 }
               }
+              // Emit `critique_finished` with the partial cost
+              // BEFORE rethrowing so REPL-side trackers
+              // (cumulative.critiqueCostUsd in cli/repl.ts) see
+              // the spend even on abort. Without this, the
+              // `/cost` breakdown shows the partial in the
+              // session total but NOT in the critique subtotal —
+              // operator hits Ctrl+C, sees inconsistent
+              // numbers. Strategy is `failed` (engine didn't
+              // produce a parsed result); reason discriminates
+              // abort from parse / stream / overhead failures so
+              // audit consumers can tell them apart.
+              safeEmit(config.onEvent, {
+                type: 'critique_finished',
+                stepN: steps,
+                strategy: 'failed',
+                filteredCount: 0,
+                rawCount: 0,
+                overallConfidence: 0,
+                durationMs: Date.now() - critiqueStartMs,
+                costUsd: partialCost,
+                decision: 'no_modal',
+                reason: 'caller_aborted',
+              });
               throw e;
             }
 
