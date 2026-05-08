@@ -430,7 +430,21 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
     }
   }
 
-  timeline.sort((a, b) => (a.ts !== b.ts ? a.ts - b.ts : a.event < b.event ? -1 : 1));
+  // Three-key total order: ts → event → detail. Returning 0 for
+  // truly equal entries respects the comparator contract; without
+  // it, equal (ts, event) pairs would fall through to `: 1` and
+  // make the sort non-antisymmetric (cmp(a,b) and cmp(b,a) would
+  // both return 1), which V8's TimSort can resolve unpredictably
+  // across runs / engines. The `detail` tiebreaker exists so two
+  // approvals decided in the same millisecond on different tools
+  // still render in a deterministic order even when their event
+  // labels coincide (e.g., two `approval_allow` events).
+  timeline.sort((a, b) => {
+    if (a.ts !== b.ts) return a.ts - b.ts;
+    if (a.event !== b.event) return a.event < b.event ? -1 : 1;
+    if (a.detail !== b.detail) return a.detail < b.detail ? -1 : 1;
+    return 0;
+  });
 
   const filesRead: RecapFileRead[] = [...readsByPath.entries()]
     .map(([path, count]): RecapFileRead => ({ path, count }))

@@ -451,6 +451,54 @@ describe('projectRecap', () => {
     expect(out.goal.text).toBe('second');
   });
 
+  test('timeline is totally ordered: ties on (ts, event) tiebreak on detail deterministically', () => {
+    // Regression: prior comparator returned 1 (instead of 0) for
+    // equal (ts, event) pairs, violating antisymmetry. Two
+    // approvals decided in the same ms with the same `approval_*`
+    // label would sort unstably across V8 versions. We force the
+    // collision by stamping two approvals at the same decided_at
+    // and verify the resulting order matches `detail` ASC.
+    const s = seedSession();
+    const userId = addUserTurn(s.id, 'do');
+    const aId = addAssistantTurn(s.id, userId, 'thinking');
+    const tcZebra = addToolCall(aId, 'bash', { command: 'echo zebra' }, null, 'done', 1, 1_301);
+    const tcAlpha = addToolCall(aId, 'bash', { command: 'echo alpha' }, null, 'done', 1, 1_302);
+    // Same `decidedAt`, same `decision` ⇒ same event label
+    // (`approval_allow`). Only `detail` differs (tool name +
+    // decided_by composition).
+    recordApproval(db, {
+      toolCallId: tcZebra,
+      decision: 'allow',
+      decidedBy: 'user',
+      decidedAt: 9_000,
+    });
+    recordApproval(db, {
+      toolCallId: tcAlpha,
+      decision: 'allow',
+      decidedBy: 'user',
+      decidedAt: 9_000,
+    });
+
+    const a = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+      now: 10_000,
+    });
+    const b = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+      now: 10_000,
+    });
+    // Determinism across runs.
+    expect(a.timeline).toEqual(b.timeline);
+    // Same event label `approval_allow` for both rows; the detail
+    // tiebreak places them in stable lexicographic order.
+    const approvals = a.timeline.filter((e) => e.event === 'approval_allow');
+    expect(approvals).toHaveLength(2);
+    const ordered = [...approvals].sort((x, y) =>
+      x.detail < y.detail ? -1 : x.detail > y.detail ? 1 : 0,
+    );
+    expect(approvals).toEqual(ordered);
+  });
+
   test('throws on unknown session id', () => {
     expect(() =>
       projectRecap(db, {

@@ -59,6 +59,17 @@ From the M4.1 self-review; commits `99a4f35`..`483dc45` plus the
 `c569c01` follow-up landed #1 (audit-comment fix) and #6
 (`listChildSessions` perf). Remaining items, by review id:
 
+- **#14 — timeline comparator violated antisymmetry.** Caught
+  post-review by the operator. The sort at projection.ts
+  returned `1` (not `0`) for entries with equal `(ts, event)`
+  pairs, so two approvals decided in the same millisecond with
+  the same `approval_*` label could sort unpredictably across
+  V8 / engine versions. **Resolved** with a three-key total
+  order (`ts → event → detail`, returning `0` only when all
+  three match) plus a regression test that forces the
+  collision and asserts deterministic ordering across two
+  back-to-back projections.
+
 - ~~**#2 — day/range silent cap at 500.**~~ **Resolved.**
   Added `listSessionsInRange(db, {start,end,cwd?,
   includeSubagents?})` to the sessions repo (SQL-side
