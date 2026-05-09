@@ -416,6 +416,69 @@ describe('compound command guard (shell injection defense)', () => {
     expect(d.kind).toBe('confirm');
     expect(d.source).toEqual({ layer: 'user', section: 'bash' });
   });
+
+  test('newline-injected command is NOT silently allowed by glob with dotAll', () => {
+    // The exact bypass: with `git status -*` allow, the matcher
+    // compiles `*` -> `.*` with dotAll so `.` includes `\n`. Without
+    // a newline check in the compound guard, the regex matches
+    // the entire two-line input and the second command runs
+    // silently. The init-template default's `git status -*` allow
+    // entry is the realistic vector — operator-authored YAML
+    // explicitly wants to allowlist `git status -s`, `git status
+    // --porcelain`, etc., and ends up admitting injection.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git status -*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'git status -s\nrm -rf /tmp/pwn' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') {
+      expect(d.reason).toContain('compound shell command');
+    }
+  });
+
+  test('CRLF and CR-only line endings still force confirm', () => {
+    // Conservative: CRLF inputs (Windows line endings, web-form
+    // pastes) and CR-only (very rare) shouldn't slip past the
+    // gate just because the line ending isn't `\n`.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git status*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    expect(eng.check('bash', 'bash', { command: 'git status\r\nrm -rf .' }).kind).toBe('confirm');
+    expect(eng.check('bash', 'bash', { command: 'git status\rrm -rf .' }).kind).toBe('confirm');
+  });
+
+  test('multi-line allow pattern (heredoc) still matches when no separator outside quotes', () => {
+    // Counter-test for the dotAll feature the matcher relies on:
+    // legitimate multi-line commands with newlines INSIDE quoted
+    // strings or escaped via line-continuation must not regress.
+    // `python -c "for i in range(3):\n  print(i)"` should match
+    // `python -c *` and pass through allow normally — newline is
+    // inside double quotes, the guard does not flag.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['python -c *'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', {
+      command: 'python -c "for i in range(3):\n  print(i)"',
+    });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('line-continuation (\\\\\\n) does not falsely flag', () => {
+    // Operator-authored long command split with `\\\n` is one
+    // logical command. The guard's escape rule consumes the
+    // backslash + newline together; no separator detected.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git status*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', {
+      command: 'git status \\\n  --porcelain',
+    });
+    expect(d.kind).toBe('allow');
+  });
 });
 
 describe('Decision.source provenance', () => {

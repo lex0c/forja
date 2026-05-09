@@ -84,19 +84,35 @@ export const matchCommand = (pattern: string, command: string): boolean =>
   compileGlobToRegex(pattern).test(command.trim());
 
 // Detects shell metacharacters that compose multiple commands into
-// one (`;`, `&&`, `||`, `|`) or embed command substitution
-// (`$(...)`, backticks). Used by the bash policy check to force the
-// confirm path on compound commands regardless of any allow rule:
-// without this, a literal `*` in an allow pattern admits injection
-// like `git status; rm -rf .` because the matcher's `*` resolves to
-// `.*` (greedy), and the deny rules can't enumerate every shape.
+// one (`;`, `\n`, `\r`, `&&`, `||`, `|`) or embed command
+// substitution (`$(...)`, backticks). Used by the bash policy check
+// to force the confirm path on compound commands regardless of any
+// allow rule: without this, a literal `*` in an allow pattern
+// admits injection like `git status; rm -rf .` because the
+// matcher's `*` resolves to `.*` with dotAll (greedy, matches
+// across newlines), and the deny rules can't enumerate every shape.
+//
+// Newline handling matters specifically because the matcher's
+// glob compiler enables `s` (dotAll) so allow patterns like
+// `bash -c *` work against multi-line scripts — but that same
+// dotAll lets `git status -s\nrm -rf /tmp/pwn` match against an
+// allow like `git status -*`. Bash treats `\n` as a command
+// terminator equivalent to `;`, so we must too. `\r` is treated
+// the same way conservatively: rare in agent-emitted commands,
+// but a CR-only or CRLF input shouldn't slip past the gate just
+// because the OS line-ending happens to be exotic.
 //
 // The scan respects single-quote, double-quote, and backslash-escape
 // state so a literal `;` inside `git commit -m "fix; bug"` does not
-// trip the detector. Heuristic — does NOT model here-docs, `<<<`
-// here-strings, or `((...))` arithmetic substitution. Those are
-// rare in agent-emitted commands; if they show up the operator
-// still sees the modal (the catch-all `confirm: ['*']` fires).
+// trip the detector. Newlines inside single/double quotes also
+// don't trip — bash treats them as part of the string, not as
+// terminators. A backslash before newline (`\\\n`) is the standard
+// line-continuation; the scanner's escape rule skips the newline,
+// correctly leaving the joined command undetected. Heuristic —
+// does NOT model here-docs, `<<<` here-strings, or `((...))`
+// arithmetic substitution. Those are rare in agent-emitted
+// commands; if they show up the operator still sees the modal
+// (the catch-all `confirm: ['*']` fires).
 //
 // Returns true on any of the metachars listed above; the caller
 // (engine.ts checkBash) treats true as "force confirm" — deny
@@ -113,7 +129,9 @@ export const containsShellInjection = (command: string): boolean => {
     // Backslash escape: skip the next char (works in unquoted +
     // double-quoted contexts; single-quotes don't honor backslash
     // — but inside single quotes we're not checking metachars
-    // anyway, so the over-skip is harmless).
+    // anyway, so the over-skip is harmless). Covers the standard
+    // bash line-continuation `\\\n` — the newline gets skipped,
+    // joined command continues.
     if (c === '\\' && i + 1 < command.length) {
       i += 2;
       continue;
@@ -131,6 +149,12 @@ export const containsShellInjection = (command: string): boolean => {
     if (!inSingle && !inDouble) {
       // Compound separators
       if (c === ';') return true;
+      // Newline as command terminator — bash treats `\n` like `;`.
+      // Without this, glob `*` (compiled with dotAll) matches
+      // across newlines and `git status -s\nrm -rf /tmp/pwn`
+      // bypasses the guard against an allow `git status -*`.
+      // `\r` covered for CR-only / CRLF inputs.
+      if (c === '\n' || c === '\r') return true;
       if (c === '|') return true; // covers both | and ||
       if (c === '&' && command[i + 1] === '&') return true;
       // Command substitution

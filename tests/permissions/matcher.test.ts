@@ -165,6 +165,50 @@ describe('containsShellInjection', () => {
     // dangerous shapes anyway.
     expect(containsShellInjection('sleep 30 &')).toBe(false);
   });
+
+  test('newline as command separator flags', () => {
+    // Bash treats `\n` like `;`. The matcher compiles glob `*` to
+    // regex `.*` with dotAll, so an allow pattern like
+    // `git status -*` would otherwise match
+    // `git status -s\nrm -rf /tmp/pwn` and silently authorize the
+    // second line. The guard must catch raw newline regardless of
+    // how the agent emitted the command (multi-line literal,
+    // string-marshaled `\n`, etc.).
+    expect(containsShellInjection('git status -s\nrm -rf /tmp/pwn')).toBe(true);
+    expect(containsShellInjection('ls\necho pwned')).toBe(true);
+    expect(containsShellInjection('foo\rbar')).toBe(true);
+    expect(containsShellInjection('foo\r\nbar')).toBe(true);
+  });
+
+  test('newline inside single quotes does NOT flag (literal multi-line string)', () => {
+    // Bash preserves newlines inside single-quoted strings as
+    // literal characters, not separators. A multi-line commit
+    // message via -m '...' should not trip the detector.
+    expect(containsShellInjection("git commit -m 'line1\nline2'")).toBe(false);
+  });
+
+  test('newline inside double quotes does NOT flag (literal multi-line string)', () => {
+    // Same property as single quotes for newline. Bash still
+    // performs $() expansion inside double quotes, but the
+    // detector already covers `$(` separately.
+    expect(containsShellInjection('echo "line1\nline2"')).toBe(false);
+  });
+
+  test('backslash-newline (line continuation) does NOT flag', () => {
+    // `\\\n` is the standard bash line-continuation: the joined
+    // line is one logical command. The escape rule consumes the
+    // backslash + newline together, so the scanner sees a
+    // continuous unquoted run with no separator. Operator's
+    // `git status -s \\\n  --porcelain` should pass without a
+    // false-positive confirm.
+    expect(containsShellInjection('git status -s \\\n  --porcelain')).toBe(false);
+  });
+
+  test('escaped newline in unquoted context does NOT flag', () => {
+    // The escape rule applies to any character following `\\`,
+    // including the literal sequence `\\\n` in the source string.
+    expect(containsShellInjection('echo foo\\\nbar')).toBe(false);
+  });
 });
 
 describe('first* helpers', () => {
