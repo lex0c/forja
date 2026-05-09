@@ -270,18 +270,20 @@ Curto, sem detalhe técnico:
 
 ### 4.4 `slack` (markdown Slack-compatible)
 
+ASCII-only template (sem `✓` / `•`): a regra anti-decoração de §7.3 vale uniformemente para output de modelo e de template, e Slack renderiza `*` / `-` limpinho.
+
 ```
 *Refactor: queue retry logic* (4m32s, $0.04)
 
-✓ Extracted `computeBackoff` to pure function
-✓ Added 5 unit tests (all passing)
-✓ Removed dead code
+* Extracted `computeBackoff` to pure function
+* Added 5 unit tests (all passing)
+* Removed dead code
 
 Files: `src/queue.ts`, `src/queue/backoff.ts` (new), `tests/queue/backoff.test.ts` (new)
 
 Decisions:
-• Did NOT rename `validateToken` (3 untracked callers)
-• Did NOT touch `queue-consumer.ts` (out of scope)
+- Did NOT rename `validateToken` (3 untracked callers)
+- Did NOT touch `queue-consumer.ts` (out of scope)
 ```
 
 ### 4.5 `json` (intermediate cru)

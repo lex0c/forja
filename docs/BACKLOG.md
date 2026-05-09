@@ -15,6 +15,84 @@ Format:
 
 ---
 
+## [2026-05-09] m4.2b/recap — slice (b) shipped: `changelog`, `slack`, `terse` renderers
+
+**Done:** Three new renderers reusing slice (a)'s LLM pipeline,
+plus a generic `renderViaLlm<T>` helper that lifts the shared
+orchestration out of `pr/llm.ts`. Each new renderer is a thin
+façade (~60 lines) over the helper. The slash command's
+`renderWithLlmOrFallback` now dispatches over a four-entry table
+(`pr` / `changelog` / `slack` / `terse`); adding a fifth renderer
+is one entry plus a new module folder + 5 goldens.
+
+| Renderer | Source of truth | LLM contributes | Cap (lines) |
+|---|---|---|---|
+| `changelog` (RECAP §4.3) | Keep a Changelog categories: filesWritten → Added/Changed/Removed by line-count direction; recovered errors → Fixed; security-keyword decisions → Security | Reword bullets in user-facing voice; pick the right category from intent rather than mechanical line counts | 40 |
+| `slack` (RECAP §4.4) | Title (goal text), duration / cost from `costs`, achievement counts from actions / outcomes, files literal from `actions.filesWritten`, decisions ordered user-first | Polish the title; sharpen the achievement bullets | 30 |
+| `terse` (RECAP §4.6) | Single sentence: goal + counts + duration + cost, ≤200 chars | Fit a one-sentence summary that surfaces the most material change inside the cap | 4 |
+
+**Decisions:**
+- **Generic `renderViaLlm<T>` extracted now**, not inlined three
+  more times. The orchestration (capability gate → constrained
+  call → parse → schema validate → fidelity → concision →
+  fallback) is identical across renderers; what varies is the
+  schema, prompt, fidelity rule, template, and line cap. The
+  shared helper takes those five as input and owns nothing else.
+  `pr/llm.ts` migrated to use it; behavior is byte-for-byte
+  identical (slice (a) tests stay green without modification).
+- **Slack template uses ASCII (`*` and `-`)**, not `✓` / `•`.
+  RECAP §7.3 says model output must avoid emoji and decoration;
+  the renderer's anti-decoration rule should apply uniformly to
+  model and template output for consistency. Slack renders ASCII
+  bullets cleanly, so there is no UX cost. Spec §4.4 patched to
+  match (was the verbatim spec example).
+- **Changelog category mapping is mechanical, not heuristic.**
+  Pure-add file (linesAdded > 0, linesRemoved == 0) → `Added`.
+  Pure-delete → `Removed`. Mixed-edit → `Changed`. Recovered
+  errors → `Fixed`. Hook/policy decisions → `Security` only when
+  text matches a narrow keyword set (`secret`, `token`,
+  `credential`, `key`, `password`, `auth`); everything else
+  defaults to `Changed`. False positives on Security are worse
+  than false negatives — operators don't want the changelog to
+  cry wolf. `Deprecated` is never deterministic; only the LLM
+  path can fill it (when reading `notDone[]` or decisions).
+- **Terse fidelity check is `() => ok`**, not path-existence.
+  A one-sentence summary cannot ground-truth-check against
+  specific paths or counts without false positives ("Edited 3
+  files" is true even if the model said "Edited 3 files in
+  src/"). Schema cap (200 chars) plus the prompt's hard rules
+  carry the burden; the bigger renderers (pr, slack) do the
+  heavy fidelity lifting via path-existence.
+- **`renderForFormat` and `LLM_RENDERER_DISPATCH` are separate
+  surfaces.** `renderForFormat` is the pure synchronous switch
+  used by the no-LLM path; the dispatch table carries the
+  promptVersion + LLM call needed only when the LLM path is
+  active. Splitting them keeps the deterministic surface free of
+  Promise / provider noise that 60% of `/recap` calls don't need.
+
+**What this slice does NOT do:**
+- LLM-mode evals for the new renderers. Slice (a) ships the
+  shape (`pr-llm.test.ts` validates fidelity / coverage /
+  concision); replicating that for changelog / slack / terse is
+  pending — the shared helper means it is mostly copy-paste.
+- Spec patch beyond §4.4. The `changelog` and `terse` examples
+  in §4.3 / §4.6 already match what the implementation produces.
+
+**Pending (review carry-overs from slice (a) still open):**
+- Haiku as default (today the LLM call uses
+  `ctx.baseConfig.provider`).
+- `cost_usd >= 0` CHECK constraint on `recap_runs` /
+  `recap_cache`.
+- LLM-mode eval gate for changelog / slack / terse (matching
+  what `pr-llm.test.ts` does).
+- Test for cache-write-failure warn path on every renderer.
+
+**Next:** Branch `feat/m4.2a-pr-llm-render` carries slices (a)
+and (b) per the same-branch-across-slices convention. Slice (c)
+opens recap_mini + Stop hook + `/recap list`.
+
+---
+
 ## [2026-05-09] m4.2a/recap — slice (a) shipped: LLM `pr` render + `recap_cache`
 
 **Done:** Five-commit slice on `feat/m4.2a-pr-llm-render` lands the

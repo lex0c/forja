@@ -278,22 +278,20 @@ describe('/recap', () => {
     expect(result.message).toContain('missing session id');
   });
 
-  test('surfaces a clear "not yet available" for future renderers', async () => {
-    for (const sub of ['changelog', 'slack', 'terse']) {
-      const result = await recapCommand.exec([sub], makeCtx());
-      expect(result.kind).toBe('error');
-      if (result.kind !== 'error') return;
-      expect(result.message).toContain('M4.2');
-    }
-  });
-
   test('surfaces a clear "not yet available" for future cross-session scopes', async () => {
-    for (const sub of ['day', 'range']) {
+    for (const sub of ['day', 'range', 'pre-compact']) {
       const result = await recapCommand.exec([sub], makeCtx());
       expect(result.kind).toBe('error');
       if (result.kind !== 'error') return;
       expect(result.message).toContain('M4.3');
     }
+  });
+
+  test("surfaces a clear 'not yet available' for /recap list", async () => {
+    const result = await recapCommand.exec(['list'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('M4.2 slice c');
   });
 
   test('rejects unknown subcommand with a hint to /recap variants', async () => {
@@ -624,5 +622,142 @@ describe('/recap', () => {
     expect(hashRow).not.toBeNull();
     const hit = readRecapCache(db, { scopeHash: hashRow?.scope_hash ?? '', now: 5_500 });
     expect(hit).not.toBeNull();
+  });
+
+  // ─── M4.2 slice (b): changelog / slack / terse renderers ─────
+
+  test('/recap changelog renders deterministic Keep a Changelog when --no-llm-render', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'extract retry helper',
+      createdAt: 1_100,
+    });
+    currentSessionId = s.id;
+    const result = await recapCommand.exec(['changelog', '--no-llm-render'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    // At least one Keep-a-Changelog category header should appear.
+    expect(text).toMatch(/### (Added|Changed|Fixed|Removed|Deprecated|Security)/);
+
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.renderer).toBe('changelog');
+    expect(runs[0]?.usedLlm).toBe(false);
+  });
+
+  test('/recap slack renders deterministic ASCII Slack post when --no-llm-render', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'refactor queue',
+      createdAt: 1_100,
+    });
+    currentSessionId = s.id;
+    const result = await recapCommand.exec(['slack', '--no-llm-render'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    // ASCII bullets, no ✓ / •.
+    expect(text).toContain('* ');
+    expect(text).not.toContain('✓');
+    expect(text).not.toContain('•');
+    // Title is bold-marked.
+    expect(text).toMatch(/^\*[^*]+\*/);
+
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.renderer).toBe('slack');
+  });
+
+  test('/recap terse renders deterministic single sentence when --no-llm-render', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'do thing',
+      createdAt: 1_100,
+    });
+    currentSessionId = s.id;
+    const result = await recapCommand.exec(['terse', '--no-llm-render'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    // Single line, ≤ 200 chars.
+    expect(text.split('\n').filter((l) => l.length > 0)).toHaveLength(1);
+    expect(text.trim().length).toBeLessThanOrEqual(200);
+    expect(text).toContain('do thing');
+
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.renderer).toBe('terse');
+  });
+
+  test('/recap changelog LLM path: audits with renderer=changelog and prompt_version', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, { sessionId: s.id, role: 'user', content: 'x', createdAt: 1_100 });
+    currentSessionId = s.id;
+    // Stub returns a valid ChangelogRenderV1.
+    const stubChangelog = JSON.stringify({
+      schemaVersion: 'changelog-v1',
+      entries: [{ category: 'Changed', bullet: 'Update queue retry logic' }],
+    });
+    const handle = stubProvider(stubChangelog);
+    const ctx = makeCtx({ baseConfig: cfgWithProvider(handle.provider) });
+    await recapCommand.exec(['changelog'], ctx);
+
+    expect(handle.calls).toHaveLength(1);
+    expect(handle.calls[0]?.output_schema_name).toBe('render_recap_changelog');
+
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.renderer).toBe('changelog');
+    expect(runs[0]?.usedLlm).toBe(true);
+    expect(runs[0]?.promptVersion).toBe('changelog-v1');
+  });
+
+  test('/recap slack LLM path: schema-violation falls back to deterministic', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, { sessionId: s.id, role: 'user', content: 'x', createdAt: 1_100 });
+    currentSessionId = s.id;
+    // Bad: missing required title.
+    const bad = JSON.stringify({
+      schemaVersion: 'slack-v1',
+      durationLabel: '1s',
+      costLabel: '$0',
+      achievements: ['x'],
+      files: [],
+      decisions: [],
+    });
+    const handle = stubProvider(bad);
+    const ctx = makeCtx({ baseConfig: cfgWithProvider(handle.provider) });
+    const events: { type: string; message?: string }[] = [];
+    ctx.bus.on('warn', (e) => events.push({ type: 'warn', message: e.message }));
+
+    const result = await recapCommand.exec(['slack'], ctx);
+    expect(result.kind).toBe('ok');
+    const warns = events.filter((e) => e.type === 'warn');
+    expect(warns[0]?.message).toContain('schema-violation');
+    expect(warns[0]?.message).toContain('using deterministic fallback');
+
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.renderer).toBe('slack');
+    expect(runs[0]?.usedLlm).toBe(false);
+  });
+
+  test('/recap terse LLM path: invalid-json falls back', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    currentSessionId = s.id;
+    const handle = stubProvider('not-json');
+    const ctx = makeCtx({ baseConfig: cfgWithProvider(handle.provider) });
+    const events: { type: string; message?: string }[] = [];
+    ctx.bus.on('warn', (e) => events.push({ type: 'warn', message: e.message }));
+
+    const result = await recapCommand.exec(['terse'], ctx);
+    expect(result.kind).toBe('ok');
+    const warns = events.filter((e) => e.type === 'warn');
+    expect(warns[0]?.message).toContain('invalid-json');
+
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.usedLlm).toBe(false);
   });
 });

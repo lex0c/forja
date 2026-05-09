@@ -3,25 +3,30 @@
 // M4.1 (slice c) shipped: /recap, /recap last <N>, /recap session <id>,
 // /recap json [session <id>] — all deterministic.
 //
-// M4.2 slice (a) adds:
-//   /recap pr [--no-llm-render] [--out <path>]   — PR description
+// M4.2 slice (a) added `/recap pr` with the LLM render pipeline.
+// M4.2 slice (b) extends the pipeline to three more renderers:
 //
-// `pr` defaults to the LLM render path: cache lookup → forced-tool
+//   /recap pr        — PR description (RECAP §4.2)
+//   /recap changelog — Keep a Changelog entry (RECAP §4.3)
+//   /recap slack     — Slack-friendly status post (RECAP §4.4)
+//   /recap terse     — single-sentence summary (RECAP §4.6)
+//
+// All four route through the same flow: cache lookup → forced-tool
 // constrained call → schema + fidelity + concision validation →
 // markdown via the deterministic template. Any failure (provider
-// down, schema violation, hallucinated path, exceeded line cap)
-// falls back to `renderPrDeterministic` and surfaces a single
-// `warn` event so the operator knows the LLM hiccupped without
-// losing the recap. `--no-llm-render` skips the LLM path entirely
-// (and the cache lookup with it), forcing the deterministic
-// template. Providers without `capabilities.constrained` (Google,
-// OpenAI today) silently degrade to the deterministic path with
-// no warn — the operator did not opt into the LLM path explicitly.
+// down, schema violation, hallucinated value, exceeded line cap)
+// falls back to the renderer-specific deterministic path and
+// surfaces a single `warn` event.
+//
+// `--no-llm-render` skips the LLM path entirely (and the cache
+// lookup with it), forcing the deterministic template. Providers
+// without `capabilities.constrained` (Google, OpenAI today)
+// silently degrade to the deterministic path with no warn.
 //
 // `--out <path>`: writes the rendered output to the given file
 // path. Recorded in `recap_runs.output_path` for audit.
 //
-// Audit (RECAP.md §6.3): every successful invocation writes a
+// Audit (RECAP §6.3): every successful invocation writes a
 // `recap_runs` row with cost / tokens / cache_hit / prompt_version
 // populated. Parse errors and projection failures deliberately do
 // NOT write a row — those never consumed audit-worthy resources,
@@ -30,11 +35,22 @@
 
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import type { Provider } from '../../../providers/types.ts';
+import { renderChangelogDeterministic } from '../../../recap/changelog/index.ts';
+import { renderChangelogViaLlm } from '../../../recap/changelog/llm.ts';
+import type { RenderViaLlmResult } from '../../../recap/llm-shared.ts';
 import { renderPrDeterministic } from '../../../recap/pr/index.ts';
 import { renderPrViaLlm } from '../../../recap/pr/llm.ts';
 import { type RecapScopeOption, projectRecap } from '../../../recap/projection.ts';
+import { CHANGELOG_PROMPT_VERSION } from '../../../recap/prompts/changelog-v1.ts';
 import { PR_PROMPT_VERSION } from '../../../recap/prompts/pr-v1.ts';
+import { SLACK_PROMPT_VERSION } from '../../../recap/prompts/slack-v1.ts';
+import { TERSE_PROMPT_VERSION } from '../../../recap/prompts/terse-v1.ts';
 import { renderHuman, renderJson } from '../../../recap/render.ts';
+import { renderSlackDeterministic } from '../../../recap/slack/index.ts';
+import { renderSlackViaLlm } from '../../../recap/slack/llm.ts';
+import { renderTerseDeterministic } from '../../../recap/terse/index.ts';
+import { renderTerseViaLlm } from '../../../recap/terse/llm.ts';
 import type { RecapIntermediate } from '../../../recap/types.ts';
 import {
   canonicalScopeHash,
@@ -46,7 +62,9 @@ import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
 const DEFAULT_STEP_LIMIT = 10;
 
-type RecapFormat = 'human' | 'json' | 'pr';
+type RecapFormat = 'human' | 'json' | 'pr' | 'changelog' | 'slack' | 'terse';
+
+type LlmRendererName = 'pr' | 'changelog' | 'slack' | 'terse';
 
 interface ParsedRecap {
   format: RecapFormat;
@@ -64,20 +82,20 @@ const positiveInt = (raw: string): number | null => {
   return n;
 };
 
-const FUTURE_SUBCOMMANDS: ReadonlySet<string> = new Set([
-  'day',
-  'range',
-  'pre-compact',
+// Subcommands that the parser recognizes as renderer / scope
+// labels. `pr`, `changelog`, `slack`, `terse` route through the
+// LLM pipeline; `json` is always deterministic.
+const RENDERER_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  'json',
+  'pr',
   'changelog',
   'slack',
   'terse',
-  'list',
 ]);
 
+const FUTURE_SUBCOMMANDS: ReadonlySet<string> = new Set(['day', 'range', 'pre-compact', 'list']);
+
 const futureSubcommandMessage = (sub: string): string => {
-  if (sub === 'changelog' || sub === 'slack' || sub === 'terse') {
-    return `/recap: '${sub}' renderer needs the LLM render path (M4.2 slice b); not yet available`;
-  }
   if (sub === 'day' || sub === 'range') {
     return `/recap: '${sub}' is cross-session scope (M4.3); not yet available`;
   }
@@ -119,8 +137,6 @@ const splitFlags = (args: string[]): FlagSplit => {
       i += 1;
       continue;
     }
-    // `--out=path` form — single-token convenience. Mirrors
-    // the long-flag convention used elsewhere in the slash surface.
     if (arg?.startsWith('--out=') === true) {
       const value = arg.slice('--out='.length);
       if (value.length === 0) {
@@ -139,9 +155,6 @@ const splitFlags = (args: string[]): FlagSplit => {
   return { positional, noLlmRender, outPath, flagError };
 };
 
-// Parse the subcommand vocabulary into a tagged union or a SlashResult
-// error. Pure: no DB access, no ctx — ctx-dependent decisions
-// (resolving the current session id) happen in the executor below.
 const parseRecapArgs = (args: string[]): ParsedRecap | { error: string } => {
   const split = splitFlags(args);
   if (split.flagError !== null) return { error: split.flagError };
@@ -156,11 +169,9 @@ const parseRecapArgs = (args: string[]): ParsedRecap | { error: string } => {
   }
   let format: RecapFormat = 'human';
   let i = 0;
-  if (positional[0] === 'json') {
-    format = 'json';
-    i = 1;
-  } else if (positional[0] === 'pr') {
-    format = 'pr';
+  const head0 = positional[0];
+  if (head0 !== undefined && RENDERER_SUBCOMMANDS.has(head0)) {
+    format = head0 as RecapFormat;
     i = 1;
   }
   if (i === positional.length) {
@@ -201,35 +212,90 @@ const parseRecapArgs = (args: string[]): ParsedRecap | { error: string } => {
     return { error: futureSubcommandMessage(head) };
   }
   return {
-    error: `/recap: unknown subcommand '${head ?? ''}' (try /recap, /recap last <N>, /recap session <id>, /recap json, /recap pr)`,
+    error: `/recap: unknown subcommand '${head ?? ''}' (try /recap, /recap last <N>, /recap session <id>, /recap json|pr|changelog|slack|terse)`,
   };
 };
 
 const renderToNotes = (text: string): string[] => {
-  // Both the human and pr renderers append a trailing newline;
-  // renderJson returns the bare JSON.stringify output with no
-  // trailing LF. Drop the trailing LF when present so the last
-  // "note" isn't an empty line that the bus would surface as a
-  // phantom blank info entry.
   const trimmed = text.endsWith('\n') ? text.slice(0, -1) : text;
   return trimmed.split('\n');
 };
 
 // Write recap output to the requested path. Creates parent
-// directories as needed (mirrors `agent worktree` and the bg
-// process log dir creation pattern). Awaits Bun.write so a slow
-// disk does not let the slash return "wrote ..." before the file
-// is actually flushed; awaiting also surfaces write errors
-// (EACCES, ENOSPC, etc.) instead of silently dropping them in an
-// unobserved Promise rejection.
+// directories as needed. Awaits Bun.write so a slow disk does not
+// let the slash return "wrote ..." before the file is flushed;
+// awaiting also surfaces write errors (EACCES, ENOSPC, etc.)
+// instead of dropping them in an unobserved Promise rejection.
 const writeOutFile = async (outPath: string, content: string): Promise<void> => {
   mkdirSync(dirname(outPath), { recursive: true });
   await Bun.write(outPath, content);
 };
 
+// Dispatch table for LLM-capable renderers. Each entry pairs a
+// deterministic fallback with the LLM render function and the
+// prompt version label that audit / cache rows record. Adding a
+// new renderer is one entry here plus its module under
+// `src/recap/<name>/` and its 5 goldens; the slash plumbing
+// generalizes over the table.
+interface LlmRendererSpec {
+  promptVersion: string;
+  deterministic: (intermediate: RecapIntermediate) => string;
+  llm: (input: {
+    intermediate: RecapIntermediate;
+    provider: Provider;
+    promptVersion: string;
+  }) => Promise<RenderViaLlmResult<unknown>>;
+}
+
+const LLM_RENDERER_DISPATCH: Record<LlmRendererName, LlmRendererSpec> = {
+  pr: {
+    promptVersion: PR_PROMPT_VERSION,
+    deterministic: (i) => renderPrDeterministic(i),
+    llm: (input) =>
+      renderPrViaLlm({
+        intermediate: input.intermediate,
+        provider: input.provider,
+        promptVersion: input.promptVersion,
+      }) as Promise<RenderViaLlmResult<unknown>>,
+  },
+  changelog: {
+    promptVersion: CHANGELOG_PROMPT_VERSION,
+    deterministic: (i) => renderChangelogDeterministic(i),
+    llm: (input) =>
+      renderChangelogViaLlm({
+        intermediate: input.intermediate,
+        provider: input.provider,
+        promptVersion: input.promptVersion,
+      }) as Promise<RenderViaLlmResult<unknown>>,
+  },
+  slack: {
+    promptVersion: SLACK_PROMPT_VERSION,
+    deterministic: (i) => renderSlackDeterministic(i),
+    llm: (input) =>
+      renderSlackViaLlm({
+        intermediate: input.intermediate,
+        provider: input.provider,
+        promptVersion: input.promptVersion,
+      }) as Promise<RenderViaLlmResult<unknown>>,
+  },
+  terse: {
+    promptVersion: TERSE_PROMPT_VERSION,
+    deterministic: (i) => renderTerseDeterministic(i),
+    llm: (input) =>
+      renderTerseViaLlm({
+        intermediate: input.intermediate,
+        provider: input.provider,
+        promptVersion: input.promptVersion,
+      }) as Promise<RenderViaLlmResult<unknown>>,
+  },
+};
+
+const isLlmRenderer = (format: RecapFormat): format is LlmRendererName =>
+  format === 'pr' || format === 'changelog' || format === 'slack' || format === 'terse';
+
 const renderForFormat = (format: RecapFormat, intermediate: RecapIntermediate): string => {
   if (format === 'json') return renderJson(intermediate);
-  if (format === 'pr') return renderPrDeterministic(intermediate);
+  if (isLlmRenderer(format)) return LLM_RENDERER_DISPATCH[format].deterministic(intermediate);
   return renderHuman(intermediate);
 };
 
@@ -264,10 +330,6 @@ export const recapCommand: SlashCommand = {
       return { kind: 'error', message: `/recap: ${message}` };
     }
 
-    // Render. For `pr` with LLM enabled, route through cache →
-    // LLM → fallback. For everything else (human, json, pr with
-    // --no-llm-render), the deterministic template is the only
-    // path.
     const renderResult = await renderWithLlmOrFallback(parsed, intermediate, ctx);
     const { output, usedLlm, cacheHit, costUsd, tokensIn, tokensOut, promptVersion } = renderResult;
 
@@ -283,10 +345,6 @@ export const recapCommand: SlashCommand = {
       }
     }
 
-    // Audit the run alongside returning the recap text. Per
-    // RECAP.md §6.3 the row is INFORMATIONAL — a disk-full /
-    // schema-corruption failure on the audit INSERT must not
-    // destroy the operator's recap output.
     try {
       recordRecapRun(ctx.db, {
         scopeKind: scope.kind,
@@ -330,44 +388,42 @@ interface RenderOutcome {
   promptVersion: string | null;
 }
 
+const deterministicOutcome = (output: string): RenderOutcome => ({
+  output,
+  usedLlm: false,
+  cacheHit: false,
+  costUsd: 0,
+  tokensIn: 0,
+  tokensOut: 0,
+  promptVersion: null,
+});
+
 const renderWithLlmOrFallback = async (
   parsed: ParsedRecap,
   intermediate: RecapIntermediate,
   ctx: SlashContext,
 ): Promise<RenderOutcome> => {
-  if (parsed.format !== 'pr' || parsed.noLlmRender) {
-    return {
-      output: renderForFormat(parsed.format, intermediate),
-      usedLlm: false,
-      cacheHit: false,
-      costUsd: 0,
-      tokensIn: 0,
-      tokensOut: 0,
-      promptVersion: null,
-    };
+  // Non-LLM renderers (human, json) and explicit opt-out always
+  // take the deterministic template path.
+  if (!isLlmRenderer(parsed.format) || parsed.noLlmRender) {
+    return deterministicOutcome(renderForFormat(parsed.format, intermediate));
   }
 
   const provider = ctx.baseConfig.provider;
-  // Provider can't constrain output natively → straight to fallback,
-  // no warn (the operator did not opt into the LLM path explicitly;
-  // they just chose `/recap pr` and we silently degrade).
+  // Provider can't constrain output natively → straight to the
+  // renderer's deterministic fallback. No warn — the operator did
+  // not opt into the LLM path explicitly; they just chose
+  // `/recap <renderer>` and we silently degrade.
   if (provider.capabilities.constrained === false) {
-    return {
-      output: renderPrDeterministic(intermediate),
-      usedLlm: false,
-      cacheHit: false,
-      costUsd: 0,
-      tokensIn: 0,
-      tokensOut: 0,
-      promptVersion: null,
-    };
+    return deterministicOutcome(LLM_RENDERER_DISPATCH[parsed.format].deterministic(intermediate));
   }
 
+  const dispatch = LLM_RENDERER_DISPATCH[parsed.format];
   const scopeHash = canonicalScopeHash({
     scopeKind: intermediate.scope.kind,
     sessionIds: intermediate.scope.sessionIds,
-    renderer: 'pr',
-    promptVersion: PR_PROMPT_VERSION,
+    renderer: parsed.format,
+    promptVersion: dispatch.promptVersion,
     intermediate,
   });
 
@@ -381,30 +437,22 @@ const renderWithLlmOrFallback = async (
       costUsd: 0,
       tokensIn: 0,
       tokensOut: 0,
-      promptVersion: PR_PROMPT_VERSION,
+      promptVersion: dispatch.promptVersion,
     };
   }
 
-  const result = await renderPrViaLlm({
+  const result = await dispatch.llm({
     intermediate,
     provider,
-    promptVersion: PR_PROMPT_VERSION,
+    promptVersion: dispatch.promptVersion,
   });
   if (!result.ok) {
     ctx.bus.emit({
       type: 'warn',
       ts: ctx.now(),
-      message: `/recap pr: LLM render failed (${result.reason}: ${result.detail}); using deterministic fallback`,
+      message: `/recap ${parsed.format}: LLM render failed (${result.reason}: ${result.detail}); using deterministic fallback`,
     });
-    return {
-      output: renderPrDeterministic(intermediate),
-      usedLlm: false,
-      cacheHit: false,
-      costUsd: 0,
-      tokensIn: 0,
-      tokensOut: 0,
-      promptVersion: null,
-    };
+    return deterministicOutcome(dispatch.deterministic(intermediate));
   }
 
   // Successful LLM render — write to cache for the next caller.
@@ -413,9 +461,9 @@ const renderWithLlmOrFallback = async (
   try {
     writeRecapCache(ctx.db, {
       scopeHash,
-      renderer: 'pr',
+      renderer: parsed.format,
       output: result.output,
-      promptVersion: PR_PROMPT_VERSION,
+      promptVersion: dispatch.promptVersion,
       generatedAt: ctx.now(),
       costUsd: result.costUsd,
       tokensIn: result.usage.input + result.usage.cache_read + result.usage.cache_creation,
@@ -426,7 +474,7 @@ const renderWithLlmOrFallback = async (
     ctx.bus.emit({
       type: 'warn',
       ts: ctx.now(),
-      message: `/recap pr: cache write failed (${reason}); render was returned`,
+      message: `/recap ${parsed.format}: cache write failed (${reason}); render was returned`,
     });
   }
 
@@ -437,6 +485,6 @@ const renderWithLlmOrFallback = async (
     costUsd: result.costUsd,
     tokensIn: result.usage.input + result.usage.cache_read + result.usage.cache_creation,
     tokensOut: result.usage.output,
-    promptVersion: PR_PROMPT_VERSION,
+    promptVersion: dispatch.promptVersion,
   };
 };
