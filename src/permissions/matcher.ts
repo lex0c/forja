@@ -84,13 +84,14 @@ export const matchCommand = (pattern: string, command: string): boolean =>
   compileGlobToRegex(pattern).test(command.trim());
 
 // Detects shell metacharacters that compose multiple commands into
-// one (`;`, `\n`, `\r`, `&&`, `||`, `|`) or embed command
-// substitution (`$(...)`, backticks). Used by the bash policy check
-// to force the confirm path on compound commands regardless of any
-// allow rule: without this, a literal `*` in an allow pattern
-// admits injection like `git status; rm -rf .` because the
-// matcher's `*` resolves to `.*` with dotAll (greedy, matches
-// across newlines), and the deny rules can't enumerate every shape.
+// one (`;`, `\n`, `\r`, `&&`, `||`, `|`, lone `&`) or embed command
+// substitution (`$(...)`, backticks, `<(...)`, `>(...)`). Used by
+// the bash policy check to force the confirm path on compound
+// commands regardless of any allow rule: without this, a literal
+// `*` in an allow pattern admits injection like `git status; rm
+// -rf .` because the matcher's `*` resolves to `.*` with dotAll
+// (greedy, matches across newlines), and the deny rules can't
+// enumerate every shape.
 //
 // Newline handling matters specifically because the matcher's
 // glob compiler enables `s` (dotAll) so allow patterns like
@@ -102,6 +103,23 @@ export const matchCommand = (pattern: string, command: string): boolean =>
 // but a CR-only or CRLF input shouldn't slip past the gate just
 // because the OS line-ending happens to be exotic.
 //
+// Lone `&` is bash's async control operator — `cmd1 & cmd2` runs
+// cmd1 in background and immediately starts cmd2, so structurally
+// it's a compound separator just like `;`. The previous version
+// only flagged `&&`, leaving `git status & rm -rf /tmp/...`
+// admitted by an allow like `git status*`. We now flag any
+// unquoted `&` UNLESS it appears inside a redirection context:
+//   - `&&` — already covered as compound (returned earlier).
+//   - `&>FILE` and `&>>FILE` — bash extension redirecting both
+//     stdout+stderr. The `&` here is part of the operator, not a
+//     separator.
+//   - `>&N`, `<&N`, `>&-`, `2>&1`, etc. — file-descriptor
+//     duplication / closure. The `&` here is part of the
+//     redirection target.
+// `prevIsRedirOp` tracks whether the previous unquoted char was
+// `>` or `<` so we can identify the second class above. The
+// `&>` lookahead handles the first.
+//
 // The scan respects single-quote, double-quote, and backslash-escape
 // state so a literal `;` inside `git commit -m "fix; bug"` does not
 // trip the detector. Newlines inside single/double quotes also
@@ -109,10 +127,11 @@ export const matchCommand = (pattern: string, command: string): boolean =>
 // terminators. A backslash before newline (`\\\n`) is the standard
 // line-continuation; the scanner's escape rule skips the newline,
 // correctly leaving the joined command undetected. Heuristic —
-// does NOT model here-docs, `<<<` here-strings, or `((...))`
-// arithmetic substitution. Those are rare in agent-emitted
-// commands; if they show up the operator still sees the modal
-// (the catch-all `confirm: ['*']` fires).
+// does NOT model here-docs, `<<<` here-strings, `((...))`
+// arithmetic substitution, or process substitution `<(...)` /
+// `>(...)`. Those are rare in agent-emitted commands; if they show
+// up the operator still sees the modal (the catch-all
+// `confirm: ['*']` fires).
 //
 // Returns true on any of the metachars listed above; the caller
 // (engine.ts checkBash) treats true as "force confirm" — deny
@@ -123,6 +142,12 @@ export const containsShellInjection = (command: string): boolean => {
   let i = 0;
   let inSingle = false;
   let inDouble = false;
+  // Tracks whether the previous unquoted char was `>` or `<`, so a
+  // following `&` can be recognized as redirection-target syntax
+  // (`>&1`, `<&-`, `2>&1`, etc.) and NOT a compound separator.
+  // Reset on quote toggles, escape consumption, and any non-`>`/`<`
+  // unquoted char.
+  let prevIsRedirOp = false;
   while (i < command.length) {
     const c = command[i];
     if (c === undefined) break;
@@ -131,23 +156,28 @@ export const containsShellInjection = (command: string): boolean => {
     // — but inside single quotes we're not checking metachars
     // anyway, so the over-skip is harmless). Covers the standard
     // bash line-continuation `\\\n` — the newline gets skipped,
-    // joined command continues.
+    // joined command continues. Resets redirection-context flag:
+    // an escaped `>` is literal, not a redirect operator, so a
+    // following `&` should NOT be treated as redirection target.
     if (c === '\\' && i + 1 < command.length) {
+      prevIsRedirOp = false;
       i += 2;
       continue;
     }
     if (!inDouble && c === "'") {
       inSingle = !inSingle;
+      prevIsRedirOp = false;
       i += 1;
       continue;
     }
     if (!inSingle && c === '"') {
       inDouble = !inDouble;
+      prevIsRedirOp = false;
       i += 1;
       continue;
     }
     if (!inSingle && !inDouble) {
-      // Compound separators
+      // Compound separators (deterministic, no lookback needed)
       if (c === ';') return true;
       // Newline as command terminator — bash treats `\n` like `;`.
       // Without this, glob `*` (compiled with dotAll) matches
@@ -156,10 +186,46 @@ export const containsShellInjection = (command: string): boolean => {
       // `\r` covered for CR-only / CRLF inputs.
       if (c === '\n' || c === '\r') return true;
       if (c === '|') return true; // covers both | and ||
-      if (c === '&' && command[i + 1] === '&') return true;
       // Command substitution
       if (c === '$' && command[i + 1] === '(') return true;
       if (c === '`') return true;
+      if (c === '&') {
+        // && — logical-AND chain
+        if (command[i + 1] === '&') return true;
+        // &> — bash extension stdout+stderr redirect (also &>>)
+        if (command[i + 1] === '>') {
+          prevIsRedirOp = false;
+          i += 1;
+          continue;
+        }
+        // After `>` or `<` — fd duplication / closure
+        // (`2>&1`, `>&-`, `<&3`, etc.). Not a separator.
+        if (prevIsRedirOp) {
+          prevIsRedirOp = false;
+          i += 1;
+          continue;
+        }
+        // Bare `&` — async control operator. Treats whatever
+        // came before as a separate command. Includes the
+        // trailing-`&` case (`sleep 30 &`): even though there's
+        // no second command, the agent could just as easily have
+        // emitted `sleep 30 & rm`, so the policy gate prefers a
+        // confirm.
+        return true;
+      }
+      // Process substitution: `<(cmd)` and `>(cmd)` run cmd in a
+      // subshell and substitute it as a file descriptor. Same
+      // security shape as `$(...)`: an allow like `cat *` would
+      // otherwise admit `cat <(rm -rf /tmp/pwn)` because no
+      // standard separator (`;`, `&`, `|`, etc.) appears in the
+      // input. The redirection-context state already tracks
+      // "previous unquoted char was `>` or `<`" — a `(` in that
+      // context is process substitution, not a subshell group.
+      if (c === '(' && prevIsRedirOp) return true;
+      // Track redirection context for the next iteration.
+      prevIsRedirOp = c === '>' || c === '<';
+    } else {
+      prevIsRedirOp = false;
     }
     i += 1;
   }

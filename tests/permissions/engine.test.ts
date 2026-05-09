@@ -466,6 +466,79 @@ describe('compound command guard (shell injection defense)', () => {
     expect(d.kind).toBe('allow');
   });
 
+  test('lone & forces confirm (async control operator is a separator)', () => {
+    // The reported bypass: `git status & rm -rf /tmp/...` against
+    // an allow `git status*` was admitted because the previous guard
+    // only flagged `&&`. Bare `&` backgrounds the first command and
+    // immediately runs the second — same compound shape as `;`.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git status*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'git status & rm -rf /tmp/pwn' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') {
+      expect(d.reason).toContain('compound shell command');
+    }
+  });
+
+  test('trailing & also forces confirm (no structural distinction from chained &)', () => {
+    // `sleep 30 &` has the same metachar shape as `sleep 30 & rm`.
+    // The policy gate cannot tell the agent's intent apart from the
+    // string alone; conservative confirm. Operator who legitimately
+    // wants to background a process session-allows the literal.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['sleep*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'sleep 30 &' });
+    expect(d.kind).toBe('confirm');
+  });
+
+  test('fd redirection (2>&1) still passes through allow rules', () => {
+    // Counter-test: `&` inside a redirection context (`>&`, `<&`,
+    // `&>`) is NOT a separator. Forcing confirm on every stderr
+    // merge would make standard shell idioms unusable through the
+    // gate without runtime promotion. The matcher's redirection
+    // detection keeps `npm test 2>&1` flowing through allow.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['npm test*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'npm test 2>&1' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('process substitution forces confirm even when allow matches the host command', () => {
+    // The `<(cmd)` and `>(cmd)` forms run cmd in a subshell. Same
+    // security shape as `$(...)`: an allow like `cat *` would
+    // otherwise admit `cat <(rm -rf /tmp/pwn)` because no standard
+    // separator appears in the input. Closes the third bypass
+    // class against the compound guard (after `;`/`\n`/`&`).
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['cat *'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'cat <(rm -rf /tmp/pwn)' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') {
+      expect(d.reason).toContain('compound shell command');
+    }
+  });
+
+  test('bash &> redirect (stdout+stderr) still passes through allow rules', () => {
+    // `cmd &>file` is bash extension syntax for redirecting both
+    // streams. The `&` is part of the redirect operator, not a
+    // separator. Allow `bash *` should accept `bash -c "echo
+    // hi" &>/tmp/log`.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'ls &>/tmp/log' });
+    expect(d.kind).toBe('allow');
+  });
+
   test('line-continuation (\\\\\\n) does not falsely flag', () => {
     // Operator-authored long command split with `\\\n` is one
     // logical command. The guard's escape rule consumes the

