@@ -101,6 +101,49 @@ describe('matchCommand', () => {
     expect(matchCommand('echo \\* *', 'echo * extra')).toBe(true);
     expect(matchCommand('echo \\* *', 'echo file extra')).toBe(false);
   });
+
+  test('backslash before non-meta char is preserved as literal (Windows paths, shell-escaped tokens)', () => {
+    // `\` followed by anything other than `*`, `?`, `\` is NOT
+    // an escape sequence — the backslash is a literal character
+    // in the pattern. This is the regression the previous slice
+    // accidentally introduced: a generic `\X` consumer dropped
+    // backslashes from rules like `cd C:\Users\foo` or `cd
+    // foo\ bar`, making them silently fail to match the same
+    // command at runtime. Both the explicit-escape form and
+    // the bare-literal form must work.
+    //
+    // Windows-style path in a pattern: bare backslash matches
+    // bare backslash.
+    expect(matchCommand('cd C:\\Users\\foo', 'cd C:\\Users\\foo')).toBe(true);
+    // Same path with the operator using explicit-escape `\\`
+    // for each backslash also matches (standard glob semantics).
+    expect(matchCommand('cd C:\\\\Users\\\\foo', 'cd C:\\Users\\foo')).toBe(true);
+    // Shell-escaped space (`foo\ bar` is bash-literal "foo bar"
+    // when typed at a shell prompt — but as a policy pattern,
+    // the chars are literal: backslash + space).
+    expect(matchCommand('cd foo\\ bar', 'cd foo\\ bar')).toBe(true);
+    expect(matchCommand('cd foo\\ bar', 'cd foo bar')).toBe(false);
+    // Backslash in an arg value: `\n`, `\t`, etc. as literal
+    // 2-char sequences in the pattern.
+    expect(matchCommand('echo a\\nb', 'echo a\\nb')).toBe(true);
+    // Wildcards alongside literal backslashes: the trailing `\`
+    // before a `*` MUST be explicit-escaped so the matcher reads
+    // the asterisk as a wildcard and not as a glob-escaped
+    // literal `*`. Standard glob behavior — operator authoring
+    // a Windows-path-prefix rule with a wildcard suffix uses
+    // `\\` for each path separator. The bare-backslash form
+    // (`cd C:\Users\*`) reads as "cd C:\Users\" + literal `*`,
+    // and only matches exactly that string.
+    expect(matchCommand('cd C:\\\\Users\\\\*', 'cd C:\\Users\\anyone')).toBe(true);
+    expect(matchCommand('cd C:\\\\Users\\\\*', 'cd D:\\Other\\anyone')).toBe(false);
+    // Bare-backslash form `cd C:\Users\*` ends in `\*` which IS
+    // a recognized escape (literal `*`) — so this rule reads as
+    // "cd C:\Users" + literal `*`. Matches only that exact form,
+    // not arbitrary subdirectories. Operator who wants the
+    // wildcard semantics uses the doubled-up form above.
+    expect(matchCommand('cd C:\\Users\\*', 'cd C:\\Users*')).toBe(true);
+    expect(matchCommand('cd C:\\Users\\*', 'cd C:\\Users\\anyone')).toBe(false);
+  });
 });
 
 describe('escapeGlobMetacharacters', () => {

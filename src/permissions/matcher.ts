@@ -68,32 +68,48 @@ const compileGlobToRegex = (pattern: string): RegExp => {
   while (i < pattern.length) {
     const ch = pattern[i];
     if (ch === undefined) break;
-    // Backslash escape: the next char is a literal, never a
-    // wildcard. Used by callers that need to promote raw input as
-    // a literal rule — for example the session-allow bridge,
-    // which calls `escapeGlobMetacharacters(args.command)` before
-    // adding the rule. Without escape support, an operator
-    // confirming `echo *` would have the rule's `*` interpreted
-    // as a wildcard, broadening "yes for this exact command" to
-    // "yes for any echo invocation" (and via the dotAll regex,
-    // even injection like `echo $(rm -rf /)`).
+    // Backslash handling is narrow: only `\*`, `\?`, and `\\`
+    // are recognized as escape sequences (the three chars the
+    // matcher otherwise interprets as glob meta). For any other
+    // following char, the backslash is preserved as a LITERAL —
+    // policies legitimately carry backslashes in Windows-style
+    // paths (`C:\Users\...`) and shell-escaped tokens
+    // (`foo\ bar`), and consuming the backslash unconditionally
+    // would silently drop them and cause `git status` rules
+    // adjacent to backslashed segments to mis-match.
+    //
+    // Escape consumption is used by the session-allow bridge,
+    // which calls `escapeGlobMetacharacters(args.command)` to
+    // turn `echo *` into the literal rule `echo \*`. Without
+    // escape support, the rule's `*` would be a wildcard and
+    // session-allow (which runs BEFORE the compound-shell
+    // guard) would auto-allow `echo $(rm -rf /)` on the next
+    // call.
     if (ch === '\\' && i + 1 < pattern.length) {
       const lit = pattern[i + 1];
-      if (lit !== undefined) {
-        // Escape the literal for regex output. `*` and `?` are
-        // glob meta the regular branch handles separately, so
-        // they're NOT in REGEX_META and need explicit escaping
-        // here — without this, an escaped `\*` would emit `*`
-        // verbatim, which is the regex "0-or-more" quantifier
-        // and does NOT match a literal asterisk.
-        if (lit === '*' || lit === '?') {
-          out += `\\${lit}`;
-        } else {
-          out += lit.replace(REGEX_META, '\\$&');
-        }
+      if (lit === '*' || lit === '?') {
+        // `\*` / `\?` — glob meta escaped to literal. Emit as
+        // regex literal (these chars aren't in REGEX_META; the
+        // compiler's main branch handles them as wildcards
+        // separately, so explicit escape is required here).
+        out += `\\${lit}`;
         i += 2;
         continue;
       }
+      if (lit === '\\') {
+        // `\\` — literal backslash. Emit regex escape so the
+        // resulting pattern matches a single backslash.
+        out += '\\\\';
+        i += 2;
+        continue;
+      }
+      // Any other pair: backslash is itself a literal char.
+      // Emit the regex escape for it and let the next char
+      // scan normally on its own iteration. This preserves
+      // `C:\foo` / `foo\ bar` / `path\with\slashes` shapes.
+      out += '\\\\';
+      i += 1;
+      continue;
     }
     if (ch === '*') out += '.*';
     else if (ch === '?') out += '.';
