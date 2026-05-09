@@ -42,11 +42,30 @@ describe('runInit', () => {
     // make `agent init` produce unparseable output).
     const policy = loadPolicyFromString(body);
     expect(policy.defaults.mode).toBe('strict');
-    // Bash uses the catch-all confirm posture — every command
-    // pops a modal. The literal `*` rule stands in for the prior
-    // curated allowlist; replacing it back to specific allows is
-    // an operator choice, not a default.
-    expect(policy.tools.bash?.allow ?? []).toEqual([]);
+    // Bash carries a conservative read-only allowlist (git
+    // inspection, ls, version probes, pwd/whoami) plus the
+    // catch-all confirm so anything not in the allow list still
+    // pops a modal, plus the deny list for catastrophic patterns.
+    // The allow list cuts modal fatigue on common dev-loop ops
+    // without admitting writes.
+    const allow = policy.tools.bash?.allow ?? [];
+    expect(allow.length).toBeGreaterThan(0);
+    // A few load-bearing entries: removal would silently revert
+    // the modal-fatigue improvement.
+    expect(allow).toContain('git status');
+    expect(allow).toContain('pwd');
+    expect(allow).toContain('git --version');
+    // Allow MUST NOT contain commands that read arbitrary file
+    // contents (cat/head/tail/rg) — they can target .env or
+    // other secrets and bash doesn't honor fs.read's deny_paths.
+    expect(allow.some((r) => r === 'cat *' || r.startsWith('cat '))).toBe(false);
+    expect(allow.some((r) => r === 'head *' || r.startsWith('head '))).toBe(false);
+    expect(allow.some((r) => r === 'tail *' || r.startsWith('tail '))).toBe(false);
+    expect(allow.some((r) => r === 'rg*' || r.startsWith('rg '))).toBe(false);
+    // Allow MUST NOT contain commands that mutate (git branch -d,
+    // git commit, etc). git branch* would admit deletion, so it's
+    // out of scope.
+    expect(allow.some((r) => r === 'git branch*' || r === 'git branch')).toBe(false);
     expect(policy.tools.bash?.confirm).toEqual(['*']);
     expect(policy.tools.bash?.deny?.length ?? 0).toBeGreaterThan(0);
     expect(policy.tools.read_file?.deny_paths?.length ?? 0).toBeGreaterThan(0);

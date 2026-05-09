@@ -1,32 +1,36 @@
 // Template for `.agent/permissions.yaml` written by `agent init`.
 // Spec: AGENTIC_CLI.md §8 (the policy schema) + §2.1 (init mode).
 //
-// Posture: ask-on-everything for bash with a deny-list of obvious
-// catastrophes. Every command the model proposes surfaces a modal
-// to the operator — there is no silent-execute allowlist — so the
-// operator stays in the loop on every shell side effect. The
-// catch-all `confirm: ['*']` rule takes the spot the prior
-// curated allowlist filled; deny rules still win and short-
-// circuit the modal for patterns that should never run.
+// Posture: conservative allowlist for read-only inspection commands
+// + catch-all confirm for everything else + deny for the obvious
+// catastrophes. The allow list cuts modal fatigue on the very
+// frequent dev-loop commands (git status, ls, version probes)
+// without surfacing the question every iteration. Anything not
+// in the allow list still pops a modal; deny rules still win.
 //
-// Trade-off the operator is opting into:
-//   + every bash call is observed; no silent execution path
-//   + the YAML is short and readable (one rule, not 16 patterns)
-//   + the operator sees the literal command before approval
-//   - frequent safe ops (`git status`, `ls`) pop a modal each
-//     time; iterate-on-failures loops feel slower
-//   - operators who prefer per-pattern allow can still narrow
-//     down by replacing the catch-all with explicit allow lists
+// Allowlist scope is deliberately narrow:
+//   - read-only inspection (no commands that read FILE CONTENTS
+//     like cat/head/tail/rg — those can target .env or other
+//     secrets and the bash matcher doesn't honor fs.read's
+//     deny_paths)
+//   - no writes (no `git commit`, no `git branch -d`, no
+//     redirects)
+//   - exact patterns where flag space would be risky
+//     (versions; pwd; whoami)
 //
-// fs.read / fs.write / fs.edit / search keep the curated path-
-// shape rules — the bash catch-all is deliberately scoped to
-// shell commands, where the surface is most adversarial and the
-// command text itself is the audit signal. Path-rule symmetry
-// can be a follow-up if operators ask for it.
+// Glob-injection caveat: a pattern like `git status*` admits
+// `git status; rm -rf .` because `*` matches `;`, `&&`, `|`,
+// `$(...)`. The deny list below catches the most catastrophic
+// shapes (rm -rf root/home, sudo, curl|sh) but cannot enumerate
+// every injection. Operators concerned about command injection
+// in untrusted agent code should narrow allows to exact patterns
+// or migrate to a sandboxed shell (TODO Tier 4: AST-based bash
+// matching).
 //
-// Path-shape rules protect `.env`, `.git/`, and `node_modules`
-// from accidental writes; fetch_url denies loopback to keep the
-// model away from local services.
+// fs.read / fs.write / fs.edit / search keep their curated
+// path-shape rules. Path-shape rules protect `.env`, `.git/`,
+// and `node_modules` from accidental writes; fetch_url denies
+// loopback to keep the model away from local services.
 //
 // Comments inline so an operator opening the file in their editor
 // understands what each section does without flipping to the spec.
@@ -57,16 +61,55 @@ defaults:
 
 tools:
   bash:
-    # Catch-all: every bash command pops a modal asking the
-    # operator. No silent allowlist. The operator sees the literal
-    # command text and decides per invocation. Replace this rule
-    # with explicit allow patterns (e.g. "bun test*", "git status")
-    # to silence frequent safe ops once you're comfortable with the
-    # agent's behavior in this project.
+    # Read-only inspection that the agent runs constantly during
+    # iterate-on-failures loops. Allow silences these so the
+    # operator only sees a modal for novel actions. Add or remove
+    # patterns to fit your project's most-frequent safe ops.
+    #
+    # Note on glob injection: a pattern like "git status*" admits
+    # "git status; <anything>" because the trailing "*" matches
+    # shell metacharacters (";", "&&", "|", "$(...)"). The deny
+    # list below catches the most catastrophic shapes; for
+    # hardened isolation, switch the allow patterns to exact-match
+    # (drop the trailing "*").
+    allow:
+      # Git inspection (read-only flows).
+      - "git status"
+      - "git status -*"
+      - "git status --*"
+      - "git diff"
+      - "git diff -*"
+      - "git diff --*"
+      - "git diff HEAD*"
+      - "git log"
+      - "git log -*"
+      - "git log --*"
+      - "git show"
+      - "git show -*"
+      - "git show HEAD*"
+      # File listing (NOT reading content — cat/head/tail/rg
+      # stay confirm because their args can target .env or
+      # other secret files).
+      - "ls"
+      - "ls -*"
+      - "ls --*"
+      # Working directory + identity (exact, no flags).
+      - "pwd"
+      - "whoami"
+      # Tool version probes (exact). Universally safe and
+      # frequent during environment debugging.
+      - "git --version"
+      - "node --version"
+      - "bun --version"
+      - "npm --version"
+
+    # Everything else surfaces a modal so the operator sees the
+    # literal command before approval.
     confirm:
       - "*"
+
     # Patterns we never want to see, even via the catch-all confirm.
-    # Deny rules win over confirm regardless of mode.
+    # Deny rules win over allow / confirm regardless of mode.
     deny:
       - "rm -rf /*"
       - "rm -rf ~*"
