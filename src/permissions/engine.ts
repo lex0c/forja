@@ -1,5 +1,10 @@
 import type { SectionProvenance } from './hierarchy.ts';
-import { firstMatchingCommand, firstMatchingHost, firstMatchingPath } from './matcher.ts';
+import {
+  containsShellInjection,
+  firstMatchingCommand,
+  firstMatchingHost,
+  firstMatchingPath,
+} from './matcher.ts';
 import type {
   BashPolicy,
   Decision,
@@ -133,8 +138,11 @@ const checkBash = (
 
   const layer = sectionLayer(provenance, 'bash');
 
-  // Deny rules win over allow/confirm regardless of mode (including bypass-
-  // outside-callers, though `bypass` itself short-circuits earlier).
+  // Deny rules win over everything (including compound commands
+  // and bypass — though bypass short-circuits before this fn).
+  // Run deny FIRST so a hostile compound like `git status; rm
+  // -rf /tmp/*` still gets denied if the literal matches a deny
+  // pattern.
   const denied = firstMatchingCommand(rules?.deny, command);
   if (denied !== null) {
     return {
@@ -143,6 +151,27 @@ const checkBash = (
       source: { layer, rule: denied, section: 'bash' },
     };
   }
+
+  // Compound-command guard: glob `*` in an allow pattern admits
+  // injection (`git status; <anything>` matches `git status*`).
+  // Force confirm on any command containing shell metacharacters
+  // (`;`, `&&`, `||`, `|`, `$(...)`, backticks). Operator always
+  // sees the literal command for a compound and decides
+  // explicitly. Deny rules already ran above; allow rules are
+  // skipped — by design, no allow pattern can silently admit a
+  // compound. Operator who needs a specific compound silenced
+  // narrows the policy with a deny exception or runs the
+  // commands separately.
+  if (containsShellInjection(command)) {
+    return {
+      kind: 'confirm',
+      prompt: `Run bash: ${command}`,
+      reason:
+        'compound shell command (contains ; && || | $(...) or backticks) — confirming explicitly to surface the literal command',
+      source: { layer, section: 'bash' },
+    };
+  }
+
   const allowed = firstMatchingCommand(rules?.allow, command);
   if (allowed !== null) {
     return {

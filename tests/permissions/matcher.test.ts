@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  containsShellInjection,
   firstMatchingCommand,
   firstMatchingHost,
   firstMatchingPath,
@@ -95,6 +96,74 @@ describe('matchHost', () => {
   test('glob pattern for subdomains', () => {
     expect(matchHost('*.internal', 'api.internal')).toBe(true);
     expect(matchHost('*.internal', 'api.public.com')).toBe(false);
+  });
+});
+
+describe('containsShellInjection', () => {
+  test('plain commands are not flagged', () => {
+    expect(containsShellInjection('ls')).toBe(false);
+    expect(containsShellInjection('git status')).toBe(false);
+    expect(containsShellInjection('git log --oneline -10')).toBe(false);
+    expect(containsShellInjection('rm -rf ./build')).toBe(false);
+  });
+
+  test('semicolon flags', () => {
+    expect(containsShellInjection('ls; rm -rf .')).toBe(true);
+    expect(containsShellInjection('git status; pwd')).toBe(true);
+  });
+
+  test('logical AND/OR chain flags', () => {
+    expect(containsShellInjection('test -f x && rm x')).toBe(true);
+    expect(containsShellInjection('mkdir -p dir || echo skip')).toBe(true);
+  });
+
+  test('pipe flags', () => {
+    expect(containsShellInjection('git log | head')).toBe(true);
+    expect(containsShellInjection('cat file | grep foo')).toBe(true);
+  });
+
+  test('command substitution flags', () => {
+    expect(containsShellInjection('echo $(whoami)')).toBe(true);
+    expect(containsShellInjection('cat $(find . -name secret)')).toBe(true);
+    expect(containsShellInjection('rm `which dangerous`')).toBe(true);
+  });
+
+  test('metachars inside single quotes are NOT flagged', () => {
+    // git commit -m "fix; bug" — semicolon is literal inside the
+    // quoted message. Single quotes preserve everything.
+    expect(containsShellInjection("echo 'foo; bar'")).toBe(false);
+    expect(containsShellInjection("echo 'a | b'")).toBe(false);
+    expect(containsShellInjection("echo 'a && b'")).toBe(false);
+  });
+
+  test('metachars inside double quotes are NOT flagged', () => {
+    // Double-quoted strings still allow $(...) expansion in real
+    // bash, but for the policy decision we treat double-quoted
+    // segments as opaque content. The deny path catches the
+    // catastrophic shapes regardless; this guard is the defense
+    // for accidental compounds, not a sandbox.
+    expect(containsShellInjection('echo "foo; bar"')).toBe(false);
+    expect(containsShellInjection('git commit -m "fix; close #1"')).toBe(false);
+  });
+
+  test('escaped metachars are NOT flagged', () => {
+    expect(containsShellInjection('echo foo\\; bar')).toBe(false);
+    expect(containsShellInjection('echo a\\|b')).toBe(false);
+  });
+
+  test('mixed quote / unquoted: unquoted metachar still flags', () => {
+    // The injection IS the unquoted part — operator must see
+    // this on the modal.
+    expect(containsShellInjection('echo "safe text"; rm -rf .')).toBe(true);
+    expect(containsShellInjection("git status -m 'msg' && rm")).toBe(true);
+  });
+
+  test('lone & does NOT flag (background marker, not chain)', () => {
+    // Single `&` backgrounds a process; we don't treat it as
+    // injection because the matcher's job is policy gate, not
+    // bash-mode enforcement. The deny rules catch the
+    // dangerous shapes anyway.
+    expect(containsShellInjection('sleep 30 &')).toBe(false);
   });
 });
 

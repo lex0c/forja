@@ -83,6 +83,65 @@ const compileGlobToRegex = (pattern: string): RegExp => {
 export const matchCommand = (pattern: string, command: string): boolean =>
   compileGlobToRegex(pattern).test(command.trim());
 
+// Detects shell metacharacters that compose multiple commands into
+// one (`;`, `&&`, `||`, `|`) or embed command substitution
+// (`$(...)`, backticks). Used by the bash policy check to force the
+// confirm path on compound commands regardless of any allow rule:
+// without this, a literal `*` in an allow pattern admits injection
+// like `git status; rm -rf .` because the matcher's `*` resolves to
+// `.*` (greedy), and the deny rules can't enumerate every shape.
+//
+// The scan respects single-quote, double-quote, and backslash-escape
+// state so a literal `;` inside `git commit -m "fix; bug"` does not
+// trip the detector. Heuristic — does NOT model here-docs, `<<<`
+// here-strings, or `((...))` arithmetic substitution. Those are
+// rare in agent-emitted commands; if they show up the operator
+// still sees the modal (the catch-all `confirm: ['*']` fires).
+//
+// Returns true on any of the metachars listed above; the caller
+// (engine.ts checkBash) treats true as "force confirm" — deny
+// rules still win over confirm, so dangerous compounds like
+// `; rm -rf /` are caught by `rm -rf /*` deny on the literal
+// command before this gate runs.
+export const containsShellInjection = (command: string): boolean => {
+  let i = 0;
+  let inSingle = false;
+  let inDouble = false;
+  while (i < command.length) {
+    const c = command[i];
+    if (c === undefined) break;
+    // Backslash escape: skip the next char (works in unquoted +
+    // double-quoted contexts; single-quotes don't honor backslash
+    // — but inside single quotes we're not checking metachars
+    // anyway, so the over-skip is harmless).
+    if (c === '\\' && i + 1 < command.length) {
+      i += 2;
+      continue;
+    }
+    if (!inDouble && c === "'") {
+      inSingle = !inSingle;
+      i += 1;
+      continue;
+    }
+    if (!inSingle && c === '"') {
+      inDouble = !inDouble;
+      i += 1;
+      continue;
+    }
+    if (!inSingle && !inDouble) {
+      // Compound separators
+      if (c === ';') return true;
+      if (c === '|') return true; // covers both | and ||
+      if (c === '&' && command[i + 1] === '&') return true;
+      // Command substitution
+      if (c === '$' && command[i + 1] === '(') return true;
+      if (c === '`') return true;
+    }
+    i += 1;
+  }
+  return false;
+};
+
 // Host matching for fetch URLs. Same compile semantics as commands —
 // hostnames don't contain `/`, but we want consistent behavior across
 // command/host matching (and `*` in `*.internal` should not be limited
