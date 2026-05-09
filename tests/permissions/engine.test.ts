@@ -532,6 +532,38 @@ describe('compound command guard (shell injection defense)', () => {
     }
   });
 
+  test('>&word (legacy bash redirect) forces confirm even when allow matches the host command', () => {
+    // Reported bypass: `git diff --name-only >&/tmp/out` matches
+    // an allow `git diff --*` because the matcher's `*` resolves
+    // to `.*` (dotAll) and spans the redirection. Until the
+    // matcher distinguished `>&digit/-` (fd duplication, no fs
+    // touch) from `>&word` (legacy form for "redirect both
+    // streams to file"), the latter slipped through and turned
+    // a read-only allow into a silent write path.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git diff --*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'git diff --name-only >&/tmp/out' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') {
+      expect(d.reason).toContain('compound shell command');
+    }
+  });
+
+  test('>&digit (fd duplication) still passes through allow rules', () => {
+    // Counter-test: `>&1`, `>&2`, `>&-` are fd
+    // duplication / closure — no filesystem mutation. The legacy
+    // `>&word` distinction must NOT regress the common stderr-
+    // merging idiom.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['npm test*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'npm test >&2' });
+    expect(d.kind).toBe('allow');
+  });
+
   test('bash &> redirect now forces confirm (was silent passthrough)', () => {
     // `cmd &>file` writes both stdout AND stderr to a file. The
     // previous matcher treated `&>` as a redirect operator and

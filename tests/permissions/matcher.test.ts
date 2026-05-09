@@ -177,6 +177,7 @@ describe('containsShellInjection', () => {
     // `<` AND don't touch the filesystem:
     //   - `2>&1` / `>&1` / `<&3` — fd duplication
     //   - `>&-` / `<&-`          — fd close
+    //   - `>&12` / `<&10`        — multi-digit fd ref
     // Forcing confirm on every `2>&1` would make stderr-merging
     // unusable through the gate without a session-allow promotion.
     expect(containsShellInjection('echo foo 2>&1')).toBe(false);
@@ -184,6 +185,39 @@ describe('containsShellInjection', () => {
     expect(containsShellInjection('cmd <&3')).toBe(false);
     expect(containsShellInjection('cmd >&-')).toBe(false);
     expect(containsShellInjection('cmd <&-')).toBe(false);
+    expect(containsShellInjection('cmd >&12')).toBe(false);
+  });
+
+  test('>&word (word not a digit/-) flags as file write (bash legacy &>word form)', () => {
+    // Per bash(1) "REDIRECTING STANDARD OUTPUT AND STANDARD
+    // ERROR": when `>&word` is followed by something that is NOT
+    // a digit or `-`, it's equivalent to `&>word` — redirects
+    // both stdout AND stderr to file `word`. The previous
+    // matcher always treated `>&` as fd duplication, missing
+    // this case and creating a bypass: an allow like `git diff
+    // --*` admits `git diff --name-only >&/tmp/out`.
+    expect(containsShellInjection('cmd >&/tmp/out')).toBe(true);
+    expect(containsShellInjection('git diff --name-only >&/tmp/out')).toBe(true);
+    expect(containsShellInjection('cmd >&log.txt')).toBe(true);
+    // No char after `>&` (truncated input) — bash error in
+    // practice; conservative flag.
+    expect(containsShellInjection('cmd >&')).toBe(true);
+    // Whitespace after `>&` — bash parses it as separate tokens;
+    // conservative flag (operator's bash typo, not a real fd dup).
+    expect(containsShellInjection('cmd >& 1')).toBe(true);
+  });
+
+  test('fd-prefixed `1>&word` (legacy redirect) flags', () => {
+    // `1>&out` is the canonical fd-1-prefixed legacy bash form
+    // of "redirect stdout to file out". The fd prefix (`1`) is
+    // before the `>&`, so the `after` byte tracked by the matcher
+    // is the char following `&` (`o`), not the `1`. Flag.
+    expect(containsShellInjection('cmd 1>&out')).toBe(true);
+    expect(containsShellInjection('cmd 2>&err.log')).toBe(true);
+    // But fd-prefixed dup (`1>&2`) still skips — the `after` is
+    // the digit `2`.
+    expect(containsShellInjection('cmd 1>&2')).toBe(false);
+    expect(containsShellInjection('cmd 2>&1')).toBe(false);
   });
 
   test('output redirection to file flags (mutation)', () => {

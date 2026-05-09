@@ -87,13 +87,13 @@ export const matchCommand = (pattern: string, command: string): boolean =>
 // one (`;`, `\n`, `\r`, `&&`, `||`, `|`, lone `&`), embed command
 // substitution (`$(...)`, backticks, `<(...)`, `>(...)`), or
 // redirect output to a file (`>FILE`, `>>FILE`, `>|FILE`,
-// `<>FILE`, `&>FILE`, `&>>FILE`). Used by the bash policy check
-// to force the confirm path on risky shapes regardless of any
-// allow rule: without this, a literal `*` in an allow pattern
-// admits injection like `git status; rm -rf .` because the
-// matcher's `*` resolves to `.*` with dotAll (greedy, matches
-// across newlines), and the deny rules can't enumerate every
-// shape.
+// `<>FILE`, `&>FILE`, `&>>FILE`, `>&FILE`). Used by the bash
+// policy check to force the confirm path on risky shapes
+// regardless of any allow rule: without this, a literal `*` in
+// an allow pattern admits injection like `git status; rm -rf .`
+// because the matcher's `*` resolves to `.*` with dotAll
+// (greedy, matches across newlines), and the deny rules can't
+// enumerate every shape.
 //
 // Output redirection matters specifically because the init
 // template's bash allowlist deliberately ships nominally
@@ -102,12 +102,15 @@ export const matchCommand = (pattern: string, command: string): boolean =>
 // `git status --short > /tmp/secrets` matches `git status -*`
 // and, without flagging `>`, would auto-allow a write operator
 // reading no permission gate. Same for `>>` (append),
-// `>|` (force-write), `<>` (open for read+write), and the bash
-// extension `&>` / `&>>` (both streams to file). Stdin
-// redirection from a file (`<FILE`, `<<EOF`, `<<<X`) does not
-// mutate the filesystem and is not flagged on its own — those
-// are the same risk class as the allowed host command reading
-// stdin, which the bash allow rule already authorized.
+// `>|` (force-write), `<>` (open for read+write), the bash
+// extension `&>` / `&>>` (both streams to file), and the bash
+// LEGACY form `>&word` where word is not a digit or `-`
+// (equivalent to `&>word` per bash(1); see the `>` branch for
+// the digit/`-` discrimination). Stdin redirection from a file
+// (`<FILE`, `<<EOF`, `<<<X`) does not mutate the filesystem
+// and is not flagged on its own — those are the same risk class
+// as the allowed host command reading stdin, which the bash
+// allow rule already authorized.
 //
 // File-descriptor manipulation that does NOT touch the filesystem
 // stays unflagged: `>&N`, `<&N`, `>&-`, `<&-`, `2>&1`, etc. The
@@ -136,12 +139,10 @@ export const matchCommand = (pattern: string, command: string): boolean =>
 // line-continuation; the scanner's escape rule skips the newline,
 // correctly leaving the joined command undetected. Heuristic —
 // does NOT model here-doc bodies (the body content scans
-// normally and may flag on its own metachars), `((...))`
-// arithmetic substitution, or unusual `>&literalfile` /
-// `<&literalfile` syntax (treated as fd duplication, false
-// negative). These are rare in agent-emitted commands; if they
-// show up the operator still sees the modal whenever a more
-// common metachar fires.
+// normally and may flag on its own metachars) or `((...))`
+// arithmetic substitution. These are rare in agent-emitted
+// commands; if they show up the operator still sees the modal
+// whenever a more common metachar fires.
 //
 // Returns true on any of the metachars listed above; the caller
 // (engine.ts checkBash) treats true as "force confirm" — deny
@@ -205,12 +206,29 @@ export const containsShellInjection = (command: string): boolean => {
       }
       if (c === '>') {
         const next = command[i + 1];
-        // >& — fd duplication / closure (`>&1`, `>&2`, `>&-`).
-        // No filesystem mutation; consume both chars and let the
-        // digit / `-` target scan normally.
+        // >& — distinguish:
+        //   >&digit / >&-  → fd duplication / closure (`>&1`,
+        //     `>&2`, `>&-`). No filesystem mutation. Skip.
+        //   >&word         → bash LEGACY form equivalent to
+        //     `&>word`: redirects both stdout AND stderr to the
+        //     file `word`. Mutation. Flag. See bash(1)
+        //     "REDIRECTING STANDARD OUTPUT AND STANDARD ERROR":
+        //     "When using the second form [>&word], word may not
+        //     expand to a number or -. If it does, other
+        //     redirection operators apply (see Duplicating File
+        //     Descriptors)."
+        //   Without this distinction, an allow like `git diff
+        //   --*` admits `git diff --name-only >&/tmp/out` because
+        //   `>&` was previously always treated as fd dup.
         if (next === '&') {
-          i += 2;
-          continue;
+          const after = command[i + 2];
+          const isFdRef = after === '-' || (after !== undefined && after >= '0' && after <= '9');
+          if (isFdRef) {
+            i += 2;
+            continue;
+          }
+          // >&word — file mutation.
+          return true;
         }
         // >( — process substitution (write side). Same risk
         // class as $(...) — the inner command runs in a subshell.
@@ -225,7 +243,15 @@ export const containsShellInjection = (command: string): boolean => {
       }
       if (c === '<') {
         const next = command[i + 1];
-        // <& — fd duplication
+        // <& — fd duplication. Note the asymmetry with `>&`:
+        //   `<&word` where word is NOT a digit or `-` is a bash
+        //   ERROR at runtime (see bash(1) "Duplicating File
+        //   Descriptors") — there's no `<&word` legacy form for
+        //   "read both streams from word" the way `>&word`
+        //   redirects both output streams. So we don't need the
+        //   digit/`-` discrimination on the `<` side: any
+        //   `<&...` either runs as fd dup (no fs touch) or
+        //   bash-errors (no execution, no security concern).
         if (next === '&') {
           i += 2;
           continue;
