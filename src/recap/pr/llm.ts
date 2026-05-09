@@ -10,6 +10,7 @@
 // the value is renderer-specific, so it is passed in here.
 
 import type { Provider } from '../../providers/types.ts';
+import type { RenderOptions } from '../format.ts';
 import {
   type RenderViaLlmFailureReason,
   type RenderViaLlmResult,
@@ -28,6 +29,14 @@ export interface RenderPrViaLlmInput {
   provider: Provider;
   promptVersion: string;
   maxTokens?: number;
+  // Threaded into the template so the rendered markdown carries
+  // the same anonymization / incomplete-callout / etc. behavior
+  // regardless of whether the LLM or deterministic path produced
+  // it. Cache is content-keyed on the intermediate, so options
+  // that affect template formatting do not affect the cache key
+  // — a session moving from incomplete to complete has a different
+  // intermediate and naturally invalidates the cache.
+  templateOptions?: RenderOptions;
 }
 
 // Re-export the shared reason enum and result shape under the
@@ -58,7 +67,7 @@ export const renderPrViaLlm = async (input: RenderPrViaLlmInput): Promise<Render
       });
       return { ok: errors.length === 0, errors };
     },
-    template: renderPrFromStructured,
+    template: (structured) => renderPrFromStructured(structured, input.templateOptions ?? {}),
     maxOutputLines: MAX_OUTPUT_LINES,
     ...(input.maxTokens !== undefined ? { maxTokens: input.maxTokens } : {}),
   });

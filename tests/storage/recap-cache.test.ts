@@ -6,6 +6,7 @@ import {
   canonicalScopeHash,
   purgeExpiredRecapCache,
   readRecapCache,
+  recapMiniCacheKey,
   writeRecapCache,
 } from '../../src/storage/repos/recap-cache.ts';
 
@@ -270,6 +271,51 @@ describe('recap_cache repo', () => {
     expect(got?.output).toBe('second');
     expect(got?.generatedAt).toBe(1_000);
     expect(got?.costUsd).toBe(0.5);
+  });
+
+  test('recapMiniCacheKey is deterministic and content-keyed', () => {
+    const a = recapMiniCacheKey({
+      sessionId: 'sid-1',
+      status: 'done',
+      endedAt: 2_000,
+      costUsd: 0.04,
+      promptVersion: 'mini-v1',
+    });
+    const b = recapMiniCacheKey({
+      sessionId: 'sid-1',
+      status: 'done',
+      endedAt: 2_000,
+      costUsd: 0.04,
+      promptVersion: 'mini-v1',
+    });
+    expect(a).toBe(b);
+    expect(a).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test('recapMiniCacheKey changes when status / endedAt / cost / version change', () => {
+    const base = {
+      sessionId: 'sid-1',
+      status: 'done' as const,
+      endedAt: 2_000,
+      costUsd: 0.04,
+      promptVersion: 'mini-v1',
+    };
+    const k0 = recapMiniCacheKey(base);
+    expect(recapMiniCacheKey({ ...base, status: 'error' })).not.toBe(k0);
+    expect(recapMiniCacheKey({ ...base, endedAt: 9_999 })).not.toBe(k0);
+    expect(recapMiniCacheKey({ ...base, costUsd: 0.05 })).not.toBe(k0);
+    expect(recapMiniCacheKey({ ...base, promptVersion: 'mini-v2' })).not.toBe(k0);
+  });
+
+  test('recapMiniCacheKey accepts null endedAt (running session)', () => {
+    const key = recapMiniCacheKey({
+      sessionId: 'sid-1',
+      status: 'running',
+      endedAt: null,
+      costUsd: 0,
+      promptVersion: 'mini-v1',
+    });
+    expect(key).toMatch(/^[0-9a-f]{64}$/);
   });
 
   test('purgeExpiredRecapCache deletes only expired rows', () => {

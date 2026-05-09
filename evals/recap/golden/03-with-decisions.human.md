@@ -2,6 +2,12 @@
 
 **Goal:** cleanup tmp dir and confirm with me before any bash
 
+## Resumo
+
+- cleanup tmp dir and confirm with me before any bash
+- 2 commands run
+- bash: rm -rf /tmp/forja-staging — cleanup is intentional
+
 ## What changed
 
 - 2 commands run

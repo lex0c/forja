@@ -23,7 +23,14 @@
 // Sections are omitted when empty. Trailing newline is appended so
 // `--out` writes land cleanly (no missing-EOF warning).
 
-import { type RenderOptions, anonymize, anonymizeText, resolveHome } from '../format.ts';
+import { stripAnsi } from '../../sanitize/ansi.ts';
+import {
+  type RenderOptions,
+  anonymize,
+  anonymizeText,
+  redactSecrets,
+  resolveHome,
+} from '../format.ts';
 import type { PrRenderV1, PrTestPlanItem } from './schema.ts';
 
 const renderTestPlanLine = (item: PrTestPlanItem): string => {
@@ -38,9 +45,21 @@ export const renderPrFromStructured = (
   const home = resolveHome(options.home);
   const anon = options.anonymizePaths !== false;
   const path = (p: string): string => (anon ? anonymize(p, home) : p);
-  const text = (s: string): string => (anon ? anonymizeText(s, home) : s);
+  // Two-pass on free-text: anonymize $HOME paths, then redact
+  // secret-shaped tokens. Order matters — anonymizing a path
+  // that happens to contain a secret-like substring would not
+  // disturb the secret pattern, but redacting first could clip
+  // the path prefix and leave a stale fragment.
+  const text = (s: string): string =>
+    redactSecrets(anon ? anonymizeText(stripAnsi(s), home) : stripAnsi(s));
 
   const lines: string[] = [];
+
+  if (options.incomplete !== undefined) {
+    const ids = options.incomplete.sessionIds.join(', ');
+    lines.push(`> ⚠ Incomplete: ${redactSecrets(options.incomplete.reason)} (${ids})`);
+    lines.push('');
+  }
 
   if (structured.summary.length > 0) {
     lines.push('## Summary');

@@ -23,7 +23,7 @@ import { canonicalJson } from '../json-safe.ts';
 
 export const DEFAULT_RECAP_CACHE_TTL_MS = 60 * 60 * 1000; // 1h
 
-export type RecapCacheRenderer = 'pr' | 'changelog' | 'slack' | 'terse' | 'human';
+export type RecapCacheRenderer = 'pr' | 'changelog' | 'slack' | 'terse' | 'human' | 'mini';
 
 export interface RecapCacheKeyInput {
   scopeKind: string;
@@ -212,3 +212,34 @@ export const purgeExpiredRecapCache = (db: DB, now: number): number => {
   const result = db.query('DELETE FROM recap_cache WHERE expires_at <= ?').run(now);
   return Number(result.changes);
 };
+
+// `recap_mini` rows live in the same `recap_cache` table per
+// RECAP §3.1 ("cacheado em recap_cache, TTL 1h"). The `output`
+// column holds the JSON of `RecapMini` (not markdown); renderer
+// label is `'mini'`. Recomputing a full RecapIntermediate just
+// to derive the cache key would defeat the purpose (recap_mini
+// exists to be CHEAPER than the full projection), so the key is
+// hashed from session-immutable identity + status + endedAt +
+// costUsd. Two projections with the same triple collide — which
+// is correct, since the deterministic projection is a function
+// of those.
+
+export interface RecapMiniCacheKeyInput {
+  sessionId: string;
+  status: string;
+  endedAt: number | null;
+  costUsd: number;
+  promptVersion: string;
+}
+
+export const recapMiniCacheKey = (input: RecapMiniCacheKeyInput): string =>
+  sha256Hex(
+    [
+      'mini',
+      input.sessionId,
+      input.status,
+      input.endedAt === null ? 'null' : String(input.endedAt),
+      input.costUsd.toString(),
+      input.promptVersion,
+    ].join(NUL),
+  );

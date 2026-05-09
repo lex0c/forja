@@ -6,6 +6,7 @@
 // heavy fidelity lifting via path-existence.
 
 import type { Provider } from '../../providers/types.ts';
+import type { RenderOptions } from '../format.ts';
 import {
   type RenderViaLlmFailureReason,
   type RenderViaLlmResult,
@@ -34,6 +35,7 @@ export interface RenderTerseViaLlmInput {
   provider: Provider;
   promptVersion: string;
   maxTokens?: number;
+  templateOptions?: RenderOptions;
 }
 
 export type RenderTerseViaLlmFailureReason = RenderViaLlmFailureReason;
@@ -53,7 +55,7 @@ export const renderTerseViaLlm = async (
     jsonSchema: TERSE_RENDER_V1_JSON_SCHEMA as unknown as Record<string, unknown>,
     validate: validateTerseRenderV1,
     fidelityCheck: () => ({ ok: true, errors: [] }),
-    template: renderTerseFromStructured,
+    template: (structured) => renderTerseFromStructured(structured, input.templateOptions ?? {}),
     maxOutputLines: MAX_OUTPUT_LINES,
     maxTokens: input.maxTokens ?? DEFAULT_TERSE_MAX_TOKENS,
   });

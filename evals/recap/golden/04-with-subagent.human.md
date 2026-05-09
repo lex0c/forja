@@ -2,6 +2,11 @@
 
 **Goal:** analyze the queue retry tests for flakiness using a subagent
 
+## Resumo
+
+- analyze the queue retry tests for flakiness using a subagent
+- 1 subagent(s) spawned
+
 ## What changed
 
 - 1 subagent(s) spawned

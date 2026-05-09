@@ -38,15 +38,32 @@ import { dirname } from 'node:path';
 import type { Provider } from '../../../providers/types.ts';
 import { renderChangelogDeterministic } from '../../../recap/changelog/index.ts';
 import { renderChangelogViaLlm } from '../../../recap/changelog/llm.ts';
+import {
+  type RenderOptions,
+  anonymize,
+  anonymizeText,
+  formatDuration,
+  redactSecrets,
+  resolveHome,
+} from '../../../recap/format.ts';
+import { renderHumanDeterministic } from '../../../recap/human/index.ts';
+import { renderHumanViaLlm } from '../../../recap/human/llm.ts';
 import type { RenderViaLlmResult } from '../../../recap/llm-shared.ts';
+import {
+  RECAP_MINI_SCHEMA_VERSION,
+  type RecapMini,
+  projectRecapMini,
+  validateRecapMini,
+} from '../../../recap/mini/index.ts';
 import { renderPrDeterministic } from '../../../recap/pr/index.ts';
 import { renderPrViaLlm } from '../../../recap/pr/llm.ts';
 import { type RecapScopeOption, projectRecap } from '../../../recap/projection.ts';
 import { CHANGELOG_PROMPT_VERSION } from '../../../recap/prompts/changelog-v1.ts';
+import { HUMAN_PROMPT_VERSION } from '../../../recap/prompts/human-v1.ts';
 import { PR_PROMPT_VERSION } from '../../../recap/prompts/pr-v1.ts';
 import { SLACK_PROMPT_VERSION } from '../../../recap/prompts/slack-v1.ts';
 import { TERSE_PROMPT_VERSION } from '../../../recap/prompts/terse-v1.ts';
-import { renderHuman, renderJson } from '../../../recap/render.ts';
+import { renderJson } from '../../../recap/render.ts';
 import { renderSlackDeterministic } from '../../../recap/slack/index.ts';
 import { renderSlackViaLlm } from '../../../recap/slack/llm.ts';
 import { renderTerseDeterministic } from '../../../recap/terse/index.ts';
@@ -55,16 +72,19 @@ import type { RecapIntermediate } from '../../../recap/types.ts';
 import {
   canonicalScopeHash,
   readRecapCache,
+  recapMiniCacheKey,
   writeRecapCache,
 } from '../../../storage/repos/recap-cache.ts';
 import { recordRecapRun } from '../../../storage/repos/recap-runs.ts';
+import { listSessions } from '../../../storage/repos/sessions.ts';
+import type { Session, SessionStatus } from '../../../storage/repos/sessions.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
 const DEFAULT_STEP_LIMIT = 10;
 
 type RecapFormat = 'human' | 'json' | 'pr' | 'changelog' | 'slack' | 'terse';
 
-type LlmRendererName = 'pr' | 'changelog' | 'slack' | 'terse';
+type LlmRendererName = 'human' | 'pr' | 'changelog' | 'slack' | 'terse';
 
 interface ParsedRecap {
   format: RecapFormat;
@@ -93,17 +113,14 @@ const RENDERER_SUBCOMMANDS: ReadonlySet<string> = new Set([
   'terse',
 ]);
 
-const FUTURE_SUBCOMMANDS: ReadonlySet<string> = new Set(['day', 'range', 'pre-compact', 'list']);
+const FUTURE_SUBCOMMANDS: ReadonlySet<string> = new Set(['day', 'range', 'pre-compact']);
 
 const futureSubcommandMessage = (sub: string): string => {
   if (sub === 'day' || sub === 'range') {
     return `/recap: '${sub}' is cross-session scope (M4.3); not yet available`;
   }
-  if (sub === 'pre-compact') {
-    return `/recap: 'pre-compact' needs Context Engine wiring (M4.3); not yet available`;
-  }
-  // 'list'
-  return `/recap: 'list' needs recap_mini cache (M4.2 slice c); not yet available`;
+  // 'pre-compact'
+  return `/recap: 'pre-compact' needs Context Engine wiring (M4.3); not yet available`;
 };
 
 interface FlagSplit {
@@ -239,70 +256,120 @@ const writeOutFile = async (outPath: string, content: string): Promise<void> => 
 // generalizes over the table.
 interface LlmRendererSpec {
   promptVersion: string;
-  deterministic: (intermediate: RecapIntermediate) => string;
+  deterministic: (intermediate: RecapIntermediate, options: RenderOptions) => string;
   llm: (input: {
     intermediate: RecapIntermediate;
     provider: Provider;
     promptVersion: string;
+    templateOptions: RenderOptions;
   }) => Promise<RenderViaLlmResult<unknown>>;
 }
 
 const LLM_RENDERER_DISPATCH: Record<LlmRendererName, LlmRendererSpec> = {
+  human: {
+    promptVersion: HUMAN_PROMPT_VERSION,
+    deterministic: (i, opts) => renderHumanDeterministic(i, opts),
+    llm: (input) =>
+      renderHumanViaLlm({
+        intermediate: input.intermediate,
+        provider: input.provider,
+        promptVersion: input.promptVersion,
+        templateOptions: input.templateOptions,
+      }) as Promise<RenderViaLlmResult<unknown>>,
+  },
   pr: {
     promptVersion: PR_PROMPT_VERSION,
-    deterministic: (i) => renderPrDeterministic(i),
+    deterministic: (i, opts) => renderPrDeterministic(i, opts),
     llm: (input) =>
       renderPrViaLlm({
         intermediate: input.intermediate,
         provider: input.provider,
         promptVersion: input.promptVersion,
+        templateOptions: input.templateOptions,
       }) as Promise<RenderViaLlmResult<unknown>>,
   },
   changelog: {
     promptVersion: CHANGELOG_PROMPT_VERSION,
-    deterministic: (i) => renderChangelogDeterministic(i),
+    deterministic: (i, opts) => renderChangelogDeterministic(i, opts),
     llm: (input) =>
       renderChangelogViaLlm({
         intermediate: input.intermediate,
         provider: input.provider,
         promptVersion: input.promptVersion,
+        templateOptions: input.templateOptions,
       }) as Promise<RenderViaLlmResult<unknown>>,
   },
   slack: {
     promptVersion: SLACK_PROMPT_VERSION,
-    deterministic: (i) => renderSlackDeterministic(i),
+    deterministic: (i, opts) => renderSlackDeterministic(i, opts),
     llm: (input) =>
       renderSlackViaLlm({
         intermediate: input.intermediate,
         provider: input.provider,
         promptVersion: input.promptVersion,
+        templateOptions: input.templateOptions,
       }) as Promise<RenderViaLlmResult<unknown>>,
   },
   terse: {
     promptVersion: TERSE_PROMPT_VERSION,
-    deterministic: (i) => renderTerseDeterministic(i),
+    deterministic: (i, opts) => renderTerseDeterministic(i, opts),
     llm: (input) =>
       renderTerseViaLlm({
         intermediate: input.intermediate,
         provider: input.provider,
         promptVersion: input.promptVersion,
+        templateOptions: input.templateOptions,
       }) as Promise<RenderViaLlmResult<unknown>>,
   },
 };
 
 const isLlmRenderer = (format: RecapFormat): format is LlmRendererName =>
-  format === 'pr' || format === 'changelog' || format === 'slack' || format === 'terse';
+  format === 'human' ||
+  format === 'pr' ||
+  format === 'changelog' ||
+  format === 'slack' ||
+  format === 'terse';
 
-const renderForFormat = (format: RecapFormat, intermediate: RecapIntermediate): string => {
+// Build the render options from the projected intermediate. Threads
+// `incomplete` so every renderer prepends the §10 callout when the
+// projected session is non-terminal. JSON renderer does not consume
+// `RenderOptions` (it emits raw structure); but `incomplete` is
+// already inside `intermediate.completeness` and surfaces in the
+// JSON output by virtue of the schema itself.
+const buildRenderOptions = (intermediate: RecapIntermediate): RenderOptions => {
+  const completeness = intermediate.completeness;
+  if (!completeness.incomplete) return {};
+  return {
+    incomplete: {
+      reason: completeness.incompleteReason,
+      sessionIds: completeness.incompleteSessions,
+    },
+  };
+};
+
+const renderForFormat = (
+  format: RecapFormat,
+  intermediate: RecapIntermediate,
+  options: RenderOptions,
+): string => {
   if (format === 'json') return renderJson(intermediate);
-  if (isLlmRenderer(format)) return LLM_RENDERER_DISPATCH[format].deterministic(intermediate);
-  return renderHuman(intermediate);
+  // Every other format (human / pr / changelog / slack / terse)
+  // routes through the dispatch — `deterministic` per renderer
+  // is the canonical "no-LLM" output.
+  return LLM_RENDERER_DISPATCH[format].deterministic(intermediate, options);
 };
 
 export const recapCommand: SlashCommand = {
   name: 'recap',
   description: 'projected view over this session (or another by id)',
   exec: async (args, ctx: SlashContext): Promise<SlashResult> => {
+    // `/recap list` is a different shape entirely — multi-session
+    // listing instead of a per-session render. Routed early so the
+    // shared `splitFlags` / `parseRecapArgs` pipeline does not have
+    // to learn the list-specific filter set.
+    if (args[0] === 'list') {
+      return await runRecapList(args.slice(1), ctx);
+    }
     const parsed = parseRecapArgs(args);
     if ('error' in parsed) {
       return { kind: 'error', message: parsed.error };
@@ -403,10 +470,11 @@ const renderWithLlmOrFallback = async (
   intermediate: RecapIntermediate,
   ctx: SlashContext,
 ): Promise<RenderOutcome> => {
+  const renderOptions = buildRenderOptions(intermediate);
   // Non-LLM renderers (human, json) and explicit opt-out always
   // take the deterministic template path.
   if (!isLlmRenderer(parsed.format) || parsed.noLlmRender) {
-    return deterministicOutcome(renderForFormat(parsed.format, intermediate));
+    return deterministicOutcome(renderForFormat(parsed.format, intermediate, renderOptions));
   }
 
   const provider = ctx.baseConfig.provider;
@@ -415,7 +483,9 @@ const renderWithLlmOrFallback = async (
   // not opt into the LLM path explicitly; they just chose
   // `/recap <renderer>` and we silently degrade.
   if (provider.capabilities.constrained === false) {
-    return deterministicOutcome(LLM_RENDERER_DISPATCH[parsed.format].deterministic(intermediate));
+    return deterministicOutcome(
+      LLM_RENDERER_DISPATCH[parsed.format].deterministic(intermediate, renderOptions),
+    );
   }
 
   const dispatch = LLM_RENDERER_DISPATCH[parsed.format];
@@ -445,6 +515,7 @@ const renderWithLlmOrFallback = async (
     intermediate,
     provider,
     promptVersion: dispatch.promptVersion,
+    templateOptions: renderOptions,
   });
   if (!result.ok) {
     ctx.bus.emit({
@@ -452,7 +523,7 @@ const renderWithLlmOrFallback = async (
       ts: ctx.now(),
       message: `/recap ${parsed.format}: LLM render failed (${result.reason}: ${result.detail}); using deterministic fallback`,
     });
-    return deterministicOutcome(dispatch.deterministic(intermediate));
+    return deterministicOutcome(dispatch.deterministic(intermediate, renderOptions));
   }
 
   // Successful LLM render — write to cache for the next caller.
@@ -487,4 +558,328 @@ const renderWithLlmOrFallback = async (
     tokensOut: result.usage.output,
     promptVersion: dispatch.promptVersion,
   };
+};
+
+// ─── /recap list ─────────────────────────────────────────────────
+//
+// Multi-session listing surface (RECAP §1, §3.1). Reads top-level
+// sessions filtered by --project / --since / --status, projects a
+// `RecapMini` per session (cache lookup → deterministic on miss),
+// optionally filters in-memory by --search on the goal text, and
+// renders either a fixed-width table or NDJSON.
+//
+// LLM `one_line_summary` (RECAP §3.1: Haiku-rendered) and the
+// Stop-hook pre-render (populates `recap_cache` at session-end so
+// list reads are <50ms) are pending follow-ups; this slice ships
+// the deterministic surface so `/recap list` is functional today.
+
+const VALID_STATUSES: ReadonlySet<SessionStatus> = new Set([
+  'running',
+  'done',
+  'interrupted',
+  'exhausted',
+  'error',
+]);
+
+interface RecapListFilters {
+  limit: number;
+  project: string | null;
+  sinceMs: number | null;
+  status: SessionStatus | null;
+  search: string | null;
+  json: boolean;
+  outPath: string | null;
+}
+
+const DEFAULT_LIST_LIMIT = 20;
+const MAX_LIST_LIMIT = 200;
+
+const parseDateToMs = (raw: string): number | null => {
+  // YYYY-MM-DD only — same surface as `/recap day`. Local
+  // calendar interpretation would surprise operators in
+  // non-UTC zones; UTC midnight is the documented anchor.
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+  if (m === null) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  const ts = Date.UTC(year, month - 1, day, 0, 0, 0, 0);
+  // Round-trip check: Date.UTC is permissive (month=13 → next
+  // year). Reject inputs that don't survive the round-trip.
+  const back = new Date(ts);
+  if (
+    back.getUTCFullYear() !== year ||
+    back.getUTCMonth() !== month - 1 ||
+    back.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return ts;
+};
+
+const parseRecapListArgs = (args: readonly string[]): RecapListFilters | { error: string } => {
+  let limit = DEFAULT_LIST_LIMIT;
+  let project: string | null = null;
+  let sinceMs: number | null = null;
+  let status: SessionStatus | null = null;
+  let search: string | null = null;
+  let json = false;
+  let outPath: string | null = null;
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--json') {
+      json = true;
+      continue;
+    }
+    if (arg === '--limit') {
+      const next = args[i + 1];
+      const n = next !== undefined ? positiveInt(next) : null;
+      if (n === null) return { error: '/recap list: --limit requires a positive integer' };
+      if (n > MAX_LIST_LIMIT) {
+        return { error: `/recap list: --limit cannot exceed ${MAX_LIST_LIMIT}` };
+      }
+      limit = n;
+      i += 1;
+      continue;
+    }
+    if (arg === '--project') {
+      const next = args[i + 1];
+      if (next === undefined || next.length === 0) {
+        return { error: '/recap list: --project requires a path' };
+      }
+      project = next;
+      i += 1;
+      continue;
+    }
+    if (arg === '--since') {
+      const next = args[i + 1];
+      if (next === undefined) return { error: '/recap list: --since requires YYYY-MM-DD' };
+      const ts = parseDateToMs(next);
+      if (ts === null) {
+        return {
+          error: `/recap list: --since received invalid date '${next}' (expected YYYY-MM-DD)`,
+        };
+      }
+      sinceMs = ts;
+      i += 1;
+      continue;
+    }
+    if (arg === '--status') {
+      const next = args[i + 1];
+      if (next === undefined || !VALID_STATUSES.has(next as SessionStatus)) {
+        return {
+          error: `/recap list: --status must be one of ${[...VALID_STATUSES].join('|')}`,
+        };
+      }
+      status = next as SessionStatus;
+      i += 1;
+      continue;
+    }
+    if (arg === '--search') {
+      const next = args[i + 1];
+      if (next === undefined || next.length === 0) {
+        return { error: '/recap list: --search requires a query' };
+      }
+      search = next;
+      i += 1;
+      continue;
+    }
+    if (arg === '--out') {
+      const next = args[i + 1];
+      if (next === undefined || next.length === 0) {
+        return { error: '/recap list: --out requires a file path' };
+      }
+      outPath = next;
+      i += 1;
+      continue;
+    }
+    if (arg?.startsWith('--out=') === true) {
+      const value = arg.slice('--out='.length);
+      if (value.length === 0) return { error: '/recap list: --out= requires a file path' };
+      outPath = value;
+      continue;
+    }
+    if (arg?.startsWith('--') === true) {
+      return { error: `/recap list: unknown flag '${arg}'` };
+    }
+    return { error: `/recap list: unexpected positional argument '${arg ?? ''}'` };
+  }
+
+  return { limit, project, sinceMs, status, search, json, outPath };
+};
+
+// Cache lookup → deterministic on miss. Cache writes happen on
+// miss so the next call (this run or another) is a hit. A read
+// failure (corrupt JSON in the row) falls through to a fresh
+// projection — the cache is an optimization, not a correctness
+// path.
+const projectRecapMiniCached = (ctx: SlashContext, session: Session): RecapMini => {
+  const key = recapMiniCacheKey({
+    sessionId: session.id,
+    status: session.status,
+    endedAt: session.endedAt,
+    costUsd: session.totalCostUsd,
+    promptVersion: RECAP_MINI_SCHEMA_VERSION,
+  });
+  const cached = readRecapCache(ctx.db, { scopeHash: key, now: ctx.now() });
+  if (cached !== null) {
+    try {
+      const parsed = JSON.parse(cached.output) as unknown;
+      if (validateRecapMini(parsed).ok) {
+        return parsed as RecapMini;
+      }
+    } catch {
+      // fall through to fresh projection
+    }
+  }
+  const fresh = projectRecapMini(ctx.db, { sessionId: session.id, now: ctx.now() });
+  // Best-effort write — a cache write failure must not break
+  // list. Running sessions don't get cached (the key changes
+  // every call as duration ticks); skip the write to avoid
+  // hot-row churn.
+  if (session.status !== 'running') {
+    try {
+      writeRecapCache(ctx.db, {
+        scopeHash: key,
+        renderer: 'mini' as const,
+        output: JSON.stringify(fresh),
+        promptVersion: RECAP_MINI_SCHEMA_VERSION,
+        generatedAt: ctx.now(),
+        costUsd: 0,
+        tokensIn: 0,
+        tokensOut: 0,
+      });
+    } catch {
+      // ignore
+    }
+  }
+  return fresh;
+};
+
+// `agent --list-sessions` shape: `YYYY-MM-DD HH:MM:SSZ`. ISO 8601
+// with explicit Z so operators in non-UTC zones don't misread the
+// listing as local time.
+const formatListTime = (ms: number): string => {
+  const d = new Date(ms);
+  return `${d.toISOString().replace('T', ' ').slice(0, 19)}Z`;
+};
+
+// Apply the same anonymize+redact pass the markdown renderers run
+// on free-text fields (RECAP §6.2). The cached `RecapMini` keeps
+// the literal bytes (audit consumers reading the cache row need
+// the raw cwd / goal); redaction happens only on the rendering
+// boundary so the operator never sees `/home/lex/...` paths or
+// `sk-ant-...` tokens in the listing.
+const redactMiniForOutput = (r: RecapMini): RecapMini => {
+  const home = resolveHome(undefined);
+  const path = (p: string): string => anonymize(p, home);
+  const text = (s: string): string => redactSecrets(anonymizeText(s, home));
+  return {
+    ...r,
+    cwd: path(r.cwd),
+    cwdLabel: text(r.cwdLabel),
+    goal: text(r.goal),
+    oneLineSummary: text(r.oneLineSummary),
+  };
+};
+
+const renderListTable = (rows: readonly RecapMini[]): string => {
+  if (rows.length === 0) return 'no sessions found.\n';
+  const lines: string[] = [];
+  lines.push(
+    'STARTED               STATUS       COST       DURATION  ID                                      SUMMARY',
+  );
+  for (const raw of rows) {
+    const r = redactMiniForOutput(raw);
+    const started = formatListTime(r.startedAt);
+    const status = r.status.padEnd(12);
+    const cost = `$${r.costUsd.toFixed(4)}`.padEnd(10);
+    const duration = formatDuration(r.durationMs).padEnd(9);
+    const id = r.sessionId.padEnd(40);
+    lines.push(`${started}  ${status} ${cost} ${duration} ${id} ${r.oneLineSummary}`);
+  }
+  lines.push('');
+  return lines.join('\n');
+};
+
+const renderListJson = (rows: readonly RecapMini[]): string => {
+  // NDJSON: one row per line, matching `agent --list-sessions
+  // --json` convention. Headless consumers can stream-parse.
+  if (rows.length === 0) return '';
+  return `${rows.map((r) => JSON.stringify(redactMiniForOutput(r))).join('\n')}\n`;
+};
+
+const SEARCH_FETCH_MULTIPLIER = 5;
+
+const runRecapList = async (args: readonly string[], ctx: SlashContext): Promise<SlashResult> => {
+  const filters = parseRecapListArgs(args);
+  if ('error' in filters) {
+    return { kind: 'error', message: filters.error };
+  }
+
+  // SQL-side filtering covers everything that maps to a column
+  // predicate (cwd / status / started_at). `--search` is the only
+  // filter that can't go to SQL — its needle is the projected
+  // goal text, not the raw message JSON. To avoid the
+  // "filter-after-LIMIT silently drops matching rows" trap, fetch
+  // up to N × SEARCH_FETCH_MULTIPLIER candidates when `--search`
+  // is set and cap to N after the in-memory filter. With
+  // MAX_LIST_LIMIT=200 the worst case fetches 1000 sessions —
+  // bounded, indexed, and the dominant cost is in-memory string
+  // matching on a small string.
+  const sqlFetchLimit =
+    filters.search !== null
+      ? Math.min(filters.limit * SEARCH_FETCH_MULTIPLIER, MAX_LIST_LIMIT * SEARCH_FETCH_MULTIPLIER)
+      : filters.limit;
+  const sessions = listSessions(ctx.db, {
+    limit: sqlFetchLimit,
+    ...(filters.project !== null ? { cwd: filters.project } : {}),
+    ...(filters.status !== null ? { status: filters.status } : {}),
+    ...(filters.sinceMs !== null ? { startedAtMin: filters.sinceMs } : {}),
+  });
+
+  // Project recap_mini per session. Search filter applies AFTER
+  // projection because the search target is the goal text the
+  // mini extracts (not the raw message JSON).
+  const minis: RecapMini[] = sessions.map((s) => projectRecapMiniCached(ctx, s));
+  let resultRows = minis;
+  if (filters.search !== null) {
+    const needle = filters.search.toLowerCase();
+    resultRows = resultRows.filter((m) => m.goal.toLowerCase().includes(needle));
+    // Final cap after the in-memory filter so `--limit N` truly
+    // means "at most N rows out".
+    if (resultRows.length > filters.limit) {
+      resultRows = resultRows.slice(0, filters.limit);
+    }
+  }
+
+  const output = filters.json ? renderListJson(resultRows) : renderListTable(resultRows);
+
+  if (filters.outPath !== null) {
+    try {
+      await writeOutFile(filters.outPath, output);
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      return {
+        kind: 'error',
+        message: `/recap list: failed to write --out '${filters.outPath}': ${reason}`,
+      };
+    }
+    return {
+      kind: 'ok',
+      notes: [`/recap list: wrote ${resultRows.length} row(s) to ${filters.outPath}`],
+    };
+  }
+
+  // The notes channel emits one line per row of the output. JSON
+  // mode strips the trailing newline; table mode preserves the
+  // header + rows. An empty result returns a single "no sessions
+  // found." line in table mode, or a single info message in JSON
+  // mode (so the caller knows the query ran).
+  if (resultRows.length === 0 && filters.json) {
+    return { kind: 'ok', notes: ['/recap list: no sessions matched the filters'] };
+  }
+  const trimmed = output.endsWith('\n') ? output.slice(0, -1) : output;
+  return { kind: 'ok', notes: trimmed.split('\n') };
 };

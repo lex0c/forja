@@ -233,4 +233,19 @@ describe('renderPrFromStructured', () => {
     expect(md.endsWith('\n')).toBe(true);
     expect(md.endsWith('\n\n')).toBe(false);
   });
+
+  test('prepends incomplete callout when option is set (RECAP §10)', () => {
+    const md = renderPrFromStructured(
+      {
+        schemaVersion: PR_SCHEMA_VERSION,
+        summary: ['x'],
+        changes: [],
+        testPlan: [],
+        notes: [],
+      },
+      { incomplete: { reason: 'session crashed', sessionIds: ['s-1'] } },
+    );
+    expect(md.startsWith('> ⚠ Incomplete: session crashed (s-1)')).toBe(true);
+    expect(md).toContain('## Summary');
+  });
 });

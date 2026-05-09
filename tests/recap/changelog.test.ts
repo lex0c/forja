@@ -281,6 +281,18 @@ describe('renderChangelogFromStructured', () => {
     expect(md.endsWith('\n\n')).toBe(false);
   });
 
+  test('prepends incomplete callout when option is set', () => {
+    const md = renderChangelogFromStructured(
+      {
+        schemaVersion: CHANGELOG_SCHEMA_VERSION,
+        entries: [{ category: 'Added', bullet: 'a' }],
+      },
+      { incomplete: { reason: 'session crashed', sessionIds: ['s-1', 's-2'] } },
+    );
+    expect(md.startsWith('> ⚠ Incomplete: session crashed (s-1, s-2)')).toBe(true);
+    expect(md).toContain('### Added');
+  });
+
   test('anonymizes paths embedded in bullets', () => {
     const md = renderChangelogFromStructured(
       {

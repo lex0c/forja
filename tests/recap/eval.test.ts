@@ -37,32 +37,48 @@ const updateMode = process.env.UPDATE_GOLDENS === '1';
 // Each renderer declares its file extension and a render function
 // that takes an already-projected intermediate. Adding a new
 // deterministic renderer is one entry here plus the 5 goldens.
+//
+// Render-options match what the slash command builds: HOME_OVERRIDE
+// for stable anonymization, and `incomplete` when the projection
+// flags a non-terminal session. The `buildRenderOptions` helper
+// mirrors the slash command's logic so a fixture marked
+// `incomplete: true` produces the same callout in goldens that an
+// operator would see in the REPL.
 interface RendererSpec {
-  readonly name: string; // label shown in the test name
-  readonly ext: string; // file extension under golden/
+  readonly name: string;
+  readonly ext: string;
   readonly render: (intermediate: RecapIntermediate) => string;
 }
 
 const HOME_OVERRIDE = '/home/lex';
 
+const optionsFor = (intermediate: RecapIntermediate) => {
+  const c = intermediate.completeness;
+  if (!c.incomplete) return { home: HOME_OVERRIDE };
+  return {
+    home: HOME_OVERRIDE,
+    incomplete: { reason: c.incompleteReason, sessionIds: c.incompleteSessions },
+  };
+};
+
 const RENDERERS: readonly RendererSpec[] = [
-  { name: 'human', ext: 'human.md', render: (i) => renderHuman(i, { home: HOME_OVERRIDE }) },
+  { name: 'human', ext: 'human.md', render: (i) => renderHuman(i, optionsFor(i)) },
   { name: 'json', ext: 'json', render: (i) => renderJson(i) },
-  { name: 'pr', ext: 'pr.md', render: (i) => renderPrDeterministic(i, { home: HOME_OVERRIDE }) },
+  { name: 'pr', ext: 'pr.md', render: (i) => renderPrDeterministic(i, optionsFor(i)) },
   {
     name: 'changelog',
     ext: 'changelog.md',
-    render: (i) => renderChangelogDeterministic(i, { home: HOME_OVERRIDE }),
+    render: (i) => renderChangelogDeterministic(i, optionsFor(i)),
   },
   {
     name: 'slack',
     ext: 'slack.md',
-    render: (i) => renderSlackDeterministic(i, { home: HOME_OVERRIDE }),
+    render: (i) => renderSlackDeterministic(i, optionsFor(i)),
   },
   {
     name: 'terse',
     ext: 'terse.md',
-    render: (i) => renderTerseDeterministic(i, { home: HOME_OVERRIDE }),
+    render: (i) => renderTerseDeterministic(i, optionsFor(i)),
   },
 ];
 

@@ -287,13 +287,6 @@ describe('/recap', () => {
     }
   });
 
-  test("surfaces a clear 'not yet available' for /recap list", async () => {
-    const result = await recapCommand.exec(['list'], makeCtx());
-    expect(result.kind).toBe('error');
-    if (result.kind !== 'error') return;
-    expect(result.message).toContain('M4.2 slice c');
-  });
-
   test('rejects unknown subcommand with a hint to /recap variants', async () => {
     const result = await recapCommand.exec(['mystery'], makeCtx());
     expect(result.kind).toBe('error');
@@ -655,6 +648,7 @@ describe('/recap', () => {
       content: 'refactor queue',
       createdAt: 1_100,
     });
+    completeSession(db, s.id, 'done', 0, true, 2_000);
     currentSessionId = s.id;
     const result = await recapCommand.exec(['slack', '--no-llm-render'], makeCtx());
     expect(result.kind).toBe('ok');
@@ -679,6 +673,7 @@ describe('/recap', () => {
       content: 'do thing',
       createdAt: 1_100,
     });
+    completeSession(db, s.id, 'done', 0, true, 2_000);
     currentSessionId = s.id;
     const result = await recapCommand.exec(['terse', '--no-llm-render'], makeCtx());
     expect(result.kind).toBe('ok');
@@ -742,6 +737,400 @@ describe('/recap', () => {
     const runs = listRecentRecapRuns(db);
     expect(runs[0]?.renderer).toBe('slack');
     expect(runs[0]?.usedLlm).toBe(false);
+  });
+
+  test('/recap (default human) LLM path: emits ## Resumo and audits used_llm/prompt_version', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, { sessionId: s.id, role: 'user', content: 'do thing', createdAt: 1_100 });
+    currentSessionId = s.id;
+    const stubHuman = JSON.stringify({
+      schemaVersion: 'human-v1',
+      summary: ['Refactored queue', 'Added tests'],
+    });
+    const handle = stubProvider(stubHuman);
+    const ctx = makeCtx({ baseConfig: cfgWithProvider(handle.provider) });
+    const result = await recapCommand.exec([], ctx);
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    expect(text).toContain('## Resumo');
+    expect(text).toContain('Refactored queue');
+    expect(text).toContain('## Cost');
+
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.renderer).toBe('human');
+    expect(runs[0]?.usedLlm).toBe(true);
+    expect(runs[0]?.promptVersion).toBe('human-v1');
+    expect(handle.calls[0]?.output_schema_name).toBe('render_recap_human');
+  });
+
+  test('/recap --no-llm-render produces deterministic ## Resumo (no provider call)', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, { sessionId: s.id, role: 'user', content: 'do thing', createdAt: 1_100 });
+    currentSessionId = s.id;
+    // Provider that throws if called — asserts the LLM bypass.
+    const provider: Provider = {
+      id: 'anthropic/claude-haiku-4-5',
+      family: 'anthropic',
+      capabilities: stubCaps('tools'),
+      generate: async function* () {},
+      generateConstrained: () => Promise.reject(new Error('must not be called')),
+      countTokens: async () => 0,
+    };
+    const ctx = makeCtx({ baseConfig: cfgWithProvider(provider) });
+    const result = await recapCommand.exec(['--no-llm-render'], ctx);
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    expect(text).toContain('## Resumo');
+    expect(text).toContain('do thing');
+
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.usedLlm).toBe(false);
+    expect(runs[0]?.promptVersion).toBeNull();
+  });
+
+  test('/recap on incomplete session shows the callout in pr/changelog/slack/terse/human', async () => {
+    // Synthesize an incomplete session: create + leave running.
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, { sessionId: s.id, role: 'user', content: 'do thing', createdAt: 1_100 });
+    // Do NOT call completeSession — session stays in 'running'
+    // status, which the projection flags as incomplete.
+    currentSessionId = s.id;
+    for (const sub of ['pr', 'changelog', 'slack', 'terse']) {
+      const r = await recapCommand.exec([sub, '--no-llm-render'], makeCtx());
+      expect(r.kind).toBe('ok');
+      if (r.kind !== 'ok') continue;
+      const text = r.notes?.join('\n') ?? '';
+      expect(text).toContain('> ⚠ Incomplete');
+    }
+    // Default human surface also surfaces it.
+    const human = await recapCommand.exec(['--no-llm-render'], makeCtx());
+    expect(human.kind).toBe('ok');
+    if (human.kind !== 'ok') return;
+    expect(human.notes?.join('\n')).toContain('> ⚠ Incomplete');
+  });
+
+  test('/recap json redacts secret-shaped tokens in free-text fields', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    // Feed a goal containing an Anthropic-shaped key — projection
+    // copies it into intermediate.goal.text; renderJson must
+    // redact it.
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'use ANTHROPIC_API_KEY=sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz1234567890',
+      createdAt: 1_100,
+    });
+    currentSessionId = s.id;
+    const result = await recapCommand.exec(['json'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    expect(text).toContain('<redacted:');
+    expect(text).not.toContain('sk-ant-api03');
+  });
+
+  // ─── /recap list (slice c-mini) ──────────────────────────────
+
+  test('/recap list returns sessions with deterministic recap_mini fields', async () => {
+    const s1 = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, { sessionId: s1.id, role: 'user', content: 'first goal', createdAt: 1_100 });
+    completeSession(db, s1.id, 'done', 0.04, true, 2_000);
+    const s2 = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 3_000 });
+    appendMessage(db, { sessionId: s2.id, role: 'user', content: 'second goal', createdAt: 3_100 });
+    completeSession(db, s2.id, 'done', 0.1, true, 4_000);
+    const result = await recapCommand.exec(['list'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    expect(text).toContain('STARTED');
+    expect(text).toContain('first goal');
+    expect(text).toContain('second goal');
+  });
+
+  test('/recap list --json emits NDJSON of RecapMini objects', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, { sessionId: s.id, role: 'user', content: 'do thing', createdAt: 1_100 });
+    completeSession(db, s.id, 'done', 0.04, true, 2_000);
+    const result = await recapCommand.exec(['list', '--json'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const lines = result.notes?.filter((l) => l.length > 0) ?? [];
+    expect(lines).toHaveLength(1);
+    const parsed = JSON.parse(lines[0] ?? '{}') as { schemaVersion: string; sessionId: string };
+    expect(parsed.schemaVersion).toBe('mini-v1');
+    expect(parsed.sessionId).toBe(s.id);
+  });
+
+  test('/recap list --search filters in-memory on goal text', async () => {
+    const a = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: a.id,
+      role: 'user',
+      content: 'refactor queue retry',
+      createdAt: 1_100,
+    });
+    completeSession(db, a.id, 'done', 0, true, 2_000);
+    const b = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 3_000 });
+    appendMessage(db, {
+      sessionId: b.id,
+      role: 'user',
+      content: 'add tests for auth',
+      createdAt: 3_100,
+    });
+    completeSession(db, b.id, 'done', 0, true, 4_000);
+    const result = await recapCommand.exec(['list', '--search', 'queue'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    expect(text).toContain('refactor queue retry');
+    expect(text).not.toContain('add tests for auth');
+  });
+
+  test('/recap list --status filters by session status', async () => {
+    const a = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, { sessionId: a.id, role: 'user', content: 'finished', createdAt: 1_100 });
+    completeSession(db, a.id, 'done', 0, true, 2_000);
+    const b = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 3_000 });
+    appendMessage(db, { sessionId: b.id, role: 'user', content: 'errored', createdAt: 3_100 });
+    completeSession(db, b.id, 'error', 0, true, 4_000);
+    const result = await recapCommand.exec(['list', '--status', 'error'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    expect(text).toContain('errored');
+    expect(text).not.toContain('finished');
+  });
+
+  test('/recap list --since YYYY-MM-DD filters startedAt >= since', async () => {
+    const old = createSession(db, {
+      model: 'sonnet',
+      cwd: '/test/cwd',
+      startedAt: Date.UTC(2026, 0, 1, 0, 0, 0, 0),
+    });
+    appendMessage(db, {
+      sessionId: old.id,
+      role: 'user',
+      content: 'old',
+      createdAt: old.startedAt + 1,
+    });
+    completeSession(db, old.id, 'done', 0, true, old.startedAt + 100);
+    const recent = createSession(db, {
+      model: 'sonnet',
+      cwd: '/test/cwd',
+      startedAt: Date.UTC(2026, 4, 9, 0, 0, 0, 0),
+    });
+    appendMessage(db, {
+      sessionId: recent.id,
+      role: 'user',
+      content: 'recent',
+      createdAt: recent.startedAt + 1,
+    });
+    completeSession(db, recent.id, 'done', 0, true, recent.startedAt + 100);
+    const result = await recapCommand.exec(['list', '--since', '2026-05-01'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    expect(text).toContain('recent');
+    expect(text).not.toContain('old');
+  });
+
+  test('/recap list --project filters by cwd', async () => {
+    const a = createSession(db, { model: 'sonnet', cwd: '/proj/A', startedAt: 1_000 });
+    appendMessage(db, { sessionId: a.id, role: 'user', content: 'aaa', createdAt: 1_100 });
+    completeSession(db, a.id, 'done', 0, true, 2_000);
+    const b = createSession(db, { model: 'sonnet', cwd: '/proj/B', startedAt: 3_000 });
+    appendMessage(db, { sessionId: b.id, role: 'user', content: 'bbb', createdAt: 3_100 });
+    completeSession(db, b.id, 'done', 0, true, 4_000);
+    const result = await recapCommand.exec(['list', '--project', '/proj/A'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    expect(text).toContain('aaa');
+    expect(text).not.toContain('bbb');
+  });
+
+  test('/recap list rejects --since with invalid date', async () => {
+    const result = await recapCommand.exec(['list', '--since', 'tomorrow'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('invalid date');
+  });
+
+  test('/recap list rejects --status outside the allowed set', async () => {
+    const result = await recapCommand.exec(['list', '--status', 'mystery'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('--status must be one of');
+  });
+
+  test('/recap list rejects unknown flags', async () => {
+    const result = await recapCommand.exec(['list', '--unknown'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain("unknown flag '--unknown'");
+  });
+
+  test('/recap list returns empty result when filters match nothing', async () => {
+    const result = await recapCommand.exec(['list', '--status', 'error'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    expect(text).toContain('no sessions');
+  });
+
+  test('/recap list anonymizes $HOME paths in cwd/cwdLabel and goal (RECAP §6.2)', async () => {
+    const HOME = process.env.HOME ?? '';
+    if (HOME.length === 0 || !HOME.startsWith('/')) {
+      // Skip when the test runner has no real $HOME; the anon
+      // helper falls back to a sentinel that doesn't match the
+      // path we'd seed below.
+      return;
+    }
+    const s = createSession(db, { model: 'sonnet', cwd: `${HOME}/proj`, startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: `look at ${HOME}/proj/notes.md`,
+      createdAt: 1_100,
+    });
+    completeSession(db, s.id, 'done', 0, true, 2_000);
+    const result = await recapCommand.exec(['list', '--json'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    expect(text).toContain('~/proj');
+    expect(text).not.toContain(HOME);
+  });
+
+  test('/recap list redacts secret-shaped tokens in goal text (RECAP §6.2)', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'use sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz1234567890',
+      createdAt: 1_100,
+    });
+    completeSession(db, s.id, 'done', 0, true, 2_000);
+    const result = await recapCommand.exec(['list', '--json'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    expect(text).toContain('<redacted:');
+    expect(text).not.toContain('sk-ant-api03');
+  });
+
+  test('/recap list --since applies at SQL boundary (no silent drop after LIMIT)', async () => {
+    // Seed: 5 newer sessions (after --since) + 5 older (before).
+    // With --limit 3 and --since on a date between, the operator
+    // expects 3 newer (not 3 newest then drop those before --since
+    // and end up with fewer).
+    const may1 = Date.UTC(2026, 4, 1, 0, 0, 0, 0);
+    for (let i = 0; i < 5; i++) {
+      const s = createSession(db, {
+        model: 'sonnet',
+        cwd: '/test/cwd',
+        startedAt: may1 + 1_000 + i,
+      });
+      appendMessage(db, {
+        sessionId: s.id,
+        role: 'user',
+        content: `new-${i}`,
+        createdAt: s.startedAt + 1,
+      });
+      completeSession(db, s.id, 'done', 0, true, s.startedAt + 100);
+    }
+    for (let i = 0; i < 5; i++) {
+      const s = createSession(db, {
+        model: 'sonnet',
+        cwd: '/test/cwd',
+        startedAt: may1 - 10_000 - i,
+      });
+      appendMessage(db, {
+        sessionId: s.id,
+        role: 'user',
+        content: `old-${i}`,
+        createdAt: s.startedAt + 1,
+      });
+      completeSession(db, s.id, 'done', 0, true, s.startedAt + 100);
+    }
+    const result = await recapCommand.exec(
+      ['list', '--limit', '3', '--since', '2026-05-01', '--json'],
+      makeCtx(),
+    );
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const lines = result.notes?.filter((l) => l.length > 0) ?? [];
+    // 3 rows, all newer (no `old-` goals leaked through).
+    expect(lines).toHaveLength(3);
+    for (const line of lines) {
+      expect(line).not.toContain('old-');
+    }
+  });
+
+  test('/recap list --search caps after in-memory filter, fetch is bumped (no silent drop)', async () => {
+    // Seed: 5 sessions whose goals match "queue", interleaved with
+    // 10 that don't. With --limit 3 --search queue, operator
+    // expects 3 matching (not 3 newest filtered down).
+    for (let i = 0; i < 5; i++) {
+      const s = createSession(db, {
+        model: 'sonnet',
+        cwd: '/test/cwd',
+        startedAt: 1_000 + i * 2,
+      });
+      appendMessage(db, {
+        sessionId: s.id,
+        role: 'user',
+        content: `refactor queue retry ${i}`,
+        createdAt: s.startedAt + 1,
+      });
+      completeSession(db, s.id, 'done', 0, true, s.startedAt + 100);
+    }
+    for (let i = 0; i < 10; i++) {
+      const s = createSession(db, {
+        model: 'sonnet',
+        cwd: '/test/cwd',
+        startedAt: 2_000 + i * 2,
+      });
+      appendMessage(db, {
+        sessionId: s.id,
+        role: 'user',
+        content: `unrelated-${i}`,
+        createdAt: s.startedAt + 1,
+      });
+      completeSession(db, s.id, 'done', 0, true, s.startedAt + 100);
+    }
+    const result = await recapCommand.exec(
+      ['list', '--limit', '3', '--search', 'queue', '--json'],
+      makeCtx(),
+    );
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const lines = result.notes?.filter((l) => l.length > 0) ?? [];
+    expect(lines).toHaveLength(3);
+    for (const line of lines) {
+      expect(line).toContain('queue');
+    }
+  });
+
+  test('/recap list cache hit on second call (deterministic, no projection re-run)', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, { sessionId: s.id, role: 'user', content: 'do thing', createdAt: 1_100 });
+    completeSession(db, s.id, 'done', 0.04, true, 2_000);
+    // First call writes the cache row.
+    await recapCommand.exec(['list', '--json'], makeCtx());
+    // The cache row should now exist for this session id.
+    const rows = db.query<{ count: number }, []>('SELECT COUNT(*) AS count FROM recap_cache').get();
+    expect(rows?.count).toBe(1);
+    // Second call hits the cache (correctness assertion: same
+    // output bytes regardless of cache state).
+    const a = await recapCommand.exec(['list', '--json'], makeCtx());
+    const b = await recapCommand.exec(['list', '--json'], makeCtx());
+    expect(a.kind).toBe('ok');
+    expect(b.kind).toBe('ok');
+    if (a.kind !== 'ok' || b.kind !== 'ok') return;
+    expect(a.notes).toEqual(b.notes);
   });
 
   test('/recap terse LLM path: invalid-json falls back', async () => {

@@ -12,10 +12,13 @@
 
 import { homedir } from 'node:os';
 import { stripAnsi } from '../sanitize/ansi.ts';
+import type { RecapIntermediate } from './types.ts';
 
 // Common options for every renderer that emits human-facing text
-// (human, pr, changelog, slack, terse). The JSON renderer ignores
-// these — it always emits literal paths and never anonymizes.
+// (human, pr, changelog, slack, terse). The JSON renderer applies
+// `anonymizePaths` and `redactSecrets` selectively to free-text
+// fields via `redactSecretsInIntermediate` rather than at the
+// template boundary.
 export interface RenderOptions {
   // When true (default), absolute paths under `$HOME` are rewritten
   // to `~/...`. Disable for debugging or when consumed by tooling
@@ -23,6 +26,13 @@ export interface RenderOptions {
   anonymizePaths?: boolean;
   // Override `$HOME` for deterministic tests.
   home?: string;
+  // When set, the renderer prepends an "incomplete session" callout
+  // before the regular content. RECAP.md §10 anti-pattern: a recap
+  // over a non-terminal session must surface the partial-data
+  // status visibly so the operator does not act on it as if it
+  // were the final word. The slash command threads the value here
+  // from `intermediate.completeness` whenever `incomplete === true`.
+  incomplete?: { reason: string; sessionIds: readonly string[] };
 }
 
 const HOME_FALLBACK = '/home/__forja_test_home__';
@@ -125,3 +135,145 @@ export const oneLine = (s: string): string =>
     .map((part) => part.trim())
     .filter((part) => part.length > 0)
     .join('; ');
+
+// RECAP.md §6.2 — heuristic redaction of secret-shaped tokens.
+// Operating on the rendered text (commands, decision reasons,
+// summaries, etc.) catches the common leak vectors:
+//   - API keys pasted into bash commands or env exports
+//   - Bearer tokens in command lines
+//   - KEY=value pairs where the key name suggests sensitivity
+//
+// The patterns are intentionally narrow — false positives in a
+// recap (which an operator reads for review) are visible noise,
+// while false negatives leak secrets into PR descriptions and
+// Slack posts. Each pattern carries a label so the redacted output
+// names what was hidden, e.g. `<redacted:anthropic-key>`. This is a
+// best-effort defense, not a substitute for not-pasting-secrets;
+// the spec acknowledges this as heuristic.
+//
+// Patterns ordered most-specific first so a JWT does not get
+// caught by the more permissive Bearer rule, etc.
+interface SecretPattern {
+  readonly name: string;
+  readonly pattern: RegExp;
+  // When true, the pattern's first capturing group is preserved
+  // (typically the env-var key) so the operator sees what was
+  // redacted. When false, the entire match is replaced.
+  readonly preserveKey: boolean;
+}
+
+const SECRET_PATTERNS: readonly SecretPattern[] = [
+  // Anthropic API keys: `sk-ant-...`. Length is open-ended in
+  // practice (40+ alphanumerics with `_-`).
+  { name: 'anthropic-key', pattern: /sk-ant-[A-Za-z0-9_-]{20,}/g, preserveKey: false },
+  // OpenAI keys: `sk-...`, `sk-proj-...`. Negative lookahead
+  // excludes Anthropic-shaped keys (handled above).
+  { name: 'openai-key', pattern: /sk-(?!ant-)[A-Za-z0-9_-]{20,}/g, preserveKey: false },
+  // AWS access key IDs.
+  { name: 'aws-access-key', pattern: /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, preserveKey: false },
+  // GitHub fine-grained / PAT / OAuth / app tokens.
+  {
+    name: 'github-token',
+    pattern: /\b(?:ghp|ghs|gho|ghu|ghr|github_pat)_[A-Za-z0-9_]{20,}\b/g,
+    preserveKey: false,
+  },
+  // JWT shape: header.payload.signature, all base64url. Has to
+  // come BEFORE the bearer rule — a JWT after `Bearer` would
+  // otherwise get caught by the broader bearer pattern with a
+  // less informative label.
+  {
+    name: 'jwt',
+    pattern: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g,
+    preserveKey: false,
+  },
+  // `Bearer <token>` carrying anything that smells like a token.
+  {
+    name: 'bearer-token',
+    pattern: /\bBearer\s+[A-Za-z0-9._~+/=-]{20,}\b/g,
+    preserveKey: false,
+  },
+  // KEY=VALUE forms where the key name suggests a secret. Key
+  // is preserved so the operator knows what was redacted; value
+  // is replaced. Catches both `FOO_API_KEY=...` and inline
+  // `--api-key foo123`. Quoted values supported.
+  {
+    name: 'env-secret',
+    pattern:
+      /\b([A-Z][A-Z0-9_]*(?:API_KEY|APIKEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTH_KEY|PRIVATE_KEY))\s*=\s*['"]?([A-Za-z0-9_./+=:-]{8,})['"]?/g,
+    preserveKey: true,
+  },
+];
+
+export const redactSecrets = (text: string): string => {
+  if (text.length === 0) return text;
+  let result = text;
+  for (const { name, pattern, preserveKey } of SECRET_PATTERNS) {
+    if (preserveKey) {
+      result = result.replace(pattern, (_match, key) => `${key}=<redacted:${name}>`);
+    } else {
+      result = result.replace(pattern, `<redacted:${name}>`);
+    }
+  }
+  return result;
+};
+
+// Selective redaction over a `RecapIntermediate`. The JSON
+// renderer needs the same §6.2 privacy guarantee as the markdown
+// renderers, but a blanket deep-traversal would corrupt
+// structured fields (paths that happen to look like
+// `sk-anything-with-dashes` would be falsely matched if not
+// guarded). This helper visits only the well-known free-text
+// fields where leaked secrets actually land — commands, decision
+// reasons, summaries, prompts — and leaves IDs, paths, numbers,
+// and enum-shaped strings alone.
+//
+// Returns a structurally-equal copy with the same keys and a
+// `(...)' shape; the input intermediate is not mutated. This is
+// the "pure" boundary: every renderer downstream of this point
+// can assume free-text fields are already redacted, so they can
+// focus on layout.
+export const redactSecretsInIntermediate = (
+  intermediate: RecapIntermediate,
+): RecapIntermediate => ({
+  ...intermediate,
+  goal: { ...intermediate.goal, text: redactSecrets(intermediate.goal.text) },
+  completeness: {
+    ...intermediate.completeness,
+    incompleteReason: redactSecrets(intermediate.completeness.incompleteReason),
+  },
+  decisions: intermediate.decisions.map((d) => ({
+    ...d,
+    what: redactSecrets(d.what),
+    why: redactSecrets(d.why),
+  })),
+  actions: {
+    ...intermediate.actions,
+    filesWritten: intermediate.actions.filesWritten.map((f) => ({
+      ...f,
+      semanticSummary: redactSecrets(f.semanticSummary),
+    })),
+    commandsRun: intermediate.actions.commandsRun.map((c) => ({
+      ...c,
+      command: redactSecrets(c.command),
+    })),
+    subagentsSpawned: intermediate.actions.subagentsSpawned.map((s) => ({
+      ...s,
+      outputSummary: redactSecrets(s.outputSummary),
+    })),
+  },
+  outcomes: {
+    ...intermediate.outcomes,
+    testsRun: intermediate.outcomes.testsRun.map((t) => ({
+      ...t,
+      command: redactSecrets(t.command),
+    })),
+  },
+  timeline: intermediate.timeline.map((t) => ({ ...t, detail: redactSecrets(t.detail) })),
+  errors: intermediate.errors.map((e) => ({ ...e, summary: redactSecrets(e.summary) })),
+  notDone: intermediate.notDone.map((n) => ({
+    ...n,
+    what: redactSecrets(n.what),
+    reason: redactSecrets(n.reason),
+  })),
+  unresolvedQuestions: intermediate.unresolvedQuestions.map((q) => redactSecrets(q)),
+});

@@ -148,6 +148,14 @@ describe('renderTerseFromStructured', () => {
     expect(md).toBe('Did a thing.\n');
   });
 
+  test('prepends incomplete callout when option is set', () => {
+    const md = renderTerseFromStructured(
+      { schemaVersion: TERSE_SCHEMA_VERSION, sentence: 'Did a thing.' },
+      { incomplete: { reason: 'crash', sessionIds: ['sid-1'] } },
+    );
+    expect(md).toBe('> ⚠ Incomplete: crash (sid-1)\nDid a thing.\n');
+  });
+
   test('anonymizes paths in the sentence', () => {
     const md = renderTerseFromStructured(
       {

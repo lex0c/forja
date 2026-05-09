@@ -2,6 +2,11 @@
 
 **Goal:** extract computeBackoff from src/queue.ts into its own pure module with tests
 
+## Resumo
+
+- extract computeBackoff from src/queue.ts into its own pure module with tests
+- 3 files edited, 1 files read, 1 commands run, 1 checkpoint(s)
+
 ## What changed
 
 - 1 files read (1 reads total)

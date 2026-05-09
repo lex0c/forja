@@ -258,6 +258,23 @@ describe('renderSlackFromStructured', () => {
     expect(md).not.toContain('/home/lex');
   });
 
+  test('prepends incomplete callout when option is set', () => {
+    const md = renderSlackFromStructured(
+      {
+        schemaVersion: SLACK_SCHEMA_VERSION,
+        title: 'x',
+        durationLabel: '1s',
+        costLabel: '$0',
+        achievements: ['a'],
+        files: [],
+        decisions: [],
+      },
+      { incomplete: { reason: 'crash', sessionIds: ['sid-1'] } },
+    );
+    expect(md.startsWith('> ⚠ Incomplete: crash (sid-1)')).toBe(true);
+    expect(md).toContain('*x*');
+  });
+
   test('output ends with a single trailing newline', () => {
     const md = renderSlackFromStructured({
       schemaVersion: SLACK_SCHEMA_VERSION,

@@ -140,6 +140,14 @@ export interface ListSessionsOptions {
   limit?: number;
   cwd?: string;
   status?: SessionStatus;
+  // Inclusive lower bound on `started_at`. Used by `/recap list
+  // --since YYYY-MM-DD` so the SQL-side LIMIT does not silently
+  // drop matching older sessions when more recent unfiltered ones
+  // also exist. Without this, applying `--since` after fetching
+  // `LIMIT 20` newest-first would yield "20 newest then drop those
+  // before --since", surprising operators who expect "20 newest
+  // matching all filters".
+  startedAtMin?: number;
   // Default: only top-level sessions (parent_session_id IS NULL).
   // Set true to include children — useful for audit/debug listings.
   // The list-sessions CLI exposes this as `--include-subagents`.
@@ -157,6 +165,10 @@ export const listSessions = (db: DB, options: ListSessionsOptions = {}): Session
   if (options.status !== undefined) {
     filters.push('status = ?');
     params.push(options.status);
+  }
+  if (options.startedAtMin !== undefined) {
+    filters.push('started_at >= ?');
+    params.push(options.startedAtMin);
   }
   if (options.includeSubagents !== true) {
     // Filter on the IDENTITY flag (`is_subagent`), not on the FK

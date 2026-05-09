@@ -15,6 +15,141 @@ Format:
 
 ---
 
+## [2026-05-09] m4.2c-mini/recap — slice (c-mini): RecapMini + `/recap list`
+
+**Done:** Schema, projection, slash, and cache wiring for the
+`recap_mini` shape (RECAP §3.1). The picker / `--list-sessions
+--with-recap` consumers can now read structured per-session
+metadata in NDJSON or table form.
+
+| Piece | Files |
+|---|---|
+| `RecapMini` schema (15 fields per RECAP §3.1) + manual validator + JSON Schema literal | `src/recap/mini/schema.ts` |
+| `projectRecapMini(db, sessionId)` deterministic — reads sessions row + count(messages) + count(tool_calls in FILE_WRITER_TOOLS); ≤3 SQL queries; cheap enough to fan out per page-load. `oneLineSummary` follows the §3.1 literal: `"<status>: {N} steps, {M} files, <goal-truncated>"`. | `src/recap/mini/deterministic.ts` |
+| Cache wired via `recap_cache` (renderer label `'mini'`, output stores JSON of RecapMini); cache key derived from session-immutable identity (id + status + endedAt + costUsd + promptVersion). Recomputing the full intermediate to derive the key would defeat the purpose. | `src/storage/repos/recap-cache.ts` |
+| `/recap list [--limit N] [--project PATH] [--since YYYY-MM-DD] [--status STATUS] [--search QUERY] [--json] [--out PATH]` slash. SQL-side filtering via `listSessions` (cwd + status + limit); `--since` / `--search` apply in-memory after projection. | `src/cli/slash/commands/recap.ts` |
+| Tests: 15 mini-projection + validator tests, 4 cache-key tests, 11 slash tests covering each filter + JSON/table modes + cache hit. | `tests/recap/mini.test.ts`, `tests/storage/recap-cache.test.ts`, `tests/cli/slash/commands/recap.test.ts` |
+
+**Decisions:**
+- **Reuse `recap_cache` for mini rows**, not a new table. RECAP §3.1
+  says "cacheado em `recap_cache` (TTL 1h)". The `output` column is
+  TEXT; storing JSON of RecapMini works the same way as storing
+  markdown for the other renderers. Reader parses; writer
+  stringifies. `RecapCacheRenderer` union grows by one entry.
+- **Cache key for mini differs from the other renderers' content
+  hash.** Recomputing the full intermediate (sha256 over canonical
+  JSON of every action / decision / outcome) just to derive the
+  mini cache key would defeat the purpose of recap_mini being
+  cheap. The mini key hashes (sessionId, status, endedAt, costUsd,
+  promptVersion) — session-immutable identity that the
+  deterministic projection is a pure function of. Two sessions
+  with the same triple collide on key, which is correct.
+- **Running sessions are NOT cached.** The cache key includes
+  costUsd, which ticks up on every provider call mid-session, so
+  a running session would produce a different key on every read
+  → cache miss every time, plus row churn. Skip the write for
+  `status === 'running'`; the projection runs fresh and is still
+  cheap (~ms range).
+- **`/recap list` filters are split between SQL and in-memory.**
+  cwd / status / limit go through `listSessions` (existing repo
+  with indexes); `--since` and `--search` apply in-memory after
+  projection. The split is justified: search target is the
+  PROJECTED goal text (extracted by the mini projection), not
+  the raw message JSON, so it cannot be a SQL predicate without
+  re-implementing the projection in SQL.
+- **No audit row for `/recap list`.** `recap_runs.scope_kind`
+  CHECK constraint pins the vocabulary `(session_current,
+  session_specific, day, range, pre_compact)`; `list` is not a
+  recognized scope. Adding it would require a migration; for
+  c-mini the audit gap is acknowledged and tracked as a
+  follow-up. The list slash is read-only over already-audited
+  sessions, so the gap is not load-bearing.
+- **`hasErrors` field is `false` today** — `failure_events` is
+  not yet wired upstream (RECAP §3 schema-fields-blocked). The
+  field is in the schema so consumers (picker) can pin against
+  the shape; flipping it to honest values is a slice (a) of the
+  upstream `failure_events` work.
+
+**Pending (carry-overs from this slice):**
+- Stop-hook integration: pre-render `recap_mini` at session-end
+  so list reads are <50ms even for cold caches. Today the first
+  list call after a session ends pays the projection cost; later
+  calls hit the cache. The Stop hook would amortize the cost into
+  the session's natural finalization.
+- LLM-rendered `one_line_summary` (Haiku, ~$0.001 per session).
+  Today the deterministic template is the only path. The schema
+  field is the same regardless; bump promptVersion when the LLM
+  path lands.
+- Audit support for `/recap list` (extend `recap_runs.scope_kind`
+  CHECK + record list invocations with the matched session ids).
+
+**Next:** Slice (d) opens headless NDJSON
+(`agent --json /recap`) — destrava CI usage of the recap surface.
+
+---
+
+## [2026-05-09] m4.2c-quick/recap — slice (c-quick): spec compliance fixes (#5, #7, #4)
+
+**Done:** Three spec-compliance fixes that the audit against
+`docs/spec/RECAP.md` flagged as actively violated or missing.
+Closes the M4.2 LLM-render coverage of all five renderers.
+
+| # | Fix | Files |
+|---|---|---|
+| #7 | Heuristic secret redaction (RECAP §6.2). `redactSecrets(text)` matches Anthropic / OpenAI / AWS / GitHub / JWT / Bearer / `<KEY>=VALUE` shapes; replaces with `<redacted:<type>>`. Applied via the `text()` helper in every markdown template (human / pr / changelog / slack / terse) and via `redactSecretsInIntermediate(i)` on the json renderer's free-text fields. ANSI also stripped at the same boundary. | `src/recap/format.ts`, all 5 templates, `tests/recap/format.test.ts` |
+| #5 | Incomplete surfacing in pr / changelog / slack / terse / human. `RenderOptions.incomplete?: { reason, sessionIds }` threads from `intermediate.completeness` through both deterministic and LLM paths. Each template prepends `> ⚠ Incomplete: <reason> (<ids>)`. RECAP §10 anti-pattern violation closed. | All 5 templates + `cli/slash/commands/recap.ts`, eval runner, fixture-05 goldens regenerated |
+| #4 | `human` renderer ganha LLM-rendered `## Resumo` section (RECAP §4.1). New `src/recap/human/{schema,deterministic,template,llm,index}.ts` + `prompts/human-v1.ts`. `HumanRenderV1` carries only `summary: string[]` (1–5 bullets ≤ 200 chars); template injects `## Resumo` between `**Goal:**` and `## What changed`, then renders the existing deterministic sections. Added `human` to `LLM_RENDERER_DISPATCH` so default `/recap` routes through cache → LLM → fallback (operator opts out via `--no-llm-render`). | `src/recap/human/`, `src/cli/slash/commands/recap.ts`, `tests/recap/human-deterministic.test.ts`, `tests/recap/human-llm.test.ts`, all 5 human goldens regenerated |
+
+**Decisions:**
+- Secret patterns ordered most-specific first (anthropic-key
+  before openai-key before env-secret) so the redaction label
+  names the actual leak vector. False positives in a recap are
+  visible noise; false negatives leak secrets into PR
+  descriptions and Slack posts. Threshold: each pattern requires
+  ≥ 16 chars of high-entropy content to fire — `sk-foo` and
+  `/home/user/sk-something` are not touched.
+- ANSI stripping moved into the `text()` helper of every
+  template (already in `oneLine`, but bullets like the
+  deterministic Resumo never went through `oneLine`).
+  Defensive: any free-text field, regardless of source, is
+  cleaned at the renderer boundary.
+- Cache key for `human` works the same as for the other
+  renderers — content-hash of the intermediate (excluding
+  volatile `generatedAt`). Adding `human` does NOT change the
+  hash composition; `prompt_version='human-v1'` becomes part of
+  the key automatically and a future `human-v2` invalidates the
+  cache without an ad-hoc migration.
+- `## Resumo` is always emitted (even with deterministic
+  fallback's "No actions recorded for this scope" sentinel) so
+  the template never has a missing section. The spec example in
+  §4.1 shows the section unconditionally.
+- Slash dispatch grew from 4 to 5 LLM renderers. `isLlmRenderer`
+  now returns `true` for `human` too, which means `/recap`
+  (no args) routes through cache + provider by default. The
+  spec acknowledges this — §4.1 says Resumo is LLM-generated.
+  Operators on tight budgets pass `--no-llm-render`; cache hit
+  on the second call costs ~10ms.
+- The legacy `renderHuman` export from `render.ts` stays valid
+  (it now delegates to `renderHumanDeterministic`) so the eval
+  runner, render.test.ts, and any external caller keeps
+  working without changes.
+
+**Pending:** the c-quick slice closes 3 of 8 items from the
+audit. Still open in subsequent slices:
+- (c-mini) — `recap_mini` schema + Stop hook + `/recap list` + picker
+- (d) — headless NDJSON `agent --json /recap`
+- (e) — M4.3 cross-session (`/recap day`, `range`, `pre-compact`,
+  `--all-projects`) + 10 fixtures + consistency metric
+- (f) — auto-rehydrate consumer no `--resume`
+
+Plus 9 schema fields blocked in upstream subsystems (#12 from
+the audit) — those land when `failure_events`, `goal_stack`,
+`context_pins`, `web_fetch`, and git diff in projection ship.
+
+**Next:** Slice (c-mini) opens recap_mini + Stop hook + picker.
+
+---
+
 ## [2026-05-09] m4.2b/recap — slice (b) shipped: `changelog`, `slack`, `terse` renderers
 
 **Done:** Three new renderers reusing slice (a)'s LLM pipeline,

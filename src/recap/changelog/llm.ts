@@ -8,6 +8,7 @@
 // orchestration.
 
 import type { Provider } from '../../providers/types.ts';
+import type { RenderOptions } from '../format.ts';
 import {
   type RenderViaLlmFailureReason,
   type RenderViaLlmResult,
@@ -30,6 +31,7 @@ export interface RenderChangelogViaLlmInput {
   provider: Provider;
   promptVersion: string;
   maxTokens?: number;
+  templateOptions?: RenderOptions;
 }
 
 export type RenderChangelogViaLlmFailureReason = RenderViaLlmFailureReason;
@@ -49,7 +51,8 @@ export const renderChangelogViaLlm = async (
     jsonSchema: CHANGELOG_RENDER_V1_JSON_SCHEMA as unknown as Record<string, unknown>,
     validate: validateChangelogRenderV1,
     fidelityCheck: () => ({ ok: true, errors: [] }),
-    template: renderChangelogFromStructured,
+    template: (structured) =>
+      renderChangelogFromStructured(structured, input.templateOptions ?? {}),
     maxOutputLines: MAX_OUTPUT_LINES,
     ...(input.maxTokens !== undefined ? { maxTokens: input.maxTokens } : {}),
   });

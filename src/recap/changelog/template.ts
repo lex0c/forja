@@ -5,7 +5,8 @@
 // Within a category, entries preserve the order the projection /
 // LLM emitted them in.
 
-import { type RenderOptions, anonymizeText, resolveHome } from '../format.ts';
+import { stripAnsi } from '../../sanitize/ansi.ts';
+import { type RenderOptions, anonymizeText, redactSecrets, resolveHome } from '../format.ts';
 import {
   CHANGELOG_CATEGORIES,
   type ChangelogCategory,
@@ -31,10 +32,18 @@ export const renderChangelogFromStructured = (
 ): string => {
   const home = resolveHome(options.home);
   const anon = options.anonymizePaths !== false;
-  const text = (s: string): string => (anon ? anonymizeText(s, home) : s);
+  const text = (s: string): string =>
+    redactSecrets(anon ? anonymizeText(stripAnsi(s), home) : stripAnsi(s));
 
   const grouped = groupByCategory(structured.entries);
   const lines: string[] = [];
+
+  if (options.incomplete !== undefined) {
+    const ids = options.incomplete.sessionIds.join(', ');
+    lines.push(`> ⚠ Incomplete: ${redactSecrets(options.incomplete.reason)} (${ids})`);
+    lines.push('');
+  }
+
   for (const category of CHANGELOG_CATEGORIES) {
     const bucket = grouped.get(category);
     if (bucket === undefined || bucket.length === 0) continue;

@@ -18,7 +18,14 @@
 //
 // Empty `files` / `decisions` arrays omit their respective blocks.
 
-import { type RenderOptions, anonymize, anonymizeText, resolveHome } from '../format.ts';
+import { stripAnsi } from '../../sanitize/ansi.ts';
+import {
+  type RenderOptions,
+  anonymize,
+  anonymizeText,
+  redactSecrets,
+  resolveHome,
+} from '../format.ts';
 import type { SlackRenderV1 } from './schema.ts';
 
 export const renderSlackFromStructured = (
@@ -28,9 +35,16 @@ export const renderSlackFromStructured = (
   const home = resolveHome(options.home);
   const anon = options.anonymizePaths !== false;
   const path = (p: string): string => (anon ? anonymize(p, home) : p);
-  const text = (s: string): string => (anon ? anonymizeText(s, home) : s);
+  const text = (s: string): string =>
+    redactSecrets(anon ? anonymizeText(stripAnsi(s), home) : stripAnsi(s));
 
   const lines: string[] = [];
+
+  if (options.incomplete !== undefined) {
+    const ids = options.incomplete.sessionIds.join(', ');
+    lines.push(`> ⚠ Incomplete: ${redactSecrets(options.incomplete.reason)} (${ids})`);
+    lines.push('');
+  }
 
   lines.push(`*${text(structured.title)}* (${structured.durationLabel}, ${structured.costLabel})`);
   lines.push('');

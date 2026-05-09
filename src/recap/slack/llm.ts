@@ -5,6 +5,7 @@
 // renderer has against hallucination).
 
 import type { Provider } from '../../providers/types.ts';
+import type { RenderOptions } from '../format.ts';
 import {
   type RenderViaLlmFailureReason,
   type RenderViaLlmResult,
@@ -27,6 +28,7 @@ export interface RenderSlackViaLlmInput {
   provider: Provider;
   promptVersion: string;
   maxTokens?: number;
+  templateOptions?: RenderOptions;
 }
 
 export type RenderSlackViaLlmFailureReason = RenderViaLlmFailureReason;
@@ -55,7 +57,7 @@ export const renderSlackViaLlm = async (
       });
       return { ok: errors.length === 0, errors };
     },
-    template: renderSlackFromStructured,
+    template: (structured) => renderSlackFromStructured(structured, input.templateOptions ?? {}),
     maxOutputLines: MAX_OUTPUT_LINES,
     ...(input.maxTokens !== undefined ? { maxTokens: input.maxTokens } : {}),
   });
