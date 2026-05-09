@@ -29,6 +29,28 @@ describe('matchPath', () => {
     expect(matchPath('src/**', '/etc/passwd', CWD)).toBe(false);
   });
 
+  test('backslash-escaped wildcards in path patterns match literally (Bun.Glob honors escape)', () => {
+    // Pinning Bun.Glob's behavior — matchPath uses Bun.Glob
+    // directly (NOT the regex compiler used by matchCommand /
+    // matchHost), so the session-allow bridge's
+    // escapeGlobMetacharacters is only safe to apply to fs.*
+    // promotion targets if Bun.Glob ALSO honors `\\*` / `\\?` /
+    // `\\\\` as literal escapes. Empirically verified at the
+    // version Bun shipped against this branch; without this pin
+    // a future Bun upgrade that changed the escape semantics
+    // would silently break fs session-allow promotions for
+    // paths containing literal `*` / `?` / `\\`.
+    expect(matchPath('foo\\*bar', '/proj/foo*bar', CWD)).toBe(true);
+    expect(matchPath('foo\\*bar', '/proj/fooXbar', CWD)).toBe(false);
+    expect(matchPath('foo\\?bar', '/proj/foo?bar', CWD)).toBe(true);
+    expect(matchPath('foo\\?bar', '/proj/fooXbar', CWD)).toBe(false);
+    expect(matchPath('foo\\\\bar', '/proj/foo\\bar', CWD)).toBe(true);
+    // Mixed: literal `*` followed by wildcard `*` (the `.ts` part
+    // is a wildcard that matches anything ending in `.ts`).
+    expect(matchPath('src/foo\\*.ts', '/proj/src/foo*.ts', CWD)).toBe(true);
+    expect(matchPath('src/foo\\*.ts', '/proj/src/fooBAR.ts', CWD)).toBe(false);
+  });
+
   test('absolute pattern matches absolute target outside cwd', () => {
     expect(matchPath('/etc/**', '/etc/passwd', CWD)).toBe(true);
   });
