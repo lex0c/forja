@@ -292,6 +292,29 @@ describe('containsShellInjection', () => {
     expect(containsShellInjection('echo a\\&b')).toBe(false);
   });
 
+  test('backslash inside single quotes is literal — does NOT consume the closing quote', () => {
+    // Bash single quotes preserve every character verbatim,
+    // including backslash. The previous scanner unconditionally
+    // consumed `\\` + next char, so `'\\'` was treated as
+    // `'\` + skip — leaving inSingle stuck at true and silently
+    // hiding the closing `'` and any following separator.
+    // Concrete bypass: `echo '\\'; rm -rf /tmp/pwn` is a real
+    // compound (literal-backslash-string, then `;` separator,
+    // then a destructive command). Must flag.
+    expect(containsShellInjection("echo '\\'; rm -rf /tmp/pwn")).toBe(true);
+    expect(containsShellInjection("echo '\\' && rm")).toBe(true);
+    // Multiple backslashes inside single quote — same property.
+    expect(containsShellInjection("echo '\\\\\\\\' ; pwd")).toBe(true);
+    // Counter-test: backslash-then-non-quote inside single quote
+    // doesn't make us flag spuriously. The single quote stays
+    // closed where it should.
+    expect(containsShellInjection("echo 'a\\b'")).toBe(false);
+    expect(containsShellInjection("echo 'a\\nb'")).toBe(false);
+    // Backslash-escape outside single quotes still works (escaped
+    // metachars don't flag).
+    expect(containsShellInjection('echo a\\;b')).toBe(false);
+  });
+
   test('newline as command separator flags', () => {
     // Bash treats `\n` like `;`. The matcher compiles glob `*` to
     // regex `.*` with dotAll, so an allow pattern like

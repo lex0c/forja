@@ -532,6 +532,25 @@ describe('compound command guard (shell injection defense)', () => {
     }
   });
 
+  test("backslash inside single quotes does not hide the closing ' (compound flagged)", () => {
+    // Reported bypass: `echo '\\'; rm -rf /tmp/pwn` is a valid
+    // bash compound — single-quoted literal backslash, then `;`
+    // separator, then destructive command. The matcher used to
+    // consume `\\` + the closing `'` as an escape pair, leaving
+    // inSingle stuck at true and silently treating the rest as
+    // still-quoted. Allow `echo *` would match the entire
+    // compound and silently authorize the chained `rm -rf`.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['echo *'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: "echo '\\'; rm -rf /tmp/pwn" });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') {
+      expect(d.reason).toContain('compound shell command');
+    }
+  });
+
   test('>&word (legacy bash redirect) forces confirm even when allow matches the host command', () => {
     // Reported bypass: `git diff --name-only >&/tmp/out` matches
     // an allow `git diff --*` because the matcher's `*` resolves

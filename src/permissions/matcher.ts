@@ -156,14 +156,25 @@ export const containsShellInjection = (command: string): boolean => {
   while (i < command.length) {
     const c = command[i];
     if (c === undefined) break;
-    // Backslash escape: skip the next char (works in unquoted +
-    // double-quoted contexts; single-quotes don't honor backslash
-    // — but inside single quotes we're not checking metachars
-    // anyway, so the over-skip is harmless). Covers the standard
-    // bash line-continuation `\\\n` — the newline gets skipped,
-    // joined command continues. Also handles `\\>` / `\\<` —
-    // escaped redirect operators are literal, not metachars.
-    if (c === '\\' && i + 1 < command.length) {
+    // Backslash escape: skip the next char ONLY in unquoted /
+    // double-quoted contexts. Inside single quotes bash does NOT
+    // honor backslash escapes — `\\` is a literal backslash and
+    // the next char retains its normal meaning, including the
+    // closing `'`. Without the `!inSingle` guard, the scanner
+    // unconditionally consumes `\\` + closing `'`, leaves
+    // inSingle stuck at true, and lets the rest of the command
+    // (including `;`, `&`, `|`) scan as if still quoted.
+    // Concrete bypass: `echo '\\'; rm -rf /tmp/pwn` is a real
+    // compound — bash sees `'\\'` as a single-quoted literal
+    // backslash, then `;` as a separator. Without this guard the
+    // matcher treats everything after `\\` as still inside the
+    // single quote and returns false.
+    //
+    // Covers the standard bash line-continuation `\\\n` — the
+    // newline gets skipped, joined command continues. Also
+    // handles `\\>` / `\\<` — escaped redirect operators are
+    // literal, not metachars.
+    if (c === '\\' && !inSingle && i + 1 < command.length) {
       i += 2;
       continue;
     }

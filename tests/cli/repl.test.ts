@@ -1479,6 +1479,107 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('confirmPermission session-allow on a glob/grep catch-all rule with implicit cwd derives from req.cwd', async () => {
+    // glob has no `path` arg and grep's `path` is optional — when
+    // either is omitted the engine treats req.cwd as the search
+    // root. derivePromotionTarget must follow the same fallback,
+    // otherwise a catch-all matched rule (`*`/`**`) ends up with
+    // no promotion target and the bridge silently no-ops on
+    // session-allow despite the modal label promising "don't
+    // ask again".
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'glob',
+      // No `cwd` arg — engine falls back to req.cwd as the
+      // search root.
+      args: { pattern: '**/*.ts' },
+      cwd: '/proj',
+      prompt: 'matched confirm rule: **',
+      source: {
+        layer: 'project',
+        rule: '**',
+        section: 'glob',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    // Promotion uses the request cwd since args.cwd is absent
+    // and the matched rule is catch-all.
+    expect(sessionAllowCalls).toEqual([{ section: 'glob', pattern: '/proj' }]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow on grep without args.path also derives from req.cwd', async () => {
+    // Symmetric case: grep's `path` arg is optional, omitted
+    // means search session cwd. Promotion follows.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'grep',
+      args: { pattern: 'TODO' },
+      cwd: '/proj',
+      prompt: 'matched confirm rule: *',
+      source: {
+        layer: 'project',
+        rule: '*',
+        section: 'grep',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    expect(sessionAllowCalls).toEqual([{ section: 'grep', pattern: '/proj' }]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('confirmPermission session-allow on a deliberately broad rule (e.g. "rm *") still promotes the rule', async () => {
     // The catch-all override is scoped to `*` and `**` only —
     // operator-authored patterns like `rm *` express intentional

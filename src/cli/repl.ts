@@ -121,20 +121,35 @@ const isCatchAllPattern = (pattern: string): boolean => CATCH_ALL_PATTERNS.has(p
 //     session rules are matched against the command via glob, so
 //     promoting the literal as the pattern means future calls
 //     with the same command shape match.
-//   - read_file / write_file / edit_file / grep: args.path.
-//     Promoted as an `allow_paths` entry; future calls against
-//     the same path match.
-//   - glob: args.cwd (the search root, since glob has no `path`).
+//   - read_file / write_file / edit_file: args.path. Promoted as
+//     an `allow_paths` entry; future calls against the same path
+//     match.
+//   - grep: args.path when set, otherwise the request cwd. The
+//     engine's resolveFsTarget treats absent args.path as "search
+//     the session cwd"; the promotion mirrors that effective root.
+//   - glob: args.cwd when set, otherwise the request cwd. Same
+//     reason as grep — glob has no `path` arg, and resolveFsTarget
+//     falls back to session cwd when args.cwd is absent.
 //   - fetch_url: args.url's hostname. Promoted as an `allow_hosts`
 //     entry; future calls to any URL on the same host match.
 //
+// The cwd fallback for glob/grep matters specifically when an
+// operator's policy uses a catch-all rule (`*`/`**`) and the
+// agent invokes glob/grep without args.cwd/args.path: derivation
+// falls through to args (catch-all override), finds nothing,
+// returns undefined, and the bridge can't promote — operator who
+// clicked "Yes, don't ask again" gets re-prompted on every
+// identical call. Deriving from the request cwd closes that
+// no-op path.
+//
 // Returns undefined when the args don't carry the expected field
-// (or it's not a non-empty string). Bridge guards on undefined to
-// fall back to one-shot allow.
+// AND no fallback applies. Bridge guards on undefined to fall
+// back to one-shot allow.
 const derivePromotionTarget = (
   section: keyof PolicyToolsSection,
   args: Record<string, unknown>,
   matchedRule: string | undefined,
+  cwd: string,
 ): string | undefined => {
   if (matchedRule !== undefined && matchedRule.length > 0 && !isCatchAllPattern(matchedRule)) {
     return matchedRule;
@@ -146,14 +161,19 @@ const derivePromotionTarget = (
     }
     case 'read_file':
     case 'write_file':
-    case 'edit_file':
-    case 'grep': {
+    case 'edit_file': {
       const v = args.path;
       return typeof v === 'string' && v.length > 0 ? v : undefined;
     }
+    case 'grep': {
+      const v = args.path;
+      if (typeof v === 'string' && v.length > 0) return v;
+      return cwd.length > 0 ? cwd : undefined;
+    }
     case 'glob': {
       const v = args.cwd;
-      return typeof v === 'string' && v.length > 0 ? v : undefined;
+      if (typeof v === 'string' && v.length > 0) return v;
+      return cwd.length > 0 ? cwd : undefined;
     }
     case 'fetch_url': {
       const v = args.url;
@@ -1075,7 +1095,12 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       req.source?.section !== undefined &&
       isPolicySectionKey(req.source.section)
     ) {
-      sessionAllowTarget = derivePromotionTarget(req.source.section, req.args, req.source.rule);
+      sessionAllowTarget = derivePromotionTarget(
+        req.source.section,
+        req.args,
+        req.source.rule,
+        req.cwd,
+      );
     }
     if (req.subagent !== undefined) {
       command = sanitizeForSubagentDisplay(command);
