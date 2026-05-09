@@ -282,6 +282,89 @@ describe('runRecapHeadless — list passthrough', () => {
   });
 });
 
+describe('runRecapHeadless — privacy + cwd guard', () => {
+  test('--json mode redacts secret-shaped tokens in recap_intermediate event (B1)', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      // Anthropic-shaped key in the goal text — must be redacted
+      // in the NDJSON intermediate, not just in the rendered output.
+      content: 'use sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz1234567890',
+      createdAt: 1_100,
+    });
+    completeSession(db, s.id, 'done', 0, true, 2_000);
+    await runRecapHeadless({
+      args: ['session', s.id],
+      json: true,
+      dbOverride: db,
+      provider: stubProvider(),
+      out,
+      err,
+    });
+    expect(stdout).toContain('<redacted:');
+    expect(stdout).not.toContain('sk-ant-api03');
+  });
+
+  test('day scope filters by ctx cwd by default (B2 — privacy guard)', async () => {
+    // Two same-day sessions, different cwds. Without --all-projects,
+    // headless must filter to the supplied cwd. Without the fix,
+    // the stub baseConfig had no cwd and the projection dropped
+    // the filter silently, fanning out cross-project.
+    const may1 = Date.UTC(2026, 4, 1, 0, 0, 0, 0);
+    const a = createSession(db, { model: 'sonnet', cwd: '/proj/here', startedAt: may1 });
+    appendMessage(db, { sessionId: a.id, role: 'user', content: 'in-proj', createdAt: may1 + 1 });
+    completeSession(db, a.id, 'done', 0, true, may1 + 100);
+    const b = createSession(db, { model: 'sonnet', cwd: '/proj/other', startedAt: may1 + 200 });
+    appendMessage(db, {
+      sessionId: b.id,
+      role: 'user',
+      content: 'cross-proj',
+      createdAt: may1 + 201,
+    });
+    completeSession(db, b.id, 'done', 0, true, may1 + 300);
+    await runRecapHeadless({
+      args: ['json', 'day', '2026-05-01'],
+      json: false,
+      dbOverride: db,
+      provider: stubProvider(),
+      cwd: '/proj/here',
+      out,
+      err,
+    });
+    // The JSON renderer's intermediate.scope.sessionIds shows
+    // ONLY the in-proj session.
+    const parsed = JSON.parse(stdout) as { scope: { sessionIds: string[] } };
+    expect(parsed.scope.sessionIds).toEqual([a.id]);
+  });
+
+  test('day scope --all-projects fans out across cwds (counterpart to B2)', async () => {
+    const may1 = Date.UTC(2026, 4, 1, 0, 0, 0, 0);
+    const a = createSession(db, { model: 'sonnet', cwd: '/proj/here', startedAt: may1 });
+    appendMessage(db, { sessionId: a.id, role: 'user', content: 'in-proj', createdAt: may1 + 1 });
+    completeSession(db, a.id, 'done', 0, true, may1 + 100);
+    const b = createSession(db, { model: 'sonnet', cwd: '/proj/other', startedAt: may1 + 200 });
+    appendMessage(db, {
+      sessionId: b.id,
+      role: 'user',
+      content: 'cross-proj',
+      createdAt: may1 + 201,
+    });
+    completeSession(db, b.id, 'done', 0, true, may1 + 300);
+    await runRecapHeadless({
+      args: ['json', 'day', '2026-05-01', '--all-projects'],
+      json: false,
+      dbOverride: db,
+      provider: stubProvider(),
+      cwd: '/proj/here',
+      out,
+      err,
+    });
+    const parsed = JSON.parse(stdout) as { scope: { sessionIds: string[] } };
+    expect(parsed.scope.sessionIds.sort()).toEqual([a.id, b.id].sort());
+  });
+});
+
 describe('runRecapHeadless — LLM path with stub provider', () => {
   // Provider that DOES support constrained generation and returns
   // a valid PrRenderV1 payload — simulates a successful LLM render.

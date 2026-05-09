@@ -243,6 +243,19 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         return out;
       }
 
+      case 'resume_rehydrate_failed':
+        // Auto-rehydrate skipped due to a projection / DB error.
+        // Resume itself proceeded; the operator just doesn't get
+        // the `[resume_context]` block this time. Surface as
+        // `warn` (not `error`) — the session is functional, the
+        // diagnostic is informational.
+        out.push({
+          type: 'warn',
+          ts,
+          message: `auto-rehydrate skipped: ${event.reason} (resume continues without the [resume_context] block)`,
+        });
+        return out;
+
       case 'step_start': {
         state.steps = event.stepN;
         out.push({

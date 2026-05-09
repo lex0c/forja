@@ -20,6 +20,7 @@
 import type { HarnessConfig } from '../harness/index.ts';
 import { createRegistry } from '../providers/registry.ts';
 import type { Provider } from '../providers/types.ts';
+import { redactSecretsInIntermediate } from '../recap/format.ts';
 import type { DB } from '../storage/db.ts';
 import { openDb } from '../storage/db.ts';
 import { migrate } from '../storage/migrate.ts';
@@ -27,7 +28,7 @@ import { defaultDbPath } from '../storage/paths.ts';
 import { createBus } from '../tui/bus.ts';
 import { createFocusStack } from '../tui/focus-stack.ts';
 import { createModalManager } from '../tui/modal-manager.ts';
-import { recapCommand, runRecapList, runRecapSession } from './slash/commands/recap.ts';
+import { runRecapList, runRecapSession } from './slash/commands/recap.ts';
 import type { SlashContext } from './slash/types.ts';
 
 export interface RunRecapHeadlessOptions {
@@ -59,6 +60,15 @@ export interface RunRecapHeadlessOptions {
   // `agent recap` (no `session <id>`) errors with "no active
   // session". Tests can override to drive `session_current`.
   currentSessionId?: () => string | null;
+  // Operator's cwd at invocation time. Used by `day` / `range`
+  // scopes to filter same-cwd sessions when `--all-projects` is
+  // absent (RECAP §6.1 cross-project opt-in). Defaults to
+  // `process.cwd()` when not supplied; tests pin a fixture path.
+  // Without this, the headless stub HarnessConfig has no `cwd`
+  // and the projection silently drops the cwd filter — fanning
+  // out cross-project even though the operator did not pass
+  // `--all-projects`.
+  cwd?: string;
 }
 
 const buildHeadlessContext = (options: RunRecapHeadlessOptions, db: DB): SlashContext => {
@@ -74,12 +84,13 @@ const buildHeadlessContext = (options: RunRecapHeadlessOptions, db: DB): SlashCo
   });
   const focusStack = createFocusStack();
   const now = options.now ?? Date.now;
-  // Minimal HarnessConfig — only `provider` is used by the recap
-  // pipeline; every other field is filled with safe defaults so
-  // the type-checker is satisfied without mocking the full config.
-  // Cast through `unknown` mirrors the test pattern in
-  // `tests/cli/slash/commands/recap.test.ts`.
-  const baseConfig = { provider: options.provider } as unknown as HarnessConfig;
+  // Minimal HarnessConfig — `provider` drives the LLM render
+  // path; `cwd` drives the cwd filter for `day` / `range` scopes
+  // (RECAP §6.1: without an explicit cwd here, the projection
+  // would silently drop the filter and fan out cross-project,
+  // bypassing the `--all-projects` opt-in guard).
+  const cwd = options.cwd ?? process.cwd();
+  const baseConfig = { provider: options.provider, cwd } as unknown as HarnessConfig;
   return {
     baseConfig,
     db,
@@ -138,14 +149,23 @@ export const runRecapHeadless = async (options: RunRecapHeadlessOptions): Promis
     }
 
     if (options.json) {
+      // §6.2 privacy guarantee: the `recap_intermediate` event
+      // carries the full structured shape, which would leak raw
+      // `$HOME/...` paths and secret-shaped tokens (e.g.,
+      // `sk-ant-...` pasted into a goal text). The slash json
+      // renderer applies the same redaction pass via
+      // `renderJson`; the headless NDJSON envelope MUST do the
+      // same. The rendered output (`recap_render`) is already
+      // redacted by its template, so it stays untouched.
+      const redactedIntermediate = redactSecretsInIntermediate(result.intermediate);
       writeNdjsonLine(options.out, {
         type: 'recap_start',
-        scope: result.intermediate.scope,
+        scope: redactedIntermediate.scope,
         ts: startTs,
       });
       writeNdjsonLine(options.out, {
         type: 'recap_intermediate',
-        data: result.intermediate,
+        data: redactedIntermediate,
       });
       writeNdjsonLine(options.out, {
         type: 'recap_render',
@@ -177,7 +197,3 @@ export const runRecapHeadless = async (options: RunRecapHeadlessOptions): Promis
     if (ownsDb) db.close();
   }
 };
-
-// Re-exported so `cli/run.ts` does not have to learn about every
-// internal helper.
-export { recapCommand };

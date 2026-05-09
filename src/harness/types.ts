@@ -49,6 +49,18 @@ export type HarnessEvent =
       truncated: boolean;
       degraded: boolean;
     }
+  | {
+      // Emitted when the auto-rehydrate path threw mid-projection
+      // (corrupt audit log, missing session, etc.) and the harness
+      // fell back to an unrehydrated prompt. The operator's resume
+      // proceeds — auto-rehydrate is defense-in-depth, not a
+      // correctness path — but the diagnostic surfaces so the
+      // operator knows the `[resume_context]` block they expected
+      // is missing and why.
+      type: 'resume_rehydrate_failed';
+      sessionId: string;
+      reason: string;
+    }
   | { type: 'step_start'; stepN: number }
   | { type: 'provider_event'; event: StreamEvent }
   | {

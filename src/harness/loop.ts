@@ -1378,10 +1378,20 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
               degraded: block.degraded,
             });
           }
-        } catch {
+        } catch (e) {
           // Don't let rehydrate failure break resume. The plain
           // prompt still works; auto-rehydrate is defense-in-
-          // depth, not a correctness path.
+          // depth, not a correctness path. Emit a diagnostic so
+          // the operator sees WHY their `[resume_context]` block
+          // is missing — silently swallowing would leave them
+          // wondering whether the spec's §7.6 promise was even
+          // attempted.
+          const reason = e instanceof Error ? e.message : String(e);
+          safeEmit(config.onEvent, {
+            type: 'resume_rehydrate_failed',
+            sessionId,
+            reason,
+          });
         }
       }
 

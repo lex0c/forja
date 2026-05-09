@@ -208,6 +208,11 @@ export const run = async (options: RunOptions): Promise<number> => {
         ...(options.bootstrapOverride?.dbPath !== undefined
           ? { dbPath: options.bootstrapOverride.dbPath }
           : {}),
+        // `cwd` drives the day/range cwd filter (RECAP §6.1
+        // privacy guard). Honors a bootstrap override when tests
+        // pin a fixture path; falls back to `process.cwd()` in
+        // production.
+        cwd: options.bootstrapOverride?.cwd ?? process.cwd(),
         provider: headlessProvider,
         out: (s) => process.stdout.write(s),
         err: errSink,
