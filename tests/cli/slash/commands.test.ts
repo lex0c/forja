@@ -13,10 +13,12 @@ import { subagentsCommand } from '../../../src/cli/slash/commands/subagents.ts';
 import type { SlashCommand, SlashContext } from '../../../src/cli/slash/types.ts';
 import type { HarnessConfig } from '../../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../../src/harness/types.ts';
+import { createPermissionEngine } from '../../../src/permissions/index.ts';
 import { createRegistry as createModelRegistry } from '../../../src/providers/registry.ts';
 import { openMemoryDb } from '../../../src/storage/db.ts';
 import { migrate } from '../../../src/storage/migrate.ts';
 import { createSession } from '../../../src/storage/repos/sessions.ts';
+import { createToolRegistry } from '../../../src/tools/registry.ts';
 import { createBus } from '../../../src/tui/bus.ts';
 import { createFocusStack } from '../../../src/tui/focus-stack.ts';
 import { createModalManager } from '../../../src/tui/modal-manager.ts';
@@ -1263,5 +1265,212 @@ describe('/perms', () => {
     });
     expect(lines[0]).toBe('policy: mode=acceptEdits');
     expect(lines.some((l) => l.includes('default-deny in strict mode'))).toBe(false);
+  });
+});
+
+describe('/perms why', () => {
+  // Build a ctx with a real permission engine + tool registry so the
+  // dry-check exercises the full path (engine.check + source
+  // population). Stubs the bare minimum of Tool — only `metadata`
+  // matters for the dispatch (category drives args shape; name
+  // drives lookup).
+  const buildCtx = (
+    policy: Parameters<typeof createPermissionEngine>[0],
+    tools: Array<{ name: string; category: string }>,
+    provenance?: Parameters<typeof createPermissionEngine>[1]['provenance'],
+  ): SlashContext => {
+    const ctx = makeCtx();
+    const engineOpts: Parameters<typeof createPermissionEngine>[1] = { cwd: '/proj' };
+    if (provenance !== undefined) engineOpts.provenance = provenance;
+    const engine = createPermissionEngine(policy, engineOpts);
+    const registry = createToolRegistry();
+    for (const t of tools) {
+      registry.register({
+        name: t.name,
+        description: 'test',
+        input_schema: { type: 'object' as const, properties: {} },
+        // biome-ignore lint/suspicious/noExplicitAny: stub — only metadata.category is consulted by /perms why
+        metadata: { category: t.category as any, writes: false },
+        execute: async () => ({ content: '' }),
+      } as unknown as Parameters<typeof registry.register>[0]);
+    }
+    (ctx.baseConfig as { permissionEngine: unknown }).permissionEngine = engine;
+    (ctx.baseConfig as { toolRegistry: unknown }).toolRegistry = registry;
+    return ctx;
+  };
+
+  test('rejects /perms why with no tool name', async () => {
+    const ctx = buildCtx({ defaults: { mode: 'strict' }, tools: {} }, []);
+    const result = await permsCommand.exec(['why'], ctx);
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('missing tool name');
+  });
+
+  test('rejects unknown tool', async () => {
+    const ctx = buildCtx({ defaults: { mode: 'strict' }, tools: {} }, []);
+    const result = await permsCommand.exec(['why', 'bogus'], ctx);
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain("unknown tool 'bogus'");
+  });
+
+  test('bash with no command surfaces a usage example', async () => {
+    const ctx = buildCtx({ defaults: { mode: 'strict' }, tools: {} }, [
+      { name: 'bash', category: 'bash' },
+    ]);
+    const result = await permsCommand.exec(['why', 'bash'], ctx);
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('missing command');
+    expect(result.message).toContain('npm test');
+  });
+
+  test('bash allow rule renders decision + rule + layer + section', async () => {
+    const ctx = buildCtx(
+      { defaults: { mode: 'strict' }, tools: { bash: { allow: ['npm test*'] } } },
+      [{ name: 'bash', category: 'bash' }],
+      { defaults: 'project', bash: 'project' },
+    );
+    const result = await permsCommand.exec(['why', 'bash', 'npm', 'test', '--watch'], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    const text = (result.notes ?? []).join('\n');
+    // Header echoes the input verbatim so scrollback is greppable.
+    expect(text).toContain('/perms why bash npm test --watch');
+    expect(text).toContain('decision: allow');
+    expect(text).toContain('rule:     npm test*');
+    expect(text).toContain('layer:    project policy');
+    expect(text).toContain('section:  bash');
+  });
+
+  test('bash deny rule renders deny decision', async () => {
+    const ctx = buildCtx(
+      { defaults: { mode: 'strict' }, tools: { bash: { deny: ['rm -rf *'] } } },
+      [{ name: 'bash', category: 'bash' }],
+      { defaults: 'project', bash: 'enterprise' },
+    );
+    const result = await permsCommand.exec(['why', 'bash', 'rm', '-rf', '/'], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    const text = (result.notes ?? []).join('\n');
+    expect(text).toContain('decision: deny');
+    expect(text).toContain('rule:     rm -rf *');
+    expect(text).toContain('layer:    enterprise policy');
+  });
+
+  test('bash confirm rule includes the prompt line', async () => {
+    const ctx = buildCtx(
+      { defaults: { mode: 'strict' }, tools: { bash: { confirm: ['git push *'] } } },
+      [{ name: 'bash', category: 'bash' }],
+      { defaults: 'project', bash: 'project' },
+    );
+    const result = await permsCommand.exec(['why', 'bash', 'git', 'push', 'origin', 'main'], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    const text = (result.notes ?? []).join('\n');
+    expect(text).toContain('decision: confirm');
+    expect(text).toContain('prompt:   Run bash: git push origin main');
+    expect(text).toContain('rule:     git push *');
+  });
+
+  test('default-deny renders without rule but with layer + section', async () => {
+    // Bash section exists in project layer but no rule matches.
+    // Operator's takeaway: edit project YAML's bash section to add
+    // an allow rule.
+    const ctx = buildCtx(
+      { defaults: { mode: 'strict' }, tools: { bash: { allow: ['ls *'] } } },
+      [{ name: 'bash', category: 'bash' }],
+      { defaults: 'project', bash: 'project' },
+    );
+    const result = await permsCommand.exec(['why', 'bash', 'whoami'], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    const text = (result.notes ?? []).join('\n');
+    expect(text).toContain('decision: deny');
+    expect(text).toContain('layer:    project policy');
+    expect(text).toContain('section:  bash');
+    // No rule line when nothing matched.
+    expect(text).not.toMatch(/^\s*rule:/m);
+  });
+
+  test('layer="default" renders as "built-in default"', async () => {
+    // No layer wrote any section AND no provenance passed —
+    // engine falls back to default everywhere.
+    const ctx = buildCtx(
+      { defaults: { mode: 'strict' }, tools: { bash: { deny: ['rm *'] } } },
+      [{ name: 'bash', category: 'bash' }],
+      // No provenance: every source.layer collapses to 'default'.
+    );
+    const result = await permsCommand.exec(['why', 'bash', 'rm', '-rf', '/'], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    const text = (result.notes ?? []).join('\n');
+    expect(text).toContain('layer:    built-in default');
+  });
+
+  test('write_file dry-check requires a path', async () => {
+    const ctx = buildCtx({ defaults: { mode: 'strict' }, tools: {} }, [
+      { name: 'write_file', category: 'fs.write' },
+    ]);
+    const result = await permsCommand.exec(['why', 'write_file'], ctx);
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('missing path');
+  });
+
+  test('write_file allow_paths matches', async () => {
+    const ctx = buildCtx(
+      {
+        defaults: { mode: 'strict' },
+        tools: { write_file: { allow_paths: ['src/**'] } },
+      },
+      [{ name: 'write_file', category: 'fs.write' }],
+      { defaults: 'project', write_file: 'project' },
+    );
+    const result = await permsCommand.exec(['why', 'write_file', 'src/foo.ts'], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    const text = (result.notes ?? []).join('\n');
+    expect(text).toContain('decision: allow');
+    expect(text).toContain('rule:     src/**');
+    expect(text).toContain('section:  write_file');
+  });
+
+  test('grep without path is accepted (engine falls back to session cwd)', async () => {
+    // grep allows missing path arg; the engine resolves to
+    // session cwd. Operator using `/perms why grep` without args
+    // gets the dry-check result for "grep with no explicit root".
+    const ctx = buildCtx(
+      {
+        defaults: { mode: 'strict' },
+        tools: { grep: { allow_paths: ['./**'] } },
+      },
+      [{ name: 'grep', category: 'fs.read' }],
+      { defaults: 'project', grep: 'project' },
+    );
+    const result = await permsCommand.exec(['why', 'grep'], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    const text = (result.notes ?? []).join('\n');
+    expect(text).toContain('decision: allow');
+  });
+
+  test('fetch_url URL rendering', async () => {
+    const ctx = buildCtx(
+      {
+        defaults: { mode: 'strict' },
+        tools: { fetch_url: { deny_hosts: ['evil.com'] } },
+      },
+      [{ name: 'fetch_url', category: 'web.fetch' }],
+      { defaults: 'project', fetch_url: 'enterprise' },
+    );
+    const result = await permsCommand.exec(['why', 'fetch_url', 'https://evil.com/x'], ctx);
+    if (result.kind !== 'ok') throw new Error('expected ok');
+    const text = (result.notes ?? []).join('\n');
+    expect(text).toContain('decision: deny');
+    expect(text).toContain('rule:     evil.com');
+    expect(text).toContain('layer:    enterprise policy');
+  });
+
+  test('rejects unknown sub-command', async () => {
+    const ctx = buildCtx({ defaults: { mode: 'strict' }, tools: {} }, []);
+    const result = await permsCommand.exec(['bogus'], ctx);
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('unknown sub-command');
   });
 });

@@ -6,7 +6,7 @@ import type {
 } from '../critique/index.ts';
 import type { HookSpec } from '../hooks/index.ts';
 import type { MemoryRegistry } from '../memory/index.ts';
-import type { Decision, PermissionEngine } from '../permissions/index.ts';
+import type { Decision, PermissionEngine, PolicySource } from '../permissions/index.ts';
 import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
 import type { DB } from '../storage/index.ts';
 import type { SubagentSet } from '../subagents/load.ts';
@@ -758,6 +758,13 @@ export interface HarnessConfig {
     args: Record<string, unknown>;
     cwd: string;
     prompt: string;
+    // Provenance of the matching policy rule. Mirrors
+    // `ConfirmPermissionRequest.source` in invoke-tool.ts —
+    // forwarded verbatim from the engine's Decision so the
+    // modal can render layer + rule in the operator's prompt.
+    // Optional for backwards compat with non-engine
+    // synthesizers (tests, future inline-permission contexts).
+    source?: PolicySource;
     // Subagent attribution. Set by the parent harness's
     // spawnSubagent closure when proxying a child's
     // `permission:ask` (spec docs/spec/IPC.md §7). The TUI

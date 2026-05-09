@@ -33,6 +33,7 @@ const makeArgs = (overrides: Partial<ParsedArgs> = {}): ParsedArgs => ({
   plan: false,
   listSessions: false,
   includeSubagents: false,
+  explainPermissions: false,
   ...overrides,
 });
 

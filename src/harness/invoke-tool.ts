@@ -1,5 +1,5 @@
 import type { HookChainResult, HookEventPayload } from '../hooks/index.ts';
-import type { Decision, PermissionEngine, ToolArgs } from '../permissions/index.ts';
+import type { Decision, PermissionEngine, PolicySource, ToolArgs } from '../permissions/index.ts';
 import type { ProviderToolResultBlock } from '../providers/index.ts';
 import { sanitizeToolOutput, stripAnsi } from '../sanitize/index.ts';
 import {
@@ -33,6 +33,16 @@ export interface ConfirmPermissionRequest {
   // ("matches deny rule bash.rm.rf", "tool runs outside workspace",
   // etc.). Renderer surfaces it as the modal's `reason`/`rule`.
   prompt: string;
+  // Provenance of the matching policy rule (PolicySource in
+  // permissions/types.ts). Carries which layer (enterprise / user /
+  // project / session / default) holds the rule and the literal
+  // pattern that fired. The REPL bridge forwards this to the modal
+  // manager so the operator sees "matched rule: rm * (project
+  // policy)" instead of a generic "denied" — points them at the
+  // YAML file that needs editing without having to grep across
+  // layers. Optional for backwards compat with non-engine
+  // synthesizers (test harnesses); the engine always populates it.
+  source?: PolicySource;
   // Subagent attribution. Set when the request originates from a
   // child run (parent's IPC observer routes the child's
   // `permission:ask` through `confirmPermission` with this filled).
@@ -478,6 +488,12 @@ export const invokeTool = async (
             args: input.args,
             cwd: deps.ctx.cwd,
             prompt: setup.prompt,
+            // Forward the engine's source provenance so the modal
+            // can render which layer/rule produced the confirm
+            // verdict. Spread keeps the field absent when the
+            // decision lacks source (synthesized Decisions in
+            // tests don't populate it).
+            ...(decision.source !== undefined ? { source: decision.source } : {}),
           }),
         deps.signal,
       );

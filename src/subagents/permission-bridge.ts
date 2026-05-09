@@ -17,6 +17,7 @@
 // verdict for any reason — every positive answer originates from
 // an operator at the parent's modal.
 
+import type { PolicySource } from '../permissions/index.ts';
 import { type IpcChannel, makePermissionAsk } from './ipc.ts';
 
 // Mirrors `HarnessConfig.confirmPermission`'s request shape so the
@@ -40,6 +41,20 @@ export interface PermissionBridgeRequest {
   // The engine's prompt — the human-readable "why did the policy
   // ask?" string. Built by the engine from the matching rule.
   prompt: string;
+  // Provenance of the matching rule (mirrors
+  // `HarnessConfig.confirmPermission` and `ConfirmPermissionRequest`).
+  // Today the IPC envelope (`makePermissionAsk`) does NOT marshal
+  // `source` — the field exists here for type-shape parity with
+  // the harness contract; subagent-proxied confirms reach the
+  // parent's modal without source layer info until the IPC
+  // protocol grows it. The modal handles the absence gracefully
+  // (renders without the layer hint), so subagent confirms see a
+  // generic "matched rule" line instead of the layer-attributed
+  // version parent confirms get. Folding source through the IPC
+  // wire is a follow-up — would extend `makePermissionAsk` plus
+  // the parser at the parent side that translates back into
+  // `confirmPermission`.
+  source?: PolicySource;
 }
 
 export interface ChildPermissionBridge {

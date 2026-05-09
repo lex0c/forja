@@ -103,7 +103,12 @@ export const BRACKETED_PASTE_START = `${CSI}200~`;
 export const BRACKETED_PASTE_END = `${CSI}201~`;
 
 // Color SGR codes. Names match UI.md §6.1 tokens (reset, dim, bold,
-// error, warn, success). No blue/cyan/magenta — the spec forbids them.
+// error, warn, success). The original UI spec restricted the palette
+// to greyscale + the three state colors (success/warn/error) and
+// excluded blue/cyan/magenta — see UI.md §6.4 line 951. The `accent`
+// token below is an operator-authorized deviation (used for the
+// modal's top rule so the structural anchor reads visually distinct
+// from surrounding dim text); a future spec amendment can codify it.
 export const SGR = {
   reset: `${CSI}0m`,
   dim: `${CSI}2m`,
@@ -116,6 +121,13 @@ export const SGR = {
   // SGR 2 (rendered same as default on terminals that don't
   // distinguish faint, but that's deliberate).
   secondary: `${CSI}90m`,
+  // `accent` (SGR 94 = bright blue) for structural anchors that
+  // need to stand out from greyscale meta. Reserved for layout
+  // chrome (modal top rule today; future: section dividers, status
+  // anchors) — NOT for content. Adding more colors at this token
+  // requires a spec amendment to UI.md §6.4; keep this scope tight
+  // until then.
+  accent: `${CSI}94m`,
   bold: `${CSI}1m`,
   error: `${CSI}31m`,
   warn: `${CSI}33m`,
@@ -127,6 +139,22 @@ export type SgrToken = keyof typeof SGR;
 // of per-color wrappers because every renderer flows through one path.
 export const paint = (caps: Pick<Capabilities, 'color'>, token: SgrToken, text: string): string =>
   caps.color === 'none' ? text : `${SGR[token]}${text}${SGR.reset}`;
+
+// Apply multiple SGR tokens with a single trailing reset. Use when
+// stacking attributes (e.g. accent + bold for the modal title) —
+// nested `paint(paint(...))` works but emits a redundant inner
+// `\x1b[0m` that some terminals re-process as a flash. Empty tokens
+// list returns the bare text. Order is preserved (outer-first), but
+// SGR cascading is order-independent for the supported tokens
+// (color and weight stack regardless).
+export const paintMulti = (
+  caps: Pick<Capabilities, 'color'>,
+  tokens: readonly SgrToken[],
+  text: string,
+): string => {
+  if (caps.color === 'none' || tokens.length === 0) return text;
+  return `${tokens.map((t) => SGR[t]).join('')}${text}${SGR.reset}`;
+};
 
 // Reverse video (SGR 7). Spec UI.md §4.10.8: reverse is an attribute,
 // not a color — it works under NO_COLOR (a black-on-white bar still

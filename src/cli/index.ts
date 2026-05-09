@@ -104,7 +104,8 @@ const main = async (): Promise<number> => {
     args.undo !== undefined ||
     args.checkpoints !== undefined ||
     args.worktrees !== undefined ||
-    args.memory !== undefined;
+    args.memory !== undefined ||
+    args.explainPermissions;
   if (args.prompt.length === 0 && !promptOptional && args.resume === undefined) {
     // JSON mode + REPL is meaningless (NDJSON consumers don't have
     // a TTY to type into) — refuse rather than open a TTY-only loop

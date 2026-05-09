@@ -152,6 +152,22 @@ export const run = async (options: RunOptions): Promise<number> => {
       });
     }
 
+    // --explain-permissions: pre-REPL inspection of the merged
+    // policy + layer provenance. No provider, no DB, no harness —
+    // just resolves the policy via the same resolver bootstrap
+    // uses and prints it. Operator gets the same view they'd see
+    // via /perms after entering the REPL, plus per-section layer
+    // attribution that /perms doesn't currently surface.
+    if (args.explainPermissions) {
+      const cwd = options.bootstrapOverride?.cwd ?? process.cwd();
+      const { runExplainPermissionsCli } = await import('./explain-permissions.ts');
+      return await runExplainPermissionsCli({
+        cwd,
+        out: (s) => process.stdout.write(s),
+        err: errSink,
+      });
+    }
+
     // Checkpoint subcommands and `--undo` short-circuit the same way
     // list-sessions does: DB-only path, no bootstrap, no API key.
     // We dispatch BEFORE the resume branch because they're mutually

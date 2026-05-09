@@ -237,3 +237,115 @@ describe('resolvePolicy — locked semantics', () => {
     expect(result.policy.tools.bash?.allow).toEqual(['ls *']);
   });
 });
+
+describe('resolvePolicy — section provenance', () => {
+  test('empty layers (no files) → defaults provenance is "default"', () => {
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: null });
+    expect(result.provenance).toEqual({ defaults: 'default' });
+  });
+
+  test('single project layer writes per-section provenance', () => {
+    writeYaml(
+      projectFile('.agent/permissions.yaml'),
+      'defaults:\n  mode: acceptEdits\ntools:\n  bash:\n    allow:\n      - "ls *"\n  read_file:\n    allow_paths:\n      - "src/**"\n',
+    );
+    const result = resolvePolicy({
+      cwd: workdir,
+      enterprisePath: null,
+      userPath: null,
+    });
+    expect(result.provenance).toEqual({
+      defaults: 'project',
+      bash: 'project',
+      read_file: 'project',
+    });
+  });
+
+  test('multi-layer merge tracks last-writer per section', () => {
+    // enterprise locks defaults.mode + writes bash. user writes
+    // read_file. project writes write_file. Provenance reflects
+    // the per-section last writer regardless of layer precedence
+    // for OTHER sections.
+    const ent = projectFile('ent.yaml');
+    const usr = projectFile('usr.yaml');
+    writeFileSync(
+      ent,
+      'defaults:\n  mode: strict\n  locked: true\ntools:\n  bash:\n    deny:\n      - "rm -rf *"\n',
+    );
+    writeFileSync(usr, 'tools:\n  read_file:\n    allow_paths:\n      - "src/**"\n');
+    writeYaml(
+      projectFile('.agent/permissions.yaml'),
+      'tools:\n  write_file:\n    allow_paths:\n      - "src/**"\n',
+    );
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: usr });
+    expect(result.provenance).toEqual({
+      defaults: 'enterprise',
+      bash: 'enterprise',
+      read_file: 'user',
+      write_file: 'project',
+    });
+  });
+
+  test('lower layer overriding a non-locked section updates provenance', () => {
+    // user writes bash, project overrides bash. Final provenance
+    // for bash points at project (last writer wins for non-locked
+    // sections). The /perms why renderer shows the project YAML
+    // as the location to edit, which matches the user's
+    // expectation since the project rule is what's active.
+    const usr = projectFile('usr.yaml');
+    writeFileSync(usr, 'tools:\n  bash:\n    allow:\n      - "ls *"\n');
+    writeYaml(
+      projectFile('.agent/permissions.yaml'),
+      'tools:\n  bash:\n    deny:\n      - "rm *"\n',
+    );
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
+    expect(result.policy.tools.bash?.deny).toEqual(['rm *']);
+    expect(result.provenance.bash).toBe('project');
+  });
+
+  test('locked section keeps provenance at the locking layer (lower-layer override rejected)', () => {
+    // enterprise locks bash; project tries to override and the
+    // override is dropped (with conflict logged). Provenance for
+    // bash stays at enterprise — the active rule lives in
+    // enterprise YAML.
+    const ent = projectFile('ent.yaml');
+    writeFileSync(ent, 'tools:\n  bash:\n    deny:\n      - "*"\n    locked: true\n');
+    writeYaml(
+      projectFile('.agent/permissions.yaml'),
+      'tools:\n  bash:\n    allow:\n      - "ls *"\n',
+    );
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: null });
+    expect(result.lockConflicts).toHaveLength(1);
+    expect(result.provenance.bash).toBe('enterprise');
+  });
+
+  test('session-layer policy (runtime override) gets tracked as session', () => {
+    const result = resolvePolicy({
+      cwd: workdir,
+      enterprisePath: null,
+      userPath: null,
+      session: {
+        defaults: { mode: 'bypass' },
+        tools: { bash: { allow: ['*'] } },
+      },
+    });
+    expect(result.provenance).toEqual({
+      defaults: 'session',
+      bash: 'session',
+    });
+  });
+
+  test('layer that sets locked:true without mode keeps prior writer for defaults', () => {
+    // user writes mode='acceptEdits'. project sets locked:true
+    // without changing mode. defaults.mode came from user;
+    // provenance points at user (the actual last writer of
+    // mode), not at project (which only set the lock).
+    const usr = projectFile('usr.yaml');
+    writeFileSync(usr, 'defaults:\n  mode: acceptEdits\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'defaults:\n  locked: true\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
+    expect(result.policy.defaults.mode).toBe('acceptEdits');
+    expect(result.policy.defaults.locked).toBe(true);
+    expect(result.provenance.defaults).toBe('user');
+  });
+});

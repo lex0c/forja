@@ -7,11 +7,14 @@ export type {
   Policy,
   PolicyCategory,
   PolicyDefaults,
+  PolicyLayer,
   PolicyMode,
+  PolicySource,
   PolicyToolsSection,
 } from './types.ts';
 
 export {
+  escapeGlobMetacharacters,
   firstMatchingCommand,
   firstMatchingHost,
   firstMatchingPath,
@@ -42,5 +45,16 @@ export type {
   LockConflict,
   ResolveOptions,
   ResolveResult,
+  SectionProvenance,
 } from './hierarchy.ts';
 export { resolvePolicy } from './hierarchy.ts';
+
+export {
+  RULE_LIST_CAP,
+  formatBash,
+  formatFetch,
+  formatPath,
+  formatRules,
+  formatSections,
+  renderPolicy,
+} from './render.ts';

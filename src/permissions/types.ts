@@ -65,14 +65,50 @@ export interface Policy {
   tools: PolicyToolsSection;
 }
 
+// Provenance of the matching rule that produced a Decision.
+// Populated by the engine on every internal Decision creation so
+// the modal layer + audit can answer "which layer / which rule
+// fired?" without re-running the merge.
+//
+// `layer` values:
+//   - 'enterprise' | 'user' | 'project' | 'session' — the layer
+//     whose section carried the matching rule.
+//   - 'default' — engine-internal decision: no rule matched
+//     anywhere (default-deny), `mode=bypass` short-circuit,
+//     `misc` category passthrough, or a missing/invalid argument
+//     rejection that fired BEFORE any policy lookup.
+//
+// `rule` (optional): the literal pattern that matched (`'rm *'`,
+// `'src/**'`, `'api.example.com'`). Absent when the path was
+// engine-internal (default-deny, missing-arg rejection, bypass,
+// misc).
+//
+// `section` (optional): the policy section the rule lives in
+// (`bash`, `read_file`, `defaults`). Lets `/perms why <tool>`
+// render "your rule lives at tools.bash:deny[2]"-style hints
+// without the modal having to recompute.
+//
+// Optional on `Decision` (rather than required) so consumers
+// that don't render source info (audit, hooks pipeline) don't
+// pay a migration cost. The engine populates source on EVERY
+// Decision it returns; absence in the wild only happens for
+// Decision objects synthesized by tests / non-engine code.
+export type PolicyLayer = 'enterprise' | 'user' | 'project' | 'session' | 'default';
+
+export interface PolicySource {
+  layer: PolicyLayer;
+  rule?: string;
+  section?: string;
+}
+
 // What the engine returns from a check. The harness converts `confirm`
 // into a UI prompt at invocation time; without a confirmFn, the harness
 // must default to deny — silently auto-allowing a `confirm` decision is
 // the bug class this type prevents.
 export type Decision =
-  | { kind: 'allow'; reason?: string }
-  | { kind: 'deny'; reason: string }
-  | { kind: 'confirm'; prompt: string; reason?: string };
+  | { kind: 'allow'; reason?: string; source?: PolicySource }
+  | { kind: 'deny'; reason: string; source?: PolicySource }
+  | { kind: 'confirm'; prompt: string; reason?: string; source?: PolicySource };
 
 // Snapshot view of permissions handed to a tool's ToolContext (per
 // CONTRACTS §2 line 63). Read-only — tools must not mutate. Currently

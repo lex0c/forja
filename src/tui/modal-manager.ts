@@ -23,6 +23,8 @@
 // One modal at a time. Concurrent `ask*` calls queue; the queue
 // drains FIFO when a prior modal resolves.
 
+import type { PolicyLayer } from '../permissions/index.ts';
+import { sanitizeOneLineForDisplay } from '../sanitize/index.ts';
 import type { Bus } from './bus.ts';
 import type { UIEvent } from './events.ts';
 import type { FocusHandler, FocusStack } from './focus-stack.ts';
@@ -75,7 +77,21 @@ export interface PermissionAskArgs {
   command: string;
   cwd: string;
   rule?: string;
+  // Pattern the bridge would promote on session-allow. Drives
+  // option 2's "Yes, don't ask again for: <X>" label. Distinct
+  // from `rule` so the matched-rule attribution line stays
+  // accurate (only renders when a real rule fired). See
+  // PermissionAskEvent.sessionAllowTarget for the full contract.
+  sessionAllowTarget?: string;
   reason?: string;
+  // Layer that holds the matching rule (PolicyLayer). When set
+  // alongside `rule`, the reducer renders "matched rule: <rule>
+  // (<layer> policy)" so the operator knows which YAML to edit.
+  // 'default' renders as "(built-in default)" — distinct from
+  // any layer-written rule. Optional for backwards compat with
+  // synthesized Decisions / subagent-proxied confirms (where
+  // IPC doesn't marshal source yet).
+  layer?: PolicyLayer;
   // Subagent attribution. Set by the parent harness when
   // proxying a child's `permission:ask` over IPC (spec
   // docs/spec/IPC.md §7). The reducer prefixes the modal title
@@ -220,25 +236,58 @@ const CRITIQUE_OPTIONS: readonly ConfirmOption[] = [
   { key: '3', label: 'Abort step', value: 'abort' },
 ];
 
-// Permission flavor's option list, kept in sync with the reducer's
-// ConfirmState construction. Exported so producers can introspect /
-// override (future trust/memory variants do their own lists).
-const PERMISSION_OPTIONS = (toolName: string): ConfirmOption[] => [
-  { key: '1', label: 'Yes', value: 'yes' },
-  {
-    key: '2',
-    label: `Yes, allow all ${toolName} during this session`,
-    value: 'session-allow',
-    shortcut: 'shift+tab',
-  },
-  { key: '3', label: 'No', value: 'no' },
-];
+// Permission flavor's option list. Source of truth for both the
+// modal-manager (uses `.length` for selection clamping in
+// moveSelection) and the reducer (renders the labels via state).
+// Exported so the reducer's `permission:ask` case calls the same
+// builder — without a single source, the manager's count and the
+// reducer's labels could drift on a future field addition (e.g.
+// adding a fourth option) and break the cursor's clamp.
+//
+// Option 2 promotes the matched policy rule into the label so the
+// operator reads a literal scope ("don't ask again for: rm -rf *")
+// instead of an ambiguous "all bash during this session" — that
+// older wording sounded like a runtime toggle, but the semantics
+// are an actual policy promotion. When `rule` is absent (synthesized
+// asks, subagent-proxied confirms before IPC marshals source) the
+// label falls back to the per-tool wording — same shape, less
+// information, never a crash.
+export const buildPermissionOptions = (
+  toolName: string,
+  sessionAllowTarget?: string,
+): ConfirmOption[] => {
+  // sessionAllowTarget can carry raw tool args (e.g. args.command
+  // for bash compound confirms or catch-all overrides). The model
+  // can pack newlines, ANSI escapes, or other control bytes that
+  // would corrupt the modal layout if interpolated verbatim into
+  // the option label — split across rows, paint fake colors,
+  // hide text, etc. Sanitize at the interpolation site so the
+  // engine still receives the RAW pattern via the bridge's
+  // separate addSessionAllow call (matching depends on the literal
+  // string — sanitizing for the engine would break future
+  // matches).
+  const sessionLabel =
+    sessionAllowTarget !== undefined && sessionAllowTarget.length > 0
+      ? `Yes, don't ask again for: ${sanitizeOneLineForDisplay(sessionAllowTarget)}`
+      : `Yes, allow all ${toolName} during this session`;
+  return [
+    { key: '1', label: 'Yes', value: 'yes' },
+    {
+      key: '2',
+      label: sessionLabel,
+      value: 'session-allow',
+      shortcut: 'shift+tab',
+    },
+    { key: '3', label: 'No', value: 'no' },
+  ];
+};
 
 export interface ModalManager {
   // Permission flavor. Returns the user's choice (or 'cancel' on Esc /
   // close / timeout). Callers translate semantics: yes → execute,
-  // session-allow → execute + write session-layer rule (deferred),
-  // no/cancel → deny.
+  // session-allow → execute + promote the matched rule onto the
+  // engine's in-memory session-allowlist (so the next matching call
+  // skips the modal), no/cancel → deny.
   askPermission: (args: PermissionAskArgs, opts?: ConfirmAskOptions) => Promise<PermissionAnswer>;
   // Trust flavor. Returns the operator's choice (or 'cancel' on Esc /
   // close / timeout). Caller (REPL boot) translates: yes → persist
@@ -626,10 +675,14 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           command: args.command,
           cwd: args.cwd,
           ...(args.rule !== undefined ? { rule: args.rule } : {}),
+          ...(args.sessionAllowTarget !== undefined
+            ? { sessionAllowTarget: args.sessionAllowTarget }
+            : {}),
+          ...(args.layer !== undefined ? { layer: args.layer } : {}),
           ...(args.reason !== undefined ? { reason: args.reason } : {}),
           ...(args.subagent !== undefined ? { subagent: args.subagent } : {}),
         }),
-        PERMISSION_OPTIONS(args.toolName),
+        buildPermissionOptions(args.toolName, args.sessionAllowTarget),
         opts?.timeoutMs,
         opts?.signal,
       ),

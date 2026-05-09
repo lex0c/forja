@@ -1000,6 +1000,85 @@ describe('renderer wiring', () => {
     r.close();
   });
 
+  test('modal up hides cursor; modal down shows it again', () => {
+    // Bug: the renderer parks the cursor on the modal's bottom row
+    // (the hint footer) when no input has a cursor target. The
+    // visible cursor block sits ON TOP of the hint text, looking
+    // like flicker because each redraw briefly moves cursor away
+    // and back. Fix: hide cursor on modal-up, restore on modal-
+    // down. Idempotent — the helper returns '' when no transition
+    // is needed, so it doesn't spam the escape every frame.
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+    });
+    bus.emit(sessionStart);
+    sched.flushAll();
+    sink.writes.length = 0;
+    // Open modal — frame should carry the cursor-hide escape.
+    bus.emit({
+      type: 'permission:ask',
+      ts: 2,
+      promptId: 'p1',
+      toolName: 'bash',
+      command: 'ls',
+      cwd: '/',
+    });
+    sched.flushAll();
+    const onOpen = sink.joined();
+    expect(onOpen).toContain(`${CSI}?25l`);
+    // Subsequent frames while modal is up MUST NOT re-emit the
+    // escape (idempotent — would spam the wire otherwise).
+    sink.writes.length = 0;
+    bus.emit({ type: 'step:budget', ts: 3, steps: 1, maxSteps: 50, costUsd: 0 });
+    sched.flushAll();
+    const duringModal = sink.joined();
+    expect(duringModal).not.toContain(`${CSI}?25l`);
+    expect(duringModal).not.toContain(`${CSI}?25h`);
+    // Close modal (operator answered) — frame should carry the
+    // cursor-show escape.
+    sink.writes.length = 0;
+    bus.emit({ type: 'modal:answer', ts: 4, promptId: 'p1', decision: 'no' });
+    sched.flushAll();
+    const onClose = sink.joined();
+    expect(onClose).toContain(`${CSI}?25h`);
+    r.close();
+  });
+
+  test('renderer.close() restores cursor visibility if a modal was active', () => {
+    // Without this, exiting the binary while a modal was up would
+    // leave the operator's shell prompt with a hidden cursor.
+    const bus = createBus();
+    const sink = makeSink();
+    const sched = makeSchedulerOptions();
+    const r = createRenderer({
+      bus,
+      caps,
+      write: sink.write,
+      schedulerOptions: sched.options,
+      bracketedPaste: false,
+    });
+    bus.emit(sessionStart);
+    bus.emit({
+      type: 'permission:ask',
+      ts: 2,
+      promptId: 'p1',
+      toolName: 'bash',
+      command: 'ls',
+      cwd: '/',
+    });
+    sched.flushAll();
+    sink.writes.length = 0;
+    r.close();
+    expect(sink.joined()).toContain(`${CSI}?25h`);
+  });
+
   test('modal up suppresses cursor positioning (no cursorUp/cursorForward after write)', () => {
     const bus = createBus();
     const sink = makeSink();

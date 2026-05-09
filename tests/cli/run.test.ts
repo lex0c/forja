@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ParsedArgs } from '../../src/cli/args.ts';
@@ -16,6 +16,7 @@ const baseArgs = (overrides: Partial<ParsedArgs> = {}): ParsedArgs => ({
   plan: false,
   listSessions: false,
   includeSubagents: false,
+  explainPermissions: false,
   yes: false,
   ...overrides,
 });
@@ -88,6 +89,46 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(workdir, { recursive: true, force: true });
+});
+
+describe('run dispatch — --explain-permissions short-circuit', () => {
+  test('explainPermissions=true → exit 0, no DB created, policy printed to stdout', async () => {
+    // Pins the seam between args parsing and run() dispatch:
+    // `args.explainPermissions === true` must trigger the
+    // explain-permissions branch BEFORE bootstrap / DB / provider
+    // setup. Without this test, accidentally moving the case
+    // below the bootstrap block (or forgetting the case
+    // entirely) would still pass typecheck and the unit-level
+    // explain-permissions tests, but break the actual CLI.
+    const errCaptured: string[] = [];
+    const stdoutCaptured: string[] = [];
+    const origWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((s: string) => {
+      stdoutCaptured.push(s);
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      const code = await run({
+        args: baseArgs({ explainPermissions: true, prompt: '' }),
+        bootstrapOverride: { cwd: workdir, dbPath },
+        errSink: (s) => errCaptured.push(s),
+      });
+      expect(code).toBe(0);
+      const stdout = stdoutCaptured.join('');
+      // Reached the renderer (it prints "policy: mode=..." for
+      // every non-error path).
+      expect(stdout).toContain('policy: mode=');
+      expect(stdout).toContain('layers:');
+      // Canary for "did NOT bootstrap": dbPath stayed unwritten.
+      // Bootstrap eagerly migrates a DB at this path; the
+      // explain-permissions short-circuit doesn't.
+      expect(existsSync(dbPath)).toBe(false);
+      // No errors on the happy path (empty cwd → default policy).
+      expect(errCaptured.join('')).toBe('');
+    } finally {
+      process.stdout.write = origWrite;
+    }
+  });
 });
 
 describe('exitCodeFor', () => {

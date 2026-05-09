@@ -1550,7 +1550,12 @@ describe('subagent lifecycle', () => {
 });
 
 describe('permission:ask modal (UI.md §4.10.13)', () => {
-  test('parent confirm renders standard title without subagent prefix', () => {
+  test('parent confirm renders the per-tool context label', () => {
+    // Modal redesign (design/permission-modal-redesign.md): the
+    // title slot carries a per-tool context label instead of the
+    // generic "Run command". bash family → "Bash command".
+    // Subject is null (the context label IS the subject row);
+    // question is null (numbered options are self-evident).
     const r = applyEvent(createInitialState(), {
       type: 'permission:ask',
       ts: 1,
@@ -1561,16 +1566,87 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
     } as UIEvent);
     expect(r.state.modal).not.toBeNull();
     if (r.state.modal !== null) {
-      expect(r.state.modal.title).toBe('Run command');
-      // Standard preview is `$ <command>` then `cwd: …`. No subagent line.
-      expect(r.state.modal.preview[0]).toBe('$ rm -rf /');
+      expect(r.state.modal.title).toBe('Bash command');
+      expect(r.state.modal.subject).toBeNull();
+      expect(r.state.modal.question).toBeNull();
+      // Action block has blank-line-action-blank-line shape — the
+      // breathing room is what sets the action apart visually.
+      // Action line carries `tone: 'bold'` so the renderer paints
+      // it bold (operator's eye lands on the command first).
+      expect(r.state.modal.preview[0]).toBe('');
+      expect(r.state.modal.preview[1]).toEqual({
+        text: '    $ rm -rf /',
+        tone: 'bold',
+      });
+      expect(r.state.modal.preview[2]).toBe('');
+      // cwd follows the action block.
+      expect(r.state.modal.preview[3]).toBe('cwd: /p');
     }
   });
 
-  test('subagent attribution mutates title + injects prefix preview line', () => {
+  test('per-tool context labels (bash / fs.* / web.fetch / search)', () => {
+    // Pins the per-tool mapping. A drift here would surface as a
+    // generic "Tool call" label for a known tool, which loses the
+    // operator's category cue.
+    const cases: Array<{ tool: string; label: string }> = [
+      { tool: 'bash', label: 'Bash command' },
+      { tool: 'bash_background', label: 'Bash command' },
+      { tool: 'bash_kill', label: 'Bash command' },
+      { tool: 'read_file', label: 'Accessing workspace:' },
+      { tool: 'write_file', label: 'Editing file' },
+      { tool: 'edit_file', label: 'Editing file' },
+      { tool: 'glob', label: 'Searching workspace' },
+      { tool: 'grep', label: 'Searching workspace' },
+      { tool: 'fetch_url', label: 'Network access' },
+    ];
+    for (const c of cases) {
+      const r = applyEvent(createInitialState(), {
+        type: 'permission:ask',
+        ts: 1,
+        promptId: 'p',
+        toolName: c.tool,
+        command: 'x',
+        cwd: '/p',
+      } as UIEvent);
+      expect(r.state.modal?.title).toBe(c.label);
+    }
+  });
+
+  test('unknown tool falls back to generic "Tool call" label', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p',
+      toolName: 'totally_unknown_tool',
+      command: 'x',
+      cwd: '/p',
+    } as UIEvent);
+    expect(r.state.modal?.title).toBe('Tool call');
+  });
+
+  test('non-bash tools omit the "$ " action prefix', () => {
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p',
+      toolName: 'write_file',
+      command: 'src/foo.ts',
+      cwd: '/p',
+    } as UIEvent);
+    // Preview action line is the path verbatim, no shell prefix.
+    // Wrapped as a `{text, tone}` object so the renderer paints bold.
+    expect(r.state.modal?.preview[1]).toEqual({
+      text: '    src/foo.ts',
+      tone: 'bold',
+    });
+  });
+
+  test('subagent attribution becomes a parenthesized title suffix (not a preview row)', () => {
     // Spec docs/spec/IPC.md §7: child-proxied asks must label the
     // subagent so the operator can distinguish parent vs child
-    // requests. The reducer keys on the optional event field.
+    // requests. New layout: attribution is a suffix on the context
+    // label, not a separate preview line — keeps the action block
+    // visually atomic.
     const r = applyEvent(createInitialState(), {
       type: 'permission:ask',
       ts: 1,
@@ -1582,14 +1658,211 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
     } as UIEvent);
     expect(r.state.modal).not.toBeNull();
     if (r.state.modal !== null) {
-      expect(r.state.modal.title).toBe('Subagent permission — explore');
-      // The first preview line is the attribution; the 8-char tail
-      // disambiguates concurrent instances of the same subagent.
-      expect(r.state.modal.preview[0]).toBe('subagent: explore (12345678)');
-      // Followed by the standard $cwd lines.
-      expect(r.state.modal.preview[1]).toBe('$ ls');
-      expect(r.state.modal.preview[2]).toBe('cwd: /p');
+      expect(r.state.modal.title).toBe('Bash command (subagent: explore)');
+      // Preview goes straight to the action block — no
+      // "subagent: explore (12345678)" prefix line.
+      expect(r.state.modal.preview[0]).toBe('');
+      expect(r.state.modal.preview[1]).toEqual({ text: '    $ ls', tone: 'bold' });
+      expect(r.state.modal.preview[2]).toBe('');
+      expect(r.state.modal.preview[3]).toBe('cwd: /p');
+      // No row contains the old "subagent: <name> (<idTail>)"
+      // prefix shape.
+      expect(
+        r.state.modal.preview.some((p) =>
+          (typeof p === 'string' ? p : p.text).startsWith('subagent: '),
+        ),
+      ).toBe(false);
     }
+  });
+
+  test('option 2 promotes the matched rule pattern when present', () => {
+    // The session-allow option's label carries the literal rule
+    // ("Yes, don't ask again for: rm -rf *") so the operator
+    // reads a policy promotion, not a vague runtime toggle. Falls
+    // back to the per-tool wording when neither rule nor
+    // sessionAllowTarget is present.
+    const withRule = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p',
+      toolName: 'bash',
+      command: 'rm -rf /tmp',
+      cwd: '/p',
+      rule: 'rm -rf *',
+    } as UIEvent);
+    const opt2WithRule = withRule.state.modal?.options[1];
+    expect(opt2WithRule?.label).toBe("Yes, don't ask again for: rm -rf *");
+
+    const noRule = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 2,
+      promptId: 'p2',
+      toolName: 'bash',
+      command: 'whoami',
+      cwd: '/p',
+    } as UIEvent);
+    const opt2NoRule = noRule.state.modal?.options[1];
+    expect(opt2NoRule?.label).toBe('Yes, allow all bash during this session');
+  });
+
+  test('option 2 uses sessionAllowTarget independently of rule (compound-confirm shape)', () => {
+    // Compound-command confirm: engine fires with no matched rule
+    // but the bridge derives a literal from args and forwards it
+    // as sessionAllowTarget. Option 2 must reflect that literal
+    // (so the operator's promise matches what addSessionAllow
+    // registers) and the matched-rule attribution line must NOT
+    // render (no real rule fired). Pins the decoupling between
+    // the two fields the bridge now produces.
+    const compound = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p',
+      toolName: 'bash',
+      command: 'git status; pwd',
+      cwd: '/p',
+      // No `rule` — this is a compound-confirm shape.
+      sessionAllowTarget: 'git status; pwd',
+      layer: 'project',
+    } as UIEvent);
+    const opt2 = compound.state.modal?.options[1];
+    expect(opt2?.label).toBe("Yes, don't ask again for: git status; pwd");
+    // Matched-rule attribution NOT rendered: the engine emitted no
+    // rule, so showing "matched rule: git status; pwd" would
+    // misattribute the modal — the rule was synthesized by the
+    // bridge for promotion only.
+    const preview = compound.state.modal?.preview ?? [];
+    const hasMatchedRule = preview.some((p) =>
+      (typeof p === 'string' ? p : p.text).startsWith('matched rule:'),
+    );
+    expect(hasMatchedRule).toBe(false);
+  });
+
+  test('option 2 label uses sessionAllowTarget literal when matched rule is catch-all "*"', () => {
+    // When the engine matched a catch-all rule (`confirm: ['*']`),
+    // the bridge's derivePromotionTarget falls through to the
+    // args-derived literal — and the modal label must show that
+    // literal, NOT the catch-all glob. Operator's option 2 promise
+    // ("Yes, don't ask again for: <X>") matches the scope of what
+    // addSessionAllow registers. The matched-rule attribution line
+    // still shows the engine's `*` because that IS what fired.
+    const catchAll = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p',
+      toolName: 'bash',
+      command: 'curl example.com',
+      cwd: '/p',
+      // Bridge sets BOTH (engine matched '*'; bridge derived literal).
+      rule: '*',
+      sessionAllowTarget: 'curl example.com',
+      layer: 'project',
+    } as UIEvent);
+    const opt2 = catchAll.state.modal?.options[1];
+    // Label promotes the literal; operator sees what they're authorizing.
+    expect(opt2?.label).toBe("Yes, don't ask again for: curl example.com");
+    // Matched-rule line still shows the engine's true match —
+    // attribution stays accurate.
+    const preview = catchAll.state.modal?.preview ?? [];
+    const matchedRuleLine = preview.find((p) =>
+      (typeof p === 'string' ? p : p.text).startsWith('matched rule:'),
+    );
+    expect(matchedRuleLine).toBeDefined();
+    if (matchedRuleLine !== undefined) {
+      const text = typeof matchedRuleLine === 'string' ? matchedRuleLine : matchedRuleLine.text;
+      expect(text).toBe('matched rule: * (project policy)');
+    }
+  });
+
+  test('option 2 label sanitizes sessionAllowTarget against ANSI / newline injection', () => {
+    // sessionAllowTarget can carry raw tool args (e.g. args.command
+    // for compound confirms). The model can pack newlines or ANSI
+    // escapes that, interpolated verbatim into the option label,
+    // would split the modal across rows or paint fake colors. The
+    // option label sanitizes at the interpolation site so the
+    // engine still receives the RAW pattern via the bridge's
+    // separate addSessionAllow call (matching depends on the
+    // literal string).
+    const ansiLaden = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p',
+      toolName: 'bash',
+      command: 'rm',
+      cwd: '/p',
+      // ESC sequence + newline + literal text. Renders normally
+      // would inject color and split rows.
+      sessionAllowTarget: 'rm \x1b[31mFAKE WARN\x1b[0m\nrm -rf /',
+    } as UIEvent);
+    const opt2 = ansiLaden.state.modal?.options[1];
+    // Label MUST NOT contain ESC byte.
+    expect(opt2?.label).not.toContain('\x1b');
+    // Label MUST be a single line.
+    expect(opt2?.label).not.toContain('\n');
+    expect(opt2?.label).not.toContain('\r');
+    // Sanitized form: ANSI stripped, newline collapsed to space.
+    expect(opt2?.label).toBe("Yes, don't ask again for: rm FAKE WARN rm -rf /");
+  });
+
+  test('option 2 label caps absurdly long sessionAllowTarget with ellipsis', () => {
+    // 1KB-long pattern would push subsequent modal content off
+    // screen; sanitizer caps display at SAFE_ONE_LINE_MAX.
+    const long = 'a'.repeat(500);
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p',
+      toolName: 'bash',
+      command: 'echo',
+      cwd: '/p',
+      sessionAllowTarget: long,
+    } as UIEvent);
+    const opt2 = r.state.modal?.options[1];
+    // Label fits in one row's worth of content. Don't pin exact
+    // length here (that's the sanitizer's contract) — just verify
+    // the prefix is intact and the suffix has the ellipsis.
+    expect(opt2?.label?.startsWith("Yes, don't ask again for: aaa")).toBe(true);
+    expect(opt2?.label?.endsWith('…')).toBe(true);
+  });
+
+  test('option 2 falls back to per-tool wording when sessionAllowTarget is absent (subagent path)', () => {
+    // Subagent confirms today have no sessionAllowTarget (the
+    // bridge skips derivation pending IPC source marshal +
+    // child-engine push-down). The vague fallback wording is the
+    // honest behavior here — no promotion will happen. Pins this
+    // until the subagent slice lands.
+    const subagent = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p',
+      toolName: 'bash',
+      command: 'rm -rf /tmp',
+      cwd: '/p',
+      // rule may or may not be set on subagent path; the fallback
+      // is driven by sessionAllowTarget absence regardless.
+      subagent: { sessionId: 'child', name: 'explore' },
+    } as UIEvent);
+    const opt2 = subagent.state.modal?.options[1];
+    expect(opt2?.label).toBe('Yes, allow all bash during this session');
+  });
+
+  test('footer hints carry only `Esc to cancel` (no unsupported affordances)', () => {
+    // Earlier slices pre-flowed `Tab to amend` and `Ctrl+E to
+    // explain` expecting handlers to land. The handlers never
+    // shipped, and on a permission modal the advertised keys do
+    // surprising things (Tab moves selection, Ctrl+E does
+    // nothing), which is risky on a security surface — operators
+    // expect to "amend" / "explain" and instead silently change
+    // the selected answer. Hints reflect ONLY what's actually
+    // wired.
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p',
+      toolName: 'bash',
+      command: 'ls',
+      cwd: '/p',
+    } as UIEvent);
+    expect(r.state.modal?.hints).toEqual(['Esc to cancel']);
   });
 });
 

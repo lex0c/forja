@@ -26,6 +26,7 @@ const makeArgs = (overrides: Partial<ParsedArgs> = {}): ParsedArgs => ({
   plan: false,
   listSessions: false,
   includeSubagents: false,
+  explainPermissions: false,
   ...overrides,
 });
 
@@ -1141,6 +1142,710 @@ describe('repl — boot + smoke', () => {
     const answer = await askPromise;
     expect(answer).toBe(true);
     // Wrap up.
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission bridge forwards source.rule + source.layer into the modal', async () => {
+    // Pins the engine → REPL bridge → modal seam. Without this,
+    // a regression where the bridge forgot to spread `rule` or
+    // `layer` into the modal manager call would silently
+    // degrade the operator UX (modal renders without the rule
+    // attribution) and only typecheck-pass because both fields
+    // are optional. Capturing rendered writes via rendererWrite
+    // is the only way to assert the rendered string contains
+    // the expected layer hint, since modalManager is internal
+    // to the REPL.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: makeBootstrapStub(),
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    expect(cfg?.confirmPermission).toBeDefined();
+    // Drive the bridge with a Decision-shaped source. The exact
+    // wording the modal prints comes from the reducer
+    // (modal-integration test pins the format string); we just
+    // check the bridge forwarded both fields end-to-end.
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: 'rm -rf /tmp/cache/*' },
+      cwd: '/r',
+      prompt: 'matched confirm rule: rm -rf *',
+      source: {
+        layer: 'project',
+        rule: 'rm -rf *',
+        section: 'bash',
+      },
+    });
+    await flushFrame();
+    const rendered = writes.join('');
+    // Rule + layer round-tripped: bridge → modalManager →
+    // event → reducer → renderer.
+    expect(rendered).toContain('matched rule: rm -rf * (project policy)');
+    // Resolve the modal so the test cleans up.
+    stdin.feed('\x1b\x1b');
+    await tick();
+    expect(await askPromise).toBe(false);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow promotes the matched rule onto the engine before returning true', async () => {
+    // Pins the bridge → engine seam introduced by the session-allow
+    // mutation slice. Without this, "Yes, don't ask again for: <rule>"
+    // would render in the modal but quietly behave like one-shot
+    // 'yes' — the option label becomes a UX lie and operators report
+    // "the modal keeps asking even after I picked option 2". The
+    // assertion proves both fields round-trip end-to-end and the
+    // call lands on the engine BEFORE the harness sees `true` so
+    // the next harness check (same turn or any future turn) reads
+    // the new session rule.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    // Stub engine: the only method the bridge calls is
+    // addSessionAllow. Real engines also expose `check`, `mode`,
+    // etc., but the bridge doesn't touch those — so the stub is
+    // surgical, asserting the bridge's API surface without
+    // requiring a full engine.
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    expect(cfg?.confirmPermission).toBeDefined();
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: 'git push origin main' },
+      cwd: '/r',
+      prompt: 'matched confirm rule: git push *',
+      source: {
+        layer: 'project',
+        rule: 'git push *',
+        section: 'bash',
+      },
+    });
+    await tick();
+    // Hotkey '2' resolves the modal as 'session-allow' — bridge
+    // promotes onto engine THEN maps to true.
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    expect(sessionAllowCalls).toEqual([{ section: 'bash', pattern: 'git push *' }]);
+    // Wrap up.
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow on a compound-confirm (no matched rule) promotes the literal command', async () => {
+    // The engine's compound-command guard fires confirm without a
+    // matched rule (the guard is structural — `;`, `&`, `|`, `\n`,
+    // process substitution, etc. — not a rule match). Without
+    // deriving a promotion target from args, option 2 of the modal
+    // would silently no-op and the same compound would re-prompt
+    // every step despite the operator picking "Yes, don't ask
+    // again". The bridge falls back to args.command as the literal
+    // pattern; future identical compounds match the session rule
+    // exact and skip the modal.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: 'git status; pwd' },
+      cwd: '/r',
+      prompt: 'compound shell command — confirming explicitly',
+      // source carries section but NO rule (compound-guard shape).
+      source: {
+        layer: 'project',
+        section: 'bash',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    // Literal command promoted — exact match for future identical
+    // compound. Operator's "don't ask again" promise honored.
+    expect(sessionAllowCalls).toEqual([{ section: 'bash', pattern: 'git status; pwd' }]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow with no args derivable for the section falls back to one-shot allow', async () => {
+    // Defense-in-depth: if the section is known but args don't
+    // carry the field the section needs (e.g., a future tool
+    // routing through `bash` section without a `command` field),
+    // derivePromotionTarget returns undefined and the bridge
+    // skips promotion. Operator's session-allow degrades to a
+    // one-shot allow rather than promoting an empty/garbage
+    // pattern.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      // No `command` in args — the bash section's derivation
+      // requires it. Bridge falls through to one-shot allow.
+      args: {},
+      cwd: '/r',
+      prompt: 'engine-internal reject',
+      source: {
+        layer: 'default',
+        section: 'bash',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    expect(sessionAllowCalls).toEqual([]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow on a catch-all matched rule promotes the args literal, not "*"', async () => {
+    // Init template default: `confirm: ['*']` for bash so any
+    // unmatched-allow command pops a modal. Operator clicks "Yes,
+    // don't ask again for: <X>" expecting THIS command to be
+    // authorized — not the universe of bash. Without the catch-all
+    // override, the bridge would promote `'*'` onto bash session-
+    // allow, effectively disabling the policy gate for the rest
+    // of the session. The override falls through to args.command
+    // so the literal command becomes the session rule.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: 'curl example.com' },
+      cwd: '/r',
+      prompt: 'matched confirm rule: *',
+      // Engine matched the catch-all `*` from `confirm: ['*']`.
+      source: {
+        layer: 'project',
+        rule: '*',
+        section: 'bash',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    // Promotion uses the literal command, NOT '*'. Future bash
+    // calls that aren't `curl example.com` still trip the modal.
+    expect(sessionAllowCalls).toEqual([{ section: 'bash', pattern: 'curl example.com' }]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow on catch-all "**" path rule promotes the args.path literal', async () => {
+    // Same property for path-based sections. Operator with
+    // `confirm_paths: ['**']` clicking session-allow on a
+    // read_file confirm meant "yes for THIS file", not "yes for
+    // every file in the project."
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'read_file',
+      args: { path: 'src/internal/notes.ts' },
+      cwd: '/r',
+      prompt: 'matched confirm rule: **',
+      source: {
+        layer: 'project',
+        rule: '**',
+        section: 'read_file',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    expect(sessionAllowCalls).toEqual([{ section: 'read_file', pattern: 'src/internal/notes.ts' }]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow on a glob/grep catch-all rule with implicit cwd derives from req.cwd', async () => {
+    // glob has no `path` arg and grep's `path` is optional — when
+    // either is omitted the engine treats req.cwd as the search
+    // root. derivePromotionTarget must follow the same fallback,
+    // otherwise a catch-all matched rule (`*`/`**`) ends up with
+    // no promotion target and the bridge silently no-ops on
+    // session-allow despite the modal label promising "don't
+    // ask again".
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'glob',
+      // No `cwd` arg — engine falls back to req.cwd as the
+      // search root.
+      args: { pattern: '**/*.ts' },
+      cwd: '/proj',
+      prompt: 'matched confirm rule: **',
+      source: {
+        layer: 'project',
+        rule: '**',
+        section: 'glob',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    // Promotion uses the request cwd as the search root, wrapped
+    // in `/**` so the engine's synthetic-descendant probe
+    // (`<root>/.forja-check`) actually matches the session rule
+    // on the next identical call. A bare `/proj` would never fire
+    // — Bun.Glob's `**` requires at least one path segment.
+    expect(sessionAllowCalls).toEqual([{ section: 'glob', pattern: '/proj/**' }]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow on glob with explicit args.cwd wraps it as a descendant glob', async () => {
+    // Even when the operator-side args carry a specific cwd, the
+    // engine still probes search tools with `<root>/.forja-check`.
+    // A literal `src` rule never matches that synthetic target, so
+    // the bridge wraps the input as `src/**`. Counter to the
+    // implicit-cwd case: this proves the wrapping isn't gated on
+    // "args missing" — it's the search-tool semantics that
+    // demand it.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'glob',
+      args: { pattern: '**/*.ts', cwd: 'src' },
+      cwd: '/proj',
+      prompt: 'matched confirm rule: **',
+      source: {
+        layer: 'project',
+        rule: '**',
+        section: 'glob',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    expect(sessionAllowCalls).toEqual([{ section: 'glob', pattern: 'src/**' }]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow on grep without args.path also derives from req.cwd', async () => {
+    // Symmetric case: grep's `path` arg is optional, omitted
+    // means search session cwd. Promotion follows.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'grep',
+      args: { pattern: 'TODO' },
+      cwd: '/proj',
+      prompt: 'matched confirm rule: *',
+      source: {
+        layer: 'project',
+        rule: '*',
+        section: 'grep',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    // Same descendant-glob wrapping as glob.
+    expect(sessionAllowCalls).toEqual([{ section: 'grep', pattern: '/proj/**' }]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow on a deliberately broad rule (e.g. "rm *") still promotes the rule', async () => {
+    // The catch-all override is scoped to `*` and `**` only —
+    // operator-authored patterns like `rm *` express intentional
+    // breadth and should be promoted as authored. Without this
+    // pin, an over-eager "anything with a wildcard is catch-all"
+    // heuristic would degrade rule-driven session-allow into
+    // literal-only.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: 'rm /tmp/foo' },
+      cwd: '/r',
+      prompt: 'matched confirm rule: rm *',
+      source: {
+        layer: 'project',
+        rule: 'rm *',
+        section: 'bash',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    expect(sessionAllowCalls).toEqual([{ section: 'bash', pattern: 'rm *' }]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow on bash escapes glob metachars before promotion', async () => {
+    // The end-to-end pin for the `echo *` bypass: bridge derives
+    // args.command as the literal, escapes it via
+    // escapeGlobMetacharacters, and the engine receives a literal-
+    // matching rule. The reviewer's specific scenario: confirming
+    // `echo *` must NOT authorize subsequent `echo $(...)`
+    // injection.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: 'echo *' },
+      cwd: '/r',
+      prompt: 'matched confirm rule: *',
+      // Catch-all rule from the init template — derivation falls
+      // through to args, escapes the literal.
+      source: {
+        layer: 'project',
+        rule: '*',
+        section: 'bash',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    // Promoted pattern is the ESCAPED literal: `*` and `?` get
+    // backslash-prefixed. Future `echo *` matches; future
+    // `echo something_else` does NOT.
+    expect(sessionAllowCalls).toEqual([{ section: 'bash', pattern: 'echo \\*' }]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow on a subagent-proxied request does NOT promote onto the parent engine', async () => {
+    // Subagent confirms gate against the CHILD's own engine
+    // (subagent runtime constructs it from `policySnapshot =
+    // parent.policy()`, which carries the resolved YAML but NOT
+    // the parent's session-allow Map). Promoting onto the parent
+    // engine on a child confirm writes a rule the child never
+    // sees — child re-prompts every step while the parent's
+    // engine accrues inert state. The bridge guards on
+    // `req.subagent === undefined` so subagent-proxied
+    // session-allow falls back to one-shot allow until a future
+    // slice wires both IPC source marshaling AND a child-engine
+    // push-down. Today subagent confirms don't even carry source
+    // (IPC doesn't marshal it), but this test pins the contract
+    // for the moment they start to.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: 'git push origin main' },
+      cwd: '/r',
+      prompt: 'matched confirm rule: git push *',
+      // Source IS populated (forward-compat: the day IPC marshals
+      // it, this branch must still skip promotion until the child
+      // push-down lands).
+      source: {
+        layer: 'project',
+        rule: 'git push *',
+        section: 'bash',
+      },
+      // The thing that disqualifies this from promotion.
+      subagent: { sessionId: 'sess-childA', name: 'explore' },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    // No promotion: subagent guard rejected the call.
+    expect(sessionAllowCalls).toEqual([]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission "yes" answer never promotes onto the engine', async () => {
+    // Operator picks option 1 (one-shot allow). Even though
+    // source.rule is populated, the bridge MUST NOT promote — the
+    // distinction between option 1 and option 2 is the entire UX
+    // value. A regression collapsing them would void the modal's
+    // promise.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: 'rm -rf /tmp/cache' },
+      cwd: '/r',
+      prompt: 'matched confirm rule: rm *',
+      source: {
+        layer: 'project',
+        rule: 'rm *',
+        section: 'bash',
+      },
+    });
+    await tick();
+    stdin.feed('1');
+    await tick();
+    expect(await askPromise).toBe(true);
+    expect(sessionAllowCalls).toEqual([]);
     ra.finish(0);
     await tick();
     stdin.feed('\x04');

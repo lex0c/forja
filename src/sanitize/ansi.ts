@@ -116,6 +116,36 @@ const ANSI_PATTERN = new RegExp(
 
 export const stripAnsi = (s: string): string => s.replace(ANSI_PATTERN, '');
 
+// One-line display sanitization for untrusted strings the modal
+// will interpolate verbatim into a single row. Three transforms:
+//   1. stripAnsi removes ESC-prefixed control sequences so the
+//      string can't paint fake colors / cursor moves into the
+//      modal layout.
+//   2. Newline / tab / CR collapse to a single space — a
+//      multi-line payload could otherwise split across modal
+//      rows and mimic separator lines or fake warnings.
+//      stripAnsi does NOT cover \x0a (LF) — its character class
+//      excludes \x09-\x0a-\x0d to keep ordinary text intact —
+//      so the explicit collapse is necessary.
+//   3. Length cap so a kilobyte-long string can't overflow the
+//      modal row width or push subsequent content off screen.
+//
+// Used by modal labels that interpolate strings derived from
+// raw tool args (e.g., the session-allow option's "Yes, don't
+// ask again for: <X>" wording — X originates from the model's
+// emitted args.command, which the parent gate doesn't otherwise
+// trust to be control-clean). Default cap matches the existing
+// SUBAGENT_DISPLAY_MAX surface so a future migration can fold
+// both call sites onto this helper without behavior drift.
+export const SAFE_ONE_LINE_MAX = 200;
+export const sanitizeOneLineForDisplay = (raw: string, max = SAFE_ONE_LINE_MAX): string => {
+  let cleaned = stripAnsi(raw).replace(/[\r\n\t]+/g, ' ');
+  if (cleaned.length > max) {
+    cleaned = `${cleaned.slice(0, max - 1)}…`;
+  }
+  return cleaned;
+};
+
 // Recursively strip ANSI from every string leaf in a value. Preserves
 // shape (plain objects, arrays, numbers, booleans, null) so a tool
 // returning `{ stdout: "..", stderr: ".." }` keeps that schema for

@@ -15,6 +15,15 @@ export interface ParsedArgs {
   // List-sessions mode (AGENTIC_CLI §2.1): print known sessions
   // (newest first) and exit. Honors --json for headless consumers.
   listSessions: boolean;
+  // Pre-REPL permission inspection. Resolves the merged policy
+  // for the current cwd + per-section provenance (which YAML
+  // wrote each section) and prints it before starting any
+  // session. Lets operators audit "what would my permissions
+  // look like here?" without entering the REPL — useful when
+  // joining a new project / cwd, debugging a layered policy
+  // setup, or scripting policy checks in CI. DB-only path; no
+  // provider, no API key.
+  explainPermissions: boolean;
   // When --list-sessions is set, fan each parent into its subagent
   // children one level deep. Default false: most users want the
   // top-level view; subagent rows are forensic detail.
@@ -251,6 +260,7 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
           plan: false,
           listSessions: false,
           includeSubagents: false,
+          explainPermissions: false,
           yes: false,
         },
       };
@@ -267,6 +277,7 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
       plan: false,
       listSessions: false,
       includeSubagents: false,
+      explainPermissions: false,
       yes: false,
       init: { force, mode, playbooks },
     },
@@ -284,6 +295,7 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
     plan: false,
     listSessions: false,
     includeSubagents: false,
+    explainPermissions: false,
     yes: false,
   };
   const promptParts: string[] = [];
@@ -314,6 +326,10 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         break;
       case '--include-subagents':
         args.includeSubagents = true;
+        i += 1;
+        break;
+      case '--explain-permissions':
+        args.explainPermissions = true;
         i += 1;
         break;
       case '--resume': {
@@ -733,6 +749,7 @@ export const usage = (): string =>
     '  --undo <session>       Restore the latest checkpoint of a session',
     '  --worktrees <verb>     Inspect / gc subagent worktrees (verb: list, gc)',
     '  --memory <verb>        Inspect cross-session memory (verb: list [scope] | show <name> [scope])',
+    '  --explain-permissions  Print the resolved permission policy + per-section layer attribution and exit',
     '  --checkpoints <cmd>    Checkpoint subcommands: list <session> | diff <session> <ckpt>',
     '                          | restore <session> <ckpt> | purge <session>',
     '  --yes, -y              Skip the bash-side-effect confirm on undo/restore',

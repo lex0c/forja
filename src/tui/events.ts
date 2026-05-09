@@ -15,6 +15,8 @@
 // and HarnessEvent diverge in shape, an adapter sits between them
 // (introduced in a later step).
 
+import type { PolicyLayer } from '../permissions/index.ts';
+
 // Common metadata. `ts` is wall-clock ms since epoch — useful for
 // rendering "elapsed" without the renderer holding its own clock.
 interface BaseEvent {
@@ -243,6 +245,24 @@ export type PermissionAskEvent = BaseEvent & {
   cwd: string;
   // Optional risk hint — when present, modal shows the "why?" detail.
   rule?: string;
+  // Pattern that would be promoted onto the engine's session
+  // allowlist on `session-allow`. Drives option 2's label ("Yes,
+  // don't ask again for: <X>"). Distinct from `rule` because the
+  // engine also fires confirm without a matched rule (compound-
+  // command guard, missing-arg, etc.) — for those, the bridge
+  // derives a literal from args (the bash command, the fs path,
+  // the URL host) so option 2 still reflects what addSessionAllow
+  // will actually register. When omitted, option 2's label falls
+  // back to "Yes, allow all <tool> during this session" — the
+  // pre-promotion vague wording, accurate when no promotion will
+  // happen (subagent-proxied confirms today; legacy events).
+  sessionAllowTarget?: string;
+  // Policy layer that holds the matching rule (PolicyLayer in
+  // permissions/types.ts). When set alongside `rule`, the reducer
+  // renders "matched rule: <rule> (<layer> policy)" so the operator
+  // knows which YAML to edit. Optional for backwards compat with
+  // synthesized events / subagent-proxied confirms.
+  layer?: PolicyLayer;
   reason?: string;
   // Subagent attribution. Set when the ask was proxied from a
   // child subagent over IPC (spec docs/spec/IPC.md §7). The

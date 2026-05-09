@@ -15,6 +15,78 @@ Format:
 
 ---
 
+## [2026-05-08] permission-ergonomics — Slice 12: session-allow extends to compound-confirm shapes (no matched rule)
+
+**Done:** Closed the second class of session-allow UX lie. The
+previous slice promoted only when the engine emitted `source.rule`
+— which left compound-command confirms (and any future
+synthesized confirm without a matched rule) silently no-op'ing
+on option 2: modal said "Yes, don't ask again", bridge returned
+true, no rule registered, same compound re-prompted on the next
+step.
+
+The bridge now derives a literal promotion target from args when
+no matched rule is present:
+- bash → `args.command`
+- read_file / write_file / edit_file / grep → `args.path`
+- glob → `args.cwd`
+- fetch_url → URL hostname
+
+The new field `sessionAllowTarget` flows separately from `rule`
+through the modal pipeline (`PermissionAskArgs` → event →
+reducer → `buildPermissionOptions`) so option 2's label reflects
+what `addSessionAllow` will actually register, while the
+matched-rule attribution line stays driven by the engine's
+`source.rule` (renders only when a real rule fired).
+
+| Change | Where | Why |
+|---|---|---|
+| `derivePromotionTarget(section, args, matchedRule)` helper | `src/cli/repl.ts` | Single derivation site per section. Falls back to literal command/path/host when matched rule is absent OR when matched rule is a pure catch-all (`*`, `**`); returns undefined when args don't carry the expected field (defense-in-depth — bridge falls back to one-shot allow). The catch-all override prevents the init-template's `confirm: ['*']` from being promoted into an unbounded session-allow on a casual click — operator's "yes" gets scoped to the literal command they saw, not the universe of bash. Operator-authored breadth (e.g. `rm *`) is still promoted as authored. |
+| `sessionAllowTarget?: string` field on `PermissionAskArgs` + `PermissionAskEvent` + bridge → modalManager.askPermission | `src/tui/modal-manager.ts`, `src/tui/events.ts`, `src/cli/repl.ts` | Decouples the option-2 label from the matched-rule attribution. Modal's "Yes, don't ask again for: <X>" now matches what addSessionAllow registers; matched-rule line stays accurate (only renders when a real rule fired). |
+| `buildPermissionOptions(toolName, sessionAllowTarget)` signature shift | `src/tui/modal-manager.ts` | Renamed parameter from `rule` to `sessionAllowTarget` — the function's job was always to drive option 2, but the old name conflated the two concerns. |
+| State reducer reads `event.sessionAllowTarget ?? event.rule` | `src/tui/state.ts` | Backward compat: events that pre-date this field (synthesized by tests, future producers) keep their existing label behavior. |
+| Bridge guards: subagent skip moves to `sessionAllowTarget` derivation | `src/cli/repl.ts` | Subagent confirms get `sessionAllowTarget = undefined` (derivation skipped at the source). Modal renders the vague fallback wording — accurate, since no promotion will happen. |
+| 6 new bridge tests + 3 new state-reducer tests | `tests/cli/repl.test.ts`, `tests/tui/state.test.ts` | Pinned: compound-confirm (no rule) promotes the literal command, no-args-derivable falls back to one-shot allow, subagent fallback to vague wording, catch-all `*` rule + bash promotes args.command literal, catch-all `**` rule + read_file promotes args.path literal, deliberately-broad `rm *` promotes the rule as authored. State reducer: option 2 uses sessionAllowTarget independently of rule, matched-rule attribution stays absent for derived-target shape, catch-all label shows the literal while attribution still shows engine's `*`. |
+
+**Decisions:**
+- Field separation (`rule` vs `sessionAllowTarget`) instead of overloading `rule` — keeps the matched-rule attribution honest. Conflating them would make the modal say "matched rule: git status; pwd (project policy)" for a compound-confirm, which is a misattribution: the engine fired structurally, not from a rule.
+- Subagent confirms degrade to the vague "allow all bash during this session" wording (since `sessionAllowTarget` isn't set). This is HONEST behavior under the current subagent-skip guard — promising "don't ask again for: <X>" when no promotion happens would re-introduce the UX lie one layer up.
+- Catch-all override (`*`/`**` matched rules fall through to literal derivation) is conservative — only the bare wildcard shapes count. Operator-authored breadth like `rm *` or `/tmp/**` is intentional and gets promoted as authored. Heuristic could grow (e.g. flag patterns whose regex compiles to `.*` after escape) but the bare-wildcard set covers the realistic footgun (init-template `confirm: ['*']` reflexive click) without policing operator intent.
+
+**Pending:** Same as slice 9 — `/perms commit` and full subagent session-allow.
+
+---
+
+## [2026-05-08] permission-ergonomics — Slice 9: session-allow promotes the matched rule onto the engine
+
+**Done:** "Yes, don't ask again for: <rule>" (modal option 2)
+stops being a UX lie. Until this slice the bridge mapped both
+`'yes'` and `'session-allow'` to the same `true` — operators picking
+option 2 saw the modal again on the very next matching call. Now
+the bridge promotes the matched rule onto an in-memory
+session-scoped allowlist on the engine BEFORE returning true, so
+subsequent matching calls allow without prompting.
+
+| Change | Where | Why |
+|---|---|---|
+| `addSessionAllow(section, pattern)` on `PermissionEngine` interface + closure-backed `Map<sectionKey, string[]>` | `src/permissions/engine.ts` | The mutation point. Append-only, deduped, trims whitespace, refuses empty patterns. In-memory only — vanishes on process exit (persisting session rules into `.agent/permissions.yaml` is a separate slice — Tier 5 `/perms commit`). |
+| Session-allow check threaded into `checkBash` / `checkPath` / `checkFetch` between deny and base allow | `src/permissions/engine.ts` | Order: deny (always wins) → session-allow (operator's runtime override) → compound guard (bash only) → base allow → base confirm → default-deny. Session-allow shortcuts past compound guard intentionally — operator already saw the modal once for that literal compound and explicitly authorized; the safety net was the first-time prompt. Decision carries `source.layer = 'session'` so `/perms why` and the modal attribute the rule to the runtime override, not the layer the section originally lived in. |
+| Bridge promotes on `answer === 'session-allow'` when subagent absent AND source has both `rule` + `section` (and section is a known `keyof PolicyToolsSection`) | `src/cli/repl.ts` | Synthesized confirms (compound-command guard, missing-arg rejections) carry no source.rule — those fall back to one-shot allow, matching option 1 behavior. Subagent-proxied requests skip promotion entirely: the child engine is built from `policySnapshot = parent.policy()` (subagent runtime), and `policy()` does NOT include session rules — they live in the parent closure's Map. Promoting onto parent on a child confirm would write a rule the child never sees, so the child re-prompts on every step while the parent's engine accrues inert state. Subagent session-allow needs both IPC source marshaling AND a child-engine push-down; tracked as a separate slice. |
+| `isPolicySectionKey` runtime guard | `src/cli/repl.ts` | `PolicySource.section` is typed `string` (loose for forward compat). Bridge needs a runtime allowlist before calling `addSessionAllow` — defense against a future engine that emits a section name we can't promote. |
+| 12 engine tests + 3 bridge tests | `tests/permissions/engine.test.ts`, `tests/cli/repl.test.ts` | Pinned: bash promotes rule, layer attribution flips to `'session'` even when base section came from `project`, deny still wins, compound-command guard skipped on session-trusted literal, per-section state isolation (write_file rule does NOT leak into read_file), search-tool root semantics preserved, dedup, empty-pattern guard, whitespace trim. Bridge tests drive the full stdin → modal → bridge → engine seam: `'2'` promotes, `'1'` does not, missing source.rule falls back to one-shot allow. |
+| Modal-manager comment refresh: removed "deferred" qualifier | `src/tui/modal-manager.ts` | Keep the comment honest with the implementation. |
+
+**Decisions:**
+- Session-allow shortcuts past the compound-command guard (deliberate, not a bug). Operator already saw the modal once for that literal compound; promoting the literal `git status; pwd` means the second occurrence allows without prompting. The compound guard exists for ACCIDENTAL compounds — once an operator says "trust this exact pattern for the session", the safety net's job is done.
+- Empty/whitespace-only patterns are silently dropped at the engine layer instead of throwing. Bridge should never call us with one (it guards on `req.source.rule !== undefined`), but a future loose entry point (slash command, hook payload) trimming a pattern down to empty would otherwise corrupt the allowlist.
+- In-memory only, no persistence to YAML. Operator restart = session rules lost. Promoting session-allowlist to project layer (so the rule survives across REPL restarts) is a separate slice.
+
+**Pending:** `/perms commit` (promote session rules to project YAML; Tier 5 of the ergonomics roadmap). Subagent session-allow: needs IPC source marshaling AND a child-engine push-down (or folding session rules into the `policy()` snapshot the subagent runtime uses). Today the bridge guards `req.subagent === undefined` so child confirms always fall back to one-shot allow regardless of source presence.
+
+**Next:** Branch `feat/permission-ergonomics` is ready for review. The session-allow gap was the most user-visible UX lie that survived the previous 8 commits — option 2 of the modal now does what its label promises.
+
+---
+
 ## [2026-05-08] m4/critique — Slice H: real-model calibration (prompt v2 + threshold 0.85)
 
 **Done:** First real-model run of `bun run eval:critique` against
