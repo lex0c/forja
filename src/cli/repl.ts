@@ -98,6 +98,25 @@ const CATCH_ALL_PATTERNS: ReadonlySet<string> = new Set(['*', '**']);
 
 const isCatchAllPattern = (pattern: string): boolean => CATCH_ALL_PATTERNS.has(pattern.trim());
 
+// For search tools (glob/grep), the engine's checkPath matches
+// against a synthetic-descendant target (`<root>/.forja-check`)
+// rather than the literal root, so an allow_paths rule like
+// `src/**` matches `src` as a search root. Session promotion has
+// to follow the same convention: a literal `/proj` rule never
+// matches `/proj/.forja-check` (Bun.Glob's `**` requires at
+// least one path segment, and a bare path requires exact match),
+// so an operator who session-allows grep rooted at `/proj` would
+// otherwise be re-prompted on the next identical call. Append
+// `/**` to make the rule descendant-capable; if the input
+// already ends in `**`, leave it alone (defensive — args.cwd
+// usually carries literal paths, but a future caller might pass
+// a glob).
+const ensureDescendantGlob = (root: string): string => {
+  if (root.endsWith('**')) return root;
+  const trimmed = root.endsWith('/') ? root.slice(0, -1) : root;
+  return `${trimmed}/**`;
+};
+
 // Derives the pattern that would be promoted onto the engine's
 // session-allow Map for a given confirm. Falls back from the
 // engine's matched rule to a literal extracted from the tool args
@@ -127,9 +146,14 @@ const isCatchAllPattern = (pattern: string): boolean => CATCH_ALL_PATTERNS.has(p
 //   - grep: args.path when set, otherwise the request cwd. The
 //     engine's resolveFsTarget treats absent args.path as "search
 //     the session cwd"; the promotion mirrors that effective root.
+//     The derived root is wrapped via ensureDescendantGlob so the
+//     stored pattern is descendant-capable (`<root>/**`) — engine
+//     checkPath probes search tools with a synthetic descendant
+//     target, and a bare-path rule would never match.
 //   - glob: args.cwd when set, otherwise the request cwd. Same
 //     reason as grep — glob has no `path` arg, and resolveFsTarget
-//     falls back to session cwd when args.cwd is absent.
+//     falls back to session cwd when args.cwd is absent. Same
+//     descendant-glob wrapping applies.
 //   - fetch_url: args.url's hostname. Promoted as an `allow_hosts`
 //     entry; future calls to any URL on the same host match.
 //
@@ -167,13 +191,18 @@ const derivePromotionTarget = (
     }
     case 'grep': {
       const v = args.path;
-      if (typeof v === 'string' && v.length > 0) return v;
-      return cwd.length > 0 ? cwd : undefined;
+      const root = typeof v === 'string' && v.length > 0 ? v : cwd;
+      if (root.length === 0) return undefined;
+      // Append `/**` so the session rule matches the synthetic
+      // descendant the engine probes with — a bare `<root>` rule
+      // would never fire on the next identical call.
+      return ensureDescendantGlob(root);
     }
     case 'glob': {
       const v = args.cwd;
-      if (typeof v === 'string' && v.length > 0) return v;
-      return cwd.length > 0 ? cwd : undefined;
+      const root = typeof v === 'string' && v.length > 0 ? v : cwd;
+      if (root.length === 0) return undefined;
+      return ensureDescendantGlob(root);
     }
     case 'fetch_url': {
       const v = args.url;

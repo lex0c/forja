@@ -914,6 +914,20 @@ describe('addSessionAllow (runtime "Yes, don\'t ask again for: <rule>")', () => 
     expect(eng.check('grep', 'fs.read', { path: 'src' }).kind).toBe('allow');
   });
 
+  test('search-tool session-allow with bare-root pattern does NOT fire (regression pin)', () => {
+    // Documents the bug the bridge's ensureDescendantGlob exists
+    // to work around: a bare `<root>` rule (no `/**` suffix) never
+    // matches the engine's synthetic-descendant probe. Engine
+    // builds `src/.forja-check` as the match target; Bun.Glob
+    // matches `src` only against exact `src`, so the rule never
+    // fires. Without the bridge wrapping the promotion as `src/**`,
+    // the operator's session-allow click would silently no-op.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    eng.addSessionAllow('grep', 'src');
+    // Bare-root rule: doesn't fire → falls through to default-deny.
+    expect(eng.check('grep', 'fs.read', { path: 'src' }).kind).toBe('deny');
+  });
+
   test('session-allow runs BEFORE base confirm rules (skips the modal)', () => {
     // Without session-allow the request would confirm. Operator's
     // session-allow short-circuits past the confirm — that's the

@@ -1525,9 +1525,63 @@ describe('repl — boot + smoke', () => {
     stdin.feed('2');
     await tick();
     expect(await askPromise).toBe(true);
-    // Promotion uses the request cwd since args.cwd is absent
-    // and the matched rule is catch-all.
-    expect(sessionAllowCalls).toEqual([{ section: 'glob', pattern: '/proj' }]);
+    // Promotion uses the request cwd as the search root, wrapped
+    // in `/**` so the engine's synthetic-descendant probe
+    // (`<root>/.forja-check`) actually matches the session rule
+    // on the next identical call. A bare `/proj` would never fire
+    // — Bun.Glob's `**` requires at least one path segment.
+    expect(sessionAllowCalls).toEqual([{ section: 'glob', pattern: '/proj/**' }]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow on glob with explicit args.cwd wraps it as a descendant glob', async () => {
+    // Even when the operator-side args carry a specific cwd, the
+    // engine still probes search tools with `<root>/.forja-check`.
+    // A literal `src` rule never matches that synthetic target, so
+    // the bridge wraps the input as `src/**`. Counter to the
+    // implicit-cwd case: this proves the wrapping isn't gated on
+    // "args missing" — it's the search-tool semantics that
+    // demand it.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'glob',
+      args: { pattern: '**/*.ts', cwd: 'src' },
+      cwd: '/proj',
+      prompt: 'matched confirm rule: **',
+      source: {
+        layer: 'project',
+        rule: '**',
+        section: 'glob',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    expect(sessionAllowCalls).toEqual([{ section: 'glob', pattern: 'src/**' }]);
     ra.finish(0);
     await tick();
     stdin.feed('\x04');
@@ -1573,7 +1627,8 @@ describe('repl — boot + smoke', () => {
     stdin.feed('2');
     await tick();
     expect(await askPromise).toBe(true);
-    expect(sessionAllowCalls).toEqual([{ section: 'grep', pattern: '/proj' }]);
+    // Same descendant-glob wrapping as glob.
+    expect(sessionAllowCalls).toEqual([{ section: 'grep', pattern: '/proj/**' }]);
     ra.finish(0);
     await tick();
     stdin.feed('\x04');
