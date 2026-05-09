@@ -1685,6 +1685,61 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('confirmPermission session-allow on bash escapes glob metachars before promotion', async () => {
+    // The end-to-end pin for the `echo *` bypass: bridge derives
+    // args.command as the literal, escapes it via
+    // escapeGlobMetacharacters, and the engine receives a literal-
+    // matching rule. The reviewer's specific scenario: confirming
+    // `echo *` must NOT authorize subsequent `echo $(...)`
+    // injection.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: 'echo *' },
+      cwd: '/r',
+      prompt: 'matched confirm rule: *',
+      // Catch-all rule from the init template — derivation falls
+      // through to args, escapes the literal.
+      source: {
+        layer: 'project',
+        rule: '*',
+        section: 'bash',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    // Promoted pattern is the ESCAPED literal: `*` and `?` get
+    // backslash-prefixed. Future `echo *` matches; future
+    // `echo something_else` does NOT.
+    expect(sessionAllowCalls).toEqual([{ section: 'bash', pattern: 'echo \\*' }]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('confirmPermission session-allow on a subagent-proxied request does NOT promote onto the parent engine', async () => {
     // Subagent confirms gate against the CHILD's own engine
     // (subagent runtime constructs it from `policySnapshot =

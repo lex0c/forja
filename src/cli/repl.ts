@@ -23,6 +23,7 @@ import { existsSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
 import { effectiveBudget, resolveMaxOutputTokens } from '../harness/types.ts';
+import { escapeGlobMetacharacters } from '../permissions/index.ts';
 import type { PolicySource, PolicyToolsSection } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
 import { stripAnsi } from '../sanitize/index.ts';
@@ -166,6 +167,16 @@ const ensureDescendantGlob = (root: string): string => {
 // identical call. Deriving from the request cwd closes that
 // no-op path.
 //
+// Args-derived literals are escaped via escapeGlobMetacharacters
+// before being returned: the engine stores session-allow rules
+// as glob patterns, so a raw `args.command` like `echo *` would
+// otherwise be interpreted as "any echo invocation" and admit
+// later injection variants (the engine consults session-allow
+// BEFORE the compound-shell guard). Escaping makes the rule
+// match the literal command only. Matched-rule values are
+// returned verbatim — those came from operator-authored YAML
+// where wildcards are intentional.
+//
 // Returns undefined when the args don't carry the expected field
 // AND no fallback applies. Bridge guards on undefined to fall
 // back to one-shot allow.
@@ -181,33 +192,40 @@ const derivePromotionTarget = (
   switch (section) {
     case 'bash': {
       const v = args.command;
-      return typeof v === 'string' && v.length > 0 ? v : undefined;
+      if (typeof v !== 'string' || v.length === 0) return undefined;
+      return escapeGlobMetacharacters(v);
     }
     case 'read_file':
     case 'write_file':
     case 'edit_file': {
       const v = args.path;
-      return typeof v === 'string' && v.length > 0 ? v : undefined;
+      if (typeof v !== 'string' || v.length === 0) return undefined;
+      return escapeGlobMetacharacters(v);
     }
     case 'grep': {
       const v = args.path;
       const root = typeof v === 'string' && v.length > 0 ? v : cwd;
       if (root.length === 0) return undefined;
-      // Append `/**` so the session rule matches the synthetic
-      // descendant the engine probes with — a bare `<root>` rule
-      // would never fire on the next identical call.
-      return ensureDescendantGlob(root);
+      // Escape the literal root before appending `/**` so the
+      // wildcard part stays intentional. Without escaping, a
+      // root that contains `*` (rare but possible) would broaden
+      // the rule beyond the operator's intent.
+      return ensureDescendantGlob(escapeGlobMetacharacters(root));
     }
     case 'glob': {
       const v = args.cwd;
       const root = typeof v === 'string' && v.length > 0 ? v : cwd;
       if (root.length === 0) return undefined;
-      return ensureDescendantGlob(root);
+      return ensureDescendantGlob(escapeGlobMetacharacters(root));
     }
     case 'fetch_url': {
       const v = args.url;
       if (typeof v !== 'string' || v.length === 0) return undefined;
       try {
+        // Hostnames per RFC 1123 cannot contain glob meta — `*`,
+        // `?`, `\\` are never valid in a DNS label. URL.hostname
+        // would have rejected the URL or returned an exotic form
+        // long before we got here. Pass through without escape.
         return new URL(v).hostname;
       } catch {
         return undefined;

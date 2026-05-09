@@ -14,6 +14,7 @@ export type {
 } from './types.ts';
 
 export {
+  escapeGlobMetacharacters,
   firstMatchingCommand,
   firstMatchingHost,
   firstMatchingPath,

@@ -64,10 +64,41 @@ const REGEX_META = /[.+^${}()|[\]\\]/g;
 
 const compileGlobToRegex = (pattern: string): RegExp => {
   let out = '';
-  for (const ch of pattern) {
+  let i = 0;
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === undefined) break;
+    // Backslash escape: the next char is a literal, never a
+    // wildcard. Used by callers that need to promote raw input as
+    // a literal rule — for example the session-allow bridge,
+    // which calls `escapeGlobMetacharacters(args.command)` before
+    // adding the rule. Without escape support, an operator
+    // confirming `echo *` would have the rule's `*` interpreted
+    // as a wildcard, broadening "yes for this exact command" to
+    // "yes for any echo invocation" (and via the dotAll regex,
+    // even injection like `echo $(rm -rf /)`).
+    if (ch === '\\' && i + 1 < pattern.length) {
+      const lit = pattern[i + 1];
+      if (lit !== undefined) {
+        // Escape the literal for regex output. `*` and `?` are
+        // glob meta the regular branch handles separately, so
+        // they're NOT in REGEX_META and need explicit escaping
+        // here — without this, an escaped `\*` would emit `*`
+        // verbatim, which is the regex "0-or-more" quantifier
+        // and does NOT match a literal asterisk.
+        if (lit === '*' || lit === '?') {
+          out += `\\${lit}`;
+        } else {
+          out += lit.replace(REGEX_META, '\\$&');
+        }
+        i += 2;
+        continue;
+      }
+    }
     if (ch === '*') out += '.*';
     else if (ch === '?') out += '.';
     else out += ch.replace(REGEX_META, '\\$&');
+    i += 1;
   }
   // `s` (dotAll) so `.` (and therefore the `.*` we use for `*`) matches
   // newlines too. The `bash` tool accepts multi-line commands; without
@@ -76,6 +107,26 @@ const compileGlobToRegex = (pattern: string): RegExp => {
   // default deny.
   return new RegExp(`^${out}$`, 's');
 };
+
+// Escapes the three glob-meaningful characters (`*`, `?`, `\\`)
+// so the resulting string, fed back through compileGlobToRegex,
+// matches its source LITERALLY rather than as a glob. Backslash
+// itself is escaped because compileGlobToRegex's escape branch
+// consumes it; an unescaped trailing backslash in the literal
+// would otherwise swallow whatever precedes the next char and
+// silently shift the pattern.
+//
+// Used by the session-allow bridge to promote `args.command` /
+// `args.path` as exact-match rules. A bash command like `echo *`
+// becomes `echo \*`; future calls of `echo *` match (the
+// compiler's escape branch produces `^echo \*$/s`), but `echo
+// $(rm -rf /)` does not. Without this, the session rule's `*`
+// would be a wildcard and the engine's order (session-allow
+// before compound-shell guard) would auto-allow the injection.
+const GLOB_META = /[\\*?]/g;
+
+export const escapeGlobMetacharacters = (literal: string): string =>
+  literal.replace(GLOB_META, '\\$&');
 
 // Command matching: pattern with `*` matches any sequence of characters
 // (including spaces and slashes). Patterns without `*` must match the full

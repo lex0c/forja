@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   containsShellInjection,
+  escapeGlobMetacharacters,
   firstMatchingCommand,
   firstMatchingHost,
   firstMatchingPath,
@@ -80,6 +81,63 @@ describe('matchCommand', () => {
 
   test('? matches a single character including newline', () => {
     expect(matchCommand('a?b', 'a\nb')).toBe(true);
+  });
+
+  test('backslash-escaped wildcards match literally', () => {
+    // `\\*` means literal `*`, not "any chars". Used by the
+    // session-allow bridge to promote `args.command` as a literal
+    // exact-match rule. Without this, a session rule for `echo *`
+    // would broaden to "any echo invocation" via the dotAll regex.
+    expect(matchCommand('echo \\*', 'echo *')).toBe(true);
+    expect(matchCommand('echo \\*', 'echo file.txt')).toBe(false);
+    expect(matchCommand('echo \\*', 'echo $(rm -rf /)')).toBe(false);
+    // `\\?` means literal `?`.
+    expect(matchCommand('cmd \\?', 'cmd ?')).toBe(true);
+    expect(matchCommand('cmd \\?', 'cmd a')).toBe(false);
+    // `\\\\` means literal backslash.
+    expect(matchCommand('cmd \\\\', 'cmd \\')).toBe(true);
+    // Mixing literal and wildcard: `echo \\* *` means "echo *"
+    // followed by anything.
+    expect(matchCommand('echo \\* *', 'echo * extra')).toBe(true);
+    expect(matchCommand('echo \\* *', 'echo file extra')).toBe(false);
+  });
+});
+
+describe('escapeGlobMetacharacters', () => {
+  test('escapes *, ?, and backslash so the result matches literally via matchCommand', () => {
+    // Round-trip: any literal string, escaped then matched
+    // against itself, must match. This is the contract the
+    // session-allow bridge depends on.
+    const literals = [
+      'echo *',
+      'rm -rf .',
+      'cmd ?',
+      'echo $(date)',
+      'git push origin main',
+      'cmd \\',
+      'multi\nline',
+    ];
+    for (const s of literals) {
+      expect(matchCommand(escapeGlobMetacharacters(s), s)).toBe(true);
+    }
+  });
+
+  test('escaped literal does NOT match other commands', () => {
+    expect(matchCommand(escapeGlobMetacharacters('echo *'), 'echo file')).toBe(false);
+    expect(matchCommand(escapeGlobMetacharacters('echo *'), 'echo $(rm -rf /)')).toBe(false);
+  });
+
+  test('strings without metachars pass through unchanged', () => {
+    // No-op for the common case; pin so a future broader regex
+    // doesn't accidentally escape printable chars.
+    expect(escapeGlobMetacharacters('git status')).toBe('git status');
+    expect(escapeGlobMetacharacters('npm test --watch')).toBe('npm test --watch');
+  });
+
+  test('all three meta chars escaped', () => {
+    expect(escapeGlobMetacharacters('*')).toBe('\\*');
+    expect(escapeGlobMetacharacters('?')).toBe('\\?');
+    expect(escapeGlobMetacharacters('\\')).toBe('\\\\');
   });
 });
 

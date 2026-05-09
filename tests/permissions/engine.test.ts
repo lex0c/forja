@@ -914,6 +914,51 @@ describe('addSessionAllow (runtime "Yes, don\'t ask again for: <rule>")', () => 
     expect(eng.check('grep', 'fs.read', { path: 'src' }).kind).toBe('allow');
   });
 
+  test('escaped-literal session-allow does NOT broaden via wildcards (regression pin for the echo * bypass)', () => {
+    // The bridge's escapeGlobMetacharacters wraps args.command
+    // before promotion. This test pins the engine-level effect:
+    //   - the escaped rule matches the original literal (operator
+    //     doesn't get re-prompted)
+    //   - the escaped rule does NOT match injection variants
+    //     (`echo $(rm -rf /)`, `echo extra`, etc.)
+    // Without escaping, the rule's `*` would be a wildcard and
+    // the engine's order (session-allow before compound guard)
+    // would auto-allow the injection.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    eng.addSessionAllow('bash', 'echo \\*');
+    // Original literal: allowed.
+    expect(eng.check('bash', 'bash', { command: 'echo *' }).kind).toBe('allow');
+    // Plain variant: NOT matched by the escaped rule, no other
+    // rules to fall through to → default-deny.
+    expect(eng.check('bash', 'bash', { command: 'echo file.txt' }).kind).toBe('deny');
+    // Injection variant: session-allow doesn't match (escape
+    // worked), so falls through to the compound-shell guard which
+    // forces confirm. The crucial property is "NOT allow" — the
+    // bypass would have returned allow without the bridge's
+    // escaping. Confirm here means the operator gets another
+    // modal, which is the safe behavior.
+    expect(eng.check('bash', 'bash', { command: 'echo $(rm -rf /)' }).kind).toBe('confirm');
+  });
+
+  test('UNESCAPED bare wildcard rule still broadens (negative pin — proves the bridge fix is load-bearing)', () => {
+    // Documents what the bridge's escaping prevents. A bare `*`
+    // pattern stored as session-allow IS a wildcard at the
+    // matcher level — that's why the bridge has to escape
+    // args-derived literals. Without the bridge layer, an
+    // operator's "Yes, don't ask again for: echo *" would
+    // accidentally authorize every echo invocation.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    eng.addSessionAllow('bash', 'echo *');
+    // Unescaped: matches the original AND every other echo.
+    expect(eng.check('bash', 'bash', { command: 'echo *' }).kind).toBe('allow');
+    expect(eng.check('bash', 'bash', { command: 'echo file.txt' }).kind).toBe('allow');
+    // BUT note: `echo $(...)` still trips the compound-shell
+    // guard? Actually no — session-allow runs BEFORE the guard.
+    // This is exactly the bypass shape the bridge's escape
+    // closes from the operator's side.
+    expect(eng.check('bash', 'bash', { command: 'echo $(rm -rf /)' }).kind).toBe('allow');
+  });
+
   test('search-tool session-allow with bare-root pattern does NOT fire (regression pin)', () => {
     // Documents the bug the bridge's ensureDescendantGlob exists
     // to work around: a bare `<root>` rule (no `/**` suffix) never
