@@ -45,6 +45,33 @@ export interface PermissionEngine {
   // (typical policies are sub-10KB) compared to the latent-bug
   // surface a shared reference would expose.
   policy(): Policy;
+  // Append a pattern to the session-scoped allowlist for the
+  // given section. Used by the REPL's "Yes, don't ask again
+  // for: <rule>" modal answer — the bridge calls this BEFORE
+  // returning true so subsequent calls matching the pattern
+  // skip the modal entirely.
+  //
+  // The pattern semantics depend on the section:
+  //   - bash → matched against `args.command` (glob).
+  //   - read_file / write_file / edit_file / glob / grep → matched
+  //     against the resolved fs target as an `allow_paths` entry.
+  //   - fetch_url → matched against the request URL's host as an
+  //     `allow_hosts` entry.
+  //
+  // Session rules consult BEFORE base allow rules, so an operator's
+  // session-allow shortcuts past any per-tool confirm rule that
+  // would otherwise fire. Deny rules still win.
+  //
+  // Decisions emitted via a session rule carry
+  // `source.layer = 'session'`, so the modal (if it ever pops
+  // again — it shouldn't, because the rule allows) and `/perms
+  // why` audit can attribute the rule to the runtime override.
+  //
+  // In-memory only — the engine's session state vanishes when the
+  // process exits. Promoting session rules to a persistent layer
+  // is a separate slice (TODO: permission ergonomics Tier 5
+  // `/perms commit`).
+  addSessionAllow(section: keyof PolicyToolsSection, pattern: string): void;
 }
 
 // Loose shape used for argument-shape lookups. The engine reads only the
@@ -123,6 +150,7 @@ const checkBash = (
   rules: BashPolicy | undefined,
   mode: PolicyMode,
   provenance: SectionProvenance | undefined,
+  sessionAllow: readonly string[] | undefined,
 ): Decision => {
   const command = args.command;
   if (typeof command !== 'string' || command.length === 0) {
@@ -138,11 +166,12 @@ const checkBash = (
 
   const layer = sectionLayer(provenance, 'bash');
 
-  // Deny rules win over everything (including compound commands
-  // and bypass — though bypass short-circuits before this fn).
-  // Run deny FIRST so a hostile compound like `git status; rm
-  // -rf /tmp/*` still gets denied if the literal matches a deny
-  // pattern.
+  // Deny rules win over everything (including compound commands,
+  // session-allow, and bypass — though bypass short-circuits
+  // before this fn). Run deny FIRST so a hostile compound like
+  // `git status; rm -rf /tmp/*` still gets denied if the literal
+  // matches a deny pattern. Operator session-allow can never
+  // override a deny.
   const denied = firstMatchingCommand(rules?.deny, command);
   if (denied !== null) {
     return {
@@ -152,16 +181,34 @@ const checkBash = (
     };
   }
 
+  // Session-allow check: operator's "Yes, don't ask again for:
+  // <rule>" promotes a pattern into an in-memory session
+  // allowlist. Matches BEFORE the compound guard and the base
+  // allowlist so a session-trusted shape skips the modal next
+  // time. Deny already ran above. Compound guard is bypassed
+  // intentionally — operator explicitly authorized this pattern
+  // for the session, the safety net for ACCIDENTAL compounds is
+  // the modal that fired the first time.
+  const sessionMatched = firstMatchingCommand(sessionAllow, command);
+  if (sessionMatched !== null) {
+    return {
+      kind: 'allow',
+      reason: `bash command matched session-allow rule: ${sessionMatched}`,
+      source: { layer: 'session', rule: sessionMatched, section: 'bash' },
+    };
+  }
+
   // Compound-command guard: glob `*` in an allow pattern admits
   // injection (`git status; <anything>` matches `git status*`).
   // Force confirm on any command containing shell metacharacters
   // (`;`, `&&`, `||`, `|`, `$(...)`, backticks). Operator always
   // sees the literal command for a compound and decides
-  // explicitly. Deny rules already ran above; allow rules are
-  // skipped — by design, no allow pattern can silently admit a
-  // compound. Operator who needs a specific compound silenced
-  // narrows the policy with a deny exception or runs the
-  // commands separately.
+  // explicitly. Deny rules already ran above; base allow rules
+  // are skipped — by design, no base allow pattern can silently
+  // admit a compound. Operator who needs a specific compound
+  // silenced narrows the policy with a deny exception, runs the
+  // commands separately, or session-allows the literal pattern
+  // (the path that already cleared the modal once).
   if (containsShellInjection(command)) {
     return {
       kind: 'confirm',
@@ -220,6 +267,7 @@ const checkPath = (
   isWrite: boolean,
   provenance: SectionProvenance | undefined,
   sectionKey: keyof PolicyToolsSection,
+  sessionAllow: readonly string[] | undefined,
 ): Decision => {
   const path = resolveFsTarget(toolName, args, cwd);
   if (path === null) {
@@ -247,6 +295,19 @@ const checkPath = (
       kind: 'deny',
       reason: `path matched deny rule: ${denied}`,
       source: { layer, rule: denied, section: sectionName },
+    };
+  }
+  // Session-allow check: same semantics as base `allow_paths` but
+  // sourced from the operator's runtime "Yes, don't ask again for:
+  // <pattern>" answers. Runs before base allow so operator's
+  // session decision shortcuts past any base confirm rule that
+  // would otherwise fire. Deny already ran above.
+  const sessionMatched = firstMatchingPath(sessionAllow, matchTarget, cwd);
+  if (sessionMatched !== null) {
+    return {
+      kind: 'allow',
+      reason: `path matched session-allow rule: ${sessionMatched}`,
+      source: { layer: 'session', rule: sessionMatched, section: sectionName },
     };
   }
   const allowed = firstMatchingPath(rules?.allow_paths, matchTarget, cwd);
@@ -289,6 +350,7 @@ const checkFetch = (
   rules: FetchPolicy | undefined,
   mode: PolicyMode,
   provenance: SectionProvenance | undefined,
+  sessionAllow: readonly string[] | undefined,
 ): Decision => {
   const url = args.url;
   if (typeof url !== 'string' || url.length === 0) {
@@ -316,6 +378,17 @@ const checkFetch = (
       kind: 'deny',
       reason: `host matched deny rule: ${denied}`,
       source: { layer, rule: denied, section: 'fetch_url' },
+    };
+  }
+  // Session-allow check: same precedence as the bash/path branches.
+  // Pattern matched against the URL host (not the full URL); the
+  // base `allow_hosts` semantics carry over.
+  const sessionMatched = firstMatchingHost(sessionAllow, host);
+  if (sessionMatched !== null) {
+    return {
+      kind: 'allow',
+      reason: `host matched session-allow rule: ${sessionMatched}`,
+      source: { layer: 'session', rule: sessionMatched, section: 'fetch_url' },
     };
   }
   const allowed = firstMatchingHost(rules?.allow_hosts, host);
@@ -375,6 +448,15 @@ export const createPermissionEngine = (
   const cwd = options.cwd;
   const provenance = options.provenance;
 
+  // Session-scoped allowlist: per-section list of patterns the
+  // operator promoted via the modal's "Yes, don't ask again
+  // for: <rule>" answer. In-memory only — survives the lifetime
+  // of this engine instance, vanishes on process exit. The Map
+  // grows append-only during a session; rules are NEVER removed
+  // (a future `/perms forget` slash would clear them, but for
+  // now operator restarts the session to revoke trust).
+  const sessionAllow = new Map<keyof PolicyToolsSection, string[]>();
+
   const check = (toolName: string, category: PolicyCategory, args: ToolArgs): Decision => {
     if (mode === 'bypass') {
       // `bypass` is a defaults-level setting — source.layer points
@@ -404,7 +486,14 @@ export const createPermissionEngine = (
         // `sectionKey` is always 'bash' here (policySectionFor
         // collapses the bash family); checkBash hardcodes the
         // section name internally.
-        return checkBash(toolName, args, sectionRules as BashPolicy | undefined, mode, provenance);
+        return checkBash(
+          toolName,
+          args,
+          sectionRules as BashPolicy | undefined,
+          mode,
+          provenance,
+          sessionAllow.get('bash'),
+        );
       case 'fs.read':
         // `sectionKey` is non-undefined for non-misc categories.
         // The non-null assertion is safe (typed branch) and
@@ -418,6 +507,7 @@ export const createPermissionEngine = (
           false,
           provenance,
           sectionKey as keyof PolicyToolsSection,
+          sessionAllow.get(sectionKey as keyof PolicyToolsSection),
         );
       case 'fs.write':
         return checkPath(
@@ -429,6 +519,7 @@ export const createPermissionEngine = (
           true,
           provenance,
           sectionKey as keyof PolicyToolsSection,
+          sessionAllow.get(sectionKey as keyof PolicyToolsSection),
         );
       case 'web.fetch':
         return checkFetch(
@@ -437,6 +528,7 @@ export const createPermissionEngine = (
           sectionRules as FetchPolicy | undefined,
           mode,
           provenance,
+          sessionAllow.get('fetch_url'),
         );
       case 'misc':
         // No category-level policy yet; misc tools must be explicitly
@@ -453,6 +545,30 @@ export const createPermissionEngine = (
 
   const view = (): PermissionsView => ({ mode });
 
+  const addSessionAllow = (section: keyof PolicyToolsSection, pattern: string): void => {
+    // Empty/whitespace-only pattern is a programming bug (the
+    // bridge should never call us with one). Silently drop
+    // instead of corrupting the allowlist with a glob that
+    // matches every input — a `''` pattern compiled to `^$`
+    // matches the empty string only, harmless, but a future
+    // refactor that strips/normalizes could turn it into `*`.
+    // Defense-in-depth.
+    const trimmed = pattern.trim();
+    if (trimmed.length === 0) return;
+    const existing = sessionAllow.get(section);
+    if (existing === undefined) {
+      sessionAllow.set(section, [trimmed]);
+      return;
+    }
+    // Skip duplicates so repeated session-allow on the same
+    // pattern doesn't grow the list unboundedly across a long
+    // session. Order is preserved (`firstMatchingCommand` walks
+    // left-to-right; the original promotion wins for diagnostic
+    // attribution).
+    if (existing.includes(trimmed)) return;
+    existing.push(trimmed);
+  };
+
   return {
     check,
     view,
@@ -466,5 +582,6 @@ export const createPermissionEngine = (
     // also work but loses Date/Map shapes if a future Policy
     // grows them; structuredClone preserves them.
     policy: () => structuredClone(policy),
+    addSessionAllow,
   };
 };

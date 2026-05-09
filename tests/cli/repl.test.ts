@@ -1207,6 +1207,232 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
+  test('confirmPermission session-allow promotes the matched rule onto the engine before returning true', async () => {
+    // Pins the bridge → engine seam introduced by the session-allow
+    // mutation slice. Without this, "Yes, don't ask again for: <rule>"
+    // would render in the modal but quietly behave like one-shot
+    // 'yes' — the option label becomes a UX lie and operators report
+    // "the modal keeps asking even after I picked option 2". The
+    // assertion proves both fields round-trip end-to-end and the
+    // call lands on the engine BEFORE the harness sees `true` so
+    // the next harness check (same turn or any future turn) reads
+    // the new session rule.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    // Stub engine: the only method the bridge calls is
+    // addSessionAllow. Real engines also expose `check`, `mode`,
+    // etc., but the bridge doesn't touch those — so the stub is
+    // surgical, asserting the bridge's API surface without
+    // requiring a full engine.
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    expect(cfg?.confirmPermission).toBeDefined();
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: 'git push origin main' },
+      cwd: '/r',
+      prompt: 'matched confirm rule: git push *',
+      source: {
+        layer: 'project',
+        rule: 'git push *',
+        section: 'bash',
+      },
+    });
+    await tick();
+    // Hotkey '2' resolves the modal as 'session-allow' — bridge
+    // promotes onto engine THEN maps to true.
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    expect(sessionAllowCalls).toEqual([{ section: 'bash', pattern: 'git push *' }]);
+    // Wrap up.
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow with missing source.rule falls back to one-shot allow', async () => {
+    // Synthesized confirms (compound-command guard, missing-arg
+    // rejections) and subagent-proxied requests today carry no
+    // matched rule — there's nothing to promote. The bridge must
+    // NOT call addSessionAllow with an empty pattern, and the
+    // operator's 'session-allow' answer still maps to true (the
+    // closest semantic — operator authorized this one). Documents
+    // the graceful-degradation contract on the bridge.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: 'git status; pwd' },
+      cwd: '/r',
+      prompt: 'compound shell command — confirming explicitly',
+      // source carries section but NO rule (compound-guard shape).
+      source: {
+        layer: 'project',
+        section: 'bash',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    // No promotion happened — the bridge guarded on rule presence.
+    expect(sessionAllowCalls).toEqual([]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow on a subagent-proxied request does NOT promote onto the parent engine', async () => {
+    // Subagent confirms gate against the CHILD's own engine
+    // (subagent runtime constructs it from `policySnapshot =
+    // parent.policy()`, which carries the resolved YAML but NOT
+    // the parent's session-allow Map). Promoting onto the parent
+    // engine on a child confirm writes a rule the child never
+    // sees — child re-prompts every step while the parent's
+    // engine accrues inert state. The bridge guards on
+    // `req.subagent === undefined` so subagent-proxied
+    // session-allow falls back to one-shot allow until a future
+    // slice wires both IPC source marshaling AND a child-engine
+    // push-down. Today subagent confirms don't even carry source
+    // (IPC doesn't marshal it), but this test pins the contract
+    // for the moment they start to.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: 'git push origin main' },
+      cwd: '/r',
+      prompt: 'matched confirm rule: git push *',
+      // Source IS populated (forward-compat: the day IPC marshals
+      // it, this branch must still skip promotion until the child
+      // push-down lands).
+      source: {
+        layer: 'project',
+        rule: 'git push *',
+        section: 'bash',
+      },
+      // The thing that disqualifies this from promotion.
+      subagent: { sessionId: 'sess-childA', name: 'explore' },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    // No promotion: subagent guard rejected the call.
+    expect(sessionAllowCalls).toEqual([]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission "yes" answer never promotes onto the engine', async () => {
+    // Operator picks option 1 (one-shot allow). Even though
+    // source.rule is populated, the bridge MUST NOT promote — the
+    // distinction between option 1 and option 2 is the entire UX
+    // value. A regression collapsing them would void the modal's
+    // promise.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: 'rm -rf /tmp/cache' },
+      cwd: '/r',
+      prompt: 'matched confirm rule: rm *',
+      source: {
+        layer: 'project',
+        rule: 'rm *',
+        section: 'bash',
+      },
+    });
+    await tick();
+    stdin.feed('1');
+    await tick();
+    expect(await askPromise).toBe(true);
+    expect(sessionAllowCalls).toEqual([]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
   test('error thrown by runAgent surfaces as an error UIEvent and lets the REPL continue', async () => {
     const stdin = makeStdin();
     const resolvers: Array<(r: HarnessResult) => void> = [];

@@ -572,3 +572,166 @@ describe('Decision.source provenance', () => {
     expect(d.source).toEqual({ layer: 'default', rule: 'rm -rf *', section: 'bash' });
   });
 });
+
+describe('addSessionAllow (runtime "Yes, don\'t ask again for: <rule>")', () => {
+  test('bash session-allow promotes the rule into in-memory allowlist', () => {
+    // First check: no rule matches, default-deny. Operator sees a
+    // confirm in real life only because the harness mode promotes
+    // default-deny to confirm; here we observe the engine's raw
+    // verdict.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    expect(eng.check('bash', 'bash', { command: 'git push origin main' }).kind).toBe('deny');
+
+    // Operator answers "Yes, don't ask again for: git push *" → bridge
+    // calls addSessionAllow. Next check on a matching command is allow.
+    eng.addSessionAllow('bash', 'git push *');
+    const d = eng.check('bash', 'bash', { command: 'git push origin main' });
+    expect(d.kind).toBe('allow');
+    expect(d.source).toEqual({ layer: 'session', rule: 'git push *', section: 'bash' });
+  });
+
+  test('session-allow attribution carries layer="session" even when base section lives elsewhere', () => {
+    // Engine built with bash section sourced from `project` provenance.
+    // A session-allow override must report `layer: 'session'`, not
+    // `'project'` — the modal / audit attribute the runtime override
+    // correctly to the layer that actually produced it.
+    const eng = createPermissionEngine(policy({ tools: { bash: { confirm: ['*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    eng.addSessionAllow('bash', 'pwd');
+    const d = eng.check('bash', 'bash', { command: 'pwd' });
+    expect(d.source?.layer).toBe('session');
+  });
+
+  test('deny still wins over session-allow', () => {
+    // Operator session-allowing a pattern does NOT override deny.
+    // This is the safety property: a runtime "yes" never lifts an
+    // enterprise/project deny.
+    const eng = createPermissionEngine(policy({ tools: { bash: { deny: ['rm -rf *'] } } }), {
+      cwd: CWD,
+    });
+    eng.addSessionAllow('bash', 'rm -rf *');
+    const d = eng.check('bash', 'bash', { command: 'rm -rf /' });
+    expect(d.kind).toBe('deny');
+  });
+
+  test('session-allow shortcuts past the compound-command guard', () => {
+    // Compound guard fires on `git status; pwd` by default. If the
+    // operator session-allowed the literal compound (because they
+    // already saw it once and accepted), the next occurrence skips
+    // the modal. This is the whole point of session-allow — operator's
+    // explicit trust beats the accidental-compound safety net.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
+      cwd: CWD,
+    });
+    // Without session-allow: compound guard forces confirm even
+    // though `*` would match.
+    expect(eng.check('bash', 'bash', { command: 'git status; pwd' }).kind).toBe('confirm');
+    // With session-allow on the literal: allow.
+    eng.addSessionAllow('bash', 'git status; pwd');
+    const d = eng.check('bash', 'bash', { command: 'git status; pwd' });
+    expect(d.kind).toBe('allow');
+    expect(d.source).toEqual({
+      layer: 'session',
+      rule: 'git status; pwd',
+      section: 'bash',
+    });
+  });
+
+  test('read_file session-allow promotes a path glob', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    expect(eng.check('read_file', 'fs.read', { path: 'src/foo.ts' }).kind).toBe('deny');
+    eng.addSessionAllow('read_file', 'src/**');
+    const d = eng.check('read_file', 'fs.read', { path: 'src/foo.ts' });
+    expect(d.kind).toBe('allow');
+    expect(d.source).toEqual({ layer: 'session', rule: 'src/**', section: 'read_file' });
+  });
+
+  test('write_file session-allow does not leak into read_file (per-section state)', () => {
+    // Two sections, two independent allowlists. Promoting `src/**`
+    // for write_file leaves read_file's state untouched — the bridge
+    // routes by req.source.section, so cross-section aliasing would
+    // be a real bug.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    eng.addSessionAllow('write_file', 'src/**');
+    expect(eng.check('write_file', 'fs.write', { path: 'src/x.ts' }).kind).toBe('allow');
+    expect(eng.check('read_file', 'fs.read', { path: 'src/x.ts' }).kind).toBe('deny');
+  });
+
+  test('fetch_url session-allow promotes a host glob', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    expect(eng.check('fetch_url', 'web.fetch', { url: 'https://api.example.com/v1' }).kind).toBe(
+      'deny',
+    );
+    eng.addSessionAllow('fetch_url', 'api.example.com');
+    const d = eng.check('fetch_url', 'web.fetch', { url: 'https://api.example.com/v1' });
+    expect(d.kind).toBe('allow');
+    expect(d.source).toEqual({
+      layer: 'session',
+      rule: 'api.example.com',
+      section: 'fetch_url',
+    });
+  });
+
+  test('search-tool session-allow follows the same root-descends-into-glob semantics', () => {
+    // grep rooted at `src` against allow `src/**` works because the
+    // engine probes `src/<synthetic>` against the rule. Session-allow
+    // funnels through the same matchTarget — so the runtime
+    // promotion behaves identically to a base allow_paths entry.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    eng.addSessionAllow('grep', 'src/**');
+    expect(eng.check('grep', 'fs.read', { path: 'src' }).kind).toBe('allow');
+  });
+
+  test('session-allow runs BEFORE base confirm rules (skips the modal)', () => {
+    // Without session-allow the request would confirm. Operator's
+    // session-allow short-circuits past the confirm — that's the
+    // ergonomics win.
+    const eng = createPermissionEngine(policy({ tools: { bash: { confirm: ['git push *'] } } }), {
+      cwd: CWD,
+    });
+    expect(eng.check('bash', 'bash', { command: 'git push origin main' }).kind).toBe('confirm');
+    eng.addSessionAllow('bash', 'git push *');
+    expect(eng.check('bash', 'bash', { command: 'git push origin main' }).kind).toBe('allow');
+  });
+
+  test('duplicate addSessionAllow calls do not grow the list', () => {
+    // Operator may answer session-allow on the same rule twice
+    // (different runs of the same agent step, modal racing, etc.).
+    // The dedup keeps the list bounded across long sessions and
+    // preserves the original rule's diagnostic position.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    eng.addSessionAllow('bash', 'pwd');
+    eng.addSessionAllow('bash', 'pwd');
+    eng.addSessionAllow('bash', 'pwd');
+    // Internal state isn't introspectable, but a successful match
+    // proves the rule is there. The dedup is a hygiene property —
+    // we exercise it via repeated calls to lock in that the API
+    // accepts repeats without throwing.
+    expect(eng.check('bash', 'bash', { command: 'pwd' }).kind).toBe('allow');
+  });
+
+  test('empty pattern is silently dropped', () => {
+    // Defense-in-depth: bridge should never call us with empty
+    // pattern, but if it does, the engine refuses to register a
+    // rule that could be silently expanded into `*` by a future
+    // refactor. Subsequent check default-denies as if no rule
+    // had been added.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    eng.addSessionAllow('bash', '');
+    eng.addSessionAllow('bash', '   ');
+    expect(eng.check('bash', 'bash', { command: 'pwd' }).kind).toBe('deny');
+  });
+
+  test('session-allow whitespace is trimmed before storage', () => {
+    // The bridge takes patterns from PolicySource.rule which
+    // originates from policy YAML; in principle whitespace is
+    // already normalized, but loose user input through future
+    // entry points (REPL command, hooks) could carry it. Trim
+    // defensively so the matcher behaves the same regardless.
+    const eng = createPermissionEngine(policy({}), { cwd: CWD });
+    eng.addSessionAllow('bash', '  pwd  ');
+    expect(eng.check('bash', 'bash', { command: 'pwd' }).kind).toBe('allow');
+  });
+});

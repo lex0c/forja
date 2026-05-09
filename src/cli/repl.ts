@@ -23,7 +23,7 @@ import { existsSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { type HarnessConfig, type HarnessResult, runAgent } from '../harness/index.ts';
 import { effectiveBudget, resolveMaxOutputTokens } from '../harness/types.ts';
-import type { PolicySource } from '../permissions/index.ts';
+import type { PolicySource, PolicyToolsSection } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
 import { stripAnsi } from '../sanitize/index.ts';
 import {
@@ -63,6 +63,21 @@ import {
   parseSlashInput,
 } from './slash/index.ts';
 import { APP_NAME, VERSION } from './version.ts';
+
+// Runtime guard for `keyof PolicyToolsSection` — the engine's
+// PolicySource.section is typed as `string` (loose) for forward
+// compat with future categories, but the session-allow bridge
+// can only promote a rule into one of the known sections. The
+// list mirrors `PolicyToolsSection` in src/permissions/types.ts;
+// adding a section there means adding it here too. Type assertion
+// in the guard's return narrows `string` → `keyof PolicyToolsSection`
+// for the caller without a runtime cast.
+const POLICY_SECTION_KEYS: ReadonlySet<keyof PolicyToolsSection> = new Set<
+  keyof PolicyToolsSection
+>(['bash', 'read_file', 'write_file', 'edit_file', 'glob', 'grep', 'fetch_url']);
+
+const isPolicySectionKey = (s: string): s is keyof PolicyToolsSection =>
+  POLICY_SECTION_KEYS.has(s as keyof PolicyToolsSection);
 
 export interface RunReplOptions {
   args: ParsedArgs;
@@ -994,10 +1009,38 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       req.signal !== undefined ? { signal: req.signal } : undefined,
     );
     // Map the spec-shape answer to the harness's boolean contract.
-    // 'session-allow' currently behaves like 'yes' — the policy
-    // mutation that would persist a session-layer rule is deferred.
-    // When that lands, this branch writes the rule before returning
-    // true.
+    // 'session-allow' promotes the matched rule onto the engine's
+    // session-scoped allowlist BEFORE returning true so the next
+    // matching call short-circuits past the modal.
+    //
+    // Promotion fires only when ALL of these hold:
+    //   - the request originated parent-side (req.subagent ===
+    //     undefined). Subagent confirms gate against the CHILD's
+    //     own engine (constructed from `policySnapshot =
+    //     parent.policy()` in runtime.ts; the snapshot does NOT
+    //     carry session rules — they live in the parent's closure
+    //     Map, not in Policy). Promoting onto parent on a child
+    //     confirm would write a rule the child never sees, so the
+    //     child re-prompts on every step while the parent's engine
+    //     accrues inert state. Skip the bridge entirely; subagent
+    //     session-allow needs both IPC source marshaling AND a
+    //     child-engine push-down (or folding session rules into
+    //     `policy()` snapshot), neither of which exists today.
+    //     Tracked as a separate follow-up slice.
+    //   - source.rule + source.section are both populated. The
+    //     engine sets them on every rule-driven Decision; absent
+    //     for synthesized confirms (compound-command guard, which
+    //     has no matched rule). Those fall back to one-shot allow,
+    //     matching option-1 behavior.
+    if (
+      answer === 'session-allow' &&
+      req.subagent === undefined &&
+      req.source?.rule !== undefined &&
+      req.source.section !== undefined &&
+      isPolicySectionKey(req.source.section)
+    ) {
+      baseConfig.permissionEngine.addSessionAllow(req.source.section, req.source.rule);
+    }
     return answer === 'yes' || answer === 'session-allow';
   };
 
