@@ -15,6 +15,48 @@ Format:
 
 ---
 
+## [2026-05-08] permission-ergonomics — Slice 12: session-allow extends to compound-confirm shapes (no matched rule)
+
+**Done:** Closed the second class of session-allow UX lie. The
+previous slice promoted only when the engine emitted `source.rule`
+— which left compound-command confirms (and any future
+synthesized confirm without a matched rule) silently no-op'ing
+on option 2: modal said "Yes, don't ask again", bridge returned
+true, no rule registered, same compound re-prompted on the next
+step.
+
+The bridge now derives a literal promotion target from args when
+no matched rule is present:
+- bash → `args.command`
+- read_file / write_file / edit_file / grep → `args.path`
+- glob → `args.cwd`
+- fetch_url → URL hostname
+
+The new field `sessionAllowTarget` flows separately from `rule`
+through the modal pipeline (`PermissionAskArgs` → event →
+reducer → `buildPermissionOptions`) so option 2's label reflects
+what `addSessionAllow` will actually register, while the
+matched-rule attribution line stays driven by the engine's
+`source.rule` (renders only when a real rule fired).
+
+| Change | Where | Why |
+|---|---|---|
+| `derivePromotionTarget(section, args, matchedRule)` helper | `src/cli/repl.ts` | Single derivation site per section. Falls back to literal command/path/host when matched rule is absent OR when matched rule is a pure catch-all (`*`, `**`); returns undefined when args don't carry the expected field (defense-in-depth — bridge falls back to one-shot allow). The catch-all override prevents the init-template's `confirm: ['*']` from being promoted into an unbounded session-allow on a casual click — operator's "yes" gets scoped to the literal command they saw, not the universe of bash. Operator-authored breadth (e.g. `rm *`) is still promoted as authored. |
+| `sessionAllowTarget?: string` field on `PermissionAskArgs` + `PermissionAskEvent` + bridge → modalManager.askPermission | `src/tui/modal-manager.ts`, `src/tui/events.ts`, `src/cli/repl.ts` | Decouples the option-2 label from the matched-rule attribution. Modal's "Yes, don't ask again for: <X>" now matches what addSessionAllow registers; matched-rule line stays accurate (only renders when a real rule fired). |
+| `buildPermissionOptions(toolName, sessionAllowTarget)` signature shift | `src/tui/modal-manager.ts` | Renamed parameter from `rule` to `sessionAllowTarget` — the function's job was always to drive option 2, but the old name conflated the two concerns. |
+| State reducer reads `event.sessionAllowTarget ?? event.rule` | `src/tui/state.ts` | Backward compat: events that pre-date this field (synthesized by tests, future producers) keep their existing label behavior. |
+| Bridge guards: subagent skip moves to `sessionAllowTarget` derivation | `src/cli/repl.ts` | Subagent confirms get `sessionAllowTarget = undefined` (derivation skipped at the source). Modal renders the vague fallback wording — accurate, since no promotion will happen. |
+| 6 new bridge tests + 3 new state-reducer tests | `tests/cli/repl.test.ts`, `tests/tui/state.test.ts` | Pinned: compound-confirm (no rule) promotes the literal command, no-args-derivable falls back to one-shot allow, subagent fallback to vague wording, catch-all `*` rule + bash promotes args.command literal, catch-all `**` rule + read_file promotes args.path literal, deliberately-broad `rm *` promotes the rule as authored. State reducer: option 2 uses sessionAllowTarget independently of rule, matched-rule attribution stays absent for derived-target shape, catch-all label shows the literal while attribution still shows engine's `*`. |
+
+**Decisions:**
+- Field separation (`rule` vs `sessionAllowTarget`) instead of overloading `rule` — keeps the matched-rule attribution honest. Conflating them would make the modal say "matched rule: git status; pwd (project policy)" for a compound-confirm, which is a misattribution: the engine fired structurally, not from a rule.
+- Subagent confirms degrade to the vague "allow all bash during this session" wording (since `sessionAllowTarget` isn't set). This is HONEST behavior under the current subagent-skip guard — promising "don't ask again for: <X>" when no promotion happens would re-introduce the UX lie one layer up.
+- Catch-all override (`*`/`**` matched rules fall through to literal derivation) is conservative — only the bare wildcard shapes count. Operator-authored breadth like `rm *` or `/tmp/**` is intentional and gets promoted as authored. Heuristic could grow (e.g. flag patterns whose regex compiles to `.*` after escape) but the bare-wildcard set covers the realistic footgun (init-template `confirm: ['*']` reflexive click) without policing operator intent.
+
+**Pending:** Same as slice 9 — `/perms commit` and full subagent session-allow.
+
+---
+
 ## [2026-05-08] permission-ergonomics — Slice 9: session-allow promotes the matched rule onto the engine
 
 **Done:** "Yes, don't ask again for: <rule>" (modal option 2)

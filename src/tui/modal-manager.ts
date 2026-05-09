@@ -76,6 +76,12 @@ export interface PermissionAskArgs {
   command: string;
   cwd: string;
   rule?: string;
+  // Pattern the bridge would promote on session-allow. Drives
+  // option 2's "Yes, don't ask again for: <X>" label. Distinct
+  // from `rule` so the matched-rule attribution line stays
+  // accurate (only renders when a real rule fired). See
+  // PermissionAskEvent.sessionAllowTarget for the full contract.
+  sessionAllowTarget?: string;
   reason?: string;
   // Layer that holds the matching rule (PolicyLayer). When set
   // alongside `rule`, the reducer renders "matched rule: <rule>
@@ -245,10 +251,13 @@ const CRITIQUE_OPTIONS: readonly ConfirmOption[] = [
 // asks, subagent-proxied confirms before IPC marshals source) the
 // label falls back to the per-tool wording — same shape, less
 // information, never a crash.
-export const buildPermissionOptions = (toolName: string, rule?: string): ConfirmOption[] => {
+export const buildPermissionOptions = (
+  toolName: string,
+  sessionAllowTarget?: string,
+): ConfirmOption[] => {
   const sessionLabel =
-    rule !== undefined && rule.length > 0
-      ? `Yes, don't ask again for: ${rule}`
+    sessionAllowTarget !== undefined && sessionAllowTarget.length > 0
+      ? `Yes, don't ask again for: ${sessionAllowTarget}`
       : `Yes, allow all ${toolName} during this session`;
   return [
     { key: '1', label: 'Yes', value: 'yes' },
@@ -655,11 +664,14 @@ export const createModalManager = (options: ModalManagerOptions): ModalManager =
           command: args.command,
           cwd: args.cwd,
           ...(args.rule !== undefined ? { rule: args.rule } : {}),
+          ...(args.sessionAllowTarget !== undefined
+            ? { sessionAllowTarget: args.sessionAllowTarget }
+            : {}),
           ...(args.layer !== undefined ? { layer: args.layer } : {}),
           ...(args.reason !== undefined ? { reason: args.reason } : {}),
           ...(args.subagent !== undefined ? { subagent: args.subagent } : {}),
         }),
-        buildPermissionOptions(args.toolName, args.rule),
+        buildPermissionOptions(args.toolName, args.sessionAllowTarget),
         opts?.timeoutMs,
         opts?.signal,
       ),

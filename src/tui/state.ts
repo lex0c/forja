@@ -1314,7 +1314,18 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
       //      "Ctrl+E to explain" hints — handlers land in later
       //      slices; the hint reservation pre-flows the footer.
 
-      const options = buildPermissionOptions(event.toolName, event.rule);
+      // Option 2's label is driven by `sessionAllowTarget` (the
+      // pattern the bridge will actually promote on session-allow),
+      // NOT by `event.rule`. Compound-command confirms emit no
+      // `rule` (no pattern matched — the guard fired structurally),
+      // but the bridge still derives a literal from args; that
+      // literal is what `sessionAllowTarget` carries. Falling back
+      // to `event.rule` keeps backward compat with synthesized
+      // events that pre-date this field.
+      const options = buildPermissionOptions(
+        event.toolName,
+        event.sessionAllowTarget ?? event.rule,
+      );
 
       // Anti-spoof: only the agent's `name` (the definition's
       // declared name from the agents/*.md frontmatter) reaches the

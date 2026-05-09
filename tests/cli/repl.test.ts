@@ -1269,14 +1269,16 @@ describe('repl — boot + smoke', () => {
     expect(await promise).toBe(130);
   });
 
-  test('confirmPermission session-allow with missing source.rule falls back to one-shot allow', async () => {
-    // Synthesized confirms (compound-command guard, missing-arg
-    // rejections) and subagent-proxied requests today carry no
-    // matched rule — there's nothing to promote. The bridge must
-    // NOT call addSessionAllow with an empty pattern, and the
-    // operator's 'session-allow' answer still maps to true (the
-    // closest semantic — operator authorized this one). Documents
-    // the graceful-degradation contract on the bridge.
+  test('confirmPermission session-allow on a compound-confirm (no matched rule) promotes the literal command', async () => {
+    // The engine's compound-command guard fires confirm without a
+    // matched rule (the guard is structural — `;`, `&`, `|`, `\n`,
+    // process substitution, etc. — not a rule match). Without
+    // deriving a promotion target from args, option 2 of the modal
+    // would silently no-op and the same compound would re-prompt
+    // every step despite the operator picking "Yes, don't ask
+    // again". The bridge falls back to args.command as the literal
+    // pattern; future identical compounds match the session rule
+    // exact and skip the modal.
     const stdin = makeStdin();
     const ra = makeRunAgent((n) => `sess-${n}`);
     const stub = makeBootstrapStub();
@@ -1313,8 +1315,214 @@ describe('repl — boot + smoke', () => {
     stdin.feed('2');
     await tick();
     expect(await askPromise).toBe(true);
-    // No promotion happened — the bridge guarded on rule presence.
+    // Literal command promoted — exact match for future identical
+    // compound. Operator's "don't ask again" promise honored.
+    expect(sessionAllowCalls).toEqual([{ section: 'bash', pattern: 'git status; pwd' }]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow with no args derivable for the section falls back to one-shot allow', async () => {
+    // Defense-in-depth: if the section is known but args don't
+    // carry the field the section needs (e.g., a future tool
+    // routing through `bash` section without a `command` field),
+    // derivePromotionTarget returns undefined and the bridge
+    // skips promotion. Operator's session-allow degrades to a
+    // one-shot allow rather than promoting an empty/garbage
+    // pattern.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      // No `command` in args — the bash section's derivation
+      // requires it. Bridge falls through to one-shot allow.
+      args: {},
+      cwd: '/r',
+      prompt: 'engine-internal reject',
+      source: {
+        layer: 'default',
+        section: 'bash',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
     expect(sessionAllowCalls).toEqual([]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow on a catch-all matched rule promotes the args literal, not "*"', async () => {
+    // Init template default: `confirm: ['*']` for bash so any
+    // unmatched-allow command pops a modal. Operator clicks "Yes,
+    // don't ask again for: <X>" expecting THIS command to be
+    // authorized — not the universe of bash. Without the catch-all
+    // override, the bridge would promote `'*'` onto bash session-
+    // allow, effectively disabling the policy gate for the rest
+    // of the session. The override falls through to args.command
+    // so the literal command becomes the session rule.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: 'curl example.com' },
+      cwd: '/r',
+      prompt: 'matched confirm rule: *',
+      // Engine matched the catch-all `*` from `confirm: ['*']`.
+      source: {
+        layer: 'project',
+        rule: '*',
+        section: 'bash',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    // Promotion uses the literal command, NOT '*'. Future bash
+    // calls that aren't `curl example.com` still trip the modal.
+    expect(sessionAllowCalls).toEqual([{ section: 'bash', pattern: 'curl example.com' }]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow on catch-all "**" path rule promotes the args.path literal', async () => {
+    // Same property for path-based sections. Operator with
+    // `confirm_paths: ['**']` clicking session-allow on a
+    // read_file confirm meant "yes for THIS file", not "yes for
+    // every file in the project."
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'read_file',
+      args: { path: 'src/internal/notes.ts' },
+      cwd: '/r',
+      prompt: 'matched confirm rule: **',
+      source: {
+        layer: 'project',
+        rule: '**',
+        section: 'read_file',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    expect(sessionAllowCalls).toEqual([{ section: 'read_file', pattern: 'src/internal/notes.ts' }]);
+    ra.finish(0);
+    await tick();
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('confirmPermission session-allow on a deliberately broad rule (e.g. "rm *") still promotes the rule', async () => {
+    // The catch-all override is scoped to `*` and `**` only —
+    // operator-authored patterns like `rm *` express intentional
+    // breadth and should be promoted as authored. Without this
+    // pin, an over-eager "anything with a wildcard is catch-all"
+    // heuristic would degrade rule-driven session-allow into
+    // literal-only.
+    const stdin = makeStdin();
+    const ra = makeRunAgent((n) => `sess-${n}`);
+    const stub = makeBootstrapStub();
+    const sessionAllowCalls: Array<{ section: string; pattern: string }> = [];
+    (stub.config as unknown as { permissionEngine: unknown }).permissionEngine = {
+      addSessionAllow: (section: string, pattern: string) => {
+        sessionAllowCalls.push({ section, pattern });
+      },
+    };
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+    });
+    await tick();
+    stdin.feed('go\r');
+    await tick();
+    const cfg = ra.captured[0]?.configs[0];
+    const askPromise = cfg?.confirmPermission?.({
+      toolName: 'bash',
+      args: { command: 'rm /tmp/foo' },
+      cwd: '/r',
+      prompt: 'matched confirm rule: rm *',
+      source: {
+        layer: 'project',
+        rule: 'rm *',
+        section: 'bash',
+      },
+    });
+    await tick();
+    stdin.feed('2');
+    await tick();
+    expect(await askPromise).toBe(true);
+    expect(sessionAllowCalls).toEqual([{ section: 'bash', pattern: 'rm *' }]);
     ra.finish(0);
     await tick();
     stdin.feed('\x04');
