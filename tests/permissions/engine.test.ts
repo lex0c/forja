@@ -495,20 +495,6 @@ describe('compound command guard (shell injection defense)', () => {
     expect(d.kind).toBe('confirm');
   });
 
-  test('fd redirection (2>&1) still passes through allow rules', () => {
-    // Counter-test: `&` inside a redirection context (`>&`, `<&`,
-    // `&>`) is NOT a separator. Forcing confirm on every stderr
-    // merge would make standard shell idioms unusable through the
-    // gate without runtime promotion. The matcher's redirection
-    // detection keeps `npm test 2>&1` flowing through allow.
-    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['npm test*'] } } }), {
-      cwd: CWD,
-      provenance: { defaults: 'project', bash: 'project' },
-    });
-    const d = eng.check('bash', 'bash', { command: 'npm test 2>&1' });
-    expect(d.kind).toBe('allow');
-  });
-
   test('process substitution forces confirm even when allow matches the host command', () => {
     // The `<(cmd)` and `>(cmd)` forms run cmd in a subshell. Same
     // security shape as `$(...)`: an allow like `cat *` would
@@ -526,16 +512,73 @@ describe('compound command guard (shell injection defense)', () => {
     }
   });
 
-  test('bash &> redirect (stdout+stderr) still passes through allow rules', () => {
-    // `cmd &>file` is bash extension syntax for redirecting both
-    // streams. The `&` is part of the redirect operator, not a
-    // separator. Allow `bash *` should accept `bash -c "echo
-    // hi" &>/tmp/log`.
+  test('output redirection forces confirm even when allow matches the host command', () => {
+    // Reported bypass: `git status --short > /tmp/out` matches
+    // an allow `git status --*` because the matcher's `*` resolves
+    // to `.*` (dotAll) and spans the redirection. Without flagging
+    // `>`, the nominally read-only allow turns into a silent
+    // write path (creates / truncates `/tmp/out`). The guard now
+    // catches every output redirection (>FILE, >>FILE, >|FILE,
+    // <>FILE) so allowlist patterns can't be silently broadened
+    // into write authorization.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['git status --*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'git status --short > /tmp/out' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') {
+      expect(d.reason).toContain('compound shell command');
+    }
+  });
+
+  test('bash &> redirect now forces confirm (was silent passthrough)', () => {
+    // `cmd &>file` writes both stdout AND stderr to a file. The
+    // previous matcher treated `&>` as a redirect operator and
+    // skipped it — same hole as the bare `>` bypass. Now flags.
+    // Operator who wants this can session-allow the literal.
     const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls*'] } } }), {
       cwd: CWD,
       provenance: { defaults: 'project', bash: 'project' },
     });
     const d = eng.check('bash', 'bash', { command: 'ls &>/tmp/log' });
+    expect(d.kind).toBe('confirm');
+  });
+
+  test('append redirection (>>) forces confirm', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['echo *'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'echo line >> /var/log/app.log' });
+    expect(d.kind).toBe('confirm');
+  });
+
+  test('stdin redirection (< FILE) still passes through allow rules (no filesystem mutation)', () => {
+    // Counter-test: `<FILE` reads from a file but doesn't mutate
+    // the filesystem. The host command's allow rule already
+    // authorizes stdin handling — flagging would force confirm
+    // on every `python script.py < input.json` and similar
+    // legitimate idioms.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['python *'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'python script.py <input.json' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('fd duplication (2>&1) still passes through allow rules', () => {
+    // Counter-test: `&` inside a redirection context (`>&`, `<&`)
+    // is fd duplication / closure, not a separator and not a file
+    // write. Forcing confirm on every stderr merge would make
+    // standard shell idioms unusable through the gate without
+    // runtime promotion.
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['npm test*'] } } }), {
+      cwd: CWD,
+      provenance: { defaults: 'project', bash: 'project' },
+    });
+    const d = eng.check('bash', 'bash', { command: 'npm test 2>&1' });
     expect(d.kind).toBe('allow');
   });
 

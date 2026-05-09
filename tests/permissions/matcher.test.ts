@@ -172,20 +172,72 @@ describe('containsShellInjection', () => {
     expect(containsShellInjection('a&b')).toBe(true);
   });
 
-  test('& inside redirection context does NOT flag', () => {
-    // Bash redirection forms that legitimately contain `&`:
+  test('fd duplication / closure (no filesystem write) does NOT flag', () => {
+    // Bash forms that legitimately contain `&` adjacent to `>` or
+    // `<` AND don't touch the filesystem:
     //   - `2>&1` / `>&1` / `<&3` — fd duplication
-    //   - `>&-` / `<&-`         — fd close
-    //   - `&>file` / `&>>file`  — bash extension (stdout+stderr)
-    // None of these compose multiple commands. Forcing confirm on
-    // every `2>&1` would make stderr-merging unusable through the
-    // gate without a session-allow promotion.
+    //   - `>&-` / `<&-`          — fd close
+    // Forcing confirm on every `2>&1` would make stderr-merging
+    // unusable through the gate without a session-allow promotion.
     expect(containsShellInjection('echo foo 2>&1')).toBe(false);
     expect(containsShellInjection('cmd >&2')).toBe(false);
     expect(containsShellInjection('cmd <&3')).toBe(false);
     expect(containsShellInjection('cmd >&-')).toBe(false);
-    expect(containsShellInjection('cmd &>file')).toBe(false);
-    expect(containsShellInjection('cmd &>>file')).toBe(false);
+    expect(containsShellInjection('cmd <&-')).toBe(false);
+  });
+
+  test('output redirection to file flags (mutation)', () => {
+    // The init template's bash allowlist deliberately ships
+    // read-only patterns (`git status -*`, `ls -*`, etc). Bash
+    // redirection turns any of those into silent file mutation
+    // — `git status --short > /tmp/secrets` matches `git status
+    // -*` and would auto-allow a write operator. The guard flags
+    // every form of file write so the operator sees the modal.
+    expect(containsShellInjection('git status > /tmp/out')).toBe(true);
+    expect(containsShellInjection('echo foo >>log')).toBe(true);
+    expect(containsShellInjection('cmd >|file')).toBe(true);
+    expect(containsShellInjection('ls -la >dir.txt')).toBe(true);
+    // No space between operator and target — same shape, must flag.
+    expect(containsShellInjection('git diff>/tmp/d.patch')).toBe(true);
+  });
+
+  test('bash &> / &>> (stdout+stderr to file) flags', () => {
+    // `&>file` and `&>>file` are bash extensions that redirect
+    // both streams to a file. File mutation. Previously the
+    // matcher treated `&>` as a redirection operator (skip) —
+    // false negative for the mutation check. Now flags.
+    expect(containsShellInjection('cmd &>file')).toBe(true);
+    expect(containsShellInjection('cmd &>>file')).toBe(true);
+    expect(containsShellInjection('build &>/tmp/build.log')).toBe(true);
+  });
+
+  test('<> (read+write) flags', () => {
+    // `<>FILE` opens FILE for read AND write. Counts as mutation
+    // because the file is created if missing.
+    expect(containsShellInjection('cmd <>file')).toBe(true);
+  });
+
+  test('stdin redirection from file does NOT flag (read only, no mutation)', () => {
+    // `<FILE`, `<<EOF`, `<<<X` — none of these write to the
+    // filesystem. The host command's bash allow rule already
+    // authorized stdin handling. Heredoc body content scans
+    // normally; if it contains `;` or `\n` separators, those
+    // flag — which is acceptable conservative behavior.
+    expect(containsShellInjection('cmd <input.txt')).toBe(false);
+    expect(containsShellInjection('cmd <<<"here-string"')).toBe(false);
+  });
+
+  test('redirection inside quotes does NOT flag', () => {
+    // Operator's commit message containing `>` is a literal, not
+    // a redirect.
+    expect(containsShellInjection('git commit -m "fix: x > y"')).toBe(false);
+    expect(containsShellInjection("echo 'a > b'")).toBe(false);
+  });
+
+  test('escaped redirect operators do NOT flag', () => {
+    // `\\>` and `\\<` are literal characters, not redirects.
+    expect(containsShellInjection('echo a\\>b')).toBe(false);
+    expect(containsShellInjection('echo a\\<b')).toBe(false);
   });
 
   test('& after a redirection target does flag (separator, not part of redirect)', () => {
@@ -282,12 +334,13 @@ describe('containsShellInjection', () => {
     expect(containsShellInjection('echo (literal text)')).toBe(false);
   });
 
-  test('redirect with whitespace before ( does NOT flag', () => {
-    // `cmd > (stuff)` isn't process substitution — bash requires
-    // `<(` or `>(` adjacent. Whitespace between `>` and `(`
-    // clears the redirection state. Real bash parse-errors on
-    // this input anyway.
-    expect(containsShellInjection('cmd > (stuff)')).toBe(false);
+  test('redirect with whitespace before ( still flags as a redirect (write)', () => {
+    // `cmd > (stuff)` isn't process substitution (bash requires
+    // `<(` or `>(` adjacent), but the `>` itself is a write
+    // redirect with whatever follows as the target — flags
+    // regardless. Real bash parse-errors on this input; the
+    // policy gate flagging conservatively is fine.
+    expect(containsShellInjection('cmd > (stuff)')).toBe(true);
   });
 });
 
