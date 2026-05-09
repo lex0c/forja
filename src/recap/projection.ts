@@ -130,6 +130,15 @@ const isTestRunner = (command: string): boolean => {
   return TEST_RUNNER_PATTERNS.some((rx) => rx.test(head));
 };
 
+// Returns only `type:'text'` blocks. `tool_use` / `tool_result` /
+// `image` blocks are intentionally dropped — every caller of this
+// helper (goal extraction + step-boundary detection in
+// `/recap last <N>` via `extractUserPromptText`; question
+// heuristic on assistant turns) mines operator/assistant prose,
+// never tool I/O. Surfacing tool_use input here would let
+// synthesized JSON arguments leak into goal text and the question
+// heuristic, and would inflate the step count by treating
+// tool_result-only user rows as prompts.
 const extractTextBlocks = (content: unknown): string[] => {
   if (typeof content === 'string') return [content];
   if (!Array.isArray(content)) return [];
@@ -246,7 +255,18 @@ const dayBoundsUtc = (yyyyMmDd: string): { start: number; end: number } => {
   return { start, end };
 };
 
-const resolveSessions = (db: DB, scope: RecapScopeOption): Session[] => {
+interface ResolvedScope {
+  sessions: Session[];
+  // Bounds for day/range scopes; null for single-session scopes.
+  // Computed once here and reused at result-construction time so
+  // `dayBoundsUtc` runs exactly once per projection — the prior
+  // shape called it twice for `day` (once to query SQL, once to
+  // build the result envelope's `range` field), an idempotent but
+  // divergence-prone duplication.
+  range: { start: number; end: number } | null;
+}
+
+const resolveSessions = (db: DB, scope: RecapScopeOption): ResolvedScope => {
   switch (scope.kind) {
     case 'session_current':
     case 'session_specific':
@@ -255,25 +275,24 @@ const resolveSessions = (db: DB, scope: RecapScopeOption): Session[] => {
       if (s === null) {
         throw new Error(`recap: session ${scope.sessionId} not found`);
       }
-      return [s];
+      return { sessions: [s], range: null };
     }
     case 'day': {
-      const { start, end } = dayBoundsUtc(scope.date);
+      const range = dayBoundsUtc(scope.date);
       // Time predicate applied in SQL via `listSessionsInRange` —
       // the prior `listSessions(limit:500).filter(...)` shape
       // would silently miss older day windows once a project
       // crossed the cap. The `[start, end)` interval matches the
       // half-open day boundary `dayBoundsUtc` produces.
-      return listSessionsInRange(db, { start, end, cwd: scope.cwd });
+      const sessions = listSessionsInRange(db, { ...range, cwd: scope.cwd });
+      return { sessions, range };
     }
     case 'range': {
       // Operator-supplied range; trust the bounds as-is. Same
       // SQL-side filter rationale as `day` above.
-      return listSessionsInRange(db, {
-        start: scope.start,
-        end: scope.end,
-        cwd: scope.cwd,
-      });
+      const range = { start: scope.start, end: scope.end };
+      const sessions = listSessionsInRange(db, { ...range, cwd: scope.cwd });
+      return { sessions, range };
     }
   }
 };
@@ -359,7 +378,8 @@ const extractExitCode = (tc: ToolCall): number => {
 
 export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapIntermediate => {
   const now = options.now ?? Date.now();
-  const sessions = resolveSessions(db, options.scope);
+  const resolved = resolveSessions(db, options.scope);
+  const sessions = resolved.sessions;
   const bundles = sessions.map((s) => loadSessionBundle(db, s));
 
   // Deterministic ordering: oldest first. day/range scope returns
@@ -409,6 +429,18 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
     }
   }
 
+  // Deliberate ordering: `projectGoal` runs over the *truncated*
+  // bundle, so `/recap last <N>` reports the first prompt of the
+  // window — not the original session prompt. Operator semantics
+  // for `last N` is "focus on the last N interactions"; goal.text
+  // staying with that window is consistent (the actions / timeline
+  // also reflect the window). Pinned by the
+  // `session_current with limit truncates to last N user-anchored
+  // steps` and `two real prompts with tool_results between` tests
+  // in projection.test.ts. Single-prompt sessions are unaffected
+  // (`step window does not anchor on tool_result-only user
+  // messages` test). Move ABOVE the truncation block only if the
+  // semantic flips to "always show the original session goal".
   const goal = projectGoal(bundles);
 
   // Actions — second pass with proper db access, replacing the
@@ -628,7 +660,7 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
       if (windowStart !== null && child.startedAt < windowStart) continue;
       const payload = getSubagentOutput(db, child.id);
       let outputSummary = '';
-      if (payload?.payload !== undefined && payload?.payload !== null) {
+      if (payload?.payload != null) {
         const env = payload.payload as Record<string, unknown>;
         if (typeof env.summary === 'string') outputSummary = env.summary;
         else if (typeof env.output === 'string') outputSummary = env.output.slice(0, 200);
@@ -691,14 +723,10 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
   const cacheHitRatio = tokensIn > 0 ? cachedTokens / tokensIn : 0;
   const model = models.size === 1 ? ([...models][0] ?? '') : '';
 
-  // Range bounds: explicit for day/range scopes, zero-pair for
-  // single-session scopes. Always present (schema-bound).
-  const range =
-    options.scope.kind === 'day'
-      ? dayBoundsUtc(options.scope.date)
-      : options.scope.kind === 'range'
-        ? { start: options.scope.start, end: options.scope.end }
-        : { start: 0, end: 0 };
+  // Range bounds: explicit for day/range scopes (computed once in
+  // resolveSessions and threaded through), zero-pair for single-
+  // session scopes. Always present (schema-bound).
+  const range = resolved.range ?? { start: 0, end: 0 };
 
   const incomplete = incompleteSessions.length > 0;
   const incompleteReason = incomplete

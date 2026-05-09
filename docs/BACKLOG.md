@@ -15,6 +15,62 @@ Format:
 
 ---
 
+## [2026-05-09] m4/recap — carry-overs slice: items #5, #7, #8, #9, #10, #12
+
+**Done:** Closed the trivial half of the M4.1 punch list (entry
+[2026-05-08] m4/recap closing inventory). Six items, two files
+touched, zero behavior change other than the dedup of
+`dayBoundsUtc` for `day` scope (idempotent before, called once
+now). Tests stay green (4157 pass, 0 fail).
+
+| # | Change | Where |
+|---|---|---|
+| #5 | Added a 13-line comment above the `projectGoal(bundles)` call site documenting the deliberate ordering: `projectGoal` runs over the *truncated* bundle, so `/recap last <N>` reports the first prompt of the window — operator semantics for `last N` is "focus on the last N interactions" and goal.text staying with that window is consistent with the actions/timeline also being windowed. References the pinning tests so a future reader doesn't file the behavior as a bug. | `src/recap/projection.ts` |
+| #7 | Refactored `resolveSessions` to return `{ sessions, range }` instead of bare `Session[]`. The `range` field carries `{start,end}` for `day`/`range` scopes (computed once) and `null` for single-session scopes. Result construction at the bottom of `projectRecap` reads `resolved.range ?? { start: 0, end: 0 }` instead of re-calling `dayBoundsUtc`. New `ResolvedScope` interface documents the dedup intent inline. Eliminates the divergence-prone duplicate call without changing observable behavior. | `src/recap/projection.ts` |
+| #8 | Rewrote the `renderToNotes` comment to reflect reality: only the human renderer appends a trailing newline; `renderJson` returns the bare `JSON.stringify(intermediate, null, 2)` with no LF. The conditional `endsWith('\n')` already handled both shapes correctly — only the comment claim was wrong. Comment-only fix. | `src/cli/slash/commands/recap.ts` |
+| #9 | Replaced `let intermediate: ReturnType<typeof projectRecap>;` with the named `RecapIntermediate` type (added `import type` from `recap/types.ts`). Same type, less awkward. | `src/cli/slash/commands/recap.ts` |
+| #10 | `payload?.payload !== undefined && payload?.payload !== null` → `payload?.payload != null`. Same semantics, one expression instead of three. | `src/recap/projection.ts` |
+| #12 | Added a 6-line comment above `extractTextBlocks` documenting that `tool_use` / `tool_result` / `image` blocks are intentionally dropped — every caller mines operator/assistant prose, never tool I/O. Surfacing tool_use input would let synthesized JSON arguments leak into goal text and the question heuristic. | `src/recap/projection.ts` |
+
+**Decisions:**
+- #5 chose option (a) "keep + comment" over option (b) "move
+  projectGoal ahead of truncate". Honesty over conceptual purity:
+  the windowed-goal behavior was already pinned by two tests
+  (`session_current with limit truncates to last N user-anchored
+  steps`, `two real prompts with tool_results between`) and
+  rolling it back would have required re-asserting those without
+  a consumer-visible benefit. Option (b) stays available as a
+  future flip with a comment marker (`Move ABOVE the truncation
+  block only if the semantic flips to "always show the original
+  session goal"`) so the path forward is signposted.
+- #7 chose to refactor `resolveSessions` to return both sessions
+  and bounds, rather than computing bounds twice and trusting they
+  agree, or extracting a memoized helper. Returning a structured
+  result keeps both consumers (the SQL filter call and the result
+  envelope) reading from the same source. The `range: null` shape
+  for single-session scopes also documents that those scopes have
+  no meaningful range — replacing the prior "zero-pair sentinel
+  computed at the bottom" implicit shape with an explicit nullable
+  contract.
+
+**Pending:** Carry-overs that survive this slice and need their
+own work:
+- **#3** — `costs.durationMs` summed across multi-session.
+  Single-session unaffected; bloqueia M4.3 (needs the wall-clock
+  `max(endedAt) − min(startedAt)` semantic decision tied to the
+  cross-session renderer).
+- **#13** — `incomplete` predicate only checks `'running'`.
+  Defensive `OR endedAt IS NULL` is the trivial part, but the
+  surfacing requires `failure_events` (not migrated). Defer until
+  the source table lands.
+
+**Next:** Branch `feat/m4-recap-carryovers` ready for review and
+PR. After merge the M4.1 punch list reduces to {#3, #13}, both
+gated on later milestones — opens the path to start M4.2 (LLM
+render + caching) on a clean baseline.
+
+---
+
 ## [2026-05-08] permission-ergonomics — Slice 12: session-allow extends to compound-confirm shapes (no matched rule)
 
 **Done:** Closed the second class of session-allow UX lie. The

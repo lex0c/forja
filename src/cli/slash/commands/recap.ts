@@ -24,6 +24,7 @@
 
 import { type RecapScopeOption, projectRecap } from '../../../recap/projection.ts';
 import { renderHuman, renderJson } from '../../../recap/render.ts';
+import type { RecapIntermediate } from '../../../recap/types.ts';
 import { recordRecapRun } from '../../../storage/repos/recap-runs.ts';
 import type { SlashCommand, SlashContext, SlashResult } from '../types.ts';
 
@@ -125,11 +126,13 @@ const parseRecapArgs = (args: string[]): ParsedRecap | { error: string } => {
 };
 
 const renderToNotes = (text: string): string[] => {
-  // Renderers emit a trailing newline (human: explicit; json: stable
-  // shape from JSON.stringify pretty mode). Drop it before splitting
-  // so the last "note" isn't an empty line that the bus would
-  // surface as a phantom blank info entry. Splitting on `\n` (not
-  // `\r?\n`) is correct because both renderers emit pure LF.
+  // Only the human renderer appends a trailing newline; renderJson
+  // returns the bare `JSON.stringify(intermediate, null, 2)` with
+  // no trailing LF. The conditional `endsWith('\n')` correctly
+  // handles both shapes — drop the trailing LF when present so the
+  // last "note" isn't an empty line that the bus would surface as
+  // a phantom blank info entry. Splitting on `\n` (not `\r?\n`) is
+  // safe because both renderers emit pure LF.
   const trimmed = text.endsWith('\n') ? text.slice(0, -1) : text;
   return trimmed.split('\n');
 };
@@ -157,7 +160,7 @@ export const recapCommand: SlashCommand = {
       scope = { kind: 'session_specific', sessionId: parsed.scope.sessionId };
     }
 
-    let intermediate: ReturnType<typeof projectRecap>;
+    let intermediate: RecapIntermediate;
     try {
       intermediate = projectRecap(ctx.db, { scope, now: ctx.now() });
     } catch (e) {
