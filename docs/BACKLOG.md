@@ -15,6 +15,340 @@ Format:
 
 ---
 
+## [2026-05-09] m4f/recap — slice (f): auto-rehydrate consumer no `--resume`
+
+**Done:** `[resume_context]` block injection on `--resume`
+(STATE_MACHINE §7.6 + RECAP §3.2). When the operator resumes a
+non-terminal session, the harness prepends a literal projection-
+derived block to their first user prompt: goal text, last 5
+decisions, pinned context, notDone items, plus a trailing
+`Resumed at:` line carrying the previous status. Pure
+deterministic — no LLM in the resume init's critical path.
+Closes the recap subsystem's last spec line item.
+
+| Piece | Files |
+|---|---|
+| `buildResumeContext({ intermediate, previousStatus, resumedAt, maxTokens?, lossBound? })` — pure helper. Format byte-identical for fixed input; head+tail-truncates decisions when over budget; pins always-include; emits a degraded fallback shape when projection has no signal. Returns `{ text, decisionCount, pinCount, todoCount, truncated, degraded }`. | `src/recap/resume-context.ts` |
+| `shouldSkipResumeContext(status)` — predicate that drops the block when the resumed session is in a terminal state (`done` / `exhausted` / `error`). | `src/recap/resume-context.ts` |
+| `HarnessEvent` extended with `resume_rehydrated` carrying `previousStatus`, decision/pin/todo counts, `truncated`, `degraded`. TUI adapter translates to a single `info` UIEvent line: `resumed from <status> — N decisions, M pins, K todos rehydrated[, truncated to fit budget]`. Degraded shape replaces counts with "rehydrate degraded (no recap signal)". | `src/harness/types.ts`, `src/tui/harness-adapter.ts` |
+| Harness loop wire-in: AFTER messages reload, BEFORE the user prompt's `appendMessage`. Projects the recap, builds the block, prepends to `userPrompt`, emits `resume_rehydrated`. Wrapped in try/catch — corrupt projection / missing session falls through to plain prompt. | `src/harness/loop.ts` |
+| 15 helper-unit tests covering format, decisions cap, head+tail truncation, pins always-included, notDone, degraded fallback, skip predicate. | `tests/recap/resume-context.test.ts` |
+
+**Decisions:**
+- **Wrap, don't insert.** The block is prepended to the
+  operator's first user prompt — `[resume_context] ... [/]`
+  envelope is part of THAT message, not a separate user turn.
+  Two consecutive user messages violate provider alternation; a
+  single wrapped message does not, and §7.6's format example
+  reads naturally as one prompt with a header section.
+- **Try/catch the entire rehydrate path.** Resume already has
+  enough failure modes; auto-rehydrate is defense-in-depth, not
+  correctness. A projection bug or DB read failure must not
+  break resume — operator gets the plain prompt and a working
+  session, no rehydrate. Helper tests pin the success path;
+  type-safe wiring + the helper's coverage gives strong
+  confidence without a full loop integration test.
+- **`degraded` is a visible flag**, not a hidden fallback. When
+  the projection has no signal (typically a session that
+  crashed before any user turn appended), rehydrate emits a
+  minimal block with just `Resumed at:` and surfaces
+  `degraded: true` so the TUI says "rehydrate degraded" instead
+  of pretending nothing happened. Matches §7.6 fallback rule.
+- **Skip `done` / `exhausted` / `error`.** §7.6 lists
+  `done`/`exhausted`/`error_fatal`; SessionStatus enum has
+  `error` (covers fatal) but no `error_fatal` as a discrete
+  value. `interrupted` and `running` both rehydrate — the spec's
+  target cases (mid-flight crash, force-quit) hit there.
+- **Token budget = `chars / 4`.** A real tokenizer is model-
+  specific and pulls in dependencies the resume init can't
+  afford. The 2k-token cap (≈ 8k chars) is generous against
+  per-bullet caps; over-budget triggers head+tail decisions
+  truncation. Pins always-include per §7.6.
+
+**Pending:**
+- Full-loop integration test (runAgent end-to-end with a pre-
+  seeded interrupted session, capture `resume_rehydrated`,
+  assert persisted user message begins with `[resume_context]`).
+  Helper unit tests + type-safe wiring cover the contract;
+  fixture-heavy integration is deferred.
+- `paused < 5 turns` skip case requires a `paused` SessionStatus
+  value that doesn't exist. Add when state machine ships pause.
+- Pinned context always empty today — `context_pins` table
+  blocked upstream. Helper handles pins correctly when
+  populated; one subsystem away from end-to-end useful.
+- `todos` from `last todo_write` would source from `src/todo/`;
+  this slice uses `intermediate.notDone[]` (the spec's existing
+  schema field) as the analogous signal.
+
+**Next:** Recap subsystem is feature-complete against the spec
+modulo upstream blockers (failure_events, context_pins,
+goal_stack, web_fetch, paused state). No active spec gaps —
+every RECAP.md line item has either shipped or has a tracked
+follow-up entry.
+
+---
+
+## [2026-05-09] m4.3e3/recap — slice (e3): cross-day fixtures + consistency metric
+
+**Done:** Two cross-day fixtures (06 / 07) + the consistency
+eval (RECAP §7.4 fourth dimension after fidelity / coverage /
+concision). Closes M4.3 minus the pre-compact Context Engine
+integration (operator-facing surface shipped in slice e2;
+programmatic engine-side wiring is a follow-up).
+
+| Piece | Files |
+|---|---|
+| `06-cross-day-single` — 2 same-cwd same-UTC-day sessions, scope=day. Exercises the multi-session aggregation that slice (e1) wired into the slash. | `evals/recap/fixtures/06-cross-day-single.ts` |
+| `07-cross-day-range` — 4 sessions across 4 days same cwd, scope=range with `[May 1, May 4)` window. Day 4 session must NOT appear in the projection (half-open exclusion is the correctness leg). | `evals/recap/fixtures/07-cross-day-range.ts` |
+| 12 new goldens (2 fixtures × 6 renderers). | `evals/recap/golden/0{6,7}-*.{human,json,pr,changelog,slack,terse}.md` |
+| Consistency metric. Each of 7 fixtures × 6 renderers projected 5× per test, asserts every run is byte-identical to the first. Catches hidden `Date.now()` / `Math.random()` / non-deterministic iteration order in projection or template. | `tests/recap/consistency.test.ts` (42 tests) |
+| README updated: §11.3 progress, consistency metric explainer, fixture table. | `evals/recap/README.md` |
+
+**Decisions:**
+- **Cross-day fixtures over read-only/write padding.** §11.3 wants
+  5 read-only + 5 write + 3 error-recovered + 2 cross-day = 15
+  total; current count is 7 (1 read-only + 3 write + 1 incomplete
+  + 2 cross-day). Padding read-only / write to 5 each is
+  mechanically straightforward but tests no new shape — the
+  existing read-only / write fixtures already exercise the
+  projection's path. Cross-day was the genuinely missing shape
+  (multi-session aggregation, scope discriminator) and is what
+  this slice ships. Read-only / write padding remains deferred:
+  add when a new categorization needs eval coverage.
+- **Error-recovered category stays blocked.** Projection's
+  `errors[]` field reads from `failure_events`, which doesn't
+  exist as a table yet. A fixture seeded to look "recovered"
+  would project as `errors: []` — the eval would test rendering
+  of an empty array, not the recovery path. Documenting the gap
+  is more honest than fabricating fixtures whose primary purpose
+  is to exercise the only field that's blocked.
+- **Consistency = byte-identical**, not "fuzzy similar". The
+  spec wording is "não 5 renderings diferentes" — for a
+  deterministic surface, anything weaker than byte-equality
+  hides bugs. The test runs 5 iterations per fixture × renderer
+  (the literal §7.4 number) and reseeds the DB on each one so a
+  hidden mutation in the projection (iterator exhaustion,
+  memoization drift) is caught alongside renderer non-determinism.
+  Each iteration runs against a fresh in-memory DB; ~7ms per
+  iteration × 5 × 42 = ~1.5s total runtime.
+- **No LLM-consistency test.** The spec's consistency dimension
+  also targets LLM (different temperature → similar bytes); the
+  deterministic-stub LLM tests in `<renderer>-llm.test.ts`
+  exercise the same code path with a fixed mock response, so
+  cross-iteration similarity is trivially 100% there. Real-
+  provider consistency is a production-time concern, not a unit-
+  test one.
+
+**Pending:**
+- 3 error-recovered fixtures (blocked on `failure_events` table).
+- 4 read-only / write padding fixtures (deferred until a new
+  shape motivates them; not blocking M4.3 closure).
+- Pre-compact Context Engine integration: when the harness
+  loop's `PreCompact` hook fires (`harness/loop.ts:2711`), wire
+  the engine to ALSO call `runRecapSession({kind:'pre_compact'})`
+  programmatically and attach the rendered preview to the
+  `PreCompact` hook payload. The slash and the engine-side
+  consumer share `runRecapSession` so no machinery needs
+  duplication. Slice (e2) shipped the operator-invoked surface;
+  this is the engine-invoked surface.
+
+**Next:** Slice (f) opens auto-rehydrate consumer (RECAP §3.2 +
+STATE_MACHINE §7.6). Re-injects `goal.text` + last 5
+`decisions[]` + `notDone[]` on `agent --resume`.
+
+---
+
+## [2026-05-09] m4.3e2/recap — slice (e2): `/recap pre-compact`
+
+**Done:** Operator-facing pre-compact preview (RECAP §1, §8.1,
+§10). `/recap pre-compact` projects the active session via
+`kind:'pre_compact'` and renders deterministically; never enters
+the LLM path. Closes the M4.3 surface vocabulary except for the
+fixtures + consistency metric (slice e3).
+
+| Piece | Files |
+|---|---|
+| Parser ramo for `pre-compact`. No arguments accepted (the active session is the only meaningful target — operator previewing what compaction would fold "right now"). Forces `noLlmRender=true` regardless of operator-passed flags. Rejects `--all-projects` as the parse error invented in slice (e1). | `src/cli/slash/commands/recap.ts` |
+| `runRecapSession` resolves the sessionId from `ctx.currentSessionId()` for the new scope kind, mirroring `session_current` semantics. | `src/cli/slash/commands/recap.ts` |
+| `FUTURE_SUBCOMMANDS` set is now empty — every spec-defined subcommand is wired. The `futureSubcommandMessage` helper stays as a stub for follow-ups that surface "reserved but not yet wired" diagnostics. | `src/cli/slash/commands/recap.ts` |
+| 5 tests: happy path, no-active-session error, extra-args rejection, audit row (`scope_kind=pre_compact`, `used_llm=false`, provider NOT called even when capability='tools'), `--all-projects` rejection. | `tests/cli/slash/commands/recap.test.ts` |
+
+**Decisions:**
+- **`noLlmRender` forced at the parser**, not at the dispatch.
+  RECAP §10 lists "LLM call em recap pre-compact" as an
+  anti-pattern: pre-compact sits on the critical path before
+  the compaction call (an automated trigger 70% of the way into
+  the context window) and a Haiku call would blow the §8.1
+  <200ms budget. Forcing the flag at the parser makes the
+  intent visible at the call site that decides — overriding
+  later in the dispatch would scatter the policy. Operator
+  passing `--no-llm-render` is a no-op but not an error: same
+  semantic.
+- **No sessionId argument on `/recap pre-compact`.** The spec
+  example takes none and the operator-facing intent is "preview
+  CURRENT session before its compaction would run". Adding a
+  `<session-id>` form would let operators preview compaction of
+  a session that isn't theirs, which would also let the slash
+  fan out across stale sessions — fine architecturally but
+  out-of-spec and unmotivated. Pre-compact stays current-only.
+- **No Context Engine integration in this slice.** The harness
+  loop already has a `PreCompact` hook event that fires when the
+  auto-trigger crosses the threshold (`harness/loop.ts:2711`).
+  The operator-facing slash is its own surface — it lets a human
+  preview before they'd hit auto-compact, distinct from the
+  programmatic hook the engine fires. If a future slice wires
+  the engine to ALSO call `/recap pre-compact` programmatically
+  (e.g., to attach the rendered preview to the PreCompact hook
+  payload), it imports `runRecapSession` the same way the
+  headless surface does. No coupling needed today.
+- **`pre_compact` scope is single-session by construction**,
+  inheriting `session_specific` semantics in `projection.ts`.
+  The semantic difference is the LABEL — the renderer can show
+  "Pre-compact preview" if a future slice cares; today the human
+  template just shows the session id. Sufficient for an
+  operator-invoked preview (they typed `pre-compact` so they
+  know what they're looking at).
+
+**Pending:**
+- Slice (e3) — 10 new fixtures (5 write + 3 error-recovered + 2
+  cross-day) + consistency metric so the §11.3 15-fixture target
+  is met. Pre-compact currently has no dedicated fixture; the
+  same projection behavior is exercised via
+  `tests/recap/projection.test.ts` and the slash test above.
+
+**Next:** Slice (e3) opens the 10 fixtures + consistency metric.
+
+---
+
+## [2026-05-09] m4.3e1/recap — slice (e1): `/recap day` + `/recap range` + `--all-projects`
+
+**Done:** Cross-session slash surface (RECAP §1) — first chunk of
+M4.3. The projection already supported `kind:'day'` and
+`kind:'range'` since M4.1; this slice wires the slash parser to
+those scopes and adds the `--all-projects` privacy flag (§6.1).
+
+| Piece | Files |
+|---|---|
+| `parseRecapArgs` accepts `day [YYYY-MM-DD]` (defaults to today UTC) and `range <from> <to>`. Strict `^\d{4}-\d{2}-\d{2}$` parse + `Date.UTC` round-trip rejects `2026-13-99`. Range emits `[from, to+1d)` so `<to>` is inclusive of the operator's calendar input but the SQL predicate stays half-open. | `src/cli/slash/commands/recap.ts` |
+| `--all-projects` flag in `splitFlags`. Honored only by `day` / `range`; passes a clean parse error on every other form (`/recap pr --all-projects` etc.) so the operator learns the flag has no effect there instead of silent no-op. | `src/cli/slash/commands/recap.ts` |
+| `RecapScopeOption` for day/range now carries `cwd: string \| null`. `null` = `--all-projects` (no SQL cwd filter); the projection's `resolveSessions` spreads `cwd` only when set, so `listSessionsInRange` falls back to its repo-side default of "every cwd". | `src/recap/projection.ts` |
+| `runRecapSession` resolves the cwd from `ctx.baseConfig.cwd` for day/range scopes when `--all-projects` is absent. Privacy guard from §6.1: cross-project recap is opt-in, never automatic. | `src/cli/slash/commands/recap.ts` |
+| 11 tests covering: day same-cwd, day default-today, day invalid date, range inclusive, range invalid order, range missing args, day cross-cwd guard, day --all-projects (verified via JSON scope.sessionIds + audit), --all-projects rejection on single-session forms, day audit row scope_kind. | `tests/cli/slash/commands/recap.test.ts` |
+| Pre-compact stays in `FUTURE_SUBCOMMANDS` — slice (e2). | `src/cli/slash/commands/recap.ts` |
+
+**Decisions:**
+- **`<to>` interpreted inclusively** for `/recap range` (operator
+  intent: "May 1 through May 3" = three days). Internally the
+  parser bumps `<to>` by 24h to produce the half-open `[start,
+  end)` shape `listSessionsInRange` expects. Without the bump,
+  `range 2026-05-01 2026-05-03` would only cover May 1 and May 2.
+- **`--all-projects` is the confirmation** (per the design
+  question we answered before slice e1 started). No additional
+  modal / prompt; the explicit flag IS the guard. Spec §6.1 says
+  "opt-in explícito" — the flag is the explicit action.
+- **`null` cwd for `--all-projects`**, not undefined. The slash
+  passes `cwd: null` so the projection's union type stays exhaustive
+  and the spread (`cwd: scope.cwd !== null ? scope.cwd : undefined`)
+  is the single place the SQL filter is dropped. Adding a fourth
+  alternate (`{ kind:'day', allProjects:true }`) was considered
+  but rejected — the discriminator should ride on `kind`, not on
+  a sibling flag, so the projection's `switch` stays one-level.
+- **--all-projects on single-session forms is a hard parse error**,
+  not a silent no-op. The error message points the operator at
+  the right scope (`day` / `range`); accepting and ignoring would
+  make the flag look effective when it isn't.
+- **Renderer surface for day/range**: the human renderer's title
+  shows `day YYYY-MM-DD` for day and `range (N sessions)` for
+  range — no operator-visible aggregation of multiple goals (the
+  `projectGoal` picks the first session-anchored bundle). The
+  spec doesn't define the multi-session rendering shape in
+  detail, and the existing `intermediate.scope.sessionIds`
+  exposes the full list to JSON consumers. Rendering all N goals
+  visibly in markdown is a follow-up if operator feedback shows
+  the current shape is too sparse.
+- **No new fixtures yet**. The §11.3 target (15 fixtures total
+  including 2 cross-day) is slice (e3); this slice ships the
+  surface, the next slice ships fixtures + consistency metric.
+
+**Pending:**
+- Slice (e2) — `/recap pre-compact` integrated with Context
+  Engine (budget <200ms, no LLM in critical path per §10).
+- Slice (e3) — 10 new fixtures (5 write + 3 error-recovered + 2
+  cross-day) + consistency metric (§7.4) so the eval gate hits
+  the §11.3 15-fixture target.
+- (e1 review carry-over) — inferred render shape for multi-
+  session goal aggregation (today only the first goal text
+  surfaces in human/pr/etc.; goalStack future could populate
+  per-session goals visibly).
+
+**Next:** Slice (e2) opens `/recap pre-compact`.
+
+---
+
+## [2026-05-09] m4.2d/recap — slice (d): headless NDJSON `agent recap`
+
+**Done:** RECAP §9 headless surface. `agent recap [args]` runs
+the recap pipeline without entering the REPL; `--json` toggles
+the four-event NDJSON envelope (`recap_start` /
+`recap_intermediate` / `recap_render` / `recap_end`). Destrava CI
+usage: `agent --json recap pr session <id> | jq '.output'`,
+`gh pr create --body "$(agent recap pr --no-llm-render)"`, etc.
+
+| Piece | Files |
+|---|---|
+| `agent recap [args]` subcommand parser. Mirrors the `init` shape: verb-first, recap-side flags forwarded verbatim to the slash parser. `--json` consumed at the subcommand boundary so the slash parser does not see it as a renderer flag. | `src/cli/args.ts`, `tests/cli/args.test.ts` |
+| `runRecapSession` extracted from the slash exec body — a reusable function that returns the structured result (intermediate + output + audit metadata). The slash `recapCommand.exec` is now a thin wrapper. Headless calls `runRecapSession` directly so the intermediate is available to emit `recap_intermediate` without re-projecting. | `src/cli/slash/commands/recap.ts` |
+| `runRecapHeadless` — entry point. Routes `list` to `runRecapList` (multi-row NDJSON), every other form to `runRecapSession` (four-event NDJSON when `--json`, plain rendered text otherwise). Builds a minimal `SlashContext` (real DB + provider, stub for everything else); forwards `warn` / `error` bus events to stderr. | `src/cli/recap-headless.ts` |
+| `cli/run.ts` dispatch routes `args.recap` to `runRecapHeadless` after `--list-sessions` and `--explain-permissions`. Stub provider with `constrained: false` — LLM render falls back to deterministic until the real bootstrap is wired in. | `src/cli/run.ts` |
+| 11 headless tests (table + NDJSON + list passthrough + LLM stub) + 5 args tests. | `tests/cli/recap-headless.test.ts`, `tests/cli/args.test.ts` |
+
+**Decisions:**
+- **`runRecapSession` extracted, not duplicated.** Headless needs
+  the intermediate to emit `recap_intermediate`; the slash exec
+  used to assemble it inline and return only the rendered output.
+  Extracting the pipeline as a reusable function lets both
+  surfaces call it; the slash's `exec` wraps the result in a
+  `SlashResult` and the headless wraps it in NDJSON. Bonus: the
+  refactor moved the audit row + `--out` write into the function,
+  so behavior is byte-identical between surfaces.
+- **`recap list` keeps its multi-row NDJSON shape.** The four-
+  event envelope (RECAP §9) is session-scoped. `list` is
+  multi-row and has its own NDJSON convention (one line per
+  `recap_mini`). When `--json` is set globally and the recap form
+  is `list`, the headless handler appends `--json` to the list
+  args so the slash list parser emits NDJSON of mini rows. Two
+  shapes, one flag — operator gets what they asked for.
+- **Stub provider in `cli/run.ts` dispatch.** The headless flow
+  needs a `Provider` for the recap LLM render path; bootstrapping
+  the real provider (with API key resolution, registry, model
+  selection) is the harness bootstrap surface and pulling it
+  into the recap-only path adds a lot of complexity for marginal
+  benefit. The stub fails the `constrained` capability gate so
+  every render falls back to the deterministic template — the
+  same surface `--no-llm-render` produces. LLM-headless wiring
+  is a follow-up tracked below.
+- **Subcommand discriminator (`init`-style verb)**, not
+  `--json /recap pr` shorthand. The spec wording suggested the
+  shorthand but the implementation matches the dispatch shape
+  every other CLI verb already uses (`agent init`, `agent
+  recap`). Operators muscle-memory matches `git`/`gh`-style
+  subcommands; the shorthand can be added later as an alias if
+  the operator-facing UX wants it.
+
+**Pending:**
+- LLM-headless bootstrap. Today the dispatch in `cli/run.ts`
+  passes a `constrained:false` stub; an operator running
+  `agent recap pr` headless gets the deterministic path even
+  with `ANTHROPIC_API_KEY` set. Wiring the real provider via
+  `bootstrap` is straightforward but adds a dependency this
+  slice intentionally skipped.
+
+**Next:** Slice (e) opens M4.3 cross-session — `/recap day`,
+`/recap range`, `/recap pre-compact`, `--all-projects` with
+guards, plus 10 fixtures + consistency metric (RECAP §11.3).
+
+---
+
 ## [2026-05-09] m4.2c-mini/recap — slice (c-mini): RecapMini + `/recap list`
 
 **Done:** Schema, projection, slash, and cache wiring for the

@@ -9,6 +9,7 @@ import type { MemoryRegistry } from '../memory/index.ts';
 import type { Decision, PermissionEngine, PolicySource } from '../permissions/index.ts';
 import type { Provider, StreamEvent, UsageInfo } from '../providers/index.ts';
 import type { DB } from '../storage/index.ts';
+import type { SessionStatus } from '../storage/repos/sessions.ts';
 import type { SubagentSet } from '../subagents/load.ts';
 import type { TodoItem } from '../todo/index.ts';
 import type { ToolRegistry } from '../tools/index.ts';
@@ -29,6 +30,24 @@ export type HarnessEvent =
       sessionId: string;
       kept: number;
       dropped: number;
+    }
+  | {
+      // Emitted on resume after the auto-rehydrate block was
+      // prepended to the operator's first user prompt
+      // (STATE_MACHINE.md §7.6 + RECAP.md §3.2). Renderer surface
+      // is the visibility line `🔄 Resumed from <status> — N
+      // decisions, M pins, K todos rehydrated`. `degraded` is
+      // true when the projection had no goal text or signal —
+      // the block is still emitted for an honest "Resumed at"
+      // marker but contains no recap content.
+      type: 'resume_rehydrated';
+      sessionId: string;
+      previousStatus: SessionStatus;
+      decisionCount: number;
+      pinCount: number;
+      todoCount: number;
+      truncated: boolean;
+      degraded: boolean;
     }
   | { type: 'step_start'; stepN: number }
   | { type: 'provider_event'; event: StreamEvent }

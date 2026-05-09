@@ -17,6 +17,8 @@ import { fixture as f02 } from '../../evals/recap/fixtures/02-write-refactor.ts'
 import { fixture as f03 } from '../../evals/recap/fixtures/03-with-decisions.ts';
 import { fixture as f04 } from '../../evals/recap/fixtures/04-with-subagent.ts';
 import { fixture as f05 } from '../../evals/recap/fixtures/05-incomplete-session.ts';
+import { fixture as f06 } from '../../evals/recap/fixtures/06-cross-day-single.ts';
+import { fixture as f07 } from '../../evals/recap/fixtures/07-cross-day-range.ts';
 import type { RecapFixture } from '../../evals/recap/fixtures/types.ts';
 import { renderChangelogDeterministic } from '../../src/recap/changelog/index.ts';
 import { renderPrDeterministic } from '../../src/recap/pr/index.ts';
@@ -28,7 +30,7 @@ import type { RecapIntermediate } from '../../src/recap/types.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 
-const FIXTURES: readonly RecapFixture[] = [f01, f02, f03, f04, f05];
+const FIXTURES: readonly RecapFixture[] = [f01, f02, f03, f04, f05, f06, f07];
 
 const GOLDEN_DIR = join(import.meta.dir, '..', '..', 'evals', 'recap', 'golden');
 

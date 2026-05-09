@@ -195,8 +195,12 @@ export type RecapScopeOption =
   | { kind: 'session_current'; sessionId: string; limit?: number }
   | { kind: 'session_specific'; sessionId: string }
   | { kind: 'pre_compact'; sessionId: string }
-  | { kind: 'day'; cwd: string; date: string }
-  | { kind: 'range'; cwd: string; start: number; end: number };
+  // `cwd: null` opts the projection out of the cwd filter (RECAP
+  // §6.1 `--all-projects` mode). The slash command requires the
+  // operator to pass `--all-projects` explicitly to set this; the
+  // projection itself does not enforce the gate (the slash does).
+  | { kind: 'day'; cwd: string | null; date: string }
+  | { kind: 'range'; cwd: string | null; start: number; end: number };
 
 export interface ProjectRecapOptions {
   scope: RecapScopeOption;
@@ -284,14 +288,22 @@ const resolveSessions = (db: DB, scope: RecapScopeOption): ResolvedScope => {
       // would silently miss older day windows once a project
       // crossed the cap. The `[start, end)` interval matches the
       // half-open day boundary `dayBoundsUtc` produces.
-      const sessions = listSessionsInRange(db, { ...range, cwd: scope.cwd });
+      // `cwd: null` (operator passed `--all-projects`) drops the
+      // filter so sessions across every project show up.
+      const sessions = listSessionsInRange(db, {
+        ...range,
+        ...(scope.cwd !== null ? { cwd: scope.cwd } : {}),
+      });
       return { sessions, range };
     }
     case 'range': {
       // Operator-supplied range; trust the bounds as-is. Same
       // SQL-side filter rationale as `day` above.
       const range = { start: scope.start, end: scope.end };
-      const sessions = listSessionsInRange(db, { ...range, cwd: scope.cwd });
+      const sessions = listSessionsInRange(db, {
+        ...range,
+        ...(scope.cwd !== null ? { cwd: scope.cwd } : {}),
+      });
       return { sessions, range };
     }
   }

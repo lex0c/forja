@@ -149,7 +149,13 @@ describe('--resume flow', () => {
     expect(msgsAfterSecond[0]?.content).toBe('first');
     expect(msgsAfterSecond[1]?.role).toBe('assistant');
     expect(msgsAfterSecond[2]?.role).toBe('user');
-    expect(msgsAfterSecond[2]?.content).toBe('follow up');
+    // Auto-rehydrate (M4.3 slice f) prepends a [resume_context]
+    // block to the operator's prompt; the content STARTS with
+    // the block and CONTAINS the literal "follow up" the
+    // operator typed. Pre-rehydrate this was a strict equality.
+    expect(typeof msgsAfterSecond[2]?.content === 'string').toBe(true);
+    expect(msgsAfterSecond[2]?.content as string).toContain('[resume_context]');
+    expect(msgsAfterSecond[2]?.content as string).toContain('follow up');
     expect(msgsAfterSecond[3]?.role).toBe('assistant');
     db.close();
   });
@@ -207,7 +213,13 @@ describe('--resume flow', () => {
     expect(sessionsAfter).toHaveLength(2); // still 2, resume reused
     // The newest session got new messages.
     const newestMsgs = listMessagesBySession(db, newest);
-    expect(newestMsgs.some((m) => m.content === 'continuing')).toBe(true);
+    // `--resume` now prepends a [resume_context] block to the
+    // operator's prompt (M4.3 slice f); the persisted message is
+    // the WRAPPED form, which still contains the operator's
+    // literal prompt — assert via includes() instead of ===.
+    expect(
+      newestMsgs.some((m) => typeof m.content === 'string' && m.content.includes('continuing')),
+    ).toBe(true);
     db.close();
   });
 
@@ -264,9 +276,13 @@ describe('--resume flow', () => {
       expect(code).toBe(0);
 
       db = openTestDb();
-      // Our session got new messages (resume worked).
+      // Our session got new messages (resume worked). The
+      // persisted prompt is wrapped in a [resume_context] block
+      // (M4.3 slice f auto-rehydrate); assert via includes().
       const ourMsgs = listMessagesBySession(db, ourSession.id);
-      expect(ourMsgs.some((m) => m.content === 'continuing')).toBe(true);
+      expect(
+        ourMsgs.some((m) => typeof m.content === 'string' && m.content.includes('continuing')),
+      ).toBe(true);
       db.close();
     } finally {
       rmSync(otherCwd, { recursive: true, force: true });
@@ -344,7 +360,11 @@ describe('--resume flow', () => {
     db = openTestDb();
     const parentMsgs = listMessagesBySession(db, parent.id);
     // The "continuing" prompt landed on the PARENT, not the child.
-    expect(parentMsgs.some((m) => m.content === 'continuing')).toBe(true);
+    // Wrapped form via M4.3 slice f auto-rehydrate; assert via
+    // includes() instead of strict ===.
+    expect(
+      parentMsgs.some((m) => typeof m.content === 'string' && m.content.includes('continuing')),
+    ).toBe(true);
     db.close();
   });
 
@@ -713,7 +733,15 @@ describe('--resume flow', () => {
     expect(msgs).toHaveLength(2);
     // The prompt is the chain root since there was no prior tail.
     expect(msgs[0]?.parentId).toBeNull();
-    expect(msgs[0]?.content).toBe('first message');
+    // Auto-rehydrate (M4.3 slice f) wraps the operator's prompt
+    // in a [resume_context] block on every resume — including
+    // for sessions with no persisted prior turns. The block
+    // exists (since session status is 'running' here) but the
+    // body is degraded (no goal text, no decisions). The
+    // operator's literal "first message" is preserved INSIDE
+    // the wrapper.
+    expect(typeof msgs[0]?.content === 'string').toBe(true);
+    expect(msgs[0]?.content as string).toContain('first message');
     db.close();
   });
 

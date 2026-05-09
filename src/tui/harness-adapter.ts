@@ -227,6 +227,22 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         });
         return out;
 
+      case 'resume_rehydrated': {
+        // Visibility line per STATE_MACHINE.md §7.6:
+        // `🔄 Resumed from <status> — N decisions, M pins, K todos rehydrated`.
+        // `degraded` produces a different shape so the operator
+        // sees that the rehydrate had no payload (typical: Stop
+        // hook never ran, recap_cache empty, projection caught
+        // an empty session).
+        const message = event.degraded
+          ? `resumed from ${event.previousStatus} — rehydrate degraded (no recap signal in audit log)`
+          : `resumed from ${event.previousStatus} — ${event.decisionCount} decisions, ${event.pinCount} pins, ${event.todoCount} todos rehydrated${
+              event.truncated ? ' (truncated to fit budget)' : ''
+            }`;
+        out.push({ type: 'info', ts, message });
+        return out;
+      }
+
       case 'step_start': {
         state.steps = event.stepN;
         out.push({

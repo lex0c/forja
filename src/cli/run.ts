@@ -168,6 +168,52 @@ export const run = async (options: RunOptions): Promise<number> => {
       });
     }
 
+    // `agent recap [args]` headless surface (RECAP §9). DB-only
+    // path: no policy resolution, no harness — just project +
+    // render. The provider stub fails the `constrained` capability
+    // gate so the LLM render path falls back to the deterministic
+    // template; a follow-up will bootstrap the real provider so
+    // `agent recap pr` exercises the LLM surface when API keys are
+    // available. `--json` toggles the four-event NDJSON envelope
+    // (recap_start / recap_intermediate / recap_render / recap_end);
+    // without it, the rendered text streams to stdout verbatim.
+    if (args.recap !== undefined) {
+      const { runRecapHeadless } = await import('./recap-headless.ts');
+      const headlessProvider: import('../providers/types.ts').Provider = {
+        id: 'headless/stub',
+        family: 'anthropic',
+        capabilities: {
+          tools: 'native',
+          cache: 'server_5min',
+          vision: false,
+          streaming: true,
+          constrained: false,
+          context_window: 200_000,
+          output_max_tokens: 4_096,
+          cost_per_1k_input: 0,
+          cost_per_1k_output: 0,
+          notes: ['headless stub: LLM render falls back to deterministic'],
+        },
+        // Stream / constrained / countTokens are unused on the
+        // deterministic path; reject if the recap pipeline ever
+        // tries to call them so the gap is loud, not silent.
+        generate: async function* () {},
+        generateConstrained: () =>
+          Promise.reject(new Error('headless recap: LLM render not yet wired')),
+        countTokens: async () => 0,
+      };
+      return await runRecapHeadless({
+        args: args.recap.args,
+        json: args.json,
+        ...(options.bootstrapOverride?.dbPath !== undefined
+          ? { dbPath: options.bootstrapOverride.dbPath }
+          : {}),
+        provider: headlessProvider,
+        out: (s) => process.stdout.write(s),
+        err: errSink,
+      });
+    }
+
     // Checkpoint subcommands and `--undo` short-circuit the same way
     // list-sessions does: DB-only path, no bootstrap, no API key.
     // We dispatch BEFORE the resume branch because they're mutually

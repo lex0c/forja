@@ -29,6 +29,8 @@ import type {
   ProviderToolUseBlock,
 } from '../providers/index.ts';
 import { estimatePromptTokens } from '../providers/tokens.ts';
+import { projectRecap } from '../recap/projection.ts';
+import { buildResumeContext, shouldSkipResumeContext } from '../recap/resume-context.ts';
 import {
   type CritiqueRunCode,
   appendMessage,
@@ -1341,6 +1343,48 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (lastFetched !== undefined) priorTailId = lastFetched.id;
       }
 
+      // Auto-rehydrate on `--resume` (STATE_MACHINE §7.6 +
+      // RECAP §3.2). Prepends a literal `[resume_context]` block
+      // to the operator's first user prompt so the next turn has
+      // access to the goal text, recent decisions, pins, and
+      // notDone items from the audit log. Pure projection (no
+      // LLM, no provider call) so it stays inside the resume
+      // init's latency envelope; any exception falls through to
+      // an unrehydrated prompt — the operator gets a working
+      // resume instead of a hard failure.
+      let effectiveUserPrompt = config.userPrompt;
+      if (resumeId !== undefined && config.userPrompt.length > 0) {
+        try {
+          const resumedSession = getSession(config.db, resumeId);
+          if (resumedSession !== null && !shouldSkipResumeContext(resumedSession.status)) {
+            const intermediate = projectRecap(config.db, {
+              scope: { kind: 'session_specific', sessionId: resumeId },
+              now: Date.now(),
+            });
+            const block = buildResumeContext({
+              intermediate,
+              previousStatus: resumedSession.status,
+              resumedAt: Date.now(),
+            });
+            effectiveUserPrompt = `${block.text}\n\n${config.userPrompt}`;
+            safeEmit(config.onEvent, {
+              type: 'resume_rehydrated',
+              sessionId,
+              previousStatus: resumedSession.status,
+              decisionCount: block.decisionCount,
+              pinCount: block.pinCount,
+              todoCount: block.todoCount,
+              truncated: block.truncated,
+              degraded: block.degraded,
+            });
+          }
+        } catch {
+          // Don't let rehydrate failure break resume. The plain
+          // prompt still works; auto-rehydrate is defense-in-
+          // depth, not a correctness path.
+        }
+      }
+
       // Skip appending when userPrompt is empty. The preassigned
       // path with parent-seeded conversation passes '' here; the
       // hydration above already loaded the seed, so a second
@@ -1353,7 +1397,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         const userMsg = appendMessage(config.db, {
           sessionId,
           role: 'user',
-          content: config.userPrompt,
+          content: effectiveUserPrompt,
           // null on first turn (new session); tail id on resume
           // / preassigned so the chain stays connected.
           // appendMessage validates the parent belongs to the
@@ -1361,7 +1405,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(priorTailId !== null ? { parentId: priorTailId } : {}),
         });
         lastMessageId = userMsg.id;
-        messages.push({ role: 'user', content: config.userPrompt });
+        messages.push({ role: 'user', content: effectiveUserPrompt });
       } else if (priorTailId !== null) {
         // No new user message to append; the prior tail id
         // becomes the lastMessageId we report on the result and

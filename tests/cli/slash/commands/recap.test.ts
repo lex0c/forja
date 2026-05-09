@@ -278,13 +278,63 @@ describe('/recap', () => {
     expect(result.message).toContain('missing session id');
   });
 
-  test('surfaces a clear "not yet available" for future cross-session scopes', async () => {
-    for (const sub of ['day', 'range', 'pre-compact']) {
-      const result = await recapCommand.exec([sub], makeCtx());
-      expect(result.kind).toBe('error');
-      if (result.kind !== 'error') return;
-      expect(result.message).toContain('M4.3');
-    }
+  // ─── /recap pre-compact (slice e2) ──────────────────────────
+
+  test('/recap pre-compact renders the current session deterministically', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'preview before compaction',
+      createdAt: 1_100,
+    });
+    currentSessionId = s.id;
+    const result = await recapCommand.exec(['pre-compact'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    expect(text).toContain('preview before compaction');
+    expect(text).toContain('# Recap');
+  });
+
+  test('/recap pre-compact errors when no active session', async () => {
+    const result = await recapCommand.exec(['pre-compact'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('no active session');
+  });
+
+  test('/recap pre-compact rejects extra arguments', async () => {
+    const result = await recapCommand.exec(['pre-compact', 'extra'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('takes no arguments');
+  });
+
+  test('/recap pre-compact records audit row with scope_kind=pre_compact and used_llm=false', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    currentSessionId = s.id;
+    // Provider that would respond to constrained calls — proves
+    // the LLM path is force-bypassed (RECAP §10), not just absent.
+    const stubHuman = JSON.stringify({
+      schemaVersion: 'human-v1',
+      summary: ['unused; pre-compact must never call the LLM'],
+    });
+    const handle = stubProvider(stubHuman);
+    const ctx = makeCtx({ baseConfig: cfgWithProvider(handle.provider) });
+    await recapCommand.exec(['pre-compact'], ctx);
+    expect(handle.calls).toHaveLength(0);
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.scopeKind).toBe('pre_compact');
+    expect(runs[0]?.usedLlm).toBe(false);
+    expect(runs[0]?.promptVersion).toBeNull();
+  });
+
+  test('/recap pre-compact rejects --all-projects (single-session form)', async () => {
+    const result = await recapCommand.exec(['pre-compact', '--all-projects'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('--all-projects only applies');
   });
 
   test('rejects unknown subcommand with a hint to /recap variants', async () => {
@@ -1112,6 +1162,201 @@ describe('/recap', () => {
     for (const line of lines) {
       expect(line).toContain('queue');
     }
+  });
+
+  // ─── /recap day + /recap range (slice e1) ───────────────────
+
+  test('/recap day [YYYY-MM-DD] aggregates same-cwd sessions in the day window', async () => {
+    const may1 = Date.UTC(2026, 4, 1, 0, 0, 0, 0);
+    const may1noon = may1 + 12 * 60 * 60 * 1000;
+    const apr30 = may1 - 60 * 60 * 1000;
+    // Two same-day same-cwd sessions, plus one previous-day same-
+    // cwd that should NOT show up.
+    for (const startedAt of [may1, may1noon]) {
+      const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt });
+      appendMessage(db, {
+        sessionId: s.id,
+        role: 'user',
+        content: `goal at ${startedAt}`,
+        createdAt: startedAt + 1,
+      });
+      completeSession(db, s.id, 'done', 0, true, startedAt + 100);
+    }
+    const before = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: apr30 });
+    appendMessage(db, {
+      sessionId: before.id,
+      role: 'user',
+      content: 'previous day',
+      createdAt: apr30 + 1,
+    });
+    completeSession(db, before.id, 'done', 0, true, apr30 + 100);
+    const result = await recapCommand.exec(['day', '2026-05-01', '--no-llm-render'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    // Day-scope title format from renderHuman: `day 2026-05-01`.
+    expect(text).toContain('day 2026-05-01');
+    // Previous day should not appear.
+    expect(text).not.toContain('previous day');
+  });
+
+  test('/recap day defaults to today UTC when no date given', async () => {
+    const today = new Date(5_000);
+    const yyyy = today.getUTCFullYear().toString().padStart(4, '0');
+    const mm = (today.getUTCMonth() + 1).toString().padStart(2, '0');
+    const dd = today.getUTCDate().toString().padStart(2, '0');
+    const todayMs = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate(), 0);
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: todayMs + 1 });
+    appendMessage(db, { sessionId: s.id, role: 'user', content: 'today', createdAt: todayMs + 2 });
+    completeSession(db, s.id, 'done', 0, true, todayMs + 100);
+    const result = await recapCommand.exec(['day', '--no-llm-render'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    expect(text).toContain(`day ${yyyy}-${mm}-${dd}`);
+  });
+
+  test('/recap day rejects an invalid date', async () => {
+    const result = await recapCommand.exec(['day', '2026-13-99'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('invalid date');
+  });
+
+  test('/recap range <from> <to> aggregates sessions in the inclusive day range', async () => {
+    const may1 = Date.UTC(2026, 4, 1, 0, 0, 0, 0);
+    const may2 = Date.UTC(2026, 4, 2, 0, 0, 0, 0);
+    const may3 = Date.UTC(2026, 4, 3, 0, 0, 0, 0);
+    const may4 = Date.UTC(2026, 4, 4, 0, 0, 0, 0);
+    for (const startedAt of [may1, may2, may3, may4]) {
+      const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt });
+      appendMessage(db, {
+        sessionId: s.id,
+        role: 'user',
+        content: `day-${startedAt}`,
+        createdAt: startedAt + 1,
+      });
+      completeSession(db, s.id, 'done', 0, true, startedAt + 100);
+    }
+    const result = await recapCommand.exec(
+      ['range', '2026-05-01', '2026-05-03', '--no-llm-render'],
+      makeCtx(),
+    );
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    // Range header from renderHuman: `range (N sessions)`. Three
+    // days inclusive should match three sessions.
+    expect(text).toContain('range (3 sessions)');
+    // May 4 (outside the range) should not appear.
+    expect(text).not.toContain(`day-${may4}`);
+  });
+
+  test('/recap range rejects when <to> is before <from>', async () => {
+    const result = await recapCommand.exec(['range', '2026-05-10', '2026-05-01'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('on or after');
+  });
+
+  test('/recap range rejects with missing arguments', async () => {
+    const result = await recapCommand.exec(['range', '2026-05-01'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('requires <from> <to>');
+  });
+
+  test('/recap day filters by current-cwd by default (privacy guard)', async () => {
+    const may1 = Date.UTC(2026, 4, 1, 0, 0, 0, 0);
+    // Session A: same cwd as the harness. Session B: different cwd.
+    const a = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: may1 });
+    appendMessage(db, {
+      sessionId: a.id,
+      role: 'user',
+      content: 'in-project',
+      createdAt: may1 + 1,
+    });
+    completeSession(db, a.id, 'done', 0, true, may1 + 100);
+    const b = createSession(db, { model: 'sonnet', cwd: '/other/proj', startedAt: may1 + 200 });
+    appendMessage(db, {
+      sessionId: b.id,
+      role: 'user',
+      content: 'cross-project',
+      createdAt: may1 + 201,
+    });
+    completeSession(db, b.id, 'done', 0, true, may1 + 300);
+    const result = await recapCommand.exec(['day', '2026-05-01', '--no-llm-render'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    expect(text).toContain('in-project');
+    expect(text).not.toContain('cross-project');
+  });
+
+  test('/recap day --all-projects fans out across every cwd (visible via audit + json shape)', async () => {
+    const may1 = Date.UTC(2026, 4, 1, 0, 0, 0, 0);
+    const a = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: may1 });
+    appendMessage(db, {
+      sessionId: a.id,
+      role: 'user',
+      content: 'in-project',
+      createdAt: may1 + 1,
+    });
+    completeSession(db, a.id, 'done', 0, true, may1 + 100);
+    const b = createSession(db, { model: 'sonnet', cwd: '/other/proj', startedAt: may1 + 200 });
+    appendMessage(db, {
+      sessionId: b.id,
+      role: 'user',
+      content: 'cross-project',
+      createdAt: may1 + 201,
+    });
+    completeSession(db, b.id, 'done', 0, true, may1 + 300);
+    // Render in JSON to inspect scope.session_ids — the human
+    // surface only shows ONE goal text (projectGoal picks the first
+    // session-anchored bundle), so we use the structured shape to
+    // assert cross-project fan-out actually happened.
+    const result = await recapCommand.exec(
+      ['json', 'day', '2026-05-01', '--all-projects', '--no-llm-render'],
+      makeCtx(),
+    );
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    const parsed = JSON.parse(text) as { scope: { sessionIds: string[] } };
+    expect(parsed.scope.sessionIds.sort()).toEqual([a.id, b.id].sort());
+
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.scopeKind).toBe('day');
+    expect(runs[0]?.sessionIds.sort()).toEqual([a.id, b.id].sort());
+  });
+
+  test('/recap rejects --all-projects on single-session scopes (parse error)', async () => {
+    for (const args of [
+      ['--all-projects'],
+      ['pr', '--all-projects'],
+      ['session', 'sid', '--all-projects'],
+      ['last', '5', '--all-projects'],
+    ]) {
+      const result = await recapCommand.exec(args, makeCtx());
+      expect(result.kind).toBe('error');
+      if (result.kind !== 'error') continue;
+      expect(result.message).toContain('--all-projects only applies');
+    }
+  });
+
+  test('/recap day audits with scope_kind=day and the full session id list', async () => {
+    const may1 = Date.UTC(2026, 4, 1, 0, 0, 0, 0);
+    const a = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: may1 });
+    appendMessage(db, { sessionId: a.id, role: 'user', content: 'a', createdAt: may1 + 1 });
+    completeSession(db, a.id, 'done', 0, true, may1 + 100);
+    const b = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: may1 + 200 });
+    appendMessage(db, { sessionId: b.id, role: 'user', content: 'b', createdAt: may1 + 201 });
+    completeSession(db, b.id, 'done', 0, true, may1 + 300);
+    await recapCommand.exec(['day', '2026-05-01', '--no-llm-render'], makeCtx());
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.scopeKind).toBe('day');
+    // Both same-cwd sessions surface in the audit row.
+    expect(runs[0]?.sessionIds.sort()).toEqual([a.id, b.id].sort());
   });
 
   test('/recap list cache hit on second call (deterministic, no projection re-run)', async () => {

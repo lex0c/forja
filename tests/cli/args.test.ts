@@ -856,3 +856,44 @@ describe('parseArgs — init subcommand', () => {
     expect(r.args.help).toBe(true);
   });
 });
+
+describe('parseArgs — recap subcommand', () => {
+  test('bare `recap` collects no args', () => {
+    const r = parseArgs(['recap']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.recap).toEqual({ args: [] });
+    expect(r.args.json).toBe(false);
+  });
+
+  test('positional and flags forward verbatim to the recap surface', () => {
+    const r = parseArgs(['recap', 'pr', '--no-llm-render', '--out', 'PR.md']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.recap?.args).toEqual(['pr', '--no-llm-render', '--out', 'PR.md']);
+  });
+
+  test('--json toggles NDJSON event mode (consumed at subcommand boundary)', () => {
+    const r = parseArgs(['recap', '--json', 'pr']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.json).toBe(true);
+    // --json is NOT forwarded to the recap-side parser (it's the
+    // headless event-stream toggle, not a renderer flag).
+    expect(r.args.recap?.args).toEqual(['pr']);
+  });
+
+  test('--help short-circuits to help mode', () => {
+    const r = parseArgs(['recap', '--help']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.help).toBe(true);
+  });
+
+  test('preserves recap-specific flags including --since DATE', () => {
+    const r = parseArgs(['recap', 'list', '--since', '2026-05-01', '--limit', '50']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.recap?.args).toEqual(['list', '--since', '2026-05-01', '--limit', '50']);
+  });
+});

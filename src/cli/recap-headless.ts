@@ -1,0 +1,183 @@
+// `agent recap [args]` — RECAP §9 headless surface. Lets a CI
+// pipeline / shell script run `/recap` without entering the REPL.
+// When the global `--json` flag is set, emits the four-event
+// NDJSON stream the spec defines:
+//
+//   {"type":"recap_start","scope":{...},"ts":...}
+//   {"type":"recap_intermediate","data":{...}}
+//   {"type":"recap_render","renderer":"...","output":"..."}
+//   {"type":"recap_end","duration_ms":...,"used_llm":...,"cost_usd":...}
+//
+// Without `--json`, the rendered text is written to stdout
+// verbatim (or to `--out PATH` if the recap-side flag is set).
+//
+// `agent recap list ...` is a special case — `/recap list` already
+// emits NDJSON of `recap_mini` rows when `--json` is in its args,
+// so the headless handler forwards the operator's `--json` to the
+// list-side parser instead of building the four-event envelope
+// (the multi-row shape doesn't match the §9 schema).
+
+import type { HarnessConfig } from '../harness/index.ts';
+import { createRegistry } from '../providers/registry.ts';
+import type { Provider } from '../providers/types.ts';
+import type { DB } from '../storage/db.ts';
+import { openDb } from '../storage/db.ts';
+import { migrate } from '../storage/migrate.ts';
+import { defaultDbPath } from '../storage/paths.ts';
+import { createBus } from '../tui/bus.ts';
+import { createFocusStack } from '../tui/focus-stack.ts';
+import { createModalManager } from '../tui/modal-manager.ts';
+import { recapCommand, runRecapList, runRecapSession } from './slash/commands/recap.ts';
+import type { SlashContext } from './slash/types.ts';
+
+export interface RunRecapHeadlessOptions {
+  // Args after `recap` in the CLI, e.g. ['pr', '--no-llm-render'].
+  args: string[];
+  // Global `--json` toggle (consumed at the subcommand boundary in
+  // `args.ts`). Drives whether the four-event NDJSON envelope or
+  // plain rendered text goes to stdout.
+  json: boolean;
+  // Test seams: a custom DB path / preopened handle.
+  dbPath?: string;
+  dbOverride?: DB;
+  // Provider for the LLM render path. Operators with an API key
+  // get the LLM-rendered surface; without one, the capability gate
+  // (`provider.capabilities.constrained === false`) trips fallback
+  // and renders deterministically. The CLI bootstrap supplies the
+  // active provider; tests pass stubs.
+  provider: Provider;
+  // Output sinks. Keep separate from process.stdout/stderr so tests
+  // can capture without touching globals; the entry-point in
+  // `cli/run.ts` wires the real fds.
+  out: (s: string) => void;
+  err: (s: string) => void;
+  // Wall-clock for `recap_start` / `recap_end` events. Defaults to
+  // `Date.now`; tests inject a counter to assert the duration math.
+  now?: () => number;
+  // Optional override for `currentSessionId`. Headless operation
+  // has no live REPL, so the default is `() => null` and bare
+  // `agent recap` (no `session <id>`) errors with "no active
+  // session". Tests can override to drive `session_current`.
+  currentSessionId?: () => string | null;
+}
+
+const buildHeadlessContext = (options: RunRecapHeadlessOptions, db: DB): SlashContext => {
+  const bus = createBus();
+  // Forward `warn` events to the error sink so the operator sees
+  // cache-write / audit failures without losing them. `error`
+  // events go the same way; everything else is dropped (the
+  // headless path doesn't render TUI status).
+  bus.onAny((event) => {
+    if (event.type === 'warn' || event.type === 'error') {
+      options.err(`forja recap: ${event.type}: ${event.message}\n`);
+    }
+  });
+  const focusStack = createFocusStack();
+  const now = options.now ?? Date.now;
+  // Minimal HarnessConfig — only `provider` is used by the recap
+  // pipeline; every other field is filled with safe defaults so
+  // the type-checker is satisfied without mocking the full config.
+  // Cast through `unknown` mirrors the test pattern in
+  // `tests/cli/slash/commands/recap.test.ts`.
+  const baseConfig = { provider: options.provider } as unknown as HarnessConfig;
+  return {
+    baseConfig,
+    db,
+    bus,
+    modalManager: createModalManager({ bus, focusStack, now }),
+    cumulative: { costUsd: 0, steps: 0, turns: 0, critiqueCostUsd: 0, critiqueRuns: 0 },
+    now,
+    requestShutdown: () => undefined,
+    isRunning: () => false,
+    currentSessionId: options.currentSessionId ?? (() => null),
+    replSessionIds: () => [],
+    modelRegistry: createRegistry(),
+  };
+};
+
+const writeNdjsonLine = (out: (s: string) => void, payload: unknown): void => {
+  out(`${JSON.stringify(payload)}\n`);
+};
+
+export const runRecapHeadless = async (options: RunRecapHeadlessOptions): Promise<number> => {
+  const dbPath = options.dbPath ?? defaultDbPath();
+  const db = options.dbOverride ?? openDb(dbPath);
+  const ownsDb = options.dbOverride === undefined;
+  const now = options.now ?? Date.now;
+  try {
+    if (ownsDb) migrate(db);
+
+    const ctx = buildHeadlessContext(options, db);
+    const startTs = now();
+
+    // `/recap list` is multi-row and has its own NDJSON shape (one
+    // line per `recap_mini`). Forward the operator's `--json` to
+    // the list parser when set; the slash already emits the right
+    // envelope for that surface, distinct from the §9 four-event
+    // stream which is session-scoped.
+    if (options.args[0] === 'list') {
+      const listArgs = options.json ? [...options.args.slice(1), '--json'] : options.args.slice(1);
+      const result = await runRecapList(listArgs, ctx);
+      if (result.kind === 'error') {
+        options.err(`/recap: ${result.message}\n`);
+        return 1;
+      }
+      if (result.kind === 'ok' && result.notes) {
+        for (const line of result.notes) options.out(`${line}\n`);
+      }
+      return 0;
+    }
+
+    // Session-scope render. The slash exec wraps `runRecapSession`
+    // in a SlashResult; headless calls the underlying function so
+    // the intermediate is available to emit `recap_intermediate`.
+    const result = await runRecapSession(options.args, ctx);
+    if (result.kind === 'error') {
+      options.err(`/recap: ${result.message}\n`);
+      return 1;
+    }
+
+    if (options.json) {
+      writeNdjsonLine(options.out, {
+        type: 'recap_start',
+        scope: result.intermediate.scope,
+        ts: startTs,
+      });
+      writeNdjsonLine(options.out, {
+        type: 'recap_intermediate',
+        data: result.intermediate,
+      });
+      writeNdjsonLine(options.out, {
+        type: 'recap_render',
+        renderer: result.format,
+        output: result.output,
+      });
+      writeNdjsonLine(options.out, {
+        type: 'recap_end',
+        duration_ms: now() - startTs,
+        used_llm: result.usedLlm,
+        cost_usd: result.costUsd,
+      });
+      return 0;
+    }
+
+    // Plain text mode. When `--out` is set, the slash already
+    // wrote the file inside `runRecapSession`; surface the same
+    // confirmation line the REPL would. Otherwise stream the
+    // rendered output verbatim (templates already end with a
+    // single trailing newline; preserve it).
+    if (result.outPath !== null) {
+      options.out(`/recap: wrote ${result.format} render to ${result.outPath}\n`);
+    } else {
+      options.out(result.output);
+      if (!result.output.endsWith('\n')) options.out('\n');
+    }
+    return 0;
+  } finally {
+    if (ownsDb) db.close();
+  }
+};
+
+// Re-exported so `cli/run.ts` does not have to learn about every
+// internal helper.
+export { recapCommand };

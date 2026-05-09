@@ -90,9 +90,27 @@ interface ParsedRecap {
   format: RecapFormat;
   scope:
     | { kind: 'session_current'; limit: number }
-    | { kind: 'session_specific'; sessionId: string };
+    | { kind: 'session_specific'; sessionId: string }
+    // `cwd: null` carries `--all-projects`; the slash exec
+    // resolves the literal cwd from `ctx.baseConfig.cwd` only
+    // when the operator did NOT opt into the cross-project
+    // surface (RECAP §6.1: cross-project recap is opt-in).
+    | { kind: 'day'; cwd: string | null; date: string }
+    | { kind: 'range'; cwd: string | null; start: number; end: number }
+    // Pre-compact preview (RECAP §1, §8.1, §10). The scope shape
+    // carries no sessionId — `runRecapSession` resolves it from
+    // `ctx.currentSessionId()` like `session_current` does. The
+    // intent of `/recap pre-compact` is "show me what would be
+    // folded if compaction triggered NOW", so the active session
+    // is the only meaningful target; the spec example takes no
+    // explicit session argument.
+    | { kind: 'pre_compact' };
   noLlmRender: boolean;
   outPath: string | null;
+  // Set when `--all-projects` was passed. Honored only by `day` /
+  // `range` scopes; emitted as a parse error on every other form
+  // (single-session recaps have nothing to fan out across).
+  allProjects: boolean;
 }
 
 const positiveInt = (raw: string): number | null => {
@@ -113,20 +131,21 @@ const RENDERER_SUBCOMMANDS: ReadonlySet<string> = new Set([
   'terse',
 ]);
 
-const FUTURE_SUBCOMMANDS: ReadonlySet<string> = new Set(['day', 'range', 'pre-compact']);
+// Reserved subcommands that the parser recognizes but does not
+// yet route. Empty today — kept as a stub so future hand-offs
+// (e.g., a follow-up that lifts `pre-compact` out of the slash
+// path into a Context Engine hook) have a place to land an
+// "M4.x; not yet available" message without rewriting the parser.
+const FUTURE_SUBCOMMANDS: ReadonlySet<string> = new Set();
 
-const futureSubcommandMessage = (sub: string): string => {
-  if (sub === 'day' || sub === 'range') {
-    return `/recap: '${sub}' is cross-session scope (M4.3); not yet available`;
-  }
-  // 'pre-compact'
-  return `/recap: 'pre-compact' needs Context Engine wiring (M4.3); not yet available`;
-};
+const futureSubcommandMessage = (sub: string): string =>
+  `/recap: '${sub}' is reserved but not yet wired`;
 
 interface FlagSplit {
   positional: string[];
   noLlmRender: boolean;
   outPath: string | null;
+  allProjects: boolean;
   flagError: string | null;
 }
 
@@ -137,18 +156,34 @@ const splitFlags = (args: string[]): FlagSplit => {
   const positional: string[] = [];
   let noLlmRender = false;
   let outPath: string | null = null;
-  let flagError: string | null = null;
+  let allProjects = false;
+  const flagError: string | null = null;
+  const fail = (msg: string): FlagSplit => ({
+    positional,
+    noLlmRender,
+    outPath,
+    allProjects,
+    flagError: msg,
+  });
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--no-llm-render') {
       noLlmRender = true;
       continue;
     }
+    if (arg === '--all-projects') {
+      // Cross-project opt-in (RECAP §6.1). Only meaningful for
+      // `day` / `range` scopes; the parser surfaces an error
+      // when paired with any other form so an operator typing
+      // `/recap pr --all-projects` learns the flag has no effect
+      // there instead of silently being ignored.
+      allProjects = true;
+      continue;
+    }
     if (arg === '--out') {
       const next = args[i + 1];
       if (next === undefined || next.length === 0) {
-        flagError = '/recap: --out requires a file path';
-        return { positional, noLlmRender, outPath, flagError };
+        return fail('/recap: --out requires a file path');
       }
       outPath = next;
       i += 1;
@@ -156,28 +191,67 @@ const splitFlags = (args: string[]): FlagSplit => {
     }
     if (arg?.startsWith('--out=') === true) {
       const value = arg.slice('--out='.length);
-      if (value.length === 0) {
-        flagError = '/recap: --out= requires a file path';
-        return { positional, noLlmRender, outPath, flagError };
-      }
+      if (value.length === 0) return fail('/recap: --out= requires a file path');
       outPath = value;
       continue;
     }
     if (arg?.startsWith('--') === true) {
-      flagError = `/recap: unknown flag '${arg}'`;
-      return { positional, noLlmRender, outPath, flagError };
+      return fail(`/recap: unknown flag '${arg}'`);
     }
     if (arg !== undefined) positional.push(arg);
   }
-  return { positional, noLlmRender, outPath, flagError };
+  return { positional, noLlmRender, outPath, allProjects, flagError };
 };
 
-const parseRecapArgs = (args: string[]): ParsedRecap | { error: string } => {
+// YYYY-MM-DD strict parse → epoch ms at UTC midnight. Mirrors the
+// shape `dayBoundsUtc` (in `recap/projection.ts`) parses; a
+// permissive `Date.UTC` accepts month=13 as "next year", so we
+// round-trip through `Date` to reject those.
+const parseYyyyMmDdToMs = (raw: string): number | null => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+  if (m === null) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  const ts = Date.UTC(year, month - 1, day, 0, 0, 0, 0);
+  const back = new Date(ts);
+  if (
+    back.getUTCFullYear() !== year ||
+    back.getUTCMonth() !== month - 1 ||
+    back.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return ts;
+};
+
+// Today UTC, midnight. Default for `/recap day` with no argument.
+const todayUtcDate = (now: number): string => {
+  const d = new Date(now);
+  const yyyy = d.getUTCFullYear().toString().padStart(4, '0');
+  const mm = (d.getUTCMonth() + 1).toString().padStart(2, '0');
+  const dd = d.getUTCDate().toString().padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+};
+
+const parseRecapArgs = (
+  args: string[],
+  options: { now: number },
+): ParsedRecap | { error: string } => {
   const split = splitFlags(args);
   if (split.flagError !== null) return { error: split.flagError };
   const positional = split.positional;
-  const baseExtras = { noLlmRender: split.noLlmRender, outPath: split.outPath };
+  const baseExtras = {
+    noLlmRender: split.noLlmRender,
+    outPath: split.outPath,
+    allProjects: split.allProjects,
+  };
   if (positional.length === 0) {
+    if (split.allProjects) {
+      return {
+        error: '/recap: --all-projects only applies to `day` / `range` scopes',
+      };
+    }
     return {
       format: 'human',
       scope: { kind: 'session_current', limit: DEFAULT_STEP_LIMIT },
@@ -192,6 +266,11 @@ const parseRecapArgs = (args: string[]): ParsedRecap | { error: string } => {
     i = 1;
   }
   if (i === positional.length) {
+    if (split.allProjects) {
+      return {
+        error: '/recap: --all-projects only applies to `day` / `range` scopes',
+      };
+    }
     return {
       format,
       scope: { kind: 'session_current', limit: DEFAULT_STEP_LIMIT },
@@ -200,6 +279,11 @@ const parseRecapArgs = (args: string[]): ParsedRecap | { error: string } => {
   }
   const head = positional[i];
   if (head === 'last') {
+    if (split.allProjects) {
+      return {
+        error: '/recap: --all-projects only applies to `day` / `range` scopes',
+      };
+    }
     const next = positional[i + 1];
     if (next === undefined) {
       return { error: '/recap last: missing step count (e.g. /recap last 5)' };
@@ -216,6 +300,11 @@ const parseRecapArgs = (args: string[]): ParsedRecap | { error: string } => {
     return { format, scope: { kind: 'session_current', limit: n }, ...baseExtras };
   }
   if (head === 'session') {
+    if (split.allProjects) {
+      return {
+        error: '/recap: --all-projects only applies to `day` / `range` scopes',
+      };
+    }
     const next = positional[i + 1];
     if (next === undefined || next.length === 0) {
       return { error: '/recap session: missing session id' };
@@ -225,11 +314,86 @@ const parseRecapArgs = (args: string[]): ParsedRecap | { error: string } => {
     }
     return { format, scope: { kind: 'session_specific', sessionId: next }, ...baseExtras };
   }
+  if (head === 'day') {
+    // Optional date arg; defaults to today UTC. Validation
+    // (round-trip check) catches `2026-02-31` and similar.
+    const next = positional[i + 1];
+    const date = next === undefined ? todayUtcDate(options.now) : next;
+    if (parseYyyyMmDdToMs(date) === null) {
+      return {
+        error: `/recap day: invalid date '${date}' (expected YYYY-MM-DD)`,
+      };
+    }
+    if (next !== undefined && i + 2 < positional.length) {
+      return { error: '/recap day: takes at most one argument (YYYY-MM-DD)' };
+    }
+    return {
+      format,
+      scope: { kind: 'day', cwd: null, date },
+      ...baseExtras,
+    };
+  }
+  if (head === 'pre-compact') {
+    if (split.allProjects) {
+      return {
+        error: '/recap: --all-projects only applies to `day` / `range` scopes',
+      };
+    }
+    if (i + 1 < positional.length) {
+      return { error: '/recap pre-compact: takes no arguments' };
+    }
+    // Force the deterministic path. RECAP §10 anti-pattern: the
+    // pre-compact view sits on the critical path in front of the
+    // compaction call, and the §8.1 latency target is < 200ms —
+    // a Haiku call would blow that. Override `--no-llm-render` to
+    // true regardless of what the operator passed; the spec is
+    // unambiguous (§10) and ignoring the override would let a
+    // future `--no-llm-render=false` flag shape leak the LLM into
+    // the path.
+    return {
+      format,
+      scope: { kind: 'pre_compact' },
+      ...baseExtras,
+      noLlmRender: true,
+    };
+  }
+  if (head === 'range') {
+    const fromArg = positional[i + 1];
+    const toArg = positional[i + 2];
+    if (fromArg === undefined || toArg === undefined) {
+      return {
+        error: '/recap range: requires <from> <to> in YYYY-MM-DD form',
+      };
+    }
+    const fromMs = parseYyyyMmDdToMs(fromArg);
+    const toMs = parseYyyyMmDdToMs(toArg);
+    if (fromMs === null) {
+      return { error: `/recap range: invalid <from> '${fromArg}' (expected YYYY-MM-DD)` };
+    }
+    if (toMs === null) {
+      return { error: `/recap range: invalid <to> '${toArg}' (expected YYYY-MM-DD)` };
+    }
+    // Right-open interval: <to> is the day-bound day's end. Bumping
+    // by 24h converts the operator's inclusive-day input into the
+    // half-open `[start, end)` shape `listSessionsInRange` expects.
+    const endMs = toMs + 24 * 60 * 60 * 1000;
+    if (endMs <= fromMs) {
+      return { error: '/recap range: <to> must be on or after <from>' };
+    }
+    if (i + 3 < positional.length) {
+      return { error: '/recap range: takes exactly two arguments' };
+    }
+    return {
+      format,
+      scope: { kind: 'range', cwd: null, start: fromMs, end: endMs },
+      ...baseExtras,
+    };
+  }
   if (head !== undefined && FUTURE_SUBCOMMANDS.has(head)) {
     return { error: futureSubcommandMessage(head) };
   }
   return {
-    error: `/recap: unknown subcommand '${head ?? ''}' (try /recap, /recap last <N>, /recap session <id>, /recap json|pr|changelog|slack|terse)`,
+    error: `/recap: unknown subcommand '${head ?? ''}' (try /recap, /recap last <N>, /recap session <id>, /recap day, /recap range, /recap json|pr|changelog|slack|terse)`,
   };
 };
 
@@ -359,6 +523,151 @@ const renderForFormat = (
   return LLM_RENDERER_DISPATCH[format].deterministic(intermediate, options);
 };
 
+// Result of the session-recap pipeline — exposed for headless
+// callers (RECAP §9 NDJSON) that need both the intermediate
+// (emit `recap_intermediate`) and the rendered output (emit
+// `recap_render`) without re-projecting. The slash command's
+// `exec` wraps this in a `SlashResult`; the headless handler
+// translates each field into a separate NDJSON event.
+export type RunRecapSessionResult =
+  | {
+      kind: 'ok';
+      format: RecapFormat;
+      scope: RecapScopeOption;
+      intermediate: RecapIntermediate;
+      output: string;
+      usedLlm: boolean;
+      cacheHit: boolean;
+      costUsd: number;
+      tokensIn: number;
+      tokensOut: number;
+      promptVersion: string | null;
+      outPath: string | null;
+    }
+  | { kind: 'error'; message: string };
+
+// Session-recap pipeline as a reusable function. Takes the raw
+// args (NOT including a leading `list`), runs the same flow the
+// slash exec ran before this refactor, and returns a structured
+// result. Side effects (`recap_runs` audit row, optional `--out`
+// write, bus warns on cache/audit failure) happen inside.
+export const runRecapSession = async (
+  args: string[],
+  ctx: SlashContext,
+): Promise<RunRecapSessionResult> => {
+  const parsed = parseRecapArgs(args, { now: ctx.now() });
+  if ('error' in parsed) {
+    return { kind: 'error', message: parsed.error };
+  }
+
+  let scope: RecapScopeOption;
+  if (parsed.scope.kind === 'session_current') {
+    const sessionId = ctx.currentSessionId();
+    if (sessionId === null) {
+      return {
+        kind: 'error',
+        message: '/recap: no active session yet (run a turn first, or use /recap session <id>)',
+      };
+    }
+    scope = { kind: 'session_current', sessionId, limit: parsed.scope.limit };
+  } else if (parsed.scope.kind === 'session_specific') {
+    scope = { kind: 'session_specific', sessionId: parsed.scope.sessionId };
+  } else if (parsed.scope.kind === 'pre_compact') {
+    // `/recap pre-compact` previews the active session before a
+    // compaction trigger. The operator hasn't typed an explicit
+    // session id; resolve from the REPL's current session.
+    const sessionId = ctx.currentSessionId();
+    if (sessionId === null) {
+      return {
+        kind: 'error',
+        message:
+          '/recap pre-compact: no active session yet (run a turn first to populate the audit log)',
+      };
+    }
+    scope = { kind: 'pre_compact', sessionId };
+  } else if (parsed.scope.kind === 'day' || parsed.scope.kind === 'range') {
+    // Cross-session scope. The parser left `cwd: null`; resolve
+    // it from the harness baseConfig unless the operator explicitly
+    // opted into the cross-project surface via `--all-projects`.
+    // This is the privacy guard from RECAP §6.1: cross-project
+    // recap is opt-in, never automatic.
+    const cwdFilter = parsed.allProjects ? null : ctx.baseConfig.cwd;
+    if (parsed.scope.kind === 'day') {
+      scope = { kind: 'day', cwd: cwdFilter, date: parsed.scope.date };
+    } else {
+      scope = {
+        kind: 'range',
+        cwd: cwdFilter,
+        start: parsed.scope.start,
+        end: parsed.scope.end,
+      };
+    }
+  } else {
+    // Exhaustive — `scope.kind` is a union the parser closes over.
+    return { kind: 'error', message: '/recap: unreachable scope kind' };
+  }
+
+  let intermediate: RecapIntermediate;
+  try {
+    intermediate = projectRecap(ctx.db, { scope, now: ctx.now() });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    return { kind: 'error', message: `/recap: ${message}` };
+  }
+
+  const renderResult = await renderWithLlmOrFallback(parsed, intermediate, ctx);
+
+  if (parsed.outPath !== null) {
+    try {
+      await writeOutFile(parsed.outPath, renderResult.output);
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      return {
+        kind: 'error',
+        message: `/recap: failed to write --out '${parsed.outPath}': ${reason}`,
+      };
+    }
+  }
+
+  try {
+    recordRecapRun(ctx.db, {
+      scopeKind: scope.kind,
+      sessionIds: intermediate.scope.sessionIds,
+      renderer: parsed.format,
+      usedLlm: renderResult.usedLlm,
+      outputPath: parsed.outPath,
+      createdAt: ctx.now(),
+      costUsd: renderResult.costUsd,
+      tokensIn: renderResult.tokensIn,
+      tokensOut: renderResult.tokensOut,
+      promptVersion: renderResult.promptVersion,
+      cacheHit: renderResult.cacheHit,
+    });
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e);
+    ctx.bus.emit({
+      type: 'warn',
+      ts: ctx.now(),
+      message: `/recap: audit row not written (${reason}); output is intact`,
+    });
+  }
+
+  return {
+    kind: 'ok',
+    format: parsed.format,
+    scope,
+    intermediate,
+    output: renderResult.output,
+    usedLlm: renderResult.usedLlm,
+    cacheHit: renderResult.cacheHit,
+    costUsd: renderResult.costUsd,
+    tokensIn: renderResult.tokensIn,
+    tokensOut: renderResult.tokensOut,
+    promptVersion: renderResult.promptVersion,
+    outPath: parsed.outPath,
+  };
+};
+
 export const recapCommand: SlashCommand = {
   name: 'recap',
   description: 'projected view over this session (or another by id)',
@@ -370,78 +679,17 @@ export const recapCommand: SlashCommand = {
     if (args[0] === 'list') {
       return await runRecapList(args.slice(1), ctx);
     }
-    const parsed = parseRecapArgs(args);
-    if ('error' in parsed) {
-      return { kind: 'error', message: parsed.error };
+    const result = await runRecapSession(args, ctx);
+    if (result.kind === 'error') {
+      return { kind: 'error', message: result.message };
     }
-
-    let scope: RecapScopeOption;
-    if (parsed.scope.kind === 'session_current') {
-      const sessionId = ctx.currentSessionId();
-      if (sessionId === null) {
-        return {
-          kind: 'error',
-          message: '/recap: no active session yet (run a turn first, or use /recap session <id>)',
-        };
-      }
-      scope = { kind: 'session_current', sessionId, limit: parsed.scope.limit };
-    } else {
-      scope = { kind: 'session_specific', sessionId: parsed.scope.sessionId };
-    }
-
-    let intermediate: RecapIntermediate;
-    try {
-      intermediate = projectRecap(ctx.db, { scope, now: ctx.now() });
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      return { kind: 'error', message: `/recap: ${message}` };
-    }
-
-    const renderResult = await renderWithLlmOrFallback(parsed, intermediate, ctx);
-    const { output, usedLlm, cacheHit, costUsd, tokensIn, tokensOut, promptVersion } = renderResult;
-
-    if (parsed.outPath !== null) {
-      try {
-        await writeOutFile(parsed.outPath, output);
-      } catch (e) {
-        const reason = e instanceof Error ? e.message : String(e);
-        return {
-          kind: 'error',
-          message: `/recap: failed to write --out '${parsed.outPath}': ${reason}`,
-        };
-      }
-    }
-
-    try {
-      recordRecapRun(ctx.db, {
-        scopeKind: scope.kind,
-        sessionIds: intermediate.scope.sessionIds,
-        renderer: parsed.format,
-        usedLlm,
-        outputPath: parsed.outPath,
-        createdAt: ctx.now(),
-        costUsd,
-        tokensIn,
-        tokensOut,
-        promptVersion,
-        cacheHit,
-      });
-    } catch (e) {
-      const reason = e instanceof Error ? e.message : String(e);
-      ctx.bus.emit({
-        type: 'warn',
-        ts: ctx.now(),
-        message: `/recap: audit row not written (${reason}); output is intact`,
-      });
-    }
-
-    if (parsed.outPath !== null) {
+    if (result.outPath !== null) {
       return {
         kind: 'ok',
-        notes: [`/recap: wrote ${parsed.format} render to ${parsed.outPath}`],
+        notes: [`/recap: wrote ${result.format} render to ${result.outPath}`],
       };
     }
-    return { kind: 'ok', notes: renderToNotes(output) };
+    return { kind: 'ok', notes: renderToNotes(result.output) };
   },
 };
 
@@ -812,7 +1060,10 @@ const renderListJson = (rows: readonly RecapMini[]): string => {
 
 const SEARCH_FETCH_MULTIPLIER = 5;
 
-const runRecapList = async (args: readonly string[], ctx: SlashContext): Promise<SlashResult> => {
+export const runRecapList = async (
+  args: readonly string[],
+  ctx: SlashContext,
+): Promise<SlashResult> => {
   const filters = parseRecapListArgs(args);
   if ('error' in filters) {
     return { kind: 'error', message: filters.error };
