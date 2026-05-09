@@ -24,6 +24,7 @@
 // drains FIFO when a prior modal resolves.
 
 import type { PolicyLayer } from '../permissions/index.ts';
+import { sanitizeOneLineForDisplay } from '../sanitize/index.ts';
 import type { Bus } from './bus.ts';
 import type { UIEvent } from './events.ts';
 import type { FocusHandler, FocusStack } from './focus-stack.ts';
@@ -255,9 +256,19 @@ export const buildPermissionOptions = (
   toolName: string,
   sessionAllowTarget?: string,
 ): ConfirmOption[] => {
+  // sessionAllowTarget can carry raw tool args (e.g. args.command
+  // for bash compound confirms or catch-all overrides). The model
+  // can pack newlines, ANSI escapes, or other control bytes that
+  // would corrupt the modal layout if interpolated verbatim into
+  // the option label — split across rows, paint fake colors,
+  // hide text, etc. Sanitize at the interpolation site so the
+  // engine still receives the RAW pattern via the bridge's
+  // separate addSessionAllow call (matching depends on the literal
+  // string — sanitizing for the engine would break future
+  // matches).
   const sessionLabel =
     sessionAllowTarget !== undefined && sessionAllowTarget.length > 0
-      ? `Yes, don't ask again for: ${sessionAllowTarget}`
+      ? `Yes, don't ask again for: ${sanitizeOneLineForDisplay(sessionAllowTarget)}`
       : `Yes, allow all ${toolName} during this session`;
   return [
     { key: '1', label: 'Yes', value: 'yes' },

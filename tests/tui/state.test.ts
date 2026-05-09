@@ -1773,6 +1773,57 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
     }
   });
 
+  test('option 2 label sanitizes sessionAllowTarget against ANSI / newline injection', () => {
+    // sessionAllowTarget can carry raw tool args (e.g. args.command
+    // for compound confirms). The model can pack newlines or ANSI
+    // escapes that, interpolated verbatim into the option label,
+    // would split the modal across rows or paint fake colors. The
+    // option label sanitizes at the interpolation site so the
+    // engine still receives the RAW pattern via the bridge's
+    // separate addSessionAllow call (matching depends on the
+    // literal string).
+    const ansiLaden = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p',
+      toolName: 'bash',
+      command: 'rm',
+      cwd: '/p',
+      // ESC sequence + newline + literal text. Renders normally
+      // would inject color and split rows.
+      sessionAllowTarget: 'rm \x1b[31mFAKE WARN\x1b[0m\nrm -rf /',
+    } as UIEvent);
+    const opt2 = ansiLaden.state.modal?.options[1];
+    // Label MUST NOT contain ESC byte.
+    expect(opt2?.label).not.toContain('\x1b');
+    // Label MUST be a single line.
+    expect(opt2?.label).not.toContain('\n');
+    expect(opt2?.label).not.toContain('\r');
+    // Sanitized form: ANSI stripped, newline collapsed to space.
+    expect(opt2?.label).toBe("Yes, don't ask again for: rm FAKE WARN rm -rf /");
+  });
+
+  test('option 2 label caps absurdly long sessionAllowTarget with ellipsis', () => {
+    // 1KB-long pattern would push subsequent modal content off
+    // screen; sanitizer caps display at SAFE_ONE_LINE_MAX.
+    const long = 'a'.repeat(500);
+    const r = applyEvent(createInitialState(), {
+      type: 'permission:ask',
+      ts: 1,
+      promptId: 'p',
+      toolName: 'bash',
+      command: 'echo',
+      cwd: '/p',
+      sessionAllowTarget: long,
+    } as UIEvent);
+    const opt2 = r.state.modal?.options[1];
+    // Label fits in one row's worth of content. Don't pin exact
+    // length here (that's the sanitizer's contract) — just verify
+    // the prefix is intact and the suffix has the ellipsis.
+    expect(opt2?.label?.startsWith("Yes, don't ask again for: aaa")).toBe(true);
+    expect(opt2?.label?.endsWith('…')).toBe(true);
+  });
+
   test('option 2 falls back to per-tool wording when sessionAllowTarget is absent (subagent path)', () => {
     // Subagent confirms today have no sessionAllowTarget (the
     // bridge skips derivation pending IPC source marshal +
@@ -1794,11 +1845,15 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
     expect(opt2?.label).toBe('Yes, allow all bash during this session');
   });
 
-  test('footer hints carry Tab to amend + Ctrl+E to explain', () => {
-    // Pre-flowing the footer for handlers that land in later
-    // slices. Without this reservation, the layout would re-flow
-    // when Tab/Ctrl+E ship and operators would see a layout
-    // change between minor versions.
+  test('footer hints carry only `Esc to cancel` (no unsupported affordances)', () => {
+    // Earlier slices pre-flowed `Tab to amend` and `Ctrl+E to
+    // explain` expecting handlers to land. The handlers never
+    // shipped, and on a permission modal the advertised keys do
+    // surprising things (Tab moves selection, Ctrl+E does
+    // nothing), which is risky on a security surface — operators
+    // expect to "amend" / "explain" and instead silently change
+    // the selected answer. Hints reflect ONLY what's actually
+    // wired.
     const r = applyEvent(createInitialState(), {
       type: 'permission:ask',
       ts: 1,
@@ -1807,7 +1862,7 @@ describe('permission:ask modal (UI.md §4.10.13)', () => {
       command: 'ls',
       cwd: '/p',
     } as UIEvent);
-    expect(r.state.modal?.hints).toEqual(['Esc to cancel', 'Tab to amend', 'Ctrl+E to explain']);
+    expect(r.state.modal?.hints).toEqual(['Esc to cancel']);
   });
 });
 

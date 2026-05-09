@@ -1409,11 +1409,16 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
             question: null,
             options,
             selectedIndex: options.length - 1,
-            // Tab and Ctrl+E are hints only — handlers are deferred
-            // to Slices 4-5 of the modal redesign. Pre-flowing the
-            // footer here means the visual layout stays stable when
-            // the handlers land.
-            hints: ['Esc to cancel', 'Tab to amend', 'Ctrl+E to explain'],
+            // Only `Esc to cancel` is wired up. The earlier slices
+            // listed `Tab to amend` and `Ctrl+E to explain` here
+            // hoping the handlers would land soon — but they
+            // didn't, and on a permission modal those keys do
+            // surprising things: Tab moves selection (default
+            // modal behavior) and Ctrl+E has no branch. Promising
+            // an action and silently changing the operator's
+            // selected answer is a UX hazard on a security
+            // surface. Restore the hint(s) when the handler lands.
+            hints: ['Esc to cancel'],
             queueDepth: 0,
           },
         },

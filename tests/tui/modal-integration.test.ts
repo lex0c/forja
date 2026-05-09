@@ -92,9 +92,13 @@ describe('modal navigation preserves contents', () => {
     expect(out).toContain('1. Yes');
     expect(out).toContain("2. Yes, don't ask again for: bash.rm.rf");
     expect(out).toContain('3. No');
-    // Footer reserves the slice 4-5 affordances.
-    expect(out).toContain('Tab to amend');
-    expect(out).toContain('Ctrl+E to explain');
+    // Footer carries only `Esc to cancel` — `Tab to amend` and
+    // `Ctrl+E to explain` were promised earlier but their handlers
+    // never landed, so advertising them is a UX hazard on a
+    // permission modal (Tab moves selection, Ctrl+E does nothing).
+    expect(out).toContain('Esc to cancel');
+    expect(out).not.toContain('Tab to amend');
+    expect(out).not.toContain('Ctrl+E to explain');
     s.fs.dispatch(key('escape'));
   });
 
