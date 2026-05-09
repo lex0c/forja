@@ -6,6 +6,7 @@ import { deriveSeedFromRequest } from '../seed.ts';
 import { estimateMessagesTokens } from '../tokens.ts';
 import type {
   ConstrainedRequest,
+  ConstrainedResult,
   GenerateRequest,
   Provider,
   ProviderMessage,
@@ -214,8 +215,8 @@ export const createOpenAIProvider = (
     family: 'openai',
     capabilities: caps,
     generate,
-    generateConstrained: (_req: ConstrainedRequest): Promise<string> =>
-      Promise.reject(new Error('generateConstrained not implemented in M1')),
+    generateConstrained: (_req: ConstrainedRequest): Promise<ConstrainedResult> =>
+      Promise.reject(new Error('generateConstrained not implemented for OpenAI in M4.2')),
     countTokens: (messages: ProviderMessage[]): Promise<number> =>
       Promise.resolve(estimateMessagesTokens(messages)),
   };

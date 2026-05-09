@@ -1,10 +1,10 @@
-# Recap eval smoke (M4.1 slice d)
+# Recap eval smoke (M4.1 slice d, extended in M4.2 slice a)
 
 Fixtures and golden outputs for the deterministic recap projection
 + renderer pipeline. Each fixture seeds a fresh in-memory SQLite
 with pinned UUIDs and timestamps, runs `projectRecap` + the
-`human` / `json` renderers, and compares against the golden files
-in `golden/`.
+`human` / `json` / `pr` renderers, and compares against the golden
+files in `golden/`.
 
 The runner lives at `tests/recap/eval.test.ts` and runs as part of
 `bun test`. Fidelity is PR-blocking (RECAP.md §11.3): a renderer
@@ -16,7 +16,7 @@ or projection change that diverges from the goldens fails CI.
 evals/recap/
   README.md
   fixtures/         # one .ts per scenario; exports seedFixture(db) + scope
-  golden/           # one <name>.human.md + <name>.json per fixture
+  golden/           # one <name>.human.md, <name>.json, <name>.pr.md per fixture
 ```
 
 ## Scenarios (M4.1)
@@ -29,9 +29,16 @@ evals/recap/
 | 04 | `04-with-subagent.ts` | subagent spawn with payload summary |
 | 05 | `05-incomplete-session.ts` | non-terminal session callout |
 
+M4.2 slice (a) adds a deterministic `pr` golden per fixture: the
+byte-for-byte output of `renderPrDeterministic`, which is the
+fallback path whenever the LLM renderer is disabled
+(`--no-llm-render`) or fails (provider down, schema violation,
+fidelity mismatch).
+
 Future milestones add: cross-day fixtures (M4.3), error-recovery
-fixtures (M4.x once `failure_events` lands), `pr` / `changelog` /
-`slack` / `terse` golden outputs (M4.2 with the LLM render path).
+fixtures (M4.x once `failure_events` lands), `changelog` / `slack` /
+`terse` deterministic goldens (M4.2 slice b), and LLM-mode
+coverage via mocked-provider tests (M4.2 slice c).
 
 ## Updating goldens
 

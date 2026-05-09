@@ -4,11 +4,22 @@ import type { SlashContext } from '../../../../src/cli/slash/types.ts';
 import type { HarnessConfig } from '../../../../src/harness/index.ts';
 import { DEFAULT_BUDGET } from '../../../../src/harness/types.ts';
 import { createRegistry as createModelRegistry } from '../../../../src/providers/registry.ts';
+import type {
+  ConstrainedRequest,
+  ConstrainedResult,
+  Provider,
+  ProviderCapabilities,
+  StreamEvent,
+} from '../../../../src/providers/types.ts';
+import { projectPrDeterministic } from '../../../../src/recap/pr/deterministic.ts';
+import { PR_SCHEMA_VERSION } from '../../../../src/recap/pr/schema.ts';
+import { projectRecap } from '../../../../src/recap/projection.ts';
 import { type DB, openMemoryDb } from '../../../../src/storage/db.ts';
 import { migrate } from '../../../../src/storage/migrate.ts';
 import { appendMessage } from '../../../../src/storage/repos/messages.ts';
+import { readRecapCache } from '../../../../src/storage/repos/recap-cache.ts';
 import { listRecentRecapRuns } from '../../../../src/storage/repos/recap-runs.ts';
-import { createSession } from '../../../../src/storage/repos/sessions.ts';
+import { completeSession, createSession } from '../../../../src/storage/repos/sessions.ts';
 import { createBus } from '../../../../src/tui/bus.ts';
 import { createFocusStack } from '../../../../src/tui/focus-stack.ts';
 import { createModalManager } from '../../../../src/tui/modal-manager.ts';
@@ -16,16 +27,80 @@ import { createModalManager } from '../../../../src/tui/modal-manager.ts';
 let db: DB;
 let currentSessionId: string | null;
 
+const stubCaps = (
+  constrained: ProviderCapabilities['constrained'] = false,
+): ProviderCapabilities => ({
+  tools: 'native',
+  cache: 'server_5min',
+  vision: false,
+  streaming: true,
+  constrained,
+  context_window: 200_000,
+  output_max_tokens: 4_096,
+  cost_per_1k_input: 1.0,
+  cost_per_1k_output: 5.0,
+  cost_per_1k_cached_input: 0.1,
+  cost_per_1k_cache_write: 1.25,
+  notes: [],
+});
+
+interface StubProviderHandle {
+  provider: Provider;
+  calls: ConstrainedRequest[];
+}
+
+// Provider stub. The default returns whatever JSON the test passes
+// in via `outputJson`; tests that do not need the constrained call
+// (or tests that simulate provider failure) override `generateConstrained`.
+const stubProvider = (
+  outputJson: string,
+  options: {
+    capabilities?: ProviderCapabilities;
+    generateConstrained?: (req: ConstrainedRequest) => Promise<ConstrainedResult>;
+  } = {},
+): StubProviderHandle => {
+  const calls: ConstrainedRequest[] = [];
+  const provider: Provider = {
+    id: 'anthropic/claude-haiku-4-5',
+    family: 'anthropic',
+    capabilities: options.capabilities ?? stubCaps('tools'),
+    generate: async function* (): AsyncIterable<StreamEvent> {},
+    generateConstrained:
+      options.generateConstrained ??
+      (async (req): Promise<ConstrainedResult> => {
+        calls.push(req);
+        return {
+          output: outputJson,
+          usage: { input: 100, output: 50, cache_read: 0, cache_creation: 0 },
+        };
+      }),
+    countTokens: async () => 0,
+  };
+  return { provider, calls };
+};
+
 const baseConfig = {
   cwd: '/test/cwd',
   enableCheckpoints: false,
   planMode: false,
   budget: { ...DEFAULT_BUDGET },
+  // Default test provider has constrained=false, so /recap pr in
+  // tests that don't override defaults stays on the deterministic
+  // path (matching the M4.1-era expectation of those tests).
   provider: {
     id: 'test/m',
-    capabilities: { context_window: 200_000, output_max_tokens: 4_096 },
+    capabilities: stubCaps(false),
+    generate: async function* () {},
+    generateConstrained: () => Promise.reject(new Error('test stub')),
+    countTokens: async () => 0,
+    family: 'anthropic',
   },
 } as unknown as HarnessConfig;
+
+// Build a HarnessConfig that uses a different provider — the LLM
+// path tests below need this so generateConstrained is callable.
+const cfgWithProvider = (provider: Provider): HarnessConfig =>
+  ({ ...baseConfig, provider }) as unknown as HarnessConfig;
 
 const makeCtx = (overrides: Partial<SlashContext> = {}): SlashContext => {
   const bus = createBus();
@@ -204,7 +279,7 @@ describe('/recap', () => {
   });
 
   test('surfaces a clear "not yet available" for future renderers', async () => {
-    for (const sub of ['pr', 'changelog', 'slack', 'terse']) {
+    for (const sub of ['changelog', 'slack', 'terse']) {
       const result = await recapCommand.exec([sub], makeCtx());
       expect(result.kind).toBe('error');
       if (result.kind !== 'error') return;
@@ -267,5 +342,287 @@ describe('/recap', () => {
     expect(result.kind).toBe('error');
     if (result.kind !== 'error') return;
     expect(result.message).toContain('exactly one argument');
+  });
+
+  // ─── M4.2 slice (a): pr renderer + flags ─────────────────────
+
+  test('/recap pr renders deterministic PR description', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'extract backoff helper',
+      createdAt: 1_100,
+    });
+    currentSessionId = s.id;
+    const result = await recapCommand.exec(['pr'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const text = result.notes?.join('\n') ?? '';
+    expect(text).toContain('## Summary');
+    expect(text).toContain('extract backoff helper');
+  });
+
+  test('/recap pr records used_llm=false and renderer=pr in audit', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    currentSessionId = s.id;
+    await recapCommand.exec(['pr'], makeCtx());
+    const runs = listRecentRecapRuns(db);
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.renderer).toBe('pr');
+    expect(runs[0]?.usedLlm).toBe(false);
+    expect(runs[0]?.outputPath).toBeNull();
+  });
+
+  test('/recap pr --no-llm-render is accepted (deterministic path)', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    currentSessionId = s.id;
+    const result = await recapCommand.exec(['pr', '--no-llm-render'], makeCtx());
+    expect(result.kind).toBe('ok');
+  });
+
+  test('/recap pr --out <path> writes to file and audits output_path', async () => {
+    const tmpdir = `${process.env.TMPDIR ?? '/tmp'}/forja-recap-out-${crypto.randomUUID()}`;
+    const outPath = `${tmpdir}/pr.md`;
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'do thing',
+      createdAt: 1_100,
+    });
+    currentSessionId = s.id;
+    const result = await recapCommand.exec(['pr', '--out', outPath], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    expect(result.notes?.[0]).toContain(`wrote pr render to ${outPath}`);
+
+    const written = await Bun.file(outPath).text();
+    expect(written).toContain('## Summary');
+
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.outputPath).toBe(outPath);
+  });
+
+  test('/recap pr --out=path (single-token form) also works', async () => {
+    const tmpdir = `${process.env.TMPDIR ?? '/tmp'}/forja-recap-out-${crypto.randomUUID()}`;
+    const outPath = `${tmpdir}/pr.md`;
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    currentSessionId = s.id;
+    const result = await recapCommand.exec(['pr', `--out=${outPath}`], makeCtx());
+    expect(result.kind).toBe('ok');
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.outputPath).toBe(outPath);
+  });
+
+  test('/recap --out without a value is a parse error', async () => {
+    currentSessionId = 'unused';
+    const result = await recapCommand.exec(['--out'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('--out requires a file path');
+  });
+
+  test('/recap rejects unknown long flags', async () => {
+    const result = await recapCommand.exec(['--bogus'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain("unknown flag '--bogus'");
+  });
+
+  // ─── M4.2 slice (a) commit 5: LLM path + cache + audit ───────
+
+  test('/recap pr LLM path: success path writes cache, audits cost+prompt', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'do thing',
+      createdAt: 1_100,
+    });
+    currentSessionId = s.id;
+    // Build a structured response that the projection produces;
+    // guarantees fidelity check passes.
+    const intermediate = projectRecap(db, {
+      scope: { kind: 'session_current', sessionId: s.id, limit: 10 },
+      now: 5_000,
+    });
+    const structured = projectPrDeterministic(intermediate);
+    const handle = stubProvider(JSON.stringify(structured));
+    const ctx = makeCtx({ baseConfig: cfgWithProvider(handle.provider) });
+
+    const result = await recapCommand.exec(['pr'], ctx);
+    expect(result.kind).toBe('ok');
+    expect(handle.calls).toHaveLength(1);
+
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.usedLlm).toBe(true);
+    expect(runs[0]?.cacheHit).toBe(false);
+    expect(runs[0]?.promptVersion).toBe('pr-v1');
+    expect(runs[0]?.tokensIn).toBe(100);
+    expect(runs[0]?.tokensOut).toBe(50);
+    expect(runs[0]?.costUsd).toBeGreaterThan(0);
+  });
+
+  test('/recap pr LLM path: cache hit on second call, no second provider call', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'do thing',
+      createdAt: 1_100,
+    });
+    // End the session so projection's durationMs is fixed (otherwise
+    // it grows with `now` on each call, making the intermediate
+    // content-different across calls and cache-missing).
+    completeSession(db, s.id, 'done', 0, true, 2_000);
+    currentSessionId = s.id;
+    const intermediate = projectRecap(db, {
+      scope: { kind: 'session_current', sessionId: s.id, limit: 10 },
+      now: 5_000,
+    });
+    const structured = projectPrDeterministic(intermediate);
+    const handle = stubProvider(JSON.stringify(structured));
+
+    // Two distinct now() values so the audit rows have distinct
+    // created_at timestamps (deterministic listRecentRecapRuns
+    // ordering); the cache key strips `generatedAt` and the
+    // session is ended so durationMs is stable across calls.
+    const ctxFirst = makeCtx({ baseConfig: cfgWithProvider(handle.provider), now: () => 5_000 });
+    const ctxSecond = makeCtx({ baseConfig: cfgWithProvider(handle.provider), now: () => 5_500 });
+
+    await recapCommand.exec(['pr'], ctxFirst);
+    await recapCommand.exec(['pr'], ctxSecond);
+    expect(handle.calls).toHaveLength(1);
+
+    const runs = listRecentRecapRuns(db);
+    expect(runs).toHaveLength(2);
+    // Most recent first; second call should be the cache hit.
+    expect(runs[0]?.cacheHit).toBe(true);
+    expect(runs[0]?.usedLlm).toBe(true);
+    expect(runs[0]?.costUsd).toBe(0);
+    expect(runs[1]?.cacheHit).toBe(false);
+    expect(runs[1]?.usedLlm).toBe(true);
+  });
+
+  test('/recap pr LLM path: schema-violation falls back to deterministic with a warn', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'do thing',
+      createdAt: 1_100,
+    });
+    currentSessionId = s.id;
+    // Hand-back a schema-violating structure (extra field).
+    const bad = {
+      schemaVersion: PR_SCHEMA_VERSION,
+      summary: ['x'],
+      changes: [],
+      testPlan: [],
+      notes: [],
+      tone: 'cheerful',
+    };
+    const handle = stubProvider(JSON.stringify(bad));
+    const ctx = makeCtx({ baseConfig: cfgWithProvider(handle.provider) });
+    const events: { type: string; message?: string }[] = [];
+    ctx.bus.on('warn', (e) => events.push({ type: 'warn', message: e.message }));
+    ctx.bus.on('error', (e) => events.push({ type: 'error', message: e.message }));
+
+    const result = await recapCommand.exec(['pr'], ctx);
+    expect(result.kind).toBe('ok');
+
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.usedLlm).toBe(false);
+    expect(runs[0]?.cacheHit).toBe(false);
+    expect(runs[0]?.costUsd).toBe(0);
+    expect(runs[0]?.promptVersion).toBeNull();
+
+    const warns = events.filter((e) => e.type === 'warn');
+    expect(warns).toHaveLength(1);
+    expect(warns[0]?.message).toContain('schema-violation');
+    expect(warns[0]?.message).toContain('using deterministic fallback');
+  });
+
+  test('/recap pr LLM path: fidelity-mismatch (hallucinated path) falls back', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    currentSessionId = s.id;
+    const bad = {
+      schemaVersion: PR_SCHEMA_VERSION,
+      summary: ['x'],
+      changes: [{ path: '/never/seen/this.ts', bullets: ['+0 / -0'] }],
+      testPlan: [],
+      notes: [],
+    };
+    const handle = stubProvider(JSON.stringify(bad));
+    const ctx = makeCtx({ baseConfig: cfgWithProvider(handle.provider) });
+    const events: { type: string; message?: string }[] = [];
+    ctx.bus.on('warn', (e) => events.push({ type: 'warn', message: e.message }));
+
+    const result = await recapCommand.exec(['pr'], ctx);
+    expect(result.kind).toBe('ok');
+    const warns = events.filter((e) => e.type === 'warn');
+    expect(warns[0]?.message).toContain('fidelity-mismatch');
+
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.usedLlm).toBe(false);
+  });
+
+  test('/recap pr --no-llm-render bypasses provider entirely', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    currentSessionId = s.id;
+    // Use a provider that would throw if called; the test asserts
+    // it is NOT called.
+    const provider: Provider = {
+      id: 'anthropic/claude-haiku-4-5',
+      family: 'anthropic',
+      capabilities: stubCaps('tools'),
+      generate: async function* () {},
+      generateConstrained: () => Promise.reject(new Error('must not be called')),
+      countTokens: async () => 0,
+    };
+    const ctx = makeCtx({ baseConfig: cfgWithProvider(provider) });
+    const result = await recapCommand.exec(['pr', '--no-llm-render'], ctx);
+    expect(result.kind).toBe('ok');
+
+    const runs = listRecentRecapRuns(db);
+    expect(runs[0]?.usedLlm).toBe(false);
+    expect(runs[0]?.promptVersion).toBeNull();
+  });
+
+  test('/recap pr writes recap_cache row on success', async () => {
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'do thing',
+      createdAt: 1_100,
+    });
+    currentSessionId = s.id;
+    const intermediate = projectRecap(db, {
+      scope: { kind: 'session_current', sessionId: s.id, limit: 10 },
+      now: 5_000,
+    });
+    const structured = projectPrDeterministic(intermediate);
+    const handle = stubProvider(JSON.stringify(structured));
+    const ctx = makeCtx({ baseConfig: cfgWithProvider(handle.provider) });
+    await recapCommand.exec(['pr'], ctx);
+
+    // We don't reconstruct the hash in the test (that's the repo's
+    // job); we observe that exactly one cache row exists.
+    const rows = db.query<{ count: number }, []>('SELECT COUNT(*) as count FROM recap_cache').get();
+    expect(rows?.count).toBe(1);
+    // And that the row has a positive cost.
+    const cost = db
+      .query<{ cost_usd: number }, []>('SELECT cost_usd FROM recap_cache LIMIT 1')
+      .get();
+    expect(cost?.cost_usd).toBeGreaterThan(0);
+    // Read by hash to confirm round-trip works.
+    const hashRow = db
+      .query<{ scope_hash: string }, []>('SELECT scope_hash FROM recap_cache LIMIT 1')
+      .get();
+    expect(hashRow).not.toBeNull();
+    const hit = readRecapCache(db, { scopeHash: hashRow?.scope_hash ?? '', now: 5_500 });
+    expect(hit).not.toBeNull();
   });
 });

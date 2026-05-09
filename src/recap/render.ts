@@ -10,171 +10,25 @@
 // see the literal path on disk; only the human-facing markdown is
 // anonymized.
 
-import { homedir } from 'node:os';
-import { stripAnsi } from '../sanitize/ansi.ts';
+import {
+  type RenderOptions,
+  anonymize,
+  anonymizeText,
+  formatDuration,
+  formatPct,
+  formatTokens,
+  formatUsd,
+  oneLine,
+  resolveHome,
+  shortStep,
+  truncate,
+} from './format.ts';
+import { renderPrDeterministic } from './pr/index.ts';
 import type { RecapIntermediate } from './types.ts';
 
-export type RecapRenderer = 'human' | 'json';
+export type { RenderOptions } from './format.ts';
 
-export interface RenderOptions {
-  // When true (default), absolute paths under `$HOME` are rewritten
-  // to `~/...`. Disable for debugging or when consumed by tooling
-  // that needs the literal path. Only applies to the human
-  // renderer; json is always literal.
-  anonymizePaths?: boolean;
-  // Override `$HOME` for deterministic tests.
-  home?: string;
-}
-
-const HOME_FALLBACK = '/home/__forja_test_home__';
-
-const resolveHome = (override: string | undefined): string => {
-  if (override !== undefined) return override;
-  const env = homedir();
-  return env.length > 0 ? env : HOME_FALLBACK;
-};
-
-// Separator that follows the home prefix in a real path: POSIX
-// `/` or Windows `\`. Forja claims Windows support
-// (`environment-prompt.ts` branches on `'win32'`), so the home
-// redactor must accept both. Without this, an operator running
-// on Windows with `home = 'C:\\Users\\alice'` saw their full
-// home path emitted verbatim in every recap.
-const isPathSeparator = (ch: string | undefined): boolean => ch === '/' || ch === '\\';
-
-const anonymize = (path: string, home: string): string => {
-  if (path.length === 0) return path;
-  if (path === home) return '~';
-  if (path.startsWith(home) && isPathSeparator(path[home.length])) {
-    return `~${path.slice(home.length)}`;
-  }
-  return path;
-};
-
-// Regex-escape a literal string so it can be embedded in a
-// RegExp without metachars firing. The home path commonly
-// contains `.` (`/home/user.local`) and other escapable chars on
-// non-Unix layouts; without escaping those would match
-// arbitrarily and either over- or under-trigger the redaction.
-const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-
-// Regex character class that matches either path separator
-// (POSIX `/` or Windows `\`). Built from a string template
-// because both characters need careful escaping at two levels:
-// JS string literal AND regex grammar. The `\\\\` is a single
-// literal backslash inside the regex source `[/\\]`.
-const SEP_REGEX_CLASS = '[/\\\\]';
-
-// Negative lookahead listing chars that COULD continue an
-// identifier-shaped token after the home prefix. The
-// fallback bare-home pass uses this to distinguish a real
-// home reference from a longer identifier that shares it
-// (`/home/alice-backup`, `/home/alice.bak`, `/home/alicia`).
-// Word chars (`\w` = `[A-Za-z0-9_]`) plus `-` and `.` —
-// the two non-word chars that show up most commonly inside
-// usernames and filenames. Without `-` and `.` here, the
-// previous `\b` shape rewrote `/home/alice-backup/log.txt`
-// to `~-backup/log.txt` because `\b` matches at any
-// word-vs-non-word transition. Other shell-meaningful chars
-// (whitespace, quotes, closers, separators) ARE allowed to
-// trigger redaction — they mark the end of the path token.
-const IDENTIFIER_CONTINUATION = '[A-Za-z0-9_\\-.]';
-
-// Redact `$HOME` paths embedded inside a free-text field (goal
-// text, command lines, decision reasons, subagent summaries,
-// open questions). The single-path `anonymize` helper above
-// handles a string that IS a path; this helper handles strings
-// that may CONTAIN a path. RECAP.md §6.2's privacy guarantee
-// applies to every human-rendered surface, not just the
-// dedicated path columns.
-//
-// Two passes:
-//   1. `<home><sep>` → `~<sep>`  — the common path-prefix case.
-//      `<sep>` matches `/` (POSIX) OR `\` (Windows) and is
-//      preserved in the replacement so the operator's native
-//      separator survives. "cat /home/lex/x" → "cat ~/x";
-//      "type C:\Users\alice\x" → "type ~\x".
-//   2. `<home>(?!<identifier-continuation>)` → `~`  — bare home
-//      with no trailing separator, only matched when the next
-//      char does NOT continue an identifier (so word chars,
-//      `-`, and `.` are excluded). End-of-string, whitespace,
-//      and shell delimiters DO trigger redaction. The earlier
-//      `\b` shape over-matched because `\b` triggers at any
-//      word-vs-non-word transition, so `/home/alice-backup`
-//      and `/home/alice.bak` got rewritten to `~-backup` and
-//      `~.bak` even though those are sibling paths NOT under
-//      $HOME. Excluding `-` and `.` from the boundary keeps
-//      identifier-shaped suffixes intact while still firing
-//      redaction on real path-token endings.
-//
-// JSON renderer is intentionally NOT wired through this helper:
-// audit consumers need the literal path. The human renderer is
-// the only surface that runs anonymization.
-const anonymizeText = (text: string, home: string): string => {
-  if (text.length === 0 || home.length === 0) return text;
-  const escaped = escapeRegex(home);
-  return text
-    .replace(new RegExp(`${escaped}(${SEP_REGEX_CLASS})`, 'g'), '~$1')
-    .replace(new RegExp(`${escaped}(?!${IDENTIFIER_CONTINUATION})`, 'g'), '~');
-};
-
-const formatDuration = (ms: number): string => {
-  if (ms < 0 || !Number.isFinite(ms)) return '0s';
-  if (ms < 1000) return `${ms}ms`;
-  const totalSeconds = Math.floor(ms / 1000);
-  const seconds = totalSeconds % 60;
-  const totalMinutes = Math.floor(totalSeconds / 60);
-  if (totalMinutes === 0) return `${seconds}s`;
-  const minutes = totalMinutes % 60;
-  const hours = Math.floor(totalMinutes / 60);
-  if (hours === 0) {
-    return seconds === 0 ? `${minutes}m` : `${minutes}m${seconds.toString().padStart(2, '0')}s`;
-  }
-  return `${hours}h${minutes.toString().padStart(2, '0')}m`;
-};
-
-const formatUsd = (usd: number): string => {
-  if (usd <= 0) return '$0.00';
-  if (usd < 0.01) return '<$0.01';
-  return `$${usd.toFixed(2)}`;
-};
-
-const formatTokens = (n: number): string => {
-  if (n < 1000) return `${n}`;
-  if (n < 100_000) return `${(n / 1000).toFixed(1)}k`;
-  return `${Math.round(n / 1000)}k`;
-};
-
-const formatPct = (ratio: number): string => {
-  if (!Number.isFinite(ratio) || ratio <= 0) return '0%';
-  return `${Math.round(ratio * 100)}%`;
-};
-
-// Short step id — first 7 chars of the UUID. Mirrors git's
-// abbreviated-sha convention so operators reading the recap can
-// pivot to the audit DB by prefix-match without copying a full
-// UUID. Empty input ("" — a synthetic placeholder from projection
-// when the source step is unknown) renders as `--` instead of an
-// empty cell, which would silently swallow the column.
-const shortStep = (id: string): string => (id.length === 0 ? '--' : id.slice(0, 7));
-
-const truncate = (s: string, max: number): string => {
-  if (s.length <= max) return s;
-  return `${s.slice(0, max - 1)}…`;
-};
-
-// Single-line normalization for command rendering. Multi-line bash
-// commands (heredocs, $(<<EOF)) collapse onto one line with `; `
-// separators so the markdown stays readable. ANSI escapes (rare,
-// but possible if a tool result was mis-quoted upstream) are
-// stripped at the renderer boundary; this is the same defense the
-// TUI applies before drawing untrusted content.
-const oneLine = (s: string): string =>
-  stripAnsi(s)
-    .split('\n')
-    .map((part) => part.trim())
-    .filter((part) => part.length > 0)
-    .join('; ');
+export type RecapRenderer = 'human' | 'json' | 'pr';
 
 export const renderJson = (intermediate: RecapIntermediate): string => {
   return JSON.stringify(intermediate, null, 2);
@@ -345,5 +199,10 @@ export const renderRecap = (
       return renderJson(intermediate);
     case 'human':
       return renderHuman(intermediate, options);
+    case 'pr':
+      // Deterministic only — the LLM render path is wired through
+      // the slash command (it needs the provider / cache / audit
+      // context that this pure dispatcher does not see).
+      return renderPrDeterministic(intermediate, options);
   }
 };

@@ -360,17 +360,24 @@ Cada execução de `/recap` é gravada em tabela `recap_runs`:
 
 ```sql
 recap_runs(
-  id TEXT PRIMARY KEY,
-  scope_kind TEXT NOT NULL,
-  session_ids TEXT NOT NULL,        -- JSON array
-  renderer TEXT NOT NULL,
-  used_llm BOOLEAN NOT NULL,
-  output_path TEXT,                  -- se --out usado
-  created_at INTEGER NOT NULL
+  id              TEXT PRIMARY KEY,
+  scope_kind      TEXT NOT NULL,
+  session_ids     TEXT NOT NULL,                -- JSON array
+  renderer        TEXT NOT NULL,
+  used_llm        INTEGER NOT NULL,             -- 0/1
+  output_path     TEXT,                          -- preenchido quando --out
+  created_at      INTEGER NOT NULL,
+  cost_usd        REAL    NOT NULL DEFAULT 0,   -- 0 quando determinístico ou cache hit
+  tokens_in       INTEGER NOT NULL DEFAULT 0,
+  tokens_out      INTEGER NOT NULL DEFAULT 0,
+  prompt_version  TEXT,                          -- e.g. 'pr-v1'; NULL quando determinístico
+  cache_hit       INTEGER NOT NULL DEFAULT 0    -- 0/1; 1 sinaliza render servido do recap_cache
 );
 ```
 
-Útil pra: detectar uso anormal (script gerando recaps em loop), debugar regressões, prove compliance.
+`cost_usd` / `tokens_*` permitem rastrear gasto agregado por dia/sessão sem juntar com os logs do provider. `prompt_version` deixa filtrar runs por versão de prompt durante regressão de eval. `cache_hit` separa quem pagou de quem reaproveitou, condição necessária pra avaliar utilidade do cache em produção.
+
+Útil pra: detectar uso anormal (script gerando recaps em loop), debugar regressões, prove compliance, e medir cost-per-render real ao longo do tempo.
 
 ---
 
@@ -379,15 +386,17 @@ recap_runs(
 ### 7.1 Prompt versionado
 
 ```
-prompts/recap/
-  human-v1.j2
-  pr-v1.j2
-  changelog-v1.j2
-  slack-v1.j2
-  terse-v1.j2
+src/recap/prompts/
+  human-v1.ts
+  pr-v1.ts
+  changelog-v1.ts
+  slack-v1.ts
+  terse-v1.ts
 ```
 
-Cada um tem versão; mudança bumpa versão + entra em eval.
+Cada arquivo exporta `version: 'pr-v1'` (etc.) + função `render(input) -> string`. Versionamento por **nome de arquivo** (não por placeholder dentro do conteúdo): bumpar de `pr-v1.ts` para `pr-v2.ts` é uma cópia explícita do arquivo, e a versão antiga continua presente até que evals confirmem a substituição. Mudança de prompt obriga evals + invalida `recap_cache` (chave inclui `prompt_version`, §8.3).
+
+Templating embutido em TS — sem dependência de Jinja/handlebars; o render é uma função pura que recebe o intermediate (e nada mais) e devolve o prompt final.
 
 ### 7.2 Schema enforcement
 
@@ -449,15 +458,36 @@ Recaps recentes ficam em `recap_cache` (tabela com TTL 1h):
 
 ```sql
 recap_cache(
-  scope_hash TEXT PRIMARY KEY,       -- hash do scope_kind + session_ids
-  renderer TEXT,
-  output TEXT,
-  generated_at INTEGER,
-  expires_at INTEGER
+  scope_hash      TEXT PRIMARY KEY,
+  renderer        TEXT NOT NULL,
+  output          TEXT NOT NULL,
+  prompt_version  TEXT NOT NULL,
+  generated_at    INTEGER NOT NULL,
+  expires_at      INTEGER NOT NULL,
+  cost_usd        REAL    NOT NULL DEFAULT 0,
+  tokens_in       INTEGER NOT NULL DEFAULT 0,
+  tokens_out      INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX recap_cache_expires ON recap_cache(expires_at);
 ```
 
-Re-executar `/recap` em sessão ativa nos últimos 1h: hit do cache, ~10ms.
+`scope_hash` cobre **escopo + conteúdo + versão do prompt**:
+
+```
+scope_hash = sha256(
+  scope_kind || \0 || sorted(session_ids).join(\0) || \0 ||
+  renderer   || \0 || prompt_version          || \0 ||
+  sha256(canonicalize(intermediate))
+)
+```
+
+`canonicalize(intermediate)` é `JSON.stringify` com chaves ordenadas lexicograficamente (helper único em `src/storage/json-safe.ts`). Hash de conteúdo é necessário, não cosmético: sem ele, `/recap pr` no step 5 cacheia um render que continuaria sendo servido após o usuário rodar mais 3 steps na mesma sessão, e o cache devolveria um render obsoleto. Com ele, qualquer mudança no audit log que afete a projeção produz miss novo. TTL de 1h vira **eviction** (limita o tamanho da tabela), não mecanismo de correctness.
+
+`prompt_version` na chave garante que bump de prompt (ex.: `pr-v1` → `pr-v2`) invalida cache automaticamente, dispensa migration ad-hoc, e impede comparação direta entre saídas de prompts diferentes.
+
+Custos: o sha256 do intermediate é O(tamanho-do-intermediate); ~5–10ms num intermediate típico (~50 KB JSON). Re-executar `/recap` em sessão ativa nos últimos 1h sem mudança intermediária: hit do cache, ~10ms total. Com mudança: miss, render LLM completo, escrita.
+
+Re-executar `/recap` em sessão ativa nos últimos 1h sem alterações no audit log: hit do cache, ~10ms.
 
 ---
 

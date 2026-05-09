@@ -17,6 +17,7 @@ import { fixture as f03 } from '../../evals/recap/fixtures/03-with-decisions.ts'
 import { fixture as f04 } from '../../evals/recap/fixtures/04-with-subagent.ts';
 import { fixture as f05 } from '../../evals/recap/fixtures/05-incomplete-session.ts';
 import type { RecapFixture } from '../../evals/recap/fixtures/types.ts';
+import { renderPrDeterministic } from '../../src/recap/pr/index.ts';
 import { projectRecap } from '../../src/recap/projection.ts';
 import { renderHuman, renderJson } from '../../src/recap/render.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
@@ -28,8 +29,8 @@ const GOLDEN_DIR = join(import.meta.dir, '..', '..', 'evals', 'recap', 'golden')
 
 const updateMode = process.env.UPDATE_GOLDENS === '1';
 
-const goldenPath = (name: string, kind: 'human' | 'json'): string => {
-  const ext = kind === 'human' ? 'human.md' : 'json';
+const goldenPath = (name: string, kind: 'human' | 'json' | 'pr'): string => {
+  const ext = kind === 'human' ? 'human.md' : kind === 'pr' ? 'pr.md' : 'json';
   return join(GOLDEN_DIR, `${name}.${ext}`);
 };
 
@@ -91,6 +92,28 @@ describe('recap eval smoke (PR-blocking)', () => {
         );
       }
       expect(json).toBe(golden);
+    });
+
+    test(`${fx.name} — pr deterministic render matches golden`, async () => {
+      const db = openMemoryDb();
+      migrate(db);
+      const scope = fx.seed(db);
+      const intermediate = projectRecap(db, { scope, now: fx.now });
+      const pr = renderPrDeterministic(intermediate, { home: '/home/lex' });
+
+      const path = goldenPath(fx.name, 'pr');
+      if (updateMode) {
+        await writeGolden(path, pr);
+        expect(await readGolden(path)).toBe(pr);
+        return;
+      }
+      const golden = await readGolden(path);
+      if (golden === null) {
+        throw new Error(
+          `Missing golden for fixture '${fx.name}' (pr). Run \`UPDATE_GOLDENS=1 bun test tests/recap/eval.test.ts\` to create it.`,
+        );
+      }
+      expect(pr).toBe(golden);
     });
   }
 

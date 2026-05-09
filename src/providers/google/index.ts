@@ -2,6 +2,7 @@ import { GoogleGenAI } from '@google/genai';
 import { deriveSeedFromRequest } from '../seed.ts';
 import type {
   ConstrainedRequest,
+  ConstrainedResult,
   GenerateRequest,
   Provider,
   ProviderContentBlock,
@@ -137,8 +138,8 @@ export const createGoogleProvider = (
     family: 'google',
     capabilities: caps,
     generate,
-    generateConstrained: (_req: ConstrainedRequest): Promise<string> =>
-      Promise.reject(new Error('generateConstrained not implemented in M1')),
+    generateConstrained: (_req: ConstrainedRequest): Promise<ConstrainedResult> =>
+      Promise.reject(new Error('generateConstrained not implemented for Google in M4.2')),
     countTokens: async (messages: ProviderMessage[]): Promise<number> => {
       const response = await client.models.countTokens({
         model: modelName,

@@ -84,7 +84,7 @@ describe('createGoogleProvider', () => {
     expect(provider.capabilities.context_window).toBe(1_000_000);
   });
 
-  test('generateConstrained rejects with not-implemented error in M1', async () => {
+  test('generateConstrained rejects (not implemented for Google in M4.2)', async () => {
     const provider = createGoogleProvider('gemini-2.5-flash', { apiKey: 'k' });
     await expect(
       provider.generateConstrained({
@@ -92,8 +92,9 @@ describe('createGoogleProvider', () => {
         messages: [{ role: 'user', content: 'hi' }],
         max_tokens: 1,
         output_schema: { type: 'object' },
+        output_schema_name: 'render_output',
       }),
-    ).rejects.toThrow(/not implemented in M1/);
+    ).rejects.toThrow(/not implemented for Google/);
   });
 
   test('generate pipes the SDK stream through the canonical normalizer', async () => {

@@ -12,18 +12,42 @@ interface CountTokensCall {
   params: unknown;
 }
 
+interface CreateCall {
+  params: unknown;
+}
+
+interface MockMessageResponse {
+  content: Array<
+    { type: 'text'; text: string } | { type: 'tool_use'; id: string; name: string; input: unknown }
+  >;
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  };
+}
+
 interface MockClientHandle {
   client: Anthropic;
   streamCalls: StreamCall[];
   countTokensCalls: CountTokensCall[];
+  createCalls: CreateCall[];
 }
 
 const mockClient = (
   events: RawAnthropicEvent[],
   countTokensResponse: { input_tokens: number } = { input_tokens: 0 },
+  createResponse:
+    | MockMessageResponse
+    | (() => MockMessageResponse | Promise<MockMessageResponse>) = {
+    content: [],
+    usage: { input_tokens: 0, output_tokens: 0 },
+  },
 ): MockClientHandle => {
   const streamCalls: StreamCall[] = [];
   const countTokensCalls: CountTokensCall[] = [];
+  const createCalls: CreateCall[] = [];
   const client = {
     messages: {
       stream(params: unknown) {
@@ -36,9 +60,13 @@ const mockClient = (
         countTokensCalls.push({ params });
         return countTokensResponse;
       },
+      async create(params: unknown) {
+        createCalls.push({ params });
+        return typeof createResponse === 'function' ? await createResponse() : createResponse;
+      },
     },
   } as unknown as Anthropic;
-  return { client, streamCalls, countTokensCalls };
+  return { client, streamCalls, countTokensCalls, createCalls };
 };
 
 describe('createAnthropicProvider', () => {
@@ -89,16 +117,98 @@ describe('createAnthropicProvider', () => {
     expect(provider.capabilities.cost_per_1k_input).toBe(1.0);
   });
 
-  test('generateConstrained rejects with not-implemented error in M1', async () => {
-    const provider = createAnthropicProvider('claude-sonnet-4-6', { apiKey: 'sk-test' });
+  test('generateConstrained forces tool_choice and returns stringified tool_use input', async () => {
+    const handle = mockClient([], undefined, {
+      content: [
+        {
+          type: 'tool_use',
+          id: 'toolu_01',
+          name: 'render_recap_pr',
+          input: { summary: ['did stuff'], changes: [], test_plan: [], notes: [] },
+        },
+      ],
+      usage: {
+        input_tokens: 100,
+        output_tokens: 30,
+        cache_read_input_tokens: 50,
+        cache_creation_input_tokens: 10,
+      },
+    });
+    const provider = createAnthropicProvider('claude-haiku-4-5', { client: handle.client });
+    const result = await provider.generateConstrained({
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'user', content: 'render this' }],
+      max_tokens: 256,
+      output_schema: { type: 'object', properties: {} },
+      output_schema_name: 'render_recap_pr',
+      output_schema_description: 'Render a recap as a PR description.',
+    });
+    expect(result.output).toBe(
+      JSON.stringify({ summary: ['did stuff'], changes: [], test_plan: [], notes: [] }),
+    );
+    expect(result.usage).toEqual({
+      input: 100,
+      output: 30,
+      cache_read: 50,
+      cache_creation: 10,
+    });
+    expect(handle.createCalls).toHaveLength(1);
+    const sent = handle.createCalls[0]?.params as {
+      tool_choice: { type: string; name: string };
+      tools: Array<{ name: string; input_schema: unknown }>;
+    };
+    expect(sent.tool_choice).toEqual({ type: 'tool', name: 'render_recap_pr' });
+    expect(sent.tools[0]?.name).toBe('render_recap_pr');
+  });
+
+  test('generateConstrained rejects when caller passes extra tools', async () => {
+    const handle = mockClient([]);
+    const provider = createAnthropicProvider('claude-haiku-4-5', { client: handle.client });
     await expect(
       provider.generateConstrained({
-        model: 'claude-sonnet-4-6',
-        messages: [{ role: 'user', content: 'hi' }],
-        max_tokens: 1,
+        model: 'claude-haiku-4-5',
+        messages: [{ role: 'user', content: 'x' }],
+        max_tokens: 64,
         output_schema: { type: 'object' },
+        output_schema_name: 'render_recap_pr',
+        tools: [{ name: 'extra', description: 'd', input_schema: { type: 'object' } }],
       }),
-    ).rejects.toThrow(/not implemented in M1/);
+    ).rejects.toThrow(/'tools' must be empty/);
+    expect(handle.createCalls).toHaveLength(0);
+  });
+
+  test('generateConstrained throws when response has no matching tool_use', async () => {
+    const handle = mockClient([], undefined, {
+      content: [{ type: 'text', text: 'sorry, plain prose' }],
+      usage: { input_tokens: 10, output_tokens: 5 },
+    });
+    const provider = createAnthropicProvider('claude-haiku-4-5', { client: handle.client });
+    await expect(
+      provider.generateConstrained({
+        model: 'claude-haiku-4-5',
+        messages: [{ role: 'user', content: 'x' }],
+        max_tokens: 64,
+        output_schema: { type: 'object' },
+        output_schema_name: 'render_recap_pr',
+      }),
+    ).rejects.toThrow(/no tool_use for forced tool 'render_recap_pr'/);
+  });
+
+  test('generateConstrained zero-fills missing cache_* usage fields', async () => {
+    const handle = mockClient([], undefined, {
+      content: [{ type: 'tool_use', id: 't1', name: 'render_recap_pr', input: {} }],
+      usage: { input_tokens: 5, output_tokens: 1 }, // no cache_* fields
+    });
+    const provider = createAnthropicProvider('claude-haiku-4-5', { client: handle.client });
+    const result = await provider.generateConstrained({
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'user', content: 'x' }],
+      max_tokens: 64,
+      output_schema: { type: 'object' },
+      output_schema_name: 'render_recap_pr',
+    });
+    expect(result.usage.cache_read).toBe(0);
+    expect(result.usage.cache_creation).toBe(0);
   });
 
   test('generate pipes the SDK stream through the canonical normalizer', async () => {

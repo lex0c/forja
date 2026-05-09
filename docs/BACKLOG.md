@@ -15,6 +15,125 @@ Format:
 
 ---
 
+## [2026-05-09] m4.2a/recap — slice (a) shipped: LLM `pr` render + `recap_cache`
+
+**Done:** Five-commit slice on `feat/m4.2a-pr-llm-render` lands the
+LLM render path for `/recap pr` with a production-grade pipeline
+(schema enforcement, fallback, cache, audit, evals). 4243 pass /
+0 fail end-to-end. Slice is complete and ready for review.
+
+| Commit | What | Surface |
+|---|---|---|
+| 1 — spec | RECAP.md §7.1 / §8.3 / §6.3 patches (entry above) | `docs/spec/RECAP.md` |
+| 2 — storage | Migrations 032 (`recap_cache`) + 033 (`recap_runs` cost cols) + `recap-cache.ts` repo with `canonicalScopeHash` (sha256 over scope+content+prompt_version, NUL-separated, sorted ids) + `canonicalJson` helper in `json-safe.ts` + tests for hash determinism, expiration, INSERT OR REPLACE, generated_at-stripped-from-hash | `src/storage/migrations/{032,033}-*.ts`, `src/storage/repos/recap-cache.ts`, `src/storage/json-safe.ts` |
+| 3 — provider | Real `generateConstrained` on Anthropic via forced `tool_choice:{type:'tool',name:schemaName}` + `Promise<ConstrainedResult>` (`output` + `usage`) so cost accounting is observable; `output_schema_name`/`output_schema_description` added to `ConstrainedRequest`; google/openai keep rejecting (capability gate trips fallback at the recap layer) | `src/providers/types.ts`, `src/providers/anthropic/index.ts`, `src/providers/{google,openai}/index.ts` |
+| 4 — deterministic pr | `PrRenderV1` schema (TS + JSON Schema literal + manual validator, no Zod) + `projectPrDeterministic` (RecapIntermediate → PrRenderV1) + `renderPrFromStructured` (template) + 5 new goldens (`evals/recap/golden/0{1..5}.pr.md`) + slash flags `--no-llm-render` and `--out [=]<path>` + format helpers extracted to `src/recap/format.ts` (shared between human and pr); RECAP §7.4 caps enforced (summary ≤140, bullets ≤120, testPlan items ≤100, notes ≤140, ≤3) | `src/recap/pr/{schema,deterministic,template,index}.ts`, `src/recap/format.ts`, `src/cli/slash/commands/recap.ts` |
+| 5 — LLM path | `renderPrViaLlm` (capability gate → forced `render_recap_pr` tool → JSON.parse → schema validate → fidelity check → concision check → fallback) + slash wiring (cache read → LLM → cache write → fallback on any failure) + `recap_runs` populated with `cost_usd`/`tokens_*`/`prompt_version`/`cache_hit` + `tests/recap/pr-llm.test.ts` with mocked provider covering all 6 failure modes + 5-fixture eval gate (fidelity/coverage/concision, RECAP §7.4) + slash tests for cache hit, schema-violation fallback, fidelity-mismatch fallback, `--no-llm-render` bypass | `src/recap/pr/llm.ts`, `src/recap/prompts/pr-v1.ts`, `src/cli/slash/commands/recap.ts`, `tests/recap/pr-llm.test.ts`, `tests/cli/slash/commands/recap.test.ts` |
+
+**Decisions:**
+- LLM emits structured JSON (PrRenderV1), template emits markdown.
+  RECAP §7.2 native schema enforcement by construction; the model
+  cannot invent a section, format a bullet differently, or drop
+  the test_plan slot. Fidelity check (every `changes[].path` ∈
+  `intermediate.actions.filesWritten`) catches the "hallucinated
+  path" failure mode that schema validation alone cannot.
+- `generateConstrained` returns `ConstrainedResult { output, usage }`,
+  not bare `string`. Without usage at the constrained boundary, the
+  caller has no way to track cost — and recap-cost auditing was
+  one of the spec's explicit goals (§8.2). Single signature change
+  on a previously-unimplemented method, so no live call sites
+  broke. Google/OpenAI continue rejecting (capability gate handles
+  the fallback transparently).
+- `generatedAt` stripped from the hashed intermediate. The cache
+  key represents "what is in the audit log right now"; the
+  wall-clock at projection time is metadata, not data. Without
+  the strip, every call would cache-miss because `generatedAt`
+  drifts. Test `volatile fields (generatedAt) do NOT affect the
+  hash` pins the property; an active session with growing
+  `durationMs` still misses correctly (durationMs IS data).
+- Provider for the LLM render call is the operator's
+  `ctx.baseConfig.provider`, not a forced Haiku. Forcing Haiku
+  would require a second set of credentials; deferring the model
+  selection to the operator means slice (a) ships against
+  whatever they already have. Cost is slightly higher than the
+  spec's Haiku target until a `--model` flag for `/recap pr`
+  lands (slice b candidate). Provider without
+  `capabilities.constrained` (Google/OpenAI today) silently
+  degrades to deterministic — same UX, no warn.
+- Goldens are deterministic-only (5 new `*.pr.md` files). LLM
+  output is non-deterministic across runs, so a byte-for-byte
+  golden would either need fixture-specific stub responses
+  (option 2 in the question we discussed) or a relaxed
+  comparison. Instead, `tests/recap/pr-llm.test.ts` asserts the
+  5 fixtures pass fidelity (100%), coverage (≥90%), and concision
+  (under the 80-line cap) when fed back the deterministic output
+  — the strongest possible LLM stub: it cannot fail by
+  construction, so any failure means the LLM pipeline (parse,
+  validate, fidelity, concision) regressed.
+- `cache_hit` and `prompt_version` are recorded on the audit row
+  even when `used_llm=false` (e.g., the schema-violation fallback
+  path sets `prompt_version=null` and `cache_hit=false`). This
+  separates "we never tried the LLM" from "we tried and the LLM
+  blew up" without a third column.
+
+**Pending:** Slice (b) — renderers `changelog`, `slack`, `terse`
+reusing the LLM machinery; they each need a schema + template +
+prompt + 5 goldens + their own slot in the slash command. Slice
+(c) — `recap_mini` schema + Stop hook + `/recap list` for the
+session picker. Slice (d) — headless `agent --json /recap`.
+Slice (a) does NOT block any of them; they all import from the
+machinery built here.
+
+**Next:** Branch `feat/m4.2a-pr-llm-render` ready for review and
+PR. After merge, slice (b) opens with the renderer-per-day
+cadence already validated by this slice.
+
+---
+
+## [2026-05-09] m4.2a/recap — spec patches: TS templating, content-hash cache key, recap_runs cost columns
+
+**Done:** Three pre-implementation patches against `docs/spec/RECAP.md`,
+landed as the first commit of the `feat/m4.2a-pr-llm-render` branch (the
+slice that wires the LLM `pr` renderer + `recap_cache`). Each patch
+exists because the original spec, written before any LLM render code
+landed, would force one of: a useless dependency, a stale-cache bug,
+or an unobservable cost path.
+
+| § | Before | After | Why |
+|---|---|---|---|
+| 7.1 | `prompts/recap/<name>-v1.j2` | `src/recap/prompts/<name>-v1.ts` exporting `version` + `render(input)` | Bun/TS stack has no Jinja runtime; pulling one for templating is gratuitous (principle 12). File-name versioning preserved verbatim — bumping is still `cp pr-v1.ts pr-v2.ts` + an eval cycle. |
+| 8.3 | `scope_hash = hash(scope_kind, session_ids)` | `scope_hash = sha256(scope_kind, sorted(session_ids), renderer, prompt_version, sha256(canonicalize(intermediate)))` + `prompt_version`/`cost_usd`/`tokens_in`/`tokens_out` columns + `recap_cache_expires` index | The original key produces a stale-render bug in the active-session path: run `/recap pr` at step 5, advance 3 steps, run again — cache returns the step-5 render. Content hash makes any audit-log change a miss; `prompt_version` makes prompt bumps invalidate without an ad-hoc migration. TTL becomes eviction, not correctness. |
+| 6.3 | `recap_runs` had `id, scope_kind, session_ids, renderer, used_llm, output_path, created_at` | + `cost_usd, tokens_in, tokens_out, prompt_version, cache_hit` | Without these, "how much did /recap cost this week" requires joining the provider audit log by timestamp window — slow, lossy, and impossible across providers. `cache_hit` is the necessary signal to evaluate cache effectiveness in production (otherwise the cache is fire-and-forget). All five columns are nullable/defaulted so M4.1 rows survive without backfill. |
+
+**Decisions:**
+- Templating in TS, not Jinja. The j2 spec text predated stack
+  selection (or was aspirational); slice (a) is the first time
+  anything actually renders a prompt, so the TS choice can't disrupt
+  a prior consumer. Reduces deps, keeps prompts greppable, and
+  the `version: 'pr-v1' as const` literal makes the version
+  observable at the type level.
+- Content hash on the cache key, not optimistic invalidation by
+  session step counter. A counter-based key would also work for
+  `session_current`/`session_specific` but breaks for `day`/`range`
+  scopes (no single counter to advance). Hashing the canonical
+  intermediate is one shape that covers all five scope kinds with
+  the same correctness argument.
+- `cache_hit` as a boolean column on `recap_runs`, not a separate
+  events table. `recap_runs` is already the audit pointer; adding a
+  flag costs one INTEGER, while a dedicated events table would
+  duplicate the join key for one bit of information.
+
+**Pending:** Code follows on the same branch. Next four commits in
+order: migrations 032 (`recap_cache`) + 033 (`recap_runs` add
+columns); `generateConstrained` for the Anthropic provider;
+deterministic `pr` renderer + 5 goldens + `--no-llm-render` /
+`--out` flags; LLM `pr` path + cache wiring + audit cost recording
++ `tests/recap/llm-render.test.ts` with mocked provider.
+
+**Next:** Migration 032/033 + repo `recap-cache.ts` + tests.
+
+---
+
 ## [2026-05-09] m4/recap — carry-overs slice: items #5, #7, #8, #9, #10, #12
 
 **Done:** Closed the trivial half of the M4.1 punch list (entry
