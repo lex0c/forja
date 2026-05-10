@@ -165,7 +165,14 @@ export const renderViaLlm = async <T>(
   }
 
   const output = template(structured);
-  const lineCount = output.split('\n').length;
+  // Strip a single trailing newline before counting. Templates
+  // canonically end with `\n` so the file reads cleanly when piped
+  // (`agent recap pr ... > PR.md`); naive `split('\n').length`
+  // would count that terminator as an extra empty line and reject
+  // outputs that exactly meet the cap. Only the trailing newline
+  // is stripped — internal blank lines stay counted because they
+  // genuinely consume a row in the operator's terminal / file.
+  const lineCount = (output.endsWith('\n') ? output.slice(0, -1) : output).split('\n').length;
   if (lineCount > input.maxOutputLines) {
     return {
       ok: false,
