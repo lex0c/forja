@@ -30,6 +30,12 @@ export const ANTHROPIC_CAPS: Record<string, ProviderCapabilities> = {
     cost_per_1k_output: 25.0,
     cost_per_1k_cached_input: 0.5,
     cost_per_1k_cache_write: 6.25,
+    // Opus 4.7 deprecated the `temperature` parameter (and `top_p`
+    // in tandem) at the Messages API: passing either returns HTTP
+    // 400. Adapter strips both before send when this is false.
+    // TOKEN_TUNING §9's canonical sampling values still apply to
+    // every other Claude 4.x model — only this entry opts out.
+    supports_sampling: false,
     notes: ['frontier model; best for security-audit and deliberate reasoning workflows'],
   },
   'claude-sonnet-4-6': {

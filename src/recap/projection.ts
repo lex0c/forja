@@ -195,8 +195,12 @@ export type RecapScopeOption =
   | { kind: 'session_current'; sessionId: string; limit?: number }
   | { kind: 'session_specific'; sessionId: string }
   | { kind: 'pre_compact'; sessionId: string }
-  | { kind: 'day'; cwd: string; date: string }
-  | { kind: 'range'; cwd: string; start: number; end: number };
+  // `cwd: null` opts the projection out of the cwd filter (RECAP
+  // §6.1 `--all-projects` mode). The slash command requires the
+  // operator to pass `--all-projects` explicitly to set this; the
+  // projection itself does not enforce the gate (the slash does).
+  | { kind: 'day'; cwd: string | null; date: string }
+  | { kind: 'range'; cwd: string | null; start: number; end: number };
 
 export interface ProjectRecapOptions {
   scope: RecapScopeOption;
@@ -284,14 +288,22 @@ const resolveSessions = (db: DB, scope: RecapScopeOption): ResolvedScope => {
       // would silently miss older day windows once a project
       // crossed the cap. The `[start, end)` interval matches the
       // half-open day boundary `dayBoundsUtc` produces.
-      const sessions = listSessionsInRange(db, { ...range, cwd: scope.cwd });
+      // `cwd: null` (operator passed `--all-projects`) drops the
+      // filter so sessions across every project show up.
+      const sessions = listSessionsInRange(db, {
+        ...range,
+        ...(scope.cwd !== null ? { cwd: scope.cwd } : {}),
+      });
       return { sessions, range };
     }
     case 'range': {
       // Operator-supplied range; trust the bounds as-is. Same
       // SQL-side filter rationale as `day` above.
       const range = { start: scope.start, end: scope.end };
-      const sessions = listSessionsInRange(db, { ...range, cwd: scope.cwd });
+      const sessions = listSessionsInRange(db, {
+        ...range,
+        ...(scope.cwd !== null ? { cwd: scope.cwd } : {}),
+      });
       return { sessions, range };
     }
   }
@@ -474,6 +486,16 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
   let tokensIn = 0;
   let tokensOut = 0;
   let cachedTokens = 0;
+  // Cache-creation tokens are accumulated locally for the cache-hit
+  // ratio denominator (RECAP §3 surfaces only `tokens.{in,out,cached}`
+  // — the spec's `cached: int` maps to Anthropic's `cache_read`, NOT
+  // to the sum of read+create). Without this, the ratio computed
+  // below would use `cached / fresh-only` and emit nonsensical
+  // values like "900% cached" when a turn read more than it wrote
+  // fresh, which is the dominant case once prompt caching is in
+  // play. Surfacing the creation count would require a spec bump;
+  // keeping it local is the minimal correct fix.
+  let cacheCreationTokens = 0;
   let usd = 0;
   let durationMs = 0;
   const models = new Set<string>();
@@ -498,6 +520,7 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
       tokensIn += m.tokensIn ?? 0;
       tokensOut += m.tokensOut ?? 0;
       cachedTokens += m.cachedTokens ?? 0;
+      cacheCreationTokens += m.cacheCreationTokens ?? 0;
       usd += m.costUsd ?? 0;
       if (m.role === 'assistant') {
         for (const text of extractTextBlocks(m.content)) {
@@ -720,7 +743,17 @@ export const projectRecap = (db: DB, options: ProjectRecapOptions): RecapInterme
     .map(([path, count]): RecapFileRead => ({ path, count }))
     .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
-  const cacheHitRatio = tokensIn > 0 ? cachedTokens / tokensIn : 0;
+  // Anthropic returns three disjoint input buckets per turn: fresh
+  // (`input_tokens` → `tokensIn`), cache-read (`cache_read_input_tokens`
+  // → `cachedTokens`), cache-create (`cache_creation_input_tokens` →
+  // `cacheCreationTokens`). The hit ratio is "what fraction of the
+  // total input did the cache serve" — denominator must be the sum,
+  // not just fresh. The previous shape (`cachedTokens / tokensIn`)
+  // produced `9.0` (rendered as "900% cached") on a turn with 100
+  // fresh + 900 cached, which is the dominant shape once prompt
+  // caching is wired.
+  const totalInput = tokensIn + cachedTokens + cacheCreationTokens;
+  const cacheHitRatio = totalInput > 0 ? cachedTokens / totalInput : 0;
   const model = models.size === 1 ? ([...models][0] ?? '') : '';
 
   // Range bounds: explicit for day/range scopes (computed once in

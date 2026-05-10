@@ -115,6 +115,133 @@ describe('runAgent onEvent', () => {
     expect(events[events.length - 1]?.type).toBe('session_finished');
   });
 
+  test('emits recap_terse_ready immediately before session_finished (RECAP §3.3)', async () => {
+    // Auto-display contract: harness MUST project + render a
+    // terse line and emit it as a discrete event so the TUI can
+    // surface it above the session:end footer. Skipped silently
+    // on failure (tested separately via the helper unit tests);
+    // the happy path here pins the ordering — terse comes
+    // BEFORE session_finished so the rendered scrollback ordering
+    // is `... terse → session:end` (operator reads the summary
+    // above the closure).
+    const events: HarnessEvent[] = [];
+    await runAgent({
+      provider: mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'fix the bug',
+      onEvent: (e) => events.push(e),
+    });
+    const terseIdx = events.findIndex((e) => e.type === 'recap_terse_ready');
+    const finishedIdx = events.findIndex((e) => e.type === 'session_finished');
+    expect(terseIdx).toBeGreaterThan(-1);
+    expect(finishedIdx).toBeGreaterThan(terseIdx);
+    const terse = events[terseIdx];
+    if (terse?.type !== 'recap_terse_ready') throw new Error('expected recap_terse_ready');
+    expect(terse.markdown.length).toBeGreaterThan(0);
+    expect(terse.cacheHit).toBe(false); // first emit on this session
+    expect(terse.sessionId.length).toBeGreaterThan(0);
+  });
+
+  test('rehydrate skips when prior session was done (uses pre-reopen status)', async () => {
+    // Regression: the rehydrate gate read `getSession(...).status`
+    // AFTER `reopenSession` flipped the row to 'running', so it
+    // never observed terminal statuses (`done` / `exhausted` /
+    // `error`) and rehydrated sessions that should have been
+    // skipped. Pin the contract: a `done` session resumed must
+    // NOT emit `resume_rehydrated`, since shouldSkipResumeContext
+    // returns true for that status.
+    const r1 = await runAgent({
+      provider: mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'first',
+    });
+    // First run completed normally — status should be 'done'.
+    const events: HarnessEvent[] = [];
+    await runAgent({
+      provider: mockProvider([{ text: 'follow-up', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'follow up',
+      resumeFromSessionId: r1.sessionId,
+      onEvent: (e) => events.push(e),
+    });
+    const rehydrateEvents = events.filter((e) => e.type === 'resume_rehydrated');
+    expect(rehydrateEvents).toHaveLength(0);
+    const failureEvents = events.filter((e) => e.type === 'resume_rehydrate_failed');
+    expect(failureEvents).toHaveLength(0);
+  });
+
+  test('rehydrate previousStatus reports the pre-reopen status, not running', async () => {
+    // Regression sibling: even when rehydrate runs (status was
+    // not in the skip list), the emitted `previousStatus` must
+    // be the value BEFORE `reopenSession` flipped the row to
+    // 'running'. Use 'interrupted' — not in the skip list, so
+    // rehydrate proceeds, and we can assert the status string.
+    const r1 = await runAgent({
+      provider: mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'first',
+    });
+    // Mutate the row directly to 'interrupted' (no harness path
+    // produces this status without a real abort signal). Manual
+    // UPDATE keeps the test fast and intent-clear.
+    db.query('UPDATE sessions SET status = ? WHERE id = ?').run('interrupted', r1.sessionId);
+
+    const events: HarnessEvent[] = [];
+    await runAgent({
+      provider: mockProvider([{ text: 'follow-up', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'follow up',
+      resumeFromSessionId: r1.sessionId,
+      onEvent: (e) => events.push(e),
+    });
+    const rehydrate = events.find((e) => e.type === 'resume_rehydrated');
+    expect(rehydrate).toBeDefined();
+    if (rehydrate?.type !== 'resume_rehydrated') throw new Error('expected resume_rehydrated');
+    expect(rehydrate.previousStatus).toBe('interrupted');
+  });
+
+  test('skips recap_terse_ready when buildAutoTerse fails — session_finished still emits', async () => {
+    // Auto-display surface MUST be best-effort: any failure
+    // (DB lock, missing table, malformed projection) collapses
+    // to "no emit" and the harness still emits session_finished
+    // so the operator's exit footer is unaffected. RECAP §3.3:
+    // "Falhas não bloqueiam".
+    //
+    // Force the helper to fail by dropping the `recap_cache`
+    // table before runAgent. `buildAutoTerse` reads cache first;
+    // SELECT on a missing table throws, the outer try/catch
+    // returns `{ ok: false }`, and the harness skips the emit.
+    db.query('DROP TABLE recap_cache').run();
+
+    const events: HarnessEvent[] = [];
+    await runAgent({
+      provider: mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'fix the bug',
+      onEvent: (e) => events.push(e),
+    });
+    expect(events.find((e) => e.type === 'recap_terse_ready')).toBeUndefined();
+    expect(events.find((e) => e.type === 'session_finished')).toBeDefined();
+  });
+
   test('emits step_start per iteration', async () => {
     const events: HarnessEvent[] = [];
     await runAgent({

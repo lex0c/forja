@@ -1,12 +1,14 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type {
   ConstrainedRequest,
+  ConstrainedResult,
   GenerateRequest,
   Provider,
   ProviderContentBlock,
   ProviderMessage,
   ProviderToolDef,
   StreamEvent,
+  UsageInfo,
 } from '../types.ts';
 import {
   MAX_CACHE_BREAKPOINTS_PER_REQUEST,
@@ -131,14 +133,21 @@ export const createAnthropicProvider = (
         `anthropic request: 'thinking_budget' (${req.thinking_budget}) must be strictly less than 'max_tokens' (${req.max_tokens}) — Anthropic API rejects equal or greater with HTTP 400. The runtime resolved max_tokens against the provider capability ceiling (capabilities.output_max_tokens=${caps.output_max_tokens}); raise the playbook's 'sampling.max_tokens' or lower 'sampling.thinking_budget'.`,
       );
     }
+    // Some frontier models (e.g. Opus 4.7) deprecated `temperature`
+    // and `top_p` at the API; sending either returns HTTP 400.
+    // The capability flag opts those models out — adapter strips
+    // both before send. Default (cap omitted ⇒ `true`) keeps every
+    // other Claude model accepting the canonical TOKEN_TUNING §9
+    // values unchanged.
+    const acceptsSampling = caps.supports_sampling !== false;
     const stream = client.messages.stream({
       model: modelName,
       max_tokens: req.max_tokens,
       messages: cachedMessages,
       ...(cachedSystem !== undefined ? { system: cachedSystem } : {}),
       ...(cachedTools !== undefined ? { tools: cachedTools } : {}),
-      ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
-      ...(req.top_p !== undefined ? { top_p: req.top_p } : {}),
+      ...(acceptsSampling && req.temperature !== undefined ? { temperature: req.temperature } : {}),
+      ...(acceptsSampling && req.top_p !== undefined ? { top_p: req.top_p } : {}),
       // Extended thinking (`PLAYBOOKS.md` §1.1
       // `sampling.thinking_budget`). Anthropic's surface is
       // `thinking: { type:'enabled', budget_tokens }`; budget=0
@@ -171,11 +180,91 @@ export const createAnthropicProvider = (
     family: 'anthropic',
     capabilities: caps,
     generate,
-    generateConstrained: (_req: ConstrainedRequest): Promise<string> =>
-      // For Anthropic this would map to forced tool_choice, but the M1
-      // autonomous loop does not call constrained generation. Implemented
-      // when the DAG executor (M6) needs it.
-      Promise.reject(new Error('generateConstrained not implemented in M1')),
+    generateConstrained: async (req: ConstrainedRequest): Promise<ConstrainedResult> => {
+      // Anthropic's structured-output surface is forced tool calling:
+      // declare ONE tool whose `input_schema` is the desired JSON
+      // shape, set `tool_choice: {type:'tool', name}`, and the model
+      // is required to emit exactly one `tool_use` block whose `input`
+      // satisfies the schema. We then stringify that input — the
+      // caller (recap LLM render path) parses + validates against the
+      // same schema, so a misbehaving model still gets caught at the
+      // boundary.
+      //
+      // Why we forbid `req.tools`:
+      // ConstrainedRequest extends GenerateRequest, which carries a
+      // `tools` field for the unconstrained path. Mixing user-supplied
+      // tools with the forced schema tool would let the model pick a
+      // different tool, defeating the schema-binding intent. Reject
+      // up-front so that mistake surfaces at the call site, not as a
+      // mysteriously-missing tool_use.
+      if (req.tools !== undefined && req.tools.length > 0) {
+        throw new Error(
+          "anthropic generateConstrained: 'tools' must be empty (forced schema tool only)",
+        );
+      }
+      const cachedSystem = systemWithCacheBreakpoint(req.system);
+      const cachedMessages = messagesWithTailCacheBreakpoint(req.messages.map(toAnthropicMessage));
+      const schemaTool: Anthropic.Tool = {
+        name: req.output_schema_name,
+        description:
+          req.output_schema_description ??
+          'Emit the structured output for the constrained request.',
+        input_schema: req.output_schema as Anthropic.Tool.InputSchema,
+      };
+      const cachedTools = toolsWithCacheBreakpoint([schemaTool]);
+      const breakpointCount = countCacheBreakpoints({
+        system: cachedSystem,
+        tools: cachedTools,
+        messages: cachedMessages,
+      });
+      if (breakpointCount > MAX_CACHE_BREAKPOINTS_PER_REQUEST) {
+        throw new Error(
+          `anthropic constrained request exceeds the ${MAX_CACHE_BREAKPOINTS_PER_REQUEST}-breakpoint cache_control limit (${breakpointCount} markers); review src/providers/anthropic/cache.ts`,
+        );
+      }
+      const response = await client.messages.create({
+        model: modelName,
+        max_tokens: req.max_tokens,
+        messages: cachedMessages,
+        tools: cachedTools,
+        tool_choice: { type: 'tool', name: req.output_schema_name },
+        ...(cachedSystem !== undefined ? { system: cachedSystem } : {}),
+        // Same sampling-deprecation gate as the streaming path —
+        // see comment there for rationale.
+        ...(caps.supports_sampling !== false && req.temperature !== undefined
+          ? { temperature: req.temperature }
+          : {}),
+        ...(caps.supports_sampling !== false && req.top_p !== undefined
+          ? { top_p: req.top_p }
+          : {}),
+        ...(req.stop_sequences !== undefined ? { stop_sequences: req.stop_sequences } : {}),
+      });
+      // Find the forced tool_use block. With `tool_choice` set to a
+      // specific tool, Anthropic's contract is "exactly one tool_use
+      // matching the requested name"; defending against the contract
+      // breaking (older models, future API drift) means walking the
+      // content array rather than indexing [0]. A missing block is a
+      // hard error — the caller has no fallback at this layer.
+      const toolUse = response.content.find(
+        (block): block is Anthropic.ToolUseBlock =>
+          block.type === 'tool_use' && block.name === req.output_schema_name,
+      );
+      if (toolUse === undefined) {
+        throw new Error(
+          `anthropic constrained: model returned no tool_use for forced tool '${req.output_schema_name}'`,
+        );
+      }
+      const usage: UsageInfo = {
+        input: response.usage.input_tokens,
+        output: response.usage.output_tokens,
+        cache_read: response.usage.cache_read_input_tokens ?? 0,
+        cache_creation: response.usage.cache_creation_input_tokens ?? 0,
+      };
+      return {
+        output: JSON.stringify(toolUse.input),
+        usage,
+      };
+    },
     countTokens: async (messages: ProviderMessage[]): Promise<number> => {
       const response = await client.messages.countTokens({
         model: modelName,

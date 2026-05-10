@@ -105,7 +105,13 @@ const main = async (): Promise<number> => {
     args.checkpoints !== undefined ||
     args.worktrees !== undefined ||
     args.memory !== undefined ||
-    args.explainPermissions;
+    args.explainPermissions ||
+    // `agent recap [args]` is the headless surface for the recap
+    // slash (RECAP §9). It carries its own positional verbs in
+    // `args.recap.args` and never expects a free-text prompt — the
+    // empty-prompt check below would otherwise route it into the
+    // REPL TTY gate or the `--json requires a prompt` rejection.
+    args.recap !== undefined;
   if (args.prompt.length === 0 && !promptOptional && args.resume === undefined) {
     // JSON mode + REPL is meaningless (NDJSON consumers don't have
     // a TTY to type into) — refuse rather than open a TTY-only loop

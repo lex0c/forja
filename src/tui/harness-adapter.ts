@@ -227,6 +227,50 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         });
         return out;
 
+      case 'resume_rehydrated': {
+        // Visibility line per STATE_MACHINE.md §7.6:
+        // `🔄 Resumed from <status> — N decisions, M pins, K todos rehydrated`.
+        // `degraded` produces a different shape so the operator
+        // sees that the rehydrate had no payload (typical: Stop
+        // hook never ran, recap_cache empty, projection caught
+        // an empty session).
+        const message = event.degraded
+          ? `resumed from ${event.previousStatus} — rehydrate degraded (no recap signal in audit log)`
+          : `resumed from ${event.previousStatus} — ${event.decisionCount} decisions, ${event.pinCount} pins, ${event.todoCount} todos rehydrated${
+              event.truncated ? ' (truncated to fit budget)' : ''
+            }`;
+        out.push({ type: 'info', ts, message });
+        return out;
+      }
+
+      case 'resume_rehydrate_failed':
+        // Auto-rehydrate skipped due to a projection / DB error.
+        // Resume itself proceeded; the operator just doesn't get
+        // the `[resume_context]` block this time. Surface as
+        // `warn` (not `error`) — the session is functional, the
+        // diagnostic is informational.
+        out.push({
+          type: 'warn',
+          ts,
+          message: `auto-rehydrate skipped: ${event.reason} (resume continues without the [resume_context] block)`,
+        });
+        return out;
+
+      case 'recap_terse_ready': {
+        // Session-end terse line (RECAP.md §3.3). Surface as a
+        // dedicated `recap:terse` UIEvent so the renderer styles
+        // it (bold "recap:" prefix + secondary color across the
+        // line) instead of the plain `info` shape used for slash
+        // output. The terse template emits a single sentence
+        // ≤ 200 chars (with trailing newline) — split on newline
+        // and drop empties so we don't render a blank styled line.
+        const lines = event.markdown.split('\n').filter((l) => l.length > 0);
+        for (const line of lines) {
+          out.push({ type: 'recap:terse', ts, message: line });
+        }
+        return out;
+      }
+
       case 'step_start': {
         state.steps = event.stepN;
         out.push({

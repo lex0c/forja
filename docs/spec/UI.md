@@ -748,6 +748,7 @@ Renderer reage a `tick` igual a qualquer evento (redraw da região viva).
 | Esc Esc | running | hard interrupt (cancela tool em curso) |
 | Ctrl+L | qualquer | clear screen (mantém histórico no scrollback) |
 | Ctrl+R | input | reverse search no histórico (ver `HISTORY.md` §2.2) |
+| Alt+R | idle | imprime recap terse da sessão corrente acima do prompt (1 frase, sempre determinístico — ver `RECAP.md §3.3`). Linha vira parte do scrollback. |
 | Ctrl+D | input vazio | exit imediato (EOF — convenção shell, sem gate) |
 | Tab | input com `/` | autocomplete |
 | Ctrl+Z | qualquer | suspend (SIGTSTP), retorna com `fg` |

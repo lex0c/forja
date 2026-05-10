@@ -616,6 +616,16 @@ export type InfoEvent = BaseEvent & {
   message: string;
 };
 
+// Recap terse line surfaced by RECAP §3.3 auto-display surfaces
+// (session-end + Alt+R). Distinct from `info` so the renderer can
+// style it specifically: bold "recap:" prefix, secondary
+// (bright-grey) color across the line. The terse renderer's
+// markdown body lands in `message`; the renderer wraps it.
+export type RecapTerseEvent = BaseEvent & {
+  type: 'recap:terse';
+  message: string;
+};
+
 // Diagnostics + interrupts.
 export type ErrorEvent = BaseEvent & {
   type: 'error';
@@ -699,6 +709,7 @@ export type UIEvent =
   | ReverseSearchUpdateEvent
   | ReverseSearchCloseEvent
   | InfoEvent
+  | RecapTerseEvent
   | ErrorEvent
   | WarnEvent
   | InterruptEvent

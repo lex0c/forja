@@ -117,4 +117,72 @@ describe('recap_runs repo', () => {
     const fetched = getRecapRun(db, run.id);
     expect(fetched?.sessionIds).toEqual([]);
   });
+
+  // Migration 033 — new columns default to "deterministic render"
+  // shape. M4.1 callers that don't pass any of the new fields must
+  // continue to get rows that read back unchanged.
+  test('cost columns default to 0/null/false when omitted', () => {
+    const run = recordRecapRun(db, {
+      scopeKind: 'session_current',
+      sessionIds: ['a'],
+      renderer: 'human',
+      usedLlm: false,
+    });
+    expect(run.costUsd).toBe(0);
+    expect(run.tokensIn).toBe(0);
+    expect(run.tokensOut).toBe(0);
+    expect(run.promptVersion).toBeNull();
+    expect(run.cacheHit).toBe(false);
+    expect(getRecapRun(db, run.id)).toEqual(run);
+  });
+
+  test('LLM render fields round-trip through migration 033 columns', () => {
+    const run = recordRecapRun(db, {
+      scopeKind: 'session_specific',
+      sessionIds: ['s1'],
+      renderer: 'pr',
+      usedLlm: true,
+      costUsd: 0.0012,
+      tokensIn: 3_412,
+      tokensOut: 712,
+      promptVersion: 'pr-v1',
+      cacheHit: false,
+    });
+    const fetched = getRecapRun(db, run.id);
+    expect(fetched?.costUsd).toBeCloseTo(0.0012, 6);
+    expect(fetched?.tokensIn).toBe(3_412);
+    expect(fetched?.tokensOut).toBe(712);
+    expect(fetched?.promptVersion).toBe('pr-v1');
+    expect(fetched?.cacheHit).toBe(false);
+  });
+
+  test('cacheHit:true marks a row served from recap_cache', () => {
+    const run = recordRecapRun(db, {
+      scopeKind: 'session_specific',
+      sessionIds: ['s1'],
+      renderer: 'pr',
+      usedLlm: true,
+      costUsd: 0,
+      tokensIn: 0,
+      tokensOut: 0,
+      promptVersion: 'pr-v1',
+      cacheHit: true,
+    });
+    expect(run.cacheHit).toBe(true);
+    expect(run.costUsd).toBe(0);
+    const fetched = getRecapRun(db, run.id);
+    expect(fetched?.cacheHit).toBe(true);
+  });
+
+  test('CHECK constraint rejects cache_hit outside 0/1', () => {
+    const run = recordRecapRun(db, {
+      scopeKind: 'session_current',
+      sessionIds: ['a'],
+      renderer: 'human',
+      usedLlm: false,
+    });
+    expect(() =>
+      db.query('UPDATE recap_runs SET cache_hit = 7 WHERE id = ?').run(run.id),
+    ).toThrow();
+  });
 });

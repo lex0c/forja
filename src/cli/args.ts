@@ -183,6 +183,18 @@ export interface ParsedArgs {
   // the permissions path so the operator does not have to
   // remember per-flag semantics.
   init?: { force: boolean; mode: 'strict' | 'acceptEdits'; playbooks: boolean };
+  // `agent recap [args]` headless subcommand (RECAP.md §9). Routes
+  // to the `runRecapHeadless` handler — same surface as the
+  // `/recap` slash but invoked from a non-REPL context (CI, scripts,
+  // `gh pr create --body $(agent recap pr ...)`). The args array is
+  // forwarded verbatim to the slash parser so every recap form
+  // (`pr`, `changelog`, `slack`, `terse`, `last <N>`, `session
+  // <id>`, `list [filtros]`, `json`, etc.) works the same way the
+  // operator types it in the REPL. Pairs with the global `--json`
+  // flag to emit the §9 NDJSON event stream
+  // (recap_start / recap_intermediate / recap_render / recap_end);
+  // without `--json`, headless output is the rendered string only.
+  recap?: { args: string[] };
 }
 
 export interface ParseError {
@@ -284,9 +296,111 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
   };
 };
 
+// `agent recap [args]` — headless surface for the recap slash
+// command. The verb has to be the very first token on the command
+// line (same convention as `init`); when present, every following
+// token is collected into `args.recap.args` verbatim and the
+// slash-side parser does the heavy lifting in `runRecapHeadless`.
+// `--json` and `--model` are consumed at the top-level scan that
+// wraps this subcommand (the dispatcher sets them before routing),
+// so the headless handler decides "NDJSON or rendered text" from
+// `args.json` and bootstrap reads `args.model` for provider
+// selection — leaving these in `recapArgs` would surface them as
+// "unknown flag" inside the slash-side parser.
+const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
+  if (argv.length === 0 || argv[0] !== 'recap') return null;
+  let json = false;
+  let model: string | undefined;
+  const recapArgs: string[] = [];
+  let i = 1;
+  while (i < argv.length) {
+    const token = argv[i];
+    if (token === undefined) {
+      i += 1;
+      continue;
+    }
+    if (token === '--help' || token === '-h') {
+      return {
+        ok: true,
+        args: {
+          prompt: '',
+          json: false,
+          version: false,
+          help: true,
+          plan: false,
+          listSessions: false,
+          includeSubagents: false,
+          explainPermissions: false,
+          yes: false,
+        },
+      };
+    }
+    if (token === '--json') {
+      // `--json` toggles NDJSON output mode (§9). Consumed at the
+      // subcommand boundary so the recap-side parser does not see
+      // it as a renderer flag.
+      json = true;
+      i += 1;
+      continue;
+    }
+    if (token === '--model') {
+      // Top-level `--model <id>` — picks the provider used by
+      // bootstrap when wiring the headless LLM render path.
+      // Without this extraction, the slash-side parser would
+      // see `--model` and reject it as an unknown flag, leaving
+      // operators no way to override the model for `agent recap`.
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith('-')) {
+        return { ok: false, message: '--model requires a value' };
+      }
+      model = value;
+      i += 2;
+      continue;
+    }
+    if (token.startsWith('--model=')) {
+      // `--model=<id>` single-token form — disambiguates a model
+      // id that legitimately starts with `-` (none in the registry
+      // today, but the form is consistent with other parsers).
+      const value = token.slice('--model='.length);
+      if (value.length === 0) {
+        return { ok: false, message: '--model= requires a value' };
+      }
+      model = value;
+      i += 1;
+      continue;
+    }
+    // Every other token — including recap-specific flags
+    // (`--no-llm-render`, `--out`, `--limit`, `--project`, etc.)
+    // and positional subcommand verbs (`pr`, `last`, `session`,
+    // `list`, `json`) — is forwarded as-is. The slash parser
+    // owns the vocabulary; redoing it here would be duplication
+    // and a place to drift.
+    recapArgs.push(token);
+    i += 1;
+  }
+  return {
+    ok: true,
+    args: {
+      prompt: '',
+      json,
+      version: false,
+      help: false,
+      plan: false,
+      listSessions: false,
+      includeSubagents: false,
+      explainPermissions: false,
+      yes: false,
+      recap: { args: recapArgs },
+      ...(model !== undefined ? { model } : {}),
+    },
+  };
+};
+
 export const parseArgs = (argv: readonly string[]): ParseResult => {
   const initParsed = parseInitSubcommand(argv);
   if (initParsed !== null) return initParsed;
+  const recapParsed = parseRecapSubcommand(argv);
+  if (recapParsed !== null) return recapParsed;
   const args: ParsedArgs = {
     prompt: '',
     json: false,

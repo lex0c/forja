@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -166,5 +166,171 @@ describe('cli entrypoint: prompt requirement', () => {
     // 'not found' lands when the session id is unknown — the
     // dispatch reached the handler.
     expect(stderr).toContain('not found');
+  });
+
+  test('`recap` subcommand does NOT require a prompt (--json + headless)', async () => {
+    // Regression: the entry's `promptOptional` list omitted
+    // `args.recap`, so `agent recap session <id> --json` was
+    // rejected with "--json requires a prompt (REPL mode is TTY
+    // only)" before reaching `runRecapHeadless`. Same shape as
+    // the --list-sessions / --undo regressions above. End-to-end
+    // through the real binary so the entry-level gate is exercised.
+    // The session id is unknown, so the handler errors with a
+    // recap-side diagnostic — what matters is that the prompt
+    // gate doesn't fire first.
+    const { exitCode, stderr } = await runCliWithRun([
+      'recap',
+      'session',
+      'no-such-session',
+      '--json',
+      '--no-llm-render',
+    ]);
+    expect(stderr).not.toContain('requires a prompt');
+    expect(stderr).not.toContain('TTY');
+    // Headless errors come through stderr with the `/recap:`
+    // prefix from runRecapHeadless. Exit 1 from the unknown id.
+    expect(stderr).toContain('/recap:');
+    expect(exitCode).toBe(1);
+  });
+
+  test('`recap` subcommand does NOT require a prompt (no --json, no TTY)', async () => {
+    // Same shape without --json — pre-fix this fell into the TTY
+    // gate ("interactive mode requires a TTY") because the empty
+    // prompt routed to the REPL branch. The recap headless path
+    // is non-interactive by design and should reach its handler
+    // regardless of TTY state.
+    const { stderr } = await runCliWithRun([
+      'recap',
+      'session',
+      'no-such-session',
+      '--no-llm-render',
+    ]);
+    expect(stderr).not.toContain('TTY');
+    expect(stderr).toContain('/recap:');
+  });
+
+  test('`recap` warns and falls back to stub when provider bootstrap fails', async () => {
+    // Regression: pre-fix the dispatcher hardcoded a stub provider
+    // (`constrained: false`), so `agent recap pr` could never
+    // exercise the LLM render path even with API keys configured.
+    // Post-fix: try `bootstrap()` for the real provider; on failure
+    // (e.g., missing ANTHROPIC_API_KEY) emit a one-line warn AND
+    // continue with the stub so deterministic surfaces still work.
+    //
+    // Bun auto-loads `.env` from the cwd of the bun process, so
+    // running with `cwd: repoRoot` would surface the developer's
+    // `.env`-supplied API key and bootstrap would succeed silently.
+    // Spawn from a tmpdir (no `.env`) AND clear the env var to make
+    // the failure path deterministic.
+    const dataDir = mkdtempSync(join(tmpdir(), 'forja-cli-'));
+    const spawnCwd = mkdtempSync(join(tmpdir(), 'forja-no-env-'));
+    try {
+      const env = { ...process.env, XDG_DATA_HOME: dataDir };
+      delete (env as { ANTHROPIC_API_KEY?: string }).ANTHROPIC_API_KEY;
+      const proc = Bun.spawn(
+        ['bun', entry, 'recap', 'session', 'no-such-session', '--no-llm-render'],
+        { cwd: spawnCwd, stdout: 'pipe', stderr: 'pipe', env },
+      );
+      const [stderr, exitCode] = await Promise.all([
+        new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+        proc.exited,
+      ]);
+      // The warn precedes the recap-side error; both land on stderr.
+      expect(stderr).toContain('forja recap: provider bootstrap failed');
+      expect(stderr).toContain('LLM render disabled');
+      // Subsequent dispatch into runRecapHeadless still happens —
+      // the unknown session id surfaces the recap-side error.
+      expect(stderr).toContain('/recap:');
+      expect(exitCode).toBe(1);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+      rmSync(spawnCwd, { recursive: true, force: true });
+    }
+  });
+
+  test('`recap` hard-fails on unknown --model (no silent fallback)', async () => {
+    // Regression: pre-fix the catch block treated all bootstrap
+    // failures as "LLM unavailable" and fell back to the stub,
+    // exit 0. A typo in `--model <bad-id>` would silently render
+    // deterministically while CI logs claimed success — masking
+    // the configuration mistake. Spec: invalid model selection
+    // is a config error and must exit non-zero.
+    const dataDir = mkdtempSync(join(tmpdir(), 'forja-cli-'));
+    const spawnCwd = mkdtempSync(join(tmpdir(), 'forja-no-env-'));
+    try {
+      // Even with the API key present (loaded from .env or env),
+      // an unknown model id throws "unknown model: ..." inside
+      // the registry lookup BEFORE the factory runs, so the auth
+      // path is irrelevant. Pass through the dev's env so the
+      // failure is unambiguously about the model id.
+      const env = { ...process.env, XDG_DATA_HOME: dataDir };
+      const proc = Bun.spawn(
+        ['bun', entry, 'recap', 'session', 'no-such-session', '--model', 'anthropic/sonnett-typo'],
+        { cwd: spawnCwd, stdout: 'pipe', stderr: 'pipe', env },
+      );
+      const [stderr, exitCode] = await Promise.all([
+        new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+        proc.exited,
+      ]);
+      // Hard-fail diagnostic; NOT the "LLM render disabled" warn.
+      expect(stderr).toContain('forja recap: unknown model');
+      expect(stderr).toContain('anthropic/sonnett-typo');
+      expect(stderr).not.toContain('LLM render disabled');
+      expect(exitCode).toBe(1);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+      rmSync(spawnCwd, { recursive: true, force: true });
+    }
+  });
+
+  test('`recap` hard-fails on a malformed .agent/permissions.yaml (config error, not auth)', async () => {
+    // Regression: pre-fix the catch block was a catch-all — every
+    // bootstrap failure that wasn't "unknown model" degraded to
+    // the stub, including malformed policy YAML, broken hook
+    // config, and other repo setup mistakes. Operator's CI saw
+    // `exit 0` and "LLM render disabled" hiding a real config
+    // bug. Post-fix: ONLY the API-key-required path falls back;
+    // every other bootstrap exception is a hard fail.
+    const dataDir = mkdtempSync(join(tmpdir(), 'forja-cli-'));
+    const spawnCwd = mkdtempSync(join(tmpdir(), 'forja-bad-policy-'));
+    try {
+      // Seed a malformed permissions.yaml inside .agent/. Bootstrap
+      // reads it during policy resolution and throws a YAML parse
+      // error — that's exactly the "real config bug" shape the
+      // fallback was wrongly hiding.
+      mkdirSync(join(spawnCwd, '.agent'), { recursive: true });
+      writeFileSync(join(spawnCwd, '.agent', 'permissions.yaml'), 'this: is: not: valid: yaml\n');
+      // Inject a fake API key so bootstrap clears the provider
+      // auth gate (which fires before YAML parsing) — without
+      // this, environments without ANTHROPIC_API_KEY in process.env
+      // (clean checkouts, CI without secrets) would hit the
+      // auth-fallback path instead of the YAML hard-fail we're
+      // pinning. The fake key never reaches the network: this
+      // test never makes an LLM call.
+      const env = {
+        ...process.env,
+        XDG_DATA_HOME: dataDir,
+        ANTHROPIC_API_KEY: 'sk-ant-fake-test-key',
+      };
+      const proc = Bun.spawn(
+        ['bun', entry, 'recap', 'session', 'no-such-session', '--no-llm-render'],
+        { cwd: spawnCwd, stdout: 'pipe', stderr: 'pipe', env },
+      );
+      const [stderr, exitCode] = await Promise.all([
+        new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+        proc.exited,
+      ]);
+      // Hard-fail; NOT the LLM-render-disabled warn.
+      expect(stderr).toContain('forja recap:');
+      expect(stderr).not.toContain('LLM render disabled');
+      // The YAML parser's diagnostic surfaces in the message;
+      // assert non-zero exit + no silent fallback rather than
+      // pinning a specific YAML error string (parser-version
+      // dependent).
+      expect(exitCode).toBe(1);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+      rmSync(spawnCwd, { recursive: true, force: true });
+    }
   });
 });

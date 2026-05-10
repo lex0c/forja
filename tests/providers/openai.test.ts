@@ -67,7 +67,7 @@ describe('createOpenAIProvider', () => {
     expect(provider.capabilities.context_window).toBe(128_000);
   });
 
-  test('generateConstrained rejects with not-implemented error in M1', async () => {
+  test('generateConstrained rejects (not implemented for OpenAI in M4.2)', async () => {
     const provider = createOpenAIProvider('gpt-4o', { apiKey: 'sk-test' });
     await expect(
       provider.generateConstrained({
@@ -75,8 +75,9 @@ describe('createOpenAIProvider', () => {
         messages: [{ role: 'user', content: 'hi' }],
         max_tokens: 1,
         output_schema: { type: 'object' },
+        output_schema_name: 'render_output',
       }),
-    ).rejects.toThrow(/not implemented in M1/);
+    ).rejects.toThrow(/not implemented for OpenAI/);
   });
 
   test('generate pipes the SDK stream through the canonical normalizer', async () => {

@@ -320,6 +320,34 @@ describe('harness-adapter — session lifecycle', () => {
     expect(out[0]?.type).toBe('warn');
     expect((out[0] as Extract<UIEvent, { type: 'warn' }>).message).toContain('30 of 50');
   });
+
+  test('recap_terse_ready → recap:terse line(s) for the scrollback (RECAP §3.3)', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'recap_terse_ready',
+      sessionId: 's',
+      markdown: 'fix the bug. 1 step, $0.00.\n',
+      cacheHit: false,
+    });
+    expect(types(out)).toEqual(['recap:terse']);
+    const ev = out[0] as Extract<UIEvent, { type: 'recap:terse' }>;
+    expect(ev.message).toBe('fix the bug. 1 step, $0.00.');
+  });
+
+  test('recap_terse_ready filters trailing-empty lines so no blank line is rendered', () => {
+    const a = createHarnessAdapter(baseCtx());
+    const out = a.translate({
+      type: 'recap_terse_ready',
+      sessionId: 's',
+      // Some renderers may emit `text\n` or `text\n\n`; the
+      // adapter normalizes by dropping empty lines.
+      markdown: 'one sentence.\n\n',
+      cacheHit: true,
+    });
+    expect(types(out)).toEqual(['recap:terse']);
+    const ev = out[0] as Extract<UIEvent, { type: 'recap:terse' }>;
+    expect(ev.message).toBe('one sentence.');
+  });
 });
 
 describe('harness-adapter — provider events: text streaming', () => {

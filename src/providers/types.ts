@@ -35,6 +35,17 @@ export interface ProviderCapabilities {
   cost_per_1k_cached_input?: number;
   cost_per_1k_cache_write?: number;
 
+  // Whether the model accepts the `temperature` / `top_p` sampling
+  // parameters at the API boundary. Vendors deprecate these on
+  // newer frontier models (e.g. Anthropic's Opus 4.7 returns HTTP
+  // 400 "temperature is deprecated for this model") — without this
+  // gate every workflow that follows TOKEN_TUNING §9 (recap LLM
+  // render and others) would 400 on those models. Adapters strip
+  // both parameters before sending when this is `false`. Default
+  // (omitted = `true`) keeps backward compat for every existing
+  // model that still accepts the field.
+  supports_sampling?: boolean;
+
   // Operational
   max_rps?: number;
   notes: string[];
@@ -157,6 +168,30 @@ export interface GenerateRequest {
 
 export interface ConstrainedRequest extends GenerateRequest {
   output_schema: Record<string, unknown>;
+  // Schema label, used as the tool name on Anthropic / OpenAI tool
+  // calling and as the response_format name on JSON-mode providers.
+  // Must match `^[a-z][a-z0-9_]{0,63}$` to satisfy provider naming
+  // rules; the recap renderer uses literal labels like 'render_recap_pr'.
+  output_schema_name: string;
+  // Free-form description of what the schema captures. Surfaced to
+  // the provider as the tool description; helps the model pick the
+  // right shape even with the tool forced. Optional — the constrained
+  // call works without it but quality typically improves when set.
+  output_schema_description?: string;
+}
+
+export interface ConstrainedResult {
+  // Stringified JSON of the model's structured output. Caller is
+  // responsible for `JSON.parse` + schema validation; the provider
+  // guarantees only that the bytes came from a forced structured-
+  // output channel (forced tool_use on Anthropic, response_format
+  // on OpenAI, GBNF on llama.cpp), not that the JSON validates
+  // against the supplied schema.
+  output: string;
+  // Per-call token usage. Distinct from the streaming `usage` event
+  // because constrained generation is a single round-trip. Adapters
+  // populate this from the same fields the streaming path reads.
+  usage: UsageInfo;
 }
 
 export interface Provider {
@@ -164,6 +199,6 @@ export interface Provider {
   family: ProviderFamily;
   capabilities: ProviderCapabilities;
   generate(req: GenerateRequest): AsyncIterable<StreamEvent>;
-  generateConstrained(req: ConstrainedRequest): Promise<string>;
+  generateConstrained(req: ConstrainedRequest): Promise<ConstrainedResult>;
   countTokens(messages: ProviderMessage[]): Promise<number>;
 }

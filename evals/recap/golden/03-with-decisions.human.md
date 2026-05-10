@@ -2,6 +2,12 @@
 
 **Goal:** cleanup tmp dir and confirm with me before any bash
 
+## Resumo
+
+- cleanup tmp dir and confirm with me before any bash
+- 2 commands run
+- bash: rm -rf /tmp/forja-staging — cleanup is intentional
+
 ## What changed
 
 - 2 commands run
@@ -13,4 +19,4 @@
 
 ## Cost
 
-<$0.01 · 1.8k in / 110 out · 78% cached · sonnet-4-6
+<$0.01 · 1.8k in / 110 out · 44% cached · sonnet-4-6

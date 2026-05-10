@@ -612,6 +612,7 @@ export type PermanentItem =
   | { kind: 'error'; message: string }
   | { kind: 'warn'; message: string }
   | { kind: 'info'; message: string }
+  | { kind: 'recap-terse'; message: string }
   | {
       // Subagent run terminal summary, emitted from the
       // `subagent:end` reducer branch. Renderer formats as a
@@ -1259,6 +1260,9 @@ const applyEventInner = (state: LiveState, event: UIEvent): ApplyResult => {
 
     case 'info':
       return { state, permanent: [{ kind: 'info', message: event.message }] };
+
+    case 'recap:terse':
+      return { state, permanent: [{ kind: 'recap-terse', message: event.message }] };
 
     case 'interrupt':
       // Spec UI.md §4.10.6: soft interrupt flips the footer cue from

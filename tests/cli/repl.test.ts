@@ -11,7 +11,9 @@ import { DEFAULT_BUDGET } from '../../src/harness/types.ts';
 import { openMemoryDb } from '../../src/storage/db.ts';
 import { migrate } from '../../src/storage/migrate.ts';
 import { recordCritiqueRun } from '../../src/storage/repos/critique-runs.ts';
-import { createSession } from '../../src/storage/repos/sessions.ts';
+import { appendMessage } from '../../src/storage/repos/messages.ts';
+import { listRecentRecapRuns } from '../../src/storage/repos/recap-runs.ts';
+import { completeSession, createSession } from '../../src/storage/repos/sessions.ts';
 import { addTrustedDir, loadTrustedDirs } from '../../src/trust/index.ts';
 
 // Build a ParsedArgs shape with all the flags the REPL inspects set
@@ -3574,6 +3576,172 @@ describe('repl — slash commands integration', () => {
     // rows ⇒ "2 runs".
     expect(newWrites).toMatch(/· 2 runs/);
 
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+});
+
+describe('repl — Alt+R recap terse (RECAP §3.3)', () => {
+  test('Alt+R before any session emits a warn, no info line, no audit row', async () => {
+    // Spec gate (`lastSessionId === null`): there's nothing to
+    // project before the first turn finishes. Operator gets a
+    // single-line warn explaining why; nothing lands in
+    // recap_runs because buildAutoTerse never ran.
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const stub = makeBootstrapStub();
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    const before = writes.length;
+    // Alt+R = ESC + 'r'. The keys parser maps `ESC <printable>`
+    // to a `kind: 'char'` event with `alt: true`.
+    stdin.feed('\x1br');
+    await flushFrame();
+    const after = writes.slice(before).join('');
+    expect(after).toContain('no session yet');
+    expect(listRecentRecapRuns(stub.db, 10)).toHaveLength(0);
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Alt+R after a finished session prints terse line + writes audit row', async () => {
+    // Pre-seed a real session in the bootstrap's db so
+    // buildAutoTerse has something to project. Then drive a
+    // synthetic turn through the runAgent override that emits
+    // session_finished with the seeded id — that's what flips
+    // lastSessionId in the REPL.
+    const stub = makeBootstrapStub();
+    const seededId = 'sess-altr-seed';
+    createSession(stub.db, {
+      id: seededId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+      startedAt: 1_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: seededId,
+      role: 'user',
+      content: 'fix the bug',
+      createdAt: 1_100,
+    });
+    appendMessage(stub.db, {
+      sessionId: seededId,
+      role: 'assistant',
+      parentId: null,
+      content: [{ type: 'text', text: 'fixed it' }],
+      tokensIn: 50,
+      tokensOut: 20,
+      cachedTokens: null,
+      cacheCreationTokens: null,
+      costUsd: 0.001,
+      createdAt: 1_200,
+    });
+    completeSession(stub.db, seededId, 'done', 0.001, true, 1_300);
+
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    // runAgent override resolves immediately, emits a
+    // session_finished pointing at the SEEDED id so lastSessionId
+    // ends up matching the real session in the DB. Without this,
+    // Alt+R would resolve to a synthetic sess-N that has no
+    // messages and the projection would render an empty terse.
+    const ra = makeRunAgent(() => seededId);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    stdin.feed('hi\r');
+    await tick();
+    ra.finish(0);
+    await tick();
+
+    const before = writes.length;
+    stdin.feed('\x1br'); // Alt+R
+    await flushFrame();
+    const after = writes.slice(before).join('');
+    // Terse output for this seeded session contains the goal text
+    // ("fix the bug") and ends with a period — same shape the
+    // session-end terse line uses. Match loosely on goal text so
+    // the test isn't brittle against future template tweaks
+    // (consistency eval pins the byte-exact format elsewhere).
+    expect(after).toContain('fix the bug');
+
+    // Audit row landed: terse, used_llm 0.
+    const runs = listRecentRecapRuns(stub.db, 10);
+    expect(runs.some((r) => r.renderer === 'terse' && !r.usedLlm)).toBe(true);
+
+    stdin.feed('\x04');
+    expect(await promise).toBe(130);
+  });
+
+  test('Alt+R is gated off while a turn is busy (no projection during run)', async () => {
+    // Mid-turn the operator's attention is on the live output
+    // and the loop is mutating db rows the projection would
+    // race. Spec §3.3 + repl.ts gate: idle-only.
+    const stub = makeBootstrapStub();
+    const seededId = 'sess-altr-busy-seed';
+    createSession(stub.db, {
+      id: seededId,
+      model: 'mock/m',
+      cwd: '/tmp/forja-repl-test',
+      startedAt: 1_000,
+    });
+    appendMessage(stub.db, {
+      sessionId: seededId,
+      role: 'user',
+      content: 'do thing',
+      createdAt: 1_100,
+    });
+
+    const stdin = makeStdin();
+    const writes: string[] = [];
+    const ra = makeRunAgent(() => seededId);
+    const promise = runRepl({
+      args: makeArgs(),
+      bootstrapOverride: stub,
+      stdin,
+      skipTtyCheck: true,
+      skipTrustPrompt: true,
+      runAgentOverride: ra.runAgent,
+      rendererWrite: (s) => {
+        writes.push(s);
+      },
+    });
+    await tick();
+    // Start a turn but do NOT finish it. While the harness
+    // override is pending, isBusy()=true and Alt+R is a no-op
+    // (gate exits early without emitting anything).
+    stdin.feed('hi\r');
+    await tick();
+    const before = writes.length;
+    stdin.feed('\x1br');
+    await flushFrame();
+    const after = writes.slice(before).join('');
+    // No "do thing"-style terse line, no warn — gate exited
+    // before emitting. Crucially: no audit row from a recap
+    // projection that should not have happened.
+    expect(after).not.toContain('do thing.');
+    expect(listRecentRecapRuns(stub.db, 10)).toHaveLength(0);
+    // Cleanup: finish the pending turn so the REPL can exit.
+    ra.finish(0);
+    await tick();
     stdin.feed('\x04');
     expect(await promise).toBe(130);
   });

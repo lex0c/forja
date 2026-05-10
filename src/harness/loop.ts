@@ -29,8 +29,12 @@ import type {
   ProviderToolUseBlock,
 } from '../providers/index.ts';
 import { estimatePromptTokens } from '../providers/tokens.ts';
+import { buildAutoTerse } from '../recap/auto-display.ts';
+import { projectRecap } from '../recap/projection.ts';
+import { buildResumeContext, shouldSkipResumeContext } from '../recap/resume-context.ts';
 import {
   type CritiqueRunCode,
+  type SessionStatus,
   appendMessage,
   completeSession,
   createSession,
@@ -304,6 +308,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // the result reports just totalCostUsd.
   let priorCostUsd = 0;
   let priorUsageComplete = true;
+
+  // Captured at resume init BEFORE reopenSession flips the row to
+  // `running`. Used by the auto-rehydrate block (RECAP §3.2 +
+  // STATE_MACHINE §7.6) for the skip-on-terminal predicate AND for
+  // the `previousStatus` field in the emitted `[resume_context]`
+  // event. Reading status from a fresh `getSession` after
+  // `reopenSession` would always see `running` and (a) bypass the
+  // `done`/`exhausted`/`error` skip gate and (b) report the
+  // operator's prior status as `running` in the rehydrate event,
+  // which is wrong on both counts.
+  let preResumeStatus: SessionStatus | null = null;
 
   // Cost incurred by settled child handles inherited from prior
   // runs of the resumed session. Lives SEPARATELY from
@@ -621,6 +636,31 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     if (pendingHookChains.size > 0) {
       await Promise.allSettled([...pendingHookChains]);
     }
+
+    // Auto-display terse line (RECAP §3.3). Project the recap
+    // determinístically and cache the result so the operator's
+    // next `/recap` is a hit, plus the harness emits the markdown
+    // so the TUI surfaces it above session:end. Skipped silently
+    // on any failure — operator's exit footer comes through
+    // regardless. Init-fail paths where `sessionId === ''` are
+    // also skipped (no real session to project).
+    if (sessionId.length > 0) {
+      const auto = buildAutoTerse({ db: config.db, sessionId, now: Date.now() });
+      if (auto.ok) {
+        safeEmit(config.onEvent, {
+          type: 'recap_terse_ready',
+          sessionId,
+          markdown: auto.markdown,
+          cacheHit: auto.cacheHit,
+        });
+      }
+      // Failure case: swallow. The harness contract is "always
+      // emit session_finished"; the recap surface is best-effort.
+      // Diagnostic is observable via `recap_runs` (no row was
+      // written) and the rare crash that this catches is
+      // typically a transient SQLite lock that the next manual
+      // /recap would also surface.
+    }
     safeEmit(config.onEvent, { type: 'session_finished', result });
     return result;
   };
@@ -725,6 +765,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         }
         priorCostUsd = existing.totalCostUsd;
         priorUsageComplete = existing.usageComplete;
+        // Snapshot the pre-resume status BEFORE `reopenSession`
+        // flips the row to 'running'. The auto-rehydrate block
+        // far below depends on this — re-reading the row at that
+        // point would always see 'running', losing the
+        // `done`/`exhausted`/`error` skip semantics and reporting
+        // a wrong `previousStatus` in the rehydrate event.
+        preResumeStatus = existing.status;
         reopenSession(config.db, resumeId);
         sessionId = resumeId;
       } else if (preassignedId !== undefined) {
@@ -1341,6 +1388,66 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         if (lastFetched !== undefined) priorTailId = lastFetched.id;
       }
 
+      // Auto-rehydrate on `--resume` (STATE_MACHINE §7.6 +
+      // RECAP §3.2). Prepends a literal `[resume_context]` block
+      // to the operator's first user prompt so the next turn has
+      // access to the goal text, recent decisions, pins, and
+      // notDone items from the audit log. Pure projection (no
+      // LLM, no provider call) so it stays inside the resume
+      // init's latency envelope; any exception falls through to
+      // an unrehydrated prompt — the operator gets a working
+      // resume instead of a hard failure.
+      let effectiveUserPrompt = config.userPrompt;
+      if (
+        resumeId !== undefined &&
+        config.userPrompt.length > 0 &&
+        preResumeStatus !== null &&
+        !shouldSkipResumeContext(preResumeStatus)
+      ) {
+        // `preResumeStatus` was captured BEFORE `reopenSession`
+        // flipped the row to 'running'. Using it here preserves
+        // the §7.6 skip-on-terminal contract (don't rehydrate a
+        // `done`/`exhausted`/`error` session — those finished
+        // cleanly and resume is just continuation, not recovery)
+        // and reports the true prior status in the emitted event.
+        try {
+          const intermediate = projectRecap(config.db, {
+            scope: { kind: 'session_specific', sessionId: resumeId },
+            now: Date.now(),
+          });
+          const block = buildResumeContext({
+            intermediate,
+            previousStatus: preResumeStatus,
+            resumedAt: Date.now(),
+          });
+          effectiveUserPrompt = `${block.text}\n\n${config.userPrompt}`;
+          safeEmit(config.onEvent, {
+            type: 'resume_rehydrated',
+            sessionId,
+            previousStatus: preResumeStatus,
+            decisionCount: block.decisionCount,
+            pinCount: block.pinCount,
+            todoCount: block.todoCount,
+            truncated: block.truncated,
+            degraded: block.degraded,
+          });
+        } catch (e) {
+          // Don't let rehydrate failure break resume. The plain
+          // prompt still works; auto-rehydrate is defense-in-
+          // depth, not a correctness path. Emit a diagnostic so
+          // the operator sees WHY their `[resume_context]` block
+          // is missing — silently swallowing would leave them
+          // wondering whether the spec's §7.6 promise was even
+          // attempted.
+          const reason = e instanceof Error ? e.message : String(e);
+          safeEmit(config.onEvent, {
+            type: 'resume_rehydrate_failed',
+            sessionId,
+            reason,
+          });
+        }
+      }
+
       // Skip appending when userPrompt is empty. The preassigned
       // path with parent-seeded conversation passes '' here; the
       // hydration above already loaded the seed, so a second
@@ -1353,7 +1460,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         const userMsg = appendMessage(config.db, {
           sessionId,
           role: 'user',
-          content: config.userPrompt,
+          content: effectiveUserPrompt,
           // null on first turn (new session); tail id on resume
           // / preassigned so the chain stays connected.
           // appendMessage validates the parent belongs to the
@@ -1361,7 +1468,7 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
           ...(priorTailId !== null ? { parentId: priorTailId } : {}),
         });
         lastMessageId = userMsg.id;
-        messages.push({ role: 'user', content: config.userPrompt });
+        messages.push({ role: 'user', content: effectiveUserPrompt });
       } else if (priorTailId !== null) {
         // No new user message to append; the prior tail id
         // becomes the lastMessageId we report on the result and

@@ -29,6 +29,8 @@ import { migration028SubagentRunsContextRecipe } from './028-subagent-runs-conte
 import { migration029SubagentProcesses } from './029-subagent-processes.ts';
 import { migration030RecapRuns } from './030-recap-runs.ts';
 import { migration031CritiqueRuns } from './031-critique-runs.ts';
+import { migration032RecapCache } from './032-recap-cache.ts';
+import { migration033RecapRunsCost } from './033-recap-runs-cost.ts';
 
 export interface Migration {
   id: number;
@@ -68,4 +70,6 @@ export const MIGRATIONS: readonly Migration[] = [
   migration029SubagentProcesses,
   migration030RecapRuns,
   migration031CritiqueRuns,
+  migration032RecapCache,
+  migration033RecapRunsCost,
 ];
