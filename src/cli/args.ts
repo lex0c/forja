@@ -301,13 +301,16 @@ const parseInitSubcommand = (argv: readonly string[]): ParseResult | null => {
 // line (same convention as `init`); when present, every following
 // token is collected into `args.recap.args` verbatim and the
 // slash-side parser does the heavy lifting in `runRecapHeadless`.
-// `--json` is consumed at the top-level scan that wraps this
-// subcommand (the dispatcher sets it before routing), so the
-// headless handler decides "NDJSON or rendered text" from
-// `args.json`.
+// `--json` and `--model` are consumed at the top-level scan that
+// wraps this subcommand (the dispatcher sets them before routing),
+// so the headless handler decides "NDJSON or rendered text" from
+// `args.json` and bootstrap reads `args.model` for provider
+// selection — leaving these in `recapArgs` would surface them as
+// "unknown flag" inside the slash-side parser.
 const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
   if (argv.length === 0 || argv[0] !== 'recap') return null;
   let json = false;
+  let model: string | undefined;
   const recapArgs: string[] = [];
   let i = 1;
   while (i < argv.length) {
@@ -340,6 +343,32 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       i += 1;
       continue;
     }
+    if (token === '--model') {
+      // Top-level `--model <id>` — picks the provider used by
+      // bootstrap when wiring the headless LLM render path.
+      // Without this extraction, the slash-side parser would
+      // see `--model` and reject it as an unknown flag, leaving
+      // operators no way to override the model for `agent recap`.
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith('-')) {
+        return { ok: false, message: '--model requires a value' };
+      }
+      model = value;
+      i += 2;
+      continue;
+    }
+    if (token.startsWith('--model=')) {
+      // `--model=<id>` single-token form — disambiguates a model
+      // id that legitimately starts with `-` (none in the registry
+      // today, but the form is consistent with other parsers).
+      const value = token.slice('--model='.length);
+      if (value.length === 0) {
+        return { ok: false, message: '--model= requires a value' };
+      }
+      model = value;
+      i += 1;
+      continue;
+    }
     // Every other token — including recap-specific flags
     // (`--no-llm-render`, `--out`, `--limit`, `--project`, etc.)
     // and positional subcommand verbs (`pr`, `last`, `session`,
@@ -362,6 +391,7 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       explainPermissions: false,
       yes: false,
       recap: { args: recapArgs },
+      ...(model !== undefined ? { model } : {}),
     },
   };
 };

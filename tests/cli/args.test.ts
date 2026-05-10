@@ -896,4 +896,42 @@ describe('parseArgs — recap subcommand', () => {
     if (!r.ok) return;
     expect(r.args.recap?.args).toEqual(['list', '--since', '2026-05-01', '--limit', '50']);
   });
+
+  test('--model <id> is consumed at top-level, not forwarded to recap args', () => {
+    // Regression: pre-fix `--model` was forwarded into recap args
+    // and the slash-side parser rejected it as an unknown flag,
+    // making model selection for `agent recap` impossible despite
+    // run() honoring args.model when bootstrapping the provider.
+    const r = parseArgs(['recap', 'pr', '--model', 'anthropic/claude-haiku-4-5']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.model).toBe('anthropic/claude-haiku-4-5');
+    // --model + value extracted from the forwarded args.
+    expect(r.args.recap?.args).toEqual(['pr']);
+  });
+
+  test('--model=<id> single-token form also extracts to args.model', () => {
+    const r = parseArgs(['recap', 'pr', '--model=anthropic/claude-haiku-4-5']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.model).toBe('anthropic/claude-haiku-4-5');
+    expect(r.args.recap?.args).toEqual(['pr']);
+  });
+
+  test('--model without a value is a parse error', () => {
+    const r = parseArgs(['recap', '--model']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--model requires a value');
+  });
+
+  test('--model with a flag-shaped value is a parse error (no silent swallow)', () => {
+    // Same defense as the slash-side parsers: refuse `--model
+    // --json` so the operator's intended toggle isn't silently
+    // consumed as the model id.
+    const r = parseArgs(['recap', '--model', '--json']);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.message).toContain('--model requires a value');
+  });
 });
