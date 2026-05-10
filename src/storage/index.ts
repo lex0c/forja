@@ -60,6 +60,22 @@ export type {
 } from './repos/approvals.ts';
 
 export {
+  appendApprovalsLog,
+  countApprovalsLog,
+  getApprovalsLogBySeq,
+  getLastApprovalsLogByInstall,
+  listApprovalsLogByInstall,
+  listApprovalsLogBySession,
+  PERSISTED_COLUMNS as APPROVALS_LOG_COLUMNS,
+} from './repos/approvals-log.ts';
+export type {
+  AppendApprovalsLogInput,
+  ApprovalLogConfidence,
+  ApprovalLogDecision,
+  ApprovalLogRow,
+} from './repos/approvals-log.ts';
+
+export {
   advanceBgProcessStderrCursor,
   advanceBgProcessStdoutCursor,
   finalizeBgProcess,

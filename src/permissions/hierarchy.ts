@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { defaultPolicy, loadPolicyFromFile } from './config.ts';
+import { type ParsePolicyContext, defaultPolicy, loadPolicyFromFile } from './config.ts';
 import { enterprisePolicyPath, projectPolicyPath, userPolicyPath } from './paths.ts';
 import type { Policy, PolicyDefaults, PolicyMode, PolicyToolsSection } from './types.ts';
 
@@ -79,6 +79,13 @@ export interface ResolveOptions {
   // Inject the env table for path discovery. Lets tests run with a
   // controlled XDG_CONFIG_HOME without touching process.env.
   env?: NodeJS.ProcessEnv;
+  // Home directory used by parsePolicy when validating protected
+  // path patterns (PERMISSION_ENGINE.md §11). When omitted, the
+  // protected-paths check is skipped — tests typically omit; the
+  // production bootstrap passes the operator's HOME explicitly so
+  // a malformed policy file fails load instead of failing at first
+  // tool call.
+  home?: string;
 }
 
 const SECTION_KEYS: readonly (keyof PolicyToolsSection)[] = [
@@ -96,6 +103,15 @@ const SECTION_KEYS: readonly (keyof PolicyToolsSection)[] = [
 const loadLayers = (options: ResolveOptions): LayerPolicy[] => {
   const out: LayerPolicy[] = [];
 
+  // Same parse context for every layer. Each loaded policy file runs
+  // through the same §11 validation; a higher layer (e.g. enterprise)
+  // that ships a protected-path redefinition fails the entire boot,
+  // not just its own layer.
+  const parseCtx: ParsePolicyContext = {
+    cwd: options.cwd,
+    ...(options.home !== undefined ? { home: options.home } : {}),
+  };
+
   const enterprisePath =
     options.enterprisePath === null
       ? null
@@ -103,7 +119,7 @@ const loadLayers = (options: ResolveOptions): LayerPolicy[] => {
   if (enterprisePath !== null && existsSync(enterprisePath)) {
     out.push({
       layer: 'enterprise',
-      policy: loadPolicyFromFile(enterprisePath),
+      policy: loadPolicyFromFile(enterprisePath, parseCtx),
       path: enterprisePath,
     });
   }
@@ -111,12 +127,20 @@ const loadLayers = (options: ResolveOptions): LayerPolicy[] => {
   const userPath =
     options.userPath === null ? null : (options.userPath ?? userPolicyPath(options.env));
   if (userPath !== null && existsSync(userPath)) {
-    out.push({ layer: 'user', policy: loadPolicyFromFile(userPath), path: userPath });
+    out.push({
+      layer: 'user',
+      policy: loadPolicyFromFile(userPath, parseCtx),
+      path: userPath,
+    });
   }
 
   const projPath = projectPolicyPath(options.cwd);
   if (existsSync(projPath)) {
-    out.push({ layer: 'project', policy: loadPolicyFromFile(projPath), path: projPath });
+    out.push({
+      layer: 'project',
+      policy: loadPolicyFromFile(projPath, parseCtx),
+      path: projPath,
+    });
   }
 
   if (options.session !== undefined) {

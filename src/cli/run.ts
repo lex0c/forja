@@ -168,6 +168,30 @@ export const run = async (options: RunOptions): Promise<number> => {
       });
     }
 
+    // `agent permission <verb>` — DB-only operator surface for the
+    // v2 permission engine. The 'verify' verb walks the audit hash
+    // chain and exits 0 (intact) / 1 (broken). No provider, no
+    // harness, no session start; reads the operator's session DB
+    // and the per-install install_id only.
+    if (args.permission !== undefined) {
+      const { runPermissionVerify } = await import('./permission-verify.ts');
+      if (args.permission.verb === 'verify') {
+        return await runPermissionVerify({
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      // The arg parser already rejects unknown verbs; this branch
+      // catches the impossible-but-safe case of a verb the dispatch
+      // doesn't know how to route.
+      errSink(`forja permission: verb '${args.permission.verb}' has no handler\n`);
+      return 1;
+    }
+
     // `agent recap [args]` headless surface (RECAP §9). Tries to
     // bootstrap the real provider so `agent recap pr` exercises
     // the LLM surface when an API key is configured — bootstrap

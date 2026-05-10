@@ -1,0 +1,71 @@
+# Conformance: static rule matching (PERMISSION_ENGINE.md §6.2)
+# Cover the rule precedence (deny > session > allow > confirm),
+# the search-tool root semantics, and the default-deny fallback.
+
+- name: "deny rule wins over allow"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["rm *"]
+          deny: ["rm -rf *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "rm -rf /tmp/x"
+  expect:
+    kind: "deny"
+    source_section: "bash"
+
+- name: "allow rule produces allow"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["git status"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git status"
+  expect:
+    kind: "allow"
+    source_section: "bash"
+
+- name: "confirm rule produces confirm"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        bash:
+          confirm: ["git push *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git push origin main"
+  expect:
+    kind: "confirm"
+    source_section: "bash"
+
+- name: "default-deny when no rule matches"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["git status"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "curl example.com"
+  expect:
+    kind: "deny"

@@ -15,6 +15,92 @@ Format:
 
 ---
 
+## [2026-05-10] permission-engine-v2 — slice 1: audit hash-chain + protected paths
+
+**Done.** First slice of the v2 evolution of the permission engine, aligned with the new spec doc `docs/spec/PERMISSION_ENGINE.md`. Additive layer on top of the v1 contract — `engine.check()` keeps its signature, hierarchy resolver and matchers untouched. The v1 `approvals` table (CONTRACTS §9, FK to `tool_calls`) stays as the external contract; the v2 `approvals_log` ledger is the internal append-only chain.
+
+### Why this first
+
+The v2 spec lists 23 areas. Three were defensible as the first slice (state machine, capabilities + resolver, audit chain). Audit chain wins because it's purely additive — it doesn't refactor any contract, doesn't gate any other slice, and it's the foundation for every later piece (replay tool, calibration telemetry, sealing, conformance suite). Protected paths come along on the same slice because they're cheap defense-in-depth that complements the audit ledger: every `confirm`/`deny` produced by a protected-path interception lands in the chain with a stable `source.section='protected'` for forensics.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `docs/spec/PERMISSION_ENGINE.md` | New (was untracked at branch start). Authoritative spec for v2 — referenced by every later slice. Committed before the implementation lands. |
+| `src/permissions/protected_paths.ts` | New. Hardcoded list per spec §11 with two-tier semantics: `deny` (`/proc`, `/sys`, `/boot`, `/dev`, `.git`, `.agent`, `.claude` for writes) vs `escalate` (`/etc`, `~/.bashrc`, `~/.zshrc`, `~/.profile`, `~/.bash_profile`, `~/.config/agent`, `~/.config/claude`). `classify(absPath, op)` returns `'deny' \| 'escalate' \| null`. |
+| `src/permissions/engine.ts` | `checkPath` consults `classify` after rule lookup. Tier `deny` overrides any rule (defense in depth). Tier `escalate` upgrades `allow` → `confirm` (never downgrades a `deny`). Bash-side `rm`/`rmdir` enforcement is deferred to the bash-AST resolver slice — explicitly called out as a known gap. |
+| `src/permissions/config.ts` | `parsePolicy` rejects allow/confirm patterns that cover protected paths. Heuristic: any literal that resolves to a prefix of a protected path is rejected with `'protected_paths_redefined'`. |
+| `src/permissions/install_id.ts` | New. `ensureInstallId(env)` reads/writes `~/.config/agent/install_id` as JSON `{install_id, created_at_ms}`, mode 0600. Idempotent. |
+| `src/permissions/paths.ts` | `installIdPath()` analogous to `userPolicyPath`. |
+| `src/permissions/canonical.ts` | New. Hand-rolled canonical JSON encoder (RFC 8785 essentials: lex-sorted keys, no whitespace, no trailing comma). ~40 LOC, no external dep. |
+| `src/permissions/audit.ts` | New. `AuditSink` interface (`emit(decision, ctx)`, `verifyChain()`). `createSqliteSink(db, opts)` bumps a per-install monotonic seq, computes `this_hash = sha256(prev_hash ‖ canonical_row)` (`prev_hash` for seq=1 is the genesis derived from `install_id ‖ created_at_ms`). `verifyChain` walks 1..N, recomputes, returns `{ ok, brokenAt? }`. |
+| `src/storage/migrations/034-approvals-log.ts` | New. Full schema from spec §7.1 — `seq AUTOINCREMENT`, `ts`, `install_id`, `session_id`, `parent_approval_id`, `tool_name`, `tool_version`, `resolver_version`, `args_hash`, `capabilities_json` default `'[]'`, `decision`, `score` default `0`, `score_components_json` default `'{}'`, `confidence` default `'high'`, `classifier_hash`/`classifier_adjust` nullable, `policy_hash`, `sandbox_profile` nullable, `ttl_expires_at` nullable, `reason_chain_json`, `prev_hash`, `this_hash`. Indexes on `session_id` and `ts`. The columns for capabilities/score/classifier are nullable / stub-defaulted now and will fill organically as later slices land — no migration churn expected. |
+| `src/storage/repos/approvals-log.ts` | New. `appendApprovalLog`, `getLastApprovalLog`, `listApprovalsLogBySession`, `verifyChainRows`. |
+| `src/permissions/engine.ts` | `EngineOptions` gains `audit?: AuditSink`. `check()` produces `policy_hash` once at construction (`canonicalize(policy)` → sha256), `args_hash` per call, emits to sink before returning. Default sink is no-op so tests don't pay SQLite tax. |
+| `src/permissions/hierarchy.ts` | `ResolveOptions` gains `home?: string`. When supplied, propagates to each layer's `parsePolicy` so §11 redefinition rejection happens at load time across enterprise + user + project. |
+| `src/permissions/index.ts` | Re-exports the new surface (`audit`, `install_id`, `canonical`, `protected_paths`, `ParsePolicyContext`, `installIdPath`). |
+| `src/storage/index.ts` | Re-exports `approvals-log` repo functions and types alongside the existing `approvals` repo (the v1 table remains untouched). |
+| `src/cli/args.ts` | New `permission?: { verb; positionals }` field on `ParsedArgs` + `parsePermissionSubcommand`. Accepts `verify` verb today; unknown verbs fail parse with a help-style error. |
+| `src/cli/permission-verify.ts` | New. `agent permission verify` walks `approvals_log` for the active install_id, prints `intact (N rows)` or `BROKEN at seq M` plus expected/actual hashes. Exit code 0 / 1. `--json` toggles single-line NDJSON form for hooks/CI. |
+| `src/cli/run.ts` | Wires the `permission verify` subcommand alongside `--explain-permissions` and `--list-sessions`. |
+| `tests/permissions/protected_paths.test.ts` | New. 34 tests: deny tier per system root, escalate tier per path category, look-alike segment boundaries, supplied-home/cwd honored. |
+| `tests/permissions/canonical.test.ts` | New. 26 tests: primitives, escape sequences, key ordering (UTF-16 code unit), chain determinism, sha256/canonicalHash invariants. |
+| `tests/permissions/audit.test.ts` | New. 16 tests: noop sink, genesis derivation, sequential emit, NOT-NULL stub defaults, args_hash semantic invariance, tampered prev_hash detection, tampered content detection, forged-row detection, cross-install chain isolation. |
+| `tests/permissions/install_id.test.ts` | New. 7 tests: first-call creates 0600 file, idempotent on second call, malformed JSON/shape rejected, missing-config-dir throws, discovery via `HOME`. |
+| `tests/permissions/engine.test.ts` | +21 tests in two new `describe` blocks: protected paths integration (10) and audit emission (8). |
+| `tests/permissions/config.test.ts` | +10 tests for §11 protected-path redefinition rejection in `parsePolicy` (allow/confirm flagged, deny welcome, catch-all globs allowed, error references PERMISSION_ENGINE.md §11). |
+| `tests/cli/permission-verify.test.ts` | New. 13 tests: arg parsing surface (verb/--json/--help/missing/unknown verb/positionals), runner happy path, broken chain diagnostic, --json NDJSON shape, install_id discovery failure. |
+| `tests/conformance/` | New. YAML loader (`index.ts`) + Bun test driver (`conformance.test.ts`) + seed cases (`cases/protected_paths.yaml` 8 cases, `cases/static_rules.yaml` 4 cases). Spec §16 calls for ≥136 cases for GA; this slice ships 12. Future slices grow the suite per category (capability resolver, bash adversarial, path traversal, ttl, subagent, …). |
+
+### Verification
+
+- `bun run typecheck` — clean (0 errors)
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched, flagged in prior backlog entry)
+- `bun test` — **4764 pass / 10 skip / 0 fail** (4774 total across 229 files). +146 net new tests vs the pre-slice baseline (4618), spread across:
+  - `tests/permissions/canonical.test.ts` (+26)
+  - `tests/permissions/protected_paths.test.ts` (+34)
+  - `tests/permissions/install_id.test.ts` (+7)
+  - `tests/permissions/audit.test.ts` (+16)
+  - `tests/permissions/engine.test.ts` (+21)
+  - `tests/permissions/config.test.ts` (+10)
+  - `tests/cli/permission-verify.test.ts` (+13)
+  - `tests/conformance/` (+13 — 12 cases + 1 file-discovery sanity check)
+  - +6 net from other paths (existing tests touched through the engine wiring)
+- Conformance suite: 12 seed cases pass (8 protected paths + 4 static rules); driver discovers + executes any new `tests/conformance/cases/*.yaml` automatically.
+
+### Wired but deferred
+
+- **Audit sink at production bootstrap.** `EngineOptions.audit` accepts a sink; this slice plumbed the sink type through and made the engine emit. Production `bootstrap.ts` still constructs the engine without a sink (default no-op). Wiring the real sink is one short follow-up: pass `createSqliteSink({ db, identity })` + `sessionId` + `home` into `createPermissionEngine`. Deliberately split because the engine-side change is what needed conformance + isolation; the bootstrap call site is a 5-line stitching change that earns more value when paired with the state-machine slice (which gates engine startup behind `verifyChain` anyway).
+- **Hot reload (§12.3).** The engine reads `policy` once at construction. File-watch + swap is its own slice.
+- **Sealing externo (§7.3).** Documented; chain alone shipped this slice.
+- **Bash-side protected paths.** `rm -rf /etc` via the bash tool consults `tools.bash`, not `tools.write_file`. Closing the gap needs the bash AST resolver (§5.2). Today's mitigation is the `agent init` baseline deny list (`rm -rf /*`, `rm -rf /`) — known limitation in this entry; closed by the bash-resolver slice.
+
+### Decisions
+
+- **Full schema now, stub-default future columns.** Spec §7.1 lists 21 columns; only ~10 are populated by this slice (`tool_name`, `args_hash`, `decision`, `policy_hash`, `reason_chain_json`, `prev_hash`, `this_hash`, `ts`, `install_id`, `session_id`). The other 11 (`capabilities_json`, `score`, `score_components_json`, `confidence`, `classifier_hash/adjust`, `sandbox_profile`, `ttl_expires_at`, `tool_version`, `resolver_version`, `parent_approval_id`) take stable defaults documented in the migration so later slices fill them without altering the table. Rationale: a hash chain is most valuable when its row shape is stable across versions — a row written today must verify identically a year from now. Choosing minimal-now and migrating later would either churn the chain (recompute every hash) or accept a chain split (two ledgers).
+- **Hand-rolled canonical JSON, not RFC 8785-complete.** The full RFC handles JSON-LD edge cases, scientific notation, and Unicode normalization that the audit row never exercises. ~40 LOC covering sorted keys + no whitespace + numeric canonical form is enough for this use; the alphabet-locked stack stays dep-free. If a future slice needs a federated audit (cross-install replay), revisit.
+- **`Bun.CryptoHasher` over `node:crypto`.** Native, faster, aligned with `bun:sqlite`/`Bun.Glob` choices already in the codebase.
+- **Two-tier protected paths, no third "warn" tier.** Spec §11 is binary (`deny direto` vs `escala pra confirm no mínimo`). Adding a "warn but allow" tier is feature creep; operators who want a soft signal can drop their own warn-style rules in the policy. The two-tier mapping matches the spec table verbatim.
+- **Bash-side protected-path enforcement deferred.** A `bash` tool call running `rm -rf /etc` doesn't pass through `checkPath` — it consults the bash policy. Catching that needs the bash-AST resolver from §5.2 which is its own slice. Logged as known limitation in this entry; closed by the bash resolver slice.
+- **Audit sink is opt-in via `EngineOptions.audit`.** Tests build engines without it (default no-op sink) to avoid the SQLite tax. Production bootstrap will inject the real sink in a follow-up. Mirrors how `provenance` is optional and keeps the engine pure-function-friendly for unit tests.
+- **`agent permission verify` lands minimal.** Just integrity check + exit code. The richer replay tool (spec §17 with `--against-current-policy`, `--without-classifier`, diff modes) is a separate slice — it depends on args being persisted in the session DB (which v1 doesn't do reliably yet) and on `policy_archive` for cross-version replay.
+- **Sealing externo (worm/rfc3161/s3) deferred.** Spec §7.3 documents it as opt-in for regulated deployment. Local-CLI ships the chain alone and earns most of the value (parcial-edit detection); sealing closes the residual root-level adversary class which is fora do escopo de §20.
+- **State machine `init`/`loading`/`ready`/`refusing` not in this slice.** A broken chain *will* set a flag in the audit sink's verify result and a future state machine slice consults it. For now, `verifyChain` returns `{ ok: false, brokenAt }` and the bootstrap or operator must act on it. Clean separation.
+- **§11 redefinition validator is conservative.** `parsePolicy` flags only patterns that target a protected path WITHOUT relying on engine-wide catch-alls (`/etc/hosts`, `/etc/**`, `/proc/...`, `~/.bashrc`). `/**` and `**` legitimately cover the whole filesystem and stay valid — the runtime classifier handles their matches against protected targets at decision time. Flagging catch-alls would break the common "allow under cwd" pattern operators write today.
+
+### Next
+
+Successor slices (in spec order, defensive ordering):
+1. State machine + bootstrap formal (consumes broken-chain signal from this slice; wires the audit sink into the bootstrap).
+2. Capabilities + resolver per-tool (refactor of `check`).
+3. Risk score determinístico.
+4. Bash AST resolver (closes the bash-side protected-path gap).
+5. Subagent intersection formal.
+6. Sandbox plan integration (bwrap profile selection).
+
+---
+
 ## [2026-05-10] m4/distribution — code-review fixes (sourcemap collision, release.yml tag pinning, SBOM rewrite, install.sh hardening)
 
 **Done:** Closes the punch list from an independent code review of the previous two slices on `feat/m4-distribution`. Eight findings, three categories: must-fix correctness/security, should-fix follow-ups, test gaps. All resolved on the same branch.

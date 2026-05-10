@@ -1,0 +1,142 @@
+# Conformance: protected paths (PERMISSION_ENGINE.md §11)
+# Each case asserts that the engine's enforcement of hardcoded
+# protected paths is deterministic and rule-independent. Cases
+# fail on any divergence in decision kind, source.section, or
+# reason substring.
+
+- name: "deny tier — write to /proc denies even with broad allow"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["/**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      path: "/proc/cpuinfo"
+  expect:
+    kind: "deny"
+    source_section: "protected"
+    reason_substring: "protected zone"
+
+- name: "deny tier — read /sys denies despite broad allow"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        read_file:
+          allow_paths: ["/**"]
+  input:
+    tool: "read_file"
+    category: "fs.read"
+    args:
+      path: "/sys/class/net/lo"
+  expect:
+    kind: "deny"
+    source_section: "protected"
+
+- name: "deny tier — /boot writes denied"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["/**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      path: "/boot/grub.cfg"
+  expect:
+    kind: "deny"
+    source_section: "protected"
+
+- name: "escalate tier — /etc write upgrades allow → confirm"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["/**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      path: "/etc/hosts"
+  expect:
+    kind: "confirm"
+    source_section: "write_file"
+    reason_substring: "escalated"
+
+- name: "escalate tier — ~/.bashrc write upgrades allow → confirm"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["/**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      path: "/home/op/.bashrc"
+  expect:
+    kind: "confirm"
+    source_section: "write_file"
+
+- name: "escalate tier — reads pass through unchanged"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        read_file:
+          allow_paths: ["/**"]
+  input:
+    tool: "read_file"
+    category: "fs.read"
+    args:
+      path: "/etc/hosts"
+  expect:
+    kind: "allow"
+
+- name: "unprotected path still allows normally"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      path: "/work/proj/src/index.ts"
+  expect:
+    kind: "allow"
+
+- name: "deny rule wins over protected escalate"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["/**"]
+          deny_paths: ["/etc/passwd"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      path: "/etc/passwd"
+  expect:
+    kind: "deny"
+    source_section: "write_file"

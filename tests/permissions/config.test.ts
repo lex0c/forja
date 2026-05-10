@@ -103,3 +103,81 @@ describe('defaultPolicy', () => {
     expect(p.tools).toEqual({});
   });
 });
+
+describe('parsePolicy — protected paths (§11)', () => {
+  const ctx = { home: '/home/op', cwd: '/work/proj' };
+
+  test('rejects allow_paths that targets a protected file directly', () => {
+    expect(() =>
+      parsePolicy({ tools: { write_file: { allow_paths: ['/etc/hosts'] } } }, ctx),
+    ).toThrow(/redefines a protected path/);
+  });
+
+  test('rejects allow_paths that targets /etc with descend', () => {
+    expect(() => parsePolicy({ tools: { write_file: { allow_paths: ['/etc/**'] } } }, ctx)).toThrow(
+      /redefines a protected path/,
+    );
+  });
+
+  test('rejects allow_paths that targets exact protected root', () => {
+    expect(() => parsePolicy({ tools: { write_file: { allow_paths: ['/proc'] } } }, ctx)).toThrow(
+      /redefines a protected path/,
+    );
+  });
+
+  test('rejects allow_paths targeting tilde-protected file', () => {
+    expect(() =>
+      parsePolicy({ tools: { write_file: { allow_paths: ['~/.bashrc'] } } }, ctx),
+    ).toThrow(/redefines a protected path/);
+  });
+
+  test('rejects confirm_paths with same protected redefinition', () => {
+    expect(() =>
+      parsePolicy({ tools: { write_file: { confirm_paths: ['/proc/sys/kernel'] } } }, ctx),
+    ).toThrow(/redefines a protected path/);
+  });
+
+  test('accepts deny_paths for protected (reinforcement is welcome)', () => {
+    expect(() =>
+      parsePolicy({ tools: { write_file: { deny_paths: ['/etc/**', '~/.bashrc'] } } }, ctx),
+    ).not.toThrow();
+  });
+
+  test('accepts broad catch-all globs (engine handles via runtime classifier)', () => {
+    // `/**` and `**` legitimately cover the whole filesystem;
+    // they get caught at decision time by the protected-path
+    // classifier. Flagging them at parse time would break the
+    // ergonomic "allow everywhere" + protected-path-fallback
+    // pattern operators write today.
+    expect(() =>
+      parsePolicy({ tools: { write_file: { allow_paths: ['/**'] } } }, ctx),
+    ).not.toThrow();
+    expect(() =>
+      parsePolicy({ tools: { write_file: { allow_paths: ['**'] } } }, ctx),
+    ).not.toThrow();
+  });
+
+  test('error message points at PERMISSION_ENGINE.md §11', () => {
+    expect(() =>
+      parsePolicy({ tools: { write_file: { allow_paths: ['/etc/passwd'] } } }, ctx),
+    ).toThrow(/PERMISSION_ENGINE\.md §11/);
+  });
+
+  test('skips check when context has no home/cwd (compat path)', () => {
+    expect(() =>
+      parsePolicy({ tools: { write_file: { allow_paths: ['/etc/hosts'] } } }),
+    ).not.toThrow();
+  });
+
+  test('cwd-rooted protected dirs (.git, .agent, .claude) flagged', () => {
+    expect(() =>
+      parsePolicy({ tools: { write_file: { allow_paths: ['/work/proj/.git/**'] } } }, ctx),
+    ).toThrow(/redefines a protected path/);
+    expect(() =>
+      parsePolicy(
+        { tools: { write_file: { allow_paths: ['/work/proj/.agent/sessions.db'] } } },
+        ctx,
+      ),
+    ).toThrow(/redefines a protected path/);
+  });
+});

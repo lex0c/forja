@@ -32,9 +32,37 @@ export {
   loadPolicyFromString,
   parsePolicy,
 } from './config.ts';
+export type { ParsePolicyContext } from './config.ts';
+
+export type {
+  AuditEmitInput,
+  AuditSink,
+  EmittedRow,
+  ReasonChainEntry,
+  VerifyResult,
+} from './audit.ts';
+export { computeGenesisHash, createNoopSink, createSqliteSink } from './audit.ts';
+
+export type { InstallIdentity, EnsureInstallIdOptions } from './install_id.ts';
+export { ensureInstallId } from './install_id.ts';
+
+export {
+  allProtectedRoots,
+  classifyProtectedPath,
+  protectedTargets,
+} from './protected_paths.ts';
+export type {
+  ProtectedClassifyInput,
+  ProtectedOp,
+  ProtectedTargets,
+  ProtectedTier,
+} from './protected_paths.ts';
+
+export { canonicalHash, canonicalize, sha256Hex } from './canonical.ts';
 
 export {
   enterprisePolicyPath,
+  installIdPath,
   projectPolicyPath,
   userPolicyPath,
 } from './paths.ts';

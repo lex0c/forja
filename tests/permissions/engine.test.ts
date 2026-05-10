@@ -1024,3 +1024,284 @@ describe('addSessionAllow (runtime "Yes, don\'t ask again for: <rule>")', () => 
     expect(eng.check('bash', 'bash', { command: 'pwd' }).kind).toBe('allow');
   });
 });
+
+describe('engine.check — protected paths (§11 integration)', () => {
+  // Most tests cwd at /work/proj so we have a stable handle on
+  // `.git/`, `.agent/`, `.claude/` for cwd-relative protected dirs.
+  const PROJ = '/work/proj';
+  const HOME = '/home/op';
+
+  test('deny tier (/proc) blocks writes regardless of allow rule', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { write_file: { allow_paths: ['/**'] } } }),
+      { cwd: PROJ, home: HOME },
+    );
+    const d = eng.check('write_file', 'fs.write', { path: '/proc/sys/kernel/randomize_va_space' });
+    expect(d.kind).toBe('deny');
+    if (d.kind === 'deny') {
+      expect(d.reason).toContain('protected zone');
+      expect(d.source?.section).toBe('protected');
+    }
+  });
+
+  test('deny tier (/proc) blocks reads as well', () => {
+    const eng = createPermissionEngine(policy({ tools: { read_file: { allow_paths: ['/**'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+    });
+    const d = eng.check('read_file', 'fs.read', { path: '/proc/1/environ' });
+    expect(d.kind).toBe('deny');
+  });
+
+  test('deny tier (/sys, /boot) blocks any op', () => {
+    const eng = createPermissionEngine(
+      policy({
+        tools: {
+          read_file: { allow_paths: ['/**'] },
+          write_file: { allow_paths: ['/**'] },
+        },
+      }),
+      { cwd: PROJ, home: HOME },
+    );
+    expect(eng.check('read_file', 'fs.read', { path: '/sys/class/net/lo' }).kind).toBe('deny');
+    expect(eng.check('write_file', 'fs.write', { path: '/boot/grub.conf' }).kind).toBe('deny');
+  });
+
+  test('escalate tier (/etc) upgrades allow to confirm for writes', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { write_file: { allow_paths: ['/**'] } } }),
+      { cwd: PROJ, home: HOME },
+    );
+    const d = eng.check('write_file', 'fs.write', { path: '/etc/hosts' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') {
+      expect(d.reason).toContain('protected zone');
+      expect(d.reason).toContain('escalated');
+      expect(d.source?.section).toBe('write_file');
+      expect(d.source?.rule).toBe('/**');
+    }
+  });
+
+  test('escalate tier (~/.bashrc) upgrades allow to confirm for writes', () => {
+    const eng = createPermissionEngine(
+      policy({ tools: { write_file: { allow_paths: ['/**'] } } }),
+      { cwd: PROJ, home: HOME },
+    );
+    const d = eng.check('write_file', 'fs.write', { path: '/home/op/.bashrc' });
+    expect(d.kind).toBe('confirm');
+  });
+
+  test('escalate tier passes reads through (no upgrade)', () => {
+    const eng = createPermissionEngine(policy({ tools: { read_file: { allow_paths: ['/**'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+    });
+    expect(eng.check('read_file', 'fs.read', { path: '/etc/hosts' }).kind).toBe('allow');
+    expect(eng.check('read_file', 'fs.read', { path: '/home/op/.bashrc' }).kind).toBe('allow');
+  });
+
+  test('escalate tier upgrades session-allow to confirm too', () => {
+    const eng = createPermissionEngine(policy({ tools: { write_file: { allow_paths: [] } } }), {
+      cwd: PROJ,
+      home: HOME,
+    });
+    eng.addSessionAllow('write_file', '/etc/hosts');
+    const d = eng.check('write_file', 'fs.write', { path: '/etc/hosts' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') {
+      expect(d.source?.layer).toBe('session');
+    }
+  });
+
+  test('escalate tier blocks acceptEdits auto-accept', () => {
+    // Without protected paths, acceptEdits would silently allow
+    // a confirm_paths-matching write. With protected paths in play,
+    // the auto-accept must NOT fire — §11 trumps acceptEdits.
+    const eng = createPermissionEngine(
+      policy({
+        defaults: { mode: 'acceptEdits' },
+        tools: { write_file: { confirm_paths: ['/**'] } },
+      }),
+      { cwd: PROJ, home: HOME },
+    );
+    expect(eng.check('write_file', 'fs.write', { path: '/etc/hosts' }).kind).toBe('confirm');
+    // Outside protected: acceptEdits still works.
+    expect(eng.check('write_file', 'fs.write', { path: '/work/proj/src/foo.ts' }).kind).toBe(
+      'allow',
+    );
+  });
+
+  test('cwd-relative protected dirs (.git/, .agent/, .claude/) escalate writes', () => {
+    const eng = createPermissionEngine(policy({ tools: { write_file: { allow_paths: ['**'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+    });
+    expect(eng.check('write_file', 'fs.write', { path: '/work/proj/.git/HEAD' }).kind).toBe(
+      'confirm',
+    );
+    expect(
+      eng.check('write_file', 'fs.write', { path: '/work/proj/.agent/sessions.db' }).kind,
+    ).toBe('confirm');
+    expect(
+      eng.check('write_file', 'fs.write', { path: '/work/proj/.claude/settings.json' }).kind,
+    ).toBe('confirm');
+  });
+
+  test('unprotected paths are not affected', () => {
+    const eng = createPermissionEngine(
+      policy({
+        tools: { write_file: { allow_paths: ['**'], confirm_paths: [] } },
+        defaults: { mode: 'acceptEdits' },
+      }),
+      { cwd: PROJ, home: HOME },
+    );
+    expect(eng.check('write_file', 'fs.write', { path: '/work/proj/src/index.ts' }).kind).toBe(
+      'allow',
+    );
+  });
+
+  test('deny rule still wins over protected escalate', () => {
+    const eng = createPermissionEngine(
+      policy({
+        tools: { write_file: { allow_paths: ['/**'], deny_paths: ['/etc/passwd'] } },
+      }),
+      { cwd: PROJ, home: HOME },
+    );
+    // /etc/passwd has BOTH a deny rule (specific) and an allow rule
+    // (broad) AND is in the protected escalate tier. Outcome must
+    // be deny — protected escalate doesn't downgrade a deny.
+    const d = eng.check('write_file', 'fs.write', { path: '/etc/passwd' });
+    expect(d.kind).toBe('deny');
+  });
+});
+
+describe('engine.check — audit emission', () => {
+  const PROJ = '/work/proj';
+  const HOME = '/home/op';
+
+  interface CapturedEmit {
+    session_id: string;
+    tool_name: string;
+    decision: 'allow' | 'deny' | 'confirm';
+    policy_hash: string;
+    reason_chain: ReadonlyArray<{
+      stage: string;
+      layer?: string;
+      rule?: string;
+      section?: string;
+      note?: string;
+    }>;
+  }
+
+  const captureSink = (collected: CapturedEmit[]) => ({
+    emit(input: CapturedEmit) {
+      collected.push(input);
+      return { seq: collected.length, this_hash: `fake-${collected.length}` };
+    },
+    verifyChain() {
+      return { ok: true as const, rows: collected.length };
+    },
+  });
+
+  test('emits one row per check call', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      sessionId: 'sess-x',
+    });
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(collected.length).toBe(1);
+    expect(collected[0]?.session_id).toBe('sess-x');
+    expect(collected[0]?.tool_name).toBe('bash');
+    expect(collected[0]?.decision).toBe('allow');
+    expect(collected[0]?.policy_hash).toMatch(/^sha256:[0-9a-f]{64}$/);
+  });
+
+  test('reason_chain captures stage = static-rule for matched allow', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+    });
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(collected[0]?.reason_chain[0]?.stage).toBe('static-rule');
+    expect(collected[0]?.reason_chain[0]?.rule).toBe('ls *');
+    expect(collected[0]?.reason_chain[0]?.section).toBe('bash');
+  });
+
+  test('reason_chain captures stage = default-deny for unmatched', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({}), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+    });
+    eng.check('bash', 'bash', { command: 'echo hi' });
+    expect(collected[0]?.decision).toBe('deny');
+    expect(collected[0]?.reason_chain[0]?.stage).toBe('default-deny');
+  });
+
+  test('reason_chain captures stage = protected-path for §11 deny', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(
+      policy({ tools: { write_file: { allow_paths: ['/**'] } } }),
+      { cwd: PROJ, home: HOME, audit: captureSink(collected) },
+    );
+    eng.check('write_file', 'fs.write', { path: '/proc/cpuinfo' });
+    expect(collected[0]?.decision).toBe('deny');
+    expect(collected[0]?.reason_chain[0]?.stage).toBe('protected-path');
+  });
+
+  test('reason_chain captures stage = session-allow for session-trusted', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({}), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+    });
+    eng.addSessionAllow('bash', 'pwd');
+    eng.check('bash', 'bash', { command: 'pwd' });
+    expect(collected[0]?.decision).toBe('allow');
+    expect(collected[0]?.reason_chain[0]?.stage).toBe('session-allow');
+  });
+
+  test('policy_hash is stable across multiple checks (same engine)', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+    });
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    eng.check('bash', 'bash', { command: 'ls --color' });
+    expect(collected[0]?.policy_hash).toBe(collected[1]?.policy_hash);
+  });
+
+  test('different policies produce different policy_hash', () => {
+    const a: CapturedEmit[] = [];
+    const b: CapturedEmit[] = [];
+    const engA = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(a),
+    });
+    const engB = createPermissionEngine(policy({ tools: { bash: { allow: ['ls -la'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(b),
+    });
+    engA.check('bash', 'bash', { command: 'ls -la' });
+    engB.check('bash', 'bash', { command: 'ls -la' });
+    expect(a[0]?.policy_hash).not.toBe(b[0]?.policy_hash);
+  });
+
+  test('no-op default sink does not throw when no audit option supplied', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: PROJ, home: HOME });
+    // Just exercising: production tests build engines without
+    // audit and must continue to work.
+    expect(() => eng.check('bash', 'bash', { command: 'ls -la' })).not.toThrow();
+  });
+});

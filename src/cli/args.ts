@@ -195,6 +195,13 @@ export interface ParsedArgs {
   // (recap_start / recap_intermediate / recap_render / recap_end);
   // without `--json`, headless output is the rendered string only.
   recap?: { args: string[] };
+  // `agent permission <verb> [positionals]` — operator surface for
+  // the v2 permission engine (PERMISSION_ENGINE.md). Verbs:
+  //   - 'verify' — walk the audit hash chain for the current
+  //                install_id, report intact / broken-at-seq, exit
+  //                code 0 / 1. Read-only, no provider, no session.
+  // Future slices add 'replay', 'revoke', 'list', 'test'.
+  permission?: { verb: string; positionals: string[] };
 }
 
 export interface ParseError {
@@ -396,11 +403,90 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
   };
 };
 
+// `agent permission <verb> [positionals]` — operator surface for the
+// v2 permission engine (PERMISSION_ENGINE.md). Mirrors the recap /
+// init parsers: verb is the second token, everything after is
+// positional. `--json` is honored as a top-level toggle so headless
+// scripts can switch the verify output to NDJSON.
+//
+// Current verbs:
+//   verify  — walk the audit hash chain. Exit 0 = intact, 1 = broken
+//             or bootstrap error.
+//
+// Future verbs (each lands in its own slice):
+//   replay   — replay decision against current policy
+//   revoke   — drop a session/pattern grant
+//   list     — show approvals log entries
+//   test     — run conformance suite
+const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null => {
+  if (argv.length === 0 || argv[0] !== 'permission') return null;
+  if (argv.length === 1) {
+    return {
+      ok: false,
+      message: 'usage: agent permission <verify> [--json]',
+    };
+  }
+  const verb = argv[1];
+  if (verb === undefined) {
+    return { ok: false, message: 'agent permission: missing verb' };
+  }
+  if (verb !== 'verify') {
+    return {
+      ok: false,
+      message: `agent permission: unknown verb '${verb}' (expected: verify)`,
+    };
+  }
+  let json = false;
+  const positionals: string[] = [];
+  for (let i = 2; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (token === '--help' || token === '-h') {
+      return {
+        ok: true,
+        args: {
+          prompt: '',
+          json: false,
+          version: false,
+          help: true,
+          plan: false,
+          listSessions: false,
+          includeSubagents: false,
+          explainPermissions: false,
+          yes: false,
+        },
+      };
+    }
+    if (token === '--json') {
+      json = true;
+      continue;
+    }
+    positionals.push(token);
+  }
+  return {
+    ok: true,
+    args: {
+      prompt: '',
+      json,
+      version: false,
+      help: false,
+      plan: false,
+      listSessions: false,
+      includeSubagents: false,
+      explainPermissions: false,
+      yes: false,
+      permission: { verb, positionals },
+    },
+  };
+};
+
 export const parseArgs = (argv: readonly string[]): ParseResult => {
   const initParsed = parseInitSubcommand(argv);
   if (initParsed !== null) return initParsed;
   const recapParsed = parseRecapSubcommand(argv);
   if (recapParsed !== null) return recapParsed;
+  const permissionParsed = parsePermissionSubcommand(argv);
+  if (permissionParsed !== null) return permissionParsed;
   const args: ParsedArgs = {
     prompt: '',
     json: false,

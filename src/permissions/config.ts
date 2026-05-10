@@ -1,6 +1,70 @@
 import { readFileSync } from 'node:fs';
 import { parse as parseYaml } from 'yaml';
+import { allProtectedRoots } from './protected_paths.ts';
 import type { Policy, PolicyMode } from './types.ts';
+
+// Optional validation context for parsePolicy. When supplied, the
+// validator additionally rejects allow/confirm patterns that
+// redefine a protected path (PERMISSION_ENGINE.md §11 — "Tentativa
+// de remoção em policy load → policy_invalid: protected_paths_redefined").
+// Production bootstrap supplies `{ home: os.homedir(), cwd:
+// process.cwd() }`; tests that build raw policy objects skip the
+// context to keep cross-platform setup-free.
+export interface ParsePolicyContext {
+  home?: string;
+  cwd?: string;
+}
+
+const expandTilde = (pattern: string, home: string): string => {
+  if (pattern === '~') return home;
+  if (pattern.startsWith('~/')) return `${home}${pattern.slice(1)}`;
+  return pattern;
+};
+
+// True when `pattern` targets a protected path WITHOUT relying on
+// engine-wide catch-alls. Two shapes flagged:
+//   - exact equality with a protected root (`/etc`, `~/.bashrc`)
+//   - pattern that descends INTO a protected dir without a leading
+//     wildcard (`/etc/hosts`, `/etc/**`, `/proc/1`)
+// Engine-wide catch-alls (`/**`, `**`) are not flagged here — the
+// runtime classifier in protected_paths.ts catches their matches
+// against protected targets at decision time. Flagging catch-alls
+// would break the common "allow all writes under cwd" pattern.
+const isProtectedRedefinition = (
+  pattern: string,
+  protectedRoots: readonly string[],
+  home: string,
+): boolean => {
+  const expanded = expandTilde(pattern, home);
+  for (const root of protectedRoots) {
+    if (expanded === root) return true;
+    if (expanded.startsWith(`${root}/`)) return true;
+  }
+  return false;
+};
+
+const enforceProtectedPathInvariants = (
+  r: Record<string, unknown>,
+  toolName: string,
+  context: ParsePolicyContext,
+): void => {
+  if (context.home === undefined || context.cwd === undefined) return;
+  const roots = allProtectedRoots(context.home, context.cwd);
+  // Only allow/confirm are restricted — deny_paths is always
+  // allowed since operator reinforcing protection is welcome.
+  for (const key of ['allow_paths', 'confirm_paths'] as const) {
+    const list = r[key];
+    if (!Array.isArray(list)) continue;
+    for (const pattern of list) {
+      if (typeof pattern !== 'string') continue;
+      if (isProtectedRedefinition(pattern, roots, context.home)) {
+        throw new Error(
+          `policy: ${toolName}.${key} pattern '${pattern}' redefines a protected path; use deny_paths if you want to reinforce protection, or rephrase with a broader glob (PERMISSION_ENGINE.md §11)`,
+        );
+      }
+    }
+  }
+};
 
 const VALID_MODES: ReadonlySet<string> = new Set(['strict', 'acceptEdits', 'bypass']);
 
@@ -48,7 +112,7 @@ const validateBashPolicy = (raw: unknown, toolName: string): void => {
   validateLocked(r, toolName);
 };
 
-const validatePathPolicy = (raw: unknown, toolName: string): void => {
+const validatePathPolicy = (raw: unknown, toolName: string, context: ParsePolicyContext): void => {
   if (raw === undefined || raw === null) return;
   if (typeof raw !== 'object') {
     throw new Error(`policy: ${toolName} must be an object`);
@@ -61,6 +125,7 @@ const validatePathPolicy = (raw: unknown, toolName: string): void => {
     }
   }
   validateLocked(r, toolName);
+  enforceProtectedPathInvariants(r, toolName, context);
 };
 
 const validateFetchPolicy = (raw: unknown, toolName: string): void => {
@@ -82,7 +147,13 @@ const validateFetchPolicy = (raw: unknown, toolName: string): void => {
 // malformed shape rather than silently ignoring fields — a typo in
 // `allow_path` (singular) instead of `allow_paths` is the kind of mistake
 // that turns into a silent allow-everything in production.
-export const parsePolicy = (raw: unknown): Policy => {
+//
+// When `context.home` and `context.cwd` are provided, the validator
+// also enforces the §11 protected-paths invariants: allow/confirm
+// patterns that redefine a protected path fail load. Tests building
+// hand-crafted policies in-memory typically skip the context;
+// production bootstrap supplies both.
+export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Policy => {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new Error('policy: top-level must be a YAML mapping');
   }
@@ -125,11 +196,11 @@ export const parsePolicy = (raw: unknown): Policy => {
   const tools = (toolsRaw ?? {}) as Record<string, unknown>;
 
   validateBashPolicy(tools.bash, 'bash');
-  validatePathPolicy(tools.read_file, 'read_file');
-  validatePathPolicy(tools.write_file, 'write_file');
-  validatePathPolicy(tools.edit_file, 'edit_file');
-  validatePathPolicy(tools.glob, 'glob');
-  validatePathPolicy(tools.grep, 'grep');
+  validatePathPolicy(tools.read_file, 'read_file', context);
+  validatePathPolicy(tools.write_file, 'write_file', context);
+  validatePathPolicy(tools.edit_file, 'edit_file', context);
+  validatePathPolicy(tools.glob, 'glob', context);
+  validatePathPolicy(tools.grep, 'grep', context);
   validateFetchPolicy(tools.fetch_url, 'fetch_url');
 
   return {
@@ -141,14 +212,14 @@ export const parsePolicy = (raw: unknown): Policy => {
   };
 };
 
-export const loadPolicyFromString = (content: string): Policy => {
+export const loadPolicyFromString = (content: string, context: ParsePolicyContext = {}): Policy => {
   const raw = parseYaml(content) as unknown;
-  return parsePolicy(raw);
+  return parsePolicy(raw, context);
 };
 
-export const loadPolicyFromFile = (path: string): Policy => {
+export const loadPolicyFromFile = (path: string, context: ParsePolicyContext = {}): Policy => {
   const content = readFileSync(path, 'utf-8');
-  return loadPolicyFromString(content);
+  return loadPolicyFromString(content, context);
 };
 
 // Default policy when no config file exists. Strict mode + empty rules =

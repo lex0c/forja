@@ -1,3 +1,8 @@
+import { realpathSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import type { AuditEmitInput, AuditSink, ReasonChainEntry } from './audit.ts';
+import { createNoopSink } from './audit.ts';
+import { canonicalHash } from './canonical.ts';
 import type { SectionProvenance } from './hierarchy.ts';
 import {
   containsShellInjection,
@@ -5,6 +10,7 @@ import {
   firstMatchingHost,
   firstMatchingPath,
 } from './matcher.ts';
+import { type ProtectedTier, classifyProtectedPath } from './protected_paths.ts';
 import type {
   BashPolicy,
   Decision,
@@ -29,6 +35,21 @@ export interface EngineOptions {
   // need to also synthesize provenance) — when absent, every
   // Decision falls back to source.layer='default'.
   provenance?: SectionProvenance;
+  // Home directory used by `classifyProtectedPath` to resolve
+  // tilde-rooted protected targets (~/.bashrc, ~/.config/agent).
+  // Default `process.env.HOME ?? cwd` — production bootstrap
+  // passes the operator's HOME explicitly so tests can swap it
+  // without polluting process.env.
+  home?: string;
+  // Audit sink. Engine emits one row per `check` before returning.
+  // Default `createNoopSink()` so unit tests don't need a SQLite
+  // DB; production bootstrap injects `createSqliteSink({ db,
+  // identity })`.
+  audit?: AuditSink;
+  // Session ID stamped on every audit row. Default 'session-anon'
+  // for tests; production bootstrap passes the active session id
+  // from the harness loop.
+  sessionId?: string;
 }
 
 export interface PermissionEngine {
@@ -258,12 +279,33 @@ const isSearchTool = (toolName: string): boolean => toolName === 'grep' || toolN
 const matchTargetForRules = (toolName: string, path: string): string =>
   isSearchTool(toolName) ? `${path}/${SYNTHETIC_DESCENDANT}` : path;
 
+// Resolve a path to its symlink-followed absolute form for protected
+// path classification. Mirrors the matcher's `resolveSymlinks` so a
+// symlink at `./safe → /etc/passwd` is caught by the protected check
+// just like the matcher catches it for rule matching. realpath fails
+// on paths that don't exist (write_file creating a new file); fall
+// back to realpathing the parent + joining the basename (catches
+// symlink parents) and finally to the textual absolute form.
+const resolveForProtected = (rawPath: string, cwd: string): string => {
+  const abs = isAbsolute(rawPath) ? rawPath : resolve(cwd, rawPath);
+  try {
+    return realpathSync(abs);
+  } catch {
+    try {
+      return join(realpathSync(dirname(abs)), basename(abs));
+    } catch {
+      return abs;
+    }
+  }
+};
+
 const checkPath = (
   toolName: string,
   args: ToolArgs,
   rules: PathPolicy | undefined,
   mode: PolicyMode,
   cwd: string,
+  home: string,
   isWrite: boolean,
   provenance: SectionProvenance | undefined,
   sectionKey: keyof PolicyToolsSection,
@@ -280,6 +322,29 @@ const checkPath = (
 
   const layer = sectionLayer(provenance, sectionKey);
   const sectionName = sectionKey;
+
+  // Protected-path classification per PERMISSION_ENGINE.md §11.
+  // Runs against the SYMLINK-RESOLVED absolute form so a symlink
+  // inside cwd pointing at /etc/passwd is still classified as
+  // protected. Tier `deny` returns immediately (any op, any rule).
+  // Tier `escalate` is carried as a flag — if downstream rule
+  // lookup produces `allow`, we upgrade it to `confirm` per
+  // §11's "write/delete sempre escala pra confirm no mínimo".
+  // Reads of escalate-tier paths pass through unchanged.
+  const protectedAbsPath = resolveForProtected(path, cwd);
+  const protectedTier: ProtectedTier | null = classifyProtectedPath({
+    absPath: protectedAbsPath,
+    op: isWrite ? 'write' : 'read',
+    home,
+    cwd,
+  });
+  if (protectedTier === 'deny') {
+    return {
+      kind: 'deny',
+      reason: `path is in protected zone (deny tier): ${protectedAbsPath}`,
+      source: { layer: 'default', section: 'protected' },
+    };
+  }
 
   // For search-tool roots we also need to check the literal path against
   // deny rules — a `deny_paths: ['secrets/**']` should block grep rooted
@@ -304,6 +369,14 @@ const checkPath = (
   // would otherwise fire. Deny already ran above.
   const sessionMatched = firstMatchingPath(sessionAllow, matchTarget, cwd);
   if (sessionMatched !== null) {
+    if (protectedTier === 'escalate') {
+      return {
+        kind: 'confirm',
+        prompt: `Write to ${path}? (protected path)`,
+        reason: `path matched session-allow '${sessionMatched}' but is in protected zone; escalated to confirm per §11`,
+        source: { layer: 'session', rule: sessionMatched, section: sectionName },
+      };
+    }
     return {
       kind: 'allow',
       reason: `path matched session-allow rule: ${sessionMatched}`,
@@ -312,6 +385,14 @@ const checkPath = (
   }
   const allowed = firstMatchingPath(rules?.allow_paths, matchTarget, cwd);
   if (allowed !== null) {
+    if (protectedTier === 'escalate') {
+      return {
+        kind: 'confirm',
+        prompt: `Write to ${path}? (protected path)`,
+        reason: `path matched allow rule '${allowed}' but is in protected zone; escalated to confirm per §11`,
+        source: { layer, rule: allowed, section: sectionName },
+      };
+    }
     return {
       kind: 'allow',
       reason: `path matched allow rule: ${allowed}`,
@@ -323,7 +404,9 @@ const checkPath = (
     // acceptEdits per AGENTIC_CLI §8: "aceita edits sem confirmação".
     // For writes, a confirm_paths match becomes an auto-allow — that IS
     // the convenience the mode promises. Reads still require confirmation.
-    if (mode === 'acceptEdits' && isWrite) {
+    // BUT: protected-tier `escalate` paths block the auto-accept —
+    // §11's "no mínimo confirm" wins over acceptEdits's convenience.
+    if (mode === 'acceptEdits' && isWrite && protectedTier !== 'escalate') {
       return {
         kind: 'allow',
         reason: `acceptEdits: matched confirm rule (auto-accepted): ${confirm}`,
@@ -332,7 +415,7 @@ const checkPath = (
     }
     return {
       kind: 'confirm',
-      prompt: `${isWrite ? 'Write to' : 'Read from'} ${path}?`,
+      prompt: `${isWrite ? 'Write to' : 'Read from'} ${path}?${protectedTier === 'escalate' ? ' (protected path)' : ''}`,
       reason: `matched confirm rule: ${confirm}`,
       source: { layer, rule: confirm, section: sectionName },
     };
@@ -436,6 +519,51 @@ const policySectionFor = (
   return toolName as keyof PolicyToolsSection;
 };
 
+// Map an engine Decision to the discrete audit row enum. The audit
+// log distinguishes pre-modal 'confirm' from post-modal 'confirm-
+// allowed' / 'confirm-denied' — the post-modal update path lands
+// in the modal-bridge slice. Today every `confirm` returned from
+// `check()` is the pre-modal form.
+const decisionToAuditEnum = (kind: Decision['kind']): 'allow' | 'deny' | 'confirm' => kind;
+
+// Build the reason chain entry for a Decision. Each stage produces
+// one entry — for now the engine emits a single entry capturing the
+// final stage. Future slices append entries from `resolve`,
+// `risk-score`, `classifier`, `sandbox-plan`, `approval-gate` per
+// spec §6.
+//
+// Stage selection order:
+//   - 'protected-path' — Decision was produced by §11 (deny or
+//     escalate). Detected via `source.section === 'protected'`.
+//   - 'session-allow' — operator promoted a rule into the in-memory
+//     session allowlist (`source.layer === 'session'`).
+//   - 'static-rule' — a configured allow/deny/confirm rule matched
+//     (rule literal present in `source`).
+//   - 'default-deny' — no rule matched and the engine fell through
+//     to default-deny (`kind === 'deny'` AND no rule).
+//   - 'engine-default' — engine-internal allow path (bypass mode,
+//     misc category) with no rule consulted.
+const reasonChainFor = (decision: Decision): ReasonChainEntry[] => {
+  let stage: string;
+  if (decision.source?.section === 'protected') {
+    stage = 'protected-path';
+  } else if (decision.source?.layer === 'session') {
+    stage = 'session-allow';
+  } else if (decision.source?.rule !== undefined) {
+    stage = 'static-rule';
+  } else if (decision.kind === 'deny') {
+    stage = 'default-deny';
+  } else {
+    stage = 'engine-default';
+  }
+  const entry: ReasonChainEntry = { stage };
+  if (decision.source?.layer !== undefined) entry.layer = decision.source.layer;
+  if (decision.source?.rule !== undefined) entry.rule = decision.source.rule;
+  if (decision.source?.section !== undefined) entry.section = decision.source.section;
+  if (decision.reason !== undefined) entry.note = decision.reason;
+  return [entry];
+};
+
 export const createPermissionEngine = (
   policy: Policy,
   options: EngineOptions,
@@ -446,7 +574,16 @@ export const createPermissionEngine = (
   // policy as the empty-file fallback.
   const mode = policy.defaults.mode ?? 'strict';
   const cwd = options.cwd;
+  const home = options.home ?? process.env.HOME ?? cwd;
   const provenance = options.provenance;
+  const audit = options.audit ?? createNoopSink();
+  const sessionId = options.sessionId ?? 'session-anon';
+  // policy_hash is stamped on every audit row. Computed ONCE at
+  // construction — the policy doesn't change for an engine
+  // instance (hot reload is a separate slice that builds a new
+  // engine). Canonical hash so two engines with semantically
+  // equivalent policies produce the same hash.
+  const policyHash = `sha256:${canonicalHash(policy)}`;
 
   // Session-scoped allowlist: per-section list of patterns the
   // operator promoted via the modal's "Yes, don't ask again
@@ -457,17 +594,31 @@ export const createPermissionEngine = (
   // now operator restarts the session to revoke trust).
   const sessionAllow = new Map<keyof PolicyToolsSection, string[]>();
 
+  const emitAudit = (toolName: string, args: ToolArgs, decision: Decision): void => {
+    const input: AuditEmitInput = {
+      session_id: sessionId,
+      tool_name: toolName,
+      args,
+      decision: decisionToAuditEnum(decision.kind),
+      policy_hash: policyHash,
+      reason_chain: reasonChainFor(decision),
+    };
+    audit.emit(input);
+  };
+
   const check = (toolName: string, category: PolicyCategory, args: ToolArgs): Decision => {
     if (mode === 'bypass') {
       // `bypass` is a defaults-level setting — source.layer points
       // at whichever YAML chose `mode='bypass'` so the operator
       // can find and undo it. No section/rule (mode-driven, not
       // rule-driven).
-      return {
+      const decision: Decision = {
         kind: 'allow',
         reason: 'mode=bypass',
         source: { layer: provenance?.defaults ?? 'default' },
       };
+      emitAudit(toolName, args, decision);
+      return decision;
     }
 
     // Single source of truth for section key + rule lookup. Both
@@ -481,12 +632,13 @@ export const createPermissionEngine = (
         ? undefined
         : (policy.tools as unknown as Record<string, unknown>)[sectionKey];
 
+    let decision: Decision;
     switch (category) {
       case 'bash':
         // `sectionKey` is always 'bash' here (policySectionFor
         // collapses the bash family); checkBash hardcodes the
         // section name internally.
-        return checkBash(
+        decision = checkBash(
           toolName,
           args,
           sectionRules as BashPolicy | undefined,
@@ -494,35 +646,40 @@ export const createPermissionEngine = (
           provenance,
           sessionAllow.get('bash'),
         );
+        break;
       case 'fs.read':
         // `sectionKey` is non-undefined for non-misc categories.
         // The non-null assertion is safe (typed branch) and
         // documented at policySectionFor.
-        return checkPath(
+        decision = checkPath(
           toolName,
           args,
           sectionRules as PathPolicy | undefined,
           mode,
           cwd,
+          home,
           false,
           provenance,
           sectionKey as keyof PolicyToolsSection,
           sessionAllow.get(sectionKey as keyof PolicyToolsSection),
         );
+        break;
       case 'fs.write':
-        return checkPath(
+        decision = checkPath(
           toolName,
           args,
           sectionRules as PathPolicy | undefined,
           mode,
           cwd,
+          home,
           true,
           provenance,
           sectionKey as keyof PolicyToolsSection,
           sessionAllow.get(sectionKey as keyof PolicyToolsSection),
         );
+        break;
       case 'web.fetch':
-        return checkFetch(
+        decision = checkFetch(
           toolName,
           args,
           sectionRules as FetchPolicy | undefined,
@@ -530,17 +687,21 @@ export const createPermissionEngine = (
           provenance,
           sessionAllow.get('fetch_url'),
         );
+        break;
       case 'misc':
         // No category-level policy yet; misc tools must be explicitly
         // safe (no side effects worth gating). Default allow.
         // source.layer='default' — engine-internal decision, no
         // policy section consulted.
-        return {
+        decision = {
           kind: 'allow',
           reason: 'misc category: no gate applied',
           source: { layer: 'default' },
         };
+        break;
     }
+    emitAudit(toolName, args, decision);
+    return decision;
   };
 
   const view = (): PermissionsView => ({ mode });
