@@ -39,7 +39,14 @@ const addAssistantTurn = (
   sessionId: string,
   parentId: string,
   text: string,
-  opts: { tokensIn?: number; tokensOut?: number; cached?: number; cost?: number; ts?: number } = {},
+  opts: {
+    tokensIn?: number;
+    tokensOut?: number;
+    cached?: number;
+    cacheCreation?: number;
+    cost?: number;
+    ts?: number;
+  } = {},
 ): string => {
   const m = appendMessage(db, {
     sessionId,
@@ -49,6 +56,7 @@ const addAssistantTurn = (
     tokensIn: opts.tokensIn ?? null,
     tokensOut: opts.tokensOut ?? null,
     cachedTokens: opts.cached ?? null,
+    cacheCreationTokens: opts.cacheCreation ?? null,
     costUsd: opts.cost ?? null,
     createdAt: opts.ts ?? 1_200,
   });
@@ -447,7 +455,36 @@ describe('projectRecap', () => {
     });
     expect(out.costs.tokens).toEqual({ in: 300, out: 130, cached: 90 });
     expect(out.costs.usd).toBeCloseTo(0.03);
-    expect(out.costs.cacheHitRatio).toBeCloseTo(90 / 300);
+    // ratio denominator is total input (fresh + cache_read +
+    // cache_create) — see projection.ts. With no creation tokens
+    // this reduces to cached / (fresh + cached).
+    expect(out.costs.cacheHitRatio).toBeCloseTo(90 / (300 + 90));
+  });
+
+  test('cacheHitRatio denominator includes cache_creation tokens', () => {
+    // The Anthropic API splits input into three disjoint buckets:
+    // fresh (`input_tokens`), cache_read, cache_create. Before
+    // this fix the ratio was `cache_read / fresh` and produced
+    // nonsense like 9.0 (rendered "900% cached") when cached
+    // dominated fresh. Pin the corrected math: the denominator
+    // is the sum across all three.
+    const s = seedSession();
+    const userId = addUserTurn(s.id, 'go');
+    addAssistantTurn(s.id, userId, 'cached-heavy', {
+      tokensIn: 100,
+      tokensOut: 50,
+      cached: 900,
+      cacheCreation: 200,
+      cost: 0.05,
+      ts: 1_200,
+    });
+
+    const out = projectRecap(db, {
+      scope: { kind: 'session_specific', sessionId: s.id },
+    });
+    // cached / (fresh + cached + cacheCreation) = 900 / (100 + 900 + 200) = 0.75
+    expect(out.costs.cacheHitRatio).toBeCloseTo(900 / 1200);
+    expect(out.costs.cacheHitRatio).toBeLessThanOrEqual(1);
   });
 
   test('checkpoints surface as outcomes.checkpoints', () => {

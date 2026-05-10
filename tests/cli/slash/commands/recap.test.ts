@@ -847,12 +847,15 @@ describe('/recap', () => {
     // Do NOT call completeSession — session stays in 'running'
     // status, which the projection flags as incomplete.
     currentSessionId = s.id;
+    // Marker is `⚠` everywhere except slack, which is ASCII-only
+    // by schema contract and emits `!` instead.
     for (const sub of ['pr', 'changelog', 'slack', 'terse']) {
       const r = await recapCommand.exec([sub, '--no-llm-render'], makeCtx());
       expect(r.kind).toBe('ok');
       if (r.kind !== 'ok') continue;
       const text = r.notes?.join('\n') ?? '';
-      expect(text).toContain('> ⚠ Incomplete');
+      const marker = sub === 'slack' ? '> ! Incomplete' : '> ⚠ Incomplete';
+      expect(text).toContain(marker);
     }
     // Default human surface also surfaces it.
     const human = await recapCommand.exec(['--no-llm-render'], makeCtx());

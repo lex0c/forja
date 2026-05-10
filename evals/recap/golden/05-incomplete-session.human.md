@@ -19,4 +19,4 @@
 
 ## Cost
 
-$0.01 · 3.4k in / 180 out · 79% cached · sonnet-4-6
+$0.01 · 3.4k in / 180 out · 44% cached · sonnet-4-6

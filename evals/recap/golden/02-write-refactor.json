@@ -103,7 +103,7 @@
     "usd": 0.022,
     "durationMs": 2000,
     "model": "sonnet-4-6",
-    "cacheHitRatio": 0.8095238095238095
+    "cacheHitRatio": 0.4473684210526316
   },
   "errors": [],
   "notDone": [],

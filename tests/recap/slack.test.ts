@@ -271,7 +271,9 @@ describe('renderSlackFromStructured', () => {
       },
       { incomplete: { reason: 'crash', sessionIds: ['sid-1'] } },
     );
-    expect(md.startsWith('> ⚠ Incomplete: crash (sid-1)')).toBe(true);
+    // Slack template is ASCII-only by schema contract — `!`
+    // marker, never `⚠`. The other renderers keep `⚠`.
+    expect(md.startsWith('> ! Incomplete: crash (sid-1)')).toBe(true);
     expect(md).toContain('*x*');
   });
 

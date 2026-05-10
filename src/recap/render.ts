@@ -14,15 +14,18 @@
 // selectively (free-text fields only — see
 // `redactSecretsInIntermediate`).
 
+import { renderChangelogDeterministic } from './changelog/index.ts';
 import { redactSecretsInIntermediate } from './format.ts';
 import type { RenderOptions } from './format.ts';
 import { renderHumanDeterministic } from './human/index.ts';
 import { renderPrDeterministic } from './pr/index.ts';
+import { renderSlackDeterministic } from './slack/index.ts';
+import { renderTerseDeterministic } from './terse/index.ts';
 import type { RecapIntermediate } from './types.ts';
 
 export type { RenderOptions } from './format.ts';
 
-export type RecapRenderer = 'human' | 'json' | 'pr';
+export type RecapRenderer = 'human' | 'json' | 'pr' | 'changelog' | 'slack' | 'terse';
 
 export const renderJson = (intermediate: RecapIntermediate): string => {
   // §6.2 — heuristic secret redaction is applied on the JSON
@@ -54,5 +57,11 @@ export const renderRecap = (
       return renderHuman(intermediate, options);
     case 'pr':
       return renderPrDeterministic(intermediate, options);
+    case 'changelog':
+      return renderChangelogDeterministic(intermediate, options);
+    case 'slack':
+      return renderSlackDeterministic(intermediate, options);
+    case 'terse':
+      return renderTerseDeterministic(intermediate, options);
   }
 };

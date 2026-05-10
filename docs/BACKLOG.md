@@ -15,6 +15,52 @@ Format:
 
 ---
 
+## [2026-05-09] m4.2/recap — review carry-overs round 2
+
+**Done:** Three fixes from a delegated independent review of the
+recap subsystem.
+
+| Fix | Files |
+|---|---|
+| **`cacheHitRatio` math + `cache_creation` accumulation.** Anthropic returns three disjoint input buckets per turn: fresh (`input_tokens` → `tokensIn`), cache-read (`cache_read_input_tokens` → `cachedTokens`), cache-create (`cache_creation_input_tokens` → `cacheCreationTokens`). Projection was accumulating only the first two and computing the ratio as `cached / fresh`, which produced nonsense like `9.0` (rendered "900% cached") whenever cached tokens dominated fresh — the dominant shape once prompt caching is wired. Fix accumulates `cacheCreationTokens` locally (not surfaced — RECAP §3 declares only `tokens.{in,out,cached}`) and uses the proper denominator `tokensIn + cachedTokens + cacheCreationTokens`. New unit test pins the corrected math against a cached-heavy turn. Goldens regenerated for fixtures 01/02/03/04/06/07 (human + json) where the cost line surfaces `cached %`. | `src/recap/projection.ts`, `tests/recap/projection.test.ts`, `evals/recap/golden/*.{human.md,json}` |
+| **Slack ASCII contract.** `slack/template.ts` was emitting `> ⚠ Incomplete: ...` for the incomplete callout, violating the ASCII-only schema contract declared at `slack/schema.ts:7-12`. Changed to `> ! Incomplete: ...`. The other renderers (human, pr, changelog, terse) keep `⚠`. Slash test loop updated to be marker-aware. | `src/recap/slack/template.ts`, `tests/recap/slack.test.ts`, `tests/cli/slash/commands/recap.test.ts` |
+| **`renderRecap` dispatch widening.** The legacy helper at `render.ts` exposed only `'human' \| 'json' \| 'pr'`; slices (b)/(c) added changelog/slack/terse renderers but never extended the union. Slash dispatch worked because it bypasses this helper, but external callers (eval runner, downstream tooling) hit a closed switch. Widened `RecapRenderer` and `renderRecap()` to dispatch all six. Imports the deterministic projection per renderer. | `src/recap/render.ts` |
+
+**Decisions:**
+- **Don't surface `cache_create` on the intermediate.** RECAP §3
+  declares `costs.tokens: { in, out, cached }`. Adding a fourth
+  field requires a spec PR; the cache-create count is only
+  needed locally as a denominator term. Local accumulator keeps
+  the schema stable and the math correct.
+- **`!` is slack-only.** The other renderers retain `⚠` because
+  their output sinks (markdown, HTML, terminal) all render the
+  glyph cleanly. Slack's schema-level ASCII rule comes from a
+  different motivation (anti-decoration uniformity with the
+  `*`/`-` bullet markers), not Slack's actual capabilities.
+- **Skip path-anonymization in headless `recap_intermediate`.**
+  Agent flagged that `redactSecretsInIntermediate` redacts
+  secrets but not `$HOME` paths. Deliberate per `render.ts:30-31`
+  comment: paths, IDs, numbers, and enum-shaped strings stay
+  intact so downstream `jq '.actions.files_written'` keeps
+  working. Trade-off documented; not changed.
+- **Skip decisions ordering rework.** Agent flagged that
+  resume-context's `decisions.slice(-5)` may not match wall-
+  clock time. Hypothetical — no concrete fixture or failure
+  case shown. Existing tests pin ordering against the source
+  array as it stands.
+
+**Tests:** 4512 pass, 0 fail (was 4511). One new test:
+`cacheHitRatio denominator includes cache_creation tokens`.
+Goldens regenerated; diff shows the expected ratio shifts
+(e.g. fixture 01: `80% cached` → `44% cached` because previous
+math was `1200/1500` not `1200/2700`).
+
+**Next:** Round 3 of recap polishing if it surfaces; otherwise
+treat the subsystem as feature-complete against `RECAP.md`
+(modulo upstream blockers documented in slice (f)).
+
+---
+
 ## [2026-05-09] m4f/recap — slice (f): auto-rehydrate consumer no `--resume`
 
 **Done:** `[resume_context]` block injection on `--resume`

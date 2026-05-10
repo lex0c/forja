@@ -41,8 +41,13 @@ export const renderSlackFromStructured = (
   const lines: string[] = [];
 
   if (options.incomplete !== undefined) {
+    // ASCII-only marker per the schema's ASCII contract (see
+    // schema.ts). The `⚠` character used by the other renderers
+    // would break the rule even though Slack would render it
+    // fine — uniform with the bullet markers (`*`/`-`) the
+    // template already keeps ASCII.
     const ids = options.incomplete.sessionIds.join(', ');
-    lines.push(`> ⚠ Incomplete: ${redactSecrets(options.incomplete.reason)} (${ids})`);
+    lines.push(`> ! Incomplete: ${redactSecrets(options.incomplete.reason)} (${ids})`);
     lines.push('');
   }
 
