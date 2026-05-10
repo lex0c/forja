@@ -1126,10 +1126,16 @@ export const runRecapList = async (
   // The notes channel emits one line per row of the output. JSON
   // mode strips the trailing newline; table mode preserves the
   // header + rows. An empty result returns a single "no sessions
-  // found." line in table mode, or a single info message in JSON
-  // mode (so the caller knows the query ran).
+  // found." line in table mode (operator-friendly note), or NO
+  // notes at all in JSON mode — emitting a plain-text diagnostic
+  // on the NDJSON channel breaks stream parsers (the operator
+  // explicitly asked for machine-readable output, so silence on
+  // empty is the correct contract; exit code 0 still signals
+  // "query ran successfully"). `agent recap list --json` was
+  // forwarding the diagnostic to stdout verbatim, polluting the
+  // NDJSON envelope with an unparseable first line.
   if (resultRows.length === 0 && filters.json) {
-    return { kind: 'ok', notes: ['/recap list: no sessions matched the filters'] };
+    return { kind: 'ok' };
   }
   const trimmed = output.endsWith('\n') ? output.slice(0, -1) : output;
   return { kind: 'ok', notes: trimmed.split('\n') };

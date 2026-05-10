@@ -1033,6 +1033,24 @@ describe('/recap', () => {
     expect(text).toContain('no sessions');
   });
 
+  test('/recap list --json with zero matches emits NO notes (clean NDJSON)', async () => {
+    // Regression: pre-fix the empty-result branch returned a
+    // plain-text note (`/recap list: no sessions matched the
+    // filters`) even when `--json` was set. Headless mode forwards
+    // notes verbatim to stdout, so consumers stream-parsing NDJSON
+    // would hit an unparseable first line. Contract: in JSON mode
+    // an empty result emits zero stdout lines (exit 0 still
+    // signals the query ran). Operator wanting a human note
+    // omits `--json`.
+    const result = await recapCommand.exec(['list', '--status', 'error', '--json'], makeCtx());
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    // `notes` is either undefined or an empty array — both render
+    // to zero stdout lines in headless. Pin the absence so a
+    // future "helpful" note doesn't break NDJSON consumers again.
+    expect(result.notes ?? []).toEqual([]);
+  });
+
   test('/recap list anonymizes $HOME paths in cwd/cwdLabel and goal (RECAP §6.2)', async () => {
     const HOME = process.env.HOME ?? '';
     if (HOME.length === 0 || !HOME.startsWith('/')) {
