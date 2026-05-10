@@ -185,6 +185,18 @@ const splitFlags = (args: string[]): FlagSplit => {
       if (next === undefined || next.length === 0) {
         return fail('/recap: --out requires a file path');
       }
+      // Refuse a flag-shaped next token (`--something` or `-x`).
+      // Without this gate, `/recap pr --out --no-llm-render` would
+      // treat `--no-llm-render` as the filename, write to a file
+      // literally named that, AND silently drop the operator's
+      // intended `--no-llm-render` toggle. Operators with paths
+      // that legitimately start with `-` can use the `--out=` form
+      // to disambiguate.
+      if (next.startsWith('-')) {
+        return fail(
+          `/recap: --out received a flag-shaped value '${next}'; pass a file path or use --out=<path> to disambiguate`,
+        );
+      }
       outPath = next;
       i += 1;
       continue;
@@ -896,6 +908,15 @@ const parseRecapListArgs = (args: readonly string[]): RecapListFilters | { error
       if (next === undefined || next.length === 0) {
         return { error: '/recap list: --project requires a path' };
       }
+      // Refuse flag-shaped value — see `--out` for the canonical
+      // rationale; same defense against silently swallowing the
+      // following option. A path that legitimately starts with
+      // `-` should be shell-quoted or prefixed (`./--weird-dir`).
+      if (next.startsWith('-')) {
+        return {
+          error: `/recap list: --project received a flag-shaped value '${next}'; pass a path (prefix with './' if it legitimately starts with '-')`,
+        };
+      }
       project = next;
       i += 1;
       continue;
@@ -929,6 +950,14 @@ const parseRecapListArgs = (args: readonly string[]): RecapListFilters | { error
       if (next === undefined || next.length === 0) {
         return { error: '/recap list: --search requires a query' };
       }
+      // Refuse flag-shaped value (see `--out`). A query that
+      // legitimately starts with `-` can be shell-quoted to
+      // disambiguate.
+      if (next.startsWith('-')) {
+        return {
+          error: `/recap list: --search received a flag-shaped value '${next}'; quote the query if it legitimately starts with '-'`,
+        };
+      }
       search = next;
       i += 1;
       continue;
@@ -937,6 +966,13 @@ const parseRecapListArgs = (args: readonly string[]): RecapListFilters | { error
       const next = args[i + 1];
       if (next === undefined || next.length === 0) {
         return { error: '/recap list: --out requires a file path' };
+      }
+      // Refuse flag-shaped value — see the session-render parser's
+      // `--out` for canonical rationale.
+      if (next.startsWith('-')) {
+        return {
+          error: `/recap list: --out received a flag-shaped value '${next}'; pass a file path or use --out=<path>`,
+        };
       }
       outPath = next;
       i += 1;

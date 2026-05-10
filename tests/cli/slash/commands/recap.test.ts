@@ -464,6 +464,39 @@ describe('/recap', () => {
     expect(result.message).toContain('--out requires a file path');
   });
 
+  test('/recap --out rejects a flag-shaped value (no silent flag swallow)', async () => {
+    // Regression: pre-fix `--out --no-llm-render` was treated as
+    // `outPath='--no-llm-render'` and the operator's intended
+    // toggle was silently consumed as the filename. Refuse so the
+    // operator gets a clear diagnostic instead of a recap written
+    // to a file literally named `--no-llm-render`.
+    currentSessionId = 'unused';
+    const result = await recapCommand.exec(['pr', '--out', '--no-llm-render'], makeCtx());
+    expect(result.kind).toBe('error');
+    if (result.kind !== 'error') return;
+    expect(result.message).toContain('--out received a flag-shaped value');
+    expect(result.message).toContain('--no-llm-render');
+  });
+
+  test('/recap list --out / --project / --search reject flag-shaped values', async () => {
+    // Same vulnerability shape on the list parser — pin all three.
+    const outResult = await recapCommand.exec(['list', '--out', '--json'], makeCtx());
+    expect(outResult.kind).toBe('error');
+    if (outResult.kind === 'error') {
+      expect(outResult.message).toContain('--out received a flag-shaped value');
+    }
+    const projectResult = await recapCommand.exec(['list', '--project', '--limit'], makeCtx());
+    expect(projectResult.kind).toBe('error');
+    if (projectResult.kind === 'error') {
+      expect(projectResult.message).toContain('--project received a flag-shaped value');
+    }
+    const searchResult = await recapCommand.exec(['list', '--search', '--json'], makeCtx());
+    expect(searchResult.kind).toBe('error');
+    if (searchResult.kind === 'error') {
+      expect(searchResult.message).toContain('--search received a flag-shaped value');
+    }
+  });
+
   test('/recap rejects unknown long flags', async () => {
     const result = await recapCommand.exec(['--bogus'], makeCtx());
     expect(result.kind).toBe('error');
