@@ -50,11 +50,22 @@ const defaultSpawn = (cmd: string, args: readonly string[]): SpawnResult => {
   return { status: r.status };
 };
 
+// Resolve a list of target ids; throw on unknown so a typoed
+// `--target=lnux-x64` doesn't silently produce a zero-row "successful"
+// compression run.
+export const resolveIds = (ids: readonly string[]): BuildTarget[] => {
+  if (ids.length === 0) return [...TARGETS];
+  const out: BuildTarget[] = [];
+  for (const id of ids) {
+    const t = findTarget(id);
+    if (t === undefined) throw new Error(`unknown target: ${id}`);
+    out.push(t);
+  }
+  return out;
+};
+
 export const runCompress = (opts: CompressOptions): CompressRow[] => {
-  const subset =
-    opts.ids.length > 0
-      ? opts.ids.map((id) => findTarget(id)).filter((t): t is BuildTarget => t !== undefined)
-      : TARGETS;
+  const subset = resolveIds(opts.ids);
   const rows: CompressRow[] = [];
   const spawn = opts.spawn ?? defaultSpawn;
   for (const t of subset) {
@@ -132,7 +143,15 @@ const parseArgs = (argv: readonly string[]): CompressOptions => {
 
 const main = (): void => {
   const opts = parseArgs(process.argv.slice(2));
-  const rows = runCompress(opts);
+  let rows: CompressRow[];
+  try {
+    rows = runCompress(opts);
+  } catch (e) {
+    // resolveIds throws on unknown --target; convert to exit-2 so
+    // release tooling surfaces the typo before downstream steps.
+    process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
+    process.exit(2);
+  }
   for (const r of rows) process.stdout.write(`${formatRow(r)}\n`);
   if (rows.some((r) => r.status === 'failed')) process.exit(1);
 };

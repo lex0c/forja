@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import {
   buildArgs,
   parseArgs,
+  resolveIds,
   runBuild,
   sourcemapName,
   targetSourcemapName,
@@ -222,6 +223,53 @@ describe('runBuild', () => {
       // operator inspects).
       expect(existsSync(join(dir, 'index.js.map'))).toBe(true);
       expect(existsSync(join(dir, 'agent-linux-x64.map'))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('resolveIds', () => {
+  test('resolves every TARGETS entry when ids is empty', () => {
+    expect(resolveIds([]).length).toBe(TARGETS.length);
+  });
+
+  test('preserves the supplied order', () => {
+    const out = resolveIds(['darwin-arm64', 'linux-x64']);
+    expect(out.map((t) => t.id)).toEqual(['darwin-arm64', 'linux-x64']);
+  });
+
+  test('throws on unknown id (no silent drop)', () => {
+    // The critical guarantee: a typoed --target=lnux-x64 would
+    // otherwise produce a "built 0 target(s)" exit-0 success and
+    // mask the operator's mistake in CI.
+    expect(() => resolveIds(['lnux-x64'])).toThrow(/unknown target.*lnux-x64/);
+    expect(() => resolveIds(['linux-x64', 'plan9-mips'])).toThrow(/plan9-mips/);
+  });
+});
+
+describe('runBuild error propagation', () => {
+  test('throws (not silent-drop) when ids contains an unknown target', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'forja-build-'));
+    try {
+      let spawned = false;
+      const fakeSpawn = () => {
+        spawned = true;
+        return { status: 0 };
+      };
+      expect(() =>
+        runBuild({
+          distDir: dir,
+          entry: 'src/cli/index.ts',
+          minify: true,
+          sourcemap: true,
+          ids: ['linux-x64', 'mystery-arch'],
+          spawn: fakeSpawn,
+        }),
+      ).toThrow(/mystery-arch/);
+      // Critical: no build was started — the validation must happen
+      // before any target's spawn, not after a partial run.
+      expect(spawned).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

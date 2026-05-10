@@ -80,12 +80,24 @@ export interface BuildResult {
   status: number | null;
 }
 
+// Resolve a list of target ids into full BuildTarget records. Unknown
+// ids throw — silent filtering would let a typo (`--target=lnux-x64`)
+// produce a no-op "built 0 target(s)" success and mask the operator's
+// mistake. Empty `ids` resolves to all `TARGETS`.
+export const resolveIds = (ids: readonly string[]): BuildTarget[] => {
+  if (ids.length === 0) return [...TARGETS];
+  const out: BuildTarget[] = [];
+  for (const id of ids) {
+    const t = findTarget(id);
+    if (t === undefined) throw new Error(`unknown target: ${id}`);
+    out.push(t);
+  }
+  return out;
+};
+
 export const runBuild = (opts: BuildOptions): BuildResult[] => {
   const spawn = opts.spawn ?? defaultSpawn;
-  const subset =
-    opts.ids.length > 0
-      ? opts.ids.map((id) => findTarget(id)).filter((t): t is BuildTarget => t !== undefined)
-      : TARGETS;
+  const subset = resolveIds(opts.ids);
 
   if (!existsSync(opts.distDir)) mkdirSync(opts.distDir, { recursive: true });
 
@@ -156,7 +168,15 @@ export const parseArgs = (argv: readonly string[]): ParsedArgs => {
 
 const main = (): void => {
   const parsed = parseArgs(process.argv.slice(2));
-  const results = runBuild(parsed);
+  let results: BuildResult[];
+  try {
+    results = runBuild(parsed);
+  } catch (e) {
+    // resolveIds throws on unknown --target ids. Convert to a clean
+    // exit-2 so CI surfaces the typo before downstream steps run.
+    process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
+    process.exit(2);
+  }
   const failed = results.filter((r) => r.status !== 0);
   if (failed.length > 0) {
     process.stderr.write(`${failed.length}/${results.length} target build(s) failed\n`);

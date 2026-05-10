@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assetName } from '../../scripts/targets.ts';
-import { formatRow, runCompress } from '../../scripts/upx-compress.ts';
+import { formatRow, resolveIds, runCompress } from '../../scripts/upx-compress.ts';
 import { targetById } from './_helpers.ts';
 
 const buildSpawn =
@@ -73,5 +73,41 @@ describe('runCompress', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test('throws on unknown target id rather than silently producing zero rows', () => {
+    // A typoed `--target=lnux-x64` would otherwise yield an empty
+    // rows array and exit 0, masking the operator's mistake in
+    // release tooling.
+    const dir = mkdtempSync(join(tmpdir(), 'forja-upx-'));
+    try {
+      let spawned = false;
+      const spawn = (_cmd: string, _args: readonly string[]) => {
+        spawned = true;
+        return { status: 0 };
+      };
+      expect(() => runCompress({ distDir: dir, ids: ['linux-x64', 'lnux-x64'], spawn })).toThrow(
+        /lnux-x64/,
+      );
+      // Validation runs before any UPX invocation.
+      expect(spawned).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('resolveIds (upx)', () => {
+  test('empty ids resolves to all TARGETS', () => {
+    expect(resolveIds([]).length).toBeGreaterThan(0);
+  });
+
+  test('throws on unknown id', () => {
+    expect(() => resolveIds(['plan9-mips'])).toThrow(/unknown target.*plan9-mips/);
+  });
+
+  test('preserves order of supplied ids', () => {
+    const out = resolveIds(['darwin-x64', 'linux-x64']);
+    expect(out.map((t) => t.id)).toEqual(['darwin-x64', 'linux-x64']);
   });
 });
