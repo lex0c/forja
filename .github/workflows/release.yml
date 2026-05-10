@@ -1,0 +1,135 @@
+name: release
+
+# Triggers on `vX.Y.Z` tags. Manual `workflow_dispatch` is wired so a
+# release can be re-attempted without retagging — the tag form is the
+# canonical path; manual is for breakage recovery.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (e.g. v0.1.0). Required for manual dispatch.'
+        required: true
+
+permissions:
+  contents: write   # uploading release assets
+  id-token: write   # reserved for future cosign keyless (out of scope for this slice)
+
+concurrency:
+  group: release-${{ github.ref_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  # Single-runner build of every target via Bun's cross-compile. We
+  # consciously do NOT use a runner matrix because Bun's --target
+  # produces the right binary from any host (PERFORMANCE.md §18.5
+  # line 626 lists targets, not runners). One runner == one cache
+  # warmup, one SBOM, one reproducibility check; the cost of an
+  # ARM/macOS runner per target buys nothing.
+  build:
+    name: build · sbom · size gate · checksums
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Install deps
+        run: bun install --frozen-lockfile
+
+      - name: Build all targets
+        run: bun run build:release
+
+      - name: Size gate (PERFORMANCE.md §18.2)
+        run: bun run build:size
+
+      - name: SBOM (CycloneDX)
+        run: bun run build:sbom
+
+      - name: SHA256SUMS
+        run: bun run build:checksums
+
+      - name: Verify checksums (round-trip sanity)
+        run: bun run build:verify
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            dist/agent-*
+            dist/sbom.cdx.json
+            dist/SHA256SUMS
+          # Keep retention modest; assets land in GitHub Releases
+          # below as the durable copy. The artifact is a transport
+          # between jobs.
+          retention-days: 7
+          if-no-files-found: error
+
+  # Reproducible-build verification runs in its own job so a failure
+  # surfaces independently in the workflow timeline. Slow (double
+  # build) and not load-bearing for the upload step, so it parallels
+  # the build job rather than gating it.
+  reproducibility:
+    name: reproducible build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Install deps
+        run: bun install --frozen-lockfile
+
+      - name: Reproducibility check
+        run: bun run build:repro
+
+  publish:
+    name: publish GitHub Release
+    needs: [build, reproducibility]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create / update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber dist/agent-* dist/sbom.cdx.json dist/SHA256SUMS
+          else
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              dist/agent-* dist/sbom.cdx.json dist/SHA256SUMS
+          fi

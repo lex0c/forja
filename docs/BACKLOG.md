@@ -15,6 +15,70 @@ Format:
 
 ---
 
+## [2026-05-10] m4/distribution — release pipeline (build flags, cross-platform matrix, size gate, SHA256SUMS, reproducible build, SBOM, release workflow, install script, UPX compress)
+
+**Done:** Closes the "Distribuição binário Bun" item from M4 roadmap (`AGENTIC_CLI.md §18`). One slice, eight commit-sized deliverables under a single branch (`feat/m4-distribution`); user requested same-branch commits. Scope confirmed up front: items 1-7, 10, 12 of `PERFORMANCE.md §18` + `SECURITY_GUIDELINE.md §7.2` (build flags, matrix, size gate, SHA256, reproducible build, SBOM, release workflow, install script, UPX). Out of scope (deferred): cosign signing (#9), `agent --version --verify` (#8), Homebrew tap (#11) — they need infra (cosign keys, second repo) that doesn't yet exist.
+
+| Slice | File(s) | What |
+|---|---|---|
+| **A** Build flags | `scripts/build-targets.ts`, `package.json` (`build:release`) | `bun build --compile --minify --sourcemap=external --target=<bun-target>`. CLI flags (`--target`, `--dist`, `--entry`, `--no-minify`, `--no-sourcemap`) + test seam (`spawn`) so `runBuild` can be unit-tested without invoking Bun. |
+| **B** Cross-platform matrix | `scripts/targets.ts` | Single source of truth: 5 targets (linux-x64, linux-arm64, darwin-x64, darwin-arm64, windows-x64). Maps `id → bunTarget`, size budget, executable extension, OS/arch tuple. Adding a target = editing one record + re-running tests. |
+| **C** Size gate | `scripts/check-size.ts`, `package.json` (`build:size`) | Three tiers from `PERFORMANCE.md §18.2`: under budget (silent), at-budget through +20% (warn, exit 0), over +20% (block, exit 1). Pure `classifyBytes` for unit tests; `runCheck` does IO. Missing assets fail by default (`allowMissing` opt-in for one-target local runs). |
+| **C'** SHA256SUMS | `scripts/checksums.ts`, `package.json` (`build:checksums`, `build:verify`) | GNU `sha256sum`-compatible format (two-space separator). Generates over every release asset present in `dist/` (binaries + SBOM; sourcemaps excluded). Verify round-trips; tampered/missing files surface explicitly. Stable alphabetical sort so `SHA256SUMS` is diffable across runs. |
+| **D** Reproducible build | `scripts/repro-check.ts`, `package.json` (`build:repro`) | Builds each target twice with `SOURCE_DATE_EPOCH=1700000000` into separate dirs, compares SHA256. Diverging hashes write a marker (`dist/repro/<id>.diff`) for forensics. Slow (double build) — runs in its own CI job, not on every PR. |
+| **E** SBOM | `scripts/sbom.ts`, `package.json` (`build:sbom`) | `bunx @cyclonedx/cyclonedx-npm@2.0.1` → CycloneDX 1.5 JSON at `dist/sbom.cdx.json`. Pinned version for SBOM reproducibility. `--omit dev` keeps devDeps off the artifact. `summarize` validates `bomFormat=CycloneDX` and prints a one-liner so CI logs are scannable without opening the JSON. |
+| **F** Release workflow | `.github/workflows/release.yml` | Triggers on `v*` tag (or manual `workflow_dispatch` with explicit tag). Three jobs: `build` (build + size + SBOM + checksums + verify + upload artifact), `reproducibility` (parallel; double-build diff), `publish` (gated on both; uses `gh release upload --clobber` so a re-run is idempotent). `permissions: contents:write + id-token:write` — id-token reserved for future cosign keyless. |
+| **F'** PR-time gate | `.github/workflows/ci.yml` | New `build-matrix` job: cross-build all 5 targets + size gate + checksums round-trip on every PR. Reproducibility intentionally skipped (slow); release workflow gates publish on it. |
+| **G** Install script | `install.sh` | POSIX `sh` (works on Alpine/macOS without bash). Detects OS/arch, fetches `agent-<id>` + `SHA256SUMS` from latest GitHub release (or pinned `--version`), verifies SHA256 with `sha256sum` or `shasum -a 256`, installs to `$HOME/.local/bin` (override via `--prefix` or `FORJA_PREFIX`). Refuses install if asset hash diverges. PATH-not-on-shell hint at the end. |
+| **H** UPX compress | `scripts/upx-compress.ts`, `package.json` (`build:compress`) | Opt-in. Per `PERFORMANCE.md §18.3` the default release ships uncompressed (perf > size). `darwin-arm64` is on a hardcoded skip-list (UPX 4.x emits "macho/arm not supported"). Reports per-target before/after with `-N%` delta. |
+
+Tests: 6 new files under `tests/scripts/`, 42 cases. Test seam pattern (`spawn?: ...`) keeps the CI-relevant logic in pure functions; the only IO touched in tests is `mkdtempSync` for fixture dirs. `tests/scripts/_helpers.ts` exposes `targetById` so tests don't need `findTarget('linux-x64')!` — keeps Biome's `noNonNullAssertion` happy without the noise of inline `if (t === undefined)` blocks at every call site.
+
+**Decisions:**
+
+- **Single-runner cross-build, not a runner matrix.** Bun's `--target=bun-<os>-<arch>` produces the right binary for every platform from any host. A `runs-on: macos-latest` for the darwin targets buys nothing (no cache reuse, slower runner, more YAML); the spec's matrix at line 626 lists targets, not runners. Saves ~5x runner-minutes per release.
+- **Sourcemaps as separate `.map` files, not embedded.** `--sourcemap=external` produces a sibling file; the binary stays smaller and operators who don't need debug info don't pay the size cost. The map is excluded from `SHA256SUMS` (sourcemaps are debugging artifacts, not release assets).
+- **`SOURCE_DATE_EPOCH` pinned at 1700000000.** Bun's `--compile` is mostly deterministic but the embedded loader can pick up build-time clocks; pinning the epoch normalizes those to a fixed value. Chosen so reproducibility holds even if CI runners drift across timezones.
+- **`build` (default script) targets only `linux-x64` with `--no-minify`.** Local dev iteration. Operators running `bun run build` for ad-hoc testing don't want a 5-target build with minification. `build:release` does the full pipeline.
+- **`@cyclonedx/cyclonedx-npm` over a hand-rolled SBOM.** User chose this in the up-front question. Maturity, schema correctness, and a shrinking surface to maintain matter more than the +1 devDep at install time. We invoke via `bunx` so it's not a permanent devDep entry — the version is pinned in `scripts/sbom.ts` for reproducibility.
+- **UPX `--target=darwin-arm64` is allow-listed-out, not try-and-skip.** UPX silently fails or emits cryptic errors on unsupported targets; an allow-list keeps the gate predictable and the failure path visible at code-review time.
+- **CI `build-matrix` job runs on every PR.** Catches a broken `bun --target` (e.g. a Bun version bump that drops a triple) before tag time. The size gate runs here too: a 50 MiB → 70 MiB regression should fail the PR, not surprise the release maintainer.
+- **Size gate is exit-1 on block, not warn-only.** Per spec line 599: "Hit do target = warning; +20% = bloqueia release." The CI job follows the spec verbatim. **NOTE: see "Pending — size targets" below; the budgets in the spec do not match reality today.**
+- **Branch strategy honored.** Single `feat/m4-distribution` branch, slices land as separate commits inside it (memory-feedback `feedback_branch_strategy.md`). User explicitly asked for this shape.
+
+**Pending — size targets divergence:**
+
+The size budgets in `PERFORMANCE.md §18.2` (50 MB linux/darwin, 60 MB Windows) **do not match what `bun build --compile` produces today.** Local measurement on `linux-x64` with `--minify`:
+
+| Build | Size |
+|---|---|
+| `--minify --sourcemap=external` (release) | 100.9 MiB |
+| `--minify` (no sourcemap) | 99.0 MiB |
+
+The gap is dominated by Bun's bundled runtime (~50-60 MiB by itself) plus three vendor SDKs (`@anthropic-ai/sdk`, `@google/genai`, `openai`). Two paths forward, both out of scope for this slice:
+
+1. **Amend the spec.** Re-baseline §18.2 to ~110 MiB / +20% = 132 MiB and surface the +60 MiB gap (Bun runtime + SDKs) in `PERFORMANCE.md`. Requires a spec PR per `CLAUDE.md` workflow.
+2. **Trim deps.** Drop the SDKs in favor of raw HTTP + JSON (mirrors the spec's "trust no provider" stance from `SECURITY_GUIDELINE.md §7.3`). Saves ~10-15 MiB. Bun runtime is the floor.
+
+The size gate ships with the spec numbers as written. CI on this PR will fail the `build-matrix` job until one of the two paths is taken — that is the correct signal: code or spec, one must move. Documented here so the next conversation lands on the right call.
+
+**Pending — out-of-scope items:**
+
+- **Cosign keyless signature** (`SECURITY_GUIDELINE.md §7.2`). Workflow has `id-token: write` reserved for it; the actual `cosign sign-blob` step + `cosign verify-blob` in `agent --version --verify` is a follow-up.
+- **`agent --version --verify`** flag. Needs the cosign signature first; without it `--verify` would only confirm the SHA against `SHA256SUMS` (which the install script already does at install time — a runtime re-check buys little).
+- **Homebrew tap** (`homebrew-forja` repo). Needs the second repo created; formula updates would be a release-workflow step (`brew bump-formula-pr` or equivalent).
+
+**Verification:**
+
+- `bun run typecheck` — pass
+- `bun run lint` — pass (2 pre-existing warnings in `tests/harness/abortable.test.ts`, untouched)
+- `bun test` — 4600 pass / 10 skip / 0 fail (42 of those are the new `tests/scripts/` cases)
+- `bun run build` (single-target host build) — produces `dist/agent-linux-x64`, 99 MiB
+
+**Next:** PR review. The size-gate divergence is the load-bearing decision the user needs to make before a release tag is cut.
+
+---
+
 ## [2026-05-09] m4.3/recap — auto-display surfaces (RECAP §3.3)
 
 **Done:** Recap deixa de exigir `/recap` explícito pra aparecer.
