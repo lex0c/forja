@@ -1,0 +1,157 @@
+# Conformance: deterministic risk score (PERMISSION_ENGINE.md §6.3).
+# Each case asserts the score floor / ceiling + presence of feature
+# components. Together they pin the §6.3.1 weights against typical
+# tool-call shapes.
+
+- name: "read_file under cwd → score=0 baseline"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        read_file:
+          allow_paths: ["**"]
+  input:
+    tool: "read_file"
+    category: "fs.read"
+    args:
+      file_path: "src/index.ts"
+  expect:
+    kind: "allow"
+    score_lte: 0.0
+
+- name: "bash ls → score=0 baseline"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["ls *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls -la"
+  expect:
+    kind: "allow"
+    score_lte: 0.0
+
+- name: "bash rm -rf → capability_risk + blocklist_command"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["rm *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "rm -rf /tmp/x"
+  expect:
+    kind: "allow"
+    score_gte: 0.5
+    score_components_include:
+      - "capability_risk"
+      - "blocklist_command"
+
+- name: "bash git push → capability_risk + wildcard_scope (net-egress:*)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["git *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git push origin main"
+  expect:
+    kind: "allow"
+    score_gte: 0.4
+    score_components_include:
+      - "capability_risk"
+      - "wildcard_scope"
+
+- name: "bash curl github (trusted host) → no untrusted_egress"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["curl *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "curl https://github.com/x/y"
+  expect:
+    kind: "allow"
+    score_lte: 0.0
+
+- name: "bash curl arbitrary host → untrusted_egress"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["curl *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "curl https://evil.example.com/data"
+  expect:
+    kind: "allow"
+    score_gte: 0.2
+    score_components_include:
+      - "untrusted_egress"
+
+- name: "bash compound (|) → shell_complex + confidence_low"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "cat file | grep token"
+  expect:
+    kind: "confirm"
+    score_gte: 0.5
+    score_components_include:
+      - "shell_complex"
+      - "confidence_low"
+
+- name: "MCP tool prefix triggers mcp_tool feature"
+  setup: {}
+  input:
+    tool: "mcp__github__create_issue"
+    category: "misc"
+    args: {}
+  expect:
+    kind: "allow"
+    score_components_include:
+      - "mcp_tool"
+
+- name: "write_file to /etc → workspace_escape feature"
+  setup:
+    cwd: "/work/proj"
+    home: "/home/op"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["/**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      file_path: "/etc/hosts"
+  expect:
+    # protected paths upgrade write under /etc to confirm
+    kind: "confirm"
+    score_components_include:
+      - "workspace_escape"

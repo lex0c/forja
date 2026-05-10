@@ -1454,10 +1454,159 @@ describe('engine — state machine integration (§2)', () => {
     });
     eng.check('bash', 'bash', { command: 'ls -la' });
     expect(collected[0]?.decision).toBe('confirm');
-    // First entry is the original static-rule attribution; second is
-    // the engine-state stage marker added by the degraded path.
-    expect(collected[0]?.reason_chain[0]?.stage).toBe('static-rule');
-    expect(collected[0]?.reason_chain[1]?.stage).toBe('engine-state');
-    expect(collected[0]?.reason_chain[1]?.note).toContain('degraded');
+    // First entry is the original static-rule attribution; the
+    // risk-score stage lands between when the engine is degraded
+    // (score > 0 from `engine_degraded` feature); engine-state is
+    // last. Search by stage rather than index to keep the test
+    // resilient to future chain-entry additions.
+    const stages = collected[0]?.reason_chain.map((e) => e.stage) ?? [];
+    expect(stages[0]).toBe('static-rule');
+    expect(stages).toContain('engine-state');
+    const engineStateEntry = collected[0]?.reason_chain.find((e) => e.stage === 'engine-state');
+    expect(engineStateEntry?.note).toContain('degraded');
+  });
+});
+
+describe('engine — risk score in audit row (§6.3 integration)', () => {
+  const PROJ = '/work/proj';
+  const HOME = '/home/op';
+
+  interface CapturedEmit {
+    decision: 'allow' | 'deny' | 'confirm';
+    score?: number;
+    score_components?: Record<string, number>;
+    reason_chain: ReadonlyArray<{ stage: string; note?: string }>;
+  }
+
+  const captureSink = (collected: CapturedEmit[]) => ({
+    emit(input: CapturedEmit) {
+      collected.push(input);
+      return { seq: collected.length, this_hash: `fake-${collected.length}` };
+    },
+    verifyChain() {
+      return { ok: true as const, rows: collected.length };
+    },
+  });
+
+  test('read_file produces score 0 baseline', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { read_file: { allow_paths: ['**'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+    });
+    eng.check('read_file', 'fs.read', { file_path: 'src/index.ts' });
+    expect(collected[0]?.score).toBe(0);
+    expect(collected[0]?.score_components).toEqual({});
+  });
+
+  test('bash rm carries capability_risk + blocklist_command', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['rm *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+    });
+    eng.check('bash', 'bash', { command: 'rm -rf /tmp/x' });
+    const components = collected[0]?.score_components ?? {};
+    expect(components.capability_risk).toBeGreaterThan(0);
+    expect(components.blocklist_command).toBeGreaterThan(0);
+    expect(collected[0]?.score).toBeGreaterThan(0.5);
+  });
+
+  test('MCP tool prefix triggers mcp_tool feature', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({}), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+    });
+    // mcp__ prefix → defaultIsMcpTool returns true → mcp_tool feature
+    // The fallback Conservative resolver also fires (registry has no
+    // resolver) which adds confidence_low. Mostly we want
+    // mcp_tool present.
+    eng.check('mcp__github__create_issue', 'misc', {});
+    expect(collected[0]?.score_components?.mcp_tool).toBe(0.1);
+  });
+
+  test('custom trustedHosts narrows untrusted_egress', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['curl *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      trustedHosts: ['internal.corp'],
+    });
+    eng.check('bash', 'bash', { command: 'curl https://internal.corp/data' });
+    expect(collected[0]?.score_components?.untrusted_egress).toBeUndefined();
+    eng.check('bash', 'bash', { command: 'curl https://github.com/repo' });
+    // github.com NOT in this custom list → untrusted
+    expect(collected[1]?.score_components?.untrusted_egress).toBeGreaterThan(0);
+  });
+
+  test('reason chain gets a risk-score entry when score > 0', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['rm *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+    });
+    eng.check('bash', 'bash', { command: 'rm -rf /tmp/x' });
+    const stages = collected[0]?.reason_chain.map((e) => e.stage) ?? [];
+    expect(stages).toContain('risk-score');
+    const entry = collected[0]?.reason_chain.find((e) => e.stage === 'risk-score');
+    expect(entry?.note).toMatch(/^score=0\.\d+$/);
+  });
+
+  test('zero-score path does NOT add a risk-score chain entry', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { read_file: { allow_paths: ['**'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+    });
+    eng.check('read_file', 'fs.read', { file_path: 'src/index.ts' });
+    const stages = collected[0]?.reason_chain.map((e) => e.stage) ?? [];
+    expect(stages).not.toContain('risk-score');
+  });
+
+  test('degraded state adds engine_degraded to components', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { read_file: { allow_paths: ['**'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      initialState: 'degraded',
+    });
+    eng.check('read_file', 'fs.read', { file_path: 'src/foo.ts' });
+    expect(collected[0]?.score_components?.engine_degraded).toBe(0.2);
+  });
+
+  test('recentToolErrors propagates to recent_errors feature', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      recentToolErrors: 5,
+    });
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(collected[0]?.score_components?.recent_errors).toBe(0.15);
+  });
+
+  test('state-rejecting check emits score=0 (no resolver / no compute)', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({}), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      initialState: 'refusing',
+    });
+    eng.check('bash', 'bash', { command: 'rm -rf /' });
+    // Deny shape per slice 2 — score not computed since the gate
+    // rejected the call before the resolver/scoring pipeline.
+    expect(collected[0]?.decision).toBe('deny');
+    expect(collected[0]?.score).toBe(0);
+    expect(collected[0]?.score_components).toEqual({});
   });
 });

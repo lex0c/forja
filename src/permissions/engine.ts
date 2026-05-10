@@ -16,6 +16,13 @@ import { type ProtectedTier, classifyProtectedPath } from './protected_paths.ts'
 // module load. Engine consumers don't need a separate wire-up step.
 import { type ResolverResult, resolveCapabilities } from './resolvers/index.ts';
 import {
+  DEFAULT_TRUSTED_HOSTS,
+  type RiskScoreConfidence,
+  type RiskScoreInput,
+  computeRiskScore,
+  defaultIsMcpTool,
+} from './risk-score.ts';
+import {
   type EngineState,
   type StateController,
   createStateController,
@@ -72,6 +79,24 @@ export interface EngineOptions {
   // is even constructed. Mutually exclusive with `initialState`;
   // when both are present, the controller wins.
   stateController?: StateController;
+  // Risk-score inputs (PERMISSION_ENGINE.md §6.3). All optional;
+  // defaults are documented at each field. The score is computed
+  // for every check and recorded in the audit row; the approval
+  // gate doesn't consume it yet (calibration slice — §6.3.2).
+  //
+  // `trustedHosts`: hosts whose net-egress capabilities do NOT
+  // trigger the `untrusted_egress` feature. Default:
+  // DEFAULT_TRUSTED_HOSTS (github.com + 5 common public registries).
+  trustedHosts?: readonly string[];
+  // `isMcpTool`: predicate for the `mcp_tool` feature. Default:
+  // tool names starting with `mcp__` (per MCP loader convention).
+  isMcpTool?: (toolName: string) => boolean;
+  // `recentToolErrors`: number of consecutive errored tool calls
+  // preceding this one. Caller-supplied because the engine doesn't
+  // track outcomes (harness's job). Default 0 — the
+  // `recent_errors` feature contributes 0 until a harness-side
+  // counter slice wires this through.
+  recentToolErrors?: number;
 }
 
 export interface PermissionEngine {
@@ -684,6 +709,9 @@ export const createPermissionEngine = (
   // by health-watcher slices) take effect immediately.
   const stateController =
     options.stateController ?? createStateController({ initial: options.initialState ?? 'ready' });
+  const trustedHosts = options.trustedHosts ?? DEFAULT_TRUSTED_HOSTS;
+  const isMcpTool = options.isMcpTool ?? defaultIsMcpTool;
+  const recentToolErrors = options.recentToolErrors ?? 0;
   // policy_hash is stamped on every audit row. Computed ONCE at
   // construction — the policy doesn't change for an engine
   // instance (hot reload is a separate slice that builds a new
@@ -705,9 +733,19 @@ export const createPermissionEngine = (
     args: ToolArgs,
     decision: Decision,
     capabilities: readonly Capability[],
+    score: number,
+    scoreComponents: Record<string, number>,
     extraStage?: ReasonChainEntry,
   ): void => {
     const chain = reasonChainFor(decision);
+    if (score > 0) {
+      // Surface the score in the reason chain so the modal preview
+      // can render "Risk score: 0.62 (capability_risk 0.40, …)"
+      // straight from the chain — no recompute. Zero-score calls
+      // get no entry (the chain stays one line for the common safe
+      // case) and the audit row's `score` column still records 0.
+      chain.push({ stage: 'risk-score', note: `score=${score.toFixed(2)}` });
+    }
     if (extraStage !== undefined) chain.push(extraStage);
     const input: AuditEmitInput = {
       session_id: sessionId,
@@ -721,6 +759,8 @@ export const createPermissionEngine = (
       // it. Resolver implementation order doesn't leak into the
       // ledger.
       capabilities: sortCapabilities(capabilities).map(formatCapability),
+      score,
+      score_components: scoreComponents,
     };
     audit.emit(input);
   };
@@ -741,7 +781,7 @@ export const createPermissionEngine = (
         reason: `engine not ready (state=${currentState})`,
         source: { layer: 'default', section: 'engine-state' },
       };
-      emitAudit(toolName, args, decision, []);
+      emitAudit(toolName, args, decision, [], 0, {});
       return decision;
     }
 
@@ -772,11 +812,38 @@ export const createPermissionEngine = (
           reason: `resolver refused: ${resolverResult.reason}`,
           source: { layer: 'default', section: 'resolver-refuse' },
         };
-        emitAudit(toolName, args, decision, []);
+        emitAudit(toolName, args, decision, [], 0, {});
         return decision;
       }
       resolvedCapabilities = resolverResult.capabilities;
     }
+
+    // Compute the deterministic risk score (PERMISSION_ENGINE.md §6.3)
+    // once per check, from the resolved state. Used both for the
+    // audit row and (in a future slice) for the approval-gate
+    // escalation. Conservative resolver outcomes feed `low`
+    // confidence into the score; `null` resolver (misc category)
+    // feeds `high` since misc tools have no side effects worth
+    // scoring.
+    const scoreConfidence: RiskScoreConfidence =
+      resolverResult === null
+        ? 'high'
+        : resolverResult.kind === 'conservative'
+          ? 'low'
+          : resolverResult.confidence;
+    const riskInput: RiskScoreInput = {
+      capabilities: resolvedCapabilities,
+      ...(typeof args.command === 'string' ? { command: args.command } : {}),
+      toolName,
+      isMcp: isMcpTool(toolName),
+      confidence: scoreConfidence,
+      engineState: currentState,
+      recentToolErrors,
+      trustedHosts,
+      cwd,
+      home,
+    };
+    const { score, components: scoreComponents } = computeRiskScore(riskInput);
     // What forces a `confirm` upgrade after the normal pipeline:
     //   - Conservative outcome (the resolver couldn't pin a precise
     //     set; the operator deserves the modal).
@@ -814,7 +881,15 @@ export const createPermissionEngine = (
         source: { layer: provenance?.defaults ?? 'default' },
       };
       const upgraded = currentState === 'degraded' ? degradeAllowToConfirm(baseAllow) : baseAllow;
-      emitAudit(toolName, args, upgraded, resolvedCapabilities, degradedStageEntry(currentState));
+      emitAudit(
+        toolName,
+        args,
+        upgraded,
+        resolvedCapabilities,
+        score,
+        scoreComponents,
+        degradedStageEntry(currentState),
+      );
       return upgraded;
     }
 
@@ -922,7 +997,7 @@ export const createPermissionEngine = (
         : resolverForcesConfirm && !sessionAllowed
           ? resolverStageEntry(resolverResult)
           : undefined;
-    emitAudit(toolName, args, decision, resolvedCapabilities, extraStage);
+    emitAudit(toolName, args, decision, resolvedCapabilities, score, scoreComponents, extraStage);
     return decision;
   };
 

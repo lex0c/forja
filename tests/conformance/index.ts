@@ -63,6 +63,14 @@ export interface ConformanceCase {
     capabilities_include?: readonly string[];
     // Exact resolver outcome kind: 'ok' | 'conservative' | 'refuse'.
     resolver_kind?: 'ok' | 'conservative' | 'refuse';
+    // Score bounds and component presence checks. Each is optional;
+    // when set, the driver compares the audit row's `score` and
+    // `score_components` against the assertion. score_gte/lte are
+    // inclusive bounds; score_components_include is a subset match
+    // — each named component must be present in the audit row.
+    score_gte?: number;
+    score_lte?: number;
+    score_components_include?: readonly string[];
   };
 }
 
@@ -105,9 +113,27 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
     policyYaml.trim().length === 0
       ? loadPolicyFromString('defaults: { mode: strict }')
       : loadPolicyFromString(policyYaml, { cwd, home });
+  // Capture the audit row so score / score_components / capabilities
+  // assertions can read what the engine actually emitted instead of
+  // recomputing. Lets the suite anchor on the production wiring.
+  interface CapturedRow {
+    score?: number;
+    score_components?: Record<string, number>;
+  }
+  const captured: CapturedRow[] = [];
+  const sink = {
+    emit(input: CapturedRow) {
+      captured.push(input);
+      return { seq: captured.length, this_hash: `fake-${captured.length}` };
+    },
+    verifyChain() {
+      return { ok: true as const, rows: captured.length };
+    },
+  };
   const engine = createPermissionEngine(policy, {
     cwd,
     home,
+    audit: sink,
     ...(c.setup.initialState !== undefined ? { initialState: c.setup.initialState } : {}),
   });
   const decision = engine.check(
@@ -115,6 +141,7 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
     c.input.category,
     c.input.args as Parameters<typeof engine.check>[2],
   );
+  const auditRow = captured[0];
 
   // Resolver-side assertions consult the resolver directly. The
   // engine consumes the same result for its audit row, so this is
@@ -172,6 +199,27 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
       reasons.push(
         `reason missing substring '${c.expect.reason_substring}' (got: ${decision.reason ?? '<absent>'})`,
       );
+    }
+  }
+  if (c.expect.score_gte !== undefined) {
+    const score = auditRow?.score ?? 0;
+    if (score < c.expect.score_gte) {
+      reasons.push(`score_gte mismatch: expected >= ${c.expect.score_gte}, got ${score}`);
+    }
+  }
+  if (c.expect.score_lte !== undefined) {
+    const score = auditRow?.score ?? 0;
+    if (score > c.expect.score_lte) {
+      reasons.push(`score_lte mismatch: expected <= ${c.expect.score_lte}, got ${score}`);
+    }
+  }
+  if (c.expect.score_components_include !== undefined) {
+    const components = auditRow?.score_components ?? {};
+    for (const expectedComp of c.expect.score_components_include) {
+      if (!(expectedComp in components)) {
+        const got = Object.keys(components).sort().join(', ') || '<none>';
+        reasons.push(`score_components missing '${expectedComp}' (got: ${got})`);
+      }
     }
   }
   return { case: c, decision, ok: reasons.length === 0, reasons };

@@ -15,6 +15,69 @@ Format:
 
 ---
 
+## [2026-05-10] permission-engine-v2 — slice 4: deterministic risk score
+
+**Done.** Fourth slice of the v2 evolution. Implements the deterministic risk score from PERMISSION_ENGINE.md §6.3 — a weighted sum of 11 features over the resolved capabilities + command shape + engine state. Score and component breakdown populate the audit row's `score` and `score_components_json` columns (stubbed `0` / `'{}'` since slice 1). The classifier hint (§6.4) is the next slice; this lands the deterministic floor first.
+
+### Why now
+
+Slice 3 produced capabilities but the audit row still ships `score=0`. Without a score, the audit chain is just an "who did what" log — it can't answer "how risky was this decision" for telemetry, post-incident review, or the calibration plan in spec §6.3.2. The score is also the input that the future classifier slice adjusts (±0.2 clamped) and the input the future approval-gate slice consults to escalate `allow` → `confirm` on high-score decisions (`§6.6 table`). Wiring the deterministic score now unblocks both.
+
+### Why not also wire score → approval gate
+
+Spec §6.6 says "static rule `allow` matched AND (score ≥ 0.4 or confidence < high) → confirm". Applying that today, with un-calibrated weights, would force confirms on shapes that operators have been allowing through slice 1–3 without complaint. Spec §6.3.2 is explicit: pesos baseline são "chute informado", and the calibration loop wants "(score, decisão_humana, outcome) triples" before treating the gate as authoritative. This slice records the score in audit; a follow-up slice (post-pilot telemetry) flips the gate. Recording is non-disruptive and gathers exactly the data calibration needs.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/risk-score.ts` | New. `RiskScoreInput` (capabilities, command, toolName, isMcp, confidence, engineState, recentToolErrors, trustedHosts, cwd, home), `RiskScoreOutput` (`score` 0–1, `components` Record<feature, weight>). Eleven features per §6.3.1 — `capability_risk` (+0.40), `wildcard_scope` (+0.20), `workspace_escape` (+0.15), `blocklist_command` (+0.30), `untrusted_egress` (+0.25), `recent_errors` (+0.15), `shell_complex` (+0.20), `mcp_tool` (+0.10), `confidence_medium` (+0.10), `confidence_low` (+0.30), `engine_degraded` (+0.20). Sum capped at 1.0. Pure / deterministic. |
+| `src/permissions/engine.ts` | `EngineOptions` gains `trustedHosts?: readonly string[]` (default: github.com + api.github.com + registry.npmjs.org + registry.yarnpkg.com + pypi.org + crates.io), `isMcpTool?: (name) => boolean` (default: name starts with `mcp__`), `recentToolErrors?: number` (default 0; future slice wires harness-level counter). `check()` computes the score after the resolver and passes both `score` + `score_components` to `emitAudit`. Reason chain gains a `risk-score` entry. The approval gate is intentionally NOT consumed yet. |
+| `src/permissions/audit.ts` | `AuditEmitInput` already declares `score` / `score_components`; this slice just stops them being `undefined` at emit time. Audit row's `score` / `score_components_json` columns now reflect the live computation. |
+| `tests/permissions/risk-score.test.ts` | New. Each feature in isolation, cap-at-1.0, zero-baseline for read-only single-capability calls, determinism (same input → same components). |
+| `tests/permissions/engine.test.ts` | +block: audit row carries score + components for representative tool calls (read-only baseline, dangerous capability, MCP tool, degraded state). |
+| `tests/conformance/cases/risk_score.yaml` | New. Conformance seed (~10 cases): read_file → low; bash rm → high (capability_risk + blocklist); curl github → low (trusted); curl arbitrary host → medium (untrusted_egress); compound bash → high (shell_complex + low confidence + conservative wildcard). |
+| `tests/conformance/index.ts` | Driver accepts `expect.score_gte` / `expect.score_lte` / `expect.score_components_include`. |
+
+### Decisions
+
+- **Record now, gate later.** Score goes into the audit row this slice; the approval gate ignores it. Calibration plan from §6.3.2 needs (score, decision, outcome) triples — collecting them is exactly what this slice enables. Flipping the gate after pilot telemetry is the right shape.
+- **Configurable trusted-hosts list with safe default.** Hardcoding a list in the source ties the registry to release cadence; making it a no-default would force every operator to populate it before any net-egress check passed. Default lists the six most-common package registries + github; operators override via `EngineOptions.trustedHosts` or (future slice) policy YAML.
+- **MCP detection by name prefix.** Spec §13.1 says MCP tools surface under `mcp__<server>__<tool>` convention. Until the tool registry exposes a `kind` field, the engine treats `name.startsWith('mcp__')` as a stable proxy. `isMcpTool` override lets tests + future registry integration swap the heuristic without engine changes.
+- **`recent_errors` source is the caller, not the engine.** The engine doesn't track tool-call outcomes (that's the harness's job). `EngineOptions.recentToolErrors` is a number the bootstrap or harness wires per-check; for now it defaults to 0 and the feature contributes 0 until a harness-side counter slice lands.
+- **Determinism is load-bearing.** The `score` lands in the audit row which feeds the hash chain. Two checks against semantically equivalent inputs must produce identical scores AND identical `score_components_json` so the chain hash stays stable across replays. Components are emitted as a plain object whose keys are also lex-sorted by `canonicalize`.
+- **Components map is sparse, not zero-filled.** Only ACTIVE features land in `score_components`. Zero-weight features (`confidence: 'high'` contributing nothing, `engineState: 'ready'` contributing nothing) are absent. Absence is information-preserving when the feature catalog is documented in spec §6.3.1 — a replay reading the JSON can tell "wasn't active" from "didn't exist when this row was written" via the engine version line.
+- **Conservative resolver → confidence=`low` for scoring.** The resolver's Conservative outcome doesn't carry a `confidence` field (it carries a `reason`). For score computation we treat it as `low` — Conservative means "couldn't pin a precise capability set", which is genuinely ambiguous. Aligns with the spec §6.3 row "confidence do resolver = low → +0.30".
+- **Misc category uses confidence=`high` for score.** Misc tools have no side effects worth gating; treating them as low-confidence would inflate the score for harmless tools. `null` resolver result (misc category short-circuit) explicitly maps to high.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **4983 pass / 10 skip / 0 fail** (4993 total across 234 files). +66 net new tests vs slice 3:
+  - `tests/permissions/risk-score.test.ts` (+48 — each feature in isolation, cap, determinism)
+  - `tests/permissions/engine.test.ts` (+9 — audit row integration block)
+  - `tests/conformance/cases/risk_score.yaml` (+9 cases)
+
+### Wired but deferred
+
+- **Approval-gate consumption of score.** Spec §6.6 wants "static rule `allow` matched AND (score ≥ 0.4 or confidence < high) → confirm". This slice records but does not consume. Calibration loop (§6.3.2) needs telemetry first; the gate switch lands in a follow-up after a pilot deployment validates the threshold against operator-fatigue data.
+- **`recent_errors` counter wired through the harness.** `EngineOptions.recentToolErrors` accepts an integer; the harness slice that updates it after every tool result lands separately. Today it stays at 0 in production.
+- **Classifier hint (±0.2 score adjust).** Spec §6.4 has an optional ML classifier that receives capabilities + score and adjusts ±0.2 clamped. The deterministic floor lands first; the classifier is its own slice.
+- **Policy-driven trusted-hosts.** Today operators override via `EngineOptions.trustedHosts`. A future slice surfaces this in the policy YAML (`tools.fetch_url.trusted_hosts` or similar).
+
+### Next
+
+Successor slices (in spec order):
+1. Classifier hint (±0.2 score adjust, hint-only).
+2. Bash AST resolver via tree-sitter (replaces token-based bash resolver; closes the bash-side protected-path gap from slice 1).
+3. Approval-gate consumption of score (post-pilot calibration).
+4. `--rotate-chain` flow.
+5. Subagent intersection formal.
+6. Sandbox plan integration (bwrap profile selection).
+
+---
+
 ## [2026-05-10] permission-engine-v2 — slice 3: capabilities + resolver per-tool
 
 **Done.** Third slice of the v2 evolution. Introduces the capability model (PERMISSION_ENGINE.md §3 + §5) — every `check()` now resolves the tool's args into a list of canonical capabilities (`read-fs:./src/**`, `exec:shell`, `net-egress:api.github.com`, ...) that flow into the audit row's `capabilities_json` column. Resolvers are per-tool, deterministic, and pure; the registry is extensible so MCP tools (M3+) plug in the same way as builtins.
