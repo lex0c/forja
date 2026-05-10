@@ -606,11 +606,20 @@ describe('/recap', () => {
     const result = await recapCommand.exec(['pr'], ctx);
     expect(result.kind).toBe('ok');
 
+    // Audit reflects the REAL LLM spend even though the shipped
+    // markdown is from the deterministic fallback. Pre-fix the
+    // helper dropped `usage` on post-call failures and the audit
+    // recorded zero cost — silent under-reporting on every
+    // malformed-but-billed response. Post-fix the audit row pins
+    // `usedLlm: true` plus the actual tokens/cost from the
+    // provider call.
     const runs = listRecentRecapRuns(db);
-    expect(runs[0]?.usedLlm).toBe(false);
+    expect(runs[0]?.usedLlm).toBe(true);
     expect(runs[0]?.cacheHit).toBe(false);
-    expect(runs[0]?.costUsd).toBe(0);
-    expect(runs[0]?.promptVersion).toBeNull();
+    expect(runs[0]?.costUsd).toBeGreaterThan(0);
+    expect(runs[0]?.tokensIn).toBe(100);
+    expect(runs[0]?.tokensOut).toBe(50);
+    expect(runs[0]?.promptVersion).toBe('pr-v1');
 
     const warns = events.filter((e) => e.type === 'warn');
     expect(warns).toHaveLength(1);
@@ -638,8 +647,12 @@ describe('/recap', () => {
     const warns = events.filter((e) => e.type === 'warn');
     expect(warns[0]?.message).toContain('fidelity-mismatch');
 
+    // Same usage-preservation contract as the schema-violation
+    // test: the LLM was billed before the fidelity check ran.
     const runs = listRecentRecapRuns(db);
-    expect(runs[0]?.usedLlm).toBe(false);
+    expect(runs[0]?.usedLlm).toBe(true);
+    expect(runs[0]?.costUsd).toBeGreaterThan(0);
+    expect(runs[0]?.promptVersion).toBe('pr-v1');
   });
 
   test('/recap pr --no-llm-render bypasses provider entirely', async () => {
@@ -819,7 +832,10 @@ describe('/recap', () => {
 
     const runs = listRecentRecapRuns(db);
     expect(runs[0]?.renderer).toBe('slack');
-    expect(runs[0]?.usedLlm).toBe(false);
+    // Schema violation = post-call failure; usage preserved.
+    expect(runs[0]?.usedLlm).toBe(true);
+    expect(runs[0]?.costUsd).toBeGreaterThan(0);
+    expect(runs[0]?.promptVersion).toBe('slack-v1');
   });
 
   test('/recap (default human) LLM path: emits ## Resumo and audits used_llm/prompt_version', async () => {
@@ -1525,7 +1541,11 @@ describe('/recap', () => {
     const warns = events.filter((e) => e.type === 'warn');
     expect(warns[0]?.message).toContain('invalid-json');
 
+    // Invalid-JSON is a post-call failure — provider already
+    // billed before the parser failed. Audit reflects spend.
     const runs = listRecentRecapRuns(db);
-    expect(runs[0]?.usedLlm).toBe(false);
+    expect(runs[0]?.usedLlm).toBe(true);
+    expect(runs[0]?.costUsd).toBeGreaterThan(0);
+    expect(runs[0]?.promptVersion).toBe('terse-v1');
   });
 });

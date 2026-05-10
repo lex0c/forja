@@ -29,7 +29,23 @@ export type RenderViaLlmFailureReason =
 
 export type RenderViaLlmResult<T> =
   | { ok: true; output: string; structured: T; usage: UsageInfo; costUsd: number }
-  | { ok: false; reason: RenderViaLlmFailureReason; detail: string };
+  | {
+      ok: false;
+      reason: RenderViaLlmFailureReason;
+      detail: string;
+      // Provider already billed for the call when it succeeded
+      // structurally but the post-call checks (parse, schema,
+      // fidelity, concision) rejected the output. Surface the
+      // real `usage` + `costUsd` so the caller's audit row
+      // reflects actual spend instead of zero — silent
+      // under-reporting on every malformed-but-billed response
+      // distorts spend tracking and any downstream alerting.
+      // Pre-call failures (`capability-missing`, `provider-error`
+      // before the request landed) leave these undefined: no
+      // call, no bill.
+      usage?: UsageInfo;
+      costUsd?: number;
+    };
 
 export interface RenderViaLlmInput<T> {
   // Provider the LLM call goes to. Capability gate trips when
@@ -134,6 +150,12 @@ export const renderViaLlm = async <T>(
     };
   }
 
+  // Compute cost once at the post-call boundary so every failure
+  // path that comes AFTER this point can carry it. The provider
+  // already billed; the audit row must reflect that even when we
+  // ship the deterministic fallback.
+  const costUsd = computeCost(provider.capabilities, usage);
+
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -142,6 +164,8 @@ export const renderViaLlm = async <T>(
       ok: false,
       reason: 'invalid-json',
       detail: e instanceof Error ? e.message : String(e),
+      usage,
+      costUsd,
     };
   }
 
@@ -151,6 +175,8 @@ export const renderViaLlm = async <T>(
       ok: false,
       reason: 'schema-violation',
       detail: validation.errors.join('; '),
+      usage,
+      costUsd,
     };
   }
   const structured = parsed as T;
@@ -161,6 +187,8 @@ export const renderViaLlm = async <T>(
       ok: false,
       reason: 'fidelity-mismatch',
       detail: fidelity.errors.join('; '),
+      usage,
+      costUsd,
     };
   }
 
@@ -178,9 +206,10 @@ export const renderViaLlm = async <T>(
       ok: false,
       reason: 'concision-violation',
       detail: `output ${lineCount} lines exceeds limit ${input.maxOutputLines}`,
+      usage,
+      costUsd,
     };
   }
 
-  const costUsd = computeCost(provider.capabilities, usage);
   return { ok: true, output, structured, usage, costUsd };
 };

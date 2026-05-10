@@ -11,8 +11,11 @@ import { renderViaLlm } from '../../src/recap/llm-shared.ts';
 // Minimal mock provider — returns a fixed JSON payload so the
 // orchestrator's parse / validate / fidelity / template path runs
 // to the concision check without renderer-specific scaffolding.
-const makeMockProvider = (output: string): Provider => {
-  const caps: ProviderCapabilities = {
+const makeMockProvider = (
+  output: string,
+  options: { usage?: UsageInfo; caps?: ProviderCapabilities } = {},
+): Provider => {
+  const caps: ProviderCapabilities = options.caps ?? {
     tools: 'native',
     cache: 'server_5min',
     vision: false,
@@ -24,7 +27,12 @@ const makeMockProvider = (output: string): Provider => {
     cost_per_1k_output: 0,
     notes: [],
   };
-  const usage: UsageInfo = { input: 0, output: 0, cache_read: 0, cache_creation: 0 };
+  const usage: UsageInfo = options.usage ?? {
+    input: 0,
+    output: 0,
+    cache_read: 0,
+    cache_creation: 0,
+  };
   return {
     id: 'mock/m',
     family: 'anthropic',
@@ -34,6 +42,26 @@ const makeMockProvider = (output: string): Provider => {
     countTokens: async () => 0,
   };
 };
+
+const billedCaps = (): ProviderCapabilities => ({
+  tools: 'native',
+  cache: 'server_5min',
+  vision: false,
+  streaming: true,
+  constrained: 'tools',
+  context_window: 200_000,
+  output_max_tokens: 4_096,
+  cost_per_1k_input: 1.0,
+  cost_per_1k_output: 5.0,
+  notes: [],
+});
+
+const billedUsage = (): UsageInfo => ({
+  input: 1_000,
+  output: 200,
+  cache_read: 0,
+  cache_creation: 0,
+});
 
 interface Stub {
   schemaVersion: 'stub-v1';
@@ -130,5 +158,145 @@ describe('renderViaLlm — concision line-count check', () => {
       maxOutputLines: 2,
     });
     expect(result.ok).toBe(true);
+  });
+});
+
+describe('renderViaLlm — usage propagation on post-call failure', () => {
+  // Regression: pre-fix the orchestrator dropped `usage` on every
+  // post-call check failure (parse / schema / fidelity /
+  // concision), so callers fell back to deterministic and the
+  // audit row recorded zero cost — silent under-reporting on
+  // every malformed-but-billed response. Pin the four reasons
+  // here so any future refactor that drops `usage` from one of
+  // the failure variants surfaces immediately.
+  test('invalid-json carries usage and costUsd', async () => {
+    const provider = makeMockProvider('not-json-at-all', {
+      usage: billedUsage(),
+      caps: billedCaps(),
+    });
+    const result = await renderViaLlm<Stub>({
+      provider,
+      prompt: { system: '', user: '' },
+      schemaName: 'stub_render',
+      jsonSchema: STUB_JSON_SCHEMA,
+      validate: VALIDATE_OK,
+      fidelityCheck: FIDELITY_OK,
+      template: () => 'x',
+      maxOutputLines: 1,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe('invalid-json');
+    expect(result.usage).toEqual(billedUsage());
+    expect(result.costUsd).toBeGreaterThan(0);
+  });
+
+  test('schema-violation carries usage and costUsd', async () => {
+    const provider = makeMockProvider(JSON.stringify(STUB_VALUE), {
+      usage: billedUsage(),
+      caps: billedCaps(),
+    });
+    const result = await renderViaLlm<Stub>({
+      provider,
+      prompt: { system: '', user: '' },
+      schemaName: 'stub_render',
+      jsonSchema: STUB_JSON_SCHEMA,
+      validate: () => ({ ok: false, errors: ['nope'] }),
+      fidelityCheck: FIDELITY_OK,
+      template: () => 'x',
+      maxOutputLines: 1,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe('schema-violation');
+    expect(result.usage).toEqual(billedUsage());
+    expect(result.costUsd).toBeGreaterThan(0);
+  });
+
+  test('fidelity-mismatch carries usage and costUsd', async () => {
+    const provider = makeMockProvider(JSON.stringify(STUB_VALUE), {
+      usage: billedUsage(),
+      caps: billedCaps(),
+    });
+    const result = await renderViaLlm<Stub>({
+      provider,
+      prompt: { system: '', user: '' },
+      schemaName: 'stub_render',
+      jsonSchema: STUB_JSON_SCHEMA,
+      validate: VALIDATE_OK,
+      fidelityCheck: () => ({ ok: false, errors: ['hallucinated'] }),
+      template: () => 'x',
+      maxOutputLines: 1,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe('fidelity-mismatch');
+    expect(result.usage).toEqual(billedUsage());
+    expect(result.costUsd).toBeGreaterThan(0);
+  });
+
+  test('concision-violation carries usage and costUsd', async () => {
+    const provider = makeMockProvider(JSON.stringify(STUB_VALUE), {
+      usage: billedUsage(),
+      caps: billedCaps(),
+    });
+    const result = await renderViaLlm<Stub>({
+      provider,
+      prompt: { system: '', user: '' },
+      schemaName: 'stub_render',
+      jsonSchema: STUB_JSON_SCHEMA,
+      validate: VALIDATE_OK,
+      fidelityCheck: FIDELITY_OK,
+      template: () => 'one\ntwo\nthree\n',
+      maxOutputLines: 1,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe('concision-violation');
+    expect(result.usage).toEqual(billedUsage());
+    expect(result.costUsd).toBeGreaterThan(0);
+  });
+
+  test('capability-missing has NO usage (pre-call failure, no bill)', async () => {
+    const provider = makeMockProvider(JSON.stringify(STUB_VALUE), {
+      caps: { ...billedCaps(), constrained: false },
+    });
+    const result = await renderViaLlm<Stub>({
+      provider,
+      prompt: { system: '', user: '' },
+      schemaName: 'stub_render',
+      jsonSchema: STUB_JSON_SCHEMA,
+      validate: VALIDATE_OK,
+      fidelityCheck: FIDELITY_OK,
+      template: () => 'x',
+      maxOutputLines: 1,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe('capability-missing');
+    expect(result.usage).toBeUndefined();
+    expect(result.costUsd).toBeUndefined();
+  });
+
+  test('provider-error has NO usage (pre-call failure, request never landed)', async () => {
+    const provider: Provider = {
+      ...makeMockProvider(JSON.stringify(STUB_VALUE)),
+      generateConstrained: () => Promise.reject(new Error('rate limited')),
+    };
+    const result = await renderViaLlm<Stub>({
+      provider,
+      prompt: { system: '', user: '' },
+      schemaName: 'stub_render',
+      jsonSchema: STUB_JSON_SCHEMA,
+      validate: VALIDATE_OK,
+      fidelityCheck: FIDELITY_OK,
+      template: () => 'x',
+      maxOutputLines: 1,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe('provider-error');
+    expect(result.usage).toBeUndefined();
+    expect(result.costUsd).toBeUndefined();
   });
 });

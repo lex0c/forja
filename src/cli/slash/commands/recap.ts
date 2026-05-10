@@ -783,7 +783,26 @@ const renderWithLlmOrFallback = async (
       ts: ctx.now(),
       message: `/recap ${parsed.format}: LLM render failed (${result.reason}: ${result.detail}); using deterministic fallback`,
     });
-    return deterministicOutcome(dispatch.deterministic(intermediate, renderOptions));
+    const fallbackOutput = dispatch.deterministic(intermediate, renderOptions);
+    // Post-call failures (parse / schema / fidelity / concision)
+    // billed real tokens before the rejection — the orchestrator
+    // surfaces `usage` + `costUsd` on those reasons. Pre-call
+    // failures (`capability-missing`, `provider-error`) leave both
+    // undefined. Either way the operator sees the deterministic
+    // markdown; the audit row records the spend that actually
+    // happened so `recap_runs` doesn't under-report.
+    if (result.usage !== undefined && result.costUsd !== undefined) {
+      return {
+        output: fallbackOutput,
+        usedLlm: true,
+        cacheHit: false,
+        costUsd: result.costUsd,
+        tokensIn: result.usage.input + result.usage.cache_read + result.usage.cache_creation,
+        tokensOut: result.usage.output,
+        promptVersion: dispatch.promptVersion,
+      };
+    }
+    return deterministicOutcome(fallbackOutput);
   }
 
   // Successful LLM render — write to cache for the next caller.
