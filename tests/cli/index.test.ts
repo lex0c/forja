@@ -300,7 +300,18 @@ describe('cli entrypoint: prompt requirement', () => {
       // fallback was wrongly hiding.
       mkdirSync(join(spawnCwd, '.agent'), { recursive: true });
       writeFileSync(join(spawnCwd, '.agent', 'permissions.yaml'), 'this: is: not: valid: yaml\n');
-      const env = { ...process.env, XDG_DATA_HOME: dataDir };
+      // Inject a fake API key so bootstrap clears the provider
+      // auth gate (which fires before YAML parsing) — without
+      // this, environments without ANTHROPIC_API_KEY in process.env
+      // (clean checkouts, CI without secrets) would hit the
+      // auth-fallback path instead of the YAML hard-fail we're
+      // pinning. The fake key never reaches the network: this
+      // test never makes an LLM call.
+      const env = {
+        ...process.env,
+        XDG_DATA_HOME: dataDir,
+        ANTHROPIC_API_KEY: 'sk-ant-fake-test-key',
+      };
       const proc = Bun.spawn(
         ['bun', entry, 'recap', 'session', 'no-such-session', '--no-llm-render'],
         { cwd: spawnCwd, stdout: 'pipe', stderr: 'pipe', env },
