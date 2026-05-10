@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -276,6 +276,46 @@ describe('cli entrypoint: prompt requirement', () => {
       expect(stderr).toContain('forja recap: unknown model');
       expect(stderr).toContain('anthropic/sonnett-typo');
       expect(stderr).not.toContain('LLM render disabled');
+      expect(exitCode).toBe(1);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+      rmSync(spawnCwd, { recursive: true, force: true });
+    }
+  });
+
+  test('`recap` hard-fails on a malformed .agent/permissions.yaml (config error, not auth)', async () => {
+    // Regression: pre-fix the catch block was a catch-all — every
+    // bootstrap failure that wasn't "unknown model" degraded to
+    // the stub, including malformed policy YAML, broken hook
+    // config, and other repo setup mistakes. Operator's CI saw
+    // `exit 0` and "LLM render disabled" hiding a real config
+    // bug. Post-fix: ONLY the API-key-required path falls back;
+    // every other bootstrap exception is a hard fail.
+    const dataDir = mkdtempSync(join(tmpdir(), 'forja-cli-'));
+    const spawnCwd = mkdtempSync(join(tmpdir(), 'forja-bad-policy-'));
+    try {
+      // Seed a malformed permissions.yaml inside .agent/. Bootstrap
+      // reads it during policy resolution and throws a YAML parse
+      // error — that's exactly the "real config bug" shape the
+      // fallback was wrongly hiding.
+      mkdirSync(join(spawnCwd, '.agent'), { recursive: true });
+      writeFileSync(join(spawnCwd, '.agent', 'permissions.yaml'), 'this: is: not: valid: yaml\n');
+      const env = { ...process.env, XDG_DATA_HOME: dataDir };
+      const proc = Bun.spawn(
+        ['bun', entry, 'recap', 'session', 'no-such-session', '--no-llm-render'],
+        { cwd: spawnCwd, stdout: 'pipe', stderr: 'pipe', env },
+      );
+      const [stderr, exitCode] = await Promise.all([
+        new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+        proc.exited,
+      ]);
+      // Hard-fail; NOT the LLM-render-disabled warn.
+      expect(stderr).toContain('forja recap:');
+      expect(stderr).not.toContain('LLM render disabled');
+      // The YAML parser's diagnostic surfaces in the message;
+      // assert non-zero exit + no silent fallback rather than
+      // pinning a specific YAML error string (parser-version
+      // dependent).
       expect(exitCode).toBe(1);
     } finally {
       rmSync(dataDir, { recursive: true, force: true });

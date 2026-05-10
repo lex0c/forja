@@ -205,18 +205,25 @@ export const run = async (options: RunOptions): Promise<number> => {
         bootstrappedDbCloser = () => result.db.close();
       } catch (e) {
         const reason = e instanceof Error ? e.message : String(e);
-        // Hard-fail on unrecoverable config errors — typo in
-        // `--model <id>` should NOT silently degrade to the
-        // deterministic stub with exit 0, because CI / scripted
-        // usage would think the requested model was used. The
-        // bootstrap registry and every provider factory throw
-        // `"unknown ... model: <id>"` (variants: bare bootstrap,
-        // anthropic/google/openai factories) on lookup miss.
-        // Match the prefix and exit non-zero with a clear error.
-        // Recoverable failures (missing API key, network) keep
-        // the fallback path so `--no-llm-render` and other
-        // deterministic surfaces work without provider config.
-        if (/^unknown\b.*model/i.test(reason)) {
+        // Whitelist for the deterministic-fallback path: ONLY a
+        // missing-API-key throw degrades to the stub. Everything
+        // else (unknown model, malformed policy YAML, broken
+        // subagent loader, hook config errors, DB migration
+        // failures, ...) is a real configuration bug that must
+        // exit non-zero — `bootstrap()` throws for far more than
+        // provider auth, and a catch-all fallback would mask
+        // those errors behind "LLM render disabled" while still
+        // shipping deterministic output and exit 0. CI would
+        // see green on a broken repo setup.
+        //
+        // The three provider factories (anthropic / google /
+        // openai) all throw `"<vendor> API key required ..."`
+        // when the relevant env var is missing; matching that
+        // prefix is the precise gate. Other auth shapes (network
+        // unreachable, expired key) surface DURING the LLM call,
+        // not during bootstrap, and the orchestrator handles
+        // them via `provider-error` in `renderViaLlm`.
+        if (!/API key required/i.test(reason)) {
           errSink(`forja recap: ${reason}\n`);
           return 1;
         }
