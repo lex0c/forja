@@ -15,6 +15,73 @@ Format:
 
 ---
 
+## [2026-05-10] permission-engine-v2 — slice 3: capabilities + resolver per-tool
+
+**Done.** Third slice of the v2 evolution. Introduces the capability model (PERMISSION_ENGINE.md §3 + §5) — every `check()` now resolves the tool's args into a list of canonical capabilities (`read-fs:./src/**`, `exec:shell`, `net-egress:api.github.com`, ...) that flow into the audit row's `capabilities_json` column. Resolvers are per-tool, deterministic, and pure; the registry is extensible so MCP tools (M3+) plug in the same way as builtins.
+
+### Why now
+
+Slice 2 wired the audit ledger end-to-end but every row still ships `capabilities_json='[]'` — the column was stubbed for forward-compat. The risk score (next slice) is a weighted sum over capability features, so without a resolver producing them, every score is `0` and the score path stays dormant. Capabilities are also the foundation for the sandbox plan (slice 6: choose a `bwrap` profile whose `allowed_capabilities` cover the resolved set) and the classifier hint (which receives capabilities, not raw args, to mitigate prompt injection). Wiring resolvers now unblocks three downstream slices.
+
+### Why this NOT capability-based static rules
+
+Spec §6.2 sketches a capability-based static rule schema (`[[deny]] capability = "write-fs" scope = ".git/**"`). That migration is much larger — it changes the policy YAML schema, the matcher, the hierarchy resolver, and every existing tool/test fixture. Spec §0 explicitly preserves v1 as the external contract ("V1 segue válido como contrato externo (Tool Registry ↔ Engine)"); this slice respects that. Resolvers run BEFORE the rule lookup and produce capabilities that the audit row records, but the rule pipeline still consults `tools.write_file.allow_paths` etc. Capabilities are internal data for downstream consumers (audit, risk score, sandbox). Migrating the policy schema is a deliberate, separately-bounded slice.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/capabilities.ts` | New. `Capability` discriminated union (kind + optional scope), `parseCapability(s)`, `formatCapability(c)`, equality + canonical sort. Covers the 11 canonical kinds from §3.1. |
+| `src/permissions/resolvers/index.ts` | New. `Resolver` interface (`resolve(args, ctx)` → `Ok` / `Conservative` / `Refuse`), `ResolverContext` (cwd, home), registry with `getResolver(toolName)` lookup. |
+| `src/permissions/resolvers/fs.ts` | New. Resolvers for `read_file`, `write_file`, `edit_file`, `grep`, `glob`. Path-based: produce `read-fs(path)` and/or `write-fs(path)`. Run `classifyProtectedPath` to attach a hint (informational; the engine's protected-path classifier still gates the decision separately). |
+| `src/permissions/resolvers/fetch.ts` | New. Resolver for `fetch_url` → `[net-egress(host)]`. Refuses non-http(s) URLs and malformed inputs upstream of any policy lookup. |
+| `src/permissions/resolvers/bash.ts` | New. Token-based resolver (AST tree-sitter deferred per §5.2). Splits on `containsShellInjection` chars to get a first-token guess, looks up a hardcoded command table (`ls`/`grep`/`cat`/`find` → `read-fs`; `rm` → `delete-fs`; `mv`/`cp` → `read-fs` + `write-fs`; `curl`/`wget` → `net-egress`; `git`/`gh` → `git-write`; `npm`/`yarn`/`bun`/`pip` → `exec:arbitrary` + `write-fs(node_modules/venv)` + `net-egress(registry)`; `chmod`/`chown` → `write-fs` + `permission-mutate` flag; `dd`/`mkfs`/`fdisk` → `Refuse`). Unknown commands or any injection metachar drop confidence to `low` and return Conservative with the §5.2 fallback set. `eval`/`source` with non-literal arg → `Refuse`. |
+| `src/permissions/engine.ts` | `check()` runs the resolver BEFORE the rule pipeline. `Refuse` → deny with `source.section='resolver-refuse'`. `Conservative` or `confidence: low/medium` adds a `resolve` reason-chain entry. Audit row carries the resolved capabilities in `capabilities_json` (no longer stubbed). |
+| `tests/permissions/capabilities.test.ts` | New. Parse/format round-trip per kind, canonical sort, equality. |
+| `tests/permissions/resolvers.test.ts` | New. Per-resolver behavior: path resolution, host extraction, bash token lookup, adversarial bash shapes (eval / `$()` / pipe-to-shell / `dd`), unknown-command fallback. |
+| `tests/permissions/engine.test.ts` | +block: audit row captures resolved capabilities; `Refuse` produces deny; low confidence flows through reason chain. |
+| `tests/conformance/cases/capability_resolvers.yaml` | New. Conformance: read/write/grep/bash/fetch resolvers — input + expected capabilities + decision. Driver extended to accept `expect.capabilities` (subset match). |
+
+### Decisions
+
+- **Capabilities are INTERNAL data, not policy schema.** Policy YAML keeps the v1 shape (`tools.write_file.allow_paths`). Resolvers produce capabilities for the audit row and for downstream slices (risk score, sandbox plan, classifier hint). Migrating the policy schema to `[[allow]] capability=... scope=...` is a separate, deliberate slice that touches every test fixture; doing it inside this slice would balloon the diff.
+- **Bash resolver ships token-based, AST tree-sitter deferred.** Spec §5.2 wants a full AST walk. Token-based catches the common shapes — `rm -rf X`, `git status`, `curl URL`, `npm install`, `python -c` — and falls to Conservative on anything complex (`|`, `&&`, `$()`, `>` redirects). The bash AST resolver is its own slice (it also closes the bash-side protected-path gap from slice 1). Until then, anything ambiguous reads as Conservative + audit attribution intact.
+- **Resolver registry over per-tool dispatch in engine.** `engine.check` calls `resolveCapabilities(toolName, ...)` and lets the resolver return its result; the engine doesn't switch on tool name to pick capability shapes. Lets MCP tools (M3+) register via the same surface without a core code change.
+- **Confidence threshold is `low`, not `< high`.** Spec §5.1 literally says "Confidence < `high` força aprovação humana mesmo se static rule daria `allow`." Calibrating that against operator fatigue is the risk-score slice's job — applying it strictly now would force confirms on `git status >&1`, `npm test 2>&1`, every `find`-with-options, every read-only git subcommand. `medium` covers "well-understood with a small residual uncertainty" and should NOT pop the modal; only `low` (genuine ambiguity) and Conservative (couldn't decide) do. Documented as a calibration decision to revisit when the scoring formula lands.
+- **Session-allow and bypass mode are exempt from resolver upgrade.** Operator's explicit trust (session-allow click, or bypass-mode policy choice) is a stronger signal than resolver Conservative. Re-prompting on every session-trusted compound would defeat the slice 2 ergonomics work that introduced session-allow. `degraded` engine state still overrides both — a subsystem-health signal trumps operator trust because the trust was given under the expectation of a healthy engine.
+- **`misc` category skips resolution entirely.** Misc tools are declared "no side effects worth gating"; running them through the resolver would force a stub `Conservative` outcome and trigger the modal for tools (today_lifecycle, etc.) that explicitly don't need it.
+- **Sort capabilities canonically before hashing.** `capabilities_json` is built from `sortCapabilities(caps).map(formatCapability)`. Two runs against equivalent inputs produce byte-identical JSON (and therefore byte-identical chain hashes); resolver implementation order doesn't leak into the audit chain.
+- **Dual-name `file_path` / `path` arg compat.** Slice-3+ tools follow Anthropic SDK convention (`file_path`); the v1 contract used `path`. Both resolvers AND the engine's `resolveFsTarget` accept either name. New tools should standardize on `file_path`; the alias keeps existing v1 fixtures working without a coordinated rename.
+- **Bash missing-arg returns Ok-empty, not Refuse.** Refuse re-routes attribution to `resolver-refuse`; the engine's `checkBash` already produces a clean deny with `source.layer='default'` (no section) when `command` is missing. Returning empty Ok lets the downstream path keep its attribution shape — Refuse is reserved for structural dangers (`dd`, `mkfs`, `bash -c` with dynamic arg, `eval`).
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **4917 pass / 10 skip / 0 fail** (4927 total across 233 files). +100 net new tests vs slice 2:
+  - `tests/permissions/capabilities.test.ts` (+40)
+  - `tests/permissions/resolvers.test.ts` (+46)
+  - `tests/permissions/engine.test.ts` (no net change — existing tests adjusted)
+  - `tests/conformance/cases/capability_resolvers.yaml` (+14 cases)
+
+### Wired but deferred
+
+- **Bash AST resolver.** Spec §5.2 wants tree-sitter-bash for per-pipeline resolution + introspection of `-c` literal args + heredoc body scanning. Token-based catches the common shapes; AST resolver lands as its own slice and also closes the bash-side protected-path gap from slice 1.
+- **Capability-based static rules.** Spec §6.2 sketches a new policy shape (`[[allow]] capability=... scope=...`). Resolvers produce capabilities; the policy still matches against v1 `tools.X.allow_paths` etc. Migrating the schema is a separate, larger slice.
+- **Confidence calibration.** Current threshold is "Conservative or `low`-confidence" forces confirm; spec literal says "`< high`". The risk score slice will calibrate this against telemetry — until then, today's threshold preserves UX while still surfacing genuine ambiguity.
+
+### Next
+
+Successor slices (in spec order):
+1. Risk score determinístico (consumes capabilities + capability count + capability_kind heuristics).
+2. Bash AST resolver via tree-sitter (replaces the token-based bash resolver; closes the bash-side protected-path gap).
+3. `--rotate-chain` flow (rotation under known break).
+4. Subagent intersection formal (subagent capability set must be ⊆ parent's).
+5. Sandbox plan integration (bwrap profile selection from resolved capabilities).
+6. Classifier hint (±0.2 score adjust from a ML model receiving capabilities, not raw args).
+
+---
+
 ## [2026-05-10] permission-engine-v2 — slice 2: state machine + bootstrap formal
 
 **Done.** Second slice of the v2 evolution. Slice 1 shipped the audit hash chain and protected paths but left two threads loose: (a) the engine had no formal lifecycle — `createPermissionEngine` returned an instance immediately usable, with no notion of "init/loading/validating"; (b) the audit sink was opt-in via `EngineOptions.audit` and production bootstrap never wired it. This slice closes both, plus what they unblock: explicit `refusing` state on chain break, `degraded` state for subsystem health, and a state-aware `check()` that fails closed on every state where the engine isn't fully ready.

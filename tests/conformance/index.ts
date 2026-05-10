@@ -23,6 +23,7 @@
 // readable diffs.
 
 import { parse as parseYaml } from 'yaml';
+import { formatCapability } from '../../src/permissions/capabilities.ts';
 import {
   type Decision,
   type EngineState,
@@ -30,6 +31,7 @@ import {
   createPermissionEngine,
 } from '../../src/permissions/index.ts';
 import { loadPolicyFromString } from '../../src/permissions/index.ts';
+import { resolveCapabilities } from '../../src/permissions/resolvers/index.ts';
 
 export interface ConformanceCase {
   name: string;
@@ -53,6 +55,14 @@ export interface ConformanceCase {
     source_section?: string;
     source_layer?: string;
     reason_substring?: string;
+    // Subset assertion against the resolver's output. Each entry
+    // must appear in the resolver's capability list (formatted via
+    // `formatCapability`). The list may carry additional entries —
+    // the assertion is "these are present", not "these are the
+    // only ones".
+    capabilities_include?: readonly string[];
+    // Exact resolver outcome kind: 'ok' | 'conservative' | 'refuse'.
+    resolver_kind?: 'ok' | 'conservative' | 'refuse';
   };
 }
 
@@ -106,9 +116,42 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
     c.input.args as Parameters<typeof engine.check>[2],
   );
 
+  // Resolver-side assertions consult the resolver directly. The
+  // engine consumes the same result for its audit row, so this is
+  // the source of truth for "what capabilities did this tool
+  // declare" — independent of any policy gating.
+  const needsResolver =
+    c.expect.capabilities_include !== undefined || c.expect.resolver_kind !== undefined;
+  const resolverResult = needsResolver
+    ? resolveCapabilities(c.input.tool, c.input.args as Record<string, unknown>, { cwd, home })
+    : null;
+
   const reasons: string[] = [];
   if (decision.kind !== c.expect.kind) {
     reasons.push(`kind mismatch: expected ${c.expect.kind}, got ${decision.kind}`);
+  }
+  if (c.expect.resolver_kind !== undefined && resolverResult !== null) {
+    if (resolverResult.kind !== c.expect.resolver_kind) {
+      reasons.push(
+        `resolver_kind mismatch: expected ${c.expect.resolver_kind}, got ${resolverResult.kind}`,
+      );
+    }
+  }
+  if (c.expect.capabilities_include !== undefined && resolverResult !== null) {
+    if (resolverResult.kind === 'refuse') {
+      reasons.push(
+        `capabilities_include set but resolver refused (reason: ${resolverResult.reason})`,
+      );
+    } else {
+      const got = new Set(resolverResult.capabilities.map(formatCapability));
+      for (const expected of c.expect.capabilities_include) {
+        if (!got.has(expected)) {
+          reasons.push(
+            `capabilities missing '${expected}' (got: ${[...got].sort().join(', ') || '<none>'})`,
+          );
+        }
+      }
+    }
   }
   if (c.expect.source_section !== undefined) {
     if (decision.source?.section !== c.expect.source_section) {

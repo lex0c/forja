@@ -3,6 +3,7 @@ import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { AuditEmitInput, AuditSink, ReasonChainEntry } from './audit.ts';
 import { createNoopSink } from './audit.ts';
 import { canonicalHash } from './canonical.ts';
+import { type Capability, formatCapability, sortCapabilities } from './capabilities.ts';
 import type { SectionProvenance } from './hierarchy.ts';
 import {
   containsShellInjection,
@@ -11,6 +12,9 @@ import {
   firstMatchingPath,
 } from './matcher.ts';
 import { type ProtectedTier, classifyProtectedPath } from './protected_paths.ts';
+// Importing the resolver index registers every builtin resolver at
+// module load. Engine consumers don't need a separate wire-up step.
+import { type ResolverResult, resolveCapabilities } from './resolvers/index.ts';
 import {
   type EngineState,
   type StateController,
@@ -151,8 +155,10 @@ export interface ToolArgs {
 }
 
 // Resolves the policy-relevant filesystem target per tool semantics.
-// read_file/write_file/edit_file all operate on a single `path`. grep
-// and glob are search tools whose effective root differs:
+// read_file/write_file/edit_file all operate on a single path (named
+// `file_path` in slice-3+ tools per Anthropic SDK convention, named
+// `path` in the v1 contract). grep and glob are search tools whose
+// effective root differs:
 //   - grep: `args.path` (optional; defaults to session cwd)
 //   - glob: `args.cwd` (optional; defaults to session cwd; the `pattern`
 //     argument defines what's matched, not what's allowed)
@@ -171,6 +177,15 @@ export interface ToolArgs {
 //   - field present but wrong type → null → caller emits deny
 const isNonEmptyString = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
 
+// Resolve the path arg for non-search tools. Accepts either
+// `file_path` (slice-3+ convention) or `path` (v1 contract) — same
+// dual-name compat as the FS resolvers.
+const filePathOf = (args: ToolArgs): string | null => {
+  if (isNonEmptyString(args.file_path)) return args.file_path as string;
+  if (isNonEmptyString(args.path)) return args.path;
+  return null;
+};
+
 const resolveFsTarget = (toolName: string, args: ToolArgs, cwd: string): string | null => {
   if (toolName === 'glob') {
     if (args.cwd === undefined) return cwd;
@@ -180,7 +195,7 @@ const resolveFsTarget = (toolName: string, args: ToolArgs, cwd: string): string 
     if (args.path === undefined) return cwd;
     return isNonEmptyString(args.path) ? args.path : null;
   }
-  return isNonEmptyString(args.path) ? args.path : null;
+  return filePathOf(args);
 };
 
 // Resolve the layer that holds a given tools section, falling back
@@ -608,6 +623,24 @@ const degradedStageEntry = (state: EngineState): ReasonChainEntry | undefined =>
   return { stage: 'engine-state', note: `state=${state}` };
 };
 
+// Reason-chain entry for the resolver stage. Fires when the resolver
+// forced a confirm upgrade — Conservative or `Ok confidence: low`.
+// The note captures the precise cause (resolver's `reason` for
+// Conservative; the confidence label for low) so the audit row +
+// modal preview show "we forced a confirm because the bash command
+// was a compound" or "...because the registry has no resolver for
+// tool X" without recomputing from the capability set.
+const resolverStageEntry = (result: ResolverResult | null): ReasonChainEntry | undefined => {
+  if (result === null) return undefined;
+  if (result.kind === 'conservative') {
+    return { stage: 'resolve', note: `conservative: ${result.reason}` };
+  }
+  if (result.kind === 'ok' && result.confidence === 'low') {
+    return { stage: 'resolve', note: `confidence=${result.confidence}` };
+  }
+  return undefined;
+};
+
 const reasonChainFor = (decision: Decision): ReasonChainEntry[] => {
   let stage: string;
   if (decision.source?.section === 'protected') {
@@ -671,6 +704,7 @@ export const createPermissionEngine = (
     toolName: string,
     args: ToolArgs,
     decision: Decision,
+    capabilities: readonly Capability[],
     extraStage?: ReasonChainEntry,
   ): void => {
     const chain = reasonChainFor(decision);
@@ -682,6 +716,11 @@ export const createPermissionEngine = (
       decision: decisionToAuditEnum(decision.kind),
       policy_hash: policyHash,
       reason_chain: chain,
+      // Canonical sort so the audit row's capabilities_json is
+      // byte-stable across runs — chain hash determinism depends on
+      // it. Resolver implementation order doesn't leak into the
+      // ledger.
+      capabilities: sortCapabilities(capabilities).map(formatCapability),
     };
     audit.emit(input);
   };
@@ -702,9 +741,58 @@ export const createPermissionEngine = (
         reason: `engine not ready (state=${currentState})`,
         source: { layer: 'default', section: 'engine-state' },
       };
-      emitAudit(toolName, args, decision);
+      emitAudit(toolName, args, decision, []);
       return decision;
     }
+
+    // Resolve capabilities (PERMISSION_ENGINE.md §5). Runs BEFORE
+    // bypass, before rule lookup — `Refuse` is structural rejection
+    // (dynamic eval, malformed args, no-safe-resolution commands
+    // like `dd`/`mkfs`) and trumps any allow rule. The resolved
+    // capabilities flow into the audit row and into the modal's
+    // preview; even a `bypass` mode decision carries an honest
+    // capability set so the operator can see what the model
+    // intended to consume.
+    //
+    // `misc` category skips resolution entirely — those tools are
+    // declared "no side effects worth gating" and shouldn't pay
+    // the resolver cost (or risk a stub-resolver mismatch). They
+    // emit with an empty capability list, which is honest about
+    // their declared shape.
+    let resolverResult: ResolverResult | null = null;
+    let resolvedCapabilities: Capability[] = [];
+    if (category !== 'misc') {
+      resolverResult = resolveCapabilities(toolName, args as Record<string, unknown>, {
+        cwd,
+        home,
+      });
+      if (resolverResult.kind === 'refuse') {
+        const decision: Decision = {
+          kind: 'deny',
+          reason: `resolver refused: ${resolverResult.reason}`,
+          source: { layer: 'default', section: 'resolver-refuse' },
+        };
+        emitAudit(toolName, args, decision, []);
+        return decision;
+      }
+      resolvedCapabilities = resolverResult.capabilities;
+    }
+    // What forces a `confirm` upgrade after the normal pipeline:
+    //   - Conservative outcome (the resolver couldn't pin a precise
+    //     set; the operator deserves the modal).
+    //   - Ok with `confidence: low` (genuinely ambiguous).
+    // We intentionally do NOT upgrade on `confidence: medium`.
+    // Spec §5.1 says "Confidence < high force human approval", but
+    // calibrating that against operator fatigue is the risk-score
+    // slice's job — medium covers "well-understood read-only with
+    // some uncertainty" (e.g. `find` against a path) and shouldn't
+    // pop the modal on every invocation. The slice 3 BACKLOG entry
+    // calls this out as an explicit decision to revisit when the
+    // scoring formula lands.
+    const resolverForcesConfirm =
+      resolverResult !== null &&
+      (resolverResult.kind === 'conservative' ||
+        (resolverResult.kind === 'ok' && resolverResult.confidence === 'low'));
 
     if (mode === 'bypass') {
       // `bypass` is a defaults-level setting — source.layer points
@@ -712,19 +800,22 @@ export const createPermissionEngine = (
       // can find and undo it. No section/rule (mode-driven, not
       // rule-driven).
       //
-      // degraded loses the bypass shortcut: spec §2 says "toda
-      // decisão `allow` automática vira `confirm`" without
-      // qualification. Defense in depth — operators wanted
-      // productivity with bypass, not an override of subsystem
-      // health signals.
+      // degraded loses the bypass shortcut (spec §2: "toda decisão
+      // `allow` automática vira `confirm`"). Resolver-driven
+      // confirm is a softer signal — operators who explicitly
+      // chose bypass are committing to the broader risk surface,
+      // and a Conservative result shouldn't undo that decision.
+      // The audit row still carries the resolved capabilities so
+      // the row remains a faithful summary of what the tool will
+      // touch, even when the decision was `allow`.
       const baseAllow: Decision = {
         kind: 'allow',
         reason: 'mode=bypass',
         source: { layer: provenance?.defaults ?? 'default' },
       };
-      const decision = currentState === 'degraded' ? degradeAllowToConfirm(baseAllow) : baseAllow;
-      emitAudit(toolName, args, decision, degradedStageEntry(currentState));
-      return decision;
+      const upgraded = currentState === 'degraded' ? degradeAllowToConfirm(baseAllow) : baseAllow;
+      emitAudit(toolName, args, upgraded, resolvedCapabilities, degradedStageEntry(currentState));
+      return upgraded;
     }
 
     // Single source of truth for section key + rule lookup. Both
@@ -807,13 +898,31 @@ export const createPermissionEngine = (
         break;
     }
     // Degraded upgrade applied AFTER the normal pipeline so the
-    // rule that would have fired keeps its attribution in
-    // `source` — the operator sees "rule X matched, but engine is
-    // degraded so I'm asking anyway" in the modal.
-    if (currentState === 'degraded') {
+    // rule that would have fired keeps its attribution in `source`
+    // — the operator sees "rule X matched, but engine is degraded
+    // so I'm asking anyway" in the modal. Same shape for
+    // resolver-driven upgrade (Conservative or low confidence).
+    //
+    // Session-allow is intentionally exempt from the resolver
+    // upgrade: the operator already saw the modal once for this
+    // shape and explicitly authorized it ("Yes, don't ask again
+    // for: <rule>"). Resolver Conservative would re-prompt every
+    // time — same approval-fatigue regression the session-allow
+    // mechanism exists to prevent. degraded state, however, DOES
+    // override session-allow: a subsystem-health signal overrides
+    // operator trust because the trust was given under the
+    // expectation of a healthy engine.
+    const sessionAllowed = decision.source?.layer === 'session';
+    if (currentState === 'degraded' || (resolverForcesConfirm && !sessionAllowed)) {
       decision = degradeAllowToConfirm(decision);
     }
-    emitAudit(toolName, args, decision, degradedStageEntry(currentState));
+    const extraStage =
+      currentState === 'degraded'
+        ? degradedStageEntry(currentState)
+        : resolverForcesConfirm && !sessionAllowed
+          ? resolverStageEntry(resolverResult)
+          : undefined;
+    emitAudit(toolName, args, decision, resolvedCapabilities, extraStage);
     return decision;
   };
 

@@ -1,0 +1,255 @@
+# Conformance: per-tool capability resolvers (PERMISSION_ENGINE.md §5).
+# Each case asserts the resolver output for a representative input.
+# `capabilities_include` is a SUBSET match — the resolver may emit
+# additional capabilities (e.g. `exec:shell` is always added on bash),
+# but every expected entry must be present.
+
+# --- read_file -----------------------------------------------------
+
+- name: "read_file: relative path resolves against cwd"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        read_file:
+          allow_paths: ["**"]
+  input:
+    tool: "read_file"
+    category: "fs.read"
+    args:
+      file_path: "src/index.ts"
+  expect:
+    kind: "allow"
+    resolver_kind: "ok"
+    capabilities_include:
+      - "read-fs:/work/proj/src/index.ts"
+
+- name: "read_file: absolute path preserved"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        read_file:
+          allow_paths: ["/var/**"]
+  input:
+    tool: "read_file"
+    category: "fs.read"
+    args:
+      file_path: "/var/log/x.log"
+  expect:
+    kind: "allow"
+    capabilities_include:
+      - "read-fs:/var/log/x.log"
+
+# --- write_file ----------------------------------------------------
+
+- name: "write_file: produces write-fs AND read-fs"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        write_file:
+          allow_paths: ["**"]
+  input:
+    tool: "write_file"
+    category: "fs.write"
+    args:
+      file_path: "src/output.ts"
+  expect:
+    kind: "allow"
+    capabilities_include:
+      - "read-fs:/work/proj/src/output.ts"
+      - "write-fs:/work/proj/src/output.ts"
+
+# --- grep / glob ---------------------------------------------------
+
+- name: "grep: explicit path produces read-fs of that path"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        grep:
+          allow_paths: ["src/**"]
+  input:
+    tool: "grep"
+    category: "fs.read"
+    args:
+      pattern: "foo"
+      path: "src"
+  expect:
+    kind: "allow"
+    capabilities_include:
+      - "read-fs:/work/proj/src"
+
+- name: "glob: defaults to cwd when no cwd arg"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        glob:
+          allow_paths: ["./**"]
+  input:
+    tool: "glob"
+    category: "fs.read"
+    args:
+      pattern: "**/*.ts"
+  expect:
+    kind: "allow"
+    capabilities_include:
+      - "read-fs:/work/proj"
+
+# --- fetch_url -----------------------------------------------------
+
+- name: "fetch_url: produces net-egress with normalized host"
+  setup:
+    project_policy: |
+      tools:
+        fetch_url:
+          allow_hosts: ["api.example.com"]
+  input:
+    tool: "fetch_url"
+    category: "web.fetch"
+    args:
+      url: "https://API.example.com/path"
+  expect:
+    kind: "allow"
+    capabilities_include:
+      - "net-egress:api.example.com"
+
+- name: "fetch_url: non-http(s) refuses at resolver layer"
+  setup: {}
+  input:
+    tool: "fetch_url"
+    category: "web.fetch"
+    args:
+      url: "file:///etc/passwd"
+  expect:
+    kind: "deny"
+    source_section: "resolver-refuse"
+    resolver_kind: "refuse"
+
+# --- bash: simple commands ----------------------------------------
+
+- name: "bash ls produces exec:shell + read-fs"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["ls *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls -la"
+  expect:
+    kind: "allow"
+    capabilities_include:
+      - "exec:shell"
+      - "read-fs:/work/proj"
+
+- name: "bash rm produces delete-fs"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["rm *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "rm -rf /tmp/x"
+  expect:
+    kind: "allow"
+    capabilities_include:
+      - "delete-fs:/tmp/x"
+
+- name: "bash curl produces net-egress with extracted host"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["curl *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "curl https://api.github.com/repos"
+  expect:
+    kind: "allow"
+    capabilities_include:
+      - "net-egress:api.github.com"
+
+- name: "bash git push produces git-write + net-egress"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["git *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "git push origin main"
+  expect:
+    kind: "allow"
+    capabilities_include:
+      - "git-write:/work/proj"
+      - "net-egress:*"
+
+# --- bash: refusals ------------------------------------------------
+
+- name: "bash dd refuses (no safe capability resolution)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "dd if=/dev/zero of=/tmp/big bs=1M count=1024"
+  expect:
+    kind: "deny"
+    source_section: "resolver-refuse"
+    resolver_kind: "refuse"
+
+- name: "bash -c with dynamic arg refuses (no AST resolver)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "bash -c 'echo hi'"
+  expect:
+    kind: "deny"
+    source_section: "resolver-refuse"
+    resolver_kind: "refuse"
+
+# --- bash: Conservative on compound shapes ------------------------
+
+- name: "bash compound (|) drops to Conservative + confirm"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls | wc -l"
+  expect:
+    kind: "confirm"
+    resolver_kind: "conservative"
