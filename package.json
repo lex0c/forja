@@ -6,7 +6,7 @@
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "agent": "./dist/agent"
+    "agent": "./dist/agent-linux-x64"
   },
   "scripts": {
     "dev": "bun run --watch src/cli/index.ts",
@@ -18,7 +18,14 @@
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
     "typecheck": "tsc --noEmit",
-    "build": "bun build src/cli/index.ts --compile --outfile dist/agent"
+    "build": "bun run scripts/build-targets.ts --target=linux-x64 --no-minify",
+    "build:release": "bun run scripts/build-targets.ts",
+    "build:size": "bun run scripts/check-size.ts",
+    "build:checksums": "bun run scripts/checksums.ts generate",
+    "build:verify": "bun run scripts/checksums.ts verify",
+    "build:repro": "bun run scripts/repro-check.ts",
+    "build:sbom": "bun run scripts/sbom.ts",
+    "build:compress": "bun run scripts/upx-compress.ts"
   },
   "engines": {
     "bun": ">=1.1.0"

@@ -38,3 +38,35 @@ jobs:
 
       - name: Test
         run: bun test
+
+  build-matrix:
+    # Smoke-builds every release target on every PR. Catches a
+    # broken Bun --target before tag time. The size gate runs here
+    # too: a +20% blow-up should fail the PR, not surprise us at
+    # release. Reproducibility is intentionally NOT in this job —
+    # it's slow (double build) and the release workflow gates on it
+    # before publish.
+    name: cross-platform build · size gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.13
+
+      - name: Install deps
+        run: bun install --frozen-lockfile
+
+      - name: Build all targets
+        run: bun run build:release
+
+      - name: Size gate
+        run: bun run build:size
+
+      - name: SHA256SUMS round-trip
+        run: |
+          bun run build:checksums
+          bun run build:verify
