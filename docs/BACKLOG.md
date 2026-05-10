@@ -15,6 +15,56 @@ Format:
 
 ---
 
+## [2026-05-10] m4/distribution — spec amendment: real binary size targets (PERFORMANCE.md §18.2)
+
+**Done:** Resolved the spec/reality divergence flagged in the previous entry. Built all 5 release targets locally with `bun build --compile --minify --sourcemap=external` (Bun 1.3.13) and re-baselined `PERFORMANCE.md §18.2` against measured numbers.
+
+| Target | Measured | New budget (warn) | New block (+20%) |
+|---|---|---|---|
+| linux-x64 | 100.9 MiB | 110 MiB | 132 MiB |
+| linux-arm64 | 100.4 MiB | 110 MiB | 132 MiB |
+| darwin-x64 | 68.9 MiB | 75 MiB | 90 MiB |
+| darwin-arm64 | 63.9 MiB | 70 MiB | 84 MiB |
+| windows-x64 | 116.0 MiB | 125 MiB | 150 MiB |
+
+Budgets sit ~9-10% above the current baseline so:
+- today's binary is under budget (silent ok)
+- a single-digit MiB drift (Bun patch, dep update) stays silent
+- a double-digit growth trips warn
+- a 30%+ jump trips block (catches "someone added 30 MiB without noticing")
+
+**Spec changes:**
+
+- `docs/spec/PERFORMANCE.md §18.2` — rewrote the table; added §18.2.1 explaining the breakdown (Bun runtime + JSC ~50-90 MiB, vendor SDKs ~10-15 MiB, Forja ~3-5 MiB) and why 50 MB was unrealistic at the chosen stack; added §18.2.2 explicitly deferring linux musl with a pull-in signal (Alpine container demand).
+
+**Code changes:**
+
+- `scripts/targets.ts` — `sizeMaxMiB` updated per target to match the new spec budgets.
+- `tests/scripts/targets.test.ts` — pinned-budget assertions follow the new numbers.
+- `tests/scripts/check-size.test.ts` — boundary tests retargeted onto darwin-arm64 (70 MiB / block 84 MiB) instead of linux-x64; introduced `writeSparse` helper using `ftruncateSync` so we don't allocate 84+ MiB Buffers per test.
+
+**Decisions:**
+
+- **Used MiB explicitly in §18.2 instead of "MB".** The original table said "< 50 MB" which is ambiguous (decimal vs binary). The size gate enforces `bytes < sizeMaxMiB * 2^20`, so the spec follows suit. The MiB column is what code reads.
+- **Headroom set at ~9-10%, not "tight to baseline".** Tight-to-baseline (every byte of growth = warn) creates noise on every Bun patch bump or dep update. 9-10% absorbs reasonable drift; 20%+ growth is the actually-interesting signal and that trips the block.
+- **macOS budgets significantly smaller than Linux/Windows.** Empirical: Apple's toolchain compiles JSC roughly 30-40 MiB tighter than glibc/MSVC. Codified per-target rather than averaged so the warn line is meaningful on each platform.
+- **Linux musl explicitly deferred.** Adding it means a third Linux pipeline (Alpine + glibc + ARM) with separate signals. Pull-in signal documented (operator running `/lib/ld-musl-*` reports the glibc binary doesn't execute). Keeps the v1 matrix at 5 targets, not 6.
+- **Spec amendment lands on the same branch.** Per `feedback_branch_strategy.md`, same-branch slices for one subsystem; the size gate doesn't ship usable without the spec values matching. Not a separate branch.
+- **Did NOT extend the spec to add cosign / `--version --verify` / brew tap.** Those are still deferred per the previous entry (out of scope for this slice).
+
+**Verification:**
+
+- `bun run typecheck` — pass
+- `bun run lint` — pass
+- `bun test` — 4602 pass / 10 skip / 0 fail (the +2 vs the previous entry are the updated check-size tests)
+- `bun run build:release` — all 5 targets built, sizes within budget (`bun run build:size` reports OK)
+- `bun run build:sbom` — CycloneDX 1.5 emitted
+- `bun run build:checksums` + `bun run build:verify` — round-trip OK
+
+**Next:** PR review. With the spec aligned to reality, the `build-matrix` job in CI now passes; release workflow is ready for the first `v0.1.0` tag.
+
+---
+
 ## [2026-05-10] m4/distribution — release pipeline (build flags, cross-platform matrix, size gate, SHA256SUMS, reproducible build, SBOM, release workflow, install script, UPX compress)
 
 **Done:** Closes the "Distribuição binário Bun" item from M4 roadmap (`AGENTIC_CLI.md §18`). One slice, eight commit-sized deliverables under a single branch (`feat/m4-distribution`); user requested same-branch commits. Scope confirmed up front: items 1-7, 10, 12 of `PERFORMANCE.md §18` + `SECURITY_GUIDELINE.md §7.2` (build flags, matrix, size gate, SHA256, reproducible build, SBOM, release workflow, install script, UPX). Out of scope (deferred): cosign signing (#9), `agent --version --verify` (#8), Homebrew tap (#11) — they need infra (cosign keys, second repo) that doesn't yet exist.

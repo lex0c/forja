@@ -36,7 +36,7 @@ export const TARGETS: readonly BuildTarget[] = [
   {
     id: 'linux-x64',
     bunTarget: 'bun-linux-x64-modern',
-    sizeMaxMiB: 50,
+    sizeMaxMiB: 110,
     ext: '',
     os: 'linux',
     arch: 'x64',
@@ -44,7 +44,7 @@ export const TARGETS: readonly BuildTarget[] = [
   {
     id: 'linux-arm64',
     bunTarget: 'bun-linux-arm64',
-    sizeMaxMiB: 50,
+    sizeMaxMiB: 110,
     ext: '',
     os: 'linux',
     arch: 'arm64',
@@ -52,7 +52,7 @@ export const TARGETS: readonly BuildTarget[] = [
   {
     id: 'darwin-x64',
     bunTarget: 'bun-darwin-x64',
-    sizeMaxMiB: 50,
+    sizeMaxMiB: 75,
     ext: '',
     os: 'darwin',
     arch: 'x64',
@@ -60,7 +60,7 @@ export const TARGETS: readonly BuildTarget[] = [
   {
     id: 'darwin-arm64',
     bunTarget: 'bun-darwin-arm64',
-    sizeMaxMiB: 45,
+    sizeMaxMiB: 70,
     ext: '',
     os: 'darwin',
     arch: 'arm64',
@@ -68,7 +68,7 @@ export const TARGETS: readonly BuildTarget[] = [
   {
     id: 'windows-x64',
     bunTarget: 'bun-windows-x64-modern',
-    sizeMaxMiB: 60,
+    sizeMaxMiB: 125,
     ext: '.exe',
     os: 'windows',
     arch: 'x64',

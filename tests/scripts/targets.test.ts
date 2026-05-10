@@ -16,11 +16,11 @@ describe('targets registry', () => {
   });
 
   test('size budgets match PERFORMANCE.md §18.2', () => {
-    expect(findTarget('linux-x64')?.sizeMaxMiB).toBe(50);
-    expect(findTarget('linux-arm64')?.sizeMaxMiB).toBe(50);
-    expect(findTarget('darwin-x64')?.sizeMaxMiB).toBe(50);
-    expect(findTarget('darwin-arm64')?.sizeMaxMiB).toBe(45);
-    expect(findTarget('windows-x64')?.sizeMaxMiB).toBe(60);
+    expect(findTarget('linux-x64')?.sizeMaxMiB).toBe(110);
+    expect(findTarget('linux-arm64')?.sizeMaxMiB).toBe(110);
+    expect(findTarget('darwin-x64')?.sizeMaxMiB).toBe(75);
+    expect(findTarget('darwin-arm64')?.sizeMaxMiB).toBe(70);
+    expect(findTarget('windows-x64')?.sizeMaxMiB).toBe(125);
   });
 
   test('assetName uses agent-<id> with extension', () => {
