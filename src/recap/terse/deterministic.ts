@@ -12,7 +12,20 @@ import { formatDuration, formatUsd } from '../format.ts';
 import type { RecapIntermediate } from '../types.ts';
 import { TERSE_LIMITS, TERSE_SCHEMA_VERSION, type TerseRenderV1 } from './schema.ts';
 
-const buildSentence = (intermediate: RecapIntermediate): string => {
+export interface TerseProjectionOptions {
+  // Drop the trailing `<duration>, <cost>.` suffix. Used by the
+  // TUI auto-display surfaces (RECAP §3.3) — the operator just
+  // saw "Cogitated for X" right above the recap line, so the
+  // duration is redundant; cost is already on the spend footer.
+  // Spec §4.6 example shape (with metrics) stays the default,
+  // since `/recap terse` and the goldens depend on it.
+  omitMetrics?: boolean;
+}
+
+const buildSentence = (
+  intermediate: RecapIntermediate,
+  options: TerseProjectionOptions = {},
+): string => {
   const segments: string[] = [];
 
   if (intermediate.goal.text.length > 0) {
@@ -43,12 +56,17 @@ const buildSentence = (intermediate: RecapIntermediate): string => {
     body = `${segments.join(' ')} — ${counts.join(', ')}`;
   }
 
-  const meta = `${formatDuration(intermediate.costs.durationMs)}, ${formatUsd(intermediate.costs.usd)}`;
-  const sentence = `${body}. ${meta}.`;
+  const sentence =
+    options.omitMetrics === true
+      ? `${body}.`
+      : `${body}. ${formatDuration(intermediate.costs.durationMs)}, ${formatUsd(intermediate.costs.usd)}.`;
   return sentence.slice(0, TERSE_LIMITS.sentenceMaxChars);
 };
 
-export const projectTerseDeterministic = (intermediate: RecapIntermediate): TerseRenderV1 => ({
+export const projectTerseDeterministic = (
+  intermediate: RecapIntermediate,
+  options: TerseProjectionOptions = {},
+): TerseRenderV1 => ({
   schemaVersion: TERSE_SCHEMA_VERSION,
-  sentence: buildSentence(intermediate),
+  sentence: buildSentence(intermediate, options),
 });

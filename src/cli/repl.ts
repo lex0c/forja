@@ -2041,11 +2041,13 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
       const auto = buildAutoTerse({ db, sessionId, now: now() });
       if (auto.ok) {
         // Same shape the harness adapter uses for session-end
-        // recap_terse_ready: split markdown into per-line info
-        // events so the bus contract holds.
+        // recap_terse_ready: split markdown into per-line
+        // `recap:terse` events. The renderer styles the prefix
+        // bold + the line in secondary color (RECAP §3.3 +
+        // UI.md §6.1).
         const lines = auto.markdown.split('\n').filter((l) => l.length > 0);
         for (const line of lines) {
-          bus.emit({ type: 'info', ts: now(), message: line });
+          bus.emit({ type: 'recap:terse', ts: now(), message: line });
         }
       } else {
         bus.emit({

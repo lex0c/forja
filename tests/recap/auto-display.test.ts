@@ -43,6 +43,15 @@ describe('buildAutoTerse', () => {
     // Terse format: one line, ≤ 200 chars, single sentence ending in '.'
     expect(result.markdown.length).toBeLessThanOrEqual(201);
     expect(result.markdown.trim().endsWith('.')).toBe(true);
+    // Auto-display passes `omitMetrics: true` to the renderer
+    // (RECAP §3.3) so the trailing `<duration>, <cost>.` suffix
+    // is dropped — the TUI surface lives below "Cogitated for X"
+    // which already shows duration + cost. Pin the absence so a
+    // future refactor that drops the flag fails this assertion.
+    // `, $X.XX.` is the canonical cost suffix shape from formatUsd;
+    // a duration token like `1m23s,` ends in a comma directly
+    // before the cost, so checking for the cost suffix is enough.
+    expect(result.markdown).not.toMatch(/, \$/);
 
     // Cache row landed for this scope. Helper's exact scope hash
     // is opaque from outside (depends on the projected

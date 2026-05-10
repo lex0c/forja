@@ -839,6 +839,21 @@ describe('formatPermanent', () => {
     expect(warned[1]).toBe(pad(`${CSI}33mwarn: high${CSI}0m`));
   });
 
+  test('recap-terse: bold "recap:" prefix + secondary across the line (RECAP §3.3)', () => {
+    // Color path: `recap:` is wrapped in `${CSI}90m${CSI}1m...${CSI}0m`
+    // (secondary + bold via paintMulti — single trailing reset).
+    // Body is wrapped in `${CSI}90m...${CSI}0m`. Two separate
+    // SGR runs with a single reset each, concatenated.
+    const out = formatPermanent({ kind: 'recap-terse', message: 'fix the bug.' }, colored);
+    expect(out[0]).toBe(pad(''));
+    expect(out[1]).toBe(pad(`${CSI}90m${CSI}1mrecap:${CSI}0m${CSI}90m fix the bug.${CSI}0m`));
+  });
+
+  test('recap-terse: plain text when color disabled', () => {
+    const out = formatPermanent({ kind: 'recap-terse', message: 'fix the bug.' }, ascii);
+    expect(out).toEqual([pad(''), pad('recap: fix the bug.')]);
+  });
+
   describe('subagent_summary (S2 of subagent IPC)', () => {
     test('done shape includes name + summary + duration', () => {
       const out = formatPermanent(

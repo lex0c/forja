@@ -11,7 +11,7 @@
 // never sees `caps`.
 
 import type { PermanentItem } from '../state.ts';
-import { type Capabilities, paint, reverse } from '../term.ts';
+import { type Capabilities, paint, paintMulti, reverse } from '../term.ts';
 import { FRAME_MARGIN, frameWidth, padFrame } from './frame.ts';
 import { subContentConnector } from './glyphs.ts';
 import { visualWidth } from './width.ts';
@@ -332,6 +332,18 @@ export const formatPermanent = (item: PermanentItem, caps: Capabilities): string
       // leading blank as error/warn so consecutive info lines from
       // different sources don't blob together.
       return ['', item.message].map(padFrame);
+    case 'recap-terse': {
+      // RECAP §3.3 auto-display: bold "recap:" prefix + the line
+      // body in `secondary` (SGR 90 = bright-grey, the same
+      // greyscale meta channel used for the turn-end "Cogitated
+      // for X" marker). Bold is layered with secondary via
+      // `paintMulti` so a single trailing reset wraps both
+      // attributes — nesting `paint(paint(...))` would double-emit
+      // resets that some terminals re-process as a flicker.
+      const prefix = paintMulti(caps, ['secondary', 'bold'], 'recap:');
+      const body = paint(caps, 'secondary', ` ${item.message}`);
+      return ['', `${prefix}${body}`].map(padFrame);
+    }
     case 'subagent_summary': {
       // One-line scrollback summary for a subagent run. Mirrors
       // tool-end's compact shape: `· task <name> Done <summary> in 1m2s`

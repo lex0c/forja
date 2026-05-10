@@ -321,7 +321,7 @@ describe('harness-adapter — session lifecycle', () => {
     expect((out[0] as Extract<UIEvent, { type: 'warn' }>).message).toContain('30 of 50');
   });
 
-  test('recap_terse_ready → info line(s) for the scrollback (RECAP §3.3)', () => {
+  test('recap_terse_ready → recap:terse line(s) for the scrollback (RECAP §3.3)', () => {
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({
       type: 'recap_terse_ready',
@@ -329,12 +329,12 @@ describe('harness-adapter — session lifecycle', () => {
       markdown: 'fix the bug. 1 step, $0.00.\n',
       cacheHit: false,
     });
-    expect(types(out)).toEqual(['info']);
-    const info = out[0] as Extract<UIEvent, { type: 'info' }>;
-    expect(info.message).toBe('fix the bug. 1 step, $0.00.');
+    expect(types(out)).toEqual(['recap:terse']);
+    const ev = out[0] as Extract<UIEvent, { type: 'recap:terse' }>;
+    expect(ev.message).toBe('fix the bug. 1 step, $0.00.');
   });
 
-  test('recap_terse_ready filters trailing-empty lines so no blank info line is rendered', () => {
+  test('recap_terse_ready filters trailing-empty lines so no blank line is rendered', () => {
     const a = createHarnessAdapter(baseCtx());
     const out = a.translate({
       type: 'recap_terse_ready',
@@ -344,9 +344,9 @@ describe('harness-adapter — session lifecycle', () => {
       markdown: 'one sentence.\n\n',
       cacheHit: true,
     });
-    expect(types(out)).toEqual(['info']);
-    const info = out[0] as Extract<UIEvent, { type: 'info' }>;
-    expect(info.message).toBe('one sentence.');
+    expect(types(out)).toEqual(['recap:terse']);
+    const ev = out[0] as Extract<UIEvent, { type: 'recap:terse' }>;
+    expect(ev.message).toBe('one sentence.');
   });
 });
 

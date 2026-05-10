@@ -257,16 +257,16 @@ export const createHarnessAdapter = (ctx: HarnessAdapterCtx): HarnessAdapter => 
         return out;
 
       case 'recap_terse_ready': {
-        // Session-end terse line (RECAP.md §3.3). Surface the
-        // markdown as one or more info lines so it lands in the
-        // scrollback above the session:end footer. The terse
-        // template emits a single sentence ≤ 200 chars (with
-        // trailing newline) — split on newline to keep the bus
-        // contract of one message-per-line, dropping trailing
-        // empties so we don't render a blank info line.
+        // Session-end terse line (RECAP.md §3.3). Surface as a
+        // dedicated `recap:terse` UIEvent so the renderer styles
+        // it (bold "recap:" prefix + secondary color across the
+        // line) instead of the plain `info` shape used for slash
+        // output. The terse template emits a single sentence
+        // ≤ 200 chars (with trailing newline) — split on newline
+        // and drop empties so we don't render a blank styled line.
         const lines = event.markdown.split('\n').filter((l) => l.length > 0);
         for (const line of lines) {
-          out.push({ type: 'info', ts, message: line });
+          out.push({ type: 'recap:terse', ts, message: line });
         }
         return out;
       }
