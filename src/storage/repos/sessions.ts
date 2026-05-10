@@ -148,6 +148,12 @@ export interface ListSessionsOptions {
   // before --since", surprising operators who expect "20 newest
   // matching all filters".
   startedAtMin?: number;
+  // Skip the first N rows (matching all other filters). Used by
+  // `/recap list --search` to paginate when the in-memory needle
+  // match is sparse — without an offset cursor, a fixed-size
+  // batch can yield zero matches even when the needle exists in
+  // older rows. Combine with `limit` to bound per-batch work.
+  offset?: number;
   // Default: only top-level sessions (parent_session_id IS NULL).
   // Set true to include children — useful for audit/debug listings.
   // The list-sessions CLI exposes this as `--include-subagents`.
@@ -180,7 +186,8 @@ export const listSessions = (db: DB, options: ListSessionsOptions = {}): Session
     filters.push('is_subagent = 0');
   }
   const where = filters.length > 0 ? `WHERE ${filters.join(' AND ')}` : '';
-  params.push(limit);
+  const offset = options.offset ?? 0;
+  params.push(limit, offset);
   // Secondary order by seq DESC (migration 008) is the deterministic
   // tiebreaker when two sessions started in the same millisecond
   // tick. Without it, `listSessions(..., {limit:1})[0]` could
@@ -192,7 +199,7 @@ export const listSessions = (db: DB, options: ListSessionsOptions = {}): Session
                FROM sessions
                ${where}
                ORDER BY started_at DESC, seq DESC
-               LIMIT ?`;
+               LIMIT ? OFFSET ?`;
   const rows = db.query(sql).all(...params) as SessionRow[];
   return rows.map(fromRow);
 };

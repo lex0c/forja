@@ -1108,37 +1108,53 @@ export const runRecapList = async (
   // SQL-side filtering covers everything that maps to a column
   // predicate (cwd / status / started_at). `--search` is the only
   // filter that can't go to SQL — its needle is the projected
-  // goal text, not the raw message JSON. To avoid the
-  // "filter-after-LIMIT silently drops matching rows" trap, fetch
-  // up to N × SEARCH_FETCH_MULTIPLIER candidates when `--search`
-  // is set and cap to N after the in-memory filter. With
-  // MAX_LIST_LIMIT=200 the worst case fetches 1000 sessions —
-  // bounded, indexed, and the dominant cost is in-memory string
-  // matching on a small string.
-  const sqlFetchLimit =
-    filters.search !== null
-      ? Math.min(filters.limit * SEARCH_FETCH_MULTIPLIER, MAX_LIST_LIMIT * SEARCH_FETCH_MULTIPLIER)
-      : filters.limit;
-  const sessions = listSessions(ctx.db, {
-    limit: sqlFetchLimit,
-    ...(filters.project !== null ? { cwd: filters.project } : {}),
-    ...(filters.status !== null ? { status: filters.status } : {}),
-    ...(filters.sinceMs !== null ? { startedAtMin: filters.sinceMs } : {}),
-  });
-
-  // Project recap_mini per session. Search filter applies AFTER
-  // projection because the search target is the goal text the
-  // mini extracts (not the raw message JSON).
-  const minis: RecapMini[] = sessions.map((s) => projectRecapMiniCached(ctx, s));
-  let resultRows = minis;
-  if (filters.search !== null) {
+  // goal text, not the raw message JSON.
+  //
+  // Without --search, one fetch is enough. With --search, paginate
+  // until we've collected `limit` matches OR the result set is
+  // exhausted. A fixed-size pre-fetch (limit × multiplier) was
+  // wrong: a sparse needle (1 match per N sessions) on a long
+  // history would yield zero matches in the first batch even
+  // though the needle existed deeper, surfacing as a false
+  // negative. The pagination cursor is SQL OFFSET — the secondary
+  // `(started_at DESC, seq DESC)` order is deterministic so the
+  // cursor is stable across batches even with same-millisecond
+  // sessions.
+  let resultRows: RecapMini[];
+  if (filters.search === null) {
+    const sessions = listSessions(ctx.db, {
+      limit: filters.limit,
+      ...(filters.project !== null ? { cwd: filters.project } : {}),
+      ...(filters.status !== null ? { status: filters.status } : {}),
+      ...(filters.sinceMs !== null ? { startedAtMin: filters.sinceMs } : {}),
+    });
+    resultRows = sessions.map((s) => projectRecapMiniCached(ctx, s));
+  } else {
     const needle = filters.search.toLowerCase();
-    resultRows = resultRows.filter((m) => m.goal.toLowerCase().includes(needle));
-    // Final cap after the in-memory filter so `--limit N` truly
-    // means "at most N rows out".
-    if (resultRows.length > filters.limit) {
-      resultRows = resultRows.slice(0, filters.limit);
+    const matches: RecapMini[] = [];
+    const batchSize = filters.limit * SEARCH_FETCH_MULTIPLIER;
+    let offset = 0;
+    while (matches.length < filters.limit) {
+      const batch = listSessions(ctx.db, {
+        limit: batchSize,
+        offset,
+        ...(filters.project !== null ? { cwd: filters.project } : {}),
+        ...(filters.status !== null ? { status: filters.status } : {}),
+        ...(filters.sinceMs !== null ? { startedAtMin: filters.sinceMs } : {}),
+      });
+      if (batch.length === 0) break;
+      for (const s of batch) {
+        const mini = projectRecapMiniCached(ctx, s);
+        if (mini.goal.toLowerCase().includes(needle)) {
+          matches.push(mini);
+          if (matches.length >= filters.limit) break;
+        }
+      }
+      // Short batch ⇒ source exhausted, no more to scan.
+      if (batch.length < batchSize) break;
+      offset += batch.length;
     }
+    resultRows = matches;
   }
 
   const output = filters.json ? renderListJson(resultRows) : renderListTable(resultRows);

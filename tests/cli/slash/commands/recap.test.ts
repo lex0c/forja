@@ -1218,6 +1218,86 @@ describe('/recap', () => {
     }
   });
 
+  test('/recap list --search paginates past the first batch (sparse-needle history)', async () => {
+    // Regression: pre-fix the SQL fetch was a single bounded
+    // `limit * SEARCH_FETCH_MULTIPLIER` call. With `--limit 2
+    // --search needle` and 30 newer non-matching sessions
+    // followed by 2 matching old ones, the first batch
+    // (2 × 5 = 10 rows newest-first) saw zero matches and
+    // returned empty — false negative despite the matches
+    // existing in DB. Post-fix paginates via OFFSET until the
+    // limit is filled or the source is exhausted.
+    //
+    // Layout (newest first by started_at): 30 unrelated-N,
+    // then 2 matching-N. Batch size 10. Pre-fix iteration 1
+    // sees zero matches and stops. Post-fix iteration 2
+    // (offset=10) and iteration 3 (offset=20) keep going until
+    // iteration 4 (offset=30) finds both matches.
+    for (let i = 0; i < 30; i++) {
+      const s = createSession(db, {
+        model: 'sonnet',
+        cwd: '/test/cwd',
+        startedAt: 10_000 + i * 2,
+      });
+      appendMessage(db, {
+        sessionId: s.id,
+        role: 'user',
+        content: `unrelated-${i}`,
+        createdAt: s.startedAt + 1,
+      });
+      completeSession(db, s.id, 'done', 0, true, s.startedAt + 100);
+    }
+    // Two matching, OLDER than the unrelated batch.
+    for (let i = 0; i < 2; i++) {
+      const s = createSession(db, {
+        model: 'sonnet',
+        cwd: '/test/cwd',
+        startedAt: 1_000 + i * 2,
+      });
+      appendMessage(db, {
+        sessionId: s.id,
+        role: 'user',
+        content: `find this needle ${i}`,
+        createdAt: s.startedAt + 1,
+      });
+      completeSession(db, s.id, 'done', 0, true, s.startedAt + 100);
+    }
+    const result = await recapCommand.exec(
+      ['list', '--limit', '2', '--search', 'needle', '--json'],
+      makeCtx(),
+    );
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const lines = result.notes?.filter((l) => l.length > 0) ?? [];
+    // Both matches found despite living past the first batch.
+    expect(lines).toHaveLength(2);
+    for (const line of lines) {
+      expect(line).toContain('needle');
+    }
+  });
+
+  test('/recap list --search returns fewer than --limit when source is exhausted', async () => {
+    // Sanity: pagination must STOP when the source runs out.
+    // With only 1 matching session in DB and `--limit 5`, the
+    // operator should get 1 row, not loop forever or hang.
+    const s = createSession(db, { model: 'sonnet', cwd: '/test/cwd', startedAt: 1_000 });
+    appendMessage(db, {
+      sessionId: s.id,
+      role: 'user',
+      content: 'lonely needle here',
+      createdAt: 1_100,
+    });
+    completeSession(db, s.id, 'done', 0, true, 2_000);
+    const result = await recapCommand.exec(
+      ['list', '--limit', '5', '--search', 'needle', '--json'],
+      makeCtx(),
+    );
+    expect(result.kind).toBe('ok');
+    if (result.kind !== 'ok') return;
+    const lines = result.notes?.filter((l) => l.length > 0) ?? [];
+    expect(lines).toHaveLength(1);
+  });
+
   // ─── /recap day + /recap range (slice e1) ───────────────────
 
   test('/recap day [YYYY-MM-DD] aggregates same-cwd sessions in the day window', async () => {
