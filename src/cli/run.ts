@@ -204,12 +204,22 @@ export const run = async (options: RunOptions): Promise<number> => {
         dbOverride = result.db;
         bootstrappedDbCloser = () => result.db.close();
       } catch (e) {
-        // Typical failures: missing `ANTHROPIC_API_KEY`, unknown
-        // model id. Surface as a one-line warn on stderr so the
-        // operator who expected LLM render knows why they got the
-        // deterministic fallback, then continue with the stub —
-        // deterministic surfaces work without provider config.
         const reason = e instanceof Error ? e.message : String(e);
+        // Hard-fail on unrecoverable config errors — typo in
+        // `--model <id>` should NOT silently degrade to the
+        // deterministic stub with exit 0, because CI / scripted
+        // usage would think the requested model was used. The
+        // bootstrap registry and every provider factory throw
+        // `"unknown ... model: <id>"` (variants: bare bootstrap,
+        // anthropic/google/openai factories) on lookup miss.
+        // Match the prefix and exit non-zero with a clear error.
+        // Recoverable failures (missing API key, network) keep
+        // the fallback path so `--no-llm-render` and other
+        // deterministic surfaces work without provider config.
+        if (/^unknown\b.*model/i.test(reason)) {
+          errSink(`forja recap: ${reason}\n`);
+          return 1;
+        }
         errSink(`forja recap: provider bootstrap failed (${reason}); LLM render disabled\n`);
         provider = {
           id: 'headless/stub',

@@ -247,4 +247,39 @@ describe('cli entrypoint: prompt requirement', () => {
       rmSync(spawnCwd, { recursive: true, force: true });
     }
   });
+
+  test('`recap` hard-fails on unknown --model (no silent fallback)', async () => {
+    // Regression: pre-fix the catch block treated all bootstrap
+    // failures as "LLM unavailable" and fell back to the stub,
+    // exit 0. A typo in `--model <bad-id>` would silently render
+    // deterministically while CI logs claimed success — masking
+    // the configuration mistake. Spec: invalid model selection
+    // is a config error and must exit non-zero.
+    const dataDir = mkdtempSync(join(tmpdir(), 'forja-cli-'));
+    const spawnCwd = mkdtempSync(join(tmpdir(), 'forja-no-env-'));
+    try {
+      // Even with the API key present (loaded from .env or env),
+      // an unknown model id throws "unknown model: ..." inside
+      // the registry lookup BEFORE the factory runs, so the auth
+      // path is irrelevant. Pass through the dev's env so the
+      // failure is unambiguously about the model id.
+      const env = { ...process.env, XDG_DATA_HOME: dataDir };
+      const proc = Bun.spawn(
+        ['bun', entry, 'recap', 'session', 'no-such-session', '--model', 'anthropic/sonnett-typo'],
+        { cwd: spawnCwd, stdout: 'pipe', stderr: 'pipe', env },
+      );
+      const [stderr, exitCode] = await Promise.all([
+        new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+        proc.exited,
+      ]);
+      // Hard-fail diagnostic; NOT the "LLM render disabled" warn.
+      expect(stderr).toContain('forja recap: unknown model');
+      expect(stderr).toContain('anthropic/sonnett-typo');
+      expect(stderr).not.toContain('LLM render disabled');
+      expect(exitCode).toBe(1);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+      rmSync(spawnCwd, { recursive: true, force: true });
+    }
+  });
 });
