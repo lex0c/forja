@@ -208,4 +208,43 @@ describe('cli entrypoint: prompt requirement', () => {
     expect(stderr).not.toContain('TTY');
     expect(stderr).toContain('/recap:');
   });
+
+  test('`recap` warns and falls back to stub when provider bootstrap fails', async () => {
+    // Regression: pre-fix the dispatcher hardcoded a stub provider
+    // (`constrained: false`), so `agent recap pr` could never
+    // exercise the LLM render path even with API keys configured.
+    // Post-fix: try `bootstrap()` for the real provider; on failure
+    // (e.g., missing ANTHROPIC_API_KEY) emit a one-line warn AND
+    // continue with the stub so deterministic surfaces still work.
+    //
+    // Bun auto-loads `.env` from the cwd of the bun process, so
+    // running with `cwd: repoRoot` would surface the developer's
+    // `.env`-supplied API key and bootstrap would succeed silently.
+    // Spawn from a tmpdir (no `.env`) AND clear the env var to make
+    // the failure path deterministic.
+    const dataDir = mkdtempSync(join(tmpdir(), 'forja-cli-'));
+    const spawnCwd = mkdtempSync(join(tmpdir(), 'forja-no-env-'));
+    try {
+      const env = { ...process.env, XDG_DATA_HOME: dataDir };
+      delete (env as { ANTHROPIC_API_KEY?: string }).ANTHROPIC_API_KEY;
+      const proc = Bun.spawn(
+        ['bun', entry, 'recap', 'session', 'no-such-session', '--no-llm-render'],
+        { cwd: spawnCwd, stdout: 'pipe', stderr: 'pipe', env },
+      );
+      const [stderr, exitCode] = await Promise.all([
+        new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+        proc.exited,
+      ]);
+      // The warn precedes the recap-side error; both land on stderr.
+      expect(stderr).toContain('forja recap: provider bootstrap failed');
+      expect(stderr).toContain('LLM render disabled');
+      // Subsequent dispatch into runRecapHeadless still happens —
+      // the unknown session id surfaces the recap-side error.
+      expect(stderr).toContain('/recap:');
+      expect(exitCode).toBe(1);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+      rmSync(spawnCwd, { recursive: true, force: true });
+    }
+  });
 });

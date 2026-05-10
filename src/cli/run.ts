@@ -168,55 +168,94 @@ export const run = async (options: RunOptions): Promise<number> => {
       });
     }
 
-    // `agent recap [args]` headless surface (RECAP §9). DB-only
-    // path: no policy resolution, no harness — just project +
-    // render. The provider stub fails the `constrained` capability
-    // gate so the LLM render path falls back to the deterministic
-    // template; a follow-up will bootstrap the real provider so
-    // `agent recap pr` exercises the LLM surface when API keys are
-    // available. `--json` toggles the four-event NDJSON envelope
-    // (recap_start / recap_intermediate / recap_render / recap_end);
-    // without it, the rendered text streams to stdout verbatim.
+    // `agent recap [args]` headless surface (RECAP §9). Tries to
+    // bootstrap the real provider so `agent recap pr` exercises
+    // the LLM surface when an API key is configured — bootstrap
+    // throws inside the Anthropic factory when the key is absent,
+    // which we catch and fall back to a stub. The stub fails the
+    // `constrained` capability gate, so LLM-render flows degrade
+    // to deterministic without crashing the headless caller.
+    // Operators with `--no-llm-render` (or any deterministic-only
+    // recap surface) still work without an API key — the stub is
+    // sufficient for that path. `--json` toggles the four-event
+    // NDJSON envelope (recap_start / recap_intermediate /
+    // recap_render / recap_end); without it, the rendered text
+    // streams to stdout verbatim.
     if (args.recap !== undefined) {
       const { runRecapHeadless } = await import('./recap-headless.ts');
-      const headlessProvider: import('../providers/types.ts').Provider = {
-        id: 'headless/stub',
-        family: 'anthropic',
-        capabilities: {
-          tools: 'native',
-          cache: 'server_5min',
-          vision: false,
-          streaming: true,
-          constrained: false,
-          context_window: 200_000,
-          output_max_tokens: 4_096,
-          cost_per_1k_input: 0,
-          cost_per_1k_output: 0,
-          notes: ['headless stub: LLM render falls back to deterministic'],
-        },
-        // Stream / constrained / countTokens are unused on the
-        // deterministic path; reject if the recap pipeline ever
-        // tries to call them so the gap is loud, not silent.
-        generate: async function* () {},
-        generateConstrained: () =>
-          Promise.reject(new Error('headless recap: LLM render not yet wired')),
-        countTokens: async () => 0,
-      };
-      return await runRecapHeadless({
-        args: args.recap.args,
-        json: args.json,
-        ...(options.bootstrapOverride?.dbPath !== undefined
-          ? { dbPath: options.bootstrapOverride.dbPath }
-          : {}),
-        // `cwd` drives the day/range cwd filter (RECAP §6.1
-        // privacy guard). Honors a bootstrap override when tests
-        // pin a fixture path; falls back to `process.cwd()` in
-        // production.
-        cwd: options.bootstrapOverride?.cwd ?? process.cwd(),
-        provider: headlessProvider,
-        out: (s) => process.stdout.write(s),
-        err: errSink,
-      });
+      let provider: import('../providers/types.ts').Provider;
+      let dbOverride: import('../storage/index.ts').DB | undefined;
+      let bootstrappedDbCloser: (() => void) | undefined;
+      try {
+        // Empty prompt is safe — bootstrap doesn't append a user
+        // message at construction time (that happens inside
+        // `runAgent`). The recap path never calls `runAgent`,
+        // so the bootstrap output is consumed only for `provider`
+        // and `db`. Other fields (subagents, hookWarnings) are
+        // ignored.
+        const bootstrapInput: BootstrapInput = {
+          prompt: '',
+          ...(args.model !== undefined ? { modelId: args.model } : {}),
+          signal: options.signal ?? new AbortController().signal,
+          ...(options.bootstrapOverride ?? {}),
+        };
+        const result = bootstrap(bootstrapInput);
+        provider = result.config.provider;
+        dbOverride = result.db;
+        bootstrappedDbCloser = () => result.db.close();
+      } catch (e) {
+        // Typical failures: missing `ANTHROPIC_API_KEY`, unknown
+        // model id. Surface as a one-line warn on stderr so the
+        // operator who expected LLM render knows why they got the
+        // deterministic fallback, then continue with the stub —
+        // deterministic surfaces work without provider config.
+        const reason = e instanceof Error ? e.message : String(e);
+        errSink(`forja recap: provider bootstrap failed (${reason}); LLM render disabled\n`);
+        provider = {
+          id: 'headless/stub',
+          family: 'anthropic',
+          capabilities: {
+            tools: 'native',
+            cache: 'server_5min',
+            vision: false,
+            streaming: true,
+            constrained: false,
+            context_window: 200_000,
+            output_max_tokens: 4_096,
+            cost_per_1k_input: 0,
+            cost_per_1k_output: 0,
+            notes: ['headless stub: bootstrap failed, LLM render disabled'],
+          },
+          generate: async function* () {},
+          generateConstrained: () =>
+            Promise.reject(new Error('headless recap: LLM render unavailable')),
+          countTokens: async () => 0,
+        };
+      }
+      try {
+        return await runRecapHeadless({
+          args: args.recap.args,
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          ...(dbOverride !== undefined ? { dbOverride } : {}),
+          // `cwd` drives the day/range cwd filter (RECAP §6.1
+          // privacy guard). Honors a bootstrap override when tests
+          // pin a fixture path; falls back to `process.cwd()` in
+          // production.
+          cwd: options.bootstrapOverride?.cwd ?? process.cwd(),
+          provider,
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      } finally {
+        // Bootstrap-owned DB handle (if any) is closed here so we
+        // don't leak it on the success path. The stub-only path
+        // (bootstrap failed) lets `runRecapHeadless` own its own
+        // DB via `dbPath` and close it in its own try/finally.
+        if (bootstrappedDbCloser !== undefined) bootstrappedDbCloser();
+      }
     }
 
     // Checkpoint subcommands and `--undo` short-circuit the same way
