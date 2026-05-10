@@ -4,6 +4,12 @@ import type { AuditEmitInput, AuditSink, ReasonChainEntry } from './audit.ts';
 import { createNoopSink } from './audit.ts';
 import { canonicalHash } from './canonical.ts';
 import { type Capability, formatCapability, sortCapabilities } from './capabilities.ts';
+import {
+  type Classifier,
+  buildClassifierInput,
+  clampAdjust,
+  validateClassifierOutput,
+} from './classifier.ts';
 import type { SectionProvenance } from './hierarchy.ts';
 import {
   containsShellInjection,
@@ -97,6 +103,23 @@ export interface EngineOptions {
   // `recent_errors` feature contributes 0 until a harness-side
   // counter slice wires this through.
   recentToolErrors?: number;
+  // Classifier hint (PERMISSION_ENGINE.md §6.4). Optional sync
+  // function; receives capabilities + deterministic score + a
+  // version pin, returns a clamped adjust. NEVER sees raw args /
+  // tool outputs / file contents — that's the prompt-injection
+  // defense. Absent or returning null counts as
+  // `classifier_unavailable`. Default: no classifier wired.
+  classifier?: Classifier;
+  // Version pin for the active classifier. Recorded in every audit
+  // row that consults the classifier so model swaps mid-install
+  // are forensically visible. Default `'none'`.
+  classifierHash?: string;
+  // When true, an unavailable classifier (offline / throw / schema
+  // invalid) transitions the engine to `degraded`. Default false
+  // (lenient) — the deterministic score is kept as-is and the
+  // call proceeds. Regulated deployments set this to true; local
+  // CLI rides lenient.
+  classifierRequired?: boolean;
 }
 
 export interface PermissionEngine {
@@ -712,6 +735,9 @@ export const createPermissionEngine = (
   const trustedHosts = options.trustedHosts ?? DEFAULT_TRUSTED_HOSTS;
   const isMcpTool = options.isMcpTool ?? defaultIsMcpTool;
   const recentToolErrors = options.recentToolErrors ?? 0;
+  const classifier = options.classifier;
+  const classifierHash = options.classifierHash ?? 'none';
+  const classifierRequired = options.classifierRequired ?? false;
   // policy_hash is stamped on every audit row. Computed ONCE at
   // construction — the policy doesn't change for an engine
   // instance (hot reload is a separate slice that builds a new
@@ -735,7 +761,8 @@ export const createPermissionEngine = (
     capabilities: readonly Capability[],
     score: number,
     scoreComponents: Record<string, number>,
-    extraStage?: ReasonChainEntry,
+    classifierAdjust: number | null,
+    extraStages: readonly ReasonChainEntry[] = [],
   ): void => {
     const chain = reasonChainFor(decision);
     if (score > 0) {
@@ -746,7 +773,7 @@ export const createPermissionEngine = (
       // case) and the audit row's `score` column still records 0.
       chain.push({ stage: 'risk-score', note: `score=${score.toFixed(2)}` });
     }
-    if (extraStage !== undefined) chain.push(extraStage);
+    for (const stage of extraStages) chain.push(stage);
     const input: AuditEmitInput = {
       session_id: sessionId,
       tool_name: toolName,
@@ -761,6 +788,13 @@ export const createPermissionEngine = (
       capabilities: sortCapabilities(capabilities).map(formatCapability),
       score,
       score_components: scoreComponents,
+      // Classifier metadata: hash is recorded for every check (even
+      // when classifier didn't run; default 'none' makes the
+      // missing-classifier case visible in audit). `classifierAdjust`
+      // is null when no classifier consulted or unavailable —
+      // forensically distinct from "consulted but returned 0".
+      classifier_hash: classifierHash,
+      classifier_adjust: classifierAdjust,
     };
     audit.emit(input);
   };
@@ -781,7 +815,7 @@ export const createPermissionEngine = (
         reason: `engine not ready (state=${currentState})`,
         source: { layer: 'default', section: 'engine-state' },
       };
-      emitAudit(toolName, args, decision, [], 0, {});
+      emitAudit(toolName, args, decision, [], 0, {}, null);
       return decision;
     }
 
@@ -812,7 +846,7 @@ export const createPermissionEngine = (
           reason: `resolver refused: ${resolverResult.reason}`,
           source: { layer: 'default', section: 'resolver-refuse' },
         };
-        emitAudit(toolName, args, decision, [], 0, {});
+        emitAudit(toolName, args, decision, [], 0, {}, null);
         return decision;
       }
       resolvedCapabilities = resolverResult.capabilities;
@@ -843,7 +877,60 @@ export const createPermissionEngine = (
       cwd,
       home,
     };
-    const { score, components: scoreComponents } = computeRiskScore(riskInput);
+    const { score: deterministicScore, components: scoreComponents } = computeRiskScore(riskInput);
+
+    // Classifier hint (PERMISSION_ENGINE.md §6.4). Hint-only — the
+    // classifier can adjust the score by ±0.2 clamped but cannot
+    // independently force a deny. Failures (offline, exception,
+    // schema invalid) emit `classifier-unavailable` in the reason
+    // chain and either continue (lenient default) or degrade the
+    // engine (strict mode). Misc category skips the classifier
+    // alongside the resolver — no side effects worth scoring AND
+    // no need to consult a hint.
+    let score = deterministicScore;
+    let classifierAdjust: number | null = null;
+    let classifierStage: ReasonChainEntry | null = null;
+    if (classifier !== undefined && category !== 'misc') {
+      const classifierInput = buildClassifierInput({
+        toolName,
+        capabilities: resolvedCapabilities,
+        score: deterministicScore,
+        classifierHash,
+      });
+      let rawOutput: ReturnType<Classifier> | null = null;
+      let failed = false;
+      let failureReason = '';
+      try {
+        rawOutput = classifier(classifierInput);
+      } catch (e) {
+        failed = true;
+        failureReason = `threw: ${(e as Error).message}`;
+      }
+      const validated = failed ? null : validateClassifierOutput(rawOutput);
+      if (validated === null) {
+        // Classifier didn't produce a usable signal — either
+        // returned null explicitly, threw, or produced garbage.
+        // All three collapse to `classifier-unavailable` in the
+        // chain. Strict mode degrades the engine; lenient
+        // continues with the deterministic score.
+        const reason = failed ? failureReason : 'unavailable';
+        classifierStage = { stage: 'classifier-unavailable', note: reason };
+        if (classifierRequired && currentState === 'ready') {
+          stateController.transition('degraded', `classifier_${failed ? 'threw' : 'unavailable'}`);
+        }
+      } else {
+        // Apply clamped adjust. Re-cap to [0, 1] after the sum so a
+        // floor of 0.9 + adjust +0.2 doesn't escape the unit
+        // interval. Subtraction handled by the cap-at-0 floor on
+        // the lower end too.
+        classifierAdjust = clampAdjust(validated.score_adjust);
+        score = Math.min(1, Math.max(0, deterministicScore + classifierAdjust));
+        classifierStage = {
+          stage: 'classifier',
+          note: `adjust=${classifierAdjust.toFixed(2)} (${validated.reason})`,
+        };
+      }
+    }
     // What forces a `confirm` upgrade after the normal pipeline:
     //   - Conservative outcome (the resolver couldn't pin a precise
     //     set; the operator deserves the modal).
@@ -881,6 +968,10 @@ export const createPermissionEngine = (
         source: { layer: provenance?.defaults ?? 'default' },
       };
       const upgraded = currentState === 'degraded' ? degradeAllowToConfirm(baseAllow) : baseAllow;
+      const stages: ReasonChainEntry[] = [];
+      if (classifierStage !== null) stages.push(classifierStage);
+      const degradedStage = degradedStageEntry(currentState);
+      if (degradedStage !== undefined) stages.push(degradedStage);
       emitAudit(
         toolName,
         args,
@@ -888,7 +979,8 @@ export const createPermissionEngine = (
         resolvedCapabilities,
         score,
         scoreComponents,
-        degradedStageEntry(currentState),
+        classifierAdjust,
+        stages,
       );
       return upgraded;
     }
@@ -991,13 +1083,25 @@ export const createPermissionEngine = (
     if (currentState === 'degraded' || (resolverForcesConfirm && !sessionAllowed)) {
       decision = degradeAllowToConfirm(decision);
     }
-    const extraStage =
+    const stages: ReasonChainEntry[] = [];
+    if (classifierStage !== null) stages.push(classifierStage);
+    const tailStage =
       currentState === 'degraded'
         ? degradedStageEntry(currentState)
         : resolverForcesConfirm && !sessionAllowed
           ? resolverStageEntry(resolverResult)
           : undefined;
-    emitAudit(toolName, args, decision, resolvedCapabilities, score, scoreComponents, extraStage);
+    if (tailStage !== undefined) stages.push(tailStage);
+    emitAudit(
+      toolName,
+      args,
+      decision,
+      resolvedCapabilities,
+      score,
+      scoreComponents,
+      classifierAdjust,
+      stages,
+    );
     return decision;
   };
 

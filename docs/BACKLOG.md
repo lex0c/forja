@@ -15,6 +15,67 @@ Format:
 
 ---
 
+## [2026-05-10] permission-engine-v2 — slice 5: classifier hint
+
+**Done.** Fifth slice of the v2 evolution. Implements the optional classifier hint per PERMISSION_ENGINE.md §6.4 — an external model that receives the resolved capabilities + deterministic score and emits a `score_adjust` clamped to ±0.2. Hint-only by design: the classifier can NEVER produce a deny that the deterministic floor wouldn't already have produced; its job is to nudge borderline scores. Schema validation, clamping, lenient vs strict modes, and full prompt-injection isolation (the classifier never sees args / outputs / file contents) all land here.
+
+### Why now
+
+Slice 4 records a deterministic floor. The classifier is the spec's natural complement: a learnable signal that catches patterns the deterministic rules don't enumerate (benign-looking-but-malicious shapes, novel attack patterns). Wiring it as hint-only first means the deterministic decision stays the source of truth; the classifier can be swapped, retrained, or disabled without changing the audit chain's structural shape. The audit columns `classifier_hash` and `classifier_adjust` (stubbed since slice 1) gain their real population this slice — completing the row schema's first-class fields.
+
+### Spec invariants this slice respects (§6.4)
+
+- The classifier receives the tool name, the resolved capability strings, the deterministic score, a classifier hash (version pin), and a summarized context — NOT raw args, tool outputs, file contents, web fetches, or anything an adversary controls. Defense against prompt injection IN the classifier.
+- Output is clamped to ±0.2. A misbehaving classifier (returns +1.0, returns NaN, returns garbage schema) cannot push the score above the deterministic + 0.2 ceiling.
+- Failures (offline, timeout > 500ms, schema invalid) emit a `classifier_unavailable` chain entry. In strict mode (`classifierRequired: true`), the engine transitions to `degraded`. In lenient mode (default), the deterministic score is kept as-is and the call proceeds.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/classifier.ts` | New. `ClassifierInput` (toolName, capability strings, score, classifierHash, contextSummary), `ClassifierOutput` (score_adjust, reason), `Classifier` sync function type, `clampAdjust` helper (−0.2 / +0.2), `validateClassifierOutput` (schema gate; invalid → null), `createNoopClassifier`. Documented as sync to match the engine's sync surface; async classifier wrappers can be built on top in a future slice. |
+| `src/permissions/engine.ts` | `EngineOptions` gains `classifier?: Classifier`, `classifierHash?: string` (version pin, default `'none'`), `classifierRequired?: boolean` (default false). `check()` invokes the classifier after the deterministic score; clamps the adjust; sums + re-caps to [0, 1]. Audit row's `classifier_hash` and `classifier_adjust` are populated (no longer NULL stubs). Reason chain gains `classifier` (success) or `classifier-unavailable` (offline/schema/exception). Strict mode + unavailable → `engine.degrade('classifier_offline')`. |
+| `src/permissions/audit.ts` | `AuditEmitInput` already declares the two fields; this slice stops them defaulting to null at emit time when a classifier is wired. |
+| `tests/permissions/classifier.test.ts` | New. `clampAdjust` (bounds + NaN + Infinity); `validateClassifierOutput` (schema gates); noop classifier returns no adjust. |
+| `tests/permissions/engine.test.ts` | +block: audit row carries classifier_hash + classifier_adjust; clamping at engine boundary; throw-from-classifier handled cleanly; strict mode degrades; lenient mode preserves deterministic score. |
+| `tests/conformance/cases/classifier.yaml` | New. Conformance: classifier adjusts within bounds; offline + lenient continues; clamping bounds. Driver gains `expect.classifier_adjust` / `expect.classifier_hash` lookups. |
+
+### Decisions
+
+- **Sync classifier interface.** The engine's `check()` is sync; making the classifier async would cascade into every audit/REPL consumer. Sync interface + per-call timeout responsibility documented to the caller keeps the surface honest. When a real ML model lands (with inference latency), the caller wraps it with a precomputed-cache or a sync stub that defers to a background worker — the engine doesn't model that complexity.
+- **Hint-only, never gating.** The classifier can adjust the score by ±0.2 but cannot independently force a deny or even a confirm. The approval gate (current and future) consults the deterministic floor; the classifier nudges. A compromised classifier can move some borderline cases by 0.2 in either direction — bounded by the clamp, recoverable by retrain/disable.
+- **`classifierRequired` defaults to lenient.** Forcing every install to wire a real classifier before any check works is a heavy bar. Default lenient + explicit strict toggle lets enterprise deployments opt-in to "classifier is part of the trust boundary"; local-CLI deploys ride without one.
+- **Classifier never sees raw args / file contents / outputs.** Spec §6.4 is explicit and this is the only defense against prompt-injection IN the classifier's input. The input shape carries capability STRINGS (already formatted by the resolver), the deterministic score (a number), a tool name (registry-controlled), the classifier hash (version pin), and an optional context summary (engine-built). The test suite pins the shape to exactly four/five keys and rejects extras. Audit row records `classifier_hash` so a swap mid-session is forensically visible.
+- **NaN clamps to 0; invalid schema → null.** A classifier returning NaN/Infinity/garbage is treated as either "no adjust" (NaN) or "unavailable" (wrong schema). The distinction matters because the audit row's `classifier_adjust` should be a real number whenever a classifier ran — NaN there would poison the chain hash. Strict-shape gating is at the validator; clamp absorbs the numeric edge cases.
+- **Misc category skips the classifier alongside the resolver.** No side effects to score, no signal to feed; running the classifier would just inflate latency and audit volume.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5017 pass / 10 skip / 0 fail** (5027 total across 235 files). +34 net new tests vs slice 4:
+  - `tests/permissions/classifier.test.ts` (+16 — clamp / validate / noop / input shape)
+  - `tests/permissions/engine.test.ts` (+10 — integration, strict, throw, malformed, misc, input-shape sanity)
+  - `tests/conformance/cases/classifier.yaml` (+8 cases via the driver)
+
+### Wired but deferred
+
+- **Real ML classifier wrapper.** This slice ships the interface + fixtures; wiring an actual inference path (local model file, remote inference endpoint with timeout, cached predictions) lands in its own slice — likely after the calibration pilot validates which model families are worth integrating.
+- **Context summary builder.** `buildClassifierInput` accepts an optional `contextSummary` but the engine doesn't yet build one; a future slice can summarize the last N step events into a sanitized string the classifier consumes. Empty default keeps the field shape stable and adds no current cost.
+- **Approval-gate consumption of (deterministic + classifier) score.** Still deferred. The classifier adjusts the audit-recorded score; the gate continues to use static rule + protected paths + resolver outcome. Post-pilot calibration flips this in one slice.
+
+### Next
+
+Successor slices (in spec order):
+1. Bash AST resolver via tree-sitter (replaces token-based; closes bash-side protected-path gap from slice 1).
+2. Approval-gate consumption of score (post-pilot calibration).
+3. `--rotate-chain` flow.
+4. Subagent intersection formal.
+5. Sandbox plan integration (bwrap profile selection).
+6. Context-summary builder for the classifier input.
+
+---
+
 ## [2026-05-10] permission-engine-v2 — slice 4: deterministic risk score
 
 **Done.** Fourth slice of the v2 evolution. Implements the deterministic risk score from PERMISSION_ENGINE.md §6.3 — a weighted sum of 11 features over the resolved capabilities + command shape + engine state. Score and component breakdown populate the audit row's `score` and `score_components_json` columns (stubbed `0` / `'{}'` since slice 1). The classifier hint (§6.4) is the next slice; this lands the deterministic floor first.

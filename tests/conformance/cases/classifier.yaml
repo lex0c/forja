@@ -1,0 +1,139 @@
+# Conformance: classifier hint (PERMISSION_ENGINE.md §6.4).
+# Each case wires a pre-baked classifier fixture and asserts the
+# audit row's classifier_hash / classifier_adjust + post-call
+# engine state.
+
+- name: "no classifier wired → hash='none', adjust=null"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["ls *"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls -la"
+  expect:
+    kind: "allow"
+    classifier_hash: "none"
+    classifier_adjust: null
+
+- name: "safe fixture lowers score by 0.1 (within bounds)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["rm *"]
+    classifier_fixture: "safe"
+    classifier_hash: "fixture-safe-v1"
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "rm -rf /tmp/x"
+  expect:
+    kind: "allow"
+    classifier_hash: "fixture-safe-v1"
+    classifier_adjust: -0.1
+
+- name: "risky fixture raises score by 0.1"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["ls *"]
+    classifier_fixture: "risky"
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls -la"
+  expect:
+    kind: "allow"
+    classifier_adjust: 0.1
+
+- name: "neutral fixture records adjust=0"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["ls *"]
+    classifier_fixture: "neutral"
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls -la"
+  expect:
+    kind: "allow"
+    classifier_adjust: 0
+
+- name: "lenient mode: broken fixture continues with adjust=null"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["ls *"]
+    classifier_fixture: "broken"
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls -la"
+  expect:
+    kind: "allow"
+    classifier_adjust: null
+    engine_state_after: "ready"
+
+- name: "strict mode: broken fixture degrades engine"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["ls *"]
+    classifier_fixture: "broken"
+    classifier_required: true
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls -la"
+  expect:
+    kind: "allow"
+    engine_state_after: "degraded"
+
+- name: "strict mode: thrower degrades engine"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["ls *"]
+    classifier_fixture: "thrower"
+    classifier_required: true
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "ls -la"
+  expect:
+    kind: "allow"
+    engine_state_after: "degraded"
+
+- name: "misc category skips classifier (adjust stays null)"
+  setup:
+    classifier_fixture: "risky"
+  input:
+    tool: "todo_write"
+    category: "misc"
+    args: {}
+  expect:
+    kind: "allow"
+    classifier_adjust: null

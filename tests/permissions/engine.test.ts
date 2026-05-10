@@ -1610,3 +1610,185 @@ describe('engine — risk score in audit row (§6.3 integration)', () => {
     expect(collected[0]?.score_components).toEqual({});
   });
 });
+
+describe('engine — classifier hint (§6.4 integration)', () => {
+  const PROJ = '/work/proj';
+  const HOME = '/home/op';
+
+  interface CapturedEmit {
+    decision: 'allow' | 'deny' | 'confirm';
+    score?: number;
+    classifier_hash?: string | null;
+    classifier_adjust?: number | null;
+    reason_chain: ReadonlyArray<{ stage: string; note?: string }>;
+  }
+
+  const captureSink = (collected: CapturedEmit[]) => ({
+    emit(input: CapturedEmit) {
+      collected.push(input);
+      return { seq: collected.length, this_hash: `fake-${collected.length}` };
+    },
+    verifyChain() {
+      return { ok: true as const, rows: collected.length };
+    },
+  });
+
+  test('classifier adjust lands in audit row and adjusts score', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['rm *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      classifier: () => ({ score_adjust: -0.15, reason: 'benign cleanup' }),
+      classifierHash: 'v1',
+    });
+    eng.check('bash', 'bash', { command: 'rm -rf /tmp/x' });
+    expect(collected[0]?.classifier_hash).toBe('v1');
+    expect(collected[0]?.classifier_adjust).toBe(-0.15);
+    const stages = collected[0]?.reason_chain.map((e) => e.stage) ?? [];
+    expect(stages).toContain('classifier');
+    const entry = collected[0]?.reason_chain.find((e) => e.stage === 'classifier');
+    expect(entry?.note).toContain('adjust=-0.15');
+    expect(entry?.note).toContain('benign cleanup');
+  });
+
+  test('positive adjust clamped at +0.2', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { read_file: { allow_paths: ['**'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      classifier: () => ({ score_adjust: 0.99, reason: 'looks risky' }),
+    });
+    eng.check('read_file', 'fs.read', { file_path: 'src/x.ts' });
+    expect(collected[0]?.classifier_adjust).toBe(0.2);
+  });
+
+  test('negative adjust clamped at -0.2', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['rm *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      classifier: () => ({ score_adjust: -5.0, reason: 'totally safe' }),
+    });
+    eng.check('bash', 'bash', { command: 'rm -rf /tmp/x' });
+    expect(collected[0]?.classifier_adjust).toBe(-0.2);
+  });
+
+  test('classifier returns null → classifier-unavailable, lenient default keeps engine ready', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      classifier: () => null,
+    });
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(eng.state()).toBe('ready');
+    expect(collected[0]?.classifier_adjust).toBeNull();
+    const stages = collected[0]?.reason_chain.map((e) => e.stage) ?? [];
+    expect(stages).toContain('classifier-unavailable');
+  });
+
+  test('classifier throws → classifier-unavailable + lenient continues', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      classifier: () => {
+        throw new Error('inference timeout');
+      },
+    });
+    expect(() => eng.check('bash', 'bash', { command: 'ls -la' })).not.toThrow();
+    expect(eng.state()).toBe('ready');
+    const stages = collected[0]?.reason_chain.map((e) => e.stage) ?? [];
+    expect(stages).toContain('classifier-unavailable');
+    const entry = collected[0]?.reason_chain.find((e) => e.stage === 'classifier-unavailable');
+    expect(entry?.note).toContain('inference timeout');
+  });
+
+  test('classifier with malformed output → classifier-unavailable', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      // biome-ignore lint/suspicious/noExplicitAny: deliberately wrong shape
+      classifier: () => ({ wrong_field: 0.1 }) as any,
+    });
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    const stages = collected[0]?.reason_chain.map((e) => e.stage) ?? [];
+    expect(stages).toContain('classifier-unavailable');
+  });
+
+  test('strict mode: unavailable classifier degrades engine', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      classifier: () => null,
+      classifierRequired: true,
+    });
+    expect(eng.state()).toBe('ready');
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(eng.state()).toBe('degraded');
+  });
+
+  test('no classifier wired → classifier_hash="none", classifier_adjust=null', () => {
+    const collected: CapturedEmit[] = [];
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+    });
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(collected[0]?.classifier_hash).toBe('none');
+    expect(collected[0]?.classifier_adjust).toBeNull();
+  });
+
+  test('misc category skips classifier entirely', () => {
+    const collected: CapturedEmit[] = [];
+    let consultCount = 0;
+    const eng = createPermissionEngine(policy({}), {
+      cwd: PROJ,
+      home: HOME,
+      audit: captureSink(collected),
+      classifier: () => {
+        consultCount += 1;
+        return { score_adjust: 0.1, reason: 'hello' };
+      },
+    });
+    eng.check('todo_write', 'misc', {});
+    expect(consultCount).toBe(0);
+    expect(collected[0]?.classifier_adjust).toBeNull();
+  });
+
+  test('classifier input shape excludes raw args / command fields', () => {
+    // The classifier sees curated fields only — capability STRINGS
+    // (derived from resolvers, which may carry path/host scope),
+    // the score, the tool name, the hash. The shape does NOT have
+    // a top-level `args` or `command` key; raw args never flow in
+    // as a model-controlled field. (Capability scope CAN reflect
+    // a path the resolver derived from args; that's the point of
+    // resolution — the classifier needs to know what'll be
+    // touched.)
+    let seen: unknown = null;
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['*'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      classifier: (input) => {
+        seen = input;
+        return null;
+      },
+    });
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    const keys = Object.keys(seen as Record<string, unknown>).sort();
+    expect(keys).toEqual(['capabilities', 'classifierHash', 'score', 'toolName']);
+    // Belt-and-braces: explicitly check no raw-arg / command field.
+    expect((seen as Record<string, unknown>).args).toBeUndefined();
+    expect((seen as Record<string, unknown>).command).toBeUndefined();
+  });
+});

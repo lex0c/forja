@@ -24,6 +24,7 @@
 
 import { parse as parseYaml } from 'yaml';
 import { formatCapability } from '../../src/permissions/capabilities.ts';
+import type { Classifier } from '../../src/permissions/classifier.ts';
 import {
   type Decision,
   type EngineState,
@@ -32,6 +33,11 @@ import {
 } from '../../src/permissions/index.ts';
 import { loadPolicyFromString } from '../../src/permissions/index.ts';
 import { resolveCapabilities } from '../../src/permissions/resolvers/index.ts';
+
+// Pre-baked classifier fixtures keyed by name. YAML cases can pin
+// a behavior without needing to express a function inline. Add new
+// names here when a case needs a shape not already covered.
+export type ClassifierFixtureName = 'noop' | 'neutral' | 'safe' | 'risky' | 'broken' | 'thrower';
 
 export interface ConformanceCase {
   name: string;
@@ -44,6 +50,17 @@ export interface ConformanceCase {
     // validating-chain/refusing reject every check; degraded
     // upgrades allow → confirm).
     initialState?: EngineState;
+    // Wire a pre-baked classifier fixture for §6.4 cases. See
+    // `classifierFixtures` in the runner. Default: no classifier
+    // wired (classifier_hash='none', classifier_adjust=null).
+    classifier_fixture?: ClassifierFixtureName;
+    // Version pin recorded in audit when a classifier is wired.
+    // Default 'fixture' to surface fixture-driven runs vs the
+    // 'none' default of unwired cases.
+    classifier_hash?: string;
+    // Strict mode toggle — unavailable classifier degrades the
+    // engine. Default false (lenient).
+    classifier_required?: boolean;
   };
   input: {
     tool: string;
@@ -71,6 +88,13 @@ export interface ConformanceCase {
     score_gte?: number;
     score_lte?: number;
     score_components_include?: readonly string[];
+    // Classifier assertions. classifier_hash matches the audit
+    // row's recorded hash; classifier_adjust is the post-clamp
+    // value (number or null). engine_state_after lets §6.4 strict-
+    // mode cases verify the engine degraded after the call.
+    classifier_hash?: string;
+    classifier_adjust?: number | null;
+    engine_state_after?: EngineState;
   };
 }
 
@@ -105,6 +129,20 @@ export interface CaseRunResult {
   reasons: string[];
 }
 
+// Pre-baked classifier fixtures keyed by name. Each is a sync
+// function with the documented shape per §6.4. New shapes plug in
+// here without touching the YAML loader.
+const classifierFixtures: Record<ClassifierFixtureName, Classifier> = {
+  noop: () => null,
+  neutral: () => ({ score_adjust: 0, reason: 'fixture: neutral' }),
+  safe: () => ({ score_adjust: -0.1, reason: 'fixture: safe' }),
+  risky: () => ({ score_adjust: 0.1, reason: 'fixture: risky' }),
+  broken: () => ({ wrong: 'shape' }) as unknown as ReturnType<Classifier>,
+  thrower: () => {
+    throw new Error('fixture: thrower');
+  },
+};
+
 export const runCase = (c: ConformanceCase): CaseRunResult => {
   const cwd = c.setup.cwd ?? '/work/proj';
   const home = c.setup.home ?? '/home/op';
@@ -119,6 +157,8 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
   interface CapturedRow {
     score?: number;
     score_components?: Record<string, number>;
+    classifier_hash?: string | null;
+    classifier_adjust?: number | null;
   }
   const captured: CapturedRow[] = [];
   const sink = {
@@ -130,11 +170,18 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
       return { ok: true as const, rows: captured.length };
     },
   };
+  const classifier =
+    c.setup.classifier_fixture !== undefined
+      ? classifierFixtures[c.setup.classifier_fixture]
+      : undefined;
   const engine = createPermissionEngine(policy, {
     cwd,
     home,
     audit: sink,
     ...(c.setup.initialState !== undefined ? { initialState: c.setup.initialState } : {}),
+    ...(classifier !== undefined ? { classifier } : {}),
+    ...(c.setup.classifier_hash !== undefined ? { classifierHash: c.setup.classifier_hash } : {}),
+    ...(c.setup.classifier_required === true ? { classifierRequired: true } : {}),
   });
   const decision = engine.check(
     c.input.tool,
@@ -220,6 +267,28 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
         const got = Object.keys(components).sort().join(', ') || '<none>';
         reasons.push(`score_components missing '${expectedComp}' (got: ${got})`);
       }
+    }
+  }
+  if (c.expect.classifier_hash !== undefined) {
+    if (auditRow?.classifier_hash !== c.expect.classifier_hash) {
+      reasons.push(
+        `classifier_hash mismatch: expected ${c.expect.classifier_hash}, got ${auditRow?.classifier_hash ?? '<absent>'}`,
+      );
+    }
+  }
+  if (c.expect.classifier_adjust !== undefined) {
+    const actual = auditRow?.classifier_adjust ?? null;
+    if (actual !== c.expect.classifier_adjust) {
+      reasons.push(
+        `classifier_adjust mismatch: expected ${c.expect.classifier_adjust}, got ${actual}`,
+      );
+    }
+  }
+  if (c.expect.engine_state_after !== undefined) {
+    if (engine.state() !== c.expect.engine_state_after) {
+      reasons.push(
+        `engine_state_after mismatch: expected ${c.expect.engine_state_after}, got ${engine.state()}`,
+      );
     }
   }
   return { case: c, decision, ok: reasons.length === 0, reasons };
