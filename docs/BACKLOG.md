@@ -15,6 +15,57 @@ Format:
 
 ---
 
+## [2026-05-09] m4.2/recap — fix headless dispatch gate
+
+**Done:** Discovered while validating round-2 fixes against a real
+session: `agent recap session <id> --json` was rejected by the
+entry-level prompt gate in `src/cli/index.ts` with
+`"--json requires a prompt (REPL mode is TTY only)"`, and the no-
+`--json` form fell into the TTY gate. The `promptOptional` list at
+`index.ts:102-108` enumerates flags that don't expect a free-text
+prompt (`--list-sessions`, `--undo`, `--checkpoints`,
+`--worktrees`, `--memory`, `--explain-permissions`); `args.recap`
+was missing. Headless was unreachable in production despite
+`runRecapHeadless` being fully implemented, tested, and routed
+inside `run.ts:180`.
+
+The args.test.ts unit tests parsed the recap subcommand correctly
+and the recap-headless.test.ts unit tests called `runRecapHeadless`
+directly — neither covered the full `index.ts main` dispatch flow,
+which is where the gate sat. Same shape as the historical
+`--list-sessions` / `--undo` regressions documented in the test
+file.
+
+| Piece | Files |
+|---|---|
+| Add `args.recap !== undefined` to `promptOptional`. One-line semantic fix. | `src/cli/index.ts` |
+| Two regression tests spawning the real binary: `recap session <id> --json` (covers the `--json requires a prompt` path) and the same without `--json` (covers the TTY gate fall-through). Both expect the dispatch to reach `runRecapHeadless` and surface the `/recap:` error prefix from there. | `tests/cli/index.test.ts` |
+
+**Validation:** Before fix — `agent recap session $REAL_ID --json`
+prints "--json requires a prompt" + general usage. After fix —
+emits the §9 four-event NDJSON envelope. Real-session smoke
+covered all 6 renderers (`human` / `pr` / `changelog` / `slack` /
+`terse` / `json`), proved the round-2 cache-hit-ratio fix in
+production: a sessão real with `tokensIn=8, cached=24217` rendered
+"66% cached" instead of the pre-fix "302700% cached" math.
+
+**Decisions:**
+- **Add to existing `promptOptional` rather than reshape the gate.**
+  The list is the shared registry of "flags that legitimately have
+  no prompt". Recap belongs there for the same reason `--undo` and
+  `--checkpoints` do — pure subcommands with their own positional
+  vocabulary.
+- **Two regression tests, not one.** The bug had two failure modes
+  (`--json` rejection + TTY gate) coming from two different code
+  paths inside the same `if (args.prompt.length === 0 ...)` block.
+  Pinning both makes a future refactor of the gate (e.g., extracting
+  to a function) noisy if it loses one mode.
+
+**Next:** None — recap subsystem now usable end-to-end from CI and
+shell scripts (the actual reason `agent recap` exists per RECAP §9).
+
+---
+
 ## [2026-05-09] m4.2/recap — review carry-overs round 2
 
 **Done:** Three fixes from a delegated independent review of the

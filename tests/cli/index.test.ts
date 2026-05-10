@@ -167,4 +167,45 @@ describe('cli entrypoint: prompt requirement', () => {
     // dispatch reached the handler.
     expect(stderr).toContain('not found');
   });
+
+  test('`recap` subcommand does NOT require a prompt (--json + headless)', async () => {
+    // Regression: the entry's `promptOptional` list omitted
+    // `args.recap`, so `agent recap session <id> --json` was
+    // rejected with "--json requires a prompt (REPL mode is TTY
+    // only)" before reaching `runRecapHeadless`. Same shape as
+    // the --list-sessions / --undo regressions above. End-to-end
+    // through the real binary so the entry-level gate is exercised.
+    // The session id is unknown, so the handler errors with a
+    // recap-side diagnostic — what matters is that the prompt
+    // gate doesn't fire first.
+    const { exitCode, stderr } = await runCliWithRun([
+      'recap',
+      'session',
+      'no-such-session',
+      '--json',
+      '--no-llm-render',
+    ]);
+    expect(stderr).not.toContain('requires a prompt');
+    expect(stderr).not.toContain('TTY');
+    // Headless errors come through stderr with the `/recap:`
+    // prefix from runRecapHeadless. Exit 1 from the unknown id.
+    expect(stderr).toContain('/recap:');
+    expect(exitCode).toBe(1);
+  });
+
+  test('`recap` subcommand does NOT require a prompt (no --json, no TTY)', async () => {
+    // Same shape without --json — pre-fix this fell into the TTY
+    // gate ("interactive mode requires a TTY") because the empty
+    // prompt routed to the REPL branch. The recap headless path
+    // is non-interactive by design and should reach its handler
+    // regardless of TTY state.
+    const { stderr } = await runCliWithRun([
+      'recap',
+      'session',
+      'no-such-session',
+      '--no-llm-render',
+    ]);
+    expect(stderr).not.toContain('TTY');
+    expect(stderr).toContain('/recap:');
+  });
 });
