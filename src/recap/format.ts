@@ -177,6 +177,26 @@ const SECRET_PATTERNS: readonly SecretPattern[] = [
     pattern: /\b(?:ghp|ghs|gho|ghu|ghr|github_pat)_[A-Za-z0-9_]{20,}\b/g,
     preserveKey: false,
   },
+  // Google API keys: `AIza` prefix + 35 chars of `[A-Za-z0-9_-]`
+  // (per Google's published format). Length is fixed; bounding
+  // with `\b` on the right is critical because the trailing chars
+  // can include `-` and `_` which `\b` treats as word boundaries.
+  // SECURITY_GUIDELINE §6.1 lists this as a required pattern.
+  {
+    name: 'google-api-key',
+    pattern: /\bAIza[A-Za-z0-9_-]{35}\b/g,
+    preserveKey: false,
+  },
+  // Slack tokens: bot (`xoxb-`), user (`xoxp-`), workspace
+  // (`xoxa-`/`xoxr-`), Slack-Internal (`xoxs-`). Body is hyphen-
+  // separated digit/alpha segments; the conservative shape
+  // `[A-Za-z0-9-]{20,}` catches every variant without
+  // over-matching neighboring text. SECURITY_GUIDELINE §6.1.
+  {
+    name: 'slack-token',
+    pattern: /\bxox[baprs]-[A-Za-z0-9-]{20,}\b/g,
+    preserveKey: false,
+  },
   // JWT shape: header.payload.signature, all base64url. Has to
   // come BEFORE the bearer rule — a JWT after `Bearer` would
   // otherwise get caught by the broader bearer pattern with a

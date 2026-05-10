@@ -2,6 +2,7 @@
 // copy of this file to `changelog-v2.ts`, never an in-place edit
 // (RECAP.md §7.1).
 
+import { redactSecretsInIntermediate } from '../format.ts';
 import type { RecapIntermediate } from '../types.ts';
 
 export const CHANGELOG_PROMPT_VERSION = 'changelog-v1' as const;
@@ -38,12 +39,14 @@ export const buildChangelogPromptV1 = (
     '- Bullets MUST be one line, no trailing period (Keep a Changelog convention).',
   ].join('\n');
 
+  // Redact secrets before serializing (see `pr-v1.ts` for the
+  // canonical rationale — SECURITY §6.2).
   const user = [
     'Render the following recap intermediate as a Keep a Changelog entry per the',
     'forced `render_recap_changelog` tool. Use only fields present below.',
     '',
     '```json',
-    stringifyForPrompt(intermediate),
+    stringifyForPrompt(redactSecretsInIntermediate(intermediate)),
     '```',
   ].join('\n');
 

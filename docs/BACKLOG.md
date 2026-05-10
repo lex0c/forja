@@ -15,6 +15,64 @@ Format:
 
 ---
 
+## [2026-05-09] m4.2/recap — spec audit fixes (sampling, secret leak, patterns)
+
+**Done:** Three follow-ups from a delegated spec audit against
+PERFORMANCE / ANTI_PATTERNS / SECURITY_GUIDELINE / TOKEN_TUNING /
+CONTEXT_TUNING. The Haiku-default gap (PERFORMANCE §8.2) was
+deferred per user; the others land here.
+
+| Fix | Spec | Files |
+|---|---|---|
+| **Sampling implícito.** `renderViaLlm` was calling `provider.generateConstrained` without `temperature` / `top_p`, so each provider used its native default (Anthropic = 1.0). Spec TOKEN_TUNING §9 line 436 declares for `recap (LLM render)`: `temperature 0.2, top_p 0.95, max_tokens 4096`. Hardcoded the canonical values in `llm-shared.ts` (no per-renderer override — the spec table treats recap as one workflow); per-renderer max_tokens caps stay (terse 256, etc.) since 4096 is the upper bound, not a target. `DEFAULT_MAX_TOKENS` bumped 2048 → 4096. New test pins the request shape at the provider boundary. | TOKEN_TUNING §9 | `src/recap/llm-shared.ts`, `tests/recap/pr-llm.test.ts` |
+| **Secrets vazando ao provider via JSON cru.** All 5 prompt builders (`pr-v1.ts`, `human-v1.ts`, `changelog-v1.ts`, `slack-v1.ts`, `terse-v1.ts`) called `JSON.stringify(intermediate, null, 2)` raw before sending to the LLM. The rendered markdown was already redacted by the template (`redactSecrets` in `format.ts`), but the request **input** carried raw secrets — a goal text or command line with a pasted `ANTHROPIC_API_KEY=sk-ant-...` leaked to the Anthropic endpoint even though the operator's rendered output landed clean. Added `redactSecretsInIntermediate(intermediate)` to all 5 builders. New test pins it via the user-prompt content of the captured request. | SECURITY §6.2, CONTEXT_TUNING §7.3 | `src/recap/prompts/{pr,human,changelog,slack,terse}-v1.ts`, `tests/recap/pr-llm.test.ts` |
+| **Faltam Google + Slack secret patterns.** `format.ts` covered Anthropic / OpenAI / AWS / GitHub / JWT / Bearer / KEY=VALUE; SECURITY_GUIDELINE §6.1 also lists Google API keys (`AIza`-prefix + 35 chars) and Slack tokens (`xox[baprs]-...`). Added both to `SECRET_PATTERNS`; tests cover the happy path and the non-matching adjacency cases (short `AIzaShort`, fake `xoxn-`). | SECURITY §6.1 | `src/recap/format.ts`, `tests/recap/format.test.ts` |
+
+**Decisions:**
+- **Hardcode sampling, don't expose as `RenderViaLlmInput`.** Spec
+  treats recap as one canonical workflow; letting each renderer
+  pass different values would mean style drift between PR and
+  changelog rendered from the same intermediate. The fact that
+  the values came from a spec table is the strongest argument
+  against a per-renderer override.
+- **Apply redaction in the prompt builder, not in `llm-shared.ts`.**
+  The orchestrator gets `prompt: { system, user }` already
+  rendered; threading the intermediate through it would re-do work.
+  Each builder owns the JSON serialization, so each owns the
+  redaction it serializes. Five identical edits is acceptable
+  duplication compared to plumbing the raw intermediate through
+  the orchestrator.
+- **Slack token pattern uses the conservative shape `[A-Za-z0-9-]{20,}`.**
+  Real Slack tokens have an internal hyphen-delimited structure
+  (e.g. `xoxb-1234567890-1234567890-abcd...`), but the body shape
+  is documented loosely; matching the conservative envelope catches
+  every variant without over-matching neighboring text.
+- **Defer Haiku default.** PERFORMANCE §8.2's promise of Haiku
+  as the recap LLM model (with `--model` override) is a separate
+  fix — it requires plumbing a model override through
+  `runRecapHeadless` / `recapCommand.exec` and the provider
+  registry. Meaningful work, not a one-line patch. User punted to
+  a future slice.
+
+**Tests:** 4518 pass (was 4514, +4 new: 2 sampling/redaction in
+`pr-llm.test.ts`, 2 pattern coverage in `format.test.ts`).
+Typecheck clean; lint with the same 2 pre-existing warnings in
+`tests/harness/abortable.test.ts`.
+
+**Validation:** Pre-fix the consistency eval (RECAP §7.4: 5
+iterations byte-identical per fixture × renderer) couldn't hold
+once the LLM path was active because providers had non-zero
+temperature variance. Post-fix the request shape is pinned at the
+provider boundary; the consistency eval against the deterministic
+path (which is what the goldens cover today) was already green
+and stays green.
+
+**Next:** Haiku default + `--model` override (deferred).
+Cache-hit-ratio observability (`agent stats --cache`). Latency
+SLO benchmark in `evals/bench/perf/recap-projection.ts`.
+
+---
+
 ## [2026-05-09] m4.2/recap — fix headless dispatch gate
 
 **Done:** Discovered while validating round-2 fixes against a real

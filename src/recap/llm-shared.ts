@@ -74,7 +74,21 @@ export interface RenderViaLlmInput<T> {
   maxTokens?: number;
 }
 
-const DEFAULT_MAX_TOKENS = 2_048;
+// TOKEN_TUNING §9 canonical sampling for `recap (LLM render)`:
+// `temperature: 0.2, top_p: 0.95, max_tokens: 4096, thinking off,
+// seed_in_eval: yes`. Hardcoded across all five renderers (no
+// per-renderer override) because the spec table treats recap as
+// one workflow — divergence would mean different style across
+// renderers, which is a regression. Sub-renderer caps below
+// `DEFAULT_MAX_TOKENS` are still allowed (terse pins 256 to
+// protect cost) — the spec sets 4096 as the upper bound, not a
+// target. Without these, each provider used its default
+// (Anthropic = 1.0) and recap output drifted between calls,
+// breaking the `5 iterations byte-identical` consistency eval
+// the moment LLM render was active.
+const RECAP_TEMPERATURE = 0.2;
+const RECAP_TOP_P = 0.95;
+const DEFAULT_MAX_TOKENS = 4_096;
 
 export const renderViaLlm = async <T>(
   input: RenderViaLlmInput<T>,
@@ -102,6 +116,8 @@ export const renderViaLlm = async <T>(
       messages: [{ role: 'user', content: prompt.user }],
       system: prompt.system,
       max_tokens: input.maxTokens ?? DEFAULT_MAX_TOKENS,
+      temperature: RECAP_TEMPERATURE,
+      top_p: RECAP_TOP_P,
       output_schema: jsonSchema,
       output_schema_name: schemaName,
       ...(input.schemaDescription !== undefined

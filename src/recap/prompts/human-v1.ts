@@ -2,6 +2,7 @@
 // v1. Bumping is a copy of this file to `human-v2.ts`, never an
 // in-place edit (RECAP §7.1).
 
+import { redactSecretsInIntermediate } from '../format.ts';
 import type { RecapIntermediate } from '../types.ts';
 
 export const HUMAN_PROMPT_VERSION = 'human-v1' as const;
@@ -32,12 +33,15 @@ export const buildHumanPromptV1 = (
     '  deterministic `## What changed` section that follows.',
   ].join('\n');
 
+  // Redact secrets before serializing (see `pr-v1.ts` for the
+  // canonical rationale — SECURITY §6.2: rendered markdown was
+  // already clean, but the JSON to the provider was raw).
   const user = [
     'Render the `## Resumo` bullets per the forced `render_recap_human` tool.',
     'Use only fields present below.',
     '',
     '```json',
-    stringifyForPrompt(intermediate),
+    stringifyForPrompt(redactSecretsInIntermediate(intermediate)),
     '```',
   ].join('\n');
 

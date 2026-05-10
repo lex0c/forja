@@ -143,6 +143,48 @@ describe('renderPrViaLlm', () => {
     ).toHaveProperty('summary');
   });
 
+  test('passes canonical sampling (temperature, top_p) per TOKEN_TUNING §9', async () => {
+    // Spec table line 436: `recap (LLM render): temperature 0.2,
+    // top_p 0.95, max_tokens 4096`. Pre-fix the request omitted
+    // both, so providers used their default (Anthropic = 1.0) and
+    // the consistency eval (5×byte-identical) couldn't hold once
+    // the LLM path was active. Pin the values at the request
+    // boundary; provider adapter forwards them to the API.
+    const intermediate = baseIntermediate();
+    const handle = makeMockProvider(JSON.stringify(validStructuredFor(intermediate)));
+    await renderPrViaLlm({
+      intermediate,
+      provider: handle.provider,
+      promptVersion: 'pr-v1',
+    });
+    const call = handle.calls[0];
+    expect(call?.temperature).toBe(0.2);
+    expect(call?.top_p).toBe(0.95);
+    expect(call?.max_tokens).toBeGreaterThanOrEqual(2_048);
+  });
+
+  test('redacts secrets in the JSON sent to the provider (SECURITY §6.2)', async () => {
+    // Pre-fix the prompt builder did `JSON.stringify(intermediate)`
+    // raw, so a goal text or command line carrying a pasted API
+    // key leaked to the LLM endpoint even though the rendered
+    // markdown was redacted by the template. The fix routes the
+    // intermediate through `redactSecretsInIntermediate` before
+    // serialization. Pin it here at the request boundary so any
+    // future prompt rewrite that drops the redaction trips this.
+    const intermediate = baseIntermediate();
+    intermediate.goal.text = `use ANTHROPIC_API_KEY=sk-ant-api03-${'X'.repeat(40)}`;
+    const handle = makeMockProvider(JSON.stringify(validStructuredFor(intermediate)));
+    await renderPrViaLlm({
+      intermediate,
+      provider: handle.provider,
+      promptVersion: 'pr-v1',
+    });
+    const call = handle.calls[0];
+    const userPrompt = call?.messages[0]?.content as string;
+    expect(userPrompt).not.toContain('sk-ant-api03-XXX');
+    expect(userPrompt).toContain('<redacted:');
+  });
+
   test('capability-missing short-circuits without a provider call', async () => {
     const caps = { ...baseCaps(), constrained: false as const };
     const handle = makeMockProvider('{}', baseUsage(), caps);

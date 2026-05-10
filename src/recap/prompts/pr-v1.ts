@@ -9,6 +9,7 @@
 // that with the negative constraints from RECAP.md §7.3 to push
 // for fidelity inside the schema's allowed shape.
 
+import { redactSecretsInIntermediate } from '../format.ts';
 import type { RecapIntermediate } from '../types.ts';
 
 export const PR_PROMPT_VERSION = 'pr-v1' as const;
@@ -50,12 +51,21 @@ export const buildPrPromptV1 = (
   // it to look at the literal data rather than a digest avoids
   // accidental loss of information that a prose-summary prompt
   // would risk.
+  //
+  // SECURITY: redact secrets BEFORE serializing — the rendered
+  // markdown is already redacted by the template (`format.ts`),
+  // but the JSON sent to the provider was previously raw. A goal
+  // text or command line containing a pasted API key would leak
+  // to the LLM endpoint even though the rendered output landed
+  // clean. RECAP §6.2 + SECURITY §6.2 forbid that path; the
+  // redaction is fast (regex over a known set of free-text
+  // fields) and idempotent with the template's own pass.
   const user = [
     'Render the following recap intermediate as a PR description per the',
     'forced `render_recap_pr` tool. Use only fields present below.',
     '',
     '```json',
-    stringifyForPrompt(intermediate),
+    stringifyForPrompt(redactSecretsInIntermediate(intermediate)),
     '```',
   ].join('\n');
 

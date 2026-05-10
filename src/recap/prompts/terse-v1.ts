@@ -1,5 +1,6 @@
 // Prompt for the `terse` renderer, version v1. RECAP §4.6.
 
+import { redactSecretsInIntermediate } from '../format.ts';
 import type { RecapIntermediate } from '../types.ts';
 
 export const TERSE_PROMPT_VERSION = 'terse-v1' as const;
@@ -26,12 +27,14 @@ export const buildTersePromptV1 = (
     '- End with a single period.',
   ].join('\n');
 
+  // Redact secrets before serializing (see `pr-v1.ts` for the
+  // canonical rationale — SECURITY §6.2).
   const user = [
     'Render the following recap intermediate as a single-sentence summary per the',
     'forced `render_recap_terse` tool. Use only fields present below.',
     '',
     '```json',
-    stringifyForPrompt(intermediate),
+    stringifyForPrompt(redactSecretsInIntermediate(intermediate)),
     '```',
   ].join('\n');
 

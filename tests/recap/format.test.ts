@@ -76,6 +76,23 @@ describe('redactSecrets', () => {
     expect(redactSecrets(jwt)).toContain('<redacted:jwt>');
   });
 
+  test('redacts Google API keys (AIza prefix + 35 chars)', () => {
+    const key = `AIza${'A'.repeat(35)}`;
+    expect(redactSecrets(key)).toContain('<redacted:google-api-key>');
+    // A short key (< 35 chars after prefix) is NOT a Google API
+    // key — must not falsely redact.
+    expect(redactSecrets('AIzaShort')).toBe('AIzaShort');
+  });
+
+  test('redacts Slack tokens (xoxb / xoxp / xoxa / xoxr / xoxs)', () => {
+    expect(redactSecrets('xoxb-1234567890-abcdefghijklm')).toContain('<redacted:slack-token>');
+    expect(redactSecrets('xoxp-1234567890-abcdefghijklm')).toContain('<redacted:slack-token>');
+    expect(redactSecrets('xoxa-1234567890-abcdefghijklm')).toContain('<redacted:slack-token>');
+    // `xoxN-` (N ∉ {b,a,p,r,s}) is not a real Slack token shape;
+    // must not falsely redact.
+    expect(redactSecrets('xoxn-1234567890-abcdefghijklm')).toBe('xoxn-1234567890-abcdefghijklm');
+  });
+
   test('redacts Bearer tokens', () => {
     const text = 'Authorization: Bearer abcDEF1234567890longenoughtoken';
     expect(redactSecrets(text)).toContain('<redacted:bearer-token>');

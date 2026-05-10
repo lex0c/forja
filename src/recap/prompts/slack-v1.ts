@@ -1,6 +1,7 @@
 // Prompt for the `slack` renderer, version v1. RECAP §4.4
 // (ASCII-template variant).
 
+import { redactSecretsInIntermediate } from '../format.ts';
 import type { RecapIntermediate } from '../types.ts';
 
 export const SLACK_PROMPT_VERSION = 'slack-v1' as const;
@@ -30,12 +31,14 @@ export const buildSlackPromptV1 = (
     '- Stay within the per-field caps declared in the schema.',
   ].join('\n');
 
+  // Redact secrets before serializing (see `pr-v1.ts` for the
+  // canonical rationale — SECURITY §6.2).
   const user = [
     'Render the following recap intermediate as a Slack post per the',
     'forced `render_recap_slack` tool. Use only fields present below.',
     '',
     '```json',
-    stringifyForPrompt(intermediate),
+    stringifyForPrompt(redactSecretsInIntermediate(intermediate)),
     '```',
   ].join('\n');
 
