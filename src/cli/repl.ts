@@ -26,6 +26,7 @@ import { effectiveBudget, resolveMaxOutputTokens } from '../harness/types.ts';
 import { escapeGlobMetacharacters } from '../permissions/index.ts';
 import type { PolicySource, PolicyToolsSection } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/registry.ts';
+import { buildAutoTerse } from '../recap/auto-display.ts';
 import { stripAnsi } from '../sanitize/index.ts';
 import {
   HISTORY_CAP,
@@ -2007,6 +2008,52 @@ export const runRepl = async (options: RunReplOptions): Promise<number> => {
     ) {
       openReverseSearch();
       cancelExitArm();
+      return true;
+    }
+
+    // Alt+R — auto-display terse line for the current session
+    // (RECAP.md §3.3, UI.md §5.4). Idle-only: mid-turn the
+    // operator's attention is on the live output, and the projection
+    // would race the writes the loop is making. Slash-mode wins
+    // (operator typing `/recap` should not get Alt+R intercepted as
+    // a side effect of the autocomplete state). No-op when no
+    // session has finished yet (`lastSessionId === null`) — the
+    // line would have nothing to project.
+    if (
+      key.kind === 'char' &&
+      key.alt &&
+      !key.ctrl &&
+      (key.char === 'r' || key.char === 'R') &&
+      !isBusy() &&
+      renderer.state().slash === null &&
+      parseSlashInput(renderer.state().input.value) === null
+    ) {
+      cancelExitArm();
+      const sessionId = lastSessionId;
+      if (sessionId === null) {
+        bus.emit({
+          type: 'warn',
+          ts: now(),
+          message: 'recap terse: no session yet (start a turn first)',
+        });
+        return true;
+      }
+      const auto = buildAutoTerse({ db, sessionId, now: now() });
+      if (auto.ok) {
+        // Same shape the harness adapter uses for session-end
+        // recap_terse_ready: split markdown into per-line info
+        // events so the bus contract holds.
+        const lines = auto.markdown.split('\n').filter((l) => l.length > 0);
+        for (const line of lines) {
+          bus.emit({ type: 'info', ts: now(), message: line });
+        }
+      } else {
+        bus.emit({
+          type: 'warn',
+          ts: now(),
+          message: `recap terse failed: ${auto.reason}`,
+        });
+      }
       return true;
     }
 

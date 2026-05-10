@@ -115,6 +115,63 @@ describe('runAgent onEvent', () => {
     expect(events[events.length - 1]?.type).toBe('session_finished');
   });
 
+  test('emits recap_terse_ready immediately before session_finished (RECAP §3.3)', async () => {
+    // Auto-display contract: harness MUST project + render a
+    // terse line and emit it as a discrete event so the TUI can
+    // surface it above the session:end footer. Skipped silently
+    // on failure (tested separately via the helper unit tests);
+    // the happy path here pins the ordering — terse comes
+    // BEFORE session_finished so the rendered scrollback ordering
+    // is `... terse → session:end` (operator reads the summary
+    // above the closure).
+    const events: HarnessEvent[] = [];
+    await runAgent({
+      provider: mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'fix the bug',
+      onEvent: (e) => events.push(e),
+    });
+    const terseIdx = events.findIndex((e) => e.type === 'recap_terse_ready');
+    const finishedIdx = events.findIndex((e) => e.type === 'session_finished');
+    expect(terseIdx).toBeGreaterThan(-1);
+    expect(finishedIdx).toBeGreaterThan(terseIdx);
+    const terse = events[terseIdx];
+    if (terse?.type !== 'recap_terse_ready') throw new Error('expected recap_terse_ready');
+    expect(terse.markdown.length).toBeGreaterThan(0);
+    expect(terse.cacheHit).toBe(false); // first emit on this session
+    expect(terse.sessionId.length).toBeGreaterThan(0);
+  });
+
+  test('skips recap_terse_ready when buildAutoTerse fails — session_finished still emits', async () => {
+    // Auto-display surface MUST be best-effort: any failure
+    // (DB lock, missing table, malformed projection) collapses
+    // to "no emit" and the harness still emits session_finished
+    // so the operator's exit footer is unaffected. RECAP §3.3:
+    // "Falhas não bloqueiam".
+    //
+    // Force the helper to fail by dropping the `recap_cache`
+    // table before runAgent. `buildAutoTerse` reads cache first;
+    // SELECT on a missing table throws, the outer try/catch
+    // returns `{ ok: false }`, and the harness skips the emit.
+    db.query('DROP TABLE recap_cache').run();
+
+    const events: HarnessEvent[] = [];
+    await runAgent({
+      provider: mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'fix the bug',
+      onEvent: (e) => events.push(e),
+    });
+    expect(events.find((e) => e.type === 'recap_terse_ready')).toBeUndefined();
+    expect(events.find((e) => e.type === 'session_finished')).toBeDefined();
+  });
+
   test('emits step_start per iteration', async () => {
     const events: HarnessEvent[] = [];
     await runAgent({

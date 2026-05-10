@@ -15,6 +15,59 @@ Format:
 
 ---
 
+## [2026-05-09] m4.3/recap — auto-display surfaces (RECAP §3.3)
+
+**Done:** Recap deixa de exigir `/recap` explícito pra aparecer.
+Duas surfaces automáticas: terse line no session-end + Alt+R
+on-demand. Determinístico, byte-stable, audita.
+
+**Spec primeiro:**
+- `docs/spec/RECAP.md` §3.3 (novo): "Auto-display surfaces (terse on session-end + Alt+R)" com escopo, render mode determinístico justificado, política de auditoria, e regra de "falha silenciosa não bloqueia surface".
+- `docs/spec/UI.md` §5.4: nova linha no keybind table — `Alt+R | idle | imprime recap terse da sessão corrente acima do prompt`.
+
+| Piece | Files |
+|---|---|
+| `buildAutoTerse({ db, sessionId, now, renderOptions? })` — helper compartilhado entre as 2 surfaces. Pure function: projeta o intermediate (session_specific scope), checa o cache (`recap_cache` com `terse-deterministic-v1` prompt id pra não colidir com o LLM `terse-v1`), renderiza terse-deterministic em miss, escreve cache + audit row em `recap_runs`. Returns `{ ok: true, markdown, cacheHit } \| { ok: false, reason }`. Cache write / audit write são try/catch best-effort — falha desses passos NÃO rouba o markdown do operador. | `src/recap/auto-display.ts` (novo) |
+| `HarnessEvent` extended com `recap_terse_ready { sessionId, markdown, cacheHit }`. Emitted entre `Stop` hooks drain e `session_finished` em `harness/loop.ts`. Init-fail paths (sessionId vazio) skipped silently — operador ainda recebe seu `session_finished`. | `src/harness/types.ts`, `src/harness/loop.ts` |
+| TUI adapter translation: `recap_terse_ready → info` UIEvent(s). Markdown splitado por newline com filter de empties pra honrar contrato do bus (1 message-per-line) sem render de blank info line. Surface lands no scrollback ABOVE o `session:end` footer (ordering pinned em events test). | `src/tui/harness-adapter.ts` |
+| Alt+R keybind no REPL idle. Mesmo helper, mesma forma de output (info events no bus). Gate: idle-only (`!isBusy()`), não-busy, não-slash-mode, sessão já existe (`lastSessionId !== null`). Falha emite `warn` (vs harness que swallow — REPL tem operador olhando, surface deve falar). | `src/cli/repl.ts` |
+
+**Decisions:**
+- **Determinístico, não LLM, em ambas as surfaces.** Auto-display dispara muitas vezes/sessão; mesmo Haiku acumula em $/dia. Determinístico é grátis, instantâneo, byte-stable, cacheia perfeitamente. LLM permanece reachable só via `/recap terse` explícito (sem `--no-llm-render`).
+- **`terse-deterministic-v1` é distinto de `terse-v1` LLM.** O cache usa `(scopeKind, sessionIds, renderer, promptVersion, intermediate)` como chave; mesmo prompt version pra ambos faria um deterministic-rendered row ser servido a um LLM-render request. Versions distintas mantêm os dois caches isolados.
+- **Helper não emite eventos.** `auto-display.ts` lê + escreve DB e nada mais. Caller decide: harness emite `recap_terse_ready`; REPL emite `info` no bus. Mantém o helper testável com bare DB e independente de quem é o consumer.
+- **Falha NÃO bloqueia o session_finished / o próximo prompt.** Spec §3.3 mandates "operador MUST receive their exit footer / their next prompt regardless". Helper retorna `{ ok: false, reason }`; harness loop swallows; REPL emits `warn` (operador-visible, mas não-bloqueante).
+- **Audit row written even on cache hit.** `recap_runs.cache_hit` distinguindo hit vs miss permite computar o hit ratio per-surface ao longo do tempo (PERFORMANCE §13 target). Sem isso, o cache aparece como "sempre rápido" mas a observabilidade fica cega.
+- **Spec UX correction.** Versão inicial da §3.3 dizia "próxima keystroke remove a linha"; corrigido na própria draft pra "linha vira parte do scrollback" — ephemeral overlay reescrevendo scrollback exigiria alternate-screen, proibido por UI.md §0.
+
+**Tests:** 4530 pass (era 4518, +12 novos após self-review carry-overs). Quebra:
+- `tests/recap/auto-display.test.ts` (5): happy path com assert do cache row, cache hit, **cache write fail via SQLite trigger** (real teste de catch path, não theater), ok:false em sessão inexistente, sentinel cache short-circuit.
+- `tests/harness/events.test.ts` (2): emit ordering — `recap_terse_ready` BEFORE `session_finished`; **skip on failure** — `DROP TABLE recap_cache` força fail, harness skip emit mas `session_finished` ainda chega.
+- `tests/tui/harness-adapter.test.ts` (2): markdown → info translation, trailing-empty filter.
+- `tests/cli/repl.test.ts` (3): **Alt+R sem sessão → warn, sem audit row**; **Alt+R pós-sessão → terse line + audit row**; **Alt+R durante turn busy → no-op gate**.
+
+Typecheck clean. Lint clean (mesmas 2 warnings pré-existentes em `tests/harness/abortable.test.ts`).
+
+**Self-review carry-overs (todos aplicados):**
+- 🔴 #1 Alt+R sem teste → 3 testes adicionados em `repl.test.ts` cobrindo no-session/idle/busy gates.
+- 🔴 #2 Harness skip-on-failure não testado → adicionado `DROP TABLE recap_cache` smoke em `events.test.ts`.
+- ⚠ #3 Spec overreach em §3.3 ("fecha o gap §3.2") → corrigido pra "fecha **apenas para terse**; recap_mini + outros renderers continuam frios".
+- ⚠ #4 Dead `TERSE_SCHEMA_VERSION` re-export em `auto-display.ts` → removido import + re-export.
+- ⚠ #5 Test theater "audit row written even when cache write fails" → reimplementado via SQLite trigger `BEFORE INSERT ON recap_cache RAISE FAIL`. Realmente exercita o catch path agora.
+- ⚪ #6 Dead `expectedHash` no test happy-path → trocado por SELECT direto na tabela `recap_cache` (testa o write em vez de re-computar o hash sem usar).
+
+**Validação real:** `buildAutoTerse({ db, sessionId: 'fc44cf72...', now })` contra a DB de produção:
+- Primeira chamada: cache miss, render `"add foobar na .gitignore. 36s, $0.10."`
+- Segunda chamada: cache hit, byte-igual ao primeiro
+- 2 rows em `recap_runs` (1 miss + 1 hit), ambos `used_llm: 0`
+
+**Next:**
+- Goldens podem evoluir pra incluir uma fixture específica de auto-display? Hoje os goldens cobrem `terse` em `evals/recap/golden/<n>.terse.md` (mesmo output do helper); cobertura existente é byte-equivalente.
+- Cache hit ratio observability (`agent stats --cache`) pra fechar PERFORMANCE §13 — `recap_runs.cache_hit` agora popula consistentemente, falta a CLI surface.
+- Se Haiku default (PERFORMANCE §8.2) for wired no futuro, o `/recap terse` LLM passa a ter custo ~zero — auto-display continua determinístico (decisão consciente, não falta de wiring).
+
+---
+
 ## [2026-05-09] m4.2/recap — spec audit fixes (sampling, secret leak, patterns)
 
 **Done:** Three follow-ups from a delegated spec audit against

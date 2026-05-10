@@ -29,6 +29,7 @@ import type {
   ProviderToolUseBlock,
 } from '../providers/index.ts';
 import { estimatePromptTokens } from '../providers/tokens.ts';
+import { buildAutoTerse } from '../recap/auto-display.ts';
 import { projectRecap } from '../recap/projection.ts';
 import { buildResumeContext, shouldSkipResumeContext } from '../recap/resume-context.ts';
 import {
@@ -622,6 +623,31 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
     // crash the harness's exit path.
     if (pendingHookChains.size > 0) {
       await Promise.allSettled([...pendingHookChains]);
+    }
+
+    // Auto-display terse line (RECAP §3.3). Project the recap
+    // determinístically and cache the result so the operator's
+    // next `/recap` is a hit, plus the harness emits the markdown
+    // so the TUI surfaces it above session:end. Skipped silently
+    // on any failure — operator's exit footer comes through
+    // regardless. Init-fail paths where `sessionId === ''` are
+    // also skipped (no real session to project).
+    if (sessionId.length > 0) {
+      const auto = buildAutoTerse({ db: config.db, sessionId, now: Date.now() });
+      if (auto.ok) {
+        safeEmit(config.onEvent, {
+          type: 'recap_terse_ready',
+          sessionId,
+          markdown: auto.markdown,
+          cacheHit: auto.cacheHit,
+        });
+      }
+      // Failure case: swallow. The harness contract is "always
+      // emit session_finished"; the recap surface is best-effort.
+      // Diagnostic is observable via `recap_runs` (no row was
+      // written) and the rare crash that this catches is
+      // typically a transient SQLite lock that the next manual
+      // /recap would also surface.
     }
     safeEmit(config.onEvent, { type: 'session_finished', result });
     return result;

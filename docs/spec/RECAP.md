@@ -183,6 +183,30 @@ recap_mini:
 
 **Garantia operacional:** hook `Stop` **deve** popular `recap_cache` antes da sessão terminar — caso contrário, resume cai em fallback degradado (apenas `goal.text` literal + warning `incomplete: true`). Crash em `tool_exec` antes de `Stop` rodar é o caso esperado em produção; eval `evals/resume/auto_rehydrate/` cobre que projeção determinística (`§3` puro SQL) reconstrói `goal.text` + `decisions[]` direto do SQLite, **sem depender de cache**. Cache é otimização, não correctness path.
 
+### 3.3 Auto-display surfaces (terse on session-end + Alt+R)
+
+Além do `/recap` explícito (§1) e do auto-rehydrate (§3.2), o operador encontra recap em **dois pontos automáticos** dentro do REPL — ambos servem a mesma função: lembrar o que aconteceu sem custo de digitar `/recap`.
+
+**Surfaces:**
+
+1. **Session-end terse line.** Quando a sessão atinge estado terminal (`done` / `error` / `exhausted`), a TUI projeta `RecapIntermediate` da sessão atual, renderiza `terse` (1 frase ≤ 200 chars), e imprime no scrollback acima da linha de exit. Mesma chamada popula `recap_cache` para a entrada `(scope=session_specific, renderer=terse)`. **Importante:** isso fecha o gap operacional de §3.2 **apenas para o renderer `terse`** — o `recap_mini` consumido pelo session picker do `--resume` continua dependendo de hook `Stop` dedicado ou de `/recap list` explícito. Cache de outros renderers (`pr`, `human`, `changelog`, `slack`) também continua frio até alguém rodar `/recap <renderer>` manualmente.
+
+2. **Alt+R keybind.** Em qualquer ponto do REPL idle, `Alt+R` projeta o recap da sessão corrente e imprime a linha terse no scrollback acima do prompt (mesmo formato do session-end). Útil quando o operador rola o scrollback longe do prompt e perde a referência. A linha vira parte do histórico do terminal — UI.md §0 ("inline > alt-screen") proíbe ephemeral overlays que reescrevem o scrollback; remoção depende do `Ctrl+L` / scroll do terminal, igual qualquer output do `/recap`.
+
+**Render mode em ambas as surfaces: determinístico, sem LLM.** Justificativa:
+
+- **Custo invisível.** Auto-display dispara muitas vezes por sessão; mesmo Haiku acumula em $/dia se cada sessão fecha + 5 Alt+R. Determinístico é grátis e instantâneo.
+- **Cache hit perfeito.** Determinístico é byte-stable (`§7.4`); Alt+R repetido sem mudança no intermediate é o mesmo bytes — TUI pode no-op o redraw.
+- **Sem dependência de provider.** Operador sem API key configurada ainda recebe a linha. LLM render fica disponível só via `/recap terse` explícito.
+
+**O que aparece:** o output de `renderTerseDeterministic(intermediate)` — o renderer descrito em §4.6, byte-igual ao que `/recap terse --no-llm-render` produziria.
+
+**Escopo:** `session_current` em ambas as surfaces. Alt+R não suporta `last N` ou `range` — esses ficam exclusivamente no `/recap` explícito (UX: keybind global é "current state"; argumentos pertencem ao slash).
+
+**Auditoria:** ambas as projeções automáticas registram em `recap_runs` (§6.3) com renderer = `terse`, used_llm = 0, prompt_version = NULL, cache_hit conforme aplicável. Distinguir auto-display de chamada explícita não é exigido pela spec — o operador raramente precisa filtrar; quando precisa, agregação por `created_at` no contexto da sessão resolve.
+
+**Falhas não bloqueiam.** Projeção que falha (DB lock, sessão recém-criada sem mensagens) é silenciosamente swallow no auto-display — operador ainda vê o exit/prompt normal. `/recap` explícito permanece o caminho oficial e fala em voz alta sobre erros.
+
 ---
 
 ## 4. Renderers

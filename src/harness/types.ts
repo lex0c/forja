@@ -387,6 +387,23 @@ export type HarnessEvent =
       // explicitly when `decision === 'no_modal'`).
       reason?: string;
     }
+  // Session-end terse line (RECAP §3.3). Emitted right before
+  // `session_finished` when the harness successfully projected
+  // the recap and rendered the deterministic terse output. The
+  // TUI surfaces `markdown` as an info line in the scrollback
+  // above the session:end footer; headless callers can ignore
+  // it. Failure to project (DB lock, no messages) skips the
+  // event entirely — operator still gets `session_finished`,
+  // never a missing exit. `cacheHit` distinguishes a fresh
+  // projection from a re-render of an unchanged intermediate
+  // (rare but possible when /recap was already run during the
+  // session and nothing changed since).
+  | {
+      type: 'recap_terse_ready';
+      sessionId: string;
+      markdown: string;
+      cacheHit: boolean;
+    }
   | { type: 'session_finished'; result: HarnessResult };
 
 // Budget caps for an autonomous run. Per AGENTIC_CLI §5: every limit has
