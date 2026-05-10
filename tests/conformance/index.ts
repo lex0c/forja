@@ -25,6 +25,7 @@
 import { parse as parseYaml } from 'yaml';
 import {
   type Decision,
+  type EngineState,
   type PolicyCategory,
   createPermissionEngine,
 } from '../../src/permissions/index.ts';
@@ -36,6 +37,11 @@ export interface ConformanceCase {
     project_policy?: string;
     cwd?: string;
     home?: string;
+    // Pin the engine into a non-default state before the input
+    // runs. Used by §2 state-machine cases (init/loading-policy/
+    // validating-chain/refusing reject every check; degraded
+    // upgrades allow → confirm).
+    initialState?: EngineState;
   };
   input: {
     tool: string;
@@ -89,7 +95,11 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
     policyYaml.trim().length === 0
       ? loadPolicyFromString('defaults: { mode: strict }')
       : loadPolicyFromString(policyYaml, { cwd, home });
-  const engine = createPermissionEngine(policy, { cwd, home });
+  const engine = createPermissionEngine(policy, {
+    cwd,
+    home,
+    ...(c.setup.initialState !== undefined ? { initialState: c.setup.initialState } : {}),
+  });
   const decision = engine.check(
     c.input.tool,
     c.input.category,

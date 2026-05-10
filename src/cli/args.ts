@@ -41,6 +41,13 @@ export interface ParsedArgs {
   // Pre-TUI substitute for the spec's interactive `Type 'undo' to
   // confirm` prompt; headless friendly.
   yes: boolean;
+  // Resume boot under a known-broken audit chain
+  // (PERMISSION_ENGINE.md §7.2). Default false: a broken chain
+  // refuses the engine and exit code is 2. With this flag, a
+  // `chain-break-accepted` audit row is emitted before any new
+  // decisions — the override itself is audited and visible in the
+  // chain forever.
+  acceptBrokenChain?: boolean;
   // Undo mode (AGENTIC_CLI §12 / CHECKPOINTS.md §2.3). Restores
   // the latest checkpoint of the named session. Same semantics as
   // `agent --checkpoints restore <session> <latest-ckpt>` but
@@ -550,6 +557,10 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
       case '--yes':
       case '-y':
         args.yes = true;
+        i += 1;
+        break;
+      case '--accept-broken-chain':
+        args.acceptBrokenChain = true;
         i += 1;
         break;
       case '--undo': {

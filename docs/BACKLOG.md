@@ -15,6 +15,75 @@ Format:
 
 ---
 
+## [2026-05-10] permission-engine-v2 — slice 2: state machine + bootstrap formal
+
+**Done.** Second slice of the v2 evolution. Slice 1 shipped the audit hash chain and protected paths but left two threads loose: (a) the engine had no formal lifecycle — `createPermissionEngine` returned an instance immediately usable, with no notion of "init/loading/validating"; (b) the audit sink was opt-in via `EngineOptions.audit` and production bootstrap never wired it. This slice closes both, plus what they unblock: explicit `refusing` state on chain break, `degraded` state for subsystem health, and a state-aware `check()` that fails closed on every state where the engine isn't fully ready.
+
+### Why this next
+
+Capabilities + resolver (the other Tier-0 candidate from the slice-1 retro) requires reworking the per-tool decision flow. State machine is the smaller refactor — additive in interface (the engine gains `state()` + transitions; existing `check()` keeps its shape) — and is a *prerequisite* for capabilities because the bash AST resolver, classifier, and sandbox subsystem all need the engine to articulate "I'm degraded because subsystem X is offline". Ordering it before capabilities means each later piece lands on an engine that already knows how to fail explicitly.
+
+State machine also unblocks the deferred item from slice 1 (audit sink at production bootstrap): the right wiring point is the same place that runs `verifyChain()`, which is exactly the `validating-chain` state transition.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/state-machine.ts` | New. `EngineState` union (`init` / `loading-policy` / `validating-chain` / `ready` / `degraded` / `refusing`), valid-transition table per spec §2, `StateController` class that emits a transition event on every change. Hand-validated transitions (no library) so an invalid attempt (e.g. `refusing → ready` without `init` reset) throws explicitly. |
+| `src/permissions/engine.ts` | `PermissionEngine` interface gains `state()`, `degrade(reason)`, `restore(reason)`, `refuse(reason)`. `EngineOptions` accepts `initialState?: EngineState` (default `ready` for backward compatibility with tests that build engines directly). `check()` consults state: `init` / `loading-policy` / `validating-chain` / `refusing` → deny with `reason: 'engine not ready (state=<x>)'`; `degraded` → pipeline runs but every `allow` is upgraded to `confirm` (spec §2 table). |
+| `src/permissions/bootstrap-engine.ts` | New. `bootstrapPermissionEngine({cwd, home, env, db, sessionId, acceptBrokenChain})` walks `init → loading-policy → validating-chain → ready` explicitly, returning `{ engine, identity, sink, events }`. Failure modes: malformed policy → `refusing` with reason; broken chain + no override → `refusing`; broken chain + `acceptBrokenChain` → `ready` with `chain_break_accepted` audit row. |
+| `src/cli/bootstrap.ts` | Replaces direct `createPermissionEngine` call with `bootstrapPermissionEngine`. Audit sink now bound in production. `BootstrapResult` exposes `permissionState`, `permissionEvents`, `installIdentity` for the CLI driver. |
+| `src/cli/args.ts` | New flag `--accept-broken-chain` for resuming under a known-broken audit chain. Documented as "audit-loud" (the override itself is logged). |
+| `src/cli/run.ts` | When `permissionState === 'refusing'`, prints the cause to stderr and exits 2 (matches the "budget exhausted" exit convention for unrecoverable startup errors). |
+| `src/storage/repos/approvals-log.ts` | No schema change. The `chain_break_accepted` event reuses `reason_chain_json` with stage='chain-break-accepted'. |
+| `tests/permissions/state-machine.test.ts` | New. Valid + invalid transitions, callback emission. |
+| `tests/permissions/bootstrap-engine.test.ts` | New. Happy path init→ready, malformed policy → refusing, broken chain → refusing, broken chain + accept → ready+audit row, audit sink emits in production path. |
+| `tests/permissions/engine.test.ts` | +tests for state honoring in `check()` (each non-ready state denies; degraded upgrades allow→confirm). |
+| `tests/conformance/cases/engine_state.yaml` | New. Conformance: degraded upgrades, refusing denies, init denies. Driver extended to accept `setup.initialState`. |
+
+### Decisions
+
+- **Transitions are hand-validated, no library.** ~30 LOC for the table + checker; library would dwarf the surface and locked stack prefers zero-dep.
+- **`degraded` upgrades allow → confirm uniformly.** Even `bypass` mode loses its allow shortcut: if the engine is degraded, the operator sees the modal. Defense in depth — bypass is meant for productivity, not for overriding subsystem-health signals.
+- **`--rotate-chain` deferred to a follow-up slice.** Rotation is rare, multi-step (archive old chain table + new install_id + quarantine flag), and orthogonal to the state machine itself. `--accept-broken-chain` covers the immediate continuation-under-known-break case operators need today.
+- **`StateController` over state-in-engine.** A separate object so the bootstrap can drive transitions externally (slice 1 plumbed audit sink the same way). Engine holds a reference and reads the current state on each `check`.
+- **Engine still ships `initialState` default of `ready`.** Test ergonomics: every existing test that builds an engine inline keeps working without retrofitting. Production path goes through `bootstrapPermissionEngine` which walks states explicitly.
+- **Audit-loud overrides.** `acceptBrokenChain` (and the future `rotateChain`) emits a stable `chain-break-accepted` audit row BEFORE the engine starts taking new decisions. Operator can't quietly silence chain failures.
+- **Preflight separates install_id + policy load from chain verify.** `bootstrapPermissionEngine` was originally one phase; a CLI test pinned that a malformed policy must NOT open the SQLite handle (no leak). Splitting into `preflightPermissionEngine` (no DB, throws on bad config) + `bootstrapPermissionEngine` (uses DB, walks state machine) preserves that invariant while still routing chain failures through the `refusing` state. Tests get a clean API for either composition; production CLI calls both in order.
+- **State machine refused outcomes split into hard-throw vs soft-refusing.** `install_id_failed` and `policy_load_failed` are HARD configuration errors — preflight throws and the CLI exits via the existing error path (no `refusing` state ever observed). `chain_broken` (without `--accept-broken-chain`) lands as `state=refusing` because the operator has a recovery flow (the override). Different shapes match different ergonomics: a typo in YAML deserves a stack trace; a chain break deserves a guided recovery message.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **4817 pass / 10 skip / 0 fail** (4827 total across 231 files). +53 net new tests vs slice 1 baseline (4764):
+  - `tests/permissions/state-machine.test.ts` (+19)
+  - `tests/permissions/bootstrap-engine.test.ts` (+12)
+  - `tests/permissions/engine.test.ts` (+14 — engine-state integration block)
+  - `tests/conformance/cases/engine_state.yaml` (+8 cases)
+
+### Wired but deferred
+
+- **`--rotate-chain`.** Rotation flow (archive old chain into `approvals_log_archived_<ts>`, rotate `install_id`, quarantine flag) lands in a successor slice. Operators needing immediate continuation under a broken chain use `--accept-broken-chain` instead, which emits an audit-loud row and keeps the existing chain intact.
+- **Subsystem-health watchers.** The engine exposes `degrade(reason)` + `restore(reason)`, but the watchers that call them (classifier-health, sandbox-health, sealing-health pollers) land per-subsystem as those slices arrive. Today the API is opt-in via direct call (tests + future bootstrap watchers).
+- **`engine.state()` consumed by harness loop.** Harness currently relies on `check()` returning deny in non-ready states. A future slice can add a pre-call `state()` check to short-circuit costly LLM rounds when the engine refused mid-session.
+
+### Closed (from slice 1 deferred list)
+
+- **Audit sink at production bootstrap.** Bootstrap now wires `createSqliteSink({ db, identity })` into the engine via `bootstrapPermissionEngine`. The deferred 5-line stitching landed naturally as part of the state-machine walk because the same phase that runs `verifyChain` is the right place to bind the sink. Every production check now emits to `approvals_log`.
+
+### Next
+
+Successor slices (in spec order):
+1. Capabilities + resolver per-tool (refactor of `check`; biggest single change, blocks risk score + bash AST).
+2. Risk score determinístico.
+3. Bash AST resolver (closes the bash-side protected-path gap from slice 1).
+4. `--rotate-chain` flow (closes the chain-recovery story).
+5. Subagent intersection formal.
+6. Sandbox plan integration (bwrap profile selection).
+
+---
+
 ## [2026-05-10] permission-engine-v2 — slice 1: audit hash-chain + protected paths
 
 **Done.** First slice of the v2 evolution of the permission engine, aligned with the new spec doc `docs/spec/PERMISSION_ENGINE.md`. Additive layer on top of the v1 contract — `engine.check()` keeps its signature, hierarchy resolver and matchers untouched. The v1 `approvals` table (CONTRACTS §9, FK to `tool_calls`) stays as the external contract; the v2 `approvals_log` ledger is the internal append-only chain.

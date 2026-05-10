@@ -122,6 +122,9 @@ const makeBootstrapStub = (
     subagents: { byName: new Map(), shadows: [] } as unknown as BootstrapResult['subagents'],
     hookWarnings: [],
     critiqueWarnings: [],
+    permissionState: 'ready',
+    permissionChain: { ok: true, rows: 0 },
+    installIdentity: { install_id: 'test-fixture', created_at_ms: 0 },
   };
 };
 

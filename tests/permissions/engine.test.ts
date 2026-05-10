@@ -1305,3 +1305,159 @@ describe('engine.check — audit emission', () => {
     expect(() => eng.check('bash', 'bash', { command: 'ls -la' })).not.toThrow();
   });
 });
+
+describe('engine — state machine integration (§2)', () => {
+  const PROJ = '/work/proj';
+  const HOME = '/home/op';
+
+  test('state() defaults to ready', () => {
+    const eng = createPermissionEngine(policy({}), { cwd: PROJ, home: HOME });
+    expect(eng.state()).toBe('ready');
+  });
+
+  test('initialState option pins the starting state', () => {
+    const eng = createPermissionEngine(policy({}), {
+      cwd: PROJ,
+      home: HOME,
+      initialState: 'init',
+    });
+    expect(eng.state()).toBe('init');
+  });
+
+  test.each(['init', 'loading-policy', 'validating-chain', 'refusing'] as const)(
+    'state=%s denies every check with engine-state reason',
+    (state) => {
+      const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+        cwd: PROJ,
+        home: HOME,
+        initialState: state,
+      });
+      const d = eng.check('bash', 'bash', { command: 'ls -la' });
+      expect(d.kind).toBe('deny');
+      if (d.kind === 'deny') {
+        expect(d.reason).toContain('engine not ready');
+        expect(d.reason).toContain(`state=${state}`);
+        expect(d.source?.section).toBe('engine-state');
+      }
+    },
+  );
+
+  test('degraded upgrades allow → confirm but preserves source attribution', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      initialState: 'ready',
+    });
+    eng.degrade('classifier_offline');
+    expect(eng.state()).toBe('degraded');
+
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.kind).toBe('confirm');
+    if (d.kind === 'confirm') {
+      expect(d.reason).toContain('degraded state forced confirm');
+      // Original rule attribution preserved
+      expect(d.source?.rule).toBe('ls *');
+      expect(d.source?.section).toBe('bash');
+    }
+  });
+
+  test('degraded does NOT downgrade deny', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { deny: ['rm -rf *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      initialState: 'degraded',
+    });
+    const d = eng.check('bash', 'bash', { command: 'rm -rf /tmp/x' });
+    expect(d.kind).toBe('deny');
+  });
+
+  test('degraded does NOT change confirm', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { confirm: ['git push *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      initialState: 'degraded',
+    });
+    const d = eng.check('bash', 'bash', { command: 'git push origin main' });
+    expect(d.kind).toBe('confirm');
+  });
+
+  test('degraded blocks bypass mode shortcut (defense in depth)', () => {
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'bypass' } }), {
+      cwd: PROJ,
+      home: HOME,
+      initialState: 'degraded',
+    });
+    const d = eng.check('bash', 'bash', { command: 'anything' });
+    expect(d.kind).toBe('confirm');
+  });
+
+  test('restore() returns from degraded to ready', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      initialState: 'ready',
+    });
+    eng.degrade('test_signal');
+    eng.restore('subsystem_back');
+    expect(eng.state()).toBe('ready');
+
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.kind).toBe('allow');
+  });
+
+  test('refuse() makes engine terminal — all checks deny', () => {
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      initialState: 'ready',
+    });
+    eng.refuse('chain_break_detected');
+    expect(eng.state()).toBe('refusing');
+
+    const d = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(d.kind).toBe('deny');
+    if (d.kind === 'deny') {
+      expect(d.source?.section).toBe('engine-state');
+    }
+  });
+
+  test('refusing is terminal — cannot restore', () => {
+    const eng = createPermissionEngine(policy({}), {
+      cwd: PROJ,
+      home: HOME,
+      initialState: 'ready',
+    });
+    eng.refuse('test');
+    expect(() => eng.restore('try_again')).toThrow(/invalid transition/);
+  });
+
+  test('audit row carries engine-state stage when degraded fires', () => {
+    interface CapturedEmit {
+      decision: 'allow' | 'deny' | 'confirm';
+      reason_chain: ReadonlyArray<{ stage: string; note?: string }>;
+    }
+    const collected: CapturedEmit[] = [];
+    const sink = {
+      emit(input: CapturedEmit) {
+        collected.push(input);
+        return { seq: collected.length, this_hash: `fake-${collected.length}` };
+      },
+      verifyChain() {
+        return { ok: true as const, rows: collected.length };
+      },
+    };
+    const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
+      cwd: PROJ,
+      home: HOME,
+      audit: sink,
+      initialState: 'degraded',
+    });
+    eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(collected[0]?.decision).toBe('confirm');
+    // First entry is the original static-rule attribution; second is
+    // the engine-state stage marker added by the degraded path.
+    expect(collected[0]?.reason_chain[0]?.stage).toBe('static-rule');
+    expect(collected[0]?.reason_chain[1]?.stage).toBe('engine-state');
+    expect(collected[0]?.reason_chain[1]?.note).toContain('degraded');
+  });
+});

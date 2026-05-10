@@ -43,6 +43,27 @@ export type {
 } from './audit.ts';
 export { computeGenesisHash, createNoopSink, createSqliteSink } from './audit.ts';
 
+export type {
+  BootstrapPermissionEngineInput,
+  BootstrapPermissionEngineResult,
+  PreflightInput,
+  PreflightResult,
+} from './bootstrap-engine.ts';
+export { bootstrapPermissionEngine, preflightPermissionEngine } from './bootstrap-engine.ts';
+
+export type {
+  EngineState,
+  StateController,
+  StateControllerOptions,
+  StateTransition,
+  TransitionListener,
+} from './state-machine.ts';
+export {
+  canTransition,
+  createStateController,
+  isRejectingState,
+} from './state-machine.ts';
+
 export type { InstallIdentity, EnsureInstallIdOptions } from './install_id.ts';
 export { ensureInstallId } from './install_id.ts';
 

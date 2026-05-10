@@ -14,7 +14,11 @@ import {
   resolveRepoRoot,
   resolveScopeRoots,
 } from '../memory/index.ts';
-import { type LockConflict, createPermissionEngine, resolvePolicy } from '../permissions/index.ts';
+import {
+  type LockConflict,
+  bootstrapPermissionEngine,
+  preflightPermissionEngine,
+} from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/index.ts';
 import type { Provider } from '../providers/index.ts';
 import { type DB, defaultDbPath, migrate, openDb } from '../storage/index.ts';
@@ -83,6 +87,12 @@ export interface BootstrapInput {
   // The resolved value drives `HarnessConfig.isCwdTrusted`, which
   // memory_write's trust gate consumes (spec MEMORY.md §7.2.1).
   trustListPathOverride?: string | null;
+  // Operator-supplied override to continue boot under a known-broken
+  // audit chain (PERMISSION_ENGINE.md §7.2). Default false: a broken
+  // chain refuses the engine. When true, a `chain-break-accepted`
+  // audit row is emitted before the engine accepts new decisions —
+  // the override itself is audited.
+  acceptBrokenChain?: boolean;
 }
 
 export interface BootstrapResult {
@@ -115,6 +125,23 @@ export interface BootstrapResult {
   // a bad value degrades to defaults rather than aborting boot.
   // Empty in the happy path.
   critiqueWarnings: readonly string[];
+  // Final state of the permission engine after bootstrap walked
+  // init → loading-policy → validating-chain → ready/refusing.
+  // When this is `refusing`, the engine is a deny-everything stub
+  // and the CLI driver MUST short-circuit to a non-zero exit
+  // (run.ts handles the dispatch).
+  permissionState: import('../permissions/index.ts').EngineState;
+  // Reason supplied to the refusing transition (when state is
+  // `refusing`). Caller surfaces it on stderr.
+  permissionRefusingReason?: string;
+  // Audit chain integrity result captured at bootstrap (§7.2). The
+  // CLI driver renders an explicit "chain ok / broken at seq N"
+  // line so the operator sees the state on every boot.
+  permissionChain: import('../permissions/index.ts').VerifyResult;
+  // Per-installation identity (`~/.config/agent/install_id`) bound
+  // to the active audit chain. The CLI surfaces this in
+  // diagnostics so operators can correlate logs across machines.
+  installIdentity: import('../permissions/index.ts').InstallIdentity;
 }
 
 // Build a HarnessConfig from environment + cwd + args. This is the main
@@ -165,29 +192,6 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   // on BootstrapResult for the CLI driver to print.
   const critiqueLoaded = loadCritiqueConfig({ cwd, registry });
 
-  // Hierarchy: enterprise → user → project → session. Each layer is
-  // optional; absent layers contribute nothing. The resolver merges
-  // with locked-section semantics so an enterprise-marked rule
-  // (`tools.bash.locked: true`) cannot be overridden downstream.
-  const resolved = resolvePolicy({
-    cwd,
-    ...(input.enterprisePolicyPath !== undefined
-      ? { enterprisePath: input.enterprisePolicyPath }
-      : {}),
-    ...(input.userPolicyPath !== undefined ? { userPath: input.userPolicyPath } : {}),
-  });
-  // Pass `provenance` so every Decision the engine returns
-  // carries `source.layer` populated from the section that fired
-  // the rule. The modal layer renders "denied by user policy
-  // (rule: rm *, section: bash)" instead of a generic "denied",
-  // and `/perms why` can point operators at the YAML they need
-  // to edit.
-  const permissionEngine = createPermissionEngine(resolved.policy, {
-    cwd,
-    provenance: resolved.provenance,
-  });
-  const policyLayers = resolved.layers.map((l) => l.layer);
-
   const toolRegistry = createToolRegistry();
   registerBuiltinTools(toolRegistry);
 
@@ -211,14 +215,49 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   // task() invocation.
   validateSubagentSet(subagents.byName.values(), toolRegistry);
 
-  // From here on, anything that throws must close the DB.
-  // `migrate` and `createMemoryRegistry` are the realistic
-  // offenders — schema-version drift surfaces in migrate, and
-  // the registry's eager index load can hit fs errors other than
-  // ENOENT (EACCES on a misconfigured user scope, EIO, etc.).
-  // ENOENT is already handled inside loadScopeIndex as `absent`.
+  // Permission engine preflight (install_id + policy load) BEFORE
+  // any SQLite handle is opened. A malformed policy YAML / a §11
+  // protected-paths redefinition / a missing config dir for
+  // install_id all throw HERE, preserving the v1 leak-test
+  // invariant ("DB file never created when policy is bad"). The
+  // chain-verify phase still runs after the DB is open and can
+  // produce a `refusing` state — that's the operator-recoverable
+  // path with --accept-broken-chain.
+  const preflight = preflightPermissionEngine({
+    cwd,
+    ...(input.enterprisePolicyPath !== undefined
+      ? { enterprisePath: input.enterprisePolicyPath }
+      : {}),
+    ...(input.userPolicyPath !== undefined ? { userPath: input.userPolicyPath } : {}),
+  });
+
+  // Open + migrate the DB. bootstrapPermissionEngine's chain-verify
+  // phase needs the schema applied. From here on, anything that
+  // throws must close the DB.
   const dbPath = input.dbPath ?? defaultDbPath();
   const db = openDb(dbPath);
+  try {
+    migrate(db);
+  } catch (e) {
+    db.close();
+    throw e;
+  }
+
+  // Permission engine bootstrap (PERMISSION_ENGINE.md §2):
+  // init → loading-policy → validating-chain → ready (or refusing
+  // when chain is broken without --accept-broken-chain). The
+  // controller drives runtime degrade/restore, and the audit sink
+  // built here is the one the engine emits through — single SQLite
+  // handle for the entire lifetime.
+  const permResult = bootstrapPermissionEngine({
+    cwd,
+    db,
+    sessionId: 'session-bootstrap',
+    preflight,
+    ...(input.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
+  });
+  const permissionEngine = permResult.engine;
+  const policyLayers = permResult.layerNames as ('enterprise' | 'user' | 'project' | 'session')[];
 
   // Resolve cwd trust state EARLY so the system-prompt composition
   // (project pointer, below) can gate on it. Originally this lived
@@ -236,8 +275,6 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
   let memoryRegistry: ReturnType<typeof createMemoryRegistry>;
   let resolvedHooks: ReturnType<typeof resolveHookConfig>;
   try {
-    migrate(db);
-
     // Resolve the effective system prompt. Layers stack here in
     // precedence order (most-specific to most-generic). Each
     // `composeWith*` prepends to the downstream chunk it
@@ -519,9 +556,15 @@ export const bootstrap = (input: BootstrapInput): BootstrapResult => {
     db,
     modelId,
     policyLayers,
-    lockConflicts: resolved.lockConflicts,
+    lockConflicts: [...permResult.lockConflicts],
     subagents,
     hookWarnings: resolvedHooks.warnings,
     critiqueWarnings: critiqueLoaded.warnings,
+    permissionState: permResult.state,
+    ...(permResult.refusingReason !== undefined
+      ? { permissionRefusingReason: permResult.refusingReason }
+      : {}),
+    permissionChain: permResult.chain,
+    installIdentity: permResult.identity,
   };
 };

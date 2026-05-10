@@ -417,11 +417,40 @@ export const run = async (options: RunOptions): Promise<number> => {
       ...(args.maxSteps !== undefined ? { budget: { maxSteps: args.maxSteps } } : {}),
       ...(args.plan === true ? { plan: true } : {}),
       ...(resumeFromSessionId !== undefined ? { resumeFromSessionId } : {}),
+      ...(args.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
       signal,
       ...(options.bootstrapOverride ?? {}),
     };
-    const { config, db, lockConflicts, subagents, hookWarnings, critiqueWarnings } =
-      bootstrap(bootstrapInput);
+    const {
+      config,
+      db,
+      lockConflicts,
+      subagents,
+      hookWarnings,
+      critiqueWarnings,
+      permissionState,
+      permissionRefusingReason,
+      permissionChain,
+    } = bootstrap(bootstrapInput);
+
+    // Permission engine refused to come up — typically a broken
+    // audit chain (PERMISSION_ENGINE.md §7.2). Surface the cause
+    // to stderr with the recovery flag, then exit 2 (boot-blocking
+    // configuration error). We close the DB explicitly so the WAL
+    // doesn't linger across the failed boot.
+    if (permissionState === 'refusing') {
+      const reason = permissionRefusingReason ?? 'unknown';
+      errSink(`forja: permission engine refused to start — ${reason}\n`);
+      if (!permissionChain.ok) {
+        errSink(`  chain broken at seq ${permissionChain.brokenAt} (${permissionChain.reason})\n`);
+        errSink('  to continue under the known break, re-run with --accept-broken-chain\n');
+        errSink(
+          '  (the override is itself audited — a `chain-break-accepted` row lands before any new decisions)\n',
+        );
+      }
+      db.close();
+      return 2;
+    }
 
     // Surface cross-scope subagent shadows. A user's
     // ~/.config/agent/agents/<name>.md silently being eclipsed by

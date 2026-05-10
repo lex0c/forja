@@ -11,6 +11,12 @@ import {
   firstMatchingPath,
 } from './matcher.ts';
 import { type ProtectedTier, classifyProtectedPath } from './protected_paths.ts';
+import {
+  type EngineState,
+  type StateController,
+  createStateController,
+  isRejectingState,
+} from './state-machine.ts';
 import type {
   BashPolicy,
   Decision,
@@ -50,12 +56,44 @@ export interface EngineOptions {
   // for tests; production bootstrap passes the active session id
   // from the harness loop.
   sessionId?: string;
+  // Initial state (PERMISSION_ENGINE.md §2). Default `ready` for
+  // backward-compatible test ergonomics — every existing test that
+  // builds an engine directly keeps working. Production bootstrap
+  // injects a `stateController` instead and walks the machine
+  // explicitly through init → loading-policy → validating-chain.
+  initialState?: EngineState;
+  // External state controller. When supplied, the engine reads
+  // state from this controller instead of owning its own — letting
+  // `bootstrapPermissionEngine` walk transitions before the engine
+  // is even constructed. Mutually exclusive with `initialState`;
+  // when both are present, the controller wins.
+  stateController?: StateController;
 }
 
 export interface PermissionEngine {
   check(toolName: string, category: PolicyCategory, args: ToolArgs): Decision;
   view(): PermissionsView;
   mode(): PolicyMode;
+  // Current state per PERMISSION_ENGINE.md §2. Bootstrap walks the
+  // engine through `init → loading-policy → validating-chain → ready`
+  // before exposing it to the harness; runtime can transition between
+  // `ready` and `degraded` based on subsystem health, or fall to
+  // `refusing` on a fatal event (chain break, policy reload failure
+  // in strict mode).
+  state(): EngineState;
+  // Transition the engine to a degraded state — happens when an
+  // auxiliary subsystem (classifier, sandbox, sealing target) goes
+  // offline mid-session. `check()` keeps running but every `allow`
+  // is upgraded to `confirm`. `reason` lands in the transition event
+  // and (future slice) flows into the audit row's reason_chain.
+  degrade(reason: string): void;
+  // Recover from `degraded` back to `ready`. Inverse of `degrade`.
+  // Used when the failing subsystem comes back up.
+  restore(reason: string): void;
+  // Fatal transition. After `refuse`, every `check` returns deny
+  // until the operator builds a new engine (typically via a fresh
+  // bootstrap with `--accept-broken-chain` or `--rotate-chain`).
+  refuse(reason: string): void;
   // Returns a deep copy of the resolved Policy this engine was
   // built from. Subagent runtime persists the copy on
   // `subagent_runs` so the subprocess child runs under the
@@ -543,6 +581,33 @@ const decisionToAuditEnum = (kind: Decision['kind']): 'allow' | 'deny' | 'confir
 //     to default-deny (`kind === 'deny'` AND no rule).
 //   - 'engine-default' — engine-internal allow path (bypass mode,
 //     misc category) with no rule consulted.
+// Upgrade an `allow` Decision into a `confirm` for the degraded path
+// (spec §2: "toda decisão `allow` automática vira `confirm`").
+// Preserves source attribution so the modal still shows the rule that
+// would have fired; the reason explicitly cites the degraded state
+// so operators see why a normally-silent allow surfaced as a prompt.
+// Non-allow decisions pass through unchanged — degraded never
+// downgrades a `deny` or `confirm`.
+const degradeAllowToConfirm = (decision: Decision): Decision => {
+  if (decision.kind !== 'allow') return decision;
+  return {
+    kind: 'confirm',
+    prompt: 'Engine is in degraded mode — confirm before continuing.',
+    reason: `degraded state forced confirm (was: ${decision.reason ?? 'allow'})`,
+    ...(decision.source !== undefined ? { source: decision.source } : {}),
+  };
+};
+
+// Optional reason-chain entry appended when the engine intercepts a
+// decision via state. Returns undefined for `ready` so the normal
+// chain stays one entry long. Audit row gains a second entry tagged
+// `engine-state` whenever degraded forced an upgrade or a non-ready
+// state forced a deny.
+const degradedStageEntry = (state: EngineState): ReasonChainEntry | undefined => {
+  if (state === 'ready') return undefined;
+  return { stage: 'engine-state', note: `state=${state}` };
+};
+
 const reasonChainFor = (decision: Decision): ReasonChainEntry[] => {
   let stage: string;
   if (decision.source?.section === 'protected') {
@@ -578,6 +643,14 @@ export const createPermissionEngine = (
   const provenance = options.provenance;
   const audit = options.audit ?? createNoopSink();
   const sessionId = options.sessionId ?? 'session-anon';
+  // State controller — caller-supplied (production: bootstrap walks
+  // init → loading-policy → validating-chain → ready) or built
+  // internally with `initialState` (default `ready` for backward
+  // test compat). The engine always reads from this controller on
+  // every `check` so external transitions (degrade / refuse fired
+  // by health-watcher slices) take effect immediately.
+  const stateController =
+    options.stateController ?? createStateController({ initial: options.initialState ?? 'ready' });
   // policy_hash is stamped on every audit row. Computed ONCE at
   // construction — the policy doesn't change for an engine
   // instance (hot reload is a separate slice that builds a new
@@ -594,30 +667,63 @@ export const createPermissionEngine = (
   // now operator restarts the session to revoke trust).
   const sessionAllow = new Map<keyof PolicyToolsSection, string[]>();
 
-  const emitAudit = (toolName: string, args: ToolArgs, decision: Decision): void => {
+  const emitAudit = (
+    toolName: string,
+    args: ToolArgs,
+    decision: Decision,
+    extraStage?: ReasonChainEntry,
+  ): void => {
+    const chain = reasonChainFor(decision);
+    if (extraStage !== undefined) chain.push(extraStage);
     const input: AuditEmitInput = {
       session_id: sessionId,
       tool_name: toolName,
       args,
       decision: decisionToAuditEnum(decision.kind),
       policy_hash: policyHash,
-      reason_chain: reasonChainFor(decision),
+      reason_chain: chain,
     };
     audit.emit(input);
   };
 
   const check = (toolName: string, category: PolicyCategory, args: ToolArgs): Decision => {
+    // State machine gate (PERMISSION_ENGINE.md §2 + §6 approval-gate).
+    // Runs BEFORE bypass and before any rule lookup: an engine in
+    // init / loading-policy / validating-chain hasn't proven it can
+    // safely decide anything; refusing is the fatal sink. In each
+    // of those states return deny with a state-specific reason so
+    // the operator (and audit log) sees exactly why. degraded falls
+    // through to the normal pipeline but with an allow → confirm
+    // upgrade after the decision is built.
+    const currentState = stateController.get();
+    if (isRejectingState(currentState)) {
+      const decision: Decision = {
+        kind: 'deny',
+        reason: `engine not ready (state=${currentState})`,
+        source: { layer: 'default', section: 'engine-state' },
+      };
+      emitAudit(toolName, args, decision);
+      return decision;
+    }
+
     if (mode === 'bypass') {
       // `bypass` is a defaults-level setting — source.layer points
       // at whichever YAML chose `mode='bypass'` so the operator
       // can find and undo it. No section/rule (mode-driven, not
       // rule-driven).
-      const decision: Decision = {
+      //
+      // degraded loses the bypass shortcut: spec §2 says "toda
+      // decisão `allow` automática vira `confirm`" without
+      // qualification. Defense in depth — operators wanted
+      // productivity with bypass, not an override of subsystem
+      // health signals.
+      const baseAllow: Decision = {
         kind: 'allow',
         reason: 'mode=bypass',
         source: { layer: provenance?.defaults ?? 'default' },
       };
-      emitAudit(toolName, args, decision);
+      const decision = currentState === 'degraded' ? degradeAllowToConfirm(baseAllow) : baseAllow;
+      emitAudit(toolName, args, decision, degradedStageEntry(currentState));
       return decision;
     }
 
@@ -700,7 +806,14 @@ export const createPermissionEngine = (
         };
         break;
     }
-    emitAudit(toolName, args, decision);
+    // Degraded upgrade applied AFTER the normal pipeline so the
+    // rule that would have fired keeps its attribution in
+    // `source` — the operator sees "rule X matched, but engine is
+    // degraded so I'm asking anyway" in the modal.
+    if (currentState === 'degraded') {
+      decision = degradeAllowToConfirm(decision);
+    }
+    emitAudit(toolName, args, decision, degradedStageEntry(currentState));
     return decision;
   };
 
@@ -734,6 +847,16 @@ export const createPermissionEngine = (
     check,
     view,
     mode: () => mode,
+    state: () => stateController.get(),
+    degrade: (reason) => {
+      stateController.transition('degraded', reason);
+    },
+    restore: (reason) => {
+      stateController.transition('ready', reason);
+    },
+    refuse: (reason) => {
+      stateController.transition('refusing', reason);
+    },
     // Deep clone via structuredClone — the resolved Policy is
     // pure data (parsed YAML), no functions or DOM references,
     // so structuredClone is both correct and ~µs for realistic
