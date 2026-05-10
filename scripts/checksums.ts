@@ -14,6 +14,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
+import { SBOM_FILENAME } from './sbom.ts';
 import { TARGETS, assetName } from './targets.ts';
 
 export const sha256File = (path: string): string => {
@@ -35,11 +36,23 @@ export const formatSums = (entries: readonly ChecksumEntry[]): string => {
   return `${body}\n`;
 };
 
-const SUMS_LINE = /^([0-9a-f]{64})\s{2}(.+)$/;
+// Strict GNU sha256sum format: 64 lowercase hex + EXACTLY two spaces
+// + filename whose first character is non-whitespace. Tabs, single
+// space, three+ spaces, and leading whitespace in the filename group
+// are all rejected so a malformed or hand-edited SUMS file fails
+// closed at parse time instead of silently passing a defense-in-depth
+// check downstream. `[ ]{2}` (over `  `) keeps the two-space
+// separator explicit for readers and Biome's lint.
+const SUMS_LINE = /^([0-9a-f]{64})[ ]{2}(\S.*)$/;
 
 export const parseSums = (text: string): ChecksumEntry[] => {
   const out: ChecksumEntry[] = [];
-  for (const raw of text.split('\n')) {
+  // Normalize CRLF to LF before splitting so a SUMS file produced on
+  // Windows (or downloaded through a CRLF-introducing proxy) parses
+  // identically. `trimEnd` further strips trailing whitespace
+  // a stray editor might have left on a line.
+  const normalized = text.replace(/\r\n/g, '\n');
+  for (const raw of normalized.split('\n')) {
     const line = raw.trimEnd();
     if (line === '') continue;
     const m = SUMS_LINE.exec(line);
@@ -51,19 +64,22 @@ export const parseSums = (text: string): ChecksumEntry[] => {
   return out;
 };
 
-// Files that should be checksummed if present in `dist/`. Kept as a
-// predicate so we don't have to re-list the SBOM filename in two
-// places (the SBOM generator decides its own name).
+// Files that should be checksummed if present in `dist/`. Allowlist
+// (not denylist) so build droppings don't sneak in. The SBOM and
+// per-target asset names are sourced from the modules that produce
+// them — renaming the SBOM file or adding a target updates this
+// predicate automatically. `.asc` / `.sig` are reserved for cosign
+// or PGP detached signatures (Slice deferred); they still hit the
+// `endsWith` excludes here so a future signature rolling out doesn't
+// accidentally land in SHA256SUMS.
 const isReleaseAsset = (name: string): boolean => {
   if (name === 'SHA256SUMS') return false;
-  if (name === 'SHA256SUMS.asc') return false;
+  if (name.endsWith('.asc') || name.endsWith('.sig')) return false;
   if (name.endsWith('.map')) return false; // sourcemaps shipped separately
-  // Match `agent-<id>` / `agent-<id>.exe`. Anything else (random
-  // build droppings) is excluded by default.
+  if (name === SBOM_FILENAME) return true;
   for (const t of TARGETS) {
     if (name === assetName(t)) return true;
   }
-  if (name === 'sbom.cdx.json') return true;
   return false;
 };
 

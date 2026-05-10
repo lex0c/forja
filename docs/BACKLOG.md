@@ -15,6 +15,72 @@ Format:
 
 ---
 
+## [2026-05-10] m4/distribution — code-review fixes (sourcemap collision, release.yml tag pinning, SBOM rewrite, install.sh hardening)
+
+**Done:** Closes the punch list from an independent code review of the previous two slices on `feat/m4-distribution`. Eight findings, three categories: must-fix correctness/security, should-fix follow-ups, test gaps. All resolved on the same branch.
+
+### Must-fix
+
+| File | Issue | Fix |
+|---|---|---|
+| `scripts/build-targets.ts` | Bun's `--compile --sourcemap=external` writes `<dist>/index.js.map` (entry-derived name), not `<outfile>.map`. Sequential builds for 5 targets all overwrote the same file — only the last target's sourcemap survived. The `rmSync(${out}.map)` cleanup at line 82 was dead code. | Added `sourcemapName(entry)` + `targetSourcemapName(target)` helpers. After each successful build, rename `index.js.map` → `agent-<id>.map`. Failed builds preserve the orphan map for forensics. Verified: `dist/` now carries 5 distinct `.map` files. |
+| `.github/workflows/release.yml` | `workflow_dispatch` with `inputs.tag` checked out the dispatched branch's HEAD (default `main`), not the supplied tag. Manual rerun while `main` had moved on would publish assets from `main` HEAD with a stale tag label. | Centralized `RELEASE_REF` env var (`inputs.tag || github.ref`). All three jobs (`build`, `reproducibility`, `publish`) now `actions/checkout@v4` with `ref: ${{ env.RELEASE_REF }}`. Added a `git rev-parse --verify "refs/tags/$TAG"` step in `build` to fail closed if `inputs.tag` doesn't resolve to a tag. `gh release create` now passes `--target "$TAG"` so the release is anchored to the tag commit, not the workflow's default branch. |
+| `scripts/checksums.ts` | `parseSums` regex `^([0-9a-f]{64})\s{2}(.+)$` accepted any whitespace pair (tab+tab, mixed) — defense-in-depth weakness. A maliciously crafted SUMS file with `\t\t` between hash and filename would round-trip through the parser. CRLF line endings also slipped through `\s{2}` rather than being normalized. | Tightened to `^([0-9a-f]{64})[ ]{2}(\S.*)$` — exactly two literal spaces, filename must start with non-whitespace. CRLF is now normalized at the top of `parseSums` (`text.replace(/\r\n/g, '\n')`). New tests cover all three: tab+tab rejected, single space rejected, three spaces rejected, CRLF normalized. |
+| `install.sh` | `--help` did `sed '2,30p' "$0"` — when the script is piped via `curl \| sh`, `$0` is the shell name, not the script, and help printed garbage. Older `wget` builds write a 0-byte file and exit 0 on partial failures, defeating the SHA verify check downstream. `--repo` accepted any value, producing a confusing 404 instead of an immediate error. | Help text baked in via `print_help()` heredoc — works under filesystem-resident AND curl-pipe paths. `[ -s "$tmp/$asset" ]` and `[ -s "$tmp/SHA256SUMS" ]` checks after each fetch; empty download fails closed. `--repo` validated against `*/*` shape at parse time, exits 2 with a specific error. |
+
+### Should-fix
+
+| File | Issue | Fix |
+|---|---|---|
+| `scripts/repro-check.ts` | After a successful run, `dist/repro/<id>-{a,b}/` left ~1 GiB of duplicate binaries on disk. | Added `rmSync(reproDir, { recursive: true })` on the happy path. Failure path retains the trees + `.diff` markers for forensics, as before. |
+| `scripts/checksums.ts` + `scripts/sbom.ts` | SBOM filename hardcoded in two places. Renaming in one would silently drop the SBOM from `SHA256SUMS`. | Exported `SBOM_FILENAME` constant from `sbom.ts`; `checksums.ts` imports it. `isReleaseAsset` predicate restructured as an allowlist with the SBOM constant + per-target asset names; `.asc` / `.sig` excluded explicitly so a future cosign signature doesn't accidentally land in SHA256SUMS. |
+| `docs/spec/PERFORMANCE.md §18.5` | Spec referenced `.github/workflows/build.yaml`; branch ships `release.yml`. Filename divergence between spec and code. | Updated §18.5 to point at `release.yml`, document trigger semantics (push tag + workflow_dispatch), and call out cosign as deferred. |
+
+### SBOM tooling rewrite (caught while validating the pipeline)
+
+| Issue | Fix |
+|---|---|
+| `bunx @cyclonedx/cyclonedx-npm@2.0.1` failed at runtime: 2.0.1 doesn't exist on npm; the latest 4.2.1 detects Bun's `bun --version` as "npm 1.3.13" and refuses to run because it requires `npm >= 9.0.0` (it shells out to `npm ls`). `@cyclonedx/cdxgen` works but pulls 700+ deps and runs under Node — installing Node just to emit one JSON file is disproportionate. | Replaced with a hand-rolled generator that walks `bun.lock` directly. Strips JSONC trailing commas, parses, walks the production closure from `workspaces[''].dependencies`, emits CycloneDX 1.5 JSON sorted by PURL with sha512 hashes (decoded from `bun.lock`'s base64 integrity field) attached per component. Two runs over the same lockfile produce byte-identical JSON (deterministic). 54 components for the current Forja graph. Test suite covers PURL encoding for scoped names, prod/devDep separation, transitive walk, deterministic output, malformed-input guards. |
+
+### Tests added / changed
+
+| File | Coverage |
+|---|---|
+| `tests/scripts/build-targets.test.ts` | Sourcemap rename happy path, no-rename when `--no-sourcemap`, no-rename on failed build, helpers `sourcemapName` + `targetSourcemapName`. Replaced legacy `require('node:fs')` smoke with `existsSync` import. |
+| `tests/scripts/checksums.test.ts` | CRLF normalization, whitespace strictness (tab+tab / single space / three spaces all rejected). |
+| `tests/scripts/check-size.test.ts` | Partial-set test: 2 of 5 targets present + `allowMissing: false` → exit 1 with both missing paths reported, qualified to the dist dir. |
+| `tests/scripts/sbom.test.ts` | Rewritten end-to-end: `parseSpec` (plain + scoped + malformed), `parseBunLock` (trailing commas + garbage), `lockfileToComponents` (sort stability + sha512 hex encoding + scope %40 encoding), `buildBom` (devDep filter + transitive walk + spec shape + determinism), `generateSbom` + `summarize` (round-trip + non-CycloneDX rejection). |
+
+### Out of scope (still deferred)
+
+- **`bunx` cyclonedx integrity hash** — moot now: SBOM is hand-rolled, no external tool fetch. Closed.
+- **Cosign keyless signing** — `release.yml` carries `id-token: write` reservation; signing step lands when keys / OIDC policy are decided.
+- **`agent --version --verify`** — needs the cosign signature first.
+- **Homebrew tap** — separate repo + formula bump-PR step.
+- **Linux musl** — explicit pull-in signal in `PERFORMANCE.md §18.2.2`.
+
+**Verification:**
+
+- `bun run typecheck` — pass
+- `bun run lint` — pass (2 pre-existing warnings in `tests/harness/abortable.test.ts`, untouched)
+- `bun test` — 4618 pass / 10 skip / 0 fail (60 of those are the new `tests/scripts/` cases, +18 vs prior slice)
+- `bun run build:release` — 5 targets produced, each with its own `.map`
+- `bun run build:size` — all 5 OK under budget
+- `bun run build:sbom` — `CycloneDX 1.5 — 54 component(s) at dist/sbom.cdx.json`
+- `bun run build:checksums` + `bun run build:verify` — round-trip OK including SBOM
+- `sh -n install.sh` — syntax OK; `--help` works; `--repo bad-format` rejects with exit 2
+
+**Decisions:**
+
+- **Hand-rolled SBOM over installing Node + cdxgen.** The Bun-only stack is intentional (CLAUDE.md §3); making the release pipeline depend on Node+npm just for SBOM generation contradicts that. `bun.lock` is small, stable, and easy to walk; the resulting generator is ~150 LOC + tests, dependency-free. Trade-off: the SBOM only covers the JS dependency closure — Bun's runtime + JSC are not enumerated. That's acceptable for a v1 SBOM (the runtime is a separate, well-known component); a future version could attach a runtime entry.
+- **Render `.asc` / `.sig` exclusion as a denylist suffix check, not a per-extension list.** Cosign + GPG could ship either; the suffix check covers both without enumerating each variant. Simpler than per-tool branching.
+- **`release.yml` `--target "$TAG"` on `gh release create`.** Anchors the release page to the tag's commit so re-running on the same tag (clobber path) doesn't accidentally retarget when `main` advances between attempts. Defense in depth alongside the checkout-by-ref.
+- **Repro check writes to `dist/repro/`, cleans on success.** Earlier draft kept everything for "forensics"; in practice the SHA + paths in `.diff` are the actionable artifact, the trees themselves are recoverable from the source. Cleaning up keeps `dist/` reasonable on a workstation that reruns the check.
+
+**Next:** PR review. The branch should be merge-ready: pipeline passes end-to-end, all reviewer findings resolved, spec aligned with code.
+
+---
+
 ## [2026-05-10] m4/distribution — spec amendment: real binary size targets (PERFORMANCE.md §18.2)
 
 **Done:** Resolved the spec/reality divergence flagged in the previous entry. Built all 5 release targets locally with `bun build --compile --minify --sourcemap=external` (Bun 1.3.13) and re-baselined `PERFORMANCE.md §18.2` against measured numbers.

@@ -109,10 +109,15 @@ const main = (): void => {
     const tag = r.reproducible ? 'OK   ' : 'FAIL ';
     process.stdout.write(`${tag} ${r.target.id.padEnd(14)} ${r.hashA.slice(0, 16)}…\n`);
   }
-  if (rows.some((r) => !r.reproducible)) {
+  const anyFailed = rows.some((r) => !r.reproducible);
+  if (anyFailed) {
     process.stderr.write('reproducibility check failed; see dist/repro/<id>.diff\n');
     process.exit(1);
   }
+  // Happy path: reclaim the ~1 GiB of duplicate binaries the double
+  // build left under dist/repro/. On failure we keep them so the
+  // operator can inspect the diff sentinel + the two trees.
+  if (existsSync(reproDir)) rmSync(reproDir, { recursive: true, force: true });
 };
 
 if (import.meta.main) main();

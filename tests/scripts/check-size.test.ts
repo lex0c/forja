@@ -124,6 +124,27 @@ describe('runCheck', () => {
     }
   });
 
+  test('partial set fails by default and reports each missing path', () => {
+    // Two of five targets present; the gate must surface both
+    // missing paths and exit 1, not silently report only the present
+    // pair as "OK".
+    const dir = setupDist([
+      { id: 'linux-x64', bytes: 10 * MIB },
+      { id: 'darwin-x64', bytes: 10 * MIB },
+    ]);
+    try {
+      const result = runCheck({ distDir: dir });
+      expect(result.exitCode).toBe(1);
+      expect(result.rows.length).toBe(2);
+      expect(result.missing.length).toBe(TARGETS.length - 2);
+      // Every missing path is qualified with the dist dir so the
+      // operator can see which build slot needs filling.
+      for (const m of result.missing) expect(m.startsWith(dir)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('missing assets are tolerated under allowMissing', () => {
     const dir = setupDist([{ id: 'linux-x64', bytes: 10 * MIB }]);
     try {

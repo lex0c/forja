@@ -1,8 +1,14 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildArgs, parseArgs, runBuild } from '../../scripts/build-targets.ts';
+import {
+  buildArgs,
+  parseArgs,
+  runBuild,
+  sourcemapName,
+  targetSourcemapName,
+} from '../../scripts/build-targets.ts';
 import { TARGETS } from '../../scripts/targets.ts';
 import { targetById } from './_helpers.ts';
 
@@ -113,22 +119,18 @@ describe('runBuild', () => {
     }
   });
 
-  test('removes pre-existing asset before spawning the build', () => {
+  test('removes pre-existing asset and per-target sourcemap before spawning the build', () => {
     const dir = mkdtempSync(join(tmpdir(), 'forja-build-'));
     try {
       const stale = join(dir, 'agent-linux-x64');
+      const staleMap = join(dir, 'agent-linux-x64.map');
       writeFileSync(stale, 'old');
-      let observedExisted = false;
+      writeFileSync(staleMap, 'old-map');
+      let assetExistedAtSpawn = true;
+      let mapExistedAtSpawn = true;
       const fakeSpawn = () => {
-        // Bun would normally produce the file; we just observe that
-        // the orchestrator wiped the stale copy before the spawn ran.
-        try {
-          // statSync would throw for a missing file
-          require('node:fs').statSync(stale);
-          observedExisted = true;
-        } catch {
-          observedExisted = false;
-        }
+        assetExistedAtSpawn = existsSync(stale);
+        mapExistedAtSpawn = existsSync(staleMap);
         writeFileSync(stale, 'new');
         return { status: 0 };
       };
@@ -140,9 +142,100 @@ describe('runBuild', () => {
         ids: ['linux-x64'],
         spawn: fakeSpawn,
       });
-      expect(observedExisted).toBe(false);
+      expect(assetExistedAtSpawn).toBe(false);
+      expect(mapExistedAtSpawn).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test('renames the entry-derived sourcemap to a per-target name after each build', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'forja-build-'));
+    try {
+      const fakeSpawn = () => {
+        // Emulate Bun's --compile --sourcemap=external: writes BOTH
+        // the binary and an `index.js.map` (entry-derived name) into
+        // the outdir. Without the rename, the next target's build
+        // would clobber this file.
+        writeFileSync(join(dir, 'agent-linux-x64'), 'binary-A');
+        writeFileSync(join(dir, 'index.js.map'), 'map-A');
+        return { status: 0 };
+      };
+      runBuild({
+        distDir: dir,
+        entry: 'src/cli/index.ts',
+        minify: true,
+        sourcemap: true,
+        ids: ['linux-x64'],
+        spawn: fakeSpawn,
+      });
+      // Original entry-derived name gone; per-target name present.
+      expect(existsSync(join(dir, 'index.js.map'))).toBe(false);
+      const renamed = join(dir, 'agent-linux-x64.map');
+      expect(existsSync(renamed)).toBe(true);
+      expect(statSync(renamed).size).toBeGreaterThan(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('skips the sourcemap rename when --no-sourcemap is set', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'forja-build-'));
+    try {
+      const fakeSpawn = () => {
+        writeFileSync(join(dir, 'agent-linux-x64'), 'binary');
+        // No sourcemap emitted under --no-sourcemap.
+        return { status: 0 };
+      };
+      runBuild({
+        distDir: dir,
+        entry: 'src/cli/index.ts',
+        minify: true,
+        sourcemap: false,
+        ids: ['linux-x64'],
+        spawn: fakeSpawn,
+      });
+      expect(existsSync(join(dir, 'agent-linux-x64.map'))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('does not rename when the build failed (status !== 0)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'forja-build-'));
+    try {
+      const fakeSpawn = () => {
+        // Simulate a build that wrote the sourcemap before erroring.
+        writeFileSync(join(dir, 'index.js.map'), 'partial');
+        return { status: 2 };
+      };
+      runBuild({
+        distDir: dir,
+        entry: 'src/cli/index.ts',
+        minify: true,
+        sourcemap: true,
+        ids: ['linux-x64'],
+        spawn: fakeSpawn,
+      });
+      // The orphan map stays where Bun left it; no per-target rename
+      // happens for a failed build (the failure path is what the
+      // operator inspects).
+      expect(existsSync(join(dir, 'index.js.map'))).toBe(true);
+      expect(existsSync(join(dir, 'agent-linux-x64.map'))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('sourcemap name helpers', () => {
+  test('sourcemapName follows Bun --compile convention', () => {
+    expect(sourcemapName('src/cli/index.ts')).toBe('index.js.map');
+    expect(sourcemapName('src/foo.ts')).toBe('foo.js.map');
+  });
+
+  test('targetSourcemapName uses the asset name + .map', () => {
+    expect(targetSourcemapName(targetById('linux-x64'))).toBe('agent-linux-x64.map');
+    expect(targetSourcemapName(targetById('windows-x64'))).toBe('agent-windows-x64.exe.map');
   });
 });

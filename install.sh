@@ -33,13 +33,36 @@ REPO="${FORJA_REPO:-lex0c/forja}"
 VERSION="${FORJA_VERSION:-}"
 PREFIX="${FORJA_PREFIX:-$HOME/.local/bin}"
 
+print_help() {
+  cat <<'USAGE'
+Forja installer — fetches a release binary from GitHub, verifies the
+SHA256 against the published SHA256SUMS, and installs into a directory
+on PATH.
+
+Usage:
+  install.sh [--version <tag>] [--prefix <dir>] [--repo <owner/repo>]
+  install.sh <tag>
+
+Defaults:
+  version  latest release tag (resolved via GitHub API)
+  prefix   $HOME/.local/bin
+  repo     lex0c/forja
+
+Environment overrides:
+  FORJA_VERSION, FORJA_PREFIX, FORJA_REPO
+USAGE
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) VERSION="$2"; shift 2 ;;
     --prefix)  PREFIX="$2";  shift 2 ;;
     --repo)    REPO="$2";    shift 2 ;;
     --help|-h)
-      sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+      # Bake the help text in. `sed -n '2,30p' $0` would work for a
+      # filesystem-resident copy but not for `curl | sh`, where $0 is
+      # the shell name and there's no script file to read.
+      print_help
       exit 0
       ;;
     -*) printf 'install.sh: unknown flag: %s\n' "$1" >&2; exit 2 ;;
@@ -49,6 +72,17 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+# Validate `--repo` shape early. Not a shell-injection vector (every
+# interpolation is quoted) but a non-conforming value just produces a
+# 404 deeper in the script; loud failure here is more actionable.
+case "$REPO" in
+  */*) ;;
+  *)
+    printf 'install.sh: --repo must be <owner>/<repo>, got: %s\n' "$REPO" >&2
+    exit 2
+    ;;
+esac
 
 # Detect tooling. We need EITHER curl or wget for HTTP, and either
 # sha256sum (Linux) or shasum (macOS) for verification.
@@ -137,8 +171,12 @@ trap 'rm -rf "$tmp"' EXIT INT TERM
 
 printf 'install.sh: downloading %s\n' "$asset_url" >&2
 fetch "$asset_url" "$tmp/$asset"
+# Some `wget` builds write a 0-byte file and exit 0 on partial
+# failures; `curl -fsSL` is stricter but we belt-and-suspenders.
+[ -s "$tmp/$asset" ] || { printf 'install.sh: empty download for %s\n' "$asset" >&2; exit 1; }
 printf 'install.sh: downloading SHA256SUMS\n' >&2
 fetch "$sums_url" "$tmp/SHA256SUMS"
+[ -s "$tmp/SHA256SUMS" ] || { printf 'install.sh: empty download for SHA256SUMS\n' >&2; exit 1; }
 
 # Pull the line matching our asset and compare hashes. Use awk to
 # extract the expected hash; never feed the raw SHA256SUMS to

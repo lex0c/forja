@@ -49,6 +49,26 @@ describe('formatSums / parseSums', () => {
     expect(parsed.length).toBe(1);
     expect(parsed[0]?.filename).toBe('agent-linux-x64');
   });
+
+  test('parseSums normalizes CRLF before splitting', () => {
+    const sum = `${'d'.repeat(64)}  agent-linux-x64`;
+    // SUMS file produced on Windows or downloaded through a
+    // CRLF-introducing proxy must parse identically to the LF form.
+    const parsed = parseSums(`${sum}\r\n`);
+    expect(parsed.length).toBe(1);
+    expect(parsed[0]?.filename).toBe('agent-linux-x64');
+  });
+
+  test('parseSums rejects whitespace other than two literal spaces', () => {
+    const hash = 'e'.repeat(64);
+    // Tab + tab between hash and filename: rejected (defense in depth
+    // against a malformed/hand-edited SUMS file).
+    expect(() => parseSums(`${hash}\t\tagent-linux-x64\n`)).toThrow();
+    // Single space: rejected (GNU sha256sum uses two).
+    expect(() => parseSums(`${hash} agent-linux-x64\n`)).toThrow();
+    // Three spaces: rejected.
+    expect(() => parseSums(`${hash}   agent-linux-x64\n`)).toThrow();
+  });
 });
 
 describe('generate / verify', () => {

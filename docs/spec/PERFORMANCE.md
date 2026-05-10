@@ -637,17 +637,20 @@ Não bundlados (disponíveis via PATH):
 ### 18.5 Cross-platform CI
 
 ```yaml
-# .github/workflows/build.yaml
-strategy:
-  matrix:
-    target: [linux-x64, linux-arm64, darwin-x64, darwin-arm64, windows-x64]
+# .github/workflows/release.yml — disparado em push de tag `v*`
+# (também aceita workflow_dispatch com `inputs.tag` para retry de release).
+# Bun --target produz qualquer plataforma a partir de qualquer host,
+# então o cross-build roda em UM runner ubuntu-latest, não em matrix
+# de runners por OS. Os 5 targets são produzidos sequencialmente e
+# publicados no mesmo GitHub Release.
+targets: [linux-x64, linux-arm64, darwin-x64, darwin-arm64, windows-x64]
 ```
 
 Cada release:
-- SBOM por target
-- SHA256 publicado
-- Cosign signature
-- Reproducible build (mesmo source = mesmo binary)
+- SBOM por target (CycloneDX 1.5 — 1 SBOM cobre todos os targets, deps idênticas)
+- SHA256 publicado em `SHA256SUMS` (formato GNU sha256sum)
+- Cosign signature *(deferred — `id-token: write` reservado no workflow)*
+- Reproducible build (mesmo source = mesmo binary; verificado com `SOURCE_DATE_EPOCH` fixo)
 
 ---
 

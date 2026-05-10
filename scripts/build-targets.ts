@@ -2,7 +2,13 @@
 //
 // For each target in `TARGETS`, runs `bun build --compile --minify
 // --sourcemap=external --target=<bun-target> --outfile=dist/agent-<id>`.
-// Sourcemaps land alongside the binary as `<asset>.map`.
+//
+// Sourcemap handling: under `--compile`, Bun emits the external
+// sourcemap as `<dist>/index.js.map` (filename derived from the entry,
+// not the outfile). Sequential builds for different targets would
+// overwrite the same file — only the last target's sourcemap would
+// survive. After each successful build we rename it to
+// `<dist>/<asset>.map` so each target keeps its own.
 //
 // CLI flags:
 //   --target=<id>       restrict to one target (repeatable)
@@ -21,9 +27,20 @@
 // retry tolerance — this orchestrator just builds.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, renameSync, rmSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { type BuildTarget, TARGETS, assetName, findTarget } from './targets.ts';
+
+// Bun --compile emits the external sourcemap as
+// `<entry-basename-without-ext>.js.map` next to the outfile, not as
+// `<outfile>.map`. Centralized so the orchestrator and any consumer
+// asking "where is target X's sourcemap?" agree.
+export const sourcemapName = (entry: string): string => {
+  const base = basename(entry).replace(/\.[^.]+$/, '');
+  return `${base}.js.map`;
+};
+
+export const targetSourcemapName = (target: BuildTarget): string => `${assetName(target)}.map`;
 
 export interface BuildOptions {
   distDir: string;
@@ -76,16 +93,27 @@ export const runBuild = (opts: BuildOptions): BuildResult[] => {
   for (const target of subset) {
     // Wipe the prior asset so a failed build doesn't leave a stale
     // binary that the next pipeline step (size gate, checksums)
-    // would treat as the current run's output.
+    // would treat as the current run's output. Same for the
+    // per-target sourcemap (the renamed copy from a previous run).
     const out = join(opts.distDir, assetName(target));
+    const targetMap = join(opts.distDir, targetSourcemapName(target));
     if (existsSync(out)) rmSync(out, { force: true });
-    if (existsSync(`${out}.map`)) rmSync(`${out}.map`, { force: true });
+    if (existsSync(targetMap)) rmSync(targetMap, { force: true });
 
     const args = buildArgs(target, opts);
     const { status } = spawn('bun', args);
     results.push({ target, status });
     if (status !== 0) {
       process.stderr.write(`build failed for ${target.id} (exit ${status})\n`);
+      continue;
+    }
+
+    // Rename the entry-derived sourcemap to a per-target name so the
+    // next target's build doesn't overwrite this one. Skip silently
+    // if --no-sourcemap was requested (the file simply isn't there).
+    if (opts.sourcemap) {
+      const emitted = join(opts.distDir, sourcemapName(opts.entry));
+      if (existsSync(emitted)) renameSync(emitted, targetMap);
     }
   }
   return results;
