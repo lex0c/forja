@@ -34,6 +34,7 @@ import { projectRecap } from '../recap/projection.ts';
 import { buildResumeContext, shouldSkipResumeContext } from '../recap/resume-context.ts';
 import {
   type CritiqueRunCode,
+  type SessionStatus,
   appendMessage,
   completeSession,
   createSession,
@@ -307,6 +308,17 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
   // the result reports just totalCostUsd.
   let priorCostUsd = 0;
   let priorUsageComplete = true;
+
+  // Captured at resume init BEFORE reopenSession flips the row to
+  // `running`. Used by the auto-rehydrate block (RECAP §3.2 +
+  // STATE_MACHINE §7.6) for the skip-on-terminal predicate AND for
+  // the `previousStatus` field in the emitted `[resume_context]`
+  // event. Reading status from a fresh `getSession` after
+  // `reopenSession` would always see `running` and (a) bypass the
+  // `done`/`exhausted`/`error` skip gate and (b) report the
+  // operator's prior status as `running` in the rehydrate event,
+  // which is wrong on both counts.
+  let preResumeStatus: SessionStatus | null = null;
 
   // Cost incurred by settled child handles inherited from prior
   // runs of the resumed session. Lives SEPARATELY from
@@ -753,6 +765,13 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
         }
         priorCostUsd = existing.totalCostUsd;
         priorUsageComplete = existing.usageComplete;
+        // Snapshot the pre-resume status BEFORE `reopenSession`
+        // flips the row to 'running'. The auto-rehydrate block
+        // far below depends on this — re-reading the row at that
+        // point would always see 'running', losing the
+        // `done`/`exhausted`/`error` skip semantics and reporting
+        // a wrong `previousStatus` in the rehydrate event.
+        preResumeStatus = existing.status;
         reopenSession(config.db, resumeId);
         sessionId = resumeId;
       } else if (preassignedId !== undefined) {
@@ -1379,31 +1398,39 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
       // an unrehydrated prompt — the operator gets a working
       // resume instead of a hard failure.
       let effectiveUserPrompt = config.userPrompt;
-      if (resumeId !== undefined && config.userPrompt.length > 0) {
+      if (
+        resumeId !== undefined &&
+        config.userPrompt.length > 0 &&
+        preResumeStatus !== null &&
+        !shouldSkipResumeContext(preResumeStatus)
+      ) {
+        // `preResumeStatus` was captured BEFORE `reopenSession`
+        // flipped the row to 'running'. Using it here preserves
+        // the §7.6 skip-on-terminal contract (don't rehydrate a
+        // `done`/`exhausted`/`error` session — those finished
+        // cleanly and resume is just continuation, not recovery)
+        // and reports the true prior status in the emitted event.
         try {
-          const resumedSession = getSession(config.db, resumeId);
-          if (resumedSession !== null && !shouldSkipResumeContext(resumedSession.status)) {
-            const intermediate = projectRecap(config.db, {
-              scope: { kind: 'session_specific', sessionId: resumeId },
-              now: Date.now(),
-            });
-            const block = buildResumeContext({
-              intermediate,
-              previousStatus: resumedSession.status,
-              resumedAt: Date.now(),
-            });
-            effectiveUserPrompt = `${block.text}\n\n${config.userPrompt}`;
-            safeEmit(config.onEvent, {
-              type: 'resume_rehydrated',
-              sessionId,
-              previousStatus: resumedSession.status,
-              decisionCount: block.decisionCount,
-              pinCount: block.pinCount,
-              todoCount: block.todoCount,
-              truncated: block.truncated,
-              degraded: block.degraded,
-            });
-          }
+          const intermediate = projectRecap(config.db, {
+            scope: { kind: 'session_specific', sessionId: resumeId },
+            now: Date.now(),
+          });
+          const block = buildResumeContext({
+            intermediate,
+            previousStatus: preResumeStatus,
+            resumedAt: Date.now(),
+          });
+          effectiveUserPrompt = `${block.text}\n\n${config.userPrompt}`;
+          safeEmit(config.onEvent, {
+            type: 'resume_rehydrated',
+            sessionId,
+            previousStatus: preResumeStatus,
+            decisionCount: block.decisionCount,
+            pinCount: block.pinCount,
+            todoCount: block.todoCount,
+            truncated: block.truncated,
+            degraded: block.degraded,
+          });
         } catch (e) {
           // Don't let rehydrate failure break resume. The plain
           // prompt still works; auto-rehydrate is defense-in-

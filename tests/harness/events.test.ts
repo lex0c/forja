@@ -145,6 +145,76 @@ describe('runAgent onEvent', () => {
     expect(terse.sessionId.length).toBeGreaterThan(0);
   });
 
+  test('rehydrate skips when prior session was done (uses pre-reopen status)', async () => {
+    // Regression: the rehydrate gate read `getSession(...).status`
+    // AFTER `reopenSession` flipped the row to 'running', so it
+    // never observed terminal statuses (`done` / `exhausted` /
+    // `error`) and rehydrated sessions that should have been
+    // skipped. Pin the contract: a `done` session resumed must
+    // NOT emit `resume_rehydrated`, since shouldSkipResumeContext
+    // returns true for that status.
+    const r1 = await runAgent({
+      provider: mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'first',
+    });
+    // First run completed normally — status should be 'done'.
+    const events: HarnessEvent[] = [];
+    await runAgent({
+      provider: mockProvider([{ text: 'follow-up', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'follow up',
+      resumeFromSessionId: r1.sessionId,
+      onEvent: (e) => events.push(e),
+    });
+    const rehydrateEvents = events.filter((e) => e.type === 'resume_rehydrated');
+    expect(rehydrateEvents).toHaveLength(0);
+    const failureEvents = events.filter((e) => e.type === 'resume_rehydrate_failed');
+    expect(failureEvents).toHaveLength(0);
+  });
+
+  test('rehydrate previousStatus reports the pre-reopen status, not running', async () => {
+    // Regression sibling: even when rehydrate runs (status was
+    // not in the skip list), the emitted `previousStatus` must
+    // be the value BEFORE `reopenSession` flipped the row to
+    // 'running'. Use 'interrupted' — not in the skip list, so
+    // rehydrate proceeds, and we can assert the status string.
+    const r1 = await runAgent({
+      provider: mockProvider([{ text: 'ok', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'first',
+    });
+    // Mutate the row directly to 'interrupted' (no harness path
+    // produces this status without a real abort signal). Manual
+    // UPDATE keeps the test fast and intent-clear.
+    db.query('UPDATE sessions SET status = ? WHERE id = ?').run('interrupted', r1.sessionId);
+
+    const events: HarnessEvent[] = [];
+    await runAgent({
+      provider: mockProvider([{ text: 'follow-up', stop_reason: 'end_turn' }]),
+      toolRegistry: createToolRegistry(),
+      permissionEngine: createPermissionEngine(policy(), { cwd: '/p' }),
+      db,
+      cwd: '/p',
+      userPrompt: 'follow up',
+      resumeFromSessionId: r1.sessionId,
+      onEvent: (e) => events.push(e),
+    });
+    const rehydrate = events.find((e) => e.type === 'resume_rehydrated');
+    expect(rehydrate).toBeDefined();
+    if (rehydrate?.type !== 'resume_rehydrated') throw new Error('expected resume_rehydrated');
+    expect(rehydrate.previousStatus).toBe('interrupted');
+  });
+
   test('skips recap_terse_ready when buildAutoTerse fails — session_finished still emits', async () => {
     // Auto-display surface MUST be best-effort: any failure
     // (DB lock, missing table, malformed projection) collapses

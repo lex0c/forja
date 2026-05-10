@@ -149,13 +149,17 @@ describe('--resume flow', () => {
     expect(msgsAfterSecond[0]?.content).toBe('first');
     expect(msgsAfterSecond[1]?.role).toBe('assistant');
     expect(msgsAfterSecond[2]?.role).toBe('user');
-    // Auto-rehydrate (M4.3 slice f) prepends a [resume_context]
-    // block to the operator's prompt; the content STARTS with
-    // the block and CONTAINS the literal "follow up" the
-    // operator typed. Pre-rehydrate this was a strict equality.
-    expect(typeof msgsAfterSecond[2]?.content === 'string').toBe(true);
-    expect(msgsAfterSecond[2]?.content as string).toContain('[resume_context]');
-    expect(msgsAfterSecond[2]?.content as string).toContain('follow up');
+    // Auto-rehydrate (RECAP §3.2 / STATE_MACHINE §7.6) skips
+    // injection when the resumed session was in a terminal
+    // state (`done` / `exhausted` / `error`) — those sessions
+    // finished cleanly, resume is continuation, not recovery,
+    // and a `[resume_context]` prefix on a clean continuation
+    // would just be noise. The first run here ended with
+    // `end_turn` so `status === 'done'` and the prompt for
+    // run #2 lands literal. Non-terminal statuses (`running`,
+    // `interrupted`) DO get the block — covered by harness-
+    // level tests in `tests/harness/events.test.ts`.
+    expect(msgsAfterSecond[2]?.content).toBe('follow up');
     expect(msgsAfterSecond[3]?.role).toBe('assistant');
     db.close();
   });
