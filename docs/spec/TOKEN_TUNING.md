@@ -436,6 +436,8 @@ Tabela canônica de tuning per workflow. Aplicada em playbook frontmatter.
 | `recap` (LLM render) | 0.2 | 0.95 | 4096 | off | yes |
 | Modo normal (sem playbook) | 0.2 | 0.95 | 4096 | conservative | no |
 
+**Nota — modelos que deprecaram `temperature`/`top_p`:** alguns frontier models (ex.: Anthropic Opus 4.7) rejeitam a passagem de `temperature` ou `top_p` no Messages API com HTTP 400. O adapter respeita uma flag opcional `capabilities.supports_sampling` (default `true`); quando declarada `false`, ambos os parâmetros são strippados antes do request. A tabela canonical acima continua valendo para todos os modelos restantes — o opt-out é por-modelo e observável via `ProviderCapabilities`, não uma exceção workflow-level. Determinismo nos modelos que opt-out fica reduzido (provider default), mas o cache de output (RECAP §8.3 / outros workflows com cache content-hashed) absorve a deriva entre runs idênticos.
+
 ### 9.1 Justificativas
 
 - **`code-review` temp 0.1**: factual; queremos consistência; mesma lógica em re-runs

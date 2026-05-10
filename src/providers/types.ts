@@ -35,6 +35,17 @@ export interface ProviderCapabilities {
   cost_per_1k_cached_input?: number;
   cost_per_1k_cache_write?: number;
 
+  // Whether the model accepts the `temperature` / `top_p` sampling
+  // parameters at the API boundary. Vendors deprecate these on
+  // newer frontier models (e.g. Anthropic's Opus 4.7 returns HTTP
+  // 400 "temperature is deprecated for this model") — without this
+  // gate every workflow that follows TOKEN_TUNING §9 (recap LLM
+  // render and others) would 400 on those models. Adapters strip
+  // both parameters before sending when this is `false`. Default
+  // (omitted = `true`) keeps backward compat for every existing
+  // model that still accepts the field.
+  supports_sampling?: boolean;
+
   // Operational
   max_rps?: number;
   notes: string[];

@@ -339,6 +339,62 @@ describe('createAnthropicProvider', () => {
     expect(tailBlocks[0]?.cache_control).toEqual({ type: 'ephemeral' });
   });
 
+  test('generate strips temperature/top_p when supports_sampling=false (Opus 4.7)', async () => {
+    // Regression: Opus 4.7 deprecated `temperature` (and `top_p`)
+    // at the Messages API — passing either returns HTTP 400
+    // ("`temperature` is deprecated for this model."). Without
+    // the per-model gate every workflow that follows TOKEN_TUNING
+    // §9 (recap LLM render and others) would 400 on this model.
+    // Cap is `supports_sampling: false` for Opus 4.7; adapter
+    // strips both params before send. Sampling-accepting models
+    // (sonnet/haiku) keep forwarding them — covered above.
+    const handle = mockClient([{ type: 'message_stop' }]);
+    const provider = createAnthropicProvider('claude-opus-4-7', { client: handle.client });
+    for await (const _ of provider.generate({
+      model: 'claude-opus-4-7',
+      messages: [{ role: 'user', content: 'do thing' }],
+      max_tokens: 16,
+      temperature: 0.2,
+      top_p: 0.95,
+    })) {
+      // drain
+    }
+    const params = handle.streamCalls[0]?.params as Record<string, unknown>;
+    expect(params).toBeDefined();
+    expect('temperature' in params).toBe(false);
+    expect('top_p' in params).toBe(false);
+  });
+
+  test('generateConstrained strips temperature/top_p when supports_sampling=false (Opus 4.7)', async () => {
+    // Same gate on the constrained path — recap's LLM render
+    // would 400 against Opus 4.7 without it.
+    const handle = mockClient([], undefined, {
+      content: [
+        {
+          type: 'tool_use',
+          id: 'toolu_01',
+          name: 'render_recap_pr',
+          input: { schemaVersion: 'pr-v1', summary: ['x'], changes: [] },
+        },
+      ],
+      usage: { input_tokens: 10, output_tokens: 5 },
+    });
+    const provider = createAnthropicProvider('claude-opus-4-7', { client: handle.client });
+    await provider.generateConstrained({
+      model: 'claude-opus-4-7',
+      messages: [{ role: 'user', content: 'render' }],
+      max_tokens: 64,
+      temperature: 0.2,
+      top_p: 0.95,
+      output_schema: { type: 'object' },
+      output_schema_name: 'render_recap_pr',
+    });
+    const sent = handle.createCalls[0]?.params as Record<string, unknown>;
+    expect(sent).toBeDefined();
+    expect('temperature' in sent).toBe(false);
+    expect('top_p' in sent).toBe(false);
+  });
+
   test('generate omits optional fields that were not provided', async () => {
     const handle = mockClient([{ type: 'message_stop' }]);
     const provider = createAnthropicProvider('claude-sonnet-4-6', { client: handle.client });

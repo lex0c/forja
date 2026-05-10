@@ -133,14 +133,21 @@ export const createAnthropicProvider = (
         `anthropic request: 'thinking_budget' (${req.thinking_budget}) must be strictly less than 'max_tokens' (${req.max_tokens}) — Anthropic API rejects equal or greater with HTTP 400. The runtime resolved max_tokens against the provider capability ceiling (capabilities.output_max_tokens=${caps.output_max_tokens}); raise the playbook's 'sampling.max_tokens' or lower 'sampling.thinking_budget'.`,
       );
     }
+    // Some frontier models (e.g. Opus 4.7) deprecated `temperature`
+    // and `top_p` at the API; sending either returns HTTP 400.
+    // The capability flag opts those models out — adapter strips
+    // both before send. Default (cap omitted ⇒ `true`) keeps every
+    // other Claude model accepting the canonical TOKEN_TUNING §9
+    // values unchanged.
+    const acceptsSampling = caps.supports_sampling !== false;
     const stream = client.messages.stream({
       model: modelName,
       max_tokens: req.max_tokens,
       messages: cachedMessages,
       ...(cachedSystem !== undefined ? { system: cachedSystem } : {}),
       ...(cachedTools !== undefined ? { tools: cachedTools } : {}),
-      ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
-      ...(req.top_p !== undefined ? { top_p: req.top_p } : {}),
+      ...(acceptsSampling && req.temperature !== undefined ? { temperature: req.temperature } : {}),
+      ...(acceptsSampling && req.top_p !== undefined ? { top_p: req.top_p } : {}),
       // Extended thinking (`PLAYBOOKS.md` §1.1
       // `sampling.thinking_budget`). Anthropic's surface is
       // `thinking: { type:'enabled', budget_tokens }`; budget=0
@@ -222,8 +229,14 @@ export const createAnthropicProvider = (
         tools: cachedTools,
         tool_choice: { type: 'tool', name: req.output_schema_name },
         ...(cachedSystem !== undefined ? { system: cachedSystem } : {}),
-        ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
-        ...(req.top_p !== undefined ? { top_p: req.top_p } : {}),
+        // Same sampling-deprecation gate as the streaming path —
+        // see comment there for rationale.
+        ...(caps.supports_sampling !== false && req.temperature !== undefined
+          ? { temperature: req.temperature }
+          : {}),
+        ...(caps.supports_sampling !== false && req.top_p !== undefined
+          ? { top_p: req.top_p }
+          : {}),
         ...(req.stop_sequences !== undefined ? { stop_sequences: req.stop_sequences } : {}),
       });
       // Find the forced tool_use block. With `tool_choice` set to a
