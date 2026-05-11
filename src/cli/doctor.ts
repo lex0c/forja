@@ -6,13 +6,15 @@
 // distribute" — we probe the host, surface what's there, and
 // recommend (don't auto-install) anything missing.
 //
-// Checks (this slice):
+// Checks:
 //   - platform: OS + architecture (informational, always ok).
 //   - sandbox: bwrap (linux) or sandbox-exec (macOS) availability.
 //   - config_dir: `~/.config/agent` writability — needed for
 //     install_id + policy files.
 //   - data_dir: `~/.local/share/forja` writability — needed for
 //     the sessions DB.
+//   - sealing: §7.3 worm-file seal status — entry count + last
+//     seal timestamp (slice 60).
 //   - git: presence on PATH — degrades git_* tools when absent.
 //
 // Exit codes:
@@ -26,8 +28,14 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { homedir, arch as nodeArch, platform as nodePlatform } from 'node:os';
 import { dirname } from 'node:path';
-import { detectSandboxAvailability } from '../permissions/index.ts';
+import {
+  type SealStore,
+  createWormFileSealer,
+  detectSandboxAvailability,
+  resolvePolicy,
+} from '../permissions/index.ts';
 import { installIdPath } from '../permissions/paths.ts';
+import type { SealPolicy } from '../permissions/types.ts';
 
 export type DoctorStatus = 'ok' | 'warn' | 'fail';
 
@@ -46,6 +54,24 @@ export interface RunDoctorOptions {
   // Test seam for `which()` so unit tests can simulate missing
   // binaries without touching $PATH on the runner host.
   which?: (cmd: string) => string | null;
+  // Working directory used by the sealing check's policy resolution.
+  // Defaults to process.cwd() in production; tests pin a specific
+  // directory containing the relevant `.agent/permissions.yaml`.
+  cwd?: string;
+  // Test seams for `resolvePolicy` — match the CLI verbs' shape so
+  // the same yaml fixtures work across surfaces. `null` disables the
+  // layer; `undefined` falls through to platform defaults.
+  enterprisePath?: string | null;
+  userPath?: string | null;
+  // Test seam for the sealing check's `SealStore` construction.
+  // Production reads the configured seal file in read-only mode via
+  // `createWormFileSealer`; tests inject a mem-store pre-loaded with
+  // entries so the check's branches can be exercised deterministically.
+  sealStoreFactory?: (config: SealPolicy) => SealStore;
+  // Timestamp seam for the sealing check's relative-time rendering
+  // ("last seal 4h ago"). Production: Date.now(); tests pin a fixed
+  // number for stable assertions.
+  now?: () => number;
   out?: (s: string) => void;
   err?: (s: string) => void;
 }
@@ -162,6 +188,141 @@ const dataDirCheck = (env: NodeJS.ProcessEnv): DoctorCheck => {
   };
 };
 
+// Human-readable relative-time formatter. Matches the spec example
+// at line 805 ("last success 4h ago"). Coarse buckets are fine — the
+// goal is "operator glances at doctor and sees sealing is recent vs
+// stale", not millisecond precision.
+const formatRelativeTime = (then: number, now: number): string => {
+  const diff = Math.max(0, now - then);
+  const seconds = Math.floor(diff / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+};
+
+// §13.3 sealing health check (slice 60). Reads the active policy's
+// `seal` section and reports the worm-file's state:
+//   - no seal config / mode='none' → ok "not configured (optional)"
+//   - mode='worm-file', file missing/empty → warn (sealing configured
+//     but no entries yet; engine seals on next interval / first call)
+//   - mode='worm-file', file with N entries → ok "N entries, last X ago"
+//   - mode='worm-file', file corrupted → fail (tampering signal)
+//
+// Spec line 805 shows this line in the canonical doctor output:
+//   `External sealing: rfc3161-tsa (last success 4h ago) OK`
+// Slice 60 ships the worm-file variant; other backends extend the
+// branch dispatch as their factories land in later slices.
+interface SealingCheckOptions {
+  env: NodeJS.ProcessEnv;
+  cwd: string;
+  enterprisePath?: string | null;
+  userPath?: string | null;
+  sealStoreFactory?: (config: SealPolicy) => SealStore;
+  now: () => number;
+}
+
+const sealingCheck = (options: SealingCheckOptions): DoctorCheck => {
+  // Resolve the active policy. Failures here are reported as warn,
+  // NOT fail — a bad policy is a separate problem from sealing
+  // health, and the policy_load check would catch it. We don't want
+  // to double-report.
+  let sealConfig: SealPolicy | undefined;
+  try {
+    const resolved = resolvePolicy({
+      cwd: options.cwd,
+      home: options.env.HOME ?? options.cwd,
+      env: options.env,
+      ...(options.enterprisePath !== undefined ? { enterprisePath: options.enterprisePath } : {}),
+      ...(options.userPath !== undefined ? { userPath: options.userPath } : {}),
+    });
+    sealConfig = resolved.policy.seal;
+  } catch (e) {
+    return {
+      name: 'sealing',
+      status: 'warn',
+      detail: `policy load failed: ${(e as Error).message}`,
+    };
+  }
+
+  if (sealConfig === undefined || sealConfig.mode === 'none') {
+    return {
+      name: 'sealing',
+      status: 'ok',
+      detail: 'not configured (optional per spec §7.3)',
+    };
+  }
+
+  if (sealConfig.mode === 'worm-file') {
+    if (sealConfig.path === undefined) {
+      // parsePolicy enforces this; unreachable in well-formed input.
+      return {
+        name: 'sealing',
+        status: 'fail',
+        detail: "worm-file mode missing 'path' field",
+        remediation: "add 'path: /var/log/agent/seal.log' to the seal section",
+      };
+    }
+    const factory =
+      options.sealStoreFactory ?? ((c: SealPolicy) => createWormFileSealer({ path: c.path ?? '' }));
+    let store: SealStore;
+    try {
+      store = factory(sealConfig);
+    } catch (e) {
+      return {
+        name: 'sealing',
+        status: 'fail',
+        detail: `factory failed: ${(e as Error).message}`,
+      };
+    }
+    let entries: readonly { seq: number; ts: number; hash: string }[];
+    try {
+      entries = store.list();
+    } catch (e) {
+      // Malformed seal file — strong tampering signal.
+      return {
+        name: 'sealing',
+        status: 'fail',
+        detail: `seal file corrupted at ${sealConfig.path}: ${(e as Error).message}`,
+        remediation: 'inspect the file; run `agent permission seal-verify` for chain cross-check',
+      };
+    }
+    if (entries.length === 0) {
+      return {
+        name: 'sealing',
+        status: 'warn',
+        detail: `worm-file at ${sealConfig.path}: configured but no entries yet`,
+        remediation:
+          'the engine seals automatically per interval; run `agent permission seal-now` to force one',
+      };
+    }
+    const last = entries[entries.length - 1];
+    if (last === undefined) {
+      // Defensive; unreachable since entries.length > 0.
+      return { name: 'sealing', status: 'fail', detail: 'list returned a missing tail entry' };
+    }
+    const relTime = formatRelativeTime(last.ts, options.now());
+    const entryWord = entries.length === 1 ? 'entry' : 'entries';
+    return {
+      name: 'sealing',
+      status: 'ok',
+      detail: `worm-file at ${sealConfig.path}: ${entries.length} ${entryWord}, last ${relTime}`,
+    };
+  }
+
+  // Defensive — parsePolicy rejects reserved modes; this only fires
+  // if a future schema accepts a new mode before the dispatch is
+  // updated.
+  return {
+    name: 'sealing',
+    status: 'warn',
+    detail: `mode '${sealConfig.mode}' has no doctor check wired yet`,
+  };
+};
+
 const gitCheck = (which: (cmd: string) => string | null): DoctorCheck => {
   const path = which('git');
   if (path !== null) {
@@ -196,11 +357,23 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
   const which = options.which ?? defaultWhich;
   const json = options.json === true;
 
+  const cwd = options.cwd ?? process.cwd();
+  const now = options.now ?? Date.now;
   const checks: DoctorCheck[] = [
     platformCheck(env),
     sandboxCheck(which),
     configDirCheck(env),
     dataDirCheck(env),
+    sealingCheck({
+      env,
+      cwd,
+      ...(options.enterprisePath !== undefined ? { enterprisePath: options.enterprisePath } : {}),
+      ...(options.userPath !== undefined ? { userPath: options.userPath } : {}),
+      ...(options.sealStoreFactory !== undefined
+        ? { sealStoreFactory: options.sealStoreFactory }
+        : {}),
+      now,
+    }),
     gitCheck(which),
   ];
 

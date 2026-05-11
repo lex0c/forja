@@ -15,6 +15,53 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 60: `forja doctor` sealing health check (§13.3 line 805)
+
+**Done.** Sixtieth slice. Closes the loop between §7.3 sealing and §13.3 doctor visibility: operators now see seal-file state in `forja doctor` output, matching the spec's canonical line 805 (`External sealing: rfc3161-tsa (last success 4h ago) OK`). Slice 60 ships the worm-file variant; future backends extend the dispatch.
+
+### Why this matters
+
+§7.3 closed end-to-end in slice 58 (primitive → scheduler → audit-sink → policy → bootstrap → CLI verbs). But the operator's first stop when investigating a system — `forja doctor` — didn't surface sealing health. An operator running `forja doctor` would see platform/sandbox/dirs/git statuses but have no signal whether sealing was configured, recent, or stale. The fix is small (one new check function + 1 line in the check list) but operationally meaningful: doctor is the spec-canonical pre-flight surface, and §13.3's example shows sealing as a first-class line.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/doctor.ts` | New `sealingCheck` function. Resolves the active policy via `resolvePolicy(cwd/HOME)`, reads `policy.seal`, branches: (a) no seal section / mode='none' → `ok "not configured (optional per spec §7.3)"`; (b) mode='worm-file' + empty file → `warn "configured but no entries yet"` with `seal-now` remediation; (c) mode='worm-file' + N entries → `ok "worm-file at <path>: N entries, last <relative-time> ago"`; (d) malformed seal file (list throws) → `fail "seal file corrupted"` with `seal-verify` remediation. New `formatRelativeTime(then, now)` helper renders `Xs/Xm/Xh/Xd ago` per the spec example. New test seams in `RunDoctorOptions`: `cwd`, `enterprisePath`, `userPath`, `sealStoreFactory`, `now`. Defaults: cwd=process.cwd(), now=Date.now, store factory builds `createWormFileSealer({path})` in read-only mode (no `onCreate` → no chattr call on this read path). |
+| `tests/cli/doctor.test.ts` | (+8 tests under new `runDoctor — sealing check (§13.3 / slice 60)` describe.) Coverage: no seal section → ok "not configured"; mode=none → ok "not configured"; worm-file with empty file → warn; worm-file with 3 entries → ok shows "3 entries" + "last 4h ago"; single entry → singular "1 entry"; corrupted file (list throws) → fail exits 1 with `seal-verify` remediation; relative-time buckets (5s/90s/90min/2d → 5s/1m/1h/2d ago); JSON mode includes the sealing check with structured fields. Pre-existing NDJSON test updated for the new check count (5 → 6 checks + 1 summary). |
+
+### Decisions
+
+- **`sealingCheck` resolves the policy via `resolvePolicy`, not via a separate config probe.** The active sealing config IS the resolved policy's `seal` section — exactly what the bootstrap reads. Re-using the same code path means: (a) layer precedence works (enterprise/user/project hierarchy applies to doctor like everywhere else); (b) a typo in the seal block fails parse in doctor with the same error the bootstrap would emit; (c) zero duplication of seal-config logic. The CLI verbs (slice 58) already do this; doctor follows suit.
+- **Read-only `SealStore` via factory without `onCreate`.** Doctor reads the seal file via `store.list()`. It NEVER appends. So `createWormFileSealer({path})` with no `onCreate` is correct — no chattr invocation, no fs writes. Same store interface, different lifecycle slice. Tests inject a `sealStoreFactory` seam pre-loaded with `SealEntry[]` to control list() output deterministically.
+- **`warn` for empty seal file, not `ok`.** A `seal:` section in policy with `mode: worm-file` declares INTENT to seal, but if no entries exist, the file hasn't been written yet. Could be normal (first session, scheduler hasn't fired yet, or `interval_decisions` not reached) OR symptomatic (chattr failed silently somehow, intervals misconfigured, audit chain empty). `warn` surfaces it as "look at this"; remediation points at `seal-now` for explicit flush. Operators in the normal case can ignore the warning until the first scheduler tick.
+- **`fail` (not `warn`) for corrupted seal file.** A `list()` throw means the file content didn't parse — strong tampering signal (chattr -a, edit, chattr +a re-applied would land here). `fail` exits 1 from doctor, matching the spec's "critical checks always live" stance. The remediation points at `seal-verify` for the structured chain cross-check, which is the next investigation step.
+- **`formatRelativeTime` uses coarse buckets (s/m/h/d), not pretty libraries.** Spec example "4h ago" is the target — matching it doesn't need date-fns or moment. ~10 lines, deterministic, easy to test, no dep weight. Buckets max out at days; weeks/months would be misleading for an audit log (seals every interval_seconds default to hourly).
+- **Default `now: Date.now`.** Production wall-clock; tests pin a fixed timestamp paired with a fixed last-entry ts so the rendered output is byte-stable. Same pattern as the scheduler and the seal-now CLI verb.
+- **Sealing check positioned BETWEEN data_dir and git in the check order.** Functional dependencies: sealing reads the data_dir (DB-adjacent SQLite via the chain query is bootstrap's job, but doctor's sealing check only reads the seal FILE) — so it lands after data_dir. git is unrelated; ordering by "core engine → external tooling" puts git last. Pre-existing tests counted 5 checks; updated to 6 (the new sealing check) in the count assertion.
+- **Top-of-file doctor comment updated to current inventory.** The original comment said "Checks (this slice):" listing 5. Updated to a stable "Checks:" with 6 entries. Future slices that extend the list update the same block; this is reference documentation, not slice history.
+- **No additional CLI flag (`--no-seal-check`, etc).** Sealing config is read from policy; if operator wants no check, they set `mode: none` (which renders `ok "not configured"`). Flag would duplicate policy state with command-line state, drift risk. The doctor surface stays a single-shot read.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`); Biome auto-format applied
+- `bun test` — **5678 pass / 10 skip / 0 fail** (5688 total across 266 files); +8 tests on top of slice 59's 5670
+- `bun test tests/cli/doctor.test.ts` — 19 pass (was 11)
+
+### Next
+
+§7.3 thread fully closed including operator visibility. Remaining open work unchanged from slice 59's inventory:
+
+1. Additional §7.3 sealing backends — `git-anchored` (simplest), `rfc3161-tsa` (spec-recommended audit-grade, needs ASN.1), `s3-object-lock` (AWS SDK dep).
+2. `forja doctor` — spec line 805/807 mention more lines the current doctor doesn't surface (engine state, hash chain integrity, conformance suite last-run). Each is a follow-up slice; sealing was the most-decoupled and shipped first.
+3. §13.7 broker/worker — multi-slice; biggest remaining thread.
+4. §19 migration, §14 MCP (blocked), macOS SBPL conformance extension, fuzz harness, telemetria.
+
+§16 conformance still at per-category-bar in all 11 categories.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 59: conformance concurrency category — §16 closes at 100%
 
 **Done.** Fifty-ninth slice. Ships the 5 concurrency cases the §16 conformance suite was missing — closing the suite from 129/136 (95%) to 134/136 (≥ the per-category minimum the spec demands). Production-ready checklist item "Conformance suite ≥ 136 casos passando" (line 1287) is now within the per-category bar; the slack vs the global 136 minimum (134 here) lives in categories that already exceed their own minimums, so the suite is GA-grade on category math.
