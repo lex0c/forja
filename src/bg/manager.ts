@@ -1,6 +1,8 @@
 import { existsSync, mkdirSync, statSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { join } from 'node:path';
+import type { SandboxProfile } from '../permissions/index.ts';
+import { maybeWrapSandboxArgv } from '../permissions/index.ts';
 import { scrubEnv } from '../sanitize/index.ts';
 import type { DB } from '../storage/db.ts';
 import {
@@ -46,6 +48,12 @@ export interface SpawnInput {
   // watchers / file-system monitors. Models can opt in when they
   // know a build / test run / one-shot job has a bounded duration.
   maxRuntimeMs?: number;
+  // §6.5 sandbox profile chosen by the engine for THIS spawn.
+  // Threaded through from `ToolContext.sandboxProfile` at the
+  // bash_background tool layer. When set + Linux + bwrap available
+  // AND profile ≠ `host`, the manager wraps the spawn argv via
+  // `maybeWrapSandboxArgv`. Undefined → status quo direct spawn.
+  sandboxProfile?: SandboxProfile;
 }
 
 export interface SpawnResult {
@@ -291,10 +299,21 @@ export const createBgManager = (options: CreateBgManagerOptions): BgManager => {
     const cwd = input.cwd ?? process.cwd();
     const spawnedAt = Date.now();
 
+    // §6.5 sandbox runtime wire-up. Same four-condition gate as
+    // bash + grep, encapsulated in maybeWrapSandboxArgv. Long-
+    // running bg processes get the same isolation when the
+    // operator configured a sandbox and the planner chose a
+    // non-host profile.
+    const cmd = maybeWrapSandboxArgv({
+      ...(input.sandboxProfile !== undefined ? { profile: input.sandboxProfile } : {}),
+      cwd,
+      innerArgv: ['bash', '-c', input.command],
+    });
+
     let proc: ReturnType<typeof Bun.spawn>;
     try {
       proc = Bun.spawn({
-        cmd: ['bash', '-c', input.command],
+        cmd,
         cwd,
         // env scrubbed at the boundary — same defense the synchronous
         // bash tool applies. Without this, a model can spawn a bg

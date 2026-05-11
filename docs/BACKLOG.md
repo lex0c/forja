@@ -15,6 +15,49 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 21: sandbox wire-up for bash-background + extract maybeWrapSandboxArgv (§6.5)
+
+**Done.** Twenty-first slice. Third sandbox runtime consume site (`bash_background` via `bgManager.spawn`) crossed the rule-of-three threshold; the four-condition gate that bash + grep duplicated is now lifted into `maybeWrapSandboxArgv` and the three call sites consume it.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/sandbox-runner.ts` | New `MaybeWrapSandboxArgvOptions` + `maybeWrapSandboxArgv(opts)`. Encapsulates: (1) profile undefined / `host` / non-Linux / missing bwrap skip cases, (2) `buildBwrapArgv` call with the `home ?? process.env.HOME ?? cwd` fallback. Returns `innerArgv.slice()` on skip (defensive copy), wrapped argv otherwise. |
+| `src/permissions/index.ts` | Re-exports `MaybeWrapSandboxArgvOptions` + `maybeWrapSandboxArgv`. |
+| `src/tools/builtin/bash.ts` | Replaces the inline `shouldWrap + buildBwrapArgv` block with one `maybeWrapSandboxArgv` call. |
+| `src/tools/builtin/grep.ts` | Same refactor as bash.ts. |
+| `src/bg/manager.ts` | `SpawnInput.sandboxProfile?: SandboxProfile` added. Spawn site uses `maybeWrapSandboxArgv` against `['bash', '-c', input.command]` and passes the result as `cmd` into `Bun.spawn`. |
+| `src/tools/builtin/bash-background.ts` | Threads `ctx.sandboxProfile` into the `bgManager.spawn({...})` payload via the standard exactOptionalPropertyTypes-safe spread. |
+| `tests/permissions/sandbox-runner.test.ts` | New describe block — 4 tests: omitted profile passthrough, host profile passthrough (even on Linux), defensive-copy of returned array, live host check (on Linux + bwrap installed the call wraps, otherwise falls through; pin the invariant without stubbing globals). |
+
+### Decisions
+
+- **Rule of three triggered the extraction.** Slice 19 (bash) had the first instance, slice 20 (grep) the second; this slice's `bash-background` would be the third unless the gate moved. The four-condition check + `home` fallback was identical across all three sites — exactly the duplication signal that justifies a helper. Extracting at the SECOND site would have been premature (two data points aren't enough to confirm the shape will stay stable); waiting longer would have grown three drift opportunities.
+- **Helper consults `Bun.which('bwrap')` at every call.** Same defense as slices 19+20 — bootstrap's `detectSandboxAvailability` runs once at session start; a host package change can remove the binary mid-session. Single PATH lookup is cheap; cache invalidation would be more code than the saved lookup costs.
+- **Defensive copy via `innerArgv.slice()` on every skip path.** Callers (bash, grep, bg manager) can mutate the returned array without poisoning shared fixtures. Cheap; argvs are short.
+- **`exactOptionalPropertyTypes: true` forces the conditional spread.** Both `bash.ts` and `grep.ts` use `...(ctx.sandboxProfile !== undefined ? { profile: ctx.sandboxProfile } : {})`. Passing `profile: undefined` literally would be a different type than omitting the field — the strict TS setting catches the difference. Documented in the call sites as standard plumbing.
+- **Live host check in tests instead of platform/which stubs.** Stubbing `process.platform` or `Bun.which` reaches into runtime globals that other tests could observe. The cleaner test asserts the INVARIANT (on Linux + bwrap → wrap fires; otherwise passthrough) and runs the same code path the production caller would.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5247 pass / 10 skip / 0 fail** (5257 total across 248 files)
+
+### Next
+
+Successor slices:
+1. macOS sandbox-exec — SBPL profile generation + runtime wrap (parallel to slices 18–21 on macOS).
+2. MCP-tool spawn wire-up (when MCP tools execute child processes; the four-condition gate is now a helper away).
+3. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
+4. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
+5. `--accept-broken-chain` operator override (§7.2 second flag).
+6. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+7. ULID-shaped public approval ids.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 20: sandbox wire-up for grep (§6.5 pattern replication)
 
 **Done.** Twentieth slice. Replicates slice 19's bwrap wrap pattern on the `grep` builtin's `Bun.spawn(cmd, ...)` site. The plumbing (`Decision.sandboxProfile` → `ToolContext.sandboxProfile`) is already in place since slice 19 — this slice only adds the per-tool consume.

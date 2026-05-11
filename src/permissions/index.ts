@@ -56,8 +56,8 @@ export type {
 } from './sandbox-plan.ts';
 export { SANDBOX_PROFILE_ORDER, selectSandboxProfile } from './sandbox-plan.ts';
 
-export type { BuildBwrapArgvOptions } from './sandbox-runner.ts';
-export { buildBwrapArgv } from './sandbox-runner.ts';
+export type { BuildBwrapArgvOptions, MaybeWrapSandboxArgvOptions } from './sandbox-runner.ts';
+export { buildBwrapArgv, maybeWrapSandboxArgv } from './sandbox-runner.ts';
 
 export type {
   BuildContextSummaryOptions,

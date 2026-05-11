@@ -133,6 +133,9 @@ export const bashBackgroundTool: Tool<BashBackgroundInput, BashBackgroundOutput>
         cwd: wd,
         ...(args.label !== undefined ? { label: args.label } : {}),
         ...(args.max_runtime_ms !== undefined ? { maxRuntimeMs: args.max_runtime_ms } : {}),
+        // §6.5: pass the engine's chosen profile through so the bg
+        // manager's Bun.spawn wraps with bwrap when applicable.
+        ...(ctx.sandboxProfile !== undefined ? { sandboxProfile: ctx.sandboxProfile } : {}),
       });
       return {
         process_id: r.id,

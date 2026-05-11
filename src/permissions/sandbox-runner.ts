@@ -123,3 +123,51 @@ export const buildBwrapArgv = (options: BuildBwrapArgvOptions): string[] => {
 
   return ['bwrap', ...flags, '--', ...innerArgv];
 };
+
+// Per-spawn-site consume primitive (§6.5 runtime wire-up).
+// Encapsulates the four-condition gate every spawn site has to
+// apply identically:
+//
+//   1. `profile` was set by the planner (engine wired with sandbox).
+//   2. `profile` isn't `host` (operator-opted-in passthrough).
+//   3. `process.platform === 'linux'` (bwrap is Linux-only).
+//   4. `Bun.which('bwrap') !== null` (defensive recheck — bootstrap
+//      detected once at startup; a package update can remove the
+//      binary mid-session).
+//
+// All four must hold for the wrap to fire. Otherwise the helper
+// returns `innerArgv.slice()` (defensive copy — caller can mutate
+// without poisoning source data) and the spawn proceeds with the
+// inner argv directly.
+//
+// The defensive Bun.which() call is a single PATH lookup — cheap
+// enough to live in the hot path. We'd rather pay the lookup per
+// spawn than cache + invalidate across session lifetime.
+//
+// `home` defaults to `process.env.HOME ?? cwd` — same fallback
+// rationale as bash.ts: in CI containers / sandboxed test runs
+// $HOME may be unset, and the `home-rw` profile needs SOMETHING
+// to bind. Falling back to cwd keeps the wrap valid without
+// throwing or accidentally binding `/root`.
+export interface MaybeWrapSandboxArgvOptions {
+  profile?: SandboxProfile;
+  cwd: string;
+  home?: string;
+  innerArgv: readonly string[];
+}
+
+export const maybeWrapSandboxArgv = (options: MaybeWrapSandboxArgvOptions): string[] => {
+  const { profile, cwd, home, innerArgv } = options;
+  const shouldWrap =
+    profile !== undefined &&
+    profile !== 'host' &&
+    process.platform === 'linux' &&
+    Bun.which('bwrap') !== null;
+  if (!shouldWrap) return innerArgv.slice();
+  return buildBwrapArgv({
+    profile: profile as Exclude<SandboxProfile, 'host'>,
+    cwd,
+    home: home ?? process.env.HOME ?? cwd,
+    innerArgv,
+  });
+};

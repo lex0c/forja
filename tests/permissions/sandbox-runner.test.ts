@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { buildBwrapArgv } from '../../src/permissions/sandbox-runner.ts';
+import { buildBwrapArgv, maybeWrapSandboxArgv } from '../../src/permissions/sandbox-runner.ts';
 
 const INNER = ['bash', '-c', 'echo hi'] as const;
 const CWD = '/work/proj';
@@ -140,5 +140,50 @@ describe('buildBwrapArgv — innerArgv preservation', () => {
     expect(() => buildBwrapArgv({ profile: 'ro', cwd: CWD, home: HOME, innerArgv: [] })).toThrow(
       'innerArgv must not be empty',
     );
+  });
+});
+
+describe('maybeWrapSandboxArgv — per-spawn-site consume primitive', () => {
+  test('omitted profile → returns innerArgv (no wrap)', () => {
+    const argv = maybeWrapSandboxArgv({ cwd: CWD, innerArgv: INNER });
+    expect(argv).toEqual(['bash', '-c', 'echo hi']);
+  });
+
+  test('host profile → returns innerArgv even on Linux', () => {
+    const argv = maybeWrapSandboxArgv({
+      profile: 'host',
+      cwd: CWD,
+      innerArgv: INNER,
+    });
+    expect(argv).toEqual(['bash', '-c', 'echo hi']);
+  });
+
+  test('returned array is a defensive copy (caller mutation safe)', () => {
+    const argv = maybeWrapSandboxArgv({ cwd: CWD, innerArgv: INNER });
+    argv.push('mutated');
+    const argv2 = maybeWrapSandboxArgv({ cwd: CWD, innerArgv: INNER });
+    expect(argv2).toEqual(['bash', '-c', 'echo hi']);
+  });
+
+  // Live host check — the helper consults process.platform +
+  // Bun.which('bwrap') at call time. We can't stub those without
+  // intercepting global state, so we ASSERT THE INVARIANT:
+  // - on Linux + bwrap installed: argv[0] === 'bwrap'.
+  // - on any other state: argv === innerArgv.
+  test('on Linux + bwrap available, ro profile wraps; otherwise passthrough', () => {
+    const bwrapInstalled = Bun.which('bwrap') !== null;
+    const onLinux = process.platform === 'linux';
+    const argv = maybeWrapSandboxArgv({
+      profile: 'ro',
+      cwd: CWD,
+      home: HOME,
+      innerArgv: INNER,
+    });
+    if (bwrapInstalled && onLinux) {
+      expect(argv[0]).toBe('bwrap');
+      expect(argv.slice(-3)).toEqual(['bash', '-c', 'echo hi']);
+    } else {
+      expect(argv).toEqual(['bash', '-c', 'echo hi']);
+    }
   });
 });
