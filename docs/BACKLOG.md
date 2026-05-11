@@ -15,6 +15,66 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 90: §13.3 doctor expansion — kernel + LSM checks + engine version footer
+
+**Done.** Ninetieth slice. Expands `forja doctor` to cover the spec's §13.3 kernel-state matrix: user namespaces, nftables, SELinux/AppArmor. Adds a derived "capability ceiling" footer that shows the sandbox profile set reachable on the current host, plus an "engine version" footer read from `package.json`. Closes the last partial section of `PERMISSION_ENGINE.md` — every named section now has a corresponding implementation.
+
+Pre-slice, `agent doctor` covered the userspace surface (sandbox binary, config + data dirs, policy load, hash chain, sealing, git) but missed the kernel-side dependencies that determine WHICH sandbox profiles the engine can actually pick. An operator with bwrap installed but `unprivileged_userns_clone = 0` (sysadmin-disabled) saw `sandbox: ok` followed by mysterious bwrap failures at runtime. Slice 90 surfaces that root cause directly.
+
+### Why this matters
+
+Spec §13.2 catalogues the support tiers — each tier defines a `capability_ceiling` (which sandbox profiles are reachable). The full Linux first-class set `[ro, cwd-rw, cwd-rw-net, home-rw, host]` requires THREE kernel-side capabilities to all be present:
+
+- **User namespaces** (CONFIG_USER_NS + `unprivileged_userns_clone=1`): bwrap can't create unprivileged user namespaces without it. Some hardened distros (Debian, RHEL) disable this by default.
+- **nftables** (`nft` binary): the `cwd-rw-net` profile uses nft to filter egress per the resolved capability set. Without it, net-profile gates degrade to host.
+- **MAC LSM** (SELinux or AppArmor): not strictly required, but Enforcing mode adds defense in depth. Permissive/Disabled is a known weaker posture.
+
+Pre-slice, these three states were invisible until something failed at runtime. Now `agent doctor` reports each as a discrete check + adds a derived capability ceiling line so operators see at a glance which profiles their engine can actually plan.
+
+The §13.3 spec also calls for an "engine version" + "conformance suite N/N" footer. Engine version lands in slice 90 (read from package.json once at module load); conformance suite reporting is out of scope (would require persisting pass counts across test runs — a CI-side concern).
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/doctor.ts` | New imports: `execFileSync`, `readFileSync`, `resolvePath`, `SandboxProfile` type. **Four new check functions:** `userNamespacesCheck(readFile)` reads `/proc/sys/user/max_user_namespaces` — Linux-only (non-Linux returns ok 'not applicable'); missing file → fail (kernel < 4.18 hint); zero → fail (sysctl remediation); non-numeric → warn; positive → ok. `netFilteringCheck(which, runCmd)` finds `nft`, runs `nft --version`, parses `v\d+\.\d+` from output. Linux-only. Missing nft → warn with install hint. `macLsmCheck(which, runCmd)` tries SELinux's `getenforce` first (Enforcing=ok, Permissive/Disabled=warn with remediation), then AppArmor's `aa-status --enabled` (success=ok). Both absent → ok 'no LSM detected' (operator choice). **Derived footer:** `computeCapabilityCeiling(sandboxOk, userNsOk)` returns the profile set per §13.2 tier: Linux+sandbox+userNs → full set; Darwin+sandbox → `[ro, cwd-rw, host]`; else `[host]`. `PACKAGE_VERSION` constant: reads `package.json` once at module load via `readFileSync(resolvePath(import.meta.dir, '../../package.json'))`; falls back to `'unknown'` on read failure. **`runDoctor` updates:** three new test seams (`readFile`, `runCmd`, `engineVersion`); new defaults (`defaultReadFile`, `defaultRunCmd`); new checks wired into the array between `platform` and `config_dir`; new info event in JSON output (`{kind:'info', engine_version, capability_ceiling}`); new plain-text footer lines `capability ceiling: [...]` + `engine version: X`. |
+| `tests/cli/doctor.test.ts` | Existing `--json` test updated: passes the new `readFile` / `runCmd` / `engineVersion` seams so all checks land OK on test runners without nft/SELinux; assertion count grows from 9 lines (8 checks + summary) to 13 (11 checks + info + summary); summary.counts.ok=11; verifies the new info event sits between last check and summary. **13 new tests** under "§13.3 kernel checks (slice 90)": user_namespaces (4: enabled, disabled, missing, non-numeric); net_filtering (3: present+version, missing, version-probe-failed); mac_lsm (4: SELinux Enforcing, SELinux Permissive, AppArmor, neither); capability_ceiling info line + plain-text footer (2). `extractCheck(out, name)` helper parses the NDJSON stream + finds the named check; `seamsAllOk` fixture provides default-good responses for the kernel probes. |
+
+### Decisions
+
+- **Read /proc/sys/user/max_user_namespaces, NOT spawn `unshare -U`.** Reading is pure (no side effects); `unshare -U /bin/true` creates a transient namespace + runs a process even though we discard the result. Side-effect-free probing is the right posture for a doctor command (spec line 790: "idempotente, read-only, sem side effects"). The sysctl path also gives the THRESHOLD (max=15000) which is informational for operators tuning kernel limits.
+- **`nft --version` parses via regex, not strict.** The output shape varies slightly across distros (some include codename suffixes); pinning a strict parse would break on minor variations. `/v[\d.]+/` matches the version token; the surrounding text falls through verbatim if the regex misses.
+- **SELinux Permissive emits `warn`, not `ok`.** Permissive logs violations but doesn't block — security theater. Operators on hardened systems should know they're a `setenforce 1` away from real enforcement; the warn surfaces that without failing the bootstrap.
+- **AppArmor's `aa-status --enabled` exits 0 on enabled, non-zero otherwise.** No need to parse output — exit code IS the contract. `defaultRunCmd` returns null on non-zero exit, so the check disambiguates "enabled" vs "kernel without AppArmor" via the null branch.
+- **Capability ceiling computed AFTER the checks run, NOT during.** Each check stays self-contained (no cross-check state). `runDoctor` re-reads the already-computed `sandboxResult.status === 'ok'` and `userNsResult.status === 'ok'` flags to derive the ceiling. Pure derivation; no extra probing. Operators with broken sandbox or userNs see ceiling `[host]` — accurate even when individual checks haven't been read.
+- **Engine version read ONCE at module load, not per-doctor-run.** package.json is static across the process lifetime; reading every `runDoctor` invocation would be wasteful. Tests override via `engineVersion` option to pin assertions; production gets the real installed version.
+- **Conformance suite reporting DEFERRED.** The spec's §13.3 example output includes `Conformance suite: 142/142 passing (last run 2d ago)`. Implementing this requires persisting test results across CI runs + a way for doctor to read them — substantial out-of-band infrastructure. Slice 90 surfaces every check that doesn't require CI persistence; the conformance line can land when operators need it.
+- **Linux-only checks return `ok` with "not applicable" on other platforms.** Avoids cluttering output with "skipped" entries; clearly signals the check ran + has no opinion on this platform. Failed-count stays clean across platforms.
+- **`runCmd` returns null on ANY error (missing binary, non-zero exit, throw).** Discriminating those at the seam level would bleed implementation details into every consumer. The two-state contract (got stdout / didn't) is enough for all three new checks; subsequent failure modes (which-found-but-exec-failed) are mapped at the check level via secondary `which` calls.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **6048 pass / 10 skip / 0 fail** (6058 total across 287 files); +13 tests on top of slice 89's 6035
+- `bun test tests/cli/doctor.test.ts` — 46 pass (was 33 pre-slice + 13 new)
+- The slice 89 sealing tests + the slice 90 doctor tests both green, confirming no cross-thread regressions
+
+### Next
+
+**PERMISSION_ENGINE.md is structurally COMPLETE.** Every named section (§1-§13 core engine, §13.7 broker thread, §15.4 fuzz, §16 conformance, §17 replay, §18 telemetry, §7.3 sealing, §13.3 doctor) has an implementation. Remaining items:
+
+- §14 MCP — still blocked (BACKLOG-level decision; ecosystem premature for v1)
+- §19 v1→v2 migration — premature (no v1 in production to migrate)
+- §13.3 conformance suite footer — deferred (CI-side persistence concern)
+- TSR / S3 retention verification — separate operator concern (verify offline)
+
+Spec status: **PERMISSION_ENGINE.md done for v1**. Operators can ship to local-CLI deployments today; regulated deployments add sealing backend choice (worm-file / git-anchored / rfc3161-tsa / s3-object-lock) per their trust model.
+
+Other spec docs unchanged: CODE_INDEX, CODE_GENERATION, MCP, TREE_SITTER (broad scope), LOCAL_MODELS (operational detail), RECAP renderers, PERFORMANCE regression suite — all per the slice 89 closing audit.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 89: §7.3 S3 Object Lock sealing backend — closes the §7.3 catalog
 
 **Done.** Eighty-ninth slice. Ships the fourth and final §7.3 sealing backend: `s3-object-lock`. Each seal record uploads to S3 as an object protected by Object Lock COMPLIANCE-mode retention; the local seal.log keeps the chain index. Closes the §7.3 catalog — every mode the spec catalogues is now implemented. `RESERVED_SEAL_MODES` is empty.

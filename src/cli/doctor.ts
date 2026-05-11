@@ -29,9 +29,10 @@
 // `{"kind":"summary",...}` line. Same convention as
 // --list-sessions / --explain-permissions.
 
-import { existsSync, mkdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir, arch as nodeArch, platform as nodePlatform } from 'node:os';
-import { dirname } from 'node:path';
+import { dirname, resolve as resolvePath } from 'node:path';
 import {
   type SealStore,
   type VerifyResult,
@@ -42,6 +43,7 @@ import {
   resolvePolicy,
 } from '../permissions/index.ts';
 import { installIdPath } from '../permissions/paths.ts';
+import type { SandboxProfile } from '../permissions/sandbox-plan.ts';
 import type { SealPolicy } from '../permissions/types.ts';
 import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 
@@ -84,6 +86,21 @@ export interface RunDoctorOptions {
   // Production reads the operator's session DB at `defaultDbPath()`;
   // tests pin an in-memory or temp-file path.
   dbPath?: string;
+  // Test seam — reads a sysctl path (e.g.,
+  // `/proc/sys/user/max_user_namespaces`). Production reads via
+  // `readFileSync`; tests pass `(path) => string | null`. Returns
+  // null on any read error so the check's branches stay
+  // deterministic.
+  readFile?: (path: string) => string | null;
+  // Test seam — invokes a command + returns stdout. Production
+  // wraps `execFileSync` with the same null-on-error convention.
+  // Used by the net_filtering + mac_lsm checks (nft --version,
+  // getenforce, aa-status).
+  runCmd?: (cmd: string, args: readonly string[]) => string | null;
+  // Test override for the package.json-derived engine version.
+  // Production: PACKAGE_VERSION constant. Tests: pin a value
+  // for stable assertions.
+  engineVersion?: string;
   out?: (s: string) => void;
   err?: (s: string) => void;
 }
@@ -97,6 +114,25 @@ const STATUS_LABEL: Record<DoctorStatus, string> = {
 // `Bun.which` is the production binary probe; tests inject a stub
 // via options.which. Returns null on miss, the absolute path on hit.
 const defaultWhich = (cmd: string): string | null => Bun.which(cmd);
+
+const defaultReadFile = (path: string): string | null => {
+  try {
+    return readFileSync(path, 'utf-8');
+  } catch {
+    return null;
+  }
+};
+
+const defaultRunCmd = (cmd: string, args: readonly string[]): string | null => {
+  try {
+    return execFileSync(cmd, [...args], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    return null;
+  }
+};
 
 const platformCheck = (env: NodeJS.ProcessEnv): DoctorCheck => {
   const os = nodePlatform();
@@ -540,6 +576,204 @@ const sealingCheck = (options: SealingCheckOptions): DoctorCheck => {
   };
 };
 
+// §13.3 doctor checks (slice 90). Linux kernel + LSM detail that
+// affects sandbox availability + capability ceiling. Each check
+// surfaces the underlying kernel/userspace state so operators
+// know WHY the engine is in a particular degraded posture before
+// chasing symptoms.
+
+// Reads /proc/sys/user/max_user_namespaces. Linux-only — non-Linux
+// platforms get an 'ok' with "not applicable" so the check appears
+// in the output without bloating the failure count. Missing file
+// (very old kernel < 4.18 or admin-disabled feature) → fail with
+// a remediation hint pointing at the relevant sysctl.
+const userNamespacesCheck = (readFile: (path: string) => string | null): DoctorCheck => {
+  if (nodePlatform() !== 'linux') {
+    return {
+      name: 'user_namespaces',
+      status: 'ok',
+      detail: 'not applicable on this platform',
+    };
+  }
+  const content = readFile('/proc/sys/user/max_user_namespaces');
+  if (content === null) {
+    return {
+      name: 'user_namespaces',
+      status: 'fail',
+      detail: '/proc/sys/user/max_user_namespaces missing (kernel < 4.18 or feature absent)',
+      remediation:
+        'upgrade kernel to ≥ 4.18 or enable CONFIG_USER_NS; bwrap requires user namespaces',
+    };
+  }
+  const max = Number.parseInt(content.trim(), 10);
+  if (!Number.isFinite(max)) {
+    return {
+      name: 'user_namespaces',
+      status: 'warn',
+      detail: `unexpected /proc/sys/user/max_user_namespaces content: ${JSON.stringify(content.trim())}`,
+    };
+  }
+  if (max < 1) {
+    return {
+      name: 'user_namespaces',
+      status: 'fail',
+      detail: `disabled (max_user_namespaces=${max})`,
+      remediation: 'enable via `sudo sysctl -w user.max_user_namespaces=15000`',
+    };
+  }
+  return {
+    name: 'user_namespaces',
+    status: 'ok',
+    detail: `enabled (max=${max})`,
+  };
+};
+
+// Detects nftables presence + version. Linux-only — affects the
+// `cwd-rw-net` profile (slice 47 wires net egress filtering via
+// nft). Absent on Linux → warn (the net-profile gates degrade to
+// host instead of being unreachable, which the operator should
+// know about). Non-Linux → ok 'not applicable'.
+const netFilteringCheck = (
+  which: (cmd: string) => string | null,
+  runCmd: (cmd: string, args: readonly string[]) => string | null,
+): DoctorCheck => {
+  if (nodePlatform() !== 'linux') {
+    return {
+      name: 'net_filtering',
+      status: 'ok',
+      detail: 'not applicable on this platform',
+    };
+  }
+  const nftPath = which('nft');
+  if (nftPath === null) {
+    return {
+      name: 'net_filtering',
+      status: 'warn',
+      detail: 'nft not found on $PATH',
+      remediation:
+        'install nftables (`apt install nftables` or distro equivalent) to enable the cwd-rw-net sandbox profile',
+    };
+  }
+  const versionOut = runCmd('nft', ['--version']);
+  if (versionOut === null) {
+    return {
+      name: 'net_filtering',
+      status: 'warn',
+      detail: `nft at ${nftPath} but version probe failed`,
+    };
+  }
+  // `nft --version` output shape: `nftables v1.0.9 (Old Doc Yak)`.
+  // Extract the v… token if present; otherwise pass the first line
+  // verbatim.
+  const firstLine = versionOut.split('\n')[0] ?? '';
+  const versionMatch = firstLine.match(/v[\d.]+/);
+  const version = versionMatch !== null ? versionMatch[0] : firstLine.trim();
+  return {
+    name: 'net_filtering',
+    status: 'ok',
+    detail: `nftables ${version} at ${nftPath}`,
+  };
+};
+
+// SELinux / AppArmor detection. Linux-only. Tries SELinux's
+// `getenforce` first, then AppArmor's `aa-status`. If neither is
+// installed/active → ok 'no LSM detected' (operator's choice).
+// Enforce mode is reported as ok; complain/permissive mode emits
+// a warn so operators know they don't have hard isolation.
+//
+// AppArmor's `aa-status` requires root for full output; we only
+// need exit code + first line, which is non-privileged.
+const macLsmCheck = (
+  which: (cmd: string) => string | null,
+  runCmd: (cmd: string, args: readonly string[]) => string | null,
+): DoctorCheck => {
+  if (nodePlatform() !== 'linux') {
+    return {
+      name: 'mac_lsm',
+      status: 'ok',
+      detail: 'not applicable on this platform',
+    };
+  }
+  // SELinux path.
+  const getEnforcePath = which('getenforce');
+  if (getEnforcePath !== null) {
+    const out = runCmd('getenforce', []);
+    if (out !== null) {
+      const mode = out.trim();
+      if (mode === 'Enforcing') {
+        return { name: 'mac_lsm', status: 'ok', detail: 'SELinux (Enforcing)' };
+      }
+      if (mode === 'Permissive' || mode === 'Disabled') {
+        return {
+          name: 'mac_lsm',
+          status: 'warn',
+          detail: `SELinux (${mode})`,
+          remediation:
+            mode === 'Permissive'
+              ? 'consider Enforcing mode for stronger isolation (`sudo setenforce 1`)'
+              : 'SELinux is installed but Disabled; enable it for stronger isolation',
+        };
+      }
+      return { name: 'mac_lsm', status: 'warn', detail: `SELinux returned: ${mode}` };
+    }
+  }
+  // AppArmor path.
+  const aaStatusPath = which('aa-status');
+  if (aaStatusPath !== null) {
+    const out = runCmd('aa-status', ['--enabled']);
+    if (out !== null) {
+      // `aa-status --enabled` exits 0 if the kernel has AppArmor
+      // enabled. We surface as ok with the profile-count hint when
+      // the verbose form succeeds.
+      return { name: 'mac_lsm', status: 'ok', detail: 'AppArmor (enabled)' };
+    }
+    return {
+      name: 'mac_lsm',
+      status: 'warn',
+      detail: `aa-status at ${aaStatusPath} but enabled probe failed`,
+    };
+  }
+  return {
+    name: 'mac_lsm',
+    status: 'ok',
+    detail: 'no LSM detected (SELinux + AppArmor absent)',
+  };
+};
+
+// Computes the sandbox profile ceiling — the maximum set of
+// profiles the engine planner can reach on this host. Pure
+// derivation from previously-checked state; doesn't probe again.
+// Output mirrors §13.2's tier table: Linux-first-class →
+// [ro, cwd-rw, cwd-rw-net, home-rw, host]; macOS-partial →
+// [ro, cwd-rw, host]; everything else → [host].
+const computeCapabilityCeiling = (
+  sandboxAvailable: boolean,
+  userNsOk: boolean,
+): readonly SandboxProfile[] => {
+  const platform = nodePlatform();
+  if (platform === 'linux' && sandboxAvailable && userNsOk) {
+    return ['ro', 'cwd-rw', 'cwd-rw-net', 'home-rw', 'host'];
+  }
+  if (platform === 'darwin' && sandboxAvailable) {
+    return ['ro', 'cwd-rw', 'host'];
+  }
+  return ['host'];
+};
+
+// Reads the package.json once at module load. Production: the
+// real installed version. Tests can override via the
+// `engineVersion` option on runDoctor.
+const PACKAGE_VERSION = ((): string => {
+  try {
+    const pkgPath = resolvePath(import.meta.dir, '../../package.json');
+    const content = readFileSync(pkgPath, 'utf-8');
+    const pkg = JSON.parse(content) as { version?: unknown };
+    return typeof pkg.version === 'string' ? pkg.version : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+})();
+
 const gitCheck = (which: (cmd: string) => string | null): DoctorCheck => {
   const path = which('git');
   if (path !== null) {
@@ -572,14 +806,26 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
   void err;
   const env = options.env ?? process.env;
   const which = options.which ?? defaultWhich;
+  const readFile = options.readFile ?? defaultReadFile;
+  const runCmd = options.runCmd ?? defaultRunCmd;
+  const engineVersion = options.engineVersion ?? PACKAGE_VERSION;
   const json = options.json === true;
 
   const cwd = options.cwd ?? process.cwd();
   const now = options.now ?? Date.now;
   const dbPath = options.dbPath ?? defaultDbPath();
+  // §13.3 platform / kernel block. Order matches the spec's
+  // example output: OS, user namespaces, sandbox binary, net
+  // filtering, MAC LSM — the kernel-side stack the engine
+  // depends on, top to bottom.
+  const sandboxResult = sandboxCheck(which);
+  const userNsResult = userNamespacesCheck(readFile);
   const checks: DoctorCheck[] = [
     platformCheck(env),
-    sandboxCheck(which),
+    userNsResult,
+    sandboxResult,
+    netFilteringCheck(which, runCmd),
+    macLsmCheck(which, runCmd),
     configDirCheck(env),
     dataDirCheck(env),
     policyLoadCheck({
@@ -602,6 +848,17 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
     gitCheck(which),
   ];
 
+  // §13.3 derived footer items.
+  //   - Capability ceiling: which sandbox profiles are reachable
+  //     given the platform + sandbox-binary + user-namespaces
+  //     state. Pure derivation; no extra probing.
+  //   - Engine version: read once at module load from
+  //     package.json (production) or overridden by tests.
+  const capabilityCeiling = computeCapabilityCeiling(
+    sandboxResult.status === 'ok',
+    userNsResult.status === 'ok',
+  );
+
   const failCount = checks.filter((c) => c.status === 'fail').length;
   const warnCount = checks.filter((c) => c.status === 'warn').length;
   const okCount = checks.filter((c) => c.status === 'ok').length;
@@ -612,6 +869,13 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
     }
     out(
       `${JSON.stringify({
+        kind: 'info',
+        engine_version: engineVersion,
+        capability_ceiling: capabilityCeiling,
+      })}\n`,
+    );
+    out(
+      `${JSON.stringify({
         kind: 'summary',
         ok: failCount === 0,
         counts: { ok: okCount, warn: warnCount, fail: failCount },
@@ -620,13 +884,17 @@ export const runDoctor = async (options: RunDoctorOptions = {}): Promise<number>
     return failCount === 0 ? 0 : 1;
   }
 
-  // Plain text: one block per check, blank line between, summary
-  // footer.
+  // Plain text: one block per check, blank line between, footer
+  // info, then summary footer.
   const blocks: string[] = [];
   for (const c of checks) {
     blocks.push(renderCheckPlain(c).join('\n'));
   }
   out(`${blocks.join('\n\n')}\n\n`);
+  // §13.3 derived info — capability ceiling + engine version.
+  // Always rendered (informational, not pass/fail signals).
+  out(`capability ceiling: [${capabilityCeiling.join(', ')}]\n`);
+  out(`engine version: ${engineVersion}\n\n`);
   if (failCount === 0 && warnCount === 0) {
     out('summary: all checks passed\n');
   } else if (failCount === 0) {

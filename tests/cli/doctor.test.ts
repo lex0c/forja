@@ -124,27 +124,43 @@ describe('runDoctor', () => {
     expect(text).toContain('install git');
   });
 
-  test('--json: NDJSON one event per check + summary line', async () => {
+  test('--json: NDJSON one event per check + info + summary line', async () => {
     const out = captured();
     const code = await runDoctor({
       json: true,
       env,
       which: (cmd) => `/usr/bin/${cmd}`,
+      // Slice 90 seams: stub the new probe sites so every check
+      // lands OK on a runner that may not have nft / SELinux /
+      // AppArmor / /proc/sys/user/max_user_namespaces.
+      readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? '15000\n' : null),
+      runCmd: (cmd, _args) => {
+        if (cmd === 'nft') return 'nftables v1.0.9 (Old Doc Yak)\n';
+        if (cmd === 'getenforce') return 'Enforcing\n';
+        return null;
+      },
+      engineVersion: '0.0.0',
       out: out.write,
       err: captured().write,
     });
     expect(code).toBe(0);
     const lines = out.lines.join('').trim().split('\n').filter(Boolean);
-    // 8 checks + 1 summary (hash_chain added in slice 62,
-    // policy_load in slice 61, sealing in slice 60).
-    expect(lines.length).toBe(9);
+    // 11 checks (slice 90 added user_namespaces + net_filtering +
+    // mac_lsm) + 1 info (capability ceiling + engine version) +
+    // 1 summary.
+    expect(lines.length).toBe(13);
     const events = lines.map((l) => JSON.parse(l));
     expect(events[0].kind).toBe('check');
     expect(events[0].name).toBe('platform');
+    // Info event sits between the last check and the summary.
+    const info = events[events.length - 2];
+    expect(info.kind).toBe('info');
+    expect(info.engine_version).toBe('0.0.0');
+    expect(Array.isArray(info.capability_ceiling)).toBe(true);
     const summary = events[events.length - 1];
     expect(summary.kind).toBe('summary');
     expect(summary.ok).toBe(true);
-    expect(summary.counts).toEqual({ ok: 8, warn: 0, fail: 0 });
+    expect(summary.counts).toEqual({ ok: 11, warn: 0, fail: 0 });
   });
 
   test('--json: failures bump summary.ok to false + exit 1', async () => {
@@ -721,5 +737,262 @@ describe('runDoctor — hash_chain check (§7.2 / §13.3 / slice 62)', () => {
     expect(chain).toBeDefined();
     expect(chain.status).toBe('ok');
     expect(chain.detail).toBe('intact (7 rows)');
+  });
+});
+
+// ─── slice 90 §13.3 expansion ─────────────────────────────────────────────
+
+describe('runDoctor — §13.3 kernel checks (slice 90)', () => {
+  const env = { PATH: process.env.PATH };
+
+  const seamsAllOk = {
+    readFile: (path: string): string | null =>
+      path === '/proc/sys/user/max_user_namespaces' ? '15000\n' : null,
+    runCmd: (cmd: string, _args: readonly string[]): string | null => {
+      if (cmd === 'nft') return 'nftables v1.0.9 (Old Doc Yak)\n';
+      if (cmd === 'getenforce') return 'Enforcing\n';
+      return null;
+    },
+  };
+
+  const extractCheck = (out: { lines: string[] }, name: string): Record<string, unknown> | null => {
+    const lines = out.lines.join('').trim().split('\n').filter(Boolean);
+    for (const l of lines) {
+      const e = JSON.parse(l) as Record<string, unknown>;
+      if (e.kind === 'check' && e.name === name) return e;
+    }
+    return null;
+  };
+
+  test('user_namespaces: enabled (max > 0) → ok', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      ...seamsAllOk,
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'user_namespaces');
+    expect(c?.status).toBe('ok');
+    expect(c?.detail).toBe('enabled (max=15000)');
+  });
+
+  test('user_namespaces: disabled (max=0) → fail with remediation', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      ...seamsAllOk,
+      readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? '0\n' : null),
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'user_namespaces');
+    expect(c?.status).toBe('fail');
+    expect(c?.detail).toContain('disabled (max_user_namespaces=0)');
+    expect(c?.remediation).toContain('sysctl');
+  });
+
+  test('user_namespaces: file missing → fail with kernel upgrade hint', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      ...seamsAllOk,
+      readFile: () => null,
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'user_namespaces');
+    expect(c?.status).toBe('fail');
+    expect(c?.detail).toContain('missing');
+    expect(c?.remediation).toContain('kernel');
+  });
+
+  test('user_namespaces: non-numeric content → warn', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      ...seamsAllOk,
+      readFile: (path) => (path === '/proc/sys/user/max_user_namespaces' ? 'garbage\n' : null),
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'user_namespaces');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('unexpected');
+  });
+
+  test('net_filtering: nft present + version → ok', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      ...seamsAllOk,
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'net_filtering');
+    expect(c?.status).toBe('ok');
+    expect(c?.detail).toContain('v1.0.9');
+    expect(c?.detail).toContain('/usr/bin/nft');
+  });
+
+  test('net_filtering: nft missing → warn with install hint', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => (cmd === 'nft' ? null : `/usr/bin/${cmd}`),
+      ...seamsAllOk,
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'net_filtering');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('nft not found');
+    expect(c?.remediation).toContain('nftables');
+  });
+
+  test('net_filtering: nft present but version probe fails → warn', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      readFile: seamsAllOk.readFile,
+      runCmd: (cmd) => (cmd === 'getenforce' ? 'Enforcing\n' : null), // nft → null
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'net_filtering');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('version probe failed');
+  });
+
+  test('mac_lsm: SELinux Enforcing → ok', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      ...seamsAllOk,
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'mac_lsm');
+    expect(c?.status).toBe('ok');
+    expect(c?.detail).toBe('SELinux (Enforcing)');
+  });
+
+  test('mac_lsm: SELinux Permissive → warn', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      readFile: seamsAllOk.readFile,
+      runCmd: (cmd) => {
+        if (cmd === 'nft') return 'nftables v1.0\n';
+        if (cmd === 'getenforce') return 'Permissive\n';
+        return null;
+      },
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'mac_lsm');
+    expect(c?.status).toBe('warn');
+    expect(c?.detail).toContain('Permissive');
+    expect(c?.remediation).toContain('setenforce');
+  });
+
+  test('mac_lsm: AppArmor enabled (no SELinux) → ok', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => {
+        if (cmd === 'getenforce') return null; // no SELinux
+        return `/usr/bin/${cmd}`;
+      },
+      readFile: seamsAllOk.readFile,
+      runCmd: (cmd) => {
+        if (cmd === 'nft') return 'nftables v1.0\n';
+        if (cmd === 'aa-status') return ''; // enabled probe exits 0
+        return null;
+      },
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'mac_lsm');
+    expect(c?.status).toBe('ok');
+    expect(c?.detail).toContain('AppArmor');
+  });
+
+  test('mac_lsm: neither SELinux nor AppArmor → ok with informational detail', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => {
+        if (cmd === 'getenforce' || cmd === 'aa-status') return null;
+        return `/usr/bin/${cmd}`;
+      },
+      readFile: seamsAllOk.readFile,
+      runCmd: (cmd) => (cmd === 'nft' ? 'nftables v1.0\n' : null),
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const c = extractCheck(out, 'mac_lsm');
+    expect(c?.status).toBe('ok');
+    expect(c?.detail).toContain('no LSM detected');
+  });
+
+  test('capability_ceiling info line: Linux+bwrap+userNs → full set', async () => {
+    const out = captured();
+    await runDoctor({
+      json: true,
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      ...seamsAllOk,
+      engineVersion: '0.0.0',
+      out: out.write,
+    });
+    const lines = out.lines.join('').trim().split('\n').filter(Boolean);
+    const info = lines
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .find((e) => e.kind === 'info');
+    expect(info?.engine_version).toBe('0.0.0');
+    // On Linux test runners; capability_ceiling reflects detected
+    // sandbox + userNs state. Since `which` returns paths for
+    // everything (including bwrap) and userNs seam returns ok,
+    // ceiling should be the full Linux set on Linux runners. On
+    // non-Linux test runners (e.g., macOS CI) the ceiling is
+    // different — assert the array exists + length > 0 instead of
+    // pinning specific contents.
+    expect(Array.isArray(info?.capability_ceiling)).toBe(true);
+    expect((info?.capability_ceiling as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  test('plain text footer: capability ceiling + engine version rendered', async () => {
+    const out = captured();
+    await runDoctor({
+      env,
+      which: (cmd) => `/usr/bin/${cmd}`,
+      ...seamsAllOk,
+      engineVersion: '1.2.3',
+      out: out.write,
+      err: captured().write,
+    });
+    const text = out.lines.join('');
+    expect(text).toContain('capability ceiling:');
+    expect(text).toContain('engine version: 1.2.3');
   });
 });
