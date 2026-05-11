@@ -15,6 +15,94 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 43: `agent doctor` (§13 platform provisioning — foundation)
+
+**Done.** Forty-third slice. First slice on §13 — biggest user-facing block remaining from the §23 production-ready criteria. Pivots from the §8 grants thread (39-42) to platform provisioning. Spec §13.3-13.9 calls for `forja doctor` (renamed `agent doctor` per repo conventions), `agent sandbox setup`, broker/worker architecture, first-boot UX, degradation banners. This slice ships the foundation — the doctor verb — with 5 checks; subsequent slices add `sandbox setup`, the broker arch, and the rest of §13.
+
+Spec philosophy line 765: "detect, don't distribute" — Forja probes the host, surfaces what's there, recommends (doesn't auto-install) anything missing. The doctor verb is exactly that surface.
+
+### Why this matters
+
+Operators running Forja for the first time today get a single "sandbox available" check buried inside the engine bootstrap and nothing else. There's no `forja doctor` to answer "is my install working?", no first-boot guidance, no platform-aware messaging. The §13 gap was the biggest user-facing item left from the spec inventory the user did at slice 25. This slice opens the §13 thread with a real, working verb.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/args.ts` | New `parseDoctorSubcommand`. Top-level verb matching the `init` / `recap` / `permission` shape. Accepts `--json` and `--help`; rejects every other flag + any positional with a clear error message. Wired into `parseArgs` before the main flag scanner. New `doctor?: { json: boolean }` on parsed args. Help text updated with `agent doctor` example. |
+| `src/cli/run.ts` | New dispatch arm for `args.doctor !== undefined` — lazy-imports `./doctor.ts` and runs the handler. Lifecycle-mode (no provider, no DB, no harness) like `--list-sessions` / `--explain-permissions`. |
+| `src/cli/index.ts` | `promptOptional` list includes `args.doctor !== undefined` — doctor doesn't need a prompt, mirrors the other lifecycle exemptions. |
+| `src/cli/doctor.ts` (new, ~225 lines) | `runDoctor({json?, env?, which?, out?, err?}): Promise<number>`. 5 checks: `platform` (OS + arch + node + bun versions, always ok), `sandbox` (detectSandboxAvailability → bwrap or sandbox-exec; warn on absence with distro-specific remediation), `config_dir` (`~/.config/agent` writability via `installIdPath` → dirname → mkdir probe; fail on derivation or mkdir failure), `data_dir` (`~/.local/share/forja` writability via XDG_DATA_HOME + HOME; fail on undeclared HOME), `git` (`which('git')`; warn on absence — git_* tools degrade, agent itself doesn't). DoctorCheck shape: `{name, status: ok\|warn\|fail, detail, remediation?}`. JSON mode emits `{kind:'check',...}` per check + a `{kind:'summary', ok, counts:{ok,warn,fail}}` footer. Plain text: per-check block (`name` / `status` / `detail` / `→ remediation`) + summary line. Exit 0 on `fail=0` (warnings allowed); exit 1 on any fail. Test seam: injectable `which(cmd)` so unit tests don't depend on $PATH. |
+| `tests/cli/doctor.test.ts` (new, 11 tests) | Parser (5 tests: verb recognized, --json captured, --help short-circuits, unknown flag rejected, positional rejected) + handler (6 tests: all-pass exit 0 + footer, missing sandbox → warn, missing git → warn, NDJSON shape with 5 checks + summary, JSON summary.ok=false + exit 1 on fail, plain-text remediation hint renders). |
+
+### Decisions
+
+- **Verb name: `doctor` not `forja doctor`.** Spec docs say `forja doctor`, but the binary in this repo is `agent` (per `bin: { agent: ... }` in package.json). Verb shape matches existing convention.
+- **Sandbox absence is `warn`, not `fail`.** Operators without bwrap installed on a fresh Linux box should still see a useful doctor report. The engine's degraded path covers the runtime; doctor's role is to surface that the safety net is missing. `fail` would block the first-boot experience for every Linux user without bubblewrap pre-installed.
+- **Git absence is `warn`, not `fail`.** Most agent tools work without git. Only `git_*` tools (commit, push, branch) need it; operators doing read-only Q&A don't. Categorizing `warn` lets the operator know they need git for SOME flows but doesn't block the others.
+- **Config dir absence is `fail` not `warn`.** Without a derivable config dir, `ensureInstallId` throws on engine bootstrap — the audit chain genesis derives from install_id, so a fresh install can't anchor anywhere. This IS a blocking condition. The doctor's `fail` surfaces it BEFORE bootstrap, so operators see a clean diagnostic instead of an opaque crash on the first `agent` invocation.
+- **5 checks now, not 15.** The §13 spec mentions many more (XDG variables, kernel feature flags, namespace availability, $TMPDIR, etc). For the foundation slice, 5 covers the most-common first-boot failure modes. Future slices add more — `agent doctor --thorough` (Linux kernel features, /tmp size, container detection) would be a natural extension.
+- **JSON shape: NDJSON one-per-check + summary.** Same convention as `--list-sessions`, `--explain-permissions --json`, etc. Consumers `jq 'select(.kind == "check" and .status == "fail")'` to grep for failures, `jq 'select(.kind == "summary").ok'` for the bottom-line bool. Stream-parsable.
+- **`platformOptional` in `index.ts` extended.** Doctor doesn't need a prompt; mirrors the exemption for `--list-sessions` and `recap`. Without this, `agent doctor` would route into the REPL TTY gate on non-interactive shells (CI).
+- **`which()` test seam.** Tests pass a stub so the sandbox + git checks behave deterministically on any runner. CI hosts often lack bwrap; we don't want the test suite reporting different doctor output between local dev and CI. Production callers leave `which` undefined and `Bun.which` runs.
+
+### Smoke
+
+```
+$ agent doctor
+platform
+  status: ok
+  linux x64 (node 24.3.0, bun 1.3.13)
+
+sandbox
+  status: ok
+  bwrap available
+
+config_dir
+  status: ok
+  /home/lex/.config/agent
+
+data_dir
+  status: ok
+  /home/lex/.local/share/forja
+
+git
+  status: ok
+  found at /usr/bin/git
+
+summary: all checks passed
+```
+
+```
+$ agent doctor --json
+{"kind":"check","name":"platform","status":"ok","detail":"linux x64 (node 24.3.0, bun 1.3.13)"}
+{"kind":"check","name":"sandbox","status":"ok","detail":"bwrap available"}
+{"kind":"check","name":"config_dir","status":"ok","detail":"/home/lex/.config/agent"}
+{"kind":"check","name":"data_dir","status":"ok","detail":"/home/lex/.local/share/forja"}
+{"kind":"check","name":"git","status":"ok","detail":"found at /usr/bin/git"}
+{"kind":"summary","ok":true,"counts":{"ok":5,"warn":0,"fail":0}}
+```
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5471 pass / 10 skip / 0 fail** (5481 total across 254 files); 11 new tests on top of slice 42's 5460
+- `bun test tests/cli/doctor.test.ts` — 11 pass
+- Manual smoke: `bun src/cli/index.ts doctor` (above) — output reads clean, all checks pass on this dev machine
+
+### Next
+
+§13 platform provisioning — subsequent slices:
+1. **`agent sandbox setup`** — guided remediation flow. When `doctor` reports sandbox warn, this is the follow-up: detect distro, suggest the install command, optionally invoke `bwrap --version` post-install to verify. No auto-installs (spec §13.1 "detect, don't distribute").
+2. **Broker/worker architecture** — spec §13.7. For sandboxed-cap subagents, a single broker process owns the sandbox setup and workers connect to it. Multi-slice work.
+3. **First-boot UX** — spec §13.5. When `agent` runs for the first time (no install_id), show a tailored doctor + setup walkthrough before opening the REPL.
+4. **Doctor extensions**: kernel-feature probe (Linux unshare / user namespaces / cgroups), `/tmp` size + permissions, container detection (docker / podman / k8s), Forja own-binary integrity.
+
+Non-§13 successors: macOS sandbox-exec (the second-biggest platform gap), MCP-tool spawn wire-up, §7.3 external sealing.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 42: §8 grants — ttl_expiry conformance cases (§16.2 minimum)
 
 **Done.** Forty-second slice. Closes the last conformance block that fits the existing YAML harness — the suite goes from **123/136 = 90% → 129/136 = 95%** against §16.2's GA bar. Only `concurrency` (~7 cases) remains, and the spec docs it as needing a separate driver outside the YAML format (race conditions don't render as static fixtures).

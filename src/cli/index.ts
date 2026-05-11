@@ -111,7 +111,11 @@ const main = async (): Promise<number> => {
     // `args.recap.args` and never expects a free-text prompt — the
     // empty-prompt check below would otherwise route it into the
     // REPL TTY gate or the `--json requires a prompt` rejection.
-    args.recap !== undefined;
+    args.recap !== undefined ||
+    // `agent doctor` (§13 slice 43) is the headless platform-health
+    // surface. No prompt, no provider, no REPL — same exemption as
+    // the other lifecycle modes above.
+    args.doctor !== undefined;
   if (args.prompt.length === 0 && !promptOptional && args.resume === undefined) {
     // JSON mode + REPL is meaningless (NDJSON consumers don't have
     // a TTY to type into) — refuse rather than open a TTY-only loop

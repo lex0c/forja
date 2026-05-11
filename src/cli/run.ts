@@ -301,6 +301,19 @@ export const run = async (options: RunOptions): Promise<number> => {
     // NDJSON envelope (recap_start / recap_intermediate /
     // recap_render / recap_end); without it, the rendered text
     // streams to stdout verbatim.
+    // `agent doctor [--json]` — §13 platform provisioning health check.
+    // No provider, no DB, no harness — just probes the host and
+    // emits a structured report. Exit 0 on all-pass, 1 if any check
+    // fails.
+    if (args.doctor !== undefined) {
+      const { runDoctor } = await import('./doctor.ts');
+      return await runDoctor({
+        json: args.doctor.json,
+        out: (s) => process.stdout.write(s),
+        err: errSink,
+      });
+    }
+
     if (args.recap !== undefined) {
       const { runRecapHeadless } = await import('./recap-headless.ts');
       let provider: import('../providers/types.ts').Provider;

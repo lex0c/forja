@@ -209,6 +209,17 @@ export interface ParsedArgs {
   // (recap_start / recap_intermediate / recap_render / recap_end);
   // without `--json`, headless output is the rendered string only.
   recap?: { args: string[] };
+  // `agent doctor [--json]` — §13 platform provisioning surface.
+  // Runs a series of health checks (platform info, sandbox tool
+  // availability, config + data dir writability, git binary
+  // presence) and renders a structured report. Exit 0 on all-pass,
+  // 1 if any check fails. Pairs with the global `--json` toggle to
+  // emit NDJSON one-line-per-check + a summary line, same shape
+  // convention as --list-sessions / --explain-permissions.
+  //
+  // First slice on §13 — foundation for future `agent sandbox
+  // setup` + broker/worker architecture.
+  doctor?: { json: boolean };
   // `agent permission <verb> [positionals]` — operator surface for
   // the v2 permission engine (PERMISSION_ENGINE.md). Verbs:
   //   - 'verify'       — walk the audit hash chain for the current
@@ -441,6 +452,57 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
       yes: false,
       recap: { args: recapArgs },
       ...(model !== undefined ? { model } : {}),
+    },
+  };
+};
+
+// `agent doctor [--json]` — §13 platform provisioning health
+// check. No positionals, no verb. Top-level subcommand mirroring
+// the `init` / `recap` / `permission` shape.
+const parseDoctorSubcommand = (argv: readonly string[]): ParseResult | null => {
+  if (argv.length === 0 || argv[0] !== 'doctor') return null;
+  let json = false;
+  for (let i = 1; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === undefined) continue;
+    if (token === '--help' || token === '-h') {
+      return {
+        ok: true,
+        args: {
+          prompt: '',
+          json: false,
+          version: false,
+          help: true,
+          plan: false,
+          listSessions: false,
+          includeSubagents: false,
+          explainPermissions: false,
+          yes: false,
+        },
+      };
+    }
+    if (token === '--json') {
+      json = true;
+      continue;
+    }
+    return {
+      ok: false,
+      message: `agent doctor: unknown flag '${token}' (only --json and --help are accepted)`,
+    };
+  }
+  return {
+    ok: true,
+    args: {
+      prompt: '',
+      json,
+      version: false,
+      help: false,
+      plan: false,
+      listSessions: false,
+      includeSubagents: false,
+      explainPermissions: false,
+      yes: false,
+      doctor: { json },
     },
   };
 };
@@ -744,6 +806,8 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
   if (initParsed !== null) return initParsed;
   const recapParsed = parseRecapSubcommand(argv);
   if (recapParsed !== null) return recapParsed;
+  const doctorParsed = parseDoctorSubcommand(argv);
+  if (doctorParsed !== null) return doctorParsed;
   const permissionParsed = parsePermissionSubcommand(argv);
   if (permissionParsed !== null) return permissionParsed;
   const args: ParsedArgs = {
@@ -1230,4 +1294,5 @@ export const usage = (): string =>
     '  agent --json "what changed in the last commit?" > events.ndjson',
     '  agent --list-sessions --json',
     '  agent --resume last "now refactor the parts you flagged"',
+    '  agent doctor             Health check: platform, sandbox tools, config + data dirs, git',
   ].join('\n');
