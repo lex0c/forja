@@ -15,6 +15,54 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 27: conformance suite — bash adversarial cases (§16.2 minimum)
+
+**Done.** Twenty-seventh slice. First major top-up of the conformance suite since slice 7: adds 25 bash-resolver adversarial cases covering every refusal contract the AST resolver exposes. §16.2 sets a minimum of 25 cases in the bash-adversarial category for GA, and the suite was at zero on that line — only ad-hoc bash cases lived in `capability_resolvers.yaml`. With this slice, the suite grows from **52 → 77 cases** (56% of the §16.2 GA bar of 136), and the bash refusal contract is locked behind explicit YAML pins so a regression in the AST walk / whitelist / hard-refuse list / pipe-to-shell detector fails loudly.
+
+### Why this matters
+
+Slice 6 shipped the bash AST resolver: tree-sitter walks the parse tree against a whitelist; anything outside the whitelist refuses with a stable reason. Slices since have leaned on that resolver as the load-bearing defense against shell escape — every `bash` tool call hits it before any policy gate. But the suite carried only three adversarial bash cases (in `capability_resolvers.yaml`: `dd`, `bash -c`, `curl | sh`), with the rest of the resolver's refusal surface — ~17 hard-refuse commands, ~22 red-flag node types, pipe-to-shell variants, per-command refuses — unverified at the conformance layer. A subtle regression in `RED_FLAG_NODES`, `HARD_REFUSE_COMMANDS`, or `detectPipeToShell` would have passed unit tests (which exist) but slipped past the suite that operators are supposed to use as the engine's behavioral contract.
+
+This slice fixes that. Every refusal path the resolver exposes now has at least one conformance case pinning it.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `tests/conformance/cases/bash_adversarial.yaml` (new, ~430 lines) | 25 adversarial cases distributed across 7 groups: A. hard-refuse commands (8: eval, exec, source, ., trap, set, unset, mkfs.*), B. command substitution + expansions (5: $(), backticks, $((..)), $var, ${var}), C. process substitution + here-docs (2: <(..), <<<), D. control flow + grouping (4: if, for, subshell, compound_statement), E. variable assignment prefix (1: PATH=/tmp cmd), F. pipe-to-shell variants (3: \|bash, \|zsh, \|dash), G. per-command resolver refuses (2: rm-no-target, curl -x proxy). Each case uses `bash.allow: ["*"]` to neutralize policy gating so the assertion isolates the resolver refusal, asserts `kind=deny + resolver_kind=refuse + source_section=resolver-refuse`, and pins the contract via `reason_substring`. |
+
+### Decisions
+
+- **One file per category.** §16.2 lists 11 categories; one YAML file per category keeps the suite navigable (`bash_adversarial.yaml` is distinct from the per-tool resolver cases in `capability_resolvers.yaml`). Future suite top-ups follow the same pattern: a new category gets a new file, not appended to an existing one.
+- **`bash.allow: ["*"]` isolates the resolver refusal.** A restrictive policy would deny via `static-rules` before the resolver even runs, masking which contract is being tested. The permissive baseline forces the resolver to be the load-bearing gate — exactly what the suite is supposed to verify.
+- **`reason_substring` anchors stable contract strings, not full reasons.** The resolver's exact refusal text may evolve (better diagnostics, classification refinements), but the substring patterns are stable invariants: `"command 'eval'"` for hard-refuse, `"command_substitution"` for the red-flag, `"pipe-to-shell"` for the detector, `"rm: missing target"` for per-command. If a future slice rewords reasons, the substring still matches as long as the contract holds.
+- **`unset` and bare `$HOME` pin where the parser actually refuses, not where the resolver author thought.** `unset` is in `HARD_REFUSE_COMMANDS`, but tree-sitter-bash parses it as `unset_command` (a distinct node type) instead of a generic `command` with name=unset, so the refusal fires at the whitelist walk, not the hard-refuse check. The case pins `unset_command` as the actual contract — both paths refuse, and the YAML now documents which one. Same for `$HOME` standalone (red-flag at walk) vs `$HOME/.ssh/id_rsa` (concatenation path → "dynamic content inside string arg"); the suite uses the bare form to lock the cleaner contract.
+- **No duplication with `capability_resolvers.yaml`.** That file already covers `dd` (hard-refuse), `bash -c` (unknown command), and `curl | sh` (pipe-to-shell). The new file picks DIFFERENT exemplars in the same categories (e.g. `mkfs.ext4` for the mkfs.* family, `echo rm | bash` for the bash interpreter variant) rather than restating. The two files complement; together they exhaust the major refusal contracts.
+- **Per-command refuses come from the COMMAND_TABLE handlers, not the whitelist.** `rm` (no target) and `curl -x` (proxy flags) refuse INSIDE `analyzeCommand` — after the walk validates the shape — because the per-command handler decides the command is unusable. These two cases pin those branches, completing the resolver-refuse surface from outermost (walkAst whitelist) to innermost (per-command handler).
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5323 pass / 10 skip / 0 fail** (5333 total across 249 files); 25 new conformance tests on top of slice 26's 5298
+- `bun test tests/conformance/` — 78 pass (52 prior + 25 new + 1 meta-test "at least one case file")
+- Suite coverage now: 77/136 = **56%** of the §16.2 GA bar
+
+### Next
+
+Successor slices on the conformance trail (largest gaps first; each is one slice):
+1. **path_traversal** (~15 cases) — symlink escape, `..`-walk, mount-point break, `/proc/<pid>/cwd` tricks. Existing shape covers (`read_file` / `write_file` with crafted paths).
+2. **score_determinism** (~10 cases) — identical inputs → identical score, ordering invariance, classifier-disabled ceiling. Existing shape covers via `score_gte/lte/components_include`.
+3. **subagent_intersection** (~6 cases) — would require extending `ConformanceCase` shape with `parent_capabilities` + `declared_capabilities` + effective/excess assertions. Heavier slice — schema extension before cases.
+4. **hash_chain** (~8 cases) — would require real audit DB + tampering harness, not the fake sink the current runner uses. Heaviest slice in the queue.
+5. **ttl_expiry** (~6 cases) — needs grants table + time mocks in the runner.
+6. **sandbox_select** (~6 cases) — needs sandbox plan output in the case shape.
+7. **concurrency** (~5 cases) — hardest to express as static YAML; likely a separate driver.
+
+Non-conformance successors still alive from prior slices: macOS sandbox-exec, MCP-tool spawn wire-up, sandbox section-level `locked`, per-field sandbox provenance, ULID-shaped public approval ids.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 26: narrow `deriveParentCapabilities` from `allow_paths` / `allow_hosts` (§10 scope projection)
 
 **Done.** Twenty-sixth slice. Tightens the §10 parent-capability derivation introduced by slice 25. Slice 25 emitted every footprint kind at universal scope (kind-level delegation); slice 26 projects operator-authored `allow_paths` / `allow_hosts` into the parent set so the upper bound for a subagent is **scope-level**, not just kind-level. A subagent declaring `read-fs:/etc/passwd` no longer slips through `intersectCapabilities` just because some `read_file` allow rule exists — the declared scope must lie inside an explicit `allow_paths` entry (or under a universal bash footprint, which the operator opted into by allowing bash at all).

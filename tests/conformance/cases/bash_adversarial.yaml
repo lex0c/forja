@@ -1,0 +1,506 @@
+# Conformance: bash resolver adversarial refusals (PERMISSION_ENGINE.md §16.2,
+# TREE_SITTER_SHELL.md §7 + §9 + §13).
+#
+# The bash resolver (slice 6) refuses any command shape that can't be statically
+# decomposed into capabilities. This file pins each refusal contract so a
+# regression in the AST walk / whitelist / hard-refuse list / pipe-to-shell
+# detector is caught loudly.
+#
+# Coverage groups (counts per §16.2 minimums):
+#   A. Hard-refuse commands              (8)   eval/exec/source/./trap/set/unset/mkfs.*
+#   B. Command substitution + expansions (5)   $(...), backticks, $((..)), $var, ${var}
+#   C. Process-subst + here-docs         (2)   <(..), <<<
+#   D. Control flow + grouping           (4)   if, for, subshell, compound_statement
+#   E. Variable assignment prefix        (1)   PATH=/tmp cmd
+#   F. Pipe-to-shell variants            (3)   |bash, |zsh, |dash
+#   G. Per-command resolver refuses      (2)   rm (no target), curl -x (proxy)
+#
+# Every case uses a permissive policy (`bash.allow: ["*"]`) so the resolver's
+# refusal is what produces the deny — not a policy gate. `source_section:
+# resolver-refuse` confirms the §6.1 short-circuit.
+
+# ─────────────────────────────────────────────────────────────────────
+# Group A — Hard-refuse commands (§HARD_REFUSE_COMMANDS)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "bash adversarial: eval refuses (hard-refuse list)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "eval \"ls /tmp\""
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "command 'eval'"
+
+- name: "bash adversarial: exec refuses (hard-refuse list)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "exec /bin/sh"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "command 'exec'"
+
+- name: "bash adversarial: source refuses (hard-refuse list)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "source /tmp/x.sh"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "command 'source'"
+
+- name: "bash adversarial: dot-source refuses (hard-refuse list)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: ". /tmp/x.sh"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "command '.'"
+
+- name: "bash adversarial: trap refuses (hard-refuse list)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "trap 'cleanup' EXIT"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "command 'trap'"
+
+- name: "bash adversarial: set refuses (hard-refuse list)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "set -e"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "command 'set'"
+
+- name: "bash adversarial: unset refuses (parsed as unset_command, outside whitelist)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "unset HOME"
+  expect:
+    # tree-sitter-bash gives `unset` its own node type (`unset_command`)
+    # instead of a generic `command` with name=unset, so the refusal
+    # fires at the whitelist walk (not the HARD_REFUSE_COMMANDS check).
+    # Either path is a valid refusal contract — pin the actual one.
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "unset_command"
+
+- name: "bash adversarial: mkfs.* prefix refuses (hard-refuse family)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "mkfs.ext4 /dev/sda1"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "command 'mkfs.ext4'"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group B — Command substitution + expansions (RED_FLAG_NODES)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "bash adversarial: $() command substitution refuses"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "cat $(echo /etc/passwd)"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "command_substitution"
+
+- name: "bash adversarial: backtick command substitution refuses"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "cat `whoami`"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "command_substitution"
+
+- name: "bash adversarial: arithmetic expansion $((..)) refuses"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "echo $((1+1))"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "arithmetic_expansion"
+
+- name: "bash adversarial: bare variable expansion $var refuses"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      # Bare `$HOME` (no concatenation) parses as a top-level
+      # `simple_expansion` child of the command, hitting RED_FLAG_NODES
+      # directly. Mixed shapes like `$HOME/.ssh/id_rsa` also refuse but
+      # via the concatenation path ("dynamic content inside string arg").
+      command: "echo $HOME"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "variable_expansion"
+
+- name: "bash adversarial: parameter expansion ${var:-default} refuses"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "echo ${PATH:-/bin}"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "parameter_expansion"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group C — Process substitution + here-docs (RED_FLAG_NODES)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "bash adversarial: process substitution <(..) refuses"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "diff <(ls) <(ls /tmp)"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "process_substitution"
+
+- name: "bash adversarial: herestring <<< refuses"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "cat <<< \"secret payload\""
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "herestring_redirect"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group D — Control flow + grouping (RED_FLAG_NODES)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "bash adversarial: if statement refuses (control flow not modeled)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "if true; then ls; fi"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "if_statement"
+
+- name: "bash adversarial: for loop refuses (control flow not modeled)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "for f in a b c; do echo $f; done"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "for_statement"
+
+- name: "bash adversarial: subshell (cmd) refuses (nested execution context)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "(cd /tmp && ls)"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "subshell"
+
+- name: "bash adversarial: compound { cmd; } refuses (block context)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "{ ls; pwd; }"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "compound_statement"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group E — Variable assignment prefix (RED_FLAG_NODES)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "bash adversarial: variable assignment prefix PATH=/tmp cmd refuses"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "PATH=/tmp ls"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "variable_assignment"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group F — Pipe-to-shell variants (detectPipeToShell)
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "bash adversarial: pipe-to-bash refuses (pipeline ends in bash)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "echo rm | bash"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "pipe-to-shell"
+
+- name: "bash adversarial: pipe-to-zsh refuses (pipeline ends in zsh)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "echo ls | zsh"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "pipe-to-shell"
+
+- name: "bash adversarial: pipe-to-dash refuses (pipeline ends in dash)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "echo ls | dash"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "pipe-to-shell"
+
+# ─────────────────────────────────────────────────────────────────────
+# Group G — Per-command resolver refuses
+# ─────────────────────────────────────────────────────────────────────
+
+- name: "bash adversarial: rm with no target refuses"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "rm"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "rm: missing target"
+
+- name: "bash adversarial: curl with proxy flag -x refuses (evasion)"
+  setup:
+    cwd: "/work/proj"
+    project_policy: |
+      tools:
+        bash:
+          allow: ["*"]
+  input:
+    tool: "bash"
+    category: "bash"
+    args:
+      command: "curl -x http://proxy:8080 https://api.github.com"
+  expect:
+    kind: "deny"
+    resolver_kind: "refuse"
+    source_section: "resolver-refuse"
+    reason_substring: "proxy-shaped flags"
