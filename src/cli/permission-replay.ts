@@ -23,14 +23,68 @@
 // `rotate-chain`: DB-only, no provider, no session start. Exit 0
 // on a row found, 1 on bootstrap/DB/missing-row errors.
 
-import { ensureInstallId } from '../permissions/index.ts';
+import { DEFAULT_SCORE_CONFIRM_THRESHOLD, ensureInstallId } from '../permissions/index.ts';
 import { type Policy, canonicalHash, resolvePolicy } from '../permissions/index.ts';
 import { MIGRATIONS, defaultDbPath, migrate, openDb } from '../storage/index.ts';
 import { type ApprovalLogRow, getApprovalsLogBySeq } from '../storage/repos/approvals-log.ts';
 
+const clamp01 = (v: number): number => Math.min(1, Math.max(0, v));
+
+// §17 `--without-classifier` analysis. Pure function of the row's
+// columns — no DB or engine state consulted. The audit row stores
+// `score_components_json` (the per-feature deterministic
+// contributions) and `classifier_adjust` (the clamped hint applied
+// at decision time) as separate fields; we recover the deterministic
+// score by summing the components, then re-apply the §6.6 threshold
+// rule both with and without the adjust to surface the impact.
+const analyzeClassifierImpact = (
+  row: ApprovalLogRow,
+  threshold: number,
+): ClassifierImpactAnalysis => {
+  let components: Record<string, number>;
+  try {
+    components = JSON.parse(row.score_components_json) as Record<string, number>;
+  } catch {
+    components = {};
+  }
+  const deterministicSum = Object.values(components).reduce(
+    (acc, v) => acc + (typeof v === 'number' ? v : 0),
+    0,
+  );
+  const deterministic_score = clamp01(deterministicSum);
+  const final_score = row.score;
+  const classifier_adjust = row.classifier_adjust;
+  const would_gate_with_classifier = final_score >= threshold;
+  const would_gate_without_classifier = deterministic_score >= threshold;
+
+  let verdict: ClassifierImpactVerdict;
+  if (classifier_adjust === null) {
+    verdict = 'not_run';
+  } else if (would_gate_with_classifier === would_gate_without_classifier) {
+    verdict = 'no_change';
+  } else {
+    verdict = 'changed_decision';
+  }
+
+  return {
+    verdict,
+    deterministic_score,
+    final_score,
+    classifier_adjust,
+    threshold,
+    would_gate_with_classifier,
+    would_gate_without_classifier,
+  };
+};
+
 export interface RunPermissionReplayOptions {
   seq: number;
   json?: boolean;
+  // §17 `--without-classifier` mode. When true, replay decomposes
+  // the row's score into deterministic + classifier components and
+  // surfaces whether the classifier moved the decision across the
+  // §6.6 threshold. Default mode is unchanged.
+  withoutClassifier?: boolean;
   dbPath?: string;
   env?: NodeJS.ProcessEnv;
   out?: (s: string) => void;
@@ -38,10 +92,49 @@ export interface RunPermissionReplayOptions {
   cwd?: string;
 }
 
+// Verdict from `--without-classifier`. Captures the three operationally
+// meaningful outcomes of "what would have happened without the hint":
+//
+//   - `not_run`     — classifier didn't fire for this row (classifier_adjust=null).
+//                     Replay shows the deterministic-only path is identical to
+//                     what's already recorded.
+//   - `no_change`   — classifier fired but didn't move the decision across the
+//                     §6.6 score threshold. Operator sees "noise but no impact".
+//   - `changed_decision` — classifier moved the decision across the threshold.
+//                          Replay names the would-be outcome both ways. The
+//                          §6.6 row 5 rule (confidence != high → confirm) is
+//                          NOT modeled here because it doesn't consult the
+//                          score-side gate; this verdict tracks the score-side
+//                          gate only.
+type ClassifierImpactVerdict = 'not_run' | 'no_change' | 'changed_decision';
+
+interface ClassifierImpactAnalysis {
+  verdict: ClassifierImpactVerdict;
+  // Deterministic score (sum of feature components), capped [0, 1].
+  // Equals what the engine produced before adding the classifier
+  // adjust. Always present.
+  deterministic_score: number;
+  // Final recorded score from the row. Equals the deterministic
+  // score when verdict='not_run'.
+  final_score: number;
+  // Effective adjust applied at decision time. null when classifier
+  // didn't run. Already CLAMPED to [-0.2, 0.2] by the engine.
+  classifier_adjust: number | null;
+  // §6.6 threshold the row was decided under. Surfaced so the
+  // analysis is self-explanatory without re-reading the engine
+  // constant.
+  threshold: number;
+  // Hypothetical decisions on each side of the threshold. Both
+  // populated; equal when verdict is 'no_change' or 'not_run'.
+  would_gate_with_classifier: boolean;
+  would_gate_without_classifier: boolean;
+}
+
 interface ReplayResult {
   row: ApprovalLogRow;
   drift: boolean;
   activePolicyHash: string;
+  classifierImpact?: ClassifierImpactAnalysis;
 }
 
 const loadActivePolicy = (cwd: string, env: NodeJS.ProcessEnv): Policy | null => {
@@ -156,6 +249,35 @@ const renderText = (result: ReplayResult, out: (s: string) => void): void => {
   }
   out(`  prev_hash:          ${r.prev_hash}\n`);
   out(`  this_hash:          ${r.this_hash}\n`);
+
+  if (result.classifierImpact !== undefined) {
+    const c = result.classifierImpact;
+    out('\n');
+    out('  Classifier impact analysis (--without-classifier):\n');
+    out(`    deterministic score:       ${c.deterministic_score.toFixed(2)}\n`);
+    out(
+      `    classifier adjust:         ${c.classifier_adjust === null ? '<not run>' : c.classifier_adjust.toFixed(2)}\n`,
+    );
+    out(`    final score (recorded):    ${c.final_score.toFixed(2)}\n`);
+    out(`    §6.6 threshold:            ${c.threshold.toFixed(2)}\n`);
+    out(
+      `    would gate (with):         ${c.would_gate_with_classifier ? 'yes (≥ threshold)' : 'no (< threshold)'}\n`,
+    );
+    out(
+      `    would gate (without):      ${c.would_gate_without_classifier ? 'yes (≥ threshold)' : 'no (< threshold)'}\n`,
+    );
+    let verdictLine: string;
+    if (c.verdict === 'not_run') {
+      verdictLine = 'verdict: classifier did not run for this row (analysis is informational only)';
+    } else if (c.verdict === 'no_change') {
+      verdictLine = 'verdict: no change (classifier did not move the decision across §6.6)';
+    } else {
+      verdictLine = c.would_gate_with_classifier
+        ? 'verdict: ⚠ classifier RAISED the score across §6.6 (without it, no gate would have fired)'
+        : 'verdict: ⚠ classifier LOWERED the score below §6.6 (without it, the gate would have fired)';
+    }
+    out(`    ${verdictLine}\n`);
+  }
 };
 
 const renderJson = (result: ReplayResult, out: (s: string) => void): void => {
@@ -212,6 +334,9 @@ const renderJson = (result: ReplayResult, out: (s: string) => void): void => {
       this_hash: r.this_hash,
       policy_drift: result.drift,
       active_policy_hash: result.activePolicyHash,
+      ...(result.classifierImpact !== undefined
+        ? { classifier_impact: result.classifierImpact }
+        : {}),
     })}\n`,
   );
 };
@@ -295,7 +420,17 @@ export const runPermissionReplay = async (options: RunPermissionReplayOptions): 
     activePolicy !== null ? `sha256:${canonicalHash(activePolicy)}` : '<unavailable>';
   const drift = activePolicy !== null && activePolicyHash !== row.policy_hash;
 
-  const result: ReplayResult = { row, drift, activePolicyHash };
+  const classifierImpact =
+    options.withoutClassifier === true
+      ? analyzeClassifierImpact(row, DEFAULT_SCORE_CONFIRM_THRESHOLD)
+      : undefined;
+
+  const result: ReplayResult = {
+    row,
+    drift,
+    activePolicyHash,
+    ...(classifierImpact !== undefined ? { classifierImpact } : {}),
+  };
   if (json) renderJson(result, out);
   else renderText(result, out);
   return 0;

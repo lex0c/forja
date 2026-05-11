@@ -209,6 +209,7 @@ export const run = async (options: RunOptions): Promise<number> => {
         return await runPermissionReplay({
           seq,
           json: args.json,
+          ...(args.permission.withoutClassifier === true ? { withoutClassifier: true } : {}),
           ...(options.bootstrapOverride?.dbPath !== undefined
             ? { dbPath: options.bootstrapOverride.dbPath }
             : {}),

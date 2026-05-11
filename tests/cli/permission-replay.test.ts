@@ -79,6 +79,31 @@ describe('parseArgs — permission replay', () => {
       expect(r.message).toContain('replay');
     }
   });
+
+  test('--without-classifier flag flows through replay parse', () => {
+    const r = parseArgs(['permission', 'replay', '42', '--without-classifier']);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.args.permission?.verb).toBe('replay');
+      expect(r.args.permission?.withoutClassifier).toBe(true);
+    }
+  });
+
+  test('--without-classifier on verify fails parse (§17 mode is replay-only)', () => {
+    const r = parseArgs(['permission', 'verify', '--without-classifier']);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.message).toContain('--without-classifier only applies to');
+    }
+  });
+
+  test('default parse leaves withoutClassifier undefined', () => {
+    const r = parseArgs(['permission', 'replay', '42']);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.args.permission?.withoutClassifier).toBeUndefined();
+    }
+  });
 });
 
 describe('runPermissionReplay', () => {
@@ -318,5 +343,200 @@ describe('runPermissionReplay', () => {
     // Replay swallows the policy error and reports the row.
     expect(out.lines.join('')).toContain(`Replay approval seq=${seq}`);
     expect(out.lines.join('')).toContain('active policy unavailable');
+  });
+});
+
+describe('runPermissionReplay — --without-classifier analysis', () => {
+  let tmp: string;
+  let dbPath: string;
+  let env: NodeJS.ProcessEnv;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'forja-replay-wc-'));
+    dbPath = join(tmp, 'sessions.db');
+    env = { HOME: tmp };
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // Seed a row with explicit score + components + classifier_adjust
+  // so the analysis math is verifiable. The §6.6 threshold is 0.40.
+  const seedScoredRow = (params: {
+    components: Record<string, number>;
+    classifierAdjust: number | null;
+  }): number => {
+    const identity = ensureInstallId({ env });
+    const db = openDb(dbPath);
+    migrate(db, MIGRATIONS);
+    const sink = createSqliteSink({ db, identity });
+    const deterministic = Math.min(
+      1,
+      Math.max(
+        0,
+        Object.values(params.components).reduce((acc, v) => acc + v, 0),
+      ),
+    );
+    const finalScore =
+      params.classifierAdjust === null
+        ? deterministic
+        : Math.min(1, Math.max(0, deterministic + params.classifierAdjust));
+    const r = sink.emit({
+      session_id: 'sess',
+      tool_name: 'bash',
+      args: { command: 'x' },
+      decision: 'allow',
+      policy_hash: 'sha256:fixture',
+      reason_chain: [{ stage: 'engine-default' }],
+      capabilities: [],
+      score: finalScore,
+      score_components: params.components,
+      confidence: 'high',
+      classifier_hash: params.classifierAdjust === null ? null : 'v1',
+      classifier_adjust: params.classifierAdjust,
+      ts: 1,
+    });
+    db.close();
+    return r.seq;
+  };
+
+  test("verdict 'not_run' when classifier_adjust is null", async () => {
+    const seq = seedScoredRow({
+      components: { capability_risk: 0.4 },
+      classifierAdjust: null,
+    });
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      withoutClassifier: true,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('Classifier impact analysis');
+    expect(text).toContain('classifier did not run');
+  });
+
+  test("verdict 'no_change' when classifier adjust does not cross threshold", async () => {
+    // Deterministic score 0.50 (above threshold), classifier adjusts
+    // -0.05 → final 0.45. Both still gate. Verdict: no change.
+    const seq = seedScoredRow({
+      components: { capability_risk: 0.4, mcp_tool: 0.1 },
+      classifierAdjust: -0.05,
+    });
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      withoutClassifier: true,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('no change');
+  });
+
+  test("verdict 'changed_decision' when classifier LOWERED below threshold", async () => {
+    // Deterministic 0.50 (above 0.40), classifier -0.15 → final 0.35
+    // (below 0.40). Without classifier, the score-gate WOULD have
+    // fired. With classifier, it did NOT.
+    const seq = seedScoredRow({
+      components: { capability_risk: 0.4, mcp_tool: 0.1 },
+      classifierAdjust: -0.15,
+    });
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      withoutClassifier: true,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('classifier LOWERED');
+    expect(text).toContain('without it, the gate would have fired');
+  });
+
+  test("verdict 'changed_decision' when classifier RAISED above threshold", async () => {
+    // Deterministic 0.30 (below 0.40), classifier +0.15 → final 0.45
+    // (above 0.40). Classifier raised the score across the gate.
+    const seq = seedScoredRow({
+      components: { capability_risk: 0.3 },
+      classifierAdjust: 0.15,
+    });
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      withoutClassifier: true,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const text = out.lines.join('');
+    expect(text).toContain('classifier RAISED');
+    expect(text).toContain('without it, no gate would have fired');
+  });
+
+  test('JSON output includes classifier_impact sub-object', async () => {
+    // Same shape as the 'no_change' verdict above: deterministic
+    // 0.50 (above threshold), classifier -0.05 → final 0.45 (still
+    // above). Both gate; verdict 'no_change'.
+    const seq = seedScoredRow({
+      components: { capability_risk: 0.4, mcp_tool: 0.1 },
+      classifierAdjust: -0.05,
+    });
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      withoutClassifier: true,
+      json: true,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    const obj = JSON.parse(out.lines[0] as string) as Record<string, unknown>;
+    const impact = obj.classifier_impact as Record<string, unknown>;
+    expect(impact).toBeDefined();
+    expect(impact.verdict).toBe('no_change');
+    expect(impact.threshold).toBe(0.4);
+    expect(impact.classifier_adjust).toBe(-0.05);
+    expect(typeof impact.deterministic_score).toBe('number');
+    expect(typeof impact.would_gate_with_classifier).toBe('boolean');
+    expect(typeof impact.would_gate_without_classifier).toBe('boolean');
+  });
+
+  test('default replay (no flag) omits classifier_impact', async () => {
+    const seq = seedScoredRow({
+      components: { capability_risk: 0.4 },
+      classifierAdjust: -0.05,
+    });
+    const out = captured();
+    const code = await runPermissionReplay({
+      seq,
+      dbPath,
+      env,
+      cwd: tmp,
+      out: out.write,
+      err: captured().write,
+    });
+    expect(code).toBe(0);
+    expect(out.lines.join('')).not.toContain('Classifier impact analysis');
   });
 });

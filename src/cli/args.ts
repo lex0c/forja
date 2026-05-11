@@ -218,7 +218,16 @@ export interface ParsedArgs {
   //                      chain (§7.2). `--reason` is captured into the
   //                      `chain_meta.reason` column for forensics.
   // Future slices add 'replay', 'revoke', 'list', 'test'.
-  permission?: { verb: string; positionals: string[]; reason?: string };
+  permission?: {
+    verb: string;
+    positionals: string[];
+    reason?: string;
+    // `agent permission replay <seq> --without-classifier` (§17 mode).
+    // Hint-only-impact analysis: split the row's deterministic score
+    // from the classifier adjust and report whether the classifier
+    // moved the decision across the §6.6 threshold.
+    withoutClassifier?: boolean;
+  };
 }
 
 export interface ParseError {
@@ -470,6 +479,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
   }
   let json = false;
   let reason: string | undefined;
+  let withoutClassifier = false;
   const positionals: string[] = [];
   for (let i = 2; i < argv.length; i += 1) {
     const token = argv[i];
@@ -506,7 +516,17 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       i += 1;
       continue;
     }
+    if (token === '--without-classifier') {
+      withoutClassifier = true;
+      continue;
+    }
     positionals.push(token);
+  }
+  if (withoutClassifier && verb !== 'replay') {
+    return {
+      ok: false,
+      message: `agent permission ${verb}: --without-classifier only applies to 'replay'`,
+    };
   }
   if (verb === 'rotate-chain') {
     if (reason === undefined || reason.trim().length === 0) {
@@ -555,7 +575,12 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       includeSubagents: false,
       explainPermissions: false,
       yes: false,
-      permission: { verb, positionals, ...(reason !== undefined ? { reason } : {}) },
+      permission: {
+        verb,
+        positionals,
+        ...(reason !== undefined ? { reason } : {}),
+        ...(withoutClassifier ? { withoutClassifier: true } : {}),
+      },
     },
   };
 };

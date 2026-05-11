@@ -15,6 +15,71 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 14: replay `--without-classifier` (§17)
+
+**Done.** Fourteenth slice of the v2 evolution. Lands the second of the three §17 replay modes: `agent permission replay <seq> --without-classifier` decomposes the row's score into deterministic (sum of feature components) + classifier adjust, re-applies the §6.6 threshold rule both ways, and reports whether the classifier moved the decision across the gate.
+
+Pure analysis — no re-execution, no engine bootstrap, no policy load. The audit row already carries every input the analysis needs as separate columns (`score`, `score_components_json`, `classifier_adjust`).
+
+### Why this mode lands before `--against-current-policy`
+
+The two deferred modes both require infrastructure this slice deliberately doesn't add:
+
+- `--against-current-policy` needs the ORIGINAL policy bytes (slice 13's `policy_archive` ✓) AND the raw tool args (no current path persists them past the session — `approvals_log` only has `args_hash`). Without args, the decision pipeline's resolver + static-rule branches can't run deterministically.
+- `agent permission diff <id1> <id2>` is structurally the same as `--against-current-policy` but with two archived rows on each side; same args prerequisite.
+
+`--without-classifier` answers a real operator question — "did the classifier's hint change the decision on this call?" — using only data already on the row. Spec §6.4 mandates the classifier as hint-only (clamped ±0.2); this mode makes that property auditable per-call.
+
+### Verdicts
+
+The analysis produces one of three verdicts, surfaced both in text + JSON output:
+
+| Verdict | Trigger | Operator interpretation |
+|---|---|---|
+| `not_run` | `classifier_adjust IS NULL` | Classifier didn't fire for this row (no model wired, or row predates classifier landing). Analysis is informational only — the deterministic score equals the recorded score. |
+| `no_change` | `final_score` and `deterministic_score` are on the SAME side of the §6.6 threshold | Classifier moved the score but didn't cross the gate. Hint is noise on this call. |
+| `changed_decision` | The two scores are on OPPOSITE sides of the threshold | Classifier flipped the §6.6 outcome. Sub-direction reported in the text output: `RAISED` (classifier pushed across) vs `LOWERED` (classifier pulled below). |
+
+The §6.6 row 5 rule ("confidence != high → confirm") is NOT modeled — it doesn't consult the score-side gate, and replay can't recover what the resolver's confidence WOULD have been without the classifier (the resolver's confidence is upstream of scoring). This mode covers the score-side gate only; documented in the impact analysis comment.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/args.ts` | `ParsedArgs.permission` gains `withoutClassifier?: boolean`. Parser accepts `--without-classifier` (presence-only flag). Rejected when paired with a non-`replay` verb so the operator gets a clean error rather than silent drop. |
+| `src/cli/permission-replay.ts` | New `RunPermissionReplayOptions.withoutClassifier?: boolean`. `ClassifierImpactAnalysis` interface captures the verdict + the four signed numbers operators want to see (deterministic_score, final_score, classifier_adjust, threshold) + the two boolean would-gate sides. Pure `analyzeClassifierImpact(row, threshold)` function. Text render adds a block; JSON render embeds the analysis as a sub-object when present. |
+| `src/cli/run.ts` | Threads `withoutClassifier` through to `runPermissionReplay`. |
+| `src/permissions/index.ts` | Re-exports `DEFAULT_SCORE_CONFIRM_THRESHOLD` so the replay handler reads the same constant the engine enforces. |
+| `tests/cli/permission-replay.test.ts` | 9 new tests — parse (flag flows; --without-classifier on `verify` rejected; default omits the field) + 6 analysis tests (not_run; no_change; changed_decision LOWERED; changed_decision RAISED; JSON includes the impact sub-object; default mode omits the impact). |
+
+### Decisions
+
+- **Clamp the deterministic sum to [0, 1] same as the engine.** A row whose components sum to 1.05 (multiple high-weight features overlapping) still hits the cap; without the clamp, the replay's "deterministic" score would render >1.0 and contradict the engine's actual behavior.
+- **Threshold sourced from the engine constant, not from the row.** `DEFAULT_SCORE_CONFIRM_THRESHOLD` is what the engine uses today. A future calibration sweep that re-derives the value will affect new rows; old rows replayed under the new threshold show the analysis "under TODAY's threshold". Documented so the operator isn't confused if a re-replay months later reports a different verdict from the original audit reasoning. The threshold is surfaced in the JSON output as `classifier_impact.threshold` for explicit grounding.
+- **Verdict captures the score-side gate ONLY.** The §6.6 approval-gate has two disjuncts: score ≥ threshold OR confidence != high. The score-side is what the classifier can move; the confidence-side is determined by the resolver upstream and the classifier can't affect it. Modeling both would require speculating about a counterfactual resolver state — out of scope. The mode is honest about its scope in the comment + JSON shape.
+- **JSON output ALWAYS includes the four numbers + booleans even when verdict is `not_run`.** Operators piping into jq for analysis want the deterministic_score (= final_score in this case) and threshold uniformly available; conditionally omitting them would force a `null`-check on every field.
+- **The flag rejects when combined with non-replay verbs.** Operator error visibility — `agent permission verify --without-classifier` is meaningless; surface that at parse instead of letting the flag drop silently into the unused-token bucket.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5195 pass / 10 skip / 0 fail** (5205 total across 245 files)
+
+### Next
+
+Successor slices (still in spec order):
+1. `tool_calls` linkage to `approvals_log` (FK or args-hash join) — prerequisite for re-execution modes.
+2. Replay `--against-current-policy` mode — consumes `policy_archive` + raw args from `tool_calls`.
+3. `agent permission diff <id1> <id2>` — consumes `policy_archive` for both ids.
+4. Sandbox runner — synthesize bwrap argv from the chosen profile + wrap every tool spawn (§6.5 enforcement).
+5. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
+6. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
+7. `--accept-broken-chain` operator override (§7.2 second flag — surface exists; the runtime override flag needs its own slice).
+8. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 13: policy_archive table (§17 prerequisite)
 
 **Done.** Thirteenth slice of the v2 evolution. Pure plumbing: adds the `policy_archive` table the spec §17 references ("`policy_hash` (lookup em `policy_archive`)") but never schema'd. Bootstrap now writes one row per engine boot snapshotting the canonical policy bytes. No user-visible behavior change; replay still only compares hashes today. The slice unlocks the next three deferred §17 modes — `--against-current-policy`, `--without-classifier`, `permission diff <id1> <id2>` — which all need the original policy bytes to re-execute deterministically.

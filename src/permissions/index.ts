@@ -24,7 +24,7 @@ export {
 } from './matcher.ts';
 
 export type { EngineOptions, PermissionEngine, ToolArgs } from './engine.ts';
-export { createPermissionEngine } from './engine.ts';
+export { DEFAULT_SCORE_CONFIRM_THRESHOLD, createPermissionEngine } from './engine.ts';
 
 export {
   defaultPolicy,
