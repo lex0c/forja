@@ -44,6 +44,19 @@ export type {
 export { computeGenesisHash, createNoopSink, createSqliteSink } from './audit.ts';
 
 export type {
+  SandboxAvailability,
+  DetectSandboxAvailabilityOptions,
+} from './sandbox-availability.ts';
+export { detectSandboxAvailability } from './sandbox-availability.ts';
+
+export type {
+  SandboxProfile,
+  SelectSandboxProfileOptions,
+  SelectSandboxProfileResult,
+} from './sandbox-plan.ts';
+export { SANDBOX_PROFILE_ORDER, selectSandboxProfile } from './sandbox-plan.ts';
+
+export type {
   BootstrapPermissionEngineInput,
   BootstrapPermissionEngineResult,
   PreflightInput,

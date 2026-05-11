@@ -28,6 +28,7 @@ import {
   computeRiskScore,
   defaultIsMcpTool,
 } from './risk-score.ts';
+import { type SelectSandboxProfileResult, selectSandboxProfile } from './sandbox-plan.ts';
 import {
   type EngineState,
   type StateController,
@@ -130,6 +131,29 @@ export interface EngineOptions {
   // re-derives the value; the knob exists so a redeployment can ship
   // the new constant without rebuilding the engine module.
   scoreConfirmThreshold?: number;
+  // Sandbox planning inputs (PERMISSION_ENGINE.md §6.5). Optional —
+  // when omitted, the sandbox-plan stage is skipped entirely (legacy
+  // path; engine.check() never refuses for `no_viable_sandbox` and
+  // never populates the audit row's sandbox_profile column).
+  //
+  //   - `available`: whether the host has bwrap / sandbox-exec
+  //     present (see `detectSandboxAvailability`). When false AND
+  //     `required` is true, the bootstrap is expected to transition
+  //     the engine to `refusing`; in lenient mode the bootstrap
+  //     transitions to `degraded` instead.
+  //   - `hostExplicitlyAllowed`: operator passed the `--sandbox-host`
+  //     flag at the CLI. Without it, the `host` profile is removed
+  //     from the candidate set even when the resolved capabilities
+  //     would otherwise admit it. Defense against accidental
+  //     passthrough.
+  //   - `required`: policy demands a viable sandbox plan; when no
+  //     profile covers, refuse the call AND (at bootstrap) refuse
+  //     the engine if availability is false. Default false.
+  sandbox?: {
+    available: boolean;
+    hostExplicitlyAllowed: boolean;
+    required: boolean;
+  };
 }
 
 // §6.6 baseline. Sourced here (not inlined at the call site) so
@@ -751,6 +775,22 @@ const approvalGateStageEntry = (
   return undefined;
 };
 
+// Reason-chain entry tagged `sandbox-plan` (PERMISSION_ENGINE.md §6.5).
+// Fires every time the sandbox planner runs — for both ok (chosen
+// profile recorded) and refuse (uncovered capability kinds named)
+// outcomes. Lets `/perms why` render "this call needed delete-fs +
+// net-egress but no profile permits both" without re-running the
+// planner.
+const sandboxPlanStageEntry = (result: SelectSandboxProfileResult): ReasonChainEntry => {
+  if (result.kind === 'ok') {
+    return { stage: 'sandbox-plan', note: `profile=${result.profile}` };
+  }
+  return {
+    stage: 'sandbox-plan',
+    note: `${result.reason} (uncovered: ${result.uncovered.join(', ')})`,
+  };
+};
+
 const reasonChainFor = (decision: Decision): ReasonChainEntry[] => {
   let stage: string;
   if (decision.source?.section === 'protected') {
@@ -803,6 +843,7 @@ export const createPermissionEngine = (
   // §6.6 score threshold. Caller can override for calibration sweeps
   // or per-deployment tuning; default is the v2 baseline (0.4).
   const scoreConfirmThreshold = options.scoreConfirmThreshold ?? DEFAULT_SCORE_CONFIRM_THRESHOLD;
+  const sandboxOptions = options.sandbox;
   // policy_hash is stamped on every audit row. Computed ONCE at
   // construction — the policy doesn't change for an engine
   // instance (hot reload is a separate slice that builds a new
@@ -828,6 +869,7 @@ export const createPermissionEngine = (
     scoreComponents: Record<string, number>,
     classifierAdjust: number | null,
     extraStages: readonly ReasonChainEntry[] = [],
+    sandboxProfileForRow: string | null = null,
   ): void => {
     const chain = reasonChainFor(decision);
     if (score > 0) {
@@ -860,6 +902,12 @@ export const createPermissionEngine = (
       // forensically distinct from "consulted but returned 0".
       classifier_hash: classifierHash,
       classifier_adjust: classifierAdjust,
+      // §6.5 chosen profile. Null when the sandbox planner didn't
+      // run (no EngineOptions.sandbox) OR when the call refused
+      // before it reached the planner. A `sandbox-plan` reason-
+      // chain entry pairs with this column on every row where the
+      // planner ran (success or refusal).
+      sandbox_profile: sandboxProfileForRow,
     };
     audit.emit(input);
   };
@@ -996,6 +1044,62 @@ export const createPermissionEngine = (
         };
       }
     }
+    // Sandbox plan stage (PERMISSION_ENGINE.md §6.5). Runs AFTER the
+    // classifier hint and BEFORE the bypass / static-rule branches.
+    // Optional — wired only when the caller passed `EngineOptions
+    // .sandbox`. When absent, the audit row's `sandbox_profile`
+    // stays null and the reason chain has no `sandbox-plan` entry
+    // (legacy callers / harness paths that don't yet snapshot
+    // sandbox availability skip the stage cleanly).
+    //
+    // Refusal cases:
+    //   - no_viable_sandbox → deny outright with
+    //     `source.section='sandbox-plan'`. Bypass mode does NOT
+    //     override this: a call whose resolved capabilities admit
+    //     no sandbox profile is a structural rejection, not a
+    //     policy decision.
+    //   - sandbox unavailable + required → already handled at the
+    //     bootstrap layer (engine never reaches `ready`); per-call
+    //     check sees the engine in `refusing` state and short-
+    //     circuits via the state-rejecting branch above.
+    //   - sandbox unavailable + lenient → handled at the bootstrap
+    //     layer too (engine transitions to `degraded`); per-call
+    //     check still runs the planner and may still pick a profile
+    //     (the planner doesn't itself care about availability —
+    //     that's a runner-side concern).
+    let sandboxProfile: string | null = null;
+    let sandboxStage: ReasonChainEntry | null = null;
+    if (sandboxOptions !== undefined) {
+      const planResult = selectSandboxProfile({
+        capabilities: resolvedCapabilities,
+        hostExplicitlyAllowed: sandboxOptions.hostExplicitlyAllowed,
+      });
+      sandboxStage = sandboxPlanStageEntry(planResult);
+      if (planResult.kind === 'refuse') {
+        const decision: Decision = {
+          kind: 'deny',
+          reason: `sandbox plan refused: ${planResult.reason} (uncovered: ${planResult.uncovered.join(', ')})`,
+          source: { layer: 'default', section: 'sandbox-plan' },
+        };
+        const stages: ReasonChainEntry[] = [];
+        if (classifierStage !== null) stages.push(classifierStage);
+        stages.push(sandboxStage);
+        emitAudit(
+          toolName,
+          args,
+          decision,
+          resolvedCapabilities,
+          score,
+          scoreComponents,
+          classifierAdjust,
+          stages,
+          /* sandbox_profile= */ null,
+        );
+        return decision;
+      }
+      sandboxProfile = planResult.profile;
+    }
+
     // What forces a `confirm` upgrade after the normal pipeline:
     //   - Conservative outcome (the resolver couldn't pin a precise
     //     set; the operator deserves the modal).
@@ -1035,6 +1139,7 @@ export const createPermissionEngine = (
       const upgraded = currentState === 'degraded' ? degradeAllowToConfirm(baseAllow) : baseAllow;
       const stages: ReasonChainEntry[] = [];
       if (classifierStage !== null) stages.push(classifierStage);
+      if (sandboxStage !== null) stages.push(sandboxStage);
       const degradedStage = degradedStageEntry(currentState);
       if (degradedStage !== undefined) stages.push(degradedStage);
       emitAudit(
@@ -1046,6 +1151,7 @@ export const createPermissionEngine = (
         scoreComponents,
         classifierAdjust,
         stages,
+        sandboxProfile,
       );
       return upgraded;
     }
@@ -1170,6 +1276,7 @@ export const createPermissionEngine = (
     }
     const stages: ReasonChainEntry[] = [];
     if (classifierStage !== null) stages.push(classifierStage);
+    if (sandboxStage !== null) stages.push(sandboxStage);
     // Tail attribution: prefer the most specific cause. degraded
     // beats everything (it's a system-health signal); resolver-
     // forced beats score-gating (resolver outcome is more precise
@@ -1193,6 +1300,7 @@ export const createPermissionEngine = (
       scoreComponents,
       classifierAdjust,
       stages,
+      sandboxProfile,
     );
     return decision;
   };

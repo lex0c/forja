@@ -54,6 +54,17 @@ export interface BootstrapPermissionEngineInput {
   // accepting new decisions, so retrospective audits see the
   // operator's authorization on the chain itself.
   acceptBrokenChain?: boolean;
+  // Sandbox-plan inputs (PERMISSION_ENGINE.md §6.5). When provided,
+  // the engine's check() runs the §6.5 planner and refuses on
+  // `no_viable_sandbox`; when omitted, the stage is skipped (legacy
+  // path). The bootstrap probes `bwrap` / `sandbox-exec`
+  // availability and forwards the result here; CLI's
+  // `--sandbox-host` flag flows into `hostExplicitlyAllowed`.
+  sandbox?: {
+    available: boolean;
+    hostExplicitlyAllowed: boolean;
+    required: boolean;
+  };
   // Test seams for policy discovery.
   enterprisePath?: string | null;
   userPath?: string | null;
@@ -256,6 +267,13 @@ export const bootstrapPermissionEngine = async (
     emitChainBreakAcceptedRow(sink, input.sessionId, policyHash, chain);
   }
 
+  // §6.5: sandbox availability + the operator's host flag flow into
+  // the engine's planner. When `sandbox.required` is true AND the
+  // host has no sandboxing tool, the engine never reaches `ready` —
+  // we transition straight to refusing with a forensic reason. When
+  // lenient, the bootstrap transitions to `degraded` instead so
+  // `check()` keeps running but every would-be allow becomes confirm.
+  const sandbox = input.sandbox;
   const engine = createPermissionEngine(resolveResult.policy, {
     cwd: input.cwd,
     home,
@@ -263,15 +281,24 @@ export const bootstrapPermissionEngine = async (
     audit: sink,
     sessionId: input.sessionId,
     stateController: controller,
+    ...(sandbox !== undefined ? { sandbox } : {}),
   });
 
-  controller.transition('ready', chain.ok ? 'chain_intact' : 'chain_break_accepted');
+  if (sandbox !== undefined && !sandbox.available) {
+    if (sandbox.required) {
+      controller.transition('refusing', 'sandbox_required_but_unavailable');
+    } else {
+      controller.transition('degraded', 'sandbox_unavailable');
+    }
+  } else {
+    controller.transition('ready', chain.ok ? 'chain_intact' : 'chain_break_accepted');
+  }
 
   return {
     engine,
     identity,
     sink,
-    state: 'ready',
+    state: controller.get(),
     events,
     policy: resolveResult.policy,
     layers: resolveResult.layers,
@@ -279,6 +306,9 @@ export const bootstrapPermissionEngine = async (
     lockConflicts: resolveResult.lockConflicts,
     provenance: resolveResult.provenance,
     chain,
+    ...(sandbox !== undefined && !sandbox.available && sandbox.required
+      ? { refusingReason: 'sandbox_required_but_unavailable' }
+      : {}),
   };
 };
 

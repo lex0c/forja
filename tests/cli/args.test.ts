@@ -934,4 +934,18 @@ describe('parseArgs — recap subcommand', () => {
     if (r.ok) return;
     expect(r.message).toContain('--model requires a value');
   });
+
+  test('--sandbox-host is a presence-only flag (slice 10 §6.5)', () => {
+    const r = parseArgs(['--sandbox-host']);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.sandboxHost).toBe(true);
+  });
+
+  test('--sandbox-host absent leaves the field undefined (default off)', () => {
+    const r = parseArgs([]);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.args.sandboxHost).toBeUndefined();
+  });
 });

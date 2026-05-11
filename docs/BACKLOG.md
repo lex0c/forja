@@ -15,6 +15,79 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 10: sandbox plan (§6.5)
+
+**Done.** Tenth slice of the v2 evolution. Lands the §6.5 sandbox PLANNING step: given a resolved capability set, pick the most restrictive viable profile from `{ro, cwd-rw, cwd-rw-net, home-rw, host}` (or refuse with `no_viable_sandbox`). The chosen profile flows into the audit row's `sandbox_profile` column and a `sandbox-plan` reason-chain entry; refusals deny with `source.section='sandbox-plan'`. Operator opts into the `host` fallback via `--sandbox-host`. Bootstrap probes `bwrap` / `sandbox-exec` availability; an unavailable + `required` sandbox transitions the engine straight to `refusing` at bootstrap, while unavailable + lenient transitions to `degraded`.
+
+### Scope decision: planning, not enforcement
+
+This slice ships the PLAN (which profile + audit + state transitions). The actual ENFORCEMENT (synthesizing bwrap argv, loading nftables rules, wrapping every tool spawn) is a separate slice. Spec §6.5 is the planning algorithm; the runner is downstream. Separating the two keeps the audit-row shape stable across the enforcement landing — postmortem queries against the `sandbox_profile` column already work today.
+
+### Spec invariants this slice respects (§6.5)
+
+- **Algorithm**: candidates = profiles whose `allowed_capabilities` cover every resolved kind; if empty → refuse; if `host` AND another → drop host (last resort); tie-break by fixed `[ro, cwd-rw, cwd-rw-net, home-rw, host]` order.
+- **Host gates**: `--sandbox-host` flag at the CLI **and** a `host-passthrough` capability in the resolved set. Either missing prunes host from the candidate pool.
+- **Sandbox unavailable**: `bwrap`/`sandbox-exec` absent triggers engine state transition — `refusing` if policy says `sandbox.required: true`, `degraded` otherwise. Bootstrap owns the transition; per-call `check()` sees the state and either short-circuits (refusing) or forces confirm on would-be allows (degraded).
+
+### Coverage table (`PROFILE_ALLOWED_CAPABILITIES`)
+
+| Profile | read-fs | write-fs | delete-fs | exec | git-write | net-egress | net-ingress | secret-access | env-mutate | agent-mutate | host-passthrough |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `ro` | ✓ | | | ✓ | | | | | | | |
+| `cwd-rw` | ✓ | ✓ | ✓ | ✓ | ✓ | | | | | | |
+| `cwd-rw-net` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | | | | | |
+| `home-rw` | ✓ | ✓ | ✓ | ✓ | ✓ | | | ✓ | | | |
+| `host` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+Notes:
+- All profiles allow `read-fs` + `exec` (sandbox doesn't take exec away, it scopes the process the exec produces).
+- `secret-access` requires `home-rw` or `host` — secrets live under `$HOME` (`~/.config/agent/secrets`), maps onto spec's "secret paths hidden EXCEPT if capability authorized".
+- `env-mutate` + `agent-mutate` + `host-passthrough` are host-only — they mutate state the parent process cares about.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/sandbox-plan.ts` (new) | `SandboxProfile` type, `SANDBOX_PROFILE_ORDER` exported, `PROFILE_ALLOWED_CAPABILITIES` table, `selectSandboxProfile({ capabilities, hostExplicitlyAllowed })` returns `{ kind: 'ok', profile } \| { kind: 'refuse', reason: 'no_viable_sandbox', uncovered }`. Pure function, no I/O. |
+| `src/permissions/sandbox-availability.ts` (new) | `detectSandboxAvailability({ platform?, which? })` probes `bwrap` (Linux) / `sandbox-exec` (macOS); returns `{ available, tool, reason }`. Windows always unavailable. Probe is platform-gated so a future WSL bwrap shim doesn't accidentally count on the Windows branch. |
+| `src/permissions/engine.ts` | `EngineOptions.sandbox?: { available, hostExplicitlyAllowed, required }`. New `sandboxPlanStageEntry()` reason-chain helper. `check()` runs the planner after the classifier, before bypass/static-rule branches. Refusal → deny with `source.section='sandbox-plan'`. `emitAudit` gains a `sandbox_profile` parameter (default null) propagated through every emit site; bypass branch and final emit pass the chosen profile. |
+| `src/permissions/bootstrap-engine.ts` | Input gains optional `sandbox`. When provided + `available: false` + `required: true` → transition `controller` directly to `refusing` with reason `sandbox_required_but_unavailable`. Lenient mode (`required: false` + unavailable) → `degraded` with reason `sandbox_unavailable`. `BootstrapPermissionEngineResult.state` now reads from the controller post-transition (was hardcoded to `'ready'`); `refusingReason` is populated for the required-but-unavailable case. |
+| `src/permissions/index.ts` | Re-exports `SandboxAvailability` + `DetectSandboxAvailabilityOptions` + `detectSandboxAvailability` and `SandboxProfile` + `SelectSandboxProfileOptions` + `SelectSandboxProfileResult` + `SANDBOX_PROFILE_ORDER` + `selectSandboxProfile`. |
+| `src/cli/args.ts` | New `--sandbox-host` presence-only flag → `args.sandboxHost?: boolean`. Captured alongside `--accept-broken-chain`. |
+| `src/cli/bootstrap.ts` | Probes `detectSandboxAvailability()` once at boot; threads result + `input.sandboxHost` into `bootstrapPermissionEngine`'s sandbox input. Policy-level `sandbox.required` defaults to false (policy section comes in a later slice). |
+| `src/cli/run.ts` | Forwards `args.sandboxHost` into `BootstrapInput`. |
+| `tests/permissions/sandbox-plan.test.ts` (new) | 18 tests covering: empty cap set → ro; per-kind escalation; host gates (flag without cap, cap without flag, both); host-is-last-resort (host pruned when alternative exists); tie-break is leftmost wins; uncovered list on refusal. |
+| `tests/permissions/sandbox-availability.test.ts` (new) | 7 tests: linux happy/missing, darwin happy/missing, windows unavailable, windows doesn't even probe `which`, unknown platforms unavailable. |
+| `tests/permissions/engine.test.ts` | New describe block — 5 tests: option omitted skips stage; read-only call lands ro + stage; write call lands cwd-rw; deny attribution path documented; bypass mode still emits sandbox-plan stage. |
+| `tests/cli/args.test.ts` | 2 tests: `--sandbox-host` presence-only true; absent → undefined. |
+
+### Decisions
+
+- **Planning only, enforcement deferred.** The slice's contract is "the audit row says which profile WOULD apply." Real sandboxing of tool processes is a separate concern wired into the tool dispatcher — the planner gives that future slice everything it needs. Audit consumers (replay, postmortem) work today against the populated column.
+- **`secret-access` requires `home-rw` or `host`.** Spec §6.5 says home-rw hides secrets "EXCEPT if capability autorizou"; modeled here as `home-rw.allowed_capabilities` including `secret-access`. The two cwd-rw profiles do NOT — secrets live above cwd. Operationally aligns with `~/.config/agent/secrets` placement.
+- **Host gates are AND, not OR.** Spec literal: "host exige flag explícito do user **e** capability `host-passthrough` allowed em policy. Sem ambos → deny". Implemented at the planner layer (prune host from candidates if either gate fails) — defense in depth: even if policy mistakenly grants host-passthrough, the absence of the CLI flag stops accidental passthrough.
+- **Bootstrap owns the unavailable transition.** Per-call `check()` doesn't second-guess availability; if the engine reached `ready`, the runner side (later slice) deals with bwrap-not-on-PATH at exec time. This keeps `check()` deterministic and the state-machine the single arbiter of "is this engine even usable".
+- **`refusingReason` only populated for required+unavailable.** Other refusing transitions (chain break, policy invalid) own their own reason strings; sandbox layers on without overwriting them. The `BootstrapPermissionEngineResult.state` change from hardcoded `'ready'` to `controller.get()` lets every future bootstrap-time transition flow through automatically.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5138 pass / 10 skip / 0 fail** (5148 total across 242 files)
+
+### Next
+
+Successor slices (still in spec order):
+1. Context-summary builder for the classifier input.
+2. Replay tool (`agent permission replay`).
+3. Sandbox runner — synthesize bwrap argv from the chosen profile + wrap every tool spawn (the §6.5 enforcement side).
+4. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 wire-up automation).
+5. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
+6. `--accept-broken-chain` operator override (§7.2 second flag).
+7. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+
+---
+
 ## [2026-05-10] permission-engine-v2 — slice 9: subagent intersection formal (§10)
 
 **Done.** Ninth slice of the v2 evolution. Implements the spec §10.1 capability inheritance rule `effective_caps = parent_caps ∩ declared_caps`. The new `capabilityCovers` primitive answers "does this parent capability subsume this child capability?"; `intersectCapabilities` lifts that to lists, returning `effective` (covered subset, in declared order) and `excess` (the uncovered tail). The `task` / `task_sync` / `task_async` tools accept an optional `capabilities` array; the spawn factory in the harness loop intersects against the parent's capability snapshot and refuses spawns whose declared set isn't a subset, surfacing `subagent.escalation` as a tool error and a `subagent_escalation` row in `subagent_gate_decisions` for postmortem.

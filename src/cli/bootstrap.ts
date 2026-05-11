@@ -17,6 +17,7 @@ import {
 import {
   type LockConflict,
   bootstrapPermissionEngine,
+  detectSandboxAvailability,
   preflightPermissionEngine,
 } from '../permissions/index.ts';
 import { createDefaultRegistry } from '../providers/index.ts';
@@ -93,6 +94,13 @@ export interface BootstrapInput {
   // audit row is emitted before the engine accepts new decisions —
   // the override itself is audited.
   acceptBrokenChain?: boolean;
+  // Operator-supplied flag enabling the `host` sandbox profile
+  // (PERMISSION_ENGINE.md §6.5). When true AND the resolved
+  // capabilities include `host-passthrough`, the sandbox planner
+  // may pick `host` as a fallback when no restricted profile
+  // covers. Without this flag, `host` is pruned from the candidate
+  // set unconditionally.
+  sandboxHost?: boolean;
 }
 
 export interface BootstrapResult {
@@ -249,12 +257,25 @@ export const bootstrap = async (input: BootstrapInput): Promise<BootstrapResult>
   // controller drives runtime degrade/restore, and the audit sink
   // built here is the one the engine emits through — single SQLite
   // handle for the entire lifetime.
+  // Sandbox availability is probed at bootstrap (cheap binary
+  // lookup via Bun.which). The result flows into the engine
+  // options so `check()` runs the §6.5 planner. Probing here
+  // rather than per-check keeps the bootstrap path the single
+  // source of truth for "is this host capable of sandboxing?".
+  const sandboxAvail = detectSandboxAvailability();
   const permResult = await bootstrapPermissionEngine({
     cwd,
     db,
     sessionId: 'session-bootstrap',
     preflight,
     ...(input.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
+    sandbox: {
+      available: sandboxAvail.available,
+      hostExplicitlyAllowed: input.sandboxHost === true,
+      // Policy-level `sandbox.required` lands in a later slice when
+      // the section is parsed; default lenient for now.
+      required: false,
+    },
   });
   const permissionEngine = permResult.engine;
   const policyLayers = permResult.layerNames as ('enterprise' | 'user' | 'project' | 'session')[];

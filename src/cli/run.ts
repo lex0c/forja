@@ -433,6 +433,7 @@ export const run = async (options: RunOptions): Promise<number> => {
       ...(args.plan === true ? { plan: true } : {}),
       ...(resumeFromSessionId !== undefined ? { resumeFromSessionId } : {}),
       ...(args.acceptBrokenChain === true ? { acceptBrokenChain: true } : {}),
+      ...(args.sandboxHost === true ? { sandboxHost: true } : {}),
       signal,
       ...(options.bootstrapOverride ?? {}),
     };

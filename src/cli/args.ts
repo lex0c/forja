@@ -48,6 +48,13 @@ export interface ParsedArgs {
   // decisions — the override itself is audited and visible in the
   // chain forever.
   acceptBrokenChain?: boolean;
+  // Explicit operator opt-in for the `host` sandbox profile
+  // (PERMISSION_ENGINE.md §6.5). Without this flag the sandbox
+  // planner refuses to fall back to the `host` (passthrough)
+  // profile even when policy and capabilities would allow it.
+  // Pairs with the `host-passthrough` capability in the
+  // resolved set — BOTH are required before host is selectable.
+  sandboxHost?: boolean;
   // Undo mode (AGENTIC_CLI §12 / CHECKPOINTS.md §2.3). Restores
   // the latest checkpoint of the named session. Same semantics as
   // `agent --checkpoints restore <session> <latest-ckpt>` but
@@ -593,6 +600,10 @@ export const parseArgs = (argv: readonly string[]): ParseResult => {
         break;
       case '--accept-broken-chain':
         args.acceptBrokenChain = true;
+        i += 1;
+        break;
+      case '--sandbox-host':
+        args.sandboxHost = true;
         i += 1;
         break;
       case '--undo': {
