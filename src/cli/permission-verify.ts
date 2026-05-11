@@ -74,6 +74,17 @@ export const runPermissionVerify = async (
     out(
       `audit chain: intact (${result.rows} row${result.rows === 1 ? '' : 's'}, install_id=${identity.install_id})\n`,
     );
+    if (result.current_rotation_id > 0) {
+      out(`  current rotation: rotation_id=${result.current_rotation_id}\n`);
+    }
+    if (result.quarantined) {
+      out('  status: QUARANTINED — chain was rotated and the archived\n');
+      out('          segment has not yet been inspected. Run\n');
+      out(
+        `          'SELECT * FROM approvals_log_archived WHERE archive_rotation_id = ${result.current_rotation_id};'\n`,
+      );
+      out('          to audit the pre-rotation rows.\n');
+    }
     return 0;
   }
   // Broken — print all fields humans need to investigate.
@@ -81,11 +92,20 @@ export const runPermissionVerify = async (
   out(`  install_id: ${identity.install_id}\n`);
   out(`  expected:   ${result.expected}\n`);
   out(`  actual:     ${result.actual}\n`);
+  if (result.current_rotation_id > 0) {
+    out(`  current rotation: rotation_id=${result.current_rotation_id}\n`);
+  }
+  if (result.quarantined) {
+    out('  quarantine: this chain segment is post-rotation and still flagged.\n');
+  }
   out('\n');
   out('Investigate before continuing. Forensic options:\n');
   out('  - Restore the SQLite DB from a backup before the break.\n');
   out('  - Audit the row at the broken seq and adjacent rows.\n');
-  out('  - If the break is acknowledged and not recoverable, the engine supports\n');
-  out('    --accept-broken-chain (with audit-log signed entry) — not implemented in this slice.\n');
+  out('  - Re-run with `agent permission rotate-chain --reason "<text>"` to archive\n');
+  out('    the broken segment and start a fresh chain (chain remains QUARANTINED\n');
+  out('    until you inspect the archived rows).\n');
+  out('  - `--accept-broken-chain` is reserved for an explicit operator override that\n');
+  out('    keeps the broken chain live — not implemented in this slice.\n');
   return 1;
 };

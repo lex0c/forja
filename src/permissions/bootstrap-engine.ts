@@ -331,7 +331,7 @@ const buildRefusingResult = (params: {
     layerNames: (params.resolved?.layers ?? []).map((l) => l.layer),
     lockConflicts: params.resolved?.lockConflicts ?? [],
     provenance: params.resolved?.provenance ?? { defaults: 'default' },
-    chain: params.chain ?? { ok: true, rows: 0 },
+    chain: params.chain ?? { ok: true, rows: 0, current_rotation_id: 0, quarantined: false },
     refusingReason: params.reason,
   };
 };

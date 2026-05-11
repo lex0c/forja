@@ -72,7 +72,7 @@ const makeBootstrapStubWithDb = (db: DB): BootstrapResult => {
     hookWarnings: [],
     critiqueWarnings: [],
     permissionState: 'ready',
-    permissionChain: { ok: true, rows: 0 },
+    permissionChain: { ok: true, rows: 0, current_rotation_id: 0, quarantined: false },
     installIdentity: { install_id: 'test-fixture', created_at_ms: 0 },
   };
 };
@@ -855,7 +855,7 @@ describe('repl — /history on reload (boot disabled → re-enable)', () => {
         hookWarnings: [],
         critiqueWarnings: [],
         permissionState: 'ready',
-        permissionChain: { ok: true, rows: 0 },
+        permissionChain: { ok: true, rows: 0, current_rotation_id: 0, quarantined: false },
         installIdentity: { install_id: 'test-fixture', created_at_ms: 0 },
       };
 

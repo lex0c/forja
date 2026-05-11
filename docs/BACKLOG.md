@@ -15,6 +15,68 @@ Format:
 
 ---
 
+## [2026-05-10] permission-engine-v2 — slice 8: --rotate-chain flow + quarantine state (§7.2)
+
+**Done.** Eighth slice of the v2 evolution. Implements the operator-driven chain rotation flow specified in `PERMISSION_ENGINE.md §7.2`: when the audit hash chain is broken (or preventively, after an incident scare), the operator runs `agent permission rotate-chain --reason "<text>"` to archive the current `approvals_log` segment under a new `rotation_id`, start a fresh chain from a distinct `GENESIS-ROTATED:<hash>`, and surface a `quarantined` flag in `agent permission verify` until the archived segment is inspected.
+
+### Why now
+
+Until this slice, the only `agent permission` verb was `verify`, which exits 1 when the chain is broken and surfaces a help text mentioning `--accept-broken-chain` (not implemented) and `--rotate-chain` (not implemented). The engine's state-machine `refusing` branch was load-bearing for slice 2 + 6 wiring but had no operator-recoverable path — every chain break required restoring from backup or wiping the DB. Slice 8 closes that gap with the spec's documented escape hatch.
+
+The flow is operator-driven by design (spec §7.2 "Não-recuperável sem ação humana"). The engine never auto-rotates; calling code never bypasses; the only entry is the CLI subcommand with a mandatory `--reason` for forensic audit.
+
+### Spec invariants this slice respects (§7.2)
+
+- **Archive table**: `approvals_log_archived` holds every pre-rotation row tagged with `(archive_rotation_id, archived_at_ms)`. Same column shape as `approvals_log` so a forensic reader sees identical bytes; no compression, no projection.
+- **New genesis with same install_id**: `computeRotatedGenesisHash(identity, rotation_id, rotated_at_ms)` returns `"GENESIS-ROTATED:" || sha256(install_id || rotated_at_ms || rotation_id)`. Distinct from the original `"GENESIS:" || sha256(install_id || created_at_ms)`; visible in raw row inspection without joining `chain_meta`.
+- **Quarantine flag**: `chain_meta.quarantined` defaults to 1; surfaced by `verify`; only cleared by an explicit operator action (no auto-clear on next emit, no auto-clear on next start). Forensic-only — engine operation continues normally.
+- **Atomicity**: rotation is one transaction (copy archived rows → write chain_meta → delete originals → commit). A half-archive state is never observable.
+- **`--reason` mandatory**: rotation without a written reason is audit-hostile and rejected at parse. No silent default.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/storage/migrations/035-chain-rotation.ts` (new) | `approvals_log_archived` table mirrors `approvals_log` shape + `archive_rotation_id`, `archived_at_ms` (composite PK `(install_id, archive_rotation_id, seq)`); `chain_meta` table holds rotation events (`rotation_id` autoincrement PK, `install_id`, `rotated_at_ms`, `reason`, `pre_rotation_tip_hash`, `pre_rotation_seq_max`, `quarantined`). Indexes on archived `(install_id, archive_rotation_id)` and meta `(install_id, rotation_id DESC)` keep lookups O(log n). |
+| `src/storage/repos/chain-rotation.ts` (new) | `rotateChain(db, input)`: atomic `withTransaction` wrap. Insert chain_meta first (so AUTOINCREMENT assigns `rotation_id` before the COPY tags rows), then INSERT…SELECT into archive table, then DELETE from `approvals_log`. Returns `{ rotation_id, archived_rows, pre_rotation_tip_hash, pre_rotation_seq_max, rotated_at_ms }`. Read-side: `getLatestChainMeta`, `listChainMetaByInstall`, `listArchivedByRotation`, `clearQuarantine`. Empty-chain rotation supported (preventive rotation case). |
+| `src/permissions/audit.ts` | New `computeRotatedGenesisHash(identity, rotation_id, rotated_at_ms)` exported with `GENESIS-ROTATED:` prefix. `createSqliteSink` reads the latest `chain_meta` on construction; uses the rotated genesis when one exists, the original `GENESIS:` form otherwise. `verifyChain` re-reads meta on each call (covers the rare case where rotation lands between sink construction and a later verify invocation via `agent permission verify`'s independently-constructed sink). `VerifyResult` widened with `current_rotation_id: number` + `quarantined: boolean` for both ok and ng branches. |
+| `src/cli/chain-rotate.ts` (new) | `runChainRotate(options)` orchestrates the rotation: install_id resolution, DB open + migrate, defensive `--reason` re-validation, atomic rotation call, JSON or text output. Mirrors `permission-verify.ts` structure (DB-only, no provider, no session). Exits 0 on success, 1 on bootstrap / rotation errors. |
+| `src/cli/args.ts` | Permission-subcommand parser extended: `rotate-chain` joins `verify` as a known verb. New `--reason <text>` flag captured into `permission.reason`; rejected when missing, empty, whitespace-only, or followed by another `--<flag>`. The unknown-verb error message and usage banner now list both verbs. |
+| `src/cli/run.ts` | Dispatch branch for the new verb wires `args.permission.reason` (parse-enforced) into `runChainRotate`. |
+| `src/cli/permission-verify.ts` | Renders quarantine status when present: a banner naming `rotation_id=N`, the quarantine notice, and the SQL hint to inspect the archived segment. Forensic options list updated — `rotate-chain` is now the documented path; `--accept-broken-chain` is still reserved for a future slice. |
+| `src/permissions/bootstrap-engine.ts` | `chain` field of `BootstrapResult` widened to include the rotation metadata fields (forwarded from `verifyChain`'s `VerifyResult`). The refusing branch's default builds the new shape. |
+| `tests/storage/chain-rotation.test.ts` (new) | Repo unit tests: archives every row, persists meta with quarantine=1, empty preventive rotation, re-rotation appends new segment, per-install isolation, read-side `getLatest`/`listHistory`/`clearQuarantine`, transaction atomicity (no half-archive visible). |
+| `tests/permissions/audit-rotation.test.ts` (new) | Audit sink rotation awareness: GENESIS-ROTATED prefix distinct from GENESIS, different rotation_id / rotated_at_ms produce different genesis (deterministic + replay-able), post-rotation sink uses rotated genesis for new emits, verifyChain reports current_rotation_id + quarantined, clearing meta flips quarantined off, re-rotation uses latest rotation_id. |
+| `tests/cli/chain-rotate.test.ts` (new) | Parser tests (mandatory --reason, --reason without value, --reason swallow attack, whitespace-only, --json toggle) + `runChainRotate` integration (preventive empty-chain success, archives existing rows, --json single NDJSON line, defensive empty-reason rejection, post-rotation verify shows QUARANTINED). |
+
+### Decisions
+
+- **Reason is mandatory at parse time.** Optional with a "unspecified" default would let drift accumulate (every rotation looks the same in audit). Spec doesn't dictate, but operator hygiene does. The parser rejects; `runChainRotate` re-validates defensively for programmatic callers.
+- **Quarantine surfaces only in verify, doesn't degrade.** Spec §7.2 calls it "quarantine flag em queries até inspeção" — query-level, not engine-level. Engine boots normally on the rotated chain; the operator sees the banner the next time they run `verify`. A future slice can add `agent permission inspect <rotation_id>` to clear the flag interactively; for now the SQL is documented in the verify output.
+- **`GENESIS-ROTATED:` prefix is distinct, not just a hash with shifted inputs.** Two reasons: (1) raw-row forensic inspection — scanning `prev_hash` columns in a DB browser, you can SEE the boundary without joining; (2) parser determinism — a downstream tool that wants to detect "is this a rotated chain" doesn't need the matching identity file (which it might not have).
+- **Composite primary key `(install_id, archive_rotation_id, seq)` on the archive table.** The live `approvals_log.seq` is AUTOINCREMENT global — a fresh INSERT after rotation continues from the last sqlite_sequence value, not 1. Preserving `seq` in the archive keeps the original row identity stable for replay; the composite PK distinguishes archived segments without collapsing two installs' rotations.
+- **`getLatestChainMeta` is read EVERY verifyChain call.** Cost is one indexed seek; benefit is correctness for the `agent permission verify` flow that constructs a fresh sink (which would also read at construction, but doing it again in verify is belt-and-braces against future code paths that long-live a sink across rotations).
+- **`appendApprovalsLog.seq` does NOT reset on rotation.** Spec says "novo seq 1" — interpreted operationally as "the first row of the new chain semantically," not "literal value of the seq column." The identity of the new chain is the `prev_hash = GENESIS-ROTATED:...` of its first row, not the seq number. Resetting `sqlite_sequence` is global per-table and would affect concurrent installs in multi-tenant DBs.
+- **Drive-by: 4 verifyChain return-shape stubs in `tests/cli/repl{,-history}.test.ts`, `tests/conformance/index.ts`, and `tests/permissions/{engine,audit}.test.ts` updated to include the two new VerifyResult fields. The `bootstrap-engine.ts` refusing-branch default builds the same shape. These are mechanical type-shape updates that fall out of the VerifyResult widening.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5079 pass / 10 skip / 0 fail** (5089 total across 238 files)
+
+### Next
+
+Successor slices (still in spec order):
+1. Subagent intersection formal (§10).
+2. Sandbox plan integration (bwrap profile selection, §6.5).
+3. Context-summary builder for the classifier input.
+4. Replay tool (`agent permission replay`).
+5. `--accept-broken-chain` operator override (§7.2 second flag, complementary to rotate-chain).
+6. `agent permission inspect <rotation_id>` (clears the quarantine flag after operator review).
+
+---
+
 ## [2026-05-10] permission-engine-v2 — slice 7: approval gate consumes score (§6.6)
 
 **Done.** Seventh slice of the v2 evolution. Wires the deterministic risk score + classifier hint (already computed and recorded since slices 4–5) into the approval gate per `PERMISSION_ENGINE.md §6.6`. A would-be `allow` whose final score crosses the calibration threshold, OR whose resolver confidence is below `high`, is upgraded to `confirm` with stable audit attribution.

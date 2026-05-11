@@ -1234,7 +1234,12 @@ describe('engine.check — audit emission', () => {
       return { seq: collected.length, this_hash: `fake-${collected.length}` };
     },
     verifyChain() {
-      return { ok: true as const, rows: collected.length };
+      return {
+        ok: true as const,
+        rows: collected.length,
+        current_rotation_id: 0,
+        quarantined: false,
+      };
     },
   });
 
@@ -1480,7 +1485,12 @@ describe('engine — state machine integration (§2)', () => {
         return { seq: collected.length, this_hash: `fake-${collected.length}` };
       },
       verifyChain() {
-        return { ok: true as const, rows: collected.length };
+        return {
+          ok: true as const,
+          rows: collected.length,
+          current_rotation_id: 0,
+          quarantined: false,
+        };
       },
     };
     const eng = createPermissionEngine(policy({ tools: { bash: { allow: ['ls *'] } } }), {
@@ -1521,7 +1531,12 @@ describe('engine — risk score in audit row (§6.3 integration)', () => {
       return { seq: collected.length, this_hash: `fake-${collected.length}` };
     },
     verifyChain() {
-      return { ok: true as const, rows: collected.length };
+      return {
+        ok: true as const,
+        rows: collected.length,
+        current_rotation_id: 0,
+        quarantined: false,
+      };
     },
   });
 
@@ -1666,7 +1681,12 @@ describe('engine — classifier hint (§6.4 integration)', () => {
       return { seq: collected.length, this_hash: `fake-${collected.length}` };
     },
     verifyChain() {
-      return { ok: true as const, rows: collected.length };
+      return {
+        ok: true as const,
+        rows: collected.length,
+        current_rotation_id: 0,
+        quarantined: false,
+      };
     },
   });
 
@@ -1845,7 +1865,12 @@ describe('engine — approval gate consumes score (§6.6, slice 7)', () => {
       return { seq: collected.length, this_hash: `fake-${collected.length}` };
     },
     verifyChain() {
-      return { ok: true as const, rows: collected.length };
+      return {
+        ok: true as const,
+        rows: collected.length,
+        current_rotation_id: 0,
+        quarantined: false,
+      };
     },
   });
 

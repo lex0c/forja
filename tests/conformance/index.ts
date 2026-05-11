@@ -167,7 +167,12 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
       return { seq: captured.length, this_hash: `fake-${captured.length}` };
     },
     verifyChain() {
-      return { ok: true as const, rows: captured.length };
+      return {
+        ok: true as const,
+        rows: captured.length,
+        current_rotation_id: 0,
+        quarantined: false,
+      };
     },
   };
   const classifier =

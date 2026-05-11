@@ -204,11 +204,14 @@ export interface ParsedArgs {
   recap?: { args: string[] };
   // `agent permission <verb> [positionals]` — operator surface for
   // the v2 permission engine (PERMISSION_ENGINE.md). Verbs:
-  //   - 'verify' — walk the audit hash chain for the current
-  //                install_id, report intact / broken-at-seq, exit
-  //                code 0 / 1. Read-only, no provider, no session.
+  //   - 'verify'       — walk the audit hash chain for the current
+  //                      install_id; exit 0 (intact) / 1 (broken).
+  //   - 'rotate-chain' — archive the current `approvals_log` segment
+  //                      under a new rotation_id and start a fresh
+  //                      chain (§7.2). `--reason` is captured into the
+  //                      `chain_meta.reason` column for forensics.
   // Future slices add 'replay', 'revoke', 'list', 'test'.
-  permission?: { verb: string; positionals: string[] };
+  permission?: { verb: string; positionals: string[]; reason?: string };
 }
 
 export interface ParseError {
@@ -417,33 +420,41 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
 // scripts can switch the verify output to NDJSON.
 //
 // Current verbs:
-//   verify  — walk the audit hash chain. Exit 0 = intact, 1 = broken
-//             or bootstrap error.
+//   verify        — walk the audit hash chain. Exit 0 = intact, 1 =
+//                   broken or bootstrap error.
+//   rotate-chain  — archive current chain under a new rotation_id and
+//                   start fresh (§7.2). `--reason "<text>"` captures
+//                   the motive into chain_meta.reason; required, no
+//                   default — operator action without a written reason
+//                   is audit-hostile and rejected at parse.
 //
 // Future verbs (each lands in its own slice):
 //   replay   — replay decision against current policy
 //   revoke   — drop a session/pattern grant
 //   list     — show approvals log entries
 //   test     — run conformance suite
+const KNOWN_PERMISSION_VERBS = ['verify', 'rotate-chain'] as const;
+
 const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null => {
   if (argv.length === 0 || argv[0] !== 'permission') return null;
   if (argv.length === 1) {
     return {
       ok: false,
-      message: 'usage: agent permission <verify> [--json]',
+      message: `usage: agent permission <${KNOWN_PERMISSION_VERBS.join('|')}> [--json] [--reason <text>]`,
     };
   }
   const verb = argv[1];
   if (verb === undefined) {
     return { ok: false, message: 'agent permission: missing verb' };
   }
-  if (verb !== 'verify') {
+  if (!KNOWN_PERMISSION_VERBS.includes(verb as (typeof KNOWN_PERMISSION_VERBS)[number])) {
     return {
       ok: false,
-      message: `agent permission: unknown verb '${verb}' (expected: verify)`,
+      message: `agent permission: unknown verb '${verb}' (expected: ${KNOWN_PERMISSION_VERBS.join('|')})`,
     };
   }
   let json = false;
+  let reason: string | undefined;
   const positionals: string[] = [];
   for (let i = 2; i < argv.length; i += 1) {
     const token = argv[i];
@@ -468,7 +479,28 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       json = true;
       continue;
     }
+    if (token === '--reason') {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith('--')) {
+        return {
+          ok: false,
+          message: 'agent permission: --reason requires a non-empty text value',
+        };
+      }
+      reason = value;
+      i += 1;
+      continue;
+    }
     positionals.push(token);
+  }
+  if (verb === 'rotate-chain') {
+    if (reason === undefined || reason.trim().length === 0) {
+      return {
+        ok: false,
+        message:
+          'agent permission rotate-chain: --reason <text> is required (forensic record of why the chain was rotated)',
+      };
+    }
   }
   return {
     ok: true,
@@ -482,7 +514,7 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
       includeSubagents: false,
       explainPermissions: false,
       yes: false,
-      permission: { verb, positionals },
+      permission: { verb, positionals, ...(reason !== undefined ? { reason } : {}) },
     },
   };
 };

@@ -40,6 +40,7 @@ import {
   getLastApprovalsLogByInstall,
   listApprovalsLogByInstall,
 } from '../storage/repos/approvals-log.ts';
+import { getLatestChainMeta } from '../storage/repos/chain-rotation.ts';
 import { canonicalize, sha256Hex } from './canonical.ts';
 import type { InstallIdentity } from './install_id.ts';
 
@@ -95,13 +96,23 @@ export interface EmittedRow {
 }
 
 export type VerifyResult =
-  | { ok: true; rows: number }
+  | {
+      ok: true;
+      rows: number;
+      // Rotation metadata (§7.2). Present for every result so the
+      // caller can render quarantine status without a second query.
+      // `current_rotation_id` is 0 for chains that never rotated.
+      current_rotation_id: number;
+      quarantined: boolean;
+    }
   | {
       ok: false;
       brokenAt: number;
       reason: 'prev_hash_mismatch' | 'this_hash_mismatch';
       expected: string;
       actual: string;
+      current_rotation_id: number;
+      quarantined: boolean;
     };
 
 export interface AuditSink {
@@ -113,7 +124,7 @@ const NOOP_ROW: EmittedRow = { seq: 0, this_hash: '' };
 
 export const createNoopSink = (): AuditSink => ({
   emit: () => NOOP_ROW,
-  verifyChain: () => ({ ok: true, rows: 0 }),
+  verifyChain: () => ({ ok: true, rows: 0, current_rotation_id: 0, quarantined: false }),
 });
 
 // Build the canonical-hash payload from a row's persisted columns.
@@ -137,11 +148,24 @@ const buildHashPayload = (
 
 // Spec §7.2: `prev_hash = "GENESIS:" || sha256(install_id || created_at_ms)`
 // for the first row of each installation. The genesis hash is stable
-// for a given identity — a chain rotation (spec §7.2 "Quebra de chain")
-// rewrites install_id (creating a new identity) and therefore a new
-// genesis.
+// for a given identity. A chain rotation keeps the same install_id
+// (per spec §7.2 "nova genesis com same install_id") so the genesis
+// MUST shift to remain distinct from the pre-rotation chain;
+// `computeRotatedGenesisHash` below carries that shift.
 export const computeGenesisHash = (identity: InstallIdentity): string =>
   `GENESIS:${sha256Hex(`${identity.install_id}${identity.created_at_ms}`)}`;
+
+// Post-rotation genesis hash. Same install_id, but the genesis incor-
+// porates the rotation event identifiers so the new chain is byte-
+// distinct from the archived one. The `GENESIS-ROTATED:` prefix makes
+// the distinction visible in raw row inspection — a forensic reader
+// scanning `prev_hash` columns can spot the boundary without joining
+// against `chain_meta`.
+export const computeRotatedGenesisHash = (
+  identity: InstallIdentity,
+  rotation_id: number,
+  rotated_at_ms: number,
+): string => `GENESIS-ROTATED:${sha256Hex(`${identity.install_id}${rotated_at_ms}${rotation_id}`)}`;
 
 export interface CreateSqliteSinkOptions {
   identity: InstallIdentity;
@@ -149,7 +173,18 @@ export interface CreateSqliteSinkOptions {
 }
 
 export const createSqliteSink = ({ identity, db }: CreateSqliteSinkOptions): AuditSink => {
-  const genesisHash = computeGenesisHash(identity);
+  // Resolve the active genesis once at construction. Rotations are
+  // operator-driven via the CLI `--rotate-chain` flow that exits
+  // before any engine starts, so the sink never sees a mid-flight
+  // rotation; the latest `chain_meta` row at construction is the
+  // definitive answer for this sink's lifetime.
+  const latestMeta = getLatestChainMeta(db, identity.install_id);
+  const current_rotation_id = latestMeta?.rotation_id ?? 0;
+  const isQuarantined = latestMeta?.quarantined === 1;
+  const genesisHash =
+    latestMeta === null
+      ? computeGenesisHash(identity)
+      : computeRotatedGenesisHash(identity, latestMeta.rotation_id, latestMeta.rotated_at_ms);
 
   const emit = (input: AuditEmitInput): EmittedRow => {
     const last = getLastApprovalsLogByInstall(db, identity.install_id);
@@ -187,6 +222,15 @@ export const createSqliteSink = ({ identity, db }: CreateSqliteSinkOptions): Aud
   };
 
   const verifyChain = (): VerifyResult => {
+    // Re-read the rotation tip on every verify so an out-of-process
+    // CLI rotation between `createSqliteSink` and a later
+    // `verifyChain` call is still reflected. emit() does not re-read
+    // (no concurrent rotation under the same sink by construction),
+    // but verify is also exposed via `agent permission verify` which
+    // operates on a freshly-constructed sink.
+    const tipMeta = getLatestChainMeta(db, identity.install_id);
+    const tipRotationId = tipMeta?.rotation_id ?? 0;
+    const tipQuarantined = tipMeta?.quarantined === 1;
     const rows = listApprovalsLogByInstall(db, identity.install_id);
     let expectedPrev = genesisHash;
     for (const row of rows) {
@@ -197,6 +241,8 @@ export const createSqliteSink = ({ identity, db }: CreateSqliteSinkOptions): Aud
           reason: 'prev_hash_mismatch',
           expected: expectedPrev,
           actual: row.prev_hash,
+          current_rotation_id: tipRotationId,
+          quarantined: tipQuarantined,
         };
       }
       const recomputed = sha256Hex(row.prev_hash + canonicalize(buildHashPayload(row)));
@@ -207,12 +253,26 @@ export const createSqliteSink = ({ identity, db }: CreateSqliteSinkOptions): Aud
           reason: 'this_hash_mismatch',
           expected: recomputed,
           actual: row.this_hash,
+          current_rotation_id: tipRotationId,
+          quarantined: tipQuarantined,
         };
       }
       expectedPrev = row.this_hash;
     }
-    return { ok: true, rows: rows.length };
+    return {
+      ok: true,
+      rows: rows.length,
+      current_rotation_id: tipRotationId,
+      quarantined: tipQuarantined,
+    };
   };
 
+  // Surface construction-time rotation snapshot for tests that need
+  // to inspect the sink state without populating any rows first.
+  // Returned as a side-channel through verifyChain (already includes
+  // current_rotation_id + quarantined) — unused vars below silence
+  // TS noUnused; both are read inside verifyChain's closures.
+  void current_rotation_id;
+  void isQuarantined;
   return { emit, verifyChain };
 };

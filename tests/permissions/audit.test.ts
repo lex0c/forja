@@ -42,7 +42,12 @@ describe('createNoopSink', () => {
   test('emits sentinel row and verifies clean', () => {
     const sink = createNoopSink();
     expect(sink.emit(baseInput())).toEqual({ seq: 0, this_hash: '' });
-    expect(sink.verifyChain()).toEqual({ ok: true, rows: 0 });
+    expect(sink.verifyChain()).toEqual({
+      ok: true,
+      rows: 0,
+      current_rotation_id: 0,
+      quarantined: false,
+    });
   });
 });
 
@@ -143,13 +148,23 @@ describe('createSqliteSink — emit + chain', () => {
 describe('createSqliteSink — verifyChain', () => {
   test('empty chain verifies clean', () => {
     const { sink } = fresh();
-    expect(sink.verifyChain()).toEqual({ ok: true, rows: 0 });
+    expect(sink.verifyChain()).toEqual({
+      ok: true,
+      rows: 0,
+      current_rotation_id: 0,
+      quarantined: false,
+    });
   });
 
   test('single-row chain verifies', () => {
     const { sink } = fresh();
     sink.emit(baseInput());
-    expect(sink.verifyChain()).toEqual({ ok: true, rows: 1 });
+    expect(sink.verifyChain()).toEqual({
+      ok: true,
+      rows: 1,
+      current_rotation_id: 0,
+      quarantined: false,
+    });
   });
 
   test('multi-row chain verifies', () => {
@@ -157,7 +172,12 @@ describe('createSqliteSink — verifyChain', () => {
     sink.emit(baseInput({ ts: 1 }));
     sink.emit(baseInput({ ts: 2, decision: 'deny' }));
     sink.emit(baseInput({ ts: 3, tool_name: 'write_file' }));
-    expect(sink.verifyChain()).toEqual({ ok: true, rows: 3 });
+    expect(sink.verifyChain()).toEqual({
+      ok: true,
+      rows: 3,
+      current_rotation_id: 0,
+      quarantined: false,
+    });
   });
 
   test('verify detects prev_hash mismatch on tampered row', () => {
@@ -229,8 +249,18 @@ describe('createSqliteSink — verifyChain', () => {
     sinkB.emit(baseInput({ ts: 2, session_id: 'sB' }));
     sinkA.emit(baseInput({ ts: 3, session_id: 'sA' }));
 
-    expect(sinkA.verifyChain()).toEqual({ ok: true, rows: 2 });
-    expect(sinkB.verifyChain()).toEqual({ ok: true, rows: 1 });
+    expect(sinkA.verifyChain()).toEqual({
+      ok: true,
+      rows: 2,
+      current_rotation_id: 0,
+      quarantined: false,
+    });
+    expect(sinkB.verifyChain()).toEqual({
+      ok: true,
+      rows: 1,
+      current_rotation_id: 0,
+      quarantined: false,
+    });
 
     // Verify B has its own genesis-anchored chain (the seq numbers
     // are shared with A in the AUTOINCREMENT space but each

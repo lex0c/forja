@@ -169,14 +169,29 @@ export const run = async (options: RunOptions): Promise<number> => {
     }
 
     // `agent permission <verb>` — DB-only operator surface for the
-    // v2 permission engine. The 'verify' verb walks the audit hash
-    // chain and exits 0 (intact) / 1 (broken). No provider, no
-    // harness, no session start; reads the operator's session DB
-    // and the per-install install_id only.
+    // v2 permission engine. Both verbs are read-only / one-shot,
+    // never start a provider or session. They read the operator's
+    // session DB and the per-install install_id only.
     if (args.permission !== undefined) {
-      const { runPermissionVerify } = await import('./permission-verify.ts');
       if (args.permission.verb === 'verify') {
+        const { runPermissionVerify } = await import('./permission-verify.ts');
         return await runPermissionVerify({
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
+      if (args.permission.verb === 'rotate-chain') {
+        // --reason is enforced at parse time; the type-checker doesn't
+        // know that, so we assert non-null here. The chain-rotate
+        // handler also re-validates defensively.
+        const reason = args.permission.reason ?? '';
+        const { runChainRotate } = await import('./chain-rotate.ts');
+        return await runChainRotate({
+          reason,
           json: args.json,
           ...(options.bootstrapOverride?.dbPath !== undefined
             ? { dbPath: options.bootstrapOverride.dbPath }
