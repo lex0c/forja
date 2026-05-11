@@ -138,6 +138,15 @@ export { resolvePolicy } from './hierarchy.ts';
 export type { PolicyWatcher, WatchAndReloadOptions } from './policy-watcher.ts';
 export { watchAndReload } from './policy-watcher.ts';
 
+export type {
+  CreateWormFileSealerOptions,
+  SealAppendResult,
+  SealEntry,
+  SealStore,
+  VerifySealResult,
+} from './sealing.ts';
+export { createWormFileSealer, verifySealAgainstChain } from './sealing.ts';
+
 export {
   RULE_LIST_CAP,
   formatBash,

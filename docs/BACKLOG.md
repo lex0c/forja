@@ -15,6 +15,57 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 54: `createWormFileSealer` — §7.3 sealing primitive (worm-file backend)
+
+**Done.** Fifty-fourth slice. Opens the §7.3 external-sealing thread by shipping the foundational primitive: a `SealStore` interface plus a worm-file backend that appends `seq\tts\thash\n` lines to a file destined to become `chattr +a`'d. Companion `verifySealAgainstChain(store, db)` cross-references each seal entry against the live `approvals_log` chain. With this slice, the building block for "the local hash chain is auditor-grade, not just root-trust" is in place — future slices wire the scheduler, audit sink integration, and `[seal]` Policy section.
+
+### Why this matters
+
+§7.2 hash chain protects against silent piecemeal edits — flip one row and the chain breaks at verify. But it does NOT protect against a root adversary who rewrites EVERY row + recomputes hashes. The local DB has no untamperable anchor. External sealing fixes that: periodically write the latest chain hash to a write-once surface (worm-file via `chattr +a`, S3 with object-lock, RFC3161 TSA, or a separate git remote) so the adversary leaves a trail.
+
+This slice is the worm-file primitive — the simplest of the four sealing modes the spec enumerates (no AWS / TSA / git remote dependency, just ext4 + `chattr +a`). It's the right first slice for the §7.3 thread because (a) every backend needs the same `SealStore` shape so its append/list/verify pattern emerges here, and (b) the file-backed test seam (inject `onCreate` instead of running `/usr/bin/chattr`) gives us deterministic tests without root.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/sealing.ts` (new, ~230 lines) | `SealEntry = {seq, ts, hash}` — three-field record per seal event. `SealStore` interface: `append(entry) → SealAppendResult`, `list() → SealEntry[]`, `close() → void`. `createWormFileSealer({path, onCreate?, exists?, read?, append?, ensureDir?})` constructs a worm-file-backed store. Wire format: `seq=<n>\tts=<ms>\thash=<opaque>\n`, one per line. Strict parser (malformed line throws with line number — tampering MUST be loud). `onCreate` runs ONCE on the append that creates the file; production wires it to `execFileSync('/usr/bin/chattr', ['+a', path])` so the file becomes append-only from the next write onward. The hash field is OPAQUE to the sealer — whatever string the caller passes is persisted byte-for-byte. This matches `approvals_log.this_hash` which stores raw sha256 hex (no `sha256:` prefix); callers that want the prefixed form pass it explicitly. Validation: `seq ≥ 1` integer, `ts ≥ 0` integer, non-empty hash with no whitespace (tab/space/newline would break parsing). `verifySealAgainstChain(store, db)` walks the seal entries, queries `getApprovalsLogBySeq(db, seq)` for each, compares hashes, returns `{ok: true, entriesChecked: N}` or `{ok: false, reason, firstMismatchAt: seq}`. Three failure surfaces collapse into one verify result: missing seq, hash mismatch, corrupted seal file. |
+| `src/permissions/index.ts` | Re-export `createWormFileSealer`, `verifySealAgainstChain`, `SealStore`, `SealEntry`, `SealAppendResult`, `VerifySealResult`, `CreateWormFileSealerOptions`. |
+| `tests/permissions/sealing.test.ts` (new, 16 tests) | **append (6):** first append creates file + invokes onCreate once + ensureDir called; subsequent appends do not re-invoke onCreate; onCreate throw still persists the line (data-integrity-first contract); invalid entries (seq=0, ts<0, empty hash, whitespace in hash, tab in hash, non-integer seq) → ok:false with no disk write; underlying append fs failure → ok:false with reason; ensureDir failure → ok:false + append not attempted. **list (4):** empty/non-existent file → []; appended entries parsed back in order; malformed line throws with line number (tampering detection); trailing newline tolerated (no phantom entry). **verifySealAgainstChain (5):** real audit chain (5 emits), seal every other row, verify ok with entriesChecked=3; missing seq → firstMismatchAt set; hash mismatch → firstMismatchAt set + both hashes in reason; corrupted seal file → ok:false; empty seal file → ok:true with entriesChecked=0. **close (1):** no-op, does not throw. |
+
+### Decisions
+
+- **One file per backend; SealStore is the seam.** Future slices add `createS3ObjectLockSealer` / `createRfc3161Sealer` / `createGitAnchoredSealer` next to `createWormFileSealer` in `sealing.ts` (or as separate files if they grow). The scheduler + audit-sink integration in later slices talk to `SealStore`, never to a backend-specific concrete type. This lets a deployment swap modes by changing the `[seal] mode` config without touching the sink.
+- **Hash field is OPAQUE, not validated as `sha256:HEX`.** Initial design enforced `sha256:` prefix + hex characters. The audit chain (`approvals_log.this_hash`) stores raw hex without prefix — enforcement would force a translation layer or break the obvious "copy this_hash into seal entry" pattern. Caller decides format; the store just persists. Validation reduced to "non-empty, no whitespace" — whitespace would break the tab-separated line format, everything else is up to the caller.
+- **`onCreate` fires AFTER the first append, not before.** Two reasons. (a) `chattr +a` requires the file to exist. Order is touch-then-chattr, and "touch" naturally collapses into the first append. (b) Data integrity: if `onCreate` throws, the line is already on disk — operators investigating a "could not seal: chattr failed" alarm need to see what the engine TRIED to seal. The test "onCreate throw → ok:false but the line is ALREADY persisted" pins this contract.
+- **`onCreate` fires ONCE per store lifetime, not on every append.** Once the file is `+a`'d, subsequent appends hit a file that's already append-only — kernel allows them, no chattr needed. Calling chattr per append would spawn `/usr/bin/chattr` per seal event (~ms each); at 100 decisions/seal interval this is negligible but wasteful. The `wasMissing = !exists(path)` check before append is the gate.
+- **Strict parsing on `list()` — malformed → throw.** A malformed line in a seal file means EITHER (a) partial-write crash mid-flush (rare with appendFileSync), OR (b) tampering. Skipping silently would mask (b); throwing makes the operator look at the file. The thrown error includes the line number to anchor investigation.
+- **`verifySealAgainstChain` reports FIRST mismatch only.** Reporting all mismatches would cascade once the chain diverges (every entry after the first tamper would appear mismatched against a re-hashed sub-chain). One mismatch point is the actionable signal; downstream is noise.
+- **fs seams are individually injectable, not a single `Fs` object.** Each method (`exists`, `read`, `append`, `ensureDir`) is a separate option. Lets tests pin specific failure modes (e.g., ensureDir throws but append doesn't) without building a full fake-fs each time. Matches the watcher-test pattern from slice 52.
+- **No `close()` work for worm-file, but the method exists in the interface.** RFC3161 TSA backend will hold an HTTPS keepalive socket; S3 backend may hold an AWS SDK client; git backend may hold a worktree handle. Having `close()` on the interface from day one means swapping backends later doesn't change the audit-sink integration signature.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`); Biome auto-format applied
+- `bun test` — **5587 pass / 10 skip / 0 fail** (5597 total across 261 files); +16 tests on top of slice 53's 5571
+- `bun test tests/permissions/sealing.test.ts` — 16 pass
+
+### Next
+
+§7.3 thread roadmap from here:
+
+1. **Slice 55**: Sealing scheduler — `createSealingScheduler({store, db, intervalDecisions, intervalSeconds, now, onSealFailed})` fires per the §7.3 config (`interval_decisions = 100` and/or `interval_seconds = 3600`, whichever first), pulls the latest chain row from `getLastApprovalsLogByInstall`, calls `store.append`. Same test-seam pattern as the watcher.
+2. **Slice 56**: Audit sink integration — `createSqliteSink` accepts an optional `scheduler` parameter; every `emit` ticks the scheduler so the decision count drives the interval.
+3. **Slice 57**: `[seal]` Policy section + bootstrap wire-up — adds `mode`, `interval_decisions`, `interval_seconds`, `endpoint`, `on_failure` keys to the policy schema; bootstrap constructs the right backend based on `mode` and wires it via slice 56's hook.
+4. **Slice 58**: `agent permission seal-verify` CLI verb — runs `verifySealAgainstChain` from the CLI for human-readable diagnostics.
+
+After that, `s3-object-lock`, `rfc3161-tsa`, and `git-anchored` backends become independent slices (each ~150 lines + ~10 tests of the same shape as slice 54).
+
+Other open spec gaps stay at the same priority as the slice 53 list (§19 migration, macOS sandbox-exec conformance, §13.7 broker/worker, §14 MCP). §16.2 conformance suite stays at 95%.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 53: bootstrap wire-up for `watchAndReload` (§12.3 production caller)
 
 **Done.** Fifty-third slice. Closes the loose end left by slice 52: the file watcher primitive existed but had no production caller. The bootstrap now opts into hot reload via `watchPolicy?: boolean`, attaches the watcher with the SAME `resolveOptions` it used at startup, and emits two new audit-row stages on every reload event — `policy-reloaded` (spec line 743) and `policy-reload-failed` (spec line 737). With this slice, an operator can edit `~/.config/agent/permissions.yaml`, save, and see (a) the engine pick up the new policy on the next `check()`, AND (b) two audit rows in `approvals_log` capturing the hash transition (or the failure reason).
