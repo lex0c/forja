@@ -215,9 +215,10 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
       throw new Error('policy: `sandbox` must be a mapping');
     }
     const s = r.sandbox as Record<string, unknown>;
-    rejectUnknownKeys(s, ['required', 'host_allowed'], 'sandbox');
+    rejectUnknownKeys(s, ['required', 'host_allowed', 'locked'], 'sandbox');
     let required: boolean | undefined;
     let hostAllowed: boolean | undefined;
+    let locked: boolean | undefined;
     if (s.required !== undefined) {
       if (typeof s.required !== 'boolean') {
         throw new Error('policy: sandbox.required must be boolean');
@@ -230,14 +231,21 @@ export const parsePolicy = (raw: unknown, context: ParsePolicyContext = {}): Pol
       }
       hostAllowed = s.host_allowed;
     }
-    // `locked` is accepted by rejectUnknownKeys for shape consistency
-    // with the other sections but NOT yet honored by the hierarchy
-    // merge for sandbox specifically. Documented as a successor slice
-    // — no current operator workflow needs it.
-    if (required !== undefined || hostAllowed !== undefined) {
+    // Section-level lock (slice 34) — mirrors `defaults.locked` /
+    // `BashPolicy.locked` / `PathPolicy.locked`. When set in a
+    // higher-precedence layer, lower layers cannot change `required`
+    // or `hostAllowed`. Re-affirming the same values is silent.
+    if (s.locked !== undefined) {
+      if (typeof s.locked !== 'boolean') {
+        throw new Error('policy: sandbox.locked must be boolean');
+      }
+      locked = s.locked;
+    }
+    if (required !== undefined || hostAllowed !== undefined || locked !== undefined) {
       sandbox = {
         ...(required !== undefined ? { required } : {}),
         ...(hostAllowed !== undefined ? { hostAllowed } : {}),
+        ...(locked !== undefined ? { locked } : {}),
       };
     }
   }

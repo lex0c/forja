@@ -397,3 +397,88 @@ describe('resolvePolicy — sandbox section (§6.5, slice 23)', () => {
     expect(result.provenance.sandbox).toBe('user');
   });
 });
+
+describe('resolvePolicy — sandbox section-level lock (§6.5, slice 34)', () => {
+  test('user lock + project change to required → lockConflict, locked value preserved', () => {
+    const usr = join(workdir, 'user-policy.yaml');
+    writeYaml(usr, 'sandbox:\n  required: true\n  locked: true\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  required: false\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
+    expect(result.policy.sandbox).toEqual({ required: true, locked: true });
+    expect(result.lockConflicts).toEqual([
+      { section: 'sandbox', lockedBy: 'user', attemptedBy: 'project' },
+    ]);
+    // Provenance stays at the locking layer — the project layer's
+    // change was discarded, so it did NOT write the section.
+    expect(result.provenance.sandbox).toBe('user');
+  });
+
+  test('user lock + project re-asserts SAME required → silent (no conflict)', () => {
+    const usr = join(workdir, 'user-policy.yaml');
+    writeYaml(usr, 'sandbox:\n  required: true\n  locked: true\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  required: true\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
+    expect(result.policy.sandbox).toEqual({ required: true, locked: true });
+    expect(result.lockConflicts).toEqual([]);
+  });
+
+  test('user lock + project change to host_allowed → lockConflict', () => {
+    // Lock applies to BOTH fields, not just `required`. A project
+    // attempting to flip `host_allowed` is also discarded.
+    const usr = join(workdir, 'user-policy.yaml');
+    writeYaml(usr, 'sandbox:\n  host_allowed: false\n  locked: true\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  host_allowed: true\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
+    expect(result.policy.sandbox).toEqual({ hostAllowed: false, locked: true });
+    expect(result.lockConflicts).toEqual([
+      { section: 'sandbox', lockedBy: 'user', attemptedBy: 'project' },
+    ]);
+  });
+
+  test('lock-only layer (no field values) still freezes lower layers', () => {
+    // User sets locked: true with no `required` / `host_allowed`.
+    // Project's attempt to set `required` should conflict — even
+    // though the locking layer didn't set any field value, the
+    // INHERITED state (undefined → bootstrap default) is what's
+    // frozen.
+    const usr = join(workdir, 'user-policy.yaml');
+    writeYaml(usr, 'sandbox:\n  locked: true\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  required: true\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
+    // `required` stays undefined (no layer wrote it); the lock alone
+    // surfaced in the merged sandbox.
+    expect(result.policy.sandbox).toEqual({ locked: true });
+    expect(result.lockConflicts).toEqual([
+      { section: 'sandbox', lockedBy: 'user', attemptedBy: 'project' },
+    ]);
+    // The locking layer counts as the writer for provenance.
+    expect(result.provenance.sandbox).toBe('user');
+  });
+
+  test('enterprise lock + user change + project change → both lower layers conflict', () => {
+    const ent = join(workdir, 'enterprise.yaml');
+    const usr = join(workdir, 'user-policy.yaml');
+    writeYaml(ent, 'sandbox:\n  required: true\n  locked: true\n');
+    writeYaml(usr, 'sandbox:\n  required: false\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  host_allowed: true\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: ent, userPath: usr });
+    expect(result.policy.sandbox).toEqual({ required: true, locked: true });
+    expect(result.lockConflicts).toEqual([
+      { section: 'sandbox', lockedBy: 'enterprise', attemptedBy: 'user' },
+      { section: 'sandbox', lockedBy: 'enterprise', attemptedBy: 'project' },
+    ]);
+  });
+
+  test('no lock → field changes propagate normally (slice 23 baseline preserved)', () => {
+    // Regression guard: making sure the lock path doesn't break the
+    // unlocked case. user sets required=true; project flips to false
+    // without any lock → project wins, no conflict.
+    const usr = join(workdir, 'user-policy.yaml');
+    writeYaml(usr, 'sandbox:\n  required: true\n');
+    writeYaml(projectFile('.agent/permissions.yaml'), 'sandbox:\n  required: false\n');
+    const result = resolvePolicy({ cwd: workdir, enterprisePath: null, userPath: usr });
+    expect(result.policy.sandbox).toEqual({ required: false });
+    expect(result.lockConflicts).toEqual([]);
+    expect(result.provenance.sandbox).toBe('project');
+  });
+});

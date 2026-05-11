@@ -176,12 +176,15 @@ const merge = (
   const mergedTools: PolicyToolsSection = {};
   const sectionLockedBy: Partial<Record<keyof PolicyToolsSection, Layer>> = {};
   const sectionWriter: Partial<Record<keyof PolicyToolsSection, Layer>> = {};
-  // §6.5 sandbox section. Field-by-field last-writer wins; no
-  // section-level lock yet (documented in PolicySandbox). The
-  // writer tracker captures the LAST layer that wrote ANY sandbox
-  // field — for provenance + `/perms why sandbox` introspection.
+  // §6.5 sandbox section. Field-by-field last-writer wins UNTIL a
+  // layer sets `locked: true`; from that point lower layers can't
+  // change `required` or `hostAllowed` (re-affirming the same
+  // values is silent; an actual change records a `lockConflict`).
+  // The writer tracker captures the LAST layer that wrote ANY
+  // sandbox field — for provenance + `/perms why sandbox`.
   let sandboxRequired: boolean | undefined;
   let sandboxHostAllowed: boolean | undefined;
+  let sandboxLockedBy: Layer | null = null;
   let sandboxWriter: Layer | null = null;
   const lockConflicts: LockConflict[] = [];
 
@@ -225,23 +228,50 @@ const merge = (
       }
     }
 
-    // §6.5 sandbox section — field-by-field last-writer wins.
-    // A layer that omits a field doesn't override the inherited
-    // value; a layer that sets a field overrides it. No
-    // section-level lock for sandbox in this slice.
+    // §6.5 sandbox section — field-by-field last-writer wins until
+    // a layer sets `locked: true`. After that, lower layers can
+    // re-affirm the same field values silently, but any actual
+    // change records a `lockConflict` and is discarded.
     if (policy.sandbox !== undefined) {
       const incoming = policy.sandbox;
-      let wroteSomething = false;
-      if (incoming.required !== undefined) {
-        sandboxRequired = incoming.required;
-        wroteSomething = true;
-      }
-      if (incoming.hostAllowed !== undefined) {
-        sandboxHostAllowed = incoming.hostAllowed;
-        wroteSomething = true;
-      }
-      if (wroteSomething) {
-        sandboxWriter = layer;
+      if (sandboxLockedBy !== null) {
+        // Already locked by an earlier layer. Re-affirmations
+        // (setting a field to its current merged value) are silent;
+        // actual changes flag a conflict and are dropped. Same
+        // semantics as `defaults.locked` / tools.* locks above.
+        const requiredChanged =
+          incoming.required !== undefined && incoming.required !== sandboxRequired;
+        const hostAllowedChanged =
+          incoming.hostAllowed !== undefined && incoming.hostAllowed !== sandboxHostAllowed;
+        if (requiredChanged || hostAllowedChanged) {
+          lockConflicts.push({
+            section: 'sandbox',
+            lockedBy: sandboxLockedBy,
+            attemptedBy: layer,
+          });
+        }
+        // Locked layers never mutate sandboxRequired / sandboxHostAllowed.
+      } else {
+        let wroteSomething = false;
+        if (incoming.required !== undefined) {
+          sandboxRequired = incoming.required;
+          wroteSomething = true;
+        }
+        if (incoming.hostAllowed !== undefined) {
+          sandboxHostAllowed = incoming.hostAllowed;
+          wroteSomething = true;
+        }
+        if (incoming.locked === true) {
+          sandboxLockedBy = layer;
+          // Activating the lock counts as "writing the section" for
+          // provenance — `/perms why sandbox` should attribute the
+          // lock to the layer that set it, even if no field value
+          // changed in the same layer.
+          wroteSomething = true;
+        }
+        if (wroteSomething) {
+          sandboxWriter = layer;
+        }
       }
     }
 
@@ -296,13 +326,17 @@ const merge = (
   };
 
   // §6.5 sandbox section: emit only when at least one field was
-  // written by some layer. Bootstrap's defaults (`required: false`,
-  // `hostAllowed: false`) handle the absent case.
+  // written by some layer OR when a layer activated the lock.
+  // Bootstrap's defaults (`required: false`, `hostAllowed: false`)
+  // handle the absent case. The `locked` flag flows through so
+  // downstream consumers can render "frozen by enterprise" in
+  // `/perms why sandbox`.
   const mergedSandbox: Policy['sandbox'] =
-    sandboxRequired !== undefined || sandboxHostAllowed !== undefined
+    sandboxRequired !== undefined || sandboxHostAllowed !== undefined || sandboxLockedBy !== null
       ? {
           ...(sandboxRequired !== undefined ? { required: sandboxRequired } : {}),
           ...(sandboxHostAllowed !== undefined ? { hostAllowed: sandboxHostAllowed } : {}),
+          ...(sandboxLockedBy !== null ? { locked: true } : {}),
         }
       : undefined;
 

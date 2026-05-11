@@ -15,6 +15,55 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 34: section-level `locked` for `sandbox` (closes slice-23 gap)
+
+**Done.** Thirty-fourth slice. Closes the explicit deferral in slice 23: the `PolicySandbox` interface comment said "section-level lock is intentionally deferred — none of the current operator workflows need it yet". The remaining conformance work blocked on `grants` table infra reminded me this gap is still open and asymmetric with every other section (`PolicyDefaults.locked`, `BashPolicy.locked`, `PathPolicy.locked`, `FetchPolicy.locked` all exist; `PolicySandbox.locked` was the holdout). Operators authoring enterprise-tier policies need the same freeze semantics on `sandbox.required` / `sandbox.host_allowed` they have on every other section — without it, an enterprise-pinned `required: true` could be silently flipped by a lower-layer `required: false` and the sandbox wrap would be bypassed.
+
+### Why this matters
+
+Slice 23 shipped the sandbox section with field-by-field last-writer-wins merging. That's the right semantic for `defaults` and `tools.*` — until an admin needs to FREEZE a field. The `locked` flag is what makes enterprise policies actually load-bearing: every other section honors it, and the sandbox section quietly didn't. An enterprise admin writing `sandbox: { required: true, locked: true }` reasonably expected the same behavior they'd get from `bash: { allow: [...], locked: true }`. The slice-23 comment was honest about the deferral but the asymmetry was a latent rough edge.
+
+This slice closes the asymmetry. Same lock semantics across all sections: lock applies to the value at the moment of activation; lower-layer re-affirmation (same value) is silent; actual changes record a `lockConflict` and are discarded. A lock-only layer (no field values, just `locked: true`) freezes the inherited state — even if that state is "undefined" — preventing lower layers from writing fields that the locking admin wanted left unset.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/types.ts` | `PolicySandbox` gets `locked?: boolean`. Header comment rewritten — used to document the deferral, now documents the semantics (mirrors `defaults.locked` / `BashPolicy.locked` etc, conflict on actual change, silent on re-affirmation). |
+| `src/permissions/config.ts` | YAML parser accepts `sandbox.locked: true/false` — added to `rejectUnknownKeys`, parsed as boolean, included in returned sandbox object when set. Type validation: `sandbox.locked must be boolean` matches the wording of the other lock fields. |
+| `src/permissions/hierarchy.ts` | New `sandboxLockedBy: Layer \| null` tracker. The sandbox-merge branch now has two arms: (1) `sandboxLockedBy !== null` → check for actual changes (re-affirmation silent, change records a `lockConflict` and is discarded), (2) unlocked → same field-by-field merge as before plus activate the lock when `incoming.locked === true`. Activating the lock alone counts as "writing the section" for provenance (so `/perms why sandbox` attributes to the locking layer). The merged-policy emit now includes `locked: true` when set, gating on `sandboxLockedBy !== null` so the merged JSON carries the lock state forward. |
+| `tests/permissions/hierarchy.test.ts` | New describe "resolvePolicy — sandbox section-level lock (§6.5, slice 34)" with 6 tests covering: lock + override-required → conflict + locked value preserved + provenance stays at locking layer; lock + same-value re-assert → silent; lock + override-host_allowed (different field) → conflict (lock applies to BOTH fields); lock-only layer freezes inherited undefined state; multi-layer lock (enterprise locks → user conflicts → project conflicts, both reported); regression guard for unlocked baseline behavior (slice 23 preserved). |
+
+### Decisions
+
+- **Same semantics as the other section locks.** Re-affirmation is silent (a lower layer setting `required: true` when `sandboxRequired === true` doesn't conflict); change is a conflict. This mirrors `defaults.locked`'s logic from lines 199-211 of hierarchy.ts. A different rule (e.g. "ANY lower-layer sandbox section after lock is a conflict") would surprise admins who model the lock after the existing patterns.
+- **Lock applies to BOTH `required` and `hostAllowed`.** Not just one. The lock is at the SECTION level, not the FIELD level. An enterprise that locks `required: true` shouldn't have to also lock `hostAllowed` — `hostAllowed` is half the security surface and lower layers shouldn't be able to flip it independently. Test 3 (`user lock + project change to host_allowed → lockConflict`) pins this contract.
+- **Lock-only layer freezes inherited UNDEFINED state.** Test 4 (`lock-only layer`) catches a subtle UX trap: an admin writes `sandbox: { locked: true }` (no field values) expecting "this section is locked at whatever inherited state". Lower layers attempting to set ANY sandbox field land in conflict — the admin didn't write the field, but the lock still freezes the section. This matches `defaults.locked`'s behavior (lock without mode still freezes inherited mode).
+- **Activating a lock counts as writing the section for provenance.** A locking-only layer with no field values still moves `sandboxWriter` so `/perms why sandbox` attributes the policy to the locking layer (where the operator can actually look to understand WHY the section is frozen). Without this, provenance would point to whichever earlier layer wrote a field — confusing when the policy is frozen by a different authority.
+- **Merged sandbox emits `locked: true`, never `locked: false`.** Consistent with how `defaults` emits locked. The `locked` flag is only meaningful when true; emitting `locked: false` would suggest the section explicitly UN-locks something (it doesn't — the absence of a lock IS the unlocked state).
+- **`mergedSandbox` emit-gate now includes `sandboxLockedBy !== null`.** Before this slice, the merged sandbox was emitted only when `sandboxRequired` OR `sandboxHostAllowed` was set. Now also when the lock is active, even with no field values. Captures the lock-only-layer case (test 4) — without this, the lock would be silently lost in the merged output.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5380 pass / 10 skip / 0 fail** (5390 total across 249 files); 6 new hierarchy tests on top of slice 33's 5374
+- `bun test tests/permissions/hierarchy.test.ts` — 32 pass (26 prior + 6 new)
+- Backwards-compatible: slice 23's existing sandbox tests pass unchanged; YAML files without `locked` produce identical merged policy.
+
+### Next
+
+Successor slices:
+1. **Per-field provenance for `sandbox`** — currently `provenance.sandbox` is a single Layer pointing at the last writer of ANY sandbox field. `/perms why sandbox` ergonomics would benefit from `{ required: Layer, hostAllowed: Layer, locked: Layer }`. Small slice.
+2. **ULID-shaped public approval ids** — independent storage tweak. Currently approval ids are seq-based; ULID makes them URL-safe and globally unique.
+3. **Grants table + TTL persistence** — implements §8 properly. Unblocks ttl_expiry conformance (~6 cases). Multi-slice undertaking.
+4. **macOS sandbox-exec** — SBPL profile generation + runtime wrap. Parallel to slices 18-21 on macOS.
+5. **MCP-tool spawn wire-up** — when MCP tools execute child processes.
+
+Remaining conformance: ttl_expiry (blocked on §8 grants table) + concurrency (separate driver). Conformance suite still at 123/136 = 90%.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 33: conformance suite — hash chain cases (§16.2 minimum)
 
 **Done.** Thirty-third slice. Sixth conformance top-up — and the one with the highest security-grade impact remaining. 8 cases pin §7.2 audit hash chain: chain construction (empty / single / multi-row), tamper detection at every break-path × every chain position, and forged-row insertion. The runner now spins up a real `bun:sqlite`-backed `createSqliteSink` (the same code path production uses), applies raw-SQL tampering, and checks `verifyChain`'s envelope. Suite grows **115 → 123** (90% of the §16.2 GA bar — past the 90% mark for the first time).

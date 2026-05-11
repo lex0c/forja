@@ -79,13 +79,17 @@ export interface PolicyDefaults {
 //     to be picked. The CLI flag remains as a session-scoped opt-in;
 //     policy + CLI compose via OR.
 //
-// Section-level lock (mirroring `defaults.locked`) is intentionally
-// deferred to a successor slice — none of the current operator
-// workflows need it yet, and adding it without a real use case would
-// be premature.
+// Section-level lock mirrors `defaults.locked` / `BashPolicy.locked` /
+// `PathPolicy.locked` / `FetchPolicy.locked`: when set in a higher-
+// precedence layer (enterprise > user > project > session), lower
+// layers cannot change `required` or `hostAllowed`. Re-affirming the
+// same values is silently OK; attempting to flip a locked field
+// records a `lockConflict` against `sandbox` and the lower layer's
+// change is discarded.
 export interface PolicySandbox {
   required?: boolean;
   hostAllowed?: boolean;
+  locked?: boolean;
 }
 
 export interface Policy {
