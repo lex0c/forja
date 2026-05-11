@@ -15,6 +15,62 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 66: fuzz harness §15.4 — `runFuzz` infra + glob target
+
+**Done.** Sixty-sixth slice. Opens the fuzz harness thread per spec §15.4 line 1114-1122 ("Target: 10⁹ iterations sem crash novo entre releases"). Ships the target-agnostic `runFuzz` runner with deterministic per-iteration seeding + the first of four required targets: the glob compiler (line 1117). Subsequent slices add bash resolver, policy parser, and hash chain verify targets.
+
+Closes the first half of production-ready checklist line 1289 ("Fuzz harness 10⁹ iterations sem crash novo"): infrastructure shipped, one target wired, 2000-iteration suite gate added. CI can crank to 10⁹ via a separate runner script — the harness is the same.
+
+### Why this matters
+
+Fuzz testing catches the long-tail of input combinations that golden tests miss: malformed glob patterns, edge-case ASCII sequences, adversarially-shaped paths. Without a harness, every regression in the matcher / bash parser / policy parser would only surface when a real user (or LLM) hits the exact failing input. Spec §15.4 line 1116-1120 mandates four fuzz targets covering the four parser-heavy subsystems; slice 66 ships the foundation + the glob target (the most-exercised matcher in the engine path).
+
+The **reproducibility contract** is the load-bearing design property: every crash record includes the per-iteration seed. An operator who sees a CI failure with `seed=42` can re-run with `seed=42, iterations=1` and deterministically reproduce the exact failing input. Without this, fuzz crashes would be non-actionable ("the harness crashed once on Tuesday").
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/fuzz/random.ts` (new, ~70 lines) | `mulberry32(seed)`: deterministic PRNG, public-domain algorithm, ~5ns per call, period 2^32. Helpers: `randInt(rng, min, max)` (inclusive), `randAsciiChar(rng)` (printable ASCII), `randAsciiString(rng, n)`, `randGlobChar(rng)` (40% glob metas: `*?/[]!\\{`; 60% ASCII), `randGlobString(rng, n)`. The glob-biased distribution is the key insight: pure-ASCII random rarely produces meaningful glob structure, so the matcher's special-case branches stay uncovered. |
+| `src/fuzz/index.ts` (new, ~120 lines) | `FuzzTarget<I>` interface: `name`, `generate(rng) → I`, `format(input) → string`, `run(input)`. Targets self-validate invariants via thrown errors (a returning `run` is a pass; any throw is a crash). `FuzzCrash<I>`: `iteration`, `seed`, `input`, `inputDisplay`, `error` — the seed is the reproducibility anchor. `FuzzResult<I>`: aggregated crashes + `iterations` + `durationMs` + `baseSeed`. `runFuzz(options)`: derives per-iteration seeds as `(baseSeed + i) >>> 0`, seeds mulberry32, calls `target.generate` then `target.run`, catches both generator throws (synthetic `<generator threw>` inputDisplay) and run throws (full input + formatted display). Seams: `seed` (default: `now()` for ad-hoc, fixed for CI), `now` (Date.now), `onCrash` (stream callback). |
+| `src/fuzz/targets/glob.ts` (new, ~50 lines) | `globFuzzTarget`: §15.4 line 1117. Generates `{pattern, target, cwd}` triples using `randGlobString`. Bounds: pattern len 0-64, target 0-128, cwd 1-32 (cwd biased to start with `/`). Run invariant: `matchPath(pattern, target, cwd)` MUST return a plain boolean — catches throws, undefined/NaN returns, and arithmetic in the compile pipeline. |
+| `tests/fuzz/harness.test.ts` (new, 8 tests) | **basic shape (3):** N iterations + empty crashes on clean target; every iteration's throw aggregated with iteration index + seed + formatted input; generator throws recorded as crashes with synthetic `<generator threw>` inputDisplay. **determinism (2):** same seed → same crash sequence (reproducibility contract); different seeds → different inputs (collision rejection). **seams (3):** default seed flows through `now()` seam; `onCrash` invoked per-crash as they happen; `durationMs` = delta between two `now()` calls. |
+| `tests/fuzz/glob-target.test.ts` (new, 4 tests) | 2000 iterations against `matchPath` produce no crashes (suite gate); format renders the three fields as single-line key=value with `JSON.stringify` escapes; format handles non-printable / quote-containing inputs without breaking the line; same seed produces same input (replay test using a capturing wrapper around `globFuzzTarget`). |
+
+### Decisions
+
+- **mulberry32 over crypto-secure RNG.** Fuzz needs statistical coverage, not cryptographic randomness. Mulberry32 is ~5ns/call vs ~500ns for `crypto.randomInt`; at 10⁹ iterations that's 500s of pure RNG overhead. Period 2^32 is enough — the `(baseSeed + i) >>> 0` derivation gives 4 billion distinct seeds before wrapping.
+- **Per-iteration seed = `(baseSeed + i) >>> 0`, not a global RNG sequence.** Each iteration gets its own PRNG instance seeded by `baseSeed + i`. Allows perfect reproducibility per-iteration: replaying with `seed = crash.seed, iterations = 1` produces the exact input. A shared sequential RNG would require replaying every prior iteration to reach the failing one.
+- **Glob-biased random characters, not pure ASCII.** Pure-random ASCII rarely produces glob metacharacters; the matcher's parser branches for `*`, `**`, `{a,b}`, `[abc]` would stay uncovered. The 40% bias is empirically chosen to balance triggering deep paths without making outputs unreadable in crash reports.
+- **`format()` separated from `run()`.** Targets render input for human-readable crash logs separately from running. JSON.stringify handles escaping; the test "format handles non-printable" verifies a crash with a `\n` in the pattern doesn't break the single-line CI log format.
+- **Generator throws recorded as crashes too.** A target's `generate` function CAN throw (programmer error) — recording these as crashes with a synthetic `<generator threw>` inputDisplay surfaces the issue without masking it. Important for slice 67+ when targets get more complex (e.g., random AST generation for the bash target).
+- **2000 iterations as the suite gate, not 10⁹.** 10⁹ takes hours; suite gates need to run in seconds. 2000 catches crashes that fire at rate ≥ 0.05% (i.e., 1-in-2000), which is the threshold below which it's mostly stress-test territory. CI can run 10⁹ via a separate nightly runner — the harness API is identical, just larger `iterations`.
+- **`baseSeed` flows through the `now()` seam when omitted.** Lets tests pin a fully-deterministic harness for end-to-end assertion (seed + duration both stable). Production: `now === Date.now` so the default seed is wall-clock-derived as the operator expects.
+- **No CLI verb in slice 66.** Operator runs fuzz via `bun test tests/fuzz/...` or programmatically. A `agent fuzz <target> --iterations N` CLI is a follow-up slice; for now, the test integration is sufficient for CI / dev workflow.
+- **`src/fuzz/` as a new top-level module under `src/`.** Parallel to `src/permissions/`, `src/cli/`, etc. Future targets (bash, policy, chain) slot under `src/fuzz/targets/`.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5750 pass / 10 skip / 0 fail** (5760 total across 268 files); +12 tests on top of slice 65's 5738 (8 harness + 4 glob target)
+- `bun test tests/fuzz/` — 12 pass
+- The 2000-iteration glob run currently produces ZERO crashes — the matcher is fuzz-robust on the current generator distribution.
+
+### Next
+
+Fuzz harness next targets per spec §15.4:
+
+1. **bash resolver** (line 1118): "random shell snippets → no panic, sempre Conservative ou Refuse em casos esquisitos". Generator produces glob-biased shell-shaped strings; invariant is "result.kind ∈ {ok, conservative, refuse}" (no throws).
+2. **policy parser** (line 1119): "random TOML → no crash". Generator emits random YAML/TOML; invariant is "throws are EXPECTED for malformed input but never panic the process".
+3. **hash chain verify** (line 1120): "corrupted rows → state=refusing, no panic". Generator corrupts random fields of seeded chain rows; invariant is "verifyChain returns ok=false, never throws".
+
+Each follow-up slice adds one target + tests; no further harness changes needed.
+
+Other remaining production-ready work: telemetria/OTEL (line 1213/§18, multi-slice with external SDK dep), s3-object-lock + rfc3161-tsa sealing backends, §13.7 broker/worker (biggest remaining thread).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 65: §16 capability_resolvers conformance closes — 15 new cases bring it to 30/30
 
 **Done.** Sixty-fifth slice. Closes the last remaining §16 conformance gap from slice 64: `capability_resolvers.yaml` was at 15/30. Ships +15 cases covering per-tool resolver behavior for read_file, write_file, edit_file, grep, glob, fetch_url, plus one more bash case to round to 30. Every §16 category now meets its per-category minimum (11/11 ✓). Production-ready checklist item line 1287 ("Conformance suite ≥ 136 casos passando") is now genuinely satisfied at the per-category level.
