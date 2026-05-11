@@ -15,6 +15,59 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 51: `engine.reloadPolicy()` — §12.3 hot reload primitive
+
+**Done.** Fifty-first slice. Ships the engine-side primitive for §12.3 hot reload. `engine.reloadPolicy(newPolicy)` swaps the active Policy atomically — recomputes `policy_hash`, updates `mode`, and the next `check()` consults the new rules. File-watch wiring (the resolver-side that detects YAML edits + triggers the reload) is a follow-up slice; this one ships the primitive everything else builds on.
+
+§12 thread is now functionally complete: 12.1 load order (existing), 12.2 validation (existing), 12.3 hot reload primitive (this slice), 12.4 rollback (slices 49 + 50). File-watch is the optional next step that makes 12.3 fire automatically.
+
+### Why this matters
+
+The engine was build-once-and-forget — once `createPermissionEngine(policy, ...)` ran, the policy was frozen for the engine's lifetime. The only way to pick up a policy edit was to restart Forja or rebuild the engine. That's operationally awkward: a long-running session that needs a quick policy tweak (add an allow rule mid-task) has to terminate and lose context.
+
+Slice 51 fixes the primitive. With `reloadPolicy()`, the engine can be told "new policy effective now" without rebuilding any other state (audit sink, session-allow, classifier, sandbox planner). In-flight `check()` calls run to completion against the old policy (single-threaded JS — no interruption); the swap takes effect on the NEXT call.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/engine.ts` | Three `const → let` conversions: `policy`, `policyHash`, `mode`. Constructor parameter renamed `policy` → `initialPolicy` to disambiguate from the mutable cell. Top-of-factory comment block explains the closure semantics (let bindings are by-reference; helpers reading `policy` / `mode` see the new value automatically). New `ReloadPolicyResult` exported type — discriminated union `{ok: true, oldHash, newHash} \| {ok: false, reason}` mirroring `verifyChain`. New `reloadPolicy(newPolicy)` method on the engine: defensive shape checks (null/non-object, missing `defaults`), canonical-hash computation (wrapped in try/catch for malformed policies), atomic swap of all three mutable cells, returns the hash transition. Old block comment about "hot reload is a separate slice that builds a new engine" rewritten — that's no longer accurate. |
+| `src/permissions/index.ts` | Re-export `ReloadPolicyResult` from the barrel. |
+| `tests/permissions/engine.test.ts` | New describe `engine.reloadPolicy — §12.3 hot reload (slice 51)` with 8 tests: successful swap returns hashes + mode updates; policy() getter returns new policy; check() consults new policy on next call (bash command goes from deny to allow); audit row carries new policy_hash after reload (verified via capturing sink); null / non-object newPolicy rejected with reason; missing `defaults` rejected; failed reload leaves engine in old state (non-destructive); session-allow preserved across reload (operator's pre-promoted patterns survive). |
+| `tests/cli/permission-policy-rollback.test.ts` | Tightened typing on test capture vars after Biome auto-format: replaced `let captured_path: string \| null = null` patterns with a `{path, content}` object literal whose union type doesn't get narrowed by TS to `null` after non-reassignment in scope. Functional tests unchanged. |
+
+### Decisions
+
+- **Mutable cells (let), not a wrapper object.** Considered `const policyRef = { current: initialPolicy }` and reading `policyRef.current` everywhere. Rejected: ~50 read sites would each need updating. The let-bound approach changes 3 declarations (policy, policyHash, mode) and leaves every closure-captured read working unchanged. JS `let` bindings ARE references in closures.
+- **Constructor parameter renamed `policy` → `initialPolicy`.** Without the rename, `let policy = policy` would self-shadow. The rename is a public-API change for ZERO callers (the closure's internal name doesn't affect callers); just makes the let-binding readable.
+- **`policy_hash` recomputed on every reload.** Without this, audit rows after a reload would carry the OLD hash even though the policy that authorized them was new — forensically misleading. `canonicalHash` is fast (~µs for realistic policies); recomputing per-reload is correct AND cheap.
+- **`mode` also tracked as mutable.** Same reason: a strict→acceptEdits reload should affect `engine.mode()` calls immediately. The getter `mode: () => mode` reads through the let-binding.
+- **Defensive validation in the engine, not by trusting the caller.** Spec line 736 says "if validate(new_policy) fails: emit policy_reload_failed event with details / keep old_policy". This slice ships the engine-side primitive's failure surface; the file-watcher (future slice) implements the wider validation (hierarchy re-resolve, lock conflicts). The engine's role is the LAST line of defense — even if the caller skips its own validation, malformed inputs can't corrupt the engine's enforcement state.
+- **No mutex / lock — JS is single-threaded.** Spec line 734-744 shows a mutex around the swap. JS's event loop runs callbacks atomically (no preemption mid-function). Adding a mutex would be ceremony without benefit. The Node.js `worker_threads` boundary is the only place real concurrency exists, and the engine doesn't cross it (each worker has its own engine instance).
+- **Failed reload is non-destructive.** Test 7 pins this — a bad reload doesn't corrupt the existing state, and re-reloading with the current policy succeeds. Engine remains usable after rejection.
+- **Session-allow survives reload.** Test 8 pins this — operators' pre-promoted patterns (the "Yes, don't ask again for: <rule>" answers) live in an in-memory Map keyed by section. Hot reload swaps the policy but leaves session-allow untouched. Reasonable default: an operator who said "yes for ls" doesn't expect a YAML edit elsewhere to clear that. If a future slice wants to surface "session-allow patterns that no longer match a policy section" as a warning, it can — but the patterns themselves stay.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched); applied Biome auto-format
+- `bun test` — **5555 pass / 10 skip / 0 fail** (5565 total across 259 files); 8 new tests on top of slice 50's 5547
+- `bun test tests/permissions/engine.test.ts` — 180 pass (172 prior + 8 new)
+
+### Next
+
+§12 thread is functionally complete at the primitive level. The remaining piece is the FILE WATCHER that uses `reloadPolicy()` to fire on disk edits — a separate slice that builds on this one. Plan: a `watchPolicyFiles({paths, onReload})` helper that wraps `node:fs.watch`, debounces rapid edits, re-resolves the hierarchy on change, validates, then calls `engine.reloadPolicy(newPolicy)`. Emits `policy_reloaded` / `policy_reload_failed` events to the audit log.
+
+Other remaining spec work:
+1. **File watcher for §12.3 hot reload** — consumes this slice's primitive.
+2. **§7.3 external sealing (worm-file backend)** — audit-grade for regulated deployments.
+3. **§19 v1→v2 migration** — translator + compat layer.
+4. **macOS sandbox-exec conformance** (extending slice 32's sandbox_select cases).
+5. **§13.7 broker/worker architecture** — multi-slice.
+6. **§14 MCP trust model** — blocked on MCP itself (M3+).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 50: `agent permission policy-rollback` (closes §12.4)
 
 **Done.** Fiftieth slice. Write side of §12.4 — pairs with slice 49's `policy-list` to close the policy archive surface. The verb is dry-run by default for safety; `--write` commits the canonical JSON bytes to the target file AND emits an audit event per spec line 756 ("Cada rollback é audit event").

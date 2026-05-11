@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from '../../src/cli/args.ts';
 import { runPermissionPolicyRollback } from '../../src/cli/permission-policy-rollback.ts';
-import { createSqliteSink, ensureInstallId } from '../../src/permissions/index.ts';
+import { ensureInstallId } from '../../src/permissions/index.ts';
 import { MIGRATIONS, migrate, openDb } from '../../src/storage/index.ts';
 import { listApprovalsLogByInstall } from '../../src/storage/repos/approvals-log.ts';
 import { archivePolicy } from '../../src/storage/repos/policy-archive.ts';
@@ -151,8 +151,10 @@ describe('runPermissionPolicyRollback', () => {
     const targetFile = join(tmp, 'permissions.yaml');
     writeFileSync(targetFile, 'stale content\n');
     const out = captured();
-    let captured_path: string | null = null;
-    let captured_content: string | null = null;
+    const captureBox: { path: string | null; content: string | null } = {
+      path: null,
+      content: null,
+    };
     const code = await runPermissionPolicyRollback({
       hash: HASH,
       target: targetFile,
@@ -162,8 +164,8 @@ describe('runPermissionPolicyRollback', () => {
       cwd: tmp,
       now: () => 5_000,
       writeFile: (p, c) => {
-        captured_path = p;
-        captured_content = c;
+        captureBox.path = p;
+        captureBox.content = c;
       },
       out: out.write,
       err: captured().write,
@@ -171,8 +173,8 @@ describe('runPermissionPolicyRollback', () => {
     expect(code).toBe(0);
     // File-write call captured (the writeFile stub doesn't actually
     // touch the filesystem; tests don't need real I/O for assertion).
-    expect(captured_path).toBe(targetFile);
-    expect(captured_content).toBe(CANONICAL);
+    expect(captureBox.path).toBe(targetFile);
+    expect(captureBox.content).toBe(CANONICAL);
     // Plain-text confirmation includes the bytes-written count.
     const text = out.lines.join('');
     expect(text).toContain('committed');
@@ -275,7 +277,7 @@ describe('runPermissionPolicyRollback', () => {
 
   test('default target is `.agent/permissions.yaml` relative to cwd', async () => {
     seedArchive([{ hash: HASH, canonical: CANONICAL }]);
-    let resolvedTarget: string | null = null;
+    const targetBox: { path: string | null } = { path: null };
     await runPermissionPolicyRollback({
       hash: HASH,
       // No `target` — handler picks default.
@@ -284,11 +286,11 @@ describe('runPermissionPolicyRollback', () => {
       env,
       cwd: tmp,
       writeFile: (p) => {
-        resolvedTarget = p;
+        targetBox.path = p;
       },
       out: captured().write,
       err: captured().write,
     });
-    expect(resolvedTarget).toBe(join(tmp, '.agent/permissions.yaml'));
+    expect(targetBox.path).toBe(join(tmp, '.agent/permissions.yaml'));
   });
 });

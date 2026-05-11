@@ -2567,3 +2567,163 @@ describe('engine.check — §8 grants (slice 40)', () => {
     expect(captured[0]?.reason_chain[0]?.stage).toBe('grant-match');
   });
 });
+
+describe('engine.reloadPolicy — §12.3 hot reload (slice 51)', () => {
+  test('successful swap: returns oldHash + newHash, mode updates', () => {
+    const eng = createPermissionEngine(
+      policy({ defaults: { mode: 'strict' }, tools: { bash: { allow: ['ls *'] } } }),
+      { cwd: CWD },
+    );
+    expect(eng.mode()).toBe('strict');
+    const result = eng.reloadPolicy(
+      policy({
+        defaults: { mode: 'acceptEdits' },
+        tools: { bash: { allow: ['*'] } },
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.oldHash).toMatch(/^sha256:/);
+      expect(result.newHash).toMatch(/^sha256:/);
+      expect(result.oldHash).not.toBe(result.newHash);
+    }
+    // mode() now returns the new policy's mode.
+    expect(eng.mode()).toBe('acceptEdits');
+  });
+
+  test('policy() getter returns the NEW policy after reload', () => {
+    const eng = createPermissionEngine(
+      policy({ defaults: { mode: 'strict' }, tools: { bash: { allow: ['ls *'] } } }),
+      { cwd: CWD },
+    );
+    expect(eng.policy().tools.bash?.allow).toEqual(['ls *']);
+    eng.reloadPolicy(
+      policy({
+        defaults: { mode: 'strict' },
+        tools: { bash: { allow: ['ls *', 'git status'] } },
+      }),
+    );
+    expect(eng.policy().tools.bash?.allow).toEqual(['ls *', 'git status']);
+  });
+
+  test('check() consults the NEW policy on the next call', () => {
+    const eng = createPermissionEngine(
+      policy({ defaults: { mode: 'strict' }, tools: { bash: { allow: ['ls *'] } } }),
+      { cwd: CWD },
+    );
+    // Pre-reload: `git status` denies (not in allow).
+    const beforeDecision = eng.check('bash', 'bash', { command: 'git status' });
+    expect(beforeDecision.kind).toBe('deny');
+    // Reload with a policy that allows `git status`.
+    eng.reloadPolicy(
+      policy({
+        defaults: { mode: 'strict' },
+        tools: { bash: { allow: ['ls *', 'git status*'] } },
+      }),
+    );
+    // Post-reload: `git status` allows.
+    const afterDecision = eng.check('bash', 'bash', { command: 'git status' });
+    expect(afterDecision.kind).toBe('allow');
+  });
+
+  test('audit row carries the NEW policy_hash after reload', () => {
+    interface CapturedRow {
+      policy_hash: string;
+    }
+    const captured: CapturedRow[] = [];
+    const sink = {
+      emit(input: CapturedRow) {
+        captured.push(input);
+        return { seq: captured.length, this_hash: `fake-${captured.length}` };
+      },
+      verifyChain() {
+        return {
+          ok: true as const,
+          rows: captured.length,
+          current_rotation_id: 0,
+          quarantined: false,
+        };
+      },
+    };
+    const eng = createPermissionEngine(
+      policy({ defaults: { mode: 'strict' }, tools: { bash: { allow: ['*'] } } }),
+      // biome-ignore lint/suspicious/noExplicitAny: stub captures input subset
+      { cwd: CWD, audit: sink as any },
+    );
+    eng.check('bash', 'bash', { command: 'ls' });
+    const oldHash = captured[0]?.policy_hash;
+    expect(oldHash).toMatch(/^sha256:/);
+    eng.reloadPolicy(
+      policy({ defaults: { mode: 'strict' }, tools: { bash: { allow: ['ls *'] } } }),
+    );
+    eng.check('bash', 'bash', { command: 'ls' });
+    const newHash = captured[1]?.policy_hash;
+    expect(newHash).toMatch(/^sha256:/);
+    expect(newHash).not.toBe(oldHash);
+  });
+
+  test('null / non-object newPolicy rejected with reason', () => {
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'strict' }, tools: {} }), {
+      cwd: CWD,
+    });
+    // biome-ignore lint/suspicious/noExplicitAny: deliberately bad input
+    const r1 = eng.reloadPolicy(null as any);
+    expect(r1.ok).toBe(false);
+    if (!r1.ok) expect(r1.reason).toContain('non-null object');
+    // biome-ignore lint/suspicious/noExplicitAny: deliberately bad input
+    const r2 = eng.reloadPolicy('not a policy' as any);
+    expect(r2.ok).toBe(false);
+  });
+
+  test('missing defaults rejected with reason', () => {
+    const eng = createPermissionEngine(policy({ defaults: { mode: 'strict' }, tools: {} }), {
+      cwd: CWD,
+    });
+    // biome-ignore lint/suspicious/noExplicitAny: deliberately missing field
+    const r = eng.reloadPolicy({ tools: {} } as any);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toContain('defaults');
+  });
+
+  test('failed reload leaves engine in old state (rejection is non-destructive)', () => {
+    const eng = createPermissionEngine(
+      policy({ defaults: { mode: 'strict' }, tools: { bash: { allow: ['ls *'] } } }),
+      { cwd: CWD },
+    );
+    const oldHash = (eng.reloadPolicy(eng.policy()) as { ok: true; newHash: string }).newHash;
+    // Try a bad reload.
+    // biome-ignore lint/suspicious/noExplicitAny: deliberately bad input
+    const result = eng.reloadPolicy(null as any);
+    expect(result.ok).toBe(false);
+    // Old policy still authoritative.
+    expect(eng.mode()).toBe('strict');
+    const after = eng.check('bash', 'bash', { command: 'ls -la' });
+    expect(after.kind).toBe('allow');
+    // Re-confirming hash hasn't shifted: re-reloading with the
+    // current policy yields the same oldHash → newHash relationship
+    // we'd seen before the bad reload.
+    const noop = eng.reloadPolicy(eng.policy());
+    expect(noop.ok).toBe(true);
+    if (noop.ok) expect(noop.oldHash).toBe(oldHash);
+  });
+
+  test('reload preserves session-allow state', () => {
+    // Session-allow lives in-memory per-engine. A reload should NOT
+    // clear it — operators don't expect their pre-promoted patterns
+    // to vanish on a YAML edit.
+    const eng = createPermissionEngine(
+      policy({ defaults: { mode: 'strict' }, tools: { bash: { allow: [] } } }),
+      { cwd: CWD },
+    );
+    eng.addSessionAllow('bash', 'echo hi');
+    const before = eng.check('bash', 'bash', { command: 'echo hi' });
+    expect(before.kind).toBe('allow');
+    eng.reloadPolicy(
+      policy({ defaults: { mode: 'strict' }, tools: { bash: { allow: ['ls *'] } } }),
+    );
+    // Session-allow still wins post-reload.
+    const after = eng.check('bash', 'bash', { command: 'echo hi' });
+    expect(after.kind).toBe('allow');
+    expect(after.source?.layer).toBe('session');
+  });
+});

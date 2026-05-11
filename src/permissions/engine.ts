@@ -213,10 +213,30 @@ export interface GrantSnapshot {
 // §6.3.2; the knob is `EngineOptions.scoreConfirmThreshold`.
 export const DEFAULT_SCORE_CONFIRM_THRESHOLD = 0.4;
 
+// §12.3 hot reload result. Discriminated union mirroring the
+// `verifyChain` pattern: callers branch on `ok` and consume the
+// hash transition on success or the diagnostic reason on failure.
+// The engine's responsibility is atomic swap + minimal sanity
+// validation; the caller (file watcher, policy resolver) is
+// responsible for upstream resolution + lock-conflict checks.
+export type ReloadPolicyResult =
+  | { ok: true; oldHash: string; newHash: string }
+  | { ok: false; reason: string };
+
 export interface PermissionEngine {
   check(toolName: string, category: PolicyCategory, args: ToolArgs): Decision;
   view(): PermissionsView;
   mode(): PolicyMode;
+  // §12.3 atomic policy swap. The new policy MUST be a Policy
+  // object the caller already resolved + validated (lock conflicts,
+  // hierarchy merge, etc); the engine does minimal shape checks
+  // and recomputes `policy_hash` for subsequent audit rows. Returns
+  // {ok: true, oldHash, newHash} on success; {ok: false, reason}
+  // when the policy fails canonical-hash computation or is
+  // missing required fields. Single-threaded JS means no in-flight
+  // check() can be interrupted — the swap takes effect on the
+  // NEXT check() call.
+  reloadPolicy(newPolicy: Policy): ReloadPolicyResult;
   // Current state per PERMISSION_ENGINE.md §2. Bootstrap walks the
   // engine through `init → loading-policy → validating-chain → ready`
   // before exposing it to the harness; runtime can transition between
@@ -1016,14 +1036,21 @@ const reasonChainFor = (decision: Decision): ReasonChainEntry[] => {
 };
 
 export const createPermissionEngine = (
-  policy: Policy,
+  initialPolicy: Policy,
   options: EngineOptions,
 ): PermissionEngine => {
+  // §12.3 hot reload: policy / mode / policyHash are mutable cells
+  // so `reloadPolicy()` can swap them atomically. JS `let` bindings
+  // are by-reference in closures, so check() (and every helper it
+  // calls through this scope) reads the CURRENT value on each
+  // access — no extra plumbing needed. The reloadPolicy method at
+  // the bottom of this factory updates all three.
+  let policy = initialPolicy;
   // Mode is optional on parsed policies (so the resolver can tell
   // "user file was silent" from "user file said strict explicitly")
   // but the engine needs a concrete value. Default to strict — same
   // policy as the empty-file fallback.
-  const mode = policy.defaults.mode ?? 'strict';
+  let mode: PolicyMode = policy.defaults.mode ?? 'strict';
   const cwd = options.cwd;
   const home = options.home ?? process.env.HOME ?? cwd;
   const provenance = options.provenance;
@@ -1051,12 +1078,11 @@ export const createPermissionEngine = (
     options.contextSummaryMaxBytes ?? DEFAULT_CONTEXT_SUMMARY_MAX_BYTES;
   const contextSummaryBuffer = createContextSummaryBuffer(contextSummaryDepth);
   const sandboxOptions = options.sandbox;
-  // policy_hash is stamped on every audit row. Computed ONCE at
-  // construction — the policy doesn't change for an engine
-  // instance (hot reload is a separate slice that builds a new
-  // engine). Canonical hash so two engines with semantically
+  // policy_hash is stamped on every audit row. Recomputed on hot
+  // reload (§12.3 / slice 51) so post-swap rows carry the new
+  // hash. Canonical hash so two engines with semantically
   // equivalent policies produce the same hash.
-  const policyHash = `sha256:${canonicalHash(policy)}`;
+  let policyHash = `sha256:${canonicalHash(policy)}`;
 
   // Session-scoped allowlist: per-section list of patterns the
   // operator promoted via the modal's "Yes, don't ask again
@@ -1633,5 +1659,34 @@ export const createPermissionEngine = (
     provenance: () =>
       structuredClone(options.provenance ?? ({ defaults: 'default' } as SectionProvenance)),
     addSessionAllow,
+    // §12.3 hot reload — atomic swap of policy + recompute hash +
+    // mode. Caller responsibility: resolve hierarchy, validate
+    // shape, check lock conflicts BEFORE invoking. Engine does
+    // minimal defensive checks (`canonicalHash` succeeds, `defaults`
+    // field present) and either commits the swap or returns a
+    // diagnostic. Single-threaded JS means in-flight check() calls
+    // run to completion before this fires.
+    reloadPolicy: (newPolicy: Policy): ReloadPolicyResult => {
+      if (newPolicy === null || typeof newPolicy !== 'object') {
+        return { ok: false, reason: 'reloadPolicy: newPolicy must be a non-null object' };
+      }
+      if (newPolicy.defaults === undefined || newPolicy.defaults === null) {
+        return { ok: false, reason: 'reloadPolicy: newPolicy missing required `defaults` field' };
+      }
+      let newHash: string;
+      try {
+        newHash = `sha256:${canonicalHash(newPolicy)}`;
+      } catch (e) {
+        return {
+          ok: false,
+          reason: `reloadPolicy: canonicalHash failed: ${(e as Error).message}`,
+        };
+      }
+      const oldHash = policyHash;
+      policy = newPolicy;
+      policyHash = newHash;
+      mode = newPolicy.defaults.mode ?? 'strict';
+      return { ok: true, oldHash, newHash };
+    },
   };
 };
