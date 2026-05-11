@@ -15,6 +15,78 @@ Format:
 
 ---
 
+## [2026-05-10] permission-engine-v2 — slice 9: subagent intersection formal (§10)
+
+**Done.** Ninth slice of the v2 evolution. Implements the spec §10.1 capability inheritance rule `effective_caps = parent_caps ∩ declared_caps`. The new `capabilityCovers` primitive answers "does this parent capability subsume this child capability?"; `intersectCapabilities` lifts that to lists, returning `effective` (covered subset, in declared order) and `excess` (the uncovered tail). The `task` / `task_sync` / `task_async` tools accept an optional `capabilities` array; the spawn factory in the harness loop intersects against the parent's capability snapshot and refuses spawns whose declared set isn't a subset, surfacing `subagent.escalation` as a tool error and a `subagent_escalation` row in `subagent_gate_decisions` for postmortem.
+
+### Why this design (and not "wire automatically from policy")
+
+Spec §10.1 is unambiguous on the math (`declared ⊆ parent` or refuse), but the **source** of parent_caps is interpretive — possible readings:
+- "Union of capabilities declared elsewhere in policy" — needs a new policy section + parser + ergonomics.
+- "Capabilities the parent actually exercised in this session" — frame-dependent, fragile under retroactive policy edits.
+- "Caller-declared snapshot passed at spawn time" — explicit, reproducible, traceable in the audit row.
+
+Slice 9 lands the third reading as the primitive plus opt-in plumbing. The harness loop's `spawnSubagentImpl` enforces the intersection only when BOTH `declaredCapabilities` AND `parentCapabilities` are populated; legacy task() calls (no `capabilities` arg) keep their existing toolset-based gating. A later slice will derive `parentCapabilities` from policy automatically so §10 becomes the default. Splitting the work this way keeps the spawn factory's guard byte-stable against the parent-snapshot derivation that comes later.
+
+### Coverage semantics (`capabilityCovers`)
+
+| Parent shape | Covers | Notes |
+|---|---|---|
+| Different `kind` | Never | `read-fs` doesn't cover `write-fs`. |
+| Scope-less kind (`env-mutate`, `agent-mutate`, `host-passthrough`) | Identity | Kind alone is the capability. |
+| `exec:arbitrary` | Every other exec class | The umbrella class. |
+| `exec:<class>` (non-arbitrary) | Same class only | `exec:shell` does NOT cover `exec:python`. |
+| `<kind>:**` or `<kind>:*` | Any scope of that kind | Universal wildcards. |
+| `<kind>:<literal>` | Identity match | `read-fs:src/index.ts` covers itself only. |
+| `<kind>:<prefix>/**` | `<prefix>` and `<prefix>/...` | Standard policy idiom (`read-fs:src/**` covers `read-fs:src/index.ts`). |
+| Mid-pattern wildcards (`src/*/x`) | Not recognized | Slice 9 minimal-but-sound; a future slice can add a real glob-subset solver. |
+
+Anything not in the table refuses. This is **conservative**: a more permissive matcher would risk false-positive coverage (parent looks like it covers child but actually doesn't), which is the unsafe direction for a security gate.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/capabilities.ts` | New `capabilityCovers(parent, child)` + `intersectCapabilities(parent[], declared[]): { effective, excess }`. `IntersectionResult` interface exported. Preserves declared order in both output arrays so audit rendering reflects the model's requested ordering. |
+| `src/tools/types.ts` | `SpawnSubagentArgs` gains optional `declaredCapabilities` + `parentCapabilities` (both `readonly string[]`). `SpawnSubagentResult` gains the `subagent_escalation` variant carrying `{ requested, excess: string[] }`. `recordGateDecision` decisionType union widened with `'subagent_escalation'`. |
+| `src/tools/builtin/task.ts` | `TaskInput.capabilities?: string[]` exposed in the input schema with operator-readable description. `execute` validates: array check, per-entry string check, `parseCapability` validity check — failures land as `invalidArg` with the offending entry. Validated array forwards into `ctx.spawnSubagent` as `declaredCapabilities`. New branch handles `result.kind === 'subagent_escalation'` → `subagent.escalation` tool error + `recordGateDecision` row with `excess` in details. |
+| `src/tools/builtin/task-await.ts` | Symmetric `subagent_escalation` branch — the async path catches the same envelope when the dispatcher refuses post-handle. |
+| `src/subagents/handle-store.ts` | `SubagentHandleSummary.kind` union widened so a settled-but-escalated handle surfaces in `task_list`. |
+| `src/tools/builtin/task-list.ts` | `TaskListEntry.kind` union widened to match the store summary. |
+| `src/harness/loop.ts` | `spawnSubagentImpl` runs the §10.1 intersection guard right after the budget gate. When both `declaredCapabilities` AND `parentCapabilities` are present in the args, it parses both, calls `intersectCapabilities`, and refuses with `subagent_escalation` carrying the formatted excess list. Defensive try/catch around `parseCapability` so a malformed string (programmer error past tool-layer validation) refuses rather than silently letting the spawn proceed. |
+| `src/storage/migrations/036-subagent-gate-escalation.ts` (new) | Widens the `subagent_gate_decisions.decision_type` CHECK constraint to include `subagent_escalation`. SQLite has no `ALTER TABLE … DROP CHECK`, so the migration uses the canonical create-new-table-and-rename pattern; row contents copied byte-for-byte from the existing table; index recreated. |
+| `src/storage/repos/subagent-gate-decisions.ts` | `GateDecisionType` union widened. |
+| `tests/permissions/capabilities-intersection.test.ts` (new) | 21 tests covering: different kinds never cover; scope-less identity; exec hierarchy (`arbitrary` umbrella + non-arbitrary literal-only); `**`/`*` universals; literal equality; `<prefix>/**` glob; mid-pattern wildcards rejected; intersect empty inputs; intersect coverage results; declared-order preservation. |
+| `tests/tools/task-capabilities.test.ts` (new) | 7 tests: array forwarded as `declaredCapabilities`; empty array forwarded verbatim (§10.1 pure-LLM); omission skips the field; non-array rejected; non-string entries rejected; malformed capability strings rejected; `subagent_escalation` envelope surfaces `subagent.escalation` tool error and records the audit row. |
+| `tests/tools/task.test.ts` + `tests/tools/task-async.test.ts` | Local `Decision` type aliases widened to match the wider `recordGateDecision` union. |
+
+### Decisions
+
+- **Opt-in plumbing, not auto-derive from policy.** The slice lands the primitive + guard + audit shape so callers can adopt §10 incrementally. Auto-derivation from the parent's effective policy comes later; until then, a caller (the harness loop or a test) explicitly snapshots and forwards `parentCapabilities`. This keeps the guard's byte-stable behavior independent of policy-shape iteration.
+- **Coverage rules are deliberately narrow.** The shapes listed in the coverage table are the ones policy authors actually write today (literals, universals, prefix globs). Mid-pattern wildcards (`src/*/x`) refuse coverage rather than producing a false positive. The spec PR can extend if a real workflow demands it; until then, narrower is safer.
+- **`exec:arbitrary` is the umbrella; non-arbitrary classes are siblings.** A parent with `exec:shell` does NOT cover `exec:python` — the model would have to escalate to `exec:arbitrary` to delegate any exec class. Mirrors the existing risk-score classification (slice 4 already treats `exec:arbitrary` as the riskier class).
+- **Declared order preserved across `effective` + `excess`.** Audit rendering displays capabilities in the order the model requested them; reordering would mask "the model declared X, Y, Z and got Y rejected" patterns useful for postmortem analysis.
+- **Pre-parse validation at the tool layer.** The `task` tool's `execute` body runs `parseCapability` on every entry before the spawn call. A malformed string surfaces as `invalidArg` with the offending entry; the model can self-correct without round-tripping through the spawn dispatcher. The spawn factory still re-parses defensively (try/catch around its own `parseCapability` calls) in case a non-tool caller bypasses the layer.
+- **`subagent_escalation` is a closed enum widening, not a free-form string.** Migration 036 widens the CHECK constraint explicitly; a future refusal kind will require its own migration. The friction is intentional — silent widening of the decision-type enum would let typos land as "valid" rows.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5107 pass / 10 skip / 0 fail** (5117 total across 240 files)
+
+### Next
+
+Successor slices (still in spec order):
+1. Sandbox plan integration (bwrap profile selection, §6.5).
+2. Context-summary builder for the classifier input.
+3. Replay tool (`agent permission replay`).
+4. Auto-derive `parentCapabilities` from policy snapshot at spawn time — completes the §10 wiring so the guard becomes the default rather than opt-in.
+5. `--accept-broken-chain` operator override (§7.2 second flag).
+6. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+
+---
+
 ## [2026-05-10] permission-engine-v2 — slice 8: --rotate-chain flow + quarantine state (§7.2)
 
 **Done.** Eighth slice of the v2 evolution. Implements the operator-driven chain rotation flow specified in `PERMISSION_ENGINE.md §7.2`: when the audit hash chain is broken (or preventively, after an incident scare), the operator runs `agent permission rotate-chain --reason "<text>"` to archive the current `approvals_log` segment under a new `rotation_id`, start a fresh chain from a distinct `GENESIS-ROTATED:<hash>`, and surface a `quarantined` flag in `agent permission verify` until the archived segment is inspected.

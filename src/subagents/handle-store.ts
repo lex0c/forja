@@ -80,7 +80,7 @@ export interface SubagentHandleSummary {
   // Without this discriminator, settled-without-summary was
   // ambiguous — model couldn't tell "ran with no summary"
   // from "refused"; with it, the surface is unambiguous.
-  kind?: 'ran' | 'unknown_subagent' | 'depth_exceeded' | 'budget_exhausted';
+  kind?: 'ran' | 'unknown_subagent' | 'depth_exceeded' | 'budget_exhausted' | 'subagent_escalation';
   // Present iff status is 'settled' and the envelope's `kind`
   // is `'ran'` (the only kind that carries a child outcome).
   // Other kinds — `unknown_subagent`, `depth_exceeded`,

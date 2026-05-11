@@ -185,6 +185,27 @@ export const taskAwaitTool: Tool<TaskAwaitInput, TaskAwaitOutput> = {
         },
       );
     }
+    if (result.kind === 'subagent_escalation') {
+      // PERMISSION_ENGINE.md §10.1 — declared capabilities exceeded
+      // parent's. Reachable when the originating task_async passed
+      // a `capabilities` array AND the dispatcher's later intersection
+      // refused. Mirrored from `task.ts`'s synchronous handler.
+      ctx.recordGateDecision?.({
+        decisionType: 'subagent_escalation',
+        toolName: 'task_async',
+        requestedName: result.requested,
+        details: { excess: result.excess },
+      });
+      return toolError(
+        'subagent.escalation',
+        `subagent '${result.requested}' requested capabilities beyond the parent's set: ${result.excess.join(', ')}`,
+        {
+          retryable: false,
+          hint: 'Spec §10.1: declared_caps must be a subset of parent_caps. Drop the excess entries from the `capabilities` array, or restructure the work so the subagent runs under the capabilities the parent itself can exercise.',
+          details: { subagent: result.requested, excess: result.excess },
+        },
+      );
+    }
     if (result.kind === 'budget_exhausted') {
       ctx.recordGateDecision?.({
         decisionType: 'budget_exhausted',

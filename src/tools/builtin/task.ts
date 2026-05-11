@@ -1,3 +1,4 @@
+import { parseCapability } from '../../permissions/capabilities.ts';
 import type { WorktreeOutcome } from '../../subagents/types.ts';
 import { ERROR_CODES, type Tool, type ToolResult, toolError } from '../types.ts';
 
@@ -18,6 +19,21 @@ export interface TaskInput {
   // Initial user prompt for the child run. The child sees only this
   // — no parent history is leaked.
   prompt: string;
+  // PERMISSION_ENGINE.md §10.1 declared capability set. Each entry
+  // is a capability string (kind:scope, e.g. `read-fs:src/**`).
+  // The spawn factory intersects this list against the parent's
+  // effective capability set; any entry NOT covered by the parent
+  // refuses the spawn with `subagent.escalation`.
+  //
+  // Three cases:
+  //   - Omitted (undefined): legacy path, no intersection guard
+  //     fires. Subagent runs under the existing toolset gating.
+  //   - Empty array: spec §10.1 "subagent receives NO capability"
+  //     — pure-LLM run (no fs/network/exec side effects).
+  //   - Non-empty array: each entry must parse cleanly AND be
+  //     covered by the parent capability snapshot; otherwise the
+  //     spawn is refused.
+  capabilities?: string[];
 }
 
 export interface TaskOutput {
@@ -71,6 +87,12 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
         type: 'string',
         description:
           'Self-contained user prompt for the child. Include all context the subagent needs — it has no view of this conversation.',
+      },
+      capabilities: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          'Optional capability list (PERMISSION_ENGINE.md §10). Each entry is a capability string like "read-fs:src/**", "exec:shell", "env-mutate". The spawned subagent receives only the intersection of these with the parent\'s capability snapshot; any capability outside the parent\'s set refuses the spawn. Omit to keep the legacy toolset-based gating; pass an empty array to run the subagent pure-LLM (no side-effect capabilities).',
       },
     },
     required: ['subagent', 'prompt'],
@@ -138,9 +160,45 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
       );
     }
 
+    // PERMISSION_ENGINE.md §10.1: validate every declared capability
+    // string parses to a well-formed Capability. Parse-fail is a
+    // model error (the model emitted a bogus kind / shape); surface
+    // it with the offending entry so the model can self-correct.
+    // Three cases survive validation:
+    //   - undefined  → no §10 guard (legacy path)
+    //   - []         → "pure-LLM" subagent (§10.1)
+    //   - [valid…]   → intersection guard at the spawn factory
+    let declaredCapabilities: string[] | undefined;
+    if (args.capabilities !== undefined) {
+      if (!Array.isArray(args.capabilities)) {
+        return toolError(
+          ERROR_CODES.invalidArg,
+          "'capabilities' must be an array of capability strings",
+        );
+      }
+      for (const entry of args.capabilities) {
+        if (typeof entry !== 'string') {
+          return toolError(
+            ERROR_CODES.invalidArg,
+            "'capabilities' entries must be capability strings (e.g. 'read-fs:src/**')",
+          );
+        }
+        try {
+          parseCapability(entry);
+        } catch (e) {
+          return toolError(
+            ERROR_CODES.invalidArg,
+            `'capabilities' entry '${entry}' is not a valid capability: ${(e as Error).message}`,
+          );
+        }
+      }
+      declaredCapabilities = args.capabilities;
+    }
+
     const result = await ctx.spawnSubagent({
       name: args.subagent,
       prompt: args.prompt,
+      ...(declaredCapabilities !== undefined ? { declaredCapabilities } : {}),
     });
     // Audit: the synchronous task family hits the dispatcher
     // first (no pre-flight check), so the three refusal kinds
@@ -178,6 +236,23 @@ export const taskTool: Tool<TaskInput, TaskOutput> = {
         {
           hint: 'Stop nesting task() calls. Either finish the work directly in this turn or restructure into a flatter chain.',
           details: { depth: result.depth, max_depth: result.maxDepth },
+        },
+      );
+    }
+    if (result.kind === 'subagent_escalation') {
+      ctx.recordGateDecision?.({
+        decisionType: 'subagent_escalation',
+        toolName: 'task_sync',
+        requestedName: result.requested,
+        details: { excess: result.excess },
+      });
+      return toolError(
+        'subagent.escalation',
+        `subagent '${result.requested}' requested capabilities beyond the parent's set: ${result.excess.join(', ')}`,
+        {
+          retryable: false,
+          hint: 'Spec §10.1: declared_caps must be a subset of parent_caps. Drop the excess entries from the `capabilities` array, or restructure the work so the subagent runs under the capabilities the parent itself can exercise.',
+          details: { subagent: result.requested, excess: result.excess },
         },
       );
     }

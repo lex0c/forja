@@ -196,7 +196,11 @@ export interface ToolContext {
   // can write its decision in one line — keeps tool code lean
   // and hides the db/sessionId binding inside the harness.
   recordGateDecision?: (input: {
-    decisionType: 'budget_exhausted' | 'unknown_subagent' | 'depth_exceeded';
+    decisionType:
+      | 'budget_exhausted'
+      | 'unknown_subagent'
+      | 'depth_exceeded'
+      | 'subagent_escalation';
     toolName: 'task' | 'task_sync' | 'task_async';
     requestedName: string;
     details: Record<string, unknown>;
@@ -303,9 +307,30 @@ export interface ToolContext {
 // Inputs the `task` tool passes through to the harness's subagent
 // runner. Kept narrow on purpose — the tool already validates the
 // model-supplied args; this type is just the spawn-side contract.
+//
+// Capability inheritance (PERMISSION_ENGINE.md §10.1):
+//   - `declaredCapabilities` — capability strings the model
+//     requested for the child via the `capabilities` task arg.
+//     Tool layer parses + validates the strings; this field
+//     carries them through verbatim so the spawn factory's
+//     intersection guard sees the exact bytes the model sent.
+//   - `parentCapabilities` — capability strings the harness loop
+//     snapshots from the parent's active policy at spawn time.
+//     The factory intersects declared ∩ parent; any declared cap
+//     NOT covered by some parent cap is `excess` and the spawn
+//     is refused with `subagent_escalation`.
+//
+// Both fields are optional. Legacy callers (no capabilities
+// declared in the task() invocation, OR a harness that doesn't
+// yet wire parentCapabilities into the ctx) skip the §10 guard
+// — the spawn proceeds under the existing toolset gating. Slice 9
+// lands the primitive + opt-in plumbing; a later slice wires
+// parentCapabilities derivation from policy automatically.
 export interface SpawnSubagentArgs {
   name: string;
   prompt: string;
+  declaredCapabilities?: readonly string[];
+  parentCapabilities?: readonly string[];
 }
 
 // Result discriminated by `kind` so the calling tool can map an
@@ -343,6 +368,19 @@ export type SpawnSubagentResult =
       estimate: number;
       projected: number;
       cap: number;
+    }
+  | {
+      // PERMISSION_ENGINE.md §10.1: refused because the declared
+      // capability set is NOT a subset of the parent's. `excess`
+      // is the formatted-string form of every declared capability
+      // the spawn factory could not match against parentCapabilities.
+      // The tool layer maps this onto `subagent.escalation` with
+      // `excess` in `details` so the operator can see exactly which
+      // capability the model asked for that wasn't already
+      // exercisable by the parent.
+      kind: 'subagent_escalation';
+      requested: string;
+      excess: string[];
     }
   | {
       kind: 'ran';

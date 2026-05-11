@@ -33,6 +33,7 @@ import { migration032RecapCache } from './032-recap-cache.ts';
 import { migration033RecapRunsCost } from './033-recap-runs-cost.ts';
 import { migration034ApprovalsLog } from './034-approvals-log.ts';
 import { migration035ChainRotation } from './035-chain-rotation.ts';
+import { migration036SubagentGateEscalation } from './036-subagent-gate-escalation.ts';
 
 export interface Migration {
   id: number;
@@ -76,4 +77,5 @@ export const MIGRATIONS: readonly Migration[] = [
   migration033RecapRunsCost,
   migration034ApprovalsLog,
   migration035ChainRotation,
+  migration036SubagentGateEscalation,
 ];

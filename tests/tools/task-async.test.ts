@@ -445,7 +445,11 @@ describe('task_async / task_await / task_cancel tools', () => {
     // is fail-soft in production; here we capture calls into
     // an array to verify shape + invocation count.
     type Decision = {
-      decisionType: 'budget_exhausted' | 'unknown_subagent' | 'depth_exceeded';
+      decisionType:
+        | 'budget_exhausted'
+        | 'unknown_subagent'
+        | 'depth_exceeded'
+        | 'subagent_escalation';
       toolName: 'task' | 'task_sync' | 'task_async';
       requestedName: string;
       details: Record<string, unknown>;
@@ -515,7 +519,11 @@ describe('task_async / task_await / task_cancel tools', () => {
     // kinds; each builds a store whose `spawnFn` returns the
     // refusal envelope (simulating the dispatcher's response).
     type Decision = {
-      decisionType: 'budget_exhausted' | 'unknown_subagent' | 'depth_exceeded';
+      decisionType:
+        | 'budget_exhausted'
+        | 'unknown_subagent'
+        | 'depth_exceeded'
+        | 'subagent_escalation';
       toolName: 'task' | 'task_sync' | 'task_async';
       requestedName: string;
       details: Record<string, unknown>;

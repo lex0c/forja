@@ -19,6 +19,11 @@ import {
   toolPlanHasWrites,
 } from '../critique/index.ts';
 import { type HookChainResult, type HookEventPayload, dispatchChain } from '../hooks/index.ts';
+import {
+  formatCapability,
+  intersectCapabilities,
+  parseCapability,
+} from '../permissions/capabilities.ts';
 import { addUsage, computeCost, emptyUsage } from '../providers/cost.ts';
 import type {
   GenerateRequest,
@@ -940,6 +945,46 @@ export const runAgent = async (config: HarnessConfig): Promise<HarnessResult> =>
                 estimate,
                 projected,
                 cap: budget.maxCostUsd,
+              };
+            }
+          }
+          // Capability intersection gate (PERMISSION_ENGINE.md §10.1).
+          // When the calling tool supplied BOTH `declaredCapabilities`
+          // (the model's requested set via the `capabilities` task
+          // arg) AND `parentCapabilities` (a snapshot of the parent's
+          // effective set), the spawn factory enforces declared ⊆
+          // parent. Any declared capability not covered by some
+          // parent capability refuses the spawn with the spec's
+          // `subagent_escalation` envelope; the tool surface maps
+          // it onto `subagent.escalation`.
+          //
+          // Both fields are optional. Legacy callers (omitted
+          // `capabilities` in task args, OR a parent path that
+          // doesn't yet wire `parentCapabilities`) skip this guard —
+          // §10 enforcement is opt-in at the call site for slice 9.
+          // A later slice wires parentCapabilities derivation from
+          // policy automatically, making §10 the default.
+          if (args.declaredCapabilities !== undefined && args.parentCapabilities !== undefined) {
+            try {
+              const declared = args.declaredCapabilities.map(parseCapability);
+              const parentCaps = args.parentCapabilities.map(parseCapability);
+              const { excess } = intersectCapabilities(parentCaps, declared);
+              if (excess.length > 0) {
+                return {
+                  kind: 'subagent_escalation',
+                  requested: args.name,
+                  excess: excess.map(formatCapability),
+                };
+              }
+            } catch (e) {
+              // Malformed capability string slipped through the
+              // tool-layer validation (programmer error, not a
+              // model error). Refuse defensively rather than
+              // silently letting the spawn proceed.
+              return {
+                kind: 'subagent_escalation',
+                requested: args.name,
+                excess: [`<parse error: ${(e as Error).message}>`],
               };
             }
           }

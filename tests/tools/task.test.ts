@@ -247,7 +247,11 @@ describe('task tool', () => {
     // spec §3.1) — the legacy `task` alias shares this
     // execute body.
     type Decision = {
-      decisionType: 'budget_exhausted' | 'unknown_subagent' | 'depth_exceeded';
+      decisionType:
+        | 'budget_exhausted'
+        | 'unknown_subagent'
+        | 'depth_exceeded'
+        | 'subagent_escalation';
       toolName: 'task' | 'task_sync' | 'task_async';
       requestedName: string;
       details: Record<string, unknown>;

@@ -140,6 +140,102 @@ export const sortCapabilities = (caps: readonly Capability[]): Capability[] => {
 // Convenience helpers for resolver authors. Read most resolvers as:
 //   readFs(path) → { kind: 'read-fs', scope: path }
 // instead of literal object literals — keeps shape consistent.
+// Does a `parent` capability cover a `child` capability per
+// PERMISSION_ENGINE.md §10.1 ("declared_caps ⊆ parent_caps")?
+// Coverage rules (deliberately small — extending the surface
+// requires a spec PR + conformance case):
+//
+//   1. Different kinds → never. exec doesn't cover read-fs, etc.
+//   2. Scope-less kinds (env-mutate, agent-mutate, host-passthrough):
+//      identity match (the kind alone IS the capability).
+//   3. exec hierarchy: `exec:arbitrary` covers every other class
+//      (`shell`, `python`, `node`); within the non-arbitrary set,
+//      only literal match (`exec:shell` does NOT cover `exec:python`).
+//   4. Scoped kinds with path/host patterns (read-fs, write-fs,
+//      delete-fs, git-write, net-egress, net-ingress, secret-access):
+//      coverage holds when the parent scope is one of —
+//        a. Universal wildcard `**` or `*`.
+//        b. Literal equality with the child scope.
+//        c. Prefix glob `<prefix>/**` where the child scope starts
+//           with `<prefix>/` or equals `<prefix>`.
+//      Anything more exotic (mid-pattern wildcards, character
+//      classes, brace expansion) is NOT recognized — parent has to
+//      use a supported shape, or the child capability cannot be
+//      proven safely covered.
+//
+// Rules 4.c handles the common policy idiom (`read-fs:src/**`
+// covers `read-fs:src/index.ts`) without bringing in a full
+// glob-vs-glob containment solver. The slice 9 spec PR records this
+// minimal-but-sound stance; broader patterns escalate to a future
+// slice with a real subset checker.
+export const capabilityCovers = (parent: Capability, child: Capability): boolean => {
+  if (parent.kind !== child.kind) return false;
+
+  // Scope-less kinds: the kind IS the capability.
+  if (KINDS_WITHOUT_SCOPE.has(parent.kind)) return true;
+
+  const pScope = parent.scope;
+  const cScope = child.scope;
+  if (pScope === null || cScope === null) return false;
+
+  // exec hierarchy. `arbitrary` is the umbrella; everything else is
+  // a literal class name.
+  if (parent.kind === 'exec') {
+    if (pScope === 'arbitrary') return true;
+    return pScope === cScope;
+  }
+
+  // Universal wildcards.
+  if (pScope === '**' || pScope === '*') return true;
+
+  // Literal equality.
+  if (pScope === cScope) return true;
+
+  // Prefix glob `<prefix>/**` covers `<prefix>` and `<prefix>/...`.
+  if (pScope.endsWith('/**')) {
+    const prefix = pScope.slice(0, -3);
+    if (prefix.length === 0) return true; // `**` alone, but handled above
+    return cScope === prefix || cScope.startsWith(`${prefix}/`);
+  }
+
+  return false;
+};
+
+// Apply the §10.1 intersection rule. Each `declared` capability that
+// IS covered by some `parent` capability survives into `effective`;
+// anything NOT covered lands in `excess`. The caller decides the
+// outcome (the spec says ANY excess → deny with `subagent_escalation`),
+// but exposing both arrays keeps the primitive composable.
+//
+// Behavior on empty inputs:
+//   - declared=[] → effective=[], excess=[]. Spec §10.1 maps this to
+//     "subagent receives NO capability" (pure-LLM); the empty
+//     effective list is exactly that signal.
+//   - parent=[] AND declared=[X, Y] → effective=[], excess=[X, Y].
+//     Every declared capability is unbacked.
+//
+// Order: `effective` preserves declared order so a downstream
+// audit/format step renders capabilities in the order the model
+// requested them; `excess` likewise.
+export interface IntersectionResult {
+  effective: Capability[];
+  excess: Capability[];
+}
+
+export const intersectCapabilities = (
+  parent: readonly Capability[],
+  declared: readonly Capability[],
+): IntersectionResult => {
+  const effective: Capability[] = [];
+  const excess: Capability[] = [];
+  for (const child of declared) {
+    const covered = parent.some((p) => capabilityCovers(p, child));
+    if (covered) effective.push(child);
+    else excess.push(child);
+  }
+  return { effective, excess };
+};
+
 export const readFs = (scope: string): Capability => ({ kind: 'read-fs', scope });
 export const writeFs = (scope: string): Capability => ({ kind: 'write-fs', scope });
 export const deleteFs = (scope: string): Capability => ({ kind: 'delete-fs', scope });
