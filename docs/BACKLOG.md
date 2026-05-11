@@ -15,6 +15,56 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 47: macOS sandbox-exec — SBPL profile generator (§6.5, foundation)
+
+**Done.** Forty-seventh slice. Opens the macOS sandbox-exec thread — the second-biggest platform gap remaining. Parallel to slice 18's bwrap argv synthesis on Linux. This slice ships the SBPL profile generator + sandbox-exec argv builder; runtime wire-up (the `maybeWrapSandboxArgv` dispatch by platform) is a follow-up.
+
+Slices 18-21 built the Linux/bwrap surface end-to-end. Linux is the only platform Forja can sandbox today. Operators on macOS get the `host` profile by default (per slice 23 detection — `detectSandboxAvailability` returns `available: false` on darwin since bwrap doesn't exist there). This slice starts closing that gap.
+
+### Why this matters
+
+macOS is a primary developer platform — every internal user on a Mac runs Forja unsandboxed because we don't generate SBPL profiles. The §13 doctor + setup verbs (slices 43-44) detect this and surface a "macOS sandbox-exec built into the OS" message, but the engine itself doesn't actually generate the profile string sandbox-exec needs. This slice fills that gap: the same five-profile shape from Linux now has a macOS implementation.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/sandbox-runner-macos.ts` (new, ~115 lines) | Two exports: `buildSbplProfile(profile, cwd, home)` builds the SBPL string for a given profile (excludes 'host' from the type — host has no profile by construction); `buildSandboxExecArgv({profile, cwd, home, innerArgv})` returns the full argv (`['sandbox-exec', '-p', <profile>, ...innerArgv]`). Profile rules: every sandboxed profile gets `(deny default)`, `(allow process-exec)`, `(allow process-fork)`, `(allow signal (target same-sandbox))`, `(allow sysctl-read)`, `(allow mach-lookup)`, `(allow file-read*)`, plus `(allow file-write* (subpath "/tmp"))` + `(subpath "/private/tmp")` + `(subpath "/private/var/folders")` for the ephemeral baseline. cwd-rw / cwd-rw-net add `(allow file-write* (subpath <cwd>))`; home-rw adds the same for `<home>`. cwd-rw-net adds `(allow network*)`. host returns innerArgv unchanged. `escapeSbplLiteral` escapes `"` and `\` defensively (filesystem paths rarely contain them, but a crafted cwd could otherwise close the string literal and inject SBPL clauses); null bytes throw. |
+| `src/permissions/index.ts` | Re-export `BuildSandboxExecArgvOptions`, `buildSandboxExecArgv`, `buildSbplProfile`. |
+| `src/permissions/sandbox-runner.ts` | Header comment updated — used to say "macOS is a parallel slice", now points at the actual macOS module + notes the dispatch wire-up is still pending. |
+| `tests/permissions/sandbox-runner-macos.test.ts` (new, 16 tests) | Common header + base rules (4: SBPL version + deny default in every profile; process-exec/fork/signal allowed; file-read* baseline; /tmp + /private/tmp + /private/var/folders writable). Per-profile (4: ro denies writes outside /tmp; cwd-rw adds cwd writable; cwd-rw-net adds network*; home-rw adds $HOME writable). Path escaping (3: `"` escaped, `\` escaped, NUL byte throws). buildSandboxExecArgv (5: host returns innerArgv unchanged, sandbox-exec -p wrap shape, cwd embedded in profile, no `--` separator unlike bwrap, empty innerArgv throws). |
+
+### Decisions
+
+- **Inline profile via `-p`, not file via `-f`.** sandbox-exec accepts both. Profile size is ~500 bytes per profile — small enough that the inline form's argv overhead is negligible, and we avoid managing tempfile lifecycle (create + write + clean up on exec failure). Profiles are immutable per-spawn; there's no benefit to persisting them.
+- **Same five-profile shape as Linux.** ro / cwd-rw / cwd-rw-net / home-rw / host. The planner (slice 10's `selectSandboxProfile`) already returns these labels; the macOS builder consumes them verbatim. Platform-specific differences live entirely inside the profile string, NOT in the profile name. This means a future spawn-site dispatch can switch between Linux/bwrap and macOS/sandbox-exec without touching the planner.
+- **`/tmp` AND `/private/tmp` AND `/private/var/folders` writable.** macOS routes /tmp through /private/tmp via a firmlink; some path resolutions return one form, some the other. Granting both keeps wrapped commands working without operators worrying about the canonical form. /private/var/folders is macOS's per-user TMPDIR — mktemp / NSTemporaryDirectory land there. Three subpaths instead of one matches the property "ephemeral scratch is writable" from the Linux profile's `--tmpfs /tmp`.
+- **`signal (target same-sandbox)`.** A wrapped process can signal others in the same sandbox (e.g. shell-fork chains) but CANNOT signal the parent agent. Mirrors the Linux profile's `--unshare-pid` (the wrapped process can't even see parent pids to signal them).
+- **`sysctl-read` + `mach-lookup` mandatory.** Without these, every exec fails — macOS stdlib reads sysctl during process init, and dyld needs mach-lookup for system services. Including them by default is "you can start the process at all", not a permission grant. Linux's equivalent is implicit in not unsharing the user namespace.
+- **`network*` for cwd-rw-net (full bundle).** SBPL has finer-grained controls (network-outbound vs network-inbound vs network-bind), but the planner already gated this profile on having the `net-egress` capability in the resolved set. Granting the full bundle matches Linux's "let the parent network namespace through" semantics — the engine doesn't sub-divide network in either platform.
+- **Path escaping defensive even though paths rarely contain `"` or `\`.** A crafted cwd containing `"` could otherwise close the SBPL string literal and inject extra clauses (e.g. `cwd = '/tmp" (allow file-write* (subpath "/"))'` would unlock the entire FS). Cheap to escape; expensive to forget.
+- **`buildSbplProfile` rejects `'host'` at the type level (`Exclude<SandboxProfile, 'host'>`).** The host profile means "no wrap" — there's no profile to build. Forcing the caller to short-circuit host BEFORE calling builds catches a class of bugs at compile-time.
+- **No runtime wire-up THIS slice.** Slice 18 also shipped the bwrap argv builder before any spawn site consumed it; slices 19-21 wired it in. Same staging here — pure-function file ships first, dispatch update comes next. Splits review surfaces cleanly.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5516 pass / 10 skip / 0 fail** (5526 total across 257 files); 16 new tests on top of slice 46's 5500
+- `bun test tests/permissions/sandbox-runner-macos.test.ts` — 16 pass
+
+### Next
+
+macOS sandbox-exec thread — remaining slices:
+1. **Dispatch by platform in `maybeWrapSandboxArgv`**. Read `process.platform` + `Bun.which('sandbox-exec')`, route to `buildSandboxExecArgv` on darwin. Parallel to slice 19's Linux wire-up.
+2. **Tool-specific spawn sites**: grep / glob / bash-background — every site that today calls `maybeWrapSandboxArgv` works on darwin automatically once the dispatch lands. Audit each site to verify no Linux-specific assumptions (path conventions, /tmp shape, etc) leak.
+3. **macOS-specific availability**: `detectSandboxAvailability` already returns `available: false` on darwin (probes for bwrap only). Extend to probe `sandbox-exec` too. Doctor + sandbox setup output update to reflect the new state.
+4. **Conformance**: extend the `sandbox_select` conformance shape (slice 32) with platform-pinned cases — pre-slice-47 the engine never produced macOS profiles; now it can.
+
+Other remaining spec work (from inventory): §12.4 rollback CLI (small), §12.3 hot reload (medium), §7.3 sealing (audit-grade), §19 migration (medium).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 46: first-boot nudge (closes §13.5)
 
 **Done.** Forty-sixth slice. Closes the §13.5 first-boot UX loop: when an operator runs Forja for the first time (install_id file doesn't exist) on any verb except the §13 setup verbs themselves, a one-line stderr nudge points them at `agent welcome`. Self-extinguishing — the next normal bootstrap creates install_id and the nudge stops firing.

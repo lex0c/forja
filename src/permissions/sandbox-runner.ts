@@ -12,12 +12,13 @@
 // today; one helper per profile, all returning string[] for the
 // caller to hand to Bun.spawn.
 //
-// Platform: Linux only. macOS (sandbox-exec) uses SBPL profile
-// files with a different syntax; that's a parallel slice and the
-// caller is expected to skip wrapping when `process.platform !==
-// 'linux'`. Detection lives at the bootstrap layer
-// (`detectSandboxAvailability`) — this module trusts the profile
-// argument and never inspects environment.
+// Platform: Linux only. macOS uses sandbox-exec / SBPL — see
+// `sandbox-runner-macos.ts` (slice 47). Spawn-site dispatch by
+// platform lives in `maybeWrapSandboxArgv` (currently Linux-only;
+// a follow-up slice updates it to route to the macOS builder
+// when `process.platform === 'darwin'`). Detection lives at the
+// bootstrap layer (`detectSandboxAvailability`) — this module
+// trusts the profile argument and never inspects environment.
 //
 // Profile flag rationale (spec §6.5 mounts/network/process columns):
 //
