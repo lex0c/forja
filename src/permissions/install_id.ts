@@ -50,6 +50,26 @@ export interface EnsureInstallIdOptions {
   pathOverride?: string;
 }
 
+export interface IsFirstBootOptions {
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  pathOverride?: string;
+}
+
+// True when the install_id file doesn't exist yet — slice 46 uses
+// this to render a one-line nudge ("try `agent welcome`") on the
+// operator's first invocation of any normal verb. Returns false when
+// the path can't be derived (no $HOME / $XDG_CONFIG_HOME / %APPDATA%)
+// so the nudge stays silent in degraded environments; ensureInstallId
+// will throw on bootstrap and surface the actionable error there.
+export const isFirstBoot = (options: IsFirstBootOptions = {}): boolean => {
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const path = options.pathOverride ?? installIdPath(env, platform);
+  if (path === null) return false;
+  return !existsSync(path);
+};
+
 // Reads existing identity or generates+writes a fresh one. Idempotent:
 // repeated calls in the same install return the same identity. Throws
 // when:

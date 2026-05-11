@@ -24,6 +24,23 @@ const main = async (): Promise<number> => {
     return 0;
   }
 
+  // §13.5 first-boot nudge (slice 46). Fires when install_id doesn't
+  // exist yet, EXCEPT on §13 verbs (welcome/doctor/sandbox) — the
+  // operator is already on the setup path and pointing them back to
+  // it would be noise. Goes to stderr so stdout stays pure for JSON
+  // consumers; one-shot per install (install_id gets created by the
+  // next normal bootstrap and the nudge stops firing).
+  const inSetupFlow =
+    args.welcome === true || args.doctor !== undefined || args.sandbox !== undefined;
+  if (!inSetupFlow) {
+    const { isFirstBoot } = await import('../permissions/install_id.ts');
+    if (isFirstBoot()) {
+      process.stderr.write(
+        'forja: first run detected — try `agent welcome` for a setup walkthrough.\n',
+      );
+    }
+  }
+
   // `agent init` — scaffold .agent/permissions.yaml. Pure
   // filesystem work, no provider/DB needed; same lazy-import
   // posture as the other handlers below so a broken provider

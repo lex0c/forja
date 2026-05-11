@@ -15,6 +15,76 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 46: first-boot nudge (closes §13.5)
+
+**Done.** Forty-sixth slice. Closes the §13.5 first-boot UX loop: when an operator runs Forja for the first time (install_id file doesn't exist) on any verb except the §13 setup verbs themselves, a one-line stderr nudge points them at `agent welcome`. Self-extinguishing — the next normal bootstrap creates install_id and the nudge stops firing.
+
+### Why this matters
+
+Slices 43-45 built the §13 surface (doctor + sandbox setup + welcome) but operators have to KNOW the verbs exist to use them. A new user installing Forja and typing `agent "what's in this repo?"` would get the normal bootstrap output with no hint that there's a guided walkthrough available. The nudge closes the discovery gap — first-run users see the pointer, run `agent welcome`, get the full intro flow, then never see the nudge again.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/install_id.ts` | New `isFirstBoot({env?, platform?, pathOverride?})` helper. Returns true when the install_id file doesn't exist; returns false when the path can't be derived (defensive — don't nudge in degraded environments since `ensureInstallId` will throw with the real diagnostic on bootstrap). New `IsFirstBootOptions` interface mirrors the existing test seams. |
+| `src/permissions/index.ts` | `isFirstBoot` + `IsFirstBootOptions` re-exported from the barrel. |
+| `src/cli/index.ts` | New nudge block after the `--version` short-circuit, before the `init` / dispatch path. Gates on `!inSetupFlow` (where `inSetupFlow = args.welcome || args.doctor !== undefined || args.sandbox !== undefined`). Lazy-imports `isFirstBoot` so the help / version paths don't touch the install_id check. Writes the one-line tip to stderr (stdout stays pure for JSON consumers). |
+| `tests/permissions/install_id.test.ts` | New `isFirstBoot (slice 46)` describe with 4 tests: returns true when file missing, returns false after `ensureInstallId` creates it (round-trip), returns false in degraded env (no $HOME), honors env-discovered XDG_CONFIG_HOME path. |
+
+### Behavior
+
+```
+$ HOME=/tmp/fresh agent --list-sessions
+forja: first run detected — try `agent welcome` for a setup walkthrough.
+no sessions found.
+
+$ HOME=/tmp/fresh agent welcome
+Welcome to Forja!
+...                                # NO nudge — operator is already on the setup path
+
+$ HOME=/tmp/fresh agent doctor
+platform                           # NO nudge — same rationale
+  status: ok
+...
+
+# After running anything that calls ensureInstallId (single-shot prompt, REPL,
+# `agent permission verify`), the install_id file exists and the nudge
+# stops firing for every subsequent verb.
+```
+
+### Decisions
+
+- **Suppress the nudge for §13 verbs (welcome/doctor/sandbox).** The operator running any of these is already inspecting the environment; pointing them at `agent welcome` from inside the welcome flow is silly. The suppression list is narrow — every OTHER verb (init, prompt, --list-sessions, permission *, recap, etc.) gets the nudge on first boot.
+- **Don't suppress for `init`.** Init is project-local scaffolding (.agent/permissions.yaml); welcome is install-level. A new operator running `agent init` to scaffold a policy file in their project should still see the install-level pointer — they'll need to run a prompt or REPL eventually, and welcome is the natural next step.
+- **Stderr, not stdout.** Project convention (CLAUDE.md hard rules: "stdout is pure, stderr is for logs"). JSON consumers piping `agent --list-sessions --json` get pure NDJSON on stdout; the nudge lands on stderr where it doesn't pollute the parse stream.
+- **Lazy import of `isFirstBoot`.** The check involves an `existsSync` syscall + path derivation; not free. Lazy-loading it means `--help` / `--version` (which short-circuit above) skip the check entirely. Help and version are also the noisiest places to add anything; keeping them lean.
+- **`isFirstBoot()` returns false in degraded env.** When $HOME / $XDG_CONFIG_HOME / %APPDATA% all missing, `installIdPath` returns null. The nudge contract says "render when first boot", not "render when something's wrong" — silent false in that case keeps the nudge focused. The bootstrap path will throw with the real "cannot determine config directory" error on the NEXT call.
+- **Self-extinguishing — no flag to suppress permanently.** A `--no-nudge` flag would add config-state to the operator's mental model for a one-time message. The nudge fires at most a handful of times per install (any normal verb that doesn't suppress + creates install_id → nudge stops). Operators who run `agent welcome` first never see it.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched); applied Biome auto-format
+- `bun test` — **5500 pass / 10 skip / 0 fail** (5510 total across 256 files); 4 new tests on top of slice 45's 5496
+- `bun test tests/permissions/install_id.test.ts` — 11 pass (7 prior + 4 new isFirstBoot tests)
+- Manual smoke: `HOME=$(mktemp -d) bun src/cli/index.ts --list-sessions` shows the nudge; `HOME=$(mktemp -d) bun src/cli/index.ts welcome` does NOT.
+
+### Next
+
+§13 platform provisioning thread is now substantively complete (doctor + sandbox setup + welcome + first-boot nudge). Remaining §13 work is non-foundational:
+- **Broker/worker architecture (§13.7)**: multi-slice, needed for sandboxed-cap subagents.
+- **Doctor extensions**: kernel-feature probe (Linux unshare / namespaces / cgroups), `/tmp` size + permissions, container detection (docker / podman / k8s), Forja own-binary integrity.
+
+Highest-value remaining work outside §13 (from the spec inventory):
+1. **macOS sandbox-exec** — second-biggest platform gap. SBPL profile generator + runtime wrap. Multi-slice undertaking parallel to slices 18-21 on Linux.
+2. **§12.4 `agent permission policy rollback`** — `policy_history` exists; CLI doesn't. Small.
+3. **§12.3 hot reload** — file-watch + `reload_policy` transition (state machine ready). Medium.
+4. **§7.3 external sealing** — worm-file backend (simplest of the four). Audit-grade.
+5. **§19 v1→v2 migration** — translator + compat layer. Medium.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 45: `agent welcome` — first-boot walkthrough (§13.5)
 
 **Done.** Forty-fifth slice. Third on the §13 thread. Composes slice 43 (`agent doctor`) + slice 44 (`agent sandbox setup`) into a single guided walkthrough for first-time operators. Spec §13.5 calls for first-boot UX; this slice ships it as an operator-invokable verb.

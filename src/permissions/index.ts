@@ -98,8 +98,8 @@ export {
   isRejectingState,
 } from './state-machine.ts';
 
-export type { InstallIdentity, EnsureInstallIdOptions } from './install_id.ts';
-export { ensureInstallId } from './install_id.ts';
+export type { InstallIdentity, EnsureInstallIdOptions, IsFirstBootOptions } from './install_id.ts';
+export { ensureInstallId, isFirstBoot } from './install_id.ts';
 
 export {
   allProtectedRoots,

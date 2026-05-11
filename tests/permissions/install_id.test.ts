@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ensureInstallId } from '../../src/permissions/install_id.ts';
+import { ensureInstallId, isFirstBoot } from '../../src/permissions/install_id.ts';
 
 describe('ensureInstallId', () => {
   let tmp: string;
@@ -101,5 +101,54 @@ describe('ensureInstallId', () => {
     });
     expect(existsSync(join(tmp, '.config', 'agent', 'install_id'))).toBe(true);
     expect(id.install_id).toBe('discovered-path-uuid');
+  });
+});
+
+describe('isFirstBoot (slice 46)', () => {
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'forja-first-boot-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  test('returns true when the install_id file does not exist', () => {
+    const path = join(tmp, 'agent', 'install_id');
+    expect(isFirstBoot({ pathOverride: path })).toBe(true);
+  });
+
+  test('returns false after ensureInstallId creates the file', () => {
+    const path = join(tmp, 'agent', 'install_id');
+    ensureInstallId({
+      pathOverride: path,
+      now: () => 1731000000000,
+      uuid: () => 'first-boot-test-uuid',
+    });
+    expect(isFirstBoot({ pathOverride: path })).toBe(false);
+  });
+
+  test('returns false when the path cannot be derived (no env, silently)', () => {
+    // No HOME / XDG_CONFIG_HOME / APPDATA — installIdPath returns
+    // null. Slice 46 contract: don't nudge in this state (the
+    // bootstrap error path will surface the real diagnostic).
+    expect(isFirstBoot({ env: {}, platform: 'linux' })).toBe(false);
+  });
+
+  test('honors env-discovered path on Linux', () => {
+    const cfg = join(tmp, '.config');
+    expect(isFirstBoot({ env: { HOME: tmp, XDG_CONFIG_HOME: cfg }, platform: 'linux' })).toBe(true);
+    // Create the discovered file and re-check.
+    ensureInstallId({
+      env: { HOME: tmp, XDG_CONFIG_HOME: cfg },
+      platform: 'linux',
+      now: () => 1731000000000,
+      uuid: () => 'env-discover-uuid',
+    });
+    expect(isFirstBoot({ env: { HOME: tmp, XDG_CONFIG_HOME: cfg }, platform: 'linux' })).toBe(
+      false,
+    );
   });
 });
