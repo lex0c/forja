@@ -435,12 +435,20 @@ const parseRecapSubcommand = (argv: readonly string[]): ParseResult | null => {
 //                   default — operator action without a written reason
 //                   is audit-hostile and rejected at parse.
 //
+// Verbs:
+//   verify        — walk the audit hash chain.
+//   rotate-chain  — archive + start a fresh chain (§7.2).
+//   replay        — render every input the engine saw for a past
+//                   decision identified by its seq, flag policy
+//                   drift (§17). Slice 12 ships default mode only;
+//                   --against-current-policy / --without-classifier
+//                   / `permission diff` land in successor slices.
+//
 // Future verbs (each lands in its own slice):
-//   replay   — replay decision against current policy
 //   revoke   — drop a session/pattern grant
 //   list     — show approvals log entries
 //   test     — run conformance suite
-const KNOWN_PERMISSION_VERBS = ['verify', 'rotate-chain'] as const;
+const KNOWN_PERMISSION_VERBS = ['verify', 'rotate-chain', 'replay'] as const;
 
 const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null => {
   if (argv.length === 0 || argv[0] !== 'permission') return null;
@@ -506,6 +514,32 @@ const parsePermissionSubcommand = (argv: readonly string[]): ParseResult | null 
         ok: false,
         message:
           'agent permission rotate-chain: --reason <text> is required (forensic record of why the chain was rotated)',
+      };
+    }
+  }
+  if (verb === 'replay') {
+    // <seq> is a single positional. We reject zero/negative/non-numeric
+    // upstream — exact integer parsing keeps the runtime handler's
+    // contract tight (no NaN, no fractional ids).
+    if (positionals.length !== 1) {
+      return {
+        ok: false,
+        message:
+          'agent permission replay: exactly one <seq> positional is required (e.g. `agent permission replay 42`)',
+      };
+    }
+    const raw = positionals[0] as string;
+    if (!/^\d+$/.test(raw)) {
+      return {
+        ok: false,
+        message: `agent permission replay: <seq> must be a positive integer (got '${raw}')`,
+      };
+    }
+    const seq = Number.parseInt(raw, 10);
+    if (seq <= 0 || !Number.isSafeInteger(seq)) {
+      return {
+        ok: false,
+        message: `agent permission replay: <seq> out of range (got ${raw})`,
       };
     }
   }

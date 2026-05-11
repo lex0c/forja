@@ -200,6 +200,22 @@ export const run = async (options: RunOptions): Promise<number> => {
           err: errSink,
         });
       }
+      if (args.permission.verb === 'replay') {
+        // <seq> positional + numeric range are enforced at parse time.
+        // The handler re-parses defensively in case a programmatic
+        // caller bypasses the CLI.
+        const seq = Number.parseInt(args.permission.positionals[0] ?? '0', 10);
+        const { runPermissionReplay } = await import('./permission-replay.ts');
+        return await runPermissionReplay({
+          seq,
+          json: args.json,
+          ...(options.bootstrapOverride?.dbPath !== undefined
+            ? { dbPath: options.bootstrapOverride.dbPath }
+            : {}),
+          out: (s) => process.stdout.write(s),
+          err: errSink,
+        });
+      }
       // The arg parser already rejects unknown verbs; this branch
       // catches the impossible-but-safe case of a verb the dispatch
       // doesn't know how to route.

@@ -50,10 +50,12 @@ describe('parseArgs — permission subcommand', () => {
   });
 
   test('unknown verb fails parse', () => {
-    const r = parseArgs(['permission', 'replay']);
+    // `revoke` is listed in the spec's future-verb table but not yet
+    // implemented — known-unknown for this test.
+    const r = parseArgs(['permission', 'revoke']);
     expect(r.ok).toBe(false);
     if (!r.ok) {
-      expect(r.message).toContain('replay');
+      expect(r.message).toContain('revoke');
       expect(r.message).toContain('verify');
     }
   });

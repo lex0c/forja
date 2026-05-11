@@ -15,6 +15,58 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 12: replay tool default mode (§17)
+
+**Done.** Twelfth slice of the v2 evolution. Lands `agent permission replay <seq>` — the spec §17 forensic surface for "qual decisão liberou X?". Slice 12 ships the **default mode only**: read the approvals_log row, render every preserved input, flag policy drift. The two extension modes (`--against-current-policy`, `--without-classifier`) and the cross-row `agent permission diff <id1> <id2>` are deferred — they all require a `policy_archive` table the slice deliberately doesn't add yet.
+
+### Scope: render the past, don't re-execute it (yet)
+
+Replay's authoritative inputs (§17 ".1 inputs preservados") are already on the row: `args_hash`, `capabilities_json`, `policy_hash`, `resolver_version`, `classifier_hash`, `score_components_json`. The deterministic re-execution paths the spec describes need MORE:
+
+- The ORIGINAL policy bytes (we keep only the hash on the row; the file may have changed).
+- The ORIGINAL resolver code at the version the row references.
+- The ORIGINAL classifier state at the hash the row references.
+
+`policy_archive` would let us snapshot bytes per-hash and look them up here, but that's a separate concern with its own retention semantics — out of scope. This slice solves the immediately useful case: "render every signal the engine recorded; flag drift if the policy isn't the same one anymore."
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/cli/permission-replay.ts` (new) | `runPermissionReplay({ seq, json, dbPath, env, cwd, out, err })`. Resolves `install_id`, opens DB, looks up the row by `seq`, refuses if the row's `install_id` doesn't match the active install (cross-install replay would be a forensic-data leak). Renders four sub-objects (`capabilities`, `score_components`, `reason_chain`) parsed from their `*_json` columns. Computes `canonicalHash(resolvePolicy(...))` for the active policy and compares against the row — drift detected, drift undecidable (resolvePolicy threw), or no drift. Three branches with distinct operator-readable lines. |
+| `src/cli/args.ts` | `replay` joins `verify` + `rotate-chain` in `KNOWN_PERMISSION_VERBS`. Parser accepts exactly one positional, validates with `^\d+$` (rejects negatives, fractions, scientific notation), then `Number.isSafeInteger` + `> 0` (rejects 0 and overflow). Mismatches surface operator-readable errors. |
+| `src/cli/run.ts` | Dispatch branch — parses the validated seq from `positionals[0]` (parser already enforced shape) and delegates to `runPermissionReplay`. |
+| `tests/cli/permission-replay.test.ts` (new) | 15 tests — parse (numeric seq, missing seq, non-numeric, zero, negative, multiple positionals, --json, unknown verb message mentions replay) and execution (text output renders every field; JSON output is one NDJSON line with parsed sub-objects; row missing returns 1 with `not_found`; row from a different install returns 1; JSON not_found shape includes install_id + seq; policy drift NOT fires when row's hash equals the active hash; malformed active policy is swallowed and `active policy unavailable` is shown). |
+| `tests/cli/permission-verify.test.ts` | Switched the "unknown verb" test from `replay` (now a known verb) to `revoke` (still future). |
+
+### Decisions
+
+- **`seq` is the row id.** Spec uses `ap_01H3K5...` shape (ULID-like) but `approvals_log` already has an INTEGER seq AUTOINCREMENT primary key, and seqs are unique per install. ULID generation would be a parallel design (column add + migration + emit-path change). Until that lands, `seq` is the local id and the operator's `--json` output carries `install_id` so an external tool can build a stable composite key.
+- **Cross-install replay refused.** When the user's active `install_id` doesn't match the row's, replay returns `not_found` with a message naming both ids. This prevents a forensic-data leak across installs sharing a single DB file (rare but possible during a DB copy/restore).
+- **Policy drift compares HASH, not file-by-file.** We hash the currently-resolved policy via `canonicalHash` (same function the engine uses at construction). If the hashes diverge, the row's policy is no longer what the engine sees today — we don't try to identify the offending rule; the operator runs `git blame` on the policy YAML to find the change. A future slice with `policy_archive` will surface the exact diff.
+- **JSON parses the `*_json` columns into sub-objects.** Operators piping `--json` into `jq` shouldn't have to do `fromjson` on every field. We parse defensively: if a column has malformed JSON (shouldn't happen — the engine canonicalizes), the original string survives so the consumer can still recover something.
+- **Score components rendered by descending magnitude.** Operator scanning the output sees the biggest contributors first (`capability_risk: +0.40` before `mcp_tool: +0.10`). Ties fall back to alphabetical for replay determinism. The audit row itself stores no order — the renderer imposes it for readability.
+- **Defensive seq re-validation in the handler.** The CLI parser already gates non-numeric/zero/negative seqs; the handler re-checks `Number.isInteger && > 0` for programmatic callers that bypass the parser. Same pattern as `chain-rotate.ts`'s `--reason` defense.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings (`tests/harness/abortable.test.ts:270/295`, untouched)
+- `bun test` — **5175 pass / 10 skip / 0 fail** (5185 total across 244 files)
+
+### Next
+
+Successor slices (still in spec order):
+1. `policy_archive` table: snapshot policy bytes per-hash so `--against-current-policy` + `--without-classifier` modes can re-execute deterministically.
+2. Sandbox runner — synthesize bwrap argv from the chosen profile + wrap every tool spawn (§6.5 enforcement).
+3. Auto-derive `parentCapabilities` from policy snapshot at spawn time (§10 automation).
+4. Policy section: `sandbox.required: true` + `sandbox.host-allowed: bool` (today operator-flag only).
+5. `--accept-broken-chain` operator override (§7.2 second flag).
+6. `agent permission inspect <rotation_id>` (clears the quarantine flag).
+7. `agent permission diff <id1> <id2>` (§17 cross-row comparison; pairs with #1).
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 11: context summary for classifier (§6.4)
 
 **Done.** Eleventh slice of the v2 evolution. Lands the §6.4 "contexto resumido (últimos N steps, sumarizados pela engine)" input the classifier expects. Slice 5 wired the classifier surface and stub'd `contextSummary` as optional/empty; this slice gives it real content — a sanitized, byte-capped rendering of recent decisions so the classifier can branch on activity patterns without ever seeing adversary-controlled bytes.
