@@ -404,6 +404,19 @@ const merge = (
   };
 };
 
+// Direct merge over a hand-constructed LayerPolicy[] — bypasses
+// `loadLayers`'s file-discovery step. The conformance runner uses
+// this to test hierarchy precedence + locked-section behavior with
+// raw YAML strings as setup, no temp files required. Production
+// code uses `resolvePolicy` (which calls `loadLayers` then this
+// merge); the export is intentionally minimal so test surfaces
+// can't accidentally smuggle production behavior changes through.
+export const mergeLayers = (
+  layers: readonly LayerPolicy[],
+): { policy: Policy; lockConflicts: LockConflict[]; provenance: SectionProvenance } => {
+  return merge(layers);
+};
+
 // Public entry — discover layers, merge, return the effective policy
 // plus the layer trail and any lock conflicts. Bootstrap consumes
 // `policy`; CLI rendering / debug surfaces consume `layers` and

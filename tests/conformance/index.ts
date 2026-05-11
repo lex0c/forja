@@ -30,13 +30,14 @@ import {
   parseCapability,
 } from '../../src/permissions/capabilities.ts';
 import type { Classifier } from '../../src/permissions/classifier.ts';
+import type { LayerPolicy } from '../../src/permissions/hierarchy.ts';
 import {
   type Decision,
   type EngineState,
   type PolicyCategory,
   createPermissionEngine,
 } from '../../src/permissions/index.ts';
-import { loadPolicyFromString } from '../../src/permissions/index.ts';
+import { loadPolicyFromString, mergeLayers } from '../../src/permissions/index.ts';
 import type { InstallIdentity } from '../../src/permissions/install_id.ts';
 import { resolveCapabilities } from '../../src/permissions/resolvers/index.ts';
 import { selectSandboxProfile } from '../../src/permissions/sandbox-plan.ts';
@@ -96,6 +97,17 @@ export interface ConformanceCase {
   name: string;
   setup: {
     project_policy?: string;
+    // §5 hierarchy precedence cases (slice 64). Optional raw YAML
+    // strings for the enterprise/user/session layers. When ANY of
+    // these is set, the runner merges all provided layers via
+    // `mergeLayers` (bypassing disk discovery) — the merged Policy
+    // feeds the engine. `project_policy` continues to work as the
+    // project layer; absent layers are simply omitted from the
+    // merge. Single-layer cases that don't care about hierarchy
+    // pin `project_policy` only (existing shape).
+    enterprise_policy?: string;
+    user_policy?: string;
+    session_policy?: string;
     cwd?: string;
     home?: string;
     // Pin the engine into a non-default state before the input
@@ -512,11 +524,35 @@ export const runCase = (c: ConformanceCase): CaseRunResult => {
   }
   const cwd = c.setup.cwd ?? '/work/proj';
   const home = c.setup.home ?? '/home/op';
-  const policyYaml = c.setup.project_policy ?? '';
-  const policy =
-    policyYaml.trim().length === 0
-      ? loadPolicyFromString('defaults: { mode: strict }')
-      : loadPolicyFromString(policyYaml, { cwd, home });
+  // §5 hierarchy resolution. When any of enterprise/user/session
+  // policies are present, merge all provided layers via
+  // `mergeLayers`. Otherwise fall back to the legacy single-layer
+  // path that parses `project_policy` as the active policy.
+  const hasMultiLayer =
+    c.setup.enterprise_policy !== undefined ||
+    c.setup.user_policy !== undefined ||
+    c.setup.session_policy !== undefined;
+  let policy: ReturnType<typeof loadPolicyFromString>;
+  if (hasMultiLayer) {
+    const layers: LayerPolicy[] = [];
+    const parseLayer = (yaml: string | undefined, layer: LayerPolicy['layer']): void => {
+      if (yaml === undefined) return;
+      const trimmed = yaml.trim();
+      if (trimmed.length === 0) return;
+      layers.push({ layer, policy: loadPolicyFromString(yaml, { cwd, home }) });
+    };
+    parseLayer(c.setup.enterprise_policy, 'enterprise');
+    parseLayer(c.setup.user_policy, 'user');
+    parseLayer(c.setup.project_policy, 'project');
+    parseLayer(c.setup.session_policy, 'session');
+    policy = mergeLayers(layers).policy;
+  } else {
+    const policyYaml = c.setup.project_policy ?? '';
+    policy =
+      policyYaml.trim().length === 0
+        ? loadPolicyFromString('defaults: { mode: strict }')
+        : loadPolicyFromString(policyYaml, { cwd, home });
+  }
   // Capture the audit row so score / score_components / capabilities
   // assertions can read what the engine actually emitted instead of
   // recomputing. Lets the suite anchor on the production wiring.

@@ -15,6 +15,52 @@ Format:
 
 ---
 
+## [2026-05-11] permission-engine-v2 — slice 64: §16 static_rules conformance — multi-layer runner + 16 new cases
+
+**Done.** Sixty-fourth slice. Closes the static_rules conformance gap that slice 59 incorrectly counted as met: the YAML category had only 4 cases against the spec's minimum of 20 (line 1091). Ships +16 cases bringing it to 20 ✓, plus the conformance runner extension that makes hierarchy + locked-section cases expressible.
+
+Also corrects the slice 59 BACKLOG claim: §16 was at 11/11 file-presence ✓ but only 9/11 per-category-minimum ✓. Slice 64 closes one of the two outstanding categories. The remaining gap (`capability_resolvers.yaml`: 15/30) lands in a follow-up slice.
+
+### Why this matters
+
+The conformance suite is §16's "load-bearing definition of deterministic behavior" — its category minimums are the contract that "the rule engine matches what the spec says about rule precedence, hierarchy, and locking". Slice 59's audit caught the YAML file presence but missed that static_rules had only 4 cases (one each for allow/deny/confirm/default-deny). The hierarchy + locked dimensions the spec line 1091 names (`"Static rule matching (deny precedence, hierarchy, locked)"`) were not pinned at all.
+
+Closing this gap means: (a) hierarchy precedence has cross-layer regression tests; (b) locked-section behavior is asserted from the operator's perspective ("higher layer locks → lower layer changes silently dropped"); (c) cross-tool rule shapes (read_file paths, fetch_url hosts, write_file deny_paths) get pinned at the rule-engine layer, complementing the path_traversal / bash_adversarial suites that test resolver-specific behavior.
+
+### Surface
+
+| File | Change |
+|---|---|
+| `src/permissions/hierarchy.ts` | New exported `mergeLayers(layers)` — thin wrapper over the private `merge` function. Bypasses `loadLayers`'s file-discovery so the conformance runner can construct `LayerPolicy[]` from raw YAML strings without writing temp files. Production code uses `resolvePolicy`; the new export is intentionally minimal so test surfaces can't smuggle production behavior changes through. |
+| `src/permissions/index.ts` | Re-exports `mergeLayers`. |
+| `tests/conformance/index.ts` | New `setup.enterprise_policy` / `user_policy` / `session_policy` fields (optional raw YAML strings). When ANY of these is set, the runner builds `LayerPolicy[]` per provided layer and merges via `mergeLayers`. Single-layer cases (only `project_policy`) keep the legacy path unchanged. Layer order: enterprise → user → project → session (last-writer-wins per section); locks freeze a section from lower-precedence overrides. |
+| `tests/conformance/cases/static_rules.yaml` | (+16 cases across four groups.) **A. Hierarchy precedence (4):** user bash section replaces enterprise bash entirely; enterprise + user write different sections — both apply; session bash beats project bash; session mode=bypass overrides project mode=strict. **B. Locked sections (4):** enterprise locks bash → user override silently rejected; enterprise locked rules still match for non-overridden allows; enterprise locks defaults.mode=strict → user mode=bypass ignored; user locks bash → project override rejected. **C. Pattern edge cases (4):** specific deny beats broad allow; multiple allow rules — any match wins; confirm rule fires when no allow/deny matches; deny beats confirm when both match. **D. Cross-tool rule shapes (4):** read_file allow_paths matches; write_file deny_paths blocks (deny precedence); fetch_url allow_hosts matches; fetch_url deny_hosts blocks. |
+
+### Decisions
+
+- **Export `mergeLayers`, not the underlying `merge` function directly.** Exposing the private function would let test surfaces accidentally drift the production semantics — adding a thin wrapper that delegates lets us swap the internal signature later without breaking tests. Comment in hierarchy.ts pins the intent ("intentionally minimal so test surfaces can't smuggle production behavior changes through").
+- **`enterprise_policy` + `user_policy` + `session_policy` as raw YAML strings, not parsed objects.** Same shape as the existing `project_policy` field — operators authoring YAML cases write actual YAML, not nested TS structures. Keeps cases readable + matches how production policies are written.
+- **Layer order in the runner mirrors `loadLayers`.** Enterprise → user → project → session, with last-writer-wins. The conformance cases assert against this order — session_policy beats project_policy because session is the last writer. Operators reading the cases should match the spec's hierarchy intuition.
+- **No assertion on `lockConflicts` in the expect block.** The runner's `expect` shape doesn't include a `lock_conflicts` field — locked-section cases verify the EFFECT (higher layer's rule won) rather than the conflict array. Adding a `lock_conflicts` expect field would let cases pin the diagnostic surface; deferred to a follow-up slice if operator demand emerges for "the conflict was logged exactly N times against layer X".
+- **Group D cross-tool cases pin the rule-engine layer, not tool-resolver-specific behavior.** Read_file / write_file / fetch_url's path/host matchers are reusable rule shapes; their adversarial inputs (symlink escape, traversal, eval) live in path_traversal.yaml / bash_adversarial.yaml. Static_rules.yaml asks "given a clean match, does the deny / allow precedence hold per tool?" — the answer should be yes uniformly across tools.
+- **Slice 59's per-category-bar claim was overcounted.** Honest correction: 9/11 categories met their minimums after slice 59; `static_rules` (4/20) and `capability_resolvers` (15/30) were under. Slice 64 closes static_rules. Capability_resolvers needs 15 more cases — separate slice.
+
+### Verification
+
+- `bun run typecheck` — clean
+- `bun run lint` — 0 errors, 2 pre-existing warnings; Biome auto-format applied
+- `bun test` — **5723 pass / 10 skip / 0 fail** (5733 total across 266 files); +16 tests on top of slice 63's 5707
+- `bun test tests/conformance/conformance.test.ts` — 146 pass (was 130)
+- §16 conformance category breakdown post-slice: Static rules **(≥20) ✓ NEW**, Capability resolvers (15/30 — gap), Bash adversarial (≥25) ✓, Path traversal (≥15) ✓, Hash chain (≥8) ✓, TTL expiry (≥6) ✓, Subagent intersection (≥6) ✓, Protected paths (≥5) ✓, Concurrency (≥5) ✓, Score determinism (≥10) ✓, Sandbox profile (≥6) ✓. **10 of 11** categories meet per-category minimums (was 9/11).
+
+### Next
+
+§16 conformance has one remaining category gap: `capability_resolvers.yaml` is at 15/30 (need 15 more cases covering per-tool resolver behavior — 10 builtin tools × 3 cases each per the spec line 1092 breakdown). The runner already supports the per-tool resolver test surface (cases use `expect.capabilities_include` + `expect.resolver_kind`); the slice is purely YAML authoring.
+
+Other open work unchanged: §7.3 backends still has `s3-object-lock` (AWS SDK dep) and `rfc3161-tsa` (ASN.1, spec-recommended audit-grade). §13.7 broker/worker remains the biggest open thread. Fuzz harness + telemetria stay on the production-ready checklist.
+
+---
+
 ## [2026-05-11] permission-engine-v2 — slice 63: `git-anchored` sealing backend (§7.3 second mode)
 
 **Done.** Sixty-third slice. Ships the second §7.3 sealing backend: `git-anchored`. Each `append` writes the entry to `<repoPath>/seal.log` (same wire format as worm-file) then runs `git add + git commit` so the seal is recorded as an immutable commit. Operators get append-only audit semantics via git's natural model — push to a protected remote (out-of-band) for external anchoring without the chattr / WORM-FS Linux dependencies.

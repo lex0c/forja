@@ -136,7 +136,7 @@ export type {
   SandboxProvenance,
   SectionProvenance,
 } from './hierarchy.ts';
-export { resolvePolicy } from './hierarchy.ts';
+export { mergeLayers, resolvePolicy } from './hierarchy.ts';
 
 export type { PolicyWatcher, WatchAndReloadOptions } from './policy-watcher.ts';
 export { watchAndReload } from './policy-watcher.ts';
